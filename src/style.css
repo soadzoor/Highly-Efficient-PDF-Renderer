@@ -64,8 +64,13 @@ body {
 
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 0;
+}
+
+.toolbar button[hidden] {
+  display: none;
 }
 
 .chevron-button {

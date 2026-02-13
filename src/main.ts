@@ -1,9 +1,10 @@
 import "./style.css";
 
+import JSZip from "jszip";
 import { GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import { GpuFloorplanRenderer } from "./gpuFloorplanRenderer";
+import { GpuFloorplanRenderer, type SceneStats } from "./gpuFloorplanRenderer";
 import { extractFirstPageVectors, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -13,6 +14,7 @@ const hudElement = document.querySelector<HTMLDivElement>("#hud");
 const toggleHudButton = document.querySelector<HTMLButtonElement>("#toggle-hud");
 const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon");
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
+const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-data");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoaderElement = document.querySelector<HTMLDivElement>("#parse-loader");
@@ -40,6 +42,7 @@ if (
   !toggleHudButton ||
   !toggleHudIcon ||
   !openButton ||
+  !downloadDataButton ||
   !fileInput ||
   !statusElement ||
   !parseLoaderElement ||
@@ -69,6 +72,7 @@ const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
 const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
+const downloadDataButtonElement = downloadDataButton;
 const fileInputElement = fileInput;
 const statusTextElement = statusElement;
 const parsingLoaderElement = parseLoaderElement;
@@ -97,10 +101,22 @@ renderer.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
 let baseStatus = "Waiting for PDF file...";
 let lastLoadedPdfBytes: Uint8Array | null = null;
 let lastLoadedPdfLabel: string | null = null;
+let lastParsedScene: VectorScene | null = null;
+let lastParsedSceneStats: SceneStats | null = null;
+let lastParsedSceneLabel: string | null = null;
 let loadToken = 0;
 
 interface LoadPdfOptions {
   preserveView?: boolean;
+}
+
+interface ExportTextureEntry {
+  name: string;
+  width: number;
+  height: number;
+  logicalItemCount: number;
+  logicalFloatCount: number;
+  data: Float32Array;
 }
 
 let fpsLastSampleTime = 0;
@@ -108,6 +124,7 @@ let fpsSmoothed = 0;
 
 setMetricPlaceholder();
 setHudCollapsed(false);
+setDownloadDataButtonState(false);
 
 renderer.setFrameListener((stats) => {
   updateFpsMetric();
@@ -120,6 +137,10 @@ renderer.setFrameListener((stats) => {
 
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
+});
+
+downloadDataButtonElement.addEventListener("click", () => {
+  void downloadParsedDataZip();
 });
 
 toggleHudButtonElement.addEventListener("click", () => {
@@ -263,6 +284,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       setStatus(`No visible vector geometry was extracted from ${label}.`);
       runtimeTextElement.textContent = "";
       setMetricPlaceholder(label);
+      setDownloadDataButtonState(false);
       return;
     }
 
@@ -284,6 +306,11 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     logInvisibleCullStats(label, scene);
     logTextVectorStats(label, scene);
     logTextureSizeStats(label, scene, sceneStats);
+
+    lastParsedScene = scene;
+    lastParsedSceneStats = sceneStats;
+    lastParsedSceneLabel = label;
+    setDownloadDataButtonState(true);
 
     updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
     baseStatus = formatSceneStatus(label, scene);
@@ -335,11 +362,155 @@ function setParsingLoader(isVisible: boolean): void {
   parsingLoaderElement.hidden = !isVisible;
 }
 
+function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
+  downloadDataButtonElement.hidden = !hasParsedData;
+  downloadDataButtonElement.disabled = !hasParsedData || isBusy;
+  downloadDataButtonElement.textContent = isBusy ? "preparing zip..." : "download parsed data";
+}
+
 function setHudCollapsed(collapsed: boolean): void {
   hudPanelElement.classList.toggle("collapsed", collapsed);
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
   toggleHudButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
   toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
+}
+
+async function downloadParsedDataZip(): Promise<void> {
+  if (!lastParsedScene || !lastParsedSceneStats || !lastParsedSceneLabel) {
+    setStatus("No parsed floorplan data available to export.");
+    return;
+  }
+
+  const scene = lastParsedScene;
+  const sceneStats = lastParsedSceneStats;
+  const label = lastParsedSceneLabel;
+  const previousStatusText = statusTextElement.textContent;
+
+  setDownloadDataButtonState(true, true);
+  statusTextElement.textContent = "Preparing parsed texture data zip...";
+
+  try {
+    const zip = new JSZip();
+    const textureEntries = buildTextureExportEntries(scene, sceneStats);
+
+    for (const entry of textureEntries) {
+      const path = `textures/${entry.name}.f32`;
+      zip.file(path, new Uint8Array(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength));
+    }
+
+    const manifest = {
+      formatVersion: 1,
+      sourceFile: label,
+      generatedAt: new Date().toISOString(),
+      scene: {
+        bounds: scene.bounds,
+        pageBounds: scene.pageBounds,
+        maxHalfWidth: scene.maxHalfWidth,
+        operatorCount: scene.operatorCount,
+        pathCount: scene.pathCount,
+        sourceSegmentCount: scene.sourceSegmentCount,
+        mergedSegmentCount: scene.mergedSegmentCount,
+        segmentCount: scene.segmentCount,
+        fillPathCount: scene.fillPathCount,
+        fillSegmentCount: scene.fillSegmentCount,
+        textInstanceCount: scene.textInstanceCount,
+        textGlyphCount: scene.textGlyphCount,
+        textGlyphPrimitiveCount: scene.textGlyphSegmentCount
+      },
+      textures: textureEntries.map((entry) => ({
+        name: entry.name,
+        file: `textures/${entry.name}.f32`,
+        width: entry.width,
+        height: entry.height,
+        channels: 4,
+        componentType: "float32",
+        logicalItemCount: entry.logicalItemCount,
+        logicalFloatCount: entry.logicalFloatCount,
+        paddedFloatCount: entry.data.length
+      }))
+    };
+
+    zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+
+    const zipBlob = await zip.generateAsync({
+      type: "blob",
+      compression: "DEFLATE",
+      compressionOptions: { level: 6 }
+    });
+
+    const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
+    triggerBlobDownload(zipBlob, zipFileName);
+    console.log(`[Parsed data export] ${label}: wrote ${textureEntries.length} textures to ${zipFileName}`);
+    statusTextElement.textContent = previousStatusText || baseStatus;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to download parsed data: ${message}`);
+  } finally {
+    setDownloadDataButtonState(true, false);
+  }
+}
+
+function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneStats): ExportTextureEntry[] {
+  return [
+    createTextureExportEntry("fill-path-meta-a", scene.fillPathMetaA, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount),
+    createTextureExportEntry("fill-path-meta-b", scene.fillPathMetaB, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount),
+    createTextureExportEntry("fill-path-meta-c", scene.fillPathMetaC, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount),
+    createTextureExportEntry("fill-segments", scene.fillSegments, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount),
+    createTextureExportEntry("stroke-endpoints", scene.endpoints, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
+    createTextureExportEntry("stroke-styles", scene.styles, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
+    createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
+    createTextureExportEntry("text-instance-b", scene.textInstanceB, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
+    createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount),
+    createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount),
+    createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount),
+    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount)
+  ];
+}
+
+function createTextureExportEntry(
+  name: string,
+  source: Float32Array,
+  width: number,
+  height: number,
+  logicalItemCount: number
+): ExportTextureEntry {
+  return {
+    name,
+    width,
+    height,
+    logicalItemCount,
+    logicalFloatCount: source.length,
+    data: createPaddedFloatTextureData(source, width, height)
+  };
+}
+
+function createPaddedFloatTextureData(source: Float32Array, width: number, height: number): Float32Array {
+  const expectedLength = Math.max(1, width) * Math.max(1, height) * 4;
+  if (source.length > expectedLength) {
+    throw new Error(`Texture source data exceeds texture size (${source.length} > ${expectedLength}).`);
+  }
+
+  const padded = new Float32Array(expectedLength);
+  padded.set(source);
+  return padded;
+}
+
+function sanitizeDownloadName(label: string): string {
+  const withoutExtension = label.replace(/\.pdf$/i, "");
+  const normalized = withoutExtension.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
+  return normalized.length > 0 ? normalized : "floorplan";
+}
+
+function triggerBlobDownload(blob: Blob, filename: string): void {
+  const downloadUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = downloadUrl;
+  link.download = filename;
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(downloadUrl), 0);
 }
 
 function setMetricPlaceholder(label: string = "-"): void {
