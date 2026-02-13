@@ -493,6 +493,7 @@ interface FontLike {
 
 interface GlyphTokenLike {
   fontChar?: unknown;
+  unicode?: unknown;
   width?: unknown;
   isSpace?: unknown;
 }
@@ -1534,9 +1535,10 @@ async function extractTextVectorData(
       const width = Number(glyph.width);
       const glyphWidth = Number.isFinite(width) ? width : 0;
       const isSpace = glyph.isSpace === true;
+      const skipGlyphRender = isWhitespaceGlyphToken(glyph, fontChar);
       const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
 
-      if (!vertical && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
+      if (!vertical && !skipGlyphRender && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
         const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
         if (glyphRecord) {
           const glyphMatrix = buildTextGlyphTransform(state, x, 0);
@@ -1947,6 +1949,23 @@ function shouldRenderFilledText(renderMode: number): boolean {
     renderMode === TEXT_RENDER_MODE_FILL_ADD_PATH ||
     renderMode === TEXT_RENDER_MODE_FILL_STROKE_ADD_PATH
   );
+}
+
+function isWhitespaceGlyphToken(glyph: GlyphTokenLike, fontChar: string): boolean {
+  if (!fontChar) {
+    return true;
+  }
+
+  if (glyph.isSpace === true) {
+    return true;
+  }
+
+  const unicode = typeof glyph.unicode === "string" ? glyph.unicode : "";
+  if (unicode.length > 0 && unicode.trim().length === 0) {
+    return true;
+  }
+
+  return false;
 }
 
 function readTextEntries(value: unknown): unknown[] {
