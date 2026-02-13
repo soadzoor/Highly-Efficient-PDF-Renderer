@@ -8,13 +8,51 @@
   <body>
     <canvas id="viewport"></canvas>
     <div id="hud" class="panel">
-      <div class="toolbar">
-        <button id="open-file" type="button">Open PDF</button>
-        <input id="file-input" type="file" accept="application/pdf" hidden />
+      <div class="panel-header">
+        <div class="toolbar">
+          <button id="open-file" type="button">Open PDF</button>
+          <input id="file-input" type="file" accept="application/pdf" hidden />
+        </div>
+        <button id="toggle-hud" class="chevron-button" type="button" aria-expanded="true" aria-controls="hud-content" title="Collapse panel">
+          <span id="toggle-hud-icon" aria-hidden="true">▾</span>
+        </button>
       </div>
-      <div id="status" class="status">Loading sample floorplan...</div>
-      <div id="runtime" class="runtime"></div>
-      <div class="help">Drag to pan, mouse wheel to zoom, or drag-and-drop a PDF.</div>
+      <div id="hud-content" class="panel-content">
+        <div class="toggles">
+          <label class="toggle">
+            <input id="toggle-pan-opt" type="checkbox" checked />
+            <span>Pan optimization</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-segment-merge" type="checkbox" checked />
+            <span>Segment merge</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-invisible-cull" type="checkbox" checked />
+            <span>Invisible cull</span>
+          </label>
+        </div>
+        <div id="status" class="status">Loading sample floorplan...</div>
+        <div id="parse-loader" class="parse-loader" hidden>
+          <span class="loader-spinner" aria-hidden="true"></span>
+          <span>Parsing PDF...</span>
+        </div>
+        <div id="runtime" class="runtime"></div>
+        <div id="metrics" class="metrics">
+          <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Operators</span><span id="metric-operators" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Visible Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Reductions</span><span id="metric-reductions" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
+        </div>
+        <div class="help">Drag to pan, mouse wheel to zoom, or drag-and-drop a PDF.</div>
+      </div>
     </div>
     <div id="drop-indicator" class="drop-indicator">Drop PDF to render</div>
     <script type="module" src="/src/main.ts"></script>

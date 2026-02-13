@@ -24,6 +24,8 @@ export interface Bounds {
 
 export interface VectorScene {
   segmentCount: number;
+  sourceSegmentCount: number;
+  mergedSegmentCount: number;
   endpoints: Float32Array;
   styles: Float32Array;
   bounds: Bounds;
@@ -31,6 +33,15 @@ export interface VectorScene {
   maxHalfWidth: number;
   operatorCount: number;
   pathCount: number;
+  discardedTransparentCount: number;
+  discardedDegenerateCount: number;
+  discardedDuplicateCount: number;
+  discardedContainedCount: number;
+}
+
+export interface VectorExtractOptions {
+  enableSegmentMerge?: boolean;
+  enableInvisibleCull?: boolean;
 }
 
 class Float4Builder {
@@ -77,8 +88,22 @@ class Float4Builder {
 const IDENTITY_MATRIX: Mat2D = [1, 0, 0, 1, 0, 0];
 const CURVE_FLATNESS = 0.35;
 const MAX_CURVE_SPLIT_DEPTH = 9;
+const SEGMENT_JOIN_EPSILON = 1e-3;
+const COLLINEAR_DOT_THRESHOLD = 0.999995;
+const COLLINEAR_PERP_EPSILON = 0.05;
+const ALPHA_INVISIBLE_EPSILON = 1e-3;
+const OPAQUE_ALPHA_EPSILON = 0.999;
+const DUPLICATE_POSITION_SCALE = 1_000;
+const DUPLICATE_STYLE_SCALE = 10_000;
+const COVER_DIRECTION_SCALE = 2_000;
+const COVER_OFFSET_SCALE = 200;
+const COVER_INTERVAL_EPSILON = 0.05;
+const COVER_HALF_WIDTH_EPSILON = 1e-4;
 
-export async function extractFirstPageVectors(pdfData: ArrayBuffer): Promise<VectorScene> {
+export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
+  const enableSegmentMerge = options.enableSegmentMerge !== false;
+  const enableInvisibleCull = options.enableInvisibleCull !== false;
+
   const loadingTask = getDocument({ data: new Uint8Array(pdfData) });
   const pdf = await loadingTask.promise;
 
@@ -105,6 +130,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer): Promise<Vec
     };
 
     let pathCount = 0;
+    let sourceSegmentCount = 0;
     let maxHalfWidth = 0;
 
     const stateStack: GraphicsState[] = [];
@@ -185,42 +211,98 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer): Promise<Vec
 
       const styleLuma = clamp01(currentState.strokeLuma);
       const styleAlpha = clamp01(currentState.strokeAlpha);
-      emitSegmentsFromPath(
+      sourceSegmentCount += emitSegmentsFromPath(
         pathData,
         currentState.matrix,
         halfWidth,
         styleLuma,
         styleAlpha,
+        enableSegmentMerge,
         endpointBuilder,
         styleBuilder,
         bounds
       );
     }
 
-    const segmentCount = endpointBuilder.quadCount;
+    const mergedSegmentCount = endpointBuilder.quadCount;
 
-    if (segmentCount === 0) {
+    if (mergedSegmentCount === 0) {
       return {
-        segmentCount,
+        segmentCount: 0,
+        sourceSegmentCount,
+        mergedSegmentCount,
         endpoints: new Float32Array(0),
         styles: new Float32Array(0),
         bounds: { ...pageBounds },
         pageBounds,
         maxHalfWidth: 0,
         operatorCount: operatorList.fnArray.length,
-        pathCount
+        pathCount,
+        discardedTransparentCount: 0,
+        discardedDegenerateCount: 0,
+        discardedDuplicateCount: 0,
+        discardedContainedCount: 0
+      };
+    }
+
+    const mergedEndpoints = endpointBuilder.toTypedArray();
+    const mergedStyles = styleBuilder.toTypedArray();
+
+    if (!enableInvisibleCull) {
+      return {
+        segmentCount: mergedSegmentCount,
+        sourceSegmentCount,
+        mergedSegmentCount,
+        endpoints: mergedEndpoints,
+        styles: mergedStyles,
+        bounds,
+        pageBounds,
+        maxHalfWidth,
+        operatorCount: operatorList.fnArray.length,
+        pathCount,
+        discardedTransparentCount: 0,
+        discardedDegenerateCount: 0,
+        discardedDuplicateCount: 0,
+        discardedContainedCount: 0
+      };
+    }
+
+    const culled = cullInvisibleSegments(mergedEndpoints, mergedStyles);
+
+    if (culled.segmentCount === 0) {
+      return {
+        segmentCount: 0,
+        sourceSegmentCount,
+        mergedSegmentCount,
+        endpoints: new Float32Array(0),
+        styles: new Float32Array(0),
+        bounds: { ...pageBounds },
+        pageBounds,
+        maxHalfWidth: 0,
+        operatorCount: operatorList.fnArray.length,
+        pathCount,
+        discardedTransparentCount: culled.discardedTransparentCount,
+        discardedDegenerateCount: culled.discardedDegenerateCount,
+        discardedDuplicateCount: culled.discardedDuplicateCount,
+        discardedContainedCount: culled.discardedContainedCount
       };
     }
 
     return {
-      segmentCount,
-      endpoints: endpointBuilder.toTypedArray(),
-      styles: styleBuilder.toTypedArray(),
-      bounds,
+      segmentCount: culled.segmentCount,
+      sourceSegmentCount,
+      mergedSegmentCount,
+      endpoints: culled.endpoints,
+      styles: culled.styles,
+      bounds: culled.bounds,
       pageBounds,
-      maxHalfWidth,
+      maxHalfWidth: culled.maxHalfWidth,
       operatorCount: operatorList.fnArray.length,
-      pathCount
+      pathCount,
+      discardedTransparentCount: culled.discardedTransparentCount,
+      discardedDegenerateCount: culled.discardedDegenerateCount,
+      discardedDuplicateCount: culled.discardedDuplicateCount,
+      discardedContainedCount: culled.discardedContainedCount
     };
   } finally {
     await pdf.destroy();
@@ -372,20 +454,100 @@ function emitSegmentsFromPath(
   halfWidth: number,
   luma: number,
   alpha: number,
+  allowSegmentMerge: boolean,
   endpoints: Float4Builder,
   styles: Float4Builder,
   bounds: Bounds
-): void {
+): number {
+  let sourceSegmentCount = 0;
   let cursorX = 0;
   let cursorY = 0;
   let startX = 0;
   let startY = 0;
   let hasStart = false;
 
-  const emitLine = (x0: number, y0: number, x1: number, y1: number): void => {
+  let pendingX0 = 0;
+  let pendingY0 = 0;
+  let pendingX1 = 0;
+  let pendingY1 = 0;
+  let hasPending = false;
+
+  const flushPending = (): void => {
+    if (!hasPending) {
+      return;
+    }
+
+    endpoints.push(pendingX0, pendingY0, pendingX1, pendingY1);
+    styles.push(halfWidth, luma, alpha, 0);
+
+    bounds.minX = Math.min(bounds.minX, pendingX0, pendingX1);
+    bounds.minY = Math.min(bounds.minY, pendingY0, pendingY1);
+    bounds.maxX = Math.max(bounds.maxX, pendingX0, pendingX1);
+    bounds.maxY = Math.max(bounds.maxY, pendingY0, pendingY1);
+
+    hasPending = false;
+  };
+
+  const tryMergePending = (x0: number, y0: number, x1: number, y1: number): boolean => {
+    if (!hasPending) {
+      return false;
+    }
+
+    const joinDx = x0 - pendingX1;
+    const joinDy = y0 - pendingY1;
+    if (joinDx * joinDx + joinDy * joinDy > SEGMENT_JOIN_EPSILON * SEGMENT_JOIN_EPSILON) {
+      return false;
+    }
+
+    const baseDx = pendingX1 - pendingX0;
+    const baseDy = pendingY1 - pendingY0;
+    const nextDx = x1 - x0;
+    const nextDy = y1 - y0;
+
+    const baseLenSq = baseDx * baseDx + baseDy * baseDy;
+    const nextLenSq = nextDx * nextDx + nextDy * nextDy;
+    if (baseLenSq < 1e-10 || nextLenSq < 1e-10) {
+      return false;
+    }
+
+    const invLenProduct = 1 / Math.sqrt(baseLenSq * nextLenSq);
+    const dot = (baseDx * nextDx + baseDy * nextDy) * invLenProduct;
+    if (dot < COLLINEAR_DOT_THRESHOLD) {
+      return false;
+    }
+
+    const chainDx = x1 - pendingX0;
+    const chainDy = y1 - pendingY0;
+    const perpDistSq = crossDistanceSq(chainDx, chainDy, baseDx, baseDy, baseLenSq);
+    if (perpDistSq > COLLINEAR_PERP_EPSILON * COLLINEAR_PERP_EPSILON) {
+      return false;
+    }
+
+    pendingX1 = x1;
+    pendingY1 = y1;
+    return true;
+  };
+
+  const emitLine = (x0: number, y0: number, x1: number, y1: number, allowMerge: boolean): void => {
     const dx = x1 - x0;
     const dy = y1 - y0;
     if (dx * dx + dy * dy < 1e-10) {
+      return;
+    }
+
+    sourceSegmentCount += 1;
+
+    if (allowSegmentMerge && allowMerge && tryMergePending(x0, y0, x1, y1)) {
+      return;
+    }
+
+    if (allowSegmentMerge) {
+      flushPending();
+      pendingX0 = x0;
+      pendingY0 = y0;
+      pendingX1 = x1;
+      pendingY1 = y1;
+      hasPending = true;
       return;
     }
 
@@ -402,6 +564,7 @@ function emitSegmentsFromPath(
     const op = pathData[i++];
 
     if (op === DRAW_MOVE_TO) {
+      flushPending();
       cursorX = pathData[i++];
       cursorY = pathData[i++];
       startX = cursorX;
@@ -415,7 +578,7 @@ function emitSegmentsFromPath(
       const y = pathData[i++];
       const [tx0, ty0] = applyMatrix(matrix, cursorX, cursorY);
       const [tx1, ty1] = applyMatrix(matrix, x, y);
-      emitLine(tx0, ty0, tx1, ty1);
+      emitLine(tx0, ty0, tx1, ty1, true);
       cursorX = x;
       cursorY = y;
       continue;
@@ -443,7 +606,7 @@ function emitSegmentsFromPath(
         t2y,
         t3x,
         t3y,
-        (ax, ay, bx, by) => emitLine(ax, ay, bx, by),
+        (ax, ay, bx, by) => emitLine(ax, ay, bx, by, false),
         CURVE_FLATNESS,
         MAX_CURVE_SPLIT_DEPTH
       );
@@ -478,7 +641,7 @@ function emitSegmentsFromPath(
         t2y,
         t3x,
         t3y,
-        (ax, ay, bx, by) => emitLine(ax, ay, bx, by),
+        (ax, ay, bx, by) => emitLine(ax, ay, bx, by, false),
         CURVE_FLATNESS,
         MAX_CURVE_SPLIT_DEPTH
       );
@@ -492,15 +655,311 @@ function emitSegmentsFromPath(
       if (hasStart && (cursorX !== startX || cursorY !== startY)) {
         const [tx0, ty0] = applyMatrix(matrix, cursorX, cursorY);
         const [tx1, ty1] = applyMatrix(matrix, startX, startY);
-        emitLine(tx0, ty0, tx1, ty1);
+        emitLine(tx0, ty0, tx1, ty1, true);
       }
       cursorX = startX;
       cursorY = startY;
+      flushPending();
       continue;
     }
 
+    flushPending();
     break;
   }
+
+  flushPending();
+  return sourceSegmentCount;
+}
+
+interface CoverageCandidate {
+  index: number;
+  start: number;
+  end: number;
+  halfWidth: number;
+  alpha: number;
+}
+
+interface InvisibleCullResult {
+  segmentCount: number;
+  endpoints: Float32Array;
+  styles: Float32Array;
+  bounds: Bounds;
+  maxHalfWidth: number;
+  discardedTransparentCount: number;
+  discardedDegenerateCount: number;
+  discardedDuplicateCount: number;
+  discardedContainedCount: number;
+}
+
+function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): InvisibleCullResult {
+  const segmentCount = endpoints.length >> 2;
+  const keepMask = new Uint8Array(segmentCount);
+  const seenDuplicates = new Set<string>();
+  const coverageGroups = new Map<string, CoverageCandidate[]>();
+
+  let discardedTransparentCount = 0;
+  let discardedDegenerateCount = 0;
+  let discardedDuplicateCount = 0;
+  let discardedContainedCount = 0;
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const offset = i * 4;
+    const x0 = endpoints[offset];
+    const y0 = endpoints[offset + 1];
+    const x1 = endpoints[offset + 2];
+    const y1 = endpoints[offset + 3];
+
+    const halfWidth = styles[offset];
+    const luma = styles[offset + 1];
+    const alpha = styles[offset + 2];
+
+    if (alpha <= ALPHA_INVISIBLE_EPSILON) {
+      discardedTransparentCount += 1;
+      continue;
+    }
+
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-10) {
+      discardedDegenerateCount += 1;
+      continue;
+    }
+
+    const duplicateKey = buildDuplicateKey(x0, y0, x1, y1, halfWidth, luma, alpha);
+    if (seenDuplicates.has(duplicateKey)) {
+      discardedDuplicateCount += 1;
+      continue;
+    }
+    seenDuplicates.add(duplicateKey);
+
+    keepMask[i] = 1;
+
+    const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, luma, alpha);
+    let bucket = coverageGroups.get(coverage.key);
+    if (!bucket) {
+      bucket = [];
+      coverageGroups.set(coverage.key, bucket);
+    }
+    bucket.push({
+      index: coverage.index,
+      start: coverage.start,
+      end: coverage.end,
+      halfWidth: coverage.halfWidth,
+      alpha: coverage.alpha
+    });
+  }
+
+  for (const candidates of coverageGroups.values()) {
+    candidates.sort((a, b) => {
+      if (Math.abs(a.halfWidth - b.halfWidth) > COVER_HALF_WIDTH_EPSILON) {
+        return b.halfWidth - a.halfWidth;
+      }
+
+      const lenA = a.end - a.start;
+      const lenB = b.end - b.start;
+      if (Math.abs(lenA - lenB) > COVER_INTERVAL_EPSILON) {
+        return lenB - lenA;
+      }
+
+      return a.start - b.start;
+    });
+
+    const opaqueCovers: CoverageCandidate[] = [];
+
+    for (const candidate of candidates) {
+      let covered = false;
+      for (const cover of opaqueCovers) {
+        if (cover.halfWidth + COVER_HALF_WIDTH_EPSILON < candidate.halfWidth) {
+          continue;
+        }
+
+        if (
+          cover.start - COVER_INTERVAL_EPSILON <= candidate.start &&
+          cover.end + COVER_INTERVAL_EPSILON >= candidate.end
+        ) {
+          covered = true;
+          break;
+        }
+      }
+
+      if (covered) {
+        if (keepMask[candidate.index] === 1) {
+          keepMask[candidate.index] = 0;
+          discardedContainedCount += 1;
+        }
+        continue;
+      }
+
+      if (candidate.alpha >= OPAQUE_ALPHA_EPSILON) {
+        opaqueCovers.push(candidate);
+      }
+    }
+  }
+
+  let visibleCount = 0;
+  for (let i = 0; i < segmentCount; i += 1) {
+    if (keepMask[i] === 1) {
+      visibleCount += 1;
+    }
+  }
+
+  if (visibleCount === 0) {
+    return {
+      segmentCount: 0,
+      endpoints: new Float32Array(0),
+      styles: new Float32Array(0),
+      bounds: {
+        minX: 0,
+        minY: 0,
+        maxX: 0,
+        maxY: 0
+      },
+      maxHalfWidth: 0,
+      discardedTransparentCount,
+      discardedDegenerateCount,
+      discardedDuplicateCount,
+      discardedContainedCount
+    };
+  }
+
+  const outEndpoints = new Float32Array(visibleCount * 4);
+  const outStyles = new Float32Array(visibleCount * 4);
+  const outBounds: Bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY
+  };
+  let maxHalfWidth = 0;
+  let out = 0;
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    if (keepMask[i] === 0) {
+      continue;
+    }
+
+    const inOffset = i * 4;
+    const outOffset = out * 4;
+
+    const x0 = endpoints[inOffset];
+    const y0 = endpoints[inOffset + 1];
+    const x1 = endpoints[inOffset + 2];
+    const y1 = endpoints[inOffset + 3];
+    const halfWidth = styles[inOffset];
+
+    outEndpoints[outOffset] = x0;
+    outEndpoints[outOffset + 1] = y0;
+    outEndpoints[outOffset + 2] = x1;
+    outEndpoints[outOffset + 3] = y1;
+
+    outStyles[outOffset] = styles[inOffset];
+    outStyles[outOffset + 1] = styles[inOffset + 1];
+    outStyles[outOffset + 2] = styles[inOffset + 2];
+    outStyles[outOffset + 3] = styles[inOffset + 3];
+
+    outBounds.minX = Math.min(outBounds.minX, x0, x1);
+    outBounds.minY = Math.min(outBounds.minY, y0, y1);
+    outBounds.maxX = Math.max(outBounds.maxX, x0, x1);
+    outBounds.maxY = Math.max(outBounds.maxY, y0, y1);
+
+    maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
+    out += 1;
+  }
+
+  return {
+    segmentCount: visibleCount,
+    endpoints: outEndpoints,
+    styles: outStyles,
+    bounds: outBounds,
+    maxHalfWidth,
+    discardedTransparentCount,
+    discardedDegenerateCount,
+    discardedDuplicateCount,
+    discardedContainedCount
+  };
+}
+
+function buildDuplicateKey(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  halfWidth: number,
+  luma: number,
+  alpha: number
+): string {
+  let ax = x0;
+  let ay = y0;
+  let bx = x1;
+  let by = y1;
+
+  if (ax > bx || (ax === bx && ay > by)) {
+    ax = x1;
+    ay = y1;
+    bx = x0;
+    by = y0;
+  }
+
+  return [
+    quantize(halfWidth, DUPLICATE_STYLE_SCALE),
+    quantize(luma, DUPLICATE_STYLE_SCALE),
+    quantize(alpha, DUPLICATE_STYLE_SCALE),
+    quantize(ax, DUPLICATE_POSITION_SCALE),
+    quantize(ay, DUPLICATE_POSITION_SCALE),
+    quantize(bx, DUPLICATE_POSITION_SCALE),
+    quantize(by, DUPLICATE_POSITION_SCALE)
+  ].join("|");
+}
+
+function buildCoverageCandidate(
+  index: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  halfWidth: number,
+  luma: number,
+  alpha: number
+): { key: string; index: number; start: number; end: number; halfWidth: number; alpha: number } {
+  let ax = x0;
+  let ay = y0;
+  let bx = x1;
+  let by = y1;
+
+  let dx = bx - ax;
+  let dy = by - ay;
+  const len = Math.hypot(dx, dy);
+
+  let ux = dx / len;
+  let uy = dy / len;
+
+  if (ux < 0 || (Math.abs(ux) < 1e-10 && uy < 0)) {
+    ux = -ux;
+    uy = -uy;
+    ax = x1;
+    ay = y1;
+    bx = x0;
+    by = y0;
+  }
+
+  const nx = -uy;
+  const ny = ux;
+  const offset = nx * ax + ny * ay;
+
+  const t0 = ux * ax + uy * ay;
+  const t1 = ux * bx + uy * by;
+  const start = Math.min(t0, t1);
+  const end = Math.max(t0, t1);
+
+  const key = [
+    quantize(ux, COVER_DIRECTION_SCALE),
+    quantize(uy, COVER_DIRECTION_SCALE),
+    quantize(offset, COVER_OFFSET_SCALE),
+    quantize(luma, DUPLICATE_STYLE_SCALE)
+  ].join("|");
+
+  return { key, index, start, end, halfWidth, alpha };
 }
 
 function flattenCubic(
@@ -582,6 +1041,10 @@ function cubicFlatnessSq(
 function crossDistanceSq(px: number, py: number, ux: number, uy: number, lenSq: number): number {
   const cross = px * uy - py * ux;
   return (cross * cross) / lenSq;
+}
+
+function quantize(value: number, scale: number): number {
+  return Math.round(value * scale);
 }
 
 function multiplyMatrices(a: Mat2D, b: Mat2D): Mat2D {

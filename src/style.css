@@ -42,10 +42,69 @@ body {
   box-shadow: 0 8px 22px rgba(15, 23, 42, 0.12);
 }
 
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.panel-content {
+  margin-top: 8px;
+}
+
+.panel.collapsed {
+  width: auto;
+  max-width: calc(100vw - 32px);
+}
+
+.panel.collapsed .panel-content {
+  display: none;
+}
+
 .toolbar {
   display: flex;
   gap: 8px;
+  margin-bottom: 0;
+}
+
+.chevron-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(15, 23, 42, 0.45);
+  background: rgba(15, 23, 42, 0.08);
+  color: #0f172a;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.chevron-button:hover {
+  background: rgba(15, 23, 42, 0.16);
+}
+
+.toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   margin-bottom: 8px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #1f2937;
+  font-size: 0.84rem;
+  user-select: none;
+}
+
+.toggle input {
+  margin: 0;
 }
 
 button {
@@ -75,6 +134,68 @@ button:hover {
   margin-top: 6px;
   font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
   color: #334155;
+}
+
+.parse-loader {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #0f172a;
+  font-size: 0.84rem;
+}
+
+.parse-loader[hidden] {
+  display: none !important;
+}
+
+.loader-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(15, 23, 42, 0.2);
+  border-top-color: #0f172a;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.metrics {
+  margin-top: 8px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.metric-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 150px) 1fr;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.metric-row + .metric-row {
+  margin-top: 4px;
+}
+
+.metric-label {
+  color: #475569;
+  font-size: 0.8rem;
+}
+
+.metric-value {
+  color: #0f172a;
+  font-size: 0.81rem;
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+  word-break: break-word;
 }
 
 .help {

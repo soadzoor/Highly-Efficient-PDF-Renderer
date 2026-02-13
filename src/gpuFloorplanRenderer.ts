@@ -16,9 +16,10 @@ uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uAAScreenPx;
 
-out vec2 vP0;
-out vec2 vP1;
+out vec2 vLocal;
+out float vHalfLength;
 out float vHalfWidth;
+out float vAAWorld;
 out float vLuma;
 out float vAlpha;
 
@@ -44,9 +45,10 @@ void main() {
 
   if (lengthValue < 1e-5 || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
-    vP0 = p0;
-    vP1 = p1;
+    vLocal = vec2(0.0);
+    vHalfLength = 0.0;
     vHalfWidth = 0.0;
+    vAAWorld = 1.0;
     vLuma = luma;
     vAlpha = 0.0;
     return;
@@ -54,22 +56,25 @@ void main() {
 
   vec2 tangent = delta / lengthValue;
   vec2 normal = vec2(-tangent.y, tangent.x);
+  float halfLength = 0.5 * lengthValue;
 
   float aaWorld = max(1.0 / uZoom, 0.0001) * uAAScreenPx;
+  float halfExtentNormal = halfWidth + aaWorld;
+  float halfExtentTangent = halfLength + halfExtentNormal;
+  vec2 local = vec2(aCorner.x * halfExtentTangent, aCorner.y * halfExtentNormal);
 
   vec2 center = 0.5 * (p0 + p1);
-  vec2 worldPosition = center
-    + tangent * aCorner.x * (0.5 * lengthValue + halfWidth + aaWorld)
-    + normal * aCorner.y * (halfWidth + aaWorld);
+  vec2 worldPosition = center + tangent * local.x + normal * local.y;
 
   vec2 screen = (worldPosition - uCameraCenter) * uZoom + 0.5 * uViewport;
   vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
 
   gl_Position = vec4(clip, 0.0, 1.0);
 
-  vP0 = p0;
-  vP1 = p1;
+  vLocal = local;
+  vHalfLength = halfLength;
   vHalfWidth = halfWidth;
+  vAAWorld = aaWorld;
   vLuma = luma;
   vAlpha = alpha;
 }
@@ -77,40 +82,25 @@ void main() {
 
 const FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
-
-uniform vec2 uViewport;
-uniform vec2 uCameraCenter;
-uniform float uZoom;
-
-in vec2 vP0;
-in vec2 vP1;
+in vec2 vLocal;
+in float vHalfLength;
 in float vHalfWidth;
+in float vAAWorld;
 in float vLuma;
 in float vAlpha;
 
 out vec4 outColor;
-
-float lineDistance(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  float abLenSq = dot(ab, ab);
-  if (abLenSq < 1e-10) {
-    return length(p - a);
-  }
-  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  vec2 projection = a + ab * t;
-  return length(p - projection);
-}
 
 void main() {
   if (vAlpha <= 0.001) {
     discard;
   }
 
-  vec2 world = (gl_FragCoord.xy - 0.5 * uViewport) / uZoom + uCameraCenter;
-  float distanceToSegment = lineDistance(world, vP0, vP1);
-  float aaWorld = max(1.0 / uZoom, 0.0001);
+  float dx = max(abs(vLocal.x) - vHalfLength, 0.0);
+  float dy = abs(vLocal.y);
+  float distanceToSegment = length(vec2(dx, dy));
 
-  float coverage = 1.0 - smoothstep(vHalfWidth - aaWorld, vHalfWidth + aaWorld, distanceToSegment);
+  float coverage = 1.0 - smoothstep(vHalfWidth - vAAWorld, vHalfWidth + vAAWorld, distanceToSegment);
   float alpha = coverage * vAlpha;
 
   if (alpha <= 0.001) {
@@ -121,6 +111,47 @@ void main() {
   outColor = vec4(color, alpha);
 }
 `;
+
+const BLIT_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec2 aCorner;
+
+void main() {
+  gl_Position = vec4(aCorner, 0.0, 1.0);
+}
+`;
+
+const BLIT_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+uniform sampler2D uCacheTex;
+uniform vec2 uViewportPx;
+uniform vec2 uCacheSizePx;
+uniform vec2 uOffsetPx;
+
+out vec4 outColor;
+
+void main() {
+  vec2 base = 0.5 * (uCacheSizePx - uViewportPx);
+  vec2 samplePx = gl_FragCoord.xy + base + uOffsetPx;
+  vec2 uv = samplePx / uCacheSizePx;
+
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+    outColor = vec4(1.0);
+    return;
+  }
+
+  outColor = texture(uCacheTex, uv);
+}
+`;
+
+const INTERACTION_DECAY_MS = 140;
+const FULL_VIEW_FALLBACK_THRESHOLD = 0.92;
+const PAN_CACHE_MIN_SEGMENTS = 300_000;
+const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
+const PAN_CACHE_BORDER_PX = 96;
+const PAN_CACHE_ZOOM_EPSILON = 1e-5;
 
 export interface DrawStats {
   renderedSegments: number;
@@ -146,9 +177,13 @@ export class GpuFloorplanRenderer {
 
   private readonly gl: WebGL2RenderingContext;
 
-  private readonly program: WebGLProgram;
+  private readonly segmentProgram: WebGLProgram;
 
-  private readonly vao: WebGLVertexArrayObject;
+  private readonly blitProgram: WebGLProgram;
+
+  private readonly segmentVao: WebGLVertexArrayObject;
+
+  private readonly blitVao: WebGLVertexArrayObject;
 
   private readonly cornerBuffer: WebGLBuffer;
 
@@ -174,6 +209,14 @@ export class GpuFloorplanRenderer {
 
   private readonly uAAScreenPx: WebGLUniformLocation;
 
+  private readonly uCacheTex: WebGLUniformLocation;
+
+  private readonly uViewportPx: WebGLUniformLocation;
+
+  private readonly uCacheSizePx: WebGLUniformLocation;
+
+  private readonly uOffsetPx: WebGLUniformLocation;
+
   private scene: VectorScene | null = null;
 
   private grid: SpatialGrid | null = null;
@@ -185,6 +228,14 @@ export class GpuFloorplanRenderer {
   private visibleSegmentIds = new Float32Array(0);
 
   private segmentMarks = new Uint32Array(0);
+
+  private segmentMinX = new Float32Array(0);
+
+  private segmentMinY = new Float32Array(0);
+
+  private segmentMaxX = new Float32Array(0);
+
+  private segmentMaxY = new Float32Array(0);
 
   private markToken = 1;
 
@@ -214,6 +265,32 @@ export class GpuFloorplanRenderer {
 
   private maxZoom = 4_096;
 
+  private lastInteractionTime = Number.NEGATIVE_INFINITY;
+
+  private isPanInteracting = false;
+
+  private panCacheTexture: WebGLTexture | null = null;
+
+  private panCacheFramebuffer: WebGLFramebuffer | null = null;
+
+  private panCacheWidth = 0;
+
+  private panCacheHeight = 0;
+
+  private panCacheValid = false;
+
+  private panCacheCenterX = 0;
+
+  private panCacheCenterY = 0;
+
+  private panCacheZoom = 1;
+
+  private panCacheRenderedSegments = 0;
+
+  private panCacheUsedCulling = false;
+
+  private panOptimizationEnabled = true;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
 
@@ -231,8 +308,11 @@ export class GpuFloorplanRenderer {
 
     this.gl = context;
 
-    this.program = this.createProgram(VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE);
-    this.vao = this.createVertexArray();
+    this.segmentProgram = this.createProgram(VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE);
+    this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
+
+    this.segmentVao = this.createVertexArray();
+    this.blitVao = this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
     this.allSegmentIdBuffer = this.mustCreateBuffer();
@@ -241,13 +321,18 @@ export class GpuFloorplanRenderer {
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
 
-    this.uSegmentTexA = this.mustGetUniformLocation("uSegmentTexA");
-    this.uSegmentTexB = this.mustGetUniformLocation("uSegmentTexB");
-    this.uSegmentTexSize = this.mustGetUniformLocation("uSegmentTexSize");
-    this.uViewport = this.mustGetUniformLocation("uViewport");
-    this.uCameraCenter = this.mustGetUniformLocation("uCameraCenter");
-    this.uZoom = this.mustGetUniformLocation("uZoom");
-    this.uAAScreenPx = this.mustGetUniformLocation("uAAScreenPx");
+    this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
+    this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
+    this.uSegmentTexSize = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexSize");
+    this.uViewport = this.mustGetUniformLocation(this.segmentProgram, "uViewport");
+    this.uCameraCenter = this.mustGetUniformLocation(this.segmentProgram, "uCameraCenter");
+    this.uZoom = this.mustGetUniformLocation(this.segmentProgram, "uZoom");
+    this.uAAScreenPx = this.mustGetUniformLocation(this.segmentProgram, "uAAScreenPx");
+
+    this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
+    this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
+    this.uCacheSizePx = this.mustGetUniformLocation(this.blitProgram, "uCacheSizePx");
+    this.uOffsetPx = this.mustGetUniformLocation(this.blitProgram, "uOffsetPx");
 
     this.initializeGeometry();
     this.initializeState();
@@ -255,6 +340,36 @@ export class GpuFloorplanRenderer {
 
   setFrameListener(listener: FrameListener | null): void {
     this.frameListener = listener;
+  }
+
+  setPanOptimizationEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.panOptimizationEnabled === nextEnabled) {
+      return;
+    }
+
+    this.panOptimizationEnabled = nextEnabled;
+    this.isPanInteracting = false;
+    this.panCacheValid = false;
+
+    if (!this.panOptimizationEnabled) {
+      this.destroyPanCacheResources();
+    }
+
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  beginPanInteraction(): void {
+    this.isPanInteracting = true;
+    this.markInteraction();
+  }
+
+  endPanInteraction(): void {
+    this.isPanInteracting = false;
+    this.markInteraction();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
   }
 
   resize(): void {
@@ -269,6 +384,7 @@ export class GpuFloorplanRenderer {
     this.canvas.width = nextWidth;
     this.canvas.height = nextHeight;
 
+    this.destroyPanCacheResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -276,6 +392,9 @@ export class GpuFloorplanRenderer {
   setScene(scene: VectorScene): SceneStats {
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
+    this.buildSegmentBounds(scene);
+    this.isPanInteracting = false;
+    this.panCacheValid = false;
 
     this.grid = buildSpatialGrid(scene);
     const textureStats = this.uploadSegments(scene);
@@ -334,7 +453,9 @@ export class GpuFloorplanRenderer {
 
     this.cameraCenterX = (bounds.minX + bounds.maxX) * 0.5;
     this.cameraCenterY = (bounds.minY + bounds.maxY) * 0.5;
+    this.isPanInteracting = false;
 
+    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -344,6 +465,7 @@ export class GpuFloorplanRenderer {
       return;
     }
 
+    this.markInteraction();
     this.cameraCenterX -= deltaX / this.zoom;
     this.cameraCenterY += deltaY / this.zoom;
 
@@ -353,6 +475,8 @@ export class GpuFloorplanRenderer {
 
   zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void {
     const clampedFactor = clamp(zoomFactor, 0.1, 10);
+    this.isPanInteracting = false;
+    this.markInteraction();
     const before = this.clientToWorld(clientX, clientY);
 
     const nextZoom = clamp(this.zoom * clampedFactor, this.minZoom, this.maxZoom);
@@ -363,6 +487,7 @@ export class GpuFloorplanRenderer {
     this.cameraCenterX += before.x - after.x;
     this.cameraCenterY += before.y - after.y;
 
+    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -381,11 +506,12 @@ export class GpuFloorplanRenderer {
   private render(): void {
     const gl = this.gl;
 
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.clearColor(1, 1, 1, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
     if (!this.scene || this.segmentCount === 0) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      gl.clearColor(1, 1, 1, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
       this.frameListener?.({
         renderedSegments: 0,
         totalSegments: 0,
@@ -395,25 +521,109 @@ export class GpuFloorplanRenderer {
       return;
     }
 
-    if (this.needsVisibleSetUpdate) {
-      this.updateVisibleSet();
-      this.needsVisibleSetUpdate = false;
-    }
-
-    const instanceCount = this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount;
-
-    if (instanceCount === 0) {
-      this.frameListener?.({
-        renderedSegments: 0,
-        totalSegments: this.segmentCount,
-        usedCulling: !this.usingAllSegments,
-        zoom: this.zoom
-      });
+    if (this.shouldUsePanCache()) {
+      this.renderWithPanCache();
       return;
     }
 
-    gl.useProgram(this.program);
-    gl.bindVertexArray(this.vao);
+    this.renderDirectToScreen();
+  }
+
+  private shouldUsePanCache(): boolean {
+    return this.panOptimizationEnabled && this.isPanInteracting && this.segmentCount >= PAN_CACHE_MIN_SEGMENTS;
+  }
+
+  private renderDirectToScreen(): void {
+    const gl = this.gl;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    if (this.needsVisibleSetUpdate) {
+      this.updateVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height);
+      this.needsVisibleSetUpdate = false;
+    }
+
+    const instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+
+    this.frameListener?.({
+      renderedSegments: instanceCount,
+      totalSegments: this.segmentCount,
+      usedCulling: !this.usingAllSegments,
+      zoom: this.zoom
+    });
+  }
+
+  private renderWithPanCache(): void {
+    if (!this.ensurePanCacheResources()) {
+      this.renderDirectToScreen();
+      return;
+    }
+
+    let offsetPxX = (this.cameraCenterX - this.panCacheCenterX) * this.zoom;
+    let offsetPxY = (this.cameraCenterY - this.panCacheCenterY) * this.zoom;
+
+    const maxOffsetX = Math.max(0, (this.panCacheWidth - this.canvas.width) * 0.5 - 2);
+    const maxOffsetY = Math.max(0, (this.panCacheHeight - this.canvas.height) * 0.5 - 2);
+
+    const zoomChanged = Math.abs(this.panCacheZoom - this.zoom) > PAN_CACHE_ZOOM_EPSILON;
+    const cacheOutOfCoverage = Math.abs(offsetPxX) > maxOffsetX || Math.abs(offsetPxY) > maxOffsetY;
+    const needsCacheRefresh = !this.panCacheValid || zoomChanged || cacheOutOfCoverage;
+
+    if (needsCacheRefresh) {
+      this.panCacheCenterX = this.cameraCenterX;
+      this.panCacheCenterY = this.cameraCenterY;
+      this.panCacheZoom = this.zoom;
+
+      this.updateVisibleSet(this.panCacheCenterX, this.panCacheCenterY, this.panCacheWidth, this.panCacheHeight);
+      this.needsVisibleSetUpdate = false;
+
+      const gl = this.gl;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.panCacheFramebuffer);
+      gl.viewport(0, 0, this.panCacheWidth, this.panCacheHeight);
+      gl.clearColor(1, 1, 1, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      this.panCacheRenderedSegments = this.drawVisibleSegments(
+        this.panCacheWidth,
+        this.panCacheHeight,
+        this.panCacheCenterX,
+        this.panCacheCenterY
+      );
+      this.panCacheUsedCulling = !this.usingAllSegments;
+      this.panCacheValid = true;
+
+      offsetPxX = 0;
+      offsetPxY = 0;
+    }
+
+    this.blitPanCache(offsetPxX, offsetPxY);
+
+    this.frameListener?.({
+      renderedSegments: this.panCacheRenderedSegments,
+      totalSegments: this.segmentCount,
+      usedCulling: this.panCacheUsedCulling,
+      zoom: this.zoom
+    });
+  }
+
+  private drawVisibleSegments(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): number {
+    const instanceCount = this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount;
+    if (instanceCount === 0) {
+      return 0;
+    }
+
+    const gl = this.gl;
+
+    gl.useProgram(this.segmentProgram);
+    gl.bindVertexArray(this.segmentVao);
 
     const segmentIdBuffer = this.usingAllSegments ? this.allSegmentIdBuffer : this.visibleSegmentIdBuffer;
     gl.bindBuffer(gl.ARRAY_BUFFER, segmentIdBuffer);
@@ -429,22 +639,131 @@ export class GpuFloorplanRenderer {
     gl.uniform1i(this.uSegmentTexA, 0);
     gl.uniform1i(this.uSegmentTexB, 1);
     gl.uniform2i(this.uSegmentTexSize, this.segmentTextureWidth, this.segmentTextureHeight);
-    gl.uniform2f(this.uViewport, this.canvas.width, this.canvas.height);
-    gl.uniform2f(this.uCameraCenter, this.cameraCenterX, this.cameraCenterY);
+    gl.uniform2f(this.uViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uZoom, this.zoom);
     gl.uniform1f(this.uAAScreenPx, 1);
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
 
-    this.frameListener?.({
-      renderedSegments: instanceCount,
-      totalSegments: this.segmentCount,
-      usedCulling: !this.usingAllSegments,
-      zoom: this.zoom
-    });
+    return instanceCount;
   }
 
-  private updateVisibleSet(): void {
+  private blitPanCache(offsetPxX: number, offsetPxY: number): void {
+    if (!this.panCacheTexture) {
+      return;
+    }
+
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(this.blitProgram);
+    gl.bindVertexArray(this.blitVao);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.panCacheTexture);
+
+    gl.uniform1i(this.uCacheTex, 0);
+    gl.uniform2f(this.uViewportPx, this.canvas.width, this.canvas.height);
+    gl.uniform2f(this.uCacheSizePx, this.panCacheWidth, this.panCacheHeight);
+    gl.uniform2f(this.uOffsetPx, offsetPxX, offsetPxY);
+
+    gl.disable(gl.BLEND);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.enable(gl.BLEND);
+  }
+
+  private ensurePanCacheResources(): boolean {
+    const gl = this.gl;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+
+    const desiredWidth = Math.min(
+      maxTextureSize,
+      Math.max(this.canvas.width + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.width * PAN_CACHE_OVERSCAN_FACTOR))
+    );
+    const desiredHeight = Math.min(
+      maxTextureSize,
+      Math.max(this.canvas.height + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.height * PAN_CACHE_OVERSCAN_FACTOR))
+    );
+
+    if (desiredWidth < this.canvas.width || desiredHeight < this.canvas.height) {
+      return false;
+    }
+
+    if (
+      this.panCacheTexture &&
+      this.panCacheFramebuffer &&
+      this.panCacheWidth === desiredWidth &&
+      this.panCacheHeight === desiredHeight
+    ) {
+      return true;
+    }
+
+    this.destroyPanCacheResources();
+
+    const texture = gl.createTexture();
+    if (!texture) {
+      return false;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    configureColorTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, desiredWidth, desiredHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    this.panCacheTexture = texture;
+    this.panCacheFramebuffer = framebuffer;
+    this.panCacheWidth = desiredWidth;
+    this.panCacheHeight = desiredHeight;
+    this.panCacheValid = false;
+
+    return true;
+  }
+
+  private destroyPanCacheResources(): void {
+    if (this.panCacheFramebuffer) {
+      this.gl.deleteFramebuffer(this.panCacheFramebuffer);
+      this.panCacheFramebuffer = null;
+    }
+
+    if (this.panCacheTexture) {
+      this.gl.deleteTexture(this.panCacheTexture);
+      this.panCacheTexture = null;
+    }
+
+    this.panCacheWidth = 0;
+    this.panCacheHeight = 0;
+    this.panCacheValid = false;
+    this.panCacheRenderedSegments = 0;
+    this.panCacheUsedCulling = false;
+  }
+
+  private updateVisibleSet(
+    viewCenterX: number = this.cameraCenterX,
+    viewCenterY: number = this.cameraCenterY,
+    viewportWidthPx: number = this.canvas.width,
+    viewportHeightPx: number = this.canvas.height
+  ): void {
     if (!this.scene || !this.grid) {
       this.visibleSegmentCount = 0;
       this.usingAllSegments = true;
@@ -453,15 +772,15 @@ export class GpuFloorplanRenderer {
 
     const grid = this.grid;
 
-    const halfViewWidth = this.canvas.width / (2 * this.zoom);
-    const halfViewHeight = this.canvas.height / (2 * this.zoom);
+    const halfViewWidth = viewportWidthPx / (2 * this.zoom);
+    const halfViewHeight = viewportHeightPx / (2 * this.zoom);
 
     const margin = Math.max(16 / this.zoom, this.scene.maxHalfWidth * 2);
 
-    const viewMinX = this.cameraCenterX - halfViewWidth - margin;
-    const viewMaxX = this.cameraCenterX + halfViewWidth + margin;
-    const viewMinY = this.cameraCenterY - halfViewHeight - margin;
-    const viewMaxY = this.cameraCenterY + halfViewHeight + margin;
+    const viewMinX = viewCenterX - halfViewWidth - margin;
+    const viewMaxX = viewCenterX + halfViewWidth + margin;
+    const viewMinY = viewCenterY - halfViewHeight - margin;
+    const viewMaxY = viewCenterY + halfViewHeight + margin;
 
     const c0 = clampToGrid(Math.floor((viewMinX - grid.minX) / grid.cellWidth), grid.gridWidth);
     const c1 = clampToGrid(Math.floor((viewMaxX - grid.minX) / grid.cellWidth), grid.gridWidth);
@@ -471,7 +790,7 @@ export class GpuFloorplanRenderer {
     const visibleCellCount = (c1 - c0 + 1) * (r1 - r0 + 1);
     const totalCellCount = grid.gridWidth * grid.gridHeight;
 
-    if (visibleCellCount >= totalCellCount * 0.7) {
+    if (!this.isInteractionActive() && visibleCellCount >= totalCellCount * FULL_VIEW_FALLBACK_THRESHOLD) {
       this.usingAllSegments = true;
       this.visibleSegmentCount = this.segmentCount;
       return;
@@ -498,6 +817,16 @@ export class GpuFloorplanRenderer {
             continue;
           }
           this.segmentMarks[segmentIndex] = this.markToken;
+
+          if (
+            this.segmentMaxX[segmentIndex] < viewMinX ||
+            this.segmentMinX[segmentIndex] > viewMaxX ||
+            this.segmentMaxY[segmentIndex] < viewMinY ||
+            this.segmentMinY[segmentIndex] > viewMaxY
+          ) {
+            continue;
+          }
+
           this.visibleSegmentIds[outCount] = segmentIndex;
           outCount += 1;
         }
@@ -571,10 +900,40 @@ export class GpuFloorplanRenderer {
     };
   }
 
+  private buildSegmentBounds(scene: VectorScene): void {
+    if (this.segmentMinX.length < this.segmentCount) {
+      this.segmentMinX = new Float32Array(this.segmentCount);
+      this.segmentMinY = new Float32Array(this.segmentCount);
+      this.segmentMaxX = new Float32Array(this.segmentCount);
+      this.segmentMaxY = new Float32Array(this.segmentCount);
+    }
+
+    for (let i = 0; i < this.segmentCount; i += 1) {
+      const endpointOffset = i * 4;
+      const styleOffset = i * 4;
+      const x0 = scene.endpoints[endpointOffset];
+      const y0 = scene.endpoints[endpointOffset + 1];
+      const x1 = scene.endpoints[endpointOffset + 2];
+      const y1 = scene.endpoints[endpointOffset + 3];
+      const margin = scene.styles[styleOffset] + 0.35;
+
+      this.segmentMinX[i] = Math.min(x0, x1) - margin;
+      this.segmentMinY[i] = Math.min(y0, y1) - margin;
+      this.segmentMaxX[i] = Math.max(x0, x1) + margin;
+      this.segmentMaxY[i] = Math.max(y0, y1) + margin;
+    }
+  }
+
+  private markInteraction(): void {
+    this.lastInteractionTime = performance.now();
+  }
+
+  private isInteractionActive(): boolean {
+    return performance.now() - this.lastInteractionTime <= INTERACTION_DECAY_MS;
+  }
+
   private initializeGeometry(): void {
     const gl = this.gl;
-
-    gl.bindVertexArray(this.vao);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
     const corners = new Float32Array([
@@ -585,6 +944,8 @@ export class GpuFloorplanRenderer {
     ]);
     gl.bufferData(gl.ARRAY_BUFFER, corners, gl.STATIC_DRAW);
 
+    gl.bindVertexArray(this.segmentVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
     gl.vertexAttribDivisor(0, 0);
@@ -593,6 +954,12 @@ export class GpuFloorplanRenderer {
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 4, 0);
     gl.vertexAttribDivisor(1, 1);
+
+    gl.bindVertexArray(this.blitVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    gl.vertexAttribDivisor(0, 0);
 
     gl.bindVertexArray(null);
   }
@@ -690,8 +1057,8 @@ export class GpuFloorplanRenderer {
     return texture;
   }
 
-  private mustGetUniformLocation(name: string): WebGLUniformLocation {
-    const location = this.gl.getUniformLocation(this.program, name);
+  private mustGetUniformLocation(program: WebGLProgram, name: string): WebGLUniformLocation {
+    const location = this.gl.getUniformLocation(program, name);
     if (!location) {
       throw new Error(`Missing uniform: ${name}`);
     }
@@ -700,6 +1067,13 @@ export class GpuFloorplanRenderer {
 }
 
 function configureFloatTexture(gl: WebGL2RenderingContext): void {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function configureColorTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
