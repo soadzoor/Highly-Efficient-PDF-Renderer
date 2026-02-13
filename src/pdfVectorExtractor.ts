@@ -115,12 +115,14 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
     const styleBuilder = new Float4Builder();
 
     const pageView = page.view;
-    const pageBounds: Bounds = {
+    const rawPageBounds: Bounds = {
       minX: Math.min(pageView[0], pageView[2]),
       minY: Math.min(pageView[1], pageView[3]),
       maxX: Math.max(pageView[0], pageView[2]),
       maxY: Math.max(pageView[1], pageView[3])
     };
+    const pageMatrix = buildPageMatrix(page);
+    const pageBounds = transformBounds(rawPageBounds, pageMatrix);
 
     const bounds: Bounds = {
       minX: Number.POSITIVE_INFINITY,
@@ -134,7 +136,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
     let maxHalfWidth = 0;
 
     const stateStack: GraphicsState[] = [];
-    let currentState: GraphicsState = createDefaultState();
+    let currentState: GraphicsState = createDefaultState(pageMatrix);
 
     for (let i = 0; i < operatorList.fnArray.length; i += 1) {
       const fn = operatorList.fnArray[i];
@@ -309,13 +311,64 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
   }
 }
 
-function createDefaultState(): GraphicsState {
+function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsState {
   return {
-    matrix: [...IDENTITY_MATRIX],
+    matrix: [...initialMatrix],
     lineWidth: 1,
     strokeLuma: 0,
     strokeAlpha: 1
   };
+}
+
+function buildPageMatrix(page: {
+  rotate: number;
+  getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown };
+}): Mat2D {
+  const rotation = normalizeRotationDegrees(page.rotate);
+  const viewport = page.getViewport({ scale: 1, rotation, dontFlip: true });
+  const transform = viewport.transform;
+
+  if (!Array.isArray(transform) || transform.length < 6) {
+    return [...IDENTITY_MATRIX];
+  }
+
+  const a = Number(transform[0]);
+  const b = Number(transform[1]);
+  const c = Number(transform[2]);
+  const d = Number(transform[3]);
+  const e = Number(transform[4]);
+  const f = Number(transform[5]);
+
+  if (![a, b, c, d, e, f].every(Number.isFinite)) {
+    return [...IDENTITY_MATRIX];
+  }
+
+  return [a, b, c, d, e, f];
+}
+
+function transformBounds(bounds: Bounds, matrix: Mat2D): Bounds {
+  const p0 = applyMatrix(matrix, bounds.minX, bounds.minY);
+  const p1 = applyMatrix(matrix, bounds.minX, bounds.maxY);
+  const p2 = applyMatrix(matrix, bounds.maxX, bounds.minY);
+  const p3 = applyMatrix(matrix, bounds.maxX, bounds.maxY);
+
+  return {
+    minX: Math.min(p0[0], p1[0], p2[0], p3[0]),
+    minY: Math.min(p0[1], p1[1], p2[1], p3[1]),
+    maxX: Math.max(p0[0], p1[0], p2[0], p3[0]),
+    maxY: Math.max(p0[1], p1[1], p2[1], p3[1])
+  };
+}
+
+function normalizeRotationDegrees(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  let normalized = value % 360;
+  if (normalized < 0) {
+    normalized += 360;
+  }
+  return normalized;
 }
 
 function cloneState(state: GraphicsState): GraphicsState {
