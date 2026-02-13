@@ -39,6 +39,8 @@ void main() {
   float halfWidth = style.x;
   float luma = style.y;
   float alpha = style.z;
+  float styleFlags = style.w;
+  bool isHairline = styleFlags >= 0.5;
 
   vec2 delta = p1 - p0;
   float lengthValue = length(delta);
@@ -58,7 +60,14 @@ void main() {
   vec2 normal = vec2(-tangent.y, tangent.x);
   float halfLength = 0.5 * lengthValue;
 
+  if (isHairline) {
+    halfWidth = max(0.5 / max(uZoom, 1e-4), 1e-5);
+  }
+
   float aaWorld = max(1.0 / uZoom, 0.0001) * uAAScreenPx;
+  if (isHairline) {
+    aaWorld = max(0.35 / max(uZoom, 1e-4), 5e-5);
+  }
   float halfExtentNormal = halfWidth + aaWorld;
   float halfExtentTangent = halfLength + halfExtentNormal;
   vec2 local = vec2(aCorner.x * halfExtentTangent, aCorner.y * halfExtentNormal);
@@ -132,6 +141,7 @@ flat out int vSegmentCount;
 flat out float vLuma;
 flat out float vAlpha;
 flat out float vFillRule;
+flat out float vFillHasCompanionStroke;
 out vec2 vLocal;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
@@ -155,6 +165,7 @@ void main() {
     vLuma = 0.0;
     vAlpha = 0.0;
     vFillRule = 0.0;
+    vFillHasCompanionStroke = 0.0;
     vLocal = vec2(0.0);
     return;
   }
@@ -173,6 +184,7 @@ void main() {
   vLuma = metaB.z;
   vAlpha = alpha;
   vFillRule = metaC.x;
+  vFillHasCompanionStroke = metaC.y;
   vLocal = world;
 }
 `;
@@ -190,6 +202,7 @@ flat in int vSegmentCount;
 flat in float vLuma;
 flat in float vAlpha;
 flat in float vFillRule;
+flat in float vFillHasCompanionStroke;
 in vec2 vLocal;
 
 out vec4 outColor;
@@ -245,6 +258,15 @@ void main() {
   bool insideNonZero = winding != 0;
   bool insideEvenOdd = (crossings & 1) == 1;
   bool inside = vFillRule >= 0.5 ? insideEvenOdd : insideNonZero;
+  if (vFillHasCompanionStroke >= 0.5) {
+    float alpha = inside ? vAlpha : 0.0;
+    if (alpha <= 0.001) {
+      discard;
+    }
+    outColor = vec4(vec3(vLuma), alpha);
+    return;
+  }
+
   float signedDistance = inside ? -minDistance : minDistance;
 
   float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));

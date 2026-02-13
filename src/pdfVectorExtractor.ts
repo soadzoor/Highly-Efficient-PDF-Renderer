@@ -278,9 +278,10 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       pathCount += 1;
 
       if (strokePaint) {
+        const isHairlineStroke = currentState.lineWidth <= 0;
         const widthScale = matrixScale(currentState.matrix);
-        const strokeWidth = currentState.lineWidth > 0 ? currentState.lineWidth * widthScale : 0.7;
-        const halfWidth = Math.max(0.2, strokeWidth * 0.5);
+        const strokeWidth = isHairlineStroke ? 0 : currentState.lineWidth * widthScale;
+        const halfWidth = Math.max(0, strokeWidth * 0.5);
         maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
 
         const styleLuma = clamp01(currentState.strokeLuma);
@@ -291,6 +292,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
           halfWidth,
           styleLuma,
           styleAlpha,
+          isHairlineStroke ? 1 : 0,
           enableSegmentMerge,
           endpointBuilder,
           styleBuilder,
@@ -301,11 +303,13 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       if (fillPaint) {
         const fillRule = isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
         const fillAlpha = clamp01(currentState.fillAlpha);
+        const hasCompanionStroke = strokePaint && clamp01(currentState.strokeAlpha) > ALPHA_INVISIBLE_EPSILON;
         if (fillAlpha > FILL_MIN_ALPHA) {
           const emitted = emitFilledPathFromPath(
             pathData,
             currentState.matrix,
             fillRule,
+            hasCompanionStroke,
             clamp01(currentState.fillLuma),
             fillAlpha,
             fillPathMetaABuilder,
@@ -768,6 +772,7 @@ function emitSegmentsFromPath(
   halfWidth: number,
   luma: number,
   alpha: number,
+  styleFlags: number,
   allowSegmentMerge: boolean,
   endpoints: Float4Builder,
   styles: Float4Builder,
@@ -792,7 +797,7 @@ function emitSegmentsFromPath(
     }
 
     endpoints.push(pendingX0, pendingY0, pendingX1, pendingY1);
-    styles.push(halfWidth, luma, alpha, 0);
+    styles.push(halfWidth, luma, alpha, styleFlags);
 
     bounds.minX = Math.min(bounds.minX, pendingX0, pendingX1);
     bounds.minY = Math.min(bounds.minY, pendingY0, pendingY1);
@@ -866,7 +871,7 @@ function emitSegmentsFromPath(
     }
 
     endpoints.push(x0, y0, x1, y1);
-    styles.push(halfWidth, luma, alpha, 0);
+    styles.push(halfWidth, luma, alpha, styleFlags);
 
     bounds.minX = Math.min(bounds.minX, x0, x1);
     bounds.minY = Math.min(bounds.minY, y0, y1);
@@ -989,6 +994,7 @@ function emitFilledPathFromPath(
   pathData: Float32Array,
   matrix: Mat2D,
   fillRule: number,
+  hasCompanionStroke: boolean,
   luma: number,
   alpha: number,
   metaA: Float4Builder,
@@ -1150,7 +1156,7 @@ function emitFilledPathFromPath(
 
   metaA.push(segmentStart, segmentCount, localBounds.minX, localBounds.minY);
   metaB.push(localBounds.maxX, localBounds.maxY, luma, alpha);
-  metaC.push(fillRule, 0, 0, 0);
+  metaC.push(fillRule, hasCompanionStroke ? 1 : 0, 0, 0);
 
   bounds.minX = Math.min(bounds.minX, localBounds.minX);
   bounds.minY = Math.min(bounds.minY, localBounds.minY);
@@ -1166,6 +1172,7 @@ interface CoverageCandidate {
   end: number;
   halfWidth: number;
   alpha: number;
+  styleFlags: number;
 }
 
 interface InvisibleCullResult {
@@ -1201,6 +1208,7 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
     const halfWidth = styles[offset];
     const luma = styles[offset + 1];
     const alpha = styles[offset + 2];
+    const styleFlags = styles[offset + 3];
 
     if (alpha <= ALPHA_INVISIBLE_EPSILON) {
       discardedTransparentCount += 1;
@@ -1215,7 +1223,7 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
       continue;
     }
 
-    const duplicateKey = buildDuplicateKey(x0, y0, x1, y1, halfWidth, luma, alpha);
+    const duplicateKey = buildDuplicateKey(x0, y0, x1, y1, halfWidth, luma, alpha, styleFlags);
     if (seenDuplicates.has(duplicateKey)) {
       discardedDuplicateCount += 1;
       continue;
@@ -1224,19 +1232,20 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
 
     keepMask[i] = 1;
 
-    const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, luma, alpha);
+    const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, luma, alpha, styleFlags);
     let bucket = coverageGroups.get(coverage.key);
     if (!bucket) {
       bucket = [];
       coverageGroups.set(coverage.key, bucket);
     }
-    bucket.push({
-      index: coverage.index,
-      start: coverage.start,
-      end: coverage.end,
-      halfWidth: coverage.halfWidth,
-      alpha: coverage.alpha
-    });
+      bucket.push({
+        index: coverage.index,
+        start: coverage.start,
+        end: coverage.end,
+        halfWidth: coverage.halfWidth,
+        alpha: coverage.alpha,
+        styleFlags: coverage.styleFlags
+      });
   }
 
   for (const candidates of coverageGroups.values()) {
@@ -1376,7 +1385,8 @@ function buildDuplicateKey(
   y1: number,
   halfWidth: number,
   luma: number,
-  alpha: number
+  alpha: number,
+  styleFlags: number
 ): string {
   let ax = x0;
   let ay = y0;
@@ -1394,6 +1404,7 @@ function buildDuplicateKey(
     quantize(halfWidth, DUPLICATE_STYLE_SCALE),
     quantize(luma, DUPLICATE_STYLE_SCALE),
     quantize(alpha, DUPLICATE_STYLE_SCALE),
+    quantize(styleFlags, 1),
     quantize(ax, DUPLICATE_POSITION_SCALE),
     quantize(ay, DUPLICATE_POSITION_SCALE),
     quantize(bx, DUPLICATE_POSITION_SCALE),
@@ -1409,8 +1420,9 @@ function buildCoverageCandidate(
   y1: number,
   halfWidth: number,
   luma: number,
-  alpha: number
-): { key: string; index: number; start: number; end: number; halfWidth: number; alpha: number } {
+  alpha: number,
+  styleFlags: number
+): { key: string; index: number; start: number; end: number; halfWidth: number; alpha: number; styleFlags: number } {
   let ax = x0;
   let ay = y0;
   let bx = x1;
@@ -1445,10 +1457,11 @@ function buildCoverageCandidate(
     quantize(ux, COVER_DIRECTION_SCALE),
     quantize(uy, COVER_DIRECTION_SCALE),
     quantize(offset, COVER_OFFSET_SCALE),
-    quantize(luma, DUPLICATE_STYLE_SCALE)
+    quantize(luma, DUPLICATE_STYLE_SCALE),
+    quantize(styleFlags, 1)
   ].join("|");
 
-  return { key, index, start, end, halfWidth, alpha };
+  return { key, index, start, end, halfWidth, alpha, styleFlags };
 }
 
 async function extractTextVectorData(
