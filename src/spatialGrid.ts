@@ -37,20 +37,16 @@ export function buildSpatialGrid(scene: VectorScene): SpatialGrid {
   let maxCellPopulation = 0;
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const endpointOffset = i * 4;
+    const primitiveBoundsOffset = i * 4;
     const styleOffset = i * 4;
 
-    const x0 = scene.endpoints[endpointOffset];
-    const y0 = scene.endpoints[endpointOffset + 1];
-    const x1 = scene.endpoints[endpointOffset + 2];
-    const y1 = scene.endpoints[endpointOffset + 3];
     const halfWidth = scene.styles[styleOffset];
     const margin = halfWidth + 0.35;
 
-    const minX = Math.min(x0, x1) - margin;
-    const minY = Math.min(y0, y1) - margin;
-    const maxX = Math.max(x0, x1) + margin;
-    const maxY = Math.max(y0, y1) + margin;
+    const minX = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+    const minY = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+    const maxX = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+    const maxY = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
 
     const c0 = clampToCell(Math.floor((minX - scene.bounds.minX) / cellWidth), gridWidth);
     const c1 = clampToCell(Math.floor((maxX - scene.bounds.minX) / cellWidth), gridWidth);
@@ -80,20 +76,16 @@ export function buildSpatialGrid(scene: VectorScene): SpatialGrid {
   const cursors = offsets.slice(0, cellCount);
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const endpointOffset = i * 4;
+    const primitiveBoundsOffset = i * 4;
     const styleOffset = i * 4;
 
-    const x0 = scene.endpoints[endpointOffset];
-    const y0 = scene.endpoints[endpointOffset + 1];
-    const x1 = scene.endpoints[endpointOffset + 2];
-    const y1 = scene.endpoints[endpointOffset + 3];
     const halfWidth = scene.styles[styleOffset];
     const margin = halfWidth + 0.35;
 
-    const minX = Math.min(x0, x1) - margin;
-    const minY = Math.min(y0, y1) - margin;
-    const maxX = Math.max(x0, x1) + margin;
-    const maxY = Math.max(y0, y1) + margin;
+    const minX = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+    const minY = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+    const maxX = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+    const maxY = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
 
     const c0 = clampToCell(Math.floor((minX - scene.bounds.minX) / cellWidth), gridWidth);
     const c1 = clampToCell(Math.floor((maxX - scene.bounds.minX) / cellWidth), gridWidth);

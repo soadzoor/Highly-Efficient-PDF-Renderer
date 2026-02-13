@@ -30,7 +30,8 @@ export interface VectorScene {
   fillPathMetaA: Float32Array;
   fillPathMetaB: Float32Array;
   fillPathMetaC: Float32Array;
-  fillSegments: Float32Array;
+  fillSegmentsA: Float32Array;
+  fillSegmentsB: Float32Array;
   segmentCount: number;
   sourceSegmentCount: number;
   mergedSegmentCount: number;
@@ -47,6 +48,8 @@ export interface VectorScene {
   textGlyphSegmentsA: Float32Array;
   textGlyphSegmentsB: Float32Array;
   endpoints: Float32Array;
+  primitiveMeta: Float32Array;
+  primitiveBounds: Float32Array;
   styles: Float32Array;
   bounds: Bounds;
   pageBounds: Bounds;
@@ -119,8 +122,6 @@ const COVER_DIRECTION_SCALE = 2_000;
 const COVER_OFFSET_SCALE = 200;
 const COVER_INTERVAL_EPSILON = 0.05;
 const COVER_HALF_WIDTH_EPSILON = 1e-4;
-const FILL_CURVE_FLATNESS = 0.18;
-const MAX_FILL_CURVE_SPLIT_DEPTH = 8;
 const TEXT_CUBIC_TO_QUAD_ERROR = 0.05;
 const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 10;
 const TEXT_BOUNDS_EPSILON = 1e-4;
@@ -138,6 +139,12 @@ const TEXT_RENDER_MODE_FILL_STROKE_ADD_PATH = 6;
 
 const TEXT_PRIMITIVE_LINE = 0;
 const TEXT_PRIMITIVE_QUADRATIC = 1;
+const STROKE_PRIMITIVE_LINE = 0;
+const STROKE_PRIMITIVE_QUADRATIC = 1;
+const FILL_PRIMITIVE_LINE = 0;
+const FILL_PRIMITIVE_QUADRATIC = 1;
+const FILL_CUBIC_TO_QUAD_ERROR = 0.08;
+const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
 
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
@@ -155,11 +162,14 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
     const operatorList = await page.getOperatorList();
 
     const endpointBuilder = new Float4Builder();
+    const primitiveMetaBuilder = new Float4Builder();
+    const primitiveBoundsBuilder = new Float4Builder();
     const styleBuilder = new Float4Builder();
     const fillPathMetaABuilder = new Float4Builder(8_192);
     const fillPathMetaBBuilder = new Float4Builder(8_192);
     const fillPathMetaCBuilder = new Float4Builder(8_192);
-    const fillSegmentBuilder = new Float4Builder(65_536);
+    const fillSegmentBuilderA = new Float4Builder(65_536);
+    const fillSegmentBuilderB = new Float4Builder(65_536);
 
     const pageView = page.view;
     const rawPageBounds: Bounds = {
@@ -295,7 +305,9 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
           isHairlineStroke ? 1 : 0,
           enableSegmentMerge,
           endpointBuilder,
+          primitiveMetaBuilder,
           styleBuilder,
+          primitiveBoundsBuilder,
           bounds
         );
       }
@@ -315,7 +327,8 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
             fillPathMetaABuilder,
             fillPathMetaBBuilder,
             fillPathMetaCBuilder,
-            fillSegmentBuilder,
+            fillSegmentBuilderA,
+            fillSegmentBuilderB,
             fillBounds
           );
           if (emitted) {
@@ -327,16 +340,21 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 
     const mergedSegmentCount = endpointBuilder.quadCount;
     const mergedEndpoints = endpointBuilder.toTypedArray();
+    const mergedPrimitiveMeta = primitiveMetaBuilder.toTypedArray();
+    const mergedPrimitiveBounds = primitiveBoundsBuilder.toTypedArray();
     const mergedStyles = styleBuilder.toTypedArray();
-    const fillSegmentCount = fillSegmentBuilder.quadCount;
+    const fillSegmentCount = fillSegmentBuilderA.quadCount;
     const fillPathMetaA = fillPathMetaABuilder.toTypedArray();
     const fillPathMetaB = fillPathMetaBBuilder.toTypedArray();
     const fillPathMetaC = fillPathMetaCBuilder.toTypedArray();
-    const fillSegments = fillSegmentBuilder.toTypedArray();
+    const fillSegmentsA = fillSegmentBuilderA.toTypedArray();
+    const fillSegmentsB = fillSegmentBuilderB.toTypedArray();
     const resolvedFillBounds = fillPathCount > 0 ? fillBounds : null;
 
     let segmentCount = mergedSegmentCount;
     let endpoints = mergedEndpoints;
+    let primitiveMeta = mergedPrimitiveMeta;
+    let primitiveBounds = mergedPrimitiveBounds;
     let styles = mergedStyles;
     let segmentBounds: Bounds | null = mergedSegmentCount > 0 ? bounds : null;
     let resolvedMaxHalfWidth = mergedSegmentCount > 0 ? maxHalfWidth : 0;
@@ -346,9 +364,11 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
     let discardedContainedCount = 0;
 
     if (mergedSegmentCount > 0 && enableInvisibleCull) {
-      const culled = cullInvisibleSegments(mergedEndpoints, mergedStyles);
+      const culled = cullInvisibleSegments(mergedEndpoints, mergedPrimitiveMeta, mergedStyles, mergedPrimitiveBounds);
       segmentCount = culled.segmentCount;
       endpoints = culled.endpoints;
+      primitiveMeta = culled.primitiveMeta;
+      primitiveBounds = culled.primitiveBounds;
       styles = culled.styles;
       segmentBounds = culled.segmentCount > 0 ? culled.bounds : null;
       resolvedMaxHalfWidth = culled.maxHalfWidth;
@@ -360,6 +380,8 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 
     if (segmentCount === 0) {
       endpoints = new Float32Array(0);
+      primitiveMeta = new Float32Array(0);
+      primitiveBounds = new Float32Array(0);
       styles = new Float32Array(0);
       resolvedMaxHalfWidth = 0;
     }
@@ -384,7 +406,8 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       fillPathMetaA,
       fillPathMetaB,
       fillPathMetaC,
-      fillSegments,
+      fillSegmentsA,
+      fillSegmentsB,
       segmentCount,
       sourceSegmentCount,
       mergedSegmentCount,
@@ -401,6 +424,8 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       textGlyphSegmentsA: textData.glyphSegmentsA,
       textGlyphSegmentsB: textData.glyphSegmentsB,
       endpoints,
+      primitiveMeta,
+      primitiveBounds,
       styles,
       bounds: combinedBounds,
       pageBounds,
@@ -775,7 +800,9 @@ function emitSegmentsFromPath(
   styleFlags: number,
   allowSegmentMerge: boolean,
   endpoints: Float4Builder,
+  primitiveMeta: Float4Builder,
   styles: Float4Builder,
+  primitiveBounds: Float4Builder,
   bounds: Bounds
 ): number {
   let sourceSegmentCount = 0;
@@ -791,18 +818,45 @@ function emitSegmentsFromPath(
   let pendingY1 = 0;
   let hasPending = false;
 
+  const emitPrimitive = (
+    p0x: number,
+    p0y: number,
+    p1x: number,
+    p1y: number,
+    p2x: number,
+    p2y: number,
+    primitiveType: number
+  ): void => {
+    endpoints.push(p0x, p0y, p1x, p1y);
+    primitiveMeta.push(p2x, p2y, primitiveType, 0);
+    styles.push(halfWidth, luma, alpha, styleFlags);
+
+    const minX = Math.min(p0x, p1x, p2x);
+    const minY = Math.min(p0y, p1y, p2y);
+    const maxX = Math.max(p0x, p1x, p2x);
+    const maxY = Math.max(p0y, p1y, p2y);
+    primitiveBounds.push(minX, minY, maxX, maxY);
+
+    bounds.minX = Math.min(bounds.minX, minX);
+    bounds.minY = Math.min(bounds.minY, minY);
+    bounds.maxX = Math.max(bounds.maxX, maxX);
+    bounds.maxY = Math.max(bounds.maxY, maxY);
+  };
+
   const flushPending = (): void => {
     if (!hasPending) {
       return;
     }
 
-    endpoints.push(pendingX0, pendingY0, pendingX1, pendingY1);
-    styles.push(halfWidth, luma, alpha, styleFlags);
-
-    bounds.minX = Math.min(bounds.minX, pendingX0, pendingX1);
-    bounds.minY = Math.min(bounds.minY, pendingY0, pendingY1);
-    bounds.maxX = Math.max(bounds.maxX, pendingX0, pendingX1);
-    bounds.maxY = Math.max(bounds.maxY, pendingY0, pendingY1);
+    emitPrimitive(
+      pendingX0,
+      pendingY0,
+      pendingX1,
+      pendingY1,
+      pendingX1,
+      pendingY1,
+      STROKE_PRIMITIVE_LINE
+    );
 
     hasPending = false;
   };
@@ -870,13 +924,21 @@ function emitSegmentsFromPath(
       return;
     }
 
-    endpoints.push(x0, y0, x1, y1);
-    styles.push(halfWidth, luma, alpha, styleFlags);
+    emitPrimitive(x0, y0, x1, y1, x1, y1, STROKE_PRIMITIVE_LINE);
+  };
 
-    bounds.minX = Math.min(bounds.minX, x0, x1);
-    bounds.minY = Math.min(bounds.minY, y0, y1);
-    bounds.maxX = Math.max(bounds.maxX, x0, x1);
-    bounds.maxY = Math.max(bounds.maxY, y0, y1);
+  const emitQuadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number): void => {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const cdx = cx - x0;
+    const cdy = cy - y0;
+    if (dx * dx + dy * dy < 1e-10 && cdx * cdx + cdy * cdy < 1e-10) {
+      return;
+    }
+
+    sourceSegmentCount += 1;
+    flushPending();
+    emitPrimitive(x0, y0, cx, cy, x1, y1, STROKE_PRIMITIVE_QUADRATIC);
   };
 
   for (let i = 0; i < pathData.length; ) {
@@ -916,7 +978,7 @@ function emitSegmentsFromPath(
       const [t2x, t2y] = applyMatrix(matrix, x2, y2);
       const [t3x, t3y] = applyMatrix(matrix, x3, y3);
 
-      flattenCubic(
+      emitCubicAsQuadratics(
         t0x,
         t0y,
         t1x,
@@ -925,9 +987,9 @@ function emitSegmentsFromPath(
         t2y,
         t3x,
         t3y,
-        (ax, ay, bx, by) => emitLine(ax, ay, bx, by, false),
-        CURVE_FLATNESS,
-        MAX_CURVE_SPLIT_DEPTH
+        emitQuadratic,
+        FILL_CUBIC_TO_QUAD_ERROR,
+        MAX_FILL_CUBIC_TO_QUAD_DEPTH
       );
 
       cursorX = x3;
@@ -936,37 +998,19 @@ function emitSegmentsFromPath(
     }
 
     if (op === DRAW_QUAD_TO) {
-      const x1 = pathData[i++];
-      const y1 = pathData[i++];
-      const x2 = pathData[i++];
-      const y2 = pathData[i++];
-
-      const c1x = cursorX + (2 / 3) * (x1 - cursorX);
-      const c1y = cursorY + (2 / 3) * (y1 - cursorY);
-      const c2x = x2 + (2 / 3) * (x1 - x2);
-      const c2y = y2 + (2 / 3) * (y1 - y2);
+      const cx = pathData[i++];
+      const cy = pathData[i++];
+      const x = pathData[i++];
+      const y = pathData[i++];
 
       const [t0x, t0y] = applyMatrix(matrix, cursorX, cursorY);
-      const [t1x, t1y] = applyMatrix(matrix, c1x, c1y);
-      const [t2x, t2y] = applyMatrix(matrix, c2x, c2y);
-      const [t3x, t3y] = applyMatrix(matrix, x2, y2);
+      const [tcx, tcy] = applyMatrix(matrix, cx, cy);
+      const [t1x, t1y] = applyMatrix(matrix, x, y);
 
-      flattenCubic(
-        t0x,
-        t0y,
-        t1x,
-        t1y,
-        t2x,
-        t2y,
-        t3x,
-        t3y,
-        (ax, ay, bx, by) => emitLine(ax, ay, bx, by, false),
-        CURVE_FLATNESS,
-        MAX_CURVE_SPLIT_DEPTH
-      );
+      emitQuadratic(t0x, t0y, tcx, tcy, t1x, t1y);
 
-      cursorX = x2;
-      cursorY = y2;
+      cursorX = x;
+      cursorY = y;
       continue;
     }
 
@@ -1000,7 +1044,8 @@ function emitFilledPathFromPath(
   metaA: Float4Builder,
   metaB: Float4Builder,
   metaC: Float4Builder,
-  segments: Float4Builder,
+  segmentsA: Float4Builder,
+  segmentsB: Float4Builder,
   bounds: Bounds
 ): boolean {
   let cursorX = 0;
@@ -1009,8 +1054,8 @@ function emitFilledPathFromPath(
   let startY = 0;
   let hasStart = false;
 
-  const segmentStart = segments.quadCount;
-  let segmentCount = 0;
+  const segmentStart = segmentsA.quadCount;
+  let primitiveCount = 0;
 
   const localBounds: Bounds = {
     minX: Number.POSITIVE_INFINITY,
@@ -1026,13 +1071,33 @@ function emitFilledPathFromPath(
       return;
     }
 
-    segments.push(x0, y0, x1, y1);
-    segmentCount += 1;
+    segmentsA.push(x0, y0, x1, y1);
+    segmentsB.push(x1, y1, FILL_PRIMITIVE_LINE, 0);
+    primitiveCount += 1;
 
     localBounds.minX = Math.min(localBounds.minX, x0, x1);
     localBounds.minY = Math.min(localBounds.minY, y0, y1);
     localBounds.maxX = Math.max(localBounds.maxX, x0, x1);
     localBounds.maxY = Math.max(localBounds.maxY, y0, y1);
+  };
+
+  const emitQuadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number): void => {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const cdx = cx - x0;
+    const cdy = cy - y0;
+    if (dx * dx + dy * dy < 1e-12 && cdx * cdx + cdy * cdy < 1e-12) {
+      return;
+    }
+
+    segmentsA.push(x0, y0, cx, cy);
+    segmentsB.push(x1, y1, FILL_PRIMITIVE_QUADRATIC, 0);
+    primitiveCount += 1;
+
+    localBounds.minX = Math.min(localBounds.minX, x0, cx, x1);
+    localBounds.minY = Math.min(localBounds.minY, y0, cy, y1);
+    localBounds.maxX = Math.max(localBounds.maxX, x0, cx, x1);
+    localBounds.maxY = Math.max(localBounds.maxY, y0, cy, y1);
   };
 
   const closeSubpath = (): void => {
@@ -1085,7 +1150,7 @@ function emitFilledPathFromPath(
       const [t2x, t2y] = applyMatrix(matrix, x2, y2);
       const [t3x, t3y] = applyMatrix(matrix, x3, y3);
 
-      flattenCubic(
+      emitCubicAsQuadratics(
         t0x,
         t0y,
         t1x,
@@ -1094,9 +1159,9 @@ function emitFilledPathFromPath(
         t2y,
         t3x,
         t3y,
-        emitLine,
-        FILL_CURVE_FLATNESS,
-        MAX_FILL_CURVE_SPLIT_DEPTH
+        emitQuadratic,
+        FILL_CUBIC_TO_QUAD_ERROR,
+        MAX_FILL_CUBIC_TO_QUAD_DEPTH
       );
 
       cursorX = x3;
@@ -1105,37 +1170,19 @@ function emitFilledPathFromPath(
     }
 
     if (op === DRAW_QUAD_TO) {
-      const x1 = pathData[i++];
-      const y1 = pathData[i++];
-      const x2 = pathData[i++];
-      const y2 = pathData[i++];
-
-      const c1x = cursorX + (2 / 3) * (x1 - cursorX);
-      const c1y = cursorY + (2 / 3) * (y1 - cursorY);
-      const c2x = x2 + (2 / 3) * (x1 - x2);
-      const c2y = y2 + (2 / 3) * (y1 - y2);
+      const cx = pathData[i++];
+      const cy = pathData[i++];
+      const x = pathData[i++];
+      const y = pathData[i++];
 
       const [t0x, t0y] = applyMatrix(matrix, cursorX, cursorY);
-      const [t1x, t1y] = applyMatrix(matrix, c1x, c1y);
-      const [t2x, t2y] = applyMatrix(matrix, c2x, c2y);
-      const [t3x, t3y] = applyMatrix(matrix, x2, y2);
+      const [tcx, tcy] = applyMatrix(matrix, cx, cy);
+      const [t1x, t1y] = applyMatrix(matrix, x, y);
 
-      flattenCubic(
-        t0x,
-        t0y,
-        t1x,
-        t1y,
-        t2x,
-        t2y,
-        t3x,
-        t3y,
-        emitLine,
-        FILL_CURVE_FLATNESS,
-        MAX_FILL_CURVE_SPLIT_DEPTH
-      );
+      emitQuadratic(t0x, t0y, tcx, tcy, t1x, t1y);
 
-      cursorX = x2;
-      cursorY = y2;
+      cursorX = x;
+      cursorY = y;
       continue;
     }
 
@@ -1150,11 +1197,11 @@ function emitFilledPathFromPath(
 
   closeSubpath();
 
-  if (segmentCount === 0) {
+  if (primitiveCount === 0) {
     return false;
   }
 
-  metaA.push(segmentStart, segmentCount, localBounds.minX, localBounds.minY);
+  metaA.push(segmentStart, primitiveCount, localBounds.minX, localBounds.minY);
   metaB.push(localBounds.maxX, localBounds.maxY, luma, alpha);
   metaC.push(fillRule, hasCompanionStroke ? 1 : 0, 0, 0);
 
@@ -1178,6 +1225,8 @@ interface CoverageCandidate {
 interface InvisibleCullResult {
   segmentCount: number;
   endpoints: Float32Array;
+  primitiveMeta: Float32Array;
+  primitiveBounds: Float32Array;
   styles: Float32Array;
   bounds: Bounds;
   maxHalfWidth: number;
@@ -1187,7 +1236,12 @@ interface InvisibleCullResult {
   discardedContainedCount: number;
 }
 
-function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): InvisibleCullResult {
+function cullInvisibleSegments(
+  endpoints: Float32Array,
+  primitiveMeta: Float32Array,
+  styles: Float32Array,
+  primitiveBounds: Float32Array
+): InvisibleCullResult {
   const segmentCount = endpoints.length >> 2;
   const keepMask = new Uint8Array(segmentCount);
   const seenDuplicates = new Set<string>();
@@ -1202,8 +1256,12 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
     const offset = i * 4;
     const x0 = endpoints[offset];
     const y0 = endpoints[offset + 1];
-    const x1 = endpoints[offset + 2];
-    const y1 = endpoints[offset + 3];
+    const cx = endpoints[offset + 2];
+    const cy = endpoints[offset + 3];
+    const x1 = primitiveMeta[offset];
+    const y1 = primitiveMeta[offset + 1];
+    const primitiveType = primitiveMeta[offset + 2];
+    const isQuadratic = primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5;
 
     const halfWidth = styles[offset];
     const luma = styles[offset + 1];
@@ -1215,15 +1273,27 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
       continue;
     }
 
-    const dx = x1 - x0;
-    const dy = y1 - y0;
-    const lenSq = dx * dx + dy * dy;
-    if (lenSq < 1e-10) {
+    const curveLength = isQuadratic
+      ? Math.hypot(cx - x0, cy - y0) + Math.hypot(x1 - cx, y1 - cy)
+      : Math.hypot(x1 - x0, y1 - y0);
+    if (curveLength < 1e-5) {
       discardedDegenerateCount += 1;
       continue;
     }
 
-    const duplicateKey = buildDuplicateKey(x0, y0, x1, y1, halfWidth, luma, alpha, styleFlags);
+    const duplicateKey = buildDuplicateKey(
+      x0,
+      y0,
+      cx,
+      cy,
+      x1,
+      y1,
+      primitiveType,
+      halfWidth,
+      luma,
+      alpha,
+      styleFlags
+    );
     if (seenDuplicates.has(duplicateKey)) {
       discardedDuplicateCount += 1;
       continue;
@@ -1232,12 +1302,13 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
 
     keepMask[i] = 1;
 
-    const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, luma, alpha, styleFlags);
-    let bucket = coverageGroups.get(coverage.key);
-    if (!bucket) {
-      bucket = [];
-      coverageGroups.set(coverage.key, bucket);
-    }
+    if (!isQuadratic) {
+      const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, luma, alpha, styleFlags);
+      let bucket = coverageGroups.get(coverage.key);
+      if (!bucket) {
+        bucket = [];
+        coverageGroups.set(coverage.key, bucket);
+      }
       bucket.push({
         index: coverage.index,
         start: coverage.start,
@@ -1246,6 +1317,7 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
         alpha: coverage.alpha,
         styleFlags: coverage.styleFlags
       });
+    }
   }
 
   for (const candidates of coverageGroups.values()) {
@@ -1306,6 +1378,8 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
     return {
       segmentCount: 0,
       endpoints: new Float32Array(0),
+      primitiveMeta: new Float32Array(0),
+      primitiveBounds: new Float32Array(0),
       styles: new Float32Array(0),
       bounds: {
         minX: 0,
@@ -1322,6 +1396,8 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
   }
 
   const outEndpoints = new Float32Array(visibleCount * 4);
+  const outPrimitiveMeta = new Float32Array(visibleCount * 4);
+  const outPrimitiveBounds = new Float32Array(visibleCount * 4);
   const outStyles = new Float32Array(visibleCount * 4);
   const outBounds: Bounds = {
     minX: Number.POSITIVE_INFINITY,
@@ -1342,24 +1418,36 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
 
     const x0 = endpoints[inOffset];
     const y0 = endpoints[inOffset + 1];
-    const x1 = endpoints[inOffset + 2];
-    const y1 = endpoints[inOffset + 3];
+    const minX = primitiveBounds[inOffset];
+    const minY = primitiveBounds[inOffset + 1];
+    const maxX = primitiveBounds[inOffset + 2];
+    const maxY = primitiveBounds[inOffset + 3];
     const halfWidth = styles[inOffset];
 
     outEndpoints[outOffset] = x0;
     outEndpoints[outOffset + 1] = y0;
-    outEndpoints[outOffset + 2] = x1;
-    outEndpoints[outOffset + 3] = y1;
+    outEndpoints[outOffset + 2] = endpoints[inOffset + 2];
+    outEndpoints[outOffset + 3] = endpoints[inOffset + 3];
+
+    outPrimitiveMeta[outOffset] = primitiveMeta[inOffset];
+    outPrimitiveMeta[outOffset + 1] = primitiveMeta[inOffset + 1];
+    outPrimitiveMeta[outOffset + 2] = primitiveMeta[inOffset + 2];
+    outPrimitiveMeta[outOffset + 3] = primitiveMeta[inOffset + 3];
+
+    outPrimitiveBounds[outOffset] = minX;
+    outPrimitiveBounds[outOffset + 1] = minY;
+    outPrimitiveBounds[outOffset + 2] = maxX;
+    outPrimitiveBounds[outOffset + 3] = maxY;
 
     outStyles[outOffset] = styles[inOffset];
     outStyles[outOffset + 1] = styles[inOffset + 1];
     outStyles[outOffset + 2] = styles[inOffset + 2];
     outStyles[outOffset + 3] = styles[inOffset + 3];
 
-    outBounds.minX = Math.min(outBounds.minX, x0, x1);
-    outBounds.minY = Math.min(outBounds.minY, y0, y1);
-    outBounds.maxX = Math.max(outBounds.maxX, x0, x1);
-    outBounds.maxY = Math.max(outBounds.maxY, y0, y1);
+    outBounds.minX = Math.min(outBounds.minX, minX);
+    outBounds.minY = Math.min(outBounds.minY, minY);
+    outBounds.maxX = Math.max(outBounds.maxX, maxX);
+    outBounds.maxY = Math.max(outBounds.maxY, maxY);
 
     maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
     out += 1;
@@ -1368,6 +1456,8 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
   return {
     segmentCount: visibleCount,
     endpoints: outEndpoints,
+    primitiveMeta: outPrimitiveMeta,
+    primitiveBounds: outPrimitiveBounds,
     styles: outStyles,
     bounds: outBounds,
     maxHalfWidth,
@@ -1381,32 +1471,47 @@ function cullInvisibleSegments(endpoints: Float32Array, styles: Float32Array): I
 function buildDuplicateKey(
   x0: number,
   y0: number,
+  cx: number,
+  cy: number,
   x1: number,
   y1: number,
+  primitiveType: number,
   halfWidth: number,
   luma: number,
   alpha: number,
   styleFlags: number
 ): string {
+  const isQuadratic = primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5;
+
   let ax = x0;
   let ay = y0;
   let bx = x1;
   let by = y1;
+  let qcx = cx;
+  let qcy = cy;
 
-  if (ax > bx || (ax === bx && ay > by)) {
+  if (!isQuadratic && (ax > bx || (ax === bx && ay > by))) {
     ax = x1;
     ay = y1;
     bx = x0;
     by = y0;
   }
 
+  if (!isQuadratic) {
+    qcx = bx;
+    qcy = by;
+  }
+
   return [
+    quantize(primitiveType, 10),
     quantize(halfWidth, DUPLICATE_STYLE_SCALE),
     quantize(luma, DUPLICATE_STYLE_SCALE),
     quantize(alpha, DUPLICATE_STYLE_SCALE),
     quantize(styleFlags, 1),
     quantize(ax, DUPLICATE_POSITION_SCALE),
     quantize(ay, DUPLICATE_POSITION_SCALE),
+    quantize(qcx, DUPLICATE_POSITION_SCALE),
+    quantize(qcy, DUPLICATE_POSITION_SCALE),
     quantize(bx, DUPLICATE_POSITION_SCALE),
     quantize(by, DUPLICATE_POSITION_SCALE)
   ].join("|");

@@ -10,6 +10,8 @@ layout(location = 1) in float aSegmentIndex;
 
 uniform sampler2D uSegmentTexA;
 uniform sampler2D uSegmentTexB;
+uniform sampler2D uSegmentStyleTex;
+uniform sampler2D uSegmentBoundsTex;
 uniform ivec2 uSegmentTexSize;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
@@ -17,11 +19,14 @@ uniform float uZoom;
 uniform float uAAScreenPx;
 
 out vec2 vLocal;
-out float vHalfLength;
-out float vHalfWidth;
-out float vAAWorld;
-out float vLuma;
-out float vAlpha;
+flat out vec2 vP0;
+flat out vec2 vP1;
+flat out vec2 vP2;
+flat out float vPrimitiveType;
+flat out float vHalfWidth;
+flat out float vAAWorld;
+flat out float vLuma;
+flat out float vAlpha;
 
 ivec2 segmentCoord(int index) {
   int x = index % uSegmentTexSize.x;
@@ -31,34 +36,39 @@ ivec2 segmentCoord(int index) {
 
 void main() {
   int index = int(aSegmentIndex + 0.5);
-  vec4 endpoints = texelFetch(uSegmentTexA, segmentCoord(index), 0);
-  vec4 style = texelFetch(uSegmentTexB, segmentCoord(index), 0);
+  vec4 primitiveA = texelFetch(uSegmentTexA, segmentCoord(index), 0);
+  vec4 primitiveB = texelFetch(uSegmentTexB, segmentCoord(index), 0);
+  vec4 style = texelFetch(uSegmentStyleTex, segmentCoord(index), 0);
+  vec4 primitiveBounds = texelFetch(uSegmentBoundsTex, segmentCoord(index), 0);
 
-  vec2 p0 = endpoints.xy;
-  vec2 p1 = endpoints.zw;
+  vec2 p0 = primitiveA.xy;
+  vec2 p1 = primitiveA.zw;
+  vec2 p2 = primitiveB.xy;
+  float primitiveType = primitiveB.z;
+  bool isQuadratic = primitiveType >= 0.5;
   float halfWidth = style.x;
   float luma = style.y;
   float alpha = style.z;
   float styleFlags = style.w;
   bool isHairline = styleFlags >= 0.5;
 
-  vec2 delta = p1 - p0;
-  float lengthValue = length(delta);
+  float geometryLength = isQuadratic
+    ? length(p1 - p0) + length(p2 - p1)
+    : length(p2 - p0);
 
-  if (lengthValue < 1e-5 || alpha <= 0.001) {
+  if (geometryLength < 1e-5 || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vLocal = vec2(0.0);
-    vHalfLength = 0.0;
+    vP0 = vec2(0.0);
+    vP1 = vec2(0.0);
+    vP2 = vec2(0.0);
+    vPrimitiveType = 0.0;
     vHalfWidth = 0.0;
     vAAWorld = 1.0;
     vLuma = luma;
     vAlpha = 0.0;
     return;
   }
-
-  vec2 tangent = delta / lengthValue;
-  vec2 normal = vec2(-tangent.y, tangent.x);
-  float halfLength = 0.5 * lengthValue;
 
   if (isHairline) {
     halfWidth = max(0.5 / max(uZoom, 1e-4), 1e-5);
@@ -68,20 +78,23 @@ void main() {
   if (isHairline) {
     aaWorld = max(0.35 / max(uZoom, 1e-4), 5e-5);
   }
-  float halfExtentNormal = halfWidth + aaWorld;
-  float halfExtentTangent = halfLength + halfExtentNormal;
-  vec2 local = vec2(aCorner.x * halfExtentTangent, aCorner.y * halfExtentNormal);
 
-  vec2 center = 0.5 * (p0 + p1);
-  vec2 worldPosition = center + tangent * local.x + normal * local.y;
+  float extent = halfWidth + aaWorld;
+  vec2 worldMin = primitiveBounds.xy - vec2(extent);
+  vec2 worldMax = primitiveBounds.zw + vec2(extent);
+  vec2 corner01 = aCorner * 0.5 + 0.5;
+  vec2 worldPosition = mix(worldMin, worldMax, corner01);
 
   vec2 screen = (worldPosition - uCameraCenter) * uZoom + 0.5 * uViewport;
   vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
 
   gl_Position = vec4(clip, 0.0, 1.0);
 
-  vLocal = local;
-  vHalfLength = halfLength;
+  vLocal = worldPosition;
+  vP0 = p0;
+  vP1 = p1;
+  vP2 = p2;
+  vPrimitiveType = primitiveType;
   vHalfWidth = halfWidth;
   vAAWorld = aaWorld;
   vLuma = luma;
@@ -92,22 +105,84 @@ void main() {
 const FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 in vec2 vLocal;
-in float vHalfLength;
-in float vHalfWidth;
-in float vAAWorld;
-in float vLuma;
-in float vAlpha;
+flat in vec2 vP0;
+flat in vec2 vP1;
+flat in vec2 vP2;
+flat in float vPrimitiveType;
+flat in float vHalfWidth;
+flat in float vAAWorld;
+flat in float vLuma;
+flat in float vAlpha;
 
 out vec4 outColor;
+
+float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
+  vec2 ab = b - a;
+  float abLenSq = dot(ab, ab);
+  if (abLenSq <= 1e-10) {
+    return length(p - a);
+  }
+  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
+  return length(p - (a + ab * t));
+}
+
+float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
+  vec2 aa = b - a;
+  vec2 bb = a - 2.0 * b + c;
+  vec2 cc = aa * 2.0;
+  vec2 dd = a - p;
+
+  float bbLenSq = dot(bb, bb);
+  if (bbLenSq <= 1e-12) {
+    return distanceToLineSegment(p, a, c);
+  }
+
+  float inv = 1.0 / bbLenSq;
+  float kx = inv * dot(aa, bb);
+  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
+  float kz = inv * dot(dd, aa);
+
+  float pValue = ky - kx * kx;
+  float pCube = pValue * pValue * pValue;
+  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+  float hValue = qValue * qValue + 4.0 * pCube;
+
+  float best = 1e20;
+
+  if (hValue >= 0.0) {
+    float hSqrt = sqrt(hValue);
+    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
+    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
+    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    vec2 delta = dd + (cc + bb * t) * t;
+    best = dot(delta, delta);
+  } else {
+    float z = sqrt(-pValue);
+    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
+    float angle = acos(acosArg) / 3.0;
+    float cosine = cos(angle);
+    float sine = sin(angle) * 1.732050808;
+    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
+
+    vec2 delta = dd + (cc + bb * t.x) * t.x;
+    best = min(best, dot(delta, delta));
+    delta = dd + (cc + bb * t.y) * t.y;
+    best = min(best, dot(delta, delta));
+    delta = dd + (cc + bb * t.z) * t.z;
+    best = min(best, dot(delta, delta));
+  }
+
+  return sqrt(max(best, 0.0));
+}
 
 void main() {
   if (vAlpha <= 0.001) {
     discard;
   }
 
-  float dx = max(abs(vLocal.x) - vHalfLength, 0.0);
-  float dy = abs(vLocal.y);
-  float distanceToSegment = length(vec2(dx, dy));
+  float distanceToSegment = vPrimitiveType >= 0.5
+    ? distanceToQuadraticBezier(vLocal, vP0, vP1, vP2)
+    : distanceToLineSegment(vLocal, vP0, vP2);
 
   float coverage = 1.0 - smoothstep(vHalfWidth - vAAWorld, vHalfWidth + vAAWorld, distanceToSegment);
   float alpha = coverage * vAlpha;
@@ -193,7 +268,8 @@ const FILL_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 precision highp sampler2D;
 
-uniform sampler2D uFillSegmentTex;
+uniform sampler2D uFillSegmentTexA;
+uniform sampler2D uFillSegmentTexB;
 uniform ivec2 uFillSegmentTexSize;
 uniform float uFillAAScreenPx;
 
@@ -207,12 +283,107 @@ in vec2 vLocal;
 
 out vec4 outColor;
 
-const int MAX_FILL_PATH_SEGMENTS = 1024;
+const int MAX_FILL_PATH_PRIMITIVES = 2048;
+const float FILL_PRIMITIVE_QUADRATIC = 1.0;
+const int QUAD_WINDING_SUBDIVISIONS = 6;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
   int y = index / sizeValue.x;
   return ivec2(x, y);
+}
+
+float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
+  vec2 ab = b - a;
+  float abLenSq = dot(ab, ab);
+  if (abLenSq <= 1e-10) {
+    return length(p - a);
+  }
+  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
+  return length(p - (a + ab * t));
+}
+
+float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
+  vec2 aa = b - a;
+  vec2 bb = a - 2.0 * b + c;
+  vec2 cc = aa * 2.0;
+  vec2 dd = a - p;
+
+  float bbLenSq = dot(bb, bb);
+  if (bbLenSq <= 1e-12) {
+    return distanceToLineSegment(p, a, c);
+  }
+
+  float inv = 1.0 / bbLenSq;
+  float kx = inv * dot(aa, bb);
+  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
+  float kz = inv * dot(dd, aa);
+
+  float pValue = ky - kx * kx;
+  float pCube = pValue * pValue * pValue;
+  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+  float hValue = qValue * qValue + 4.0 * pCube;
+
+  float best = 1e20;
+
+  if (hValue >= 0.0) {
+    float hSqrt = sqrt(hValue);
+    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
+    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
+    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    vec2 delta = dd + (cc + bb * t) * t;
+    best = dot(delta, delta);
+  } else {
+    float z = sqrt(-pValue);
+    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
+    float angle = acos(acosArg) / 3.0;
+    float cosine = cos(angle);
+    float sine = sin(angle) * 1.732050808;
+    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
+
+    vec2 delta = dd + (cc + bb * t.x) * t.x;
+    best = min(best, dot(delta, delta));
+    delta = dd + (cc + bb * t.y) * t.y;
+    best = min(best, dot(delta, delta));
+    delta = dd + (cc + bb * t.z) * t.z;
+    best = min(best, dot(delta, delta));
+  }
+
+  return sqrt(max(best, 0.0));
+}
+
+vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
+  float oneMinusT = 1.0 - t;
+  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
+}
+
+void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding, inout int crossings) {
+  bool upward = (a.y <= p.y) && (b.y > p.y);
+  bool downward = (a.y > p.y) && (b.y <= p.y);
+  if (!upward && !downward) {
+    return;
+  }
+
+  float denom = b.y - a.y;
+  if (abs(denom) <= 1e-6) {
+    return;
+  }
+
+  float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
+  if (xCross > p.x) {
+    crossings += 1;
+    winding += upward ? 1 : -1;
+  }
+}
+
+void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding, inout int crossings) {
+  vec2 prev = a;
+  for (int i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i += 1) {
+    float t = float(i) / float(QUAD_WINDING_SUBDIVISIONS);
+    vec2 next = evaluateQuadratic(a, b, c, t);
+    accumulateLineCrossing(prev, next, p, winding, crossings);
+    prev = next;
+  }
 }
 
 void main() {
@@ -224,34 +395,24 @@ void main() {
   int winding = 0;
   int crossings = 0;
 
-  for (int i = 0; i < MAX_FILL_PATH_SEGMENTS; i += 1) {
+  for (int i = 0; i < MAX_FILL_PATH_PRIMITIVES; i += 1) {
     if (i >= vSegmentCount) {
       break;
     }
 
-    vec4 segment = texelFetch(uFillSegmentTex, coordFromIndex(vSegmentStart + i, uFillSegmentTexSize), 0);
-    vec2 a = segment.xy;
-    vec2 b = segment.zw;
-    vec2 ab = b - a;
-    vec2 ap = vLocal - a;
-    float abLenSq = dot(ab, ab);
+    vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(vSegmentStart + i, uFillSegmentTexSize), 0);
+    vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(vSegmentStart + i, uFillSegmentTexSize), 0);
+    vec2 p0 = primitiveA.xy;
+    vec2 p1 = primitiveA.zw;
+    vec2 p2 = primitiveB.xy;
+    float primitiveType = primitiveB.z;
 
-    if (abLenSq > 1e-10) {
-      float t = clamp(dot(ap, ab) / abLenSq, 0.0, 1.0);
-      vec2 closest = a + t * ab;
-      minDistance = min(minDistance, length(vLocal - closest));
-    }
-
-    bool crosses = (a.y <= vLocal.y && b.y > vLocal.y) || (b.y <= vLocal.y && a.y > vLocal.y);
-    if (crosses) {
-      float denom = b.y - a.y;
-      if (abs(denom) > 1e-6) {
-        float xCross = a.x + (vLocal.y - a.y) * (b.x - a.x) / denom;
-        if (xCross > vLocal.x) {
-          crossings += 1;
-          winding += (b.y > a.y) ? 1 : -1;
-        }
-      }
+    if (primitiveType >= FILL_PRIMITIVE_QUADRATIC) {
+      minDistance = min(minDistance, distanceToQuadraticBezier(vLocal, p0, p1, p2));
+      accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding, crossings);
+    } else {
+      minDistance = min(minDistance, distanceToLineSegment(vLocal, p0, p2));
+      accumulateLineCrossing(p0, p2, vLocal, winding, crossings);
     }
   }
 
@@ -620,13 +781,19 @@ export class GpuFloorplanRenderer {
 
   private readonly segmentTextureB: WebGLTexture;
 
+  private readonly segmentTextureC: WebGLTexture;
+
+  private readonly segmentTextureD: WebGLTexture;
+
   private readonly fillPathMetaTextureA: WebGLTexture;
 
   private readonly fillPathMetaTextureB: WebGLTexture;
 
   private readonly fillPathMetaTextureC: WebGLTexture;
 
-  private readonly fillSegmentTexture: WebGLTexture;
+  private readonly fillSegmentTextureA: WebGLTexture;
+
+  private readonly fillSegmentTextureB: WebGLTexture;
 
   private readonly textInstanceTextureA: WebGLTexture;
 
@@ -644,6 +811,10 @@ export class GpuFloorplanRenderer {
 
   private readonly uSegmentTexB: WebGLUniformLocation;
 
+  private readonly uSegmentStyleTex: WebGLUniformLocation;
+
+  private readonly uSegmentBoundsTex: WebGLUniformLocation;
+
   private readonly uSegmentTexSize: WebGLUniformLocation;
 
   private readonly uViewport: WebGLUniformLocation;
@@ -660,7 +831,9 @@ export class GpuFloorplanRenderer {
 
   private readonly uFillPathMetaTexC: WebGLUniformLocation;
 
-  private readonly uFillSegmentTex: WebGLUniformLocation;
+  private readonly uFillSegmentTexA: WebGLUniformLocation;
+
+  private readonly uFillSegmentTexB: WebGLUniformLocation;
 
   private readonly uFillPathMetaTexSize: WebGLUniformLocation;
 
@@ -845,10 +1018,13 @@ export class GpuFloorplanRenderer {
 
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
+    this.segmentTextureC = this.mustCreateTexture();
+    this.segmentTextureD = this.mustCreateTexture();
     this.fillPathMetaTextureA = this.mustCreateTexture();
     this.fillPathMetaTextureB = this.mustCreateTexture();
     this.fillPathMetaTextureC = this.mustCreateTexture();
-    this.fillSegmentTexture = this.mustCreateTexture();
+    this.fillSegmentTextureA = this.mustCreateTexture();
+    this.fillSegmentTextureB = this.mustCreateTexture();
     this.textInstanceTextureA = this.mustCreateTexture();
     this.textInstanceTextureB = this.mustCreateTexture();
     this.textGlyphMetaTextureA = this.mustCreateTexture();
@@ -858,6 +1034,8 @@ export class GpuFloorplanRenderer {
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
+    this.uSegmentStyleTex = this.mustGetUniformLocation(this.segmentProgram, "uSegmentStyleTex");
+    this.uSegmentBoundsTex = this.mustGetUniformLocation(this.segmentProgram, "uSegmentBoundsTex");
     this.uSegmentTexSize = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexSize");
     this.uViewport = this.mustGetUniformLocation(this.segmentProgram, "uViewport");
     this.uCameraCenter = this.mustGetUniformLocation(this.segmentProgram, "uCameraCenter");
@@ -867,7 +1045,8 @@ export class GpuFloorplanRenderer {
     this.uFillPathMetaTexA = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexA");
     this.uFillPathMetaTexB = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexB");
     this.uFillPathMetaTexC = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexC");
-    this.uFillSegmentTex = this.mustGetUniformLocation(this.fillProgram, "uFillSegmentTex");
+    this.uFillSegmentTexA = this.mustGetUniformLocation(this.fillProgram, "uFillSegmentTexA");
+    this.uFillSegmentTexB = this.mustGetUniformLocation(this.fillProgram, "uFillSegmentTexB");
     this.uFillPathMetaTexSize = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexSize");
     this.uFillSegmentTexSize = this.mustGetUniformLocation(this.fillProgram, "uFillSegmentTexSize");
     this.uFillViewport = this.mustGetUniformLocation(this.fillProgram, "uViewport");
@@ -1235,12 +1414,15 @@ export class GpuFloorplanRenderer {
     gl.activeTexture(gl.TEXTURE9);
     gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureC);
     gl.activeTexture(gl.TEXTURE10);
-    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTexture);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTextureA);
+    gl.activeTexture(gl.TEXTURE11);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTextureB);
 
     gl.uniform1i(this.uFillPathMetaTexA, 7);
     gl.uniform1i(this.uFillPathMetaTexB, 8);
     gl.uniform1i(this.uFillPathMetaTexC, 9);
-    gl.uniform1i(this.uFillSegmentTex, 10);
+    gl.uniform1i(this.uFillSegmentTexA, 10);
+    gl.uniform1i(this.uFillSegmentTexB, 11);
     gl.uniform2i(this.uFillPathMetaTexSize, this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight);
     gl.uniform2i(this.uFillSegmentTexSize, this.fillSegmentTextureWidth, this.fillSegmentTextureHeight);
     gl.uniform2f(this.uFillViewport, viewportWidth, viewportHeight);
@@ -1278,9 +1460,15 @@ export class GpuFloorplanRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureA);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureB);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureC);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureD);
 
     gl.uniform1i(this.uSegmentTexA, 0);
     gl.uniform1i(this.uSegmentTexB, 1);
+    gl.uniform1i(this.uSegmentStyleTex, 2);
+    gl.uniform1i(this.uSegmentBoundsTex, 3);
     gl.uniform2i(this.uSegmentTexSize, this.segmentTextureWidth, this.segmentTextureHeight);
     gl.uniform2f(this.uViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
@@ -1559,8 +1747,11 @@ export class GpuFloorplanRenderer {
     const pathMetaCData = new Float32Array(pathTexelCount * 4);
     pathMetaCData.set(scene.fillPathMetaC);
 
-    const segmentData = new Float32Array(segmentTexelCount * 4);
-    segmentData.set(scene.fillSegments);
+    const segmentDataA = new Float32Array(segmentTexelCount * 4);
+    segmentDataA.set(scene.fillSegmentsA);
+
+    const segmentDataB = new Float32Array(segmentTexelCount * 4);
+    segmentDataB.set(scene.fillSegmentsB);
 
     gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureA);
     configureFloatTexture(gl);
@@ -1604,7 +1795,7 @@ export class GpuFloorplanRenderer {
       pathMetaCData
     );
 
-    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTexture);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTextureA);
     configureFloatTexture(gl);
     gl.texImage2D(
       gl.TEXTURE_2D,
@@ -1615,7 +1806,21 @@ export class GpuFloorplanRenderer {
       0,
       gl.RGBA,
       gl.FLOAT,
-      segmentData
+      segmentDataA
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTextureB);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.fillSegmentTextureWidth,
+      this.fillSegmentTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      segmentDataB
     );
 
     return {
@@ -1647,8 +1852,14 @@ export class GpuFloorplanRenderer {
     const endpointsTextureData = new Float32Array(texelCount * 4);
     endpointsTextureData.set(scene.endpoints);
 
+    const primitiveMetaTextureData = new Float32Array(texelCount * 4);
+    primitiveMetaTextureData.set(scene.primitiveMeta);
+
     const styleTextureData = new Float32Array(texelCount * 4);
     styleTextureData.set(scene.styles);
+
+    const primitiveBoundsTextureData = new Float32Array(texelCount * 4);
+    primitiveBoundsTextureData.set(scene.primitiveBounds);
 
     gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureA);
     configureFloatTexture(gl);
@@ -1675,7 +1886,35 @@ export class GpuFloorplanRenderer {
       0,
       gl.RGBA,
       gl.FLOAT,
+      primitiveMetaTextureData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureC);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.segmentTextureWidth,
+      this.segmentTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
       styleTextureData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureD);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.segmentTextureWidth,
+      this.segmentTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      primitiveBoundsTextureData
     );
 
     return {
@@ -1832,18 +2071,14 @@ export class GpuFloorplanRenderer {
     }
 
     for (let i = 0; i < this.segmentCount; i += 1) {
-      const endpointOffset = i * 4;
+      const primitiveBoundsOffset = i * 4;
       const styleOffset = i * 4;
-      const x0 = scene.endpoints[endpointOffset];
-      const y0 = scene.endpoints[endpointOffset + 1];
-      const x1 = scene.endpoints[endpointOffset + 2];
-      const y1 = scene.endpoints[endpointOffset + 3];
       const margin = scene.styles[styleOffset] + 0.35;
 
-      this.segmentMinX[i] = Math.min(x0, x1) - margin;
-      this.segmentMinY[i] = Math.min(y0, y1) - margin;
-      this.segmentMaxX[i] = Math.max(x0, x1) + margin;
-      this.segmentMaxY[i] = Math.max(y0, y1) + margin;
+      this.segmentMinX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+      this.segmentMinY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+      this.segmentMaxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+      this.segmentMaxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
     }
   }
 
