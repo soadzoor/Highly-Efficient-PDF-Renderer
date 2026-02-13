@@ -1,0 +1,15 @@
+/.idea/**
+.eslintcache
+/node_modules/**
+/build/prod/**
+/build/dev/**
+/build/temp/**
+/build/offline/**
+**/node_modules/**/*
+package-lock.json
+*.DS_Store
+.DS_Store
+/src/temp/*
+*package-lock.json
+*tsconfig.tsbuildinfo
+**/dist/**/*

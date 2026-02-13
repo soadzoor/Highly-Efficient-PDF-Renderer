@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPU PDF Floorplan POC</title>
+  </head>
+  <body>
+    <canvas id="viewport"></canvas>
+    <div id="hud" class="panel">
+      <div class="toolbar">
+        <button id="open-file" type="button">Open PDF</button>
+        <input id="file-input" type="file" accept="application/pdf" hidden />
+      </div>
+      <div id="status" class="status">Loading sample floorplan...</div>
+      <div id="runtime" class="runtime"></div>
+      <div class="help">Drag to pan, mouse wheel to zoom, or drag-and-drop a PDF.</div>
+    </div>
+    <div id="drop-indicator" class="drop-indicator">Drop PDF to render</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
