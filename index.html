@@ -49,6 +49,17 @@
           <label for="max-pages-per-row">Max Pages Per Row</label>
           <input id="max-pages-per-row" type="number" min="1" max="100" step="1" value="10" />
         </div>
+        <div class="number-row number-row-color">
+          <label for="page-bg-color">Page Background</label>
+          <div class="color-controls">
+            <input id="page-bg-color" type="color" value="#ffffff" />
+            <label for="page-bg-opacity-slider" class="sr-only">Page Background Opacity Slider</label>
+            <input id="page-bg-opacity-slider" type="range" min="0" max="100" step="1" value="100" />
+            <label for="page-bg-opacity" class="sr-only">Page Background Opacity</label>
+            <input id="page-bg-opacity" type="number" min="0" max="100" step="1" value="100" />
+            <span class="color-suffix">%</span>
+          </div>
+        </div>
         <div id="status" class="status">Loading sample floorplan...</div>
         <div id="parse-loader" class="parse-loader" hidden>
           <span class="loader-spinner" aria-hidden="true"></span>

@@ -756,7 +756,7 @@ void main() {
   vec2 uv = samplePx / uCacheSizePx;
 
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
-    outColor = vec4(1.0);
+    outColor = vec4(0.627451, 0.662745, 0.686275, 1.0);
     return;
   }
 
@@ -824,6 +824,9 @@ const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const CLEAR_COLOR_R = 160 / 255;
+const CLEAR_COLOR_G = 169 / 255;
+const CLEAR_COLOR_B = 175 / 255;
 
 export interface DrawStats {
   renderedSegments: number;
@@ -933,6 +936,8 @@ export class GpuFloorplanRenderer {
   private readonly textGlyphSegmentTextureB: WebGLTexture;
 
   private readonly textRasterAtlasTexture: WebGLTexture;
+
+  private readonly pageBackgroundTexture: WebGLTexture;
 
   private readonly uSegmentTexA: WebGLUniformLocation;
 
@@ -1068,6 +1073,8 @@ export class GpuFloorplanRenderer {
 
   private rasterLayers: RasterLayerGpu[] = [];
 
+  private pageRects: Float32Array<ArrayBufferLike> = new Float32Array(0);
+
   private visibleSegmentCount = 0;
 
   private usingAllSegments = true;
@@ -1146,6 +1153,8 @@ export class GpuFloorplanRenderer {
 
   private textVectorOnly = false;
 
+  private pageBackgroundColor: [number, number, number, number] = [1, 1, 1, 1];
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
 
@@ -1198,6 +1207,7 @@ export class GpuFloorplanRenderer {
     this.textGlyphSegmentTextureA = this.mustCreateTexture();
     this.textGlyphSegmentTextureB = this.mustCreateTexture();
     this.textRasterAtlasTexture = this.mustCreateTexture();
+    this.pageBackgroundTexture = this.mustCreateTexture();
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
@@ -1256,6 +1266,7 @@ export class GpuFloorplanRenderer {
 
     this.initializeGeometry();
     this.initializeState();
+    this.uploadPageBackgroundTexture();
   }
 
   setFrameListener(listener: FrameListener | null): void {
@@ -1299,6 +1310,28 @@ export class GpuFloorplanRenderer {
     this.requestFrame();
   }
 
+  setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
+    const nextRed = clamp(red, 0, 1);
+    const nextGreen = clamp(green, 0, 1);
+    const nextBlue = clamp(blue, 0, 1);
+    const nextAlpha = clamp(alpha, 0, 1);
+
+    const prev = this.pageBackgroundColor;
+    if (
+      Math.abs(prev[0] - nextRed) <= 1e-6 &&
+      Math.abs(prev[1] - nextGreen) <= 1e-6 &&
+      Math.abs(prev[2] - nextBlue) <= 1e-6 &&
+      Math.abs(prev[3] - nextAlpha) <= 1e-6
+    ) {
+      return;
+    }
+
+    this.pageBackgroundColor = [nextRed, nextGreen, nextBlue, nextAlpha];
+    this.uploadPageBackgroundTexture();
+    this.panCacheValid = false;
+    this.requestFrame();
+  }
+
   beginPanInteraction(): void {
     this.isPanInteracting = true;
     this.markInteraction();
@@ -1333,6 +1366,7 @@ export class GpuFloorplanRenderer {
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
     this.textInstanceCount = scene.textInstanceCount;
+    this.pageRects = normalizePageRects(scene);
     this.buildSegmentBounds(scene);
     this.isPanInteracting = false;
     this.panCacheValid = false;
@@ -1514,10 +1548,17 @@ export class GpuFloorplanRenderer {
   private render(): void {
     const gl = this.gl;
 
-    if (!this.scene || (this.fillPathCount === 0 && this.segmentCount === 0 && this.textInstanceCount === 0 && this.rasterLayers.length === 0)) {
+    if (
+      !this.scene ||
+      (this.fillPathCount === 0 &&
+        this.segmentCount === 0 &&
+        this.textInstanceCount === 0 &&
+        this.rasterLayers.length === 0 &&
+        this.pageRects.length === 0)
+    ) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-      gl.clearColor(1, 1, 1, 1);
+      gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
       this.frameListener?.({
@@ -1546,7 +1587,7 @@ export class GpuFloorplanRenderer {
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.clearColor(1, 1, 1, 1);
+    gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     if (this.needsVisibleSetUpdate) {
@@ -1594,7 +1635,7 @@ export class GpuFloorplanRenderer {
       const gl = this.gl;
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.panCacheFramebuffer);
       gl.viewport(0, 0, this.panCacheWidth, this.panCacheHeight);
-      gl.clearColor(1, 1, 1, 1);
+      gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
       this.drawRasterLayer(
@@ -1644,7 +1685,7 @@ export class GpuFloorplanRenderer {
     cameraCenterX: number,
     cameraCenterY: number
   ): void {
-    if (this.rasterLayers.length === 0) {
+    if (this.rasterLayers.length === 0 && this.pageRects.length === 0) {
       return;
     }
 
@@ -1655,6 +1696,28 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uRasterViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uRasterZoom, this.zoom);
+
+    if (this.pageRects.length > 0) {
+      gl.activeTexture(gl.TEXTURE12);
+      gl.bindTexture(gl.TEXTURE_2D, this.pageBackgroundTexture);
+      gl.uniform1i(this.uRasterTex, 12);
+
+      for (let i = 0; i < this.pageRects.length; i += 4) {
+        const minX = this.pageRects[i];
+        const minY = this.pageRects[i + 1];
+        const maxX = this.pageRects[i + 2];
+        const maxY = this.pageRects[i + 3];
+        const width = Math.max(maxX - minX, 1e-6);
+        const height = Math.max(maxY - minY, 1e-6);
+        gl.uniform4f(this.uRasterMatrixABCD, width, 0, 0, height);
+        gl.uniform2f(this.uRasterMatrixEF, minX, minY);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+    }
+
+    if (this.rasterLayers.length === 0) {
+      return;
+    }
 
     // Raster textures are premultiplied on upload to avoid dark/gray filtering fringes.
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -1830,7 +1893,7 @@ export class GpuFloorplanRenderer {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.clearColor(1, 1, 1, 1);
+    gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.useProgram(this.blitProgram);
@@ -2587,6 +2650,25 @@ export class GpuFloorplanRenderer {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
+  private uploadPageBackgroundTexture(): void {
+    const gl = this.gl;
+    const color = this.pageBackgroundColor;
+    const data = new Uint8Array([
+      Math.round(color[0] * 255),
+      Math.round(color[1] * 255),
+      Math.round(color[2] * 255),
+      Math.round(color[3] * 255)
+    ]);
+
+    gl.bindTexture(gl.TEXTURE_2D, this.pageBackgroundTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
   private clientToWorld(clientX: number, clientY: number): { x: number; y: number } {
     const rect = this.canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
@@ -2741,6 +2823,19 @@ function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { w
   }
 
   return { width, height };
+}
+
+function normalizePageRects(scene: VectorScene): Float32Array {
+  if (scene.pageRects instanceof Float32Array && scene.pageRects.length >= 4) {
+    return new Float32Array(scene.pageRects);
+  }
+
+  return new Float32Array([
+    scene.pageBounds.minX,
+    scene.pageBounds.minY,
+    scene.pageBounds.maxX,
+    scene.pageBounds.maxY
+  ]);
 }
 
 function clamp(value: number, min: number, max: number): number {

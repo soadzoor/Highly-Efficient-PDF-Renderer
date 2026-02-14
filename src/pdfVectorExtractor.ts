@@ -39,6 +39,7 @@ export interface RasterLayer {
 export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
+  pageRects: Float32Array;
   fillPathCount: number;
   fillSegmentCount: number;
   fillPathMetaA: Float32Array;
@@ -173,6 +174,8 @@ const FILL_PRIMITIVE_QUADRATIC = 1;
 const FILL_CUBIC_TO_QUAD_ERROR = 0.08;
 const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
 const STROKE_STYLE_FLAG_OFFSET = 2;
+const PAGE_GRID_GAP_FACTOR = 0.08;
+const PAGE_GRID_MIN_GAP = 24;
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   const normalizedAlpha = clamp01(alpha);
@@ -560,6 +563,7 @@ async function extractSinglePageVectors(
   return {
     pageCount: 1,
     pagesPerRow: 1,
+    pageRects: new Float32Array([pageBounds.minX, pageBounds.minY, pageBounds.maxX, pageBounds.maxY]),
     fillPathCount,
     fillSegmentCount,
     fillPathMetaA,
@@ -638,6 +642,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let totalDiscardedDuplicateCount = 0;
   let totalDiscardedContainedCount = 0;
   let maxHalfWidth = 0;
+  let totalPageRectCount = 0;
 
   for (const scene of pageScenes) {
     totalFillPathCount += scene.fillPathCount;
@@ -658,6 +663,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     totalDiscardedDuplicateCount += scene.discardedDuplicateCount;
     totalDiscardedContainedCount += scene.discardedContainedCount;
     maxHalfWidth = Math.max(maxHalfWidth, scene.maxHalfWidth);
+    const rectCount = scene.pageRects.length >= 4 ? Math.floor(scene.pageRects.length / 4) : 1;
+    totalPageRectCount += Math.max(1, rectCount);
   }
 
   const fillPathMetaA = new Float32Array(totalFillPathCount * 4);
@@ -676,6 +683,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textGlyphMetaB = new Float32Array(totalTextGlyphCount * 4);
   const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
   const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
+  const pageRects = new Float32Array(totalPageRectCount * 4);
 
   let fillPathOffset = 0;
   let fillSegmentOffset = 0;
@@ -683,6 +691,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let textInstanceOffset = 0;
   let textGlyphOffset = 0;
   let textGlyphSegmentOffset = 0;
+  let pageRectOffset = 0;
   let combinedBounds: Bounds | null = null;
   let combinedPageBounds: Bounds | null = null;
 
@@ -780,6 +789,27 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     textGlyphSegmentsA.set(scene.textGlyphSegmentsA, textGlyphSegmentOffset * 4);
     textGlyphSegmentsB.set(scene.textGlyphSegmentsB, textGlyphSegmentOffset * 4);
 
+    const scenePageRects = scene.pageRects;
+    if (scenePageRects.length >= 4) {
+      const sceneRectCount = Math.floor(scenePageRects.length / 4);
+      for (let i = 0; i < sceneRectCount; i += 1) {
+        const src = i * 4;
+        const dst = (pageRectOffset + i) * 4;
+        pageRects[dst] = scenePageRects[src] + tx;
+        pageRects[dst + 1] = scenePageRects[src + 1] + ty;
+        pageRects[dst + 2] = scenePageRects[src + 2] + tx;
+        pageRects[dst + 3] = scenePageRects[src + 3] + ty;
+      }
+      pageRectOffset += sceneRectCount;
+    } else {
+      const dst = pageRectOffset * 4;
+      pageRects[dst] = scene.pageBounds.minX + tx;
+      pageRects[dst + 1] = scene.pageBounds.minY + ty;
+      pageRects[dst + 2] = scene.pageBounds.maxX + tx;
+      pageRects[dst + 3] = scene.pageBounds.maxY + ty;
+      pageRectOffset += 1;
+    }
+
     combinedBounds = combineBounds(combinedBounds, offsetBounds(scene.bounds, tx, ty));
     combinedPageBounds = combineBounds(combinedPageBounds, offsetBounds(scene.pageBounds, tx, ty));
 
@@ -816,6 +846,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   return {
     pageCount: pageScenes.length,
     pagesPerRow,
+    pageRects,
     fillPathCount: totalFillPathCount,
     fillSegmentCount: totalFillSegmentCount,
     fillPathMetaA,
@@ -876,7 +907,7 @@ function computeGridPlacements(pageScenes: VectorScene[], pagesPerRow: number): 
   }
 
   const averageExtent = extentSum / Math.max(1, pageBoundsList.length);
-  const gap = Math.max(averageExtent * 0.06, 8);
+  const gap = Math.max(averageExtent * PAGE_GRID_GAP_FACTOR, PAGE_GRID_MIN_GAP);
   const rowTop = new Float64Array(rowCount);
   for (let row = 1; row < rowCount; row += 1) {
     rowTop[row] = rowTop[row - 1] - rowHeights[row - 1] - gap;
@@ -987,6 +1018,7 @@ function createEmptyVectorScene(): VectorScene {
   return {
     pageCount: 0,
     pagesPerRow: 1,
+    pageRects: new Float32Array(0),
     fillPathCount: 0,
     fillSegmentCount: 0,
     fillPathMetaA: new Float32Array(0),

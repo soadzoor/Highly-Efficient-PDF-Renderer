@@ -17,6 +17,12 @@ const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const CLEAR_COLOR = {
+  r: 160 / 255,
+  g: 169 / 255,
+  b: 175 / 255,
+  a: 1
+};
 
 const CAMERA_UNIFORM_FLOATS = 12;
 const CAMERA_UNIFORM_BUFFER_BYTES = 64;
@@ -929,7 +935,7 @@ fn fsMain(@builtin(position) fragPos : vec4f) -> @location(0) vec4f {
   let uv = samplePx / uBlit.cacheSizePx;
 
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
-    return vec4f(1.0, 1.0, 1.0, 1.0);
+    return vec4f(0.627451, 0.662745, 0.686275, 1.0);
   }
 
   return textureSampleLevel(uCacheTex, uCacheSampler, uv, 0.0);
@@ -1007,6 +1013,7 @@ export class WebGpuFloorplanRenderer {
 
   private textInstanceTextureC: any = null;
   private rasterLayerResources: WebGpuRasterLayerResource[] = [];
+  private pageBackgroundResources: WebGpuRasterLayerResource[] = [];
 
   private textGlyphMetaTextureA: any = null;
 
@@ -1019,6 +1026,7 @@ export class WebGpuFloorplanRenderer {
   private textGlyphSegmentTextureB: any = null;
 
   private textRasterAtlasTexture: any = null;
+  private pageBackgroundTexture: any = null;
 
   private segmentIdBufferAll: any = null;
 
@@ -1065,6 +1073,8 @@ export class WebGpuFloorplanRenderer {
   private strokeCurveEnabled = true;
 
   private textVectorOnly = false;
+
+  private pageBackgroundColor: [number, number, number, number] = [1, 1, 1, 1];
 
   private panOptimizationEnabled = true;
 
@@ -1357,6 +1367,8 @@ export class WebGpuFloorplanRenderer {
       addressModeV: "clamp-to-edge"
     });
 
+    this.pageBackgroundTexture = this.createRgba8Texture(1, 1, new Uint8Array([255, 255, 255, 255]));
+
     this.ensureSegmentIdBuffers(1);
   }
 
@@ -1432,6 +1444,28 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.textVectorOnly = nextEnabled;
+    this.panCacheValid = false;
+    this.requestFrame();
+  }
+
+  setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
+    const nextRed = clamp(red, 0, 1);
+    const nextGreen = clamp(green, 0, 1);
+    const nextBlue = clamp(blue, 0, 1);
+    const nextAlpha = clamp(alpha, 0, 1);
+
+    const prev = this.pageBackgroundColor;
+    if (
+      Math.abs(prev[0] - nextRed) <= 1e-6 &&
+      Math.abs(prev[1] - nextGreen) <= 1e-6 &&
+      Math.abs(prev[2] - nextBlue) <= 1e-6 &&
+      Math.abs(prev[3] - nextAlpha) <= 1e-6
+    ) {
+      return;
+    }
+
+    this.pageBackgroundColor = [nextRed, nextGreen, nextBlue, nextAlpha];
+    this.uploadPageBackgroundTexture();
     this.panCacheValid = false;
     this.requestFrame();
   }
@@ -1534,6 +1568,7 @@ export class WebGpuFloorplanRenderer {
       ? this.createRgba8Texture(textRasterAtlas.width, textRasterAtlas.height, textRasterAtlas.rgba)
       : this.createRgba8Texture(1, 1, new Uint8Array([0, 0, 0, 0]));
 
+    this.configurePageBackgroundResources(scene);
     this.configureRasterLayers(scene);
 
     this.allSegmentIds = new Uint32Array(this.segmentCount);
@@ -1832,6 +1867,10 @@ export class WebGpuFloorplanRenderer {
     if (this.blitUniformBuffer) {
       this.blitUniformBuffer.destroy();
     }
+    if (this.pageBackgroundTexture) {
+      this.pageBackgroundTexture.destroy();
+      this.pageBackgroundTexture = null;
+    }
   }
 
   private configureContext(): void {
@@ -1929,7 +1968,14 @@ export class WebGpuFloorplanRenderer {
   }
 
   private render(): void {
-    if (!this.scene || (this.segmentCount === 0 && this.fillPathCount === 0 && this.textInstanceCount === 0 && this.rasterLayerResources.length === 0)) {
+    if (
+      !this.scene ||
+      (this.segmentCount === 0 &&
+        this.fillPathCount === 0 &&
+        this.textInstanceCount === 0 &&
+        this.rasterLayerResources.length === 0 &&
+        this.pageBackgroundResources.length === 0)
+    ) {
       this.clearToScreen();
       this.frameListener?.({
         renderedSegments: 0,
@@ -1964,7 +2010,7 @@ export class WebGpuFloorplanRenderer {
       colorAttachments: [
         {
           view,
-          clearValue: { r: 1, g: 1, b: 1, a: 1 },
+          clearValue: CLEAR_COLOR,
           loadOp: "clear",
           storeOp: "store"
         }
@@ -2013,7 +2059,7 @@ export class WebGpuFloorplanRenderer {
         colorAttachments: [
           {
             view: this.panCacheTexture.createView(),
-            clearValue: { r: 1, g: 1, b: 1, a: 1 },
+            clearValue: CLEAR_COLOR,
             loadOp: "clear",
             storeOp: "store"
           }
@@ -2056,6 +2102,14 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number
   ): number {
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
+
+    if (this.pageBackgroundResources.length > 0) {
+      pass.setPipeline(this.rasterPipeline);
+      for (const layer of this.pageBackgroundResources) {
+        pass.setBindGroup(0, layer.bindGroup);
+        pass.draw(4, 1, 0, 0);
+      }
+    }
 
     if (this.rasterLayerResources.length > 0) {
       pass.setPipeline(this.rasterPipeline);
@@ -2143,7 +2197,7 @@ export class WebGpuFloorplanRenderer {
       colorAttachments: [
         {
           view,
-          clearValue: { r: 1, g: 1, b: 1, a: 1 },
+          clearValue: CLEAR_COLOR,
           loadOp: "clear",
           storeOp: "store"
         }
@@ -2350,7 +2404,6 @@ export class WebGpuFloorplanRenderer {
   private configureRasterLayers(scene: VectorScene): void {
     this.destroyRasterLayerResources();
 
-    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     for (const source of this.getSceneRasterLayers(scene)) {
       const matrix = new Float32Array(6);
       if (source.matrix.length >= 6) {
@@ -2365,48 +2418,36 @@ export class WebGpuFloorplanRenderer {
         matrix[3] = 1;
       }
 
-      const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
-      rasterUniforms[0] = matrix[0];
-      rasterUniforms[1] = matrix[1];
-      rasterUniforms[2] = matrix[2];
-      rasterUniforms[3] = matrix[3];
-      rasterUniforms[4] = matrix[4];
-      rasterUniforms[5] = matrix[5];
-      rasterUniforms[6] = 0;
-      rasterUniforms[7] = 0;
-      assertUniformBufferSizeMatches(rasterUniforms, RASTER_UNIFORM_BUFFER_BYTES, "raster");
-
-      const uniformBuffer = this.gpuDevice.createBuffer({
-        size: RASTER_UNIFORM_BUFFER_BYTES,
-        usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
-      });
-      this.gpuDevice.queue.writeBuffer(uniformBuffer, 0, rasterUniforms);
-
       const rgba = source.data.subarray(0, source.width * source.height * 4);
       const premultiplied = premultiplyRgba(rgba);
       const texture = this.createRgba8Texture(source.width, source.height, premultiplied);
-      const bindGroup = this.gpuDevice.createBindGroup({
-        layout: this.rasterPipeline.getBindGroupLayout(0),
-        entries: [
-          {
-            binding: 0,
-            resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
-          },
-          {
-            binding: 1,
-            resource: { buffer: uniformBuffer, size: RASTER_UNIFORM_BUFFER_BYTES }
-          },
-          {
-            binding: 2,
-            resource: this.rasterLayerSampler
-          },
-          {
-            binding: 3,
-            resource: texture.createView()
-          }
-        ]
-      });
-      this.rasterLayerResources.push({ texture, uniformBuffer, bindGroup });
+      this.rasterLayerResources.push(this.createRasterLayerResource(matrix, texture));
+    }
+  }
+
+  private configurePageBackgroundResources(scene: VectorScene): void {
+    this.destroyPageBackgroundResources();
+    if (!this.pageBackgroundTexture) {
+      this.uploadPageBackgroundTexture();
+    }
+    if (!this.pageBackgroundTexture) {
+      return;
+    }
+
+    const rects = normalizePageRects(scene);
+    for (let i = 0; i + 3 < rects.length; i += 4) {
+      const minX = rects[i];
+      const minY = rects[i + 1];
+      const maxX = rects[i + 2];
+      const maxY = rects[i + 3];
+      if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
+        continue;
+      }
+
+      const width = Math.max(maxX - minX, 1e-6);
+      const height = Math.max(maxY - minY, 1e-6);
+      const matrix = new Float32Array([width, 0, 0, height, minX, minY]);
+      this.pageBackgroundResources.push(this.createRasterLayerResource(matrix, this.pageBackgroundTexture));
     }
   }
 
@@ -2459,6 +2500,77 @@ export class WebGpuFloorplanRenderer {
       }
     }
     this.rasterLayerResources = [];
+  }
+
+  private destroyPageBackgroundResources(): void {
+    for (const layer of this.pageBackgroundResources) {
+      if (layer.uniformBuffer) {
+        layer.uniformBuffer.destroy();
+      }
+    }
+    this.pageBackgroundResources = [];
+  }
+
+  private uploadPageBackgroundTexture(): void {
+    const alphaByte = Math.round(this.pageBackgroundColor[3] * 255);
+    const alphaScale = alphaByte / 255;
+    const rgba = new Uint8Array([
+      Math.round(this.pageBackgroundColor[0] * alphaScale * 255),
+      Math.round(this.pageBackgroundColor[1] * alphaScale * 255),
+      Math.round(this.pageBackgroundColor[2] * alphaScale * 255),
+      alphaByte
+    ]);
+
+    if (!this.pageBackgroundTexture) {
+      this.pageBackgroundTexture = this.createRgba8Texture(1, 1, rgba);
+      return;
+    }
+
+    this.writeRgba8Texture(this.pageBackgroundTexture, 1, 1, rgba, 0);
+  }
+
+  private createRasterLayerResource(matrix: Float32Array, texture: any): WebGpuRasterLayerResource {
+    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
+    const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
+    rasterUniforms[0] = matrix[0];
+    rasterUniforms[1] = matrix[1];
+    rasterUniforms[2] = matrix[2];
+    rasterUniforms[3] = matrix[3];
+    rasterUniforms[4] = matrix[4];
+    rasterUniforms[5] = matrix[5];
+    rasterUniforms[6] = 0;
+    rasterUniforms[7] = 0;
+    assertUniformBufferSizeMatches(rasterUniforms, RASTER_UNIFORM_BUFFER_BYTES, "raster");
+
+    const uniformBuffer = this.gpuDevice.createBuffer({
+      size: RASTER_UNIFORM_BUFFER_BYTES,
+      usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
+    });
+    this.gpuDevice.queue.writeBuffer(uniformBuffer, 0, rasterUniforms);
+
+    const bindGroup = this.gpuDevice.createBindGroup({
+      layout: this.rasterPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          resource: { buffer: uniformBuffer, size: RASTER_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 2,
+          resource: this.rasterLayerSampler
+        },
+        {
+          binding: 3,
+          resource: texture.createView()
+        }
+      ]
+    });
+
+    return { texture, uniformBuffer, bindGroup };
   }
 
   private createFloatTexture(width: number, height: number, source: Float32Array): any {
@@ -2590,7 +2702,7 @@ export class WebGpuFloorplanRenderer {
       colorAttachments: [
         {
           view,
-          clearValue: { r: 1, g: 1, b: 1, a: 1 },
+          clearValue: CLEAR_COLOR,
           loadOp: "clear",
           storeOp: "store"
         }
@@ -2606,6 +2718,7 @@ export class WebGpuFloorplanRenderer {
     this.strokeBindGroupVisible = null;
     this.fillBindGroup = null;
     this.textBindGroup = null;
+    this.destroyPageBackgroundResources();
     this.destroyRasterLayerResources();
 
     const textures = [
@@ -2781,6 +2894,19 @@ function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { w
   }
 
   return { width, height };
+}
+
+function normalizePageRects(scene: VectorScene): Float32Array {
+  if (scene.pageRects instanceof Float32Array && scene.pageRects.length >= 4) {
+    return new Float32Array(scene.pageRects);
+  }
+
+  return new Float32Array([
+    scene.pageBounds.minX,
+    scene.pageBounds.minY,
+    scene.pageBounds.maxX,
+    scene.pageBounds.maxY
+  ]);
 }
 
 function alignTo(value: number, alignment: number): number {

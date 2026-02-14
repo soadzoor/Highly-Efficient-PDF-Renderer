@@ -13,7 +13,7 @@ body {
   height: 100%;
   margin: 0;
   overflow: hidden;
-  background: #f4f5f7;
+  background: #a0a9af;
 }
 
 #viewport {
@@ -22,7 +22,7 @@ body {
   display: block;
   touch-action: none;
   cursor: grab;
-  background: #ffffff;
+  background: #a0a9af;
 }
 
 #viewport:active {
@@ -111,6 +111,50 @@ body {
 
 .number-row input[type="number"] {
   width: 100%;
+}
+
+.number-row input[type="color"] {
+  width: 44px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid rgba(15, 23, 42, 0.2);
+  border-radius: 6px;
+  background: transparent;
+}
+
+.number-row-color {
+  grid-template-columns: max-content 1fr;
+}
+
+.color-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.color-controls input[type="number"] {
+  width: 64px;
+}
+
+.color-controls input[type="range"] {
+  width: min(180px, 22vw);
+}
+
+.color-suffix {
+  color: #475569;
+  font-size: 0.8rem;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .toggle {

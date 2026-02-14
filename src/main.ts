@@ -47,6 +47,9 @@ const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stro
 const vectorTextOnlyToggle = document.querySelector<HTMLInputElement>("#toggle-vector-text-only");
 const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
 const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages-per-row");
+const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
+const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
+const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
 
 if (
   !canvas ||
@@ -78,7 +81,10 @@ if (
   !strokeCurveToggle ||
   !vectorTextOnlyToggle ||
   !webGpuToggle ||
-  !maxPagesPerRowInput
+  !maxPagesPerRowInput ||
+  !pageBackgroundColorInput ||
+  !pageBackgroundOpacitySlider ||
+  !pageBackgroundOpacityInput
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -113,6 +119,9 @@ const strokeCurveToggleElement = strokeCurveToggle;
 const vectorTextOnlyToggleElement = vectorTextOnlyToggle;
 const webGpuToggleElement = webGpuToggle;
 const maxPagesPerRowInputElement = maxPagesPerRowInput;
+const pageBackgroundColorInputElement = pageBackgroundColorInput;
+const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
+const pageBackgroundOpacityInputElement = pageBackgroundOpacityInput;
 
 type RendererBackend = "webgl" | "webgpu";
 const webGpuSupported = isWebGpuSupported();
@@ -124,6 +133,7 @@ interface RendererApi {
   setPanOptimizationEnabled(enabled: boolean): void;
   setStrokeCurveEnabled(enabled: boolean): void;
   setTextVectorOnly(enabled: boolean): void;
+  setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void;
   beginPanInteraction(): void;
   endPanInteraction(): void;
   resize(): void;
@@ -152,6 +162,13 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
   rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
+  const pageBackgroundColor = readPageBackgroundColorInput();
+  rendererApi.setPageBackgroundColor(
+    pageBackgroundColor[0],
+    pageBackgroundColor[1],
+    pageBackgroundColor[2],
+    pageBackgroundColor[3]
+  );
   rendererApi.setFrameListener(onRendererFrame);
 }
 
@@ -223,6 +240,7 @@ interface ParsedDataRasterLayerEntry {
 interface ParsedDataSceneEntry {
   bounds?: unknown;
   pageBounds?: unknown;
+  pageRects?: unknown;
   pageCount?: unknown;
   pagesPerRow?: unknown;
   maxHalfWidth?: unknown;
@@ -313,6 +331,22 @@ strokeCurveToggleElement.addEventListener("change", () => {
 
 vectorTextOnlyToggleElement.addEventListener("change", () => {
   renderer.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
+});
+
+pageBackgroundColorInputElement.addEventListener("input", () => {
+  applyPageBackgroundColorFromControls();
+});
+
+pageBackgroundOpacitySliderElement.addEventListener("input", () => {
+  const opacityPercent = readPageBackgroundOpacityPercent(pageBackgroundOpacitySliderElement.value);
+  setPageBackgroundOpacityControls(opacityPercent);
+  applyPageBackgroundColorFromControls();
+});
+
+pageBackgroundOpacityInputElement.addEventListener("input", () => {
+  const opacityPercent = readPageBackgroundOpacityPercent(pageBackgroundOpacityInputElement.value);
+  setPageBackgroundOpacityControls(opacityPercent);
+  applyPageBackgroundColorFromControls();
 });
 
 maxPagesPerRowInputElement.addEventListener("change", () => {
@@ -868,6 +902,49 @@ function readMaxPagesPerRowInput(): number {
   return clamp(parsed, 1, 100);
 }
 
+function readPageBackgroundColorInput(): [number, number, number, number] {
+  const hex = pageBackgroundColorInputElement.value || "#ffffff";
+  const match = /^#([0-9a-fA-F]{6})$/.exec(hex);
+  const opacityPercent = readPageBackgroundOpacityPercent(pageBackgroundOpacityInputElement.value);
+  setPageBackgroundOpacityControls(opacityPercent);
+  const alpha = opacityPercent / 100;
+  if (!match) {
+    return [1, 1, 1, alpha];
+  }
+  const packed = Number.parseInt(match[1], 16);
+  if (!Number.isFinite(packed)) {
+    return [1, 1, 1, alpha];
+  }
+  const red = ((packed >> 16) & 0xff) / 255;
+  const green = ((packed >> 8) & 0xff) / 255;
+  const blue = (packed & 0xff) / 255;
+  return [red, green, blue, alpha];
+}
+
+function readPageBackgroundOpacityPercent(value: string): number {
+  const parsed = Math.trunc(Number(value));
+  if (!Number.isFinite(parsed)) {
+    return 100;
+  }
+  return clamp(parsed, 0, 100);
+}
+
+function setPageBackgroundOpacityControls(opacityPercent: number): void {
+  const normalized = clamp(Math.trunc(opacityPercent), 0, 100);
+  pageBackgroundOpacityInputElement.value = String(normalized);
+  pageBackgroundOpacitySliderElement.value = String(normalized);
+}
+
+function applyPageBackgroundColorFromControls(): void {
+  const pageBackgroundColor = readPageBackgroundColorInput();
+  renderer.setPageBackgroundColor(
+    pageBackgroundColor[0],
+    pageBackgroundColor[1],
+    pageBackgroundColor[2],
+    pageBackgroundColor[3]
+  );
+}
+
 async function downloadParsedDataZip(): Promise<void> {
   if (!lastParsedScene || !lastParsedSceneStats || !lastParsedSceneLabel) {
     setStatus("No parsed floorplan data available to export.");
@@ -908,6 +985,7 @@ async function downloadParsedDataZip(): Promise<void> {
       scene: {
         bounds: scene.bounds,
         pageBounds: scene.pageBounds,
+        pageRects: Array.from(scene.pageRects),
         pageCount: scene.pageCount,
         pagesPerRow: scene.pagesPerRow,
         maxHalfWidth: scene.maxHalfWidth,
@@ -1152,8 +1230,10 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
     ) ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 };
   const bounds = parsedBounds ?? fallbackBounds;
   const pageBounds = parsedPageBounds ?? bounds;
+  const pageRects = parsePageRects(sceneMeta.pageRects, pageBounds);
 
   return {
+    pageRects,
     fillPathCount,
     fillSegmentCount,
     fillPathMetaA,
@@ -1402,6 +1482,35 @@ function parseBounds(value: unknown): Bounds | null {
   }
 
   return { minX, minY, maxX, maxY };
+}
+
+function parsePageRects(value: unknown, fallbackBounds: Bounds): Float32Array {
+  if (Array.isArray(value)) {
+    const quadCount = Math.floor(value.length / 4);
+    if (quadCount > 0) {
+      const out = new Float32Array(quadCount * 4);
+      let writeOffset = 0;
+      for (let i = 0; i < quadCount; i += 1) {
+        const readOffset = i * 4;
+        const minX = Number(value[readOffset]);
+        const minY = Number(value[readOffset + 1]);
+        const maxX = Number(value[readOffset + 2]);
+        const maxY = Number(value[readOffset + 3]);
+        if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
+          continue;
+        }
+        out[writeOffset] = minX;
+        out[writeOffset + 1] = minY;
+        out[writeOffset + 2] = maxX;
+        out[writeOffset + 3] = maxY;
+        writeOffset += 4;
+      }
+      if (writeOffset > 0) {
+        return out.slice(0, writeOffset);
+      }
+    }
+  }
+  return new Float32Array([fallbackBounds.minX, fallbackBounds.minY, fallbackBounds.maxX, fallbackBounds.maxY]);
 }
 
 function parseMat2D(value: unknown): Float32Array | null {
