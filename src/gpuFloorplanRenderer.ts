@@ -526,6 +526,7 @@ uniform sampler2D uTextGlyphSegmentTexB;
 uniform ivec2 uTextGlyphSegmentTexSize;
 uniform float uTextAAScreenPx;
 uniform float uTextCurveEnabled;
+uniform float uTextMinifySmoothing;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
@@ -673,9 +674,19 @@ void main() {
 
   float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
   float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-  float aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uTextAAScreenPx, 1e-4);
+  float localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  float smoothing = clamp(uTextMinifySmoothing, 0.0, 1.0);
+  float minifyFactor = smoothstep(0.01, 0.20, localPerPixel);
+  float smoothAmount = smoothing * minifyFactor;
 
-  float alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * vColorAlpha;
+  float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
+  float alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+
+  float smoothAAWidth = baseAAWidth * (1.0 + smoothAmount * 7.0);
+  float smoothBias = localPerPixel * 0.55 * smoothAmount;
+  float alphaSmooth = 1.0 - smoothstep(-smoothAAWidth, smoothAAWidth, signedDistance - smoothBias);
+
+  float alpha = mix(alphaBase, alphaSmooth, smoothAmount) * vColorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -953,6 +964,8 @@ export class GpuFloorplanRenderer {
 
   private readonly uTextCurveEnabled: WebGLUniformLocation;
 
+  private readonly uTextMinifySmoothing: WebGLUniformLocation;
+
   private readonly uCacheTex: WebGLUniformLocation;
 
   private readonly uViewportPx: WebGLUniformLocation;
@@ -1081,6 +1094,8 @@ export class GpuFloorplanRenderer {
 
   private strokeCurveEnabled = true;
 
+  private textMinifySmoothing = 1;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
 
@@ -1171,6 +1186,7 @@ export class GpuFloorplanRenderer {
     this.uTextZoom = this.mustGetUniformLocation(this.textProgram, "uZoom");
     this.uTextAAScreenPx = this.mustGetUniformLocation(this.textProgram, "uTextAAScreenPx");
     this.uTextCurveEnabled = this.mustGetUniformLocation(this.textProgram, "uTextCurveEnabled");
+    this.uTextMinifySmoothing = this.mustGetUniformLocation(this.textProgram, "uTextMinifySmoothing");
 
     this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
@@ -1216,6 +1232,21 @@ export class GpuFloorplanRenderer {
       return;
     }
     this.strokeCurveEnabled = nextEnabled;
+    this.requestFrame();
+  }
+
+  setTextMinifySmoothing(value: number): void {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+
+    const nextValue = clamp(value, 0, 1);
+    if (Math.abs(nextValue - this.textMinifySmoothing) <= 1e-4) {
+      return;
+    }
+
+    this.textMinifySmoothing = nextValue;
+    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -1724,6 +1755,7 @@ export class GpuFloorplanRenderer {
     gl.uniform1f(this.uTextZoom, this.zoom);
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
     gl.uniform1f(this.uTextCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
+    gl.uniform1f(this.uTextMinifySmoothing, this.textMinifySmoothing);
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.textInstanceCount);
     return this.textInstanceCount;

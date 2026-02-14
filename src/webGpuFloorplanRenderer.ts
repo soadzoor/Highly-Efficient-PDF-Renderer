@@ -30,8 +30,8 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
+  textMinifySmoothing : f32,
   pad0 : f32,
-  pad1 : f32,
 };
 
 struct SegmentIdBuffer {
@@ -244,8 +244,8 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
+  textMinifySmoothing : f32,
   pad0 : f32,
-  pad1 : f32,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -502,8 +502,8 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
+  textMinifySmoothing : f32,
   pad0 : f32,
-  pad1 : f32,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -697,7 +697,11 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let pixelToLocalX = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let pixelToLocalY = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
-  let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uCamera.textAAScreenPx, 1e-4);
+  let localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  let smoothing = clamp(uCamera.textMinifySmoothing, 0.0, 1.0);
+  let minifyFactor = smoothstep(0.01, 0.20, localPerPixel);
+  let smoothAmount = smoothing * minifyFactor;
+  let baseAAWidth = max(localPerPixel * uCamera.textAAScreenPx, 1e-4);
 
   if (inData.segmentCount <= 0) {
     discard;
@@ -734,8 +738,11 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
   let inside = winding != 0;
   let signedDistance = select(minDistance, -minDistance, inside);
-
-  let alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * inData.colorAlpha;
+  let alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  let smoothAAWidth = baseAAWidth * (1.0 + smoothAmount * 7.0);
+  let smoothBias = localPerPixel * 0.55 * smoothAmount;
+  let alphaSmooth = 1.0 - smoothstep(-smoothAAWidth, smoothAAWidth, signedDistance - smoothBias);
+  let alpha = mix(alphaBase, alphaSmooth, smoothAmount) * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -754,8 +761,8 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
+  textMinifySmoothing : f32,
   pad0 : f32,
-  pad1 : f32,
 };
 
 struct RasterUniforms {
@@ -1009,6 +1016,8 @@ export class WebGpuFloorplanRenderer {
   private maxZoom = 8_192;
 
   private strokeCurveEnabled = true;
+
+  private textMinifySmoothing = 1;
 
   private panOptimizationEnabled = true;
 
@@ -1360,6 +1369,21 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.strokeCurveEnabled = nextEnabled;
+    this.requestFrame();
+  }
+
+  setTextMinifySmoothing(value: number): void {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+
+    const nextValue = clamp(value, 0, 1);
+    if (Math.abs(nextValue - this.textMinifySmoothing) <= 1e-4) {
+      return;
+    }
+
+    this.textMinifySmoothing = nextValue;
+    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -2010,7 +2034,7 @@ export class WebGpuFloorplanRenderer {
     data[7] = 1.25;
     data[8] = this.strokeCurveEnabled ? 1 : 0;
     data[9] = 1.0;
-    data[10] = 0;
+    data[10] = this.textMinifySmoothing;
     data[11] = 0;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");

@@ -41,6 +41,11 @@
             <span>Use WebGPU (preview)</span>
           </label>
         </div>
+        <div class="slider-row">
+          <label for="text-minify-smoothing">Text Minify Smoothing</label>
+          <input id="text-minify-smoothing" type="range" min="0" max="1" step="0.01" value="1" />
+          <span id="text-minify-smoothing-value">100%</span>
+        </div>
         <div id="status" class="status">Loading sample floorplan...</div>
         <div id="parse-loader" class="parse-loader" hidden>
           <span class="loader-spinner" aria-hidden="true"></span>

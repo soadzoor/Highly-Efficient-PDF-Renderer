@@ -38,6 +38,8 @@ const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-seg
 const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
 const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
+const textMinifySmoothingSlider = document.querySelector<HTMLInputElement>("#text-minify-smoothing");
+const textMinifySmoothingValue = document.querySelector<HTMLSpanElement>("#text-minify-smoothing-value");
 
 if (
   !canvas ||
@@ -67,7 +69,9 @@ if (
   !segmentMergeToggle ||
   !invisibleCullToggle ||
   !strokeCurveToggle ||
-  !webGpuToggle
+  !webGpuToggle ||
+  !textMinifySmoothingSlider ||
+  !textMinifySmoothingValue
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -100,6 +104,8 @@ const segmentMergeToggleElement = segmentMergeToggle;
 const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
 const webGpuToggleElement = webGpuToggle;
+const textMinifySmoothingSliderElement = textMinifySmoothingSlider;
+const textMinifySmoothingValueElement = textMinifySmoothingValue;
 
 type RendererBackend = "webgl" | "webgpu";
 const webGpuSupported = isWebGpuSupported();
@@ -110,6 +116,7 @@ interface RendererApi {
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
   setPanOptimizationEnabled(enabled: boolean): void;
   setStrokeCurveEnabled(enabled: boolean): void;
+  setTextMinifySmoothing(value: number): void;
   beginPanInteraction(): void;
   endPanInteraction(): void;
   resize(): void;
@@ -137,6 +144,7 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
   rendererApi.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
+  rendererApi.setTextMinifySmoothing(readTextMinifySmoothingSlider());
   rendererApi.setFrameListener(onRendererFrame);
 }
 
@@ -231,6 +239,7 @@ initializeBackendToggleState();
 setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
+updateTextMinifySmoothingLabel(readTextMinifySmoothingSlider());
 
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
@@ -274,6 +283,12 @@ invisibleCullToggleElement.addEventListener("change", () => {
 
 strokeCurveToggleElement.addEventListener("change", () => {
   renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
+});
+
+textMinifySmoothingSliderElement.addEventListener("input", () => {
+  const value = readTextMinifySmoothingSlider();
+  updateTextMinifySmoothingLabel(value);
+  renderer.setTextMinifySmoothing(value);
 });
 
 webGpuToggleElement.addEventListener("change", () => {
@@ -680,6 +695,18 @@ function setHudCollapsed(collapsed: boolean): void {
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
   toggleHudButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
   toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
+}
+
+function readTextMinifySmoothingSlider(): number {
+  const parsed = Number(textMinifySmoothingSliderElement.value);
+  if (!Number.isFinite(parsed)) {
+    return 1;
+  }
+  return clamp(parsed, 0, 1);
+}
+
+function updateTextMinifySmoothingLabel(value: number): void {
+  textMinifySmoothingValueElement.textContent = `${Math.round(clamp(value, 0, 1) * 100)}%`;
 }
 
 async function downloadParsedDataZip(): Promise<void> {
@@ -1502,6 +1529,16 @@ function cloneSourceBytes(buffer: ArrayBuffer): Uint8Array {
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.slice().buffer;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
 }
 
 void loadDefaultSample();

@@ -99,6 +99,27 @@ body {
   margin-bottom: 8px;
 }
 
+.slider-row {
+  display: grid;
+  grid-template-columns: max-content minmax(120px, 1fr) max-content;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 0.84rem;
+  color: #1f2937;
+}
+
+.slider-row input[type="range"] {
+  width: 100%;
+  min-width: 140px;
+}
+
+.slider-row span {
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+  font-size: 0.8rem;
+  color: #334155;
+}
+
 .toggle {
   display: inline-flex;
   align-items: center;
