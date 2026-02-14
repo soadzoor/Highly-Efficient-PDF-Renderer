@@ -17,6 +17,9 @@ const CAMERA_UNIFORM_BUFFER_BYTES = 64;
 const BLIT_UNIFORM_FLOATS = 8;
 const BLIT_UNIFORM_BUFFER_BYTES = 48;
 
+const RASTER_UNIFORM_FLOATS = 8;
+const RASTER_UNIFORM_BUFFER_BYTES = 32;
+
 const STROKE_SHADER_SOURCE = /* wgsl */ `
 struct CameraUniforms {
   viewport : vec2f,
@@ -741,6 +744,88 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 }
 `;
 
+const RASTER_SHADER_SOURCE = /* wgsl */ `
+struct CameraUniforms {
+  viewport : vec2f,
+  cameraCenter : vec2f,
+  zoom : f32,
+  strokeAAScreenPx : f32,
+  strokeCurveEnabled : f32,
+  textAAScreenPx : f32,
+  textCurveEnabled : f32,
+  fillAAScreenPx : f32,
+  pad0 : f32,
+  pad1 : f32,
+};
+
+struct RasterUniforms {
+  matrixA : vec4f,
+  matrixB : vec4f,
+};
+
+@group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
+@group(0) @binding(1) var<uniform> uRaster : RasterUniforms;
+@group(0) @binding(2) var uRasterSampler : sampler;
+@group(0) @binding(3) var uRasterTex : texture_2d<f32>;
+
+struct VsOut {
+  @builtin(position) position : vec4f,
+  @location(0) uv : vec2f,
+};
+
+fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
+  switch (vertexIndex) {
+    case 0u: {
+      return vec2f(-1.0, -1.0);
+    }
+    case 1u: {
+      return vec2f(1.0, -1.0);
+    }
+    case 2u: {
+      return vec2f(-1.0, 1.0);
+    }
+    default: {
+      return vec2f(1.0, 1.0);
+    }
+  }
+}
+
+@vertex
+fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
+  let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
+  let localTopDown = vec2f(corner01.x, 1.0 - corner01.y);
+
+  let a = uRaster.matrixA.x;
+  let b = uRaster.matrixA.y;
+  let c = uRaster.matrixA.z;
+  let d = uRaster.matrixA.w;
+  let e = uRaster.matrixB.x;
+  let f = uRaster.matrixB.y;
+
+  let world = vec2f(
+    a * localTopDown.x + c * localTopDown.y + e,
+    b * localTopDown.x + d * localTopDown.y + f
+  );
+
+  let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
+  let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
+
+  var out : VsOut;
+  out.position = vec4f(clip, 0.0, 1.0);
+  out.uv = localTopDown;
+  return out;
+}
+
+@fragment
+fn fsMain(inData : VsOut) -> @location(0) vec4f {
+  let color = textureSampleLevel(uRasterTex, uRasterSampler, inData.uv, 0.0);
+  if (color.a <= 0.001) {
+    discard;
+  }
+  return color;
+}
+`;
+
 const BLIT_SHADER_SOURCE = /* wgsl */ `
 struct BlitUniforms {
   viewportPx : vec2f,
@@ -811,19 +896,27 @@ export class WebGpuFloorplanRenderer {
 
   private readonly textPipeline: any;
 
+  private readonly rasterPipeline: any;
+
   private readonly blitPipeline: any;
 
   private readonly cameraUniformBuffer: any;
 
   private readonly blitUniformBuffer: any;
 
+  private readonly rasterUniformBuffer: any;
+
   private readonly panCacheSampler: any;
+
+  private readonly rasterLayerSampler: any;
 
   private readonly strokeBindGroupLayout: any;
 
   private readonly fillBindGroupLayout: any;
 
   private readonly textBindGroupLayout: any;
+
+  private readonly rasterBindGroupLayout: any;
 
   private readonly blitBindGroupLayout: any;
 
@@ -834,6 +927,8 @@ export class WebGpuFloorplanRenderer {
   private fillBindGroup: any = null;
 
   private textBindGroup: any = null;
+
+  private rasterBindGroup: any = null;
 
   private blitBindGroup: any = null;
 
@@ -860,6 +955,8 @@ export class WebGpuFloorplanRenderer {
   private textInstanceTextureB: any = null;
 
   private textInstanceTextureC: any = null;
+
+  private rasterLayerTexture: any = null;
 
   private textGlyphMetaTextureA: any = null;
 
@@ -927,6 +1024,10 @@ export class WebGpuFloorplanRenderer {
 
   private textInstanceCount = 0;
 
+  private hasRasterLayer = false;
+
+  private rasterLayerMatrix = new Float32Array(6);
+
   private visibleSegmentCount = 0;
 
   private usingAllSegments = true;
@@ -988,6 +1089,11 @@ export class WebGpuFloorplanRenderer {
 
     this.blitUniformBuffer = this.gpuDevice.createBuffer({
       size: BLIT_UNIFORM_BUFFER_BYTES,
+      usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
+    });
+
+    this.rasterUniformBuffer = this.gpuDevice.createBuffer({
+      size: RASTER_UNIFORM_BUFFER_BYTES,
       usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
     });
 
@@ -1106,6 +1212,31 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
+    this.rasterBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "uniform", minBindingSize: RASTER_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 2,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 3,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        }
+      ]
+    });
+
     this.blitBindGroupLayout = this.gpuDevice.createBindGroupLayout({
       entries: [
         {
@@ -1135,6 +1266,9 @@ export class WebGpuFloorplanRenderer {
     const textPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.textBindGroupLayout]
     });
+    const rasterPipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.rasterBindGroupLayout]
+    });
     const blitPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.blitBindGroupLayout]
     });
@@ -1142,11 +1276,20 @@ export class WebGpuFloorplanRenderer {
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
     this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
+    this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout);
     this.blitPipeline = this.createPipeline(BLIT_SHADER_SOURCE, "vsMain", "fsMain", blitPipelineLayout);
 
     this.panCacheSampler = this.gpuDevice.createSampler({
       magFilter: "nearest",
       minFilter: "nearest",
+      mipmapFilter: "nearest",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge"
+    });
+
+    this.rasterLayerSampler = this.gpuDevice.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
       mipmapFilter: "nearest",
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge"
@@ -1304,6 +1447,8 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphMetaTextureB = this.createFloatTexture(this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight, scene.textGlyphMetaB);
     this.textGlyphSegmentTextureA = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsA);
     this.textGlyphSegmentTextureB = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsB);
+
+    this.configureRasterLayer(scene);
 
     this.allSegmentIds = new Uint32Array(this.segmentCount);
     for (let i = 0; i < this.segmentCount; i += 1) {
@@ -1589,6 +1734,9 @@ export class WebGpuFloorplanRenderer {
     if (this.blitUniformBuffer) {
       this.blitUniformBuffer.destroy();
     }
+    if (this.rasterUniformBuffer) {
+      this.rasterUniformBuffer.destroy();
+    }
   }
 
   private configureContext(): void {
@@ -1679,7 +1827,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private render(): void {
-    if (!this.scene || (this.segmentCount === 0 && this.fillPathCount === 0 && this.textInstanceCount === 0)) {
+    if (!this.scene || (this.segmentCount === 0 && this.fillPathCount === 0 && this.textInstanceCount === 0 && !this.hasRasterLayer)) {
       this.clearToScreen();
       this.frameListener?.({
         renderedSegments: 0,
@@ -1806,6 +1954,12 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number
   ): number {
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
+
+    if (this.hasRasterLayer && this.rasterBindGroup) {
+      pass.setPipeline(this.rasterPipeline);
+      pass.setBindGroup(0, this.rasterBindGroup);
+      pass.draw(4, 1, 0, 0);
+    }
 
     if (this.fillPathCount > 0 && this.fillBindGroup) {
       pass.setPipeline(this.fillPipeline);
@@ -2089,6 +2243,74 @@ export class WebGpuFloorplanRenderer {
     return performance.now() - this.lastInteractionTime <= INTERACTION_DECAY_MS;
   }
 
+  private configureRasterLayer(scene: VectorScene): void {
+    if (this.rasterLayerTexture) {
+      this.rasterLayerTexture.destroy();
+      this.rasterLayerTexture = null;
+    }
+    this.rasterBindGroup = null;
+    this.hasRasterLayer = false;
+
+    const width = Math.max(0, Math.trunc(scene.rasterLayerWidth));
+    const height = Math.max(0, Math.trunc(scene.rasterLayerHeight));
+    if (width <= 0 || height <= 0 || scene.rasterLayerData.length < width * height * 4) {
+      return;
+    }
+
+    if (scene.rasterLayerMatrix.length >= 6) {
+      this.rasterLayerMatrix[0] = scene.rasterLayerMatrix[0];
+      this.rasterLayerMatrix[1] = scene.rasterLayerMatrix[1];
+      this.rasterLayerMatrix[2] = scene.rasterLayerMatrix[2];
+      this.rasterLayerMatrix[3] = scene.rasterLayerMatrix[3];
+      this.rasterLayerMatrix[4] = scene.rasterLayerMatrix[4];
+      this.rasterLayerMatrix[5] = scene.rasterLayerMatrix[5];
+    } else {
+      this.rasterLayerMatrix[0] = 1;
+      this.rasterLayerMatrix[1] = 0;
+      this.rasterLayerMatrix[2] = 0;
+      this.rasterLayerMatrix[3] = 1;
+      this.rasterLayerMatrix[4] = 0;
+      this.rasterLayerMatrix[5] = 0;
+    }
+
+    const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
+    rasterUniforms[0] = this.rasterLayerMatrix[0];
+    rasterUniforms[1] = this.rasterLayerMatrix[1];
+    rasterUniforms[2] = this.rasterLayerMatrix[2];
+    rasterUniforms[3] = this.rasterLayerMatrix[3];
+    rasterUniforms[4] = this.rasterLayerMatrix[4];
+    rasterUniforms[5] = this.rasterLayerMatrix[5];
+    rasterUniforms[6] = 0;
+    rasterUniforms[7] = 0;
+    assertUniformBufferSizeMatches(rasterUniforms, RASTER_UNIFORM_BUFFER_BYTES, "raster");
+    this.gpuDevice.queue.writeBuffer(this.rasterUniformBuffer, 0, rasterUniforms);
+
+    const rgba = scene.rasterLayerData.subarray(0, width * height * 4);
+    this.rasterLayerTexture = this.createRgba8Texture(width, height, rgba);
+    this.rasterBindGroup = this.gpuDevice.createBindGroup({
+      layout: this.rasterPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          resource: { buffer: this.rasterUniformBuffer, size: RASTER_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 2,
+          resource: this.rasterLayerSampler
+        },
+        {
+          binding: 3,
+          resource: this.rasterLayerTexture.createView()
+        }
+      ]
+    });
+    this.hasRasterLayer = true;
+  }
+
   private createFloatTexture(width: number, height: number, source: Float32Array): any {
     const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
 
@@ -2105,6 +2327,24 @@ export class WebGpuFloorplanRenderer {
     const padded = createPaddedFloatTextureData(source, width, height);
     this.writeFloatTexture(texture, width, height, padded);
 
+    return texture;
+  }
+
+  private createRgba8Texture(width: number, height: number, source: Uint8Array): any {
+    const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
+
+    const texture = this.gpuDevice.createTexture({
+      size: {
+        width,
+        height,
+        depthOrArrayLayers: 1
+      },
+      format: "rgba8unorm",
+      usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
+    });
+
+    const padded = createPaddedByteTextureData(source, width, height);
+    this.writeRgba8Texture(texture, width, height, padded);
     return texture;
   }
 
@@ -2149,6 +2389,45 @@ export class WebGpuFloorplanRenderer {
     );
   }
 
+  private writeRgba8Texture(texture: any, width: number, height: number, data: Uint8Array): void {
+    const bytesPerRowUnpadded = width * 4;
+    const bytesPerRowAligned = alignTo(bytesPerRowUnpadded, 256);
+
+    if (height <= 1 && bytesPerRowUnpadded === bytesPerRowAligned) {
+      this.gpuDevice.queue.writeTexture(
+        { texture },
+        data,
+        { offset: 0 },
+        { width, height, depthOrArrayLayers: 1 }
+      );
+      return;
+    }
+
+    if (bytesPerRowUnpadded === bytesPerRowAligned) {
+      this.gpuDevice.queue.writeTexture(
+        { texture },
+        data,
+        { offset: 0, bytesPerRow: bytesPerRowUnpadded, rowsPerImage: height },
+        { width, height, depthOrArrayLayers: 1 }
+      );
+      return;
+    }
+
+    const paddedBytes = new Uint8Array(bytesPerRowAligned * height);
+    for (let row = 0; row < height; row += 1) {
+      const srcOffset = row * bytesPerRowUnpadded;
+      const dstOffset = row * bytesPerRowAligned;
+      paddedBytes.set(data.subarray(srcOffset, srcOffset + bytesPerRowUnpadded), dstOffset);
+    }
+
+    this.gpuDevice.queue.writeTexture(
+      { texture },
+      paddedBytes,
+      { offset: 0, bytesPerRow: bytesPerRowAligned, rowsPerImage: height },
+      { width, height, depthOrArrayLayers: 1 }
+    );
+  }
+
   private clearToScreen(): void {
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
@@ -2172,8 +2451,11 @@ export class WebGpuFloorplanRenderer {
     this.strokeBindGroupVisible = null;
     this.fillBindGroup = null;
     this.textBindGroup = null;
+    this.rasterBindGroup = null;
+    this.hasRasterLayer = false;
 
     const textures = [
+      this.rasterLayerTexture,
       this.segmentTextureA,
       this.segmentTextureB,
       this.segmentTextureC,
@@ -2210,6 +2492,7 @@ export class WebGpuFloorplanRenderer {
     this.textInstanceTextureA = null;
     this.textInstanceTextureB = null;
     this.textInstanceTextureC = null;
+    this.rasterLayerTexture = null;
     this.textGlyphMetaTextureA = null;
     this.textGlyphMetaTextureB = null;
     this.textGlyphSegmentTextureA = null;
@@ -2237,6 +2520,17 @@ function createPaddedFloatTextureData(source: Float32Array, width: number, heigh
   }
 
   const padded = new Float32Array(expectedLength);
+  padded.set(source);
+  return padded;
+}
+
+function createPaddedByteTextureData(source: Uint8Array, width: number, height: number): Uint8Array {
+  const expectedLength = width * height * 4;
+  if (source.length > expectedLength) {
+    throw new Error(`Texture source data exceeds texture size (${source.length} > ${expectedLength}).`);
+  }
+
+  const padded = new Uint8Array(expectedLength);
   padded.set(source);
   return padded;
 }

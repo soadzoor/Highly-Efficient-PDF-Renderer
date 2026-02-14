@@ -718,6 +718,60 @@ void main() {
 }
 `;
 
+const RASTER_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec2 aCorner;
+
+uniform vec4 uRasterMatrixABCD;
+uniform vec2 uRasterMatrixEF;
+uniform vec2 uViewport;
+uniform vec2 uCameraCenter;
+uniform float uZoom;
+
+out vec2 vUv;
+
+void main() {
+  vec2 corner01 = aCorner * 0.5 + 0.5;
+  vec2 localTopDown = vec2(corner01.x, 1.0 - corner01.y);
+
+  float a = uRasterMatrixABCD.x;
+  float b = uRasterMatrixABCD.y;
+  float c = uRasterMatrixABCD.z;
+  float d = uRasterMatrixABCD.w;
+  float e = uRasterMatrixEF.x;
+  float f = uRasterMatrixEF.y;
+
+  vec2 world = vec2(
+    a * localTopDown.x + c * localTopDown.y + e,
+    b * localTopDown.x + d * localTopDown.y + f
+  );
+
+  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+
+  gl_Position = vec4(clip, 0.0, 1.0);
+  vUv = localTopDown;
+}
+`;
+
+const RASTER_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D uRasterTex;
+in vec2 vUv;
+out vec4 outColor;
+
+void main() {
+  vec4 color = texture(uRasterTex, vUv);
+  if (color.a <= 0.001) {
+    discard;
+  }
+  outColor = color;
+}
+`;
+
 const INTERACTION_DECAY_MS = 140;
 const FULL_VIEW_FALLBACK_THRESHOLD = 0.92;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
@@ -773,6 +827,8 @@ export class GpuFloorplanRenderer {
 
   private readonly blitProgram: WebGLProgram;
 
+  private readonly rasterProgram: WebGLProgram;
+
   private readonly segmentVao: WebGLVertexArrayObject;
 
   private readonly fillVao: WebGLVertexArrayObject;
@@ -822,6 +878,8 @@ export class GpuFloorplanRenderer {
   private readonly textGlyphSegmentTextureA: WebGLTexture;
 
   private readonly textGlyphSegmentTextureB: WebGLTexture;
+
+  private readonly rasterTexture: WebGLTexture;
 
   private readonly uSegmentTexA: WebGLUniformLocation;
 
@@ -903,6 +961,18 @@ export class GpuFloorplanRenderer {
 
   private readonly uOffsetPx: WebGLUniformLocation;
 
+  private readonly uRasterTex: WebGLUniformLocation;
+
+  private readonly uRasterMatrixABCD: WebGLUniformLocation;
+
+  private readonly uRasterMatrixEF: WebGLUniformLocation;
+
+  private readonly uRasterViewport: WebGLUniformLocation;
+
+  private readonly uRasterCameraCenter: WebGLUniformLocation;
+
+  private readonly uRasterZoom: WebGLUniformLocation;
+
   private scene: VectorScene | null = null;
 
   private grid: SpatialGrid | null = null;
@@ -934,6 +1004,10 @@ export class GpuFloorplanRenderer {
   private fillPathCount = 0;
 
   private textInstanceCount = 0;
+
+  private hasRasterLayer = false;
+
+  private rasterLayerMatrix = new Float32Array(6);
 
   private visibleSegmentCount = 0;
 
@@ -1028,6 +1102,7 @@ export class GpuFloorplanRenderer {
     this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE, FILL_FRAGMENT_SHADER_SOURCE);
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, TEXT_FRAGMENT_SHADER_SOURCE);
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
+    this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, RASTER_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
     this.fillVao = this.createVertexArray();
@@ -1056,6 +1131,7 @@ export class GpuFloorplanRenderer {
     this.textGlyphMetaTextureB = this.mustCreateTexture();
     this.textGlyphSegmentTextureA = this.mustCreateTexture();
     this.textGlyphSegmentTextureB = this.mustCreateTexture();
+    this.rasterTexture = this.mustCreateTexture();
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
@@ -1100,6 +1176,13 @@ export class GpuFloorplanRenderer {
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
     this.uCacheSizePx = this.mustGetUniformLocation(this.blitProgram, "uCacheSizePx");
     this.uOffsetPx = this.mustGetUniformLocation(this.blitProgram, "uOffsetPx");
+
+    this.uRasterTex = this.mustGetUniformLocation(this.rasterProgram, "uRasterTex");
+    this.uRasterMatrixABCD = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixABCD");
+    this.uRasterMatrixEF = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixEF");
+    this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
+    this.uRasterCameraCenter = this.mustGetUniformLocation(this.rasterProgram, "uCameraCenter");
+    this.uRasterZoom = this.mustGetUniformLocation(this.rasterProgram, "uZoom");
 
     this.initializeGeometry();
     this.initializeState();
@@ -1175,6 +1258,7 @@ export class GpuFloorplanRenderer {
     this.panCacheValid = false;
 
     this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.uploadRasterLayer(scene);
     const fillTextureStats = this.uploadFillPaths(scene);
     const textureStats = this.uploadSegments(scene);
     const textTextureStats = this.uploadTextData(scene);
@@ -1346,7 +1430,7 @@ export class GpuFloorplanRenderer {
   private render(): void {
     const gl = this.gl;
 
-    if (!this.scene || (this.fillPathCount === 0 && this.segmentCount === 0 && this.textInstanceCount === 0)) {
+    if (!this.scene || (this.fillPathCount === 0 && this.segmentCount === 0 && this.textInstanceCount === 0 && !this.hasRasterLayer)) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.clearColor(1, 1, 1, 1);
@@ -1386,6 +1470,7 @@ export class GpuFloorplanRenderer {
       this.needsVisibleSetUpdate = false;
     }
 
+    this.drawRasterLayer(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     this.drawFilledPaths(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     const instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
@@ -1428,6 +1513,12 @@ export class GpuFloorplanRenderer {
       gl.clearColor(1, 1, 1, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
+      this.drawRasterLayer(
+        this.panCacheWidth,
+        this.panCacheHeight,
+        this.panCacheCenterX,
+        this.panCacheCenterY
+      );
       this.drawFilledPaths(
         this.panCacheWidth,
         this.panCacheHeight,
@@ -1461,6 +1552,39 @@ export class GpuFloorplanRenderer {
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     });
+  }
+
+  private drawRasterLayer(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): void {
+    if (!this.hasRasterLayer) {
+      return;
+    }
+
+    const gl = this.gl;
+    gl.useProgram(this.rasterProgram);
+    gl.bindVertexArray(this.blitVao);
+
+    gl.activeTexture(gl.TEXTURE12);
+    gl.bindTexture(gl.TEXTURE_2D, this.rasterTexture);
+    gl.uniform1i(this.uRasterTex, 12);
+
+    gl.uniform4f(
+      this.uRasterMatrixABCD,
+      this.rasterLayerMatrix[0],
+      this.rasterLayerMatrix[1],
+      this.rasterLayerMatrix[2],
+      this.rasterLayerMatrix[3]
+    );
+    gl.uniform2f(this.uRasterMatrixEF, this.rasterLayerMatrix[4], this.rasterLayerMatrix[5]);
+    gl.uniform2f(this.uRasterViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
+    gl.uniform1f(this.uRasterZoom, this.zoom);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
   private drawFilledPaths(
@@ -1792,6 +1916,40 @@ export class GpuFloorplanRenderer {
     const slice = this.visibleSegmentIds.subarray(0, outCount);
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.visibleSegmentIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
+  }
+
+  private uploadRasterLayer(scene: VectorScene): void {
+    const gl = this.gl;
+    const width = Math.max(0, Math.trunc(scene.rasterLayerWidth));
+    const height = Math.max(0, Math.trunc(scene.rasterLayerHeight));
+    const hasData = width > 0 && height > 0 && scene.rasterLayerData.length >= width * height * 4;
+
+    this.hasRasterLayer = hasData;
+    if (scene.rasterLayerMatrix.length >= 6) {
+      this.rasterLayerMatrix[0] = scene.rasterLayerMatrix[0];
+      this.rasterLayerMatrix[1] = scene.rasterLayerMatrix[1];
+      this.rasterLayerMatrix[2] = scene.rasterLayerMatrix[2];
+      this.rasterLayerMatrix[3] = scene.rasterLayerMatrix[3];
+      this.rasterLayerMatrix[4] = scene.rasterLayerMatrix[4];
+      this.rasterLayerMatrix[5] = scene.rasterLayerMatrix[5];
+    } else {
+      this.rasterLayerMatrix[0] = 1;
+      this.rasterLayerMatrix[1] = 0;
+      this.rasterLayerMatrix[2] = 0;
+      this.rasterLayerMatrix[3] = 1;
+      this.rasterLayerMatrix[4] = 0;
+      this.rasterLayerMatrix[5] = 0;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this.rasterTexture);
+    configureRasterTexture(gl);
+    if (hasData) {
+      const pixels = scene.rasterLayerData.subarray(0, width * height * 4);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    } else {
+      const transparent = new Uint8Array([0, 0, 0, 0]);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, transparent);
+    }
   }
 
   private uploadFillPaths(scene: VectorScene): {
@@ -2349,6 +2507,13 @@ function configureFloatTexture(gl: WebGL2RenderingContext): void {
 function configureColorTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function configureRasterTexture(gl: WebGL2RenderingContext): void {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }

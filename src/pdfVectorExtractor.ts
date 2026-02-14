@@ -53,6 +53,10 @@ export interface VectorScene {
   textGlyphMetaB: Float32Array;
   textGlyphSegmentsA: Float32Array;
   textGlyphSegmentsB: Float32Array;
+  rasterLayerWidth: number;
+  rasterLayerHeight: number;
+  rasterLayerData: Uint8Array;
+  rasterLayerMatrix: Float32Array;
   endpoints: Float32Array;
   primitiveMeta: Float32Array;
   primitiveBounds: Float32Array;
@@ -168,11 +172,13 @@ function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: nu
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
+  const standardFontDataUrl = resolveStandardFontDataUrl();
 
   const loadingTask = getDocument({
     data: new Uint8Array(pdfData),
     disableFontFace: true,
-    fontExtraProperties: true
+    fontExtraProperties: true,
+    ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;
 
@@ -441,7 +447,13 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
         textData = fallbackTextData;
       }
     }
-    const combinedBounds = combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds) ?? { ...pageBounds };
+    const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
+    const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
+      allowFullPageFallback: allowFullPageRasterFallback
+    });
+    const combinedBounds =
+      combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterLayer.bounds) ??
+      { ...pageBounds };
 
     return {
       fillPathCount,
@@ -467,6 +479,10 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       textGlyphMetaB: textData.glyphMetaB,
       textGlyphSegmentsA: textData.glyphSegmentsA,
       textGlyphSegmentsB: textData.glyphSegmentsB,
+      rasterLayerWidth: rasterLayer.width,
+      rasterLayerHeight: rasterLayer.height,
+      rasterLayerData: rasterLayer.data,
+      rasterLayerMatrix: new Float32Array(rasterLayer.matrix),
       endpoints,
       primitiveMeta,
       primitiveBounds,
@@ -558,6 +574,13 @@ function normalizeRotationDegrees(value: number): number {
   return normalized;
 }
 
+function resolveStandardFontDataUrl(): string | undefined {
+  if (typeof window === "undefined" || !window.location) {
+    return undefined;
+  }
+  return new URL("pdfjs-standard-fonts/", window.location.href).toString();
+}
+
 function cloneState(state: GraphicsState): GraphicsState {
   return {
     matrix: [...state.matrix],
@@ -605,6 +628,18 @@ interface TextExtractResult {
   glyphSegmentsA: Float32Array;
   glyphSegmentsB: Float32Array;
   bounds: Bounds | null;
+}
+
+interface RasterLayerExtractResult {
+  width: number;
+  height: number;
+  data: Uint8Array;
+  matrix: Mat2D;
+  bounds: Bounds | null;
+}
+
+interface RasterLayerExtractOptions {
+  allowFullPageFallback: boolean;
 }
 
 interface TextGlyphBuildResult {
@@ -2072,6 +2107,293 @@ async function warmUpTextPathCache(page: unknown): Promise<void> {
   }
 }
 
+interface RasterOperatorPlan {
+  hasImagePaintOps: boolean;
+  hasFormXObjectOps: boolean;
+  imageOnlyMask: Uint8Array;
+}
+
+function isImagePaintOperator(fn: number): boolean {
+  return (
+    fn === OPS.paintImageXObject ||
+    fn === OPS.paintInlineImageXObject ||
+    fn === OPS.paintInlineImageXObjectGroup ||
+    fn === OPS.paintImageXObjectRepeat ||
+    fn === OPS.paintImageMaskXObject ||
+    fn === OPS.paintImageMaskXObjectGroup ||
+    fn === OPS.paintImageMaskXObjectRepeat ||
+    fn === OPS.paintSolidColorImageMask ||
+    fn === OPS.beginInlineImage ||
+    fn === OPS.beginImageData ||
+    fn === OPS.endInlineImage
+  );
+}
+
+function isImageRasterStateOperator(fn: number, args: unknown): boolean {
+  if (
+    fn === OPS.dependency ||
+    fn === OPS.save ||
+    fn === OPS.restore ||
+    fn === OPS.transform ||
+    fn === OPS.setGState ||
+    fn === OPS.beginGroup ||
+    fn === OPS.endGroup ||
+    fn === OPS.beginCompat ||
+    fn === OPS.endCompat ||
+    fn === OPS.beginMarkedContent ||
+    fn === OPS.beginMarkedContentProps ||
+    fn === OPS.endMarkedContent ||
+    fn === OPS.paintFormXObjectBegin ||
+    fn === OPS.paintFormXObjectEnd ||
+    fn === OPS.paintXObject ||
+    fn === OPS.clip ||
+    fn === OPS.eoClip ||
+    fn === OPS.endPath
+  ) {
+    return true;
+  }
+
+  if (
+    fn === OPS.setFillRGBColor ||
+    fn === OPS.setFillColor ||
+    fn === OPS.setFillGray ||
+    fn === OPS.setFillCMYKColor ||
+    fn === OPS.setFillColorN ||
+    fn === OPS.setFillColorSpace ||
+    fn === OPS.setFillTransparent ||
+    fn === OPS.setStrokeRGBColor ||
+    fn === OPS.setStrokeColor ||
+    fn === OPS.setStrokeGray ||
+    fn === OPS.setStrokeCMYKColor ||
+    fn === OPS.setStrokeColorN ||
+    fn === OPS.setStrokeColorSpace ||
+    fn === OPS.setStrokeTransparent
+  ) {
+    return true;
+  }
+
+  if (fn === OPS.constructPath) {
+    const paintOp = readNumber(args, 0, -1);
+    return paintOp === OPS.endPath;
+  }
+
+  return false;
+}
+
+function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: unknown[] }): RasterOperatorPlan {
+  const imageOnlyMask = new Uint8Array(operatorList.fnArray.length);
+  let hasImagePaintOps = false;
+  let hasFormXObjectOps = false;
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+
+    if (isImagePaintOperator(fn)) {
+      hasImagePaintOps = true;
+      imageOnlyMask[i] = 1;
+      continue;
+    }
+
+    if (fn === OPS.paintFormXObjectBegin || fn === OPS.paintFormXObjectEnd || fn === OPS.paintXObject) {
+      hasFormXObjectOps = true;
+    }
+
+    if (isImageRasterStateOperator(fn, args)) {
+      imageOnlyMask[i] = 1;
+    }
+  }
+
+  return {
+    hasImagePaintOps,
+    hasFormXObjectOps,
+    imageOnlyMask
+  };
+}
+
+function createEmptyRasterLayerResult(): RasterLayerExtractResult {
+  return {
+    width: 0,
+    height: 0,
+    data: new Uint8Array(0),
+    matrix: [...IDENTITY_MATRIX],
+    bounds: null
+  };
+}
+
+async function extractRasterLayerData(
+  page: unknown,
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  pageMatrix: Mat2D,
+  options: RasterLayerExtractOptions
+): Promise<RasterLayerExtractResult> {
+  if (typeof document === "undefined") {
+    return createEmptyRasterLayerResult();
+  }
+
+  const rasterPlan = buildRasterOperatorPlan(operatorList);
+  if (!rasterPlan.hasImagePaintOps && !(options.allowFullPageFallback && rasterPlan.hasFormXObjectOps)) {
+    return createEmptyRasterLayerResult();
+  }
+
+  const pageLike = page as {
+    rotate: number;
+    view: number[];
+    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; width: number; height: number };
+    render: (params: {
+      canvasContext: CanvasRenderingContext2D;
+      viewport: unknown;
+      intent?: string;
+      background?: string;
+      operationsFilter?: (index: number) => boolean;
+    }) => { promise: Promise<unknown> };
+  };
+
+  if (
+    !Array.isArray(pageLike.view) ||
+    typeof pageLike.getViewport !== "function" ||
+    typeof pageLike.render !== "function"
+  ) {
+    return createEmptyRasterLayerResult();
+  }
+
+  const rawPageWidth = Math.max(1, Math.abs(pageLike.view[2] - pageLike.view[0]));
+  const rawPageHeight = Math.max(1, Math.abs(pageLike.view[3] - pageLike.view[1]));
+  const maxPageDim = Math.max(rawPageWidth, rawPageHeight);
+  const maxRasterDim = 4096;
+  const scale = maxPageDim > maxRasterDim ? maxRasterDim / maxPageDim : 1;
+
+  const viewport = pageLike.getViewport({
+    scale,
+    rotation: normalizeRotationDegrees(pageLike.rotate),
+    dontFlip: false
+  });
+
+  const width = Math.max(1, Math.ceil(viewport.width));
+  const height = Math.max(1, Math.ceil(viewport.height));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return createEmptyRasterLayerResult();
+  }
+
+  let rgba: Uint8Array | null = null;
+  if (rasterPlan.hasImagePaintOps) {
+    rgba = await renderRasterLayerRgba(pageLike, viewport, rasterPlan.imageOnlyMask);
+    if (rgba && hasVisibleAlphaPixels(rgba)) {
+      return finalizeRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+    }
+  }
+
+  if (!options.allowFullPageFallback || !rasterPlan.hasFormXObjectOps) {
+    return createEmptyRasterLayerResult();
+  }
+
+  rgba = await renderRasterLayerRgba(pageLike, viewport);
+  if (!rgba || !hasVisibleAlphaPixels(rgba)) {
+    return createEmptyRasterLayerResult();
+  }
+
+  return finalizeRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+}
+
+async function renderRasterLayerRgba(
+  pageLike: {
+    render: (params: {
+      canvasContext: CanvasRenderingContext2D;
+      viewport: unknown;
+      intent?: string;
+      background?: string;
+      operationsFilter?: (index: number) => boolean;
+    }) => { promise: Promise<unknown> };
+  },
+  viewport: unknown,
+  operationMask?: Uint8Array
+): Promise<Uint8Array | null> {
+  const viewportLike = viewport as { width?: unknown; height?: unknown };
+  const width = Math.max(1, Math.ceil(Number(viewportLike.width) || 1));
+  const height = Math.max(1, Math.ceil(Number(viewportLike.height) || 1));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d", {
+    alpha: true,
+    willReadFrequently: true
+  });
+
+  if (!context) {
+    return null;
+  }
+
+  try {
+    const params: {
+      canvasContext: CanvasRenderingContext2D;
+      viewport: unknown;
+      intent?: string;
+      background?: string;
+      operationsFilter?: (index: number) => boolean;
+    } = {
+      canvasContext: context,
+      viewport,
+      intent: "display",
+      // Keep a transparent background so we only capture rasterized PDF content.
+      background: "rgba(0,0,0,0)"
+    };
+    if (operationMask) {
+      params.operationsFilter = (index: number): boolean => index >= 0 && index < operationMask.length && operationMask[index] === 1;
+    }
+    await pageLike.render(params).promise;
+  } catch {
+    canvas.width = 0;
+    canvas.height = 0;
+    return null;
+  }
+
+  const imageData = context.getImageData(0, 0, width, height);
+  const rgba = new Uint8Array(imageData.data);
+  canvas.width = 0;
+  canvas.height = 0;
+  return rgba;
+}
+
+function hasVisibleAlphaPixels(rgba: Uint8Array): boolean {
+  for (let i = 3; i < rgba.length; i += 4) {
+    if (rgba[i] > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function finalizeRasterLayerResult(
+  width: number,
+  height: number,
+  rgba: Uint8Array,
+  viewport: unknown,
+  pageMatrix: Mat2D
+): RasterLayerExtractResult {
+  const transform = readTransform((viewport as { transform?: unknown }).transform) ?? [...IDENTITY_MATRIX];
+  const inverseTransform = invertMatrix(transform) ?? [...IDENTITY_MATRIX];
+  const unitToCanvas: Mat2D = [width, 0, 0, height, 0, 0];
+  const matrix = multiplyMatrices(pageMatrix, multiplyMatrices(inverseTransform, unitToCanvas));
+  const bounds = transformBounds(
+    {
+      minX: 0,
+      minY: 0,
+      maxX: 1,
+      maxY: 1
+    },
+    matrix
+  );
+
+  return {
+    width,
+    height,
+    data: rgba,
+    matrix,
+    bounds
+  };
+}
+
 function createDefaultTextState(matrix: Mat2D): TextState {
   return {
     matrix: [...matrix],
@@ -2696,6 +3018,30 @@ function multiplyMatrices(a: Mat2D, b: Mat2D): Mat2D {
     a[1] * b[2] + a[3] * b[3],
     a[0] * b[4] + a[2] * b[5] + a[4],
     a[1] * b[4] + a[3] * b[5] + a[5]
+  ];
+}
+
+function invertMatrix(m: Mat2D): Mat2D | null {
+  const a = m[0];
+  const b = m[1];
+  const c = m[2];
+  const d = m[3];
+  const e = m[4];
+  const f = m[5];
+
+  const det = a * d - b * c;
+  if (!Number.isFinite(det) || Math.abs(det) <= 1e-12) {
+    return null;
+  }
+
+  const invDet = 1 / det;
+  return [
+    d * invDet,
+    -b * invDet,
+    -c * invDet,
+    a * invDet,
+    (c * f - d * e) * invDet,
+    (b * e - a * f) * invDet
   ];
 }
 

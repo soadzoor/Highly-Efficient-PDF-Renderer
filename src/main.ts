@@ -211,6 +211,10 @@ interface ParsedDataSceneEntry {
   discardedDegenerateCount?: unknown;
   discardedDuplicateCount?: unknown;
   discardedContainedCount?: unknown;
+  rasterLayerWidth?: unknown;
+  rasterLayerHeight?: unknown;
+  rasterLayerMatrix?: unknown;
+  rasterLayerFile?: unknown;
 }
 
 interface ParsedDataManifest {
@@ -513,8 +517,9 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
 
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0) {
-      setStatus(`No visible vector geometry was extracted from ${label}.`);
+    const hasRasterLayer = scene.rasterLayerWidth > 0 && scene.rasterLayerHeight > 0 && scene.rasterLayerData.length > 0;
+    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
+      setStatus(`No visible geometry was extracted from ${label}.`);
       runtimeTextElement.textContent = "";
       setMetricPlaceholder(label);
       setDownloadDataButtonState(false);
@@ -522,7 +527,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     setStatus(
-      `Uploading ${scene.segmentCount.toLocaleString()} segments and ${scene.textInstanceCount.toLocaleString()} text instances to GPU...`
+      `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? ", raster fallback layer" : ""} to GPU...`
     );
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
@@ -586,8 +591,9 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
       return;
     }
 
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0) {
-      setStatus(`No visible vector geometry was found in ${label}.`);
+    const hasRasterLayer = scene.rasterLayerWidth > 0 && scene.rasterLayerHeight > 0 && scene.rasterLayerData.length > 0;
+    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
+      setStatus(`No visible geometry was found in ${label}.`);
       runtimeTextElement.textContent = "";
       setMetricPlaceholder(label);
       setDownloadDataButtonState(false);
@@ -595,7 +601,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     }
 
     setStatus(
-      `Uploading ${scene.segmentCount.toLocaleString()} segments and ${scene.textInstanceCount.toLocaleString()} text instances to GPU...`
+      `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? ", raster fallback layer" : ""} to GPU...`
     );
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
@@ -649,7 +655,9 @@ function formatSceneStatus(
   const sourceSegmentCount = scene.sourceSegmentCount.toLocaleString();
   const visibleSegmentCount = scene.segmentCount.toLocaleString();
   const textInstanceCount = scene.textInstanceCount.toLocaleString();
-  return `${label} loaded | fills ${fillPathCount}, ${visibleSegmentCount} visible from ${sourceSegmentCount} source segments, ${textInstanceCount} text instances`;
+  const hasRasterLayer = scene.rasterLayerWidth > 0 && scene.rasterLayerHeight > 0 && scene.rasterLayerData.length > 0;
+  const rasterSuffix = hasRasterLayer ? `, raster ${scene.rasterLayerWidth}x${scene.rasterLayerHeight}` : "";
+  return `${label} loaded | fills ${fillPathCount}, ${visibleSegmentCount} visible from ${sourceSegmentCount} source segments, ${textInstanceCount} text instances${rasterSuffix}`;
 }
 
 function setStatus(message: string): void {
@@ -691,10 +699,18 @@ async function downloadParsedDataZip(): Promise<void> {
   try {
     const zip = new JSZip();
     const textureEntries = buildTextureExportEntries(scene, sceneStats);
+    const hasRasterLayer = scene.rasterLayerWidth > 0 && scene.rasterLayerHeight > 0 && scene.rasterLayerData.length > 0;
+    const rasterLayerFile = "raster/layer.rgba";
 
     for (const entry of textureEntries) {
       const path = `textures/${entry.name}.f32`;
       zip.file(path, new Uint8Array(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength));
+    }
+
+    if (hasRasterLayer) {
+      const expectedBytes = scene.rasterLayerWidth * scene.rasterLayerHeight * 4;
+      const rasterBytes = scene.rasterLayerData.subarray(0, expectedBytes);
+      zip.file(rasterLayerFile, rasterBytes);
     }
 
     const manifest = {
@@ -714,7 +730,11 @@ async function downloadParsedDataZip(): Promise<void> {
         fillSegmentCount: scene.fillSegmentCount,
         textInstanceCount: scene.textInstanceCount,
         textGlyphCount: scene.textGlyphCount,
-        textGlyphPrimitiveCount: scene.textGlyphSegmentCount
+        textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
+        rasterLayerWidth: hasRasterLayer ? scene.rasterLayerWidth : 0,
+        rasterLayerHeight: hasRasterLayer ? scene.rasterLayerHeight : 0,
+        rasterLayerMatrix: hasRasterLayer ? Array.from(scene.rasterLayerMatrix) : undefined,
+        rasterLayerFile: hasRasterLayer ? rasterLayerFile : undefined
       },
       textures: textureEntries.map((entry) => ({
         name: entry.name,
@@ -916,6 +936,15 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
   const sourceTextCount = readNonNegativeInt(sceneMeta.sourceTextCount, textInstanceCount);
   const textInPageCount = readNonNegativeInt(sceneMeta.textInPageCount, textInstanceCount);
   const textOutOfPageCount = readNonNegativeInt(sceneMeta.textOutOfPageCount, Math.max(0, sourceTextCount - textInPageCount));
+  const rasterLayerWidth = readNonNegativeInt(sceneMeta.rasterLayerWidth, 0);
+  const rasterLayerHeight = readNonNegativeInt(sceneMeta.rasterLayerHeight, 0);
+  const rasterLayerMatrix = parseMat2D(sceneMeta.rasterLayerMatrix) ?? new Float32Array([1, 0, 0, 1, 0, 0]);
+  const rasterLayerData = await readRasterLayerBytes(
+    zip,
+    typeof sceneMeta.rasterLayerFile === "string" ? sceneMeta.rasterLayerFile : "raster/layer.rgba",
+    rasterLayerWidth,
+    rasterLayerHeight
+  );
   const maxHalfWidth =
     readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
     computeMaxHalfWidth(styles, segmentCount);
@@ -954,6 +983,10 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
     textGlyphMetaB,
     textGlyphSegmentsA,
     textGlyphSegmentsB,
+    rasterLayerWidth,
+    rasterLayerHeight,
+    rasterLayerData,
+    rasterLayerMatrix,
     endpoints,
     primitiveMeta,
     primitiveBounds,
@@ -1174,6 +1207,49 @@ function parseBounds(value: unknown): Bounds | null {
   return { minX, minY, maxX, maxY };
 }
 
+function parseMat2D(value: unknown): Float32Array | null {
+  if (!Array.isArray(value) || value.length < 6) {
+    return null;
+  }
+
+  const out = new Float32Array(6);
+  for (let i = 0; i < 6; i += 1) {
+    const component = Number(value[i]);
+    if (!Number.isFinite(component)) {
+      return null;
+    }
+    out[i] = component;
+  }
+  return out;
+}
+
+async function readRasterLayerBytes(
+  zip: JSZip,
+  path: string,
+  width: number,
+  height: number
+): Promise<Uint8Array> {
+  if (width <= 0 || height <= 0) {
+    return new Uint8Array(0);
+  }
+
+  const expectedLength = width * height * 4;
+  const zipEntry = zip.file(path);
+  if (!zipEntry) {
+    return new Uint8Array(0);
+  }
+
+  const buffer = await zipEntry.async("arraybuffer");
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < expectedLength) {
+    throw new Error(`Raster layer data is truncated (${bytes.length} < ${expectedLength}).`);
+  }
+  if (bytes.length === expectedLength) {
+    return bytes;
+  }
+  return bytes.slice(0, expectedLength);
+}
+
 function computeMaxHalfWidth(styles: Float32Array, segmentCount: number): number {
   let maxHalfWidth = 0;
   for (let i = 0; i < segmentCount; i += 1) {
@@ -1291,6 +1367,7 @@ function updateMetricsPanel(
     sceneStats.textureHeight,
     sceneStats.maxTextureSize
   );
+  const hasRasterLayer = scene.rasterLayerWidth > 0 && scene.rasterLayerHeight > 0 && scene.rasterLayerData.length > 0;
 
   metricFileTextElement.textContent = label;
   metricOperatorsTextElement.textContent = scene.operatorCount.toLocaleString();
@@ -1304,7 +1381,7 @@ function updateMetricsPanel(
     `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}, glyphs ${scene.textGlyphCount.toLocaleString()} / glyph segments ${scene.textGlyphSegmentCount.toLocaleString()}`;
   metricTimesTextElement.textContent = `parse ${parseMs.toFixed(0)} ms, upload ${uploadMs.toFixed(0)} ms`;
   metricTextureTextElement.textContent =
-    `fill paths ${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight}, fill seg ${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight}, segments ${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max area ${sceneStats.maxTextureSize}x${sceneStats.maxTextureSize}), text inst ${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight}, glyph ${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight}, glyph-seg ${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight}`;
+    `fill paths ${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight}, fill seg ${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight}, segments ${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max area ${sceneStats.maxTextureSize}x${sceneStats.maxTextureSize}), text inst ${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight}, glyph ${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight}, glyph-seg ${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight}${hasRasterLayer ? `, raster ${scene.rasterLayerWidth}x${scene.rasterLayerHeight}` : ""}`;
   metricGridMaxCellTextElement.textContent = sceneStats.maxCellPopulation.toLocaleString();
   metricsPanelElement.dataset.ready = "true";
 }
@@ -1350,8 +1427,9 @@ function logTextureSizeStats(
     sceneStats.textureHeight,
     sceneStats.maxTextureSize
   );
+  const hasRasterLayer = scene.rasterLayerWidth > 0 && scene.rasterLayerHeight > 0 && scene.rasterLayerData.length > 0;
   console.log(
-    `[GPU texture size] ${label}: fills=${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight} (paths=${scene.fillPathCount.toLocaleString()}), fill-segments=${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight} (count=${scene.fillSegmentCount.toLocaleString()}), segments=${sceneStats.textureWidth}x${sceneStats.textureHeight} (count=${scene.segmentCount.toLocaleString()}, max=${sceneStats.maxTextureSize}, util=${utilization.toFixed(1)}%), text instances=${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight} (count=${scene.textInstanceCount.toLocaleString()}), glyphs=${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight} (count=${scene.textGlyphCount.toLocaleString()}), glyph-segments=${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight} (count=${scene.textGlyphSegmentCount.toLocaleString()})`
+    `[GPU texture size] ${label}: fills=${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight} (paths=${scene.fillPathCount.toLocaleString()}), fill-segments=${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight} (count=${scene.fillSegmentCount.toLocaleString()}), segments=${sceneStats.textureWidth}x${sceneStats.textureHeight} (count=${scene.segmentCount.toLocaleString()}, max=${sceneStats.maxTextureSize}, util=${utilization.toFixed(1)}%), text instances=${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight} (count=${scene.textInstanceCount.toLocaleString()}), glyphs=${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight} (count=${scene.textGlyphCount.toLocaleString()}), glyph-segments=${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight} (count=${scene.textGlyphSegmentCount.toLocaleString()})${hasRasterLayer ? `, raster=${scene.rasterLayerWidth}x${scene.rasterLayerHeight}` : ""}`
   );
 }
 
