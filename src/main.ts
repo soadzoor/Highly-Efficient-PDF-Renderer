@@ -37,9 +37,8 @@ const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-
 const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
 const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
+const vectorTextOnlyToggle = document.querySelector<HTMLInputElement>("#toggle-vector-text-only");
 const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
-const textMinifySmoothingSlider = document.querySelector<HTMLInputElement>("#text-minify-smoothing");
-const textMinifySmoothingValue = document.querySelector<HTMLSpanElement>("#text-minify-smoothing-value");
 const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages-per-row");
 
 if (
@@ -70,9 +69,8 @@ if (
   !segmentMergeToggle ||
   !invisibleCullToggle ||
   !strokeCurveToggle ||
+  !vectorTextOnlyToggle ||
   !webGpuToggle ||
-  !textMinifySmoothingSlider ||
-  !textMinifySmoothingValue ||
   !maxPagesPerRowInput
 ) {
   throw new Error("Required UI elements are missing from index.html.");
@@ -105,9 +103,8 @@ const panOptimizationToggleElement = panOptimizationToggle;
 const segmentMergeToggleElement = segmentMergeToggle;
 const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
+const vectorTextOnlyToggleElement = vectorTextOnlyToggle;
 const webGpuToggleElement = webGpuToggle;
-const textMinifySmoothingSliderElement = textMinifySmoothingSlider;
-const textMinifySmoothingValueElement = textMinifySmoothingValue;
 const maxPagesPerRowInputElement = maxPagesPerRowInput;
 
 type RendererBackend = "webgl" | "webgpu";
@@ -119,7 +116,7 @@ interface RendererApi {
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
   setPanOptimizationEnabled(enabled: boolean): void;
   setStrokeCurveEnabled(enabled: boolean): void;
-  setTextMinifySmoothing(value: number): void;
+  setTextVectorOnly(enabled: boolean): void;
   beginPanInteraction(): void;
   endPanInteraction(): void;
   resize(): void;
@@ -147,7 +144,7 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
   rendererApi.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
-  rendererApi.setTextMinifySmoothing(readTextMinifySmoothingSlider());
+  rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
   rendererApi.setFrameListener(onRendererFrame);
 }
 
@@ -252,7 +249,6 @@ initializeBackendToggleState();
 setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
-updateTextMinifySmoothingLabel(readTextMinifySmoothingSlider());
 maxPagesPerRowInputElement.value = String(readMaxPagesPerRowInput());
 
 openButtonElement.addEventListener("click", () => {
@@ -299,10 +295,8 @@ strokeCurveToggleElement.addEventListener("change", () => {
   renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
 });
 
-textMinifySmoothingSliderElement.addEventListener("input", () => {
-  const value = readTextMinifySmoothingSlider();
-  updateTextMinifySmoothingLabel(value);
-  renderer.setTextMinifySmoothing(value);
+vectorTextOnlyToggleElement.addEventListener("change", () => {
+  renderer.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
 });
 
 maxPagesPerRowInputElement.addEventListener("change", () => {
@@ -780,24 +774,12 @@ function setHudCollapsed(collapsed: boolean): void {
   toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
 }
 
-function readTextMinifySmoothingSlider(): number {
-  const parsed = Number(textMinifySmoothingSliderElement.value);
-  if (!Number.isFinite(parsed)) {
-    return 1;
-  }
-  return clamp(parsed, 0, 1);
-}
-
 function readMaxPagesPerRowInput(): number {
   const parsed = Math.trunc(Number(maxPagesPerRowInputElement.value));
   if (!Number.isFinite(parsed)) {
     return 10;
   }
   return clamp(parsed, 1, 100);
-}
-
-function updateTextMinifySmoothingLabel(value: number): void {
-  textMinifySmoothingValueElement.textContent = `${Math.round(clamp(value, 0, 1) * 100)}%`;
 }
 
 async function downloadParsedDataZip(): Promise<void> {

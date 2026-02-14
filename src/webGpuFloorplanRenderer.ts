@@ -1,6 +1,7 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { DrawStats, SceneStats, ViewState } from "./gpuFloorplanRenderer";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import { buildTextRasterAtlas } from "./textRasterAtlas";
 
 type FrameListener = (stats: DrawStats) => void;
 
@@ -36,7 +37,7 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
-  textMinifySmoothing : f32,
+  textVectorOnly : f32,
   pad0 : f32,
 };
 
@@ -250,7 +251,7 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
-  textMinifySmoothing : f32,
+  textVectorOnly : f32,
   pad0 : f32,
 };
 
@@ -508,7 +509,7 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
-  textMinifySmoothing : f32,
+  textVectorOnly : f32,
   pad0 : f32,
 };
 
@@ -520,6 +521,9 @@ struct CameraUniforms {
 @group(0) @binding(5) var uTextGlyphMetaTexB : texture_2d<f32>;
 @group(0) @binding(6) var uTextGlyphSegmentTexA : texture_2d<f32>;
 @group(0) @binding(7) var uTextGlyphSegmentTexB : texture_2d<f32>;
+@group(0) @binding(8) var uTextGlyphRasterMetaTex : texture_2d<f32>;
+@group(0) @binding(9) var uTextRasterSampler : sampler;
+@group(0) @binding(10) var uTextRasterAtlasTex : texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) position : vec4f,
@@ -528,6 +532,8 @@ struct VsOut {
   @location(2) @interpolate(flat) segmentCount : i32,
   @location(3) @interpolate(flat) color : vec3f,
   @location(4) @interpolate(flat) colorAlpha : f32,
+  @location(5) @interpolate(flat) rasterRect : vec4f,
+  @location(6) normCoord : vec2f,
 };
 
 const MAX_GLYPH_PRIMITIVES : i32 = 256;
@@ -663,6 +669,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let glyphCoord = coordFromIndex(glyphIndex, i32(glyphMetaDims.x));
   let glyphMetaA = textureLoad(uTextGlyphMetaTexA, glyphCoord, 0);
   let glyphMetaB = textureLoad(uTextGlyphMetaTexB, glyphCoord, 0);
+  let glyphRasterMeta = textureLoad(uTextGlyphRasterMetaTex, glyphCoord, 0);
 
   let segmentCount = i32(glyphMetaA.y + 0.5);
 
@@ -674,6 +681,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.segmentCount = 0;
     out.color = vec3f(0.0, 0.0, 0.0);
     out.colorAlpha = 0.0;
+    out.rasterRect = vec4f(0.0, 0.0, 0.0, 0.0);
+    out.normCoord = vec2f(0.0, 0.0);
     return out;
   }
 
@@ -696,6 +705,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.segmentCount = segmentCount;
   out.color = instanceC.xyz;
   out.colorAlpha = instanceC.w;
+  out.rasterRect = glyphRasterMeta;
+  out.normCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2f(1e-6, 1e-6)), vec2f(0.0), vec2f(1.0));
   return out;
 }
 
@@ -704,13 +715,43 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let pixelToLocalX = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let pixelToLocalY = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
   let localPerPixel = max(pixelToLocalX, pixelToLocalY);
-  let smoothing = clamp(uCamera.textMinifySmoothing, 0.0, 1.0);
-  let minifyFactor = smoothstep(0.01, 0.20, localPerPixel);
-  let smoothAmount = smoothing * minifyFactor;
   let baseAAWidth = max(localPerPixel * uCamera.textAAScreenPx, 1e-4);
+  let atlasDims = vec2f(textureDimensions(uTextRasterAtlasTex));
+  let nc = vec2f(inData.normCoord.x, 1.0 - inData.normCoord.y) * (inData.rasterRect.zw * atlasDims);
+  let ncFwidthX = fwidth(nc.x);
+  let ncFwidthY = fwidth(nc.y);
+  let dncDx = dpdx(nc);
+  let dncDy = dpdy(nc);
 
   if (inData.segmentCount <= 0) {
     discard;
+  }
+
+  if (
+    uCamera.textVectorOnly < 0.5 &&
+    inData.rasterRect.z > 0.0 &&
+    inData.rasterRect.w > 0.0 &&
+    min(ncFwidthX, ncFwidthY) > 2.0
+  ) {
+    let uv = vec2f(
+      inData.rasterRect.x + inData.normCoord.x * inData.rasterRect.z,
+      inData.rasterRect.y + (1.0 - inData.normCoord.y) * inData.rasterRect.w
+    );
+    let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
+    let dx = dncDx * 0.33 * texel;
+    let dy = dncDy * 0.33 * texel;
+    let alphaRaster = (1.0 / 3.0) * textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv).r +
+      (1.0 / 6.0) * (
+        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv - dx - dy).r +
+        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv - dx + dy).r +
+        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv + dx - dy).r +
+        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv + dx + dy).r
+      );
+    let alpha = alphaRaster * inData.colorAlpha;
+    if (alpha <= 0.001) {
+      discard;
+    }
+    return vec4f(inData.color, alpha);
   }
 
   let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
@@ -745,10 +786,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let inside = winding != 0;
   let signedDistance = select(minDistance, -minDistance, inside);
   let alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
-  let smoothAAWidth = baseAAWidth * (1.0 + smoothAmount * 7.0);
-  let smoothBias = localPerPixel * 0.55 * smoothAmount;
-  let alphaSmooth = 1.0 - smoothstep(-smoothAAWidth, smoothAAWidth, signedDistance - smoothBias);
-  let alpha = mix(alphaBase, alphaSmooth, smoothAmount) * inData.colorAlpha;
+  let alpha = alphaBase * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -767,7 +805,7 @@ struct CameraUniforms {
   textAAScreenPx : f32,
   textCurveEnabled : f32,
   fillAAScreenPx : f32,
-  textMinifySmoothing : f32,
+  textVectorOnly : f32,
   pad0 : f32,
 };
 
@@ -970,9 +1008,13 @@ export class WebGpuFloorplanRenderer {
 
   private textGlyphMetaTextureB: any = null;
 
+  private textGlyphRasterMetaTexture: any = null;
+
   private textGlyphSegmentTextureA: any = null;
 
   private textGlyphSegmentTextureB: any = null;
+
+  private textRasterAtlasTexture: any = null;
 
   private segmentIdBufferAll: any = null;
 
@@ -1018,7 +1060,7 @@ export class WebGpuFloorplanRenderer {
 
   private strokeCurveEnabled = true;
 
-  private textMinifySmoothing = 1;
+  private textVectorOnly = false;
 
   private panOptimizationEnabled = true;
 
@@ -1209,6 +1251,21 @@ export class WebGpuFloorplanRenderer {
           binding: 7,
           visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 8,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 9,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 10,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
         }
       ]
     });
@@ -1364,17 +1421,13 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
-  setTextMinifySmoothing(value: number): void {
-    if (!Number.isFinite(value)) {
+  setTextVectorOnly(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.textVectorOnly === nextEnabled) {
       return;
     }
 
-    const nextValue = clamp(value, 0, 1);
-    if (Math.abs(nextValue - this.textMinifySmoothing) <= 1e-4) {
-      return;
-    }
-
-    this.textMinifySmoothing = nextValue;
+    this.textVectorOnly = nextEnabled;
     this.panCacheValid = false;
     this.requestFrame();
   }
@@ -1463,6 +1516,19 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphMetaTextureB = this.createFloatTexture(this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight, scene.textGlyphMetaB);
     this.textGlyphSegmentTextureA = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsA);
     this.textGlyphSegmentTextureB = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsB);
+    const glyphRasterMetaData = new Float32Array(this.textGlyphMetaTextureWidth * this.textGlyphMetaTextureHeight * 4);
+    const textRasterAtlas = buildTextRasterAtlas(scene, maxTextureSize);
+    if (textRasterAtlas) {
+      glyphRasterMetaData.set(textRasterAtlas.glyphUvRects);
+    }
+    this.textGlyphRasterMetaTexture = this.createFloatTexture(
+      this.textGlyphMetaTextureWidth,
+      this.textGlyphMetaTextureHeight,
+      glyphRasterMetaData
+    );
+    this.textRasterAtlasTexture = textRasterAtlas
+      ? this.createRgba8Texture(textRasterAtlas.width, textRasterAtlas.height, textRasterAtlas.rgba)
+      : this.createRgba8Texture(1, 1, new Uint8Array([0, 0, 0, 0]));
 
     this.configureRasterLayers(scene);
 
@@ -1541,6 +1607,18 @@ export class WebGpuFloorplanRenderer {
         {
           binding: 7,
           resource: this.textGlyphSegmentTextureB.createView()
+        },
+        {
+          binding: 8,
+          resource: this.textGlyphRasterMetaTexture.createView()
+        },
+        {
+          binding: 9,
+          resource: this.rasterLayerSampler
+        },
+        {
+          binding: 10,
+          resource: this.textRasterAtlasTexture.createView()
         }
       ]
     });
@@ -2025,7 +2103,7 @@ export class WebGpuFloorplanRenderer {
     data[7] = 1.25;
     data[8] = this.strokeCurveEnabled ? 1 : 0;
     data[9] = 1.0;
-    data[10] = this.textMinifySmoothing;
+    data[10] = this.textVectorOnly ? 1 : 0;
     data[11] = 0;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
@@ -2541,8 +2619,10 @@ export class WebGpuFloorplanRenderer {
       this.textInstanceTextureC,
       this.textGlyphMetaTextureA,
       this.textGlyphMetaTextureB,
+      this.textGlyphRasterMetaTexture,
       this.textGlyphSegmentTextureA,
-      this.textGlyphSegmentTextureB
+      this.textGlyphSegmentTextureB,
+      this.textRasterAtlasTexture
     ];
 
     for (const texture of textures) {
@@ -2565,8 +2645,10 @@ export class WebGpuFloorplanRenderer {
     this.textInstanceTextureC = null;
     this.textGlyphMetaTextureA = null;
     this.textGlyphMetaTextureB = null;
+    this.textGlyphRasterMetaTexture = null;
     this.textGlyphSegmentTextureA = null;
     this.textGlyphSegmentTextureB = null;
+    this.textRasterAtlasTexture = null;
   }
 
   private clientToWorld(clientX: number, clientY: number): { x: number; y: number } {

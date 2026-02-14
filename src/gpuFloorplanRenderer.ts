@@ -1,5 +1,6 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import { buildTextRasterAtlas } from "./textRasterAtlas";
 
 const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
@@ -456,6 +457,7 @@ uniform sampler2D uTextInstanceTexB;
 uniform sampler2D uTextInstanceTexC;
 uniform sampler2D uTextGlyphMetaTexA;
 uniform sampler2D uTextGlyphMetaTexB;
+uniform sampler2D uTextGlyphRasterMetaTex;
 uniform ivec2 uTextInstanceTexSize;
 uniform ivec2 uTextGlyphMetaTexSize;
 uniform vec2 uViewport;
@@ -466,6 +468,8 @@ flat out int vSegmentStart;
 flat out int vSegmentCount;
 flat out vec3 vColor;
 flat out float vColorAlpha;
+flat out vec4 vRasterRect;
+out vec2 vNormCoord;
 out vec2 vLocal;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
@@ -483,6 +487,7 @@ void main() {
   int glyphIndex = int(instanceB.z + 0.5);
   vec4 glyphMetaA = texelFetch(uTextGlyphMetaTexA, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
   vec4 glyphMetaB = texelFetch(uTextGlyphMetaTexB, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
+  vec4 glyphRasterMeta = texelFetch(uTextGlyphRasterMetaTex, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
 
   int segmentCount = int(glyphMetaA.y + 0.5);
   if (segmentCount <= 0) {
@@ -491,6 +496,8 @@ void main() {
     vSegmentCount = 0;
     vColor = vec3(0.0);
     vColorAlpha = 0.0;
+    vRasterRect = vec4(0.0);
+    vNormCoord = vec2(0.0);
     vLocal = vec2(0.0);
     return;
   }
@@ -513,6 +520,8 @@ void main() {
   vSegmentCount = segmentCount;
   vColor = instanceC.rgb;
   vColorAlpha = instanceC.a;
+  vRasterRect = glyphRasterMeta;
+  vNormCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2(1e-6)), 0.0, 1.0);
   vLocal = local;
 }
 `;
@@ -523,15 +532,19 @@ precision highp sampler2D;
 
 uniform sampler2D uTextGlyphSegmentTexA;
 uniform sampler2D uTextGlyphSegmentTexB;
+uniform sampler2D uTextRasterAtlasTex;
 uniform ivec2 uTextGlyphSegmentTexSize;
+uniform vec2 uTextRasterAtlasSize;
 uniform float uTextAAScreenPx;
 uniform float uTextCurveEnabled;
-uniform float uTextMinifySmoothing;
+uniform float uTextVectorOnly;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
 flat in vec3 vColor;
 flat in float vColorAlpha;
+flat in vec4 vRasterRect;
+in vec2 vNormCoord;
 in vec2 vLocal;
 
 out vec4 outColor;
@@ -644,6 +657,33 @@ void main() {
     discard;
   }
 
+  if (uTextVectorOnly < 0.5 && vRasterRect.z > 0.0 && vRasterRect.w > 0.0) {
+    vec2 atlasPxSize = max(uTextRasterAtlasSize, vec2(1.0));
+    vec2 nc = vec2(vNormCoord.x, 1.0 - vNormCoord.y) * (vRasterRect.zw * atlasPxSize);
+    if (min(fwidth(nc.x), fwidth(nc.y)) > 2.0) {
+      vec2 uv = vec2(
+        vRasterRect.x + vNormCoord.x * vRasterRect.z,
+        vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
+      );
+      vec2 texel = 1.0 / atlasPxSize;
+      vec2 dx = dFdx(nc) * 0.33 * texel;
+      vec2 dy = dFdy(nc) * 0.33 * texel;
+      float alpha = (1.0 / 3.0) * texture(uTextRasterAtlasTex, uv).r +
+        (1.0 / 6.0) * (
+          texture(uTextRasterAtlasTex, uv - dx - dy).r +
+          texture(uTextRasterAtlasTex, uv - dx + dy).r +
+          texture(uTextRasterAtlasTex, uv + dx - dy).r +
+          texture(uTextRasterAtlasTex, uv + dx + dy).r
+        );
+      alpha *= vColorAlpha;
+      if (alpha <= 0.001) {
+        discard;
+      }
+      outColor = vec4(vColor, alpha);
+      return;
+    }
+  }
+
   float minDistance = 1e20;
   int winding = 0;
 
@@ -675,18 +715,10 @@ void main() {
   float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
   float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
   float localPerPixel = max(pixelToLocalX, pixelToLocalY);
-  float smoothing = clamp(uTextMinifySmoothing, 0.0, 1.0);
-  float minifyFactor = smoothstep(0.01, 0.20, localPerPixel);
-  float smoothAmount = smoothing * minifyFactor;
 
   float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
   float alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
-
-  float smoothAAWidth = baseAAWidth * (1.0 + smoothAmount * 7.0);
-  float smoothBias = localPerPixel * 0.55 * smoothAmount;
-  float alphaSmooth = 1.0 - smoothstep(-smoothAAWidth, smoothAAWidth, signedDistance - smoothBias);
-
-  float alpha = mix(alphaBase, alphaSmooth, smoothAmount) * vColorAlpha;
+  float alpha = alphaBase * vColorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -891,9 +923,13 @@ export class GpuFloorplanRenderer {
 
   private readonly textGlyphMetaTextureB: WebGLTexture;
 
+  private readonly textGlyphRasterMetaTexture: WebGLTexture;
+
   private readonly textGlyphSegmentTextureA: WebGLTexture;
 
   private readonly textGlyphSegmentTextureB: WebGLTexture;
+
+  private readonly textRasterAtlasTexture: WebGLTexture;
 
   private readonly uSegmentTexA: WebGLUniformLocation;
 
@@ -947,6 +983,8 @@ export class GpuFloorplanRenderer {
 
   private readonly uTextGlyphMetaTexB: WebGLUniformLocation;
 
+  private readonly uTextGlyphRasterMetaTex: WebGLUniformLocation;
+
   private readonly uTextGlyphSegmentTexA: WebGLUniformLocation;
 
   private readonly uTextGlyphSegmentTexB: WebGLUniformLocation;
@@ -967,7 +1005,11 @@ export class GpuFloorplanRenderer {
 
   private readonly uTextCurveEnabled: WebGLUniformLocation;
 
-  private readonly uTextMinifySmoothing: WebGLUniformLocation;
+  private readonly uTextRasterAtlasTex: WebGLUniformLocation;
+
+  private readonly uTextRasterAtlasSize: WebGLUniformLocation;
+
+  private readonly uTextVectorOnly: WebGLUniformLocation;
 
   private readonly uCacheTex: WebGLUniformLocation;
 
@@ -1047,6 +1089,10 @@ export class GpuFloorplanRenderer {
 
   private textGlyphMetaTextureHeight = 1;
 
+  private textRasterAtlasWidth = 1;
+
+  private textRasterAtlasHeight = 1;
+
   private textGlyphSegmentTextureWidth = 1;
 
   private textGlyphSegmentTextureHeight = 1;
@@ -1095,7 +1141,7 @@ export class GpuFloorplanRenderer {
 
   private strokeCurveEnabled = true;
 
-  private textMinifySmoothing = 1;
+  private textVectorOnly = false;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -1145,8 +1191,10 @@ export class GpuFloorplanRenderer {
     this.textInstanceTextureC = this.mustCreateTexture();
     this.textGlyphMetaTextureA = this.mustCreateTexture();
     this.textGlyphMetaTextureB = this.mustCreateTexture();
+    this.textGlyphRasterMetaTexture = this.mustCreateTexture();
     this.textGlyphSegmentTextureA = this.mustCreateTexture();
     this.textGlyphSegmentTextureB = this.mustCreateTexture();
+    this.textRasterAtlasTexture = this.mustCreateTexture();
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
@@ -1176,6 +1224,7 @@ export class GpuFloorplanRenderer {
     this.uTextInstanceTexC = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexC");
     this.uTextGlyphMetaTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexA");
     this.uTextGlyphMetaTexB = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexB");
+    this.uTextGlyphRasterMetaTex = this.mustGetUniformLocation(this.textProgram, "uTextGlyphRasterMetaTex");
     this.uTextGlyphSegmentTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexA");
     this.uTextGlyphSegmentTexB = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexB");
     this.uTextInstanceTexSize = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexSize");
@@ -1186,7 +1235,9 @@ export class GpuFloorplanRenderer {
     this.uTextZoom = this.mustGetUniformLocation(this.textProgram, "uZoom");
     this.uTextAAScreenPx = this.mustGetUniformLocation(this.textProgram, "uTextAAScreenPx");
     this.uTextCurveEnabled = this.mustGetUniformLocation(this.textProgram, "uTextCurveEnabled");
-    this.uTextMinifySmoothing = this.mustGetUniformLocation(this.textProgram, "uTextMinifySmoothing");
+    this.uTextRasterAtlasTex = this.mustGetUniformLocation(this.textProgram, "uTextRasterAtlasTex");
+    this.uTextRasterAtlasSize = this.mustGetUniformLocation(this.textProgram, "uTextRasterAtlasSize");
+    this.uTextVectorOnly = this.mustGetUniformLocation(this.textProgram, "uTextVectorOnly");
 
     this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
@@ -1235,17 +1286,12 @@ export class GpuFloorplanRenderer {
     this.requestFrame();
   }
 
-  setTextMinifySmoothing(value: number): void {
-    if (!Number.isFinite(value)) {
+  setTextVectorOnly(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.textVectorOnly === nextEnabled) {
       return;
     }
-
-    const nextValue = clamp(value, 0, 1);
-    if (Math.abs(nextValue - this.textMinifySmoothing) <= 1e-4) {
-      return;
-    }
-
-    this.textMinifySmoothing = nextValue;
+    this.textVectorOnly = nextEnabled;
     this.panCacheValid = false;
     this.requestFrame();
   }
@@ -1744,6 +1790,10 @@ export class GpuFloorplanRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureA);
     gl.activeTexture(gl.TEXTURE8);
     gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureB);
+    gl.activeTexture(gl.TEXTURE9);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphRasterMetaTexture);
+    gl.activeTexture(gl.TEXTURE13);
+    gl.bindTexture(gl.TEXTURE_2D, this.textRasterAtlasTexture);
 
     gl.uniform1i(this.uTextInstanceTexA, 2);
     gl.uniform1i(this.uTextInstanceTexB, 3);
@@ -1752,15 +1802,18 @@ export class GpuFloorplanRenderer {
     gl.uniform1i(this.uTextGlyphMetaTexB, 6);
     gl.uniform1i(this.uTextGlyphSegmentTexA, 7);
     gl.uniform1i(this.uTextGlyphSegmentTexB, 8);
+    gl.uniform1i(this.uTextGlyphRasterMetaTex, 9);
+    gl.uniform1i(this.uTextRasterAtlasTex, 13);
     gl.uniform2i(this.uTextInstanceTexSize, this.textInstanceTextureWidth, this.textInstanceTextureHeight);
     gl.uniform2i(this.uTextGlyphMetaTexSize, this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight);
     gl.uniform2i(this.uTextGlyphSegmentTexSize, this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight);
+    gl.uniform2f(this.uTextRasterAtlasSize, this.textRasterAtlasWidth, this.textRasterAtlasHeight);
     gl.uniform2f(this.uTextViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uTextZoom, this.zoom);
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
     gl.uniform1f(this.uTextCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
-    gl.uniform1f(this.uTextMinifySmoothing, this.textMinifySmoothing);
+    gl.uniform1f(this.uTextVectorOnly, this.textVectorOnly ? 1 : 0);
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.textInstanceCount);
     return this.textInstanceCount;
@@ -2281,6 +2334,17 @@ export class GpuFloorplanRenderer {
     const glyphMetaBData = new Float32Array(glyphMetaTexelCount * 4);
     glyphMetaBData.set(scene.textGlyphMetaB);
 
+    const glyphRasterMetaData = new Float32Array(glyphMetaTexelCount * 4);
+    const textRasterAtlas = buildTextRasterAtlas(scene, maxTextureSize);
+    if (textRasterAtlas) {
+      glyphRasterMetaData.set(textRasterAtlas.glyphUvRects);
+      this.textRasterAtlasWidth = textRasterAtlas.width;
+      this.textRasterAtlasHeight = textRasterAtlas.height;
+    } else {
+      this.textRasterAtlasWidth = 1;
+      this.textRasterAtlasHeight = 1;
+    }
+
     const glyphSegmentDataA = new Float32Array(glyphSegmentTexelCount * 4);
     glyphSegmentDataA.set(scene.textGlyphSegmentsA);
 
@@ -2357,6 +2421,20 @@ export class GpuFloorplanRenderer {
       glyphMetaBData
     );
 
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphRasterMetaTexture);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textGlyphMetaTextureWidth,
+      this.textGlyphMetaTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      glyphRasterMetaData
+    );
+
     gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureA);
     configureFloatTexture(gl);
     gl.texImage2D(
@@ -2384,6 +2462,26 @@ export class GpuFloorplanRenderer {
       gl.FLOAT,
       glyphSegmentDataB
     );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textRasterAtlasTexture);
+    configureRasterTexture(gl);
+    if (textRasterAtlas) {
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        this.textRasterAtlasWidth,
+        this.textRasterAtlasHeight,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        textRasterAtlas.rgba
+      );
+    } else {
+      const transparent = new Uint8Array([0, 0, 0, 0]);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, transparent);
+    }
+    gl.generateMipmap(gl.TEXTURE_2D);
 
     return {
       instanceTextureWidth: this.textInstanceTextureWidth,
