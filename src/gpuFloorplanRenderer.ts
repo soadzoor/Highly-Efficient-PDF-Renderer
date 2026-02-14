@@ -771,6 +771,20 @@ void main() {
 }
 `;
 
+const VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+uniform sampler2D uVectorLayerTex;
+uniform vec2 uViewportPx;
+
+out vec4 outColor;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / max(uViewportPx, vec2(1.0));
+  outColor = texture(uVectorLayerTex, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+`;
+
 const RASTER_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
 
@@ -826,11 +840,12 @@ void main() {
 `;
 
 const INTERACTION_DECAY_MS = 140;
-const FULL_VIEW_FALLBACK_THRESHOLD = 0.92;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const VECTOR_MINIFY_SUPERSAMPLE = 2;
+const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
 const CAMERA_DAMPING_ZOOM_RATE = 24;
 const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
@@ -895,6 +910,8 @@ export class GpuFloorplanRenderer {
   private readonly textProgram: WebGLProgram;
 
   private readonly blitProgram: WebGLProgram;
+
+  private readonly vectorCompositeProgram: WebGLProgram;
 
   private readonly rasterProgram: WebGLProgram;
 
@@ -1048,6 +1065,10 @@ export class GpuFloorplanRenderer {
 
   private readonly uOffsetPx: WebGLUniformLocation;
 
+  private readonly uVectorLayerTex: WebGLUniformLocation;
+
+  private readonly uVectorLayerViewportPx: WebGLUniformLocation;
+
   private readonly uRasterTex: WebGLUniformLocation;
 
   private readonly uRasterMatrixABCD: WebGLUniformLocation;
@@ -1198,11 +1219,24 @@ export class GpuFloorplanRenderer {
 
   private panCacheUsedCulling = false;
 
+  private vectorMinifyTexture: WebGLTexture | null = null;
+
+  private vectorMinifyFramebuffer: WebGLFramebuffer | null = null;
+
+  private vectorMinifyWidth = 0;
+
+  private vectorMinifyHeight = 0;
+
+  private vectorMinifyWarmupPending = false;
+
   private panOptimizationEnabled = true;
 
   private strokeCurveEnabled = true;
 
   private textVectorOnly = false;
+
+  // Keep first loaded frame complete; enable culling once user actually pans/zooms.
+  private hasCameraInteractionSinceSceneLoad = false;
 
   private pageBackgroundColor: [number, number, number, number] = [1, 1, 1, 1];
 
@@ -1231,6 +1265,7 @@ export class GpuFloorplanRenderer {
     this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE, FILL_FRAGMENT_SHADER_SOURCE);
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, TEXT_FRAGMENT_SHADER_SOURCE);
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
+    this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, RASTER_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
@@ -1315,6 +1350,9 @@ export class GpuFloorplanRenderer {
     this.uCacheSizePx = this.mustGetUniformLocation(this.blitProgram, "uCacheSizePx");
     this.uOffsetPx = this.mustGetUniformLocation(this.blitProgram, "uOffsetPx");
 
+    this.uVectorLayerTex = this.mustGetUniformLocation(this.vectorCompositeProgram, "uVectorLayerTex");
+    this.uVectorLayerViewportPx = this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx");
+
     this.uRasterTex = this.mustGetUniformLocation(this.rasterProgram, "uRasterTex");
     this.uRasterMatrixABCD = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixABCD");
     this.uRasterMatrixEF = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixEF");
@@ -1365,6 +1403,9 @@ export class GpuFloorplanRenderer {
     }
     this.textVectorOnly = nextEnabled;
     this.panCacheValid = false;
+    if (this.textVectorOnly) {
+      this.destroyVectorMinifyResources();
+    }
     this.requestFrame();
   }
 
@@ -1413,6 +1454,7 @@ export class GpuFloorplanRenderer {
   }
 
   beginPanInteraction(): void {
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.syncCameraTargetsToCurrent();
     this.panVelocityWorldX = 0;
     this.panVelocityWorldY = 0;
@@ -1461,6 +1503,7 @@ export class GpuFloorplanRenderer {
     this.canvas.height = nextHeight;
 
     this.destroyPanCacheResources();
+    this.destroyVectorMinifyResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -1474,6 +1517,7 @@ export class GpuFloorplanRenderer {
     this.buildSegmentBounds(scene);
     this.isPanInteracting = false;
     this.panCacheValid = false;
+    this.destroyVectorMinifyResources();
 
     this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
     this.uploadRasterLayers(scene);
@@ -1538,6 +1582,8 @@ export class GpuFloorplanRenderer {
 
     this.minZoom = 0.01;
     this.maxZoom = 8_192;
+    // WebGL can underperform when forcing a full-scene uncull on first frame; start with normal culling.
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.syncCameraTargetsToCurrent();
 
     this.needsVisibleSetUpdate = true;
@@ -1613,6 +1659,7 @@ export class GpuFloorplanRenderer {
     }
     this.frameListener = null;
     this.destroyPanCacheResources();
+    this.destroyVectorMinifyResources();
     for (const layer of this.rasterLayers) {
       this.gl.deleteTexture(layer.texture);
     }
@@ -1624,6 +1671,7 @@ export class GpuFloorplanRenderer {
       return;
     }
 
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.markInteraction();
     this.hasZoomAnchor = false;
     const worldDeltaX = -deltaX / this.zoom;
@@ -1641,6 +1689,7 @@ export class GpuFloorplanRenderer {
 
   zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void {
     const clampedFactor = clamp(zoomFactor, 0.1, 10);
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.isPanInteracting = false;
     this.markInteraction();
     const anchorWorld = this.clientToWorld(clientX, clientY);
@@ -1738,6 +1787,16 @@ export class GpuFloorplanRenderer {
 
   private renderDirectToScreen(): void {
     const gl = this.gl;
+    let useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
+
+    // WebGL drivers can produce a transient thin/missing first composite frame
+    // right after creating the minify target. Warm up with one direct frame.
+    if (useVectorMinify && this.vectorMinifyWarmupPending) {
+      useVectorMinify = false;
+      this.vectorMinifyWarmupPending = false;
+      this.needsVisibleSetUpdate = true;
+      this.requestFrame();
+    }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -1745,14 +1804,36 @@ export class GpuFloorplanRenderer {
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     if (this.needsVisibleSetUpdate) {
-      this.updateVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height);
+      if (useVectorMinify) {
+        const effectiveZoom = this.computeVectorMinifyZoom(this.vectorMinifyWidth, this.vectorMinifyHeight);
+        this.updateVisibleSet(
+          this.cameraCenterX,
+          this.cameraCenterY,
+          this.vectorMinifyWidth,
+          this.vectorMinifyHeight,
+          effectiveZoom
+        );
+      } else {
+        this.updateVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height, this.zoom);
+      }
       this.needsVisibleSetUpdate = false;
     }
 
     this.drawRasterLayer(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
-    this.drawFilledPaths(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
-    const instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
-    this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    let instanceCount = 0;
+    if (useVectorMinify) {
+      instanceCount = this.renderVectorLayerIntoMinifyTarget(
+        this.vectorMinifyWidth,
+        this.vectorMinifyHeight,
+        this.cameraCenterX,
+        this.cameraCenterY
+      );
+      this.compositeVectorMinifyLayer();
+    } else {
+      this.drawFilledPaths(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    }
 
     this.frameListener?.({
       renderedSegments: instanceCount,
@@ -1760,6 +1841,132 @@ export class GpuFloorplanRenderer {
       usedCulling: !this.usingAllSegments,
       zoom: this.zoom
     });
+  }
+
+  private hasVectorContent(): boolean {
+    return this.fillPathCount > 0 || this.segmentCount > 0 || this.textInstanceCount > 0;
+  }
+
+  private shouldUseVectorMinifyPath(): boolean {
+    if (this.textVectorOnly || !this.hasVectorContent()) {
+      return false;
+    }
+    return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
+  }
+
+  private computeVectorMinifyZoom(viewportWidth: number, viewportHeight: number): number {
+    const zoomScale = Math.min(
+      viewportWidth / Math.max(1, this.canvas.width),
+      viewportHeight / Math.max(1, this.canvas.height)
+    );
+    return this.zoom * Math.max(1, zoomScale);
+  }
+
+  private ensureVectorMinifyResources(): boolean {
+    const gl = this.gl;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    const maxScaleX = maxTextureSize / Math.max(1, this.canvas.width);
+    const maxScaleY = maxTextureSize / Math.max(1, this.canvas.height);
+    const scale = Math.max(1, Math.min(VECTOR_MINIFY_SUPERSAMPLE, maxScaleX, maxScaleY));
+    const desiredWidth = Math.max(this.canvas.width, Math.floor(this.canvas.width * scale));
+    const desiredHeight = Math.max(this.canvas.height, Math.floor(this.canvas.height * scale));
+
+    if (desiredWidth < this.canvas.width || desiredHeight < this.canvas.height) {
+      return false;
+    }
+
+    if (
+      this.vectorMinifyTexture &&
+      this.vectorMinifyFramebuffer &&
+      this.vectorMinifyWidth === desiredWidth &&
+      this.vectorMinifyHeight === desiredHeight
+    ) {
+      return true;
+    }
+
+    this.destroyVectorMinifyResources();
+
+    const texture = gl.createTexture();
+    if (!texture) {
+      return false;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    configureVectorMinifyTexture(gl);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, desiredWidth, desiredHeight);
+
+    const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    this.vectorMinifyTexture = texture;
+    this.vectorMinifyFramebuffer = framebuffer;
+    this.vectorMinifyWidth = desiredWidth;
+    this.vectorMinifyHeight = desiredHeight;
+    this.vectorMinifyWarmupPending = true;
+    return true;
+  }
+
+  private renderVectorLayerIntoMinifyTarget(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): number {
+    if (!this.vectorMinifyFramebuffer || !this.vectorMinifyTexture) {
+      return 0;
+    }
+
+    const gl = this.gl;
+    const effectiveZoom = this.computeVectorMinifyZoom(viewportWidth, viewportHeight);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.vectorMinifyFramebuffer);
+    gl.viewport(0, 0, viewportWidth, viewportHeight);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    // Offscreen vector layer needs straight-alpha color blending with correct alpha accumulation.
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+    this.drawFilledPaths(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    const instanceCount = this.drawVisibleSegments(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    this.drawTextInstances(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+
+    gl.bindTexture(gl.TEXTURE_2D, this.vectorMinifyTexture);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return instanceCount;
+  }
+
+  private compositeVectorMinifyLayer(): void {
+    if (!this.vectorMinifyTexture) {
+      return;
+    }
+
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.useProgram(this.vectorCompositeProgram);
+    gl.bindVertexArray(this.blitVao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.vectorMinifyTexture);
+    gl.uniform1i(this.uVectorLayerTex, 0);
+    gl.uniform2f(this.uVectorLayerViewportPx, this.canvas.width, this.canvas.height);
+
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   private renderWithPanCache(): void {
@@ -1896,7 +2103,8 @@ export class GpuFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    zoomValue = this.zoom
   ): number {
     if (!this.scene || this.fillPathCount <= 0) {
       return 0;
@@ -1927,7 +2135,7 @@ export class GpuFloorplanRenderer {
     gl.uniform2i(this.uFillSegmentTexSize, this.fillSegmentTextureWidth, this.fillSegmentTextureHeight);
     gl.uniform2f(this.uFillViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uFillCameraCenter, cameraCenterX, cameraCenterY);
-    gl.uniform1f(this.uFillZoom, this.zoom);
+    gl.uniform1f(this.uFillZoom, zoomValue);
     gl.uniform1f(this.uFillAAScreenPx, 1);
     gl.uniform4f(
       this.uFillVectorOverride,
@@ -1945,7 +2153,8 @@ export class GpuFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    zoomValue = this.zoom
   ): number {
     const instanceCount = this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount;
     if (instanceCount === 0) {
@@ -1979,7 +2188,7 @@ export class GpuFloorplanRenderer {
     gl.uniform2i(this.uSegmentTexSize, this.segmentTextureWidth, this.segmentTextureHeight);
     gl.uniform2f(this.uViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
-    gl.uniform1f(this.uZoom, this.zoom);
+    gl.uniform1f(this.uZoom, zoomValue);
     gl.uniform1f(this.uAAScreenPx, 1);
     gl.uniform1f(this.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
     gl.uniform4f(
@@ -1999,7 +2208,8 @@ export class GpuFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    zoomValue = this.zoom
   ): number {
     if (!this.scene || this.textInstanceCount <= 0) {
       return 0;
@@ -2044,7 +2254,7 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uTextRasterAtlasSize, this.textRasterAtlasWidth, this.textRasterAtlasHeight);
     gl.uniform2f(this.uTextViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
-    gl.uniform1f(this.uTextZoom, this.zoom);
+    gl.uniform1f(this.uTextZoom, zoomValue);
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
     gl.uniform1f(this.uTextCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
     gl.uniform1f(this.uTextVectorOnly, this.textVectorOnly ? 1 : 0);
@@ -2169,11 +2379,28 @@ export class GpuFloorplanRenderer {
     this.panCacheUsedCulling = false;
   }
 
+  private destroyVectorMinifyResources(): void {
+    if (this.vectorMinifyFramebuffer) {
+      this.gl.deleteFramebuffer(this.vectorMinifyFramebuffer);
+      this.vectorMinifyFramebuffer = null;
+    }
+
+    if (this.vectorMinifyTexture) {
+      this.gl.deleteTexture(this.vectorMinifyTexture);
+      this.vectorMinifyTexture = null;
+    }
+
+    this.vectorMinifyWidth = 0;
+    this.vectorMinifyHeight = 0;
+    this.vectorMinifyWarmupPending = false;
+  }
+
   private updateVisibleSet(
     viewCenterX: number = this.cameraCenterX,
     viewCenterY: number = this.cameraCenterY,
     viewportWidthPx: number = this.canvas.width,
-    viewportHeightPx: number = this.canvas.height
+    viewportHeightPx: number = this.canvas.height,
+    zoomValue: number = this.zoom
   ): void {
     if (!this.scene || !this.grid) {
       this.visibleSegmentCount = 0;
@@ -2181,12 +2408,19 @@ export class GpuFloorplanRenderer {
       return;
     }
 
+    if (!this.hasCameraInteractionSinceSceneLoad) {
+      this.usingAllSegments = true;
+      this.visibleSegmentCount = this.segmentCount;
+      return;
+    }
+
     const grid = this.grid;
 
-    const halfViewWidth = viewportWidthPx / (2 * this.zoom);
-    const halfViewHeight = viewportHeightPx / (2 * this.zoom);
+    const safeZoom = Math.max(zoomValue, 1e-6);
+    const halfViewWidth = viewportWidthPx / (2 * safeZoom);
+    const halfViewHeight = viewportHeightPx / (2 * safeZoom);
 
-    const margin = Math.max(16 / this.zoom, this.scene.maxHalfWidth * 2);
+    const margin = Math.max(16 / safeZoom, this.scene.maxHalfWidth * 2);
 
     const viewMinX = viewCenterX - halfViewWidth - margin;
     const viewMaxX = viewCenterX + halfViewWidth + margin;
@@ -2197,15 +2431,6 @@ export class GpuFloorplanRenderer {
     const c1 = clampToGrid(Math.floor((viewMaxX - grid.minX) / grid.cellWidth), grid.gridWidth);
     const r0 = clampToGrid(Math.floor((viewMinY - grid.minY) / grid.cellHeight), grid.gridHeight);
     const r1 = clampToGrid(Math.floor((viewMaxY - grid.minY) / grid.cellHeight), grid.gridHeight);
-
-    const visibleCellCount = (c1 - c0 + 1) * (r1 - r0 + 1);
-    const totalCellCount = grid.gridWidth * grid.gridHeight;
-
-    if (!this.isInteractionActive() && visibleCellCount >= totalCellCount * FULL_VIEW_FALLBACK_THRESHOLD) {
-      this.usingAllSegments = true;
-      this.visibleSegmentCount = this.segmentCount;
-      return;
-    }
 
     this.usingAllSegments = false;
 
@@ -2822,7 +3047,7 @@ export class GpuFloorplanRenderer {
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   private uploadPageBackgroundTexture(): void {
@@ -3091,6 +3316,13 @@ function configureFloatTexture(gl: WebGL2RenderingContext): void {
 function configureColorTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function configureVectorMinifyTexture(gl: WebGL2RenderingContext): void {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }

@@ -17,6 +17,8 @@ const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const VECTOR_MINIFY_SUPERSAMPLE = 2;
+const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
 const CAMERA_DAMPING_ZOOM_RATE = 24;
 const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
@@ -37,6 +39,9 @@ const CAMERA_UNIFORM_BUFFER_BYTES = 64;
 
 const BLIT_UNIFORM_FLOATS = 8;
 const BLIT_UNIFORM_BUFFER_BYTES = 48;
+
+const VECTOR_COMPOSITE_UNIFORM_FLOATS = 4;
+const VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES = 16;
 
 const RASTER_UNIFORM_FLOATS = 8;
 const RASTER_UNIFORM_BUFFER_BYTES = 32;
@@ -958,6 +963,52 @@ fn fsMain(@builtin(position) fragPos : vec4f) -> @location(0) vec4f {
 }
 `;
 
+const VECTOR_COMPOSITE_SHADER_SOURCE = /* wgsl */ `
+struct VectorCompositeUniforms {
+  viewportPx : vec2f,
+  pad : vec2f,
+};
+
+@group(0) @binding(0) var uVectorSampler : sampler;
+@group(0) @binding(1) var uVectorTex : texture_2d<f32>;
+@group(0) @binding(2) var<uniform> uComposite : VectorCompositeUniforms;
+
+struct VsOut {
+  @builtin(position) position : vec4f,
+};
+
+fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
+  switch (vertexIndex) {
+    case 0u: {
+      return vec2f(-1.0, -1.0);
+    }
+    case 1u: {
+      return vec2f(1.0, -1.0);
+    }
+    case 2u: {
+      return vec2f(-1.0, 1.0);
+    }
+    default: {
+      return vec2f(1.0, 1.0);
+    }
+  }
+}
+
+@vertex
+fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
+  var out : VsOut;
+  out.position = vec4f(cornerFromVertexIndex(vertexIndex), 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fsMain(@builtin(position) fragPos : vec4f) -> @location(0) vec4f {
+  let viewport = max(uComposite.viewportPx, vec2f(1.0, 1.0));
+  let uv = fragPos.xy / viewport;
+  return textureSampleLevel(uVectorTex, uVectorSampler, clamp(uv, vec2f(0.0), vec2f(1.0)), 0.0);
+}
+`;
+
 export class WebGpuFloorplanRenderer {
   private readonly canvas: HTMLCanvasElement;
 
@@ -977,13 +1028,19 @@ export class WebGpuFloorplanRenderer {
 
   private readonly blitPipeline: any;
 
+  private readonly vectorCompositePipeline: any;
+
   private readonly cameraUniformBuffer: any;
 
   private readonly blitUniformBuffer: any;
 
+  private readonly vectorCompositeUniformBuffer: any;
+
   private readonly panCacheSampler: any;
 
   private readonly rasterLayerSampler: any;
+
+  private readonly vectorCompositeSampler: any;
 
   private readonly strokeBindGroupLayout: any;
 
@@ -995,6 +1052,8 @@ export class WebGpuFloorplanRenderer {
 
   private readonly blitBindGroupLayout: any;
 
+  private readonly vectorCompositeBindGroupLayout: any;
+
   private strokeBindGroupAll: any = null;
 
   private strokeBindGroupVisible: any = null;
@@ -1004,6 +1063,8 @@ export class WebGpuFloorplanRenderer {
   private textBindGroup: any = null;
 
   private blitBindGroup: any = null;
+
+  private vectorCompositeBindGroup: any = null;
 
   private segmentTextureA: any = null;
 
@@ -1065,6 +1126,12 @@ export class WebGpuFloorplanRenderer {
   private panCacheRenderedSegments = 0;
 
   private panCacheUsedCulling = false;
+
+  private vectorMinifyTexture: any = null;
+
+  private vectorMinifyWidth = 0;
+
+  private vectorMinifyHeight = 0;
 
   private scene: VectorScene | null = null;
 
@@ -1129,6 +1196,9 @@ export class WebGpuFloorplanRenderer {
   private panOptimizationEnabled = true;
 
   private isPanInteracting = false;
+
+  // Keep first loaded frame complete; enable culling once user actually pans/zooms.
+  private hasCameraInteractionSinceSceneLoad = false;
 
   private lastInteractionTime = Number.NEGATIVE_INFINITY;
 
@@ -1201,6 +1271,11 @@ export class WebGpuFloorplanRenderer {
 
     this.blitUniformBuffer = this.gpuDevice.createBuffer({
       size: BLIT_UNIFORM_BUFFER_BYTES,
+      usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
+    });
+
+    this.vectorCompositeUniformBuffer = this.gpuDevice.createBuffer({
+      size: VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES,
       usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
     });
 
@@ -1379,6 +1454,26 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
+    this.vectorCompositeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 1,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        },
+        {
+          binding: 2,
+          visibility: gpuShaderStage.FRAGMENT,
+          buffer: { type: "uniform", minBindingSize: VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES }
+        }
+      ]
+    });
+
     const strokePipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.strokeBindGroupLayout]
     });
@@ -1394,12 +1489,22 @@ export class WebGpuFloorplanRenderer {
     const blitPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.blitBindGroupLayout]
     });
+    const vectorCompositePipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.vectorCompositeBindGroupLayout]
+    });
 
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
     this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
     this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout, true);
     this.blitPipeline = this.createPipeline(BLIT_SHADER_SOURCE, "vsMain", "fsMain", blitPipelineLayout);
+    this.vectorCompositePipeline = this.createPipeline(
+      VECTOR_COMPOSITE_SHADER_SOURCE,
+      "vsMain",
+      "fsMain",
+      vectorCompositePipelineLayout,
+      true
+    );
 
     this.panCacheSampler = this.gpuDevice.createSampler({
       magFilter: "nearest",
@@ -1413,6 +1518,14 @@ export class WebGpuFloorplanRenderer {
       magFilter: "linear",
       minFilter: "linear",
       mipmapFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge"
+    });
+
+    this.vectorCompositeSampler = this.gpuDevice.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "nearest",
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge"
     });
@@ -1495,6 +1608,9 @@ export class WebGpuFloorplanRenderer {
 
     this.textVectorOnly = nextEnabled;
     this.panCacheValid = false;
+    if (this.textVectorOnly) {
+      this.destroyVectorMinifyResources();
+    }
     this.requestFrame();
   }
 
@@ -1543,6 +1659,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   beginPanInteraction(): void {
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.syncCameraTargetsToCurrent();
     this.panVelocityWorldX = 0;
     this.panVelocityWorldY = 0;
@@ -1592,6 +1709,7 @@ export class WebGpuFloorplanRenderer {
     this.configureContext();
 
     this.destroyPanCacheResources();
+    this.destroyVectorMinifyResources();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -1605,6 +1723,7 @@ export class WebGpuFloorplanRenderer {
 
     this.isPanInteracting = false;
     this.panCacheValid = false;
+    this.destroyVectorMinifyResources();
 
     this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
 
@@ -1852,6 +1971,7 @@ export class WebGpuFloorplanRenderer {
 
     this.minZoom = 0.01;
     this.maxZoom = 8_192;
+    this.hasCameraInteractionSinceSceneLoad = false;
     this.syncCameraTargetsToCurrent();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -1924,6 +2044,7 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.markInteraction();
     this.hasZoomAnchor = false;
     const worldDeltaX = -deltaX / this.zoom;
@@ -1941,6 +2062,7 @@ export class WebGpuFloorplanRenderer {
 
   zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void {
     const clampedFactor = clamp(zoomFactor, 0.1, 10);
+    this.hasCameraInteractionSinceSceneLoad = true;
     this.isPanInteracting = false;
     this.markInteraction();
     const anchorWorld = this.clientToWorld(clientX, clientY);
@@ -1978,6 +2100,7 @@ export class WebGpuFloorplanRenderer {
 
     this.frameListener = null;
     this.destroyPanCacheResources();
+    this.destroyVectorMinifyResources();
     this.destroyDataResources();
 
     if (this.segmentIdBufferAll) {
@@ -1994,6 +2117,9 @@ export class WebGpuFloorplanRenderer {
     }
     if (this.blitUniformBuffer) {
       this.blitUniformBuffer.destroy();
+    }
+    if (this.vectorCompositeUniformBuffer) {
+      this.vectorCompositeUniformBuffer.destroy();
     }
     if (this.pageBackgroundTexture) {
       this.pageBackgroundTexture.destroy();
@@ -2145,9 +2271,59 @@ export class WebGpuFloorplanRenderer {
   }
 
   private renderDirectToScreen(): void {
+    const useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
+
     if (this.needsVisibleSetUpdate) {
-      this.updateVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height);
+      if (useVectorMinify) {
+        const effectiveZoom = this.computeVectorMinifyZoom(this.vectorMinifyWidth, this.vectorMinifyHeight);
+        this.updateVisibleSet(
+          this.cameraCenterX,
+          this.cameraCenterY,
+          this.vectorMinifyWidth,
+          this.vectorMinifyHeight,
+          effectiveZoom
+        );
+      } else {
+        this.updateVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height, this.zoom);
+      }
       this.needsVisibleSetUpdate = false;
+    }
+
+    if (useVectorMinify) {
+      const renderedSegments = this.renderVectorLayerIntoMinifyTarget(
+        this.vectorMinifyWidth,
+        this.vectorMinifyHeight,
+        this.cameraCenterX,
+        this.cameraCenterY
+      );
+
+      const view = this.gpuContext.getCurrentTexture().createView();
+      const encoder = this.gpuDevice.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view,
+            clearValue: CLEAR_COLOR,
+            loadOp: "clear",
+            storeOp: "store"
+          }
+        ]
+      });
+
+      this.updateCameraUniforms(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      this.drawRasterContentIntoPass(pass);
+      this.drawVectorMinifyCompositeIntoPass(pass, this.canvas.width, this.canvas.height);
+
+      pass.end();
+      this.gpuDevice.queue.submit([encoder.finish()]);
+
+      this.frameListener?.({
+        renderedSegments,
+        totalSegments: this.segmentCount,
+        usedCulling: !this.usingAllSegments,
+        zoom: this.zoom
+      });
+      return;
     }
 
     const view = this.gpuContext.getCurrentTexture().createView();
@@ -2174,6 +2350,66 @@ export class WebGpuFloorplanRenderer {
       usedCulling: !this.usingAllSegments,
       zoom: this.zoom
     });
+  }
+
+  private hasVectorContent(): boolean {
+    return this.fillPathCount > 0 || this.segmentCount > 0 || this.textInstanceCount > 0;
+  }
+
+  private shouldUseVectorMinifyPath(): boolean {
+    if (this.textVectorOnly || !this.hasVectorContent()) {
+      return false;
+    }
+    return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
+  }
+
+  private computeVectorMinifyZoom(viewportWidth: number, viewportHeight: number): number {
+    const zoomScale = Math.min(
+      viewportWidth / Math.max(1, this.canvas.width),
+      viewportHeight / Math.max(1, this.canvas.height)
+    );
+    return this.zoom * Math.max(1, zoomScale);
+  }
+
+  private renderVectorLayerIntoMinifyTarget(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): number {
+    if (!this.vectorMinifyTexture) {
+      return 0;
+    }
+
+    const effectiveZoom = this.computeVectorMinifyZoom(viewportWidth, viewportHeight);
+    const encoder = this.gpuDevice.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: this.vectorMinifyTexture.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "store"
+        }
+      ]
+    });
+
+    this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    const renderedSegments = this.drawVectorContentIntoPass(pass);
+    pass.end();
+    this.gpuDevice.queue.submit([encoder.finish()]);
+    return renderedSegments;
+  }
+
+  private drawVectorMinifyCompositeIntoPass(pass: any, viewportWidth: number, viewportHeight: number): void {
+    if (!this.vectorCompositeBindGroup || !this.vectorMinifyTexture) {
+      return;
+    }
+
+    this.updateVectorCompositeUniforms(viewportWidth, viewportHeight);
+    pass.setPipeline(this.vectorCompositePipeline);
+    pass.setBindGroup(0, this.vectorCompositeBindGroup);
+    pass.draw(4, 1, 0, 0);
   }
 
   private renderWithPanCache(): void {
@@ -2248,7 +2484,11 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number
   ): number {
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
+    this.drawRasterContentIntoPass(pass);
+    return this.drawVectorContentIntoPass(pass);
+  }
 
+  private drawRasterContentIntoPass(pass: any): void {
     if (this.pageBackgroundResources.length > 0) {
       pass.setPipeline(this.rasterPipeline);
       for (const layer of this.pageBackgroundResources) {
@@ -2264,7 +2504,9 @@ export class WebGpuFloorplanRenderer {
         pass.draw(4, 1, 0, 0);
       }
     }
+  }
 
+  private drawVectorContentIntoPass(pass: any): number {
     if (this.fillPathCount > 0 && this.fillBindGroup) {
       pass.setPipeline(this.fillPipeline);
       pass.setBindGroup(0, this.fillBindGroup);
@@ -2294,14 +2536,15 @@ export class WebGpuFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    zoomValue = this.zoom
   ): void {
     const data = new Float32Array(CAMERA_UNIFORM_FLOATS);
     data[0] = viewportWidth;
     data[1] = viewportHeight;
     data[2] = cameraCenterX;
     data[3] = cameraCenterY;
-    data[4] = this.zoom;
+    data[4] = zoomValue;
     data[5] = 1.0;
     data[6] = this.strokeCurveEnabled ? 1 : 0;
     data[7] = 1.25;
@@ -2316,6 +2559,16 @@ export class WebGpuFloorplanRenderer {
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
+  }
+
+  private updateVectorCompositeUniforms(viewportWidth: number, viewportHeight: number): void {
+    const data = new Float32Array(VECTOR_COMPOSITE_UNIFORM_FLOATS);
+    data[0] = viewportWidth;
+    data[1] = viewportHeight;
+    data[2] = 0;
+    data[3] = 0;
+    assertUniformBufferSizeMatches(data, VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES, "vector composite");
+    this.gpuDevice.queue.writeBuffer(this.vectorCompositeUniformBuffer, 0, data);
   }
 
   private updateBlitUniforms(offsetPxX: number, offsetPxY: number): void {
@@ -2360,6 +2613,64 @@ export class WebGpuFloorplanRenderer {
 
     pass.end();
     this.gpuDevice.queue.submit([encoder.finish()]);
+  }
+
+  private ensureVectorMinifyResources(): boolean {
+    const maxTextureSize = this.maxTextureSize();
+    const maxScaleX = maxTextureSize / Math.max(1, this.canvas.width);
+    const maxScaleY = maxTextureSize / Math.max(1, this.canvas.height);
+    const scale = Math.max(1, Math.min(VECTOR_MINIFY_SUPERSAMPLE, maxScaleX, maxScaleY));
+    const desiredWidth = Math.max(this.canvas.width, Math.floor(this.canvas.width * scale));
+    const desiredHeight = Math.max(this.canvas.height, Math.floor(this.canvas.height * scale));
+
+    if (desiredWidth < this.canvas.width || desiredHeight < this.canvas.height) {
+      return false;
+    }
+
+    if (
+      this.vectorMinifyTexture &&
+      this.vectorMinifyWidth === desiredWidth &&
+      this.vectorMinifyHeight === desiredHeight &&
+      this.vectorCompositeBindGroup
+    ) {
+      return true;
+    }
+
+    this.destroyVectorMinifyResources();
+
+    const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
+    this.vectorMinifyTexture = this.gpuDevice.createTexture({
+      size: {
+        width: desiredWidth,
+        height: desiredHeight,
+        depthOrArrayLayers: 1
+      },
+      format: this.presentationFormat,
+      usage: gpuTextureUsage.RENDER_ATTACHMENT | gpuTextureUsage.TEXTURE_BINDING
+    });
+
+    this.vectorMinifyWidth = desiredWidth;
+    this.vectorMinifyHeight = desiredHeight;
+
+    this.vectorCompositeBindGroup = this.gpuDevice.createBindGroup({
+      layout: this.vectorCompositePipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: this.vectorCompositeSampler
+        },
+        {
+          binding: 1,
+          resource: this.vectorMinifyTexture.createView()
+        },
+        {
+          binding: 2,
+          resource: { buffer: this.vectorCompositeUniformBuffer, size: VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES }
+        }
+      ]
+    });
+
+    return true;
   }
 
   private ensurePanCacheResources(): boolean {
@@ -2439,11 +2750,23 @@ export class WebGpuFloorplanRenderer {
     this.blitBindGroup = null;
   }
 
+  private destroyVectorMinifyResources(): void {
+    if (this.vectorMinifyTexture) {
+      this.vectorMinifyTexture.destroy();
+      this.vectorMinifyTexture = null;
+    }
+
+    this.vectorMinifyWidth = 0;
+    this.vectorMinifyHeight = 0;
+    this.vectorCompositeBindGroup = null;
+  }
+
   private updateVisibleSet(
     viewCenterX: number = this.cameraCenterX,
     viewCenterY: number = this.cameraCenterY,
     viewportWidthPx: number = this.canvas.width,
-    viewportHeightPx: number = this.canvas.height
+    viewportHeightPx: number = this.canvas.height,
+    zoomValue: number = this.zoom
   ): void {
     if (!this.scene || !this.grid) {
       this.visibleSegmentCount = 0;
@@ -2451,12 +2774,19 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
+    if (!this.hasCameraInteractionSinceSceneLoad) {
+      this.usingAllSegments = true;
+      this.visibleSegmentCount = this.segmentCount;
+      return;
+    }
+
     const grid = this.grid;
 
-    const halfViewWidth = viewportWidthPx / (2 * this.zoom);
-    const halfViewHeight = viewportHeightPx / (2 * this.zoom);
+    const safeZoom = Math.max(zoomValue, 1e-6);
+    const halfViewWidth = viewportWidthPx / (2 * safeZoom);
+    const halfViewHeight = viewportHeightPx / (2 * safeZoom);
 
-    const margin = Math.max(16 / this.zoom, this.scene.maxHalfWidth * 2);
+    const margin = Math.max(16 / safeZoom, this.scene.maxHalfWidth * 2);
 
     const viewMinX = viewCenterX - halfViewWidth - margin;
     const viewMaxX = viewCenterX + halfViewWidth + margin;
