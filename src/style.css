@@ -120,6 +120,20 @@ body {
   color: #334155;
 }
 
+.number-row {
+  display: grid;
+  grid-template-columns: max-content minmax(70px, 120px);
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 0.84rem;
+  color: #1f2937;
+}
+
+.number-row input[type="number"] {
+  width: 100%;
+}
+
 .toggle {
   display: inline-flex;
   align-items: center;

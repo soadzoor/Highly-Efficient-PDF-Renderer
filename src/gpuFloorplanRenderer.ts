@@ -825,6 +825,11 @@ export interface ViewState {
 
 type FrameListener = (stats: DrawStats) => void;
 
+interface RasterLayerGpu {
+  texture: WebGLTexture;
+  matrix: Float32Array;
+}
+
 export class GpuFloorplanRenderer {
   private readonly canvas: HTMLCanvasElement;
 
@@ -889,8 +894,6 @@ export class GpuFloorplanRenderer {
   private readonly textGlyphSegmentTextureA: WebGLTexture;
 
   private readonly textGlyphSegmentTextureB: WebGLTexture;
-
-  private readonly rasterTexture: WebGLTexture;
 
   private readonly uSegmentTexA: WebGLUniformLocation;
 
@@ -1018,9 +1021,7 @@ export class GpuFloorplanRenderer {
 
   private textInstanceCount = 0;
 
-  private hasRasterLayer = false;
-
-  private rasterLayerMatrix = new Float32Array(6);
+  private rasterLayers: RasterLayerGpu[] = [];
 
   private visibleSegmentCount = 0;
 
@@ -1146,7 +1147,6 @@ export class GpuFloorplanRenderer {
     this.textGlyphMetaTextureB = this.mustCreateTexture();
     this.textGlyphSegmentTextureA = this.mustCreateTexture();
     this.textGlyphSegmentTextureB = this.mustCreateTexture();
-    this.rasterTexture = this.mustCreateTexture();
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
@@ -1289,7 +1289,7 @@ export class GpuFloorplanRenderer {
     this.panCacheValid = false;
 
     this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
-    this.uploadRasterLayer(scene);
+    this.uploadRasterLayers(scene);
     const fillTextureStats = this.uploadFillPaths(scene);
     const textureStats = this.uploadSegments(scene);
     const textTextureStats = this.uploadTextData(scene);
@@ -1413,6 +1413,10 @@ export class GpuFloorplanRenderer {
     }
     this.frameListener = null;
     this.destroyPanCacheResources();
+    for (const layer of this.rasterLayers) {
+      this.gl.deleteTexture(layer.texture);
+    }
+    this.rasterLayers = [];
   }
 
   panByPixels(deltaX: number, deltaY: number): void {
@@ -1461,7 +1465,7 @@ export class GpuFloorplanRenderer {
   private render(): void {
     const gl = this.gl;
 
-    if (!this.scene || (this.fillPathCount === 0 && this.segmentCount === 0 && this.textInstanceCount === 0 && !this.hasRasterLayer)) {
+    if (!this.scene || (this.fillPathCount === 0 && this.segmentCount === 0 && this.textInstanceCount === 0 && this.rasterLayers.length === 0)) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.clearColor(1, 1, 1, 1);
@@ -1591,7 +1595,7 @@ export class GpuFloorplanRenderer {
     cameraCenterX: number,
     cameraCenterY: number
   ): void {
-    if (!this.hasRasterLayer) {
+    if (this.rasterLayers.length === 0) {
       return;
     }
 
@@ -1599,25 +1603,26 @@ export class GpuFloorplanRenderer {
     gl.useProgram(this.rasterProgram);
     gl.bindVertexArray(this.blitVao);
 
-    gl.activeTexture(gl.TEXTURE12);
-    gl.bindTexture(gl.TEXTURE_2D, this.rasterTexture);
-    gl.uniform1i(this.uRasterTex, 12);
-
-    gl.uniform4f(
-      this.uRasterMatrixABCD,
-      this.rasterLayerMatrix[0],
-      this.rasterLayerMatrix[1],
-      this.rasterLayerMatrix[2],
-      this.rasterLayerMatrix[3]
-    );
-    gl.uniform2f(this.uRasterMatrixEF, this.rasterLayerMatrix[4], this.rasterLayerMatrix[5]);
     gl.uniform2f(this.uRasterViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uRasterZoom, this.zoom);
 
     // Raster textures are premultiplied on upload to avoid dark/gray filtering fringes.
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    for (const layer of this.rasterLayers) {
+      gl.activeTexture(gl.TEXTURE12);
+      gl.bindTexture(gl.TEXTURE_2D, layer.texture);
+      gl.uniform1i(this.uRasterTex, 12);
+      gl.uniform4f(
+        this.uRasterMatrixABCD,
+        layer.matrix[0],
+        layer.matrix[1],
+        layer.matrix[2],
+        layer.matrix[3]
+      );
+      gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
@@ -1953,40 +1958,80 @@ export class GpuFloorplanRenderer {
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
   }
 
-  private uploadRasterLayer(scene: VectorScene): void {
+  private uploadRasterLayers(scene: VectorScene): void {
     const gl = this.gl;
-    const width = Math.max(0, Math.trunc(scene.rasterLayerWidth));
-    const height = Math.max(0, Math.trunc(scene.rasterLayerHeight));
-    const hasData = width > 0 && height > 0 && scene.rasterLayerData.length >= width * height * 4;
-
-    this.hasRasterLayer = hasData;
-    if (scene.rasterLayerMatrix.length >= 6) {
-      this.rasterLayerMatrix[0] = scene.rasterLayerMatrix[0];
-      this.rasterLayerMatrix[1] = scene.rasterLayerMatrix[1];
-      this.rasterLayerMatrix[2] = scene.rasterLayerMatrix[2];
-      this.rasterLayerMatrix[3] = scene.rasterLayerMatrix[3];
-      this.rasterLayerMatrix[4] = scene.rasterLayerMatrix[4];
-      this.rasterLayerMatrix[5] = scene.rasterLayerMatrix[5];
-    } else {
-      this.rasterLayerMatrix[0] = 1;
-      this.rasterLayerMatrix[1] = 0;
-      this.rasterLayerMatrix[2] = 0;
-      this.rasterLayerMatrix[3] = 1;
-      this.rasterLayerMatrix[4] = 0;
-      this.rasterLayerMatrix[5] = 0;
+    for (const layer of this.rasterLayers) {
+      gl.deleteTexture(layer.texture);
     }
+    this.rasterLayers = [];
 
-    gl.bindTexture(gl.TEXTURE_2D, this.rasterTexture);
-    configureRasterTexture(gl);
-    if (hasData) {
-      const pixels = scene.rasterLayerData.subarray(0, width * height * 4);
+    for (const source of this.getSceneRasterLayers(scene)) {
+      const texture = gl.createTexture();
+      if (!texture) {
+        continue;
+      }
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      configureRasterTexture(gl);
+      const pixels = source.data.subarray(0, source.width * source.height * 4);
       const premultiplied = premultiplyRgba(pixels);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultiplied);
-    } else {
-      const transparent = new Uint8Array([0, 0, 0, 0]);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, transparent);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, source.width, source.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultiplied);
+      gl.generateMipmap(gl.TEXTURE_2D);
+
+      const matrix = new Float32Array(6);
+      if (source.matrix.length >= 6) {
+        matrix[0] = source.matrix[0];
+        matrix[1] = source.matrix[1];
+        matrix[2] = source.matrix[2];
+        matrix[3] = source.matrix[3];
+        matrix[4] = source.matrix[4];
+        matrix[5] = source.matrix[5];
+      } else {
+        matrix[0] = 1;
+        matrix[3] = 1;
+      }
+
+      this.rasterLayers.push({ texture, matrix });
     }
-    gl.generateMipmap(gl.TEXTURE_2D);
+  }
+
+  private getSceneRasterLayers(
+    scene: VectorScene
+  ): Array<{ width: number; height: number; data: Uint8Array<ArrayBufferLike>; matrix: Float32Array }> {
+    const out: Array<{ width: number; height: number; data: Uint8Array<ArrayBufferLike>; matrix: Float32Array }> = [];
+    if (Array.isArray(scene.rasterLayers)) {
+      for (const layer of scene.rasterLayers) {
+        const width = Math.max(0, Math.trunc(layer?.width ?? 0));
+        const height = Math.max(0, Math.trunc(layer?.height ?? 0));
+        if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
+          continue;
+        }
+        out.push({
+          width,
+          height,
+          data: layer.data,
+          matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix)
+        });
+      }
+    }
+
+    if (out.length > 0) {
+      return out;
+    }
+
+    const legacyWidth = Math.max(0, Math.trunc(scene.rasterLayerWidth));
+    const legacyHeight = Math.max(0, Math.trunc(scene.rasterLayerHeight));
+    if (legacyWidth <= 0 || legacyHeight <= 0 || scene.rasterLayerData.length < legacyWidth * legacyHeight * 4) {
+      return out;
+    }
+
+    out.push({
+      width: legacyWidth,
+      height: legacyHeight,
+      data: scene.rasterLayerData,
+      matrix: scene.rasterLayerMatrix
+    });
+    return out;
   }
 
   private uploadFillPaths(scene: VectorScene): {

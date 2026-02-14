@@ -29,7 +29,16 @@ export interface Bounds {
   maxY: number;
 }
 
+export interface RasterLayer {
+  width: number;
+  height: number;
+  data: Uint8Array<ArrayBufferLike>;
+  matrix: Float32Array;
+}
+
 export interface VectorScene {
+  pageCount: number;
+  pagesPerRow: number;
   fillPathCount: number;
   fillSegmentCount: number;
   fillPathMetaA: Float32Array;
@@ -53,9 +62,11 @@ export interface VectorScene {
   textGlyphMetaB: Float32Array;
   textGlyphSegmentsA: Float32Array;
   textGlyphSegmentsB: Float32Array;
+  rasterLayers: RasterLayer[];
+  // Legacy single-layer fields kept for backward compatibility with old parsed-data ZIPs.
   rasterLayerWidth: number;
   rasterLayerHeight: number;
-  rasterLayerData: Uint8Array;
+  rasterLayerData: Uint8Array<ArrayBufferLike>;
   rasterLayerMatrix: Float32Array;
   endpoints: Float32Array;
   primitiveMeta: Float32Array;
@@ -75,6 +86,8 @@ export interface VectorScene {
 export interface VectorExtractOptions {
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
+  maxPages?: number;
+  maxPagesPerRow?: number;
 }
 
 class Float4Builder {
@@ -139,9 +152,9 @@ const FONT_MATRIX_FALLBACK = 0.001;
 const TEXT_MIN_ALPHA = 1e-3;
 const FILL_MIN_ALPHA = 1e-3;
 const RASTER_TARGET_SCALE_PER_DPR = 3;
-const RASTER_MAX_SCALE = 4;
-const RASTER_MAX_DIMENSION = 4096;
-const RASTER_MAX_PIXELS = RASTER_MAX_DIMENSION * RASTER_MAX_DIMENSION;
+const RASTER_MAX_SCALE = 24;
+const RASTER_MAX_DIMENSION = 16384;
+const RASTER_MAX_PIXELS = 134_217_728;
 
 const FILL_RULE_NONZERO = 0;
 const FILL_RULE_EVEN_ODD = 1;
@@ -174,8 +187,18 @@ function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: nu
 }
 
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
+  return extractPdfVectors(pdfData, {
+    ...options,
+    maxPages: 1,
+    maxPagesPerRow: 1
+  });
+}
+
+export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
+  const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
+  const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
   const standardFontDataUrl = resolveStandardFontDataUrl();
 
   const loadingTask = getDocument({
@@ -187,323 +210,810 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
   const pdf = await loadingTask.promise;
 
   try {
-    const page = await pdf.getPage(1);
-    const operatorList = await page.getOperatorList();
+    const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
+    const extractedPageCount = Math.max(1, Math.min(pdfPageCount, maxPages));
+    const pageScenes: VectorScene[] = [];
 
-    const endpointBuilder = new Float4Builder();
-    const primitiveMetaBuilder = new Float4Builder();
-    const primitiveBoundsBuilder = new Float4Builder();
-    const styleBuilder = new Float4Builder();
-    const fillPathMetaABuilder = new Float4Builder(8_192);
-    const fillPathMetaBBuilder = new Float4Builder(8_192);
-    const fillPathMetaCBuilder = new Float4Builder(8_192);
-    const fillSegmentBuilderA = new Float4Builder(65_536);
-    const fillSegmentBuilderB = new Float4Builder(65_536);
-
-    const pageView = page.view;
-    const rawPageBounds: Bounds = {
-      minX: Math.min(pageView[0], pageView[2]),
-      minY: Math.min(pageView[1], pageView[3]),
-      maxX: Math.max(pageView[0], pageView[2]),
-      maxY: Math.max(pageView[1], pageView[3])
-    };
-    const pageMatrix = buildPageMatrix(page);
-    const pageBounds = transformBounds(rawPageBounds, pageMatrix);
-
-    const bounds: Bounds = {
-      minX: Number.POSITIVE_INFINITY,
-      minY: Number.POSITIVE_INFINITY,
-      maxX: Number.NEGATIVE_INFINITY,
-      maxY: Number.NEGATIVE_INFINITY
-    };
-    const fillBounds: Bounds = {
-      minX: Number.POSITIVE_INFINITY,
-      minY: Number.POSITIVE_INFINITY,
-      maxX: Number.NEGATIVE_INFINITY,
-      maxY: Number.NEGATIVE_INFINITY
-    };
-
-    let pathCount = 0;
-    let sourceSegmentCount = 0;
-    let maxHalfWidth = 0;
-    let fillPathCount = 0;
-
-    const stateStack: GraphicsState[] = [];
-    let currentState: GraphicsState = createDefaultState(pageMatrix);
-
-    for (let i = 0; i < operatorList.fnArray.length; i += 1) {
-      const fn = operatorList.fnArray[i];
-      const args = operatorList.argsArray[i];
-
-      if (fn === OPS.save) {
-        stateStack.push(cloneState(currentState));
-        continue;
-      }
-
-      if (fn === OPS.restore) {
-        const restored = stateStack.pop();
-        if (restored) {
-          currentState = restored;
-        }
-        continue;
-      }
-
-      if (fn === OPS.transform) {
-        const transform = readTransform(args);
-        if (transform) {
-          currentState.matrix = multiplyMatrices(currentState.matrix, transform);
-        }
-        continue;
-      }
-
-      if (fn === OPS.setLineWidth) {
-        const nextWidth = readNumber(args, 0, currentState.lineWidth);
-        currentState.lineWidth = Math.max(0, nextWidth);
-        continue;
-      }
-
-      if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeColor) {
-        const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
-        currentState.strokeR = r;
-        currentState.strokeG = g;
-        currentState.strokeB = b;
-        continue;
-      }
-
-      if (fn === OPS.setStrokeGray) {
-        const strokeGray = readArg(args, 0);
-        const [gray] = parseGrayColor(strokeGray, currentState.strokeR);
-        currentState.strokeR = gray;
-        currentState.strokeG = gray;
-        currentState.strokeB = gray;
-        continue;
-      }
-
-      if (fn === OPS.setStrokeCMYKColor) {
-        const [r, g, b] = parseCmykColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
-        currentState.strokeR = r;
-        currentState.strokeG = g;
-        currentState.strokeB = b;
-        continue;
-      }
-
-      if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor) {
-        const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.fillR, currentState.fillG, currentState.fillB]);
-        currentState.fillR = r;
-        currentState.fillG = g;
-        currentState.fillB = b;
-        continue;
-      }
-
-      if (fn === OPS.setFillGray) {
-        const [gray] = parseGrayColor(readArg(args, 0), currentState.fillR);
-        currentState.fillR = gray;
-        currentState.fillG = gray;
-        currentState.fillB = gray;
-        continue;
-      }
-
-      if (fn === OPS.setFillCMYKColor) {
-        const [r, g, b] = parseCmykColorFromOperatorArgs(args, [currentState.fillR, currentState.fillG, currentState.fillB]);
-        currentState.fillR = r;
-        currentState.fillG = g;
-        currentState.fillB = b;
-        continue;
-      }
-
-      if (fn === OPS.setGState) {
-        applyGraphicsStateEntries(readArg(args, 0), currentState);
-        continue;
-      }
-
-      if (fn !== OPS.constructPath) {
-        continue;
-      }
-
-      const paintOp = readNumber(args, 0, -1);
-      const strokePaint = isStrokePaintOp(paintOp);
-      const fillPaint = isFillPaintOp(paintOp);
-      if (!strokePaint && !fillPaint) {
-        continue;
-      }
-
-      const pathData = readPathData(args);
-      if (!pathData) {
-        continue;
-      }
-
-      pathCount += 1;
-
-      if (strokePaint) {
-        const isHairlineStroke = currentState.lineWidth <= 0;
-        const widthScale = matrixScale(currentState.matrix);
-        const strokeWidth = isHairlineStroke ? 0 : currentState.lineWidth * widthScale;
-        const halfWidth = Math.max(0, strokeWidth * 0.5);
-        maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
-
-        const styleR = clamp01(currentState.strokeR);
-        const styleG = clamp01(currentState.strokeG);
-        const styleB = clamp01(currentState.strokeB);
-        const styleAlpha = clamp01(currentState.strokeAlpha);
-        sourceSegmentCount += emitSegmentsFromPath(
-          pathData,
-          currentState.matrix,
-          halfWidth,
-          styleR,
-          styleG,
-          styleB,
-          styleAlpha,
-          isHairlineStroke ? 1 : 0,
-          enableSegmentMerge,
-          endpointBuilder,
-          primitiveMetaBuilder,
-          styleBuilder,
-          primitiveBoundsBuilder,
-          bounds
-        );
-      }
-
-      if (fillPaint) {
-        const fillRule = isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
-        const fillAlpha = clamp01(currentState.fillAlpha);
-        const hasCompanionStroke = strokePaint && clamp01(currentState.strokeAlpha) > ALPHA_INVISIBLE_EPSILON;
-        if (fillAlpha > FILL_MIN_ALPHA) {
-          const emitted = emitFilledPathFromPath(
-            pathData,
-            currentState.matrix,
-            fillRule,
-            hasCompanionStroke,
-            clamp01(currentState.fillR),
-            clamp01(currentState.fillG),
-            clamp01(currentState.fillB),
-            fillAlpha,
-            fillPathMetaABuilder,
-            fillPathMetaBBuilder,
-            fillPathMetaCBuilder,
-            fillSegmentBuilderA,
-            fillSegmentBuilderB,
-            fillBounds
-          );
-          if (emitted) {
-            fillPathCount += 1;
-          }
-        }
-      }
+    for (let pageNumber = 1; pageNumber <= extractedPageCount; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const operatorList = await page.getOperatorList();
+      const pageScene = await extractSinglePageVectors(page, operatorList, {
+        enableSegmentMerge,
+        enableInvisibleCull
+      });
+      pageScenes.push(pageScene);
     }
 
-    const mergedSegmentCount = endpointBuilder.quadCount;
-    const mergedEndpoints = endpointBuilder.toTypedArray();
-    const mergedPrimitiveMeta = primitiveMetaBuilder.toTypedArray();
-    const mergedPrimitiveBounds = primitiveBoundsBuilder.toTypedArray();
-    const mergedStyles = styleBuilder.toTypedArray();
-    const fillSegmentCount = fillSegmentBuilderA.quadCount;
-    const fillPathMetaA = fillPathMetaABuilder.toTypedArray();
-    const fillPathMetaB = fillPathMetaBBuilder.toTypedArray();
-    const fillPathMetaC = fillPathMetaCBuilder.toTypedArray();
-    const fillSegmentsA = fillSegmentBuilderA.toTypedArray();
-    const fillSegmentsB = fillSegmentBuilderB.toTypedArray();
-    const resolvedFillBounds = fillPathCount > 0 ? fillBounds : null;
-
-    let segmentCount = mergedSegmentCount;
-    let endpoints = mergedEndpoints;
-    let primitiveMeta = mergedPrimitiveMeta;
-    let primitiveBounds = mergedPrimitiveBounds;
-    let styles = mergedStyles;
-    let segmentBounds: Bounds | null = mergedSegmentCount > 0 ? bounds : null;
-    let resolvedMaxHalfWidth = mergedSegmentCount > 0 ? maxHalfWidth : 0;
-    let discardedTransparentCount = 0;
-    let discardedDegenerateCount = 0;
-    let discardedDuplicateCount = 0;
-    let discardedContainedCount = 0;
-
-    if (mergedSegmentCount > 0 && enableInvisibleCull) {
-      const culled = cullInvisibleSegments(mergedEndpoints, mergedPrimitiveMeta, mergedStyles, mergedPrimitiveBounds);
-      segmentCount = culled.segmentCount;
-      endpoints = culled.endpoints;
-      primitiveMeta = culled.primitiveMeta;
-      primitiveBounds = culled.primitiveBounds;
-      styles = culled.styles;
-      segmentBounds = culled.segmentCount > 0 ? culled.bounds : null;
-      resolvedMaxHalfWidth = culled.maxHalfWidth;
-      discardedTransparentCount = culled.discardedTransparentCount;
-      discardedDegenerateCount = culled.discardedDegenerateCount;
-      discardedDuplicateCount = culled.discardedDuplicateCount;
-      discardedContainedCount = culled.discardedContainedCount;
-    }
-
-    if (segmentCount === 0) {
-      endpoints = new Float32Array(0);
-      primitiveMeta = new Float32Array(0);
-      primitiveBounds = new Float32Array(0);
-      styles = new Float32Array(0);
-      resolvedMaxHalfWidth = 0;
-    }
-
-    let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
-    if (textData.instanceCount === 0 && hasTextShowOperators(operatorList)) {
-      await warmUpTextPathCache(page);
-      textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
-    }
-
-    if (textData.instanceCount > 0 && textData.inPageCount < textData.instanceCount * 0.2) {
-      const fallbackTextData = await extractTextVectorData(page, operatorList, IDENTITY_MATRIX, pageBounds);
-      if (fallbackTextData.inPageCount > textData.inPageCount) {
-        textData = fallbackTextData;
-      }
-    }
-    const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
-    const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
-      allowFullPageFallback: allowFullPageRasterFallback
-    });
-    const combinedBounds =
-      combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterLayer.bounds) ??
-      { ...pageBounds };
-
-    return {
-      fillPathCount,
-      fillSegmentCount,
-      fillPathMetaA,
-      fillPathMetaB,
-      fillPathMetaC,
-      fillSegmentsA,
-      fillSegmentsB,
-      segmentCount,
-      sourceSegmentCount,
-      mergedSegmentCount,
-      sourceTextCount: textData.sourceTextCount,
-      textInstanceCount: textData.instanceCount,
-      textGlyphCount: textData.glyphCount,
-      textGlyphSegmentCount: textData.glyphSegmentCount,
-      textInPageCount: textData.inPageCount,
-      textOutOfPageCount: textData.outOfPageCount,
-      textInstanceA: textData.instanceA,
-      textInstanceB: textData.instanceB,
-      textInstanceC: textData.instanceC,
-      textGlyphMetaA: textData.glyphMetaA,
-      textGlyphMetaB: textData.glyphMetaB,
-      textGlyphSegmentsA: textData.glyphSegmentsA,
-      textGlyphSegmentsB: textData.glyphSegmentsB,
-      rasterLayerWidth: rasterLayer.width,
-      rasterLayerHeight: rasterLayer.height,
-      rasterLayerData: rasterLayer.data,
-      rasterLayerMatrix: new Float32Array(rasterLayer.matrix),
-      endpoints,
-      primitiveMeta,
-      primitiveBounds,
-      styles,
-      bounds: combinedBounds,
-      pageBounds,
-      maxHalfWidth: resolvedMaxHalfWidth,
-      operatorCount: operatorList.fnArray.length,
-      pathCount,
-      discardedTransparentCount,
-      discardedDegenerateCount,
-      discardedDuplicateCount,
-      discardedContainedCount
-    };
+    return composeScenesInGrid(pageScenes, maxPagesPerRow);
   } finally {
     await pdf.destroy();
   }
+}
+
+interface SinglePageExtractOptions {
+  enableSegmentMerge: boolean;
+  enableInvisibleCull: boolean;
+}
+
+interface PagePlacement {
+  translateX: number;
+  translateY: number;
+}
+
+async function extractSinglePageVectors(
+  page: unknown,
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  options: SinglePageExtractOptions
+): Promise<VectorScene> {
+  const pageView = (page as { view?: unknown }).view;
+  const pageBoundsInput = Array.isArray(pageView) ? pageView : [0, 0, 1, 1];
+  const rawPageBounds: Bounds = {
+    minX: Math.min(Number(pageBoundsInput[0]) || 0, Number(pageBoundsInput[2]) || 1),
+    minY: Math.min(Number(pageBoundsInput[1]) || 0, Number(pageBoundsInput[3]) || 1),
+    maxX: Math.max(Number(pageBoundsInput[0]) || 0, Number(pageBoundsInput[2]) || 1),
+    maxY: Math.max(Number(pageBoundsInput[1]) || 0, Number(pageBoundsInput[3]) || 1)
+  };
+  const pageMatrix = buildPageMatrix(page as {
+    rotate: number;
+    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; height: number };
+  });
+  const pageBounds = transformBounds(rawPageBounds, pageMatrix);
+
+  const endpointBuilder = new Float4Builder();
+  const primitiveMetaBuilder = new Float4Builder();
+  const primitiveBoundsBuilder = new Float4Builder();
+  const styleBuilder = new Float4Builder();
+  const fillPathMetaABuilder = new Float4Builder(8_192);
+  const fillPathMetaBBuilder = new Float4Builder(8_192);
+  const fillPathMetaCBuilder = new Float4Builder(8_192);
+  const fillSegmentBuilderA = new Float4Builder(65_536);
+  const fillSegmentBuilderB = new Float4Builder(65_536);
+
+  const bounds: Bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY
+  };
+  const fillBounds: Bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY
+  };
+
+  let pathCount = 0;
+  let sourceSegmentCount = 0;
+  let maxHalfWidth = 0;
+  let fillPathCount = 0;
+
+  const stateStack: GraphicsState[] = [];
+  let currentState: GraphicsState = createDefaultState(pageMatrix);
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+
+    if (fn === OPS.save) {
+      stateStack.push(cloneState(currentState));
+      continue;
+    }
+
+    if (fn === OPS.restore) {
+      const restored = stateStack.pop();
+      if (restored) {
+        currentState = restored;
+      }
+      continue;
+    }
+
+    if (fn === OPS.transform) {
+      const transform = readTransform(args);
+      if (transform) {
+        currentState.matrix = multiplyMatrices(currentState.matrix, transform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.setLineWidth) {
+      const nextWidth = readNumber(args, 0, currentState.lineWidth);
+      currentState.lineWidth = Math.max(0, nextWidth);
+      continue;
+    }
+
+    if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeColor) {
+      const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
+      currentState.strokeR = r;
+      currentState.strokeG = g;
+      currentState.strokeB = b;
+      continue;
+    }
+
+    if (fn === OPS.setStrokeGray) {
+      const strokeGray = readArg(args, 0);
+      const [gray] = parseGrayColor(strokeGray, currentState.strokeR);
+      currentState.strokeR = gray;
+      currentState.strokeG = gray;
+      currentState.strokeB = gray;
+      continue;
+    }
+
+    if (fn === OPS.setStrokeCMYKColor) {
+      const [r, g, b] = parseCmykColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
+      currentState.strokeR = r;
+      currentState.strokeG = g;
+      currentState.strokeB = b;
+      continue;
+    }
+
+    if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor) {
+      const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.fillR, currentState.fillG, currentState.fillB]);
+      currentState.fillR = r;
+      currentState.fillG = g;
+      currentState.fillB = b;
+      continue;
+    }
+
+    if (fn === OPS.setFillGray) {
+      const [gray] = parseGrayColor(readArg(args, 0), currentState.fillR);
+      currentState.fillR = gray;
+      currentState.fillG = gray;
+      currentState.fillB = gray;
+      continue;
+    }
+
+    if (fn === OPS.setFillCMYKColor) {
+      const [r, g, b] = parseCmykColorFromOperatorArgs(args, [currentState.fillR, currentState.fillG, currentState.fillB]);
+      currentState.fillR = r;
+      currentState.fillG = g;
+      currentState.fillB = b;
+      continue;
+    }
+
+    if (fn === OPS.setGState) {
+      applyGraphicsStateEntries(readArg(args, 0), currentState);
+      continue;
+    }
+
+    if (fn !== OPS.constructPath) {
+      continue;
+    }
+
+    const paintOp = readNumber(args, 0, -1);
+    const strokePaint = isStrokePaintOp(paintOp);
+    const fillPaint = isFillPaintOp(paintOp);
+    if (!strokePaint && !fillPaint) {
+      continue;
+    }
+
+    const pathData = readPathData(args);
+    if (!pathData) {
+      continue;
+    }
+
+    pathCount += 1;
+
+    if (strokePaint) {
+      const isHairlineStroke = currentState.lineWidth <= 0;
+      const widthScale = matrixScale(currentState.matrix);
+      const strokeWidth = isHairlineStroke ? 0 : currentState.lineWidth * widthScale;
+      const halfWidth = Math.max(0, strokeWidth * 0.5);
+      maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
+
+      const styleR = clamp01(currentState.strokeR);
+      const styleG = clamp01(currentState.strokeG);
+      const styleB = clamp01(currentState.strokeB);
+      const styleAlpha = clamp01(currentState.strokeAlpha);
+      sourceSegmentCount += emitSegmentsFromPath(
+        pathData,
+        currentState.matrix,
+        halfWidth,
+        styleR,
+        styleG,
+        styleB,
+        styleAlpha,
+        isHairlineStroke ? 1 : 0,
+        options.enableSegmentMerge,
+        endpointBuilder,
+        primitiveMetaBuilder,
+        styleBuilder,
+        primitiveBoundsBuilder,
+        bounds
+      );
+    }
+
+    if (fillPaint) {
+      const fillRule = isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
+      const fillAlpha = clamp01(currentState.fillAlpha);
+      const hasCompanionStroke = strokePaint && clamp01(currentState.strokeAlpha) > ALPHA_INVISIBLE_EPSILON;
+      if (fillAlpha > FILL_MIN_ALPHA) {
+        const emitted = emitFilledPathFromPath(
+          pathData,
+          currentState.matrix,
+          fillRule,
+          hasCompanionStroke,
+          clamp01(currentState.fillR),
+          clamp01(currentState.fillG),
+          clamp01(currentState.fillB),
+          fillAlpha,
+          fillPathMetaABuilder,
+          fillPathMetaBBuilder,
+          fillPathMetaCBuilder,
+          fillSegmentBuilderA,
+          fillSegmentBuilderB,
+          fillBounds
+        );
+        if (emitted) {
+          fillPathCount += 1;
+        }
+      }
+    }
+  }
+
+  const mergedSegmentCount = endpointBuilder.quadCount;
+  const mergedEndpoints = endpointBuilder.toTypedArray();
+  const mergedPrimitiveMeta = primitiveMetaBuilder.toTypedArray();
+  const mergedPrimitiveBounds = primitiveBoundsBuilder.toTypedArray();
+  const mergedStyles = styleBuilder.toTypedArray();
+  const fillSegmentCount = fillSegmentBuilderA.quadCount;
+  const fillPathMetaA = fillPathMetaABuilder.toTypedArray();
+  const fillPathMetaB = fillPathMetaBBuilder.toTypedArray();
+  const fillPathMetaC = fillPathMetaCBuilder.toTypedArray();
+  const fillSegmentsA = fillSegmentBuilderA.toTypedArray();
+  const fillSegmentsB = fillSegmentBuilderB.toTypedArray();
+  const resolvedFillBounds = fillPathCount > 0 ? fillBounds : null;
+
+  let segmentCount = mergedSegmentCount;
+  let endpoints = mergedEndpoints;
+  let primitiveMeta = mergedPrimitiveMeta;
+  let primitiveBounds = mergedPrimitiveBounds;
+  let styles = mergedStyles;
+  let segmentBounds: Bounds | null = mergedSegmentCount > 0 ? bounds : null;
+  let resolvedMaxHalfWidth = mergedSegmentCount > 0 ? maxHalfWidth : 0;
+  let discardedTransparentCount = 0;
+  let discardedDegenerateCount = 0;
+  let discardedDuplicateCount = 0;
+  let discardedContainedCount = 0;
+
+  if (mergedSegmentCount > 0 && options.enableInvisibleCull) {
+    const culled = cullInvisibleSegments(mergedEndpoints, mergedPrimitiveMeta, mergedStyles, mergedPrimitiveBounds);
+    segmentCount = culled.segmentCount;
+    endpoints = culled.endpoints;
+    primitiveMeta = culled.primitiveMeta;
+    primitiveBounds = culled.primitiveBounds;
+    styles = culled.styles;
+    segmentBounds = culled.segmentCount > 0 ? culled.bounds : null;
+    resolvedMaxHalfWidth = culled.maxHalfWidth;
+    discardedTransparentCount = culled.discardedTransparentCount;
+    discardedDegenerateCount = culled.discardedDegenerateCount;
+    discardedDuplicateCount = culled.discardedDuplicateCount;
+    discardedContainedCount = culled.discardedContainedCount;
+  }
+
+  if (segmentCount === 0) {
+    endpoints = new Float32Array(0);
+    primitiveMeta = new Float32Array(0);
+    primitiveBounds = new Float32Array(0);
+    styles = new Float32Array(0);
+    resolvedMaxHalfWidth = 0;
+  }
+
+  let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+  if (textData.instanceCount === 0 && hasTextShowOperators(operatorList)) {
+    await warmUpTextPathCache(page);
+    textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+  }
+
+  if (textData.instanceCount > 0 && textData.inPageCount < textData.instanceCount * 0.2) {
+    const fallbackTextData = await extractTextVectorData(page, operatorList, IDENTITY_MATRIX, pageBounds);
+    if (fallbackTextData.inPageCount > textData.inPageCount) {
+      textData = fallbackTextData;
+    }
+  }
+
+  const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
+  const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
+    allowFullPageFallback: allowFullPageRasterFallback
+  });
+  const rasterLayers: RasterLayer[] =
+    rasterLayer.width > 0 && rasterLayer.height > 0 && rasterLayer.data.length >= rasterLayer.width * rasterLayer.height * 4
+      ? [
+        {
+          width: rasterLayer.width,
+          height: rasterLayer.height,
+          data: rasterLayer.data,
+          matrix: new Float32Array(rasterLayer.matrix)
+        }
+      ]
+      : [];
+  const combinedBounds =
+    combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterLayer.bounds) ??
+    { ...pageBounds };
+
+  return {
+    pageCount: 1,
+    pagesPerRow: 1,
+    fillPathCount,
+    fillSegmentCount,
+    fillPathMetaA,
+    fillPathMetaB,
+    fillPathMetaC,
+    fillSegmentsA,
+    fillSegmentsB,
+    segmentCount,
+    sourceSegmentCount,
+    mergedSegmentCount,
+    sourceTextCount: textData.sourceTextCount,
+    textInstanceCount: textData.instanceCount,
+    textGlyphCount: textData.glyphCount,
+    textGlyphSegmentCount: textData.glyphSegmentCount,
+    textInPageCount: textData.inPageCount,
+    textOutOfPageCount: textData.outOfPageCount,
+    textInstanceA: textData.instanceA,
+    textInstanceB: textData.instanceB,
+    textInstanceC: textData.instanceC,
+    textGlyphMetaA: textData.glyphMetaA,
+    textGlyphMetaB: textData.glyphMetaB,
+    textGlyphSegmentsA: textData.glyphSegmentsA,
+    textGlyphSegmentsB: textData.glyphSegmentsB,
+    rasterLayers,
+    rasterLayerWidth: rasterLayers[0]?.width ?? 0,
+    rasterLayerHeight: rasterLayers[0]?.height ?? 0,
+    rasterLayerData: rasterLayers[0]?.data ?? new Uint8Array(0),
+    rasterLayerMatrix: rasterLayers[0]?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
+    endpoints,
+    primitiveMeta,
+    primitiveBounds,
+    styles,
+    bounds: combinedBounds,
+    pageBounds,
+    maxHalfWidth: resolvedMaxHalfWidth,
+    operatorCount: operatorList.fnArray.length,
+    pathCount,
+    discardedTransparentCount,
+    discardedDegenerateCount,
+    discardedDuplicateCount,
+    discardedContainedCount
+  };
+}
+
+function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number): VectorScene {
+  if (pageScenes.length === 0) {
+    return createEmptyVectorScene();
+  }
+
+  if (pageScenes.length === 1) {
+    return {
+      ...pageScenes[0],
+      pageCount: 1,
+      pagesPerRow: 1
+    };
+  }
+
+  const pagesPerRow = normalizePositiveInt(requestedPagesPerRow, 10, 1, 100);
+  const placements = computeGridPlacements(pageScenes, pagesPerRow);
+
+  let totalFillPathCount = 0;
+  let totalFillSegmentCount = 0;
+  let totalSegmentCount = 0;
+  let totalSourceSegmentCount = 0;
+  let totalMergedSegmentCount = 0;
+  let totalSourceTextCount = 0;
+  let totalTextInstanceCount = 0;
+  let totalTextGlyphCount = 0;
+  let totalTextGlyphSegmentCount = 0;
+  let totalTextInPageCount = 0;
+  let totalTextOutOfPageCount = 0;
+  let totalOperatorCount = 0;
+  let totalPathCount = 0;
+  let totalDiscardedTransparentCount = 0;
+  let totalDiscardedDegenerateCount = 0;
+  let totalDiscardedDuplicateCount = 0;
+  let totalDiscardedContainedCount = 0;
+  let maxHalfWidth = 0;
+
+  for (const scene of pageScenes) {
+    totalFillPathCount += scene.fillPathCount;
+    totalFillSegmentCount += scene.fillSegmentCount;
+    totalSegmentCount += scene.segmentCount;
+    totalSourceSegmentCount += scene.sourceSegmentCount;
+    totalMergedSegmentCount += scene.mergedSegmentCount;
+    totalSourceTextCount += scene.sourceTextCount;
+    totalTextInstanceCount += scene.textInstanceCount;
+    totalTextGlyphCount += scene.textGlyphCount;
+    totalTextGlyphSegmentCount += scene.textGlyphSegmentCount;
+    totalTextInPageCount += scene.textInPageCount;
+    totalTextOutOfPageCount += scene.textOutOfPageCount;
+    totalOperatorCount += scene.operatorCount;
+    totalPathCount += scene.pathCount;
+    totalDiscardedTransparentCount += scene.discardedTransparentCount;
+    totalDiscardedDegenerateCount += scene.discardedDegenerateCount;
+    totalDiscardedDuplicateCount += scene.discardedDuplicateCount;
+    totalDiscardedContainedCount += scene.discardedContainedCount;
+    maxHalfWidth = Math.max(maxHalfWidth, scene.maxHalfWidth);
+  }
+
+  const fillPathMetaA = new Float32Array(totalFillPathCount * 4);
+  const fillPathMetaB = new Float32Array(totalFillPathCount * 4);
+  const fillPathMetaC = new Float32Array(totalFillPathCount * 4);
+  const fillSegmentsA = new Float32Array(totalFillSegmentCount * 4);
+  const fillSegmentsB = new Float32Array(totalFillSegmentCount * 4);
+  const endpoints = new Float32Array(totalSegmentCount * 4);
+  const primitiveMeta = new Float32Array(totalSegmentCount * 4);
+  const primitiveBounds = new Float32Array(totalSegmentCount * 4);
+  const styles = new Float32Array(totalSegmentCount * 4);
+  const textInstanceA = new Float32Array(totalTextInstanceCount * 4);
+  const textInstanceB = new Float32Array(totalTextInstanceCount * 4);
+  const textInstanceC = new Float32Array(totalTextInstanceCount * 4);
+  const textGlyphMetaA = new Float32Array(totalTextGlyphCount * 4);
+  const textGlyphMetaB = new Float32Array(totalTextGlyphCount * 4);
+  const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
+  const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
+
+  let fillPathOffset = 0;
+  let fillSegmentOffset = 0;
+  let segmentOffset = 0;
+  let textInstanceOffset = 0;
+  let textGlyphOffset = 0;
+  let textGlyphSegmentOffset = 0;
+  let combinedBounds: Bounds | null = null;
+  let combinedPageBounds: Bounds | null = null;
+
+  const rasterLayers: RasterLayer[] = [];
+
+  for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
+    const scene = pageScenes[pageIndex];
+    const placement = placements[pageIndex];
+    const tx = placement.translateX;
+    const ty = placement.translateY;
+
+    for (let i = 0; i < scene.fillPathCount; i += 1) {
+      const src = i * 4;
+      const dst = (fillPathOffset + i) * 4;
+      fillPathMetaA[dst] = scene.fillPathMetaA[src] + fillSegmentOffset;
+      fillPathMetaA[dst + 1] = scene.fillPathMetaA[src + 1];
+      fillPathMetaA[dst + 2] = scene.fillPathMetaA[src + 2] + tx;
+      fillPathMetaA[dst + 3] = scene.fillPathMetaA[src + 3] + ty;
+
+      fillPathMetaB[dst] = scene.fillPathMetaB[src] + tx;
+      fillPathMetaB[dst + 1] = scene.fillPathMetaB[src + 1] + ty;
+      fillPathMetaB[dst + 2] = scene.fillPathMetaB[src + 2];
+      fillPathMetaB[dst + 3] = scene.fillPathMetaB[src + 3];
+
+      fillPathMetaC[dst] = scene.fillPathMetaC[src];
+      fillPathMetaC[dst + 1] = scene.fillPathMetaC[src + 1];
+      fillPathMetaC[dst + 2] = scene.fillPathMetaC[src + 2];
+      fillPathMetaC[dst + 3] = scene.fillPathMetaC[src + 3];
+    }
+
+    for (let i = 0; i < scene.fillSegmentCount; i += 1) {
+      const src = i * 4;
+      const dst = (fillSegmentOffset + i) * 4;
+      fillSegmentsA[dst] = scene.fillSegmentsA[src] + tx;
+      fillSegmentsA[dst + 1] = scene.fillSegmentsA[src + 1] + ty;
+      fillSegmentsA[dst + 2] = scene.fillSegmentsA[src + 2] + tx;
+      fillSegmentsA[dst + 3] = scene.fillSegmentsA[src + 3] + ty;
+
+      fillSegmentsB[dst] = scene.fillSegmentsB[src] + tx;
+      fillSegmentsB[dst + 1] = scene.fillSegmentsB[src + 1] + ty;
+      fillSegmentsB[dst + 2] = scene.fillSegmentsB[src + 2];
+      fillSegmentsB[dst + 3] = scene.fillSegmentsB[src + 3];
+    }
+
+    for (let i = 0; i < scene.segmentCount; i += 1) {
+      const src = i * 4;
+      const dst = (segmentOffset + i) * 4;
+      endpoints[dst] = scene.endpoints[src] + tx;
+      endpoints[dst + 1] = scene.endpoints[src + 1] + ty;
+      endpoints[dst + 2] = scene.endpoints[src + 2] + tx;
+      endpoints[dst + 3] = scene.endpoints[src + 3] + ty;
+
+      primitiveMeta[dst] = scene.primitiveMeta[src] + tx;
+      primitiveMeta[dst + 1] = scene.primitiveMeta[src + 1] + ty;
+      primitiveMeta[dst + 2] = scene.primitiveMeta[src + 2];
+      primitiveMeta[dst + 3] = scene.primitiveMeta[src + 3];
+
+      primitiveBounds[dst] = scene.primitiveBounds[src] + tx;
+      primitiveBounds[dst + 1] = scene.primitiveBounds[src + 1] + ty;
+      primitiveBounds[dst + 2] = scene.primitiveBounds[src + 2] + tx;
+      primitiveBounds[dst + 3] = scene.primitiveBounds[src + 3] + ty;
+
+      styles[dst] = scene.styles[src];
+      styles[dst + 1] = scene.styles[src + 1];
+      styles[dst + 2] = scene.styles[src + 2];
+      styles[dst + 3] = scene.styles[src + 3];
+    }
+
+    textInstanceA.set(scene.textInstanceA, textInstanceOffset * 4);
+    textInstanceC.set(scene.textInstanceC, textInstanceOffset * 4);
+
+    for (let i = 0; i < scene.textInstanceCount; i += 1) {
+      const src = i * 4;
+      const dst = (textInstanceOffset + i) * 4;
+      textInstanceB[dst] = scene.textInstanceB[src] + tx;
+      textInstanceB[dst + 1] = scene.textInstanceB[src + 1] + ty;
+      textInstanceB[dst + 2] = scene.textInstanceB[src + 2] + textGlyphOffset;
+      textInstanceB[dst + 3] = scene.textInstanceB[src + 3];
+    }
+
+    for (let i = 0; i < scene.textGlyphCount; i += 1) {
+      const src = i * 4;
+      const dst = (textGlyphOffset + i) * 4;
+      textGlyphMetaA[dst] = scene.textGlyphMetaA[src] + textGlyphSegmentOffset;
+      textGlyphMetaA[dst + 1] = scene.textGlyphMetaA[src + 1];
+      textGlyphMetaA[dst + 2] = scene.textGlyphMetaA[src + 2];
+      textGlyphMetaA[dst + 3] = scene.textGlyphMetaA[src + 3];
+
+      textGlyphMetaB[dst] = scene.textGlyphMetaB[src];
+      textGlyphMetaB[dst + 1] = scene.textGlyphMetaB[src + 1];
+      textGlyphMetaB[dst + 2] = scene.textGlyphMetaB[src + 2];
+      textGlyphMetaB[dst + 3] = scene.textGlyphMetaB[src + 3];
+    }
+
+    textGlyphSegmentsA.set(scene.textGlyphSegmentsA, textGlyphSegmentOffset * 4);
+    textGlyphSegmentsB.set(scene.textGlyphSegmentsB, textGlyphSegmentOffset * 4);
+
+    combinedBounds = combineBounds(combinedBounds, offsetBounds(scene.bounds, tx, ty));
+    combinedPageBounds = combineBounds(combinedPageBounds, offsetBounds(scene.pageBounds, tx, ty));
+
+    for (const layer of listSceneRasterLayers(scene)) {
+      if (layer.matrix.length < 6) {
+        continue;
+      }
+
+      const matrix = new Float32Array(6);
+      matrix[0] = layer.matrix[0];
+      matrix[1] = layer.matrix[1];
+      matrix[2] = layer.matrix[2];
+      matrix[3] = layer.matrix[3];
+      matrix[4] = layer.matrix[4] + tx;
+      matrix[5] = layer.matrix[5] + ty;
+      rasterLayers.push({
+        width: layer.width,
+        height: layer.height,
+        data: layer.data,
+        matrix
+      });
+    }
+
+    fillPathOffset += scene.fillPathCount;
+    fillSegmentOffset += scene.fillSegmentCount;
+    segmentOffset += scene.segmentCount;
+    textInstanceOffset += scene.textInstanceCount;
+    textGlyphOffset += scene.textGlyphCount;
+    textGlyphSegmentOffset += scene.textGlyphSegmentCount;
+  }
+
+  const primaryRasterLayer = rasterLayers[0] ?? null;
+
+  return {
+    pageCount: pageScenes.length,
+    pagesPerRow,
+    fillPathCount: totalFillPathCount,
+    fillSegmentCount: totalFillSegmentCount,
+    fillPathMetaA,
+    fillPathMetaB,
+    fillPathMetaC,
+    fillSegmentsA,
+    fillSegmentsB,
+    segmentCount: totalSegmentCount,
+    sourceSegmentCount: totalSourceSegmentCount,
+    mergedSegmentCount: totalMergedSegmentCount,
+    sourceTextCount: totalSourceTextCount,
+    textInstanceCount: totalTextInstanceCount,
+    textGlyphCount: totalTextGlyphCount,
+    textGlyphSegmentCount: totalTextGlyphSegmentCount,
+    textInPageCount: totalTextInPageCount,
+    textOutOfPageCount: totalTextOutOfPageCount,
+    textInstanceA,
+    textInstanceB,
+    textInstanceC,
+    textGlyphMetaA,
+    textGlyphMetaB,
+    textGlyphSegmentsA,
+    textGlyphSegmentsB,
+    rasterLayers,
+    rasterLayerWidth: primaryRasterLayer?.width ?? 0,
+    rasterLayerHeight: primaryRasterLayer?.height ?? 0,
+    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    rasterLayerMatrix: primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
+    endpoints,
+    primitiveMeta,
+    primitiveBounds,
+    styles,
+    bounds: combinedBounds ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 },
+    pageBounds: combinedPageBounds ?? combinedBounds ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 },
+    maxHalfWidth,
+    operatorCount: totalOperatorCount,
+    pathCount: totalPathCount,
+    discardedTransparentCount: totalDiscardedTransparentCount,
+    discardedDegenerateCount: totalDiscardedDegenerateCount,
+    discardedDuplicateCount: totalDiscardedDuplicateCount,
+    discardedContainedCount: totalDiscardedContainedCount
+  };
+}
+
+function computeGridPlacements(pageScenes: VectorScene[], pagesPerRow: number): PagePlacement[] {
+  const pageBoundsList = pageScenes.map((scene) => normalizeSceneBounds(scene.pageBounds, scene.bounds));
+  const rowCount = Math.ceil(pageScenes.length / pagesPerRow);
+  const rowHeights = new Float64Array(rowCount);
+  let extentSum = 0;
+
+  for (let i = 0; i < pageBoundsList.length; i += 1) {
+    const bounds = pageBoundsList[i];
+    const width = Math.max(bounds.maxX - bounds.minX, 1e-3);
+    const height = Math.max(bounds.maxY - bounds.minY, 1e-3);
+    extentSum += Math.max(width, height);
+    const row = Math.floor(i / pagesPerRow);
+    rowHeights[row] = Math.max(rowHeights[row], height);
+  }
+
+  const averageExtent = extentSum / Math.max(1, pageBoundsList.length);
+  const gap = Math.max(averageExtent * 0.06, 8);
+  const rowTop = new Float64Array(rowCount);
+  for (let row = 1; row < rowCount; row += 1) {
+    rowTop[row] = rowTop[row - 1] - rowHeights[row - 1] - gap;
+  }
+
+  const rowCursorX = new Float64Array(rowCount);
+  const placements: PagePlacement[] = new Array(pageScenes.length);
+  for (let i = 0; i < pageBoundsList.length; i += 1) {
+    const bounds = pageBoundsList[i];
+    const width = Math.max(bounds.maxX - bounds.minX, 1e-3);
+    const row = Math.floor(i / pagesPerRow);
+    const translateX = rowCursorX[row] - bounds.minX;
+    const translateY = rowTop[row] - bounds.maxY;
+    placements[i] = { translateX, translateY };
+    rowCursorX[row] += width + gap;
+  }
+
+  return placements;
+}
+
+function normalizeSceneBounds(primary: Bounds, fallback: Bounds): Bounds {
+  const source = isFiniteBounds(primary) ? primary : fallback;
+  if (isFiniteBounds(source)) {
+    return source;
+  }
+  return { minX: 0, minY: 0, maxX: 1, maxY: 1 };
+}
+
+function isFiniteBounds(bounds: Bounds): boolean {
+  return (
+    Number.isFinite(bounds.minX) &&
+    Number.isFinite(bounds.minY) &&
+    Number.isFinite(bounds.maxX) &&
+    Number.isFinite(bounds.maxY)
+  );
+}
+
+function offsetBounds(bounds: Bounds, tx: number, ty: number): Bounds {
+  return {
+    minX: bounds.minX + tx,
+    minY: bounds.minY + ty,
+    maxX: bounds.maxX + tx,
+    maxY: bounds.maxY + ty
+  };
+}
+
+function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
+  const out: RasterLayer[] = [];
+  if (Array.isArray(scene.rasterLayers)) {
+    for (const layer of scene.rasterLayers) {
+      const width = Math.max(0, Math.trunc(layer?.width ?? 0));
+      const height = Math.max(0, Math.trunc(layer?.height ?? 0));
+      if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
+        continue;
+      }
+
+      const matrix = new Float32Array(6);
+      if (layer.matrix.length >= 6) {
+        matrix[0] = layer.matrix[0];
+        matrix[1] = layer.matrix[1];
+        matrix[2] = layer.matrix[2];
+        matrix[3] = layer.matrix[3];
+        matrix[4] = layer.matrix[4];
+        matrix[5] = layer.matrix[5];
+      } else {
+        matrix[0] = 1;
+        matrix[3] = 1;
+      }
+
+      out.push({
+        width,
+        height,
+        data: layer.data,
+        matrix
+      });
+    }
+  }
+
+  if (out.length > 0) {
+    return out;
+  }
+
+  const legacyWidth = Math.max(0, Math.trunc(scene.rasterLayerWidth));
+  const legacyHeight = Math.max(0, Math.trunc(scene.rasterLayerHeight));
+  if (legacyWidth <= 0 || legacyHeight <= 0 || scene.rasterLayerData.length < legacyWidth * legacyHeight * 4) {
+    return out;
+  }
+
+  const matrix = new Float32Array([1, 0, 0, 1, 0, 0]);
+  if (scene.rasterLayerMatrix.length >= 6) {
+    matrix[0] = scene.rasterLayerMatrix[0];
+    matrix[1] = scene.rasterLayerMatrix[1];
+    matrix[2] = scene.rasterLayerMatrix[2];
+    matrix[3] = scene.rasterLayerMatrix[3];
+    matrix[4] = scene.rasterLayerMatrix[4];
+    matrix[5] = scene.rasterLayerMatrix[5];
+  }
+  out.push({
+    width: legacyWidth,
+    height: legacyHeight,
+    data: scene.rasterLayerData,
+    matrix
+  });
+  return out;
+}
+
+function createEmptyVectorScene(): VectorScene {
+  return {
+    pageCount: 0,
+    pagesPerRow: 1,
+    fillPathCount: 0,
+    fillSegmentCount: 0,
+    fillPathMetaA: new Float32Array(0),
+    fillPathMetaB: new Float32Array(0),
+    fillPathMetaC: new Float32Array(0),
+    fillSegmentsA: new Float32Array(0),
+    fillSegmentsB: new Float32Array(0),
+    segmentCount: 0,
+    sourceSegmentCount: 0,
+    mergedSegmentCount: 0,
+    sourceTextCount: 0,
+    textInstanceCount: 0,
+    textGlyphCount: 0,
+    textGlyphSegmentCount: 0,
+    textInPageCount: 0,
+    textOutOfPageCount: 0,
+    textInstanceA: new Float32Array(0),
+    textInstanceB: new Float32Array(0),
+    textInstanceC: new Float32Array(0),
+    textGlyphMetaA: new Float32Array(0),
+    textGlyphMetaB: new Float32Array(0),
+    textGlyphSegmentsA: new Float32Array(0),
+    textGlyphSegmentsB: new Float32Array(0),
+    rasterLayers: [],
+    rasterLayerWidth: 0,
+    rasterLayerHeight: 0,
+    rasterLayerData: new Uint8Array(0),
+    rasterLayerMatrix: new Float32Array([1, 0, 0, 1, 0, 0]),
+    endpoints: new Float32Array(0),
+    primitiveMeta: new Float32Array(0),
+    primitiveBounds: new Float32Array(0),
+    styles: new Float32Array(0),
+    bounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 },
+    pageBounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 },
+    maxHalfWidth: 0,
+    operatorCount: 0,
+    pathCount: 0,
+    discardedTransparentCount: 0,
+    discardedDegenerateCount: 0,
+    discardedDuplicateCount: 0,
+    discardedContainedCount: 0
+  };
+}
+
+function normalizePositiveInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Math.trunc(Number(value));
+  const valid = Number.isFinite(parsed) ? parsed : fallback;
+  if (valid < min) {
+    return min;
+  }
+  if (valid > max) {
+    return max;
+  }
+  return valid;
 }
 
 function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsState {
@@ -585,13 +1095,14 @@ function resolveStandardFontDataUrl(): string | undefined {
   return new URL("pdfjs-standard-fonts/", window.location.href).toString();
 }
 
-function chooseRasterExtractionScale(baseWidth: number, baseHeight: number): number {
+function chooseRasterExtractionScale(baseWidth: number, baseHeight: number, nativeScaleHint = 1): number {
   if (!Number.isFinite(baseWidth) || !Number.isFinite(baseHeight) || baseWidth <= 0 || baseHeight <= 0) {
     return 1;
   }
 
   const dpr = typeof window === "undefined" ? 1 : Math.max(1, Number(window.devicePixelRatio) || 1);
-  let scale = Math.max(1, Math.min(RASTER_MAX_SCALE, dpr * RASTER_TARGET_SCALE_PER_DPR));
+  const targetScale = Math.max(dpr * RASTER_TARGET_SCALE_PER_DPR, Number.isFinite(nativeScaleHint) ? nativeScaleHint : 1);
+  let scale = Math.max(1, Math.min(RASTER_MAX_SCALE, targetScale));
 
   while (scale > 1) {
     const width = Math.max(1, Math.ceil(baseWidth * scale));
@@ -2239,6 +2750,96 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
   };
 }
 
+function estimateRasterNativeScaleHint(operatorList: { fnArray: number[]; argsArray: unknown[] }): number {
+  const matrixStack: Mat2D[] = [];
+  let currentMatrix: Mat2D = [...IDENTITY_MATRIX];
+  let maxScaleHint = 1;
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+
+    if (fn === OPS.save) {
+      matrixStack.push([...currentMatrix]);
+      continue;
+    }
+
+    if (fn === OPS.restore) {
+      const restored = matrixStack.pop();
+      if (restored) {
+        currentMatrix = restored;
+      }
+      continue;
+    }
+
+    if (fn === OPS.transform) {
+      const transform = readTransform(args);
+      if (transform) {
+        currentMatrix = multiplyMatrices(currentMatrix, transform);
+      }
+      continue;
+    }
+
+    if (!isImagePaintOperator(fn)) {
+      continue;
+    }
+
+    const size = readImageOpIntrinsicSize(fn, args);
+    if (!size) {
+      continue;
+    }
+
+    const sx = Math.hypot(currentMatrix[0], currentMatrix[1]);
+    const sy = Math.hypot(currentMatrix[2], currentMatrix[3]);
+    if (!Number.isFinite(sx) || !Number.isFinite(sy) || sx <= 1e-5 || sy <= 1e-5) {
+      continue;
+    }
+
+    const scaleX = size.width / sx;
+    const scaleY = size.height / sy;
+    if (Number.isFinite(scaleX) && scaleX > maxScaleHint) {
+      maxScaleHint = scaleX;
+    }
+    if (Number.isFinite(scaleY) && scaleY > maxScaleHint) {
+      maxScaleHint = scaleY;
+    }
+  }
+
+  if (!Number.isFinite(maxScaleHint)) {
+    return 1;
+  }
+  return Math.max(1, maxScaleHint);
+}
+
+function readImageOpIntrinsicSize(fn: number, args: unknown): { width: number; height: number } | null {
+  if (fn === OPS.paintImageXObject || fn === OPS.paintImageXObjectRepeat) {
+    const width = readNumber(args, 1, Number.NaN);
+    const height = readNumber(args, 2, Number.NaN);
+    if (width > 0 && height > 0) {
+      return { width, height };
+    }
+  }
+
+  if (fn === OPS.paintInlineImageXObject) {
+    const imageObject = readArg(args, 0);
+    const width = Number((imageObject as { width?: unknown })?.width);
+    const height = Number((imageObject as { height?: unknown })?.height);
+    if (width > 0 && height > 0) {
+      return { width, height };
+    }
+  }
+
+  if (fn === OPS.paintImageMaskXObject || fn === OPS.paintImageMaskXObjectRepeat) {
+    const width = readNumber(args, 1, Number.NaN);
+    const height = readNumber(args, 2, Number.NaN);
+    if (width > 0 && height > 0) {
+      return { width, height };
+    }
+  }
+
+  return null;
+}
+
 function createEmptyRasterLayerResult(): RasterLayerExtractResult {
   return {
     width: 0,
@@ -2290,9 +2891,11 @@ async function extractRasterLayerData(
     rotation: normalizeRotationDegrees(pageLike.rotate),
     dontFlip: false
   });
+  const nativeScaleHint = estimateRasterNativeScaleHint(operatorList);
   const rasterScale = chooseRasterExtractionScale(
     Math.max(1, Math.ceil(baseViewport.width)),
-    Math.max(1, Math.ceil(baseViewport.height))
+    Math.max(1, Math.ceil(baseViewport.height)),
+    nativeScaleHint
   );
   const viewport = rasterScale === 1
     ? baseViewport
