@@ -7,13 +7,18 @@ const DRAW_QUAD_TO = 3;
 const DRAW_CLOSE = 4;
 
 type Mat2D = [number, number, number, number, number, number];
+type RgbColor = [number, number, number];
 
 interface GraphicsState {
   matrix: Mat2D;
   lineWidth: number;
-  strokeLuma: number;
+  strokeR: number;
+  strokeG: number;
+  strokeB: number;
   strokeAlpha: number;
-  fillLuma: number;
+  fillR: number;
+  fillG: number;
+  fillB: number;
   fillAlpha: number;
 }
 
@@ -43,6 +48,7 @@ export interface VectorScene {
   textOutOfPageCount: number;
   textInstanceA: Float32Array;
   textInstanceB: Float32Array;
+  textInstanceC: Float32Array;
   textGlyphMetaA: Float32Array;
   textGlyphMetaB: Float32Array;
   textGlyphSegmentsA: Float32Array;
@@ -145,6 +151,19 @@ const FILL_PRIMITIVE_LINE = 0;
 const FILL_PRIMITIVE_QUADRATIC = 1;
 const FILL_CUBIC_TO_QUAD_ERROR = 0.08;
 const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
+const STROKE_STYLE_FLAG_OFFSET = 2;
+
+function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
+  const normalizedAlpha = clamp01(alpha);
+  const normalizedFlags = styleFlags >= 0.5 ? STROKE_STYLE_FLAG_OFFSET : 0;
+  return normalizedAlpha + normalizedFlags;
+}
+
+function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: number } {
+  const hasFlags = encoded >= STROKE_STYLE_FLAG_OFFSET - 1e-6;
+  const alpha = clamp01(hasFlags ? encoded - STROKE_STYLE_FLAG_OFFSET : encoded);
+  return { alpha, styleFlags: hasFlags ? 1 : 0 };
+}
 
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
@@ -234,33 +253,51 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       }
 
       if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeColor) {
-        currentState.strokeLuma = parseColorLumaFromOperatorArgs(args, currentState.strokeLuma);
+        const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
+        currentState.strokeR = r;
+        currentState.strokeG = g;
+        currentState.strokeB = b;
         continue;
       }
 
       if (fn === OPS.setStrokeGray) {
         const strokeGray = readArg(args, 0);
-        currentState.strokeLuma = parseLuma(strokeGray, currentState.strokeLuma);
+        const [gray] = parseGrayColor(strokeGray, currentState.strokeR);
+        currentState.strokeR = gray;
+        currentState.strokeG = gray;
+        currentState.strokeB = gray;
         continue;
       }
 
       if (fn === OPS.setStrokeCMYKColor) {
-        currentState.strokeLuma = parseCmykLumaFromOperatorArgs(args, currentState.strokeLuma);
+        const [r, g, b] = parseCmykColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
+        currentState.strokeR = r;
+        currentState.strokeG = g;
+        currentState.strokeB = b;
         continue;
       }
 
       if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor) {
-        currentState.fillLuma = parseColorLumaFromOperatorArgs(args, currentState.fillLuma);
+        const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.fillR, currentState.fillG, currentState.fillB]);
+        currentState.fillR = r;
+        currentState.fillG = g;
+        currentState.fillB = b;
         continue;
       }
 
       if (fn === OPS.setFillGray) {
-        currentState.fillLuma = parseLuma(readArg(args, 0), currentState.fillLuma);
+        const [gray] = parseGrayColor(readArg(args, 0), currentState.fillR);
+        currentState.fillR = gray;
+        currentState.fillG = gray;
+        currentState.fillB = gray;
         continue;
       }
 
       if (fn === OPS.setFillCMYKColor) {
-        currentState.fillLuma = parseCmykLumaFromOperatorArgs(args, currentState.fillLuma);
+        const [r, g, b] = parseCmykColorFromOperatorArgs(args, [currentState.fillR, currentState.fillG, currentState.fillB]);
+        currentState.fillR = r;
+        currentState.fillG = g;
+        currentState.fillB = b;
         continue;
       }
 
@@ -294,13 +331,17 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
         const halfWidth = Math.max(0, strokeWidth * 0.5);
         maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
 
-        const styleLuma = clamp01(currentState.strokeLuma);
+        const styleR = clamp01(currentState.strokeR);
+        const styleG = clamp01(currentState.strokeG);
+        const styleB = clamp01(currentState.strokeB);
         const styleAlpha = clamp01(currentState.strokeAlpha);
         sourceSegmentCount += emitSegmentsFromPath(
           pathData,
           currentState.matrix,
           halfWidth,
-          styleLuma,
+          styleR,
+          styleG,
+          styleB,
           styleAlpha,
           isHairlineStroke ? 1 : 0,
           enableSegmentMerge,
@@ -322,7 +363,9 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
             currentState.matrix,
             fillRule,
             hasCompanionStroke,
-            clamp01(currentState.fillLuma),
+            clamp01(currentState.fillR),
+            clamp01(currentState.fillG),
+            clamp01(currentState.fillB),
             fillAlpha,
             fillPathMetaABuilder,
             fillPathMetaBBuilder,
@@ -419,6 +462,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       textOutOfPageCount: textData.outOfPageCount,
       textInstanceA: textData.instanceA,
       textInstanceB: textData.instanceB,
+      textInstanceC: textData.instanceC,
       textGlyphMetaA: textData.glyphMetaA,
       textGlyphMetaB: textData.glyphMetaB,
       textGlyphSegmentsA: textData.glyphSegmentsA,
@@ -446,9 +490,13 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsSta
   return {
     matrix: [...initialMatrix],
     lineWidth: 1,
-    strokeLuma: 0,
+    strokeR: 0,
+    strokeG: 0,
+    strokeB: 0,
     strokeAlpha: 1,
-    fillLuma: 0,
+    fillR: 0,
+    fillG: 0,
+    fillB: 0,
     fillAlpha: 1
   };
 }
@@ -514,9 +562,13 @@ function cloneState(state: GraphicsState): GraphicsState {
   return {
     matrix: [...state.matrix],
     lineWidth: state.lineWidth,
-    strokeLuma: state.strokeLuma,
+    strokeR: state.strokeR,
+    strokeG: state.strokeG,
+    strokeB: state.strokeB,
     strokeAlpha: state.strokeAlpha,
-    fillLuma: state.fillLuma,
+    fillR: state.fillR,
+    fillG: state.fillG,
+    fillB: state.fillB,
     fillAlpha: state.fillAlpha
   };
 }
@@ -547,6 +599,7 @@ interface TextExtractResult {
   outOfPageCount: number;
   instanceA: Float32Array;
   instanceB: Float32Array;
+  instanceC: Float32Array;
   glyphMetaA: Float32Array;
   glyphMetaB: Float32Array;
   glyphSegmentsA: Float32Array;
@@ -566,7 +619,9 @@ interface CommonObjsLike {
 
 interface TextState {
   matrix: Mat2D;
-  fillLuma: number;
+  fillR: number;
+  fillG: number;
+  fillB: number;
   fillAlpha: number;
   textMatrix: Mat2D;
   textX: number;
@@ -671,15 +726,25 @@ function isEvenOddFillPaintOp(op: number): boolean {
   return op === OPS.eoFill || op === OPS.eoFillStroke || op === OPS.closeEOFillStroke;
 }
 
-function parseLuma(value: unknown, fallback: number): number {
+function parseGrayColor(value: unknown, fallback: number): RgbColor {
+  const gray = Number(value);
+  if (Number.isFinite(gray)) {
+    const normalized = clamp01(gray > 1 ? gray / 255 : gray);
+    return [normalized, normalized, normalized];
+  }
+  return [fallback, fallback, fallback];
+}
+
+function parseColor(value: unknown, fallback: RgbColor): RgbColor {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return clamp01(value);
+    const normalized = clamp01(value > 1 ? value / 255 : value);
+    return [normalized, normalized, normalized];
   }
 
   if (typeof value === "string") {
     if (value.startsWith("#") && (value.length === 7 || value.length === 4)) {
       const [r, g, b] = parseHexColor(value);
-      return clamp01((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255);
+      return [clamp01(r / 255), clamp01(g / 255), clamp01(b / 255)];
     }
   }
 
@@ -688,33 +753,36 @@ function parseLuma(value: unknown, fallback: number): number {
     const g = Number(value[1]);
     const b = Number(value[2]);
     if ([r, g, b].every(Number.isFinite)) {
-      const normalized = [r, g, b].map((entry) => (entry > 1 ? entry / 255 : entry));
-      return clamp01(0.2126 * normalized[0] + 0.7152 * normalized[1] + 0.0722 * normalized[2]);
+      return [
+        clamp01(r > 1 ? r / 255 : r),
+        clamp01(g > 1 ? g / 255 : g),
+        clamp01(b > 1 ? b / 255 : b)
+      ];
     }
   }
 
-  return fallback;
+  return [fallback[0], fallback[1], fallback[2]];
 }
 
-function parseColorLumaFromOperatorArgs(args: unknown, fallback: number): number {
+function parseColorFromOperatorArgs(args: unknown, fallback: RgbColor): RgbColor {
   if (!Array.isArray(args)) {
-    return parseLuma(args, fallback);
+    return parseColor(args, fallback);
   }
 
   if (args.length >= 3 && args.slice(0, 3).every((entry) => Number.isFinite(Number(entry)))) {
-    return parseLuma([args[0], args[1], args[2]], fallback);
+    return parseColor([args[0], args[1], args[2]], fallback);
   }
 
   if (args.length > 0) {
-    return parseLuma(args[0], fallback);
+    return parseColor(args[0], fallback);
   }
 
-  return fallback;
+  return [fallback[0], fallback[1], fallback[2]];
 }
 
-function parseCmykLumaFromOperatorArgs(args: unknown, fallback: number): number {
+function parseCmykColorFromOperatorArgs(args: unknown, fallback: RgbColor): RgbColor {
   if (!Array.isArray(args) || args.length < 4) {
-    return parseColorLumaFromOperatorArgs(args, fallback);
+    return parseColorFromOperatorArgs(args, fallback);
   }
 
   const c = normalizeColorComponent(args[0]);
@@ -722,7 +790,7 @@ function parseCmykLumaFromOperatorArgs(args: unknown, fallback: number): number 
   const y = normalizeColorComponent(args[2]);
   const k = normalizeColorComponent(args[3]);
   if ([c, m, y, k].some((component) => component === null)) {
-    return parseColorLumaFromOperatorArgs(args, fallback);
+    return parseColorFromOperatorArgs(args, fallback);
   }
 
   const cyan = c as number;
@@ -733,7 +801,7 @@ function parseCmykLumaFromOperatorArgs(args: unknown, fallback: number): number 
   const r = 1 - Math.min(1, cyan + black);
   const g = 1 - Math.min(1, magenta + black);
   const b = 1 - Math.min(1, yellow + black);
-  return clamp01(0.2126 * r + 0.7152 * g + 0.0722 * b);
+  return [clamp01(r), clamp01(g), clamp01(b)];
 }
 
 function normalizeColorComponent(value: unknown): number | null {
@@ -801,7 +869,9 @@ function emitSegmentsFromPath(
   pathData: Float32Array,
   matrix: Mat2D,
   halfWidth: number,
-  luma: number,
+  colorR: number,
+  colorG: number,
+  colorB: number,
   alpha: number,
   styleFlags: number,
   allowSegmentMerge: boolean,
@@ -834,8 +904,8 @@ function emitSegmentsFromPath(
     primitiveType: number
   ): void => {
     endpoints.push(p0x, p0y, p1x, p1y);
-    primitiveMeta.push(p2x, p2y, primitiveType, 0);
-    styles.push(halfWidth, luma, alpha, styleFlags);
+    primitiveMeta.push(p2x, p2y, primitiveType, encodeStrokeStyleMeta(alpha, styleFlags));
+    styles.push(halfWidth, colorR, colorG, colorB);
 
     const minX = Math.min(p0x, p1x, p2x);
     const minY = Math.min(p0y, p1y, p2y);
@@ -1045,7 +1115,9 @@ function emitFilledPathFromPath(
   matrix: Mat2D,
   fillRule: number,
   hasCompanionStroke: boolean,
-  luma: number,
+  colorR: number,
+  colorG: number,
+  colorB: number,
   alpha: number,
   metaA: Float4Builder,
   metaB: Float4Builder,
@@ -1208,8 +1280,8 @@ function emitFilledPathFromPath(
   }
 
   metaA.push(segmentStart, primitiveCount, localBounds.minX, localBounds.minY);
-  metaB.push(localBounds.maxX, localBounds.maxY, luma, alpha);
-  metaC.push(fillRule, hasCompanionStroke ? 1 : 0, 0, 0);
+  metaB.push(localBounds.maxX, localBounds.maxY, colorR, colorG);
+  metaC.push(fillRule, hasCompanionStroke ? 1 : 0, colorB, alpha);
 
   bounds.minX = Math.min(bounds.minX, localBounds.minX);
   bounds.minY = Math.min(bounds.minY, localBounds.minY);
@@ -1270,9 +1342,10 @@ function cullInvisibleSegments(
     const isQuadratic = primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5;
 
     const halfWidth = styles[offset];
-    const luma = styles[offset + 1];
-    const alpha = styles[offset + 2];
-    const styleFlags = styles[offset + 3];
+    const colorR = styles[offset + 1];
+    const colorG = styles[offset + 2];
+    const colorB = styles[offset + 3];
+    const { alpha, styleFlags } = decodeStrokeStyleMeta(primitiveMeta[offset + 3]);
 
     if (alpha <= ALPHA_INVISIBLE_EPSILON) {
       discardedTransparentCount += 1;
@@ -1296,7 +1369,9 @@ function cullInvisibleSegments(
       y1,
       primitiveType,
       halfWidth,
-      luma,
+      colorR,
+      colorG,
+      colorB,
       alpha,
       styleFlags
     );
@@ -1309,7 +1384,7 @@ function cullInvisibleSegments(
     keepMask[i] = 1;
 
     if (!isQuadratic) {
-      const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, luma, alpha, styleFlags);
+      const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, colorR, colorG, colorB, alpha, styleFlags);
       let bucket = coverageGroups.get(coverage.key);
       if (!bucket) {
         bucket = [];
@@ -1483,7 +1558,9 @@ function buildDuplicateKey(
   y1: number,
   primitiveType: number,
   halfWidth: number,
-  luma: number,
+  colorR: number,
+  colorG: number,
+  colorB: number,
   alpha: number,
   styleFlags: number
 ): string {
@@ -1511,7 +1588,9 @@ function buildDuplicateKey(
   return [
     quantize(primitiveType, 10),
     quantize(halfWidth, DUPLICATE_STYLE_SCALE),
-    quantize(luma, DUPLICATE_STYLE_SCALE),
+    quantize(colorR, DUPLICATE_STYLE_SCALE),
+    quantize(colorG, DUPLICATE_STYLE_SCALE),
+    quantize(colorB, DUPLICATE_STYLE_SCALE),
     quantize(alpha, DUPLICATE_STYLE_SCALE),
     quantize(styleFlags, 1),
     quantize(ax, DUPLICATE_POSITION_SCALE),
@@ -1530,7 +1609,9 @@ function buildCoverageCandidate(
   x1: number,
   y1: number,
   halfWidth: number,
-  luma: number,
+  colorR: number,
+  colorG: number,
+  colorB: number,
   alpha: number,
   styleFlags: number
 ): { key: string; index: number; start: number; end: number; halfWidth: number; alpha: number; styleFlags: number } {
@@ -1568,7 +1649,9 @@ function buildCoverageCandidate(
     quantize(ux, COVER_DIRECTION_SCALE),
     quantize(uy, COVER_DIRECTION_SCALE),
     quantize(offset, COVER_OFFSET_SCALE),
-    quantize(luma, DUPLICATE_STYLE_SCALE),
+    quantize(colorR, DUPLICATE_STYLE_SCALE),
+    quantize(colorG, DUPLICATE_STYLE_SCALE),
+    quantize(colorB, DUPLICATE_STYLE_SCALE),
     quantize(styleFlags, 1)
   ].join("|");
 
@@ -1588,6 +1671,7 @@ async function extractTextVectorData(
 
   const textInstanceA = new Float4Builder(4_096);
   const textInstanceB = new Float4Builder(4_096);
+  const textInstanceC = new Float4Builder(4_096);
   const textGlyphMetaA = new Float4Builder(2_048);
   const textGlyphMetaB = new Float4Builder(2_048);
   const textGlyphSegmentsA = new Float4Builder(16_384);
@@ -1670,12 +1754,13 @@ async function extractTextVectorData(
       const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
 
       if (!vertical && !skipGlyphRender && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
-        const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
-        if (glyphRecord) {
-          const glyphMatrix = buildTextGlyphTransform(state, x, 0);
-          textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
-          textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, state.fillLuma);
-          sourceTextCount += 1;
+          const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
+          if (glyphRecord) {
+            const glyphMatrix = buildTextGlyphTransform(state, x, 0);
+            textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
+            textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
+            textInstanceC.push(state.fillR, state.fillG, state.fillB, state.fillAlpha);
+            sourceTextCount += 1;
 
           const transformedGlyphBounds = transformBounds(glyphRecord.bounds, glyphMatrix);
           if (pageBounds) {
@@ -1741,9 +1826,20 @@ async function extractTextVectorData(
 
     if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor || fn === OPS.setFillGray || fn === OPS.setFillCMYKColor) {
       if (fn === OPS.setFillCMYKColor) {
-        state.fillLuma = parseCmykLumaFromOperatorArgs(args, state.fillLuma);
+        const [r, g, b] = parseCmykColorFromOperatorArgs(args, [state.fillR, state.fillG, state.fillB]);
+        state.fillR = r;
+        state.fillG = g;
+        state.fillB = b;
+      } else if (fn === OPS.setFillGray) {
+        const [gray] = parseGrayColor(readArg(args, 0), state.fillR);
+        state.fillR = gray;
+        state.fillG = gray;
+        state.fillB = gray;
       } else {
-        state.fillLuma = parseColorLumaFromOperatorArgs(args, state.fillLuma);
+        const [r, g, b] = parseColorFromOperatorArgs(args, [state.fillR, state.fillG, state.fillB]);
+        state.fillR = r;
+        state.fillG = g;
+        state.fillB = b;
       }
       continue;
     }
@@ -1865,6 +1961,7 @@ async function extractTextVectorData(
     outOfPageCount,
     instanceA: textInstanceA.toTypedArray(),
     instanceB: textInstanceB.toTypedArray(),
+    instanceC: textInstanceC.toTypedArray(),
     glyphMetaA: textGlyphMetaA.toTypedArray(),
     glyphMetaB: textGlyphMetaB.toTypedArray(),
     glyphSegmentsA: textGlyphSegmentsA.toTypedArray(),
@@ -1883,6 +1980,7 @@ function createEmptyTextExtractResult(): TextExtractResult {
     outOfPageCount: 0,
     instanceA: new Float32Array(0),
     instanceB: new Float32Array(0),
+    instanceC: new Float32Array(0),
     glyphMetaA: new Float32Array(0),
     glyphMetaB: new Float32Array(0),
     glyphSegmentsA: new Float32Array(0),
@@ -1977,7 +2075,9 @@ async function warmUpTextPathCache(page: unknown): Promise<void> {
 function createDefaultTextState(matrix: Mat2D): TextState {
   return {
     matrix: [...matrix],
-    fillLuma: 0,
+    fillR: 0,
+    fillG: 0,
+    fillB: 0,
     fillAlpha: 1,
     textMatrix: [...IDENTITY_MATRIX],
     textX: 0,
@@ -1999,7 +2099,9 @@ function createDefaultTextState(matrix: Mat2D): TextState {
 function cloneTextState(state: TextState): TextState {
   return {
     matrix: [...state.matrix],
-    fillLuma: state.fillLuma,
+    fillR: state.fillR,
+    fillG: state.fillG,
+    fillB: state.fillB,
     fillAlpha: state.fillAlpha,
     textMatrix: [...state.textMatrix],
     textX: state.textX,

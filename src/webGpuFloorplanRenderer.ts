@@ -51,7 +51,7 @@ struct VsOut {
   @location(4) @interpolate(flat) primitiveType : f32,
   @location(5) @interpolate(flat) halfWidth : f32,
   @location(6) @interpolate(flat) aaWorld : f32,
-  @location(7) @interpolate(flat) luma : f32,
+  @location(7) @interpolate(flat) color : vec3f,
   @location(8) @interpolate(flat) alpha : f32,
 };
 
@@ -153,9 +153,10 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let isQuadratic = primitiveType >= 0.5;
 
   var halfWidth = style.x;
-  let luma = style.y;
-  let alpha = style.z;
-  let styleFlags = style.w;
+  let color = style.yzw;
+  let packedStyle = primitiveB.w;
+  let styleFlags = select(0.0, 1.0, packedStyle >= 2.0);
+  let alpha = clamp(packedStyle - styleFlags * 2.0, 0.0, 1.0);
   let isHairline = styleFlags >= 0.5;
 
   let geometryLength = select(length(p2 - p0), length(p1 - p0) + length(p2 - p1), isQuadratic);
@@ -170,7 +171,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.primitiveType = 0.0;
     out.halfWidth = 0.0;
     out.aaWorld = 1.0;
-    out.luma = luma;
+    out.color = color;
     out.alpha = 0.0;
     return out;
   }
@@ -201,7 +202,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.primitiveType = primitiveType;
   out.halfWidth = halfWidth;
   out.aaWorld = aaWorld;
-  out.luma = luma;
+  out.color = color;
   out.alpha = alpha;
   return out;
 }
@@ -226,7 +227,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  return vec4f(vec3f(inData.luma), alpha);
+  return vec4f(inData.color, alpha);
 }
 `;
 
@@ -256,7 +257,7 @@ struct VsOut {
   @location(0) local : vec2f,
   @location(1) @interpolate(flat) segmentStart : i32,
   @location(2) @interpolate(flat) segmentCount : i32,
-  @location(3) @interpolate(flat) luma : f32,
+  @location(3) @interpolate(flat) color : vec3f,
   @location(4) @interpolate(flat) alpha : f32,
   @location(5) @interpolate(flat) fillRule : f32,
   @location(6) @interpolate(flat) fillHasCompanionStroke : f32,
@@ -391,7 +392,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let metaC = textureLoad(uFillPathMetaTexC, coord, 0);
 
   let segmentCount = i32(metaA.y + 0.5);
-  let alpha = metaB.w;
+  let alpha = metaC.w;
 
   var out : VsOut;
   if (segmentCount <= 0 || alpha <= 0.001) {
@@ -399,7 +400,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.local = vec2f(0.0, 0.0);
     out.segmentStart = 0;
     out.segmentCount = 0;
-    out.luma = 0.0;
+    out.color = vec3f(0.0, 0.0, 0.0);
     out.alpha = 0.0;
     out.fillRule = 0.0;
     out.fillHasCompanionStroke = 0.0;
@@ -418,7 +419,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.local = world;
   out.segmentStart = i32(metaA.x + 0.5);
   out.segmentCount = segmentCount;
-  out.luma = metaB.z;
+  out.color = vec3f(metaB.z, metaB.w, metaC.z);
   out.alpha = alpha;
   out.fillRule = metaC.x;
   out.fillHasCompanionStroke = metaC.y;
@@ -474,7 +475,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     if (alpha <= 0.001) {
       discard;
     }
-    return vec4f(vec3f(inData.luma), alpha);
+    return vec4f(inData.color, alpha);
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
@@ -484,7 +485,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  return vec4f(vec3f(inData.luma), alpha);
+  return vec4f(inData.color, alpha);
 }
 `;
 
@@ -505,17 +506,19 @@ struct CameraUniforms {
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
 @group(0) @binding(1) var uTextInstanceTexA : texture_2d<f32>;
 @group(0) @binding(2) var uTextInstanceTexB : texture_2d<f32>;
-@group(0) @binding(3) var uTextGlyphMetaTexA : texture_2d<f32>;
-@group(0) @binding(4) var uTextGlyphMetaTexB : texture_2d<f32>;
-@group(0) @binding(5) var uTextGlyphSegmentTexA : texture_2d<f32>;
-@group(0) @binding(6) var uTextGlyphSegmentTexB : texture_2d<f32>;
+@group(0) @binding(3) var uTextInstanceTexC : texture_2d<f32>;
+@group(0) @binding(4) var uTextGlyphMetaTexA : texture_2d<f32>;
+@group(0) @binding(5) var uTextGlyphMetaTexB : texture_2d<f32>;
+@group(0) @binding(6) var uTextGlyphSegmentTexA : texture_2d<f32>;
+@group(0) @binding(7) var uTextGlyphSegmentTexB : texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) position : vec4f,
   @location(0) local : vec2f,
   @location(1) @interpolate(flat) segmentStart : i32,
   @location(2) @interpolate(flat) segmentCount : i32,
-  @location(3) @interpolate(flat) luma : f32,
+  @location(3) @interpolate(flat) color : vec3f,
+  @location(4) @interpolate(flat) colorAlpha : f32,
 };
 
 const MAX_GLYPH_PRIMITIVES : i32 = 256;
@@ -645,6 +648,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
   let instanceA = textureLoad(uTextInstanceTexA, instanceCoord, 0);
   let instanceB = textureLoad(uTextInstanceTexB, instanceCoord, 0);
+  let instanceC = textureLoad(uTextInstanceTexC, instanceCoord, 0);
 
   let glyphIndex = i32(instanceB.z + 0.5);
   let glyphCoord = coordFromIndex(glyphIndex, i32(glyphMetaDims.x));
@@ -659,7 +663,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.local = vec2f(0.0, 0.0);
     out.segmentStart = 0;
     out.segmentCount = 0;
-    out.luma = 0.0;
+    out.color = vec3f(0.0, 0.0, 0.0);
+    out.colorAlpha = 0.0;
     return out;
   }
 
@@ -680,7 +685,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.local = local;
   out.segmentStart = i32(glyphMetaA.x + 0.5);
   out.segmentCount = segmentCount;
-  out.luma = instanceB.w;
+  out.color = instanceC.xyz;
+  out.colorAlpha = instanceC.w;
   return out;
 }
 
@@ -726,12 +732,12 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let inside = winding != 0;
   let signedDistance = select(minDistance, -minDistance, inside);
 
-  let alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  let alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
 
-  return vec4f(vec3f(inData.luma), alpha);
+  return vec4f(inData.color, alpha);
 }
 `;
 
@@ -851,6 +857,8 @@ export class WebGpuFloorplanRenderer {
   private textInstanceTextureA: any = null;
 
   private textInstanceTextureB: any = null;
+
+  private textInstanceTextureC: any = null;
 
   private textGlyphMetaTextureA: any = null;
 
@@ -1081,11 +1089,16 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 5,
-          visibility: gpuShaderStage.FRAGMENT,
+          visibility: gpuShaderStage.VERTEX,
           texture: { sampleType: "unfilterable-float" }
         },
         {
           binding: 6,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 7,
           visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
         }
@@ -1285,6 +1298,7 @@ export class WebGpuFloorplanRenderer {
 
     this.textInstanceTextureA = this.createFloatTexture(this.textInstanceTextureWidth, this.textInstanceTextureHeight, scene.textInstanceA);
     this.textInstanceTextureB = this.createFloatTexture(this.textInstanceTextureWidth, this.textInstanceTextureHeight, scene.textInstanceB);
+    this.textInstanceTextureC = this.createFloatTexture(this.textInstanceTextureWidth, this.textInstanceTextureHeight, scene.textInstanceC);
     this.textGlyphMetaTextureA = this.createFloatTexture(this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight, scene.textGlyphMetaA);
     this.textGlyphMetaTextureB = this.createFloatTexture(this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight, scene.textGlyphMetaB);
     this.textGlyphSegmentTextureA = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsA);
@@ -1348,18 +1362,22 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 3,
-          resource: this.textGlyphMetaTextureA.createView()
+          resource: this.textInstanceTextureC.createView()
         },
         {
           binding: 4,
-          resource: this.textGlyphMetaTextureB.createView()
+          resource: this.textGlyphMetaTextureA.createView()
         },
         {
           binding: 5,
-          resource: this.textGlyphSegmentTextureA.createView()
+          resource: this.textGlyphMetaTextureB.createView()
         },
         {
           binding: 6,
+          resource: this.textGlyphSegmentTextureA.createView()
+        },
+        {
+          binding: 7,
           resource: this.textGlyphSegmentTextureB.createView()
         }
       ]
@@ -2166,6 +2184,7 @@ export class WebGpuFloorplanRenderer {
       this.fillSegmentTextureB,
       this.textInstanceTextureA,
       this.textInstanceTextureB,
+      this.textInstanceTextureC,
       this.textGlyphMetaTextureA,
       this.textGlyphMetaTextureB,
       this.textGlyphSegmentTextureA,
@@ -2189,6 +2208,7 @@ export class WebGpuFloorplanRenderer {
     this.fillSegmentTextureB = null;
     this.textInstanceTextureA = null;
     this.textInstanceTextureB = null;
+    this.textInstanceTextureC = null;
     this.textGlyphMetaTextureA = null;
     this.textGlyphMetaTextureB = null;
     this.textGlyphSegmentTextureA = null;

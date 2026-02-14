@@ -762,6 +762,7 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneStats): 
     createTextureExportEntry("stroke-primitive-bounds", scene.primitiveBounds, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
     createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
     createTextureExportEntry("text-instance-b", scene.textInstanceB, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
+    createTextureExportEntry("text-instance-c", scene.textInstanceC, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
     createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount),
     createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount),
     createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount),
@@ -849,6 +850,7 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
   const strokePrimitiveBoundsEntry = await readTexture(["stroke-primitive-bounds"], false);
   const textInstanceAEntry = await readTexture(["text-instance-a"], false);
   const textInstanceBEntry = await readTexture(["text-instance-b"], false);
+  const textInstanceCEntry = await readTexture(["text-instance-c"], false);
   const textGlyphMetaAEntry = await readTexture(["text-glyph-meta-a"], false);
   const textGlyphMetaBEntry = await readTexture(["text-glyph-meta-b"], false);
   const textGlyphPrimitiveAEntry = await readTexture(["text-glyph-primitives-a"], false);
@@ -890,6 +892,9 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
 
   const textInstanceA = trimTextureForItemCount(textInstanceAEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-a");
   const textInstanceB = trimTextureForItemCount(textInstanceBEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-b");
+  const textInstanceC = textInstanceCEntry
+    ? trimTextureForItemCount(textInstanceCEntry.data, textInstanceCount, "text-instance-c")
+    : deriveLegacyTextInstanceColors(textInstanceB, textInstanceCount);
   const textGlyphMetaA = trimTextureForItemCount(textGlyphMetaAEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-a");
   const textGlyphMetaB = trimTextureForItemCount(textGlyphMetaBEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-b");
   const textGlyphSegmentsA = trimTextureForItemCount(
@@ -902,6 +907,9 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
     textGlyphSegmentCount,
     "text-glyph-primitives-b"
   );
+
+  migrateLegacyStrokeLayout(primitiveMeta, styles, segmentCount);
+  migrateLegacyFillLayout(fillPathMetaB, fillPathMetaC, fillPathCount);
 
   const sourceSegmentCount = readNonNegativeInt(sceneMeta.sourceSegmentCount, segmentCount);
   const mergedSegmentCount = readNonNegativeInt(sceneMeta.mergedSegmentCount, segmentCount);
@@ -941,6 +949,7 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
     textOutOfPageCount,
     textInstanceA,
     textInstanceB,
+    textInstanceC,
     textGlyphMetaA,
     textGlyphMetaB,
     textGlyphSegmentsA,
@@ -985,6 +994,87 @@ function deriveLinePrimitiveB(primitivesA: Float32Array, primitiveCount: number)
     out[offset + 3] = 0;
   }
   return out;
+}
+
+function deriveLegacyTextInstanceColors(textInstanceB: Float32Array, textInstanceCount: number): Float32Array {
+  const out = new Float32Array(textInstanceCount * 4);
+  for (let i = 0; i < textInstanceCount; i += 1) {
+    const offset = i * 4;
+    const luma = clamp01(textInstanceB[offset + 3]);
+    out[offset] = luma;
+    out[offset + 1] = luma;
+    out[offset + 2] = luma;
+    out[offset + 3] = 1;
+  }
+  return out;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 1) {
+    return 1;
+  }
+  return value;
+}
+
+function migrateLegacyStrokeLayout(primitiveMeta: Float32Array, styles: Float32Array, segmentCount: number): void {
+  if (segmentCount <= 0) {
+    return;
+  }
+
+  let hasPackedStyleMeta = false;
+  for (let i = 0; i < segmentCount; i += 1) {
+    if (Math.abs(primitiveMeta[i * 4 + 3]) > 1e-6) {
+      hasPackedStyleMeta = true;
+      break;
+    }
+  }
+  if (hasPackedStyleMeta) {
+    return;
+  }
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const offset = i * 4;
+    const luma = clamp01(styles[offset + 1]);
+    const alpha = clamp01(styles[offset + 2]);
+    const styleFlags = styles[offset + 3] >= 0.5 ? 1 : 0;
+    styles[offset + 1] = luma;
+    styles[offset + 2] = luma;
+    styles[offset + 3] = luma;
+    primitiveMeta[offset + 3] = alpha + styleFlags * 2;
+  }
+}
+
+function migrateLegacyFillLayout(fillPathMetaB: Float32Array, fillPathMetaC: Float32Array, fillPathCount: number): void {
+  if (fillPathCount <= 0) {
+    return;
+  }
+
+  let hasPackedFillAlpha = false;
+  for (let i = 0; i < fillPathCount; i += 1) {
+    if (Math.abs(fillPathMetaC[i * 4 + 3]) > 1e-6) {
+      hasPackedFillAlpha = true;
+      break;
+    }
+  }
+  if (hasPackedFillAlpha) {
+    return;
+  }
+
+  for (let i = 0; i < fillPathCount; i += 1) {
+    const offset = i * 4;
+    const luma = clamp01(fillPathMetaB[offset + 2]);
+    const alpha = clamp01(fillPathMetaB[offset + 3]);
+    fillPathMetaB[offset + 2] = luma;
+    fillPathMetaB[offset + 3] = luma;
+    fillPathMetaC[offset + 2] = luma;
+    fillPathMetaC[offset + 3] = alpha;
+  }
 }
 
 function derivePrimitiveBounds(primitivesA: Float32Array, primitivesB: Float32Array, primitiveCount: number): Float32Array {

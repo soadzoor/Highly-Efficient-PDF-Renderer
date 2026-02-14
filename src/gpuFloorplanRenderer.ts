@@ -25,7 +25,7 @@ flat out vec2 vP2;
 flat out float vPrimitiveType;
 flat out float vHalfWidth;
 flat out float vAAWorld;
-flat out float vLuma;
+flat out vec3 vColor;
 flat out float vAlpha;
 
 ivec2 segmentCoord(int index) {
@@ -47,9 +47,10 @@ void main() {
   float primitiveType = primitiveB.z;
   bool isQuadratic = primitiveType >= 0.5;
   float halfWidth = style.x;
-  float luma = style.y;
-  float alpha = style.z;
-  float styleFlags = style.w;
+  vec3 color = style.yzw;
+  float packedStyle = primitiveB.w;
+  float styleFlags = packedStyle >= 2.0 ? 1.0 : 0.0;
+  float alpha = packedStyle - styleFlags * 2.0;
   bool isHairline = styleFlags >= 0.5;
 
   float geometryLength = isQuadratic
@@ -65,7 +66,7 @@ void main() {
     vPrimitiveType = 0.0;
     vHalfWidth = 0.0;
     vAAWorld = 1.0;
-    vLuma = luma;
+    vColor = color;
     vAlpha = 0.0;
     return;
   }
@@ -97,7 +98,7 @@ void main() {
   vPrimitiveType = primitiveType;
   vHalfWidth = halfWidth;
   vAAWorld = aaWorld;
-  vLuma = luma;
+  vColor = color;
   vAlpha = alpha;
 }
 `;
@@ -112,7 +113,7 @@ flat in vec2 vP2;
 flat in float vPrimitiveType;
 flat in float vHalfWidth;
 flat in float vAAWorld;
-flat in float vLuma;
+flat in vec3 vColor;
 flat in float vAlpha;
 
 out vec4 outColor;
@@ -192,8 +193,7 @@ void main() {
     discard;
   }
 
-  vec3 color = vec3(vLuma);
-  outColor = vec4(color, alpha);
+  outColor = vec4(vColor, alpha);
 }
 `;
 
@@ -214,7 +214,7 @@ uniform float uZoom;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
-flat out float vLuma;
+flat out vec3 vColor;
 flat out float vAlpha;
 flat out float vFillRule;
 flat out float vFillHasCompanionStroke;
@@ -233,12 +233,12 @@ void main() {
   vec4 metaC = texelFetch(uFillPathMetaTexC, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
 
   int segmentCount = int(metaA.y + 0.5);
-  float alpha = metaB.w;
+  float alpha = metaC.w;
   if (segmentCount <= 0 || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
     vSegmentCount = 0;
-    vLuma = 0.0;
+    vColor = vec3(0.0);
     vAlpha = 0.0;
     vFillRule = 0.0;
     vFillHasCompanionStroke = 0.0;
@@ -257,7 +257,7 @@ void main() {
 
   vSegmentStart = int(metaA.x + 0.5);
   vSegmentCount = segmentCount;
-  vLuma = metaB.z;
+  vColor = vec3(metaB.z, metaB.w, metaC.z);
   vAlpha = alpha;
   vFillRule = metaC.x;
   vFillHasCompanionStroke = metaC.y;
@@ -276,7 +276,7 @@ uniform float uFillAAScreenPx;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
-flat in float vLuma;
+flat in vec3 vColor;
 flat in float vAlpha;
 flat in float vFillRule;
 flat in float vFillHasCompanionStroke;
@@ -425,7 +425,7 @@ void main() {
     if (alpha <= 0.001) {
       discard;
     }
-    outColor = vec4(vec3(vLuma), alpha);
+    outColor = vec4(vColor, alpha);
     return;
   }
 
@@ -440,7 +440,7 @@ void main() {
     discard;
   }
 
-  outColor = vec4(vec3(vLuma), alpha);
+  outColor = vec4(vColor, alpha);
 }
 `;
 
@@ -453,6 +453,7 @@ layout(location = 2) in float aTextInstanceIndex;
 
 uniform sampler2D uTextInstanceTexA;
 uniform sampler2D uTextInstanceTexB;
+uniform sampler2D uTextInstanceTexC;
 uniform sampler2D uTextGlyphMetaTexA;
 uniform sampler2D uTextGlyphMetaTexB;
 uniform ivec2 uTextInstanceTexSize;
@@ -463,7 +464,8 @@ uniform float uZoom;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
-flat out float vLuma;
+flat out vec3 vColor;
+flat out float vColorAlpha;
 out vec2 vLocal;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
@@ -476,6 +478,7 @@ void main() {
   int instanceIndex = int(aTextInstanceIndex + 0.5);
   vec4 instanceA = texelFetch(uTextInstanceTexA, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
   vec4 instanceB = texelFetch(uTextInstanceTexB, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
+  vec4 instanceC = texelFetch(uTextInstanceTexC, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
 
   int glyphIndex = int(instanceB.z + 0.5);
   vec4 glyphMetaA = texelFetch(uTextGlyphMetaTexA, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
@@ -486,7 +489,8 @@ void main() {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
     vSegmentCount = 0;
-    vLuma = 0.0;
+    vColor = vec3(0.0);
+    vColorAlpha = 0.0;
     vLocal = vec2(0.0);
     return;
   }
@@ -507,7 +511,8 @@ void main() {
   gl_Position = vec4(clip, 0.0, 1.0);
   vSegmentStart = int(glyphMetaA.x + 0.5);
   vSegmentCount = segmentCount;
-  vLuma = instanceB.w;
+  vColor = instanceC.rgb;
+  vColorAlpha = instanceC.a;
   vLocal = local;
 }
 `;
@@ -524,7 +529,8 @@ uniform float uTextCurveEnabled;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
-flat in float vLuma;
+flat in vec3 vColor;
+flat in float vColorAlpha;
 in vec2 vLocal;
 
 out vec4 outColor;
@@ -669,12 +675,12 @@ void main() {
   float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
   float aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uTextAAScreenPx, 1e-4);
 
-  float alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  float alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * vColorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
 
-  outColor = vec4(vec3(vLuma), alpha);
+  outColor = vec4(vColor, alpha);
 }
 `;
 
@@ -807,6 +813,8 @@ export class GpuFloorplanRenderer {
 
   private readonly textInstanceTextureB: WebGLTexture;
 
+  private readonly textInstanceTextureC: WebGLTexture;
+
   private readonly textGlyphMetaTextureA: WebGLTexture;
 
   private readonly textGlyphMetaTextureB: WebGLTexture;
@@ -860,6 +868,8 @@ export class GpuFloorplanRenderer {
   private readonly uTextInstanceTexA: WebGLUniformLocation;
 
   private readonly uTextInstanceTexB: WebGLUniformLocation;
+
+  private readonly uTextInstanceTexC: WebGLUniformLocation;
 
   private readonly uTextGlyphMetaTexA: WebGLUniformLocation;
 
@@ -1041,6 +1051,7 @@ export class GpuFloorplanRenderer {
     this.fillSegmentTextureB = this.mustCreateTexture();
     this.textInstanceTextureA = this.mustCreateTexture();
     this.textInstanceTextureB = this.mustCreateTexture();
+    this.textInstanceTextureC = this.mustCreateTexture();
     this.textGlyphMetaTextureA = this.mustCreateTexture();
     this.textGlyphMetaTextureB = this.mustCreateTexture();
     this.textGlyphSegmentTextureA = this.mustCreateTexture();
@@ -1071,6 +1082,7 @@ export class GpuFloorplanRenderer {
 
     this.uTextInstanceTexA = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexA");
     this.uTextInstanceTexB = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexB");
+    this.uTextInstanceTexC = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexC");
     this.uTextGlyphMetaTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexA");
     this.uTextGlyphMetaTexB = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexB");
     this.uTextGlyphSegmentTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexA");
@@ -1560,20 +1572,23 @@ export class GpuFloorplanRenderer {
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureB);
     gl.activeTexture(gl.TEXTURE4);
-    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureA);
+    gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureC);
     gl.activeTexture(gl.TEXTURE5);
-    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureB);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureA);
     gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureA);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureB);
     gl.activeTexture(gl.TEXTURE7);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureA);
+    gl.activeTexture(gl.TEXTURE8);
     gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureB);
 
     gl.uniform1i(this.uTextInstanceTexA, 2);
     gl.uniform1i(this.uTextInstanceTexB, 3);
-    gl.uniform1i(this.uTextGlyphMetaTexA, 4);
-    gl.uniform1i(this.uTextGlyphMetaTexB, 5);
-    gl.uniform1i(this.uTextGlyphSegmentTexA, 6);
-    gl.uniform1i(this.uTextGlyphSegmentTexB, 7);
+    gl.uniform1i(this.uTextInstanceTexC, 4);
+    gl.uniform1i(this.uTextGlyphMetaTexA, 5);
+    gl.uniform1i(this.uTextGlyphMetaTexB, 6);
+    gl.uniform1i(this.uTextGlyphSegmentTexA, 7);
+    gl.uniform1i(this.uTextGlyphSegmentTexB, 8);
     gl.uniform2i(this.uTextInstanceTexSize, this.textInstanceTextureWidth, this.textInstanceTextureHeight);
     gl.uniform2i(this.uTextGlyphMetaTexSize, this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight);
     gl.uniform2i(this.uTextGlyphSegmentTexSize, this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight);
@@ -2017,6 +2032,9 @@ export class GpuFloorplanRenderer {
     const instanceBData = new Float32Array(instanceTexelCount * 4);
     instanceBData.set(scene.textInstanceB);
 
+    const instanceCData = new Float32Array(instanceTexelCount * 4);
+    instanceCData.set(scene.textInstanceC);
+
     const glyphMetaAData = new Float32Array(glyphMetaTexelCount * 4);
     glyphMetaAData.set(scene.textGlyphMetaA);
 
@@ -2055,6 +2073,20 @@ export class GpuFloorplanRenderer {
       gl.RGBA,
       gl.FLOAT,
       instanceBData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureC);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textInstanceTextureWidth,
+      this.textInstanceTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      instanceCData
     );
 
     gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureA);
