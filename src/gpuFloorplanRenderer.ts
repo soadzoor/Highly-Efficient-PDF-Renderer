@@ -754,12 +754,14 @@ uniform sampler2D uCacheTex;
 uniform vec2 uViewportPx;
 uniform vec2 uCacheSizePx;
 uniform vec2 uOffsetPx;
+uniform float uSampleScale;
 
 out vec4 outColor;
 
 void main() {
-  vec2 base = 0.5 * (uCacheSizePx - uViewportPx);
-  vec2 samplePx = gl_FragCoord.xy + base + uOffsetPx;
+  float sampleScale = max(uSampleScale, 1e-6);
+  vec2 centered = gl_FragCoord.xy - 0.5 * uViewportPx;
+  vec2 samplePx = centered * sampleScale + 0.5 * uCacheSizePx + uOffsetPx;
   vec2 uv = samplePx / uCacheSizePx;
 
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
@@ -844,6 +846,8 @@ const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
+const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
@@ -1064,6 +1068,8 @@ export class GpuFloorplanRenderer {
   private readonly uCacheSizePx: WebGLUniformLocation;
 
   private readonly uOffsetPx: WebGLUniformLocation;
+
+  private readonly uSampleScale: WebGLUniformLocation;
 
   private readonly uVectorLayerTex: WebGLUniformLocation;
 
@@ -1349,6 +1355,7 @@ export class GpuFloorplanRenderer {
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
     this.uCacheSizePx = this.mustGetUniformLocation(this.blitProgram, "uCacheSizePx");
     this.uOffsetPx = this.mustGetUniformLocation(this.blitProgram, "uOffsetPx");
+    this.uSampleScale = this.mustGetUniformLocation(this.blitProgram, "uSampleScale");
 
     this.uVectorLayerTex = this.mustGetUniformLocation(this.vectorCompositeProgram, "uVectorLayerTex");
     this.uVectorLayerViewportPx = this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx");
@@ -1778,11 +1785,7 @@ export class GpuFloorplanRenderer {
     if (this.isPanInteracting) {
       return true;
     }
-    if (!isCameraAnimating) {
-      return false;
-    }
-    // Keep cache active through pan damping tail; avoid zoom damping where cache refreshes each frame.
-    return Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON;
+    return isCameraAnimating;
   }
 
   private renderDirectToScreen(): void {
@@ -1975,15 +1978,27 @@ export class GpuFloorplanRenderer {
       return;
     }
 
-    let offsetPxX = (this.cameraCenterX - this.panCacheCenterX) * this.zoom;
-    let offsetPxY = (this.cameraCenterY - this.panCacheCenterY) * this.zoom;
+    let sampleScale = this.panCacheZoom / Math.max(this.zoom, 1e-6);
+    let offsetPxX = (this.cameraCenterX - this.panCacheCenterX) * this.panCacheZoom;
+    let offsetPxY = (this.cameraCenterY - this.panCacheCenterY) * this.panCacheZoom;
 
-    const maxOffsetX = Math.max(0, (this.panCacheWidth - this.canvas.width) * 0.5 - 2);
-    const maxOffsetY = Math.max(0, (this.panCacheHeight - this.canvas.height) * 0.5 - 2);
+    const halfCacheX = this.panCacheWidth * 0.5 - 2;
+    const halfCacheY = this.panCacheHeight * 0.5 - 2;
+    const halfScaledViewX = this.canvas.width * 0.5 * Math.abs(sampleScale);
+    const halfScaledViewY = this.canvas.height * 0.5 * Math.abs(sampleScale);
+    const coverageX = halfCacheX - halfScaledViewX;
+    const coverageY = halfCacheY - halfScaledViewY;
 
-    const zoomChanged = Math.abs(this.panCacheZoom - this.zoom) > PAN_CACHE_ZOOM_EPSILON;
-    const cacheOutOfCoverage = Math.abs(offsetPxX) > maxOffsetX || Math.abs(offsetPxY) > maxOffsetY;
-    const needsCacheRefresh = !this.panCacheValid || zoomChanged || cacheOutOfCoverage;
+    const zoomRatio = this.zoom / Math.max(this.panCacheZoom, 1e-6);
+    const zoomOutOfRange = zoomRatio < PAN_CACHE_ZOOM_RATIO_MIN || zoomRatio > PAN_CACHE_ZOOM_RATIO_MAX;
+    const zoomSettled = Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON;
+    const needsSharpRefresh = zoomSettled && Math.abs(this.panCacheZoom - this.zoom) > PAN_CACHE_ZOOM_EPSILON;
+    const cacheOutOfCoverage =
+      coverageX < 0 ||
+      coverageY < 0 ||
+      Math.abs(offsetPxX) > coverageX ||
+      Math.abs(offsetPxY) > coverageY;
+    const needsCacheRefresh = !this.panCacheValid || zoomOutOfRange || cacheOutOfCoverage || needsSharpRefresh;
 
     if (needsCacheRefresh) {
       this.panCacheCenterX = this.cameraCenterX;
@@ -2026,11 +2041,12 @@ export class GpuFloorplanRenderer {
       this.panCacheUsedCulling = !this.usingAllSegments;
       this.panCacheValid = true;
 
+      sampleScale = 1;
       offsetPxX = 0;
       offsetPxY = 0;
     }
 
-    this.blitPanCache(offsetPxX, offsetPxY);
+    this.blitPanCache(offsetPxX, offsetPxY, sampleScale);
 
     this.frameListener?.({
       renderedSegments: this.panCacheRenderedSegments,
@@ -2270,7 +2286,7 @@ export class GpuFloorplanRenderer {
     return this.textInstanceCount;
   }
 
-  private blitPanCache(offsetPxX: number, offsetPxY: number): void {
+  private blitPanCache(offsetPxX: number, offsetPxY: number, sampleScale: number): void {
     if (!this.panCacheTexture) {
       return;
     }
@@ -2291,6 +2307,7 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uViewportPx, this.canvas.width, this.canvas.height);
     gl.uniform2f(this.uCacheSizePx, this.panCacheWidth, this.panCacheHeight);
     gl.uniform2f(this.uOffsetPx, offsetPxX, offsetPxY);
+    gl.uniform1f(this.uSampleScale, sampleScale);
 
     gl.disable(gl.BLEND);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

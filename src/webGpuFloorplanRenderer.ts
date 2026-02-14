@@ -17,6 +17,8 @@ const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
+const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
@@ -37,7 +39,7 @@ const CLEAR_COLOR = {
 const CAMERA_UNIFORM_FLOATS = 16;
 const CAMERA_UNIFORM_BUFFER_BYTES = 64;
 
-const BLIT_UNIFORM_FLOATS = 8;
+const BLIT_UNIFORM_FLOATS = 12;
 const BLIT_UNIFORM_BUFFER_BYTES = 48;
 
 const VECTOR_COMPOSITE_UNIFORM_FLOATS = 4;
@@ -913,7 +915,8 @@ struct BlitUniforms {
   viewportPx : vec2f,
   cacheSizePx : vec2f,
   offsetPx : vec2f,
-  pad : vec2f,
+  sampleScale : f32,
+  pad : vec3f,
 };
 
 @group(0) @binding(0) var uCacheSampler : sampler;
@@ -950,9 +953,10 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
 
 @fragment
 fn fsMain(@builtin(position) fragPos : vec4f) -> @location(0) vec4f {
-  let base = 0.5 * (uBlit.cacheSizePx - uBlit.viewportPx);
+  let scale = max(uBlit.sampleScale, 1e-6);
+  let centered = fragPos.xy - 0.5 * uBlit.viewportPx;
   let offsetPx = vec2f(uBlit.offsetPx.x, -uBlit.offsetPx.y);
-  let samplePx = fragPos.xy + base + offsetPx;
+  let samplePx = centered * scale + 0.5 * uBlit.cacheSizePx + offsetPx;
   let uv = samplePx / uBlit.cacheSizePx;
 
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
@@ -2263,11 +2267,7 @@ export class WebGpuFloorplanRenderer {
     if (this.isPanInteracting) {
       return true;
     }
-    if (!isCameraAnimating) {
-      return false;
-    }
-    // Keep cache active through pan damping tail; avoid zoom damping where cache refreshes each frame.
-    return Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON;
+    return isCameraAnimating;
   }
 
   private renderDirectToScreen(): void {
@@ -2418,15 +2418,27 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
-    let offsetPxX = (this.cameraCenterX - this.panCacheCenterX) * this.zoom;
-    let offsetPxY = (this.cameraCenterY - this.panCacheCenterY) * this.zoom;
+    let sampleScale = this.panCacheZoom / Math.max(this.zoom, 1e-6);
+    let offsetPxX = (this.cameraCenterX - this.panCacheCenterX) * this.panCacheZoom;
+    let offsetPxY = (this.cameraCenterY - this.panCacheCenterY) * this.panCacheZoom;
 
-    const maxOffsetX = Math.max(0, (this.panCacheWidth - this.canvas.width) * 0.5 - 2);
-    const maxOffsetY = Math.max(0, (this.panCacheHeight - this.canvas.height) * 0.5 - 2);
+    const halfCacheX = this.panCacheWidth * 0.5 - 2;
+    const halfCacheY = this.panCacheHeight * 0.5 - 2;
+    const halfScaledViewX = this.canvas.width * 0.5 * Math.abs(sampleScale);
+    const halfScaledViewY = this.canvas.height * 0.5 * Math.abs(sampleScale);
+    const coverageX = halfCacheX - halfScaledViewX;
+    const coverageY = halfCacheY - halfScaledViewY;
 
-    const zoomChanged = Math.abs(this.panCacheZoom - this.zoom) > PAN_CACHE_ZOOM_EPSILON;
-    const cacheOutOfCoverage = Math.abs(offsetPxX) > maxOffsetX || Math.abs(offsetPxY) > maxOffsetY;
-    const needsCacheRefresh = !this.panCacheValid || zoomChanged || cacheOutOfCoverage;
+    const zoomRatio = this.zoom / Math.max(this.panCacheZoom, 1e-6);
+    const zoomOutOfRange = zoomRatio < PAN_CACHE_ZOOM_RATIO_MIN || zoomRatio > PAN_CACHE_ZOOM_RATIO_MAX;
+    const zoomSettled = Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON;
+    const needsSharpRefresh = zoomSettled && Math.abs(this.panCacheZoom - this.zoom) > PAN_CACHE_ZOOM_EPSILON;
+    const cacheOutOfCoverage =
+      coverageX < 0 ||
+      coverageY < 0 ||
+      Math.abs(offsetPxX) > coverageX ||
+      Math.abs(offsetPxY) > coverageY;
+    const needsCacheRefresh = !this.panCacheValid || zoomOutOfRange || cacheOutOfCoverage || needsSharpRefresh;
 
     if (needsCacheRefresh) {
       this.panCacheCenterX = this.cameraCenterX;
@@ -2462,11 +2474,12 @@ export class WebGpuFloorplanRenderer {
       this.panCacheUsedCulling = !this.usingAllSegments;
       this.panCacheValid = true;
 
+      sampleScale = 1;
       offsetPxX = 0;
       offsetPxY = 0;
     }
 
-    this.blitPanCache(offsetPxX, offsetPxY);
+    this.blitPanCache(offsetPxX, offsetPxY, sampleScale);
 
     this.frameListener?.({
       renderedSegments: this.panCacheRenderedSegments,
@@ -2571,7 +2584,7 @@ export class WebGpuFloorplanRenderer {
     this.gpuDevice.queue.writeBuffer(this.vectorCompositeUniformBuffer, 0, data);
   }
 
-  private updateBlitUniforms(offsetPxX: number, offsetPxY: number): void {
+  private updateBlitUniforms(offsetPxX: number, offsetPxY: number, sampleScale: number): void {
     const data = new Float32Array(BLIT_UNIFORM_FLOATS);
     data[0] = this.canvas.width;
     data[1] = this.canvas.height;
@@ -2579,20 +2592,24 @@ export class WebGpuFloorplanRenderer {
     data[3] = this.panCacheHeight;
     data[4] = offsetPxX;
     data[5] = offsetPxY;
-    data[6] = 0;
+    data[6] = sampleScale;
     data[7] = 0;
+    data[8] = 0;
+    data[9] = 0;
+    data[10] = 0;
+    data[11] = 0;
 
     assertUniformBufferSizeMatches(data, BLIT_UNIFORM_BUFFER_BYTES, "blit");
     this.gpuDevice.queue.writeBuffer(this.blitUniformBuffer, 0, data);
   }
 
-  private blitPanCache(offsetPxX: number, offsetPxY: number): void {
+  private blitPanCache(offsetPxX: number, offsetPxY: number, sampleScale: number): void {
     if (!this.panCacheTexture || !this.blitBindGroup) {
       this.renderDirectToScreen();
       return;
     }
 
-    this.updateBlitUniforms(offsetPxX, offsetPxY);
+    this.updateBlitUniforms(offsetPxX, offsetPxY, sampleScale);
 
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
