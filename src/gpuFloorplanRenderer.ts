@@ -107,6 +107,7 @@ void main() {
 const FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 uniform float uStrokeCurveEnabled;
+uniform vec4 uVectorOverride;
 in vec2 vLocal;
 flat in vec2 vP0;
 flat in vec2 vP1;
@@ -194,7 +195,8 @@ void main() {
     discard;
   }
 
-  outColor = vec4(vColor, alpha);
+  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+  outColor = vec4(color, alpha);
 }
 `;
 
@@ -274,6 +276,7 @@ uniform sampler2D uFillSegmentTexA;
 uniform sampler2D uFillSegmentTexB;
 uniform ivec2 uFillSegmentTexSize;
 uniform float uFillAAScreenPx;
+uniform vec4 uVectorOverride;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
@@ -421,12 +424,13 @@ void main() {
   bool insideNonZero = winding != 0;
   bool insideEvenOdd = (crossings & 1) == 1;
   bool inside = vFillRule >= 0.5 ? insideEvenOdd : insideNonZero;
+  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
   if (vFillHasCompanionStroke >= 0.5) {
     float alpha = inside ? vAlpha : 0.0;
     if (alpha <= 0.001) {
       discard;
     }
-    outColor = vec4(vColor, alpha);
+    outColor = vec4(color, alpha);
     return;
   }
 
@@ -441,7 +445,7 @@ void main() {
     discard;
   }
 
-  outColor = vec4(vColor, alpha);
+  outColor = vec4(color, alpha);
 }
 `;
 
@@ -538,6 +542,7 @@ uniform vec2 uTextRasterAtlasSize;
 uniform float uTextAAScreenPx;
 uniform float uTextCurveEnabled;
 uniform float uTextVectorOnly;
+uniform vec4 uVectorOverride;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
@@ -682,7 +687,8 @@ void main() {
       if (alpha <= 0.001) {
         discard;
       }
-      outColor = vec4(vColor, alpha);
+      vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+      outColor = vec4(color, alpha);
       return;
     }
   }
@@ -726,7 +732,8 @@ void main() {
     discard;
   }
 
-  outColor = vec4(vColor, alpha);
+  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+  outColor = vec4(color, alpha);
 }
 `;
 
@@ -959,6 +966,8 @@ export class GpuFloorplanRenderer {
 
   private readonly uStrokeCurveEnabled: WebGLUniformLocation;
 
+  private readonly uStrokeVectorOverride: WebGLUniformLocation;
+
   private readonly uFillPathMetaTexA: WebGLUniformLocation;
 
   private readonly uFillPathMetaTexB: WebGLUniformLocation;
@@ -980,6 +989,8 @@ export class GpuFloorplanRenderer {
   private readonly uFillZoom: WebGLUniformLocation;
 
   private readonly uFillAAScreenPx: WebGLUniformLocation;
+
+  private readonly uFillVectorOverride: WebGLUniformLocation;
 
   private readonly uTextInstanceTexA: WebGLUniformLocation;
 
@@ -1018,6 +1029,8 @@ export class GpuFloorplanRenderer {
   private readonly uTextRasterAtlasSize: WebGLUniformLocation;
 
   private readonly uTextVectorOnly: WebGLUniformLocation;
+
+  private readonly uTextVectorOverride: WebGLUniformLocation;
 
   private readonly uCacheTex: WebGLUniformLocation;
 
@@ -1155,6 +1168,10 @@ export class GpuFloorplanRenderer {
 
   private pageBackgroundColor: [number, number, number, number] = [1, 1, 1, 1];
 
+  private vectorOverrideColor: [number, number, number] = [0, 0, 0];
+
+  private vectorOverrideOpacity = 0;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
 
@@ -1219,6 +1236,7 @@ export class GpuFloorplanRenderer {
     this.uZoom = this.mustGetUniformLocation(this.segmentProgram, "uZoom");
     this.uAAScreenPx = this.mustGetUniformLocation(this.segmentProgram, "uAAScreenPx");
     this.uStrokeCurveEnabled = this.mustGetUniformLocation(this.segmentProgram, "uStrokeCurveEnabled");
+    this.uStrokeVectorOverride = this.mustGetUniformLocation(this.segmentProgram, "uVectorOverride");
 
     this.uFillPathMetaTexA = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexA");
     this.uFillPathMetaTexB = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexB");
@@ -1231,6 +1249,7 @@ export class GpuFloorplanRenderer {
     this.uFillCameraCenter = this.mustGetUniformLocation(this.fillProgram, "uCameraCenter");
     this.uFillZoom = this.mustGetUniformLocation(this.fillProgram, "uZoom");
     this.uFillAAScreenPx = this.mustGetUniformLocation(this.fillProgram, "uFillAAScreenPx");
+    this.uFillVectorOverride = this.mustGetUniformLocation(this.fillProgram, "uVectorOverride");
 
     this.uTextInstanceTexA = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexA");
     this.uTextInstanceTexB = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexB");
@@ -1251,6 +1270,7 @@ export class GpuFloorplanRenderer {
     this.uTextRasterAtlasTex = this.mustGetUniformLocation(this.textProgram, "uTextRasterAtlasTex");
     this.uTextRasterAtlasSize = this.mustGetUniformLocation(this.textProgram, "uTextRasterAtlasSize");
     this.uTextVectorOnly = this.mustGetUniformLocation(this.textProgram, "uTextVectorOnly");
+    this.uTextVectorOverride = this.mustGetUniformLocation(this.textProgram, "uVectorOverride");
 
     this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
@@ -1328,6 +1348,28 @@ export class GpuFloorplanRenderer {
 
     this.pageBackgroundColor = [nextRed, nextGreen, nextBlue, nextAlpha];
     this.uploadPageBackgroundTexture();
+    this.panCacheValid = false;
+    this.requestFrame();
+  }
+
+  setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
+    const nextRed = clamp(red, 0, 1);
+    const nextGreen = clamp(green, 0, 1);
+    const nextBlue = clamp(blue, 0, 1);
+    const nextOpacity = clamp(opacity, 0, 1);
+
+    const prevColor = this.vectorOverrideColor;
+    if (
+      Math.abs(prevColor[0] - nextRed) <= 1e-6 &&
+      Math.abs(prevColor[1] - nextGreen) <= 1e-6 &&
+      Math.abs(prevColor[2] - nextBlue) <= 1e-6 &&
+      Math.abs(this.vectorOverrideOpacity - nextOpacity) <= 1e-6
+    ) {
+      return;
+    }
+
+    this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
+    this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
     this.requestFrame();
   }
@@ -1775,6 +1817,13 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uFillCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uFillZoom, this.zoom);
     gl.uniform1f(this.uFillAAScreenPx, 1);
+    gl.uniform4f(
+      this.uFillVectorOverride,
+      this.vectorOverrideColor[0],
+      this.vectorOverrideColor[1],
+      this.vectorOverrideColor[2],
+      this.vectorOverrideOpacity
+    );
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.fillPathCount);
     return this.fillPathCount;
@@ -1821,6 +1870,13 @@ export class GpuFloorplanRenderer {
     gl.uniform1f(this.uZoom, this.zoom);
     gl.uniform1f(this.uAAScreenPx, 1);
     gl.uniform1f(this.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
+    gl.uniform4f(
+      this.uStrokeVectorOverride,
+      this.vectorOverrideColor[0],
+      this.vectorOverrideColor[1],
+      this.vectorOverrideColor[2],
+      this.vectorOverrideOpacity
+    );
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
 
@@ -1880,6 +1936,13 @@ export class GpuFloorplanRenderer {
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
     gl.uniform1f(this.uTextCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
     gl.uniform1f(this.uTextVectorOnly, this.textVectorOnly ? 1 : 0);
+    gl.uniform4f(
+      this.uTextVectorOverride,
+      this.vectorOverrideColor[0],
+      this.vectorOverrideColor[1],
+      this.vectorOverrideColor[2],
+      this.vectorOverrideOpacity
+    );
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.textInstanceCount);
     return this.textInstanceCount;

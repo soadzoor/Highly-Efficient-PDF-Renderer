@@ -50,6 +50,9 @@ const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
 const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
+const vectorColorInput = document.querySelector<HTMLInputElement>("#vector-color");
+const vectorOpacitySlider = document.querySelector<HTMLInputElement>("#vector-opacity-slider");
+const vectorOpacityInput = document.querySelector<HTMLInputElement>("#vector-opacity");
 
 if (
   !canvas ||
@@ -84,7 +87,10 @@ if (
   !maxPagesPerRowInput ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
-  !pageBackgroundOpacityInput
+  !pageBackgroundOpacityInput ||
+  !vectorColorInput ||
+  !vectorOpacitySlider ||
+  !vectorOpacityInput
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -122,6 +128,9 @@ const maxPagesPerRowInputElement = maxPagesPerRowInput;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
 const pageBackgroundOpacityInputElement = pageBackgroundOpacityInput;
+const vectorColorInputElement = vectorColorInput;
+const vectorOpacitySliderElement = vectorOpacitySlider;
+const vectorOpacityInputElement = vectorOpacityInput;
 
 type RendererBackend = "webgl" | "webgpu";
 const webGpuSupported = isWebGpuSupported();
@@ -134,6 +143,7 @@ interface RendererApi {
   setStrokeCurveEnabled(enabled: boolean): void;
   setTextVectorOnly(enabled: boolean): void;
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void;
+  setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void;
   beginPanInteraction(): void;
   endPanInteraction(): void;
   resize(): void;
@@ -168,6 +178,13 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
     pageBackgroundColor[1],
     pageBackgroundColor[2],
     pageBackgroundColor[3]
+  );
+  const vectorColorOverride = readVectorColorOverrideInput();
+  rendererApi.setVectorColorOverride(
+    vectorColorOverride[0],
+    vectorColorOverride[1],
+    vectorColorOverride[2],
+    vectorColorOverride[3]
   );
   rendererApi.setFrameListener(onRendererFrame);
 }
@@ -347,6 +364,22 @@ pageBackgroundOpacityInputElement.addEventListener("input", () => {
   const opacityPercent = readPageBackgroundOpacityPercent(pageBackgroundOpacityInputElement.value);
   setPageBackgroundOpacityControls(opacityPercent);
   applyPageBackgroundColorFromControls();
+});
+
+vectorColorInputElement.addEventListener("input", () => {
+  applyVectorColorOverrideFromControls();
+});
+
+vectorOpacitySliderElement.addEventListener("input", () => {
+  const opacityPercent = readVectorOpacityPercent(vectorOpacitySliderElement.value);
+  setVectorOpacityControls(opacityPercent);
+  applyVectorColorOverrideFromControls();
+});
+
+vectorOpacityInputElement.addEventListener("input", () => {
+  const opacityPercent = readVectorOpacityPercent(vectorOpacityInputElement.value);
+  setVectorOpacityControls(opacityPercent);
+  applyVectorColorOverrideFromControls();
 });
 
 maxPagesPerRowInputElement.addEventListener("change", () => {
@@ -929,10 +962,43 @@ function readPageBackgroundOpacityPercent(value: string): number {
   return clamp(parsed, 0, 100);
 }
 
+function readVectorColorOverrideInput(): [number, number, number, number] {
+  const hex = vectorColorInputElement.value || "#000000";
+  const match = /^#([0-9a-fA-F]{6})$/.exec(hex);
+  const opacityPercent = readVectorOpacityPercent(vectorOpacityInputElement.value);
+  setVectorOpacityControls(opacityPercent);
+  const opacity = opacityPercent / 100;
+  if (!match) {
+    return [0, 0, 0, opacity];
+  }
+  const packed = Number.parseInt(match[1], 16);
+  if (!Number.isFinite(packed)) {
+    return [0, 0, 0, opacity];
+  }
+  const red = ((packed >> 16) & 0xff) / 255;
+  const green = ((packed >> 8) & 0xff) / 255;
+  const blue = (packed & 0xff) / 255;
+  return [red, green, blue, opacity];
+}
+
+function readVectorOpacityPercent(value: string): number {
+  const parsed = Math.trunc(Number(value));
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return clamp(parsed, 0, 100);
+}
+
 function setPageBackgroundOpacityControls(opacityPercent: number): void {
   const normalized = clamp(Math.trunc(opacityPercent), 0, 100);
   pageBackgroundOpacityInputElement.value = String(normalized);
   pageBackgroundOpacitySliderElement.value = String(normalized);
+}
+
+function setVectorOpacityControls(opacityPercent: number): void {
+  const normalized = clamp(Math.trunc(opacityPercent), 0, 100);
+  vectorOpacityInputElement.value = String(normalized);
+  vectorOpacitySliderElement.value = String(normalized);
 }
 
 function applyPageBackgroundColorFromControls(): void {
@@ -942,6 +1008,16 @@ function applyPageBackgroundColorFromControls(): void {
     pageBackgroundColor[1],
     pageBackgroundColor[2],
     pageBackgroundColor[3]
+  );
+}
+
+function applyVectorColorOverrideFromControls(): void {
+  const vectorColorOverride = readVectorColorOverrideInput();
+  renderer.setVectorColorOverride(
+    vectorColorOverride[0],
+    vectorColorOverride[1],
+    vectorColorOverride[2],
+    vectorColorOverride[3]
   );
 }
 

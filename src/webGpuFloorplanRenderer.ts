@@ -24,7 +24,7 @@ const CLEAR_COLOR = {
   a: 1
 };
 
-const CAMERA_UNIFORM_FLOATS = 12;
+const CAMERA_UNIFORM_FLOATS = 16;
 const CAMERA_UNIFORM_BUFFER_BYTES = 64;
 
 const BLIT_UNIFORM_FLOATS = 8;
@@ -45,6 +45,7 @@ struct CameraUniforms {
   fillAAScreenPx : f32,
   textVectorOnly : f32,
   pad0 : f32,
+  vectorOverride : vec4f,
 };
 
 struct SegmentIdBuffer {
@@ -243,7 +244,8 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  return vec4f(inData.color, alpha);
+  let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
+  return vec4f(color, alpha);
 }
 `;
 
@@ -259,6 +261,7 @@ struct CameraUniforms {
   fillAAScreenPx : f32,
   textVectorOnly : f32,
   pad0 : f32,
+  vectorOverride : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -485,13 +488,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let insideNonZero = winding != 0;
   let insideEvenOdd = (crossings & 1) == 1;
   let inside = select(insideNonZero, insideEvenOdd, inData.fillRule >= 0.5);
+  let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
 
   if (inData.fillHasCompanionStroke >= 0.5) {
     let alpha = select(0.0, inData.alpha, inside);
     if (alpha <= 0.001) {
       discard;
     }
-    return vec4f(inData.color, alpha);
+    return vec4f(color, alpha);
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
@@ -501,7 +505,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  return vec4f(inData.color, alpha);
+  return vec4f(color, alpha);
 }
 `;
 
@@ -517,6 +521,7 @@ struct CameraUniforms {
   fillAAScreenPx : f32,
   textVectorOnly : f32,
   pad0 : f32,
+  vectorOverride : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -761,7 +766,8 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     if (alpha <= 0.001) {
       discard;
     }
-    return vec4f(inData.color, alpha);
+    let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
+    return vec4f(color, alpha);
   }
 
   let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
@@ -801,7 +807,8 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  return vec4f(inData.color, alpha);
+  let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
+  return vec4f(color, alpha);
 }
 `;
 
@@ -817,6 +824,7 @@ struct CameraUniforms {
   fillAAScreenPx : f32,
   textVectorOnly : f32,
   pad0 : f32,
+  vectorOverride : vec4f,
 };
 
 struct RasterUniforms {
@@ -1075,6 +1083,10 @@ export class WebGpuFloorplanRenderer {
   private textVectorOnly = false;
 
   private pageBackgroundColor: [number, number, number, number] = [1, 1, 1, 1];
+
+  private vectorOverrideColor: [number, number, number] = [0, 0, 0];
+
+  private vectorOverrideOpacity = 0;
 
   private panOptimizationEnabled = true;
 
@@ -1466,6 +1478,28 @@ export class WebGpuFloorplanRenderer {
 
     this.pageBackgroundColor = [nextRed, nextGreen, nextBlue, nextAlpha];
     this.uploadPageBackgroundTexture();
+    this.panCacheValid = false;
+    this.requestFrame();
+  }
+
+  setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
+    const nextRed = clamp(red, 0, 1);
+    const nextGreen = clamp(green, 0, 1);
+    const nextBlue = clamp(blue, 0, 1);
+    const nextOpacity = clamp(opacity, 0, 1);
+
+    const prevColor = this.vectorOverrideColor;
+    if (
+      Math.abs(prevColor[0] - nextRed) <= 1e-6 &&
+      Math.abs(prevColor[1] - nextGreen) <= 1e-6 &&
+      Math.abs(prevColor[2] - nextBlue) <= 1e-6 &&
+      Math.abs(this.vectorOverrideOpacity - nextOpacity) <= 1e-6
+    ) {
+      return;
+    }
+
+    this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
+    this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
     this.requestFrame();
   }
@@ -2163,6 +2197,10 @@ export class WebGpuFloorplanRenderer {
     data[9] = 1.0;
     data[10] = this.textVectorOnly ? 1 : 0;
     data[11] = 0;
+    data[12] = this.vectorOverrideColor[0];
+    data[13] = this.vectorOverrideColor[1];
+    data[14] = this.vectorOverrideColor[2];
+    data[15] = this.vectorOverrideOpacity;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);

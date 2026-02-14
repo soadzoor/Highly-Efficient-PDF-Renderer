@@ -60,6 +60,17 @@
             <span class="color-suffix">%</span>
           </div>
         </div>
+        <div class="number-row number-row-color">
+          <label for="vector-color">Vector Override</label>
+          <div class="color-controls">
+            <input id="vector-color" type="color" value="#000000" />
+            <label for="vector-opacity-slider" class="sr-only">Vector Override Opacity Slider</label>
+            <input id="vector-opacity-slider" type="range" min="0" max="100" step="1" value="0" />
+            <label for="vector-opacity" class="sr-only">Vector Override Opacity</label>
+            <input id="vector-opacity" type="number" min="0" max="100" step="1" value="0" />
+            <span class="color-suffix">%</span>
+          </div>
+        </div>
         <div id="status" class="status">Loading sample floorplan...</div>
         <div id="parse-loader" class="parse-loader" hidden>
           <span class="loader-spinner" aria-hidden="true"></span>
