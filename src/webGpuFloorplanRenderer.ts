@@ -1276,7 +1276,7 @@ export class WebGpuFloorplanRenderer {
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
     this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
-    this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout);
+    this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout, true);
     this.blitPipeline = this.createPipeline(BLIT_SHADER_SOURCE, "vsMain", "fsMain", blitPipelineLayout);
 
     this.panCacheSampler = this.gpuDevice.createSampler({
@@ -1747,8 +1747,15 @@ export class WebGpuFloorplanRenderer {
     });
   }
 
-  private createPipeline(shaderSource: string, vertexEntry: string, fragmentEntry: string, layout: any): any {
+  private createPipeline(
+    shaderSource: string,
+    vertexEntry: string,
+    fragmentEntry: string,
+    layout: any,
+    premultipliedColor = false
+  ): any {
     const shaderModule = this.gpuDevice.createShaderModule({ code: shaderSource });
+    const colorSrcFactor = premultipliedColor ? "one" : "src-alpha";
     return this.gpuDevice.createRenderPipeline({
       layout,
       vertex: {
@@ -1763,7 +1770,7 @@ export class WebGpuFloorplanRenderer {
             format: this.presentationFormat,
             blend: {
               color: {
-                srcFactor: "src-alpha",
+                srcFactor: colorSrcFactor,
                 dstFactor: "one-minus-src-alpha",
                 operation: "add"
               },
@@ -2286,7 +2293,8 @@ export class WebGpuFloorplanRenderer {
     this.gpuDevice.queue.writeBuffer(this.rasterUniformBuffer, 0, rasterUniforms);
 
     const rgba = scene.rasterLayerData.subarray(0, width * height * 4);
-    this.rasterLayerTexture = this.createRgba8Texture(width, height, rgba);
+    const premultiplied = premultiplyRgba(rgba);
+    this.rasterLayerTexture = this.createRgba8Texture(width, height, premultiplied);
     this.rasterBindGroup = this.gpuDevice.createBindGroup({
       layout: this.rasterPipeline.getBindGroupLayout(0),
       entries: [
@@ -2533,6 +2541,35 @@ function createPaddedByteTextureData(source: Uint8Array, width: number, height: 
   const padded = new Uint8Array(expectedLength);
   padded.set(source);
   return padded;
+}
+
+function premultiplyRgba(source: Uint8Array): Uint8Array {
+  const out = new Uint8Array(source.length);
+  for (let i = 0; i + 3 < source.length; i += 4) {
+    const alpha = source[i + 3];
+    if (alpha <= 0) {
+      out[i] = 0;
+      out[i + 1] = 0;
+      out[i + 2] = 0;
+      out[i + 3] = 0;
+      continue;
+    }
+
+    if (alpha >= 255) {
+      out[i] = source[i];
+      out[i + 1] = source[i + 1];
+      out[i + 2] = source[i + 2];
+      out[i + 3] = 255;
+      continue;
+    }
+
+    const scale = alpha / 255;
+    out[i] = Math.round(source[i] * scale);
+    out[i + 1] = Math.round(source[i + 1] * scale);
+    out[i + 2] = Math.round(source[i + 2] * scale);
+    out[i + 3] = alpha;
+  }
+  return out;
 }
 
 function assertUniformBufferSizeMatches(data: Float32Array, requiredBytes: number, label: string): void {

@@ -1584,7 +1584,10 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uRasterZoom, this.zoom);
 
+    // Raster textures are premultiplied on upload to avoid dark/gray filtering fringes.
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   private drawFilledPaths(
@@ -1945,7 +1948,8 @@ export class GpuFloorplanRenderer {
     configureRasterTexture(gl);
     if (hasData) {
       const pixels = scene.rasterLayerData.subarray(0, width * height * 4);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      const premultiplied = premultiplyRgba(pixels);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultiplied);
     } else {
       const transparent = new Uint8Array([0, 0, 0, 0]);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, transparent);
@@ -2516,6 +2520,35 @@ function configureRasterTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function premultiplyRgba(source: Uint8Array): Uint8Array {
+  const out = new Uint8Array(source.length);
+  for (let i = 0; i + 3 < source.length; i += 4) {
+    const alpha = source[i + 3];
+    if (alpha <= 0) {
+      out[i] = 0;
+      out[i + 1] = 0;
+      out[i + 2] = 0;
+      out[i + 3] = 0;
+      continue;
+    }
+
+    if (alpha >= 255) {
+      out[i] = source[i];
+      out[i + 1] = source[i + 1];
+      out[i + 2] = source[i + 2];
+      out[i + 3] = 255;
+      continue;
+    }
+
+    const scale = alpha / 255;
+    out[i] = Math.round(source[i] * scale);
+    out[i + 1] = Math.round(source[i + 1] * scale);
+    out[i + 2] = Math.round(source[i + 2] * scale);
+    out[i + 3] = alpha;
+  }
+  return out;
 }
 
 function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { width: number; height: number } {
