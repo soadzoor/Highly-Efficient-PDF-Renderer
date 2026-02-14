@@ -6,7 +6,14 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import { GpuFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./gpuFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
-import { extractPdfVectors, type Bounds, type RasterLayer, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import {
+  composeVectorScenesInGrid,
+  extractPdfPageScenes,
+  type Bounds,
+  type RasterLayer,
+  type VectorExtractOptions,
+  type VectorScene
+} from "./pdfVectorExtractor";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -176,6 +183,15 @@ let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
 let loadToken = 0;
+
+interface ParsedPdfPageCache {
+  sourceBytes: Uint8Array;
+  sourceLabel: string;
+  optionsKey: string;
+  pageScenes: VectorScene[];
+}
+
+let parsedPdfPageCache: ParsedPdfPageCache | null = null;
 
 interface LoadPdfOptions {
   preserveView?: boolean;
@@ -517,6 +533,7 @@ async function loadPdfFile(file: File): Promise<void> {
   const buffer = await file.arrayBuffer();
   const bytes = cloneSourceBytes(buffer);
   lastLoadedSource = { kind: "pdf", bytes, label: file.name };
+  parsedPdfPageCache = null;
   await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
 }
 
@@ -525,24 +542,54 @@ async function loadParsedDataZipFile(file: File): Promise<void> {
   const buffer = await file.arrayBuffer();
   const bytes = cloneSourceBytes(buffer);
   lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
+  parsedPdfPageCache = null;
   await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
 }
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
   const extractionOptions = getExtractionOptions();
+  const pageSceneOptionsKey = buildPdfPageCacheKey(extractionOptions);
+  const cachedPageScenes = getCachedPdfPageScenes(label, pageSceneOptionsKey);
 
   try {
-    const parseStart = performance.now();
-    setParsingLoader(true);
-    setStatus(
-      `Parsing ${label} with PDF.js... (pages/row ${extractionOptions.maxPagesPerRow}, merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
-    );
-    const scene = await extractPdfVectors(buffer, extractionOptions);
-    const parseEnd = performance.now();
+    let scene: VectorScene;
+    let parseMs = 0;
+    const requestedPagesPerRow = readMaxPagesPerRowInput();
 
-    if (activeLoadToken === loadToken) {
+    if (cachedPageScenes) {
+      const composeStart = performance.now();
       setParsingLoader(false);
+      setStatus(
+        `Rearranging ${label}... (pages/row ${requestedPagesPerRow}, using cached parsed pages)`
+      );
+      scene = composeVectorScenesInGrid(cachedPageScenes, requestedPagesPerRow);
+      parseMs = performance.now() - composeStart;
+      console.log(
+        `[Page grid] ${label}: recomposed ${cachedPageScenes.length.toLocaleString()} cached page scenes at ${requestedPagesPerRow.toLocaleString()} pages/row in ${parseMs.toFixed(1)} ms`
+      );
+    } else {
+      const parseStart = performance.now();
+      setParsingLoader(true);
+      setStatus(
+        `Parsing ${label} with PDF.js... (pages/row ${requestedPagesPerRow}, merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
+      );
+      const pageScenes = await extractPdfPageScenes(buffer, extractionOptions);
+      parseMs = performance.now() - parseStart;
+
+      if (activeLoadToken === loadToken) {
+        setParsingLoader(false);
+      }
+
+      if (activeLoadToken !== loadToken) {
+        return;
+      }
+
+      scene = composeVectorScenesInGrid(pageScenes, requestedPagesPerRow);
+      storeCachedPdfPageScenes(label, pageSceneOptionsKey, pageScenes);
+      console.log(
+        `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${requestedPagesPerRow.toLocaleString()}/row`
+      );
     }
 
     if (activeLoadToken !== loadToken) {
@@ -583,7 +630,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedSceneLabel = label;
     setDownloadDataButtonState(true);
 
-    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
+    updateMetricsPanel(label, scene, sceneStats, parseMs, uploadEnd - uploadStart);
     baseStatus = formatSceneStatus(label, scene);
     statusTextElement.textContent = baseStatus;
   } catch (error) {
@@ -679,6 +726,45 @@ function getExtractionOptions(): VectorExtractOptions {
     enableSegmentMerge: segmentMergeToggleElement.checked,
     enableInvisibleCull: invisibleCullToggleElement.checked,
     maxPagesPerRow: readMaxPagesPerRowInput()
+  };
+}
+
+function buildPdfPageCacheKey(options: VectorExtractOptions): string {
+  const mergeEnabled = options.enableSegmentMerge !== false;
+  const invisibleCullEnabled = options.enableInvisibleCull !== false;
+  const rawMaxPages = Math.trunc(Number(options.maxPages));
+  const maxPages =
+    Number.isFinite(rawMaxPages) && rawMaxPages >= 1
+      ? rawMaxPages
+      : Number.MAX_SAFE_INTEGER;
+  return `merge:${mergeEnabled ? 1 : 0}|cull:${invisibleCullEnabled ? 1 : 0}|maxPages:${maxPages}`;
+}
+
+function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[] | null {
+  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf" || !parsedPdfPageCache) {
+    return null;
+  }
+  if (parsedPdfPageCache.sourceBytes !== lastLoadedSource.bytes) {
+    return null;
+  }
+  if (parsedPdfPageCache.sourceLabel !== label) {
+    return null;
+  }
+  if (parsedPdfPageCache.optionsKey !== optionsKey) {
+    return null;
+  }
+  return parsedPdfPageCache.pageScenes;
+}
+
+function storeCachedPdfPageScenes(label: string, optionsKey: string, pageScenes: VectorScene[]): void {
+  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
+    return;
+  }
+  parsedPdfPageCache = {
+    sourceBytes: lastLoadedSource.bytes,
+    sourceLabel: label,
+    optionsKey,
+    pageScenes
   };
 }
 

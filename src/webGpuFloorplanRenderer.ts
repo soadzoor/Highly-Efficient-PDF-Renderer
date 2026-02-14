@@ -743,12 +743,13 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     let dx = dncDx * 0.33 * texel;
     let dy = dncDy * 0.33 * texel;
     let mipBias = -1.25;
-    let alphaRaster = (1.0 / 3.0) * textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter, uvMin, uvMax), mipBias).r +
+    let lod = max(log2(max(max(ncFwidthX, ncFwidthY), 1e-6)) + mipBias, 0.0);
+    let alphaRaster = (1.0 / 3.0) * textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter, uvMin, uvMax), lod).r +
       (1.0 / 6.0) * (
-        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx - dy, uvMin, uvMax), mipBias).r +
-        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx + dy, uvMin, uvMax), mipBias).r +
-        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias).r +
-        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias).r
+        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx - dy, uvMin, uvMax), lod).r +
+        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx + dy, uvMin, uvMax), lod).r +
+        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx - dy, uvMin, uvMax), lod).r +
+        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx + dy, uvMin, uvMax), lod).r
       );
     let alpha = alphaRaster * inData.colorAlpha;
     if (alpha <= 0.001) {

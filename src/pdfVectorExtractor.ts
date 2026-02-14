@@ -194,11 +194,10 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
   });
 }
 
-export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
+export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene[]> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
   const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
-  const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
   const standardFontDataUrl = resolveStandardFontDataUrl();
 
   const loadingTask = getDocument({
@@ -224,10 +223,20 @@ export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExt
       pageScenes.push(pageScene);
     }
 
-    return composeScenesInGrid(pageScenes, maxPagesPerRow);
+    return pageScenes;
   } finally {
     await pdf.destroy();
   }
+}
+
+export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number): VectorScene {
+  return composeScenesInGrid(pageScenes, requestedPagesPerRow);
+}
+
+export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
+  const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
+  const pageScenes = await extractPdfPageScenes(pdfData, options);
+  return composeScenesInGrid(pageScenes, maxPagesPerRow);
 }
 
 interface SinglePageExtractOptions {
