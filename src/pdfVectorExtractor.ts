@@ -86,6 +86,7 @@ export interface VectorScene {
   pageBounds: Bounds;
   maxHalfWidth: number;
   operatorCount: number;
+  imagePaintOpCount: number;
   pathCount: number;
   discardedTransparentCount: number;
   discardedDegenerateCount: number;
@@ -251,6 +252,43 @@ export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExt
   return composeScenesInGrid(pageScenes, maxPagesPerRow);
 }
 
+export async function extractPdfRasterPageScenes(
+  pdfData: ArrayBuffer,
+  options: VectorExtractOptions = {}
+): Promise<VectorScene[]> {
+  const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
+  const standardFontDataUrl = resolveStandardFontDataUrl();
+  const loadingTask = getDocument({
+    data: new Uint8Array(pdfData),
+    disableFontFace: true,
+    fontExtraProperties: true,
+    ...(standardFontDataUrl ? { standardFontDataUrl } : {})
+  });
+  const pdf = await loadingTask.promise;
+
+  try {
+    const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
+    const extractedPageCount = Math.max(1, Math.min(pdfPageCount, maxPages));
+    const pageScenes: VectorScene[] = [];
+
+    for (let pageNumber = 1; pageNumber <= extractedPageCount; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const operatorList = await page.getOperatorList();
+      pageScenes.push(await extractSinglePageRasterOnly(page, operatorList));
+    }
+
+    return pageScenes;
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
+  const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
+  const pageScenes = await extractPdfRasterPageScenes(pdfData, options);
+  return composeScenesInGrid(pageScenes, maxPagesPerRow);
+}
+
 interface SinglePageExtractOptions {
   enableSegmentMerge: boolean;
   enableInvisibleCull: boolean;
@@ -259,6 +297,60 @@ interface SinglePageExtractOptions {
 interface PagePlacement {
   translateX: number;
   translateY: number;
+}
+
+async function extractSinglePageRasterOnly(
+  page: unknown,
+  operatorList: { fnArray: number[]; argsArray: unknown[] }
+): Promise<VectorScene> {
+  const pageView = (page as { view?: unknown }).view;
+  const pageBoundsInput = Array.isArray(pageView) ? pageView : [0, 0, 1, 1];
+  const rawPageBounds: Bounds = {
+    minX: Math.min(Number(pageBoundsInput[0]) || 0, Number(pageBoundsInput[2]) || 1),
+    minY: Math.min(Number(pageBoundsInput[1]) || 0, Number(pageBoundsInput[3]) || 1),
+    maxX: Math.max(Number(pageBoundsInput[0]) || 0, Number(pageBoundsInput[2]) || 1),
+    maxY: Math.max(Number(pageBoundsInput[1]) || 0, Number(pageBoundsInput[3]) || 1)
+  };
+  const pageMatrix = buildPageMatrix(page as {
+    rotate: number;
+    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; height: number };
+  });
+  const pageBounds = transformBounds(rawPageBounds, pageMatrix);
+  const imagePaintOpCount = countImagePaintOps(operatorList);
+  const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
+    allowFullPageFallback: true
+  });
+  const rasterLayers: RasterLayer[] =
+    rasterLayer.width > 0 && rasterLayer.height > 0 && rasterLayer.data.length >= rasterLayer.width * rasterLayer.height * 4
+      ? [
+        {
+          width: rasterLayer.width,
+          height: rasterLayer.height,
+          data: rasterLayer.data,
+          matrix: new Float32Array(rasterLayer.matrix)
+        }
+      ]
+      : [];
+
+  const base = createEmptyVectorScene();
+  const primaryRasterLayer = rasterLayers[0] ?? null;
+  const combinedBounds = combineBounds(pageBounds, rasterLayer.bounds) ?? pageBounds;
+
+  return {
+    ...base,
+    pageCount: 1,
+    pagesPerRow: 1,
+    pageRects: new Float32Array([pageBounds.minX, pageBounds.minY, pageBounds.maxX, pageBounds.maxY]),
+    rasterLayers,
+    rasterLayerWidth: primaryRasterLayer?.width ?? 0,
+    rasterLayerHeight: primaryRasterLayer?.height ?? 0,
+    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    rasterLayerMatrix: primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
+    bounds: combinedBounds,
+    pageBounds,
+    imagePaintOpCount,
+    operatorCount: operatorList.fnArray.length
+  };
 }
 
 async function extractSinglePageVectors(
@@ -279,6 +371,7 @@ async function extractSinglePageVectors(
     getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; height: number };
   });
   const pageBounds = transformBounds(rawPageBounds, pageMatrix);
+  const imagePaintOpCount = countImagePaintOps(operatorList);
 
   const endpointBuilder = new Float4Builder();
   const primitiveMetaBuilder = new Float4Builder();
@@ -608,6 +701,7 @@ async function extractSinglePageVectors(
     bounds: combinedBounds,
     pageBounds,
     maxHalfWidth: resolvedMaxHalfWidth,
+    imagePaintOpCount,
     operatorCount: operatorList.fnArray.length,
     pathCount,
     discardedTransparentCount,
@@ -645,6 +739,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let totalTextInPageCount = 0;
   let totalTextOutOfPageCount = 0;
   let totalOperatorCount = 0;
+  let totalImagePaintOpCount = 0;
   let totalPathCount = 0;
   let totalDiscardedTransparentCount = 0;
   let totalDiscardedDegenerateCount = 0;
@@ -666,6 +761,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     totalTextInPageCount += scene.textInPageCount;
     totalTextOutOfPageCount += scene.textOutOfPageCount;
     totalOperatorCount += scene.operatorCount;
+    totalImagePaintOpCount += scene.imagePaintOpCount;
     totalPathCount += scene.pathCount;
     totalDiscardedTransparentCount += scene.discardedTransparentCount;
     totalDiscardedDegenerateCount += scene.discardedDegenerateCount;
@@ -891,6 +987,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     bounds: combinedBounds ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 },
     pageBounds: combinedPageBounds ?? combinedBounds ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 },
     maxHalfWidth,
+    imagePaintOpCount: totalImagePaintOpCount,
     operatorCount: totalOperatorCount,
     pathCount: totalPathCount,
     discardedTransparentCount: totalDiscardedTransparentCount,
@@ -1063,6 +1160,7 @@ function createEmptyVectorScene(): VectorScene {
     bounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 },
     pageBounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 },
     maxHalfWidth: 0,
+    imagePaintOpCount: 0,
     operatorCount: 0,
     pathCount: 0,
     discardedTransparentCount: 0,
@@ -1157,10 +1255,25 @@ function normalizeRotationDegrees(value: number): number {
 }
 
 function resolveStandardFontDataUrl(): string | undefined {
-  if (typeof window === "undefined" || !window.location) {
-    return undefined;
+  if (typeof window !== "undefined" && window.location) {
+    return new URL("pdfjs-standard-fonts/", window.location.href).toString();
   }
-  return new URL("pdfjs-standard-fonts/", window.location.href).toString();
+
+  if (typeof window === "undefined") {
+    // Node-side extraction (example ZIP generation) needs an explicit local font directory.
+    const nodeFontUrl = new URL(
+      /* @vite-ignore */
+      "../node_modules/pdfjs-dist/standard_fonts/",
+      import.meta.url
+    );
+    if (nodeFontUrl.protocol === "file:") {
+      const directoryPath = decodeURIComponent(nodeFontUrl.pathname);
+      return directoryPath.endsWith("/") ? directoryPath : `${directoryPath}/`;
+    }
+    return nodeFontUrl.toString();
+  }
+
+  return undefined;
 }
 
 function chooseRasterExtractionScale(baseWidth: number, baseHeight: number, nativeScaleHint = 1): number {
@@ -1248,6 +1361,22 @@ interface RasterLayerExtractResult {
 interface RasterLayerExtractOptions {
   allowFullPageFallback: boolean;
 }
+
+interface RasterRenderSurface {
+  context: CanvasRenderingContext2D | { getImageData: (x: number, y: number, width: number, height: number) => { data: Uint8Array | Uint8ClampedArray } };
+  dispose: () => void;
+}
+
+let cachedNodeCanvasModule:
+  | {
+    createCanvas: (width: number, height: number) => {
+      width: number;
+      height: number;
+      getContext: (kind: "2d") => unknown;
+    };
+  }
+  | null
+  | undefined;
 
 interface TextGlyphBuildResult {
   segmentCount: number;
@@ -2845,6 +2974,16 @@ function hasTextShowOperators(operatorList: { fnArray: number[] }): boolean {
   return false;
 }
 
+function countImagePaintOps(operatorList: { fnArray: number[] }): number {
+  let count = 0;
+  for (const fn of operatorList.fnArray) {
+    if (isImagePaintOperator(fn)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 async function warmUpTextPathCache(page: unknown): Promise<void> {
   if (typeof document === "undefined") {
     return;
@@ -3116,10 +3255,6 @@ async function extractRasterLayerData(
   pageMatrix: Mat2D,
   options: RasterLayerExtractOptions
 ): Promise<RasterLayerExtractResult> {
-  if (typeof document === "undefined") {
-    return createEmptyRasterLayerResult();
-  }
-
   const rasterPlan = buildRasterOperatorPlan(operatorList);
   if (!rasterPlan.hasImagePaintOps && !(options.allowFullPageFallback && rasterPlan.hasFormXObjectOps)) {
     return createEmptyRasterLayerResult();
@@ -3191,6 +3326,89 @@ async function extractRasterLayerData(
   return finalizeRasterLayerResult(width, height, rgba, viewport, pageMatrix);
 }
 
+async function getNodeCanvasModule():
+  Promise<{
+    createCanvas: (width: number, height: number) => {
+      width: number;
+      height: number;
+      getContext: (kind: "2d") => unknown;
+    };
+  } | null> {
+  if (cachedNodeCanvasModule !== undefined) {
+    return cachedNodeCanvasModule;
+  }
+
+  if (typeof window !== "undefined") {
+    cachedNodeCanvasModule = null;
+    return null;
+  }
+
+  try {
+    const moduleName = "@napi-rs/canvas";
+    const mod = await import(
+      /* @vite-ignore */
+      moduleName
+    ) as { createCanvas?: unknown };
+    if (typeof mod.createCanvas !== "function") {
+      cachedNodeCanvasModule = null;
+      return null;
+    }
+    cachedNodeCanvasModule = {
+      createCanvas: mod.createCanvas as (width: number, height: number) => {
+        width: number;
+        height: number;
+        getContext: (kind: "2d") => unknown;
+      }
+    };
+    return cachedNodeCanvasModule;
+  } catch {
+    cachedNodeCanvasModule = null;
+    return null;
+  }
+}
+
+async function createRasterRenderSurface(width: number, height: number): Promise<RasterRenderSurface | null> {
+  if (typeof document !== "undefined") {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", {
+      alpha: true,
+      willReadFrequently: true
+    });
+    if (!context) {
+      return null;
+    }
+
+    return {
+      context,
+      dispose: () => {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    };
+  }
+
+  const nodeCanvas = await getNodeCanvasModule();
+  if (!nodeCanvas) {
+    return null;
+  }
+
+  const canvas = nodeCanvas.createCanvas(width, height);
+  const context = canvas.getContext("2d");
+  if (!context || typeof (context as { getImageData?: unknown }).getImageData !== "function") {
+    return null;
+  }
+
+  return {
+    context: context as { getImageData: (x: number, y: number, renderWidth: number, renderHeight: number) => { data: Uint8Array | Uint8ClampedArray } },
+    dispose: () => {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  };
+}
+
 async function renderRasterLayerRgba(
   pageLike: {
     render: (params: {
@@ -3207,18 +3425,11 @@ async function renderRasterLayerRgba(
   const viewportLike = viewport as { width?: unknown; height?: unknown };
   const width = Math.max(1, Math.ceil(Number(viewportLike.width) || 1));
   const height = Math.max(1, Math.ceil(Number(viewportLike.height) || 1));
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-
-  const context = canvas.getContext("2d", {
-    alpha: true,
-    willReadFrequently: true
-  });
-
-  if (!context) {
+  const surface = await createRasterRenderSurface(width, height);
+  if (!surface) {
     return null;
   }
+  const context = surface.context;
 
   try {
     const params: {
@@ -3228,7 +3439,7 @@ async function renderRasterLayerRgba(
       background?: string;
       operationsFilter?: (index: number) => boolean;
     } = {
-      canvasContext: context,
+      canvasContext: context as unknown as CanvasRenderingContext2D,
       viewport,
       intent: "display",
       // Keep a transparent background so we only capture rasterized PDF content.
@@ -3239,15 +3450,13 @@ async function renderRasterLayerRgba(
     }
     await pageLike.render(params).promise;
   } catch {
-    canvas.width = 0;
-    canvas.height = 0;
+    surface.dispose();
     return null;
   }
 
   const imageData = context.getImageData(0, 0, width, height);
-  const rgba = new Uint8Array(imageData.data);
-  canvas.width = 0;
-  canvas.height = 0;
+  const rgba = new Uint8Array(imageData.data instanceof Uint8ClampedArray ? imageData.data : new Uint8Array(imageData.data));
+  surface.dispose();
   return rgba;
 }
 

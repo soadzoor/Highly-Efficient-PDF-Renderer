@@ -2,20 +2,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 
-import JSZip from "jszip";
-
-import { extractPdfVectors, type RasterLayer, type VectorScene } from "../src/pdfVectorExtractor.ts";
-
-interface ExportTextureEntry {
-  name: string;
-  filePath: string;
-  width: number;
-  height: number;
-  logicalItemCount: number;
-  logicalFloatCount: number;
-  data: Float32Array;
-}
-
 interface ExampleOptionManifestEntry {
   id: string;
   name: string;
@@ -34,100 +20,157 @@ interface ExampleManifest {
   examples: ExampleOptionManifestEntry[];
 }
 
+interface NamedFile {
+  name: string;
+  sizeBytes: number;
+}
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRootDir = path.resolve(scriptDir, "..");
-const sourcePdfDir = path.resolve(repoRootDir, "pdfs");
 const outputRootDir = path.resolve(repoRootDir, "public", "examples");
 const outputPdfDir = path.resolve(outputRootDir, "pdfs");
 const outputZipDir = path.resolve(outputRootDir, "zips");
 const outputManifestPath = path.resolve(outputRootDir, "manifest.json");
 
 async function main(): Promise<void> {
-  await fs.rm(outputPdfDir, { recursive: true, force: true });
-  await fs.rm(outputZipDir, { recursive: true, force: true });
-  await fs.rm(outputManifestPath, { force: true });
-  await fs.mkdir(outputPdfDir, { recursive: true });
-  await fs.mkdir(outputZipDir, { recursive: true });
-
-  const files = await fs.readdir(sourcePdfDir, { withFileTypes: true });
-  const pdfFiles = files
-    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".pdf"))
-    .map((entry) => entry.name)
-    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  const pdfFiles = await readFilesWithExtension(outputPdfDir, ".pdf");
+  const zipFiles = await readFilesWithExtension(outputZipDir, ".zip");
 
   if (pdfFiles.length === 0) {
-    throw new Error(`No PDF files found in ${sourcePdfDir}`);
+    throw new Error(`No PDFs found in ${outputPdfDir}`);
+  }
+  if (zipFiles.length === 0) {
+    throw new Error(`No ZIPs found in ${outputZipDir}`);
   }
 
+  const zipBuckets = buildZipBuckets(zipFiles);
   const usedIds = new Set<string>();
   const manifestEntries: ExampleOptionManifestEntry[] = [];
+  const missingZipPdfs: string[] = [];
 
-  for (let i = 0; i < pdfFiles.length; i += 1) {
-    const pdfFileName = pdfFiles[i];
-    const sourcePdfPath = path.resolve(sourcePdfDir, pdfFileName);
-    const targetPdfPath = path.resolve(outputPdfDir, pdfFileName);
-    await fs.copyFile(sourcePdfPath, targetPdfPath);
+  for (const pdf of pdfFiles) {
+    const pdfStem = path.parse(pdf.name).name;
+    const comparableKey = normalizeComparableStem(pdfStem);
+    const zipList = zipBuckets.get(comparableKey);
+    const matchedZip = zipList && zipList.length > 0 ? zipList.shift() : undefined;
 
-    const pdfBytes = await fs.readFile(sourcePdfPath);
-    const pdfArrayBuffer = pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength);
+    if (!matchedZip) {
+      missingZipPdfs.push(pdf.name);
+      continue;
+    }
 
-    console.log(`[examples] parsing ${pdfFileName} (${formatKilobytes(pdfBytes.byteLength)} kB)`);
-    const scene = await extractPdfVectors(pdfArrayBuffer, {
-      enableSegmentMerge: true,
-      enableInvisibleCull: true,
-      maxPagesPerRow: 10
-    });
-
-    const parsedZipBytes = await buildParsedDataZip(scene, pdfFileName);
-    const zipFileName = makeUniqueZipFileName(path.parse(pdfFileName).name, i);
-    const targetZipPath = path.resolve(outputZipDir, zipFileName);
-    await fs.writeFile(targetZipPath, parsedZipBytes);
-
-    const exampleId = makeUniqueId(path.parse(pdfFileName).name, usedIds, i + 1);
-    const pdfRelativePath = `/examples/pdfs/${encodeURIComponent(pdfFileName)}`;
-    const zipRelativePath = `/examples/zips/${encodeURIComponent(zipFileName)}`;
+    const id = makeUniqueId(pdfStem, usedIds, manifestEntries.length + 1);
     manifestEntries.push({
-      id: exampleId,
-      name: pdfFileName,
+      id,
+      name: pdf.name,
       pdf: {
-        path: pdfRelativePath,
-        sizeBytes: pdfBytes.byteLength
+        path: `/examples/pdfs/${encodeURIComponent(pdf.name)}`,
+        sizeBytes: pdf.sizeBytes
       },
       parsedZip: {
-        path: zipRelativePath,
-        sizeBytes: parsedZipBytes.byteLength
+        path: `/examples/zips/${encodeURIComponent(matchedZip.name)}`,
+        sizeBytes: matchedZip.sizeBytes
       }
     });
-
-    console.log(
-      `[examples] wrote ${pdfFileName}: PDF ${formatKilobytes(pdfBytes.byteLength)} kB, ZIP ${formatKilobytes(parsedZipBytes.byteLength)} kB`
-    );
   }
 
+  manifestEntries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+
+  const unusedZipNames = collectUnusedZipNames(zipBuckets);
   const manifest: ExampleManifest = {
     generatedAt: new Date().toISOString(),
     examples: manifestEntries
   };
+
   await fs.writeFile(outputManifestPath, JSON.stringify(manifest, null, 2), "utf8");
   console.log(`[examples] manifest written: ${outputManifestPath}`);
+  console.log(`[examples] matched ${manifestEntries.length} PDF/ZIP pair(s).`);
+
+  if (missingZipPdfs.length > 0) {
+    console.warn(`[examples] PDFs without matching ZIP (${missingZipPdfs.length}): ${missingZipPdfs.join(", ")}`);
+  }
+  if (unusedZipNames.length > 0) {
+    console.warn(`[examples] ZIPs without matching PDF (${unusedZipNames.length}): ${unusedZipNames.join(", ")}`);
+  }
 }
 
-function makeUniqueZipFileName(baseName: string, index: number): string {
-  const safeBase = sanitizeStem(baseName);
-  const prefix = safeBase.length > 0 ? safeBase : `example-${index + 1}`;
-  return `${prefix}.parsed-data.zip`;
+async function readFilesWithExtension(dirPath: string, extension: string): Promise<NamedFile[]> {
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  const out: NamedFile[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!entry.name.toLowerCase().endsWith(extension)) {
+      continue;
+    }
+
+    const absolutePath = path.resolve(dirPath, entry.name);
+    const stat = await fs.stat(absolutePath);
+    out.push({
+      name: entry.name,
+      sizeBytes: stat.size
+    });
+  }
+
+  out.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  return out;
 }
 
-function sanitizeStem(input: string): string {
-  return input
-    .normalize("NFKD")
-    .replace(/[^\w.-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
+function buildZipBuckets(zipFiles: NamedFile[]): Map<string, NamedFile[]> {
+  const buckets = new Map<string, NamedFile[]>();
+
+  for (const zip of zipFiles) {
+    const zipStem = path.parse(zip.name).name;
+    const comparable = normalizeComparableStem(stripParsedDataSuffix(zipStem));
+    if (!comparable) {
+      continue;
+    }
+
+    const bucket = buckets.get(comparable) ?? [];
+    bucket.push(zip);
+    buckets.set(comparable, bucket);
+  }
+
+  for (const bucket of buckets.values()) {
+    bucket.sort((a, b) => scoreZipName(a.name) - scoreZipName(b.name) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  }
+
+  return buckets;
+}
+
+function stripParsedDataSuffix(stem: string): string {
+  return stem.replace(/[._-]?parsed[._-]?data$/i, "");
+}
+
+function scoreZipName(name: string): number {
+  const lower = name.toLowerCase();
+  if (lower.endsWith("-parsed-data.zip")) {
+    return 0;
+  }
+  if (lower.endsWith(".parsed-data.zip")) {
+    return 1;
+  }
+  if (lower.endsWith("_parsed_data.zip")) {
+    return 2;
+  }
+  return 3;
+}
+
+function collectUnusedZipNames(zipBuckets: Map<string, NamedFile[]>): string[] {
+  const names: string[] = [];
+  for (const bucket of zipBuckets.values()) {
+    for (const zip of bucket) {
+      names.push(zip.name);
+    }
+  }
+  names.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  return names;
 }
 
 function makeUniqueId(baseName: string, used: Set<string>, index: number): string {
-  const stem = sanitizeStem(baseName).toLowerCase() || `example-${index}`;
+  const stem = normalizeIdStem(baseName) || `example-${index}`;
   let candidate = stem;
   let suffix = 2;
   while (used.has(candidate)) {
@@ -138,140 +181,22 @@ function makeUniqueId(baseName: string, used: Set<string>, index: number): strin
   return candidate;
 }
 
-async function buildParsedDataZip(scene: VectorScene, sourceFileName: string): Promise<Uint8Array> {
-  const zip = new JSZip();
-  const textureEntries = buildTextureExportEntries(scene);
-  const rasterLayers = listSceneRasterLayers(scene);
-  const primaryRasterLayer = rasterLayers[0] ?? null;
-
-  for (const entry of textureEntries) {
-    const bytes = new Uint8Array(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength);
-    zip.file(entry.filePath, bytes);
-  }
-
-  for (let i = 0; i < rasterLayers.length; i += 1) {
-    const layer = rasterLayers[i];
-    const filePath = `raster/layer-${i}.rgba`;
-    const expectedBytes = layer.width * layer.height * 4;
-    zip.file(filePath, layer.data.subarray(0, expectedBytes));
-  }
-
-  const manifest = {
-    formatVersion: 2,
-    sourceFile: sourceFileName,
-    generatedAt: new Date().toISOString(),
-    scene: {
-      bounds: scene.bounds,
-      pageBounds: scene.pageBounds,
-      pageRects: Array.from(scene.pageRects),
-      pageCount: scene.pageCount,
-      pagesPerRow: scene.pagesPerRow,
-      maxHalfWidth: scene.maxHalfWidth,
-      operatorCount: scene.operatorCount,
-      pathCount: scene.pathCount,
-      sourceSegmentCount: scene.sourceSegmentCount,
-      mergedSegmentCount: scene.mergedSegmentCount,
-      segmentCount: scene.segmentCount,
-      fillPathCount: scene.fillPathCount,
-      fillSegmentCount: scene.fillSegmentCount,
-      sourceTextCount: scene.sourceTextCount,
-      textInstanceCount: scene.textInstanceCount,
-      textGlyphCount: scene.textGlyphCount,
-      textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
-      textInPageCount: scene.textInPageCount,
-      textOutOfPageCount: scene.textOutOfPageCount,
-      discardedTransparentCount: scene.discardedTransparentCount,
-      discardedDegenerateCount: scene.discardedDegenerateCount,
-      discardedDuplicateCount: scene.discardedDuplicateCount,
-      discardedContainedCount: scene.discardedContainedCount,
-      rasterLayers: rasterLayers.map((layer, index) => ({
-        width: layer.width,
-        height: layer.height,
-        matrix: Array.from(layer.matrix),
-        file: `raster/layer-${index}.rgba`
-      })),
-      rasterLayerWidth: primaryRasterLayer?.width ?? 0,
-      rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-      rasterLayerMatrix: primaryRasterLayer ? Array.from(primaryRasterLayer.matrix) : undefined,
-      rasterLayerFile: primaryRasterLayer ? "raster/layer-0.rgba" : undefined
-    },
-    textures: textureEntries.map((entry) => ({
-      name: entry.name,
-      file: entry.filePath,
-      width: entry.width,
-      height: entry.height,
-      channels: 4,
-      componentType: "float32",
-      logicalItemCount: entry.logicalItemCount,
-      logicalFloatCount: entry.logicalFloatCount,
-      paddedFloatCount: entry.data.length
-    }))
-  };
-
-  zip.file("manifest.json", JSON.stringify(manifest, null, 2));
-  return zip.generateAsync({
-    type: "uint8array",
-    compression: "DEFLATE",
-    compressionOptions: { level: 6 }
-  });
+function normalizeIdStem(input: string): string {
+  return input
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
 }
 
-function buildTextureExportEntries(scene: VectorScene): ExportTextureEntry[] {
-  return [
-    createTextureExportEntry("fill-path-meta-a", scene.fillPathMetaA, scene.fillPathCount),
-    createTextureExportEntry("fill-path-meta-b", scene.fillPathMetaB, scene.fillPathCount),
-    createTextureExportEntry("fill-path-meta-c", scene.fillPathMetaC, scene.fillPathCount),
-    createTextureExportEntry("fill-primitives-a", scene.fillSegmentsA, scene.fillSegmentCount),
-    createTextureExportEntry("fill-primitives-b", scene.fillSegmentsB, scene.fillSegmentCount),
-    createTextureExportEntry("stroke-primitives-a", scene.endpoints, scene.segmentCount),
-    createTextureExportEntry("stroke-primitives-b", scene.primitiveMeta, scene.segmentCount),
-    createTextureExportEntry("stroke-styles", scene.styles, scene.segmentCount),
-    createTextureExportEntry("stroke-primitive-bounds", scene.primitiveBounds, scene.segmentCount),
-    createTextureExportEntry("text-instance-a", scene.textInstanceA, scene.textInstanceCount),
-    createTextureExportEntry("text-instance-b", scene.textInstanceB, scene.textInstanceCount),
-    createTextureExportEntry("text-instance-c", scene.textInstanceC, scene.textInstanceCount),
-    createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, scene.textGlyphCount),
-    createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, scene.textGlyphCount),
-    createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, scene.textGlyphSegmentCount),
-    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, scene.textGlyphSegmentCount)
-  ];
-}
-
-function createTextureExportEntry(name: string, data: Float32Array, logicalItemCount: number): ExportTextureEntry {
-  const logicalFloatCount = logicalItemCount * 4;
-  const floats = logicalFloatCount > 0 ? data.slice(0, logicalFloatCount) : new Float32Array(0);
-  const dims = chooseTextureDimensions(logicalItemCount);
-  return {
-    name,
-    filePath: `textures/${name}.f32`,
-    width: dims.width,
-    height: dims.height,
-    logicalItemCount,
-    logicalFloatCount,
-    data: floats
-  };
-}
-
-function chooseTextureDimensions(itemCount: number): { width: number; height: number } {
-  const safeCount = Math.max(1, itemCount);
-  const width = Math.max(1, Math.ceil(Math.sqrt(safeCount)));
-  const height = Math.max(1, Math.ceil(safeCount / width));
-  return { width, height };
-}
-
-function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
-  if (Array.isArray(scene.rasterLayers) && scene.rasterLayers.length > 0) {
-    return scene.rasterLayers.filter((layer) => {
-      const width = Math.max(0, Math.trunc(layer?.width ?? 0));
-      const height = Math.max(0, Math.trunc(layer?.height ?? 0));
-      return width > 0 && height > 0 && layer.data.length >= width * height * 4;
-    });
-  }
-  return [];
-}
-
-function formatKilobytes(sizeBytes: number): string {
-  return (sizeBytes / 1024).toFixed(1);
+function normalizeComparableStem(input: string): string {
+  return input
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
 }
 
 await main();

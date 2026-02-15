@@ -9,11 +9,18 @@ import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import {
   composeVectorScenesInGrid,
   extractPdfPageScenes,
+  extractPdfRasterScene,
   type Bounds,
   type RasterLayer,
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
+import {
+  decodeByteShuffledFloat32,
+  decodeChannelMajorFloat32,
+  decodeXorDeltaByteShuffledFloat32,
+  encodeChannelMajorFloat32
+} from "./parsedDataEncoding";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -238,16 +245,24 @@ interface LoadPdfOptions {
 
 interface ExportTextureEntry {
   name: string;
+  filePath: string;
   width: number;
   height: number;
   logicalItemCount: number;
   logicalFloatCount: number;
   data: Float32Array;
+  layout: "interleaved" | "channel-major";
 }
+
+type TextureLayout = "interleaved" | "channel-major";
 
 interface ParsedDataTextureEntry {
   name?: unknown;
   file?: unknown;
+  componentType?: unknown;
+  layout?: unknown;
+  byteShuffle?: unknown;
+  predictor?: unknown;
   logicalItemCount?: unknown;
   logicalFloatCount?: unknown;
 }
@@ -257,6 +272,7 @@ interface ParsedDataRasterLayerEntry {
   height?: unknown;
   matrix?: unknown;
   file?: unknown;
+  encoding?: unknown;
 }
 
 interface ParsedDataSceneEntry {
@@ -267,6 +283,7 @@ interface ParsedDataSceneEntry {
   pagesPerRow?: unknown;
   maxHalfWidth?: unknown;
   operatorCount?: unknown;
+  imagePaintOpCount?: unknown;
   pathCount?: unknown;
   sourceSegmentCount?: unknown;
   mergedSegmentCount?: unknown;
@@ -294,6 +311,9 @@ interface ParsedDataSceneEntry {
 interface ParsedDataManifest {
   formatVersion?: unknown;
   sourceFile?: unknown;
+  sourcePdfFile?: unknown;
+  sourcePdfUrl?: unknown;
+  sourcePdfSizeBytes?: unknown;
   scene?: ParsedDataSceneEntry;
   textures?: ParsedDataTextureEntry[];
 }
@@ -1251,88 +1271,27 @@ async function downloadParsedDataZip(): Promise<void> {
   const scene = lastParsedScene;
   const sceneStats = lastParsedSceneStats;
   const label = lastParsedSceneLabel;
+  let sourcePdfBytes = lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : null;
+  if (scene.imagePaintOpCount <= 0) {
+    sourcePdfBytes = null;
+  }
+  if (!sourcePdfBytes && lastLoadedSource?.kind === "parsed-zip") {
+    sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(lastLoadedSource.bytes);
+  }
   const previousStatusText = statusTextElement.textContent;
 
   setDownloadDataButtonState(true, true);
   statusTextElement.textContent = "Preparing parsed texture data zip...";
 
   try {
-    const zip = new JSZip();
-    const textureEntries = buildTextureExportEntries(scene, sceneStats);
-    const rasterLayers = listSceneRasterLayers(scene);
-    const primaryRasterLayer = rasterLayers[0] ?? null;
-
-    for (const entry of textureEntries) {
-      const path = `textures/${entry.name}.f32`;
-      zip.file(path, new Uint8Array(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength));
-    }
-
-    for (let i = 0; i < rasterLayers.length; i += 1) {
-      const layer = rasterLayers[i];
-      const rasterLayerFile = `raster/layer-${i}.rgba`;
-      const expectedBytes = layer.width * layer.height * 4;
-      const rasterBytes = layer.data.subarray(0, expectedBytes);
-      zip.file(rasterLayerFile, rasterBytes);
-    }
-
-    const manifest = {
-      formatVersion: 2,
-      sourceFile: label,
-      generatedAt: new Date().toISOString(),
-      scene: {
-        bounds: scene.bounds,
-        pageBounds: scene.pageBounds,
-        pageRects: Array.from(scene.pageRects),
-        pageCount: scene.pageCount,
-        pagesPerRow: scene.pagesPerRow,
-        maxHalfWidth: scene.maxHalfWidth,
-        operatorCount: scene.operatorCount,
-        pathCount: scene.pathCount,
-        sourceSegmentCount: scene.sourceSegmentCount,
-        mergedSegmentCount: scene.mergedSegmentCount,
-        segmentCount: scene.segmentCount,
-        fillPathCount: scene.fillPathCount,
-        fillSegmentCount: scene.fillSegmentCount,
-        textInstanceCount: scene.textInstanceCount,
-        textGlyphCount: scene.textGlyphCount,
-        textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
-        rasterLayers: rasterLayers.map((layer, index) => ({
-          width: layer.width,
-          height: layer.height,
-          matrix: Array.from(layer.matrix),
-          file: `raster/layer-${index}.rgba`
-        })),
-        // Legacy single-layer manifest fields kept so older builds can still open newer exports.
-        rasterLayerWidth: primaryRasterLayer?.width ?? 0,
-        rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-        rasterLayerMatrix: primaryRasterLayer ? Array.from(primaryRasterLayer.matrix) : undefined,
-        rasterLayerFile: primaryRasterLayer ? "raster/layer-0.rgba" : undefined
-      },
-      textures: textureEntries.map((entry) => ({
-        name: entry.name,
-        file: `textures/${entry.name}.f32`,
-        width: entry.width,
-        height: entry.height,
-        channels: 4,
-        componentType: "float32",
-        logicalItemCount: entry.logicalItemCount,
-        logicalFloatCount: entry.logicalFloatCount,
-        paddedFloatCount: entry.data.length
-      }))
-    };
-
-    zip.file("manifest.json", JSON.stringify(manifest, null, 2));
-
-    const zipBlob = await zip.generateAsync({
-      type: "blob",
-      compression: "DEFLATE",
-      compressionOptions: { level: 6 }
-    });
+    const interleavedZip = await buildParsedDataZipBlobForLayout(scene, sceneStats, label, sourcePdfBytes, "interleaved");
+    const channelMajorZip = await buildParsedDataZipBlobForLayout(scene, sceneStats, label, sourcePdfBytes, "channel-major");
+    const selectedZip = channelMajorZip.byteLength < interleavedZip.byteLength ? channelMajorZip : interleavedZip;
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
-    triggerBlobDownload(zipBlob, zipFileName);
+    triggerBlobDownload(selectedZip.blob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${textureEntries.length} vector textures + ${rasterLayers.length.toLocaleString()} raster layers to ${zipFileName}`
+      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, interleaved ${formatKilobytes(interleavedZip.byteLength)} kB, channel-major ${formatKilobytes(channelMajorZip.byteLength)} kB)`
     );
     statusTextElement.textContent = previousStatusText || baseStatus;
   } catch (error) {
@@ -1343,24 +1302,154 @@ async function downloadParsedDataZip(): Promise<void> {
   }
 }
 
-function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneStats): ExportTextureEntry[] {
+interface ParsedDataZipBlobResult {
+  blob: Blob;
+  byteLength: number;
+  textureCount: number;
+  rasterLayerCount: number;
+  layout: TextureLayout;
+}
+
+interface SerializedRasterLayerEntry {
+  width: number;
+  height: number;
+  matrix: number[];
+  file: string;
+  encoding: "webp" | "png" | "rgba";
+}
+
+async function buildParsedDataZipBlobForLayout(
+  scene: VectorScene,
+  sceneStats: SceneStats,
+  label: string,
+  sourcePdfBytes: Uint8Array | null,
+  textureLayout: TextureLayout
+): Promise<ParsedDataZipBlobResult> {
+  const zip = new JSZip();
+  const textureEntries = buildTextureExportEntries(scene, sceneStats, textureLayout);
+  const includeSourcePdf = !!sourcePdfBytes && sourcePdfBytes.length > 0 && scene.imagePaintOpCount > 0;
+  const sceneRasterLayers = listSceneRasterLayers(scene);
+  const useSourcePdfFallback = includeSourcePdf && sceneRasterLayers.length === 0;
+  const rasterLayers = useSourcePdfFallback ? [] : sceneRasterLayers;
+  const primaryRasterLayer = rasterLayers[0] ?? null;
+  const sourcePdfFile = useSourcePdfFallback ? "source/source.pdf" : undefined;
+
+  for (const entry of textureEntries) {
+    const bytes = entry.layout === "channel-major"
+      ? encodeChannelMajorFloat32(entry.data)
+      : new Uint8Array(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength);
+    zip.file(entry.filePath, bytes);
+  }
+
+  if (sourcePdfFile && sourcePdfBytes) {
+    zip.file(sourcePdfFile, sourcePdfBytes);
+  }
+
+  const serializedRasterLayers: SerializedRasterLayerEntry[] = [];
+  for (let i = 0; i < rasterLayers.length; i += 1) {
+    const layer = rasterLayers[i];
+    const expectedBytes = layer.width * layer.height * 4;
+    const rasterBytes = layer.data.subarray(0, expectedBytes);
+    let filePath = `raster/layer-${i}.rgba`;
+    let encoding: "webp" | "png" | "rgba" = "rgba";
+    let layerBytes: Uint8Array = rasterBytes;
+    const encodedImage = await encodeRasterLayerAsBestImage(layer.width, layer.height, rasterBytes);
+    if (encodedImage) {
+      filePath = `raster/layer-${i}.${encodedImage.extension}`;
+      encoding = encodedImage.encoding;
+      layerBytes = encodedImage.bytes;
+    }
+    zip.file(filePath, layerBytes, encoding === "rgba" ? undefined : { compression: "STORE" });
+    serializedRasterLayers.push({
+      width: layer.width,
+      height: layer.height,
+      matrix: Array.from(layer.matrix),
+      file: filePath,
+      encoding
+    });
+  }
+
+  const manifest = {
+    formatVersion: 3,
+    sourceFile: label,
+    sourcePdfFile,
+    sourcePdfSizeBytes: useSourcePdfFallback ? sourcePdfBytes?.length ?? 0 : 0,
+    generatedAt: new Date().toISOString(),
+    scene: {
+      bounds: scene.bounds,
+      pageBounds: scene.pageBounds,
+      pageRects: Array.from(scene.pageRects),
+      pageCount: scene.pageCount,
+      pagesPerRow: scene.pagesPerRow,
+      maxHalfWidth: scene.maxHalfWidth,
+      operatorCount: scene.operatorCount,
+      imagePaintOpCount: scene.imagePaintOpCount,
+      pathCount: scene.pathCount,
+      sourceSegmentCount: scene.sourceSegmentCount,
+      mergedSegmentCount: scene.mergedSegmentCount,
+      segmentCount: scene.segmentCount,
+      fillPathCount: scene.fillPathCount,
+      fillSegmentCount: scene.fillSegmentCount,
+      textInstanceCount: scene.textInstanceCount,
+      textGlyphCount: scene.textGlyphCount,
+      textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
+      rasterLayers: serializedRasterLayers,
+      rasterLayerWidth: primaryRasterLayer?.width ?? 0,
+      rasterLayerHeight: primaryRasterLayer?.height ?? 0,
+      rasterLayerMatrix: primaryRasterLayer ? Array.from(primaryRasterLayer.matrix) : undefined,
+      rasterLayerFile: serializedRasterLayers[0]?.file
+    },
+    textures: textureEntries.map((entry) => ({
+      name: entry.name,
+      file: entry.filePath,
+      width: entry.width,
+      height: entry.height,
+      channels: 4,
+      componentType: "float32",
+      layout: entry.layout,
+      byteShuffle: false,
+      predictor: "none",
+      logicalItemCount: entry.logicalItemCount,
+      logicalFloatCount: entry.logicalFloatCount,
+      paddedFloatCount: entry.data.length
+    }))
+  };
+
+  zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+
+  const zipBlob = await zip.generateAsync({
+    type: "blob",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 }
+  });
+
+  return {
+    blob: zipBlob,
+    byteLength: zipBlob.size,
+    textureCount: textureEntries.length,
+    rasterLayerCount: rasterLayers.length,
+    layout: textureLayout
+  };
+}
+
+function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneStats, textureLayout: TextureLayout): ExportTextureEntry[] {
   return [
-    createTextureExportEntry("fill-path-meta-a", scene.fillPathMetaA, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount),
-    createTextureExportEntry("fill-path-meta-b", scene.fillPathMetaB, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount),
-    createTextureExportEntry("fill-path-meta-c", scene.fillPathMetaC, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount),
-    createTextureExportEntry("fill-primitives-a", scene.fillSegmentsA, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount),
-    createTextureExportEntry("fill-primitives-b", scene.fillSegmentsB, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount),
-    createTextureExportEntry("stroke-primitives-a", scene.endpoints, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
-    createTextureExportEntry("stroke-primitives-b", scene.primitiveMeta, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
-    createTextureExportEntry("stroke-styles", scene.styles, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
-    createTextureExportEntry("stroke-primitive-bounds", scene.primitiveBounds, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount),
-    createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
-    createTextureExportEntry("text-instance-b", scene.textInstanceB, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
-    createTextureExportEntry("text-instance-c", scene.textInstanceC, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount),
-    createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount),
-    createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount),
-    createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount),
-    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount)
+    createTextureExportEntry("fill-path-meta-a", scene.fillPathMetaA, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount, textureLayout),
+    createTextureExportEntry("fill-path-meta-b", scene.fillPathMetaB, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount, textureLayout),
+    createTextureExportEntry("fill-path-meta-c", scene.fillPathMetaC, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount, textureLayout),
+    createTextureExportEntry("fill-primitives-a", scene.fillSegmentsA, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount, textureLayout),
+    createTextureExportEntry("fill-primitives-b", scene.fillSegmentsB, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount, textureLayout),
+    createTextureExportEntry("stroke-primitives-a", scene.endpoints, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
+    createTextureExportEntry("stroke-primitives-b", scene.primitiveMeta, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
+    createTextureExportEntry("stroke-styles", scene.styles, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
+    createTextureExportEntry("stroke-primitive-bounds", scene.primitiveBounds, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
+    createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
+    createTextureExportEntry("text-instance-b", scene.textInstanceB, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
+    createTextureExportEntry("text-instance-c", scene.textInstanceC, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
+    createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
+    createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
+    createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout),
+    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout)
   ];
 }
 
@@ -1402,18 +1491,20 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
         continue;
       }
 
-      const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}.f32`;
+      const inferredSuffix =
+        typeof entry.layout === "string" && entry.layout === "channel-major"
+          ? ".f32cm"
+          : entry.byteShuffle === true
+            ? ".f32bs"
+            : ".f32";
+      const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}${inferredSuffix}`;
       const zipEntry = zip.file(path);
       if (!zipEntry) {
         continue;
       }
 
       const fileBuffer = await zipEntry.async("arraybuffer");
-      if (fileBuffer.byteLength % 4 !== 0) {
-        throw new Error(`Texture ${candidate} has invalid byte length (${fileBuffer.byteLength}).`);
-      }
-
-      const raw = new Float32Array(fileBuffer);
+      const raw = readTexturePayloadAsFloat32(fileBuffer, entry, candidate);
       const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
       if (logicalFloatCount > raw.length) {
         throw new Error(`Texture ${candidate} logical float count exceeds file length.`);
@@ -1512,7 +1603,27 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
   const textOutOfPageCount = readNonNegativeInt(sceneMeta.textOutOfPageCount, Math.max(0, sourceTextCount - textInPageCount));
   const pageCount = Math.max(1, readNonNegativeInt(sceneMeta.pageCount, 1));
   const pagesPerRow = Math.max(1, readNonNegativeInt(sceneMeta.pagesPerRow, 1));
-  const rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta);
+  let rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta);
+  if (rasterLayers.length === 0) {
+    const sourcePdfBytes = await readSourcePdfBytesFromParsedData(zip, manifest);
+    if (sourcePdfBytes) {
+      try {
+        const rasterScene = await extractPdfRasterScene(createParseBuffer(sourcePdfBytes), {
+          maxPages: pageCount,
+          maxPagesPerRow: pagesPerRow
+        });
+        rasterLayers = listSceneRasterLayers(rasterScene);
+        if (rasterLayers.length > 0) {
+          console.log(
+            `[Parsed data load] Restored ${rasterLayers.length.toLocaleString()} raster layer(s) from embedded source PDF.`
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[Parsed data load] Failed to restore raster layers from source PDF: ${message}`);
+      }
+    }
+  }
   const primaryRasterLayer = rasterLayers[0] ?? null;
   const maxHalfWidth =
     readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
@@ -1568,6 +1679,7 @@ async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorSc
     pageCount,
     pagesPerRow,
     maxHalfWidth,
+    imagePaintOpCount: readNonNegativeInt(sceneMeta.imagePaintOpCount, 0),
     operatorCount: readNonNegativeInt(sceneMeta.operatorCount, 0),
     pathCount: readNonNegativeInt(sceneMeta.pathCount, 0),
     discardedTransparentCount: readNonNegativeInt(sceneMeta.discardedTransparentCount, 0),
@@ -1826,6 +1938,214 @@ function parseMat2D(value: unknown): Float32Array | null {
   return out;
 }
 
+async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedDataManifest): Promise<Uint8Array | null> {
+  const manifestPath = readNonEmptyString(manifest.sourcePdfFile);
+  const manifestUrl = readNonEmptyString(manifest.sourcePdfUrl);
+  const candidatePaths = [
+    manifestPath,
+    "source/source.pdf",
+    "source.pdf"
+  ];
+
+  for (const candidatePath of candidatePaths) {
+    if (!candidatePath) {
+      continue;
+    }
+    const zipEntry = zip.file(candidatePath);
+    if (!zipEntry) {
+      continue;
+    }
+
+    const fileBuffer = await zipEntry.async("arraybuffer");
+    if (fileBuffer.byteLength <= 0) {
+      continue;
+    }
+    return new Uint8Array(fileBuffer);
+  }
+
+  if (manifestUrl) {
+    try {
+      const response = await fetch(manifestUrl);
+      if (response.ok) {
+        const fileBuffer = await response.arrayBuffer();
+        if (fileBuffer.byteLength > 0) {
+          return new Uint8Array(fileBuffer);
+        }
+      }
+    } catch {
+      // Best-effort fallback only.
+    }
+  }
+
+  return null;
+}
+
+interface EncodedRasterImage {
+  bytes: Uint8Array;
+  encoding: "webp" | "png";
+  extension: "webp" | "png";
+}
+
+async function encodeRasterLayerAsBestImage(width: number, height: number, rgba: Uint8Array): Promise<EncodedRasterImage | null> {
+  const [webp, png] = await Promise.all([
+    encodeRasterLayerAsImage(width, height, rgba, "image/webp"),
+    encodeRasterLayerAsImage(width, height, rgba, "image/png")
+  ]);
+
+  if (!webp && !png) {
+    return null;
+  }
+  if (webp && !png) {
+    return { bytes: webp, encoding: "webp", extension: "webp" };
+  }
+  if (png && !webp) {
+    return { bytes: png, encoding: "png", extension: "png" };
+  }
+
+  if (!webp || !png) {
+    return null;
+  }
+  return webp.byteLength < png.byteLength
+    ? { bytes: webp, encoding: "webp", extension: "webp" }
+    : { bytes: png, encoding: "png", extension: "png" };
+}
+
+async function encodeRasterLayerAsImage(
+  width: number,
+  height: number,
+  rgba: Uint8Array,
+  mimeType: "image/png" | "image/webp"
+): Promise<Uint8Array | null> {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const expectedBytes = width * height * 4;
+  if (width <= 0 || height <= 0 || rgba.length < expectedBytes) {
+    return null;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d", { alpha: true });
+  if (!context) {
+    canvas.width = 0;
+    canvas.height = 0;
+    return null;
+  }
+
+  const clamped = new Uint8ClampedArray(expectedBytes);
+  clamped.set(rgba.subarray(0, expectedBytes));
+  const imageData = new ImageData(clamped, width, height);
+  context.putImageData(imageData, 0, 0);
+
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, mimeType);
+  });
+  canvas.width = 0;
+  canvas.height = 0;
+  if (!blob) {
+    return null;
+  }
+
+  const buffer = await blob.arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
+function getMimeTypeForRasterPath(path: string): string | null {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".png")) {
+    return "image/png";
+  }
+  if (lower.endsWith(".webp")) {
+    return "image/webp";
+  }
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+    return "image/jpeg";
+  }
+  return null;
+}
+
+async function decodeRasterImageToRgba(path: string, encoded: Uint8Array): Promise<{ width: number; height: number; data: Uint8Array } | null> {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  const mimeType = getMimeTypeForRasterPath(path);
+  if (!mimeType) {
+    return null;
+  }
+
+  const encodedCopy = new Uint8Array(encoded.length);
+  encodedCopy.set(encoded);
+  const blob = new Blob([encodedCopy], { type: mimeType });
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const width = bitmap.width;
+    const height = bitmap.height;
+    if (width <= 0 || height <= 0) {
+      return null;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { alpha: true, willReadFrequently: true });
+    if (!context) {
+      canvas.width = 0;
+      canvas.height = 0;
+      return null;
+    }
+
+    context.drawImage(bitmap, 0, 0);
+    const imageData = context.getImageData(0, 0, width, height);
+    const rgba = new Uint8Array(imageData.data);
+    canvas.width = 0;
+    canvas.height = 0;
+    return { width, height, data: rgba };
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8Array): Promise<Uint8Array | null> {
+  try {
+    const zip = await JSZip.loadAsync(zipBytes);
+    const manifestFile = zip.file("manifest.json");
+    let sourcePdfFile: string | null = null;
+    if (manifestFile) {
+      const manifestJson = await manifestFile.async("string");
+      try {
+        const manifest = JSON.parse(manifestJson) as ParsedDataManifest;
+        sourcePdfFile = readNonEmptyString(manifest.sourcePdfFile);
+      } catch {
+        sourcePdfFile = null;
+      }
+    }
+
+    const candidatePaths = [sourcePdfFile, "source/source.pdf", "source.pdf"];
+    for (const candidatePath of candidatePaths) {
+      if (!candidatePath) {
+        continue;
+      }
+      const entry = zip.file(candidatePath);
+      if (!entry) {
+        continue;
+      }
+      const fileBuffer = await entry.async("arraybuffer");
+      if (fileBuffer.byteLength <= 0) {
+        continue;
+      }
+      return new Uint8Array(fileBuffer);
+    }
+  } catch {
+    // Best-effort only.
+  }
+
+  return null;
+}
+
 async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataSceneEntry): Promise<RasterLayer[]> {
   const layers: RasterLayer[] = [];
 
@@ -1843,12 +2163,12 @@ async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataS
     const height = readNonNegativeInt(layerMeta.height, 0);
     const path = typeof layerMeta.file === "string" ? layerMeta.file : `raster/layer-${i}.rgba`;
     const matrix = parseMat2D(layerMeta.matrix) ?? new Float32Array([1, 0, 0, 1, 0, 0]);
-    const data = await readRasterLayerBytes(zip, path, width, height);
-    if (width <= 0 || height <= 0 || data.length < width * height * 4) {
+    const decoded = await readRasterLayerFromZip(zip, path, width, height);
+    if (!decoded || decoded.width <= 0 || decoded.height <= 0 || decoded.data.length < decoded.width * decoded.height * 4) {
       continue;
     }
 
-    layers.push({ width, height, matrix, data });
+    layers.push({ width: decoded.width, height: decoded.height, matrix, data: decoded.data });
   }
 
   if (layers.length > 0) {
@@ -1858,49 +2178,71 @@ async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataS
   const rasterLayerWidth = readNonNegativeInt(sceneMeta.rasterLayerWidth, 0);
   const rasterLayerHeight = readNonNegativeInt(sceneMeta.rasterLayerHeight, 0);
   const rasterLayerMatrix = parseMat2D(sceneMeta.rasterLayerMatrix) ?? new Float32Array([1, 0, 0, 1, 0, 0]);
-  const defaultLegacyPath = zip.file("raster/layer-0.rgba") ? "raster/layer-0.rgba" : "raster/layer.rgba";
-  const rasterLayerData = await readRasterLayerBytes(
+  const defaultLegacyPath = zip.file("raster/layer-0.webp")
+    ? "raster/layer-0.webp"
+    : zip.file("raster/layer-0.png")
+      ? "raster/layer-0.png"
+      : zip.file("raster/layer-0.rgba")
+        ? "raster/layer-0.rgba"
+        : zip.file("raster/layer.webp")
+          ? "raster/layer.webp"
+          : zip.file("raster/layer.png")
+            ? "raster/layer.png"
+            : "raster/layer.rgba";
+  const legacyLayer = await readRasterLayerFromZip(
     zip,
     typeof sceneMeta.rasterLayerFile === "string" ? sceneMeta.rasterLayerFile : defaultLegacyPath,
     rasterLayerWidth,
     rasterLayerHeight
   );
-  if (rasterLayerWidth > 0 && rasterLayerHeight > 0 && rasterLayerData.length >= rasterLayerWidth * rasterLayerHeight * 4) {
+  if (
+    legacyLayer &&
+    legacyLayer.width > 0 &&
+    legacyLayer.height > 0 &&
+    legacyLayer.data.length >= legacyLayer.width * legacyLayer.height * 4
+  ) {
     layers.push({
-      width: rasterLayerWidth,
-      height: rasterLayerHeight,
-      data: rasterLayerData,
+      width: legacyLayer.width,
+      height: legacyLayer.height,
+      data: legacyLayer.data,
       matrix: rasterLayerMatrix
     });
   }
   return layers;
 }
 
-async function readRasterLayerBytes(
+async function readRasterLayerFromZip(
   zip: JSZip,
   path: string,
-  width: number,
-  height: number
-): Promise<Uint8Array> {
-  if (width <= 0 || height <= 0) {
-    return new Uint8Array(0);
-  }
-
-  const expectedLength = width * height * 4;
+  widthHint: number,
+  heightHint: number
+): Promise<{ width: number; height: number; data: Uint8Array } | null> {
   const zipEntry = zip.file(path);
   if (!zipEntry) {
-    return new Uint8Array(0);
+    return null;
   }
 
   const buffer = await zipEntry.async("arraybuffer");
   const bytes = new Uint8Array(buffer);
+
+  const decodedImage = await decodeRasterImageToRgba(path, bytes);
+  if (decodedImage) {
+    return decodedImage;
+  }
+
+  if (widthHint <= 0 || heightHint <= 0) {
+    return null;
+  }
+
+  const expectedLength = widthHint * heightHint * 4;
   if (bytes.length < expectedLength) {
     throw new Error(`Raster layer data is truncated (${bytes.length} < ${expectedLength}).`);
   }
-  if (bytes.length === expectedLength) {
-    return bytes;
-  }
-  return bytes.slice(0, expectedLength);
+  return {
+    width: widthHint,
+    height: heightHint,
+    data: bytes.length === expectedLength ? bytes : bytes.slice(0, expectedLength)
+  };
 }
 
 function computeMaxHalfWidth(styles: Float32Array, segmentCount: number): number {
@@ -1942,27 +2284,68 @@ function createTextureExportEntry(
   source: Float32Array,
   width: number,
   height: number,
-  logicalItemCount: number
+  logicalItemCount: number,
+  textureLayout: TextureLayout
 ): ExportTextureEntry {
+  const logicalFloatCount = logicalItemCount * 4;
+  if (source.length < logicalFloatCount) {
+    throw new Error(`Texture ${name} has insufficient data (${source.length} < ${logicalFloatCount}).`);
+  }
+  const suffix = textureLayout === "channel-major" ? ".f32cm" : ".f32";
+
   return {
     name,
+    filePath: `textures/${name}${suffix}`,
     width,
     height,
     logicalItemCount,
-    logicalFloatCount: source.length,
-    data: createPaddedFloatTextureData(source, width, height)
+    logicalFloatCount,
+    data: source.slice(0, logicalFloatCount),
+    layout: textureLayout
   };
 }
 
-function createPaddedFloatTextureData(source: Float32Array, width: number, height: number): Float32Array {
-  const expectedLength = Math.max(1, width) * Math.max(1, height) * 4;
-  if (source.length > expectedLength) {
-    throw new Error(`Texture source data exceeds texture size (${source.length} > ${expectedLength}).`);
+function readTexturePayloadAsFloat32(
+  fileBuffer: ArrayBuffer,
+  entry: ParsedDataTextureEntry,
+  textureName: string
+): Float32Array {
+  const componentType = typeof entry.componentType === "string" ? entry.componentType : "float32";
+  if (componentType !== "float32") {
+    throw new Error(`Texture ${textureName} has unsupported componentType ${String(componentType)}.`);
   }
 
-  const padded = new Float32Array(expectedLength);
-  padded.set(source);
-  return padded;
+  const layout = typeof entry.layout === "string" ? entry.layout : "interleaved";
+  if (layout !== "interleaved" && layout !== "channel-major") {
+    throw new Error(`Texture ${textureName} has unsupported layout ${String(layout)}.`);
+  }
+
+  if (layout === "channel-major") {
+    return decodeChannelMajorFloat32(new Uint8Array(fileBuffer));
+  }
+
+  const byteShuffle = entry.byteShuffle === true;
+  const predictor = typeof entry.predictor === "string" ? entry.predictor : "none";
+  if (predictor !== "none" && predictor !== "xor-delta-u32") {
+    throw new Error(`Texture ${textureName} has unsupported predictor ${String(predictor)}.`);
+  }
+
+  if (byteShuffle) {
+    if (predictor === "xor-delta-u32") {
+      return decodeXorDeltaByteShuffledFloat32(new Uint8Array(fileBuffer));
+    }
+    return decodeByteShuffledFloat32(new Uint8Array(fileBuffer));
+  }
+
+  if (predictor !== "none") {
+    throw new Error(`Texture ${textureName} declares predictor ${predictor} without byteShuffle.`);
+  }
+
+  if (fileBuffer.byteLength % 4 !== 0) {
+    throw new Error(`Texture ${textureName} has invalid byte length (${fileBuffer.byteLength}).`);
+  }
+
+  return new Float32Array(fileBuffer);
 }
 
 function sanitizeDownloadName(label: string): string {
