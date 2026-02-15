@@ -64,11 +64,11 @@ async function main(): Promise<void> {
       id,
       name: pdf.name,
       pdf: {
-        path: `/examples/pdfs/${encodeURIComponent(pdf.name)}`,
+        path: `examples/pdfs/${encodeURIComponent(pdf.name)}`,
         sizeBytes: pdf.sizeBytes
       },
       parsedZip: {
-        path: `/examples/zips/${encodeURIComponent(matchedZip.name)}`,
+        path: `examples/zips/${encodeURIComponent(matchedZip.name)}`,
         sizeBytes: matchedZip.sizeBytes
       }
     });

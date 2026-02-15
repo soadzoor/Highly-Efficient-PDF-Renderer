@@ -8,6 +8,14 @@ The project started from vector-texture ideas inspired by:
 
 It has since evolved beyond a floorplan-only proof of concept into a broader PDF renderer with multi-page layout, vector + raster support, parsed-data export/import, and both WebGL and WebGPU backends.
 
+## Demo
+- <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer>
+
+<video src="./public/demo.mp4" controls muted loop playsinline></video>
+
+- [`public/demo.mp4`](public/demo.mp4)
+- <https://youtu.be/HDMntIG-1e4>
+
 ## Current Feature Set
 
 - Input sources:

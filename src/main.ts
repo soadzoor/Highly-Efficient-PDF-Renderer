@@ -355,6 +355,18 @@ interface NormalizedExampleEntry {
 }
 
 const exampleSelectionMap = new Map<string, ExampleSelection>();
+const absoluteUrlPattern = /^[a-z][a-z\d+.-]*:/i;
+const appBaseUrl = new URL(import.meta.env.BASE_URL, window.location.href);
+
+function resolveAppAssetUrl(inputPath: string): string {
+  const trimmedPath = inputPath.trim();
+  if (absoluteUrlPattern.test(trimmedPath)) {
+    return trimmedPath;
+  }
+
+  const normalizedPath = trimmedPath.replace(/^\/+/, "");
+  return new URL(normalizedPath, appBaseUrl).toString();
+}
 
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
@@ -903,7 +915,8 @@ async function loadExampleManifest(): Promise<void> {
   exampleSelectElement.disabled = true;
 
   try {
-    const response = await fetch("/examples/manifest.json", { cache: "no-store" });
+    const manifestUrl = resolveAppAssetUrl("examples/manifest.json");
+    const response = await fetch(manifestUrl, { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -939,8 +952,10 @@ function normalizeExampleManifestEntries(manifest: ExampleAssetManifest): Normal
     }
 
     const idCandidate = readNonEmptyString(raw?.id) ?? `example-${i + 1}`;
-    const pdfPath = readNonEmptyString(raw?.pdf?.path);
-    const zipPath = readNonEmptyString(raw?.parsedZip?.path);
+    const rawPdfPath = readNonEmptyString(raw?.pdf?.path);
+    const rawZipPath = readNonEmptyString(raw?.parsedZip?.path);
+    const pdfPath = rawPdfPath ? resolveAppAssetUrl(rawPdfPath) : null;
+    const zipPath = rawZipPath ? resolveAppAssetUrl(rawZipPath) : null;
     if (!pdfPath || !zipPath) {
       continue;
     }
@@ -2192,7 +2207,7 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
 
   if (manifestUrl) {
     try {
-      const response = await fetch(manifestUrl);
+      const response = await fetch(resolveAppAssetUrl(manifestUrl));
       if (response.ok) {
         const fileBuffer = await response.arrayBuffer();
         if (fileBuffer.byteLength > 0) {

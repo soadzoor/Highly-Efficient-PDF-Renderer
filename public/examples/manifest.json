@@ -1,15 +1,15 @@
 {
-  "generatedAt": "2026-02-15T09:13:37.369Z",
+  "generatedAt": "2026-02-15T10:04:52.271Z",
   "examples": [
     {
       "id": "dublin_1st_floor_2018_06_01",
       "name": "Dublin 1st Floor 2018 06 01.pdf",
       "pdf": {
-        "path": "/examples/pdfs/Dublin%201st%20Floor%202018%2006%2001.pdf",
+        "path": "examples/pdfs/Dublin%201st%20Floor%202018%2006%2001.pdf",
         "sizeBytes": 2918857
       },
       "parsedZip": {
-        "path": "/examples/zips/Dublin_1st_Floor_2018_06_01-parsed-data.zip",
+        "path": "examples/zips/Dublin_1st_Floor_2018_06_01-parsed-data.zip",
         "sizeBytes": 5872122
       }
     },
@@ -17,11 +17,11 @@
       "id": "level_1",
       "name": "Level 1.pdf",
       "pdf": {
-        "path": "/examples/pdfs/Level%201.pdf",
+        "path": "examples/pdfs/Level%201.pdf",
         "sizeBytes": 31445683
       },
       "parsedZip": {
-        "path": "/examples/zips/Level_1-parsed-data.zip",
+        "path": "examples/zips/Level_1-parsed-data.zip",
         "sizeBytes": 41638374
       }
     },
@@ -29,11 +29,11 @@
       "id": "lk_office_level_1",
       "name": "LK Office Level 1.pdf",
       "pdf": {
-        "path": "/examples/pdfs/LK%20Office%20Level%201.pdf",
+        "path": "examples/pdfs/LK%20Office%20Level%201.pdf",
         "sizeBytes": 30175
       },
       "parsedZip": {
-        "path": "/examples/zips/LK_Office_Level_1-parsed-data.zip",
+        "path": "examples/zips/LK_Office_Level_1-parsed-data.zip",
         "sizeBytes": 19037
       }
     },
@@ -41,11 +41,11 @@
       "id": "lower_level",
       "name": "Lower Level.pdf",
       "pdf": {
-        "path": "/examples/pdfs/Lower%20Level.pdf",
+        "path": "examples/pdfs/Lower%20Level.pdf",
         "sizeBytes": 51313557
       },
       "parsedZip": {
-        "path": "/examples/zips/Lower_Level-parsed-data.zip",
+        "path": "examples/zips/Lower_Level-parsed-data.zip",
         "sizeBytes": 29529867
       }
     },
@@ -53,11 +53,11 @@
       "id": "murietta_level1",
       "name": "Murietta_Level1.pdf",
       "pdf": {
-        "path": "/examples/pdfs/Murietta_Level1.pdf",
+        "path": "examples/pdfs/Murietta_Level1.pdf",
         "sizeBytes": 4001014
       },
       "parsedZip": {
-        "path": "/examples/zips/Murietta_Level1-parsed-data.zip",
+        "path": "examples/zips/Murietta_Level1-parsed-data.zip",
         "sizeBytes": 6061002
       }
     },
@@ -65,11 +65,11 @@
       "id": "optimizing_cpp",
       "name": "optimizing_cpp.pdf",
       "pdf": {
-        "path": "/examples/pdfs/optimizing_cpp.pdf",
+        "path": "examples/pdfs/optimizing_cpp.pdf",
         "sizeBytes": 1848238
       },
       "parsedZip": {
-        "path": "/examples/zips/optimizing_cpp-parsed-data.zip",
+        "path": "examples/zips/optimizing_cpp-parsed-data.zip",
         "sizeBytes": 2435027
       }
     },
@@ -77,11 +77,11 @@
       "id": "simivalleybehavioralhealth_sr_20180403",
       "name": "SimiValleyBehavioralHealth_SR_20180403.pdf",
       "pdf": {
-        "path": "/examples/pdfs/SimiValleyBehavioralHealth_SR_20180403.pdf",
+        "path": "examples/pdfs/SimiValleyBehavioralHealth_SR_20180403.pdf",
         "sizeBytes": 916550
       },
       "parsedZip": {
-        "path": "/examples/zips/SimiValleyBehavioralHealth_SR_20180403-parsed-data.zip",
+        "path": "examples/zips/SimiValleyBehavioralHealth_SR_20180403-parsed-data.zip",
         "sizeBytes": 1189347
       }
     },
@@ -89,11 +89,11 @@
       "id": "thesis",
       "name": "thesis.pdf",
       "pdf": {
-        "path": "/examples/pdfs/thesis.pdf",
+        "path": "examples/pdfs/thesis.pdf",
         "sizeBytes": 2833537
       },
       "parsedZip": {
-        "path": "/examples/zips/thesis-parsed-data.zip",
+        "path": "examples/zips/thesis-parsed-data.zip",
         "sizeBytes": 2486937
       }
     }
