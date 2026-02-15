@@ -11,9 +11,9 @@ It has since evolved beyond a floorplan-only proof of concept into a broader PDF
 ## Demo
 - <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer>
 
-<video src="./demo/demo.mp4" controls muted loop playsinline></video>
+![Demo GIF](./demo/demo.gif)
 
-- [`demo/demo.mp4`](demo/demo.mp4)
+- [`demo/demo.gif`](demo/demo.gif)
 - <https://youtu.be/HDMntIG-1e4>
 
 ## Current Feature Set
