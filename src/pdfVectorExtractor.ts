@@ -21,6 +21,7 @@ type RgbColor = [number, number, number];
 interface GraphicsState {
   matrix: Mat2D;
   lineWidth: number;
+  lineCap: number;
   strokeR: number;
   strokeG: number;
   strokeB: number;
@@ -183,20 +184,22 @@ const FILL_PRIMITIVE_LINE = 0;
 const FILL_PRIMITIVE_QUADRATIC = 1;
 const FILL_CUBIC_TO_QUAD_ERROR = 0.08;
 const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
+const STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
+const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
 const STROKE_STYLE_FLAG_OFFSET = 2;
 const PAGE_GRID_GAP_FACTOR = 0.08;
 const PAGE_GRID_MIN_GAP = 24;
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   const normalizedAlpha = clamp01(alpha);
-  const normalizedFlags = styleFlags >= 0.5 ? STROKE_STYLE_FLAG_OFFSET : 0;
-  return normalizedAlpha + normalizedFlags;
+  const normalizedFlags = Math.max(0, Math.trunc(styleFlags + 1e-6));
+  return normalizedAlpha + normalizedFlags * STROKE_STYLE_FLAG_OFFSET;
 }
 
 function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: number } {
-  const hasFlags = encoded >= STROKE_STYLE_FLAG_OFFSET - 1e-6;
-  const alpha = clamp01(hasFlags ? encoded - STROKE_STYLE_FLAG_OFFSET : encoded);
-  return { alpha, styleFlags: hasFlags ? 1 : 0 };
+  const flags = Math.max(0, Math.trunc(encoded / STROKE_STYLE_FLAG_OFFSET + 1e-6));
+  const alpha = clamp01(encoded - flags * STROKE_STYLE_FLAG_OFFSET);
+  return { alpha, styleFlags: flags };
 }
 
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
@@ -453,6 +456,12 @@ async function extractSinglePageVectors(
       continue;
     }
 
+    if (fn === OPS.setLineCap) {
+      const nextCap = Math.trunc(readNumber(args, 0, currentState.lineCap));
+      currentState.lineCap = Math.min(2, Math.max(0, nextCap));
+      continue;
+    }
+
     if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeColor) {
       const [r, g, b] = parseColorFromOperatorArgs(args, [currentState.strokeR, currentState.strokeG, currentState.strokeB]);
       currentState.strokeR = r;
@@ -531,6 +540,13 @@ async function extractSinglePageVectors(
       const strokeWidth = isHairlineStroke ? 0 : currentState.lineWidth * widthScale;
       const halfWidth = Math.max(0, strokeWidth * 0.5);
       maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
+      let styleFlags = 0;
+      if (isHairlineStroke) {
+        styleFlags |= STROKE_STYLE_FLAG_HAIRLINE;
+      }
+      if (currentState.lineCap === 1) {
+        styleFlags |= STROKE_STYLE_FLAG_ROUND_CAP;
+      }
 
       const styleR = clamp01(currentState.strokeR);
       const styleG = clamp01(currentState.strokeG);
@@ -544,7 +560,7 @@ async function extractSinglePageVectors(
         styleG,
         styleB,
         styleAlpha,
-        isHairlineStroke ? 1 : 0,
+        styleFlags,
         options.enableSegmentMerge,
         endpointBuilder,
         primitiveMetaBuilder,
@@ -1186,6 +1202,7 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsSta
   return {
     matrix: [...initialMatrix],
     lineWidth: 1,
+    lineCap: 0,
     strokeR: 0,
     strokeG: 0,
     strokeB: 0,
@@ -1305,6 +1322,7 @@ function cloneState(state: GraphicsState): GraphicsState {
   return {
     matrix: [...state.matrix],
     lineWidth: state.lineWidth,
+    lineCap: state.lineCap,
     strokeR: state.strokeR,
     strokeG: state.strokeG,
     strokeB: state.strokeB,
@@ -1632,6 +1650,14 @@ function applyGraphicsStateEntries(rawEntries: unknown, state: GraphicsState): v
       if (Number.isFinite(lineWidth)) {
         state.lineWidth = Math.max(0, lineWidth);
       }
+      continue;
+    }
+
+    if (key === "LC") {
+      const lineCap = Number(value);
+      if (Number.isFinite(lineCap)) {
+        state.lineCap = Math.min(2, Math.max(0, Math.trunc(lineCap)));
+      }
     }
   }
 }
@@ -1751,7 +1777,15 @@ function emitSegmentsFromPath(
   const emitLine = (x0: number, y0: number, x1: number, y1: number, allowMerge: boolean): void => {
     const dx = x1 - x0;
     const dy = y1 - y0;
-    if (dx * dx + dy * dy < 1e-10) {
+    const lengthSq = dx * dx + dy * dy;
+    if (lengthSq < 1e-10) {
+      // Round-cap zero-length strokes are rendered as point dots in PDFs.
+      if ((styleFlags & STROKE_STYLE_FLAG_ROUND_CAP) === 0) {
+        return;
+      }
+      sourceSegmentCount += 1;
+      flushPending();
+      emitPrimitive(x0, y0, x1, y1, x1, y1, STROKE_PRIMITIVE_LINE);
       return;
     }
 
@@ -2127,8 +2161,13 @@ function cullInvisibleSegments(
       ? Math.hypot(cx - x0, cy - y0) + Math.hypot(x1 - cx, y1 - cy)
       : Math.hypot(x1 - x0, y1 - y0);
     if (curveLength < 1e-5) {
-      discardedDegenerateCount += 1;
-      continue;
+      const isRoundCapPoint = !isQuadratic && (styleFlags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0;
+      const isHairline = (styleFlags & STROKE_STYLE_FLAG_HAIRLINE) !== 0;
+      const hasVisibleRadius = isHairline || halfWidth > 1e-6;
+      if (!isRoundCapPoint || !hasVisibleRadius) {
+        discardedDegenerateCount += 1;
+        continue;
+      }
     }
 
     const duplicateKey = buildDuplicateKey(
@@ -2154,7 +2193,7 @@ function cullInvisibleSegments(
 
     keepMask[i] = 1;
 
-    if (!isQuadratic) {
+    if (!isQuadratic && curveLength >= 1e-5) {
       const coverage = buildCoverageCandidate(i, x0, y0, x1, y1, halfWidth, colorR, colorG, colorB, alpha, styleFlags);
       let bucket = coverageGroups.get(coverage.key);
       if (!bucket) {

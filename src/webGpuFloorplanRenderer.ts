@@ -187,14 +187,15 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   var halfWidth = style.x;
   let color = style.yzw;
   let packedStyle = primitiveB.w;
-  let styleFlags = select(0.0, 1.0, packedStyle >= 2.0);
-  let alpha = clamp(packedStyle - styleFlags * 2.0, 0.0, 1.0);
-  let isHairline = styleFlags >= 0.5;
+  let styleFlags = i32(floor(packedStyle / 2.0 + 1e-6));
+  let alpha = clamp(packedStyle - f32(styleFlags) * 2.0, 0.0, 1.0);
+  let isHairline = (styleFlags & 1) != 0;
+  let isRoundCap = (styleFlags & 2) != 0;
 
   let geometryLength = select(length(p2 - p0), length(p1 - p0) + length(p2 - p1), isQuadratic);
 
   var out : VsOut;
-  if (geometryLength < 1e-5 || alpha <= 0.001) {
+  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0, 0.0);
     out.p0 = vec2f(0.0, 0.0);

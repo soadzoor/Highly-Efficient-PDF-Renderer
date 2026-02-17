@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-02-15T10:04:52.271Z",
+  "generatedAt": "2026-02-17T09:21:18.060Z",
   "examples": [
     {
       "id": "dublin_1st_floor_2018_06_01",
@@ -83,6 +83,18 @@
       "parsedZip": {
         "path": "examples/zips/SimiValleyBehavioralHealth_SR_20180403-parsed-data.zip",
         "sizeBytes": 1189347
+      }
+    },
+    {
+      "id": "stn_arch_kp_ontario_177920237_detached",
+      "name": "stn_arch_kp-ontario_177920237_detached.pdf",
+      "pdf": {
+        "path": "examples/pdfs/stn_arch_kp-ontario_177920237_detached.pdf",
+        "sizeBytes": 18277813
+      },
+      "parsedZip": {
+        "path": "examples/zips/stn_arch_kp-ontario_177920237_detached-parsed-data.zip",
+        "sizeBytes": 27535327
       }
     },
     {

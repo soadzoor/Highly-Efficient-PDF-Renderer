@@ -50,15 +50,16 @@ void main() {
   float halfWidth = style.x;
   vec3 color = style.yzw;
   float packedStyle = primitiveB.w;
-  float styleFlags = packedStyle >= 2.0 ? 1.0 : 0.0;
+  float styleFlags = floor(packedStyle / 2.0 + 1e-6);
   float alpha = packedStyle - styleFlags * 2.0;
-  bool isHairline = styleFlags >= 0.5;
+  bool isHairline = mod(styleFlags, 2.0) >= 0.5;
+  bool isRoundCap = mod(floor(styleFlags * 0.5), 2.0) >= 0.5;
 
   float geometryLength = isQuadratic
     ? length(p1 - p0) + length(p2 - p1)
     : length(p2 - p0);
 
-  if (geometryLength < 1e-5 || alpha <= 0.001) {
+  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vLocal = vec2(0.0);
     vP0 = vec2(0.0);
