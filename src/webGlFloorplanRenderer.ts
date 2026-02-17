@@ -1681,8 +1681,9 @@ export class WebGlFloorplanRenderer {
     this.hasCameraInteractionSinceSceneLoad = true;
     this.markInteraction();
     this.hasZoomAnchor = false;
-    const worldDeltaX = -deltaX / this.zoom;
-    const worldDeltaY = deltaY / this.zoom;
+    const dpr = window.devicePixelRatio || 1;
+    const worldDeltaX = -(deltaX * dpr) / this.zoom;
+    const worldDeltaY = (deltaY * dpr) / this.zoom;
 
     // While dragging, camera should follow pointer immediately.
     this.cameraCenterX += worldDeltaX;
