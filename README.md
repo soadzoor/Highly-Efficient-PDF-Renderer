@@ -2,12 +2,6 @@
 
 GPU-first PDF renderer for large technical documents, floorplans, and general mixed-content PDFs.
 
-The project started from vector-texture ideas inspired by:
-- <https://wdobbie.com/post/gpu-text-rendering-with-vector-textures/>
-- <https://wdobbie.com/post/war-and-peace-and-webgl/>
-
-It has since evolved beyond a floorplan-only proof of concept into a broader PDF renderer with multi-page layout, vector + raster support, parsed-data export/import, and both WebGL and WebGPU backends.
-
 ## Demo
 - <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer>
 
@@ -15,6 +9,13 @@ It has since evolved beyond a floorplan-only proof of concept into a broader PDF
 
 - [`demo/demo.gif`](demo/demo.gif)
 - <https://youtu.be/HDMntIG-1e4>
+
+
+The project started from vector-texture ideas inspired by:
+- <https://wdobbie.com/post/gpu-text-rendering-with-vector-textures/>
+- <https://wdobbie.com/post/war-and-peace-and-webgl/>
+
+It has since evolved beyond a floorplan-only proof of concept into a broader PDF renderer with multi-page layout, vector + raster support, parsed-data export/import, and both WebGL and WebGPU backends.
 
 ## Current Feature Set
 
