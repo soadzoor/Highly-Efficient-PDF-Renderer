@@ -2067,7 +2067,6 @@ export class WebGpuFloorplanRenderer {
   zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void {
     const clampedFactor = clamp(zoomFactor, 0.1, 10);
     this.hasCameraInteractionSinceSceneLoad = true;
-    this.isPanInteracting = false;
     this.markInteraction();
     const anchorWorld = this.clientToWorld(clientX, clientY);
     const nextZoom = clamp(this.targetZoom * clampedFactor, this.minZoom, this.maxZoom);
@@ -2087,7 +2086,6 @@ export class WebGpuFloorplanRenderer {
     this.targetCameraCenterX = targetCenter.x;
     this.targetCameraCenterY = targetCenter.y;
 
-    this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.panVelocityWorldX = 0;
     this.panVelocityWorldY = 0;
