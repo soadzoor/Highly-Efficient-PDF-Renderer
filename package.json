@@ -1,19 +1,46 @@
 {
-  "name": "pdf-render-on-gpu",
-  "private": true,
+  "name": "hepr",
   "version": "0.1.0",
   "type": "module",
+  "main": "./dist/lib/index.js",
+  "module": "./dist/lib/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/lib/index.js",
+      "default": "./dist/lib/index.js"
+    },
+    "./three": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/lib/index.js",
+      "default": "./dist/lib/index.js"
+    }
+  },
+  "files": [
+    "dist/lib",
+    "dist/types",
+    "README.md"
+  ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run build:app",
+    "build:app": "tsc && vite build",
+    "build:lib": "tsc -p tsconfig.lib.json && vite build --mode lib",
+    "build:all": "npm run build:app && npm run build:lib",
     "preview": "vite preview",
     "examples:generate": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-example-assets.ts"
+  },
+  "peerDependencies": {
+    "three": ">=0.170.0"
   },
   "dependencies": {
     "jszip": "3.10.1",
     "pdfjs-dist": "5.4.624"
   },
   "devDependencies": {
+    "@types/three": "^0.183.0",
+    "three": "0.179.1",
     "typescript": "5.9.3",
     "vite": "7.3.1"
   }

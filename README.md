@@ -2,8 +2,11 @@
 
 GPU-first PDF renderer for large technical documents, floorplans, and general mixed-content PDFs.
 
+This repo now also exposes an npm package API (`hepr`) with a native-renderer-backed three.js wrapper.
+
 ## Demo
 - <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer>
+- Local three.js wrapper demo: `three-example.html`
 
 ![Demo GIF](./demo/demo.gif)
 
@@ -48,6 +51,47 @@ It has since evolved beyond a floorplan-only proof of concept into a broader PDF
   - FPS + parse/upload timing
   - segment/fill/text counts
   - texture usage and cull stats
+
+## npm Package API (`hepr`)
+
+Use the package API to load a PDF/parsed ZIP and get a `THREE.Group` that is rendered by the native HEPR renderer internally.
+
+```ts
+import * as THREE from "three";
+import { pdfObjectGenerator } from "hepr";
+
+const source = fileOrPathOrBase64ToPdfOrZip;
+
+const pdfObject = await pdfObjectGenerator(
+  source,
+  {
+    segmentMerge: true,
+    invisibleCull: true,
+    curveStrokes: true,
+    pageBackground: 0xffffff,
+    vectorOverrideColor: 0xff0000
+  },
+  "webgpu" // optional: "webgl" (default) | "webgpu"
+);
+
+const scene = new THREE.Scene();
+scene.add(pdfObject);
+
+// Optional: attach native HEPR controls (same pointer/wheel/touch logic as core app).
+pdfObject.attachControls(renderer.domElement);
+```
+
+Supported `source` inputs:
+- `File` / `Blob`
+- `Uint8Array` / `ArrayBuffer`
+- `string` path or URL to `.pdf` / `.zip`
+- base64 payload string (`PDF` or `ZIP`)
+- base64 data URL (`data:application/pdf;base64,...`)
+
+Notes:
+- The wrapper uses the same native core renderer classes (`WebGlFloorplanRenderer` / `WebGpuFloorplanRenderer`) internally.
+- For best parity with the core app camera behavior, use an orthographic camera in three.js.
+- You can call `pdfObject.fitToBounds()`, `pdfObject.getViewState()`, `pdfObject.setViewState(...)`, and `pdfObject.dispose()`.
 
 ## High-Level Architecture
 
@@ -110,6 +154,18 @@ npm run dev
 
 ```bash
 npm run build
+```
+
+### Build library artifacts
+
+```bash
+npm run build:lib
+```
+
+### Build app + library
+
+```bash
+npm run build:all
 ```
 
 ### Preview production build

@@ -911,6 +911,19 @@ const CLEAR_COLOR_R = 160 / 255;
 const CLEAR_COLOR_G = 169 / 255;
 const CLEAR_COLOR_B = 175 / 255;
 
+// Shared shader sources exposed for adapter integrations (Three/Babylon/native wrappers).
+export const CORE_STROKE_VERTEX_SHADER_SOURCE = VERTEX_SHADER_SOURCE;
+export const CORE_STROKE_FRAGMENT_SHADER_SOURCE = FRAGMENT_SHADER_SOURCE;
+export const CORE_FILL_VERTEX_SHADER_SOURCE = FILL_VERTEX_SHADER_SOURCE;
+export const CORE_FILL_FRAGMENT_SHADER_SOURCE = FILL_FRAGMENT_SHADER_SOURCE;
+export const CORE_TEXT_VERTEX_SHADER_SOURCE = TEXT_VERTEX_SHADER_SOURCE;
+export const CORE_TEXT_FRAGMENT_SHADER_SOURCE = TEXT_FRAGMENT_SHADER_SOURCE;
+export const CORE_BLIT_VERTEX_SHADER_SOURCE = BLIT_VERTEX_SHADER_SOURCE;
+export const CORE_BLIT_FRAGMENT_SHADER_SOURCE = BLIT_FRAGMENT_SHADER_SOURCE;
+export const CORE_VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE = VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE;
+export const CORE_RASTER_VERTEX_SHADER_SOURCE = RASTER_VERTEX_SHADER_SOURCE;
+export const CORE_RASTER_FRAGMENT_SHADER_SOURCE = RASTER_FRAGMENT_SHADER_SOURCE;
+
 export interface DrawStats {
   renderedSegments: number;
   totalSegments: number;
@@ -1209,6 +1222,12 @@ export class WebGlFloorplanRenderer {
   private rafHandle = 0;
 
   private frameListener: FrameListener | null = null;
+  private interactionViewportProvider: (() => DOMRect | DOMRectReadOnly | null) | null = null;
+  private externalFrameDriver = false;
+  private presentedCameraCenterX = 0;
+  private presentedCameraCenterY = 0;
+  private presentedZoom = 1;
+  private presentedFrameSerial = 0;
 
   private cameraCenterX = 0;
 
@@ -1285,6 +1304,14 @@ export class WebGlFloorplanRenderer {
   private vectorMinifyWarmupPending = false;
 
   private panOptimizationEnabled = true;
+
+  private rasterRenderingEnabled = true;
+
+  private fillRenderingEnabled = true;
+
+  private strokeRenderingEnabled = true;
+
+  private textRenderingEnabled = true;
 
   private strokeCurveEnabled = true;
 
@@ -1425,6 +1452,23 @@ export class WebGlFloorplanRenderer {
     this.frameListener = listener;
   }
 
+  setExternalFrameDriver(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.externalFrameDriver === nextEnabled) {
+      return;
+    }
+
+    this.externalFrameDriver = nextEnabled;
+    if (this.externalFrameDriver && this.rafHandle !== 0) {
+      cancelAnimationFrame(this.rafHandle);
+      this.rafHandle = 0;
+    }
+  }
+
+  renderExternalFrame(timestamp: number = performance.now()): void {
+    this.render(timestamp);
+  }
+
   setPanOptimizationEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.panOptimizationEnabled === nextEnabled) {
@@ -1449,6 +1493,50 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.strokeCurveEnabled = nextEnabled;
+    this.requestFrame();
+  }
+
+  setRasterRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.rasterRenderingEnabled === nextEnabled) {
+      return;
+    }
+    this.rasterRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setStrokeRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.strokeRenderingEnabled === nextEnabled) {
+      return;
+    }
+    this.strokeRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setFillRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.fillRenderingEnabled === nextEnabled) {
+      return;
+    }
+    this.fillRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setTextRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.textRenderingEnabled === nextEnabled) {
+      return;
+    }
+    this.textRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
 
@@ -1507,6 +1595,12 @@ export class WebGlFloorplanRenderer {
     this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
     this.requestFrame();
+  }
+
+  setInteractionViewportProvider(
+    provider: (() => DOMRect | DOMRectReadOnly | null) | null
+  ): void {
+    this.interactionViewportProvider = provider;
   }
 
   beginPanInteraction(): void {
@@ -1660,6 +1754,18 @@ export class WebGlFloorplanRenderer {
     };
   }
 
+  getPresentedViewState(): ViewState {
+    return {
+      cameraCenterX: this.presentedCameraCenterX,
+      cameraCenterY: this.presentedCameraCenterY,
+      zoom: this.presentedZoom
+    };
+  }
+
+  getPresentedFrameSerial(): number {
+    return this.presentedFrameSerial;
+  }
+
   setViewState(viewState: ViewState): void {
     const nextCenterX = Number(viewState.cameraCenterX);
     const nextCenterY = Number(viewState.cameraCenterY);
@@ -1679,6 +1785,9 @@ export class WebGlFloorplanRenderer {
     this.hasZoomAnchor = false;
     this.isPanInteracting = false;
     this.panCacheValid = false;
+    this.presentedCameraCenterX = this.cameraCenterX;
+    this.presentedCameraCenterY = this.cameraCenterY;
+    this.presentedZoom = this.zoom;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -1690,7 +1799,9 @@ export class WebGlFloorplanRenderer {
     const viewWidth = Math.max(1, this.canvas.width - paddingPixels * 2);
     const viewHeight = Math.max(1, this.canvas.height - paddingPixels * 2);
 
-    const nextZoom = clamp(Math.min(viewWidth / width, viewHeight / height), this.minZoom, this.maxZoom);
+    const fitZoom = Math.min(viewWidth / width, viewHeight / height);
+    const nextZoom = clamp(fitZoom, 1e-8, this.maxZoom);
+    this.minZoom = Math.min(this.minZoom, nextZoom);
     const nextCenterX = (bounds.minX + bounds.maxX) * 0.5;
     const nextCenterY = (bounds.minY + bounds.maxY) * 0.5;
     this.zoom = nextZoom;
@@ -1704,6 +1815,9 @@ export class WebGlFloorplanRenderer {
     this.isPanInteracting = false;
 
     this.panCacheValid = false;
+    this.presentedCameraCenterX = this.cameraCenterX;
+    this.presentedCameraCenterY = this.cameraCenterY;
+    this.presentedZoom = this.zoom;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -1730,9 +1844,9 @@ export class WebGlFloorplanRenderer {
     this.hasCameraInteractionSinceSceneLoad = true;
     this.markInteraction();
     this.hasZoomAnchor = false;
-    const dpr = window.devicePixelRatio || 1;
-    const worldDeltaX = -(deltaX * dpr) / this.zoom;
-    const worldDeltaY = (deltaY * dpr) / this.zoom;
+    const pixelScale = this.resolveClientToPixelScale();
+    const worldDeltaX = -(deltaX * pixelScale.x) / this.zoom;
+    const worldDeltaY = (deltaY * pixelScale.y) / this.zoom;
 
     // While dragging, camera should follow pointer immediately.
     this.cameraCenterX += worldDeltaX;
@@ -1775,6 +1889,9 @@ export class WebGlFloorplanRenderer {
   }
 
   requestFrame(): void {
+    if (this.externalFrameDriver) {
+      return;
+    }
     if (this.rafHandle !== 0) {
       return;
     }
@@ -1802,6 +1919,7 @@ export class WebGlFloorplanRenderer {
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
+      this.capturePresentedFrameState();
 
       this.frameListener?.({
         renderedSegments: 0,
@@ -1820,10 +1938,18 @@ export class WebGlFloorplanRenderer {
     } else {
       this.renderDirectToScreen();
     }
+    this.capturePresentedFrameState();
 
     if (isCameraAnimating) {
       this.requestFrame();
     }
+  }
+
+  private capturePresentedFrameState(): void {
+    this.presentedCameraCenterX = this.cameraCenterX;
+    this.presentedCameraCenterY = this.cameraCenterY;
+    this.presentedZoom = this.zoom;
+    this.presentedFrameSerial += 1;
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
@@ -1875,7 +2001,9 @@ export class WebGlFloorplanRenderer {
       this.needsVisibleSetUpdate = false;
     }
 
-    this.drawRasterLayer(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    if (this.rasterRenderingEnabled) {
+      this.drawRasterLayer(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    }
     let instanceCount = 0;
     if (useVectorMinify) {
       instanceCount = this.renderVectorLayerIntoMinifyTarget(
@@ -1886,9 +2014,15 @@ export class WebGlFloorplanRenderer {
       );
       this.compositeVectorMinifyLayer();
     } else {
-      this.drawFilledPaths(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
-      instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
-      this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      if (this.fillRenderingEnabled) {
+        this.drawFilledPaths(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      }
+      if (this.strokeRenderingEnabled) {
+        instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      }
+      if (this.textRenderingEnabled) {
+        this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      }
     }
 
     this.frameListener?.({
@@ -1900,7 +2034,11 @@ export class WebGlFloorplanRenderer {
   }
 
   private hasVectorContent(): boolean {
-    return this.fillPathCount > 0 || this.segmentCount > 0 || this.textInstanceCount > 0;
+    return (
+      (this.fillRenderingEnabled && this.fillPathCount > 0) ||
+      (this.strokeRenderingEnabled && this.segmentCount > 0) ||
+      (this.textRenderingEnabled && this.textInstanceCount > 0)
+    );
   }
 
   private shouldUseVectorMinifyPath(): boolean {
@@ -1996,9 +2134,15 @@ export class WebGlFloorplanRenderer {
     // Offscreen vector layer needs straight-alpha color blending with correct alpha accumulation.
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-    this.drawFilledPaths(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
-    const instanceCount = this.drawVisibleSegments(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
-    this.drawTextInstances(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    if (this.fillRenderingEnabled) {
+      this.drawFilledPaths(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    }
+    const instanceCount = this.strokeRenderingEnabled
+      ? this.drawVisibleSegments(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom)
+      : 0;
+    if (this.textRenderingEnabled) {
+      this.drawTextInstances(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    }
 
     gl.bindTexture(gl.TEXTURE_2D, this.vectorMinifyTexture);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -2067,30 +2211,38 @@ export class WebGlFloorplanRenderer {
       gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
-      this.drawRasterLayer(
-        this.panCacheWidth,
-        this.panCacheHeight,
-        this.panCacheCenterX,
-        this.panCacheCenterY
-      );
-      this.drawFilledPaths(
-        this.panCacheWidth,
-        this.panCacheHeight,
-        this.panCacheCenterX,
-        this.panCacheCenterY
-      );
-      this.panCacheRenderedSegments = this.drawVisibleSegments(
-        this.panCacheWidth,
-        this.panCacheHeight,
-        this.panCacheCenterX,
-        this.panCacheCenterY
-      );
-      this.drawTextInstances(
-        this.panCacheWidth,
-        this.panCacheHeight,
-        this.panCacheCenterX,
-        this.panCacheCenterY
-      );
+      if (this.rasterRenderingEnabled) {
+        this.drawRasterLayer(
+          this.panCacheWidth,
+          this.panCacheHeight,
+          this.panCacheCenterX,
+          this.panCacheCenterY
+        );
+      }
+      if (this.fillRenderingEnabled) {
+        this.drawFilledPaths(
+          this.panCacheWidth,
+          this.panCacheHeight,
+          this.panCacheCenterX,
+          this.panCacheCenterY
+        );
+      }
+      this.panCacheRenderedSegments = this.strokeRenderingEnabled
+        ? this.drawVisibleSegments(
+          this.panCacheWidth,
+          this.panCacheHeight,
+          this.panCacheCenterX,
+          this.panCacheCenterY
+        )
+        : 0;
+      if (this.textRenderingEnabled) {
+        this.drawTextInstances(
+          this.panCacheWidth,
+          this.panCacheHeight,
+          this.panCacheCenterX,
+          this.panCacheCenterY
+        );
+      }
       this.panCacheUsedCulling = !this.usingAllSegments;
       this.panCacheValid = true;
 
@@ -3150,11 +3302,11 @@ export class WebGlFloorplanRenderer {
     cameraCenterY: number,
     zoom: number
   ): { x: number; y: number } {
-    const rect = this.canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
+    const rect = this.resolveInteractionViewportRect();
+    const pixelScale = this.resolveClientToPixelScale(rect);
 
-    const pixelX = (clientX - rect.left) * dpr;
-    const pixelY = (rect.bottom - clientY) * dpr;
+    const pixelX = (clientX - rect.left) * pixelScale.x;
+    const pixelY = (rect.bottom - clientY) * pixelScale.y;
 
     return {
       x: (pixelX - this.canvas.width * 0.5) / zoom + cameraCenterX,
@@ -3286,13 +3438,32 @@ export class WebGlFloorplanRenderer {
     worldY: number,
     zoom: number
   ): { x: number; y: number } {
-    const rect = this.canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const pixelX = (clientX - rect.left) * dpr;
-    const pixelY = (rect.bottom - clientY) * dpr;
+    const rect = this.resolveInteractionViewportRect();
+    const pixelScale = this.resolveClientToPixelScale(rect);
+    const pixelX = (clientX - rect.left) * pixelScale.x;
+    const pixelY = (rect.bottom - clientY) * pixelScale.y;
     return {
       x: worldX - (pixelX - this.canvas.width * 0.5) / zoom,
       y: worldY - (pixelY - this.canvas.height * 0.5) / zoom
+    };
+  }
+
+  private resolveInteractionViewportRect(): DOMRect | DOMRectReadOnly {
+    const providerRect = this.interactionViewportProvider?.();
+    if (providerRect) {
+      return providerRect;
+    }
+    return this.canvas.getBoundingClientRect();
+  }
+
+  private resolveClientToPixelScale(rectInput?: DOMRect | DOMRectReadOnly): { x: number; y: number } {
+    const rect = rectInput ?? this.resolveInteractionViewportRect();
+    const defaultScale = Math.max(window.devicePixelRatio || 1, 1e-6);
+    const scaleX = rect.width > 1e-6 ? this.canvas.width / rect.width : defaultScale;
+    const scaleY = rect.height > 1e-6 ? this.canvas.height / rect.height : defaultScale;
+    return {
+      x: Math.max(1e-6, scaleX),
+      y: Math.max(1e-6, scaleY)
     };
   }
 

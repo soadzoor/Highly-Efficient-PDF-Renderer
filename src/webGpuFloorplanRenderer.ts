@@ -1194,6 +1194,11 @@ export class WebGpuFloorplanRenderer {
   private grid: SpatialGrid | null = null;
 
   private frameListener: FrameListener | null = null;
+  private interactionViewportProvider: (() => DOMRect | DOMRectReadOnly | null) | null = null;
+  private presentedCameraCenterX = 0;
+  private presentedCameraCenterY = 0;
+  private presentedZoom = 1;
+  private presentedFrameSerial = 0;
 
   private rafHandle = 0;
 
@@ -1238,6 +1243,14 @@ export class WebGpuFloorplanRenderer {
   private maxZoom = 8_192;
 
   private strokeCurveEnabled = true;
+
+  private rasterRenderingEnabled = true;
+
+  private fillRenderingEnabled = true;
+
+  private strokeRenderingEnabled = true;
+
+  private textRenderingEnabled = true;
 
   private textVectorOnly = false;
 
@@ -1654,6 +1667,54 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
+  setRasterRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.rasterRenderingEnabled === nextEnabled) {
+      return;
+    }
+
+    this.rasterRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setFillRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.fillRenderingEnabled === nextEnabled) {
+      return;
+    }
+
+    this.fillRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setStrokeRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.strokeRenderingEnabled === nextEnabled) {
+      return;
+    }
+
+    this.strokeRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setTextRenderingEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.textRenderingEnabled === nextEnabled) {
+      return;
+    }
+
+    this.textRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   setTextVectorOnly(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.textVectorOnly === nextEnabled) {
@@ -1710,6 +1771,12 @@ export class WebGpuFloorplanRenderer {
     this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
     this.requestFrame();
+  }
+
+  setInteractionViewportProvider(
+    provider: (() => DOMRect | DOMRectReadOnly | null) | null
+  ): void {
+    this.interactionViewportProvider = provider;
   }
 
   beginPanInteraction(): void {
@@ -2045,6 +2112,18 @@ export class WebGpuFloorplanRenderer {
     };
   }
 
+  getPresentedViewState(): ViewState {
+    return {
+      cameraCenterX: this.presentedCameraCenterX,
+      cameraCenterY: this.presentedCameraCenterY,
+      zoom: this.presentedZoom
+    };
+  }
+
+  getPresentedFrameSerial(): number {
+    return this.presentedFrameSerial;
+  }
+
   setViewState(viewState: ViewState): void {
     const nextCenterX = Number(viewState.cameraCenterX);
     const nextCenterY = Number(viewState.cameraCenterY);
@@ -2064,6 +2143,9 @@ export class WebGpuFloorplanRenderer {
     this.hasZoomAnchor = false;
     this.isPanInteracting = false;
     this.panCacheValid = false;
+    this.presentedCameraCenterX = this.cameraCenterX;
+    this.presentedCameraCenterY = this.cameraCenterY;
+    this.presentedZoom = this.zoom;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2075,7 +2157,9 @@ export class WebGpuFloorplanRenderer {
     const viewWidth = Math.max(1, this.canvas.width - paddingPixels * 2);
     const viewHeight = Math.max(1, this.canvas.height - paddingPixels * 2);
 
-    const nextZoom = clamp(Math.min(viewWidth / width, viewHeight / height), this.minZoom, this.maxZoom);
+    const fitZoom = Math.min(viewWidth / width, viewHeight / height);
+    const nextZoom = clamp(fitZoom, 1e-8, this.maxZoom);
+    this.minZoom = Math.min(this.minZoom, nextZoom);
     const nextCenterX = (bounds.minX + bounds.maxX) * 0.5;
     const nextCenterY = (bounds.minY + bounds.maxY) * 0.5;
     this.zoom = nextZoom;
@@ -2089,6 +2173,9 @@ export class WebGpuFloorplanRenderer {
     this.isPanInteracting = false;
 
     this.panCacheValid = false;
+    this.presentedCameraCenterX = this.cameraCenterX;
+    this.presentedCameraCenterY = this.cameraCenterY;
+    this.presentedZoom = this.zoom;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2101,9 +2188,9 @@ export class WebGpuFloorplanRenderer {
     this.hasCameraInteractionSinceSceneLoad = true;
     this.markInteraction();
     this.hasZoomAnchor = false;
-    const dpr = window.devicePixelRatio || 1;
-    const worldDeltaX = -(deltaX * dpr) / this.zoom;
-    const worldDeltaY = (deltaY * dpr) / this.zoom;
+    const pixelScale = this.resolveClientToPixelScale();
+    const worldDeltaX = -(deltaX * pixelScale.x) / this.zoom;
+    const worldDeltaY = (deltaY * pixelScale.y) / this.zoom;
 
     // While dragging, camera should follow pointer immediately.
     this.cameraCenterX += worldDeltaX;
@@ -2286,6 +2373,7 @@ export class WebGpuFloorplanRenderer {
         this.pageBackgroundResources.length === 0)
     ) {
       this.clearToScreen();
+      this.capturePresentedFrameState();
       this.frameListener?.({
         renderedSegments: 0,
         totalSegments: 0,
@@ -2303,10 +2391,18 @@ export class WebGpuFloorplanRenderer {
     } else {
       this.renderDirectToScreen();
     }
+    this.capturePresentedFrameState();
 
     if (isCameraAnimating) {
       this.requestFrame();
     }
+  }
+
+  private capturePresentedFrameState(): void {
+    this.presentedCameraCenterX = this.cameraCenterX;
+    this.presentedCameraCenterY = this.cameraCenterY;
+    this.presentedZoom = this.zoom;
+    this.presentedFrameSerial += 1;
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
@@ -2407,7 +2503,11 @@ export class WebGpuFloorplanRenderer {
   }
 
   private hasVectorContent(): boolean {
-    return this.fillPathCount > 0 || this.segmentCount > 0 || this.textInstanceCount > 0;
+    return (
+      (this.fillRenderingEnabled && this.fillPathCount > 0) ||
+      (this.strokeRenderingEnabled && this.segmentCount > 0) ||
+      (this.textRenderingEnabled && this.textInstanceCount > 0)
+    );
   }
 
   private shouldUseVectorMinifyPath(): boolean {
@@ -2556,6 +2656,10 @@ export class WebGpuFloorplanRenderer {
   }
 
   private drawRasterContentIntoPass(pass: any): void {
+    if (!this.rasterRenderingEnabled) {
+      return;
+    }
+
     if (this.pageBackgroundResources.length > 0) {
       pass.setPipeline(this.rasterPipeline);
       for (const layer of this.pageBackgroundResources) {
@@ -2574,13 +2678,15 @@ export class WebGpuFloorplanRenderer {
   }
 
   private drawVectorContentIntoPass(pass: any): number {
-    if (this.fillPathCount > 0 && this.fillBindGroup) {
+    if (this.fillRenderingEnabled && this.fillPathCount > 0 && this.fillBindGroup) {
       pass.setPipeline(this.fillPipeline);
       pass.setBindGroup(0, this.fillBindGroup);
       pass.draw(4, this.fillPathCount, 0, 0);
     }
 
-    let strokeInstanceCount = this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount;
+    let strokeInstanceCount = this.strokeRenderingEnabled
+      ? (this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount)
+      : 0;
     if (strokeInstanceCount > 0) {
       const strokeBindGroup = this.usingAllSegments ? this.strokeBindGroupAll : this.strokeBindGroupVisible;
       if (strokeBindGroup) {
@@ -2590,7 +2696,7 @@ export class WebGpuFloorplanRenderer {
       }
     }
 
-    if (this.textInstanceCount > 0 && this.textBindGroup) {
+    if (this.textRenderingEnabled && this.textInstanceCount > 0 && this.textBindGroup) {
       pass.setPipeline(this.textPipeline);
       pass.setBindGroup(0, this.textBindGroup);
       pass.draw(4, this.textInstanceCount, 0, 0);
@@ -3330,11 +3436,11 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number,
     zoom: number
   ): { x: number; y: number } {
-    const rect = this.canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
+    const rect = this.resolveInteractionViewportRect();
+    const pixelScale = this.resolveClientToPixelScale(rect);
 
-    const pixelX = (clientX - rect.left) * dpr;
-    const pixelY = (rect.bottom - clientY) * dpr;
+    const pixelX = (clientX - rect.left) * pixelScale.x;
+    const pixelY = (rect.bottom - clientY) * pixelScale.y;
 
     return {
       x: (pixelX - this.canvas.width * 0.5) / zoom + cameraCenterX,
@@ -3466,13 +3572,32 @@ export class WebGpuFloorplanRenderer {
     worldY: number,
     zoom: number
   ): { x: number; y: number } {
-    const rect = this.canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const pixelX = (clientX - rect.left) * dpr;
-    const pixelY = (rect.bottom - clientY) * dpr;
+    const rect = this.resolveInteractionViewportRect();
+    const pixelScale = this.resolveClientToPixelScale(rect);
+    const pixelX = (clientX - rect.left) * pixelScale.x;
+    const pixelY = (rect.bottom - clientY) * pixelScale.y;
     return {
       x: worldX - (pixelX - this.canvas.width * 0.5) / zoom,
       y: worldY - (pixelY - this.canvas.height * 0.5) / zoom
+    };
+  }
+
+  private resolveInteractionViewportRect(): DOMRect | DOMRectReadOnly {
+    const providerRect = this.interactionViewportProvider?.();
+    if (providerRect) {
+      return providerRect;
+    }
+    return this.canvas.getBoundingClientRect();
+  }
+
+  private resolveClientToPixelScale(rectInput?: DOMRect | DOMRectReadOnly): { x: number; y: number } {
+    const rect = rectInput ?? this.resolveInteractionViewportRect();
+    const defaultScale = Math.max(window.devicePixelRatio || 1, 1e-6);
+    const scaleX = rect.width > 1e-6 ? this.canvas.width / rect.width : defaultScale;
+    const scaleY = rect.height > 1e-6 ? this.canvas.height / rect.height : defaultScale;
+    return {
+      x: Math.max(1e-6, scaleX),
+      y: Math.max(1e-6, scaleY)
     };
   }
 }

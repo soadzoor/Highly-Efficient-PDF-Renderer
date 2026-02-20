@@ -7,15 +7,18 @@ type InteractionRenderer = Pick<
 
 export interface CanvasInteractionController {
   attach(targetCanvas: HTMLCanvasElement): void;
+  detach(): void;
   resetState(): void;
 }
 
 export function createCanvasInteractionController(
   getRenderer: () => InteractionRenderer
 ): CanvasInteractionController {
+  let attachedCanvas: HTMLCanvasElement | null = null;
   let isPanning = false;
   let previousX = 0;
   let previousY = 0;
+  const activePointerIds = new Set<number>();
   const activeTouchPointers = new Map<number, { x: number; y: number }>();
   let touchPanPointerId: number | null = null;
   let touchPinchActive = false;
@@ -27,6 +30,7 @@ export function createCanvasInteractionController(
     isPanning = false;
     previousX = 0;
     previousY = 0;
+    activePointerIds.clear();
     activeTouchPointers.clear();
     touchPanPointerId = null;
     touchPinchActive = false;
@@ -154,6 +158,7 @@ export function createCanvasInteractionController(
 
   function handleTouchPointerEnd(targetCanvas: HTMLCanvasElement, event: PointerEvent): void {
     activeTouchPointers.delete(event.pointerId);
+    activePointerIds.delete(event.pointerId);
     releasePointerCaptureIfHeld(targetCanvas, event.pointerId);
 
     if (activeTouchPointers.size >= 2) {
@@ -187,113 +192,165 @@ export function createCanvasInteractionController(
     resetPointerGestureState(true);
   }
 
-  function attach(targetCanvas: HTMLCanvasElement): void {
-    targetCanvas.addEventListener("pointerdown", (event) => {
-      if (!isPanning) {
-        isPanning = true;
-        getRenderer().beginPanInteraction();
-      }
+  const handlePointerDown = (event: PointerEvent): void => {
+    const targetCanvas = attachedCanvas;
+    if (!targetCanvas) {
+      return;
+    }
+    activePointerIds.add(event.pointerId);
 
-      if (event.pointerType === "touch") {
-        activeTouchPointers.set(event.pointerId, {
-          x: event.clientX,
-          y: event.clientY
-        });
+    if (!isPanning) {
+      isPanning = true;
+      getRenderer().beginPanInteraction();
+    }
 
-        if (activeTouchPointers.size === 1) {
-          touchPanPointerId = event.pointerId;
-          touchPinchActive = false;
-          touchPreviousDistance = 0;
-          touchPreviousCenterX = event.clientX;
-          touchPreviousCenterY = event.clientY;
-          previousX = event.clientX;
-          previousY = event.clientY;
-        } else {
-          const pinchInfo = getTouchPinchInfo();
-          if (pinchInfo) {
-            touchPinchActive = true;
-            touchPanPointerId = null;
-            touchPreviousDistance = Math.max(pinchInfo.distance, 1e-3);
-            touchPreviousCenterX = pinchInfo.centerX;
-            touchPreviousCenterY = pinchInfo.centerY;
-          }
-        }
-      } else {
+    if (event.pointerType === "touch") {
+      activeTouchPointers.set(event.pointerId, {
+        x: event.clientX,
+        y: event.clientY
+      });
+
+      if (activeTouchPointers.size === 1) {
+        touchPanPointerId = event.pointerId;
+        touchPinchActive = false;
+        touchPreviousDistance = 0;
+        touchPreviousCenterX = event.clientX;
+        touchPreviousCenterY = event.clientY;
         previousX = event.clientX;
         previousY = event.clientY;
+      } else {
+        const pinchInfo = getTouchPinchInfo();
+        if (pinchInfo) {
+          touchPinchActive = true;
+          touchPanPointerId = null;
+          touchPreviousDistance = Math.max(pinchInfo.distance, 1e-3);
+          touchPreviousCenterX = pinchInfo.centerX;
+          touchPreviousCenterY = pinchInfo.centerY;
+        }
       }
-
-      targetCanvas.setPointerCapture(event.pointerId);
-    });
-
-    targetCanvas.addEventListener("pointermove", (event) => {
-      if (event.pointerType === "touch") {
-        handleTouchPointerMove(event);
-        return;
-      }
-
-      if (!isPanning) {
-        return;
-      }
-
-      const deltaX = event.clientX - previousX;
-      const deltaY = event.clientY - previousY;
-
+    } else {
       previousX = event.clientX;
       previousY = event.clientY;
+    }
 
-      getRenderer().panByPixels(deltaX, deltaY);
-    });
+    targetCanvas.setPointerCapture(event.pointerId);
+  };
 
-    targetCanvas.addEventListener("pointerup", (event) => {
-      if (event.pointerType === "touch") {
-        handleTouchPointerEnd(targetCanvas, event);
-        return;
+  const handlePointerMove = (event: PointerEvent): void => {
+    if (event.pointerType === "touch") {
+      handleTouchPointerMove(event);
+      return;
+    }
+
+    if (!isPanning) {
+      return;
+    }
+
+    const deltaX = event.clientX - previousX;
+    const deltaY = event.clientY - previousY;
+
+    previousX = event.clientX;
+    previousY = event.clientY;
+
+    getRenderer().panByPixels(deltaX, deltaY);
+  };
+
+  const handlePointerUp = (event: PointerEvent): void => {
+    const targetCanvas = attachedCanvas;
+    if (!targetCanvas) {
+      return;
+    }
+
+    if (event.pointerType === "touch") {
+      handleTouchPointerEnd(targetCanvas, event);
+      return;
+    }
+
+    activePointerIds.delete(event.pointerId);
+    resetPointerGestureState(true);
+    releasePointerCaptureIfHeld(targetCanvas, event.pointerId);
+  };
+
+  const handlePointerCancel = (event: PointerEvent): void => {
+    const targetCanvas = attachedCanvas;
+    if (!targetCanvas) {
+      return;
+    }
+
+    if (event.pointerType === "touch") {
+      handleTouchPointerEnd(targetCanvas, event);
+      return;
+    }
+
+    activePointerIds.delete(event.pointerId);
+    resetPointerGestureState(true);
+    releasePointerCaptureIfHeld(targetCanvas, event.pointerId);
+  };
+
+  const handleLostPointerCapture = (event: PointerEvent): void => {
+    activePointerIds.delete(event.pointerId);
+    if (event.pointerType === "touch") {
+      if (activeTouchPointers.has(event.pointerId)) {
+        activeTouchPointers.delete(event.pointerId);
       }
-
-      resetPointerGestureState(true);
-      releasePointerCaptureIfHeld(targetCanvas, event.pointerId);
-    });
-
-    targetCanvas.addEventListener("pointercancel", (event) => {
-      if (event.pointerType === "touch") {
-        handleTouchPointerEnd(targetCanvas, event);
-        return;
-      }
-
-      resetPointerGestureState(true);
-      releasePointerCaptureIfHeld(targetCanvas, event.pointerId);
-    });
-
-    targetCanvas.addEventListener("lostpointercapture", (event) => {
-      if (event.pointerType === "touch") {
-        if (activeTouchPointers.has(event.pointerId)) {
-          activeTouchPointers.delete(event.pointerId);
-        }
-        if (activeTouchPointers.size === 0) {
-          resetPointerGestureState(true);
-        }
-        return;
-      }
-
-      if (isPanning) {
+      if (activeTouchPointers.size === 0) {
         resetPointerGestureState(true);
       }
-    });
+      return;
+    }
 
-    targetCanvas.addEventListener(
-      "wheel",
-      (event) => {
-        event.preventDefault();
-        const zoomFactor = Math.exp(-event.deltaY * 0.0013);
-        getRenderer().zoomAtClientPoint(event.clientX, event.clientY, zoomFactor);
-      },
-      { passive: false }
-    );
+    if (isPanning) {
+      resetPointerGestureState(true);
+    }
+  };
+
+  const handleWheel = (event: WheelEvent): void => {
+    event.preventDefault();
+    const zoomFactor = Math.exp(-event.deltaY * 0.0013);
+    getRenderer().zoomAtClientPoint(event.clientX, event.clientY, zoomFactor);
+  };
+
+  function attach(targetCanvas: HTMLCanvasElement): void {
+    if (attachedCanvas === targetCanvas) {
+      return;
+    }
+
+    if (attachedCanvas) {
+      detach();
+    }
+
+    attachedCanvas = targetCanvas;
+    targetCanvas.addEventListener("pointerdown", handlePointerDown);
+    targetCanvas.addEventListener("pointermove", handlePointerMove);
+    targetCanvas.addEventListener("pointerup", handlePointerUp);
+    targetCanvas.addEventListener("pointercancel", handlePointerCancel);
+    targetCanvas.addEventListener("lostpointercapture", handleLostPointerCapture);
+    targetCanvas.addEventListener("wheel", handleWheel, { passive: false });
+  }
+
+  function detach(): void {
+    const targetCanvas = attachedCanvas;
+    if (!targetCanvas) {
+      return;
+    }
+
+    for (const pointerId of activePointerIds) {
+      releasePointerCaptureIfHeld(targetCanvas, pointerId);
+    }
+    targetCanvas.removeEventListener("pointerdown", handlePointerDown);
+    targetCanvas.removeEventListener("pointermove", handlePointerMove);
+    targetCanvas.removeEventListener("pointerup", handlePointerUp);
+    targetCanvas.removeEventListener("pointercancel", handlePointerCancel);
+    targetCanvas.removeEventListener("lostpointercapture", handleLostPointerCapture);
+    targetCanvas.removeEventListener("wheel", handleWheel);
+
+    attachedCanvas = null;
+    resetPointerGestureState(true);
   }
 
   return {
     attach,
+    detach,
     resetState
   };
 }
