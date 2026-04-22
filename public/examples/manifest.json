@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-02-17T09:21:18.060Z",
+  "generatedAt": "2026-04-22T15:54:53.524Z",
   "examples": [
     {
       "id": "dublin_1st_floor_2018_06_01",
@@ -107,6 +107,18 @@
       "parsedZip": {
         "path": "examples/zips/thesis-parsed-data.zip",
         "sizeBytes": 2486937
+      }
+    },
+    {
+      "id": "warandpeace",
+      "name": "WarAndPeace.pdf",
+      "pdf": {
+        "path": "examples/pdfs/WarAndPeace.pdf",
+        "sizeBytes": 6964852
+      },
+      "parsedZip": {
+        "path": "examples/zips/WarAndPeace-parsed-data.zip",
+        "sizeBytes": 41432623
       }
     }
   ]

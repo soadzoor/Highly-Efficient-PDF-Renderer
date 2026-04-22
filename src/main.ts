@@ -8,6 +8,7 @@ import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import {
   composeVectorScenesInGrid,
   extractPdfPageScenes,
+  type Bounds,
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
@@ -653,7 +654,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
     if (!options.preserveView) {
-      renderer.fitToBounds(scene.bounds, 64);
+      renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
 
@@ -729,7 +730,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
     if (!options.preserveView) {
-      renderer.fitToBounds(scene.bounds, 64);
+      renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
 
@@ -834,6 +835,55 @@ function formatSceneStatus(
   const rasterSummary = formatRasterLayerSummary(scene);
   const rasterSuffix = rasterSummary ? `, raster ${rasterSummary}` : "";
   return `${label} loaded | ${pagePrefix}fills ${fillPathCount}, ${visibleSegmentCount} visible from ${sourceSegmentCount} source segments, ${textInstanceCount} text instances${rasterSuffix}`;
+}
+
+function resolveSceneFitBounds(scene: VectorScene): Bounds {
+  if (scene.pageRects instanceof Float32Array && scene.pageRects.length >= 4) {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (let i = 0; i + 3 < scene.pageRects.length; i += 4) {
+      const x0 = scene.pageRects[i];
+      const y0 = scene.pageRects[i + 1];
+      const x1 = scene.pageRects[i + 2];
+      const y1 = scene.pageRects[i + 3];
+      if (!Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(x1) || !Number.isFinite(y1)) {
+        continue;
+      }
+
+      minX = Math.min(minX, x0, x1);
+      minY = Math.min(minY, y0, y1);
+      maxX = Math.max(maxX, x0, x1);
+      maxY = Math.max(maxY, y0, y1);
+    }
+
+    if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxX) && Number.isFinite(maxY)) {
+      return { minX, minY, maxX, maxY };
+    }
+  }
+
+  if (
+    Number.isFinite(scene.pageBounds.minX) &&
+    Number.isFinite(scene.pageBounds.minY) &&
+    Number.isFinite(scene.pageBounds.maxX) &&
+    Number.isFinite(scene.pageBounds.maxY)
+  ) {
+    return {
+      minX: scene.pageBounds.minX,
+      minY: scene.pageBounds.minY,
+      maxX: scene.pageBounds.maxX,
+      maxY: scene.pageBounds.maxY
+    };
+  }
+
+  return {
+    minX: scene.bounds.minX,
+    minY: scene.bounds.minY,
+    maxX: scene.bounds.maxX,
+    maxY: scene.bounds.maxY
+  };
 }
 
 function setStatus(message: string): void {

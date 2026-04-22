@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HEPR Three.js Example</title>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: #11161d;
+        color: #e8edf5;
+      }
+
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+
+      #viewport {
+        width: 100%;
+        height: 100%;
+        display: block;
+        touch-action: none;
+        cursor: grab;
+      }
+
+      #viewport:active {
+        cursor: grabbing;
+      }
+
+      #panel {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        width: min(620px, calc(100vw - 32px));
+        background: rgba(13, 18, 26, 0.9);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 10px;
+        padding: 12px;
+        box-sizing: border-box;
+        backdrop-filter: blur(8px);
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .row:last-child {
+        margin-bottom: 0;
+      }
+
+      input[type="text"],
+      select,
+      button,
+      input[type="file"] {
+        font: inherit;
+      }
+
+      input[type="text"] {
+        flex: 1;
+        background: #0a0f16;
+        color: #e8edf5;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 7px 10px;
+        min-width: 0;
+      }
+
+      select,
+      button {
+        background: #162030;
+        color: #e8edf5;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 7px 10px;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+
+      #status {
+        font-size: 13px;
+        opacity: 0.92;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="viewport"></canvas>
+    </div>
+
+    <div id="panel" role="group" aria-label="Three.js HEPR controls">
+      <div class="row">
+        <input
+          id="source-input"
+          type="text"
+          placeholder="PDF/ZIP path, URL, or base64"
+          aria-label="PDF or ZIP path/URL/base64"
+        />
+        <button id="load-source" type="button">Load Source</button>
+      </div>
+      <div class="row">
+        <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
+          <option value="">Examples (loading...)</option>
+        </select>
+        <select id="backend-select" aria-label="Renderer backend">
+          <option value="webgl" selected>WebGL</option>
+          <option value="webgpu">WebGPU</option>
+        </select>
+      </div>
+      <div class="row">
+        <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" />
+      </div>
+      <div id="status" class="row">Waiting for PDF or parsed ZIP source.</div>
+    </div>
+
+    <script type="module" src="/src/three-example.ts"></script>
+  </body>
+</html>

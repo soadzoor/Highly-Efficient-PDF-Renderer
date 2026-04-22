@@ -13,3 +13,4 @@ package-lock.json
 *package-lock.json
 *tsconfig.tsbuildinfo
 **/dist/**/*
+.codex

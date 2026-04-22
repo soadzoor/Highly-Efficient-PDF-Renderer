@@ -5,9 +5,10 @@ const pdfJsModule = (
 ) as {
   getDocument: typeof import("pdfjs-dist").getDocument;
   OPS: typeof import("pdfjs-dist").OPS;
+  VerbosityLevel: typeof import("pdfjs-dist").VerbosityLevel;
 };
 
-const { getDocument, OPS } = pdfJsModule;
+const { getDocument, OPS, VerbosityLevel } = pdfJsModule;
 
 const DRAW_MOVE_TO = 0;
 const DRAW_LINE_TO = 1;
@@ -189,6 +190,7 @@ const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
 const STROKE_STYLE_FLAG_OFFSET = 2;
 const PAGE_GRID_GAP_FACTOR = 0.08;
 const PAGE_GRID_MIN_GAP = 24;
+const PDFJS_VERBOSITY_ERRORS = VerbosityLevel?.ERRORS ?? 0;
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   const normalizedAlpha = clamp01(alpha);
@@ -220,6 +222,7 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     data: new Uint8Array(pdfData),
     disableFontFace: true,
     fontExtraProperties: true,
+    verbosity: PDFJS_VERBOSITY_ERRORS,
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;
@@ -265,6 +268,7 @@ export async function extractPdfRasterPageScenes(
     data: new Uint8Array(pdfData),
     disableFontFace: true,
     fontExtraProperties: true,
+    verbosity: PDFJS_VERBOSITY_ERRORS,
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;

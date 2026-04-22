@@ -5,11 +5,22 @@ export type RendererBackend = "webgl" | "webgpu";
 
 export interface RendererApi {
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
+  setExternalFrameDriver?(enabled: boolean): void;
+  renderExternalFrame?(timestamp?: number): void;
+  setRasterRenderingEnabled?(enabled: boolean): void;
+  setFillRenderingEnabled?(enabled: boolean): void;
+  setStrokeRenderingEnabled?(enabled: boolean): void;
+  setTextRenderingEnabled?(enabled: boolean): void;
   setPanOptimizationEnabled(enabled: boolean): void;
   setStrokeCurveEnabled(enabled: boolean): void;
   setTextVectorOnly(enabled: boolean): void;
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void;
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void;
+  getPresentedViewState(): ViewState;
+  getPresentedFrameSerial(): number;
+  setInteractionViewportProvider(
+    provider: (() => DOMRect | DOMRectReadOnly | null) | null
+  ): void;
   beginPanInteraction(): void;
   endPanInteraction(): void;
   resize(): void;
