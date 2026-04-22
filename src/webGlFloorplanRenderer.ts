@@ -964,6 +964,11 @@ interface RasterLayerGpu {
   matrix: Float32Array;
 }
 
+interface InstanceRange {
+  start: number;
+  count: number;
+}
+
 export class WebGlFloorplanRenderer {
   private readonly canvas: HTMLCanvasElement;
 
@@ -1184,6 +1189,14 @@ export class WebGlFloorplanRenderer {
   private rasterLayers: RasterLayerGpu[] = [];
 
   private pageRects: Float32Array<ArrayBufferLike> = new Float32Array(0);
+
+  private pageTextRanges: Uint32Array<ArrayBufferLike> = new Uint32Array(0);
+
+  private visiblePageRectIndices: Uint32Array<ArrayBufferLike> = new Uint32Array(0);
+
+  private visiblePageRectCount = 0;
+
+  private visibleTextRanges: InstanceRange[] = [];
 
   private visibleSegmentCount = 0;
 
@@ -1664,6 +1677,12 @@ export class WebGlFloorplanRenderer {
     this.fillPathCount = scene.fillPathCount;
     this.textInstanceCount = scene.textInstanceCount;
     this.pageRects = normalizePageRects(scene);
+    this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
+    if (this.visiblePageRectIndices.length < Math.floor(this.pageRects.length / 4)) {
+      this.visiblePageRectIndices = new Uint32Array(Math.floor(this.pageRects.length / 4));
+    }
+    this.visiblePageRectCount = 0;
+    this.visibleTextRanges = [];
     this.buildSegmentBounds(scene);
     this.isPanInteracting = false;
     this.panCacheValid = false;
@@ -1729,6 +1748,7 @@ export class WebGlFloorplanRenderer {
 
     this.visibleSegmentCount = this.segmentCount;
     this.usingAllSegments = true;
+    this.setAllPagesAndTextVisible();
 
     this.minZoom = 0.01;
     this.maxZoom = 8_192;
@@ -2046,6 +2066,9 @@ export class WebGlFloorplanRenderer {
     if (this.textVectorOnly || !this.hasVectorContent()) {
       return false;
     }
+    if (this.textInstanceCount > 100_000 && this.segmentCount === 0) {
+      return false;
+    }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
   }
 
@@ -2280,16 +2303,17 @@ export class WebGlFloorplanRenderer {
     gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uRasterZoom, this.zoom);
 
-    if (this.pageRects.length > 0) {
+    if (this.pageRects.length > 0 && this.visiblePageRectCount > 0) {
       gl.activeTexture(gl.TEXTURE12);
       gl.bindTexture(gl.TEXTURE_2D, this.pageBackgroundTexture);
       gl.uniform1i(this.uRasterTex, 12);
 
-      for (let i = 0; i < this.pageRects.length; i += 4) {
-        const minX = this.pageRects[i];
-        const minY = this.pageRects[i + 1];
-        const maxX = this.pageRects[i + 2];
-        const maxY = this.pageRects[i + 3];
+      for (let i = 0; i < this.visiblePageRectCount; i += 1) {
+        const rectOffset = this.visiblePageRectIndices[i] * 4;
+        const minX = this.pageRects[rectOffset];
+        const minY = this.pageRects[rectOffset + 1];
+        const maxX = this.pageRects[rectOffset + 2];
+        const maxY = this.pageRects[rectOffset + 3];
         const width = Math.max(maxX - minX, 1e-6);
         const height = Math.max(maxY - minY, 1e-6);
         gl.uniform4f(this.uRasterMatrixABCD, width, 0, 0, height);
@@ -2436,11 +2460,17 @@ export class WebGlFloorplanRenderer {
     if (!this.scene || this.textInstanceCount <= 0) {
       return 0;
     }
+    if (this.visibleTextRanges.length === 0) {
+      return 0;
+    }
 
     const gl = this.gl;
 
     gl.useProgram(this.textProgram);
     gl.bindVertexArray(this.textVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.allTextInstanceIdBuffer);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribDivisor(2, 1);
 
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureA);
@@ -2488,8 +2518,16 @@ export class WebGlFloorplanRenderer {
       this.vectorOverrideOpacity
     );
 
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.textInstanceCount);
-    return this.textInstanceCount;
+    let renderedInstanceCount = 0;
+    for (const range of this.visibleTextRanges) {
+      if (range.count <= 0) {
+        continue;
+      }
+      gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 4, range.start * 4);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, range.count);
+      renderedInstanceCount += range.count;
+    }
+    return renderedInstanceCount;
   }
 
   private blitPanCache(offsetPxX: number, offsetPxY: number, sampleScale: number): void {
@@ -2625,19 +2663,20 @@ export class WebGlFloorplanRenderer {
     viewportHeightPx: number = this.canvas.height,
     zoomValue: number = this.zoom
   ): void {
-    if (!this.scene || !this.grid) {
+    if (!this.scene) {
       this.visibleSegmentCount = 0;
       this.usingAllSegments = true;
+      this.visiblePageRectCount = 0;
+      this.visibleTextRanges = [];
       return;
     }
 
     if (!this.hasCameraInteractionSinceSceneLoad) {
       this.usingAllSegments = true;
       this.visibleSegmentCount = this.segmentCount;
+      this.setAllPagesAndTextVisible();
       return;
     }
-
-    const grid = this.grid;
 
     const safeZoom = Math.max(zoomValue, 1e-6);
     const halfViewWidth = viewportWidthPx / (2 * safeZoom);
@@ -2649,6 +2688,16 @@ export class WebGlFloorplanRenderer {
     const viewMaxX = viewCenterX + halfViewWidth + margin;
     const viewMinY = viewCenterY - halfViewHeight - margin;
     const viewMaxY = viewCenterY + halfViewHeight + margin;
+
+    this.updateVisiblePagesAndTextRanges(viewMinX, viewMinY, viewMaxX, viewMaxY);
+
+    if (!this.grid) {
+      this.visibleSegmentCount = 0;
+      this.usingAllSegments = true;
+      return;
+    }
+
+    const grid = this.grid;
 
     const c0 = clampToGrid(Math.floor((viewMinX - grid.minX) / grid.cellWidth), grid.gridWidth);
     const c1 = clampToGrid(Math.floor((viewMaxX - grid.minX) / grid.cellWidth), grid.gridWidth);
@@ -2698,6 +2747,82 @@ export class WebGlFloorplanRenderer {
     const slice = this.visibleSegmentIds.subarray(0, outCount);
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.visibleSegmentIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
+  }
+
+  private setAllPagesAndTextVisible(): void {
+    const pageCount = Math.floor(this.pageRects.length / 4);
+    if (this.visiblePageRectIndices.length < pageCount) {
+      this.visiblePageRectIndices = new Uint32Array(pageCount);
+    }
+    for (let i = 0; i < pageCount; i += 1) {
+      this.visiblePageRectIndices[i] = i;
+    }
+    this.visiblePageRectCount = pageCount;
+    this.visibleTextRanges = this.textInstanceCount > 0
+      ? [{ start: 0, count: this.textInstanceCount }]
+      : [];
+  }
+
+  private updateVisiblePagesAndTextRanges(
+    viewMinX: number,
+    viewMinY: number,
+    viewMaxX: number,
+    viewMaxY: number
+  ): void {
+    const pageCount = Math.floor(this.pageRects.length / 4);
+    if (pageCount <= 0) {
+      this.visiblePageRectCount = 0;
+      this.visibleTextRanges = this.textInstanceCount > 0
+        ? [{ start: 0, count: this.textInstanceCount }]
+        : [];
+      return;
+    }
+
+    if (this.visiblePageRectIndices.length < pageCount) {
+      this.visiblePageRectIndices = new Uint32Array(pageCount);
+    }
+
+    const nextTextRanges: InstanceRange[] = [];
+    let visiblePageCount = 0;
+
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const offset = pageIndex * 4;
+      const minX = Math.min(this.pageRects[offset], this.pageRects[offset + 2]);
+      const minY = Math.min(this.pageRects[offset + 1], this.pageRects[offset + 3]);
+      const maxX = Math.max(this.pageRects[offset], this.pageRects[offset + 2]);
+      const maxY = Math.max(this.pageRects[offset + 1], this.pageRects[offset + 3]);
+      if (maxX < viewMinX || minX > viewMaxX || maxY < viewMinY || minY > viewMaxY) {
+        continue;
+      }
+
+      this.visiblePageRectIndices[visiblePageCount] = pageIndex;
+      visiblePageCount += 1;
+
+      const rangeOffset = pageIndex * 2;
+      const start = this.pageTextRanges[rangeOffset] ?? 0;
+      const count = this.pageTextRanges[rangeOffset + 1] ?? 0;
+      this.appendVisibleTextRange(nextTextRanges, start, count);
+    }
+
+    this.visiblePageRectCount = visiblePageCount;
+    this.visibleTextRanges = nextTextRanges;
+  }
+
+  private appendVisibleTextRange(ranges: InstanceRange[], start: number, count: number): void {
+    const clampedStart = clamp(Math.trunc(start), 0, this.textInstanceCount);
+    const clampedCount = clamp(Math.trunc(count), 0, this.textInstanceCount - clampedStart);
+    if (clampedCount <= 0) {
+      return;
+    }
+
+    const last = ranges[ranges.length - 1];
+    if (last && clampedStart <= last.start + last.count) {
+      const nextEnd = Math.max(last.start + last.count, clampedStart + clampedCount);
+      last.count = nextEnd - last.start;
+      return;
+    }
+
+    ranges.push({ start: clampedStart, count: clampedCount });
   }
 
   private uploadRasterLayers(scene: VectorScene): void {
@@ -3635,6 +3760,40 @@ function normalizePageRects(scene: VectorScene): Float32Array {
     scene.pageBounds.maxX,
     scene.pageBounds.maxY
   ]);
+}
+
+function normalizePageTextRanges(
+  scene: VectorScene,
+  pageRects: Float32Array,
+  textInstanceCount: number
+): Uint32Array {
+  const pageCount = Math.max(1, Math.floor(pageRects.length / 4));
+  const expectedLength = pageCount * 2;
+  const maxTextInstanceCount = Math.max(0, textInstanceCount | 0);
+
+  if (scene.pageTextRanges instanceof Uint32Array && scene.pageTextRanges.length >= expectedLength) {
+    const out = new Uint32Array(expectedLength);
+    let previousEnd = 0;
+    for (let i = 0; i < pageCount; i += 1) {
+      const offset = i * 2;
+      const start = clamp(Math.trunc(scene.pageTextRanges[offset]), previousEnd, maxTextInstanceCount);
+      const count = clamp(Math.trunc(scene.pageTextRanges[offset + 1]), 0, maxTextInstanceCount - start);
+      out[offset] = start;
+      out[offset + 1] = count;
+      previousEnd = start + count;
+    }
+    return out;
+  }
+
+  const out = new Uint32Array(expectedLength);
+  out[0] = 0;
+  out[1] = maxTextInstanceCount;
+  for (let i = 1; i < pageCount; i += 1) {
+    const offset = i * 2;
+    out[offset] = maxTextInstanceCount;
+    out[offset + 1] = 0;
+  }
+  return out;
 }
 
 function clamp(value: number, min: number, max: number): number {

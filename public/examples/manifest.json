@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-04-22T15:54:53.524Z",
+  "generatedAt": "2026-04-22T18:48:18.730Z",
   "examples": [
     {
       "id": "dublin_1st_floor_2018_06_01",
@@ -70,7 +70,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/optimizing_cpp-parsed-data.zip",
-        "sizeBytes": 2435027
+        "sizeBytes": 2396311
       }
     },
     {
@@ -94,7 +94,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/stn_arch_kp-ontario_177920237_detached-parsed-data.zip",
-        "sizeBytes": 27535327
+        "sizeBytes": 28025627
       }
     },
     {
@@ -106,7 +106,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/thesis-parsed-data.zip",
-        "sizeBytes": 2486937
+        "sizeBytes": 2056939
       }
     },
     {
@@ -118,7 +118,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/WarAndPeace-parsed-data.zip",
-        "sizeBytes": 41432623
+        "sizeBytes": 14119669
       }
     }
   ]

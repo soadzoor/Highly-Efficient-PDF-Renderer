@@ -2,6 +2,8 @@ import JSZip from "jszip";
 
 import {
   extractPdfRasterScene,
+  inferPageTextRanges,
+  optimizeVectorSceneTextGlyphs,
   type Bounds,
   type RasterLayer,
   type VectorScene
@@ -75,6 +77,7 @@ interface ParsedDataSceneEntry {
   bounds?: unknown;
   pageBounds?: unknown;
   pageRects?: unknown;
+  pageTextRanges?: unknown;
   pageCount?: unknown;
   pagesPerRow?: unknown;
   maxHalfWidth?: unknown;
@@ -198,6 +201,7 @@ export async function buildParsedDataZipBlobForLayout(
       bounds: scene.bounds,
       pageBounds: scene.pageBounds,
       pageRects: Array.from(scene.pageRects),
+      pageTextRanges: Array.from(scene.pageTextRanges),
       pageCount: scene.pageCount,
       pagesPerRow: scene.pagesPerRow,
       maxHalfWidth: scene.maxHalfWidth,
@@ -494,10 +498,16 @@ export async function loadSceneFromParsedDataZip(
   const bounds = parsedBounds ?? fallbackBounds;
   const pageBounds = parsedPageBounds ?? bounds;
   const pageRects = parsePageRects(sceneMeta.pageRects, pageBounds);
+  const pageTextRanges = parsePageTextRanges(
+    sceneMeta.pageTextRanges,
+    Math.max(1, Math.floor(pageRects.length / 4)),
+    textInstanceCount
+  ) ?? inferPageTextRanges(pageRects, textInstanceB, textInstanceCount);
   progress.report(0.96, { stage: "compile", sourceType: "zip" });
 
-  const scene = {
+  const scene = optimizeVectorSceneTextGlyphs({
     pageRects,
+    pageTextRanges,
     fillPathCount,
     fillSegmentCount,
     fillPathMetaA,
@@ -542,7 +552,7 @@ export async function loadSceneFromParsedDataZip(
     discardedDegenerateCount: readNonNegativeInt(sceneMeta.discardedDegenerateCount, 0),
     discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
-  };
+  });
   progress.complete({ sourceType: "zip" });
   return scene;
 }
@@ -817,6 +827,33 @@ function parsePageRects(value: unknown, fallbackBounds: Bounds): Float32Array {
     }
   }
   return new Float32Array([fallbackBounds.minX, fallbackBounds.minY, fallbackBounds.maxX, fallbackBounds.maxY]);
+}
+
+function parsePageTextRanges(value: unknown, pageCount: number, textInstanceCount: number): Uint32Array | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const normalizedPageCount = Math.max(1, pageCount | 0);
+  if (value.length < normalizedPageCount * 2) {
+    return null;
+  }
+
+  const maxTextInstanceCount = Math.max(0, textInstanceCount | 0);
+  const out = new Uint32Array(normalizedPageCount * 2);
+  let previousStart = 0;
+  for (let pageIndex = 0; pageIndex < normalizedPageCount; pageIndex += 1) {
+    const offset = pageIndex * 2;
+    const start = readNonNegativeInt(value[offset], previousStart);
+    const count = readNonNegativeInt(value[offset + 1], 0);
+    const clampedStart = Math.min(Math.max(start, previousStart), maxTextInstanceCount);
+    const clampedCount = Math.min(count, Math.max(0, maxTextInstanceCount - clampedStart));
+    out[offset] = clampedStart;
+    out[offset + 1] = clampedCount;
+    previousStart = clampedStart + clampedCount;
+  }
+
+  return out;
 }
 
 function parseMat2D(value: unknown): Float32Array | null {

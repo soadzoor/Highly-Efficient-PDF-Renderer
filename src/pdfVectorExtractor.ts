@@ -53,6 +53,7 @@ export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
   pageRects: Float32Array;
+  pageTextRanges: Uint32Array;
   fillPathCount: number;
   fillSegmentCount: number;
   fillPathMetaA: Float32Array;
@@ -127,6 +128,15 @@ class Float4Builder {
     this.data[offset + 2] = c;
     this.data[offset + 3] = d;
     this.length += 4;
+  }
+
+  append(source: Float32Array, offset: number, length: number): void {
+    if (length <= 0) {
+      return;
+    }
+    this.ensureCapacity(length);
+    this.data.set(source.subarray(offset, offset + length), this.length);
+    this.length += length;
   }
 
   toTypedArray(): Float32Array {
@@ -440,6 +450,7 @@ async function extractSinglePageRasterOnly(
     pageCount: 1,
     pagesPerRow: 1,
     pageRects: new Float32Array([pageBounds.minX, pageBounds.minY, pageBounds.maxX, pageBounds.maxY]),
+    pageTextRanges: new Uint32Array([0, 0]),
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
@@ -778,6 +789,7 @@ async function extractSinglePageVectors(
     pageCount: 1,
     pagesPerRow: 1,
     pageRects: new Float32Array([pageBounds.minX, pageBounds.minY, pageBounds.maxX, pageBounds.maxY]),
+    pageTextRanges: new Uint32Array([0, textData.instanceCount]),
     fillPathCount,
     fillSegmentCount,
     fillPathMetaA,
@@ -832,7 +844,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     return {
       ...pageScenes[0],
       pageCount: 1,
-      pagesPerRow: 1
+      pagesPerRow: 1,
+      pageTextRanges: normalizePageTextRangesForScene(pageScenes[0])
     };
   }
 
@@ -901,6 +914,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
   const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
   const pageRects = new Float32Array(totalPageRectCount * 4);
+  const pageTextRanges = new Uint32Array(totalPageRectCount * 2);
 
   let fillPathOffset = 0;
   let fillSegmentOffset = 0;
@@ -1009,6 +1023,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     const scenePageRects = scene.pageRects;
     if (scenePageRects.length >= 4) {
       const sceneRectCount = Math.floor(scenePageRects.length / 4);
+      const sceneTextRanges = normalizePageTextRangesForScene(scene, sceneRectCount);
       for (let i = 0; i < sceneRectCount; i += 1) {
         const src = i * 4;
         const dst = (pageRectOffset + i) * 4;
@@ -1016,6 +1031,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         pageRects[dst + 1] = scenePageRects[src + 1] + ty;
         pageRects[dst + 2] = scenePageRects[src + 2] + tx;
         pageRects[dst + 3] = scenePageRects[src + 3] + ty;
+
+        const rangeDst = (pageRectOffset + i) * 2;
+        const rangeSrc = i * 2;
+        pageTextRanges[rangeDst] = sceneTextRanges[rangeSrc] + textInstanceOffset;
+        pageTextRanges[rangeDst + 1] = sceneTextRanges[rangeSrc + 1];
       }
       pageRectOffset += sceneRectCount;
     } else {
@@ -1024,6 +1044,9 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       pageRects[dst + 1] = scene.pageBounds.minY + ty;
       pageRects[dst + 2] = scene.pageBounds.maxX + tx;
       pageRects[dst + 3] = scene.pageBounds.maxY + ty;
+      const rangeDst = pageRectOffset * 2;
+      pageTextRanges[rangeDst] = textInstanceOffset;
+      pageTextRanges[rangeDst + 1] = scene.textInstanceCount;
       pageRectOffset += 1;
     }
 
@@ -1060,10 +1083,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   const primaryRasterLayer = rasterLayers[0] ?? null;
 
-  return {
+  const composedScene: VectorScene = {
     pageCount: pageScenes.length,
     pagesPerRow,
     pageRects,
+    pageTextRanges,
     fillPathCount: totalFillPathCount,
     fillSegmentCount: totalFillSegmentCount,
     fillPathMetaA,
@@ -1107,6 +1131,313 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     discardedDuplicateCount: totalDiscardedDuplicateCount,
     discardedContainedCount: totalDiscardedContainedCount
   };
+
+  return optimizeVectorSceneTextGlyphs(composedScene);
+}
+
+export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
+  const glyphCount = Math.max(0, scene.textGlyphCount | 0);
+  const glyphSegmentCount = Math.max(0, scene.textGlyphSegmentCount | 0);
+  if (
+    glyphCount <= 1 ||
+    glyphSegmentCount <= 0 ||
+    scene.textGlyphMetaA.length < glyphCount * 4 ||
+    scene.textGlyphMetaB.length < glyphCount * 4
+  ) {
+    return scene;
+  }
+
+  const segmentWordsA = new Uint32Array(
+    scene.textGlyphSegmentsA.buffer,
+    scene.textGlyphSegmentsA.byteOffset,
+    scene.textGlyphSegmentsA.length
+  );
+  const segmentWordsB = new Uint32Array(
+    scene.textGlyphSegmentsB.buffer,
+    scene.textGlyphSegmentsB.byteOffset,
+    scene.textGlyphSegmentsB.length
+  );
+  const metaWordsA = new Uint32Array(scene.textGlyphMetaA.buffer, scene.textGlyphMetaA.byteOffset, scene.textGlyphMetaA.length);
+  const metaWordsB = new Uint32Array(scene.textGlyphMetaB.buffer, scene.textGlyphMetaB.byteOffset, scene.textGlyphMetaB.length);
+
+  const remap = new Uint32Array(glyphCount);
+  const uniqueOldGlyphIndices: number[] = [];
+  const candidatesByHash = new Map<string, number[]>();
+  const dedupGlyphMetaA = new Float4Builder(Math.min(glyphCount, 4096));
+  const dedupGlyphMetaB = new Float4Builder(Math.min(glyphCount, 4096));
+  const dedupGlyphSegmentsA = new Float4Builder(Math.min(glyphSegmentCount, 65_536));
+  const dedupGlyphSegmentsB = new Float4Builder(Math.min(glyphSegmentCount, 65_536));
+
+  for (let glyphIndex = 0; glyphIndex < glyphCount; glyphIndex += 1) {
+    const hash = hashTextGlyph(scene, glyphIndex, metaWordsA, metaWordsB, segmentWordsA, segmentWordsB);
+    const candidates = candidatesByHash.get(hash);
+    let uniqueIndex = -1;
+
+    if (candidates) {
+      for (const candidateUniqueIndex of candidates) {
+        if (textGlyphsEqual(scene, glyphIndex, uniqueOldGlyphIndices[candidateUniqueIndex])) {
+          uniqueIndex = candidateUniqueIndex;
+          break;
+        }
+      }
+    }
+
+    if (uniqueIndex < 0) {
+      uniqueIndex = uniqueOldGlyphIndices.length;
+      uniqueOldGlyphIndices.push(glyphIndex);
+      if (candidates) {
+        candidates.push(uniqueIndex);
+      } else {
+        candidatesByHash.set(hash, [uniqueIndex]);
+      }
+
+      const metaOffset = glyphIndex * 4;
+      const segmentStart = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffset]));
+      const segmentCount = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffset + 1]));
+      const segmentFloatStart = segmentStart * 4;
+      const segmentFloatCount = Math.min(
+        segmentCount * 4,
+        Math.max(0, scene.textGlyphSegmentsA.length - segmentFloatStart),
+        Math.max(0, scene.textGlyphSegmentsB.length - segmentFloatStart)
+      );
+      const nextSegmentStart = dedupGlyphSegmentsA.quadCount;
+      dedupGlyphSegmentsA.append(scene.textGlyphSegmentsA, segmentFloatStart, segmentFloatCount);
+      dedupGlyphSegmentsB.append(scene.textGlyphSegmentsB, segmentFloatStart, segmentFloatCount);
+      dedupGlyphMetaA.push(
+        nextSegmentStart,
+        segmentFloatCount / 4,
+        scene.textGlyphMetaA[metaOffset + 2],
+        scene.textGlyphMetaA[metaOffset + 3]
+      );
+      dedupGlyphMetaB.push(
+        scene.textGlyphMetaB[metaOffset],
+        scene.textGlyphMetaB[metaOffset + 1],
+        scene.textGlyphMetaB[metaOffset + 2],
+        scene.textGlyphMetaB[metaOffset + 3]
+      );
+    }
+
+    remap[glyphIndex] = uniqueIndex;
+  }
+
+  if (uniqueOldGlyphIndices.length === glyphCount) {
+    return scene;
+  }
+
+  const textInstanceB = scene.textInstanceB;
+  for (let i = 0; i < scene.textInstanceCount; i += 1) {
+    const offset = i * 4 + 2;
+    const oldGlyphIndex = Math.max(0, Math.trunc(textInstanceB[offset]));
+    if (oldGlyphIndex < remap.length) {
+      textInstanceB[offset] = remap[oldGlyphIndex];
+    }
+  }
+
+  return {
+    ...scene,
+    textInstanceB,
+    textGlyphCount: uniqueOldGlyphIndices.length,
+    textGlyphSegmentCount: dedupGlyphSegmentsA.quadCount,
+    textGlyphMetaA: dedupGlyphMetaA.toTypedArray(),
+    textGlyphMetaB: dedupGlyphMetaB.toTypedArray(),
+    textGlyphSegmentsA: dedupGlyphSegmentsA.toTypedArray(),
+    textGlyphSegmentsB: dedupGlyphSegmentsB.toTypedArray()
+  };
+}
+
+export function inferPageTextRanges(
+  pageRects: Float32Array,
+  textInstanceB: Float32Array,
+  textInstanceCount: number
+): Uint32Array {
+  const pageCount = Math.max(1, Math.floor(pageRects.length / 4));
+  const ranges = new Uint32Array(pageCount * 2);
+  const instanceCount = Math.max(0, Math.min(textInstanceCount | 0, Math.floor(textInstanceB.length / 4)));
+
+  if (pageCount <= 1 || instanceCount <= 0) {
+    ranges[0] = 0;
+    ranges[1] = instanceCount;
+    return ranges;
+  }
+
+  const margin = computePageTextRangeMargin(pageRects, pageCount);
+  let currentPage = 0;
+  let rangeStart = 0;
+
+  for (let i = 0; i < instanceCount; i += 1) {
+    const offset = i * 4;
+    const x = textInstanceB[offset];
+    const y = textInstanceB[offset + 1];
+    if (!Number.isFinite(x) || !Number.isFinite(y) || pointInPageRect(pageRects, currentPage, x, y, margin)) {
+      continue;
+    }
+
+    const nextPage = findContainingPageFrom(pageRects, pageCount, currentPage + 1, x, y, margin);
+    if (nextPage <= currentPage) {
+      continue;
+    }
+
+    ranges[currentPage * 2] = rangeStart;
+    ranges[currentPage * 2 + 1] = i - rangeStart;
+    for (let pageIndex = currentPage + 1; pageIndex < nextPage; pageIndex += 1) {
+      ranges[pageIndex * 2] = i;
+      ranges[pageIndex * 2 + 1] = 0;
+    }
+    currentPage = nextPage;
+    rangeStart = i;
+  }
+
+  ranges[currentPage * 2] = rangeStart;
+  ranges[currentPage * 2 + 1] = instanceCount - rangeStart;
+  for (let pageIndex = currentPage + 1; pageIndex < pageCount; pageIndex += 1) {
+    ranges[pageIndex * 2] = instanceCount;
+    ranges[pageIndex * 2 + 1] = 0;
+  }
+
+  return ranges;
+}
+
+function normalizePageTextRangesForScene(scene: VectorScene, requestedPageCount?: number): Uint32Array {
+  const inferredPageCount = Math.floor(scene.pageRects.length / 4) || scene.pageCount || 1;
+  const pageCount = Math.max(1, requestedPageCount ?? inferredPageCount);
+  const expectedLength = pageCount * 2;
+  if (scene.pageTextRanges instanceof Uint32Array && scene.pageTextRanges.length >= expectedLength) {
+    return scene.pageTextRanges.subarray(0, expectedLength);
+  }
+  return inferPageTextRanges(scene.pageRects, scene.textInstanceB, scene.textInstanceCount);
+}
+
+function hashTextGlyph(
+  scene: VectorScene,
+  glyphIndex: number,
+  metaWordsA: Uint32Array,
+  metaWordsB: Uint32Array,
+  segmentWordsA: Uint32Array,
+  segmentWordsB: Uint32Array
+): string {
+  const metaOffset = glyphIndex * 4;
+  const segmentStart = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffset]));
+  const segmentCount = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffset + 1]));
+  const segmentWordStart = segmentStart * 4;
+  const segmentWordCount = Math.min(
+    segmentCount * 4,
+    Math.max(0, segmentWordsA.length - segmentWordStart),
+    Math.max(0, segmentWordsB.length - segmentWordStart)
+  );
+
+  let hash = 2166136261;
+  hash = fnv1aAdd(hash, segmentCount);
+  hash = fnv1aAdd(hash, metaWordsA[metaOffset + 2] ?? 0);
+  hash = fnv1aAdd(hash, metaWordsA[metaOffset + 3] ?? 0);
+  hash = fnv1aAdd(hash, metaWordsB[metaOffset] ?? 0);
+  hash = fnv1aAdd(hash, metaWordsB[metaOffset + 1] ?? 0);
+
+  for (let i = 0; i < segmentWordCount; i += 1) {
+    hash = fnv1aAdd(hash, segmentWordsA[segmentWordStart + i]);
+    hash = fnv1aAdd(hash, segmentWordsB[segmentWordStart + i]);
+  }
+
+  return `${segmentCount}:${hash >>> 0}`;
+}
+
+function textGlyphsEqual(scene: VectorScene, glyphA: number, glyphB: number): boolean {
+  if (glyphA === glyphB) {
+    return true;
+  }
+
+  const metaOffsetA = glyphA * 4;
+  const metaOffsetB = glyphB * 4;
+  const segmentCountA = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffsetA + 1]));
+  const segmentCountB = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffsetB + 1]));
+  if (segmentCountA !== segmentCountB) {
+    return false;
+  }
+
+  if (
+    scene.textGlyphMetaA[metaOffsetA + 2] !== scene.textGlyphMetaA[metaOffsetB + 2] ||
+    scene.textGlyphMetaA[metaOffsetA + 3] !== scene.textGlyphMetaA[metaOffsetB + 3] ||
+    scene.textGlyphMetaB[metaOffsetA] !== scene.textGlyphMetaB[metaOffsetB] ||
+    scene.textGlyphMetaB[metaOffsetA + 1] !== scene.textGlyphMetaB[metaOffsetB + 1] ||
+    scene.textGlyphMetaB[metaOffsetA + 2] !== scene.textGlyphMetaB[metaOffsetB + 2] ||
+    scene.textGlyphMetaB[metaOffsetA + 3] !== scene.textGlyphMetaB[metaOffsetB + 3]
+  ) {
+    return false;
+  }
+
+  const segmentStartA = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffsetA]));
+  const segmentStartB = Math.max(0, Math.trunc(scene.textGlyphMetaA[metaOffsetB]));
+  const segmentFloatStartA = segmentStartA * 4;
+  const segmentFloatStartB = segmentStartB * 4;
+  const segmentFloatCount = segmentCountA * 4;
+  for (let i = 0; i < segmentFloatCount; i += 1) {
+    if (
+      scene.textGlyphSegmentsA[segmentFloatStartA + i] !== scene.textGlyphSegmentsA[segmentFloatStartB + i] ||
+      scene.textGlyphSegmentsB[segmentFloatStartA + i] !== scene.textGlyphSegmentsB[segmentFloatStartB + i]
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function fnv1aAdd(hash: number, value: number): number {
+  hash ^= value >>> 0;
+  return Math.imul(hash, 16777619);
+}
+
+function computePageTextRangeMargin(pageRects: Float32Array, pageCount: number): number {
+  let extentSum = 0;
+  let extentCount = 0;
+  for (let i = 0; i < pageCount; i += 1) {
+    const offset = i * 4;
+    const width = Math.abs(pageRects[offset + 2] - pageRects[offset]);
+    const height = Math.abs(pageRects[offset + 3] - pageRects[offset + 1]);
+    const extent = Math.max(width, height);
+    if (Number.isFinite(extent) && extent > 0) {
+      extentSum += extent;
+      extentCount += 1;
+    }
+  }
+  if (extentCount === 0) {
+    return 8;
+  }
+  return clampNumber(extentSum / extentCount * 0.025, 4, 24);
+}
+
+function findContainingPageFrom(
+  pageRects: Float32Array,
+  pageCount: number,
+  startPage: number,
+  x: number,
+  y: number,
+  margin: number
+): number {
+  for (let pageIndex = Math.max(0, startPage); pageIndex < pageCount; pageIndex += 1) {
+    if (pointInPageRect(pageRects, pageIndex, x, y, margin)) {
+      return pageIndex;
+    }
+  }
+  return -1;
+}
+
+function pointInPageRect(pageRects: Float32Array, pageIndex: number, x: number, y: number, margin: number): boolean {
+  const offset = pageIndex * 4;
+  const x0 = Math.min(pageRects[offset], pageRects[offset + 2]) - margin;
+  const x1 = Math.max(pageRects[offset], pageRects[offset + 2]) + margin;
+  const y0 = Math.min(pageRects[offset + 1], pageRects[offset + 3]) - margin;
+  const y1 = Math.max(pageRects[offset + 1], pageRects[offset + 3]) + margin;
+  return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
 }
 
 function computeGridPlacements(pageScenes: VectorScene[], pagesPerRow: number): PagePlacement[] {
@@ -1237,6 +1568,7 @@ function createEmptyVectorScene(): VectorScene {
     pageCount: 0,
     pagesPerRow: 1,
     pageRects: new Float32Array(0),
+    pageTextRanges: new Uint32Array(0),
     fillPathCount: 0,
     fillSegmentCount: 0,
     fillPathMetaA: new Float32Array(0),
