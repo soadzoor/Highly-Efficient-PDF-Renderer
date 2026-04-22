@@ -8,6 +8,7 @@ import {
   type VectorScene
 } from "./pdfVectorExtractor";
 import { loadSceneFromParsedDataZip } from "./parsedDataZip";
+import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 
 export type PdfObjectSource = ArrayBuffer | Uint8Array | Blob | File | string;
 export type PdfObjectSourceKind = "pdf" | "parsed-zip";
@@ -17,6 +18,7 @@ export interface PdfObjectGeneratorOptions {
   invisibleCull?: boolean;
   maxPages?: number;
   maxPagesPerRow?: number;
+  onProgress?: LoadProgressCallback;
   sourceKind?: PdfObjectSourceKind | "auto";
 }
 
@@ -33,7 +35,8 @@ export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions = {}
 ): Promise<LoadedPdfScene> {
-  const sourceBytes = await readSourceBytes(source);
+  const progress = createLoadProgressReporter(options.onProgress);
+  const sourceBytes = await readSourceBytes(source, progress.child(0, 0.16));
   const sourceKind = resolveSourceKind(source, sourceBytes, options.sourceKind);
   const sourceLabel = resolveSourceLabel(source, sourceKind);
 
@@ -42,20 +45,28 @@ export async function loadPdfSceneFromSource(
     const extractOptions: VectorExtractOptions = {
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
-      maxPages: options.maxPages
+      maxPages: options.maxPages,
+      onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
     const pageScenes = await extractPdfPageScenes(createParseBuffer(sourceBytes), extractOptions);
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow);
+    const scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
+    progress.report(0.93, { stage: "compile", sourceType: "pdf" });
+    progress.complete({ sourceType: "pdf" });
     return {
-      scene: composeVectorScenesInGrid(pageScenes, pagesPerRow),
+      scene,
       sourceLabel,
       sourceKind,
       sourceBytes
     };
   }
 
+  const scene = await loadSceneFromParsedDataZip(createParseBuffer(sourceBytes), {
+    onProgress: progress.child(0.16, 0.95, { sourceType: "zip" }).toCallback()
+  });
+  progress.complete({ sourceType: "zip" });
   return {
-    scene: await loadSceneFromParsedDataZip(createParseBuffer(sourceBytes)),
+    scene,
     sourceLabel,
     sourceKind,
     sourceBytes
@@ -72,35 +83,47 @@ function ensurePdfWorkerConfigured(): void {
   isPdfWorkerConfigured = true;
 }
 
-async function readSourceBytes(source: PdfObjectSource): Promise<Uint8Array> {
+async function readSourceBytes(source: PdfObjectSource, progress?: LoadProgressReporter): Promise<Uint8Array> {
+  progress?.report(0, { stage: "source", unit: "bytes" });
   if (source instanceof Uint8Array) {
-    return source.slice();
+    const bytes = source.slice();
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    return bytes;
   }
   if (source instanceof ArrayBuffer) {
-    return new Uint8Array(source).slice();
+    const bytes = new Uint8Array(source).slice();
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    return bytes;
   }
   if (isBlobLike(source)) {
-    return new Uint8Array(await source.arrayBuffer()).slice();
+    const bytes = new Uint8Array(await source.arrayBuffer()).slice();
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    return bytes;
   }
   if (typeof source === "string") {
-    return readStringSourceBytes(source);
+    const bytes = await readStringSourceBytes(source, progress);
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    return bytes;
   }
 
   throw new Error("Unsupported source type. Expected File, Blob, Uint8Array, ArrayBuffer, or string.");
 }
 
-async function readStringSourceBytes(source: string): Promise<Uint8Array> {
+async function readStringSourceBytes(source: string, progress?: LoadProgressReporter): Promise<Uint8Array> {
   const trimmed = source.trim();
   if (trimmed.length === 0) {
     throw new Error("Source string is empty.");
   }
 
   if (looksLikeDataUrl(trimmed)) {
-    return decodeDataUrlBytes(trimmed);
+    const bytes = decodeDataUrlBytes(trimmed);
+    progress?.report(1, { stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    return bytes;
   }
 
   const decodedBase64 = tryDecodeBase64Bytes(trimmed);
   if (decodedBase64 && (looksLikePdfBytes(decodedBase64) || looksLikeZipBytes(decodedBase64))) {
+    progress?.report(1, { stage: "source", unit: "bytes", processed: decodedBase64.length, total: decodedBase64.length });
     return decodedBase64;
   }
 
@@ -108,8 +131,62 @@ async function readStringSourceBytes(source: string): Promise<Uint8Array> {
   if (!response.ok) {
     throw new Error(`Failed to load source path/URL (${response.status} ${response.statusText}).`);
   }
-  const buffer = await response.arrayBuffer();
-  return new Uint8Array(buffer);
+  return readResponseBytesWithProgress(response, progress);
+}
+
+async function readResponseBytesWithProgress(response: Response, progress?: LoadProgressReporter): Promise<Uint8Array> {
+  const totalHeader = Number(response.headers.get("content-length"));
+  const total = Number.isFinite(totalHeader) && totalHeader > 0 ? Math.trunc(totalHeader) : undefined;
+  if (!response.body || !progress?.enabled) {
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    progress?.report(1, {
+      stage: "source",
+      unit: "bytes",
+      processed: bytes.length,
+      total: total ?? bytes.length
+    });
+    return bytes;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  progress.report(0, { stage: "source", unit: "bytes", processed: 0, total });
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!value) {
+      continue;
+    }
+    chunks.push(value);
+    received += value.length;
+    if (total) {
+      progress.report(received / total, {
+        stage: "source",
+        unit: "bytes",
+        processed: received,
+        total
+      });
+    }
+  }
+
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  progress.report(1, {
+    stage: "source",
+    unit: "bytes",
+    processed: received,
+    total: total ?? received
+  });
+  return bytes;
 }
 
 function resolveSourceKind(

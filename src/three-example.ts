@@ -1,12 +1,19 @@
 import * as THREE from "three";
 
-import { createCanvasInteractionController, pdfObjectGenerator, type HeprRendererType, type HeprThreePdfObject } from "./index";
+import {
+  createCanvasInteractionController,
+  pdfObjectGenerator,
+  type HeprRendererType,
+  type HeprThreePdfObject,
+  type PDFLoadProgress
+} from "./index";
 import {
   normalizeExampleManifestEntries,
   resolveAppAssetUrl,
   type ExampleAssetManifest,
   type NormalizedExampleEntry
 } from "./exampleManifest";
+import { formatLoadProgressStage } from "./loadProgress";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const sourceInput = document.querySelector<HTMLInputElement>("#source-input");
@@ -15,8 +22,20 @@ const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
+const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
+const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
 
-if (!canvas || !sourceInput || !loadSourceButton || !fileInput || !exampleSelect || !backendSelect || !statusElement) {
+if (
+  !canvas ||
+  !sourceInput ||
+  !loadSourceButton ||
+  !fileInput ||
+  !exampleSelect ||
+  !backendSelect ||
+  !statusElement ||
+  !parseLoader ||
+  !parseLoaderText
+) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
 
@@ -27,8 +46,11 @@ const fileInputElement = fileInput;
 const exampleSelectElement = exampleSelect;
 const backendSelectElement = backendSelect;
 const statusElementNode = statusElement;
+const parseLoaderElement = parseLoader;
+const parseLoaderTextElement = parseLoaderText;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
+let loadToken = 0;
 
 const renderer = new THREE.WebGLRenderer({
   canvas: canvasElement,
@@ -148,10 +170,12 @@ function disposeExample(): void {
 }
 
 async function loadSource(source: File | string): Promise<void> {
+  const activeLoadToken = ++loadToken;
   const backend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
   const useWebGpuMaterialPipeline = backend === "webgpu";
   const sourceLabel = typeof source === "string" ? source : source.name;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
+  setLoadingProgress(true, "Parsing / loading 0.00%");
   loadSourceButtonElement.disabled = true;
   backendSelectElement.disabled = true;
 
@@ -166,20 +190,33 @@ async function loadSource(source: File | string): Promise<void> {
         experimentalMaterialFills: useWebGpuMaterialPipeline,
         experimentalMaterialStrokes: useWebGpuMaterialPipeline,
         experimentalMaterialTexts: useWebGpuMaterialPipeline,
-        pageBackground: 0xffffff
+        pageBackground: 0xffffff,
+        onProgress: (progress) => {
+          updateLoadingProgress(activeLoadToken, progress);
+        }
       },
       backend as HeprRendererType
     );
 
+    if (activeLoadToken !== loadToken) {
+      nextObject.dispose();
+      return;
+    }
     replacePdfObject(nextObject);
     lastLoadedSource = source;
     setStatus(`Loaded ${nextObject.sourceLabel} (${nextObject.sourceKind}) via ${backend.toUpperCase()}.`);
   } catch (error) {
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load source: ${message}`);
   } finally {
-    loadSourceButtonElement.disabled = false;
-    backendSelectElement.disabled = false;
+    if (activeLoadToken === loadToken) {
+      setLoadingProgress(false);
+      loadSourceButtonElement.disabled = false;
+      backendSelectElement.disabled = false;
+    }
   }
 }
 
@@ -204,6 +241,20 @@ function disposeCurrentObject(): void {
 
 function setStatus(text: string): void {
   statusElementNode.textContent = text;
+}
+
+function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
+  if (token !== loadToken) {
+    return;
+  }
+  const stageLabel = formatLoadProgressStage(progress.stage);
+  const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
+  setLoadingProgress(true, `${stageLabel} ${(value * 100).toFixed(2)}%`);
+}
+
+function setLoadingProgress(visible: boolean, text = ""): void {
+  parseLoaderElement.hidden = !visible;
+  parseLoaderTextElement.textContent = visible ? text : "";
 }
 
 async function loadExampleManifest(): Promise<void> {

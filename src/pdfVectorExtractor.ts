@@ -1,3 +1,5 @@
+import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
+
 const pdfJsModule = (
   typeof window === "undefined"
     ? await import("pdfjs-dist/legacy/build/pdf.mjs")
@@ -101,6 +103,7 @@ export interface VectorExtractOptions {
   enableInvisibleCull?: boolean;
   maxPages?: number;
   maxPagesPerRow?: number;
+  onProgress?: LoadProgressCallback;
 }
 
 class Float4Builder {
@@ -217,6 +220,8 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
   const enableInvisibleCull = options.enableInvisibleCull !== false;
   const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
   const standardFontDataUrl = resolveStandardFontDataUrl();
+  const progress = createLoadProgressReporter(options.onProgress);
+  progress.report(0, { stage: "source", sourceType: "pdf" });
 
   const loadingTask = getDocument({
     data: new Uint8Array(pdfData),
@@ -226,22 +231,65 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;
+  progress.report(0.06, { stage: "pdf-page", sourceType: "pdf" });
 
   try {
     const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
     const extractedPageCount = Math.max(1, Math.min(pdfPageCount, maxPages));
     const pageScenes: VectorScene[] = [];
+    const pageProgressStart = 0.08;
+    const pageProgressRange = 0.84;
 
     for (let pageNumber = 1; pageNumber <= extractedPageCount; pageNumber += 1) {
+      const pageIndex = pageNumber - 1;
+      const pageStart = pageProgressStart + (pageIndex / extractedPageCount) * pageProgressRange;
+      const pageEnd = pageProgressStart + (pageNumber / extractedPageCount) * pageProgressRange;
+      progress.report(pageStart, {
+        stage: "pdf-page",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: pageIndex,
+        total: extractedPageCount,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
       const page = await pdf.getPage(pageNumber);
+      progress.report(lerpNumber(pageStart, pageEnd, 0.28), {
+        stage: "pdf-operators",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: pageIndex,
+        total: extractedPageCount,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
       const operatorList = await page.getOperatorList();
+      progress.report(lerpNumber(pageStart, pageEnd, 0.58), {
+        stage: "compile",
+        sourceType: "pdf",
+        unit: "operators",
+        processed: operatorList.fnArray.length,
+        total: operatorList.fnArray.length,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
       const pageScene = await extractSinglePageVectors(page, operatorList, {
         enableSegmentMerge,
         enableInvisibleCull
       });
       pageScenes.push(pageScene);
+      progress.report(pageEnd, {
+        stage: "pdf-page",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: pageNumber,
+        total: extractedPageCount,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
     }
 
+    progress.report(0.94, { stage: "compile", sourceType: "pdf" });
     return pageScenes;
   } finally {
     await pdf.destroy();
@@ -255,7 +303,11 @@ export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPa
 export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
   const pageScenes = await extractPdfPageScenes(pdfData, options);
-  return composeScenesInGrid(pageScenes, maxPagesPerRow);
+  const progress = createLoadProgressReporter(options.onProgress);
+  progress.report(0.96, { stage: "compile", sourceType: "pdf" });
+  const scene = composeScenesInGrid(pageScenes, maxPagesPerRow);
+  progress.complete({ sourceType: "pdf" });
+  return scene;
 }
 
 export async function extractPdfRasterPageScenes(
@@ -264,6 +316,8 @@ export async function extractPdfRasterPageScenes(
 ): Promise<VectorScene[]> {
   const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
   const standardFontDataUrl = resolveStandardFontDataUrl();
+  const progress = createLoadProgressReporter(options.onProgress);
+  progress.report(0, { stage: "source", sourceType: "pdf" });
   const loadingTask = getDocument({
     data: new Uint8Array(pdfData),
     disableFontFace: true,
@@ -272,18 +326,52 @@ export async function extractPdfRasterPageScenes(
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;
+  progress.report(0.06, { stage: "pdf-page", sourceType: "pdf" });
 
   try {
     const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
     const extractedPageCount = Math.max(1, Math.min(pdfPageCount, maxPages));
     const pageScenes: VectorScene[] = [];
+    const pageProgressStart = 0.08;
+    const pageProgressRange = 0.84;
 
     for (let pageNumber = 1; pageNumber <= extractedPageCount; pageNumber += 1) {
+      const pageIndex = pageNumber - 1;
+      const pageStart = pageProgressStart + (pageIndex / extractedPageCount) * pageProgressRange;
+      const pageEnd = pageProgressStart + (pageNumber / extractedPageCount) * pageProgressRange;
+      progress.report(pageStart, {
+        stage: "pdf-page",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: pageIndex,
+        total: extractedPageCount,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
       const page = await pdf.getPage(pageNumber);
       const operatorList = await page.getOperatorList();
+      progress.report(lerpNumber(pageStart, pageEnd, 0.4), {
+        stage: "pdf-raster",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: pageIndex,
+        total: extractedPageCount,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
       pageScenes.push(await extractSinglePageRasterOnly(page, operatorList));
+      progress.report(pageEnd, {
+        stage: "pdf-page",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: pageNumber,
+        total: extractedPageCount,
+        pageIndex,
+        pageCount: extractedPageCount
+      });
     }
 
+    progress.report(0.94, { stage: "compile", sourceType: "pdf" });
     return pageScenes;
   } finally {
     await pdf.destroy();
@@ -293,7 +381,11 @@ export async function extractPdfRasterPageScenes(
 export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
   const pageScenes = await extractPdfRasterPageScenes(pdfData, options);
-  return composeScenesInGrid(pageScenes, maxPagesPerRow);
+  const progress = createLoadProgressReporter(options.onProgress);
+  progress.report(0.96, { stage: "compile", sourceType: "pdf" });
+  const scene = composeScenesInGrid(pageScenes, maxPagesPerRow);
+  progress.complete({ sourceType: "pdf" });
+  return scene;
 }
 
 interface SinglePageExtractOptions {
@@ -4212,4 +4304,8 @@ function clamp01(value: number): number {
     return 1;
   }
   return value;
+}
+
+function lerpNumber(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }

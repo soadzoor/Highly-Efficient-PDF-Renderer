@@ -15,6 +15,7 @@ import {
   createCanvasInteractionController,
   type CanvasInteractionController
 } from "./canvasInteractions";
+import { createLoadProgressReporter } from "./loadProgress";
 
 export interface PdfObjectGeneratorRuntimeOptions
   extends PdfObjectGeneratorOptions,
@@ -25,11 +26,18 @@ export async function pdfObjectGenerator(
   options: PdfObjectGeneratorRuntimeOptions = {},
   rendererType: HeprRendererType = "webgl"
 ): Promise<HeprThreePdfObject> {
-  const loadedScene = await loadPdfSceneFromSource(source, options);
-  return createThreePdfObject(loadedScene, {
+  const progress = createLoadProgressReporter(options.onProgress);
+  const loadedScene = await loadPdfSceneFromSource(source, {
+    ...options,
+    onProgress: progress.child(0, 0.92).toCallback()
+  });
+  progress.report(0.94, { stage: "upload", sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
+  const object = await createThreePdfObject(loadedScene, {
     ...options,
     rendererType
   });
+  progress.complete({ sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
+  return object;
 }
 
 export {
@@ -62,3 +70,9 @@ export type {
   HeprThreePdfObject,
   CanvasInteractionController
 };
+
+export type {
+  LoadProgressCallback,
+  PDFLoadProgress,
+  PDFLoadStage
+} from "./loadProgress";

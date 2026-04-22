@@ -6,6 +6,7 @@ import {
   type RasterLayer,
   type VectorScene
 } from "./pdfVectorExtractor";
+import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import {
   decodeByteShuffledFloat32,
   decodeChannelMajorFloat32,
@@ -45,6 +46,10 @@ export interface BuildParsedDataZipOptions {
   encodeRasterImages?: boolean;
   zipCompression?: "STORE" | "DEFLATE";
   zipDeflateLevel?: number;
+}
+
+export interface LoadParsedDataZipOptions {
+  onProgress?: LoadProgressCallback;
 }
 
 interface ParsedDataTextureEntry {
@@ -274,14 +279,24 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
   ];
 }
 
-export async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorScene> {
-  const zip = await JSZip.loadAsync(buffer);
+export async function loadSceneFromParsedDataZip(
+  buffer: ArrayBuffer,
+  options: LoadParsedDataZipOptions = {}
+): Promise<VectorScene> {
+  const progress = createLoadProgressReporter(options.onProgress);
+  const zip = await progress.child(0, 0.16, { sourceType: "zip" }).withIndeterminateProgress(
+    JSZip.loadAsync(buffer),
+    { stage: "zip-open", sourceType: "zip" }
+  );
   const manifestFile = zip.file("manifest.json");
   if (!manifestFile) {
     throw new Error("Parsed data zip is missing manifest.json.");
   }
 
-  const manifestJson = await manifestFile.async("string");
+  const manifestJson = await progress.child(0.16, 0.22, { sourceType: "zip" }).withIndeterminateProgress(
+    manifestFile.async("string"),
+    { stage: "zip-manifest", sourceType: "zip" }
+  );
   let manifest: ParsedDataManifest;
   try {
     manifest = JSON.parse(manifestJson) as ParsedDataManifest;
@@ -294,6 +309,17 @@ export async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<V
   const manifestTextures = Array.isArray(manifest.textures) ? manifest.textures : [];
 
   const textureByName = new Map<string, ParsedDataTextureEntry>();
+  const textureReadTotal = 16;
+  let textureReadCount = 0;
+  const reportTextureProgress = (): void => {
+    progress.report(0.22 + (textureReadCount / textureReadTotal) * 0.58, {
+      stage: "zip-file",
+      sourceType: "zip",
+      unit: "files",
+      processed: textureReadCount,
+      total: textureReadTotal
+    });
+  };
   for (const entry of manifestTextures) {
     const name = typeof entry.name === "string" ? entry.name : null;
     if (!name) {
@@ -306,43 +332,49 @@ export async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<V
     candidateNames: string[],
     required: boolean
   ): Promise<{ data: Float32Array; logicalItemCount: number } | null> => {
-    for (const candidate of candidateNames) {
-      const entry = textureByName.get(candidate);
-      if (!entry) {
-        continue;
+    try {
+      reportTextureProgress();
+      for (const candidate of candidateNames) {
+        const entry = textureByName.get(candidate);
+        if (!entry) {
+          continue;
+        }
+
+        const inferredSuffix =
+          typeof entry.layout === "string" && entry.layout === "channel-major"
+            ? ".f32cm"
+            : entry.byteShuffle === true
+              ? ".f32bs"
+              : ".f32";
+        const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}${inferredSuffix}`;
+        const zipEntry = zip.file(path);
+        if (!zipEntry) {
+          continue;
+        }
+
+        const fileBuffer = await zipEntry.async("arraybuffer");
+        const raw = readTexturePayloadAsFloat32(fileBuffer, entry, candidate);
+        const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
+        if (logicalFloatCount > raw.length) {
+          throw new Error(`Texture ${candidate} logical float count exceeds file length.`);
+        }
+
+        const logicalItemCount = readNonNegativeInt(entry.logicalItemCount, Math.floor(logicalFloatCount / 4));
+        return {
+          data: raw.slice(0, logicalFloatCount),
+          logicalItemCount
+        };
       }
 
-      const inferredSuffix =
-        typeof entry.layout === "string" && entry.layout === "channel-major"
-          ? ".f32cm"
-          : entry.byteShuffle === true
-            ? ".f32bs"
-            : ".f32";
-      const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}${inferredSuffix}`;
-      const zipEntry = zip.file(path);
-      if (!zipEntry) {
-        continue;
+      if (required) {
+        throw new Error(`Parsed data zip is missing required texture: ${candidateNames[0]}.`);
       }
 
-      const fileBuffer = await zipEntry.async("arraybuffer");
-      const raw = readTexturePayloadAsFloat32(fileBuffer, entry, candidate);
-      const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
-      if (logicalFloatCount > raw.length) {
-        throw new Error(`Texture ${candidate} logical float count exceeds file length.`);
-      }
-
-      const logicalItemCount = readNonNegativeInt(entry.logicalItemCount, Math.floor(logicalFloatCount / 4));
-      return {
-        data: raw.slice(0, logicalFloatCount),
-        logicalItemCount
-      };
+      return null;
+    } finally {
+      textureReadCount += 1;
+      reportTextureProgress();
     }
-
-    if (required) {
-      throw new Error(`Parsed data zip is missing required texture: ${candidateNames[0]}.`);
-    }
-
-    return null;
   };
 
   const fillPathMetaAEntry = await readTexture(["fill-path-meta-a"], false);
@@ -424,7 +456,9 @@ export async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<V
   const textOutOfPageCount = readNonNegativeInt(sceneMeta.textOutOfPageCount, Math.max(0, sourceTextCount - textInPageCount));
   const pageCount = Math.max(1, readNonNegativeInt(sceneMeta.pageCount, 1));
   const pagesPerRow = Math.max(1, readNonNegativeInt(sceneMeta.pagesPerRow, 1));
+  progress.report(0.82, { stage: "zip-file", sourceType: "zip", unit: "files" });
   let rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta);
+  progress.report(0.88, { stage: "compile", sourceType: "zip" });
   if (rasterLayers.length === 0) {
     const sourcePdfBytes = await readSourcePdfBytesFromParsedData(zip, manifest);
     if (sourcePdfBytes) {
@@ -460,8 +494,9 @@ export async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<V
   const bounds = parsedBounds ?? fallbackBounds;
   const pageBounds = parsedPageBounds ?? bounds;
   const pageRects = parsePageRects(sceneMeta.pageRects, pageBounds);
+  progress.report(0.96, { stage: "compile", sourceType: "zip" });
 
-  return {
+  const scene = {
     pageRects,
     fillPathCount,
     fillSegmentCount,
@@ -508,6 +543,8 @@ export async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<V
     discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
   };
+  progress.complete({ sourceType: "zip" });
+  return scene;
 }
 
 export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
