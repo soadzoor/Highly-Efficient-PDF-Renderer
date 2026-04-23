@@ -101,6 +101,20 @@
         opacity: 0.92;
       }
 
+      .meter-row {
+        justify-content: space-between;
+        font-size: 13px;
+        color: rgba(232, 237, 245, 0.88);
+      }
+
+      .meter-label {
+        color: rgba(232, 237, 245, 0.66);
+      }
+
+      .meter-value {
+        font-variant-numeric: tabular-nums;
+      }
+
       #parse-loader {
         display: inline-flex;
         align-items: center;
@@ -163,6 +177,10 @@
       <div id="parse-loader" class="row" hidden>
         <span class="loader-spinner" aria-hidden="true"></span>
         <span id="parse-loader-text">Parsing / loading...</span>
+      </div>
+      <div class="row meter-row">
+        <span class="meter-label">FPS</span>
+        <span id="fps-value" class="meter-value">-</span>
       </div>
     </div>
 

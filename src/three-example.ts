@@ -24,6 +24,7 @@ const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
 const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
+const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
 
 if (
   !canvas ||
@@ -34,7 +35,8 @@ if (
   !backendSelect ||
   !statusElement ||
   !parseLoader ||
-  !parseLoaderText
+  !parseLoaderText ||
+  !fpsValue
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
@@ -48,6 +50,7 @@ const backendSelectElement = backendSelect;
 const statusElementNode = statusElement;
 const parseLoaderElement = parseLoader;
 const parseLoaderTextElement = parseLoaderText;
+const fpsValueElement = fpsValue;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
@@ -74,6 +77,8 @@ camera.lookAt(0, 0, 0);
 let currentPdfObject: HeprThreePdfObject | null = null;
 let lastLoadedSource: File | string | null = null;
 let animationFrameId = 0;
+let fpsLastSampleTime = 0;
+let fpsSmoothed = 0;
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
 const interactionController = createCanvasInteractionController(() => {
@@ -89,8 +94,9 @@ const interactionController = createCanvasInteractionController(() => {
 });
 interactionController.attach(renderer.domElement);
 
-function renderFrame(): void {
+function renderFrame(now: number = performance.now()): void {
   animationFrameId = requestAnimationFrame(renderFrame);
+  updateFpsMeter(now);
   renderer.render(scene, camera);
 }
 renderFrame();
@@ -255,6 +261,18 @@ function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
 function setLoadingProgress(visible: boolean, text = ""): void {
   parseLoaderElement.hidden = !visible;
   parseLoaderTextElement.textContent = visible ? text : "";
+}
+
+function updateFpsMeter(now: number): void {
+  if (fpsLastSampleTime > 0) {
+    const deltaMs = now - fpsLastSampleTime;
+    if (deltaMs > 0 && deltaMs < 1000) {
+      const fpsNow = 1000 / deltaMs;
+      fpsSmoothed = fpsSmoothed === 0 ? fpsNow : fpsSmoothed * 0.85 + fpsNow * 0.15;
+      fpsValueElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
+    }
+  }
+  fpsLastSampleTime = now;
 }
 
 async function loadExampleManifest(): Promise<void> {
