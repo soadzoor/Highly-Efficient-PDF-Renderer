@@ -186,12 +186,14 @@ async function loadSource(source: File | string): Promise<void> {
   backendSelectElement.disabled = true;
 
   try {
+    const hostCanvas = backend === "webgl" ? renderer.domElement : undefined;
     const nextObject = await pdfObjectGenerator(
       source,
       {
         segmentMerge: true,
         invisibleCull: true,
         curveStrokes: true,
+        hostCanvas,
         experimentalMaterialRasters: useWebGpuMaterialPipeline,
         experimentalMaterialFills: useWebGpuMaterialPipeline,
         experimentalMaterialStrokes: useWebGpuMaterialPipeline,

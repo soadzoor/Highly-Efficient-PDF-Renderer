@@ -21,6 +21,7 @@ export type HeprColorInput = number | string | [number, number, number];
 
 export interface HeprThreeObjectOptions {
   rendererType?: HeprRendererType;
+  hostCanvas?: HTMLCanvasElement;
   experimentalMaterialRasters?: boolean;
   experimentalMaterialFills?: boolean;
   experimentalMaterialStrokes?: boolean;
@@ -304,28 +305,27 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.directHostRendering || this.rendererType !== "webgl") {
       return;
     }
-    if (this.renderCanvas === hostCanvas) {
-      this.directHostRendering = true;
-      return;
+    if (this.renderCanvas !== hostCanvas) {
+      const previousRenderer = this.renderer;
+      const previousView = previousRenderer.getViewState();
+      const nextRenderer = new WebGlFloorplanRenderer(hostCanvas);
+      applyRendererConfig(nextRenderer, this.rendererConfig);
+      nextRenderer.setExternalFrameDriver?.(true);
+      nextRenderer.setScene(this.sceneData);
+      nextRenderer.setViewState(previousView);
+      nextRenderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
+
+      previousRenderer.setInteractionViewportProvider(null);
+      previousRenderer.setFrameListener(null);
+      previousRenderer.dispose();
+
+      this.renderer = nextRenderer;
+      this.renderCanvas = hostCanvas;
+      this.userData.hepr.renderer = this.renderer;
     }
 
-    const previousRenderer = this.renderer;
-    const previousView = previousRenderer.getViewState();
-    const nextRenderer = new WebGlFloorplanRenderer(hostCanvas);
-    applyRendererConfig(nextRenderer, this.rendererConfig);
-    nextRenderer.setExternalFrameDriver?.(true);
-    nextRenderer.setScene(this.sceneData);
-    nextRenderer.setViewState(previousView);
-    nextRenderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
-
-    previousRenderer.setInteractionViewportProvider(null);
-    previousRenderer.setFrameListener(null);
-    previousRenderer.dispose();
-
-    this.renderer = nextRenderer;
-    this.renderCanvas = hostCanvas;
+    this.renderer.setExternalFrameDriver?.(true);
     this.directHostRendering = true;
-    this.userData.hepr.renderer = this.renderer;
 
     if (this.renderTexture) {
       this.renderTexture.dispose();
@@ -569,15 +569,24 @@ export async function createThreePdfObject(
 ): Promise<HeprThreePdfObject> {
   const rendererType = options.rendererType ?? "webgl";
   const sceneBounds = normalizeBounds(resolveSceneFitBounds(loadedScene.scene));
-  const initialCanvasSize = computeInitialCanvasSize(sceneBounds);
-  const renderCanvas = document.createElement("canvas");
-  renderCanvas.width = initialCanvasSize.width;
-  renderCanvas.height = initialCanvasSize.height;
+  const hostCanvas = rendererType === "webgl" ? options.hostCanvas ?? null : null;
+  const renderCanvas = hostCanvas ?? document.createElement("canvas");
+  if (hostCanvas) {
+    if (renderCanvas.width <= 0 || renderCanvas.height <= 0) {
+      const fallbackCanvasSize = computeInitialCanvasSize(sceneBounds);
+      renderCanvas.width = fallbackCanvasSize.width;
+      renderCanvas.height = fallbackCanvasSize.height;
+    }
+  } else {
+    const initialCanvasSize = computeInitialCanvasSize(sceneBounds);
+    renderCanvas.width = initialCanvasSize.width;
+    renderCanvas.height = initialCanvasSize.height;
+  }
 
   const rendererConfig = normalizeRendererConfig(options);
   const nativeRenderer = await createNativeRenderer(rendererType, renderCanvas);
   applyRendererConfig(nativeRenderer, rendererConfig);
-  if (rendererType === "webgpu") {
+  if (rendererType === "webgpu" || hostCanvas) {
     nativeRenderer.setExternalFrameDriver?.(true);
   }
   nativeRenderer.setScene(loadedScene.scene);
@@ -680,6 +689,9 @@ export async function createThreePdfObject(
   pageMesh.onBeforeRender = (renderer, _scene, camera) => {
     object.handleBeforeRender(renderer as THREE.WebGLRenderer, camera as THREE.Camera);
   };
+  if (hostCanvas) {
+    object.prepareHostRendering(hostCanvas);
+  }
 
   return object;
 }
