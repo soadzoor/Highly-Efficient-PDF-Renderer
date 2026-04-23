@@ -228,6 +228,7 @@ async function loadSource(source: File | string): Promise<void> {
 
 function replacePdfObject(nextObject: HeprThreePdfObject): void {
   disposeCurrentObject();
+  nextObject.prepareHostRendering(renderer.domElement);
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
   nextObject.renderer.setFrameListener(null);
   currentPdfObject = nextObject;

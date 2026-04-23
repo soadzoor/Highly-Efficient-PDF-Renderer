@@ -1338,6 +1338,7 @@ export class WebGlFloorplanRenderer {
   private vectorOverrideColor: [number, number, number] = [0, 0, 0];
 
   private vectorOverrideOpacity = 0;
+  private isDisposed = false;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -1843,17 +1844,102 @@ export class WebGlFloorplanRenderer {
   }
 
   dispose(): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.isDisposed = true;
+
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = 0;
     }
+    this.externalFrameDriver = true;
     this.frameListener = null;
+    this.interactionViewportProvider = null;
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
+    const gl = this.gl;
     for (const layer of this.rasterLayers) {
-      this.gl.deleteTexture(layer.texture);
+      gl.deleteTexture(layer.texture);
     }
     this.rasterLayers = [];
+
+    const textures: WebGLTexture[] = [
+      this.segmentTextureA,
+      this.segmentTextureB,
+      this.segmentTextureC,
+      this.segmentTextureD,
+      this.fillPathMetaTextureA,
+      this.fillPathMetaTextureB,
+      this.fillPathMetaTextureC,
+      this.fillSegmentTextureA,
+      this.fillSegmentTextureB,
+      this.textInstanceTextureA,
+      this.textInstanceTextureB,
+      this.textInstanceTextureC,
+      this.textGlyphMetaTextureA,
+      this.textGlyphMetaTextureB,
+      this.textGlyphRasterMetaTexture,
+      this.textGlyphSegmentTextureA,
+      this.textGlyphSegmentTextureB,
+      this.textRasterAtlasTexture,
+      this.pageBackgroundTexture
+    ];
+    for (const texture of textures) {
+      gl.deleteTexture(texture);
+    }
+
+    const buffers: WebGLBuffer[] = [
+      this.cornerBuffer,
+      this.allSegmentIdBuffer,
+      this.visibleSegmentIdBuffer,
+      this.allFillPathIdBuffer,
+      this.allTextInstanceIdBuffer
+    ];
+    for (const buffer of buffers) {
+      gl.deleteBuffer(buffer);
+    }
+
+    const vaos: WebGLVertexArrayObject[] = [
+      this.segmentVao,
+      this.fillVao,
+      this.textVao,
+      this.blitVao
+    ];
+    for (const vao of vaos) {
+      gl.deleteVertexArray(vao);
+    }
+
+    const programs: WebGLProgram[] = [
+      this.segmentProgram,
+      this.fillProgram,
+      this.textProgram,
+      this.blitProgram,
+      this.vectorCompositeProgram,
+      this.rasterProgram
+    ];
+    for (const program of programs) {
+      gl.deleteProgram(program);
+    }
+
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(null);
+    for (let unit = 0; unit <= 13; unit += 1) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+
+    this.scene = null;
+    this.grid = null;
+    this.sceneStats = null;
+    this.pageRects = new Float32Array(0);
+    this.pageTextRanges = new Uint32Array(0);
+    this.visiblePageRectIndices = new Uint32Array(0);
+    this.visibleTextRanges = [];
   }
 
   panByPixels(deltaX: number, deltaY: number): void {
