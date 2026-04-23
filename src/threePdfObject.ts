@@ -15,6 +15,9 @@ const DEFAULT_INITIAL_LONG_SIDE = 2048;
 const DEFAULT_MIN_CANVAS_DIMENSION = 256;
 const DEFAULT_MAX_CANVAS_DIMENSION = 4096;
 const DEFAULT_MAX_CANVAS_PIXELS = 4_194_304;
+const PERSPECTIVE_NATIVE_OVERSAMPLE = 1.15;
+const PERSPECTIVE_RESIZE_HYSTERESIS_MIN = 0.9;
+const PERSPECTIVE_RESIZE_HYSTERESIS_MAX = 1.12;
 
 export type HeprRendererType = "webgl" | "webgpu";
 export type HeprColorInput = number | string | [number, number, number];
@@ -22,6 +25,8 @@ export type HeprColorInput = number | string | [number, number, number];
 export interface HeprThreeObjectOptions {
   rendererType?: HeprRendererType;
   hostCanvas?: HTMLCanvasElement;
+  threeCameraDriven?: boolean;
+  threeCameraDebugLogs?: boolean;
   experimentalMaterialRasters?: boolean;
   experimentalMaterialFills?: boolean;
   experimentalMaterialStrokes?: boolean;
@@ -39,6 +44,18 @@ export interface HeprThreeObjectOptions {
 interface ViewportPixels {
   width: number;
   height: number;
+}
+
+interface SceneBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+interface DerivedThreeCameraView {
+  viewState: ViewState;
+  nativeViewport: ViewportPixels;
 }
 
 interface RendererConfig {
@@ -64,11 +81,16 @@ export class HeprThreePdfObject extends THREE.Group {
   renderCanvas: HTMLCanvasElement;
   renderTexture: THREE.CanvasTexture | null;
   directHostRendering: boolean;
+  readonly threeCameraDriven: boolean;
+  readonly threeCameraDebugLogs: boolean;
 
   private readonly pageMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
   private readonly uvArray: Float32Array;
   private readonly uvAttribute: THREE.BufferAttribute;
-  private readonly sceneBounds: { minX: number; minY: number; maxX: number; maxY: number };
+  private readonly sceneBounds: SceneBounds;
+  private readonly localSceneBounds: SceneBounds;
+  private readonly sceneCenterX: number;
+  private readonly sceneCenterY: number;
   private readonly cameraDepthByCamera = new WeakMap<THREE.Camera, number>();
   private readonly rendererConfig: RendererConfig;
   private readonly rasterMaterialLayer: ThreeMaterialRasterLayer | null;
@@ -84,7 +106,36 @@ export class HeprThreePdfObject extends THREE.Group {
   private lastUploadedFrameSerial = -1;
   private lastViewportWidth = 0;
   private lastViewportHeight = 0;
+  private textureAnisotropy = 1;
+  private perspectiveVectorPipelineActive = false;
   private isDisposed = false;
+  private warnedThreeCameraUnsupported = false;
+  private warnedThreeCameraPerspectiveFallback = false;
+  private lastThreeCameraWarningMessage: string | null = null;
+  private lastThreeCameraWarningAtMs = 0;
+  private readonly pagePlane = new THREE.Plane();
+  private readonly pagePlanePoint = new THREE.Vector3();
+  private readonly pagePlaneNormal = new THREE.Vector3();
+  private readonly pageWorldInverse = new THREE.Matrix4();
+  private readonly clipFromWorldMatrix = new THREE.Matrix4();
+  private readonly clipFromLocalMatrix = new THREE.Matrix4();
+  private readonly clipFromDataMatrix = new THREE.Matrix4();
+  private readonly dataToLocalMatrix = new THREE.Matrix4();
+  private readonly ndcOrigin = new THREE.Vector3();
+  private readonly ndcLocalX = new THREE.Vector3();
+  private readonly ndcLocalY = new THREE.Vector3();
+  private readonly rayOriginNear = new THREE.Vector3();
+  private readonly rayFarPoint = new THREE.Vector3();
+  private readonly rayDirection = new THREE.Vector3();
+  private readonly worldIntersection = new THREE.Vector3();
+  private readonly localIntersection = new THREE.Vector3();
+  private readonly projectedCorner0 = new THREE.Vector3();
+  private readonly projectedCorner1 = new THREE.Vector3();
+  private readonly projectedCorner2 = new THREE.Vector3();
+  private readonly projectedCorner3 = new THREE.Vector3();
+  private readonly projectedCenter = new THREE.Vector3();
+  private readonly projectedBasisX = new THREE.Vector3();
+  private readonly projectedBasisY = new THREE.Vector3();
 
   constructor(
     loadedScene: LoadedPdfScene,
@@ -93,6 +144,8 @@ export class HeprThreePdfObject extends THREE.Group {
     renderCanvas: HTMLCanvasElement,
     renderTexture: THREE.CanvasTexture | null,
     directHostRendering: boolean,
+    threeCameraDriven: boolean,
+    threeCameraDebugLogs: boolean,
     rendererConfig: RendererConfig,
     initialFitPaddingPixels: number,
     rasterMaterialLayer: ThreeMaterialRasterLayer | null,
@@ -112,6 +165,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.renderCanvas = renderCanvas;
     this.renderTexture = renderTexture;
     this.directHostRendering = directHostRendering;
+    this.threeCameraDriven = threeCameraDriven;
+    this.threeCameraDebugLogs = threeCameraDebugLogs;
     this.rendererConfig = rendererConfig;
     this.rasterMaterialLayer = rasterMaterialLayer;
     this.fillMaterialLayer = fillMaterialLayer;
@@ -123,6 +178,15 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pendingInitialFit = true;
     this.initialFitPaddingPixels = Math.max(0, initialFitPaddingPixels);
     this.sceneBounds = normalizeBounds(resolveSceneFitBounds(loadedScene.scene));
+    this.sceneCenterX = (this.sceneBounds.minX + this.sceneBounds.maxX) * 0.5;
+    this.sceneCenterY = (this.sceneBounds.minY + this.sceneBounds.maxY) * 0.5;
+    this.localSceneBounds = {
+      minX: this.sceneBounds.minX - this.sceneCenterX,
+      minY: this.sceneBounds.minY - this.sceneCenterY,
+      maxX: this.sceneBounds.maxX - this.sceneCenterX,
+      maxY: this.sceneBounds.maxY - this.sceneCenterY
+    };
+    this.dataToLocalMatrix.makeTranslation(-this.sceneCenterX, -this.sceneCenterY, 0);
     this.interactionController = createCanvasInteractionController(() => this.renderer);
     this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
 
@@ -234,46 +298,130 @@ export class HeprThreePdfObject extends THREE.Group {
       this.hostRenderCanvas = rendererCanvas;
     }
 
-    const viewport = readThreeRendererViewportPixels(renderer);
-    this.resizeNativeRendererCanvas(viewport);
+    const rendererViewport = readThreeRendererViewportPixels(renderer);
+    this.updateTextureSampling(renderer);
+    const cameraType = camera as { isPerspectiveCamera?: boolean };
+    const perspectiveThreeCameraMode = this.threeCameraDriven && cameraType.isPerspectiveCamera === true;
+    const perspectiveVectorPipelineEnabled =
+      perspectiveThreeCameraMode && this.setPerspectiveVectorPipelineActive(true);
+    if (!perspectiveThreeCameraMode) {
+      this.setPerspectiveVectorPipelineActive(false);
+    }
+
+    let nativeViewport = rendererViewport;
+    let nativeViewChanged = false;
+
+    if (this.threeCameraDriven) {
+      if (perspectiveThreeCameraMode) {
+        if (perspectiveVectorPipelineEnabled) {
+          this.warnedThreeCameraPerspectiveFallback = false;
+          const derivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
+          if (derivedView) {
+            nativeViewport = derivedView.nativeViewport;
+            this.resizeNativeRendererCanvas(nativeViewport);
+            const previousView = this.renderer.getViewState();
+            if (!isViewStateApproxEqual(previousView, derivedView.viewState)) {
+              this.renderer.setViewState(derivedView.viewState);
+              nativeViewChanged = true;
+            }
+            this.pendingInitialFit = false;
+          }
+        } else {
+          if (!this.warnedThreeCameraPerspectiveFallback) {
+            this.warnedThreeCameraPerspectiveFallback = true;
+            console.warn(
+              "[HEPR] threeCameraDriven with PerspectiveCamera uses adaptive texture fallback. Camera rotation is handled by Three.js; HEPR updates texture resolution/view as needed."
+            );
+          }
+          const perspectiveView = this.derivePerspectiveFallbackViewState(camera as THREE.PerspectiveCamera, rendererViewport);
+          if (perspectiveView) {
+            nativeViewport = perspectiveView.nativeViewport;
+            this.resizeNativeRendererCanvas(nativeViewport);
+            const previousView = this.renderer.getViewState();
+            if (!isViewStateApproxEqual(previousView, perspectiveView.viewState)) {
+              this.renderer.setViewState(perspectiveView.viewState);
+              nativeViewChanged = true;
+            }
+            this.pendingInitialFit = false;
+          } else {
+            this.resizeNativeRendererCanvas(nativeViewport);
+          }
+        }
+      } else {
+        this.warnedThreeCameraPerspectiveFallback = false;
+        const derivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
+        if (derivedView) {
+          nativeViewport = derivedView.nativeViewport;
+          this.resizeNativeRendererCanvas(nativeViewport);
+          this.renderer.setViewState(derivedView.viewState);
+          this.pendingInitialFit = false;
+          nativeViewChanged = true;
+        } else {
+          this.resizeNativeRendererCanvas(nativeViewport);
+        }
+      }
+    } else {
+      this.warnedThreeCameraPerspectiveFallback = false;
+      this.resizeNativeRendererCanvas(nativeViewport);
+    }
+
+    const viewportChanged = nativeViewport.width !== this.lastViewportWidth || nativeViewport.height !== this.lastViewportHeight;
     if (this.pendingInitialFit) {
       this.renderer.fitToBounds(resolveSceneFitBounds(this.sceneData), this.initialFitPaddingPixels);
       this.pendingInitialFit = false;
+      nativeViewChanged = true;
     }
 
-    if (this.rendererType === "webgpu") {
+    const shouldRenderDirectHost = this.directHostRendering && renderer.getRenderTarget() === null;
+    const shouldRenderThreeCameraFrame =
+      this.threeCameraDriven &&
+      !this.perspectiveVectorPipelineActive &&
+      (
+        !perspectiveThreeCameraMode ||
+        nativeViewChanged ||
+        viewportChanged
+      );
+    const shouldRenderExternally = shouldRenderDirectHost || shouldRenderThreeCameraFrame || this.rendererType === "webgpu";
+    if (shouldRenderExternally) {
+      if (shouldRenderDirectHost) {
+        renderer.resetState();
+      }
       this.renderer.renderExternalFrame?.(performance.now());
+      if (shouldRenderDirectHost) {
+        renderer.resetState();
+      }
     }
 
-    if (this.directHostRendering && renderer.getRenderTarget() === null) {
-      renderer.resetState();
-      this.renderer.renderExternalFrame?.(performance.now());
-      renderer.resetState();
-    }
+    this.updateMaterialLayerTransforms(camera, nativeViewport, perspectiveVectorPipelineEnabled);
 
     const presentedFrameSerial = this.renderer.getPresentedFrameSerial();
-    const viewportChanged = viewport.width !== this.lastViewportWidth || viewport.height !== this.lastViewportHeight;
-    if (viewportChanged || presentedFrameSerial !== this.lastSyncedFrameSerial) {
+    if (viewportChanged || presentedFrameSerial !== this.lastSyncedFrameSerial || this.perspectiveVectorPipelineActive) {
       const viewState = this.renderer.getPresentedViewState();
-      this.syncOrthographicCamera(camera, viewState, viewport);
-      if (!this.directHostRendering) {
-        this.updateUvFromViewState(viewState, viewport);
+      if (!this.threeCameraDriven) {
+        this.syncOrthographicCamera(camera, viewState, nativeViewport);
+      }
+      if (!this.directHostRendering && this.renderTexture) {
+        if (perspectiveThreeCameraMode) {
+          this.updateUvToFullPage();
+        } else {
+          this.updateUvFromViewState(viewState, nativeViewport);
+        }
       }
       if (this.rasterMaterialLayer && this.rasterMaterialLayer.group.visible) {
-        this.rasterMaterialLayer.updateFrame(viewState, viewport);
+        this.rasterMaterialLayer.updateFrame(viewState, nativeViewport);
       }
       if (this.fillMaterialLayer && this.fillMaterialLayer.mesh.visible) {
-        this.fillMaterialLayer.updateFrame(viewState, viewport);
+        this.fillMaterialLayer.updateFrame(viewState, nativeViewport);
       }
       if (this.strokeMaterialLayer && this.strokeMaterialLayer.mesh.visible) {
-        this.strokeMaterialLayer.updateFrame(viewState, viewport);
+        this.strokeMaterialLayer.updateFrame(viewState, nativeViewport);
       }
       if (this.textMaterialLayer && this.textMaterialLayer.mesh.visible) {
-        this.textMaterialLayer.updateFrame(viewState, viewport);
+        this.textMaterialLayer.updateFrame(viewState, nativeViewport);
       }
       this.lastSyncedFrameSerial = presentedFrameSerial;
-      this.lastViewportWidth = viewport.width;
-      this.lastViewportHeight = viewport.height;
+      this.lastViewportWidth = nativeViewport.width;
+      this.lastViewportHeight = nativeViewport.height;
     }
 
     if (!this.directHostRendering && this.renderTexture && presentedFrameSerial !== this.lastUploadedFrameSerial) {
@@ -287,8 +435,9 @@ export class HeprThreePdfObject extends THREE.Group {
       return;
     }
 
-    const width = Math.max(1, Math.round(viewport.width));
-    const height = Math.max(1, Math.round(viewport.height));
+    const clampedViewport = clampViewportPixels(viewport);
+    const width = clampedViewport.width;
+    const height = clampedViewport.height;
     if (this.renderCanvas.width === width && this.renderCanvas.height === height) {
       return;
     }
@@ -301,10 +450,193 @@ export class HeprThreePdfObject extends THREE.Group {
     this.lastUploadedFrameSerial = -1;
   }
 
+  private updateTextureSampling(renderer: THREE.WebGLRenderer): void {
+    if (this.directHostRendering || !this.renderTexture) {
+      this.textureAnisotropy = 1;
+      return;
+    }
+
+    const maxAnisotropy = Math.max(1, renderer.capabilities.getMaxAnisotropy());
+    if (this.textureAnisotropy === maxAnisotropy && this.renderTexture.anisotropy === maxAnisotropy) {
+      return;
+    }
+
+    this.textureAnisotropy = maxAnisotropy;
+    this.renderTexture.anisotropy = maxAnisotropy;
+    this.renderTexture.needsUpdate = true;
+  }
+
+  private hasCompleteMaterialLayers(): boolean {
+    return (
+      this.rasterMaterialLayer !== null &&
+      this.fillMaterialLayer !== null &&
+      this.strokeMaterialLayer !== null &&
+      this.textMaterialLayer !== null
+    );
+  }
+
+  private setPerspectiveVectorPipelineActive(active: boolean): boolean {
+    if (!active) {
+      if (!this.perspectiveVectorPipelineActive) {
+        return false;
+      }
+      this.perspectiveVectorPipelineActive = false;
+      if (this.directHostRendering) {
+        return false;
+      }
+
+      this.rasterMaterialLayer?.setVisible(false);
+      this.fillMaterialLayer?.setVisible(false);
+      this.strokeMaterialLayer?.setVisible(false);
+      this.textMaterialLayer?.setVisible(false);
+      this.renderer.setRasterRenderingEnabled?.(true);
+      this.renderer.setFillRenderingEnabled?.(true);
+      this.renderer.setStrokeRenderingEnabled?.(true);
+      this.renderer.setTextRenderingEnabled?.(true);
+
+      const previousMaterial = this.pageMesh.material;
+      if (!this.renderTexture) {
+        this.renderTexture = createRenderCanvasTexture(this.renderCanvas);
+      }
+      this.pageMesh.material = createTexturedPageMaterial(this.renderTexture);
+      previousMaterial.dispose();
+      this.pageMesh.frustumCulled = true;
+      this.pageMesh.renderOrder = 0;
+
+      this.lastSyncedFrameSerial = -1;
+      this.lastUploadedFrameSerial = -1;
+      this.lastViewportWidth = 0;
+      this.lastViewportHeight = 0;
+      return false;
+    }
+
+    if (this.rendererType !== "webgl" || !this.hasCompleteMaterialLayers()) {
+      this.perspectiveVectorPipelineActive = false;
+      return false;
+    }
+
+    if (this.directHostRendering) {
+      this.disableDirectHostRendering();
+    }
+
+    if (this.perspectiveVectorPipelineActive) {
+      return true;
+    }
+    this.perspectiveVectorPipelineActive = true;
+
+    this.rasterMaterialLayer?.setVisible(true);
+    this.rasterMaterialLayer?.setPageBackgroundColor(
+      this.rendererConfig.pageBackground[0],
+      this.rendererConfig.pageBackground[1],
+      this.rendererConfig.pageBackground[2],
+      this.rendererConfig.pageBackground[3]
+    );
+    this.fillMaterialLayer?.setVisible(true);
+    this.fillMaterialLayer?.setVectorOverride(
+      this.rendererConfig.vectorOverride[0],
+      this.rendererConfig.vectorOverride[1],
+      this.rendererConfig.vectorOverride[2],
+      this.rendererConfig.vectorOverride[3]
+    );
+    this.strokeMaterialLayer?.setVisible(true);
+    this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+    this.strokeMaterialLayer?.setVectorOverride(
+      this.rendererConfig.vectorOverride[0],
+      this.rendererConfig.vectorOverride[1],
+      this.rendererConfig.vectorOverride[2],
+      this.rendererConfig.vectorOverride[3]
+    );
+    this.textMaterialLayer?.setVisible(true);
+    this.textMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+    this.textMaterialLayer?.setTextVectorOnly(this.rendererConfig.textVectorOnly);
+    this.textMaterialLayer?.setVectorOverride(
+      this.rendererConfig.vectorOverride[0],
+      this.rendererConfig.vectorOverride[1],
+      this.rendererConfig.vectorOverride[2],
+      this.rendererConfig.vectorOverride[3]
+    );
+    this.renderer.setRasterRenderingEnabled?.(false);
+    this.renderer.setFillRenderingEnabled?.(false);
+    this.renderer.setStrokeRenderingEnabled?.(false);
+    this.renderer.setTextRenderingEnabled?.(false);
+
+    const previousMaterial = this.pageMesh.material;
+    this.renderTexture?.dispose();
+    this.renderTexture = null;
+    this.pageMesh.material = createDirectHostTriggerMaterial();
+    previousMaterial.dispose();
+    this.pageMesh.frustumCulled = false;
+    this.pageMesh.renderOrder = -1_000_000;
+
+    this.lastSyncedFrameSerial = -1;
+    this.lastUploadedFrameSerial = -1;
+    this.lastViewportWidth = 0;
+    this.lastViewportHeight = 0;
+    return true;
+  }
+
+  private updateMaterialLayerTransforms(
+    camera: THREE.Camera,
+    viewport: ViewportPixels,
+    useLocalToClip: boolean
+  ): void {
+    if (!this.rasterMaterialLayer || !this.fillMaterialLayer || !this.strokeMaterialLayer || !this.textMaterialLayer) {
+      return;
+    }
+
+    if (!useLocalToClip) {
+      this.rasterMaterialLayer.setScreenSpaceTransform();
+      this.fillMaterialLayer.setScreenSpaceTransform();
+      this.strokeMaterialLayer.setScreenSpaceTransform();
+      this.textMaterialLayer.setScreenSpaceTransform();
+      return;
+    }
+
+    this.clipFromWorldMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    this.clipFromLocalMatrix.multiplyMatrices(this.clipFromWorldMatrix, this.pageMesh.matrixWorld);
+    this.clipFromDataMatrix.multiplyMatrices(this.clipFromLocalMatrix, this.dataToLocalMatrix);
+    const localUnitsPerPixel = this.estimateLocalUnitsPerPixel(camera, viewport);
+    this.rasterMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
+    this.fillMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
+    this.strokeMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
+    this.textMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
+  }
+
+  private estimateLocalUnitsPerPixel(camera: THREE.Camera, viewport: ViewportPixels): number {
+    const viewportWidth = Math.max(1, viewport.width);
+    const viewportHeight = Math.max(1, viewport.height);
+    this.projectedCenter.set(0, 0, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+    this.projectedBasisX.set(1, 0, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+    this.projectedBasisY.set(0, 1, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+
+    if (
+      !Number.isFinite(this.projectedCenter.x) || !Number.isFinite(this.projectedCenter.y) ||
+      !Number.isFinite(this.projectedBasisX.x) || !Number.isFinite(this.projectedBasisX.y) ||
+      !Number.isFinite(this.projectedBasisY.x) || !Number.isFinite(this.projectedBasisY.y)
+    ) {
+      return 1 / Math.max(1e-6, this.renderer.getViewState().zoom);
+    }
+
+    const scaleX = Math.hypot(
+      (this.projectedBasisX.x - this.projectedCenter.x) * 0.5 * viewportWidth,
+      (this.projectedBasisX.y - this.projectedCenter.y) * 0.5 * viewportHeight
+    );
+    const scaleY = Math.hypot(
+      (this.projectedBasisY.x - this.projectedCenter.x) * 0.5 * viewportWidth,
+      (this.projectedBasisY.y - this.projectedCenter.y) * 0.5 * viewportHeight
+    );
+    const pixelsPerLocalUnit = Math.max(scaleX, scaleY);
+    if (!Number.isFinite(pixelsPerLocalUnit) || pixelsPerLocalUnit <= 1e-6) {
+      return 1 / Math.max(1e-6, this.renderer.getViewState().zoom);
+    }
+    return 1 / pixelsPerLocalUnit;
+  }
+
   private tryEnableDirectHostRendering(hostCanvas: HTMLCanvasElement): void {
     if (this.directHostRendering || this.rendererType !== "webgl") {
       return;
     }
+    this.perspectiveVectorPipelineActive = false;
     if (this.renderCanvas !== hostCanvas) {
       const previousRenderer = this.renderer;
       const previousView = previousRenderer.getViewState();
@@ -392,6 +724,59 @@ export class HeprThreePdfObject extends THREE.Group {
     } else {
       this.renderer.setTextRenderingEnabled?.(true);
     }
+
+    this.lastSyncedFrameSerial = -1;
+    this.lastUploadedFrameSerial = -1;
+    this.lastViewportWidth = 0;
+    this.lastViewportHeight = 0;
+  }
+
+  private disableDirectHostRendering(): void {
+    if (!this.directHostRendering || this.rendererType !== "webgl") {
+      return;
+    }
+
+    const previousRenderer = this.renderer;
+    const previousView = previousRenderer.getViewState();
+    const nextCanvas = document.createElement("canvas");
+    const fallbackViewport = this.resolveKnownViewportPixelsForFit() ?? computeInitialCanvasSize(this.sceneBounds);
+    const clampedViewport = clampViewportPixels(fallbackViewport);
+    nextCanvas.width = clampedViewport.width;
+    nextCanvas.height = clampedViewport.height;
+
+    const nextRenderer = new WebGlFloorplanRenderer(nextCanvas);
+    applyRendererConfig(nextRenderer, this.rendererConfig);
+    nextRenderer.setExternalFrameDriver?.(true);
+    nextRenderer.setScene(this.sceneData);
+    nextRenderer.setViewState(previousView);
+    nextRenderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
+
+    previousRenderer.setInteractionViewportProvider(null);
+    previousRenderer.setFrameListener(null);
+    previousRenderer.dispose();
+
+    this.renderer = nextRenderer;
+    this.renderCanvas = nextCanvas;
+    this.userData.hepr.renderer = this.renderer;
+    this.directHostRendering = false;
+    this.perspectiveVectorPipelineActive = false;
+
+    this.rasterMaterialLayer?.setVisible(false);
+    this.fillMaterialLayer?.setVisible(false);
+    this.strokeMaterialLayer?.setVisible(false);
+    this.textMaterialLayer?.setVisible(false);
+    this.renderer.setRasterRenderingEnabled?.(true);
+    this.renderer.setFillRenderingEnabled?.(true);
+    this.renderer.setStrokeRenderingEnabled?.(true);
+    this.renderer.setTextRenderingEnabled?.(true);
+
+    const previousMaterial = this.pageMesh.material;
+    this.renderTexture?.dispose();
+    this.renderTexture = createRenderCanvasTexture(this.renderCanvas);
+    this.pageMesh.material = createTexturedPageMaterial(this.renderTexture);
+    previousMaterial.dispose();
+    this.pageMesh.frustumCulled = true;
+    this.pageMesh.renderOrder = 0;
 
     this.lastSyncedFrameSerial = -1;
     this.lastUploadedFrameSerial = -1;
@@ -506,7 +891,11 @@ export class HeprThreePdfObject extends THREE.Group {
 
     const z = this.cameraDepthByCamera.get(maybeOrtho) ?? maybeOrtho.position.z;
     this.cameraDepthByCamera.set(maybeOrtho, z);
-    maybeOrtho.position.set(viewState.cameraCenterX, viewState.cameraCenterY, z);
+    maybeOrtho.position.set(
+      viewState.cameraCenterX - this.sceneCenterX,
+      viewState.cameraCenterY - this.sceneCenterY,
+      z
+    );
     maybeOrtho.updateProjectionMatrix();
   }
 
@@ -517,19 +906,43 @@ export class HeprThreePdfObject extends THREE.Group {
     const viewMinX = viewState.cameraCenterX - viewWidth * 0.5;
     const viewMinY = viewState.cameraCenterY - viewHeight * 0.5;
 
-    const x0 = this.sceneBounds.minX;
-    const y0 = this.sceneBounds.minY;
-    const x1 = this.sceneBounds.maxX;
-    const y1 = this.sceneBounds.maxY;
+    const localX0 = this.localSceneBounds.minX;
+    const localY0 = this.localSceneBounds.minY;
+    const localX1 = this.localSceneBounds.maxX;
+    const localY1 = this.localSceneBounds.maxY;
 
-    this.uvArray[0] = (x0 - viewMinX) / viewWidth;
-    this.uvArray[1] = (y0 - viewMinY) / viewHeight;
-    this.uvArray[2] = (x1 - viewMinX) / viewWidth;
-    this.uvArray[3] = (y0 - viewMinY) / viewHeight;
-    this.uvArray[4] = (x1 - viewMinX) / viewWidth;
-    this.uvArray[5] = (y1 - viewMinY) / viewHeight;
-    this.uvArray[6] = (x0 - viewMinX) / viewWidth;
-    this.uvArray[7] = (y1 - viewMinY) / viewHeight;
+    this.uvArray[0] = (localX0 + this.sceneCenterX - viewMinX) / viewWidth;
+    this.uvArray[1] = (localY0 + this.sceneCenterY - viewMinY) / viewHeight;
+    this.uvArray[2] = (localX1 + this.sceneCenterX - viewMinX) / viewWidth;
+    this.uvArray[3] = (localY0 + this.sceneCenterY - viewMinY) / viewHeight;
+    this.uvArray[4] = (localX1 + this.sceneCenterX - viewMinX) / viewWidth;
+    this.uvArray[5] = (localY1 + this.sceneCenterY - viewMinY) / viewHeight;
+    this.uvArray[6] = (localX0 + this.sceneCenterX - viewMinX) / viewWidth;
+    this.uvArray[7] = (localY1 + this.sceneCenterY - viewMinY) / viewHeight;
+    this.uvAttribute.needsUpdate = true;
+  }
+
+  private updateUvToFullPage(): void {
+    const expected = [0, 0, 1, 0, 1, 1, 0, 1] as const;
+    let changed = false;
+    for (let i = 0; i < expected.length; i += 1) {
+      if (Math.abs(this.uvArray[i] - expected[i]) > 1e-7) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) {
+      return;
+    }
+
+    this.uvArray[0] = 0;
+    this.uvArray[1] = 0;
+    this.uvArray[2] = 1;
+    this.uvArray[3] = 0;
+    this.uvArray[4] = 1;
+    this.uvArray[5] = 1;
+    this.uvArray[6] = 0;
+    this.uvArray[7] = 1;
     this.uvAttribute.needsUpdate = true;
   }
 
@@ -561,6 +974,313 @@ export class HeprThreePdfObject extends THREE.Group {
       : Math.max(1, Math.round(canvas.clientHeight * (window.devicePixelRatio || 1)));
     return { width, height };
   }
+
+  private deriveViewStateFromThreeCamera(camera: THREE.Camera, viewport: ViewportPixels): DerivedThreeCameraView | null {
+    const cameraType = camera as { isOrthographicCamera?: boolean; isPerspectiveCamera?: boolean };
+    if (cameraType.isOrthographicCamera !== true && cameraType.isPerspectiveCamera !== true) {
+      this.warnThreeCameraUnsupported("[HEPR] threeCameraDriven mode supports orthographic or perspective cameras.");
+      return null;
+    }
+
+    if (cameraType.isOrthographicCamera === true) {
+      const orthographicView = this.deriveAxisAlignedOrthographicViewState(camera as THREE.OrthographicCamera, viewport);
+      if (!orthographicView) {
+        return null;
+      }
+      this.warnedThreeCameraUnsupported = false;
+      return orthographicView;
+    }
+
+    this.pagePlanePoint.set(0, 0, 0).applyMatrix4(this.pageMesh.matrixWorld);
+    this.pagePlaneNormal.set(0, 0, 1).transformDirection(this.pageMesh.matrixWorld);
+    if (!Number.isFinite(this.pagePlaneNormal.x) || !Number.isFinite(this.pagePlaneNormal.y) || !Number.isFinite(this.pagePlaneNormal.z)) {
+      return null;
+    }
+    this.pagePlane.setFromNormalAndCoplanarPoint(this.pagePlaneNormal, this.pagePlanePoint);
+    this.pageWorldInverse.copy(this.pageMesh.matrixWorld);
+    if (Math.abs(this.pageWorldInverse.determinant()) < 1e-10) {
+      this.warnThreeCameraUnsupported("[HEPR] threeCameraDriven mode requires a non-singular PDF object transform.");
+      return null;
+    }
+    this.pageWorldInverse.invert();
+
+    let minLocalX = Number.POSITIVE_INFINITY;
+    let minLocalY = Number.POSITIVE_INFINITY;
+    let maxLocalX = Number.NEGATIVE_INFINITY;
+    let maxLocalY = Number.NEGATIVE_INFINITY;
+    const ndcCorners: readonly [readonly [number, number], readonly [number, number], readonly [number, number], readonly [number, number]] = [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1]
+    ] as const;
+    for (const [ndcX, ndcY] of ndcCorners) {
+      const localPoint = this.intersectViewportCornerWithPagePlane(camera, ndcX, ndcY);
+      if (!localPoint) {
+        this.warnThreeCameraUnsupported(
+          "[HEPR] threeCameraDriven mode could not project viewport corners onto the PDF plane for this camera/view."
+        );
+        return null;
+      }
+      minLocalX = Math.min(minLocalX, localPoint.x);
+      minLocalY = Math.min(minLocalY, localPoint.y);
+      maxLocalX = Math.max(maxLocalX, localPoint.x);
+      maxLocalY = Math.max(maxLocalY, localPoint.y);
+    }
+
+    const visibleWidth = Math.max(1e-6, maxLocalX - minLocalX);
+    const visibleHeight = Math.max(1e-6, maxLocalY - minLocalY);
+    const desiredNativeViewport = clampViewportPixels(viewport);
+    const zoom = Math.max(
+      1e-6,
+      Math.min(
+        desiredNativeViewport.width / visibleWidth,
+        desiredNativeViewport.height / visibleHeight
+      )
+    );
+    if (!Number.isFinite(zoom)) {
+      return null;
+    }
+
+    const cameraCenterX = (minLocalX + maxLocalX) * 0.5 + this.sceneCenterX;
+    const cameraCenterY = (minLocalY + maxLocalY) * 0.5 + this.sceneCenterY;
+    if (!Number.isFinite(cameraCenterX) || !Number.isFinite(cameraCenterY)) {
+      return null;
+    }
+
+    this.warnedThreeCameraUnsupported = false;
+    return {
+      viewState: { cameraCenterX, cameraCenterY, zoom },
+      nativeViewport: desiredNativeViewport
+    };
+  }
+
+  private deriveAxisAlignedOrthographicViewState(
+    camera: THREE.OrthographicCamera,
+    viewport: ViewportPixels
+  ): DerivedThreeCameraView | null {
+    const nativeViewport = clampViewportPixels(viewport);
+    this.clipFromWorldMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    this.clipFromLocalMatrix.multiplyMatrices(this.clipFromWorldMatrix, this.pageMesh.matrixWorld);
+
+    this.ndcOrigin.set(0, 0, 0).applyMatrix4(this.clipFromLocalMatrix);
+    this.ndcLocalX.set(1, 0, 0).applyMatrix4(this.clipFromLocalMatrix);
+    this.ndcLocalY.set(0, 1, 0).applyMatrix4(this.clipFromLocalMatrix);
+
+    const sx = this.ndcLocalX.x - this.ndcOrigin.x;
+    const sy = this.ndcLocalY.y - this.ndcOrigin.y;
+    const shearX = this.ndcLocalY.x - this.ndcOrigin.x;
+    const shearY = this.ndcLocalX.y - this.ndcOrigin.y;
+    const minAxisScale = 1e-8;
+    if (!Number.isFinite(sx) || !Number.isFinite(sy) || Math.abs(sx) < minAxisScale || Math.abs(sy) < minAxisScale) {
+      this.warnThreeCameraUnsupported(
+        `[HEPR] threeCameraDriven orthographic mode has invalid axis scale (sx=${sx.toExponential(3)}, sy=${sy.toExponential(3)}).`
+      );
+      return null;
+    }
+
+    const maxCrossAxis = 1e-4;
+    if (!Number.isFinite(shearX) || !Number.isFinite(shearY) || Math.abs(shearX) > maxCrossAxis || Math.abs(shearY) > maxCrossAxis) {
+      this.warnThreeCameraUnsupported(
+        `[HEPR] threeCameraDriven orthographic mode is skewed (shearX=${shearX.toExponential(3)}, shearY=${shearY.toExponential(3)}).`
+      );
+      return null;
+    }
+
+    const localCenterX = -this.ndcOrigin.x / sx;
+    const localCenterY = -this.ndcOrigin.y / sy;
+    const zoomX = Math.abs(sx) * nativeViewport.width * 0.5;
+    const zoomY = Math.abs(sy) * nativeViewport.height * 0.5;
+    const zoom = Math.max(1e-6, Math.min(zoomX, zoomY));
+    if (!Number.isFinite(localCenterX) || !Number.isFinite(localCenterY) || !Number.isFinite(zoom)) {
+      this.warnThreeCameraUnsupported(
+        `[HEPR] threeCameraDriven orthographic mode produced non-finite view values (cx=${localCenterX}, cy=${localCenterY}, zoom=${zoom}).`
+      );
+      return null;
+    }
+
+    return {
+      viewState: {
+        cameraCenterX: localCenterX + this.sceneCenterX,
+        cameraCenterY: localCenterY + this.sceneCenterY,
+        zoom
+      },
+      nativeViewport
+    };
+  }
+
+  private derivePerspectiveFallbackViewState(
+    camera: THREE.PerspectiveCamera,
+    viewport: ViewportPixels
+  ): DerivedThreeCameraView | null {
+    const clampedViewport = clampViewportPixels(viewport);
+    if (clampedViewport.width <= 0 || clampedViewport.height <= 0) {
+      return null;
+    }
+
+    const pageWidth = Math.max(1e-6, this.sceneBounds.maxX - this.sceneBounds.minX);
+    const pageHeight = Math.max(1e-6, this.sceneBounds.maxY - this.sceneBounds.minY);
+    const pageAspect = pageWidth / pageHeight;
+
+    const projectedFootprint = this.measureProjectedPageFootprint(camera, clampedViewport);
+    const targetFootprintWidth = Math.max(
+      1,
+      (projectedFootprint?.width ?? clampedViewport.width) * PERSPECTIVE_NATIVE_OVERSAMPLE
+    );
+    const targetFootprintHeight = Math.max(
+      1,
+      (projectedFootprint?.height ?? clampedViewport.height) * PERSPECTIVE_NATIVE_OVERSAMPLE
+    );
+
+    const requiredWidth = Math.max(targetFootprintWidth, targetFootprintHeight * pageAspect);
+    const requiredHeight = requiredWidth / pageAspect;
+    const desiredViewport = clampViewportPixels({
+      width: requiredWidth,
+      height: requiredHeight
+    });
+
+    let nativeViewport = desiredViewport;
+    const currentWidth = Math.max(1, Math.round(this.renderCanvas.width));
+    const currentHeight = Math.max(1, Math.round(this.renderCanvas.height));
+    if (currentWidth > 0 && currentHeight > 0) {
+      const widthRatio = desiredViewport.width / currentWidth;
+      const heightRatio = desiredViewport.height / currentHeight;
+      const withinHysteresis =
+        widthRatio >= PERSPECTIVE_RESIZE_HYSTERESIS_MIN &&
+        widthRatio <= PERSPECTIVE_RESIZE_HYSTERESIS_MAX &&
+        heightRatio >= PERSPECTIVE_RESIZE_HYSTERESIS_MIN &&
+        heightRatio <= PERSPECTIVE_RESIZE_HYSTERESIS_MAX;
+      if (withinHysteresis) {
+        nativeViewport = {
+          width: currentWidth,
+          height: currentHeight
+        };
+      }
+    }
+
+    const zoom = Math.max(
+      1e-6,
+      Math.min(
+        nativeViewport.width / pageWidth,
+        nativeViewport.height / pageHeight
+      )
+    );
+
+    return {
+      viewState: {
+        cameraCenterX: this.sceneCenterX,
+        cameraCenterY: this.sceneCenterY,
+        zoom
+      },
+      nativeViewport
+    };
+  }
+
+  private measureProjectedPageFootprint(
+    camera: THREE.PerspectiveCamera,
+    viewport: ViewportPixels
+  ): { width: number; height: number } | null {
+    const localX0 = this.localSceneBounds.minX;
+    const localY0 = this.localSceneBounds.minY;
+    const localX1 = this.localSceneBounds.maxX;
+    const localY1 = this.localSceneBounds.maxY;
+
+    this.projectedCorner0.set(localX0, localY0, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+    this.projectedCorner1.set(localX1, localY0, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+    this.projectedCorner2.set(localX1, localY1, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+    this.projectedCorner3.set(localX0, localY1, 0).applyMatrix4(this.pageMesh.matrixWorld).project(camera);
+
+    const corners = [this.projectedCorner0, this.projectedCorner1, this.projectedCorner2, this.projectedCorner3];
+    let minPixelX = Number.POSITIVE_INFINITY;
+    let minPixelY = Number.POSITIVE_INFINITY;
+    let maxPixelX = Number.NEGATIVE_INFINITY;
+    let maxPixelY = Number.NEGATIVE_INFINITY;
+
+    for (const corner of corners) {
+      if (!Number.isFinite(corner.x) || !Number.isFinite(corner.y) || !Number.isFinite(corner.z)) {
+        return null;
+      }
+      const pixelX = (corner.x * 0.5 + 0.5) * viewport.width;
+      const pixelY = (1 - (corner.y * 0.5 + 0.5)) * viewport.height;
+      minPixelX = Math.min(minPixelX, pixelX);
+      minPixelY = Math.min(minPixelY, pixelY);
+      maxPixelX = Math.max(maxPixelX, pixelX);
+      maxPixelY = Math.max(maxPixelY, pixelY);
+    }
+
+    if (!Number.isFinite(minPixelX) || !Number.isFinite(minPixelY) || !Number.isFinite(maxPixelX) || !Number.isFinite(maxPixelY)) {
+      return null;
+    }
+
+    const clippedMinX = Math.max(0, Math.min(viewport.width, minPixelX));
+    const clippedMinY = Math.max(0, Math.min(viewport.height, minPixelY));
+    const clippedMaxX = Math.max(0, Math.min(viewport.width, maxPixelX));
+    const clippedMaxY = Math.max(0, Math.min(viewport.height, maxPixelY));
+    const width = Math.max(0, clippedMaxX - clippedMinX);
+    const height = Math.max(0, clippedMaxY - clippedMinY);
+
+    if (width < 1 || height < 1) {
+      return null;
+    }
+    return { width, height };
+  }
+
+  private intersectViewportCornerWithPagePlane(
+    camera: THREE.Camera,
+    ndcX: number,
+    ndcY: number
+  ): THREE.Vector3 | null {
+    this.rayOriginNear.set(ndcX, ndcY, -1).unproject(camera);
+    this.rayFarPoint.set(ndcX, ndcY, 1).unproject(camera);
+    this.rayDirection.copy(this.rayFarPoint).sub(this.rayOriginNear);
+    const rayLengthSq = this.rayDirection.lengthSq();
+    if (!Number.isFinite(rayLengthSq) || rayLengthSq <= 1e-16) {
+      return null;
+    }
+    this.rayDirection.multiplyScalar(1 / Math.sqrt(rayLengthSq));
+
+    const denominator = this.pagePlane.normal.dot(this.rayDirection);
+    if (!Number.isFinite(denominator) || Math.abs(denominator) <= 1e-8) {
+      return null;
+    }
+    const distance = -(
+      this.pagePlane.normal.dot(this.rayOriginNear) + this.pagePlane.constant
+    ) / denominator;
+    if (!Number.isFinite(distance) || distance < 0) {
+      return null;
+    }
+
+    this.worldIntersection.copy(this.rayDirection).multiplyScalar(distance).add(this.rayOriginNear);
+    this.localIntersection.copy(this.worldIntersection).applyMatrix4(this.pageWorldInverse);
+    if (!Number.isFinite(this.localIntersection.x) || !Number.isFinite(this.localIntersection.y)) {
+      return null;
+    }
+    return this.localIntersection;
+  }
+
+  private warnThreeCameraUnsupported(message: string): void {
+    if (!this.threeCameraDebugLogs) {
+      if (this.warnedThreeCameraUnsupported) {
+        return;
+      }
+      this.warnedThreeCameraUnsupported = true;
+      console.warn(message);
+      return;
+    }
+
+    const now = performance.now();
+    const sameMessage = this.lastThreeCameraWarningMessage === message;
+    const tooSoon = sameMessage && now - this.lastThreeCameraWarningAtMs < 250;
+    if (tooSoon) {
+      this.warnedThreeCameraUnsupported = true;
+      return;
+    }
+
+    this.warnedThreeCameraUnsupported = true;
+    this.lastThreeCameraWarningMessage = message;
+    this.lastThreeCameraWarningAtMs = now;
+    console.warn(`${message} source=${this.sourceLabel}`);
+  }
 }
 
 export async function createThreePdfObject(
@@ -568,8 +1288,12 @@ export async function createThreePdfObject(
   options: HeprThreeObjectOptions = {}
 ): Promise<HeprThreePdfObject> {
   const rendererType = options.rendererType ?? "webgl";
+  const threeCameraDriven = options.threeCameraDriven === true;
+  const threeCameraDebugLogs = options.threeCameraDebugLogs === true;
   const sceneBounds = normalizeBounds(resolveSceneFitBounds(loadedScene.scene));
-  const hostCanvas = rendererType === "webgl" ? options.hostCanvas ?? null : null;
+  const sceneCenterX = (sceneBounds.minX + sceneBounds.maxX) * 0.5;
+  const sceneCenterY = (sceneBounds.minY + sceneBounds.maxY) * 0.5;
+  const hostCanvas = rendererType === "webgl" && !threeCameraDriven ? options.hostCanvas ?? null : null;
   const renderCanvas = hostCanvas ?? document.createElement("canvas");
   if (hostCanvas) {
     if (renderCanvas.width <= 0 || renderCanvas.height <= 0) {
@@ -586,11 +1310,12 @@ export async function createThreePdfObject(
   const rendererConfig = normalizeRendererConfig(options);
   const nativeRenderer = await createNativeRenderer(rendererType, renderCanvas);
   applyRendererConfig(nativeRenderer, rendererConfig);
-  if (rendererType === "webgpu" || hostCanvas) {
+  if (rendererType === "webgpu" || hostCanvas || threeCameraDriven) {
     nativeRenderer.setExternalFrameDriver?.(true);
   }
   nativeRenderer.setScene(loadedScene.scene);
   const initialFitPaddingPixels = normalizePadding(options.fitPadding);
+  const forceWebGlMaterialLayers = rendererType === "webgl" && threeCameraDriven;
 
   const enableMaterialLayerConstruction =
     rendererType === "webgl" ||
@@ -603,21 +1328,21 @@ export async function createThreePdfObject(
     );
 
   const rasterMaterialLayer =
-    enableMaterialLayerConstruction && rendererConfig.materialRasterEnabled
+    enableMaterialLayerConstruction && (rendererConfig.materialRasterEnabled || forceWebGlMaterialLayers)
       ? new ThreeMaterialRasterLayer(loadedScene.scene, {
         pageBackground: rendererConfig.pageBackground
       })
       : null;
 
   const fillMaterialLayer =
-    enableMaterialLayerConstruction && rendererConfig.materialFillEnabled
+    enableMaterialLayerConstruction && (rendererConfig.materialFillEnabled || forceWebGlMaterialLayers)
       ? new ThreeMaterialFillLayer(loadedScene.scene, {
         vectorOverride: rendererConfig.vectorOverride
       })
       : null;
 
   const strokeMaterialLayer =
-    enableMaterialLayerConstruction && rendererConfig.materialStrokeEnabled
+    enableMaterialLayerConstruction && (rendererConfig.materialStrokeEnabled || forceWebGlMaterialLayers)
       ? new ThreeMaterialStrokeLayer(loadedScene.scene, {
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
         vectorOverride: rendererConfig.vectorOverride
@@ -625,7 +1350,7 @@ export async function createThreePdfObject(
       : null;
 
   const textMaterialLayer =
-    enableMaterialLayerConstruction && rendererConfig.materialTextEnabled
+    enableMaterialLayerConstruction && (rendererConfig.materialTextEnabled || forceWebGlMaterialLayers)
       ? new ThreeMaterialTextLayer(loadedScene.scene, {
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
         textVectorOnly: rendererConfig.textVectorOnly,
@@ -633,21 +1358,14 @@ export async function createThreePdfObject(
       })
       : null;
 
-  const renderTexture = new THREE.CanvasTexture(renderCanvas);
-  renderTexture.colorSpace = THREE.SRGBColorSpace;
-  renderTexture.flipY = true;
-  renderTexture.generateMipmaps = false;
-  renderTexture.minFilter = THREE.LinearFilter;
-  renderTexture.magFilter = THREE.LinearFilter;
-  renderTexture.wrapS = THREE.ClampToEdgeWrapping;
-  renderTexture.wrapT = THREE.ClampToEdgeWrapping;
+  const renderTexture = createRenderCanvasTexture(renderCanvas);
 
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array([
-    sceneBounds.minX, sceneBounds.minY, 0,
-    sceneBounds.maxX, sceneBounds.minY, 0,
-    sceneBounds.maxX, sceneBounds.maxY, 0,
-    sceneBounds.minX, sceneBounds.maxY, 0
+    sceneBounds.minX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
+    sceneBounds.maxX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
+    sceneBounds.maxX - sceneCenterX, sceneBounds.maxY - sceneCenterY, 0,
+    sceneBounds.minX - sceneCenterX, sceneBounds.maxY - sceneCenterY, 0
   ]);
   const uvArray = new Float32Array([
     0, 0,
@@ -660,13 +1378,7 @@ export async function createThreePdfObject(
   geometry.setAttribute("uv", uvAttribute);
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
 
-  const material = new THREE.MeshBasicMaterial({
-    map: renderTexture,
-    transparent: false,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    toneMapped: false
-  });
+  const material = createTexturedPageMaterial(renderTexture);
 
   const pageMesh = new THREE.Mesh(geometry, material);
   const object = new HeprThreePdfObject(
@@ -676,6 +1388,8 @@ export async function createThreePdfObject(
     renderCanvas,
     renderTexture,
     false,
+    threeCameraDriven,
+    threeCameraDebugLogs,
     rendererConfig,
     initialFitPaddingPixels,
     rasterMaterialLayer,
@@ -689,8 +1403,8 @@ export async function createThreePdfObject(
   pageMesh.onBeforeRender = (renderer, _scene, camera) => {
     object.handleBeforeRender(renderer as THREE.WebGLRenderer, camera as THREE.Camera);
   };
-  if (hostCanvas) {
-    object.prepareHostRendering(hostCanvas);
+  if (options.hostCanvas) {
+    object.prepareHostRendering(options.hostCanvas);
   }
 
   return object;
@@ -714,6 +1428,44 @@ function createDirectHostTriggerMaterial(): THREE.MeshBasicMaterial {
     colorWrite: false,
     toneMapped: false
   });
+}
+
+function createRenderCanvasTexture(renderCanvas: HTMLCanvasElement): THREE.CanvasTexture {
+  const texture = new THREE.CanvasTexture(renderCanvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.flipY = true;
+  texture.generateMipmaps = false;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  return texture;
+}
+
+function createTexturedPageMaterial(texture: THREE.CanvasTexture): THREE.MeshBasicMaterial {
+  return new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: false,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    toneMapped: false
+  });
+}
+
+function isViewStateApproxEqual(previous: ViewState, next: ViewState): boolean {
+  const centerTolerance = 1e-4;
+  const zoomTolerance = 1e-4;
+  const centerClose =
+    Math.abs(previous.cameraCenterX - next.cameraCenterX) <= centerTolerance &&
+    Math.abs(previous.cameraCenterY - next.cameraCenterY) <= centerTolerance;
+  if (!centerClose) {
+    return false;
+  }
+
+  const previousZoom = Math.max(1e-6, previous.zoom);
+  const nextZoom = Math.max(1e-6, next.zoom);
+  const zoomRelativeDelta = Math.abs(nextZoom - previousZoom) / Math.max(previousZoom, nextZoom);
+  return zoomRelativeDelta <= zoomTolerance;
 }
 
 function normalizeRendererConfig(options: HeprThreeObjectOptions): RendererConfig {
@@ -783,6 +1535,29 @@ function readThreeRendererViewportPixels(renderer: THREE.WebGLRenderer): Viewpor
 function readThreeRendererCanvas(renderer: THREE.WebGLRenderer): HTMLCanvasElement | null {
   const element = renderer.domElement;
   return element instanceof HTMLCanvasElement ? element : null;
+}
+
+function clampViewportPixels(viewport: ViewportPixels): ViewportPixels {
+  let width = Math.max(1, Math.round(viewport.width));
+  let height = Math.max(1, Math.round(viewport.height));
+
+  if (width > DEFAULT_MAX_CANVAS_DIMENSION || height > DEFAULT_MAX_CANVAS_DIMENSION) {
+    const scale = Math.min(
+      DEFAULT_MAX_CANVAS_DIMENSION / width,
+      DEFAULT_MAX_CANVAS_DIMENSION / height
+    );
+    width = Math.max(1, Math.floor(width * scale));
+    height = Math.max(1, Math.floor(height * scale));
+  }
+
+  const pixelCount = width * height;
+  if (pixelCount > DEFAULT_MAX_CANVAS_PIXELS) {
+    const scale = Math.sqrt(DEFAULT_MAX_CANVAS_PIXELS / pixelCount);
+    width = Math.max(1, Math.floor(width * scale));
+    height = Math.max(1, Math.floor(height * scale));
+  }
+
+  return { width, height };
 }
 
 function normalizeBounds(bounds: { minX: number; minY: number; maxX: number; maxY: number }): {

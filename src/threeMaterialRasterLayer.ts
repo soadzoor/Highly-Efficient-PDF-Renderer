@@ -39,6 +39,8 @@ export class ThreeMaterialRasterLayer {
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
   private readonly zoomUniform: { value: number };
+  private readonly useLocalToClipUniform: { value: number };
+  private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
     this.group = new THREE.Group();
@@ -47,6 +49,8 @@ export class ThreeMaterialRasterLayer {
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
+    this.useLocalToClipUniform = { value: 0 };
+    this.localToClipUniform = new THREE.Matrix4();
 
     this.geometry = createRasterGeometry();
 
@@ -107,6 +111,15 @@ export class ThreeMaterialRasterLayer {
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
   }
 
+  setScreenSpaceTransform(): void {
+    this.useLocalToClipUniform.value = 0;
+  }
+
+  setLocalToClipTransform(localToClip: THREE.Matrix4): void {
+    this.useLocalToClipUniform.value = 1;
+    this.localToClipUniform.copy(localToClip);
+  }
+
   dispose(): void {
     for (const entry of this.entries) {
       this.group.remove(entry.mesh);
@@ -149,7 +162,9 @@ export class ThreeMaterialRasterLayer {
         uRasterMatrixEF: { value: new THREE.Vector2(matrix[4], matrix[5]) },
         uViewport: { value: this.viewportUniform },
         uCameraCenter: { value: this.cameraCenterUniform },
-        uZoom: this.zoomUniform
+        uZoom: this.zoomUniform,
+        uUseLocalToClip: this.useLocalToClipUniform,
+        uLocalToClip: { value: this.localToClipUniform }
       }
     });
 

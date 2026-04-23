@@ -1,7 +1,7 @@
 import * as THREE from "three";
+import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
-  createCanvasInteractionController,
   pdfObjectGenerator,
   type HeprRendererType,
   type HeprThreePdfObject,
@@ -19,6 +19,7 @@ const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const sourceInput = document.querySelector<HTMLInputElement>("#source-input");
 const loadSourceButton = document.querySelector<HTMLButtonElement>("#load-source");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
+const focusBoxButton = document.querySelector<HTMLButtonElement>("#focus-box");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
@@ -31,6 +32,7 @@ if (
   !sourceInput ||
   !loadSourceButton ||
   !fileInput ||
+  !focusBoxButton ||
   !exampleSelect ||
   !backendSelect ||
   !statusElement ||
@@ -45,6 +47,7 @@ const canvasElement = canvas;
 const sourceInputElement = sourceInput;
 const loadSourceButtonElement = loadSourceButton;
 const fileInputElement = fileInput;
+const focusBoxButtonElement = focusBoxButton;
 const exampleSelectElement = exampleSelect;
 const backendSelectElement = backendSelect;
 const statusElementNode = statusElement;
@@ -54,6 +57,26 @@ const fpsValueElement = fpsValue;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
+const searchParams = new URLSearchParams(window.location.search);
+const allowRotate = searchParams.get("heprAllowRotate") === "1";
+const threeCameraDebugLogs =
+  searchParams.get("heprThreeCameraDebug") === "1" ||
+  searchParams.get("heprPerspectiveDebug") === "1";
+const disableDirectHost = searchParams.get("heprNoDirectHost") === "1";
+const useThreeCameraDirectHost = !allowRotate && !disableDirectHost;
+const CAMERA_FIT_PADDING = 1.06;
+const MIN_OBJECT_EXTENT = 1e-3;
+const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
+const CAMERA_CLIP_NEAR_MIN = 0.01;
+const CAMERA_CLIP_MARGIN_MULTIPLIER = 3.5;
+const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
+const tempObjectBounds = new THREE.Box3();
+const tempObjectSize = new THREE.Vector3();
+const tempObjectCenter = new THREE.Vector3();
+const tempViewDirection = new THREE.Vector3();
+const tempClipDelta = new THREE.Vector3();
+const currentContentCenter = new THREE.Vector3();
+let currentContentRadius = 10;
 
 const renderer = new THREE.WebGLRenderer({
   canvas: canvasElement,
@@ -70,9 +93,39 @@ renderer.setPixelRatio(window.devicePixelRatio || 1);
 renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
 
 const scene = new THREE.Scene();
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -1000, 1000);
+const mesh = new THREE.Mesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    transparent: true,
+    opacity: 1,
+    depthTest: false,
+    depthWrite: false,
+    toneMapped: false
+  })
+);
+mesh.name = "debug-red-box";
+mesh.renderOrder = 1_000_000;
+scene.add(mesh);
+const camera = new THREE.PerspectiveCamera(
+  DEFAULT_PERSPECTIVE_FOV_DEGREES,
+  resolveCanvasAspect(),
+  CAMERA_CLIP_NEAR_MIN,
+  2000
+);
 camera.position.set(0, 0, 10);
 camera.lookAt(0, 0, 0);
+updatePerspectiveCameraProjection();
+
+const controls = new MapControls(camera, renderer.domElement);
+controls.enableRotate = allowRotate;
+controls.enableDamping = false;
+controls.screenSpacePanning = true;
+if (threeCameraDebugLogs) {
+  console.info(
+    `[HEPR:three-example] three-camera debug logs enabled (rotate=${allowRotate}, directHost=${useThreeCameraDirectHost}).`
+  );
+}
 
 let currentPdfObject: HeprThreePdfObject | null = null;
 let lastLoadedSource: File | string | null = null;
@@ -81,22 +134,11 @@ let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
-const interactionController = createCanvasInteractionController(() => {
-  if (!currentPdfObject) {
-    return {
-      beginPanInteraction: () => {},
-      endPanInteraction: () => {},
-      panByPixels: () => {},
-      zoomAtClientPoint: () => {}
-    };
-  }
-  return currentPdfObject.renderer;
-});
-interactionController.attach(renderer.domElement);
-
 function renderFrame(now: number = performance.now()): void {
   animationFrameId = requestAnimationFrame(renderFrame);
   updateFpsMeter(now);
+  controls.update();
+  updateCameraClipping();
   renderer.render(scene, camera);
 }
 renderFrame();
@@ -104,6 +146,8 @@ renderFrame();
 window.addEventListener("resize", () => {
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
+  updatePerspectiveCameraProjection();
+  updateCameraClipping();
 }, { signal: lifetimeSignal });
 
 loadSourceButtonElement.addEventListener("click", () => {
@@ -140,6 +184,10 @@ fileInputElement.addEventListener("change", () => {
   fileInputElement.value = "";
 }, { signal: lifetimeSignal });
 
+focusBoxButtonElement.addEventListener("click", () => {
+  focusCameraToBox();
+}, { signal: lifetimeSignal });
+
 backendSelectElement.addEventListener("change", () => {
   if (!lastLoadedSource) {
     const backend = backendSelectElement.value === "webgpu" ? "WebGPU" : "WebGL";
@@ -170,7 +218,7 @@ function disposeExample(): void {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
   }
-  interactionController.detach();
+  controls.dispose();
   disposeCurrentObject();
   renderer.dispose();
 }
@@ -186,10 +234,12 @@ async function loadSource(source: File | string): Promise<void> {
   backendSelectElement.disabled = true;
 
   try {
-    const hostCanvas = backend === "webgl" ? renderer.domElement : undefined;
+    const hostCanvas = backend === "webgl" && useThreeCameraDirectHost ? renderer.domElement : undefined;
     const nextObject = await pdfObjectGenerator(
       source,
       {
+        threeCameraDriven: true,
+        threeCameraDebugLogs,
         segmentMerge: true,
         invisibleCull: true,
         curveStrokes: true,
@@ -235,6 +285,9 @@ function replacePdfObject(nextObject: HeprThreePdfObject): void {
   nextObject.renderer.setFrameListener(null);
   currentPdfObject = nextObject;
   scene.add(nextObject);
+  updateDebugBoxForLoadedPdf(nextObject);
+  fitCameraToPdfObject(nextObject);
+  updateCameraClipping(true);
 }
 
 function disposeCurrentObject(): void {
@@ -374,4 +427,111 @@ interface ExampleSelection {
   sourceName: string;
   kind: ExampleSelectionKind;
   path: string;
+}
+
+function resolveCanvasAspect(): number {
+  const viewportWidth = Math.max(1, canvasElement.clientWidth);
+  const viewportHeight = Math.max(1, canvasElement.clientHeight);
+  return viewportWidth / viewportHeight;
+}
+
+function updatePerspectiveCameraProjection(): void {
+  camera.aspect = resolveCanvasAspect();
+  camera.updateProjectionMatrix();
+}
+
+function fitCameraToPdfObject(pdfObject: HeprThreePdfObject): void {
+  fitCameraToObject(pdfObject, true);
+}
+
+function focusCameraToBox(): void {
+  fitCameraToObject(mesh, false);
+  setStatus("Camera moved to red box.");
+}
+
+function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean): void {
+  scene.updateMatrixWorld(true);
+  if (tempObjectBounds.setFromObject(targetObject).isEmpty()) {
+    return;
+  }
+
+  tempObjectBounds.getSize(tempObjectSize);
+  tempObjectBounds.getCenter(tempObjectCenter);
+
+  const objectWidth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.x);
+  const objectHeight = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.y);
+  const objectDepth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.z);
+  const paddedWidth = objectWidth * CAMERA_FIT_PADDING;
+  const paddedHeight = objectHeight * CAMERA_FIT_PADDING;
+
+  const verticalFovRadians = THREE.MathUtils.degToRad(camera.fov);
+  const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, camera.aspect));
+  const distanceForHeight = (paddedHeight * 0.5) / Math.tan(verticalFovRadians * 0.5);
+  const distanceForWidth = (paddedWidth * 0.5) / Math.tan(horizontalFovRadians * 0.5);
+  const distance = Math.max(1e-3, distanceForHeight, distanceForWidth);
+
+  tempViewDirection.subVectors(camera.position, controls.target);
+  if (tempViewDirection.lengthSq() <= 1e-12) {
+    tempViewDirection.set(0, 0, 1);
+  } else {
+    tempViewDirection.normalize();
+  }
+
+  camera.position.copy(tempObjectCenter).addScaledVector(tempViewDirection, distance);
+  controls.target.set(tempObjectCenter.x, tempObjectCenter.y, tempObjectCenter.z);
+  if (updateClipForTarget || !currentPdfObject) {
+    updateClipAnchor(tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
+  }
+  updateCameraClipping(true);
+  controls.update();
+}
+
+function updateDebugBoxForLoadedPdf(pdfObject: HeprThreePdfObject): void {
+  scene.updateMatrixWorld(true);
+  if (tempObjectBounds.setFromObject(pdfObject).isEmpty()) {
+    return;
+  }
+  tempObjectBounds.getSize(tempObjectSize);
+  tempObjectBounds.getCenter(tempObjectCenter);
+
+  const minPlanarExtent = Math.max(MIN_OBJECT_EXTENT, Math.min(tempObjectSize.x, tempObjectSize.y));
+  const boxSize = Math.max(1, minPlanarExtent * 0.02);
+  mesh.scale.setScalar(boxSize);
+  mesh.position.set(
+    tempObjectCenter.x,
+    tempObjectCenter.y,
+    tempObjectBounds.max.z + boxSize * 0.75
+  );
+
+  updateClipAnchor(tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
+}
+
+function updateClipAnchor(center: THREE.Vector3, radius: number): void {
+  currentContentCenter.copy(center);
+  currentContentRadius = Math.max(MIN_OBJECT_EXTENT, radius);
+}
+
+function updateCameraClipping(force = false): void {
+  const distanceToTarget = camera.position.distanceTo(controls.target);
+  const targetOffset = tempClipDelta.subVectors(currentContentCenter, controls.target).length();
+  const span = Math.max(MIN_OBJECT_EXTENT, currentContentRadius + targetOffset);
+  const margin = span * CAMERA_CLIP_MARGIN_MULTIPLIER;
+
+  const nextNear = Math.max(
+    CAMERA_CLIP_NEAR_MIN,
+    Math.min(distanceToTarget * 0.5, distanceToTarget - margin)
+  );
+  const nextFar = Math.max(nextNear + 10, distanceToTarget + margin);
+
+  if (
+    !force &&
+    Math.abs(camera.near - nextNear) <= CAMERA_CLIP_UPDATE_EPSILON &&
+    Math.abs(camera.far - nextFar) <= CAMERA_CLIP_UPDATE_EPSILON
+  ) {
+    return;
+  }
+
+  camera.near = nextNear;
+  camera.far = nextFar;
+  camera.updateProjectionMatrix();
 }

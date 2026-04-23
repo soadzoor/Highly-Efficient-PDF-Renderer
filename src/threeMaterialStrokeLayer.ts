@@ -29,6 +29,9 @@ export class ThreeMaterialStrokeLayer {
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
   private readonly zoomUniform: { value: number };
+  private readonly useLocalToClipUniform: { value: number };
+  private readonly localToClipUniform: THREE.Matrix4;
+  private readonly localUnitsPerPixelUniform: { value: number };
   private readonly curveUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
@@ -44,6 +47,7 @@ export class ThreeMaterialStrokeLayer {
   private readonly maxHalfWidth: number;
   private markToken = 1;
   private usingAllSegments = true;
+  private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: StrokeLayerOptions) {
     const segmentCount = Math.max(0, scene.segmentCount | 0);
@@ -95,6 +99,9 @@ export class ThreeMaterialStrokeLayer {
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
+    this.useLocalToClipUniform = { value: 0 };
+    this.localToClipUniform = new THREE.Matrix4();
+    this.localUnitsPerPixelUniform = { value: 1 };
     this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
     this.vectorOverrideUniform = new THREE.Vector4(
       options.vectorOverride[0],
@@ -123,6 +130,9 @@ export class ThreeMaterialStrokeLayer {
         uViewport: { value: this.viewportUniform },
         uCameraCenter: { value: this.cameraCenterUniform },
         uZoom: this.zoomUniform,
+        uUseLocalToClip: this.useLocalToClipUniform,
+        uLocalToClip: { value: this.localToClipUniform },
+        uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
         uAAScreenPx: { value: 1.0 },
         uStrokeCurveEnabled: this.curveUniform,
         uVectorOverride: { value: this.vectorOverrideUniform }
@@ -146,6 +156,21 @@ export class ThreeMaterialStrokeLayer {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }
 
+  setScreenSpaceTransform(): void {
+    this.useLocalToClip = false;
+    this.useLocalToClipUniform.value = 0;
+  }
+
+  setLocalToClipTransform(localToClip: THREE.Matrix4, localUnitsPerPixel: number): void {
+    this.useLocalToClip = true;
+    this.useLocalToClipUniform.value = 1;
+    this.localToClipUniform.copy(localToClip);
+    this.localUnitsPerPixelUniform.value =
+      Number.isFinite(localUnitsPerPixel) && localUnitsPerPixel > 1e-8
+        ? localUnitsPerPixel
+        : 1;
+  }
+
   updateFrame(viewState: ViewState, viewport: ViewportPixels): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
@@ -163,6 +188,11 @@ export class ThreeMaterialStrokeLayer {
   }
 
   private updateVisibleSegments(viewState: ViewState, viewport: ViewportPixels): void {
+    if (this.useLocalToClip) {
+      this.setAllSegmentsVisible();
+      return;
+    }
+
     if (!this.grid || this.segmentCount <= 0) {
       this.setAllSegmentsVisible();
       return;

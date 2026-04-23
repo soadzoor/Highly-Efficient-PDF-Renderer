@@ -28,6 +28,8 @@ export class ThreeMaterialFillLayer {
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
   private readonly zoomUniform: { value: number };
+  private readonly useLocalToClipUniform: { value: number };
+  private readonly localToClipUniform: THREE.Matrix4;
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly fillPathCount: number;
   private readonly fillPathIndexAttribute: THREE.InstancedBufferAttribute;
@@ -42,6 +44,7 @@ export class ThreeMaterialFillLayer {
   private readonly sceneMaxX: number;
   private readonly sceneMaxY: number;
   private usingAllFillPaths = true;
+  private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
@@ -102,6 +105,8 @@ export class ThreeMaterialFillLayer {
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
+    this.useLocalToClipUniform = { value: 0 };
+    this.localToClipUniform = new THREE.Matrix4();
     this.vectorOverrideUniform = new THREE.Vector4(
       options.vectorOverride[0],
       options.vectorOverride[1],
@@ -133,6 +138,8 @@ export class ThreeMaterialFillLayer {
         uViewport: { value: this.viewportUniform },
         uCameraCenter: { value: this.cameraCenterUniform },
         uZoom: this.zoomUniform,
+        uUseLocalToClip: this.useLocalToClipUniform,
+        uLocalToClip: { value: this.localToClipUniform },
         uFillAAScreenPx: { value: 1.0 },
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
@@ -149,6 +156,17 @@ export class ThreeMaterialFillLayer {
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
+  }
+
+  setScreenSpaceTransform(): void {
+    this.useLocalToClip = false;
+    this.useLocalToClipUniform.value = 0;
+  }
+
+  setLocalToClipTransform(localToClip: THREE.Matrix4): void {
+    this.useLocalToClip = true;
+    this.useLocalToClipUniform.value = 1;
+    this.localToClipUniform.copy(localToClip);
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels): void {
@@ -169,6 +187,11 @@ export class ThreeMaterialFillLayer {
   }
 
   private updateVisibleFillPaths(viewState: ViewState, viewport: ViewportPixels): void {
+    if (this.useLocalToClip) {
+      this.setAllFillPathsVisible();
+      return;
+    }
+
     if (this.fillPathCount <= 0) {
       this.setAllFillPathsVisible();
       return;

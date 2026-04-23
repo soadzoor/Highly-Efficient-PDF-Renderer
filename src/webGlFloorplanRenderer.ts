@@ -18,6 +18,9 @@ uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uAAScreenPx;
+uniform float uUseLocalToClip;
+uniform mat4 uLocalToClip;
+uniform float uLocalUnitsPerPixel;
 
 out vec2 vLocal;
 flat out vec2 vP0;
@@ -73,13 +76,16 @@ void main() {
     return;
   }
 
+  float localUnitsPerPixel = uUseLocalToClip >= 0.5
+    ? max(uLocalUnitsPerPixel, 1e-6)
+    : (1.0 / max(uZoom, 1e-4));
   if (isHairline) {
-    halfWidth = max(0.5 / max(uZoom, 1e-4), 1e-5);
+    halfWidth = max(0.5 * localUnitsPerPixel, 1e-5);
   }
 
-  float aaWorld = max(1.0 / uZoom, 0.0001) * uAAScreenPx;
+  float aaWorld = max(localUnitsPerPixel, 0.0001) * uAAScreenPx;
   if (isHairline) {
-    aaWorld = max(0.35 / max(uZoom, 1e-4), 5e-5);
+    aaWorld = max(0.35 * localUnitsPerPixel, 5e-5);
   }
 
   float extent = halfWidth + aaWorld;
@@ -88,10 +94,13 @@ void main() {
   vec2 corner01 = aCorner * 0.5 + 0.5;
   vec2 worldPosition = mix(worldMin, worldMax, corner01);
 
-  vec2 screen = (worldPosition - uCameraCenter) * uZoom + 0.5 * uViewport;
-  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
-
-  gl_Position = vec4(clip, 0.0, 1.0);
+  if (uUseLocalToClip >= 0.5) {
+    gl_Position = uLocalToClip * vec4(worldPosition, 0.0, 1.0);
+  } else {
+    vec2 screen = (worldPosition - uCameraCenter) * uZoom + 0.5 * uViewport;
+    vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }
 
   vLocal = worldPosition;
   vP0 = p0;
@@ -215,6 +224,8 @@ uniform ivec2 uFillPathMetaTexSize;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
+uniform float uUseLocalToClip;
+uniform mat4 uLocalToClip;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
@@ -255,9 +266,13 @@ void main() {
   vec2 corner01 = aCorner * 0.5 + 0.5;
   vec2 world = mix(minBounds, maxBounds, corner01);
 
-  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
-  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
-  gl_Position = vec4(clip, 0.0, 1.0);
+  if (uUseLocalToClip >= 0.5) {
+    gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
+  } else {
+    vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+    vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }
 
   vSegmentStart = int(metaA.x + 0.5);
   vSegmentCount = segmentCount;
@@ -468,6 +483,8 @@ uniform ivec2 uTextGlyphMetaTexSize;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
+uniform float uUseLocalToClip;
+uniform mat4 uLocalToClip;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
@@ -517,10 +534,13 @@ void main() {
     instanceA.y * local.x + instanceA.w * local.y + instanceB.y
   );
 
-  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
-  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
-
-  gl_Position = vec4(clip, 0.0, 1.0);
+  if (uUseLocalToClip >= 0.5) {
+    gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
+  } else {
+    vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+    vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }
   vSegmentStart = int(glyphMetaA.x + 0.5);
   vSegmentCount = segmentCount;
   vColor = instanceC.rgb;
@@ -846,6 +866,8 @@ uniform vec2 uRasterMatrixEF;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
+uniform float uUseLocalToClip;
+uniform mat4 uLocalToClip;
 
 out vec2 vUv;
 
@@ -865,10 +887,13 @@ void main() {
     b * localTopDown.x + d * localTopDown.y + f
   );
 
-  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
-  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
-
-  gl_Position = vec4(clip, 0.0, 1.0);
+  if (uUseLocalToClip >= 0.5) {
+    gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
+  } else {
+    vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+    vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }
   vUv = localTopDown;
 }
 `;
