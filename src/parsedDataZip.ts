@@ -23,8 +23,11 @@ interface ExportTextureEntry {
   height: number;
   logicalItemCount: number;
   logicalFloatCount: number;
-  data: Float32Array;
+  data: Uint8Array;
+  componentType: TextureComponentType;
   layout: TextureLayout;
+  quantizationMin?: number[];
+  quantizationMax?: number[];
 }
 
 export interface SceneTextureStats {
@@ -43,6 +46,7 @@ export interface SceneTextureStats {
 }
 
 export type TextureLayout = "interleaved" | "channel-major";
+type TextureComponentType = "float32" | "uint8-normalized" | "uint16-normalized-range" | "stroke-primitive-b-u16-packed";
 
 export interface BuildParsedDataZipOptions {
   encodeRasterImages?: boolean;
@@ -59,6 +63,8 @@ interface ParsedDataTextureEntry {
   file?: unknown;
   componentType?: unknown;
   layout?: unknown;
+  quantizationMin?: unknown;
+  quantizationMax?: unknown;
   byteShuffle?: unknown;
   predictor?: unknown;
   logicalItemCount?: unknown;
@@ -155,9 +161,7 @@ export async function buildParsedDataZipBlobForLayout(
   const sourcePdfFile = useSourcePdfFallback ? "source/source.pdf" : undefined;
 
   for (const entry of textureEntries) {
-    const bytes = entry.layout === "channel-major"
-      ? encodeChannelMajorFloat32(entry.data)
-      : new Uint8Array(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength);
+    const bytes = serializeTextureExportEntry(entry);
     zip.file(entry.filePath, bytes);
   }
 
@@ -228,13 +232,16 @@ export async function buildParsedDataZipBlobForLayout(
       width: entry.width,
       height: entry.height,
       channels: 4,
-      componentType: "float32",
+      componentType: entry.componentType,
       layout: entry.layout,
+      quantizationMin: entry.quantizationMin,
+      quantizationMax: entry.quantizationMax,
       byteShuffle: false,
       predictor: "none",
       logicalItemCount: entry.logicalItemCount,
       logicalFloatCount: entry.logicalFloatCount,
-      paddedFloatCount: entry.data.length
+      byteLength: entry.data.byteLength,
+      paddedFloatCount: entry.logicalFloatCount
     }))
   };
 
@@ -272,7 +279,7 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
     createTextureExportEntry("stroke-primitives-a", scene.endpoints, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
     createTextureExportEntry("stroke-primitives-b", scene.primitiveMeta, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
     createTextureExportEntry("stroke-styles", scene.styles, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
-    createTextureExportEntry("stroke-primitive-bounds", scene.primitiveBounds, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
+    // Stroke bounds are derived on load; storing them duplicates most stroke coordinate data.
     createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
     createTextureExportEntry("text-instance-b", scene.textInstanceB, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
     createTextureExportEntry("text-instance-c", scene.textInstanceC, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
@@ -345,11 +352,17 @@ export async function loadSceneFromParsedDataZip(
         }
 
         const inferredSuffix =
-          typeof entry.layout === "string" && entry.layout === "channel-major"
-            ? ".f32cm"
-            : entry.byteShuffle === true
-              ? ".f32bs"
-              : ".f32";
+          entry.componentType === "uint8-normalized"
+            ? ".rgba8"
+            : entry.componentType === "uint16-normalized-range"
+              ? ".q16"
+              : entry.componentType === "stroke-primitive-b-u16-packed"
+                ? ".spb16"
+                : typeof entry.layout === "string" && entry.layout === "channel-major"
+                  ? ".f32cm"
+                  : entry.byteShuffle === true
+                    ? ".f32bs"
+                    : ".f32";
         const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}${inferredSuffix}`;
         const zipEntry = zip.file(path);
         if (!zipEntry) {
@@ -1220,18 +1233,201 @@ function createTextureExportEntry(
   if (source.length < logicalFloatCount) {
     throw new Error(`Texture ${name} has insufficient data (${source.length} < ${logicalFloatCount}).`);
   }
-  const suffix = textureLayout === "channel-major" ? ".f32cm" : ".f32";
+  const logicalSource = source.subarray(0, logicalFloatCount);
+  const packed = packTextureForZip(name, logicalSource, textureLayout);
 
   return {
     name,
-    filePath: `textures/${name}${suffix}`,
+    filePath: `textures/${name}${packed.suffix}`,
     width,
     height,
     logicalItemCount,
     logicalFloatCount,
-    data: source.subarray(0, logicalFloatCount),
-    layout: textureLayout
+    data: packed.data,
+    componentType: packed.componentType,
+    layout: packed.layout,
+    quantizationMin: packed.quantizationMin,
+    quantizationMax: packed.quantizationMax
   };
+}
+
+function serializeTextureExportEntry(entry: ExportTextureEntry): Uint8Array {
+  return entry.data;
+}
+
+function packTextureForZip(
+  name: string,
+  source: Float32Array,
+  textureLayout: TextureLayout
+): {
+  data: Uint8Array;
+  componentType: TextureComponentType;
+  layout: TextureLayout;
+  suffix: string;
+  quantizationMin?: number[];
+  quantizationMax?: number[];
+} {
+  if (name === "text-instance-c") {
+    return {
+      data: encodeNormalizedUint8(source),
+      componentType: "uint8-normalized",
+      layout: "interleaved",
+      suffix: ".rgba8"
+    };
+  }
+
+  if (name === "stroke-primitives-b") {
+    const packed = encodeStrokePrimitiveBUint16(source);
+    return {
+      data: packed.data,
+      componentType: "stroke-primitive-b-u16-packed",
+      layout: "interleaved",
+      suffix: ".spb16",
+      quantizationMin: Array.from(packed.min),
+      quantizationMax: Array.from(packed.max)
+    };
+  }
+
+  if (usesRangeQuantizedUint16(name)) {
+    const packed = encodeUint16NormalizedRange(source);
+    return {
+      data: packed.data,
+      componentType: "uint16-normalized-range",
+      layout: "interleaved",
+      suffix: ".q16",
+      quantizationMin: Array.from(packed.min),
+      quantizationMax: Array.from(packed.max)
+    };
+  }
+
+  const bytes = textureLayout === "channel-major"
+    ? encodeChannelMajorFloat32(source)
+    : new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice();
+  return {
+    data: bytes,
+    componentType: "float32",
+    layout: textureLayout,
+    suffix: textureLayout === "channel-major" ? ".f32cm" : ".f32"
+  };
+}
+
+function usesRangeQuantizedUint16(name: string): boolean {
+  return name === "fill-primitives-a"
+    || name === "fill-primitives-b"
+    || name === "stroke-primitives-a"
+    || name === "text-glyph-primitives-a"
+    || name === "text-glyph-primitives-b";
+}
+
+function encodeNormalizedUint8(source: Float32Array): Uint8Array {
+  const out = new Uint8Array(source.length);
+  for (let i = 0; i < source.length; i += 1) {
+    const value = Number.isFinite(source[i]) ? source[i] : 0;
+    out[i] = Math.round(clamp01(value) * 255);
+  }
+  return out;
+}
+
+function encodeUint16NormalizedRange(source: Float32Array): { data: Uint8Array; min: Float32Array; max: Float32Array } {
+  const itemCount = Math.floor(source.length / 4);
+  const min = new Float32Array([Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]);
+  const max = new Float32Array([Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY]);
+
+  for (let i = 0; i < itemCount; i += 1) {
+    const offset = i * 4;
+    for (let channel = 0; channel < 4; channel += 1) {
+      const value = source[offset + channel];
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      min[channel] = Math.min(min[channel], value);
+      max[channel] = Math.max(max[channel], value);
+    }
+  }
+
+  for (let channel = 0; channel < 4; channel += 1) {
+    if (!Number.isFinite(min[channel]) || !Number.isFinite(max[channel])) {
+      min[channel] = 0;
+      max[channel] = 0;
+    }
+  }
+
+  const quantized = new Uint16Array(source.length);
+  for (let i = 0; i < itemCount; i += 1) {
+    const offset = i * 4;
+    for (let channel = 0; channel < 4; channel += 1) {
+      const range = max[channel] - min[channel];
+      if (Math.abs(range) <= 1e-20) {
+        quantized[offset + channel] = 0;
+        continue;
+      }
+      const value = Number.isFinite(source[offset + channel]) ? source[offset + channel] : min[channel];
+      const normalized = (value - min[channel]) / range;
+      quantized[offset + channel] = Math.round(clamp01(normalized) * 65535);
+    }
+  }
+
+  return {
+    data: new Uint8Array(quantized.buffer),
+    min,
+    max
+  };
+}
+
+function encodeStrokePrimitiveBUint16(source: Float32Array): { data: Uint8Array; min: Float32Array; max: Float32Array } {
+  const itemCount = Math.floor(source.length / 4);
+  const min = new Float32Array([Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, 0, 0]);
+  const max = new Float32Array([Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, 1, 0]);
+
+  for (let i = 0; i < itemCount; i += 1) {
+    const offset = i * 4;
+    const x = source[offset];
+    const y = source[offset + 1];
+    if (Number.isFinite(x)) {
+      min[0] = Math.min(min[0], x);
+      max[0] = Math.max(max[0], x);
+    }
+    if (Number.isFinite(y)) {
+      min[1] = Math.min(min[1], y);
+      max[1] = Math.max(max[1], y);
+    }
+  }
+
+  for (let channel = 0; channel < 2; channel += 1) {
+    if (!Number.isFinite(min[channel]) || !Number.isFinite(max[channel])) {
+      min[channel] = 0;
+      max[channel] = 0;
+    }
+  }
+
+  const packed = new Uint16Array(source.length);
+  for (let i = 0; i < itemCount; i += 1) {
+    const offset = i * 4;
+    packed[offset] = encodeRangeUint16(source[offset], min[0], max[0]);
+    packed[offset + 1] = encodeRangeUint16(source[offset + 1], min[1], max[1]);
+    packed[offset + 2] = source[offset + 2] >= 0.5 ? 1 : 0;
+
+    const packedStyle = Number.isFinite(source[offset + 3]) ? source[offset + 3] : 0;
+    const styleFlags = Math.min(15, Math.max(0, Math.floor(packedStyle / 2 + 1e-6)));
+    const alpha = clamp01(packedStyle - styleFlags * 2);
+    const alphaBits = Math.round(alpha * 4095);
+    packed[offset + 3] = (styleFlags << 12) | alphaBits;
+  }
+
+  return {
+    data: new Uint8Array(packed.buffer),
+    min,
+    max
+  };
+}
+
+function encodeRangeUint16(rawValue: number, min: number, max: number): number {
+  const range = max - min;
+  if (Math.abs(range) <= 1e-20) {
+    return 0;
+  }
+  const value = Number.isFinite(rawValue) ? rawValue : min;
+  return Math.round(clamp01((value - min) / range) * 65535);
 }
 
 function readTexturePayloadAsFloat32(
@@ -1240,6 +1436,15 @@ function readTexturePayloadAsFloat32(
   textureName: string
 ): Float32Array {
   const componentType = typeof entry.componentType === "string" ? entry.componentType : "float32";
+  if (componentType === "uint8-normalized") {
+    return decodeNormalizedUint8(new Uint8Array(fileBuffer));
+  }
+  if (componentType === "uint16-normalized-range") {
+    return decodeUint16NormalizedRange(new Uint8Array(fileBuffer), entry, textureName);
+  }
+  if (componentType === "stroke-primitive-b-u16-packed") {
+    return decodeStrokePrimitiveBUint16(new Uint8Array(fileBuffer), entry, textureName);
+  }
   if (componentType !== "float32") {
     throw new Error(`Texture ${textureName} has unsupported componentType ${String(componentType)}.`);
   }
@@ -1275,6 +1480,87 @@ function readTexturePayloadAsFloat32(
   }
 
   return new Float32Array(fileBuffer);
+}
+
+function decodeNormalizedUint8(bytes: Uint8Array): Float32Array {
+  const out = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i += 1) {
+    out[i] = bytes[i] / 255;
+  }
+  return out;
+}
+
+function decodeUint16NormalizedRange(
+  bytes: Uint8Array,
+  entry: ParsedDataTextureEntry,
+  textureName: string
+): Float32Array {
+  if (bytes.byteLength % 2 !== 0) {
+    throw new Error(`Texture ${textureName} has invalid uint16 byte length (${bytes.byteLength}).`);
+  }
+  const min = readQuantizationVector(entry.quantizationMin, textureName, "quantizationMin");
+  const max = readQuantizationVector(entry.quantizationMax, textureName, "quantizationMax");
+  const quantized = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const out = new Float32Array(quantized.length);
+
+  for (let i = 0; i < quantized.length; i += 1) {
+    const channel = i & 3;
+    const range = max[channel] - min[channel];
+    out[i] = Math.abs(range) <= 1e-20
+      ? min[channel]
+      : min[channel] + (quantized[i] / 65535) * range;
+  }
+
+  return out;
+}
+
+function decodeStrokePrimitiveBUint16(
+  bytes: Uint8Array,
+  entry: ParsedDataTextureEntry,
+  textureName: string
+): Float32Array {
+  if (bytes.byteLength % 8 !== 0) {
+    throw new Error(`Texture ${textureName} has invalid packed stroke primitive byte length (${bytes.byteLength}).`);
+  }
+  const min = readQuantizationVector(entry.quantizationMin, textureName, "quantizationMin");
+  const max = readQuantizationVector(entry.quantizationMax, textureName, "quantizationMax");
+  const packed = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+  const out = new Float32Array(packed.length);
+  const xRange = max[0] - min[0];
+  const yRange = max[1] - min[1];
+
+  for (let i = 0; i < packed.length; i += 4) {
+    out[i] = Math.abs(xRange) <= 1e-20
+      ? min[0]
+      : min[0] + (packed[i] / 65535) * xRange;
+    out[i + 1] = Math.abs(yRange) <= 1e-20
+      ? min[1]
+      : min[1] + (packed[i + 1] / 65535) * yRange;
+    out[i + 2] = packed[i + 2] >= 1 ? 1 : 0;
+
+    const styleWord = packed[i + 3];
+    const styleFlags = styleWord >>> 12;
+    const alpha = (styleWord & 0x0fff) / 4095;
+    out[i + 3] = alpha + styleFlags * 2;
+  }
+
+  return out;
+}
+
+function readQuantizationVector(value: unknown, textureName: string, label: string): Float32Array {
+  if (!Array.isArray(value) || value.length < 4) {
+    throw new Error(`Texture ${textureName} is missing ${label}.`);
+  }
+
+  const out = new Float32Array(4);
+  for (let i = 0; i < 4; i += 1) {
+    const number = Number(value[i]);
+    if (!Number.isFinite(number)) {
+      throw new Error(`Texture ${textureName} has invalid ${label}[${i}].`);
+    }
+    out[i] = number;
+  }
+  return out;
 }
 
 const ABSOLUTE_URL_PATTERN = /^[a-z][a-z\d+.-]*:/i;

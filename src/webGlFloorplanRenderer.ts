@@ -3139,8 +3139,7 @@ export class WebGlFloorplanRenderer {
     const instanceBData = new Float32Array(instanceTexelCount * 4);
     instanceBData.set(scene.textInstanceB);
 
-    const instanceCData = new Float32Array(instanceTexelCount * 4);
-    instanceCData.set(scene.textInstanceC);
+    const instanceCData = packNormalizedUint8TextureData(scene.textInstanceC, instanceTexelCount);
 
     const glyphMetaAData = new Float32Array(glyphMetaTexelCount * 4);
     glyphMetaAData.set(scene.textGlyphMetaA);
@@ -3194,16 +3193,16 @@ export class WebGlFloorplanRenderer {
     );
 
     gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureC);
-    configureFloatTexture(gl);
+    configureByteTexture(gl);
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
-      gl.RGBA32F,
+      gl.RGBA8,
       this.textInstanceTextureWidth,
       this.textInstanceTextureHeight,
       0,
       gl.RGBA,
-      gl.FLOAT,
+      gl.UNSIGNED_BYTE,
       instanceCData
     );
 
@@ -3279,22 +3278,24 @@ export class WebGlFloorplanRenderer {
 
     gl.bindTexture(gl.TEXTURE_2D, this.textRasterAtlasTexture);
     configureRasterTexture(gl);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     if (textRasterAtlas) {
       gl.texImage2D(
         gl.TEXTURE_2D,
         0,
-        gl.RGBA,
+        gl.R8,
         this.textRasterAtlasWidth,
         this.textRasterAtlasHeight,
         0,
-        gl.RGBA,
+        gl.RED,
         gl.UNSIGNED_BYTE,
-        textRasterAtlas.rgba
+        textRasterAtlas.alpha
       );
     } else {
-      const transparent = new Uint8Array([0, 0, 0, 0]);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, transparent);
+      const transparent = new Uint8Array([0]);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, transparent);
     }
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
     gl.generateMipmap(gl.TEXTURE_2D);
 
     return {
@@ -3686,6 +3687,13 @@ function configureFloatTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }
 
+function configureByteTexture(gl: WebGL2RenderingContext): void {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
 function configureColorTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -3732,6 +3740,15 @@ function premultiplyRgba(source: Uint8Array): Uint8Array {
     out[i + 1] = Math.round(source[i + 1] * scale);
     out[i + 2] = Math.round(source[i + 2] * scale);
     out[i + 3] = alpha;
+  }
+  return out;
+}
+
+function packNormalizedUint8TextureData(source: Float32Array, texelCount: number): Uint8Array {
+  const out = new Uint8Array(texelCount * 4);
+  const sourceLength = Math.min(source.length, out.length);
+  for (let i = 0; i < sourceLength; i += 1) {
+    out[i] = Math.round(clamp(source[i], 0, 1) * 255);
   }
   return out;
 }

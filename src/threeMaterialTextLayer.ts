@@ -64,7 +64,7 @@ export class ThreeMaterialTextLayer {
       instanceTextureSize.width,
       instanceTextureSize.height
     );
-    this.textInstanceTextureC = createFloatTexture(
+    this.textInstanceTextureC = createNormalizedByteTexture(
       scene.textInstanceC,
       textInstanceCount,
       instanceTextureSize.width,
@@ -118,13 +118,13 @@ export class ThreeMaterialTextLayer {
 
     if (rasterAtlas) {
       this.textRasterAtlasTexture = createRasterAtlasTexture(
-        rasterAtlas.rgba,
+        rasterAtlas.alpha,
         rasterAtlas.width,
         rasterAtlas.height
       );
       this.rasterAtlasSizeUniform = new THREE.Vector2(rasterAtlas.width, rasterAtlas.height);
     } else {
-      this.textRasterAtlasTexture = createRasterAtlasTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+      this.textRasterAtlasTexture = createRasterAtlasTexture(new Uint8Array([0]), 1, 1);
       this.rasterAtlasSizeUniform = new THREE.Vector2(1, 1);
     }
 
@@ -255,14 +255,38 @@ function createFloatTexture(
   return texture;
 }
 
-function createRasterAtlasTexture(data: Uint8Array, width: number, height: number): THREE.DataTexture {
+function createNormalizedByteTexture(
+  source: Float32Array,
+  count: number,
+  width: number,
+  height: number
+): THREE.DataTexture {
+  const data = new Uint8Array(width * height * 4);
+  const sourceLength = Math.min(source.length, count * 4);
+  for (let i = 0; i < sourceLength; i += 1) {
+    data[i] = Math.round(clampNumber(source[i], 0, 1) * 255);
+  }
+
   const texture = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestFilter;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.flipY = false;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function createRasterAtlasTexture(data: Uint8Array, width: number, height: number): THREE.DataTexture {
+  const texture = new THREE.DataTexture(data, width, height, THREE.RedFormat, THREE.UnsignedByteType);
   texture.magFilter = THREE.LinearFilter;
   texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
   texture.flipY = false;
   texture.generateMipmaps = true;
+  texture.unpackAlignment = 1;
   texture.needsUpdate = true;
   return texture;
 }
@@ -306,4 +330,14 @@ function clampInt(value: number, min: number, max: number): number {
     return max;
   }
   return rounded;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
 }

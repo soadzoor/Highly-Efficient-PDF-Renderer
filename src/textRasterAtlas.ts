@@ -3,7 +3,7 @@ import type { VectorScene } from "./pdfVectorExtractor";
 export interface TextRasterAtlas {
   width: number;
   height: number;
-  rgba: Uint8Array;
+  alpha: Uint8Array;
   glyphUvRects: Float32Array;
 }
 
@@ -87,12 +87,15 @@ export function buildTextRasterAtlas(scene: VectorScene, maxTextureSize: number)
   }
 
   const imageData = context.getImageData(0, 0, selected.width, selected.height);
-  const rgba = new Uint8Array(imageData.data);
+  const alpha = new Uint8Array(selected.width * selected.height);
+  for (let i = 0, pixel = 0; pixel < alpha.length; i += 4, pixel += 1) {
+    alpha[pixel] = imageData.data[i + 3];
+  }
 
   return {
     width: selected.width,
     height: selected.height,
-    rgba,
+    alpha,
     glyphUvRects
   };
 }
