@@ -180,6 +180,10 @@ npm run preview
 npm run examples:generate
 ```
 
+### Regenerate example ZIPs from the demo
+
+Open the demo with `?bulkZip=1` or `?downloadAllZips=1` to reveal the `Download All Example ZIPs` button.
+
 ## Notes
 
 - WebGPU mode is marked preview and depends on browser/GPU support.

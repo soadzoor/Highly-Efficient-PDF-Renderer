@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-04-22T18:48:18.730Z",
+  "generatedAt": "2026-04-23T05:49:53.931Z",
   "examples": [
     {
       "id": "dublin_1st_floor_2018_06_01",
@@ -10,7 +10,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/Dublin_1st_Floor_2018_06_01-parsed-data.zip",
-        "sizeBytes": 5872122
+        "sizeBytes": 2752850
       }
     },
     {
@@ -22,7 +22,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/Level_1-parsed-data.zip",
-        "sizeBytes": 41638374
+        "sizeBytes": 13669118
       }
     },
     {
@@ -34,7 +34,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/LK_Office_Level_1-parsed-data.zip",
-        "sizeBytes": 19037
+        "sizeBytes": 14027
       }
     },
     {
@@ -46,7 +46,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/Lower_Level-parsed-data.zip",
-        "sizeBytes": 29529867
+        "sizeBytes": 7258930
       }
     },
     {
@@ -58,7 +58,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/Murietta_Level1-parsed-data.zip",
-        "sizeBytes": 6061002
+        "sizeBytes": 3711921
       }
     },
     {
@@ -70,7 +70,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/optimizing_cpp-parsed-data.zip",
-        "sizeBytes": 2396311
+        "sizeBytes": 2346465
       }
     },
     {
@@ -82,7 +82,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/SimiValleyBehavioralHealth_SR_20180403-parsed-data.zip",
-        "sizeBytes": 1189347
+        "sizeBytes": 648060
       }
     },
     {
@@ -94,7 +94,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/stn_arch_kp-ontario_177920237_detached-parsed-data.zip",
-        "sizeBytes": 28025627
+        "sizeBytes": 8225712
       }
     },
     {
@@ -106,7 +106,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/thesis-parsed-data.zip",
-        "sizeBytes": 2056939
+        "sizeBytes": 2050026
       }
     },
     {
@@ -118,7 +118,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/WarAndPeace-parsed-data.zip",
-        "sizeBytes": 14119669
+        "sizeBytes": 14039864
       }
     }
   ]
