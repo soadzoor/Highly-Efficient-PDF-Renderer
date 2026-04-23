@@ -84,9 +84,6 @@ export class HeprThreePdfObject extends THREE.Group {
   private lastViewportWidth = 0;
   private lastViewportHeight = 0;
   private isDisposed = false;
-  private deferredDisposedMaterials: THREE.Material[] = [];
-  private deferredDisposedTextures: THREE.Texture[] = [];
-  private deferredDisposeScheduled = false;
 
   constructor(
     loadedScene: LoadedPdfScene,
@@ -224,7 +221,6 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     this.interactionController.detach();
     this.controlsCanvas = null;
-    this.flushDeferredDisposals();
   }
 
   handleBeforeRender(renderer: THREE.WebGLRenderer, camera: THREE.Camera): void {
@@ -235,7 +231,6 @@ export class HeprThreePdfObject extends THREE.Group {
     const rendererCanvas = readThreeRendererCanvas(renderer);
     if (rendererCanvas) {
       this.hostRenderCanvas = rendererCanvas;
-      this.tryEnableDirectHostRendering(rendererCanvas);
     }
 
     const viewport = readThreeRendererViewportPixels(renderer);
@@ -333,13 +328,13 @@ export class HeprThreePdfObject extends THREE.Group {
     this.userData.hepr.renderer = this.renderer;
 
     if (this.renderTexture) {
-      this.deferTextureDisposal(this.renderTexture);
+      this.renderTexture.dispose();
       this.renderTexture = null;
     }
 
     const previousMaterial = this.pageMesh.material;
     this.pageMesh.material = createDirectHostTriggerMaterial();
-    this.deferMaterialDisposal(previousMaterial);
+    previousMaterial.dispose();
     this.pageMesh.frustumCulled = false;
     this.pageMesh.renderOrder = -1_000_000;
 
@@ -484,7 +479,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pageMesh.renderOrder = -1_000_000;
 
     if (this.renderTexture) {
-      this.deferTextureDisposal(this.renderTexture);
+      this.renderTexture.dispose();
       this.renderTexture = null;
     }
 
@@ -565,42 +560,6 @@ export class HeprThreePdfObject extends THREE.Group {
       ? canvas.height
       : Math.max(1, Math.round(canvas.clientHeight * (window.devicePixelRatio || 1)));
     return { width, height };
-  }
-
-  private deferMaterialDisposal(material: THREE.Material): void {
-    this.deferredDisposedMaterials.push(material);
-    this.scheduleDeferredDisposal();
-  }
-
-  private deferTextureDisposal(texture: THREE.Texture): void {
-    this.deferredDisposedTextures.push(texture);
-    this.scheduleDeferredDisposal();
-  }
-
-  private scheduleDeferredDisposal(): void {
-    if (this.deferredDisposeScheduled) {
-      return;
-    }
-    this.deferredDisposeScheduled = true;
-    queueMicrotask(() => {
-      this.deferredDisposeScheduled = false;
-      this.flushDeferredDisposals();
-    });
-  }
-
-  private flushDeferredDisposals(): void {
-    if (this.deferredDisposedMaterials.length > 0) {
-      for (const material of this.deferredDisposedMaterials) {
-        material.dispose();
-      }
-      this.deferredDisposedMaterials = [];
-    }
-    if (this.deferredDisposedTextures.length > 0) {
-      for (const texture of this.deferredDisposedTextures) {
-        texture.dispose();
-      }
-      this.deferredDisposedTextures = [];
-    }
   }
 }
 
