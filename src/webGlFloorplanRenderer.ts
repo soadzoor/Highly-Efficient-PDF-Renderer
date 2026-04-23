@@ -27,6 +27,7 @@ flat out vec2 vP0;
 flat out vec2 vP1;
 flat out vec2 vP2;
 flat out float vPrimitiveType;
+flat out float vIsHairline;
 flat out float vHalfWidth;
 flat out float vAAWorld;
 flat out vec3 vColor;
@@ -69,6 +70,7 @@ void main() {
     vP1 = vec2(0.0);
     vP2 = vec2(0.0);
     vPrimitiveType = 0.0;
+    vIsHairline = 0.0;
     vHalfWidth = 0.0;
     vAAWorld = 1.0;
     vColor = color;
@@ -107,6 +109,7 @@ void main() {
   vP1 = p1;
   vP2 = p2;
   vPrimitiveType = primitiveType;
+  vIsHairline = isHairline ? 1.0 : 0.0;
   vHalfWidth = halfWidth;
   vAAWorld = aaWorld;
   vColor = color;
@@ -117,14 +120,15 @@ void main() {
 const FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 uniform float uStrokeCurveEnabled;
+uniform float uAAScreenPx;
 uniform vec4 uVectorOverride;
 in vec2 vLocal;
 flat in vec2 vP0;
 flat in vec2 vP1;
 flat in vec2 vP2;
 flat in float vPrimitiveType;
+flat in float vIsHairline;
 flat in float vHalfWidth;
-flat in float vAAWorld;
 flat in vec3 vColor;
 flat in float vAlpha;
 
@@ -198,7 +202,13 @@ void main() {
     ? distanceToQuadraticBezier(vLocal, vP0, vP1, vP2)
     : distanceToLineSegment(vLocal, vP0, vP2);
 
-  float coverage = 1.0 - smoothstep(vHalfWidth - vAAWorld, vHalfWidth + vAAWorld, distanceToSegment);
+  float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 1e-6);
+  float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
+  float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
+
+  float coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
   float alpha = coverage * vAlpha;
 
   if (alpha <= 0.001) {
