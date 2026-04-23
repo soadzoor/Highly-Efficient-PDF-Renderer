@@ -5,6 +5,7 @@ import {
   CORE_STROKE_FRAGMENT_SHADER_SOURCE,
   CORE_STROKE_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
+import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface StrokeLayerOptions {
@@ -30,9 +31,23 @@ export class ThreeMaterialStrokeLayer {
   private readonly zoomUniform: { value: number };
   private readonly curveUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
+  private readonly segmentCount: number;
+  private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;
+  private readonly allSegmentIds: Float32Array;
+  private readonly visibleSegmentIds: Float32Array;
+  private readonly grid: SpatialGrid | null;
+  private readonly segmentMarks: Uint32Array;
+  private readonly segmentMinX: Float32Array;
+  private readonly segmentMinY: Float32Array;
+  private readonly segmentMaxX: Float32Array;
+  private readonly segmentMaxY: Float32Array;
+  private readonly maxHalfWidth: number;
+  private markToken = 1;
+  private usingAllSegments = true;
 
   constructor(scene: VectorScene, options: StrokeLayerOptions) {
     const segmentCount = Math.max(0, scene.segmentCount | 0);
+    this.segmentCount = segmentCount;
     const segmentTextureSize = chooseSegmentTextureSize(segmentCount);
 
     this.segmentTextureA = createSegmentDataTexture(
@@ -60,7 +75,23 @@ export class ThreeMaterialStrokeLayer {
       segmentTextureSize.height
     );
 
-    const geometry = createStrokeGeometry(segmentCount);
+    this.grid = segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.segmentMarks = new Uint32Array(segmentCount);
+    this.visibleSegmentIds = new Float32Array(Math.max(1, segmentCount));
+    this.allSegmentIds = new Float32Array(Math.max(1, segmentCount));
+    for (let i = 0; i < segmentCount; i += 1) {
+      this.allSegmentIds[i] = i;
+      this.visibleSegmentIds[i] = i;
+    }
+    const expandedBounds = buildExpandedSegmentBounds(scene, segmentCount);
+    this.segmentMinX = expandedBounds.minX;
+    this.segmentMinY = expandedBounds.minY;
+    this.segmentMaxX = expandedBounds.maxX;
+    this.segmentMaxY = expandedBounds.maxY;
+    this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
+
+    const geometry = createStrokeGeometry(this.visibleSegmentIds, segmentCount);
+    this.segmentIndexAttribute = geometry.getAttribute("aSegmentIndex") as THREE.InstancedBufferAttribute;
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
@@ -119,6 +150,7 @@ export class ThreeMaterialStrokeLayer {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    this.updateVisibleSegments(viewState, viewport);
   }
 
   dispose(): void {
@@ -128,6 +160,89 @@ export class ThreeMaterialStrokeLayer {
     this.segmentTextureB.dispose();
     this.segmentStyleTexture.dispose();
     this.segmentBoundsTexture.dispose();
+  }
+
+  private updateVisibleSegments(viewState: ViewState, viewport: ViewportPixels): void {
+    if (!this.grid || this.segmentCount <= 0) {
+      this.setAllSegmentsVisible();
+      return;
+    }
+
+    const safeZoom = Math.max(1e-6, viewState.zoom);
+    const halfViewWidth = Math.max(1, viewport.width) / (2 * safeZoom);
+    const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
+    const margin = Math.max(16 / safeZoom, this.maxHalfWidth * 2, 0.5);
+
+    const viewMinX = viewState.cameraCenterX - halfViewWidth - margin;
+    const viewMaxX = viewState.cameraCenterX + halfViewWidth + margin;
+    const viewMinY = viewState.cameraCenterY - halfViewHeight - margin;
+    const viewMaxY = viewState.cameraCenterY + halfViewHeight + margin;
+    const grid = this.grid;
+
+    if (
+      viewMinX <= grid.minX &&
+      viewMaxX >= grid.maxX &&
+      viewMinY <= grid.minY &&
+      viewMaxY >= grid.maxY
+    ) {
+      this.setAllSegmentsVisible();
+      return;
+    }
+
+    const c0 = clampToGrid(Math.floor((viewMinX - grid.minX) / grid.cellWidth), grid.gridWidth);
+    const c1 = clampToGrid(Math.floor((viewMaxX - grid.minX) / grid.cellWidth), grid.gridWidth);
+    const r0 = clampToGrid(Math.floor((viewMinY - grid.minY) / grid.cellHeight), grid.gridHeight);
+    const r1 = clampToGrid(Math.floor((viewMaxY - grid.minY) / grid.cellHeight), grid.gridHeight);
+
+    this.markToken += 1;
+    if (this.markToken === 0xffffffff) {
+      this.segmentMarks.fill(0);
+      this.markToken = 1;
+    }
+
+    let outCount = 0;
+    for (let row = r0; row <= r1; row += 1) {
+      let cellIndex = row * grid.gridWidth + c0;
+      for (let col = c0; col <= c1; col += 1) {
+        const offset = grid.offsets[cellIndex];
+        const count = grid.counts[cellIndex];
+        for (let i = 0; i < count; i += 1) {
+          const segmentIndex = grid.indices[offset + i];
+          if (this.segmentMarks[segmentIndex] === this.markToken) {
+            continue;
+          }
+          this.segmentMarks[segmentIndex] = this.markToken;
+
+          if (
+            this.segmentMaxX[segmentIndex] < viewMinX ||
+            this.segmentMinX[segmentIndex] > viewMaxX ||
+            this.segmentMaxY[segmentIndex] < viewMinY ||
+            this.segmentMinY[segmentIndex] > viewMaxY
+          ) {
+            continue;
+          }
+
+          this.visibleSegmentIds[outCount] = segmentIndex;
+          outCount += 1;
+        }
+        cellIndex += 1;
+      }
+    }
+
+    this.usingAllSegments = false;
+    this.mesh.geometry.instanceCount = outCount;
+    this.segmentIndexAttribute.addUpdateRange(0, outCount);
+    this.segmentIndexAttribute.needsUpdate = true;
+  }
+
+  private setAllSegmentsVisible(): void {
+    if (!this.usingAllSegments) {
+      this.visibleSegmentIds.set(this.allSegmentIds.subarray(0, this.segmentCount), 0);
+      this.segmentIndexAttribute.addUpdateRange(0, this.segmentCount);
+      this.segmentIndexAttribute.needsUpdate = true;
+    }
+    this.usingAllSegments = true;
+    this.mesh.geometry.instanceCount = this.segmentCount;
   }
 }
 
@@ -164,7 +279,7 @@ function createSegmentDataTexture(
   return texture;
 }
 
-function createStrokeGeometry(segmentCount: number): THREE.InstancedBufferGeometry {
+function createStrokeGeometry(segmentIds: Float32Array, segmentCount: number): THREE.InstancedBufferGeometry {
   const geometry = new THREE.InstancedBufferGeometry();
 
   const corners = new Float32Array([
@@ -176,15 +291,50 @@ function createStrokeGeometry(segmentCount: number): THREE.InstancedBufferGeomet
   geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute(corners, 2));
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
 
-  const instanceCount = Math.max(0, segmentCount | 0);
-  const segmentIds = new Float32Array(Math.max(1, instanceCount));
-  for (let i = 0; i < instanceCount; i += 1) {
-    segmentIds[i] = i;
-  }
-  geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(segmentIds, 1));
-  geometry.instanceCount = instanceCount;
+  const segmentIndexAttribute = new THREE.InstancedBufferAttribute(segmentIds, 1);
+  segmentIndexAttribute.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("aSegmentIndex", segmentIndexAttribute);
+  geometry.instanceCount = Math.max(0, segmentCount | 0);
 
   return geometry;
+}
+
+function buildExpandedSegmentBounds(scene: VectorScene, segmentCount: number): {
+  minX: Float32Array;
+  minY: Float32Array;
+  maxX: Float32Array;
+  maxY: Float32Array;
+} {
+  const minX = new Float32Array(segmentCount);
+  const minY = new Float32Array(segmentCount);
+  const maxX = new Float32Array(segmentCount);
+  const maxY = new Float32Array(segmentCount);
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const primitiveBoundsOffset = i * 4;
+    const styleOffset = i * 4;
+    const margin = (scene.styles[styleOffset] ?? 0) + 0.35;
+
+    minX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+    minY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+    maxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+    maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function clampToGrid(value: number, side: number): number {
+  if (side <= 1) {
+    return 0;
+  }
+  if (value < 0) {
+    return 0;
+  }
+  if (value >= side) {
+    return side - 1;
+  }
+  return value;
 }
 
 function normalizeCoreShaderSource(source: string): string {

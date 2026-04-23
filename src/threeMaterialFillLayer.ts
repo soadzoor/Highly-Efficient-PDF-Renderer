@@ -29,10 +29,24 @@ export class ThreeMaterialFillLayer {
   private readonly cameraCenterUniform: THREE.Vector2;
   private readonly zoomUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
+  private readonly fillPathCount: number;
+  private readonly fillPathIndexAttribute: THREE.InstancedBufferAttribute;
+  private readonly allFillPathIds: Float32Array;
+  private readonly visibleFillPathIds: Float32Array;
+  private readonly fillMinX: Float32Array;
+  private readonly fillMinY: Float32Array;
+  private readonly fillMaxX: Float32Array;
+  private readonly fillMaxY: Float32Array;
+  private readonly sceneMinX: number;
+  private readonly sceneMinY: number;
+  private readonly sceneMaxX: number;
+  private readonly sceneMaxY: number;
+  private usingAllFillPaths = true;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
+    this.fillPathCount = fillPathCount;
     const pathTextureSize = chooseTextureSize(fillPathCount);
     const segmentTextureSize = chooseTextureSize(fillSegmentCount);
 
@@ -67,7 +81,24 @@ export class ThreeMaterialFillLayer {
       segmentTextureSize.height
     );
 
-    const geometry = createFillGeometry(fillPathCount);
+    this.visibleFillPathIds = new Float32Array(Math.max(1, fillPathCount));
+    this.allFillPathIds = new Float32Array(Math.max(1, fillPathCount));
+    for (let i = 0; i < fillPathCount; i += 1) {
+      this.visibleFillPathIds[i] = i;
+      this.allFillPathIds[i] = i;
+    }
+    const fillBounds = buildFillPathBounds(scene, fillPathCount);
+    this.fillMinX = fillBounds.minX;
+    this.fillMinY = fillBounds.minY;
+    this.fillMaxX = fillBounds.maxX;
+    this.fillMaxY = fillBounds.maxY;
+    this.sceneMinX = fillBounds.sceneMinX;
+    this.sceneMinY = fillBounds.sceneMinY;
+    this.sceneMaxX = fillBounds.sceneMaxX;
+    this.sceneMaxY = fillBounds.sceneMaxY;
+
+    const geometry = createFillGeometry(this.visibleFillPathIds, fillPathCount);
+    this.fillPathIndexAttribute = geometry.getAttribute("aFillPathIndex") as THREE.InstancedBufferAttribute;
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
@@ -124,6 +155,7 @@ export class ThreeMaterialFillLayer {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    this.updateVisibleFillPaths(viewState, viewport);
   }
 
   dispose(): void {
@@ -134,6 +166,63 @@ export class ThreeMaterialFillLayer {
     this.fillPathMetaTextureC.dispose();
     this.fillSegmentTextureA.dispose();
     this.fillSegmentTextureB.dispose();
+  }
+
+  private updateVisibleFillPaths(viewState: ViewState, viewport: ViewportPixels): void {
+    if (this.fillPathCount <= 0) {
+      this.setAllFillPathsVisible();
+      return;
+    }
+
+    const safeZoom = Math.max(1e-6, viewState.zoom);
+    const halfViewWidth = Math.max(1, viewport.width) / (2 * safeZoom);
+    const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
+    const margin = Math.max(16 / safeZoom, 0.5);
+
+    const viewMinX = viewState.cameraCenterX - halfViewWidth - margin;
+    const viewMaxX = viewState.cameraCenterX + halfViewWidth + margin;
+    const viewMinY = viewState.cameraCenterY - halfViewHeight - margin;
+    const viewMaxY = viewState.cameraCenterY + halfViewHeight + margin;
+
+    if (
+      viewMinX <= this.sceneMinX &&
+      viewMaxX >= this.sceneMaxX &&
+      viewMinY <= this.sceneMinY &&
+      viewMaxY >= this.sceneMaxY
+    ) {
+      this.setAllFillPathsVisible();
+      return;
+    }
+
+    let outCount = 0;
+    for (let i = 0; i < this.fillPathCount; i += 1) {
+      if (
+        this.fillMaxX[i] < viewMinX ||
+        this.fillMinX[i] > viewMaxX ||
+        this.fillMaxY[i] < viewMinY ||
+        this.fillMinY[i] > viewMaxY
+      ) {
+        continue;
+      }
+
+      this.visibleFillPathIds[outCount] = i;
+      outCount += 1;
+    }
+
+    this.usingAllFillPaths = false;
+    this.mesh.geometry.instanceCount = outCount;
+    this.fillPathIndexAttribute.addUpdateRange(0, outCount);
+    this.fillPathIndexAttribute.needsUpdate = true;
+  }
+
+  private setAllFillPathsVisible(): void {
+    if (!this.usingAllFillPaths) {
+      this.visibleFillPathIds.set(this.allFillPathIds.subarray(0, this.fillPathCount), 0);
+      this.fillPathIndexAttribute.addUpdateRange(0, this.fillPathCount);
+      this.fillPathIndexAttribute.needsUpdate = true;
+    }
+    this.usingAllFillPaths = true;
+    this.mesh.geometry.instanceCount = this.fillPathCount;
   }
 }
 
@@ -170,7 +259,7 @@ function createFloatTexture(
   return texture;
 }
 
-function createFillGeometry(fillPathCount: number): THREE.InstancedBufferGeometry {
+function createFillGeometry(fillPathIds: Float32Array, fillPathCount: number): THREE.InstancedBufferGeometry {
   const geometry = new THREE.InstancedBufferGeometry();
 
   const corners = new Float32Array([
@@ -182,15 +271,60 @@ function createFillGeometry(fillPathCount: number): THREE.InstancedBufferGeometr
   geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute(corners, 2));
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
 
-  const instanceCount = Math.max(0, fillPathCount | 0);
-  const fillPathIds = new Float32Array(Math.max(1, instanceCount));
-  for (let i = 0; i < instanceCount; i += 1) {
-    fillPathIds[i] = i;
-  }
-  geometry.setAttribute("aFillPathIndex", new THREE.InstancedBufferAttribute(fillPathIds, 1));
-  geometry.instanceCount = instanceCount;
+  const fillPathIndexAttribute = new THREE.InstancedBufferAttribute(fillPathIds, 1);
+  fillPathIndexAttribute.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("aFillPathIndex", fillPathIndexAttribute);
+  geometry.instanceCount = Math.max(0, fillPathCount | 0);
 
   return geometry;
+}
+
+function buildFillPathBounds(scene: VectorScene, fillPathCount: number): {
+  minX: Float32Array;
+  minY: Float32Array;
+  maxX: Float32Array;
+  maxY: Float32Array;
+  sceneMinX: number;
+  sceneMinY: number;
+  sceneMaxX: number;
+  sceneMaxY: number;
+} {
+  const minX = new Float32Array(fillPathCount);
+  const minY = new Float32Array(fillPathCount);
+  const maxX = new Float32Array(fillPathCount);
+  const maxY = new Float32Array(fillPathCount);
+
+  let sceneMinX = Number.POSITIVE_INFINITY;
+  let sceneMinY = Number.POSITIVE_INFINITY;
+  let sceneMaxX = Number.NEGATIVE_INFINITY;
+  let sceneMaxY = Number.NEGATIVE_INFINITY;
+
+  for (let i = 0; i < fillPathCount; i += 1) {
+    const offset = i * 4;
+    const x0 = scene.fillPathMetaA[offset + 2];
+    const y0 = scene.fillPathMetaA[offset + 3];
+    const x1 = scene.fillPathMetaB[offset];
+    const y1 = scene.fillPathMetaB[offset + 1];
+
+    minX[i] = Math.min(x0, x1);
+    minY[i] = Math.min(y0, y1);
+    maxX[i] = Math.max(x0, x1);
+    maxY[i] = Math.max(y0, y1);
+
+    sceneMinX = Math.min(sceneMinX, minX[i]);
+    sceneMinY = Math.min(sceneMinY, minY[i]);
+    sceneMaxX = Math.max(sceneMaxX, maxX[i]);
+    sceneMaxY = Math.max(sceneMaxY, maxY[i]);
+  }
+
+  if (!Number.isFinite(sceneMinX) || !Number.isFinite(sceneMinY) || !Number.isFinite(sceneMaxX) || !Number.isFinite(sceneMaxY)) {
+    sceneMinX = scene.bounds.minX;
+    sceneMinY = scene.bounds.minY;
+    sceneMaxX = scene.bounds.maxX;
+    sceneMaxY = scene.bounds.maxY;
+  }
+
+  return { minX, minY, maxX, maxY, sceneMinX, sceneMinY, sceneMaxX, sceneMaxY };
 }
 
 function normalizeCoreShaderSource(source: string): string {
