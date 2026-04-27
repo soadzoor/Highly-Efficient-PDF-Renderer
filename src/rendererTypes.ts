@@ -1,12 +1,18 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 
 export type RendererBackend = "webgl" | "webgpu";
+
+export interface ViewStateUpdateOptions {
+  preservePanCache?: boolean;
+  interacting?: boolean;
+}
 
 export interface RendererApi {
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
   setExternalFrameDriver?(enabled: boolean): void;
   renderExternalFrame?(timestamp?: number): void;
+  renderProjectedFrame?(options: ProjectedFrameOptions): DrawStats;
   setRasterRenderingEnabled?(enabled: boolean): void;
   setFillRenderingEnabled?(enabled: boolean): void;
   setStrokeRenderingEnabled?(enabled: boolean): void;
@@ -30,6 +36,6 @@ export interface RendererApi {
   panByPixels(deltaX: number, deltaY: number): void;
   zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void;
   getViewState(): ViewState;
-  setViewState(viewState: ViewState): void;
+  setViewState(viewState: ViewState, options?: ViewStateUpdateOptions): void;
   dispose(): void;
 }

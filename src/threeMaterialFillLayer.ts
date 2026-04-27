@@ -16,6 +16,13 @@ interface ViewportPixels {
   height: number;
 }
 
+interface CullingBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
 export class ThreeMaterialFillLayer {
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.RawShaderMaterial>;
 
@@ -169,11 +176,11 @@ export class ThreeMaterialFillLayer {
     this.localToClipUniform.copy(localToClip);
   }
 
-  updateFrame(viewState: ViewState, viewport: ViewportPixels): void {
+  updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
-    this.updateVisibleFillPaths(viewState, viewport);
+    this.updateVisibleFillPaths(viewState, viewport, cullingBounds);
   }
 
   dispose(): void {
@@ -186,8 +193,12 @@ export class ThreeMaterialFillLayer {
     this.fillSegmentTextureB.dispose();
   }
 
-  private updateVisibleFillPaths(viewState: ViewState, viewport: ViewportPixels): void {
-    if (this.useLocalToClip) {
+  private updateVisibleFillPaths(
+    viewState: ViewState,
+    viewport: ViewportPixels,
+    cullingBounds?: CullingBounds | null
+  ): void {
+    if (this.useLocalToClip && !cullingBounds) {
       this.setAllFillPathsVisible();
       return;
     }
@@ -202,10 +213,18 @@ export class ThreeMaterialFillLayer {
     const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
     const margin = Math.max(16 / safeZoom, 0.5);
 
-    const viewMinX = viewState.cameraCenterX - halfViewWidth - margin;
-    const viewMaxX = viewState.cameraCenterX + halfViewWidth + margin;
-    const viewMinY = viewState.cameraCenterY - halfViewHeight - margin;
-    const viewMaxY = viewState.cameraCenterY + halfViewHeight + margin;
+    const viewMinX = cullingBounds
+      ? cullingBounds.minX - margin
+      : viewState.cameraCenterX - halfViewWidth - margin;
+    const viewMaxX = cullingBounds
+      ? cullingBounds.maxX + margin
+      : viewState.cameraCenterX + halfViewWidth + margin;
+    const viewMinY = cullingBounds
+      ? cullingBounds.minY - margin
+      : viewState.cameraCenterY - halfViewHeight - margin;
+    const viewMaxY = cullingBounds
+      ? cullingBounds.maxY + margin
+      : viewState.cameraCenterY + halfViewHeight + margin;
 
     if (
       viewMinX <= this.sceneMinX &&

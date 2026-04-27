@@ -2161,7 +2161,7 @@ export class WebGpuFloorplanRenderer {
     return this.presentedFrameSerial;
   }
 
-  setViewState(viewState: ViewState): void {
+  setViewState(viewState: ViewState, _options: { preservePanCache?: boolean; interacting?: boolean } = {}): void {
     const nextCenterX = Number(viewState.cameraCenterX);
     const nextCenterY = Number(viewState.cameraCenterY);
     const nextZoom = Number(viewState.zoom);

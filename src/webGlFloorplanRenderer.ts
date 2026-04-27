@@ -992,6 +992,23 @@ export interface ViewState {
   zoom: number;
 }
 
+export interface ProjectedFrameOptions {
+  viewportWidth: number;
+  viewportHeight: number;
+  localToClip: ArrayLike<number>;
+  localUnitsPerPixel: number;
+  cullingBounds?: Bounds | null;
+}
+
+export interface ViewStateUpdateOptions {
+  preservePanCache?: boolean;
+  interacting?: boolean;
+}
+
+export interface WebGlFloorplanRendererOptions {
+  preserveDrawingBuffer?: boolean;
+}
+
 type FrameListener = (stats: DrawStats) => void;
 
 interface RasterLayerGpu {
@@ -1095,6 +1112,12 @@ export class WebGlFloorplanRenderer {
 
   private readonly uAAScreenPx: WebGLUniformLocation;
 
+  private readonly uUseLocalToClip: WebGLUniformLocation;
+
+  private readonly uLocalToClip: WebGLUniformLocation;
+
+  private readonly uLocalUnitsPerPixel: WebGLUniformLocation;
+
   private readonly uStrokeCurveEnabled: WebGLUniformLocation;
 
   private readonly uStrokeVectorOverride: WebGLUniformLocation;
@@ -1120,6 +1143,10 @@ export class WebGlFloorplanRenderer {
   private readonly uFillZoom: WebGLUniformLocation;
 
   private readonly uFillAAScreenPx: WebGLUniformLocation;
+
+  private readonly uFillUseLocalToClip: WebGLUniformLocation;
+
+  private readonly uFillLocalToClip: WebGLUniformLocation;
 
   private readonly uFillVectorOverride: WebGLUniformLocation;
 
@@ -1152,6 +1179,10 @@ export class WebGlFloorplanRenderer {
   private readonly uTextZoom: WebGLUniformLocation;
 
   private readonly uTextAAScreenPx: WebGLUniformLocation;
+
+  private readonly uTextUseLocalToClip: WebGLUniformLocation;
+
+  private readonly uTextLocalToClip: WebGLUniformLocation;
 
   private readonly uTextCurveEnabled: WebGLUniformLocation;
 
@@ -1188,6 +1219,10 @@ export class WebGlFloorplanRenderer {
   private readonly uRasterCameraCenter: WebGLUniformLocation;
 
   private readonly uRasterZoom: WebGLUniformLocation;
+
+  private readonly uRasterUseLocalToClip: WebGLUniformLocation;
+
+  private readonly uRasterLocalToClip: WebGLUniformLocation;
 
   private scene: VectorScene | null = null;
 
@@ -1373,9 +1408,12 @@ export class WebGlFloorplanRenderer {
   private vectorOverrideColor: [number, number, number] = [0, 0, 0];
 
   private vectorOverrideOpacity = 0;
+  private localToClipRenderingEnabled = false;
+  private readonly localToClipMatrix = new Float32Array(16);
+  private localUnitsPerPixel = 1;
   private isDisposed = false;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, options: WebGlFloorplanRendererOptions = {}) {
     this.canvas = canvas;
 
     const context = canvas.getContext("webgl2", {
@@ -1383,7 +1421,8 @@ export class WebGlFloorplanRenderer {
       depth: false,
       stencil: false,
       alpha: false,
-      premultipliedAlpha: false
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: options.preserveDrawingBuffer === true
     });
 
     if (!context) {
@@ -1439,6 +1478,9 @@ export class WebGlFloorplanRenderer {
     this.uCameraCenter = this.mustGetUniformLocation(this.segmentProgram, "uCameraCenter");
     this.uZoom = this.mustGetUniformLocation(this.segmentProgram, "uZoom");
     this.uAAScreenPx = this.mustGetUniformLocation(this.segmentProgram, "uAAScreenPx");
+    this.uUseLocalToClip = this.mustGetUniformLocation(this.segmentProgram, "uUseLocalToClip");
+    this.uLocalToClip = this.mustGetUniformLocation(this.segmentProgram, "uLocalToClip");
+    this.uLocalUnitsPerPixel = this.mustGetUniformLocation(this.segmentProgram, "uLocalUnitsPerPixel");
     this.uStrokeCurveEnabled = this.mustGetUniformLocation(this.segmentProgram, "uStrokeCurveEnabled");
     this.uStrokeVectorOverride = this.mustGetUniformLocation(this.segmentProgram, "uVectorOverride");
 
@@ -1453,6 +1495,8 @@ export class WebGlFloorplanRenderer {
     this.uFillCameraCenter = this.mustGetUniformLocation(this.fillProgram, "uCameraCenter");
     this.uFillZoom = this.mustGetUniformLocation(this.fillProgram, "uZoom");
     this.uFillAAScreenPx = this.mustGetUniformLocation(this.fillProgram, "uFillAAScreenPx");
+    this.uFillUseLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uUseLocalToClip");
+    this.uFillLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uLocalToClip");
     this.uFillVectorOverride = this.mustGetUniformLocation(this.fillProgram, "uVectorOverride");
 
     this.uTextInstanceTexA = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexA");
@@ -1470,6 +1514,8 @@ export class WebGlFloorplanRenderer {
     this.uTextCameraCenter = this.mustGetUniformLocation(this.textProgram, "uCameraCenter");
     this.uTextZoom = this.mustGetUniformLocation(this.textProgram, "uZoom");
     this.uTextAAScreenPx = this.mustGetUniformLocation(this.textProgram, "uTextAAScreenPx");
+    this.uTextUseLocalToClip = this.mustGetUniformLocation(this.textProgram, "uUseLocalToClip");
+    this.uTextLocalToClip = this.mustGetUniformLocation(this.textProgram, "uLocalToClip");
     this.uTextCurveEnabled = this.mustGetUniformLocation(this.textProgram, "uTextCurveEnabled");
     this.uTextRasterAtlasTex = this.mustGetUniformLocation(this.textProgram, "uTextRasterAtlasTex");
     this.uTextRasterAtlasSize = this.mustGetUniformLocation(this.textProgram, "uTextRasterAtlasSize");
@@ -1491,6 +1537,8 @@ export class WebGlFloorplanRenderer {
     this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
     this.uRasterCameraCenter = this.mustGetUniformLocation(this.rasterProgram, "uCameraCenter");
     this.uRasterZoom = this.mustGetUniformLocation(this.rasterProgram, "uZoom");
+    this.uRasterUseLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uUseLocalToClip");
+    this.uRasterLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uLocalToClip");
 
     this.initializeGeometry();
     this.initializeState();
@@ -1516,6 +1564,74 @@ export class WebGlFloorplanRenderer {
 
   renderExternalFrame(timestamp: number = performance.now()): void {
     this.render(timestamp);
+  }
+
+  renderProjectedFrame(options: ProjectedFrameOptions): DrawStats {
+    const viewportWidth = Math.max(1, Math.round(options.viewportWidth));
+    const viewportHeight = Math.max(1, Math.round(options.viewportHeight));
+    const localUnitsPerPixel = Math.max(1e-9, Number(options.localUnitsPerPixel));
+    if (options.localToClip.length < 16) {
+      return {
+        renderedSegments: 0,
+        totalSegments: this.segmentCount,
+        usedCulling: false,
+        zoom: 1 / localUnitsPerPixel
+      };
+    }
+
+    for (let i = 0; i < 16; i += 1) {
+      const value = Number(options.localToClip[i]);
+      if (!Number.isFinite(value)) {
+        return {
+          renderedSegments: 0,
+          totalSegments: this.segmentCount,
+          usedCulling: false,
+          zoom: 1 / localUnitsPerPixel
+        };
+      }
+      this.localToClipMatrix[i] = value;
+    }
+    this.localUnitsPerPixel = localUnitsPerPixel;
+    this.localToClipRenderingEnabled = true;
+
+    const gl = this.gl;
+    this.ensureRenderState();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, viewportWidth, viewportHeight);
+
+    if (options.cullingBounds) {
+      this.updateVisibleSetForBounds(options.cullingBounds, localUnitsPerPixel);
+    } else {
+      this.setAllPagesAndTextVisible();
+      this.usingAllSegments = true;
+      this.visibleSegmentCount = this.segmentCount;
+    }
+
+    if (this.rasterRenderingEnabled) {
+      this.drawRasterLayer(viewportWidth, viewportHeight, this.cameraCenterX, this.cameraCenterY, 1 / localUnitsPerPixel);
+    }
+    if (this.fillRenderingEnabled) {
+      this.drawFilledPaths(viewportWidth, viewportHeight, this.cameraCenterX, this.cameraCenterY, 1 / localUnitsPerPixel);
+    }
+    const renderedSegments = this.strokeRenderingEnabled
+      ? this.drawVisibleSegments(viewportWidth, viewportHeight, this.cameraCenterX, this.cameraCenterY, 1 / localUnitsPerPixel)
+      : 0;
+    if (this.textRenderingEnabled) {
+      this.drawTextInstances(viewportWidth, viewportHeight, this.cameraCenterX, this.cameraCenterY, 1 / localUnitsPerPixel);
+    }
+
+    this.localToClipRenderingEnabled = false;
+    gl.bindVertexArray(null);
+    this.presentedFrameSerial += 1;
+
+    const stats = {
+      renderedSegments,
+      totalSegments: this.segmentCount,
+      usedCulling: !this.usingAllSegments,
+      zoom: 1 / localUnitsPerPixel
+    };
+    this.frameListener?.(stats);
+    return stats;
   }
 
   setPanOptimizationEnabled(enabled: boolean): void {
@@ -1822,7 +1938,7 @@ export class WebGlFloorplanRenderer {
     return this.presentedFrameSerial;
   }
 
-  setViewState(viewState: ViewState): void {
+  setViewState(viewState: ViewState, options: ViewStateUpdateOptions = {}): void {
     const nextCenterX = Number(viewState.cameraCenterX);
     const nextCenterY = Number(viewState.cameraCenterY);
     const nextZoom = Number(viewState.zoom);
@@ -1830,17 +1946,36 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
+    const resolvedZoom = clamp(nextZoom, this.minZoom, this.maxZoom);
+    const stateChanged =
+      Math.abs(this.cameraCenterX - nextCenterX) > 1e-6 ||
+      Math.abs(this.cameraCenterY - nextCenterY) > 1e-6 ||
+      Math.abs(this.zoom - resolvedZoom) > 1e-6;
+    if (!stateChanged && options.preservePanCache === true) {
+      const nextInteracting = options.interacting === true;
+      if (this.isPanInteracting !== nextInteracting) {
+        this.isPanInteracting = nextInteracting;
+        if (!nextInteracting) {
+          this.needsVisibleSetUpdate = true;
+        }
+      }
+      return;
+    }
+
     this.cameraCenterX = nextCenterX;
     this.cameraCenterY = nextCenterY;
-    const resolvedZoom = clamp(nextZoom, this.minZoom, this.maxZoom);
     this.zoom = resolvedZoom;
     this.targetCameraCenterX = nextCenterX;
     this.targetCameraCenterY = nextCenterY;
     this.targetZoom = resolvedZoom;
     this.lastCameraAnimationTimeMs = 0;
     this.hasZoomAnchor = false;
-    this.isPanInteracting = false;
-    this.panCacheValid = false;
+    if (options.preservePanCache === true) {
+      this.isPanInteracting = options.interacting === true;
+    } else {
+      this.isPanInteracting = false;
+      this.panCacheValid = false;
+    }
     this.presentedCameraCenterX = this.cameraCenterX;
     this.presentedCameraCenterY = this.cameraCenterY;
     this.presentedZoom = this.zoom;
@@ -2410,7 +2545,8 @@ export class WebGlFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    zoomValue = this.zoom
   ): void {
     if (this.rasterLayers.length === 0 && this.pageRects.length === 0) {
       return;
@@ -2422,7 +2558,11 @@ export class WebGlFloorplanRenderer {
 
     gl.uniform2f(this.uRasterViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
-    gl.uniform1f(this.uRasterZoom, this.zoom);
+    gl.uniform1f(this.uRasterZoom, zoomValue);
+    gl.uniform1f(this.uRasterUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+    if (this.localToClipRenderingEnabled) {
+      gl.uniformMatrix4fv(this.uRasterLocalToClip, false, this.localToClipMatrix);
+    }
 
     if (this.pageRects.length > 0 && this.visiblePageRectCount > 0) {
       gl.activeTexture(gl.TEXTURE12);
@@ -2504,6 +2644,10 @@ export class WebGlFloorplanRenderer {
     gl.uniform2f(this.uFillCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uFillZoom, zoomValue);
     gl.uniform1f(this.uFillAAScreenPx, 1);
+    gl.uniform1f(this.uFillUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+    if (this.localToClipRenderingEnabled) {
+      gl.uniformMatrix4fv(this.uFillLocalToClip, false, this.localToClipMatrix);
+    }
     gl.uniform4f(
       this.uFillVectorOverride,
       this.vectorOverrideColor[0],
@@ -2557,6 +2701,11 @@ export class WebGlFloorplanRenderer {
     gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uZoom, zoomValue);
     gl.uniform1f(this.uAAScreenPx, 1);
+    gl.uniform1f(this.uUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+    gl.uniform1f(this.uLocalUnitsPerPixel, this.localUnitsPerPixel);
+    if (this.localToClipRenderingEnabled) {
+      gl.uniformMatrix4fv(this.uLocalToClip, false, this.localToClipMatrix);
+    }
     gl.uniform1f(this.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
     gl.uniform4f(
       this.uStrokeVectorOverride,
@@ -2629,6 +2778,10 @@ export class WebGlFloorplanRenderer {
     gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uTextZoom, zoomValue);
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
+    gl.uniform1f(this.uTextUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+    if (this.localToClipRenderingEnabled) {
+      gl.uniformMatrix4fv(this.uTextLocalToClip, false, this.localToClipMatrix);
+    }
     gl.uniform1f(this.uTextCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
     gl.uniform1f(this.uTextVectorOnly, this.textVectorOnly ? 1 : 0);
     gl.uniform4f(
@@ -2865,6 +3018,78 @@ export class WebGlFloorplanRenderer {
 
     this.visibleSegmentCount = outCount;
 
+    const slice = this.visibleSegmentIds.subarray(0, outCount);
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.visibleSegmentIdBuffer);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
+  }
+
+  private updateVisibleSetForBounds(bounds: Bounds, localUnitsPerPixel: number): void {
+    if (!this.scene) {
+      this.visibleSegmentCount = 0;
+      this.usingAllSegments = true;
+      this.visiblePageRectCount = 0;
+      this.visibleTextRanges = [];
+      return;
+    }
+
+    const margin = Math.max(16 * Math.max(localUnitsPerPixel, 1e-9), this.scene.maxHalfWidth * 2);
+    const viewMinX = bounds.minX - margin;
+    const viewMinY = bounds.minY - margin;
+    const viewMaxX = bounds.maxX + margin;
+    const viewMaxY = bounds.maxY + margin;
+
+    this.updateVisiblePagesAndTextRanges(viewMinX, viewMinY, viewMaxX, viewMaxY);
+
+    if (!this.grid) {
+      this.visibleSegmentCount = 0;
+      this.usingAllSegments = true;
+      return;
+    }
+
+    const grid = this.grid;
+    const c0 = clampToGrid(Math.floor((viewMinX - grid.minX) / grid.cellWidth), grid.gridWidth);
+    const c1 = clampToGrid(Math.floor((viewMaxX - grid.minX) / grid.cellWidth), grid.gridWidth);
+    const r0 = clampToGrid(Math.floor((viewMinY - grid.minY) / grid.cellHeight), grid.gridHeight);
+    const r1 = clampToGrid(Math.floor((viewMaxY - grid.minY) / grid.cellHeight), grid.gridHeight);
+
+    this.usingAllSegments = false;
+
+    this.markToken += 1;
+    if (this.markToken === 0xffffffff) {
+      this.segmentMarks.fill(0);
+      this.markToken = 1;
+    }
+
+    let outCount = 0;
+    for (let row = r0; row <= r1; row += 1) {
+      let cellIndex = row * grid.gridWidth + c0;
+      for (let col = c0; col <= c1; col += 1) {
+        const offset = grid.offsets[cellIndex];
+        const count = grid.counts[cellIndex];
+        for (let i = 0; i < count; i += 1) {
+          const segmentIndex = grid.indices[offset + i];
+          if (this.segmentMarks[segmentIndex] === this.markToken) {
+            continue;
+          }
+          this.segmentMarks[segmentIndex] = this.markToken;
+
+          if (
+            this.segmentMaxX[segmentIndex] < viewMinX ||
+            this.segmentMinX[segmentIndex] > viewMaxX ||
+            this.segmentMaxY[segmentIndex] < viewMinY ||
+            this.segmentMinY[segmentIndex] > viewMaxY
+          ) {
+            continue;
+          }
+
+          this.visibleSegmentIds[outCount] = segmentIndex;
+          outCount += 1;
+        }
+        cellIndex += 1;
+      }
+    }
+
+    this.visibleSegmentCount = outCount;
     const slice = this.visibleSegmentIds.subarray(0, outCount);
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.visibleSegmentIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);

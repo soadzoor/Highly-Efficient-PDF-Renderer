@@ -3,10 +3,13 @@ import * as THREE from "three";
 import { createCanvasInteractionController, type CanvasInteractionController } from "./canvasInteractions";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
 import type { RendererApi } from "./rendererTypes";
+import { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
+import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
+import { ThreeTiledOverviewLayer } from "./threeTiledOverviewLayer";
 import { WebGlFloorplanRenderer, type ViewState } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 
@@ -18,6 +21,17 @@ const DEFAULT_MAX_CANVAS_PIXELS = 4_194_304;
 const PERSPECTIVE_NATIVE_OVERSAMPLE = 1.15;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MIN = 0.9;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MAX = 1.12;
+const PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_AREA_RATIO = 0.22;
+const PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_AREA_RATIO = 0.34;
+const PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_AXIS_RATIO = 0.58;
+const PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_AXIS_RATIO = 0.68;
+const PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_STROKES = 100_000;
+const PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_STROKES = 160_000;
+const OVERVIEW_TILE_ENTER_MAX_PROJECTED_LONG_RATIO = 1.02;
+const OVERVIEW_TILE_EXIT_MAX_PROJECTED_LONG_RATIO = 1.18;
+const OVERVIEW_TILE_ENTER_NDC_MARGIN = 0.035;
+const OVERVIEW_TILE_EXIT_NDC_MARGIN = 0.16;
+const PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT = 0.9995;
 
 export type HeprRendererType = "webgl" | "webgpu";
 export type HeprColorInput = number | string | [number, number, number];
@@ -56,6 +70,7 @@ interface SceneBounds {
 interface DerivedThreeCameraView {
   viewState: ViewState;
   nativeViewport: ViewportPixels;
+  cullingBounds?: SceneBounds;
 }
 
 interface RendererConfig {
@@ -96,7 +111,10 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly rasterMaterialLayer: ThreeMaterialRasterLayer | null;
   private readonly fillMaterialLayer: ThreeMaterialFillLayer | null;
   private readonly strokeMaterialLayer: ThreeMaterialStrokeLayer | null;
+  private readonly triangleStrokeLayer: ThreeTriangleStrokeLayer | null;
+  private readonly compactedStrokeLayer: ThreeCompactedStrokeLayer | null;
   private readonly textMaterialLayer: ThreeMaterialTextLayer | null;
+  private readonly overviewTileLayer: ThreeTiledOverviewLayer | null;
 
   private controlsCanvas: HTMLCanvasElement | null = null;
   private hostRenderCanvas: HTMLCanvasElement | null = null;
@@ -108,6 +126,8 @@ export class HeprThreePdfObject extends THREE.Group {
   private lastViewportHeight = 0;
   private textureAnisotropy = 1;
   private perspectiveVectorPipelineActive = false;
+  private perspectiveNativeProjectionPipelineActive = false;
+  private perspectiveOverviewTilePipelineActive = false;
   private isDisposed = false;
   private warnedThreeCameraUnsupported = false;
   private warnedThreeCameraPerspectiveFallback = false;
@@ -136,6 +156,11 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly projectedCenter = new THREE.Vector3();
   private readonly projectedBasisX = new THREE.Vector3();
   private readonly projectedBasisY = new THREE.Vector3();
+  private readonly cameraForwardWorld = new THREE.Vector3();
+  private readonly cameraRightWorld = new THREE.Vector3();
+  private readonly cameraUpWorld = new THREE.Vector3();
+  private readonly pageRightWorld = new THREE.Vector3();
+  private readonly pageUpWorld = new THREE.Vector3();
 
   constructor(
     loadedScene: LoadedPdfScene,
@@ -151,7 +176,10 @@ export class HeprThreePdfObject extends THREE.Group {
     rasterMaterialLayer: ThreeMaterialRasterLayer | null,
     fillMaterialLayer: ThreeMaterialFillLayer | null,
     strokeMaterialLayer: ThreeMaterialStrokeLayer | null,
+    triangleStrokeLayer: ThreeTriangleStrokeLayer | null,
+    compactedStrokeLayer: ThreeCompactedStrokeLayer | null,
     textMaterialLayer: ThreeMaterialTextLayer | null,
+    overviewTileLayer: ThreeTiledOverviewLayer | null,
     pageMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>,
     uvArray: Float32Array,
     uvAttribute: THREE.BufferAttribute
@@ -171,7 +199,10 @@ export class HeprThreePdfObject extends THREE.Group {
     this.rasterMaterialLayer = rasterMaterialLayer;
     this.fillMaterialLayer = fillMaterialLayer;
     this.strokeMaterialLayer = strokeMaterialLayer;
+    this.triangleStrokeLayer = triangleStrokeLayer;
+    this.compactedStrokeLayer = compactedStrokeLayer;
     this.textMaterialLayer = textMaterialLayer;
+    this.overviewTileLayer = overviewTileLayer;
     this.pageMesh = pageMesh;
     this.uvArray = uvArray;
     this.uvAttribute = uvAttribute;
@@ -204,9 +235,21 @@ export class HeprThreePdfObject extends THREE.Group {
       this.strokeMaterialLayer.setVisible(false);
       this.add(this.strokeMaterialLayer.mesh);
     }
+    if (this.triangleStrokeLayer) {
+      this.triangleStrokeLayer.setVisible(false);
+      this.add(this.triangleStrokeLayer.mesh);
+    }
+    if (this.compactedStrokeLayer) {
+      this.compactedStrokeLayer.deactivate();
+      this.add(this.compactedStrokeLayer.group);
+    }
     if (this.textMaterialLayer) {
       this.textMaterialLayer.setVisible(false);
       this.add(this.textMaterialLayer.mesh);
+    }
+    if (this.overviewTileLayer) {
+      this.overviewTileLayer.setVisible(false);
+      this.add(this.overviewTileLayer.group);
     }
     this.userData.hepr = {
       sourceLabel: this.sourceLabel,
@@ -269,7 +312,10 @@ export class HeprThreePdfObject extends THREE.Group {
     this.rasterMaterialLayer?.dispose();
     this.fillMaterialLayer?.dispose();
     this.strokeMaterialLayer?.dispose();
+    this.triangleStrokeLayer?.dispose();
+    this.compactedStrokeLayer?.dispose();
     this.textMaterialLayer?.dispose();
+    this.overviewTileLayer?.dispose();
     this.renderTexture?.dispose();
     this.remove(this.pageMesh);
     if (this.rasterMaterialLayer) {
@@ -281,8 +327,17 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.strokeMaterialLayer) {
       this.remove(this.strokeMaterialLayer.mesh);
     }
+    if (this.triangleStrokeLayer) {
+      this.remove(this.triangleStrokeLayer.mesh);
+    }
+    if (this.compactedStrokeLayer) {
+      this.remove(this.compactedStrokeLayer.group);
+    }
     if (this.textMaterialLayer) {
       this.remove(this.textMaterialLayer.mesh);
+    }
+    if (this.overviewTileLayer) {
+      this.remove(this.overviewTileLayer.group);
     }
     this.interactionController.detach();
     this.controlsCanvas = null;
@@ -302,22 +357,74 @@ export class HeprThreePdfObject extends THREE.Group {
     this.updateTextureSampling(renderer);
     const cameraType = camera as { isPerspectiveCamera?: boolean };
     const perspectiveThreeCameraMode = this.threeCameraDriven && cameraType.isPerspectiveCamera === true;
-    const perspectiveVectorPipelineEnabled =
-      perspectiveThreeCameraMode && this.setPerspectiveVectorPipelineActive(true);
-    if (!perspectiveThreeCameraMode) {
+    let perspectiveDerivedView: DerivedThreeCameraView | null = null;
+    let perspectiveNativeDirectHost2dPipelineEnabled = false;
+    let perspectiveNativeProjectionPipelineEnabled = false;
+    let perspectiveVectorPipelineEnabled = false;
+    let perspectiveOverviewTilePipelineEnabled = false;
+    if (perspectiveThreeCameraMode) {
+      perspectiveDerivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
+      perspectiveNativeDirectHost2dPipelineEnabled =
+        perspectiveDerivedView !== null &&
+        this.shouldUsePerspectiveNativeDirectHost2dPipeline(camera) &&
+        this.renderPerspectiveNativeDirectHost2dFrame(renderer, rendererViewport, perspectiveDerivedView);
+      if (perspectiveNativeDirectHost2dPipelineEnabled) {
+        this.setPerspectiveVectorPipelineActive(false);
+        this.setPerspectiveOverviewTilePipelineActive(false);
+      } else {
+        perspectiveOverviewTilePipelineEnabled =
+          perspectiveDerivedView !== null &&
+          this.overviewTileLayer !== null &&
+          this.shouldUsePerspectiveOverviewTilePipeline(camera, rendererViewport, perspectiveDerivedView);
+        if (perspectiveOverviewTilePipelineEnabled) {
+          this.setPerspectiveNativeProjectionPipelineActive(false);
+          this.setPerspectiveVectorPipelineActive(false);
+        } else {
+          perspectiveNativeProjectionPipelineEnabled =
+            perspectiveDerivedView !== null &&
+            this.renderPerspectiveNativeProjectionFrame(renderer, camera, rendererViewport, perspectiveDerivedView);
+          if (perspectiveNativeProjectionPipelineEnabled) {
+            this.setPerspectiveVectorPipelineActive(false);
+            this.setPerspectiveOverviewTilePipelineActive(false);
+          } else {
+            const shouldUseVectorPipeline =
+              perspectiveDerivedView !== null &&
+              this.shouldUsePerspectiveVectorPipeline(perspectiveDerivedView);
+            perspectiveVectorPipelineEnabled = shouldUseVectorPipeline && this.setPerspectiveVectorPipelineActive(true);
+            if (!perspectiveVectorPipelineEnabled) {
+              this.setPerspectiveVectorPipelineActive(false);
+              if (this.directHostRendering) {
+                this.disableDirectHostRendering();
+              }
+            }
+          }
+        }
+      }
+      this.setPerspectiveNativeProjectionPipelineActive(
+        perspectiveNativeDirectHost2dPipelineEnabled || perspectiveNativeProjectionPipelineEnabled
+      );
+      this.setPerspectiveOverviewTilePipelineActive(perspectiveOverviewTilePipelineEnabled);
+    } else {
+      this.setPerspectiveNativeProjectionPipelineActive(false);
       this.setPerspectiveVectorPipelineActive(false);
+      this.setPerspectiveOverviewTilePipelineActive(false);
     }
 
     let nativeViewport = rendererViewport;
     let nativeViewChanged = false;
+    let materialCullingBounds: SceneBounds | null = null;
 
     if (this.threeCameraDriven) {
       if (perspectiveThreeCameraMode) {
-        if (perspectiveVectorPipelineEnabled) {
+        if (perspectiveNativeDirectHost2dPipelineEnabled || perspectiveNativeProjectionPipelineEnabled) {
           this.warnedThreeCameraPerspectiveFallback = false;
-          const derivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
+          this.pendingInitialFit = false;
+        } else if (perspectiveVectorPipelineEnabled) {
+          this.warnedThreeCameraPerspectiveFallback = false;
+          const derivedView = perspectiveDerivedView;
           if (derivedView) {
             nativeViewport = derivedView.nativeViewport;
+            materialCullingBounds = derivedView.cullingBounds ?? null;
             this.resizeNativeRendererCanvas(nativeViewport);
             const previousView = this.renderer.getViewState();
             if (!isViewStateApproxEqual(previousView, derivedView.viewState)) {
@@ -326,6 +433,9 @@ export class HeprThreePdfObject extends THREE.Group {
             }
             this.pendingInitialFit = false;
           }
+        } else if (perspectiveOverviewTilePipelineEnabled) {
+          this.warnedThreeCameraPerspectiveFallback = false;
+          this.pendingInitialFit = false;
         } else {
           if (!this.warnedThreeCameraPerspectiveFallback) {
             this.warnedThreeCameraPerspectiveFallback = true;
@@ -372,10 +482,16 @@ export class HeprThreePdfObject extends THREE.Group {
       nativeViewChanged = true;
     }
 
-    const shouldRenderDirectHost = this.directHostRendering && renderer.getRenderTarget() === null;
+    const shouldRenderDirectHost =
+      this.directHostRendering &&
+      !this.perspectiveNativeProjectionPipelineActive &&
+      !this.perspectiveOverviewTilePipelineActive &&
+      renderer.getRenderTarget() === null;
     const shouldRenderThreeCameraFrame =
       this.threeCameraDriven &&
+      !this.perspectiveNativeProjectionPipelineActive &&
       !this.perspectiveVectorPipelineActive &&
+      !this.perspectiveOverviewTilePipelineActive &&
       (
         !perspectiveThreeCameraMode ||
         nativeViewChanged ||
@@ -392,10 +508,15 @@ export class HeprThreePdfObject extends THREE.Group {
       }
     }
 
-    this.updateMaterialLayerTransforms(camera, nativeViewport, perspectiveVectorPipelineEnabled);
+    const localUnitsPerPixel = this.updateMaterialLayerTransforms(camera, nativeViewport, perspectiveVectorPipelineEnabled);
+    this.updateStrokeLodVisibility(localUnitsPerPixel, perspectiveVectorPipelineEnabled);
 
     const presentedFrameSerial = this.renderer.getPresentedFrameSerial();
-    if (viewportChanged || presentedFrameSerial !== this.lastSyncedFrameSerial || this.perspectiveVectorPipelineActive) {
+    if (
+      !this.perspectiveNativeProjectionPipelineActive &&
+      !this.perspectiveOverviewTilePipelineActive &&
+      (viewportChanged || presentedFrameSerial !== this.lastSyncedFrameSerial || this.perspectiveVectorPipelineActive)
+    ) {
       const viewState = this.renderer.getPresentedViewState();
       if (!this.threeCameraDriven) {
         this.syncOrthographicCamera(camera, viewState, nativeViewport);
@@ -411,10 +532,13 @@ export class HeprThreePdfObject extends THREE.Group {
         this.rasterMaterialLayer.updateFrame(viewState, nativeViewport);
       }
       if (this.fillMaterialLayer && this.fillMaterialLayer.mesh.visible) {
-        this.fillMaterialLayer.updateFrame(viewState, nativeViewport);
+        this.fillMaterialLayer.updateFrame(viewState, nativeViewport, materialCullingBounds);
       }
       if (this.strokeMaterialLayer && this.strokeMaterialLayer.mesh.visible) {
-        this.strokeMaterialLayer.updateFrame(viewState, nativeViewport);
+        this.strokeMaterialLayer.updateFrame(viewState, nativeViewport, materialCullingBounds);
+      }
+      if (this.triangleStrokeLayer && this.triangleStrokeLayer.mesh.visible) {
+        this.triangleStrokeLayer.updateFrame(viewState, nativeViewport, materialCullingBounds);
       }
       if (this.textMaterialLayer && this.textMaterialLayer.mesh.visible) {
         this.textMaterialLayer.updateFrame(viewState, nativeViewport);
@@ -424,7 +548,13 @@ export class HeprThreePdfObject extends THREE.Group {
       this.lastViewportHeight = nativeViewport.height;
     }
 
-    if (!this.directHostRendering && this.renderTexture && presentedFrameSerial !== this.lastUploadedFrameSerial) {
+    if (
+      !this.perspectiveNativeProjectionPipelineActive &&
+      !this.perspectiveOverviewTilePipelineActive &&
+      !this.directHostRendering &&
+      this.renderTexture &&
+      presentedFrameSerial !== this.lastUploadedFrameSerial
+    ) {
       this.renderTexture.needsUpdate = true;
       this.lastUploadedFrameSerial = presentedFrameSerial;
     }
@@ -470,9 +600,180 @@ export class HeprThreePdfObject extends THREE.Group {
     return (
       this.rasterMaterialLayer !== null &&
       this.fillMaterialLayer !== null &&
-      this.strokeMaterialLayer !== null &&
+      (
+        this.strokeMaterialLayer !== null ||
+        this.triangleStrokeLayer !== null ||
+        this.compactedStrokeLayer !== null
+      ) &&
       this.textMaterialLayer !== null
     );
+  }
+
+  private shouldUsePerspectiveNativeDirectHost2dPipeline(camera: THREE.Camera): boolean {
+    if (this.rendererType !== "webgl") {
+      return false;
+    }
+
+    this.pagePlaneNormal.set(0, 0, 1).transformDirection(this.pageMesh.matrixWorld);
+    this.pageRightWorld.set(1, 0, 0).transformDirection(this.pageMesh.matrixWorld);
+    this.pageUpWorld.set(0, 1, 0).transformDirection(this.pageMesh.matrixWorld);
+    this.cameraForwardWorld.set(0, 0, -1).transformDirection(camera.matrixWorld);
+    this.cameraRightWorld.set(1, 0, 0).transformDirection(camera.matrixWorld);
+    this.cameraUpWorld.set(0, 1, 0).transformDirection(camera.matrixWorld);
+
+    const normalDot = this.pagePlaneNormal.dot(this.cameraForwardWorld);
+    const rightDot = this.pageRightWorld.dot(this.cameraRightWorld);
+    const upDot = this.pageUpWorld.dot(this.cameraUpWorld);
+    if (!Number.isFinite(normalDot) || !Number.isFinite(rightDot) || !Number.isFinite(upDot)) {
+      return false;
+    }
+
+    return (
+      normalDot <= -PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT &&
+      rightDot >= PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT &&
+      upDot >= PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT
+    );
+  }
+
+  private renderPerspectiveNativeDirectHost2dFrame(
+    threeRenderer: THREE.WebGLRenderer,
+    viewport: ViewportPixels,
+    derivedView: DerivedThreeCameraView
+  ): boolean {
+    if (this.rendererType !== "webgl") {
+      return false;
+    }
+    if (threeRenderer.getRenderTarget() !== null) {
+      return false;
+    }
+
+    const rendererCanvas = readThreeRendererCanvas(threeRenderer);
+    if (!rendererCanvas || !this.ensureHostNativeProjectionRenderer(rendererCanvas)) {
+      return false;
+    }
+
+    const previousView = this.renderer.getViewState();
+    const viewChanged = !isViewStateApproxEqual(previousView, derivedView.viewState);
+    const viewportChanged = viewport.width !== this.lastViewportWidth || viewport.height !== this.lastViewportHeight;
+    this.renderer.setViewState(derivedView.viewState, {
+      preservePanCache: true,
+      interacting: viewChanged || viewportChanged
+    });
+
+    threeRenderer.resetState();
+    this.renderer.renderExternalFrame?.(performance.now());
+    threeRenderer.resetState();
+
+    this.lastSyncedFrameSerial = this.renderer.getPresentedFrameSerial();
+    this.lastUploadedFrameSerial = this.lastSyncedFrameSerial;
+    this.lastViewportWidth = viewport.width;
+    this.lastViewportHeight = viewport.height;
+    return true;
+  }
+
+  private renderPerspectiveNativeProjectionFrame(
+    threeRenderer: THREE.WebGLRenderer,
+    camera: THREE.Camera,
+    viewport: ViewportPixels,
+    derivedView: DerivedThreeCameraView
+  ): boolean {
+    if (this.rendererType !== "webgl" || typeof this.renderer.renderProjectedFrame !== "function") {
+      return false;
+    }
+    if (threeRenderer.getRenderTarget() !== null) {
+      return false;
+    }
+
+    const rendererCanvas = readThreeRendererCanvas(threeRenderer);
+    if (!rendererCanvas || !this.ensureHostNativeProjectionRenderer(rendererCanvas)) {
+      return false;
+    }
+
+    this.clipFromWorldMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    this.clipFromLocalMatrix.multiplyMatrices(this.clipFromWorldMatrix, this.pageMesh.matrixWorld);
+    this.clipFromDataMatrix.multiplyMatrices(this.clipFromLocalMatrix, this.dataToLocalMatrix);
+
+    const localUnitsPerPixel = this.estimateLocalUnitsPerPixel(camera, viewport);
+    threeRenderer.resetState();
+    this.renderer.renderProjectedFrame({
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      localToClip: this.clipFromDataMatrix.elements,
+      localUnitsPerPixel,
+      cullingBounds: derivedView.cullingBounds ?? this.sceneBounds
+    });
+    threeRenderer.resetState();
+    return true;
+  }
+
+  private ensureHostNativeProjectionRenderer(hostCanvas: HTMLCanvasElement): boolean {
+    if (this.rendererType !== "webgl") {
+      return false;
+    }
+
+    if (this.renderCanvas !== hostCanvas) {
+      const previousRenderer = this.renderer;
+      const previousView = previousRenderer.getViewState();
+      const nextRenderer = new WebGlFloorplanRenderer(hostCanvas);
+      applyRendererConfig(nextRenderer, this.rendererConfig);
+      nextRenderer.setExternalFrameDriver?.(true);
+      nextRenderer.setScene(this.sceneData);
+      nextRenderer.setViewState(previousView);
+      nextRenderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
+
+      previousRenderer.setInteractionViewportProvider(null);
+      previousRenderer.setFrameListener(null);
+      previousRenderer.dispose();
+
+      this.renderer = nextRenderer;
+      this.renderCanvas = hostCanvas;
+      this.userData.hepr.renderer = this.renderer;
+    }
+
+    this.directHostRendering = true;
+    this.rasterMaterialLayer?.setVisible(false);
+    this.fillMaterialLayer?.setVisible(false);
+    this.strokeMaterialLayer?.setVisible(false);
+    this.triangleStrokeLayer?.setVisible(false);
+    this.compactedStrokeLayer?.deactivate();
+    this.textMaterialLayer?.setVisible(false);
+    this.overviewTileLayer?.setVisible(false);
+    this.renderer.setRasterRenderingEnabled?.(true);
+    this.renderer.setFillRenderingEnabled?.(true);
+    this.renderer.setStrokeRenderingEnabled?.(true);
+    this.renderer.setTextRenderingEnabled?.(true);
+
+    if (this.renderTexture) {
+      this.renderTexture.dispose();
+      this.renderTexture = null;
+    }
+
+    if (this.pageMesh.material.colorWrite !== false) {
+      const previousMaterial = this.pageMesh.material;
+      this.pageMesh.material = createDirectHostTriggerMaterial();
+      previousMaterial.dispose();
+    }
+    this.pageMesh.frustumCulled = false;
+    this.pageMesh.renderOrder = -1_000_000;
+
+    this.lastSyncedFrameSerial = this.renderer.getPresentedFrameSerial();
+    this.lastUploadedFrameSerial = this.lastSyncedFrameSerial;
+    this.lastViewportWidth = hostCanvas.width;
+    this.lastViewportHeight = hostCanvas.height;
+    return true;
+  }
+
+  private setPerspectiveNativeProjectionPipelineActive(active: boolean): void {
+    const nextActive = Boolean(active);
+    if (this.perspectiveNativeProjectionPipelineActive === nextActive) {
+      return;
+    }
+
+    this.perspectiveNativeProjectionPipelineActive = nextActive;
+    if (!nextActive) {
+      this.lastSyncedFrameSerial = -1;
+      this.lastUploadedFrameSerial = -1;
+    }
   }
 
   private setPerspectiveVectorPipelineActive(active: boolean): boolean {
@@ -488,6 +789,8 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rasterMaterialLayer?.setVisible(false);
       this.fillMaterialLayer?.setVisible(false);
       this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer?.deactivate();
       this.textMaterialLayer?.setVisible(false);
       this.renderer.setRasterRenderingEnabled?.(true);
       this.renderer.setFillRenderingEnabled?.(true);
@@ -523,6 +826,7 @@ export class HeprThreePdfObject extends THREE.Group {
       return true;
     }
     this.perspectiveVectorPipelineActive = true;
+    this.setPerspectiveOverviewTilePipelineActive(false);
 
     this.rasterMaterialLayer?.setVisible(true);
     this.rasterMaterialLayer?.setPageBackgroundColor(
@@ -538,14 +842,35 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rendererConfig.vectorOverride[2],
       this.rendererConfig.vectorOverride[3]
     );
-    this.strokeMaterialLayer?.setVisible(true);
-    this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
-    this.strokeMaterialLayer?.setVectorOverride(
-      this.rendererConfig.vectorOverride[0],
-      this.rendererConfig.vectorOverride[1],
-      this.rendererConfig.vectorOverride[2],
-      this.rendererConfig.vectorOverride[3]
-    );
+    if (this.compactedStrokeLayer) {
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer.deactivate();
+      this.compactedStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+    } else if (this.triangleStrokeLayer) {
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer.setVisible(true);
+      this.triangleStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+    } else {
+      this.strokeMaterialLayer?.setVisible(true);
+      this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+      this.strokeMaterialLayer?.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+    }
     this.textMaterialLayer?.setVisible(true);
     this.textMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
     this.textMaterialLayer?.setTextVectorOnly(this.rendererConfig.textVectorOnly);
@@ -575,21 +900,52 @@ export class HeprThreePdfObject extends THREE.Group {
     return true;
   }
 
+  private setPerspectiveOverviewTilePipelineActive(active: boolean): void {
+    const nextActive = Boolean(active && this.overviewTileLayer);
+    if (this.perspectiveOverviewTilePipelineActive === nextActive) {
+      return;
+    }
+
+    this.perspectiveOverviewTilePipelineActive = nextActive;
+    this.overviewTileLayer?.setVisible(nextActive);
+    if (nextActive) {
+      this.rasterMaterialLayer?.setVisible(false);
+      this.fillMaterialLayer?.setVisible(false);
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer?.deactivate();
+      this.textMaterialLayer?.setVisible(false);
+      this.renderer.setRasterRenderingEnabled?.(false);
+      this.renderer.setFillRenderingEnabled?.(false);
+      this.renderer.setStrokeRenderingEnabled?.(false);
+      this.renderer.setTextRenderingEnabled?.(false);
+    } else {
+      this.renderer.setRasterRenderingEnabled?.(true);
+      this.renderer.setFillRenderingEnabled?.(true);
+      this.renderer.setStrokeRenderingEnabled?.(true);
+      this.renderer.setTextRenderingEnabled?.(true);
+      this.lastSyncedFrameSerial = -1;
+      this.lastUploadedFrameSerial = -1;
+    }
+  }
+
   private updateMaterialLayerTransforms(
     camera: THREE.Camera,
     viewport: ViewportPixels,
     useLocalToClip: boolean
-  ): void {
-    if (!this.rasterMaterialLayer || !this.fillMaterialLayer || !this.strokeMaterialLayer || !this.textMaterialLayer) {
-      return;
+  ): number | null {
+    if (!this.rasterMaterialLayer || !this.fillMaterialLayer || !this.textMaterialLayer) {
+      return null;
     }
 
     if (!useLocalToClip) {
+      const localUnitsPerPixel = 1 / Math.max(1e-6, this.renderer.getViewState().zoom);
       this.rasterMaterialLayer.setScreenSpaceTransform();
       this.fillMaterialLayer.setScreenSpaceTransform();
-      this.strokeMaterialLayer.setScreenSpaceTransform();
+      this.strokeMaterialLayer?.setScreenSpaceTransform();
+      this.triangleStrokeLayer?.setScreenSpaceTransform();
       this.textMaterialLayer.setScreenSpaceTransform();
-      return;
+      return localUnitsPerPixel;
     }
 
     this.clipFromWorldMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -598,8 +954,42 @@ export class HeprThreePdfObject extends THREE.Group {
     const localUnitsPerPixel = this.estimateLocalUnitsPerPixel(camera, viewport);
     this.rasterMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
     this.fillMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
-    this.strokeMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
+    this.strokeMaterialLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
+    this.triangleStrokeLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
     this.textMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
+    return localUnitsPerPixel;
+  }
+
+  private updateStrokeLodVisibility(localUnitsPerPixel: number | null, vectorPipelineActive: boolean): void {
+    if (!this.compactedStrokeLayer || !vectorPipelineActive || localUnitsPerPixel === null) {
+      this.compactedStrokeLayer?.deactivate();
+      return;
+    }
+
+    this.compactedStrokeLayer.setVectorOverride(
+      this.rendererConfig.vectorOverride[0],
+      this.rendererConfig.vectorOverride[1],
+      this.rendererConfig.vectorOverride[2],
+      this.rendererConfig.vectorOverride[3]
+    );
+    const compactedActive = this.compactedStrokeLayer.updateForLocalUnitsPerPixel(localUnitsPerPixel);
+    if (compactedActive) {
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      return;
+    }
+
+    if (!this.triangleStrokeLayer) {
+      return;
+    }
+
+    this.triangleStrokeLayer.setVisible(true);
+    this.triangleStrokeLayer.setVectorOverride(
+      this.rendererConfig.vectorOverride[0],
+      this.rendererConfig.vectorOverride[1],
+      this.rendererConfig.vectorOverride[2],
+      this.rendererConfig.vectorOverride[3]
+    );
   }
 
   private estimateLocalUnitsPerPixel(camera: THREE.Camera, viewport: ViewportPixels): number {
@@ -630,6 +1020,67 @@ export class HeprThreePdfObject extends THREE.Group {
       return 1 / Math.max(1e-6, this.renderer.getViewState().zoom);
     }
     return 1 / pixelsPerLocalUnit;
+  }
+
+  private shouldUsePerspectiveVectorPipeline(derivedView: DerivedThreeCameraView): boolean {
+    if (this.rendererType !== "webgl" || !this.hasCompleteMaterialLayers()) {
+      return false;
+    }
+
+    const bounds = derivedView.cullingBounds;
+    if (!bounds) {
+      return false;
+    }
+
+    const pageWidth = Math.max(1e-6, this.sceneBounds.maxX - this.sceneBounds.minX);
+    const pageHeight = Math.max(1e-6, this.sceneBounds.maxY - this.sceneBounds.minY);
+    const visibleWidth = Math.max(0, bounds.maxX - bounds.minX);
+    const visibleHeight = Math.max(0, bounds.maxY - bounds.minY);
+    const widthRatio = visibleWidth / pageWidth;
+    const heightRatio = visibleHeight / pageHeight;
+    const areaRatio = widthRatio * heightRatio;
+
+    const maxAreaRatio = this.perspectiveVectorPipelineActive
+      ? PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_AREA_RATIO
+      : PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_AREA_RATIO;
+    const maxAxisRatio = this.perspectiveVectorPipelineActive
+      ? PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_AXIS_RATIO
+      : PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_AXIS_RATIO;
+    const maxVisibleStrokes = this.perspectiveVectorPipelineActive
+      ? PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_STROKES
+      : PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_STROKES;
+
+    const estimatedVisibleStrokes = this.strokeMaterialLayer?.estimateVisibleSegmentCount(
+      derivedView.viewState,
+      derivedView.nativeViewport,
+      bounds
+    ) ?? 0;
+
+    return (
+      Number.isFinite(areaRatio) &&
+      Number.isFinite(widthRatio) &&
+      Number.isFinite(heightRatio) &&
+      estimatedVisibleStrokes <= maxVisibleStrokes &&
+      areaRatio <= maxAreaRatio &&
+      widthRatio <= maxAxisRatio &&
+      heightRatio <= maxAxisRatio
+    );
+  }
+
+  private shouldUsePerspectiveOverviewTilePipeline(
+    camera: THREE.Camera,
+    viewport: ViewportPixels,
+    derivedView: DerivedThreeCameraView
+  ): boolean {
+    if (this.rendererType !== "webgl" || !this.overviewTileLayer) {
+      return false;
+    }
+    return this.overviewTileLayer.updateForCamera(
+      camera,
+      viewport,
+      this.pageMesh.matrixWorld,
+      derivedView.cullingBounds ?? this.sceneBounds
+    );
   }
 
   private tryEnableDirectHostRendering(hostCanvas: HTMLCanvasElement): void {
@@ -696,7 +1147,28 @@ export class HeprThreePdfObject extends THREE.Group {
       this.renderer.setFillRenderingEnabled?.(true);
     }
 
-    if (this.strokeMaterialLayer) {
+    if (this.compactedStrokeLayer) {
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer.updateForLocalUnitsPerPixel(1 / Math.max(1e-6, this.renderer.getViewState().zoom));
+      this.compactedStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+      this.renderer.setStrokeRenderingEnabled?.(false);
+    } else if (this.triangleStrokeLayer) {
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer.setVisible(true);
+      this.triangleStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+      this.renderer.setStrokeRenderingEnabled?.(false);
+    } else if (this.strokeMaterialLayer) {
       this.strokeMaterialLayer.setVisible(true);
       this.strokeMaterialLayer.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
       this.strokeMaterialLayer.setVectorOverride(
@@ -764,6 +1236,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.rasterMaterialLayer?.setVisible(false);
     this.fillMaterialLayer?.setVisible(false);
     this.strokeMaterialLayer?.setVisible(false);
+    this.triangleStrokeLayer?.setVisible(false);
+    this.compactedStrokeLayer?.deactivate();
     this.textMaterialLayer?.setVisible(false);
     this.renderer.setRasterRenderingEnabled?.(true);
     this.renderer.setFillRenderingEnabled?.(true);
@@ -809,6 +1283,8 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rasterMaterialLayer?.setVisible(false);
       this.fillMaterialLayer?.setVisible(false);
       this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer?.deactivate();
       this.textMaterialLayer?.setVisible(false);
       this.renderer.setRasterRenderingEnabled?.(true);
       this.renderer.setFillRenderingEnabled?.(true);
@@ -834,6 +1310,7 @@ export class HeprThreePdfObject extends THREE.Group {
     );
 
     this.strokeMaterialLayer?.setVisible(true);
+    this.compactedStrokeLayer?.deactivate();
     this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
     this.strokeMaterialLayer?.setVectorOverride(
       this.rendererConfig.vectorOverride[0],
@@ -1014,18 +1491,29 @@ export class HeprThreePdfObject extends THREE.Group {
       [1, 1],
       [-1, 1]
     ] as const;
+    let projectedCornerCount = 0;
     for (const [ndcX, ndcY] of ndcCorners) {
       const localPoint = this.intersectViewportCornerWithPagePlane(camera, ndcX, ndcY);
       if (!localPoint) {
-        this.warnThreeCameraUnsupported(
-          "[HEPR] threeCameraDriven mode could not project viewport corners onto the PDF plane for this camera/view."
-        );
-        return null;
+        continue;
       }
+      projectedCornerCount += 1;
       minLocalX = Math.min(minLocalX, localPoint.x);
       minLocalY = Math.min(minLocalY, localPoint.y);
       maxLocalX = Math.max(maxLocalX, localPoint.x);
       maxLocalY = Math.max(maxLocalY, localPoint.y);
+    }
+
+    if (projectedCornerCount < ndcCorners.length) {
+      const fallbackView = this.deriveFullSceneMaterialView(viewport);
+      if (fallbackView) {
+        this.warnedThreeCameraUnsupported = false;
+        return fallbackView;
+      }
+      this.warnThreeCameraUnsupported(
+        "[HEPR] threeCameraDriven mode could not project enough viewport corners onto the PDF plane for this camera/view."
+      );
+      return null;
     }
 
     const visibleWidth = Math.max(1e-6, maxLocalX - minLocalX);
@@ -1051,7 +1539,36 @@ export class HeprThreePdfObject extends THREE.Group {
     this.warnedThreeCameraUnsupported = false;
     return {
       viewState: { cameraCenterX, cameraCenterY, zoom },
-      nativeViewport: desiredNativeViewport
+      nativeViewport: desiredNativeViewport,
+      cullingBounds: {
+        minX: minLocalX + this.sceneCenterX,
+        minY: minLocalY + this.sceneCenterY,
+        maxX: maxLocalX + this.sceneCenterX,
+        maxY: maxLocalY + this.sceneCenterY
+      }
+    };
+  }
+
+  private deriveFullSceneMaterialView(viewport: ViewportPixels): DerivedThreeCameraView | null {
+    const nativeViewport = clampViewportPixels(viewport);
+    const pageWidth = Math.max(1e-6, this.sceneBounds.maxX - this.sceneBounds.minX);
+    const pageHeight = Math.max(1e-6, this.sceneBounds.maxY - this.sceneBounds.minY);
+    const zoom = Math.max(
+      1e-6,
+      Math.min(nativeViewport.width / pageWidth, nativeViewport.height / pageHeight)
+    );
+    if (!Number.isFinite(zoom)) {
+      return null;
+    }
+
+    return {
+      viewState: {
+        cameraCenterX: this.sceneCenterX,
+        cameraCenterY: this.sceneCenterY,
+        zoom
+      },
+      nativeViewport,
+      cullingBounds: this.sceneBounds
     };
   }
 
@@ -1180,6 +1697,32 @@ export class HeprThreePdfObject extends THREE.Group {
     camera: THREE.PerspectiveCamera,
     viewport: ViewportPixels
   ): { width: number; height: number } | null {
+    const bounds = this.measureProjectedPageNdcBounds(camera, viewport);
+    if (!bounds) {
+      return null;
+    }
+
+    const minPixelX = (bounds.minX * 0.5 + 0.5) * viewport.width;
+    const minPixelY = (1 - (bounds.maxY * 0.5 + 0.5)) * viewport.height;
+    const maxPixelX = (bounds.maxX * 0.5 + 0.5) * viewport.width;
+    const maxPixelY = (1 - (bounds.minY * 0.5 + 0.5)) * viewport.height;
+    const clippedMinX = Math.max(0, Math.min(viewport.width, minPixelX));
+    const clippedMinY = Math.max(0, Math.min(viewport.height, minPixelY));
+    const clippedMaxX = Math.max(0, Math.min(viewport.width, maxPixelX));
+    const clippedMaxY = Math.max(0, Math.min(viewport.height, maxPixelY));
+    const width = Math.max(0, clippedMaxX - clippedMinX);
+    const height = Math.max(0, clippedMaxY - clippedMinY);
+
+    if (width < 1 || height < 1) {
+      return null;
+    }
+    return { width, height };
+  }
+
+  private measureProjectedPageNdcBounds(
+    camera: THREE.Camera,
+    viewport: ViewportPixels
+  ): { minX: number; minY: number; maxX: number; maxY: number; longRatio: number } | null {
     const localX0 = this.localSceneBounds.minX;
     const localY0 = this.localSceneBounds.minY;
     const localX1 = this.localSceneBounds.maxX;
@@ -1200,29 +1743,26 @@ export class HeprThreePdfObject extends THREE.Group {
       if (!Number.isFinite(corner.x) || !Number.isFinite(corner.y) || !Number.isFinite(corner.z)) {
         return null;
       }
-      const pixelX = (corner.x * 0.5 + 0.5) * viewport.width;
-      const pixelY = (1 - (corner.y * 0.5 + 0.5)) * viewport.height;
-      minPixelX = Math.min(minPixelX, pixelX);
-      minPixelY = Math.min(minPixelY, pixelY);
-      maxPixelX = Math.max(maxPixelX, pixelX);
-      maxPixelY = Math.max(maxPixelY, pixelY);
+      minPixelX = Math.min(minPixelX, corner.x);
+      minPixelY = Math.min(minPixelY, corner.y);
+      maxPixelX = Math.max(maxPixelX, corner.x);
+      maxPixelY = Math.max(maxPixelY, corner.y);
     }
 
     if (!Number.isFinite(minPixelX) || !Number.isFinite(minPixelY) || !Number.isFinite(maxPixelX) || !Number.isFinite(maxPixelY)) {
       return null;
     }
 
-    const clippedMinX = Math.max(0, Math.min(viewport.width, minPixelX));
-    const clippedMinY = Math.max(0, Math.min(viewport.height, minPixelY));
-    const clippedMaxX = Math.max(0, Math.min(viewport.width, maxPixelX));
-    const clippedMaxY = Math.max(0, Math.min(viewport.height, maxPixelY));
-    const width = Math.max(0, clippedMaxX - clippedMinX);
-    const height = Math.max(0, clippedMaxY - clippedMinY);
-
-    if (width < 1 || height < 1) {
-      return null;
-    }
-    return { width, height };
+    const projectedWidthRatio = Math.max(0, maxPixelX - minPixelX) * 0.5;
+    const projectedHeightRatio = Math.max(0, maxPixelY - minPixelY) * 0.5;
+    const longRatio = Math.max(projectedWidthRatio, projectedHeightRatio);
+    return {
+      minX: minPixelX,
+      minY: minPixelY,
+      maxX: maxPixelX,
+      maxY: maxPixelY,
+      longRatio
+    };
   }
 
   private intersectViewportCornerWithPagePlane(
@@ -1293,7 +1833,7 @@ export async function createThreePdfObject(
   const sceneBounds = normalizeBounds(resolveSceneFitBounds(loadedScene.scene));
   const sceneCenterX = (sceneBounds.minX + sceneBounds.maxX) * 0.5;
   const sceneCenterY = (sceneBounds.minY + sceneBounds.maxY) * 0.5;
-  const hostCanvas = rendererType === "webgl" && !threeCameraDriven ? options.hostCanvas ?? null : null;
+  const hostCanvas = rendererType === "webgl" ? options.hostCanvas ?? null : null;
   const renderCanvas = hostCanvas ?? document.createElement("canvas");
   if (hostCanvas) {
     if (renderCanvas.width <= 0 || renderCanvas.height <= 0) {
@@ -1316,6 +1856,10 @@ export async function createThreePdfObject(
   nativeRenderer.setScene(loadedScene.scene);
   const initialFitPaddingPixels = normalizePadding(options.fitPadding);
   const forceWebGlMaterialLayers = rendererType === "webgl" && threeCameraDriven;
+  const useStaticStrokeLayer =
+    rendererType === "webgl" &&
+    threeCameraDriven &&
+    loadedScene.scene.segmentCount >= 300_000;
 
   const enableMaterialLayerConstruction =
     rendererType === "webgl" ||
@@ -1342,9 +1886,23 @@ export async function createThreePdfObject(
       : null;
 
   const strokeMaterialLayer =
-    enableMaterialLayerConstruction && (rendererConfig.materialStrokeEnabled || forceWebGlMaterialLayers)
+    !useStaticStrokeLayer &&
+    enableMaterialLayerConstruction &&
+    (rendererConfig.materialStrokeEnabled || forceWebGlMaterialLayers)
       ? new ThreeMaterialStrokeLayer(loadedScene.scene, {
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
+        vectorOverride: rendererConfig.vectorOverride
+      })
+      : null;
+
+  const triangleStrokeLayer = null;
+
+  const compactedStrokeLayer =
+    useStaticStrokeLayer
+      ? new ThreeCompactedStrokeLayer(loadedScene.scene, {
+        sceneBounds,
+        sceneCenterX,
+        sceneCenterY,
         vectorOverride: rendererConfig.vectorOverride
       })
       : null;
@@ -1357,6 +1915,21 @@ export async function createThreePdfObject(
         vectorOverride: rendererConfig.vectorOverride
       })
       : null;
+
+  const overviewTileLayer =
+    useStaticStrokeLayer
+      ? new ThreeTiledOverviewLayer(loadedScene.scene, {
+        sceneBounds,
+        sceneCenterX,
+        sceneCenterY,
+        pageBackground: rendererConfig.pageBackground,
+        vectorOverride: rendererConfig.vectorOverride,
+        strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
+        textVectorOnly: rendererConfig.textVectorOnly,
+        overviewTilePyramid: loadedScene.scene.overviewTilePyramid ?? null
+      })
+      : null;
+  await overviewTileLayer?.preloadBaseLevel();
 
   const renderTexture = createRenderCanvasTexture(renderCanvas);
 
@@ -1395,7 +1968,10 @@ export async function createThreePdfObject(
     rasterMaterialLayer,
     fillMaterialLayer,
     strokeMaterialLayer,
+    triangleStrokeLayer,
+    compactedStrokeLayer,
     textMaterialLayer,
+    overviewTileLayer,
     pageMesh,
     uvArray,
     uvAttribute
