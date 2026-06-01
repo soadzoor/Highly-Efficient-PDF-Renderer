@@ -1999,8 +1999,8 @@ async function createNativeRenderer(
 function createDirectHostTriggerMaterial(): THREE.MeshBasicMaterial {
   return new THREE.MeshBasicMaterial({
     side: THREE.DoubleSide,
-    depthTest: false,
-    depthWrite: false,
+    depthTest: true,
+    depthWrite: true,
     colorWrite: false,
     toneMapped: false
   });
@@ -2023,7 +2023,8 @@ function createTexturedPageMaterial(texture: THREE.CanvasTexture): THREE.MeshBas
     map: texture,
     transparent: false,
     side: THREE.DoubleSide,
-    depthWrite: false,
+    depthTest: true,
+    depthWrite: true,
     toneMapped: false
   });
 }

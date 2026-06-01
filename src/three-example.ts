@@ -82,7 +82,7 @@ const renderer = new THREE.WebGLRenderer({
   canvas: canvasElement,
   antialias: false,
   alpha: false,
-  depth: false,
+  depth: true,
   stencil: false,
   premultipliedAlpha: false,
   powerPreference: "high-performance"
@@ -97,10 +97,9 @@ const mesh = new THREE.Mesh(
   new THREE.BoxGeometry(1, 1, 1),
   new THREE.MeshBasicMaterial({
     color: 0xff0000,
-    transparent: true,
-    opacity: 1,
-    depthTest: false,
-    depthWrite: false,
+    transparent: false,
+    depthTest: true,
+    depthWrite: true,
     toneMapped: false
   })
 );
