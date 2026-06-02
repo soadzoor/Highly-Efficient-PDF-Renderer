@@ -7,6 +7,7 @@ import {
   type HeprThreePdfObject,
   type PDFLoadProgress
 } from "./index";
+import type { DrawStats } from "./webGlFloorplanRenderer";
 import {
   normalizeExampleManifestEntries,
   resolveAppAssetUrl,
@@ -19,13 +20,13 @@ const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const sourceInput = document.querySelector<HTMLInputElement>("#source-input");
 const loadSourceButton = document.querySelector<HTMLButtonElement>("#load-source");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
-const focusBoxButton = document.querySelector<HTMLButtonElement>("#focus-box");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
 const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
+const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
 
 if (
@@ -33,13 +34,13 @@ if (
   !sourceInput ||
   !loadSourceButton ||
   !fileInput ||
-  !focusBoxButton ||
   !exampleSelect ||
   !backendSelect ||
   !statusElement ||
   !parseLoader ||
   !parseLoaderText ||
   !fpsValue ||
+  !drawStatsValue ||
   !lodStatsValue
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
@@ -49,13 +50,13 @@ const canvasElement = canvas;
 const sourceInputElement = sourceInput;
 const loadSourceButtonElement = loadSourceButton;
 const fileInputElement = fileInput;
-const focusBoxButtonElement = focusBoxButton;
 const exampleSelectElement = exampleSelect;
 const backendSelectElement = backendSelect;
 const statusElementNode = statusElement;
 const parseLoaderElement = parseLoader;
 const parseLoaderTextElement = parseLoaderText;
 const fpsValueElement = fpsValue;
+const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
@@ -96,19 +97,6 @@ renderer.setPixelRatio(window.devicePixelRatio || 1);
 renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
 
 const scene = new THREE.Scene();
-const mesh = new THREE.Mesh(
-  new THREE.BoxGeometry(1, 1, 1),
-  new THREE.MeshBasicMaterial({
-    color: 0xff0000,
-    transparent: false,
-    depthTest: true,
-    depthWrite: true,
-    toneMapped: false
-  })
-);
-mesh.name = "debug-red-box";
-mesh.renderOrder = 1_000_000;
-scene.add(mesh);
 const camera = new THREE.PerspectiveCamera(
   DEFAULT_PERSPECTIVE_FOV_DEGREES,
   resolveCanvasAspect(),
@@ -132,26 +120,50 @@ if (threeCameraDebugLogs) {
 let currentPdfObject: HeprThreePdfObject | null = null;
 let lastLoadedSource: File | string | null = null;
 let animationFrameId = 0;
+let needsRender = false;
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
+let lastNativeDrawStats: DrawStats | null = null;
+let drawStatsLastText = "";
 let lodStatsLastText = "";
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
 function renderFrame(now: number = performance.now()): void {
-  animationFrameId = requestAnimationFrame(renderFrame);
+  animationFrameId = 0;
+  if (!needsRender) {
+    return;
+  }
+  needsRender = false;
   updateFpsMeter(now);
-  controls.update();
+  const controlsChanged = controls.update();
   updateCameraClipping();
   renderer.render(scene, camera);
+  updateDrawStatsMeter();
   updateLodStatsMeter();
+  if (controlsChanged) {
+    requestRender();
+  }
 }
-renderFrame();
+
+function requestRender(): void {
+  needsRender = true;
+  if (animationFrameId === 0) {
+    animationFrameId = requestAnimationFrame(renderFrame);
+  }
+}
+
+controls.addEventListener("change", () => {
+  requestRender();
+});
+
+requestRender();
 
 window.addEventListener("resize", () => {
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
   updatePerspectiveCameraProjection();
   updateCameraClipping();
+  requestRender();
 }, { signal: lifetimeSignal });
 
 loadSourceButtonElement.addEventListener("click", () => {
@@ -186,10 +198,6 @@ fileInputElement.addEventListener("change", () => {
   }
   void loadSource(file);
   fileInputElement.value = "";
-}, { signal: lifetimeSignal });
-
-focusBoxButtonElement.addEventListener("click", () => {
-  focusCameraToBox();
 }, { signal: lifetimeSignal });
 
 backendSelectElement.addEventListener("change", () => {
@@ -267,6 +275,7 @@ async function loadSource(source: File | string): Promise<void> {
     replacePdfObject(nextObject);
     lastLoadedSource = source;
     setStatus(`Loaded ${nextObject.sourceLabel} (${nextObject.sourceKind}) via ${backend.toUpperCase()}.`);
+    requestRender();
   } catch (error) {
     if (activeLoadToken !== loadToken) {
       return;
@@ -286,12 +295,17 @@ function replacePdfObject(nextObject: HeprThreePdfObject): void {
   disposeCurrentObject();
   nextObject.prepareHostRendering(renderer.domElement);
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
-  nextObject.renderer.setFrameListener(null);
+  lastNativeDrawStats = null;
+  nextObject.renderer.setFrameListener((stats) => {
+    lastNativeDrawStats = stats;
+    updateDrawStatsMeter();
+  });
   currentPdfObject = nextObject;
   scene.add(nextObject);
-  updateDebugBoxForLoadedPdf(nextObject);
   fitCameraToPdfObject(nextObject);
   updateCameraClipping(true);
+  updateDrawStatsMeter();
+  requestRender();
 }
 
 function disposeCurrentObject(): void {
@@ -303,6 +317,10 @@ function disposeCurrentObject(): void {
   scene.remove(currentPdfObject);
   currentPdfObject.dispose();
   currentPdfObject = null;
+  lastNativeDrawStats = null;
+  setDrawStatsText("-");
+  setLodStatsText("-");
+  requestRender();
 }
 
 function setStatus(text: string): void {
@@ -333,6 +351,33 @@ function updateFpsMeter(now: number): void {
     }
   }
   fpsLastSampleTime = now;
+}
+
+function updateDrawStatsMeter(): void {
+  if (!currentPdfObject) {
+    setDrawStatsText("-");
+    return;
+  }
+
+  const materialRenderedSegments = currentPdfObject.getRenderedStrokeSegmentCount();
+  const renderedSegments = materialRenderedSegments ?? lastNativeDrawStats?.renderedSegments ?? 0;
+  const totalSegments = currentPdfObject.sceneData.segmentCount;
+  const mode = materialRenderedSegments !== null
+    ? "material"
+    : lastNativeDrawStats?.usedCulling
+      ? "culled"
+      : "full";
+  setDrawStatsText(
+    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments | mode: ${mode}`
+  );
+}
+
+function setDrawStatsText(text: string): void {
+  if (text === drawStatsLastText) {
+    return;
+  }
+  drawStatsLastText = text;
+  drawStatsValueElement.textContent = text;
 }
 
 function updateLodStatsMeter(): void {
@@ -495,11 +540,6 @@ function fitCameraToPdfObject(pdfObject: HeprThreePdfObject): void {
   fitCameraToObject(pdfObject, true);
 }
 
-function focusCameraToBox(): void {
-  fitCameraToObject(mesh, false);
-  setStatus("Camera moved to red box.");
-}
-
 function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean): void {
   scene.updateMatrixWorld(true);
   if (tempObjectBounds.setFromObject(targetObject).isEmpty()) {
@@ -535,26 +575,7 @@ function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: bo
   }
   updateCameraClipping(true);
   controls.update();
-}
-
-function updateDebugBoxForLoadedPdf(pdfObject: HeprThreePdfObject): void {
-  scene.updateMatrixWorld(true);
-  if (tempObjectBounds.setFromObject(pdfObject).isEmpty()) {
-    return;
-  }
-  tempObjectBounds.getSize(tempObjectSize);
-  tempObjectBounds.getCenter(tempObjectCenter);
-
-  const minPlanarExtent = Math.max(MIN_OBJECT_EXTENT, Math.min(tempObjectSize.x, tempObjectSize.y));
-  const boxSize = Math.max(1, minPlanarExtent * 0.02);
-  mesh.scale.setScalar(boxSize);
-  mesh.position.set(
-    tempObjectCenter.x,
-    tempObjectCenter.y,
-    tempObjectBounds.max.z + boxSize * 0.75
-  );
-
-  updateClipAnchor(tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
+  requestRender();
 }
 
 function updateClipAnchor(center: THREE.Vector3, radius: number): void {

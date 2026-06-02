@@ -271,6 +271,13 @@ export class ThreeTriangleStrokeLayer {
     this.mesh.visible = visible;
   }
 
+  getRenderedSegmentCount(): number {
+    if (!this.mesh.visible) {
+      return 0;
+    }
+    return Math.max(0, this.mesh.geometry.instanceCount ?? 0);
+  }
+
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }

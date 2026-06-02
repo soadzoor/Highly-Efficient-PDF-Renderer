@@ -222,6 +222,13 @@ export class ThreeCompactedStrokeLayer {
     this.group.visible = visible && this.activeLevelIndex >= 0;
   }
 
+  getRenderedSegmentCount(): number {
+    if (!this.group.visible || this.activeLevelIndex < 0) {
+      return 0;
+    }
+    return this.levels[this.activeLevelIndex]?.segmentCount ?? 0;
+  }
+
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }

@@ -91,6 +91,13 @@ export class ThreeVectorLodStrokeLayer {
     return this.runtime.estimateVisibleSegmentCount();
   }
 
+  getRenderedSegmentCount(): number {
+    if (!this.group.visible) {
+      return 0;
+    }
+    return this.runtime.getStats().renderedSegments;
+  }
+
   getStats(): VectorStrokeLodStats {
     return this.runtime.getStats();
   }

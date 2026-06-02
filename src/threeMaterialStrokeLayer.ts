@@ -161,6 +161,13 @@ export class ThreeMaterialStrokeLayer {
     this.mesh.geometry.instanceCount = enabled ? this.drawInstanceCount : 0;
   }
 
+  getRenderedSegmentCount(): number {
+    if (!this.mesh.visible) {
+      return 0;
+    }
+    return Math.max(0, this.mesh.geometry.instanceCount ?? 0);
+  }
+
   setStrokeCurveEnabled(enabled: boolean): void {
     this.curveUniform.value = enabled ? 1 : 0;
   }

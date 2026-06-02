@@ -313,6 +313,28 @@ export class HeprThreePdfObject extends THREE.Group {
     return this.vectorLodStrokeLayer?.getStats() ?? this.renderer.getVectorStrokeLodStats?.() ?? null;
   }
 
+  getRenderedStrokeSegmentCount(): number | null {
+    if (this.vectorLodStrokeLayer?.group.visible) {
+      return this.vectorLodStrokeLayer.getRenderedSegmentCount();
+    }
+    if (this.strokeMaterialLayer?.mesh.visible) {
+      return this.strokeMaterialLayer.getRenderedSegmentCount();
+    }
+    if (this.triangleStrokeLayer?.mesh.visible) {
+      return this.triangleStrokeLayer.getRenderedSegmentCount();
+    }
+    if (this.compactedStrokeLayer?.group.visible) {
+      return this.compactedStrokeLayer.getRenderedSegmentCount();
+    }
+
+    const nativeLodStats = this.renderer.getVectorStrokeLodStats?.();
+    if (nativeLodStats && nativeLodStats.totalLevels > 1) {
+      return nativeLodStats.renderedSegments;
+    }
+
+    return null;
+  }
+
   setViewState(viewState: ViewState): void {
     this.pendingInitialFit = false;
     this.renderer.setViewState(viewState);
