@@ -78,6 +78,7 @@ export type {
 } from "./loadProgress";
 
 export type {
+  VectorStrokeLodStats,
   VectorLodMode
 } from "./vectorStrokeLod";
 

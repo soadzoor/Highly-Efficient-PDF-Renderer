@@ -13,6 +13,7 @@ import type { ThreeTiledOverviewLayer } from "./threeTiledOverviewLayer";
 import {
   shouldUseVectorStrokeLod,
   ThreeVectorLodStrokeLayer,
+  type VectorStrokeLodStats,
   type VectorLodMode
 } from "./vectorStrokeLod";
 import { WebGlFloorplanRenderer, type ViewState } from "./webGlFloorplanRenderer";
@@ -306,6 +307,10 @@ export class HeprThreePdfObject extends THREE.Group {
 
   getViewState(): ViewState {
     return this.renderer.getViewState();
+  }
+
+  getVectorStrokeLodStats(): VectorStrokeLodStats | null {
+    return this.vectorLodStrokeLayer?.getStats() ?? null;
   }
 
   setViewState(viewState: ViewState): void {

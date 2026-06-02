@@ -10,6 +10,31 @@ export const VECTOR_STROKE_LOD_MIN_SEGMENTS = 150_000;
 export const VECTOR_STROKE_LOD_TOLERANCES = [0.5, 1, 2, 4, 8, 16, 32] as const;
 export const VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS = 150_000;
 
+export interface VectorStrokeLodLevelStats {
+  index: number;
+  tolerance: number;
+  renderedSegments: number;
+}
+
+export interface VectorStrokeLodStats {
+  renderedSegments: number;
+  visibleTileCount: number;
+  targetSegmentsPerTile: number;
+  baselineLevelIndex: number;
+  baselineTolerance: number;
+  activeLevels: VectorStrokeLodLevelStats[];
+  maxBaselineTileSegments: number;
+  maxBaselineTileSelectedSegments: number;
+  maxBaselineTileSelectedLevelIndex: number;
+  maxBaselineTileSelectedTolerance: number;
+  maxSelectedTileSegments: number;
+  maxSelectedTileLevelIndex: number;
+  maxSelectedTileTolerance: number;
+  tileGridColumns: number;
+  tileGridRows: number;
+  totalLevels: number;
+}
+
 interface VectorStrokeLodLayerOptions {
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
@@ -171,11 +196,13 @@ export class ThreeVectorLodStrokeLayer {
   private localToClip = new THREE.Matrix4();
   private localUnitsPerPixel = 1;
   private lastVisibleSegmentCount = 0;
+  private stats: VectorStrokeLodStats;
 
   constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
 
+    const lodBuildStart = nowMs();
     this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0));
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.levels = buildVectorStrokeLodScenes(scene).map((levelScene) => {
@@ -196,6 +223,8 @@ export class ThreeVectorLodStrokeLayer {
     if (this.levels.length > 0) {
       this.activeLevelIndex = 0;
     }
+    this.stats = this.createEmptyStats();
+    logVectorLodBuildTiming(lodBuildStart, scene.segmentCount, this.levels);
   }
 
   setVisible(visible: boolean): void {
@@ -253,9 +282,17 @@ export class ThreeVectorLodStrokeLayer {
     return active?.layer.estimateVisibleSegmentCount(viewState, viewport, cullingBounds) ?? 0;
   }
 
+  getStats(): VectorStrokeLodStats {
+    return {
+      ...this.stats,
+      activeLevels: this.stats.activeLevels.map((level) => ({ ...level }))
+    };
+  }
+
   deactivate(): void {
     this.requestedVisible = false;
     this.lastVisibleSegmentCount = 0;
+    this.stats = this.createEmptyStats();
     for (const level of this.levels) {
       level.visibleSegmentCount = 0;
       level.layer.setDrawEnabled(false);
@@ -289,31 +326,58 @@ export class ThreeVectorLodStrokeLayer {
     this.resetLevelDrawLists();
 
     const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth);
+    const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
     const tileRange = tileRangeForBounds(viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY, this.tileGrid);
     if (!tileRange) {
       this.lastVisibleSegmentCount = 0;
-      this.updateLevelDraws(viewState, viewport);
+      this.updateLevelDraws(viewState, viewport, 0, 0, 0, 0, screenErrorLevelIndex, 0, screenErrorLevelIndex, screenErrorLevelIndex);
       return;
     }
 
-    const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
     this.activeLevelIndex = screenErrorLevelIndex;
     const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
     const targetSegmentsPerTile = Math.max(
       LOD_TILE_MIN_VISIBLE_SEGMENTS,
       Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / visibleTileCount)
     );
+    let maxBaselineTileSegments = 0;
+    let maxBaselineTileSelectedSegments = 0;
+    let maxBaselineTileSelectedLevelIndex = screenErrorLevelIndex;
+    let maxSelectedTileSegments = 0;
+    let maxSelectedTileLevelIndex = screenErrorLevelIndex;
 
     for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
       let tileIndex = row * this.tileGrid.columns + tileRange.c0;
       for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
-        const levelIndex = this.chooseTileLevel(tileIndex, screenErrorLevelIndex, targetSegmentsPerTile);
+        const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
+        const levelIndex = this.chooseTileLevel(tileIndex, targetSegmentsPerTile);
+        const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
+        if (baselineTileSegments > maxBaselineTileSegments) {
+          maxBaselineTileSegments = baselineTileSegments;
+          maxBaselineTileSelectedSegments = selectedTileSegments;
+          maxBaselineTileSelectedLevelIndex = levelIndex;
+        }
+        if (selectedTileSegments > maxSelectedTileSegments) {
+          maxSelectedTileSegments = selectedTileSegments;
+          maxSelectedTileLevelIndex = levelIndex;
+        }
         this.appendTileSegments(this.levels[levelIndex], tileIndex, viewBounds);
         tileIndex += 1;
       }
     }
 
-    this.updateLevelDraws(viewState, viewport);
+    this.updateLevelDraws(
+      viewState,
+      viewport,
+      visibleTileCount,
+      targetSegmentsPerTile,
+      maxBaselineTileSegments,
+      maxBaselineTileSelectedSegments,
+      maxBaselineTileSelectedLevelIndex,
+      maxSelectedTileSegments,
+      maxSelectedTileLevelIndex,
+      screenErrorLevelIndex
+    );
   }
 
   private resetLevelDrawLists(): void {
@@ -327,8 +391,8 @@ export class ThreeVectorLodStrokeLayer {
     }
   }
 
-  private chooseTileLevel(tileIndex: number, screenErrorLevelIndex: number, targetSegmentsPerTile: number): number {
-    for (let i = screenErrorLevelIndex; i < this.levels.length; i += 1) {
+  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+    for (let i = 0; i < this.levels.length; i += 1) {
       if (this.levels[i].tileCounts[tileIndex] <= targetSegmentsPerTile) {
         return i;
       }
@@ -376,17 +440,55 @@ export class ThreeVectorLodStrokeLayer {
     level.visibleSegmentCount = outCount;
   }
 
-  private updateLevelDraws(viewState: ViewState, viewport: ViewportPixels): void {
+  private updateLevelDraws(
+    viewState: ViewState,
+    viewport: ViewportPixels,
+    visibleTileCount: number,
+    targetSegmentsPerTile: number,
+    maxBaselineTileSegments: number,
+    maxBaselineTileSelectedSegments: number,
+    maxBaselineTileSelectedLevelIndex: number,
+    maxSelectedTileSegments: number,
+    maxSelectedTileLevelIndex: number,
+    baselineLevelIndex: number
+  ): void {
     let visibleSegmentCount = 0;
+    const activeLevels: VectorStrokeLodLevelStats[] = [];
     const visible = this.requestedVisible && this.group.visible;
-    for (const level of this.levels) {
+    for (let i = 0; i < this.levels.length; i += 1) {
+      const level = this.levels[i];
       const drawCount = visible ? level.visibleSegmentCount : 0;
       visibleSegmentCount += drawCount;
       level.layer.updateFrameWithVisibleSegmentIds(viewState, viewport, level.visibleSegmentIds, drawCount);
       level.layer.setVisible(visible);
       level.layer.setDrawEnabled(drawCount > 0);
+      if (drawCount > 0) {
+        activeLevels.push({
+          index: i,
+          tolerance: level.tolerance,
+          renderedSegments: drawCount
+        });
+      }
     }
     this.lastVisibleSegmentCount = visibleSegmentCount;
+    this.stats = {
+      renderedSegments: visibleSegmentCount,
+      visibleTileCount,
+      targetSegmentsPerTile,
+      baselineLevelIndex,
+      baselineTolerance: this.levels[baselineLevelIndex]?.tolerance ?? 0,
+      activeLevels,
+      maxBaselineTileSegments,
+      maxBaselineTileSelectedSegments,
+      maxBaselineTileSelectedLevelIndex,
+      maxBaselineTileSelectedTolerance: this.levels[maxBaselineTileSelectedLevelIndex]?.tolerance ?? 0,
+      maxSelectedTileSegments,
+      maxSelectedTileLevelIndex,
+      maxSelectedTileTolerance: this.levels[maxSelectedTileLevelIndex]?.tolerance ?? 0,
+      tileGridColumns: this.tileGrid.columns,
+      tileGridRows: this.tileGrid.rows,
+      totalLevels: this.levels.length
+    };
   }
 
   private updateGroupVisibility(): void {
@@ -397,6 +499,27 @@ export class ThreeVectorLodStrokeLayer {
       level.layer.setVisible(visible);
       level.layer.setDrawEnabled(visible && level.visibleSegmentCount > 0);
     }
+  }
+
+  private createEmptyStats(): VectorStrokeLodStats {
+    return {
+      renderedSegments: 0,
+      visibleTileCount: 0,
+      targetSegmentsPerTile: 0,
+      baselineLevelIndex: this.activeLevelIndex,
+      baselineTolerance: this.levels[this.activeLevelIndex]?.tolerance ?? 0,
+      activeLevels: [],
+      maxBaselineTileSegments: 0,
+      maxBaselineTileSelectedSegments: 0,
+      maxBaselineTileSelectedLevelIndex: this.activeLevelIndex,
+      maxBaselineTileSelectedTolerance: this.levels[this.activeLevelIndex]?.tolerance ?? 0,
+      maxSelectedTileSegments: 0,
+      maxSelectedTileLevelIndex: this.activeLevelIndex,
+      maxSelectedTileTolerance: this.levels[this.activeLevelIndex]?.tolerance ?? 0,
+      tileGridColumns: this.tileGrid.columns,
+      tileGridRows: this.tileGrid.rows,
+      totalLevels: this.levels.length
+    };
   }
 }
 
@@ -945,6 +1068,27 @@ function normalizeLocalUnitsPerPixel(value: number): number {
 
 function formatToleranceName(tolerance: number): string {
   return tolerance <= 0 ? "exact" : `tol-${String(tolerance).replace(".", "_")}`;
+}
+
+function nowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function logVectorLodBuildTiming(
+  startMs: number,
+  sourceSegmentCount: number,
+  levels: Array<{ tolerance: number; segmentCount: number }>
+): void {
+  const elapsedMs = nowMs() - startMs;
+  const levelSummary = levels
+    .map((level) => `${formatToleranceName(level.tolerance)}:${level.segmentCount}`)
+    .join(", ");
+  console.info(
+    `[hepr] vector stroke LOD generated in ${elapsedMs.toFixed(1)}ms ` +
+    `(source segments: ${Math.max(0, sourceSegmentCount | 0)}, levels: ${levelSummary})`
+  );
 }
 
 function clamp01(value: number): number {

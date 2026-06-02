@@ -26,6 +26,7 @@ const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
 const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
+const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
 
 if (
   !canvas ||
@@ -38,7 +39,8 @@ if (
   !statusElement ||
   !parseLoader ||
   !parseLoaderText ||
-  !fpsValue
+  !fpsValue ||
+  !lodStatsValue
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
@@ -54,6 +56,7 @@ const statusElementNode = statusElement;
 const parseLoaderElement = parseLoader;
 const parseLoaderTextElement = parseLoaderText;
 const fpsValueElement = fpsValue;
+const lodStatsValueElement = lodStatsValue;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
@@ -131,6 +134,7 @@ let lastLoadedSource: File | string | null = null;
 let animationFrameId = 0;
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
+let lodStatsLastText = "";
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
 function renderFrame(now: number = performance.now()): void {
@@ -139,6 +143,7 @@ function renderFrame(now: number = performance.now()): void {
   controls.update();
   updateCameraClipping();
   renderer.render(scene, camera);
+  updateLodStatsMeter();
 }
 renderFrame();
 
@@ -330,6 +335,38 @@ function updateFpsMeter(now: number): void {
   fpsLastSampleTime = now;
 }
 
+function updateLodStatsMeter(): void {
+  const stats = currentPdfObject?.getVectorStrokeLodStats() ?? null;
+  if (!stats || stats.totalLevels <= 1) {
+    setLodStatsText("-");
+    return;
+  }
+
+  const activeLevels = stats.activeLevels.length > 0
+    ? stats.activeLevels
+      .map((level) => `${formatLodTolerance(level.tolerance)}:${formatCompactCount(level.renderedSegments)}`)
+      .join(" ")
+    : "none";
+  setLodStatsText(
+    `${formatCompactCount(stats.renderedSegments)} seg | ` +
+    `${stats.visibleTileCount.toLocaleString()} tiles | ` +
+    `target ${formatCompactCount(stats.targetSegmentsPerTile)}/tile | ` +
+    `zoom ${formatLodTolerance(stats.baselineTolerance)} | ` +
+    `active ${activeLevels} | ` +
+    `dense exact ${stats.maxBaselineTileSegments.toLocaleString()} -> ` +
+    `${stats.maxBaselineTileSelectedSegments.toLocaleString()} @${formatLodTolerance(stats.maxBaselineTileSelectedTolerance)} | ` +
+    `peak ${stats.maxSelectedTileSegments.toLocaleString()} @${formatLodTolerance(stats.maxSelectedTileTolerance)}`
+  );
+}
+
+function setLodStatsText(text: string): void {
+  if (text === lodStatsLastText) {
+    return;
+  }
+  lodStatsLastText = text;
+  lodStatsValueElement.textContent = text;
+}
+
 async function loadExampleManifest(): Promise<void> {
   exampleSelectionMap.clear();
   exampleSelectElement.innerHTML = "";
@@ -417,6 +454,21 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
 
 function formatKilobytes(bytes: number): string {
   return (bytes / 1024).toFixed(1);
+}
+
+function formatCompactCount(value: number): string {
+  const count = Math.max(0, Math.round(value));
+  if (count >= 1_000_000) {
+    return `${(count / 1_000_000).toFixed(1)}M`;
+  }
+  if (count >= 10_000) {
+    return `${Math.round(count / 1_000)}k`;
+  }
+  return count.toLocaleString();
+}
+
+function formatLodTolerance(tolerance: number): string {
+  return tolerance <= 0 ? "exact" : `tol${tolerance}`;
 }
 
 type ExampleSelectionKind = "pdf" | "zip";
