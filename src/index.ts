@@ -76,3 +76,7 @@ export type {
   PDFLoadProgress,
   PDFLoadStage
 } from "./loadProgress";
+
+export type {
+  VectorLodMode
+} from "./vectorStrokeLod";

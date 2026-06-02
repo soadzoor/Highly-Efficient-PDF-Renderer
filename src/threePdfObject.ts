@@ -3,13 +3,18 @@ import * as THREE from "three";
 import { createCanvasInteractionController, type CanvasInteractionController } from "./canvasInteractions";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
 import type { RendererApi } from "./rendererTypes";
-import { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
+import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
 import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
-import { ThreeTiledOverviewLayer } from "./threeTiledOverviewLayer";
+import type { ThreeTiledOverviewLayer } from "./threeTiledOverviewLayer";
+import {
+  shouldUseVectorStrokeLod,
+  ThreeVectorLodStrokeLayer,
+  type VectorLodMode
+} from "./vectorStrokeLod";
 import { WebGlFloorplanRenderer, type ViewState } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 
@@ -46,6 +51,7 @@ export interface HeprThreeObjectOptions {
   experimentalMaterialStrokes?: boolean;
   experimentalMaterialTexts?: boolean;
   panOptimization?: boolean;
+  vectorLod?: VectorLodMode;
   curveStrokes?: boolean;
   vectorOnly?: boolean;
   fitPadding?: number;
@@ -79,6 +85,7 @@ interface RendererConfig {
   materialFillEnabled: boolean;
   materialStrokeEnabled: boolean;
   materialTextEnabled: boolean;
+  vectorLodMode: VectorLodMode;
   strokeCurveEnabled: boolean;
   textVectorOnly: boolean;
   pageBackground: [number, number, number, number];
@@ -112,6 +119,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly fillMaterialLayer: ThreeMaterialFillLayer | null;
   private readonly strokeMaterialLayer: ThreeMaterialStrokeLayer | null;
   private readonly triangleStrokeLayer: ThreeTriangleStrokeLayer | null;
+  private readonly vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null;
   private readonly compactedStrokeLayer: ThreeCompactedStrokeLayer | null;
   private readonly textMaterialLayer: ThreeMaterialTextLayer | null;
   private readonly overviewTileLayer: ThreeTiledOverviewLayer | null;
@@ -177,6 +185,7 @@ export class HeprThreePdfObject extends THREE.Group {
     fillMaterialLayer: ThreeMaterialFillLayer | null,
     strokeMaterialLayer: ThreeMaterialStrokeLayer | null,
     triangleStrokeLayer: ThreeTriangleStrokeLayer | null,
+    vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null,
     compactedStrokeLayer: ThreeCompactedStrokeLayer | null,
     textMaterialLayer: ThreeMaterialTextLayer | null,
     overviewTileLayer: ThreeTiledOverviewLayer | null,
@@ -200,6 +209,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.fillMaterialLayer = fillMaterialLayer;
     this.strokeMaterialLayer = strokeMaterialLayer;
     this.triangleStrokeLayer = triangleStrokeLayer;
+    this.vectorLodStrokeLayer = vectorLodStrokeLayer;
     this.compactedStrokeLayer = compactedStrokeLayer;
     this.textMaterialLayer = textMaterialLayer;
     this.overviewTileLayer = overviewTileLayer;
@@ -238,6 +248,10 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.triangleStrokeLayer) {
       this.triangleStrokeLayer.setVisible(false);
       this.add(this.triangleStrokeLayer.mesh);
+    }
+    if (this.vectorLodStrokeLayer) {
+      this.vectorLodStrokeLayer.deactivate();
+      this.add(this.vectorLodStrokeLayer.group);
     }
     if (this.compactedStrokeLayer) {
       this.compactedStrokeLayer.deactivate();
@@ -313,6 +327,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.fillMaterialLayer?.dispose();
     this.strokeMaterialLayer?.dispose();
     this.triangleStrokeLayer?.dispose();
+    this.vectorLodStrokeLayer?.dispose();
     this.compactedStrokeLayer?.dispose();
     this.textMaterialLayer?.dispose();
     this.overviewTileLayer?.dispose();
@@ -329,6 +344,9 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     if (this.triangleStrokeLayer) {
       this.remove(this.triangleStrokeLayer.mesh);
+    }
+    if (this.vectorLodStrokeLayer) {
+      this.remove(this.vectorLodStrokeLayer.group);
     }
     if (this.compactedStrokeLayer) {
       this.remove(this.compactedStrokeLayer.group);
@@ -364,7 +382,9 @@ export class HeprThreePdfObject extends THREE.Group {
     let perspectiveOverviewTilePipelineEnabled = false;
     if (perspectiveThreeCameraMode) {
       perspectiveDerivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
+      const preferPerspectiveVectorLod = this.vectorLodStrokeLayer !== null && perspectiveDerivedView !== null;
       perspectiveNativeDirectHost2dPipelineEnabled =
+        !preferPerspectiveVectorLod &&
         perspectiveDerivedView !== null &&
         this.shouldUsePerspectiveNativeDirectHost2dPipeline(camera) &&
         this.renderPerspectiveNativeDirectHost2dFrame(renderer, rendererViewport, perspectiveDerivedView);
@@ -381,6 +401,7 @@ export class HeprThreePdfObject extends THREE.Group {
           this.setPerspectiveVectorPipelineActive(false);
         } else {
           perspectiveNativeProjectionPipelineEnabled =
+            !preferPerspectiveVectorLod &&
             perspectiveDerivedView !== null &&
             this.renderPerspectiveNativeProjectionFrame(renderer, camera, rendererViewport, perspectiveDerivedView);
           if (perspectiveNativeProjectionPipelineEnabled) {
@@ -509,7 +530,14 @@ export class HeprThreePdfObject extends THREE.Group {
     }
 
     const localUnitsPerPixel = this.updateMaterialLayerTransforms(camera, nativeViewport, perspectiveVectorPipelineEnabled);
-    this.updateStrokeLodVisibility(localUnitsPerPixel, perspectiveVectorPipelineEnabled);
+    const strokeMaterialPipelineActive =
+      perspectiveVectorPipelineEnabled ||
+      (
+        this.directHostRendering &&
+        !this.perspectiveNativeProjectionPipelineActive &&
+        !this.perspectiveOverviewTilePipelineActive
+      );
+    this.updateStrokeLodVisibility(localUnitsPerPixel, strokeMaterialPipelineActive);
 
     const presentedFrameSerial = this.renderer.getPresentedFrameSerial();
     if (
@@ -539,6 +567,9 @@ export class HeprThreePdfObject extends THREE.Group {
       }
       if (this.triangleStrokeLayer && this.triangleStrokeLayer.mesh.visible) {
         this.triangleStrokeLayer.updateFrame(viewState, nativeViewport, materialCullingBounds);
+      }
+      if (this.vectorLodStrokeLayer && this.vectorLodStrokeLayer.group.visible) {
+        this.vectorLodStrokeLayer.updateFrame(viewState, nativeViewport, materialCullingBounds);
       }
       if (this.textMaterialLayer && this.textMaterialLayer.mesh.visible) {
         this.textMaterialLayer.updateFrame(viewState, nativeViewport);
@@ -603,6 +634,7 @@ export class HeprThreePdfObject extends THREE.Group {
       (
         this.strokeMaterialLayer !== null ||
         this.triangleStrokeLayer !== null ||
+        this.vectorLodStrokeLayer !== null ||
         this.compactedStrokeLayer !== null
       ) &&
       this.textMaterialLayer !== null
@@ -735,6 +767,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.fillMaterialLayer?.setVisible(false);
     this.strokeMaterialLayer?.setVisible(false);
     this.triangleStrokeLayer?.setVisible(false);
+    this.vectorLodStrokeLayer?.deactivate();
     this.compactedStrokeLayer?.deactivate();
     this.textMaterialLayer?.setVisible(false);
     this.overviewTileLayer?.setVisible(false);
@@ -790,6 +823,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.fillMaterialLayer?.setVisible(false);
       this.strokeMaterialLayer?.setVisible(false);
       this.triangleStrokeLayer?.setVisible(false);
+      this.vectorLodStrokeLayer?.deactivate();
       this.compactedStrokeLayer?.deactivate();
       this.textMaterialLayer?.setVisible(false);
       this.renderer.setRasterRenderingEnabled?.(true);
@@ -842,7 +876,19 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rendererConfig.vectorOverride[2],
       this.rendererConfig.vectorOverride[3]
     );
-    if (this.compactedStrokeLayer) {
+    if (this.vectorLodStrokeLayer) {
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer?.deactivate();
+      this.vectorLodStrokeLayer.setVisible(true);
+      this.vectorLodStrokeLayer.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+      this.vectorLodStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+    } else if (this.compactedStrokeLayer) {
       this.strokeMaterialLayer?.setVisible(false);
       this.triangleStrokeLayer?.setVisible(false);
       this.compactedStrokeLayer.deactivate();
@@ -913,6 +959,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.fillMaterialLayer?.setVisible(false);
       this.strokeMaterialLayer?.setVisible(false);
       this.triangleStrokeLayer?.setVisible(false);
+      this.vectorLodStrokeLayer?.deactivate();
       this.compactedStrokeLayer?.deactivate();
       this.textMaterialLayer?.setVisible(false);
       this.renderer.setRasterRenderingEnabled?.(false);
@@ -944,6 +991,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.fillMaterialLayer.setScreenSpaceTransform();
       this.strokeMaterialLayer?.setScreenSpaceTransform();
       this.triangleStrokeLayer?.setScreenSpaceTransform();
+      this.vectorLodStrokeLayer?.setScreenSpaceTransform();
       this.textMaterialLayer.setScreenSpaceTransform();
       return localUnitsPerPixel;
     }
@@ -956,11 +1004,33 @@ export class HeprThreePdfObject extends THREE.Group {
     this.fillMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
     this.strokeMaterialLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
     this.triangleStrokeLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
+    this.vectorLodStrokeLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
     this.textMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
     return localUnitsPerPixel;
   }
 
   private updateStrokeLodVisibility(localUnitsPerPixel: number | null, vectorPipelineActive: boolean): void {
+    if (this.vectorLodStrokeLayer) {
+      if (!vectorPipelineActive || localUnitsPerPixel === null) {
+        this.vectorLodStrokeLayer.deactivate();
+        return;
+      }
+
+      this.vectorLodStrokeLayer.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+      this.vectorLodStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+      this.vectorLodStrokeLayer.setVisible(true);
+      this.vectorLodStrokeLayer.updateForLocalUnitsPerPixel(localUnitsPerPixel);
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer?.deactivate();
+      return;
+    }
+
     if (!this.compactedStrokeLayer || !vectorPipelineActive || localUnitsPerPixel === null) {
       this.compactedStrokeLayer?.deactivate();
       return;
@@ -1032,6 +1102,10 @@ export class HeprThreePdfObject extends THREE.Group {
       return false;
     }
 
+    if (this.vectorLodStrokeLayer) {
+      return true;
+    }
+
     const pageWidth = Math.max(1e-6, this.sceneBounds.maxX - this.sceneBounds.minX);
     const pageHeight = Math.max(1e-6, this.sceneBounds.maxY - this.sceneBounds.minY);
     const visibleWidth = Math.max(0, bounds.maxX - bounds.minX);
@@ -1050,11 +1124,13 @@ export class HeprThreePdfObject extends THREE.Group {
       ? PERSPECTIVE_VECTOR_EXIT_MAX_VISIBLE_STROKES
       : PERSPECTIVE_VECTOR_ENTER_MAX_VISIBLE_STROKES;
 
-    const estimatedVisibleStrokes = this.strokeMaterialLayer?.estimateVisibleSegmentCount(
-      derivedView.viewState,
-      derivedView.nativeViewport,
-      bounds
-    ) ?? 0;
+    const estimatedVisibleStrokes =
+      this.strokeMaterialLayer?.estimateVisibleSegmentCount(
+        derivedView.viewState,
+        derivedView.nativeViewport,
+        bounds
+      ) ??
+      0;
 
     return (
       Number.isFinite(areaRatio) &&
@@ -1147,7 +1223,23 @@ export class HeprThreePdfObject extends THREE.Group {
       this.renderer.setFillRenderingEnabled?.(true);
     }
 
-    if (this.compactedStrokeLayer) {
+    if (this.vectorLodStrokeLayer) {
+      const localUnitsPerPixel = 1 / Math.max(1e-6, this.renderer.getViewState().zoom);
+      this.strokeMaterialLayer?.setVisible(false);
+      this.triangleStrokeLayer?.setVisible(false);
+      this.compactedStrokeLayer?.deactivate();
+      this.vectorLodStrokeLayer.setScreenSpaceTransform();
+      this.vectorLodStrokeLayer.setVisible(true);
+      this.vectorLodStrokeLayer.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+      this.vectorLodStrokeLayer.updateForLocalUnitsPerPixel(localUnitsPerPixel);
+      this.vectorLodStrokeLayer.setVectorOverride(
+        this.rendererConfig.vectorOverride[0],
+        this.rendererConfig.vectorOverride[1],
+        this.rendererConfig.vectorOverride[2],
+        this.rendererConfig.vectorOverride[3]
+      );
+      this.renderer.setStrokeRenderingEnabled?.(false);
+    } else if (this.compactedStrokeLayer) {
       this.strokeMaterialLayer?.setVisible(false);
       this.triangleStrokeLayer?.setVisible(false);
       this.compactedStrokeLayer.updateForLocalUnitsPerPixel(1 / Math.max(1e-6, this.renderer.getViewState().zoom));
@@ -1237,6 +1329,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.fillMaterialLayer?.setVisible(false);
     this.strokeMaterialLayer?.setVisible(false);
     this.triangleStrokeLayer?.setVisible(false);
+    this.vectorLodStrokeLayer?.deactivate();
     this.compactedStrokeLayer?.deactivate();
     this.textMaterialLayer?.setVisible(false);
     this.renderer.setRasterRenderingEnabled?.(true);
@@ -1284,6 +1377,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.fillMaterialLayer?.setVisible(false);
       this.strokeMaterialLayer?.setVisible(false);
       this.triangleStrokeLayer?.setVisible(false);
+      this.vectorLodStrokeLayer?.deactivate();
       this.compactedStrokeLayer?.deactivate();
       this.textMaterialLayer?.setVisible(false);
       this.renderer.setRasterRenderingEnabled?.(true);
@@ -1310,6 +1404,7 @@ export class HeprThreePdfObject extends THREE.Group {
     );
 
     this.strokeMaterialLayer?.setVisible(true);
+    this.vectorLodStrokeLayer?.deactivate();
     this.compactedStrokeLayer?.deactivate();
     this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
     this.strokeMaterialLayer?.setVectorOverride(
@@ -1856,10 +1951,15 @@ export async function createThreePdfObject(
   nativeRenderer.setScene(loadedScene.scene);
   const initialFitPaddingPixels = normalizePadding(options.fitPadding);
   const forceWebGlMaterialLayers = rendererType === "webgl" && threeCameraDriven;
-  const useStaticStrokeLayer =
-    rendererType === "webgl" &&
-    threeCameraDriven &&
-    loadedScene.scene.segmentCount >= 300_000;
+  const shouldConstructStrokeMaterial =
+    rendererConfig.materialStrokeEnabled || forceWebGlMaterialLayers;
+  const useVectorLodStrokeLayer =
+    shouldConstructStrokeMaterial &&
+    shouldUseVectorStrokeLod(
+      rendererConfig.vectorLodMode,
+      rendererType,
+      loadedScene.scene.segmentCount
+    );
 
   const enableMaterialLayerConstruction =
     rendererType === "webgl" ||
@@ -1886,9 +1986,9 @@ export async function createThreePdfObject(
       : null;
 
   const strokeMaterialLayer =
-    !useStaticStrokeLayer &&
+    !useVectorLodStrokeLayer &&
     enableMaterialLayerConstruction &&
-    (rendererConfig.materialStrokeEnabled || forceWebGlMaterialLayers)
+    shouldConstructStrokeMaterial
       ? new ThreeMaterialStrokeLayer(loadedScene.scene, {
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
         vectorOverride: rendererConfig.vectorOverride
@@ -1897,15 +1997,15 @@ export async function createThreePdfObject(
 
   const triangleStrokeLayer = null;
 
-  const compactedStrokeLayer =
-    useStaticStrokeLayer
-      ? new ThreeCompactedStrokeLayer(loadedScene.scene, {
-        sceneBounds,
-        sceneCenterX,
-        sceneCenterY,
+  const vectorLodStrokeLayer =
+    useVectorLodStrokeLayer && enableMaterialLayerConstruction
+      ? new ThreeVectorLodStrokeLayer(loadedScene.scene, {
+        strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
         vectorOverride: rendererConfig.vectorOverride
       })
       : null;
+
+  const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
 
   const textMaterialLayer =
     enableMaterialLayerConstruction && (rendererConfig.materialTextEnabled || forceWebGlMaterialLayers)
@@ -1916,20 +2016,7 @@ export async function createThreePdfObject(
       })
       : null;
 
-  const overviewTileLayer =
-    useStaticStrokeLayer
-      ? new ThreeTiledOverviewLayer(loadedScene.scene, {
-        sceneBounds,
-        sceneCenterX,
-        sceneCenterY,
-        pageBackground: rendererConfig.pageBackground,
-        vectorOverride: rendererConfig.vectorOverride,
-        strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
-        textVectorOnly: rendererConfig.textVectorOnly,
-        overviewTilePyramid: loadedScene.scene.overviewTilePyramid ?? null
-      })
-      : null;
-  await overviewTileLayer?.preloadBaseLevel();
+  const overviewTileLayer: ThreeTiledOverviewLayer | null = null;
 
   const renderTexture = createRenderCanvasTexture(renderCanvas);
 
@@ -1969,6 +2056,7 @@ export async function createThreePdfObject(
     fillMaterialLayer,
     strokeMaterialLayer,
     triangleStrokeLayer,
+    vectorLodStrokeLayer,
     compactedStrokeLayer,
     textMaterialLayer,
     overviewTileLayer,
@@ -2065,11 +2153,16 @@ function normalizeRendererConfig(options: HeprThreeObjectOptions): RendererConfi
     materialFillEnabled: options.experimentalMaterialFills === true,
     materialStrokeEnabled: options.experimentalMaterialStrokes === true,
     materialTextEnabled: options.experimentalMaterialTexts === true,
+    vectorLodMode: normalizeVectorLodMode(options.vectorLod),
     strokeCurveEnabled: options.curveStrokes !== false,
     textVectorOnly: options.vectorOnly === true,
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2], pageBackgroundOpacity],
     vectorOverride: [vectorColor[0], vectorColor[1], vectorColor[2], vectorOpacity]
   };
+}
+
+function normalizeVectorLodMode(value: VectorLodMode | undefined): VectorLodMode {
+  return value === "off" || value === "force" ? value : "auto";
 }
 
 function applyRendererConfig(renderer: RendererApi, config: RendererConfig): void {
