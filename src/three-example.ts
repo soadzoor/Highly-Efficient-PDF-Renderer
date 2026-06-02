@@ -5,6 +5,7 @@ import {
   pdfObjectGenerator,
   type HeprRendererType,
   type HeprThreePdfObject,
+  type VectorLodMode,
   type PDFLoadProgress
 } from "./index";
 import type { DrawStats } from "./webGlFloorplanRenderer";
@@ -22,6 +23,7 @@ const loadSourceButton = document.querySelector<HTMLButtonElement>("#load-source
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
+const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
 const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
@@ -36,6 +38,7 @@ if (
   !fileInput ||
   !exampleSelect ||
   !backendSelect ||
+  !vectorLodSelect ||
   !statusElement ||
   !parseLoader ||
   !parseLoaderText ||
@@ -52,6 +55,7 @@ const loadSourceButtonElement = loadSourceButton;
 const fileInputElement = fileInput;
 const exampleSelectElement = exampleSelect;
 const backendSelectElement = backendSelect;
+const vectorLodSelectElement = vectorLodSelect;
 const statusElementNode = statusElement;
 const parseLoaderElement = parseLoader;
 const parseLoaderTextElement = parseLoaderText;
@@ -62,12 +66,9 @@ const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
 const searchParams = new URLSearchParams(window.location.search);
-const allowRotate = searchParams.get("heprAllowRotate") === "1";
 const threeCameraDebugLogs =
   searchParams.get("heprThreeCameraDebug") === "1" ||
   searchParams.get("heprPerspectiveDebug") === "1";
-const disableDirectHost = searchParams.get("heprNoDirectHost") === "1";
-const useThreeCameraDirectHost = !allowRotate && !disableDirectHost;
 const CAMERA_FIT_PADDING = 1.06;
 const MIN_OBJECT_EXTENT = 1e-3;
 const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
@@ -92,6 +93,7 @@ const renderer = new THREE.WebGLRenderer({
   powerPreference: "high-performance"
 });
 renderer.toneMapping = THREE.NoToneMapping;
+renderer.autoClear = false;
 renderer.setClearColor(new THREE.Color(160 / 255, 169 / 255, 175 / 255), 1);
 renderer.setPixelRatio(window.devicePixelRatio || 1);
 renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
@@ -108,12 +110,12 @@ camera.lookAt(0, 0, 0);
 updatePerspectiveCameraProjection();
 
 const controls = new MapControls(camera, renderer.domElement);
-controls.enableRotate = allowRotate;
+controls.enableRotate = true;
 controls.enableDamping = false;
 controls.screenSpacePanning = true;
 if (threeCameraDebugLogs) {
   console.info(
-    `[HEPR:three-example] three-camera debug logs enabled (rotate=${allowRotate}, directHost=${useThreeCameraDirectHost}).`
+    "[HEPR:three-example] three-camera debug logs enabled."
   );
 }
 
@@ -137,7 +139,9 @@ function renderFrame(now: number = performance.now()): void {
   updateFpsMeter(now);
   const controlsChanged = controls.update();
   updateCameraClipping();
+  renderer.clear(true, true, true);
   currentPdfObject?.prepareFrameForThreeRenderer(renderer, camera);
+  renderer.clearDepth();
   renderer.render(scene, camera);
   updateDrawStatsMeter();
   updateLodStatsMeter();
@@ -210,6 +214,19 @@ backendSelectElement.addEventListener("change", () => {
   void loadSource(lastLoadedSource);
 }, { signal: lifetimeSignal });
 
+vectorLodSelectElement.addEventListener("change", () => {
+  const vectorLod = readVectorLodMode();
+  if (!lastLoadedSource) {
+    setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}. Load a source to render.`);
+    return;
+  }
+  currentPdfObject?.setVectorLodMode(vectorLod);
+  setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}.`);
+  updateDrawStatsMeter();
+  updateLodStatsMeter();
+  requestRender();
+}, { signal: lifetimeSignal });
+
 void loadExampleManifest();
 
 window.addEventListener("beforeunload", () => {
@@ -241,13 +258,14 @@ async function loadSource(source: File | string): Promise<void> {
   const backend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
   const useWebGpuMaterialPipeline = backend === "webgpu";
   const sourceLabel = typeof source === "string" ? source : source.name;
+  const vectorLod = readVectorLodMode();
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "Parsing / loading 0.00%");
   loadSourceButtonElement.disabled = true;
   backendSelectElement.disabled = true;
+  vectorLodSelectElement.disabled = true;
 
   try {
-    const hostCanvas = backend === "webgl" && useThreeCameraDirectHost ? renderer.domElement : undefined;
     const nextObject = await pdfObjectGenerator(
       source,
       {
@@ -256,7 +274,7 @@ async function loadSource(source: File | string): Promise<void> {
         segmentMerge: true,
         invisibleCull: true,
         curveStrokes: true,
-        hostCanvas,
+        vectorLod,
         experimentalMaterialRasters: useWebGpuMaterialPipeline,
         experimentalMaterialFills: useWebGpuMaterialPipeline,
         experimentalMaterialStrokes: useWebGpuMaterialPipeline,
@@ -275,7 +293,9 @@ async function loadSource(source: File | string): Promise<void> {
     }
     replacePdfObject(nextObject);
     lastLoadedSource = source;
-    setStatus(`Loaded ${nextObject.sourceLabel} (${nextObject.sourceKind}) via ${backend.toUpperCase()}.`);
+    setStatus(
+      `Loaded ${nextObject.sourceLabel} (${nextObject.sourceKind}) via ${backend.toUpperCase()} | Vector LOD: ${formatVectorLodMode(vectorLod)}.`
+    );
     requestRender();
   } catch (error) {
     if (activeLoadToken !== loadToken) {
@@ -288,6 +308,7 @@ async function loadSource(source: File | string): Promise<void> {
       setLoadingProgress(false);
       loadSourceButtonElement.disabled = false;
       backendSelectElement.disabled = false;
+      vectorLodSelectElement.disabled = false;
     }
   }
 }
@@ -514,6 +535,15 @@ function formatCompactCount(value: number): string {
 
 function formatLodTolerance(tolerance: number): string {
   return tolerance <= 0 ? "exact" : `tol${tolerance}`;
+}
+
+function readVectorLodMode(): VectorLodMode {
+  const value = vectorLodSelectElement.value;
+  return value === "off" || value === "force" ? value : "auto";
+}
+
+function formatVectorLodMode(mode: VectorLodMode): string {
+  return mode === "off" ? "Off" : mode === "force" ? "Force" : "Auto";
 }
 
 type ExampleSelectionKind = "pdf" | "zip";

@@ -34,7 +34,7 @@ import {
   formatLoadProgressStage,
   type PDFLoadProgress
 } from "./loadProgress";
-import type { VectorStrokeLodStats } from "./vectorStrokeLodCore";
+import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -69,6 +69,7 @@ const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-in
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
 const vectorTextOnlyToggle = document.querySelector<HTMLInputElement>("#toggle-vector-text-only");
 const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
+const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
 const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages-per-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -109,6 +110,7 @@ if (
   !strokeCurveToggle ||
   !vectorTextOnlyToggle ||
   !webGpuToggle ||
+  !vectorLodSelect ||
   !maxPagesPerRowInput ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -151,6 +153,7 @@ const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
 const vectorTextOnlyToggleElement = vectorTextOnlyToggle;
 const webGpuToggleElement = webGpuToggle;
+const vectorLodSelectElement = vectorLodSelect;
 const maxPagesPerRowInputElement = maxPagesPerRowInput;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -168,6 +171,7 @@ const uiControlManager = createUiControlManager(
     strokeCurveToggle: strokeCurveToggleElement,
     vectorTextOnlyToggle: vectorTextOnlyToggleElement,
     webGpuToggle: webGpuToggleElement,
+    vectorLodSelect: vectorLodSelectElement,
     maxPagesPerRowInput: maxPagesPerRowInputElement,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
@@ -195,6 +199,7 @@ function onRendererFrame(stats: DrawStats): void {
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
+  rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
   rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
@@ -385,6 +390,9 @@ uiControlManager.bindEventListeners({
   onVectorTextOnlyChange: (enabled) => {
     renderer.setTextVectorOnly(enabled);
   },
+  onVectorLodModeChange: (mode) => {
+    applyVectorLodMode(mode);
+  },
   onMaxPagesPerRowChange: async () => {
     if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
       return;
@@ -393,6 +401,10 @@ uiControlManager.bindEventListeners({
   },
   onWebGpuToggleChange: (enabled) => backendSwitcher?.applyPreference(enabled) ?? Promise.resolve()
 });
+
+function applyVectorLodMode(mode: VectorLodMode): void {
+  renderer.setVectorLodMode?.(mode);
+}
 
 canvasInteractionController.attach(canvasElement);
 

@@ -1,4 +1,5 @@
 import type { RendererApi } from "./rendererTypes";
+import type { VectorLodMode } from "./vectorStrokeLodCore";
 
 type ColorRgba = [number, number, number, number];
 
@@ -12,6 +13,7 @@ export interface UiControlElements {
   strokeCurveToggle: HTMLInputElement;
   vectorTextOnlyToggle: HTMLInputElement;
   webGpuToggle: HTMLInputElement;
+  vectorLodSelect: HTMLSelectElement;
   maxPagesPerRowInput: HTMLInputElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
@@ -26,12 +28,14 @@ export interface UiControlCallbacks {
   onInvisibleCullChange(): AsyncOrSync;
   onStrokeCurveChange(enabled: boolean): void;
   onVectorTextOnlyChange(enabled: boolean): void;
+  onVectorLodModeChange(mode: VectorLodMode): void;
   onMaxPagesPerRowChange(maxPagesPerRow: number): AsyncOrSync;
   onWebGpuToggleChange(enabled: boolean): AsyncOrSync;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
+  readVectorLodModeInput(): VectorLodMode;
   readMaxPagesPerRowInput(): number;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
@@ -50,6 +54,11 @@ export function createUiControlManager(
       return 10;
     }
     return clamp(parsed, 1, 100);
+  }
+
+  function readVectorLodModeInput(): VectorLodMode {
+    const value = elements.vectorLodSelect.value;
+    return value === "off" || value === "force" ? value : "auto";
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -163,6 +172,10 @@ export function createUiControlManager(
       callbacks.onVectorTextOnlyChange(elements.vectorTextOnlyToggle.checked);
     });
 
+    elements.vectorLodSelect.addEventListener("change", () => {
+      callbacks.onVectorLodModeChange(readVectorLodModeInput());
+    });
+
     elements.pageBackgroundColorInput.addEventListener("input", () => {
       applyPageBackgroundColorFromControls();
     });
@@ -208,6 +221,7 @@ export function createUiControlManager(
 
   return {
     bindEventListeners,
+    readVectorLodModeInput,
     readMaxPagesPerRowInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,

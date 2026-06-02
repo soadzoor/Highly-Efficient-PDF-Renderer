@@ -113,6 +113,10 @@ body {
   width: 100%;
 }
 
+.number-row select {
+  width: 100%;
+}
+
 .number-row input[type="color"] {
   width: 44px;
   height: 28px;

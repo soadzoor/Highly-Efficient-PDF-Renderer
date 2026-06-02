@@ -118,9 +118,9 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly rendererConfig: RendererConfig;
   private readonly rasterMaterialLayer: ThreeMaterialRasterLayer | null;
   private readonly fillMaterialLayer: ThreeMaterialFillLayer | null;
-  private readonly strokeMaterialLayer: ThreeMaterialStrokeLayer | null;
+  private strokeMaterialLayer: ThreeMaterialStrokeLayer | null;
   private readonly triangleStrokeLayer: ThreeTriangleStrokeLayer | null;
-  private readonly vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null;
+  private vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null;
   private readonly compactedStrokeLayer: ThreeCompactedStrokeLayer | null;
   private readonly textMaterialLayer: ThreeMaterialTextLayer | null;
   private readonly overviewTileLayer: ThreeTiledOverviewLayer | null;
@@ -344,6 +344,29 @@ export class HeprThreePdfObject extends THREE.Group {
     this.skipNextBeforeRenderCallback = true;
   }
 
+  setVectorLodMode(mode: VectorLodMode): void {
+    if (this.isDisposed) {
+      return;
+    }
+
+    const nextMode = normalizeVectorLodMode(mode);
+    const useVectorLodLayer = this.shouldUseThreeVectorLodLayer(nextMode);
+    const useExactMaterialLayer = this.shouldUseThreeMaterialStrokeLayer() && !useVectorLodLayer;
+    const hasExpectedLayer =
+      (useVectorLodLayer && this.vectorLodStrokeLayer !== null && this.strokeMaterialLayer === null) ||
+      (useExactMaterialLayer && this.strokeMaterialLayer !== null && this.vectorLodStrokeLayer === null) ||
+      (!useVectorLodLayer && !useExactMaterialLayer && this.strokeMaterialLayer === null && this.vectorLodStrokeLayer === null);
+
+    this.rendererConfig.vectorLodMode = nextMode;
+    this.renderer.setVectorLodMode?.(useVectorLodLayer || useExactMaterialLayer ? "off" : nextMode);
+
+    if (!hasExpectedLayer) {
+      this.rebuildThreeStrokeLayer(useVectorLodLayer, useExactMaterialLayer);
+    }
+
+    this.resetRenderPipelinesAfterLayerChange();
+  }
+
   setViewState(viewState: ViewState): void {
     this.pendingInitialFit = false;
     this.renderer.setViewState(viewState);
@@ -396,6 +419,67 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     this.interactionController.detach();
     this.controlsCanvas = null;
+  }
+
+  private shouldUseThreeMaterialStrokeLayer(): boolean {
+    return this.rendererType === "webgl" && (this.rendererConfig.materialStrokeEnabled || this.threeCameraDriven);
+  }
+
+  private shouldUseThreeVectorLodLayer(mode: VectorLodMode): boolean {
+    return (
+      this.shouldUseThreeMaterialStrokeLayer() &&
+      shouldUseVectorStrokeLod(mode, this.rendererType, this.sceneData.segmentCount)
+    );
+  }
+
+  private rebuildThreeStrokeLayer(useVectorLodLayer: boolean, useExactMaterialLayer: boolean): void {
+    this.disposeThreeStrokeLayers();
+
+    if (useVectorLodLayer) {
+      this.vectorLodStrokeLayer = new ThreeVectorLodStrokeLayer(this.sceneData, {
+        strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
+        vectorOverride: this.rendererConfig.vectorOverride
+      });
+      this.vectorLodStrokeLayer.deactivate();
+      this.add(this.vectorLodStrokeLayer.group);
+      return;
+    }
+
+    if (useExactMaterialLayer) {
+      this.strokeMaterialLayer = new ThreeMaterialStrokeLayer(this.sceneData, {
+        strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
+        vectorOverride: this.rendererConfig.vectorOverride
+      });
+      this.strokeMaterialLayer.setVisible(false);
+      this.add(this.strokeMaterialLayer.mesh);
+    }
+  }
+
+  private disposeThreeStrokeLayers(): void {
+    if (this.strokeMaterialLayer) {
+      this.remove(this.strokeMaterialLayer.mesh);
+      this.strokeMaterialLayer.dispose();
+      this.strokeMaterialLayer = null;
+    }
+    if (this.vectorLodStrokeLayer) {
+      this.remove(this.vectorLodStrokeLayer.group);
+      this.vectorLodStrokeLayer.dispose();
+      this.vectorLodStrokeLayer = null;
+    }
+  }
+
+  private resetRenderPipelinesAfterLayerChange(): void {
+    this.strokeMaterialLayer?.setVisible(false);
+    this.triangleStrokeLayer?.setVisible(false);
+    this.vectorLodStrokeLayer?.deactivate();
+    this.compactedStrokeLayer?.deactivate();
+    this.perspectiveVectorPipelineActive = false;
+    this.perspectiveNativeProjectionPipelineActive = false;
+    this.perspectiveOverviewTilePipelineActive = false;
+    this.lastSyncedFrameSerial = -1;
+    this.lastUploadedFrameSerial = -1;
+    this.lastViewportWidth = 0;
+    this.lastViewportHeight = 0;
   }
 
   handleBeforeRender(renderer: THREE.WebGLRenderer, camera: THREE.Camera): void {
