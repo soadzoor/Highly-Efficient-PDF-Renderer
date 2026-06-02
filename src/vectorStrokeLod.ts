@@ -165,6 +165,8 @@ const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
 const LOD_RUNTIME_MAX_GRID_SIDE = 96;
 const LOD_TILE_MIN_VISIBLE_SEGMENTS = 48;
+const LOD_TILE_COARSEN_RATIO = 1.18;
+const LOD_TILE_REFINE_RATIO = 0.72;
 const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
 const LOD_TILE_WORLD_FACTOR = 192;
@@ -189,6 +191,7 @@ export class ThreeVectorLodStrokeLayer {
     markToken: number;
   }>;
   private readonly tileGrid: RuntimeTileGrid;
+  private readonly tileSelectedLevelIndices: Int16Array;
   private readonly maxHalfWidth: number;
   private requestedVisible = false;
   private activeLevelIndex = 0;
@@ -204,6 +207,8 @@ export class ThreeVectorLodStrokeLayer {
 
     const lodBuildStart = nowMs();
     this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0));
+    this.tileSelectedLevelIndices = new Int16Array(this.tileGrid.columns * this.tileGrid.rows);
+    this.tileSelectedLevelIndices.fill(-1);
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.levels = buildVectorStrokeLodScenes(scene).map((levelScene) => {
       const layer = new ThreeMaterialStrokeLayer(levelScene.scene, options);
@@ -392,12 +397,41 @@ export class ThreeVectorLodStrokeLayer {
   }
 
   private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+    const previousLevelIndex = this.tileSelectedLevelIndices[tileIndex];
+    const coarsenLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_COARSEN_RATIO);
+    const refineLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_REFINE_RATIO);
+
+    if (previousLevelIndex >= 0 && previousLevelIndex < this.levels.length) {
+      let nextIndex = previousLevelIndex;
+
+      while (
+        nextIndex < this.levels.length - 1 &&
+        this.levels[nextIndex].tileCounts[tileIndex] > coarsenLimit
+      ) {
+        nextIndex += 1;
+      }
+
+      while (
+        nextIndex > 0 &&
+        this.levels[nextIndex - 1].tileCounts[tileIndex] <= refineLimit
+      ) {
+        nextIndex -= 1;
+      }
+
+      this.tileSelectedLevelIndices[tileIndex] = nextIndex;
+      return nextIndex;
+    }
+
     for (let i = 0; i < this.levels.length; i += 1) {
-      if (this.levels[i].tileCounts[tileIndex] <= targetSegmentsPerTile) {
+      if (this.levels[i].tileCounts[tileIndex] <= coarsenLimit) {
+        this.tileSelectedLevelIndices[tileIndex] = i;
         return i;
       }
     }
-    return this.levels.length - 1;
+
+    const fallbackIndex = this.levels.length - 1;
+    this.tileSelectedLevelIndices[tileIndex] = fallbackIndex;
+    return fallbackIndex;
   }
 
   private appendTileSegments(
