@@ -165,8 +165,13 @@ const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
 const LOD_RUNTIME_MAX_GRID_SIDE = 96;
 const LOD_TILE_MIN_VISIBLE_SEGMENTS = 48;
+const LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS = 384;
+const LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS = 192;
+const LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS = 96;
 const LOD_TILE_COARSEN_RATIO = 1.18;
 const LOD_TILE_REFINE_RATIO = 0.72;
+const LOD_TILE_PROJECTED_MIN_FACTOR = 0.1;
+const LOD_TILE_PROJECTED_MAX_FACTOR = 4096;
 const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
 const LOD_TILE_WORLD_FACTOR = 192;
@@ -341,10 +346,12 @@ export class ThreeVectorLodStrokeLayer {
 
     this.activeLevelIndex = screenErrorLevelIndex;
     const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
+    const minTargetSegmentsPerTile = minTileTargetForBaselineLevel(screenErrorLevelIndex);
     const targetSegmentsPerTile = Math.max(
-      LOD_TILE_MIN_VISIBLE_SEGMENTS,
+      minTargetSegmentsPerTile,
       Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / visibleTileCount)
     );
+    const averageProjectedTileArea = this.computeAverageProjectedTileArea(tileRange, viewport);
     let maxBaselineTileSegments = 0;
     let maxBaselineTileSelectedSegments = 0;
     let maxBaselineTileSelectedLevelIndex = screenErrorLevelIndex;
@@ -355,7 +362,13 @@ export class ThreeVectorLodStrokeLayer {
       let tileIndex = row * this.tileGrid.columns + tileRange.c0;
       for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
         const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
-        const levelIndex = this.chooseTileLevel(tileIndex, targetSegmentsPerTile);
+        const tileTargetSegments = this.computeTileTargetSegments(
+          tileIndex,
+          targetSegmentsPerTile,
+          averageProjectedTileArea,
+          viewport
+        );
+        const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments);
         const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
         if (baselineTileSegments > maxBaselineTileSegments) {
           maxBaselineTileSegments = baselineTileSegments;
@@ -432,6 +445,103 @@ export class ThreeVectorLodStrokeLayer {
     const fallbackIndex = this.levels.length - 1;
     this.tileSelectedLevelIndices[tileIndex] = fallbackIndex;
     return fallbackIndex;
+  }
+
+  private computeAverageProjectedTileArea(tileRange: RuntimeTileRange, viewport: ViewportPixels): number {
+    if (!this.useLocalToClip) {
+      return 0;
+    }
+
+    let totalArea = 0;
+    let areaCount = 0;
+    for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
+      let tileIndex = row * this.tileGrid.columns + tileRange.c0;
+      for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
+        const area = this.computeProjectedTileArea(tileIndex, viewport);
+        if (area > 0) {
+          totalArea += area;
+          areaCount += 1;
+        }
+        tileIndex += 1;
+      }
+    }
+
+    return areaCount > 0 ? totalArea / areaCount : 0;
+  }
+
+  private computeTileTargetSegments(
+    tileIndex: number,
+    baseTargetSegmentsPerTile: number,
+    averageProjectedTileArea: number,
+    viewport: ViewportPixels
+  ): number {
+    if (!this.useLocalToClip || averageProjectedTileArea <= 1) {
+      return baseTargetSegmentsPerTile;
+    }
+
+    const projectedArea = this.computeProjectedTileArea(tileIndex, viewport);
+    if (projectedArea <= 0) {
+      return LOD_TILE_MIN_VISIBLE_SEGMENTS;
+    }
+
+    const areaFactor = clampNumber(
+      projectedArea / averageProjectedTileArea,
+      LOD_TILE_PROJECTED_MIN_FACTOR,
+      LOD_TILE_PROJECTED_MAX_FACTOR
+    );
+    return Math.max(
+      LOD_TILE_MIN_VISIBLE_SEGMENTS,
+      Math.round(baseTargetSegmentsPerTile * areaFactor)
+    );
+  }
+
+  private computeProjectedTileArea(tileIndex: number, viewport: ViewportPixels): number {
+    const column = tileIndex % this.tileGrid.columns;
+    const row = Math.floor(tileIndex / this.tileGrid.columns);
+    const minX = this.tileGrid.minX + column * this.tileGrid.tileWidth;
+    const minY = this.tileGrid.minY + row * this.tileGrid.tileHeight;
+    const maxX = column === this.tileGrid.columns - 1 ? this.tileGrid.maxX : minX + this.tileGrid.tileWidth;
+    const maxY = row === this.tileGrid.rows - 1 ? this.tileGrid.maxY : minY + this.tileGrid.tileHeight;
+    const viewportWidth = Math.max(1, viewport.width);
+    const viewportHeight = Math.max(1, viewport.height);
+    const elements = this.localToClip.elements;
+
+    let projectedMinX = Number.POSITIVE_INFINITY;
+    let projectedMinY = Number.POSITIVE_INFINITY;
+    let projectedMaxX = Number.NEGATIVE_INFINITY;
+    let projectedMaxY = Number.NEGATIVE_INFINITY;
+
+    for (let corner = 0; corner < 4; corner += 1) {
+      const x = (corner & 1) === 0 ? minX : maxX;
+      const y = (corner & 2) === 0 ? minY : maxY;
+      const clipX = elements[0] * x + elements[4] * y + elements[12];
+      const clipY = elements[1] * x + elements[5] * y + elements[13];
+      const clipW = elements[3] * x + elements[7] * y + elements[15];
+      if (!Number.isFinite(clipW) || Math.abs(clipW) <= 1e-8) {
+        continue;
+      }
+      const ndcX = clipX / clipW;
+      const ndcY = clipY / clipW;
+      if (!Number.isFinite(ndcX) || !Number.isFinite(ndcY)) {
+        continue;
+      }
+      const px = (ndcX * 0.5 + 0.5) * viewportWidth;
+      const py = (ndcY * 0.5 + 0.5) * viewportHeight;
+      projectedMinX = Math.min(projectedMinX, px);
+      projectedMinY = Math.min(projectedMinY, py);
+      projectedMaxX = Math.max(projectedMaxX, px);
+      projectedMaxY = Math.max(projectedMaxY, py);
+    }
+
+    if (!Number.isFinite(projectedMinX) || !Number.isFinite(projectedMinY)) {
+      return 0;
+    }
+
+    const clippedMinX = clampNumber(projectedMinX, 0, viewportWidth);
+    const clippedMinY = clampNumber(projectedMinY, 0, viewportHeight);
+    const clippedMaxX = clampNumber(projectedMaxX, 0, viewportWidth);
+    const clippedMaxY = clampNumber(projectedMaxY, 0, viewportHeight);
+    return Math.max(0, clippedMaxX - clippedMinX) * Math.max(0, clippedMaxY - clippedMinY);
   }
 
   private appendTileSegments(
@@ -760,6 +870,19 @@ function tileRangeForBounds(
     r0: clampInt(Math.floor((minY - grid.minY) / grid.tileHeight), 0, grid.rows - 1),
     r1: clampInt(Math.floor((maxY - grid.minY) / grid.tileHeight), 0, grid.rows - 1)
   };
+}
+
+function minTileTargetForBaselineLevel(levelIndex: number): number {
+  if (levelIndex <= 0) {
+    return LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS;
+  }
+  if (levelIndex === 1) {
+    return LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS;
+  }
+  if (levelIndex === 2) {
+    return LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS;
+  }
+  return LOD_TILE_MIN_VISIBLE_SEGMENTS;
 }
 
 function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
@@ -1131,6 +1254,16 @@ function clamp01(value: number): number {
   }
   if (value >= 1) {
     return 1;
+  }
+  return value;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
   }
   return value;
 }
