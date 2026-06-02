@@ -137,6 +137,7 @@ function renderFrame(now: number = performance.now()): void {
   updateFpsMeter(now);
   const controlsChanged = controls.update();
   updateCameraClipping();
+  currentPdfObject?.prepareFrameForThreeRenderer(renderer, camera);
   renderer.render(scene, camera);
   updateDrawStatsMeter();
   updateLodStatsMeter();
@@ -298,7 +299,6 @@ function replacePdfObject(nextObject: HeprThreePdfObject): void {
   lastNativeDrawStats = null;
   nextObject.renderer.setFrameListener((stats) => {
     lastNativeDrawStats = stats;
-    updateDrawStatsMeter();
   });
   currentPdfObject = nextObject;
   scene.add(nextObject);

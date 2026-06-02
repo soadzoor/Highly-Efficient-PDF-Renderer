@@ -197,6 +197,7 @@ export class VectorStrokeLodRuntime {
   readonly tileGrid: RuntimeTileGrid;
 
   private readonly tileSelectedLevelIndices: Int16Array;
+  private readonly projectedTileAreas: Float32Array;
   private readonly maxHalfWidth: number;
   private activeLevelIndex = 0;
   private useLocalToClip = false;
@@ -210,6 +211,7 @@ export class VectorStrokeLodRuntime {
     this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0));
     this.tileSelectedLevelIndices = new Int16Array(this.tileGrid.columns * this.tileGrid.rows);
     this.tileSelectedLevelIndices.fill(-1);
+    this.projectedTileAreas = new Float32Array(this.tileGrid.columns * this.tileGrid.rows);
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.levels = buildVectorStrokeLodScenes(scene).map((levelScene) => {
       const tileData = buildRuntimeTileBuckets(levelScene.scene, this.tileGrid);
@@ -309,7 +311,7 @@ export class VectorStrokeLodRuntime {
       minTargetSegmentsPerTile,
       Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / visibleTileCount)
     );
-    const averageProjectedTileArea = this.computeAverageProjectedTileArea(tileRange, viewport);
+    const averageProjectedTileArea = this.computeProjectedTileAreas(tileRange, viewport);
     let maxBaselineTileSegments = 0;
     let maxBaselineTileSelectedSegments = 0;
     let maxBaselineTileSelectedLevelIndex = screenErrorLevelIndex;
@@ -321,10 +323,9 @@ export class VectorStrokeLodRuntime {
       for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
         const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
         const tileTargetSegments = this.computeTileTargetSegments(
-          tileIndex,
           targetSegmentsPerTile,
           averageProjectedTileArea,
-          viewport
+          this.projectedTileAreas[tileIndex]
         );
         const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments);
         const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
@@ -394,7 +395,7 @@ export class VectorStrokeLodRuntime {
     return fallbackIndex;
   }
 
-  private computeAverageProjectedTileArea(tileRange: RuntimeTileRange, viewport: ViewportPixels): number {
+  private computeProjectedTileAreas(tileRange: RuntimeTileRange, viewport: ViewportPixels): number {
     if (!this.useLocalToClip) {
       return 0;
     }
@@ -405,6 +406,7 @@ export class VectorStrokeLodRuntime {
       let tileIndex = row * this.tileGrid.columns + tileRange.c0;
       for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
         const area = this.computeProjectedTileArea(tileIndex, viewport);
+        this.projectedTileAreas[tileIndex] = area;
         if (area > 0) {
           totalArea += area;
           areaCount += 1;
@@ -416,16 +418,14 @@ export class VectorStrokeLodRuntime {
   }
 
   private computeTileTargetSegments(
-    tileIndex: number,
     baseTargetSegmentsPerTile: number,
     averageProjectedTileArea: number,
-    viewport: ViewportPixels
+    projectedArea: number
   ): number {
     if (!this.useLocalToClip || averageProjectedTileArea <= 1) {
       return baseTargetSegmentsPerTile;
     }
 
-    const projectedArea = this.computeProjectedTileArea(tileIndex, viewport);
     if (projectedArea <= 0) {
       return LOD_TILE_MIN_VISIBLE_SEGMENTS;
     }

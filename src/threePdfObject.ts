@@ -138,6 +138,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private perspectiveNativeProjectionPipelineActive = false;
   private perspectiveOverviewTilePipelineActive = false;
   private isDisposed = false;
+  private skipNextBeforeRenderCallback = false;
   private warnedThreeCameraUnsupported = false;
   private warnedThreeCameraPerspectiveFallback = false;
   private lastThreeCameraWarningMessage: string | null = null;
@@ -335,6 +336,14 @@ export class HeprThreePdfObject extends THREE.Group {
     return null;
   }
 
+  prepareFrameForThreeRenderer(renderer: THREE.WebGLRenderer, camera: THREE.Camera): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.syncBeforeRender(renderer, camera);
+    this.skipNextBeforeRenderCallback = true;
+  }
+
   setViewState(viewState: ViewState): void {
     this.pendingInitialFit = false;
     this.renderer.setViewState(viewState);
@@ -345,6 +354,7 @@ export class HeprThreePdfObject extends THREE.Group {
       return;
     }
     this.isDisposed = true;
+    this.skipNextBeforeRenderCallback = false;
     this.renderer.setInteractionViewportProvider(null);
     this.renderer.dispose();
     this.pageMesh.onBeforeRender = () => {};
@@ -389,6 +399,14 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   handleBeforeRender(renderer: THREE.WebGLRenderer, camera: THREE.Camera): void {
+    if (this.skipNextBeforeRenderCallback) {
+      this.skipNextBeforeRenderCallback = false;
+      return;
+    }
+    this.syncBeforeRender(renderer, camera);
+  }
+
+  private syncBeforeRender(renderer: THREE.WebGLRenderer, camera: THREE.Camera): void {
     if (this.isDisposed) {
       return;
     }
@@ -1970,12 +1988,6 @@ export async function createThreePdfObject(
   }
 
   const rendererConfig = normalizeRendererConfig(options);
-  const nativeRenderer = await createNativeRenderer(rendererType, renderCanvas);
-  applyRendererConfig(nativeRenderer, rendererConfig);
-  if (rendererType === "webgpu" || hostCanvas || threeCameraDriven) {
-    nativeRenderer.setExternalFrameDriver?.(true);
-  }
-  nativeRenderer.setScene(loadedScene.scene);
   const initialFitPaddingPixels = normalizePadding(options.fitPadding);
   const forceWebGlMaterialLayers = rendererType === "webgl" && threeCameraDriven;
   const shouldConstructStrokeMaterial =
@@ -1987,6 +1999,15 @@ export async function createThreePdfObject(
       rendererType,
       loadedScene.scene.segmentCount
     );
+  const nativeRenderer = await createNativeRenderer(rendererType, renderCanvas);
+  applyRendererConfig(nativeRenderer, rendererConfig);
+  if (useVectorLodStrokeLayer) {
+    nativeRenderer.setVectorLodMode?.("off");
+  }
+  if (rendererType === "webgpu" || hostCanvas || threeCameraDriven) {
+    nativeRenderer.setExternalFrameDriver?.(true);
+  }
+  nativeRenderer.setScene(loadedScene.scene);
 
   const enableMaterialLayerConstruction =
     rendererType === "webgl" ||
