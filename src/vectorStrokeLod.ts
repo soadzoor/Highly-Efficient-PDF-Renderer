@@ -6,8 +6,8 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 
 export type VectorLodMode = "auto" | "off" | "force";
 
-export const VECTOR_STROKE_LOD_MIN_SEGMENTS = 300_000;
-export const VECTOR_STROKE_LOD_TOLERANCES = [0.25, 0.5, 1, 2, 4, 8] as const;
+export const VECTOR_STROKE_LOD_MIN_SEGMENTS = 150_000;
+export const VECTOR_STROKE_LOD_TOLERANCES = [0.5, 1, 2, 4, 8, 16, 32] as const;
 
 interface VectorStrokeLodLayerOptions {
   strokeCurveEnabled: boolean;
@@ -118,6 +118,10 @@ const STROKE_STYLE_FLAG_OFFSET = 2;
 const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
+const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
+const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
+const LOD_MERGE_GAP_FACTOR = 1.5;
+const LOD_TILE_WORLD_FACTOR = 192;
 
 export class ThreeVectorLodStrokeLayer {
   readonly group = new THREE.Group();
@@ -230,7 +234,7 @@ export class ThreeVectorLodStrokeLayer {
   }
 
   private chooseLevelIndex(localUnitsPerPixel: number): number {
-    const maxTolerance = localUnitsPerPixel * 0.5;
+    const maxTolerance = localUnitsPerPixel * LOD_SCREEN_ERROR_BUDGET_PX;
     for (let i = this.levels.length - 1; i >= 1; i -= 1) {
       if (this.levels[i].tolerance <= maxTolerance) {
         return i;
@@ -418,7 +422,7 @@ function shouldDropPrimitiveAtTolerance(
   const minY = scene.primitiveBounds[offset + 1] - primitive.halfWidth;
   const maxX = scene.primitiveBounds[offset + 2] + primitive.halfWidth;
   const maxY = scene.primitiveBounds[offset + 3] + primitive.halfWidth;
-  const projectedDropLocalSize = tolerance * 0.7;
+  const projectedDropLocalSize = tolerance * LOD_DROP_LOCAL_SIZE_FACTOR;
   return Math.max(maxX - minX, maxY - minY) <= projectedDropLocalSize;
 }
 
@@ -503,7 +507,7 @@ function emitMergedIntervals(
   }
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);
 
-  const mergeGap = tolerance;
+  const mergeGap = tolerance * LOD_MERGE_GAP_FACTOR;
   let currentStart = intervals[0].start;
   let currentEnd = intervals[0].end;
   for (let i = 1; i < intervals.length; i += 1) {
@@ -581,7 +585,7 @@ function createTileGrid(bounds: Bounds, tolerance: number): TileGrid {
   const width = Math.max(1e-6, bounds.maxX - bounds.minX);
   const height = Math.max(1e-6, bounds.maxY - bounds.minY);
   const longSide = Math.max(width, height);
-  const targetTileWorld = Math.max(64, tolerance * 128);
+  const targetTileWorld = Math.max(96, tolerance * LOD_TILE_WORLD_FACTOR);
   const longAxisTiles = clampInt(Math.ceil(longSide / targetTileWorld), 16, 96);
   const aspect = width / height;
   const columns = aspect >= 1
