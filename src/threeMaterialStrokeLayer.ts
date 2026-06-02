@@ -52,6 +52,7 @@ export class ThreeMaterialStrokeLayer {
   private readonly segmentMaxX: Float32Array;
   private readonly segmentMaxY: Float32Array;
   private readonly maxHalfWidth: number;
+  private drawInstanceCount: number;
   private markToken = 1;
   private usingAllSegments = true;
   private useLocalToClip = false;
@@ -100,6 +101,7 @@ export class ThreeMaterialStrokeLayer {
     this.segmentMaxX = expandedBounds.maxX;
     this.segmentMaxY = expandedBounds.maxY;
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
+    this.drawInstanceCount = segmentCount;
 
     const geometry = createStrokeGeometry(this.visibleSegmentIds, segmentCount);
     this.segmentIndexAttribute = geometry.getAttribute("aSegmentIndex") as THREE.InstancedBufferAttribute;
@@ -155,6 +157,10 @@ export class ThreeMaterialStrokeLayer {
     this.mesh.visible = visible;
   }
 
+  setDrawEnabled(enabled: boolean): void {
+    this.mesh.geometry.instanceCount = enabled ? this.drawInstanceCount : 0;
+  }
+
   setStrokeCurveEnabled(enabled: boolean): void {
     this.curveUniform.value = enabled ? 1 : 0;
   }
@@ -179,10 +185,28 @@ export class ThreeMaterialStrokeLayer {
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
-    this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
-    this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
-    this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    this.updateFrameUniforms(viewState, viewport);
     this.updateVisibleSegments(viewState, viewport, cullingBounds);
+  }
+
+  updateFrameWithVisibleSegmentIds(
+    viewState: ViewState,
+    viewport: ViewportPixels,
+    segmentIds: Uint32Array,
+    segmentIdCount: number
+  ): void {
+    this.updateFrameUniforms(viewState, viewport);
+    const outCount = Math.max(0, Math.min(segmentIdCount | 0, this.segmentCount, this.visibleSegmentIds.length));
+    for (let i = 0; i < outCount; i += 1) {
+      this.visibleSegmentIds[i] = segmentIds[i];
+    }
+    this.usingAllSegments = false;
+    this.drawInstanceCount = outCount;
+    this.mesh.geometry.instanceCount = outCount;
+    if (outCount > 0) {
+      this.segmentIndexAttribute.addUpdateRange(0, outCount);
+      this.segmentIndexAttribute.needsUpdate = true;
+    }
   }
 
   estimateVisibleSegmentCount(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): number {
@@ -207,10 +231,17 @@ export class ThreeMaterialStrokeLayer {
     const outCount = this.collectVisibleSegments(viewState, viewport, cullingBounds, true);
     if (outCount >= 0) {
       this.usingAllSegments = false;
+      this.drawInstanceCount = outCount;
       this.mesh.geometry.instanceCount = outCount;
       this.segmentIndexAttribute.addUpdateRange(0, outCount);
       this.segmentIndexAttribute.needsUpdate = true;
     }
+  }
+
+  private updateFrameUniforms(viewState: ViewState, viewport: ViewportPixels): void {
+    this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
+    this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
+    this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
   }
 
   private collectVisibleSegments(
@@ -317,6 +348,7 @@ export class ThreeMaterialStrokeLayer {
       this.segmentIndexAttribute.needsUpdate = true;
     }
     this.usingAllSegments = true;
+    this.drawInstanceCount = this.segmentCount;
     this.mesh.geometry.instanceCount = this.segmentCount;
   }
 }

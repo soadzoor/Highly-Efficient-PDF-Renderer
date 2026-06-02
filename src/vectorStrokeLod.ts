@@ -8,6 +8,7 @@ export type VectorLodMode = "auto" | "off" | "force";
 
 export const VECTOR_STROKE_LOD_MIN_SEGMENTS = 150_000;
 export const VECTOR_STROKE_LOD_TOLERANCES = [0.5, 1, 2, 4, 8, 16, 32] as const;
+export const VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS = 150_000;
 
 interface VectorStrokeLodLayerOptions {
   strokeCurveEnabled: boolean;
@@ -70,6 +71,20 @@ interface TileGrid {
   tileHeight: number;
 }
 
+interface RuntimeTileGrid extends TileGrid {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+interface RuntimeTileRange {
+  c0: number;
+  c1: number;
+  r0: number;
+  r1: number;
+}
+
 class Float4Builder {
   private data: Float32Array;
   private length = 0;
@@ -119,6 +134,12 @@ const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
+const LOD_RUNTIME_TILE_TARGET_SEGMENTS = 512;
+const LOD_RUNTIME_MIN_TILE_COUNT = 256;
+const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
+const LOD_RUNTIME_MIN_GRID_SIDE = 12;
+const LOD_RUNTIME_MAX_GRID_SIDE = 96;
+const LOD_TILE_MIN_VISIBLE_SEGMENTS = 48;
 const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
 const LOD_TILE_WORLD_FACTOR = 192;
@@ -130,26 +151,45 @@ export class ThreeVectorLodStrokeLayer {
     tolerance: number;
     layer: ThreeMaterialStrokeLayer;
     segmentCount: number;
+    tileOffsets: Uint32Array;
+    tileCounts: Uint32Array;
+    tileSegmentIds: Uint32Array;
+    segmentMarks: Uint32Array;
+    segmentMinX: Float32Array;
+    segmentMinY: Float32Array;
+    segmentMaxX: Float32Array;
+    segmentMaxY: Float32Array;
+    visibleSegmentIds: Uint32Array;
+    visibleSegmentCount: number;
+    markToken: number;
   }>;
+  private readonly tileGrid: RuntimeTileGrid;
+  private readonly maxHalfWidth: number;
   private requestedVisible = false;
   private activeLevelIndex = 0;
   private useLocalToClip = false;
   private localToClip = new THREE.Matrix4();
   private localUnitsPerPixel = 1;
+  private lastVisibleSegmentCount = 0;
 
   constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
 
+    this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0));
+    this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.levels = buildVectorStrokeLodScenes(scene).map((levelScene) => {
       const layer = new ThreeMaterialStrokeLayer(levelScene.scene, options);
+      const tileData = buildRuntimeTileBuckets(levelScene.scene, this.tileGrid);
       layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(levelScene.tolerance)}`;
       layer.setVisible(false);
+      layer.setDrawEnabled(false);
       this.group.add(layer.mesh);
       return {
         tolerance: levelScene.tolerance,
         layer,
-        segmentCount: Math.max(0, levelScene.scene.segmentCount | 0)
+        segmentCount: Math.max(0, levelScene.scene.segmentCount | 0),
+        ...tileData
       };
     });
 
@@ -193,34 +233,32 @@ export class ThreeVectorLodStrokeLayer {
 
   updateForLocalUnitsPerPixel(localUnitsPerPixel: number): boolean {
     this.localUnitsPerPixel = normalizeLocalUnitsPerPixel(localUnitsPerPixel);
-    const nextIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
-    if (nextIndex !== this.activeLevelIndex) {
-      this.levels[this.activeLevelIndex]?.layer.setVisible(false);
-      this.activeLevelIndex = nextIndex;
-      if (this.useLocalToClip) {
-        this.levels[this.activeLevelIndex]?.layer.setLocalToClipTransform(this.localToClip, this.localUnitsPerPixel);
-      }
-    }
+    this.activeLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
     this.updateGroupVisibility();
     return this.activeLevelIndex > 0;
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
-    const active = this.levels[this.activeLevelIndex];
-    if (!active || !this.group.visible) {
+    if (!this.group.visible || this.levels.length <= 0) {
       return;
     }
-    active.layer.updateFrame(viewState, viewport, cullingBounds);
+    this.updateTiledVisibleSegments(viewState, viewport, cullingBounds);
   }
 
   estimateVisibleSegmentCount(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): number {
+    if (this.lastVisibleSegmentCount > 0) {
+      return this.lastVisibleSegmentCount;
+    }
     const active = this.levels[this.activeLevelIndex];
     return active?.layer.estimateVisibleSegmentCount(viewState, viewport, cullingBounds) ?? 0;
   }
 
   deactivate(): void {
     this.requestedVisible = false;
+    this.lastVisibleSegmentCount = 0;
     for (const level of this.levels) {
+      level.visibleSegmentCount = 0;
+      level.layer.setDrawEnabled(false);
       level.layer.setVisible(false);
     }
     this.group.visible = false;
@@ -243,12 +281,121 @@ export class ThreeVectorLodStrokeLayer {
     return 0;
   }
 
+  private updateTiledVisibleSegments(
+    viewState: ViewState,
+    viewport: ViewportPixels,
+    cullingBounds?: CullingBounds | null
+  ): void {
+    this.resetLevelDrawLists();
+
+    const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth);
+    const tileRange = tileRangeForBounds(viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY, this.tileGrid);
+    if (!tileRange) {
+      this.lastVisibleSegmentCount = 0;
+      this.updateLevelDraws(viewState, viewport);
+      return;
+    }
+
+    const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
+    this.activeLevelIndex = screenErrorLevelIndex;
+    const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
+    const targetSegmentsPerTile = Math.max(
+      LOD_TILE_MIN_VISIBLE_SEGMENTS,
+      Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / visibleTileCount)
+    );
+
+    for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
+      let tileIndex = row * this.tileGrid.columns + tileRange.c0;
+      for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
+        const levelIndex = this.chooseTileLevel(tileIndex, screenErrorLevelIndex, targetSegmentsPerTile);
+        this.appendTileSegments(this.levels[levelIndex], tileIndex, viewBounds);
+        tileIndex += 1;
+      }
+    }
+
+    this.updateLevelDraws(viewState, viewport);
+  }
+
+  private resetLevelDrawLists(): void {
+    for (const level of this.levels) {
+      level.visibleSegmentCount = 0;
+      level.markToken += 1;
+      if (level.markToken === 0xffffffff) {
+        level.segmentMarks.fill(0);
+        level.markToken = 1;
+      }
+    }
+  }
+
+  private chooseTileLevel(tileIndex: number, screenErrorLevelIndex: number, targetSegmentsPerTile: number): number {
+    for (let i = screenErrorLevelIndex; i < this.levels.length; i += 1) {
+      if (this.levels[i].tileCounts[tileIndex] <= targetSegmentsPerTile) {
+        return i;
+      }
+    }
+    return this.levels.length - 1;
+  }
+
+  private appendTileSegments(
+    level: {
+      tileOffsets: Uint32Array;
+      tileCounts: Uint32Array;
+      tileSegmentIds: Uint32Array;
+      segmentMarks: Uint32Array;
+      segmentMinX: Float32Array;
+      segmentMinY: Float32Array;
+      segmentMaxX: Float32Array;
+      segmentMaxY: Float32Array;
+      visibleSegmentIds: Uint32Array;
+      visibleSegmentCount: number;
+      markToken: number;
+    },
+    tileIndex: number,
+    viewBounds: CullingBounds
+  ): void {
+    const start = level.tileOffsets[tileIndex];
+    const end = start + level.tileCounts[tileIndex];
+    let outCount = level.visibleSegmentCount;
+    for (let i = start; i < end; i += 1) {
+      const segmentIndex = level.tileSegmentIds[i];
+      if (level.segmentMarks[segmentIndex] === level.markToken) {
+        continue;
+      }
+      if (
+        level.segmentMaxX[segmentIndex] < viewBounds.minX ||
+        level.segmentMinX[segmentIndex] > viewBounds.maxX ||
+        level.segmentMaxY[segmentIndex] < viewBounds.minY ||
+        level.segmentMinY[segmentIndex] > viewBounds.maxY
+      ) {
+        continue;
+      }
+      level.segmentMarks[segmentIndex] = level.markToken;
+      level.visibleSegmentIds[outCount] = segmentIndex;
+      outCount += 1;
+    }
+    level.visibleSegmentCount = outCount;
+  }
+
+  private updateLevelDraws(viewState: ViewState, viewport: ViewportPixels): void {
+    let visibleSegmentCount = 0;
+    const visible = this.requestedVisible && this.group.visible;
+    for (const level of this.levels) {
+      const drawCount = visible ? level.visibleSegmentCount : 0;
+      visibleSegmentCount += drawCount;
+      level.layer.updateFrameWithVisibleSegmentIds(viewState, viewport, level.visibleSegmentIds, drawCount);
+      level.layer.setVisible(visible);
+      level.layer.setDrawEnabled(drawCount > 0);
+    }
+    this.lastVisibleSegmentCount = visibleSegmentCount;
+  }
+
   private updateGroupVisibility(): void {
     const active = this.levels[this.activeLevelIndex];
     const visible = this.requestedVisible && !!active;
     this.group.visible = visible;
-    for (let i = 0; i < this.levels.length; i += 1) {
-      this.levels[i].layer.setVisible(visible && i === this.activeLevelIndex);
+    for (const level of this.levels) {
+      level.layer.setVisible(visible);
+      level.layer.setDrawEnabled(visible && level.visibleSegmentCount > 0);
     }
   }
 }
@@ -293,6 +440,169 @@ export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodS
   }
 
   return levels;
+}
+
+function createRuntimeTileGrid(bounds: Bounds, segmentCount: number): RuntimeTileGrid {
+  const width = Math.max(1e-6, bounds.maxX - bounds.minX);
+  const height = Math.max(1e-6, bounds.maxY - bounds.minY);
+  const targetTileCount = clampInt(
+    Math.round(Math.max(1, segmentCount) / LOD_RUNTIME_TILE_TARGET_SEGMENTS),
+    LOD_RUNTIME_MIN_TILE_COUNT,
+    LOD_RUNTIME_MAX_TILE_COUNT
+  );
+  const aspect = width / height;
+  let columns = Math.round(Math.sqrt(targetTileCount * aspect));
+  let rows = Math.round(targetTileCount / Math.max(1, columns));
+  columns = clampInt(columns, LOD_RUNTIME_MIN_GRID_SIDE, LOD_RUNTIME_MAX_GRID_SIDE);
+  rows = clampInt(rows, LOD_RUNTIME_MIN_GRID_SIDE, LOD_RUNTIME_MAX_GRID_SIDE);
+  return {
+    columns,
+    rows,
+    minX: bounds.minX,
+    minY: bounds.minY,
+    maxX: bounds.maxX,
+    maxY: bounds.maxY,
+    tileWidth: width / columns,
+    tileHeight: height / rows
+  };
+}
+
+function buildRuntimeTileBuckets(scene: VectorScene, grid: RuntimeTileGrid): {
+  tileOffsets: Uint32Array;
+  tileCounts: Uint32Array;
+  tileSegmentIds: Uint32Array;
+  segmentMarks: Uint32Array;
+  segmentMinX: Float32Array;
+  segmentMinY: Float32Array;
+  segmentMaxX: Float32Array;
+  segmentMaxY: Float32Array;
+  visibleSegmentIds: Uint32Array;
+  visibleSegmentCount: number;
+  markToken: number;
+} {
+  const segmentCount = Math.max(0, scene.segmentCount | 0);
+  const tileCount = grid.columns * grid.rows;
+  const tileCounts = new Uint32Array(tileCount);
+  const bounds = buildRuntimeSegmentBounds(scene, segmentCount);
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const range = tileRangeForBounds(bounds.minX[i], bounds.minY[i], bounds.maxX[i], bounds.maxY[i], grid);
+    if (!range) {
+      continue;
+    }
+    for (let row = range.r0; row <= range.r1; row += 1) {
+      let tileIndex = row * grid.columns + range.c0;
+      for (let column = range.c0; column <= range.c1; column += 1) {
+        tileCounts[tileIndex] += 1;
+        tileIndex += 1;
+      }
+    }
+  }
+
+  const tileOffsets = new Uint32Array(tileCount + 1);
+  for (let i = 0; i < tileCount; i += 1) {
+    tileOffsets[i + 1] = tileOffsets[i] + tileCounts[i];
+  }
+
+  const tileSegmentIds = new Uint32Array(tileOffsets[tileCount]);
+  const cursors = tileOffsets.slice(0, tileCount);
+  for (let i = 0; i < segmentCount; i += 1) {
+    const range = tileRangeForBounds(bounds.minX[i], bounds.minY[i], bounds.maxX[i], bounds.maxY[i], grid);
+    if (!range) {
+      continue;
+    }
+    for (let row = range.r0; row <= range.r1; row += 1) {
+      let tileIndex = row * grid.columns + range.c0;
+      for (let column = range.c0; column <= range.c1; column += 1) {
+        const writeOffset = cursors[tileIndex];
+        tileSegmentIds[writeOffset] = i;
+        cursors[tileIndex] = writeOffset + 1;
+        tileIndex += 1;
+      }
+    }
+  }
+
+  return {
+    tileOffsets,
+    tileCounts,
+    tileSegmentIds,
+    segmentMarks: new Uint32Array(segmentCount),
+    segmentMinX: bounds.minX,
+    segmentMinY: bounds.minY,
+    segmentMaxX: bounds.maxX,
+    segmentMaxY: bounds.maxY,
+    visibleSegmentIds: new Uint32Array(Math.max(1, segmentCount)),
+    visibleSegmentCount: 0,
+    markToken: 1
+  };
+}
+
+function buildRuntimeSegmentBounds(scene: VectorScene, segmentCount: number): {
+  minX: Float32Array;
+  minY: Float32Array;
+  maxX: Float32Array;
+  maxY: Float32Array;
+} {
+  const minX = new Float32Array(segmentCount);
+  const minY = new Float32Array(segmentCount);
+  const maxX = new Float32Array(segmentCount);
+  const maxY = new Float32Array(segmentCount);
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const primitiveBoundsOffset = i * 4;
+    const styleOffset = i * 4;
+    const margin = (scene.styles[styleOffset] ?? 0) + 0.35;
+    minX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+    minY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+    maxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+    maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function resolveStrokeViewBounds(
+  viewState: ViewState,
+  viewport: ViewportPixels,
+  cullingBounds: CullingBounds | null | undefined,
+  maxHalfWidth: number
+): CullingBounds {
+  const safeZoom = Math.max(1e-6, viewState.zoom);
+  const halfViewWidth = Math.max(1, viewport.width) / (2 * safeZoom);
+  const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
+  const margin = Math.max(16 / safeZoom, maxHalfWidth * 2, 0.5);
+
+  return cullingBounds
+    ? {
+      minX: cullingBounds.minX - margin,
+      minY: cullingBounds.minY - margin,
+      maxX: cullingBounds.maxX + margin,
+      maxY: cullingBounds.maxY + margin
+    }
+    : {
+      minX: viewState.cameraCenterX - halfViewWidth - margin,
+      minY: viewState.cameraCenterY - halfViewHeight - margin,
+      maxX: viewState.cameraCenterX + halfViewWidth + margin,
+      maxY: viewState.cameraCenterY + halfViewHeight + margin
+    };
+}
+
+function tileRangeForBounds(
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  grid: RuntimeTileGrid
+): RuntimeTileRange | null {
+  if (maxX < grid.minX || minX > grid.maxX || maxY < grid.minY || minY > grid.maxY) {
+    return null;
+  }
+  return {
+    c0: clampInt(Math.floor((minX - grid.minX) / grid.tileWidth), 0, grid.columns - 1),
+    c1: clampInt(Math.floor((maxX - grid.minX) / grid.tileWidth), 0, grid.columns - 1),
+    r0: clampInt(Math.floor((minY - grid.minY) / grid.tileHeight), 0, grid.rows - 1),
+    r1: clampInt(Math.floor((maxY - grid.minY) / grid.tileHeight), 0, grid.rows - 1)
+  };
 }
 
 function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
