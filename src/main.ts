@@ -34,6 +34,7 @@ import {
   formatLoadProgressStage,
   type PDFLoadProgress
 } from "./loadProgress";
+import type { VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -63,7 +64,6 @@ const metricFpsElement = document.querySelector<HTMLSpanElement>("#metric-fps");
 const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-texture");
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
-const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-opt");
 const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
 const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
@@ -104,7 +104,6 @@ if (
   !metricTextureElement ||
   !metricGridMaxCellElement ||
   !dropIndicator ||
-  !panOptimizationToggle ||
   !segmentMergeToggle ||
   !invisibleCullToggle ||
   !strokeCurveToggle ||
@@ -147,7 +146,6 @@ const metricFpsTextElement = metricFpsElement;
 const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
 const dropIndicatorElement = dropIndicator;
-const panOptimizationToggleElement = panOptimizationToggle;
 const segmentMergeToggleElement = segmentMergeToggle;
 const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
@@ -165,7 +163,6 @@ let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
   {
-    panOptimizationToggle: panOptimizationToggleElement,
     segmentMergeToggle: segmentMergeToggleElement,
     invisibleCullToggle: invisibleCullToggleElement,
     strokeCurveToggle: strokeCurveToggleElement,
@@ -191,13 +188,13 @@ function onRendererFrame(stats: DrawStats): void {
   const total = stats.totalSegments.toLocaleString();
   const mode = stats.usedCulling ? "culled" : "full";
   const activeBackendLabel = (backendSwitcher?.getActiveBackend() ?? "webgl").toUpperCase();
+  const vectorLodSuffix = formatRuntimeVectorLodStats(renderer.getVectorStrokeLodStats?.() ?? null);
   runtimeTextElement.textContent =
-    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}`;
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}`;
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
-  rendererApi.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
   rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
@@ -380,9 +377,6 @@ exampleSelectElement.addEventListener("change", () => {
 });
 
 uiControlManager.bindEventListeners({
-  onPanOptimizationChange: (enabled) => {
-    renderer.setPanOptimizationEnabled(enabled);
-  },
   onSegmentMergeChange: () => reloadLastPdfWithCurrentOptions(),
   onInvisibleCullChange: () => reloadLastPdfWithCurrentOptions(),
   onStrokeCurveChange: (enabled) => {
@@ -1212,6 +1206,40 @@ function updateMetricsPanel(
 
 function formatPercent(value: number): string {
   return `${Math.max(0, value).toFixed(1)}%`;
+}
+
+function formatRuntimeVectorLodStats(stats: VectorStrokeLodStats | null): string {
+  if (!stats || stats.totalLevels <= 1) {
+    return "";
+  }
+
+  const activeLevels = stats.activeLevels.length > 0
+    ? stats.activeLevels
+      .map((level) => `${formatLodTolerance(level.tolerance)}:${formatCompactCount(level.renderedSegments)}`)
+      .join(" ")
+    : "none";
+
+  return (
+    ` | lod ${formatCompactCount(stats.renderedSegments)} seg` +
+    `, ${stats.visibleTileCount.toLocaleString()} tiles` +
+    `, target ${formatCompactCount(stats.targetSegmentsPerTile)}/tile` +
+    `, active ${activeLevels}`
+  );
+}
+
+function formatCompactCount(value: number): string {
+  const count = Math.max(0, Math.round(value));
+  if (count >= 1_000_000) {
+    return `${(count / 1_000_000).toFixed(1)}M`;
+  }
+  if (count >= 10_000) {
+    return `${Math.round(count / 1_000)}k`;
+  }
+  return count.toLocaleString();
+}
+
+function formatLodTolerance(tolerance: number): string {
+  return tolerance <= 0 ? "exact" : `tol${tolerance}`;
 }
 
 function updateFpsMetric(): void {

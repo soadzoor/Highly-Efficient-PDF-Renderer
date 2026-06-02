@@ -1,6 +1,12 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
+import {
+  shouldUseVectorStrokeLod,
+  VectorStrokeLodRuntime,
+  type VectorLodMode,
+  type VectorStrokeLodStats
+} from "./vectorStrokeLodCore";
 
 const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
@@ -1016,6 +1022,21 @@ interface RasterLayerGpu {
   matrix: Float32Array;
 }
 
+interface StrokeTextureSet {
+  textureA: WebGLTexture;
+  textureB: WebGLTexture;
+  textureC: WebGLTexture;
+  textureD: WebGLTexture;
+  textureWidth: number;
+  textureHeight: number;
+  ownsTextures: boolean;
+}
+
+interface VectorLodGpuLevel extends StrokeTextureSet {
+  visibleSegmentIdBuffer: WebGLBuffer;
+  visibleSegmentIdsFloat: Float32Array;
+}
+
 interface InstanceRange {
   start: number;
   count: number;
@@ -1229,6 +1250,14 @@ export class WebGlFloorplanRenderer {
   private grid: SpatialGrid | null = null;
 
   private sceneStats: SceneStats | null = null;
+
+  private vectorLodMode: VectorLodMode = "auto";
+
+  private vectorLodRuntime: VectorStrokeLodRuntime | null = null;
+
+  private vectorLodLevels: VectorLodGpuLevel[] = [];
+
+  private vectorLodStats: VectorStrokeLodStats | null = null;
 
   private allSegmentIds = new Float32Array(0);
 
@@ -1600,11 +1629,20 @@ export class WebGlFloorplanRenderer {
     gl.viewport(0, 0, viewportWidth, viewportHeight);
 
     if (options.cullingBounds) {
-      this.updateVisibleSetForBounds(options.cullingBounds, localUnitsPerPixel);
+      this.updateVisibleSetForBounds(options.cullingBounds, localUnitsPerPixel, viewportWidth, viewportHeight);
     } else {
       this.setAllPagesAndTextVisible();
-      this.usingAllSegments = true;
-      this.visibleSegmentCount = this.segmentCount;
+      if (this.vectorLodRuntime) {
+        this.updateVectorLodVisibleSet(
+          { cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: 1 / localUnitsPerPixel },
+          { width: viewportWidth, height: viewportHeight },
+          null,
+          localUnitsPerPixel
+        );
+      } else {
+        this.usingAllSegments = true;
+        this.visibleSegmentCount = this.segmentCount;
+      }
     }
 
     if (this.rasterRenderingEnabled) {
@@ -1650,6 +1688,27 @@ export class WebGlFloorplanRenderer {
 
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
+  }
+
+  setVectorLodMode(mode: VectorLodMode): void {
+    const nextMode: VectorLodMode = mode === "off" || mode === "force" ? mode : "auto";
+    if (this.vectorLodMode === nextMode) {
+      return;
+    }
+    this.vectorLodMode = nextMode;
+    if (this.scene) {
+      this.destroyVectorLodResources();
+      const vectorLodActive = this.rebuildVectorLod(this.scene);
+      this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
+      this.destroyPanCacheResources();
+      this.destroyVectorMinifyResources();
+      this.needsVisibleSetUpdate = true;
+      this.requestFrame();
+    }
+  }
+
+  getVectorStrokeLodStats(): VectorStrokeLodStats | null {
+    return this.vectorLodStats ? { ...this.vectorLodStats, activeLevels: this.vectorLodStats.activeLevels.map((level) => ({ ...level })) } : null;
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -1839,11 +1898,12 @@ export class WebGlFloorplanRenderer {
     this.isPanInteracting = false;
     this.panCacheValid = false;
     this.destroyVectorMinifyResources();
-
-    this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.destroyVectorLodResources();
     this.uploadRasterLayers(scene);
     const fillTextureStats = this.uploadFillPaths(scene);
     const textureStats = this.uploadSegments(scene);
+    const vectorLodActive = this.rebuildVectorLod(scene);
+    this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
     const textTextureStats = this.uploadTextData(scene);
     this.sceneStats = {
       gridWidth: this.grid?.gridWidth ?? 0,
@@ -2028,6 +2088,7 @@ export class WebGlFloorplanRenderer {
     this.interactionViewportProvider = null;
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
+    this.destroyVectorLodResources();
     const gl = this.gl;
     for (const layer of this.rasterLayers) {
       gl.deleteTexture(layer.texture);
@@ -2230,7 +2291,7 @@ export class WebGlFloorplanRenderer {
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (!this.panOptimizationEnabled || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
+    if (this.vectorLodRuntime || !this.panOptimizationEnabled || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
       return false;
     }
     if (this.isPanInteracting) {
@@ -2319,7 +2380,7 @@ export class WebGlFloorplanRenderer {
   }
 
   private shouldUseVectorMinifyPath(): boolean {
-    if (this.textVectorOnly || !this.hasVectorContent()) {
+    if (this.vectorLodRuntime || this.textVectorOnly || !this.hasVectorContent()) {
       return false;
     }
     if (this.textInstanceCount > 100_000 && this.segmentCount === 0) {
@@ -2667,36 +2728,106 @@ export class WebGlFloorplanRenderer {
     cameraCenterY: number,
     zoomValue = this.zoom
   ): number {
+    if (this.vectorLodRuntime && this.vectorLodLevels.length > 0) {
+      return this.drawVectorLodSegments(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+    }
+
     const instanceCount = this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount;
     if (instanceCount === 0) {
       return 0;
     }
 
+    const segmentIdBuffer = this.usingAllSegments ? this.allSegmentIdBuffer : this.visibleSegmentIdBuffer;
+    this.drawStrokeInstances(
+      {
+        textureA: this.segmentTextureA,
+        textureB: this.segmentTextureB,
+        textureC: this.segmentTextureC,
+        textureD: this.segmentTextureD,
+        textureWidth: this.segmentTextureWidth,
+        textureHeight: this.segmentTextureHeight,
+        ownsTextures: false
+      },
+      segmentIdBuffer,
+      instanceCount,
+      viewportWidth,
+      viewportHeight,
+      cameraCenterX,
+      cameraCenterY,
+      zoomValue
+    );
+
+    return instanceCount;
+  }
+
+  private drawVectorLodSegments(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): number {
+    if (!this.vectorLodRuntime) {
+      return 0;
+    }
+
+    let renderedSegments = 0;
+    for (let i = 0; i < this.vectorLodRuntime.levels.length; i += 1) {
+      const runtimeLevel = this.vectorLodRuntime.levels[i];
+      const gpuLevel = this.vectorLodLevels[i];
+      const instanceCount = Math.max(0, runtimeLevel.visibleSegmentCount | 0);
+      if (!gpuLevel || instanceCount <= 0) {
+        continue;
+      }
+      this.drawStrokeInstances(
+        gpuLevel,
+        gpuLevel.visibleSegmentIdBuffer,
+        instanceCount,
+        viewportWidth,
+        viewportHeight,
+        cameraCenterX,
+        cameraCenterY,
+        zoomValue
+      );
+      renderedSegments += instanceCount;
+    }
+    return renderedSegments;
+  }
+
+  private drawStrokeInstances(
+    textureSet: StrokeTextureSet,
+    segmentIdBuffer: WebGLBuffer,
+    instanceCount: number,
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): void {
     const gl = this.gl;
 
     gl.useProgram(this.segmentProgram);
     gl.bindVertexArray(this.segmentVao);
 
-    const segmentIdBuffer = this.usingAllSegments ? this.allSegmentIdBuffer : this.visibleSegmentIdBuffer;
     gl.bindBuffer(gl.ARRAY_BUFFER, segmentIdBuffer);
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 4, 0);
     gl.vertexAttribDivisor(1, 1);
 
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureA);
+    gl.bindTexture(gl.TEXTURE_2D, textureSet.textureA);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureB);
+    gl.bindTexture(gl.TEXTURE_2D, textureSet.textureB);
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureC);
+    gl.bindTexture(gl.TEXTURE_2D, textureSet.textureC);
     gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureD);
+    gl.bindTexture(gl.TEXTURE_2D, textureSet.textureD);
 
     gl.uniform1i(this.uSegmentTexA, 0);
     gl.uniform1i(this.uSegmentTexB, 1);
     gl.uniform1i(this.uSegmentStyleTex, 2);
     gl.uniform1i(this.uSegmentBoundsTex, 3);
-    gl.uniform2i(this.uSegmentTexSize, this.segmentTextureWidth, this.segmentTextureHeight);
+    gl.uniform2i(this.uSegmentTexSize, textureSet.textureWidth, textureSet.textureHeight);
     gl.uniform2f(this.uViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uZoom, zoomValue);
@@ -2716,8 +2847,6 @@ export class WebGlFloorplanRenderer {
     );
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
-
-    return instanceCount;
   }
 
   private drawTextInstances(
@@ -2945,7 +3074,7 @@ export class WebGlFloorplanRenderer {
       return;
     }
 
-    if (!this.hasCameraInteractionSinceSceneLoad) {
+    if (!this.vectorLodRuntime && !this.hasCameraInteractionSinceSceneLoad) {
       this.usingAllSegments = true;
       this.visibleSegmentCount = this.segmentCount;
       this.setAllPagesAndTextVisible();
@@ -2964,6 +3093,16 @@ export class WebGlFloorplanRenderer {
     const viewMaxY = viewCenterY + halfViewHeight + margin;
 
     this.updateVisiblePagesAndTextRanges(viewMinX, viewMinY, viewMaxX, viewMaxY);
+
+    if (this.vectorLodRuntime) {
+      this.updateVectorLodVisibleSet(
+        { cameraCenterX: viewCenterX, cameraCenterY: viewCenterY, zoom: safeZoom },
+        { width: viewportWidthPx, height: viewportHeightPx },
+        null,
+        1 / safeZoom
+      );
+      return;
+    }
 
     if (!this.grid) {
       this.visibleSegmentCount = 0;
@@ -3023,7 +3162,12 @@ export class WebGlFloorplanRenderer {
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
   }
 
-  private updateVisibleSetForBounds(bounds: Bounds, localUnitsPerPixel: number): void {
+  private updateVisibleSetForBounds(
+    bounds: Bounds,
+    localUnitsPerPixel: number,
+    viewportWidthPx: number = this.canvas.width,
+    viewportHeightPx: number = this.canvas.height
+  ): void {
     if (!this.scene) {
       this.visibleSegmentCount = 0;
       this.usingAllSegments = true;
@@ -3039,6 +3183,16 @@ export class WebGlFloorplanRenderer {
     const viewMaxY = bounds.maxY + margin;
 
     this.updateVisiblePagesAndTextRanges(viewMinX, viewMinY, viewMaxX, viewMaxY);
+
+    if (this.vectorLodRuntime) {
+      this.updateVectorLodVisibleSet(
+        { cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: 1 / Math.max(localUnitsPerPixel, 1e-9) },
+        { width: viewportWidthPx, height: viewportHeightPx },
+        { minX: viewMinX, minY: viewMinY, maxX: viewMaxX, maxY: viewMaxY },
+        localUnitsPerPixel
+      );
+      return;
+    }
 
     if (!this.grid) {
       this.visibleSegmentCount = 0;
@@ -3093,6 +3247,50 @@ export class WebGlFloorplanRenderer {
     const slice = this.visibleSegmentIds.subarray(0, outCount);
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.visibleSegmentIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
+  }
+
+  private updateVectorLodVisibleSet(
+    viewState: ViewState,
+    viewport: { width: number; height: number },
+    cullingBounds: Bounds | null,
+    localUnitsPerPixel: number
+  ): void {
+    if (!this.vectorLodRuntime) {
+      return;
+    }
+
+    if (this.localToClipRenderingEnabled) {
+      this.vectorLodRuntime.setLocalToClipTransform(this.localToClipMatrix, localUnitsPerPixel);
+    } else {
+      this.vectorLodRuntime.setScreenSpaceTransform();
+      this.vectorLodRuntime.updateForLocalUnitsPerPixel(localUnitsPerPixel);
+    }
+
+    this.vectorLodRuntime.update(viewState, viewport, cullingBounds);
+    this.vectorLodStats = this.vectorLodRuntime.getStats();
+    this.visibleSegmentCount = this.vectorLodStats.renderedSegments;
+    this.usingAllSegments = false;
+
+    for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
+      const runtimeLevel = this.vectorLodRuntime.levels[levelIndex];
+      const gpuLevel = this.vectorLodLevels[levelIndex];
+      if (!gpuLevel) {
+        continue;
+      }
+      const drawCount = Math.max(0, runtimeLevel.visibleSegmentCount | 0);
+      if (gpuLevel.visibleSegmentIdsFloat.length < drawCount) {
+        gpuLevel.visibleSegmentIdsFloat = new Float32Array(Math.max(1, runtimeLevel.segmentCount));
+      }
+      for (let i = 0; i < drawCount; i += 1) {
+        gpuLevel.visibleSegmentIdsFloat[i] = runtimeLevel.visibleSegmentIds[i];
+      }
+      this.gl.bindBuffer(this.gl.ARRAY_BUFFER, gpuLevel.visibleSegmentIdBuffer);
+      this.gl.bufferData(
+        this.gl.ARRAY_BUFFER,
+        gpuLevel.visibleSegmentIdsFloat.subarray(0, drawCount),
+        this.gl.DYNAMIC_DRAW
+      );
+    }
   }
 
   private setAllPagesAndTextVisible(): void {
@@ -3365,92 +3563,150 @@ export class WebGlFloorplanRenderer {
     textureHeight: number;
     maxTextureSize: number;
   } {
-    const gl = this.gl;
-    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-
-    const preferredWidth = Math.ceil(Math.sqrt(scene.segmentCount));
-    this.segmentTextureWidth = clamp(preferredWidth, 1, maxTextureSize);
-    this.segmentTextureHeight = Math.max(1, Math.ceil(scene.segmentCount / this.segmentTextureWidth));
-
-    if (this.segmentTextureHeight > maxTextureSize) {
-      throw new Error("Segment texture exceeds GPU limits for this browser/GPU.");
-    }
-
-    const texelCount = this.segmentTextureWidth * this.segmentTextureHeight;
-
-    const endpointsTextureData = new Float32Array(texelCount * 4);
-    endpointsTextureData.set(scene.endpoints);
-
-    const primitiveMetaTextureData = new Float32Array(texelCount * 4);
-    primitiveMetaTextureData.set(scene.primitiveMeta);
-
-    const styleTextureData = new Float32Array(texelCount * 4);
-    styleTextureData.set(scene.styles);
-
-    const primitiveBoundsTextureData = new Float32Array(texelCount * 4);
-    primitiveBoundsTextureData.set(scene.primitiveBounds);
-
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureA);
-    configureFloatTexture(gl);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      this.segmentTextureWidth,
-      this.segmentTextureHeight,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      endpointsTextureData
-    );
-
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureB);
-    configureFloatTexture(gl);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      this.segmentTextureWidth,
-      this.segmentTextureHeight,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      primitiveMetaTextureData
-    );
-
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureC);
-    configureFloatTexture(gl);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      this.segmentTextureWidth,
-      this.segmentTextureHeight,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      styleTextureData
-    );
-
-    gl.bindTexture(gl.TEXTURE_2D, this.segmentTextureD);
-    configureFloatTexture(gl);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      this.segmentTextureWidth,
-      this.segmentTextureHeight,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      primitiveBoundsTextureData
-    );
-
+    const textureSet = this.uploadStrokeTextureSet(scene, {
+      textureA: this.segmentTextureA,
+      textureB: this.segmentTextureB,
+      textureC: this.segmentTextureC,
+      textureD: this.segmentTextureD
+    });
+    this.segmentTextureWidth = textureSet.textureWidth;
+    this.segmentTextureHeight = textureSet.textureHeight;
     return {
       textureWidth: this.segmentTextureWidth,
       textureHeight: this.segmentTextureHeight,
-      maxTextureSize
+      maxTextureSize: textureSet.maxTextureSize
     };
+  }
+
+  private uploadStrokeTextureSet(
+    scene: VectorScene,
+    textures: {
+      textureA: WebGLTexture;
+      textureB: WebGLTexture;
+      textureC: WebGLTexture;
+      textureD: WebGLTexture;
+    }
+  ): {
+    textureWidth: number;
+    textureHeight: number;
+    maxTextureSize: number;
+  } {
+    const gl = this.gl;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    const segmentCount = Math.max(0, scene.segmentCount | 0);
+    const preferredWidth = Math.ceil(Math.sqrt(segmentCount));
+    const textureWidth = clamp(preferredWidth, 1, maxTextureSize);
+    const textureHeight = Math.max(1, Math.ceil(segmentCount / textureWidth));
+
+    if (textureHeight > maxTextureSize) {
+      throw new Error("Segment texture exceeds GPU limits for this browser/GPU.");
+    }
+
+    const texelCount = textureWidth * textureHeight;
+
+    const endpointsTextureData = new Float32Array(texelCount * 4);
+    endpointsTextureData.set(scene.endpoints.subarray(0, segmentCount * 4));
+
+    const primitiveMetaTextureData = new Float32Array(texelCount * 4);
+    primitiveMetaTextureData.set(scene.primitiveMeta.subarray(0, segmentCount * 4));
+
+    const styleTextureData = new Float32Array(texelCount * 4);
+    styleTextureData.set(scene.styles.subarray(0, segmentCount * 4));
+
+    const primitiveBoundsTextureData = new Float32Array(texelCount * 4);
+    primitiveBoundsTextureData.set(scene.primitiveBounds.subarray(0, segmentCount * 4));
+
+    gl.bindTexture(gl.TEXTURE_2D, textures.textureA);
+    configureFloatTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, endpointsTextureData);
+
+    gl.bindTexture(gl.TEXTURE_2D, textures.textureB);
+    configureFloatTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, primitiveMetaTextureData);
+
+    gl.bindTexture(gl.TEXTURE_2D, textures.textureC);
+    configureFloatTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, styleTextureData);
+
+    gl.bindTexture(gl.TEXTURE_2D, textures.textureD);
+    configureFloatTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, primitiveBoundsTextureData);
+
+    return { textureWidth, textureHeight, maxTextureSize };
+  }
+
+  private rebuildVectorLod(scene: VectorScene): boolean {
+    this.vectorLodRuntime = shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)
+      ? new VectorStrokeLodRuntime(scene)
+      : null;
+    this.vectorLodStats = null;
+
+    if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
+      this.destroyVectorLodResources();
+      this.vectorLodRuntime = null;
+      return false;
+    }
+
+    this.uploadVectorLodLevels();
+    return this.vectorLodLevels.length > 1;
+  }
+
+  private uploadVectorLodLevels(): void {
+    this.destroyVectorLodResources();
+    if (!this.vectorLodRuntime) {
+      return;
+    }
+
+    for (let i = 0; i < this.vectorLodRuntime.levels.length; i += 1) {
+      const level = this.vectorLodRuntime.levels[i];
+      const visibleSegmentIdBuffer = this.mustCreateBuffer();
+      const visibleSegmentIdsFloat = new Float32Array(Math.max(1, level.segmentCount));
+      if (i === 0) {
+        this.vectorLodLevels.push({
+          textureA: this.segmentTextureA,
+          textureB: this.segmentTextureB,
+          textureC: this.segmentTextureC,
+          textureD: this.segmentTextureD,
+          textureWidth: this.segmentTextureWidth,
+          textureHeight: this.segmentTextureHeight,
+          ownsTextures: false,
+          visibleSegmentIdBuffer,
+          visibleSegmentIdsFloat
+        });
+        continue;
+      }
+
+      const textureA = this.mustCreateTexture();
+      const textureB = this.mustCreateTexture();
+      const textureC = this.mustCreateTexture();
+      const textureD = this.mustCreateTexture();
+      const textureStats = this.uploadStrokeTextureSet(level.scene, { textureA, textureB, textureC, textureD });
+      this.vectorLodLevels.push({
+        textureA,
+        textureB,
+        textureC,
+        textureD,
+        textureWidth: textureStats.textureWidth,
+        textureHeight: textureStats.textureHeight,
+        ownsTextures: true,
+        visibleSegmentIdBuffer,
+        visibleSegmentIdsFloat
+      });
+    }
+  }
+
+  private destroyVectorLodResources(): void {
+    for (const level of this.vectorLodLevels) {
+      this.gl.deleteBuffer(level.visibleSegmentIdBuffer);
+      if (level.ownsTextures) {
+        this.gl.deleteTexture(level.textureA);
+        this.gl.deleteTexture(level.textureB);
+        this.gl.deleteTexture(level.textureC);
+        this.gl.deleteTexture(level.textureD);
+      }
+    }
+    this.vectorLodLevels = [];
+    this.vectorLodStats = null;
   }
 
   private uploadTextData(scene: VectorScene): {

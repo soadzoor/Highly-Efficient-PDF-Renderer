@@ -7,7 +7,6 @@ type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColo
 type AsyncOrSync = void | Promise<void>;
 
 export interface UiControlElements {
-  panOptimizationToggle: HTMLInputElement;
   segmentMergeToggle: HTMLInputElement;
   invisibleCullToggle: HTMLInputElement;
   strokeCurveToggle: HTMLInputElement;
@@ -23,7 +22,6 @@ export interface UiControlElements {
 }
 
 export interface UiControlCallbacks {
-  onPanOptimizationChange(enabled: boolean): void;
   onSegmentMergeChange(): AsyncOrSync;
   onInvisibleCullChange(): AsyncOrSync;
   onStrokeCurveChange(enabled: boolean): void;
@@ -149,10 +147,6 @@ export function createUiControlManager(
   }
 
   function bindEventListeners(callbacks: UiControlCallbacks): void {
-    elements.panOptimizationToggle.addEventListener("change", () => {
-      callbacks.onPanOptimizationChange(elements.panOptimizationToggle.checked);
-    });
-
     elements.segmentMergeToggle.addEventListener("change", () => {
       void callbacks.onSegmentMergeChange();
     });

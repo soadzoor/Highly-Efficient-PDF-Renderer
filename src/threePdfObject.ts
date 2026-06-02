@@ -310,7 +310,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   getVectorStrokeLodStats(): VectorStrokeLodStats | null {
-    return this.vectorLodStrokeLayer?.getStats() ?? null;
+    return this.vectorLodStrokeLayer?.getStats() ?? this.renderer.getVectorStrokeLodStats?.() ?? null;
   }
 
   setViewState(viewState: ViewState): void {
@@ -2172,6 +2172,7 @@ function normalizeVectorLodMode(value: VectorLodMode | undefined): VectorLodMode
 
 function applyRendererConfig(renderer: RendererApi, config: RendererConfig): void {
   renderer.setPanOptimizationEnabled(config.panOptimizationEnabled);
+  renderer.setVectorLodMode?.(config.vectorLodMode);
   renderer.setRasterRenderingEnabled?.(true);
   renderer.setFillRenderingEnabled?.(true);
   renderer.setStrokeRenderingEnabled?.(true);
