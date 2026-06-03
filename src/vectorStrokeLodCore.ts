@@ -5,7 +5,7 @@ export type VectorLodMode = "auto" | "off" | "force";
 
 export const VECTOR_STROKE_LOD_MIN_SEGMENTS = 150_000;
 export const VECTOR_STROKE_LOD_TOLERANCES = [0.5, 1, 2, 4, 8, 16, 32] as const;
-export const VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS = 150_000;
+export const VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS = 50_000;
 
 export interface VectorStrokeLodLevelStats {
   index: number;
@@ -183,10 +183,14 @@ const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
 const LOD_RUNTIME_MAX_GRID_SIDE = 96;
 const LOD_RUNTIME_DENSITY_EDGE_MIN_TILE_RATIO = 0.22;
-const LOD_TILE_MIN_VISIBLE_SEGMENTS = 48;
-const LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS = 384;
-const LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS = 192;
-const LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS = 96;
+const LOD_RUNTIME_EDGE_CENTER_WEIGHT = 0.45;
+const LOD_RUNTIME_EDGE_ENDPOINT_WEIGHT = 0.1;
+const LOD_RUNTIME_EDGE_STYLE_BIN_WEIGHT = 3.2;
+const LOD_RUNTIME_STYLE_BIN_KEY_STRIDE = 8192;
+const LOD_TILE_MIN_VISIBLE_SEGMENTS = 24;
+const LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS = 256;
+const LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS = 128;
+const LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS = 48;
 const LOD_TILE_COARSEN_RATIO = 1.18;
 const LOD_TILE_REFINE_RATIO = 0.72;
 const LOD_TILE_PROJECTED_MIN_FACTOR = 0.1;
@@ -643,8 +647,9 @@ function createRuntimeTileEdges(
   const segmentCount = Math.max(0, scene.segmentCount | 0);
   const binCount = clampInt(tileCount * 16, 256, 4096);
   const bins = new Float64Array(binCount);
+  const styleBins = new Map<number, number>();
   const primitiveBounds = scene.primitiveBounds;
-  let weightedCount = 0;
+  let sampleCount = 0;
 
   for (let i = 0; i < segmentCount; i += 1) {
     const offset = i * 4;
@@ -656,17 +661,34 @@ function createRuntimeTileEdges(
     }
     const normalized = (center - minValue) / span;
     const bin = clampInt(Math.floor(normalized * binCount), 0, binCount - 1);
-    bins[bin] += 1;
-    weightedCount += 1;
+    const minBin = clampInt(Math.floor((Math.min(a, b) - minValue) / span * binCount), 0, binCount - 1);
+    const maxBin = clampInt(Math.floor((Math.max(a, b) - minValue) / span * binCount), 0, binCount - 1);
+    const styleKey = strokeStyleKey(scene, i);
+    bins[bin] += LOD_RUNTIME_EDGE_CENTER_WEIGHT;
+    addStyleBinSample(styleBins, styleKey, bin, 1);
+    if (minBin !== bin) {
+      bins[minBin] += LOD_RUNTIME_EDGE_ENDPOINT_WEIGHT;
+      addStyleBinSample(styleBins, styleKey, minBin, LOD_RUNTIME_EDGE_ENDPOINT_WEIGHT);
+    }
+    if (maxBin !== bin && maxBin !== minBin) {
+      bins[maxBin] += LOD_RUNTIME_EDGE_ENDPOINT_WEIGHT;
+      addStyleBinSample(styleBins, styleKey, maxBin, LOD_RUNTIME_EDGE_ENDPOINT_WEIGHT);
+    }
+    sampleCount += 1;
   }
 
-  if (weightedCount <= tileCount) {
+  if (sampleCount <= tileCount) {
     return createUniformTileEdges(minValue, maxValue, tileCount);
+  }
+
+  for (const [key, weight] of styleBins) {
+    const bin = key % LOD_RUNTIME_STYLE_BIN_KEY_STRIDE;
+    bins[bin] += Math.sqrt(Math.max(0, weight)) * LOD_RUNTIME_EDGE_STYLE_BIN_WEIGHT;
   }
 
   // Small uniform density keeps quantile edges stable through empty spans without
   // losing the density signal from clustered vectors.
-  const densityFloor = Math.max(1e-6, weightedCount / binCount * 0.015);
+  const densityFloor = Math.max(1e-6, sampleCount / binCount * 0.015);
   let totalWeight = 0;
   for (let i = 0; i < binCount; i += 1) {
     bins[i] += densityFloor;
@@ -695,6 +717,26 @@ function createRuntimeTileEdges(
   }
 
   return edges;
+}
+
+function addStyleBinSample(styleBins: Map<number, number>, styleKey: number, bin: number, weight: number): void {
+  const key = styleKey * LOD_RUNTIME_STYLE_BIN_KEY_STRIDE + bin;
+  styleBins.set(key, (styleBins.get(key) ?? 0) + weight);
+}
+
+function strokeStyleKey(scene: VectorScene, segmentIndex: number): number {
+  const offset = segmentIndex * 4;
+  const halfWidth = Math.max(0, scene.styles[offset] ?? 0);
+  const packedStyle = scene.primitiveMeta[offset + 3] ?? 0;
+  const flags = Math.max(0, Math.floor(packedStyle / STROKE_STYLE_FLAG_OFFSET + 1e-6));
+  const alpha = clamp01(packedStyle - flags * STROKE_STYLE_FLAG_OFFSET);
+  const widthKey = clampInt(Math.round(Math.log1p(halfWidth) * 32), 0, 255);
+  const styleFlagsKey = flags & (STROKE_STYLE_FLAG_HAIRLINE | STROKE_STYLE_FLAG_ROUND_CAP);
+  const alphaKey = clampInt(Math.round(alpha * 15), 0, 15);
+  const redKey = clampInt(Math.round(clamp01(scene.styles[offset + 1] ?? 0) * 31), 0, 31);
+  const greenKey = clampInt(Math.round(clamp01(scene.styles[offset + 2] ?? 0) * 31), 0, 31);
+  const blueKey = clampInt(Math.round(clamp01(scene.styles[offset + 3] ?? 0) * 31), 0, 31);
+  return (((((widthKey * 4 + styleFlagsKey) * 16 + alphaKey) * 32 + redKey) * 32 + greenKey) * 32 + blueKey);
 }
 
 function createUniformTileEdges(minValue: number, maxValue: number, tileCount: number): Float64Array {
