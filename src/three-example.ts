@@ -75,7 +75,7 @@ const searchParams = new URLSearchParams(window.location.search);
 const threeCameraDebugLogs =
   searchParams.get("heprThreeCameraDebug") === "1" ||
   searchParams.get("heprPerspectiveDebug") === "1";
-const CAMERA_FIT_PADDING = 1.06;
+const CAMERA_FIT_PADDING_PIXELS = 64;
 const MIN_OBJECT_EXTENT = 1e-3;
 const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
@@ -591,6 +591,14 @@ function resolveCanvasAspect(): number {
   return viewportWidth / viewportHeight;
 }
 
+function resolveRendererViewportPixels(): { width: number; height: number } {
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  return {
+    width: Math.max(1, Math.round(size.x)),
+    height: Math.max(1, Math.round(size.y))
+  };
+}
+
 function updatePerspectiveCameraProjection(): void {
   camera.aspect = resolveCanvasAspect();
   camera.updateProjectionMatrix();
@@ -612,8 +620,11 @@ function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: bo
   const objectWidth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.x);
   const objectHeight = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.y);
   const objectDepth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.z);
-  const paddedWidth = objectWidth * CAMERA_FIT_PADDING;
-  const paddedHeight = objectHeight * CAMERA_FIT_PADDING;
+  const viewport = resolveRendererViewportPixels();
+  const widthPaddingFactor = viewport.width / Math.max(1, viewport.width - CAMERA_FIT_PADDING_PIXELS * 2);
+  const heightPaddingFactor = viewport.height / Math.max(1, viewport.height - CAMERA_FIT_PADDING_PIXELS * 2);
+  const paddedWidth = objectWidth * widthPaddingFactor;
+  const paddedHeight = objectHeight * heightPaddingFactor;
 
   const verticalFovRadians = THREE.MathUtils.degToRad(camera.fov);
   const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, camera.aspect));

@@ -529,14 +529,17 @@ export class HeprThreePdfObject extends THREE.Group {
     let perspectiveNativeDirectHost2dPipelineEnabled = false;
     let perspectiveNativeProjectionPipelineEnabled = false;
     let perspectiveVectorPipelineEnabled = false;
+    let perspectiveVectorScreenSpacePipelineEnabled = false;
     let perspectiveOverviewTilePipelineEnabled = false;
     if (perspectiveThreeCameraMode) {
       perspectiveDerivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
+      const perspectiveScreenSpaceCompatible =
+        perspectiveDerivedView !== null && this.shouldUsePerspectiveNativeDirectHost2dPipeline(camera);
       const preferPerspectiveVectorLod = this.vectorLodStrokeLayer !== null && perspectiveDerivedView !== null;
       perspectiveNativeDirectHost2dPipelineEnabled =
         !preferPerspectiveVectorLod &&
         perspectiveDerivedView !== null &&
-        this.shouldUsePerspectiveNativeDirectHost2dPipeline(camera) &&
+        perspectiveScreenSpaceCompatible &&
         this.renderPerspectiveNativeDirectHost2dFrame(renderer, rendererViewport, perspectiveDerivedView);
       if (perspectiveNativeDirectHost2dPipelineEnabled) {
         this.setPerspectiveVectorPipelineActive(false);
@@ -562,6 +565,8 @@ export class HeprThreePdfObject extends THREE.Group {
               perspectiveDerivedView !== null &&
               this.shouldUsePerspectiveVectorPipeline(perspectiveDerivedView);
             perspectiveVectorPipelineEnabled = shouldUseVectorPipeline && this.setPerspectiveVectorPipelineActive(true);
+            perspectiveVectorScreenSpacePipelineEnabled =
+              perspectiveVectorPipelineEnabled && perspectiveScreenSpaceCompatible;
             if (!perspectiveVectorPipelineEnabled) {
               this.setPerspectiveVectorPipelineActive(false);
               if (this.directHostRendering) {
@@ -595,7 +600,9 @@ export class HeprThreePdfObject extends THREE.Group {
           const derivedView = perspectiveDerivedView;
           if (derivedView) {
             nativeViewport = derivedView.nativeViewport;
-            materialCullingBounds = derivedView.cullingBounds ?? null;
+            materialCullingBounds = perspectiveVectorScreenSpacePipelineEnabled
+              ? null
+              : derivedView.cullingBounds ?? null;
             this.resizeNativeRendererCanvas(nativeViewport);
             const previousView = this.renderer.getViewState();
             if (!isViewStateApproxEqual(previousView, derivedView.viewState)) {
@@ -679,7 +686,11 @@ export class HeprThreePdfObject extends THREE.Group {
       }
     }
 
-    const localUnitsPerPixel = this.updateMaterialLayerTransforms(camera, nativeViewport, perspectiveVectorPipelineEnabled);
+    const localUnitsPerPixel = this.updateMaterialLayerTransforms(
+      camera,
+      nativeViewport,
+      perspectiveVectorPipelineEnabled && !perspectiveVectorScreenSpacePipelineEnabled
+    );
     const strokeMaterialPipelineActive =
       perspectiveVectorPipelineEnabled ||
       (

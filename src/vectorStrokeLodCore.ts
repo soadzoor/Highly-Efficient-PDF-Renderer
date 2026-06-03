@@ -191,8 +191,9 @@ const LOD_TILE_MIN_VISIBLE_SEGMENTS = 24;
 const LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS = 256;
 const LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS = 128;
 const LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS = 48;
-const LOD_TILE_COARSEN_RATIO = 1.18;
-const LOD_TILE_REFINE_RATIO = 0.72;
+const LOD_TILE_SOFT_OVERSHOOT_RATIO = 1.65;
+const LOD_TILE_SELECTION_HYSTERESIS_RATIO = 0.18;
+const LOD_TILE_UNDERSHOOT_SCORE_WEIGHT = 1.15;
 const LOD_TILE_PROJECTED_MIN_FACTOR = 0.1;
 const LOD_TILE_PROJECTED_MAX_FACTOR = 4096;
 const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
@@ -370,32 +371,52 @@ export class VectorStrokeLodRuntime {
   }
 
   private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+    const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile);
     const previousLevelIndex = this.tileSelectedLevelIndices[tileIndex];
-    const coarsenLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_COARSEN_RATIO);
-    const refineLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_REFINE_RATIO);
 
     if (previousLevelIndex >= 0 && previousLevelIndex < this.levels.length) {
-      let nextIndex = previousLevelIndex;
-      while (nextIndex < this.levels.length - 1 && this.levels[nextIndex].tileCounts[tileIndex] > coarsenLimit) {
-        nextIndex += 1;
+      const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
+      const previousCount = this.levels[previousLevelIndex].tileCounts[tileIndex];
+      if (previousCount <= softOvershootLimit) {
+        const bestCount = this.levels[bestIndex].tileCounts[tileIndex];
+        const previousScore = tileLevelTargetScore(previousCount, targetSegmentsPerTile);
+        const bestScore = tileLevelTargetScore(bestCount, targetSegmentsPerTile);
+        const hysteresis = Math.max(2, targetSegmentsPerTile * LOD_TILE_SELECTION_HYSTERESIS_RATIO);
+        if (previousScore <= bestScore + hysteresis) {
+          return previousLevelIndex;
+        }
       }
-      while (nextIndex > 0 && this.levels[nextIndex - 1].tileCounts[tileIndex] <= refineLimit) {
-        nextIndex -= 1;
-      }
-      this.tileSelectedLevelIndices[tileIndex] = nextIndex;
-      return nextIndex;
     }
+
+    this.tileSelectedLevelIndices[tileIndex] = bestIndex;
+    return bestIndex;
+  }
+
+  private chooseTargetBalancedTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+    const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
+    let bestIndex = -1;
+    let bestScore = Number.POSITIVE_INFINITY;
+    let smallestCount = Number.POSITIVE_INFINITY;
+    let smallestCountIndex = Math.max(0, this.levels.length - 1);
 
     for (let i = 0; i < this.levels.length; i += 1) {
-      if (this.levels[i].tileCounts[tileIndex] <= coarsenLimit) {
-        this.tileSelectedLevelIndices[tileIndex] = i;
-        return i;
+      const tileSegments = this.levels[i].tileCounts[tileIndex];
+      if (tileSegments < smallestCount || (tileSegments === smallestCount && i < smallestCountIndex)) {
+        smallestCount = tileSegments;
+        smallestCountIndex = i;
+      }
+      if (tileSegments > softOvershootLimit) {
+        continue;
+      }
+
+      const score = tileLevelTargetScore(tileSegments, targetSegmentsPerTile);
+      if (score < bestScore || (score === bestScore && (bestIndex < 0 || i < bestIndex))) {
+        bestScore = score;
+        bestIndex = i;
       }
     }
 
-    const fallbackIndex = this.levels.length - 1;
-    this.tileSelectedLevelIndices[tileIndex] = fallbackIndex;
-    return fallbackIndex;
+    return bestIndex >= 0 ? bestIndex : smallestCountIndex;
   }
 
   private computeProjectedTileAreas(tileRange: RuntimeTileRange, viewport: ViewportPixels): number {
@@ -944,6 +965,11 @@ function targetSegmentsPerTileForVisibleTiles(visibleTileCount: number, baseline
     return globalTarget;
   }
   return Math.max(globalTarget, Math.ceil(Math.sqrt(globalTarget * qualityFloor)));
+}
+
+function tileLevelTargetScore(tileSegments: number, targetSegmentsPerTile: number): number {
+  const delta = tileSegments - targetSegmentsPerTile;
+  return delta >= 0 ? delta : -delta * LOD_TILE_UNDERSHOOT_SCORE_WEIGHT;
 }
 
 function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
