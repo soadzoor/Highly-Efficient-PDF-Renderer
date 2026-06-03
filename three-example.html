@@ -127,6 +127,10 @@
         display: none !important;
       }
 
+      .row[hidden] {
+        display: none !important;
+      }
+
       .loader-spinner {
         width: 14px;
         height: 14px;
@@ -169,7 +173,16 @@
           <option value="webgl" selected>WebGL</option>
           <option value="webgpu">WebGPU</option>
         </select>
+        <select id="vector-lod-select" aria-label="Vector LOD mode">
+          <option value="auto" selected>Vector LOD: Auto</option>
+          <option value="off">Vector LOD: Off</option>
+          <option value="force">Vector LOD: Force</option>
+        </select>
       </div>
+      <label id="pan-optimization-row" class="row" hidden>
+        <input id="pan-optimization-checkbox" type="checkbox" checked />
+        <span>Pan optimization</span>
+      </label>
       <div class="row">
         <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" />
       </div>
@@ -181,6 +194,14 @@
       <div class="row meter-row">
         <span class="meter-label">FPS</span>
         <span id="fps-value" class="meter-value">-</span>
+      </div>
+      <div class="row meter-row">
+        <span class="meter-label">Draw</span>
+        <span id="draw-stats-value" class="meter-value">-</span>
+      </div>
+      <div class="row meter-row">
+        <span class="meter-label">Vector LOD</span>
+        <span id="lod-stats-value" class="meter-value">-</span>
       </div>
     </div>
 

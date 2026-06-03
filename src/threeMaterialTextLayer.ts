@@ -38,6 +38,8 @@ export class ThreeMaterialTextLayer {
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
   private readonly zoomUniform: { value: number };
+  private readonly useLocalToClipUniform: { value: number };
+  private readonly localToClipUniform: THREE.Matrix4;
   private readonly curveUniform: { value: number };
   private readonly vectorOnlyUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
@@ -132,6 +134,8 @@ export class ThreeMaterialTextLayer {
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
+    this.useLocalToClipUniform = { value: 0 };
+    this.localToClipUniform = new THREE.Matrix4();
     this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
     this.vectorOnlyUniform = { value: options.textVectorOnly ? 1 : 0 };
     this.vectorOverrideUniform = new THREE.Vector4(
@@ -173,6 +177,8 @@ export class ThreeMaterialTextLayer {
         uViewport: { value: this.viewportUniform },
         uCameraCenter: { value: this.cameraCenterUniform },
         uZoom: this.zoomUniform,
+        uUseLocalToClip: this.useLocalToClipUniform,
+        uLocalToClip: { value: this.localToClipUniform },
         uTextAAScreenPx: { value: 1.25 },
         uTextCurveEnabled: this.curveUniform,
         uTextVectorOnly: this.vectorOnlyUniform,
@@ -199,6 +205,15 @@ export class ThreeMaterialTextLayer {
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
+  }
+
+  setScreenSpaceTransform(): void {
+    this.useLocalToClipUniform.value = 0;
+  }
+
+  setLocalToClipTransform(localToClip: THREE.Matrix4): void {
+    this.useLocalToClipUniform.value = 1;
+    this.localToClipUniform.copy(localToClip);
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels): void {

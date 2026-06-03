@@ -76,3 +76,14 @@ export type {
   PDFLoadProgress,
   PDFLoadStage
 } from "./loadProgress";
+
+export type {
+  VectorStrokeLodStats,
+  VectorLodMode
+} from "./vectorStrokeLod";
+
+export {
+  VECTOR_STROKE_LOD_MIN_SEGMENTS,
+  VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
+  VECTOR_STROKE_LOD_TOLERANCES
+} from "./vectorStrokeLod";

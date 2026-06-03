@@ -34,6 +34,7 @@ import {
   formatLoadProgressStage,
   type PDFLoadProgress
 } from "./loadProgress";
+import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -63,12 +64,14 @@ const metricFpsElement = document.querySelector<HTMLSpanElement>("#metric-fps");
 const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-texture");
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
-const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-opt");
 const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
 const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
 const vectorTextOnlyToggle = document.querySelector<HTMLInputElement>("#toggle-vector-text-only");
 const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
+const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-optimization");
+const panOptimizationToggleRow = document.querySelector<HTMLElement>("#toggle-pan-optimization-row");
+const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
 const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages-per-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -104,12 +107,14 @@ if (
   !metricTextureElement ||
   !metricGridMaxCellElement ||
   !dropIndicator ||
-  !panOptimizationToggle ||
   !segmentMergeToggle ||
   !invisibleCullToggle ||
   !strokeCurveToggle ||
   !vectorTextOnlyToggle ||
   !webGpuToggle ||
+  !panOptimizationToggle ||
+  !panOptimizationToggleRow ||
+  !vectorLodSelect ||
   !maxPagesPerRowInput ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -147,12 +152,14 @@ const metricFpsTextElement = metricFpsElement;
 const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
 const dropIndicatorElement = dropIndicator;
-const panOptimizationToggleElement = panOptimizationToggle;
 const segmentMergeToggleElement = segmentMergeToggle;
 const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
 const vectorTextOnlyToggleElement = vectorTextOnlyToggle;
 const webGpuToggleElement = webGpuToggle;
+const panOptimizationToggleElement = panOptimizationToggle;
+const panOptimizationToggleRowElement = panOptimizationToggleRow;
+const vectorLodSelectElement = vectorLodSelect;
 const maxPagesPerRowInputElement = maxPagesPerRowInput;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -165,12 +172,13 @@ let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
   {
-    panOptimizationToggle: panOptimizationToggleElement,
     segmentMergeToggle: segmentMergeToggleElement,
     invisibleCullToggle: invisibleCullToggleElement,
     strokeCurveToggle: strokeCurveToggleElement,
     vectorTextOnlyToggle: vectorTextOnlyToggleElement,
     webGpuToggle: webGpuToggleElement,
+    panOptimizationToggle: panOptimizationToggleElement,
+    vectorLodSelect: vectorLodSelectElement,
     maxPagesPerRowInput: maxPagesPerRowInputElement,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
@@ -191,13 +199,15 @@ function onRendererFrame(stats: DrawStats): void {
   const total = stats.totalSegments.toLocaleString();
   const mode = stats.usedCulling ? "culled" : "full";
   const activeBackendLabel = (backendSwitcher?.getActiveBackend() ?? "webgl").toUpperCase();
+  const vectorLodSuffix = formatRuntimeVectorLodStats(renderer.getVectorStrokeLodStats?.() ?? null);
   runtimeTextElement.textContent =
-    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}`;
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}`;
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
-  rendererApi.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
+  rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
+  rendererApi.setPanOptimizationEnabled(uiControlManager.readPanOptimizationInput());
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
   rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
@@ -269,6 +279,8 @@ const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
 const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
 const EXPORT_ZIP_DEFLATE_LEVEL = 9;
 const EXPORT_ENCODE_RASTER_IMAGES = true;
+const EXPORT_BUILD_OVERVIEW_TILES = true;
+const EXPORT_OVERVIEW_TILE_ENCODING = "webp" as const;
 
 type ExampleSelectionKind = "pdf" | "zip";
 
@@ -333,6 +345,7 @@ setHudCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadAllDataButtonState(false);
 uiControlManager.syncMaxPagesPerRowInputValue();
+syncPanOptimizationVisibility();
 setStatus(baseStatus);
 refreshDropIndicator();
 void loadExampleManifest();
@@ -378,9 +391,6 @@ exampleSelectElement.addEventListener("change", () => {
 });
 
 uiControlManager.bindEventListeners({
-  onPanOptimizationChange: (enabled) => {
-    renderer.setPanOptimizationEnabled(enabled);
-  },
   onSegmentMergeChange: () => reloadLastPdfWithCurrentOptions(),
   onInvisibleCullChange: () => reloadLastPdfWithCurrentOptions(),
   onStrokeCurveChange: (enabled) => {
@@ -388,6 +398,12 @@ uiControlManager.bindEventListeners({
   },
   onVectorTextOnlyChange: (enabled) => {
     renderer.setTextVectorOnly(enabled);
+  },
+  onVectorLodModeChange: (mode) => {
+    applyVectorLodMode(mode);
+  },
+  onPanOptimizationChange: (enabled) => {
+    renderer.setPanOptimizationEnabled(enabled);
   },
   onMaxPagesPerRowChange: async () => {
     if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
@@ -397,6 +413,15 @@ uiControlManager.bindEventListeners({
   },
   onWebGpuToggleChange: (enabled) => backendSwitcher?.applyPreference(enabled) ?? Promise.resolve()
 });
+
+function applyVectorLodMode(mode: VectorLodMode): void {
+  renderer.setVectorLodMode?.(mode);
+  syncPanOptimizationVisibility();
+}
+
+function syncPanOptimizationVisibility(): void {
+  panOptimizationToggleRowElement.hidden = uiControlManager.readVectorLodModeInput() !== "off";
+}
 
 canvasInteractionController.attach(canvasElement);
 
@@ -1066,7 +1091,9 @@ async function downloadParsedDataZip(): Promise<boolean> {
   const previousStatusText = statusTextElement.textContent;
 
   setDownloadDataButtonState(true, true);
-  statusTextElement.textContent = "Preparing parsed texture data zip (fast export)...";
+  statusTextElement.textContent = EXPORT_BUILD_OVERVIEW_TILES
+    ? "Preparing parsed texture data zip with WebP overview tiles..."
+    : "Preparing parsed texture data zip (fast export)...";
 
   try {
     const sceneRasterLayers = listSceneRasterLayers(scene);
@@ -1079,6 +1106,14 @@ async function downloadParsedDataZip(): Promise<boolean> {
       sceneRasterLayers,
       {
         encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
+        buildOverviewTiles: EXPORT_BUILD_OVERVIEW_TILES,
+        overviewTileEncoding: EXPORT_OVERVIEW_TILE_ENCODING,
+        overviewTileRenderConfig: {
+          pageBackground: uiControlManager.readPageBackgroundColorInput(),
+          vectorOverride: uiControlManager.readVectorColorOverrideInput(),
+          strokeCurveEnabled: strokeCurveToggleElement.checked,
+          textVectorOnly: vectorTextOnlyToggleElement.checked
+        },
         zipCompression: EXPORT_ZIP_COMPRESSION,
         zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
       }
@@ -1087,7 +1122,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
     triggerBlobDownload(selectedZip.blob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
+      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers + ${selectedZip.overviewTileCount.toLocaleString()} ${EXPORT_OVERVIEW_TILE_ENCODING.toUpperCase()} overview tiles to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
     );
     statusTextElement.textContent = previousStatusText || baseStatus;
     return true;
@@ -1200,6 +1235,40 @@ function updateMetricsPanel(
 
 function formatPercent(value: number): string {
   return `${Math.max(0, value).toFixed(1)}%`;
+}
+
+function formatRuntimeVectorLodStats(stats: VectorStrokeLodStats | null): string {
+  if (!stats || stats.totalLevels <= 1) {
+    return "";
+  }
+
+  const activeLevels = stats.activeLevels.length > 0
+    ? stats.activeLevels
+      .map((level) => `${formatLodTolerance(level.tolerance)}:${formatCompactCount(level.renderedSegments)}`)
+      .join(" ")
+    : "none";
+
+  return (
+    ` | lod ${formatCompactCount(stats.renderedSegments)} seg` +
+    `, ${stats.visibleTileCount.toLocaleString()} tiles` +
+    `, target ${formatCompactCount(stats.targetSegmentsPerTile)}/tile` +
+    `, active ${activeLevels}`
+  );
+}
+
+function formatCompactCount(value: number): string {
+  const count = Math.max(0, Math.round(value));
+  if (count >= 1_000_000) {
+    return `${(count / 1_000_000).toFixed(1)}M`;
+  }
+  if (count >= 10_000) {
+    return `${Math.round(count / 1_000)}k`;
+  }
+  return count.toLocaleString();
+}
+
+function formatLodTolerance(tolerance: number): string {
+  return tolerance <= 0 ? "exact" : `tol${tolerance}`;
 }
 
 function updateFpsMetric(): void {

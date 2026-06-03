@@ -39,11 +39,11 @@ It has since evolved beyond a floorplan-only proof of concept into a broader PDF
   - touch pan + pinch zoom
   - damping + inertia camera behavior
 - Runtime options:
-  - `Pan optimization`
   - `Segment merge`
   - `Invisible cull`
   - `Curve strokes`
   - `Vector only`
+  - analytic vector stroke LOD for large WebGL scenes
 - Export/import:
   - `Download Parsed Data` exports current scene into ZIP
   - ZIP can be reloaded directly (skips fresh PDF vector extraction)
@@ -68,6 +68,7 @@ const pdfObject = await pdfObjectGenerator(
     segmentMerge: true,
     invisibleCull: true,
     curveStrokes: true,
+    vectorLod: "auto",
     pageBackground: 0xffffff,
     vectorOverrideColor: 0xff0000
   },
@@ -91,6 +92,7 @@ Supported `source` inputs:
 Notes:
 - The wrapper uses the same native core renderer classes (`WebGlFloorplanRenderer` / `WebGpuFloorplanRenderer`) internally.
 - For best parity with the core app camera behavior, use an orthographic camera in three.js.
+- `vectorLod` defaults to `"auto"` and enables analytic multi-resolution stroke rendering for large WebGL scenes. Use `"off"` to force exact strokes or `"force"` to build LODs for smaller scenes.
 - You can call `pdfObject.fitToBounds()`, `pdfObject.getViewState()`, `pdfObject.setViewState(...)`, and `pdfObject.dispose()`.
 
 ## High-Level Architecture

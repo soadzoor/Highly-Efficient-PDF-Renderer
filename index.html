@@ -25,10 +25,6 @@
       <div id="hud-content" class="panel-content">
         <div class="toggles">
           <label class="toggle">
-            <input id="toggle-pan-opt" type="checkbox" checked />
-            <span>Pan optimization</span>
-          </label>
-          <label class="toggle">
             <input id="toggle-segment-merge" type="checkbox" checked />
             <span>Segment merge</span>
           </label>
@@ -48,6 +44,18 @@
             <input id="toggle-webgpu" type="checkbox" />
             <span>Use WebGPU (preview)</span>
           </label>
+          <label id="toggle-pan-optimization-row" class="toggle" hidden>
+            <input id="toggle-pan-optimization" type="checkbox" checked />
+            <span>Pan optimization</span>
+          </label>
+        </div>
+        <div class="number-row">
+          <label for="vector-lod-mode">Vector LOD</label>
+          <select id="vector-lod-mode">
+            <option value="auto" selected>Auto</option>
+            <option value="off">Off</option>
+            <option value="force">Force</option>
+          </select>
         </div>
         <div class="number-row">
           <label for="max-pages-per-row">Max Pages Per Row</label>

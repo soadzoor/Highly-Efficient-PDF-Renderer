@@ -1,15 +1,10 @@
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
-import {
-  CORE_STROKE_FRAGMENT_SHADER_SOURCE,
-  CORE_STROKE_VERTEX_SHADER_SOURCE
-} from "./coreShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
-interface StrokeLayerOptions {
-  strokeCurveEnabled: boolean;
+interface TriangleStrokeLayerOptions {
   vectorOverride: [number, number, number, number];
 }
 
@@ -25,13 +20,145 @@ interface CullingBounds {
   maxY: number;
 }
 
-export class ThreeMaterialStrokeLayer {
+const TRIANGLE_STROKE_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in float aSegmentIndex;
+
+uniform sampler2D uSegmentTexA;
+uniform sampler2D uSegmentTexB;
+uniform sampler2D uSegmentStyleTex;
+uniform ivec2 uSegmentTexSize;
+uniform vec2 uViewport;
+uniform vec2 uCameraCenter;
+uniform float uZoom;
+uniform float uUseLocalToClip;
+uniform mat4 uLocalToClip;
+uniform float uLocalUnitsPerPixel;
+uniform vec4 uVectorOverride;
+
+out vec4 vColor;
+out vec2 vStrokeCoord;
+flat out float vAxisLength;
+flat out float vHalfWidth;
+flat out float vAAWorld;
+flat out float vIsRoundCap;
+
+ivec2 segmentCoord(int index) {
+  int x = index % uSegmentTexSize.x;
+  int y = index / uSegmentTexSize.x;
+  return ivec2(x, y);
+}
+
+void main() {
+  int index = int(aSegmentIndex + 0.5);
+  vec4 primitiveA = texelFetch(uSegmentTexA, segmentCoord(index), 0);
+  vec4 primitiveB = texelFetch(uSegmentTexB, segmentCoord(index), 0);
+  vec4 style = texelFetch(uSegmentStyleTex, segmentCoord(index), 0);
+
+  vec2 p0 = primitiveA.xy;
+  vec2 p1 = primitiveB.xy;
+  float packedStyle = primitiveB.w;
+  float styleFlags = floor(packedStyle / 2.0 + 1e-6);
+  float alpha = packedStyle - styleFlags * 2.0;
+  bool isHairline = mod(styleFlags, 2.0) >= 0.5;
+  bool isRoundCap = mod(floor(styleFlags * 0.5), 2.0) >= 0.5;
+
+  vec2 axis = p1 - p0;
+  float axisLen = length(axis);
+  if ((axisLen <= 1e-6 && !isRoundCap) || alpha <= 0.001) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vColor = vec4(0.0);
+    vStrokeCoord = vec2(0.0);
+    vAxisLength = 0.0;
+    vHalfWidth = 0.0;
+    vAAWorld = 1.0;
+    vIsRoundCap = 0.0;
+    return;
+  }
+
+  float localUnitsPerPixel = uUseLocalToClip >= 0.5
+    ? max(uLocalUnitsPerPixel, 1e-6)
+    : (1.0 / max(uZoom, 1e-4));
+  float halfWidth = style.x;
+  if (isHairline) {
+    halfWidth = max(0.5 * localUnitsPerPixel, 1e-5);
+  }
+
+  float aaWorld = isHairline
+    ? max(0.35 * localUnitsPerPixel, 5e-5)
+    : max(localUnitsPerPixel, 0.0001);
+  float extent = halfWidth + aaWorld;
+  float capExtent = isRoundCap ? extent : aaWorld;
+  vec2 tangent = axisLen > 1e-6 ? axis / axisLen : vec2(1.0, 0.0);
+  vec2 normal = vec2(-tangent.y, tangent.x);
+  float side01 = aCorner.x * 0.5 + 0.5;
+  float lineCoord = mix(-capExtent, axisLen + capExtent, side01);
+  float crossCoord = aCorner.y * extent;
+  vec2 worldPosition = p0 + tangent * lineCoord + normal * crossCoord;
+
+  if (uUseLocalToClip >= 0.5) {
+    gl_Position = uLocalToClip * vec4(worldPosition, 0.0, 1.0);
+  } else {
+    vec2 screen = (worldPosition - uCameraCenter) * uZoom + 0.5 * uViewport;
+    vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }
+
+  vec3 color = mix(style.yzw, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+  vColor = vec4(color, alpha);
+  vStrokeCoord = vec2(lineCoord, crossCoord);
+  vAxisLength = axisLen;
+  vHalfWidth = halfWidth;
+  vAAWorld = aaWorld;
+  vIsRoundCap = isRoundCap ? 1.0 : 0.0;
+}
+`;
+
+const TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+in vec4 vColor;
+in vec2 vStrokeCoord;
+flat in float vAxisLength;
+flat in float vHalfWidth;
+flat in float vAAWorld;
+flat in float vIsRoundCap;
+out vec4 outColor;
+
+void main() {
+  if (vColor.a <= 0.001) {
+    discard;
+  }
+
+  float edgeDistance = abs(vStrokeCoord.y) - vHalfWidth;
+  if (vIsRoundCap >= 0.5) {
+    if (vStrokeCoord.x < 0.0) {
+      edgeDistance = length(vStrokeCoord) - vHalfWidth;
+    } else if (vStrokeCoord.x > vAxisLength) {
+      edgeDistance = length(vec2(vStrokeCoord.x - vAxisLength, vStrokeCoord.y)) - vHalfWidth;
+    }
+  } else {
+    edgeDistance = max(edgeDistance, max(-vStrokeCoord.x, vStrokeCoord.x - vAxisLength));
+  }
+
+  float coverage = 1.0 - smoothstep(-vAAWorld, vAAWorld, edgeDistance);
+  float alpha = coverage * vColor.a;
+  if (alpha <= 0.001) {
+    discard;
+  }
+  outColor = vec4(vColor.rgb, alpha);
+}
+`;
+
+export class ThreeTriangleStrokeLayer {
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.RawShaderMaterial>;
 
   private readonly segmentTextureA: THREE.DataTexture;
   private readonly segmentTextureB: THREE.DataTexture;
   private readonly segmentStyleTexture: THREE.DataTexture;
-  private readonly segmentBoundsTexture: THREE.DataTexture;
 
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
@@ -39,7 +166,6 @@ export class ThreeMaterialStrokeLayer {
   private readonly useLocalToClipUniform: { value: number };
   private readonly localToClipUniform: THREE.Matrix4;
   private readonly localUnitsPerPixelUniform: { value: number };
-  private readonly curveUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;
@@ -52,12 +178,11 @@ export class ThreeMaterialStrokeLayer {
   private readonly segmentMaxX: Float32Array;
   private readonly segmentMaxY: Float32Array;
   private readonly maxHalfWidth: number;
-  private drawInstanceCount: number;
   private markToken = 1;
   private usingAllSegments = true;
   private useLocalToClip = false;
 
-  constructor(scene: VectorScene, options: StrokeLayerOptions) {
+  constructor(scene: VectorScene, options: TriangleStrokeLayerOptions) {
     const segmentCount = Math.max(0, scene.segmentCount | 0);
     this.segmentCount = segmentCount;
     const segmentTextureSize = chooseSegmentTextureSize(segmentCount);
@@ -80,12 +205,6 @@ export class ThreeMaterialStrokeLayer {
       segmentTextureSize.width,
       segmentTextureSize.height
     );
-    this.segmentBoundsTexture = createSegmentDataTexture(
-      scene.primitiveBounds,
-      segmentCount,
-      segmentTextureSize.width,
-      segmentTextureSize.height
-    );
 
     this.grid = segmentCount > 0 ? buildSpatialGrid(scene) : null;
     this.segmentMarks = new Uint32Array(segmentCount);
@@ -101,9 +220,8 @@ export class ThreeMaterialStrokeLayer {
     this.segmentMaxX = expandedBounds.maxX;
     this.segmentMaxY = expandedBounds.maxY;
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
-    this.drawInstanceCount = segmentCount;
 
-    const geometry = createStrokeGeometry(this.visibleSegmentIds, segmentCount);
+    const geometry = createTriangleStrokeGeometry(this.visibleSegmentIds, segmentCount);
     this.segmentIndexAttribute = geometry.getAttribute("aSegmentIndex") as THREE.InstancedBufferAttribute;
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
@@ -111,7 +229,6 @@ export class ThreeMaterialStrokeLayer {
     this.useLocalToClipUniform = { value: 0 };
     this.localToClipUniform = new THREE.Matrix4();
     this.localUnitsPerPixelUniform = { value: 1 };
-    this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
     this.vectorOverrideUniform = new THREE.Vector4(
       options.vectorOverride[0],
       options.vectorOverride[1],
@@ -121,8 +238,8 @@ export class ThreeMaterialStrokeLayer {
 
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
-      vertexShader: normalizeCoreShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE),
+      vertexShader: normalizeCoreShaderSource(TRIANGLE_STROKE_VERTEX_SHADER_SOURCE),
+      fragmentShader: normalizeCoreShaderSource(TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE),
       transparent: true,
       depthTest: false,
       depthWrite: false,
@@ -132,7 +249,6 @@ export class ThreeMaterialStrokeLayer {
         uSegmentTexA: { value: this.segmentTextureA },
         uSegmentTexB: { value: this.segmentTextureB },
         uSegmentStyleTex: { value: this.segmentStyleTexture },
-        uSegmentBoundsTex: { value: this.segmentBoundsTexture },
         uSegmentTexSize: {
           value: new Int32Array([segmentTextureSize.width, segmentTextureSize.height])
         },
@@ -142,8 +258,6 @@ export class ThreeMaterialStrokeLayer {
         uUseLocalToClip: this.useLocalToClipUniform,
         uLocalToClip: { value: this.localToClipUniform },
         uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
-        uAAScreenPx: { value: 1.0 },
-        uStrokeCurveEnabled: this.curveUniform,
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
     });
@@ -157,19 +271,11 @@ export class ThreeMaterialStrokeLayer {
     this.mesh.visible = visible;
   }
 
-  setDrawEnabled(enabled: boolean): void {
-    this.mesh.geometry.instanceCount = enabled ? this.drawInstanceCount : 0;
-  }
-
   getRenderedSegmentCount(): number {
     if (!this.mesh.visible) {
       return 0;
     }
     return Math.max(0, this.mesh.geometry.instanceCount ?? 0);
-  }
-
-  setStrokeCurveEnabled(enabled: boolean): void {
-    this.curveUniform.value = enabled ? 1 : 0;
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
@@ -192,33 +298,10 @@ export class ThreeMaterialStrokeLayer {
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
-    this.updateFrameUniforms(viewState, viewport);
+    this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
+    this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
+    this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
     this.updateVisibleSegments(viewState, viewport, cullingBounds);
-  }
-
-  updateFrameWithVisibleSegmentIds(
-    viewState: ViewState,
-    viewport: ViewportPixels,
-    segmentIds: Uint32Array,
-    segmentIdCount: number
-  ): void {
-    this.updateFrameUniforms(viewState, viewport);
-    const outCount = Math.max(0, Math.min(segmentIdCount | 0, this.segmentCount, this.visibleSegmentIds.length));
-    for (let i = 0; i < outCount; i += 1) {
-      this.visibleSegmentIds[i] = segmentIds[i];
-    }
-    this.usingAllSegments = false;
-    this.drawInstanceCount = outCount;
-    this.mesh.geometry.instanceCount = outCount;
-    if (outCount > 0) {
-      this.segmentIndexAttribute.addUpdateRange(0, outCount);
-      this.segmentIndexAttribute.needsUpdate = true;
-    }
-  }
-
-  estimateVisibleSegmentCount(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): number {
-    const estimate = this.collectVisibleSegments(viewState, viewport, cullingBounds, false);
-    return estimate >= 0 ? estimate : this.segmentCount;
   }
 
   dispose(): void {
@@ -227,7 +310,6 @@ export class ThreeMaterialStrokeLayer {
     this.segmentTextureA.dispose();
     this.segmentTextureB.dispose();
     this.segmentStyleTexture.dispose();
-    this.segmentBoundsTexture.dispose();
   }
 
   private updateVisibleSegments(
@@ -238,17 +320,10 @@ export class ThreeMaterialStrokeLayer {
     const outCount = this.collectVisibleSegments(viewState, viewport, cullingBounds, true);
     if (outCount >= 0) {
       this.usingAllSegments = false;
-      this.drawInstanceCount = outCount;
       this.mesh.geometry.instanceCount = outCount;
       this.segmentIndexAttribute.addUpdateRange(0, outCount);
       this.segmentIndexAttribute.needsUpdate = true;
     }
-  }
-
-  private updateFrameUniforms(viewState: ViewState, viewport: ViewportPixels): void {
-    this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
-    this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
-    this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
   }
 
   private collectVisibleSegments(
@@ -355,7 +430,6 @@ export class ThreeMaterialStrokeLayer {
       this.segmentIndexAttribute.needsUpdate = true;
     }
     this.usingAllSegments = true;
-    this.drawInstanceCount = this.segmentCount;
     this.mesh.geometry.instanceCount = this.segmentCount;
   }
 }
@@ -393,9 +467,8 @@ function createSegmentDataTexture(
   return texture;
 }
 
-function createStrokeGeometry(segmentIds: Float32Array, segmentCount: number): THREE.InstancedBufferGeometry {
+function createTriangleStrokeGeometry(segmentIds: Float32Array, segmentCount: number): THREE.InstancedBufferGeometry {
   const geometry = new THREE.InstancedBufferGeometry();
-
   const corners = new Float32Array([
     -1, -1,
     1, -1,
@@ -409,7 +482,6 @@ function createStrokeGeometry(segmentIds: Float32Array, segmentCount: number): T
   segmentIndexAttribute.setUsage(THREE.DynamicDrawUsage);
   geometry.setAttribute("aSegmentIndex", segmentIndexAttribute);
   geometry.instanceCount = Math.max(0, segmentCount | 0);
-
   return geometry;
 }
 

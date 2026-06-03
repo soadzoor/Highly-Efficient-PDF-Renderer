@@ -16,6 +16,13 @@ interface ViewportPixels {
   height: number;
 }
 
+interface CullingBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
 export class ThreeMaterialFillLayer {
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.RawShaderMaterial>;
 
@@ -28,6 +35,8 @@ export class ThreeMaterialFillLayer {
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
   private readonly zoomUniform: { value: number };
+  private readonly useLocalToClipUniform: { value: number };
+  private readonly localToClipUniform: THREE.Matrix4;
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly fillPathCount: number;
   private readonly fillPathIndexAttribute: THREE.InstancedBufferAttribute;
@@ -42,6 +51,7 @@ export class ThreeMaterialFillLayer {
   private readonly sceneMaxX: number;
   private readonly sceneMaxY: number;
   private usingAllFillPaths = true;
+  private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
@@ -102,6 +112,8 @@ export class ThreeMaterialFillLayer {
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
+    this.useLocalToClipUniform = { value: 0 };
+    this.localToClipUniform = new THREE.Matrix4();
     this.vectorOverrideUniform = new THREE.Vector4(
       options.vectorOverride[0],
       options.vectorOverride[1],
@@ -133,6 +145,8 @@ export class ThreeMaterialFillLayer {
         uViewport: { value: this.viewportUniform },
         uCameraCenter: { value: this.cameraCenterUniform },
         uZoom: this.zoomUniform,
+        uUseLocalToClip: this.useLocalToClipUniform,
+        uLocalToClip: { value: this.localToClipUniform },
         uFillAAScreenPx: { value: 1.0 },
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
@@ -151,11 +165,22 @@ export class ThreeMaterialFillLayer {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }
 
-  updateFrame(viewState: ViewState, viewport: ViewportPixels): void {
+  setScreenSpaceTransform(): void {
+    this.useLocalToClip = false;
+    this.useLocalToClipUniform.value = 0;
+  }
+
+  setLocalToClipTransform(localToClip: THREE.Matrix4): void {
+    this.useLocalToClip = true;
+    this.useLocalToClipUniform.value = 1;
+    this.localToClipUniform.copy(localToClip);
+  }
+
+  updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
-    this.updateVisibleFillPaths(viewState, viewport);
+    this.updateVisibleFillPaths(viewState, viewport, cullingBounds);
   }
 
   dispose(): void {
@@ -168,7 +193,16 @@ export class ThreeMaterialFillLayer {
     this.fillSegmentTextureB.dispose();
   }
 
-  private updateVisibleFillPaths(viewState: ViewState, viewport: ViewportPixels): void {
+  private updateVisibleFillPaths(
+    viewState: ViewState,
+    viewport: ViewportPixels,
+    cullingBounds?: CullingBounds | null
+  ): void {
+    if (this.useLocalToClip && !cullingBounds) {
+      this.setAllFillPathsVisible();
+      return;
+    }
+
     if (this.fillPathCount <= 0) {
       this.setAllFillPathsVisible();
       return;
@@ -179,10 +213,18 @@ export class ThreeMaterialFillLayer {
     const halfViewHeight = Math.max(1, viewport.height) / (2 * safeZoom);
     const margin = Math.max(16 / safeZoom, 0.5);
 
-    const viewMinX = viewState.cameraCenterX - halfViewWidth - margin;
-    const viewMaxX = viewState.cameraCenterX + halfViewWidth + margin;
-    const viewMinY = viewState.cameraCenterY - halfViewHeight - margin;
-    const viewMaxY = viewState.cameraCenterY + halfViewHeight + margin;
+    const viewMinX = cullingBounds
+      ? cullingBounds.minX - margin
+      : viewState.cameraCenterX - halfViewWidth - margin;
+    const viewMaxX = cullingBounds
+      ? cullingBounds.maxX + margin
+      : viewState.cameraCenterX + halfViewWidth + margin;
+    const viewMinY = cullingBounds
+      ? cullingBounds.minY - margin
+      : viewState.cameraCenterY - halfViewHeight - margin;
+    const viewMaxY = cullingBounds
+      ? cullingBounds.maxY + margin
+      : viewState.cameraCenterY + halfViewHeight + margin;
 
     if (
       viewMinX <= this.sceneMinX &&

@@ -1,4 +1,5 @@
 import type { RendererApi } from "./rendererTypes";
+import type { VectorLodMode } from "./vectorStrokeLodCore";
 
 type ColorRgba = [number, number, number, number];
 
@@ -7,12 +8,13 @@ type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColo
 type AsyncOrSync = void | Promise<void>;
 
 export interface UiControlElements {
-  panOptimizationToggle: HTMLInputElement;
   segmentMergeToggle: HTMLInputElement;
   invisibleCullToggle: HTMLInputElement;
   strokeCurveToggle: HTMLInputElement;
   vectorTextOnlyToggle: HTMLInputElement;
   webGpuToggle: HTMLInputElement;
+  panOptimizationToggle: HTMLInputElement;
+  vectorLodSelect: HTMLSelectElement;
   maxPagesPerRowInput: HTMLInputElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
@@ -23,17 +25,20 @@ export interface UiControlElements {
 }
 
 export interface UiControlCallbacks {
-  onPanOptimizationChange(enabled: boolean): void;
   onSegmentMergeChange(): AsyncOrSync;
   onInvisibleCullChange(): AsyncOrSync;
   onStrokeCurveChange(enabled: boolean): void;
   onVectorTextOnlyChange(enabled: boolean): void;
+  onVectorLodModeChange(mode: VectorLodMode): void;
+  onPanOptimizationChange(enabled: boolean): void;
   onMaxPagesPerRowChange(maxPagesPerRow: number): AsyncOrSync;
   onWebGpuToggleChange(enabled: boolean): AsyncOrSync;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
+  readVectorLodModeInput(): VectorLodMode;
+  readPanOptimizationInput(): boolean;
   readMaxPagesPerRowInput(): number;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
@@ -52,6 +57,15 @@ export function createUiControlManager(
       return 10;
     }
     return clamp(parsed, 1, 100);
+  }
+
+  function readVectorLodModeInput(): VectorLodMode {
+    const value = elements.vectorLodSelect.value;
+    return value === "off" || value === "force" ? value : "auto";
+  }
+
+  function readPanOptimizationInput(): boolean {
+    return elements.panOptimizationToggle.checked;
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -149,10 +163,6 @@ export function createUiControlManager(
   }
 
   function bindEventListeners(callbacks: UiControlCallbacks): void {
-    elements.panOptimizationToggle.addEventListener("change", () => {
-      callbacks.onPanOptimizationChange(elements.panOptimizationToggle.checked);
-    });
-
     elements.segmentMergeToggle.addEventListener("change", () => {
       void callbacks.onSegmentMergeChange();
     });
@@ -167,6 +177,14 @@ export function createUiControlManager(
 
     elements.vectorTextOnlyToggle.addEventListener("change", () => {
       callbacks.onVectorTextOnlyChange(elements.vectorTextOnlyToggle.checked);
+    });
+
+    elements.vectorLodSelect.addEventListener("change", () => {
+      callbacks.onVectorLodModeChange(readVectorLodModeInput());
+    });
+
+    elements.panOptimizationToggle.addEventListener("change", () => {
+      callbacks.onPanOptimizationChange(readPanOptimizationInput());
     });
 
     elements.pageBackgroundColorInput.addEventListener("input", () => {
@@ -214,6 +232,8 @@ export function createUiControlManager(
 
   return {
     bindEventListeners,
+    readVectorLodModeInput,
+    readPanOptimizationInput,
     readMaxPagesPerRowInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,

@@ -113,6 +113,10 @@ body {
   width: 100%;
 }
 
+.number-row select {
+  width: 100%;
+}
+
 .number-row input[type="color"] {
   width: 44px;
   height: 28px;
@@ -164,6 +168,10 @@ body {
   color: #1f2937;
   font-size: 0.84rem;
   user-select: none;
+}
+
+.toggle[hidden] {
+  display: none !important;
 }
 
 .toggle input {

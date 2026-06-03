@@ -30,7 +30,8 @@
     "build:all": "npm run build:app && npm run build:lib",
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
-    "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-example-assets.ts"
+    "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
+    "prepublishOnly": "npm run build:all"
   },
   "peerDependencies": {
     "three": ">=0.170.0"
