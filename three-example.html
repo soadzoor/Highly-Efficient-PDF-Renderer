@@ -127,6 +127,10 @@
         display: none !important;
       }
 
+      .row[hidden] {
+        display: none !important;
+      }
+
       .loader-spinner {
         width: 14px;
         height: 14px;
@@ -175,6 +179,10 @@
           <option value="force">Vector LOD: Force</option>
         </select>
       </div>
+      <label id="pan-optimization-row" class="row" hidden>
+        <input id="pan-optimization-checkbox" type="checkbox" checked />
+        <span>Pan optimization</span>
+      </label>
       <div class="row">
         <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" />
       </div>

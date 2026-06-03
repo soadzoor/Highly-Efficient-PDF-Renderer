@@ -24,6 +24,8 @@ const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
+const panOptimizationCheckbox = document.querySelector<HTMLInputElement>("#pan-optimization-checkbox");
+const panOptimizationRow = document.querySelector<HTMLElement>("#pan-optimization-row");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
 const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
@@ -39,6 +41,8 @@ if (
   !exampleSelect ||
   !backendSelect ||
   !vectorLodSelect ||
+  !panOptimizationCheckbox ||
+  !panOptimizationRow ||
   !statusElement ||
   !parseLoader ||
   !parseLoaderText ||
@@ -56,6 +60,8 @@ const fileInputElement = fileInput;
 const exampleSelectElement = exampleSelect;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
+const panOptimizationCheckboxElement = panOptimizationCheckbox;
+const panOptimizationRowElement = panOptimizationRow;
 const statusElementNode = statusElement;
 const parseLoaderElement = parseLoader;
 const parseLoaderTextElement = parseLoaderText;
@@ -162,6 +168,7 @@ controls.addEventListener("change", () => {
 });
 
 requestRender();
+syncPanOptimizationVisibility();
 
 window.addEventListener("resize", () => {
   renderer.setPixelRatio(window.devicePixelRatio || 1);
@@ -216,6 +223,7 @@ backendSelectElement.addEventListener("change", () => {
 
 vectorLodSelectElement.addEventListener("change", () => {
   const vectorLod = readVectorLodMode();
+  syncPanOptimizationVisibility();
   if (!lastLoadedSource) {
     setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}. Load a source to render.`);
     return;
@@ -224,6 +232,14 @@ vectorLodSelectElement.addEventListener("change", () => {
   setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}.`);
   updateDrawStatsMeter();
   updateLodStatsMeter();
+  requestRender();
+}, { signal: lifetimeSignal });
+
+panOptimizationCheckboxElement.addEventListener("change", () => {
+  const enabled = readPanOptimizationEnabled();
+  currentPdfObject?.setPanOptimizationEnabled(enabled);
+  setStatus(`Pan optimization ${enabled ? "enabled" : "disabled"}.`);
+  updateDrawStatsMeter();
   requestRender();
 }, { signal: lifetimeSignal });
 
@@ -259,11 +275,13 @@ async function loadSource(source: File | string): Promise<void> {
   const useWebGpuMaterialPipeline = backend === "webgpu";
   const sourceLabel = typeof source === "string" ? source : source.name;
   const vectorLod = readVectorLodMode();
+  const panOptimization = readPanOptimizationEnabled();
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "Parsing / loading 0.00%");
   loadSourceButtonElement.disabled = true;
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
+  panOptimizationCheckboxElement.disabled = true;
 
   try {
     const nextObject = await pdfObjectGenerator(
@@ -274,6 +292,7 @@ async function loadSource(source: File | string): Promise<void> {
         segmentMerge: true,
         invisibleCull: true,
         curveStrokes: true,
+        panOptimization,
         vectorLod,
         experimentalMaterialRasters: useWebGpuMaterialPipeline,
         experimentalMaterialFills: useWebGpuMaterialPipeline,
@@ -309,6 +328,8 @@ async function loadSource(source: File | string): Promise<void> {
       loadSourceButtonElement.disabled = false;
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
+      panOptimizationCheckboxElement.disabled = false;
+      syncPanOptimizationVisibility();
     }
   }
 }
@@ -318,7 +339,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject): void {
   nextObject.prepareHostRendering(renderer.domElement);
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
   lastNativeDrawStats = null;
-  nextObject.renderer.setFrameListener((stats) => {
+  nextObject.setFrameListener((stats) => {
     lastNativeDrawStats = stats;
   });
   currentPdfObject = nextObject;
@@ -333,7 +354,7 @@ function disposeCurrentObject(): void {
   if (!currentPdfObject) {
     return;
   }
-  currentPdfObject.renderer.setFrameListener(null);
+  currentPdfObject.setFrameListener(null);
   currentPdfObject.renderer.setInteractionViewportProvider(null);
   scene.remove(currentPdfObject);
   currentPdfObject.dispose();
@@ -381,11 +402,12 @@ function updateDrawStatsMeter(): void {
   }
 
   const materialRenderedSegments = currentPdfObject.getRenderedStrokeSegmentCount();
-  const renderedSegments = materialRenderedSegments ?? lastNativeDrawStats?.renderedSegments ?? 0;
+  const nativeDrawStats = lastNativeDrawStats ?? currentPdfObject.getNativeDrawStats();
+  const renderedSegments = materialRenderedSegments ?? nativeDrawStats?.renderedSegments ?? 0;
   const totalSegments = currentPdfObject.sceneData.segmentCount;
   const mode = materialRenderedSegments !== null
     ? "material"
-    : lastNativeDrawStats?.usedCulling
+    : nativeDrawStats?.usedCulling
       ? "culled"
       : "full";
   setDrawStatsText(
@@ -540,6 +562,14 @@ function formatLodTolerance(tolerance: number): string {
 function readVectorLodMode(): VectorLodMode {
   const value = vectorLodSelectElement.value;
   return value === "off" || value === "force" ? value : "auto";
+}
+
+function readPanOptimizationEnabled(): boolean {
+  return panOptimizationCheckboxElement.checked;
+}
+
+function syncPanOptimizationVisibility(): void {
+  panOptimizationRowElement.hidden = readVectorLodMode() !== "off";
 }
 
 function formatVectorLodMode(mode: VectorLodMode): string {

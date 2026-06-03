@@ -69,6 +69,8 @@ const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-in
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
 const vectorTextOnlyToggle = document.querySelector<HTMLInputElement>("#toggle-vector-text-only");
 const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
+const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-optimization");
+const panOptimizationToggleRow = document.querySelector<HTMLElement>("#toggle-pan-optimization-row");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
 const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages-per-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
@@ -110,6 +112,8 @@ if (
   !strokeCurveToggle ||
   !vectorTextOnlyToggle ||
   !webGpuToggle ||
+  !panOptimizationToggle ||
+  !panOptimizationToggleRow ||
   !vectorLodSelect ||
   !maxPagesPerRowInput ||
   !pageBackgroundColorInput ||
@@ -153,6 +157,8 @@ const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
 const vectorTextOnlyToggleElement = vectorTextOnlyToggle;
 const webGpuToggleElement = webGpuToggle;
+const panOptimizationToggleElement = panOptimizationToggle;
+const panOptimizationToggleRowElement = panOptimizationToggleRow;
 const vectorLodSelectElement = vectorLodSelect;
 const maxPagesPerRowInputElement = maxPagesPerRowInput;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
@@ -171,6 +177,7 @@ const uiControlManager = createUiControlManager(
     strokeCurveToggle: strokeCurveToggleElement,
     vectorTextOnlyToggle: vectorTextOnlyToggleElement,
     webGpuToggle: webGpuToggleElement,
+    panOptimizationToggle: panOptimizationToggleElement,
     vectorLodSelect: vectorLodSelectElement,
     maxPagesPerRowInput: maxPagesPerRowInputElement,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
@@ -200,6 +207,7 @@ function onRendererFrame(stats: DrawStats): void {
 function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
+  rendererApi.setPanOptimizationEnabled(uiControlManager.readPanOptimizationInput());
   rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
   rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
@@ -337,6 +345,7 @@ setHudCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadAllDataButtonState(false);
 uiControlManager.syncMaxPagesPerRowInputValue();
+syncPanOptimizationVisibility();
 setStatus(baseStatus);
 refreshDropIndicator();
 void loadExampleManifest();
@@ -393,6 +402,9 @@ uiControlManager.bindEventListeners({
   onVectorLodModeChange: (mode) => {
     applyVectorLodMode(mode);
   },
+  onPanOptimizationChange: (enabled) => {
+    renderer.setPanOptimizationEnabled(enabled);
+  },
   onMaxPagesPerRowChange: async () => {
     if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
       return;
@@ -404,6 +416,11 @@ uiControlManager.bindEventListeners({
 
 function applyVectorLodMode(mode: VectorLodMode): void {
   renderer.setVectorLodMode?.(mode);
+  syncPanOptimizationVisibility();
+}
+
+function syncPanOptimizationVisibility(): void {
+  panOptimizationToggleRowElement.hidden = uiControlManager.readVectorLodModeInput() !== "off";
 }
 
 canvasInteractionController.attach(canvasElement);

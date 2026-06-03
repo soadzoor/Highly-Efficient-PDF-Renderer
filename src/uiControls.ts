@@ -13,6 +13,7 @@ export interface UiControlElements {
   strokeCurveToggle: HTMLInputElement;
   vectorTextOnlyToggle: HTMLInputElement;
   webGpuToggle: HTMLInputElement;
+  panOptimizationToggle: HTMLInputElement;
   vectorLodSelect: HTMLSelectElement;
   maxPagesPerRowInput: HTMLInputElement;
   pageBackgroundColorInput: HTMLInputElement;
@@ -29,6 +30,7 @@ export interface UiControlCallbacks {
   onStrokeCurveChange(enabled: boolean): void;
   onVectorTextOnlyChange(enabled: boolean): void;
   onVectorLodModeChange(mode: VectorLodMode): void;
+  onPanOptimizationChange(enabled: boolean): void;
   onMaxPagesPerRowChange(maxPagesPerRow: number): AsyncOrSync;
   onWebGpuToggleChange(enabled: boolean): AsyncOrSync;
 }
@@ -36,6 +38,7 @@ export interface UiControlCallbacks {
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
   readVectorLodModeInput(): VectorLodMode;
+  readPanOptimizationInput(): boolean;
   readMaxPagesPerRowInput(): number;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
@@ -59,6 +62,10 @@ export function createUiControlManager(
   function readVectorLodModeInput(): VectorLodMode {
     const value = elements.vectorLodSelect.value;
     return value === "off" || value === "force" ? value : "auto";
+  }
+
+  function readPanOptimizationInput(): boolean {
+    return elements.panOptimizationToggle.checked;
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -176,6 +183,10 @@ export function createUiControlManager(
       callbacks.onVectorLodModeChange(readVectorLodModeInput());
     });
 
+    elements.panOptimizationToggle.addEventListener("change", () => {
+      callbacks.onPanOptimizationChange(readPanOptimizationInput());
+    });
+
     elements.pageBackgroundColorInput.addEventListener("input", () => {
       applyPageBackgroundColorFromControls();
     });
@@ -222,6 +233,7 @@ export function createUiControlManager(
   return {
     bindEventListeners,
     readVectorLodModeInput,
+    readPanOptimizationInput,
     readMaxPagesPerRowInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,

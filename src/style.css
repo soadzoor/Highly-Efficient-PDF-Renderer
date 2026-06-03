@@ -170,6 +170,10 @@ body {
   user-select: none;
 }
 
+.toggle[hidden] {
+  display: none !important;
+}
+
 .toggle input {
   margin: 0;
 }

@@ -16,7 +16,7 @@ import {
   type VectorStrokeLodStats,
   type VectorLodMode
 } from "./vectorStrokeLod";
-import { WebGlFloorplanRenderer, type ViewState } from "./webGlFloorplanRenderer";
+import { WebGlFloorplanRenderer, type DrawStats, type ViewState } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 
 const DEFAULT_FIT_PADDING_PIXELS = 64;
@@ -137,6 +137,8 @@ export class HeprThreePdfObject extends THREE.Group {
   private perspectiveVectorPipelineActive = false;
   private perspectiveNativeProjectionPipelineActive = false;
   private perspectiveOverviewTilePipelineActive = false;
+  private frameListener: ((stats: DrawStats) => void) | null = null;
+  private lastNativeDrawStats: DrawStats | null = null;
   private isDisposed = false;
   private skipNextBeforeRenderCallback = false;
   private warnedThreeCameraUnsupported = false;
@@ -232,6 +234,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.dataToLocalMatrix.makeTranslation(-this.sceneCenterX, -this.sceneCenterY, 0);
     this.interactionController = createCanvasInteractionController(() => this.renderer);
     this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
+    this.attachNativeFrameListener(this.renderer);
 
     this.name = loadedScene.sourceLabel;
     this.add(this.pageMesh);
@@ -336,6 +339,14 @@ export class HeprThreePdfObject extends THREE.Group {
     return null;
   }
 
+  getNativeDrawStats(): DrawStats | null {
+    return this.lastNativeDrawStats ? { ...this.lastNativeDrawStats } : null;
+  }
+
+  setFrameListener(listener: ((stats: DrawStats) => void) | null): void {
+    this.frameListener = listener;
+  }
+
   prepareFrameForThreeRenderer(renderer: THREE.WebGLRenderer, camera: THREE.Camera): void {
     if (this.isDisposed) {
       return;
@@ -367,6 +378,14 @@ export class HeprThreePdfObject extends THREE.Group {
     this.resetRenderPipelinesAfterLayerChange();
   }
 
+  setPanOptimizationEnabled(enabled: boolean): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.rendererConfig.panOptimizationEnabled = Boolean(enabled);
+    this.renderer.setPanOptimizationEnabled(this.rendererConfig.panOptimizationEnabled);
+  }
+
   setViewState(viewState: ViewState): void {
     this.pendingInitialFit = false;
     this.renderer.setViewState(viewState);
@@ -378,6 +397,8 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     this.isDisposed = true;
     this.skipNextBeforeRenderCallback = false;
+    this.frameListener = null;
+    this.renderer.setFrameListener(null);
     this.renderer.setInteractionViewportProvider(null);
     this.renderer.dispose();
     this.pageMesh.onBeforeRender = () => {};
@@ -887,6 +908,7 @@ export class HeprThreePdfObject extends THREE.Group {
       previousRenderer.dispose();
 
       this.renderer = nextRenderer;
+      this.attachNativeFrameListener(nextRenderer);
       this.renderCanvas = hostCanvas;
       this.userData.hepr.renderer = this.renderer;
     }
@@ -1308,6 +1330,7 @@ export class HeprThreePdfObject extends THREE.Group {
       previousRenderer.dispose();
 
       this.renderer = nextRenderer;
+      this.attachNativeFrameListener(nextRenderer);
       this.renderCanvas = hostCanvas;
       this.userData.hepr.renderer = this.renderer;
     }
@@ -1449,6 +1472,7 @@ export class HeprThreePdfObject extends THREE.Group {
     previousRenderer.dispose();
 
     this.renderer = nextRenderer;
+    this.attachNativeFrameListener(nextRenderer);
     this.renderCanvas = nextCanvas;
     this.userData.hepr.renderer = this.renderer;
     this.directHostRendering = false;
@@ -2044,6 +2068,13 @@ export class HeprThreePdfObject extends THREE.Group {
     this.lastThreeCameraWarningMessage = message;
     this.lastThreeCameraWarningAtMs = now;
     console.warn(`${message} source=${this.sourceLabel}`);
+  }
+
+  private attachNativeFrameListener(renderer: RendererApi): void {
+    renderer.setFrameListener((stats) => {
+      this.lastNativeDrawStats = stats;
+      this.frameListener?.(stats);
+    });
   }
 }
 
