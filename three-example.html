@@ -198,6 +198,70 @@
         font-variant-numeric: tabular-nums;
       }
 
+      .rooms-panel {
+        margin-top: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 8px;
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .rooms-panel[hidden] {
+        display: none !important;
+      }
+
+      .rooms-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        color: rgba(232, 237, 245, 0.82);
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .rooms-count {
+        color: rgba(232, 237, 245, 0.62);
+        font-variant-numeric: tabular-nums;
+        font-weight: 400;
+      }
+
+      .rooms-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+        gap: 6px;
+        max-height: 150px;
+        margin-top: 8px;
+        overflow: auto;
+      }
+
+      .room-button {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        width: 100%;
+        min-width: 0;
+        padding: 5px 7px;
+        background: #162030;
+        color: #e8edf5;
+        font-size: 12px;
+        text-align: left;
+      }
+
+      .room-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .room-confidence {
+        color: rgba(232, 237, 245, 0.58);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+
       #parse-loader {
         display: inline-flex;
         align-items: center;
@@ -327,6 +391,13 @@
       <div class="row meter-row">
         <span class="meter-label">Vector LOD</span>
         <span id="lod-stats-value" class="meter-value">-</span>
+      </div>
+      <div id="rooms-panel" class="rooms-panel" hidden>
+        <div class="rooms-header">
+          <span>Rooms</span>
+          <span id="rooms-count" class="rooms-count">0</span>
+        </div>
+        <div id="rooms-list" class="rooms-list"></div>
       </div>
       </div>
     </div>

@@ -33,6 +33,7 @@ body {
   position: fixed;
   left: 16px;
   top: 16px;
+  z-index: 4;
   width: min(560px, calc(100vw - 32px));
   background: rgba(250, 251, 252, 0.9);
   border: 1px solid rgba(15, 23, 42, 0.16);
@@ -291,6 +292,75 @@ button:disabled {
   word-break: break-word;
 }
 
+.rooms-panel {
+  margin-top: 8px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.rooms-panel[hidden] {
+  display: none !important;
+}
+
+.rooms-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #334155;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.rooms-count {
+  color: #64748b;
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+  font-weight: 500;
+}
+
+.rooms-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 6px;
+  max-height: 150px;
+  margin-top: 8px;
+  overflow: auto;
+}
+
+.room-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border-color: rgba(15, 23, 42, 0.28);
+  background: #ffffff;
+  color: #0f172a;
+  font-size: 0.78rem;
+  text-align: left;
+}
+
+.room-button:hover {
+  background: #eef2f7;
+}
+
+.room-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-confidence {
+  color: #64748b;
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+  font-size: 0.72rem;
+}
+
 .help {
   margin-top: 6px;
   color: #475569;
@@ -299,6 +369,7 @@ button:disabled {
 .drop-indicator {
   position: fixed;
   inset: 0;
+  z-index: 6;
   display: grid;
   place-items: center;
   pointer-events: none;
@@ -316,4 +387,25 @@ button:disabled {
 
 .drop-indicator.dragging {
   background: rgba(10, 22, 40, 0.18);
+}
+
+.room-highlight {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 1;
+  pointer-events: none;
+  overflow: visible;
+  filter: drop-shadow(0 0 14px rgba(20, 184, 166, 0.6));
+  will-change: opacity;
+}
+
+.room-highlight polygon {
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.room-highlight[hidden] {
+  display: none !important;
 }

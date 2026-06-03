@@ -5,6 +5,7 @@ import {
   inferPageTextRanges,
   optimizeVectorSceneTextGlyphs,
   type Bounds,
+  type DetectedRoom,
   type RasterLayer,
   type VectorScene
 } from "./pdfVectorExtractor";
@@ -121,6 +122,7 @@ interface ParsedDataSceneEntry {
   discardedDegenerateCount?: unknown;
   discardedDuplicateCount?: unknown;
   discardedContainedCount?: unknown;
+  detectedRooms?: unknown;
   rasterLayers?: unknown;
   rasterLayerWidth?: unknown;
   rasterLayerHeight?: unknown;
@@ -313,6 +315,7 @@ export async function buildParsedDataZipBlobForLayout(
       textInstanceCount: scene.textInstanceCount,
       textGlyphCount: scene.textGlyphCount,
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
+      detectedRooms: serializeDetectedRooms(scene.detectedRooms),
       rasterLayers: serializedRasterLayers,
       rasterLayerWidth: primaryRasterLayer?.width ?? 0,
       rasterLayerHeight: primaryRasterLayer?.height ?? 0,
@@ -795,6 +798,7 @@ export async function loadSceneFromParsedDataZip(
     Math.max(1, Math.floor(pageRects.length / 4)),
     textInstanceCount
   ) ?? inferPageTextRanges(pageRects, textInstanceB, textInstanceCount);
+  const detectedRooms = parseDetectedRooms(sceneMeta.detectedRooms, pageRects);
   progress.report(0.96, { stage: "compile", sourceType: "zip" });
 
   const scene = optimizeVectorSceneTextGlyphs({
@@ -823,6 +827,8 @@ export async function loadSceneFromParsedDataZip(
     textGlyphMetaB,
     textGlyphSegmentsA,
     textGlyphSegmentsB,
+    textItems: [],
+    detectedRooms,
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
@@ -1073,6 +1079,138 @@ function mergeBounds(a: Bounds | null, b: Bounds | null): Bounds | null {
     maxX: Math.max(a.maxX, b.maxX),
     maxY: Math.max(a.maxY, b.maxY)
   };
+}
+
+function serializeDetectedRooms(rooms: DetectedRoom[] | undefined): unknown[] {
+  if (!Array.isArray(rooms) || rooms.length === 0) {
+    return [];
+  }
+  return rooms
+    .filter((room) => room && typeof room.label === "string" && room.label.trim().length > 0)
+    .map((room) => ({
+      id: room.id,
+      label: room.label,
+      bounds: serializeBounds(room.bounds),
+      labelBounds: serializeBounds(room.labelBounds),
+      polygon: serializeRoomPolygon(room.polygon),
+      confidence: room.confidence,
+      pageIndex: room.pageIndex
+    }));
+}
+
+function serializeBounds(bounds: Bounds): Bounds {
+  return {
+    minX: bounds.minX,
+    minY: bounds.minY,
+    maxX: bounds.maxX,
+    maxY: bounds.maxY
+  };
+}
+
+function parseDetectedRooms(value: unknown, pageRects: Float32Array): DetectedRoom[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const rooms: DetectedRoom[] = [];
+  const pageCount = Math.max(1, Math.floor(pageRects.length / 4));
+  for (let i = 0; i < value.length; i += 1) {
+    const raw = value[i];
+    if (!raw || typeof raw !== "object") {
+      continue;
+    }
+    const record = raw as Record<string, unknown>;
+    const label = typeof record.label === "string" ? record.label.trim() : "";
+    if (label.length === 0) {
+      continue;
+    }
+    const bounds = parseBounds(record.bounds);
+    const labelBounds = parseBounds(record.labelBounds) ?? bounds;
+    if (!bounds || !labelBounds) {
+      continue;
+    }
+    const polygon = parseRoomPolygon(record.polygon);
+    const inferredPageIndex = inferPageIndexForBounds(labelBounds, pageRects);
+    const pageIndex = Math.max(0, Math.min(pageCount - 1, readNonNegativeInt(record.pageIndex, inferredPageIndex)));
+    const id = typeof record.id === "string" && record.id.trim().length > 0
+      ? record.id
+      : `${pageIndex + 1}-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${i}`;
+    rooms.push({
+      id,
+      label,
+      bounds,
+      labelBounds,
+      ...(polygon.length >= 3 ? { polygon } : {}),
+      confidence: Math.max(0, Math.min(1, readFiniteNumber(record.confidence, 0))),
+      pageIndex
+    });
+  }
+  return rooms;
+}
+
+function serializeRoomPolygon(polygon: DetectedRoom["polygon"]): unknown[] | undefined {
+  if (!Array.isArray(polygon) || polygon.length < 3) {
+    return undefined;
+  }
+  const serialized = polygon
+    .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y))
+    .map((point) => ({ x: point.x, y: point.y }));
+  return serialized.length >= 3 ? serialized : undefined;
+}
+
+function parseRoomPolygon(value: unknown): NonNullable<DetectedRoom["polygon"]> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const polygon: NonNullable<DetectedRoom["polygon"]> = [];
+  for (const rawPoint of value) {
+    if (!rawPoint || typeof rawPoint !== "object") {
+      continue;
+    }
+    const point = rawPoint as Record<string, unknown>;
+    const x = readFiniteNumber(point.x, Number.NaN);
+    const y = readFiniteNumber(point.y, Number.NaN);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      polygon.push({ x, y });
+    }
+  }
+  return polygon.length >= 3 ? simplifyRoomPolygon(polygon) : [];
+}
+
+function simplifyRoomPolygon(polygon: NonNullable<DetectedRoom["polygon"]>): NonNullable<DetectedRoom["polygon"]> {
+  const simplified: NonNullable<DetectedRoom["polygon"]> = [];
+  for (const point of polygon) {
+    const previous = simplified[simplified.length - 1];
+    if (previous && Math.abs(previous.x - point.x) <= 1e-6 && Math.abs(previous.y - point.y) <= 1e-6) {
+      continue;
+    }
+    simplified.push(point);
+  }
+  if (simplified.length > 1) {
+    const first = simplified[0];
+    const last = simplified[simplified.length - 1];
+    if (Math.abs(first.x - last.x) <= 1e-6 && Math.abs(first.y - last.y) <= 1e-6) {
+      simplified.pop();
+    }
+  }
+  return simplified.length >= 3 ? simplified : [];
+}
+
+function inferPageIndexForBounds(bounds: Bounds, pageRects: Float32Array): number {
+  const pageCount = Math.floor(pageRects.length / 4);
+  const x = (bounds.minX + bounds.maxX) * 0.5;
+  const y = (bounds.minY + bounds.maxY) * 0.5;
+  for (let i = 0; i < pageCount; i += 1) {
+    const offset = i * 4;
+    const minX = Math.min(pageRects[offset], pageRects[offset + 2]);
+    const minY = Math.min(pageRects[offset + 1], pageRects[offset + 3]);
+    const maxX = Math.max(pageRects[offset], pageRects[offset + 2]);
+    const maxY = Math.max(pageRects[offset + 1], pageRects[offset + 3]);
+    if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+      return i;
+    }
+  }
+  return 0;
 }
 
 function parseBounds(value: unknown): Bounds | null {

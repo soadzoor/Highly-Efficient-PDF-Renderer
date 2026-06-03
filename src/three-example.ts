@@ -18,6 +18,7 @@ import {
   type NormalizedExampleEntry
 } from "./exampleManifest";
 import { formatLoadProgressStage } from "./loadProgress";
+import type { Bounds, DetectedRoom, RoomPolygonPoint } from "./pdfVectorExtractor";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const panel = document.querySelector<HTMLDivElement>("#panel");
@@ -46,6 +47,9 @@ const timesValue = document.querySelector<HTMLSpanElement>("#times-value");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
+const roomsPanel = document.querySelector<HTMLDivElement>("#rooms-panel");
+const roomsCount = document.querySelector<HTMLSpanElement>("#rooms-count");
+const roomsList = document.querySelector<HTMLDivElement>("#rooms-list");
 
 if (
   !canvas ||
@@ -74,7 +78,10 @@ if (
   !timesValue ||
   !fpsValue ||
   !drawStatsValue ||
-  !lodStatsValue
+  !lodStatsValue ||
+  !roomsPanel ||
+  !roomsCount ||
+  !roomsList
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
@@ -106,6 +113,9 @@ const timesValueElement = timesValue;
 const fpsValueElement = fpsValue;
 const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
+const roomsPanelElement = roomsPanel;
+const roomsCountElement = roomsCount;
+const roomsListElement = roomsList;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
@@ -119,6 +129,10 @@ const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
 const CAMERA_CLIP_MARGIN_MULTIPLIER = 3.5;
 const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
+const ROOM_HIGHLIGHT_DURATION_MS = 3_600;
+const ROOM_HIGHLIGHT_FADE_MS = 700;
+const ROOM_HIGHLIGHT_PULSE_HZ = 1.35;
+const ROOM_HIGHLIGHT_LOCAL_Z = 0.08;
 const tempObjectBounds = new THREE.Box3();
 const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
@@ -174,6 +188,9 @@ let drawStatsLastText = "";
 let lodStatsLastText = "";
 let lastLoadTimingText = "-";
 let renderedFrameSerial = 0;
+let roomHighlightMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
+let roomHighlightAnimationFrame = 0;
+let roomHighlightStartedAt = 0;
 const pendingRenderedFrameResolvers: Array<() => void> = [];
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
@@ -356,6 +373,7 @@ async function loadSource(source: File | string): Promise<void> {
   const panOptimization = readPanOptimizationEnabled();
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
+  disposeRoomHighlight();
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "Parsing / loading 0.00%");
   setLoadControlsEnabled(false);
@@ -447,6 +465,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject): void {
 }
 
 function disposeCurrentObject(): void {
+  disposeRoomHighlight();
   if (!currentPdfObject) {
     return;
   }
@@ -462,6 +481,7 @@ function disposeCurrentObject(): void {
   timesValueElement.textContent = "-";
   setDrawStatsText("-");
   setLodStatsText("-");
+  updateRoomsPanel(null);
   requestRender();
 }
 
@@ -509,6 +529,173 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
   visibleSegmentsValueElement.textContent =
     `${visibleSegments.toLocaleString()} (${Math.max(0, totalReduction).toFixed(1)}% total reduction), fills ${sceneData.fillPathCount.toLocaleString()}, text ${sceneData.textInstanceCount.toLocaleString()} instances, pages ${sceneData.pageCount.toLocaleString()} (${sceneData.pagesPerRow.toLocaleString()}/row)`;
   timesValueElement.textContent = lastLoadTimingText;
+  updateRoomsPanel(pdfObject);
+}
+
+function updateRoomsPanel(pdfObject: HeprThreePdfObject | null): void {
+  const rooms = pdfObject?.sceneData.detectedRooms ?? [];
+  roomsListElement.innerHTML = "";
+  roomsCountElement.textContent = rooms.length.toLocaleString();
+  roomsPanelElement.hidden = rooms.length === 0;
+  for (const room of rooms) {
+    roomsListElement.append(createRoomButton(room));
+  }
+}
+
+function createRoomButton(room: DetectedRoom): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "room-button";
+  button.title = `Room ${room.label}`;
+  const label = document.createElement("span");
+  label.className = "room-label";
+  label.textContent = room.label;
+  const confidence = document.createElement("span");
+  confidence.className = "room-confidence";
+  confidence.textContent = `${Math.round(room.confidence * 100)}%`;
+  button.append(label, confidence);
+  button.addEventListener("click", () => {
+    if (!currentPdfObject) {
+      return;
+    }
+    fitCameraToPdfSceneBounds(currentPdfObject, room.bounds);
+    startRoomHighlight(currentPdfObject, room);
+  });
+  return button;
+}
+
+function startRoomHighlight(pdfObject: HeprThreePdfObject, room: DetectedRoom): void {
+  const polygon = readRoomHighlightPolygon(room);
+  if (!polygon) {
+    return;
+  }
+  const localPoints = polygon.map((point) => pdfObject.getLocalPointForScenePoint(point));
+  const center = polygonCentroid(localPoints);
+  const relativePoints = localPoints.map((point) => new THREE.Vector2(point.x - center.x, point.y - center.y));
+  if (relativePoints.length < 3 || Math.abs(THREE.ShapeUtils.area(relativePoints)) <= 1e-6) {
+    return;
+  }
+
+  const mesh = ensureRoomHighlightMesh(pdfObject);
+  const nextGeometry = new THREE.ShapeGeometry(new THREE.Shape(relativePoints));
+  mesh.geometry.dispose();
+  mesh.geometry = nextGeometry;
+  mesh.position.set(center.x, center.y, ROOM_HIGHLIGHT_LOCAL_Z);
+  mesh.scale.setScalar(1);
+  mesh.visible = true;
+  roomHighlightStartedAt = performance.now();
+  updateRoomHighlight(roomHighlightStartedAt);
+  scheduleRoomHighlightFrame();
+  requestRender();
+}
+
+function ensureRoomHighlightMesh(pdfObject: HeprThreePdfObject): THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> {
+  if (!roomHighlightMesh) {
+    const geometry = new THREE.BufferGeometry();
+    const material = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(20 / 255, 184 / 255, 166 / 255),
+      transparent: true,
+      opacity: 0.22,
+      depthTest: false,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+    roomHighlightMesh = new THREE.Mesh(geometry, material);
+    roomHighlightMesh.name = "HEPR room highlight";
+    roomHighlightMesh.renderOrder = 10_000;
+  }
+  if (roomHighlightMesh.parent !== pdfObject) {
+    roomHighlightMesh.parent?.remove(roomHighlightMesh);
+    pdfObject.add(roomHighlightMesh);
+  }
+  return roomHighlightMesh;
+}
+
+function disposeRoomHighlight(): void {
+  if (roomHighlightAnimationFrame !== 0) {
+    cancelAnimationFrame(roomHighlightAnimationFrame);
+    roomHighlightAnimationFrame = 0;
+  }
+  if (!roomHighlightMesh) {
+    return;
+  }
+  roomHighlightMesh.parent?.remove(roomHighlightMesh);
+  roomHighlightMesh.geometry.dispose();
+  roomHighlightMesh.material.dispose();
+  roomHighlightMesh = null;
+}
+
+function scheduleRoomHighlightFrame(): void {
+  if (roomHighlightAnimationFrame !== 0) {
+    return;
+  }
+  roomHighlightAnimationFrame = requestAnimationFrame((timestamp) => {
+    roomHighlightAnimationFrame = 0;
+    updateRoomHighlight(timestamp);
+    if (roomHighlightMesh?.visible) {
+      requestRender();
+      scheduleRoomHighlightFrame();
+    }
+  });
+}
+
+function updateRoomHighlight(timestamp: number): void {
+  if (!roomHighlightMesh) {
+    return;
+  }
+  const elapsed = timestamp - roomHighlightStartedAt;
+  if (elapsed >= ROOM_HIGHLIGHT_DURATION_MS) {
+    roomHighlightMesh.visible = false;
+    requestRender();
+    return;
+  }
+
+  const pulse = 0.5 + Math.sin(elapsed * 0.001 * ROOM_HIGHLIGHT_PULSE_HZ * Math.PI * 2) * 0.5;
+  const remaining = ROOM_HIGHLIGHT_DURATION_MS - elapsed;
+  const fade = Math.max(0, Math.min(1, remaining / ROOM_HIGHLIGHT_FADE_MS));
+  roomHighlightMesh.scale.setScalar(1);
+  roomHighlightMesh.material.opacity = (0.16 + pulse * 0.18) * fade;
+}
+
+function readRoomHighlightPolygon(room: DetectedRoom): RoomPolygonPoint[] | null {
+  const source = room.polygon && room.polygon.length >= 3 ? room.polygon : boundsToPolygon(room.bounds);
+  const polygon = source.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  return polygon.length >= 3 ? polygon : null;
+}
+
+function boundsToPolygon(bounds: Bounds): RoomPolygonPoint[] {
+  const normalized = normalizeBounds(bounds);
+  if (!normalized) {
+    return [];
+  }
+  return [
+    { x: normalized.minX, y: normalized.minY },
+    { x: normalized.minX, y: normalized.maxY },
+    { x: normalized.maxX, y: normalized.maxY },
+    { x: normalized.maxX, y: normalized.minY }
+  ];
+}
+
+function normalizeBounds(bounds: Bounds): Bounds | null {
+  const minX = Math.min(bounds.minX, bounds.maxX);
+  const minY = Math.min(bounds.minY, bounds.maxY);
+  const maxX = Math.max(bounds.minX, bounds.maxX);
+  const maxY = Math.max(bounds.minY, bounds.maxY);
+  if (![minX, minY, maxX, maxY].every(Number.isFinite) || maxX <= minX || maxY <= minY) {
+    return null;
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function polygonCentroid(points: Array<{ x: number; y: number }>): { x: number; y: number } {
+  let x = 0;
+  let y = 0;
+  for (const point of points) {
+    x += point.x;
+    y += point.y;
+  }
+  const count = Math.max(1, points.length);
+  return { x: x / count, y: y / count };
 }
 
 function formatLoadTiming(
@@ -818,14 +1005,27 @@ function fitCameraToPdfObject(pdfObject: HeprThreePdfObject): void {
   fitCameraToObject(pdfObject, true);
 }
 
+function fitCameraToPdfSceneBounds(pdfObject: HeprThreePdfObject, bounds: Bounds): void {
+  scene.updateMatrixWorld(true);
+  const localBox = pdfObject.getLocalBoxForSceneBounds(bounds);
+  tempObjectBounds.copy(localBox).applyMatrix4(pdfObject.matrixWorld);
+  if (tempObjectBounds.isEmpty()) {
+    return;
+  }
+  fitCameraToBox(tempObjectBounds, true);
+}
+
 function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean): void {
   scene.updateMatrixWorld(true);
   if (tempObjectBounds.setFromObject(targetObject).isEmpty()) {
     return;
   }
+  fitCameraToBox(tempObjectBounds, updateClipForTarget);
+}
 
-  tempObjectBounds.getSize(tempObjectSize);
-  tempObjectBounds.getCenter(tempObjectCenter);
+function fitCameraToBox(bounds: THREE.Box3, updateClipForTarget: boolean): void {
+  bounds.getSize(tempObjectSize);
+  bounds.getCenter(tempObjectCenter);
 
   const objectWidth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.x);
   const objectHeight = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.y);

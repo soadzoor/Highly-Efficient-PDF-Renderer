@@ -115,6 +115,14 @@ export type {
   VectorLodMode
 } from "./vectorStrokeLod";
 
+export type {
+  Bounds,
+  DetectedRoom,
+  RoomPolygonPoint,
+  SceneTextItem,
+  VectorScene
+} from "./pdfVectorExtractor";
+
 export {
   consumeVectorStrokeLodBuildTiming,
   prebuildVectorStrokeLodRuntime,

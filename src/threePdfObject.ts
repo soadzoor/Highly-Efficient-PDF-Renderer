@@ -309,6 +309,18 @@ export class HeprThreePdfObject extends THREE.Group {
     this.renderer.fitToBounds(resolveSceneFitBounds(this.sceneData), this.initialFitPaddingPixels);
   }
 
+  getLocalBoxForSceneBounds(bounds: SceneBounds): THREE.Box3 {
+    const normalized = normalizeBounds(bounds);
+    return new THREE.Box3(
+      new THREE.Vector3(normalized.minX - this.sceneCenterX, normalized.minY - this.sceneCenterY, 0),
+      new THREE.Vector3(normalized.maxX - this.sceneCenterX, normalized.maxY - this.sceneCenterY, 0)
+    );
+  }
+
+  getLocalPointForScenePoint(point: { x: number; y: number }): THREE.Vector2 {
+    return new THREE.Vector2(point.x - this.sceneCenterX, point.y - this.sceneCenterY);
+  }
+
   getViewState(): ViewState {
     return this.renderer.getViewState();
   }

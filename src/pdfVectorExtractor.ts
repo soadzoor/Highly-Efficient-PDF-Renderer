@@ -1,5 +1,6 @@
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import type { OverviewTilePyramid } from "./overviewTilePyramid";
+import { detectRooms } from "./roomDetection";
 
 const pdfJsModule = (
   typeof window === "undefined"
@@ -50,6 +51,27 @@ export interface RasterLayer {
   matrix: Float32Array;
 }
 
+export interface SceneTextItem {
+  text: string;
+  bounds: Bounds;
+  pageIndex: number;
+}
+
+export interface RoomPolygonPoint {
+  x: number;
+  y: number;
+}
+
+export interface DetectedRoom {
+  id: string;
+  label: string;
+  bounds: Bounds;
+  labelBounds: Bounds;
+  polygon?: RoomPolygonPoint[];
+  confidence: number;
+  pageIndex: number;
+}
+
 export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
@@ -78,6 +100,8 @@ export interface VectorScene {
   textGlyphMetaB: Float32Array;
   textGlyphSegmentsA: Float32Array;
   textGlyphSegmentsB: Float32Array;
+  textItems: SceneTextItem[];
+  detectedRooms: DetectedRoom[];
   rasterLayers: RasterLayer[];
   // Legacy single-layer fields kept for backward compatibility with old parsed-data ZIPs.
   rasterLayerWidth: number;
@@ -815,6 +839,8 @@ async function extractSinglePageVectors(
     textGlyphMetaB: textData.glyphMetaB,
     textGlyphSegmentsA: textData.glyphSegmentsA,
     textGlyphSegmentsB: textData.glyphSegmentsB,
+    textItems: textData.textItems,
+    detectedRooms: [],
     rasterLayers,
     rasterLayerWidth: rasterLayers[0]?.width ?? 0,
     rasterLayerHeight: rasterLayers[0]?.height ?? 0,
@@ -843,12 +869,18 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   }
 
   if (pageScenes.length === 1) {
-    return {
+    const scene = {
       ...pageScenes[0],
       pageCount: 1,
       pagesPerRow: 1,
       pageTextRanges: normalizePageTextRangesForScene(pageScenes[0])
     };
+    return scene.detectedRooms.length > 0
+      ? scene
+      : {
+        ...scene,
+        detectedRooms: detectRooms(scene)
+      };
   }
 
   const pagesPerRow = normalizePositiveInt(requestedPagesPerRow, 10, 1, 100);
@@ -917,6 +949,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
   const pageRects = new Float32Array(totalPageRectCount * 4);
   const pageTextRanges = new Uint32Array(totalPageRectCount * 2);
+  const textItems: SceneTextItem[] = [];
 
   let fillPathOffset = 0;
   let fillSegmentOffset = 0;
@@ -1003,6 +1036,14 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       textInstanceB[dst + 1] = scene.textInstanceB[src + 1] + ty;
       textInstanceB[dst + 2] = scene.textInstanceB[src + 2] + textGlyphOffset;
       textInstanceB[dst + 3] = scene.textInstanceB[src + 3];
+    }
+
+    for (const item of scene.textItems) {
+      textItems.push({
+        text: item.text,
+        bounds: offsetBounds(item.bounds, tx, ty),
+        pageIndex: pageRectOffset + Math.max(0, Math.trunc(item.pageIndex))
+      });
     }
 
     for (let i = 0; i < scene.textGlyphCount; i += 1) {
@@ -1113,6 +1154,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     textGlyphMetaB,
     textGlyphSegmentsA,
     textGlyphSegmentsB,
+    textItems,
+    detectedRooms: [],
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
@@ -1134,7 +1177,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     discardedContainedCount: totalDiscardedContainedCount
   };
 
-  return optimizeVectorSceneTextGlyphs(composedScene);
+  const optimizedScene = optimizeVectorSceneTextGlyphs(composedScene);
+  return {
+    ...optimizedScene,
+    detectedRooms: detectRooms(optimizedScene)
+  };
 }
 
 export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
@@ -1594,6 +1641,8 @@ function createEmptyVectorScene(): VectorScene {
     textGlyphMetaB: new Float32Array(0),
     textGlyphSegmentsA: new Float32Array(0),
     textGlyphSegmentsB: new Float32Array(0),
+    textItems: [],
+    detectedRooms: [],
     rasterLayers: [],
     rasterLayerWidth: 0,
     rasterLayerHeight: 0,
@@ -1788,6 +1837,7 @@ interface TextExtractResult {
   glyphSegmentCount: number;
   inPageCount: number;
   outOfPageCount: number;
+  textItems: SceneTextItem[];
   instanceA: Float32Array;
   instanceB: Float32Array;
   instanceC: Float32Array;
@@ -2922,6 +2972,7 @@ async function extractTextVectorData(
 
   let sourceTextCount = 0;
   let textBounds: Bounds | null = null;
+  const textItems: SceneTextItem[] = [];
   let inPageCount = 0;
   let outOfPageCount = 0;
 
@@ -2983,20 +3034,59 @@ async function extractTextVectorData(
     const textHScale = state.textHScale * state.fontDirection;
 
     let x = 0;
+    let runText = "";
+    let runBounds: Bounds | null = null;
+
+    const flushRun = (): void => {
+      const normalizedText = runText.replace(/\s+/g, " ").trim();
+      if (normalizedText.length > 0 && runBounds) {
+        textItems.push({
+          text: normalizedText,
+          bounds: {
+            minX: runBounds.minX - TEXT_BOUNDS_EPSILON,
+            minY: runBounds.minY - TEXT_BOUNDS_EPSILON,
+            maxX: runBounds.maxX + TEXT_BOUNDS_EPSILON,
+            maxY: runBounds.maxY + TEXT_BOUNDS_EPSILON
+          },
+          pageIndex: 0
+        });
+      }
+      runText = "";
+      runBounds = null;
+    };
+
+    const appendTextGlyph = (text: string, bounds: Bounds | null): void => {
+      if (text.length === 0) {
+        return;
+      }
+      runText += text;
+      if (bounds) {
+        runBounds = combineBounds(runBounds, bounds);
+      }
+    };
 
     for (const entry of entries) {
       if (typeof entry === "number" && Number.isFinite(entry)) {
-        x += spacingDir * entry * state.fontSize / 1000;
+        const adjustment = spacingDir * entry * state.fontSize / 1000;
+        if (Math.abs(adjustment) > Math.max(1, Math.abs(state.fontSize) * 0.45)) {
+          flushRun();
+        }
+        x += adjustment;
         continue;
       }
 
       const glyph = entry as GlyphTokenLike;
       const fontChar = typeof glyph.fontChar === "string" ? glyph.fontChar : "";
+      const glyphText = readGlyphDisplayText(glyph, fontChar);
       const width = Number(glyph.width);
       const glyphWidth = Number.isFinite(width) ? width : 0;
       const isSpace = glyph.isSpace === true;
       const skipGlyphRender = isWhitespaceGlyphToken(glyph, fontChar);
       const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
+
+      if (skipGlyphRender && glyphText.trim().length === 0 && runText.length > 0 && !runText.endsWith(" ")) {
+        runText += " ";
+      }
 
       if (!vertical && !skipGlyphRender && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
         const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
@@ -3009,6 +3099,7 @@ async function extractTextVectorData(
             textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
             textInstanceC.push(state.fillR, state.fillG, state.fillB, state.fillAlpha);
             sourceTextCount += 1;
+            appendTextGlyph(glyphText, transformedGlyphBounds);
 
             if (pageBounds) {
               if (boundsIntersect(transformedGlyphBounds, pageBounds)) {
@@ -3040,6 +3131,8 @@ async function extractTextVectorData(
         : glyphWidth * widthAdvanceScale + spacing * state.fontDirection;
       x += charWidth;
     }
+
+    flushRun();
 
     if (vertical) {
       state.textY -= x;
@@ -3265,6 +3358,7 @@ async function extractTextVectorData(
     glyphMetaB: textGlyphMetaB.toTypedArray(),
     glyphSegmentsA: textGlyphSegmentsA.toTypedArray(),
     glyphSegmentsB: textGlyphSegmentsB.toTypedArray(),
+    textItems,
     bounds: textBounds
   };
 }
@@ -3410,6 +3504,7 @@ function createEmptyTextExtractResult(): TextExtractResult {
     glyphSegmentCount: 0,
     inPageCount: 0,
     outOfPageCount: 0,
+    textItems: [],
     instanceA: new Float32Array(0),
     instanceB: new Float32Array(0),
     instanceC: new Float32Array(0),
@@ -4097,6 +4192,14 @@ function isWhitespaceGlyphToken(glyph: GlyphTokenLike, fontChar: string): boolea
   }
 
   return false;
+}
+
+function readGlyphDisplayText(glyph: GlyphTokenLike, fontChar: string): string {
+  const unicode = typeof glyph.unicode === "string" ? glyph.unicode : "";
+  if (unicode.length > 0) {
+    return unicode;
+  }
+  return fontChar;
 }
 
 function readTextEntries(value: unknown): unknown[] {

@@ -9,6 +9,8 @@ import {
   composeVectorScenesInGrid,
   extractPdfPageScenes,
   type Bounds,
+  type DetectedRoom,
+  type RoomPolygonPoint,
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
@@ -70,6 +72,9 @@ const metricTimesElement = document.querySelector<HTMLSpanElement>("#metric-time
 const metricFpsElement = document.querySelector<HTMLSpanElement>("#metric-fps");
 const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-texture");
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
+const roomsPanel = document.querySelector<HTMLDivElement>("#rooms-panel");
+const roomsCount = document.querySelector<HTMLSpanElement>("#rooms-count");
+const roomsList = document.querySelector<HTMLDivElement>("#rooms-list");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-optimization");
@@ -108,6 +113,9 @@ if (
   !metricFpsElement ||
   !metricTextureElement ||
   !metricGridMaxCellElement ||
+  !roomsPanel ||
+  !roomsCount ||
+  !roomsList ||
   !dropIndicator ||
   !backendSelect ||
   !panOptimizationToggle ||
@@ -148,6 +156,9 @@ const metricTimesTextElement = metricTimesElement;
 const metricFpsTextElement = metricFpsElement;
 const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
+const roomsPanelElement = roomsPanel;
+const roomsCountElement = roomsCount;
+const roomsListElement = roomsList;
 const dropIndicatorElement = dropIndicator;
 const backendSelectElement = backendSelect;
 const panOptimizationToggleElement = panOptimizationToggle;
@@ -271,6 +282,18 @@ const LOAD_PROGRESS_COMPILE = 0.36;
 const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
 const LOAD_PROGRESS_VECTOR_LOD_END = 0.96;
 const LOAD_PROGRESS_UPLOAD = 0.98;
+const ROOM_HIGHLIGHT_DURATION_MS = 3_600;
+const ROOM_HIGHLIGHT_FADE_MS = 700;
+const ROOM_HIGHLIGHT_PULSE_HZ = 1.35;
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const roomHighlightElement = document.createElementNS(SVG_NS, "svg");
+const roomHighlightPolygonElement = document.createElementNS(SVG_NS, "polygon");
+roomHighlightElement.classList.add("room-highlight");
+roomHighlightElement.style.display = "none";
+roomHighlightElement.setAttribute("aria-hidden", "true");
+roomHighlightElement.append(roomHighlightPolygonElement);
+document.body.append(roomHighlightElement);
 
 type ExampleSelectionKind = "pdf" | "zip";
 
@@ -286,6 +309,9 @@ let exampleManifestEntries: NormalizedExampleEntry[] = [];
 
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
+let activeRoomHighlightPolygon: RoomPolygonPoint[] | null = null;
+let roomHighlightStartedAt = 0;
+let roomHighlightAnimationFrame = 0;
 
 backendSwitcher = createBackendSwitcher({
   backendSelectElement,
@@ -612,6 +638,7 @@ async function loadParsedDataZipFile(file: File): Promise<void> {
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
   const loadStart = performance.now();
+  stopRoomHighlight();
   const extractionOptions = getExtractionOptions();
   const pageSceneOptionsKey = buildPdfPageCacheKey();
   const cachedPageScenes = getCachedPdfPageScenes(label, pageSceneOptionsKey);
@@ -742,6 +769,7 @@ async function reloadLastPdfWithCurrentOptions(): Promise<void> {
 async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
   const loadStart = performance.now();
+  stopRoomHighlight();
   const progress = createLoadProgressReporter((payload) => {
     if (activeLoadToken === loadToken) {
       updateParsingLoaderProgress(payload);
@@ -940,6 +968,142 @@ function clearLoadedStatus(): void {
   baseStatus = "";
   statusTextElement.textContent = "";
   statusTextElement.hidden = true;
+}
+
+function updateRoomsPanel(scene: VectorScene | null): void {
+  const rooms = scene?.detectedRooms ?? [];
+  if (rooms.length === 0) {
+    stopRoomHighlight();
+  }
+  roomsListElement.innerHTML = "";
+  roomsCountElement.textContent = rooms.length.toLocaleString();
+  roomsPanelElement.hidden = rooms.length === 0;
+  for (const room of rooms) {
+    roomsListElement.append(createRoomButton(room));
+  }
+}
+
+function createRoomButton(room: DetectedRoom): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "room-button";
+  button.title = `Room ${room.label}`;
+  const label = document.createElement("span");
+  label.className = "room-label";
+  label.textContent = room.label;
+  const confidence = document.createElement("span");
+  confidence.className = "room-confidence";
+  confidence.textContent = `${Math.round(room.confidence * 100)}%`;
+  button.append(label, confidence);
+  button.addEventListener("click", () => {
+    renderer.fitToBounds(room.bounds, 96);
+    startRoomHighlight(room);
+  });
+  return button;
+}
+
+function startRoomHighlight(room: DetectedRoom): void {
+  const polygon = readRoomHighlightPolygon(room);
+  if (!polygon) {
+    return;
+  }
+  activeRoomHighlightPolygon = polygon;
+  roomHighlightStartedAt = performance.now();
+  roomHighlightElement.style.display = "";
+  updateRoomHighlight(roomHighlightStartedAt);
+  scheduleRoomHighlightFrame();
+}
+
+function stopRoomHighlight(): void {
+  activeRoomHighlightPolygon = null;
+  roomHighlightElement.style.display = "none";
+  if (roomHighlightAnimationFrame !== 0) {
+    cancelAnimationFrame(roomHighlightAnimationFrame);
+    roomHighlightAnimationFrame = 0;
+  }
+}
+
+function scheduleRoomHighlightFrame(): void {
+  if (roomHighlightAnimationFrame !== 0) {
+    return;
+  }
+  roomHighlightAnimationFrame = requestAnimationFrame((timestamp) => {
+    roomHighlightAnimationFrame = 0;
+    updateRoomHighlight(timestamp);
+    if (activeRoomHighlightPolygon) {
+      scheduleRoomHighlightFrame();
+    }
+  });
+}
+
+function updateRoomHighlight(timestamp: number): void {
+  if (!activeRoomHighlightPolygon) {
+    return;
+  }
+
+  const elapsed = timestamp - roomHighlightStartedAt;
+  if (elapsed >= ROOM_HIGHLIGHT_DURATION_MS) {
+    stopRoomHighlight();
+    return;
+  }
+
+  const rect = canvasElement.getBoundingClientRect();
+  const view = renderer.getPresentedViewState();
+  const widthScale = rect.width / Math.max(1, canvasElement.width);
+  const heightScale = rect.height / Math.max(1, canvasElement.height);
+  const projectedPoints = activeRoomHighlightPolygon.map((point) => {
+    const xDevice = (point.x - view.cameraCenterX) * view.zoom + canvasElement.width * 0.5;
+    const yDevice = canvasElement.height - ((point.y - view.cameraCenterY) * view.zoom + canvasElement.height * 0.5);
+    return {
+      x: rect.left + xDevice * widthScale,
+      y: rect.top + yDevice * heightScale
+    };
+  });
+  if (projectedPoints.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) {
+    roomHighlightElement.style.display = "none";
+    return;
+  }
+
+  const pulse = 0.5 + Math.sin(elapsed * 0.001 * ROOM_HIGHLIGHT_PULSE_HZ * Math.PI * 2) * 0.5;
+  const remaining = ROOM_HIGHLIGHT_DURATION_MS - elapsed;
+  const fade = Math.max(0, Math.min(1, remaining / ROOM_HIGHLIGHT_FADE_MS));
+  roomHighlightElement.setAttribute("viewBox", `0 0 ${Math.max(1, window.innerWidth)} ${Math.max(1, window.innerHeight)}`);
+  roomHighlightElement.style.display = "";
+  roomHighlightElement.style.opacity = String(fade);
+  roomHighlightPolygonElement.setAttribute("points", projectedPoints.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" "));
+  roomHighlightPolygonElement.removeAttribute("transform");
+  roomHighlightPolygonElement.setAttribute("fill", `rgba(20, 184, 166, ${(0.14 + pulse * 0.14).toFixed(3)})`);
+  roomHighlightPolygonElement.setAttribute("stroke", `rgba(45, 212, 191, ${(0.72 + pulse * 0.24).toFixed(3)})`);
+}
+
+function readRoomHighlightPolygon(room: DetectedRoom): RoomPolygonPoint[] | null {
+  const source = room.polygon && room.polygon.length >= 3 ? room.polygon : boundsToPolygon(room.bounds);
+  const polygon = source.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  return polygon.length >= 3 ? polygon : null;
+}
+
+function boundsToPolygon(bounds: Bounds): RoomPolygonPoint[] {
+  const normalized = normalizeBounds(bounds);
+  if (!normalized) {
+    return [];
+  }
+  return [
+    { x: normalized.minX, y: normalized.minY },
+    { x: normalized.minX, y: normalized.maxY },
+    { x: normalized.maxX, y: normalized.maxY },
+    { x: normalized.maxX, y: normalized.minY }
+  ];
+}
+
+function normalizeBounds(bounds: Bounds): Bounds | null {
+  const minX = Math.min(bounds.minX, bounds.maxX);
+  const minY = Math.min(bounds.minY, bounds.maxY);
+  const maxX = Math.max(bounds.minX, bounds.maxX);
+  const maxY = Math.max(bounds.minY, bounds.maxY);
+  if (![minX, minY, maxX, maxY].every(Number.isFinite) || maxX <= minX || maxY <= minY) {
+    return null;
+  }
+  return { minX, minY, maxX, maxY };
 }
 
 function setParsingLoader(isVisible: boolean, text = "Parsing / loading..."): void {
@@ -1192,6 +1356,7 @@ function setMetricPlaceholder(label: string = "-"): void {
   metricTextureTextElement.textContent = "-";
   metricGridMaxCellTextElement.textContent = "-";
   metricsPanelElement.dataset.ready = "false";
+  updateRoomsPanel(null);
 }
 
 function updateMetricsPanel(
@@ -1254,6 +1419,7 @@ function updateMetricsPanel(
     `fill paths ${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight}, fill seg ${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight}, segments ${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max area ${sceneStats.maxTextureSize}x${sceneStats.maxTextureSize}), text inst ${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight}, glyph ${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight}, glyph-seg ${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight}${rasterSummary ? `, raster ${rasterSummary}` : ""}`;
   metricGridMaxCellTextElement.textContent = sceneStats.maxCellPopulation.toLocaleString();
   metricsPanelElement.dataset.ready = "true";
+  updateRoomsPanel(scene);
 }
 
 function formatPercent(value: number): string {
