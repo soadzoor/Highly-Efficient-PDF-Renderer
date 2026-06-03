@@ -49,7 +49,7 @@ export async function loadPdfSceneFromSource(
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
     const pageScenes = await extractPdfPageScenes(createParseBuffer(sourceBytes), extractOptions);
-    const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow);
+    const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
     const scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
     progress.complete({ sourceType: "pdf" });
@@ -273,9 +273,9 @@ function readSourceNameFromString(source: string): string | null {
   return name ?? trimmed;
 }
 
-function normalizePagesPerRow(value: number | undefined): number {
+function normalizePagesPerRow(value: number | undefined, pageCount: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    return 10;
+    return clamp(Math.ceil(Math.sqrt(Math.max(1, Math.trunc(pageCount)))), 1, 100);
   }
   return clamp(Math.trunc(value), 1, 100);
 }

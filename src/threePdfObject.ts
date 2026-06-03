@@ -386,6 +386,40 @@ export class HeprThreePdfObject extends THREE.Group {
     this.renderer.setPanOptimizationEnabled(this.rendererConfig.panOptimizationEnabled);
   }
 
+  setStrokeCurveEnabled(enabled: boolean): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.rendererConfig.strokeCurveEnabled = Boolean(enabled);
+    this.renderer.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+    this.vectorLodStrokeLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+    this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+    this.textMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+  }
+
+  setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.rendererConfig.pageBackground = [red, green, blue, alpha];
+    this.renderer.setPageBackgroundColor(red, green, blue, alpha);
+    this.rasterMaterialLayer?.setPageBackgroundColor(red, green, blue, alpha);
+  }
+
+  setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.rendererConfig.vectorOverride = [red, green, blue, opacity];
+    this.renderer.setVectorColorOverride(red, green, blue, opacity);
+    this.fillMaterialLayer?.setVectorOverride(red, green, blue, opacity);
+    this.vectorLodStrokeLayer?.setVectorOverride(red, green, blue, opacity);
+    this.compactedStrokeLayer?.setVectorOverride(red, green, blue, opacity);
+    this.triangleStrokeLayer?.setVectorOverride(red, green, blue, opacity);
+    this.strokeMaterialLayer?.setVectorOverride(red, green, blue, opacity);
+    this.textMaterialLayer?.setVectorOverride(red, green, blue, opacity);
+  }
+
   setViewState(viewState: ViewState): void {
     this.pendingInitialFit = false;
     this.renderer.setViewState(viewState);

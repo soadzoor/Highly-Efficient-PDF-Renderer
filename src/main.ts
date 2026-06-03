@@ -34,7 +34,13 @@ import {
   formatLoadProgressStage,
   type PDFLoadProgress
 } from "./loadProgress";
-import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
+import {
+  consumeVectorStrokeLodBuildTiming,
+  resetVectorStrokeLodBuildTiming,
+  type VectorLodMode,
+  type VectorStrokeLodBuildTiming,
+  type VectorStrokeLodStats
+} from "./vectorStrokeLodCore";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -64,15 +70,10 @@ const metricFpsElement = document.querySelector<HTMLSpanElement>("#metric-fps");
 const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-texture");
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
-const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
-const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
-const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
-const vectorTextOnlyToggle = document.querySelector<HTMLInputElement>("#toggle-vector-text-only");
-const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
+const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-optimization");
 const panOptimizationToggleRow = document.querySelector<HTMLElement>("#toggle-pan-optimization-row");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
-const maxPagesPerRowInput = document.querySelector<HTMLInputElement>("#max-pages-per-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
 const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
@@ -107,15 +108,10 @@ if (
   !metricTextureElement ||
   !metricGridMaxCellElement ||
   !dropIndicator ||
-  !segmentMergeToggle ||
-  !invisibleCullToggle ||
-  !strokeCurveToggle ||
-  !vectorTextOnlyToggle ||
-  !webGpuToggle ||
+  !backendSelect ||
   !panOptimizationToggle ||
   !panOptimizationToggleRow ||
   !vectorLodSelect ||
-  !maxPagesPerRowInput ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
   !pageBackgroundOpacityInput ||
@@ -152,15 +148,10 @@ const metricFpsTextElement = metricFpsElement;
 const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
 const dropIndicatorElement = dropIndicator;
-const segmentMergeToggleElement = segmentMergeToggle;
-const invisibleCullToggleElement = invisibleCullToggle;
-const strokeCurveToggleElement = strokeCurveToggle;
-const vectorTextOnlyToggleElement = vectorTextOnlyToggle;
-const webGpuToggleElement = webGpuToggle;
+const backendSelectElement = backendSelect;
 const panOptimizationToggleElement = panOptimizationToggle;
 const panOptimizationToggleRowElement = panOptimizationToggleRow;
 const vectorLodSelectElement = vectorLodSelect;
-const maxPagesPerRowInputElement = maxPagesPerRowInput;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
 const pageBackgroundOpacityInputElement = pageBackgroundOpacityInput;
@@ -172,14 +163,8 @@ let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
   {
-    segmentMergeToggle: segmentMergeToggleElement,
-    invisibleCullToggle: invisibleCullToggleElement,
-    strokeCurveToggle: strokeCurveToggleElement,
-    vectorTextOnlyToggle: vectorTextOnlyToggleElement,
-    webGpuToggle: webGpuToggleElement,
     panOptimizationToggle: panOptimizationToggleElement,
     vectorLodSelect: vectorLodSelectElement,
-    maxPagesPerRowInput: maxPagesPerRowInputElement,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
     pageBackgroundOpacityInput: pageBackgroundOpacityInputElement,
@@ -208,8 +193,8 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
   rendererApi.setPanOptimizationEnabled(uiControlManager.readPanOptimizationInput());
-  rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
-  rendererApi.setTextVectorOnly(vectorTextOnlyToggleElement.checked);
+  rendererApi.setStrokeCurveEnabled(true);
+  rendererApi.setTextVectorOnly(false);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
   rendererApi.setPageBackgroundColor(
     pageBackgroundColor[0],
@@ -272,7 +257,6 @@ let parsedPdfPageCache: ParsedPdfPageCache | null = null;
 
 interface LoadPdfOptions {
   preserveView?: boolean;
-  autoMaxPagesPerRow?: boolean;
 }
 
 const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
@@ -298,7 +282,7 @@ let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
 
 backendSwitcher = createBackendSwitcher({
-  webGpuToggleElement,
+  backendSelectElement,
   getRenderer: () => renderer,
   setRenderer: (nextRenderer) => {
     renderer = nextRenderer;
@@ -324,12 +308,11 @@ backendSwitcher = createBackendSwitcher({
     lastParsedSceneStats = stats;
   },
   updateMetricsAfterSwitch: (label, scene, sceneStats) => {
-    updateMetricsPanel(label, scene, sceneStats, 0, 0);
+    updateMetricsPanel(label, scene, sceneStats, 0, 0, null);
   },
   setMetricTimesText: (text) => {
     metricTimesTextElement.textContent = text;
   },
-  formatSceneStatus,
   setBaseStatus: (status) => {
     baseStatus = status;
   },
@@ -344,7 +327,6 @@ setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadAllDataButtonState(false);
-uiControlManager.syncMaxPagesPerRowInputValue();
 syncPanOptimizationVisibility();
 setStatus(baseStatus);
 refreshDropIndicator();
@@ -390,28 +372,18 @@ exampleSelectElement.addEventListener("change", () => {
   void loadExampleSelection(selectedKey);
 });
 
+backendSelectElement.addEventListener("change", () => {
+  const targetBackend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
+  void backendSwitcher?.applyPreference(targetBackend);
+});
+
 uiControlManager.bindEventListeners({
-  onSegmentMergeChange: () => reloadLastPdfWithCurrentOptions(),
-  onInvisibleCullChange: () => reloadLastPdfWithCurrentOptions(),
-  onStrokeCurveChange: (enabled) => {
-    renderer.setStrokeCurveEnabled(enabled);
-  },
-  onVectorTextOnlyChange: (enabled) => {
-    renderer.setTextVectorOnly(enabled);
-  },
   onVectorLodModeChange: (mode) => {
     applyVectorLodMode(mode);
   },
   onPanOptimizationChange: (enabled) => {
     renderer.setPanOptimizationEnabled(enabled);
-  },
-  onMaxPagesPerRowChange: async () => {
-    if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
-      return;
-    }
-    await loadPdfBuffer(createParseBuffer(lastLoadedSource.bytes), lastLoadedSource.label, { preserveView: false });
-  },
-  onWebGpuToggleChange: (enabled) => backendSwitcher?.applyPreference(enabled) ?? Promise.resolve()
+  }
 });
 
 function applyVectorLodMode(mode: VectorLodMode): void {
@@ -576,8 +548,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
         label: selection.sourceName
       };
       await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
-        preserveView: false,
-        autoMaxPagesPerRow: true
+        preserveView: false
       });
     } else {
       const zipLabel = `${selection.sourceName} (parsed zip)`;
@@ -619,7 +590,7 @@ async function loadPdfFile(file: File): Promise<void> {
   const bytes = cloneSourceBytes(buffer);
   lastLoadedSource = { kind: "pdf", bytes, label: file.name };
   parsedPdfPageCache = null;
-  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false, autoMaxPagesPerRow: true });
+  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
 }
 
 async function loadParsedDataZipFile(file: File): Promise<void> {
@@ -634,7 +605,7 @@ async function loadParsedDataZipFile(file: File): Promise<void> {
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
   const extractionOptions = getExtractionOptions();
-  const pageSceneOptionsKey = buildPdfPageCacheKey(extractionOptions);
+  const pageSceneOptionsKey = buildPdfPageCacheKey();
   const cachedPageScenes = getCachedPdfPageScenes(label, pageSceneOptionsKey);
   const progress = createLoadProgressReporter((payload) => {
     if (activeLoadToken === loadToken) {
@@ -645,20 +616,15 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
   try {
     let scene: VectorScene;
     let parseMs = 0;
-    let pagesPerRow = uiControlManager.readMaxPagesPerRowInput();
 
     if (cachedPageScenes) {
-      if (options.autoMaxPagesPerRow) {
-        pagesPerRow = computeAutoPagesPerRow(cachedPageScenes.length);
-        maxPagesPerRowInputElement.value = String(pagesPerRow);
-      }
+      const pagesPerRow = computeAutoPagesPerRow(cachedPageScenes.length);
       const composeStart = performance.now();
       progress.report(0.9, { stage: "compile", sourceType: "pdf" });
       setStatus(
         `Rearranging ${label}... (pages/row ${pagesPerRow}, using cached parsed pages)`
       );
       scene = composeVectorScenesInGrid(cachedPageScenes, pagesPerRow);
-      progress.report(0.96, { stage: "upload", sourceType: "pdf" });
       parseMs = performance.now() - composeStart;
       console.log(
         `[Page grid] ${label}: recomposed ${cachedPageScenes.length.toLocaleString()} cached page scenes at ${pagesPerRow.toLocaleString()} pages/row in ${parseMs.toFixed(1)} ms`
@@ -683,13 +649,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
         return;
       }
 
-      if (options.autoMaxPagesPerRow) {
-        pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
-        maxPagesPerRowInputElement.value = String(pagesPerRow);
-      }
-
+      const pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
       scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
-      progress.report(0.96, { stage: "upload", sourceType: "pdf" });
       storeCachedPdfPageScenes(label, pageSceneOptionsKey, pageScenes);
       console.log(
         `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
@@ -712,14 +673,23 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     setStatus(
-      `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""} to GPU...`
+      `Building Vector LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
+    progress.report(0.94, { stage: "vector-lod", sourceType: "pdf" });
+    await waitForNextAnimationFrame();
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
+    resetVectorStrokeLodBuildTiming();
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
+    const lodTiming = consumeVectorStrokeLodBuildTiming();
+    progress.report(0.98, { stage: "upload", sourceType: "pdf" });
     if (!options.preserveView) {
       renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
+    const uploadMs = Math.max(0, uploadEnd - uploadStart - lodTiming.elapsedMs);
     progress.complete({ sourceType: "pdf" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -740,8 +710,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
-    updateMetricsPanel(label, scene, sceneStats, parseMs, uploadEnd - uploadStart);
-    baseStatus = formatSceneStatus(label, scene);
+    updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming);
+    baseStatus = "Ready.";
     statusTextElement.textContent = baseStatus;
   } catch (error) {
     if (activeLoadToken !== loadToken) {
@@ -781,7 +751,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     const parseEnd = performance.now();
 
     if (activeLoadToken === loadToken) {
-      progress.report(0.94, { stage: "upload", sourceType: "zip" });
+      progress.report(0.94, { stage: "vector-lod", sourceType: "zip" });
     }
 
     if (activeLoadToken !== loadToken) {
@@ -800,14 +770,22 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     }
 
     setStatus(
-      `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""} to GPU...`
+      `Building Vector LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
+    await waitForNextAnimationFrame();
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
+    resetVectorStrokeLodBuildTiming();
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
+    const lodTiming = consumeVectorStrokeLodBuildTiming();
+    progress.report(0.98, { stage: "upload", sourceType: "zip" });
     if (!options.preserveView) {
       renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
+    const uploadMs = Math.max(0, uploadEnd - uploadStart - lodTiming.elapsedMs);
     progress.complete({ sourceType: "zip" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -828,8 +806,8 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
-    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
-    baseStatus = `${formatSceneStatus(label, scene)} | source: parsed data zip`;
+    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadMs, lodTiming);
+    baseStatus = "Ready. Source: parsed data zip.";
     statusTextElement.textContent = baseStatus;
   } catch (error) {
     if (activeLoadToken !== loadToken) {
@@ -846,15 +824,13 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
 
 function getExtractionOptions(): VectorExtractOptions {
   return {
-    enableSegmentMerge: segmentMergeToggleElement.checked,
-    enableInvisibleCull: invisibleCullToggleElement.checked
+    enableSegmentMerge: true,
+    enableInvisibleCull: true
   };
 }
 
-function buildPdfPageCacheKey(options: VectorExtractOptions): string {
-  const mergeEnabled = options.enableSegmentMerge !== false;
-  const invisibleCullEnabled = options.enableInvisibleCull !== false;
-  return `merge:${mergeEnabled ? 1 : 0}|cull:${invisibleCullEnabled ? 1 : 0}`;
+function buildPdfPageCacheKey(): string {
+  return "merge:1|cull:1";
 }
 
 function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[] | null {
@@ -897,23 +873,6 @@ function formatRasterLayerSummary(scene: VectorScene): string {
   const totalPixels = rasterLayers.reduce((sum, layer) => sum + layer.width * layer.height, 0);
   const megaPixels = totalPixels / 1_000_000;
   return `${rasterLayers.length.toLocaleString()} layers (${megaPixels.toFixed(1)} MP total)`;
-}
-
-function formatSceneStatus(
-  label: string,
-  scene: VectorScene
-): string {
-  const pagePrefix =
-    scene.pageCount > 1
-      ? `${scene.pageCount.toLocaleString()} pages (${scene.pagesPerRow.toLocaleString()}/row) | `
-      : "";
-  const fillPathCount = scene.fillPathCount.toLocaleString();
-  const sourceSegmentCount = scene.sourceSegmentCount.toLocaleString();
-  const visibleSegmentCount = scene.segmentCount.toLocaleString();
-  const textInstanceCount = scene.textInstanceCount.toLocaleString();
-  const rasterSummary = formatRasterLayerSummary(scene);
-  const rasterSuffix = rasterSummary ? `, raster ${rasterSummary}` : "";
-  return `${label} loaded | ${pagePrefix}fills ${fillPathCount}, ${visibleSegmentCount} visible from ${sourceSegmentCount} source segments, ${textInstanceCount} text instances${rasterSuffix}`;
 }
 
 function resolveSceneFitBounds(scene: VectorScene): Bounds {
@@ -1044,8 +1003,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
       parsedPdfPageCache = null;
 
       await loadPdfBuffer(createParseBuffer(bytes), entry.name, {
-        preserveView: false,
-        autoMaxPagesPerRow: true
+        preserveView: false
       });
 
       if (!lastParsedScene || !lastParsedSceneStats || lastParsedSceneLabel !== entry.name) {
@@ -1111,8 +1069,8 @@ async function downloadParsedDataZip(): Promise<boolean> {
         overviewTileRenderConfig: {
           pageBackground: uiControlManager.readPageBackgroundColorInput(),
           vectorOverride: uiControlManager.readVectorColorOverrideInput(),
-          strokeCurveEnabled: strokeCurveToggleElement.checked,
-          textVectorOnly: vectorTextOnlyToggleElement.checked
+          strokeCurveEnabled: true,
+          textVectorOnly: false
         },
         zipCompression: EXPORT_ZIP_COMPRESSION,
         zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
@@ -1164,6 +1122,12 @@ function delayMilliseconds(durationMs: number): Promise<void> {
   });
 }
 
+function waitForNextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
 function setMetricPlaceholder(label: string = "-"): void {
   metricFileTextElement.textContent = label;
   metricOperatorsTextElement.textContent = "-";
@@ -1199,7 +1163,8 @@ function updateMetricsPanel(
     textSegmentTextureHeight: number;
   },
   parseMs: number,
-  uploadMs: number
+  uploadMs: number,
+  lodTiming: VectorStrokeLodBuildTiming | null
 ): void {
   const sourceSegments = scene.sourceSegmentCount;
   const mergedSegments = scene.mergedSegmentCount;
@@ -1226,7 +1191,12 @@ function updateMetricsPanel(
     `merge ${formatPercent(mergeReduction)}, invisible-cull ${formatPercent(cullReduction)}, total ${formatPercent(totalReduction)}`;
   metricCullDiscardsTextElement.textContent =
     `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}, glyphs ${scene.textGlyphCount.toLocaleString()} / glyph segments ${scene.textGlyphSegmentCount.toLocaleString()}`;
-  metricTimesTextElement.textContent = `parse ${parseMs.toFixed(0)} ms, upload ${uploadMs.toFixed(0)} ms`;
+  const lodMs = lodTiming?.elapsedMs ?? 0;
+  const lodSuffix = lodTiming && lodTiming.buildCount > 0
+    ? `, vector lod ${lodMs.toFixed(0)} ms (${lodTiming.levelCount.toLocaleString()} levels)`
+    : ", vector lod -";
+  metricTimesTextElement.textContent =
+    `parse ${parseMs.toFixed(0)} ms${lodSuffix}, upload ${uploadMs.toFixed(0)} ms`;
   metricTextureTextElement.textContent =
     `fill paths ${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight}, fill seg ${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight}, segments ${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max area ${sceneStats.maxTextureSize}x${sceneStats.maxTextureSize}), text inst ${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight}, glyph ${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight}, glyph-seg ${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight}${rasterSummary ? `, raster ${rasterSummary}` : ""}`;
   metricGridMaxCellTextElement.textContent = sceneStats.maxCellPopulation.toLocaleString();

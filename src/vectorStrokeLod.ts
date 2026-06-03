@@ -4,13 +4,16 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import {
   formatToleranceName,
+  consumeVectorStrokeLodBuildTiming,
   shouldUseVectorStrokeLod,
+  resetVectorStrokeLodBuildTiming,
   VectorStrokeLodRuntime,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES,
   type CullingBounds,
   type VectorLodMode,
+  type VectorStrokeLodBuildTiming,
   type VectorStrokeLodStats,
   type ViewportPixels
 } from "./vectorStrokeLodCore";
@@ -144,7 +147,9 @@ export class ThreeVectorLodStrokeLayer {
 }
 
 export {
+  consumeVectorStrokeLodBuildTiming,
   shouldUseVectorStrokeLod,
+  resetVectorStrokeLodBuildTiming,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES
@@ -152,5 +157,6 @@ export {
 
 export type {
   VectorLodMode,
+  VectorStrokeLodBuildTiming,
   VectorStrokeLodStats
 };

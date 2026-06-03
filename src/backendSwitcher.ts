@@ -11,7 +11,7 @@ interface SceneSnapshot {
 }
 
 export interface BackendSwitcherOptions {
-  webGpuToggleElement: HTMLInputElement;
+  backendSelectElement: HTMLSelectElement;
   getRenderer: () => RendererApi;
   setRenderer: (renderer: RendererApi) => void;
   getCanvasElement: () => HTMLCanvasElement;
@@ -24,7 +24,6 @@ export interface BackendSwitcherOptions {
   setSceneStats: (stats: SceneStats | null) => void;
   updateMetricsAfterSwitch: (label: string, scene: VectorScene, sceneStats: SceneStats) => void;
   setMetricTimesText: (text: string) => void;
-  formatSceneStatus: (label: string, scene: VectorScene) => string;
   setBaseStatus: (status: string) => void;
   setStatus: (status: string) => void;
   setStatusText: (status: string) => void;
@@ -34,7 +33,7 @@ export interface BackendSwitcher {
   readonly webGpuSupported: boolean;
   getActiveBackend(): RendererBackend;
   initializeToggleState(): void;
-  applyPreference(useWebGpu: boolean): Promise<void>;
+  applyPreference(targetBackend: RendererBackend): Promise<void>;
 }
 
 export function createBackendSwitcher(options: BackendSwitcherOptions): BackendSwitcher {
@@ -43,25 +42,30 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
   let backendSwitchInFlight = false;
 
   function initializeToggleState(): void {
+    options.backendSelectElement.value = activeRendererBackend;
+    const webGpuOption = Array.from(options.backendSelectElement.options).find((option) => option.value === "webgpu");
     if (!webGpuSupported) {
-      options.webGpuToggleElement.checked = false;
-      options.webGpuToggleElement.disabled = true;
-      options.webGpuToggleElement.title = "WebGPU is not available in this browser/GPU.";
+      if (webGpuOption) {
+        webGpuOption.disabled = true;
+      }
+      options.backendSelectElement.title = "WebGPU is not available in this browser/GPU.";
       return;
     }
 
-    options.webGpuToggleElement.disabled = false;
-    options.webGpuToggleElement.title = "Experimental WebGPU backend.";
+    if (webGpuOption) {
+      webGpuOption.disabled = false;
+    }
+    options.backendSelectElement.title = "Experimental WebGPU backend available.";
   }
 
-  async function applyPreference(useWebGpu: boolean): Promise<void> {
-    const targetBackend: RendererBackend = useWebGpu ? "webgpu" : "webgl";
+  async function applyPreference(targetBackend: RendererBackend): Promise<void> {
     if (targetBackend === activeRendererBackend || backendSwitchInFlight) {
+      options.backendSelectElement.value = activeRendererBackend;
       return;
     }
 
     if (targetBackend === "webgpu" && !webGpuSupported) {
-      options.webGpuToggleElement.checked = false;
+      options.backendSelectElement.value = activeRendererBackend;
       options.setStatus("WebGPU is not supported in this browser/GPU. Using WebGL.");
       return;
     }
@@ -87,7 +91,7 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
 
       options.setRenderer(nextRenderer);
       activeRendererBackend = targetBackend;
-      options.webGpuToggleElement.checked = targetBackend === "webgpu";
+      options.backendSelectElement.value = activeRendererBackend;
       options.resetPointerInteractionState();
 
       previousRenderer.setFrameListener(null);
@@ -98,10 +102,10 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
         options.setSceneStats(nextSceneStats);
         nextRenderer.setViewState(previousViewState);
         options.updateMetricsAfterSwitch(sceneSnapshot.label, sceneSnapshot.scene, nextSceneStats);
-        options.setMetricTimesText("parse -, upload - (backend switch)");
+        options.setMetricTimesText("parse -, vector lod -, upload - (backend switch)");
 
-        const sourceSuffix = sceneSnapshot.loadedSourceKind === "parsed-zip" ? " | source: parsed data zip" : "";
-        const statusBase = `${options.formatSceneStatus(sceneSnapshot.label, sceneSnapshot.scene)}${sourceSuffix}`;
+        const sourceSuffix = sceneSnapshot.loadedSourceKind === "parsed-zip" ? " Source: parsed data zip." : "";
+        const statusBase = `Ready.${sourceSuffix}`;
         options.setBaseStatus(statusBase);
         options.setStatusText(
           targetBackend === "webgpu"
@@ -120,7 +124,7 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
       }
 
       const message = error instanceof Error ? error.message : String(error);
-      options.webGpuToggleElement.checked = activeRendererBackend === "webgpu";
+      options.backendSelectElement.value = activeRendererBackend;
       options.setStatus(`Failed to switch backend: ${message}`);
     } finally {
       backendSwitchInFlight = false;

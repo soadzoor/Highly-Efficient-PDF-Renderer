@@ -32,6 +32,13 @@ export interface VectorStrokeLodStats {
   totalLevels: number;
 }
 
+export interface VectorStrokeLodBuildTiming {
+  elapsedMs: number;
+  buildCount: number;
+  sourceSegmentCount: number;
+  levelCount: number;
+}
+
 export interface ViewportPixels {
   width: number;
   height: number;
@@ -127,6 +134,13 @@ interface RuntimeTileRange {
   r0: number;
   r1: number;
 }
+
+let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
+  elapsedMs: 0,
+  buildCount: 0,
+  sourceSegmentCount: 0,
+  levelCount: 0
+};
 
 class Float4Builder {
   private data: Float32Array;
@@ -234,7 +248,8 @@ export class VectorStrokeLodRuntime {
       this.activeLevelIndex = 0;
     }
     this.stats = this.createEmptyStats();
-    logVectorLodBuildTiming(lodBuildStart, scene.segmentCount, this.levels);
+    const elapsedMs = logVectorLodBuildTiming(lodBuildStart, scene.segmentCount, this.levels);
+    recordVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels.length);
   }
 
   setScreenSpaceTransform(): void {
@@ -618,6 +633,28 @@ export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodS
   }
 
   return levels;
+}
+
+export function resetVectorStrokeLodBuildTiming(): void {
+  accumulatedBuildTiming = {
+    elapsedMs: 0,
+    buildCount: 0,
+    sourceSegmentCount: 0,
+    levelCount: 0
+  };
+}
+
+export function consumeVectorStrokeLodBuildTiming(): VectorStrokeLodBuildTiming {
+  const timing = { ...accumulatedBuildTiming };
+  resetVectorStrokeLodBuildTiming();
+  return timing;
+}
+
+function recordVectorLodBuildTiming(elapsedMs: number, sourceSegmentCount: number, levelCount: number): void {
+  accumulatedBuildTiming.elapsedMs += Math.max(0, elapsedMs);
+  accumulatedBuildTiming.buildCount += 1;
+  accumulatedBuildTiming.sourceSegmentCount += Math.max(0, sourceSegmentCount | 0);
+  accumulatedBuildTiming.levelCount += Math.max(0, levelCount | 0);
 }
 
 export function createRuntimeTileGrid(bounds: Bounds, segmentCount: number, scene?: VectorScene): RuntimeTileGrid {
@@ -1324,7 +1361,7 @@ function logVectorLodBuildTiming(
   startMs: number,
   sourceSegmentCount: number,
   levels: Array<{ tolerance: number; segmentCount: number }>
-): void {
+): number {
   const elapsedMs = nowMs() - startMs;
   const levelSummary = levels
     .map((level) => `${formatToleranceName(level.tolerance)}:${level.segmentCount}`)
@@ -1333,6 +1370,7 @@ function logVectorLodBuildTiming(
     `[hepr] vector stroke LOD generated in ${elapsedMs.toFixed(1)}ms ` +
     `(source segments: ${Math.max(0, sourceSegmentCount | 0)}, levels: ${levelSummary})`
   );
+  return elapsedMs;
 }
 
 function clamp01(value: number): number {

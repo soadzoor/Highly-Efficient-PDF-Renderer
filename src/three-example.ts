@@ -3,6 +3,8 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
   pdfObjectGenerator,
+  consumeVectorStrokeLodBuildTiming,
+  resetVectorStrokeLodBuildTiming,
   type HeprRendererType,
   type HeprThreePdfObject,
   type VectorLodMode,
@@ -18,34 +20,58 @@ import {
 import { formatLoadProgressStage } from "./loadProgress";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
-const sourceInput = document.querySelector<HTMLInputElement>("#source-input");
-const loadSourceButton = document.querySelector<HTMLButtonElement>("#load-source");
+const panel = document.querySelector<HTMLDivElement>("#panel");
+const togglePanelButton = document.querySelector<HTMLButtonElement>("#toggle-panel");
+const togglePanelIcon = document.querySelector<HTMLSpanElement>("#toggle-panel-icon");
+const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
 const panOptimizationCheckbox = document.querySelector<HTMLInputElement>("#pan-optimization-checkbox");
 const panOptimizationRow = document.querySelector<HTMLElement>("#pan-optimization-row");
+const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
+const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
+const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
+const vectorColorInput = document.querySelector<HTMLInputElement>("#vector-color");
+const vectorOpacitySlider = document.querySelector<HTMLInputElement>("#vector-opacity-slider");
+const vectorOpacityInput = document.querySelector<HTMLInputElement>("#vector-opacity");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoader = document.querySelector<HTMLDivElement>("#parse-loader");
 const parseLoaderText = document.querySelector<HTMLSpanElement>("#parse-loader-text");
+const fileValue = document.querySelector<HTMLSpanElement>("#file-value");
+const sourceSegmentsValue = document.querySelector<HTMLSpanElement>("#source-segments-value");
+const visibleSegmentsValue = document.querySelector<HTMLSpanElement>("#visible-segments-value");
+const timesValue = document.querySelector<HTMLSpanElement>("#times-value");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
 
 if (
   !canvas ||
-  !sourceInput ||
-  !loadSourceButton ||
+  !panel ||
+  !togglePanelButton ||
+  !togglePanelIcon ||
+  !openButton ||
   !fileInput ||
   !exampleSelect ||
   !backendSelect ||
   !vectorLodSelect ||
   !panOptimizationCheckbox ||
   !panOptimizationRow ||
+  !pageBackgroundColorInput ||
+  !pageBackgroundOpacitySlider ||
+  !pageBackgroundOpacityInput ||
+  !vectorColorInput ||
+  !vectorOpacitySlider ||
+  !vectorOpacityInput ||
   !statusElement ||
   !parseLoader ||
   !parseLoaderText ||
+  !fileValue ||
+  !sourceSegmentsValue ||
+  !visibleSegmentsValue ||
+  !timesValue ||
   !fpsValue ||
   !drawStatsValue ||
   !lodStatsValue
@@ -54,17 +80,29 @@ if (
 }
 
 const canvasElement = canvas;
-const sourceInputElement = sourceInput;
-const loadSourceButtonElement = loadSourceButton;
+const panelElement = panel;
+const togglePanelButtonElement = togglePanelButton;
+const togglePanelIconElement = togglePanelIcon;
+const openButtonElement = openButton;
 const fileInputElement = fileInput;
 const exampleSelectElement = exampleSelect;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
 const panOptimizationCheckboxElement = panOptimizationCheckbox;
 const panOptimizationRowElement = panOptimizationRow;
+const pageBackgroundColorInputElement = pageBackgroundColorInput;
+const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
+const pageBackgroundOpacityInputElement = pageBackgroundOpacityInput;
+const vectorColorInputElement = vectorColorInput;
+const vectorOpacitySliderElement = vectorOpacitySlider;
+const vectorOpacityInputElement = vectorOpacityInput;
 const statusElementNode = statusElement;
 const parseLoaderElement = parseLoader;
 const parseLoaderTextElement = parseLoaderText;
+const fileValueElement = fileValue;
+const sourceSegmentsValueElement = sourceSegmentsValue;
+const visibleSegmentsValueElement = visibleSegmentsValue;
+const timesValueElement = timesValue;
 const fpsValueElement = fpsValue;
 const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
@@ -134,7 +172,11 @@ let fpsSmoothed = 0;
 let lastNativeDrawStats: DrawStats | null = null;
 let drawStatsLastText = "";
 let lodStatsLastText = "";
+let lastLoadTimingText = "-";
 const exampleSelectionMap = new Map<string, ExampleSelection>();
+
+initializeBackendSelect();
+setPanelCollapsed(false);
 
 function renderFrame(now: number = performance.now()): void {
   animationFrameId = 0;
@@ -178,21 +220,13 @@ window.addEventListener("resize", () => {
   requestRender();
 }, { signal: lifetimeSignal });
 
-loadSourceButtonElement.addEventListener("click", () => {
-  const raw = sourceInputElement.value.trim();
-  if (!raw) {
-    setStatus("Please enter a PDF or ZIP path/base64 source.");
-    return;
-  }
-  void loadSource(raw);
+openButtonElement.addEventListener("click", () => {
+  fileInputElement.click();
 }, { signal: lifetimeSignal });
 
-sourceInputElement.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter") {
-    return;
-  }
-  event.preventDefault();
-  loadSourceButtonElement.click();
+togglePanelButtonElement.addEventListener("click", () => {
+  const currentlyCollapsed = panelElement.classList.contains("collapsed");
+  setPanelCollapsed(!currentlyCollapsed);
 }, { signal: lifetimeSignal });
 
 exampleSelectElement.addEventListener("change", () => {
@@ -243,6 +277,26 @@ panOptimizationCheckboxElement.addEventListener("change", () => {
   requestRender();
 }, { signal: lifetimeSignal });
 
+pageBackgroundColorInputElement.addEventListener("input", applyPageBackgroundFromControls, { signal: lifetimeSignal });
+pageBackgroundOpacitySliderElement.addEventListener("input", () => {
+  syncPercentInputs(pageBackgroundOpacitySliderElement, pageBackgroundOpacityInputElement, 100);
+  applyPageBackgroundFromControls();
+}, { signal: lifetimeSignal });
+pageBackgroundOpacityInputElement.addEventListener("input", () => {
+  syncPercentInputs(pageBackgroundOpacityInputElement, pageBackgroundOpacitySliderElement, 100);
+  applyPageBackgroundFromControls();
+}, { signal: lifetimeSignal });
+
+vectorColorInputElement.addEventListener("input", applyVectorOverrideFromControls, { signal: lifetimeSignal });
+vectorOpacitySliderElement.addEventListener("input", () => {
+  syncPercentInputs(vectorOpacitySliderElement, vectorOpacityInputElement, 0);
+  applyVectorOverrideFromControls();
+}, { signal: lifetimeSignal });
+vectorOpacityInputElement.addEventListener("input", () => {
+  syncPercentInputs(vectorOpacityInputElement, vectorOpacitySliderElement, 0);
+  applyVectorOverrideFromControls();
+}, { signal: lifetimeSignal });
+
 void loadExampleManifest();
 
 window.addEventListener("beforeunload", () => {
@@ -276,14 +330,18 @@ async function loadSource(source: File | string): Promise<void> {
   const sourceLabel = typeof source === "string" ? source : source.name;
   const vectorLod = readVectorLodMode();
   const panOptimization = readPanOptimizationEnabled();
+  const pageBackground = readPageBackgroundColor();
+  const vectorOverride = readVectorOverrideColor();
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "Parsing / loading 0.00%");
-  loadSourceButtonElement.disabled = true;
+  setLoadControlsEnabled(false);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
   panOptimizationCheckboxElement.disabled = true;
 
   try {
+    const loadStart = performance.now();
+    resetVectorStrokeLodBuildTiming();
     const nextObject = await pdfObjectGenerator(
       source,
       {
@@ -298,23 +356,28 @@ async function loadSource(source: File | string): Promise<void> {
         experimentalMaterialFills: useWebGpuMaterialPipeline,
         experimentalMaterialStrokes: useWebGpuMaterialPipeline,
         experimentalMaterialTexts: useWebGpuMaterialPipeline,
-        pageBackground: 0xffffff,
+        pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],
+        pageBackgroundOpacity: pageBackground[3],
+        vectorOverrideColor: [vectorOverride[0], vectorOverride[1], vectorOverride[2]],
+        vectorOverrideOpacity: vectorOverride[3],
         onProgress: (progress) => {
           updateLoadingProgress(activeLoadToken, progress);
         }
       },
       backend as HeprRendererType
     );
+    const totalLoadMs = performance.now() - loadStart;
+    const lodTiming = consumeVectorStrokeLodBuildTiming();
 
     if (activeLoadToken !== loadToken) {
       nextObject.dispose();
       return;
     }
+    lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount);
     replacePdfObject(nextObject);
     lastLoadedSource = source;
-    setStatus(
-      `Loaded ${nextObject.sourceLabel} (${nextObject.sourceKind}) via ${backend.toUpperCase()} | Vector LOD: ${formatVectorLodMode(vectorLod)}.`
-    );
+    setStatus(`Ready. Backend: ${backend.toUpperCase()}. Vector LOD: ${formatVectorLodMode(vectorLod)}.`);
+    updateSceneMetrics(nextObject);
     requestRender();
   } catch (error) {
     if (activeLoadToken !== loadToken) {
@@ -325,7 +388,7 @@ async function loadSource(source: File | string): Promise<void> {
   } finally {
     if (activeLoadToken === loadToken) {
       setLoadingProgress(false);
-      loadSourceButtonElement.disabled = false;
+      setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
       panOptimizationCheckboxElement.disabled = false;
@@ -360,6 +423,10 @@ function disposeCurrentObject(): void {
   currentPdfObject.dispose();
   currentPdfObject = null;
   lastNativeDrawStats = null;
+  fileValueElement.textContent = "-";
+  sourceSegmentsValueElement.textContent = "-";
+  visibleSegmentsValueElement.textContent = "-";
+  timesValueElement.textContent = "-";
   setDrawStatsText("-");
   setLodStatsText("-");
   requestRender();
@@ -367,6 +434,48 @@ function disposeCurrentObject(): void {
 
 function setStatus(text: string): void {
   statusElementNode.textContent = text;
+}
+
+function setPanelCollapsed(collapsed: boolean): void {
+  panelElement.classList.toggle("collapsed", collapsed);
+  togglePanelButtonElement.setAttribute("aria-expanded", String(!collapsed));
+  togglePanelButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
+  togglePanelIconElement.textContent = collapsed ? "▸" : "▾";
+}
+
+function setLoadControlsEnabled(enabled: boolean): void {
+  openButtonElement.disabled = !enabled;
+  fileInputElement.disabled = !enabled;
+  exampleSelectElement.disabled = !enabled || exampleSelectionMap.size === 0;
+}
+
+function initializeBackendSelect(): void {
+  const webGpuOption = Array.from(backendSelectElement.options).find((option) => option.value === "webgpu");
+  const webGpuSupported = typeof (navigator as Navigator & { gpu?: unknown }).gpu !== "undefined";
+  if (!webGpuSupported && webGpuOption) {
+    webGpuOption.disabled = true;
+    backendSelectElement.title = "WebGPU is not available in this browser/GPU.";
+  } else {
+    backendSelectElement.title = "Experimental WebGPU backend available.";
+  }
+}
+
+function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
+  const sceneData = pdfObject.sceneData;
+  const sourceSegments = sceneData.sourceSegmentCount;
+  const visibleSegments = sceneData.segmentCount;
+  const totalReduction = sourceSegments > 0 ? (1 - visibleSegments / sourceSegments) * 100 : 0;
+  fileValueElement.textContent = `${pdfObject.sourceLabel} (${pdfObject.sourceKind})`;
+  sourceSegmentsValueElement.textContent = sourceSegments.toLocaleString();
+  visibleSegmentsValueElement.textContent =
+    `${visibleSegments.toLocaleString()} (${Math.max(0, totalReduction).toFixed(1)}% total reduction), fills ${sceneData.fillPathCount.toLocaleString()}, text ${sceneData.textInstanceCount.toLocaleString()} instances, pages ${sceneData.pageCount.toLocaleString()} (${sceneData.pagesPerRow.toLocaleString()}/row)`;
+  timesValueElement.textContent = lastLoadTimingText;
+}
+
+function formatLoadTiming(totalLoadMs: number, lodMs: number, lodBuildCount: number): string {
+  const otherMs = Math.max(0, totalLoadMs - Math.max(0, lodMs));
+  const lodText = lodBuildCount > 0 ? `${lodMs.toFixed(0)} ms` : "-";
+  return `parse/upload ${otherMs.toFixed(0)} ms, vector lod ${lodText}`;
 }
 
 function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
@@ -381,6 +490,62 @@ function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
 function setLoadingProgress(visible: boolean, text = ""): void {
   parseLoaderElement.hidden = !visible;
   parseLoaderTextElement.textContent = visible ? text : "";
+}
+
+function readPageBackgroundColor(): [number, number, number, number] {
+  const color = readHexColor(pageBackgroundColorInputElement.value, [1, 1, 1]);
+  const opacity = readPercentInput(pageBackgroundOpacityInputElement, 100) / 100;
+  syncPercentInputs(pageBackgroundOpacityInputElement, pageBackgroundOpacitySliderElement, 100);
+  return [color[0], color[1], color[2], opacity];
+}
+
+function readVectorOverrideColor(): [number, number, number, number] {
+  const color = readHexColor(vectorColorInputElement.value, [0, 0, 0]);
+  const opacity = readPercentInput(vectorOpacityInputElement, 0) / 100;
+  syncPercentInputs(vectorOpacityInputElement, vectorOpacitySliderElement, 0);
+  return [color[0], color[1], color[2], opacity];
+}
+
+function applyPageBackgroundFromControls(): void {
+  const color = readPageBackgroundColor();
+  currentPdfObject?.setPageBackgroundColor(color[0], color[1], color[2], color[3]);
+  requestRender();
+}
+
+function applyVectorOverrideFromControls(): void {
+  const color = readVectorOverrideColor();
+  currentPdfObject?.setVectorColorOverride(color[0], color[1], color[2], color[3]);
+  requestRender();
+}
+
+function syncPercentInputs(source: HTMLInputElement, target: HTMLInputElement, fallback: number): void {
+  const percent = readPercentInput(source, fallback);
+  source.value = String(percent);
+  target.value = String(percent);
+}
+
+function readPercentInput(input: HTMLInputElement, fallback: number): number {
+  const parsed = Math.trunc(Number(input.value));
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return THREE.MathUtils.clamp(parsed, 0, 100);
+}
+
+function readHexColor(value: string, fallback: [number, number, number]): [number, number, number] {
+  const match = /^#([0-9a-fA-F]{6})$/.exec(value);
+  if (!match) {
+    return fallback;
+  }
+  const packed = Number.parseInt(match[1], 16);
+  if (!Number.isFinite(packed)) {
+    return fallback;
+  }
+  return [
+    ((packed >> 16) & 0xff) / 255,
+    ((packed >> 8) & 0xff) / 255,
+    (packed & 0xff) / 255
+  ];
 }
 
 function updateFpsMeter(now: number): void {

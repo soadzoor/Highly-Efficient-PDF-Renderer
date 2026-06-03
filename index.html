@@ -24,30 +24,17 @@
       </div>
       <div id="hud-content" class="panel-content">
         <div class="toggles">
-          <label class="toggle">
-            <input id="toggle-segment-merge" type="checkbox" checked />
-            <span>Segment merge</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-invisible-cull" type="checkbox" checked />
-            <span>Invisible cull</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-stroke-curves" type="checkbox" checked />
-            <span>Curve strokes</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-vector-text-only" type="checkbox" />
-            <span>Vector only</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-webgpu" type="checkbox" />
-            <span>Use WebGPU (preview)</span>
-          </label>
           <label id="toggle-pan-optimization-row" class="toggle" hidden>
             <input id="toggle-pan-optimization" type="checkbox" checked />
             <span>Pan optimization</span>
           </label>
+        </div>
+        <div class="number-row">
+          <label for="backend-select">Renderer Backend</label>
+          <select id="backend-select">
+            <option value="webgl" selected>WebGL</option>
+            <option value="webgpu">WebGPU</option>
+          </select>
         </div>
         <div class="number-row">
           <label for="vector-lod-mode">Vector LOD</label>
@@ -56,10 +43,6 @@
             <option value="off">Off</option>
             <option value="force">Force</option>
           </select>
-        </div>
-        <div class="number-row">
-          <label for="max-pages-per-row">Max Pages Per Row</label>
-          <input id="max-pages-per-row" type="number" min="1" max="100" step="1" value="10" />
         </div>
         <div class="number-row number-row-color">
           <label for="page-bg-color">Page Background</label>

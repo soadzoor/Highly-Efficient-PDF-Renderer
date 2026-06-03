@@ -31,13 +31,27 @@ export async function pdfObjectGenerator(
     ...options,
     onProgress: progress.child(0, 0.92).toCallback()
   });
-  progress.report(0.94, { stage: "upload", sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
+  progress.report(0.94, { stage: "vector-lod", sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
+  await yieldToHostFrame();
   const object = await createThreePdfObject(loadedScene, {
     ...options,
     rendererType
   });
+  progress.report(0.98, { stage: "upload", sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
   progress.complete({ sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
   return object;
+}
+
+async function yieldToHostFrame(): Promise<void> {
+  if (typeof requestAnimationFrame === "function") {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
 }
 
 export {
@@ -78,11 +92,14 @@ export type {
 } from "./loadProgress";
 
 export type {
+  VectorStrokeLodBuildTiming,
   VectorStrokeLodStats,
   VectorLodMode
 } from "./vectorStrokeLod";
 
 export {
+  consumeVectorStrokeLodBuildTiming,
+  resetVectorStrokeLodBuildTiming,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES

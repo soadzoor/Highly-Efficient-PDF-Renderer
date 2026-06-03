@@ -5,17 +5,9 @@ type ColorRgba = [number, number, number, number];
 
 type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColorOverride">;
 
-type AsyncOrSync = void | Promise<void>;
-
 export interface UiControlElements {
-  segmentMergeToggle: HTMLInputElement;
-  invisibleCullToggle: HTMLInputElement;
-  strokeCurveToggle: HTMLInputElement;
-  vectorTextOnlyToggle: HTMLInputElement;
-  webGpuToggle: HTMLInputElement;
   panOptimizationToggle: HTMLInputElement;
   vectorLodSelect: HTMLSelectElement;
-  maxPagesPerRowInput: HTMLInputElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
   pageBackgroundOpacityInput: HTMLInputElement;
@@ -25,40 +17,24 @@ export interface UiControlElements {
 }
 
 export interface UiControlCallbacks {
-  onSegmentMergeChange(): AsyncOrSync;
-  onInvisibleCullChange(): AsyncOrSync;
-  onStrokeCurveChange(enabled: boolean): void;
-  onVectorTextOnlyChange(enabled: boolean): void;
   onVectorLodModeChange(mode: VectorLodMode): void;
   onPanOptimizationChange(enabled: boolean): void;
-  onMaxPagesPerRowChange(maxPagesPerRow: number): AsyncOrSync;
-  onWebGpuToggleChange(enabled: boolean): AsyncOrSync;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
   readVectorLodModeInput(): VectorLodMode;
   readPanOptimizationInput(): boolean;
-  readMaxPagesPerRowInput(): number;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
   applyPageBackgroundColorFromControls(): void;
   applyVectorColorOverrideFromControls(): void;
-  syncMaxPagesPerRowInputValue(): void;
 }
 
 export function createUiControlManager(
   elements: UiControlElements,
   getRenderer: () => ColorRenderer
 ): UiControlManager {
-  function readMaxPagesPerRowInput(): number {
-    const parsed = Math.trunc(Number(elements.maxPagesPerRowInput.value));
-    if (!Number.isFinite(parsed)) {
-      return 10;
-    }
-    return clamp(parsed, 1, 100);
-  }
-
   function readVectorLodModeInput(): VectorLodMode {
     const value = elements.vectorLodSelect.value;
     return value === "off" || value === "force" ? value : "auto";
@@ -158,27 +134,7 @@ export function createUiControlManager(
     );
   }
 
-  function syncMaxPagesPerRowInputValue(): void {
-    elements.maxPagesPerRowInput.value = String(readMaxPagesPerRowInput());
-  }
-
   function bindEventListeners(callbacks: UiControlCallbacks): void {
-    elements.segmentMergeToggle.addEventListener("change", () => {
-      void callbacks.onSegmentMergeChange();
-    });
-
-    elements.invisibleCullToggle.addEventListener("change", () => {
-      void callbacks.onInvisibleCullChange();
-    });
-
-    elements.strokeCurveToggle.addEventListener("change", () => {
-      callbacks.onStrokeCurveChange(elements.strokeCurveToggle.checked);
-    });
-
-    elements.vectorTextOnlyToggle.addEventListener("change", () => {
-      callbacks.onVectorTextOnlyChange(elements.vectorTextOnlyToggle.checked);
-    });
-
     elements.vectorLodSelect.addEventListener("change", () => {
       callbacks.onVectorLodModeChange(readVectorLodModeInput());
     });
@@ -218,28 +174,16 @@ export function createUiControlManager(
       setVectorOpacityControls(opacityPercent);
       applyVectorColorOverrideFromControls();
     });
-
-    elements.maxPagesPerRowInput.addEventListener("change", () => {
-      const maxPagesPerRow = readMaxPagesPerRowInput();
-      elements.maxPagesPerRowInput.value = String(maxPagesPerRow);
-      void callbacks.onMaxPagesPerRowChange(maxPagesPerRow);
-    });
-
-    elements.webGpuToggle.addEventListener("change", () => {
-      void callbacks.onWebGpuToggleChange(elements.webGpuToggle.checked);
-    });
   }
 
   return {
     bindEventListeners,
     readVectorLodModeInput,
     readPanOptimizationInput,
-    readMaxPagesPerRowInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,
     applyPageBackgroundColorFromControls,
-    applyVectorColorOverrideFromControls,
-    syncMaxPagesPerRowInputValue
+    applyVectorColorOverrideFromControls
   };
 }
 
