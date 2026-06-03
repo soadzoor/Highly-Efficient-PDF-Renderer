@@ -10,6 +10,7 @@ export type PDFLoadStage =
   | "zip-file"
   | "vector-lod"
   | "upload"
+  | "first-render"
   | "complete";
 
 export type PDFLoadExecutionPath = "worker" | "main-thread" | "main-thread-fallback";
@@ -216,6 +217,8 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Building Vector LOD";
     case "upload":
       return "Uploading";
+    case "first-render":
+      return "Rendering first frame";
     case "complete":
       return "Complete";
     default:

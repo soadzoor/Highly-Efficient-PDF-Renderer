@@ -5,15 +5,19 @@ import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import {
   formatToleranceName,
   consumeVectorStrokeLodBuildTiming,
+  prebuildVectorStrokeLodRuntime,
   shouldUseVectorStrokeLod,
   resetVectorStrokeLodBuildTiming,
+  takePrebuiltVectorStrokeLodRuntime,
   VectorStrokeLodRuntime,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES,
   type CullingBounds,
   type VectorLodMode,
+  type VectorStrokeLodAsyncBuildOptions,
   type VectorStrokeLodBuildTiming,
+  type VectorStrokeLodBuildProgress,
   type VectorStrokeLodStats,
   type ViewportPixels
 } from "./vectorStrokeLodCore";
@@ -34,7 +38,7 @@ export class ThreeVectorLodStrokeLayer {
   constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
-    this.runtime = new VectorStrokeLodRuntime(scene);
+    this.runtime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
     this.layers = this.runtime.levels.map((level) => {
       const layer = new ThreeMaterialStrokeLayer(level.scene, options);
       layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(level.tolerance)}`;
@@ -148,8 +152,10 @@ export class ThreeVectorLodStrokeLayer {
 
 export {
   consumeVectorStrokeLodBuildTiming,
+  prebuildVectorStrokeLodRuntime,
   shouldUseVectorStrokeLod,
   resetVectorStrokeLodBuildTiming,
+  takePrebuiltVectorStrokeLodRuntime,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES
@@ -157,6 +163,8 @@ export {
 
 export type {
   VectorLodMode,
+  VectorStrokeLodAsyncBuildOptions,
   VectorStrokeLodBuildTiming,
+  VectorStrokeLodBuildProgress,
   VectorStrokeLodStats
 };

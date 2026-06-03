@@ -104,14 +104,9 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
         options.updateMetricsAfterSwitch(sceneSnapshot.label, sceneSnapshot.scene, nextSceneStats);
         options.setMetricTimesText("parse -, vector lod -, upload - (backend switch)");
 
-        const sourceSuffix = sceneSnapshot.loadedSourceKind === "parsed-zip" ? " Source: parsed data zip." : "";
-        const statusBase = `Ready.${sourceSuffix}`;
+        const statusBase = "";
         options.setBaseStatus(statusBase);
-        options.setStatusText(
-          targetBackend === "webgpu"
-            ? `${statusBase} | backend: WebGPU (preview)`
-            : `${statusBase} | backend: WebGL`
-        );
+        options.setStatusText(statusBase);
       } else {
         nextRenderer.setViewState(previousViewState);
         options.setStatus(`Switched to ${targetBackend.toUpperCase()} backend.`);

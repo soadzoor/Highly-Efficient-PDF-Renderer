@@ -36,6 +36,7 @@ import {
 } from "./loadProgress";
 import {
   consumeVectorStrokeLodBuildTiming,
+  prebuildVectorStrokeLodRuntime,
   resetVectorStrokeLodBuildTiming,
   type VectorLodMode,
   type VectorStrokeLodBuildTiming,
@@ -265,6 +266,11 @@ const EXPORT_ZIP_DEFLATE_LEVEL = 9;
 const EXPORT_ENCODE_RASTER_IMAGES = true;
 const EXPORT_BUILD_OVERVIEW_TILES = true;
 const EXPORT_OVERVIEW_TILE_ENCODING = "webp" as const;
+const LOAD_PROGRESS_PARSE_END = 0.34;
+const LOAD_PROGRESS_COMPILE = 0.36;
+const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
+const LOAD_PROGRESS_VECTOR_LOD_END = 0.96;
+const LOAD_PROGRESS_UPLOAD = 0.98;
 
 type ExampleSelectionKind = "pdf" | "zip";
 
@@ -308,7 +314,7 @@ backendSwitcher = createBackendSwitcher({
     lastParsedSceneStats = stats;
   },
   updateMetricsAfterSwitch: (label, scene, sceneStats) => {
-    updateMetricsPanel(label, scene, sceneStats, 0, 0, null);
+    updateMetricsPanel(label, scene, sceneStats, 0, 0, null, null);
   },
   setMetricTimesText: (text) => {
     metricTimesTextElement.textContent = text;
@@ -319,6 +325,7 @@ backendSwitcher = createBackendSwitcher({
   setStatus,
   setStatusText: (status) => {
     statusTextElement.textContent = status;
+    statusTextElement.hidden = status.trim().length === 0;
   }
 });
 
@@ -604,6 +611,7 @@ async function loadParsedDataZipFile(file: File): Promise<void> {
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
+  const loadStart = performance.now();
   const extractionOptions = getExtractionOptions();
   const pageSceneOptionsKey = buildPdfPageCacheKey();
   const cachedPageScenes = getCachedPdfPageScenes(label, pageSceneOptionsKey);
@@ -620,7 +628,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     if (cachedPageScenes) {
       const pagesPerRow = computeAutoPagesPerRow(cachedPageScenes.length);
       const composeStart = performance.now();
-      progress.report(0.9, { stage: "compile", sourceType: "pdf" });
+      progress.report(LOAD_PROGRESS_COMPILE, { stage: "compile", sourceType: "pdf" });
       setStatus(
         `Rearranging ${label}... (pages/row ${pagesPerRow}, using cached parsed pages)`
       );
@@ -637,12 +645,12 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       );
       const pageScenes = await extractPdfPageScenes(buffer, {
         ...extractionOptions,
-        onProgress: progress.child(0, 0.88, { sourceType: "pdf" }).toCallback()
+        onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
       });
       parseMs = performance.now() - parseStart;
 
       if (activeLoadToken === loadToken) {
-        progress.report(0.9, { stage: "compile", sourceType: "pdf" });
+        progress.report(LOAD_PROGRESS_COMPILE, { stage: "compile", sourceType: "pdf" });
       }
 
       if (activeLoadToken !== loadToken) {
@@ -675,21 +683,20 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     setStatus(
       `Building Vector LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
-    progress.report(0.94, { stage: "vector-lod", sourceType: "pdf" });
-    await waitForNextAnimationFrame();
+    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "pdf", activeLoadToken);
     if (activeLoadToken !== loadToken) {
       return;
     }
-    resetVectorStrokeLodBuildTiming();
+    progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "pdf" });
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
-    const lodTiming = consumeVectorStrokeLodBuildTiming();
-    progress.report(0.98, { stage: "upload", sourceType: "pdf" });
+    const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
+    const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     if (!options.preserveView) {
       renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
-    const uploadMs = Math.max(0, uploadEnd - uploadStart - lodTiming.elapsedMs);
+    const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
     progress.complete({ sourceType: "pdf" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -710,9 +717,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
-    updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming);
-    baseStatus = "Ready.";
-    statusTextElement.textContent = baseStatus;
+    updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming, performance.now() - loadStart);
+    clearLoadedStatus();
   } catch (error) {
     if (activeLoadToken !== loadToken) {
       return;
@@ -735,6 +741,7 @@ async function reloadLastPdfWithCurrentOptions(): Promise<void> {
 
 async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
+  const loadStart = performance.now();
   const progress = createLoadProgressReporter((payload) => {
     if (activeLoadToken === loadToken) {
       updateParsingLoaderProgress(payload);
@@ -746,12 +753,12 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     setParsingLoader(true, "Parsing / loading 0.00%");
     setStatus(`Loading parsed data from ${label}...`);
     const scene = await loadSceneFromParsedDataZip(buffer, {
-      onProgress: progress.child(0, 0.9, { sourceType: "zip" }).toCallback()
+      onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "zip" }).toCallback()
     });
     const parseEnd = performance.now();
 
     if (activeLoadToken === loadToken) {
-      progress.report(0.94, { stage: "vector-lod", sourceType: "zip" });
+      progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType: "zip" });
     }
 
     if (activeLoadToken !== loadToken) {
@@ -772,20 +779,20 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     setStatus(
       `Building Vector LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
-    await waitForNextAnimationFrame();
+    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "zip", activeLoadToken);
     if (activeLoadToken !== loadToken) {
       return;
     }
-    resetVectorStrokeLodBuildTiming();
+    progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "zip" });
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
-    const lodTiming = consumeVectorStrokeLodBuildTiming();
-    progress.report(0.98, { stage: "upload", sourceType: "zip" });
+    const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
+    const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     if (!options.preserveView) {
       renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
-    const uploadMs = Math.max(0, uploadEnd - uploadStart - lodTiming.elapsedMs);
+    const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
     progress.complete({ sourceType: "zip" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -806,9 +813,8 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
-    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadMs, lodTiming);
-    baseStatus = "Ready. Source: parsed data zip.";
-    statusTextElement.textContent = baseStatus;
+    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadMs, lodTiming, performance.now() - loadStart);
+    clearLoadedStatus();
   } catch (error) {
     if (activeLoadToken !== loadToken) {
       return;
@@ -927,6 +933,13 @@ function resolveSceneFitBounds(scene: VectorScene): Bounds {
 function setStatus(message: string): void {
   baseStatus = message;
   statusTextElement.textContent = baseStatus;
+  statusTextElement.hidden = message.trim().length === 0;
+}
+
+function clearLoadedStatus(): void {
+  baseStatus = "";
+  statusTextElement.textContent = "";
+  statusTextElement.hidden = true;
 }
 
 function setParsingLoader(isVisible: boolean, text = "Parsing / loading..."): void {
@@ -938,6 +951,47 @@ function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
   const stageLabel = formatLoadProgressStage(progress.stage);
   const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
   setParsingLoader(true, `${stageLabel} ${(value * 100).toFixed(2)}%`);
+}
+
+async function prebuildVectorLodForScene(
+  scene: VectorScene,
+  progress: ReturnType<typeof createLoadProgressReporter>,
+  sourceType: "pdf" | "zip",
+  activeLoadToken: number
+): Promise<VectorStrokeLodBuildTiming> {
+  resetVectorStrokeLodBuildTiming();
+  progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
+  await prebuildVectorStrokeLodRuntime(
+    scene,
+    uiControlManager.readVectorLodModeInput(),
+    backendSwitcher?.getActiveBackend() ?? "webgl",
+    {
+      yieldIntervalMs: 500,
+      shouldCancel: () => activeLoadToken !== loadToken,
+      onProgress: (lodProgress) => {
+        if (activeLoadToken !== loadToken) {
+          return;
+        }
+        const value =
+          LOAD_PROGRESS_VECTOR_LOD_START +
+          lodProgress.value * (LOAD_PROGRESS_VECTOR_LOD_END - LOAD_PROGRESS_VECTOR_LOD_START);
+        progress.report(value, { stage: "vector-lod", sourceType });
+      }
+    }
+  );
+  return consumeVectorStrokeLodBuildTiming();
+}
+
+function combineVectorLodTimings(
+  a: VectorStrokeLodBuildTiming,
+  b: VectorStrokeLodBuildTiming
+): VectorStrokeLodBuildTiming {
+  return {
+    elapsedMs: a.elapsedMs + b.elapsedMs,
+    buildCount: a.buildCount + b.buildCount,
+    sourceSegmentCount: a.sourceSegmentCount + b.sourceSegmentCount,
+    levelCount: a.levelCount + b.levelCount
+  };
 }
 
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
@@ -1049,6 +1103,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
   const previousStatusText = statusTextElement.textContent;
 
   setDownloadDataButtonState(true, true);
+  statusTextElement.hidden = false;
   statusTextElement.textContent = EXPORT_BUILD_OVERVIEW_TILES
     ? "Preparing parsed texture data zip with WebP overview tiles..."
     : "Preparing parsed texture data zip (fast export)...";
@@ -1082,7 +1137,9 @@ async function downloadParsedDataZip(): Promise<boolean> {
     console.log(
       `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers + ${selectedZip.overviewTileCount.toLocaleString()} ${EXPORT_OVERVIEW_TILE_ENCODING.toUpperCase()} overview tiles to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
     );
-    statusTextElement.textContent = previousStatusText || baseStatus;
+    const restoredStatus = previousStatusText || baseStatus;
+    statusTextElement.textContent = restoredStatus;
+    statusTextElement.hidden = restoredStatus.trim().length === 0;
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1122,12 +1179,6 @@ function delayMilliseconds(durationMs: number): Promise<void> {
   });
 }
 
-function waitForNextAnimationFrame(): Promise<void> {
-  return new Promise((resolve) => {
-    window.requestAnimationFrame(() => resolve());
-  });
-}
-
 function setMetricPlaceholder(label: string = "-"): void {
   metricFileTextElement.textContent = label;
   metricOperatorsTextElement.textContent = "-";
@@ -1164,7 +1215,8 @@ function updateMetricsPanel(
   },
   parseMs: number,
   uploadMs: number,
-  lodTiming: VectorStrokeLodBuildTiming | null
+  lodTiming: VectorStrokeLodBuildTiming | null,
+  totalMs: number | null
 ): void {
   const sourceSegments = scene.sourceSegmentCount;
   const mergedSegments = scene.mergedSegmentCount;
@@ -1195,8 +1247,9 @@ function updateMetricsPanel(
   const lodSuffix = lodTiming && lodTiming.buildCount > 0
     ? `, vector lod ${lodMs.toFixed(0)} ms (${lodTiming.levelCount.toLocaleString()} levels)`
     : ", vector lod -";
+  const totalPrefix = totalMs !== null ? `total ${totalMs.toFixed(0)} ms, ` : "";
   metricTimesTextElement.textContent =
-    `parse ${parseMs.toFixed(0)} ms${lodSuffix}, upload ${uploadMs.toFixed(0)} ms`;
+    `${totalPrefix}parse ${parseMs.toFixed(0)} ms${lodSuffix}, upload ${uploadMs.toFixed(0)} ms`;
   metricTextureTextElement.textContent =
     `fill paths ${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight}, fill seg ${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight}, segments ${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max area ${sceneStats.maxTextureSize}x${sceneStats.maxTextureSize}), text inst ${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight}, glyph ${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight}, glyph-seg ${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight}${rasterSummary ? `, raster ${rasterSummary}` : ""}`;
   metricGridMaxCellTextElement.textContent = sceneStats.maxCellPopulation.toLocaleString();

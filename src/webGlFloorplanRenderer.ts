@@ -3,6 +3,7 @@ import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
+  takePrebuiltVectorStrokeLodRuntime,
   VectorStrokeLodRuntime,
   type VectorLodMode,
   type VectorStrokeLodStats
@@ -3636,9 +3637,11 @@ export class WebGlFloorplanRenderer {
   }
 
   private rebuildVectorLod(scene: VectorScene): boolean {
-    this.vectorLodRuntime = shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)
-      ? new VectorStrokeLodRuntime(scene)
-      : null;
+    if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgl", scene.segmentCount)) {
+      this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
+    } else {
+      this.vectorLodRuntime = null;
+    }
     this.vectorLodStats = null;
 
     if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {

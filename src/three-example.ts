@@ -173,6 +173,8 @@ let lastNativeDrawStats: DrawStats | null = null;
 let drawStatsLastText = "";
 let lodStatsLastText = "";
 let lastLoadTimingText = "-";
+let renderedFrameSerial = 0;
+const pendingRenderedFrameResolvers: Array<() => void> = [];
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
 initializeBackendSelect();
@@ -193,6 +195,8 @@ function renderFrame(now: number = performance.now()): void {
   renderer.render(scene, camera);
   updateDrawStatsMeter();
   updateLodStatsMeter();
+  renderedFrameSerial += 1;
+  resolveRenderedFrameWaiters();
   if (controlsChanged) {
     requestRender();
   }
@@ -202,6 +206,26 @@ function requestRender(): void {
   needsRender = true;
   if (animationFrameId === 0) {
     animationFrameId = requestAnimationFrame(renderFrame);
+  }
+}
+
+function waitForNextRenderedFrame(token: number): Promise<void> {
+  if (token !== loadToken) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    pendingRenderedFrameResolvers.push(resolve);
+    requestRender();
+  });
+}
+
+function resolveRenderedFrameWaiters(): void {
+  if (pendingRenderedFrameResolvers.length <= 0) {
+    return;
+  }
+  const resolvers = pendingRenderedFrameResolvers.splice(0, pendingRenderedFrameResolvers.length);
+  for (const resolve of resolvers) {
+    resolve();
   }
 }
 
@@ -366,19 +390,28 @@ async function loadSource(source: File | string): Promise<void> {
       },
       backend as HeprRendererType
     );
-    const totalLoadMs = performance.now() - loadStart;
+    const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
 
     if (activeLoadToken !== loadToken) {
       nextObject.dispose();
       return;
     }
-    lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount);
     replacePdfObject(nextObject);
     lastLoadedSource = source;
-    setStatus(`Ready. Backend: ${backend.toUpperCase()}. Vector LOD: ${formatVectorLodMode(vectorLod)}.`);
-    updateSceneMetrics(nextObject);
+    updateLoadingProgress(activeLoadToken, {
+      value: 0.99,
+      stage: "first-render",
+      sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "zip"
+    });
+    const firstRenderStart = performance.now();
     requestRender();
+    await waitForNextRenderedFrame(activeLoadToken);
+    const firstRenderMs = performance.now() - firstRenderStart;
+    const totalLoadMs = performance.now() - loadStart;
+    lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstRenderMs, objectReadyMs);
+    clearLoadedStatus();
+    updateSceneMetrics(nextObject);
   } catch (error) {
     if (activeLoadToken !== loadToken) {
       return;
@@ -434,6 +467,12 @@ function disposeCurrentObject(): void {
 
 function setStatus(text: string): void {
   statusElementNode.textContent = text;
+  statusElementNode.hidden = text.trim().length === 0;
+}
+
+function clearLoadedStatus(): void {
+  statusElementNode.textContent = "";
+  statusElementNode.hidden = true;
 }
 
 function setPanelCollapsed(collapsed: boolean): void {
@@ -472,10 +511,16 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
   timesValueElement.textContent = lastLoadTimingText;
 }
 
-function formatLoadTiming(totalLoadMs: number, lodMs: number, lodBuildCount: number): string {
-  const otherMs = Math.max(0, totalLoadMs - Math.max(0, lodMs));
+function formatLoadTiming(
+  totalLoadMs: number,
+  lodMs: number,
+  lodBuildCount: number,
+  firstRenderMs: number,
+  objectReadyMs: number
+): string {
+  const otherMs = Math.max(0, objectReadyMs - Math.max(0, lodMs));
   const lodText = lodBuildCount > 0 ? `${lodMs.toFixed(0)} ms` : "-";
-  return `parse/upload ${otherMs.toFixed(0)} ms, vector lod ${lodText}`;
+  return `total ${totalLoadMs.toFixed(0)} ms, parse/upload ${otherMs.toFixed(0)} ms, vector lod ${lodText}, first render ${firstRenderMs.toFixed(0)} ms`;
 }
 
 function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {

@@ -39,6 +39,17 @@ export interface VectorStrokeLodBuildTiming {
   levelCount: number;
 }
 
+export interface VectorStrokeLodBuildProgress {
+  value: number;
+  message: string;
+}
+
+export interface VectorStrokeLodAsyncBuildOptions {
+  yieldIntervalMs?: number;
+  onProgress?: (progress: VectorStrokeLodBuildProgress) => void;
+  shouldCancel?: () => boolean;
+}
+
 export interface ViewportPixels {
   width: number;
   height: number;
@@ -135,12 +146,20 @@ interface RuntimeTileRange {
   r1: number;
 }
 
+interface VectorStrokeLodRuntimeBuildData {
+  tileGrid: RuntimeTileGrid;
+  levels: RuntimeVectorStrokeLodLevel[];
+  elapsedMs?: number;
+}
+
 let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
   elapsedMs: 0,
   buildCount: 0,
   sourceSegmentCount: 0,
   levelCount: 0
 };
+
+const prebuiltRuntimeByScene = new WeakMap<VectorScene, VectorStrokeLodRuntime[]>();
 
 class Float4Builder {
   private data: Float32Array;
@@ -228,14 +247,14 @@ export class VectorStrokeLodRuntime {
   private lastVisibleSegmentCount = 0;
   private stats: VectorStrokeLodStats;
 
-  constructor(scene: VectorScene) {
+  constructor(scene: VectorScene, buildData?: VectorStrokeLodRuntimeBuildData) {
     const lodBuildStart = nowMs();
-    this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
+    this.tileGrid = buildData?.tileGrid ?? createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
     this.tileSelectedLevelIndices = new Int16Array(this.tileGrid.columns * this.tileGrid.rows);
     this.tileSelectedLevelIndices.fill(-1);
     this.projectedTileAreas = new Float32Array(this.tileGrid.columns * this.tileGrid.rows);
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
-    this.levels = buildVectorStrokeLodScenes(scene).map((levelScene) => {
+    this.levels = buildData?.levels ?? buildVectorStrokeLodScenes(scene).map((levelScene) => {
       const tileData = buildRuntimeTileBuckets(levelScene.scene, this.tileGrid);
       return {
         tolerance: levelScene.tolerance,
@@ -248,7 +267,8 @@ export class VectorStrokeLodRuntime {
       this.activeLevelIndex = 0;
     }
     this.stats = this.createEmptyStats();
-    const elapsedMs = logVectorLodBuildTiming(lodBuildStart, scene.segmentCount, this.levels);
+    const elapsedMs = buildData?.elapsedMs ?? (nowMs() - lodBuildStart);
+    logVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels);
     recordVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels.length);
   }
 
@@ -635,6 +655,319 @@ export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodS
   return levels;
 }
 
+export async function prebuildVectorStrokeLodRuntime(
+  scene: VectorScene,
+  mode: VectorLodMode,
+  rendererType: "webgl" | "webgpu",
+  options: VectorStrokeLodAsyncBuildOptions = {}
+): Promise<VectorStrokeLodRuntime | null> {
+  if (!shouldUseVectorStrokeLod(mode, rendererType, scene.segmentCount)) {
+    return null;
+  }
+
+  const scheduler = new VectorStrokeLodYieldScheduler(options);
+  const startedAt = nowMs();
+  scheduler.report(0, "Preparing Vector LOD");
+  const tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
+  await scheduler.maybeYield(true, 0.04, "Partitioning stroke density");
+
+  const levelScenes = await buildVectorStrokeLodScenesAsync(scene, scheduler);
+  const levels: RuntimeVectorStrokeLodLevel[] = [];
+  const levelCount = Math.max(1, levelScenes.length);
+  for (let i = 0; i < levelScenes.length; i += 1) {
+    const levelScene = levelScenes[i];
+    const startValue = 0.68 + i / levelCount * 0.3;
+    const endValue = 0.68 + (i + 1) / levelCount * 0.3;
+    scheduler.report(startValue, `Building Vector LOD buckets ${i + 1}/${levelScenes.length}`);
+    const tileData = await buildRuntimeTileBucketsAsync(levelScene.scene, tileGrid, scheduler, startValue, endValue);
+    levels.push({
+      tolerance: levelScene.tolerance,
+      scene: levelScene.scene,
+      segmentCount: Math.max(0, levelScene.scene.segmentCount | 0),
+      ...tileData
+    });
+  }
+
+  scheduler.report(0.99, "Finalizing Vector LOD");
+  await scheduler.maybeYield(true, 0.99, "Finalizing Vector LOD");
+  const runtime = new VectorStrokeLodRuntime(scene, {
+    tileGrid,
+    levels,
+    elapsedMs: nowMs() - startedAt
+  });
+  storePrebuiltVectorStrokeLodRuntime(scene, runtime);
+  scheduler.report(1, "Vector LOD ready");
+  return runtime;
+}
+
+export function takePrebuiltVectorStrokeLodRuntime(scene: VectorScene): VectorStrokeLodRuntime | null {
+  const runtimes = prebuiltRuntimeByScene.get(scene);
+  if (!runtimes || runtimes.length <= 0) {
+    return null;
+  }
+  const runtime = runtimes.shift() ?? null;
+  if (runtimes.length <= 0) {
+    prebuiltRuntimeByScene.delete(scene);
+  }
+  return runtime;
+}
+
+function storePrebuiltVectorStrokeLodRuntime(scene: VectorScene, runtime: VectorStrokeLodRuntime): void {
+  const runtimes = prebuiltRuntimeByScene.get(scene);
+  if (runtimes) {
+    runtimes.push(runtime);
+  } else {
+    prebuiltRuntimeByScene.set(scene, [runtime]);
+  }
+}
+
+async function buildVectorStrokeLodScenesAsync(
+  scene: VectorScene,
+  scheduler: VectorStrokeLodYieldScheduler
+): Promise<VectorStrokeLodScene[]> {
+  const baseCount = Math.max(0, scene.segmentCount | 0);
+  const levels: VectorStrokeLodScene[] = [{ tolerance: 0, scene }];
+  let previousCount = baseCount;
+  const toleranceCount = VECTOR_STROKE_LOD_TOLERANCES.length;
+
+  for (let i = 0; i < toleranceCount; i += 1) {
+    const tolerance = VECTOR_STROKE_LOD_TOLERANCES[i];
+    const startValue = 0.06 + i / toleranceCount * 0.62;
+    const endValue = 0.06 + (i + 1) / toleranceCount * 0.62;
+    scheduler.report(startValue, `Simplifying Vector LOD ${i + 1}/${toleranceCount}`);
+    const simplified = await buildSimplifiedStrokeSceneAsync(scene, tolerance, scheduler, startValue, endValue);
+    if (!simplified || simplified.segmentCount <= 0) {
+      continue;
+    }
+    if (simplified.segmentCount >= previousCount * MIN_LEVEL_REDUCTION_RATIO) {
+      continue;
+    }
+    levels.push({
+      tolerance,
+      scene: {
+        ...scene,
+        segmentCount: simplified.segmentCount,
+        endpoints: simplified.endpoints,
+        primitiveMeta: simplified.primitiveMeta,
+        primitiveBounds: simplified.primitiveBounds,
+        styles: simplified.styles,
+        bounds: simplified.bounds,
+        maxHalfWidth: simplified.maxHalfWidth
+      }
+    });
+    previousCount = simplified.segmentCount;
+  }
+
+  return levels;
+}
+
+async function buildSimplifiedStrokeSceneAsync(
+  scene: VectorScene,
+  tolerance: number,
+  scheduler: VectorStrokeLodYieldScheduler,
+  startValue: number,
+  endValue: number
+): Promise<{
+  segmentCount: number;
+  endpoints: Float32Array;
+  primitiveMeta: Float32Array;
+  primitiveBounds: Float32Array;
+  styles: Float32Array;
+  bounds: Bounds;
+  maxHalfWidth: number;
+} | null> {
+  const segmentCount = Math.max(0, scene.segmentCount | 0);
+  if (segmentCount <= 0 || tolerance <= 0) {
+    return null;
+  }
+
+  const grid = createTileGrid(scene.bounds, tolerance);
+  const groups = new Map<string, IntervalGroup>();
+  const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
+  const primitiveMeta = new Float4Builder(Math.min(segmentCount, 65_536));
+  const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
+  const styles = new Float4Builder(Math.min(segmentCount, 65_536));
+  const outBounds = createEmptyBounds();
+  let maxHalfWidth = 0;
+
+  for (let index = 0; index < segmentCount; index += 1) {
+    const primitive = readStrokePrimitive(scene, index);
+    if (!primitive || primitive.alpha <= 0.001) {
+      continue;
+    }
+    if (shouldDropPrimitiveAtTolerance(scene, index, primitive, tolerance)) {
+      continue;
+    }
+
+    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive);
+      maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+      continue;
+    }
+
+    const dx = primitive.x1 - primitive.x0;
+    const dy = primitive.y1 - primitive.y0;
+    if (dx * dx + dy * dy <= 1e-10) {
+      if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
+        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive);
+        maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+      }
+      continue;
+    }
+
+    const tileIndex = tileIndexForPoint(
+      (primitive.x0 + primitive.x1) * 0.5,
+      (primitive.y0 + primitive.y1) * 0.5,
+      scene.bounds,
+      grid
+    );
+    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
+    const start = primitive.x0 * group.axisX + primitive.y0 * group.axisY;
+    const end = primitive.x1 * group.axisX + primitive.y1 * group.axisY;
+    if (start <= end) {
+      group.intervals.push(start, end);
+    } else {
+      group.intervals.push(end, start);
+    }
+    maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+
+    if ((index & 4095) === 0) {
+      const value = startValue + (endValue - startValue) * 0.72 * (index / Math.max(1, segmentCount));
+      await scheduler.maybeYield(false, value, `Simplifying ${formatToleranceName(tolerance)}`);
+    }
+  }
+
+  let groupIndex = 0;
+  const groupCount = Math.max(1, groups.size);
+  for (const group of groups.values()) {
+    emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance);
+    groupIndex += 1;
+    if ((groupIndex & 1023) === 0) {
+      const value = startValue + (endValue - startValue) * (0.72 + 0.28 * groupIndex / groupCount);
+      await scheduler.maybeYield(false, value, `Merging ${formatToleranceName(tolerance)}`);
+    }
+  }
+
+  if (endpoints.quadCount === 0) {
+    return null;
+  }
+
+  return {
+    segmentCount: endpoints.quadCount,
+    endpoints: endpoints.toTypedArray(),
+    primitiveMeta: primitiveMeta.toTypedArray(),
+    primitiveBounds: primitiveBounds.toTypedArray(),
+    styles: styles.toTypedArray(),
+    bounds: normalizeOutputBounds(outBounds, scene.bounds),
+    maxHalfWidth
+  };
+}
+
+async function buildRuntimeTileBucketsAsync(
+  scene: VectorScene,
+  grid: RuntimeTileGrid,
+  scheduler: VectorStrokeLodYieldScheduler,
+  startValue: number,
+  endValue: number
+): Promise<RuntimeStrokeTileBuckets> {
+  const segmentCount = Math.max(0, scene.segmentCount | 0);
+  const tileCount = grid.columns * grid.rows;
+  const tileCounts = new Uint32Array(tileCount);
+  const bounds = await buildRuntimeSegmentBoundsAsync(scene, segmentCount, scheduler, startValue, startValue + (endValue - startValue) * 0.22);
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const range = tileRangeForBounds(bounds.minX[i], bounds.minY[i], bounds.maxX[i], bounds.maxY[i], grid);
+    if (range) {
+      for (let row = range.r0; row <= range.r1; row += 1) {
+        let tileIndex = row * grid.columns + range.c0;
+        for (let column = range.c0; column <= range.c1; column += 1) {
+          tileCounts[tileIndex] += 1;
+          tileIndex += 1;
+        }
+      }
+    }
+    if ((i & 4095) === 0) {
+      const value = startValue + (endValue - startValue) * (0.22 + 0.28 * i / Math.max(1, segmentCount));
+      await scheduler.maybeYield(false, value, "Counting Vector LOD tiles");
+    }
+  }
+
+  const tileOffsets = new Uint32Array(tileCount + 1);
+  for (let i = 0; i < tileCount; i += 1) {
+    tileOffsets[i + 1] = tileOffsets[i] + tileCounts[i];
+  }
+
+  const tileSegmentIds = new Uint32Array(tileOffsets[tileCount]);
+  const cursors = tileOffsets.slice(0, tileCount);
+  for (let i = 0; i < segmentCount; i += 1) {
+    const range = tileRangeForBounds(bounds.minX[i], bounds.minY[i], bounds.maxX[i], bounds.maxY[i], grid);
+    if (range) {
+      for (let row = range.r0; row <= range.r1; row += 1) {
+        let tileIndex = row * grid.columns + range.c0;
+        for (let column = range.c0; column <= range.c1; column += 1) {
+          const writeOffset = cursors[tileIndex];
+          tileSegmentIds[writeOffset] = i;
+          cursors[tileIndex] = writeOffset + 1;
+          tileIndex += 1;
+        }
+      }
+    }
+    if ((i & 4095) === 0) {
+      const value = startValue + (endValue - startValue) * (0.5 + 0.5 * i / Math.max(1, segmentCount));
+      await scheduler.maybeYield(false, value, "Assigning Vector LOD tiles");
+    }
+  }
+
+  return {
+    tileOffsets,
+    tileCounts,
+    tileSegmentIds,
+    segmentMarks: new Uint32Array(segmentCount),
+    segmentMinX: bounds.minX,
+    segmentMinY: bounds.minY,
+    segmentMaxX: bounds.maxX,
+    segmentMaxY: bounds.maxY,
+    visibleSegmentIds: new Uint32Array(Math.max(1, segmentCount)),
+    visibleSegmentCount: 0,
+    markToken: 1
+  };
+}
+
+async function buildRuntimeSegmentBoundsAsync(
+  scene: VectorScene,
+  segmentCount: number,
+  scheduler: VectorStrokeLodYieldScheduler,
+  startValue: number,
+  endValue: number
+): Promise<{
+  minX: Float32Array;
+  minY: Float32Array;
+  maxX: Float32Array;
+  maxY: Float32Array;
+}> {
+  const minX = new Float32Array(segmentCount);
+  const minY = new Float32Array(segmentCount);
+  const maxX = new Float32Array(segmentCount);
+  const maxY = new Float32Array(segmentCount);
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const primitiveBoundsOffset = i * 4;
+    const styleOffset = i * 4;
+    const margin = (scene.styles[styleOffset] ?? 0) + 0.35;
+    minX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+    minY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+    maxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+    maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
+
+    if ((i & 8191) === 0) {
+      const value = startValue + (endValue - startValue) * (i / Math.max(1, segmentCount));
+      await scheduler.maybeYield(false, value, "Preparing Vector LOD bounds");
+    }
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
 export function resetVectorStrokeLodBuildTiming(): void {
   accumulatedBuildTiming = {
     elapsedMs: 0,
@@ -655,6 +988,58 @@ function recordVectorLodBuildTiming(elapsedMs: number, sourceSegmentCount: numbe
   accumulatedBuildTiming.buildCount += 1;
   accumulatedBuildTiming.sourceSegmentCount += Math.max(0, sourceSegmentCount | 0);
   accumulatedBuildTiming.levelCount += Math.max(0, levelCount | 0);
+}
+
+class VectorStrokeLodBuildCancelledError extends Error {
+  constructor() {
+    super("Vector LOD build cancelled.");
+    this.name = "VectorStrokeLodBuildCancelledError";
+  }
+}
+
+class VectorStrokeLodYieldScheduler {
+  private readonly yieldIntervalMs: number;
+  private readonly onProgress?: (progress: VectorStrokeLodBuildProgress) => void;
+  private readonly shouldCancel?: () => boolean;
+  private lastYieldAt = nowMs();
+  private lastProgressValue = -1;
+
+  constructor(options: VectorStrokeLodAsyncBuildOptions) {
+    this.yieldIntervalMs = Math.max(50, Math.trunc(options.yieldIntervalMs ?? 500));
+    this.onProgress = options.onProgress;
+    this.shouldCancel = options.shouldCancel;
+  }
+
+  report(value: number, message: string): void {
+    const normalized = clamp01(value);
+    if (normalized < this.lastProgressValue && this.lastProgressValue >= 0) {
+      return;
+    }
+    this.lastProgressValue = normalized;
+    this.onProgress?.({ value: normalized, message });
+  }
+
+  async maybeYield(force: boolean, value: number, message: string): Promise<void> {
+    if (this.shouldCancel?.()) {
+      throw new VectorStrokeLodBuildCancelledError();
+    }
+    this.report(value, message);
+    const now = nowMs();
+    if (!force && now - this.lastYieldAt < this.yieldIntervalMs) {
+      return;
+    }
+    await yieldToBrowser();
+    this.lastYieldAt = nowMs();
+    if (this.shouldCancel?.()) {
+      throw new VectorStrokeLodBuildCancelledError();
+    }
+  }
+}
+
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, 0);
+  });
 }
 
 export function createRuntimeTileGrid(bounds: Bounds, segmentCount: number, scene?: VectorScene): RuntimeTileGrid {
@@ -1358,11 +1743,10 @@ function nowMs(): number {
 }
 
 function logVectorLodBuildTiming(
-  startMs: number,
+  elapsedMs: number,
   sourceSegmentCount: number,
   levels: Array<{ tolerance: number; segmentCount: number }>
-): number {
-  const elapsedMs = nowMs() - startMs;
+): void {
   const levelSummary = levels
     .map((level) => `${formatToleranceName(level.tolerance)}:${level.segmentCount}`)
     .join(", ");
@@ -1370,7 +1754,6 @@ function logVectorLodBuildTiming(
     `[hepr] vector stroke LOD generated in ${elapsedMs.toFixed(1)}ms ` +
     `(source segments: ${Math.max(0, sourceSegmentCount | 0)}, levels: ${levelSummary})`
   );
-  return elapsedMs;
 }
 
 function clamp01(value: number): number {

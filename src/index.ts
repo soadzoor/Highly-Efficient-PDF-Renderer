@@ -16,10 +16,16 @@ import {
   type CanvasInteractionController
 } from "./canvasInteractions";
 import { createLoadProgressReporter } from "./loadProgress";
+import { prebuildVectorStrokeLodRuntime } from "./vectorStrokeLod";
 
 export interface PdfObjectGeneratorRuntimeOptions
   extends PdfObjectGeneratorOptions,
     Omit<HeprThreeObjectOptions, "rendererType"> {}
+
+const LOAD_PROGRESS_SCENE_END = 0.34;
+const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
+const LOAD_PROGRESS_VECTOR_LOD_END = 0.96;
+const LOAD_PROGRESS_UPLOAD = 0.98;
 
 export async function pdfObjectGenerator(
   source: PdfObjectSource,
@@ -29,16 +35,26 @@ export async function pdfObjectGenerator(
   const progress = createLoadProgressReporter(options.onProgress);
   const loadedScene = await loadPdfSceneFromSource(source, {
     ...options,
-    onProgress: progress.child(0, 0.92).toCallback()
+    onProgress: progress.child(0, LOAD_PROGRESS_SCENE_END).toCallback()
   });
-  progress.report(0.94, { stage: "vector-lod", sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
+  const sourceType = loadedScene.sourceKind === "pdf" ? "pdf" : "zip";
+  progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
+  await prebuildVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
+    yieldIntervalMs: 500,
+    onProgress: (lodProgress) => {
+      const value =
+        LOAD_PROGRESS_VECTOR_LOD_START +
+        lodProgress.value * (LOAD_PROGRESS_VECTOR_LOD_END - LOAD_PROGRESS_VECTOR_LOD_START);
+      progress.report(value, { stage: "vector-lod", sourceType });
+    }
+  });
+  progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType });
   await yieldToHostFrame();
   const object = await createThreePdfObject(loadedScene, {
     ...options,
     rendererType
   });
-  progress.report(0.98, { stage: "upload", sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
-  progress.complete({ sourceType: loadedScene.sourceKind === "pdf" ? "pdf" : "zip" });
+  progress.complete({ sourceType });
   return object;
 }
 
@@ -92,6 +108,8 @@ export type {
 } from "./loadProgress";
 
 export type {
+  VectorStrokeLodAsyncBuildOptions,
+  VectorStrokeLodBuildProgress,
   VectorStrokeLodBuildTiming,
   VectorStrokeLodStats,
   VectorLodMode
@@ -99,6 +117,7 @@ export type {
 
 export {
   consumeVectorStrokeLodBuildTiming,
+  prebuildVectorStrokeLodRuntime,
   resetVectorStrokeLodBuildTiming,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
