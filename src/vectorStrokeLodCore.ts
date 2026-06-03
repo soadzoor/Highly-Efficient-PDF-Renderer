@@ -58,6 +58,8 @@ export interface RuntimeTileGrid {
   maxY: number;
   tileWidth: number;
   tileHeight: number;
+  xEdges: Float64Array;
+  yEdges: Float64Array;
 }
 
 export interface RuntimeStrokeTileBuckets {
@@ -180,6 +182,7 @@ const LOD_RUNTIME_MIN_TILE_COUNT = 256;
 const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
 const LOD_RUNTIME_MAX_GRID_SIDE = 96;
+const LOD_RUNTIME_DENSITY_EDGE_MIN_TILE_RATIO = 0.22;
 const LOD_TILE_MIN_VISIBLE_SEGMENTS = 48;
 const LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS = 384;
 const LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS = 192;
@@ -208,7 +211,7 @@ export class VectorStrokeLodRuntime {
 
   constructor(scene: VectorScene) {
     const lodBuildStart = nowMs();
-    this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0));
+    this.tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
     this.tileSelectedLevelIndices = new Int16Array(this.tileGrid.columns * this.tileGrid.rows);
     this.tileSelectedLevelIndices.fill(-1);
     this.projectedTileAreas = new Float32Array(this.tileGrid.columns * this.tileGrid.rows);
@@ -441,10 +444,10 @@ export class VectorStrokeLodRuntime {
   private computeProjectedTileArea(tileIndex: number, viewport: ViewportPixels): number {
     const column = tileIndex % this.tileGrid.columns;
     const row = Math.floor(tileIndex / this.tileGrid.columns);
-    const minX = this.tileGrid.minX + column * this.tileGrid.tileWidth;
-    const minY = this.tileGrid.minY + row * this.tileGrid.tileHeight;
-    const maxX = column === this.tileGrid.columns - 1 ? this.tileGrid.maxX : minX + this.tileGrid.tileWidth;
-    const maxY = row === this.tileGrid.rows - 1 ? this.tileGrid.maxY : minY + this.tileGrid.tileHeight;
+    const minX = this.tileGrid.xEdges[column];
+    const minY = this.tileGrid.yEdges[row];
+    const maxX = this.tileGrid.xEdges[column + 1];
+    const maxY = this.tileGrid.yEdges[row + 1];
     const viewportWidth = Math.max(1, viewport.width);
     const viewportHeight = Math.max(1, viewport.height);
     const elements = this.localToClip;
@@ -596,7 +599,7 @@ export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodS
   return levels;
 }
 
-export function createRuntimeTileGrid(bounds: Bounds, segmentCount: number): RuntimeTileGrid {
+export function createRuntimeTileGrid(bounds: Bounds, segmentCount: number, scene?: VectorScene): RuntimeTileGrid {
   const width = Math.max(1e-6, bounds.maxX - bounds.minX);
   const height = Math.max(1e-6, bounds.maxY - bounds.minY);
   const targetTileCount = clampInt(
@@ -609,6 +612,8 @@ export function createRuntimeTileGrid(bounds: Bounds, segmentCount: number): Run
   let rows = Math.round(targetTileCount / Math.max(1, columns));
   columns = clampInt(columns, LOD_RUNTIME_MIN_GRID_SIDE, LOD_RUNTIME_MAX_GRID_SIDE);
   rows = clampInt(rows, LOD_RUNTIME_MIN_GRID_SIDE, LOD_RUNTIME_MAX_GRID_SIDE);
+  const xEdges = createRuntimeTileEdges(bounds.minX, bounds.maxX, columns, scene, "x");
+  const yEdges = createRuntimeTileEdges(bounds.minY, bounds.maxY, rows, scene, "y");
   return {
     columns,
     rows,
@@ -617,8 +622,90 @@ export function createRuntimeTileGrid(bounds: Bounds, segmentCount: number): Run
     maxX: bounds.maxX,
     maxY: bounds.maxY,
     tileWidth: width / columns,
-    tileHeight: height / rows
+    tileHeight: height / rows,
+    xEdges,
+    yEdges
   };
+}
+
+function createRuntimeTileEdges(
+  minValue: number,
+  maxValue: number,
+  tileCount: number,
+  scene: VectorScene | undefined,
+  axis: "x" | "y"
+): Float64Array {
+  if (!scene || tileCount <= 1 || scene.segmentCount <= tileCount * 4) {
+    return createUniformTileEdges(minValue, maxValue, tileCount);
+  }
+
+  const span = Math.max(1e-9, maxValue - minValue);
+  const segmentCount = Math.max(0, scene.segmentCount | 0);
+  const binCount = clampInt(tileCount * 16, 256, 4096);
+  const bins = new Float64Array(binCount);
+  const primitiveBounds = scene.primitiveBounds;
+  let weightedCount = 0;
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const offset = i * 4;
+    const a = axis === "x" ? primitiveBounds[offset] : primitiveBounds[offset + 1];
+    const b = axis === "x" ? primitiveBounds[offset + 2] : primitiveBounds[offset + 3];
+    const center = (a + b) * 0.5;
+    if (!Number.isFinite(center)) {
+      continue;
+    }
+    const normalized = (center - minValue) / span;
+    const bin = clampInt(Math.floor(normalized * binCount), 0, binCount - 1);
+    bins[bin] += 1;
+    weightedCount += 1;
+  }
+
+  if (weightedCount <= tileCount) {
+    return createUniformTileEdges(minValue, maxValue, tileCount);
+  }
+
+  // Small uniform density keeps quantile edges stable through empty spans without
+  // losing the density signal from clustered vectors.
+  const densityFloor = Math.max(1e-6, weightedCount / binCount * 0.015);
+  let totalWeight = 0;
+  for (let i = 0; i < binCount; i += 1) {
+    bins[i] += densityFloor;
+    totalWeight += bins[i];
+  }
+
+  const edges = new Float64Array(tileCount + 1);
+  edges[0] = minValue;
+  edges[tileCount] = maxValue;
+  const minStep = span / tileCount * LOD_RUNTIME_DENSITY_EDGE_MIN_TILE_RATIO;
+  let binIndex = 0;
+  let cumulativeBeforeBin = 0;
+
+  for (let edgeIndex = 1; edgeIndex < tileCount; edgeIndex += 1) {
+    const targetWeight = totalWeight * edgeIndex / tileCount;
+    while (binIndex < binCount - 1 && cumulativeBeforeBin + bins[binIndex] < targetWeight) {
+      cumulativeBeforeBin += bins[binIndex];
+      binIndex += 1;
+    }
+    const binWeight = Math.max(1e-9, bins[binIndex]);
+    const fraction = clampNumber((targetWeight - cumulativeBeforeBin) / binWeight, 0, 1);
+    const edge = minValue + ((binIndex + fraction) / binCount) * span;
+    const minAllowed = edges[edgeIndex - 1] + minStep;
+    const maxAllowed = maxValue - (tileCount - edgeIndex) * minStep;
+    edges[edgeIndex] = clampNumber(edge, minAllowed, maxAllowed);
+  }
+
+  return edges;
+}
+
+function createUniformTileEdges(minValue: number, maxValue: number, tileCount: number): Float64Array {
+  const edges = new Float64Array(tileCount + 1);
+  const span = maxValue - minValue;
+  for (let i = 0; i <= tileCount; i += 1) {
+    edges[i] = minValue + span * i / tileCount;
+  }
+  edges[0] = minValue;
+  edges[tileCount] = maxValue;
+  return edges;
 }
 
 export function buildRuntimeTileBuckets(scene: VectorScene, grid: RuntimeTileGrid): RuntimeStrokeTileBuckets {
@@ -764,11 +851,36 @@ function tileRangeForBounds(
     return null;
   }
   return {
-    c0: clampInt(Math.floor((minX - grid.minX) / grid.tileWidth), 0, grid.columns - 1),
-    c1: clampInt(Math.floor((maxX - grid.minX) / grid.tileWidth), 0, grid.columns - 1),
-    r0: clampInt(Math.floor((minY - grid.minY) / grid.tileHeight), 0, grid.rows - 1),
-    r1: clampInt(Math.floor((maxY - grid.minY) / grid.tileHeight), 0, grid.rows - 1)
+    c0: edgeLowerBound(grid.xEdges, minX),
+    c1: edgeUpperBound(grid.xEdges, maxX),
+    r0: edgeLowerBound(grid.yEdges, minY),
+    r1: edgeUpperBound(grid.yEdges, maxY)
   };
+}
+
+function edgeLowerBound(edges: Float64Array, value: number): number {
+  const maxIndex = edges.length - 2;
+  if (value <= edges[0]) {
+    return 0;
+  }
+  if (value >= edges[edges.length - 1]) {
+    return maxIndex;
+  }
+  let low = 0;
+  let high = edges.length - 1;
+  while (low + 1 < high) {
+    const mid = (low + high) >> 1;
+    if (edges[mid] <= value) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  return clampInt(low, 0, maxIndex);
+}
+
+function edgeUpperBound(edges: Float64Array, value: number): number {
+  return edgeLowerBound(edges, value);
 }
 
 function minTileTargetForBaselineLevel(levelIndex: number): number {
