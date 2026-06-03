@@ -313,11 +313,7 @@ export class VectorStrokeLodRuntime {
 
     this.activeLevelIndex = screenErrorLevelIndex;
     const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
-    const minTargetSegmentsPerTile = minTileTargetForBaselineLevel(screenErrorLevelIndex);
-    const targetSegmentsPerTile = Math.max(
-      minTargetSegmentsPerTile,
-      Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / visibleTileCount)
-    );
+    const targetSegmentsPerTile = targetSegmentsPerTileForVisibleTiles(visibleTileCount, screenErrorLevelIndex);
     const averageProjectedTileArea = this.computeProjectedTileAreas(tileRange, viewport);
     let maxBaselineTileSegments = 0;
     let maxBaselineTileSelectedSegments = 0;
@@ -936,6 +932,18 @@ function minTileTargetForBaselineLevel(levelIndex: number): number {
     return LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS;
   }
   return LOD_TILE_MIN_VISIBLE_SEGMENTS;
+}
+
+function targetSegmentsPerTileForVisibleTiles(visibleTileCount: number, baselineLevelIndex: number): number {
+  const globalTarget = Math.max(
+    LOD_TILE_MIN_VISIBLE_SEGMENTS,
+    Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / Math.max(1, visibleTileCount))
+  );
+  const qualityFloor = minTileTargetForBaselineLevel(baselineLevelIndex);
+  if (globalTarget >= qualityFloor) {
+    return globalTarget;
+  }
+  return Math.max(globalTarget, Math.ceil(Math.sqrt(globalTarget * qualityFloor)));
 }
 
 function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
