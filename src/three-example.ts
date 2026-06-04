@@ -31,6 +31,8 @@ const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
 const panOptimizationCheckbox = document.querySelector<HTMLInputElement>("#pan-optimization-checkbox");
 const panOptimizationRow = document.querySelector<HTMLElement>("#pan-optimization-row");
+const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
+const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
 const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
@@ -60,6 +62,8 @@ if (
   !vectorLodSelect ||
   !panOptimizationCheckbox ||
   !panOptimizationRow ||
+  !touchRotateCheckbox ||
+  !touchRotateRow ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
   !pageBackgroundOpacityInput ||
@@ -91,6 +95,8 @@ const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
 const panOptimizationCheckboxElement = panOptimizationCheckbox;
 const panOptimizationRowElement = panOptimizationRow;
+const touchRotateCheckboxElement = touchRotateCheckbox;
+const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
 const pageBackgroundOpacityInputElement = pageBackgroundOpacityInput;
@@ -165,6 +171,7 @@ let drawStatsLastText = "";
 let lodStatsLastText = "";
 let lastLoadTimingText = "-";
 let renderedFrameSerial = 0;
+let touchControlsAvailable = hasTouchCapability();
 const pendingRenderedFrameResolvers: Array<() => void> = [];
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
@@ -211,6 +218,7 @@ function createMapControls(): MapControls {
   nextControls.enableRotate = true;
   nextControls.enableDamping = false;
   nextControls.screenSpacePanning = true;
+  applyTouchGestureMode(nextControls);
   nextControls.addEventListener("change", () => {
     requestRender();
   });
@@ -306,6 +314,7 @@ function resolveRenderedFrameWaiters(): void {
 
 requestRender();
 syncPanOptimizationVisibility();
+syncTouchRotateVisibility();
 
 window.addEventListener("resize", () => {
   renderer.setPixelRatio(window.devicePixelRatio || 1);
@@ -378,6 +387,20 @@ panOptimizationCheckboxElement.addEventListener("change", () => {
   setStatus(`Pan optimization ${enabled ? "enabled" : "disabled"}.`);
   updateDrawStatsMeter();
   requestRender();
+}, { signal: lifetimeSignal });
+
+touchRotateCheckboxElement.addEventListener("change", () => {
+  applyTouchGestureMode(controls);
+  setStatus(`Touch rotate ${readTouchRotateEnabled() ? "enabled" : "disabled"}.`);
+  requestRender();
+}, { signal: lifetimeSignal });
+
+window.addEventListener("pointerdown", (event) => {
+  if (event.pointerType !== "touch" || touchControlsAvailable) {
+    return;
+  }
+  touchControlsAvailable = true;
+  syncTouchRotateVisibility();
 }, { signal: lifetimeSignal });
 
 pageBackgroundColorInputElement.addEventListener("input", applyPageBackgroundFromControls, { signal: lifetimeSignal });
@@ -875,8 +898,34 @@ function readPanOptimizationEnabled(): boolean {
   return panOptimizationCheckboxElement.checked;
 }
 
+function readTouchRotateEnabled(): boolean {
+  return touchRotateCheckboxElement.checked;
+}
+
 function syncPanOptimizationVisibility(): void {
   panOptimizationRowElement.hidden = readVectorLodMode() !== "off";
+}
+
+function syncTouchRotateVisibility(): void {
+  touchRotateRowElement.hidden = !touchControlsAvailable;
+}
+
+function applyTouchGestureMode(targetControls: MapControls): void {
+  targetControls.touches.ONE = THREE.TOUCH.PAN;
+  targetControls.touches.TWO = readTouchRotateEnabled()
+    ? THREE.TOUCH.DOLLY_ROTATE
+    : THREE.TOUCH.DOLLY_PAN;
+}
+
+function hasTouchCapability(): boolean {
+  const touchNavigator = navigator as Navigator & {
+    maxTouchPoints?: number;
+    msMaxTouchPoints?: number;
+  };
+  if ((touchNavigator.maxTouchPoints ?? 0) > 0 || (touchNavigator.msMaxTouchPoints ?? 0) > 0) {
+    return true;
+  }
+  return window.matchMedia?.("(any-pointer: coarse)").matches === true;
 }
 
 function formatVectorLodMode(mode: VectorLodMode): string {
