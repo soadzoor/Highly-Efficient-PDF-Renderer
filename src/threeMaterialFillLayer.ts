@@ -5,6 +5,8 @@ import {
   CORE_FILL_FRAGMENT_SHADER_SOURCE,
   CORE_FILL_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
+import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
 import { createThreeWebGpuFillMaterial, type ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -146,8 +148,8 @@ export class ThreeMaterialFillLayer {
     } else {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
-        vertexShader: normalizeCoreShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE),
-        fragmentShader: normalizeCoreShaderSource(CORE_FILL_FRAGMENT_SHADER_SOURCE),
+        vertexShader: normalizeThreeRawShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE),
+        fragmentShader: normalizeThreeRawShaderSource(CORE_FILL_FRAGMENT_SHADER_SOURCE, true),
         transparent: true,
         depthTest: false,
         depthWrite: false,
@@ -175,6 +177,7 @@ export class ThreeMaterialFillLayer {
         }
       });
     }
+    configureStraightAlphaBlending(material);
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
@@ -400,8 +403,4 @@ function buildFillPathBounds(scene: VectorScene, fillPathCount: number): {
   }
 
   return { minX, minY, maxX, maxY, sceneMinX, sceneMinY, sceneMaxX, sceneMaxY };
-}
-
-function normalizeCoreShaderSource(source: string): string {
-  return source.replace(/^\s*#version\s+300\s+es\s*/m, "");
 }

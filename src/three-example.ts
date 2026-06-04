@@ -128,6 +128,9 @@ const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
 const CAMERA_CLIP_MARGIN_MULTIPLIER = 3.5;
 const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
+const NATIVE_CLEAR_COLOR_R = 160 / 255;
+const NATIVE_CLEAR_COLOR_G = 169 / 255;
+const NATIVE_CLEAR_COLOR_B = 175 / 255;
 const tempObjectBounds = new THREE.Box3();
 const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
@@ -218,10 +221,20 @@ async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promi
 
 function configureThreeRenderer(nextRenderer: ThreeExampleRenderer): void {
   nextRenderer.toneMapping = THREE.NoToneMapping;
+  nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
   nextRenderer.autoClear = false;
-  nextRenderer.setClearColor(new THREE.Color(160 / 255, 169 / 255, 175 / 255), 1);
+  nextRenderer.setClearColor(createNativeClearColor(), 1);
   nextRenderer.setPixelRatio(window.devicePixelRatio || 1);
   nextRenderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
+}
+
+function createNativeClearColor(): THREE.Color {
+  return new THREE.Color().setRGB(
+    NATIVE_CLEAR_COLOR_R,
+    NATIVE_CLEAR_COLOR_G,
+    NATIVE_CLEAR_COLOR_B,
+    THREE.SRGBColorSpace
+  );
 }
 
 function createMapControls(): MapControls {

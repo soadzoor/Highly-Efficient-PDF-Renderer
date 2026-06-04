@@ -1,6 +1,8 @@
 import * as THREE from "three";
 
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { encodeThreeShaderOutputToSrgb } from "./threeRawShaderColorSpace";
 
 interface CompactedStrokeLayerOptions {
   sceneBounds: Bounds;
@@ -189,7 +191,7 @@ export class ThreeCompactedStrokeLayer {
     );
     this.material = new THREE.ShaderMaterial({
       vertexShader: COMPACTED_STROKE_VERTEX_SHADER,
-      fragmentShader: COMPACTED_STROKE_FRAGMENT_SHADER,
+      fragmentShader: encodeThreeShaderOutputToSrgb(COMPACTED_STROKE_FRAGMENT_SHADER),
       transparent: true,
       depthTest: false,
       depthWrite: false,
@@ -200,6 +202,7 @@ export class ThreeCompactedStrokeLayer {
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
     });
+    configureStraightAlphaBlending(this.material);
 
     const effectiveLevels: CompactedLevel[] = [];
     for (const spec of buildLodSpecs(options.sceneBounds)) {

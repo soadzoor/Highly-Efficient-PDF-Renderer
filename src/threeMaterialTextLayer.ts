@@ -6,6 +6,8 @@ import {
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
 import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -175,8 +177,8 @@ export class ThreeMaterialTextLayer {
     } else {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
-        vertexShader: normalizeCoreShaderSource(CORE_TEXT_VERTEX_SHADER_SOURCE),
-        fragmentShader: normalizeCoreShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE),
+        vertexShader: normalizeThreeRawShaderSource(CORE_TEXT_VERTEX_SHADER_SOURCE),
+        fragmentShader: normalizeThreeRawShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE, true),
         transparent: true,
         depthTest: false,
         depthWrite: false,
@@ -214,6 +216,7 @@ export class ThreeMaterialTextLayer {
         }
       });
     }
+    configureStraightAlphaBlending(material);
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
@@ -373,9 +376,6 @@ function createTextGeometry(textInstanceCount: number): THREE.InstancedBufferGeo
   return geometry;
 }
 
-function normalizeCoreShaderSource(source: string): string {
-  return source.replace(/^\s*#version\s+300\s+es\s*/m, "");
-}
 
 function clampInt(value: number, min: number, max: number): number {
   const rounded = Math.trunc(value);

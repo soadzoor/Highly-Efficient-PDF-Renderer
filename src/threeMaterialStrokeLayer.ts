@@ -6,6 +6,8 @@ import {
   CORE_STROKE_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
 import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -144,8 +146,8 @@ export class ThreeMaterialStrokeLayer {
     } else {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
-        vertexShader: normalizeCoreShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
-        fragmentShader: normalizeCoreShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE),
+        vertexShader: normalizeThreeRawShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
+        fragmentShader: normalizeThreeRawShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE, true),
         transparent: true,
         depthTest: false,
         depthWrite: false,
@@ -171,6 +173,7 @@ export class ThreeMaterialStrokeLayer {
         }
       });
     }
+    configureStraightAlphaBlending(material);
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
@@ -482,8 +485,4 @@ function clampToGrid(value: number, side: number): number {
     return side - 1;
   }
   return value;
-}
-
-function normalizeCoreShaderSource(source: string): string {
-  return source.replace(/^\s*#version\s+300\s+es\s*/m, "");
 }

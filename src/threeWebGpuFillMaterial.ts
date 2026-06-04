@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
+import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+
 interface MutableUniform<T> {
   value: T;
 }
@@ -283,6 +285,7 @@ export function createThreeWebGpuFillMaterial(
   material.toneMapped = false;
   material.fog = false;
   material.lights = false;
+  configureStraightAlphaBlending(material);
 
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);

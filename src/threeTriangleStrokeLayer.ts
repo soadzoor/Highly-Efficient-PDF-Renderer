@@ -2,6 +2,8 @@ import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TriangleStrokeLayerOptions {
@@ -238,8 +240,8 @@ export class ThreeTriangleStrokeLayer {
 
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
-      vertexShader: normalizeCoreShaderSource(TRIANGLE_STROKE_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE),
+      vertexShader: normalizeThreeRawShaderSource(TRIANGLE_STROKE_VERTEX_SHADER_SOURCE),
+      fragmentShader: normalizeThreeRawShaderSource(TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE, true),
       transparent: true,
       depthTest: false,
       depthWrite: false,
@@ -261,6 +263,7 @@ export class ThreeTriangleStrokeLayer {
         uVectorOverride: { value: this.vectorOverrideUniform }
       }
     });
+    configureStraightAlphaBlending(material);
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
@@ -521,8 +524,4 @@ function clampToGrid(value: number, side: number): number {
     return side - 1;
   }
   return value;
-}
-
-function normalizeCoreShaderSource(source: string): string {
-  return source.replace(/^\s*#version\s+300\s+es\s*/m, "");
 }
