@@ -165,24 +165,24 @@ fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: ve
 `, [includeNode(distanceToLineSegmentFn)]);
 
 const textCrossingFns = TSL.wgslFn(`
-fn heprAccumulateLineWinding(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>, winding: ptr<function, i32>) {
+fn heprLineWindingDelta(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> i32 {
   let upward = (a.y <= p.y) && (b.y > p.y);
   let downward = (a.y > p.y) && (b.y <= p.y);
   if (!upward && !downward) {
-    return;
+    return 0;
   }
   let denom = b.y - a.y;
   if (abs(denom) <= 0.000001) {
-    return;
+    return 0;
   }
   let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
   if (xCross > p.x) {
     if (upward) {
-      (*winding) = (*winding) + 1;
-    } else {
-      (*winding) = (*winding) - 1;
+      return 1;
     }
+    return -1;
   }
+  return 0;
 }
 
 fn heprEvaluateQuadratic(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t: f32) -> vec2<f32> {
@@ -190,14 +190,16 @@ fn heprEvaluateQuadratic(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t: f32) -> ve
   return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
 }
 
-fn heprAccumulateQuadraticWinding(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>, winding: ptr<function, i32>) {
+fn heprQuadraticWindingDelta(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>) -> i32 {
+  var delta = 0;
   var prev = a;
   for (var i = 1; i <= 6; i = i + 1) {
     let t = f32(i) / 6.0;
     let next = heprEvaluateQuadratic(a, b, c, t);
-    heprAccumulateLineWinding(prev, next, p, winding);
+    delta = delta + heprLineWindingDelta(prev, next, p);
     prev = next;
   }
+  return delta;
 }
 `);
 
@@ -239,10 +241,10 @@ fn heprTextFragment(
 
     if (textCurveEnabled >= 0.5 && primitiveType >= 1.0) {
       minDistance = min(minDistance, heprDistanceToQuadraticBezier(local, p0, p1, p2));
-      heprAccumulateQuadraticWinding(p0, p1, p2, local, &winding);
+      winding = winding + heprQuadraticWindingDelta(p0, p1, p2, local);
     } else {
       minDistance = min(minDistance, heprDistanceToLineSegment(local, p0, p2));
-      heprAccumulateLineWinding(p0, p2, local, &winding);
+      winding = winding + heprLineWindingDelta(p0, p2, local);
     }
   }
 

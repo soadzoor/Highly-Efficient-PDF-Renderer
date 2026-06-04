@@ -129,10 +129,14 @@ fn heprFillFragment(
 
     if (primitiveType >= 1.0) {
       minDistance = min(minDistance, heprDistanceToQuadraticBezier(local, p0, p1, p2));
-      heprAccumulateQuadraticCrossing(p0, p1, p2, local, &winding, &crossings);
+      let crossingDelta = heprQuadraticCrossingDelta(p0, p1, p2, local);
+      winding = winding + crossingDelta.x;
+      crossings = crossings + crossingDelta.y;
     } else {
       minDistance = min(minDistance, heprDistanceToLineSegment(local, p0, p2));
-      heprAccumulateLineCrossing(p0, p2, local, &winding, &crossings);
+      let crossingDelta = heprLineCrossingDelta(p0, p2, local);
+      winding = winding + crossingDelta.x;
+      crossings = crossings + crossingDelta.y;
     }
   }
 
@@ -227,25 +231,25 @@ fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: ve
 }
 `)),
   includeNode(TSL.wgslFn(`
-fn heprAccumulateLineCrossing(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>, winding: ptr<function, i32>, crossings: ptr<function, i32>) {
+fn heprLineCrossingDelta(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> vec2<i32> {
   let upward = (a.y <= p.y) && (b.y > p.y);
   let downward = (a.y > p.y) && (b.y <= p.y);
   if (!upward && !downward) {
-    return;
+    return vec2<i32>(0);
   }
   let denom = b.y - a.y;
   if (abs(denom) <= 0.000001) {
-    return;
+    return vec2<i32>(0);
   }
   let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
   if (xCross > p.x) {
-    (*crossings) = (*crossings) + 1;
+    var windingDelta = -1;
     if (upward) {
-      (*winding) = (*winding) + 1;
-    } else {
-      (*winding) = (*winding) - 1;
+      windingDelta = 1;
     }
+    return vec2<i32>(windingDelta, 1);
   }
+  return vec2<i32>(0);
 }
 `)),
   includeNode(TSL.wgslFn(`
@@ -254,14 +258,16 @@ fn heprEvaluateQuadratic(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t: f32) -> ve
   return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
 }
 
-fn heprAccumulateQuadraticCrossing(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>, winding: ptr<function, i32>, crossings: ptr<function, i32>) {
+fn heprQuadraticCrossingDelta(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>) -> vec2<i32> {
+  var delta = vec2<i32>(0);
   var prev = a;
   for (var i = 1; i <= 6; i = i + 1) {
     let t = f32(i) / 6.0;
     let next = heprEvaluateQuadratic(a, b, c, t);
-    heprAccumulateLineCrossing(prev, next, p, winding, crossings);
+    delta = delta + heprLineCrossingDelta(prev, next, p);
     prev = next;
   }
+  return delta;
 }
 `))
 ]);
