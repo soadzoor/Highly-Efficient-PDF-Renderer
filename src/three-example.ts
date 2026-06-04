@@ -196,7 +196,7 @@ setPanelCollapsed(false);
 function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLRenderer {
   const nextRenderer = new THREE.WebGLRenderer({
     canvas: targetCanvas,
-    antialias: false,
+    antialias: true,
     alpha: false,
     depth: true,
     stencil: false,
@@ -210,7 +210,7 @@ function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLR
 async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promise<WebGPURenderer> {
   const nextRenderer = new WebGPURenderer({
     canvas: targetCanvas,
-    antialias: false,
+    antialias: true,
     alpha: false,
     depth: true,
     stencil: false
