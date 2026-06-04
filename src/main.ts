@@ -30,6 +30,12 @@ import {
   type NormalizedExampleEntry
 } from "./exampleManifest";
 import {
+  formatPdfDownloadFilename,
+  readPdfDownloadBlob,
+  triggerBrowserDownload,
+  type PdfDownloadSource
+} from "./downloadUtils";
+import {
   createLoadProgressReporter,
   formatLoadProgressStage,
   type PDFLoadProgress
@@ -52,6 +58,7 @@ const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon"
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-data");
+const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-pdf");
 const downloadAllDataButton = document.querySelector<HTMLButtonElement>("#download-all-data");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
@@ -90,6 +97,7 @@ if (
   !openButton ||
   !exampleSelect ||
   !downloadDataButton ||
+  !downloadPdfButton ||
   !downloadAllDataButton ||
   !fileInput ||
   !statusElement ||
@@ -130,6 +138,7 @@ const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
 const exampleSelectElement = exampleSelect;
 const downloadDataButtonElement = downloadDataButton;
+const downloadPdfButtonElement = downloadPdfButton;
 const downloadAllDataButtonElement = downloadAllDataButton;
 const fileInputElement = fileInput;
 const statusTextElement = statusElement;
@@ -280,10 +289,12 @@ interface ExampleSelection {
   sourceName: string;
   kind: ExampleSelectionKind;
   path: string;
+  pdfPath: string;
 }
 
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 let exampleManifestEntries: NormalizedExampleEntry[] = [];
+let lastDownloadablePdf: PdfDownloadSource | null = null;
 
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
@@ -334,6 +345,7 @@ backendSwitcher.initializeToggleState();
 setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
+setDownloadPdfButtonState(false);
 setDownloadAllDataButtonState(false);
 syncPanOptimizationVisibility();
 setStatus(baseStatus);
@@ -346,6 +358,10 @@ openButtonElement.addEventListener("click", () => {
 
 downloadDataButtonElement.addEventListener("click", () => {
   void downloadParsedDataZip();
+});
+
+downloadPdfButtonElement.addEventListener("click", () => {
+  void downloadSourcePdf();
 });
 
 downloadAllDataButtonElement.addEventListener("click", () => {
@@ -510,13 +526,15 @@ function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
       id: entry.id,
       sourceName: entry.name,
       kind: "pdf",
-      path: entry.pdfPath
+      path: entry.pdfPath,
+      pdfPath: entry.pdfPath
     });
     exampleSelectionMap.set(zipKey, {
       id: entry.id,
       sourceName: entry.name,
       kind: "zip",
-      path: entry.zipPath
+      path: entry.zipPath,
+      pdfPath: entry.pdfPath
     });
 
     group.append(new Option(pdfLabel, pdfKey));
@@ -555,6 +573,11 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
         bytes,
         label: selection.sourceName
       };
+      lastDownloadablePdf = {
+        label: selection.sourceName,
+        bytes
+      };
+      setDownloadPdfButtonState(true);
       await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
         preserveView: false
       });
@@ -565,6 +588,11 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
         bytes,
         label: zipLabel
       };
+      lastDownloadablePdf = {
+        label: selection.sourceName,
+        url: selection.pdfPath
+      };
+      setDownloadPdfButtonState(true);
       await loadParsedDataZipBuffer(createParseBuffer(bytes), zipLabel, {
         preserveView: false
       });
@@ -594,20 +622,32 @@ function isParsedDataZipFile(file: File): boolean {
 
 async function loadPdfFile(file: File): Promise<void> {
   setStatus(`Reading ${file.name}...`);
+  setDownloadPdfButtonState(false);
   const buffer = await file.arrayBuffer();
   const bytes = cloneSourceBytes(buffer);
   lastLoadedSource = { kind: "pdf", bytes, label: file.name };
+  lastDownloadablePdf = { label: file.name, bytes };
+  setDownloadPdfButtonState(true);
   parsedPdfPageCache = null;
   await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
 }
 
 async function loadParsedDataZipFile(file: File): Promise<void> {
   setStatus(`Reading ${file.name}...`);
+  lastDownloadablePdf = null;
+  setDownloadPdfButtonState(false);
   const buffer = await file.arrayBuffer();
   const bytes = cloneSourceBytes(buffer);
   lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
   parsedPdfPageCache = null;
   await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+  if (lastLoadedSource?.bytes === bytes) {
+    const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(bytes);
+    if (sourcePdfBytes && sourcePdfBytes.length > 0) {
+      lastDownloadablePdf = { label: file.name, bytes: sourcePdfBytes };
+      setDownloadPdfButtonState(true);
+    }
+  }
 }
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
@@ -1001,6 +1041,12 @@ function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): voi
   downloadDataButtonElement.textContent = isBusy ? "Preparing ZIP..." : "Download Parsed Data";
 }
 
+function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
+  downloadPdfButtonElement.hidden = !hasPdf;
+  downloadPdfButtonElement.disabled = !hasPdf || isBusy || isBatchExampleExportRunning;
+  downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
+}
+
 function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, progressText?: string): void {
   downloadAllDataButtonElement.hidden = !bulkZipExportEnabled;
   downloadAllDataButtonElement.disabled = !bulkZipExportEnabled || !hasExamples || isBusy;
@@ -1036,6 +1082,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
   isBatchExampleExportRunning = true;
   setPrimaryLoadControlsEnabled(false);
   setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneStats && lastParsedSceneLabel), false);
+  setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(true, true, `Exporting 0/${pdfEntries.length}...`);
 
   try {
@@ -1052,6 +1099,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
 
       const bytes = cloneSourceBytes(await response.arrayBuffer());
       lastLoadedSource = { kind: "pdf", bytes, label: entry.name };
+      lastDownloadablePdf = { label: entry.name, bytes };
       lastParsedScene = null;
       lastParsedSceneStats = null;
       lastParsedSceneLabel = null;
@@ -1081,6 +1129,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
     isBatchExampleExportRunning = false;
     setPrimaryLoadControlsEnabled(true);
     setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneStats && lastParsedSceneLabel), false);
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
     setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
   }
 }
@@ -1134,7 +1183,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
     );
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
-    triggerBlobDownload(selectedZip.blob, zipFileName);
+    triggerBrowserDownload(selectedZip.blob, zipFileName);
     console.log(
       `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers + ${selectedZip.overviewTileCount.toLocaleString()} ${EXPORT_OVERVIEW_TILE_ENCODING.toUpperCase()} overview tiles to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
     );
@@ -1151,6 +1200,26 @@ async function downloadParsedDataZip(): Promise<boolean> {
   }
 }
 
+async function downloadSourcePdf(): Promise<boolean> {
+  if (!lastDownloadablePdf) {
+    setStatus("No source PDF is available for the current file.");
+    return false;
+  }
+
+  setDownloadPdfButtonState(true, true);
+  try {
+    const blob = await readPdfDownloadBlob(lastDownloadablePdf);
+    triggerBrowserDownload(blob, formatPdfDownloadFilename(lastDownloadablePdf.label));
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to download PDF: ${message}`);
+    return false;
+  } finally {
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+  }
+}
+
 function formatKilobytes(sizeBytes: number): string {
   const safeBytes = Math.max(0, Number(sizeBytes) || 0);
   return (safeBytes / 1024).toFixed(1);
@@ -1160,18 +1229,6 @@ function sanitizeDownloadName(label: string): string {
   const withoutExtension = label.replace(/\.pdf$/i, "");
   const normalized = withoutExtension.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
   return normalized.length > 0 ? normalized : "floorplan";
-}
-
-function triggerBlobDownload(blob: Blob, filename: string): void {
-  const downloadUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = downloadUrl;
-  link.download = filename;
-  link.style.display = "none";
-  document.body.append(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(downloadUrl), 0);
 }
 
 function delayMilliseconds(durationMs: number): Promise<void> {

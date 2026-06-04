@@ -22,6 +22,20 @@ import {
 } from "./exampleManifest";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
+import {
+  buildParsedDataZipBlobForLayout,
+  listSceneRasterLayers,
+  tryReadSourcePdfBytesFromExistingParsedZip,
+  type TextureLayout
+} from "./parsedDataZip";
+import {
+  filenameFromUrl,
+  formatPdfDownloadFilename,
+  readPdfDownloadBlob,
+  readPdfDownloadBytes,
+  triggerBrowserDownload,
+  type PdfDownloadSource
+} from "./downloadUtils";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const panel = document.querySelector<HTMLDivElement>("#panel");
@@ -30,6 +44,8 @@ const togglePanelIcon = document.querySelector<HTMLSpanElement>("#toggle-panel-i
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
+const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-data");
+const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-pdf");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
 const panOptimizationCheckbox = document.querySelector<HTMLInputElement>("#pan-optimization-checkbox");
@@ -61,6 +77,8 @@ if (
   !openButton ||
   !fileInput ||
   !exampleSelect ||
+  !downloadDataButton ||
+  !downloadPdfButton ||
   !backendSelect ||
   !vectorLodSelect ||
   !panOptimizationCheckbox ||
@@ -94,6 +112,8 @@ const togglePanelIconElement = togglePanelIcon;
 const openButtonElement = openButton;
 const fileInputElement = fileInput;
 const exampleSelectElement = exampleSelect;
+const downloadDataButtonElement = downloadDataButton;
+const downloadPdfButtonElement = downloadPdfButton;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
 const panOptimizationCheckboxElement = panOptimizationCheckbox;
@@ -132,6 +152,12 @@ const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
 const NATIVE_CLEAR_COLOR_R = 160 / 255;
 const NATIVE_CLEAR_COLOR_G = 169 / 255;
 const NATIVE_CLEAR_COLOR_B = 175 / 255;
+const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
+const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
+const EXPORT_ZIP_DEFLATE_LEVEL = 9;
+const EXPORT_ENCODE_RASTER_IMAGES = true;
+const EXPORT_BUILD_OVERVIEW_TILES = true;
+const EXPORT_OVERVIEW_TILE_ENCODING = "webp" as const;
 const tempObjectBounds = new THREE.Box3();
 const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
@@ -177,6 +203,7 @@ if (threeCameraDebugLogs) {
 
 let currentPdfObject: HeprThreePdfObject | null = null;
 let lastLoadedSource: File | string | null = null;
+let lastDownloadablePdf: PdfDownloadSource | null = null;
 let animationFrameId = 0;
 let needsRender = false;
 let fpsLastSampleTime = 0;
@@ -192,6 +219,8 @@ const exampleSelectionMap = new Map<string, ExampleSelection>();
 
 initializeBackendSelect();
 setPanelCollapsed(false);
+setDownloadDataButtonState(false);
+setDownloadPdfButtonState(false);
 
 function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLRenderer {
   const nextRenderer = new THREE.WebGLRenderer({
@@ -374,6 +403,14 @@ exampleSelectElement.addEventListener("change", () => {
   void loadExampleSelection(selectionKey);
 }, { signal: lifetimeSignal });
 
+downloadDataButtonElement.addEventListener("click", () => {
+  void downloadParsedDataZip();
+}, { signal: lifetimeSignal });
+
+downloadPdfButtonElement.addEventListener("click", () => {
+  void downloadSourcePdf();
+}, { signal: lifetimeSignal });
+
 fileInputElement.addEventListener("change", () => {
   const file = fileInputElement.files?.[0];
   if (!file) {
@@ -503,14 +540,21 @@ function readThreeObjectOptions(backend: HeprRendererType): Omit<HeprThreeObject
   };
 }
 
-async function loadSource(source: File | string): Promise<void> {
+async function loadSource(
+  source: File | string,
+  options: { pdfDownloadHint?: PdfDownloadSource | null } = {}
+): Promise<void> {
   const activeLoadToken = ++loadToken;
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
   const objectOptions = readThreeObjectOptions(backend);
+  const previousPdfObject = currentPdfObject;
+  const previousDownloadablePdf = lastDownloadablePdf;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "Parsing / loading 0.00%");
   setLoadControlsEnabled(false);
+  setDownloadDataButtonState(false);
+  setDownloadPdfButtonState(false);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
   panOptimizationCheckboxElement.disabled = true;
@@ -545,6 +589,9 @@ async function loadSource(source: File | string): Promise<void> {
     }
     replacePdfObject(nextObject);
     lastLoadedSource = source;
+    lastDownloadablePdf = await resolveDownloadablePdfSource(source, nextObject, options.pdfDownloadHint ?? null);
+    setDownloadDataButtonState(true);
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     updateLoadingProgress(activeLoadToken, {
       value: 0.99,
       stage: "first-render",
@@ -563,6 +610,11 @@ async function loadSource(source: File | string): Promise<void> {
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
+    if (currentPdfObject === previousPdfObject) {
+      lastDownloadablePdf = previousDownloadablePdf;
+      setDownloadDataButtonState(Boolean(currentPdfObject), false);
+      setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+    }
     setStatus(`Failed to load source: ${message}`);
   } finally {
     if (activeLoadToken === loadToken) {
@@ -617,6 +669,8 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
     replacePdfObject(nextObject, { fitCamera: false });
     restoreCameraSnapshot(cameraSnapshot);
     updateSceneMetrics(nextObject);
+    setDownloadDataButtonState(true);
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     clearLoadedStatus();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -630,6 +684,8 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
       replacePdfObject(fallbackObject, { fitCamera: false });
       restoreCameraSnapshot(cameraSnapshot);
       updateSceneMetrics(fallbackObject);
+      setDownloadDataButtonState(true);
+      setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     } catch {
       // Leave the original error visible; the user action needs attention.
     }
@@ -662,6 +718,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   }
   updateCameraClipping(true);
   updateDrawStatsMeter();
+  setDownloadDataButtonState(true);
   requestRender();
 }
 
@@ -677,12 +734,15 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   currentPdfObject = null;
   lastNativeDrawStats = null;
   if (clearMetrics) {
+    lastDownloadablePdf = null;
     fileValueElement.textContent = "-";
     sourceSegmentsValueElement.textContent = "-";
     visibleSegmentsValueElement.textContent = "-";
     timesValueElement.textContent = "-";
     setDrawStatsText("-");
     setLodStatsText("-");
+    setDownloadDataButtonState(false);
+    setDownloadPdfButtonState(false);
   }
   requestRender();
 }
@@ -708,6 +768,18 @@ function setLoadControlsEnabled(enabled: boolean): void {
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleSelectElement.disabled = !enabled || exampleSelectionMap.size === 0;
+}
+
+function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
+  downloadDataButtonElement.hidden = !hasParsedData;
+  downloadDataButtonElement.disabled = !hasParsedData || isBusy;
+  downloadDataButtonElement.textContent = isBusy ? "Preparing ZIP..." : "Download Parsed Data";
+}
+
+function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
+  downloadPdfButtonElement.hidden = !hasPdf;
+  downloadPdfButtonElement.disabled = !hasPdf || isBusy;
+  downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
 }
 
 function initializeBackendSelect(): void {
@@ -737,6 +809,120 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
   visibleSegmentsValueElement.textContent =
     `${visibleSegments.toLocaleString()} (${Math.max(0, totalReduction).toFixed(1)}% total reduction), fills ${sceneData.fillPathCount.toLocaleString()}, text ${sceneData.textInstanceCount.toLocaleString()} instances, pages ${sceneData.pageCount.toLocaleString()} (${sceneData.pagesPerRow.toLocaleString()}/row)`;
   timesValueElement.textContent = lastLoadTimingText;
+}
+
+async function downloadParsedDataZip(): Promise<boolean> {
+  const pdfObject = currentPdfObject;
+  const sceneStats = pdfObject?.renderer.getSceneStats() ?? null;
+  if (!pdfObject || !sceneStats) {
+    setStatus("No parsed floorplan data available to export.");
+    return false;
+  }
+
+  setDownloadDataButtonState(true, true);
+  try {
+    const sceneData = pdfObject.sceneData;
+    const sourcePdfBytes = sceneData.imagePaintOpCount > 0 && lastDownloadablePdf
+      ? await readPdfDownloadBytes(lastDownloadablePdf)
+      : null;
+    const sceneRasterLayers = listSceneRasterLayers(sceneData);
+    const selectedZip = await buildParsedDataZipBlobForLayout(
+      sceneData,
+      sceneStats,
+      pdfObject.sourceLabel,
+      sourcePdfBytes,
+      EXPORT_TEXTURE_LAYOUT,
+      sceneRasterLayers,
+      {
+        encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
+        buildOverviewTiles: EXPORT_BUILD_OVERVIEW_TILES,
+        overviewTileEncoding: EXPORT_OVERVIEW_TILE_ENCODING,
+        overviewTileRenderConfig: {
+          pageBackground: readPageBackgroundColor(),
+          vectorOverride: readVectorOverrideColor(),
+          strokeCurveEnabled: true,
+          textVectorOnly: false
+        },
+        zipCompression: EXPORT_ZIP_COMPRESSION,
+        zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
+      }
+    );
+
+    const zipFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.zip`;
+    triggerBrowserDownload(selectedZip.blob, zipFileName);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to download parsed data: ${message}`);
+    return false;
+  } finally {
+    setDownloadDataButtonState(Boolean(currentPdfObject), false);
+  }
+}
+
+async function downloadSourcePdf(): Promise<boolean> {
+  if (!lastDownloadablePdf) {
+    setStatus("No source PDF is available for the current file.");
+    return false;
+  }
+
+  setDownloadPdfButtonState(true, true);
+  try {
+    const blob = await readPdfDownloadBlob(lastDownloadablePdf);
+    triggerBrowserDownload(blob, formatPdfDownloadFilename(lastDownloadablePdf.label));
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to download PDF: ${message}`);
+    return false;
+  } finally {
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+  }
+}
+
+async function resolveDownloadablePdfSource(
+  source: File | string,
+  pdfObject: HeprThreePdfObject,
+  hint: PdfDownloadSource | null
+): Promise<PdfDownloadSource | null> {
+  if (pdfObject.sourceKind === "pdf") {
+    if (source instanceof File) {
+      return { label: source.name, blob: source };
+    }
+    return {
+      label: filenameFromUrl(source, pdfObject.sourceLabel),
+      url: source
+    };
+  }
+
+  if (hint) {
+    return hint;
+  }
+
+  const zipBytes = await readParsedZipBytesForSource(source);
+  if (!zipBytes) {
+    return null;
+  }
+  const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(zipBytes);
+  return sourcePdfBytes && sourcePdfBytes.length > 0
+    ? { label: pdfObject.sourceLabel, bytes: sourcePdfBytes }
+    : null;
+}
+
+async function readParsedZipBytesForSource(source: File | string): Promise<Uint8Array | null> {
+  try {
+    if (source instanceof File) {
+      return new Uint8Array(await source.arrayBuffer());
+    }
+
+    const response = await fetch(source, { cache: "no-store" });
+    if (!response.ok) {
+      return null;
+    }
+    return new Uint8Array(await response.arrayBuffer());
+  } catch {
+    return null;
+  }
 }
 
 function formatLoadTiming(
@@ -923,13 +1109,15 @@ function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
       id: entry.id,
       sourceName: entry.name,
       kind: "pdf",
-      path: entry.pdfPath
+      path: entry.pdfPath,
+      pdfPath: entry.pdfPath
     });
     exampleSelectionMap.set(zipKey, {
       id: entry.id,
       sourceName: entry.name,
       kind: "zip",
-      path: entry.zipPath
+      path: entry.zipPath,
+      pdfPath: entry.pdfPath
     });
 
     group.append(new Option(pdfLabel, pdfKey));
@@ -952,7 +1140,12 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
   try {
     const modeLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
     setStatus(`Loading example ${selection.sourceName} (${modeLabel})...`);
-    await loadSource(selection.path);
+    await loadSource(selection.path, {
+      pdfDownloadHint: {
+        label: selection.sourceName,
+        url: selection.pdfPath
+      }
+    });
   } finally {
     exampleSelectElement.value = "";
     exampleSelectElement.disabled = exampleSelectionMap.size === 0;
@@ -961,6 +1154,12 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
 
 function formatKilobytes(bytes: number): string {
   return (bytes / 1024).toFixed(1);
+}
+
+function sanitizeDownloadName(label: string): string {
+  const withoutExtension = label.replace(/\.pdf$/i, "");
+  const normalized = withoutExtension.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
+  return normalized.length > 0 ? normalized : "floorplan";
 }
 
 function readVectorLodMode(): VectorLodMode {
@@ -1021,6 +1220,7 @@ interface ExampleSelection {
   sourceName: string;
   kind: ExampleSelectionKind;
   path: string;
+  pdfPath: string;
 }
 
 function resolveCanvasAspect(): number {
