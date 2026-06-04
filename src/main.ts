@@ -39,9 +39,9 @@ import {
   prebuildVectorStrokeLodRuntime,
   resetVectorStrokeLodBuildTiming,
   type VectorLodMode,
-  type VectorStrokeLodBuildTiming,
-  type VectorStrokeLodStats
+  type VectorStrokeLodBuildTiming
 } from "./vectorStrokeLodCore";
+import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -185,7 +185,8 @@ function onRendererFrame(stats: DrawStats): void {
   const total = stats.totalSegments.toLocaleString();
   const mode = stats.usedCulling ? "culled" : "full";
   const activeBackendLabel = (backendSwitcher?.getActiveBackend() ?? "webgl").toUpperCase();
-  const vectorLodSuffix = formatRuntimeVectorLodStats(renderer.getVectorStrokeLodStats?.() ?? null);
+  const vectorLodStats = formatVectorStrokeLodStats(renderer.getVectorStrokeLodStats?.() ?? null);
+  const vectorLodSuffix = vectorLodStats ? ` | ${vectorLodStats}` : "";
   runtimeTextElement.textContent =
     `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}`;
 }
@@ -1260,39 +1261,6 @@ function formatPercent(value: number): string {
   return `${Math.max(0, value).toFixed(1)}%`;
 }
 
-function formatRuntimeVectorLodStats(stats: VectorStrokeLodStats | null): string {
-  if (!stats || stats.totalLevels <= 1) {
-    return "";
-  }
-
-  const activeLevels = stats.activeLevels.length > 0
-    ? stats.activeLevels
-      .map((level) => `${formatLodTolerance(level.tolerance)}:${formatCompactCount(level.renderedSegments)}`)
-      .join(" ")
-    : "none";
-
-  return (
-    ` | lod ${formatCompactCount(stats.renderedSegments)} seg` +
-    `, ${stats.visibleTileCount.toLocaleString()} tiles` +
-    `, target ${formatCompactCount(stats.targetSegmentsPerTile)}/tile` +
-    `, active ${activeLevels}`
-  );
-}
-
-function formatCompactCount(value: number): string {
-  const count = Math.max(0, Math.round(value));
-  if (count >= 1_000_000) {
-    return `${(count / 1_000_000).toFixed(1)}M`;
-  }
-  if (count >= 10_000) {
-    return `${Math.round(count / 1_000)}k`;
-  }
-  return count.toLocaleString();
-}
-
-function formatLodTolerance(tolerance: number): string {
-  return tolerance <= 0 ? "exact" : `tol${tolerance}`;
-}
 
 function updateFpsMetric(): void {
   const now = performance.now();

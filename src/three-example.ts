@@ -21,6 +21,7 @@ import {
   type NormalizedExampleEntry
 } from "./exampleManifest";
 import { formatLoadProgressStage } from "./loadProgress";
+import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const panel = document.querySelector<HTMLDivElement>("#panel");
@@ -862,26 +863,7 @@ function setDrawStatsText(text: string): void {
 
 function updateLodStatsMeter(): void {
   const stats = currentPdfObject?.getVectorStrokeLodStats() ?? null;
-  if (!stats || stats.totalLevels <= 1) {
-    setLodStatsText("-");
-    return;
-  }
-
-  const activeLevels = stats.activeLevels.length > 0
-    ? stats.activeLevels
-      .map((level) => `${formatLodTolerance(level.tolerance)}:${formatCompactCount(level.renderedSegments)}`)
-      .join(" ")
-    : "none";
-  setLodStatsText(
-    `${formatCompactCount(stats.renderedSegments)} seg | ` +
-    `${stats.visibleTileCount.toLocaleString()} tiles | ` +
-    `target ${formatCompactCount(stats.targetSegmentsPerTile)}/tile | ` +
-    `zoom ${formatLodTolerance(stats.baselineTolerance)} | ` +
-    `active ${activeLevels} | ` +
-    `dense exact ${stats.maxBaselineTileSegments.toLocaleString()} -> ` +
-    `${stats.maxBaselineTileSelectedSegments.toLocaleString()} @${formatLodTolerance(stats.maxBaselineTileSelectedTolerance)} | ` +
-    `peak ${stats.maxSelectedTileSegments.toLocaleString()} @${formatLodTolerance(stats.maxSelectedTileTolerance)}`
-  );
+  setLodStatsText(formatVectorStrokeLodStats(stats) || "-");
 }
 
 function setLodStatsText(text: string): void {
@@ -979,21 +961,6 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
 
 function formatKilobytes(bytes: number): string {
   return (bytes / 1024).toFixed(1);
-}
-
-function formatCompactCount(value: number): string {
-  const count = Math.max(0, Math.round(value));
-  if (count >= 1_000_000) {
-    return `${(count / 1_000_000).toFixed(1)}M`;
-  }
-  if (count >= 10_000) {
-    return `${Math.round(count / 1_000)}k`;
-  }
-  return count.toLocaleString();
-}
-
-function formatLodTolerance(tolerance: number): string {
-  return tolerance <= 0 ? "exact" : `tol${tolerance}`;
 }
 
 function readVectorLodMode(): VectorLodMode {

@@ -152,6 +152,11 @@ interface VectorStrokeLodRuntimeBuildData {
   elapsedMs?: number;
 }
 
+interface ProjectedTileAreaStats {
+  averageArea: number;
+  useDynamicBudget: boolean;
+}
+
 let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
   elapsedMs: 0,
   buildCount: 0,
@@ -229,6 +234,8 @@ const LOD_TILE_SELECTION_HYSTERESIS_RATIO = 0.18;
 const LOD_TILE_UNDERSHOOT_SCORE_WEIGHT = 1.15;
 const LOD_TILE_PROJECTED_MIN_FACTOR = 0.1;
 const LOD_TILE_PROJECTED_MAX_FACTOR = 4096;
+const LOD_TILE_PROJECTED_DYNAMIC_AREA_RATIO = 1.25;
+const LOD_TILE_PROJECTED_PERSPECTIVE_RATIO = 0.015;
 const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
 const LOD_TILE_WORLD_FACTOR = 192;
@@ -354,7 +361,7 @@ export class VectorStrokeLodRuntime {
     this.activeLevelIndex = screenErrorLevelIndex;
     const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
     const targetSegmentsPerTile = targetSegmentsPerTileForVisibleTiles(visibleTileCount, screenErrorLevelIndex);
-    const averageProjectedTileArea = this.computeProjectedTileAreas(tileRange, viewport);
+    const projectedTileAreaStats = this.computeProjectedTileAreaStats(tileRange, viewport);
     let maxBaselineTileSegments = 0;
     let maxBaselineTileSelectedSegments = 0;
     let maxBaselineTileSelectedLevelIndex = screenErrorLevelIndex;
@@ -367,7 +374,7 @@ export class VectorStrokeLodRuntime {
         const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
         const tileTargetSegments = this.computeTileTargetSegments(
           targetSegmentsPerTile,
-          averageProjectedTileArea,
+          projectedTileAreaStats,
           this.projectedTileAreas[tileIndex]
         );
         const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments);
@@ -458,13 +465,14 @@ export class VectorStrokeLodRuntime {
     return bestIndex >= 0 ? bestIndex : smallestCountIndex;
   }
 
-  private computeProjectedTileAreas(tileRange: RuntimeTileRange, viewport: ViewportPixels): number {
-    if (!this.useLocalToClip) {
-      return 0;
+  private computeProjectedTileAreaStats(tileRange: RuntimeTileRange, viewport: ViewportPixels): ProjectedTileAreaStats {
+    if (!this.useLocalToClip || !this.hasPerspectiveTileScaleVariation()) {
+      return { averageArea: 0, useDynamicBudget: false };
     }
 
     let totalArea = 0;
     let areaCount = 0;
+    let maxArea = 0;
     for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
       let tileIndex = row * this.tileGrid.columns + tileRange.c0;
       for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
@@ -473,19 +481,24 @@ export class VectorStrokeLodRuntime {
         if (area > 0) {
           totalArea += area;
           areaCount += 1;
+          maxArea = Math.max(maxArea, area);
         }
         tileIndex += 1;
       }
     }
-    return areaCount > 0 ? totalArea / areaCount : 0;
+    const averageArea = areaCount > 0 ? totalArea / areaCount : 0;
+    return {
+      averageArea,
+      useDynamicBudget: averageArea > 1 && maxArea / averageArea >= LOD_TILE_PROJECTED_DYNAMIC_AREA_RATIO
+    };
   }
 
   private computeTileTargetSegments(
     baseTargetSegmentsPerTile: number,
-    averageProjectedTileArea: number,
+    projectedTileAreaStats: ProjectedTileAreaStats,
     projectedArea: number
   ): number {
-    if (!this.useLocalToClip || averageProjectedTileArea <= 1) {
+    if (!this.useLocalToClip || !projectedTileAreaStats.useDynamicBudget || projectedTileAreaStats.averageArea <= 1) {
       return baseTargetSegmentsPerTile;
     }
 
@@ -494,11 +507,26 @@ export class VectorStrokeLodRuntime {
     }
 
     const areaFactor = clampNumber(
-      projectedArea / averageProjectedTileArea,
+      projectedArea / projectedTileAreaStats.averageArea,
       LOD_TILE_PROJECTED_MIN_FACTOR,
       LOD_TILE_PROJECTED_MAX_FACTOR
     );
     return Math.max(LOD_TILE_MIN_VISIBLE_SEGMENTS, Math.round(baseTargetSegmentsPerTile * areaFactor));
+  }
+
+  private hasPerspectiveTileScaleVariation(): boolean {
+    const elements = this.localToClip;
+    const width = Math.max(0, this.tileGrid.maxX - this.tileGrid.minX);
+    const height = Math.max(0, this.tileGrid.maxY - this.tileGrid.minY);
+    const centerX = (this.tileGrid.minX + this.tileGrid.maxX) * 0.5;
+    const centerY = (this.tileGrid.minY + this.tileGrid.maxY) * 0.5;
+    const centerW = elements[3] * centerX + elements[7] * centerY + elements[15];
+    if (!Number.isFinite(centerW) || Math.abs(centerW) <= 1e-8) {
+      return false;
+    }
+
+    const wVariation = Math.abs(elements[3]) * width + Math.abs(elements[7]) * height;
+    return wVariation / Math.abs(centerW) >= LOD_TILE_PROJECTED_PERSPECTIVE_RATIO;
   }
 
   private computeProjectedTileArea(tileIndex: number, viewport: ViewportPixels): number {
