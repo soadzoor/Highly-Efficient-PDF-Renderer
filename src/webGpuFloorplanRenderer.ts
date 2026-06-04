@@ -67,6 +67,24 @@ const VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES = 16;
 const RASTER_UNIFORM_FLOATS = 8;
 const RASTER_UNIFORM_BUFFER_BYTES = 32;
 
+const WGSL_OUTPUT_COLOR_HELPERS = /* wgsl */ `
+fn heprLinearToOutputSrgb(color : vec3f) -> vec3f {
+  let safeColor = max(color, vec3f(0.0));
+  let lower = safeColor * 12.92;
+  let higher = 1.055 * pow(safeColor, vec3f(1.0 / 2.4)) - vec3f(0.055);
+  return select(higher, lower, safeColor <= vec3f(0.0031308));
+}
+
+fn heprEncodeOutputColor(color : vec4f) -> vec4f {
+  return vec4f(heprLinearToOutputSrgb(color.rgb), color.a);
+}
+
+fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
+  let safeCoverage = clamp(coverage, 0.0, 1.0);
+  return 1.0 - heprLinearToOutputSrgb(vec3f(1.0 - safeCoverage)).r;
+}
+`;
+
 const STROKE_SHADER_SOURCE = /* wgsl */ `
 struct CameraUniforms {
   viewport : vec2f,
@@ -105,6 +123,8 @@ struct VsOut {
   @location(7) @interpolate(flat) color : vec3f,
   @location(8) @interpolate(flat) alpha : f32,
 };
+
+${WGSL_OUTPUT_COLOR_HELPERS}
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
   switch (vertexIndex) {
@@ -273,14 +293,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   );
 
   let coverage = 1.0 - smoothstep(inData.halfWidth - inData.aaWorld, inData.halfWidth + inData.aaWorld, distanceToSegment);
-  let alpha = coverage * inData.alpha;
+  let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
 
   if (alpha <= 0.001) {
     discard;
   }
 
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, alpha);
+  return heprEncodeOutputColor(vec4f(color, alpha));
 }
 `;
 
@@ -316,6 +336,8 @@ struct VsOut {
   @location(5) @interpolate(flat) fillRule : f32,
   @location(6) @interpolate(flat) fillHasCompanionStroke : f32,
 };
+
+${WGSL_OUTPUT_COLOR_HELPERS}
 
 const MAX_FILL_PATH_PRIMITIVES : i32 = 2048;
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
@@ -530,17 +552,18 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     if (alpha <= 0.001) {
       discard;
     }
-    return vec4f(color, alpha);
+    return heprEncodeOutputColor(vec4f(color, alpha));
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
 
-  let alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * inData.alpha;
+  let coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
   if (alpha <= 0.001) {
     discard;
   }
 
-  return vec4f(color, alpha);
+  return heprEncodeOutputColor(vec4f(color, alpha));
 }
 `;
 
@@ -581,6 +604,8 @@ struct VsOut {
   @location(5) @interpolate(flat) rasterRect : vec4f,
   @location(6) normCoord : vec2f,
 };
+
+${WGSL_OUTPUT_COLOR_HELPERS}
 
 const MAX_GLYPH_PRIMITIVES : i32 = 256;
 const TEXT_PRIMITIVE_QUADRATIC : f32 = 1.0;
@@ -846,12 +871,12 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
         textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx - dy, uvMin, uvMax), lod).r +
         textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx + dy, uvMin, uvMax), lod).r
       );
-    let alpha = alphaRaster * inData.colorAlpha;
+    let alpha = heprLinearCoverageToOutputAlpha(alphaRaster) * inData.colorAlpha;
     if (alpha <= 0.001) {
       discard;
     }
     let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-    return vec4f(color, alpha);
+    return heprEncodeOutputColor(vec4f(color, alpha));
   }
 
   let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
@@ -886,13 +911,13 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let inside = winding != 0;
   let signedDistance = select(minDistance, -minDistance, inside);
   let alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
-  let alpha = alphaBase * inData.colorAlpha;
+  let alpha = heprLinearCoverageToOutputAlpha(alphaBase) * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
 
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, alpha);
+  return heprEncodeOutputColor(vec4f(color, alpha));
 }
 `;
 

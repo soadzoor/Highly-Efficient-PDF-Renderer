@@ -9,6 +9,25 @@ import {
   type VectorStrokeLodStats
 } from "./vectorStrokeLodCore";
 
+const GLSL_OUTPUT_COLOR_HELPERS = `
+vec3 heprThreeLinearToOutputSrgb(vec3 color) {
+  vec3 safeColor = max(color, vec3(0.0));
+  vec3 cutoff = step(safeColor, vec3(0.0031308));
+  vec3 lower = safeColor * 12.92;
+  vec3 higher = 1.055 * pow(safeColor, vec3(1.0 / 2.4)) - 0.055;
+  return mix(higher, lower, cutoff);
+}
+
+vec4 heprThreeEncodeOutputColor(vec4 color) {
+  return vec4(heprThreeLinearToOutputSrgb(color.rgb), color.a);
+}
+
+float heprThreeLinearCoverageToOutputAlpha(float coverage) {
+  float safeCoverage = clamp(coverage, 0.0, 1.0);
+  return 1.0 - heprThreeLinearToOutputSrgb(vec3(1.0 - safeCoverage)).r;
+}
+`;
+
 const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -141,6 +160,8 @@ flat in float vAlpha;
 
 out vec4 outColor;
 
+${GLSL_OUTPUT_COLOR_HELPERS}
+
 float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
   vec2 ab = b - a;
   float abLenSq = dot(ab, ab);
@@ -216,14 +237,14 @@ void main() {
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
 
   float coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
-  float alpha = coverage * vAlpha;
+  float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
 
   if (alpha <= 0.001) {
     discard;
   }
 
   vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, alpha);
+  outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
 }
 `;
 
@@ -320,6 +341,8 @@ flat in float vFillHasCompanionStroke;
 in vec2 vLocal;
 
 out vec4 outColor;
+
+${GLSL_OUTPUT_COLOR_HELPERS}
 
 const int MAX_FILL_PATH_PRIMITIVES = 2048;
 const float FILL_PRIMITIVE_QUADRATIC = 1.0;
@@ -463,7 +486,7 @@ void main() {
     if (alpha <= 0.001) {
       discard;
     }
-    outColor = vec4(color, alpha);
+    outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
     return;
   }
 
@@ -473,12 +496,13 @@ void main() {
   float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
   float aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uFillAAScreenPx, 1e-4);
 
-  float alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * vAlpha;
+  float coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
   if (alpha <= 0.001) {
     discard;
   }
 
-  outColor = vec4(color, alpha);
+  outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
 }
 `;
 
@@ -591,6 +615,8 @@ in vec2 vNormCoord;
 in vec2 vLocal;
 
 out vec4 outColor;
+
+${GLSL_OUTPUT_COLOR_HELPERS}
 
 const int MAX_GLYPH_PRIMITIVES = 256;
 const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
@@ -769,12 +795,12 @@ void main() {
           texture(uTextRasterAtlasTex, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias).r +
           texture(uTextRasterAtlasTex, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias).r
         );
-      alpha *= vColorAlpha;
+      alpha = heprThreeLinearCoverageToOutputAlpha(alpha) * vColorAlpha;
       if (alpha <= 0.001) {
         discard;
       }
       vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-      outColor = vec4(color, alpha);
+      outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
       return;
     }
   }
@@ -813,13 +839,13 @@ void main() {
 
   float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
   float alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
-  float alpha = alphaBase * vColorAlpha;
+  float alpha = heprThreeLinearCoverageToOutputAlpha(alphaBase) * vColorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
 
   vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, alpha);
+  outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
 }
 `;
 
