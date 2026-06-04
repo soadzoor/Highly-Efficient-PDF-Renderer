@@ -5,9 +5,11 @@ import {
   CORE_RASTER_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
+import { createThreeWebGpuRasterMaterial, type ThreeWebGpuRasterMaterialState } from "./threeWebGpuRasterMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface RasterLayerOptions {
+  materialBackend?: "webgl" | "webgpu";
   pageBackground: [number, number, number, number];
 }
 
@@ -24,14 +26,16 @@ interface RasterLayerSource {
 }
 
 interface RasterLayerEntry {
-  mesh: THREE.Mesh<THREE.BufferGeometry, THREE.RawShaderMaterial>;
-  material: THREE.RawShaderMaterial;
+  mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
+  material: THREE.Material;
+  webGpuState?: ThreeWebGpuRasterMaterialState;
 }
 
 export class ThreeMaterialRasterLayer {
   readonly group: THREE.Group;
 
   private readonly geometry: THREE.BufferGeometry;
+  private readonly materialBackend: "webgl" | "webgpu";
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
@@ -43,6 +47,7 @@ export class ThreeMaterialRasterLayer {
   private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
+    this.materialBackend = options.materialBackend ?? "webgl";
     this.group = new THREE.Group();
     this.group.visible = false;
 
@@ -109,15 +114,30 @@ export class ThreeMaterialRasterLayer {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    for (const entry of this.entries) {
+      if (entry.webGpuState) {
+        entry.webGpuState.zoomUniform.value = this.zoomUniform.value;
+      }
+    }
   }
 
   setScreenSpaceTransform(): void {
     this.useLocalToClipUniform.value = 0;
+    for (const entry of this.entries) {
+      if (entry.webGpuState) {
+        entry.webGpuState.useLocalToClipUniform.value = 0;
+      }
+    }
   }
 
   setLocalToClipTransform(localToClip: THREE.Matrix4): void {
     this.useLocalToClipUniform.value = 1;
     this.localToClipUniform.copy(localToClip);
+    for (const entry of this.entries) {
+      if (entry.webGpuState) {
+        entry.webGpuState.useLocalToClipUniform.value = 1;
+      }
+    }
   }
 
   dispose(): void {
@@ -141,6 +161,24 @@ export class ThreeMaterialRasterLayer {
     renderOrder: number
   ): RasterLayerEntry {
     const matrix = normalizeRasterMatrix(matrixSource);
+
+    if (this.materialBackend === "webgpu") {
+      const state = createThreeWebGpuRasterMaterial({
+        texture,
+        matrixABCD: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]),
+        matrixEF: new THREE.Vector2(matrix[4], matrix[5]),
+        viewport: this.viewportUniform,
+        cameraCenter: this.cameraCenterUniform,
+        localToClip: this.localToClipUniform
+      });
+      state.zoomUniform.value = this.zoomUniform.value;
+      state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
+
+      const mesh = new THREE.Mesh(this.geometry, state.material);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = renderOrder;
+      return { mesh, material: state.material, webGpuState: state };
+    }
 
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,

@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
@@ -79,7 +80,7 @@ if (
   throw new Error("Three example UI is missing required DOM elements.");
 }
 
-const canvasElement = canvas;
+let canvasElement = canvas;
 const panelElement = panel;
 const togglePanelButtonElement = togglePanelButton;
 const togglePanelIconElement = togglePanelIcon;
@@ -127,20 +128,13 @@ const tempClipDelta = new THREE.Vector3();
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 
-const renderer = new THREE.WebGLRenderer({
-  canvas: canvasElement,
-  antialias: false,
-  alpha: false,
-  depth: true,
-  stencil: false,
-  premultipliedAlpha: false,
-  powerPreference: "high-performance"
-});
-renderer.toneMapping = THREE.NoToneMapping;
-renderer.autoClear = false;
-renderer.setClearColor(new THREE.Color(160 / 255, 169 / 255, 175 / 255), 1);
-renderer.setPixelRatio(window.devicePixelRatio || 1);
-renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
+type ThreeExampleRenderer = THREE.WebGLRenderer | WebGPURenderer;
+type WebGpuRendererParametersWithCanvas = ConstructorParameters<typeof WebGPURenderer>[0] & {
+  canvas: HTMLCanvasElement;
+};
+
+let activeThreeRendererBackend: HeprRendererType = "webgl";
+let renderer: ThreeExampleRenderer = createWebGlThreeRenderer(canvasElement);
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(
@@ -153,10 +147,7 @@ camera.position.set(0, 0, 10);
 camera.lookAt(0, 0, 0);
 updatePerspectiveCameraProjection();
 
-const controls = new MapControls(camera, renderer.domElement);
-controls.enableRotate = true;
-controls.enableDamping = false;
-controls.screenSpacePanning = true;
+let controls = createMapControls();
 if (threeCameraDebugLogs) {
   console.info(
     "[HEPR:three-example] three-camera debug logs enabled."
@@ -179,6 +170,90 @@ const exampleSelectionMap = new Map<string, ExampleSelection>();
 
 initializeBackendSelect();
 setPanelCollapsed(false);
+
+function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLRenderer {
+  const nextRenderer = new THREE.WebGLRenderer({
+    canvas: targetCanvas,
+    antialias: false,
+    alpha: false,
+    depth: true,
+    stencil: false,
+    premultipliedAlpha: false,
+    powerPreference: "high-performance"
+  });
+  configureThreeRenderer(nextRenderer);
+  return nextRenderer;
+}
+
+async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promise<WebGPURenderer> {
+  const nextRenderer = new WebGPURenderer({
+    canvas: targetCanvas,
+    antialias: false,
+    alpha: false,
+    depth: true,
+    stencil: false
+  } as WebGpuRendererParametersWithCanvas);
+  configureThreeRenderer(nextRenderer);
+  await nextRenderer.init();
+  return nextRenderer;
+}
+
+function configureThreeRenderer(nextRenderer: ThreeExampleRenderer): void {
+  nextRenderer.toneMapping = THREE.NoToneMapping;
+  nextRenderer.autoClear = false;
+  nextRenderer.setClearColor(new THREE.Color(160 / 255, 169 / 255, 175 / 255), 1);
+  nextRenderer.setPixelRatio(window.devicePixelRatio || 1);
+  nextRenderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
+}
+
+function createMapControls(): MapControls {
+  const nextControls = new MapControls(camera, canvasElement);
+  nextControls.enableRotate = true;
+  nextControls.enableDamping = false;
+  nextControls.screenSpacePanning = true;
+  nextControls.addEventListener("change", () => {
+    requestRender();
+  });
+  return nextControls;
+}
+
+function createReplacementViewportCanvas(): HTMLCanvasElement {
+  const nextCanvas = canvasElement.cloneNode(false) as HTMLCanvasElement;
+  nextCanvas.width = Math.max(1, canvasElement.width);
+  nextCanvas.height = Math.max(1, canvasElement.height);
+  return nextCanvas;
+}
+
+async function ensureThreeRendererBackend(backend: HeprRendererType): Promise<void> {
+  if (backend === activeThreeRendererBackend) {
+    return;
+  }
+
+  const previousCanvas = canvasElement;
+  const nextCanvas = createReplacementViewportCanvas();
+  const nextRenderer = backend === "webgpu"
+    ? await createWebGpuThreeRenderer(nextCanvas)
+    : createWebGlThreeRenderer(nextCanvas);
+
+  if (animationFrameId !== 0) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = 0;
+  }
+  needsRender = false;
+
+  controls.dispose();
+  disposeCurrentObject();
+  renderer.dispose();
+
+  previousCanvas.replaceWith(nextCanvas);
+  canvasElement = nextCanvas;
+  renderer = nextRenderer;
+  activeThreeRendererBackend = backend;
+  controls = createMapControls();
+  updatePerspectiveCameraProjection();
+  updateCameraClipping();
+  requestRender();
+}
 
 function renderFrame(now: number = performance.now()): void {
   animationFrameId = 0;
@@ -229,10 +304,6 @@ function resolveRenderedFrameWaiters(): void {
   }
 }
 
-controls.addEventListener("change", () => {
-  requestRender();
-});
-
 requestRender();
 syncPanOptimizationVisibility();
 
@@ -271,9 +342,17 @@ fileInputElement.addEventListener("change", () => {
 }, { signal: lifetimeSignal });
 
 backendSelectElement.addEventListener("change", () => {
+  const backend = readBackendMode();
   if (!lastLoadedSource) {
-    const backend = backendSelectElement.value === "webgpu" ? "WebGPU" : "WebGL";
-    setStatus(`Backend switched to ${backend}. Load a source to render.`);
+    void ensureThreeRendererBackend(backend)
+      .then(() => {
+        setStatus(`Backend switched to ${formatBackendLabel(backend)}. Load a source to render.`);
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        backendSelectElement.value = activeThreeRendererBackend;
+        setStatus(`Failed to switch backend: ${message}`);
+      });
     return;
   }
   void loadSource(lastLoadedSource);
@@ -349,7 +428,7 @@ function disposeExample(): void {
 
 async function loadSource(source: File | string): Promise<void> {
   const activeLoadToken = ++loadToken;
-  const backend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
+  const backend = readBackendMode();
   const useWebGpuMaterialPipeline = backend === "webgpu";
   const sourceLabel = typeof source === "string" ? source : source.name;
   const vectorLod = readVectorLodMode();
@@ -365,6 +444,10 @@ async function loadSource(source: File | string): Promise<void> {
 
   try {
     const loadStart = performance.now();
+    await ensureThreeRendererBackend(backend);
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
     resetVectorStrokeLodBuildTiming();
     const nextObject = await pdfObjectGenerator(
       source,
@@ -493,10 +576,16 @@ function initializeBackendSelect(): void {
   const webGpuSupported = typeof (navigator as Navigator & { gpu?: unknown }).gpu !== "undefined";
   if (!webGpuSupported && webGpuOption) {
     webGpuOption.disabled = true;
+    if (backendSelectElement.value === "webgpu") {
+      backendSelectElement.value = "webgl";
+    }
     backendSelectElement.title = "WebGPU is not available in this browser/GPU.";
-  } else {
-    backendSelectElement.title = "Experimental WebGPU backend available.";
+    return;
   }
+  if (webGpuOption) {
+    webGpuOption.disabled = false;
+  }
+  backendSelectElement.title = "WebGPU backend available.";
 }
 
 function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
@@ -772,6 +861,14 @@ function formatLodTolerance(tolerance: number): string {
 function readVectorLodMode(): VectorLodMode {
   const value = vectorLodSelectElement.value;
   return value === "off" || value === "force" ? value : "auto";
+}
+
+function readBackendMode(): HeprRendererType {
+  return backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
+}
+
+function formatBackendLabel(backend: HeprRendererType): string {
+  return backend === "webgpu" ? "WebGPU" : "WebGL";
 }
 
 function readPanOptimizationEnabled(): boolean {

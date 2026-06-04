@@ -6,9 +6,11 @@ import {
   CORE_STROKE_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface StrokeLayerOptions {
+  materialBackend?: "webgl" | "webgpu";
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
 }
@@ -26,7 +28,7 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialStrokeLayer {
-  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.RawShaderMaterial>;
+  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly segmentTextureA: THREE.DataTexture;
   private readonly segmentTextureB: THREE.DataTexture;
@@ -35,11 +37,11 @@ export class ThreeMaterialStrokeLayer {
 
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
-  private readonly zoomUniform: { value: number };
-  private readonly useLocalToClipUniform: { value: number };
+  private zoomUniform: { value: number };
+  private useLocalToClipUniform: { value: number };
   private readonly localToClipUniform: THREE.Matrix4;
-  private readonly localUnitsPerPixelUniform: { value: number };
-  private readonly curveUniform: { value: number };
+  private localUnitsPerPixelUniform: { value: number };
+  private curveUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;
@@ -119,34 +121,56 @@ export class ThreeMaterialStrokeLayer {
       options.vectorOverride[3]
     );
 
-    const material = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      vertexShader: normalizeCoreShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE),
-      transparent: true,
-      depthTest: false,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      toneMapped: false,
-      uniforms: {
-        uSegmentTexA: { value: this.segmentTextureA },
-        uSegmentTexB: { value: this.segmentTextureB },
-        uSegmentStyleTex: { value: this.segmentStyleTexture },
-        uSegmentBoundsTex: { value: this.segmentBoundsTexture },
-        uSegmentTexSize: {
-          value: new Int32Array([segmentTextureSize.width, segmentTextureSize.height])
-        },
-        uViewport: { value: this.viewportUniform },
-        uCameraCenter: { value: this.cameraCenterUniform },
-        uZoom: this.zoomUniform,
-        uUseLocalToClip: this.useLocalToClipUniform,
-        uLocalToClip: { value: this.localToClipUniform },
-        uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
-        uAAScreenPx: { value: 1.0 },
-        uStrokeCurveEnabled: this.curveUniform,
-        uVectorOverride: { value: this.vectorOverrideUniform }
-      }
-    });
+    const materialBackend = options.materialBackend ?? "webgl";
+    let material: THREE.Material;
+    if (materialBackend === "webgpu") {
+      const webGpuMaterial = createThreeWebGpuStrokeMaterial({
+        segmentTextureA: this.segmentTextureA,
+        segmentTextureB: this.segmentTextureB,
+        segmentStyleTexture: this.segmentStyleTexture,
+        segmentBoundsTexture: this.segmentBoundsTexture,
+        segmentTextureWidth: segmentTextureSize.width,
+        viewport: this.viewportUniform,
+        cameraCenter: this.cameraCenterUniform,
+        localToClip: this.localToClipUniform,
+        vectorOverride: this.vectorOverrideUniform,
+        strokeCurveEnabled: options.strokeCurveEnabled
+      });
+      this.zoomUniform = webGpuMaterial.zoomUniform;
+      this.useLocalToClipUniform = webGpuMaterial.useLocalToClipUniform;
+      this.localUnitsPerPixelUniform = webGpuMaterial.localUnitsPerPixelUniform;
+      this.curveUniform = webGpuMaterial.curveUniform;
+      material = webGpuMaterial.material;
+    } else {
+      material = new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: normalizeCoreShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
+        fragmentShader: normalizeCoreShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+        uniforms: {
+          uSegmentTexA: { value: this.segmentTextureA },
+          uSegmentTexB: { value: this.segmentTextureB },
+          uSegmentStyleTex: { value: this.segmentStyleTexture },
+          uSegmentBoundsTex: { value: this.segmentBoundsTexture },
+          uSegmentTexSize: {
+            value: new Int32Array([segmentTextureSize.width, segmentTextureSize.height])
+          },
+          uViewport: { value: this.viewportUniform },
+          uCameraCenter: { value: this.cameraCenterUniform },
+          uZoom: this.zoomUniform,
+          uUseLocalToClip: this.useLocalToClipUniform,
+          uLocalToClip: { value: this.localToClipUniform },
+          uLocalUnitsPerPixel: this.localUnitsPerPixelUniform,
+          uAAScreenPx: { value: 1.0 },
+          uStrokeCurveEnabled: this.curveUniform,
+          uVectorOverride: { value: this.vectorOverrideUniform }
+        }
+      });
+    }
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;

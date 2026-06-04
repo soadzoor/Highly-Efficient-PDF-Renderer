@@ -24,6 +24,7 @@ import {
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface VectorStrokeLodLayerOptions {
+  materialBackend?: "webgl" | "webgpu";
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
 }

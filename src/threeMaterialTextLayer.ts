@@ -6,9 +6,11 @@ import {
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TextLayerOptions {
+  materialBackend?: "webgl" | "webgpu";
   strokeCurveEnabled: boolean;
   textVectorOnly: boolean;
   vectorOverride: [number, number, number, number];
@@ -23,7 +25,7 @@ interface ViewportPixels {
 const DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE = 4096;
 
 export class ThreeMaterialTextLayer {
-  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.RawShaderMaterial>;
+  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly textInstanceTextureA: THREE.DataTexture;
   private readonly textInstanceTextureB: THREE.DataTexture;
@@ -44,6 +46,7 @@ export class ThreeMaterialTextLayer {
   private readonly vectorOnlyUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly rasterAtlasSizeUniform: THREE.Vector2;
+  private webGpuState: ThreeWebGpuTextMaterialState | null = null;
 
   constructor(scene: VectorScene, options: TextLayerOptions) {
     const textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
@@ -145,46 +148,72 @@ export class ThreeMaterialTextLayer {
       options.vectorOverride[3]
     );
 
-    const material = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      vertexShader: normalizeCoreShaderSource(CORE_TEXT_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE),
-      transparent: true,
-      depthTest: false,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      toneMapped: false,
-      uniforms: {
-        uTextInstanceTexA: { value: this.textInstanceTextureA },
-        uTextInstanceTexB: { value: this.textInstanceTextureB },
-        uTextInstanceTexC: { value: this.textInstanceTextureC },
-        uTextGlyphMetaTexA: { value: this.textGlyphMetaTextureA },
-        uTextGlyphMetaTexB: { value: this.textGlyphMetaTextureB },
-        uTextGlyphRasterMetaTex: { value: this.textGlyphRasterMetaTexture },
-        uTextGlyphSegmentTexA: { value: this.textGlyphSegmentTextureA },
-        uTextGlyphSegmentTexB: { value: this.textGlyphSegmentTextureB },
-        uTextRasterAtlasTex: { value: this.textRasterAtlasTexture },
-        uTextInstanceTexSize: {
-          value: new Int32Array([instanceTextureSize.width, instanceTextureSize.height])
-        },
-        uTextGlyphMetaTexSize: {
-          value: new Int32Array([glyphMetaTextureSize.width, glyphMetaTextureSize.height])
-        },
-        uTextGlyphSegmentTexSize: {
-          value: new Int32Array([glyphSegmentTextureSize.width, glyphSegmentTextureSize.height])
-        },
-        uTextRasterAtlasSize: { value: this.rasterAtlasSizeUniform },
-        uViewport: { value: this.viewportUniform },
-        uCameraCenter: { value: this.cameraCenterUniform },
-        uZoom: this.zoomUniform,
-        uUseLocalToClip: this.useLocalToClipUniform,
-        uLocalToClip: { value: this.localToClipUniform },
-        uTextAAScreenPx: { value: 1.25 },
-        uTextCurveEnabled: this.curveUniform,
-        uTextVectorOnly: this.vectorOnlyUniform,
-        uVectorOverride: { value: this.vectorOverrideUniform }
-      }
-    });
+    let material: THREE.Material;
+    if ((options.materialBackend ?? "webgl") === "webgpu") {
+      const state = createThreeWebGpuTextMaterial({
+        textInstanceTextureA: this.textInstanceTextureA,
+        textInstanceTextureB: this.textInstanceTextureB,
+        textInstanceTextureC: this.textInstanceTextureC,
+        textGlyphMetaTextureA: this.textGlyphMetaTextureA,
+        textGlyphMetaTextureB: this.textGlyphMetaTextureB,
+        textGlyphSegmentTextureA: this.textGlyphSegmentTextureA,
+        textGlyphSegmentTextureB: this.textGlyphSegmentTextureB,
+        textInstanceTextureWidth: instanceTextureSize.width,
+        textGlyphTextureWidth: glyphMetaTextureSize.width,
+        textSegmentTextureWidth: glyphSegmentTextureSize.width,
+        viewport: this.viewportUniform,
+        cameraCenter: this.cameraCenterUniform,
+        localToClip: this.localToClipUniform,
+        vectorOverride: this.vectorOverrideUniform,
+        strokeCurveEnabled: options.strokeCurveEnabled,
+        textVectorOnly: options.textVectorOnly
+      });
+      state.zoomUniform.value = this.zoomUniform.value;
+      state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
+      this.webGpuState = state;
+      material = state.material;
+    } else {
+      material = new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: normalizeCoreShaderSource(CORE_TEXT_VERTEX_SHADER_SOURCE),
+        fragmentShader: normalizeCoreShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+        uniforms: {
+          uTextInstanceTexA: { value: this.textInstanceTextureA },
+          uTextInstanceTexB: { value: this.textInstanceTextureB },
+          uTextInstanceTexC: { value: this.textInstanceTextureC },
+          uTextGlyphMetaTexA: { value: this.textGlyphMetaTextureA },
+          uTextGlyphMetaTexB: { value: this.textGlyphMetaTextureB },
+          uTextGlyphRasterMetaTex: { value: this.textGlyphRasterMetaTexture },
+          uTextGlyphSegmentTexA: { value: this.textGlyphSegmentTextureA },
+          uTextGlyphSegmentTexB: { value: this.textGlyphSegmentTextureB },
+          uTextRasterAtlasTex: { value: this.textRasterAtlasTexture },
+          uTextInstanceTexSize: {
+            value: new Int32Array([instanceTextureSize.width, instanceTextureSize.height])
+          },
+          uTextGlyphMetaTexSize: {
+            value: new Int32Array([glyphMetaTextureSize.width, glyphMetaTextureSize.height])
+          },
+          uTextGlyphSegmentTexSize: {
+            value: new Int32Array([glyphSegmentTextureSize.width, glyphSegmentTextureSize.height])
+          },
+          uTextRasterAtlasSize: { value: this.rasterAtlasSizeUniform },
+          uViewport: { value: this.viewportUniform },
+          uCameraCenter: { value: this.cameraCenterUniform },
+          uZoom: this.zoomUniform,
+          uUseLocalToClip: this.useLocalToClipUniform,
+          uLocalToClip: { value: this.localToClipUniform },
+          uTextAAScreenPx: { value: 1.25 },
+          uTextCurveEnabled: this.curveUniform,
+          uTextVectorOnly: this.vectorOnlyUniform,
+          uVectorOverride: { value: this.vectorOverrideUniform }
+        }
+      });
+    }
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
@@ -197,10 +226,16 @@ export class ThreeMaterialTextLayer {
 
   setStrokeCurveEnabled(enabled: boolean): void {
     this.curveUniform.value = enabled ? 1 : 0;
+    if (this.webGpuState) {
+      this.webGpuState.curveUniform.value = this.curveUniform.value;
+    }
   }
 
   setTextVectorOnly(enabled: boolean): void {
     this.vectorOnlyUniform.value = enabled ? 1 : 0;
+    if (this.webGpuState) {
+      this.webGpuState.vectorOnlyUniform.value = this.vectorOnlyUniform.value;
+    }
   }
 
   setVectorOverride(red: number, green: number, blue: number, opacity: number): void {
@@ -209,17 +244,26 @@ export class ThreeMaterialTextLayer {
 
   setScreenSpaceTransform(): void {
     this.useLocalToClipUniform.value = 0;
+    if (this.webGpuState) {
+      this.webGpuState.useLocalToClipUniform.value = 0;
+    }
   }
 
   setLocalToClipTransform(localToClip: THREE.Matrix4): void {
     this.useLocalToClipUniform.value = 1;
     this.localToClipUniform.copy(localToClip);
+    if (this.webGpuState) {
+      this.webGpuState.useLocalToClipUniform.value = 1;
+    }
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    if (this.webGpuState) {
+      this.webGpuState.zoomUniform.value = this.zoomUniform.value;
+    }
   }
 
   dispose(): void {

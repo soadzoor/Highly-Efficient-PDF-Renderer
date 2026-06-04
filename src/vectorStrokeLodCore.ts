@@ -614,7 +614,10 @@ export class VectorStrokeLodRuntime {
 }
 
 export function shouldUseVectorStrokeLod(mode: VectorLodMode, rendererType: "webgl" | "webgpu", segmentCount: number): boolean {
-  if (mode === "off" || rendererType !== "webgl") {
+  if (mode === "off") {
+    return false;
+  }
+  if (rendererType !== "webgl" && rendererType !== "webgpu") {
     return false;
   }
   if (mode === "force") {

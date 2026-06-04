@@ -2,6 +2,13 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { DrawStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
+import {
+  shouldUseVectorStrokeLod,
+  takePrebuiltVectorStrokeLodRuntime,
+  VectorStrokeLodRuntime,
+  type VectorLodMode,
+  type VectorStrokeLodStats
+} from "./vectorStrokeLodCore";
 
 type FrameListener = (stats: DrawStats) => void;
 
@@ -9,6 +16,18 @@ interface WebGpuRasterLayerResource {
   texture: any;
   uniformBuffer: any;
   bindGroup: any;
+}
+
+interface WebGpuVectorLodLevelResource {
+  textureA: any;
+  textureB: any;
+  textureC: any;
+  textureD: any;
+  textureWidth: number;
+  textureHeight: number;
+  visibleSegmentIdBuffer: any;
+  bindGroup: any;
+  ownsTextures: boolean;
 }
 
 const INTERACTION_DECAY_MS = 140;
@@ -1119,6 +1138,7 @@ export class WebGpuFloorplanRenderer {
   private blitBindGroup: any = null;
 
   private vectorCompositeBindGroup: any = null;
+  private vectorLodLevelResources: WebGpuVectorLodLevelResource[] = [];
 
   private segmentTextureA: any = null;
 
@@ -1192,6 +1212,9 @@ export class WebGpuFloorplanRenderer {
   private sceneStats: SceneStats | null = null;
 
   private grid: SpatialGrid | null = null;
+  private vectorLodMode: VectorLodMode = "auto";
+  private vectorLodRuntime: VectorStrokeLodRuntime | null = null;
+  private vectorLodStats: VectorStrokeLodStats | null = null;
 
   private frameListener: FrameListener | null = null;
   private interactionViewportProvider: (() => DOMRect | DOMRectReadOnly | null) | null = null;
@@ -1690,6 +1713,32 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
+  setVectorLodMode(mode: VectorLodMode): void {
+    const nextMode = normalizeVectorLodMode(mode);
+    if (this.vectorLodMode === nextMode) {
+      return;
+    }
+
+    this.vectorLodMode = nextMode;
+    if (this.scene) {
+      const vectorLodActive = this.rebuildVectorLod(this.scene);
+      this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(this.scene) : null;
+    }
+
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  getVectorStrokeLodStats(): VectorStrokeLodStats | null {
+    return this.vectorLodStats
+      ? {
+        ...this.vectorLodStats,
+        activeLevels: this.vectorLodStats.activeLevels.map((level) => ({ ...level }))
+      }
+      : null;
+  }
+
   setStrokeCurveEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.strokeCurveEnabled === nextEnabled) {
@@ -1878,8 +1927,8 @@ export class WebGpuFloorplanRenderer {
     this.isPanInteracting = false;
     this.panCacheValid = false;
     this.destroyVectorMinifyResources();
-
-    this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.destroyVectorLodResources();
+    this.grid = null;
 
     const maxTextureSize = this.maxTextureSize();
 
@@ -2106,6 +2155,9 @@ export class WebGpuFloorplanRenderer {
 
     this.visibleSegmentCount = this.segmentCount;
     this.usingAllSegments = true;
+
+    const vectorLodActive = this.rebuildVectorLod(scene);
+    this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
 
     this.sceneStats = {
       gridWidth: this.grid?.gridWidth ?? 0,
@@ -2363,7 +2415,6 @@ export class WebGpuFloorplanRenderer {
   }
 
   private ensureSegmentIdBuffers(segmentCapacity: number): void {
-    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const nextBytes = Math.max(1, segmentCapacity) * 4;
 
     if (this.segmentIdBufferAll) {
@@ -2376,13 +2427,15 @@ export class WebGpuFloorplanRenderer {
       this.segmentIdBufferVisible = null;
     }
 
-    this.segmentIdBufferAll = this.gpuDevice.createBuffer({
-      size: nextBytes,
-      usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
-    });
+    this.segmentIdBufferAll = this.createSegmentIdStorageBuffer(nextBytes);
+    this.segmentIdBufferVisible = this.createSegmentIdStorageBuffer(nextBytes);
+  }
 
-    this.segmentIdBufferVisible = this.gpuDevice.createBuffer({
-      size: nextBytes,
+  private createSegmentIdStorageBuffer(byteSizeOrCapacity: number, sizeIsBytes = true): any {
+    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
+    const size = sizeIsBytes ? byteSizeOrCapacity : Math.max(1, byteSizeOrCapacity) * 4;
+    return this.gpuDevice.createBuffer({
+      size: Math.max(4, size),
       usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
     });
   }
@@ -2471,7 +2524,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (!this.panOptimizationEnabled || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
+    if (this.vectorLodRuntime || !this.panOptimizationEnabled || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
       return false;
     }
     if (this.isPanInteracting) {
@@ -2487,11 +2540,14 @@ export class WebGpuFloorplanRenderer {
     if (this.panOptimizationEnabled && this.segmentCount >= PAN_CACHE_MIN_SEGMENTS) {
       useVectorMinify = false;
     }
+    if (this.vectorLodRuntime) {
+      useVectorMinify = false;
+    }
 
     if (this.needsVisibleSetUpdate) {
       if (useVectorMinify) {
         const effectiveZoom = this.computeVectorMinifyZoom(this.vectorMinifyWidth, this.vectorMinifyHeight);
-        this.updateVisibleSet(
+        this.updateStrokeVisibleSet(
           this.cameraCenterX,
           this.cameraCenterY,
           this.vectorMinifyWidth,
@@ -2499,7 +2555,7 @@ export class WebGpuFloorplanRenderer {
           effectiveZoom
         );
       } else {
-        this.updateVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height, this.zoom);
+        this.updateStrokeVisibleSet(this.cameraCenterX, this.cameraCenterY, this.canvas.width, this.canvas.height, this.zoom);
       }
       this.needsVisibleSetUpdate = false;
     }
@@ -2664,7 +2720,7 @@ export class WebGpuFloorplanRenderer {
       this.panCacheCenterY = this.cameraCenterY;
       this.panCacheZoom = this.zoom;
 
-      this.updateVisibleSet(this.panCacheCenterX, this.panCacheCenterY, this.panCacheWidth, this.panCacheHeight);
+      this.updateStrokeVisibleSet(this.panCacheCenterX, this.panCacheCenterY, this.panCacheWidth, this.panCacheHeight);
       this.needsVisibleSetUpdate = false;
 
       const encoder = this.gpuDevice.createCommandEncoder();
@@ -2749,15 +2805,31 @@ export class WebGpuFloorplanRenderer {
       pass.draw(4, this.fillPathCount, 0, 0);
     }
 
-    let strokeInstanceCount = this.strokeRenderingEnabled
-      ? (this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount)
-      : 0;
-    if (strokeInstanceCount > 0) {
-      const strokeBindGroup = this.usingAllSegments ? this.strokeBindGroupAll : this.strokeBindGroupVisible;
-      if (strokeBindGroup) {
+    let strokeInstanceCount = 0;
+    if (this.strokeRenderingEnabled && this.vectorLodRuntime && this.vectorLodLevelResources.length > 0) {
+      for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
+        const runtimeLevel = this.vectorLodRuntime.levels[levelIndex];
+        const resource = this.vectorLodLevelResources[levelIndex];
+        const instanceCount = Math.max(0, runtimeLevel.visibleSegmentCount | 0);
+        if (!resource || instanceCount <= 0 || !resource.bindGroup) {
+          continue;
+        }
         pass.setPipeline(this.strokePipeline);
-        pass.setBindGroup(0, strokeBindGroup);
-        pass.draw(4, strokeInstanceCount, 0, 0);
+        pass.setBindGroup(0, resource.bindGroup);
+        pass.draw(4, instanceCount, 0, 0);
+        strokeInstanceCount += instanceCount;
+      }
+    } else {
+      strokeInstanceCount = this.strokeRenderingEnabled
+        ? (this.usingAllSegments ? this.segmentCount : this.visibleSegmentCount)
+        : 0;
+      if (strokeInstanceCount > 0) {
+        const strokeBindGroup = this.usingAllSegments ? this.strokeBindGroupAll : this.strokeBindGroupVisible;
+        if (strokeBindGroup) {
+          pass.setPipeline(this.strokePipeline);
+          pass.setBindGroup(0, strokeBindGroup);
+          pass.draw(4, strokeInstanceCount, 0, 0);
+        }
       }
     }
 
@@ -3093,6 +3165,178 @@ export class WebGpuFloorplanRenderer {
       const slice = this.visibleSegmentIds.subarray(0, outCount);
       this.gpuDevice.queue.writeBuffer(this.segmentIdBufferVisible, 0, slice);
     }
+  }
+
+  private updateStrokeVisibleSet(
+    viewCenterX: number = this.cameraCenterX,
+    viewCenterY: number = this.cameraCenterY,
+    viewportWidthPx: number = this.canvas.width,
+    viewportHeightPx: number = this.canvas.height,
+    zoomValue: number = this.zoom
+  ): void {
+    if (this.vectorLodRuntime) {
+      this.updateVectorLodVisibleSet(viewCenterX, viewCenterY, viewportWidthPx, viewportHeightPx, zoomValue);
+      return;
+    }
+
+    this.updateVisibleSet(viewCenterX, viewCenterY, viewportWidthPx, viewportHeightPx, zoomValue);
+  }
+
+  private updateVectorLodVisibleSet(
+    viewCenterX: number = this.cameraCenterX,
+    viewCenterY: number = this.cameraCenterY,
+    viewportWidthPx: number = this.canvas.width,
+    viewportHeightPx: number = this.canvas.height,
+    zoomValue: number = this.zoom
+  ): void {
+    if (!this.scene || !this.vectorLodRuntime) {
+      this.vectorLodStats = null;
+      this.visibleSegmentCount = 0;
+      this.usingAllSegments = true;
+      return;
+    }
+
+    const safeZoom = Math.max(zoomValue, 1e-6);
+    this.vectorLodRuntime.setScreenSpaceTransform();
+    this.vectorLodRuntime.updateForLocalUnitsPerPixel(1 / safeZoom);
+    this.vectorLodRuntime.update(
+      { cameraCenterX: viewCenterX, cameraCenterY: viewCenterY, zoom: safeZoom },
+      { width: Math.max(1, viewportWidthPx), height: Math.max(1, viewportHeightPx) },
+      null
+    );
+    this.vectorLodStats = this.vectorLodRuntime.getStats();
+    this.visibleSegmentCount = this.vectorLodStats.renderedSegments;
+    this.usingAllSegments = false;
+
+    for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
+      const runtimeLevel = this.vectorLodRuntime.levels[levelIndex];
+      const resource = this.vectorLodLevelResources[levelIndex];
+      if (!resource) {
+        continue;
+      }
+      const drawCount = Math.max(0, runtimeLevel.visibleSegmentCount | 0);
+      if (drawCount > 0) {
+        this.gpuDevice.queue.writeBuffer(
+          resource.visibleSegmentIdBuffer,
+          0,
+          runtimeLevel.visibleSegmentIds.subarray(0, drawCount)
+        );
+      }
+    }
+  }
+
+  private rebuildVectorLod(scene: VectorScene): boolean {
+    if (shouldUseVectorStrokeLod(this.vectorLodMode, "webgpu", scene.segmentCount)) {
+      this.vectorLodRuntime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
+    } else {
+      this.vectorLodRuntime = null;
+    }
+    this.vectorLodStats = null;
+
+    if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
+      this.destroyVectorLodResources();
+      this.vectorLodRuntime = null;
+      return false;
+    }
+
+    this.uploadVectorLodLevels();
+    return this.vectorLodLevelResources.length > 1;
+  }
+
+  private uploadVectorLodLevels(): void {
+    this.destroyVectorLodResources();
+    if (!this.vectorLodRuntime) {
+      return;
+    }
+
+    const maxTextureSize = this.maxTextureSize();
+    for (let levelIndex = 0; levelIndex < this.vectorLodRuntime.levels.length; levelIndex += 1) {
+      const level = this.vectorLodRuntime.levels[levelIndex];
+      const visibleSegmentIdBuffer = this.createSegmentIdStorageBuffer(Math.max(1, level.segmentCount), false);
+      if (levelIndex === 0) {
+        this.vectorLodLevelResources.push({
+          textureA: this.segmentTextureA,
+          textureB: this.segmentTextureB,
+          textureC: this.segmentTextureC,
+          textureD: this.segmentTextureD,
+          textureWidth: this.segmentTextureWidth,
+          textureHeight: this.segmentTextureHeight,
+          visibleSegmentIdBuffer,
+          bindGroup: this.createStrokeBindGroup(
+            this.segmentTextureA,
+            this.segmentTextureB,
+            this.segmentTextureC,
+            this.segmentTextureD,
+            visibleSegmentIdBuffer
+          ),
+          ownsTextures: false
+        });
+        continue;
+      }
+
+      const dims = chooseTextureDimensions(level.scene.segmentCount, maxTextureSize);
+      const textureA = this.createFloatTexture(dims.width, dims.height, level.scene.endpoints);
+      const textureB = this.createFloatTexture(dims.width, dims.height, level.scene.primitiveMeta);
+      const textureC = this.createFloatTexture(dims.width, dims.height, level.scene.styles);
+      const textureD = this.createFloatTexture(dims.width, dims.height, level.scene.primitiveBounds);
+      this.vectorLodLevelResources.push({
+        textureA,
+        textureB,
+        textureC,
+        textureD,
+        textureWidth: dims.width,
+        textureHeight: dims.height,
+        visibleSegmentIdBuffer,
+        bindGroup: this.createStrokeBindGroup(textureA, textureB, textureC, textureD, visibleSegmentIdBuffer),
+        ownsTextures: true
+      });
+    }
+  }
+
+  private createStrokeBindGroup(textureA: any, textureB: any, textureC: any, textureD: any, segmentIdBuffer: any): any {
+    return this.gpuDevice.createBindGroup({
+      layout: this.strokePipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          resource: textureA.createView()
+        },
+        {
+          binding: 2,
+          resource: textureB.createView()
+        },
+        {
+          binding: 3,
+          resource: textureC.createView()
+        },
+        {
+          binding: 4,
+          resource: textureD.createView()
+        },
+        {
+          binding: 5,
+          resource: { buffer: segmentIdBuffer }
+        }
+      ]
+    });
+  }
+
+  private destroyVectorLodResources(): void {
+    for (const level of this.vectorLodLevelResources) {
+      if (level.ownsTextures) {
+        level.textureA?.destroy();
+        level.textureB?.destroy();
+        level.textureC?.destroy();
+        level.textureD?.destroy();
+      }
+      level.visibleSegmentIdBuffer?.destroy();
+    }
+    this.vectorLodLevelResources = [];
+    this.vectorLodStats = null;
   }
 
   private buildSegmentBounds(scene: VectorScene): void {
@@ -3516,6 +3760,8 @@ export class WebGpuFloorplanRenderer {
   }
 
   private destroyDataResources(): void {
+    this.destroyVectorLodResources();
+    this.vectorLodRuntime = null;
     this.strokeBindGroupAll = null;
     this.strokeBindGroupVisible = null;
     this.fillBindGroup = null;
@@ -3938,6 +4184,13 @@ function clamp(value: number, min: number, max: number): number {
     return max;
   }
   return value;
+}
+
+function normalizeVectorLodMode(value: VectorLodMode | undefined): VectorLodMode {
+  if (value === "off" || value === "force") {
+    return value;
+  }
+  return "auto";
 }
 
 function clampToGrid(value: number, gridSize: number): number {

@@ -5,9 +5,11 @@ import {
   CORE_FILL_FRAGMENT_SHADER_SOURCE,
   CORE_FILL_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
+import { createThreeWebGpuFillMaterial, type ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface FillLayerOptions {
+  materialBackend?: "webgl" | "webgpu";
   vectorOverride: [number, number, number, number];
 }
 
@@ -24,7 +26,7 @@ interface CullingBounds {
 }
 
 export class ThreeMaterialFillLayer {
-  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.RawShaderMaterial>;
+  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
   private readonly fillPathMetaTextureA: THREE.DataTexture;
   private readonly fillPathMetaTextureB: THREE.DataTexture;
@@ -50,6 +52,7 @@ export class ThreeMaterialFillLayer {
   private readonly sceneMinY: number;
   private readonly sceneMaxX: number;
   private readonly sceneMaxY: number;
+  private webGpuState: ThreeWebGpuFillMaterialState | null = null;
   private usingAllFillPaths = true;
   private useLocalToClip = false;
 
@@ -121,36 +124,57 @@ export class ThreeMaterialFillLayer {
       options.vectorOverride[3]
     );
 
-    const material = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      vertexShader: normalizeCoreShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(CORE_FILL_FRAGMENT_SHADER_SOURCE),
-      transparent: true,
-      depthTest: false,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      toneMapped: false,
-      uniforms: {
-        uFillPathMetaTexA: { value: this.fillPathMetaTextureA },
-        uFillPathMetaTexB: { value: this.fillPathMetaTextureB },
-        uFillPathMetaTexC: { value: this.fillPathMetaTextureC },
-        uFillSegmentTexA: { value: this.fillSegmentTextureA },
-        uFillSegmentTexB: { value: this.fillSegmentTextureB },
-        uFillPathMetaTexSize: {
-          value: new Int32Array([pathTextureSize.width, pathTextureSize.height])
-        },
-        uFillSegmentTexSize: {
-          value: new Int32Array([segmentTextureSize.width, segmentTextureSize.height])
-        },
-        uViewport: { value: this.viewportUniform },
-        uCameraCenter: { value: this.cameraCenterUniform },
-        uZoom: this.zoomUniform,
-        uUseLocalToClip: this.useLocalToClipUniform,
-        uLocalToClip: { value: this.localToClipUniform },
-        uFillAAScreenPx: { value: 1.0 },
-        uVectorOverride: { value: this.vectorOverrideUniform }
-      }
-    });
+    let material: THREE.Material;
+    if ((options.materialBackend ?? "webgl") === "webgpu") {
+      const state = createThreeWebGpuFillMaterial({
+        fillPathMetaTextureA: this.fillPathMetaTextureA,
+        fillPathMetaTextureB: this.fillPathMetaTextureB,
+        fillPathMetaTextureC: this.fillPathMetaTextureC,
+        fillSegmentTextureA: this.fillSegmentTextureA,
+        fillSegmentTextureB: this.fillSegmentTextureB,
+        fillPathTextureWidth: pathTextureSize.width,
+        fillSegmentTextureWidth: segmentTextureSize.width,
+        viewport: this.viewportUniform,
+        cameraCenter: this.cameraCenterUniform,
+        localToClip: this.localToClipUniform,
+        vectorOverride: this.vectorOverrideUniform
+      });
+      state.zoomUniform.value = this.zoomUniform.value;
+      state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
+      this.webGpuState = state;
+      material = state.material;
+    } else {
+      material = new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: normalizeCoreShaderSource(CORE_FILL_VERTEX_SHADER_SOURCE),
+        fragmentShader: normalizeCoreShaderSource(CORE_FILL_FRAGMENT_SHADER_SOURCE),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+        uniforms: {
+          uFillPathMetaTexA: { value: this.fillPathMetaTextureA },
+          uFillPathMetaTexB: { value: this.fillPathMetaTextureB },
+          uFillPathMetaTexC: { value: this.fillPathMetaTextureC },
+          uFillSegmentTexA: { value: this.fillSegmentTextureA },
+          uFillSegmentTexB: { value: this.fillSegmentTextureB },
+          uFillPathMetaTexSize: {
+            value: new Int32Array([pathTextureSize.width, pathTextureSize.height])
+          },
+          uFillSegmentTexSize: {
+            value: new Int32Array([segmentTextureSize.width, segmentTextureSize.height])
+          },
+          uViewport: { value: this.viewportUniform },
+          uCameraCenter: { value: this.cameraCenterUniform },
+          uZoom: this.zoomUniform,
+          uUseLocalToClip: this.useLocalToClipUniform,
+          uLocalToClip: { value: this.localToClipUniform },
+          uFillAAScreenPx: { value: 1.0 },
+          uVectorOverride: { value: this.vectorOverrideUniform }
+        }
+      });
+    }
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
@@ -168,18 +192,27 @@ export class ThreeMaterialFillLayer {
   setScreenSpaceTransform(): void {
     this.useLocalToClip = false;
     this.useLocalToClipUniform.value = 0;
+    if (this.webGpuState) {
+      this.webGpuState.useLocalToClipUniform.value = 0;
+    }
   }
 
   setLocalToClipTransform(localToClip: THREE.Matrix4): void {
     this.useLocalToClip = true;
     this.useLocalToClipUniform.value = 1;
     this.localToClipUniform.copy(localToClip);
+    if (this.webGpuState) {
+      this.webGpuState.useLocalToClipUniform.value = 1;
+    }
   }
 
   updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    if (this.webGpuState) {
+      this.webGpuState.zoomUniform.value = this.zoomUniform.value;
+    }
     this.updateVisibleFillPaths(viewState, viewport, cullingBounds);
   }
 
