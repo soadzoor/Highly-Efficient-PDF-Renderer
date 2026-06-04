@@ -3,7 +3,10 @@ import * as THREE from "three";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
+import {
+  normalizeThreeRawShaderSource,
+  normalizeThreeStrokeRawFragmentShaderSource
+} from "./threeRawShaderColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TriangleStrokeLayerOptions {
@@ -241,7 +244,7 @@ export class ThreeTriangleStrokeLayer {
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader: normalizeThreeRawShaderSource(TRIANGLE_STROKE_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeThreeRawShaderSource(TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE, true),
+      fragmentShader: normalizeThreeStrokeRawFragmentShaderSource(TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE),
       transparent: true,
       depthTest: false,
       depthWrite: false,

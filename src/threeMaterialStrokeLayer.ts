@@ -7,7 +7,10 @@ import {
 } from "./coreShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
+import {
+  normalizeThreeRawShaderSource,
+  normalizeThreeStrokeRawFragmentShaderSource
+} from "./threeRawShaderColorSpace";
 import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -147,7 +150,7 @@ export class ThreeMaterialStrokeLayer {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
         vertexShader: normalizeThreeRawShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
-        fragmentShader: normalizeThreeRawShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE, true),
+        fragmentShader: normalizeThreeStrokeRawFragmentShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE),
         transparent: true,
         depthTest: false,
         depthWrite: false,

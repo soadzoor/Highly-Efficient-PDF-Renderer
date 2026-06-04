@@ -2,7 +2,7 @@ import * as THREE from "three";
 
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { encodeThreeShaderOutputToSrgb } from "./threeRawShaderColorSpace";
+import { normalizeThreeStrokeRawFragmentShaderSource } from "./threeRawShaderColorSpace";
 
 interface CompactedStrokeLayerOptions {
   sceneBounds: Bounds;
@@ -191,7 +191,7 @@ export class ThreeCompactedStrokeLayer {
     );
     this.material = new THREE.ShaderMaterial({
       vertexShader: COMPACTED_STROKE_VERTEX_SHADER,
-      fragmentShader: encodeThreeShaderOutputToSrgb(COMPACTED_STROKE_FRAGMENT_SHADER),
+      fragmentShader: normalizeThreeStrokeRawFragmentShaderSource(COMPACTED_STROKE_FRAGMENT_SHADER),
       transparent: true,
       depthTest: false,
       depthWrite: false,
