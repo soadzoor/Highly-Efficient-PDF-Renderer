@@ -316,6 +316,15 @@ export class ThreeMaterialStrokeLayer {
     const grid = this.grid;
 
     if (
+      viewMaxX < grid.minX ||
+      viewMinX > grid.maxX ||
+      viewMaxY < grid.minY ||
+      viewMinY > grid.maxY
+    ) {
+      return 0;
+    }
+
+    if (
       viewMinX <= grid.minX &&
       viewMaxX >= grid.maxX &&
       viewMinY <= grid.minY &&

@@ -321,6 +321,10 @@ export class VectorStrokeLodRuntime {
     return this.levels[this.activeLevelIndex]?.segmentCount ?? 0;
   }
 
+  getRenderedSegmentCount(): number {
+    return this.lastVisibleSegmentCount;
+  }
+
   private chooseLevelIndex(localUnitsPerPixel: number): number {
     const maxTolerance = localUnitsPerPixel * LOD_SCREEN_ERROR_BUDGET_PX;
     for (let i = this.levels.length - 1; i >= 1; i -= 1) {
