@@ -8,6 +8,7 @@ import {
   prebuildVectorStrokeLodRuntime,
   shouldUseVectorStrokeLod,
   resetVectorStrokeLodBuildTiming,
+  storePrebuiltVectorStrokeLodRuntime,
   takePrebuiltVectorStrokeLodRuntime,
   VectorStrokeLodRuntime,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
@@ -32,11 +33,13 @@ interface VectorStrokeLodLayerOptions {
 export class ThreeVectorLodStrokeLayer {
   readonly group = new THREE.Group();
 
+  private readonly scene: VectorScene;
   private readonly runtime: VectorStrokeLodRuntime;
   private readonly layers: ThreeMaterialStrokeLayer[];
   private requestedVisible = false;
 
   constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
+    this.scene = scene;
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
     this.runtime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
@@ -125,6 +128,7 @@ export class ThreeVectorLodStrokeLayer {
       layer.dispose();
     }
     this.group.clear();
+    storePrebuiltVectorStrokeLodRuntime(this.scene, this.runtime);
   }
 
   private updateLevelDraws(viewState: ViewState, viewport: ViewportPixels): void {
@@ -156,6 +160,7 @@ export {
   prebuildVectorStrokeLodRuntime,
   shouldUseVectorStrokeLod,
   resetVectorStrokeLodBuildTiming,
+  storePrebuiltVectorStrokeLodRuntime,
   takePrebuiltVectorStrokeLodRuntime,
   VECTOR_STROKE_LOD_MIN_SEGMENTS,
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,

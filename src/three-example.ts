@@ -3,10 +3,12 @@ import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
+  createThreePdfObject,
   pdfObjectGenerator,
   consumeVectorStrokeLodBuildTiming,
   resetVectorStrokeLodBuildTiming,
   type HeprRendererType,
+  type HeprThreeObjectOptions,
   type HeprThreePdfObject,
   type VectorLodMode,
   type PDFLoadProgress
@@ -134,6 +136,15 @@ const tempClipDelta = new THREE.Vector3();
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 
+interface CameraSnapshot {
+  position: THREE.Vector3;
+  quaternion: THREE.Quaternion;
+  up: THREE.Vector3;
+  target: THREE.Vector3;
+  clipCenter: THREE.Vector3;
+  clipRadius: number;
+}
+
 type ThreeExampleRenderer = THREE.WebGLRenderer | WebGPURenderer;
 type WebGpuRendererParametersWithCanvas = ConstructorParameters<typeof WebGPURenderer>[0] & {
   canvas: HTMLCanvasElement;
@@ -232,11 +243,16 @@ function createReplacementViewportCanvas(): HTMLCanvasElement {
   return nextCanvas;
 }
 
-async function ensureThreeRendererBackend(backend: HeprRendererType): Promise<void> {
+async function ensureThreeRendererBackend(
+  backend: HeprRendererType,
+  options: { disposeCurrentPdfObject?: boolean } = {}
+): Promise<void> {
   if (backend === activeThreeRendererBackend) {
     return;
   }
 
+  const disposeCurrentPdfObject = options.disposeCurrentPdfObject !== false;
+  const previousControlsTarget = controls.target.clone();
   const previousCanvas = canvasElement;
   const nextCanvas = createReplacementViewportCanvas();
   const nextRenderer = backend === "webgpu"
@@ -250,7 +266,9 @@ async function ensureThreeRendererBackend(backend: HeprRendererType): Promise<vo
   needsRender = false;
 
   controls.dispose();
-  disposeCurrentObject();
+  if (disposeCurrentPdfObject) {
+    disposeCurrentObject();
+  }
   renderer.dispose();
 
   previousCanvas.replaceWith(nextCanvas);
@@ -258,6 +276,7 @@ async function ensureThreeRendererBackend(backend: HeprRendererType): Promise<vo
   renderer = nextRenderer;
   activeThreeRendererBackend = backend;
   controls = createMapControls();
+  controls.target.copy(previousControlsTarget);
   updatePerspectiveCameraProjection();
   updateCameraClipping();
   requestRender();
@@ -352,7 +371,7 @@ fileInputElement.addEventListener("change", () => {
 
 backendSelectElement.addEventListener("change", () => {
   const backend = readBackendMode();
-  if (!lastLoadedSource) {
+  if (!currentPdfObject || !lastLoadedSource) {
     void ensureThreeRendererBackend(backend)
       .then(() => {
         setStatus(`Backend switched to ${formatBackendLabel(backend)}. Load a source to render.`);
@@ -364,7 +383,7 @@ backendSelectElement.addEventListener("change", () => {
       });
     return;
   }
-  void loadSource(lastLoadedSource);
+  void switchLoadedSceneBackend(backend);
 }, { signal: lifetimeSignal });
 
 vectorLodSelectElement.addEventListener("change", () => {
@@ -449,15 +468,32 @@ function disposeExample(): void {
   renderer.dispose();
 }
 
+function readThreeObjectOptions(backend: HeprRendererType): Omit<HeprThreeObjectOptions, "rendererType"> {
+  const useWebGpuMaterialPipeline = backend === "webgpu";
+  const pageBackground = readPageBackgroundColor();
+  const vectorOverride = readVectorOverrideColor();
+  return {
+    threeCameraDriven: true,
+    threeCameraDebugLogs,
+    curveStrokes: true,
+    panOptimization: readPanOptimizationEnabled(),
+    vectorLod: readVectorLodMode(),
+    experimentalMaterialRasters: useWebGpuMaterialPipeline,
+    experimentalMaterialFills: useWebGpuMaterialPipeline,
+    experimentalMaterialStrokes: useWebGpuMaterialPipeline,
+    experimentalMaterialTexts: useWebGpuMaterialPipeline,
+    pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],
+    pageBackgroundOpacity: pageBackground[3],
+    vectorOverrideColor: [vectorOverride[0], vectorOverride[1], vectorOverride[2]],
+    vectorOverrideOpacity: vectorOverride[3]
+  };
+}
+
 async function loadSource(source: File | string): Promise<void> {
   const activeLoadToken = ++loadToken;
   const backend = readBackendMode();
-  const useWebGpuMaterialPipeline = backend === "webgpu";
   const sourceLabel = typeof source === "string" ? source : source.name;
-  const vectorLod = readVectorLodMode();
-  const panOptimization = readPanOptimizationEnabled();
-  const pageBackground = readPageBackgroundColor();
-  const vectorOverride = readVectorOverrideColor();
+  const objectOptions = readThreeObjectOptions(backend);
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "Parsing / loading 0.00%");
   setLoadControlsEnabled(false);
@@ -479,17 +515,7 @@ async function loadSource(source: File | string): Promise<void> {
         threeCameraDebugLogs,
         segmentMerge: true,
         invisibleCull: true,
-        curveStrokes: true,
-        panOptimization,
-        vectorLod,
-        experimentalMaterialRasters: useWebGpuMaterialPipeline,
-        experimentalMaterialFills: useWebGpuMaterialPipeline,
-        experimentalMaterialStrokes: useWebGpuMaterialPipeline,
-        experimentalMaterialTexts: useWebGpuMaterialPipeline,
-        pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],
-        pageBackgroundOpacity: pageBackground[3],
-        vectorOverrideColor: [vectorOverride[0], vectorOverride[1], vectorOverride[2]],
-        vectorOverrideOpacity: vectorOverride[3],
+        ...objectOptions,
         onProgress: (progress) => {
           updateLoadingProgress(activeLoadToken, progress);
         }
@@ -536,8 +562,80 @@ async function loadSource(source: File | string): Promise<void> {
   }
 }
 
-function replacePdfObject(nextObject: HeprThreePdfObject): void {
-  disposeCurrentObject();
+async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void> {
+  const previousObject = currentPdfObject;
+  if (!previousObject || backend === activeThreeRendererBackend) {
+    return;
+  }
+
+  const activeLoadToken = ++loadToken;
+  const previousBackend = activeThreeRendererBackend;
+  const cameraSnapshot = captureCameraSnapshot();
+  const loadedScene = {
+    scene: previousObject.sceneData,
+    sourceLabel: previousObject.sourceLabel,
+    sourceKind: previousObject.sourceKind,
+    sourceBytes: new Uint8Array(0)
+  } satisfies Parameters<typeof createThreePdfObject>[0];
+
+  setStatus(`Switching renderer to ${formatBackendLabel(backend)}...`);
+  setLoadControlsEnabled(false);
+  backendSelectElement.disabled = true;
+  vectorLodSelectElement.disabled = true;
+  panOptimizationCheckboxElement.disabled = true;
+
+  try {
+    disposeCurrentObject({ clearMetrics: false });
+    await ensureThreeRendererBackend(backend, { disposeCurrentPdfObject: false });
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
+
+    const nextObject = await createThreePdfObject(loadedScene, {
+      ...readThreeObjectOptions(backend),
+      rendererType: backend
+    });
+    if (activeLoadToken !== loadToken) {
+      nextObject.dispose();
+      return;
+    }
+
+    replacePdfObject(nextObject, { fitCamera: false });
+    restoreCameraSnapshot(cameraSnapshot);
+    updateSceneMetrics(nextObject);
+    clearLoadedStatus();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    backendSelectElement.value = previousBackend;
+    try {
+      await ensureThreeRendererBackend(previousBackend, { disposeCurrentPdfObject: false });
+      const fallbackObject = await createThreePdfObject(loadedScene, {
+        ...readThreeObjectOptions(previousBackend),
+        rendererType: previousBackend
+      });
+      replacePdfObject(fallbackObject, { fitCamera: false });
+      restoreCameraSnapshot(cameraSnapshot);
+      updateSceneMetrics(fallbackObject);
+    } catch {
+      // Leave the original error visible; the user action needs attention.
+    }
+    setStatus(`Failed to switch renderer: ${message}`);
+  } finally {
+    if (activeLoadToken === loadToken) {
+      setLoadControlsEnabled(true);
+      backendSelectElement.disabled = false;
+      vectorLodSelectElement.disabled = false;
+      panOptimizationCheckboxElement.disabled = false;
+      syncPanOptimizationVisibility();
+      updateDrawStatsMeter();
+      updateLodStatsMeter();
+      requestRender();
+    }
+  }
+}
+
+function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?: boolean } = {}): void {
+  disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   nextObject.prepareHostRendering(renderer.domElement);
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
   lastNativeDrawStats = null;
@@ -546,28 +644,33 @@ function replacePdfObject(nextObject: HeprThreePdfObject): void {
   });
   currentPdfObject = nextObject;
   scene.add(nextObject);
-  fitCameraToPdfObject(nextObject);
+  if (options.fitCamera !== false) {
+    fitCameraToPdfObject(nextObject);
+  }
   updateCameraClipping(true);
   updateDrawStatsMeter();
   requestRender();
 }
 
-function disposeCurrentObject(): void {
+function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   if (!currentPdfObject) {
     return;
   }
+  const clearMetrics = options.clearMetrics !== false;
   currentPdfObject.setFrameListener(null);
   currentPdfObject.renderer.setInteractionViewportProvider(null);
   scene.remove(currentPdfObject);
   currentPdfObject.dispose();
   currentPdfObject = null;
   lastNativeDrawStats = null;
-  fileValueElement.textContent = "-";
-  sourceSegmentsValueElement.textContent = "-";
-  visibleSegmentsValueElement.textContent = "-";
-  timesValueElement.textContent = "-";
-  setDrawStatsText("-");
-  setLodStatsText("-");
+  if (clearMetrics) {
+    fileValueElement.textContent = "-";
+    sourceSegmentsValueElement.textContent = "-";
+    visibleSegmentsValueElement.textContent = "-";
+    timesValueElement.textContent = "-";
+    setDrawStatsText("-");
+    setLodStatsText("-");
+  }
   requestRender();
 }
 
@@ -962,6 +1065,29 @@ function updatePerspectiveCameraProjection(): void {
 
 function fitCameraToPdfObject(pdfObject: HeprThreePdfObject): void {
   fitCameraToObject(pdfObject, true);
+}
+
+function captureCameraSnapshot(): CameraSnapshot {
+  return {
+    position: camera.position.clone(),
+    quaternion: camera.quaternion.clone(),
+    up: camera.up.clone(),
+    target: controls.target.clone(),
+    clipCenter: currentContentCenter.clone(),
+    clipRadius: currentContentRadius
+  };
+}
+
+function restoreCameraSnapshot(snapshot: CameraSnapshot): void {
+  camera.position.copy(snapshot.position);
+  camera.quaternion.copy(snapshot.quaternion);
+  camera.up.copy(snapshot.up);
+  controls.target.copy(snapshot.target);
+  currentContentCenter.copy(snapshot.clipCenter);
+  currentContentRadius = snapshot.clipRadius;
+  updatePerspectiveCameraProjection();
+  updateCameraClipping(true);
+  controls.update();
 }
 
 function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean): void {

@@ -702,7 +702,7 @@ export async function prebuildVectorStrokeLodRuntime(
     levels,
     elapsedMs: nowMs() - startedAt
   });
-  storePrebuiltVectorStrokeLodRuntime(scene, runtime);
+  storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
   scheduler.report(1, "Vector LOD ready");
   return runtime;
 }
@@ -719,7 +719,12 @@ export function takePrebuiltVectorStrokeLodRuntime(scene: VectorScene): VectorSt
   return runtime;
 }
 
-function storePrebuiltVectorStrokeLodRuntime(scene: VectorScene, runtime: VectorStrokeLodRuntime): void {
+export function storePrebuiltVectorStrokeLodRuntime(scene: VectorScene, runtime: VectorStrokeLodRuntime): void {
+  runtime.resetVisible();
+  storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
+}
+
+function storePrebuiltVectorStrokeLodRuntimeInternal(scene: VectorScene, runtime: VectorStrokeLodRuntime): void {
   const runtimes = prebuiltRuntimeByScene.get(scene);
   if (runtimes) {
     runtimes.push(runtime);
