@@ -7,7 +7,10 @@ import {
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
+import {
+  normalizeThreeRawShaderSource,
+  normalizeThreeTextRawFragmentShaderSource
+} from "./threeRawShaderColorSpace";
 import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -48,9 +51,12 @@ export class ThreeMaterialTextLayer {
   private readonly vectorOnlyUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly rasterAtlasSizeUniform: THREE.Vector2;
+  private readonly forceVectorTextOnly: boolean;
   private webGpuState: ThreeWebGpuTextMaterialState | null = null;
 
   constructor(scene: VectorScene, options: TextLayerOptions) {
+    const materialBackend = options.materialBackend ?? "webgl";
+    this.forceVectorTextOnly = true;
     const textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
     const textGlyphCount = Math.max(0, scene.textGlyphCount | 0);
     const textGlyphSegmentCount = Math.max(0, scene.textGlyphSegmentCount | 0);
@@ -92,14 +98,16 @@ export class ThreeMaterialTextLayer {
     );
 
     const rasterMetaData = new Float32Array(glyphMetaTextureSize.width * glyphMetaTextureSize.height * 4);
-    const rasterAtlas = buildTextRasterAtlas(
-      scene,
-      clampInt(
-        options.maxRasterAtlasTextureSize ?? DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE,
-        256,
-        8192
-      )
-    );
+    const rasterAtlas = this.forceVectorTextOnly
+      ? null
+      : buildTextRasterAtlas(
+        scene,
+        clampInt(
+          options.maxRasterAtlasTextureSize ?? DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE,
+          256,
+          8192
+        )
+      );
     if (rasterAtlas) {
       rasterMetaData.set(rasterAtlas.glyphUvRects, 0);
     }
@@ -142,7 +150,7 @@ export class ThreeMaterialTextLayer {
     this.useLocalToClipUniform = { value: 0 };
     this.localToClipUniform = new THREE.Matrix4();
     this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
-    this.vectorOnlyUniform = { value: options.textVectorOnly ? 1 : 0 };
+    this.vectorOnlyUniform = { value: this.resolveTextVectorOnlyValue(options.textVectorOnly) };
     this.vectorOverrideUniform = new THREE.Vector4(
       options.vectorOverride[0],
       options.vectorOverride[1],
@@ -151,7 +159,7 @@ export class ThreeMaterialTextLayer {
     );
 
     let material: THREE.Material;
-    if ((options.materialBackend ?? "webgl") === "webgpu") {
+    if (materialBackend === "webgpu") {
       const state = createThreeWebGpuTextMaterial({
         textInstanceTextureA: this.textInstanceTextureA,
         textInstanceTextureB: this.textInstanceTextureB,
@@ -178,7 +186,7 @@ export class ThreeMaterialTextLayer {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
         vertexShader: normalizeThreeRawShaderSource(CORE_TEXT_VERTEX_SHADER_SOURCE),
-        fragmentShader: normalizeThreeRawShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE, true),
+        fragmentShader: normalizeThreeTextRawFragmentShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE),
         transparent: true,
         depthTest: false,
         depthWrite: false,
@@ -235,7 +243,7 @@ export class ThreeMaterialTextLayer {
   }
 
   setTextVectorOnly(enabled: boolean): void {
-    this.vectorOnlyUniform.value = enabled ? 1 : 0;
+    this.vectorOnlyUniform.value = this.resolveTextVectorOnlyValue(enabled);
     if (this.webGpuState) {
       this.webGpuState.vectorOnlyUniform.value = this.vectorOnlyUniform.value;
     }
@@ -267,6 +275,10 @@ export class ThreeMaterialTextLayer {
     if (this.webGpuState) {
       this.webGpuState.zoomUniform.value = this.zoomUniform.value;
     }
+  }
+
+  private resolveTextVectorOnlyValue(enabled: boolean): number {
+    return enabled || this.forceVectorTextOnly ? 1 : 0;
   }
 
   dispose(): void {
