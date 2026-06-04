@@ -9,7 +9,6 @@ import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
 import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
-import type { ThreeTiledOverviewLayer } from "./threeTiledOverviewLayer";
 import {
   shouldUseVectorStrokeLod,
   ThreeVectorLodStrokeLayer,
@@ -121,7 +120,6 @@ export class HeprThreePdfObject extends THREE.Group {
   private vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null;
   private readonly compactedStrokeLayer: ThreeCompactedStrokeLayer | null;
   private readonly textMaterialLayer: ThreeMaterialTextLayer | null;
-  private readonly overviewTileLayer: ThreeTiledOverviewLayer | null;
 
   private controlsCanvas: HTMLCanvasElement | null = null;
   private pendingInitialFit: boolean;
@@ -181,7 +179,6 @@ export class HeprThreePdfObject extends THREE.Group {
     vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null,
     compactedStrokeLayer: ThreeCompactedStrokeLayer | null,
     textMaterialLayer: ThreeMaterialTextLayer | null,
-    overviewTileLayer: ThreeTiledOverviewLayer | null,
     pageMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>,
     uvArray: Float32Array,
     uvAttribute: THREE.BufferAttribute
@@ -204,7 +201,6 @@ export class HeprThreePdfObject extends THREE.Group {
     this.vectorLodStrokeLayer = vectorLodStrokeLayer;
     this.compactedStrokeLayer = compactedStrokeLayer;
     this.textMaterialLayer = textMaterialLayer;
-    this.overviewTileLayer = overviewTileLayer;
     this.pageMesh = pageMesh;
     this.uvArray = uvArray;
     this.uvAttribute = uvAttribute;
@@ -253,10 +249,6 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.textMaterialLayer) {
       this.textMaterialLayer.setVisible(false);
       this.add(this.textMaterialLayer.mesh);
-    }
-    if (this.overviewTileLayer) {
-      this.overviewTileLayer.setVisible(false);
-      this.add(this.overviewTileLayer.group);
     }
     this.userData.hepr = {
       sourceLabel: this.sourceLabel,
@@ -425,7 +417,6 @@ export class HeprThreePdfObject extends THREE.Group {
     this.vectorLodStrokeLayer?.dispose();
     this.compactedStrokeLayer?.dispose();
     this.textMaterialLayer?.dispose();
-    this.overviewTileLayer?.dispose();
     this.renderTexture?.dispose();
     this.remove(this.pageMesh);
     if (this.rasterMaterialLayer) {
@@ -448,9 +439,6 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     if (this.textMaterialLayer) {
       this.remove(this.textMaterialLayer.mesh);
-    }
-    if (this.overviewTileLayer) {
-      this.remove(this.overviewTileLayer.group);
     }
     this.interactionController.detach();
     this.controlsCanvas = null;
@@ -755,7 +743,6 @@ export class HeprThreePdfObject extends THREE.Group {
     this.vectorLodStrokeLayer?.deactivate();
     this.compactedStrokeLayer?.deactivate();
     this.textMaterialLayer?.setVisible(false);
-    this.overviewTileLayer?.setVisible(false);
     this.renderer.setRasterRenderingEnabled?.(true);
     this.renderer.setFillRenderingEnabled?.(true);
     this.renderer.setStrokeRenderingEnabled?.(true);
@@ -1570,8 +1557,6 @@ export async function createThreePdfObject(
       })
       : null;
 
-  const overviewTileLayer: ThreeTiledOverviewLayer | null = null;
-
   const renderTexture = forceThreeMaterialLayers ? null : createRenderCanvasTexture(renderCanvas);
 
   const geometry = new THREE.BufferGeometry();
@@ -1612,7 +1597,6 @@ export async function createThreePdfObject(
     vectorLodStrokeLayer,
     compactedStrokeLayer,
     textMaterialLayer,
-    overviewTileLayer,
     pageMesh,
     uvArray,
     uvAttribute

@@ -274,8 +274,6 @@ const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
 const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
 const EXPORT_ZIP_DEFLATE_LEVEL = 9;
 const EXPORT_ENCODE_RASTER_IMAGES = true;
-const EXPORT_BUILD_OVERVIEW_TILES = true;
-const EXPORT_OVERVIEW_TILE_ENCODING = "webp" as const;
 const LOAD_PROGRESS_PARSE_END = 0.34;
 const LOAD_PROGRESS_COMPILE = 0.36;
 const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
@@ -1154,9 +1152,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
 
   setDownloadDataButtonState(true, true);
   statusTextElement.hidden = false;
-  statusTextElement.textContent = EXPORT_BUILD_OVERVIEW_TILES
-    ? "Preparing parsed texture data zip with WebP overview tiles..."
-    : "Preparing parsed texture data zip (fast export)...";
+  statusTextElement.textContent = "Preparing parsed texture data zip...";
 
   try {
     const sceneRasterLayers = listSceneRasterLayers(scene);
@@ -1169,14 +1165,6 @@ async function downloadParsedDataZip(): Promise<boolean> {
       sceneRasterLayers,
       {
         encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
-        buildOverviewTiles: EXPORT_BUILD_OVERVIEW_TILES,
-        overviewTileEncoding: EXPORT_OVERVIEW_TILE_ENCODING,
-        overviewTileRenderConfig: {
-          pageBackground: uiControlManager.readPageBackgroundColorInput(),
-          vectorOverride: uiControlManager.readVectorColorOverrideInput(),
-          strokeCurveEnabled: true,
-          textVectorOnly: false
-        },
         zipCompression: EXPORT_ZIP_COMPRESSION,
         zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
       }
@@ -1185,7 +1173,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
     triggerBrowserDownload(selectedZip.blob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers + ${selectedZip.overviewTileCount.toLocaleString()} ${EXPORT_OVERVIEW_TILE_ENCODING.toUpperCase()} overview tiles to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
+      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
     );
     const restoredStatus = previousStatusText || baseStatus;
     statusTextElement.textContent = restoredStatus;

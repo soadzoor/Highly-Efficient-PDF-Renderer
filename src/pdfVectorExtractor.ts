@@ -1,5 +1,4 @@
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
-import type { OverviewTilePyramid } from "./overviewTilePyramid";
 
 const pdfJsModule = (
   typeof window === "undefined"
@@ -94,7 +93,6 @@ export interface VectorScene {
   operatorCount: number;
   imagePaintOpCount: number;
   pathCount: number;
-  overviewTilePyramid?: OverviewTilePyramid;
   discardedTransparentCount: number;
   discardedDegenerateCount: number;
   discardedDuplicateCount: number;

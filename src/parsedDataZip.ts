@@ -15,17 +15,6 @@ import {
   decodeXorDeltaByteShuffledFloat32,
   encodeChannelMajorFloat32
 } from "./parsedDataEncoding";
-import {
-  buildOverviewTileLevels,
-  DEFAULT_OVERVIEW_TILE_OVERLAP_PIXELS,
-  type OverviewTileAsset,
-  type OverviewTileEncoding,
-  type OverviewTileLevelConfig,
-  type OverviewTilePyramid,
-  type OverviewTileRenderConfig,
-  type OverviewTileSpec
-} from "./overviewTilePyramid";
-import { WebGlFloorplanRenderer } from "./webGlFloorplanRenderer";
 
 interface ExportTextureEntry {
   name: string;
@@ -61,10 +50,6 @@ type TextureComponentType = "float32" | "uint8-normalized" | "uint16-normalized-
 
 export interface BuildParsedDataZipOptions {
   encodeRasterImages?: boolean;
-  buildOverviewTiles?: boolean;
-  overviewTileEncoding?: OverviewTileEncoding;
-  overviewTileQuality?: number;
-  overviewTileRenderConfig?: Partial<OverviewTileRenderConfig>;
   zipCompression?: "STORE" | "DEFLATE";
   zipDeflateLevel?: number;
 }
@@ -128,43 +113,6 @@ interface ParsedDataSceneEntry {
   rasterLayerFile?: unknown;
 }
 
-interface ParsedDataOverviewTileEntry {
-  key?: unknown;
-  levelIndex?: unknown;
-  column?: unknown;
-  row?: unknown;
-  minX?: unknown;
-  minY?: unknown;
-  maxX?: unknown;
-  maxY?: unknown;
-  innerWidth?: unknown;
-  innerHeight?: unknown;
-  textureWidth?: unknown;
-  textureHeight?: unknown;
-  uvMinX?: unknown;
-  uvMinY?: unknown;
-  uvMaxX?: unknown;
-  uvMaxY?: unknown;
-  file?: unknown;
-  encoding?: unknown;
-  byteLength?: unknown;
-}
-
-interface ParsedDataOverviewTileLevelEntry {
-  index?: unknown;
-  config?: unknown;
-  tiles?: unknown;
-}
-
-interface ParsedDataOverviewTilesEntry {
-  formatVersion?: unknown;
-  encoding?: unknown;
-  bounds?: unknown;
-  overlapPixels?: unknown;
-  renderConfig?: unknown;
-  levels?: unknown;
-}
-
 interface ParsedDataManifest {
   formatVersion?: unknown;
   sourceFile?: unknown;
@@ -173,7 +121,6 @@ interface ParsedDataManifest {
   sourcePdfSizeBytes?: unknown;
   scene?: ParsedDataSceneEntry;
   textures?: ParsedDataTextureEntry[];
-  overviewTiles?: ParsedDataOverviewTilesEntry;
 }
 
 export interface ParsedDataZipBlobResult {
@@ -181,7 +128,6 @@ export interface ParsedDataZipBlobResult {
   byteLength: number;
   textureCount: number;
   rasterLayerCount: number;
-  overviewTileCount: number;
   layout: TextureLayout;
 }
 
@@ -192,35 +138,6 @@ interface SerializedRasterLayerEntry {
   file: string;
   encoding: "webp" | "png" | "rgba";
 }
-
-interface SerializedOverviewTileEntry extends OverviewTileSpec {
-  file: string;
-  encoding: OverviewTileEncoding;
-  byteLength: number;
-}
-
-interface SerializedOverviewTileLevelEntry {
-  index: number;
-  config: OverviewTileLevelConfig;
-  tiles: SerializedOverviewTileEntry[];
-}
-
-interface SerializedOverviewTilePyramidEntry {
-  formatVersion: 1;
-  encoding: OverviewTileEncoding;
-  bounds: Bounds;
-  overlapPixels: number;
-  renderConfig: OverviewTileRenderConfig;
-  levels: SerializedOverviewTileLevelEntry[];
-}
-
-interface OverviewTileZipBuild {
-  manifest: SerializedOverviewTilePyramidEntry;
-  files: Array<{ path: string; bytes: Uint8Array }>;
-  tileCount: number;
-}
-
-const DEFAULT_OVERVIEW_TILE_WEBP_QUALITY = 0.96;
 
 export async function buildParsedDataZipBlobForLayout(
   scene: VectorScene,
@@ -278,22 +195,12 @@ export async function buildParsedDataZipBlobForLayout(
     });
   }
 
-  const overviewTileBuild = options.buildOverviewTiles === true
-    ? await buildOverviewTileZipAssets(scene, options)
-    : null;
-  if (overviewTileBuild) {
-    for (const file of overviewTileBuild.files) {
-      zip.file(file.path, file.bytes, { compression: "STORE" });
-    }
-  }
-
   const manifest = {
     formatVersion: 3,
     sourceFile: label,
     sourcePdfFile,
     sourcePdfSizeBytes: useSourcePdfFallback ? sourcePdfBytes?.length ?? 0 : 0,
     generatedAt: new Date().toISOString(),
-    overviewTiles: overviewTileBuild?.manifest,
     scene: {
       bounds: scene.bounds,
       pageBounds: scene.pageBounds,
@@ -358,7 +265,6 @@ export async function buildParsedDataZipBlobForLayout(
     byteLength: zipBlob.size,
     textureCount: textureEntries.length,
     rasterLayerCount: rasterLayers.length,
-    overviewTileCount: overviewTileBuild?.tileCount ?? 0,
     layout: textureLayout
   };
 }
@@ -382,190 +288,6 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
     createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout),
     createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout)
   ];
-}
-
-async function buildOverviewTileZipAssets(
-  scene: VectorScene,
-  options: BuildParsedDataZipOptions
-): Promise<OverviewTileZipBuild | null> {
-  if (typeof document === "undefined") {
-    return null;
-  }
-
-  const encoding = options.overviewTileEncoding ?? "webp";
-  const mimeType = encoding === "webp" ? "image/webp" : "image/png";
-  const quality = normalizeOverviewTileQuality(options.overviewTileQuality);
-  const overlapPixels = DEFAULT_OVERVIEW_TILE_OVERLAP_PIXELS;
-  const bounds = scene.pageBounds ?? scene.bounds;
-  const renderConfig = resolveOverviewTileRenderConfig(options.overviewTileRenderConfig);
-  const levels = buildOverviewTileLevels(bounds, overlapPixels);
-  if (levels.length === 0) {
-    return null;
-  }
-
-  const renderCanvas = document.createElement("canvas");
-  const tileRenderer = new WebGlFloorplanRenderer(renderCanvas, { preserveDrawingBuffer: true });
-  tileRenderer.setExternalFrameDriver?.(true);
-  tileRenderer.setPanOptimizationEnabled(false);
-  tileRenderer.setRasterRenderingEnabled?.(true);
-  tileRenderer.setFillRenderingEnabled?.(true);
-  tileRenderer.setStrokeRenderingEnabled?.(true);
-  tileRenderer.setTextRenderingEnabled?.(true);
-  tileRenderer.setStrokeCurveEnabled(renderConfig.strokeCurveEnabled);
-  tileRenderer.setTextVectorOnly(renderConfig.textVectorOnly);
-  tileRenderer.setPageBackgroundColor(
-    renderConfig.pageBackground[0],
-    renderConfig.pageBackground[1],
-    renderConfig.pageBackground[2],
-    renderConfig.pageBackground[3]
-  );
-  tileRenderer.setVectorColorOverride(
-    renderConfig.vectorOverride[0],
-    renderConfig.vectorOverride[1],
-    renderConfig.vectorOverride[2],
-    renderConfig.vectorOverride[3]
-  );
-  tileRenderer.setScene(scene);
-
-  const files: Array<{ path: string; bytes: Uint8Array }> = [];
-  const manifestLevels: SerializedOverviewTileLevelEntry[] = [];
-  let tileCount = 0;
-  try {
-    for (const level of levels) {
-      const tiles: SerializedOverviewTileEntry[] = [];
-      for (const spec of level.specs) {
-        const canvas = renderOverviewTileToCanvas(tileRenderer, renderCanvas, spec);
-        const bytes = await encodeCanvasAsImage(canvas, mimeType, encoding === "webp" ? quality : undefined);
-        canvas.width = 0;
-        canvas.height = 0;
-        if (!bytes) {
-          return null;
-        }
-
-        const filePath = `overview-tiles/level-${level.index}/${spec.column}-${spec.row}.${encoding}`;
-        files.push({ path: filePath, bytes });
-        tiles.push({
-          ...spec,
-          file: filePath,
-          encoding,
-          byteLength: bytes.byteLength
-        });
-        tileCount += 1;
-      }
-      manifestLevels.push({
-        index: level.index,
-        config: level.config,
-        tiles
-      });
-    }
-  } finally {
-    tileRenderer.dispose();
-    renderCanvas.width = 0;
-    renderCanvas.height = 0;
-  }
-
-  return {
-    manifest: {
-      formatVersion: 1,
-      encoding,
-      bounds,
-      overlapPixels,
-      renderConfig,
-      levels: manifestLevels
-    },
-    files,
-    tileCount
-  };
-}
-
-function renderOverviewTileToCanvas(
-  renderer: WebGlFloorplanRenderer,
-  renderCanvas: HTMLCanvasElement,
-  spec: OverviewTileSpec
-): HTMLCanvasElement {
-  renderCanvas.width = spec.textureWidth;
-  renderCanvas.height = spec.textureHeight;
-
-  const tileWidth = Math.max(1e-6, spec.maxX - spec.minX);
-  const tileHeight = Math.max(1e-6, spec.maxY - spec.minY);
-  const zoom = Math.max(1e-6, Math.min(spec.innerWidth / tileWidth, spec.innerHeight / tileHeight));
-  renderer.setViewState({
-    cameraCenterX: (spec.minX + spec.maxX) * 0.5,
-    cameraCenterY: (spec.minY + spec.maxY) * 0.5,
-    zoom
-  });
-  renderer.renderExternalFrame?.(readPerformanceNow());
-
-  const canvas = document.createElement("canvas");
-  canvas.width = spec.textureWidth;
-  canvas.height = spec.textureHeight;
-  const context = canvas.getContext("2d", { alpha: false });
-  if (!context) {
-    throw new Error("Unable to create 2D canvas for HEPR overview tile export.");
-  }
-  context.drawImage(renderCanvas, 0, 0);
-  return canvas;
-}
-
-async function encodeCanvasAsImage(
-  canvas: HTMLCanvasElement,
-  mimeType: "image/png" | "image/webp",
-  quality?: number
-): Promise<Uint8Array | null> {
-  const blob = await new Promise<Blob | null>((resolve) => {
-    canvas.toBlob(resolve, mimeType, quality);
-  });
-  if (!blob) {
-    return null;
-  }
-  if (mimeType === "image/webp" && blob.type && blob.type !== "image/webp") {
-    return null;
-  }
-  const buffer = await blob.arrayBuffer();
-  return new Uint8Array(buffer);
-}
-
-function resolveOverviewTileRenderConfig(config: Partial<OverviewTileRenderConfig> | undefined): OverviewTileRenderConfig {
-  return {
-    pageBackground: normalizeColorTuple(config?.pageBackground, [1, 1, 1, 1]),
-    vectorOverride: normalizeColorTuple(config?.vectorOverride, [0, 0, 0, 0]),
-    strokeCurveEnabled: config?.strokeCurveEnabled !== false,
-    textVectorOnly: config?.textVectorOnly === true
-  };
-}
-
-function normalizeColorTuple(
-  value: [number, number, number, number] | undefined,
-  fallback: [number, number, number, number]
-): [number, number, number, number] {
-  if (!Array.isArray(value) || value.length < 4) {
-    return fallback;
-  }
-  return [
-    clamp01Finite(value[0], fallback[0]),
-    clamp01Finite(value[1], fallback[1]),
-    clamp01Finite(value[2], fallback[2]),
-    clamp01Finite(value[3], fallback[3])
-  ];
-}
-
-function clamp01Finite(value: number, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.min(1, Math.max(0, value))
-    : fallback;
-}
-
-function normalizeOverviewTileQuality(value: number | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return DEFAULT_OVERVIEW_TILE_WEBP_QUALITY;
-  }
-  return Math.min(1, Math.max(0.1, value));
-}
-
-function readPerformanceNow(): number {
-  return typeof performance === "object" && typeof performance.now === "function"
-    ? performance.now()
-    : Date.now();
 }
 
 export async function loadSceneFromParsedDataZip(
@@ -775,7 +497,6 @@ export async function loadSceneFromParsedDataZip(
     }
   }
   const primaryRasterLayer = rasterLayers[0] ?? null;
-  const overviewTilePyramid = readOverviewTilePyramidFromParsedData(zip, manifest.overviewTiles);
   const maxHalfWidth =
     readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
     computeMaxHalfWidth(styles, segmentCount);
@@ -837,7 +558,6 @@ export async function loadSceneFromParsedDataZip(
     pageCount,
     pagesPerRow,
     maxHalfWidth,
-    overviewTilePyramid: overviewTilePyramid ?? undefined,
     imagePaintOpCount: readNonNegativeInt(sceneMeta.imagePaintOpCount, 0),
     operatorCount: readNonNegativeInt(sceneMeta.operatorCount, 0),
     pathCount: readNonNegativeInt(sceneMeta.pathCount, 0),
@@ -1371,186 +1091,6 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
   }
 
   return null;
-}
-
-function readOverviewTilePyramidFromParsedData(
-  zip: JSZip,
-  meta: ParsedDataOverviewTilesEntry | undefined
-): OverviewTilePyramid | null {
-  if (!meta || typeof meta !== "object") {
-    return null;
-  }
-  const formatVersion = readNonNegativeInt(meta.formatVersion, 0);
-  if (formatVersion !== 1) {
-    return null;
-  }
-
-  const encoding = parseOverviewTileEncoding(meta.encoding);
-  if (!encoding) {
-    return null;
-  }
-  const bounds = parseBounds(meta.bounds);
-  if (!bounds) {
-    return null;
-  }
-  const renderConfig = parseOverviewTileRenderConfig(meta.renderConfig);
-  const rawLevels = Array.isArray(meta.levels) ? meta.levels : [];
-  const levels: OverviewTilePyramid["levels"] = [];
-
-  for (const rawLevel of rawLevels) {
-    if (!rawLevel || typeof rawLevel !== "object") {
-      continue;
-    }
-    const levelMeta = rawLevel as ParsedDataOverviewTileLevelEntry;
-    const index = readNonNegativeInt(levelMeta.index, levels.length);
-    const config = parseOverviewTileLevelConfig(levelMeta.config);
-    const rawTiles = Array.isArray(levelMeta.tiles) ? levelMeta.tiles : [];
-    const tiles: OverviewTileAsset[] = [];
-    for (const rawTile of rawTiles) {
-      if (!rawTile || typeof rawTile !== "object") {
-        continue;
-      }
-      const tileMeta = rawTile as ParsedDataOverviewTileEntry;
-      const file = readNonEmptyString(tileMeta.file);
-      if (!file) {
-        continue;
-      }
-      const zipEntry = zip.file(file);
-      if (!zipEntry) {
-        continue;
-      }
-      const tileEncoding = parseOverviewTileEncoding(tileMeta.encoding) ?? encoding;
-      const column = readNonNegativeInt(tileMeta.column, 0);
-      const row = readNonNegativeInt(tileMeta.row, 0);
-      const levelIndex = readNonNegativeInt(tileMeta.levelIndex, index);
-      const spec = parseOverviewTileSpec(tileMeta, levelIndex, column, row);
-      if (!spec) {
-        continue;
-      }
-      tiles.push({
-        ...spec,
-        file,
-        encoding: tileEncoding,
-        byteLength: readNonNegativeInt(tileMeta.byteLength, 0),
-        loadBytes: createCachedZipEntryByteLoader(zipEntry)
-      });
-    }
-    if (tiles.length > 0) {
-      levels.push({ index, config, tiles });
-    }
-  }
-
-  if (levels.length === 0) {
-    return null;
-  }
-
-  return {
-    formatVersion: 1,
-    encoding,
-    bounds,
-    overlapPixels: readNonNegativeInt(meta.overlapPixels, DEFAULT_OVERVIEW_TILE_OVERLAP_PIXELS),
-    renderConfig,
-    levels
-  };
-}
-
-function parseOverviewTileSpec(
-  tileMeta: ParsedDataOverviewTileEntry,
-  levelIndex: number,
-  column: number,
-  row: number
-): OverviewTileSpec | null {
-  const minX = readFiniteNumber(tileMeta.minX, Number.NaN);
-  const minY = readFiniteNumber(tileMeta.minY, Number.NaN);
-  const maxX = readFiniteNumber(tileMeta.maxX, Number.NaN);
-  const maxY = readFiniteNumber(tileMeta.maxY, Number.NaN);
-  const innerWidth = readNonNegativeInt(tileMeta.innerWidth, 0);
-  const innerHeight = readNonNegativeInt(tileMeta.innerHeight, 0);
-  const textureWidth = readNonNegativeInt(tileMeta.textureWidth, 0);
-  const textureHeight = readNonNegativeInt(tileMeta.textureHeight, 0);
-  const uvMinX = readFiniteNumber(tileMeta.uvMinX, Number.NaN);
-  const uvMinY = readFiniteNumber(tileMeta.uvMinY, Number.NaN);
-  const uvMaxX = readFiniteNumber(tileMeta.uvMaxX, Number.NaN);
-  const uvMaxY = readFiniteNumber(tileMeta.uvMaxY, Number.NaN);
-
-  if (
-    ![minX, minY, maxX, maxY, uvMinX, uvMinY, uvMaxX, uvMaxY].every(Number.isFinite) ||
-    innerWidth <= 0 ||
-    innerHeight <= 0 ||
-    textureWidth <= 0 ||
-    textureHeight <= 0
-  ) {
-    return null;
-  }
-
-  return {
-    key: readNonEmptyString(tileMeta.key) ?? `${levelIndex}:${column}:${row}`,
-    levelIndex,
-    column,
-    row,
-    minX,
-    minY,
-    maxX,
-    maxY,
-    innerWidth,
-    innerHeight,
-    textureWidth,
-    textureHeight,
-    uvMinX,
-    uvMinY,
-    uvMaxX,
-    uvMaxY
-  };
-}
-
-function parseOverviewTileLevelConfig(value: unknown): OverviewTileLevelConfig {
-  if (!value || typeof value !== "object") {
-    return { longAxisTiles: 1, tileLongSide: 1, maxProjectedLongRatio: 1 };
-  }
-  const maybe = value as Record<string, unknown>;
-  return {
-    longAxisTiles: Math.max(1, readNonNegativeInt(maybe.longAxisTiles, 1)),
-    tileLongSide: Math.max(1, readNonNegativeInt(maybe.tileLongSide, 1)),
-    maxProjectedLongRatio: Math.max(0, readFiniteNumber(maybe.maxProjectedLongRatio, 1))
-  };
-}
-
-function parseOverviewTileRenderConfig(value: unknown): OverviewTileRenderConfig {
-  const maybe = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  return {
-    pageBackground: parseColorTupleValue(maybe.pageBackground, [1, 1, 1, 1]),
-    vectorOverride: parseColorTupleValue(maybe.vectorOverride, [0, 0, 0, 0]),
-    strokeCurveEnabled: maybe.strokeCurveEnabled !== false,
-    textVectorOnly: maybe.textVectorOnly === true
-  };
-}
-
-function parseColorTupleValue(value: unknown, fallback: [number, number, number, number]): [number, number, number, number] {
-  if (!Array.isArray(value) || value.length < 4) {
-    return fallback;
-  }
-  return [
-    clamp01Finite(readFiniteNumber(value[0], fallback[0]), fallback[0]),
-    clamp01Finite(readFiniteNumber(value[1], fallback[1]), fallback[1]),
-    clamp01Finite(readFiniteNumber(value[2], fallback[2]), fallback[2]),
-    clamp01Finite(readFiniteNumber(value[3], fallback[3]), fallback[3])
-  ];
-}
-
-function parseOverviewTileEncoding(value: unknown): OverviewTileEncoding | null {
-  return value === "webp" || value === "png" ? value : null;
-}
-
-function createCachedZipEntryByteLoader(zipEntry: { async(type: "arraybuffer"): Promise<ArrayBuffer> }): () => Promise<Uint8Array> {
-  let cachedBytes: Uint8Array | null = null;
-  return async () => {
-    if (cachedBytes) {
-      return cachedBytes;
-    }
-    const buffer = await zipEntry.async("arraybuffer");
-    cachedBytes = new Uint8Array(buffer);
-    return cachedBytes;
-  };
 }
 
 async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataSceneEntry): Promise<RasterLayer[]> {

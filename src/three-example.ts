@@ -156,8 +156,6 @@ const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
 const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
 const EXPORT_ZIP_DEFLATE_LEVEL = 9;
 const EXPORT_ENCODE_RASTER_IMAGES = true;
-const EXPORT_BUILD_OVERVIEW_TILES = true;
-const EXPORT_OVERVIEW_TILE_ENCODING = "webp" as const;
 const tempObjectBounds = new THREE.Box3();
 const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
@@ -835,14 +833,6 @@ async function downloadParsedDataZip(): Promise<boolean> {
       sceneRasterLayers,
       {
         encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
-        buildOverviewTiles: EXPORT_BUILD_OVERVIEW_TILES,
-        overviewTileEncoding: EXPORT_OVERVIEW_TILE_ENCODING,
-        overviewTileRenderConfig: {
-          pageBackground: readPageBackgroundColor(),
-          vectorOverride: readVectorOverrideColor(),
-          strokeCurveEnabled: true,
-          textVectorOnly: false
-        },
         zipCompression: EXPORT_ZIP_COMPRESSION,
         zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
       }
