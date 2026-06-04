@@ -1628,6 +1628,8 @@ export class WebGlFloorplanRenderer {
     this.ensureRenderState();
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, viewportWidth, viewportHeight);
+    gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
 
     if (options.cullingBounds) {
       this.updateVisibleSetForBounds(options.cullingBounds, localUnitsPerPixel, viewportWidth, viewportHeight);

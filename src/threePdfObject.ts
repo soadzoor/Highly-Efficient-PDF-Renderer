@@ -37,7 +37,6 @@ const OVERVIEW_TILE_ENTER_MAX_PROJECTED_LONG_RATIO = 1.02;
 const OVERVIEW_TILE_EXIT_MAX_PROJECTED_LONG_RATIO = 1.18;
 const OVERVIEW_TILE_ENTER_NDC_MARGIN = 0.035;
 const OVERVIEW_TILE_EXIT_NDC_MARGIN = 0.16;
-const PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT = 0.9995;
 
 export type HeprRendererType = "webgl" | "webgpu";
 export type HeprColorInput = number | string | [number, number, number];
@@ -181,11 +180,6 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly projectedCenter = new THREE.Vector3();
   private readonly projectedBasisX = new THREE.Vector3();
   private readonly projectedBasisY = new THREE.Vector3();
-  private readonly cameraForwardWorld = new THREE.Vector3();
-  private readonly cameraRightWorld = new THREE.Vector3();
-  private readonly cameraUpWorld = new THREE.Vector3();
-  private readonly pageRightWorld = new THREE.Vector3();
-  private readonly pageUpWorld = new THREE.Vector3();
 
   constructor(
     loadedScene: LoadedPdfScene,
@@ -309,7 +303,9 @@ export class HeprThreePdfObject extends THREE.Group {
       return;
     }
     this.hostRenderCanvas = targetCanvas;
-    this.tryEnableDirectHostRendering(targetCanvas);
+    if (!this.threeCameraDriven) {
+      this.tryEnableDirectHostRendering(targetCanvas);
+    }
   }
 
   fitToBounds(paddingPixels = DEFAULT_FIT_PADDING_PIXELS): void {
@@ -492,7 +488,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private shouldUseThreeMaterialStrokeLayer(): boolean {
     return (
       (this.rendererType === "webgl" || this.rendererType === "webgpu") &&
-      (this.rendererType === "webgpu" || this.rendererConfig.materialStrokeEnabled || this.threeCameraDriven)
+      (this.rendererType === "webgpu" || this.rendererConfig.materialStrokeEnabled)
     );
   }
 
@@ -580,7 +576,6 @@ export class HeprThreePdfObject extends THREE.Group {
     const perspectiveThreeCameraMode = this.threeCameraDriven && cameraType.isPerspectiveCamera === true;
     const webGpuThreeMaterialPipelineAvailable = this.rendererType === "webgpu" && this.hasCompleteMaterialLayers();
     let perspectiveDerivedView: DerivedThreeCameraView | null = null;
-    let perspectiveNativeDirectHost2dPipelineEnabled = false;
     let perspectiveNativeProjectionPipelineEnabled = false;
     let perspectiveVectorPipelineEnabled = false;
     let perspectiveVectorScreenSpacePipelineEnabled = false;
@@ -592,53 +587,38 @@ export class HeprThreePdfObject extends THREE.Group {
         this.setPerspectiveVectorPipelineActive(false);
         this.setPerspectiveOverviewTilePipelineActive(false);
       } else {
-        const perspectiveScreenSpaceCompatible =
-          perspectiveDerivedView !== null && this.shouldUsePerspectiveNativeDirectHost2dPipeline(camera);
         const preferPerspectiveVectorLod = this.vectorLodStrokeLayer !== null && perspectiveDerivedView !== null;
-        perspectiveNativeDirectHost2dPipelineEnabled =
-          !preferPerspectiveVectorLod &&
+        perspectiveOverviewTilePipelineEnabled =
           perspectiveDerivedView !== null &&
-          perspectiveScreenSpaceCompatible &&
-          this.renderPerspectiveNativeDirectHost2dFrame(renderer, rendererViewport, perspectiveDerivedView);
-        if (perspectiveNativeDirectHost2dPipelineEnabled) {
+          this.overviewTileLayer !== null &&
+          this.shouldUsePerspectiveOverviewTilePipeline(camera, rendererViewport, perspectiveDerivedView);
+        if (perspectiveOverviewTilePipelineEnabled) {
+          this.setPerspectiveNativeProjectionPipelineActive(false);
           this.setPerspectiveVectorPipelineActive(false);
-          this.setPerspectiveOverviewTilePipelineActive(false);
         } else {
-          perspectiveOverviewTilePipelineEnabled =
+          perspectiveNativeProjectionPipelineEnabled =
+            !preferPerspectiveVectorLod &&
             perspectiveDerivedView !== null &&
-            this.overviewTileLayer !== null &&
-            this.shouldUsePerspectiveOverviewTilePipeline(camera, rendererViewport, perspectiveDerivedView);
-          if (perspectiveOverviewTilePipelineEnabled) {
-            this.setPerspectiveNativeProjectionPipelineActive(false);
+            this.renderPerspectiveNativeProjectionFrame(renderer, camera, rendererViewport, perspectiveDerivedView);
+          if (perspectiveNativeProjectionPipelineEnabled) {
             this.setPerspectiveVectorPipelineActive(false);
+            this.setPerspectiveOverviewTilePipelineActive(false);
           } else {
-            perspectiveNativeProjectionPipelineEnabled =
-              !preferPerspectiveVectorLod &&
+            const shouldUseVectorPipeline =
               perspectiveDerivedView !== null &&
-              this.renderPerspectiveNativeProjectionFrame(renderer, camera, rendererViewport, perspectiveDerivedView);
-            if (perspectiveNativeProjectionPipelineEnabled) {
+              this.shouldUsePerspectiveVectorPipeline(perspectiveDerivedView);
+            perspectiveVectorPipelineEnabled = shouldUseVectorPipeline && this.setPerspectiveVectorPipelineActive(true);
+            perspectiveVectorScreenSpacePipelineEnabled = false;
+            if (!perspectiveVectorPipelineEnabled) {
               this.setPerspectiveVectorPipelineActive(false);
-              this.setPerspectiveOverviewTilePipelineActive(false);
-            } else {
-              const shouldUseVectorPipeline =
-                perspectiveDerivedView !== null &&
-                this.shouldUsePerspectiveVectorPipeline(perspectiveDerivedView);
-              perspectiveVectorPipelineEnabled = shouldUseVectorPipeline && this.setPerspectiveVectorPipelineActive(true);
-              perspectiveVectorScreenSpacePipelineEnabled =
-                perspectiveVectorPipelineEnabled && perspectiveScreenSpaceCompatible;
-              if (!perspectiveVectorPipelineEnabled) {
-                this.setPerspectiveVectorPipelineActive(false);
-                if (this.directHostRendering) {
-                  this.disableDirectHostRendering();
-                }
+              if (this.directHostRendering) {
+                this.disableDirectHostRendering();
               }
             }
           }
         }
       }
-      this.setPerspectiveNativeProjectionPipelineActive(
-        perspectiveNativeDirectHost2dPipelineEnabled || perspectiveNativeProjectionPipelineEnabled
-      );
+      this.setPerspectiveNativeProjectionPipelineActive(perspectiveNativeProjectionPipelineEnabled);
       this.setPerspectiveOverviewTilePipelineActive(perspectiveOverviewTilePipelineEnabled);
     } else {
       this.setPerspectiveNativeProjectionPipelineActive(false);
@@ -652,7 +632,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
     if (this.threeCameraDriven) {
       if (perspectiveThreeCameraMode) {
-        if (perspectiveNativeDirectHost2dPipelineEnabled || perspectiveNativeProjectionPipelineEnabled) {
+        if (perspectiveNativeProjectionPipelineEnabled) {
           this.warnedThreeCameraPerspectiveFallback = false;
           this.pendingInitialFit = false;
         } else if (perspectiveVectorPipelineEnabled) {
@@ -911,68 +891,6 @@ export class HeprThreePdfObject extends THREE.Group {
       this.vectorLodStrokeLayer !== null ||
       this.compactedStrokeLayer !== null
     );
-  }
-
-  private shouldUsePerspectiveNativeDirectHost2dPipeline(camera: THREE.Camera): boolean {
-    if (this.rendererType !== "webgl") {
-      return false;
-    }
-
-    this.pagePlaneNormal.set(0, 0, 1).transformDirection(this.pageMesh.matrixWorld);
-    this.pageRightWorld.set(1, 0, 0).transformDirection(this.pageMesh.matrixWorld);
-    this.pageUpWorld.set(0, 1, 0).transformDirection(this.pageMesh.matrixWorld);
-    this.cameraForwardWorld.set(0, 0, -1).transformDirection(camera.matrixWorld);
-    this.cameraRightWorld.set(1, 0, 0).transformDirection(camera.matrixWorld);
-    this.cameraUpWorld.set(0, 1, 0).transformDirection(camera.matrixWorld);
-
-    const normalDot = this.pagePlaneNormal.dot(this.cameraForwardWorld);
-    const rightDot = this.pageRightWorld.dot(this.cameraRightWorld);
-    const upDot = this.pageUpWorld.dot(this.cameraUpWorld);
-    if (!Number.isFinite(normalDot) || !Number.isFinite(rightDot) || !Number.isFinite(upDot)) {
-      return false;
-    }
-
-    return (
-      normalDot <= -PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT &&
-      rightDot >= PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT &&
-      upDot >= PERSPECTIVE_NATIVE_2D_ALIGNMENT_DOT
-    );
-  }
-
-  private renderPerspectiveNativeDirectHost2dFrame(
-    threeRenderer: ThreeHostRenderer,
-    viewport: ViewportPixels,
-    derivedView: DerivedThreeCameraView
-  ): boolean {
-    if (this.rendererType !== "webgl") {
-      return false;
-    }
-    if (readThreeRendererRenderTarget(threeRenderer) !== null) {
-      return false;
-    }
-
-    const rendererCanvas = readThreeRendererCanvas(threeRenderer);
-    if (!rendererCanvas || !this.ensureHostNativeProjectionRenderer(rendererCanvas)) {
-      return false;
-    }
-
-    const previousView = this.renderer.getViewState();
-    const viewChanged = !isViewStateApproxEqual(previousView, derivedView.viewState);
-    const viewportChanged = viewport.width !== this.lastViewportWidth || viewport.height !== this.lastViewportHeight;
-    this.renderer.setViewState(derivedView.viewState, {
-      preservePanCache: true,
-      interacting: viewChanged || viewportChanged
-    });
-
-    resetThreeRendererState(threeRenderer);
-    this.renderer.renderExternalFrame?.(performance.now());
-    resetThreeRendererState(threeRenderer);
-
-    this.lastSyncedFrameSerial = this.renderer.getPresentedFrameSerial();
-    this.lastUploadedFrameSerial = this.lastSyncedFrameSerial;
-    this.lastViewportWidth = viewport.width;
-    this.lastViewportHeight = viewport.height;
-    return true;
   }
 
   private renderPerspectiveNativeProjectionFrame(
@@ -2249,7 +2167,7 @@ export async function createThreePdfObject(
 
   const rendererConfig = normalizeRendererConfig(options);
   const initialFitPaddingPixels = normalizePadding(options.fitPadding);
-  const forceThreeMaterialLayers = rendererType === "webgpu" || (rendererType === "webgl" && threeCameraDriven);
+  const forceThreeMaterialLayers = rendererType === "webgpu";
   const shouldConstructStrokeMaterial =
     rendererConfig.materialStrokeEnabled || forceThreeMaterialLayers;
   const useVectorLodStrokeLayer =
