@@ -636,7 +636,6 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
 
 function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?: boolean } = {}): void {
   disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
-  nextObject.prepareHostRendering(renderer.domElement);
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
   lastNativeDrawStats = null;
   nextObject.setFrameListener((stats) => {
