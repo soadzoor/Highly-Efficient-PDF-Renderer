@@ -16,6 +16,10 @@ The project also exposes an [npm package API (`@soadzoor/hepr`)](https://www.npm
 - [`demo/demo.gif`](demo/demo.gif)
 - <https://youtu.be/HDMntIG-1e4>
 
+## Credits
+
+HEPR was mostly inspired by the PDF GPU-text rendering work shared at <https://wdobbie.com/>, and Unreal Engine's Nanite Technology. Thanks for publishing the ideas and experiments that helped shape this project.
+
 ## Current Highlights
 
 - WebGL and WebGPU renderer backends.
@@ -310,3 +314,4 @@ npm run preview
 - Three.js WebGPU support is implemented through Three's WebGPU renderer/material path, not by mixing a WebGPU-rendered canvas texture into a WebGL scene.
 - Embedded PDF image layers remain raster images by definition; the "no raster fallback" rule applies to vector floorplan geometry.
 - Parsed ZIPs improve load time by skipping PDF extraction, but large stroke-heavy scenes may still spend time building Vector LOD.
+- Most of this repo was "vibe-coded" with Codex. It would've taken a lot more time (~forever) without AI tools to get to this stage for me, even though I'm a professional graphical programmer. The know-hows, and technical details about PDFs are way out of my expertise.
