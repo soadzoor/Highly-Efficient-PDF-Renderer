@@ -255,6 +255,18 @@ Build library artifacts:
 npm run build:lib
 ```
 
+Create a local install tarball:
+
+```bash
+npm run pack:local
+```
+
+Run the npm publish dry run:
+
+```bash
+npm run publish:dry-run
+```
+
 Build app and library:
 
 ```bash
