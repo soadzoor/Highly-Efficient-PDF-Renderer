@@ -49,6 +49,11 @@ body {
   gap: 10px;
 }
 
+#hud {
+  max-height: calc(100vh - 50px);
+  overflow-y: auto;
+}
+
 .panel-content {
   margin-top: 8px;
 }

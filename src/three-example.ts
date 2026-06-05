@@ -68,6 +68,7 @@ const timesValue = document.querySelector<HTMLSpanElement>("#times-value");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
+const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 
 if (
   !canvas ||
@@ -100,7 +101,8 @@ if (
   !timesValue ||
   !fpsValue ||
   !drawStatsValue ||
-  !lodStatsValue
+  !lodStatsValue ||
+  !dropIndicator
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
@@ -136,6 +138,7 @@ const timesValueElement = timesValue;
 const fpsValueElement = fpsValue;
 const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
+const dropIndicatorElement = dropIndicator;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
@@ -212,6 +215,7 @@ let lodStatsLastText = "";
 let lastLoadTimingText = "-";
 let renderedFrameSerial = 0;
 let touchControlsAvailable = hasTouchCapability();
+let isDropDragActive = false;
 const pendingRenderedFrameResolvers: Array<() => void> = [];
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
@@ -219,6 +223,7 @@ initializeBackendSelect();
 setPanelCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadPdfButtonState(false);
+refreshDropIndicator();
 
 function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLRenderer {
   const nextRenderer = new THREE.WebGLRenderer({
@@ -414,7 +419,7 @@ fileInputElement.addEventListener("change", () => {
   if (!file) {
     return;
   }
-  void loadSource(file);
+  void loadSupportedFile(file);
   fileInputElement.value = "";
 }, { signal: lifetimeSignal });
 
@@ -469,6 +474,43 @@ window.addEventListener("pointerdown", (event) => {
   }
   touchControlsAvailable = true;
   syncTouchRotateVisibility();
+}, { signal: lifetimeSignal });
+
+window.addEventListener("dragenter", (event) => {
+  event.preventDefault();
+  isDropDragActive = true;
+  refreshDropIndicator();
+}, { signal: lifetimeSignal });
+
+window.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  if (!isDropDragActive) {
+    isDropDragActive = true;
+    refreshDropIndicator();
+  }
+}, { signal: lifetimeSignal });
+
+window.addEventListener("dragleave", (event) => {
+  if (event.target === document.documentElement || event.target === document.body) {
+    isDropDragActive = false;
+    refreshDropIndicator();
+  }
+}, { signal: lifetimeSignal });
+
+window.addEventListener("drop", (event) => {
+  event.preventDefault();
+  isDropDragActive = false;
+  refreshDropIndicator();
+
+  const files = Array.from(event.dataTransfer?.files || []);
+  const supported = files.find((file) => isPdfFile(file) || isParsedDataZipFile(file));
+
+  if (!supported) {
+    setStatus("Dropped file is not a supported PDF or parsed zip.");
+    return;
+  }
+
+  void loadSupportedFile(supported);
 }, { signal: lifetimeSignal });
 
 pageBackgroundColorInputElement.addEventListener("input", applyPageBackgroundFromControls, { signal: lifetimeSignal });
@@ -711,6 +753,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   });
   currentPdfObject = nextObject;
   scene.add(nextObject);
+  refreshDropIndicator();
   if (options.fitCamera !== false) {
     fitCameraToPdfObject(nextObject);
   }
@@ -778,6 +821,34 @@ function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
   downloadPdfButtonElement.hidden = !hasPdf;
   downloadPdfButtonElement.disabled = !hasPdf || isBusy;
   downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
+}
+
+function refreshDropIndicator(): void {
+  const shouldShow = isDropDragActive || !currentPdfObject;
+  dropIndicatorElement.classList.toggle("active", shouldShow);
+  dropIndicatorElement.classList.toggle("dragging", isDropDragActive);
+}
+
+async function loadSupportedFile(file: File): Promise<void> {
+  if (!isPdfFile(file) && !isParsedDataZipFile(file)) {
+    setStatus(`Unsupported file type: ${file.name}`);
+    return;
+  }
+  await loadSource(file);
+}
+
+function isPdfFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return file.type === "application/pdf" || lowerName.endsWith(".pdf");
+}
+
+function isParsedDataZipFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return (
+    lowerName.endsWith(".zip") ||
+    file.type === "application/zip" ||
+    file.type === "application/x-zip-compressed"
+  );
 }
 
 function initializeBackendSelect(): void {
