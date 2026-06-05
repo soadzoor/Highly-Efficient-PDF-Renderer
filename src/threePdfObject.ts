@@ -28,6 +28,16 @@ const PERSPECTIVE_NATIVE_OVERSAMPLE = 1.15;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MIN = 0.9;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MAX = 1.12;
 
+type ThreeSceneRenderCallback = THREE.Scene["onBeforeRender"];
+
+interface HeprSceneRenderHook {
+  callback: ThreeSceneRenderCallback;
+  objects: Set<HeprThreePdfObject>;
+  previous: ThreeSceneRenderCallback;
+}
+
+const sceneRenderHooks = new WeakMap<THREE.Scene, HeprSceneRenderHook>();
+
 /**
  * Native renderer backend used to upload and draw HEPR data.
  *
@@ -239,6 +249,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private skipNextBeforeRenderCallback = false;
   private warnedThreeCameraUnsupported = false;
   private warnedThreeCameraPerspectiveFallback = false;
+  private hookedScene: THREE.Scene | null = null;
   private readonly pagePlane = new THREE.Plane();
   private readonly pagePlanePoint = new THREE.Vector3();
   private readonly pagePlaneNormal = new THREE.Vector3();
@@ -262,6 +273,12 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly projectedCenter = new THREE.Vector3();
   private readonly projectedBasisX = new THREE.Vector3();
   private readonly projectedBasisY = new THREE.Vector3();
+  private readonly handleAddedToParent = (): void => {
+    this.refreshSceneRenderHook();
+  };
+  private readonly handleRemovedFromParent = (): void => {
+    this.detachSceneRenderHook();
+  };
 
   /**
    * Internal constructor used by `createThreePdfObject`.
@@ -323,6 +340,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.interactionController = createCanvasInteractionController(() => this.renderer);
     this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
     this.attachNativeFrameListener(this.renderer);
+    this.addEventListener("added", this.handleAddedToParent);
+    this.addEventListener("removed", this.handleRemovedFromParent);
 
     this.name = loadedScene.sourceLabel;
     this.add(this.pageMesh);
@@ -585,6 +604,9 @@ export class HeprThreePdfObject extends THREE.Group {
     this.renderer.setFrameListener(null);
     this.renderer.setInteractionViewportProvider(null);
     this.renderer.dispose();
+    this.removeEventListener("added", this.handleAddedToParent);
+    this.removeEventListener("removed", this.handleRemovedFromParent);
+    this.detachSceneRenderHook();
     this.pageMesh.onBeforeRender = () => {};
     this.pageMesh.geometry.dispose();
     this.pageMesh.material.dispose();
@@ -672,11 +694,42 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   handleBeforeRender(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    this.refreshSceneRenderHook();
     if (this.skipNextBeforeRenderCallback) {
       this.skipNextBeforeRenderCallback = false;
       return;
     }
     this.syncBeforeRender(renderer, camera);
+  }
+
+  private refreshSceneRenderHook(): void {
+    if (this.isDisposed) {
+      return;
+    }
+    const scene = findAncestorScene(this);
+    if (scene === this.hookedScene) {
+      if (scene) {
+        installSceneRenderHook(scene, this);
+      }
+      return;
+    }
+
+    this.detachSceneRenderHook();
+    if (!scene) {
+      return;
+    }
+
+    installSceneRenderHook(scene, this);
+    this.hookedScene = scene;
+  }
+
+  private detachSceneRenderHook(): void {
+    const scene = this.hookedScene;
+    if (!scene) {
+      return;
+    }
+    removeSceneRenderHookObject(scene, this);
+    this.hookedScene = null;
   }
 
   private syncBeforeRender(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
@@ -1562,6 +1615,75 @@ export class HeprThreePdfObject extends THREE.Group {
       this.frameListener?.(stats);
     });
   }
+}
+
+function installSceneRenderHook(scene: THREE.Scene, object: HeprThreePdfObject): void {
+  const existingHook = sceneRenderHooks.get(scene);
+  if (existingHook) {
+    existingHook.objects.add(object);
+    if (scene.onBeforeRender !== existingHook.callback) {
+      existingHook.previous = scene.onBeforeRender;
+      scene.onBeforeRender = existingHook.callback;
+    }
+    return;
+  }
+
+  let hook: HeprSceneRenderHook;
+  const callback = ((...args: Parameters<ThreeSceneRenderCallback>) => {
+    hook.previous(...args);
+
+    const renderer = args[0] as unknown as ThreeHostRenderer;
+    const activeScene = args[1] as THREE.Scene;
+    const camera = args[2] as THREE.Camera;
+
+    for (const pdfObject of Array.from(hook.objects)) {
+      if (findAncestorScene(pdfObject) !== activeScene) {
+        hook.objects.delete(pdfObject);
+        continue;
+      }
+      pdfObject.prepareFrameForThreeRenderer(renderer, camera);
+    }
+
+    if (hook.objects.size === 0) {
+      removeSceneRenderHookObject(activeScene, object);
+    }
+  }) as ThreeSceneRenderCallback;
+
+  hook = {
+    callback,
+    objects: new Set([object]),
+    previous: scene.onBeforeRender
+  };
+  sceneRenderHooks.set(scene, hook);
+  scene.onBeforeRender = callback;
+}
+
+function removeSceneRenderHookObject(scene: THREE.Scene, object: HeprThreePdfObject): void {
+  const hook = sceneRenderHooks.get(scene);
+  if (!hook) {
+    return;
+  }
+
+  hook.objects.delete(object);
+  if (hook.objects.size > 0) {
+    return;
+  }
+
+  if (scene.onBeforeRender === hook.callback) {
+    scene.onBeforeRender = hook.previous;
+  }
+  sceneRenderHooks.delete(scene);
+}
+
+function findAncestorScene(object: THREE.Object3D): THREE.Scene | null {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if ((current as THREE.Scene & { isScene?: boolean }).isScene === true) {
+      return current as THREE.Scene;
+    }
+    current = current.parent;
+  }
+  return null;
 }
 
 /**
