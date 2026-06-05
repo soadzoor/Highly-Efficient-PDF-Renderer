@@ -45,9 +45,6 @@ export interface RendererApi {
   /** Enable or disable native text rendering. */
   setTextRenderingEnabled?(enabled: boolean): void;
 
-  /** Enable or disable the native fallback pan cache. */
-  setPanOptimizationEnabled(enabled: boolean): void;
-
   /** Change Vector LOD mode. */
   setVectorLodMode?(mode: VectorLodMode): void;
 

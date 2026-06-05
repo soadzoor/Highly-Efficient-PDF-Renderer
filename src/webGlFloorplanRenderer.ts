@@ -1506,8 +1506,6 @@ export class WebGlFloorplanRenderer {
 
   private vectorMinifyWarmupPending = false;
 
-  private panOptimizationEnabled = true;
-
   private rasterRenderingEnabled = true;
 
   private fillRenderingEnabled = true;
@@ -1763,24 +1761,6 @@ export class WebGlFloorplanRenderer {
     };
     this.frameListener?.(stats);
     return stats;
-  }
-
-  setPanOptimizationEnabled(enabled: boolean): void {
-    const nextEnabled = Boolean(enabled);
-    if (this.panOptimizationEnabled === nextEnabled) {
-      return;
-    }
-
-    this.panOptimizationEnabled = nextEnabled;
-    this.isPanInteracting = false;
-    this.panCacheValid = false;
-
-    if (!this.panOptimizationEnabled) {
-      this.destroyPanCacheResources();
-    }
-
-    this.needsVisibleSetUpdate = true;
-    this.requestFrame();
   }
 
   setVectorLodMode(mode: VectorLodMode): void {
@@ -2384,7 +2364,7 @@ export class WebGlFloorplanRenderer {
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (this.vectorLodRuntime || !this.panOptimizationEnabled || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
+    if (this.vectorLodRuntime || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
       return false;
     }
     if (this.isPanInteracting) {
@@ -2398,7 +2378,7 @@ export class WebGlFloorplanRenderer {
     let useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
     // Keep still/moving appearance consistent on large pan-optimized scenes.
     // Pan-cache path renders vectors directly; matching that avoids thickness shifts while camera moves.
-    if (this.panOptimizationEnabled && this.segmentCount >= PAN_CACHE_MIN_SEGMENTS) {
+    if (this.segmentCount >= PAN_CACHE_MIN_SEGMENTS) {
       useVectorMinify = false;
     }
 
