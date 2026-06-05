@@ -7,11 +7,11 @@ import {
 } from "./coreShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { HEPR_THREE_LAYER_ORDER_STROKE } from "./threeLayerOrder";
 import {
   normalizeThreeRawShaderSource,
   normalizeThreeStrokeRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
-import { HEPR_THREE_RENDER_ORDER_STROKE } from "./threeRenderOrder";
 import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -181,7 +181,7 @@ export class ThreeMaterialStrokeLayer {
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_RENDER_ORDER_STROKE;
+    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
   }
 
   setVisible(visible: boolean): void {

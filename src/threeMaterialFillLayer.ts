@@ -6,8 +6,8 @@ import {
   CORE_FILL_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { HEPR_THREE_LAYER_ORDER_FILL } from "./threeLayerOrder";
 import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
-import { HEPR_THREE_RENDER_ORDER_FILL } from "./threeRenderOrder";
 import { createThreeWebGpuFillMaterial, type ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -182,7 +182,7 @@ export class ThreeMaterialFillLayer {
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_RENDER_ORDER_FILL;
+    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
   }
 
   setVisible(visible: boolean): void {

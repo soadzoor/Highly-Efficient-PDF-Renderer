@@ -3,11 +3,11 @@ import * as THREE from "three";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { HEPR_THREE_LAYER_ORDER_STROKE } from "./threeLayerOrder";
 import {
   normalizeThreeRawShaderSource,
   normalizeThreeStrokeRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
-import { HEPR_THREE_RENDER_ORDER_STROKE } from "./threeRenderOrder";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TriangleStrokeLayerOptions {
@@ -271,7 +271,7 @@ export class ThreeTriangleStrokeLayer {
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_RENDER_ORDER_STROKE;
+    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
   }
 
   setVisible(visible: boolean): void {

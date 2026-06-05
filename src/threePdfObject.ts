@@ -8,7 +8,7 @@ import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
-import { HEPR_THREE_RENDER_ORDER_PAGE_DEPTH } from "./threeRenderOrder";
+import { HEPR_THREE_LAYER_ORDER_PAGE_DEPTH } from "./threeLayerOrder";
 import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
 import {
   shouldUseVectorStrokeLod,
@@ -999,7 +999,7 @@ export class HeprThreePdfObject extends THREE.Group {
     // single scene object. PDF material layers draw after it in fixed order
     // without depth testing, so coplanar page content cannot self-fight.
     this.pageMesh.frustumCulled = false;
-    this.pageMesh.renderOrder = HEPR_THREE_RENDER_ORDER_PAGE_DEPTH;
+    this.pageMesh.renderOrder = HEPR_THREE_LAYER_ORDER_PAGE_DEPTH;
 
     if (!wasMaterialPipelineActive) {
       this.lastSyncedFrameSerial = -1;

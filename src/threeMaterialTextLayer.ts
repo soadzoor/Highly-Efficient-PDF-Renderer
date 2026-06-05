@@ -7,11 +7,11 @@ import {
 import type { VectorScene } from "./pdfVectorExtractor";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import {
   normalizeThreeRawShaderSource,
   normalizeThreeTextRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
-import { HEPR_THREE_RENDER_ORDER_TEXT } from "./threeRenderOrder";
 import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -229,7 +229,7 @@ export class ThreeMaterialTextLayer {
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_RENDER_ORDER_TEXT;
+    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
   }
 
   setVisible(visible: boolean): void {
