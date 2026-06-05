@@ -168,8 +168,8 @@ interface RendererConfig {
  * A three.js `Group` that represents a loaded PDF or parsed HEPR ZIP scene.
  *
  * Add it to your scene like any other object. HEPR derives its PDF view from
- * your `THREE.Camera`, so call `prepareFrameForThreeRenderer(renderer, camera)`
- * before `renderer.render(scene, camera)` when you own the render loop.
+ * your `THREE.Camera` and synchronizes itself from three.js `onBeforeRender`,
+ * so typical render loops do not need a separate per-frame HEPR call.
  *
  * Example:
  *
@@ -178,7 +178,6 @@ interface RendererConfig {
  * scene.add(pdfObject);
  *
  * function frame() {
- *   pdfObject.prepareFrameForThreeRenderer(renderer, camera);
  *   renderer.render(scene, camera);
  *   requestAnimationFrame(frame);
  * }
@@ -461,12 +460,12 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   /**
-   * Synchronize HEPR with a three.js renderer/camera before rendering.
+   * Manually synchronize HEPR with a three.js renderer/camera before rendering.
    *
-   * Call this once per frame before `renderer.render(scene, camera)` when you
-   * use your own render loop. The object also installs an `onBeforeRender`
-   * hook, but explicit preparation avoids ordering surprises in apps with
-   * custom render passes.
+   * This is optional for normal three.js usage because the object installs an
+   * internal `onBeforeRender` hook. Use it only for advanced render pipelines
+   * where you intentionally need to prepare HEPR before three.js reaches the
+   * PDF object during scene traversal.
    *
    * Example:
    *

@@ -323,7 +323,6 @@ function renderFrame(now: number = performance.now()): void {
   const controlsChanged = controls.update();
   updateCameraClipping();
   renderer.clear(true, true, true);
-  currentPdfObject?.prepareFrameForThreeRenderer(renderer, camera);
   renderer.clearDepth();
   renderer.render(scene, camera);
   updateDrawStatsMeter();

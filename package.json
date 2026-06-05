@@ -1,5 +1,5 @@
 {
-  "name": "hepr",
+  "name": "@soadzoor/hepr",
   "version": "0.1.0",
   "description": "Highly-Efficient-PDF-Renderer is a GPU-first PDF renderer for large technical documents, floorplans, books, and more, using the latest technologies and various tricks to achieve high performance and visual fidelity.",
   "license": "MIT",
@@ -7,6 +7,9 @@
   "main": "./dist/lib/index.js",
   "module": "./dist/lib/index.js",
   "types": "./dist/types/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "homepage": "https://soadzoor.github.io/Highly-Efficient-PDF-Renderer",
   "repository": {
     "type": "git",
@@ -50,7 +53,7 @@
     "build:lib": "tsc -p tsconfig.lib.json && vite build --mode lib",
     "build:all": "npm run build:app && npm run build:lib",
     "pack:local": "npm run build:lib && npm pack",
-    "publish:dry-run": "npm publish --dry-run",
+    "publish:dry-run": "npm publish --access public --dry-run",
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",

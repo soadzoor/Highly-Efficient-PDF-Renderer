@@ -4,7 +4,7 @@ GPU-first PDF renderer for large technical documents, floorplans, and mixed vect
 
 HEPR is built around analytic vector rendering. Strokes, fills, and text are extracted from PDF operator streams and rendered on the GPU instead of being flattened into a giant page bitmap. Embedded PDF image layers are still supported, but vector floorplan geometry stays vector geometry.
 
-The project also exposes an npm package API (`hepr`) with a native renderer and a three.js wrapper.
+The project also exposes an npm package API (`@soadzoor/hepr`) with a native renderer and a three.js wrapper.
 
 ## Demos
 
@@ -85,7 +85,7 @@ Controls include:
 
 Backend switches reuse the loaded scene and preserve the camera where possible.
 
-## npm Package API (`hepr`)
+## npm Package API (`@soadzoor/hepr`)
 
 Use `pdfObjectGenerator` to load a PDF or parsed ZIP and create a `THREE.Group`.
 The three.js wrapper is camera-driven by default, so the PDF follows your
@@ -95,7 +95,7 @@ options, return types, and runtime methods.
 
 ```ts
 import * as THREE from "three";
-import { pdfObjectGenerator } from "hepr";
+import { pdfObjectGenerator } from "@soadzoor/hepr";
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, width / height, 0.01, 2000);
@@ -114,12 +114,34 @@ const pdfObject = await pdfObjectGenerator(
 scene.add(pdfObject);
 
 function frame(): void {
-  pdfObject.prepareFrameForThreeRenderer(renderer, camera);
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
 
 frame();
+```
+
+A minimal typed setup can look like this:
+
+```ts
+import { pdfObjectGenerator } from "@soadzoor/hepr";
+import type { HeprThreePdfObject, PDFLoadProgress } from "@soadzoor/hepr";
+
+const dublinPdfUrl = "/examples/pdfs/dublin.pdf";
+
+const pdf: HeprThreePdfObject = await pdfObjectGenerator(dublinPdfUrl, {
+  onProgress: (progress: PDFLoadProgress) => {
+    console.log(`${progress.stage}: ${progress.value}`);
+  }
+});
+
+const bounds = pdf.sceneData.pageBounds;
+const width = bounds.maxX - bounds.minX;
+const height = bounds.maxY - bounds.minY;
+const maxSize = Math.max(width, height);
+
+pdf.scale.set(1 / maxSize, 1 / maxSize, 1);
+scene.add(pdf);
 ```
 
 Supported `source` inputs:
@@ -132,7 +154,6 @@ Supported `source` inputs:
 
 Useful object APIs:
 
-- `pdfObject.prepareFrameForThreeRenderer(renderer, camera)`
 - `pdfObject.getViewState()`
 - `pdfObject.setViewState(...)`
 - `pdfObject.setVectorLodMode("auto" | "off" | "force")`
@@ -143,10 +164,15 @@ Useful object APIs:
 - `pdfObject.attachControls(renderer.domElement)` for HEPR's fallback 2D controls
 - `pdfObject.dispose()`
 
+Advanced render pipelines can call
+`pdfObject.prepareFrameForThreeRenderer(renderer, camera)` manually before
+`renderer.render(scene, camera)`, but normal three.js render loops do not need
+it because the PDF object synchronizes itself through `onBeforeRender`.
+
 Package exports:
 
-- `hepr`
-- `hepr/three`
+- `@soadzoor/hepr`
+- `@soadzoor/hepr/three`
 
 ## Architecture
 

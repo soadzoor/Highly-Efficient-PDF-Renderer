@@ -37,15 +37,16 @@ const LOAD_PROGRESS_UPLOAD = 0.98;
  * Load a PDF or HEPR parsed-data ZIP and return a three.js object.
  *
  * This is the main package entry point for three.js applications. The returned
- * object is a `THREE.Group`; add it to your scene, then call
- * `prepareFrameForThreeRenderer` before rendering each frame.
+ * object is a `THREE.Group`; add it to your scene and render normally.
  *
- * The PDF follows your three.js camera by default.
+ * The PDF follows your three.js camera by default. HEPR synchronizes itself
+ * from three.js `onBeforeRender`, so typical render loops do not need a
+ * separate per-frame HEPR call.
  *
  * Example:
  *
  * ```ts
- * import { pdfObjectGenerator } from "hepr";
+ * import { pdfObjectGenerator } from "@soadzoor/hepr";
  *
  * const pdfObject = await pdfObjectGenerator(file, {
  *   vectorLod: "auto",
@@ -58,7 +59,6 @@ const LOAD_PROGRESS_UPLOAD = 0.98;
  * scene.add(pdfObject);
  *
  * function frame() {
- *   pdfObject.prepareFrameForThreeRenderer(renderer, camera);
  *   renderer.render(scene, camera);
  *   requestAnimationFrame(frame);
  * }
