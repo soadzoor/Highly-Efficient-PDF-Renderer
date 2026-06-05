@@ -28,6 +28,7 @@
     "build:app": "tsc && vite build",
     "build:lib": "tsc -p tsconfig.lib.json && vite build --mode lib",
     "build:all": "npm run build:app && npm run build:lib",
+    "pack:local": "npm run build:lib && npm pack",
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",

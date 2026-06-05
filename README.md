@@ -53,7 +53,7 @@ Important details:
 The default mode is `vectorLod: "auto"`:
 
 - `"auto"` enables Vector LOD for large vector-heavy scenes.
-- `"off"` disables Vector LOD and uses exact vector strokes, with pan optimization available in the demos.
+- `"off"` disables Vector LOD and uses exact vector strokes.
 - `"force"` builds and uses Vector LOD even below the usual large-scene threshold.
 
 ## Renderer Modes
@@ -66,7 +66,6 @@ Controls include:
 
 - backend switcher: WebGL / WebGPU
 - Vector LOD mode: Auto / Off / Force
-- pan optimization toggle when Vector LOD is off
 - page background color/opacity
 - vector override color/opacity
 - collapsible diagnostics panel
@@ -79,7 +78,6 @@ Controls include:
 
 - backend switcher: WebGL / WebGPU
 - Vector LOD mode: Auto / Off / Force
-- pan optimization toggle when Vector LOD is off
 - optional touch rotation on touch-capable devices
 - page background color/opacity
 - vector override color/opacity

@@ -48,8 +48,6 @@ const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-
 const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-pdf");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
-const panOptimizationCheckbox = document.querySelector<HTMLInputElement>("#pan-optimization-checkbox");
-const panOptimizationRow = document.querySelector<HTMLElement>("#pan-optimization-row");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
@@ -82,8 +80,6 @@ if (
   !downloadPdfButton ||
   !backendSelect ||
   !vectorLodSelect ||
-  !panOptimizationCheckbox ||
-  !panOptimizationRow ||
   !touchRotateCheckbox ||
   !touchRotateRow ||
   !pageBackgroundColorInput ||
@@ -118,8 +114,6 @@ const downloadDataButtonElement = downloadDataButton;
 const downloadPdfButtonElement = downloadPdfButton;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
-const panOptimizationCheckboxElement = panOptimizationCheckbox;
-const panOptimizationRowElement = panOptimizationRow;
 const touchRotateCheckboxElement = touchRotateCheckbox;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
@@ -378,7 +372,6 @@ function resolveRenderedFrameWaiters(): void {
 }
 
 requestRender();
-syncPanOptimizationVisibility();
 syncTouchRotateVisibility();
 
 window.addEventListener("resize", () => {
@@ -442,7 +435,6 @@ backendSelectElement.addEventListener("change", () => {
 
 vectorLodSelectElement.addEventListener("change", () => {
   const vectorLod = readVectorLodMode();
-  syncPanOptimizationVisibility();
   if (!lastLoadedSource) {
     setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}. Load a source to render.`);
     return;
@@ -451,14 +443,6 @@ vectorLodSelectElement.addEventListener("change", () => {
   setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}.`);
   updateDrawStatsMeter();
   updateLodStatsMeter();
-  requestRender();
-}, { signal: lifetimeSignal });
-
-panOptimizationCheckboxElement.addEventListener("change", () => {
-  const enabled = readPanOptimizationEnabled();
-  currentPdfObject?.setPanOptimizationEnabled(enabled);
-  setStatus(`Pan optimization ${enabled ? "enabled" : "disabled"}.`);
-  updateDrawStatsMeter();
   requestRender();
 }, { signal: lifetimeSignal });
 
@@ -567,7 +551,6 @@ function readThreeObjectOptions(backend: HeprRendererType): Omit<HeprThreeObject
     threeCameraDriven: true,
     threeCameraDebugLogs,
     curveStrokes: true,
-    panOptimization: readPanOptimizationEnabled(),
     vectorLod: readVectorLodMode(),
     experimentalMaterialRasters: useWebGpuMaterialPipeline,
     experimentalMaterialFills: useWebGpuMaterialPipeline,
@@ -597,7 +580,6 @@ async function loadSource(
   setDownloadPdfButtonState(false);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
-  panOptimizationCheckboxElement.disabled = true;
 
   try {
     const loadStart = performance.now();
@@ -662,8 +644,6 @@ async function loadSource(
       setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
-      panOptimizationCheckboxElement.disabled = false;
-      syncPanOptimizationVisibility();
     }
   }
 }
@@ -688,7 +668,6 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
   setLoadControlsEnabled(false);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
-  panOptimizationCheckboxElement.disabled = true;
 
   try {
     disposeCurrentObject({ clearMetrics: false });
@@ -735,8 +714,6 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
       setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
-      panOptimizationCheckboxElement.disabled = false;
-      syncPanOptimizationVisibility();
       updateDrawStatsMeter();
       updateLodStatsMeter();
       requestRender();
@@ -1236,16 +1213,8 @@ function formatBackendLabel(backend: HeprRendererType): string {
   return backend === "webgpu" ? "WebGPU" : "WebGL";
 }
 
-function readPanOptimizationEnabled(): boolean {
-  return panOptimizationCheckboxElement.checked;
-}
-
 function readTouchRotateEnabled(): boolean {
   return touchRotateCheckboxElement.checked;
-}
-
-function syncPanOptimizationVisibility(): void {
-  panOptimizationRowElement.hidden = readVectorLodMode() !== "off";
 }
 
 function syncTouchRotateVisibility(): void {

@@ -79,8 +79,6 @@ const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-te
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
-const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-optimization");
-const panOptimizationToggleRow = document.querySelector<HTMLElement>("#toggle-pan-optimization-row");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -118,8 +116,6 @@ if (
   !metricGridMaxCellElement ||
   !dropIndicator ||
   !backendSelect ||
-  !panOptimizationToggle ||
-  !panOptimizationToggleRow ||
   !vectorLodSelect ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -159,8 +155,6 @@ const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
 const dropIndicatorElement = dropIndicator;
 const backendSelectElement = backendSelect;
-const panOptimizationToggleElement = panOptimizationToggle;
-const panOptimizationToggleRowElement = panOptimizationToggleRow;
 const vectorLodSelectElement = vectorLodSelect;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -173,7 +167,6 @@ let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
   {
-    panOptimizationToggle: panOptimizationToggleElement,
     vectorLodSelect: vectorLodSelectElement,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
@@ -203,7 +196,6 @@ function onRendererFrame(stats: DrawStats): void {
 function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
-  rendererApi.setPanOptimizationEnabled(uiControlManager.readPanOptimizationInput());
   rendererApi.setStrokeCurveEnabled(true);
   rendererApi.setTextVectorOnly(false);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
@@ -345,7 +337,6 @@ setHudCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadPdfButtonState(false);
 setDownloadAllDataButtonState(false);
-syncPanOptimizationVisibility();
 setStatus(baseStatus);
 refreshDropIndicator();
 void loadExampleManifest();
@@ -402,19 +393,11 @@ backendSelectElement.addEventListener("change", () => {
 uiControlManager.bindEventListeners({
   onVectorLodModeChange: (mode) => {
     applyVectorLodMode(mode);
-  },
-  onPanOptimizationChange: (enabled) => {
-    renderer.setPanOptimizationEnabled(enabled);
   }
 });
 
 function applyVectorLodMode(mode: VectorLodMode): void {
   renderer.setVectorLodMode?.(mode);
-  syncPanOptimizationVisibility();
-}
-
-function syncPanOptimizationVisibility(): void {
-  panOptimizationToggleRowElement.hidden = uiControlManager.readVectorLodModeInput() !== "off";
 }
 
 canvasInteractionController.attach(canvasElement);

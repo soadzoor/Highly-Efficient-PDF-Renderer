@@ -6,7 +6,6 @@ type ColorRgba = [number, number, number, number];
 type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColorOverride">;
 
 export interface UiControlElements {
-  panOptimizationToggle: HTMLInputElement;
   vectorLodSelect: HTMLSelectElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
@@ -18,13 +17,11 @@ export interface UiControlElements {
 
 export interface UiControlCallbacks {
   onVectorLodModeChange(mode: VectorLodMode): void;
-  onPanOptimizationChange(enabled: boolean): void;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
   readVectorLodModeInput(): VectorLodMode;
-  readPanOptimizationInput(): boolean;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
   applyPageBackgroundColorFromControls(): void;
@@ -38,10 +35,6 @@ export function createUiControlManager(
   function readVectorLodModeInput(): VectorLodMode {
     const value = elements.vectorLodSelect.value;
     return value === "off" || value === "force" ? value : "auto";
-  }
-
-  function readPanOptimizationInput(): boolean {
-    return elements.panOptimizationToggle.checked;
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -139,10 +132,6 @@ export function createUiControlManager(
       callbacks.onVectorLodModeChange(readVectorLodModeInput());
     });
 
-    elements.panOptimizationToggle.addEventListener("change", () => {
-      callbacks.onPanOptimizationChange(readPanOptimizationInput());
-    });
-
     elements.pageBackgroundColorInput.addEventListener("input", () => {
       applyPageBackgroundColorFromControls();
     });
@@ -179,7 +168,6 @@ export function createUiControlManager(
   return {
     bindEventListeners,
     readVectorLodModeInput,
-    readPanOptimizationInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,
     applyPageBackgroundColorFromControls,
