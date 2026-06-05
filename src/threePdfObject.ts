@@ -8,6 +8,7 @@ import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
+import { HEPR_THREE_RENDER_ORDER_PAGE_DEPTH } from "./threeRenderOrder";
 import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
 import {
   shouldUseVectorStrokeLod,
@@ -1024,8 +1025,11 @@ export class HeprThreePdfObject extends THREE.Group {
       previousMaterial.dispose();
     }
 
+    // The invisible page rectangle is a cheap depth pre-pass for the PDF as a
+    // single scene object. PDF material layers draw after it in fixed order
+    // without depth testing, so coplanar page content cannot self-fight.
     this.pageMesh.frustumCulled = false;
-    this.pageMesh.renderOrder = -1_000_000;
+    this.pageMesh.renderOrder = HEPR_THREE_RENDER_ORDER_PAGE_DEPTH;
 
     if (!wasMaterialPipelineActive) {
       this.lastSyncedFrameSerial = -1;
@@ -1760,6 +1764,7 @@ function createInvisiblePageMaterial(): THREE.MeshBasicMaterial {
     side: THREE.DoubleSide,
     depthTest: true,
     depthWrite: true,
+    depthFunc: THREE.LessEqualDepth,
     colorWrite: false,
     toneMapped: false
   });
@@ -1784,6 +1789,7 @@ function createTexturedPageMaterial(texture: THREE.CanvasTexture): THREE.MeshBas
     side: THREE.DoubleSide,
     depthTest: true,
     depthWrite: true,
+    depthFunc: THREE.LessEqualDepth,
     toneMapped: false
   });
 }

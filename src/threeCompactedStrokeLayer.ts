@@ -3,6 +3,7 @@ import * as THREE from "three";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { normalizeThreeStrokeRawFragmentShaderSource } from "./threeRawShaderColorSpace";
+import { HEPR_THREE_RENDER_ORDER_STROKE } from "./threeRenderOrder";
 
 interface CompactedStrokeLayerOptions {
   sceneBounds: Bounds;
@@ -192,7 +193,7 @@ export class ThreeCompactedStrokeLayer {
     this.material = new THREE.ShaderMaterial({
       vertexShader: COMPACTED_STROKE_VERTEX_SHADER,
       fragmentShader: normalizeThreeStrokeRawFragmentShaderSource(COMPACTED_STROKE_FRAGMENT_SHADER),
-      transparent: true,
+      transparent: false,
       depthTest: false,
       depthWrite: false,
       side: THREE.DoubleSide,
@@ -432,7 +433,7 @@ function buildCompactedLevel(
     const mesh = new THREE.Mesh(geometry, material);
     mesh.name = `${group.name}-tile-${tileIndex}`;
     mesh.frustumCulled = true;
-    mesh.renderOrder = 1;
+    mesh.renderOrder = HEPR_THREE_RENDER_ORDER_STROKE;
     meshes.push(mesh);
     group.add(mesh);
   }

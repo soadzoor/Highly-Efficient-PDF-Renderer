@@ -6,6 +6,10 @@ import {
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { createThreeWebGpuRasterMaterial, type ThreeWebGpuRasterMaterialState } from "./threeWebGpuRasterMaterial";
+import {
+  HEPR_THREE_RENDER_ORDER_PAGE_BACKGROUND,
+  HEPR_THREE_RENDER_ORDER_RASTER
+} from "./threeRenderOrder";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface RasterLayerOptions {
@@ -71,7 +75,7 @@ export class ThreeMaterialRasterLayer {
       const width = Math.max(maxX - minX, 1e-6);
       const height = Math.max(maxY - minY, 1e-6);
       const matrix = new Float32Array([width, 0, 0, height, minX, minY]);
-      const entry = this.createEntry(this.pageBackgroundTexture, matrix, -20);
+      const entry = this.createEntry(this.pageBackgroundTexture, matrix, HEPR_THREE_RENDER_ORDER_PAGE_BACKGROUND);
       this.entries.push(entry);
       this.group.add(entry.mesh);
     }
@@ -79,7 +83,7 @@ export class ThreeMaterialRasterLayer {
     for (const source of getSceneRasterLayers(scene)) {
       const texture = createRasterTexture(source);
       this.ownedTextures.add(texture);
-      const entry = this.createEntry(texture, source.matrix, -10);
+      const entry = this.createEntry(texture, source.matrix, HEPR_THREE_RENDER_ORDER_RASTER);
       this.entries.push(entry);
       this.group.add(entry.mesh);
     }
@@ -184,7 +188,7 @@ export class ThreeMaterialRasterLayer {
       glslVersion: THREE.GLSL3,
       vertexShader: normalizeCoreShaderSource(CORE_RASTER_VERTEX_SHADER_SOURCE),
       fragmentShader: normalizeCoreShaderSource(CORE_RASTER_FRAGMENT_SHADER_SOURCE),
-      transparent: true,
+      transparent: false,
       depthTest: false,
       depthWrite: false,
       side: THREE.DoubleSide,

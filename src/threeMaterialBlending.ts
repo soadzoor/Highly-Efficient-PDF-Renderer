@@ -1,7 +1,9 @@
 import * as THREE from "three";
 
 export function configureStraightAlphaBlending(material: THREE.Material): void {
-  material.transparent = true;
+  material.transparent = false;
+  material.depthTest = false;
+  material.depthWrite = false;
   material.blending = THREE.CustomBlending;
   material.blendEquation = THREE.AddEquation;
   material.blendSrc = THREE.SrcAlphaFactor;

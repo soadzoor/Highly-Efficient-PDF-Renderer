@@ -11,6 +11,7 @@ import {
   normalizeThreeRawShaderSource,
   normalizeThreeTextRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
+import { HEPR_THREE_RENDER_ORDER_TEXT } from "./threeRenderOrder";
 import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -187,7 +188,7 @@ export class ThreeMaterialTextLayer {
         glslVersion: THREE.GLSL3,
         vertexShader: normalizeThreeRawShaderSource(CORE_TEXT_VERTEX_SHADER_SOURCE),
         fragmentShader: normalizeThreeTextRawFragmentShaderSource(CORE_TEXT_FRAGMENT_SHADER_SOURCE),
-        transparent: true,
+        transparent: false,
         depthTest: false,
         depthWrite: false,
         side: THREE.DoubleSide,
@@ -228,7 +229,7 @@ export class ThreeMaterialTextLayer {
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = 2;
+    this.mesh.renderOrder = HEPR_THREE_RENDER_ORDER_TEXT;
   }
 
   setVisible(visible: boolean): void {

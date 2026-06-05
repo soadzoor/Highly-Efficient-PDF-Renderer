@@ -260,7 +260,7 @@ export function createThreeWebGpuStrokeMaterial(
   options: ThreeWebGpuStrokeMaterialOptions
 ): ThreeWebGpuStrokeMaterialState {
   const material = new NodeMaterial();
-  material.transparent = true;
+  material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
   material.side = THREE.DoubleSide;

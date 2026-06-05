@@ -276,7 +276,7 @@ export function createThreeWebGpuTextMaterial(
   options: ThreeWebGpuTextMaterialOptions
 ): ThreeWebGpuTextMaterialState {
   const material = new NodeMaterial();
-  material.transparent = true;
+  material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
   material.side = THREE.DoubleSide;

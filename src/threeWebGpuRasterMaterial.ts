@@ -76,7 +76,7 @@ export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions
 ): ThreeWebGpuRasterMaterialState {
   const material = new NodeMaterial();
-  material.transparent = true;
+  material.transparent = false;
   material.depthTest = false;
   material.depthWrite = false;
   material.side = THREE.DoubleSide;

@@ -11,6 +11,7 @@ import {
   normalizeThreeRawShaderSource,
   normalizeThreeStrokeRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
+import { HEPR_THREE_RENDER_ORDER_STROKE } from "./threeRenderOrder";
 import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -151,7 +152,7 @@ export class ThreeMaterialStrokeLayer {
         glslVersion: THREE.GLSL3,
         vertexShader: normalizeThreeRawShaderSource(CORE_STROKE_VERTEX_SHADER_SOURCE),
         fragmentShader: normalizeThreeStrokeRawFragmentShaderSource(CORE_STROKE_FRAGMENT_SHADER_SOURCE),
-        transparent: true,
+        transparent: false,
         depthTest: false,
         depthWrite: false,
         side: THREE.DoubleSide,
@@ -180,7 +181,7 @@ export class ThreeMaterialStrokeLayer {
 
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = 1;
+    this.mesh.renderOrder = HEPR_THREE_RENDER_ORDER_STROKE;
   }
 
   setVisible(visible: boolean): void {
