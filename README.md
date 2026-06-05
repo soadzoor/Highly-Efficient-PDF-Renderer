@@ -4,13 +4,12 @@ GPU-first PDF renderer for large technical documents, floorplans, and mixed vect
 
 HEPR is built around analytic vector rendering. Strokes, fills, and text are extracted from PDF operator streams and rendered on the GPU instead of being flattened into a giant page bitmap. Embedded PDF image layers are still supported, but vector floorplan geometry stays vector geometry.
 
-The project also exposes an npm package API (`@soadzoor/hepr`) with a native renderer and a three.js wrapper.
+The project also exposes an [npm package API (`@soadzoor/hepr`)](https://www.npmjs.com/package/@soadzoor/hepr) with a native renderer and a three.js wrapper.
 
 ## Demos
 
-- Native demo: <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer>
-- Local native demo: `index.html`
-- Local three.js demo: `three-example.html`
+- "Native" WebGL and WebGPU demo: <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer>
+- Three.js demo: <https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/three-example.html>
 
 ![Demo GIF](./demo/demo.gif)
 
@@ -85,7 +84,7 @@ Controls include:
 
 Backend switches reuse the loaded scene and preserve the camera where possible.
 
-## npm Package API (`@soadzoor/hepr`)
+## npm Package API ([`@soadzoor/hepr`](https://www.npmjs.com/package/@soadzoor/hepr))
 
 Use `pdfObjectGenerator` to load a PDF or parsed ZIP and create a `THREE.Group`.
 The three.js wrapper is camera-driven by default, so the PDF follows your
