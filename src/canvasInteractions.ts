@@ -5,12 +5,33 @@ type InteractionRenderer = Pick<
   "beginPanInteraction" | "endPanInteraction" | "panByPixels" | "zoomAtClientPoint"
 >;
 
+/**
+ * Pointer interaction helper for HEPR's native/fallback 2D viewport.
+ *
+ * Most three.js integrations use three.js controls instead. Use this only when
+ * you intentionally want HEPR's internal renderer view to handle pan/zoom.
+ */
 export interface CanvasInteractionController {
+  /** Attach pointer listeners to a canvas. */
   attach(targetCanvas: HTMLCanvasElement): void;
+
+  /** Remove listeners from the currently attached canvas, if any. */
   detach(): void;
+
+  /** Clear transient pointer/touch gesture state. */
   resetState(): void;
 }
 
+/**
+ * Create a pointer controller for a renderer-like object.
+ *
+ * Example:
+ *
+ * ```ts
+ * const controller = createCanvasInteractionController(() => pdfObject.renderer);
+ * controller.attach(renderer.domElement);
+ * ```
+ */
 export function createCanvasInteractionController(
   getRenderer: () => InteractionRenderer
 ): CanvasInteractionController {

@@ -10,27 +10,96 @@ import {
 import { loadSceneFromParsedDataZip } from "./parsedDataZip";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 
+/**
+ * Source input accepted by HEPR loaders.
+ *
+ * String sources may be URLs/paths, base64 payloads, or base64 data URLs.
+ * Binary sources may contain either a PDF or a HEPR parsed-data ZIP.
+ */
 export type PdfObjectSource = ArrayBuffer | Uint8Array | Blob | File | string;
+
+/** Detected or declared source format. */
 export type PdfObjectSourceKind = "pdf" | "parsed-zip";
 
+/**
+ * Options used while loading and parsing a source into HEPR scene data.
+ */
 export interface PdfObjectGeneratorOptions {
+  /**
+   * Merge compatible adjacent vector stroke segments during parse.
+   *
+   * @default true
+   */
   segmentMerge?: boolean;
+
+  /**
+   * Drop vector content that is known to be invisible.
+   *
+   * @default true
+   */
   invisibleCull?: boolean;
+
+  /**
+   * Maximum number of PDF pages to parse. Omit to parse all pages.
+   */
   maxPages?: number;
+
+  /**
+   * Maximum pages per row when a multi-page PDF is composed into one scene.
+   * Omit to let HEPR choose a compact grid.
+   */
   maxPagesPerRow?: number;
+
+  /**
+   * Progress callback for source loading, PDF parsing, ZIP loading, Vector LOD
+   * building, and upload preparation.
+   */
   onProgress?: LoadProgressCallback;
+
+  /**
+   * Force source interpretation. Use this when bytes or URLs do not make the
+   * format obvious.
+   *
+   * @default "auto"
+   */
   sourceKind?: PdfObjectSourceKind | "auto";
 }
 
+/**
+ * Parsed HEPR scene plus source metadata.
+ *
+ * This is the input shape accepted by `createThreePdfObject`.
+ */
 export interface LoadedPdfScene {
+  /** Parsed vector/raster/text scene data. */
   scene: VectorScene;
+
+  /** Human-readable source label, usually a file name or URL basename. */
   sourceLabel: string;
+
+  /** Whether the source was loaded as a PDF or parsed-data ZIP. */
   sourceKind: PdfObjectSourceKind;
+
+  /** Original source bytes. */
   sourceBytes: Uint8Array;
 }
 
 let isPdfWorkerConfigured = false;
 
+/**
+ * Load and parse a PDF or HEPR parsed-data ZIP into scene data.
+ *
+ * Use this when you want to cache parsed scene data or create multiple
+ * `HeprThreePdfObject` instances from the same source. For a one-step three.js
+ * integration, prefer `pdfObjectGenerator`.
+ *
+ * Example:
+ *
+ * ```ts
+ * const loaded = await loadPdfSceneFromSource(file);
+ * const pdfObject = await createThreePdfObject(loaded);
+ * ```
+ */
 export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions = {}

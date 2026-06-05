@@ -18,6 +18,12 @@ import {
 import { createLoadProgressReporter } from "./loadProgress";
 import { prebuildVectorStrokeLodRuntime } from "./vectorStrokeLod";
 
+/**
+ * Combined options for `pdfObjectGenerator`.
+ *
+ * This includes source parsing options such as `segmentMerge` plus three.js
+ * object options such as `vectorLod` and colors.
+ */
 export interface PdfObjectGeneratorRuntimeOptions
   extends PdfObjectGeneratorOptions,
     Omit<HeprThreeObjectOptions, "rendererType"> {}
@@ -27,6 +33,41 @@ const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
 const LOAD_PROGRESS_VECTOR_LOD_END = 0.96;
 const LOAD_PROGRESS_UPLOAD = 0.98;
 
+/**
+ * Load a PDF or HEPR parsed-data ZIP and return a three.js object.
+ *
+ * This is the main package entry point for three.js applications. The returned
+ * object is a `THREE.Group`; add it to your scene, then call
+ * `prepareFrameForThreeRenderer` before rendering each frame.
+ *
+ * The PDF follows your three.js camera by default.
+ *
+ * Example:
+ *
+ * ```ts
+ * import { pdfObjectGenerator } from "hepr";
+ *
+ * const pdfObject = await pdfObjectGenerator(file, {
+ *   vectorLod: "auto",
+ *   pageBackground: "#ffffff",
+ *   onProgress: (progress) => {
+ *     console.log(progress.stage, progress.value);
+ *   }
+ * });
+ *
+ * scene.add(pdfObject);
+ *
+ * function frame() {
+ *   pdfObject.prepareFrameForThreeRenderer(renderer, camera);
+ *   renderer.render(scene, camera);
+ *   requestAnimationFrame(frame);
+ * }
+ * ```
+ *
+ * @param source PDF/ZIP bytes, a `File`/`Blob`, a URL/path string, or a base64 string.
+ * @param options Parsing and three.js rendering options.
+ * @param rendererType Native backend to use internally. Defaults to `"webgl"`.
+ */
 export async function pdfObjectGenerator(
   source: PdfObjectSource,
   options: PdfObjectGeneratorRuntimeOptions = {},

@@ -992,53 +992,117 @@ export const CORE_VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE = VECTOR_COMPOSITE_FRA
 export const CORE_RASTER_VERTEX_SHADER_SOURCE = RASTER_VERTEX_SHADER_SOURCE;
 export const CORE_RASTER_FRAGMENT_SHADER_SOURCE = RASTER_FRAGMENT_SHADER_SOURCE;
 
+/** Per-frame draw diagnostics from HEPR's native renderer. */
 export interface DrawStats {
+  /** Number of vector stroke segments rendered in the frame. */
   renderedSegments: number;
+
+  /** Total stroke segment count in the loaded scene. */
   totalSegments: number;
+
+  /** Whether renderer-side culling reduced the frame workload. */
   usedCulling: boolean;
+
+  /** HEPR view zoom in screen pixels per PDF scene unit. */
   zoom: number;
 }
 
+/** GPU resource and spatial-index diagnostics for the loaded scene. */
 export interface SceneStats {
+  /** Spatial grid column count. */
   gridWidth: number;
+
+  /** Spatial grid row count. */
   gridHeight: number;
+
+  /** Number of segment index entries stored in the spatial grid. */
   gridIndexCount: number;
+
+  /** Largest number of segments assigned to one spatial grid cell. */
   maxCellPopulation: number;
+
+  /** Fill path metadata texture width. */
   fillPathTextureWidth: number;
+
+  /** Fill path metadata texture height. */
   fillPathTextureHeight: number;
+
+  /** Fill segment texture width. */
   fillSegmentTextureWidth: number;
+
+  /** Fill segment texture height. */
   fillSegmentTextureHeight: number;
+
+  /** Stroke segment texture width. */
   textureWidth: number;
+
+  /** Stroke segment texture height. */
   textureHeight: number;
+
+  /** Maximum texture size reported by the active renderer. */
   maxTextureSize: number;
+
+  /** Text instance texture width. */
   textInstanceTextureWidth: number;
+
+  /** Text instance texture height. */
   textInstanceTextureHeight: number;
+
+  /** Text glyph metadata texture width. */
   textGlyphTextureWidth: number;
+
+  /** Text glyph metadata texture height. */
   textGlyphTextureHeight: number;
+
+  /** Text glyph segment texture width. */
   textSegmentTextureWidth: number;
+
+  /** Text glyph segment texture height. */
   textSegmentTextureHeight: number;
 }
 
+/** HEPR's native 2D view state in PDF scene coordinates. */
 export interface ViewState {
+  /** X coordinate at the center of the HEPR view. */
   cameraCenterX: number;
+
+  /** Y coordinate at the center of the HEPR view. */
   cameraCenterY: number;
+
+  /** Screen pixels per PDF scene unit. */
   zoom: number;
 }
 
+/** Parameters for rendering a native frame through an external projection. */
 export interface ProjectedFrameOptions {
+  /** Render viewport width in device pixels. */
   viewportWidth: number;
+
+  /** Render viewport height in device pixels. */
   viewportHeight: number;
+
+  /** Column-major local-to-clip transform matrix. */
   localToClip: ArrayLike<number>;
+
+  /** Approximate PDF local units per screen pixel. */
   localUnitsPerPixel: number;
+
+  /** Optional PDF-scene culling bounds for the projected frame. */
   cullingBounds?: Bounds | null;
 }
 
+/** Options for native view-state updates. */
 export interface ViewStateUpdateOptions {
+  /** Preserve cached pan content where possible. */
   preservePanCache?: boolean;
+
+  /** Whether the update occurs during an active interaction. */
   interacting?: boolean;
 }
 
+/** WebGL native renderer construction options. */
 export interface WebGlFloorplanRendererOptions {
+  /** Preserve the WebGL drawing buffer after presentation. */
   preserveDrawingBuffer?: boolean;
 }
 

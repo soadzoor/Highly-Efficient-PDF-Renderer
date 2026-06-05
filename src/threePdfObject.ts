@@ -27,25 +27,102 @@ const PERSPECTIVE_NATIVE_OVERSAMPLE = 1.15;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MIN = 0.9;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MAX = 1.12;
 
+/**
+ * Native renderer backend used to upload and draw HEPR data.
+ *
+ * `webgl` is the broad-compatibility default. Use `webgpu` only in browsers
+ * where `navigator.gpu` is available and your application already uses a
+ * WebGPU-capable three.js renderer.
+ */
 export type HeprRendererType = "webgl" | "webgpu";
+
+/**
+ * Color accepted by HEPR option helpers.
+ *
+ * Supported forms:
+ * - `"#ffffff"` or `"ffffff"`
+ * - `0xffffff`
+ * - normalized RGB tuple such as `[1, 1, 1]`
+ */
 export type HeprColorInput = number | string | [number, number, number];
 
+/**
+ * Options for creating a `HeprThreePdfObject`.
+ *
+ * Example:
+ *
+ * ```ts
+ * const pdfObject = await pdfObjectGenerator(file, {
+ *   vectorLod: "auto",
+ *   pageBackground: "#ffffff",
+ *   pageBackgroundOpacity: 1,
+ *   vectorOverrideColor: "#111827",
+ *   vectorOverrideOpacity: 0
+ * });
+ * scene.add(pdfObject);
+ * ```
+ */
 export interface HeprThreeObjectOptions {
+  /**
+   * Native upload/render backend. Defaults to `"webgl"` when passed through
+   * `pdfObjectGenerator`.
+   */
   rendererType?: HeprRendererType;
-  threeCameraDriven?: boolean;
-  threeCameraDebugLogs?: boolean;
-  experimentalMaterialRasters?: boolean;
-  experimentalMaterialFills?: boolean;
-  experimentalMaterialStrokes?: boolean;
-  experimentalMaterialTexts?: boolean;
-  panOptimization?: boolean;
+
+  /**
+   * Vector level-of-detail mode for large stroke-heavy PDFs.
+   *
+   * - `"auto"` enables LOD only for large scenes.
+   * - `"off"` always uses exact strokes.
+   * - `"force"` builds and uses LOD even below the normal size threshold.
+   *
+   * @default "auto"
+   */
   vectorLod?: VectorLodMode;
+
+  /**
+   * Render strokes with curve-aware joins/caps where supported.
+   *
+   * @default true
+   */
   curveStrokes?: boolean;
+
+  /**
+   * Render text as vector glyph geometry only. Raster glyph atlas rendering is
+   * disabled when this is true.
+   *
+   * @default false
+   */
   vectorOnly?: boolean;
-  fitPadding?: number;
+
+  /**
+   * Page background color behind PDF content.
+   *
+   * @default "#ffffff"
+   */
   pageBackground?: HeprColorInput;
+
+  /**
+   * Page background alpha in the range 0..1.
+   *
+   * @default 1
+   */
   pageBackgroundOpacity?: number;
+
+  /**
+   * Optional color override for vector content. Use with
+   * `vectorOverrideOpacity` to tint or replace vector drawing colors.
+   *
+   * @default "#000000"
+   */
   vectorOverrideColor?: HeprColorInput;
+
+  /**
+   * Strength of `vectorOverrideColor` in the range 0..1. A value of 0 preserves
+   * original vector colors; 1 fully replaces them.
+   *
+   * @default 0
+   */
   vectorOverrideOpacity?: number;
 }
 
@@ -79,11 +156,6 @@ interface DerivedThreeCameraView {
 }
 
 interface RendererConfig {
-  panOptimizationEnabled: boolean;
-  materialRasterEnabled: boolean;
-  materialFillEnabled: boolean;
-  materialStrokeEnabled: boolean;
-  materialTextEnabled: boolean;
   vectorLodMode: VectorLodMode;
   strokeCurveEnabled: boolean;
   textVectorOnly: boolean;
@@ -91,18 +163,50 @@ interface RendererConfig {
   vectorOverride: [number, number, number, number];
 }
 
+/**
+ * A three.js `Group` that represents a loaded PDF or parsed HEPR ZIP scene.
+ *
+ * Add it to your scene like any other object. HEPR derives its PDF view from
+ * your `THREE.Camera`, so call `prepareFrameForThreeRenderer(renderer, camera)`
+ * before `renderer.render(scene, camera)` when you own the render loop.
+ *
+ * Example:
+ *
+ * ```ts
+ * const pdfObject = await pdfObjectGenerator(file);
+ * scene.add(pdfObject);
+ *
+ * function frame() {
+ *   pdfObject.prepareFrameForThreeRenderer(renderer, camera);
+ *   renderer.render(scene, camera);
+ *   requestAnimationFrame(frame);
+ * }
+ * ```
+ */
 export class HeprThreePdfObject extends THREE.Group {
+  /** Human-readable source label, usually the file name or URL basename. */
   readonly sourceLabel: string;
+
+  /** Whether this object was loaded from a PDF or a parsed-data ZIP. */
   readonly sourceKind: LoadedPdfScene["sourceKind"];
+
+  /** Native renderer backend used internally by this object. */
   readonly rendererType: HeprRendererType;
+
+  /** Parsed scene data backing this three.js object. Treat as read-only. */
   readonly sceneData: LoadedPdfScene["scene"];
 
+  /** Internal native renderer. Advanced escape hatch; prefer object methods. */
   renderer: RendererApi;
+
+  /** Built-in 2D interaction helper for the fallback viewport path. */
   readonly interactionController: CanvasInteractionController;
+
+  /** Internal canvas used by the fallback texture pipeline. */
   renderCanvas: HTMLCanvasElement;
+
+  /** Texture wrapping `renderCanvas`, or `null` while using material layers. */
   renderTexture: THREE.CanvasTexture | null;
-  readonly threeCameraDriven: boolean;
-  readonly threeCameraDebugLogs: boolean;
 
   private readonly pageMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
   private readonly uvArray: Float32Array;
@@ -111,7 +215,6 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly localSceneBounds: SceneBounds;
   private readonly sceneCenterX: number;
   private readonly sceneCenterY: number;
-  private readonly cameraDepthByCamera = new WeakMap<THREE.Camera, number>();
   private readonly rendererConfig: RendererConfig;
   private readonly rasterMaterialLayer: ThreeMaterialRasterLayer | null;
   private readonly fillMaterialLayer: ThreeMaterialFillLayer | null;
@@ -136,8 +239,6 @@ export class HeprThreePdfObject extends THREE.Group {
   private skipNextBeforeRenderCallback = false;
   private warnedThreeCameraUnsupported = false;
   private warnedThreeCameraPerspectiveFallback = false;
-  private lastThreeCameraWarningMessage: string | null = null;
-  private lastThreeCameraWarningAtMs = 0;
   private readonly pagePlane = new THREE.Plane();
   private readonly pagePlanePoint = new THREE.Vector3();
   private readonly pagePlaneNormal = new THREE.Vector3();
@@ -162,14 +263,19 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly projectedBasisX = new THREE.Vector3();
   private readonly projectedBasisY = new THREE.Vector3();
 
+  /**
+   * Internal constructor used by `createThreePdfObject`.
+   *
+   * Application code should create objects with `pdfObjectGenerator(source,
+   * options)` or `createThreePdfObject(loadedScene, options)` instead of
+   * calling this constructor directly.
+   */
   constructor(
     loadedScene: LoadedPdfScene,
     rendererType: HeprRendererType,
     renderer: RendererApi,
     renderCanvas: HTMLCanvasElement,
     renderTexture: THREE.CanvasTexture | null,
-    threeCameraDriven: boolean,
-    threeCameraDebugLogs: boolean,
     rendererConfig: RendererConfig,
     initialFitPaddingPixels: number,
     rasterMaterialLayer: ThreeMaterialRasterLayer | null,
@@ -191,8 +297,6 @@ export class HeprThreePdfObject extends THREE.Group {
     this.renderer = renderer;
     this.renderCanvas = renderCanvas;
     this.renderTexture = renderTexture;
-    this.threeCameraDriven = threeCameraDriven;
-    this.threeCameraDebugLogs = threeCameraDebugLogs;
     this.rendererConfig = rendererConfig;
     this.rasterMaterialLayer = rasterMaterialLayer;
     this.fillMaterialLayer = fillMaterialLayer;
@@ -260,6 +364,13 @@ export class HeprThreePdfObject extends THREE.Group {
     this.configureThreeMaterialPipeline();
   }
 
+  /**
+   * Attach HEPR's built-in pointer controls to a canvas.
+   *
+   * Most three.js applications already use `OrbitControls`, `MapControls`, or
+   * custom controls; in that case do not call this method. It exists for the
+   * self-contained fallback viewport path.
+   */
   attachControls(targetCanvas: HTMLCanvasElement): void {
     if (this.controlsCanvas === targetCanvas) {
       return;
@@ -271,6 +382,15 @@ export class HeprThreePdfObject extends THREE.Group {
     this.controlsCanvas = targetCanvas;
   }
 
+  /**
+   * Fit the internal HEPR view to the full PDF bounds.
+   *
+   * In camera-driven three.js integrations, applications often position their
+   * own camera instead. Use this method when you want HEPR's fallback view
+   * state to frame the source.
+   *
+   * @param paddingPixels Padding in device pixels around the fitted PDF.
+   */
   fitToBounds(paddingPixels = DEFAULT_FIT_PADDING_PIXELS): void {
     this.pendingInitialFit = false;
     this.initialFitPaddingPixels = Math.max(0, paddingPixels);
@@ -281,14 +401,31 @@ export class HeprThreePdfObject extends THREE.Group {
     this.renderer.fitToBounds(resolveSceneFitBounds(this.sceneData), this.initialFitPaddingPixels);
   }
 
+  /**
+   * Read the current HEPR view state.
+   *
+   * The returned values are in PDF scene coordinates. In camera-driven mode
+   * this is the view derived from the current three.js camera after the latest
+   * prepared frame.
+   */
   getViewState(): ViewState {
     return this.renderer.getViewState();
   }
 
+  /**
+   * Return Vector LOD statistics for diagnostics, or `null` when Vector LOD is
+   * inactive.
+   */
   getVectorStrokeLodStats(): VectorStrokeLodStats | null {
     return this.vectorLodStrokeLayer?.getStats() ?? this.renderer.getVectorStrokeLodStats?.() ?? null;
   }
 
+  /**
+   * Return the current rendered stroke segment count when it is known.
+   *
+   * This is useful for debug HUDs. Returns `null` when the active pipeline does
+   * not expose a separate stroke count.
+   */
   getRenderedStrokeSegmentCount(): number | null {
     if (this.vectorLodStrokeLayer?.group.visible) {
       return this.vectorLodStrokeLayer.getRenderedSegmentCount();
@@ -311,14 +448,38 @@ export class HeprThreePdfObject extends THREE.Group {
     return null;
   }
 
+  /**
+   * Return the most recent native renderer draw stats, or `null` before the
+   * first native frame.
+   */
   getNativeDrawStats(): DrawStats | null {
     return this.lastNativeDrawStats ? { ...this.lastNativeDrawStats } : null;
   }
 
+  /**
+   * Subscribe to native frame statistics.
+   *
+   * Pass `null` to clear the listener.
+   */
   setFrameListener(listener: ((stats: DrawStats) => void) | null): void {
     this.frameListener = listener;
   }
 
+  /**
+   * Synchronize HEPR with a three.js renderer/camera before rendering.
+   *
+   * Call this once per frame before `renderer.render(scene, camera)` when you
+   * use your own render loop. The object also installs an `onBeforeRender`
+   * hook, but explicit preparation avoids ordering surprises in apps with
+   * custom render passes.
+   *
+   * Example:
+   *
+   * ```ts
+   * pdfObject.prepareFrameForThreeRenderer(renderer, camera);
+   * renderer.render(scene, camera);
+   * ```
+   */
   prepareFrameForThreeRenderer(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
     if (this.isDisposed) {
       return;
@@ -327,6 +488,12 @@ export class HeprThreePdfObject extends THREE.Group {
     this.skipNextBeforeRenderCallback = true;
   }
 
+  /**
+   * Change Vector LOD mode at runtime.
+   *
+   * Use `"auto"` for normal use, `"off"` for exact strokes, and `"force"` to
+   * always use LOD when supported.
+   */
   setVectorLodMode(mode: VectorLodMode): void {
     if (this.isDisposed) {
       return;
@@ -350,14 +517,9 @@ export class HeprThreePdfObject extends THREE.Group {
     this.resetRenderPipelinesAfterLayerChange();
   }
 
-  setPanOptimizationEnabled(enabled: boolean): void {
-    if (this.isDisposed) {
-      return;
-    }
-    this.rendererConfig.panOptimizationEnabled = Boolean(enabled);
-    this.renderer.setPanOptimizationEnabled(this.rendererConfig.panOptimizationEnabled);
-  }
-
+  /**
+   * Enable or disable curve-aware stroke rendering where supported.
+   */
   setStrokeCurveEnabled(enabled: boolean): void {
     if (this.isDisposed) {
       return;
@@ -369,6 +531,11 @@ export class HeprThreePdfObject extends THREE.Group {
     this.textMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
   }
 
+  /**
+   * Set the page background color.
+   *
+   * All channels are normalized floats in the range 0..1.
+   */
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
     if (this.isDisposed) {
       return;
@@ -378,6 +545,12 @@ export class HeprThreePdfObject extends THREE.Group {
     this.rasterMaterialLayer?.setPageBackgroundColor(red, green, blue, alpha);
   }
 
+  /**
+   * Blend vector drawing colors toward a single override color.
+   *
+   * Color channels and opacity are normalized floats in the range 0..1.
+   * `opacity = 0` preserves source colors; `opacity = 1` fully replaces them.
+   */
   setVectorColorOverride(red: number, green: number, blue: number, opacity: number): void {
     if (this.isDisposed) {
       return;
@@ -392,11 +565,22 @@ export class HeprThreePdfObject extends THREE.Group {
     this.textMaterialLayer?.setVectorOverride(red, green, blue, opacity);
   }
 
+  /**
+   * Set the internal HEPR view state.
+   *
+   * The next prepared frame derives this state from the three.js camera again,
+   * so this is mainly useful for inspecting or temporarily overriding fallback
+   * native view state.
+   */
   setViewState(viewState: ViewState): void {
     this.pendingInitialFit = false;
     this.renderer.setViewState(viewState);
   }
 
+  /**
+   * Dispose GPU resources, textures, geometry, event listeners, and the native
+   * renderer owned by this object.
+   */
   dispose(): void {
     if (this.isDisposed) {
       return;
@@ -445,10 +629,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private shouldUseThreeMaterialStrokeLayer(): boolean {
-    return (
-      (this.rendererType === "webgl" || this.rendererType === "webgpu") &&
-      (this.rendererType === "webgpu" || this.threeCameraDriven || this.rendererConfig.materialStrokeEnabled)
-    );
+    return this.rendererType === "webgl" || this.rendererType === "webgpu";
   }
 
   private shouldUseThreeVectorLodLayer(mode: VectorLodMode): boolean {
@@ -525,11 +706,9 @@ export class HeprThreePdfObject extends THREE.Group {
     const rendererViewport = readThreeRendererViewportPixels(renderer);
     this.updateTextureSampling(renderer);
     const cameraType = camera as { isPerspectiveCamera?: boolean };
-    const perspectiveThreeCameraMode = this.threeCameraDriven && cameraType.isPerspectiveCamera === true;
-    const cameraDrivenMaterialPipelineAvailable = this.threeCameraDriven && this.hasCompleteMaterialLayers();
-    const derivedView = this.threeCameraDriven
-      ? this.deriveViewStateFromThreeCamera(camera, rendererViewport)
-      : null;
+    const perspectiveThreeCameraMode = cameraType.isPerspectiveCamera === true;
+    const cameraDrivenMaterialPipelineAvailable = this.hasCompleteMaterialLayers();
+    const derivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
     const cameraDrivenMaterialPipelineEnabled = cameraDrivenMaterialPipelineAvailable && derivedView !== null;
 
     let nativeViewport = rendererViewport;
@@ -538,54 +717,47 @@ export class HeprThreePdfObject extends THREE.Group {
       ? derivedView.cullingBounds ?? null
       : null;
 
-    if (this.threeCameraDriven) {
-      if (cameraDrivenMaterialPipelineEnabled) {
+    if (cameraDrivenMaterialPipelineEnabled) {
+      this.warnedThreeCameraPerspectiveFallback = false;
+      nativeViewport = derivedView.nativeViewport;
+      const previousView = this.renderer.getViewState();
+      if (!isViewStateApproxEqual(previousView, derivedView.viewState)) {
+        this.renderer.setViewState(derivedView.viewState);
+        nativeViewChanged = true;
+      }
+      this.pendingInitialFit = false;
+    } else if (perspectiveThreeCameraMode) {
+      if (!this.warnedThreeCameraPerspectiveFallback) {
+        this.warnedThreeCameraPerspectiveFallback = true;
+        console.warn(
+          "[HEPR] PerspectiveCamera uses adaptive texture fallback because complete Three material layers are unavailable."
+        );
+      }
+      const perspectiveView = this.derivePerspectiveFallbackViewState(camera as THREE.PerspectiveCamera, rendererViewport);
+      if (perspectiveView) {
         this.warnedThreeCameraPerspectiveFallback = false;
-        nativeViewport = derivedView.nativeViewport;
+        nativeViewport = perspectiveView.nativeViewport;
+        this.resizeNativeRendererCanvas(nativeViewport);
         const previousView = this.renderer.getViewState();
-        if (!isViewStateApproxEqual(previousView, derivedView.viewState)) {
-          this.renderer.setViewState(derivedView.viewState);
+        if (!isViewStateApproxEqual(previousView, perspectiveView.viewState)) {
+          this.renderer.setViewState(perspectiveView.viewState);
           nativeViewChanged = true;
         }
         this.pendingInitialFit = false;
-      } else if (perspectiveThreeCameraMode) {
-        if (!this.warnedThreeCameraPerspectiveFallback) {
-          this.warnedThreeCameraPerspectiveFallback = true;
-          console.warn(
-            "[HEPR] threeCameraDriven with PerspectiveCamera uses adaptive texture fallback because complete Three material layers are unavailable."
-          );
-        }
-        const perspectiveView = this.derivePerspectiveFallbackViewState(camera as THREE.PerspectiveCamera, rendererViewport);
-        if (perspectiveView) {
-          this.warnedThreeCameraPerspectiveFallback = false;
-          nativeViewport = perspectiveView.nativeViewport;
-          this.resizeNativeRendererCanvas(nativeViewport);
-          const previousView = this.renderer.getViewState();
-          if (!isViewStateApproxEqual(previousView, perspectiveView.viewState)) {
-            this.renderer.setViewState(perspectiveView.viewState);
-            nativeViewChanged = true;
-          }
-          this.pendingInitialFit = false;
-        } else {
-          this.resizeNativeRendererCanvas(nativeViewport);
-        }
       } else {
-        this.warnedThreeCameraPerspectiveFallback = false;
-        if (derivedView) {
-          nativeViewport = derivedView.nativeViewport;
-          if (!cameraDrivenMaterialPipelineEnabled) {
-            this.resizeNativeRendererCanvas(nativeViewport);
-          }
-          this.renderer.setViewState(derivedView.viewState);
-          this.pendingInitialFit = false;
-          nativeViewChanged = true;
-        } else {
-          this.resizeNativeRendererCanvas(nativeViewport);
-        }
+        this.resizeNativeRendererCanvas(nativeViewport);
       }
     } else {
       this.warnedThreeCameraPerspectiveFallback = false;
-      this.resizeNativeRendererCanvas(nativeViewport);
+      if (derivedView) {
+        nativeViewport = derivedView.nativeViewport;
+        this.resizeNativeRendererCanvas(nativeViewport);
+        this.renderer.setViewState(derivedView.viewState);
+        this.pendingInitialFit = false;
+        nativeViewChanged = true;
+      } else {
+        this.resizeNativeRendererCanvas(nativeViewport);
+      }
     }
 
     if (cameraDrivenMaterialPipelineEnabled) {
@@ -602,7 +774,6 @@ export class HeprThreePdfObject extends THREE.Group {
     }
 
     const shouldRenderThreeCameraFrame =
-      this.threeCameraDriven &&
       !cameraDrivenMaterialPipelineEnabled &&
       (
         !perspectiveThreeCameraMode ||
@@ -634,9 +805,6 @@ export class HeprThreePdfObject extends THREE.Group {
         cameraDrivenMaterialPipelineEnabled && derivedView
           ? derivedView.viewState
           : this.renderer.getPresentedViewState();
-      if (!this.threeCameraDriven) {
-        this.syncOrthographicCamera(camera, viewState, nativeViewport);
-      }
       if (!cameraDrivenMaterialPipelineEnabled && this.renderTexture) {
         if (perspectiveThreeCameraMode) {
           this.updateUvToFullPage();
@@ -991,31 +1159,6 @@ export class HeprThreePdfObject extends THREE.Group {
     return 1 / pixelsPerLocalUnit;
   }
 
-  private syncOrthographicCamera(camera: THREE.Camera, viewState: ViewState, viewport: ViewportPixels): void {
-    const maybeOrtho = camera as THREE.OrthographicCamera;
-    if (!maybeOrtho || (maybeOrtho as { isOrthographicCamera?: boolean }).isOrthographicCamera !== true) {
-      return;
-    }
-
-    const safeZoom = Math.max(1e-6, viewState.zoom);
-    const halfWidth = viewport.width / (2 * safeZoom);
-    const halfHeight = viewport.height / (2 * safeZoom);
-    maybeOrtho.left = -halfWidth;
-    maybeOrtho.right = halfWidth;
-    maybeOrtho.top = halfHeight;
-    maybeOrtho.bottom = -halfHeight;
-    maybeOrtho.zoom = 1;
-
-    const z = this.cameraDepthByCamera.get(maybeOrtho) ?? maybeOrtho.position.z;
-    this.cameraDepthByCamera.set(maybeOrtho, z);
-    maybeOrtho.position.set(
-      viewState.cameraCenterX - this.sceneCenterX,
-      viewState.cameraCenterY - this.sceneCenterY,
-      z
-    );
-    maybeOrtho.updateProjectionMatrix();
-  }
-
   private updateUvFromViewState(viewState: ViewState, viewport: ViewportPixels): void {
     const safeZoom = Math.max(1e-6, viewState.zoom);
     const viewWidth = viewport.width / safeZoom;
@@ -1092,7 +1235,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private deriveViewStateFromThreeCamera(camera: THREE.Camera, viewport: ViewportPixels): DerivedThreeCameraView | null {
     const cameraType = camera as { isOrthographicCamera?: boolean; isPerspectiveCamera?: boolean };
     if (cameraType.isOrthographicCamera !== true && cameraType.isPerspectiveCamera !== true) {
-      this.warnThreeCameraUnsupported("[HEPR] threeCameraDriven mode supports orthographic or perspective cameras.");
+      this.warnThreeCameraUnsupported("[HEPR] Camera-driven rendering supports orthographic or perspective cameras.");
       return null;
     }
 
@@ -1113,7 +1256,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pagePlane.setFromNormalAndCoplanarPoint(this.pagePlaneNormal, this.pagePlanePoint);
     this.pageWorldInverse.copy(this.pageMesh.matrixWorld);
     if (Math.abs(this.pageWorldInverse.determinant()) < 1e-10) {
-      this.warnThreeCameraUnsupported("[HEPR] threeCameraDriven mode requires a non-singular PDF object transform.");
+      this.warnThreeCameraUnsupported("[HEPR] Camera-driven rendering requires a non-singular PDF object transform.");
       return null;
     }
     this.pageWorldInverse.invert();
@@ -1148,7 +1291,7 @@ export class HeprThreePdfObject extends THREE.Group {
         return fallbackView;
       }
       this.warnThreeCameraUnsupported(
-        "[HEPR] threeCameraDriven mode could not project enough viewport corners onto the PDF plane for this camera/view."
+        "[HEPR] Camera-driven rendering could not project enough viewport corners onto the PDF plane for this camera/view."
       );
       return null;
     }
@@ -1228,7 +1371,7 @@ export class HeprThreePdfObject extends THREE.Group {
     const minAxisScale = 1e-8;
     if (!Number.isFinite(sx) || !Number.isFinite(sy) || Math.abs(sx) < minAxisScale || Math.abs(sy) < minAxisScale) {
       this.warnThreeCameraUnsupported(
-        `[HEPR] threeCameraDriven orthographic mode has invalid axis scale (sx=${sx.toExponential(3)}, sy=${sy.toExponential(3)}).`
+        `[HEPR] Camera-driven orthographic rendering has invalid axis scale (sx=${sx.toExponential(3)}, sy=${sy.toExponential(3)}).`
       );
       return null;
     }
@@ -1236,7 +1379,7 @@ export class HeprThreePdfObject extends THREE.Group {
     const maxCrossAxis = 1e-4;
     if (!Number.isFinite(shearX) || !Number.isFinite(shearY) || Math.abs(shearX) > maxCrossAxis || Math.abs(shearY) > maxCrossAxis) {
       this.warnThreeCameraUnsupported(
-        `[HEPR] threeCameraDriven orthographic mode is skewed (shearX=${shearX.toExponential(3)}, shearY=${shearY.toExponential(3)}).`
+        `[HEPR] Camera-driven orthographic rendering is skewed (shearX=${shearX.toExponential(3)}, shearY=${shearY.toExponential(3)}).`
       );
       return null;
     }
@@ -1248,7 +1391,7 @@ export class HeprThreePdfObject extends THREE.Group {
     const zoom = Math.max(1e-6, Math.min(zoomX, zoomY));
     if (!Number.isFinite(localCenterX) || !Number.isFinite(localCenterY) || !Number.isFinite(zoom)) {
       this.warnThreeCameraUnsupported(
-        `[HEPR] threeCameraDriven orthographic mode produced non-finite view values (cx=${localCenterX}, cy=${localCenterY}, zoom=${zoom}).`
+        `[HEPR] Camera-driven orthographic rendering produced non-finite view values (cx=${localCenterX}, cy=${localCenterY}, zoom=${zoom}).`
       );
       return null;
     }
@@ -1436,26 +1579,10 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private warnThreeCameraUnsupported(message: string): void {
-    if (!this.threeCameraDebugLogs) {
-      if (this.warnedThreeCameraUnsupported) {
-        return;
-      }
-      this.warnedThreeCameraUnsupported = true;
-      console.warn(message);
+    if (this.warnedThreeCameraUnsupported) {
       return;
     }
-
-    const now = performance.now();
-    const sameMessage = this.lastThreeCameraWarningMessage === message;
-    const tooSoon = sameMessage && now - this.lastThreeCameraWarningAtMs < 250;
-    if (tooSoon) {
-      this.warnedThreeCameraUnsupported = true;
-      return;
-    }
-
     this.warnedThreeCameraUnsupported = true;
-    this.lastThreeCameraWarningMessage = message;
-    this.lastThreeCameraWarningAtMs = now;
     console.warn(`${message} source=${this.sourceLabel}`);
   }
 
@@ -1467,13 +1594,29 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 }
 
+/**
+ * Create a three.js PDF object from an already parsed HEPR scene.
+ *
+ * Most applications should call `pdfObjectGenerator(source, options)` instead,
+ * which loads/parses the source before creating this object. Use this lower
+ * level helper when you already have a `LoadedPdfScene`, for example from
+ * `loadPdfSceneFromSource`.
+ *
+ * Example:
+ *
+ * ```ts
+ * const loaded = await loadPdfSceneFromSource(file);
+ * const pdfObject = await createThreePdfObject(loaded, {
+ *   vectorLod: "auto"
+ * });
+ * scene.add(pdfObject);
+ * ```
+ */
 export async function createThreePdfObject(
   loadedScene: LoadedPdfScene,
   options: HeprThreeObjectOptions = {}
 ): Promise<HeprThreePdfObject> {
   const rendererType = options.rendererType ?? "webgl";
-  const threeCameraDriven = options.threeCameraDriven === true;
-  const threeCameraDebugLogs = options.threeCameraDebugLogs === true;
   const sceneBounds = normalizeBounds(resolveSceneFitBounds(loadedScene.scene));
   const sceneCenterX = (sceneBounds.minX + sceneBounds.maxX) * 0.5;
   const sceneCenterY = (sceneBounds.minY + sceneBounds.maxY) * 0.5;
@@ -1483,10 +1626,8 @@ export async function createThreePdfObject(
   renderCanvas.height = initialCanvasSize.height;
 
   const rendererConfig = normalizeRendererConfig(options);
-  const initialFitPaddingPixels = normalizePadding(options.fitPadding);
-  const forceThreeMaterialLayers = threeCameraDriven || rendererType === "webgpu";
-  const shouldConstructStrokeMaterial =
-    rendererConfig.materialStrokeEnabled || forceThreeMaterialLayers;
+  const initialFitPaddingPixels = DEFAULT_FIT_PADDING_PIXELS;
+  const shouldConstructStrokeMaterial = true;
   const useVectorLodStrokeLayer =
     shouldConstructStrokeMaterial &&
     shouldUseVectorStrokeLod(
@@ -1499,16 +1640,14 @@ export async function createThreePdfObject(
   if (useVectorLodStrokeLayer) {
     nativeRenderer.setVectorLodMode?.("off");
   }
-  if (rendererType === "webgpu" || threeCameraDriven) {
-    nativeRenderer.setExternalFrameDriver?.(true);
-  }
+  nativeRenderer.setExternalFrameDriver?.(true);
   nativeRenderer.setScene(loadedScene.scene);
 
   const materialBackend = rendererType === "webgpu" ? "webgpu" : "webgl";
   const enableMaterialLayerConstruction = rendererType === "webgl" || rendererType === "webgpu";
 
   const rasterMaterialLayer =
-    enableMaterialLayerConstruction && (rendererConfig.materialRasterEnabled || forceThreeMaterialLayers)
+    enableMaterialLayerConstruction
       ? new ThreeMaterialRasterLayer(loadedScene.scene, {
         materialBackend,
         pageBackground: rendererConfig.pageBackground
@@ -1516,7 +1655,7 @@ export async function createThreePdfObject(
       : null;
 
   const fillMaterialLayer =
-    enableMaterialLayerConstruction && (rendererConfig.materialFillEnabled || forceThreeMaterialLayers)
+    enableMaterialLayerConstruction
       ? new ThreeMaterialFillLayer(loadedScene.scene, {
         materialBackend,
         vectorOverride: rendererConfig.vectorOverride
@@ -1548,7 +1687,7 @@ export async function createThreePdfObject(
   const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
 
   const textMaterialLayer =
-    enableMaterialLayerConstruction && (rendererConfig.materialTextEnabled || forceThreeMaterialLayers)
+    enableMaterialLayerConstruction
       ? new ThreeMaterialTextLayer(loadedScene.scene, {
         materialBackend,
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
@@ -1557,7 +1696,7 @@ export async function createThreePdfObject(
       })
       : null;
 
-  const renderTexture = forceThreeMaterialLayers ? null : createRenderCanvasTexture(renderCanvas);
+  const renderTexture = null;
 
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array([
@@ -1586,8 +1725,6 @@ export async function createThreePdfObject(
     nativeRenderer,
     renderCanvas,
     renderTexture,
-    threeCameraDriven,
-    threeCameraDebugLogs,
     rendererConfig,
     initialFitPaddingPixels,
     rasterMaterialLayer,
@@ -1682,11 +1819,6 @@ function normalizeRendererConfig(options: HeprThreeObjectOptions): RendererConfi
         : 1;
 
   return {
-    panOptimizationEnabled: options.panOptimization !== false,
-    materialRasterEnabled: options.experimentalMaterialRasters === true,
-    materialFillEnabled: options.experimentalMaterialFills === true,
-    materialStrokeEnabled: options.experimentalMaterialStrokes === true,
-    materialTextEnabled: options.experimentalMaterialTexts === true,
     vectorLodMode: normalizeVectorLodMode(options.vectorLod),
     strokeCurveEnabled: options.curveStrokes !== false,
     textVectorOnly: options.vectorOnly === true,
@@ -1700,7 +1832,7 @@ function normalizeVectorLodMode(value: VectorLodMode | undefined): VectorLodMode
 }
 
 function applyRendererConfig(renderer: RendererApi, config: RendererConfig): void {
-  renderer.setPanOptimizationEnabled(config.panOptimizationEnabled);
+  renderer.setPanOptimizationEnabled(true);
   renderer.setVectorLodMode?.(config.vectorLodMode);
   renderer.setRasterRenderingEnabled?.(true);
   renderer.setFillRenderingEnabled?.(true);
@@ -1843,13 +1975,6 @@ function resolveSceneFitBounds(scene: LoadedPdfScene["scene"]): {
     maxX: scene.bounds.maxX,
     maxY: scene.bounds.maxY
   };
-}
-
-function normalizePadding(value: number | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return DEFAULT_FIT_PADDING_PIXELS;
-  }
-  return Math.max(0, value);
 }
 
 function clamp01(value: number): number {

@@ -88,22 +88,22 @@ Backend switches reuse the loaded scene and preserve the camera where possible.
 ## npm Package API (`hepr`)
 
 Use `pdfObjectGenerator` to load a PDF or parsed ZIP and create a `THREE.Group`.
+The three.js wrapper is camera-driven by default, so the PDF follows your
+existing `THREE.Camera` and controls.
+The generated TypeScript declaration files include JSDoc comments for the main
+options, return types, and runtime methods.
 
 ```ts
 import * as THREE from "three";
 import { pdfObjectGenerator } from "hepr";
 
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, width / height, 0.01, 2000);
+const renderer = new THREE.WebGLRenderer({ canvas });
+
 const pdfObject = await pdfObjectGenerator(
   source,
   {
-    segmentMerge: true,
-    invisibleCull: true,
-    vectorLod: "auto",
-    threeCameraDriven: true,
-    pageBackground: "#ffffff",
-    pageBackgroundOpacity: 1,
-    vectorOverrideColor: "#000000",
-    vectorOverrideOpacity: 0,
     onProgress: (progress) => {
       console.log(progress.stage, progress.value);
     }
@@ -111,10 +111,15 @@ const pdfObject = await pdfObjectGenerator(
   "webgl" // "webgl" (default) | "webgpu"
 );
 
-const scene = new THREE.Scene();
 scene.add(pdfObject);
 
-pdfObject.fitToBounds();
+function frame(): void {
+  pdfObject.prepareFrameForThreeRenderer(renderer, camera);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+frame();
 ```
 
 Supported `source` inputs:
@@ -127,14 +132,15 @@ Supported `source` inputs:
 
 Useful object APIs:
 
-- `pdfObject.attachControls(renderer.domElement)`
-- `pdfObject.fitToBounds()`
+- `pdfObject.prepareFrameForThreeRenderer(renderer, camera)`
 - `pdfObject.getViewState()`
 - `pdfObject.setViewState(...)`
 - `pdfObject.setVectorLodMode("auto" | "off" | "force")`
 - `pdfObject.getVectorStrokeLodStats()`
 - `pdfObject.setPageBackgroundColor(...)`
 - `pdfObject.setVectorColorOverride(...)`
+- `pdfObject.fitToBounds()` for the internal fallback view state
+- `pdfObject.attachControls(renderer.domElement)` for HEPR's fallback 2D controls
 - `pdfObject.dispose()`
 
 Package exports:

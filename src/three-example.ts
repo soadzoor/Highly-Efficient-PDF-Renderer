@@ -136,10 +136,6 @@ const dropIndicatorElement = dropIndicator;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
-const searchParams = new URLSearchParams(window.location.search);
-const threeCameraDebugLogs =
-  searchParams.get("heprThreeCameraDebug") === "1" ||
-  searchParams.get("heprPerspectiveDebug") === "1";
 const CAMERA_FIT_PADDING_PIXELS = 64;
 const MIN_OBJECT_EXTENT = 1e-3;
 const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
@@ -190,11 +186,6 @@ camera.lookAt(0, 0, 0);
 updatePerspectiveCameraProjection();
 
 let controls = createMapControls();
-if (threeCameraDebugLogs) {
-  console.info(
-    "[HEPR:three-example] three-camera debug logs enabled."
-  );
-}
 
 let currentPdfObject: HeprThreePdfObject | null = null;
 let lastLoadedSource: File | string | null = null;
@@ -543,19 +534,11 @@ function disposeExample(): void {
   renderer.dispose();
 }
 
-function readThreeObjectOptions(backend: HeprRendererType): Omit<HeprThreeObjectOptions, "rendererType"> {
-  const useWebGpuMaterialPipeline = backend === "webgpu";
+function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> {
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
-    threeCameraDriven: true,
-    threeCameraDebugLogs,
-    curveStrokes: true,
     vectorLod: readVectorLodMode(),
-    experimentalMaterialRasters: useWebGpuMaterialPipeline,
-    experimentalMaterialFills: useWebGpuMaterialPipeline,
-    experimentalMaterialStrokes: useWebGpuMaterialPipeline,
-    experimentalMaterialTexts: useWebGpuMaterialPipeline,
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],
     pageBackgroundOpacity: pageBackground[3],
     vectorOverrideColor: [vectorOverride[0], vectorOverride[1], vectorOverride[2]],
@@ -570,7 +553,7 @@ async function loadSource(
   const activeLoadToken = ++loadToken;
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
-  const objectOptions = readThreeObjectOptions(backend);
+  const objectOptions = readThreeObjectOptions();
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
@@ -591,10 +574,6 @@ async function loadSource(
     const nextObject = await pdfObjectGenerator(
       source,
       {
-        threeCameraDriven: true,
-        threeCameraDebugLogs,
-        segmentMerge: true,
-        invisibleCull: true,
         ...objectOptions,
         onProgress: (progress) => {
           updateLoadingProgress(activeLoadToken, progress);
@@ -677,7 +656,7 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
     }
 
     const nextObject = await createThreePdfObject(loadedScene, {
-      ...readThreeObjectOptions(backend),
+      ...readThreeObjectOptions(),
       rendererType: backend
     });
     if (activeLoadToken !== loadToken) {
@@ -697,7 +676,7 @@ async function switchLoadedSceneBackend(backend: HeprRendererType): Promise<void
     try {
       await ensureThreeRendererBackend(previousBackend, { disposeCurrentPdfObject: false });
       const fallbackObject = await createThreePdfObject(loadedScene, {
-        ...readThreeObjectOptions(previousBackend),
+        ...readThreeObjectOptions(),
         rendererType: previousBackend
       });
       replacePdfObject(fallbackObject, { fitCamera: false });

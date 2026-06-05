@@ -1,3 +1,6 @@
+/**
+ * Current phase of source loading, parsing, LOD preparation, or upload.
+ */
 export type PDFLoadStage =
   | "source"
   | "pdf-page"
@@ -13,20 +16,57 @@ export type PDFLoadStage =
   | "first-render"
   | "complete";
 
+/** Where PDF operator parsing is running. */
 export type PDFLoadExecutionPath = "worker" | "main-thread" | "main-thread-fallback";
 
+/**
+ * Progress event emitted by HEPR loaders.
+ *
+ * `value` is always normalized from 0..1 for the overall operation. Additional
+ * fields describe the active unit when HEPR knows it, such as bytes, pages, or
+ * operators.
+ */
 export interface PDFLoadProgress {
+  /** Overall normalized progress in the range 0..1. */
   value: number;
+
+  /** Current load/parse/upload phase. */
   stage: PDFLoadStage;
+
+  /** Execution path used for PDF parsing, when known. */
   executionPath?: PDFLoadExecutionPath;
+
+  /** Source family currently being processed. */
   sourceType?: "pdf" | "zip";
+
+  /** Unit represented by `processed` and `total`, when available. */
   unit?: "bytes" | "operators" | "files" | "pages";
+
+  /** Completed units for the current stage. */
   processed?: number;
+
+  /** Total units for the current stage, when known. */
   total?: number;
+
+  /** Zero-based PDF page index for page-scoped progress. */
   pageIndex?: number;
+
+  /** Total page count, when known. */
   pageCount?: number;
 }
 
+/**
+ * Receives progress events from `pdfObjectGenerator` and
+ * `loadPdfSceneFromSource`.
+ *
+ * Example:
+ *
+ * ```ts
+ * const onProgress: LoadProgressCallback = (progress) => {
+ *   console.log(progress.stage, `${Math.round(progress.value * 100)}%`);
+ * };
+ * ```
+ */
 export type LoadProgressCallback = (progress: PDFLoadProgress) => void;
 
 type ProgressMetadata = Omit<PDFLoadProgress, "value">;

@@ -1,52 +1,120 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
+/**
+ * Vector stroke level-of-detail behavior.
+ *
+ * - `"auto"` enables LOD for large stroke-heavy scenes.
+ * - `"off"` always renders exact strokes.
+ * - `"force"` builds and uses LOD even below the normal scene-size threshold.
+ */
 export type VectorLodMode = "auto" | "off" | "force";
 
+/** Minimum source segment count where `"auto"` considers Vector LOD. */
 export const VECTOR_STROKE_LOD_MIN_SEGMENTS = 150_000;
+
+/** Simplification tolerances used to build Vector LOD levels. */
 export const VECTOR_STROKE_LOD_TOLERANCES = [0.5, 1, 2, 4, 8, 16, 32] as const;
+
+/** Runtime target for visible stroke segments when Vector LOD is active. */
 export const VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS = 50_000;
 
+/** Per-level Vector LOD diagnostic stats. */
 export interface VectorStrokeLodLevelStats {
+  /** Zero-based LOD level index. */
   index: number;
+
+  /** Simplification tolerance for this level. */
   tolerance: number;
+
+  /** Number of stroke segments rendered from this level. */
   renderedSegments: number;
 }
 
+/** Runtime Vector LOD diagnostic stats for the current view. */
 export interface VectorStrokeLodStats {
+  /** Total rendered stroke segments across active LOD levels. */
   renderedSegments: number;
+
+  /** Number of visible runtime tiles. */
   visibleTileCount: number;
+
+  /** Segment budget assigned to each visible tile. */
   targetSegmentsPerTile: number;
+
+  /** Baseline LOD level selected for the current zoom. */
   baselineLevelIndex: number;
+
+  /** Simplification tolerance of the baseline level. */
   baselineTolerance: number;
+
+  /** LOD levels that contributed visible segments this frame. */
   activeLevels: VectorStrokeLodLevelStats[];
+
+  /** Largest source segment count in any visible baseline tile. */
   maxBaselineTileSegments: number;
+
+  /** Largest selected segment count in any visible baseline tile. */
   maxBaselineTileSelectedSegments: number;
+
+  /** LOD level selected for the largest baseline tile. */
   maxBaselineTileSelectedLevelIndex: number;
+
+  /** Tolerance selected for the largest baseline tile. */
   maxBaselineTileSelectedTolerance: number;
+
+  /** Largest selected segment count in any visible tile. */
   maxSelectedTileSegments: number;
+
+  /** LOD level selected for the largest visible tile. */
   maxSelectedTileLevelIndex: number;
+
+  /** Tolerance selected for the largest visible tile. */
   maxSelectedTileTolerance: number;
+
+  /** Runtime tile grid column count. */
   tileGridColumns: number;
+
+  /** Runtime tile grid row count. */
   tileGridRows: number;
+
+  /** Total built LOD level count, including exact geometry. */
   totalLevels: number;
 }
 
+/** Aggregate timing for Vector LOD prebuild work. */
 export interface VectorStrokeLodBuildTiming {
+  /** Total build time in milliseconds. */
   elapsedMs: number;
+
+  /** Number of Vector LOD builds included in this timing snapshot. */
   buildCount: number;
+
+  /** Source stroke segment count used for the build. */
   sourceSegmentCount: number;
+
+  /** Built LOD level count. */
   levelCount: number;
 }
 
+/** Progress event emitted while Vector LOD levels are built. */
 export interface VectorStrokeLodBuildProgress {
+  /** Normalized build progress in the range 0..1. */
   value: number;
+
+  /** Human-readable build status message. */
   message: string;
 }
 
+/** Async Vector LOD prebuild controls. */
 export interface VectorStrokeLodAsyncBuildOptions {
+  /** Yield to the browser after this many milliseconds of build work. */
   yieldIntervalMs?: number;
+
+  /** Receives Vector LOD build progress events. */
   onProgress?: (progress: VectorStrokeLodBuildProgress) => void;
+
+  /** Return true to cancel an in-progress async build. */
   shouldCancel?: () => boolean;
 }
 
