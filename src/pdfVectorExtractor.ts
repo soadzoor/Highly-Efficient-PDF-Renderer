@@ -23,6 +23,7 @@ type RgbColor = [number, number, number];
 
 interface GraphicsState {
   matrix: Mat2D;
+  clipBounds: Bounds | null;
   lineWidth: number;
   lineCap: number;
   strokeR: number;
@@ -120,6 +121,10 @@ class Float4Builder {
     return this.length >> 2;
   }
 
+  truncateQuads(quadCount: number): void {
+    this.length = Math.max(0, Math.min(this.length, Math.trunc(quadCount) * 4));
+  }
+
   push(a: number, b: number, c: number, d: number): void {
     this.ensureCapacity(4);
     const offset = this.length;
@@ -174,6 +179,9 @@ const COVER_HALF_WIDTH_EPSILON = 1e-4;
 const TEXT_CUBIC_TO_QUAD_ERROR = 0.015;
 const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 12;
 const TEXT_BOUNDS_EPSILON = 1e-4;
+const BACKGROUND_FILL_COLOR_EPSILON = 1e-3;
+const BACKGROUND_FILL_MIN_AREA_RATIO = 0.2;
+const BACKGROUND_FILL_MIN_DIMENSION_RATIO = 0.65;
 const FONT_MATRIX_FALLBACK = 0.001;
 const TEXT_MIN_ALPHA = 1e-3;
 const FILL_MIN_ALPHA = 1e-3;
@@ -513,7 +521,9 @@ async function extractSinglePageVectors(
 
   const stateStack: GraphicsState[] = [];
   const formStateStack: GraphicsState[] = [];
-  let currentState: GraphicsState = createDefaultState(pageMatrix);
+  let currentState: GraphicsState = createDefaultState(pageMatrix, pageBounds);
+  let pendingClipPathBounds: Bounds | null = null;
+  let pendingClipOperator = false;
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
@@ -529,6 +539,8 @@ async function extractSinglePageVectors(
       if (restored) {
         currentState = restored;
       }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -546,6 +558,8 @@ async function extractSinglePageVectors(
       if (transform) {
         currentState.matrix = multiplyMatrices(currentState.matrix, transform);
       }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -554,6 +568,8 @@ async function extractSinglePageVectors(
       if (restored) {
         currentState = restored;
       }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -623,19 +639,56 @@ async function extractSinglePageVectors(
       continue;
     }
 
+    if (fn === OPS.clip || fn === OPS.eoClip) {
+      if (pendingClipPathBounds) {
+        currentState.clipBounds = intersectBounds(currentState.clipBounds, pendingClipPathBounds);
+        pendingClipPathBounds = null;
+      } else {
+        pendingClipOperator = true;
+      }
+      continue;
+    }
+
+    if (fn === OPS.endPath) {
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
     if (fn !== OPS.constructPath) {
+      pendingClipPathBounds = null;
       continue;
     }
 
     const paintOp = readNumber(args, 0, -1);
+    const pathData = readPathData(args);
+    if (!pathData) {
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+    const transformedPathBounds =
+      pendingClipOperator || paintOp === OPS.endPath || currentState.clipBounds
+        ? computeTransformedPathBounds(pathData, currentState.matrix)
+        : null;
+
+    if (pendingClipOperator) {
+      currentState.clipBounds = intersectBounds(currentState.clipBounds, transformedPathBounds);
+      pendingClipOperator = false;
+      pendingClipPathBounds = null;
+    } else if (paintOp === OPS.endPath) {
+      pendingClipPathBounds = transformedPathBounds;
+    } else {
+      pendingClipPathBounds = null;
+    }
+
     const strokePaint = isStrokePaintOp(paintOp);
     const fillPaint = isFillPaintOp(paintOp);
     if (!strokePaint && !fillPaint) {
       continue;
     }
 
-    const pathData = readPathData(args);
-    if (!pathData) {
+    if (currentState.clipBounds && !isNonEmptyBounds(intersectBounds(currentState.clipBounds, transformedPathBounds))) {
       continue;
     }
 
@@ -696,7 +749,9 @@ async function extractSinglePageVectors(
           fillPathMetaCBuilder,
           fillSegmentBuilderA,
           fillSegmentBuilderB,
-          fillBounds
+          fillBounds,
+          currentState.clipBounds,
+          pageBounds
         );
         if (emitted) {
           fillPathCount += 1;
@@ -1626,9 +1681,10 @@ function normalizePositiveInt(value: unknown, fallback: number, min: number, max
   return valid;
 }
 
-function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsState {
+function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX, initialClipBounds: Bounds | null = null): GraphicsState {
   return {
     matrix: [...initialMatrix],
+    clipBounds: cloneBoundsOrNull(initialClipBounds),
     lineWidth: 1,
     lineCap: 0,
     strokeR: 0,
@@ -1749,6 +1805,7 @@ function chooseRasterExtractionScale(baseWidth: number, baseHeight: number, nati
 function cloneState(state: GraphicsState): GraphicsState {
   return {
     matrix: [...state.matrix],
+    clipBounds: cloneBoundsOrNull(state.clipBounds),
     lineWidth: state.lineWidth,
     lineCap: state.lineCap,
     strokeR: state.strokeR,
@@ -2357,7 +2414,9 @@ function emitFilledPathFromPath(
   metaC: Float4Builder,
   segmentsA: Float4Builder,
   segmentsB: Float4Builder,
-  bounds: Bounds
+  bounds: Bounds,
+  clipBounds: Bounds | null,
+  pageBounds: Bounds
 ): boolean {
   let cursorX = 0;
   let cursorY = 0;
@@ -2509,17 +2568,32 @@ function emitFilledPathFromPath(
   closeSubpath();
 
   if (primitiveCount === 0) {
+    segmentsA.truncateQuads(segmentStart);
+    segmentsB.truncateQuads(segmentStart);
     return false;
   }
 
-  metaA.push(segmentStart, primitiveCount, localBounds.minX, localBounds.minY);
-  metaB.push(localBounds.maxX, localBounds.maxY, colorR, colorG);
+  const visibleBounds = clipBounds ? intersectBounds(clipBounds, localBounds) : { ...localBounds };
+  if (!isNonEmptyBounds(visibleBounds)) {
+    segmentsA.truncateQuads(segmentStart);
+    segmentsB.truncateQuads(segmentStart);
+    return false;
+  }
+
+  if (isOpaqueWhiteBackgroundFill(visibleBounds, pageBounds, colorR, colorG, colorB, alpha)) {
+    segmentsA.truncateQuads(segmentStart);
+    segmentsB.truncateQuads(segmentStart);
+    return false;
+  }
+
+  metaA.push(segmentStart, primitiveCount, visibleBounds.minX, visibleBounds.minY);
+  metaB.push(visibleBounds.maxX, visibleBounds.maxY, colorR, colorG);
   metaC.push(fillRule, hasCompanionStroke ? 1 : 0, colorB, alpha);
 
-  bounds.minX = Math.min(bounds.minX, localBounds.minX);
-  bounds.minY = Math.min(bounds.minY, localBounds.minY);
-  bounds.maxX = Math.max(bounds.maxX, localBounds.maxX);
-  bounds.maxY = Math.max(bounds.maxY, localBounds.maxY);
+  bounds.minX = Math.min(bounds.minX, visibleBounds.minX);
+  bounds.minY = Math.min(bounds.minY, visibleBounds.minY);
+  bounds.maxX = Math.max(bounds.maxX, visibleBounds.maxX);
+  bounds.maxY = Math.max(bounds.maxY, visibleBounds.maxY);
 
   return true;
 }
@@ -2930,6 +3004,7 @@ async function extractTextVectorData(
   let state = createDefaultTextState(pageMatrix);
   let clipBounds: Bounds | null = null;
   let pendingClipPathBounds: Bounds | null = null;
+  let pendingClipOperator = false;
 
   const getOrCreateGlyph = (font: FontLike | null, fontRef: string, fontChar: string): { index: number; bounds: Bounds } | null => {
     if (!fontChar) {
@@ -3063,6 +3138,7 @@ async function extractTextVectorData(
       }
       clipBounds = clipBoundsStack.pop() ?? null;
       pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -3082,6 +3158,7 @@ async function extractTextVectorData(
         state.matrix = multiplyMatrices(state.matrix, transform);
       }
       pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -3092,14 +3169,20 @@ async function extractTextVectorData(
       }
       clipBounds = formClipBoundsStack.pop() ?? clipBounds;
       pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
     if (fn === OPS.constructPath) {
       const paintOp = readNumber(args, 0, -1);
-      if (paintOp === OPS.endPath) {
-        const pathData = readPathData(args);
-        pendingClipPathBounds = pathData ? computeTransformedPathBounds(pathData, state.matrix) : null;
+      const pathData = readPathData(args);
+      const pathBounds = pathData ? computeTransformedPathBounds(pathData, state.matrix) : null;
+      if (pendingClipOperator) {
+        clipBounds = intersectBounds(clipBounds, pathBounds);
+        pendingClipPathBounds = null;
+        pendingClipOperator = false;
+      } else if (paintOp === OPS.endPath) {
+        pendingClipPathBounds = pathBounds;
       } else {
         pendingClipPathBounds = null;
       }
@@ -3109,12 +3192,16 @@ async function extractTextVectorData(
     if (fn === OPS.clip || fn === OPS.eoClip) {
       if (pendingClipPathBounds) {
         clipBounds = intersectBounds(clipBounds, pendingClipPathBounds);
+        pendingClipPathBounds = null;
+      } else {
+        pendingClipOperator = true;
       }
       continue;
     }
 
     if (fn === OPS.endPath) {
       pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -3291,9 +3378,44 @@ function intersectBounds(a: Bounds | null, b: Bounds | null): Bounds | null {
   const maxY = Math.min((a as Bounds).maxY, (b as Bounds).maxY);
 
   if (!(minX <= maxX && minY <= maxY)) {
-    return null;
+    return { minX: 1, minY: 1, maxX: 0, maxY: 0 };
   }
   return { minX, minY, maxX, maxY };
+}
+
+function isNonEmptyBounds(bounds: Bounds | null): bounds is Bounds {
+  return Boolean(bounds && bounds.minX <= bounds.maxX && bounds.minY <= bounds.maxY);
+}
+
+function isOpaqueWhiteBackgroundFill(
+  bounds: Bounds,
+  pageBounds: Bounds,
+  colorR: number,
+  colorG: number,
+  colorB: number,
+  alpha: number
+): boolean {
+  if (
+    alpha < OPAQUE_ALPHA_EPSILON ||
+    colorR < 1 - BACKGROUND_FILL_COLOR_EPSILON ||
+    colorG < 1 - BACKGROUND_FILL_COLOR_EPSILON ||
+    colorB < 1 - BACKGROUND_FILL_COLOR_EPSILON
+  ) {
+    return false;
+  }
+
+  const pageWidth = Math.max(1e-6, pageBounds.maxX - pageBounds.minX);
+  const pageHeight = Math.max(1e-6, pageBounds.maxY - pageBounds.minY);
+  const width = Math.max(0, bounds.maxX - bounds.minX);
+  const height = Math.max(0, bounds.maxY - bounds.minY);
+  const areaRatio = (width * height) / Math.max(1e-6, pageWidth * pageHeight);
+  const widthRatio = width / pageWidth;
+  const heightRatio = height / pageHeight;
+
+  return (
+    areaRatio >= BACKGROUND_FILL_MIN_AREA_RATIO &&
+    Math.max(widthRatio, heightRatio) >= BACKGROUND_FILL_MIN_DIMENSION_RATIO
+  );
 }
 
 function computeTransformedPathBounds(pathData: Float32Array, matrix: Mat2D): Bounds | null {
@@ -4494,6 +4616,9 @@ function combineBounds(primary: Bounds | null, secondary: Bounds | null): Bounds
 }
 
 function boundsIntersect(a: Bounds, b: Bounds): boolean {
+  if (!isNonEmptyBounds(a) || !isNonEmptyBounds(b)) {
+    return false;
+  }
   return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY);
 }
 
