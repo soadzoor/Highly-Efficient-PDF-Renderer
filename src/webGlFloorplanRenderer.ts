@@ -58,6 +58,8 @@ flat out float vHalfWidth;
 flat out float vAAWorld;
 flat out vec3 vColor;
 flat out float vAlpha;
+flat out vec4 vClipBounds;
+flat out float vHasClipBounds;
 
 ivec2 segmentCoord(int index) {
   int x = index % uSegmentTexSize.x;
@@ -84,6 +86,7 @@ void main() {
   float alpha = packedStyle - styleFlags * 2.0;
   bool isHairline = mod(styleFlags, 2.0) >= 0.5;
   bool isRoundCap = mod(floor(styleFlags * 0.5), 2.0) >= 0.5;
+  bool hasClipBounds = mod(floor(styleFlags * 0.25), 2.0) >= 0.5;
 
   float geometryLength = isQuadratic
     ? length(p1 - p0) + length(p2 - p1)
@@ -101,6 +104,8 @@ void main() {
     vAAWorld = 1.0;
     vColor = color;
     vAlpha = 0.0;
+    vClipBounds = vec4(0.0);
+    vHasClipBounds = 0.0;
     return;
   }
 
@@ -140,6 +145,8 @@ void main() {
   vAAWorld = aaWorld;
   vColor = color;
   vAlpha = alpha;
+  vClipBounds = primitiveBounds;
+  vHasClipBounds = hasClipBounds ? 1.0 : 0.0;
 }
 `;
 
@@ -157,6 +164,8 @@ flat in float vIsHairline;
 flat in float vHalfWidth;
 flat in vec3 vColor;
 flat in float vAlpha;
+flat in vec4 vClipBounds;
+flat in float vHasClipBounds;
 
 out vec4 outColor;
 
@@ -223,6 +232,13 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
 
 void main() {
   if (vAlpha <= 0.001) {
+    discard;
+  }
+
+  if (
+    vHasClipBounds >= 0.5 &&
+    (vLocal.x < vClipBounds.x || vLocal.y < vClipBounds.y || vLocal.x > vClipBounds.z || vLocal.y > vClipBounds.w)
+  ) {
     discard;
   }
 

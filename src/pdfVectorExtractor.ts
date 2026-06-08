@@ -24,6 +24,12 @@ type RgbColor = [number, number, number];
 interface GraphicsState {
   matrix: Mat2D;
   clipBounds: Bounds | null;
+  groupFillAlpha: number;
+  groupStrokeAlpha: number;
+  groupFillAlphaVersion: number;
+  groupStrokeAlphaVersion: number;
+  fillAlphaVersion: number;
+  strokeAlphaVersion: number;
   lineWidth: number;
   lineCap: number;
   strokeR: number;
@@ -182,6 +188,9 @@ const TEXT_BOUNDS_EPSILON = 1e-4;
 const BACKGROUND_FILL_COLOR_EPSILON = 1e-3;
 const BACKGROUND_FILL_MIN_AREA_RATIO = 0.2;
 const BACKGROUND_FILL_MIN_DIMENSION_RATIO = 0.65;
+const FILL_SUBPATH_SPLIT_MIN_SUBPATHS = 100;
+const FILL_SUBPATH_TILE_TARGET_CHILDREN = 48;
+const FILL_SUBPATH_TILE_MAX_COUNT = 32;
 const FONT_MATRIX_FALLBACK = 0.001;
 const TEXT_MIN_ALPHA = 1e-3;
 const FILL_MIN_ALPHA = 1e-3;
@@ -208,6 +217,7 @@ const FILL_CUBIC_TO_QUAD_ERROR = 0.08;
 const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
 const STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
 const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
+const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
 const STROKE_STYLE_FLAG_OFFSET = 2;
 const PAGE_GRID_GAP_FACTOR = 0.08;
 const PAGE_GRID_MIN_GAP = 24;
@@ -521,6 +531,10 @@ async function extractSinglePageVectors(
 
   const stateStack: GraphicsState[] = [];
   const formStateStack: GraphicsState[] = [];
+  const groupAlphaStack: Array<Pick<
+    GraphicsState,
+    "groupFillAlpha" | "groupStrokeAlpha" | "groupFillAlphaVersion" | "groupStrokeAlphaVersion"
+  >> = [];
   let currentState: GraphicsState = createDefaultState(pageMatrix, pageBounds);
   let pendingClipPathBounds: Bounds | null = null;
   let pendingClipOperator = false;
@@ -639,6 +653,35 @@ async function extractSinglePageVectors(
       continue;
     }
 
+    if (fn === OPS.beginGroup) {
+      groupAlphaStack.push({
+        groupFillAlpha: currentState.groupFillAlpha,
+        groupStrokeAlpha: currentState.groupStrokeAlpha,
+        groupFillAlphaVersion: currentState.groupFillAlphaVersion,
+        groupStrokeAlphaVersion: currentState.groupStrokeAlphaVersion
+      });
+      currentState.groupFillAlpha = clamp01(currentState.groupFillAlpha * currentState.fillAlpha);
+      currentState.groupStrokeAlpha = clamp01(currentState.groupStrokeAlpha * currentState.strokeAlpha);
+      currentState.groupFillAlphaVersion = currentState.fillAlphaVersion;
+      currentState.groupStrokeAlphaVersion = currentState.strokeAlphaVersion;
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
+    if (fn === OPS.endGroup) {
+      const restoredGroupAlpha = groupAlphaStack.pop();
+      if (restoredGroupAlpha) {
+        currentState.groupFillAlpha = restoredGroupAlpha.groupFillAlpha;
+        currentState.groupStrokeAlpha = restoredGroupAlpha.groupStrokeAlpha;
+        currentState.groupFillAlphaVersion = restoredGroupAlpha.groupFillAlphaVersion;
+        currentState.groupStrokeAlphaVersion = restoredGroupAlpha.groupStrokeAlphaVersion;
+      }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
     if (fn === OPS.clip || fn === OPS.eoClip) {
       if (pendingClipPathBounds) {
         currentState.clipBounds = intersectBounds(currentState.clipBounds, pendingClipPathBounds);
@@ -711,7 +754,7 @@ async function extractSinglePageVectors(
       const styleR = clamp01(currentState.strokeR);
       const styleG = clamp01(currentState.strokeG);
       const styleB = clamp01(currentState.strokeB);
-      const styleAlpha = clamp01(currentState.strokeAlpha);
+      const styleAlpha = effectiveStrokeAlpha(currentState);
       sourceSegmentCount += emitSegmentsFromPath(
         pathData,
         currentState.matrix,
@@ -726,16 +769,17 @@ async function extractSinglePageVectors(
         primitiveMetaBuilder,
         styleBuilder,
         primitiveBoundsBuilder,
-        bounds
+        bounds,
+        currentState.clipBounds
       );
     }
 
     if (fillPaint) {
       const fillRule = isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
-      const fillAlpha = clamp01(currentState.fillAlpha);
-      const hasCompanionStroke = strokePaint && clamp01(currentState.strokeAlpha) > ALPHA_INVISIBLE_EPSILON;
+      const fillAlpha = effectiveFillAlpha(currentState);
+      const hasCompanionStroke = strokePaint && effectiveStrokeAlpha(currentState) > ALPHA_INVISIBLE_EPSILON;
       if (fillAlpha > FILL_MIN_ALPHA) {
-        const emitted = emitFilledPathFromPath(
+        const emittedFillPathCount = emitFilledPathFromPath(
           pathData,
           currentState.matrix,
           fillRule,
@@ -753,9 +797,7 @@ async function extractSinglePageVectors(
           currentState.clipBounds,
           pageBounds
         );
-        if (emitted) {
-          fillPathCount += 1;
-        }
+        fillPathCount += emittedFillPathCount;
       }
     }
   }
@@ -1685,6 +1727,12 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX, initialClipB
   return {
     matrix: [...initialMatrix],
     clipBounds: cloneBoundsOrNull(initialClipBounds),
+    groupFillAlpha: 1,
+    groupStrokeAlpha: 1,
+    groupFillAlphaVersion: -1,
+    groupStrokeAlphaVersion: -1,
+    fillAlphaVersion: 0,
+    strokeAlphaVersion: 0,
     lineWidth: 1,
     lineCap: 0,
     strokeR: 0,
@@ -1806,6 +1854,12 @@ function cloneState(state: GraphicsState): GraphicsState {
   return {
     matrix: [...state.matrix],
     clipBounds: cloneBoundsOrNull(state.clipBounds),
+    groupFillAlpha: state.groupFillAlpha,
+    groupStrokeAlpha: state.groupStrokeAlpha,
+    groupFillAlphaVersion: state.groupFillAlphaVersion,
+    groupStrokeAlphaVersion: state.groupStrokeAlphaVersion,
+    fillAlphaVersion: state.fillAlphaVersion,
+    strokeAlphaVersion: state.strokeAlphaVersion,
     lineWidth: state.lineWidth,
     lineCap: state.lineCap,
     strokeR: state.strokeR,
@@ -1893,6 +1947,9 @@ interface CommonObjsLike {
 
 interface TextState {
   matrix: Mat2D;
+  groupFillAlpha: number;
+  groupFillAlphaVersion: number;
+  fillAlphaVersion: number;
   fillR: number;
   fillG: number;
   fillB: number;
@@ -2118,6 +2175,7 @@ function applyGraphicsStateEntries(rawEntries: unknown, state: GraphicsState): v
       const alpha = Number(value);
       if (Number.isFinite(alpha)) {
         state.strokeAlpha = clamp01(alpha);
+        state.strokeAlphaVersion += 1;
       }
       continue;
     }
@@ -2126,6 +2184,7 @@ function applyGraphicsStateEntries(rawEntries: unknown, state: GraphicsState): v
       const alpha = Number(value);
       if (Number.isFinite(alpha)) {
         state.fillAlpha = clamp01(alpha);
+        state.fillAlphaVersion += 1;
       }
       continue;
     }
@@ -2147,6 +2206,20 @@ function applyGraphicsStateEntries(rawEntries: unknown, state: GraphicsState): v
   }
 }
 
+function effectiveFillAlpha(state: GraphicsState): number {
+  if (state.fillAlphaVersion === state.groupFillAlphaVersion) {
+    return clamp01(state.groupFillAlpha);
+  }
+  return clamp01(state.groupFillAlpha * state.fillAlpha);
+}
+
+function effectiveStrokeAlpha(state: GraphicsState): number {
+  if (state.strokeAlphaVersion === state.groupStrokeAlphaVersion) {
+    return clamp01(state.groupStrokeAlpha);
+  }
+  return clamp01(state.groupStrokeAlpha * state.strokeAlpha);
+}
+
 function emitSegmentsFromPath(
   pathData: Float32Array,
   matrix: Mat2D,
@@ -2161,7 +2234,8 @@ function emitSegmentsFromPath(
   primitiveMeta: Float4Builder,
   styles: Float4Builder,
   primitiveBounds: Float4Builder,
-  bounds: Bounds
+  bounds: Bounds,
+  clipBounds: Bounds | null
 ): number {
   let sourceSegmentCount = 0;
   let cursorX = 0;
@@ -2185,20 +2259,31 @@ function emitSegmentsFromPath(
     p2y: number,
     primitiveType: number
   ): void => {
-    endpoints.push(p0x, p0y, p1x, p1y);
-    primitiveMeta.push(p2x, p2y, primitiveType, encodeStrokeStyleMeta(alpha, styleFlags));
-    styles.push(halfWidth, colorR, colorG, colorB);
-
     const minX = Math.min(p0x, p1x, p2x);
     const minY = Math.min(p0y, p1y, p2y);
     const maxX = Math.max(p0x, p1x, p2x);
     const maxY = Math.max(p0y, p1y, p2y);
-    primitiveBounds.push(minX, minY, maxX, maxY);
+    const visibleBounds = clipBounds ? intersectBounds(clipBounds, { minX, minY, maxX, maxY }) : { minX, minY, maxX, maxY };
+    if (!isNonEmptyBounds(visibleBounds)) {
+      return;
+    }
+    const wasClipped =
+      Boolean(clipBounds) &&
+      (visibleBounds.minX > minX + 1e-6 ||
+        visibleBounds.minY > minY + 1e-6 ||
+        visibleBounds.maxX < maxX - 1e-6 ||
+        visibleBounds.maxY < maxY - 1e-6);
 
-    bounds.minX = Math.min(bounds.minX, minX);
-    bounds.minY = Math.min(bounds.minY, minY);
-    bounds.maxX = Math.max(bounds.maxX, maxX);
-    bounds.maxY = Math.max(bounds.maxY, maxY);
+    endpoints.push(p0x, p0y, p1x, p1y);
+    const visibleStyleFlags = wasClipped ? styleFlags | STROKE_STYLE_FLAG_CLIPPED : styleFlags;
+    primitiveMeta.push(p2x, p2y, primitiveType, encodeStrokeStyleMeta(alpha, visibleStyleFlags));
+    styles.push(halfWidth, colorR, colorG, colorB);
+    primitiveBounds.push(visibleBounds.minX, visibleBounds.minY, visibleBounds.maxX, visibleBounds.maxY);
+
+    bounds.minX = Math.min(bounds.minX, visibleBounds.minX);
+    bounds.minY = Math.min(bounds.minY, visibleBounds.minY);
+    bounds.maxX = Math.max(bounds.maxX, visibleBounds.maxX);
+    bounds.maxY = Math.max(bounds.maxY, visibleBounds.maxY);
   };
 
   const flushPending = (): void => {
@@ -2416,8 +2501,39 @@ function emitFilledPathFromPath(
   segmentsB: Float4Builder,
   bounds: Bounds,
   clipBounds: Bounds | null,
-  pageBounds: Bounds
-): boolean {
+  pageBounds: Bounds,
+  allowSubpathSplit = true
+): number {
+  if (allowSubpathSplit && fillRule === FILL_RULE_NONZERO && countPathMoveOps(pathData) >= FILL_SUBPATH_SPLIT_MIN_SUBPATHS) {
+    const splitPaths = splitPathIntoDrawableSubpaths(pathData, matrix, clipBounds);
+    if (splitPaths.length > 1) {
+      let emittedCount = 0;
+      for (const splitPath of splitPaths) {
+        const splitClipBounds = splitPath.clipBounds ? intersectBounds(clipBounds, splitPath.clipBounds) : clipBounds;
+        emittedCount += emitFilledPathFromPath(
+          splitPath.data,
+          matrix,
+          fillRule,
+          hasCompanionStroke,
+          colorR,
+          colorG,
+          colorB,
+          alpha,
+          metaA,
+          metaB,
+          metaC,
+          segmentsA,
+          segmentsB,
+          bounds,
+          splitClipBounds,
+          pageBounds,
+          false
+        );
+      }
+      return emittedCount;
+    }
+  }
+
   let cursorX = 0;
   let cursorY = 0;
   let startX = 0;
@@ -2570,20 +2686,20 @@ function emitFilledPathFromPath(
   if (primitiveCount === 0) {
     segmentsA.truncateQuads(segmentStart);
     segmentsB.truncateQuads(segmentStart);
-    return false;
+    return 0;
   }
 
   const visibleBounds = clipBounds ? intersectBounds(clipBounds, localBounds) : { ...localBounds };
   if (!isNonEmptyBounds(visibleBounds)) {
     segmentsA.truncateQuads(segmentStart);
     segmentsB.truncateQuads(segmentStart);
-    return false;
+    return 0;
   }
 
   if (isOpaqueWhiteBackgroundFill(visibleBounds, pageBounds, colorR, colorG, colorB, alpha)) {
     segmentsA.truncateQuads(segmentStart);
     segmentsB.truncateQuads(segmentStart);
-    return false;
+    return 0;
   }
 
   metaA.push(segmentStart, primitiveCount, visibleBounds.minX, visibleBounds.minY);
@@ -2595,7 +2711,267 @@ function emitFilledPathFromPath(
   bounds.maxX = Math.max(bounds.maxX, visibleBounds.maxX);
   bounds.maxY = Math.max(bounds.maxY, visibleBounds.maxY);
 
-  return true;
+  return 1;
+}
+
+function countPathMoveOps(pathData: Float32Array): number {
+  let moveCount = 0;
+  for (let i = 0; i < pathData.length; ) {
+    const op = pathData[i++];
+    if (op === DRAW_MOVE_TO) {
+      moveCount += 1;
+      i += 2;
+      continue;
+    }
+    if (op === DRAW_LINE_TO) {
+      i += 2;
+      continue;
+    }
+    if (op === DRAW_CURVE_TO) {
+      i += 6;
+      continue;
+    }
+    if (op === DRAW_QUAD_TO) {
+      i += 4;
+      continue;
+    }
+    if (op === DRAW_CLOSE) {
+      continue;
+    }
+    break;
+  }
+  return moveCount;
+}
+
+interface FillSubpath {
+  data: Float32Array;
+  bounds: Bounds | null;
+  parent: number;
+  children: number[];
+}
+
+interface FillPathSplit {
+  data: Float32Array;
+  clipBounds: Bounds | null;
+}
+
+function splitPathIntoDrawableSubpaths(pathData: Float32Array, matrix: Mat2D, clipBounds: Bounds | null): FillPathSplit[] {
+  const subpaths = collectFillSubpaths(pathData, matrix);
+  if (subpaths.length <= 1) {
+    return subpaths.map((subpath) => ({ data: subpath.data, clipBounds: null }));
+  }
+
+  for (let i = 0; i < subpaths.length; i += 1) {
+    const inner = subpaths[i];
+    if (!isNonEmptyBounds(inner.bounds)) {
+      continue;
+    }
+
+    let parentIndex = -1;
+    let parentArea = Number.POSITIVE_INFINITY;
+    for (let j = 0; j < subpaths.length; j += 1) {
+      if (i === j) {
+        continue;
+      }
+
+      const outer = subpaths[j];
+      if (!isNonEmptyBounds(outer.bounds) || !boundsContainBounds(outer.bounds, inner.bounds)) {
+        continue;
+      }
+
+      const outerArea = boundsArea(outer.bounds);
+      const innerArea = boundsArea(inner.bounds);
+      if (outerArea <= innerArea + 1e-6 || outerArea >= parentArea) {
+        continue;
+      }
+
+      parentIndex = j;
+      parentArea = outerArea;
+    }
+
+    inner.parent = parentIndex;
+  }
+
+  for (let i = 0; i < subpaths.length; i += 1) {
+    const parent = subpaths[i].parent;
+    if (parent >= 0) {
+      subpaths[parent].children.push(i);
+    }
+  }
+
+  const rootIndices: number[] = [];
+  for (let i = 0; i < subpaths.length; i += 1) {
+    if (subpaths[i].parent >= 0) {
+      continue;
+    }
+    rootIndices.push(i);
+  }
+
+  if (rootIndices.length === 1) {
+    const tiled = splitSingleRootFillSubpathGroup(subpaths, rootIndices[0], clipBounds);
+    if (tiled.length > 1) {
+      return tiled;
+    }
+  }
+
+  const out: FillPathSplit[] = [];
+  for (const rootIndex of rootIndices) {
+    out.push({
+      data: concatenateFillSubpathGroup(subpaths, rootIndex),
+      clipBounds: null
+    });
+  }
+  return out;
+}
+
+function collectFillSubpaths(pathData: Float32Array, matrix: Mat2D): FillSubpath[] {
+  const subpaths: FillSubpath[] = [];
+  let subpathStart = -1;
+
+  const pushSubpath = (endOffset: number): void => {
+    if (subpathStart < 0 || endOffset <= subpathStart) {
+      return;
+    }
+    const data = pathData.slice(subpathStart, endOffset);
+    subpaths.push({
+      data,
+      bounds: computeTransformedPathBounds(data, matrix),
+      parent: -1,
+      children: []
+    });
+  };
+
+  for (let i = 0; i < pathData.length; ) {
+    const opOffset = i;
+    const op = pathData[i++];
+
+    if (op === DRAW_MOVE_TO) {
+      pushSubpath(opOffset);
+      subpathStart = opOffset;
+      i += 2;
+      continue;
+    }
+    if (op === DRAW_LINE_TO) {
+      i += 2;
+      continue;
+    }
+    if (op === DRAW_CURVE_TO) {
+      i += 6;
+      continue;
+    }
+    if (op === DRAW_QUAD_TO) {
+      i += 4;
+      continue;
+    }
+    if (op === DRAW_CLOSE) {
+      continue;
+    }
+    break;
+  }
+
+  pushSubpath(pathData.length);
+  return subpaths;
+}
+
+function concatenateFillSubpathGroup(subpaths: FillSubpath[], rootIndex: number): Float32Array {
+  const indices: number[] = [];
+  const collect = (index: number): void => {
+    indices.push(index);
+    for (const childIndex of subpaths[index].children) {
+      collect(childIndex);
+    }
+  };
+  collect(rootIndex);
+  indices.sort((a, b) => a - b);
+  return concatenateFillSubpathIndices(subpaths, indices);
+}
+
+function concatenateFillSubpathIndices(subpaths: FillSubpath[], indices: number[]): Float32Array {
+  let totalLength = 0;
+  for (const index of indices) {
+    totalLength += subpaths[index].data.length;
+  }
+
+  const out = new Float32Array(totalLength);
+  let offset = 0;
+  for (const index of indices) {
+    out.set(subpaths[index].data, offset);
+    offset += subpaths[index].data.length;
+  }
+
+  return out;
+}
+
+function splitSingleRootFillSubpathGroup(subpaths: FillSubpath[], rootIndex: number, clipBounds: Bounds | null): FillPathSplit[] {
+  const root = subpaths[rootIndex];
+  if (!isNonEmptyBounds(root.bounds) || root.children.length < FILL_SUBPATH_TILE_TARGET_CHILDREN) {
+    return [];
+  }
+
+  const visibleBounds = clipBounds ? intersectBounds(clipBounds, root.bounds) : { ...root.bounds };
+  if (!isNonEmptyBounds(visibleBounds)) {
+    return [];
+  }
+
+  const tileCount = Math.min(
+    FILL_SUBPATH_TILE_MAX_COUNT,
+    Math.max(2, Math.ceil(root.children.length / FILL_SUBPATH_TILE_TARGET_CHILDREN))
+  );
+  const width = Math.max(0, visibleBounds.maxX - visibleBounds.minX);
+  const height = Math.max(0, visibleBounds.maxY - visibleBounds.minY);
+  const columns = width >= height ? tileCount : 1;
+  const rows = width >= height ? 1 : tileCount;
+  const splits: FillPathSplit[] = [];
+
+  for (let row = 0; row < rows; row += 1) {
+    const tileMinY = visibleBounds.minY + (height * row) / rows;
+    const tileMaxY = row + 1 === rows ? visibleBounds.maxY : visibleBounds.minY + (height * (row + 1)) / rows;
+    for (let column = 0; column < columns; column += 1) {
+      const tileMinX = visibleBounds.minX + (width * column) / columns;
+      const tileMaxX = column + 1 === columns ? visibleBounds.maxX : visibleBounds.minX + (width * (column + 1)) / columns;
+      const tileBounds = { minX: tileMinX, minY: tileMinY, maxX: tileMaxX, maxY: tileMaxY };
+      const indices = new Set<number>([rootIndex]);
+
+      for (const childIndex of root.children) {
+        const child = subpaths[childIndex];
+        if (isNonEmptyBounds(child.bounds) && boundsIntersect(child.bounds, tileBounds)) {
+          collectFillSubpathTreeIndices(subpaths, childIndex, indices);
+        }
+      }
+
+      const sortedIndices = [...indices].sort((a, b) => a - b);
+      splits.push({
+        data: concatenateFillSubpathIndices(subpaths, sortedIndices),
+        clipBounds: tileBounds
+      });
+    }
+  }
+
+  return splits;
+}
+
+function collectFillSubpathTreeIndices(subpaths: FillSubpath[], index: number, out: Set<number>): void {
+  if (out.has(index)) {
+    return;
+  }
+  out.add(index);
+  for (const childIndex of subpaths[index].children) {
+    collectFillSubpathTreeIndices(subpaths, childIndex, out);
+  }
+}
+
+function boundsContainBounds(outer: Bounds, inner: Bounds): boolean {
+  const epsilon = 1e-3;
+  return (
+    inner.minX >= outer.minX - epsilon &&
+    inner.minY >= outer.minY - epsilon &&
+    inner.maxX <= outer.maxX + epsilon &&
+    inner.maxY <= outer.maxY + epsilon
+  );
+}
+
+function boundsArea(bounds: Bounds): number {
+  return Math.max(0, bounds.maxX - bounds.minX) * Math.max(0, bounds.maxY - bounds.minY);
 }
 
 interface CoverageCandidate {
@@ -3001,6 +3377,7 @@ async function extractTextVectorData(
   const formStateStack: TextState[] = [];
   const clipBoundsStack: Array<Bounds | null> = [];
   const formClipBoundsStack: Array<Bounds | null> = [];
+  const groupAlphaStack: Array<Pick<TextState, "groupFillAlpha" | "groupFillAlphaVersion">> = [];
   let state = createDefaultTextState(pageMatrix);
   let clipBounds: Bounds | null = null;
   let pendingClipPathBounds: Bounds | null = null;
@@ -3071,7 +3448,12 @@ async function extractTextVectorData(
       const skipGlyphRender = isWhitespaceGlyphToken(glyph, fontChar);
       const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
 
-      if (!vertical && !skipGlyphRender && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
+      if (
+        !vertical &&
+        !skipGlyphRender &&
+        shouldRenderFilledText(state.renderMode) &&
+        effectiveTextFillAlpha(state) > TEXT_MIN_ALPHA
+      ) {
         const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
         if (glyphRecord) {
           const glyphMatrix = buildTextGlyphTransform(state, x, 0);
@@ -3080,7 +3462,7 @@ async function extractTextVectorData(
           if (visibleByClip) {
             textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
             textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
-            textInstanceC.push(state.fillR, state.fillG, state.fillB, state.fillAlpha);
+            textInstanceC.push(state.fillR, state.fillG, state.fillB, effectiveTextFillAlpha(state));
             sourceTextCount += 1;
 
             if (pageBounds) {
@@ -3227,6 +3609,29 @@ async function extractTextVectorData(
 
     if (fn === OPS.setGState) {
       applyTextGraphicsStateEntries(readArg(args, 0), state);
+      continue;
+    }
+
+    if (fn === OPS.beginGroup) {
+      groupAlphaStack.push({
+        groupFillAlpha: state.groupFillAlpha,
+        groupFillAlphaVersion: state.groupFillAlphaVersion
+      });
+      state.groupFillAlpha = clamp01(state.groupFillAlpha * state.fillAlpha);
+      state.groupFillAlphaVersion = state.fillAlphaVersion;
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
+    if (fn === OPS.endGroup) {
+      const restoredGroupAlpha = groupAlphaStack.pop();
+      if (restoredGroupAlpha) {
+        state.groupFillAlpha = restoredGroupAlpha.groupFillAlpha;
+        state.groupFillAlphaVersion = restoredGroupAlpha.groupFillAlphaVersion;
+      }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
       continue;
     }
 
@@ -4091,6 +4496,9 @@ function finalizeRasterLayerResult(
 function createDefaultTextState(matrix: Mat2D): TextState {
   return {
     matrix: [...matrix],
+    groupFillAlpha: 1,
+    groupFillAlphaVersion: -1,
+    fillAlphaVersion: 0,
     fillR: 0,
     fillG: 0,
     fillB: 0,
@@ -4115,6 +4523,9 @@ function createDefaultTextState(matrix: Mat2D): TextState {
 function cloneTextState(state: TextState): TextState {
   return {
     matrix: [...state.matrix],
+    groupFillAlpha: state.groupFillAlpha,
+    groupFillAlphaVersion: state.groupFillAlphaVersion,
+    fillAlphaVersion: state.fillAlphaVersion,
     fillR: state.fillR,
     fillG: state.fillG,
     fillB: state.fillB,
@@ -4168,6 +4579,7 @@ function applyTextGraphicsStateEntries(rawEntries: unknown, state: TextState): v
       const alpha = Number(value);
       if (Number.isFinite(alpha)) {
         state.fillAlpha = clamp01(alpha);
+        state.fillAlphaVersion += 1;
       }
       continue;
     }
@@ -4237,6 +4649,13 @@ function resolveFont(commonObjs: CommonObjsLike, fontRef: string): FontLike | nu
   } catch {
     return null;
   }
+}
+
+function effectiveTextFillAlpha(state: TextState): number {
+  if (state.fillAlphaVersion === state.groupFillAlphaVersion) {
+    return clamp01(state.groupFillAlpha);
+  }
+  return clamp01(state.groupFillAlpha * state.fillAlpha);
 }
 
 function resolveFontMatrixScale(font: FontLike | null): number {
