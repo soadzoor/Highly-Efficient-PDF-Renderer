@@ -320,7 +320,7 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     progress.report(0.94, { stage: "compile", sourceType: "pdf" });
     return pageScenes;
   } finally {
-    await pdf.destroy();
+    await loadingTask.destroy();
   }
 }
 
@@ -402,7 +402,7 @@ export async function extractPdfRasterPageScenes(
     progress.report(0.94, { stage: "compile", sourceType: "pdf" });
     return pageScenes;
   } finally {
-    await pdf.destroy();
+    await loadingTask.destroy();
   }
 }
 
