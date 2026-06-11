@@ -57,6 +57,16 @@ export interface PdfObjectGeneratorOptions {
   onProgress?: LoadProgressCallback;
 
   /**
+   * Also extract text strings with scene-space bounding boxes into
+   * `VectorScene.textContent` (used for example by `detectRooms` to seed room
+   * detection from room labels). Only PDF sources carry text strings;
+   * parsed-zip sources ignore this option.
+   *
+   * @default false
+   */
+  extractText?: boolean;
+
+  /**
    * Force source interpretation. Use this when bytes or URLs do not make the
    * format obvious.
    *
@@ -115,6 +125,7 @@ export async function loadPdfSceneFromSource(
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
       maxPages: options.maxPages,
+      extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
     const pageScenes = await extractPdfPageScenes(createParseBuffer(sourceBytes), extractOptions);

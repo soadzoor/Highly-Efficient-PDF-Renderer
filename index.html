@@ -7,12 +7,21 @@
   </head>
   <body>
     <canvas id="viewport"></canvas>
+    <canvas id="room-overlay"></canvas>
     <div id="hud" class="panel">
       <div class="panel-header">
         <div class="toolbar">
           <button id="open-file" type="button">Open PDF / ZIP</button>
           <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
             <option value="">Examples (loading...)</option>
+          </select>
+          <button id="detect-rooms" type="button" disabled>Detect Rooms</button>
+          <select id="room-overlay-mode" aria-label="Room overlay mode" hidden>
+            <option value="rooms" selected>Rooms</option>
+            <option value="walls">Walls</option>
+            <option value="closures">Closures</option>
+            <option value="contours">Contours</option>
+            <option value="off">Off</option>
           </select>
           <button id="download-data" type="button" hidden disabled>Download Parsed Data</button>
           <button id="download-pdf" type="button" hidden disabled>Download PDF</button>

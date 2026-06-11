@@ -177,6 +177,36 @@ Package exports:
 - `@soadzoor/hepr`
 - `@soadzoor/hepr/three`
 
+### Room Detection
+
+`detectRooms` finds wall-bounded rooms on architectural floorplan pages and
+returns one closed polygon per room (scene coordinates), with the room-label
+text attached when the scene was parsed with text extraction enabled:
+
+```ts
+import { detectRooms, loadPdfSceneFromSource } from "@soadzoor/hepr";
+
+const loaded = await loadPdfSceneFromSource(source, { extractText: true });
+const { rooms, failedSeeds } = detectRooms(loaded.scene);
+
+for (const room of rooms) {
+  console.log(room.labelText, room.area, room.polygon); // polygon: [x0, y0, x1, y1, ...]
+}
+```
+
+The detector classifies thick/long strokes as wall candidates, bridges door
+openings with virtual closures, rasterizes the walls into an occupancy bitmap,
+flood-fills from each text label (plus a coarse grid for unlabeled rooms),
+traces the region contours, and snaps the polygons back onto the inner wall
+faces. All thresholds are adaptive and can be overridden through
+`RoomDetectionOptions`; pass `collectDebugInfo: true` to inspect wall
+candidates, closures, raw contours, and per-page statistics.
+
+The native demo exposes this via a **Detect Rooms** button with overlay modes
+(rooms / walls / closures / contours), and
+`scripts/room-detect-debug.mjs --all` runs the detector headlessly against the
+example floorplans, writing annotated PNG snapshots to `.debug/`.
+
 ## Architecture
 
 ### 1. PDF Extraction

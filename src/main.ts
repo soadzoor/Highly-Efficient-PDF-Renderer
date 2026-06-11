@@ -14,6 +14,8 @@ import {
 } from "./pdfVectorExtractor";
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
+import { detectRooms } from "./roomDetector";
+import { createRoomOverlay, type RoomOverlayMode } from "./roomOverlay";
 import {
   buildParsedDataZipBlobForLayout,
   listSceneRasterLayers,
@@ -52,6 +54,9 @@ import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
+const roomOverlayCanvas = document.querySelector<HTMLCanvasElement>("#room-overlay");
+const detectRoomsButton = document.querySelector<HTMLButtonElement>("#detect-rooms");
+const roomOverlayModeSelect = document.querySelector<HTMLSelectElement>("#room-overlay-mode");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
 const toggleHudButton = document.querySelector<HTMLButtonElement>("#toggle-hud");
 const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon");
@@ -89,6 +94,9 @@ const vectorOpacityInput = document.querySelector<HTMLInputElement>("#vector-opa
 
 if (
   !canvas ||
+  !roomOverlayCanvas ||
+  !detectRoomsButton ||
+  !roomOverlayModeSelect ||
   !hudElement ||
   !toggleHudButton ||
   !toggleHudIcon ||
@@ -128,6 +136,9 @@ if (
 }
 
 let canvasElement = canvas;
+const roomOverlayCanvasElement = roomOverlayCanvas;
+const detectRoomsButtonElement = detectRoomsButton;
+const roomOverlayModeSelectElement = roomOverlayModeSelect;
 const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
 const toggleHudIconElement = toggleHudIcon;
@@ -180,7 +191,14 @@ const uiControlManager = createUiControlManager(
 
 const canvasInteractionController = createCanvasInteractionController(() => renderer);
 
+const roomOverlay = createRoomOverlay({
+  overlayCanvas: roomOverlayCanvasElement,
+  getRenderer: () => renderer
+});
+roomOverlay.syncSize();
+
 function onRendererFrame(stats: DrawStats): void {
+  roomOverlay.redraw();
   updateFpsMetric();
 
   const rendered = stats.renderedSegments.toLocaleString();
@@ -337,6 +355,7 @@ setHudCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadPdfButtonState(false);
 setDownloadAllDataButtonState(false);
+setDetectRoomsButtonState(null);
 setStatus(baseStatus);
 refreshDropIndicator();
 void loadExampleManifest();
@@ -344,6 +363,41 @@ void loadExampleManifest();
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
 });
+
+detectRoomsButtonElement.addEventListener("click", () => {
+  void runRoomDetection();
+});
+
+roomOverlayModeSelectElement.addEventListener("change", () => {
+  roomOverlay.setMode(roomOverlayModeSelectElement.value as RoomOverlayMode);
+});
+
+async function runRoomDetection(): Promise<void> {
+  const scene = lastParsedScene;
+  if (!scene) {
+    return;
+  }
+  detectRoomsButtonElement.disabled = true;
+  setStatus("Detecting rooms...");
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  try {
+    const detectStart = performance.now();
+    const result = detectRooms(scene, { collectDebugInfo: true });
+    const detectMs = performance.now() - detectStart;
+    roomOverlay.setResult(result);
+    roomOverlayModeSelectElement.hidden = false;
+    const labeledRoomCount = result.rooms.filter((room) => room.labels.length > 0).length;
+    setStatus(
+      `Detected ${result.rooms.length.toLocaleString()} rooms (${labeledRoomCount.toLocaleString()} labeled, ` +
+        `${result.failedSeeds.length.toLocaleString()} seeds discarded) in ${detectMs.toFixed(0)} ms`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Room detection failed: ${message}`);
+  } finally {
+    setDetectRoomsButtonState(lastParsedScene);
+  }
+}
 
 downloadDataButtonElement.addEventListener("click", () => {
   void downloadParsedDataZip();
@@ -404,6 +458,8 @@ canvasInteractionController.attach(canvasElement);
 
 window.addEventListener("resize", () => {
   renderer.resize();
+  roomOverlay.syncSize();
+  roomOverlay.redraw();
 });
 
 window.addEventListener("dragenter", (event) => {
@@ -738,6 +794,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedSceneLabel = label;
     refreshDropIndicator();
     setDownloadDataButtonState(true);
+    roomOverlay.setResult(null);
+    setDetectRoomsButtonState(scene);
 
     updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming, performance.now() - loadStart);
     clearLoadedStatus();
@@ -834,6 +892,8 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     lastParsedSceneLabel = label;
     refreshDropIndicator();
     setDownloadDataButtonState(true);
+    roomOverlay.setResult(null);
+    setDetectRoomsButtonState(scene);
 
     updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadMs, lodTiming, performance.now() - loadStart);
     clearLoadedStatus();
@@ -853,12 +913,13 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
 function getExtractionOptions(): VectorExtractOptions {
   return {
     enableSegmentMerge: true,
-    enableInvisibleCull: true
+    enableInvisibleCull: true,
+    extractTextContent: true
   };
 }
 
 function buildPdfPageCacheKey(): string {
-  return "merge:1|cull:1";
+  return "merge:1|cull:1|text:1";
 }
 
 function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[] | null {
@@ -1020,6 +1081,16 @@ function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): voi
   downloadDataButtonElement.hidden = !hasParsedData;
   downloadDataButtonElement.disabled = !hasParsedData || isBusy || isBatchExampleExportRunning;
   downloadDataButtonElement.textContent = isBusy ? "Preparing ZIP..." : "Download Parsed Data";
+}
+
+function setDetectRoomsButtonState(scene: VectorScene | null): void {
+  const hasScene = Boolean(scene && scene.segmentCount > 0);
+  detectRoomsButtonElement.disabled = !hasScene;
+  detectRoomsButtonElement.title = !hasScene
+    ? "Load a PDF first"
+    : scene?.textContent?.length
+      ? "Detect rooms seeded from text labels"
+      : "No text labels in this source (parsed ZIP); detected rooms will be unlabeled";
 }
 
 function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
