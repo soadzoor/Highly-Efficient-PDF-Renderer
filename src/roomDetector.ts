@@ -115,6 +115,33 @@ export interface RoomDetectionOptions {
    */
   detectUnlabeledRooms?: boolean;
 
+  /**
+   * Require every room to touch at least one bridged opening (door). A region that is
+   * completely sealed by drawn strokes cannot be entered, so it is treated as furniture,
+   * a label frame, a column, or a wall cavity rather than a room.
+   *
+   * @default true
+   */
+  requireDoor?: boolean;
+
+  /**
+   * Drop wall candidates whose connected stroke cluster is small and isolated from the
+   * wall network (equipment symbols, letters drawn as paths, label frames). Expressed as
+   * a multiple of the resolved door-gap limit: clusters spanning less than this many
+   * door widths are discarded. Set to 0 to disable.
+   *
+   * @default 2.5
+   */
+  minWallComponentFactor?: number;
+
+  /**
+   * Split one detected region between distant room-label clusters, e.g. a continuous
+   * corridor carrying several CORRIDOR labels becomes one room per label.
+   *
+   * @default true
+   */
+  splitByLabels?: boolean;
+
   /** Collect `RoomDetectionDebugInfo` (wall candidates, closures, raw contours, stats). */
   collectDebugInfo?: boolean;
 }
@@ -141,7 +168,8 @@ export type RoomSeedFailureReason =
   | "tooLarge"
   | "tooSmall"
   | "duplicate"
-  | "noWalls";
+  | "noWalls"
+  | "noDoor";
 
 export interface RoomSeedFailure {
   seed: RoomSeed;
@@ -159,6 +187,8 @@ export interface RoomDetectionPageStats {
   /** Length-weighted median half-width of the accepted wall segments. */
   wallMedianHalfWidth: number;
   wallSegmentCount: number;
+  /** True when stroke widths carried no signal and ink-density filtering was the fallback. */
+  uniformWidthMode: boolean;
   doorGapMax: number;
   /** Number of virtual closure segments bridging door openings and wall gaps. */
   closureCount: number;
@@ -214,6 +244,10 @@ interface ResolvedOptions {
   axisSnapAngleDegrees: number;
   snapToWallLines: boolean;
   detectUnlabeledRooms: boolean;
+  requireDoor: boolean;
+  minWallComponentFactor: number;
+  splitByLabels: boolean;
+  allowDensityFilter: boolean;
 }
 
 interface PageSeed {
@@ -266,7 +300,14 @@ export function detectRooms(scene: VectorScene, options: RoomDetectionOptions = 
     simplifyTolerancePx: normalizePositive(options.simplifyTolerancePx, 1.5),
     axisSnapAngleDegrees: normalizePositive(options.axisSnapAngleDegrees, 4),
     snapToWallLines: options.snapToWallLines !== false,
-    detectUnlabeledRooms: options.detectUnlabeledRooms !== false
+    detectUnlabeledRooms: options.detectUnlabeledRooms !== false,
+    requireDoor: options.requireDoor !== false,
+    minWallComponentFactor:
+      options.minWallComponentFactor !== undefined && Number.isFinite(options.minWallComponentFactor) && options.minWallComponentFactor >= 0
+        ? options.minWallComponentFactor
+        : 2.5,
+    splitByLabels: options.splitByLabels !== false,
+    allowDensityFilter: true
   };
 
   const pageCount = Math.max(1, Math.floor(scene.pageRects.length / 4));
@@ -324,16 +365,29 @@ export function detectRooms(scene: VectorScene, options: RoomDetectionOptions = 
   for (const pageIndex of pageIndexes) {
     let attempt = runPage(pageIndex, resolved);
 
-    // If nearly every label seed leaked, the width-based wall classifier most likely
-    // picked the wrong stroke class (drawings with uniform line widths). Retry treating
-    // every eligible stroke as a wall and keep the attempt that explains more labels.
+    // The wall classifier can pick the wrong strokes (wrong width class, or the
+    // ink-density fallback erased single-line walls). When the first attempt relied on
+    // density filtering, or a large share of label seeds leaked, also try treating
+    // every eligible stroke as a wall (with and without density filtering) and keep the
+    // attempt that explains the most labels, preferring fewer leaks on ties.
     if (resolved.wallHalfWidthThreshold === null) {
       const labelSeedCount = attempt.rooms.reduce((count, room) => count + room.labels.length, 0) + attempt.failedSeeds.length;
-      const leakedCount = attempt.failedSeeds.filter((failure) => failure.reason === "leaked" || failure.reason === "noWalls").length;
-      if (labelSeedCount >= 10 && leakedCount / labelSeedCount > 0.8) {
-        const retry = runPage(pageIndex, { ...resolved, wallHalfWidthThreshold: 1e-9 });
-        if (countLabeledRooms(retry) > countLabeledRooms(attempt)) {
-          attempt = retry;
+      const leakedCount = (candidate: PageAttempt): number =>
+        candidate.failedSeeds.filter((failure) => failure.reason === "leaked" || failure.reason === "noWalls").length;
+      const firstWasUniform = [...(attempt.debug?.pageStats.values() ?? [])].some((stats) => stats.uniformWidthMode);
+      const massLeak = labelSeedCount >= 10 && leakedCount(attempt) / labelSeedCount > 0.45;
+      if (labelSeedCount >= 10 && (firstWasUniform || massLeak)) {
+        const candidates: PageAttempt[] = [runPage(pageIndex, { ...resolved, wallHalfWidthThreshold: 1e-9, allowDensityFilter: false })];
+        if (!firstWasUniform) {
+          candidates.push(runPage(pageIndex, { ...resolved, wallHalfWidthThreshold: 1e-9, allowDensityFilter: true }));
+        }
+        for (const candidate of candidates) {
+          const better =
+            countLabeledRooms(candidate) > countLabeledRooms(attempt) ||
+            (countLabeledRooms(candidate) === countLabeledRooms(attempt) && leakedCount(candidate) < leakedCount(attempt));
+          if (better) {
+            attempt = candidate;
+          }
         }
       }
     }
@@ -406,6 +460,7 @@ function detectRoomsOnPage(
     wallHalfWidthThreshold: stageA.wallHalfWidthThreshold,
     wallMedianHalfWidth: stageA.wallMedianHalfWidth,
     wallSegmentCount: stageA.walls.length / WALL_STRIDE,
+    uniformWidthMode: stageA.uniformWidthMode,
     doorGapMax: 0,
     closureCount: 0,
     rasterScale: 0,
@@ -415,31 +470,18 @@ function detectRoomsOnPage(
   };
   debug?.pageStats.set(pageIndex, stats);
 
-  const wallCount = stageA.walls.length / WALL_STRIDE;
-  if (wallCount === 0 || !(stageA.wallMedianHalfWidth > 0)) {
+  const initialWallCount = stageA.walls.length / WALL_STRIDE;
+  if (initialWallCount === 0 || !(stageA.wallMedianHalfWidth > 0)) {
     for (const seed of seeds) {
       failedSeeds.push({ seed: seed.asRoomSeed, reason: "noWalls" });
     }
     return;
-  }
-  const walls = stageA.walls;
-
-  if (debug) {
-    for (let i = 0; i < wallCount; i += 1) {
-      const base = i * WALL_STRIDE;
-      debugWallSegments.push(walls[base], walls[base + 1], walls[base + 2], walls[base + 3]);
-    }
   }
 
   // Resolved gap thresholds. The page-diagonal floor matters for drawings whose wall
   // strokes are hairline-thin: door openings still have architectural proportions.
   const wallWidth = stageA.wallMedianHalfWidth * 2;
   const doorGapMax = Math.min(Math.max(options.doorGapFactor * wallWidth, 0.0055 * pageDiagonal), 0.025 * pageDiagonal);
-  let maxWallHalfWidth = 0;
-  for (let i = 0; i < wallCount; i += 1) {
-    maxWallHalfWidth = Math.max(maxWallHalfWidth, walls[i * WALL_STRIDE + 4]);
-  }
-  const grid = new WallGrid(walls, wallCount, pageMinX, pageMinY, pageMaxX, pageMaxY, Math.max(doorGapMax, wallWidth * 4));
 
   // Stage C: rasterize walls into an occupancy bitmap.
   const scale = options.maxRasterSize / Math.max(pageWidth, pageHeight);
@@ -455,21 +497,100 @@ function detectRoomsOnPage(
   const rasterToWorldX = (rx: number): number => pageMinX + (rx - RASTER_PAD) / scale;
   const rasterToWorldY = (ry: number): number => pageMaxY - (ry - RASTER_PAD) / scale;
 
-  for (let i = 0; i < wallCount; i += 1) {
+  for (let i = 0; i < initialWallCount; i += 1) {
     const base = i * WALL_STRIDE;
     stampSegment(
       occupancy,
       rasterWidth,
       rasterHeight,
-      worldToRasterX(walls[base]),
-      worldToRasterY(walls[base + 1]),
-      worldToRasterX(walls[base + 2]),
-      worldToRasterY(walls[base + 3]),
-      Math.max(walls[base + 4] * scale, 0.875)
+      worldToRasterX(stageA.walls[base]),
+      worldToRasterY(stageA.walls[base + 1]),
+      worldToRasterX(stageA.walls[base + 2]),
+      worldToRasterY(stageA.walls[base + 3]),
+      Math.max(stageA.walls[base + 4] * scale, 0.875)
     );
   }
 
+  // When stroke width carried no signal, fall back to ink density: walls are drawn as
+  // bands (double faces, hatching) that ink a wide footprint, while furniture, door
+  // leaves, and annotation are sparse single lines. Long straight runs (glazing,
+  // single-line partitions) are sparse but real, so they are stamped back afterwards.
+  if (stageA.uniformWidthMode && options.allowDensityFilter) {
+    filterOccupancyByDensity(occupancy, rasterWidth, rasterHeight, 3, 0.45);
+    const longKeepLength = 0.01 * pageDiagonal;
+    for (let i = 0; i < initialWallCount; i += 1) {
+      const base = i * WALL_STRIDE;
+      const length = Math.hypot(stageA.walls[base + 2] - stageA.walls[base], stageA.walls[base + 3] - stageA.walls[base + 1]);
+      if (length >= longKeepLength) {
+        stampSegment(
+          occupancy,
+          rasterWidth,
+          rasterHeight,
+          worldToRasterX(stageA.walls[base]),
+          worldToRasterY(stageA.walls[base + 1]),
+          worldToRasterX(stageA.walls[base + 2]),
+          worldToRasterY(stageA.walls[base + 3]),
+          Math.max(stageA.walls[base + 4] * scale, 0.875)
+        );
+      }
+    }
+  }
+
+  // Drop small isolated stroke clusters (equipment symbols, letters drawn as paths,
+  // label frames): real walls form a large connected network, optionally via doors.
+  const walls =
+    options.minWallComponentFactor > 0
+      ? pruneIsolatedWallComponents(
+        occupancy,
+        rasterWidth,
+        rasterHeight,
+        stageA.walls,
+        worldToRasterX,
+        worldToRasterY,
+        options.minWallComponentFactor * doorGapMax * scale
+      )
+      : stageA.walls;
+  const wallCount = walls.length / WALL_STRIDE;
+  stats.wallSegmentCount = wallCount;
+  if (wallCount === 0) {
+    for (const seed of seeds) {
+      failedSeeds.push({ seed: seed.asRoomSeed, reason: "noWalls" });
+    }
+    return;
+  }
+
+  if (debug) {
+    for (let i = 0; i < wallCount; i += 1) {
+      const base = i * WALL_STRIDE;
+      debugWallSegments.push(walls[base], walls[base + 1], walls[base + 2], walls[base + 3]);
+    }
+  }
+
+  let maxWallHalfWidth = 0;
+  for (let i = 0; i < wallCount; i += 1) {
+    maxWallHalfWidth = Math.max(maxWallHalfWidth, walls[i * WALL_STRIDE + 4]);
+  }
+  const grid = new WallGrid(walls, wallCount, pageMinX, pageMinY, pageMaxX, pageMaxY, Math.max(doorGapMax, wallWidth * 4));
+
   // Stage B: bridge door openings by extending wall ends until they contact other walls.
+  // Closures are tracked in their own mask as well: a room must touch one of them to
+  // count as a room at all (a fully sealed shape has no door). Door-swing arcs are
+  // literal doors: they seal the doorway in the occupancy AND mark it as an opening.
+  const closureMask = new Uint8Array(rasterWidth * rasterHeight);
+  for (const target of [occupancy, closureMask]) {
+    for (let i = 0; i + 4 < stageA.doorArcs.length + 1; i += WALL_STRIDE) {
+      stampSegment(
+        target,
+        rasterWidth,
+        rasterHeight,
+        worldToRasterX(stageA.doorArcs[i]),
+        worldToRasterY(stageA.doorArcs[i + 1]),
+        worldToRasterX(stageA.doorArcs[i + 2]),
+        worldToRasterY(stageA.doorArcs[i + 3]),
+        Math.max(stageA.doorArcs[i + 4] * scale, 0.875)
+      );
+    }
+  }
   const closures = buildWhiskerClosures(walls, wallCount, grid, wallWidth, maxWallHalfWidth, doorGapMax, {
     occupancy,
     width: rasterWidth,
@@ -485,27 +606,30 @@ function detectRoomsOnPage(
       debugClosures.push(closures[i], closures[i + 1], closures[i + 2], closures[i + 3]);
     }
   }
-  for (let i = 0; i + 4 < closures.length + 1; i += WALL_STRIDE) {
-    stampSegment(
-      occupancy,
-      rasterWidth,
-      rasterHeight,
-      worldToRasterX(closures[i]),
-      worldToRasterY(closures[i + 1]),
-      worldToRasterX(closures[i + 2]),
-      worldToRasterY(closures[i + 3]),
-      Math.max(closures[i + 4] * scale, 0.875)
-    );
+  for (const target of [occupancy, closureMask]) {
+    for (let i = 0; i + 4 < closures.length + 1; i += WALL_STRIDE) {
+      stampSegment(
+        target,
+        rasterWidth,
+        rasterHeight,
+        worldToRasterX(closures[i]),
+        worldToRasterY(closures[i + 1]),
+        worldToRasterX(closures[i + 2]),
+        worldToRasterY(closures[i + 3]),
+        Math.max(closures[i + 4] * scale, 0.875)
+      );
+    }
   }
 
   // Close small gaps: walls drawn as two parallel face strokes leave a hollow band that
   // would otherwise be detected as a snaking enclosed region, and dashed wall pieces
-  // leave pinholes. The radius stays well below door-opening widths.
+  // leave pinholes. When the face-pair spacing was measured, the radius is sized to fill
+  // exactly that band; either way it stays well below door-opening widths.
   morphologicalClose(
     occupancy,
     rasterWidth,
     rasterHeight,
-    Math.min(Math.max(1.5 * wallWidth * scale, 2.5), 0.15 * doorGapMax * scale, 12)
+    Math.min(Math.max(1.5 * wallWidth * scale, 2.5), 0.35 * doorGapMax * scale, 12)
   );
 
   // Stage D: flood fill from each seed.
@@ -532,12 +656,14 @@ function detectRoomsOnPage(
     failure: RoomSeedFailureReason | null;
     roomIndex: number;
     auto: boolean;
+    touchesDoor: boolean;
     pixelCount: number;
     minX: number;
     minY: number;
     maxX: number;
     maxY: number;
     seeds: PageSeed[];
+    seedProbes: number[];
   }
   const regions: RegionRecord[] = [];
   let nextRegionId = 1;
@@ -568,6 +694,7 @@ function detectRoomsOnPage(
         failedSeeds.push({ seed: seed.asRoomSeed, reason: region.failure });
       } else {
         region.seeds.push(seed);
+        region.seedProbes.push(probe);
       }
       continue;
     }
@@ -578,17 +705,19 @@ function detectRoomsOnPage(
     }
     const regionId = nextRegionId;
     nextRegionId += 1;
-    const fill = floodFillRegion(occupancy, regionMap, rasterWidth, rasterHeight, probe, regionId, maxRegionPixels, EXTERIOR_REGION_ID);
+    const fill = floodFillRegion(occupancy, regionMap, rasterWidth, rasterHeight, probe, regionId, maxRegionPixels, EXTERIOR_REGION_ID, closureMask);
     const region: RegionRecord = {
       failure: null,
       roomIndex: -1,
       auto: false,
+      touchesDoor: fill.touchedDoor,
       pixelCount: fill.pixelCount,
       minX: fill.minX,
       minY: fill.minY,
       maxX: fill.maxX,
       maxY: fill.maxY,
-      seeds: [seed]
+      seeds: [seed],
+      seedProbes: [probe]
     };
     regions.push(region);
 
@@ -598,6 +727,16 @@ function detectRoomsOnPage(
       region.failure = "leaked";
     } else if (fill.pixelCount < options.minRoomAreaPixels) {
       region.failure = "tooSmall";
+    } else if (options.requireDoor && !fill.touchedDoor) {
+      // Sealed shapes are usually furniture or label frames — but a room-number label
+      // inside a region much larger than the label itself is strong evidence of a real
+      // (door-less in the drawing) room, e.g. a shaft or riser.
+      const item = seed.item;
+      const labelAreaPx = item ? Math.max(1, (item.maxX - item.minX) * (item.maxY - item.minY) * scale * scale) : 1;
+      const labelOverridesDoor = item !== null && isRoomLikeLabel(seed.label) && fill.pixelCount >= 6 * labelAreaPx;
+      if (!labelOverridesDoor) {
+        region.failure = "noDoor";
+      }
     }
     if (region.failure) {
       failedSeeds.push({ seed: seed.asRoomSeed, reason: region.failure });
@@ -619,17 +758,210 @@ function detectRoomsOnPage(
         }
         const regionId = nextRegionId;
         nextRegionId += 1;
-        const fill = floodFillRegion(occupancy, regionMap, rasterWidth, rasterHeight, index, regionId, maxRegionPixels, EXTERIOR_REGION_ID);
+        const fill = floodFillRegion(occupancy, regionMap, rasterWidth, rasterHeight, index, regionId, maxRegionPixels, EXTERIOR_REGION_ID, closureMask);
         regions.push({
-          failure: fill.aborted ? "tooLarge" : fill.touchedBorder ? "leaked" : fill.pixelCount < autoMinAreaPixels ? "tooSmall" : null,
+          failure: fill.aborted
+            ? "tooLarge"
+            : fill.touchedBorder
+              ? "leaked"
+              : fill.pixelCount < autoMinAreaPixels
+                ? "tooSmall"
+                : options.requireDoor && !fill.touchedDoor
+                  ? "noDoor"
+                  : null,
           roomIndex: -1,
           auto: true,
+          touchesDoor: fill.touchedDoor,
           pixelCount: fill.pixelCount,
           minX: fill.minX,
           minY: fill.minY,
           maxX: fill.maxX,
           maxY: fill.maxY,
-          seeds: []
+          seeds: [],
+          seedProbes: []
+        });
+      }
+    }
+  }
+
+  // Split regions that carry several distant room-label clusters (e.g. one continuous
+  // corridor with multiple CORRIDOR labels, or an open floor zoned by labels) along the
+  // equidistance between the clusters. Stacked multi-line labels stay one cluster, and
+  // clusters made only of annotation-like text (GFI, +45", J) never cause a split.
+  if (options.splitByLabels) {
+    const originalRegionCount = regions.length;
+    for (let regionIndex = 0; regionIndex < originalRegionCount; regionIndex += 1) {
+      const region = regions[regionIndex];
+      if (region.failure || region.seeds.length < 2) {
+        continue;
+      }
+      const clusters = clusterLabelSeeds(region.seeds, region.seedProbes);
+      const roomClusters = clusters.filter((cluster) => cluster.roomLike);
+      if (roomClusters.length < 2 || nextRegionId + roomClusters.length > EXTERIOR_REGION_ID) {
+        continue;
+      }
+      // Annotation-only clusters join their nearest room-label cluster.
+      for (const cluster of clusters) {
+        if (cluster.roomLike) {
+          continue;
+        }
+        let best = roomClusters[0];
+        let bestDistance = Number.POSITIVE_INFINITY;
+        for (const candidate of roomClusters) {
+          const distance = Math.hypot(candidate.x - cluster.x, candidate.y - cluster.y);
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            best = candidate;
+          }
+        }
+        best.seeds.push(...cluster.seeds);
+        best.probes.push(...cluster.probes);
+      }
+
+      const newIds = roomClusters.map(() => {
+        const id = nextRegionId;
+        nextRegionId += 1;
+        return id;
+      });
+      const { fills, frontiers } = watershedSplitRegion(regionMap, rasterWidth, rasterHeight, regionIndex + 1, roomClusters, newIds);
+
+      // A split is only meaningful across a narrow neck (a corridor cross-section). A
+      // wide-open frontier means the labels share one continuous space (an open hall
+      // zoned by equipment tags): merge such sub-regions back together.
+      const frontierMaxPx = 3 * doorGapMax * scale;
+      const groupOf = new Int32Array(roomClusters.length);
+      for (let clusterIndex = 0; clusterIndex < roomClusters.length; clusterIndex += 1) {
+        groupOf[clusterIndex] = clusterIndex;
+      }
+      const findGroup = (clusterIndex: number): number => {
+        let root = clusterIndex;
+        while (groupOf[root] !== root) {
+          root = groupOf[root];
+        }
+        return root;
+      };
+      for (const [key, frontierLength] of frontiers) {
+        if (frontierLength > frontierMaxPx) {
+          const a = findGroup(Math.floor(key / 4096));
+          const b = findGroup(key % 4096);
+          if (a !== b) {
+            groupOf[a] = b;
+          }
+        }
+      }
+
+      // Canonical cluster per group, and the pixel repaint target for each new id.
+      const canonicalOf = new Map<number, number>();
+      let groupCount = 0;
+      for (let clusterIndex = 0; clusterIndex < roomClusters.length; clusterIndex += 1) {
+        const root = findGroup(clusterIndex);
+        if (!canonicalOf.has(root)) {
+          canonicalOf.set(root, clusterIndex);
+          groupCount += 1;
+        }
+      }
+
+      const repaint = new Map<number, number>();
+      if (groupCount <= 1) {
+        // Everything merged back: restore the parent region untouched.
+        for (const id of newIds) {
+          repaint.set(id, regionIndex + 1);
+        }
+      } else {
+        for (let clusterIndex = 0; clusterIndex < roomClusters.length; clusterIndex += 1) {
+          repaint.set(newIds[clusterIndex], newIds[canonicalOf.get(findGroup(clusterIndex)) as number]);
+        }
+      }
+      let needsRepaint = false;
+      for (const [from, to] of repaint) {
+        if (from !== to) {
+          needsRepaint = true;
+        }
+      }
+      if (needsRepaint) {
+        const repaintMinX = Math.max(0, region.minX);
+        const repaintMaxX = Math.min(rasterWidth - 1, region.maxX);
+        for (let y = Math.max(0, region.minY); y <= Math.min(rasterHeight - 1, region.maxY); y += 1) {
+          const rowBase = y * rasterWidth;
+          for (let x = repaintMinX; x <= repaintMaxX; x += 1) {
+            const target = repaint.get(regionMap[rowBase + x]);
+            if (target !== undefined) {
+              regionMap[rowBase + x] = target;
+            }
+          }
+        }
+      }
+
+      if (groupCount <= 1) {
+        // Parent stays a single room; the allocated ids are repainted away but still
+        // need placeholder records so region ids keep matching array indexes.
+        for (let k = 0; k < newIds.length; k += 1) {
+          regions.push({
+            failure: "duplicate",
+            roomIndex: -1,
+            auto: false,
+            touchesDoor: region.touchesDoor,
+            pixelCount: 0,
+            minX: 0,
+            minY: 0,
+            maxX: -1,
+            maxY: -1,
+            seeds: [],
+            seedProbes: []
+          });
+        }
+        continue;
+      }
+
+      region.failure = "duplicate"; // parent retired in favor of its splits
+      for (let clusterIndex = 0; clusterIndex < roomClusters.length; clusterIndex += 1) {
+        const root = findGroup(clusterIndex);
+        const isCanonical = canonicalOf.get(root) === clusterIndex;
+        if (!isCanonical) {
+          // Placeholder keeps the region-id <-> array-index invariant intact.
+          regions.push({
+            failure: "duplicate",
+            roomIndex: -1,
+            auto: false,
+            touchesDoor: region.touchesDoor,
+            pixelCount: 0,
+            minX: 0,
+            minY: 0,
+            maxX: -1,
+            maxY: -1,
+            seeds: [],
+            seedProbes: []
+          });
+          continue;
+        }
+        const fill: WatershedFill = { pixelCount: 0, minX: rasterWidth, minY: rasterHeight, maxX: -1, maxY: -1 };
+        const seeds: PageSeed[] = [];
+        const probes: number[] = [];
+        for (let member = 0; member < roomClusters.length; member += 1) {
+          if (findGroup(member) !== root) {
+            continue;
+          }
+          const memberFill = fills[member];
+          fill.pixelCount += memberFill.pixelCount;
+          fill.minX = Math.min(fill.minX, memberFill.minX);
+          fill.minY = Math.min(fill.minY, memberFill.minY);
+          fill.maxX = Math.max(fill.maxX, memberFill.maxX);
+          fill.maxY = Math.max(fill.maxY, memberFill.maxY);
+          seeds.push(...roomClusters[member].seeds);
+          probes.push(...roomClusters[member].probes);
+        }
+        regions.push({
+          failure: fill.pixelCount < options.minRoomAreaPixels ? "tooSmall" : null,
+          roomIndex: -1,
+          auto: false,
+          touchesDoor: region.touchesDoor,
+          pixelCount: fill.pixelCount,
+          minX: fill.minX,
+          minY: fill.minY,
+          maxX: fill.maxX,
+          maxY: fill.maxY,
+          seeds,
+          seedProbes: probes
         });
       }
     }
@@ -802,11 +1134,15 @@ function collectPageSeeds(
 
 interface StageAResult {
   walls: Float64Array;
+  /** Door-swing arcs (tight curves) as [x0, y0, x1, y1, halfWidth] runs: they both seal doorways and mark them as doors. */
+  doorArcs: Float64Array;
   eligibleSegmentCount: number;
   totalStrokeLength: number;
   widthHistogram: { halfWidth: number; totalLength: number; segmentCount: number }[];
   wallHalfWidthThreshold: number;
   wallMedianHalfWidth: number;
+  /** True when stroke width carried no signal and every eligible stroke was accepted. */
+  uniformWidthMode: boolean;
 }
 
 function collectWallSegments(
@@ -890,13 +1226,29 @@ function collectWallSegments(
     wallHalfWidthThreshold = dominantThickWidth * options.wallWidthRatio;
   }
 
+  // When the width threshold accepts nearly all stroke length, thickness carries no
+  // signal (uniformly thin CAD exports); the caller then falls back to ink-density
+  // filtering on the rasterized occupancy.
+  let thresholdCoverage = 0;
+  for (const bucket of widthHistogram) {
+    if (bucket.halfWidth >= wallHalfWidthThreshold) {
+      thresholdCoverage += bucket.totalLength;
+    }
+  }
+  const uniformWidthMode = totalStrokeLength > 0 && thresholdCoverage / totalStrokeLength > 0.85;
+
   // Second pass: collect wall subsegments (flattening quadratics into polylines).
   // Besides strokes at full wall thickness, long straight strokes at medium thickness
   // are accepted too: glass/curtain walls are often drawn thinner than solid walls but
   // much longer than furniture or door-arc pieces.
   const longWallMinLength = 0.01 * pageDiagonal;
   const longWallHalfWidthMin = 0.35 * wallHalfWidthThreshold;
+  // Walls are almost never tightly curved; door-swing arcs, chairs, and similar symbols
+  // are. Tight curves are rejected by their curvature radius, while gently curved
+  // building walls (large radius) survive.
+  const curveRadiusMin = 0.012 * pageDiagonal;
   const walls: number[] = [];
+  const doorArcs: number[] = [];
   const acceptedWidthLengths: { halfWidth: number; length: number }[] = [];
   for (const i of eligible) {
     const base = i * 4;
@@ -906,6 +1258,32 @@ function collectWallSegments(
     const endX = primitiveMeta[base];
     const endY = primitiveMeta[base + 1];
     const primitiveType = primitiveMeta[base + 2];
+
+    if (primitiveType === 1) {
+      const cx = endpoints[base + 2];
+      const cy = endpoints[base + 3];
+      const chord = Math.hypot(endX - x0, endY - y0);
+      const sagitta = Math.hypot(x0 - 2 * cx + endX, y0 - 2 * cy + endY) / 4;
+      if (sagitta > 0.05 * Math.max(chord, 1e-9)) {
+        const radius = (chord * chord) / (8 * sagitta) + sagitta / 2;
+        if (radius < curveRadiusMin) {
+          // Tight curve: flatten coarsely into the door-arc set instead of the walls.
+          let prevX = x0;
+          let prevY = y0;
+          for (let k = 1; k <= 4; k += 1) {
+            const t = k / 4;
+            const mt = 1 - t;
+            const px = mt * mt * x0 + 2 * mt * t * cx + t * t * endX;
+            const py = mt * mt * y0 + 2 * mt * t * cy + t * t * endY;
+            doorArcs.push(prevX, prevY, px, py, halfWidth);
+            prevX = px;
+            prevY = py;
+          }
+          continue;
+        }
+      }
+    }
+
     if (halfWidth < wallHalfWidthThreshold) {
       const isLongStraight =
         primitiveType === 0 && halfWidth >= longWallHalfWidthMin && Math.hypot(endX - x0, endY - y0) >= longWallMinLength;
@@ -939,14 +1317,163 @@ function collectWallSegments(
     }
   }
 
+  const wallsFiltered = dropPolylineArcChains(walls, curveRadiusMin, doorArcs);
+
   return {
-    walls: new Float64Array(walls),
+    walls: new Float64Array(wallsFiltered),
+    doorArcs: new Float64Array(doorArcs),
     eligibleSegmentCount: eligible.length,
     totalStrokeLength,
     widthHistogram,
     wallHalfWidthThreshold,
-    wallMedianHalfWidth: lengthWeightedMedianHalfWidth(acceptedWidthLengths)
+    wallMedianHalfWidth: lengthWeightedMedianHalfWidth(acceptedWidthLengths),
+    uniformWidthMode
   };
+}
+
+/**
+ * Drop chains of short end-to-end segments that turn consistently with a small radius:
+ * door-swing arcs and circle symbols are commonly exported as polylines rather than
+ * curve primitives. Straight walls (no turning), sharp corners (single large turns), and
+ * gently curved walls (large radius) all survive.
+ */
+function dropPolylineArcChains(walls: number[], curveRadiusMin: number, doorArcs: number[]): number[] {
+  const wallCount = walls.length / WALL_STRIDE;
+  const pieceMaxLength = 0.4 * curveRadiusMin;
+  if (wallCount === 0 || !(pieceMaxLength > 0)) {
+    return walls;
+  }
+
+  // Endpoint adjacency over the short segments only (arc pieces are short).
+  const shortIndexes: number[] = [];
+  const isShort = new Uint8Array(wallCount);
+  for (let i = 0; i < wallCount; i += 1) {
+    const base = i * WALL_STRIDE;
+    const length = Math.hypot(walls[base + 2] - walls[base], walls[base + 3] - walls[base + 1]);
+    if (length > 1e-9 && length <= pieceMaxLength) {
+      isShort[i] = 1;
+      shortIndexes.push(i);
+    }
+  }
+  if (shortIndexes.length < 4) {
+    return walls;
+  }
+
+  const keyOf = (x: number, y: number): string => `${Math.round(x * 16)},${Math.round(y * 16)}`;
+  const byEndpoint = new Map<string, number[]>();
+  for (const i of shortIndexes) {
+    const base = i * WALL_STRIDE;
+    for (const key of [keyOf(walls[base], walls[base + 1]), keyOf(walls[base + 2], walls[base + 3])]) {
+      const list = byEndpoint.get(key);
+      if (list) {
+        list.push(i);
+      } else {
+        byEndpoint.set(key, [i]);
+      }
+    }
+  }
+
+  const visited = new Uint8Array(wallCount);
+  const drop = new Uint8Array(wallCount);
+  const chain: number[] = [];
+
+  for (const start of shortIndexes) {
+    if (visited[start]) {
+      continue;
+    }
+    // Walk the chain in both directions from the start segment.
+    chain.length = 0;
+    chain.push(start);
+    visited[start] = 1;
+    let totalTurn = 0;
+    let totalLength = segmentLengthAt(walls, start);
+
+    for (const direction of [0, 1] as const) {
+      let current = start;
+      let endX = walls[start * WALL_STRIDE + (direction === 0 ? 2 : 0)];
+      let endY = walls[start * WALL_STRIDE + (direction === 0 ? 3 : 1)];
+      let headingX = direction === 0 ? endX - walls[start * WALL_STRIDE] : endX - walls[start * WALL_STRIDE + 2];
+      let headingY = direction === 0 ? endY - walls[start * WALL_STRIDE + 1] : endY - walls[start * WALL_STRIDE + 3];
+      let turnSign = 0;
+
+      for (;;) {
+        const neighbors = byEndpoint.get(keyOf(endX, endY)) ?? [];
+        let next = -1;
+        for (const candidate of neighbors) {
+          if (candidate !== current && !visited[candidate]) {
+            if (next >= 0) {
+              next = -2; // junction: more than one continuation
+              break;
+            }
+            next = candidate;
+          }
+        }
+        if (next < 0) {
+          break;
+        }
+        const nextBase = next * WALL_STRIDE;
+        // Orient the next piece to continue from (endX, endY).
+        const forwardFromStart = keyOf(walls[nextBase], walls[nextBase + 1]) === keyOf(endX, endY);
+        const nextEndX = forwardFromStart ? walls[nextBase + 2] : walls[nextBase];
+        const nextEndY = forwardFromStart ? walls[nextBase + 3] : walls[nextBase + 1];
+        const nextHeadingX = nextEndX - endX;
+        const nextHeadingY = nextEndY - endY;
+        const cross = headingX * nextHeadingY - headingY * nextHeadingX;
+        const dot = headingX * nextHeadingX + headingY * nextHeadingY;
+        const turn = Math.atan2(cross, dot);
+        const turnDegrees = Math.abs(turn) * (180 / Math.PI);
+        if (turnDegrees < 0.5 || turnDegrees > 45) {
+          break; // straight continuation or sharp corner: not an arc step
+        }
+        const sign = turn > 0 ? 1 : -1;
+        if (turnSign !== 0 && sign !== turnSign) {
+          break; // zigzag, not an arc
+        }
+        turnSign = sign;
+        visited[next] = 1;
+        chain.push(next);
+        totalTurn += Math.abs(turn);
+        totalLength += Math.hypot(nextHeadingX, nextHeadingY);
+        current = next;
+        endX = nextEndX;
+        endY = nextEndY;
+        headingX = nextHeadingX;
+        headingY = nextHeadingY;
+      }
+    }
+
+    if (chain.length >= 4 && totalTurn >= (40 * Math.PI) / 180) {
+      const radius = totalLength / totalTurn;
+      if (radius < curveRadiusMin) {
+        for (const index of chain) {
+          drop[index] = 1;
+        }
+      }
+    }
+  }
+
+  let dropped = 0;
+  for (let i = 0; i < wallCount; i += 1) {
+    dropped += drop[i];
+  }
+  if (dropped === 0) {
+    return walls;
+  }
+  const kept: number[] = [];
+  for (let i = 0; i < wallCount; i += 1) {
+    const base = i * WALL_STRIDE;
+    if (drop[i]) {
+      doorArcs.push(walls[base], walls[base + 1], walls[base + 2], walls[base + 3], walls[base + 4]);
+    } else {
+      kept.push(walls[base], walls[base + 1], walls[base + 2], walls[base + 3], walls[base + 4]);
+    }
+  }
+  return kept;
+}
+
+function segmentLengthAt(walls: number[], index: number): number {
+  const base = index * WALL_STRIDE;
+  return Math.hypot(walls[base + 2] - walls[base], walls[base + 3] - walls[base + 1]);
 }
 
 function lengthWeightedMedianHalfWidth(entries: { halfWidth: number; length: number }[]): number {
@@ -1254,6 +1781,55 @@ function stampDisc(occupancy: Uint8Array, width: number, height: number, cx: num
 }
 
 /**
+ * Erase sparsely inked occupancy: keep a pixel only when the surrounding window has
+ * enough ink coverage. Wall bands (double faces, hatch fill, thick strokes) ink a wide
+ * footprint and survive; isolated single-line strokes (furniture outlines, door leaves,
+ * annotation symbols) do not.
+ */
+function filterOccupancyByDensity(
+  occupancy: Uint8Array,
+  width: number,
+  height: number,
+  windowRadius: number,
+  minCoverage: number
+): void {
+  const stride = width + 1;
+  const integral = new Int32Array(stride * (height + 1));
+  for (let y = 0; y < height; y += 1) {
+    let rowSum = 0;
+    const rowBase = y * width;
+    const outBase = (y + 1) * stride;
+    const prevBase = y * stride;
+    for (let x = 0; x < width; x += 1) {
+      rowSum += occupancy[rowBase + x];
+      integral[outBase + x + 1] = integral[prevBase + x + 1] + rowSum;
+    }
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    const y0 = Math.max(0, y - windowRadius);
+    const y1 = Math.min(height - 1, y + windowRadius);
+    const rowBase = y * width;
+    for (let x = 0; x < width; x += 1) {
+      if (occupancy[rowBase + x] === 0) {
+        continue;
+      }
+      const x0 = Math.max(0, x - windowRadius);
+      const x1 = Math.min(width - 1, x + windowRadius);
+      const count =
+        integral[(y1 + 1) * stride + x1 + 1] -
+        integral[y0 * stride + x1 + 1] -
+        integral[(y1 + 1) * stride + x0] +
+        integral[y0 * stride + x0];
+      const windowArea = (x1 - x0 + 1) * (y1 - y0 + 1);
+      if (count < minCoverage * windowArea) {
+        occupancy[rowBase + x] = 0;
+      }
+    }
+  }
+}
+
+/**
  * Morphological closing (dilate then erode) of the occupancy bitmap using a chamfer 3-4
  * distance transform, filling free-space gaps narrower than ~2x the radius.
  */
@@ -1388,6 +1964,7 @@ function probeFreePixel(
 interface FloodFillResult {
   pixelCount: number;
   touchedBorder: boolean;
+  touchedDoor: boolean;
   aborted: boolean;
   minX: number;
   minY: number;
@@ -1398,7 +1975,8 @@ interface FloodFillResult {
 /**
  * Scanline flood fill of free pixels (occupancy 0, region 0) writing `regionId`.
  * Touching the bitmap border or a pixel owned by `exteriorId` marks the region as
- * leaked (`touchedBorder`).
+ * leaked (`touchedBorder`); touching a pixel of `closureMask` (a bridged door opening)
+ * marks `touchedDoor`.
  */
 function floodFillRegion(
   occupancy: Uint8Array,
@@ -1408,11 +1986,13 @@ function floodFillRegion(
   startIndex: number,
   regionId: number,
   maxPixels: number,
-  exteriorId: number
+  exteriorId: number,
+  closureMask: Uint8Array | null = null
 ): FloodFillResult {
   const result: FloodFillResult = {
     pixelCount: 0,
     touchedBorder: false,
+    touchedDoor: false,
     aborted: false,
     minX: width,
     minY: height,
@@ -1439,6 +2019,9 @@ function floodFillRegion(
     }
     if ((left > rowStart && regionMap[left - 1] === exteriorId) || (right < rowEnd && regionMap[right + 1] === exteriorId)) {
       result.touchedBorder = true;
+    }
+    if (closureMask && ((left > rowStart && closureMask[left - 1] !== 0) || (right < rowEnd && closureMask[right + 1] !== 0))) {
+      result.touchedDoor = true;
     }
 
     regionMap.fill(regionId, left, right + 1);
@@ -1482,6 +2065,9 @@ function floodFillRegion(
         } else {
           if (regionMap[x + offset] === exteriorId) {
             result.touchedBorder = true;
+          }
+          if (closureMask && closureMask[x + offset] !== 0) {
+            result.touchedDoor = true;
           }
           x += 1;
         }
@@ -1874,6 +2460,286 @@ function snapPolygonToWallFaces(
     }
   }
   return result;
+}
+
+/**
+ * Remove small isolated connected components from the stamped occupancy bitmap
+ * (equipment symbols, text drawn as outlines, label frames) and return the wall
+ * subsegments that survive. Real walls form large connected networks; a cluster whose
+ * bounding box spans less than `minSpanPx` and touches nothing else cannot bound a room.
+ */
+function pruneIsolatedWallComponents(
+  occupancy: Uint8Array,
+  width: number,
+  height: number,
+  walls: Float64Array,
+  worldToRasterX: (wx: number) => number,
+  worldToRasterY: (wy: number) => number,
+  minSpanPx: number
+): Float64Array {
+  if (!(minSpanPx > 1)) {
+    return walls;
+  }
+  const minSpanSquared = minSpanPx * minSpanPx;
+  const visited = new Uint8Array(width * height);
+  const stack: number[] = [];
+  const componentPixels: number[] = [];
+
+  for (let start = 0; start < occupancy.length; start += 1) {
+    if (occupancy[start] === 0 || visited[start] !== 0) {
+      continue;
+    }
+    stack.length = 0;
+    componentPixels.length = 0;
+    stack.push(start);
+    visited[start] = 1;
+    let minX = start % width;
+    let maxX = minX;
+    let minY = Math.floor(start / width);
+    let maxY = minY;
+    // Pixels are only collected while the component could still be "small"; once its
+    // bounding box exceeds the span limit it is a keeper and collection stops.
+    let keep = false;
+
+    while (stack.length > 0) {
+      const index = stack.pop() as number;
+      const x = index % width;
+      const y = (index - x) / width;
+      if (!keep) {
+        componentPixels.push(index);
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+        const spanX = maxX - minX;
+        const spanY = maxY - minY;
+        if (spanX * spanX + spanY * spanY >= minSpanSquared) {
+          keep = true;
+          componentPixels.length = 0;
+        }
+      }
+      if (x > 0 && occupancy[index - 1] !== 0 && visited[index - 1] === 0) {
+        visited[index - 1] = 1;
+        stack.push(index - 1);
+      }
+      if (x < width - 1 && occupancy[index + 1] !== 0 && visited[index + 1] === 0) {
+        visited[index + 1] = 1;
+        stack.push(index + 1);
+      }
+      if (y > 0 && occupancy[index - width] !== 0 && visited[index - width] === 0) {
+        visited[index - width] = 1;
+        stack.push(index - width);
+      }
+      if (y < height - 1 && occupancy[index + width] !== 0 && visited[index + width] === 0) {
+        visited[index + width] = 1;
+        stack.push(index + width);
+      }
+    }
+
+    if (!keep) {
+      for (const index of componentPixels) {
+        occupancy[index] = 0;
+      }
+    }
+  }
+
+  // Keep only wall subsegments whose midpoint still lies on occupied pixels.
+  const kept: number[] = [];
+  const wallCount = walls.length / WALL_STRIDE;
+  for (let i = 0; i < wallCount; i += 1) {
+    const base = i * WALL_STRIDE;
+    const midX = Math.min(width - 1, Math.max(0, Math.round(worldToRasterX((walls[base] + walls[base + 2]) / 2))));
+    const midY = Math.min(height - 1, Math.max(0, Math.round(worldToRasterY((walls[base + 1] + walls[base + 3]) / 2))));
+    if (occupancy[midY * width + midX] !== 0) {
+      kept.push(walls[base], walls[base + 1], walls[base + 2], walls[base + 3], walls[base + 4]);
+    }
+  }
+  return kept.length === walls.length ? walls : new Float64Array(kept);
+}
+
+interface SeedCluster {
+  seeds: PageSeed[];
+  probes: number[];
+  x: number;
+  y: number;
+  roomLike: boolean;
+}
+
+/**
+ * Group a region's seeds into label clusters: stacked label lines (room name + number)
+ * merge into one cluster, far-apart labels stay separate.
+ */
+function clusterLabelSeeds(seeds: PageSeed[], probes: number[]): SeedCluster[] {
+  const count = seeds.length;
+  const parent = new Int32Array(count);
+  for (let i = 0; i < count; i += 1) {
+    parent[i] = i;
+  }
+  const find = (i: number): number => {
+    let root = i;
+    while (parent[root] !== root) {
+      root = parent[root];
+    }
+    while (parent[i] !== root) {
+      const next = parent[i];
+      parent[i] = root;
+      i = next;
+    }
+    return root;
+  };
+
+  const heights = seeds.map((seed) => (seed.item ? Math.max(1e-6, seed.item.maxY - seed.item.minY) : 0));
+  for (let i = 0; i < count; i += 1) {
+    for (let j = i + 1; j < count; j += 1) {
+      const reach = 2.5 * (heights[i] + heights[j]);
+      if (reach > 0 && Math.hypot(seeds[j].x - seeds[i].x, seeds[j].y - seeds[i].y) <= reach) {
+        parent[find(i)] = find(j);
+      }
+    }
+  }
+
+  const clustersByRoot = new Map<number, SeedCluster>();
+  for (let i = 0; i < count; i += 1) {
+    const root = find(i);
+    let cluster = clustersByRoot.get(root);
+    if (!cluster) {
+      cluster = { seeds: [], probes: [], x: 0, y: 0, roomLike: false };
+      clustersByRoot.set(root, cluster);
+    }
+    cluster.seeds.push(seeds[i]);
+    cluster.probes.push(probes[i]);
+    cluster.roomLike = cluster.roomLike || isRoomLikeLabel(seeds[i].label);
+  }
+  for (const cluster of clustersByRoot.values()) {
+    for (const seed of cluster.seeds) {
+      cluster.x += seed.x / cluster.seeds.length;
+      cluster.y += seed.y / cluster.seeds.length;
+    }
+  }
+  return [...clustersByRoot.values()];
+}
+
+/**
+ * Room labels are room numbers (1612A, 60C06, 200, S2) or room-name words (CORRIDOR,
+ * HALL); electrical/dimension annotations (GFI, J, DM, +45", 15.26 SF) are not.
+ */
+function isRoomLikeLabel(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 2 || trimmed.length > 24) {
+    return false;
+  }
+  if (!/\d/.test(trimmed)) {
+    return /^[A-Z][A-Z &,./()'-]{3,}$/.test(trimmed);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9./-]*$/.test(trimmed) || /\d\.\d/.test(trimmed)) {
+    return false;
+  }
+  const digitCount = (trimmed.match(/\d/g) ?? []).length;
+  return digitCount >= 2 || /[A-Za-z]/.test(trimmed);
+}
+
+interface WatershedFill {
+  pixelCount: number;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+/**
+ * Reassign one region's pixels to per-cluster region ids by multi-source BFS (each
+ * pixel joins its nearest cluster). Returns the per-cluster pixel stats and the
+ * frontier length (in pixels) between each pair of adjacent sub-regions.
+ */
+function watershedSplitRegion(
+  regionMap: Uint16Array,
+  width: number,
+  height: number,
+  oldRegionId: number,
+  clusters: SeedCluster[],
+  newIds: number[]
+): { fills: WatershedFill[]; frontiers: Map<number, number> } {
+  const fills: WatershedFill[] = clusters.map(() => ({ pixelCount: 0, minX: width, minY: height, maxX: -1, maxY: -1 }));
+  const idToCluster = new Map<number, number>();
+  for (let clusterIndex = 0; clusterIndex < newIds.length; clusterIndex += 1) {
+    idToCluster.set(newIds[clusterIndex], clusterIndex);
+  }
+
+  const queue: number[] = [];
+  let head = 0;
+  let bboxMinX = width;
+  let bboxMinY = height;
+  let bboxMaxX = -1;
+  let bboxMaxY = -1;
+  const claim = (index: number, newId: number): void => {
+    regionMap[index] = newId;
+    queue.push(index);
+    const clusterIndex = idToCluster.get(newId) as number;
+    const fill = fills[clusterIndex];
+    const x = index % width;
+    const y = (index - x) / width;
+    fill.pixelCount += 1;
+    fill.minX = Math.min(fill.minX, x);
+    fill.maxX = Math.max(fill.maxX, x);
+    fill.minY = Math.min(fill.minY, y);
+    fill.maxY = Math.max(fill.maxY, y);
+    bboxMinX = Math.min(bboxMinX, x);
+    bboxMaxX = Math.max(bboxMaxX, x);
+    bboxMinY = Math.min(bboxMinY, y);
+    bboxMaxY = Math.max(bboxMaxY, y);
+  };
+
+  for (let clusterIndex = 0; clusterIndex < clusters.length; clusterIndex += 1) {
+    for (const probe of clusters[clusterIndex].probes) {
+      if (regionMap[probe] === oldRegionId) {
+        claim(probe, newIds[clusterIndex]);
+      }
+    }
+  }
+
+  while (head < queue.length) {
+    const index = queue[head];
+    head += 1;
+    const newId = regionMap[index];
+    const x = index % width;
+    if (x > 0 && regionMap[index - 1] === oldRegionId) {
+      claim(index - 1, newId);
+    }
+    if (x < width - 1 && regionMap[index + 1] === oldRegionId) {
+      claim(index + 1, newId);
+    }
+    if (index >= width && regionMap[index - width] === oldRegionId) {
+      claim(index - width, newId);
+    }
+    if (index + width < regionMap.length && regionMap[index + width] === oldRegionId) {
+      claim(index + width, newId);
+    }
+  }
+
+  // Frontier lengths between adjacent sub-regions (cluster-index pairs).
+  const frontiers = new Map<number, number>();
+  for (let y = Math.max(0, bboxMinY); y <= Math.min(height - 1, bboxMaxY); y += 1) {
+    for (let x = Math.max(0, bboxMinX); x <= Math.min(width - 1, bboxMaxX); x += 1) {
+      const index = y * width + x;
+      const clusterA = idToCluster.get(regionMap[index]);
+      if (clusterA === undefined) {
+        continue;
+      }
+      for (const neighbor of [index + 1, index + width]) {
+        if ((neighbor === index + 1 && x === width - 1) || neighbor >= regionMap.length) {
+          continue;
+        }
+        const clusterB = idToCluster.get(regionMap[neighbor]);
+        if (clusterB === undefined || clusterB === clusterA) {
+          continue;
+        }
+        const key = clusterA < clusterB ? clusterA * 4096 + clusterB : clusterB * 4096 + clusterA;
+        frontiers.set(key, (frontiers.get(key) ?? 0) + 1);
+      }
+    }
+  }
+
+  return { fills, frontiers };
 }
 
 function polygonCentroid(polygon: ArrayLike<number>): { x: number; y: number } {

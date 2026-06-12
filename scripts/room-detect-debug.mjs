@@ -7,7 +7,9 @@
  *
  * Usage:
  *   node scripts/room-detect-debug.mjs "LK Office Level 1.pdf" [more.pdf ...]
- *   node scripts/room-detect-debug.mjs --all   # the four reference floorplans
+ *   node scripts/room-detect-debug.mjs --all            # the four reference floorplans
+ *   node scripts/room-detect-debug.mjs --gt [substring] # evaluate against the TSV ground
+ *     truth in public/examples/rooms/accurate_rooms (optionally filtered by substring)
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +19,7 @@ import zlib from "node:zlib";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRootDir = path.resolve(scriptDir, "..");
 const pdfDir = path.resolve(repoRootDir, "public", "examples", "pdfs");
+const gtDir = path.resolve(repoRootDir, "public", "examples", "rooms", "accurate_rooms");
 const outDir = path.resolve(repoRootDir, ".debug");
 
 const REFERENCE_PDFS = [
@@ -28,11 +31,41 @@ const REFERENCE_PDFS = [
 
 const IMAGE_MAX_SIZE = 2200;
 
+// Optional crop: --crop fx0,fy0,fx1,fy1 (fractions of the page, origin top-left).
+let cropFractions = null;
+
 async function main() {
   const args = process.argv.slice(2);
-  const names = args.includes("--all") ? REFERENCE_PDFS : args.filter((arg) => !arg.startsWith("--"));
-  if (names.length === 0) {
-    console.error("Usage: node scripts/room-detect-debug.mjs <pdf name in public/examples/pdfs> | --all");
+  const gtMode = args.includes("--gt");
+  const cropArgIndex = args.findIndex((arg) => arg === "--crop");
+  if (cropArgIndex >= 0 && args[cropArgIndex + 1]) {
+    const parts = args[cropArgIndex + 1].split(",").map(Number);
+    if (parts.length === 4 && parts.every(Number.isFinite)) {
+      cropFractions = parts;
+    }
+    args.splice(cropArgIndex, 2);
+  }
+  let extraOptions = {};
+  const optsArgIndex = args.findIndex((arg) => arg === "--opts");
+  if (optsArgIndex >= 0 && args[optsArgIndex + 1]) {
+    extraOptions = JSON.parse(args[optsArgIndex + 1]);
+    args.splice(optsArgIndex, 2);
+  }
+  const positional = args.filter((arg) => !arg.startsWith("--"));
+
+  let targets;
+  if (gtMode) {
+    const allGt = (await fs.readdir(gtDir)).filter((file) => file.endsWith(".pdf"));
+    const filter = positional[0]?.toLowerCase();
+    targets = allGt
+      .filter((file) => !filter || file.toLowerCase().includes(filter))
+      .map((file) => ({ name: file, filePath: path.resolve(gtDir, file), tsvPath: path.resolve(gtDir, file.replace(/\.pdf$/, ".tsv")) }));
+  } else {
+    const names = args.includes("--all") ? REFERENCE_PDFS : positional;
+    targets = names.map((name) => ({ name, filePath: path.resolve(pdfDir, name), tsvPath: null }));
+  }
+  if (targets.length === 0) {
+    console.error("Usage: node scripts/room-detect-debug.mjs <pdf name in public/examples/pdfs> | --all | --gt [substring]");
     process.exit(1);
   }
 
@@ -61,8 +94,8 @@ async function main() {
 
     await fs.mkdir(outDir, { recursive: true });
 
-    for (const name of names) {
-      const filePath = path.resolve(pdfDir, name);
+    for (const target of targets) {
+      const { name, filePath, tsvPath } = target;
       console.log(`\n=== ${name} ===`);
       const bytes = await fs.readFile(filePath);
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -79,13 +112,20 @@ async function main() {
       );
 
       const detectStart = performance.now();
-      const result = detector.detectRooms(scene, { collectDebugInfo: true });
+      const result = detector.detectRooms(scene, { collectDebugInfo: true, ...extraOptions });
       const detectMs = performance.now() - detectStart;
 
-      printResult(result, detectMs);
+      printResult(result, detectMs, !gtMode);
       const stem = path.parse(name).name.replaceAll(" ", "_");
       const imagePath = path.resolve(outDir, `${stem}.png`);
-      await renderResultPng(scene, result, imagePath);
+
+      let groundTruth = null;
+      if (tsvPath) {
+        groundTruth = await loadGroundTruth(tsvPath, scene);
+        evaluateAgainstGroundTruth(scene, result, groundTruth);
+      }
+
+      await renderResultPng(scene, result, imagePath, groundTruth);
       const regionsPath = path.resolve(outDir, `${stem}_regions.png`);
       await renderRegionsPng(result, regionsPath);
       console.log(`wrote ${path.relative(repoRootDir, imagePath)} and ${path.relative(repoRootDir, regionsPath)}`);
@@ -95,7 +135,169 @@ async function main() {
   }
 }
 
-function printResult(result, detectMs) {
+// ---------------------------------------------------------------------------
+// Ground-truth evaluation
+// ---------------------------------------------------------------------------
+
+/**
+ * The TSV room polygons live in a coordinate space translated relative to scene space
+ * (origin at the page center). Returns { rooms: [{ roomNumber, polygon: number[] }] }
+ * with polygons already converted to scene coordinates.
+ */
+async function loadGroundTruth(tsvPath, scene) {
+  const pageCenterX = (scene.pageRects[0] + scene.pageRects[2]) / 2;
+  const pageCenterY = (scene.pageRects[1] + scene.pageRects[3]) / 2;
+  const tsv = await fs.readFile(tsvPath, "utf8");
+  const rooms = [];
+  for (const line of tsv.split("\n").slice(1)) {
+    const tabIndex = line.indexOf("\t");
+    if (tabIndex < 0) {
+      continue;
+    }
+    const roomNumber = line.slice(0, tabIndex).trim();
+    let points;
+    try {
+      points = JSON.parse(line.slice(tabIndex + 1));
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(points) || points.length < 3) {
+      continue;
+    }
+    const polygon = [];
+    for (const point of points) {
+      polygon.push(point.x + pageCenterX, point.y + pageCenterY);
+    }
+    rooms.push({ roomNumber, polygon });
+  }
+  return { rooms };
+}
+
+function evaluateAgainstGroundTruth(scene, result, groundTruth) {
+  // Rasterize GT and detected rooms into id maps at a modest resolution, then build the
+  // full intersection matrix in one pass.
+  const bounds = scene.pageBounds;
+  const scale = 1600 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+  const width = Math.ceil((bounds.maxX - bounds.minX) * scale) + 2;
+  const height = Math.ceil((bounds.maxY - bounds.minY) * scale) + 2;
+  const toRaster = (polygon) => {
+    const out = [];
+    for (let i = 0; i + 1 < polygon.length; i += 2) {
+      out.push([(polygon[i] - bounds.minX) * scale + 1, (bounds.maxY - polygon[i + 1]) * scale + 1]);
+    }
+    return out;
+  };
+
+  const gtMap = new Uint16Array(width * height);
+  const detMap = new Uint16Array(width * height);
+  const gtAreas = new Map();
+  const detAreas = new Map();
+  for (const [index, room] of groundTruth.rooms.entries()) {
+    fillPolygonId(gtMap, width, height, toRaster(room.polygon), index + 1);
+  }
+  for (const [index, room] of result.rooms.entries()) {
+    fillPolygonId(detMap, width, height, toRaster(Array.from(room.polygon)), index + 1);
+  }
+  const intersections = new Map();
+  for (let i = 0; i < gtMap.length; i += 1) {
+    const gtId = gtMap[i];
+    const detId = detMap[i];
+    if (gtId) {
+      gtAreas.set(gtId, (gtAreas.get(gtId) ?? 0) + 1);
+    }
+    if (detId) {
+      detAreas.set(detId, (detAreas.get(detId) ?? 0) + 1);
+    }
+    if (gtId && detId) {
+      const key = gtId * 100000 + detId;
+      intersections.set(key, (intersections.get(key) ?? 0) + 1);
+    }
+  }
+
+  // Greedy one-to-one matching by IoU descending.
+  const pairs = [];
+  for (const [key, intersection] of intersections) {
+    const gtId = Math.floor(key / 100000);
+    const detId = key % 100000;
+    const union = (gtAreas.get(gtId) ?? 0) + (detAreas.get(detId) ?? 0) - intersection;
+    if (union > 0) {
+      pairs.push({ gtId, detId, iou: intersection / union });
+    }
+  }
+  pairs.sort((a, b) => b.iou - a.iou);
+  const gtMatched = new Map();
+  const detMatched = new Set();
+  for (const pair of pairs) {
+    if (gtMatched.has(pair.gtId) || detMatched.has(pair.detId)) {
+      continue;
+    }
+    gtMatched.set(pair.gtId, pair);
+    detMatched.add(pair.detId);
+  }
+
+  const ious = [...gtMatched.values()].map((pair) => pair.iou);
+  const recallAt = (threshold) => ious.filter((iou) => iou >= threshold).length / Math.max(1, groundTruth.rooms.length);
+  const matchedDetections = [...gtMatched.values()].filter((pair) => pair.iou >= 0.5);
+  let labelHits = 0;
+  for (const pair of matchedDetections) {
+    const gtRoom = groundTruth.rooms[pair.gtId - 1];
+    const detRoom = result.rooms[pair.detId - 1];
+    if (detRoom.labelText.toLowerCase().includes(gtRoom.roomNumber.toLowerCase())) {
+      labelHits += 1;
+    }
+  }
+  const meanIou = ious.length > 0 ? ious.reduce((sum, iou) => sum + iou, 0) / ious.length : 0;
+  console.log(
+    `GT: ${groundTruth.rooms.length} rooms | detections: ${result.rooms.length} | ` +
+      `recall@0.5=${(recallAt(0.5) * 100).toFixed(1)}% recall@0.7=${(recallAt(0.7) * 100).toFixed(1)}% ` +
+      `precision@0.5=${((matchedDetections.length / Math.max(1, result.rooms.length)) * 100).toFixed(1)}% ` +
+      `meanIoU(matched)=${meanIou.toFixed(3)} labelAcc=${labelHits}/${matchedDetections.length}`
+  );
+
+  // Worst GT misses, to guide tuning.
+  const misses = groundTruth.rooms
+    .map((room, index) => ({ room, iou: gtMatched.get(index + 1)?.iou ?? 0, area: gtAreas.get(index + 1) ?? 0 }))
+    .filter((entry) => entry.iou < 0.5)
+    .sort((a, b) => b.area - a.area);
+  if (misses.length > 0) {
+    const sample = misses.slice(0, 10).map((entry) => `${entry.room.roomNumber}(${entry.iou.toFixed(2)})`).join(" ");
+    console.log(`  missed GT rooms (${misses.length}): ${sample}${misses.length > 10 ? " ..." : ""}`);
+  }
+}
+
+function fillPolygonId(idMap, width, height, points, id) {
+  if (points.length < 3) {
+    return;
+  }
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const [, y] of points) {
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  for (let y = Math.max(0, Math.floor(minY)); y <= Math.min(height - 1, Math.ceil(maxY)); y += 1) {
+    const sampleY = y + 0.5;
+    const crossings = [];
+    for (let i = 0; i < points.length; i += 1) {
+      const [x0, y0] = points[i];
+      const [x1, y1] = points[(i + 1) % points.length];
+      if (y0 <= sampleY === y1 <= sampleY) {
+        continue;
+      }
+      crossings.push(x0 + ((sampleY - y0) / (y1 - y0)) * (x1 - x0));
+    }
+    crossings.sort((a, b) => a - b);
+    for (let i = 0; i + 1 < crossings.length; i += 2) {
+      const startX = Math.max(0, Math.round(crossings[i]));
+      const endX = Math.min(width - 1, Math.round(crossings[i + 1]));
+      for (let x = startX; x <= endX; x += 1) {
+        idMap[y * width + x] = id;
+      }
+    }
+  }
+}
+
+function printResult(result, detectMs, listRooms = true) {
   for (const [pageIndex, stats] of result.debug?.pageStats ?? new Map()) {
     console.log(
       `page ${pageIndex}: eligible=${stats.eligibleSegmentCount} totalLen=${stats.totalStrokeLength.toFixed(0)} ` +
@@ -131,6 +333,9 @@ function printResult(result, detectMs) {
     `rooms=${result.rooms.length} failedSeeds=${result.failedSeeds.length} ` +
       `(${[...failureCounts.entries()].map(([reason, count]) => `${reason}:${count}`).join(", ")}) in ${detectMs.toFixed(0)} ms`
   );
+  if (!listRooms) {
+    return;
+  }
   for (const [index, room] of result.rooms.entries()) {
     const label = room.labelText.replaceAll("\n", " | ");
     console.log(`  room ${index}: area=${room.area.toFixed(0)} vertices=${room.polygon.length / 2} label="${label}"`);
@@ -141,8 +346,20 @@ function printResult(result, detectMs) {
 // PNG rendering
 // ---------------------------------------------------------------------------
 
-async function renderResultPng(scene, result, imagePath) {
-  const bounds = scene.pageBounds;
+async function renderResultPng(scene, result, imagePath, groundTruth = null) {
+  let bounds = scene.pageBounds;
+  if (cropFractions) {
+    const [fx0, fy0, fx1, fy1] = cropFractions;
+    const fullWidth = bounds.maxX - bounds.minX;
+    const fullHeight = bounds.maxY - bounds.minY;
+    // Fractions are top-left based; world Y is up.
+    bounds = {
+      minX: bounds.minX + fx0 * fullWidth,
+      maxX: bounds.minX + fx1 * fullWidth,
+      minY: bounds.maxY - fy1 * fullHeight,
+      maxY: bounds.maxY - fy0 * fullHeight
+    };
+  }
   const worldWidth = bounds.maxX - bounds.minX;
   const worldHeight = bounds.maxY - bounds.minY;
   const scale = IMAGE_MAX_SIZE / Math.max(worldWidth, worldHeight);
@@ -209,6 +426,17 @@ async function renderResultPng(scene, result, imagePath) {
       const y = (item.minY + item.maxY) / 2;
       const failed = failedPositions.has(`${x.toFixed(2)},${y.toFixed(2)}`);
       drawDot(rgba, width, height, toX(x), toY(y), 2.2, failed ? [255, 140, 0, 255] : [0, 150, 0, 255]);
+    }
+  }
+
+  // Ground-truth polygons as black outlines.
+  if (groundTruth) {
+    for (const room of groundTruth.rooms) {
+      const polygon = room.polygon;
+      for (let i = 0; i + 1 < polygon.length; i += 2) {
+        const j = (i + 2) % polygon.length;
+        drawLine(rgba, width, height, toX(polygon[i]), toY(polygon[i + 1]), toX(polygon[j]), toY(polygon[j + 1]), 0.8, [0, 0, 0, 230]);
+      }
     }
   }
 

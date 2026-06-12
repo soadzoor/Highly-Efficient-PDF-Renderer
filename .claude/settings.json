@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc)",
+      "Bash(npx tsc *)",
+      "Bash(node scripts/room-detect-debug.mjs *)",
+      "Search(*)",
+      "Search(pattern:*)",
+      "Search(pattern:*, include:*)",
+      "Read(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(sed:*)",
+      "Bash(npm:*)"
+    ]
+  }
+}
