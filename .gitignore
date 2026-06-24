@@ -15,3 +15,5 @@ package-lock.json
 *tsconfig.tsbuildinfo
 **/dist/**/*
 .codex
+/data/*
+/ml/*
