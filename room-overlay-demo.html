@@ -35,10 +35,57 @@
         cursor: grabbing;
       }
 
+      #room-label-layer {
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        overflow: hidden;
+      }
+
+      .room-label-pill {
+        position: fixed;
+        left: 0;
+        top: 0;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        max-width: min(170px, 28vw);
+        padding: 3px 7px 4px;
+        border: 1px solid var(--room-label-color, #f59e0b);
+        border-radius: 4px;
+        background: rgba(8, 13, 20, 0.86);
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.22);
+        color: rgba(255, 255, 255, 0.97);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        font-size: 11px;
+        font-weight: 700;
+        line-height: 1.1;
+        text-align: center;
+        white-space: nowrap;
+        transform: translate3d(-9999px, -9999px, 0);
+        user-select: none;
+        will-change: transform;
+      }
+
+      .room-label-pill span {
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .room-label-pill span + span {
+        margin-top: 1px;
+        font-size: 10px;
+        font-weight: 650;
+        opacity: 0.92;
+      }
+
       #panel {
         position: fixed;
         top: 16px;
         left: 16px;
+        z-index: 2;
         width: min(520px, calc(100vw - 32px));
         max-height: calc(100vh - 32px);
         overflow-y: auto;
@@ -77,7 +124,8 @@
       }
 
       button:disabled,
-      select:disabled {
+      select:disabled,
+      input:disabled {
         opacity: 0.55;
         cursor: default;
       }
@@ -94,6 +142,28 @@
         color: #1f2937;
         font-size: 0.88rem;
         line-height: 1.35;
+      }
+
+      .toggles {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 10px;
+      }
+
+      .toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: #1f2937;
+        font-size: 0.86rem;
+        user-select: none;
+      }
+
+      .toggle input {
+        width: 15px;
+        height: 15px;
+        margin: 0;
       }
 
       .metrics {
@@ -130,11 +200,20 @@
   </head>
   <body>
     <canvas id="viewport"></canvas>
+    <div id="room-label-layer" aria-hidden="true"></div>
     <div id="panel">
       <div class="toolbar">
         <button id="load-files" type="button">Load PDF + TSV</button>
+        <button id="detect-rooms" type="button" disabled>Detect Rooms</button>
+        <button id="download-generated-tsv" type="button" disabled>Download Generated TSV</button>
         <button id="clear-tsv" type="button" disabled>Clear TSV</button>
         <input id="file-input" type="file" accept=".pdf,.tsv,application/pdf,text/tab-separated-values,text/plain" multiple hidden />
+      </div>
+      <div class="toggles">
+        <label class="toggle">
+          <input id="show-room-labels" type="checkbox" checked disabled />
+          <span>Show labels</span>
+        </label>
       </div>
       <div id="status" class="status">Load a PDF to begin.</div>
       <div class="metrics">

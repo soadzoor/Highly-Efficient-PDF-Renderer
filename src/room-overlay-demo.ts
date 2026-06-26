@@ -5,6 +5,8 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
+import { runRoomDetectionOnPdf } from "./roomDetectionModel";
+import type { RoomDetection, RoomDetectionResult } from "./roomDetectionTypes";
 
 const CAMERA_FIT_PADDING_PIXELS = 64;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
@@ -31,6 +33,8 @@ interface RoomPoint {
 
 interface RoomPolygon {
   id: string;
+  roomType: string;
+  roomNumber: string;
   points: RoomPoint[];
 }
 
@@ -46,15 +50,28 @@ interface RoomOverlay {
   fillMaterial: THREE.MeshBasicMaterial | null;
   lineGeometry: THREE.BufferGeometry | null;
   lineMaterial: THREE.LineBasicMaterial | null;
+  labelElements: RoomLabelElement[];
   roomCount: number;
+  labelCount: number;
   skippedRows: number;
   triangleCount: number;
   edgeCount: number;
   fileName: string;
 }
 
+interface RoomLabelElement {
+  element: HTMLDivElement;
+  anchor: THREE.Vector3;
+}
+
 interface PdfCoordinateTransform {
   matrix: Mat2D;
+}
+
+interface GeneratedRoomTsv {
+  fileName: string;
+  text: string;
+  rowCount: number;
 }
 
 interface ClassifiedRoomDemoFiles {
@@ -69,8 +86,12 @@ if (!GlobalWorkerOptions.workerSrc) {
 
 const canvas = requireElement<HTMLCanvasElement>("#viewport");
 const loadFilesButton = requireElement<HTMLButtonElement>("#load-files");
+const detectRoomsButton = requireElement<HTMLButtonElement>("#detect-rooms");
+const downloadGeneratedTsvButton = requireElement<HTMLButtonElement>("#download-generated-tsv");
 const clearTsvButton = requireElement<HTMLButtonElement>("#clear-tsv");
+const showRoomLabelsCheckbox = requireElement<HTMLInputElement>("#show-room-labels");
 const fileInput = requireElement<HTMLInputElement>("#file-input");
+const roomLabelLayer = requireElement<HTMLDivElement>("#room-label-layer");
 const statusElement = requireElement<HTMLDivElement>("#status");
 const pdfValue = requireElement<HTMLSpanElement>("#pdf-value");
 const tsvValue = requireElement<HTMLSpanElement>("#tsv-value");
@@ -111,13 +132,17 @@ const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
 const tempViewDirection = new THREE.Vector3();
 const tempClipDelta = new THREE.Vector3();
+const tempRoomLabelWorldPosition = new THREE.Vector3();
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 let currentPdfObject: HeprThreePdfObject | null = null;
+let currentPdfFile: File | null = null;
 let currentRoomOverlay: RoomOverlay | null = null;
 let currentParsedTsv: ParsedRoomTsv | null = null;
+let currentGeneratedTsv: GeneratedRoomTsv | null = null;
 let currentPdfCoordinateTransform: PdfCoordinateTransform = createIdentityPdfCoordinateTransform();
 let loadToken = 0;
+let roomDetectionToken = 0;
 let animationFrameId = 0;
 let needsRender = false;
 let isDisposed = false;
@@ -134,6 +159,19 @@ loadFilesButton.addEventListener("click", () => {
 clearTsvButton.addEventListener("click", () => {
   clearRoomOverlay();
   setStatus(currentPdfObject ? "TSV overlay cleared." : "Load a PDF to begin.");
+});
+
+detectRoomsButton.addEventListener("click", () => {
+  void detectRoomsForCurrentPdf();
+});
+
+downloadGeneratedTsvButton.addEventListener("click", () => {
+  downloadGeneratedTsv();
+});
+
+showRoomLabelsCheckbox.addEventListener("change", () => {
+  updateRoomLabelVisibility();
+  requestRender();
 });
 
 fileInput.addEventListener("change", () => {
@@ -308,6 +346,8 @@ async function loadPdf(file: File): Promise<boolean> {
     }
 
     currentPdfObject = pdfObject;
+    currentPdfFile = file;
+    currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
     scene.add(pdfObject);
     pdfValue.textContent = pdfObject.sourceLabel;
@@ -341,6 +381,7 @@ async function loadTsv(file: File): Promise<boolean> {
 
   try {
     const text = await file.text();
+    currentGeneratedTsv = null;
     currentParsedTsv = parseRoomTsv(text, file.name);
     rebuildCurrentRoomOverlay();
     setStatus(formatOverlayStatus(currentRoomOverlay));
@@ -354,6 +395,147 @@ async function loadTsv(file: File): Promise<boolean> {
     syncControlsEnabled();
     requestRender();
   }
+}
+
+async function detectRoomsForCurrentPdf(): Promise<void> {
+  if (isBusy) {
+    setStatus("A file load or detection is already in progress.");
+    return;
+  }
+
+  const pdfObject = currentPdfObject;
+  const pdfFile = currentPdfFile;
+  if (!pdfObject || !pdfFile) {
+    setStatus("Load a PDF before running room detection.");
+    return;
+  }
+
+  const activeToken = ++roomDetectionToken;
+  setBusy(true);
+  setStatus("Preparing room detection...");
+
+  try {
+    const pdfBytes = new Uint8Array(await pdfFile.arrayBuffer());
+    if (activeToken !== roomDetectionToken) {
+      return;
+    }
+
+    const { manifest, result } = await runRoomDetectionOnPdf({
+      sourceLabel: pdfObject.sourceLabel,
+      pdfBytes,
+      scene: pdfObject.sceneData,
+      maxPages: 1,
+      onProgress: (progress) => {
+        if (activeToken !== roomDetectionToken) {
+          return;
+        }
+        if (progress.stage === "loading-model") {
+          setStatus("Loading room detector model...");
+          return;
+        }
+        if (progress.stage === "complete") {
+          setStatus("Generating TSV from room detections...");
+          return;
+        }
+        setStatus(
+          `Room detection ${progress.stage.replace(/-/g, " ")}: page ${progress.pageIndex + 1}/${Math.max(1, progress.pageCount)}`
+        );
+      }
+    });
+    if (activeToken !== roomDetectionToken) {
+      return;
+    }
+
+    const generated = createGeneratedRoomTsv(result, currentPdfCoordinateTransform, pdfObject.sourceLabel);
+    if (generated.rowCount <= 0) {
+      clearRoomOverlay();
+      setStatus(`Room detector ${manifest.version} did not return any first-page room polygons.`);
+      return;
+    }
+
+    const parsedTsv = parseRoomTsv(generated.text, generated.fileName);
+    disposeRoomOverlay();
+    currentGeneratedTsv = generated;
+    currentParsedTsv = parsedTsv;
+    rebuildCurrentRoomOverlay();
+    setStatus(
+      `Detected ${generated.rowCount.toLocaleString()} room${generated.rowCount === 1 ? "" : "s"} with ${manifest.version}; generated ${generated.fileName}.`
+    );
+  } catch (error) {
+    if (activeToken !== roomDetectionToken) {
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Room detection failed: ${message}`);
+  } finally {
+    if (activeToken === roomDetectionToken) {
+      setBusy(false);
+      syncControlsEnabled();
+      requestRender();
+    }
+  }
+}
+
+function createGeneratedRoomTsv(
+  result: RoomDetectionResult,
+  pdfCoordinateTransform: PdfCoordinateTransform,
+  sourceLabel: string
+): GeneratedRoomTsv {
+  const inverseMatrix = invertMatrix(pdfCoordinateTransform.matrix);
+  if (!inverseMatrix) {
+    throw new Error("Unable to invert the PDF coordinate transform for TSV generation.");
+  }
+
+  const rows = ["boundaryID\tboundaryType\troomType\troomNumber\tgeometryData"];
+  let rowCount = 0;
+  for (const detection of result.detections) {
+    if (detection.pageIndex !== 0) {
+      continue;
+    }
+    const geometryData = roomDetectionPolygonToGeometryData(detection, inverseMatrix);
+    if (!geometryData) {
+      continue;
+    }
+    rowCount += 1;
+    rows.push([
+      formatTsvCell(`det-${String(rowCount).padStart(4, "0")}`),
+      "Room",
+      formatTsvCell(String(detection.label)),
+      formatTsvCell(detection.roomNumber ?? ""),
+      formatTsvCell(geometryData)
+    ].join("\t"));
+  }
+
+  return {
+    fileName: `${sanitizeDownloadName(sourceLabel.replace(/\.pdf$/i, ""))}-detected-rooms.tsv`,
+    text: `${rows.join("\n")}\n`,
+    rowCount
+  };
+}
+
+function roomDetectionPolygonToGeometryData(detection: RoomDetection, inverseMatrix: Mat2D): string | null {
+  if (detection.polygon.length < 3) {
+    return null;
+  }
+  const points = detection.polygon
+    .map(([x, y]) => applyMatrix(inverseMatrix, x, y))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+    .map((point) => ({
+      x: roundTsvCoordinate(point.x),
+      y: roundTsvCoordinate(point.y)
+    }));
+  return points.length >= 3 ? JSON.stringify(points) : null;
+}
+
+function downloadGeneratedTsv(): void {
+  if (!currentGeneratedTsv) {
+    setStatus("No generated TSV is available to download.");
+    return;
+  }
+  const blob = new Blob([currentGeneratedTsv.text], {
+    type: "text/tab-separated-values;charset=utf-8"
+  });
+  triggerBrowserDownload(blob, currentGeneratedTsv.fileName);
 }
 
 function rebuildCurrentRoomOverlay(): void {
@@ -386,6 +568,8 @@ function parseRoomTsv(text: string, fileName: string): ParsedRoomTsv {
   }
 
   const boundaryIdIndex = findHeaderIndex(headers, "boundaryID");
+  const roomTypeIndex = findHeaderIndex(headers, "roomType");
+  const roomNumberIndex = findHeaderIndex(headers, "roomNumber");
   const rooms: RoomPolygon[] = [];
   let skippedRows = 0;
 
@@ -401,6 +585,8 @@ function parseRoomTsv(text: string, fileName: string): ParsedRoomTsv {
     const boundaryId = boundaryIdIndex >= 0 ? cells[boundaryIdIndex]?.trim() : "";
     rooms.push({
       id: boundaryId || `row-${rowIndex + 1}`,
+      roomType: roomTypeIndex >= 0 ? normalizeTsvCell(cells[roomTypeIndex] ?? "") : "",
+      roomNumber: roomNumberIndex >= 0 ? normalizeTsvCell(cells[roomNumberIndex] ?? "") : "",
       points
     });
   }
@@ -469,8 +655,10 @@ function createRoomOverlay(
   const fillColors: number[] = [];
   const linePositions: number[] = [];
   const lineColors: number[] = [];
+  const labelElements: RoomLabelElement[] = [];
   let triangleCount = 0;
   let edgeCount = 0;
+  let labelCount = 0;
 
   for (let roomIndex = 0; roomIndex < parsedTsv.rooms.length; roomIndex += 1) {
     const room = parsedTsv.rooms[roomIndex];
@@ -505,6 +693,14 @@ function createRoomOverlay(
       linePositions.push(start.x, start.y, OVERLAY_Z, end.x, end.y, OVERLAY_Z);
       lineColors.push(lineColor.r, lineColor.g, lineColor.b, lineColor.r, lineColor.g, lineColor.b);
       edgeCount += 1;
+    }
+
+    const labelLines = formatRoomLabelLines(room);
+    if (labelLines.length > 0 && localPoints.length >= 3) {
+      const labelElement = createRoomLabelElement(labelLines, lineColor, localPoints);
+      labelElements.push(labelElement);
+      roomLabelLayer.append(labelElement.element);
+      labelCount += 1;
     }
   }
 
@@ -558,7 +754,9 @@ function createRoomOverlay(
     fillMaterial,
     lineGeometry,
     lineMaterial,
+    labelElements,
     roomCount: parsedTsv.rooms.length,
+    labelCount,
     skippedRows: parsedTsv.skippedRows,
     triangleCount,
     edgeCount,
@@ -574,6 +772,74 @@ function toLocalPoint(
 ): THREE.Vector2 {
   const transformed = applyMatrix(pdfCoordinateMatrix, point.x, point.y);
   return new THREE.Vector2(transformed.x - centerX, transformed.y - centerY);
+}
+
+function formatRoomLabelLines(room: RoomPolygon): string[] {
+  const roomNumber = room.roomNumber.trim();
+  const roomType = room.roomType.trim();
+  if (roomNumber && roomType) {
+    return [roomNumber, roomType];
+  }
+  if (roomNumber) {
+    return [roomNumber];
+  }
+  if (roomType) {
+    return [roomType];
+  }
+  return [];
+}
+
+function createRoomLabelElement(
+  lines: string[],
+  color: THREE.Color,
+  localPoints: THREE.Vector2[]
+): RoomLabelElement {
+  const centroid = computeLocalPolygonCentroid(localPoints);
+  const element = document.createElement("div");
+  element.className = "room-label-pill";
+  element.style.setProperty("--room-label-color", `#${color.getHexString(THREE.SRGBColorSpace)}`);
+  for (const line of lines) {
+    const span = document.createElement("span");
+    span.textContent = line;
+    element.append(span);
+  }
+  return {
+    element,
+    anchor: new THREE.Vector3(centroid.x, centroid.y, OVERLAY_Z)
+  };
+}
+
+function computeLocalPointBounds(points: THREE.Vector2[]): { minX: number; minY: number; maxX: number; maxY: number } {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function computeLocalPolygonCentroid(points: THREE.Vector2[]): THREE.Vector2 {
+  let twiceArea = 0;
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const current = points[i];
+    const next = points[(i + 1) % points.length];
+    const cross = current.x * next.y - next.x * current.y;
+    twiceArea += cross;
+    x += (current.x + next.x) * cross;
+    y += (current.y + next.y) * cross;
+  }
+  if (Math.abs(twiceArea) <= 1e-9) {
+    const bounds = computeLocalPointBounds(points);
+    return new THREE.Vector2((bounds.minX + bounds.maxX) * 0.5, (bounds.minY + bounds.maxY) * 0.5);
+  }
+  return new THREE.Vector2(x / (3 * twiceArea), y / (3 * twiceArea));
 }
 
 async function readFirstPageCoordinateTransform(file: File): Promise<PdfCoordinateTransform> {
@@ -658,6 +924,26 @@ function applyMatrix(matrix: Mat2D, x: number, y: number): RoomPoint {
   };
 }
 
+function invertMatrix(matrix: Mat2D): Mat2D | null {
+  const determinant = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+  if (!Number.isFinite(determinant) || Math.abs(determinant) <= 1e-12) {
+    return null;
+  }
+  const invDet = 1 / determinant;
+  const a = matrix[3] * invDet;
+  const b = -matrix[1] * invDet;
+  const c = -matrix[2] * invDet;
+  const d = matrix[0] * invDet;
+  return [
+    a,
+    b,
+    c,
+    d,
+    -(a * matrix[4] + c * matrix[5]),
+    -(b * matrix[4] + d * matrix[5])
+  ];
+}
+
 function createIdentityPdfCoordinateTransform(): PdfCoordinateTransform {
   return {
     matrix: createIdentityMatrix()
@@ -683,6 +969,38 @@ function hashString(value: string): number {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
+}
+
+function roundTsvCoordinate(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function formatTsvCell(value: string): string {
+  if (!/[\t\r\n"]/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, "\"\"")}"`;
+}
+
+function sanitizeDownloadName(value: string): string {
+  const cleaned = value
+    .trim()
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[^a-z0-9._-]+/gi, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "rooms";
+}
+
+function triggerBrowserDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }
 
 function resolveSceneFitBounds(sceneData: HeprThreePdfObject["sceneData"]): Bounds {
@@ -739,6 +1057,8 @@ function isFiniteBounds(bounds: Bounds): boolean {
 function clearCurrentPdfObject(): void {
   clearRoomOverlay({ silent: true });
   currentParsedTsv = null;
+  currentGeneratedTsv = null;
+  currentPdfFile = null;
   currentPdfCoordinateTransform = createIdentityPdfCoordinateTransform();
   if (!currentPdfObject) {
     pdfValue.textContent = "-";
@@ -756,6 +1076,7 @@ function clearCurrentPdfObject(): void {
 function clearRoomOverlay(options: { silent?: boolean } = {}): void {
   disposeRoomOverlay();
   currentParsedTsv = null;
+  currentGeneratedTsv = null;
   updateRoomMetrics();
   syncControlsEnabled();
   if (!options.silent) {
@@ -773,6 +1094,9 @@ function disposeRoomOverlay(): void {
   currentRoomOverlay.fillMaterial?.dispose();
   currentRoomOverlay.lineGeometry?.dispose();
   currentRoomOverlay.lineMaterial?.dispose();
+  for (const label of currentRoomOverlay.labelElements) {
+    label.element.remove();
+  }
   currentRoomOverlay = null;
 }
 
@@ -790,7 +1114,8 @@ function updateRoomMetrics(): void {
   roomsValue.textContent =
     `${currentRoomOverlay.roomCount.toLocaleString()} rooms, ` +
     `${currentRoomOverlay.triangleCount.toLocaleString()} triangles, ` +
-    `${currentRoomOverlay.edgeCount.toLocaleString()} edges${skippedSuffix}`;
+    `${currentRoomOverlay.edgeCount.toLocaleString()} edges, ` +
+    `${currentRoomOverlay.labelCount.toLocaleString()} labels${skippedSuffix}`;
 }
 
 function updatePdfLoadProgress(activeToken: number, fileName: string, progress: PDFLoadProgress): void {
@@ -868,6 +1193,7 @@ function renderFrame(): void {
   updateCameraClipping();
   renderer.clear(true, true, true);
   renderer.render(scene, camera);
+  updateRoomDomLabels();
   if (controlsChanged) {
     requestRender();
   }
@@ -889,6 +1215,7 @@ function resizeRenderer(): void {
   camera.aspect = resolveCanvasAspect();
   camera.updateProjectionMatrix();
   updateCameraClipping(true);
+  updateRoomDomLabels();
 }
 
 function resolveCanvasAspect(): number {
@@ -906,12 +1233,74 @@ function resolveRendererViewportPixels(): { width: number; height: number } {
 function setBusy(busy: boolean): void {
   isBusy = busy;
   loadFilesButton.disabled = busy;
+  detectRoomsButton.disabled = busy || !currentPdfObject || !currentPdfFile;
+  detectRoomsButton.textContent = busy ? "Working..." : "Detect Rooms";
+  downloadGeneratedTsvButton.disabled = busy || !currentGeneratedTsv;
+  showRoomLabelsCheckbox.disabled = busy || !currentRoomOverlay;
   clearTsvButton.disabled = busy || !currentRoomOverlay;
 }
 
 function syncControlsEnabled(): void {
-  loadFilesButton.disabled = false;
-  clearTsvButton.disabled = !currentRoomOverlay;
+  loadFilesButton.disabled = isBusy;
+  detectRoomsButton.disabled = isBusy || !currentPdfObject || !currentPdfFile;
+  detectRoomsButton.textContent = isBusy ? "Working..." : "Detect Rooms";
+  downloadGeneratedTsvButton.disabled = isBusy || !currentGeneratedTsv;
+  showRoomLabelsCheckbox.disabled = isBusy || !currentRoomOverlay;
+  updateRoomLabelVisibility();
+  clearTsvButton.disabled = isBusy || !currentRoomOverlay;
+}
+
+function updateRoomLabelVisibility(): void {
+  if (currentRoomOverlay) {
+    updateRoomDomLabels();
+  }
+}
+
+function updateRoomDomLabels(): void {
+  const overlay = currentRoomOverlay;
+  const pdfObject = currentPdfObject;
+  const labelsVisible = Boolean(overlay && pdfObject && showRoomLabelsCheckbox.checked);
+  if (!overlay || !pdfObject) {
+    return;
+  }
+
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+  pdfObject.updateMatrixWorld(true);
+
+  for (const label of overlay.labelElements) {
+    if (!labelsVisible) {
+      label.element.style.display = "none";
+      continue;
+    }
+
+    tempRoomLabelWorldPosition.copy(label.anchor);
+    pdfObject.localToWorld(tempRoomLabelWorldPosition);
+    tempRoomLabelWorldPosition.project(camera);
+    const ndcX = tempRoomLabelWorldPosition.x;
+    const ndcY = tempRoomLabelWorldPosition.y;
+    const ndcZ = tempRoomLabelWorldPosition.z;
+    if (
+      !Number.isFinite(ndcX) ||
+      !Number.isFinite(ndcY) ||
+      !Number.isFinite(ndcZ) ||
+      ndcZ < -1 ||
+      ndcZ > 1 ||
+      ndcX < -1.15 ||
+      ndcX > 1.15 ||
+      ndcY < -1.15 ||
+      ndcY > 1.15
+    ) {
+      label.element.style.display = "none";
+      continue;
+    }
+
+    const screenX = rect.left + (ndcX * 0.5 + 0.5) * width;
+    const screenY = rect.top + (-ndcY * 0.5 + 0.5) * height;
+    label.element.style.display = "";
+    label.element.style.transform = `translate3d(${screenX}px, ${screenY}px, 0) translate(-50%, -50%)`;
+  }
 }
 
 function setStatus(text: string): void {

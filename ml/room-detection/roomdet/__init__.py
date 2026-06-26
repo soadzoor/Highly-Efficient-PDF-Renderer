@@ -1,0 +1,2 @@
+"""Room detection training helpers."""
+

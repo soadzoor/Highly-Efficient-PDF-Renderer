@@ -531,6 +531,7 @@ async function extractSinglePageVectors(
 
   const stateStack: GraphicsState[] = [];
   const formStateStack: GraphicsState[] = [];
+  const annotationStateStack: GraphicsState[] = [];
   const groupAlphaStack: Array<Pick<
     GraphicsState,
     "groupFillAlpha" | "groupStrokeAlpha" | "groupFillAlphaVersion" | "groupStrokeAlphaVersion"
@@ -579,6 +580,27 @@ async function extractSinglePageVectors(
 
     if (fn === OPS.paintFormXObjectEnd) {
       const restored = formStateStack.pop();
+      if (restored) {
+        currentState = restored;
+      }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
+    if (fn === OPS.beginAnnotation) {
+      annotationStateStack.push(cloneState(currentState));
+      const annotationTransform = readAnnotationTransform(args);
+      if (annotationTransform) {
+        currentState.matrix = multiplyMatrices(currentState.matrix, annotationTransform);
+      }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
+    if (fn === OPS.endAnnotation) {
+      const restored = annotationStateStack.pop();
       if (restored) {
         currentState = restored;
       }
@@ -1994,6 +2016,33 @@ function readTransform(args: unknown): Mat2D | null {
   return [a, b, c, d, e, f];
 }
 
+function readAnnotationTransform(args: unknown): Mat2D | null {
+  const annotationPlacement = readTransformFromValue(readArg(args, 2));
+  const annotationMatrix = readTransformFromValue(readArg(args, 3));
+  if (annotationPlacement && annotationMatrix) {
+    return multiplyMatrices(annotationPlacement, annotationMatrix);
+  }
+  return annotationPlacement ?? annotationMatrix;
+}
+
+function readTransformFromValue(value: unknown): Mat2D | null {
+  const matrixArgs = asNumberArrayLike(value);
+  if (!matrixArgs || matrixArgs.length < 6) {
+    return null;
+  }
+
+  const a = Number(matrixArgs[0]);
+  const b = Number(matrixArgs[1]);
+  const c = Number(matrixArgs[2]);
+  const d = Number(matrixArgs[3]);
+  const e = Number(matrixArgs[4]);
+  const f = Number(matrixArgs[5]);
+  if (![a, b, c, d, e, f].every(Number.isFinite)) {
+    return null;
+  }
+  return [a, b, c, d, e, f];
+}
+
 function asNumberArrayLike(value: unknown): ArrayLike<unknown> | null {
   if (Array.isArray(value)) {
     return value;
@@ -3377,6 +3426,8 @@ async function extractTextVectorData(
   const formStateStack: TextState[] = [];
   const clipBoundsStack: Array<Bounds | null> = [];
   const formClipBoundsStack: Array<Bounds | null> = [];
+  const annotationStateStack: TextState[] = [];
+  const annotationClipBoundsStack: Array<Bounds | null> = [];
   const groupAlphaStack: Array<Pick<TextState, "groupFillAlpha" | "groupFillAlphaVersion">> = [];
   let state = createDefaultTextState(pageMatrix);
   let clipBounds: Bounds | null = null;
@@ -3550,6 +3601,29 @@ async function extractTextVectorData(
         state = restoredState;
       }
       clipBounds = formClipBoundsStack.pop() ?? clipBounds;
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
+    if (fn === OPS.beginAnnotation) {
+      annotationStateStack.push(cloneTextState(state));
+      annotationClipBoundsStack.push(cloneBoundsOrNull(clipBounds));
+      const annotationTransform = readAnnotationTransform(args);
+      if (annotationTransform) {
+        state.matrix = multiplyMatrices(state.matrix, annotationTransform);
+      }
+      pendingClipPathBounds = null;
+      pendingClipOperator = false;
+      continue;
+    }
+
+    if (fn === OPS.endAnnotation) {
+      const restoredState = annotationStateStack.pop();
+      if (restoredState) {
+        state = restoredState;
+      }
+      clipBounds = annotationClipBoundsStack.pop() ?? clipBounds;
       pendingClipPathBounds = null;
       pendingClipOperator = false;
       continue;
@@ -4072,6 +4146,8 @@ function isImageRasterStateOperator(fn: number, args: unknown): boolean {
     fn === OPS.endGroup ||
     fn === OPS.beginCompat ||
     fn === OPS.endCompat ||
+    fn === OPS.beginAnnotation ||
+    fn === OPS.endAnnotation ||
     fn === OPS.beginMarkedContent ||
     fn === OPS.beginMarkedContentProps ||
     fn === OPS.endMarkedContent ||
@@ -4169,6 +4245,23 @@ function estimateRasterNativeScaleHint(operatorList: { fnArray: number[]; argsAr
       const transform = readTransform(args);
       if (transform) {
         currentMatrix = multiplyMatrices(currentMatrix, transform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.beginAnnotation) {
+      matrixStack.push([...currentMatrix]);
+      const annotationTransform = readAnnotationTransform(args);
+      if (annotationTransform) {
+        currentMatrix = multiplyMatrices(currentMatrix, annotationTransform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.endAnnotation) {
+      const restored = matrixStack.pop();
+      if (restored) {
+        currentMatrix = restored;
       }
       continue;
     }
