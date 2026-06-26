@@ -27,7 +27,8 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         input: {
           main: resolve(__dirname, "index.html"),
-          three: resolve(__dirname, "three-example.html")
+          three: resolve(__dirname, "three-example.html"),
+          roomOverlay: resolve(__dirname, "room-overlay-demo.html")
         }
       }
     }

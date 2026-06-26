@@ -1,0 +1,159 @@
+{
+  "version": "pdf-tsv-roomtypes-sep3-v1",
+  "onnxPath": "models/room-detector/model.onnx",
+  "inputSize": {
+    "width": 1536,
+    "height": 1536
+  },
+  "classes": [
+    {
+      "id": 0,
+      "label": "background",
+      "color": "#0f172a",
+      "kind": "background"
+    },
+    {
+      "id": 1,
+      "label": "office",
+      "color": "#2563eb",
+      "kind": "room"
+    },
+    {
+      "id": 2,
+      "label": "toilet",
+      "color": "#0891b2",
+      "kind": "room"
+    },
+    {
+      "id": 3,
+      "label": "shower",
+      "color": "#06b6d4",
+      "kind": "room"
+    },
+    {
+      "id": 4,
+      "label": "patient_room",
+      "color": "#16a34a",
+      "kind": "room"
+    },
+    {
+      "id": 5,
+      "label": "exam_treatment",
+      "color": "#d97706",
+      "kind": "room"
+    },
+    {
+      "id": 6,
+      "label": "corridor",
+      "color": "#7c3aed",
+      "kind": "room"
+    },
+    {
+      "id": 7,
+      "label": "storage_supply",
+      "color": "#64748b",
+      "kind": "room"
+    },
+    {
+      "id": 8,
+      "label": "vertical_transport",
+      "color": "#dc2626",
+      "kind": "room"
+    },
+    {
+      "id": 9,
+      "label": "building_services",
+      "color": "#475569",
+      "kind": "room"
+    },
+    {
+      "id": 10,
+      "label": "public_waiting",
+      "color": "#65a30d",
+      "kind": "room"
+    },
+    {
+      "id": 11,
+      "label": "staff_support",
+      "color": "#c026d3",
+      "kind": "room"
+    },
+    {
+      "id": 12,
+      "label": "other",
+      "color": "#0f766e",
+      "kind": "room"
+    },
+    {
+      "id": 13,
+      "label": "separator",
+      "color": "#111827",
+      "kind": "separator"
+    }
+  ],
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "thresholds": {
+    "minConfidence": 0.45,
+    "minAreaPixels": 96,
+    "simplifyTolerancePixels": 2.5,
+    "maxDetectionsPerPage": 512,
+    "foregroundIouExperimentalThreshold": 0.6,
+    "separatorBarrierProbability": 0.12,
+    "separatorBarrierPixels": 2,
+    "contourExpansionPixels": 3,
+    "roomSplitErosionPixels": 1,
+    "doorArcStraightenMaxChordPixels": 0,
+    "doorArcStraightenMaxDepthPixels": 0,
+    "doorArcStraightenMinDepthPixels": 0,
+    "orthogonalizePolygons": true,
+    "orthogonalSnapAngleDegrees": 12,
+    "orthogonalMinEdgePixels": 8,
+    "notchRemovalMaxDepthPixels": 18,
+    "notchRemovalMaxWidthPixels": 80,
+    "polygonCleanupMaxPasses": 2
+  },
+  "license": "Model trained from local PDF-TSV roomType geometry annotations.",
+  "metrics": {
+    "status": "evaluated",
+    "pdfTsvForegroundIou": 0.9840094277337916,
+    "pdfTsvRoomInteriorIou": 0.9738147956841159,
+    "pdfTsvSeparatorIou": 0.8285524133367856,
+    "pdfTsvMeanRoomClassIou": 0.959335750856208,
+    "pdfTsvPerClassIou": {
+      "background": 0.9951155979979274,
+      "office": 0.9675864557740642,
+      "toilet": 0.9246070325363497,
+      "shower": 0.9330342984006162,
+      "patient_room": 0.9717176933334917,
+      "exam_treatment": 0.9695547853298446,
+      "corridor": 0.9659740213701276,
+      "storage_supply": 0.93904954816248,
+      "vertical_transport": 0.9732712532284226,
+      "building_services": 0.9677384007612676,
+      "public_waiting": 0.9685733886135366,
+      "staff_support": 0.9525883175679242,
+      "other": 0.9783338151963704,
+      "separator": 0.8285524133367856
+    },
+    "pdfTsvValidationSamples": 60,
+    "pdfTsvLoss": 0.08299443994959195,
+    "pdfTsvMatchedRoomMeanIou": 0.8906992377599459,
+    "pdfTsvMatchedRoomRecallAt50": 0.9309870457411441,
+    "pdfTsvMatchedRoomTypeAccuracyAt50": 0.9820219184829454,
+    "pdfTsvMatchedRoomTargets": 8723,
+    "pdfTsvSplit": "train",
+    "pdfTsvTargetMode": "class",
+    "trainingSources": [
+      "pdf-tsv roomType geometry"
+    ]
+  }
+}
