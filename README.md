@@ -272,6 +272,8 @@ Run dev server:
 npm run dev
 ```
 
+The room overlay demo is available at `/room-overlay-demo.html`. After running room detection, use **Download Detection Debug** to save the browser-side room probability, separator probability, predicted mask, and detection metadata as a zip.
+
 Build app:
 
 ```bash
