@@ -24,6 +24,7 @@ type RgbColor = [number, number, number];
 interface GraphicsState {
   matrix: Mat2D;
   clipBounds: Bounds | null;
+  clipMask: ClipMask | null;
   groupFillAlpha: number;
   groupStrokeAlpha: number;
   groupFillAlphaVersion: number;
@@ -47,6 +48,11 @@ export interface Bounds {
   minY: number;
   maxX: number;
   maxY: number;
+}
+
+interface ClipMask {
+  bounds: Bounds;
+  exclusionBounds: Bounds[];
 }
 
 export interface RasterLayer {
@@ -538,7 +544,9 @@ async function extractSinglePageVectors(
   >> = [];
   let currentState: GraphicsState = createDefaultState(pageMatrix, pageBounds);
   let pendingClipPathBounds: Bounds | null = null;
+  let pendingClipPathMask: ClipMask | null = null;
   let pendingClipOperator = false;
+  let pendingClipRule = FILL_RULE_NONZERO;
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
@@ -705,11 +713,14 @@ async function extractSinglePageVectors(
     }
 
     if (fn === OPS.clip || fn === OPS.eoClip) {
+      const clipRule = fn === OPS.eoClip ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
       if (pendingClipPathBounds) {
-        currentState.clipBounds = intersectBounds(currentState.clipBounds, pendingClipPathBounds);
+        applyClipToState(currentState, pendingClipPathBounds, pendingClipPathMask, clipRule);
         pendingClipPathBounds = null;
+        pendingClipPathMask = null;
       } else {
         pendingClipOperator = true;
+        pendingClipRule = clipRule;
       }
       continue;
     }
@@ -736,15 +747,23 @@ async function extractSinglePageVectors(
       pendingClipOperator || paintOp === OPS.endPath || currentState.clipBounds
         ? computeTransformedPathBounds(pathData, currentState.matrix)
         : null;
+    const transformedClipMask =
+      pendingClipOperator || paintOp === OPS.endPath
+        ? extractSimpleEvenOddRectangleClipMask(pathData, currentState.matrix)
+        : null;
 
     if (pendingClipOperator) {
-      currentState.clipBounds = intersectBounds(currentState.clipBounds, transformedPathBounds);
+      applyClipToState(currentState, transformedPathBounds, transformedClipMask, pendingClipRule);
       pendingClipOperator = false;
+      pendingClipRule = FILL_RULE_NONZERO;
       pendingClipPathBounds = null;
+      pendingClipPathMask = null;
     } else if (paintOp === OPS.endPath) {
       pendingClipPathBounds = transformedPathBounds;
+      pendingClipPathMask = transformedClipMask;
     } else {
       pendingClipPathBounds = null;
+      pendingClipPathMask = null;
     }
 
     const strokePaint = isStrokePaintOp(paintOp);
@@ -817,6 +836,7 @@ async function extractSinglePageVectors(
           fillSegmentBuilderB,
           fillBounds,
           currentState.clipBounds,
+          currentState.clipMask,
           pageBounds
         );
         fillPathCount += emittedFillPathCount;
@@ -1749,6 +1769,7 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX, initialClipB
   return {
     matrix: [...initialMatrix],
     clipBounds: cloneBoundsOrNull(initialClipBounds),
+    clipMask: null,
     groupFillAlpha: 1,
     groupStrokeAlpha: 1,
     groupFillAlphaVersion: -1,
@@ -1876,6 +1897,7 @@ function cloneState(state: GraphicsState): GraphicsState {
   return {
     matrix: [...state.matrix],
     clipBounds: cloneBoundsOrNull(state.clipBounds),
+    clipMask: cloneClipMaskOrNull(state.clipMask),
     groupFillAlpha: state.groupFillAlpha,
     groupStrokeAlpha: state.groupStrokeAlpha,
     groupFillAlphaVersion: state.groupFillAlphaVersion,
@@ -2550,6 +2572,7 @@ function emitFilledPathFromPath(
   segmentsB: Float4Builder,
   bounds: Bounds,
   clipBounds: Bounds | null,
+  clipMask: ClipMask | null,
   pageBounds: Bounds,
   allowSubpathSplit = true
 ): number {
@@ -2575,6 +2598,7 @@ function emitFilledPathFromPath(
           segmentsB,
           bounds,
           splitClipBounds,
+          clipMask,
           pageBounds,
           false
         );
@@ -2745,6 +2769,32 @@ function emitFilledPathFromPath(
     return 0;
   }
 
+  const clipConstrainedPath = createClipConstrainedFillPath(pathData, matrix, localBounds, visibleBounds, clipMask);
+  if (clipConstrainedPath) {
+    segmentsA.truncateQuads(segmentStart);
+    segmentsB.truncateQuads(segmentStart);
+    return emitFilledPathFromPath(
+      clipConstrainedPath,
+      IDENTITY_MATRIX,
+      FILL_RULE_EVEN_ODD,
+      hasCompanionStroke,
+      colorR,
+      colorG,
+      colorB,
+      alpha,
+      metaA,
+      metaB,
+      metaC,
+      segmentsA,
+      segmentsB,
+      bounds,
+      null,
+      null,
+      pageBounds,
+      false
+    );
+  }
+
   if (isOpaqueWhiteBackgroundFill(visibleBounds, pageBounds, colorR, colorG, colorB, alpha)) {
     segmentsA.truncateQuads(segmentStart);
     segmentsB.truncateQuads(segmentStart);
@@ -2790,6 +2840,156 @@ function countPathMoveOps(pathData: Float32Array): number {
     break;
   }
   return moveCount;
+}
+
+function createClipConstrainedFillPath(
+  pathData: Float32Array,
+  matrix: Mat2D,
+  localBounds: Bounds,
+  visibleBounds: Bounds,
+  clipMask: ClipMask | null
+): Float32Array | null {
+  if (!clipMask || clipMask.exclusionBounds.length === 0) {
+    return null;
+  }
+  if (!boundsNearlyEqual(visibleBounds, clipMask.bounds)) {
+    return null;
+  }
+  if (!boundsContainBoundsWithTolerance(localBounds, clipMask.bounds)) {
+    return null;
+  }
+  if (!isAxisAlignedRectanglePath(pathData, matrix, localBounds)) {
+    return null;
+  }
+
+  const exclusionBounds = clipMask.exclusionBounds.filter((bounds) => {
+    return boundsContainBoundsWithTolerance(visibleBounds, bounds) && boundsArea(bounds) > 1e-6;
+  });
+  if (exclusionBounds.length === 0) {
+    return null;
+  }
+
+  return createEvenOddRectanglePath(visibleBounds, exclusionBounds);
+}
+
+function extractSimpleEvenOddRectangleClipMask(pathData: Float32Array, matrix: Mat2D): ClipMask | null {
+  const subpaths = collectFillSubpaths(pathData, matrix);
+  if (subpaths.length < 2) {
+    return null;
+  }
+
+  const rectangles: Bounds[] = [];
+  for (const subpath of subpaths) {
+    if (!isNonEmptyBounds(subpath.bounds) || !isAxisAlignedRectanglePath(subpath.data, matrix, subpath.bounds)) {
+      return null;
+    }
+    rectangles.push(subpath.bounds);
+  }
+
+  rectangles.sort((a, b) => boundsArea(b) - boundsArea(a));
+  const outerBounds = rectangles[0];
+  const exclusionBounds = rectangles.slice(1).filter((bounds) => {
+    return boundsArea(bounds) > 1e-6 && boundsContainBoundsWithTolerance(outerBounds, bounds);
+  });
+
+  if (exclusionBounds.length === 0) {
+    return null;
+  }
+
+  return {
+    bounds: { ...outerBounds },
+    exclusionBounds: exclusionBounds.map((bounds) => ({ ...bounds }))
+  };
+}
+
+function createEvenOddRectanglePath(outerBounds: Bounds, exclusionBounds: Bounds[]): Float32Array {
+  const commands: number[] = [];
+  appendRectanglePath(commands, outerBounds);
+  for (const bounds of exclusionBounds) {
+    appendRectanglePath(commands, bounds);
+  }
+  return new Float32Array(commands);
+}
+
+function appendRectanglePath(commands: number[], bounds: Bounds): void {
+  commands.push(
+    DRAW_MOVE_TO,
+    bounds.minX,
+    bounds.minY,
+    DRAW_LINE_TO,
+    bounds.maxX,
+    bounds.minY,
+    DRAW_LINE_TO,
+    bounds.maxX,
+    bounds.maxY,
+    DRAW_LINE_TO,
+    bounds.minX,
+    bounds.maxY,
+    DRAW_CLOSE
+  );
+}
+
+function isAxisAlignedRectanglePath(pathData: Float32Array, matrix: Mat2D, bounds: Bounds): boolean {
+  const width = Math.max(0, bounds.maxX - bounds.minX);
+  const height = Math.max(0, bounds.maxY - bounds.minY);
+  if (width <= 1e-6 || height <= 1e-6) {
+    return false;
+  }
+
+  const epsilon = Math.max(1e-3, Math.max(width, height) * 1e-4);
+  let cornerMask = 0;
+  let moveCount = 0;
+  let lineCount = 0;
+  let valid = true;
+
+  const recordPoint = (x: number, y: number): void => {
+    if (!valid) {
+      return;
+    }
+    const [tx, ty] = applyMatrix(matrix, x, y);
+    const nearMinX = Math.abs(tx - bounds.minX) <= epsilon;
+    const nearMaxX = Math.abs(tx - bounds.maxX) <= epsilon;
+    const nearMinY = Math.abs(ty - bounds.minY) <= epsilon;
+    const nearMaxY = Math.abs(ty - bounds.maxY) <= epsilon;
+
+    if (nearMinX && nearMinY) {
+      cornerMask |= 1;
+      return;
+    }
+    if (nearMaxX && nearMinY) {
+      cornerMask |= 2;
+      return;
+    }
+    if (nearMaxX && nearMaxY) {
+      cornerMask |= 4;
+      return;
+    }
+    if (nearMinX && nearMaxY) {
+      cornerMask |= 8;
+      return;
+    }
+    valid = false;
+  };
+
+  for (let i = 0; i < pathData.length; ) {
+    const op = pathData[i++];
+    if (op === DRAW_MOVE_TO) {
+      moveCount += 1;
+      recordPoint(pathData[i++], pathData[i++]);
+      continue;
+    }
+    if (op === DRAW_LINE_TO) {
+      lineCount += 1;
+      recordPoint(pathData[i++], pathData[i++]);
+      continue;
+    }
+    if (op === DRAW_CLOSE) {
+      continue;
+    }
+    return false;
+  }
+
+  return valid && moveCount === 1 && lineCount >= 3 && lineCount <= 4 && cornerMask === 15;
 }
 
 interface FillSubpath {
@@ -3011,12 +3211,35 @@ function collectFillSubpathTreeIndices(subpaths: FillSubpath[], index: number, o
 
 function boundsContainBounds(outer: Bounds, inner: Bounds): boolean {
   const epsilon = 1e-3;
+  return boundsContainBoundsWithTolerance(outer, inner, epsilon);
+}
+
+function boundsContainBoundsWithTolerance(
+  outer: Bounds,
+  inner: Bounds,
+  epsilon = boundsComparisonTolerance(outer, inner)
+): boolean {
   return (
     inner.minX >= outer.minX - epsilon &&
     inner.minY >= outer.minY - epsilon &&
     inner.maxX <= outer.maxX + epsilon &&
     inner.maxY <= outer.maxY + epsilon
   );
+}
+
+function boundsNearlyEqual(a: Bounds, b: Bounds, epsilon = boundsComparisonTolerance(a, b)): boolean {
+  return (
+    Math.abs(a.minX - b.minX) <= epsilon &&
+    Math.abs(a.minY - b.minY) <= epsilon &&
+    Math.abs(a.maxX - b.maxX) <= epsilon &&
+    Math.abs(a.maxY - b.maxY) <= epsilon
+  );
+}
+
+function boundsComparisonTolerance(a: Bounds, b: Bounds): number {
+  const width = Math.max(Math.abs(a.maxX - a.minX), Math.abs(b.maxX - b.minX));
+  const height = Math.max(Math.abs(a.maxY - a.minY), Math.abs(b.maxY - b.minY));
+  return Math.max(1e-3, Math.max(width, height) * 1e-5);
 }
 
 function boundsArea(bounds: Bounds): number {
@@ -3838,6 +4061,70 @@ function cloneBoundsOrNull(bounds: Bounds | null): Bounds | null {
     return null;
   }
   return { ...bounds };
+}
+
+function cloneClipMaskOrNull(mask: ClipMask | null): ClipMask | null {
+  if (!mask) {
+    return null;
+  }
+  return {
+    bounds: { ...mask.bounds },
+    exclusionBounds: mask.exclusionBounds.map((bounds) => ({ ...bounds }))
+  };
+}
+
+function applyClipToState(
+  state: GraphicsState,
+  pathBounds: Bounds | null,
+  pathMask: ClipMask | null,
+  clipRule: number
+): void {
+  const nextClipBounds = intersectBounds(state.clipBounds, pathBounds);
+  state.clipBounds = nextClipBounds;
+  state.clipMask = combineClipMasks(
+    state.clipMask,
+    clipRule === FILL_RULE_EVEN_ODD ? pathMask : null,
+    nextClipBounds
+  );
+}
+
+function combineClipMasks(
+  currentMask: ClipMask | null,
+  nextMask: ClipMask | null,
+  clipBounds: Bounds | null
+): ClipMask | null {
+  if (!isNonEmptyBounds(clipBounds)) {
+    return null;
+  }
+
+  const exclusionBounds: Bounds[] = [];
+  const addExclusion = (bounds: Bounds): void => {
+    const clipped = intersectBounds(clipBounds, bounds);
+    if (!isNonEmptyBounds(clipped) || boundsArea(clipped) <= 1e-6 || boundsNearlyEqual(clipped, clipBounds)) {
+      return;
+    }
+    exclusionBounds.push(clipped);
+  };
+
+  if (currentMask) {
+    for (const bounds of currentMask.exclusionBounds) {
+      addExclusion(bounds);
+    }
+  }
+  if (nextMask) {
+    for (const bounds of nextMask.exclusionBounds) {
+      addExclusion(bounds);
+    }
+  }
+
+  if (exclusionBounds.length === 0) {
+    return null;
+  }
+
+  return {
+    bounds: { ...clipBounds },
+    exclusionBounds
+  };
 }
 
 function intersectBounds(a: Bounds | null, b: Bounds | null): Bounds | null {
