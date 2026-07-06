@@ -122,6 +122,8 @@ struct VsOut {
   @location(6) @interpolate(flat) aaWorld : f32,
   @location(7) @interpolate(flat) color : vec3f,
   @location(8) @interpolate(flat) alpha : f32,
+  @location(9) @interpolate(flat) clipBounds : vec4f,
+  @location(10) @interpolate(flat) hasClipBounds : f32,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
@@ -230,6 +232,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let alpha = clamp(packedStyle - f32(styleFlags) * 2.0, 0.0, 1.0);
   let isHairline = (styleFlags & 1) != 0;
   let isRoundCap = (styleFlags & 2) != 0;
+  let isClipped = (styleFlags & 4) != 0;
 
   let geometryLength = select(length(p2 - p0), length(p1 - p0) + length(p2 - p1), isQuadratic);
 
@@ -245,6 +248,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.aaWorld = 1.0;
     out.color = color;
     out.alpha = 0.0;
+    out.clipBounds = vec4f(0.0, 0.0, 0.0, 0.0);
+    out.hasClipBounds = 0.0;
     return out;
   }
 
@@ -258,11 +263,39 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   }
 
   let extent = halfWidth + aaWorld;
+  let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
+
+  // Candidate A: axis-aligned quad over the (possibly clip-intersected) primitive bounds.
   let worldMin = primitiveBounds.xy - vec2f(extent, extent);
   let worldMax = primitiveBounds.zw + vec2f(extent, extent);
 
-  let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let worldPosition = mix(worldMin, worldMax, corner01);
+  // Candidate B: oriented quad along the primitive direction. Diagonal segments
+  // (e.g. hatching) rasterize orders of magnitude fewer wasted fragments this way,
+  // because their axis-aligned bounds cover far more area than the stroke itself.
+  let axisDelta = p2 - p0;
+  let axisLength = length(axisDelta);
+  let axisU = select(vec2f(1.0, 0.0), axisDelta / axisLength, axisLength > 1e-6);
+  let axisV = vec2f(-axisU.y, axisU.x);
+  let controlOffset = p1 - p0;
+  let controlU = dot(controlOffset, axisU);
+  let controlV = dot(controlOffset, axisV);
+  let orientedMinU = min(min(0.0, controlU), axisLength) - extent;
+  let orientedMaxU = max(max(0.0, controlU), axisLength) + extent;
+  let orientedMinV = min(0.0, controlV) - extent;
+  let orientedMaxV = max(0.0, controlV) + extent;
+
+  let axisAlignedArea = (worldMax.x - worldMin.x) * (worldMax.y - worldMin.y);
+  let orientedArea = (orientedMaxU - orientedMinU) * (orientedMaxV - orientedMinV);
+
+  var worldPosition : vec2f;
+  if (orientedArea < axisAlignedArea) {
+    worldPosition = p0
+      + axisU * mix(orientedMinU, orientedMaxU, corner01.x)
+      + axisV * mix(orientedMinV, orientedMaxV, corner01.y);
+  } else {
+    worldPosition = mix(worldMin, worldMax, corner01);
+  }
+
   let screen = (worldPosition - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
 
@@ -276,12 +309,22 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.aaWorld = aaWorld;
   out.color = color;
   out.alpha = alpha;
+  out.clipBounds = primitiveBounds;
+  out.hasClipBounds = select(0.0, 1.0, isClipped);
   return out;
 }
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
   if (inData.alpha <= 0.001) {
+    discard;
+  }
+
+  if (
+    inData.hasClipBounds >= 0.5 &&
+    (inData.local.x < inData.clipBounds.x || inData.local.y < inData.clipBounds.y ||
+      inData.local.x > inData.clipBounds.z || inData.local.y > inData.clipBounds.w)
+  ) {
     discard;
   }
 

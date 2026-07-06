@@ -100,10 +100,42 @@ fn heprStrokeWorldPack(
   }
 
   let extent = halfWidth + aaWorld;
+  let corner01 = corner * 0.5 + vec2<f32>(0.5);
+
+  // Candidate A: axis-aligned quad over the (possibly clip-intersected) primitive bounds.
   let worldMin = primitiveBounds.xy - vec2<f32>(extent);
   let worldMax = primitiveBounds.zw + vec2<f32>(extent);
-  let corner01 = corner * 0.5 + vec2<f32>(0.5);
-  let worldPosition = worldMin + (worldMax - worldMin) * corner01;
+
+  // Candidate B: oriented quad along the primitive direction. Diagonal segments
+  // (e.g. hatching) rasterize orders of magnitude fewer wasted fragments this way,
+  // because their axis-aligned bounds cover far more area than the stroke itself.
+  let axisDelta = p2 - p0;
+  let axisLength = length(axisDelta);
+  var axisU = vec2<f32>(1.0, 0.0);
+  if (axisLength > 0.000001) {
+    axisU = axisDelta / axisLength;
+  }
+  let axisV = vec2<f32>(-axisU.y, axisU.x);
+  let controlOffset = p1 - p0;
+  let controlU = dot(controlOffset, axisU);
+  let controlV = dot(controlOffset, axisV);
+  let orientedMinU = min(min(0.0, controlU), axisLength) - extent;
+  let orientedMaxU = max(max(0.0, controlU), axisLength) + extent;
+  let orientedMinV = min(0.0, controlV) - extent;
+  let orientedMaxV = max(0.0, controlV) + extent;
+
+  let axisAlignedArea = (worldMax.x - worldMin.x) * (worldMax.y - worldMin.y);
+  let orientedArea = (orientedMaxU - orientedMinU) * (orientedMaxV - orientedMinV);
+
+  var worldPosition : vec2<f32>;
+  if (orientedArea < axisAlignedArea) {
+    worldPosition = p0
+      + axisU * mix(orientedMinU, orientedMaxU, corner01.x)
+      + axisV * mix(orientedMinV, orientedMaxV, corner01.y);
+  } else {
+    worldPosition = worldMin + (worldMax - worldMin) * corner01;
+  }
+
   return vec4<f32>(worldPosition, halfWidth, aaWorld);
 }
 `, [includeNode(floatModFn)]);
@@ -206,6 +238,7 @@ fn heprStrokeFragment(
   primitiveA: vec4<f32>,
   primitiveB: vec4<f32>,
   style: vec4<f32>,
+  primitiveBounds: vec4<f32>,
   halfWidthFromVertex: f32,
   strokeCurveEnabled: f32,
   aaScreenPx: f32,
@@ -219,6 +252,15 @@ fn heprStrokeFragment(
   let styleFlags = floor(packedStyle / 2.0 + 0.000001);
   let alphaStyle = packedStyle - styleFlags * 2.0;
   if (alphaStyle <= 0.001) {
+    discard;
+  }
+
+  let hasClipBounds = heprFloatMod(floor(styleFlags * 0.25), 2.0) >= 0.5;
+  if (
+    hasClipBounds &&
+    (local.x < primitiveBounds.x || local.y < primitiveBounds.y ||
+      local.x > primitiveBounds.z || local.y > primitiveBounds.w)
+  ) {
     discard;
   }
 
@@ -321,6 +363,7 @@ export function createThreeWebGpuStrokeMaterial(
     primitiveA,
     primitiveB,
     style,
+    primitiveBounds,
     halfWidthFromVertex: worldPackValue.z,
     strokeCurveEnabled: curveUniform,
     aaScreenPx: aaScreenPxUniform,
