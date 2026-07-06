@@ -1,5 +1,10 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { DrawStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import {
+  CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
+  CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
+  CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE
+} from "./coreWgslShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
@@ -149,65 +154,9 @@ fn coordFromIndex(index : u32, width : u32) -> vec2<i32> {
   return vec2<i32>(i32(index % width), i32(index / width));
 }
 
-fn distanceToLineSegment(p : vec2f, a : vec2f, b : vec2f) -> f32 {
-  let ab = b - a;
-  let abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 {
-  let aa = b - a;
-  let bb = a - 2.0 * b + c;
-  let cc = aa * 2.0;
-  let dd = a - p;
-
-  let bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  let inv = 1.0 / bbLenSq;
-  let kx = inv * dot(aa, bb);
-  let ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  let kz = inv * dot(dd, aa);
-
-  let pValue = ky - kx * kx;
-  let pCube = pValue * pValue * pValue;
-  let qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  let hValue = qValue * qValue + 4.0 * pCube;
-
-  var best = 1e20;
-
-  if (hValue >= 0.0) {
-    let hSqrt = sqrt(hValue);
-    let roots = (vec2f(hSqrt, -hSqrt) - qValue) * 0.5;
-    let uv = sign(roots) * pow(abs(roots), vec2f(1.0 / 3.0));
-    let t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    let delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    let z = sqrt(-pValue);
-    let acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    let angle = acos(acosArg) / 3.0;
-    let cosine = cos(angle);
-    let sine = sin(angle) * 1.732050808;
-    let t = clamp(vec3f(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, vec3f(0.0), vec3f(1.0));
-
-    var delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
-
+${CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE}
+${CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE}
+${CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE}
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
   let segmentIndex = uSegmentIds.values[instanceIndex];
@@ -264,37 +213,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
   let extent = halfWidth + aaWorld;
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-
-  // Candidate A: axis-aligned quad over the (possibly clip-intersected) primitive bounds.
-  let worldMin = primitiveBounds.xy - vec2f(extent, extent);
-  let worldMax = primitiveBounds.zw + vec2f(extent, extent);
-
-  // Candidate B: oriented quad along the primitive direction. Diagonal segments
-  // (e.g. hatching) rasterize orders of magnitude fewer wasted fragments this way,
-  // because their axis-aligned bounds cover far more area than the stroke itself.
-  let axisDelta = p2 - p0;
-  let axisLength = length(axisDelta);
-  let axisU = select(vec2f(1.0, 0.0), axisDelta / axisLength, axisLength > 1e-6);
-  let axisV = vec2f(-axisU.y, axisU.x);
-  let controlOffset = p1 - p0;
-  let controlU = dot(controlOffset, axisU);
-  let controlV = dot(controlOffset, axisV);
-  let orientedMinU = min(min(0.0, controlU), axisLength) - extent;
-  let orientedMaxU = max(max(0.0, controlU), axisLength) + extent;
-  let orientedMinV = min(0.0, controlV) - extent;
-  let orientedMaxV = max(0.0, controlV) + extent;
-
-  let axisAlignedArea = (worldMax.x - worldMin.x) * (worldMax.y - worldMin.y);
-  let orientedArea = (orientedMaxU - orientedMinU) * (orientedMaxV - orientedMinV);
-
-  var worldPosition : vec2f;
-  if (orientedArea < axisAlignedArea) {
-    worldPosition = p0
-      + axisU * mix(orientedMinU, orientedMaxU, corner01.x)
-      + axisV * mix(orientedMinV, orientedMaxV, corner01.y);
-  } else {
-    worldPosition = mix(worldMin, worldMax, corner01);
-  }
+  let worldPosition = heprStrokeQuadWorldPosition(corner01, p0, p1, p2, primitiveBounds, extent);
 
   let screen = (worldPosition - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
@@ -330,8 +249,8 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
   let useCurve = uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5;
   let distanceToSegment = select(
-    distanceToLineSegment(inData.local, inData.p0, inData.p2),
-    distanceToQuadraticBezier(inData.local, inData.p0, inData.p1, inData.p2),
+    heprDistanceToLineSegment(inData.local, inData.p0, inData.p2),
+    heprDistanceToQuadraticBezier(inData.local, inData.p0, inData.p1, inData.p2),
     useCurve
   );
 
