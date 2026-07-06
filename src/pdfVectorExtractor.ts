@@ -873,16 +873,9 @@ async function extractSinglePageVectors(
   }
 
   let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
-  if (textData.instanceCount === 0 && hasTextShowOperators(operatorList)) {
+  if (textData.sourceTextCount === 0 && hasTextShowOperators(operatorList)) {
     await warmUpTextPathCache(page);
     textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
-  }
-
-  if (textData.instanceCount > 0 && textData.inPageCount < textData.instanceCount * 0.2) {
-    const fallbackTextData = await extractTextVectorData(page, operatorList, IDENTITY_MATRIX, pageBounds);
-    if (fallbackTextData.inPageCount > textData.inPageCount) {
-      textData = fallbackTextData;
-    }
   }
 
   const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
@@ -3511,31 +3504,36 @@ async function extractTextVectorData(
           const transformedGlyphBounds = transformBounds(glyphRecord.bounds, glyphMatrix);
           const visibleByClip = !clipBounds || boundsIntersect(transformedGlyphBounds, clipBounds);
           if (visibleByClip) {
-            textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
-            textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
-            textInstanceC.push(state.fillR, state.fillG, state.fillB, effectiveTextFillAlpha(state));
             sourceTextCount += 1;
 
-            if (pageBounds) {
-              if (boundsIntersect(transformedGlyphBounds, pageBounds)) {
-                inPageCount += 1;
-              } else {
-                outOfPageCount += 1;
-              }
-            }
-
-            if (!textBounds) {
-              textBounds = {
-                minX: transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON,
-                minY: transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON,
-                maxX: transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON,
-                maxY: transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON
-              };
+            // Viewers hide content outside the page/crop box. Vector content is
+            // culled through the clip state (seeded with the page bounds), so
+            // cull text the same way instead of emitting out-of-page glyphs.
+            const visibleInPage = !pageBounds || boundsIntersect(transformedGlyphBounds, pageBounds);
+            if (!visibleInPage) {
+              outOfPageCount += 1;
             } else {
-              textBounds.minX = Math.min(textBounds.minX, transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON);
-              textBounds.minY = Math.min(textBounds.minY, transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON);
-              textBounds.maxX = Math.max(textBounds.maxX, transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON);
-              textBounds.maxY = Math.max(textBounds.maxY, transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON);
+              if (pageBounds) {
+                inPageCount += 1;
+              }
+
+              textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
+              textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
+              textInstanceC.push(state.fillR, state.fillG, state.fillB, effectiveTextFillAlpha(state));
+
+              if (!textBounds) {
+                textBounds = {
+                  minX: transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON,
+                  minY: transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON,
+                  maxX: transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON,
+                  maxY: transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON
+                };
+              } else {
+                textBounds.minX = Math.min(textBounds.minX, transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON);
+                textBounds.minY = Math.min(textBounds.minY, transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON);
+                textBounds.maxX = Math.max(textBounds.maxX, transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON);
+                textBounds.maxY = Math.max(textBounds.maxY, transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON);
+              }
             }
           }
         }
