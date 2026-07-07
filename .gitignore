@@ -29,6 +29,7 @@ package-lock.json
 !/ml/room-detection/**
 /ml/room-detection/.venv/
 /ml/room-detection/runs/
+/ml/room-detection/data/
 /ml/room-detection/*splits.json
 /ml/room-detection/**/__pycache__/
 /ml/room-detection/**/*.pyc

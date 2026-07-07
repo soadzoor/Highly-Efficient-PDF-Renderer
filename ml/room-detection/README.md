@@ -130,3 +130,58 @@ Open `three-example.html`, load a PDF, run `Detect Rooms`, and verify:
 - room labels use manifest class names and colors
 - room numbers appear when the PDF exposes extractable room-number text
 - `Download Rooms JSON` includes the displayed detections
+
+## Vector Pipeline (no rasterization)
+
+A second, vector-native pipeline detects rooms directly from PDF stroke segments:
+a small neighbour-attention encoder classifies each segment as room-boundary or
+not, a learned link predictor bridges ink-free gaps (doors), and shapely
+polygonizes the surviving segments into faces scored by perimeter support.
+Rasterization only happens inside the scorer, so results are scale invariant —
+`--scale-check` re-runs the whole pipeline at x0.25 / x4 coordinates and the
+metrics must not move.
+
+Modules live in `roomdet/vector_*.py`; supervision is derived from the same TSVs
+(hand-drawn polygons are snapped onto real strokes first; `boundaryID`/
+`boundaryType` are ignored). Splits are grouped by building stem so floors of one
+building never straddle train/val, and are deterministic from the seed
+(`vector-splits.json` is gitignored like the raster split manifests; regenerate it
+with the same seed, or `git add -f` to pin it).
+
+All long-running scripts print JSON progress lines at least every `--log-seconds`
+(default 10) with percentages and ETAs; every trainer writes `last.pt`/`best.pt`.
+`--device auto` picks cuda, then mps, then cpu.
+
+```bash
+cd ml/room-detection
+
+# 0. one-time: segment dumps via the browser extractor running headless in Node
+node ../../scripts/extract-segments.mjs --root pdf-tsv --out ml/room-detection/data/vector-segments   # run from repo root
+
+# 1. labels, bridge candidates, QC overlays (data/vector-dataset/qc), splits
+python prepare_vector_dataset.py
+
+# 2. raster baseline (optimistic upper bound: the committed model trained on all pages)
+python evaluate_onnx_baseline.py --split val
+
+# 3. segment classifier (Head A)
+python train_segment_classifier.py --device auto --output-dir runs/vector-seg
+
+# 4. end-to-end faces vs the same instance-matching harness + scale invariance
+python evaluate_vector_rooms.py --checkpoint runs/vector-seg/best.pt --split val --scale-check
+
+# 5. learned gap bridging (Head B), then re-evaluate with --bridger
+python train_gap_bridger.py --encoder runs/vector-seg/best.pt --output-dir runs/vector-bridge
+python evaluate_vector_rooms.py --checkpoint runs/vector-seg/best.pt --bridger runs/vector-bridge/best.pt --split val
+
+# 6. room types (Head C, kp+uci labels only), then clinical-coarse evaluation
+python train_room_type_head.py --encoder runs/vector-seg/best.pt --output-dir runs/vector-type
+python evaluate_vector_rooms.py --checkpoint runs/vector-seg/best.pt \
+  --bridger runs/vector-bridge/best.pt --type-head runs/vector-type/best.pt \
+  --taxonomy clinical-coarse --split val
+```
+
+Follow-up (not wired yet): ONNX export of the encoder + heads for onnxruntime-web
+(the kNN graph build and polygonization stay in TypeScript at runtime; the demo's
+`pdfVectorExtractor` already produces the exact segments the dumps contain), with
+the raster model kept as the fallback for scanned PDFs.
