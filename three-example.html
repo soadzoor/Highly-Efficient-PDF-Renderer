@@ -244,6 +244,168 @@
         display: none !important;
       }
 
+      .example-dropdown {
+        position: relative;
+      }
+
+      .example-trigger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-width: 190px;
+        max-width: 100%;
+        cursor: pointer;
+        transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+      }
+
+      .example-trigger:hover:not(:disabled) {
+        background: #1d2a3e;
+        border-color: rgba(255, 255, 255, 0.32);
+      }
+
+      .example-trigger:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .example-dropdown.open .example-trigger {
+        border-color: rgba(96, 165, 250, 0.7);
+        box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18);
+      }
+
+      .example-trigger-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .example-trigger-count {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 20px;
+        height: 20px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.12);
+        color: rgba(232, 237, 245, 0.85);
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1;
+      }
+
+      .example-trigger-chevron {
+        color: rgba(232, 237, 245, 0.6);
+        font-size: 12px;
+        line-height: 1;
+        transition: transform 140ms ease;
+      }
+
+      .example-dropdown.open .example-trigger-chevron {
+        transform: rotate(180deg);
+      }
+
+      .example-menu {
+        position: fixed;
+        z-index: 40;
+        width: max-content;
+        max-width: min(460px, calc(100vw - 32px));
+        padding: 6px;
+        overflow-y: auto;
+        background: rgba(19, 26, 38, 0.97);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(8px);
+        outline: none;
+        animation: menu-pop 120ms ease-out;
+      }
+
+      .example-menu[hidden] {
+        display: none;
+      }
+
+      @keyframes menu-pop {
+        from {
+          opacity: 0;
+          transform: translateY(-4px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .example-menu-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 6px 10px;
+        border-radius: 8px;
+      }
+
+      .example-menu-row:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .example-menu-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #e8edf5;
+        font-size: 13px;
+      }
+
+      .example-menu-actions {
+        display: inline-flex;
+        flex-shrink: 0;
+        gap: 6px;
+      }
+
+      .example-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        background: rgba(255, 255, 255, 0.04);
+        color: #e8edf5;
+        border-radius: 999px;
+        padding: 3px 10px;
+        font-size: 12px;
+        line-height: 1.3;
+        cursor: pointer;
+        transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+      }
+
+      .example-chip:hover,
+      .example-chip:focus-visible {
+        background: #e8edf5;
+        border-color: #e8edf5;
+        color: #11161d;
+      }
+
+      .example-chip-kind {
+        font-weight: 600;
+      }
+
+      .example-chip-size {
+        color: rgba(232, 237, 245, 0.55);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 11px;
+      }
+
+      .example-chip:hover .example-chip-size,
+      .example-chip:focus-visible .example-chip-size {
+        color: rgba(17, 22, 29, 0.65);
+      }
+
       .loader-spinner {
         width: 14px;
         height: 14px;
@@ -262,12 +424,12 @@
         }
       }
     </style>
-    <script type="module" crossorigin src="./assets/three-C3Y6SIc4.js"></script>
+    <script type="module" crossorigin src="./assets/three-B_PLHBSS.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/preload-helper-kNaey6uv.js">
-    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-ChqOzZEH.js">
+    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-C_T_cAzw.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-BIWo0Ry8.js">
-    <link rel="modulepreload" crossorigin href="./assets/src-BzA4M3v8.js">
-    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-CZvKSF8x.js">
+    <link rel="modulepreload" crossorigin href="./assets/src-KDzDjuQW.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-BJtG5xic.js">
   </head>
   <body>
     <div id="app">
@@ -278,9 +440,13 @@
       <div class="panel-header">
         <div class="toolbar">
           <button id="open-file" type="button">Open PDF / ZIP</button>
-          <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
-            <option value="">Examples (loading...)</option>
-          </select>
+          <div id="example-dropdown" class="example-dropdown">
+            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or parsed ZIP" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+              <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
+              <span class="example-trigger-chevron" aria-hidden="true">▾</span>
+            </button>
+            <div id="example-menu" class="example-menu" hidden></div>
+          </div>
           <button id="download-data" type="button" hidden disabled>Download Parsed Data</button>
           <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
           <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />

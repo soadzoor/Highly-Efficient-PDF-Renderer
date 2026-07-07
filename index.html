@@ -4,12 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
-    <script type="module" crossorigin src="./assets/main-Uvh9_XzG.js"></script>
+    <script type="module" crossorigin src="./assets/main-CyDW5HLV.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/preload-helper-kNaey6uv.js">
-    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-ChqOzZEH.js">
+    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-C_T_cAzw.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-BIWo0Ry8.js">
-    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-CZvKSF8x.js">
-    <link rel="stylesheet" crossorigin href="./assets/main-0AXJG-c-.css">
+    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-BJtG5xic.js">
+    <link rel="stylesheet" crossorigin href="./assets/main-FYTNO0A-.css">
   </head>
   <body>
     <canvas id="viewport"></canvas>
@@ -17,9 +17,13 @@
       <div class="panel-header">
         <div class="toolbar">
           <button id="open-file" type="button">Open PDF / ZIP</button>
-          <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
-            <option value="">Examples (loading...)</option>
-          </select>
+          <div id="example-dropdown" class="example-dropdown">
+            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or parsed ZIP" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+              <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
+              <span class="example-trigger-chevron" aria-hidden="true">▾</span>
+            </button>
+            <div id="example-menu" class="example-menu" hidden></div>
+          </div>
           <button id="download-data" type="button" hidden disabled>Download Parsed Data</button>
           <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
           <button id="download-all-data" type="button" hidden disabled>Download All Example ZIPs</button>

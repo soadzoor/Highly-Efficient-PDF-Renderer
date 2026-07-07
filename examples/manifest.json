@@ -1,6 +1,30 @@
 {
-  "generatedAt": "2026-04-23T05:49:53.931Z",
+  "generatedAt": "2026-07-07T10:01:29.982Z",
   "examples": [
+    {
+      "id": "baldwin_park_ed_remodel_floor_1",
+      "name": "Baldwin Park ED Remodel_Floor 1.pdf",
+      "pdf": {
+        "path": "examples/pdfs/Baldwin%20Park%20ED%20Remodel_Floor%201.pdf",
+        "sizeBytes": 5231679
+      },
+      "parsedZip": {
+        "path": "examples/zips/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.zip",
+        "sizeBytes": 2999639
+      }
+    },
+    {
+      "id": "chino_mob_floor_1",
+      "name": "Chino MOB_FLOOR 1.pdf",
+      "pdf": {
+        "path": "examples/pdfs/Chino%20MOB_FLOOR%201.pdf",
+        "sizeBytes": 666826
+      },
+      "parsedZip": {
+        "path": "examples/zips/Chino_MOB_FLOOR_1-parsed-data.zip",
+        "sizeBytes": 492968
+      }
+    },
     {
       "id": "dublin_1st_floor_2018_06_01",
       "name": "Dublin 1st Floor 2018 06 01.pdf",
@@ -23,6 +47,18 @@
       "parsedZip": {
         "path": "examples/zips/Level_1-parsed-data.zip",
         "sizeBytes": 13669118
+      }
+    },
+    {
+      "id": "livermore_l1",
+      "name": "Livermore_L1.pdf",
+      "pdf": {
+        "path": "examples/pdfs/Livermore_L1.pdf",
+        "sizeBytes": 9263862
+      },
+      "parsedZip": {
+        "path": "examples/zips/Livermore_L1-parsed-data.zip",
+        "sizeBytes": 4984369
       }
     },
     {
