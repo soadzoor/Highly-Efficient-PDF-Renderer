@@ -191,6 +191,8 @@ interface IntervalGroup {
   normalX: number;
   normalY: number;
   offset: number;
+  offsetSum: number;
+  offsetWeightSum: number;
   halfWidth: number;
   flags: number;
   alpha: number;
@@ -1677,6 +1679,8 @@ function resolveIntervalGroup(
       normalX,
       normalY,
       offset: offsetKey * tolerance,
+      offsetSum: 0,
+      offsetWeightSum: 0,
       halfWidth: primitive.halfWidth,
       flags,
       alpha: primitive.alpha,
@@ -1687,6 +1691,14 @@ function resolveIntervalGroup(
     };
     groups.set(key, group);
   }
+
+  // Track the length-weighted true perpendicular offset of the group's members.
+  // Emitting merged lines at this average (instead of the quantized bucket
+  // offset) keeps regular patterns like hatching evenly spaced and makes line
+  // positions agree across LOD levels, so per-tile level mixing stays seamless.
+  const memberWeight = Math.hypot(dx, dy);
+  group.offsetSum += offset * memberWeight;
+  group.offsetWeightSum += memberWeight;
   return group;
 }
 
@@ -1702,6 +1714,10 @@ function emitMergedIntervals(
   const pairCount = group.intervals.length >> 1;
   if (pairCount <= 0) {
     return;
+  }
+
+  if (group.offsetWeightSum > 0) {
+    group.offset = group.offsetSum / group.offsetWeightSum;
   }
 
   const intervals = new Array<{ start: number; end: number }>(pairCount);
