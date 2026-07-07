@@ -22,9 +22,12 @@ cd ml/room-detection
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+cd ../..
 ```
 
-Run commands below from the repository root unless noted otherwise.
+Run commands below from the repository root unless noted otherwise. If you stay
+in `ml/room-detection`, omit the leading `ml/room-detection/` from script paths
+and adjust repo-root-relative data paths accordingly.
 
 ## Prepare PDF-TSV Data
 
