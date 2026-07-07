@@ -194,6 +194,11 @@ updatePerspectiveCameraProjection();
 let controls = createMapControls();
 
 let currentPdfObject: HeprThreePdfObject | null = null;
+// Debug handle for automated verification and manual diagnostics in the console.
+(window as unknown as { __heprThreeDebug?: { getPdfObject: () => HeprThreePdfObject | null; getCamera: () => THREE.PerspectiveCamera } }).__heprThreeDebug = {
+  getPdfObject: () => currentPdfObject,
+  getCamera: () => camera
+};
 let lastLoadedSource: File | string | null = null;
 let lastDownloadablePdf: PdfDownloadSource | null = null;
 let animationFrameId = 0;

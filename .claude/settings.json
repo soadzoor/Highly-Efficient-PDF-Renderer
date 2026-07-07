@@ -6,7 +6,10 @@
 			"Bash(npm *)",
 			"Bash(npx *)",
 			"Bash(node *)",
-			"Bash(sed *)"
+			"Bash(python3 *)",
+			"Bash(sed *)",
+			"Bash(echo *)",
+			"Bash(unzip -l *)"
 		]
 	}
 }

@@ -1,10 +1,12 @@
 import * as THREE from "three";
 
 import { createCanvasInteractionController, type CanvasInteractionController } from "./canvasInteractions";
+import type { Bounds } from "./pdfVectorExtractor";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
 import type { RendererApi } from "./rendererTypes";
 import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
+import { ThreeMaterialPageTileLayer } from "./threeMaterialPageTileLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
@@ -16,7 +18,13 @@ import {
   type VectorStrokeLodStats,
   type VectorLodMode
 } from "./vectorStrokeLod";
-import { WebGlFloorplanRenderer, type DrawStats, type ViewState } from "./webGlFloorplanRenderer";
+import {
+  WebGlFloorplanRenderer,
+  type DrawStats,
+  type PageTextTileBakeRequest,
+  type PageTextTileStats,
+  type ViewState
+} from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 
 const DEFAULT_FIT_PADDING_PIXELS = 64;
@@ -27,6 +35,26 @@ const DEFAULT_MAX_CANVAS_PIXELS = 4_194_304;
 const PERSPECTIVE_NATIVE_OVERSAMPLE = 1.15;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MIN = 0.9;
 const PERSPECTIVE_RESIZE_HYSTERESIS_MAX = 1.12;
+const THREE_PAGE_TEXT_TILE_MIN_TEXT_INSTANCES = 150_000;
+const THREE_PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX = 176;
+const THREE_PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX = 200;
+const THREE_PAGE_TEXT_TILE_RATIO_MIN = 0.75;
+const THREE_PAGE_TEXT_TILE_RATIO_MAX = 1.3333333333;
+const THREE_PAGE_TEXT_TILE_GUTTER_PX = 2;
+const THREE_PAGE_TEXT_TILE_ATLAS_DIM = 2048;
+const THREE_PAGE_TEXT_TILE_MAX_TILE_DIM = 512;
+const THREE_PAGE_TEXT_TILE_BAKE_MAX_PAGES = 128;
+const THREE_PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET = 300_000;
+const THREE_PAGE_TEXT_TILE_STABLE_FRAMES = 3;
+
+interface ThreePageTextTileRecord {
+  hasTile: boolean;
+  atlasX: number;
+  atlasY: number;
+  innerWidth: number;
+  innerHeight: number;
+  epoch: number;
+}
 
 type ThreeSceneRenderCallback = THREE.Scene["onBeforeRender"];
 
@@ -233,6 +261,30 @@ export class HeprThreePdfObject extends THREE.Group {
   private vectorLodStrokeLayer: ThreeVectorLodStrokeLayer | null;
   private readonly compactedStrokeLayer: ThreeCompactedStrokeLayer | null;
   private readonly textMaterialLayer: ThreeMaterialTextLayer;
+  private readonly pageTileLayer: ThreeMaterialPageTileLayer;
+  private readonly tilePageRects: Float32Array;
+  private readonly tilePageTextRanges: Uint32Array;
+  private readonly pageTileRecords: ThreePageTextTileRecord[];
+  private readonly pageTileInstanceData: Float32Array;
+  private readonly pageTileMaskScratch: Uint8Array;
+  private readonly previousClipFromDataElements = new Float32Array(16);
+  private clipFromDataStableFrames = 0;
+  private pageTileShelfX = 0;
+  private pageTileShelfY = 0;
+  private pageTileShelfRowHeight = 0;
+  private pageTileEpoch = 0;
+  private pageTextTilesEnabled = true;
+  private pageTileModeActive = false;
+  private pageTileBakeInFlight = false;
+  private lastPageTileStats: PageTextTileStats = {
+    enabled: true,
+    active: false,
+    tiledPages: 0,
+    directPages: 0,
+    bakedPages: 0,
+    atlasWidth: 0,
+    atlasHeight: 0
+  };
 
   private controlsCanvas: HTMLCanvasElement | null = null;
   private pendingInitialFit: boolean;
@@ -367,6 +419,35 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     this.textMaterialLayer.setVisible(false);
     this.add(this.textMaterialLayer.mesh);
+
+    this.tilePageRects = normalizeObjectPageRects(loadedScene.scene);
+    this.tilePageTextRanges = normalizeObjectPageTextRanges(
+      loadedScene.scene,
+      this.tilePageRects,
+      loadedScene.scene.textInstanceCount
+    );
+    const tilePageCount = Math.floor(this.tilePageRects.length / 4);
+    this.pageTileRecords = new Array(tilePageCount);
+    for (let i = 0; i < tilePageCount; i += 1) {
+      this.pageTileRecords[i] = {
+        hasTile: false,
+        atlasX: 0,
+        atlasY: 0,
+        innerWidth: 0,
+        innerHeight: 0,
+        epoch: -1
+      };
+    }
+    this.pageTileInstanceData = new Float32Array(Math.max(8, tilePageCount * 8));
+    this.pageTileMaskScratch = new Uint8Array(Math.max(1, tilePageCount));
+    this.pageTileLayer = new ThreeMaterialPageTileLayer({
+      materialBackend: rendererType === "webgpu" ? "webgpu" : "webgl",
+      atlasWidth: THREE_PAGE_TEXT_TILE_ATLAS_DIM,
+      atlasHeight: THREE_PAGE_TEXT_TILE_ATLAS_DIM,
+      maxTileCount: Math.max(1, tilePageCount)
+    });
+    this.add(this.pageTileLayer.mesh);
+
     this.userData.hepr = {
       sourceLabel: this.sourceLabel,
       sourceKind: this.sourceKind,
@@ -542,6 +623,30 @@ export class HeprThreePdfObject extends THREE.Group {
     this.vectorLodStrokeLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
     this.strokeMaterialLayer?.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
     this.textMaterialLayer.setStrokeCurveEnabled(this.rendererConfig.strokeCurveEnabled);
+    this.invalidatePageTextTiles();
+  }
+
+  /**
+   * Enable or disable baked page text tiles for far-zoom text rendering.
+   */
+  setPageTextTilesEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.pageTextTilesEnabled === nextEnabled) {
+      return;
+    }
+    this.pageTextTilesEnabled = nextEnabled;
+    this.invalidatePageTextTiles();
+    if (!nextEnabled) {
+      this.pageTileLayer.setVisible(false);
+      this.pageTileModeActive = false;
+    }
+  }
+
+  /**
+   * Return page text tile diagnostics for the last prepared frame.
+   */
+  getPageTextTileStats(): PageTextTileStats {
+    return { ...this.lastPageTileStats };
   }
 
   /**
@@ -576,6 +681,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.triangleStrokeLayer?.setVectorOverride(red, green, blue, opacity);
     this.strokeMaterialLayer?.setVectorOverride(red, green, blue, opacity);
     this.textMaterialLayer.setVectorOverride(red, green, blue, opacity);
+    this.invalidatePageTextTiles();
   }
 
   /**
@@ -617,6 +723,8 @@ export class HeprThreePdfObject extends THREE.Group {
     this.vectorLodStrokeLayer?.dispose();
     this.compactedStrokeLayer?.dispose();
     this.textMaterialLayer.dispose();
+    this.pageTileLayer.dispose();
+    this.remove(this.pageTileLayer.mesh);
     this.renderTexture?.dispose();
     this.remove(this.pageMesh);
     this.remove(this.rasterMaterialLayer.group);
@@ -827,6 +935,7 @@ export class HeprThreePdfObject extends THREE.Group {
       cameraDrivenMaterialPipelineEnabled
     );
     this.updateStrokeLodVisibility(localUnitsPerPixel, cameraDrivenMaterialPipelineEnabled);
+    this.updatePageTextTiles(cameraDrivenMaterialPipelineEnabled, materialCullingBounds, materialLayerViewport);
 
     const presentedFrameSerial = this.renderer.getPresentedFrameSerial();
     if (
@@ -861,7 +970,10 @@ export class HeprThreePdfObject extends THREE.Group {
         this.vectorLodStrokeLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
       if (this.textMaterialLayer.mesh.visible) {
-        this.textMaterialLayer.updateFrame(viewState, materialLayerViewport);
+        this.textMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
+      }
+      if (this.pageTileLayer.mesh.visible) {
+        this.pageTileLayer.updateFrame(viewState, materialLayerViewport);
       }
       this.lastSyncedFrameSerial = presentedFrameSerial;
       this.lastViewportWidth = nativeViewport.width;
@@ -1083,6 +1195,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.triangleStrokeLayer?.setScreenSpaceTransform();
       this.vectorLodStrokeLayer?.setScreenSpaceTransform();
       this.textMaterialLayer.setScreenSpaceTransform();
+      this.pageTileLayer.setScreenSpaceTransform();
       return localUnitsPerPixel;
     }
 
@@ -1096,6 +1209,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.triangleStrokeLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
     this.vectorLodStrokeLayer?.setLocalToClipTransform(this.clipFromDataMatrix, localUnitsPerPixel);
     this.textMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
+    this.pageTileLayer.setLocalToClipTransform(this.clipFromDataMatrix);
     return localUnitsPerPixel;
   }
 
@@ -1150,6 +1264,356 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rendererConfig.vectorOverride[2],
       this.rendererConfig.vectorOverride[3]
     );
+  }
+
+  // Swaps the per-glyph text mesh for baked page tiles when every visible page
+  // is small on screen. All-or-nothing per frame: tiles draw only once each
+  // visible page has a valid bake, so glyphs and tiles never double-draw.
+  private updatePageTextTiles(
+    pipelineActive: boolean,
+    cullingBounds: Bounds | null,
+    viewport: ViewportPixels
+  ): void {
+    const textInstanceCount = Math.max(0, this.sceneData.textInstanceCount | 0);
+    const pageCount = this.pageTileRecords.length;
+    const bakeSupported = typeof this.renderer.bakePageTextTilePixels === "function";
+
+    if (
+      this.isDisposed ||
+      !pipelineActive ||
+      !this.pageTextTilesEnabled ||
+      !bakeSupported ||
+      !cullingBounds ||
+      pageCount === 0 ||
+      textInstanceCount < THREE_PAGE_TEXT_TILE_MIN_TEXT_INSTANCES
+    ) {
+      this.deactivatePageTileRendering();
+      this.pageTileModeActive = false;
+      this.updatePageTileStats(false, 0, 0, 0);
+      return;
+    }
+
+    const transformStable = this.trackClipFromDataStability();
+
+    const visiblePages: number[] = [];
+    const targetWidths: number[] = [];
+    const targetHeights: number[] = [];
+    let maxHeight = 0;
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const rangeCount = this.tilePageTextRanges[pageIndex * 2 + 1] ?? 0;
+      if (rangeCount <= 0) {
+        continue;
+      }
+      const rectOffset = pageIndex * 4;
+      const minX = Math.min(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
+      const minY = Math.min(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
+      const maxX = Math.max(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
+      const maxY = Math.max(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
+      if (
+        maxX < cullingBounds.minX ||
+        minX > cullingBounds.maxX ||
+        maxY < cullingBounds.minY ||
+        minY > cullingBounds.maxY
+      ) {
+        continue;
+      }
+
+      const size = this.measurePageProjectedSizePx(minX, minY, maxX, maxY, viewport);
+      if (!size || size.width > THREE_PAGE_TEXT_TILE_MAX_TILE_DIM) {
+        // Behind-camera or oversized pages cannot be tiled; a clamped bake would
+        // crop them, so fall back to direct text for the whole view.
+        maxHeight = Number.POSITIVE_INFINITY;
+        break;
+      }
+      visiblePages.push(pageIndex);
+      targetWidths.push(size.width);
+      targetHeights.push(size.height);
+      maxHeight = Math.max(maxHeight, size.height);
+    }
+
+    if (visiblePages.length === 0 || !Number.isFinite(maxHeight)) {
+      this.deactivatePageTileRendering();
+      this.pageTileModeActive = false;
+      this.updatePageTileStats(true, 0, visiblePages.length, 0);
+      return;
+    }
+
+    if (this.pageTileModeActive) {
+      if (maxHeight >= THREE_PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX) {
+        this.pageTileModeActive = false;
+      }
+    } else if (maxHeight <= THREE_PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX) {
+      this.pageTileModeActive = true;
+    }
+    if (!this.pageTileModeActive) {
+      this.deactivatePageTileRendering();
+      this.updatePageTileStats(true, 0, visiblePages.length, 0);
+      return;
+    }
+
+    // Granular per-page mixing: baked pages draw as tile quads and are masked
+    // out of the glyph draw; missing/stale pages keep drawing glyphs while
+    // their bakes are in flight, so panning never falls back to full direct.
+    const pageTileMask = this.pageTileMaskScratch;
+    pageTileMask.fill(0);
+    const missing: PageTextTileBakeRequest[] = [];
+    let tileCount = 0;
+    let directPages = 0;
+    let directStart = textInstanceCount;
+    let directEnd = 0;
+    for (let i = 0; i < visiblePages.length; i += 1) {
+      const pageIndex = visiblePages[i];
+      const record = this.pageTileRecords[pageIndex];
+      const targetWidth = clampTileDimension(targetWidths[i]);
+      const targetHeight = clampTileDimension(targetHeights[i]);
+      const heightRatio = record.hasTile ? targetHeight / Math.max(1, record.innerHeight) : 0;
+      const tileValid =
+        record.hasTile &&
+        record.epoch === this.pageTileEpoch &&
+        heightRatio >= THREE_PAGE_TEXT_TILE_RATIO_MIN &&
+        heightRatio <= THREE_PAGE_TEXT_TILE_RATIO_MAX &&
+        !(transformStable && Math.abs(targetHeight - record.innerHeight) > 1);
+
+      if (tileValid) {
+        tileCount = this.appendPageTileInstance(pageIndex, record, tileCount);
+        pageTileMask[pageIndex] = 1;
+      } else {
+        missing.push({ pageIndex, innerWidth: targetWidth, innerHeight: targetHeight });
+        const rangeOffset = pageIndex * 2;
+        const rangeStart = this.tilePageTextRanges[rangeOffset] ?? 0;
+        const rangeCount = this.tilePageTextRanges[rangeOffset + 1] ?? 0;
+        if (rangeCount > 0) {
+          directStart = Math.min(directStart, rangeStart);
+          directEnd = Math.max(directEnd, rangeStart + rangeCount);
+          directPages += 1;
+        }
+      }
+    }
+
+    if (tileCount > 0) {
+      this.pageTileLayer.setTiles(this.pageTileInstanceData, tileCount);
+      this.pageTileLayer.setVisible(true);
+    } else {
+      this.pageTileLayer.setVisible(false);
+    }
+
+    if (directPages > 0 && directEnd > directStart) {
+      this.textMaterialLayer.setPageTileMask(tileCount > 0 ? pageTileMask : null);
+      this.textMaterialLayer.setInstanceWindow(directStart, directEnd - directStart);
+    } else {
+      this.textMaterialLayer.setVisible(false);
+      this.textMaterialLayer.setPageTileMask(null);
+      this.textMaterialLayer.clearInstanceWindow();
+    }
+
+    this.updatePageTileStats(true, tileCount, directPages, missing.length);
+    this.kickPageTileBakes(missing);
+  }
+
+  private deactivatePageTileRendering(): void {
+    this.pageTileLayer.setVisible(false);
+    this.textMaterialLayer.setPageTileMask(null);
+    this.textMaterialLayer.clearInstanceWindow();
+  }
+
+  private appendPageTileInstance(pageIndex: number, record: ThreePageTextTileRecord, tileCount: number): number {
+    const rectOffset = pageIndex * 4;
+    const minX = Math.min(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
+    const minY = Math.min(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
+    const maxX = Math.max(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
+    const maxY = Math.max(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
+
+    const atlasWidth = this.pageTileLayer.atlasWidth;
+    const atlasHeight = this.pageTileLayer.atlasHeight;
+    const out = this.pageTileInstanceData;
+    const offset = tileCount * 8;
+    out[offset] = minX;
+    out[offset + 1] = minY;
+    out[offset + 2] = maxX;
+    out[offset + 3] = maxY;
+    // Baked pixels store row 0 at the page top (world maxY), so v is flipped
+    // relative to the world rect.
+    out[offset + 4] = record.atlasX / atlasWidth;
+    out[offset + 5] = (record.atlasY + record.innerHeight) / atlasHeight;
+    out[offset + 6] = (record.atlasX + record.innerWidth) / atlasWidth;
+    out[offset + 7] = record.atlasY / atlasHeight;
+    return tileCount + 1;
+  }
+
+  private kickPageTileBakes(missing: PageTextTileBakeRequest[]): void {
+    if (this.pageTileBakeInFlight || missing.length === 0) {
+      return;
+    }
+
+    const batch: PageTextTileBakeRequest[] = [];
+    let batchedInstances = 0;
+    for (const request of missing) {
+      if (batch.length >= THREE_PAGE_TEXT_TILE_BAKE_MAX_PAGES) {
+        break;
+      }
+      if (batch.length > 0 && batchedInstances >= THREE_PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET) {
+        break;
+      }
+      batch.push(request);
+      batchedInstances += this.tilePageTextRanges[request.pageIndex * 2 + 1] ?? 0;
+    }
+    if (batch.length === 0) {
+      return;
+    }
+
+    const bakeTiles = this.renderer.bakePageTextTilePixels;
+    if (!bakeTiles) {
+      return;
+    }
+    this.pageTileBakeInFlight = true;
+    const epochAtRequest = this.pageTileEpoch;
+    bakeTiles
+      .call(this.renderer, batch)
+      .then((results) => {
+        this.pageTileBakeInFlight = false;
+        if (!results || this.isDisposed || epochAtRequest !== this.pageTileEpoch) {
+          return;
+        }
+
+        let wroteAny = false;
+        for (const result of results) {
+          const record = this.pageTileRecords[result.pageIndex];
+          if (!record) {
+            continue;
+          }
+          // A transient GPU hiccup can yield an empty bake for a page that has
+          // glyphs; leave the record missing so the page stays direct and rebakes.
+          if ((this.tilePageTextRanges[result.pageIndex * 2 + 1] ?? 0) > 0 && isAllZeroAlpha(result.pixels)) {
+            continue;
+          }
+          const slot = this.allocatePageTileSlot(result.innerWidth, result.innerHeight);
+          if (!slot) {
+            // Atlas full: drop every tile (including this batch) and let the
+            // next frames rebake into the fresh atlas.
+            this.resetPageTileAtlas();
+            break;
+          }
+          this.pageTileLayer.writeTilePixels(slot.x, slot.y, result.innerWidth, result.innerHeight, result.pixels);
+          record.hasTile = true;
+          record.atlasX = slot.x;
+          record.atlasY = slot.y;
+          record.innerWidth = result.innerWidth;
+          record.innerHeight = result.innerHeight;
+          record.epoch = epochAtRequest;
+          wroteAny = true;
+        }
+        if (wroteAny) {
+          this.pageTileLayer.markAtlasDirty();
+        }
+      })
+      .catch(() => {
+        this.pageTileBakeInFlight = false;
+      });
+  }
+
+  private measurePageProjectedSizePx(
+    minX: number,
+    minY: number,
+    maxX: number,
+    maxY: number,
+    viewport: ViewportPixels
+  ): { width: number; height: number } | null {
+    const elements = this.clipFromDataMatrix.elements;
+    const halfWidth = Math.max(1, viewport.width) * 0.5;
+    const halfHeight = Math.max(1, viewport.height) * 0.5;
+
+    const project = (x: number, y: number): [number, number] | null => {
+      const clipW = elements[3] * x + elements[7] * y + elements[15];
+      if (!(clipW > 1e-9)) {
+        return null;
+      }
+      const clipX = elements[0] * x + elements[4] * y + elements[12];
+      const clipY = elements[1] * x + elements[5] * y + elements[13];
+      return [(clipX / clipW) * halfWidth, (clipY / clipW) * halfHeight];
+    };
+
+    const p00 = project(minX, minY);
+    const p10 = project(maxX, minY);
+    const p11 = project(maxX, maxY);
+    const p01 = project(minX, maxY);
+    if (!p00 || !p10 || !p11 || !p01) {
+      return null;
+    }
+
+    const width = Math.max(Math.hypot(p10[0] - p00[0], p10[1] - p00[1]), Math.hypot(p11[0] - p01[0], p11[1] - p01[1]));
+    const height = Math.max(Math.hypot(p01[0] - p00[0], p01[1] - p00[1]), Math.hypot(p11[0] - p10[0], p11[1] - p10[1]));
+    if (!Number.isFinite(width) || !Number.isFinite(height)) {
+      return null;
+    }
+    return { width, height };
+  }
+
+  private trackClipFromDataStability(): boolean {
+    const elements = this.clipFromDataMatrix.elements;
+    let unchanged = true;
+    for (let i = 0; i < 16; i += 1) {
+      const previous = this.previousClipFromDataElements[i];
+      const next = elements[i];
+      const scale = Math.max(Math.abs(previous), Math.abs(next), 1e-6);
+      if (Math.abs(next - previous) > scale * 1e-6) {
+        unchanged = false;
+      }
+      this.previousClipFromDataElements[i] = next;
+    }
+
+    this.clipFromDataStableFrames = unchanged ? this.clipFromDataStableFrames + 1 : 0;
+    return this.clipFromDataStableFrames >= THREE_PAGE_TEXT_TILE_STABLE_FRAMES;
+  }
+
+  private allocatePageTileSlot(innerWidth: number, innerHeight: number): { x: number; y: number } | null {
+    const atlasWidth = this.pageTileLayer.atlasWidth;
+    const atlasHeight = this.pageTileLayer.atlasHeight;
+    const slotWidth = innerWidth + THREE_PAGE_TEXT_TILE_GUTTER_PX * 2;
+    const slotHeight = innerHeight + THREE_PAGE_TEXT_TILE_GUTTER_PX * 2;
+    if (slotWidth > atlasWidth || slotHeight > atlasHeight) {
+      return null;
+    }
+
+    if (this.pageTileShelfX + slotWidth > atlasWidth) {
+      this.pageTileShelfY += this.pageTileShelfRowHeight;
+      this.pageTileShelfX = 0;
+      this.pageTileShelfRowHeight = 0;
+    }
+    if (this.pageTileShelfY + slotHeight > atlasHeight) {
+      return null;
+    }
+
+    const x = this.pageTileShelfX + THREE_PAGE_TEXT_TILE_GUTTER_PX;
+    const y = this.pageTileShelfY + THREE_PAGE_TEXT_TILE_GUTTER_PX;
+    this.pageTileShelfX += slotWidth;
+    this.pageTileShelfRowHeight = Math.max(this.pageTileShelfRowHeight, slotHeight);
+    return { x, y };
+  }
+
+  private resetPageTileAtlas(): void {
+    this.pageTileShelfX = 0;
+    this.pageTileShelfY = 0;
+    this.pageTileShelfRowHeight = 0;
+    for (const record of this.pageTileRecords) {
+      record.hasTile = false;
+    }
+  }
+
+  private invalidatePageTextTiles(): void {
+    this.pageTileEpoch += 1;
+    this.resetPageTileAtlas();
+  }
+
+  private updatePageTileStats(active: boolean, tiledPages: number, directPages: number, bakedPages: number): void {
+    this.lastPageTileStats = {
+      enabled: this.pageTextTilesEnabled,
+      active,
+      tiledPages,
+      directPages,
+      bakedPages,
+      atlasWidth: this.pageTileLayer.atlasWidth,
+      atlasHeight: this.pageTileLayer.atlasHeight
+    };
   }
 
   private estimateLocalUnitsPerPixel(camera: THREE.Camera, viewport: ViewportPixels): number {
@@ -2052,6 +2516,70 @@ function resolveSceneFitBounds(scene: LoadedPdfScene["scene"]): {
     maxX: scene.bounds.maxX,
     maxY: scene.bounds.maxY
   };
+}
+
+function isAllZeroAlpha(pixels: Uint8Array): boolean {
+  for (let i = 3; i < pixels.length; i += 4) {
+    if (pixels[i] !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function clampTileDimension(value: number): number {
+  const rounded = Math.round(value);
+  if (!Number.isFinite(rounded)) {
+    return 4;
+  }
+  return Math.min(THREE_PAGE_TEXT_TILE_MAX_TILE_DIM, Math.max(4, rounded));
+}
+
+function normalizeObjectPageRects(scene: LoadedPdfScene["scene"]): Float32Array {
+  if (scene.pageRects instanceof Float32Array && scene.pageRects.length >= 4) {
+    return new Float32Array(scene.pageRects);
+  }
+
+  return new Float32Array([
+    scene.pageBounds.minX,
+    scene.pageBounds.minY,
+    scene.pageBounds.maxX,
+    scene.pageBounds.maxY
+  ]);
+}
+
+function normalizeObjectPageTextRanges(
+  scene: LoadedPdfScene["scene"],
+  pageRects: Float32Array,
+  textInstanceCount: number
+): Uint32Array {
+  const pageCount = Math.max(1, Math.floor(pageRects.length / 4));
+  const expectedLength = pageCount * 2;
+  const maxTextInstanceCount = Math.max(0, textInstanceCount | 0);
+
+  if (scene.pageTextRanges instanceof Uint32Array && scene.pageTextRanges.length >= expectedLength) {
+    const out = new Uint32Array(expectedLength);
+    let previousEnd = 0;
+    for (let i = 0; i < pageCount; i += 1) {
+      const offset = i * 2;
+      const start = Math.min(maxTextInstanceCount, Math.max(previousEnd, Math.trunc(scene.pageTextRanges[offset])));
+      const count = Math.min(maxTextInstanceCount - start, Math.max(0, Math.trunc(scene.pageTextRanges[offset + 1])));
+      out[offset] = start;
+      out[offset + 1] = count;
+      previousEnd = start + count;
+    }
+    return out;
+  }
+
+  const out = new Uint32Array(expectedLength);
+  out[0] = 0;
+  out[1] = maxTextInstanceCount;
+  for (let i = 1; i < pageCount; i += 1) {
+    const offset = i * 2;
+    out[offset] = maxTextInstanceCount;
+    out[offset + 1] = 0;
+  }
+  return out;
 }
 
 function clamp01(value: number): number {

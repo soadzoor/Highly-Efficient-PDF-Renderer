@@ -570,6 +570,13 @@ uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
+// Base instance offset for windowed range draws; stays 0 in the native renderer.
+uniform float uTextInstanceStart;
+// Per-page tile mask (three adapter): pages drawn as baked tiles collapse their
+// glyphs here. Disabled (0) in the native renderers.
+uniform float uTextPageMaskEnabled;
+uniform sampler2D uTextPageModeTex;
+uniform ivec2 uTextPageModeTexSize;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
@@ -586,10 +593,17 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 }
 
 void main() {
-  int instanceIndex = int(aTextInstanceIndex + 0.5);
+  int instanceIndex = int(aTextInstanceIndex + uTextInstanceStart + 0.5);
   vec4 instanceA = texelFetch(uTextInstanceTexA, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
   vec4 instanceB = texelFetch(uTextInstanceTexB, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
   vec4 instanceC = texelFetch(uTextInstanceTexC, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
+
+  bool pageMasked = false;
+  if (uTextPageMaskEnabled >= 0.5) {
+    int pageIndex = int(instanceB.w + 0.5);
+    float pageMode = texelFetch(uTextPageModeTex, coordFromIndex(pageIndex, uTextPageModeTexSize), 0).r;
+    pageMasked = pageMode >= 0.5;
+  }
 
   int glyphIndex = int(instanceB.z + 0.5);
   vec4 glyphMetaA = texelFetch(uTextGlyphMetaTexA, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
@@ -597,7 +611,7 @@ void main() {
   vec4 glyphRasterMeta = texelFetch(uTextGlyphRasterMetaTex, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
 
   int segmentCount = int(glyphMetaA.y + 0.5);
-  if (segmentCount <= 0) {
+  if (segmentCount <= 0 || pageMasked) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
     vSegmentCount = 0;
@@ -1168,6 +1182,26 @@ export interface ViewState {
   zoom: number;
 }
 
+/** One page-text-tile bake request for external consumers (three adapter). */
+export interface PageTextTileBakeRequest {
+  /** Page index within the scene's page rect list. */
+  pageIndex: number;
+
+  /** Tile width in pixels. */
+  innerWidth: number;
+
+  /** Tile height in pixels. */
+  innerHeight: number;
+}
+
+/** Baked page-text-tile pixels: RGBA8, premultiplied alpha, row 0 = top (world maxY). */
+export interface PageTextTileBakePixels {
+  pageIndex: number;
+  innerWidth: number;
+  innerHeight: number;
+  pixels: Uint8Array;
+}
+
 /** Parameters for rendering a native frame through an external projection. */
 export interface ProjectedFrameOptions {
   /** Render viewport width in device pixels. */
@@ -1666,6 +1700,14 @@ export class WebGlFloorplanRenderer {
 
   private pageTextTileInstanceData: Float32Array = new Float32Array(0);
 
+  private pageTextTileBakeScratchTexture: WebGLTexture | null = null;
+
+  private pageTextTileBakeScratchFramebuffer: WebGLFramebuffer | null = null;
+
+  private pageTextTileBakeScratchWidth = 0;
+
+  private pageTextTileBakeScratchHeight = 0;
+
   private lastPageTextTileStats: PageTextTileStats = {
     enabled: true,
     active: false,
@@ -1835,6 +1877,14 @@ export class WebGlFloorplanRenderer {
     this.uPageTileCameraCenter = this.mustGetUniformLocation(this.pageTileProgram, "uCameraCenter");
     this.uPageTileZoom = this.mustGetUniformLocation(this.pageTileProgram, "uZoom");
     this.uPageTileAtlasTex = this.mustGetUniformLocation(this.pageTileProgram, "uPageTileAtlasTex");
+
+    // The page-mask sampler is only used by the three adapter's material copy of
+    // this shader. Point it at an always-bound unit so it never references unit
+    // 0, where a render-target texture could create a draw-time feedback loop.
+    const gl = this.gl;
+    gl.useProgram(this.textProgram);
+    gl.uniform1i(this.mustGetUniformLocation(this.textProgram, "uTextPageModeTex"), 13);
+    gl.useProgram(null);
 
     this.initializeGeometry();
     this.initializeState();
@@ -2374,6 +2424,7 @@ export class WebGlFloorplanRenderer {
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
     this.destroyPageTextTileResources();
+    this.destroyPageTextTileBakeScratchResources();
     const gl = this.gl;
     for (const layer of this.rasterLayers) {
       gl.deleteTexture(layer.texture);
@@ -3604,9 +3655,12 @@ export class WebGlFloorplanRenderer {
       return false;
     }
 
+    // Configure on a unit no shader samples (see the bake scratch equivalent).
+    gl.activeTexture(gl.TEXTURE15);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     configureColorTexture(gl);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
+    gl.bindTexture(gl.TEXTURE_2D, null);
 
     const framebuffer = gl.createFramebuffer();
     if (!framebuffer) {
@@ -3661,6 +3715,217 @@ export class WebGlFloorplanRenderer {
     this.pageTextTileAtlasWidth = 0;
     this.pageTextTileAtlasHeight = 0;
     this.resetPageTextTileAtlas();
+  }
+
+  // Bakes page text tiles and returns their pixels for external atlas consumers
+  // (three adapter). Pixels are RGBA8 premultiplied in the output color space,
+  // row 0 = top of the page (world maxY). The readback is asynchronous (PBO +
+  // fence) so callers never stall the main thread on the GPU.
+  bakePageTextTilePixels(requests: PageTextTileBakeRequest[]): Promise<PageTextTileBakePixels[] | null> {
+    if (this.isDisposed || !this.scene || this.textInstanceCount <= 0 || requests.length === 0) {
+      return Promise.resolve(null);
+    }
+
+    const pageCount = Math.floor(this.pageRects.length / 4);
+    const batch: { pageIndex: number; innerWidth: number; innerHeight: number; byteOffset: number }[] = [];
+    let maxWidth = 1;
+    let maxHeight = 1;
+    let totalBytes = 0;
+    for (const request of requests) {
+      const pageIndex = Math.trunc(request.pageIndex);
+      if (pageIndex < 0 || pageIndex >= pageCount) {
+        continue;
+      }
+      const innerWidth = clamp(Math.trunc(request.innerWidth), 1, 2048);
+      const innerHeight = clamp(Math.trunc(request.innerHeight), 1, 2048);
+      batch.push({ pageIndex, innerWidth, innerHeight, byteOffset: totalBytes });
+      totalBytes += innerWidth * innerHeight * 4;
+      maxWidth = Math.max(maxWidth, innerWidth);
+      maxHeight = Math.max(maxHeight, innerHeight);
+    }
+    if (batch.length === 0 || !this.ensurePageTextTileBakeScratchResources(maxWidth, maxHeight)) {
+      return Promise.resolve(null);
+    }
+
+    const gl = this.gl;
+    const packBuffer = gl.createBuffer();
+    if (!packBuffer) {
+      return Promise.resolve(null);
+    }
+
+    // Drain stale error state so the post-batch check below is meaningful.
+    while (gl.getError() !== gl.NO_ERROR) {
+      // clearing queued errors only
+    }
+
+    const wasLocalToClipEnabled = this.localToClipRenderingEnabled;
+    this.localToClipRenderingEnabled = false;
+    this.ensureRenderState();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pageTextTileBakeScratchFramebuffer);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, packBuffer);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, totalBytes, gl.STREAM_READ);
+
+    this.bindTextProgramCommon(1);
+    const scratchRange: InstanceRange[] = [{ start: 0, count: 0 }];
+
+    for (const entry of batch) {
+      const rectOffset = entry.pageIndex * 4;
+      const worldHeight = Math.abs(this.pageRects[rectOffset + 3] - this.pageRects[rectOffset + 1]);
+      const pageCenterX = (this.pageRects[rectOffset] + this.pageRects[rectOffset + 2]) * 0.5;
+      const pageCenterY = (this.pageRects[rectOffset + 1] + this.pageRects[rectOffset + 3]) * 0.5;
+      const zoomValue = entry.innerHeight / Math.max(worldHeight, 1e-9);
+
+      gl.scissor(0, 0, entry.innerWidth, entry.innerHeight);
+      gl.viewport(0, 0, entry.innerWidth, entry.innerHeight);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.uniform1f(this.uTextZoom, zoomValue);
+
+      const rangeOffset = entry.pageIndex * 2;
+      scratchRange[0].start = this.pageTextRanges[rangeOffset] ?? 0;
+      scratchRange[0].count = this.pageTextRanges[rangeOffset + 1] ?? 0;
+      if (scratchRange[0].count > 0) {
+        this.drawBoundTextRanges(scratchRange, entry.innerWidth, entry.innerHeight, pageCenterX, pageCenterY);
+      }
+
+      gl.readPixels(0, 0, entry.innerWidth, entry.innerHeight, gl.RGBA, gl.UNSIGNED_BYTE, entry.byteOffset);
+    }
+
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindVertexArray(null);
+    this.localToClipRenderingEnabled = wasLocalToClipEnabled;
+
+    const batchError = gl.getError();
+    if (batchError !== gl.NO_ERROR) {
+      // Let the caller retry the batch instead of caching broken tiles.
+      console.warn(`[HEPR] page text tile bake batch hit GL error 0x${batchError.toString(16)}; retrying later.`);
+      gl.deleteBuffer(packBuffer);
+      return Promise.resolve(null);
+    }
+
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!sync) {
+      gl.deleteBuffer(packBuffer);
+      return Promise.resolve(null);
+    }
+    gl.flush();
+
+    return new Promise((resolve) => {
+      const finish = (packed: Uint8Array | null) => {
+        gl.deleteSync(sync);
+        gl.deleteBuffer(packBuffer);
+        if (!packed) {
+          resolve(null);
+          return;
+        }
+        const results: PageTextTileBakePixels[] = [];
+        for (const entry of batch) {
+          const rowBytes = entry.innerWidth * 4;
+          const pixels = new Uint8Array(rowBytes * entry.innerHeight);
+          // readPixels rows start at the framebuffer bottom (world minY); flip to top-first.
+          for (let row = 0; row < entry.innerHeight; row += 1) {
+            const sourceOffset = entry.byteOffset + (entry.innerHeight - 1 - row) * rowBytes;
+            pixels.set(packed.subarray(sourceOffset, sourceOffset + rowBytes), row * rowBytes);
+          }
+          results.push({
+            pageIndex: entry.pageIndex,
+            innerWidth: entry.innerWidth,
+            innerHeight: entry.innerHeight,
+            pixels
+          });
+        }
+        resolve(results);
+      };
+
+      const poll = () => {
+        if (this.isDisposed) {
+          finish(null);
+          return;
+        }
+        const status = gl.clientWaitSync(sync, 0, 0);
+        if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+          const packed = new Uint8Array(totalBytes);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, packBuffer);
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, packed);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+          finish(packed);
+          return;
+        }
+        if (status === gl.WAIT_FAILED) {
+          finish(null);
+          return;
+        }
+        setTimeout(poll, 4);
+      };
+      poll();
+    });
+  }
+
+  private ensurePageTextTileBakeScratchResources(width: number, height: number): boolean {
+    if (
+      this.pageTextTileBakeScratchTexture &&
+      this.pageTextTileBakeScratchFramebuffer &&
+      this.pageTextTileBakeScratchWidth >= width &&
+      this.pageTextTileBakeScratchHeight >= height
+    ) {
+      return true;
+    }
+
+    this.destroyPageTextTileBakeScratchResources();
+
+    const gl = this.gl;
+    const desiredWidth = clamp(roundUpToPowerOfTwo(width), 64, 2048);
+    const desiredHeight = clamp(roundUpToPowerOfTwo(height), 64, 2048);
+
+    const texture = gl.createTexture();
+    if (!texture) {
+      return false;
+    }
+    // Configure on a unit no shader samples so the render target never sits on
+    // a samplable unit at draw time (feedback loops are draw-time errors).
+    gl.activeTexture(gl.TEXTURE15);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    configureColorTexture(gl);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, desiredWidth, desiredHeight);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      gl.deleteTexture(texture);
+      return false;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    this.pageTextTileBakeScratchTexture = texture;
+    this.pageTextTileBakeScratchFramebuffer = framebuffer;
+    this.pageTextTileBakeScratchWidth = desiredWidth;
+    this.pageTextTileBakeScratchHeight = desiredHeight;
+    return true;
+  }
+
+  private destroyPageTextTileBakeScratchResources(): void {
+    if (this.pageTextTileBakeScratchFramebuffer) {
+      this.gl.deleteFramebuffer(this.pageTextTileBakeScratchFramebuffer);
+      this.pageTextTileBakeScratchFramebuffer = null;
+    }
+    if (this.pageTextTileBakeScratchTexture) {
+      this.gl.deleteTexture(this.pageTextTileBakeScratchTexture);
+      this.pageTextTileBakeScratchTexture = null;
+    }
+    this.pageTextTileBakeScratchWidth = 0;
+    this.pageTextTileBakeScratchHeight = 0;
   }
 
   private updatePageTextTileStats(active: boolean, tiledPages: number, directPages: number, bakedPages: number): void {

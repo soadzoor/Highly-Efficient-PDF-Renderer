@@ -1,5 +1,13 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, PageTextTileStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type {
+  DrawStats,
+  PageTextTileBakePixels,
+  PageTextTileBakeRequest,
+  PageTextTileStats,
+  ProjectedFrameOptions,
+  SceneStats,
+  ViewState
+} from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
 /** Native HEPR renderer backend identifier. */
@@ -59,6 +67,9 @@ export interface RendererApi {
 
   /** Return page text tile diagnostics for the last drawn frame. */
   getPageTextTileStats?(): PageTextTileStats;
+
+  /** Bake page text tiles and return their pixels for external atlases. */
+  bakePageTextTilePixels?(requests: PageTextTileBakeRequest[]): Promise<PageTextTileBakePixels[] | null>;
 
   /** Set page background color with normalized RGBA channels. */
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void;

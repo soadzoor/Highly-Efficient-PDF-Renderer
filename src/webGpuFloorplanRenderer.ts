@@ -1,5 +1,12 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, PageTextTileStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type {
+  DrawStats,
+  PageTextTileBakePixels,
+  PageTextTileBakeRequest,
+  PageTextTileStats,
+  SceneStats,
+  ViewState
+} from "./webGlFloorplanRenderer";
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
   CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
@@ -1372,6 +1379,12 @@ export class WebGpuFloorplanRenderer {
 
   private pageTextTileInstanceData: Float32Array = new Float32Array(0);
 
+  private pageTextTileBakeScratchTexture: any = null;
+
+  private pageTextTileBakeScratchWidth = 0;
+
+  private pageTextTileBakeScratchHeight = 0;
+
   private pageRects: Float32Array = new Float32Array(0);
 
   private pageTextRanges: Uint32Array = new Uint32Array(0);
@@ -2714,6 +2727,7 @@ export class WebGpuFloorplanRenderer {
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
     this.destroyPageTextTileResources();
+    this.destroyPageTextTileBakeScratchResources();
     this.pageTextTileRecords = [];
     this.destroyDataResources();
 
@@ -3713,6 +3727,182 @@ export class WebGpuFloorplanRenderer {
     this.pageTextTileAtlasHeight = 0;
     this.pageTextTileFramePlan = null;
     this.resetPageTextTileAtlas();
+  }
+
+  // Bakes page text tiles and returns their pixels for external atlas consumers
+  // (three adapter). Pixels are RGBA8 premultiplied in the output color space,
+  // row 0 = top of the page (world maxY).
+  async bakePageTextTilePixels(requests: PageTextTileBakeRequest[]): Promise<PageTextTileBakePixels[] | null> {
+    if (!this.scene || this.textInstanceCount <= 0 || !this.textBakeBindGroup || requests.length === 0) {
+      return null;
+    }
+
+    const pageCount = Math.floor(this.pageRects.length / 4);
+    const batch: { pageIndex: number; innerWidth: number; innerHeight: number }[] = [];
+    for (const request of requests) {
+      if (batch.length >= PAGE_TEXT_TILE_MAX_BAKES_PER_FRAME) {
+        break;
+      }
+      const pageIndex = Math.trunc(request.pageIndex);
+      if (pageIndex < 0 || pageIndex >= pageCount) {
+        continue;
+      }
+      batch.push({
+        pageIndex,
+        innerWidth: clamp(Math.trunc(request.innerWidth), 1, 2048),
+        innerHeight: clamp(Math.trunc(request.innerHeight), 1, 2048)
+      });
+    }
+    if (batch.length === 0) {
+      return null;
+    }
+
+    let maxWidth = 1;
+    let maxHeight = 1;
+    for (const entry of batch) {
+      maxWidth = Math.max(maxWidth, entry.innerWidth);
+      maxHeight = Math.max(maxHeight, entry.innerHeight);
+    }
+    if (!this.ensurePageTextTileBakeScratchResources(maxWidth, maxHeight)) {
+      return null;
+    }
+
+    const floatsPerSlice = PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES / 4;
+    const uniformData = new Float32Array(batch.length * floatsPerSlice);
+    const layouts: { bufferOffset: number; bytesPerRow: number }[] = [];
+    let readBufferBytes = 0;
+    for (let i = 0; i < batch.length; i += 1) {
+      const entry = batch[i];
+      const rectOffset = entry.pageIndex * 4;
+      const worldHeight = Math.abs(this.pageRects[rectOffset + 3] - this.pageRects[rectOffset + 1]);
+      const pageCenterX = (this.pageRects[rectOffset] + this.pageRects[rectOffset + 2]) * 0.5;
+      const pageCenterY = (this.pageRects[rectOffset + 1] + this.pageRects[rectOffset + 3]) * 0.5;
+      const base = i * floatsPerSlice;
+      uniformData[base] = entry.innerWidth;
+      uniformData[base + 1] = entry.innerHeight;
+      uniformData[base + 2] = pageCenterX;
+      uniformData[base + 3] = pageCenterY;
+      uniformData[base + 4] = entry.innerHeight / Math.max(worldHeight, 1e-9);
+      uniformData[base + 5] = 1.0;
+      uniformData[base + 6] = this.strokeCurveEnabled ? 1 : 0;
+      uniformData[base + 7] = 1.25;
+      uniformData[base + 8] = this.strokeCurveEnabled ? 1 : 0;
+      uniformData[base + 9] = 1.0;
+      uniformData[base + 10] = this.textVectorOnly ? 1 : 0;
+      uniformData[base + 11] = 0;
+      uniformData[base + 12] = this.vectorOverrideColor[0];
+      uniformData[base + 13] = this.vectorOverrideColor[1];
+      uniformData[base + 14] = this.vectorOverrideColor[2];
+      uniformData[base + 15] = this.vectorOverrideOpacity;
+
+      const bytesPerRow = alignTo(entry.innerWidth * 4, 256);
+      const bufferOffset = alignTo(readBufferBytes, 512);
+      layouts.push({ bufferOffset, bytesPerRow });
+      readBufferBytes = bufferOffset + bytesPerRow * entry.innerHeight;
+    }
+
+    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
+    const readBuffer = this.gpuDevice.createBuffer({
+      size: Math.max(4, readBufferBytes),
+      usage: gpuBufferUsage.COPY_DST | gpuBufferUsage.MAP_READ
+    });
+
+    this.gpuDevice.queue.writeBuffer(this.pageTextTileBakeUniformBuffer, 0, uniformData);
+
+    const encoder = this.gpuDevice.createCommandEncoder();
+    for (let i = 0; i < batch.length; i += 1) {
+      const entry = batch[i];
+      const rangeOffset = entry.pageIndex * 2;
+      const rangeStart = this.pageTextRanges[rangeOffset] ?? 0;
+      const rangeCount = this.pageTextRanges[rangeOffset + 1] ?? 0;
+
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: this.pageTextTileBakeScratchTexture.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store"
+          }
+        ]
+      });
+      pass.setViewport(0, 0, entry.innerWidth, entry.innerHeight, 0, 1);
+      pass.setScissorRect(0, 0, entry.innerWidth, entry.innerHeight);
+      if (rangeCount > 0) {
+        pass.setPipeline(this.textBakePipeline);
+        pass.setBindGroup(0, this.textBakeBindGroup, [i * PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES]);
+        pass.draw(4, rangeCount, 0, rangeStart);
+      }
+      pass.end();
+
+      encoder.copyTextureToBuffer(
+        { texture: this.pageTextTileBakeScratchTexture },
+        { buffer: readBuffer, offset: layouts[i].bufferOffset, bytesPerRow: layouts[i].bytesPerRow, rowsPerImage: entry.innerHeight },
+        { width: entry.innerWidth, height: entry.innerHeight, depthOrArrayLayers: 1 }
+      );
+    }
+    this.gpuDevice.queue.submit([encoder.finish()]);
+
+    const gpuMapMode = (globalThis as any).GPUMapMode;
+    await readBuffer.mapAsync(gpuMapMode.READ);
+    const mapped = new Uint8Array(readBuffer.getMappedRange());
+    const swizzleBgra = String(this.presentationFormat).toLowerCase().startsWith("bgra");
+
+    const results: PageTextTileBakePixels[] = [];
+    for (let i = 0; i < batch.length; i += 1) {
+      const entry = batch[i];
+      const rowBytes = entry.innerWidth * 4;
+      const pixels = new Uint8Array(rowBytes * entry.innerHeight);
+      for (let row = 0; row < entry.innerHeight; row += 1) {
+        const sourceOffset = layouts[i].bufferOffset + row * layouts[i].bytesPerRow;
+        pixels.set(mapped.subarray(sourceOffset, sourceOffset + rowBytes), row * rowBytes);
+      }
+      if (swizzleBgra) {
+        for (let p = 0; p < pixels.length; p += 4) {
+          const blue = pixels[p];
+          pixels[p] = pixels[p + 2];
+          pixels[p + 2] = blue;
+        }
+      }
+      results.push({ pageIndex: entry.pageIndex, innerWidth: entry.innerWidth, innerHeight: entry.innerHeight, pixels });
+    }
+
+    readBuffer.unmap();
+    readBuffer.destroy();
+    return results;
+  }
+
+  private ensurePageTextTileBakeScratchResources(width: number, height: number): boolean {
+    if (
+      this.pageTextTileBakeScratchTexture &&
+      this.pageTextTileBakeScratchWidth >= width &&
+      this.pageTextTileBakeScratchHeight >= height
+    ) {
+      return true;
+    }
+
+    this.destroyPageTextTileBakeScratchResources();
+
+    const desiredWidth = clamp(roundUpToPowerOfTwo(width), 64, 2048);
+    const desiredHeight = clamp(roundUpToPowerOfTwo(height), 64, 2048);
+    const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
+    this.pageTextTileBakeScratchTexture = this.gpuDevice.createTexture({
+      size: { width: desiredWidth, height: desiredHeight, depthOrArrayLayers: 1 },
+      format: this.presentationFormat,
+      usage: gpuTextureUsage.RENDER_ATTACHMENT | gpuTextureUsage.COPY_SRC
+    });
+    this.pageTextTileBakeScratchWidth = desiredWidth;
+    this.pageTextTileBakeScratchHeight = desiredHeight;
+    return true;
+  }
+
+  private destroyPageTextTileBakeScratchResources(): void {
+    if (this.pageTextTileBakeScratchTexture) {
+      this.pageTextTileBakeScratchTexture.destroy();
+      this.pageTextTileBakeScratchTexture = null;
+    }
+    this.pageTextTileBakeScratchWidth = 0;
+    this.pageTextTileBakeScratchHeight = 0;
   }
 
   private updatePageTextTileStats(active: boolean, tiledPages: number, directPages: number, bakedPages: number): void {

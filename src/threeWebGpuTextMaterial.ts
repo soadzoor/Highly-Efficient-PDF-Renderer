@@ -13,6 +13,8 @@ export interface ThreeWebGpuTextMaterialState {
   useLocalToClipUniform: MutableUniform<number>;
   curveUniform: MutableUniform<number>;
   vectorOnlyUniform: MutableUniform<number>;
+  instanceStartUniform: MutableUniform<number>;
+  pageMaskEnabledUniform: MutableUniform<number>;
 }
 
 interface ThreeWebGpuTextMaterialOptions {
@@ -21,8 +23,13 @@ interface ThreeWebGpuTextMaterialOptions {
   textInstanceTextureC: THREE.DataTexture;
   textGlyphMetaTextureA: THREE.DataTexture;
   textGlyphMetaTextureB: THREE.DataTexture;
+  textGlyphRasterMetaTexture: THREE.DataTexture;
   textGlyphSegmentTextureA: THREE.DataTexture;
   textGlyphSegmentTextureB: THREE.DataTexture;
+  textRasterAtlasTexture: THREE.DataTexture;
+  textPageModeTexture: THREE.DataTexture;
+  textPageModeTextureWidth: number;
+  rasterAtlasSize: THREE.Vector2;
   textInstanceTextureWidth: number;
   textGlyphTextureWidth: number;
   textSegmentTextureWidth: number;
@@ -44,6 +51,10 @@ function callNode(fn: WgslFunction, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
 }
 
+function component(node: unknown, key: string): never {
+  return (node as Record<string, never>)[key];
+}
+
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
   let itemIndex = i32(index + 0.5);
@@ -58,10 +69,11 @@ fn heprTextVertexPack(
   instanceA: vec4<f32>,
   instanceB: vec4<f32>,
   glyphMetaA: vec4<f32>,
-  glyphMetaB: vec4<f32>
+  glyphMetaB: vec4<f32>,
+  pageMasked: f32
 ) -> vec4<f32> {
   let segmentCount = i32(glyphMetaA.y + 0.5);
-  if (segmentCount <= 0) {
+  if (segmentCount <= 0 || pageMasked >= 0.5) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
 
@@ -210,6 +222,10 @@ fn heprTextFragment(
   local: vec2<f32>,
   glyphMetaA: vec4<f32>,
   instanceColor: vec4<f32>,
+  rasterRect: vec4<f32>,
+  atlasCoverage: f32,
+  atlasMinFwidth: f32,
+  textVectorOnly: f32,
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
@@ -221,6 +237,18 @@ fn heprTextFragment(
   let segmentCount = i32(glyphMetaA.y + 0.5);
   if (segmentCount <= 0 || instanceColor.a <= 0.001) {
     discard;
+  }
+
+  // Minified glyphs sample the mipmapped raster atlas instead of evaluating
+  // curve segments per pixel, mirroring the native renderers' fast path.
+  if (textVectorOnly < 0.5 && rasterRect.z > 0.0 && rasterRect.w > 0.0 && atlasMinFwidth > 2.0) {
+    let alphaRaster = clamp(atlasCoverage, 0.0, 1.0) * instanceColor.a;
+    if (alphaRaster <= 0.001) {
+      discard;
+    }
+    let rasterMixAmount = clamp(vectorOverride.a, 0.0, 1.0);
+    let rasterColor = instanceColor.rgb * (1.0 - rasterMixAmount) + vectorOverride.rgb * rasterMixAmount;
+    return vec4<f32>(rasterColor, alphaRaster);
   }
 
   var minDistance = 100000000000000000000.0;
@@ -289,13 +317,16 @@ export function createThreeWebGpuTextMaterial(
   const useLocalToClipUniform = TSL.uniform(0);
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
   const vectorOnlyUniform = TSL.uniform(options.textVectorOnly ? 1 : 0);
+  const instanceStartUniform = TSL.uniform(0);
+  const pageMaskEnabledUniform = TSL.uniform(0);
+  const pageModeTextureWidthUniform = TSL.uniform(Math.max(1, options.textPageModeTextureWidth));
   const textAAScreenPxUniform = TSL.uniform(1.25);
   const instanceTextureWidthUniform = TSL.uniform(Math.max(1, options.textInstanceTextureWidth));
   const glyphTextureWidthUniform = TSL.uniform(Math.max(1, options.textGlyphTextureWidth));
   const segmentTextureWidthUniform = TSL.uniform(Math.max(1, options.textSegmentTextureWidth));
 
   const corner = TSL.attribute("aCorner", "vec2");
-  const instanceIndex = TSL.attribute("aTextInstanceIndex", "float");
+  const instanceIndex = TSL.add(TSL.attribute("aTextInstanceIndex", "float"), instanceStartUniform);
   const instanceCoord = callNode(coordFromIndexFn, {
     index: instanceIndex,
     width: instanceTextureWidthUniform
@@ -309,12 +340,22 @@ export function createThreeWebGpuTextMaterial(
   });
   const glyphMetaA = TSL.varying(TSL.textureLoad(options.textGlyphMetaTextureA, glyphCoord, 0));
   const glyphMetaB = TSL.varying(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0));
+  const glyphRasterMeta = TSL.varying(TSL.textureLoad(options.textGlyphRasterMetaTexture, glyphCoord, 0));
+  const pageModeCoord = callNode(coordFromIndexFn, {
+    index: component(instanceB, "w"),
+    width: pageModeTextureWidthUniform
+  });
+  const pageMasked = TSL.mul(
+    component(TSL.textureLoad(options.textPageModeTexture, pageModeCoord, 0), "r"),
+    pageMaskEnabledUniform
+  );
   const vertexPack = TSL.varying(callNode(textVertexPackFn, {
     corner,
     instanceA,
     instanceB,
     glyphMetaA,
-    glyphMetaB
+    glyphMetaB,
+    pageMasked
   }));
   const vertexPackValue = vertexPack as typeof vertexPack & { zw: unknown };
 
@@ -326,10 +367,44 @@ export function createThreeWebGpuTextMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: TSL.uniform(options.localToClip)
   });
+
+  // Atlas coverage for minified glyphs: one trilinear tap at the natural mip
+  // level of the glyph's atlas tile, mirroring the native fast path.
+  const localNode = component(vertexPack, "zw");
+  const minBounds = component(glyphMetaA, "zw");
+  const maxBounds = component(glyphMetaB, "xy");
+  const normCoord = TSL.clamp(
+    TSL.div(TSL.sub(localNode, minBounds), TSL.max(TSL.sub(maxBounds, minBounds), TSL.vec2(1e-6, 1e-6))),
+    0,
+    1
+  );
+  const ncFlipped = TSL.vec2(component(normCoord, "x"), TSL.sub(1, component(normCoord, "y")));
+  const rasterRectXY = component(glyphRasterMeta, "xy");
+  const rasterRectZW = component(glyphRasterMeta, "zw");
+  const atlasSizeUniform = TSL.uniform(options.rasterAtlasSize);
+  const ncPx = TSL.mul(TSL.mul(ncFlipped, rasterRectZW), atlasSizeUniform);
+  const ncFwidthX = TSL.fwidth(component(ncPx, "x"));
+  const ncFwidthY = TSL.fwidth(component(ncPx, "y"));
+  const atlasMinFwidth = TSL.min(ncFwidthX, ncFwidthY);
+  const atlasLod = TSL.clamp(TSL.log2(TSL.max(TSL.max(ncFwidthX, ncFwidthY), 1e-6)), 0, 12);
+  const atlasTexel = TSL.div(TSL.vec2(1, 1), atlasSizeUniform);
+  const uvCenter = TSL.add(rasterRectXY, TSL.mul(ncFlipped, rasterRectZW));
+  const uvMin = TSL.add(rasterRectXY, TSL.mul(atlasTexel, 0.5));
+  const uvMax = TSL.sub(TSL.add(rasterRectXY, rasterRectZW), TSL.mul(atlasTexel, 0.5));
+  const uvClamped = TSL.clamp(uvCenter, uvMin, uvMax);
+  const atlasSample = (
+    TSL.texture(options.textRasterAtlasTexture, uvClamped) as unknown as { level: (lod: unknown) => unknown }
+  ).level(atlasLod);
+  const atlasCoverage = component(atlasSample, "r");
+
   material.fragmentNode = callNode(textFragmentFn, {
     local: vertexPackValue.zw,
     glyphMetaA,
     instanceColor,
+    rasterRect: glyphRasterMeta,
+    atlasCoverage,
+    atlasMinFwidth,
+    textVectorOnly: vectorOnlyUniform,
     segmentTexA: TSL.textureLoad(options.textGlyphSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.textGlyphSegmentTextureB),
     segmentTexWidth: segmentTextureWidthUniform,
@@ -343,6 +418,8 @@ export function createThreeWebGpuTextMaterial(
     zoomUniform: zoomUniform as MutableUniform<number>,
     useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
     curveUniform: curveUniform as MutableUniform<number>,
-    vectorOnlyUniform: vectorOnlyUniform as MutableUniform<number>
+    vectorOnlyUniform: vectorOnlyUniform as MutableUniform<number>,
+    instanceStartUniform: instanceStartUniform as MutableUniform<number>,
+    pageMaskEnabledUniform: pageMaskEnabledUniform as MutableUniform<number>
   };
 }
