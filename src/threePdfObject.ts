@@ -1,13 +1,14 @@
 import * as THREE from "three";
 
 import { createCanvasInteractionController, type CanvasInteractionController } from "./canvasInteractions";
+import { heprPerf } from "./heprPerfLog";
 import type { Bounds } from "./pdfVectorExtractor";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
 import type { RendererApi } from "./rendererTypes";
 import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
-import { ThreeMaterialPageTileLayer } from "./threeMaterialPageTileLayer";
-import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
+import { ThreeMaterialPageTileLayer, type PageTileUpload } from "./threeMaterialPageTileLayer";
+import { ThreeMaterialRasterLayer, type HeprPageBackgroundMode } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
 import { HEPR_THREE_LAYER_ORDER_PAGE_DEPTH } from "./threeLayerOrder";
@@ -40,20 +41,42 @@ const THREE_PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX = 176;
 const THREE_PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX = 200;
 const THREE_PAGE_TEXT_TILE_RATIO_MIN = 0.75;
 const THREE_PAGE_TEXT_TILE_RATIO_MAX = 1.3333333333;
+// Bakes are async here, so a tile whose scale drifted outside the fresh
+// window keeps displaying (briefly blurry) while its rebake is in flight —
+// falling back to per-glyph drawing for hundreds of pages at once is orders
+// of magnitude slower than a soft tile. The display window bounds how far a
+// stale tile may be stretched before the page really goes direct.
+const THREE_PAGE_TEXT_TILE_DISPLAY_RATIO_MIN = 0.2;
+const THREE_PAGE_TEXT_TILE_DISPLAY_RATIO_MAX = 5;
 const THREE_PAGE_TEXT_TILE_GUTTER_PX = 2;
-const THREE_PAGE_TEXT_TILE_ATLAS_DIM = 2048;
-const THREE_PAGE_TEXT_TILE_MAX_TILE_DIM = 512;
-const THREE_PAGE_TEXT_TILE_BAKE_MAX_PAGES = 128;
-const THREE_PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET = 300_000;
+const THREE_PAGE_TEXT_TILE_ATLAS_MIN_DIM = 2048;
+const THREE_PAGE_TEXT_TILE_ATLAS_MAX_DIM = 4096;
+const THREE_PAGE_TEXT_TILE_ATLAS_AREA_FACTOR = 1.35;
+const THREE_PAGE_TEXT_TILE_MAX_TILE_DIM = 1024;
+const THREE_PAGE_TEXT_TILE_BAKE_MAX_PAGES = 512;
+const THREE_PAGE_TEXT_TILE_BAKE_MIN_PAGES = 24;
+const THREE_PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET = 400_000;
+const THREE_PAGE_TEXT_TILE_MAX_CONCURRENT_BAKES = 2;
 const THREE_PAGE_TEXT_TILE_STABLE_FRAMES = 3;
 
 interface ThreePageTextTileRecord {
+  tileMode: boolean;
   hasTile: boolean;
   atlasX: number;
   atlasY: number;
   innerWidth: number;
   innerHeight: number;
   epoch: number;
+  generation: number;
+}
+
+interface ThreePageTileBakeCandidate {
+  pageIndex: number;
+  distanceSq: number;
+  instanceCount: number;
+  innerWidth: number;
+  innerHeight: number;
+  hasDisplayableTile: boolean;
 }
 
 type ThreeSceneRenderCallback = THREE.Scene["onBeforeRender"];
@@ -74,6 +97,8 @@ const sceneRenderHooks = new WeakMap<THREE.Scene, HeprSceneRenderHook>();
  * WebGPU-capable three.js renderer.
  */
 export type HeprRendererType = "webgl" | "webgpu";
+
+export type { HeprPageBackgroundMode } from "./threeMaterialRasterLayer";
 
 /**
  * Color accepted by HEPR option helpers.
@@ -163,6 +188,20 @@ export interface HeprThreeObjectOptions {
    * @default 0
    */
   vectorOverrideOpacity?: number;
+
+  /**
+   * How page background rectangles are represented in the three.js scene.
+   *
+   * - `"mesh"`: one plain `THREE.Mesh` per page (raycastable; moving a page
+   *   mesh's x/y position moves the whole page's content with it — see
+   *   `getPageBackgroundMesh` / `setPageOffset`).
+   * - `"instanced"`: a single instanced draw for all page backgrounds — the
+   *   fastest option for documents with many pages.
+   * - `"auto"`: `"mesh"` up to 200 pages, `"instanced"` above.
+   *
+   * @default "auto"
+   */
+  pageBackgroundMode?: HeprPageBackgroundMode;
 }
 
 interface ViewportPixels {
@@ -179,6 +218,12 @@ interface ThreeHostRenderer {
   getDrawingBufferSize?: (target: THREE.Vector2) => THREE.Vector2;
   getSize?: (target: THREE.Vector2) => THREE.Vector2;
   getPixelRatio?: () => number;
+  copyTextureToTexture?: (
+    srcTexture: THREE.Texture,
+    dstTexture: THREE.Texture,
+    srcRegion?: unknown,
+    dstPosition?: unknown
+  ) => void;
 }
 
 interface SceneBounds {
@@ -266,16 +311,19 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly tilePageTextRanges: Uint32Array;
   private readonly pageTileRecords: ThreePageTextTileRecord[];
   private readonly pageTileInstanceData: Float32Array;
-  private readonly pageTileMaskScratch: Uint8Array;
+  private readonly pageOffsets: Float32Array;
+  private readonly pageOffsetDirtyPages = new Set<number>();
   private readonly previousClipFromDataElements = new Float32Array(16);
   private clipFromDataStableFrames = 0;
   private pageTileShelfX = 0;
   private pageTileShelfY = 0;
   private pageTileShelfRowHeight = 0;
+  private pageTileActiveGeneration = 0;
   private pageTileEpoch = 0;
   private pageTextTilesEnabled = true;
-  private pageTileModeActive = false;
-  private pageTileBakeInFlight = false;
+  private pageTileBakesInFlight = 0;
+  private readonly pageTileBakePendingPages = new Set<number>();
+  private lastHostRenderer: ThreeHostRenderer | null = null;
   private lastPageTileStats: PageTextTileStats = {
     enabled: true,
     active: false,
@@ -418,7 +466,7 @@ export class HeprThreePdfObject extends THREE.Group {
       this.add(this.compactedStrokeLayer.group);
     }
     this.textMaterialLayer.setVisible(false);
-    this.add(this.textMaterialLayer.mesh);
+    this.add(this.textMaterialLayer.group);
 
     this.tilePageRects = normalizeObjectPageRects(loadedScene.scene);
     this.tilePageTextRanges = normalizeObjectPageTextRanges(
@@ -430,20 +478,23 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pageTileRecords = new Array(tilePageCount);
     for (let i = 0; i < tilePageCount; i += 1) {
       this.pageTileRecords[i] = {
+        tileMode: false,
         hasTile: false,
         atlasX: 0,
         atlasY: 0,
         innerWidth: 0,
         innerHeight: 0,
-        epoch: -1
+        epoch: -1,
+        generation: 0
       };
     }
     this.pageTileInstanceData = new Float32Array(Math.max(8, tilePageCount * 8));
-    this.pageTileMaskScratch = new Uint8Array(Math.max(1, tilePageCount));
+    this.pageOffsets = new Float32Array(Math.max(2, tilePageCount * 2));
+    this.textMaterialLayer.setSharedPageOffsets(this.pageOffsets);
     this.pageTileLayer = new ThreeMaterialPageTileLayer({
       materialBackend: rendererType === "webgpu" ? "webgpu" : "webgl",
-      atlasWidth: THREE_PAGE_TEXT_TILE_ATLAS_DIM,
-      atlasHeight: THREE_PAGE_TEXT_TILE_ATLAS_DIM,
+      atlasWidth: THREE_PAGE_TEXT_TILE_ATLAS_MIN_DIM,
+      atlasHeight: THREE_PAGE_TEXT_TILE_ATLAS_MIN_DIM,
       maxTileCount: Math.max(1, tilePageCount)
     });
     this.add(this.pageTileLayer.mesh);
@@ -637,8 +688,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pageTextTilesEnabled = nextEnabled;
     this.invalidatePageTextTiles();
     if (!nextEnabled) {
-      this.pageTileLayer.setVisible(false);
-      this.pageTileModeActive = false;
+      this.deactivatePageTileRendering();
     }
   }
 
@@ -647,6 +697,56 @@ export class HeprThreePdfObject extends THREE.Group {
    */
   getPageTextTileStats(): PageTextTileStats {
     return { ...this.lastPageTileStats };
+  }
+
+  /** Number of pages in the loaded document. */
+  getPageCount(): number {
+    return this.pageTileRecords.length;
+  }
+
+  /**
+   * Offset a page's content from its laid-out position, in PDF scene units.
+   *
+   * Moves the page's text glyphs, fill paths, baked text tiles, and page
+   * background together. Limitations: stroke geometry does not follow page
+   * offsets yet, and neither does the non-camera-driven fallback texture
+   * path.
+   */
+  setPageOffset(pageIndex: number, offsetX: number, offsetY: number): void {
+    if (this.isDisposed || !Number.isFinite(offsetX) || !Number.isFinite(offsetY)) {
+      return;
+    }
+    const index = Math.trunc(pageIndex);
+    if (index < 0 || index >= this.pageTileRecords.length) {
+      return;
+    }
+    if (this.pageOffsets[index * 2] === offsetX && this.pageOffsets[index * 2 + 1] === offsetY) {
+      return;
+    }
+    this.pageOffsets[index * 2] = offsetX;
+    this.pageOffsets[index * 2 + 1] = offsetY;
+    this.pageOffsetDirtyPages.add(index);
+    this.rasterMaterialLayer.setPageOffset(index, offsetX, offsetY);
+  }
+
+  /** Read a page's current offset. Returns null for out-of-range pages. */
+  getPageOffset(pageIndex: number, target = new THREE.Vector2()): THREE.Vector2 | null {
+    const index = Math.trunc(pageIndex);
+    if (index < 0 || index >= this.pageTileRecords.length) {
+      return null;
+    }
+    return target.set(this.pageOffsets[index * 2], this.pageOffsets[index * 2 + 1]);
+  }
+
+  /**
+   * The page's background mesh when the layer runs in per-page mesh mode
+   * (`pageBackgroundMode: "mesh"`, or `"auto"` up to 200 pages), else null.
+   *
+   * Moving this mesh's x/y position moves the whole page — text, fills, and
+   * tiles follow on the next rendered frame.
+   */
+  getPageBackgroundMesh(pageIndex: number): THREE.Mesh | null {
+    return this.rasterMaterialLayer.getPageBackgroundMesh(Math.trunc(pageIndex));
   }
 
   /**
@@ -741,7 +841,7 @@ export class HeprThreePdfObject extends THREE.Group {
     if (this.compactedStrokeLayer) {
       this.remove(this.compactedStrokeLayer.group);
     }
-    this.remove(this.textMaterialLayer.mesh);
+    this.remove(this.textMaterialLayer.group);
     this.interactionController.detach();
     this.controlsCanvas = null;
   }
@@ -845,6 +945,16 @@ export class HeprThreePdfObject extends THREE.Group {
       return;
     }
 
+    const perfSyncStart = heprPerf.enabled ? performance.now() : 0;
+    this.lastHostRenderer = renderer;
+    this.syncBeforeRenderInternal(renderer, camera);
+    if (heprPerf.enabled) {
+      heprPerf.noteSync(performance.now() - perfSyncStart);
+    }
+  }
+
+  private syncBeforeRenderInternal(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    this.flushPageOffsets(renderer);
     const rendererViewport = readThreeRendererViewportPixels(renderer);
     this.updateTextureSampling(renderer);
     const cameraType = camera as { isPerspectiveCamera?: boolean };
@@ -969,7 +1079,7 @@ export class HeprThreePdfObject extends THREE.Group {
       if (this.vectorLodStrokeLayer && this.vectorLodStrokeLayer.group.visible) {
         this.vectorLodStrokeLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
-      if (this.textMaterialLayer.mesh.visible) {
+      if (this.textMaterialLayer.group.visible) {
         this.textMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
       if (this.pageTileLayer.mesh.visible) {
@@ -988,6 +1098,28 @@ export class HeprThreePdfObject extends THREE.Group {
       this.renderTexture.needsUpdate = true;
       this.lastUploadedFrameSerial = presentedFrameSerial;
     }
+  }
+
+  // Adopts page-mesh moves made by the application and pushes all pending
+  // page offsets into the content layers before the frame's culling and
+  // uploads run.
+  private flushPageOffsets(renderer: ThreeHostRenderer): void {
+    this.rasterMaterialLayer.collectMeshDrivenOffsetChanges((pageIndex, offsetX, offsetY) => {
+      if (this.pageOffsets[pageIndex * 2] === offsetX && this.pageOffsets[pageIndex * 2 + 1] === offsetY) {
+        return;
+      }
+      this.pageOffsets[pageIndex * 2] = offsetX;
+      this.pageOffsets[pageIndex * 2 + 1] = offsetY;
+      this.pageOffsetDirtyPages.add(pageIndex);
+    });
+
+    if (this.pageOffsetDirtyPages.size === 0) {
+      return;
+    }
+    const changedPages = Array.from(this.pageOffsetDirtyPages);
+    this.pageOffsetDirtyPages.clear();
+    this.textMaterialLayer.applyPageOffsets(this.pageOffsets, changedPages, renderer);
+    this.fillMaterialLayer.applyPageOffsets(this.pageOffsets, changedPages);
   }
 
   private resizeNativeRendererCanvas(viewport: ViewportPixels): void {
@@ -1266,9 +1398,12 @@ export class HeprThreePdfObject extends THREE.Group {
     );
   }
 
-  // Swaps the per-glyph text mesh for baked page tiles when every visible page
-  // is small on screen. All-or-nothing per frame: tiles draw only once each
-  // visible page has a valid bake, so glyphs and tiles never double-draw.
+  // Mixes baked page tiles with direct glyph ranges per page, mirroring the
+  // native renderers: each visible page independently enters/exits tile mode
+  // by its on-screen size, pages with valid bakes draw as single tile quads,
+  // and every other page (including pages whose bakes are still in flight)
+  // keeps drawing direct glyph ranges so panning never regresses to a full
+  // direct draw.
   private updatePageTextTiles(
     pipelineActive: boolean,
     cullingBounds: Bounds | null,
@@ -1288,27 +1423,38 @@ export class HeprThreePdfObject extends THREE.Group {
       textInstanceCount < THREE_PAGE_TEXT_TILE_MIN_TEXT_INSTANCES
     ) {
       this.deactivatePageTileRendering();
-      this.pageTileModeActive = false;
       this.updatePageTileStats(false, 0, 0, 0);
       return;
     }
 
-    const transformStable = this.trackClipFromDataStability();
+    // Size the atlas so EACH generation half holds a native-sized working set
+    // (viewport area x 1.35); overflow then recycles the other half instead of
+    // ever wiping the visible tiles.
+    const desiredAtlasArea = Math.max(1, viewport.width * viewport.height) * THREE_PAGE_TEXT_TILE_ATLAS_AREA_FACTOR * 2;
+    if (this.pageTileLayer.ensureAtlasArea(desiredAtlasArea, THREE_PAGE_TEXT_TILE_ATLAS_MAX_DIM)) {
+      this.invalidatePageTextTiles();
+    }
 
-    const visiblePages: number[] = [];
-    const targetWidths: number[] = [];
-    const targetHeights: number[] = [];
-    let maxHeight = 0;
+    const transformStable = this.trackClipFromDataStability();
+    const viewCenterX = (cullingBounds.minX + cullingBounds.maxX) * 0.5;
+    const viewCenterY = (cullingBounds.minY + cullingBounds.maxY) * 0.5;
+
+    const directPages: number[] = [];
+    const candidates: ThreePageTileBakeCandidate[] = [];
+    let tileCount = 0;
+
     for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
       const rangeCount = this.tilePageTextRanges[pageIndex * 2 + 1] ?? 0;
       if (rangeCount <= 0) {
         continue;
       }
       const rectOffset = pageIndex * 4;
-      const minX = Math.min(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
-      const minY = Math.min(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
-      const maxX = Math.max(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
-      const maxY = Math.max(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
+      const pageOffsetX = this.pageOffsets[pageIndex * 2];
+      const pageOffsetY = this.pageOffsets[pageIndex * 2 + 1];
+      const minX = Math.min(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]) + pageOffsetX;
+      const minY = Math.min(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]) + pageOffsetY;
+      const maxX = Math.max(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]) + pageOffsetX;
+      const maxY = Math.max(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]) + pageOffsetY;
       if (
         maxX < cullingBounds.minX ||
         minX > cullingBounds.maxX ||
@@ -1318,76 +1464,68 @@ export class HeprThreePdfObject extends THREE.Group {
         continue;
       }
 
-      const size = this.measurePageProjectedSizePx(minX, minY, maxX, maxY, viewport);
-      if (!size || size.width > THREE_PAGE_TEXT_TILE_MAX_TILE_DIM) {
-        // Behind-camera or oversized pages cannot be tiled; a clamped bake would
-        // crop them, so fall back to direct text for the whole view.
-        maxHeight = Number.POSITIVE_INFINITY;
-        break;
-      }
-      visiblePages.push(pageIndex);
-      targetWidths.push(size.width);
-      targetHeights.push(size.height);
-      maxHeight = Math.max(maxHeight, size.height);
-    }
-
-    if (visiblePages.length === 0 || !Number.isFinite(maxHeight)) {
-      this.deactivatePageTileRendering();
-      this.pageTileModeActive = false;
-      this.updatePageTileStats(true, 0, visiblePages.length, 0);
-      return;
-    }
-
-    if (this.pageTileModeActive) {
-      if (maxHeight >= THREE_PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX) {
-        this.pageTileModeActive = false;
-      }
-    } else if (maxHeight <= THREE_PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX) {
-      this.pageTileModeActive = true;
-    }
-    if (!this.pageTileModeActive) {
-      this.deactivatePageTileRendering();
-      this.updatePageTileStats(true, 0, visiblePages.length, 0);
-      return;
-    }
-
-    // Granular per-page mixing: baked pages draw as tile quads and are masked
-    // out of the glyph draw; missing/stale pages keep drawing glyphs while
-    // their bakes are in flight, so panning never falls back to full direct.
-    const pageTileMask = this.pageTileMaskScratch;
-    pageTileMask.fill(0);
-    const missing: PageTextTileBakeRequest[] = [];
-    let tileCount = 0;
-    let directPages = 0;
-    let directStart = textInstanceCount;
-    let directEnd = 0;
-    for (let i = 0; i < visiblePages.length; i += 1) {
-      const pageIndex = visiblePages[i];
       const record = this.pageTileRecords[pageIndex];
-      const targetWidth = clampTileDimension(targetWidths[i]);
-      const targetHeight = clampTileDimension(targetHeights[i]);
+      const size = this.measurePageProjectedSizePx(minX, minY, maxX, maxY, viewport);
+      if (
+        !size ||
+        size.width > THREE_PAGE_TEXT_TILE_MAX_TILE_DIM ||
+        size.height > THREE_PAGE_TEXT_TILE_MAX_TILE_DIM
+      ) {
+        // Behind-camera or oversized pages cannot be tiled; a clamped bake
+        // would crop them, so keep these pages on the direct path.
+        record.tileMode = false;
+        directPages.push(pageIndex);
+        continue;
+      }
+
+      if (record.tileMode) {
+        if (size.height >= THREE_PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX) {
+          record.tileMode = false;
+        }
+      } else if (size.height <= THREE_PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX) {
+        record.tileMode = true;
+      }
+      if (!record.tileMode) {
+        directPages.push(pageIndex);
+        continue;
+      }
+
+      const targetWidth = clampTileDimension(size.width);
+      const targetHeight = clampTileDimension(size.height);
       const heightRatio = record.hasTile ? targetHeight / Math.max(1, record.innerHeight) : 0;
-      const tileValid =
+      // Displayable: close enough in scale to keep showing (possibly soft)
+      // while a rebake is in flight. Fresh: also within the crisp window and
+      // pixel-exact once the view settles, so no rebake is needed at all.
+      const tileDisplayable =
         record.hasTile &&
         record.epoch === this.pageTileEpoch &&
+        heightRatio >= THREE_PAGE_TEXT_TILE_DISPLAY_RATIO_MIN &&
+        heightRatio <= THREE_PAGE_TEXT_TILE_DISPLAY_RATIO_MAX;
+      const tileFresh =
+        tileDisplayable &&
         heightRatio >= THREE_PAGE_TEXT_TILE_RATIO_MIN &&
         heightRatio <= THREE_PAGE_TEXT_TILE_RATIO_MAX &&
         !(transformStable && Math.abs(targetHeight - record.innerHeight) > 1);
 
-      if (tileValid) {
+      if (tileDisplayable) {
         tileCount = this.appendPageTileInstance(pageIndex, record, tileCount);
-        pageTileMask[pageIndex] = 1;
       } else {
-        missing.push({ pageIndex, innerWidth: targetWidth, innerHeight: targetHeight });
-        const rangeOffset = pageIndex * 2;
-        const rangeStart = this.tilePageTextRanges[rangeOffset] ?? 0;
-        const rangeCount = this.tilePageTextRanges[rangeOffset + 1] ?? 0;
-        if (rangeCount > 0) {
-          directStart = Math.min(directStart, rangeStart);
-          directEnd = Math.max(directEnd, rangeStart + rangeCount);
-          directPages += 1;
-        }
+        directPages.push(pageIndex);
       }
+      if (tileFresh) {
+        continue;
+      }
+
+      const dx = (minX + maxX) * 0.5 - viewCenterX;
+      const dy = (minY + maxY) * 0.5 - viewCenterY;
+      candidates.push({
+        pageIndex,
+        distanceSq: dx * dx + dy * dy,
+        instanceCount: rangeCount,
+        innerWidth: targetWidth,
+        innerHeight: targetHeight,
+        hasDisplayableTile: tileDisplayable
+      });
     }
 
     if (tileCount > 0) {
@@ -1397,31 +1535,28 @@ export class HeprThreePdfObject extends THREE.Group {
       this.pageTileLayer.setVisible(false);
     }
 
-    if (directPages > 0 && directEnd > directStart) {
-      this.textMaterialLayer.setPageTileMask(tileCount > 0 ? pageTileMask : null);
-      this.textMaterialLayer.setInstanceWindow(directStart, directEnd - directStart);
-    } else {
+    this.textMaterialLayer.setExplicitDirectPages(directPages);
+    if (directPages.length === 0) {
       this.textMaterialLayer.setVisible(false);
-      this.textMaterialLayer.setPageTileMask(null);
-      this.textMaterialLayer.clearInstanceWindow();
     }
 
-    this.updatePageTileStats(true, tileCount, directPages, missing.length);
-    this.kickPageTileBakes(missing);
+    this.updatePageTileStats(true, tileCount, directPages.length, candidates.length);
+    this.kickPageTileBakes(candidates);
   }
 
   private deactivatePageTileRendering(): void {
     this.pageTileLayer.setVisible(false);
-    this.textMaterialLayer.setPageTileMask(null);
-    this.textMaterialLayer.clearInstanceWindow();
+    this.textMaterialLayer.setExplicitDirectPages(null);
   }
 
   private appendPageTileInstance(pageIndex: number, record: ThreePageTextTileRecord, tileCount: number): number {
     const rectOffset = pageIndex * 4;
-    const minX = Math.min(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
-    const minY = Math.min(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
-    const maxX = Math.max(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]);
-    const maxY = Math.max(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]);
+    const pageOffsetX = this.pageOffsets[pageIndex * 2];
+    const pageOffsetY = this.pageOffsets[pageIndex * 2 + 1];
+    const minX = Math.min(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]) + pageOffsetX;
+    const minY = Math.min(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]) + pageOffsetY;
+    const maxX = Math.max(this.tilePageRects[rectOffset], this.tilePageRects[rectOffset + 2]) + pageOffsetX;
+    const maxY = Math.max(this.tilePageRects[rectOffset + 1], this.tilePageRects[rectOffset + 3]) + pageOffsetY;
 
     const atlasWidth = this.pageTileLayer.atlasWidth;
     const atlasHeight = this.pageTileLayer.atlasHeight;
@@ -1440,42 +1575,87 @@ export class HeprThreePdfObject extends THREE.Group {
     return tileCount + 1;
   }
 
-  private kickPageTileBakes(missing: PageTextTileBakeRequest[]): void {
-    if (this.pageTileBakeInFlight || missing.length === 0) {
+  private kickPageTileBakes(candidates: ThreePageTileBakeCandidate[]): void {
+    if (this.pageTileBakesInFlight >= THREE_PAGE_TEXT_TILE_MAX_CONCURRENT_BAKES || candidates.length === 0) {
       return;
     }
 
+    // Pages with no displayable tile draw expensive direct glyphs right now,
+    // so they bake before pages that merely show a soft stale tile; within
+    // each class, pages closest to the view center go first. Pages already
+    // requested by an in-flight batch are skipped so pipelined batches never
+    // bake the same page twice, and every free concurrency slot is filled in
+    // the same frame.
+    candidates.sort((a, b) => {
+      if (a.hasDisplayableTile !== b.hasDisplayableTile) {
+        return a.hasDisplayableTile ? 1 : -1;
+      }
+      return a.distanceSq - b.distanceSq;
+    });
+    while (this.pageTileBakesInFlight < THREE_PAGE_TEXT_TILE_MAX_CONCURRENT_BAKES) {
+      if (!this.dispatchPageTileBakeBatch(candidates)) {
+        return;
+      }
+    }
+  }
+
+  private dispatchPageTileBakeBatch(candidates: ThreePageTileBakeCandidate[]): boolean {
     const batch: PageTextTileBakeRequest[] = [];
     let batchedInstances = 0;
-    for (const request of missing) {
-      if (batch.length >= THREE_PAGE_TEXT_TILE_BAKE_MAX_PAGES) {
+    for (const candidate of candidates) {
+      if (this.pageTileBakePendingPages.has(candidate.pageIndex)) {
+        continue;
+      }
+      const withinBudget =
+        batch.length < THREE_PAGE_TEXT_TILE_BAKE_MAX_PAGES &&
+        (batch.length < THREE_PAGE_TEXT_TILE_BAKE_MIN_PAGES ||
+          batchedInstances < THREE_PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET);
+      if (!withinBudget) {
         break;
       }
-      if (batch.length > 0 && batchedInstances >= THREE_PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET) {
-        break;
-      }
-      batch.push(request);
-      batchedInstances += this.tilePageTextRanges[request.pageIndex * 2 + 1] ?? 0;
+      batch.push({
+        pageIndex: candidate.pageIndex,
+        innerWidth: candidate.innerWidth,
+        innerHeight: candidate.innerHeight
+      });
+      batchedInstances += candidate.instanceCount;
     }
     if (batch.length === 0) {
-      return;
+      return false;
     }
 
     const bakeTiles = this.renderer.bakePageTextTilePixels;
     if (!bakeTiles) {
-      return;
+      return false;
     }
-    this.pageTileBakeInFlight = true;
+    this.pageTileBakesInFlight += 1;
+    for (const request of batch) {
+      this.pageTileBakePendingPages.add(request.pageIndex);
+    }
+    const releaseBatch = () => {
+      this.pageTileBakesInFlight = Math.max(0, this.pageTileBakesInFlight - 1);
+      for (const request of batch) {
+        this.pageTileBakePendingPages.delete(request.pageIndex);
+      }
+    };
     const epochAtRequest = this.pageTileEpoch;
+    const perfKickedAt = heprPerf.enabled ? performance.now() : 0;
+    heprPerf.event("bake-kick", {
+      pages: batch.length,
+      instances: batchedInstances,
+      inFlight: this.pageTileBakesInFlight
+    });
     bakeTiles
       .call(this.renderer, batch)
       .then((results) => {
-        this.pageTileBakeInFlight = false;
+        releaseBatch();
+        const perfLandedAt = heprPerf.enabled ? performance.now() : 0;
         if (!results || this.isDisposed || epochAtRequest !== this.pageTileEpoch) {
+          heprPerf.event("bake-dropped", { pages: batch.length });
           return;
         }
 
-        let wroteAny = false;
+        const tileWrites: PageTileUpload[] = [];
         for (const result of results) {
           const record = this.pageTileRecords[result.pageIndex];
           if (!record) {
@@ -1486,29 +1666,50 @@ export class HeprThreePdfObject extends THREE.Group {
           if ((this.tilePageTextRanges[result.pageIndex * 2 + 1] ?? 0) > 0 && isAllZeroAlpha(result.pixels)) {
             continue;
           }
-          const slot = this.allocatePageTileSlot(result.innerWidth, result.innerHeight);
+          let slot = this.allocatePageTileSlot(result.innerWidth, result.innerHeight);
           if (!slot) {
-            // Atlas full: drop every tile (including this batch) and let the
-            // next frames rebake into the fresh atlas.
-            this.resetPageTileAtlas();
-            break;
+            // Active atlas half is full: recycle the other half (invalidating
+            // only its stale tiles) and retry. Pages whose tiles cannot fit
+            // even in an empty half simply stay on the direct path.
+            this.swapPageTileGeneration();
+            slot = this.allocatePageTileSlot(result.innerWidth, result.innerHeight);
+            if (!slot) {
+              continue;
+            }
           }
-          this.pageTileLayer.writeTilePixels(slot.x, slot.y, result.innerWidth, result.innerHeight, result.pixels);
+          tileWrites.push({
+            atlasX: slot.x,
+            atlasY: slot.y,
+            width: result.innerWidth,
+            height: result.innerHeight,
+            pixels: result.pixels
+          });
           record.hasTile = true;
           record.atlasX = slot.x;
           record.atlasY = slot.y;
           record.innerWidth = result.innerWidth;
           record.innerHeight = result.innerHeight;
           record.epoch = epochAtRequest;
-          wroteAny = true;
+          record.generation = this.pageTileActiveGeneration;
         }
-        if (wroteAny) {
-          this.pageTileLayer.markAtlasDirty();
+        const perfProcessedAt = heprPerf.enabled ? performance.now() : 0;
+        this.pageTileLayer.uploadTiles(this.lastHostRenderer, tileWrites);
+        if (heprPerf.enabled) {
+          const perfUploadedAt = performance.now();
+          heprPerf.event("bake-land", {
+            pages: batch.length,
+            tilesWritten: tileWrites.length,
+            readbackMs: Number((perfLandedAt - perfKickedAt).toFixed(1)),
+            processMs: Number((perfProcessedAt - perfLandedAt).toFixed(1)),
+            uploadMs: Number((perfUploadedAt - perfProcessedAt).toFixed(1))
+          });
         }
       })
       .catch(() => {
-        this.pageTileBakeInFlight = false;
+        releaseBatch();
+        heprPerf.event("bake-failed", { pages: batch.length });
       });
+    return true;
   }
 
   private measurePageProjectedSizePx(
@@ -1565,12 +1766,17 @@ export class HeprThreePdfObject extends THREE.Group {
     return this.clipFromDataStableFrames >= THREE_PAGE_TEXT_TILE_STABLE_FRAMES;
   }
 
+  // The atlas is split into two generation halves. New tiles fill the active
+  // half; when it overflows, the halves swap and only the tiles in the newly
+  // recycled half are invalidated. Unlike a full reset, the current visible
+  // working set survives an overflow, which matters here because rebakes are
+  // asynchronous and repopulating everything takes many frames.
   private allocatePageTileSlot(innerWidth: number, innerHeight: number): { x: number; y: number } | null {
     const atlasWidth = this.pageTileLayer.atlasWidth;
-    const atlasHeight = this.pageTileLayer.atlasHeight;
+    const halfHeight = Math.floor(this.pageTileLayer.atlasHeight / 2);
     const slotWidth = innerWidth + THREE_PAGE_TEXT_TILE_GUTTER_PX * 2;
     const slotHeight = innerHeight + THREE_PAGE_TEXT_TILE_GUTTER_PX * 2;
-    if (slotWidth > atlasWidth || slotHeight > atlasHeight) {
+    if (slotWidth > atlasWidth || slotHeight > halfHeight) {
       return null;
     }
 
@@ -1579,21 +1785,35 @@ export class HeprThreePdfObject extends THREE.Group {
       this.pageTileShelfX = 0;
       this.pageTileShelfRowHeight = 0;
     }
-    if (this.pageTileShelfY + slotHeight > atlasHeight) {
+    if (this.pageTileShelfY + slotHeight > halfHeight) {
       return null;
     }
 
     const x = this.pageTileShelfX + THREE_PAGE_TEXT_TILE_GUTTER_PX;
-    const y = this.pageTileShelfY + THREE_PAGE_TEXT_TILE_GUTTER_PX;
+    const y = this.pageTileActiveGeneration * halfHeight + this.pageTileShelfY + THREE_PAGE_TEXT_TILE_GUTTER_PX;
     this.pageTileShelfX += slotWidth;
     this.pageTileShelfRowHeight = Math.max(this.pageTileShelfRowHeight, slotHeight);
     return { x, y };
+  }
+
+  private swapPageTileGeneration(): void {
+    this.pageTileActiveGeneration = this.pageTileActiveGeneration === 0 ? 1 : 0;
+    this.pageTileShelfX = 0;
+    this.pageTileShelfY = 0;
+    this.pageTileShelfRowHeight = 0;
+    for (const record of this.pageTileRecords) {
+      if (record.generation === this.pageTileActiveGeneration) {
+        record.hasTile = false;
+      }
+    }
+    heprPerf.event("tile-generation-swap", { activeGeneration: this.pageTileActiveGeneration });
   }
 
   private resetPageTileAtlas(): void {
     this.pageTileShelfX = 0;
     this.pageTileShelfY = 0;
     this.pageTileShelfRowHeight = 0;
+    this.pageTileActiveGeneration = 0;
     for (const record of this.pageTileRecords) {
       record.hasTile = false;
     }
@@ -2201,7 +2421,9 @@ export async function createThreePdfObject(
 
   const rasterMaterialLayer = new ThreeMaterialRasterLayer(loadedScene.scene, {
     materialBackend,
-    pageBackground: rendererConfig.pageBackground
+    pageBackground: rendererConfig.pageBackground,
+    pageBackgroundMode: options.pageBackgroundMode ?? "auto",
+    sceneCenter: [sceneCenterX, sceneCenterY]
   });
 
   const fillMaterialLayer = new ThreeMaterialFillLayer(loadedScene.scene, {

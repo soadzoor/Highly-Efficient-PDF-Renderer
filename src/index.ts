@@ -6,6 +6,7 @@ import {
 } from "./pdfObjectGenerator";
 import {
   createThreePdfObject,
+  type HeprPageBackgroundMode,
   type HeprRendererType,
   type HeprThreeObjectOptions,
   type HeprColorInput,
@@ -136,6 +137,7 @@ export type {
   PdfObjectSourceKind,
   PdfObjectGeneratorOptions,
   HeprRendererType,
+  HeprPageBackgroundMode,
   HeprThreeObjectOptions,
   HeprColorInput,
   HeprThreePdfObject,

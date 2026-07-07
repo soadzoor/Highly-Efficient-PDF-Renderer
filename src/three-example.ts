@@ -21,6 +21,7 @@ import {
   type NormalizedExampleEntry
 } from "./exampleManifest";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
+import { heprPerf } from "./heprPerfLog";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import {
@@ -199,6 +200,87 @@ let currentPdfObject: HeprThreePdfObject | null = null;
   getPdfObject: () => currentPdfObject,
   getCamera: () => camera
 };
+
+// --- [HEPR-PERF] diagnostics, enabled by loading the page with ?perf ---
+heprPerf.enabled = new URLSearchParams(window.location.search).has("perf");
+const PERF_SUMMARY_INTERVAL_MS = 2000;
+let perfWindowStart = 0;
+let perfFrameCount = 0;
+let perfRenderMsTotal = 0;
+let perfRenderMsMax = 0;
+
+function logPerfEnvironment(label: string): void {
+  if (!heprPerf.enabled) {
+    return;
+  }
+  const size = new THREE.Vector2();
+  renderer.getDrawingBufferSize(size);
+  let msaa: string | number = "unknown";
+  const maybeWebGl = renderer as THREE.WebGLRenderer;
+  if (typeof maybeWebGl.getContext === "function" && activeThreeRendererBackend === "webgl") {
+    const gl = maybeWebGl.getContext() as WebGL2RenderingContext;
+    msaa = gl.getParameter(gl.SAMPLES) as number;
+  } else {
+    const samples = (renderer as unknown as { samples?: number }).samples;
+    msaa = typeof samples === "number" ? samples : "unknown";
+  }
+  console.log(`[HEPR-PERF] env (${label})`, {
+    backend: activeThreeRendererBackend,
+    dpr: window.devicePixelRatio || 1,
+    drawingBuffer: `${size.x}x${size.y}`,
+    canvasClient: `${canvasElement.clientWidth}x${canvasElement.clientHeight}`,
+    msaaSamples: msaa
+  });
+}
+
+function notePerfFrame(now: number, renderMs: number): void {
+  if (!heprPerf.enabled) {
+    return;
+  }
+  perfFrameCount += 1;
+  perfRenderMsTotal += renderMs;
+  perfRenderMsMax = Math.max(perfRenderMsMax, renderMs);
+  if (perfWindowStart === 0) {
+    perfWindowStart = now;
+    return;
+  }
+  const windowMs = now - perfWindowStart;
+  if (windowMs < PERF_SUMMARY_INTERVAL_MS) {
+    return;
+  }
+
+  const sync = heprPerf.drainSync();
+  const info = (renderer as unknown as { info?: { render?: Record<string, number> } }).info;
+  const renderInfo = info?.render ?? {};
+  const tileStats = currentPdfObject?.getPageTextTileStats();
+  const size = new THREE.Vector2();
+  renderer.getDrawingBufferSize(size);
+  console.log("[HEPR-PERF] frame summary", {
+    backend: activeThreeRendererBackend,
+    pipeline: currentPdfObject ? (currentPdfObject.renderTexture ? "fallback-texture" : "material") : "none",
+    fps: Number((perfFrameCount * 1000 / windowMs).toFixed(1)),
+    framesInWindow: perfFrameCount,
+    renderCpuAvgMs: Number((perfRenderMsTotal / perfFrameCount).toFixed(2)),
+    renderCpuMaxMs: Number(perfRenderMsMax.toFixed(2)),
+    heprSyncAvgMs: Number(sync.avgMs.toFixed(2)),
+    heprSyncMaxMs: Number(sync.maxMs.toFixed(2)),
+    drawCalls: renderInfo.calls ?? renderInfo.drawCalls ?? "n/a",
+    triangles: renderInfo.triangles ?? "n/a",
+    textRangeMeshes: heprPerf.textRangeMeshCount,
+    textInstancesDrawn: heprPerf.textInstancesDrawn,
+    tiledPages: tileStats?.tiledPages ?? 0,
+    directPages: tileStats?.directPages ?? 0,
+    pendingBakePages: tileStats?.bakedPages ?? 0,
+    atlas: tileStats ? `${tileStats.atlasWidth}x${tileStats.atlasHeight}` : "n/a",
+    drawingBuffer: `${size.x}x${size.y}`
+  });
+
+  perfWindowStart = now;
+  perfFrameCount = 0;
+  perfRenderMsTotal = 0;
+  perfRenderMsMax = 0;
+}
+// --- end [HEPR-PERF] instrumentation ---
 let lastLoadedSource: File | string | null = null;
 let lastDownloadablePdf: PdfDownloadSource | null = null;
 let animationFrameId = 0;
@@ -251,7 +333,8 @@ async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promi
     antialias: true,
     alpha: false,
     depth: true,
-    stencil: false
+    stencil: false,
+    powerPreference: "high-performance"
   } as WebGpuRendererParametersWithCanvas);
   configureThreeRenderer(nextRenderer);
   await nextRenderer.init();
@@ -331,6 +414,7 @@ async function ensureThreeRendererBackend(
   controls.target.copy(previousControlsTarget);
   updatePerspectiveCameraProjection();
   updateCameraClipping();
+  logPerfEnvironment("backend switch");
   requestRender();
 }
 
@@ -343,9 +427,11 @@ function renderFrame(now: number = performance.now()): void {
   updateFpsMeter(now);
   const controlsChanged = controls.update();
   updateCameraClipping();
+  const perfRenderStart = performance.now();
   renderer.clear(true, true, true);
   renderer.clearDepth();
   renderer.render(scene, camera);
+  notePerfFrame(now, performance.now() - perfRenderStart);
   updateDrawStatsMeter();
   updateLodStatsMeter();
   renderedFrameSerial += 1;
@@ -382,6 +468,7 @@ function resolveRenderedFrameWaiters(): void {
   }
 }
 
+logPerfEnvironment("startup");
 requestRender();
 syncTouchRotateVisibility();
 

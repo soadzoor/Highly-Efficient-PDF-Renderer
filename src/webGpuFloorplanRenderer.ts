@@ -1234,6 +1234,7 @@ export class WebGpuFloorplanRenderer {
   private readonly pageTileClearPipeline: any;
 
   private readonly textBakePipeline: any;
+  private readonly textBakeReadbackPipeline: any;
 
   private readonly cameraUniformBuffer: any;
 
@@ -1892,6 +1893,16 @@ export class WebGpuFloorplanRenderer {
     // Text baked into transparent tiles with the standard straight-alpha blend
     // accumulates premultiplied color, mirroring the WebGL minify-layer math.
     this.textBakePipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textBakePipelineLayout);
+    // Readback bakes (three adapter) render into an rgba8unorm scratch so the
+    // mapped pixels never need a CPU-side BGRA swizzle.
+    this.textBakeReadbackPipeline = this.createPipeline(
+      TEXT_SHADER_SOURCE,
+      "vsMain",
+      "fsMain",
+      textBakePipelineLayout,
+      false,
+      "rgba8unorm"
+    );
     this.pageTilePipeline = this.createPipeline(PAGE_TILE_SHADER_SOURCE, "vsMain", "fsMain", pageTilePipelineLayout, true);
 
     const clearShaderModule = this.gpuDevice.createShaderModule({ code: PAGE_TILE_CLEAR_SHADER_SOURCE });
@@ -2771,7 +2782,8 @@ export class WebGpuFloorplanRenderer {
     vertexEntry: string,
     fragmentEntry: string,
     layout: any,
-    premultipliedColor = false
+    premultipliedColor = false,
+    targetFormat: string = this.presentationFormat
   ): any {
     const shaderModule = this.gpuDevice.createShaderModule({ code: shaderSource });
     const colorSrcFactor = premultipliedColor ? "one" : "src-alpha";
@@ -2786,7 +2798,7 @@ export class WebGpuFloorplanRenderer {
         entryPoint: fragmentEntry,
         targets: [
           {
-            format: this.presentationFormat,
+            format: targetFormat,
             blend: {
               color: {
                 srcFactor: colorSrcFactor,
@@ -3829,7 +3841,7 @@ export class WebGpuFloorplanRenderer {
       pass.setViewport(0, 0, entry.innerWidth, entry.innerHeight, 0, 1);
       pass.setScissorRect(0, 0, entry.innerWidth, entry.innerHeight);
       if (rangeCount > 0) {
-        pass.setPipeline(this.textBakePipeline);
+        pass.setPipeline(this.textBakeReadbackPipeline);
         pass.setBindGroup(0, this.textBakeBindGroup, [i * PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES]);
         pass.draw(4, rangeCount, 0, rangeStart);
       }
@@ -3846,7 +3858,6 @@ export class WebGpuFloorplanRenderer {
     const gpuMapMode = (globalThis as any).GPUMapMode;
     await readBuffer.mapAsync(gpuMapMode.READ);
     const mapped = new Uint8Array(readBuffer.getMappedRange());
-    const swizzleBgra = String(this.presentationFormat).toLowerCase().startsWith("bgra");
 
     const results: PageTextTileBakePixels[] = [];
     for (let i = 0; i < batch.length; i += 1) {
@@ -3856,13 +3867,6 @@ export class WebGpuFloorplanRenderer {
       for (let row = 0; row < entry.innerHeight; row += 1) {
         const sourceOffset = layouts[i].bufferOffset + row * layouts[i].bytesPerRow;
         pixels.set(mapped.subarray(sourceOffset, sourceOffset + rowBytes), row * rowBytes);
-      }
-      if (swizzleBgra) {
-        for (let p = 0; p < pixels.length; p += 4) {
-          const blue = pixels[p];
-          pixels[p] = pixels[p + 2];
-          pixels[p + 2] = blue;
-        }
       }
       results.push({ pageIndex: entry.pageIndex, innerWidth: entry.innerWidth, innerHeight: entry.innerHeight, pixels });
     }
@@ -3888,7 +3892,7 @@ export class WebGpuFloorplanRenderer {
     const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
     this.pageTextTileBakeScratchTexture = this.gpuDevice.createTexture({
       size: { width: desiredWidth, height: desiredHeight, depthOrArrayLayers: 1 },
-      format: this.presentationFormat,
+      format: "rgba8unorm",
       usage: gpuTextureUsage.RENDER_ATTACHMENT | gpuTextureUsage.COPY_SRC
     });
     this.pageTextTileBakeScratchWidth = desiredWidth;

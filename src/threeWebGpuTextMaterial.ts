@@ -318,6 +318,15 @@ export function createThreeWebGpuTextMaterial(
   const curveUniform = TSL.uniform(options.strokeCurveEnabled ? 1 : 0);
   const vectorOnlyUniform = TSL.uniform(options.textVectorOnly ? 1 : 0);
   const instanceStartUniform = TSL.uniform(0);
+  // Ranged text meshes share this material; each mesh carries its own instance
+  // start in userData and the per-object update writes it into that object's
+  // uniform buffer (uniforms default to the object group).
+  (instanceStartUniform as unknown as {
+    onObjectUpdate: (callback: (frame: { object?: THREE.Object3D }) => number) => unknown;
+  }).onObjectUpdate((frame) => {
+    const start = frame.object?.userData?.heprTextInstanceStart;
+    return typeof start === "number" ? start : 0;
+  });
   const pageMaskEnabledUniform = TSL.uniform(0);
   const pageModeTextureWidthUniform = TSL.uniform(Math.max(1, options.textPageModeTextureWidth));
   const textAAScreenPxUniform = TSL.uniform(1.25);

@@ -195,8 +195,49 @@ const uiControlManager = createUiControlManager(
 
 const canvasInteractionController = createCanvasInteractionController(() => renderer);
 
+// --- [HEPR-PERF] diagnostics, enabled by loading the page with ?perf ---
+const perfLoggingEnabled = new URLSearchParams(window.location.search).has("perf");
+const PERF_SUMMARY_INTERVAL_MS = 2000;
+let perfWindowStart = 0;
+let perfFrameCount = 0;
+
+function notePerfFrame(stats: DrawStats): void {
+  if (!perfLoggingEnabled) {
+    return;
+  }
+  const now = performance.now();
+  perfFrameCount += 1;
+  if (perfWindowStart === 0) {
+    perfWindowStart = now;
+    return;
+  }
+  const windowMs = now - perfWindowStart;
+  if (windowMs < PERF_SUMMARY_INTERVAL_MS) {
+    return;
+  }
+
+  const tileStats = renderer.getPageTextTileStats?.();
+  console.log("[HEPR-PERF] native frame summary", {
+    backend: backendSwitcher?.getActiveBackend() ?? "webgl",
+    fps: Number((perfFrameCount * 1000 / windowMs).toFixed(1)),
+    framesInWindow: perfFrameCount,
+    canvas: `${canvasElement.width}x${canvasElement.height}`,
+    dpr: window.devicePixelRatio || 1,
+    zoom: Number(stats.zoom.toFixed(3)),
+    renderedSegments: stats.renderedSegments,
+    tiledPages: tileStats?.tiledPages ?? 0,
+    directPages: tileStats?.directPages ?? 0,
+    atlas: tileStats ? `${tileStats.atlasWidth}x${tileStats.atlasHeight}` : "n/a"
+  });
+
+  perfWindowStart = now;
+  perfFrameCount = 0;
+}
+// --- end [HEPR-PERF] instrumentation ---
+
 function onRendererFrame(stats: DrawStats): void {
   updateFpsMetric();
+  notePerfFrame(stats);
 
   const rendered = stats.renderedSegments.toLocaleString();
   const total = stats.totalSegments.toLocaleString();

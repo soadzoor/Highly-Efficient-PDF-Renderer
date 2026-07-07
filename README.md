@@ -163,9 +163,48 @@ Useful object APIs:
 - `pdfObject.getVectorStrokeLodStats()`
 - `pdfObject.setPageBackgroundColor(...)`
 - `pdfObject.setVectorColorOverride(...)`
+- `pdfObject.getPageCount()`
+- `pdfObject.setPageOffset(pageIndex, offsetX, offsetY)` / `pdfObject.getPageOffset(pageIndex)`
+- `pdfObject.getPageBackgroundMesh(pageIndex)`
 - `pdfObject.fitToBounds()` for the internal fallback view state
 - `pdfObject.attachControls(renderer.domElement)` for HEPR's fallback 2D controls
 - `pdfObject.dispose()`
+
+### Page Backgrounds and Moving Pages
+
+The `pageBackgroundMode` option controls how page background rectangles are
+represented in the three.js scene:
+
+- `"mesh"`: one plain `THREE.Mesh` per page. The meshes are raycastable, named
+  `hepr-page-background-<index>`, and reachable via
+  `pdfObject.getPageBackgroundMesh(pageIndex)`.
+- `"instanced"`: a single instanced draw for all page backgrounds — the
+  fastest option for documents with many pages.
+- `"auto"` (default): `"mesh"` up to 200 pages, `"instanced"` above.
+
+Individual pages can be repositioned at runtime in any mode. Offsets are in
+PDF scene units, relative to the page's laid-out position, and move the page's
+text, fills, baked text tiles, and background together:
+
+```ts
+const pdf = await pdfObjectGenerator(source, { pageBackgroundMode: "mesh" });
+
+// Move page 3 half a page to the right via the API...
+const [minX, , maxX] = pdf.sceneData.pageRects;
+pdf.setPageOffset(3, (maxX - minX) * 0.5, 0);
+
+// ...or, in mesh mode, simply move the page's background mesh; the page
+// content follows on the next rendered frame.
+const pageMesh = pdf.getPageBackgroundMesh(4);
+if (pageMesh) {
+  pageMesh.position.y -= 100;
+}
+```
+
+Current limitations: stroke geometry does not follow page offsets yet, the
+non-camera-driven fallback texture path renders the original layout, and only
+a page mesh's x/y position is synchronized (scaling or rotating the mesh only
+affects the background rectangle).
 
 Advanced render pipelines can call
 `pdfObject.prepareFrameForThreeRenderer(renderer, camera)` manually before

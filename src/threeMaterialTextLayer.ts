@@ -5,6 +5,7 @@ import {
   CORE_TEXT_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import { heprPerf } from "./heprPerfLog";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
@@ -28,10 +29,30 @@ interface ViewportPixels {
   height: number;
 }
 
+interface InstanceRange {
+  start: number;
+  count: number;
+}
+
 const DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE = 4096;
 
+// Upper bound on per-frame instanced draws for direct text. Visible pages
+// produce merged contiguous ranges like the native renderers; if a view ever
+// exceeds this many disjoint ranges, the smallest gaps are merged away.
+const MAX_TEXT_RANGE_MESHES = 64;
+
 export class ThreeMaterialTextLayer {
-  readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
+  // Direct text draws one instanced mesh per merged visible-page range,
+  // mirroring the native renderers' per-range draws, so off-screen glyphs
+  // never reach the vertex stage.
+  readonly group: THREE.Group;
+
+  private readonly material: THREE.Material;
+  private readonly materialBackend: "webgl" | "webgpu";
+  private readonly cornerAttribute: THREE.Float32BufferAttribute;
+  private readonly geometryIndex: THREE.BufferAttribute;
+  private readonly instanceIdAttribute: THREE.InstancedBufferAttribute;
+  private readonly rangeMeshes: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>[] = [];
 
   private readonly textInstanceTextureA: THREE.DataTexture;
   private readonly textInstanceTextureB: THREE.DataTexture;
@@ -55,26 +76,30 @@ export class ThreeMaterialTextLayer {
   private readonly instanceStartUniform: { value: number };
   private readonly pageMaskEnabledUniform: { value: number };
   private readonly pageModeTexture: THREE.DataTexture;
-  private readonly pageModeData: Uint8Array;
   private readonly textInstanceCount: number;
   private readonly pageRects: Float32Array;
   private readonly pageTextRanges: Uint32Array;
-  private explicitInstanceWindow: { start: number; count: number } | null = null;
+  // Baked glyph translations, referenced (not copied) from the scene data so
+  // page offsets can be re-applied from pristine values without drift.
+  private readonly baselineInstanceB: Float32Array;
+  private sharedPageOffsets: Float32Array | null = null;
+  private explicitDirectPages: number[] | null = null;
   private webGpuState: ThreeWebGpuTextMaterialState | null = null;
 
   constructor(scene: VectorScene, options: TextLayerOptions) {
     const materialBackend = options.materialBackend ?? "webgl";
+    this.materialBackend = materialBackend;
     this.textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
     this.pageRects = normalizeLayerPageRects(scene);
     this.pageTextRanges = normalizeLayerPageTextRanges(scene, this.pageRects, this.textInstanceCount);
+    this.baselineInstanceB = scene.textInstanceB;
     this.instanceStartUniform = { value: 0 };
     this.pageMaskEnabledUniform = { value: 0 };
 
     const pageCount = Math.max(1, Math.floor(this.pageRects.length / 4));
     const pageModeTextureSize = chooseTextureSize(pageCount);
-    this.pageModeData = new Uint8Array(pageModeTextureSize.width * pageModeTextureSize.height);
     this.pageModeTexture = new THREE.DataTexture(
-      this.pageModeData,
+      new Uint8Array(pageModeTextureSize.width * pageModeTextureSize.height),
       pageModeTextureSize.width,
       pageModeTextureSize.height,
       THREE.RedFormat,
@@ -175,7 +200,6 @@ export class ThreeMaterialTextLayer {
       this.rasterAtlasSizeUniform = new THREE.Vector2(1, 1);
     }
 
-    const geometry = createTextGeometry(textInstanceCount);
     this.viewportUniform = new THREE.Vector2(1, 1);
     this.cameraCenterUniform = new THREE.Vector2();
     this.zoomUniform = { value: 1 };
@@ -268,14 +292,59 @@ export class ThreeMaterialTextLayer {
       });
     }
     configureStraightAlphaBlending(material);
+    this.material = material;
 
-    this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
+    this.cornerAttribute = new THREE.Float32BufferAttribute(
+      new Float32Array([
+        -1, -1,
+        1, -1,
+        1, 1,
+        -1, 1
+      ]),
+      2
+    );
+    this.geometryIndex = new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1);
+    const instanceCount = this.textInstanceCount;
+    const textInstanceIds = new Float32Array(Math.max(1, instanceCount));
+    for (let i = 0; i < instanceCount; i += 1) {
+      textInstanceIds[i] = i;
+    }
+    this.instanceIdAttribute = new THREE.InstancedBufferAttribute(textInstanceIds, 1);
+
+    this.group = new THREE.Group();
+    this.group.name = "hepr-text-layer";
+    const primaryMesh = this.createRangeMesh();
+    primaryMesh.geometry.instanceCount = instanceCount;
+    this.rangeMeshes.push(primaryMesh);
+    this.group.add(primaryMesh);
+  }
+
+  private createRangeMesh(): THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material> {
+    const geometry = new THREE.InstancedBufferGeometry();
+    geometry.setAttribute("aCorner", this.cornerAttribute);
+    geometry.setAttribute("aTextInstanceIndex", this.instanceIdAttribute);
+    geometry.setIndex(this.geometryIndex);
+    geometry.instanceCount = 0;
+
+    const mesh = new THREE.Mesh(geometry, this.material);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
+    mesh.userData.heprTextInstanceStart = 0;
+    if (this.materialBackend === "webgl") {
+      // Ranged draws share one material; re-upload uniforms per mesh so each
+      // draw picks up its own instance start.
+      const rawMaterial = this.material as THREE.RawShaderMaterial;
+      const startUniform = this.instanceStartUniform;
+      mesh.onBeforeRender = () => {
+        startUniform.value = (mesh.userData.heprTextInstanceStart as number) ?? 0;
+        rawMaterial.uniformsNeedUpdate = true;
+      };
+    }
+    return mesh;
   }
 
   setVisible(visible: boolean): void {
-    this.mesh.visible = visible;
+    this.group.visible = visible;
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -296,38 +365,86 @@ export class ThreeMaterialTextLayer {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }
 
-  // Overrides the bounds-derived instance window (pass null to restore it).
-  setInstanceWindow(start: number, count: number): void {
-    this.explicitInstanceWindow = { start, count };
+  // Shares the pdf object's per-page offset array so culling tests moved
+  // pages at their moved rects.
+  setSharedPageOffsets(pageOffsets: Float32Array): void {
+    this.sharedPageOffsets = pageOffsets;
   }
 
-  clearInstanceWindow(): void {
-    this.explicitInstanceWindow = null;
-  }
-
-  // Per-page mask: pages flagged 1 collapse their glyphs so baked tiles can be
-  // drawn for them instead. Pass null to disable masking entirely.
-  setPageTileMask(tiledFlags: Uint8Array | null): void {
-    if (!tiledFlags) {
-      if (this.pageMaskEnabledUniform.value !== 0) {
-        this.pageMaskEnabledUniform.value = 0;
-        if (this.webGpuState) {
-          this.webGpuState.pageMaskEnabledUniform.value = 0;
-        }
-      }
+  // Re-applies baked glyph translations plus each changed page's offset, then
+  // uploads only the affected texel rows of the instance texture (glyphs are
+  // page-contiguous). Falls back to a full texture update without a
+  // copy-capable host renderer.
+  applyPageOffsets(pageOffsets: Float32Array, changedPages: readonly number[], hostRenderer: unknown): void {
+    if (this.textInstanceCount <= 0 || changedPages.length === 0) {
       return;
     }
 
-    const copyLength = Math.min(tiledFlags.length, this.pageModeData.length);
-    this.pageModeData.fill(0);
-    for (let i = 0; i < copyLength; i += 1) {
-      this.pageModeData[i] = tiledFlags[i] ? 255 : 0;
+    const image = this.textInstanceTextureB.image as { data: Float32Array; width: number; height: number };
+    const data = image.data;
+    const textureWidth = Math.max(1, image.width);
+    const copyTextureToTexture = (hostRenderer as {
+      copyTextureToTexture?: (src: THREE.Texture, dst: THREE.Texture, srcRegion?: unknown, dstPosition?: unknown) => void;
+    } | null)?.copyTextureToTexture;
+    let needsFullUpload = false;
+
+    const pageCount = Math.floor(this.pageRects.length / 4);
+    for (const pageIndex of changedPages) {
+      if (pageIndex < 0 || pageIndex >= pageCount) {
+        continue;
+      }
+      const rangeStart = this.pageTextRanges[pageIndex * 2] ?? 0;
+      const rangeCount = this.pageTextRanges[pageIndex * 2 + 1] ?? 0;
+      if (rangeCount <= 0) {
+        continue;
+      }
+
+      const offsetX = pageOffsets[pageIndex * 2] ?? 0;
+      const offsetY = pageOffsets[pageIndex * 2 + 1] ?? 0;
+      for (let i = rangeStart; i < rangeStart + rangeCount; i += 1) {
+        const base = i * 4;
+        data[base] = this.baselineInstanceB[base] + offsetX;
+        data[base + 1] = this.baselineInstanceB[base + 1] + offsetY;
+      }
+
+      if (typeof copyTextureToTexture !== "function") {
+        needsFullUpload = true;
+        continue;
+      }
+
+      const rowStart = Math.floor(rangeStart / textureWidth);
+      const rowEnd = Math.floor((rangeStart + rangeCount - 1) / textureWidth);
+      const rowCount = rowEnd - rowStart + 1;
+      const strip = new Float32Array(
+        data.subarray(rowStart * textureWidth * 4, (rowEnd + 1) * textureWidth * 4)
+      );
+      const stripTexture = new THREE.DataTexture(strip, textureWidth, rowCount, THREE.RGBAFormat, THREE.FloatType);
+      stripTexture.magFilter = THREE.NearestFilter;
+      stripTexture.minFilter = THREE.NearestFilter;
+      stripTexture.flipY = false;
+      stripTexture.generateMipmaps = false;
+      stripTexture.needsUpdate = true;
+      try {
+        pageOffsetCopyPosition.set(0, rowStart);
+        copyTextureToTexture.call(hostRenderer, stripTexture, this.textInstanceTextureB, null, pageOffsetCopyPosition);
+      } finally {
+        stripTexture.dispose();
+      }
     }
-    this.pageModeTexture.needsUpdate = true;
-    this.pageMaskEnabledUniform.value = 1;
-    if (this.webGpuState) {
-      this.webGpuState.pageMaskEnabledUniform.value = 1;
+
+    if (needsFullUpload) {
+      this.textInstanceTextureB.needsUpdate = true;
     }
+  }
+
+  // Restricts direct text drawing to exactly these pages (page tile
+  // orchestration). Pass null to restore culling-bounds-derived visibility.
+  setExplicitDirectPages(pageIndices: readonly number[] | null): void {
+    if (!pageIndices) {
+      this.explicitDirectPages = null;
+      return;
+    }
+    this.explicitDirectPages = Array.from(pageIndices).sort((a, b) => a - b);
   }
 
   setScreenSpaceTransform(): void {
@@ -352,71 +469,112 @@ export class ThreeMaterialTextLayer {
     if (this.webGpuState) {
       this.webGpuState.zoomUniform.value = this.zoomUniform.value;
     }
-    this.applyInstanceWindow(cullingBounds);
+    this.applyRanges(this.computeDirectRanges(cullingBounds));
   }
 
-  // Restricts the instanced draw to an explicit range (page tile orchestration)
-  // or, by default, the contiguous range covering pages that intersect the
-  // culling bounds; draws everything without either.
-  private applyInstanceWindow(cullingBounds: Bounds | null): void {
-    if (this.explicitInstanceWindow) {
-      const start = clampInt(this.explicitInstanceWindow.start, 0, this.textInstanceCount);
-      const count = clampInt(this.explicitInstanceWindow.count, 0, this.textInstanceCount - start);
-      this.instanceStartUniform.value = start;
-      if (this.webGpuState) {
-        this.webGpuState.instanceStartUniform.value = start;
+  // Merged contiguous instance ranges covering exactly the pages that should
+  // draw direct text this frame, mirroring the native renderers' per-range
+  // text draws.
+  private computeDirectRanges(cullingBounds: Bounds | null): InstanceRange[] {
+    if (this.textInstanceCount <= 0) {
+      return [];
+    }
+
+    const pageCount = Math.floor(this.pageRects.length / 4);
+    if (this.explicitDirectPages) {
+      const ranges: InstanceRange[] = [];
+      for (const pageIndex of this.explicitDirectPages) {
+        if (pageIndex < 0 || pageIndex >= pageCount) {
+          continue;
+        }
+        const rangeOffset = pageIndex * 2;
+        this.appendMergedRange(ranges, this.pageTextRanges[rangeOffset] ?? 0, this.pageTextRanges[rangeOffset + 1] ?? 0);
       }
-      this.mesh.geometry.instanceCount = count;
+      return ranges;
+    }
+
+    if (!cullingBounds || pageCount <= 0 || this.pageTextRanges.length < pageCount * 2) {
+      return [{ start: 0, count: this.textInstanceCount }];
+    }
+
+    const offsets = this.sharedPageOffsets;
+    const ranges: InstanceRange[] = [];
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const rectOffset = pageIndex * 4;
+      const offsetX = offsets ? offsets[pageIndex * 2] : 0;
+      const offsetY = offsets ? offsets[pageIndex * 2 + 1] : 0;
+      const minX = Math.min(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]) + offsetX;
+      const minY = Math.min(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]) + offsetY;
+      const maxX = Math.max(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]) + offsetX;
+      const maxY = Math.max(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]) + offsetY;
+      if (
+        maxX < cullingBounds.minX ||
+        minX > cullingBounds.maxX ||
+        maxY < cullingBounds.minY ||
+        minY > cullingBounds.maxY
+      ) {
+        continue;
+      }
+
+      const rangeOffset = pageIndex * 2;
+      this.appendMergedRange(ranges, this.pageTextRanges[rangeOffset] ?? 0, this.pageTextRanges[rangeOffset + 1] ?? 0);
+    }
+    return ranges;
+  }
+
+  private appendMergedRange(ranges: InstanceRange[], start: number, count: number): void {
+    const clampedStart = clampInt(start, 0, this.textInstanceCount);
+    const clampedCount = clampInt(count, 0, this.textInstanceCount - clampedStart);
+    if (clampedCount <= 0) {
       return;
     }
 
-    let windowStart = 0;
-    let windowEnd = this.textInstanceCount;
+    const last = ranges[ranges.length - 1];
+    if (last && clampedStart <= last.start + last.count) {
+      const nextEnd = Math.max(last.start + last.count, clampedStart + clampedCount);
+      last.count = nextEnd - last.start;
+      return;
+    }
+    ranges.push({ start: clampedStart, count: clampedCount });
+  }
 
-    const pageCount = Math.floor(this.pageRects.length / 4);
-    if (cullingBounds && pageCount > 0 && this.pageTextRanges.length >= pageCount * 2) {
-      windowStart = this.textInstanceCount;
-      windowEnd = 0;
-      for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-        const rectOffset = pageIndex * 4;
-        const minX = Math.min(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
-        const minY = Math.min(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
-        const maxX = Math.max(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
-        const maxY = Math.max(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
-        if (
-          maxX < cullingBounds.minX ||
-          minX > cullingBounds.maxX ||
-          maxY < cullingBounds.minY ||
-          minY > cullingBounds.maxY
-        ) {
-          continue;
-        }
+  private applyRanges(ranges: InstanceRange[]): void {
+    const limited = limitRangesByLargestGaps(ranges, MAX_TEXT_RANGE_MESHES);
 
-        const rangeOffset = pageIndex * 2;
-        const rangeStart = this.pageTextRanges[rangeOffset] ?? 0;
-        const rangeCount = this.pageTextRanges[rangeOffset + 1] ?? 0;
-        if (rangeCount <= 0) {
-          continue;
-        }
-        windowStart = Math.min(windowStart, rangeStart);
-        windowEnd = Math.max(windowEnd, rangeStart + rangeCount);
+    if (heprPerf.enabled) {
+      heprPerf.textRangeMeshCount = limited.length;
+      let drawn = 0;
+      for (const range of limited) {
+        drawn += range.count;
       }
-      if (windowEnd <= windowStart) {
-        windowStart = 0;
-        windowEnd = 0;
-      }
+      heprPerf.textInstancesDrawn = drawn;
     }
 
-    this.instanceStartUniform.value = windowStart;
-    if (this.webGpuState) {
-      this.webGpuState.instanceStartUniform.value = windowStart;
+    for (let i = 0; i < limited.length; i += 1) {
+      let mesh = this.rangeMeshes[i];
+      if (!mesh) {
+        mesh = this.createRangeMesh();
+        this.rangeMeshes.push(mesh);
+        this.group.add(mesh);
+      }
+      mesh.visible = true;
+      mesh.geometry.instanceCount = limited[i].count;
+      mesh.userData.heprTextInstanceStart = limited[i].start;
     }
-    this.mesh.geometry.instanceCount = Math.max(0, windowEnd - windowStart);
+    for (let i = limited.length; i < this.rangeMeshes.length; i += 1) {
+      this.rangeMeshes[i].visible = false;
+      this.rangeMeshes[i].geometry.instanceCount = 0;
+    }
   }
 
   dispose(): void {
-    this.mesh.geometry.dispose();
-    this.mesh.material.dispose();
+    for (const mesh of this.rangeMeshes) {
+      mesh.onBeforeRender = () => {};
+      this.group.remove(mesh);
+      mesh.geometry.dispose();
+    }
+    this.rangeMeshes.length = 0;
+    this.material.dispose();
     this.textInstanceTextureA.dispose();
     this.textInstanceTextureB.dispose();
     this.textInstanceTextureC.dispose();
@@ -428,6 +586,40 @@ export class ThreeMaterialTextLayer {
     this.textRasterAtlasTexture.dispose();
     this.pageModeTexture.dispose();
   }
+}
+
+const pageOffsetCopyPosition = new THREE.Vector2();
+
+// Reduces disjoint ranges to at most `limit` by preserving the largest gaps
+// and merging across the rest, so the extra vertex work stays minimal.
+function limitRangesByLargestGaps(ranges: InstanceRange[], limit: number): InstanceRange[] {
+  if (ranges.length <= limit) {
+    return ranges;
+  }
+
+  const gapOrder: number[] = [];
+  for (let i = 0; i + 1 < ranges.length; i += 1) {
+    gapOrder.push(i);
+  }
+  gapOrder.sort((a, b) => {
+    const gapA = ranges[a + 1].start - (ranges[a].start + ranges[a].count);
+    const gapB = ranges[b + 1].start - (ranges[b].start + ranges[b].count);
+    return gapB - gapA;
+  });
+  const keptGaps = new Set(gapOrder.slice(0, Math.max(0, limit - 1)));
+
+  const out: InstanceRange[] = [];
+  let current: InstanceRange = { start: ranges[0].start, count: ranges[0].count };
+  for (let i = 1; i < ranges.length; i += 1) {
+    if (keptGaps.has(i - 1)) {
+      out.push(current);
+      current = { start: ranges[i].start, count: ranges[i].count };
+    } else {
+      current.count = ranges[i].start + ranges[i].count - current.start;
+    }
+  }
+  out.push(current);
+  return out;
 }
 
 function chooseTextureSize(count: number): { width: number; height: number } {
@@ -497,29 +689,6 @@ function createRasterAtlasTexture(data: Uint8Array, width: number, height: numbe
   texture.unpackAlignment = 1;
   texture.needsUpdate = true;
   return texture;
-}
-
-function createTextGeometry(textInstanceCount: number): THREE.InstancedBufferGeometry {
-  const geometry = new THREE.InstancedBufferGeometry();
-
-  const corners = new Float32Array([
-    -1, -1,
-    1, -1,
-    1, 1,
-    -1, 1
-  ]);
-  geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute(corners, 2));
-  geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
-
-  const instanceCount = Math.max(0, textInstanceCount | 0);
-  const textInstanceIds = new Float32Array(Math.max(1, instanceCount));
-  for (let i = 0; i < instanceCount; i += 1) {
-    textInstanceIds[i] = i;
-  }
-  geometry.setAttribute("aTextInstanceIndex", new THREE.InstancedBufferAttribute(textInstanceIds, 1));
-  geometry.instanceCount = instanceCount;
-
-  return geometry;
 }
 
 

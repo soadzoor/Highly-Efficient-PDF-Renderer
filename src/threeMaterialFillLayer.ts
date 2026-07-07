@@ -55,6 +55,14 @@ export class ThreeMaterialFillLayer {
   private readonly sceneMinY: number;
   private readonly sceneMaxX: number;
   private readonly sceneMaxY: number;
+  // Baked fill data, referenced from the scene so page offsets re-apply from
+  // pristine values, plus a lazily built path -> page association.
+  private readonly baselineFillPathMetaA: Float32Array;
+  private readonly baselineFillPathMetaB: Float32Array;
+  private readonly baselineFillSegmentsA: Float32Array;
+  private readonly baselineFillSegmentsB: Float32Array;
+  private readonly fillPageRects: Float32Array;
+  private fillPathPageIndex: Int32Array | null = null;
   private webGpuState: ThreeWebGpuFillMaterialState | null = null;
   private usingAllFillPaths = true;
   private useLocalToClip = false;
@@ -63,6 +71,11 @@ export class ThreeMaterialFillLayer {
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
+    this.baselineFillPathMetaA = scene.fillPathMetaA;
+    this.baselineFillPathMetaB = scene.fillPathMetaB;
+    this.baselineFillSegmentsA = scene.fillSegmentsA;
+    this.baselineFillSegmentsB = scene.fillSegmentsB;
+    this.fillPageRects = normalizeFillLayerPageRects(scene);
     const pathTextureSize = chooseTextureSize(fillPathCount);
     const segmentTextureSize = chooseTextureSize(fillSegmentCount);
 
@@ -193,6 +206,102 @@ export class ThreeMaterialFillLayer {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }
 
+  // Moves each changed page's fill paths by re-applying baked coordinates
+  // plus the page offset (path bounds, segment points, and the CPU culling
+  // bounds). Fill textures are small, so a full texture update per change is
+  // cheap.
+  applyPageOffsets(pageOffsets: Float32Array, changedPages: readonly number[]): void {
+    if (this.fillPathCount <= 0 || changedPages.length === 0) {
+      return;
+    }
+
+    const pageForPath = this.ensureFillPathPageIndex();
+    const changed = new Set(changedPages);
+    const metaAData = (this.fillPathMetaTextureA.image as { data: Float32Array }).data;
+    const metaBData = (this.fillPathMetaTextureB.image as { data: Float32Array }).data;
+    const segmentAData = (this.fillSegmentTextureA.image as { data: Float32Array }).data;
+    const segmentBData = (this.fillSegmentTextureB.image as { data: Float32Array }).data;
+    let touched = false;
+
+    for (let path = 0; path < this.fillPathCount; path += 1) {
+      const pageIndex = pageForPath[path];
+      if (pageIndex < 0 || !changed.has(pageIndex)) {
+        continue;
+      }
+      const offsetX = pageOffsets[pageIndex * 2] ?? 0;
+      const offsetY = pageOffsets[pageIndex * 2 + 1] ?? 0;
+      const metaOffset = path * 4;
+
+      const minX = this.baselineFillPathMetaA[metaOffset + 2] + offsetX;
+      const minY = this.baselineFillPathMetaA[metaOffset + 3] + offsetY;
+      const maxX = this.baselineFillPathMetaB[metaOffset] + offsetX;
+      const maxY = this.baselineFillPathMetaB[metaOffset + 1] + offsetY;
+      metaAData[metaOffset + 2] = minX;
+      metaAData[metaOffset + 3] = minY;
+      metaBData[metaOffset] = maxX;
+      metaBData[metaOffset + 1] = maxY;
+      this.fillMinX[path] = Math.min(minX, maxX);
+      this.fillMinY[path] = Math.min(minY, maxY);
+      this.fillMaxX[path] = Math.max(minX, maxX);
+      this.fillMaxY[path] = Math.max(minY, maxY);
+
+      const segmentStart = Math.max(0, Math.trunc(this.baselineFillPathMetaA[metaOffset]));
+      const segmentCount = Math.max(0, Math.trunc(this.baselineFillPathMetaA[metaOffset + 1]));
+      for (let segment = segmentStart; segment < segmentStart + segmentCount; segment += 1) {
+        const segmentOffset = segment * 4;
+        if (segmentOffset + 3 >= segmentAData.length || segmentOffset + 1 >= segmentBData.length) {
+          break;
+        }
+        segmentAData[segmentOffset] = this.baselineFillSegmentsA[segmentOffset] + offsetX;
+        segmentAData[segmentOffset + 1] = this.baselineFillSegmentsA[segmentOffset + 1] + offsetY;
+        segmentAData[segmentOffset + 2] = this.baselineFillSegmentsA[segmentOffset + 2] + offsetX;
+        segmentAData[segmentOffset + 3] = this.baselineFillSegmentsA[segmentOffset + 3] + offsetY;
+        segmentBData[segmentOffset] = this.baselineFillSegmentsB[segmentOffset] + offsetX;
+        segmentBData[segmentOffset + 1] = this.baselineFillSegmentsB[segmentOffset + 1] + offsetY;
+      }
+      touched = true;
+    }
+
+    if (touched) {
+      this.fillPathMetaTextureA.needsUpdate = true;
+      this.fillPathMetaTextureB.needsUpdate = true;
+      this.fillSegmentTextureA.needsUpdate = true;
+      this.fillSegmentTextureB.needsUpdate = true;
+    }
+  }
+
+  // Associates each fill path with the page whose rect contains its center.
+  // Paths are page-ordered, so the scan resumes from the previous hit.
+  private ensureFillPathPageIndex(): Int32Array {
+    if (this.fillPathPageIndex) {
+      return this.fillPathPageIndex;
+    }
+
+    const pageCount = Math.floor(this.fillPageRects.length / 4);
+    const pageForPath = new Int32Array(this.fillPathCount).fill(-1);
+    let searchStart = 0;
+    for (let path = 0; path < this.fillPathCount; path += 1) {
+      const metaOffset = path * 4;
+      const centerX = (this.baselineFillPathMetaA[metaOffset + 2] + this.baselineFillPathMetaB[metaOffset]) * 0.5;
+      const centerY = (this.baselineFillPathMetaA[metaOffset + 3] + this.baselineFillPathMetaB[metaOffset + 1]) * 0.5;
+      for (let probe = 0; probe < pageCount; probe += 1) {
+        const pageIndex = (searchStart + probe) % pageCount;
+        const rectOffset = pageIndex * 4;
+        const minX = Math.min(this.fillPageRects[rectOffset], this.fillPageRects[rectOffset + 2]);
+        const minY = Math.min(this.fillPageRects[rectOffset + 1], this.fillPageRects[rectOffset + 3]);
+        const maxX = Math.max(this.fillPageRects[rectOffset], this.fillPageRects[rectOffset + 2]);
+        const maxY = Math.max(this.fillPageRects[rectOffset + 1], this.fillPageRects[rectOffset + 3]);
+        if (centerX >= minX && centerX <= maxX && centerY >= minY && centerY <= maxY) {
+          pageForPath[path] = pageIndex;
+          searchStart = pageIndex;
+          break;
+        }
+      }
+    }
+    this.fillPathPageIndex = pageForPath;
+    return pageForPath;
+  }
+
   setScreenSpaceTransform(): void {
     this.useLocalToClip = false;
     this.useLocalToClipUniform.value = 0;
@@ -303,6 +412,19 @@ export class ThreeMaterialFillLayer {
     this.usingAllFillPaths = true;
     this.mesh.geometry.instanceCount = this.fillPathCount;
   }
+}
+
+function normalizeFillLayerPageRects(scene: VectorScene): Float32Array {
+  if (scene.pageRects instanceof Float32Array && scene.pageRects.length >= 4) {
+    return new Float32Array(scene.pageRects);
+  }
+
+  return new Float32Array([
+    scene.pageBounds.minX,
+    scene.pageBounds.minY,
+    scene.pageBounds.maxX,
+    scene.pageBounds.maxY
+  ]);
 }
 
 function chooseTextureSize(count: number): { width: number; height: number } {

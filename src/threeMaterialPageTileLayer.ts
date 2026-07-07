@@ -18,6 +18,23 @@ interface ViewportPixels {
   height: number;
 }
 
+export interface PageTileUpload {
+  atlasX: number;
+  atlasY: number;
+  width: number;
+  height: number;
+  pixels: Uint8Array;
+}
+
+interface TileCopyCapableRenderer {
+  copyTextureToTexture?: (
+    srcTexture: THREE.Texture,
+    dstTexture: THREE.Texture,
+    srcRegion?: unknown,
+    dstPosition?: unknown
+  ) => void;
+}
+
 // Tiles hold premultiplied text baked in the shared output color space, so the
 // fragment shader passes texels through and the material composites with
 // (ONE, ONE_MINUS_SRC_ALPHA), mirroring the native renderers' tile draw.
@@ -115,11 +132,13 @@ function callNode(fn: ReturnType<typeof TSL.wgslFn>, params: Record<string, unkn
 export class ThreeMaterialPageTileLayer {
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
-  readonly atlasWidth: number;
-  readonly atlasHeight: number;
-  readonly atlasData: Uint8Array;
+  private atlasWidthInternal: number;
+  private atlasHeightInternal: number;
+  private atlasData: Uint8Array;
 
-  private readonly atlasTexture: THREE.DataTexture;
+  private atlasTexture: THREE.DataTexture;
+  private readonly materialBackend: "webgl" | "webgpu";
+  private atlasTextureNode: { value: THREE.Texture } | null = null;
   private readonly worldRectAttribute: THREE.InstancedBufferAttribute;
   private readonly uvRectAttribute: THREE.InstancedBufferAttribute;
   private readonly viewportUniform: THREE.Vector2;
@@ -132,26 +151,21 @@ export class ThreeMaterialPageTileLayer {
     useLocalToClip: { value: number };
   } | null = null;
 
+  get atlasWidth(): number {
+    return this.atlasWidthInternal;
+  }
+
+  get atlasHeight(): number {
+    return this.atlasHeightInternal;
+  }
+
   constructor(options: PageTileLayerOptions) {
     const materialBackend = options.materialBackend ?? "webgl";
-    this.atlasWidth = Math.max(64, options.atlasWidth | 0);
-    this.atlasHeight = Math.max(64, options.atlasHeight | 0);
-    this.atlasData = new Uint8Array(this.atlasWidth * this.atlasHeight * 4);
-
-    this.atlasTexture = new THREE.DataTexture(
-      this.atlasData,
-      this.atlasWidth,
-      this.atlasHeight,
-      THREE.RGBAFormat,
-      THREE.UnsignedByteType
-    );
-    this.atlasTexture.magFilter = THREE.LinearFilter;
-    this.atlasTexture.minFilter = THREE.LinearFilter;
-    this.atlasTexture.wrapS = THREE.ClampToEdgeWrapping;
-    this.atlasTexture.wrapT = THREE.ClampToEdgeWrapping;
-    this.atlasTexture.flipY = false;
-    this.atlasTexture.generateMipmaps = false;
-    this.atlasTexture.needsUpdate = true;
+    this.materialBackend = materialBackend;
+    this.atlasWidthInternal = Math.max(64, options.atlasWidth | 0);
+    this.atlasHeightInternal = Math.max(64, options.atlasHeight | 0);
+    this.atlasData = new Uint8Array(this.atlasWidthInternal * this.atlasHeightInternal * 4);
+    this.atlasTexture = createAtlasTexture(this.atlasData, this.atlasWidthInternal, this.atlasHeightInternal);
 
     const maxTileCount = Math.max(1, options.maxTileCount | 0);
     const geometry = new THREE.InstancedBufferGeometry();
@@ -236,13 +250,51 @@ export class ThreeMaterialPageTileLayer {
     });
 
     const uv = TSL.varying(callNode(pageTileUvFn, { corner, uvRect }));
-    material.fragmentNode = callNode(pageTileDecodeFn, { texel: TSL.texture(this.atlasTexture, uv) });
+    const atlasTextureNode = TSL.texture(this.atlasTexture, uv);
+    material.fragmentNode = callNode(pageTileDecodeFn, { texel: atlasTextureNode });
 
+    this.atlasTextureNode = atlasTextureNode as unknown as { value: THREE.Texture };
     this.webGpuUniforms = {
       zoom: zoomUniform as { value: number },
       useLocalToClip: useLocalToClipUniform as { value: number }
     };
     return material;
+  }
+
+  // Grows the atlas to at least `minArea` pixels (square power-of-two steps,
+  // capped at maxDim). Returns true when the atlas was recreated; all
+  // previously written tiles are lost and must be rebaked by the caller.
+  ensureAtlasArea(minArea: number, maxDim: number): boolean {
+    const currentArea = this.atlasWidthInternal * this.atlasHeightInternal;
+    let width = this.atlasWidthInternal;
+    let height = this.atlasHeightInternal;
+    while (width * height < minArea && Math.min(width, height) < maxDim) {
+      if (width <= height) {
+        width *= 2;
+      } else {
+        height *= 2;
+      }
+    }
+    if (width * height <= currentArea) {
+      return false;
+    }
+    this.recreateAtlas(width, height);
+    return true;
+  }
+
+  private recreateAtlas(width: number, height: number): void {
+    this.atlasTexture.dispose();
+    this.atlasWidthInternal = width;
+    this.atlasHeightInternal = height;
+    this.atlasData = new Uint8Array(width * height * 4);
+    this.atlasTexture = createAtlasTexture(this.atlasData, width, height);
+
+    if (this.materialBackend === "webgl") {
+      const material = this.mesh.material as THREE.RawShaderMaterial;
+      material.uniforms.uPageTileAtlasTex.value = this.atlasTexture;
+    } else if (this.atlasTextureNode) {
+      this.atlasTextureNode.value = this.atlasTexture;
+    }
   }
 
   setVisible(visible: boolean): void {
@@ -273,16 +325,82 @@ export class ThreeMaterialPageTileLayer {
     this.mesh.geometry.instanceCount = count;
   }
 
-  writeTilePixels(atlasX: number, atlasY: number, width: number, height: number, pixels: Uint8Array): void {
-    const rowBytes = width * 4;
-    for (let row = 0; row < height; row += 1) {
-      const targetOffset = ((atlasY + row) * this.atlasWidth + atlasX) * 4;
-      this.atlasData.set(pixels.subarray(row * rowBytes, row * rowBytes + rowBytes), targetOffset);
+  // Uploads freshly baked tiles into the atlas. With a capable host renderer
+  // this issues small per-shelf-row region copies (no full-atlas re-upload,
+  // matching the native renderers' incremental atlas writes); otherwise it
+  // falls back to the CPU mirror plus a full texture update.
+  uploadTiles(hostRenderer: unknown, tiles: PageTileUpload[]): void {
+    if (tiles.length === 0) {
+      return;
+    }
+
+    const copyTextureToTexture = (hostRenderer as TileCopyCapableRenderer | null)?.copyTextureToTexture;
+    if (typeof copyTextureToTexture !== "function") {
+      for (const tile of tiles) {
+        this.writeTilePixelsToMirror(tile);
+      }
+      this.atlasTexture.needsUpdate = true;
+      return;
+    }
+
+    // The shelf allocator hands out slots left-to-right per row, so one
+    // batch's tiles in the same row are contiguous; upload them as one strip.
+    const sorted = [...tiles].sort((a, b) => (a.atlasY - b.atlasY) || (a.atlasX - b.atlasX));
+    let runStart = 0;
+    while (runStart < sorted.length) {
+      let runEnd = runStart + 1;
+      while (runEnd < sorted.length && sorted[runEnd].atlasY === sorted[runStart].atlasY) {
+        runEnd += 1;
+      }
+      this.uploadTileRun(hostRenderer as TileCopyCapableRenderer, sorted.slice(runStart, runEnd));
+      runStart = runEnd;
     }
   }
 
-  markAtlasDirty(): void {
-    this.atlasTexture.needsUpdate = true;
+  private uploadTileRun(hostRenderer: TileCopyCapableRenderer, run: PageTileUpload[]): void {
+    const first = run[0];
+    const last = run[run.length - 1];
+    const stripX = first.atlasX;
+    const stripY = first.atlasY;
+    const stripWidth = last.atlasX + last.width - stripX;
+    let stripHeight = 1;
+    for (const tile of run) {
+      stripHeight = Math.max(stripHeight, tile.height);
+    }
+    if (stripWidth <= 0 || stripX + stripWidth > this.atlasWidthInternal || stripY + stripHeight > this.atlasHeightInternal) {
+      return;
+    }
+
+    const strip = new Uint8Array(stripWidth * stripHeight * 4);
+    for (const tile of run) {
+      const rowBytes = tile.width * 4;
+      const offsetX = tile.atlasX - stripX;
+      for (let row = 0; row < tile.height; row += 1) {
+        strip.set(
+          tile.pixels.subarray(row * rowBytes, row * rowBytes + rowBytes),
+          (row * stripWidth + offsetX) * 4
+        );
+      }
+    }
+
+    const stripTexture = new THREE.DataTexture(strip, stripWidth, stripHeight, THREE.RGBAFormat, THREE.UnsignedByteType);
+    stripTexture.flipY = false;
+    stripTexture.generateMipmaps = false;
+    stripTexture.needsUpdate = true;
+    try {
+      copyTilePosition.set(stripX, stripY);
+      hostRenderer.copyTextureToTexture!(stripTexture, this.atlasTexture, null, copyTilePosition);
+    } finally {
+      stripTexture.dispose();
+    }
+  }
+
+  private writeTilePixelsToMirror(tile: PageTileUpload): void {
+    const rowBytes = tile.width * 4;
+    for (let row = 0; row < tile.height; row += 1) {
+      const targetOffset = ((tile.atlasY + row) * this.atlasWidthInternal + tile.atlasX) * 4;
+      this.atlasData.set(tile.pixels.subarray(row * rowBytes, row * rowBytes + rowBytes), targetOffset);
+    }
   }
 
   setScreenSpaceTransform(): void {
@@ -314,4 +432,18 @@ export class ThreeMaterialPageTileLayer {
     this.mesh.material.dispose();
     this.atlasTexture.dispose();
   }
+}
+
+const copyTilePosition = new THREE.Vector2();
+
+function createAtlasTexture(data: Uint8Array, width: number, height: number): THREE.DataTexture {
+  const texture = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.flipY = false;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return texture;
 }
