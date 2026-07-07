@@ -90,6 +90,24 @@ def test_discover_pdf_tsv_pairs_reports_missing_files(tmp_path: Path) -> None:
     assert discovery.missing_tsvs == ["pdf-only"]
 
 
+def test_discover_pdf_tsv_pairs_recurses_into_subfolders(tmp_path: Path) -> None:
+    # The corpus layout: pdf-tsv/kp, pdf-tsv/uci, ... with no root-level files.
+    for folder, stem in (("kp", "Floor 1"), ("uci", "Level 2")):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / f"{stem}.pdf").write_bytes(b"%PDF-1.7\n")
+        (tmp_path / folder / f"{stem}.tsv").write_text("geometryData\n[]\n", encoding="utf-8")
+    (tmp_path / "withoutTSV").mkdir()
+    (tmp_path / "withoutTSV" / "Murietta.pdf").write_bytes(b"%PDF-1.7\n")
+
+    discovery = discover_pdf_tsv_pairs(tmp_path)
+
+    assert [pair.stem for pair in discovery.pairs] == ["kp__Floor 1", "uci__Level 2"]
+    assert discovery.pairs[0].pdf_path == tmp_path / "kp" / "Floor 1.pdf"
+    assert discovery.pairs[0].tsv_path == tmp_path / "kp" / "Floor 1.tsv"
+    assert discovery.missing_tsvs == ["withoutTSV__Murietta"]
+    assert discovery.missing_pdfs == []
+
+
 @pytest.mark.parametrize(
     ("rotation", "expected"),
     [
@@ -144,6 +162,49 @@ def test_pdf_tsv_dataset_reads_cached_images_deterministically(tmp_path: Path) -
     assert torch.equal(image_a, image_b)
     assert torch.equal(mask_a, mask_b)
     assert mask_a.unique().tolist() == [PDF_TSV_ROOM_ID, PDF_TSV_SEPARATOR_ID]
+
+
+def test_write_pdf_tsv_splits_matching_mirrors_vector_splits(tmp_path: Path) -> None:
+    from roomdet.pdf_tsv_dataset import read_pdf_tsv_split, write_pdf_tsv_splits_matching
+
+    def sample(stem: str) -> PreparedPdfTsvSample:
+        return PreparedPdfTsvSample(
+            image_path=tmp_path / f"{stem}.png",
+            mask_path=tmp_path / f"{stem}_mask.png",
+            source_pdf=tmp_path / f"{stem}.pdf",
+            source_tsv=tmp_path / f"{stem}.tsv",
+            stem=stem,
+            geometry_rows=1,
+            skipped_rows=0,
+            exterior_rows=0,
+            rotation=0,
+            page_width=8,
+            page_height=8,
+        )
+
+    vector_splits = tmp_path / "vector-splits.json"
+    vector_splits.write_text(
+        json.dumps(
+            {
+                "train": [{"folder": "uci", "stem": "B_Level 1", "page": "pages/x.npz"}],
+                "val": [{"folder": "kp", "stem": "A_Floor 1", "page": "pages/y.npz"}],
+                "test": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    samples = [sample("kp__A_Floor 1"), sample("uci__B_Level 1"), sample("kp__Not In Vector")]
+    output = tmp_path / "raster-splits.json"
+    unmatched = write_pdf_tsv_splits_matching(samples, output, vector_splits, taxonomy="geometry")
+
+    assert unmatched == ["kp__Not In Vector"]
+    assert [entry.stem for entry in read_pdf_tsv_split(output, "val")] == ["kp__A_Floor 1"]
+    assert sorted(entry.stem for entry in read_pdf_tsv_split(output, "train")) == ["kp__Not In Vector", "uci__B_Level 1"]
+    assert read_pdf_tsv_split(output, "test") == []
+    metadata = json.loads(output.read_text(encoding="utf-8"))["metadata"]
+    assert metadata["splitMode"] == "match-vector"
+    assert metadata["unmatchedSamples"] == ["kp__Not In Vector"]
 
 
 def test_write_pdf_tsv_splits_train_all_records_class_specs(tmp_path: Path) -> None:

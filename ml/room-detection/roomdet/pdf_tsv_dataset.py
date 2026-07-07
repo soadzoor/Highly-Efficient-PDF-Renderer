@@ -82,14 +82,27 @@ class PreparedPdfTsvSample:
 
 
 def discover_pdf_tsv_pairs(root: Path) -> PairDiscovery:
-    pdfs = {path.stem: path for path in sorted(root.glob("*.pdf"))}
-    tsvs = {path.stem: path for path in sorted(root.glob("*.tsv"))}
-    stems = sorted(set(pdfs) & set(tsvs))
-    return PairDiscovery(
-        pairs=[PdfTsvPair(stem=stem, pdf_path=pdfs[stem], tsv_path=tsvs[stem]) for stem in stems],
-        missing_pdfs=sorted(set(tsvs) - set(pdfs)),
-        missing_tsvs=sorted(set(pdfs) - set(tsvs)),
-    )
+    """Pair PDFs and TSVs by stem, in the root and one level of subfolders.
+
+    Subfolder pairs get a `<folder>__` stem prefix so output filenames stay
+    unique when the corpus is organized as pdf-tsv/kp, pdf-tsv/uci, etc.
+    """
+    directories = [root]
+    if root.is_dir():
+        directories += sorted(path for path in root.iterdir() if path.is_dir())
+
+    pairs: list[PdfTsvPair] = []
+    missing_pdfs: list[str] = []
+    missing_tsvs: list[str] = []
+    for directory in directories:
+        pdfs = {path.stem: path for path in sorted(directory.glob("*.pdf"))}
+        tsvs = {path.stem: path for path in sorted(directory.glob("*.tsv"))}
+        prefix = "" if directory == root else f"{directory.name}__"
+        stems = sorted(set(pdfs) & set(tsvs))
+        pairs.extend(PdfTsvPair(stem=f"{prefix}{stem}", pdf_path=pdfs[stem], tsv_path=tsvs[stem]) for stem in stems)
+        missing_pdfs.extend(f"{prefix}{stem}" for stem in set(tsvs) - set(pdfs))
+        missing_tsvs.extend(f"{prefix}{stem}" for stem in set(pdfs) - set(tsvs))
+    return PairDiscovery(pairs=pairs, missing_pdfs=sorted(missing_pdfs), missing_tsvs=sorted(missing_tsvs))
 
 
 def parse_pdf_tsv_geometry(tsv_path: Path) -> ParsedTsvGeometry:
@@ -428,6 +441,52 @@ def write_pdf_tsv_splits(
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_pdf_tsv_splits_matching(
+    samples: list[PreparedPdfTsvSample],
+    output_path: Path,
+    vector_splits_path: Path,
+    class_specs: Sequence[ClassSpec] | None = None,
+    taxonomy: str = "geometry",
+) -> list[str]:
+    """Assign train/val/test to mirror a vector-splits.json (fair raster baseline).
+
+    Samples are matched by the `<folder>__<stem>` naming that subfolder discovery
+    produces. Unmatched samples fall back to train and are returned for reporting.
+    """
+    vector_payload = json.loads(vector_splits_path.read_text(encoding="utf-8"))
+    membership: dict[str, str] = {}
+    for split in ("train", "val", "test"):
+        for entry in vector_payload.get(split, []):
+            membership[f"{entry['folder']}__{entry['stem']}"] = split
+
+    buckets: dict[str, list[PreparedPdfTsvSample]] = {"train": [], "val": [], "test": []}
+    unmatched: list[str] = []
+    for sample in samples:
+        split = membership.get(sample.stem)
+        if split is None:
+            unmatched.append(sample.stem)
+            split = "train"
+        buckets[split].append(sample)
+
+    class_specs = tuple(class_specs or classes_for_taxonomy(taxonomy))
+    payload = {
+        "metadata": {
+            "splitMode": "match-vector",
+            "matchedFrom": str(vector_splits_path),
+            "taxonomy": taxonomy,
+            "targetMode": "class" if taxonomy != "geometry" else "geometry",
+            "classSpecs": manifest_classes(class_specs),
+            "unmatchedSamples": sorted(unmatched),
+        },
+        "train": [serialize_prepared_sample(sample) for sample in buckets["train"]],
+        "val": [serialize_prepared_sample(sample) for sample in buckets["val"]],
+        "test": [serialize_prepared_sample(sample) for sample in buckets["test"]],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return sorted(unmatched)
 
 
 def read_pdf_tsv_metadata(split_path: Path) -> dict[str, object]:

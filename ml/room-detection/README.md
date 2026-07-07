@@ -2,6 +2,13 @@
 
 This workspace trains and exports the room detector used by the browser ONNX demo. The current model is trained from local PDF/TSV room geometry and room type annotations.
 
+There are two independent pipelines with two different trainers — don't mix their commands:
+
+| Pipeline | Input | Trainer | Sections |
+|---|---|---|---|
+| Raster CNN (shipped model) | rendered page images | `train_pdf_tsv_scratch.py` | Prepare / Train / Evaluate / Export below |
+| Vector-native (experimental) | PDF stroke segments | `train_segment_classifier.py` | "Vector Pipeline" at the bottom |
+
 The app expects the exported files at:
 
 ```text
@@ -31,7 +38,12 @@ and adjust repo-root-relative data paths accordingly.
 
 ## Prepare PDF-TSV Data
 
-Put local paired `*.pdf` and `*.tsv` files in `pdf-tsv/`. Files are paired by filename stem. The raw `pdf-tsv/` directory and generated `data/` cache are ignored by Git.
+Put local paired `*.pdf` and `*.tsv` files in `pdf-tsv/`, either flat or organized
+into subfolders (`pdf-tsv/kp`, `pdf-tsv/uci`, ...). Files are paired by filename
+stem within each folder; subfolder samples get a `<folder>__` stem prefix. PDFs
+without a matching TSV (`withoutTSV/`, `not_floorplans/`) are reported and
+skipped. The raw `pdf-tsv/` directory and generated `data/` cache are ignored by
+Git.
 
 ```bash
 python3 ml/room-detection/prepare_pdf_tsv_dataset.py \
@@ -44,6 +56,22 @@ python3 ml/room-detection/prepare_pdf_tsv_dataset.py \
   --room-type-taxonomy clinical-coarse
 ```
 
+`--split-mode train-all` (used for the shipped model) trains on everything and
+keeps no validation split. To retrain the raster model as a *fair baseline* for
+the vector pipeline, mirror the vector splits instead so both models share the
+exact same held-out pages:
+
+```bash
+python3 ml/room-detection/prepare_pdf_tsv_dataset.py \
+  --pdf-tsv-root pdf-tsv \
+  --output-root data/pdf-tsv-roomtypes-sep3-vecmatch \
+  --splits ml/room-detection/pdf_tsv_vecmatch_splits.json \
+  --image-size 1536 \
+  --separator-width 3 \
+  --room-type-taxonomy clinical-coarse \
+  --match-vector-splits ml/room-detection/vector-splits.json
+```
+
 The preparer reads `geometryData`, `roomType`, and `roomNumber`; it ignores `boundaryID` and `boundaryType`. It renders the first PDF page, applies the rotation-aware PDF coordinate transform, rasterizes class masks, and writes cached images, masks, metadata, and debug overlays.
 
 QC overlays are written under:
@@ -54,7 +82,10 @@ data/pdf-tsv-roomtypes-sep3-v1/debug/
 
 Check the overlays before training. Green regions represent room interiors and dark separator pixels represent room boundaries. Warnings such as `empty_mask`, `tiny_geometry`, or `huge_geometry` usually mean a PDF/TSV alignment issue should be fixed first.
 
-## Train
+## Train (raster CNN)
+
+This trains the raster segmentation CNN (`train_pdf_tsv_scratch.py`). The vector
+model has its own trainer — see "Vector Pipeline" below.
 
 Train the ImageNet-initialized PDF-TSV room-type model:
 
@@ -155,16 +186,24 @@ All long-running scripts print JSON progress lines at least every `--log-seconds
 (default 10) with percentages and ETAs; every trainer writes `last.pt`/`best.pt`.
 `--device auto` picks cuda, then mps, then cpu.
 
+All vector commands below run from `ml/room-detection`. The Node dump script is
+the one exception in spirit: its `--root`/`--out` arguments (and their defaults,
+`pdf-tsv` and `ml/room-detection/data/vector-segments`) always resolve against
+the repository root, no matter where you invoke it from.
+
 ```bash
 cd ml/room-detection
 
 # 0. one-time: segment dumps via the browser extractor running headless in Node
-node ../../scripts/extract-segments.mjs --root pdf-tsv --out ml/room-detection/data/vector-segments   # run from repo root
+node ../../scripts/extract-segments.mjs
 
 # 1. labels, bridge candidates, QC overlays (data/vector-dataset/qc), splits
 python prepare_vector_dataset.py
 
 # 2. raster baseline (optimistic upper bound: the committed model trained on all pages)
+#    For a fair clean-split baseline instead, retrain the raster CNN on splits
+#    prepared with --match-vector-splits (see "Prepare PDF-TSV Data"), then
+#    evaluate it with evaluate_pdf_tsv.py --split val --instance-matching.
 python evaluate_onnx_baseline.py --split val
 
 # 3. segment classifier (Head A)

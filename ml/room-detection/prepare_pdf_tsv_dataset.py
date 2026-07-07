@@ -9,6 +9,7 @@ from roomdet.pdf_tsv_dataset import (
     prepare_pdf_tsv_sample,
     serialize_prepared_sample,
     write_pdf_tsv_splits,
+    write_pdf_tsv_splits_matching,
 )
 from roomdet.classes import classes_for_taxonomy, manifest_classes
 
@@ -24,6 +25,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--split-mode", choices=("standard", "train-all"), default="standard")
     parser.add_argument("--room-type-taxonomy", choices=("geometry", "clinical-coarse"), default="geometry")
+    parser.add_argument(
+        "--match-vector-splits",
+        type=Path,
+        default=None,
+        help="assign train/val/test to mirror this vector-splits.json (fair baseline vs the vector pipeline); overrides --split-mode",
+    )
     args = parser.parse_args()
 
     discovery = discover_pdf_tsv_pairs(args.pdf_tsv_root)
@@ -90,14 +97,25 @@ def main() -> None:
             flush=True,
         )
 
-    write_pdf_tsv_splits(
-        samples,
-        args.splits,
-        seed=args.seed,
-        split_mode=args.split_mode,
-        class_specs=class_specs,
-        taxonomy=args.room_type_taxonomy,
-    )
+    if args.match_vector_splits is not None:
+        unmatched = write_pdf_tsv_splits_matching(
+            samples,
+            args.splits,
+            args.match_vector_splits,
+            class_specs=class_specs,
+            taxonomy=args.room_type_taxonomy,
+        )
+        if unmatched:
+            print(json.dumps({"event": "match_vector_unmatched", "assignedToTrain": unmatched}), flush=True)
+    else:
+        write_pdf_tsv_splits(
+            samples,
+            args.splits,
+            seed=args.seed,
+            split_mode=args.split_mode,
+            class_specs=class_specs,
+            taxonomy=args.room_type_taxonomy,
+        )
     manifest_path = args.output_root / "metadata.json"
     total_class_pixel_counts: dict[str, int] = {}
     total_room_type_counts: dict[str, int] = {}
