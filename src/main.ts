@@ -29,6 +29,7 @@ import {
   type ExampleAssetManifest,
   type NormalizedExampleEntry
 } from "./exampleManifest";
+import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import {
   formatPdfDownloadFilename,
   readPdfDownloadBlob,
@@ -56,7 +57,10 @@ const hudElement = document.querySelector<HTMLDivElement>("#hud");
 const toggleHudButton = document.querySelector<HTMLButtonElement>("#toggle-hud");
 const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon");
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
-const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
+const exampleDropdownContainer = document.querySelector<HTMLDivElement>("#example-dropdown");
+const exampleSelect = document.querySelector<HTMLButtonElement>("#example-select");
+const exampleSelectLabel = document.querySelector<HTMLSpanElement>("#example-select-label");
+const exampleMenu = document.querySelector<HTMLDivElement>("#example-menu");
 const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-data");
 const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-pdf");
 const downloadAllDataButton = document.querySelector<HTMLButtonElement>("#download-all-data");
@@ -93,7 +97,10 @@ if (
   !toggleHudButton ||
   !toggleHudIcon ||
   !openButton ||
+  !exampleDropdownContainer ||
   !exampleSelect ||
+  !exampleSelectLabel ||
+  !exampleMenu ||
   !downloadDataButton ||
   !downloadPdfButton ||
   !downloadAllDataButton ||
@@ -132,7 +139,15 @@ const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
 const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
-const exampleSelectElement = exampleSelect;
+const exampleDropdown = createExampleDropdown({
+  containerElement: exampleDropdownContainer,
+  triggerElement: exampleSelect,
+  labelElement: exampleSelectLabel,
+  menuElement: exampleMenu,
+  onSelect: (selectionKey) => {
+    void loadExampleSelection(selectionKey);
+  }
+});
 const downloadDataButtonElement = downloadDataButton;
 const downloadPdfButtonElement = downloadPdfButton;
 const downloadAllDataButtonElement = downloadAllDataButton;
@@ -377,14 +392,6 @@ fileInputElement.addEventListener("change", async () => {
   fileInputElement.value = "";
 });
 
-exampleSelectElement.addEventListener("change", () => {
-  const selectedKey = exampleSelectElement.value;
-  if (!selectedKey) {
-    return;
-  }
-  void loadExampleSelection(selectedKey);
-});
-
 backendSelectElement.addEventListener("change", () => {
   const targetBackend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
   void backendSwitcher?.applyPreference(targetBackend);
@@ -456,10 +463,7 @@ function refreshDropIndicator(): void {
 async function loadExampleManifest(): Promise<void> {
   exampleSelectionMap.clear();
   exampleManifestEntries = [];
-  exampleSelectElement.innerHTML = "";
-  exampleSelectElement.append(new Option("Examples (loading...)", ""));
-  exampleSelectElement.value = "";
-  exampleSelectElement.disabled = true;
+  exampleDropdown.setPlaceholder("Examples (loading...)");
   setDownloadAllDataButtonState(false);
 
   try {
@@ -475,33 +479,24 @@ async function loadExampleManifest(): Promise<void> {
       throw new Error("Manifest does not contain valid examples.");
     }
 
-    populateExampleSelect(entries);
+    populateExampleDropdown(entries);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[Examples] Failed to load manifest: ${message}`);
     exampleManifestEntries = [];
-    exampleSelectElement.innerHTML = "";
-    exampleSelectElement.append(new Option("Examples unavailable", ""));
-    exampleSelectElement.value = "";
-    exampleSelectElement.disabled = true;
+    exampleDropdown.setPlaceholder("Examples unavailable");
     setDownloadAllDataButtonState(false);
   }
 }
 
-function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
+function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
   exampleManifestEntries = [...entries];
   exampleSelectionMap.clear();
-  exampleSelectElement.innerHTML = "";
-  exampleSelectElement.append(new Option("Load example...", ""));
+  const items: ExampleDropdownItem[] = [];
 
   for (const entry of entries) {
-    const group = document.createElement("optgroup");
-    group.label = entry.name;
-
     const pdfKey = `${entry.id}:pdf`;
     const zipKey = `${entry.id}:zip`;
-    const pdfLabel = `Parse PDF (${formatKilobytes(entry.pdfSizeBytes)} kB)`;
-    const zipLabel = `Load Parsed ZIP (${formatKilobytes(entry.zipSizeBytes)} kB)`;
 
     exampleSelectionMap.set(pdfKey, {
       id: entry.id,
@@ -518,24 +513,36 @@ function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
       pdfPath: entry.pdfPath
     });
 
-    group.append(new Option(pdfLabel, pdfKey));
-    group.append(new Option(zipLabel, zipKey));
-    exampleSelectElement.append(group);
+    items.push({
+      name: entry.name,
+      actions: [
+        {
+          key: pdfKey,
+          label: "PDF",
+          sizeLabel: `${formatKilobytes(entry.pdfSizeBytes)} kB`,
+          title: `Parse ${entry.name} from the original PDF`
+        },
+        {
+          key: zipKey,
+          label: "ZIP",
+          sizeLabel: `${formatKilobytes(entry.zipSizeBytes)} kB`,
+          title: `Load precomputed parsed data for ${entry.name}`
+        }
+      ]
+    });
   }
 
-  exampleSelectElement.value = "";
-  exampleSelectElement.disabled = exampleSelectionMap.size === 0;
+  exampleDropdown.setItems(items);
   setDownloadAllDataButtonState(exampleManifestEntries.length > 0);
 }
 
 async function loadExampleSelection(selectionKey: string): Promise<void> {
   const selection = exampleSelectionMap.get(selectionKey);
   if (!selection) {
-    exampleSelectElement.value = "";
     return;
   }
 
-  exampleSelectElement.disabled = true;
+  exampleDropdown.setDisabled(true);
   try {
     const modeLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
     setStatus(`Loading example ${selection.sourceName} (${modeLabel})...`);
@@ -582,8 +589,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load example: ${message}`);
   } finally {
-    exampleSelectElement.value = "";
-    exampleSelectElement.disabled = exampleSelectionMap.size === 0;
+    exampleDropdown.setDisabled(false);
   }
 }
 
@@ -1039,7 +1045,7 @@ function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, pro
 function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
   openButtonElement.disabled = !isEnabled;
   fileInputElement.disabled = !isEnabled;
-  exampleSelectElement.disabled = !isEnabled || exampleSelectionMap.size === 0;
+  exampleDropdown.setDisabled(!isEnabled);
 }
 
 function setHudCollapsed(collapsed: boolean): void {

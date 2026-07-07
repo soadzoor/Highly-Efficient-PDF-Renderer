@@ -25,7 +25,8 @@
   - what changed,
   - which files were modified,
   - any checks or tests that were run,
-  - any checks that still need to be run manually.
+  - any checks that still need to be run manually,
+  - recommended commit message.
 
 ## Testing and Validation
 

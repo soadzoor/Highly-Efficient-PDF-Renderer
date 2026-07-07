@@ -122,10 +122,38 @@ void main() {
   }
 
   float extent = halfWidth + aaWorld;
+  vec2 corner01 = aCorner * 0.5 + 0.5;
+
+  // Candidate A: axis-aligned quad over the (possibly clip-intersected) primitive bounds.
   vec2 worldMin = primitiveBounds.xy - vec2(extent);
   vec2 worldMax = primitiveBounds.zw + vec2(extent);
-  vec2 corner01 = aCorner * 0.5 + 0.5;
-  vec2 worldPosition = mix(worldMin, worldMax, corner01);
+
+  // Candidate B: oriented quad along the primitive direction. Diagonal segments
+  // (e.g. hatching) rasterize orders of magnitude fewer wasted fragments this way,
+  // because their axis-aligned bounds cover far more area than the stroke itself.
+  vec2 axisDelta = p2 - p0;
+  float axisLength = length(axisDelta);
+  vec2 axisU = axisLength > 1e-6 ? axisDelta / axisLength : vec2(1.0, 0.0);
+  vec2 axisV = vec2(-axisU.y, axisU.x);
+  vec2 controlOffset = p1 - p0;
+  float controlU = dot(controlOffset, axisU);
+  float controlV = dot(controlOffset, axisV);
+  float orientedMinU = min(min(0.0, controlU), axisLength) - extent;
+  float orientedMaxU = max(max(0.0, controlU), axisLength) + extent;
+  float orientedMinV = min(0.0, controlV) - extent;
+  float orientedMaxV = max(0.0, controlV) + extent;
+
+  float axisAlignedArea = (worldMax.x - worldMin.x) * (worldMax.y - worldMin.y);
+  float orientedArea = (orientedMaxU - orientedMinU) * (orientedMaxV - orientedMinV);
+
+  vec2 worldPosition;
+  if (orientedArea < axisAlignedArea) {
+    worldPosition = p0
+      + axisU * mix(orientedMinU, orientedMaxU, corner01.x)
+      + axisV * mix(orientedMinV, orientedMaxV, corner01.y);
+  } else {
+    worldPosition = mix(worldMin, worldMax, corner01);
+  }
 
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(worldPosition, 0.0, 1.0);

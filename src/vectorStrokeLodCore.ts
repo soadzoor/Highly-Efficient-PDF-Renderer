@@ -1,5 +1,5 @@
-import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { ViewState } from "./webGlFloorplanRenderer";
+import type {Bounds, VectorScene} from "./pdfVectorExtractor";
+import type {ViewState} from "./webGlFloorplanRenderer";
 
 /**
  * Vector stroke level-of-detail behavior.
@@ -182,6 +182,8 @@ interface StrokePrimitive {
   colorR: number;
   colorG: number;
   colorB: number;
+  /** Clip-intersected bounds; only set for primitives carrying the clipped flag. */
+  visibleBounds?: Bounds;
 }
 
 interface IntervalGroup {
@@ -191,6 +193,12 @@ interface IntervalGroup {
   normalX: number;
   normalY: number;
   offset: number;
+  offsetSum: number;
+  offsetWeightSum: number;
+  clipMinX: number;
+  clipMinY: number;
+  clipMaxX: number;
+  clipMaxY: number;
   halfWidth: number;
   flags: number;
   alpha: number;
@@ -278,6 +286,7 @@ const STROKE_PRIMITIVE_LINE = 0;
 const STROKE_PRIMITIVE_QUADRATIC = 1;
 const STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
 const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
+const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
 const STROKE_STYLE_FLAG_OFFSET = 2;
 const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
@@ -377,7 +386,7 @@ export class VectorStrokeLodRuntime {
   getStats(): VectorStrokeLodStats {
     return {
       ...this.stats,
-      activeLevels: this.stats.activeLevels.map((level) => ({ ...level }))
+      activeLevels: this.stats.activeLevels.map((level) => ({...level}))
     };
   }
 
@@ -535,7 +544,7 @@ export class VectorStrokeLodRuntime {
 
   private computeProjectedTileAreaStats(tileRange: RuntimeTileRange, viewport: ViewportPixels): ProjectedTileAreaStats {
     if (!this.useLocalToClip || !this.hasPerspectiveTileScaleVariation()) {
-      return { averageArea: 0, useDynamicBudget: false };
+      return {averageArea: 0, useDynamicBudget: false};
     }
 
     let totalArea = 0;
@@ -728,7 +737,7 @@ export function shouldUseVectorStrokeLod(mode: VectorLodMode, rendererType: "web
 
 export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodScene[] {
   const baseCount = Math.max(0, scene.segmentCount | 0);
-  const levels: VectorStrokeLodScene[] = [{ tolerance: 0, scene }];
+  const levels: VectorStrokeLodScene[] = [{tolerance: 0, scene}];
   let previousCount = baseCount;
 
   for (const tolerance of VECTOR_STROKE_LOD_TOLERANCES) {
@@ -834,7 +843,7 @@ async function buildVectorStrokeLodScenesAsync(
   scheduler: VectorStrokeLodYieldScheduler
 ): Promise<VectorStrokeLodScene[]> {
   const baseCount = Math.max(0, scene.segmentCount | 0);
-  const levels: VectorStrokeLodScene[] = [{ tolerance: 0, scene }];
+  const levels: VectorStrokeLodScene[] = [{tolerance: 0, scene}];
   let previousCount = baseCount;
   const toleranceCount = VECTOR_STROKE_LOD_TOLERANCES.length;
 
@@ -924,19 +933,13 @@ async function buildSimplifiedStrokeSceneAsync(
     }
 
     const tileIndex = tileIndexForPoint(
-      (primitive.x0 + primitive.x1) * 0.5,
-      (primitive.y0 + primitive.y1) * 0.5,
+      primitiveCenterX(primitive),
+      primitiveCenterY(primitive),
       scene.bounds,
       grid
     );
     const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
-    const start = primitive.x0 * group.axisX + primitive.y0 * group.axisY;
-    const end = primitive.x1 * group.axisX + primitive.y1 * group.axisY;
-    if (start <= end) {
-      group.intervals.push(start, end);
-    } else {
-      group.intervals.push(end, start);
-    }
+    pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
 
     if ((index & 4095) === 0) {
@@ -1073,7 +1076,7 @@ async function buildRuntimeSegmentBoundsAsync(
     }
   }
 
-  return { minX, minY, maxX, maxY };
+  return {minX, minY, maxX, maxY};
 }
 
 export function resetVectorStrokeLodBuildTiming(): void {
@@ -1086,7 +1089,7 @@ export function resetVectorStrokeLodBuildTiming(): void {
 }
 
 export function consumeVectorStrokeLodBuildTiming(): VectorStrokeLodBuildTiming {
-  const timing = { ...accumulatedBuildTiming };
+  const timing = {...accumulatedBuildTiming};
   resetVectorStrokeLodBuildTiming();
   return timing;
 }
@@ -1124,7 +1127,7 @@ class VectorStrokeLodYieldScheduler {
       return;
     }
     this.lastProgressValue = normalized;
-    this.onProgress?.({ value: normalized, message });
+    this.onProgress?.({value: normalized, message});
   }
 
   async maybeYield(force: boolean, value: number, message: string): Promise<void> {
@@ -1368,17 +1371,17 @@ export function resolveStrokeViewBounds(
 
   return cullingBounds
     ? {
-        minX: cullingBounds.minX - margin,
-        minY: cullingBounds.minY - margin,
-        maxX: cullingBounds.maxX + margin,
-        maxY: cullingBounds.maxY + margin
-      }
+      minX: cullingBounds.minX - margin,
+      minY: cullingBounds.minY - margin,
+      maxX: cullingBounds.maxX + margin,
+      maxY: cullingBounds.maxY + margin
+    }
     : {
-        minX: viewState.cameraCenterX - halfViewWidth - margin,
-        minY: viewState.cameraCenterY - halfViewHeight - margin,
-        maxX: viewState.cameraCenterX + halfViewWidth + margin,
-        maxY: viewState.cameraCenterY + halfViewHeight + margin
-      };
+      minX: viewState.cameraCenterX - halfViewWidth - margin,
+      minY: viewState.cameraCenterY - halfViewHeight - margin,
+      maxX: viewState.cameraCenterX + halfViewWidth + margin,
+      maxY: viewState.cameraCenterY + halfViewHeight + margin
+    };
 }
 
 function appendTileSegments(level: RuntimeStrokeTileBuckets, tileIndex: number, viewBounds: CullingBounds): void {
@@ -1426,7 +1429,7 @@ function buildRuntimeSegmentBounds(scene: VectorScene, segmentCount: number): {
     maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
   }
 
-  return { minX, minY, maxX, maxY };
+  return {minX, minY, maxX, maxY};
 }
 
 function tileRangeForBounds(
@@ -1551,19 +1554,13 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
     }
 
     const tileIndex = tileIndexForPoint(
-      (primitive.x0 + primitive.x1) * 0.5,
-      (primitive.y0 + primitive.y1) * 0.5,
+      primitiveCenterX(primitive),
+      primitiveCenterY(primitive),
       scene.bounds,
       grid
     );
     const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
-    const start = primitive.x0 * group.axisX + primitive.y0 * group.axisY;
-    const end = primitive.x1 * group.axisX + primitive.y1 * group.axisY;
-    if (start <= end) {
-      group.intervals.push(start, end);
-    } else {
-      group.intervals.push(end, start);
-    }
+    pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
   }
 
@@ -1601,6 +1598,23 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
   if (!Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(x1) || !Number.isFinite(y1)) {
     return null;
   }
+
+  let visibleBounds: Bounds | undefined;
+  if ((flags & STROKE_STYLE_FLAG_CLIPPED) !== 0) {
+    const boundsMinX = scene.primitiveBounds[offset];
+    const boundsMinY = scene.primitiveBounds[offset + 1];
+    const boundsMaxX = scene.primitiveBounds[offset + 2];
+    const boundsMaxY = scene.primitiveBounds[offset + 3];
+    if (
+      Number.isFinite(boundsMinX) &&
+      Number.isFinite(boundsMinY) &&
+      Number.isFinite(boundsMaxX) &&
+      Number.isFinite(boundsMaxY)
+    ) {
+      visibleBounds = {minX: boundsMinX, minY: boundsMinY, maxX: boundsMaxX, maxY: boundsMaxY};
+    }
+  }
+
   return {
     x0,
     y0,
@@ -1614,7 +1628,8 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
     alpha,
     colorR: clamp01(scene.styles[offset + 1] ?? 0),
     colorG: clamp01(scene.styles[offset + 2] ?? 0),
-    colorB: clamp01(scene.styles[offset + 3] ?? 0)
+    colorB: clamp01(scene.styles[offset + 3] ?? 0),
+    visibleBounds
   };
 }
 
@@ -1665,7 +1680,7 @@ function resolveIntervalGroup(
   const colorKey =
     `${Math.round(primitive.colorR * 255)},${Math.round(primitive.colorG * 255)},` +
     `${Math.round(primitive.colorB * 255)},${Math.round(primitive.alpha * 255)}`;
-  const flags = primitive.flags & (STROKE_STYLE_FLAG_HAIRLINE | STROKE_STYLE_FLAG_ROUND_CAP);
+  const flags = primitive.flags & (STROKE_STYLE_FLAG_HAIRLINE | STROKE_STYLE_FLAG_ROUND_CAP | STROKE_STYLE_FLAG_CLIPPED);
   const key = `${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
 
   let group = groups.get(key);
@@ -1677,6 +1692,12 @@ function resolveIntervalGroup(
       normalX,
       normalY,
       offset: offsetKey * tolerance,
+      offsetSum: 0,
+      offsetWeightSum: 0,
+      clipMinX: Number.POSITIVE_INFINITY,
+      clipMinY: Number.POSITIVE_INFINITY,
+      clipMaxX: Number.NEGATIVE_INFINITY,
+      clipMaxY: Number.NEGATIVE_INFINITY,
       halfWidth: primitive.halfWidth,
       flags,
       alpha: primitive.alpha,
@@ -1686,6 +1707,26 @@ function resolveIntervalGroup(
       intervals: []
     };
     groups.set(key, group);
+  }
+
+  // Track the length-weighted true perpendicular offset of the group's members.
+  // Emitting merged lines at this average (instead of the quantized bucket
+  // offset) keeps regular patterns like hatching evenly spaced and makes line
+  // positions agree across LOD levels, so per-tile level mixing stays seamless.
+  const memberWeight = Math.hypot(dx, dy);
+  group.offsetSum += offset * memberWeight;
+  group.offsetWeightSum += memberWeight;
+
+  // Clipped groups keep the union of their members' clip rects so merged
+  // strokes can still be clip-discarded at render time. The union may span
+  // multiple clip regions merged into one group; any resulting bleed is
+  // bounded by the interval trim extension, i.e. the level's error budget.
+  const clip = primitive.visibleBounds;
+  if (clip) {
+    group.clipMinX = Math.min(group.clipMinX, clip.minX);
+    group.clipMinY = Math.min(group.clipMinY, clip.minY);
+    group.clipMaxX = Math.max(group.clipMaxX, clip.maxX);
+    group.clipMaxY = Math.max(group.clipMaxY, clip.maxY);
   }
   return group;
 }
@@ -1704,7 +1745,11 @@ function emitMergedIntervals(
     return;
   }
 
-  const intervals = new Array<{ start: number; end: number }>(pairCount);
+  if (group.offsetWeightSum > 0) {
+    group.offset = group.offsetSum / group.offsetWeightSum;
+  }
+
+  const intervals = new Array<{start: number; end: number}>(pairCount);
   for (let i = 0; i < pairCount; i += 1) {
     const offset = i * 2;
     intervals[i] = {
@@ -1743,6 +1788,10 @@ function emitInterval(
   if (end - start <= 1e-6) {
     return;
   }
+  const hasClip =
+    (group.flags & STROKE_STYLE_FLAG_CLIPPED) !== 0 &&
+    group.clipMinX <= group.clipMaxX &&
+    group.clipMinY <= group.clipMaxY;
   emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, {
     x0: group.axisX * start + group.normalX * group.offset,
     y0: group.axisY * start + group.normalY * group.offset,
@@ -1756,7 +1805,10 @@ function emitInterval(
     alpha: group.alpha,
     colorR: group.colorR,
     colorG: group.colorG,
-    colorB: group.colorB
+    colorB: group.colorB,
+    visibleBounds: hasClip
+      ? {minX: group.clipMinX, minY: group.clipMinY, maxX: group.clipMaxX, maxY: group.clipMaxY}
+      : undefined
   });
 }
 
@@ -1777,15 +1829,55 @@ function emitPrimitive(
   );
   styles.push(primitive.halfWidth, primitive.colorR, primitive.colorG, primitive.colorB);
 
-  const minX = Math.min(primitive.x0, primitive.cx, primitive.x1);
-  const minY = Math.min(primitive.y0, primitive.cy, primitive.y1);
-  const maxX = Math.max(primitive.x0, primitive.cx, primitive.x1);
-  const maxY = Math.max(primitive.y0, primitive.cy, primitive.y1);
+  // Clipped primitives store their clip rect so the stroke shaders keep
+  // discarding fragments outside it; everything else stores geometric bounds.
+  const clip = primitive.visibleBounds;
+  const minX = clip ? clip.minX : Math.min(primitive.x0, primitive.cx, primitive.x1);
+  const minY = clip ? clip.minY : Math.min(primitive.y0, primitive.cy, primitive.y1);
+  const maxX = clip ? clip.maxX : Math.max(primitive.x0, primitive.cx, primitive.x1);
+  const maxY = clip ? clip.maxY : Math.max(primitive.y0, primitive.cy, primitive.y1);
   primitiveBounds.push(minX, minY, maxX, maxY);
   bounds.minX = Math.min(bounds.minX, minX);
   bounds.minY = Math.min(bounds.minY, minY);
   bounds.maxX = Math.max(bounds.maxX, maxX);
   bounds.maxY = Math.max(bounds.maxY, maxY);
+}
+
+function primitiveCenterX(primitive: StrokePrimitive): number {
+  const clip = primitive.visibleBounds;
+  return clip ? (clip.minX + clip.maxX) * 0.5 : (primitive.x0 + primitive.x1) * 0.5;
+}
+
+function primitiveCenterY(primitive: StrokePrimitive): number {
+  const clip = primitive.visibleBounds;
+  return clip ? (clip.minY + clip.maxY) * 0.5 : (primitive.y0 + primitive.y1) * 0.5;
+}
+
+function pushGroupInterval(group: IntervalGroup, primitive: StrokePrimitive, tolerance: number): void {
+  const startProjection = primitive.x0 * group.axisX + primitive.y0 * group.axisY;
+  const endProjection = primitive.x1 * group.axisX + primitive.y1 * group.axisY;
+  let start = Math.min(startProjection, endProjection);
+  let end = Math.max(startProjection, endProjection);
+
+  // Clipped stroke geometry keeps its full unclipped extent in the source
+  // scene; trim the LOD representative to the clip window (plus a small
+  // extension so caps and AA still reach the clip edge before the fragment
+  // discard cuts them) instead of emitting the invisible remainder.
+  const clip = primitive.visibleBounds;
+  if (clip) {
+    const p0 = clip.minX * group.axisX + clip.minY * group.axisY;
+    const p1 = clip.minX * group.axisX + clip.maxY * group.axisY;
+    const p2 = clip.maxX * group.axisX + clip.minY * group.axisY;
+    const p3 = clip.maxX * group.axisX + clip.maxY * group.axisY;
+    const extension = Math.max(primitive.halfWidth * 4, tolerance, 1e-3);
+    start = Math.max(start, Math.min(p0, p1, p2, p3) - extension);
+    end = Math.min(end, Math.max(p0, p1, p2, p3) + extension);
+    if (end - start <= 1e-6) {
+      return;
+    }
+  }
+
+  group.intervals.push(start, end);
 }
 
 function createTileGrid(bounds: Bounds, tolerance: number): TileGrid {
@@ -1853,7 +1945,7 @@ function nowMs(): number {
 function logVectorLodBuildTiming(
   elapsedMs: number,
   sourceSegmentCount: number,
-  levels: Array<{ tolerance: number; segmentCount: number }>
+  levels: Array<{tolerance: number; segmentCount: number}>
 ): void {
   const levelSummary = levels
     .map((level) => `${formatToleranceName(level.tolerance)}:${level.segmentCount}`)
