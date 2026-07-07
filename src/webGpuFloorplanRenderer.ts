@@ -1,5 +1,5 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, PageTextTileStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
   CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
@@ -21,6 +21,30 @@ interface WebGpuRasterLayerResource {
   texture: any;
   uniformBuffer: any;
   bindGroup: any;
+}
+
+interface PageTextTileRecord {
+  tileMode: boolean;
+  hasTile: boolean;
+  atlasX: number;
+  atlasY: number;
+  innerWidth: number;
+  innerHeight: number;
+  bakedZoom: number;
+  epoch: number;
+}
+
+interface PageTextTileBake {
+  pageIndex: number;
+  rangeStart: number;
+  rangeCount: number;
+}
+
+interface PageTextTileFramePlan {
+  tileInstanceCount: number;
+  directRanges: { start: number; count: number }[];
+  bakedPages: number;
+  directPages: number;
 }
 
 interface WebGpuVectorLodLevelResource {
@@ -45,6 +69,19 @@ const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
+const PAGE_TEXT_TILE_MIN_TEXT_INSTANCES = 150_000;
+const PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX = 176;
+const PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX = 200;
+const PAGE_TEXT_TILE_ZOOM_RATIO_MIN = 0.75;
+const PAGE_TEXT_TILE_ZOOM_RATIO_MAX = 1.3333333333;
+const PAGE_TEXT_TILE_SETTLED_ZOOM_RATIO_EPSILON = 1e-3;
+const PAGE_TEXT_TILE_GUTTER_PX = 2;
+const PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET = 400_000;
+const PAGE_TEXT_TILE_BAKE_MIN_PAGES = 24;
+const PAGE_TEXT_TILE_MAX_BAKES_PER_FRAME = 512;
+const PAGE_TEXT_TILE_ATLAS_AREA_FACTOR = 1.35;
+const PAGE_TEXT_TILE_MAX_ATLAS_DIM = 8192;
+const PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES = 256;
 const CAMERA_DAMPING_POSITION_RATE = 24;
 const CAMERA_DAMPING_ZOOM_RATE = 24;
 const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
@@ -883,6 +920,101 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 }
 `;
 
+const PAGE_TILE_SHADER_SOURCE = /* wgsl */ `
+struct CameraUniforms {
+  viewport : vec2f,
+  cameraCenter : vec2f,
+  zoom : f32,
+  strokeAAScreenPx : f32,
+  strokeCurveEnabled : f32,
+  textAAScreenPx : f32,
+  textCurveEnabled : f32,
+  fillAAScreenPx : f32,
+  textVectorOnly : f32,
+  pad0 : f32,
+  vectorOverride : vec4f,
+};
+
+@group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
+@group(0) @binding(1) var uPageTileSampler : sampler;
+@group(0) @binding(2) var uPageTileAtlasTex : texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> uPageTileRects : array<vec4f>;
+
+struct VsOut {
+  @builtin(position) position : vec4f,
+  @location(0) uv : vec2f,
+};
+
+fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
+  switch (vertexIndex) {
+    case 0u: {
+      return vec2f(-1.0, -1.0);
+    }
+    case 1u: {
+      return vec2f(1.0, -1.0);
+    }
+    case 2u: {
+      return vec2f(-1.0, 1.0);
+    }
+    default: {
+      return vec2f(1.0, 1.0);
+    }
+  }
+}
+
+@vertex
+fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
+  let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
+  let worldRect = uPageTileRects[instanceIndex * 2u];
+  let uvRect = uPageTileRects[instanceIndex * 2u + 1u];
+
+  let world = mix(worldRect.xy, worldRect.zw, corner01);
+  let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
+  let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
+
+  var out : VsOut;
+  out.position = vec4f(clip, 0.0, 1.0);
+  out.uv = vec2f(mix(uvRect.x, uvRect.z, corner01.x), mix(uvRect.y, uvRect.w, corner01.y));
+  return out;
+}
+
+// Tiles hold premultiplied straight-alpha-accumulated text (see bakePageTextTiles),
+// so this pipeline composites with (one, one-minus-src-alpha) like the minify layer.
+@fragment
+fn fsMain(inData : VsOut) -> @location(0) vec4f {
+  return textureSample(uPageTileAtlasTex, uPageTileSampler, inData.uv);
+}
+`;
+
+const PAGE_TILE_CLEAR_SHADER_SOURCE = /* wgsl */ `
+fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
+  switch (vertexIndex) {
+    case 0u: {
+      return vec2f(-1.0, -1.0);
+    }
+    case 1u: {
+      return vec2f(1.0, -1.0);
+    }
+    case 2u: {
+      return vec2f(-1.0, 1.0);
+    }
+    default: {
+      return vec2f(1.0, 1.0);
+    }
+  }
+}
+
+@vertex
+fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> @builtin(position) vec4f {
+  return vec4f(cornerFromVertexIndex(vertexIndex), 0.0, 1.0);
+}
+
+@fragment
+fn fsMain() -> @location(0) vec4f {
+  return vec4f(0.0, 0.0, 0.0, 0.0);
+}
+`;
+
 const RASTER_SHADER_SOURCE = /* wgsl */ `
 struct CameraUniforms {
   viewport : vec2f,
@@ -1090,13 +1222,23 @@ export class WebGpuFloorplanRenderer {
 
   private readonly vectorCompositePipeline: any;
 
+  private readonly pageTilePipeline: any;
+
+  private readonly pageTileClearPipeline: any;
+
+  private readonly textBakePipeline: any;
+
   private readonly cameraUniformBuffer: any;
 
   private readonly blitUniformBuffer: any;
 
   private readonly vectorCompositeUniformBuffer: any;
 
+  private readonly pageTextTileBakeUniformBuffer: any;
+
   private readonly panCacheSampler: any;
+
+  private readonly pageTileSampler: any;
 
   private readonly rasterLayerSampler: any;
 
@@ -1107,6 +1249,10 @@ export class WebGpuFloorplanRenderer {
   private readonly fillBindGroupLayout: any;
 
   private readonly textBindGroupLayout: any;
+
+  private readonly textBakeBindGroupLayout: any;
+
+  private readonly pageTileBindGroupLayout: any;
 
   private readonly rasterBindGroupLayout: any;
 
@@ -1121,6 +1267,10 @@ export class WebGpuFloorplanRenderer {
   private fillBindGroup: any = null;
 
   private textBindGroup: any = null;
+
+  private textBakeBindGroup: any = null;
+
+  private pageTileBindGroup: any = null;
 
   private blitBindGroup: any = null;
 
@@ -1193,6 +1343,48 @@ export class WebGpuFloorplanRenderer {
   private vectorMinifyWidth = 0;
 
   private vectorMinifyHeight = 0;
+
+  private pageTextTileAtlasTexture: any = null;
+
+  private pageTextTileAtlasWidth = 0;
+
+  private pageTextTileAtlasHeight = 0;
+
+  private pageTextTileRectBuffer: any = null;
+
+  private pageTextTileRectBufferCapacity = 0;
+
+  private pageTextTileShelfX = 0;
+
+  private pageTextTileShelfY = 0;
+
+  private pageTextTileShelfRowHeight = 0;
+
+  private pageTextTileRecords: PageTextTileRecord[] = [];
+
+  private pageTextTileEpoch = 0;
+
+  private pageTextTilesEnabled = true;
+
+  private pageTextTileBakePending = false;
+
+  private pageTextTileFramePlan: PageTextTileFramePlan | null = null;
+
+  private pageTextTileInstanceData: Float32Array = new Float32Array(0);
+
+  private pageRects: Float32Array = new Float32Array(0);
+
+  private pageTextRanges: Uint32Array = new Uint32Array(0);
+
+  private lastPageTextTileStats: PageTextTileStats = {
+    enabled: true,
+    active: false,
+    tiledPages: 0,
+    directPages: 0,
+    bakedPages: 0,
+    atlasWidth: 0,
+    atlasHeight: 0
+  };
 
   private scene: VectorScene | null = null;
 
@@ -1356,6 +1548,11 @@ export class WebGpuFloorplanRenderer {
       usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
     });
 
+    this.pageTextTileBakeUniformBuffer = this.gpuDevice.createBuffer({
+      size: PAGE_TEXT_TILE_MAX_BAKES_PER_FRAME * PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES,
+      usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
+    });
+
     this.strokeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
       entries: [
         {
@@ -1486,6 +1683,93 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
+    // Same bindings as the text layout, but with a dynamic camera-uniform offset so
+    // page tile bakes can bind one 256-byte camera slice per baked page.
+    this.textBakeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES, hasDynamicOffset: true }
+        },
+        {
+          binding: 1,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 2,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 3,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 4,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 5,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 6,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 7,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 8,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        {
+          binding: 9,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 10,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        }
+      ]
+    });
+
+    this.pageTileBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 2,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        },
+        {
+          binding: 3,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "read-only-storage" }
+        }
+      ]
+    });
+
     this.rasterBindGroupLayout = this.gpuDevice.createBindGroupLayout({
       entries: [
         {
@@ -1570,6 +1854,16 @@ export class WebGpuFloorplanRenderer {
       bindGroupLayouts: [this.vectorCompositeBindGroupLayout]
     });
 
+    const textBakePipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.textBakeBindGroupLayout]
+    });
+    const pageTilePipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.pageTileBindGroupLayout]
+    });
+    const pageTileClearPipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: []
+    });
+
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
     this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
@@ -1582,8 +1876,41 @@ export class WebGpuFloorplanRenderer {
       vectorCompositePipelineLayout,
       true
     );
+    // Text baked into transparent tiles with the standard straight-alpha blend
+    // accumulates premultiplied color, mirroring the WebGL minify-layer math.
+    this.textBakePipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textBakePipelineLayout);
+    this.pageTilePipeline = this.createPipeline(PAGE_TILE_SHADER_SOURCE, "vsMain", "fsMain", pageTilePipelineLayout, true);
+
+    const clearShaderModule = this.gpuDevice.createShaderModule({ code: PAGE_TILE_CLEAR_SHADER_SOURCE });
+    this.pageTileClearPipeline = this.gpuDevice.createRenderPipeline({
+      layout: pageTileClearPipelineLayout,
+      vertex: {
+        module: clearShaderModule,
+        entryPoint: "vsMain"
+      },
+      fragment: {
+        module: clearShaderModule,
+        entryPoint: "fsMain",
+        targets: [
+          {
+            format: this.presentationFormat
+          }
+        ]
+      },
+      primitive: {
+        topology: "triangle-strip"
+      }
+    });
 
     this.panCacheSampler = this.gpuDevice.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "nearest",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge"
+    });
+
+    this.pageTileSampler = this.gpuDevice.createSampler({
       magFilter: "linear",
       minFilter: "linear",
       mipmapFilter: "nearest",
@@ -1713,6 +2040,7 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.strokeCurveEnabled = nextEnabled;
+    this.invalidatePageTextTiles();
     this.requestFrame();
   }
 
@@ -1772,10 +2100,26 @@ export class WebGpuFloorplanRenderer {
 
     this.textVectorOnly = nextEnabled;
     this.panCacheValid = false;
+    this.invalidatePageTextTiles();
     if (this.textVectorOnly) {
       this.destroyVectorMinifyResources();
     }
     this.requestFrame();
+  }
+
+  setPageTextTilesEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.pageTextTilesEnabled === nextEnabled) {
+      return;
+    }
+    this.pageTextTilesEnabled = nextEnabled;
+    this.invalidatePageTextTiles();
+    this.panCacheValid = false;
+    this.requestFrame();
+  }
+
+  getPageTextTileStats(): PageTextTileStats {
+    return { ...this.lastPageTextTileStats };
   }
 
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
@@ -1819,6 +2163,7 @@ export class WebGpuFloorplanRenderer {
     this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
     this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
+    this.invalidatePageTextTiles();
     this.requestFrame();
   }
 
@@ -1889,6 +2234,23 @@ export class WebGpuFloorplanRenderer {
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
     this.textInstanceCount = scene.textInstanceCount;
+    this.pageRects = normalizePageRects(scene);
+    this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
+    const scenePageCount = Math.floor(this.pageRects.length / 4);
+    this.pageTextTileRecords = new Array(scenePageCount);
+    for (let i = 0; i < scenePageCount; i += 1) {
+      this.pageTextTileRecords[i] = {
+        tileMode: false,
+        hasTile: false,
+        atlasX: 0,
+        atlasY: 0,
+        innerWidth: 0,
+        innerHeight: 0,
+        bakedZoom: 1,
+        epoch: -1
+      };
+    }
+    this.invalidatePageTextTiles();
     this.buildSegmentBounds(scene);
 
     this.isPanInteracting = false;
@@ -2007,6 +2369,60 @@ export class WebGpuFloorplanRenderer {
         {
           binding: 0,
           resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          resource: this.textInstanceTextureA.createView()
+        },
+        {
+          binding: 2,
+          resource: this.textInstanceTextureB.createView()
+        },
+        {
+          binding: 3,
+          resource: this.textInstanceTextureC.createView()
+        },
+        {
+          binding: 4,
+          resource: this.textGlyphMetaTextureA.createView()
+        },
+        {
+          binding: 5,
+          resource: this.textGlyphMetaTextureB.createView()
+        },
+        {
+          binding: 6,
+          resource: this.textGlyphSegmentTextureA.createView()
+        },
+        {
+          binding: 7,
+          resource: this.textGlyphSegmentTextureB.createView()
+        },
+        {
+          binding: 8,
+          resource: this.textGlyphRasterMetaTexture.createView()
+        },
+        {
+          binding: 9,
+          resource: this.rasterLayerSampler
+        },
+        {
+          binding: 10,
+          resource: this.textRasterAtlasTexture.createView()
+        }
+      ]
+    });
+
+    this.textBakeBindGroup = this.gpuDevice.createBindGroup({
+      layout: this.textBakeBindGroupLayout,
+      entries: [
+        {
+          binding: 0,
+          resource: {
+            buffer: this.pageTextTileBakeUniformBuffer,
+            offset: 0,
+            size: CAMERA_UNIFORM_BUFFER_BYTES
+          }
         },
         {
           binding: 1,
@@ -2297,6 +2713,8 @@ export class WebGpuFloorplanRenderer {
     this.frameListener = null;
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
+    this.destroyPageTextTileResources();
+    this.pageTextTileRecords = [];
     this.destroyDataResources();
 
     if (this.segmentIdBufferAll) {
@@ -2316,6 +2734,9 @@ export class WebGpuFloorplanRenderer {
     }
     if (this.vectorCompositeUniformBuffer) {
       this.vectorCompositeUniformBuffer.destroy();
+    }
+    if (this.pageTextTileBakeUniformBuffer) {
+      this.pageTextTileBakeUniformBuffer.destroy();
     }
     if (this.pageBackgroundTexture) {
       this.pageBackgroundTexture.destroy();
@@ -2426,6 +2847,9 @@ export class WebGpuFloorplanRenderer {
   private render(timestamp: number = performance.now()): void {
     const isCameraAnimating = this.updateCameraWithDamping(timestamp);
     this.updatePanReleaseVelocitySample(timestamp);
+    // Only frames that actually prepare page text tiles may re-arm deferred bakes.
+    this.pageTextTileBakePending = false;
+    this.pageTextTileFramePlan = null;
     if (
       !this.scene ||
       (this.segmentCount === 0 &&
@@ -2469,7 +2893,7 @@ export class WebGpuFloorplanRenderer {
     }
     this.capturePresentedFrameState();
 
-    if (isCameraAnimating) {
+    if (isCameraAnimating || this.pageTextTileBakePending) {
       this.requestFrame();
     }
   }
@@ -2564,6 +2988,8 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
+    this.preparePageTextTiles(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+
     const view = this.gpuContext.getCurrentTexture().createView();
     const encoder = this.gpuDevice.createCommandEncoder();
     const pass = encoder.beginRenderPass({
@@ -2577,7 +3003,7 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
-    const renderedSegments = this.drawSceneIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    const renderedSegments = this.drawSceneIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, true);
 
     pass.end();
     this.gpuDevice.queue.submit([encoder.finish()]);
@@ -2600,6 +3026,10 @@ export class WebGpuFloorplanRenderer {
 
   private shouldUseVectorMinifyPath(): boolean {
     if (this.textVectorOnly || !this.hasVectorContent()) {
+      return false;
+    }
+    // Page text tiles already handle heavy text scenes; minify would bypass them.
+    if (this.pageTextTilesApplicable()) {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
@@ -2690,6 +3120,8 @@ export class WebGpuFloorplanRenderer {
       this.updateStrokeVisibleSet(this.panCacheCenterX, this.panCacheCenterY, this.panCacheWidth, this.panCacheHeight);
       this.needsVisibleSetUpdate = false;
 
+      this.preparePageTextTiles(this.panCacheWidth, this.panCacheHeight, this.panCacheCenterX, this.panCacheCenterY);
+
       const encoder = this.gpuDevice.createCommandEncoder();
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -2707,7 +3139,8 @@ export class WebGpuFloorplanRenderer {
         this.panCacheWidth,
         this.panCacheHeight,
         this.panCacheCenterX,
-        this.panCacheCenterY
+        this.panCacheCenterY,
+        true
       );
 
       pass.end();
@@ -2736,11 +3169,12 @@ export class WebGpuFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    allowPageTextTiles = false
   ): number {
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
     this.drawRasterContentIntoPass(pass);
-    return this.drawVectorContentIntoPass(pass);
+    return this.drawVectorContentIntoPass(pass, allowPageTextTiles);
   }
 
   private drawRasterContentIntoPass(pass: any): void {
@@ -2765,7 +3199,7 @@ export class WebGpuFloorplanRenderer {
     }
   }
 
-  private drawVectorContentIntoPass(pass: any): number {
+  private drawVectorContentIntoPass(pass: any, allowPageTextTiles = false): number {
     if (this.fillRenderingEnabled && this.fillPathCount > 0 && this.fillBindGroup) {
       pass.setPipeline(this.fillPipeline);
       pass.setBindGroup(0, this.fillBindGroup);
@@ -2801,12 +3235,496 @@ export class WebGpuFloorplanRenderer {
     }
 
     if (this.textRenderingEnabled && this.textInstanceCount > 0 && this.textBindGroup) {
-      pass.setPipeline(this.textPipeline);
-      pass.setBindGroup(0, this.textBindGroup);
-      pass.draw(4, this.textInstanceCount, 0, 0);
+      const tilePlan = allowPageTextTiles ? this.pageTextTileFramePlan : null;
+      if (tilePlan) {
+        if (tilePlan.tileInstanceCount > 0 && this.pageTileBindGroup) {
+          pass.setPipeline(this.pageTilePipeline);
+          pass.setBindGroup(0, this.pageTileBindGroup);
+          pass.draw(4, tilePlan.tileInstanceCount, 0, 0);
+        }
+        if (tilePlan.directRanges.length > 0) {
+          pass.setPipeline(this.textPipeline);
+          pass.setBindGroup(0, this.textBindGroup);
+          for (const range of tilePlan.directRanges) {
+            if (range.count > 0) {
+              pass.draw(4, range.count, 0, range.start);
+            }
+          }
+        }
+      } else {
+        pass.setPipeline(this.textPipeline);
+        pass.setBindGroup(0, this.textBindGroup);
+        pass.draw(4, this.textInstanceCount, 0, 0);
+      }
     }
 
     return strokeInstanceCount;
+  }
+
+  private pageTextTilesApplicable(): boolean {
+    return (
+      this.pageTextTilesEnabled &&
+      this.textInstanceCount >= PAGE_TEXT_TILE_MIN_TEXT_INSTANCES &&
+      this.pageTextTileRecords.length > 0 &&
+      this.pageTextRanges.length >= this.pageTextTileRecords.length * 2
+    );
+  }
+
+  // Plans and bakes page text tiles for the upcoming frame target. Tile quads and
+  // leftover direct ranges are drawn later inside the frame's render pass via
+  // this.pageTextTileFramePlan (see drawVectorContentIntoPass).
+  private preparePageTextTiles(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): void {
+    this.pageTextTileFramePlan = null;
+    if (!this.textRenderingEnabled || this.textInstanceCount <= 0) {
+      return;
+    }
+    if (
+      !this.pageTextTilesApplicable() ||
+      !this.textBakeBindGroup ||
+      !this.ensurePageTextTileAtlasResources()
+    ) {
+      this.updatePageTextTileStats(false, 0, 0, 0);
+      return;
+    }
+
+    const zoomValue = this.zoom;
+    const zoomSettled = Math.abs(this.targetZoom - zoomValue) <= CAMERA_DAMPING_ZOOM_EPSILON;
+
+    let plan: {
+      tileInstanceCount: number;
+      bakes: PageTextTileBake[];
+      directRanges: { start: number; count: number }[];
+      directPages: number;
+    } | null = null;
+    for (let attempt = 0; attempt < 2 && !plan; attempt += 1) {
+      plan = this.buildPageTextTilePlan(
+        viewportWidth,
+        viewportHeight,
+        cameraCenterX,
+        cameraCenterY,
+        zoomValue,
+        zoomSettled
+      );
+      if (!plan) {
+        // Shelf allocator overflowed: drop every tile and retry once with a clean atlas.
+        this.resetPageTextTileAtlas();
+      }
+    }
+    if (!plan) {
+      this.updatePageTextTileStats(false, 0, 0, 0);
+      return;
+    }
+
+    if (plan.tileInstanceCount > 0) {
+      this.uploadPageTextTileRects(plan.tileInstanceCount);
+      if (!this.pageTileBindGroup) {
+        // Without the tile bind group the tiled pages could not be drawn at all;
+        // fall back to the plain full text draw for this frame.
+        this.resetPageTextTileAtlas();
+        this.updatePageTextTileStats(false, 0, 0, 0);
+        return;
+      }
+    }
+
+    if (plan.bakes.length > 0) {
+      this.bakePageTextTiles(plan.bakes, zoomValue);
+    }
+
+    this.pageTextTileFramePlan = {
+      tileInstanceCount: plan.tileInstanceCount,
+      directRanges: plan.directRanges,
+      bakedPages: plan.bakes.length,
+      directPages: plan.directPages
+    };
+    this.updatePageTextTileStats(true, plan.tileInstanceCount, plan.directPages, plan.bakes.length);
+  }
+
+  private buildPageTextTilePlan(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number,
+    zoomSettled: boolean
+  ): {
+    tileInstanceCount: number;
+    bakes: PageTextTileBake[];
+    directRanges: { start: number; count: number }[];
+    directPages: number;
+  } | null {
+    const pageCount = this.pageTextTileRecords.length;
+    const requiredFloats = pageCount * 8;
+    if (this.pageTextTileInstanceData.length < requiredFloats) {
+      this.pageTextTileInstanceData = new Float32Array(Math.max(requiredFloats, 256));
+    }
+
+    const safeZoom = Math.max(zoomValue, 1e-9);
+    const halfViewWidth = viewportWidth / (2 * safeZoom);
+    const halfViewHeight = viewportHeight / (2 * safeZoom);
+    const viewMinX = cameraCenterX - halfViewWidth;
+    const viewMaxX = cameraCenterX + halfViewWidth;
+    const viewMinY = cameraCenterY - halfViewHeight;
+    const viewMaxY = cameraCenterY + halfViewHeight;
+
+    const directPageIndices: number[] = [];
+    const candidates: { pageIndex: number; distanceSq: number; instanceCount: number }[] = [];
+    let tileInstanceCount = 0;
+
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const record = this.pageTextTileRecords[pageIndex];
+      const rangeOffset = pageIndex * 2;
+      const rangeCount = this.pageTextRanges[rangeOffset + 1] ?? 0;
+      if (!record || rangeCount <= 0) {
+        continue;
+      }
+
+      const rectOffset = pageIndex * 4;
+      const minX = Math.min(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+      const minY = Math.min(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+      const maxX = Math.max(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+      const maxY = Math.max(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+      if (maxX < viewMinX || minX > viewMaxX || maxY < viewMinY || minY > viewMaxY) {
+        continue;
+      }
+
+      const pageScreenHeight = (maxY - minY) * zoomValue;
+      if (record.tileMode) {
+        if (pageScreenHeight >= PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX) {
+          record.tileMode = false;
+        }
+      } else if (pageScreenHeight <= PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX) {
+        record.tileMode = true;
+      }
+
+      if (!record.tileMode) {
+        directPageIndices.push(pageIndex);
+        continue;
+      }
+
+      const zoomRatio = record.hasTile ? zoomValue / Math.max(record.bakedZoom, 1e-9) : 0;
+      const tileValid =
+        record.hasTile &&
+        record.epoch === this.pageTextTileEpoch &&
+        zoomRatio >= PAGE_TEXT_TILE_ZOOM_RATIO_MIN &&
+        zoomRatio <= PAGE_TEXT_TILE_ZOOM_RATIO_MAX &&
+        !(zoomSettled && Math.abs(zoomRatio - 1) > PAGE_TEXT_TILE_SETTLED_ZOOM_RATIO_EPSILON);
+
+      if (tileValid) {
+        tileInstanceCount = this.appendPageTextTileInstance(pageIndex, record, tileInstanceCount);
+        continue;
+      }
+
+      const dx = (minX + maxX) * 0.5 - cameraCenterX;
+      const dy = (minY + maxY) * 0.5 - cameraCenterY;
+      candidates.push({ pageIndex, distanceSq: dx * dx + dy * dy, instanceCount: rangeCount });
+    }
+
+    const bakes: PageTextTileBake[] = [];
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => a.distanceSq - b.distanceSq);
+
+      let bakedInstances = 0;
+      for (const candidate of candidates) {
+        const withinBudget =
+          bakes.length < PAGE_TEXT_TILE_MAX_BAKES_PER_FRAME &&
+          (bakes.length < PAGE_TEXT_TILE_BAKE_MIN_PAGES || bakedInstances < PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET);
+        if (!withinBudget) {
+          directPageIndices.push(candidate.pageIndex);
+          this.pageTextTileBakePending = true;
+          continue;
+        }
+
+        const record = this.pageTextTileRecords[candidate.pageIndex];
+        const rectOffset = candidate.pageIndex * 4;
+        const worldWidth = Math.abs(this.pageRects[rectOffset + 2] - this.pageRects[rectOffset]);
+        const worldHeight = Math.abs(this.pageRects[rectOffset + 3] - this.pageRects[rectOffset + 1]);
+        const innerWidth = Math.max(1, Math.round(worldWidth * zoomValue));
+        const innerHeight = Math.max(1, Math.round(worldHeight * zoomValue));
+        const slot = this.allocatePageTextTileSlot(innerWidth, innerHeight);
+        if (!slot) {
+          if (this.pageTextTileShelfY > 0 || this.pageTextTileShelfX > 0) {
+            // Atlas is fragmented/full: signal the caller to reset and re-plan.
+            return null;
+          }
+          // Tile cannot fit even in an empty atlas; keep this page on the direct path.
+          directPageIndices.push(candidate.pageIndex);
+          continue;
+        }
+
+        record.hasTile = true;
+        record.atlasX = slot.x;
+        record.atlasY = slot.y;
+        record.innerWidth = innerWidth;
+        record.innerHeight = innerHeight;
+        record.bakedZoom = zoomValue;
+        record.epoch = this.pageTextTileEpoch;
+
+        const rangeOffset = candidate.pageIndex * 2;
+        bakes.push({
+          pageIndex: candidate.pageIndex,
+          rangeStart: this.pageTextRanges[rangeOffset] ?? 0,
+          rangeCount: candidate.instanceCount
+        });
+        bakedInstances += candidate.instanceCount;
+        tileInstanceCount = this.appendPageTextTileInstance(candidate.pageIndex, record, tileInstanceCount);
+      }
+    }
+
+    const directRanges: { start: number; count: number }[] = [];
+    if (directPageIndices.length > 0) {
+      directPageIndices.sort((a, b) => a - b);
+      for (const pageIndex of directPageIndices) {
+        const rangeOffset = pageIndex * 2;
+        const start = this.pageTextRanges[rangeOffset] ?? 0;
+        const count = this.pageTextRanges[rangeOffset + 1] ?? 0;
+        if (count <= 0) {
+          continue;
+        }
+        const last = directRanges[directRanges.length - 1];
+        if (last && start <= last.start + last.count) {
+          const nextEnd = Math.max(last.start + last.count, start + count);
+          last.count = nextEnd - last.start;
+        } else {
+          directRanges.push({ start, count });
+        }
+      }
+    }
+
+    return { tileInstanceCount, bakes, directRanges, directPages: directPageIndices.length };
+  }
+
+  private appendPageTextTileInstance(pageIndex: number, record: PageTextTileRecord, tileInstanceCount: number): number {
+    const rectOffset = pageIndex * 4;
+    const minX = Math.min(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+    const minY = Math.min(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+    const maxX = Math.max(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+    const maxY = Math.max(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+
+    const atlasWidth = Math.max(1, this.pageTextTileAtlasWidth);
+    const atlasHeight = Math.max(1, this.pageTextTileAtlasHeight);
+    const out = this.pageTextTileInstanceData;
+    const offset = tileInstanceCount * 8;
+    out[offset] = minX;
+    out[offset + 1] = minY;
+    out[offset + 2] = maxX;
+    out[offset + 3] = maxY;
+    // WebGPU texture row 0 is the top, and the bake maps world maxY to the tile's
+    // top row, so the v coordinates are flipped relative to the world rect.
+    out[offset + 4] = record.atlasX / atlasWidth;
+    out[offset + 5] = (record.atlasY + record.innerHeight) / atlasHeight;
+    out[offset + 6] = (record.atlasX + record.innerWidth) / atlasWidth;
+    out[offset + 7] = record.atlasY / atlasHeight;
+    return tileInstanceCount + 1;
+  }
+
+  private bakePageTextTiles(bakes: PageTextTileBake[], zoomValue: number): void {
+    const floatsPerSlice = PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES / 4;
+    const uniformData = new Float32Array(bakes.length * floatsPerSlice);
+    for (let i = 0; i < bakes.length; i += 1) {
+      const record = this.pageTextTileRecords[bakes[i].pageIndex];
+      const rectOffset = bakes[i].pageIndex * 4;
+      const pageCenterX = (this.pageRects[rectOffset] + this.pageRects[rectOffset + 2]) * 0.5;
+      const pageCenterY = (this.pageRects[rectOffset + 1] + this.pageRects[rectOffset + 3]) * 0.5;
+      const base = i * floatsPerSlice;
+      uniformData[base] = record.innerWidth;
+      uniformData[base + 1] = record.innerHeight;
+      uniformData[base + 2] = pageCenterX;
+      uniformData[base + 3] = pageCenterY;
+      uniformData[base + 4] = zoomValue;
+      uniformData[base + 5] = 1.0;
+      uniformData[base + 6] = this.strokeCurveEnabled ? 1 : 0;
+      uniformData[base + 7] = 1.25;
+      uniformData[base + 8] = this.strokeCurveEnabled ? 1 : 0;
+      uniformData[base + 9] = 1.0;
+      uniformData[base + 10] = this.textVectorOnly ? 1 : 0;
+      uniformData[base + 11] = 0;
+      uniformData[base + 12] = this.vectorOverrideColor[0];
+      uniformData[base + 13] = this.vectorOverrideColor[1];
+      uniformData[base + 14] = this.vectorOverrideColor[2];
+      uniformData[base + 15] = this.vectorOverrideOpacity;
+    }
+    this.gpuDevice.queue.writeBuffer(this.pageTextTileBakeUniformBuffer, 0, uniformData);
+
+    const encoder = this.gpuDevice.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: this.pageTextTileAtlasTexture.createView(),
+          loadOp: "load",
+          storeOp: "store"
+        }
+      ]
+    });
+
+    for (let i = 0; i < bakes.length; i += 1) {
+      const bake = bakes[i];
+      const record = this.pageTextTileRecords[bake.pageIndex];
+      const clearX = record.atlasX - PAGE_TEXT_TILE_GUTTER_PX;
+      const clearY = record.atlasY - PAGE_TEXT_TILE_GUTTER_PX;
+      const clearWidth = record.innerWidth + PAGE_TEXT_TILE_GUTTER_PX * 2;
+      const clearHeight = record.innerHeight + PAGE_TEXT_TILE_GUTTER_PX * 2;
+
+      pass.setViewport(clearX, clearY, clearWidth, clearHeight, 0, 1);
+      pass.setScissorRect(clearX, clearY, clearWidth, clearHeight);
+      pass.setPipeline(this.pageTileClearPipeline);
+      pass.draw(4, 1, 0, 0);
+
+      pass.setViewport(record.atlasX, record.atlasY, record.innerWidth, record.innerHeight, 0, 1);
+      pass.setScissorRect(record.atlasX, record.atlasY, record.innerWidth, record.innerHeight);
+      pass.setPipeline(this.textBakePipeline);
+      pass.setBindGroup(0, this.textBakeBindGroup, [i * PAGE_TEXT_TILE_BAKE_UNIFORM_STRIDE_BYTES]);
+      pass.draw(4, bake.rangeCount, 0, bake.rangeStart);
+    }
+
+    pass.end();
+    this.gpuDevice.queue.submit([encoder.finish()]);
+  }
+
+  private uploadPageTextTileRects(tileInstanceCount: number): void {
+    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
+    const byteLength = tileInstanceCount * 8 * 4;
+    if (!this.pageTextTileRectBuffer || this.pageTextTileRectBufferCapacity < byteLength) {
+      if (this.pageTextTileRectBuffer) {
+        this.pageTextTileRectBuffer.destroy();
+        this.pageTextTileRectBuffer = null;
+      }
+      const capacity = Math.max(4096, roundUpToPowerOfTwo(byteLength));
+      this.pageTextTileRectBuffer = this.gpuDevice.createBuffer({
+        size: capacity,
+        usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
+      });
+      this.pageTextTileRectBufferCapacity = capacity;
+      this.pageTileBindGroup = null;
+    }
+
+    this.gpuDevice.queue.writeBuffer(this.pageTextTileRectBuffer, 0, this.pageTextTileInstanceData, 0, tileInstanceCount * 8);
+
+    if (!this.pageTileBindGroup && this.pageTextTileAtlasTexture) {
+      this.pageTileBindGroup = this.gpuDevice.createBindGroup({
+        layout: this.pageTileBindGroupLayout,
+        entries: [
+          {
+            binding: 0,
+            resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
+          },
+          {
+            binding: 1,
+            resource: this.pageTileSampler
+          },
+          {
+            binding: 2,
+            resource: this.pageTextTileAtlasTexture.createView()
+          },
+          {
+            binding: 3,
+            resource: { buffer: this.pageTextTileRectBuffer }
+          }
+        ]
+      });
+    }
+  }
+
+  private allocatePageTextTileSlot(innerWidth: number, innerHeight: number): { x: number; y: number } | null {
+    const slotWidth = innerWidth + PAGE_TEXT_TILE_GUTTER_PX * 2;
+    const slotHeight = innerHeight + PAGE_TEXT_TILE_GUTTER_PX * 2;
+    if (slotWidth > this.pageTextTileAtlasWidth || slotHeight > this.pageTextTileAtlasHeight) {
+      return null;
+    }
+
+    if (this.pageTextTileShelfX + slotWidth > this.pageTextTileAtlasWidth) {
+      this.pageTextTileShelfY += this.pageTextTileShelfRowHeight;
+      this.pageTextTileShelfX = 0;
+      this.pageTextTileShelfRowHeight = 0;
+    }
+    if (this.pageTextTileShelfY + slotHeight > this.pageTextTileAtlasHeight) {
+      return null;
+    }
+
+    const x = this.pageTextTileShelfX + PAGE_TEXT_TILE_GUTTER_PX;
+    const y = this.pageTextTileShelfY + PAGE_TEXT_TILE_GUTTER_PX;
+    this.pageTextTileShelfX += slotWidth;
+    this.pageTextTileShelfRowHeight = Math.max(this.pageTextTileShelfRowHeight, slotHeight);
+    return { x, y };
+  }
+
+  private ensurePageTextTileAtlasResources(): boolean {
+    const maxDim = Math.min(PAGE_TEXT_TILE_MAX_ATLAS_DIM, this.maxTextureSize());
+    const neededArea = Math.max(1, this.canvas.width * this.canvas.height * PAGE_TEXT_TILE_ATLAS_AREA_FACTOR);
+    const width = clamp(roundUpToPowerOfTwo(Math.ceil(Math.sqrt(neededArea))), 512, maxDim);
+    const height = clamp(roundUpToPowerOfTwo(Math.ceil(neededArea / width)), 512, maxDim);
+
+    if (
+      this.pageTextTileAtlasTexture &&
+      this.pageTextTileAtlasWidth === width &&
+      this.pageTextTileAtlasHeight === height
+    ) {
+      return true;
+    }
+
+    this.destroyPageTextTileResources();
+
+    const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
+    this.pageTextTileAtlasTexture = this.gpuDevice.createTexture({
+      size: {
+        width,
+        height,
+        depthOrArrayLayers: 1
+      },
+      format: this.presentationFormat,
+      usage: gpuTextureUsage.RENDER_ATTACHMENT | gpuTextureUsage.TEXTURE_BINDING
+    });
+
+    this.pageTextTileAtlasWidth = width;
+    this.pageTextTileAtlasHeight = height;
+    return true;
+  }
+
+  private resetPageTextTileAtlas(): void {
+    this.pageTextTileShelfX = 0;
+    this.pageTextTileShelfY = 0;
+    this.pageTextTileShelfRowHeight = 0;
+    for (const record of this.pageTextTileRecords) {
+      record.hasTile = false;
+    }
+  }
+
+  private invalidatePageTextTiles(): void {
+    this.pageTextTileEpoch += 1;
+    this.resetPageTextTileAtlas();
+  }
+
+  private destroyPageTextTileResources(): void {
+    if (this.pageTextTileAtlasTexture) {
+      this.pageTextTileAtlasTexture.destroy();
+      this.pageTextTileAtlasTexture = null;
+    }
+    if (this.pageTextTileRectBuffer) {
+      this.pageTextTileRectBuffer.destroy();
+      this.pageTextTileRectBuffer = null;
+    }
+    this.pageTextTileRectBufferCapacity = 0;
+    this.pageTileBindGroup = null;
+    this.pageTextTileAtlasWidth = 0;
+    this.pageTextTileAtlasHeight = 0;
+    this.pageTextTileFramePlan = null;
+    this.resetPageTextTileAtlas();
+  }
+
+  private updatePageTextTileStats(active: boolean, tiledPages: number, directPages: number, bakedPages: number): void {
+    this.lastPageTextTileStats = {
+      enabled: this.pageTextTilesEnabled,
+      active,
+      tiledPages,
+      directPages,
+      bakedPages,
+      atlasWidth: this.pageTextTileAtlasWidth,
+      atlasHeight: this.pageTextTileAtlasHeight
+    };
   }
 
   private updateCameraUniforms(
@@ -3733,6 +4651,7 @@ export class WebGpuFloorplanRenderer {
     this.strokeBindGroupVisible = null;
     this.fillBindGroup = null;
     this.textBindGroup = null;
+    this.textBakeBindGroup = null;
     this.destroyPageBackgroundResources();
     this.destroyRasterLayerResources();
 
@@ -4134,6 +5053,51 @@ function normalizePageRects(scene: VectorScene): Float32Array {
     scene.pageBounds.maxX,
     scene.pageBounds.maxY
   ]);
+}
+
+function normalizePageTextRanges(
+  scene: VectorScene,
+  pageRects: Float32Array,
+  textInstanceCount: number
+): Uint32Array {
+  const pageCount = Math.max(1, Math.floor(pageRects.length / 4));
+  const expectedLength = pageCount * 2;
+  const maxTextInstanceCount = Math.max(0, textInstanceCount | 0);
+
+  if (scene.pageTextRanges instanceof Uint32Array && scene.pageTextRanges.length >= expectedLength) {
+    const out = new Uint32Array(expectedLength);
+    let previousEnd = 0;
+    for (let i = 0; i < pageCount; i += 1) {
+      const offset = i * 2;
+      const start = clamp(Math.trunc(scene.pageTextRanges[offset]), previousEnd, maxTextInstanceCount);
+      const count = clamp(Math.trunc(scene.pageTextRanges[offset + 1]), 0, maxTextInstanceCount - start);
+      out[offset] = start;
+      out[offset + 1] = count;
+      previousEnd = start + count;
+    }
+    return out;
+  }
+
+  const out = new Uint32Array(expectedLength);
+  out[0] = 0;
+  out[1] = maxTextInstanceCount;
+  for (let i = 1; i < pageCount; i += 1) {
+    const offset = i * 2;
+    out[offset] = maxTextInstanceCount;
+    out[offset + 1] = 0;
+  }
+  return out;
+}
+
+function roundUpToPowerOfTwo(value: number): number {
+  if (value <= 1) {
+    return 1;
+  }
+  let out = 1;
+  while (out < value) {
+    out <<= 1;
+  }
+  return out;
 }
 
 function alignTo(value: number, alignment: number): number {

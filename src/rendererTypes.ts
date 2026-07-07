@@ -1,5 +1,5 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, PageTextTileStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
 /** Native HEPR renderer backend identifier. */
@@ -53,6 +53,12 @@ export interface RendererApi {
 
   /** Force text to render as vector geometry only. */
   setTextVectorOnly(enabled: boolean): void;
+
+  /** Enable or disable page-level text tile caching for heavy text scenes. */
+  setPageTextTilesEnabled?(enabled: boolean): void;
+
+  /** Return page text tile diagnostics for the last drawn frame. */
+  getPageTextTileStats?(): PageTextTileStats;
 
   /** Set page background color with normalized RGBA channels. */
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void;

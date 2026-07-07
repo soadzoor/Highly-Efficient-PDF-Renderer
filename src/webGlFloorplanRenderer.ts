@@ -1002,6 +1002,45 @@ void main() {
 }
 `;
 
+const PAGE_TILE_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 aPageWorldRect;
+layout(location = 2) in vec4 aPageUvRect;
+
+uniform vec2 uViewport;
+uniform vec2 uCameraCenter;
+uniform float uZoom;
+
+out vec2 vUv;
+
+void main() {
+  vec2 corner01 = aCorner * 0.5 + 0.5;
+  vec2 world = mix(aPageWorldRect.xy, aPageWorldRect.zw, corner01);
+  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+  gl_Position = vec4(clip, 0.0, 1.0);
+  vUv = mix(aPageUvRect.xy, aPageUvRect.zw, corner01);
+}
+`;
+
+// Tiles hold premultiplied straight-alpha-accumulated text (see bakePageTextTiles),
+// so the composite draw uses (ONE, ONE_MINUS_SRC_ALPHA) blending like the minify layer.
+const PAGE_TILE_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D uPageTileAtlasTex;
+
+in vec2 vUv;
+out vec4 outColor;
+
+void main() {
+  outColor = texture(uPageTileAtlasTex, vUv);
+}
+`;
+
 const INTERACTION_DECAY_MS = 140;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
@@ -1011,6 +1050,18 @@ const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
+const PAGE_TEXT_TILE_MIN_TEXT_INSTANCES = 150_000;
+const PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX = 176;
+const PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX = 200;
+const PAGE_TEXT_TILE_ZOOM_RATIO_MIN = 0.75;
+const PAGE_TEXT_TILE_ZOOM_RATIO_MAX = 1.3333333333;
+const PAGE_TEXT_TILE_SETTLED_ZOOM_RATIO_EPSILON = 1e-3;
+const PAGE_TEXT_TILE_GUTTER_PX = 2;
+const PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET = 400_000;
+const PAGE_TEXT_TILE_BAKE_MIN_PAGES = 24;
+const PAGE_TEXT_TILE_MAX_BAKES_PER_FRAME = 512;
+const PAGE_TEXT_TILE_ATLAS_AREA_FACTOR = 1.35;
+const PAGE_TEXT_TILE_MAX_ATLAS_DIM = 8192;
 const CAMERA_DAMPING_POSITION_RATE = 24;
 const CAMERA_DAMPING_ZOOM_RATE = 24;
 const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
@@ -1177,6 +1228,33 @@ interface InstanceRange {
   count: number;
 }
 
+interface PageTextTileRecord {
+  tileMode: boolean;
+  hasTile: boolean;
+  atlasX: number;
+  atlasY: number;
+  innerWidth: number;
+  innerHeight: number;
+  bakedZoom: number;
+  epoch: number;
+}
+
+interface PageTextTileBake {
+  pageIndex: number;
+  rangeStart: number;
+  rangeCount: number;
+}
+
+export interface PageTextTileStats {
+  enabled: boolean;
+  active: boolean;
+  tiledPages: number;
+  directPages: number;
+  bakedPages: number;
+  atlasWidth: number;
+  atlasHeight: number;
+}
+
 export class WebGlFloorplanRenderer {
   private readonly canvas: HTMLCanvasElement;
 
@@ -1194,6 +1272,8 @@ export class WebGlFloorplanRenderer {
 
   private readonly rasterProgram: WebGLProgram;
 
+  private readonly pageTileProgram: WebGLProgram;
+
   private readonly segmentVao: WebGLVertexArrayObject;
 
   private readonly fillVao: WebGLVertexArrayObject;
@@ -1202,7 +1282,11 @@ export class WebGlFloorplanRenderer {
 
   private readonly blitVao: WebGLVertexArrayObject;
 
+  private readonly pageTileVao: WebGLVertexArrayObject;
+
   private readonly cornerBuffer: WebGLBuffer;
+
+  private readonly pageTextTileInstanceBuffer: WebGLBuffer;
 
   private readonly allSegmentIdBuffer: WebGLBuffer;
 
@@ -1380,6 +1464,14 @@ export class WebGlFloorplanRenderer {
 
   private readonly uRasterLocalToClip: WebGLUniformLocation;
 
+  private readonly uPageTileViewport: WebGLUniformLocation;
+
+  private readonly uPageTileCameraCenter: WebGLUniformLocation;
+
+  private readonly uPageTileZoom: WebGLUniformLocation;
+
+  private readonly uPageTileAtlasTex: WebGLUniformLocation;
+
   private scene: VectorScene | null = null;
 
   private grid: SpatialGrid | null = null;
@@ -1550,6 +1642,40 @@ export class WebGlFloorplanRenderer {
 
   private vectorMinifyWarmupPending = false;
 
+  private pageTextTileAtlasTexture: WebGLTexture | null = null;
+
+  private pageTextTileAtlasFramebuffer: WebGLFramebuffer | null = null;
+
+  private pageTextTileAtlasWidth = 0;
+
+  private pageTextTileAtlasHeight = 0;
+
+  private pageTextTileShelfX = 0;
+
+  private pageTextTileShelfY = 0;
+
+  private pageTextTileShelfRowHeight = 0;
+
+  private pageTextTileRecords: PageTextTileRecord[] = [];
+
+  private pageTextTileEpoch = 0;
+
+  private pageTextTilesEnabled = true;
+
+  private pageTextTileBakePending = false;
+
+  private pageTextTileInstanceData: Float32Array = new Float32Array(0);
+
+  private lastPageTextTileStats: PageTextTileStats = {
+    enabled: true,
+    active: false,
+    tiledPages: 0,
+    directPages: 0,
+    bakedPages: 0,
+    atlasWidth: 0,
+    atlasHeight: 0
+  };
+
   private rasterRenderingEnabled = true;
 
   private fillRenderingEnabled = true;
@@ -1599,17 +1725,20 @@ export class WebGlFloorplanRenderer {
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, RASTER_FRAGMENT_SHADER_SOURCE);
+    this.pageTileProgram = this.createProgram(PAGE_TILE_VERTEX_SHADER_SOURCE, PAGE_TILE_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
     this.fillVao = this.createVertexArray();
     this.textVao = this.createVertexArray();
     this.blitVao = this.createVertexArray();
+    this.pageTileVao = this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
     this.allSegmentIdBuffer = this.mustCreateBuffer();
     this.visibleSegmentIdBuffer = this.mustCreateBuffer();
     this.allFillPathIdBuffer = this.mustCreateBuffer();
     this.allTextInstanceIdBuffer = this.mustCreateBuffer();
+    this.pageTextTileInstanceBuffer = this.mustCreateBuffer();
 
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
@@ -1701,6 +1830,11 @@ export class WebGlFloorplanRenderer {
     this.uRasterZoom = this.mustGetUniformLocation(this.rasterProgram, "uZoom");
     this.uRasterUseLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uUseLocalToClip");
     this.uRasterLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uLocalToClip");
+
+    this.uPageTileViewport = this.mustGetUniformLocation(this.pageTileProgram, "uViewport");
+    this.uPageTileCameraCenter = this.mustGetUniformLocation(this.pageTileProgram, "uCameraCenter");
+    this.uPageTileZoom = this.mustGetUniformLocation(this.pageTileProgram, "uZoom");
+    this.uPageTileAtlasTex = this.mustGetUniformLocation(this.pageTileProgram, "uPageTileAtlasTex");
 
     this.initializeGeometry();
     this.initializeState();
@@ -1834,6 +1968,7 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.strokeCurveEnabled = nextEnabled;
+    this.invalidatePageTextTiles();
     this.requestFrame();
   }
 
@@ -1888,10 +2023,26 @@ export class WebGlFloorplanRenderer {
     }
     this.textVectorOnly = nextEnabled;
     this.panCacheValid = false;
+    this.invalidatePageTextTiles();
     if (this.textVectorOnly) {
       this.destroyVectorMinifyResources();
     }
     this.requestFrame();
+  }
+
+  setPageTextTilesEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.pageTextTilesEnabled === nextEnabled) {
+      return;
+    }
+    this.pageTextTilesEnabled = nextEnabled;
+    this.invalidatePageTextTiles();
+    this.panCacheValid = false;
+    this.requestFrame();
+  }
+
+  getPageTextTileStats(): PageTextTileStats {
+    return { ...this.lastPageTextTileStats };
   }
 
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
@@ -1935,6 +2086,7 @@ export class WebGlFloorplanRenderer {
     this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
     this.vectorOverrideOpacity = nextOpacity;
     this.panCacheValid = false;
+    this.invalidatePageTextTiles();
     this.requestFrame();
   }
 
@@ -2006,6 +2158,21 @@ export class WebGlFloorplanRenderer {
     this.textInstanceCount = scene.textInstanceCount;
     this.pageRects = normalizePageRects(scene);
     this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
+    const scenePageCount = Math.floor(this.pageRects.length / 4);
+    this.pageTextTileRecords = new Array(scenePageCount);
+    for (let i = 0; i < scenePageCount; i += 1) {
+      this.pageTextTileRecords[i] = {
+        tileMode: false,
+        hasTile: false,
+        atlasX: 0,
+        atlasY: 0,
+        innerWidth: 0,
+        innerHeight: 0,
+        bakedZoom: 1,
+        epoch: -1
+      };
+    }
+    this.invalidatePageTextTiles();
     if (this.visiblePageRectIndices.length < Math.floor(this.pageRects.length / 4)) {
       this.visiblePageRectIndices = new Uint32Array(Math.floor(this.pageRects.length / 4));
     }
@@ -2206,6 +2373,7 @@ export class WebGlFloorplanRenderer {
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
+    this.destroyPageTextTileResources();
     const gl = this.gl;
     for (const layer of this.rasterLayers) {
       gl.deleteTexture(layer.texture);
@@ -2242,7 +2410,8 @@ export class WebGlFloorplanRenderer {
       this.allSegmentIdBuffer,
       this.visibleSegmentIdBuffer,
       this.allFillPathIdBuffer,
-      this.allTextInstanceIdBuffer
+      this.allTextInstanceIdBuffer,
+      this.pageTextTileInstanceBuffer
     ];
     for (const buffer of buffers) {
       gl.deleteBuffer(buffer);
@@ -2252,7 +2421,8 @@ export class WebGlFloorplanRenderer {
       this.segmentVao,
       this.fillVao,
       this.textVao,
-      this.blitVao
+      this.blitVao,
+      this.pageTileVao
     ];
     for (const vao of vaos) {
       gl.deleteVertexArray(vao);
@@ -2264,7 +2434,8 @@ export class WebGlFloorplanRenderer {
       this.textProgram,
       this.blitProgram,
       this.vectorCompositeProgram,
-      this.rasterProgram
+      this.rasterProgram,
+      this.pageTileProgram
     ];
     for (const program of programs) {
       gl.deleteProgram(program);
@@ -2288,6 +2459,7 @@ export class WebGlFloorplanRenderer {
     this.pageTextRanges = new Uint32Array(0);
     this.visiblePageRectIndices = new Uint32Array(0);
     this.visibleTextRanges = [];
+    this.pageTextTileRecords = [];
   }
 
   panByPixels(deltaX: number, deltaY: number): void {
@@ -2361,6 +2533,8 @@ export class WebGlFloorplanRenderer {
     this.updatePanReleaseVelocitySample(timestamp);
     const gl = this.gl;
     this.ensureRenderState();
+    // Only frames that actually run drawTextLayer may re-arm deferred tile bakes.
+    this.pageTextTileBakePending = false;
 
     if (
       !this.scene ||
@@ -2395,7 +2569,7 @@ export class WebGlFloorplanRenderer {
     }
     this.capturePresentedFrameState();
 
-    if (isCameraAnimating) {
+    if (isCameraAnimating || this.pageTextTileBakePending) {
       this.requestFrame();
     }
   }
@@ -2476,7 +2650,7 @@ export class WebGlFloorplanRenderer {
         instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
       }
       if (this.textRenderingEnabled) {
-        this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+        this.drawTextLayer(null, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
       }
     }
 
@@ -2501,6 +2675,10 @@ export class WebGlFloorplanRenderer {
       return false;
     }
     if (this.textInstanceCount > 100_000 && this.segmentCount === 0) {
+      return false;
+    }
+    // Page text tiles already handle heavy text scenes; minify would bypass them.
+    if (this.pageTextTilesApplicable()) {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
@@ -2694,7 +2872,8 @@ export class WebGlFloorplanRenderer {
         )
         : 0;
       if (this.textRenderingEnabled) {
-        this.drawTextInstances(
+        this.drawTextLayer(
+          this.panCacheFramebuffer,
           this.panCacheWidth,
           this.panCacheHeight,
           this.panCacheCenterX,
@@ -2973,13 +3152,33 @@ export class WebGlFloorplanRenderer {
     cameraCenterY: number,
     zoomValue = this.zoom
   ): number {
-    if (!this.scene || this.textInstanceCount <= 0) {
-      return 0;
-    }
-    if (this.visibleTextRanges.length === 0) {
+    return this.drawTextInstanceRanges(
+      this.visibleTextRanges,
+      viewportWidth,
+      viewportHeight,
+      cameraCenterX,
+      cameraCenterY,
+      zoomValue
+    );
+  }
+
+  private drawTextInstanceRanges(
+    ranges: InstanceRange[],
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue = this.zoom
+  ): number {
+    if (!this.scene || this.textInstanceCount <= 0 || ranges.length === 0) {
       return 0;
     }
 
+    this.bindTextProgramCommon(zoomValue);
+    return this.drawBoundTextRanges(ranges, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
+  }
+
+  private bindTextProgramCommon(zoomValue: number): void {
     const gl = this.gl;
 
     gl.useProgram(this.textProgram);
@@ -3020,8 +3219,6 @@ export class WebGlFloorplanRenderer {
     gl.uniform2i(this.uTextGlyphMetaTexSize, this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight);
     gl.uniform2i(this.uTextGlyphSegmentTexSize, this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight);
     gl.uniform2f(this.uTextRasterAtlasSize, this.textRasterAtlasWidth, this.textRasterAtlasHeight);
-    gl.uniform2f(this.uTextViewport, viewportWidth, viewportHeight);
-    gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uTextZoom, zoomValue);
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
     gl.uniform1f(this.uTextUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
@@ -3037,9 +3234,21 @@ export class WebGlFloorplanRenderer {
       this.vectorOverrideColor[2],
       this.vectorOverrideOpacity
     );
+  }
+
+  private drawBoundTextRanges(
+    ranges: InstanceRange[],
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): number {
+    const gl = this.gl;
+    gl.uniform2f(this.uTextViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
 
     let renderedInstanceCount = 0;
-    for (const range of this.visibleTextRanges) {
+    for (const range of ranges) {
       if (range.count <= 0) {
         continue;
       }
@@ -3048,6 +3257,422 @@ export class WebGlFloorplanRenderer {
       renderedInstanceCount += range.count;
     }
     return renderedInstanceCount;
+  }
+
+  // Draws the text layer for one frame target. For heavy text scenes with small
+  // on-screen pages, whole pages are baked once into an offscreen tile atlas and
+  // drawn as single quads; everything else falls back to per-glyph instancing.
+  private drawTextLayer(
+    targetFramebuffer: WebGLFramebuffer | null,
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue = this.zoom
+  ): number {
+    this.pageTextTileBakePending = false;
+    if (!this.scene || this.textInstanceCount <= 0) {
+      return 0;
+    }
+
+    if (!this.pageTextTilesApplicable() || !this.ensurePageTextTileAtlasResources()) {
+      this.updatePageTextTileStats(false, 0, this.visiblePageRectCount, 0);
+      return this.drawTextInstanceRanges(
+        this.visibleTextRanges,
+        viewportWidth,
+        viewportHeight,
+        cameraCenterX,
+        cameraCenterY,
+        zoomValue
+      );
+    }
+
+    const zoomSettled = Math.abs(this.targetZoom - zoomValue) <= CAMERA_DAMPING_ZOOM_EPSILON;
+    let tileInstanceCount = 0;
+    let bakes: PageTextTileBake[] = [];
+    let directPageIndices: number[] = [];
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const plan = this.buildPageTextTilePlan(cameraCenterX, cameraCenterY, zoomValue, zoomSettled);
+      if (plan) {
+        tileInstanceCount = plan.tileInstanceCount;
+        bakes = plan.bakes;
+        directPageIndices = plan.directPageIndices;
+        break;
+      }
+      // Shelf allocator overflowed: drop every tile and retry once with a clean atlas.
+      this.resetPageTextTileAtlas();
+    }
+
+    if (bakes.length > 0) {
+      this.bakePageTextTiles(bakes, zoomValue, targetFramebuffer, viewportWidth, viewportHeight);
+    }
+    if (tileInstanceCount > 0) {
+      this.drawPageTextTileQuads(tileInstanceCount, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+    }
+
+    let renderedInstanceCount = 0;
+    if (directPageIndices.length > 0) {
+      directPageIndices.sort((a, b) => a - b);
+      const directRanges: InstanceRange[] = [];
+      for (const pageIndex of directPageIndices) {
+        const rangeOffset = pageIndex * 2;
+        this.appendVisibleTextRange(
+          directRanges,
+          this.pageTextRanges[rangeOffset] ?? 0,
+          this.pageTextRanges[rangeOffset + 1] ?? 0
+        );
+      }
+      renderedInstanceCount = this.drawTextInstanceRanges(
+        directRanges,
+        viewportWidth,
+        viewportHeight,
+        cameraCenterX,
+        cameraCenterY,
+        zoomValue
+      );
+    }
+
+    this.updatePageTextTileStats(true, tileInstanceCount, directPageIndices.length, bakes.length);
+    return renderedInstanceCount;
+  }
+
+  private pageTextTilesApplicable(): boolean {
+    return (
+      this.pageTextTilesEnabled &&
+      !this.localToClipRenderingEnabled &&
+      this.textInstanceCount >= PAGE_TEXT_TILE_MIN_TEXT_INSTANCES &&
+      this.pageTextTileRecords.length > 0 &&
+      this.pageTextRanges.length >= this.pageTextTileRecords.length * 2
+    );
+  }
+
+  private buildPageTextTilePlan(
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number,
+    zoomSettled: boolean
+  ): { tileInstanceCount: number; bakes: PageTextTileBake[]; directPageIndices: number[] } | null {
+    const requiredFloats = this.visiblePageRectCount * 8;
+    if (this.pageTextTileInstanceData.length < requiredFloats) {
+      this.pageTextTileInstanceData = new Float32Array(Math.max(requiredFloats, 256));
+    }
+
+    const directPageIndices: number[] = [];
+    const candidates: { pageIndex: number; distanceSq: number; instanceCount: number }[] = [];
+    let tileInstanceCount = 0;
+
+    for (let i = 0; i < this.visiblePageRectCount; i += 1) {
+      const pageIndex = this.visiblePageRectIndices[i];
+      const record = this.pageTextTileRecords[pageIndex];
+      const rangeOffset = pageIndex * 2;
+      const rangeCount = this.pageTextRanges[rangeOffset + 1] ?? 0;
+      if (!record || rangeCount <= 0) {
+        continue;
+      }
+
+      const rectOffset = pageIndex * 4;
+      const minY = Math.min(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+      const maxY = Math.max(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+      const pageScreenHeight = (maxY - minY) * zoomValue;
+
+      if (record.tileMode) {
+        if (pageScreenHeight >= PAGE_TEXT_TILE_EXIT_PAGE_SCREEN_PX) {
+          record.tileMode = false;
+        }
+      } else if (pageScreenHeight <= PAGE_TEXT_TILE_ENTER_PAGE_SCREEN_PX) {
+        record.tileMode = true;
+      }
+
+      if (!record.tileMode) {
+        directPageIndices.push(pageIndex);
+        continue;
+      }
+
+      const zoomRatio = record.hasTile ? zoomValue / Math.max(record.bakedZoom, 1e-9) : 0;
+      const tileValid =
+        record.hasTile &&
+        record.epoch === this.pageTextTileEpoch &&
+        zoomRatio >= PAGE_TEXT_TILE_ZOOM_RATIO_MIN &&
+        zoomRatio <= PAGE_TEXT_TILE_ZOOM_RATIO_MAX &&
+        !(zoomSettled && Math.abs(zoomRatio - 1) > PAGE_TEXT_TILE_SETTLED_ZOOM_RATIO_EPSILON);
+
+      if (tileValid) {
+        tileInstanceCount = this.appendPageTextTileInstance(pageIndex, record, tileInstanceCount);
+        continue;
+      }
+
+      const minX = Math.min(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+      const maxX = Math.max(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+      const dx = (minX + maxX) * 0.5 - cameraCenterX;
+      const dy = (minY + maxY) * 0.5 - cameraCenterY;
+      candidates.push({ pageIndex, distanceSq: dx * dx + dy * dy, instanceCount: rangeCount });
+    }
+
+    const bakes: PageTextTileBake[] = [];
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => a.distanceSq - b.distanceSq);
+
+      let bakedInstances = 0;
+      for (const candidate of candidates) {
+        const withinBudget =
+          bakes.length < PAGE_TEXT_TILE_MAX_BAKES_PER_FRAME &&
+          (bakes.length < PAGE_TEXT_TILE_BAKE_MIN_PAGES || bakedInstances < PAGE_TEXT_TILE_BAKE_INSTANCE_BUDGET);
+        if (!withinBudget) {
+          directPageIndices.push(candidate.pageIndex);
+          this.pageTextTileBakePending = true;
+          continue;
+        }
+
+        const record = this.pageTextTileRecords[candidate.pageIndex];
+        const rectOffset = candidate.pageIndex * 4;
+        const worldWidth = Math.abs(this.pageRects[rectOffset + 2] - this.pageRects[rectOffset]);
+        const worldHeight = Math.abs(this.pageRects[rectOffset + 3] - this.pageRects[rectOffset + 1]);
+        const innerWidth = Math.max(1, Math.round(worldWidth * zoomValue));
+        const innerHeight = Math.max(1, Math.round(worldHeight * zoomValue));
+        const slot = this.allocatePageTextTileSlot(innerWidth, innerHeight);
+        if (!slot) {
+          if (this.pageTextTileShelfY > 0 || this.pageTextTileShelfX > 0) {
+            // Atlas is fragmented/full: signal the caller to reset and re-plan.
+            return null;
+          }
+          // Tile cannot fit even in an empty atlas; keep this page on the direct path.
+          directPageIndices.push(candidate.pageIndex);
+          continue;
+        }
+
+        record.hasTile = true;
+        record.atlasX = slot.x;
+        record.atlasY = slot.y;
+        record.innerWidth = innerWidth;
+        record.innerHeight = innerHeight;
+        record.bakedZoom = zoomValue;
+        record.epoch = this.pageTextTileEpoch;
+
+        const rangeOffset = candidate.pageIndex * 2;
+        bakes.push({
+          pageIndex: candidate.pageIndex,
+          rangeStart: this.pageTextRanges[rangeOffset] ?? 0,
+          rangeCount: candidate.instanceCount
+        });
+        bakedInstances += candidate.instanceCount;
+        tileInstanceCount = this.appendPageTextTileInstance(candidate.pageIndex, record, tileInstanceCount);
+      }
+    }
+
+    return { tileInstanceCount, bakes, directPageIndices };
+  }
+
+  private appendPageTextTileInstance(pageIndex: number, record: PageTextTileRecord, tileInstanceCount: number): number {
+    const rectOffset = pageIndex * 4;
+    const minX = Math.min(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+    const minY = Math.min(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+    const maxX = Math.max(this.pageRects[rectOffset], this.pageRects[rectOffset + 2]);
+    const maxY = Math.max(this.pageRects[rectOffset + 1], this.pageRects[rectOffset + 3]);
+
+    const atlasWidth = Math.max(1, this.pageTextTileAtlasWidth);
+    const atlasHeight = Math.max(1, this.pageTextTileAtlasHeight);
+    const out = this.pageTextTileInstanceData;
+    const offset = tileInstanceCount * 8;
+    out[offset] = minX;
+    out[offset + 1] = minY;
+    out[offset + 2] = maxX;
+    out[offset + 3] = maxY;
+    out[offset + 4] = record.atlasX / atlasWidth;
+    out[offset + 5] = record.atlasY / atlasHeight;
+    out[offset + 6] = (record.atlasX + record.innerWidth) / atlasWidth;
+    out[offset + 7] = (record.atlasY + record.innerHeight) / atlasHeight;
+    return tileInstanceCount + 1;
+  }
+
+  private bakePageTextTiles(
+    bakes: PageTextTileBake[],
+    zoomValue: number,
+    restoreFramebuffer: WebGLFramebuffer | null,
+    restoreViewportWidth: number,
+    restoreViewportHeight: number
+  ): void {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pageTextTileAtlasFramebuffer);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+
+    // Text accumulates with the ambient straight-alpha blend, which leaves
+    // premultiplied color in the transparent tile (same math as the minify layer).
+    this.bindTextProgramCommon(zoomValue);
+    const scratchRange: InstanceRange[] = [{ start: 0, count: 0 }];
+
+    for (const bake of bakes) {
+      const record = this.pageTextTileRecords[bake.pageIndex];
+      const clearX = record.atlasX - PAGE_TEXT_TILE_GUTTER_PX;
+      const clearY = record.atlasY - PAGE_TEXT_TILE_GUTTER_PX;
+      gl.scissor(
+        clearX,
+        clearY,
+        record.innerWidth + PAGE_TEXT_TILE_GUTTER_PX * 2,
+        record.innerHeight + PAGE_TEXT_TILE_GUTTER_PX * 2
+      );
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      gl.scissor(record.atlasX, record.atlasY, record.innerWidth, record.innerHeight);
+      gl.viewport(record.atlasX, record.atlasY, record.innerWidth, record.innerHeight);
+
+      const rectOffset = bake.pageIndex * 4;
+      const pageCenterX = (this.pageRects[rectOffset] + this.pageRects[rectOffset + 2]) * 0.5;
+      const pageCenterY = (this.pageRects[rectOffset + 1] + this.pageRects[rectOffset + 3]) * 0.5;
+      scratchRange[0].start = bake.rangeStart;
+      scratchRange[0].count = bake.rangeCount;
+      this.drawBoundTextRanges(scratchRange, record.innerWidth, record.innerHeight, pageCenterX, pageCenterY);
+    }
+
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, restoreFramebuffer);
+    gl.viewport(0, 0, restoreViewportWidth, restoreViewportHeight);
+  }
+
+  private drawPageTextTileQuads(
+    tileInstanceCount: number,
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): void {
+    const gl = this.gl;
+    gl.useProgram(this.pageTileProgram);
+    gl.bindVertexArray(this.pageTileVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.pageTextTileInstanceBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, this.pageTextTileInstanceData.subarray(0, tileInstanceCount * 8), gl.DYNAMIC_DRAW);
+
+    gl.activeTexture(gl.TEXTURE12);
+    gl.bindTexture(gl.TEXTURE_2D, this.pageTextTileAtlasTexture);
+    gl.uniform1i(this.uPageTileAtlasTex, 12);
+    gl.uniform2f(this.uPageTileViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uPageTileCameraCenter, cameraCenterX, cameraCenterY);
+    gl.uniform1f(this.uPageTileZoom, zoomValue);
+
+    // Tiles hold premultiplied content; composite like the minify layer.
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, tileInstanceCount);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  private allocatePageTextTileSlot(innerWidth: number, innerHeight: number): { x: number; y: number } | null {
+    const slotWidth = innerWidth + PAGE_TEXT_TILE_GUTTER_PX * 2;
+    const slotHeight = innerHeight + PAGE_TEXT_TILE_GUTTER_PX * 2;
+    if (slotWidth > this.pageTextTileAtlasWidth || slotHeight > this.pageTextTileAtlasHeight) {
+      return null;
+    }
+
+    if (this.pageTextTileShelfX + slotWidth > this.pageTextTileAtlasWidth) {
+      this.pageTextTileShelfY += this.pageTextTileShelfRowHeight;
+      this.pageTextTileShelfX = 0;
+      this.pageTextTileShelfRowHeight = 0;
+    }
+    if (this.pageTextTileShelfY + slotHeight > this.pageTextTileAtlasHeight) {
+      return null;
+    }
+
+    const x = this.pageTextTileShelfX + PAGE_TEXT_TILE_GUTTER_PX;
+    const y = this.pageTextTileShelfY + PAGE_TEXT_TILE_GUTTER_PX;
+    this.pageTextTileShelfX += slotWidth;
+    this.pageTextTileShelfRowHeight = Math.max(this.pageTextTileShelfRowHeight, slotHeight);
+    return { x, y };
+  }
+
+  private ensurePageTextTileAtlasResources(): boolean {
+    const gl = this.gl;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    const maxDim = Math.min(PAGE_TEXT_TILE_MAX_ATLAS_DIM, maxTextureSize);
+    const neededArea = Math.max(1, this.canvas.width * this.canvas.height * PAGE_TEXT_TILE_ATLAS_AREA_FACTOR);
+    const width = clamp(roundUpToPowerOfTwo(Math.ceil(Math.sqrt(neededArea))), 512, maxDim);
+    const height = clamp(roundUpToPowerOfTwo(Math.ceil(neededArea / width)), 512, maxDim);
+
+    if (
+      this.pageTextTileAtlasTexture &&
+      this.pageTextTileAtlasFramebuffer &&
+      this.pageTextTileAtlasWidth === width &&
+      this.pageTextTileAtlasHeight === height
+    ) {
+      return true;
+    }
+
+    this.destroyPageTextTileResources();
+
+    const texture = gl.createTexture();
+    if (!texture) {
+      return false;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    configureColorTexture(gl);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
+
+    const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+      return false;
+    }
+
+    this.pageTextTileAtlasTexture = texture;
+    this.pageTextTileAtlasFramebuffer = framebuffer;
+    this.pageTextTileAtlasWidth = width;
+    this.pageTextTileAtlasHeight = height;
+    return true;
+  }
+
+  private resetPageTextTileAtlas(): void {
+    this.pageTextTileShelfX = 0;
+    this.pageTextTileShelfY = 0;
+    this.pageTextTileShelfRowHeight = 0;
+    for (const record of this.pageTextTileRecords) {
+      record.hasTile = false;
+    }
+  }
+
+  private invalidatePageTextTiles(): void {
+    this.pageTextTileEpoch += 1;
+    this.resetPageTextTileAtlas();
+  }
+
+  private destroyPageTextTileResources(): void {
+    if (this.pageTextTileAtlasFramebuffer) {
+      this.gl.deleteFramebuffer(this.pageTextTileAtlasFramebuffer);
+      this.pageTextTileAtlasFramebuffer = null;
+    }
+
+    if (this.pageTextTileAtlasTexture) {
+      this.gl.deleteTexture(this.pageTextTileAtlasTexture);
+      this.pageTextTileAtlasTexture = null;
+    }
+
+    this.pageTextTileAtlasWidth = 0;
+    this.pageTextTileAtlasHeight = 0;
+    this.resetPageTextTileAtlas();
+  }
+
+  private updatePageTextTileStats(active: boolean, tiledPages: number, directPages: number, bakedPages: number): void {
+    this.lastPageTextTileStats = {
+      enabled: this.pageTextTilesEnabled,
+      active,
+      tiledPages,
+      directPages,
+      bakedPages,
+      atlasWidth: this.pageTextTileAtlasWidth,
+      atlasHeight: this.pageTextTileAtlasHeight
+    };
   }
 
   private blitPanCache(offsetPxX: number, offsetPxY: number, sampleScale: number): void {
@@ -4108,6 +4733,20 @@ export class WebGlFloorplanRenderer {
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
     gl.vertexAttribDivisor(0, 0);
 
+    gl.bindVertexArray(this.pageTileVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    gl.vertexAttribDivisor(0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.pageTextTileInstanceBuffer);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0);
+    gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16);
+    gl.vertexAttribDivisor(2, 1);
+
     gl.bindVertexArray(null);
   }
 
@@ -4413,6 +5052,17 @@ function configureByteTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function roundUpToPowerOfTwo(value: number): number {
+  if (value <= 1) {
+    return 1;
+  }
+  let out = 1;
+  while (out < value) {
+    out <<= 1;
+  }
+  return out;
 }
 
 function configureColorTexture(gl: WebGL2RenderingContext): void {

@@ -228,6 +228,8 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
     vectorColorOverride[3]
   );
   rendererApi.setFrameListener(onRendererFrame);
+  // Debug handle for automated verification and manual diagnostics in the console.
+  (window as unknown as { __heprDebugRenderer?: RendererApi }).__heprDebugRenderer = rendererApi;
 }
 
 function createWebGlRenderer(targetCanvas: HTMLCanvasElement): RendererApi {
