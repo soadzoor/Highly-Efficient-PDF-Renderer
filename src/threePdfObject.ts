@@ -8,7 +8,14 @@ import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
-import { HEPR_THREE_LAYER_ORDER_PAGE_DEPTH } from "./threeLayerOrder";
+import { HEPR_THREE_LAYER_ORDER_PAGE_DEPTH, HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT } from "./threeLayerOrder";
+import type { Bounds } from "./pdfVectorExtractor";
+import {
+  createSceneTextSearcher,
+  type SceneTextSearcher,
+  type SceneTextSearchOptions,
+  type TextSearchMatch
+} from "./textSearch";
 import type { ThreeTriangleStrokeLayer } from "./threeTriangleStrokeLayer";
 import {
   shouldUseVectorStrokeLod,
@@ -18,6 +25,16 @@ import {
 } from "./vectorStrokeLod";
 import { WebGlFloorplanRenderer, type DrawStats, type ViewState } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
+
+/** A text-search match with bounds in PDF scene space and this object's local space. */
+export interface HeprTextSearchMatch extends TextSearchMatch {
+  /**
+   * Match bounds translated into the object's local (centered) coordinate
+   * space — the space of this THREE.Group's children, convenient for framing
+   * a three.js camera on the match.
+   */
+  localBounds: Bounds;
+}
 
 const DEFAULT_FIT_PADDING_PIXELS = 64;
 const DEFAULT_INITIAL_LONG_SIDE = 2048;
@@ -234,6 +251,12 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly compactedStrokeLayer: ThreeCompactedStrokeLayer | null;
   private readonly textMaterialLayer: ThreeMaterialTextLayer;
 
+  private textSearcher: SceneTextSearcher | null = null;
+  private searchHighlightGroup: THREE.Group | null = null;
+  private searchHighlightOthersMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
+  private searchHighlightCurrentMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
+  private searchHighlightOthersOutline: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial> | null = null;
+  private searchHighlightCurrentOutline: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial> | null = null;
   private controlsCanvas: HTMLCanvasElement | null = null;
   private pendingInitialFit: boolean;
   private initialFitPaddingPixels: number;
@@ -423,6 +446,195 @@ export class HeprThreePdfObject extends THREE.Group {
    */
   getViewState(): ViewState {
     return this.renderer.getViewState();
+  }
+
+  /** Whether the loaded document carries a searchable text index. */
+  get hasSearchableText(): boolean {
+    this.textSearcher ??= createSceneTextSearcher(this.sceneData);
+    return this.textSearcher.hasText;
+  }
+
+  /**
+   * Find text in the document (browser Ctrl+F-style building block).
+   *
+   * Matching is case-insensitive unless `options.caseSensitive` is set, and
+   * whitespace in the query matches across line breaks. Matches come back in
+   * page/reading order with `bounds` in PDF scene space and `localBounds` in
+   * this object's local space; feed them to `setSearchHighlights` and frame
+   * your camera on `localBounds` to implement a find feature.
+   */
+  searchText(query: string, options: SceneTextSearchOptions = {}): HeprTextSearchMatch[] {
+    if (this.isDisposed) {
+      return [];
+    }
+    this.textSearcher ??= createSceneTextSearcher(this.sceneData);
+    return this.textSearcher.search(query, options).map((match) => ({
+      ...match,
+      localBounds: {
+        minX: match.bounds.minX - this.sceneCenterX,
+        minY: match.bounds.minY - this.sceneCenterY,
+        maxX: match.bounds.maxX - this.sceneCenterX,
+        maxY: match.bounds.maxY - this.sceneCenterY
+      }
+    }));
+  }
+
+  /**
+   * Show browser-find style highlight rectangles for search matches.
+   *
+   * Highlights are plain three.js meshes parented to this object, so they
+   * stay in perfect sync with your camera in every pipeline. The match at
+   * `options.currentIndex` is emphasized. Pass `null` or an empty array to
+   * clear.
+   */
+  setSearchHighlights(
+    matches: ReadonlyArray<Pick<TextSearchMatch, "bounds">> | null,
+    options: { currentIndex?: number } = {}
+  ): void {
+    if (this.isDisposed) {
+      return;
+    }
+    const list = matches ?? [];
+    if (list.length === 0) {
+      if (this.searchHighlightGroup) {
+        this.searchHighlightGroup.visible = false;
+      }
+      return;
+    }
+
+    this.ensureSearchHighlightLayer();
+    const currentIndex =
+      options.currentIndex !== undefined && options.currentIndex >= 0 && options.currentIndex < list.length
+        ? options.currentIndex
+        : -1;
+
+    const othersCount = currentIndex >= 0 ? list.length - 1 : list.length;
+    const othersPositions = new Float32Array(othersCount * 18);
+    const othersOutlinePositions = new Float32Array(othersCount * 24);
+    const currentPositions = new Float32Array(currentIndex >= 0 ? 18 : 0);
+    const currentOutlinePositions = new Float32Array(currentIndex >= 0 ? 24 : 0);
+    let othersIndex = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      if (i === currentIndex) {
+        this.writeHighlightQuad(currentPositions, 0, list[i].bounds);
+        this.writeHighlightOutline(currentOutlinePositions, 0, list[i].bounds);
+      } else {
+        this.writeHighlightQuad(othersPositions, othersIndex * 18, list[i].bounds);
+        this.writeHighlightOutline(othersOutlinePositions, othersIndex * 24, list[i].bounds);
+        othersIndex += 1;
+      }
+    }
+
+    if (this.searchHighlightOthersMesh) {
+      this.replaceHighlightGeometry(this.searchHighlightOthersMesh, othersPositions);
+    }
+    if (this.searchHighlightOthersOutline) {
+      this.replaceHighlightGeometry(this.searchHighlightOthersOutline, othersOutlinePositions);
+    }
+    if (this.searchHighlightCurrentMesh) {
+      this.replaceHighlightGeometry(this.searchHighlightCurrentMesh, currentPositions);
+    }
+    if (this.searchHighlightCurrentOutline) {
+      this.replaceHighlightGeometry(this.searchHighlightCurrentOutline, currentOutlinePositions);
+    }
+  }
+
+  private ensureSearchHighlightLayer(): void {
+    if (this.searchHighlightGroup) {
+      this.searchHighlightGroup.visible = true;
+      return;
+    }
+
+    const group = new THREE.Group();
+    const makeMesh = (
+      color: number,
+      opacity: number,
+      renderOrder: number
+    ): THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> => {
+      const material = new THREE.MeshBasicMaterial({
+        color,
+        opacity,
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide
+      });
+      const mesh = new THREE.Mesh(new THREE.BufferGeometry(), material);
+      mesh.renderOrder = renderOrder;
+      mesh.frustumCulled = false;
+      group.add(mesh);
+      return mesh;
+    };
+    const makeOutline = (
+      color: number,
+      renderOrder: number
+    ): THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial> => {
+      const material = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        depthTest: false,
+        depthWrite: false
+      });
+      const outline = new THREE.LineSegments(new THREE.BufferGeometry(), material);
+      outline.renderOrder = renderOrder;
+      outline.frustumCulled = false;
+      group.add(outline);
+      return outline;
+    };
+
+    // Semi-transparent fill under a solid outline, matching the app renderers.
+    this.searchHighlightOthersMesh = makeMesh(0xffeb3b, 0.35, HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT);
+    this.searchHighlightOthersOutline = makeOutline(0xca8a04, HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT + 1);
+    this.searchHighlightCurrentMesh = makeMesh(0xff9800, 0.45, HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT + 2);
+    this.searchHighlightCurrentOutline = makeOutline(0xea580c, HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT + 3);
+    this.searchHighlightGroup = group;
+    this.add(group);
+  }
+
+  private writeHighlightOutline(target: Float32Array, offset: number, bounds: Bounds): void {
+    const minX = bounds.minX - this.sceneCenterX;
+    const minY = bounds.minY - this.sceneCenterY;
+    const maxX = bounds.maxX - this.sceneCenterX;
+    const maxY = bounds.maxY - this.sceneCenterY;
+    // 4 edges as line-segment pairs.
+    const points = [
+      minX, minY, maxX, minY,
+      maxX, minY, maxX, maxY,
+      maxX, maxY, minX, maxY,
+      minX, maxY, minX, minY
+    ];
+    for (let point = 0; point < 8; point += 1) {
+      target[offset + point * 3] = points[point * 2];
+      target[offset + point * 3 + 1] = points[point * 2 + 1];
+      target[offset + point * 3 + 2] = 0;
+    }
+  }
+
+  private writeHighlightQuad(target: Float32Array, offset: number, bounds: Bounds): void {
+    const minX = bounds.minX - this.sceneCenterX;
+    const minY = bounds.minY - this.sceneCenterY;
+    const maxX = bounds.maxX - this.sceneCenterX;
+    const maxY = bounds.maxY - this.sceneCenterY;
+    const corners = [minX, minY, maxX, minY, maxX, maxY, minX, minY, maxX, maxY, minX, maxY];
+    for (let vertex = 0; vertex < 6; vertex += 1) {
+      target[offset + vertex * 3] = corners[vertex * 2];
+      target[offset + vertex * 3 + 1] = corners[vertex * 2 + 1];
+      target[offset + vertex * 3 + 2] = 0;
+    }
+  }
+
+  private replaceHighlightGeometry(
+    target:
+      | THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>
+      | THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>,
+    positions: Float32Array
+  ): void {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const previous = target.geometry;
+    target.geometry = geometry;
+    previous.dispose();
+    target.visible = positions.length > 0;
   }
 
   /**
@@ -618,6 +830,22 @@ export class HeprThreePdfObject extends THREE.Group {
     this.compactedStrokeLayer?.dispose();
     this.textMaterialLayer.dispose();
     this.renderTexture?.dispose();
+    if (this.searchHighlightGroup) {
+      this.searchHighlightOthersMesh?.geometry.dispose();
+      this.searchHighlightOthersMesh?.material.dispose();
+      this.searchHighlightOthersOutline?.geometry.dispose();
+      this.searchHighlightOthersOutline?.material.dispose();
+      this.searchHighlightCurrentMesh?.geometry.dispose();
+      this.searchHighlightCurrentMesh?.material.dispose();
+      this.searchHighlightCurrentOutline?.geometry.dispose();
+      this.searchHighlightCurrentOutline?.material.dispose();
+      this.remove(this.searchHighlightGroup);
+      this.searchHighlightGroup = null;
+      this.searchHighlightOthersMesh = null;
+      this.searchHighlightOthersOutline = null;
+      this.searchHighlightCurrentMesh = null;
+      this.searchHighlightCurrentOutline = null;
+    }
     this.remove(this.pageMesh);
     this.remove(this.rasterMaterialLayer.group);
     this.remove(this.fillMaterialLayer.mesh);

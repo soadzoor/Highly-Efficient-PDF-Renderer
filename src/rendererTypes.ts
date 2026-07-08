@@ -1,6 +1,8 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, ProjectedFrameOptions, SceneStats, SearchHighlightSet, ViewState } from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
+
+export type { SearchHighlightSet };
 
 /** Native HEPR renderer backend identifier. */
 export type RendererBackend = "webgl" | "webgpu";
@@ -88,6 +90,9 @@ export interface RendererApi {
 
   /** Return Vector LOD diagnostics, if active. */
   getVectorStrokeLodStats?(): VectorStrokeLodStats | null;
+
+  /** Draw search-highlight rectangles as part of every rendered frame. */
+  setSearchHighlights?(highlights: SearchHighlightSet | null): void;
 
   /** Fit native view state to bounds with optional pixel padding. */
   fitToBounds(bounds: Bounds, paddingPixels?: number): void;

@@ -5,7 +5,9 @@ import {
   inferPageTextRanges,
   optimizeVectorSceneTextGlyphs,
   type Bounds,
+  type PageTextIndex,
   type RasterLayer,
+  type SceneTextIndex,
   type VectorScene
 } from "./pdfVectorExtractor";
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
@@ -13,8 +15,21 @@ import {
   decodeByteShuffledFloat32,
   decodeChannelMajorFloat32,
   decodeXorDeltaByteShuffledFloat32,
-  encodeChannelMajorFloat32
+  encodeChannelMajorFloat32,
+  encodeXorDeltaByteShuffledFloat32
 } from "./parsedDataEncoding";
+import {
+  ByteWriter,
+  decodeFixed512DeltaColumnInto,
+  decodeRangeUint16,
+  decodeU16DeltaColumnInto,
+  encodeFixed512DeltaColumn,
+  encodeRangeUint16,
+  encodeU16DeltaColumn,
+  VarintCursor,
+  zigzagDecode32,
+  zigzagEncode32
+} from "./parsedDataVarint";
 
 interface ExportTextureEntry {
   name: string;
@@ -28,6 +43,9 @@ interface ExportTextureEntry {
   layout: TextureLayout;
   quantizationMin?: number[];
   quantizationMax?: number[];
+  byteShuffle?: boolean;
+  predictor?: "none" | "xor-delta-u32";
+  columnByteLengths?: number[];
 }
 
 export interface SceneTextureStats {
@@ -46,7 +64,11 @@ export interface SceneTextureStats {
 }
 
 export type TextureLayout = "interleaved" | "channel-major";
-type TextureComponentType = "float32" | "uint8-normalized" | "uint16-normalized-range" | "stroke-primitive-b-u16-packed";
+type TextureComponentType =
+  | "float32"
+  | "uint8-normalized"
+  | "uint16-normalized-range"
+  | "uint16-range-delta-columns";
 
 export interface BuildParsedDataZipOptions {
   encodeRasterImages?: boolean;
@@ -69,6 +91,7 @@ interface ParsedDataTextureEntry {
   predictor?: unknown;
   logicalItemCount?: unknown;
   logicalFloatCount?: unknown;
+  columnByteLengths?: unknown;
 }
 
 interface ParsedDataRasterLayerEntry {
@@ -107,10 +130,6 @@ interface ParsedDataSceneEntry {
   discardedDuplicateCount?: unknown;
   discardedContainedCount?: unknown;
   rasterLayers?: unknown;
-  rasterLayerWidth?: unknown;
-  rasterLayerHeight?: unknown;
-  rasterLayerMatrix?: unknown;
-  rasterLayerFile?: unknown;
 }
 
 interface ParsedDataManifest {
@@ -121,6 +140,9 @@ interface ParsedDataManifest {
   sourcePdfSizeBytes?: unknown;
   scene?: ParsedDataSceneEntry;
   textures?: ParsedDataTextureEntry[];
+  textIndex?: unknown;
+  strokeGeometry?: unknown;
+  textInstances?: unknown;
 }
 
 export interface ParsedDataZipBlobResult {
@@ -157,7 +179,6 @@ export async function buildParsedDataZipBlobForLayout(
   const includeSourcePdf = !!sourcePdfBytes && sourcePdfBytes.length > 0 && scene.imagePaintOpCount > 0;
   const useSourcePdfFallback = includeSourcePdf && sceneRasterLayers.length === 0;
   const rasterLayers = useSourcePdfFallback ? [] : sceneRasterLayers;
-  const primaryRasterLayer = rasterLayers[0] ?? null;
   const sourcePdfFile = useSourcePdfFallback ? "source/source.pdf" : undefined;
 
   for (const entry of textureEntries) {
@@ -167,6 +188,27 @@ export async function buildParsedDataZipBlobForLayout(
 
   if (sourcePdfFile && sourcePdfBytes) {
     zip.file(sourcePdfFile, sourcePdfBytes);
+  }
+
+  const textIndexExport = buildTextIndexExport(scene);
+  if (textIndexExport) {
+    zip.file(TEXT_INDEX_JSON_PATH, textIndexExport.json);
+    zip.file(TEXT_CHAR_MAP_PATH, textIndexExport.charMapBytes);
+    if (textIndexExport.fallbackBytes) {
+      zip.file(TEXT_FALLBACK_PATH, textIndexExport.fallbackBytes);
+    }
+  }
+
+  const strokeGeometryExport = buildStrokeGeometryExport(scene);
+  if (strokeGeometryExport) {
+    zip.file(STROKE_ENDPOINTS_PATH, strokeGeometryExport.endpointsBytes);
+    zip.file(STROKE_META_PATH, strokeGeometryExport.metaBytes);
+  }
+
+  const textInstancesExport = buildTextInstancesExport(scene);
+  if (textInstancesExport) {
+    zip.file(textInstancesExport.manifest.positionsFile, textInstancesExport.positionsBytes);
+    zip.file(textInstancesExport.manifest.glyphIndexFile, textInstancesExport.glyphIndexBytes);
   }
 
   const serializedRasterLayers: SerializedRasterLayerEntry[] = [];
@@ -196,11 +238,25 @@ export async function buildParsedDataZipBlobForLayout(
   }
 
   const manifest = {
-    formatVersion: 3,
+    formatVersion: PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,
     sourcePdfFile,
     sourcePdfSizeBytes: useSourcePdfFallback ? sourcePdfBytes?.length ?? 0 : 0,
     generatedAt: new Date().toISOString(),
+    strokeGeometry: strokeGeometryExport?.manifest,
+    textInstances: textInstancesExport?.manifest,
+    textIndex: textIndexExport
+      ? {
+        version: 2,
+        file: TEXT_INDEX_JSON_PATH,
+        charMapFile: TEXT_CHAR_MAP_PATH,
+        fallbackFile: textIndexExport.fallbackBytes ? TEXT_FALLBACK_PATH : undefined,
+        fallbackColumnByteLengths: textIndexExport.fallbackBytes ? textIndexExport.fallbackColumnByteLengths : undefined,
+        pageCount: textIndexExport.pageCount,
+        totalCharCount: textIndexExport.totalCharCount,
+        totalFallbackCount: textIndexExport.totalFallbackCount
+      }
+      : undefined,
     scene: {
       bounds: scene.bounds,
       pageBounds: scene.pageBounds,
@@ -220,11 +276,7 @@ export async function buildParsedDataZipBlobForLayout(
       textInstanceCount: scene.textInstanceCount,
       textGlyphCount: scene.textGlyphCount,
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
-      rasterLayers: serializedRasterLayers,
-      rasterLayerWidth: primaryRasterLayer?.width ?? 0,
-      rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-      rasterLayerMatrix: primaryRasterLayer ? Array.from(primaryRasterLayer.matrix) : undefined,
-      rasterLayerFile: serializedRasterLayers[0]?.file
+      rasterLayers: serializedRasterLayers
     },
     textures: textureEntries.map((entry) => ({
       name: entry.name,
@@ -236,8 +288,9 @@ export async function buildParsedDataZipBlobForLayout(
       layout: entry.layout,
       quantizationMin: entry.quantizationMin,
       quantizationMax: entry.quantizationMax,
-      byteShuffle: false,
-      predictor: "none",
+      byteShuffle: entry.byteShuffle === true,
+      predictor: entry.predictor ?? "none",
+      columnByteLengths: entry.columnByteLengths,
       logicalItemCount: entry.logicalItemCount,
       logicalFloatCount: entry.logicalFloatCount,
       byteLength: entry.data.byteLength,
@@ -269,6 +322,658 @@ export async function buildParsedDataZipBlobForLayout(
   };
 }
 
+/** Only zips written with this format version (or newer) can be loaded. */
+const PARSED_DATA_FORMAT_VERSION = 5;
+
+const TEXT_INDEX_JSON_PATH = "text/text-index.json";
+const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
+const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";
+
+interface TextIndexExportResult {
+  json: string;
+  charMapBytes: Uint8Array;
+  fallbackBytes: Uint8Array | null;
+  fallbackColumnByteLengths: number[];
+  pageCount: number;
+  totalCharCount: number;
+  totalFallbackCount: number;
+}
+
+function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null {
+  const pages = scene.textIndex?.pages;
+  if (!pages || pages.length === 0) {
+    return null;
+  }
+
+  const pageEntries: Array<{ text: string; charCount: number; fallbackCount: number }> = [];
+  let totalCharCount = 0;
+  let totalFallbackCount = 0;
+  for (const page of pages) {
+    const valid = page.charInstance.length === page.text.length;
+    const text = valid ? page.text : "";
+    const fallbackCount = valid ? Math.floor(page.fallbackQuads.length / 4) : 0;
+    pageEntries.push({ text, charCount: text.length, fallbackCount });
+    totalCharCount += text.length;
+    totalFallbackCount += fallbackCount;
+  }
+
+  if (totalCharCount === 0) {
+    return null;
+  }
+
+  // One varint token per code unit: 0 = separator, 1 = next fallback slot,
+  // t >= 2 = instance = prevInstance + 1 + zigzag(t - 2). Instances are
+  // monotone in char order, so the dominant token is 2 (expected +1 step).
+  const charMap = new ByteWriter(totalCharCount + 16);
+  let prevInstance = -1;
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    if (pageEntries[pageIndex].charCount === 0) {
+      continue;
+    }
+    const refs = pages[pageIndex].charInstance;
+    for (let i = 0; i < refs.length; i += 1) {
+      const ref = refs[i];
+      if (ref === -1) {
+        charMap.writeByte(0);
+      } else if (ref <= -2) {
+        charMap.writeByte(1);
+      } else {
+        charMap.writeVarUint32(zigzagEncode32(ref - prevInstance - 1) + 2);
+        prevInstance = ref;
+      }
+    }
+  }
+
+  let fallbackBytes: Uint8Array | null = null;
+  const fallbackColumnByteLengths: number[] = [];
+  if (totalFallbackCount > 0) {
+    const quads = new Float32Array(totalFallbackCount * 4);
+    let quadOffset = 0;
+    for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+      const fallbackCount = pageEntries[pageIndex].fallbackCount;
+      if (fallbackCount === 0) {
+        continue;
+      }
+      quads.set(pages[pageIndex].fallbackQuads.subarray(0, fallbackCount * 4), quadOffset);
+      quadOffset += fallbackCount * 4;
+    }
+    const columns: Uint8Array[] = [];
+    let totalBytes = 0;
+    for (let channel = 0; channel < 4; channel += 1) {
+      const column = encodeFixed512DeltaColumn(quads, totalFallbackCount, 4, channel);
+      columns.push(column);
+      fallbackColumnByteLengths.push(column.length);
+      totalBytes += column.length;
+    }
+    fallbackBytes = new Uint8Array(totalBytes);
+    let byteOffset = 0;
+    for (const column of columns) {
+      fallbackBytes.set(column, byteOffset);
+      byteOffset += column.length;
+    }
+  }
+
+  return {
+    json: JSON.stringify({ version: 2, pages: pageEntries }),
+    charMapBytes: charMap.toUint8Array(),
+    fallbackBytes,
+    fallbackColumnByteLengths,
+    pageCount: pageEntries.length,
+    totalCharCount,
+    totalFallbackCount
+  };
+}
+
+interface TextIndexManifestMeta {
+  version?: unknown;
+  file?: unknown;
+  charMapFile?: unknown;
+  fallbackFile?: unknown;
+  fallbackColumnByteLengths?: unknown;
+}
+
+interface TextIndexPageEntry {
+  text?: unknown;
+  fallbackCount?: unknown;
+}
+
+async function readSceneTextIndexFromParsedData(zip: JSZip, manifest: ParsedDataManifest): Promise<SceneTextIndex | null> {
+  try {
+    const meta =
+      typeof manifest.textIndex === "object" && manifest.textIndex
+        ? (manifest.textIndex as TextIndexManifestMeta)
+        : {};
+    const jsonPath = typeof meta.file === "string" ? meta.file : TEXT_INDEX_JSON_PATH;
+    const jsonEntry = zip.file(jsonPath);
+    if (!jsonEntry) {
+      return null;
+    }
+
+    const jsonText = await jsonEntry.async("string");
+    const parsed = JSON.parse(jsonText) as { pages?: TextIndexPageEntry[] };
+    const pageEntries = Array.isArray(parsed.pages) ? parsed.pages : [];
+    if (pageEntries.length === 0) {
+      return null;
+    }
+
+    const charMapPath = typeof meta.charMapFile === "string" ? meta.charMapFile : TEXT_CHAR_MAP_PATH;
+    const charMapEntry = zip.file(charMapPath);
+    if (!charMapEntry) {
+      return null;
+    }
+    return await readTextIndexV2(zip, meta, pageEntries, charMapEntry);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[Parsed data load] Failed to read text index: ${message}`);
+    return null;
+  }
+}
+
+async function readTextIndexV2(
+  zip: JSZip,
+  meta: TextIndexManifestMeta,
+  pageEntries: TextIndexPageEntry[],
+  charMapEntry: JSZip.JSZipObject
+): Promise<SceneTextIndex | null> {
+  const charMapBytes = new Uint8Array(await charMapEntry.async("arraybuffer"));
+
+  let totalFallbackCount = 0;
+  for (const entry of pageEntries) {
+    totalFallbackCount += readNonNegativeInt(entry.fallbackCount, 0);
+  }
+
+  let fallbackAll: Float32Array | null = null;
+  if (totalFallbackCount > 0) {
+    const fallbackPath = typeof meta.fallbackFile === "string" ? meta.fallbackFile : TEXT_FALLBACK_PATH;
+    const fallbackEntry = zip.file(fallbackPath);
+    const lengths = Array.isArray(meta.fallbackColumnByteLengths) ? meta.fallbackColumnByteLengths.map(Number) : null;
+    if (!fallbackEntry || !lengths || lengths.length !== 4 || lengths.some((value) => !Number.isFinite(value) || value < 0)) {
+      console.warn("[Parsed data load] Text index fallback quads are missing or invalid; ignoring text index.");
+      return null;
+    }
+    const fallbackBytes = new Uint8Array(await fallbackEntry.async("arraybuffer"));
+    if (lengths.reduce((sum, value) => sum + value, 0) !== fallbackBytes.length) {
+      console.warn("[Parsed data load] Text index fallback quads have a length mismatch; ignoring text index.");
+      return null;
+    }
+    fallbackAll = new Float32Array(totalFallbackCount * 4);
+    let byteOffset = 0;
+    for (let channel = 0; channel < 4; channel += 1) {
+      decodeFixed512DeltaColumnInto(
+        fallbackBytes,
+        byteOffset,
+        byteOffset + lengths[channel],
+        fallbackAll,
+        totalFallbackCount,
+        4,
+        channel
+      );
+      byteOffset += lengths[channel];
+    }
+  }
+
+  const cursor = new VarintCursor(charMapBytes);
+  let prevInstance = -1;
+  let fallbackOffset = 0;
+  const pages: PageTextIndex[] = [];
+  for (const entry of pageEntries) {
+    const text = typeof entry.text === "string" ? entry.text : "";
+    const charInstance = new Int32Array(text.length);
+    let pageFallbackCount = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      const token = cursor.readVarUint32();
+      if (token === 0) {
+        charInstance[i] = -1;
+      } else if (token === 1) {
+        charInstance[i] = -2 - pageFallbackCount;
+        pageFallbackCount += 1;
+      } else {
+        prevInstance = prevInstance + 1 + zigzagDecode32(token - 2);
+        charInstance[i] = prevInstance;
+      }
+    }
+
+    const declaredFallbackCount = readNonNegativeInt(entry.fallbackCount, pageFallbackCount);
+    if (declaredFallbackCount !== pageFallbackCount || (pageFallbackCount > 0 && !fallbackAll)) {
+      console.warn("[Parsed data load] Text index char map is inconsistent; ignoring text index.");
+      return null;
+    }
+    const fallbackQuads = fallbackAll
+      ? fallbackAll.slice(fallbackOffset * 4, (fallbackOffset + pageFallbackCount) * 4)
+      : new Float32Array(0);
+    fallbackOffset += pageFallbackCount;
+    pages.push({ text, charInstance, fallbackQuads });
+  }
+  cursor.expectEnd("text/char-map.bin");
+
+  return { version: 2, pages };
+}
+
+interface StrokeGeometrySectionMeta {
+  endpointsFile: string;
+  metaFile: string;
+  segmentCount: number;
+  curveCount: number;
+  quantizationMin: number[];
+  quantizationMax: number[];
+  ctrlQuantizationMin: number[];
+  ctrlQuantizationMax: number[];
+  endpointColumnByteLengths: number[];
+}
+
+interface TextInstancesSectionMeta {
+  positionsFile: string;
+  glyphIndexFile: string;
+  glyphIndexFormat: "u16" | "u32";
+  count: number;
+  positionColumnByteLengths: number[];
+}
+
+function readFiniteNumberArray(value: unknown, expectedLength: number): number[] | null {
+  if (!Array.isArray(value) || value.length !== expectedLength) {
+    return null;
+  }
+  const out: number[] = [];
+  for (const item of value) {
+    const parsed = Number(item);
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+    out.push(parsed);
+  }
+  return out;
+}
+
+function parseStrokeGeometrySection(value: unknown): StrokeGeometrySectionMeta | null {
+  if (typeof value !== "object" || !value) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const endpointsFile = typeof raw.endpointsFile === "string" ? raw.endpointsFile : null;
+  const metaFile = typeof raw.metaFile === "string" ? raw.metaFile : null;
+  const segmentCount = Number(raw.segmentCount);
+  const curveCount = Number(raw.curveCount);
+  const quantizationMin = readFiniteNumberArray(raw.quantizationMin, 4);
+  const quantizationMax = readFiniteNumberArray(raw.quantizationMax, 4);
+  const ctrlQuantizationMin = readFiniteNumberArray(raw.ctrlQuantizationMin, 2);
+  const ctrlQuantizationMax = readFiniteNumberArray(raw.ctrlQuantizationMax, 2);
+  const endpointColumnByteLengths = readFiniteNumberArray(raw.endpointColumnByteLengths, 4);
+  if (
+    !endpointsFile ||
+    !metaFile ||
+    !Number.isInteger(segmentCount) ||
+    segmentCount < 0 ||
+    !Number.isInteger(curveCount) ||
+    curveCount < 0 ||
+    !quantizationMin ||
+    !quantizationMax ||
+    !ctrlQuantizationMin ||
+    !ctrlQuantizationMax ||
+    !endpointColumnByteLengths ||
+    endpointColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0)
+  ) {
+    throw new Error("Parsed data zip has an invalid strokeGeometry section.");
+  }
+  return {
+    endpointsFile,
+    metaFile,
+    segmentCount,
+    curveCount,
+    quantizationMin,
+    quantizationMax,
+    ctrlQuantizationMin,
+    ctrlQuantizationMax,
+    endpointColumnByteLengths
+  };
+}
+
+function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | null {
+  if (typeof value !== "object" || !value) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const positionsFile = typeof raw.positionsFile === "string" ? raw.positionsFile : null;
+  const glyphIndexFile = typeof raw.glyphIndexFile === "string" ? raw.glyphIndexFile : null;
+  const glyphIndexFormat = raw.glyphIndexFormat === "u32" ? "u32" : raw.glyphIndexFormat === "u16" ? "u16" : null;
+  const count = Number(raw.count);
+  const positionColumnByteLengths = readFiniteNumberArray(raw.positionColumnByteLengths, 2);
+  if (
+    !positionsFile ||
+    !glyphIndexFile ||
+    !glyphIndexFormat ||
+    !Number.isInteger(count) ||
+    count < 0 ||
+    !positionColumnByteLengths ||
+    positionColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0)
+  ) {
+    throw new Error("Parsed data zip has an invalid textInstances section.");
+  }
+  return { positionsFile, glyphIndexFile, glyphIndexFormat, count, positionColumnByteLengths };
+}
+
+/**
+ * Decodes the v5 stroke section back into the interleaved `endpoints` and
+ * `primitiveMeta` arrays in one pass. Start points chain against the previous
+ * segment's end point in the integer domain (exact), and curve control points
+ * are stored as deltas against the quantized chord midpoint.
+ */
+async function readStrokeGeometryFromSection(
+  zip: JSZip,
+  section: StrokeGeometrySectionMeta
+): Promise<{ endpoints: Float32Array; primitiveMeta: Float32Array }> {
+  const segmentCount = section.segmentCount;
+  const endpoints = new Float32Array(segmentCount * 4);
+  const primitiveMeta = new Float32Array(segmentCount * 4);
+  if (segmentCount === 0) {
+    return { endpoints, primitiveMeta };
+  }
+
+  const endpointsEntry = zip.file(section.endpointsFile);
+  const metaEntry = zip.file(section.metaFile);
+  if (!endpointsEntry || !metaEntry) {
+    throw new Error("Parsed data zip is missing v5 stroke geometry files.");
+  }
+  const [endpointBuffer, metaBuffer] = await Promise.all([
+    endpointsEntry.async("arraybuffer"),
+    metaEntry.async("arraybuffer")
+  ]);
+  const endpointBytes = new Uint8Array(endpointBuffer);
+  const metaBytes = new Uint8Array(metaBuffer);
+
+  const columnLengths = section.endpointColumnByteLengths;
+  if (columnLengths[0] + columnLengths[1] + columnLengths[2] + columnLengths[3] !== endpointBytes.length) {
+    throw new Error("Parsed data zip stroke endpoint columns have a length mismatch.");
+  }
+  const col0End = columnLengths[0];
+  const col1End = col0End + columnLengths[1];
+  const col2End = col1End + columnLengths[2];
+  const startX = new VarintCursor(endpointBytes, 0, col0End);
+  const startY = new VarintCursor(endpointBytes, col0End, col1End);
+  const endX = new VarintCursor(endpointBytes, col1End, col2End);
+  const endY = new VarintCursor(endpointBytes, col2End, endpointBytes.length);
+
+  const bitsetLength = Math.ceil(segmentCount / 8);
+  const ch3Start = bitsetLength;
+  const ctrlStart = bitsetLength + segmentCount * 2;
+  if (metaBytes.length < ctrlStart) {
+    throw new Error("Parsed data zip stroke meta stream is truncated.");
+  }
+  const ctrl = new VarintCursor(metaBytes, ctrlStart, metaBytes.length);
+
+  const qMin = section.quantizationMin;
+  const qMax = section.quantizationMax;
+  const cMin = section.ctrlQuantizationMin;
+  const cMax = section.ctrlQuantizationMax;
+
+  let prevEndXInt = 0;
+  let prevEndYInt = 0;
+  let curvesSeen = 0;
+  for (let i = 0; i < segmentCount; i += 1) {
+    const sx = startX.readZigzagVarint() + prevEndXInt;
+    const sy = startY.readZigzagVarint() + prevEndYInt;
+    const ex = endX.readZigzagVarint() + sx;
+    const ey = endY.readZigzagVarint() + sy;
+    prevEndXInt = ex;
+    prevEndYInt = ey;
+
+    const startXFloat = decodeRangeUint16(sx, qMin[0], qMax[0]);
+    const startYFloat = decodeRangeUint16(sy, qMin[1], qMax[1]);
+    const endXFloat = decodeRangeUint16(ex, qMin[2], qMax[2]);
+    const endYFloat = decodeRangeUint16(ey, qMin[3], qMax[3]);
+    const isQuad = (metaBytes[i >> 3] >>> (i & 7)) & 1;
+
+    const offset = i * 4;
+    endpoints[offset] = startXFloat;
+    endpoints[offset + 1] = startYFloat;
+    if (isQuad) {
+      curvesSeen += 1;
+      const predictedX = encodeRangeUint16((startXFloat + endXFloat) * 0.5, cMin[0], cMax[0]);
+      const predictedY = encodeRangeUint16((startYFloat + endYFloat) * 0.5, cMin[1], cMax[1]);
+      endpoints[offset + 2] = decodeRangeUint16(ctrl.readZigzagVarint() + predictedX, cMin[0], cMax[0]);
+      endpoints[offset + 3] = decodeRangeUint16(ctrl.readZigzagVarint() + predictedY, cMin[1], cMax[1]);
+    } else {
+      endpoints[offset + 2] = endXFloat;
+      endpoints[offset + 3] = endYFloat;
+    }
+
+    primitiveMeta[offset] = endXFloat;
+    primitiveMeta[offset + 1] = endYFloat;
+    primitiveMeta[offset + 2] = isQuad;
+    const styleWord = metaBytes[ch3Start + i * 2] | (metaBytes[ch3Start + i * 2 + 1] << 8);
+    primitiveMeta[offset + 3] = (styleWord & 0x0fff) / 4095 + (styleWord >>> 12) * 2;
+  }
+
+  startX.expectEnd("stroke start-x column");
+  startY.expectEnd("stroke start-y column");
+  endX.expectEnd("stroke end-x column");
+  endY.expectEnd("stroke end-y column");
+  ctrl.expectEnd("stroke control-point stream");
+  if (curvesSeen !== section.curveCount) {
+    throw new Error(`Parsed data zip stroke curve count mismatch (${curvesSeen} vs ${section.curveCount}).`);
+  }
+
+  return { endpoints, primitiveMeta };
+}
+
+/** Decodes the v5 text instance section back into the interleaved textInstanceB array. */
+async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSectionMeta): Promise<Float32Array> {
+  const count = section.count;
+  const instanceB = new Float32Array(count * 4);
+  if (count === 0) {
+    return instanceB;
+  }
+
+  const positionsEntry = zip.file(section.positionsFile);
+  const glyphIndexEntry = zip.file(section.glyphIndexFile);
+  if (!positionsEntry || !glyphIndexEntry) {
+    throw new Error("Parsed data zip is missing v5 text instance files.");
+  }
+  const [positionsBuffer, glyphIndexBuffer] = await Promise.all([
+    positionsEntry.async("arraybuffer"),
+    glyphIndexEntry.async("arraybuffer")
+  ]);
+  const positionBytes = new Uint8Array(positionsBuffer);
+  const [eLength, fLength] = section.positionColumnByteLengths;
+  if (eLength + fLength !== positionBytes.length) {
+    throw new Error("Parsed data zip text instance position columns have a length mismatch.");
+  }
+
+  decodeFixed512DeltaColumnInto(positionBytes, 0, eLength, instanceB, count, 4, 0);
+  decodeFixed512DeltaColumnInto(positionBytes, eLength, positionBytes.length, instanceB, count, 4, 1);
+
+  if (section.glyphIndexFormat === "u32") {
+    if (glyphIndexBuffer.byteLength !== count * 4) {
+      throw new Error("Parsed data zip glyph index stream has a length mismatch.");
+    }
+    const glyphIndices = new Uint32Array(glyphIndexBuffer);
+    for (let i = 0; i < count; i += 1) {
+      instanceB[i * 4 + 2] = glyphIndices[i];
+    }
+  } else {
+    if (glyphIndexBuffer.byteLength !== count * 2) {
+      throw new Error("Parsed data zip glyph index stream has a length mismatch.");
+    }
+    const glyphIndices = new Uint16Array(glyphIndexBuffer);
+    for (let i = 0; i < count; i += 1) {
+      instanceB[i * 4 + 2] = glyphIndices[i];
+    }
+  }
+
+  return instanceB;
+}
+
+const STROKE_ENDPOINTS_PATH = "geometry/stroke-endpoints.csq16";
+const STROKE_META_PATH = "geometry/stroke-meta.bin";
+const TEXT_INSTANCE_POSITIONS_PATH = "geometry/text-instance-ef.d512";
+const TEXT_INSTANCE_GLYPHS_U16_PATH = "geometry/text-instance-glyphs.u16";
+const TEXT_INSTANCE_GLYPHS_U32_PATH = "geometry/text-instance-glyphs.u32";
+
+function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const chunk of chunks) {
+    total += chunk.length;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+interface StrokeGeometryExport {
+  endpointsBytes: Uint8Array;
+  metaBytes: Uint8Array;
+  manifest: StrokeGeometrySectionMeta;
+}
+
+/**
+ * v5 stroke storage: uint16 range-quantized coordinates stored as chained
+ * per-column zigzag-varint deltas (start chains to the previous end, end is
+ * relative to its own start) plus a type bitset, a raw u16 packed style
+ * column, and control-point deltas only for curve segments.
+ */
+function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExport | null {
+  const segmentCount = Math.max(0, Math.trunc(scene.segmentCount));
+  if (segmentCount === 0) {
+    return null;
+  }
+
+  const endpointsSource = scene.endpoints.subarray(0, segmentCount * 4);
+  const metaSource = scene.primitiveMeta.subarray(0, segmentCount * 4);
+  const packedA = encodeUint16NormalizedRange(endpointsSource);
+  const packedB = encodeStrokePrimitiveBUint16(metaSource);
+  const aInts = new Uint16Array(packedA.data.buffer, packedA.data.byteOffset, packedA.data.byteLength / 2);
+  const bInts = new Uint16Array(packedB.data.buffer, packedB.data.byteOffset, packedB.data.byteLength / 2);
+
+  const startXColumn = new ByteWriter(segmentCount);
+  const startYColumn = new ByteWriter(segmentCount);
+  const endXColumn = new ByteWriter(segmentCount);
+  const endYColumn = new ByteWriter(segmentCount);
+  const bitset = new Uint8Array(Math.ceil(segmentCount / 8));
+  const ctrl = new ByteWriter(256);
+
+  let prevEndXInt = 0;
+  let prevEndYInt = 0;
+  let curveCount = 0;
+  for (let i = 0; i < segmentCount; i += 1) {
+    const offset = i * 4;
+    const sx = aInts[offset];
+    const sy = aInts[offset + 1];
+    const ex = bInts[offset];
+    const ey = bInts[offset + 1];
+    startXColumn.writeZigzagVarint(sx - prevEndXInt);
+    startYColumn.writeZigzagVarint(sy - prevEndYInt);
+    endXColumn.writeZigzagVarint(ex - sx);
+    endYColumn.writeZigzagVarint(ey - sy);
+    prevEndXInt = ex;
+    prevEndYInt = ey;
+
+    if (bInts[offset + 2] >= 1) {
+      bitset[i >> 3] |= 1 << (i & 7);
+      curveCount += 1;
+      // Predict the control point from DECODED floats so the reader's
+      // prediction reproduces this value bit-exactly.
+      const startXFloat = decodeRangeUint16(sx, packedA.min[0], packedA.max[0]);
+      const startYFloat = decodeRangeUint16(sy, packedA.min[1], packedA.max[1]);
+      const endXFloat = decodeRangeUint16(ex, packedB.min[0], packedB.max[0]);
+      const endYFloat = decodeRangeUint16(ey, packedB.min[1], packedB.max[1]);
+      const predictedX = encodeRangeUint16((startXFloat + endXFloat) * 0.5, packedA.min[2], packedA.max[2]);
+      const predictedY = encodeRangeUint16((startYFloat + endYFloat) * 0.5, packedA.min[3], packedA.max[3]);
+      ctrl.writeZigzagVarint(aInts[offset + 2] - predictedX);
+      ctrl.writeZigzagVarint(aInts[offset + 3] - predictedY);
+    }
+  }
+
+  const meta = new ByteWriter(bitset.length + segmentCount * 2 + ctrl.length);
+  meta.writeBytes(bitset);
+  for (let i = 0; i < segmentCount; i += 1) {
+    meta.writeUint16(bInts[i * 4 + 3]);
+  }
+  meta.writeBytes(ctrl.toUint8Array());
+
+  const columns = [
+    startXColumn.toUint8Array(),
+    startYColumn.toUint8Array(),
+    endXColumn.toUint8Array(),
+    endYColumn.toUint8Array()
+  ];
+
+  return {
+    endpointsBytes: concatByteChunks(columns),
+    metaBytes: meta.toUint8Array(),
+    manifest: {
+      endpointsFile: STROKE_ENDPOINTS_PATH,
+      metaFile: STROKE_META_PATH,
+      segmentCount,
+      curveCount,
+      quantizationMin: [packedA.min[0], packedA.min[1], packedB.min[0], packedB.min[1]],
+      quantizationMax: [packedA.max[0], packedA.max[1], packedB.max[0], packedB.max[1]],
+      ctrlQuantizationMin: [packedA.min[2], packedA.min[3]],
+      ctrlQuantizationMax: [packedA.max[2], packedA.max[3]],
+      endpointColumnByteLengths: columns.map((column) => column.length)
+    }
+  };
+}
+
+interface TextInstancesExport {
+  positionsBytes: Uint8Array;
+  glyphIndexBytes: Uint8Array;
+  manifest: TextInstancesSectionMeta;
+}
+
+/**
+ * v5 text instance storage: e/f as fixed-point 1/512 per-column varint deltas
+ * (quantization approved: max error 1/1024 scene unit), glyph indices as a
+ * raw u16/u32 column. The always-zero 4th channel is dropped.
+ */
+function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | null {
+  const count = Math.max(0, Math.trunc(scene.textInstanceCount));
+  if (count === 0) {
+    return null;
+  }
+
+  const source = scene.textInstanceB.subarray(0, count * 4);
+  const eColumn = encodeFixed512DeltaColumn(source, count, 4, 0);
+  const fColumn = encodeFixed512DeltaColumn(source, count, 4, 1);
+
+  let maxGlyphIndex = 0;
+  for (let i = 0; i < count; i += 1) {
+    const glyphIndex = Math.max(0, Math.trunc(source[i * 4 + 2]));
+    if (glyphIndex > maxGlyphIndex) {
+      maxGlyphIndex = glyphIndex;
+    }
+  }
+  const useU32 = maxGlyphIndex > 65535;
+  let glyphIndexBytes: Uint8Array;
+  if (useU32) {
+    const glyphIndices = new Uint32Array(count);
+    for (let i = 0; i < count; i += 1) {
+      glyphIndices[i] = Math.max(0, Math.trunc(source[i * 4 + 2]));
+    }
+    glyphIndexBytes = new Uint8Array(glyphIndices.buffer);
+  } else {
+    const glyphIndices = new Uint16Array(count);
+    for (let i = 0; i < count; i += 1) {
+      glyphIndices[i] = Math.max(0, Math.trunc(source[i * 4 + 2]));
+    }
+    glyphIndexBytes = new Uint8Array(glyphIndices.buffer);
+  }
+
+  return {
+    positionsBytes: concatByteChunks([eColumn, fColumn]),
+    glyphIndexBytes,
+    manifest: {
+      positionsFile: TEXT_INSTANCE_POSITIONS_PATH,
+      glyphIndexFile: useU32 ? TEXT_INSTANCE_GLYPHS_U32_PATH : TEXT_INSTANCE_GLYPHS_U16_PATH,
+      glyphIndexFormat: useU32 ? "u32" : "u16",
+      count,
+      positionColumnByteLengths: [eColumn.length, fColumn.length]
+    }
+  };
+}
+
 function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureStats, textureLayout: TextureLayout): ExportTextureEntry[] {
   return [
     createTextureExportEntry("fill-path-meta-a", scene.fillPathMetaA, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount, textureLayout),
@@ -276,12 +981,11 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
     createTextureExportEntry("fill-path-meta-c", scene.fillPathMetaC, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount, textureLayout),
     createTextureExportEntry("fill-primitives-a", scene.fillSegmentsA, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount, textureLayout),
     createTextureExportEntry("fill-primitives-b", scene.fillSegmentsB, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount, textureLayout),
-    createTextureExportEntry("stroke-primitives-a", scene.endpoints, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
-    createTextureExportEntry("stroke-primitives-b", scene.primitiveMeta, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
+    // Stroke endpoints/meta live in the v5 strokeGeometry section; stroke
+    // bounds are derived on load either way.
     createTextureExportEntry("stroke-styles", scene.styles, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
-    // Stroke bounds are derived on load; storing them duplicates most stroke coordinate data.
     createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
-    createTextureExportEntry("text-instance-b", scene.textInstanceB, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
+    // text-instance-b lives in the v5 textInstances section.
     createTextureExportEntry("text-instance-c", scene.textInstanceC, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
     createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
     createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
@@ -316,11 +1020,21 @@ export async function loadSceneFromParsedDataZip(
     throw new Error(`Invalid manifest.json: ${message}`);
   }
 
+  const formatVersion = readNonNegativeInt(manifest.formatVersion, 0);
+  if (formatVersion < PARSED_DATA_FORMAT_VERSION) {
+    throw new Error(
+      `Parsed data zip format v${formatVersion} is no longer supported; re-export the zip with the current version.`
+    );
+  }
+
   const sceneMeta = typeof manifest.scene === "object" && manifest.scene ? manifest.scene : {};
   const manifestTextures = Array.isArray(manifest.textures) ? manifest.textures : [];
 
+  const strokeGeometrySection = parseStrokeGeometrySection(manifest.strokeGeometry);
+  const textInstancesSection = parseTextInstancesSection(manifest.textInstances);
+
   const textureByName = new Map<string, ParsedDataTextureEntry>();
-  const textureReadTotal = 16;
+  const textureReadTotal = 12;
   let textureReadCount = 0;
   const reportTextureProgress = (): void => {
     progress.report(0.22 + (textureReadCount / textureReadTotal) * 0.58, {
@@ -340,116 +1054,92 @@ export async function loadSceneFromParsedDataZip(
   }
 
   const readTexture = async (
-    candidateNames: string[],
+    name: string,
     required: boolean
   ): Promise<{ data: Float32Array; logicalItemCount: number } | null> => {
     try {
       reportTextureProgress();
-      for (const candidate of candidateNames) {
-        const entry = textureByName.get(candidate);
-        if (!entry) {
-          continue;
+      const entry = textureByName.get(name);
+      const path = entry && typeof entry.file === "string" ? entry.file : null;
+      const zipEntry = path ? zip.file(path) : null;
+      if (!entry || !zipEntry) {
+        if (required) {
+          throw new Error(`Parsed data zip is missing required texture: ${name}.`);
         }
-
-        const inferredSuffix =
-          entry.componentType === "uint8-normalized"
-            ? ".rgba8"
-            : entry.componentType === "uint16-normalized-range"
-              ? ".q16"
-              : entry.componentType === "stroke-primitive-b-u16-packed"
-                ? ".spb16"
-                : typeof entry.layout === "string" && entry.layout === "channel-major"
-                  ? ".f32cm"
-                  : entry.byteShuffle === true
-                    ? ".f32bs"
-                    : ".f32";
-        const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}${inferredSuffix}`;
-        const zipEntry = zip.file(path);
-        if (!zipEntry) {
-          continue;
-        }
-
-        const fileBuffer = await zipEntry.async("arraybuffer");
-        const raw = readTexturePayloadAsFloat32(fileBuffer, entry, candidate);
-        const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
-        if (logicalFloatCount > raw.length) {
-          throw new Error(`Texture ${candidate} logical float count exceeds file length.`);
-        }
-
-        const logicalItemCount = readNonNegativeInt(entry.logicalItemCount, Math.floor(logicalFloatCount / 4));
-        return {
-          data: raw.slice(0, logicalFloatCount),
-          logicalItemCount
-        };
+        return null;
       }
 
-      if (required) {
-        throw new Error(`Parsed data zip is missing required texture: ${candidateNames[0]}.`);
+      const fileBuffer = await zipEntry.async("arraybuffer");
+      const raw = readTexturePayloadAsFloat32(fileBuffer, entry, name);
+      const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
+      if (logicalFloatCount > raw.length) {
+        throw new Error(`Texture ${name} logical float count exceeds file length.`);
       }
 
-      return null;
+      const logicalItemCount = readNonNegativeInt(entry.logicalItemCount, Math.floor(logicalFloatCount / 4));
+      return {
+        data: raw.slice(0, logicalFloatCount),
+        logicalItemCount
+      };
     } finally {
       textureReadCount += 1;
       reportTextureProgress();
     }
   };
 
-  const fillPathMetaAEntry = await readTexture(["fill-path-meta-a"], false);
-  const fillPathMetaBEntry = await readTexture(["fill-path-meta-b"], false);
-  const fillPathMetaCEntry = await readTexture(["fill-path-meta-c"], false);
-  const fillPrimitiveAEntry = await readTexture(["fill-primitives-a", "fill-segments"], false);
-  const fillPrimitiveBEntry = await readTexture(["fill-primitives-b"], false);
-  const strokePrimitiveAEntry = await readTexture(["stroke-primitives-a", "stroke-endpoints"], false);
-  const strokePrimitiveBEntry = await readTexture(["stroke-primitives-b"], false);
-  const strokeStylesEntry = await readTexture(["stroke-styles"], false);
-  const strokePrimitiveBoundsEntry = await readTexture(["stroke-primitive-bounds"], false);
-  const textInstanceAEntry = await readTexture(["text-instance-a"], false);
-  const textInstanceBEntry = await readTexture(["text-instance-b"], false);
-  const textInstanceCEntry = await readTexture(["text-instance-c"], false);
-  const textGlyphMetaAEntry = await readTexture(["text-glyph-meta-a"], false);
-  const textGlyphMetaBEntry = await readTexture(["text-glyph-meta-b"], false);
-  const textGlyphPrimitiveAEntry = await readTexture(["text-glyph-primitives-a"], false);
-  const textGlyphPrimitiveBEntry = await readTexture(["text-glyph-primitives-b"], false);
+  const fillPathMetaAEntry = await readTexture("fill-path-meta-a", false);
+  const fillPathMetaBEntry = await readTexture("fill-path-meta-b", false);
+  const fillPathMetaCEntry = await readTexture("fill-path-meta-c", false);
+  const fillPrimitiveAEntry = await readTexture("fill-primitives-a", false);
+  const fillPrimitiveBEntry = await readTexture("fill-primitives-b", false);
+  const strokeStylesEntry = await readTexture("stroke-styles", false);
+  const textInstanceAEntry = await readTexture("text-instance-a", false);
+  const textInstanceCEntry = await readTexture("text-instance-c", false);
+  const textGlyphMetaAEntry = await readTexture("text-glyph-meta-a", false);
+  const textGlyphMetaBEntry = await readTexture("text-glyph-meta-b", false);
+  const textGlyphPrimitiveAEntry = await readTexture("text-glyph-primitives-a", false);
+  const textGlyphPrimitiveBEntry = await readTexture("text-glyph-primitives-b", false);
 
   const fillPathCount = readNonNegativeInt(sceneMeta.fillPathCount, fillPathMetaAEntry?.logicalItemCount ?? 0);
   const fillSegmentCount = readNonNegativeInt(sceneMeta.fillSegmentCount, fillPrimitiveAEntry?.logicalItemCount ?? 0);
-  const segmentCount = readNonNegativeInt(
-    sceneMeta.segmentCount,
-    strokeStylesEntry?.logicalItemCount ?? strokePrimitiveAEntry?.logicalItemCount ?? 0
-  );
-  const textInstanceCount = readNonNegativeInt(sceneMeta.textInstanceCount, textInstanceAEntry?.logicalItemCount ?? 0);
+  const segmentCount = strokeGeometrySection?.segmentCount ?? 0;
+  const textInstanceCount = textInstancesSection?.count ?? 0;
   const textGlyphCount = readNonNegativeInt(sceneMeta.textGlyphCount, textGlyphMetaAEntry?.logicalItemCount ?? 0);
   const textGlyphSegmentCount = readNonNegativeInt(
     sceneMeta.textGlyphPrimitiveCount,
     readNonNegativeInt(sceneMeta.textGlyphSegmentCount, textGlyphPrimitiveAEntry?.logicalItemCount ?? 0)
   );
 
-  if (segmentCount > 0 && (!strokePrimitiveAEntry || !strokeStylesEntry)) {
-    throw new Error("Parsed data zip is missing stroke geometry textures.");
+  if (segmentCount > 0 && !strokeStylesEntry) {
+    throw new Error("Parsed data zip is missing the stroke-styles texture.");
   }
 
   const fillPathMetaA = trimTextureForItemCount(fillPathMetaAEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-a");
   const fillPathMetaB = trimTextureForItemCount(fillPathMetaBEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-b");
   const fillPathMetaC = trimTextureForItemCount(fillPathMetaCEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-c");
   const fillSegmentsA = trimTextureForItemCount(fillPrimitiveAEntry?.data ?? new Float32Array(0), fillSegmentCount, "fill-primitives-a");
-  const fillSegmentsB = fillPrimitiveBEntry
-    ? trimTextureForItemCount(fillPrimitiveBEntry.data, fillSegmentCount, "fill-primitives-b")
-    : deriveLinePrimitiveB(fillSegmentsA, fillSegmentCount);
+  const fillSegmentsB = trimTextureForItemCount(fillPrimitiveBEntry?.data ?? new Float32Array(0), fillSegmentCount, "fill-primitives-b");
 
-  const endpoints = trimTextureForItemCount(strokePrimitiveAEntry?.data ?? new Float32Array(0), segmentCount, "stroke-primitives-a");
+  const strokeDecodeStart = performance.now();
+  const strokeGeometry = strokeGeometrySection ? await readStrokeGeometryFromSection(zip, strokeGeometrySection) : null;
+  const strokeDecodeMs = performance.now() - strokeDecodeStart;
+  const endpoints = strokeGeometry?.endpoints ?? new Float32Array(0);
   const styles = trimTextureForItemCount(strokeStylesEntry?.data ?? new Float32Array(0), segmentCount, "stroke-styles");
-  const primitiveMeta = strokePrimitiveBEntry
-    ? trimTextureForItemCount(strokePrimitiveBEntry.data, segmentCount, "stroke-primitives-b")
-    : deriveLinePrimitiveB(endpoints, segmentCount);
-  const primitiveBounds = strokePrimitiveBoundsEntry
-    ? trimTextureForItemCount(strokePrimitiveBoundsEntry.data, segmentCount, "stroke-primitive-bounds")
-    : derivePrimitiveBounds(endpoints, primitiveMeta, segmentCount);
+  const primitiveMeta = strokeGeometry?.primitiveMeta ?? new Float32Array(0);
+  const primitiveBounds = derivePrimitiveBounds(endpoints, primitiveMeta, segmentCount);
 
   const textInstanceA = trimTextureForItemCount(textInstanceAEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-a");
-  const textInstanceB = trimTextureForItemCount(textInstanceBEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-b");
-  const textInstanceC = textInstanceCEntry
-    ? trimTextureForItemCount(textInstanceCEntry.data, textInstanceCount, "text-instance-c")
-    : deriveLegacyTextInstanceColors(textInstanceB, textInstanceCount);
+  const textDecodeStart = performance.now();
+  const textInstanceB = textInstancesSection
+    ? await readTextInstancesFromSection(zip, textInstancesSection)
+    : new Float32Array(0);
+  if (strokeGeometrySection || textInstancesSection) {
+    const textDecodeMs = performance.now() - textDecodeStart;
+    console.log(
+      `[Parsed data load] v5 geometry decode: strokes ${strokeDecodeMs.toFixed(0)} ms (${segmentCount.toLocaleString()} segments), text ${textDecodeMs.toFixed(0)} ms (${textInstanceCount.toLocaleString()} instances)`
+    );
+  }
+  const textInstanceC = trimTextureForItemCount(textInstanceCEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-c");
   const textGlyphMetaA = trimTextureForItemCount(textGlyphMetaAEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-a");
   const textGlyphMetaB = trimTextureForItemCount(textGlyphMetaBEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-b");
   const textGlyphSegmentsA = trimTextureForItemCount(
@@ -462,9 +1152,6 @@ export async function loadSceneFromParsedDataZip(
     textGlyphSegmentCount,
     "text-glyph-primitives-b"
   );
-
-  migrateLegacyStrokeLayout(primitiveMeta, styles, segmentCount);
-  migrateLegacyFillLayout(fillPathMetaB, fillPathMetaC, fillPathCount);
 
   const sourceSegmentCount = readNonNegativeInt(sceneMeta.sourceSegmentCount, segmentCount);
   const mergedSegmentCount = readNonNegativeInt(sceneMeta.mergedSegmentCount, segmentCount);
@@ -497,6 +1184,7 @@ export async function loadSceneFromParsedDataZip(
     }
   }
   const primaryRasterLayer = rasterLayers[0] ?? null;
+  const textIndex = await readSceneTextIndexFromParsedData(zip, manifest);
   const maxHalfWidth =
     readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
     computeMaxHalfWidth(styles, segmentCount);
@@ -521,6 +1209,7 @@ export async function loadSceneFromParsedDataZip(
   const scene = optimizeVectorSceneTextGlyphs({
     pageRects,
     pageTextRanges,
+    textIndex,
     fillPathCount,
     fillSegmentCount,
     fillPathMetaA,
@@ -623,31 +1312,6 @@ function trimTextureForItemCount(source: Float32Array, itemCount: number, label:
   return source.slice(0, expectedLength);
 }
 
-function deriveLinePrimitiveB(primitivesA: Float32Array, primitiveCount: number): Float32Array {
-  const out = new Float32Array(primitiveCount * 4);
-  for (let i = 0; i < primitiveCount; i += 1) {
-    const offset = i * 4;
-    out[offset] = primitivesA[offset + 2];
-    out[offset + 1] = primitivesA[offset + 3];
-    out[offset + 2] = 0;
-    out[offset + 3] = 0;
-  }
-  return out;
-}
-
-function deriveLegacyTextInstanceColors(textInstanceB: Float32Array, textInstanceCount: number): Float32Array {
-  const out = new Float32Array(textInstanceCount * 4);
-  for (let i = 0; i < textInstanceCount; i += 1) {
-    const offset = i * 4;
-    const luma = clamp01(textInstanceB[offset + 3]);
-    out[offset] = luma;
-    out[offset + 1] = luma;
-    out[offset + 2] = luma;
-    out[offset + 3] = 1;
-  }
-  return out;
-}
-
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) {
     return 0;
@@ -659,61 +1323,6 @@ function clamp01(value: number): number {
     return 1;
   }
   return value;
-}
-
-function migrateLegacyStrokeLayout(primitiveMeta: Float32Array, styles: Float32Array, segmentCount: number): void {
-  if (segmentCount <= 0) {
-    return;
-  }
-
-  let hasPackedStyleMeta = false;
-  for (let i = 0; i < segmentCount; i += 1) {
-    if (Math.abs(primitiveMeta[i * 4 + 3]) > 1e-6) {
-      hasPackedStyleMeta = true;
-      break;
-    }
-  }
-  if (hasPackedStyleMeta) {
-    return;
-  }
-
-  for (let i = 0; i < segmentCount; i += 1) {
-    const offset = i * 4;
-    const luma = clamp01(styles[offset + 1]);
-    const alpha = clamp01(styles[offset + 2]);
-    const styleFlags = styles[offset + 3] >= 0.5 ? 1 : 0;
-    styles[offset + 1] = luma;
-    styles[offset + 2] = luma;
-    styles[offset + 3] = luma;
-    primitiveMeta[offset + 3] = alpha + styleFlags * 2;
-  }
-}
-
-function migrateLegacyFillLayout(fillPathMetaB: Float32Array, fillPathMetaC: Float32Array, fillPathCount: number): void {
-  if (fillPathCount <= 0) {
-    return;
-  }
-
-  let hasPackedFillAlpha = false;
-  for (let i = 0; i < fillPathCount; i += 1) {
-    if (Math.abs(fillPathMetaC[i * 4 + 3]) > 1e-6) {
-      hasPackedFillAlpha = true;
-      break;
-    }
-  }
-  if (hasPackedFillAlpha) {
-    return;
-  }
-
-  for (let i = 0; i < fillPathCount; i += 1) {
-    const offset = i * 4;
-    const luma = clamp01(fillPathMetaB[offset + 2]);
-    const alpha = clamp01(fillPathMetaB[offset + 3]);
-    fillPathMetaB[offset + 2] = luma;
-    fillPathMetaB[offset + 3] = luma;
-    fillPathMetaC[offset + 2] = luma;
-    fillPathMetaC[offset + 3] = alpha;
-  }
 }
 
 function derivePrimitiveBounds(primitivesA: Float32Array, primitivesB: Float32Array, primitiveCount: number): Float32Array {
@@ -1118,43 +1727,6 @@ async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataS
     layers.push({ width: decoded.width, height: decoded.height, matrix, data: decoded.data });
   }
 
-  if (layers.length > 0) {
-    return layers;
-  }
-
-  const rasterLayerWidth = readNonNegativeInt(sceneMeta.rasterLayerWidth, 0);
-  const rasterLayerHeight = readNonNegativeInt(sceneMeta.rasterLayerHeight, 0);
-  const rasterLayerMatrix = parseMat2D(sceneMeta.rasterLayerMatrix) ?? new Float32Array([1, 0, 0, 1, 0, 0]);
-  const defaultLegacyPath = zip.file("raster/layer-0.webp")
-    ? "raster/layer-0.webp"
-    : zip.file("raster/layer-0.png")
-      ? "raster/layer-0.png"
-      : zip.file("raster/layer-0.rgba")
-        ? "raster/layer-0.rgba"
-        : zip.file("raster/layer.webp")
-          ? "raster/layer.webp"
-          : zip.file("raster/layer.png")
-            ? "raster/layer.png"
-            : "raster/layer.rgba";
-  const legacyLayer = await readRasterLayerFromZip(
-    zip,
-    typeof sceneMeta.rasterLayerFile === "string" ? sceneMeta.rasterLayerFile : defaultLegacyPath,
-    rasterLayerWidth,
-    rasterLayerHeight
-  );
-  if (
-    legacyLayer &&
-    legacyLayer.width > 0 &&
-    legacyLayer.height > 0 &&
-    legacyLayer.data.length >= legacyLayer.width * legacyLayer.height * 4
-  ) {
-    layers.push({
-      width: legacyLayer.width,
-      height: legacyLayer.height,
-      data: legacyLayer.data,
-      matrix: rasterLayerMatrix
-    });
-  }
   return layers;
 }
 
@@ -1247,7 +1819,10 @@ function createTextureExportEntry(
     componentType: packed.componentType,
     layout: packed.layout,
     quantizationMin: packed.quantizationMin,
-    quantizationMax: packed.quantizationMax
+    quantizationMax: packed.quantizationMax,
+    byteShuffle: packed.byteShuffle,
+    predictor: packed.predictor,
+    columnByteLengths: packed.columnByteLengths
   };
 }
 
@@ -1266,6 +1841,9 @@ function packTextureForZip(
   suffix: string;
   quantizationMin?: number[];
   quantizationMax?: number[];
+  byteShuffle?: boolean;
+  predictor?: "none" | "xor-delta-u32";
+  columnByteLengths?: number[];
 } {
   if (name === "text-instance-c") {
     return {
@@ -1276,15 +1854,48 @@ function packTextureForZip(
     };
   }
 
-  if (name === "stroke-primitives-b") {
-    const packed = encodeStrokePrimitiveBUint16(source);
+  if (name === "text-instance-a") {
+    // Glyph matrices repeat heavily along text lines; the xor-delta predictor
+    // plus byte shuffle lets DEFLATE collapse them (read path pre-existing).
     return {
-      data: packed.data,
-      componentType: "stroke-primitive-b-u16-packed",
+      data: encodeXorDeltaByteShuffledFloat32(source),
+      componentType: "float32",
       layout: "interleaved",
-      suffix: ".spb16",
+      suffix: ".f32bs",
+      byteShuffle: true,
+      predictor: "xor-delta-u32"
+    };
+  }
+
+  if (name === "fill-primitives-a" || name === "fill-primitives-b") {
+    // Same q16 grid as before, stored as per-column zigzag-varint deltas:
+    // fill outlines chain segment to segment, so deltas stay tiny.
+    const packed = encodeUint16NormalizedRange(source);
+    const quantized = new Uint16Array(packed.data.buffer, packed.data.byteOffset, packed.data.byteLength / 2);
+    const itemCount = Math.floor(source.length / 4);
+    const columns: Uint8Array[] = [];
+    const columnByteLengths: number[] = [];
+    let totalBytes = 0;
+    for (let channel = 0; channel < 4; channel += 1) {
+      const column = encodeU16DeltaColumn(quantized, itemCount, 4, channel);
+      columns.push(column);
+      columnByteLengths.push(column.length);
+      totalBytes += column.length;
+    }
+    const data = new Uint8Array(totalBytes);
+    let byteOffset = 0;
+    for (const column of columns) {
+      data.set(column, byteOffset);
+      byteOffset += column.length;
+    }
+    return {
+      data,
+      componentType: "uint16-range-delta-columns",
+      layout: "interleaved",
+      suffix: ".q16dc",
       quantizationMin: Array.from(packed.min),
-      quantizationMax: Array.from(packed.max)
+      quantizationMax: Array.from(packed.max),
+      columnByteLengths
     };
   }
 
@@ -1312,10 +1923,7 @@ function packTextureForZip(
 }
 
 function usesRangeQuantizedUint16(name: string): boolean {
-  return name === "fill-primitives-a"
-    || name === "fill-primitives-b"
-    || name === "stroke-primitives-a"
-    || name === "text-glyph-primitives-a"
+  return name === "text-glyph-primitives-a"
     || name === "text-glyph-primitives-b";
 }
 
@@ -1356,14 +1964,7 @@ function encodeUint16NormalizedRange(source: Float32Array): { data: Uint8Array; 
   for (let i = 0; i < itemCount; i += 1) {
     const offset = i * 4;
     for (let channel = 0; channel < 4; channel += 1) {
-      const range = max[channel] - min[channel];
-      if (Math.abs(range) <= 1e-20) {
-        quantized[offset + channel] = 0;
-        continue;
-      }
-      const value = Number.isFinite(source[offset + channel]) ? source[offset + channel] : min[channel];
-      const normalized = (value - min[channel]) / range;
-      quantized[offset + channel] = Math.round(clamp01(normalized) * 65535);
+      quantized[offset + channel] = encodeRangeUint16(source[offset + channel], min[channel], max[channel]);
     }
   }
 
@@ -1421,15 +2022,6 @@ function encodeStrokePrimitiveBUint16(source: Float32Array): { data: Uint8Array;
   };
 }
 
-function encodeRangeUint16(rawValue: number, min: number, max: number): number {
-  const range = max - min;
-  if (Math.abs(range) <= 1e-20) {
-    return 0;
-  }
-  const value = Number.isFinite(rawValue) ? rawValue : min;
-  return Math.round(clamp01((value - min) / range) * 65535);
-}
-
 function readTexturePayloadAsFloat32(
   fileBuffer: ArrayBuffer,
   entry: ParsedDataTextureEntry,
@@ -1442,8 +2034,8 @@ function readTexturePayloadAsFloat32(
   if (componentType === "uint16-normalized-range") {
     return decodeUint16NormalizedRange(new Uint8Array(fileBuffer), entry, textureName);
   }
-  if (componentType === "stroke-primitive-b-u16-packed") {
-    return decodeStrokePrimitiveBUint16(new Uint8Array(fileBuffer), entry, textureName);
+  if (componentType === "uint16-range-delta-columns") {
+    return decodeUint16RangeDeltaColumns(new Uint8Array(fileBuffer), entry, textureName);
   }
   if (componentType !== "float32") {
     throw new Error(`Texture ${textureName} has unsupported componentType ${String(componentType)}.`);
@@ -1505,45 +2097,40 @@ function decodeUint16NormalizedRange(
 
   for (let i = 0; i < quantized.length; i += 1) {
     const channel = i & 3;
-    const range = max[channel] - min[channel];
-    out[i] = Math.abs(range) <= 1e-20
-      ? min[channel]
-      : min[channel] + (quantized[i] / 65535) * range;
+    out[i] = decodeRangeUint16(quantized[i], min[channel], max[channel]);
   }
 
   return out;
 }
 
-function decodeStrokePrimitiveBUint16(
+function decodeUint16RangeDeltaColumns(
   bytes: Uint8Array,
   entry: ParsedDataTextureEntry,
   textureName: string
 ): Float32Array {
-  if (bytes.byteLength % 8 !== 0) {
-    throw new Error(`Texture ${textureName} has invalid packed stroke primitive byte length (${bytes.byteLength}).`);
-  }
   const min = readQuantizationVector(entry.quantizationMin, textureName, "quantizationMin");
   const max = readQuantizationVector(entry.quantizationMax, textureName, "quantizationMax");
-  const packed = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-  const out = new Float32Array(packed.length);
-  const xRange = max[0] - min[0];
-  const yRange = max[1] - min[1];
-
-  for (let i = 0; i < packed.length; i += 4) {
-    out[i] = Math.abs(xRange) <= 1e-20
-      ? min[0]
-      : min[0] + (packed[i] / 65535) * xRange;
-    out[i + 1] = Math.abs(yRange) <= 1e-20
-      ? min[1]
-      : min[1] + (packed[i + 1] / 65535) * yRange;
-    out[i + 2] = packed[i + 2] >= 1 ? 1 : 0;
-
-    const styleWord = packed[i + 3];
-    const styleFlags = styleWord >>> 12;
-    const alpha = (styleWord & 0x0fff) / 4095;
-    out[i + 3] = alpha + styleFlags * 2;
+  const itemCount = readNonNegativeInt(entry.logicalItemCount, 0);
+  const lengths = readFiniteNumberArray(entry.columnByteLengths, 4);
+  if (!lengths || lengths.some((length) => !Number.isInteger(length) || length < 0)) {
+    throw new Error(`Texture ${textureName} has invalid columnByteLengths.`);
+  }
+  if (lengths[0] + lengths[1] + lengths[2] + lengths[3] !== bytes.length) {
+    throw new Error(`Texture ${textureName} delta columns have a length mismatch.`);
   }
 
+  const quantized = new Uint16Array(itemCount * 4);
+  let byteOffset = 0;
+  for (let channel = 0; channel < 4; channel += 1) {
+    decodeU16DeltaColumnInto(bytes, byteOffset, byteOffset + lengths[channel], quantized, itemCount, 4, channel);
+    byteOffset += lengths[channel];
+  }
+
+  const out = new Float32Array(itemCount * 4);
+  for (let i = 0; i < out.length; i += 1) {
+    const channel = i & 3;
+    out[i] = decodeRangeUint16(quantized[i], min[channel], max[channel]);
+  }
   return out;
 }
 
