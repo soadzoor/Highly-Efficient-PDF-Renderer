@@ -782,15 +782,20 @@ def build_segment_features(
     """Scale-invariant per-segment features, shape (N, FEATURE_DIM)."""
     count = len(seg_p0)
     delta = (seg_p1 - seg_p0).astype(np.float64)
-    length = np.hypot(delta[:, 0], delta[:, 1])
+    # sqrt(dx^2 + dy^2) instead of np.hypot: every step is IEEE correctly rounded,
+    # so the TypeScript runtime reproduces the ranks' tie order bit for bit
+    # (np.hypot and Math.hypot can differ in the last ulp, which reorders ties).
+    length = np.sqrt(delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1])
     safe_length = np.maximum(length, 1e-9)
     ux = delta[:, 0] / safe_length
     uy = delta[:, 1] / safe_length
     mid = (seg_p0 + seg_p1) * 0.5
     diag = normalizers.diag
 
-    length_rank = np.argsort(np.argsort(length)) / max(1, count - 1) if count > 1 else np.full(count, 0.5)
-    width_rank = np.argsort(np.argsort(half_width)) / max(1, count - 1) if count > 1 else np.full(count, 0.5)
+    # Stable sorts keep tie order deterministic so the TypeScript runtime
+    # (stable by spec) produces bit-identical ranks on tie-heavy CAD pages.
+    length_rank = np.argsort(np.argsort(length, kind="stable")) / max(1, count - 1) if count > 1 else np.full(count, 0.5)
+    width_rank = np.argsort(np.argsort(half_width, kind="stable")) / max(1, count - 1) if count > 1 else np.full(count, 0.5)
 
     features = np.zeros((count, FEATURE_DIM), dtype=np.float32)
     features[:, 0] = (mid[:, 0] - normalizers.center[0]) / (0.5 * diag)

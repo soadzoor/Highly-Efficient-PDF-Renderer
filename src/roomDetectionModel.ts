@@ -162,6 +162,40 @@ export async function runRoomDetectionOnPdf(options: RunRoomDetectionOptions): P
   };
 }
 
+// Shared with the vector detector: matches PDF text to detections per page.
+export async function attachRoomNumbersFromPdfBytes(
+  pdfBytes: Uint8Array,
+  scene: VectorScene,
+  detections: RoomDetection[],
+  pageCount: number
+): Promise<void> {
+  if (detections.length === 0) {
+    return;
+  }
+  const standardFontDataUrl = resolveStandardFontDataUrl();
+  const loadingTask = getDocument({
+    data: pdfBytes.slice(),
+    disableFontFace: true,
+    fontExtraProperties: true,
+    verbosity: PDFJS_VERBOSITY_ERRORS,
+    ...(standardFontDataUrl ? { standardFontDataUrl } : {})
+  });
+  try {
+    const pdf = await loadingTask.promise;
+    const pages = Math.min(pageCount, readPdfPageCount(pdf));
+    for (let pageIndex = 0; pageIndex < pages; pageIndex += 1) {
+      const pageDetections = detections.filter((detection) => detection.pageIndex === pageIndex);
+      if (pageDetections.length === 0) {
+        continue;
+      }
+      const page = await pdf.getPage(pageIndex + 1);
+      await attachRoomNumbersFromPageText(page, readPageRect(scene, pageIndex), pageDetections);
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
 async function loadRoomDetectionSession(manifest: RoomDetectionModelManifest): Promise<ort.InferenceSession> {
   const modelUrl = resolveAppAssetUrl(manifest.onnxPath);
   const preferredBackend = hasWebGpuSupport() ? "webgpu" : "wasm";

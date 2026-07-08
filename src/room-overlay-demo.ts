@@ -6,7 +6,8 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
 import { runRoomDetectionOnPdf } from "./roomDetectionModel";
-import type { RoomDetection, RoomDetectionResult } from "./roomDetectionTypes";
+import type { RoomDetection, RoomDetectionProgress, RoomDetectionResult } from "./roomDetectionTypes";
+import { runVectorRoomDetection, vectorSceneSupportsRoomDetection } from "./roomDetectionVector";
 
 const CAMERA_FIT_PADDING_PIXELS = 64;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
@@ -62,6 +63,13 @@ interface RoomOverlay {
 interface RoomLabelElement {
   element: HTMLDivElement;
   anchor: THREE.Vector3;
+  hasRoomNumber: boolean;
+  hasNonNumberLines: boolean;
+}
+
+interface RoomLabelLine {
+  text: string;
+  isRoomNumber: boolean;
 }
 
 interface PdfCoordinateTransform {
@@ -90,6 +98,7 @@ const detectRoomsButton = requireElement<HTMLButtonElement>("#detect-rooms");
 const downloadGeneratedTsvButton = requireElement<HTMLButtonElement>("#download-generated-tsv");
 const clearTsvButton = requireElement<HTMLButtonElement>("#clear-tsv");
 const showRoomLabelsCheckbox = requireElement<HTMLInputElement>("#show-room-labels");
+const showRoomNumbersCheckbox = requireElement<HTMLInputElement>("#show-room-numbers");
 const fileInput = requireElement<HTMLInputElement>("#file-input");
 const roomLabelLayer = requireElement<HTMLDivElement>("#room-label-layer");
 const statusElement = requireElement<HTMLDivElement>("#status");
@@ -170,6 +179,13 @@ downloadGeneratedTsvButton.addEventListener("click", () => {
 });
 
 showRoomLabelsCheckbox.addEventListener("change", () => {
+  applyRoomLineVisibility();
+  updateRoomLabelVisibility();
+  requestRender();
+});
+
+showRoomNumbersCheckbox.addEventListener("change", () => {
+  applyRoomLineVisibility();
   updateRoomLabelVisibility();
   requestRender();
 });
@@ -420,28 +436,54 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
       return;
     }
 
-    const { manifest, result } = await runRoomDetectionOnPdf({
-      sourceLabel: pdfObject.sourceLabel,
-      pdfBytes,
-      scene: pdfObject.sceneData,
-      maxPages: 1,
-      onProgress: (progress) => {
+    const reportProgress = (progress: RoomDetectionProgress): void => {
+      if (activeToken !== roomDetectionToken) {
+        return;
+      }
+      if (progress.stage === "loading-model") {
+        setStatus("Loading room detector model...");
+        return;
+      }
+      if (progress.stage === "complete") {
+        setStatus("Generating TSV from room detections...");
+        return;
+      }
+      setStatus(
+        `Room detection ${progress.stage.replace(/-/g, " ")}: page ${progress.pageIndex + 1}/${Math.max(1, progress.pageCount)}`
+      );
+    };
+
+    // Vector-native detection on the extracted stroke segments; the raster CNN
+    // stays as the fallback for scanned PDFs (no usable vector ink) or when the
+    // vector models are not installed.
+    let detection: { manifest: { version: string }; result: RoomDetectionResult } | null = null;
+    if (vectorSceneSupportsRoomDetection(pdfObject.sceneData)) {
+      try {
+        detection = await runVectorRoomDetection({
+          sourceLabel: pdfObject.sourceLabel,
+          scene: pdfObject.sceneData,
+          pdfBytes,
+          maxPages: 1,
+          onProgress: reportProgress
+        });
+      } catch (error) {
         if (activeToken !== roomDetectionToken) {
           return;
         }
-        if (progress.stage === "loading-model") {
-          setStatus("Loading room detector model...");
-          return;
-        }
-        if (progress.stage === "complete") {
-          setStatus("Generating TSV from room detections...");
-          return;
-        }
-        setStatus(
-          `Room detection ${progress.stage.replace(/-/g, " ")}: page ${progress.pageIndex + 1}/${Math.max(1, progress.pageCount)}`
-        );
+        console.warn("[Room detection] Vector model unavailable or failed; falling back to raster.", error);
+        setStatus("Vector room detector unavailable; falling back to the raster model...");
       }
-    });
+    }
+    if (!detection) {
+      detection = await runRoomDetectionOnPdf({
+        sourceLabel: pdfObject.sourceLabel,
+        pdfBytes,
+        scene: pdfObject.sceneData,
+        maxPages: 1,
+        onProgress: reportProgress
+      });
+    }
+    const { manifest, result } = detection;
     if (activeToken !== roomDetectionToken) {
       return;
     }
@@ -774,23 +816,21 @@ function toLocalPoint(
   return new THREE.Vector2(transformed.x - centerX, transformed.y - centerY);
 }
 
-function formatRoomLabelLines(room: RoomPolygon): string[] {
+function formatRoomLabelLines(room: RoomPolygon): RoomLabelLine[] {
   const roomNumber = room.roomNumber.trim();
   const roomType = room.roomType.trim();
-  if (roomNumber && roomType) {
-    return [roomNumber, roomType];
-  }
+  const lines: RoomLabelLine[] = [];
   if (roomNumber) {
-    return [roomNumber];
+    lines.push({ text: roomNumber, isRoomNumber: true });
   }
   if (roomType) {
-    return [roomType];
+    lines.push({ text: roomType, isRoomNumber: false });
   }
-  return [];
+  return lines;
 }
 
 function createRoomLabelElement(
-  lines: string[],
+  lines: RoomLabelLine[],
   color: THREE.Color,
   localPoints: THREE.Vector2[]
 ): RoomLabelElement {
@@ -798,14 +838,30 @@ function createRoomLabelElement(
   const element = document.createElement("div");
   element.className = "room-label-pill";
   element.style.setProperty("--room-label-color", `#${color.getHexString(THREE.SRGBColorSpace)}`);
+  let hasRoomNumber = false;
+  let hasNonNumberLines = false;
   for (const line of lines) {
     const span = document.createElement("span");
-    span.textContent = line;
+    span.textContent = line.text;
+    if (line.isRoomNumber) {
+      span.classList.add("room-label-number");
+      hasRoomNumber = true;
+    } else {
+      hasNonNumberLines = true;
+    }
     element.append(span);
+  }
+  if (hasRoomNumber && !showRoomNumbersCheckbox.checked) {
+    element.classList.add("hide-room-number");
+  }
+  if (hasNonNumberLines && !showRoomLabelsCheckbox.checked) {
+    element.classList.add("hide-room-text");
   }
   return {
     element,
-    anchor: new THREE.Vector3(centroid.x, centroid.y, OVERLAY_Z)
+    anchor: new THREE.Vector3(centroid.x, centroid.y, OVERLAY_Z),
+    hasRoomNumber,
+    hasNonNumberLines
   };
 }
 
@@ -1237,6 +1293,7 @@ function setBusy(busy: boolean): void {
   detectRoomsButton.textContent = busy ? "Working..." : "Detect Rooms";
   downloadGeneratedTsvButton.disabled = busy || !currentGeneratedTsv;
   showRoomLabelsCheckbox.disabled = busy || !currentRoomOverlay;
+  showRoomNumbersCheckbox.disabled = busy || !currentRoomOverlay;
   clearTsvButton.disabled = busy || !currentRoomOverlay;
 }
 
@@ -1246,6 +1303,7 @@ function syncControlsEnabled(): void {
   detectRoomsButton.textContent = isBusy ? "Working..." : "Detect Rooms";
   downloadGeneratedTsvButton.disabled = isBusy || !currentGeneratedTsv;
   showRoomLabelsCheckbox.disabled = isBusy || !currentRoomOverlay;
+  showRoomNumbersCheckbox.disabled = isBusy || !currentRoomOverlay;
   updateRoomLabelVisibility();
   clearTsvButton.disabled = isBusy || !currentRoomOverlay;
 }
@@ -1256,13 +1314,32 @@ function updateRoomLabelVisibility(): void {
   }
 }
 
+// Show/hide the individual lines inside each label pill: "Show labels" owns the
+// text line(s), "Room numbers" owns the number line - independently toggleable.
+function applyRoomLineVisibility(): void {
+  if (!currentRoomOverlay) {
+    return;
+  }
+  const hideNumbers = !showRoomNumbersCheckbox.checked;
+  const hideText = !showRoomLabelsCheckbox.checked;
+  for (const label of currentRoomOverlay.labelElements) {
+    if (label.hasRoomNumber) {
+      label.element.classList.toggle("hide-room-number", hideNumbers);
+    }
+    if (label.hasNonNumberLines) {
+      label.element.classList.toggle("hide-room-text", hideText);
+    }
+  }
+}
+
 function updateRoomDomLabels(): void {
   const overlay = currentRoomOverlay;
   const pdfObject = currentPdfObject;
-  const labelsVisible = Boolean(overlay && pdfObject && showRoomLabelsCheckbox.checked);
   if (!overlay || !pdfObject) {
     return;
   }
+  const textVisible = showRoomLabelsCheckbox.checked;
+  const numbersVisible = showRoomNumbersCheckbox.checked;
 
   const rect = canvas.getBoundingClientRect();
   const width = Math.max(1, rect.width);
@@ -1270,7 +1347,10 @@ function updateRoomDomLabels(): void {
   pdfObject.updateMatrixWorld(true);
 
   for (const label of overlay.labelElements) {
-    if (!labelsVisible) {
+    // The pill shows whenever either toggle contributes a visible line.
+    const labelHasVisibleContent =
+      (textVisible && label.hasNonNumberLines) || (numbersVisible && label.hasRoomNumber);
+    if (!labelHasVisibleContent) {
       label.element.style.display = "none";
       continue;
     }

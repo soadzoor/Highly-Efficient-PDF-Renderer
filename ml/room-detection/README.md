@@ -191,6 +191,22 @@ the one exception in spirit: its `--root`/`--out` arguments (and their defaults,
 `pdf-tsv` and `ml/room-detection/data/vector-segments`) always resolve against
 the repository root, no matter where you invoke it from.
 
+Before running step 0, make sure the local training corpus exists at the
+repository root:
+
+```text
+pdf-tsv/
+  kp/
+    floor-a.pdf
+    floor-a.tsv
+  uci/
+    floor-b.pdf
+    floor-b.tsv
+```
+
+If your corpus lives somewhere else, pass it explicitly with `--root`, using a
+path relative to the repository root or an absolute path.
+
 ```bash
 cd ml/room-detection
 
@@ -221,9 +237,57 @@ python train_room_type_head.py --encoder runs/vector-seg/best.pt --output-dir ru
 python evaluate_vector_rooms.py --checkpoint runs/vector-seg/best.pt \
   --bridger runs/vector-bridge/best.pt --type-head runs/vector-type/best.pt \
   --taxonomy clinical-coarse --split val
+
+# 7. ONNX export of the encoder + heads for onnxruntime-web
+python export_vector_onnx.py \
+  --encoder runs/vector-seg/best.pt \
+  --bridger runs/vector-bridge/best.pt \
+  --type-head runs/vector-type/best.pt \
+  --output-dir ../../public/models/room-detector-vector
 ```
 
-Follow-up (not wired yet): ONNX export of the encoder + heads for onnxruntime-web
-(the kNN graph build and polygonization stay in TypeScript at runtime; the demo's
-`pdfVectorExtractor` already produces the exact segments the dumps contain), with
-the raster model kept as the fallback for scanned PDFs.
+The export writes `encoder.onnx`, `bridger.onnx`, `type-head.onnx` (all with a
+dynamic segment/candidate/face count, opset 18, int32 kNN indices) plus a
+`manifest.json` that records the full runtime contract: feature slot layout,
+boundary/bridge thresholds from the checkpoints, the `VectorPrepConfig` /
+`FaceConfig` constants, and the clinical-coarse class table. Every graph is
+verified against the PyTorch modules through onnxruntime at several sizes
+before it is written; pass `--metrics` to embed an
+`evaluate_vector_rooms.py --output` JSON into the manifest.
+
+### Browser runtime + parity harness
+
+The TypeScript runtime that consumes these graphs is wired into the demo:
+
+- `src/vectorRoomPipeline.ts` mirrors `roomdet` stage by stage — segment
+  collection, per-segment features, kd-tree kNN graph + edge features, bridge
+  candidates/features, snap-round noding + planar-arrangement polygonization +
+  perimeter-support face scoring (the shapely replacement), and memory-bounded
+  tiled encoder inference (spatial tiles + a `layers`-hop kNN halo make the
+  tile outputs exact while capping the attention working set).
+- `src/roomDetectionVector.ts` loads the manifest + ONNX sessions
+  (webgpu -> wasm fallback) and produces the same `RoomDetectionResult` the
+  raster detector returns.
+- `room-overlay-demo.html`'s Detect Rooms button prefers the vector detector
+  whenever the page has enough stroke segments and falls back to the raster
+  CNN for scanned PDFs (or when the vector models are not installed).
+
+TS-vs-Python parity is checked stage by stage on real pages:
+
+```bash
+# reference intermediates from the Python pipeline for one page
+python dump_vector_reference.py \
+  --dump "data/vector-segments/kp/<page>.segments.json.gz" \
+  --bridger runs/vector-bridge/best.pt --type-head runs/vector-type/best.pt \
+  --out /tmp/vector-reference.json.gz
+
+# replay through src/vectorRoomPipeline.ts + the exported ONNX graphs in Node
+node ../../scripts/verify-vector-rooms.mjs --reference /tmp/vector-reference.json.gz
+```
+
+The verifier gates on: segment/feature/edge parity at float32 noise level, kNN
+disagreements being provably exact distance ties (scipy's tie order is
+arbitrary; ranks and lengths are computed with stable sorts and
+`sqrt(dx^2+dy^2)` on both sides precisely so ties are the *only* source of
+divergence), tiled encoder output bit-identical to the single-call path, and
+faces IoU-matched against shapely's (>0.95 matched at >0.95 IoU).
