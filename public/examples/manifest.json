@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-08T17:56:04.316Z",
+  "generatedAt": "2026-07-08T20:28:46.256Z",
   "examples": [
     {
       "id": "baldwin_park_ed_remodel_floor_1",
@@ -142,7 +142,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/thesis-parsed-data.zip",
-        "sizeBytes": 3622809
+        "sizeBytes": 1608191
       }
     },
     {

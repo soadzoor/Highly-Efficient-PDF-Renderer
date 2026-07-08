@@ -315,7 +315,15 @@ const FILL_SUBPATH_TILE_MAX_COUNT = 32;
 const FONT_MATRIX_FALLBACK = 0.001;
 const TEXT_MIN_ALPHA = 1e-3;
 const FILL_MIN_ALPHA = 1e-3;
-const RASTER_TARGET_SCALE_PER_DPR = 3;
+// Render scale for raster content without a measurable native resolution (full-page
+// vector fallback, unmeasurable image ops, solid-color masks). A fixed policy value
+// keeps extraction deterministic across devices instead of depending on the display.
+const RASTER_FALLBACK_TARGET_SCALE = 3;
+// Above this many image ops on a page, fall back to one flattened page layer instead of
+// per-image layers to bound texture count and draw calls.
+const RASTER_MAX_IMAGE_LAYERS = 32;
+// Padding around a per-image crop so clip antialiasing at the image edge is kept.
+const RASTER_CROP_PADDING_PX = 2;
 const RASTER_MAX_SCALE = 24;
 const RASTER_MAX_DIMENSION = 16384;
 const RASTER_MAX_PIXELS = 134_217_728;
@@ -565,24 +573,19 @@ async function extractSinglePageRasterOnly(
   });
   const pageBounds = transformBounds(rawPageBounds, pageMatrix);
   const imagePaintOpCount = countImagePaintOps(operatorList);
-  const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
+  const rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
     allowFullPageFallback: true
   });
-  const rasterLayers: RasterLayer[] =
-    rasterLayer.width > 0 && rasterLayer.height > 0 && rasterLayer.data.length >= rasterLayer.width * rasterLayer.height * 4
-      ? [
-        {
-          width: rasterLayer.width,
-          height: rasterLayer.height,
-          data: rasterLayer.data,
-          matrix: new Float32Array(rasterLayer.matrix)
-        }
-      ]
-      : [];
+  const rasterLayers: RasterLayer[] = rasterExtract.layers.map((layer) => ({
+    width: layer.width,
+    height: layer.height,
+    data: layer.data,
+    matrix: new Float32Array(layer.matrix)
+  }));
 
   const base = createEmptyVectorScene();
   const primaryRasterLayer = rasterLayers[0] ?? null;
-  const combinedBounds = combineBounds(pageBounds, rasterLayer.bounds) ?? pageBounds;
+  const combinedBounds = combineBounds(pageBounds, rasterExtract.bounds) ?? pageBounds;
 
   return {
     ...base,
@@ -1014,22 +1017,17 @@ async function extractSinglePageVectors(
   }
 
   const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
-  const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
+  const rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
     allowFullPageFallback: allowFullPageRasterFallback
   });
-  const rasterLayers: RasterLayer[] =
-    rasterLayer.width > 0 && rasterLayer.height > 0 && rasterLayer.data.length >= rasterLayer.width * rasterLayer.height * 4
-      ? [
-        {
-          width: rasterLayer.width,
-          height: rasterLayer.height,
-          data: rasterLayer.data,
-          matrix: new Float32Array(rasterLayer.matrix)
-        }
-      ]
-      : [];
+  const rasterLayers: RasterLayer[] = rasterExtract.layers.map((layer) => ({
+    width: layer.width,
+    height: layer.height,
+    data: layer.data,
+    matrix: new Float32Array(layer.matrix)
+  }));
   const combinedBounds =
-    combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterLayer.bounds) ??
+    combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterExtract.bounds) ??
     { ...pageBounds };
 
   return {
@@ -2023,14 +2021,12 @@ function resolveStandardFontDataUrl(): string | undefined {
   return undefined;
 }
 
-function chooseRasterExtractionScale(baseWidth: number, baseHeight: number, nativeScaleHint = 1): number {
+function chooseRasterExtractionScale(baseWidth: number, baseHeight: number, targetScale: number): number {
   if (!Number.isFinite(baseWidth) || !Number.isFinite(baseHeight) || baseWidth <= 0 || baseHeight <= 0) {
     return 1;
   }
 
-  const dpr = typeof window === "undefined" ? 1 : Math.max(1, Number(window.devicePixelRatio) || 1);
-  const targetScale = Math.max(dpr * RASTER_TARGET_SCALE_PER_DPR, Number.isFinite(nativeScaleHint) ? nativeScaleHint : 1);
-  let scale = Math.max(1, Math.min(RASTER_MAX_SCALE, targetScale));
+  let scale = Math.max(1, Math.min(RASTER_MAX_SCALE, Number.isFinite(targetScale) ? targetScale : 1));
 
   while (scale > 1) {
     const width = Math.max(1, Math.ceil(baseWidth * scale));
@@ -2107,11 +2103,15 @@ interface TextExtractResult {
   textIndexPage: PageTextIndex;
 }
 
-interface RasterLayerExtractResult {
+interface ExtractedRasterLayer {
   width: number;
   height: number;
   data: Uint8Array;
   matrix: Mat2D;
+}
+
+interface RasterLayerExtractResult {
+  layers: ExtractedRasterLayer[];
   bounds: Bounds | null;
 }
 
@@ -4606,7 +4606,10 @@ async function warmUpTextPathCache(page: unknown): Promise<void> {
 interface RasterOperatorPlan {
   hasImagePaintOps: boolean;
   hasFormXObjectOps: boolean;
+  /** Image paint ops plus the state ops they depend on. */
   imageOnlyMask: Uint8Array;
+  /** State ops only — combined with a single op index to render one image in isolation. */
+  imageStateMask: Uint8Array;
 }
 
 function isImagePaintOperator(fn: number): boolean {
@@ -4680,6 +4683,7 @@ function isImageRasterStateOperator(fn: number, args: unknown): boolean {
 
 function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: unknown[] }): RasterOperatorPlan {
   const imageOnlyMask = new Uint8Array(operatorList.fnArray.length);
+  const imageStateMask = new Uint8Array(operatorList.fnArray.length);
   let hasImagePaintOps = false;
   let hasFormXObjectOps = false;
 
@@ -4699,20 +4703,40 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
 
     if (isImageRasterStateOperator(fn, args)) {
       imageOnlyMask[i] = 1;
+      imageStateMask[i] = 1;
     }
   }
 
   return {
     hasImagePaintOps,
     hasFormXObjectOps,
-    imageOnlyMask
+    imageOnlyMask,
+    imageStateMask
   };
 }
 
-function estimateRasterNativeScaleHint(operatorList: { fnArray: number[]; argsArray: unknown[] }): number {
+interface RasterImageOpPlan {
+  opIndex: number;
+  /** PDF-user-space CTM at the op; the image covers the unit square under this matrix. */
+  ctm: Mat2D;
+  /** Source pixels per page point; null for scale-free paints (solid-color masks). */
+  nativeScale: number | null;
+}
+
+interface RasterImageOpScan {
+  /** One entry per visible image paint op, in paint order; null when any op's placement or size is unreadable (repeat/group/inline-marker ops). */
+  plans: RasterImageOpPlan[] | null;
+  /** Largest native image scale on the page; null when any image op is unmeasurable. */
+  nativeScaleHint: number | null;
+}
+
+function scanRasterImageOps(operatorList: { fnArray: number[]; argsArray: unknown[] }): RasterImageOpScan {
   const matrixStack: Mat2D[] = [];
   let currentMatrix: Mat2D = [...IDENTITY_MATRIX];
   let maxScaleHint = 1;
+  const plans: RasterImageOpPlan[] = [];
+  let plansValid = true;
+  let hintValid = true;
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
@@ -4739,6 +4763,23 @@ function estimateRasterNativeScaleHint(operatorList: { fnArray: number[]; argsAr
       continue;
     }
 
+    if (fn === OPS.paintFormXObjectBegin) {
+      matrixStack.push([...currentMatrix]);
+      const transform = readTransform(args);
+      if (transform) {
+        currentMatrix = multiplyMatrices(currentMatrix, transform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.paintFormXObjectEnd) {
+      const restored = matrixStack.pop();
+      if (restored) {
+        currentMatrix = restored;
+      }
+      continue;
+    }
+
     if (fn === OPS.beginAnnotation) {
       matrixStack.push([...currentMatrix]);
       const annotationTransform = readAnnotationTransform(args);
@@ -4760,70 +4801,95 @@ function estimateRasterNativeScaleHint(operatorList: { fnArray: number[]; argsAr
       continue;
     }
 
-    const size = readImageOpIntrinsicSize(fn, args);
-    if (!size) {
-      continue;
-    }
-
     const sx = Math.hypot(currentMatrix[0], currentMatrix[1]);
     const sy = Math.hypot(currentMatrix[2], currentMatrix[3]);
     if (!Number.isFinite(sx) || !Number.isFinite(sy) || sx <= 1e-5 || sy <= 1e-5) {
+      // Degenerate placement paints a zero-area region — nothing visible to capture.
       continue;
     }
 
-    const scaleX = size.width / sx;
-    const scaleY = size.height / sy;
-    if (Number.isFinite(scaleX) && scaleX > maxScaleHint) {
-      maxScaleHint = scaleX;
+    // Solid-color mask paints carry no pixel data, so they don't constrain resolution.
+    if (fn === OPS.paintSolidColorImageMask) {
+      plans.push({ opIndex: i, ctm: [...currentMatrix], nativeScale: null });
+      continue;
     }
-    if (Number.isFinite(scaleY) && scaleY > maxScaleHint) {
-      maxScaleHint = scaleY;
+
+    const size = readImageOpIntrinsicSize(fn, args);
+    if (!size) {
+      plansValid = false;
+      hintValid = false;
+      continue;
+    }
+
+    const nativeScale = Math.max(size.width / sx, size.height / sy);
+    if (!Number.isFinite(nativeScale)) {
+      plansValid = false;
+      hintValid = false;
+      continue;
+    }
+
+    plans.push({ opIndex: i, ctm: [...currentMatrix], nativeScale: Math.max(1, nativeScale) });
+    if (nativeScale > maxScaleHint) {
+      maxScaleHint = nativeScale;
     }
   }
 
-  if (!Number.isFinite(maxScaleHint)) {
-    return 1;
-  }
-  return Math.max(1, maxScaleHint);
+  return {
+    plans: plansValid ? plans : null,
+    nativeScaleHint: hintValid && Number.isFinite(maxScaleHint) ? Math.max(1, maxScaleHint) : null
+  };
 }
 
 function readImageOpIntrinsicSize(fn: number, args: unknown): { width: number; height: number } | null {
-  if (fn === OPS.paintImageXObject || fn === OPS.paintImageXObjectRepeat) {
+  // paintImageXObject args are [objId, width, height].
+  if (fn === OPS.paintImageXObject) {
     const width = readNumber(args, 1, Number.NaN);
     const height = readNumber(args, 2, Number.NaN);
     if (width > 0 && height > 0) {
       return { width, height };
     }
+    return null;
   }
 
-  if (fn === OPS.paintInlineImageXObject) {
+  // Inline images and image masks carry the image object (with width/height) as args[0].
+  if (fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
     const imageObject = readArg(args, 0);
     const width = Number((imageObject as { width?: unknown })?.width);
     const height = Number((imageObject as { height?: unknown })?.height);
     if (width > 0 && height > 0) {
       return { width, height };
     }
+    return null;
   }
 
-  if (fn === OPS.paintImageMaskXObject || fn === OPS.paintImageMaskXObjectRepeat) {
-    const width = readNumber(args, 1, Number.NaN);
-    const height = readNumber(args, 2, Number.NaN);
-    if (width > 0 && height > 0) {
-      return { width, height };
-    }
-  }
-
+  // Repeat/group ops carry placement scales and position maps, not native pixel sizes.
   return null;
 }
 
 function createEmptyRasterLayerResult(): RasterLayerExtractResult {
   return {
-    width: 0,
-    height: 0,
-    data: new Uint8Array(0),
-    matrix: [...IDENTITY_MATRIX],
+    layers: [],
     bounds: null
   };
+}
+
+interface RasterPageLike {
+  rotate: number;
+  view: number[];
+  getViewport: (params: {
+    scale: number;
+    rotation?: number;
+    offsetX?: number;
+    offsetY?: number;
+    dontFlip?: boolean;
+  }) => { transform: unknown; width: number; height: number };
+  render: (params: {
+    canvasContext: CanvasRenderingContext2D;
+    viewport: unknown;
+    intent?: string;
+    background?: string;
+    operationsFilter?: (index: number) => boolean;
+  }) => { promise: Promise<unknown> };
 }
 
 async function extractRasterLayerData(
@@ -4837,19 +4903,7 @@ async function extractRasterLayerData(
     return createEmptyRasterLayerResult();
   }
 
-  const pageLike = page as {
-    rotate: number;
-    view: number[];
-    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; width: number; height: number };
-    render: (params: {
-      canvasContext: CanvasRenderingContext2D;
-      viewport: unknown;
-      intent?: string;
-      background?: string;
-      operationsFilter?: (index: number) => boolean;
-    }) => { promise: Promise<unknown> };
-  };
-
+  const pageLike = page as RasterPageLike;
   if (
     !Array.isArray(pageLike.view) ||
     typeof pageLike.getViewport !== "function" ||
@@ -4858,36 +4912,39 @@ async function extractRasterLayerData(
     return createEmptyRasterLayerResult();
   }
 
-  const baseViewport = pageLike.getViewport({
-    scale: 1,
-    rotation: normalizeRotationDegrees(pageLike.rotate),
-    dontFlip: false
-  });
-  const nativeScaleHint = estimateRasterNativeScaleHint(operatorList);
-  const rasterScale = chooseRasterExtractionScale(
-    Math.max(1, Math.ceil(baseViewport.width)),
-    Math.max(1, Math.ceil(baseViewport.height)),
-    nativeScaleHint
-  );
-  const viewport = rasterScale === 1
-    ? baseViewport
-    : pageLike.getViewport({
-      scale: rasterScale,
-      rotation: normalizeRotationDegrees(pageLike.rotate),
-      dontFlip: false
-    });
+  const rotation = normalizeRotationDegrees(pageLike.rotate);
+  const baseViewport = pageLike.getViewport({ scale: 1, rotation, dontFlip: false });
+  const baseWidth = Math.max(1, Math.ceil(baseViewport.width));
+  const baseHeight = Math.max(1, Math.ceil(baseViewport.height));
+  const scan = scanRasterImageOps(operatorList);
+  const buildViewport = (rasterScale: number): { transform: unknown; width: number; height: number } =>
+    rasterScale === 1 ? baseViewport : pageLike.getViewport({ scale: rasterScale, rotation, dontFlip: false });
 
-  const width = Math.max(1, Math.ceil(viewport.width));
-  const height = Math.max(1, Math.ceil(viewport.height));
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-    return createEmptyRasterLayerResult();
+  // Preferred path: one cropped layer per image op, each at its own native resolution.
+  if (rasterPlan.hasImagePaintOps && scan.plans && scan.plans.length > 0 && scan.plans.length <= RASTER_MAX_IMAGE_LAYERS) {
+    const perImage = await renderPerImageRasterLayers(pageLike, scan.plans, rasterPlan.imageStateMask, pageMatrix, rotation, baseViewport);
+    if (perImage) {
+      return perImage;
+    }
   }
 
   let rgba: Uint8Array | null = null;
   if (rasterPlan.hasImagePaintOps) {
-    rgba = await renderRasterLayerRgba(pageLike, viewport, rasterPlan.imageOnlyMask);
-    if (rgba && hasVisibleAlphaPixels(rgba)) {
-      return finalizeRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+    // Flattened-page fallback: per-image placement unavailable (repeat/group ops,
+    // unreadable sizes) or too many image ops for individual layers. Embedded images
+    // cannot gain detail beyond their native resolution, so the page renders at the
+    // largest native image scale when it is known.
+    const imageScale = chooseRasterExtractionScale(baseWidth, baseHeight, scan.nativeScaleHint ?? RASTER_FALLBACK_TARGET_SCALE);
+    const viewport = buildViewport(imageScale);
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      const imageOnlyMask = rasterPlan.imageOnlyMask;
+      const filter = (index: number): boolean => index >= 0 && index < imageOnlyMask.length && imageOnlyMask[index] === 1;
+      rgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
+      if (rgba && hasVisibleAlphaPixels(rgba)) {
+        return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+      }
     }
   }
 
@@ -4895,12 +4952,101 @@ async function extractRasterLayerData(
     return createEmptyRasterLayerResult();
   }
 
-  rgba = await renderRasterLayerRgba(pageLike, viewport);
+  // The full-page fallback rasterizes vector content too, which sharpens with resolution.
+  const fallbackScale = chooseRasterExtractionScale(
+    baseWidth,
+    baseHeight,
+    Math.max(RASTER_FALLBACK_TARGET_SCALE, scan.nativeScaleHint ?? 1)
+  );
+  const viewport = buildViewport(fallbackScale);
+  const width = Math.max(1, Math.ceil(viewport.width));
+  const height = Math.max(1, Math.ceil(viewport.height));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return createEmptyRasterLayerResult();
+  }
+
+  rgba = await renderRasterLayerRgba(pageLike, viewport, width, height);
   if (!rgba || !hasVisibleAlphaPixels(rgba)) {
     return createEmptyRasterLayerResult();
   }
 
-  return finalizeRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+  return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+}
+
+const UNIT_BOUNDS: Bounds = { minX: 0, minY: 0, maxX: 1, maxY: 1 };
+
+async function renderPerImageRasterLayers(
+  pageLike: RasterPageLike,
+  plans: RasterImageOpPlan[],
+  imageStateMask: Uint8Array,
+  pageMatrix: Mat2D,
+  rotation: number,
+  baseViewport: { transform: unknown; width: number; height: number }
+): Promise<RasterLayerExtractResult | null> {
+  const baseTransform = readTransform(baseViewport.transform);
+  if (!baseTransform) {
+    return null;
+  }
+  const pageDeviceBounds: Bounds = {
+    minX: 0,
+    minY: 0,
+    maxX: Math.max(1, baseViewport.width),
+    maxY: Math.max(1, baseViewport.height)
+  };
+
+  const layers: ExtractedRasterLayer[] = [];
+  let bounds: Bounds | null = null;
+
+  for (const plan of plans) {
+    // Visible placement at scale 1 decides the scale clamp; skip fully off-page images.
+    const placedBase = transformBounds(UNIT_BOUNDS, multiplyMatrices(baseTransform, plan.ctm));
+    const visibleBase = intersectBounds(placedBase, pageDeviceBounds);
+    if (!visibleBase || visibleBase.maxX <= visibleBase.minX || visibleBase.maxY <= visibleBase.minY) {
+      continue;
+    }
+
+    const scale = chooseRasterExtractionScale(
+      Math.max(1, Math.ceil(visibleBase.maxX - visibleBase.minX)),
+      Math.max(1, Math.ceil(visibleBase.maxY - visibleBase.minY)),
+      plan.nativeScale ?? RASTER_FALLBACK_TARGET_SCALE
+    );
+    const scaledViewport = scale === 1 ? baseViewport : pageLike.getViewport({ scale, rotation, dontFlip: false });
+    const scaledTransform = readTransform(scaledViewport.transform);
+    if (!scaledTransform) {
+      return null;
+    }
+
+    const placed = transformBounds(UNIT_BOUNDS, multiplyMatrices(scaledTransform, plan.ctm));
+    const cropMinX = Math.max(0, Math.floor(placed.minX - RASTER_CROP_PADDING_PX));
+    const cropMinY = Math.max(0, Math.floor(placed.minY - RASTER_CROP_PADDING_PX));
+    const cropMaxX = Math.min(Math.ceil(scaledViewport.width), Math.ceil(placed.maxX + RASTER_CROP_PADDING_PX));
+    const cropMaxY = Math.min(Math.ceil(scaledViewport.height), Math.ceil(placed.maxY + RASTER_CROP_PADDING_PX));
+    const width = cropMaxX - cropMinX;
+    const height = cropMaxY - cropMinY;
+    if (width <= 0 || height <= 0) {
+      continue;
+    }
+
+    // Shift the viewport so the crop starts at the canvas origin.
+    const renderViewport = pageLike.getViewport({ scale, rotation, offsetX: -cropMinX, offsetY: -cropMinY, dontFlip: false });
+    const opIndex = plan.opIndex;
+    const filter = (index: number): boolean =>
+      index === opIndex || (index >= 0 && index < imageStateMask.length && imageStateMask[index] === 1);
+    const rgba = await renderRasterLayerRgba(pageLike, renderViewport, width, height, filter);
+    if (!rgba || !hasVisibleAlphaPixels(rgba)) {
+      // Fully clipped away or transparent — nothing worth storing.
+      continue;
+    }
+
+    const matrix = buildRasterLayerMatrix(width, height, cropMinX, cropMinY, scaledTransform, pageMatrix);
+    layers.push({ width, height, data: rgba, matrix });
+    bounds = combineBounds(bounds, transformBounds(UNIT_BOUNDS, matrix));
+  }
+
+  if (layers.length === 0) {
+    return null;
+  }
+  return { layers, bounds };
 }
 
 async function getNodeCanvasModule():
@@ -4987,21 +5133,15 @@ async function createRasterRenderSurface(width: number, height: number): Promise
 }
 
 async function renderRasterLayerRgba(
-  pageLike: {
-    render: (params: {
-      canvasContext: CanvasRenderingContext2D;
-      viewport: unknown;
-      intent?: string;
-      background?: string;
-      operationsFilter?: (index: number) => boolean;
-    }) => { promise: Promise<unknown> };
-  },
+  pageLike: Pick<RasterPageLike, "render">,
   viewport: unknown,
-  operationMask?: Uint8Array
+  width: number,
+  height: number,
+  operationsFilter?: (index: number) => boolean
 ): Promise<Uint8Array | null> {
-  const viewportLike = viewport as { width?: unknown; height?: unknown };
-  const width = Math.max(1, Math.ceil(Number(viewportLike.width) || 1));
-  const height = Math.max(1, Math.ceil(Number(viewportLike.height) || 1));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
   const surface = await createRasterRenderSurface(width, height);
   if (!surface) {
     return null;
@@ -5022,8 +5162,8 @@ async function renderRasterLayerRgba(
       // Keep a transparent background so we only capture rasterized PDF content.
       background: "rgba(0,0,0,0)"
     };
-    if (operationMask) {
-      params.operationsFilter = (index: number): boolean => index >= 0 && index < operationMask.length && operationMask[index] === 1;
+    if (operationsFilter) {
+      params.operationsFilter = operationsFilter;
     }
     await pageLike.render(params).promise;
   } catch {
@@ -5046,7 +5186,25 @@ function hasVisibleAlphaPixels(rgba: Uint8Array): boolean {
   return false;
 }
 
-function finalizeRasterLayerResult(
+/**
+ * Matrix mapping the layer's unit square to world space, where the layer canvas covers
+ * the device-space rect [offsetX, offsetX + width] x [offsetY, offsetY + height] of the
+ * given viewport transform.
+ */
+function buildRasterLayerMatrix(
+  width: number,
+  height: number,
+  offsetX: number,
+  offsetY: number,
+  viewportTransform: Mat2D,
+  pageMatrix: Mat2D
+): Mat2D {
+  const inverseTransform = invertMatrix(viewportTransform) ?? [...IDENTITY_MATRIX];
+  const unitToDevice: Mat2D = [width, 0, 0, height, offsetX, offsetY];
+  return multiplyMatrices(pageMatrix, multiplyMatrices(inverseTransform, unitToDevice));
+}
+
+function finalizeSingleRasterLayerResult(
   width: number,
   height: number,
   rgba: Uint8Array,
@@ -5054,24 +5212,11 @@ function finalizeRasterLayerResult(
   pageMatrix: Mat2D
 ): RasterLayerExtractResult {
   const transform = readTransform((viewport as { transform?: unknown }).transform) ?? [...IDENTITY_MATRIX];
-  const inverseTransform = invertMatrix(transform) ?? [...IDENTITY_MATRIX];
-  const unitToCanvas: Mat2D = [width, 0, 0, height, 0, 0];
-  const matrix = multiplyMatrices(pageMatrix, multiplyMatrices(inverseTransform, unitToCanvas));
-  const bounds = transformBounds(
-    {
-      minX: 0,
-      minY: 0,
-      maxX: 1,
-      maxY: 1
-    },
-    matrix
-  );
+  const matrix = buildRasterLayerMatrix(width, height, 0, 0, transform, pageMatrix);
+  const bounds = transformBounds(UNIT_BOUNDS, matrix);
 
   return {
-    width,
-    height,
-    data: rgba,
-    matrix,
+    layers: [{ width, height, data: rgba, matrix }],
     bounds
   };
 }

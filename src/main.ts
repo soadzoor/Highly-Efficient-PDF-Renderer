@@ -599,13 +599,13 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
         {
           key: pdfKey,
           label: "PDF",
-          sizeLabel: `${formatKilobytes(entry.pdfSizeBytes)} kB`,
+          sizeLabel: formatFileSize(entry.pdfSizeBytes),
           title: `Parse ${entry.name} from the original PDF`
         },
         {
           key: zipKey,
           label: "ZIP",
-          sizeLabel: `${formatKilobytes(entry.zipSizeBytes)} kB`,
+          sizeLabel: formatFileSize(entry.zipSizeBytes),
           title: `Load precomputed parsed data for ${entry.name}`
         }
       ]
@@ -1244,7 +1244,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
     triggerBrowserDownload(selectedZip.blob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
+      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatFileSize(selectedZip.byteLength)}, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
     );
     const restoredStatus = previousStatusText || baseStatus;
     statusTextElement.textContent = restoredStatus;
@@ -1279,9 +1279,17 @@ async function downloadSourcePdf(): Promise<boolean> {
   }
 }
 
-function formatKilobytes(sizeBytes: number): string {
+function formatFileSize(sizeBytes: number): string {
   const safeBytes = Math.max(0, Number(sizeBytes) || 0);
-  return (safeBytes / 1024).toFixed(1);
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  let value = safeBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = unitIndex === 0 ? Math.round(value) : Number(value.toFixed(2));
+  return `${rounded} ${units[unitIndex]}`;
 }
 
 function sanitizeDownloadName(label: string): string {
