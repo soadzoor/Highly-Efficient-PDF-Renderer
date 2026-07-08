@@ -169,8 +169,13 @@ Open `three-example.html`, load a PDF, run `Detect Rooms`, and verify:
 
 A second, vector-native pipeline detects rooms directly from PDF stroke segments:
 a small neighbour-attention encoder classifies each segment as room-boundary or
-not, a learned link predictor bridges ink-free gaps (doors), and shapely
-polygonizes the surviving segments into faces scored by perimeter support.
+not, a geometric chain filter drops selected segments whose near-collinear chain
+is shorter than `chain_min_length_tolerances` snap tolerances (walls chain up
+across piecewise strokes; equipment/furniture strokes form short chains that
+would otherwise chord rooms into fragments — tune with
+`evaluate_vector_rooms.py --chain-min-length`, 0 disables), a learned link
+predictor bridges ink-free gaps (doors), and shapely polygonizes the surviving
+segments into faces scored by perimeter support.
 Rasterization only happens inside the scorer, so results are scale invariant —
 `--scale-check` re-runs the whole pipeline at x0.25 / x4 coordinates and the
 metrics must not move.

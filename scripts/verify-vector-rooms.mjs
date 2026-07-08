@@ -273,13 +273,41 @@ async function main() {
       tiledVsDirectMaxAbsDiff: tiledVsDirect
     });
 
-    // 4. Bridge candidates + features + scores.
+    // 4. Boundary selection: threshold + chain filter, replayed on the reference
+    // probabilities so this gate isolates the chain-filter geometry from encoder
+    // tie noise (rounded probs can still flip within 1e-6 of the threshold,
+    // hence Jaccard instead of exact equality).
     const probs = direct.probs;
+    const prep = { ...pipeline.DEFAULT_VECTOR_PREP_CONFIG, ...manifest.prep };
+    const face = { ...pipeline.DEFAULT_VECTOR_FACE_CONFIG, ...manifest.faceExtraction, threshold };
+    if (reference.chainFilter) {
+      face.chainMinLengthTolerances = reference.chainFilter.minLengthTolerances;
+      face.chainAngleToleranceDegrees = reference.chainFilter.angleToleranceDegrees;
+      face.chainJoinToleranceFraction = reference.chainFilter.joinToleranceFraction;
+    }
+    if (reference.selectedBoundary) {
+      const refProbs = Float32Array.from(reference.probs);
+      const mineSelected = pipeline.selectBoundarySegments(segments, refProbs, face, prep, pageBounds);
+      const refSet = new Set(reference.selectedBoundary);
+      let common = 0;
+      for (const i of mineSelected) {
+        if (refSet.has(i)) {
+          common += 1;
+        }
+      }
+      const jaccard = common / Math.max(1, refSet.size + mineSelected.length - common);
+      gate("boundarySelection", jaccard > 0.995, {
+        mine: mineSelected.length,
+        reference: refSet.size,
+        jaccard
+      });
+    }
+
+    // 5. Bridge candidates + features + scores.
     if (reference.bridges) {
-      const prep = { ...pipeline.DEFAULT_VECTOR_PREP_CONFIG, ...manifest.prep };
       const boundaryMask = new Uint8Array(segments.count);
-      for (let i = 0; i < segments.count; i += 1) {
-        boundaryMask[i] = probs[i] >= threshold ? 1 : 0;
+      for (const i of pipeline.selectBoundarySegments(segments, probs, face, prep, pageBounds)) {
+        boundaryMask[i] = 1;
       }
       const candidates = pipeline.buildBridgeCandidates(segments, boundaryMask, prep, pageBounds);
       const keyOf = (a, b) => (a < b ? `${a},${b}` : `${b},${a}`);
@@ -355,7 +383,7 @@ async function main() {
         acceptedDelta
       });
 
-      // 5. Faces end-to-end (with bridges), IoU-matched against Python's shapely faces.
+      // 6. Faces end-to-end (with bridges), IoU-matched against Python's shapely faces.
       const acceptedCoords = [];
       for (let c = 0; c < candidates.segA.length; c += 1) {
         if (scores[c] >= reference.bridges.threshold) {
@@ -367,7 +395,6 @@ async function main() {
           );
         }
       }
-      const face = { ...pipeline.DEFAULT_VECTOR_FACE_CONFIG, ...manifest.faceExtraction, threshold };
       const faces = pipeline.extractRoomFaces(segments, probs, {
         faceConfig: face,
         prepConfig: prep,

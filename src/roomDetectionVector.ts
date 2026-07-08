@@ -20,7 +20,8 @@ import {
   encodePageTiled,
   extractRoomFaces,
   faceShapeFeatures,
-  pooledFaceEmbedding
+  pooledFaceEmbedding,
+  selectBoundarySegments
 } from "./vectorRoomPipeline";
 
 const MANIFEST_PATH = "models/room-detector-vector/manifest.json";
@@ -117,12 +118,14 @@ export async function runVectorRoomDetection(options: RunVectorRoomDetectionOpti
     );
 
     options.onProgress?.({ pageIndex, pageCount, stage: "postprocessing" });
-    const threshold = manifest.thresholds.boundaryProbability;
     let bridgeCoords: Float32Array | null = null;
     if (sessions.bridger && manifest.thresholds.bridgeProbability !== undefined) {
+      // Same thresholded + chain-filtered selection extractRoomFaces uses, so
+      // bridges only sprout from segments that survive the chain filter.
+      const selectedBoundary = selectBoundarySegments(segments, probs, faceConfig, prepConfig, pageRect);
       const boundaryMask = new Uint8Array(segments.count);
-      for (let i = 0; i < segments.count; i += 1) {
-        boundaryMask[i] = probs[i] >= threshold ? 1 : 0;
+      for (const i of selectedBoundary) {
+        boundaryMask[i] = 1;
       }
       const candidates = buildBridgeCandidates(segments, boundaryMask, prepConfig, pageRect);
       const candidateCount = candidates.segA.length;

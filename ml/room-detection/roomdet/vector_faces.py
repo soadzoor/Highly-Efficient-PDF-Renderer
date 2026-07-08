@@ -14,9 +14,90 @@ from typing import Sequence
 
 import numpy as np
 
-from .vector_dataset import VectorPage, VectorPrepConfig, snap_tolerance
+from .vector_dataset import VectorPage, VectorPrepConfig, snap_tolerance, weld_endpoints
 
 FACE_SHAPE_DIM = 6
+
+
+def chain_filter_selected(
+    seg_p0: np.ndarray,
+    seg_p1: np.ndarray,
+    selected: np.ndarray,
+    min_chain_length: float,
+    join_tolerance: float,
+    angle_tolerance_degrees: float = 10.0,
+) -> np.ndarray:
+    """Drop selected segments whose near-collinear chain is shorter than min_chain_length.
+
+    Walls survive as long runs of near-touching, near-collinear strokes (chains are
+    grown across endpoint welds, so a wall drawn as many short pieces still counts
+    its full run length); isolated short strokes (equipment, furniture, text) form
+    short chains and are removed before polygonization so they cannot chord a room
+    into fragments. Corners do not chain: an L stays two independently-measured runs.
+    """
+    count = len(selected)
+    if count == 0 or min_chain_length <= 0:
+        return selected
+    p0 = seg_p0[selected].astype(np.float64)
+    p1 = seg_p1[selected].astype(np.float64)
+    delta = p1 - p0
+    # sqrt(dx^2 + dy^2) instead of np.hypot for bit-parity with the TS runtime
+    # (same convention as build_segment_features).
+    lengths = np.sqrt(delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1])
+    safe_length = np.maximum(lengths, 1e-12)
+    ux = delta[:, 0] / safe_length
+    uy = delta[:, 1] / safe_length
+
+    parent = np.arange(count, dtype=np.int64)
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = int(parent[index])
+        return index
+
+    min_dot = math.cos(math.radians(angle_tolerance_degrees))
+    node_ids = weld_endpoints(np.concatenate([p0, p1], axis=0), max(join_tolerance, 1e-9))
+    buckets: dict[int, list[int]] = {}
+    for point_index, node in enumerate(node_ids):
+        buckets.setdefault(int(node), []).append(point_index % count)
+    for members in buckets.values():
+        unique = list(dict.fromkeys(members))
+        for i in range(len(unique)):
+            for j in range(i + 1, len(unique)):
+                a = unique[i]
+                b = unique[j]
+                if abs(ux[a] * ux[b] + uy[a] * uy[b]) >= min_dot:
+                    root_a = find(a)
+                    root_b = find(b)
+                    if root_a != root_b:
+                        parent[root_b] = root_a
+
+    roots = np.fromiter((find(index) for index in range(count)), dtype=np.int64, count=count)
+    chain_length = np.zeros(count, dtype=np.float64)
+    np.add.at(chain_length, roots, lengths)
+    return selected[chain_length[roots] >= min_chain_length]
+
+
+def select_boundary_segments(
+    seg_p0: np.ndarray,
+    seg_p1: np.ndarray,
+    probabilities: np.ndarray,
+    tolerance: float,
+    config: FaceConfig,
+) -> np.ndarray:
+    """Threshold + chain-filter: the boundary selection every downstream stage uses."""
+    selected = np.nonzero(probabilities >= config.threshold)[0].astype(np.int64)
+    if config.chain_min_length_tolerances > 0 and len(selected):
+        selected = chain_filter_selected(
+            seg_p0,
+            seg_p1,
+            selected,
+            min_chain_length=config.chain_min_length_tolerances * tolerance,
+            join_tolerance=config.chain_join_tolerance_fraction * tolerance,
+            angle_tolerance_degrees=config.chain_angle_tolerance_degrees,
+        )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -31,6 +112,13 @@ class FaceConfig:
     min_mean_width_tolerance_factor: float = 1.0
     simplify_fraction: float = 0.5  # of snap tolerance
     max_perimeter_samples: int = 256
+    # Boundary segments must belong to a near-collinear chain at least this many
+    # snap tolerances long (walls chain up across piecewise strokes; equipment and
+    # furniture form short chains that would otherwise chord rooms into fragments).
+    # 0 disables the filter.
+    chain_min_length_tolerances: float = 8.0
+    chain_angle_tolerance_degrees: float = 10.0
+    chain_join_tolerance_fraction: float = 0.5  # of snap tolerance
 
 
 @dataclass
@@ -165,7 +253,7 @@ def extract_rooms(
     tolerance = snap_tolerance(page, prep_config)
     weld_tolerance = tolerance * face_config.weld_tolerance_fraction
 
-    selected = np.nonzero(probabilities >= face_config.threshold)[0].astype(np.int64)
+    selected = select_boundary_segments(page.seg_p0, page.seg_p1, probabilities, tolerance, face_config)
     if len(selected) == 0:
         return []
     faces = polygonize_boundary_segments(page.seg_p0, page.seg_p1, selected, weld_tolerance, bridge_coords)

@@ -28,7 +28,8 @@ from roomdet.vector_dataset import (
     build_page_inputs,
     load_split_pages,
 )
-from roomdet.vector_faces import FaceConfig, extract_rooms, face_shape_features, pooled_face_embedding
+from roomdet.vector_dataset import snap_tolerance
+from roomdet.vector_faces import FaceConfig, extract_rooms, face_shape_features, pooled_face_embedding, select_boundary_segments
 from roomdet.vector_metrics import (
     aggregate_page_metrics,
     evaluate_rooms_on_page,
@@ -46,11 +47,25 @@ def main() -> None:
     parser.add_argument("--split", default="val")
     parser.add_argument("--threshold", type=float, default=None, help="boundary threshold; default from checkpoint")
     parser.add_argument("--bridger", type=Path, default=None, help="optional runs/vector-bridge/best.pt")
+    parser.add_argument("--bridge-threshold", type=float, default=None, help="bridge acceptance threshold; default from bridger checkpoint")
     parser.add_argument("--type-head", type=Path, default=None, help="optional runs/vector-type/best.pt")
     parser.add_argument("--taxonomy", choices=("geometry", "clinical-coarse"), default="geometry")
     parser.add_argument("--image-size", type=int, default=1536)
     parser.add_argument("--separator-width", type=int, default=3)
     parser.add_argument("--min-coverage", type=float, default=FaceConfig.min_perimeter_coverage)
+    parser.add_argument(
+        "--chain-min-length",
+        type=float,
+        default=FaceConfig.chain_min_length_tolerances,
+        help="drop boundary segments whose collinear chain is shorter than this many snap tolerances (0 = off)",
+    )
+    parser.add_argument("--chain-angle", type=float, default=FaceConfig.chain_angle_tolerance_degrees, help="max per-joint angle (degrees) for chaining")
+    parser.add_argument(
+        "--chain-join-fraction",
+        type=float,
+        default=FaceConfig.chain_join_tolerance_fraction,
+        help="endpoint weld tolerance for chaining, as a fraction of snap tolerance",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--infer-chunk", type=int, default=16_384)
     parser.add_argument("--scale-check", action="store_true")
@@ -67,7 +82,13 @@ def main() -> None:
     encoder, encoder_payload = load_encoder_checkpoint(args.checkpoint)
     encoder = encoder.to(device)
     threshold = args.threshold if args.threshold is not None else float(encoder_payload.get("threshold", 0.5))
-    face_config = FaceConfig(threshold=threshold, min_perimeter_coverage=args.min_coverage)
+    face_config = FaceConfig(
+        threshold=threshold,
+        min_perimeter_coverage=args.min_coverage,
+        chain_min_length_tolerances=args.chain_min_length,
+        chain_angle_tolerance_degrees=args.chain_angle,
+        chain_join_tolerance_fraction=args.chain_join_fraction,
+    )
     prep_config = VectorPrepConfig()
 
     bridger = bridger_threshold = None
@@ -76,7 +97,7 @@ def main() -> None:
         bridger = BridgeScorer(payload["embedding_dim"], pair_dim=payload["pair_dim"]).to(device)
         bridger.load_state_dict(payload["model"])
         bridger.eval()
-        bridger_threshold = float(payload.get("threshold", 0.5))
+        bridger_threshold = args.bridge_threshold if args.bridge_threshold is not None else float(payload.get("threshold", 0.5))
 
     type_head = type_class_ids = None
     if args.type_head is not None:
@@ -97,6 +118,8 @@ def main() -> None:
                 "threshold": round(threshold, 3),
                 "taxonomy": args.taxonomy,
                 "bridger": str(args.bridger) if args.bridger else None,
+                "bridgeThreshold": round(bridger_threshold, 3) if bridger_threshold is not None else None,
+                "chainMinLength": args.chain_min_length,
                 "typeHead": str(args.type_head) if args.type_head else None,
                 "scaleCheck": args.scale_check,
             }
@@ -159,7 +182,13 @@ def main() -> None:
     base_metrics = run(1.0)
     print(json.dumps({"event": "vector_eval_metrics", "split": args.split, **base_metrics}), flush=True)
 
-    results: dict[str, object] = {"split": args.split, "threshold": threshold, "metrics": base_metrics}
+    results: dict[str, object] = {
+        "split": args.split,
+        "threshold": threshold,
+        "bridgeThreshold": bridger_threshold,
+        "chainMinLength": args.chain_min_length,
+        "metrics": base_metrics,
+    }
     if args.scale_check:
         deltas = {}
         for factor in (0.25, 4.0):
@@ -189,9 +218,14 @@ def detect_page(page, encoder, device, threshold, face_config, prep_config, brid
     )
     probs = torch.sigmoid(logits).numpy()
 
+    tolerance = snap_tolerance(page, prep_config)
+    selected = select_boundary_segments(page.seg_p0, page.seg_p1, probs, tolerance, face_config)
+    boundary_mask = np.zeros(len(probs), dtype=bool)
+    boundary_mask[selected] = True
+
     bridge_coords = None
     if bridger is not None:
-        seg_a, seg_b, coords, _ = build_bridge_candidates(page, probs >= threshold, prep_config)
+        seg_a, seg_b, coords, _ = build_bridge_candidates(page, boundary_mask, prep_config)
         if len(seg_a):
             normalizers = PageNormalizers.for_page(page)
             pair = build_bridge_features(page.seg_p0, page.seg_p1, page.half_width, seg_a, seg_b, coords, normalizers)

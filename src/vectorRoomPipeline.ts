@@ -13,6 +13,8 @@
 //                               the attention memory bounded, outputs stay exact)
 //   buildBridgeCandidates      (build_bridge_candidates)
 //   buildBridgeFeatures        (build_bridge_features)
+//   selectBoundarySegments     (select_boundary_segments: threshold + chain filter)
+//   chainFilterSelected        (chain_filter_selected)
 //   extractRoomFaces           (extract_rooms: snap-round noding + planar faces +
 //                               perimeter-support scoring instead of shapely)
 //   faceShapeFeatures          (face_shape_features)
@@ -82,6 +84,9 @@ export interface VectorFaceConfig {
   minMeanWidthToleranceFactor: number;
   simplifyFraction: number;
   maxPerimeterSamples: number;
+  chainMinLengthTolerances: number;
+  chainAngleToleranceDegrees: number;
+  chainJoinToleranceFraction: number;
 }
 
 export const DEFAULT_VECTOR_PREP_CONFIG: VectorPrepConfig = {
@@ -101,7 +106,10 @@ export const DEFAULT_VECTOR_FACE_CONFIG: VectorFaceConfig = {
   minPerimeterCoverage: 0.55,
   minMeanWidthToleranceFactor: 1,
   simplifyFraction: 0.5,
-  maxPerimeterSamples: 256
+  maxPerimeterSamples: 256,
+  chainMinLengthTolerances: 8,
+  chainAngleToleranceDegrees: 10,
+  chainJoinToleranceFraction: 0.5
 };
 
 export interface VectorPageNormalizers {
@@ -997,6 +1005,148 @@ export function buildBridgeFeatures(
 }
 
 // ---------------------------------------------------------------------------
+// Boundary selection (select_boundary_segments / chain_filter_selected)
+// ---------------------------------------------------------------------------
+
+// numpy's np.round is half-to-even; Math.round is half-up. Weld node ids must
+// agree with weld_endpoints bit for bit or chains split differently at ties.
+function roundHalfToEven(value: number): number {
+  const floor = Math.floor(value);
+  const diff = value - floor;
+  if (diff > 0.5) {
+    return floor + 1;
+  }
+  if (diff < 0.5) {
+    return floor;
+  }
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+// Drop selected segments whose near-collinear chain is shorter than
+// minChainLength. Mirrors chain_filter_selected: chains grow across welded
+// endpoints through an angle gate, so a wall drawn as many short pieces keeps
+// its full run length while equipment/furniture strokes form short chains and
+// are removed before they can chord a room into fragments. Corners do not
+// chain: an L stays two independently-measured runs.
+export function chainFilterSelected(
+  segments: VectorPageSegments,
+  selected: number[],
+  minChainLength: number,
+  joinTolerance: number,
+  angleToleranceDegrees: number
+): number[] {
+  const count = selected.length;
+  if (count === 0 || minChainLength <= 0) {
+    return selected;
+  }
+  const lengths = new Float64Array(count);
+  const ux = new Float64Array(count);
+  const uy = new Float64Array(count);
+  for (let j = 0; j < count; j += 1) {
+    const i = selected[j];
+    const dx = segments.p1x[i] - segments.p0x[i];
+    const dy = segments.p1y[i] - segments.p0y[i];
+    // sqrt(dx^2 + dy^2) for bit-parity with the Python side (not Math.hypot).
+    const length = Math.sqrt(dx * dx + dy * dy);
+    lengths[j] = length;
+    const safeLength = Math.max(length, 1e-12);
+    ux[j] = dx / safeLength;
+    uy[j] = dy / safeLength;
+  }
+
+  const parent = new Int32Array(count);
+  for (let j = 0; j < count; j += 1) {
+    parent[j] = j;
+  }
+  const find = (index: number): number => {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+    return index;
+  };
+
+  const minDot = Math.cos((angleToleranceDegrees * Math.PI) / 180);
+  const tol = Math.max(joinTolerance, 1e-9);
+  // Insertion order matches Python's enumerate over concat(p0, p1): all first
+  // endpoints, then all second endpoints.
+  const buckets = new Map<string, number[]>();
+  for (let p = 0; p < count * 2; p += 1) {
+    const j = p % count;
+    const i = selected[j];
+    const x = p < count ? segments.p0x[i] : segments.p1x[i];
+    const y = p < count ? segments.p0y[i] : segments.p1y[i];
+    const key = `${roundHalfToEven(x / tol)},${roundHalfToEven(y / tol)}`;
+    const bucket = buckets.get(key);
+    if (bucket) {
+      bucket.push(j);
+    } else {
+      buckets.set(key, [j]);
+    }
+  }
+  for (const members of buckets.values()) {
+    const unique = Array.from(new Set(members));
+    for (let a = 0; a < unique.length; a += 1) {
+      for (let b = a + 1; b < unique.length; b += 1) {
+        const ja = unique[a];
+        const jb = unique[b];
+        if (Math.abs(ux[ja] * ux[jb] + uy[ja] * uy[jb]) >= minDot) {
+          const rootA = find(ja);
+          const rootB = find(jb);
+          if (rootA !== rootB) {
+            parent[rootB] = rootA;
+          }
+        }
+      }
+    }
+  }
+
+  const roots = new Int32Array(count);
+  for (let j = 0; j < count; j += 1) {
+    roots[j] = find(j);
+  }
+  const chainLength = new Float64Array(count);
+  for (let j = 0; j < count; j += 1) {
+    chainLength[roots[j]] += lengths[j];
+  }
+  const kept: number[] = [];
+  for (let j = 0; j < count; j += 1) {
+    if (chainLength[roots[j]] >= minChainLength) {
+      kept.push(selected[j]);
+    }
+  }
+  return kept;
+}
+
+// Threshold + chain filter: the boundary selection every downstream stage uses
+// (select_boundary_segments).
+export function selectBoundarySegments(
+  segments: VectorPageSegments,
+  probabilities: Float32Array,
+  faceConfig: VectorFaceConfig,
+  prepConfig: VectorPrepConfig,
+  pageBounds: VectorBoundsLike
+): number[] {
+  const tolerance = computeSnapTolerance(segments, prepConfig, pageBounds);
+  let selected: number[] = [];
+  for (let i = 0; i < segments.count; i += 1) {
+    if (probabilities[i] >= faceConfig.threshold) {
+      selected.push(i);
+    }
+  }
+  if (faceConfig.chainMinLengthTolerances > 0 && selected.length > 0) {
+    selected = chainFilterSelected(
+      segments,
+      selected,
+      faceConfig.chainMinLengthTolerances * tolerance,
+      faceConfig.chainJoinToleranceFraction * tolerance,
+      faceConfig.chainAngleToleranceDegrees
+    );
+  }
+  return selected;
+}
+
+// ---------------------------------------------------------------------------
 // Polygonization: snap-round noding + planar faces (vector_faces.py sans shapely)
 // ---------------------------------------------------------------------------
 
@@ -1016,12 +1166,7 @@ export function extractRoomFaces(
   const tolerance = computeSnapTolerance(segments, prepConfig, pageBounds);
   const weldTolerance = tolerance * faceConfig.weldToleranceFraction;
 
-  const selected: number[] = [];
-  for (let i = 0; i < segments.count; i += 1) {
-    if (probabilities[i] >= faceConfig.threshold) {
-      selected.push(i);
-    }
-  }
+  const selected = selectBoundarySegments(segments, probabilities, faceConfig, prepConfig, pageBounds);
   if (selected.length === 0) {
     return [];
   }

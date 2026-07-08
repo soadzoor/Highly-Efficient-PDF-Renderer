@@ -62,11 +62,18 @@ def main() -> None:
     parser.add_argument("--log-seconds", type=float, default=10.0)
     parser.add_argument("--snap-page-fraction", type=float, default=VectorPrepConfig.snap_tolerance_page_fraction)
     parser.add_argument("--angle-tolerance", type=float, default=VectorPrepConfig.angle_tolerance_degrees)
+    parser.add_argument(
+        "--boundary-positive-fraction",
+        type=float,
+        default=VectorPrepConfig.boundary_positive_fraction,
+        help="min fraction of a segment's length on the snapped GT boundary to label it positive",
+    )
     args = parser.parse_args()
 
     config = VectorPrepConfig(
         snap_tolerance_page_fraction=args.snap_page_fraction,
         angle_tolerance_degrees=args.angle_tolerance,
+        boundary_positive_fraction=args.boundary_positive_fraction,
     )
     labeled_folders = [name for name in args.labeled_folders.split(",") if name]
     negative_folders = [name for name in args.negative_folders.split(",") if name]

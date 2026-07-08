@@ -100,7 +100,7 @@
     "dropout": 0.1
   },
   "thresholds": {
-    "boundaryProbability": 0.65,
+    "boundaryProbability": 0.55,
     "bridgeProbability": 0.15
   },
   "prep": {
@@ -116,14 +116,17 @@
     "bridgePositiveSupport": 0.8
   },
   "faceExtraction": {
-    "threshold": 0.65,
+    "threshold": 0.55,
     "weldToleranceFraction": 0.25,
     "minAreaFraction": 5e-05,
     "maxAreaFraction": 0.35,
     "minPerimeterCoverage": 0.55,
     "minMeanWidthToleranceFactor": 1.0,
     "simplifyFraction": 0.5,
-    "maxPerimeterSamples": 256
+    "maxPerimeterSamples": 256,
+    "chainMinLengthTolerances": 8.0,
+    "chainAngleToleranceDegrees": 10.0,
+    "chainJoinToleranceFraction": 0.5
   },
   "featureSpec": {
     "segment": [
@@ -270,6 +273,20 @@
   ],
   "license": "Model trained from local PDF-TSV roomType geometry annotations.",
   "metrics": {
-    "status": "exported; run evaluate_vector_rooms.py --output to populate metrics"
+    "split": "val",
+    "threshold": 0.55,
+    "bridgeThreshold": 0.15,
+    "chainMinLength": 8.0,
+    "metrics": {
+      "pdfTsvMatchedRoomMeanIou": 0.4536723496703663,
+      "pdfTsvMatchedRoomRecallAt50": 0.4954954954954955,
+      "pdfTsvMatchedRoomTypeAccuracyAt50": 0.09696969696969697,
+      "pdfTsvMatchedRoomTargets": 333,
+      "pdfTsvRoomInteriorIou": 0.49459721711933224,
+      "predictedRooms": 446,
+      "pages": 7,
+      "predictedRoomsOnNegativePages": 0,
+      "scale": 1.0
+    }
   }
 }

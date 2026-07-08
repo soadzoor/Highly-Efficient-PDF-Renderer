@@ -31,7 +31,7 @@ from roomdet.vector_dataset import (
     load_segment_dump,
     snap_tolerance,
 )
-from roomdet.vector_faces import FaceConfig, extract_rooms, face_shape_features, pooled_face_embedding
+from roomdet.vector_faces import FaceConfig, extract_rooms, face_shape_features, pooled_face_embedding, select_boundary_segments
 from roomdet.vector_model import BridgeScorer, FaceTypeHead, encode_page_chunked, load_encoder_checkpoint
 
 
@@ -67,13 +67,24 @@ def main() -> None:
     probs = torch.sigmoid(logits).numpy()
     normalizers = PageNormalizers.for_page(page)
 
+    tolerance = float(snap_tolerance(page, prep_config))
+    selected = select_boundary_segments(page.seg_p0, page.seg_p1, probs, tolerance, face_config)
+    boundary_mask = np.zeros(len(probs), dtype=bool)
+    boundary_mask[selected] = True
+
     reference: dict[str, object] = {
         "dump": str(args.dump),
         "stem": page.stem,
         "pageBounds": list(page.page_bounds),
         "segmentCount": page.segment_count,
         "threshold": threshold,
-        "snapTolerance": float(snap_tolerance(page, prep_config)),
+        "snapTolerance": tolerance,
+        "chainFilter": {
+            "minLengthTolerances": face_config.chain_min_length_tolerances,
+            "angleToleranceDegrees": face_config.chain_angle_tolerance_degrees,
+            "joinToleranceFraction": face_config.chain_join_tolerance_fraction,
+        },
+        "selectedBoundary": selected.astype(int).tolist(),
         "normalizers": {
             "centerX": normalizers.center[0],
             "centerY": normalizers.center[1],
@@ -102,7 +113,7 @@ def main() -> None:
         bridger.load_state_dict(payload["model"])
         bridger.eval()
         bridger_threshold = float(payload.get("threshold", 0.5))
-        seg_a, seg_b, coords, radius = build_bridge_candidates(page, probs >= threshold, prep_config)
+        seg_a, seg_b, coords, radius = build_bridge_candidates(page, boundary_mask, prep_config)
         pair = build_bridge_features(page.seg_p0, page.seg_p1, page.half_width, seg_a, seg_b, coords, normalizers)
         scores = np.zeros(0, dtype=np.float32)
         if len(seg_a):

@@ -58,7 +58,9 @@ def test_bridge_closes_door_gap() -> None:
     ]
     page = make_page(segments)
     probs = np.ones(page.segment_count, dtype=np.float32)
-    config = FaceConfig(min_perimeter_coverage=0.5)
+    # The 15-unit door stubs are shorter than the default chain gate; chaining
+    # has its own tests below, this one exercises bridging.
+    config = FaceConfig(min_perimeter_coverage=0.5, chain_min_length_tolerances=0.0)
     assert extract_rooms(page, probs, face_config=config) == []
     bridge = np.asarray([[35.0, 20.0, 45.0, 20.0]], dtype=np.float32)
     faces = extract_rooms(page, probs, face_config=config, bridge_coords=bridge)
@@ -119,3 +121,67 @@ def test_prep_config_defaults_referenced_by_face_config() -> None:
     face = FaceConfig()
     assert 0 < face.weld_tolerance_fraction < 1
     assert 0 < prep.snap_tolerance_page_fraction < 0.01
+
+
+def test_chain_filter_keeps_pieced_walls_and_drops_short_strokes() -> None:
+    from roomdet.vector_faces import chain_filter_selected
+
+    segments = [
+        # wall drawn as four collinear 10-unit pieces (total 40)
+        ((10.0, 10.0), (20.0, 10.0), 0.5),
+        ((20.0, 10.0), (30.0, 10.0), 0.5),
+        ((30.0, 10.0), (40.0, 10.0), 0.5),
+        ((40.0, 10.0), (50.0, 10.0), 0.5),
+        # perpendicular stub at a wall joint: must not chain into the wall run
+        ((30.0, 10.0), (30.0, 13.0), 0.5),
+        # isolated short stroke in the room interior (equipment)
+        ((60.0, 50.0), (63.0, 50.0), 0.5),
+        # gentle arc as near-collinear pieces (5 degrees per joint, total ~30)
+        ((10.0, 80.0), (20.0, 80.0), 0.5),
+        ((20.0, 80.0), (29.96, 80.87), 0.5),
+        ((29.96, 80.87), (39.81, 82.61), 0.5),
+    ]
+    page = make_page(segments)
+    selected = np.arange(page.segment_count, dtype=np.int64)
+    kept = chain_filter_selected(
+        page.seg_p0,
+        page.seg_p1,
+        selected,
+        min_chain_length=20.0,
+        join_tolerance=0.5,
+        angle_tolerance_degrees=10.0,
+    )
+    assert sorted(kept.tolist()) == [0, 1, 2, 3, 6, 7, 8]
+
+
+def test_chain_filter_defragments_room_split_by_short_strokes() -> None:
+    # A single room whose interior is crossed by a zigzag of short strokes
+    # (equipment): without the chain filter the zigzag chords the room into two
+    # faces; with the default filter the room comes back in one piece.
+    segments = [
+        *square_walls(10, 10, 90, 40),
+        ((50.0, 10.0), (54.0, 18.0), 0.5),
+        ((54.0, 18.0), (50.0, 26.0), 0.5),
+        ((50.0, 26.0), (54.0, 34.0), 0.5),
+        ((54.0, 34.0), (50.0, 40.0), 0.5),
+    ]
+    page = make_page(segments)
+    probs = np.ones(page.segment_count, dtype=np.float32)
+    fragmented = extract_rooms(
+        page, probs, face_config=FaceConfig(min_perimeter_coverage=0.5, chain_min_length_tolerances=0.0)
+    )
+    assert len(fragmented) == 2
+    faces = extract_rooms(page, probs, face_config=FaceConfig(min_perimeter_coverage=0.5))
+    assert len(faces) == 1
+    assert faces[0].area == pytest.approx(80 * 30, rel=0.05)
+
+
+def test_chain_filter_disabled_or_empty_is_identity() -> None:
+    from roomdet.vector_faces import chain_filter_selected
+
+    page = make_page(square_walls(20, 20, 60, 60))
+    selected = np.arange(page.segment_count, dtype=np.int64)
+    unchanged = chain_filter_selected(page.seg_p0, page.seg_p1, selected, 0.0, 0.5)
+    assert np.array_equal(unchanged, selected)
+    empty = np.zeros(0, dtype=np.int64)
+    assert len(chain_filter_selected(page.seg_p0, page.seg_p1, empty, 10.0, 0.5)) == 0

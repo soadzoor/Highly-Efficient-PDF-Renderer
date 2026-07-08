@@ -212,6 +212,8 @@ def main() -> None:
     parser.add_argument("--asset-prefix", default="models/room-detector-vector", help="onnxPath prefix as served to the app")
     parser.add_argument("--version", default="vector-rooms-v1")
     parser.add_argument("--metrics", type=Path, default=None, help="optional evaluate_vector_rooms.py --output JSON")
+    parser.add_argument("--boundary-threshold", type=float, default=None, help="override the encoder checkpoint's boundary threshold")
+    parser.add_argument("--bridge-threshold", type=float, default=None, help="override the bridger checkpoint's acceptance threshold")
     args = parser.parse_args()
 
     rng = np.random.default_rng(1337)
@@ -221,7 +223,7 @@ def main() -> None:
     encoder, encoder_payload = load_encoder_checkpoint(args.encoder)
     encoder.eval()
     config = encoder.config
-    boundary_threshold = float(encoder_payload.get("threshold", 0.5))
+    boundary_threshold = args.boundary_threshold if args.boundary_threshold is not None else float(encoder_payload.get("threshold", 0.5))
     encoder_module = EncoderOnnx(encoder)
 
     encoder_path = args.output_dir / "encoder.onnx"
@@ -297,7 +299,9 @@ def main() -> None:
             "outputs": {"bridge_prob": ["candidates"]},
             "checkpoint": str(args.bridger),
         }
-        thresholds["bridgeProbability"] = float(payload.get("threshold", 0.5))
+        thresholds["bridgeProbability"] = (
+            args.bridge_threshold if args.bridge_threshold is not None else float(payload.get("threshold", 0.5))
+        )
 
     if args.type_head is not None:
         payload = torch.load(args.type_head, map_location="cpu", weights_only=False)
