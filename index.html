@@ -4,12 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
-    <script type="module" crossorigin src="./assets/main-CyDW5HLV.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/preload-helper-kNaey6uv.js">
-    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-C_T_cAzw.js">
-    <link rel="modulepreload" crossorigin href="./assets/pdf-BIWo0Ry8.js">
-    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-BJtG5xic.js">
-    <link rel="stylesheet" crossorigin href="./assets/main-FYTNO0A-.css">
+    <script type="module" crossorigin src="./assets/main-CcDA5AtE.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/rolldown-runtime-BHe-jwch.js">
+    <link rel="modulepreload" crossorigin href="./assets/preload-helper-DYl5dUZ5.js">
+    <link rel="modulepreload" crossorigin href="./assets/textSearch-CQi1OYbg.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdf-DdEv3O06.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-C9JL7sdM.js">
+    <link rel="stylesheet" crossorigin href="./assets/main-CQiLrgWB.css">
   </head>
   <body>
     <canvas id="viewport"></canvas>
@@ -34,6 +35,16 @@
         </button>
       </div>
       <div id="hud-content" class="panel-content">
+        <div class="number-row search-row">
+          <label for="text-search-input">Find Text</label>
+          <div class="search-controls">
+            <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
+            <span id="text-search-count" class="search-count" hidden>0/0</span>
+            <button id="text-search-prev" type="button" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
+            <button id="text-search-next" type="button" class="search-nav" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
+            <button id="text-search-case" type="button" class="search-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+          </div>
+        </div>
         <div class="number-row">
           <label for="backend-select">Renderer Backend</label>
           <select id="backend-select">

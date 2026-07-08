@@ -1,0 +1,275 @@
+{
+  "version": "vector-rooms-v1",
+  "kind": "vector-room-detection",
+  "featureVersion": 1,
+  "models": {
+    "encoder": {
+      "onnxPath": "models/room-detector-vector/encoder.onnx",
+      "inputs": {
+        "features": [
+          "segments",
+          21
+        ],
+        "knn_idx": [
+          "segments",
+          12
+        ],
+        "edge": [
+          "segments",
+          12,
+          6
+        ]
+      },
+      "outputs": {
+        "embedding": [
+          "segments",
+          128
+        ],
+        "boundary_prob": [
+          "segments"
+        ]
+      },
+      "knnIndexType": "int32",
+      "checkpoint": "runs/vector-seg/best.pt"
+    },
+    "bridger": {
+      "onnxPath": "models/room-detector-vector/bridger.onnx",
+      "inputs": {
+        "embedding_a": [
+          "candidates",
+          128
+        ],
+        "embedding_b": [
+          "candidates",
+          128
+        ],
+        "pair_features": [
+          "candidates",
+          8
+        ]
+      },
+      "outputs": {
+        "bridge_prob": [
+          "candidates"
+        ]
+      },
+      "checkpoint": "runs/vector-bridge/best.pt"
+    },
+    "typeHead": {
+      "onnxPath": "models/room-detector-vector/type-head.onnx",
+      "inputs": {
+        "pooled_embedding": [
+          "faces",
+          128
+        ],
+        "shape_features": [
+          "faces",
+          6
+        ]
+      },
+      "outputs": {
+        "type_logits": [
+          "faces",
+          12
+        ]
+      },
+      "classIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "checkpoint": "runs/vector-type/best.pt"
+    }
+  },
+  "encoderConfig": {
+    "featureDim": 21,
+    "edgeDim": 6,
+    "width": 128,
+    "layers": 5,
+    "heads": 4,
+    "knn": 12,
+    "dropout": 0.1
+  },
+  "thresholds": {
+    "boundaryProbability": 0.65,
+    "bridgeProbability": 0.15
+  },
+  "prep": {
+    "snapTolerancePageFraction": 0.002,
+    "snapToleranceMinHalfwidths": 4.0,
+    "angleToleranceDegrees": 10.0,
+    "boundaryPositiveFraction": 0.5,
+    "boundarySamplesMax": 9,
+    "weldToleranceFraction": 0.25,
+    "bridgeRadiusHalfwidths": 24.0,
+    "bridgeRadiusPageFractionMax": 0.04,
+    "bridgeMinLengthFraction": 0.1,
+    "bridgePositiveSupport": 0.8
+  },
+  "faceExtraction": {
+    "threshold": 0.65,
+    "weldToleranceFraction": 0.25,
+    "minAreaFraction": 5e-05,
+    "maxAreaFraction": 0.35,
+    "minPerimeterCoverage": 0.55,
+    "minMeanWidthToleranceFactor": 1.0,
+    "simplifyFraction": 0.5,
+    "maxPerimeterSamples": 256
+  },
+  "featureSpec": {
+    "segment": [
+      "midXCentered",
+      "midYCentered",
+      "cos2Theta",
+      "sin2Theta",
+      "lengthOverDiag",
+      "log1pLengthOverMedianLength",
+      "lengthRank",
+      "log1pHalfWidthOverMedianHalfWidth",
+      "halfWidthOverMedianHalfWidthClip16",
+      "widthRank",
+      "colorR",
+      "colorG",
+      "colorB",
+      "alpha",
+      "luma",
+      "flagHairline",
+      "flagRoundCap",
+      "flagClipped",
+      "flagFillOutline",
+      "flagQuadratic",
+      "log1pLengthOverStrokeWidth"
+    ],
+    "edge": [
+      "relMidXOverLocalScale",
+      "relMidYOverLocalScale",
+      "distanceOverLocalScale",
+      "log1pDistanceOverLocalScale",
+      "absDirectionDot",
+      "absDirectionCross"
+    ],
+    "bridgePair": [
+      "log1pLengthOver2MedianHalfWidth",
+      "lengthOverDiag",
+      "lengthOver24MedianHalfWidthClip4",
+      "absAlignBridgeSegA",
+      "absAlignBridgeSegB",
+      "absDirectionDotAB",
+      "absDirectionCrossAB",
+      "halfWidthRatioMinOverMax"
+    ],
+    "faceShape": [
+      "sqrtAreaOverDiag",
+      "log1pAreaPercentOfPage",
+      "bboxAspectMinOverMax",
+      "isoperimetricQuotient",
+      "vertexCountOver64Clip1",
+      "perimeterOverDiag"
+    ]
+  },
+  "featureDims": {
+    "segment": 21,
+    "edge": 6,
+    "bridgePair": 8,
+    "faceShape": 6
+  },
+  "classes": [
+    {
+      "id": 0,
+      "label": "background",
+      "color": "#0f172a",
+      "kind": "background"
+    },
+    {
+      "id": 1,
+      "label": "office",
+      "color": "#2563eb",
+      "kind": "room"
+    },
+    {
+      "id": 2,
+      "label": "toilet",
+      "color": "#0891b2",
+      "kind": "room"
+    },
+    {
+      "id": 3,
+      "label": "shower",
+      "color": "#06b6d4",
+      "kind": "room"
+    },
+    {
+      "id": 4,
+      "label": "patient_room",
+      "color": "#16a34a",
+      "kind": "room"
+    },
+    {
+      "id": 5,
+      "label": "exam_treatment",
+      "color": "#d97706",
+      "kind": "room"
+    },
+    {
+      "id": 6,
+      "label": "corridor",
+      "color": "#7c3aed",
+      "kind": "room"
+    },
+    {
+      "id": 7,
+      "label": "storage_supply",
+      "color": "#64748b",
+      "kind": "room"
+    },
+    {
+      "id": 8,
+      "label": "vertical_transport",
+      "color": "#dc2626",
+      "kind": "room"
+    },
+    {
+      "id": 9,
+      "label": "building_services",
+      "color": "#475569",
+      "kind": "room"
+    },
+    {
+      "id": 10,
+      "label": "public_waiting",
+      "color": "#65a30d",
+      "kind": "room"
+    },
+    {
+      "id": 11,
+      "label": "staff_support",
+      "color": "#c026d3",
+      "kind": "room"
+    },
+    {
+      "id": 12,
+      "label": "other",
+      "color": "#0f766e",
+      "kind": "room"
+    },
+    {
+      "id": 13,
+      "label": "separator",
+      "color": "#111827",
+      "kind": "separator"
+    }
+  ],
+  "license": "Model trained from local PDF-TSV roomType geometry annotations.",
+  "metrics": {
+    "status": "exported; run evaluate_vector_rooms.py --output to populate metrics"
+  }
+}

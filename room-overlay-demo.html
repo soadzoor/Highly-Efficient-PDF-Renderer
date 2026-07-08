@@ -81,6 +81,23 @@
         opacity: 0.92;
       }
 
+      .room-label-pill.hide-room-number .room-label-number {
+        display: none;
+      }
+
+      .room-label-pill.hide-room-text span:not(.room-label-number) {
+        display: none;
+      }
+
+      /* With the number hidden, the line after it becomes the pill's first
+         visible line and takes over the primary styling. */
+      .room-label-pill.hide-room-number .room-label-number + span {
+        margin-top: 0;
+        font-size: 11px;
+        font-weight: 700;
+        opacity: 1;
+      }
+
       #panel {
         position: fixed;
         top: 16px;
@@ -197,11 +214,12 @@
         word-break: break-word;
       }
     </style>
-    <script type="module" crossorigin src="./assets/roomOverlay-CfmU0vHC.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/preload-helper-kNaey6uv.js">
-    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-C_T_cAzw.js">
-    <link rel="modulepreload" crossorigin href="./assets/pdf-BIWo0Ry8.js">
-    <link rel="modulepreload" crossorigin href="./assets/src-KDzDjuQW.js">
+    <script type="module" crossorigin src="./assets/roomOverlay-B5Zq55C0.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/rolldown-runtime-BHe-jwch.js">
+    <link rel="modulepreload" crossorigin href="./assets/preload-helper-DYl5dUZ5.js">
+    <link rel="modulepreload" crossorigin href="./assets/textSearch-CQi1OYbg.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdf-DdEv3O06.js">
+    <link rel="modulepreload" crossorigin href="./assets/src-waVcz5we.js">
   </head>
   <body>
     <canvas id="viewport"></canvas>
@@ -218,6 +236,10 @@
         <label class="toggle">
           <input id="show-room-labels" type="checkbox" checked disabled />
           <span>Show labels</span>
+        </label>
+        <label class="toggle">
+          <input id="show-room-numbers" type="checkbox" checked disabled />
+          <span>Room numbers</span>
         </label>
       </div>
       <div id="status" class="status">Load a PDF to begin.</div>

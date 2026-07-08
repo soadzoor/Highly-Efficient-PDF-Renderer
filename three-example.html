@@ -406,6 +406,57 @@
         color: rgba(17, 22, 29, 0.65);
       }
 
+      .search-row {
+        grid-template-columns: max-content 1fr;
+      }
+
+      .search-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .search-controls input[type="search"] {
+        flex: 1;
+        min-width: 0;
+        background: #162030;
+        color: #e8edf5;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 6px 8px;
+      }
+
+      .search-controls input[type="search"]:disabled {
+        opacity: 0.6;
+      }
+
+      .search-count {
+        flex-shrink: 0;
+        min-width: 3.2em;
+        text-align: right;
+        color: rgba(232, 237, 245, 0.66);
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .search-count[hidden] {
+        display: none;
+      }
+
+      .search-controls button {
+        width: 32px;
+        min-width: 32px;
+        padding: 6px 0;
+        font-size: 12px;
+      }
+
+      #text-search-case[aria-pressed="true"] {
+        background: #e8edf5;
+        border-color: #e8edf5;
+        color: #11161d;
+      }
+
       .loader-spinner {
         width: 14px;
         height: 14px;
@@ -424,12 +475,13 @@
         }
       }
     </style>
-    <script type="module" crossorigin src="./assets/three-B_PLHBSS.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/preload-helper-kNaey6uv.js">
-    <link rel="modulepreload" crossorigin href="./assets/parsedDataZip-C_T_cAzw.js">
-    <link rel="modulepreload" crossorigin href="./assets/pdf-BIWo0Ry8.js">
-    <link rel="modulepreload" crossorigin href="./assets/src-KDzDjuQW.js">
-    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-BJtG5xic.js">
+    <script type="module" crossorigin src="./assets/three-D9azw69n.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/rolldown-runtime-BHe-jwch.js">
+    <link rel="modulepreload" crossorigin href="./assets/preload-helper-DYl5dUZ5.js">
+    <link rel="modulepreload" crossorigin href="./assets/textSearch-CQi1OYbg.js">
+    <link rel="modulepreload" crossorigin href="./assets/vectorStrokeLodStatsFormat-C9JL7sdM.js">
+    <link rel="modulepreload" crossorigin href="./assets/pdf-DdEv3O06.js">
+    <link rel="modulepreload" crossorigin href="./assets/src-waVcz5we.js">
   </head>
   <body>
     <div id="app">
@@ -461,6 +513,16 @@
           <input id="touch-rotate-checkbox" type="checkbox" />
           <span>Touch rotate</span>
         </label>
+      </div>
+      <div class="number-row search-row">
+        <label for="text-search-input">Find Text</label>
+        <div class="search-controls">
+          <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
+          <span id="text-search-count" class="search-count" hidden>0/0</span>
+          <button id="text-search-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
+          <button id="text-search-next" type="button" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
+          <button id="text-search-case" type="button" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+        </div>
       </div>
       <div class="number-row">
         <label for="backend-select">Renderer Backend</label>
