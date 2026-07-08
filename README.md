@@ -28,7 +28,8 @@ HEPR was mostly inspired by the PDF GPU-text rendering work shared at <https://w
 - Nanite-inspired Vector LOD for very large vector stroke sets.
 - Multi-page PDF extraction and grid composition.
 - Stroked paths, filled paths, vector text, and embedded raster image layers.
-- Parsed-data ZIP export/import to skip repeated PDF extraction.
+- Browser-style find-in-text: full-document search over the extracted text with GPU-drawn match highlights, exposed through the package API.
+- Parsed-data ZIP export/import to skip repeated PDF extraction, with delta/varint-compressed geometry and a searchable text index (exported ZIPs are typically smaller than the source PDFs).
 - Runtime diagnostics for FPS, draw counts, Vector LOD state, parse/upload timing, texture usage, and culling stats.
 
 ## Nanite-Inspired Vector LOD
@@ -69,6 +70,7 @@ Controls include:
 
 - backend switcher: WebGL / WebGPU
 - Vector LOD mode: Auto / Off / Force
+- find-in-text search (also on `Ctrl`/`Cmd+F`) with next/prev, match counter, and case-sensitivity toggle
 - page background color/opacity
 - vector override color/opacity
 - collapsible diagnostics panel
@@ -81,6 +83,7 @@ Controls include:
 
 - backend switcher: WebGL / WebGPU
 - Vector LOD mode: Auto / Off / Force
+- find-in-text search with next/prev, match counter, case-sensitivity toggle, and camera fly-to
 - optional touch rotation on touch-capable devices
 - page background color/opacity
 - vector override color/opacity
@@ -165,7 +168,67 @@ Useful object APIs:
 - `pdfObject.setVectorColorOverride(...)`
 - `pdfObject.fitToBounds()` for the internal fallback view state
 - `pdfObject.attachControls(renderer.domElement)` for HEPR's fallback 2D controls
+- `pdfObject.hasSearchableText`, `pdfObject.searchText(...)`, `pdfObject.setSearchHighlights(...)` (see below)
 - `pdfObject.dispose()`
+
+### Find in Text
+
+`HeprThreePdfObject` exposes everything needed for a browser-style `Ctrl+F`
+feature. Matching is case-insensitive by default, and whitespace in the query
+matches across line breaks and word gaps, so multi-word phrases work.
+
+```ts
+import type { HeprTextSearchMatch } from "@soadzoor/hepr";
+
+if (pdfObject.hasSearchableText) {
+  // Matches come back in page/reading order.
+  const matches: HeprTextSearchMatch[] = pdfObject.searchText("kitchen 12", {
+    caseSensitive: false, // default
+    maxMatches: 5000 // default
+  });
+
+  // Show browser-find style highlights (semi-transparent fill + solid
+  // outline). They are plain three.js meshes parented to the PDF object, so
+  // they stay in sync with your camera automatically. The match at
+  // `currentIndex` is emphasized.
+  pdfObject.setSearchHighlights(matches, { currentIndex: 0 });
+
+  // Frame your own camera on the current match. `localBounds` is in the PDF
+  // object's local space (the space of the THREE.Group's children);
+  // `bounds` is the same rectangle in PDF scene coordinates.
+  const target = matches[0].localBounds;
+  const centerX = (target.minX + target.maxX) / 2;
+  const centerY = (target.minY + target.maxY) / 2;
+  // ...point your camera/controls at (centerX, centerY) on the PDF plane...
+
+  // Clear highlights when the search UI closes.
+  pdfObject.setSearchHighlights(null);
+}
+```
+
+For next/prev cycling, keep the match array plus a current index in your app
+state and call `setSearchHighlights(matches, { currentIndex })` again — the
+highlights update in place. See `src/three-example.ts` for a complete working
+implementation (input field, match counter, case toggle, and camera fly-to).
+
+Search works on scenes loaded from PDFs and from parsed-data ZIPs (the ZIP
+stores a compact text index alongside the geometry).
+
+For custom pipelines that do not use the three.js wrapper, the same search
+core is available directly:
+
+```ts
+import { createSceneTextSearcher } from "@soadzoor/hepr";
+
+const searcher = createSceneTextSearcher(pdfObject.sceneData);
+const matches = searcher.search("room 101", { maxMatches: 100 });
+// matches[i].bounds is the scene-space rectangle of each hit.
+```
+
+The native renderers (`WebGlFloorplanRenderer` / `WebGpuFloorplanRenderer`)
+also accept `setSearchHighlights({ rects, count, currentIndex })` and draw the
+rectangles as part of every frame with the live camera transform, so
+highlights never lag behind pans or zooms.
 
 Advanced render pipelines can call
 `pdfObject.prepareFrameForThreeRenderer(renderer, camera)` manually before
@@ -237,10 +300,14 @@ The exported ZIP contains parsed scene data:
 
 - `manifest.json`
 - vector texture payloads
+- compact stroke/text geometry sections (chained delta + varint columns over the quantized grids)
+- a searchable text index (per-page text plus a char-to-glyph-instance map for find-in-text)
 - optional raster layers
 - optional embedded source PDF fallback
 
-Parsed ZIPs are designed to skip expensive PDF extraction. The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make ZIPs much larger than the original parsed scene.
+Parsed ZIPs are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported ZIPs are typically smaller than the source PDFs themselves. Only the current format version is supported: ZIPs exported with older versions are rejected at load with a clear error and need to be re-exported.
+
+The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make ZIPs much larger than the original parsed scene.
 
 Open the native demo with `?bulkZip=1` or `?downloadAllZips=1` to reveal the `Download All Example ZIPs` button.
 

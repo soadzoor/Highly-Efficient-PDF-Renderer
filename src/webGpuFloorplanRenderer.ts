@@ -1,5 +1,5 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, SceneStats, SearchHighlightSet, ViewState } from "./webGlFloorplanRenderer";
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
   CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
@@ -966,6 +966,91 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 }
 `;
 
+const HIGHLIGHT_SHADER_SOURCE = /* wgsl */ `
+struct HighlightCamera {
+  viewport : vec2f,
+  cameraCenter : vec2f,
+  zoom : f32,
+  pad0 : f32,
+  pad1 : f32,
+  pad2 : f32,
+};
+
+struct HighlightStyle {
+  fillColor : vec4f,
+  borderColor : vec4f,
+  borderPx : f32,
+  minSizePx : f32,
+  pad0 : f32,
+  pad1 : f32,
+};
+
+@group(0) @binding(0) var<uniform> uCamera : HighlightCamera;
+@group(0) @binding(1) var<uniform> uStyle : HighlightStyle;
+@group(0) @binding(2) var<storage, read> uRects : array<vec4f>;
+
+struct VsOut {
+  @builtin(position) position : vec4f,
+  @location(0) localPx : vec2f,
+  @location(1) halfSizePx : vec2f,
+};
+
+fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
+  switch (vertexIndex) {
+    case 0u: {
+      return vec2f(-1.0, -1.0);
+    }
+    case 1u: {
+      return vec2f(1.0, -1.0);
+    }
+    case 2u: {
+      return vec2f(-1.0, 1.0);
+    }
+    default: {
+      return vec2f(1.0, 1.0);
+    }
+  }
+}
+
+@vertex
+fn vsMain(
+  @builtin(vertex_index) vertexIndex : u32,
+  @builtin(instance_index) instanceIndex : u32
+) -> VsOut {
+  let rect = uRects[instanceIndex];
+  let corner = cornerFromVertexIndex(vertexIndex);
+  let center = (rect.xy + rect.zw) * 0.5;
+  let halfSize = (rect.zw - rect.xy) * 0.5;
+  let halfSizePx = max(halfSize * uCamera.zoom, vec2f(0.5 * uStyle.minSizePx));
+  let expandedHalfPx = halfSizePx + vec2f(uStyle.borderPx);
+  let world = center + corner * (expandedHalfPx / uCamera.zoom);
+  let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
+  let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
+
+  var out : VsOut;
+  out.position = vec4f(clip, 0.0, 1.0);
+  out.localPx = corner * expandedHalfPx;
+  out.halfSizePx = halfSizePx;
+  return out;
+}
+
+@fragment
+fn fsMain(inData : VsOut) -> @location(0) vec4f {
+  let distanceToEdgePx = inData.halfSizePx - abs(inData.localPx);
+  let insideRect = all(distanceToEdgePx >= vec2f(0.0));
+  return select(uStyle.borderColor, uStyle.fillColor, insideRect);
+}
+`;
+
+const HIGHLIGHT_CAMERA_BUFFER_BYTES = 32;
+const HIGHLIGHT_STYLE_BUFFER_BYTES = 48;
+/** Browser-find style: semi-transparent fill with a solid outline ring. */
+const HIGHLIGHT_STYLES: ReadonlyArray<{ fillColor: readonly number[]; borderColor: readonly number[]; borderPx: number }> = [
+  { fillColor: [1, 0.921, 0.231, 0.35], borderColor: [0.792, 0.541, 0.016, 1], borderPx: 1 },
+  { fillColor: [1, 0.596, 0, 0.45], borderColor: [0.918, 0.345, 0.047, 1], borderPx: 2 }
+];
+const HIGHLIGHT_MIN_SIZE_PX = 2;
+
 const BLIT_SHADER_SOURCE = /* wgsl */ `
 struct BlitUniforms {
   viewportPx : vec2f,
@@ -1090,7 +1175,29 @@ export class WebGpuFloorplanRenderer {
 
   private readonly vectorCompositePipeline: any;
 
+  private readonly highlightPipeline: any;
+
   private readonly cameraUniformBuffer: any;
+
+  private readonly highlightCameraBuffer: any;
+
+  private readonly highlightStyleBuffers: any[];
+
+  private readonly highlightBindGroupLayout: any;
+
+  private highlightOthersRectsBuffer: any = null;
+
+  private highlightOthersCapacityBytes = 0;
+
+  private highlightCurrentRectBuffer: any = null;
+
+  private highlightOthersBindGroups: any[] = [];
+
+  private highlightCurrentBindGroups: any[] = [];
+
+  private highlightOthersCount = 0;
+
+  private highlightHasCurrent = false;
 
   private readonly blitUniformBuffer: any;
 
@@ -1356,6 +1463,30 @@ export class WebGpuFloorplanRenderer {
       usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
     });
 
+    this.highlightCameraBuffer = this.gpuDevice.createBuffer({
+      size: HIGHLIGHT_CAMERA_BUFFER_BYTES,
+      usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
+    });
+    this.highlightStyleBuffers = HIGHLIGHT_STYLES.map((style) => {
+      const buffer = this.gpuDevice.createBuffer({
+        size: HIGHLIGHT_STYLE_BUFFER_BYTES,
+        usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
+      });
+      const data = new Float32Array(12);
+      data[0] = style.fillColor[0];
+      data[1] = style.fillColor[1];
+      data[2] = style.fillColor[2];
+      data[3] = style.fillColor[3];
+      data[4] = style.borderColor[0];
+      data[5] = style.borderColor[1];
+      data[6] = style.borderColor[2];
+      data[7] = style.borderColor[3];
+      data[8] = style.borderPx;
+      data[9] = HIGHLIGHT_MIN_SIZE_PX;
+      this.gpuDevice.queue.writeBuffer(buffer, 0, data);
+      return buffer;
+    });
+
     this.strokeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
       entries: [
         {
@@ -1551,6 +1682,26 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
+    this.highlightBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "uniform", minBindingSize: HIGHLIGHT_CAMERA_BUFFER_BYTES }
+        },
+        {
+          binding: 1,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          buffer: { type: "uniform", minBindingSize: HIGHLIGHT_STYLE_BUFFER_BYTES }
+        },
+        {
+          binding: 2,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "read-only-storage" }
+        }
+      ]
+    });
+
     const strokePipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.strokeBindGroupLayout]
     });
@@ -1570,7 +1721,12 @@ export class WebGpuFloorplanRenderer {
       bindGroupLayouts: [this.vectorCompositeBindGroupLayout]
     });
 
+    const highlightPipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.highlightBindGroupLayout]
+    });
+
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
+    this.highlightPipeline = this.createPipeline(HIGHLIGHT_SHADER_SOURCE, "vsMain", "fsMain", highlightPipelineLayout);
     this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
     this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout, true);
@@ -2206,6 +2362,118 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
+  setSearchHighlights(highlights: SearchHighlightSet | null): void {
+    const count = highlights ? Math.min(Math.max(0, highlights.count), Math.floor(highlights.rects.length / 4)) : 0;
+    if (!highlights || count === 0) {
+      if (this.highlightOthersCount !== 0 || this.highlightHasCurrent) {
+        this.highlightOthersCount = 0;
+        this.highlightHasCurrent = false;
+        this.requestFrame();
+      }
+      return;
+    }
+
+    const rects = highlights.rects;
+    const currentIndex = highlights.currentIndex >= 0 && highlights.currentIndex < count ? highlights.currentIndex : -1;
+    const othersCount = currentIndex >= 0 ? count - 1 : count;
+
+    const others = new Float32Array(Math.max(1, othersCount) * 4);
+    let cursor = 0;
+    for (let i = 0; i < count; i += 1) {
+      if (i === currentIndex) {
+        continue;
+      }
+      others.set(rects.subarray(i * 4, i * 4 + 4), cursor * 4);
+      cursor += 1;
+    }
+
+    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
+    let bindGroupsInvalid = false;
+    if (!this.highlightOthersRectsBuffer || this.highlightOthersCapacityBytes < others.byteLength) {
+      this.highlightOthersRectsBuffer?.destroy();
+      this.highlightOthersCapacityBytes = Math.max(others.byteLength, 16 * 64);
+      this.highlightOthersRectsBuffer = this.gpuDevice.createBuffer({
+        size: this.highlightOthersCapacityBytes,
+        usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
+      });
+      bindGroupsInvalid = true;
+    }
+    if (!this.highlightCurrentRectBuffer) {
+      this.highlightCurrentRectBuffer = this.gpuDevice.createBuffer({
+        size: 16,
+        usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
+      });
+      bindGroupsInvalid = true;
+    }
+    this.gpuDevice.queue.writeBuffer(this.highlightOthersRectsBuffer, 0, others);
+    if (currentIndex >= 0) {
+      this.gpuDevice.queue.writeBuffer(
+        this.highlightCurrentRectBuffer,
+        0,
+        rects.slice(currentIndex * 4, currentIndex * 4 + 4)
+      );
+    }
+
+    if (bindGroupsInvalid || this.highlightOthersBindGroups.length === 0) {
+      this.rebuildHighlightBindGroups();
+    }
+
+    this.highlightOthersCount = othersCount;
+    this.highlightHasCurrent = currentIndex >= 0;
+    this.requestFrame();
+  }
+
+  private rebuildHighlightBindGroups(): void {
+    const makeBindGroup = (styleIndex: number, rectsBuffer: any): any =>
+      this.gpuDevice.createBindGroup({
+        layout: this.highlightBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.highlightCameraBuffer } },
+          { binding: 1, resource: { buffer: this.highlightStyleBuffers[styleIndex] } },
+          { binding: 2, resource: { buffer: rectsBuffer } }
+        ]
+      });
+
+    this.highlightOthersBindGroups = [makeBindGroup(0, this.highlightOthersRectsBuffer)];
+    this.highlightCurrentBindGroups = [makeBindGroup(1, this.highlightCurrentRectBuffer)];
+  }
+
+  /**
+   * Draws search highlights into the presented pass with the live camera so
+   * they can never lag the scene (the dedicated camera buffer is refreshed
+   * even on pan-cache blit frames).
+   */
+  private drawHighlightsIntoPass(
+    pass: any,
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): void {
+    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent) {
+      return;
+    }
+
+    const camera = new Float32Array(8);
+    camera[0] = viewportWidth;
+    camera[1] = viewportHeight;
+    camera[2] = cameraCenterX;
+    camera[3] = cameraCenterY;
+    camera[4] = zoomValue;
+    this.gpuDevice.queue.writeBuffer(this.highlightCameraBuffer, 0, camera);
+
+    pass.setPipeline(this.highlightPipeline);
+    if (this.highlightOthersCount > 0 && this.highlightOthersBindGroups.length === 1) {
+      pass.setBindGroup(0, this.highlightOthersBindGroups[0]);
+      pass.draw(4, this.highlightOthersCount, 0, 0);
+    }
+    if (this.highlightHasCurrent && this.highlightCurrentBindGroups.length === 1) {
+      pass.setBindGroup(0, this.highlightCurrentBindGroups[0]);
+      pass.draw(4, 1, 0, 0);
+    }
+  }
+
   fitToBounds(bounds: Bounds, paddingPixels = 64): void {
     const width = Math.max(bounds.maxX - bounds.minX, 1e-4);
     const height = Math.max(bounds.maxY - bounds.minY, 1e-4);
@@ -2310,6 +2578,20 @@ export class WebGpuFloorplanRenderer {
 
     if (this.cameraUniformBuffer) {
       this.cameraUniformBuffer.destroy();
+    }
+    if (this.highlightCameraBuffer) {
+      this.highlightCameraBuffer.destroy();
+    }
+    for (const buffer of this.highlightStyleBuffers) {
+      buffer.destroy();
+    }
+    if (this.highlightOthersRectsBuffer) {
+      this.highlightOthersRectsBuffer.destroy();
+      this.highlightOthersRectsBuffer = null;
+    }
+    if (this.highlightCurrentRectBuffer) {
+      this.highlightCurrentRectBuffer.destroy();
+      this.highlightCurrentRectBuffer = null;
     }
     if (this.blitUniformBuffer) {
       this.blitUniformBuffer.destroy();
@@ -2551,6 +2833,7 @@ export class WebGpuFloorplanRenderer {
       this.updateCameraUniforms(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
       this.drawRasterContentIntoPass(pass);
       this.drawVectorMinifyCompositeIntoPass(pass, this.canvas.width, this.canvas.height);
+      this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);
 
       pass.end();
       this.gpuDevice.queue.submit([encoder.finish()]);
@@ -2578,6 +2861,7 @@ export class WebGpuFloorplanRenderer {
     });
 
     const renderedSegments = this.drawSceneIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);
 
     pass.end();
     this.gpuDevice.queue.submit([encoder.finish()]);
@@ -2891,6 +3175,9 @@ export class WebGpuFloorplanRenderer {
     pass.setPipeline(this.blitPipeline);
     pass.setBindGroup(0, this.blitBindGroup);
     pass.draw(4, 1, 0, 0);
+
+    // Live camera on top of the (possibly slightly stale) blitted cache.
+    this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);
 
     pass.end();
     this.gpuDevice.queue.submit([encoder.finish()]);

@@ -8,6 +8,7 @@ import {
   consumeVectorStrokeLodBuildTiming,
   resetVectorStrokeLodBuildTiming,
   type HeprRendererType,
+  type HeprTextSearchMatch,
   type HeprThreeObjectOptions,
   type HeprThreePdfObject,
   type VectorLodMode,
@@ -71,6 +72,11 @@ const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
+const textSearchInput = document.querySelector<HTMLInputElement>("#text-search-input");
+const textSearchCount = document.querySelector<HTMLSpanElement>("#text-search-count");
+const textSearchPrevButton = document.querySelector<HTMLButtonElement>("#text-search-prev");
+const textSearchNextButton = document.querySelector<HTMLButtonElement>("#text-search-next");
+const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-search-case");
 
 if (
   !canvas ||
@@ -105,7 +111,12 @@ if (
   !fpsValue ||
   !drawStatsValue ||
   !lodStatsValue ||
-  !dropIndicator
+  !dropIndicator ||
+  !textSearchInput ||
+  !textSearchCount ||
+  !textSearchPrevButton ||
+  !textSearchNextButton ||
+  !textSearchCaseButton
 ) {
   throw new Error("Three example UI is missing required DOM elements.");
 }
@@ -139,6 +150,11 @@ const fpsValueElement = fpsValue;
 const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
 const dropIndicatorElement = dropIndicator;
+const textSearchInputElement = textSearchInput;
+const textSearchCountElement = textSearchCount;
+const textSearchPrevButtonElement = textSearchPrevButton;
+const textSearchNextButtonElement = textSearchNextButton;
+const textSearchCaseButtonElement = textSearchCaseButton;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
@@ -515,6 +531,178 @@ vectorOpacityInputElement.addEventListener("input", () => {
   applyVectorOverrideFromControls();
 }, { signal: lifetimeSignal });
 
+// --- Find in text: demo of the public HeprThreePdfObject search API. ---
+// `searchText` returns matches with `localBounds` in the object's local space
+// (frame your camera on them) and `setSearchHighlights` shows browser-find
+// style rectangles that stay in sync with the camera automatically.
+const searchState = {
+  matches: [] as HeprTextSearchMatch[],
+  currentIndex: -1,
+  caseSensitive: false,
+  lastQuery: ""
+};
+let searchDebounceHandle = 0;
+
+function refreshSearchAvailability(): void {
+  const pdfObject = currentPdfObject;
+  const searchable = pdfObject?.hasSearchableText === true;
+  textSearchInputElement.disabled = !searchable;
+  textSearchCaseButtonElement.disabled = !searchable;
+  textSearchInputElement.placeholder = !pdfObject
+    ? "Load a document to search"
+    : searchable
+      ? "Find in document..."
+      : "No text data in this ZIP - re-export to enable search";
+  if (!searchable) {
+    searchState.matches = [];
+    searchState.currentIndex = -1;
+    searchState.lastQuery = "";
+    updateSearchCounter();
+  }
+}
+
+function runSearch(query: string, flyToFirstMatch = true): void {
+  const pdfObject = currentPdfObject;
+  searchState.lastQuery = query;
+  if (!pdfObject || query.trim().length === 0) {
+    searchState.matches = [];
+    searchState.currentIndex = -1;
+    pdfObject?.setSearchHighlights(null);
+    updateSearchCounter();
+    requestRender();
+    return;
+  }
+
+  searchState.matches = pdfObject.searchText(query, { caseSensitive: searchState.caseSensitive });
+  searchState.currentIndex = searchState.matches.length > 0 ? 0 : -1;
+  applySearchHighlights();
+  if (flyToFirstMatch && searchState.currentIndex >= 0) {
+    flyToMatch(searchState.matches[searchState.currentIndex]);
+  }
+  updateSearchCounter();
+}
+
+function applySearchHighlights(): void {
+  currentPdfObject?.setSearchHighlights(searchState.matches, { currentIndex: searchState.currentIndex });
+  requestRender();
+}
+
+function stepSearch(direction: 1 | -1): void {
+  const count = searchState.matches.length;
+  if (count === 0) {
+    return;
+  }
+  searchState.currentIndex = (searchState.currentIndex + direction + count) % count;
+  applySearchHighlights();
+  flyToMatch(searchState.matches[searchState.currentIndex]);
+  updateSearchCounter();
+}
+
+function updateSearchCounter(): void {
+  const showCount = searchState.lastQuery.trim().length > 0 && currentPdfObject !== null;
+  textSearchCountElement.hidden = !showCount;
+  if (showCount) {
+    textSearchCountElement.textContent =
+      searchState.matches.length > 0
+        ? `${searchState.currentIndex + 1}/${searchState.matches.length}`
+        : "0/0";
+  }
+  const hasMatches = searchState.matches.length > 0;
+  textSearchPrevButtonElement.disabled = !hasMatches;
+  textSearchNextButtonElement.disabled = !hasMatches;
+}
+
+function clearSearch(): void {
+  window.clearTimeout(searchDebounceHandle);
+  textSearchInputElement.value = "";
+  searchState.matches = [];
+  searchState.currentIndex = -1;
+  searchState.lastQuery = "";
+  currentPdfObject?.setSearchHighlights(null);
+  updateSearchCounter();
+  requestRender();
+}
+
+function flyToMatch(match: HeprTextSearchMatch): void {
+  const pdfObject = currentPdfObject;
+  if (!pdfObject) {
+    return;
+  }
+  scene.updateMatrixWorld(true);
+
+  const localBounds = match.localBounds;
+  const center = pdfObject.localToWorld(
+    new THREE.Vector3((localBounds.minX + localBounds.maxX) * 0.5, (localBounds.minY + localBounds.maxY) * 0.5, 0)
+  );
+  const matchWidth = Math.max(localBounds.maxX - localBounds.minX, MIN_OBJECT_EXTENT);
+  const matchHeight = Math.max(localBounds.maxY - localBounds.minY, MIN_OBJECT_EXTENT);
+
+  // Frame the match at roughly 1/8 of the viewport height with some context.
+  const verticalFovRadians = THREE.MathUtils.degToRad(camera.fov);
+  const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, camera.aspect));
+  const framedDistance = Math.max(
+    MIN_OBJECT_EXTENT,
+    (matchHeight * 8 * 0.5) / Math.tan(verticalFovRadians * 0.5),
+    (matchWidth * 1.6 * 0.5) / Math.tan(horizontalFovRadians * 0.5)
+  );
+
+  // Keep the current distance while cycling nearby matches; re-frame only
+  // when the camera is far out (unreadable) or too close (match off-screen).
+  const currentDistance = camera.position.distanceTo(controls.target);
+  const distance =
+    currentDistance >= framedDistance * 0.8 && currentDistance <= framedDistance * 6 ? currentDistance : framedDistance;
+
+  tempViewDirection.subVectors(camera.position, controls.target);
+  if (tempViewDirection.lengthSq() <= 1e-12) {
+    tempViewDirection.set(0, 0, 1);
+  } else {
+    tempViewDirection.normalize();
+  }
+  camera.position.copy(center).addScaledVector(tempViewDirection, distance);
+  controls.target.copy(center);
+  updateCameraClipping(true);
+  controls.update();
+  requestRender();
+}
+
+textSearchInputElement.addEventListener("input", () => {
+  window.clearTimeout(searchDebounceHandle);
+  searchDebounceHandle = window.setTimeout(() => {
+    runSearch(textSearchInputElement.value);
+  }, 150);
+}, { signal: lifetimeSignal });
+
+textSearchInputElement.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    window.clearTimeout(searchDebounceHandle);
+    if (textSearchInputElement.value !== searchState.lastQuery) {
+      runSearch(textSearchInputElement.value);
+    } else {
+      stepSearch(event.shiftKey ? -1 : 1);
+    }
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    clearSearch();
+    textSearchInputElement.blur();
+  }
+}, { signal: lifetimeSignal });
+
+textSearchPrevButtonElement.addEventListener("click", () => {
+  stepSearch(-1);
+}, { signal: lifetimeSignal });
+
+textSearchNextButtonElement.addEventListener("click", () => {
+  stepSearch(1);
+}, { signal: lifetimeSignal });
+
+textSearchCaseButtonElement.addEventListener("click", () => {
+  searchState.caseSensitive = !searchState.caseSensitive;
+  textSearchCaseButtonElement.setAttribute("aria-pressed", searchState.caseSensitive ? "true" : "false");
+  window.clearTimeout(searchDebounceHandle);
+  runSearch(textSearchInputElement.value);
+}, { signal: lifetimeSignal });
+
 void loadExampleManifest();
 
 window.addEventListener("beforeunload", () => {
@@ -723,6 +911,11 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   updateCameraClipping(true);
   updateDrawStatsMeter();
   setDownloadDataButtonState(true);
+  refreshSearchAvailability();
+  if (textSearchInputElement.value.trim().length > 0 && nextObject.hasSearchableText) {
+    // Restore the active query on the new object without yanking the camera.
+    runSearch(textSearchInputElement.value, false);
+  }
   requestRender();
 }
 
@@ -748,6 +941,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
     setDownloadDataButtonState(false);
     setDownloadPdfButtonState(false);
   }
+  refreshSearchAvailability();
   requestRender();
 }
 

@@ -1002,6 +1002,72 @@ void main() {
 }
 `;
 
+const HIGHLIGHT_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 aRectBounds;
+
+uniform vec2 uViewport;
+uniform vec2 uCameraCenter;
+// Pixels per scene unit; also supplied on the projected path so pixel-space
+// border/min-size math works in both branches.
+uniform float uZoom;
+uniform float uUseLocalToClip;
+uniform mat4 uLocalToClip;
+uniform float uBorderPx;
+uniform float uMinSizePx;
+
+out vec2 vLocalPx;
+out vec2 vHalfSizePx;
+
+void main() {
+  vec2 center = (aRectBounds.xy + aRectBounds.zw) * 0.5;
+  vec2 halfSize = (aRectBounds.zw - aRectBounds.xy) * 0.5;
+  vec2 halfSizePx = max(halfSize * uZoom, vec2(0.5 * uMinSizePx));
+  vec2 expandedHalfPx = halfSizePx + vec2(uBorderPx);
+  vec2 world = center + aCorner * (expandedHalfPx / uZoom);
+
+  vLocalPx = aCorner * expandedHalfPx;
+  vHalfSizePx = halfSizePx;
+
+  if (uUseLocalToClip >= 0.5) {
+    gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
+  } else {
+    vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+    vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }
+}
+`;
+
+const HIGHLIGHT_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+
+in vec2 vLocalPx;
+in vec2 vHalfSizePx;
+
+uniform vec4 uFillColor;
+uniform vec4 uBorderColor;
+
+out vec4 outColor;
+
+void main() {
+  vec2 distanceToEdgePx = vHalfSizePx - abs(vLocalPx);
+  bool insideRect = distanceToEdgePx.x >= 0.0 && distanceToEdgePx.y >= 0.0;
+  outColor = insideRect ? uFillColor : uBorderColor;
+}
+`;
+
+/** Browser-find style: semi-transparent fill with a solid outline ring. */
+const HIGHLIGHT_OTHER_FILL: readonly number[] = [1, 0.921, 0.231, 0.35];
+const HIGHLIGHT_OTHER_BORDER: readonly number[] = [0.792, 0.541, 0.016, 1];
+const HIGHLIGHT_OTHER_BORDER_PX = 1;
+const HIGHLIGHT_CURRENT_FILL: readonly number[] = [1, 0.596, 0, 0.45];
+const HIGHLIGHT_CURRENT_BORDER: readonly number[] = [0.918, 0.345, 0.047, 1];
+const HIGHLIGHT_CURRENT_BORDER_PX = 2;
+const HIGHLIGHT_MIN_SIZE_PX = 2;
+
 const INTERACTION_DECAY_MS = 140;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
@@ -1117,6 +1183,18 @@ export interface ViewState {
   zoom: number;
 }
 
+/**
+ * Search-highlight rectangles drawn natively by the renderer, in the same
+ * frame and with the same camera transform as the scene (no overlay lag).
+ */
+export interface SearchHighlightSet {
+  /** 4 floats per rectangle: minX, minY, maxX, maxY in scene space. */
+  rects: Float32Array;
+  count: number;
+  /** Rectangle drawn with the emphasized "current match" style, or -1. */
+  currentIndex: number;
+}
+
 /** Parameters for rendering a native frame through an external projection. */
 export interface ProjectedFrameOptions {
   /** Render viewport width in device pixels. */
@@ -1194,6 +1272,8 @@ export class WebGlFloorplanRenderer {
 
   private readonly rasterProgram: WebGLProgram;
 
+  private readonly highlightProgram: WebGLProgram;
+
   private readonly segmentVao: WebGLVertexArrayObject;
 
   private readonly fillVao: WebGLVertexArrayObject;
@@ -1201,6 +1281,10 @@ export class WebGlFloorplanRenderer {
   private readonly textVao: WebGLVertexArrayObject;
 
   private readonly blitVao: WebGLVertexArrayObject;
+
+  private readonly highlightOthersVao: WebGLVertexArrayObject;
+
+  private readonly highlightCurrentVao: WebGLVertexArrayObject;
 
   private readonly cornerBuffer: WebGLBuffer;
 
@@ -1211,6 +1295,14 @@ export class WebGlFloorplanRenderer {
   private readonly allFillPathIdBuffer: WebGLBuffer;
 
   private readonly allTextInstanceIdBuffer: WebGLBuffer;
+
+  private readonly highlightOthersBuffer: WebGLBuffer;
+
+  private readonly highlightCurrentBuffer: WebGLBuffer;
+
+  private highlightOthersCount = 0;
+
+  private highlightHasCurrent = false;
 
   private readonly segmentTextureA: WebGLTexture;
 
@@ -1379,6 +1471,24 @@ export class WebGlFloorplanRenderer {
   private readonly uRasterUseLocalToClip: WebGLUniformLocation;
 
   private readonly uRasterLocalToClip: WebGLUniformLocation;
+
+  private readonly uHighlightViewport: WebGLUniformLocation;
+
+  private readonly uHighlightCameraCenter: WebGLUniformLocation;
+
+  private readonly uHighlightZoom: WebGLUniformLocation;
+
+  private readonly uHighlightUseLocalToClip: WebGLUniformLocation;
+
+  private readonly uHighlightLocalToClip: WebGLUniformLocation;
+
+  private readonly uHighlightBorderPx: WebGLUniformLocation;
+
+  private readonly uHighlightMinSizePx: WebGLUniformLocation;
+
+  private readonly uHighlightFillColor: WebGLUniformLocation;
+
+  private readonly uHighlightBorderColor: WebGLUniformLocation;
 
   private scene: VectorScene | null = null;
 
@@ -1599,17 +1709,22 @@ export class WebGlFloorplanRenderer {
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, RASTER_FRAGMENT_SHADER_SOURCE);
+    this.highlightProgram = this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
     this.fillVao = this.createVertexArray();
     this.textVao = this.createVertexArray();
     this.blitVao = this.createVertexArray();
+    this.highlightOthersVao = this.createVertexArray();
+    this.highlightCurrentVao = this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
     this.allSegmentIdBuffer = this.mustCreateBuffer();
     this.visibleSegmentIdBuffer = this.mustCreateBuffer();
     this.allFillPathIdBuffer = this.mustCreateBuffer();
     this.allTextInstanceIdBuffer = this.mustCreateBuffer();
+    this.highlightOthersBuffer = this.mustCreateBuffer();
+    this.highlightCurrentBuffer = this.mustCreateBuffer();
 
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
@@ -1702,6 +1817,16 @@ export class WebGlFloorplanRenderer {
     this.uRasterUseLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uUseLocalToClip");
     this.uRasterLocalToClip = this.mustGetUniformLocation(this.rasterProgram, "uLocalToClip");
 
+    this.uHighlightViewport = this.mustGetUniformLocation(this.highlightProgram, "uViewport");
+    this.uHighlightCameraCenter = this.mustGetUniformLocation(this.highlightProgram, "uCameraCenter");
+    this.uHighlightZoom = this.mustGetUniformLocation(this.highlightProgram, "uZoom");
+    this.uHighlightUseLocalToClip = this.mustGetUniformLocation(this.highlightProgram, "uUseLocalToClip");
+    this.uHighlightLocalToClip = this.mustGetUniformLocation(this.highlightProgram, "uLocalToClip");
+    this.uHighlightBorderPx = this.mustGetUniformLocation(this.highlightProgram, "uBorderPx");
+    this.uHighlightMinSizePx = this.mustGetUniformLocation(this.highlightProgram, "uMinSizePx");
+    this.uHighlightFillColor = this.mustGetUniformLocation(this.highlightProgram, "uFillColor");
+    this.uHighlightBorderColor = this.mustGetUniformLocation(this.highlightProgram, "uBorderColor");
+
     this.initializeGeometry();
     this.initializeState();
     this.uploadPageBackgroundTexture();
@@ -1792,6 +1917,7 @@ export class WebGlFloorplanRenderer {
     if (this.textRenderingEnabled) {
       this.drawTextInstances(viewportWidth, viewportHeight, this.cameraCenterX, this.cameraCenterY, 1 / localUnitsPerPixel);
     }
+    this.drawSearchHighlights(viewportWidth, viewportHeight, this.cameraCenterX, this.cameraCenterY, 1 / localUnitsPerPixel);
 
     this.localToClipRenderingEnabled = false;
     gl.bindVertexArray(null);
@@ -2160,6 +2286,47 @@ export class WebGlFloorplanRenderer {
     this.requestFrame();
   }
 
+  setSearchHighlights(highlights: SearchHighlightSet | null): void {
+    if (this.isDisposed) {
+      return;
+    }
+    const gl = this.gl;
+    const count = highlights ? Math.min(Math.max(0, highlights.count), Math.floor(highlights.rects.length / 4)) : 0;
+    if (!highlights || count === 0) {
+      if (this.highlightOthersCount !== 0 || this.highlightHasCurrent) {
+        this.highlightOthersCount = 0;
+        this.highlightHasCurrent = false;
+        this.requestFrame();
+      }
+      return;
+    }
+
+    const rects = highlights.rects;
+    const currentIndex = highlights.currentIndex >= 0 && highlights.currentIndex < count ? highlights.currentIndex : -1;
+    const othersCount = currentIndex >= 0 ? count - 1 : count;
+
+    const others = new Float32Array(othersCount * 4);
+    let cursor = 0;
+    for (let i = 0; i < count; i += 1) {
+      if (i === currentIndex) {
+        continue;
+      }
+      others.set(rects.subarray(i * 4, i * 4 + 4), cursor * 4);
+      cursor += 1;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightOthersBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, others, gl.DYNAMIC_DRAW);
+    if (currentIndex >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightCurrentBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, rects.subarray(currentIndex * 4, currentIndex * 4 + 4), gl.DYNAMIC_DRAW);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+    this.highlightOthersCount = othersCount;
+    this.highlightHasCurrent = currentIndex >= 0;
+    this.requestFrame();
+  }
+
   fitToBounds(bounds: Bounds, paddingPixels = 64): void {
     const width = Math.max(bounds.maxX - bounds.minX, 1e-4);
     const height = Math.max(bounds.maxY - bounds.minY, 1e-4);
@@ -2242,7 +2409,9 @@ export class WebGlFloorplanRenderer {
       this.allSegmentIdBuffer,
       this.visibleSegmentIdBuffer,
       this.allFillPathIdBuffer,
-      this.allTextInstanceIdBuffer
+      this.allTextInstanceIdBuffer,
+      this.highlightOthersBuffer,
+      this.highlightCurrentBuffer
     ];
     for (const buffer of buffers) {
       gl.deleteBuffer(buffer);
@@ -2252,7 +2421,9 @@ export class WebGlFloorplanRenderer {
       this.segmentVao,
       this.fillVao,
       this.textVao,
-      this.blitVao
+      this.blitVao,
+      this.highlightOthersVao,
+      this.highlightCurrentVao
     ];
     for (const vao of vaos) {
       gl.deleteVertexArray(vao);
@@ -2264,7 +2435,8 @@ export class WebGlFloorplanRenderer {
       this.textProgram,
       this.blitProgram,
       this.vectorCompositeProgram,
-      this.rasterProgram
+      this.rasterProgram,
+      this.highlightProgram
     ];
     for (const program of programs) {
       gl.deleteProgram(program);
@@ -2393,6 +2565,9 @@ export class WebGlFloorplanRenderer {
     } else {
       this.renderDirectToScreen();
     }
+    // Drawn last with the live camera so highlights can never lag the scene,
+    // and never bake into the pan cache.
+    this.drawSearchHighlights(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     this.capturePresentedFrameState();
 
     if (isCameraAnimating) {
@@ -2782,6 +2957,56 @@ export class WebGlFloorplanRenderer {
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  /**
+   * Draws search highlights with the live camera uniforms in the same frame
+   * as the scene, on top of all content and outside any cached layer.
+   */
+  private drawSearchHighlights(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue = this.zoom
+  ): void {
+    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent) {
+      return;
+    }
+
+    const gl = this.gl;
+    gl.useProgram(this.highlightProgram);
+    gl.uniform2f(this.uHighlightViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uHighlightCameraCenter, cameraCenterX, cameraCenterY);
+    gl.uniform1f(this.uHighlightZoom, zoomValue);
+    gl.uniform1f(this.uHighlightMinSizePx, HIGHLIGHT_MIN_SIZE_PX);
+    gl.uniform1f(this.uHighlightUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
+    if (this.localToClipRenderingEnabled) {
+      gl.uniformMatrix4fv(this.uHighlightLocalToClip, false, this.localToClipMatrix);
+    }
+
+    if (this.highlightOthersCount > 0) {
+      gl.bindVertexArray(this.highlightOthersVao);
+      this.drawHighlightBatch(this.highlightOthersCount, HIGHLIGHT_OTHER_FILL, HIGHLIGHT_OTHER_BORDER, HIGHLIGHT_OTHER_BORDER_PX);
+    }
+    if (this.highlightHasCurrent) {
+      gl.bindVertexArray(this.highlightCurrentVao);
+      this.drawHighlightBatch(1, HIGHLIGHT_CURRENT_FILL, HIGHLIGHT_CURRENT_BORDER, HIGHLIGHT_CURRENT_BORDER_PX);
+    }
+    gl.bindVertexArray(null);
+  }
+
+  private drawHighlightBatch(
+    instanceCount: number,
+    fillColor: readonly number[],
+    borderColor: readonly number[],
+    borderPx: number
+  ): void {
+    const gl = this.gl;
+    gl.uniform4f(this.uHighlightFillColor, fillColor[0], fillColor[1], fillColor[2], fillColor[3]);
+    gl.uniform4f(this.uHighlightBorderColor, borderColor[0], borderColor[1], borderColor[2], borderColor[3]);
+    gl.uniform1f(this.uHighlightBorderPx, borderPx);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
   }
 
   private drawFilledPaths(
@@ -4107,6 +4332,22 @@ export class WebGlFloorplanRenderer {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
     gl.vertexAttribDivisor(0, 0);
+
+    for (const [vao, rectBuffer] of [
+      [this.highlightOthersVao, this.highlightOthersBuffer],
+      [this.highlightCurrentVao, this.highlightCurrentBuffer]
+    ] as const) {
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+      gl.vertexAttribDivisor(0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, rectBuffer);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
+      gl.vertexAttribDivisor(1, 1);
+    }
 
     gl.bindVertexArray(null);
   }

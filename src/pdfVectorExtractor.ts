@@ -62,11 +62,37 @@ export interface RasterLayer {
   matrix: Float32Array;
 }
 
+/** Searchable text for one page, in scene space (Y-up, page placement baked in). */
+export interface PageTextIndex {
+  /** Searchable text; word gaps and line breaks are encoded as a single " ". */
+  text: string;
+  /**
+   * One entry per UTF-16 code unit of `text`:
+   *   >= 0  -> row index into textInstanceA/B/C (bounds derivable from the
+   *            instance transform and the glyph ink box);
+   *   -1    -> separator " " (no geometry);
+   *   <= -2 -> fallback quad slot k = (-value - 2) into `fallbackQuads`, used
+   *            for glyphs without a render instance (invisible OCR text,
+   *            atlas misses, clip-culled, vertical fonts).
+   * Multi-code-unit glyphs (ligatures) repeat the same reference per unit.
+   */
+  charInstance: Int32Array;
+  /** 4 floats per fallback slot: minX, minY, maxX, maxY in scene space. */
+  fallbackQuads: Float32Array;
+}
+
+export interface SceneTextIndex {
+  version: 2;
+  /** One entry per page, aligned with pageRects ordering. */
+  pages: PageTextIndex[];
+}
+
 export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
   pageRects: Float32Array;
   pageTextRanges: Uint32Array;
+  textIndex: SceneTextIndex | null;
   fillPathCount: number;
   fillSegmentCount: number;
   fillPathMetaA: Float32Array;
@@ -171,6 +197,95 @@ class Float4Builder {
     const next = new Float32Array(nextLength);
     next.set(this.data);
     this.data = next;
+  }
+}
+
+/** Pen-position jump (in em units) treated as a word/line break in the text index. */
+const TEXT_INDEX_GAP_EM_FACTOR = 0.25;
+/** Fallback glyph box (em units, +y up) for glyphs without atlas ink bounds. */
+const TEXT_INDEX_FALLBACK_DESCENT = -0.25;
+const TEXT_INDEX_FALLBACK_ASCENT = 0.85;
+
+class PageTextIndexBuilder {
+  private readonly chars: string[] = [];
+
+  private readonly instanceRefs: number[] = [];
+
+  private readonly fallbackQuads = new Float4Builder(1_024);
+
+  private prevEndX = 0;
+
+  private prevEndY = 0;
+
+  private prevEmHeight = 0;
+
+  private hasPrev = false;
+
+  private separatorPending = false;
+
+  appendSeparator(): void {
+    this.separatorPending = true;
+  }
+
+  appendGlyph(
+    unicode: string,
+    quad: Bounds,
+    penStartX: number,
+    penStartY: number,
+    penEndX: number,
+    penEndY: number,
+    emHeight: number,
+    instanceIndex: number
+  ): void {
+    const needsFallbackQuad = instanceIndex < 0;
+    if (
+      !Number.isFinite(penStartX) ||
+      !Number.isFinite(penStartY) ||
+      (needsFallbackQuad &&
+        (!Number.isFinite(quad.minX) ||
+          !Number.isFinite(quad.minY) ||
+          !Number.isFinite(quad.maxX) ||
+          !Number.isFinite(quad.maxY)))
+    ) {
+      this.separatorPending = true;
+      return;
+    }
+
+    if (this.hasPrev && !this.separatorPending) {
+      const gap = Math.hypot(penStartX - this.prevEndX, penStartY - this.prevEndY);
+      if (gap > TEXT_INDEX_GAP_EM_FACTOR * Math.max(emHeight, this.prevEmHeight, 1e-6)) {
+        this.separatorPending = true;
+      }
+    }
+
+    if (this.separatorPending && this.chars.length > 0) {
+      this.chars.push(" ");
+      this.instanceRefs.push(-1);
+    }
+    this.separatorPending = false;
+
+    for (let i = 0; i < unicode.length; i += 1) {
+      this.chars.push(unicode[i]);
+      if (needsFallbackQuad) {
+        this.instanceRefs.push(-2 - this.fallbackQuads.quadCount);
+        this.fallbackQuads.push(quad.minX, quad.minY, quad.maxX, quad.maxY);
+      } else {
+        this.instanceRefs.push(instanceIndex);
+      }
+    }
+
+    this.prevEndX = Number.isFinite(penEndX) ? penEndX : penStartX;
+    this.prevEndY = Number.isFinite(penEndY) ? penEndY : penStartY;
+    this.prevEmHeight = Number.isFinite(emHeight) && emHeight > 0 ? emHeight : this.prevEmHeight;
+    this.hasPrev = true;
+  }
+
+  build(): PageTextIndex {
+    return {
+      text: this.chars.join(""),
+      charInstance: Int32Array.from(this.instanceRefs),
+      fallbackQuads: this.fallbackQuads.toTypedArray()
+    };
   }
 }
 
@@ -922,6 +1037,7 @@ async function extractSinglePageVectors(
     pagesPerRow: 1,
     pageRects: new Float32Array([pageBounds.minX, pageBounds.minY, pageBounds.maxX, pageBounds.maxY]),
     pageTextRanges: new Uint32Array([0, textData.instanceCount]),
+    textIndex: { version: 2, pages: [textData.textIndexPage] },
     fillPathCount,
     fillSegmentCount,
     fillPathMetaA,
@@ -1004,8 +1120,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let totalDiscardedContainedCount = 0;
   let maxHalfWidth = 0;
   let totalPageRectCount = 0;
+  let hasAnyTextIndex = false;
 
   for (const scene of pageScenes) {
+    hasAnyTextIndex = hasAnyTextIndex || scene.textIndex !== null;
     totalFillPathCount += scene.fillPathCount;
     totalFillSegmentCount += scene.fillSegmentCount;
     totalSegmentCount += scene.segmentCount;
@@ -1059,6 +1177,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let combinedPageBounds: Bounds | null = null;
 
   const rasterLayers: RasterLayer[] = [];
+  const mergedTextIndexPages: PageTextIndex[] = [];
 
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
     const scene = pageScenes[pageIndex];
@@ -1169,6 +1288,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         pageTextRanges[rangeDst] = sceneTextRanges[rangeSrc] + textInstanceOffset;
         pageTextRanges[rangeDst + 1] = sceneTextRanges[rangeSrc + 1];
       }
+      appendTranslatedTextIndexPages(mergedTextIndexPages, scene, sceneRectCount, tx, ty, textInstanceOffset);
       pageRectOffset += sceneRectCount;
     } else {
       const dst = pageRectOffset * 4;
@@ -1179,6 +1299,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       const rangeDst = pageRectOffset * 2;
       pageTextRanges[rangeDst] = textInstanceOffset;
       pageTextRanges[rangeDst + 1] = scene.textInstanceCount;
+      appendTranslatedTextIndexPages(mergedTextIndexPages, scene, 1, tx, ty, textInstanceOffset);
       pageRectOffset += 1;
     }
 
@@ -1220,6 +1341,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     pagesPerRow,
     pageRects,
     pageTextRanges,
+    textIndex: hasAnyTextIndex ? { version: 2, pages: mergedTextIndexPages } : null,
     fillPathCount: totalFillPathCount,
     fillSegmentCount: totalFillSegmentCount,
     fillPathMetaA,
@@ -1265,6 +1387,45 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   };
 
   return optimizeVectorSceneTextGlyphs(composedScene);
+}
+
+function appendTranslatedTextIndexPages(
+  target: PageTextIndex[],
+  scene: VectorScene,
+  rectCount: number,
+  tx: number,
+  ty: number,
+  textInstanceOffset: number
+): void {
+  const sourcePages = scene.textIndex?.pages ?? [];
+  for (let i = 0; i < rectCount; i += 1) {
+    const page = sourcePages[i];
+    if (page && page.text.length > 0) {
+      target.push(offsetPageTextIndex(page, tx, ty, textInstanceOffset));
+    } else {
+      target.push({ text: "", charInstance: new Int32Array(0), fallbackQuads: new Float32Array(0) });
+    }
+  }
+}
+
+function offsetPageTextIndex(page: PageTextIndex, tx: number, ty: number, instanceOffset: number): PageTextIndex {
+  // Copy instead of mutating: cached page scenes get re-composed at other
+  // pagesPerRow layouts, so the source data must stay untranslated.
+  const charInstance = new Int32Array(page.charInstance.length);
+  for (let i = 0; i < charInstance.length; i += 1) {
+    const ref = page.charInstance[i];
+    charInstance[i] = ref >= 0 ? ref + instanceOffset : ref;
+  }
+
+  const source = page.fallbackQuads;
+  const fallbackQuads = new Float32Array(source.length);
+  for (let i = 0; i + 3 < source.length; i += 4) {
+    fallbackQuads[i] = source[i] + tx;
+    fallbackQuads[i + 1] = source[i + 1] + ty;
+    fallbackQuads[i + 2] = source[i + 2] + tx;
+    fallbackQuads[i + 3] = source[i + 3] + ty;
+  }
+  return { text: page.text, charInstance, fallbackQuads };
 }
 
 export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
@@ -1701,6 +1862,7 @@ function createEmptyVectorScene(): VectorScene {
     pagesPerRow: 1,
     pageRects: new Float32Array(0),
     pageTextRanges: new Uint32Array(0),
+    textIndex: null,
     fillPathCount: 0,
     fillSegmentCount: 0,
     fillPathMetaA: new Float32Array(0),
@@ -1942,6 +2104,7 @@ interface TextExtractResult {
   glyphSegmentsA: Float32Array;
   glyphSegmentsB: Float32Array;
   bounds: Bounds | null;
+  textIndexPage: PageTextIndex;
 }
 
 interface RasterLayerExtractResult {
@@ -3632,6 +3795,7 @@ async function extractTextVectorData(
 
   const glyphIndexByKey = new Map<string, number>();
   const glyphBoundsByIndex: Bounds[] = [];
+  const textIndexBuilder = new PageTextIndexBuilder();
 
   let sourceTextCount = 0;
   let textBounds: Bounds | null = null;
@@ -3714,6 +3878,9 @@ async function extractTextVectorData(
       const isSpace = glyph.isSpace === true;
       const skipGlyphRender = isWhitespaceGlyphToken(glyph, fontChar);
       const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
+      const glyphMatrix = buildTextGlyphTransform(state, vertical ? 0 : x, vertical ? x : 0);
+      let indexGlyphBounds: Bounds | null = null;
+      let emittedInstanceIndex = -1;
 
       if (
         !vertical &&
@@ -3723,8 +3890,8 @@ async function extractTextVectorData(
       ) {
         const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
         if (glyphRecord) {
-          const glyphMatrix = buildTextGlyphTransform(state, x, 0);
           const transformedGlyphBounds = transformBounds(glyphRecord.bounds, glyphMatrix);
+          indexGlyphBounds = transformedGlyphBounds;
           const visibleByClip = !clipBounds || boundsIntersect(transformedGlyphBounds, clipBounds);
           if (visibleByClip) {
             sourceTextCount += 1;
@@ -3743,6 +3910,7 @@ async function extractTextVectorData(
               textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
               textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
               textInstanceC.push(state.fillR, state.fillG, state.fillB, effectiveTextFillAlpha(state));
+              emittedInstanceIndex = textInstanceA.quadCount - 1;
 
               if (!textBounds) {
                 textBounds = {
@@ -3765,6 +3933,41 @@ async function extractTextVectorData(
       const charWidth = vertical
         ? glyphWidth * widthAdvanceScale - spacing * state.fontDirection
         : glyphWidth * widthAdvanceScale + spacing * state.fontDirection;
+
+      // Text-index capture runs regardless of render gating so invisible
+      // (e.g. OCR), clip-culled, and atlas-miss glyphs stay searchable.
+      const unicode = typeof glyph.unicode === "string" ? glyph.unicode : "";
+      if (skipGlyphRender || unicode.length === 0) {
+        textIndexBuilder.appendSeparator();
+      } else {
+        const advanceEm = charWidth / state.fontSize;
+        const glyphQuad =
+          indexGlyphBounds ??
+          transformBounds(
+            vertical
+              ? { minX: -0.5, minY: -Math.abs(advanceEm), maxX: 0.5, maxY: 0 }
+              : { minX: 0, minY: TEXT_INDEX_FALLBACK_DESCENT, maxX: advanceEm, maxY: TEXT_INDEX_FALLBACK_ASCENT },
+            glyphMatrix
+          );
+        const penEndX = vertical
+          ? glyphMatrix[2] * advanceEm + glyphMatrix[4]
+          : glyphMatrix[0] * advanceEm + glyphMatrix[4];
+        const penEndY = vertical
+          ? glyphMatrix[3] * advanceEm + glyphMatrix[5]
+          : glyphMatrix[1] * advanceEm + glyphMatrix[5];
+        const emHeight = Math.hypot(glyphMatrix[2], glyphMatrix[3]);
+        textIndexBuilder.appendGlyph(
+          unicode,
+          glyphQuad,
+          glyphMatrix[4],
+          glyphMatrix[5],
+          penEndX,
+          penEndY,
+          emHeight,
+          emittedInstanceIndex
+        );
+      }
+
       x += charWidth;
     }
 
@@ -4050,7 +4253,8 @@ async function extractTextVectorData(
     glyphMetaB: textGlyphMetaB.toTypedArray(),
     glyphSegmentsA: textGlyphSegmentsA.toTypedArray(),
     glyphSegmentsB: textGlyphSegmentsB.toTypedArray(),
-    bounds: textBounds
+    bounds: textBounds,
+    textIndexPage: textIndexBuilder.build()
   };
 }
 
@@ -4301,7 +4505,8 @@ function createEmptyTextExtractResult(): TextExtractResult {
     glyphMetaB: new Float32Array(0),
     glyphSegmentsA: new Float32Array(0),
     glyphSegmentsB: new Float32Array(0),
-    bounds: null
+    bounds: null,
+    textIndexPage: { text: "", charInstance: new Int32Array(0), fallbackQuads: new Float32Array(0) }
   };
 }
 

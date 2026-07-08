@@ -28,6 +28,16 @@
         </button>
       </div>
       <div id="hud-content" class="panel-content">
+        <div class="number-row search-row">
+          <label for="text-search-input">Find Text</label>
+          <div class="search-controls">
+            <input id="text-search-input" type="search" placeholder="Load a document to search" autocomplete="off" spellcheck="false" disabled />
+            <span id="text-search-count" class="search-count" hidden>0/0</span>
+            <button id="text-search-prev" type="button" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>▲</button>
+            <button id="text-search-next" type="button" class="search-nav" title="Next match (Enter)" aria-label="Next match" disabled>▼</button>
+            <button id="text-search-case" type="button" class="search-case" title="Match case" aria-label="Match case" aria-pressed="false" disabled>Aa</button>
+          </div>
+        </div>
         <div class="number-row">
           <label for="backend-select">Renderer Backend</label>
           <select id="backend-select">

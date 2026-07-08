@@ -148,6 +148,23 @@ export type {
   PDFLoadStage
 } from "./loadProgress";
 
+export { createSceneTextSearcher, createTextSearchController } from "./textSearch";
+
+export type {
+  SceneTextSearcher,
+  SceneTextSearchOptions,
+  TextSearchController,
+  TextSearchControllerOptions,
+  TextSearchMatch,
+  TextSearchState
+} from "./textSearch";
+
+export type { HeprTextSearchMatch } from "./threePdfObject";
+
+export type { SearchHighlightSet } from "./rendererTypes";
+
+export type { PageTextIndex, SceneTextIndex } from "./pdfVectorExtractor";
+
 export type {
   VectorStrokeLodAsyncBuildOptions,
   VectorStrokeLodBuildProgress,

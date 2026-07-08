@@ -49,6 +49,9 @@ import {
   type VectorStrokeLodBuildTiming
 } from "./vectorStrokeLodCore";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
+import { createTextSearchController, type TextSearchController, type TextSearchMatch } from "./textSearch";
+import { createTextSearchWidget } from "./textSearchWidget";
+import type { SearchHighlightSet } from "./rendererTypes";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -90,6 +93,11 @@ const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#pa
 const vectorColorInput = document.querySelector<HTMLInputElement>("#vector-color");
 const vectorOpacitySlider = document.querySelector<HTMLInputElement>("#vector-opacity-slider");
 const vectorOpacityInput = document.querySelector<HTMLInputElement>("#vector-opacity");
+const textSearchInput = document.querySelector<HTMLInputElement>("#text-search-input");
+const textSearchCount = document.querySelector<HTMLSpanElement>("#text-search-count");
+const textSearchPrevButton = document.querySelector<HTMLButtonElement>("#text-search-prev");
+const textSearchNextButton = document.querySelector<HTMLButtonElement>("#text-search-next");
+const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-search-case");
 
 if (
   !canvas ||
@@ -129,7 +137,12 @@ if (
   !pageBackgroundOpacityInput ||
   !vectorColorInput ||
   !vectorOpacitySlider ||
-  !vectorOpacityInput
+  !vectorOpacityInput ||
+  !textSearchInput ||
+  !textSearchCount ||
+  !textSearchPrevButton ||
+  !textSearchNextButton ||
+  !textSearchCaseButton
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -194,6 +207,59 @@ const uiControlManager = createUiControlManager(
 );
 
 const canvasInteractionController = createCanvasInteractionController(() => renderer);
+
+let textSearchController: TextSearchController;
+let lastSearchHighlights: SearchHighlightSet | null = null;
+
+function applySearchHighlights(current: TextSearchMatch | null, all: TextSearchMatch[]): void {
+  if (all.length === 0) {
+    lastSearchHighlights = null;
+  } else {
+    const rects = new Float32Array(all.length * 4);
+    let currentIndex = -1;
+    for (let i = 0; i < all.length; i += 1) {
+      const bounds = all[i].bounds;
+      rects[i * 4] = bounds.minX;
+      rects[i * 4 + 1] = bounds.minY;
+      rects[i * 4 + 2] = bounds.maxX;
+      rects[i * 4 + 3] = bounds.maxY;
+      if (all[i] === current) {
+        currentIndex = i;
+      }
+    }
+    lastSearchHighlights = { rects, count: all.length, currentIndex };
+  }
+  renderer.setSearchHighlights?.(lastSearchHighlights);
+}
+
+const textSearchWidget = createTextSearchWidget(
+  {
+    input: textSearchInput,
+    prevButton: textSearchPrevButton,
+    nextButton: textSearchNextButton,
+    caseButton: textSearchCaseButton,
+    countLabel: textSearchCount
+  },
+  {
+    onQueryInput: (query) => textSearchController.setQuery(query),
+    onNext: () => textSearchController.next(),
+    onPrev: () => textSearchController.prev(),
+    onCaseToggle: (enabled) => textSearchController.setCaseSensitive(enabled),
+    onClose: () => textSearchController.clear()
+  }
+);
+textSearchController = createTextSearchController({
+  getRenderer: () => renderer,
+  getCanvas: () => canvasElement,
+  onStateChange: (state) => textSearchWidget.applyState(state),
+  onMatchesChange: applySearchHighlights
+});
+
+function applyTextSearchScene(scene: VectorScene): void {
+  textSearchController.setScene(scene);
+  const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
+  textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
+}
 
 function onRendererFrame(stats: DrawStats): void {
   updateFpsMetric();
@@ -309,6 +375,8 @@ backendSwitcher = createBackendSwitcher({
   getRenderer: () => renderer,
   setRenderer: (nextRenderer) => {
     renderer = nextRenderer;
+    // Highlights live in renderer-owned GPU buffers; re-apply after a switch.
+    renderer.setSearchHighlights?.(lastSearchHighlights);
   },
   getCanvasElement: () => canvasElement,
   setCanvasElement: (nextCanvas) => {
@@ -411,6 +479,18 @@ canvasInteractionController.attach(canvasElement);
 
 window.addEventListener("resize", () => {
   renderer.resize();
+});
+
+window.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f") {
+    // Without a searchable document, let the browser's native find run.
+    if (!textSearchWidget.isAvailable()) {
+      return;
+    }
+    event.preventDefault();
+    setHudCollapsed(false);
+    textSearchWidget.focusInput();
+  }
 });
 
 window.addEventListener("dragenter", (event) => {
@@ -742,6 +822,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedScene = scene;
     lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    applyTextSearchScene(scene);
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
@@ -838,6 +919,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     lastParsedScene = scene;
     lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    applyTextSearchScene(scene);
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
