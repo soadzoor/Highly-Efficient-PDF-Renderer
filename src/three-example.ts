@@ -336,6 +336,8 @@ async function ensureThreeRendererBackend(
 
   previousCanvas.replaceWith(nextCanvas);
   canvasElement = nextCanvas;
+  canvasResizeObserver.disconnect();
+  canvasResizeObserver.observe(nextCanvas);
   renderer = nextRenderer;
   activeThreeRendererBackend = backend;
   controls = createMapControls();
@@ -396,13 +398,25 @@ function resolveRenderedFrameWaiters(): void {
 requestRender();
 syncTouchRotateVisibility();
 
-window.addEventListener("resize", () => {
+function handleViewportResize(): void {
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
   updatePerspectiveCameraProjection();
   updateCameraClipping();
   requestRender();
-}, { signal: lifetimeSignal });
+}
+
+window.addEventListener("resize", handleViewportResize, { signal: lifetimeSignal });
+
+// Mobile browsers can fire the window "resize" event before an orientation
+// change has re-laid-out the page, so clientWidth/clientHeight are stale and
+// the drawing buffer keeps the previous orientation's aspect ratio.
+// ResizeObserver callbacks are delivered after layout with final geometry.
+const canvasResizeObserver = new ResizeObserver(handleViewportResize);
+canvasResizeObserver.observe(canvasElement);
+lifetimeSignal.addEventListener("abort", () => {
+  canvasResizeObserver.disconnect();
+}, { once: true });
 
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();

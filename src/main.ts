@@ -381,6 +381,8 @@ backendSwitcher = createBackendSwitcher({
   getCanvasElement: () => canvasElement,
   setCanvasElement: (nextCanvas) => {
     canvasElement = nextCanvas;
+    canvasResizeObserver.disconnect();
+    canvasResizeObserver.observe(nextCanvas);
   },
   createWebGlRenderer,
   createWebGpuRenderer,
@@ -480,6 +482,15 @@ canvasInteractionController.attach(canvasElement);
 window.addEventListener("resize", () => {
   renderer.resize();
 });
+
+// Mobile browsers can fire the window "resize" event before an orientation
+// change has re-laid-out the page, so clientWidth/clientHeight are stale and
+// the drawing buffer keeps the previous orientation's aspect ratio.
+// ResizeObserver callbacks are delivered after layout with final geometry.
+const canvasResizeObserver = new ResizeObserver(() => {
+  renderer.resize();
+});
+canvasResizeObserver.observe(canvasElement);
 
 window.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f") {

@@ -200,6 +200,19 @@ window.addEventListener("resize", () => {
   requestRender();
 });
 
+// Mobile browsers can fire the window "resize" event before an orientation
+// change has re-laid-out the page, so clientWidth/clientHeight are stale and
+// the drawing buffer keeps the previous orientation's aspect ratio.
+// ResizeObserver callbacks are delivered after layout with final geometry.
+const canvasResizeObserver = new ResizeObserver(() => {
+  if (isDisposed) {
+    return;
+  }
+  resizeRenderer();
+  requestRender();
+});
+canvasResizeObserver.observe(canvas);
+
 window.addEventListener("dragenter", handleWindowFileDrag);
 window.addEventListener("dragover", handleWindowFileDrag);
 window.addEventListener("dragleave", handleWindowFileDrag);
@@ -1413,6 +1426,7 @@ function disposeDemo(): void {
     return;
   }
   isDisposed = true;
+  canvasResizeObserver.disconnect();
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
