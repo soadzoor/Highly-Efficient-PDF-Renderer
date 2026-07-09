@@ -1466,6 +1466,41 @@ function detectRoomsOnPage(
       continue;
     }
 
+    // The mean-thickness gate misses composites: the interiors of double-line walls
+    // form one connected snaking network, and a single attached room-sized pocket
+    // raises the composite's mean above the cavity limit. Pixel-level test instead:
+    // a region that is cavity-thin across most of its pixels is a wall network no
+    // matter what hangs off it.
+    {
+      const regionId = regionIndex + 1;
+      clearance ??= buildClearanceField(occupancy, rasterWidth, rasterHeight);
+      const thinLimit = 0.825 * doorGapMax * scale; // chamfer units: local width < 0.55 door gaps
+      let regionPixels = 0;
+      let thinPixels = 0;
+      const scanMinX = Math.max(0, region.minX);
+      const scanMaxX = Math.min(rasterWidth - 1, region.maxX);
+      for (let y = Math.max(0, region.minY); y <= Math.min(rasterHeight - 1, region.maxY); y += 1) {
+        const rowBase = y * rasterWidth;
+        for (let x = scanMinX; x <= scanMaxX; x += 1) {
+          if (regionMap[rowBase + x] !== regionId) {
+            continue;
+          }
+          regionPixels += 1;
+          if (clearance[rowBase + x] < thinLimit) {
+            thinPixels += 1;
+          }
+        }
+      }
+      const thinFraction = regionPixels > 0 ? thinPixels / regionPixels : 0;
+      if (thinFraction > (roomLikeLabeled ? 0.85 : 0.65)) {
+        region.failure = "wallCavity";
+        for (const seed of region.seeds) {
+          failedSeeds.push({ seed: seed.asRoomSeed, reason: "wallCavity" });
+        }
+        continue;
+      }
+    }
+
     const bboxFill = area / Math.max(1e-9, (roomMaxX - roomMinX) * (roomMaxY - roomMinY));
     const thicknessScore = Math.min(1, meanThickness / (1.2 * doorGapMax));
     const confidence = Math.max(
