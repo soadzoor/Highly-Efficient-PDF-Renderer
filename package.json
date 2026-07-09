@@ -51,6 +51,7 @@
     "build": "tsc && vite build",
     "build:lib": "tsc -p tsconfig.lib.json && vite build --mode lib",
     "build:all": "npm run build && npm run build:lib",
+    "release-new-version": "npm run build:all && npm version patch && git push --follow-tags",
     "pack:local": "npm run build:lib && npm pack",
     "publish:dry-run": "npm publish --access public --dry-run",
     "preview": "vite preview",
