@@ -41,7 +41,9 @@ const COPY_BUTTON_MARGIN_PX = 8;
 
 export function createSelectionOverlay(callbacks: SelectionOverlayCallbacks): SelectionOverlay {
   const container = document.createElement("div");
-  container.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:10000;";
+  container.style.cssText =
+    "position:fixed;inset:0;pointer-events:none;z-index:10000;" +
+    "user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;";
 
   const makeHandle = (which: "start" | "end"): HTMLDivElement => {
     const handle = document.createElement("div");

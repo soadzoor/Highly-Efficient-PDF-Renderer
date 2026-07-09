@@ -768,6 +768,37 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     cursorApplied = false;
   }
 
+  /**
+   * Keep the browser's own text selection away from the canvas: an iOS
+   * long-press would otherwise start a native HTML selection anchored in
+   * nearby DOM text (the canvas has none), alongside ours.
+   */
+  let guardedCanvas: HTMLCanvasElement | null = null;
+
+  function ensureCanvasSelectionGuards(canvas: HTMLCanvasElement): void {
+    if (guardedCanvas === canvas) {
+      return;
+    }
+    releaseCanvasSelectionGuards();
+    canvas.style.userSelect = "none";
+    canvas.style.setProperty("-webkit-user-select", "none");
+    canvas.style.setProperty("-webkit-touch-callout", "none");
+    guardedCanvas = canvas;
+  }
+
+  function releaseCanvasSelectionGuards(): void {
+    if (guardedCanvas) {
+      guardedCanvas.style.userSelect = "";
+      guardedCanvas.style.removeProperty("-webkit-user-select");
+      guardedCanvas.style.removeProperty("-webkit-touch-callout");
+      guardedCanvas = null;
+    }
+  }
+
+  function clearNativeDomSelection(): void {
+    document.getSelection()?.removeAllRanges();
+  }
+
   function extendSelectionTo(caret: TextSelectionCaret): void {
     if (wordGranularity && wordAnchor && lastScene?.textIndex) {
       const page = lastScene.textIndex.pages[caret.pageIndex];
@@ -864,6 +895,9 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     if (!canvas) {
       return;
     }
+    if (event.target === canvas) {
+      ensureCanvasSelectionGuards(canvas);
+    }
 
     // While a selection gesture owns a pointer, keep every other canvas
     // pointer away from the camera controllers.
@@ -909,6 +943,9 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         adapter.setCameraInteractionEnabled?.(false);
         state = "touchSelecting";
         selectionIsTouch = true;
+        // Drop any native HTML selection the OS long-press may have started
+        // in surrounding UI text before ours takes over.
+        clearNativeDomSelection();
         overlay.hide();
         if (selectWordAt(hit)) {
           (navigator as Navigator & { vibrate?: (pattern: number) => boolean }).vibrate?.(10);
@@ -1082,6 +1119,17 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     }
   };
 
+  const handleSelectStart = (event: Event): void => {
+    if (!enabled || disposed) {
+      return;
+    }
+    // While a touch gesture engages the PDF (or a handle is being dragged),
+    // no native HTML selection should start anywhere on the page.
+    if (state === "touchPending" || state === "touchSelecting" || state === "handleDragging") {
+      event.preventDefault();
+    }
+  };
+
   const handleContextMenu = (event: MouseEvent): void => {
     if (!enabled || disposed) {
       return;
@@ -1113,6 +1161,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   window.addEventListener("pointercancel", handlePointerEnd, { capture: true });
   window.addEventListener("keydown", handleKeyDown);
   window.addEventListener("contextmenu", handleContextMenu);
+  window.addEventListener("selectstart", handleSelectStart, { capture: true });
 
   async function copySelection(): Promise<boolean> {
     const scene = lastScene;
@@ -1188,6 +1237,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       activePointerId = null;
       resetSelection(true);
       restoreCursor();
+      releaseCanvasSelectionGuards();
     },
 
     isEnabled(): boolean {
@@ -1233,12 +1283,14 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         adapter.setCameraInteractionEnabled?.(true);
       }
       restoreCursor();
+      releaseCanvasSelectionGuards();
       window.removeEventListener("pointerdown", handlePointerDown, { capture: true });
       window.removeEventListener("pointermove", handlePointerMove, { capture: true });
       window.removeEventListener("pointerup", handlePointerEnd, { capture: true });
       window.removeEventListener("pointercancel", handlePointerEnd, { capture: true });
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("contextmenu", handleContextMenu);
+      window.removeEventListener("selectstart", handleSelectStart, { capture: true });
       overlay.dispose();
     }
   };
