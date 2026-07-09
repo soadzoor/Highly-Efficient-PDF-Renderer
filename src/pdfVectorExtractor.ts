@@ -87,6 +87,21 @@ export interface SceneTextIndex {
   pages: PageTextIndex[];
 }
 
+/**
+ * One text string extracted from a PDF page via pdf.js `getTextContent()`, with its
+ * axis-aligned bounding box in composed scene coordinates (Y-up, same space as
+ * `VectorScene.endpoints`).
+ */
+export interface SceneTextItem {
+  text: string;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  /** Index into `VectorScene.pageRects` (4 floats per page). */
+  pageIndex: number;
+}
+
 export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
@@ -136,6 +151,11 @@ export interface VectorScene {
   discardedDegenerateCount: number;
   discardedDuplicateCount: number;
   discardedContainedCount: number;
+  /**
+   * Text strings with scene-space bounding boxes, present only when extracted from a PDF
+   * source with `extractTextContent` enabled (parsed-zip sources do not carry strings).
+   */
+  textContent?: SceneTextItem[];
 }
 
 export interface VectorExtractOptions {
@@ -144,6 +164,8 @@ export interface VectorExtractOptions {
   maxPages?: number;
   maxPagesPerRow?: number;
   onProgress?: LoadProgressCallback;
+  /** Also extract text strings with positions via pdf.js `getTextContent()`. Default false. */
+  extractTextContent?: boolean;
 }
 
 class Float4Builder {
@@ -344,7 +366,7 @@ const FILL_PRIMITIVE_LINE = 0;
 const FILL_PRIMITIVE_QUADRATIC = 1;
 const FILL_CUBIC_TO_QUAD_ERROR = 0.08;
 const MAX_FILL_CUBIC_TO_QUAD_DEPTH = 9;
-const STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
+export const STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
 const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
 const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
 const STROKE_STYLE_FLAG_OFFSET = 2;
@@ -358,7 +380,7 @@ function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   return normalizedAlpha + normalizedFlags * STROKE_STYLE_FLAG_OFFSET;
 }
 
-function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: number } {
+export function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: number } {
   const flags = Math.max(0, Math.trunc(encoded / STROKE_STYLE_FLAG_OFFSET + 1e-6));
   const alpha = clamp01(encoded - flags * STROKE_STYLE_FLAG_OFFSET);
   return { alpha, styleFlags: flags };
@@ -375,6 +397,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene[]> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
+  const enableTextContent = options.extractTextContent === true;
   const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
   const standardFontDataUrl = resolveStandardFontDataUrl();
   const progress = createLoadProgressReporter(options.onProgress);
@@ -434,6 +457,9 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
         enableSegmentMerge,
         enableInvisibleCull
       });
+      if (enableTextContent) {
+        pageScene.textContent = await extractPageTextContent(page);
+      }
       pageScenes.push(pageScene);
       progress.report(pageEnd, {
         stage: "pdf-page",
@@ -1176,12 +1202,29 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   const rasterLayers: RasterLayer[] = [];
   const mergedTextIndexPages: PageTextIndex[] = [];
+  const combinedTextContent: SceneTextItem[] = [];
+  let hasTextContent = false;
 
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
     const scene = pageScenes[pageIndex];
     const placement = placements[pageIndex];
     const tx = placement.translateX;
     const ty = placement.translateY;
+    const pageRectBase = pageRectOffset;
+
+    if (scene.textContent) {
+      hasTextContent = true;
+      for (const item of scene.textContent) {
+        combinedTextContent.push({
+          text: item.text,
+          minX: item.minX + tx,
+          minY: item.minY + ty,
+          maxX: item.maxX + tx,
+          maxY: item.maxY + ty,
+          pageIndex: pageRectBase + item.pageIndex
+        });
+      }
+    }
 
     for (let i = 0; i < scene.fillPathCount; i += 1) {
       const src = i * 4;
@@ -1383,6 +1426,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     discardedDuplicateCount: totalDiscardedDuplicateCount,
     discardedContainedCount: totalDiscardedContainedCount
   };
+
+  if (hasTextContent) {
+    composedScene.textContent = combinedTextContent;
+  }
 
   return optimizeVectorSceneTextGlyphs(composedScene);
 }
@@ -1972,6 +2019,79 @@ function buildPageMatrix(page: {
 
   // PDF.js display viewport is Y-down by default; convert to Y-up world space.
   return multiplyMatrices([1, 0, 0, -1, 0, viewportHeight], [a, b, c, d, e, f]);
+}
+
+async function extractPageTextContent(page: unknown): Promise<SceneTextItem[]> {
+  const textPage = page as { getTextContent?: () => Promise<{ items?: unknown[] }> };
+  if (typeof textPage.getTextContent !== "function") {
+    return [];
+  }
+
+  let content: { items?: unknown[] };
+  try {
+    content = await textPage.getTextContent();
+  } catch {
+    return [];
+  }
+
+  const pageMatrix = buildPageMatrix(page as {
+    rotate: number;
+    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; height: number };
+  });
+  const rawItems = Array.isArray(content.items) ? content.items : [];
+  const items: SceneTextItem[] = [];
+
+  for (const raw of rawItems) {
+    const item = raw as { str?: unknown; transform?: unknown; width?: unknown; height?: unknown };
+    const text = typeof item.str === "string" ? item.str : "";
+    if (text.trim().length === 0 || !Array.isArray(item.transform) || item.transform.length < 6) {
+      continue;
+    }
+
+    const a = Number(item.transform[0]);
+    const b = Number(item.transform[1]);
+    const c = Number(item.transform[2]);
+    const d = Number(item.transform[3]);
+    const e = Number(item.transform[4]);
+    const f = Number(item.transform[5]);
+    const width = Number(item.width);
+    const height = Number(item.height);
+    if (![a, b, c, d, e, f, width, height].every(Number.isFinite)) {
+      continue;
+    }
+
+    // The transform's columns carry the baseline/up directions with the font size baked
+    // into their magnitudes, while width/height are already user-space lengths — so the
+    // text rect is spanned by the *unit* directions scaled by width/height.
+    const baselineScale = Math.hypot(a, b);
+    const upScale = Math.hypot(c, d);
+    const wx = baselineScale > 0 ? (a / baselineScale) * width : width;
+    const wy = baselineScale > 0 ? (b / baselineScale) * width : 0;
+    const ux = upScale > 0 ? (c / upScale) * height : 0;
+    const uy = upScale > 0 ? (d / upScale) * height : height;
+
+    const corners = [
+      applyMatrix(pageMatrix, e, f),
+      applyMatrix(pageMatrix, e + wx, f + wy),
+      applyMatrix(pageMatrix, e + ux, f + uy),
+      applyMatrix(pageMatrix, e + wx + ux, f + wy + uy)
+    ];
+
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const corner of corners) {
+      minX = Math.min(minX, corner[0]);
+      minY = Math.min(minY, corner[1]);
+      maxX = Math.max(maxX, corner[0]);
+      maxY = Math.max(maxY, corner[1]);
+    }
+
+    items.push({ text, minX, minY, maxX, maxY, pageIndex: 0 });
+  }
+
+  return items;
 }
 
 function transformBounds(bounds: Bounds, matrix: Mat2D): Bounds {

@@ -5,9 +5,14 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
-import { runRoomDetectionOnPdf } from "./roomDetectionModel";
-import type { RoomDetection, RoomDetectionProgress, RoomDetectionResult } from "./roomDetectionTypes";
-import { runVectorRoomDetection, vectorSceneSupportsRoomDetection } from "./roomDetectionVector";
+import { detectRooms, type DetectedRoom, type RoomDetectionResult } from "./roomDetector";
+import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
+import {
+  normalizeExampleManifestEntries,
+  resolveAppAssetUrl,
+  type ExampleAssetManifest,
+  type NormalizedExampleEntry
+} from "./exampleManifest";
 
 const CAMERA_FIT_PADDING_PIXELS = 64;
 const CAMERA_CLIP_NEAR_MIN = 0.01;
@@ -83,7 +88,8 @@ interface GeneratedRoomTsv {
 }
 
 interface ClassifiedRoomDemoFiles {
-  pdfFile: File | null;
+  /** PDF or HEPR parsed-data ZIP. */
+  sourceFile: File | null;
   tsvFile: File | null;
   error: string | null;
 }
@@ -95,8 +101,15 @@ if (!GlobalWorkerOptions.workerSrc) {
 const canvas = requireElement<HTMLCanvasElement>("#viewport");
 const loadFilesButton = requireElement<HTMLButtonElement>("#load-files");
 const detectRoomsButton = requireElement<HTMLButtonElement>("#detect-rooms");
+const detectRoomsLabel = requireElement<HTMLSpanElement>("#detect-rooms-label");
+const detectRoomsSpinner = requireElement<HTMLSpanElement>("#detect-rooms-spinner");
 const downloadGeneratedTsvButton = requireElement<HTMLButtonElement>("#download-generated-tsv");
 const clearTsvButton = requireElement<HTMLButtonElement>("#clear-tsv");
+const exampleDropdownContainer = requireElement<HTMLDivElement>("#example-dropdown");
+const exampleSelectButton = requireElement<HTMLButtonElement>("#example-select");
+const exampleSelectLabel = requireElement<HTMLSpanElement>("#example-select-label");
+const exampleMenu = requireElement<HTMLDivElement>("#example-menu");
+const showRoomsCheckbox = requireElement<HTMLInputElement>("#show-rooms");
 const showRoomLabelsCheckbox = requireElement<HTMLInputElement>("#show-room-labels");
 const showRoomNumbersCheckbox = requireElement<HTMLInputElement>("#show-room-numbers");
 const fileInput = requireElement<HTMLInputElement>("#file-input");
@@ -145,7 +158,6 @@ const tempRoomLabelWorldPosition = new THREE.Vector3();
 const currentContentCenter = new THREE.Vector3();
 let currentContentRadius = 10;
 let currentPdfObject: HeprThreePdfObject | null = null;
-let currentPdfFile: File | null = null;
 let currentRoomOverlay: RoomOverlay | null = null;
 let currentParsedTsv: ParsedRoomTsv | null = null;
 let currentGeneratedTsv: GeneratedRoomTsv | null = null;
@@ -157,9 +169,21 @@ let needsRender = false;
 let isDisposed = false;
 let isBusy = false;
 
+const exampleEntryMap = new Map<string, NormalizedExampleEntry>();
+const exampleDropdown = createExampleDropdown({
+  containerElement: exampleDropdownContainer,
+  triggerElement: exampleSelectButton,
+  labelElement: exampleSelectLabel,
+  menuElement: exampleMenu,
+  onSelect: (selectionKey) => {
+    void loadExampleSelection(selectionKey);
+  }
+});
+
 resizeRenderer();
 requestRender();
 syncControlsEnabled();
+void loadExampleManifest();
 
 loadFilesButton.addEventListener("click", () => {
   fileInput.click();
@@ -167,7 +191,7 @@ loadFilesButton.addEventListener("click", () => {
 
 clearTsvButton.addEventListener("click", () => {
   clearRoomOverlay();
-  setStatus(currentPdfObject ? "TSV overlay cleared." : "Load a PDF to begin.");
+  setStatus(currentPdfObject ? "TSV overlay cleared." : "Load a PDF or parsed ZIP to begin.");
 });
 
 detectRoomsButton.addEventListener("click", () => {
@@ -176,6 +200,11 @@ detectRoomsButton.addEventListener("click", () => {
 
 downloadGeneratedTsvButton.addEventListener("click", () => {
   downloadGeneratedTsv();
+});
+
+showRoomsCheckbox.addEventListener("change", () => {
+  applyRoomGroupVisibility();
+  requestRender();
 });
 
 showRoomLabelsCheckbox.addEventListener("change", () => {
@@ -250,20 +279,20 @@ async function loadFiles(files: FileList | File[], _source: "picker" | "drop"): 
     return;
   }
 
-  const { pdfFile, tsvFile } = classified;
-  if (!pdfFile && !tsvFile) {
-    setStatus("Select or drop a PDF, a TSV, or one of each.");
+  const { sourceFile, tsvFile } = classified;
+  if (!sourceFile && !tsvFile) {
+    setStatus("Select or drop a PDF or parsed ZIP, a TSV, or one of each.");
     return;
   }
 
-  if (!pdfFile && tsvFile && !currentPdfObject) {
-    setStatus("Load or drop a PDF with this TSV first.");
+  if (!sourceFile && tsvFile && !currentPdfObject) {
+    setStatus("Load or drop a PDF or parsed ZIP with this TSV first.");
     return;
   }
 
-  if (pdfFile) {
-    const pdfLoaded = await loadPdf(pdfFile);
-    if (!pdfLoaded || !tsvFile) {
+  if (sourceFile) {
+    const sourceLoaded = await loadSceneSource(sourceFile);
+    if (!sourceLoaded || !tsvFile) {
       return;
     }
   }
@@ -274,12 +303,12 @@ async function loadFiles(files: FileList | File[], _source: "picker" | "drop"): 
 }
 
 function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFiles {
-  const supportedPdfFiles: File[] = [];
+  const supportedSourceFiles: File[] = [];
   const supportedTsvFiles: File[] = [];
 
   for (const file of Array.from(files)) {
-    if (isPdfFile(file)) {
-      supportedPdfFiles.push(file);
+    if (isPdfFile(file) || isZipFile(file)) {
+      supportedSourceFiles.push(file);
       continue;
     }
 
@@ -288,32 +317,32 @@ function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFile
     }
   }
 
-  if (supportedPdfFiles.length > 1) {
+  if (supportedSourceFiles.length > 1) {
     return {
-      pdfFile: null,
+      sourceFile: null,
       tsvFile: null,
-      error: "Select or drop only one PDF at a time."
+      error: "Select or drop only one PDF or parsed ZIP at a time."
     };
   }
 
   if (supportedTsvFiles.length > 1) {
     return {
-      pdfFile: null,
+      sourceFile: null,
       tsvFile: null,
       error: "Select or drop only one TSV at a time."
     };
   }
 
-  if (supportedPdfFiles.length === 0 && supportedTsvFiles.length === 0) {
+  if (supportedSourceFiles.length === 0 && supportedTsvFiles.length === 0) {
     return {
-      pdfFile: null,
+      sourceFile: null,
       tsvFile: null,
-      error: "Select or drop a PDF, a TSV, or one of each."
+      error: "Select or drop a PDF or parsed ZIP, a TSV, or one of each."
     };
   }
 
   return {
-    pdfFile: supportedPdfFiles[0] ?? null,
+    sourceFile: supportedSourceFiles[0] ?? null,
     tsvFile: supportedTsvFiles[0] ?? null,
     error: null
   };
@@ -322,6 +351,11 @@ function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFile
 function isPdfFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return file.type === "application/pdf" || lowerName.endsWith(".pdf");
+}
+
+function isZipFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return file.type === "application/zip" || file.type === "application/x-zip-compressed" || lowerName.endsWith(".zip");
 }
 
 function isTsvFile(file: File): boolean {
@@ -344,7 +378,96 @@ function isFileDrag(event: DragEvent): boolean {
   return Array.from(event.dataTransfer?.types ?? []).includes("Files");
 }
 
-async function loadPdf(file: File): Promise<boolean> {
+async function loadExampleManifest(): Promise<void> {
+  exampleEntryMap.clear();
+  exampleDropdown.setPlaceholder("Examples (loading...)");
+
+  try {
+    const manifestUrl = resolveAppAssetUrl("examples/manifest.json");
+    const response = await fetch(manifestUrl, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const manifest = (await response.json()) as ExampleAssetManifest;
+    const entries = normalizeExampleManifestEntries(manifest);
+    if (entries.length === 0) {
+      throw new Error("Manifest does not contain valid examples.");
+    }
+
+    const items: ExampleDropdownItem[] = entries.map((entry) => {
+      exampleEntryMap.set(entry.id, entry);
+      return {
+        name: entry.name,
+        actions: [
+          {
+            key: `${entry.id}:pdf`,
+            label: "PDF",
+            sizeLabel: formatFileSize(entry.pdfSizeBytes),
+            title: `Parse ${entry.name} from the original PDF`
+          },
+          {
+            key: `${entry.id}:zip`,
+            label: "ZIP",
+            sizeLabel: formatFileSize(entry.zipSizeBytes),
+            title: `Load precomputed parsed data for ${entry.name}`
+          }
+        ]
+      };
+    });
+    exampleDropdown.setItems(items);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[Examples] Failed to load manifest: ${message}`);
+    exampleDropdown.setPlaceholder("Examples unavailable");
+  }
+}
+
+async function loadExampleSelection(selectionKey: string): Promise<void> {
+  const separatorIndex = selectionKey.lastIndexOf(":");
+  const entry = exampleEntryMap.get(selectionKey.slice(0, separatorIndex));
+  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "zip";
+  if (!entry || isBusy) {
+    return;
+  }
+
+  exampleDropdown.setDisabled(true);
+  try {
+    setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "parsed ZIP"})...`);
+    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.zipPath, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const bytes = await response.arrayBuffer();
+    const baseName = entry.name.replace(/\.pdf$/i, "");
+    const file =
+      kind === "pdf"
+        ? new File([bytes], `${baseName}.pdf`, { type: "application/pdf" })
+        : new File([bytes], `${baseName}.zip`, { type: "application/zip" });
+    await loadSceneSource(file);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to load example ${entry.name}: ${message}`);
+  } finally {
+    exampleDropdown.setDisabled(isBusy);
+  }
+}
+
+function formatFileSize(sizeBytes: number): string {
+  const safeBytes = Math.max(0, Number(sizeBytes) || 0);
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  let value = safeBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = unitIndex === 0 ? Math.round(value) : Number(value.toFixed(2));
+  return `${rounded} ${units[unitIndex]}`;
+}
+
+async function loadSceneSource(file: File): Promise<boolean> {
+  const isZip = isZipFile(file);
   const activeToken = ++loadToken;
   setBusy(true);
   setStatus(`Loading ${file.name}...`);
@@ -358,6 +481,7 @@ async function loadPdf(file: File): Promise<boolean> {
         vectorLod: "auto",
         pageBackground: "#ffffff",
         pageBackgroundOpacity: 1,
+        extractText: true,
         onProgress: (progress) => updatePdfLoadProgress(activeToken, file.name, progress)
       },
       "webgl"
@@ -368,14 +492,17 @@ async function loadPdf(file: File): Promise<boolean> {
       return false;
     }
 
-    currentPdfCoordinateTransform = await readFirstPageCoordinateTransform(file);
+    // Parsed ZIPs carry no source PDF to derive the TSV coordinate transform from;
+    // identity matches the common case (origin-0, unrotated pages).
+    currentPdfCoordinateTransform = isZip
+      ? createIdentityPdfCoordinateTransform()
+      : await readFirstPageCoordinateTransform(file);
     if (activeToken !== loadToken) {
       pdfObject.dispose();
       return false;
     }
 
     currentPdfObject = pdfObject;
-    currentPdfFile = file;
     currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
     scene.add(pdfObject);
@@ -388,7 +515,7 @@ async function loadPdf(file: File): Promise<boolean> {
       return false;
     }
     const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Failed to load PDF: ${message}`);
+    setStatus(`Failed to load ${isZip ? "parsed ZIP" : "PDF"}: ${message}`);
     return false;
   } finally {
     if (activeToken === loadToken) {
@@ -401,7 +528,7 @@ async function loadPdf(file: File): Promise<boolean> {
 
 async function loadTsv(file: File): Promise<boolean> {
   if (!currentPdfObject) {
-    setStatus("Load a PDF before adding a TSV overlay.");
+    setStatus("Load a PDF or parsed ZIP before adding a TSV overlay.");
     return false;
   }
 
@@ -433,9 +560,8 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
   }
 
   const pdfObject = currentPdfObject;
-  const pdfFile = currentPdfFile;
-  if (!pdfObject || !pdfFile) {
-    setStatus("Load a PDF before running room detection.");
+  if (!pdfObject) {
+    setStatus("Load a PDF or parsed ZIP before running room detection.");
     return;
   }
 
@@ -444,59 +570,22 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
   setStatus("Preparing room detection...");
 
   try {
-    const pdfBytes = new Uint8Array(await pdfFile.arrayBuffer());
+    setStatus("Detecting rooms from the extracted vector scene...");
+    detectRoomsSpinner.hidden = false;
+
+    // detectRooms runs synchronously and can take a few seconds; yield two frames so
+    // the browser paints the spinner and status before the main thread blocks (the
+    // transform-based spinner animation keeps running on the compositor).
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
     if (activeToken !== roomDetectionToken) {
       return;
     }
 
-    const reportProgress = (progress: RoomDetectionProgress): void => {
-      if (activeToken !== roomDetectionToken) {
-        return;
-      }
-      if (progress.stage === "loading-model") {
-        setStatus("Loading room detector model...");
-        return;
-      }
-      if (progress.stage === "complete") {
-        setStatus("Generating TSV from room detections...");
-        return;
-      }
-      setStatus(
-        `Room detection ${progress.stage.replace(/-/g, " ")}: page ${progress.pageIndex + 1}/${Math.max(1, progress.pageCount)}`
-      );
-    };
-
-    // Vector-native detection on the extracted stroke segments; the raster CNN
-    // stays as the fallback for scanned PDFs (no usable vector ink) or when the
-    // vector models are not installed.
-    let detection: { manifest: { version: string }; result: RoomDetectionResult } | null = null;
-    if (vectorSceneSupportsRoomDetection(pdfObject.sceneData)) {
-      try {
-        detection = await runVectorRoomDetection({
-          sourceLabel: pdfObject.sourceLabel,
-          scene: pdfObject.sceneData,
-          pdfBytes,
-          maxPages: 1,
-          onProgress: reportProgress
-        });
-      } catch (error) {
-        if (activeToken !== roomDetectionToken) {
-          return;
-        }
-        console.warn("[Room detection] Vector model unavailable or failed; falling back to raster.", error);
-        setStatus("Vector room detector unavailable; falling back to the raster model...");
-      }
-    }
-    if (!detection) {
-      detection = await runRoomDetectionOnPdf({
-        sourceLabel: pdfObject.sourceLabel,
-        pdfBytes,
-        scene: pdfObject.sceneData,
-        maxPages: 1,
-        onProgress: reportProgress
-      });
-    }
-    const { manifest, result } = detection;
+    // Deterministic detection on the extracted stroke segments; seeds come from
+    // scene.textContent (extracted at load time via extractText: true).
+    const result = detectRooms(pdfObject.sceneData, { pageIndexes: [0] });
     if (activeToken !== roomDetectionToken) {
       return;
     }
@@ -504,7 +593,7 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
     const generated = createGeneratedRoomTsv(result, currentPdfCoordinateTransform, pdfObject.sourceLabel);
     if (generated.rowCount <= 0) {
       clearRoomOverlay();
-      setStatus(`Room detector ${manifest.version} did not return any first-page room polygons.`);
+      setStatus("The room detector did not return any first-page room polygons.");
       return;
     }
 
@@ -513,8 +602,12 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
     currentGeneratedTsv = generated;
     currentParsedTsv = parsedTsv;
     rebuildCurrentRoomOverlay();
+    const seedNote =
+      result.seedSource === "none"
+        ? " Source carries no extractable text (drawn as paths?), so rooms are unlabeled."
+        : "";
     setStatus(
-      `Detected ${generated.rowCount.toLocaleString()} room${generated.rowCount === 1 ? "" : "s"} with ${manifest.version}; generated ${generated.fileName}.`
+      `Detected ${generated.rowCount.toLocaleString()} room${generated.rowCount === 1 ? "" : "s"}; generated ${generated.fileName}.${seedNote}`
     );
   } catch (error) {
     if (activeToken !== roomDetectionToken) {
@@ -543,20 +636,28 @@ function createGeneratedRoomTsv(
 
   const rows = ["boundaryID\tboundaryType\troomType\troomNumber\tgeometryData"];
   let rowCount = 0;
-  for (const detection of result.detections) {
-    if (detection.pageIndex !== 0) {
+  for (const room of result.rooms) {
+    if (room.pageIndex !== 0) {
       continue;
     }
-    const geometryData = roomDetectionPolygonToGeometryData(detection, inverseMatrix);
+    const geometryData = roomDetectionPolygonToGeometryData(room, inverseMatrix);
     if (!geometryData) {
       continue;
     }
     rowCount += 1;
+    // The detector's heuristic picks the digit-bearing label as the room number;
+    // the first remaining label line ("LOCKERS", "DRESSING", ...) is the room type.
+    const roomNumber = room.roomNumber;
+    const roomType =
+      room.labelText
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 0 && line !== roomNumber) ?? "Room";
     rows.push([
       formatTsvCell(`det-${String(rowCount).padStart(4, "0")}`),
       "Room",
-      formatTsvCell(String(detection.label)),
-      formatTsvCell(detection.roomNumber ?? ""),
+      formatTsvCell(roomType),
+      formatTsvCell(roomNumber),
       formatTsvCell(geometryData)
     ].join("\t"));
   }
@@ -568,17 +669,18 @@ function createGeneratedRoomTsv(
   };
 }
 
-function roomDetectionPolygonToGeometryData(detection: RoomDetection, inverseMatrix: Mat2D): string | null {
-  if (detection.polygon.length < 3) {
+function roomDetectionPolygonToGeometryData(room: DetectedRoom, inverseMatrix: Mat2D): string | null {
+  if (room.polygon.length < 6) {
     return null;
   }
-  const points = detection.polygon
-    .map(([x, y]) => applyMatrix(inverseMatrix, x, y))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
-    .map((point) => ({
-      x: roundTsvCoordinate(point.x),
-      y: roundTsvCoordinate(point.y)
-    }));
+  const points: { x: number; y: number }[] = [];
+  for (let i = 0; i + 1 < room.polygon.length; i += 2) {
+    const point = applyMatrix(inverseMatrix, room.polygon[i], room.polygon[i + 1]);
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+      continue;
+    }
+    points.push({ x: roundTsvCoordinate(point.x), y: roundTsvCoordinate(point.y) });
+  }
   return points.length >= 3 ? JSON.stringify(points) : null;
 }
 
@@ -601,9 +703,19 @@ function rebuildCurrentRoomOverlay(): void {
   disposeRoomOverlay();
   currentRoomOverlay = createRoomOverlay(currentParsedTsv, currentPdfObject, currentPdfCoordinateTransform);
   currentPdfObject.add(currentRoomOverlay.group);
+  applyRoomGroupVisibility();
   updateRoomMetrics();
   syncControlsEnabled();
   requestRender();
+}
+
+// "Show rooms" owns the drawn room shapes (fills and outlines); the label pills stay
+// governed by their own toggles so rooms and labels are independently comparable
+// against the underlying drawing.
+function applyRoomGroupVisibility(): void {
+  if (currentRoomOverlay) {
+    currentRoomOverlay.group.visible = showRoomsCheckbox.checked;
+  }
 }
 
 function parseRoomTsv(text: string, fileName: string): ParsedRoomTsv {
@@ -1127,7 +1239,6 @@ function clearCurrentPdfObject(): void {
   clearRoomOverlay({ silent: true });
   currentParsedTsv = null;
   currentGeneratedTsv = null;
-  currentPdfFile = null;
   currentPdfCoordinateTransform = createIdentityPdfCoordinateTransform();
   if (!currentPdfObject) {
     pdfValue.textContent = "-";
@@ -1302,23 +1413,33 @@ function resolveRendererViewportPixels(): { width: number; height: number } {
 function setBusy(busy: boolean): void {
   isBusy = busy;
   loadFilesButton.disabled = busy;
-  detectRoomsButton.disabled = busy || !currentPdfObject || !currentPdfFile;
-  detectRoomsButton.textContent = busy ? "Working..." : "Detect Rooms";
+  exampleDropdown.setDisabled(busy);
+  detectRoomsButton.disabled = busy || !currentPdfObject;
+  detectRoomsLabel.textContent = busy ? "Working..." : "Detect Rooms";
   downloadGeneratedTsvButton.disabled = busy || !currentGeneratedTsv;
+  showRoomsCheckbox.disabled = busy || !currentRoomOverlay;
   showRoomLabelsCheckbox.disabled = busy || !currentRoomOverlay;
   showRoomNumbersCheckbox.disabled = busy || !currentRoomOverlay;
   clearTsvButton.disabled = busy || !currentRoomOverlay;
+  if (!busy) {
+    detectRoomsSpinner.hidden = true;
+  }
 }
 
 function syncControlsEnabled(): void {
   loadFilesButton.disabled = isBusy;
-  detectRoomsButton.disabled = isBusy || !currentPdfObject || !currentPdfFile;
-  detectRoomsButton.textContent = isBusy ? "Working..." : "Detect Rooms";
+  exampleDropdown.setDisabled(isBusy);
+  detectRoomsButton.disabled = isBusy || !currentPdfObject;
+  detectRoomsLabel.textContent = isBusy ? "Working..." : "Detect Rooms";
   downloadGeneratedTsvButton.disabled = isBusy || !currentGeneratedTsv;
+  showRoomsCheckbox.disabled = isBusy || !currentRoomOverlay;
   showRoomLabelsCheckbox.disabled = isBusy || !currentRoomOverlay;
   showRoomNumbersCheckbox.disabled = isBusy || !currentRoomOverlay;
   updateRoomLabelVisibility();
   clearTsvButton.disabled = isBusy || !currentRoomOverlay;
+  if (!isBusy) {
+    detectRoomsSpinner.hidden = true;
+  }
 }
 
 function updateRoomLabelVisibility(): void {

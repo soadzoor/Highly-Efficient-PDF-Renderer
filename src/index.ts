@@ -194,3 +194,21 @@ export {
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES
 } from "./vectorStrokeLod";
+
+export type { LoadedPdfScene } from "./pdfObjectGenerator";
+
+export type { Bounds, SceneTextItem, VectorScene } from "./pdfVectorExtractor";
+
+export { detectRooms } from "./roomDetector";
+
+export type {
+  DetectedRoom,
+  RoomDetectionDebugInfo,
+  RoomDetectionOptions,
+  RoomDetectionPageStats,
+  RoomDetectionRegionDebug,
+  RoomDetectionResult,
+  RoomSeed,
+  RoomSeedFailure,
+  RoomSeedFailureReason
+} from "./roomDetector";

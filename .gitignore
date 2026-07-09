@@ -33,3 +33,7 @@ package-lock.json
 /ml/room-detection/*splits.json
 /ml/room-detection/**/__pycache__/
 /ml/room-detection/**/*.pyc
+
+# Room-detection eval/debug outputs stay local.
+/.eval/
+/.debug/
