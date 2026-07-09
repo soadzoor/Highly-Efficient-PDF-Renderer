@@ -213,26 +213,235 @@
         font-size: 0.81rem;
         word-break: break-word;
       }
+
+      #detect-rooms {
+        display: inline-flex;
+        align-items: center;
+      }
+
+      .button-spinner {
+        width: 13px;
+        height: 13px;
+        margin-left: 8px;
+        border: 2px solid rgba(249, 250, 251, 0.35);
+        border-top-color: #f9fafb;
+        border-radius: 50%;
+        animation: spinner-rotate 0.8s linear infinite;
+      }
+
+      .button-spinner[hidden] {
+        display: none;
+      }
+
+      @keyframes spinner-rotate {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .example-dropdown {
+        position: relative;
+      }
+
+      .example-trigger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-width: 160px;
+        max-width: 100%;
+        border: 1px solid rgba(15, 23, 42, 0.35);
+        background: #ffffff;
+        color: #0f172a;
+        border-radius: 8px;
+        padding: 7px 12px;
+        font: inherit;
+        font-size: 0.88rem;
+        cursor: pointer;
+        transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+      }
+
+      .example-trigger:hover {
+        background: #f8fafc;
+        border-color: rgba(15, 23, 42, 0.55);
+      }
+
+      .example-trigger:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        pointer-events: auto;
+      }
+
+      .example-dropdown.open .example-trigger {
+        border-color: rgba(37, 99, 235, 0.65);
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16);
+      }
+
+      .example-trigger-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .example-trigger-count {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 20px;
+        height: 20px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.08);
+        color: #334155;
+        font-size: 0.72rem;
+        font-weight: 600;
+        line-height: 1;
+      }
+
+      .example-trigger-chevron {
+        color: #64748b;
+        font-size: 0.8rem;
+        line-height: 1;
+        transition: transform 140ms ease;
+      }
+
+      .example-dropdown.open .example-trigger-chevron {
+        transform: rotate(180deg);
+      }
+
+      .example-menu {
+        position: fixed;
+        z-index: 40;
+        width: max-content;
+        max-width: min(460px, calc(100vw - 32px));
+        padding: 6px;
+        overflow-y: auto;
+        background: rgba(255, 255, 255, 0.97);
+        border: 1px solid rgba(15, 23, 42, 0.14);
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2);
+        backdrop-filter: blur(8px);
+        outline: none;
+        animation: menu-pop 120ms ease-out;
+      }
+
+      .example-menu[hidden] {
+        display: none;
+      }
+
+      @keyframes menu-pop {
+        from {
+          opacity: 0;
+          transform: translateY(-4px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .example-menu-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 6px 10px;
+        border-radius: 8px;
+      }
+
+      .example-menu-row:hover {
+        background: rgba(15, 23, 42, 0.05);
+      }
+
+      .example-menu-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #0f172a;
+        font-size: 0.86rem;
+      }
+
+      .example-menu-actions {
+        display: inline-flex;
+        flex-shrink: 0;
+        gap: 6px;
+      }
+
+      .example-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid rgba(15, 23, 42, 0.18);
+        background: rgba(255, 255, 255, 0.9);
+        color: #0f172a;
+        border-radius: 999px;
+        padding: 3px 10px;
+        font: inherit;
+        font-size: 0.76rem;
+        line-height: 1.3;
+        cursor: pointer;
+        transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+      }
+
+      .example-chip:hover,
+      .example-chip:focus-visible {
+        background: #111827;
+        border-color: #111827;
+        color: #f9fafb;
+      }
+
+      .example-chip-kind {
+        font-weight: 600;
+      }
+
+      .example-chip-size {
+        color: #64748b;
+        font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
+        font-size: 0.72rem;
+      }
+
+      .example-chip:hover .example-chip-size,
+      .example-chip:focus-visible .example-chip-size {
+        color: #cbd5e1;
+      }
     </style>
-    <script type="module" crossorigin src="./assets/roomOverlay-K4ic0D99.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/rolldown-runtime-BHe-jwch.js">
+    <script type="module" crossorigin src="./assets/roomOverlay-DL9Mi7ne.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/preload-helper-HclGiUj8.js">
-    <link rel="modulepreload" crossorigin href="./assets/textSelection-CCyRrBXL.js">
+    <link rel="modulepreload" crossorigin href="./assets/textSelection-oKruHYwv.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-BrkPXbfk.js">
-    <link rel="modulepreload" crossorigin href="./assets/src-BmrdubVp.js">
+    <link rel="modulepreload" crossorigin href="./assets/src-CXtgK6Sj.js">
   </head>
   <body>
     <canvas id="viewport"></canvas>
     <div id="room-label-layer" aria-hidden="true"></div>
     <div id="panel">
       <div class="toolbar">
-        <button id="load-files" type="button">Load PDF + TSV</button>
-        <button id="detect-rooms" type="button" disabled>Detect Rooms</button>
+        <button id="load-files" type="button">Load PDF/ZIP + TSV</button>
+        <div id="example-dropdown" class="example-dropdown">
+          <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+            <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
+            <span class="example-trigger-chevron" aria-hidden="true">▾</span>
+          </button>
+          <div id="example-menu" class="example-menu" hidden></div>
+        </div>
+        <button id="detect-rooms" type="button" disabled>
+          <span id="detect-rooms-label">Detect Rooms</span>
+          <span id="detect-rooms-spinner" class="button-spinner" hidden aria-hidden="true"></span>
+        </button>
         <button id="download-generated-tsv" type="button" disabled>Download Generated TSV</button>
         <button id="clear-tsv" type="button" disabled>Clear TSV</button>
-        <input id="file-input" type="file" accept=".pdf,.tsv,application/pdf,text/tab-separated-values,text/plain" multiple hidden />
+        <input id="file-input" type="file" accept=".pdf,.zip,.tsv,application/pdf,application/zip,text/tab-separated-values,text/plain" multiple hidden />
       </div>
       <div class="toggles">
+        <label class="toggle">
+          <input id="show-rooms" type="checkbox" checked disabled />
+          <span>Show rooms</span>
+        </label>
         <label class="toggle">
           <input id="show-room-labels" type="checkbox" checked disabled />
           <span>Show labels</span>
@@ -242,7 +451,7 @@
           <span>Room numbers</span>
         </label>
       </div>
-      <div id="status" class="status">Load a PDF to begin.</div>
+      <div id="status" class="status">Load a PDF or parsed ZIP to begin.</div>
       <div class="metrics">
         <div class="metric-row"><span class="metric-label">PDF</span><span id="pdf-value" class="metric-value">-</span></div>
         <div class="metric-row"><span class="metric-label">TSV</span><span id="tsv-value" class="metric-value">-</span></div>
