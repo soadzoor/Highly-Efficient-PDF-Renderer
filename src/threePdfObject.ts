@@ -8,7 +8,11 @@ import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
-import { HEPR_THREE_LAYER_ORDER_PAGE_DEPTH, HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT } from "./threeLayerOrder";
+import {
+  HEPR_THREE_LAYER_ORDER_PAGE_DEPTH,
+  HEPR_THREE_LAYER_ORDER_SEARCH_HIGHLIGHT,
+  HEPR_THREE_LAYER_ORDER_TEXT_SELECTION
+} from "./threeLayerOrder";
 import type { Bounds } from "./pdfVectorExtractor";
 import {
   createSceneTextSearcher,
@@ -257,6 +261,9 @@ export class HeprThreePdfObject extends THREE.Group {
   private searchHighlightCurrentMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
   private searchHighlightOthersOutline: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial> | null = null;
   private searchHighlightCurrentOutline: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial> | null = null;
+  private textSelectionHighlightGroup: THREE.Group | null = null;
+  private textSelectionHighlightMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null;
+  private textSelectionHighlightOutline: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial> | null = null;
   private controlsCanvas: HTMLCanvasElement | null = null;
   private pendingInitialFit: boolean;
   private initialFitPaddingPixels: number;
@@ -289,6 +296,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly rayDirection = new THREE.Vector3();
   private readonly worldIntersection = new THREE.Vector3();
   private readonly localIntersection = new THREE.Vector3();
+  private readonly sceneToClientScratch = new THREE.Vector3();
   private readonly projectedCorner0 = new THREE.Vector3();
   private readonly projectedCorner1 = new THREE.Vector3();
   private readonly projectedCorner2 = new THREE.Vector3();
@@ -591,6 +599,199 @@ export class HeprThreePdfObject extends THREE.Group {
     this.add(group);
   }
 
+  /**
+   * Show text-selection highlight rectangles (browser-selection blue).
+   *
+   * Rectangles are in PDF scene space — the same space as the text index and
+   * `searchText` bounds — either as `Bounds` objects or as a packed
+   * `Float32Array` (minX, minY, maxX, maxY per rect, the format produced by
+   * `createTextSelectionController`). Like search highlights, they are plain
+   * three.js meshes parented to this object. Pass `null` or an empty array to
+   * clear.
+   */
+  setTextSelectionHighlights(rects: ReadonlyArray<Bounds> | Float32Array | null): void {
+    if (this.isDisposed) {
+      return;
+    }
+    const list: ReadonlyArray<Bounds> =
+      rects instanceof Float32Array
+        ? Array.from({ length: Math.floor(rects.length / 4) }, (_, i) => ({
+            minX: rects[i * 4],
+            minY: rects[i * 4 + 1],
+            maxX: rects[i * 4 + 2],
+            maxY: rects[i * 4 + 3]
+          }))
+        : rects ?? [];
+    if (list.length === 0) {
+      if (this.textSelectionHighlightGroup) {
+        this.textSelectionHighlightGroup.visible = false;
+      }
+      return;
+    }
+
+    this.ensureTextSelectionHighlightLayer();
+    const positions = new Float32Array(list.length * 18);
+    const outlinePositions = new Float32Array(list.length * 24);
+    for (let i = 0; i < list.length; i += 1) {
+      this.writeHighlightQuad(positions, i * 18, list[i]);
+      this.writeHighlightOutline(outlinePositions, i * 24, list[i]);
+    }
+
+    if (this.textSelectionHighlightMesh) {
+      this.replaceHighlightGeometry(this.textSelectionHighlightMesh, positions);
+    }
+    if (this.textSelectionHighlightOutline) {
+      this.replaceHighlightGeometry(this.textSelectionHighlightOutline, outlinePositions);
+    }
+  }
+
+  private ensureTextSelectionHighlightLayer(): void {
+    if (this.textSelectionHighlightGroup) {
+      this.textSelectionHighlightGroup.visible = true;
+      return;
+    }
+
+    const group = new THREE.Group();
+    const fillMaterial = new THREE.MeshBasicMaterial({
+      color: 0x4285f4,
+      opacity: 0.35,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+    const mesh = new THREE.Mesh(new THREE.BufferGeometry(), fillMaterial);
+    mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT_SELECTION;
+    mesh.frustumCulled = false;
+    group.add(mesh);
+    const outlineMaterial = new THREE.LineBasicMaterial({
+      color: 0x1b5dc9,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false
+    });
+    const outline = new THREE.LineSegments(new THREE.BufferGeometry(), outlineMaterial);
+    outline.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT_SELECTION + 1;
+    outline.frustumCulled = false;
+    group.add(outline);
+
+    this.textSelectionHighlightMesh = mesh;
+    this.textSelectionHighlightOutline = outline;
+    this.textSelectionHighlightGroup = group;
+    this.add(group);
+  }
+
+  /**
+   * Intersect a client-space (CSS px) point with the PDF page plane through
+   * the given camera and return PDF scene coordinates — the same space as the
+   * text index and `searchText` bounds. Returns `null` when the point misses
+   * the page plane.
+   */
+  clientToScenePoint(
+    camera: THREE.Camera,
+    clientX: number,
+    clientY: number,
+    domElement: HTMLElement
+  ): { x: number; y: number } | null {
+    if (this.isDisposed) {
+      return null;
+    }
+    const rect = domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -(((clientY - rect.top) / rect.height) * 2 - 1);
+
+    camera.updateMatrixWorld();
+    if (!this.refreshPagePlaneForPicking()) {
+      return null;
+    }
+    const localPoint = this.intersectViewportCornerWithPagePlane(camera, ndcX, ndcY);
+    if (!localPoint) {
+      return null;
+    }
+    // intersectViewportCornerWithPagePlane returns a reused scratch vector.
+    return {
+      x: localPoint.x + this.sceneCenterX,
+      y: localPoint.y + this.sceneCenterY
+    };
+  }
+
+  /**
+   * Project PDF scene coordinates to a client-space (CSS px) point through
+   * the given camera. Returns `null` when the point is behind the camera or
+   * cannot be projected.
+   */
+  sceneToClientPoint(
+    camera: THREE.Camera,
+    sceneX: number,
+    sceneY: number,
+    domElement: HTMLElement
+  ): { x: number; y: number } | null {
+    if (this.isDisposed) {
+      return null;
+    }
+    const rect = domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+
+    camera.updateMatrixWorld();
+    this.pageMesh.updateWorldMatrix(true, false);
+    const point = this.sceneToClientScratch
+      .set(sceneX - this.sceneCenterX, sceneY - this.sceneCenterY, 0)
+      .applyMatrix4(this.pageMesh.matrixWorld);
+
+    // Reject points behind the camera before projecting (project() would
+    // mirror them into view).
+    const cameraType = camera as THREE.Camera & { isPerspectiveCamera?: boolean };
+    if (cameraType.isPerspectiveCamera === true) {
+      const viewZ =
+        camera.matrixWorldInverse.elements[2] * point.x +
+        camera.matrixWorldInverse.elements[6] * point.y +
+        camera.matrixWorldInverse.elements[10] * point.z +
+        camera.matrixWorldInverse.elements[14];
+      if (viewZ >= 0) {
+        return null;
+      }
+    }
+
+    point.project(camera);
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+      return null;
+    }
+
+    return {
+      x: rect.left + (point.x + 1) * 0.5 * rect.width,
+      y: rect.top + (1 - point.y) * 0.5 * rect.height
+    };
+  }
+
+  /**
+   * Refresh the page plane and world-inverse used by plane picking, matching
+   * the setup camera-driven rendering performs before corner projection.
+   */
+  private refreshPagePlaneForPicking(): boolean {
+    this.pageMesh.updateWorldMatrix(true, false);
+    this.pagePlanePoint.set(0, 0, 0).applyMatrix4(this.pageMesh.matrixWorld);
+    this.pagePlaneNormal.set(0, 0, 1).transformDirection(this.pageMesh.matrixWorld);
+    if (
+      !Number.isFinite(this.pagePlaneNormal.x) ||
+      !Number.isFinite(this.pagePlaneNormal.y) ||
+      !Number.isFinite(this.pagePlaneNormal.z)
+    ) {
+      return false;
+    }
+    this.pagePlane.setFromNormalAndCoplanarPoint(this.pagePlaneNormal, this.pagePlanePoint);
+    this.pageWorldInverse.copy(this.pageMesh.matrixWorld);
+    if (Math.abs(this.pageWorldInverse.determinant()) < 1e-10) {
+      return false;
+    }
+    this.pageWorldInverse.invert();
+    return true;
+  }
+
   private writeHighlightOutline(target: Float32Array, offset: number, bounds: Bounds): void {
     const minX = bounds.minX - this.sceneCenterX;
     const minY = bounds.minY - this.sceneCenterY;
@@ -845,6 +1046,16 @@ export class HeprThreePdfObject extends THREE.Group {
       this.searchHighlightOthersOutline = null;
       this.searchHighlightCurrentMesh = null;
       this.searchHighlightCurrentOutline = null;
+    }
+    if (this.textSelectionHighlightGroup) {
+      this.textSelectionHighlightMesh?.geometry.dispose();
+      this.textSelectionHighlightMesh?.material.dispose();
+      this.textSelectionHighlightOutline?.geometry.dispose();
+      this.textSelectionHighlightOutline?.material.dispose();
+      this.remove(this.textSelectionHighlightGroup);
+      this.textSelectionHighlightGroup = null;
+      this.textSelectionHighlightMesh = null;
+      this.textSelectionHighlightOutline = null;
     }
     this.remove(this.pageMesh);
     this.remove(this.rasterMaterialLayer.group);

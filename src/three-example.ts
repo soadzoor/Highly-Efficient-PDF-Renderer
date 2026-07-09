@@ -4,6 +4,7 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
   createThreePdfObject,
+  createTextSelectionController,
   pdfObjectGenerator,
   consumeVectorStrokeLodBuildTiming,
   resetVectorStrokeLodBuildTiming,
@@ -54,6 +55,7 @@ const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-p
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
+const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
@@ -94,6 +96,7 @@ if (
   !backendSelect ||
   !vectorLodSelect ||
   !touchRotateCheckbox ||
+  !textSelectionCheckbox ||
   !touchRotateRow ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
@@ -132,6 +135,7 @@ const downloadPdfButtonElement = downloadPdfButton;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
 const touchRotateCheckboxElement = touchRotateCheckbox;
+const textSelectionCheckboxElement = textSelectionCheckbox;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -210,6 +214,26 @@ updatePerspectiveCameraProjection();
 let controls = createMapControls();
 
 let currentPdfObject: HeprThreePdfObject | null = null;
+
+const textSelection = createTextSelectionController({
+  getCanvas: () => canvasElement,
+  enabled: textSelectionCheckboxElement.checked,
+  adapter: {
+    getScene: () => currentPdfObject?.sceneData ?? null,
+    clientToScenePoint: (clientX, clientY) =>
+      currentPdfObject?.clientToScenePoint(camera, clientX, clientY, canvasElement) ?? null,
+    sceneToClientPoint: (sceneX, sceneY) =>
+      currentPdfObject?.sceneToClientPoint(camera, sceneX, sceneY, canvasElement) ?? null,
+    setSelectionHighlights: (rects) => {
+      currentPdfObject?.setTextSelectionHighlights(rects);
+      requestRender();
+    },
+    setCameraInteractionEnabled: (interactionEnabled) => {
+      controls.enabled = interactionEnabled;
+    }
+  }
+});
+
 let lastLoadedSource: File | string | null = null;
 let lastDownloadablePdf: PdfDownloadSource | null = null;
 let animationFrameId = 0;
@@ -359,6 +383,7 @@ function renderFrame(now: number = performance.now()): void {
   renderer.clear(true, true, true);
   renderer.clearDepth();
   renderer.render(scene, camera);
+  textSelection.updateOverlay();
   updateDrawStatsMeter();
   updateLodStatsMeter();
   renderedFrameSerial += 1;
@@ -478,6 +503,15 @@ touchRotateCheckboxElement.addEventListener("change", () => {
   applyTouchGestureMode(controls);
   setStatus(`Touch rotate ${readTouchRotateEnabled() ? "enabled" : "disabled"}.`);
   requestRender();
+}, { signal: lifetimeSignal });
+
+textSelectionCheckboxElement.addEventListener("change", () => {
+  if (textSelectionCheckboxElement.checked) {
+    textSelection.enable();
+  } else {
+    textSelection.disable();
+  }
+  setStatus(`Text selection ${textSelectionCheckboxElement.checked ? "enabled" : "disabled"}.`);
 }, { signal: lifetimeSignal });
 
 window.addEventListener("pointerdown", (event) => {

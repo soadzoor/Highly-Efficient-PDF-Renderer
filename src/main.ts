@@ -51,6 +51,7 @@ import {
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { createTextSearchController, type TextSearchController, type TextSearchMatch } from "./textSearch";
 import { createTextSearchWidget } from "./textSearchWidget";
+import { createTextSelectionController } from "./textSelection";
 import type { SearchHighlightSet } from "./rendererTypes";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -98,6 +99,7 @@ const textSearchCount = document.querySelector<HTMLSpanElement>("#text-search-co
 const textSearchPrevButton = document.querySelector<HTMLButtonElement>("#text-search-prev");
 const textSearchNextButton = document.querySelector<HTMLButtonElement>("#text-search-next");
 const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-search-case");
+const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 
 if (
   !canvas ||
@@ -142,7 +144,8 @@ if (
   !textSearchCount ||
   !textSearchPrevButton ||
   !textSearchNextButton ||
-  !textSearchCaseButton
+  !textSearchCaseButton ||
+  !textSelectionCheckbox
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -261,8 +264,33 @@ function applyTextSearchScene(scene: VectorScene): void {
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
 }
 
+const textSelection = createTextSelectionController({
+  getCanvas: () => canvasElement,
+  enabled: textSelectionCheckbox.checked,
+  adapter: {
+    getScene: () => lastParsedScene,
+    clientToScenePoint: (clientX, clientY) => renderer.clientToScenePoint?.(clientX, clientY) ?? null,
+    sceneToClientPoint: (sceneX, sceneY) => renderer.sceneToClientPoint?.(sceneX, sceneY) ?? null,
+    setSelectionHighlights: (rects) => renderer.setTextSelectionHighlights?.(rects),
+    setCameraInteractionEnabled: (interactionEnabled) => {
+      if (!interactionEnabled) {
+        canvasInteractionController.cancelActiveGesture();
+      }
+    }
+  }
+});
+
+textSelectionCheckbox.addEventListener("change", () => {
+  if (textSelectionCheckbox.checked) {
+    textSelection.enable();
+  } else {
+    textSelection.disable();
+  }
+});
+
 function onRendererFrame(stats: DrawStats): void {
   updateFpsMetric();
+  textSelection.updateOverlay();
 
   const rendered = stats.renderedSegments.toLocaleString();
   const total = stats.totalSegments.toLocaleString();
@@ -377,6 +405,7 @@ backendSwitcher = createBackendSwitcher({
     renderer = nextRenderer;
     // Highlights live in renderer-owned GPU buffers; re-apply after a switch.
     renderer.setSearchHighlights?.(lastSearchHighlights);
+    textSelection.refreshHighlights();
   },
   getCanvasElement: () => canvasElement,
   setCanvasElement: (nextCanvas) => {

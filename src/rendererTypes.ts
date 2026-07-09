@@ -94,6 +94,18 @@ export interface RendererApi {
   /** Draw search-highlight rectangles as part of every rendered frame. */
   setSearchHighlights?(highlights: SearchHighlightSet | null): void;
 
+  /**
+   * Draw text-selection rectangles (scene space, 4 floats per rect as
+   * minX, minY, maxX, maxY) as part of every rendered frame; null clears.
+   */
+  setTextSelectionHighlights?(rects: Float32Array | null): void;
+
+  /** Map a client-space (CSS px) point to PDF scene coordinates. */
+  clientToScenePoint?(clientX: number, clientY: number): { x: number; y: number } | null;
+
+  /** Map PDF scene coordinates to a client-space (CSS px) point. */
+  sceneToClientPoint?(sceneX: number, sceneY: number): { x: number; y: number } | null;
+
   /** Fit native view state to bounds with optional pixel padding. */
   fitToBounds(bounds: Bounds, paddingPixels?: number): void;
 

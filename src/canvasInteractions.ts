@@ -20,6 +20,13 @@ export interface CanvasInteractionController {
 
   /** Clear transient pointer/touch gesture state. */
   resetState(): void;
+
+  /**
+   * Cancel any in-flight pan/pinch gesture: releases pointer captures and
+   * ends the renderer pan interaction. Used when another feature (e.g. text
+   * selection) takes over an active pointer mid-gesture.
+   */
+  cancelActiveGesture(): void;
 }
 
 /**
@@ -369,9 +376,20 @@ export function createCanvasInteractionController(
     resetPointerGestureState(true);
   }
 
+  function cancelActiveGesture(): void {
+    const targetCanvas = attachedCanvas;
+    if (targetCanvas) {
+      for (const pointerId of activePointerIds) {
+        releasePointerCaptureIfHeld(targetCanvas, pointerId);
+      }
+    }
+    resetPointerGestureState(true);
+  }
+
   return {
     attach,
     detach,
-    resetState
+    resetState,
+    cancelActiveGesture
   };
 }
