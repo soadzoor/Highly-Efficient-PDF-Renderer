@@ -33,10 +33,21 @@ interface ThreeWebGpuStrokeMaterialOptions {
   strokeCurveEnabled: boolean;
 }
 
-type WgslFunction = ReturnType<typeof TSL.wgslFn>;
+// Deliberately typed as `unknown`: naming the TSL function type (e.g. via
+// `ReturnType<typeof TSL.wgslFn>`) instantiates @types/three's recursive
+// ProxiedTuple/ProxiedObject types, which hangs the TypeScript 7 native compiler.
+// Since three r180, wgslFn results are proxies without a `functionNode`
+// property; the include entry is the wgslFn value itself.
+function includeNode(fn: unknown): never {
+  return fn as never;
+}
 
-function includeNode(fn: WgslFunction): never {
-  return (fn as WgslFunction & { functionNode: unknown }).functionNode as never;
+function callNode(fn: unknown, params: Record<string, unknown>): never {
+  return (fn as (...args: unknown[]) => unknown)(params) as never;
+}
+
+function varyingNode(node: unknown): never {
+  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
 const segmentCoordFn = TSL.wgslFn(`
@@ -234,16 +245,16 @@ export function createThreeWebGpuStrokeMaterial(
 
   const corner = TSL.attribute("aCorner", "vec2");
   const segmentIndex = TSL.attribute("aSegmentIndex", "float");
-  const coord = segmentCoordFn({
+  const coord = callNode(segmentCoordFn, {
     index: segmentIndex,
     width: segmentTextureWidthUniform
   });
 
-  const primitiveA = TSL.varying(TSL.textureLoad(options.segmentTextureA, coord, 0));
-  const primitiveB = TSL.varying(TSL.textureLoad(options.segmentTextureB, coord, 0));
-  const style = TSL.varying(TSL.textureLoad(options.segmentStyleTexture, coord, 0));
-  const primitiveBounds = TSL.varying(TSL.textureLoad(options.segmentBoundsTexture, coord, 0));
-  const worldPack = TSL.varying(worldPackFn({
+  const primitiveA = varyingNode(TSL.textureLoad(options.segmentTextureA, coord, 0));
+  const primitiveB = varyingNode(TSL.textureLoad(options.segmentTextureB, coord, 0));
+  const style = varyingNode(TSL.textureLoad(options.segmentStyleTexture, coord, 0));
+  const primitiveBounds = varyingNode(TSL.textureLoad(options.segmentBoundsTexture, coord, 0));
+  const worldPack = varyingNode(callNode(worldPackFn, {
     corner,
     primitiveA,
     primitiveB,
@@ -254,7 +265,7 @@ export function createThreeWebGpuStrokeMaterial(
     localUnitsPerPixelInput: localUnitsPerPixelUniform,
     aaScreenPx: aaScreenPxUniform
   }));
-  const worldPackValue = worldPack as typeof worldPack & {
+  const worldPackValue = worldPack as {
     xy: unknown;
     z: unknown;
   };
@@ -264,7 +275,7 @@ export function createThreeWebGpuStrokeMaterial(
   const localToClipUniform = TSL.uniform(options.localToClip);
   const vectorOverrideUniform = TSL.uniform(options.vectorOverride);
 
-  material.vertexNode = clipPositionFn({
+  material.vertexNode = callNode(clipPositionFn, {
     worldPack,
     viewport: viewportUniform,
     cameraCenter: cameraCenterUniform,
@@ -272,7 +283,7 @@ export function createThreeWebGpuStrokeMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: localToClipUniform
   });
-  material.fragmentNode = (fragmentFn as (...params: unknown[]) => unknown)({
+  material.fragmentNode = callNode(fragmentFn, {
     local: worldPackValue.xy,
     primitiveA,
     primitiveB,
@@ -282,7 +293,7 @@ export function createThreeWebGpuStrokeMaterial(
     strokeCurveEnabled: curveUniform,
     aaScreenPx: aaScreenPxUniform,
     vectorOverride: vectorOverrideUniform
-  }) as never;
+  });
 
   return {
     material,
