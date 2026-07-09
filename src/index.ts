@@ -161,6 +161,19 @@ export type {
 
 export type { HeprTextSearchMatch } from "./threePdfObject";
 
+export { createTextSelectionController } from "./textSelection";
+
+export type {
+  TextSelectionAdapter,
+  TextSelectionCaret,
+  TextSelectionController,
+  TextSelectionOptions,
+  TextSelectionPoint,
+  TextSelectionRange
+} from "./textSelection";
+
+export { computeCharQuad, computeCharRangeBounds } from "./sceneTextGeometry";
+
 export type { SearchHighlightSet } from "./rendererTypes";
 
 export type { PageTextIndex, SceneTextIndex } from "./pdfVectorExtractor";

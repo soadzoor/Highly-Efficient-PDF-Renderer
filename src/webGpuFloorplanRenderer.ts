@@ -1047,7 +1047,9 @@ const HIGHLIGHT_STYLE_BUFFER_BYTES = 48;
 /** Browser-find style: semi-transparent fill with a solid outline ring. */
 const HIGHLIGHT_STYLES: ReadonlyArray<{ fillColor: readonly number[]; borderColor: readonly number[]; borderPx: number }> = [
   { fillColor: [1, 0.921, 0.231, 0.35], borderColor: [0.792, 0.541, 0.016, 1], borderPx: 1 },
-  { fillColor: [1, 0.596, 0, 0.45], borderColor: [0.918, 0.345, 0.047, 1], borderPx: 2 }
+  { fillColor: [1, 0.596, 0, 0.45], borderColor: [0.918, 0.345, 0.047, 1], borderPx: 2 },
+  // Text-selection style: browser-selection blue, same fill+ring treatment.
+  { fillColor: [0.259, 0.522, 0.957, 0.35], borderColor: [0.106, 0.365, 0.788, 1], borderPx: 1 }
 ];
 const HIGHLIGHT_MIN_SIZE_PX = 2;
 
@@ -1191,13 +1193,21 @@ export class WebGpuFloorplanRenderer {
 
   private highlightCurrentRectBuffer: any = null;
 
+  private highlightSelectionRectsBuffer: any = null;
+
+  private highlightSelectionCapacityBytes = 0;
+
   private highlightOthersBindGroups: any[] = [];
 
   private highlightCurrentBindGroups: any[] = [];
 
+  private highlightSelectionBindGroups: any[] = [];
+
   private highlightOthersCount = 0;
 
   private highlightHasCurrent = false;
+
+  private highlightSelectionCount = 0;
 
   private readonly blitUniformBuffer: any;
 
@@ -2434,8 +2444,43 @@ export class WebGpuFloorplanRenderer {
         ]
       });
 
-    this.highlightOthersBindGroups = [makeBindGroup(0, this.highlightOthersRectsBuffer)];
-    this.highlightCurrentBindGroups = [makeBindGroup(1, this.highlightCurrentRectBuffer)];
+    this.highlightOthersBindGroups = this.highlightOthersRectsBuffer ? [makeBindGroup(0, this.highlightOthersRectsBuffer)] : [];
+    this.highlightCurrentBindGroups = this.highlightCurrentRectBuffer ? [makeBindGroup(1, this.highlightCurrentRectBuffer)] : [];
+    this.highlightSelectionBindGroups = this.highlightSelectionRectsBuffer
+      ? [makeBindGroup(2, this.highlightSelectionRectsBuffer)]
+      : [];
+  }
+
+  setTextSelectionHighlights(rects: Float32Array | null): void {
+    const count = rects ? Math.floor(rects.length / 4) : 0;
+    if (!rects || count === 0) {
+      if (this.highlightSelectionCount !== 0) {
+        this.highlightSelectionCount = 0;
+        this.requestFrame();
+      }
+      return;
+    }
+
+    const data = rects.length === count * 4 ? rects : rects.subarray(0, count * 4);
+    const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
+    let bindGroupsInvalid = false;
+    if (!this.highlightSelectionRectsBuffer || this.highlightSelectionCapacityBytes < data.byteLength) {
+      this.highlightSelectionRectsBuffer?.destroy();
+      this.highlightSelectionCapacityBytes = Math.max(data.byteLength, 16 * 64);
+      this.highlightSelectionRectsBuffer = this.gpuDevice.createBuffer({
+        size: this.highlightSelectionCapacityBytes,
+        usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
+      });
+      bindGroupsInvalid = true;
+    }
+    this.gpuDevice.queue.writeBuffer(this.highlightSelectionRectsBuffer, 0, data);
+
+    if (bindGroupsInvalid || this.highlightSelectionBindGroups.length === 0) {
+      this.rebuildHighlightBindGroups();
+    }
+
+    this.highlightSelectionCount = count;
+    this.requestFrame();
   }
 
   /**
@@ -2451,7 +2496,7 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number,
     zoomValue: number
   ): void {
-    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent) {
+    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent && this.highlightSelectionCount === 0) {
       return;
     }
 
@@ -2464,6 +2509,11 @@ export class WebGpuFloorplanRenderer {
     this.gpuDevice.queue.writeBuffer(this.highlightCameraBuffer, 0, camera);
 
     pass.setPipeline(this.highlightPipeline);
+    // Selection first so the search current-match ring stays visible on top.
+    if (this.highlightSelectionCount > 0 && this.highlightSelectionBindGroups.length === 1) {
+      pass.setBindGroup(0, this.highlightSelectionBindGroups[0]);
+      pass.draw(4, this.highlightSelectionCount, 0, 0);
+    }
     if (this.highlightOthersCount > 0 && this.highlightOthersBindGroups.length === 1) {
       pass.setBindGroup(0, this.highlightOthersBindGroups[0]);
       pass.draw(4, this.highlightOthersCount, 0, 0);
@@ -2592,6 +2642,10 @@ export class WebGpuFloorplanRenderer {
     if (this.highlightCurrentRectBuffer) {
       this.highlightCurrentRectBuffer.destroy();
       this.highlightCurrentRectBuffer = null;
+    }
+    if (this.highlightSelectionRectsBuffer) {
+      this.highlightSelectionRectsBuffer.destroy();
+      this.highlightSelectionRectsBuffer = null;
     }
     if (this.blitUniformBuffer) {
       this.blitUniformBuffer.destroy();
@@ -4068,6 +4122,26 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphSegmentTextureA = null;
     this.textGlyphSegmentTextureB = null;
     this.textRasterAtlasTexture = null;
+  }
+
+  clientToScenePoint(clientX: number, clientY: number): { x: number; y: number } | null {
+    return this.clientToWorld(clientX, clientY);
+  }
+
+  sceneToClientPoint(sceneX: number, sceneY: number): { x: number; y: number } | null {
+    const rect = this.resolveInteractionViewportRect();
+    const pixelScale = this.resolveClientToPixelScale(rect);
+    if (pixelScale.x === 0 || pixelScale.y === 0) {
+      return null;
+    }
+
+    const pixelX = (sceneX - this.cameraCenterX) * this.zoom + this.canvas.width * 0.5;
+    const pixelY = (sceneY - this.cameraCenterY) * this.zoom + this.canvas.height * 0.5;
+
+    return {
+      x: rect.left + pixelX / pixelScale.x,
+      y: rect.bottom - pixelY / pixelScale.y
+    };
   }
 
   private clientToWorld(clientX: number, clientY: number): { x: number; y: number } {

@@ -34,14 +34,21 @@ interface ThreeWebGpuTextMaterialOptions {
   textVectorOnly: boolean;
 }
 
-type WgslFunction = ReturnType<typeof TSL.wgslFn>;
-
-function includeNode(fn: WgslFunction): never {
-  return (fn as WgslFunction & { functionNode: unknown }).functionNode as never;
+// Deliberately typed as `unknown`: naming the TSL function type (e.g. via
+// `ReturnType<typeof TSL.wgslFn>`) instantiates @types/three's recursive
+// ProxiedTuple/ProxiedObject types, which hangs the TypeScript 7 native compiler.
+// Since three r180, wgslFn results are proxies without a `functionNode`
+// property; the include entry is the wgslFn value itself.
+function includeNode(fn: unknown): never {
+  return fn as never;
 }
 
-function callNode(fn: WgslFunction, params: Record<string, unknown>): never {
+function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
+}
+
+function varyingNode(node: unknown): never {
+  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
 const coordFromIndexFn = TSL.wgslFn(`
@@ -300,23 +307,23 @@ export function createThreeWebGpuTextMaterial(
     index: instanceIndex,
     width: instanceTextureWidthUniform
   });
-  const instanceA = TSL.varying(TSL.textureLoad(options.textInstanceTextureA, instanceCoord, 0));
-  const instanceB = TSL.varying(TSL.textureLoad(options.textInstanceTextureB, instanceCoord, 0));
-  const instanceColor = TSL.varying(TSL.textureLoad(options.textInstanceTextureC, instanceCoord, 0));
+  const instanceA = varyingNode(TSL.textureLoad(options.textInstanceTextureA, instanceCoord, 0));
+  const instanceB = varyingNode(TSL.textureLoad(options.textInstanceTextureB, instanceCoord, 0));
+  const instanceColor = varyingNode(TSL.textureLoad(options.textInstanceTextureC, instanceCoord, 0));
   const glyphCoord = callNode(coordFromIndexFn, {
-    index: (instanceB as typeof instanceB & { z: unknown }).z,
+    index: (instanceB as { z: unknown }).z,
     width: glyphTextureWidthUniform
   });
-  const glyphMetaA = TSL.varying(TSL.textureLoad(options.textGlyphMetaTextureA, glyphCoord, 0));
-  const glyphMetaB = TSL.varying(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0));
-  const vertexPack = TSL.varying(callNode(textVertexPackFn, {
+  const glyphMetaA = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, glyphCoord, 0));
+  const glyphMetaB = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0));
+  const vertexPack = varyingNode(callNode(textVertexPackFn, {
     corner,
     instanceA,
     instanceB,
     glyphMetaA,
     glyphMetaB
   }));
-  const vertexPackValue = vertexPack as typeof vertexPack & { zw: unknown };
+  const vertexPackValue = vertexPack as { zw: unknown };
 
   material.vertexNode = callNode(textClipFn, {
     vertexPack,

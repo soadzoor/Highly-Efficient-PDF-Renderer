@@ -29,6 +29,7 @@ HEPR was mostly inspired by the PDF GPU-text rendering work shared at <https://w
 - Multi-page PDF extraction and grid composition.
 - Stroked paths, filled paths, vector text, and embedded raster image layers.
 - Browser-style find-in-text: full-document search over the extracted text with GPU-drawn match highlights, exposed through the package API.
+- Native-viewer text selection: drag to select on desktop (with a `text` cursor over selectable text), long-press with drag handles and a Copy popup on touch devices, blue GPU-drawn highlights, and clipboard copy — optional and exposed through the package API.
 - Parsed-data ZIP export/import to skip repeated PDF extraction, with delta/varint-compressed geometry and a searchable text index (exported ZIPs are typically smaller than the source PDFs).
 - Runtime diagnostics for FPS, draw counts, Vector LOD state, parse/upload timing, texture usage, and culling stats.
 
@@ -71,6 +72,7 @@ Controls include:
 - backend switcher: WebGL / WebGPU
 - Vector LOD mode: Auto / Off / Force
 - find-in-text search (also on `Ctrl`/`Cmd+F`) with next/prev, match counter, and case-sensitivity toggle
+- text selection on/off toggle: drag over text with the primary button (double-click selects a word, `Ctrl`/`Cmd+C` copies); long-press on touch
 - page background color/opacity
 - vector override color/opacity
 - collapsible diagnostics panel
@@ -84,6 +86,7 @@ Controls include:
 - backend switcher: WebGL / WebGPU
 - Vector LOD mode: Auto / Off / Force
 - find-in-text search with next/prev, match counter, case-sensitivity toggle, and camera fly-to
+- text selection on/off toggle: drag over text with the primary button (double-click selects a word, `Ctrl`/`Cmd+C` copies); long-press on touch
 - optional touch rotation on touch-capable devices
 - page background color/opacity
 - vector override color/opacity
@@ -169,6 +172,7 @@ Useful object APIs:
 - `pdfObject.fitToBounds()` for the internal fallback view state
 - `pdfObject.attachControls(renderer.domElement)` for HEPR's fallback 2D controls
 - `pdfObject.hasSearchableText`, `pdfObject.searchText(...)`, `pdfObject.setSearchHighlights(...)` (see below)
+- `pdfObject.clientToScenePoint(...)`, `pdfObject.sceneToClientPoint(...)`, `pdfObject.setTextSelectionHighlights(...)` (see "Text Selection" below)
 - `pdfObject.dispose()`
 
 ### Find in Text
@@ -234,6 +238,101 @@ Advanced render pipelines can call
 `pdfObject.prepareFrameForThreeRenderer(renderer, camera)` manually before
 `renderer.render(scene, camera)`, but normal three.js render loops do not need
 it because the PDF object synchronizes itself through `onBeforeRender`.
+
+### Text Selection
+
+`createTextSelectionController` adds native-viewer style text selection on top
+of any HEPR-rendered canvas. It is fully optional — nothing is selectable
+unless you create the controller.
+
+What it does out of the box:
+
+- **Desktop:** the cursor turns into a `text` caret over selectable text, and a
+  primary-button drag that starts on text selects instead of panning (drags on
+  empty space keep panning as usual). Double-click selects a word, a click on
+  empty space clears the selection, and `Ctrl`/`Cmd+C` copies it. Right-clicking
+  the selection opens a custom context menu with a **Copy** action (the
+  browser's native menu cannot offer "Copy" for canvas-rendered text).
+- **Touch (Android/iOS):** a long-press on text selects the word under the
+  finger; dragging on extends the selection word by word. On release, two
+  native-style drag handles adjust the range character-precisely and a floating
+  **Copy** button writes the text to the clipboard. One-finger pan and
+  two-finger pinch are untouched.
+- Selection highlights use the search-highlight style in browser-selection
+  blue and are GPU-drawn, so they stick to the text through pans and zooms.
+- Selections can span multiple pages; pages are joined with `\n` in the copied
+  text.
+
+The controller is renderer-agnostic: it talks to your setup through a small
+adapter. With the three.js wrapper and `MapControls`/`OrbitControls`:
+
+```ts
+import { createTextSelectionController } from "@soadzoor/hepr";
+
+const textSelection = createTextSelectionController({
+  getCanvas: () => renderer.domElement,
+  enabled: true, // optional feature toggle (default true)
+  adapter: {
+    getScene: () => pdfObject.sceneData,
+    clientToScenePoint: (x, y) =>
+      pdfObject.clientToScenePoint(camera, x, y, renderer.domElement),
+    sceneToClientPoint: (x, y) =>
+      pdfObject.sceneToClientPoint(camera, x, y, renderer.domElement),
+    setSelectionHighlights: (rects) => pdfObject.setTextSelectionHighlights(rects),
+    // Suspends the camera controls while a touch selection gesture owns the pointer.
+    setCameraInteractionEnabled: (enabled) => {
+      controls.enabled = enabled;
+    }
+  },
+  onSelectionChange: (range, text) => console.log(text),
+  onCopy: (text) => console.log("copied:", text)
+});
+
+// In your render loop, after renderer.render(...): keeps the touch handles
+// and Copy button glued to the selection while the camera moves.
+textSelection.updateOverlay();
+
+// Later:
+textSelection.disable(); // or .enable(); construction option `enabled` sets the initial state
+textSelection.getSelectedText();
+await textSelection.copySelection();
+textSelection.dispose();
+```
+
+For the native renderers, the adapter maps straight onto `RendererApi` — the
+new `clientToScenePoint` / `sceneToClientPoint` coordinate helpers and
+`setTextSelectionHighlights(rects)` exist on both `WebGlFloorplanRenderer` and
+`WebGpuFloorplanRenderer`. If you use HEPR's built-in 2D controls, pass the
+interaction controller's `cancelActiveGesture()` so a long-press can take over
+an in-flight pan:
+
+```ts
+const textSelection = createTextSelectionController({
+  getCanvas: () => canvas,
+  adapter: {
+    getScene: () => scene,
+    clientToScenePoint: (x, y) => renderer.clientToScenePoint?.(x, y) ?? null,
+    sceneToClientPoint: (x, y) => renderer.sceneToClientPoint?.(x, y) ?? null,
+    setSelectionHighlights: (rects) => renderer.setTextSelectionHighlights?.(rects),
+    setCameraInteractionEnabled: (enabled) => {
+      if (!enabled) canvasInteractionController.cancelActiveGesture();
+    }
+  }
+});
+```
+
+Notes:
+
+- Call `textSelection.refreshHighlights()` after swapping renderer backends
+  (highlights live in renderer-owned GPU buffers).
+- The controller resets itself automatically when `adapter.getScene()` starts
+  returning a different scene (new document loaded).
+- Selection works on scenes loaded from PDFs and from parsed-data ZIPs, and
+  coexists with search highlights (the current search match stays visible on
+  top of a selection).
+- Rotated/vertical text falls back to axis-aligned boxes, mirroring search.
+- See `src/three-example.ts` and `src/main.ts` for the two complete working
+  integrations.
 
 Package exports:
 
@@ -383,4 +482,4 @@ npm run preview
 - Three.js WebGPU support is implemented through Three's WebGPU renderer/material path, not by mixing a WebGPU-rendered canvas texture into a WebGL scene.
 - Embedded PDF image layers remain raster images by definition; the "no raster fallback" rule applies to vector floorplan geometry.
 - Parsed ZIPs improve load time by skipping PDF extraction, but large stroke-heavy scenes may still spend time building Vector LOD.
-- Most of this repo was "vibe-coded" with Codex. It would've taken a lot more time (~forever) without AI tools to get to this stage for me, even though I'm a professional graphical programmer. The know-hows, and technical details about PDFs are way out of my expertise.
+- Most of this repo was "vibe-coded" with Codex and Fable. It would've taken a lot more time (~forever) without AI tools to get to this stage for me, even though I'm a professional graphical programmer. The know-hows, and technical details about PDFs are way out of my expertise.

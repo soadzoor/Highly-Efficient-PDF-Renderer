@@ -27,14 +27,21 @@ interface ThreeWebGpuFillMaterialOptions {
   vectorOverride: THREE.Vector4;
 }
 
-type WgslFunction = ReturnType<typeof TSL.wgslFn>;
-
-function includeNode(fn: WgslFunction): never {
-  return (fn as WgslFunction & { functionNode: unknown }).functionNode as never;
+// Deliberately typed as `unknown`: naming the TSL function type (e.g. via
+// `ReturnType<typeof TSL.wgslFn>`) instantiates @types/three's recursive
+// ProxiedTuple/ProxiedObject types, which hangs the TypeScript 7 native compiler.
+// Since three r180, wgslFn results are proxies without a `functionNode`
+// property; the include entry is the wgslFn value itself.
+function includeNode(fn: unknown): never {
+  return fn as never;
 }
 
-function callNode(fn: WgslFunction, params: Record<string, unknown>): never {
+function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
+}
+
+function varyingNode(node: unknown): never {
+  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
 const coordFromIndexFn = TSL.wgslFn(`
@@ -299,16 +306,16 @@ export function createThreeWebGpuFillMaterial(
     index: fillPathIndex,
     width: fillPathTextureWidthUniform
   });
-  const metaA = TSL.varying(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0));
-  const metaB = TSL.varying(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0));
-  const metaC = TSL.varying(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0));
-  const vertexPack = TSL.varying(callNode(fillVertexPackFn, {
+  const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0));
+  const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0));
+  const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0));
+  const vertexPack = varyingNode(callNode(fillVertexPackFn, {
     corner,
     metaA,
     metaB,
     metaC
   }));
-  const vertexPackValue = vertexPack as typeof vertexPack & { xy: unknown };
+  const vertexPackValue = vertexPack as { xy: unknown };
 
   material.vertexNode = callNode(fillClipFn, {
     vertexPack,

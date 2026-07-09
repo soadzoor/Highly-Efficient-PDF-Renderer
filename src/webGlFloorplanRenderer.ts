@@ -1066,6 +1066,10 @@ const HIGHLIGHT_OTHER_BORDER_PX = 1;
 const HIGHLIGHT_CURRENT_FILL: readonly number[] = [1, 0.596, 0, 0.45];
 const HIGHLIGHT_CURRENT_BORDER: readonly number[] = [0.918, 0.345, 0.047, 1];
 const HIGHLIGHT_CURRENT_BORDER_PX = 2;
+/** Text-selection style: browser-selection blue, same fill+ring treatment. */
+const HIGHLIGHT_SELECTION_FILL: readonly number[] = [0.259, 0.522, 0.957, 0.35];
+const HIGHLIGHT_SELECTION_BORDER: readonly number[] = [0.106, 0.365, 0.788, 1];
+const HIGHLIGHT_SELECTION_BORDER_PX = 1;
 const HIGHLIGHT_MIN_SIZE_PX = 2;
 
 const INTERACTION_DECAY_MS = 140;
@@ -1286,6 +1290,8 @@ export class WebGlFloorplanRenderer {
 
   private readonly highlightCurrentVao: WebGLVertexArrayObject;
 
+  private readonly highlightSelectionVao: WebGLVertexArrayObject;
+
   private readonly cornerBuffer: WebGLBuffer;
 
   private readonly allSegmentIdBuffer: WebGLBuffer;
@@ -1300,9 +1306,13 @@ export class WebGlFloorplanRenderer {
 
   private readonly highlightCurrentBuffer: WebGLBuffer;
 
+  private readonly highlightSelectionBuffer: WebGLBuffer;
+
   private highlightOthersCount = 0;
 
   private highlightHasCurrent = false;
+
+  private highlightSelectionCount = 0;
 
   private readonly segmentTextureA: WebGLTexture;
 
@@ -1717,6 +1727,7 @@ export class WebGlFloorplanRenderer {
     this.blitVao = this.createVertexArray();
     this.highlightOthersVao = this.createVertexArray();
     this.highlightCurrentVao = this.createVertexArray();
+    this.highlightSelectionVao = this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
     this.allSegmentIdBuffer = this.mustCreateBuffer();
@@ -1725,6 +1736,7 @@ export class WebGlFloorplanRenderer {
     this.allTextInstanceIdBuffer = this.mustCreateBuffer();
     this.highlightOthersBuffer = this.mustCreateBuffer();
     this.highlightCurrentBuffer = this.mustCreateBuffer();
+    this.highlightSelectionBuffer = this.mustCreateBuffer();
 
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
@@ -2327,6 +2339,28 @@ export class WebGlFloorplanRenderer {
     this.requestFrame();
   }
 
+  setTextSelectionHighlights(rects: Float32Array | null): void {
+    if (this.isDisposed) {
+      return;
+    }
+    const count = rects ? Math.floor(rects.length / 4) : 0;
+    if (!rects || count === 0) {
+      if (this.highlightSelectionCount !== 0) {
+        this.highlightSelectionCount = 0;
+        this.requestFrame();
+      }
+      return;
+    }
+
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightSelectionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, rects.subarray(0, count * 4), gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+    this.highlightSelectionCount = count;
+    this.requestFrame();
+  }
+
   fitToBounds(bounds: Bounds, paddingPixels = 64): void {
     const width = Math.max(bounds.maxX - bounds.minX, 1e-4);
     const height = Math.max(bounds.maxY - bounds.minY, 1e-4);
@@ -2411,7 +2445,8 @@ export class WebGlFloorplanRenderer {
       this.allFillPathIdBuffer,
       this.allTextInstanceIdBuffer,
       this.highlightOthersBuffer,
-      this.highlightCurrentBuffer
+      this.highlightCurrentBuffer,
+      this.highlightSelectionBuffer
     ];
     for (const buffer of buffers) {
       gl.deleteBuffer(buffer);
@@ -2423,7 +2458,8 @@ export class WebGlFloorplanRenderer {
       this.textVao,
       this.blitVao,
       this.highlightOthersVao,
-      this.highlightCurrentVao
+      this.highlightCurrentVao,
+      this.highlightSelectionVao
     ];
     for (const vao of vaos) {
       gl.deleteVertexArray(vao);
@@ -2970,7 +3006,7 @@ export class WebGlFloorplanRenderer {
     cameraCenterY: number,
     zoomValue = this.zoom
   ): void {
-    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent) {
+    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent && this.highlightSelectionCount === 0) {
       return;
     }
 
@@ -2985,6 +3021,11 @@ export class WebGlFloorplanRenderer {
       gl.uniformMatrix4fv(this.uHighlightLocalToClip, false, this.localToClipMatrix);
     }
 
+    // Selection first so the search current-match ring stays visible on top.
+    if (this.highlightSelectionCount > 0) {
+      gl.bindVertexArray(this.highlightSelectionVao);
+      this.drawHighlightBatch(this.highlightSelectionCount, HIGHLIGHT_SELECTION_FILL, HIGHLIGHT_SELECTION_BORDER, HIGHLIGHT_SELECTION_BORDER_PX);
+    }
     if (this.highlightOthersCount > 0) {
       gl.bindVertexArray(this.highlightOthersVao);
       this.drawHighlightBatch(this.highlightOthersCount, HIGHLIGHT_OTHER_FILL, HIGHLIGHT_OTHER_BORDER, HIGHLIGHT_OTHER_BORDER_PX);
@@ -4335,7 +4376,8 @@ export class WebGlFloorplanRenderer {
 
     for (const [vao, rectBuffer] of [
       [this.highlightOthersVao, this.highlightOthersBuffer],
-      [this.highlightCurrentVao, this.highlightCurrentBuffer]
+      [this.highlightCurrentVao, this.highlightCurrentBuffer],
+      [this.highlightSelectionVao, this.highlightSelectionBuffer]
     ] as const) {
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
@@ -4384,6 +4426,32 @@ export class WebGlFloorplanRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
     gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  clientToScenePoint(clientX: number, clientY: number): { x: number; y: number } | null {
+    if (this.isDisposed) {
+      return null;
+    }
+    return this.clientToWorld(clientX, clientY);
+  }
+
+  sceneToClientPoint(sceneX: number, sceneY: number): { x: number; y: number } | null {
+    if (this.isDisposed) {
+      return null;
+    }
+    const rect = this.resolveInteractionViewportRect();
+    const pixelScale = this.resolveClientToPixelScale(rect);
+    if (pixelScale.x === 0 || pixelScale.y === 0) {
+      return null;
+    }
+
+    const pixelX = (sceneX - this.cameraCenterX) * this.zoom + this.canvas.width * 0.5;
+    const pixelY = (sceneY - this.cameraCenterY) * this.zoom + this.canvas.height * 0.5;
+
+    return {
+      x: rect.left + pixelX / pixelScale.x,
+      y: rect.bottom - pixelY / pixelScale.y
+    };
   }
 
   private clientToWorld(clientX: number, clientY: number): { x: number; y: number } {

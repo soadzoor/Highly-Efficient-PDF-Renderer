@@ -123,6 +123,12 @@ body {
   width: 100%;
 }
 
+.number-row input[type="checkbox"] {
+  justify-self: start;
+  width: 16px;
+  height: 16px;
+}
+
 .number-row input[type="color"] {
   width: 44px;
   height: 28px;

@@ -20,10 +20,15 @@ interface ThreeWebGpuRasterMaterialOptions {
   localToClip: THREE.Matrix4;
 }
 
-type WgslFunction = ReturnType<typeof TSL.wgslFn>;
-
-function callNode(fn: WgslFunction, params: Record<string, unknown>): never {
+// Deliberately typed as `unknown`: naming the TSL function type (e.g. via
+// `ReturnType<typeof TSL.wgslFn>`) instantiates @types/three's recursive
+// ProxiedTuple/ProxiedObject types, which hangs the TypeScript 7 native compiler.
+function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
+}
+
+function varyingNode(node: unknown): never {
+  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
 const rasterPackFn = TSL.wgslFn(`
@@ -92,12 +97,12 @@ export function createThreeWebGpuRasterMaterial(
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const corner = TSL.attribute("aCorner", "vec2");
-  const rasterPack = TSL.varying(callNode(rasterPackFn, {
+  const rasterPack = varyingNode(callNode(rasterPackFn, {
     corner,
     matrixABCD: TSL.uniform(options.matrixABCD),
     matrixEF: TSL.uniform(options.matrixEF)
   }));
-  const rasterPackValue = rasterPack as typeof rasterPack & { zw: unknown };
+  const rasterPackValue = rasterPack as { zw: unknown };
 
   material.vertexNode = callNode(rasterClipFn, {
     rasterPack,
