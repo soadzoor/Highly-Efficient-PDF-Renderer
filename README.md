@@ -438,7 +438,62 @@ Run dev server:
 npm run dev
 ```
 
-The room overlay demo is available at `/room-overlay-demo.html`. After running room detection, use **Download Detection Debug** to save the browser-side room probability, separator probability, predicted mask, and detection metadata as a zip.
+The room overlay demo is available at `/room-overlay-demo.html`. After running room
+detection, use **Download Detection Debug** to save the browser-side room probability,
+separator probability, predicted mask, and detection metadata as a zip. Room detection
+uses the PDF's vector wall geometry and text when available; it also discovers sealed,
+unlabeled spaces such as shafts. Each returned room includes `hasDoorEvidence`, so callers
+can distinguish accessible-room candidates from sealed service spaces without making text
+or door annotations a prerequisite for geometry. Returned room cells do not overlap or
+contain one another: enclosing “super room” contours are discarded, while unsafe
+snapping/offset geometry falls back to the underlying connected-component boundary.
+For uniform-pen CAD exports, the detector also tests whether one long-line color cohort
+dominates the page (typically the architectural layer). It uses that trace only to replace
+an individual jagged outline when the simpler polygon contains exactly one room anchor,
+has a bounded area change, is simple, and remains disjoint from every neighboring room.
+Density-pruned paired partitions are restored only when a structural cap, validated door
+swing, and nearby architectural-scale room numbers on opposite sides agree. Likewise, a
+complete equipment-displaced room side is recovered only when the other three contour
+sides match an orthogonal paired-wall envelope and the expanded cell remains label-owned,
+simple, and non-overlapping. Deep furniture peninsulas are also removed from a labeled
+room when their narrow mouth lies on a long, room-extremal paired wall with substantial
+support beyond both endpoints; bounded-area, label-retention, and overlap checks still
+apply.
+
+Run the synthetic topology regressions with:
+
+```bash
+npm run test:rooms
+```
+
+For corpus evaluation, `scripts/eval-rooms.mjs --from-pdf` exercises the same live text
+extraction path as the demo. Its `--score` option uses the dependency-free
+`scripts/score-rooms.mjs` scorer, which treats TSV polygons as incomplete positive labels
+and reports unmatched predictions for review instead of automatically calling them false
+positives.
+
+Audit saved predictions independently of TSV annotations with:
+
+```bash
+npm run audit:rooms -- .eval/my-room-run
+```
+
+This command rejects invalid/self-intersecting polygons, duplicates, containment, and
+positive-area overlap while allowing rooms to share boundaries.
+
+For an evaluation set that is independent of the noisy TSV geometry, create a deterministic
+stratified review manifest and follow [the room gold-set adjudication protocol](docs/room-gold-set.md):
+
+```bash
+npm run gold:rooms -- select \
+  --score-report .eval/my-room-run/scores-iou50.json \
+  --output .eval/room-gold/gold.json \
+  --count 12
+npm run gold:rooms -- validate .eval/room-gold/gold.json --check-files
+```
+
+Detector polygons start as `ambiguous`; reviewers inspect the PDF first, add omissions,
+and classify each candidate as `room`, `shaft-service`, `non-room`, or `ambiguous`.
 
 Build app:
 

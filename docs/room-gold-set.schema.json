@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/schemas/room-gold-set.schema.json",
+  "title": "Floorplan room gold set",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "generatedAt",
+    "coordinateSpace",
+    "annotationPolicy",
+    "selection",
+    "pages"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "kind": {
+      "const": "floorplan-room-gold-set"
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "coordinateSpace": {
+      "const": "detector-scene-space"
+    },
+    "annotationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tsvIsGroundTruth", "acceptedRegionStatuses", "topology"],
+      "properties": {
+        "tsvIsGroundTruth": {
+          "const": false
+        },
+        "acceptedRegionStatuses": {
+          "const": ["room", "shaft-service"]
+        },
+        "topology": {
+          "type": "string"
+        }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "requestedCount", "selectedCount", "seed", "sourceScoreReport", "thresholds"],
+      "properties": {
+        "method": {
+          "const": "deterministic-stratified-round-robin-v1"
+        },
+        "requestedCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "selectedCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "sourceScoreReport": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sparsePredictionCount",
+            "densePredictionCount",
+            "lowAgreementRecall",
+            "highAgreementRecall",
+            "highUnmatchedRate",
+            "highAgreementMinimumKnownPositiveCount"
+          ],
+          "properties": {
+            "sparsePredictionCount": { "$ref": "#/$defs/nullableNumber" },
+            "densePredictionCount": { "$ref": "#/$defs/nullableNumber" },
+            "lowAgreementRecall": { "$ref": "#/$defs/nullableNumber" },
+            "highAgreementRecall": { "$ref": "#/$defs/nullableNumber" },
+            "highUnmatchedRate": { "$ref": "#/$defs/nullableNumber" },
+            "highAgreementMinimumKnownPositiveCount": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "pages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/page"
+      }
+    }
+  },
+  "$defs": {
+    "nullableNumber": {
+      "type": ["number", "null"]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "folder", "stem", "coverage", "selection", "sources", "review", "regions"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "folder": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stem": {
+          "type": "string",
+          "minLength": 1
+        },
+        "coverage": {
+          "enum": ["complete", "partial", "unknown"]
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["primaryStratum", "challengeTags", "family", "detectorCandidateCount", "weakLabelSignals"],
+          "properties": {
+            "primaryStratum": {
+              "type": "string",
+              "minLength": 1
+            },
+            "challengeTags": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "family": {
+              "type": "string",
+              "minLength": 1
+            },
+            "detectorCandidateCount": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "weakLabelSignals": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "comparisonStatus",
+                "knownPositiveCount",
+                "knownPositiveRecallAtThreshold",
+                "knownPositiveMeanBestIou",
+                "unmatchedPredictionCount",
+                "invalidGeometryCount",
+                "isGroundTruth"
+              ],
+              "properties": {
+                "comparisonStatus": {
+                  "type": "string"
+                },
+                "knownPositiveCount": { "$ref": "#/$defs/nullableNumber" },
+                "knownPositiveRecallAtThreshold": { "$ref": "#/$defs/nullableNumber" },
+                "knownPositiveMeanBestIou": { "$ref": "#/$defs/nullableNumber" },
+                "unmatchedPredictionCount": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "invalidGeometryCount": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "isGroundTruth": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pdf", "detectorPrediction", "detectorOverlay", "weakLabelTsv"],
+          "properties": {
+            "pdf": { "$ref": "#/$defs/nullableString" },
+            "detectorPrediction": {
+              "type": "string",
+              "minLength": 1
+            },
+            "detectorOverlay": { "$ref": "#/$defs/nullableString" },
+            "weakLabelTsv": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reviewer", "reviewedAt", "notes"],
+          "properties": {
+            "reviewer": {
+              "type": "string"
+            },
+            "reviewedAt": {
+              "type": ["string", "null"],
+              "format": "date-time"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/region"
+          }
+        }
+      }
+    },
+    "region": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "polygon", "origin"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": ["room", "shaft-service", "non-room", "ambiguous"]
+        },
+        "polygon": {
+          "type": "array",
+          "minItems": 6,
+          "items": {
+            "type": "number"
+          }
+        },
+        "origin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "enum": ["detector", "edited-detector", "manual"]
+            },
+            "predictionIndices": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "roomNumber": {
+              "type": "string"
+            },
+            "labelText": {
+              "type": "string"
+            },
+            "confidence": { "$ref": "#/$defs/nullableNumber" },
+            "hasDoorEvidence": {
+              "type": ["boolean", "null"]
+            }
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

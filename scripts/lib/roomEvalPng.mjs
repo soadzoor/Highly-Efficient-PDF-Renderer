@@ -38,15 +38,34 @@ export function renderResultPng(scene, result, groundTruth = null) {
   const toX = (wx) => (wx - bounds.minX) * scale + pad;
   const toY = (wy) => (bounds.maxY - wy) * scale + pad;
 
-  // All strokes, light gray. Scene encoding: endpoints[4i..] = (x0, y0, x1, y1).
+  // All strokes, light gray. Scene encoding stores (start, control-or-line-end) in
+  // `endpoints` and the true end point plus primitive type in `primitiveMeta`.
   const endpoints = scene.endpoints;
+  const primitiveMeta = scene.primitiveMeta;
   for (let i = 0; i < scene.segmentCount; i += 1) {
     const base = i * 4;
     const x0 = endpoints[base];
     const y0 = endpoints[base + 1];
-    const x1 = endpoints[base + 2];
-    const y1 = endpoints[base + 3];
-    drawLine(rgba, width, height, toX(x0), toY(y0), toX(x1), toY(y1), 0.6, [185, 185, 185, 255]);
+    const controlOrEndX = endpoints[base + 2];
+    const controlOrEndY = endpoints[base + 3];
+    const isQuadratic = (primitiveMeta[base + 2] ?? 0) >= 0.5;
+    if (!isQuadratic) {
+      drawLine(rgba, width, height, toX(x0), toY(y0), toX(controlOrEndX), toY(controlOrEndY), 0.6, [185, 185, 185, 255]);
+      continue;
+    }
+    const x1 = primitiveMeta[base];
+    const y1 = primitiveMeta[base + 1];
+    let previousX = x0;
+    let previousY = y0;
+    for (let step = 1; step <= 8; step += 1) {
+      const t = step / 8;
+      const mt = 1 - t;
+      const nextX = mt * mt * x0 + 2 * mt * t * controlOrEndX + t * t * x1;
+      const nextY = mt * mt * y0 + 2 * mt * t * controlOrEndY + t * t * y1;
+      drawLine(rgba, width, height, toX(previousX), toY(previousY), toX(nextX), toY(nextY), 0.6, [185, 185, 185, 255]);
+      previousX = nextX;
+      previousY = nextY;
+    }
   }
 
   for (const [index, room] of result.rooms.entries()) {

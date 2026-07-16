@@ -57,6 +57,10 @@
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
+    "test:rooms": "node scripts/test-room-detector.mjs",
+    "score:rooms": "node scripts/score-rooms.mjs",
+    "audit:rooms": "node scripts/audit-room-topology.mjs",
+    "gold:rooms": "node scripts/room-gold-set.mjs",
     "prepublishOnly": "npm run build:all"
   },
   "peerDependencies": {
