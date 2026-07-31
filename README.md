@@ -92,13 +92,15 @@ Controls include:
 - vector override color/opacity
 - collapsible diagnostics panel
 
-Backend switches reuse the loaded scene and preserve the camera where possible.
+Backend switches reload the current source through `pdfObjectGenerator` and
+preserve the camera where possible.
 
 ## npm Package API ([`@soadzoor/hepr`](https://www.npmjs.com/package/@soadzoor/hepr))
 
-Use `pdfObjectGenerator` to load a PDF or parsed ZIP and create a `THREE.Group`.
-The three.js wrapper is camera-driven by default, so the PDF follows your
-existing `THREE.Camera` and controls.
+Use `pdfObjectGenerator`, the package's single PDF-object construction entry
+point, to load a PDF or parsed ZIP and create a `THREE.Group`. The three.js
+wrapper is camera-driven by default, so the PDF follows your existing
+`THREE.Camera` and controls.
 The generated TypeScript declaration files include JSDoc comments for the main
 options, return types, and runtime methods.
 
@@ -160,6 +162,37 @@ Supported `source` inputs:
 - `string` path or URL to `.pdf` / `.zip`
 - base64 payload string (`PDF` or `ZIP`)
 - base64 data URL (`data:application/pdf;base64,...`)
+
+Select pages with Chrome-style, one-based ASCII print syntax:
+
+```ts
+// Only PDF page 2.
+const page2 = await pdfObjectGenerator(source, {
+  pages: "2"
+});
+
+// An inclusive range.
+const pages2To5 = await pdfObjectGenerator(source, {
+  pages: "2-5"
+});
+
+// Ranges and individual pages can be combined.
+const selectedPages = await pdfObjectGenerator(source, {
+  pages: "1-3, 5, 8, 11-13"
+});
+```
+
+Ranges are inclusive. Whitespace is allowed, overlaps and duplicates are
+ignored, and selected pages are composed in ascending document order. Open
+ranges are supported too: `"5-"` means page 5 through the end, while `"-3"`
+means the first three pages. Omitting `pages` or passing a blank string selects
+every page. Page selection applies to PDF sources; parsed-data ZIPs already
+contain one composed scene and currently ignore this option.
+
+Page indexes returned by scene search/selection APIs are zero-based positions
+within the normalized composed subset. Page-scoped progress events expose both
+the composed `pageIndex` / `pageCount` and the original PDF's
+`sourcePageIndex` / `sourcePageCount`.
 
 Useful object APIs:
 

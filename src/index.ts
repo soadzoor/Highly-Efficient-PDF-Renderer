@@ -36,8 +36,9 @@ const LOAD_PROGRESS_UPLOAD = 0.98;
 /**
  * Load a PDF or HEPR parsed-data ZIP and return a three.js object.
  *
- * This is the main package entry point for three.js applications. The returned
- * object is a `THREE.Group`; add it to your scene and render normally.
+ * This is the package's public PDF-object construction entry point for
+ * three.js applications. The returned object is a `THREE.Group`; add it to
+ * your scene and render normally.
  *
  * The PDF follows your three.js camera by default. HEPR synchronizes itself
  * from three.js `onBeforeRender`, so typical render loops do not need a
@@ -111,11 +112,7 @@ async function yieldToHostFrame(): Promise<void> {
   });
 }
 
-export {
-  loadPdfSceneFromSource,
-  createThreePdfObject,
-  createCanvasInteractionController
-};
+export { createCanvasInteractionController };
 
 export {
   CORE_STROKE_VERTEX_SHADER_SOURCE,
@@ -194,8 +191,6 @@ export {
   VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
   VECTOR_STROKE_LOD_TOLERANCES
 } from "./vectorStrokeLod";
-
-export type { LoadedPdfScene } from "./pdfObjectGenerator";
 
 export type { Bounds, SceneTextItem, VectorScene } from "./pdfVectorExtractor";
 

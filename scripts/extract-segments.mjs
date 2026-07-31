@@ -306,7 +306,7 @@ async function main() {
           folder: entry.folder,
           sourcePdf: relativePdf,
           generatedAt: new Date().toISOString(),
-          extractOptions: { maxPages: 1, enableSegmentMerge: true, enableInvisibleCull: true },
+          extractOptions: { pages: "1", enableSegmentMerge: true, enableInvisibleCull: true },
           page: pageMeta,
           boundsMismatch,
           sceneStats: {

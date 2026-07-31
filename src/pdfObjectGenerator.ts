@@ -40,9 +40,19 @@ export interface PdfObjectGeneratorOptions {
   invisibleCull?: boolean;
 
   /**
-   * Maximum number of PDF pages to parse. Omit to parse all pages.
+   * One-based PDF pages to parse, using Chrome-style ASCII print syntax.
+   * Separate individual page numbers or inclusive ranges with commas.
+   * Open ranges such as `"5-"` and `"-3"` are also supported.
+   *
+   * Omit or pass a blank string to parse all pages. Overlaps and duplicates
+   * are ignored, and pages are composed in ascending document order. Invalid
+   * string selections reject with a `RangeError`.
+   *
+   * PDF sources only; parsed-data ZIP sources ignore this option.
+   *
+   * @example "1-5, 8, 11-13"
    */
-  maxPages?: number;
+  pages?: string;
 
   /**
    * Maximum pages per row when a multi-page PDF is composed into one scene.
@@ -77,9 +87,7 @@ export interface PdfObjectGeneratorOptions {
 }
 
 /**
- * Parsed HEPR scene plus source metadata.
- *
- * This is the input shape accepted by `createThreePdfObject`.
+ * Internal parsed HEPR scene plus source metadata.
  */
 export interface LoadedPdfScene {
   /** Parsed vector/raster/text scene data. */
@@ -98,18 +106,7 @@ export interface LoadedPdfScene {
 let isPdfWorkerConfigured = false;
 
 /**
- * Load and parse a PDF or HEPR parsed-data ZIP into scene data.
- *
- * Use this when you want to cache parsed scene data or create multiple
- * `HeprThreePdfObject` instances from the same source. For a one-step three.js
- * integration, prefer `pdfObjectGenerator`.
- *
- * Example:
- *
- * ```ts
- * const loaded = await loadPdfSceneFromSource(file);
- * const pdfObject = await createThreePdfObject(loaded);
- * ```
+ * Internal source-loading step used by `pdfObjectGenerator`.
  */
 export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
@@ -125,7 +122,7 @@ export async function loadPdfSceneFromSource(
     const extractOptions: VectorExtractOptions = {
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
-      maxPages: options.maxPages,
+      pages: options.pages,
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };

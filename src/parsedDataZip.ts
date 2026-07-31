@@ -1168,7 +1168,7 @@ export async function loadSceneFromParsedDataZip(
     if (sourcePdfBytes) {
       try {
         const rasterScene = await extractPdfRasterScene(createParseBuffer(sourcePdfBytes), {
-          maxPages: pageCount,
+          pages: pageCount === 1 ? "1" : `1-${pageCount}`,
           maxPagesPerRow: pagesPerRow
         });
         rasterLayers = listSceneRasterLayers(rasterScene);

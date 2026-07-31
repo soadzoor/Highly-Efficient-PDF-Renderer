@@ -14,7 +14,7 @@ export default defineConfig(({ mode }) => {
         outDir: "dist/lib",
         emptyOutDir: false,
         rollupOptions: {
-          external: ["three"]
+          external: (id) => id === "three" || id.startsWith("three/")
         }
       }
     };

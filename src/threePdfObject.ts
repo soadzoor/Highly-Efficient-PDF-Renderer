@@ -312,11 +312,10 @@ export class HeprThreePdfObject extends THREE.Group {
   };
 
   /**
-   * Internal constructor used by `createThreePdfObject`.
+   * Internal constructor used by the PDF object factory.
    *
-   * Application code should create objects with `pdfObjectGenerator(source,
-   * options)` or `createThreePdfObject(loadedScene, options)` instead of
-   * calling this constructor directly.
+   * Application code should use `pdfObjectGenerator(source, options)` instead
+   * of calling this constructor directly.
    */
   constructor(
     loadedScene: LoadedPdfScene,
@@ -467,9 +466,10 @@ export class HeprThreePdfObject extends THREE.Group {
    *
    * Matching is case-insensitive unless `options.caseSensitive` is set, and
    * whitespace in the query matches across line breaks. Matches come back in
-   * page/reading order with `bounds` in PDF scene space and `localBounds` in
-   * this object's local space; feed them to `setSearchHighlights` and frame
-   * your camera on `localBounds` to implement a find feature.
+   * composed page/reading order with `bounds` in PDF scene space and
+   * `localBounds` in this object's local space; feed them to
+   * `setSearchHighlights` and frame your camera on `localBounds` to implement
+   * a find feature.
    */
   searchText(query: string, options: SceneTextSearchOptions = {}): HeprTextSearchMatch[] {
     if (this.isDisposed) {
@@ -2126,22 +2126,9 @@ function findAncestorScene(object: THREE.Object3D): THREE.Scene | null {
 }
 
 /**
- * Create a three.js PDF object from an already parsed HEPR scene.
- *
- * Most applications should call `pdfObjectGenerator(source, options)` instead,
- * which loads/parses the source before creating this object. Use this lower
- * level helper when you already have a `LoadedPdfScene`, for example from
- * `loadPdfSceneFromSource`.
- *
- * Example:
- *
- * ```ts
- * const loaded = await loadPdfSceneFromSource(file);
- * const pdfObject = await createThreePdfObject(loaded, {
- *   vectorLod: "auto"
- * });
- * scene.add(pdfObject);
- * ```
+ * Internal factory that creates a three.js PDF object from a parsed HEPR
+ * scene. The public `pdfObjectGenerator` entry point owns source loading,
+ * parsing, LOD preparation, and object creation.
  */
 export async function createThreePdfObject(
   loadedScene: LoadedPdfScene,

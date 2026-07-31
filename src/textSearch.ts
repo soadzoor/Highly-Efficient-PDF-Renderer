@@ -3,6 +3,7 @@ import type { RendererApi } from "./rendererTypes";
 import { computeCharRangeBounds } from "./sceneTextGeometry";
 
 export interface TextSearchMatch {
+  /** Zero-based page index in the composed scene. */
   pageIndex: number;
   /** UTF-16 offset into the page's indexed text. */
   startChar: number;
@@ -64,10 +65,10 @@ export interface SceneTextSearcher {
   /** Whether the scene carries a searchable text index. */
   readonly hasText: boolean;
   /**
-   * Finds non-overlapping matches in document order. Whitespace runs in the
-   * query are collapsed to single spaces to mirror the index's word-gap
-   * encoding, so phrases match across line breaks. Match bounds are
-   * scene-space rectangles derived from the glyph geometry.
+   * Finds non-overlapping matches in composed page order. Whitespace runs in
+   * the query are collapsed to single spaces to mirror the index's word-gap
+   * encoding, so phrases match across line breaks. Match bounds are scene-space
+   * rectangles derived from the glyph geometry.
    */
   search(query: string, options?: SceneTextSearchOptions): TextSearchMatch[];
 }

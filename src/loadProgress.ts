@@ -24,7 +24,10 @@ export type PDFLoadExecutionPath = "worker" | "main-thread" | "main-thread-fallb
  *
  * `value` is always normalized from 0..1 for the overall operation. Additional
  * fields describe the active unit when HEPR knows it, such as bytes, pages, or
- * operators.
+ * operators. When a PDF page subset is selected, `pageIndex` and `pageCount`
+ * describe the composed subset; `sourcePageIndex` and `sourcePageCount`
+ * identify the original PDF page. `processed` and `total` remain specific to
+ * the active `unit`.
  */
 export interface PDFLoadProgress {
   /** Overall normalized progress in the range 0..1. */
@@ -48,16 +51,21 @@ export interface PDFLoadProgress {
   /** Total units for the current stage, when known. */
   total?: number;
 
-  /** Zero-based PDF page index for page-scoped progress. */
+  /** Zero-based page index within the selected/composed page set. */
   pageIndex?: number;
 
-  /** Total page count, when known. */
+  /** Number of selected/composed pages, when known. */
   pageCount?: number;
+
+  /** Zero-based page index within the source PDF, when known. */
+  sourcePageIndex?: number;
+
+  /** Total page count in the source PDF, when known. */
+  sourcePageCount?: number;
 }
 
 /**
- * Receives progress events from `pdfObjectGenerator` and
- * `loadPdfSceneFromSource`.
+ * Receives progress events from `pdfObjectGenerator`.
  *
  * Example:
  *
@@ -165,7 +173,9 @@ export class LoadProgressReporter {
       processed: mergedMeta.processed,
       total: mergedMeta.total,
       pageIndex: mergedMeta.pageIndex,
-      pageCount: mergedMeta.pageCount
+      pageCount: mergedMeta.pageCount,
+      sourcePageIndex: mergedMeta.sourcePageIndex,
+      sourcePageCount: mergedMeta.sourcePageCount
     };
 
     this.root.lastEmittedValue = payload.value;
@@ -188,6 +198,8 @@ export class LoadProgressReporter {
       total?: number;
       pageIndex?: number;
       pageCount?: number;
+      sourcePageIndex?: number;
+      sourcePageCount?: number;
       tickMs?: number;
       ceiling?: number;
     }
@@ -206,7 +218,9 @@ export class LoadProgressReporter {
       processed: options.processed,
       total: options.total,
       pageIndex: options.pageIndex,
-      pageCount: options.pageCount
+      pageCount: options.pageCount,
+      sourcePageIndex: options.sourcePageIndex,
+      sourcePageCount: options.sourcePageCount
     };
 
     this.report(0, meta);

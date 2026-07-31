@@ -410,8 +410,8 @@ const EXTERIOR_REGION_ID = 65535;
  * Example:
  *
  * ```ts
- * const loaded = await loadPdfSceneFromSource(file, { extractText: true });
- * const result = detectRooms(loaded.scene);
+ * const pdfObject = await pdfObjectGenerator(file, { extractText: true });
+ * const result = detectRooms(pdfObject.sceneData);
  * for (const room of result.rooms) {
  *   console.log(room.labelText, room.area, room.polygon);
  * }
