@@ -3,6 +3,7 @@ import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
+  buildParsedDataZip,
   createTextSelectionController,
   pdfObjectGenerator,
   consumeVectorStrokeLodBuildTiming,
@@ -24,17 +25,11 @@ import {
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
-import {
-  buildParsedDataZipBlobForLayout,
-  listSceneRasterLayers,
-  tryReadSourcePdfBytesFromExistingParsedZip,
-  type TextureLayout
-} from "./parsedDataZip";
+import { tryReadSourcePdfBytesFromExistingParsedZip } from "./parsedDataZip";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
   readPdfDownloadBlob,
-  readPdfDownloadBytes,
   triggerBrowserDownload,
   type PdfDownloadSource
 } from "./downloadUtils";
@@ -170,10 +165,6 @@ const CAMERA_CLIP_UPDATE_EPSILON = 1e-3;
 const NATIVE_CLEAR_COLOR_R = 160 / 255;
 const NATIVE_CLEAR_COLOR_G = 169 / 255;
 const NATIVE_CLEAR_COLOR_B = 175 / 255;
-const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
-const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
-const EXPORT_ZIP_DEFLATE_LEVEL = 9;
-const EXPORT_ENCODE_RASTER_IMAGES = true;
 const tempObjectBounds = new THREE.Box3();
 const tempObjectSize = new THREE.Vector3();
 const tempObjectCenter = new THREE.Vector3();
@@ -1128,35 +1119,25 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
 
 async function downloadParsedDataZip(): Promise<boolean> {
   const pdfObject = currentPdfObject;
-  const sceneStats = pdfObject?.renderer.getSceneStats() ?? null;
-  if (!pdfObject || !sceneStats) {
+  if (!pdfObject) {
     setStatus("No parsed floorplan data available to export.");
     return false;
   }
 
   setDownloadDataButtonState(true, true);
   try {
-    const sceneData = pdfObject.sceneData;
-    const sourcePdfBytes = sceneData.imagePaintOpCount > 0 && lastDownloadablePdf
-      ? await readPdfDownloadBytes(lastDownloadablePdf)
-      : null;
-    const sceneRasterLayers = listSceneRasterLayers(sceneData);
-    const selectedZip = await buildParsedDataZipBlobForLayout(
-      sceneData,
-      sceneStats,
-      pdfObject.sourceLabel,
-      sourcePdfBytes,
-      EXPORT_TEXTURE_LAYOUT,
-      sceneRasterLayers,
-      {
-        encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
-        zipCompression: EXPORT_ZIP_COMPRESSION,
-        zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
-      }
-    );
+    const zipBlob = await buildParsedDataZip(pdfObject.sceneData, {
+      sourceLabel: pdfObject.sourceLabel,
+      sourcePdf:
+        pdfObject.sourceKind === "pdf" && lastLoadedSource
+          ? lastLoadedSource
+          : lastDownloadablePdf?.bytes ??
+            lastDownloadablePdf?.blob ??
+            lastDownloadablePdf?.url
+    });
 
     const zipFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.zip`;
-    triggerBrowserDownload(selectedZip.blob, zipFileName);
+    triggerBrowserDownload(zipBlob, zipFileName);
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

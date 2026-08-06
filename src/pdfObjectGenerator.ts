@@ -1,5 +1,14 @@
-import { GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+
+const pdfJsModule = (
+  typeof window === "undefined"
+    ? await import("pdfjs-dist/legacy/build/pdf.mjs")
+    : await import("pdfjs-dist")
+) as {
+  GlobalWorkerOptions: typeof import("pdfjs-dist").GlobalWorkerOptions;
+};
+
+const { GlobalWorkerOptions } = pdfJsModule;
 
 import {
   composeVectorScenesInGrid,
@@ -113,7 +122,7 @@ export async function loadPdfSceneFromSource(
   options: PdfObjectGeneratorOptions = {}
 ): Promise<LoadedPdfScene> {
   const progress = createLoadProgressReporter(options.onProgress);
-  const sourceBytes = await readSourceBytes(source, progress.child(0, 0.16));
+  const sourceBytes = await readPdfObjectSourceBytes(source, progress.child(0, 0.16));
   const sourceKind = resolveSourceKind(source, sourceBytes, options.sourceKind);
   const sourceLabel = resolveSourceLabel(source, sourceKind);
 
@@ -155,16 +164,25 @@ function ensurePdfWorkerConfigured(): void {
   if (isPdfWorkerConfigured) {
     return;
   }
-  if (!GlobalWorkerOptions.workerSrc) {
+  // Vite inlines this URL in the published library. In source-level Node/SSR
+  // execution it may instead be a browser-only root path, so retain the
+  // legacy PDF.js module's own worker path there.
+  const currentWorkerSrc = GlobalWorkerOptions.workerSrc;
+  const usesPdfJsDefault = !currentWorkerSrc || currentWorkerSrc === "./pdf.worker.mjs";
+  if (usesPdfJsDefault && (typeof window !== "undefined" || pdfWorkerUrl.startsWith("data:"))) {
     GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
   }
   isPdfWorkerConfigured = true;
 }
 
-async function readSourceBytes(source: PdfObjectSource, progress?: LoadProgressReporter): Promise<Uint8Array> {
+/** @internal Read an accepted HEPR source without parsing it. */
+export async function readPdfObjectSourceBytes(
+  source: PdfObjectSource,
+  progress?: LoadProgressReporter
+): Promise<Uint8Array> {
   progress?.report(0, { stage: "source", unit: "bytes" });
   if (source instanceof Uint8Array) {
-    const bytes = source.slice();
+    const bytes = new Uint8Array(source);
     progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
     return bytes;
   }
@@ -335,6 +353,10 @@ function readSourceNameFromString(source: string): string | null {
     return "inline-data.bin";
   }
 
+  if (looksLikeRawBase64Source(trimmed)) {
+    return null;
+  }
+
   if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
     try {
       const pathname = new URL(trimmed).pathname;
@@ -359,7 +381,16 @@ function normalizePagesPerRow(value: number | undefined, pageCount: number): num
 }
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.slice().buffer;
+  return new Uint8Array(bytes).buffer;
+}
+
+function looksLikeRawBase64Source(value: string): boolean {
+  const normalized = value.replace(/\s+/g, "");
+  return (
+    normalized.length >= 64 &&
+    normalized.length % 4 === 0 &&
+    /^[A-Za-z0-9+/]+={0,2}$/.test(normalized)
+  );
 }
 
 function looksLikePdfBytes(bytes: Uint8Array): boolean {

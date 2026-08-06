@@ -74,6 +74,8 @@ export interface BuildParsedDataZipOptions {
   encodeRasterImages?: boolean;
   zipCompression?: "STORE" | "DEFLATE";
   zipDeflateLevel?: number;
+  sourcePdfPages?: string;
+  onBuildProgress?: (value: number) => void;
 }
 
 export interface LoadParsedDataZipOptions {
@@ -136,6 +138,7 @@ interface ParsedDataManifest {
   formatVersion?: unknown;
   sourceFile?: unknown;
   sourcePdfFile?: unknown;
+  sourcePdfPages?: unknown;
   sourcePdfUrl?: unknown;
   sourcePdfSizeBytes?: unknown;
   scene?: ParsedDataSceneEntry;
@@ -173,7 +176,12 @@ export async function buildParsedDataZipBlobForLayout(
   const encodeRasterImages = options.encodeRasterImages ?? true;
   const zipCompression = options.zipCompression ?? "DEFLATE";
   const zipDeflateLevel = options.zipDeflateLevel ?? 9;
+  const sourcePdfPages =
+    typeof options.sourcePdfPages === "string" && options.sourcePdfPages.trim().length > 0
+      ? options.sourcePdfPages.trim()
+      : undefined;
 
+  options.onBuildProgress?.(0);
   const zip = new JSZip();
   const textureEntries = buildTextureExportEntries(scene, sceneStats, textureLayout);
   const includeSourcePdf = !!sourcePdfBytes && sourcePdfBytes.length > 0 && scene.imagePaintOpCount > 0;
@@ -235,12 +243,15 @@ export async function buildParsedDataZipBlobForLayout(
       file: filePath,
       encoding
     });
+    options.onBuildProgress?.(0.4 * ((i + 1) / rasterLayers.length));
   }
+  options.onBuildProgress?.(0.4);
 
   const manifest = {
     formatVersion: PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,
     sourcePdfFile,
+    sourcePdfPages: useSourcePdfFallback ? sourcePdfPages : undefined,
     sourcePdfSizeBytes: useSourcePdfFallback ? sourcePdfBytes?.length ?? 0 : 0,
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,
@@ -304,14 +315,19 @@ export async function buildParsedDataZipBlobForLayout(
       ? {
           type: "blob" as const,
           compression: "DEFLATE" as const,
-          compressionOptions: { level: zipDeflateLevel }
+          compressionOptions: { level: zipDeflateLevel },
+          mimeType: "application/zip"
         }
       : {
           type: "blob" as const,
-          compression: "STORE" as const
+          compression: "STORE" as const,
+          mimeType: "application/zip"
         };
 
-  const zipBlob = await zip.generateAsync(zipGenerateOptions);
+  const zipBlob = await zip.generateAsync(zipGenerateOptions, (metadata) => {
+    options.onBuildProgress?.(0.4 + 0.6 * (metadata.percent / 100));
+  });
+  options.onBuildProgress?.(1);
 
   return {
     blob: zipBlob,
@@ -1167,10 +1183,16 @@ export async function loadSceneFromParsedDataZip(
     const sourcePdfBytes = await readSourcePdfBytesFromParsedData(zip, manifest);
     if (sourcePdfBytes) {
       try {
+        const sourcePdfPages = readNonEmptyString(manifest.sourcePdfPages);
         const rasterScene = await extractPdfRasterScene(createParseBuffer(sourcePdfBytes), {
-          pages: pageCount === 1 ? "1" : `1-${pageCount}`,
+          pages: sourcePdfPages ?? (pageCount === 1 ? "1" : `1-${pageCount}`),
           maxPagesPerRow: pagesPerRow
         });
+        if (rasterScene.pageCount !== pageCount) {
+          throw new Error(
+            `Embedded source PDF restored ${rasterScene.pageCount} page(s); expected ${pageCount}.`
+          );
+        }
         rasterLayers = listSceneRasterLayers(rasterScene);
         if (rasterLayers.length > 0) {
           console.log(
@@ -2151,7 +2173,10 @@ function readQuantizationVector(value: unknown, textureName: string, label: stri
 }
 
 const ABSOLUTE_URL_PATTERN = /^[a-z][a-z\d+.-]*:/i;
-const APP_BASE_URL = new URL(import.meta.env.BASE_URL, window.location.href);
+const APP_BASE_URL = new URL(
+  import.meta.env.BASE_URL,
+  typeof window !== "undefined" ? window.location.href : "file:///"
+);
 
 function resolveAppAssetUrl(inputPath: string): string {
   const trimmedPath = inputPath.trim();
@@ -2164,5 +2189,5 @@ function resolveAppAssetUrl(inputPath: string): string {
 }
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.slice().buffer;
+  return new Uint8Array(bytes).buffer;
 }

@@ -139,6 +139,15 @@ export type {
   CanvasInteractionController
 };
 
+export { buildParsedDataZip } from "./parsedDataZipBuilder";
+
+export type {
+  BuildParsedDataZipFromPdfOptions,
+  BuildParsedDataZipFromSceneOptions,
+  ParsedDataZipCompression,
+  ParsedDataZipEncodingOptions
+} from "./parsedDataZipBuilder";
+
 export type {
   LoadProgressCallback,
   PDFLoadProgress,

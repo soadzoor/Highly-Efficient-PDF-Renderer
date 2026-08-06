@@ -57,6 +57,8 @@
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
+    "test:parsed-zip": "node scripts/test-parsed-data-zip.mjs",
+    "test:parsed-zip:package": "npm run build:lib && node scripts/test-parsed-data-zip-package.mjs",
     "test:rooms": "node scripts/test-room-detector.mjs",
     "score:rooms": "node scripts/score-rooms.mjs",
     "audit:rooms": "node scripts/audit-room-topology.mjs",

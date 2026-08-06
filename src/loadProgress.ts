@@ -11,6 +11,7 @@ export type PDFLoadStage =
   | "zip-open"
   | "zip-manifest"
   | "zip-file"
+  | "zip-build"
   | "vector-lod"
   | "upload"
   | "first-render"
@@ -267,6 +268,8 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Reading manifest";
     case "zip-file":
       return "Decoding ZIP";
+    case "zip-build":
+      return "Building ZIP";
     case "vector-lod":
       return "Building Vector LOD";
     case "upload":

@@ -14,12 +14,11 @@ import {
 } from "./pdfVectorExtractor";
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
+import { buildParsedDataZip } from "./index";
 import {
-  buildParsedDataZipBlobForLayout,
   listSceneRasterLayers,
   loadSceneFromParsedDataZip,
-  tryReadSourcePdfBytesFromExistingParsedZip,
-  type TextureLayout
+  tryReadSourcePdfBytesFromExistingParsedZip
 } from "./parsedDataZip";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
@@ -371,10 +370,6 @@ interface LoadPdfOptions {
   preserveView?: boolean;
 }
 
-const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
-const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
-const EXPORT_ZIP_DEFLATE_LEVEL = 9;
-const EXPORT_ENCODE_RASTER_IMAGES = true;
 const LOAD_PROGRESS_PARSE_END = 0.34;
 const LOAD_PROGRESS_COMPILE = 0.36;
 const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
@@ -1190,7 +1185,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
 
   isBatchExampleExportRunning = true;
   setPrimaryLoadControlsEnabled(false);
-  setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneStats && lastParsedSceneLabel), false);
+  setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(true, true, `Exporting 0/${pdfEntries.length}...`);
 
@@ -1207,26 +1202,10 @@ async function downloadAllExampleParsedZips(): Promise<void> {
       }
 
       const bytes = cloneSourceBytes(await response.arrayBuffer());
-      lastLoadedSource = { kind: "pdf", bytes, label: entry.name };
-      lastDownloadablePdf = { label: entry.name, bytes };
-      lastParsedScene = null;
-      lastParsedSceneStats = null;
-      lastParsedSceneLabel = null;
-      parsedPdfPageCache = null;
-
-      await loadPdfBuffer(createParseBuffer(bytes), entry.name, {
-        preserveView: false
-      });
-
-      if (!lastParsedScene || !lastParsedSceneStats || lastParsedSceneLabel !== entry.name) {
-        throw new Error(`${entry.name}: parsed data not available after load.`);
-      }
-
+      const zipBlob = await buildParsedDataZip(bytes, { sourceLabel: entry.name });
+      const zipFileName = `${sanitizeDownloadName(entry.name)}-parsed-data.zip`;
       setStatus(`Batch ${step}/${pdfEntries.length}: downloading ${entry.name} parsed ZIP...`);
-      const exported = await downloadParsedDataZip();
-      if (!exported) {
-        throw new Error(`${entry.name}: parsed ZIP export failed.`);
-      }
+      triggerBrowserDownload(zipBlob, zipFileName);
       await delayMilliseconds(200);
     }
 
@@ -1237,28 +1216,20 @@ async function downloadAllExampleParsedZips(): Promise<void> {
   } finally {
     isBatchExampleExportRunning = false;
     setPrimaryLoadControlsEnabled(true);
-    setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneStats && lastParsedSceneLabel), false);
+    setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
     setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
   }
 }
 
 async function downloadParsedDataZip(): Promise<boolean> {
-  if (!lastParsedScene || !lastParsedSceneStats || !lastParsedSceneLabel) {
+  if (!lastParsedScene || !lastParsedSceneLabel) {
     setStatus("No parsed floorplan data available to export.");
     return false;
   }
 
   const scene = lastParsedScene;
-  const sceneStats = lastParsedSceneStats;
   const label = lastParsedSceneLabel;
-  let sourcePdfBytes = lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : null;
-  if (scene.imagePaintOpCount <= 0) {
-    sourcePdfBytes = null;
-  }
-  if (!sourcePdfBytes && lastLoadedSource?.kind === "parsed-zip") {
-    sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(lastLoadedSource.bytes);
-  }
   const previousStatusText = statusTextElement.textContent;
 
   setDownloadDataButtonState(true, true);
@@ -1266,25 +1237,20 @@ async function downloadParsedDataZip(): Promise<boolean> {
   statusTextElement.textContent = "Preparing parsed texture data zip...";
 
   try {
-    const sceneRasterLayers = listSceneRasterLayers(scene);
-    const selectedZip = await buildParsedDataZipBlobForLayout(
-      scene,
-      sceneStats,
-      label,
-      sourcePdfBytes,
-      EXPORT_TEXTURE_LAYOUT,
-      sceneRasterLayers,
-      {
-        encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
-        zipCompression: EXPORT_ZIP_COMPRESSION,
-        zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
-      }
-    );
+    const zipBlob = await buildParsedDataZip(scene, {
+      sourceLabel: label,
+      sourcePdf:
+        lastLoadedSource?.kind === "pdf"
+          ? lastLoadedSource.bytes
+          : lastDownloadablePdf?.bytes ??
+            lastDownloadablePdf?.blob ??
+            lastDownloadablePdf?.url
+    });
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
-    triggerBrowserDownload(selectedZip.blob, zipFileName);
+    triggerBrowserDownload(zipBlob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatFileSize(selectedZip.byteLength)}, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
+      `[Parsed data export] ${label}: wrote ${zipFileName} (${formatFileSize(zipBlob.size)})`
     );
     const restoredStatus = previousStatusText || baseStatus;
     statusTextElement.textContent = restoredStatus;
@@ -1517,7 +1483,7 @@ function cloneSourceBytes(buffer: ArrayBuffer): Uint8Array {
 }
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.slice().buffer;
+  return new Uint8Array(bytes).buffer;
 }
 
 function clamp(value: number, min: number, max: number): number {

@@ -163,6 +163,28 @@ Supported `source` inputs:
 - base64 payload string (`PDF` or `ZIP`)
 - base64 data URL (`data:application/pdf;base64,...`)
 
+Build a parsed-data ZIP directly from any supported PDF input. The result is
+an `application/zip` `Blob` that can be downloaded, uploaded, or stored:
+
+```ts
+import { buildParsedDataZip } from "@soadzoor/hepr";
+
+// URL, File, Blob, Uint8Array, ArrayBuffer, base64, or data URL
+const zipBlob = await buildParsedDataZip(pdfSource);
+```
+
+If the PDF is already loaded, pass its parsed scene to avoid parsing it again:
+
+```ts
+const zipBlob = await buildParsedDataZip(pdfObject.sceneData, {
+  sourceLabel: pdfObject.sourceLabel,
+  // Needed only if the scene has PDF image operations but no raster layers.
+  sourcePdf: originalPdfSource,
+  // If pages were selected, use the same selection for raster fallback.
+  sourcePdfPages: "3-5"
+});
+```
+
 Select pages with Chrome-style, one-based ASCII print syntax:
 
 ```ts
