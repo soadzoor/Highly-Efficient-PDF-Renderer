@@ -11,6 +11,7 @@ import {
   type VectorScene
 } from "./pdfVectorExtractor";
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
+import { hasPdfHeader } from "./pdfSignature";
 import {
   decodeByteShuffledFloat32,
   decodeChannelMajorFloat32,
@@ -1535,10 +1536,10 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
     }
 
     const fileBuffer = await zipEntry.async("arraybuffer");
-    if (fileBuffer.byteLength <= 0) {
-      continue;
+    const bytes = new Uint8Array(fileBuffer);
+    if (hasPdfHeader(bytes)) {
+      return bytes;
     }
-    return new Uint8Array(fileBuffer);
   }
 
   if (manifestUrl) {
@@ -1546,8 +1547,9 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
       const response = await fetch(resolveAppAssetUrl(manifestUrl));
       if (response.ok) {
         const fileBuffer = await response.arrayBuffer();
-        if (fileBuffer.byteLength > 0) {
-          return new Uint8Array(fileBuffer);
+        const bytes = new Uint8Array(fileBuffer);
+        if (hasPdfHeader(bytes)) {
+          return bytes;
         }
       }
     } catch {
@@ -1823,10 +1825,10 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
         continue;
       }
       const fileBuffer = await entry.async("arraybuffer");
-      if (fileBuffer.byteLength <= 0) {
-        continue;
+      const bytes = new Uint8Array(fileBuffer);
+      if (hasPdfHeader(bytes)) {
+        return bytes;
       }
-      return new Uint8Array(fileBuffer);
     }
   } catch {
     // Best-effort only.

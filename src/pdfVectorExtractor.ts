@@ -1,4 +1,5 @@
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
+import { assertPdfBytes } from "./pdfSignature";
 
 const pdfJsModule = (
   typeof window === "undefined"
@@ -408,9 +409,11 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
   const standardFontDataUrl = resolveStandardFontDataUrl();
   const progress = createLoadProgressReporter(options.onProgress);
   progress.report(0, { stage: "source", sourceType: "pdf" });
+  const pdfBytes = new Uint8Array(pdfData);
+  assertPdfBytes(pdfBytes);
 
   const loadingTask = getDocument({
-    data: new Uint8Array(pdfData),
+    data: pdfBytes,
     disableFontFace: true,
     fontExtraProperties: true,
     verbosity: PDFJS_VERBOSITY_ERRORS,
@@ -516,8 +519,10 @@ export async function extractPdfRasterPageScenes(
   const standardFontDataUrl = resolveStandardFontDataUrl();
   const progress = createLoadProgressReporter(options.onProgress);
   progress.report(0, { stage: "source", sourceType: "pdf" });
+  const pdfBytes = new Uint8Array(pdfData);
+  assertPdfBytes(pdfBytes);
   const loadingTask = getDocument({
-    data: new Uint8Array(pdfData),
+    data: pdfBytes,
     disableFontFace: true,
     fontExtraProperties: true,
     verbosity: PDFJS_VERBOSITY_ERRORS,
@@ -5015,6 +5020,8 @@ interface RasterOperatorPlan {
   hasImagePaintOps: boolean;
   hasShadingFillOps: boolean;
   hasSoftMaskPaintOps: boolean;
+  hasEarlyStrokeUnderlayOps: boolean;
+  hasOrderedPatternPaintOps: boolean;
   hasBackdropDependentBlendOps: boolean;
   hasFormXObjectOps: boolean;
   /** Image paint ops plus the state ops they depend on. */
@@ -5026,6 +5033,14 @@ interface RasterOperatorPlan {
   /** Definition/activation/consumer ranges whose paint output must not also be vectorized. */
   softMaskPaintMask: Uint8Array;
   softMaskCompositeCount: number;
+  /** A leading stroke-only paint run captured below later vector artwork. */
+  earlyStrokeUnderlayMask: Uint8Array;
+  earlyStrokeUnderlayCount: number;
+  earlyStrokeUnderlaySignature: string;
+  orderedPatternPaintCount: number;
+  orderedPatternPaintSignature: string;
+  /** True when every graphics paint precedes every text paint on the page. */
+  graphicsPaintsBeforeText: boolean;
   /** Complete non-text artwork for pages that require an existing backdrop to blend. */
   graphicsOnlyMask: Uint8Array;
   /** Source vector paths represented by graphicsOnlyMask and therefore suppressed. */
@@ -5192,6 +5207,215 @@ function buildSoftMaskPaintMask(
   return { mask, compositeCount };
 }
 
+function isSolidStrokeColorOperator(fn: number): boolean {
+  return (
+    fn === OPS.setStrokeRGBColor ||
+    fn === OPS.setStrokeColor ||
+    fn === OPS.setStrokeGray ||
+    fn === OPS.setStrokeCMYKColor ||
+    fn === OPS.setStrokeColorSpace ||
+    fn === OPS.setStrokeTransparent
+  );
+}
+
+function isSolidFillColorOperator(fn: number): boolean {
+  return (
+    fn === OPS.setFillRGBColor ||
+    fn === OPS.setFillColor ||
+    fn === OPS.setFillGray ||
+    fn === OPS.setFillCMYKColor ||
+    fn === OPS.setFillColorSpace ||
+    fn === OPS.setFillTransparent
+  );
+}
+
+/**
+ * Find a safe vector underlay that can be moved into the page's raster pass.
+ *
+ * Pattern-colored strokes cannot be represented by the flat RGB stroke buffer.
+ * When such a stroke occurs in the first visible, stroke-only paint run, the
+ * entire run can be rendered by PDF.js and placed below all later artwork
+ * without changing painter order. Capturing the complete run also keeps nearby
+ * solid-color decorative strokes in their original order relative to the
+ * pattern stroke.
+ */
+function buildEarlyStrokeUnderlayMask(
+  operatorList: { fnArray: number[]; argsArray: unknown[] }
+): { mask: Uint8Array; count: number; signature: string } {
+  const { fnArray, argsArray } = operatorList;
+  if (!fnArray.includes(OPS.setStrokeColorN)) {
+    return { mask: new Uint8Array(0), count: 0, signature: "" };
+  }
+  const mask = new Uint8Array(fnArray.length);
+  const patternStates: boolean[] = [];
+  const stateStack: boolean[] = [];
+  const formStateStack: boolean[] = [];
+  const annotationStateStack: boolean[] = [];
+  let strokeUsesPattern = false;
+
+  for (let i = 0; i < fnArray.length; i += 1) {
+    const fn = fnArray[i];
+
+    if (fn === OPS.save) {
+      stateStack.push(strokeUsesPattern);
+      continue;
+    }
+    if (fn === OPS.restore) {
+      strokeUsesPattern = stateStack.pop() ?? strokeUsesPattern;
+      continue;
+    }
+    if (fn === OPS.paintFormXObjectBegin) {
+      formStateStack.push(strokeUsesPattern);
+      continue;
+    }
+    if (fn === OPS.paintFormXObjectEnd) {
+      strokeUsesPattern = formStateStack.pop() ?? strokeUsesPattern;
+      continue;
+    }
+    if (fn === OPS.beginAnnotation) {
+      annotationStateStack.push(strokeUsesPattern);
+      continue;
+    }
+    if (fn === OPS.endAnnotation) {
+      strokeUsesPattern = annotationStateStack.pop() ?? strokeUsesPattern;
+      continue;
+    }
+
+    if (fn === OPS.setStrokeColorN) {
+      strokeUsesPattern = true;
+      continue;
+    }
+    if (isSolidStrokeColorOperator(fn)) {
+      strokeUsesPattern = false;
+      continue;
+    }
+
+    if (fn === OPS.constructPath) {
+      const paintOp = readNumber(argsArray[i], 0, -1);
+      const strokeOnly = isStrokePaintOp(paintOp) && !isFillPaintOp(paintOp);
+      if (!strokeOnly) {
+        if (isFillPaintOp(paintOp)) {
+          break;
+        }
+        continue;
+      }
+      mask[i] = 1;
+      patternStates.push(strokeUsesPattern);
+      continue;
+    }
+
+    if (
+      fn === OPS.shadingFill ||
+      isTextPaintOperator(fn) ||
+      isImagePaintOperator(fn) ||
+      fn === OPS.paintXObject
+    ) {
+      break;
+    }
+  }
+
+  if (patternStates.length === 0 || !patternStates.some(Boolean)) {
+    return { mask: new Uint8Array(fnArray.length), count: 0, signature: "" };
+  }
+
+  return {
+    mask,
+    count: patternStates.length,
+    signature: patternStates.map((value) => value ? "1" : "0").join("")
+  };
+}
+
+function buildOrderedPatternPaintPlan(
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  earlyStrokeUnderlayMask?: Uint8Array
+): { count: number; signature: string } {
+  const { fnArray, argsArray } = operatorList;
+  if (!fnArray.includes(OPS.setStrokeColorN) && !fnArray.includes(OPS.setFillColorN)) {
+    return { count: 0, signature: "" };
+  }
+  const stateStack: Array<{ stroke: boolean; fill: boolean }> = [];
+  const formStateStack: Array<{ stroke: boolean; fill: boolean }> = [];
+  const annotationStateStack: Array<{ stroke: boolean; fill: boolean }> = [];
+  const signatureParts: string[] = [];
+  let strokeUsesPattern = false;
+  let fillUsesPattern = false;
+
+  const snapshot = (): { stroke: boolean; fill: boolean } => ({
+    stroke: strokeUsesPattern,
+    fill: fillUsesPattern
+  });
+  const restore = (state: { stroke: boolean; fill: boolean } | undefined): void => {
+    if (state) {
+      strokeUsesPattern = state.stroke;
+      fillUsesPattern = state.fill;
+    }
+  };
+
+  for (let i = 0; i < fnArray.length; i += 1) {
+    const fn = fnArray[i];
+
+    if (fn === OPS.save) {
+      stateStack.push(snapshot());
+      continue;
+    }
+    if (fn === OPS.restore) {
+      restore(stateStack.pop());
+      continue;
+    }
+    if (fn === OPS.paintFormXObjectBegin) {
+      formStateStack.push(snapshot());
+      continue;
+    }
+    if (fn === OPS.paintFormXObjectEnd) {
+      restore(formStateStack.pop());
+      continue;
+    }
+    if (fn === OPS.beginAnnotation) {
+      annotationStateStack.push(snapshot());
+      continue;
+    }
+    if (fn === OPS.endAnnotation) {
+      restore(annotationStateStack.pop());
+      continue;
+    }
+
+    if (fn === OPS.setStrokeColorN) {
+      strokeUsesPattern = true;
+      continue;
+    }
+    if (fn === OPS.setFillColorN) {
+      fillUsesPattern = true;
+      continue;
+    }
+    if (isSolidStrokeColorOperator(fn)) {
+      strokeUsesPattern = false;
+      continue;
+    }
+    if (isSolidFillColorOperator(fn)) {
+      fillUsesPattern = false;
+      continue;
+    }
+
+    if (fn !== OPS.constructPath || earlyStrokeUnderlayMask?.[i] === 1) {
+      continue;
+    }
+
+    const paintOp = readNumber(argsArray[i], 0, -1);
+    const patternedStroke = isStrokePaintOp(paintOp) && strokeUsesPattern;
+    const patternedFill = isFillPaintOp(paintOp) && fillUsesPattern;
+    if (!patternedStroke && !patternedFill) {
+      continue;
+    }
+
+    signatureParts.push(patternedStroke && patternedFill ? "B" : patternedStroke ? "S" : "F");
+  }
+
+  return {
+    count: signatureParts.length,
+    signature: signatureParts.join("")
+  };
+}
+
 function isImageRasterStateOperator(fn: number, args: unknown): boolean {
   if (
     fn === OPS.dependency ||
@@ -5275,12 +5499,19 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
   const vectorPaintMask = new Uint8Array(operatorList.fnArray.length);
   const softMaskPlan = buildSoftMaskPaintMask(operatorList);
   const softMaskPaintMask = softMaskPlan.mask;
+  const earlyStrokeUnderlayPlan = buildEarlyStrokeUnderlayMask(operatorList);
+  const orderedPatternPlan = buildOrderedPatternPaintPlan(
+    operatorList,
+    earlyStrokeUnderlayPlan.mask
+  );
   let hasImagePaintOps = false;
   let hasShadingFillOps = false;
   let hasSoftMaskPaintOps = false;
   let hasBackdropDependentBlendOps = false;
   let backdropBlendCount = 0;
   let hasFormXObjectOps = false;
+  let firstTextPaintIndex = Number.POSITIVE_INFINITY;
+  let lastGraphicsPaintIndex = -1;
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
@@ -5289,11 +5520,18 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
     if (!isTextPaintOperator(fn)) {
       graphicsOnlyMask[i] = 1;
     }
+    if (isTextPaintOperator(fn)) {
+      firstTextPaintIndex = Math.min(firstTextPaintIndex, i);
+    }
     if (fn === OPS.constructPath) {
       const paintOp = readNumber(args, 0, -1);
       if (isStrokePaintOp(paintOp) || isFillPaintOp(paintOp)) {
         vectorPaintMask[i] = 1;
+        lastGraphicsPaintIndex = i;
       }
+    }
+    if (fn === OPS.shadingFill || isImagePaintOperator(fn) || fn === OPS.paintXObject) {
+      lastGraphicsPaintIndex = i;
     }
     if (fn === OPS.setGState && graphicsStateHasBackdropDependentBlend(args)) {
       hasBackdropDependentBlendOps = true;
@@ -5337,6 +5575,8 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
     hasImagePaintOps,
     hasShadingFillOps,
     hasSoftMaskPaintOps,
+    hasEarlyStrokeUnderlayOps: earlyStrokeUnderlayPlan.count > 0,
+    hasOrderedPatternPaintOps: orderedPatternPlan.count > 0,
     hasBackdropDependentBlendOps,
     hasFormXObjectOps,
     imageOnlyMask,
@@ -5344,6 +5584,12 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
     imageStateMask,
     softMaskPaintMask,
     softMaskCompositeCount: softMaskPlan.compositeCount,
+    earlyStrokeUnderlayMask: earlyStrokeUnderlayPlan.mask,
+    earlyStrokeUnderlayCount: earlyStrokeUnderlayPlan.count,
+    earlyStrokeUnderlaySignature: earlyStrokeUnderlayPlan.signature,
+    orderedPatternPaintCount: orderedPatternPlan.count,
+    orderedPatternPaintSignature: orderedPatternPlan.signature,
+    graphicsPaintsBeforeText: lastGraphicsPaintIndex < firstTextPaintIndex,
     graphicsOnlyMask,
     vectorPaintMask,
     backdropBlendCount
@@ -5518,9 +5764,29 @@ function combineRasterLayerResults(
   return {
     layers: [...first.layers, ...second.layers],
     bounds: combineBounds(first.bounds, second.bounds),
-    suppressedSourcePaintMask:
-      first.suppressedSourcePaintMask ?? second.suppressedSourcePaintMask
+    suppressedSourcePaintMask: combinePaintMasks(
+      first.suppressedSourcePaintMask,
+      second.suppressedSourcePaintMask
+    )
   };
+}
+
+function combinePaintMasks(first?: Uint8Array, second?: Uint8Array): Uint8Array | undefined {
+  if (!first) {
+    return second;
+  }
+  if (!second) {
+    return first;
+  }
+
+  const combined = new Uint8Array(Math.max(first.length, second.length));
+  combined.set(first);
+  for (let i = 0; i < second.length; i += 1) {
+    if (second[i] !== 0) {
+      combined[i] = 1;
+    }
+  }
+  return combined;
 }
 
 interface RasterPageLike {
@@ -5630,6 +5896,8 @@ async function extractRasterLayerData(
     !sourceRasterPlan.hasImagePaintOps &&
     !sourceRasterPlan.hasShadingFillOps &&
     !sourceRasterPlan.hasSoftMaskPaintOps &&
+    !sourceRasterPlan.hasEarlyStrokeUnderlayOps &&
+    !sourceRasterPlan.hasOrderedPatternPaintOps &&
     !sourceRasterPlan.hasBackdropDependentBlendOps &&
     !(options.allowFullPageFallback && sourceRasterPlan.hasFormXObjectOps)
   ) {
@@ -5648,6 +5916,33 @@ async function extractRasterLayerData(
   const displayOperatorList = await prepareDisplayOperatorList(pageLike);
   const filterOperatorList = displayOperatorList ?? operatorList;
   const rasterPlan = buildRasterOperatorPlan(filterOperatorList);
+  const earlyStrokeUnderlayMatches =
+    rasterPlan.earlyStrokeUnderlayCount > 0 &&
+    rasterPlan.earlyStrokeUnderlayCount === sourceRasterPlan.earlyStrokeUnderlayCount &&
+    rasterPlan.earlyStrokeUnderlaySignature === sourceRasterPlan.earlyStrokeUnderlaySignature;
+  let orderedPatternPaintMatches =
+    rasterPlan.orderedPatternPaintCount > 0 &&
+    rasterPlan.orderedPatternPaintCount === sourceRasterPlan.orderedPatternPaintCount &&
+    rasterPlan.orderedPatternPaintSignature === sourceRasterPlan.orderedPatternPaintSignature &&
+    rasterPlan.graphicsPaintsBeforeText &&
+    sourceRasterPlan.graphicsPaintsBeforeText;
+  if (
+    displayOperatorList &&
+    !earlyStrokeUnderlayMatches &&
+    (rasterPlan.earlyStrokeUnderlayCount > 0 || sourceRasterPlan.earlyStrokeUnderlayCount > 0)
+  ) {
+    const displayPatternPlan = buildOrderedPatternPaintPlan(filterOperatorList);
+    const sourcePatternPlan = buildOrderedPatternPaintPlan(operatorList);
+    orderedPatternPaintMatches =
+      displayPatternPlan.count > 0 &&
+      displayPatternPlan.count === sourcePatternPlan.count &&
+      displayPatternPlan.signature === sourcePatternPlan.signature &&
+      rasterPlan.graphicsPaintsBeforeText &&
+      sourceRasterPlan.graphicsPaintsBeforeText;
+  }
+  const backdropBlendMatches =
+    rasterPlan.backdropBlendCount > 0 &&
+    rasterPlan.backdropBlendCount === sourceRasterPlan.backdropBlendCount;
 
   const rotation = normalizeRotationDegrees(pageLike.rotate);
   const baseViewport = pageLike.getViewport({ scale: 1, rotation, dontFlip: false });
@@ -5682,13 +5977,14 @@ async function extractRasterLayerData(
 
   if (
     displayOperatorList &&
-    rasterPlan.backdropBlendCount > 0 &&
-    rasterPlan.backdropBlendCount === sourceRasterPlan.backdropBlendCount
+    (backdropBlendMatches || orderedPatternPaintMatches)
   ) {
     const graphicsScale = chooseRasterExtractionScale(
       baseWidth,
       baseHeight,
-      Math.max(RASTER_SHADING_TARGET_SCALE, completeImageScan.nativeScaleHint ?? 1)
+      backdropBlendMatches
+        ? Math.max(RASTER_SHADING_TARGET_SCALE, completeImageScan.nativeScaleHint ?? 1)
+        : RASTER_SHADING_TARGET_SCALE
     );
     const viewport = buildViewport(graphicsScale);
     const width = Math.max(1, Math.ceil(viewport.width));
@@ -5704,21 +6000,28 @@ async function extractRasterLayerData(
         return graphicsResult;
       }
     }
-    // Retain the selective shading/image path when the backdrop-inclusive render
+    // Retain the selective shading/image path when the ordered graphics render
     // cannot be allocated or rendered.
   }
 
   let rgba: Uint8Array | null = null;
   let shadingResult = createEmptyRasterLayerResult();
-  if (displayOperatorList && (rasterPlan.hasShadingFillOps || rasterPlan.hasSoftMaskPaintOps)) {
+  if (
+    displayOperatorList &&
+    (rasterPlan.hasShadingFillOps || rasterPlan.hasSoftMaskPaintOps || earlyStrokeUnderlayMatches)
+  ) {
     const shadingScale = chooseRasterExtractionScale(baseWidth, baseHeight, RASTER_SHADING_TARGET_SCALE);
     const viewport = buildViewport(shadingScale);
     const width = Math.max(1, Math.ceil(viewport.width));
     const height = Math.max(1, Math.ceil(viewport.height));
     if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
       const shadingOnlyMask = rasterPlan.shadingOnlyMask;
+      const earlyStrokeUnderlayMask = rasterPlan.earlyStrokeUnderlayMask;
       const filter = (index: number): boolean =>
-        index >= 0 && index < shadingOnlyMask.length && shadingOnlyMask[index] === 1;
+        index >= 0 &&
+        index < shadingOnlyMask.length &&
+        (shadingOnlyMask[index] === 1 ||
+          (earlyStrokeUnderlayMatches && earlyStrokeUnderlayMask[index] === 1));
       rgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
       if (rgba && hasVisibleAlphaPixels(rgba)) {
         shadingResult = finalizeCroppedRasterLayerResult(width, height, rgba, viewport, pageMatrix);
@@ -5727,6 +6030,12 @@ async function extractRasterLayerData(
           rasterPlan.softMaskCompositeCount === sourceRasterPlan.softMaskCompositeCount
         ) {
           shadingResult.suppressedSourcePaintMask = sourceRasterPlan.softMaskPaintMask;
+        }
+        if (earlyStrokeUnderlayMatches) {
+          shadingResult.suppressedSourcePaintMask = combinePaintMasks(
+            shadingResult.suppressedSourcePaintMask,
+            sourceRasterPlan.earlyStrokeUnderlayMask
+          );
         }
       }
     }

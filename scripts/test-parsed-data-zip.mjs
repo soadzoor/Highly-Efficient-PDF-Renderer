@@ -196,6 +196,109 @@ async function run() {
       "optimized PDF.js render lists must preserve raster layers"
     );
 
+    const parsedOrderedUnderlayPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "11"
+    });
+    const orderedUnderlayLayers = listSceneRasterLayers(parsedOrderedUnderlayPdf.scene);
+    assert.equal(orderedUnderlayLayers.length, 1, "leading patterned strokes must share the page underlay capture");
+    assert.ok(
+      orderedUnderlayLayers[0].width >= 1_700 && orderedUnderlayLayers[0].height >= 1_200,
+      "the decorative-circle underlay must retain its full-page arc extent"
+    );
+    assert.equal(parsedOrderedUnderlayPdf.scene.segmentCount, 2_322, "decorative circles must not remain above table fills");
+    assert.equal(parsedOrderedUnderlayPdf.scene.fillPathCount, 156, "ordered underlay capture must preserve vector tables");
+    assert.equal(parsedOrderedUnderlayPdf.scene.textInstanceCount, 2_608, "ordered underlay capture must preserve vector text");
+    let blackStrokeCount = 0;
+    let burgundyStrokeCount = 0;
+    for (let i = 0; i < parsedOrderedUnderlayPdf.scene.segmentCount; i += 1) {
+      const offset = i * 4;
+      const red = parsedOrderedUnderlayPdf.scene.styles[offset + 1];
+      const green = parsedOrderedUnderlayPdf.scene.styles[offset + 2];
+      const blue = parsedOrderedUnderlayPdf.scene.styles[offset + 3];
+      if (Math.abs(red) < 1e-4 && Math.abs(green) < 1e-4 && Math.abs(blue) < 1e-4) {
+        blackStrokeCount += 1;
+      }
+      if (
+        Math.abs(red - 80 / 255) < 1e-4 &&
+        Math.abs(green - 23 / 255) < 1e-4 &&
+        Math.abs(blue - 31 / 255) < 1e-4
+      ) {
+        burgundyStrokeCount += 1;
+      }
+    }
+    assert.equal(blackStrokeCount, 0, "ColorN pattern strokes must not fall back to black vectors");
+    assert.equal(burgundyStrokeCount, 0, "the complete decorative-circle run must stay below the tables");
+    const orderedCirclePixel = sampleRasterLayerAtWorld(orderedUnderlayLayers[0], 361, 694);
+    assert.ok(
+      Math.abs(orderedCirclePixel[0] - 244) <= 2 &&
+        Math.abs(orderedCirclePixel[1] - 154) <= 2 &&
+        Math.abs(orderedCirclePixel[2] - 127) <= 2 &&
+        orderedCirclePixel[3] >= 253,
+      "ColorN circle strokes must retain their PDF shading pattern"
+    );
+    const tableOverlapX = 724.574;
+    const tableOverlapY = 352.798;
+    const underTableCirclePixel = sampleRasterLayerAtWorld(
+      orderedUnderlayLayers[0],
+      tableOverlapX,
+      tableOverlapY
+    );
+    assert.ok(
+      underTableCirclePixel[0] > 245 &&
+        underTableCirclePixel[1] < 100 &&
+        underTableCirclePixel[2] < 80 &&
+        underTableCirclePixel[3] > 220,
+      "the circle paint must exist in the underlay at the table intersection"
+    );
+    let hasOpaqueCreamTableFill = false;
+    for (let i = 0; i < parsedOrderedUnderlayPdf.scene.fillPathCount; i += 1) {
+      const offset = i * 4;
+      const minX = parsedOrderedUnderlayPdf.scene.fillPathMetaA[offset + 2];
+      const minY = parsedOrderedUnderlayPdf.scene.fillPathMetaA[offset + 3];
+      const maxX = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset];
+      const maxY = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset + 1];
+      const red = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset + 2];
+      const green = parsedOrderedUnderlayPdf.scene.fillPathMetaB[offset + 3];
+      const blue = parsedOrderedUnderlayPdf.scene.fillPathMetaC[offset + 2];
+      const alpha = parsedOrderedUnderlayPdf.scene.fillPathMetaC[offset + 3];
+      if (
+        tableOverlapX >= minX && tableOverlapX <= maxX &&
+        tableOverlapY >= minY && tableOverlapY <= maxY &&
+        Math.abs(red - 251 / 255) < 1e-4 &&
+        Math.abs(green - 243 / 255) < 1e-4 &&
+        Math.abs(blue - 240 / 255) < 1e-4 &&
+        Math.abs(alpha - 1) < 1e-4
+      ) {
+        hasOpaqueCreamTableFill = true;
+        break;
+      }
+    }
+    assert.ok(hasOpaqueCreamTableFill, "an opaque table fill must remain vector-rendered above the circle underlay");
+
+    const parsedOrderedPatternPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "6"
+    });
+    const orderedPatternLayers = listSceneRasterLayers(parsedOrderedPatternPdf.scene);
+    assert.equal(orderedPatternLayers.length, 1, "interleaved ColorN strokes require one ordered graphics composite");
+    assert.ok(
+      orderedPatternLayers[0].width <= 1_800 && orderedPatternLayers[0].height <= 1_300,
+      "ordered vector-pattern capture must stay at the bounded shading scale"
+    );
+    assert.equal(parsedOrderedPatternPdf.scene.segmentCount, 0, "ordered pattern graphics must not be emitted twice");
+    assert.equal(parsedOrderedPatternPdf.scene.fillPathCount, 0, "ordered pattern fills must not be emitted twice");
+    assert.equal(parsedOrderedPatternPdf.scene.textInstanceCount, 1_461, "ordered graphics capture must preserve vector text");
+    const orderedPatternSamples = [
+      sampleRasterLayerAtWorld(orderedPatternLayers[0], 900, 236.543),
+      sampleRasterLayerAtWorld(orderedPatternLayers[0], 930, 252.274),
+      sampleRasterLayerAtWorld(orderedPatternLayers[0], 970, 228.581)
+    ];
+    assert.ok(
+      orderedPatternSamples.every((pixel) => pixel[0] > 245 && pixel[1] >= 70 && pixel[1] <= 190 && pixel[2] < 60 && pixel[3] > 250),
+      "interleaved ColorN strokes must retain their red/orange gradients and PDF paint order"
+    );
+
     const parsedShadingAndDashPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
       sourceKind: "pdf",
       pages: "12"

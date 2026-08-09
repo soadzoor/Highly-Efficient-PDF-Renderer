@@ -2,6 +2,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 
+import { encodeExampleAssetPathSegment } from "./example-asset-path.ts";
+
 interface ExampleOptionManifestEntry {
   id: string;
   name: string;
@@ -64,11 +66,11 @@ async function main(): Promise<void> {
       id,
       name: pdf.name,
       pdf: {
-        path: `examples/pdfs/${encodeURIComponent(pdf.name)}`,
+        path: `examples/pdfs/${encodeExampleAssetPathSegment(pdf.name)}`,
         sizeBytes: pdf.sizeBytes
       },
       parsedZip: {
-        path: `examples/zips/${encodeURIComponent(matchedZip.name)}`,
+        path: `examples/zips/${encodeExampleAssetPathSegment(matchedZip.name)}`,
         sizeBytes: matchedZip.sizeBytes
       }
     });

@@ -1,3 +1,5 @@
+import { assertPdfBytes, PDF_HEADER_SCAN_BYTES } from "./pdfSignature";
+
 export interface PdfDownloadSource {
   label: string;
   bytes?: Uint8Array;
@@ -19,12 +21,14 @@ export function triggerBrowserDownload(blob: Blob, filename: string): void {
 
 export async function readPdfDownloadBlob(source: PdfDownloadSource): Promise<Blob> {
   if (source.blob) {
+    await assertPdfBlob(source.blob, source.label, source.blob.type);
     return source.blob.type === "application/pdf"
       ? source.blob
       : new Blob([source.blob], { type: "application/pdf" });
   }
 
   if (source.bytes && source.bytes.length > 0) {
+    assertPdfBytes(source.bytes.subarray(0, PDF_HEADER_SCAN_BYTES), { label: source.label });
     return new Blob([copyBytesToArrayBuffer(source.bytes)], { type: "application/pdf" });
   }
 
@@ -33,10 +37,17 @@ export async function readPdfDownloadBlob(source: PdfDownloadSource): Promise<Bl
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-    return await response.blob();
+    const blob = await response.blob();
+    await assertPdfBlob(blob, source.label || source.url, response.headers.get("content-type"));
+    return blob.type === "application/pdf" ? blob : new Blob([blob], { type: "application/pdf" });
   }
 
   throw new Error("No PDF source is available.");
+}
+
+async function assertPdfBlob(blob: Blob, label: string, contentType?: string | null): Promise<void> {
+  const headerBytes = new Uint8Array(await blob.slice(0, PDF_HEADER_SCAN_BYTES).arrayBuffer());
+  assertPdfBytes(headerBytes, { label, contentType });
 }
 
 export async function readPdfDownloadBytes(source: PdfDownloadSource): Promise<Uint8Array> {

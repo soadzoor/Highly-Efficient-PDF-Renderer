@@ -14,6 +14,7 @@ import {
   type LoadProgressCallback,
   type PDFLoadProgress
 } from "./loadProgress";
+import { hasPdfHeader } from "./pdfSignature";
 
 /** Compression algorithm used for a generated parsed-data ZIP. */
 export type ParsedDataZipCompression = "deflate" | "store";
@@ -148,7 +149,7 @@ async function buildParsedDataZipFromScene(
       options.sourcePdf,
       progress.child(0, buildStart, { sourceType: "pdf" })
     );
-    if (!looksLikePdfBytes(sourcePdfBytes)) {
+    if (!hasPdfHeader(sourcePdfBytes)) {
       throw new Error("options.sourcePdf does not contain PDF data.");
     }
   }
@@ -271,16 +272,6 @@ function validateEncodingOptions(options: ParsedDataZipEncodingOptions): void {
 
 function needsSourcePdfFallback(scene: VectorScene, rasterLayerCount: number): boolean {
   return scene.imagePaintOpCount > 0 && rasterLayerCount === 0;
-}
-
-function looksLikePdfBytes(bytes: Uint8Array): boolean {
-  return (
-    bytes.length >= 4 &&
-    bytes[0] === 0x25 &&
-    bytes[1] === 0x50 &&
-    bytes[2] === 0x44 &&
-    bytes[3] === 0x46
-  );
 }
 
 function isVectorScene(value: PdfObjectSource | VectorScene): value is VectorScene {

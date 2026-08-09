@@ -18,6 +18,7 @@ import {
 } from "./pdfVectorExtractor";
 import { loadSceneFromParsedDataZip } from "./parsedDataZip";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
+import { hasPdfHeader } from "./pdfSignature";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -218,7 +219,7 @@ async function readStringSourceBytes(source: string, progress?: LoadProgressRepo
   }
 
   const decodedBase64 = tryDecodeBase64Bytes(trimmed);
-  if (decodedBase64 && (looksLikePdfBytes(decodedBase64) || looksLikeZipBytes(decodedBase64))) {
+  if (decodedBase64 && (hasPdfHeader(decodedBase64) || looksLikeZipBytes(decodedBase64))) {
     progress?.report(1, { stage: "source", unit: "bytes", processed: decodedBase64.length, total: decodedBase64.length });
     return decodedBase64;
   }
@@ -305,11 +306,11 @@ function resolveSourceKind(
     }
   }
 
-  if (looksLikePdfBytes(sourceBytes)) {
-    return "pdf";
-  }
   if (looksLikeZipBytes(sourceBytes)) {
     return "parsed-zip";
+  }
+  if (hasPdfHeader(sourceBytes)) {
+    return "pdf";
   }
 
   throw new Error(
@@ -390,18 +391,6 @@ function looksLikeRawBase64Source(value: string): boolean {
     normalized.length >= 64 &&
     normalized.length % 4 === 0 &&
     /^[A-Za-z0-9+/]+={0,2}$/.test(normalized)
-  );
-}
-
-function looksLikePdfBytes(bytes: Uint8Array): boolean {
-  if (bytes.length < 4) {
-    return false;
-  }
-  return (
-    bytes[0] === 0x25 && // %
-    bytes[1] === 0x50 && // P
-    bytes[2] === 0x44 && // D
-    bytes[3] === 0x46 // F
   );
 }
 
