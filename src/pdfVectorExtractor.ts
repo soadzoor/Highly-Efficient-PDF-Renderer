@@ -4800,6 +4800,12 @@ interface RasterOperatorPlan {
   imageStateMask: Uint8Array;
 }
 
+interface PdfOperatorListLike {
+  fnArray: number[];
+  argsArray: unknown[];
+  lastChunk?: boolean;
+}
+
 function isImagePaintOperator(fn: number): boolean {
   return (
     fn === OPS.paintImageXObject ||
@@ -5078,6 +5084,83 @@ interface RasterPageLike {
     background?: string;
     operationsFilter?: (index: number) => boolean;
   }) => { promise: Promise<unknown> };
+  _intentStates?: {
+    get: (key: string) => { operatorList?: PdfOperatorListLike } | undefined;
+  };
+  _transport?: {
+    getRenderingIntent?: (intent: string) => { cacheKey?: string };
+  };
+}
+
+function getCachedDisplayOperatorList(pageLike: RasterPageLike): PdfOperatorListLike | null {
+  const intentStates = pageLike._intentStates;
+  const getRenderingIntent = pageLike._transport?.getRenderingIntent;
+  if (!intentStates || typeof intentStates.get !== "function" || typeof getRenderingIntent !== "function") {
+    return null;
+  }
+
+  let cacheKey: string | undefined;
+  try {
+    cacheKey = getRenderingIntent.call(pageLike._transport, "display").cacheKey;
+  } catch {
+    return null;
+  }
+  if (!cacheKey) {
+    return null;
+  }
+
+  const operatorList = intentStates.get(cacheKey)?.operatorList;
+  if (
+    !operatorList?.lastChunk ||
+    !Array.isArray(operatorList.fnArray) ||
+    !Array.isArray(operatorList.argsArray) ||
+    operatorList.fnArray.length !== operatorList.argsArray.length
+  ) {
+    return null;
+  }
+  return operatorList;
+}
+
+async function prepareDisplayOperatorList(pageLike: RasterPageLike): Promise<PdfOperatorListLike | null> {
+  const cached = getCachedDisplayOperatorList(pageLike);
+  if (cached) {
+    return cached;
+  }
+
+  // PDF.js deliberately returns an unoptimized list from getOperatorList(), but
+  // render() streams an optimized list whose operator indices can differ. Prime that
+  // display list with a no-op render so operationsFilter is built against the exact
+  // list it will receive, rather than applying unoptimized indices to optimized ops.
+  const pageWidth = Math.max(1, Math.abs(pageLike.view[2] - pageLike.view[0]));
+  const pageHeight = Math.max(1, Math.abs(pageLike.view[3] - pageLike.view[1]));
+  const probeScale = 1 / Math.max(pageWidth, pageHeight);
+  const viewport = pageLike.getViewport({
+    scale: probeScale,
+    rotation: normalizeRotationDegrees(pageLike.rotate),
+    dontFlip: false
+  });
+  const width = Math.max(1, Math.ceil(viewport.width));
+  const height = Math.max(1, Math.ceil(viewport.height));
+  const surface = await createRasterRenderSurface(width, height);
+  if (!surface) {
+    return null;
+  }
+
+  try {
+    await pageLike.render({
+      canvasContext: surface.context as unknown as CanvasRenderingContext2D,
+      viewport,
+      intent: "display",
+      background: "rgba(0,0,0,0)",
+      operationsFilter: () => false
+    }).promise;
+  } catch {
+    return null;
+  } finally {
+    surface.dispose();
+  }
+
+  return getCachedDisplayOperatorList(pageLike);
 }
 
 async function extractRasterLayerData(
@@ -5086,8 +5169,8 @@ async function extractRasterLayerData(
   pageMatrix: Mat2D,
   options: RasterLayerExtractOptions
 ): Promise<RasterLayerExtractResult> {
-  const rasterPlan = buildRasterOperatorPlan(operatorList);
-  if (!rasterPlan.hasImagePaintOps && !(options.allowFullPageFallback && rasterPlan.hasFormXObjectOps)) {
+  const sourceRasterPlan = buildRasterOperatorPlan(operatorList);
+  if (!sourceRasterPlan.hasImagePaintOps && !(options.allowFullPageFallback && sourceRasterPlan.hasFormXObjectOps)) {
     return createEmptyRasterLayerResult();
   }
 
@@ -5100,16 +5183,26 @@ async function extractRasterLayerData(
     return createEmptyRasterLayerResult();
   }
 
+  const displayOperatorList = await prepareDisplayOperatorList(pageLike);
+  const filterOperatorList = displayOperatorList ?? operatorList;
+  const rasterPlan = buildRasterOperatorPlan(filterOperatorList);
+
   const rotation = normalizeRotationDegrees(pageLike.rotate);
   const baseViewport = pageLike.getViewport({ scale: 1, rotation, dontFlip: false });
   const baseWidth = Math.max(1, Math.ceil(baseViewport.width));
   const baseHeight = Math.max(1, Math.ceil(baseViewport.height));
-  const scan = scanRasterImageOps(operatorList);
+  const scan = scanRasterImageOps(filterOperatorList);
   const buildViewport = (rasterScale: number): { transform: unknown; width: number; height: number } =>
     rasterScale === 1 ? baseViewport : pageLike.getViewport({ scale: rasterScale, rotation, dontFlip: false });
 
   // Preferred path: one cropped layer per image op, each at its own native resolution.
-  if (rasterPlan.hasImagePaintOps && scan.plans && scan.plans.length > 0 && scan.plans.length <= RASTER_MAX_IMAGE_LAYERS) {
+  if (
+    displayOperatorList &&
+    rasterPlan.hasImagePaintOps &&
+    scan.plans &&
+    scan.plans.length > 0 &&
+    scan.plans.length <= RASTER_MAX_IMAGE_LAYERS
+  ) {
     const perImage = await renderPerImageRasterLayers(pageLike, scan.plans, rasterPlan.imageStateMask, pageMatrix, rotation, baseViewport);
     if (perImage) {
       return perImage;
@@ -5117,7 +5210,7 @@ async function extractRasterLayerData(
   }
 
   let rgba: Uint8Array | null = null;
-  if (rasterPlan.hasImagePaintOps) {
+  if (displayOperatorList && rasterPlan.hasImagePaintOps) {
     // Flattened-page fallback: per-image placement unavailable (repeat/group ops,
     // unreadable sizes) or too many image ops for individual layers. Embedded images
     // cannot gain detail beyond their native resolution, so the page renders at the
@@ -5133,6 +5226,24 @@ async function extractRasterLayerData(
       if (rgba && hasVisibleAlphaPixels(rgba)) {
         return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
       }
+    }
+  }
+
+  if (!displayOperatorList && sourceRasterPlan.hasImagePaintOps) {
+    // If a future PDF.js version stops exposing its cached display list, avoid an
+    // unsafe index filter. A full render may duplicate vector pixels, but it preserves
+    // the document's raster content and cannot unbalance PDF.js graphics state.
+    const imageScale = chooseRasterExtractionScale(
+      baseWidth,
+      baseHeight,
+      scan.nativeScaleHint ?? RASTER_FALLBACK_TARGET_SCALE
+    );
+    const viewport = buildViewport(imageScale);
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    rgba = await renderRasterLayerRgba(pageLike, viewport, width, height);
+    if (rgba && hasVisibleAlphaPixels(rgba)) {
+      return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
     }
   }
 

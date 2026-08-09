@@ -1,6 +1,18 @@
 {
-  "generatedAt": "2026-07-08T20:28:46.256Z",
+  "generatedAt": "2026-08-09T16:08:59.733Z",
   "examples": [
+    {
+      "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
+      "name": "20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
+      "pdf": {
+        "path": "examples/pdfs/20260415%2BBroschuere_Leo_B2C_RZ%2B(online%2Breduz).pdf",
+        "sizeBytes": 3357354
+      },
+      "parsedZip": {
+        "path": "examples/zips/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.zip",
+        "sizeBytes": 1264026
+      }
+    },
     {
       "id": "baldwin_park_ed_remodel_floor_1",
       "name": "Baldwin Park ED Remodel_Floor 1.pdf",

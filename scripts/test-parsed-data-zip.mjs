@@ -25,6 +25,10 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRootDir = path.resolve(scriptDir, "..");
 const fixturePath = path.join(repoRootDir, "public/examples/pdfs/LK Office Level 1.pdf");
 const rasterFixturePath = path.join(repoRootDir, "public/examples/pdfs/thesis.pdf");
+const optimizedRasterFixturePath = path.join(
+  repoRootDir,
+  "public/examples/pdfs/20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf"
+);
 
 function assertSceneCountsEqual(actual, expected, context) {
   for (const key of [
@@ -165,6 +169,17 @@ async function run() {
         Array.from(expectedRasterLayers[i].matrix)
       );
     }
+
+    const optimizedRasterPdfBytes = await readFile(optimizedRasterFixturePath);
+    const parsedOptimizedRasterPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "1"
+    });
+    assert.ok(parsedOptimizedRasterPdf.scene.imagePaintOpCount > 0);
+    assert.ok(
+      listSceneRasterLayers(parsedOptimizedRasterPdf.scene).length > 0,
+      "optimized PDF.js render lists must preserve raster layers"
+    );
 
     await assert.rejects(
       buildParsedDataZip(new Uint8Array([1]), { compression: "deflate", compressionLevel: 0 }),
