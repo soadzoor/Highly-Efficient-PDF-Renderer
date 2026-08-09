@@ -48,6 +48,21 @@ async function readZip(blob) {
   return JSZip.loadAsync(await blob.arrayBuffer());
 }
 
+function sampleRasterLayerAtWorld(layer, worldX, worldY) {
+  const [a, b, c, d, e, f] = layer.matrix;
+  const det = a * d - b * c;
+  assert.ok(Math.abs(det) > 1e-9, "raster layer matrix must be invertible");
+  const dx = worldX - e;
+  const dy = worldY - f;
+  const u = (d * dx - c * dy) / det;
+  const v = (-b * dx + a * dy) / det;
+  assert.ok(u >= 0 && u <= 1 && v >= 0 && v <= 1, "sample point must be inside the raster layer");
+  const x = Math.min(layer.width - 1, Math.max(0, Math.floor(u * layer.width)));
+  const y = Math.min(layer.height - 1, Math.max(0, Math.floor(v * layer.height)));
+  const offset = (y * layer.width + x) * 4;
+  return Array.from(layer.data.subarray(offset, offset + 4));
+}
+
 async function run() {
   const viteServer = await createServer({
     configFile: false,
@@ -179,6 +194,116 @@ async function run() {
     assert.ok(
       listSceneRasterLayers(parsedOptimizedRasterPdf.scene).length > 0,
       "optimized PDF.js render lists must preserve raster layers"
+    );
+
+    const parsedShadingAndDashPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "12"
+    });
+    const shadingLayers = listSceneRasterLayers(parsedShadingAndDashPdf.scene);
+    assert.equal(shadingLayers.length, 1, "shadingFill operators must produce a raster layer");
+    const sampledShadingColors = new Set();
+    for (let i = 0; i + 3 < shadingLayers[0].data.length; i += 388) {
+      if (shadingLayers[0].data[i + 3] > 0) {
+        sampledShadingColors.add(
+          `${shadingLayers[0].data[i]},${shadingLayers[0].data[i + 1]},${shadingLayers[0].data[i + 2]}`
+        );
+      }
+    }
+    assert.ok(sampledShadingColors.size > 16, "captured shading content must retain gradient color variation");
+    const maskedCirclePixel = sampleRasterLayerAtWorld(shadingLayers[0], 500, 700);
+    assert.ok(
+      maskedCirclePixel[3] >= 40,
+      "soft-mask consumers must be composited with their luminosity-mask definitions"
+    );
+    const maskedCenterDotPixel = sampleRasterLayerAtWorld(shadingLayers[0], 800, 436.4);
+    assert.ok(
+      Math.abs(maskedCenterDotPixel[0] - 233) <= 2 &&
+        Math.abs(maskedCenterDotPixel[1] - 198) <= 2 &&
+        Math.abs(maskedCenterDotPixel[2] - 186) <= 2 &&
+        maskedCenterDotPixel[3] >= 253,
+      "soft-masked fill and dash consumers must be captured in PDF paint order"
+    );
+    let flatSalmonVectorFillCount = 0;
+    for (let i = 0; i < parsedShadingAndDashPdf.scene.fillPathCount; i += 1) {
+      const offset = i * 4;
+      const red = parsedShadingAndDashPdf.scene.fillPathMetaB[offset + 2];
+      const green = parsedShadingAndDashPdf.scene.fillPathMetaB[offset + 3];
+      const blue = parsedShadingAndDashPdf.scene.fillPathMetaC[offset + 2];
+      if (Math.abs(red - 1) < 1e-4 && Math.abs(green - 76 / 255) < 1e-4 && Math.abs(blue - 41 / 255) < 1e-4) {
+        flatSalmonVectorFillCount += 1;
+      }
+    }
+    assert.equal(flatSalmonVectorFillCount, 0, "soft-mask consumers must not be emitted again as opaque vector fills");
+    assert.ok(
+      parsedShadingAndDashPdf.scene.sourceSegmentCount > 1_000,
+      "setDash operators must expand stroked paths into painted dash spans"
+    );
+    assert.equal(parsedShadingAndDashPdf.scene.textInstanceCount, 1_764, "shading fallback must preserve vector text");
+    let darkTableTextCount = 0;
+    for (let i = 0; i < parsedShadingAndDashPdf.scene.textInstanceCount; i += 1) {
+      const offset = i * 4;
+      const red = parsedShadingAndDashPdf.scene.textInstanceC[offset];
+      const green = parsedShadingAndDashPdf.scene.textInstanceC[offset + 1];
+      const blue = parsedShadingAndDashPdf.scene.textInstanceC[offset + 2];
+      const alpha = parsedShadingAndDashPdf.scene.textInstanceC[offset + 3];
+      if (
+        Math.abs(red - 44 / 255) < 1e-4 &&
+        Math.abs(green - 46 / 255) < 1e-4 &&
+        Math.abs(blue - 53 / 255) < 1e-4 &&
+        Math.abs(alpha - 1) < 1e-4
+      ) {
+        darkTableTextCount += 1;
+      }
+    }
+    assert.equal(darkTableTextCount, 1_649, "PDF display/sRGB text colors must survive extraction unchanged");
+
+    const shadingZipBlob = await buildParsedDataZip(parsedShadingAndDashPdf.scene, {
+      sourceLabel: "shading-and-dash.pdf",
+      compression: "store"
+    });
+    const shadingZip = await readZip(shadingZipBlob);
+    const shadingManifest = JSON.parse(await shadingZip.file("manifest.json").async("string"));
+    const encodedShading = shadingManifest.scene.rasterLayers[0];
+    assert.match(encodedShading.file, /\.(?:png|webp)$/);
+    assert.match(encodedShading.encoding, /^(?:png|webp)$/);
+    const encodedShadingBytes = await shadingZip.file(encodedShading.file).async("uint8array");
+    assert.ok(encodedShadingBytes.length < shadingLayers[0].data.length, "Node ZIP builds must compress raster layers");
+    const encodedShadingRoundTrip = await loadSceneFromParsedDataZip(await shadingZipBlob.arrayBuffer());
+    const decodedShadingLayers = listSceneRasterLayers(encodedShadingRoundTrip);
+    assert.equal(decodedShadingLayers.length, 1, "Node ZIP loads must decode encoded raster layers");
+    assert.equal(decodedShadingLayers[0].width, shadingLayers[0].width);
+    assert.equal(decodedShadingLayers[0].height, shadingLayers[0].height);
+    const decodedCenterDotPixel = sampleRasterLayerAtWorld(decodedShadingLayers[0], 800, 436.4);
+    assert.ok(
+      decodedCenterDotPixel[0] > 210 &&
+        decodedCenterDotPixel[1] > 170 &&
+        decodedCenterDotPixel[2] > 160 &&
+        decodedCenterDotPixel[3] > 245,
+      "encoded soft-mask composites must survive the Node ZIP round trip"
+    );
+
+    const parsedBackdropBlendPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "14"
+    });
+    const backdropBlendLayers = listSceneRasterLayers(parsedBackdropBlendPdf.scene);
+    assert.ok(parsedBackdropBlendPdf.scene.imagePaintOpCount > 0, "blend fixture must contain an image backdrop");
+    assert.equal(
+      backdropBlendLayers.length,
+      1,
+      "backdrop-dependent blend groups and their image backdrop must retain PDF paint order in one composite"
+    );
+    assert.equal(parsedBackdropBlendPdf.scene.segmentCount, 0, "composited blend paths must not be emitted twice");
+    assert.equal(
+      parsedBackdropBlendPdf.scene.sourceSegmentCount,
+      0,
+      "composited blend strokes must not remain in vector source data"
+    );
+    assert.equal(parsedBackdropBlendPdf.scene.fillPathCount, 0, "composited blend fills must not be emitted twice");
+    assert.ok(
+      parsedBackdropBlendPdf.scene.textInstanceCount > 1_000,
+      "backdrop-inclusive graphics capture must preserve searchable vector text"
     );
 
     await assert.rejects(

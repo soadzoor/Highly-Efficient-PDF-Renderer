@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -161,7 +162,7 @@ fn heprFillFragment(
     if (alpha <= 0.001) {
       discard;
     }
-    return vec4<f32>(color, alpha);
+    return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
@@ -173,9 +174,10 @@ fn heprFillFragment(
     discard;
   }
 
-  return vec4<f32>(color, alpha);
+  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
 }
 `, [
+  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(TSL.wgslFn(`
 fn heprDistanceToLineSegment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
   let ab = b - a;

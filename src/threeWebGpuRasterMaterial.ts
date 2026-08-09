@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
+import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
+
 interface MutableUniform<T> {
   value: T;
 }
@@ -73,9 +75,11 @@ fn heprRasterFragment(color: vec4<f32>) -> vec4<f32> {
   if (color.a <= 0.001) {
     discard;
   }
-  return color;
+  let straightSrgb = clamp(color.rgb / color.a, vec3<f32>(0.0), vec3<f32>(1.0));
+  let linearPremultiplied = heprThreeOutputSrgbToLinear(straightSrgb) * color.a;
+  return vec4<f32>(linearPremultiplied, color.a);
 }
-`);
+`, [threeWebGpuOutputSrgbToLinearFn as never]);
 
 export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions

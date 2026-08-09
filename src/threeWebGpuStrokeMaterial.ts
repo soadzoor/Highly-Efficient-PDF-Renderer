@@ -7,6 +7,7 @@ import {
   CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE
 } from "./coreWgslShaders";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -215,9 +216,10 @@ fn heprStrokeFragment(
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let baseColor = style.yzw;
   let color = baseColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
-  return vec4<f32>(color, alpha);
+  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
 }
 `, [
+  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(floatModFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn)

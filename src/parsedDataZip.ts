@@ -1564,6 +1564,25 @@ interface EncodedRasterImage {
   extension: "webp" | "png";
 }
 
+interface NodeRasterCanvasContext {
+  putImageData: (imageData: unknown, x: number, y: number) => void;
+  drawImage: (image: unknown, x: number, y: number) => void;
+  getImageData: (x: number, y: number, width: number, height: number) => { data: Uint8Array | Uint8ClampedArray };
+}
+
+interface NodeRasterImageEncoder {
+  createCanvas: (width: number, height: number) => {
+    width: number;
+    height: number;
+    getContext: (kind: "2d") => NodeRasterCanvasContext | null;
+    encode: (format: "png" | "webp") => Promise<Uint8Array>;
+  };
+  ImageData: new (data: Uint8ClampedArray, width: number, height: number) => unknown;
+  loadImage?: (encoded: Uint8Array) => Promise<{ width: number; height: number }>;
+}
+
+let cachedNodeRasterImageEncoder: NodeRasterImageEncoder | null | undefined;
+
 async function encodeRasterLayerAsBestImage(width: number, height: number, rgba: Uint8Array): Promise<EncodedRasterImage | null> {
   const [webp, png] = await Promise.all([
     encodeRasterLayerAsImage(width, height, rgba, "image/webp"),
@@ -1595,7 +1614,7 @@ async function encodeRasterLayerAsImage(
   mimeType: "image/png" | "image/webp"
 ): Promise<Uint8Array | null> {
   if (typeof document === "undefined") {
-    return null;
+    return encodeRasterLayerAsNodeImage(width, height, rgba, mimeType);
   }
 
   const expectedBytes = width * height * 4;
@@ -1632,6 +1651,72 @@ async function encodeRasterLayerAsImage(
   return new Uint8Array(buffer);
 }
 
+async function encodeRasterLayerAsNodeImage(
+  width: number,
+  height: number,
+  rgba: Uint8Array,
+  mimeType: "image/png" | "image/webp"
+): Promise<Uint8Array | null> {
+  const expectedBytes = width * height * 4;
+  if (width <= 0 || height <= 0 || rgba.length < expectedBytes) {
+    return null;
+  }
+
+  const encoder = await getNodeRasterImageEncoder();
+  if (!encoder) {
+    return null;
+  }
+
+  const canvas = encoder.createCanvas(width, height);
+  try {
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return null;
+    }
+
+    const clamped = new Uint8ClampedArray(expectedBytes);
+    clamped.set(rgba.subarray(0, expectedBytes));
+    context.putImageData(new encoder.ImageData(clamped, width, height), 0, 0);
+    const encoded = await canvas.encode(mimeType === "image/webp" ? "webp" : "png");
+    return new Uint8Array(encoded);
+  } catch {
+    return null;
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
+
+async function getNodeRasterImageEncoder(): Promise<NodeRasterImageEncoder | null> {
+  if (cachedNodeRasterImageEncoder !== undefined) {
+    return cachedNodeRasterImageEncoder;
+  }
+
+  try {
+    const moduleName = "@napi-rs/canvas";
+    const mod = await import(
+      /* @vite-ignore */
+      moduleName
+    ) as { createCanvas?: unknown; ImageData?: unknown; loadImage?: unknown };
+    if (typeof mod.createCanvas !== "function" || typeof mod.ImageData !== "function") {
+      cachedNodeRasterImageEncoder = null;
+      return null;
+    }
+
+    cachedNodeRasterImageEncoder = {
+      createCanvas: mod.createCanvas as NodeRasterImageEncoder["createCanvas"],
+      ImageData: mod.ImageData as NodeRasterImageEncoder["ImageData"],
+      loadImage: typeof mod.loadImage === "function"
+        ? mod.loadImage as NodeRasterImageEncoder["loadImage"]
+        : undefined
+    };
+    return cachedNodeRasterImageEncoder;
+  } catch {
+    cachedNodeRasterImageEncoder = null;
+    return null;
+  }
+}
+
 function getMimeTypeForRasterPath(path: string): string | null {
   const lower = path.toLowerCase();
   if (lower.endsWith(".png")) {
@@ -1648,7 +1733,33 @@ function getMimeTypeForRasterPath(path: string): string | null {
 
 async function decodeRasterImageToRgba(path: string, encoded: Uint8Array): Promise<{ width: number; height: number; data: Uint8Array } | null> {
   if (typeof document === "undefined") {
-    return null;
+    const decoder = await getNodeRasterImageEncoder();
+    if (!decoder?.loadImage) {
+      return null;
+    }
+    try {
+      const image = await decoder.loadImage(encoded);
+      const width = Math.max(0, Math.trunc(image.width));
+      const height = Math.max(0, Math.trunc(image.height));
+      if (width <= 0 || height <= 0) {
+        return null;
+      }
+      const canvas = decoder.createCanvas(width, height);
+      try {
+        const context = canvas.getContext("2d");
+        if (!context) {
+          return null;
+        }
+        context.drawImage(image, 0, 0);
+        const imageData = context.getImageData(0, 0, width, height);
+        return { width, height, data: new Uint8Array(imageData.data) };
+      } finally {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    } catch {
+      return null;
+    }
   }
   const mimeType = getMimeTypeForRasterPath(path);
   if (!mimeType) {
@@ -1769,6 +1880,12 @@ async function readRasterLayerFromZip(
   const decodedImage = await decodeRasterImageToRgba(path, bytes);
   if (decodedImage) {
     return decodedImage;
+  }
+
+  if (getMimeTypeForRasterPath(path)) {
+    throw new Error(
+      `Unable to decode raster image ${path}; the image is invalid or no compatible image decoder is available.`
+    );
   }
 
   if (widthHint <= 0 || heightHint <= 0) {

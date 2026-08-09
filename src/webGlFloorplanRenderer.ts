@@ -10,21 +10,14 @@ import {
 } from "./vectorStrokeLodCore";
 
 const GLSL_OUTPUT_COLOR_HELPERS = `
-vec3 heprThreeLinearToOutputSrgb(vec3 color) {
-  vec3 safeColor = max(color, vec3(0.0));
-  vec3 cutoff = step(safeColor, vec3(0.0031308));
-  vec3 lower = safeColor * 12.92;
-  vec3 higher = 1.055 * pow(safeColor, vec3(1.0 / 2.4)) - 0.055;
-  return mix(higher, lower, cutoff);
-}
-
 vec4 heprThreeEncodeOutputColor(vec4 color) {
-  return vec4(heprThreeLinearToOutputSrgb(color.rgb), color.a);
+  // PDF.js supplies display/sRGB components already. The canvas framebuffer is
+  // unorm, so encoding them again would wash dark colors toward gray.
+  return color;
 }
 
 float heprThreeLinearCoverageToOutputAlpha(float coverage) {
-  float safeCoverage = clamp(coverage, 0.0, 1.0);
-  return 1.0 - heprThreeLinearToOutputSrgb(vec3(1.0 - safeCoverage)).r;
+  return clamp(coverage, 0.0, 1.0);
 }
 `;
 

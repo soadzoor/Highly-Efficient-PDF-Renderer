@@ -73,20 +73,14 @@ const RASTER_UNIFORM_FLOATS = 8;
 const RASTER_UNIFORM_BUFFER_BYTES = 32;
 
 const WGSL_OUTPUT_COLOR_HELPERS = /* wgsl */ `
-fn heprLinearToOutputSrgb(color : vec3f) -> vec3f {
-  let safeColor = max(color, vec3f(0.0));
-  let lower = safeColor * 12.92;
-  let higher = 1.055 * pow(safeColor, vec3f(1.0 / 2.4)) - vec3f(0.055);
-  return select(higher, lower, safeColor <= vec3f(0.0031308));
-}
-
 fn heprEncodeOutputColor(color : vec4f) -> vec4f {
-  return vec4f(heprLinearToOutputSrgb(color.rgb), color.a);
+  // Extracted PDF colors are display/sRGB values and the presentation target is
+  // unorm. Preserve those values instead of applying the transfer curve twice.
+  return color;
 }
 
 fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
-  let safeCoverage = clamp(coverage, 0.0, 1.0);
-  return 1.0 - heprLinearToOutputSrgb(vec3f(1.0 - safeCoverage)).r;
+  return clamp(coverage, 0.0, 1.0);
 }
 `;
 

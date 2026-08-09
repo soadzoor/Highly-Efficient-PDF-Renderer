@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
+import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -271,9 +272,10 @@ fn heprTextFragment(
 
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let color = instanceColor.rgb * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
-  return vec4<f32>(color, alpha);
+  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
 }
 `, [
+  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
   includeNode(textCrossingFns)

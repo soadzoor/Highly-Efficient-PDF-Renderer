@@ -33,6 +33,8 @@ interface GraphicsState {
   strokeAlphaVersion: number;
   lineWidth: number;
   lineCap: number;
+  lineDash: number[];
+  dashPhase: number;
   strokeR: number;
   strokeG: number;
   strokeB: number;
@@ -342,6 +344,10 @@ const FILL_MIN_ALPHA = 1e-3;
 // vector fallback, unmeasurable image ops, solid-color masks). A fixed policy value
 // keeps extraction deterministic across devices instead of depending on the display.
 const RASTER_FALLBACK_TARGET_SCALE = 3;
+// Shadings are continuous vector color fields without embedded pixel detail.
+// A lower scale preserves smooth gradients and clipped edges without retaining
+// a multi-megapixel 3x texture for every decorated brochure page.
+const RASTER_SHADING_TARGET_SCALE = 1.5;
 // Above this many image ops on a page, fall back to one flattened page layer instead of
 // per-image layers to bound texture count and draw calls.
 const RASTER_MAX_IMAGE_LAYERS = 32;
@@ -667,6 +673,10 @@ async function extractSinglePageVectors(
   });
   const pageBounds = transformBounds(rawPageBounds, pageMatrix);
   const imagePaintOpCount = countImagePaintOps(operatorList);
+  let rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
+    allowFullPageFallback: false
+  });
+  const suppressedPaintMask = rasterExtract.suppressedSourcePaintMask;
 
   const endpointBuilder = new Float4Builder();
   const primitiveMetaBuilder = new Float4Builder();
@@ -787,6 +797,15 @@ async function extractSinglePageVectors(
     if (fn === OPS.setLineCap) {
       const nextCap = Math.trunc(readNumber(args, 0, currentState.lineCap));
       currentState.lineCap = Math.min(2, Math.max(0, nextCap));
+      continue;
+    }
+
+    if (fn === OPS.setDash) {
+      const nextDash = readLineDash(args);
+      if (nextDash) {
+        currentState.lineDash = nextDash.pattern;
+        currentState.dashPhase = nextDash.phase;
+      }
       continue;
     }
 
@@ -933,6 +952,10 @@ async function extractSinglePageVectors(
       continue;
     }
 
+    if (suppressedPaintMask?.[i] === 1) {
+      continue;
+    }
+
     if (currentState.clipBounds && !isNonEmptyBounds(intersectBounds(currentState.clipBounds, transformedPathBounds))) {
       continue;
     }
@@ -966,6 +989,8 @@ async function extractSinglePageVectors(
         styleB,
         styleAlpha,
         styleFlags,
+        currentState.lineDash,
+        currentState.dashPhase,
         options.enableSegmentMerge,
         endpointBuilder,
         primitiveMetaBuilder,
@@ -1053,16 +1078,18 @@ async function extractSinglePageVectors(
     resolvedMaxHalfWidth = 0;
   }
 
-  let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+  let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds, suppressedPaintMask);
   if (textData.sourceTextCount === 0 && hasTextShowOperators(operatorList)) {
     await warmUpTextPathCache(page);
-    textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+    textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds, suppressedPaintMask);
   }
 
   const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
-  const rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
-    allowFullPageFallback: allowFullPageRasterFallback
-  });
+  if (allowFullPageRasterFallback) {
+    rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
+      allowFullPageFallback: true
+    });
+  }
   const rasterLayers: RasterLayer[] = rasterExtract.layers.map((layer) => ({
     width: layer.width,
     height: layer.height,
@@ -2046,6 +2073,8 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX, initialClipB
     strokeAlphaVersion: 0,
     lineWidth: 1,
     lineCap: 0,
+    lineDash: [],
+    dashPhase: 0,
     strokeR: 0,
     strokeG: 0,
     strokeB: 0,
@@ -2245,6 +2274,8 @@ function cloneState(state: GraphicsState): GraphicsState {
     strokeAlphaVersion: state.strokeAlphaVersion,
     lineWidth: state.lineWidth,
     lineCap: state.lineCap,
+    lineDash: [...state.lineDash],
+    dashPhase: state.dashPhase,
     strokeR: state.strokeR,
     strokeG: state.strokeG,
     strokeB: state.strokeB,
@@ -2301,6 +2332,8 @@ interface ExtractedRasterLayer {
 interface RasterLayerExtractResult {
   layers: ExtractedRasterLayer[];
   bounds: Bounds | null;
+  /** Source-list paints already represented by a captured soft-mask composite. */
+  suppressedSourcePaintMask?: Uint8Array;
 }
 
 interface RasterLayerExtractOptions {
@@ -2444,6 +2477,41 @@ function readNumber(args: unknown, index: number, fallback: number): number {
   const raw = readArg(args, index);
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
+}
+
+function readLineDash(value: unknown): { pattern: number[]; phase: number } | null {
+  const rawPattern = asNumberArrayLike(readArg(value, 0));
+  if (!rawPattern) {
+    return null;
+  }
+
+  const pattern: number[] = [];
+  let patternLength = 0;
+  for (let i = 0; i < rawPattern.length; i += 1) {
+    const entry = Number(rawPattern[i]);
+    if (!Number.isFinite(entry) || entry < 0) {
+      return null;
+    }
+    pattern.push(entry);
+    patternLength += entry;
+  }
+
+  // PDF repeats an odd-sized dash array to produce an even number of on/off
+  // intervals. Normalize it here so phase wrapping has the correct period.
+  if (pattern.length % 2 === 1) {
+    pattern.push(...pattern);
+    patternLength *= 2;
+  }
+
+  if (patternLength <= 1e-9) {
+    pattern.length = 0;
+  }
+
+  const rawPhase = Number(readArg(value, 1));
+  return {
+    pattern,
+    phase: Number.isFinite(rawPhase) ? rawPhase : 0
+  };
 }
 
 function isStrokePaintOp(op: number): boolean {
@@ -2617,6 +2685,15 @@ function applyGraphicsStateEntries(rawEntries: unknown, state: GraphicsState): v
       if (Number.isFinite(lineCap)) {
         state.lineCap = Math.min(2, Math.max(0, Math.trunc(lineCap)));
       }
+      continue;
+    }
+
+    if (key === "D") {
+      const nextDash = readLineDash(value);
+      if (nextDash) {
+        state.lineDash = nextDash.pattern;
+        state.dashPhase = nextDash.phase;
+      }
     }
   }
 }
@@ -2644,6 +2721,8 @@ function emitSegmentsFromPath(
   colorB: number,
   alpha: number,
   styleFlags: number,
+  lineDash: number[],
+  dashPhase: number,
   allowSegmentMerge: boolean,
   endpoints: Float4Builder,
   primitiveMeta: Float4Builder,
@@ -2664,6 +2743,14 @@ function emitSegmentsFromPath(
   let pendingX1 = 0;
   let pendingY1 = 0;
   let hasPending = false;
+
+  const dashScale = matrixScale(matrix);
+  const dashPattern = lineDash.map((entry) => entry * dashScale);
+  const dashPatternLength = dashPattern.reduce((sum, entry) => sum + entry, 0);
+  const hasDashPattern = dashPattern.length > 0 && dashPatternLength > 1e-9;
+  let dashIndex = 0;
+  let dashRemaining = Number.POSITIVE_INFINITY;
+  let dashPaint = true;
 
   const emitPrimitive = (
     p0x: number,
@@ -2793,6 +2880,98 @@ function emitSegmentsFromPath(
     emitPrimitive(x0, y0, x1, y1, x1, y1, STROKE_PRIMITIVE_LINE);
   };
 
+  const advanceDashInterval = (): void => {
+    if (!hasDashPattern) {
+      dashRemaining = Number.POSITIVE_INFINITY;
+      dashPaint = true;
+      return;
+    }
+
+    // Zero-length intervals are legal as long as the whole pattern is not zero.
+    // Skip them while retaining their on/off transition.
+    for (let guard = 0; guard <= dashPattern.length; guard += 1) {
+      dashIndex = (dashIndex + 1) % dashPattern.length;
+      dashPaint = !dashPaint;
+      dashRemaining = dashPattern[dashIndex];
+      if (dashRemaining > 1e-9) {
+        return;
+      }
+    }
+  };
+
+  const resetDashCursor = (): void => {
+    if (!hasDashPattern) {
+      dashIndex = 0;
+      dashRemaining = Number.POSITIVE_INFINITY;
+      dashPaint = true;
+      return;
+    }
+
+    dashIndex = 0;
+    dashRemaining = dashPattern[0];
+    dashPaint = true;
+    if (dashRemaining <= 1e-9) {
+      advanceDashInterval();
+    }
+
+    let phase = dashPhase * dashScale;
+    phase = ((phase % dashPatternLength) + dashPatternLength) % dashPatternLength;
+    while (phase > 1e-9) {
+      if (phase < dashRemaining - 1e-9) {
+        dashRemaining -= phase;
+        phase = 0;
+      } else {
+        phase -= dashRemaining;
+        advanceDashInterval();
+      }
+    }
+  };
+
+  const emitStrokedLine = (x0: number, y0: number, x1: number, y1: number, allowMerge: boolean): void => {
+    if (!hasDashPattern) {
+      emitLine(x0, y0, x1, y1, allowMerge);
+      return;
+    }
+
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const length = Math.hypot(dx, dy);
+    if (length <= 1e-9) {
+      if (dashPaint) {
+        emitLine(x0, y0, x1, y1, false);
+      }
+      return;
+    }
+
+    let consumed = 0;
+    while (consumed < length - 1e-9) {
+      const spanLength = Math.min(length - consumed, dashRemaining);
+      const nextConsumed = consumed + spanLength;
+      if (dashPaint && spanLength > 1e-9) {
+        const startT = consumed / length;
+        const endT = nextConsumed / length;
+        emitLine(
+          x0 + dx * startT,
+          y0 + dy * startT,
+          x0 + dx * endT,
+          y0 + dy * endT,
+          allowMerge
+        );
+      } else {
+        flushPending();
+      }
+
+      consumed = nextConsumed;
+      dashRemaining -= spanLength;
+      if (dashRemaining <= 1e-9) {
+        advanceDashInterval();
+        if (!dashPaint) {
+          flushPending();
+        }
+      }
+    }
+  };
+
   const emitQuadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number): void => {
     const dx = x1 - x0;
     const dy = y1 - y0;
@@ -2807,6 +2986,8 @@ function emitSegmentsFromPath(
     emitPrimitive(x0, y0, cx, cy, x1, y1, STROKE_PRIMITIVE_QUADRATIC);
   };
 
+  resetDashCursor();
+
   for (let i = 0; i < pathData.length; ) {
     const op = pathData[i++];
 
@@ -2817,6 +2998,7 @@ function emitSegmentsFromPath(
       startX = cursorX;
       startY = cursorY;
       hasStart = true;
+      resetDashCursor();
       continue;
     }
 
@@ -2825,7 +3007,7 @@ function emitSegmentsFromPath(
       const y = pathData[i++];
       const [tx0, ty0] = applyMatrix(matrix, cursorX, cursorY);
       const [tx1, ty1] = applyMatrix(matrix, x, y);
-      emitLine(tx0, ty0, tx1, ty1, true);
+      emitStrokedLine(tx0, ty0, tx1, ty1, true);
       cursorX = x;
       cursorY = y;
       continue;
@@ -2844,19 +3026,35 @@ function emitSegmentsFromPath(
       const [t2x, t2y] = applyMatrix(matrix, x2, y2);
       const [t3x, t3y] = applyMatrix(matrix, x3, y3);
 
-      emitCubicAsQuadratics(
-        t0x,
-        t0y,
-        t1x,
-        t1y,
-        t2x,
-        t2y,
-        t3x,
-        t3y,
-        emitQuadratic,
-        FILL_CUBIC_TO_QUAD_ERROR,
-        MAX_FILL_CUBIC_TO_QUAD_DEPTH
-      );
+      if (hasDashPattern) {
+        flattenCubic(
+          t0x,
+          t0y,
+          t1x,
+          t1y,
+          t2x,
+          t2y,
+          t3x,
+          t3y,
+          (ax, ay, bx, by) => emitStrokedLine(ax, ay, bx, by, true),
+          CURVE_FLATNESS,
+          MAX_CURVE_SPLIT_DEPTH
+        );
+      } else {
+        emitCubicAsQuadratics(
+          t0x,
+          t0y,
+          t1x,
+          t1y,
+          t2x,
+          t2y,
+          t3x,
+          t3y,
+          emitQuadratic,
+          FILL_CUBIC_TO_QUAD_ERROR,
+          MAX_FILL_CUBIC_TO_QUAD_DEPTH
+        );
+      }
 
       cursorX = x3;
       cursorY = y3;
@@ -2873,7 +3071,27 @@ function emitSegmentsFromPath(
       const [tcx, tcy] = applyMatrix(matrix, cx, cy);
       const [t1x, t1y] = applyMatrix(matrix, x, y);
 
-      emitQuadratic(t0x, t0y, tcx, tcy, t1x, t1y);
+      if (hasDashPattern) {
+        const c1x = t0x + (2 / 3) * (tcx - t0x);
+        const c1y = t0y + (2 / 3) * (tcy - t0y);
+        const c2x = t1x + (2 / 3) * (tcx - t1x);
+        const c2y = t1y + (2 / 3) * (tcy - t1y);
+        flattenCubic(
+          t0x,
+          t0y,
+          c1x,
+          c1y,
+          c2x,
+          c2y,
+          t1x,
+          t1y,
+          (ax, ay, bx, by) => emitStrokedLine(ax, ay, bx, by, true),
+          CURVE_FLATNESS,
+          MAX_CURVE_SPLIT_DEPTH
+        );
+      } else {
+        emitQuadratic(t0x, t0y, tcx, tcy, t1x, t1y);
+      }
 
       cursorX = x;
       cursorY = y;
@@ -2884,7 +3102,7 @@ function emitSegmentsFromPath(
       if (hasStart && (cursorX !== startX || cursorY !== startY)) {
         const [tx0, ty0] = applyMatrix(matrix, cursorX, cursorY);
         const [tx1, ty1] = applyMatrix(matrix, startX, startY);
-        emitLine(tx0, ty0, tx1, ty1, true);
+        emitStrokedLine(tx0, ty0, tx1, ty1, true);
       }
       cursorX = startX;
       cursorY = startY;
@@ -3966,7 +4184,8 @@ async function extractTextVectorData(
   page: unknown,
   operatorList: { fnArray: number[]; argsArray: unknown[] },
   pageMatrix: Mat2D,
-  pageBounds?: Bounds
+  pageBounds?: Bounds,
+  suppressedPaintMask?: Uint8Array
 ): Promise<TextExtractResult> {
   const commonObjs = resolveCommonObjs(page);
   if (!commonObjs) {
@@ -4039,7 +4258,7 @@ async function extractTextVectorData(
     return { index: glyphIndex, bounds: glyphBuild.bounds };
   };
 
-  const emitTextEntries = (entries: unknown[]): void => {
+  const emitTextEntries = (entries: unknown[], suppressRender = false): void => {
     if (entries.length === 0 || state.fontSize === 0) {
       return;
     }
@@ -4071,6 +4290,7 @@ async function extractTextVectorData(
       let emittedInstanceIndex = -1;
 
       if (
+        !suppressRender &&
         !vertical &&
         !skipGlyphRender &&
         shouldRenderFilledText(state.renderMode) &&
@@ -4405,14 +4625,14 @@ async function extractTextVectorData(
     }
 
     if (fn === OPS.showText || fn === OPS.showSpacedText) {
-      emitTextEntries(readTextEntries(readArg(args, 0)));
+      emitTextEntries(readTextEntries(readArg(args, 0)), suppressedPaintMask?.[i] === 1);
       pendingClipPathBounds = null;
       continue;
     }
 
     if (fn === OPS.nextLineShowText) {
       moveText(state, 0, state.leading);
-      emitTextEntries(readTextEntries(readArg(args, 0)));
+      emitTextEntries(readTextEntries(readArg(args, 0)), suppressedPaintMask?.[i] === 1);
       pendingClipPathBounds = null;
       continue;
     }
@@ -4421,7 +4641,7 @@ async function extractTextVectorData(
       state.wordSpacing = readNumber(args, 0, state.wordSpacing);
       state.charSpacing = readNumber(args, 1, state.charSpacing);
       moveText(state, 0, state.leading);
-      emitTextEntries(readTextEntries(readArg(args, 2)));
+      emitTextEntries(readTextEntries(readArg(args, 2)), suppressedPaintMask?.[i] === 1);
       pendingClipPathBounds = null;
       continue;
     }
@@ -4793,11 +5013,24 @@ async function warmUpTextPathCache(page: unknown): Promise<void> {
 
 interface RasterOperatorPlan {
   hasImagePaintOps: boolean;
+  hasShadingFillOps: boolean;
+  hasSoftMaskPaintOps: boolean;
+  hasBackdropDependentBlendOps: boolean;
   hasFormXObjectOps: boolean;
   /** Image paint ops plus the state ops they depend on. */
   imageOnlyMask: Uint8Array;
+  /** Direct shadings and complete soft-mask composites, plus required state ops. */
+  shadingOnlyMask: Uint8Array;
   /** State ops only — combined with a single op index to render one image in isolation. */
   imageStateMask: Uint8Array;
+  /** Definition/activation/consumer ranges whose paint output must not also be vectorized. */
+  softMaskPaintMask: Uint8Array;
+  softMaskCompositeCount: number;
+  /** Complete non-text artwork for pages that require an existing backdrop to blend. */
+  graphicsOnlyMask: Uint8Array;
+  /** Source vector paths represented by graphicsOnlyMask and therefore suppressed. */
+  vectorPaintMask: Uint8Array;
+  backdropBlendCount: number;
 }
 
 interface PdfOperatorListLike {
@@ -4822,12 +5055,156 @@ function isImagePaintOperator(fn: number): boolean {
   );
 }
 
+function isTextPaintOperator(fn: number): boolean {
+  return (
+    fn === OPS.showText ||
+    fn === OPS.showSpacedText ||
+    fn === OPS.nextLineShowText ||
+    fn === OPS.nextLineSetSpacingShowText
+  );
+}
+
+function graphicsStateHasBackdropDependentBlend(args: unknown): boolean {
+  const isBackdropDependent = (value: unknown): boolean =>
+    typeof value === "string" && value !== "source-over" && value !== "normal";
+  const entries = readArg(args, 0);
+  if (!Array.isArray(entries)) {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length < 2 || entry[0] !== "BM") {
+      continue;
+    }
+    const blendMode = entry[1];
+    if (Array.isArray(blendMode)) {
+      return blendMode.some(isBackdropDependent);
+    }
+    return isBackdropDependent(blendMode);
+  }
+  return false;
+}
+
+function readGraphicsStateSoftMaskToggle(args: unknown): boolean | null {
+  const entries = readArg(args, 0);
+  if (!Array.isArray(entries)) {
+    return null;
+  }
+  for (const entry of entries) {
+    if (Array.isArray(entry) && entry.length >= 2 && entry[0] === "SMask") {
+      return entry[1] === true;
+    }
+  }
+  return null;
+}
+
+function groupDefinesSoftMask(args: unknown): boolean {
+  const group = readArg(args, 0);
+  if (!group || typeof group !== "object") {
+    return false;
+  }
+  const softMask = (group as { smask?: unknown }).smask;
+  return Boolean(softMask && typeof softMask === "object");
+}
+
+function findMatchingGroupEnd(fnArray: number[], beginIndex: number): number {
+  let depth = 0;
+  for (let i = beginIndex; i < fnArray.length; i += 1) {
+    if (fnArray[i] === OPS.beginGroup) {
+      depth += 1;
+    } else if (fnArray[i] === OPS.endGroup) {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+function buildSoftMaskPaintMask(
+  operatorList: { fnArray: number[]; argsArray: unknown[] }
+): { mask: Uint8Array; compositeCount: number } {
+  const { fnArray, argsArray } = operatorList;
+  const mask = new Uint8Array(fnArray.length);
+  let compositeCount = 0;
+
+  for (let definitionStart = 0; definitionStart < fnArray.length; definitionStart += 1) {
+    if (fnArray[definitionStart] !== OPS.beginGroup || !groupDefinesSoftMask(argsArray[definitionStart])) {
+      continue;
+    }
+
+    const definitionEnd = findMatchingGroupEnd(fnArray, definitionStart);
+    if (definitionEnd < 0) {
+      break;
+    }
+
+    let softMaskActive = false;
+    let consumerStart = -1;
+    // PDF.js emits the SMask activation and its consumer group immediately after
+    // the luminosity-mask definition. Follow non-paint state/marked-content ops,
+    // but stop at a paint or graphics-scope boundary so unrelated groups cannot
+    // be paired merely because they occur later in the list.
+    for (let i = definitionEnd + 1; i < fnArray.length; i += 1) {
+      const fn = fnArray[i];
+      if (fn === OPS.setGState) {
+        const toggle = readGraphicsStateSoftMaskToggle(argsArray[i]);
+        if (toggle !== null) {
+          softMaskActive = toggle;
+        }
+        continue;
+      }
+      if (fn === OPS.beginGroup) {
+        if (softMaskActive) {
+          consumerStart = i;
+        }
+        break;
+      }
+      if (
+        fn === OPS.restore ||
+        fn === OPS.paintFormXObjectEnd ||
+        fn === OPS.endAnnotation ||
+        fn === OPS.shadingFill ||
+        isImagePaintOperator(fn) ||
+        (fn === OPS.constructPath && readNumber(argsArray[i], 0, OPS.endPath) !== OPS.endPath) ||
+        fn === OPS.showText ||
+        fn === OPS.showSpacedText ||
+        fn === OPS.nextLineShowText ||
+        fn === OPS.nextLineSetSpacingShowText
+      ) {
+        break;
+      }
+    }
+
+    if (consumerStart < 0) {
+      definitionStart = definitionEnd;
+      continue;
+    }
+    const consumerEnd = findMatchingGroupEnd(fnArray, consumerStart);
+    if (consumerEnd < 0) {
+      break;
+    }
+
+    mask.fill(1, definitionStart, consumerEnd + 1);
+    compositeCount += 1;
+    definitionStart = consumerEnd;
+  }
+
+  return { mask, compositeCount };
+}
+
 function isImageRasterStateOperator(fn: number, args: unknown): boolean {
   if (
     fn === OPS.dependency ||
     fn === OPS.save ||
     fn === OPS.restore ||
     fn === OPS.transform ||
+    fn === OPS.setLineWidth ||
+    fn === OPS.setLineCap ||
+    fn === OPS.setLineJoin ||
+    fn === OPS.setMiterLimit ||
+    fn === OPS.setDash ||
+    fn === OPS.setRenderingIntent ||
+    fn === OPS.setFlatness ||
     fn === OPS.setGState ||
     fn === OPS.beginGroup ||
     fn === OPS.endGroup ||
@@ -4841,6 +5218,21 @@ function isImageRasterStateOperator(fn: number, args: unknown): boolean {
     fn === OPS.paintFormXObjectBegin ||
     fn === OPS.paintFormXObjectEnd ||
     fn === OPS.paintXObject ||
+    fn === OPS.beginText ||
+    fn === OPS.endText ||
+    fn === OPS.setCharSpacing ||
+    fn === OPS.setWordSpacing ||
+    fn === OPS.setHScale ||
+    fn === OPS.setLeading ||
+    fn === OPS.setFont ||
+    fn === OPS.setTextRenderingMode ||
+    fn === OPS.setTextRise ||
+    fn === OPS.moveText ||
+    fn === OPS.setLeadingMoveText ||
+    fn === OPS.setTextMatrix ||
+    fn === OPS.nextLine ||
+    fn === OPS.setCharWidth ||
+    fn === OPS.setCharWidthAndBounds ||
     fn === OPS.clip ||
     fn === OPS.eoClip ||
     fn === OPS.endPath
@@ -4877,35 +5269,84 @@ function isImageRasterStateOperator(fn: number, args: unknown): boolean {
 
 function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: unknown[] }): RasterOperatorPlan {
   const imageOnlyMask = new Uint8Array(operatorList.fnArray.length);
+  const shadingOnlyMask = new Uint8Array(operatorList.fnArray.length);
   const imageStateMask = new Uint8Array(operatorList.fnArray.length);
+  const graphicsOnlyMask = new Uint8Array(operatorList.fnArray.length);
+  const vectorPaintMask = new Uint8Array(operatorList.fnArray.length);
+  const softMaskPlan = buildSoftMaskPaintMask(operatorList);
+  const softMaskPaintMask = softMaskPlan.mask;
   let hasImagePaintOps = false;
+  let hasShadingFillOps = false;
+  let hasSoftMaskPaintOps = false;
+  let hasBackdropDependentBlendOps = false;
+  let backdropBlendCount = 0;
   let hasFormXObjectOps = false;
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
     const args = operatorList.argsArray[i];
 
-    if (isImagePaintOperator(fn)) {
-      hasImagePaintOps = true;
-      imageOnlyMask[i] = 1;
-      continue;
+    if (!isTextPaintOperator(fn)) {
+      graphicsOnlyMask[i] = 1;
+    }
+    if (fn === OPS.constructPath) {
+      const paintOp = readNumber(args, 0, -1);
+      if (isStrokePaintOp(paintOp) || isFillPaintOp(paintOp)) {
+        vectorPaintMask[i] = 1;
+      }
+    }
+    if (fn === OPS.setGState && graphicsStateHasBackdropDependentBlend(args)) {
+      hasBackdropDependentBlendOps = true;
+      backdropBlendCount += 1;
     }
 
     if (fn === OPS.paintFormXObjectBegin || fn === OPS.paintFormXObjectEnd || fn === OPS.paintXObject) {
       hasFormXObjectOps = true;
     }
 
+    if (softMaskPaintMask[i] === 1) {
+      hasSoftMaskPaintOps = true;
+      shadingOnlyMask[i] = 1;
+    }
+
+    if (fn === OPS.shadingFill) {
+      hasShadingFillOps = true;
+      if (softMaskPaintMask[i] === 0) {
+        shadingOnlyMask[i] = 1;
+      }
+    }
+
+    if (isImagePaintOperator(fn) && softMaskPaintMask[i] === 0) {
+      hasImagePaintOps = true;
+      imageOnlyMask[i] = 1;
+      continue;
+    }
+
+    if (fn === OPS.shadingFill || softMaskPaintMask[i] === 1) {
+      continue;
+    }
+
     if (isImageRasterStateOperator(fn, args)) {
       imageOnlyMask[i] = 1;
+      shadingOnlyMask[i] = 1;
       imageStateMask[i] = 1;
     }
   }
 
   return {
     hasImagePaintOps,
+    hasShadingFillOps,
+    hasSoftMaskPaintOps,
+    hasBackdropDependentBlendOps,
     hasFormXObjectOps,
     imageOnlyMask,
-    imageStateMask
+    shadingOnlyMask,
+    imageStateMask,
+    softMaskPaintMask,
+    softMaskCompositeCount: softMaskPlan.compositeCount,
+    graphicsOnlyMask,
+    vectorPaintMask,
+    backdropBlendCount
   };
 }
 
@@ -4924,7 +5365,10 @@ interface RasterImageOpScan {
   nativeScaleHint: number | null;
 }
 
-function scanRasterImageOps(operatorList: { fnArray: number[]; argsArray: unknown[] }): RasterImageOpScan {
+function scanRasterImageOps(
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  excludedPaintMask?: Uint8Array
+): RasterImageOpScan {
   const matrixStack: Mat2D[] = [];
   let currentMatrix: Mat2D = [...IDENTITY_MATRIX];
   let maxScaleHint = 1;
@@ -4991,7 +5435,7 @@ function scanRasterImageOps(operatorList: { fnArray: number[]; argsArray: unknow
       continue;
     }
 
-    if (!isImagePaintOperator(fn)) {
+    if (!isImagePaintOperator(fn) || excludedPaintMask?.[i] === 1) {
       continue;
     }
 
@@ -5064,6 +5508,18 @@ function createEmptyRasterLayerResult(): RasterLayerExtractResult {
   return {
     layers: [],
     bounds: null
+  };
+}
+
+function combineRasterLayerResults(
+  first: RasterLayerExtractResult,
+  second: RasterLayerExtractResult
+): RasterLayerExtractResult {
+  return {
+    layers: [...first.layers, ...second.layers],
+    bounds: combineBounds(first.bounds, second.bounds),
+    suppressedSourcePaintMask:
+      first.suppressedSourcePaintMask ?? second.suppressedSourcePaintMask
   };
 }
 
@@ -5170,7 +5626,13 @@ async function extractRasterLayerData(
   options: RasterLayerExtractOptions
 ): Promise<RasterLayerExtractResult> {
   const sourceRasterPlan = buildRasterOperatorPlan(operatorList);
-  if (!sourceRasterPlan.hasImagePaintOps && !(options.allowFullPageFallback && sourceRasterPlan.hasFormXObjectOps)) {
+  if (
+    !sourceRasterPlan.hasImagePaintOps &&
+    !sourceRasterPlan.hasShadingFillOps &&
+    !sourceRasterPlan.hasSoftMaskPaintOps &&
+    !sourceRasterPlan.hasBackdropDependentBlendOps &&
+    !(options.allowFullPageFallback && sourceRasterPlan.hasFormXObjectOps)
+  ) {
     return createEmptyRasterLayerResult();
   }
 
@@ -5191,9 +5653,84 @@ async function extractRasterLayerData(
   const baseViewport = pageLike.getViewport({ scale: 1, rotation, dontFlip: false });
   const baseWidth = Math.max(1, Math.ceil(baseViewport.width));
   const baseHeight = Math.max(1, Math.ceil(baseViewport.height));
-  const scan = scanRasterImageOps(filterOperatorList);
+  const completeImageScan = scanRasterImageOps(filterOperatorList);
+  const scan = scanRasterImageOps(filterOperatorList, rasterPlan.softMaskPaintMask);
   const buildViewport = (rasterScale: number): { transform: unknown; width: number; height: number } =>
     rasterScale === 1 ? baseViewport : pageLike.getViewport({ scale: rasterScale, rotation, dontFlip: false });
+
+  if (
+    options.allowFullPageFallback &&
+    (sourceRasterPlan.hasFormXObjectOps || rasterPlan.hasFormXObjectOps)
+  ) {
+    const fallbackScale = chooseRasterExtractionScale(
+      baseWidth,
+      baseHeight,
+      Math.max(RASTER_FALLBACK_TARGET_SCALE, scan.nativeScaleHint ?? 1)
+    );
+    const viewport = buildViewport(fallbackScale);
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      const fallbackRgba = await renderRasterLayerRgba(pageLike, viewport, width, height);
+      if (fallbackRgba && hasVisibleAlphaPixels(fallbackRgba)) {
+        return finalizeSingleRasterLayerResult(width, height, fallbackRgba, viewport, pageMatrix);
+      }
+    }
+    // If the larger full-page allocation/render fails, retain the selective
+    // lower-resolution paths below instead of dropping content altogether.
+  }
+
+  if (
+    displayOperatorList &&
+    rasterPlan.backdropBlendCount > 0 &&
+    rasterPlan.backdropBlendCount === sourceRasterPlan.backdropBlendCount
+  ) {
+    const graphicsScale = chooseRasterExtractionScale(
+      baseWidth,
+      baseHeight,
+      Math.max(RASTER_SHADING_TARGET_SCALE, completeImageScan.nativeScaleHint ?? 1)
+    );
+    const viewport = buildViewport(graphicsScale);
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      const graphicsOnlyMask = rasterPlan.graphicsOnlyMask;
+      const filter = (index: number): boolean =>
+        index >= 0 && index < graphicsOnlyMask.length && graphicsOnlyMask[index] === 1;
+      const graphicsRgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
+      if (graphicsRgba && hasVisibleAlphaPixels(graphicsRgba)) {
+        const graphicsResult = finalizeCroppedRasterLayerResult(width, height, graphicsRgba, viewport, pageMatrix);
+        graphicsResult.suppressedSourcePaintMask = sourceRasterPlan.vectorPaintMask;
+        return graphicsResult;
+      }
+    }
+    // Retain the selective shading/image path when the backdrop-inclusive render
+    // cannot be allocated or rendered.
+  }
+
+  let rgba: Uint8Array | null = null;
+  let shadingResult = createEmptyRasterLayerResult();
+  if (displayOperatorList && (rasterPlan.hasShadingFillOps || rasterPlan.hasSoftMaskPaintOps)) {
+    const shadingScale = chooseRasterExtractionScale(baseWidth, baseHeight, RASTER_SHADING_TARGET_SCALE);
+    const viewport = buildViewport(shadingScale);
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      const shadingOnlyMask = rasterPlan.shadingOnlyMask;
+      const filter = (index: number): boolean =>
+        index >= 0 && index < shadingOnlyMask.length && shadingOnlyMask[index] === 1;
+      rgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
+      if (rgba && hasVisibleAlphaPixels(rgba)) {
+        shadingResult = finalizeCroppedRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+        if (
+          rasterPlan.softMaskCompositeCount > 0 &&
+          rasterPlan.softMaskCompositeCount === sourceRasterPlan.softMaskCompositeCount
+        ) {
+          shadingResult.suppressedSourcePaintMask = sourceRasterPlan.softMaskPaintMask;
+        }
+      }
+    }
+  }
 
   // Preferred path: one cropped layer per image op, each at its own native resolution.
   if (
@@ -5205,17 +5742,18 @@ async function extractRasterLayerData(
   ) {
     const perImage = await renderPerImageRasterLayers(pageLike, scan.plans, rasterPlan.imageStateMask, pageMatrix, rotation, baseViewport);
     if (perImage) {
-      return perImage;
+      return combineRasterLayerResults(shadingResult, perImage);
     }
   }
 
-  let rgba: Uint8Array | null = null;
   if (displayOperatorList && rasterPlan.hasImagePaintOps) {
-    // Flattened-page fallback: per-image placement unavailable (repeat/group ops,
-    // unreadable sizes) or too many image ops for individual layers. Embedded images
-    // cannot gain detail beyond their native resolution, so the page renders at the
-    // largest native image scale when it is known.
-    const imageScale = chooseRasterExtractionScale(baseWidth, baseHeight, scan.nativeScaleHint ?? RASTER_FALLBACK_TARGET_SCALE);
+    // Flattened-image fallback: per-image placement is unavailable (repeat/group
+    // ops, unreadable sizes) or there are too many image ops for individual layers.
+    const imageScale = chooseRasterExtractionScale(
+      baseWidth,
+      baseHeight,
+      scan.nativeScaleHint ?? RASTER_FALLBACK_TARGET_SCALE
+    );
     const viewport = buildViewport(imageScale);
     const width = Math.max(1, Math.ceil(viewport.width));
     const height = Math.max(1, Math.ceil(viewport.height));
@@ -5224,12 +5762,20 @@ async function extractRasterLayerData(
       const filter = (index: number): boolean => index >= 0 && index < imageOnlyMask.length && imageOnlyMask[index] === 1;
       rgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
       if (rgba && hasVisibleAlphaPixels(rgba)) {
-        return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+        const imageResult = finalizeCroppedRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+        return combineRasterLayerResults(shadingResult, imageResult);
       }
     }
   }
 
-  if (!displayOperatorList && sourceRasterPlan.hasImagePaintOps) {
+  if (displayOperatorList && shadingResult.layers.length > 0) {
+    return shadingResult;
+  }
+
+  if (
+    !displayOperatorList &&
+    (sourceRasterPlan.hasImagePaintOps || sourceRasterPlan.hasShadingFillOps || sourceRasterPlan.hasSoftMaskPaintOps)
+  ) {
     // If a future PDF.js version stops exposing its cached display list, avoid an
     // unsafe index filter. A full render may duplicate vector pixels, but it preserves
     // the document's raster content and cannot unbalance PDF.js graphics state.
@@ -5247,29 +5793,7 @@ async function extractRasterLayerData(
     }
   }
 
-  if (!options.allowFullPageFallback || !rasterPlan.hasFormXObjectOps) {
-    return createEmptyRasterLayerResult();
-  }
-
-  // The full-page fallback rasterizes vector content too, which sharpens with resolution.
-  const fallbackScale = chooseRasterExtractionScale(
-    baseWidth,
-    baseHeight,
-    Math.max(RASTER_FALLBACK_TARGET_SCALE, scan.nativeScaleHint ?? 1)
-  );
-  const viewport = buildViewport(fallbackScale);
-  const width = Math.max(1, Math.ceil(viewport.width));
-  const height = Math.max(1, Math.ceil(viewport.height));
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-    return createEmptyRasterLayerResult();
-  }
-
-  rgba = await renderRasterLayerRgba(pageLike, viewport, width, height);
-  if (!rgba || !hasVisibleAlphaPixels(rgba)) {
-    return createEmptyRasterLayerResult();
-  }
-
-  return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+  return createEmptyRasterLayerResult();
 }
 
 const UNIT_BOUNDS: Bounds = { minX: 0, minY: 0, maxX: 1, maxY: 1 };
@@ -5517,6 +6041,57 @@ function finalizeSingleRasterLayerResult(
   return {
     layers: [{ width, height, data: rgba, matrix }],
     bounds
+  };
+}
+
+function finalizeCroppedRasterLayerResult(
+  width: number,
+  height: number,
+  rgba: Uint8Array,
+  viewport: unknown,
+  pageMatrix: Mat2D
+): RasterLayerExtractResult {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y += 1) {
+    const rowOffset = y * width * 4;
+    for (let x = 0; x < width; x += 1) {
+      if (rgba[rowOffset + x * 4 + 3] === 0) {
+        continue;
+      }
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return createEmptyRasterLayerResult();
+  }
+
+  const cropMinX = Math.max(0, minX - RASTER_CROP_PADDING_PX);
+  const cropMinY = Math.max(0, minY - RASTER_CROP_PADDING_PX);
+  const cropMaxX = Math.min(width, maxX + 1 + RASTER_CROP_PADDING_PX);
+  const cropMaxY = Math.min(height, maxY + 1 + RASTER_CROP_PADDING_PX);
+  const cropWidth = cropMaxX - cropMinX;
+  const cropHeight = cropMaxY - cropMinY;
+  const cropped = new Uint8Array(cropWidth * cropHeight * 4);
+  const sourceStride = width * 4;
+  const cropStride = cropWidth * 4;
+  for (let y = 0; y < cropHeight; y += 1) {
+    const sourceOffset = (cropMinY + y) * sourceStride + cropMinX * 4;
+    cropped.set(rgba.subarray(sourceOffset, sourceOffset + cropStride), y * cropStride);
+  }
+
+  const transform = readTransform((viewport as { transform?: unknown }).transform) ?? [...IDENTITY_MATRIX];
+  const matrix = buildRasterLayerMatrix(cropWidth, cropHeight, cropMinX, cropMinY, transform, pageMatrix);
+  return {
+    layers: [{ width: cropWidth, height: cropHeight, data: cropped, matrix }],
+    bounds: transformBounds(UNIT_BOUNDS, matrix)
   };
 }
 

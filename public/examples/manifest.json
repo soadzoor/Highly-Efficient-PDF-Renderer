@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-09T16:08:59.733Z",
+  "generatedAt": "2026-08-09T18:01:44.768Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -10,7 +10,7 @@
       },
       "parsedZip": {
         "path": "examples/zips/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.zip",
-        "sizeBytes": 1264026
+        "sizeBytes": 2977407
       }
     },
     {
