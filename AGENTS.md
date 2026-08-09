@@ -8,6 +8,7 @@
 - You may inspect git status, diffs, and logs when useful.
 - You may suggest git commands or commit messages, but leave all git operations for the user to perform manually.
 - If not instructed otherwise, don't run commands that can take hours to run (like machine learning training, evaluations, etc.), just say the word, and user will run them manually if they agree to run them
+- This also includes generating parsed ZIPs from PDFs. Don't do that by yourself, because it can take a lot of time. Ask me to do it if needed.
 
 ## Development Server
 

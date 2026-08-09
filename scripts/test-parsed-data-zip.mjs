@@ -386,6 +386,115 @@ async function run() {
       "encoded soft-mask composites must survive the Node ZIP round trip"
     );
 
+    const parsedInterleavedRasterPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "3"
+    });
+    const interleavedRasterLayers = listSceneRasterLayers(parsedInterleavedRasterPdf.scene);
+    assert.equal(
+      interleavedRasterLayers.length,
+      1,
+      "image-interleaved shadings must share one source-ordered raster composite"
+    );
+    assert.ok(
+      interleavedRasterLayers[0].width * interleavedRasterLayers[0].height < 4_500_000,
+      "the ordered raster composite must stay within the bounded page texture budget"
+    );
+    const interleavedOverlapPixel = sampleRasterLayerAtWorld(
+      interleavedRasterLayers[0],
+      372.6666667,
+      607.89
+    );
+    assert.ok(
+      interleavedOverlapPixel[0] >= 142 && interleavedOverlapPixel[0] <= 146 &&
+        interleavedOverlapPixel[1] >= 47 && interleavedOverlapPixel[1] <= 51 &&
+        interleavedOverlapPixel[2] >= 35 && interleavedOverlapPixel[2] <= 39 &&
+        interleavedOverlapPixel[3] >= 253,
+      "the early gradient must remain composited over the first image"
+    );
+    const lateShadingPixel = sampleRasterLayerAtWorld(
+      interleavedRasterLayers[0],
+      924.6666667,
+      232.5566667
+    );
+    assert.ok(
+      lateShadingPixel[0] >= 253 &&
+        lateShadingPixel[1] >= 72 && lateShadingPixel[1] <= 78 &&
+        lateShadingPixel[2] >= 40 && lateShadingPixel[2] <= 46 &&
+        lateShadingPixel[3] >= 69 && lateShadingPixel[3] <= 73,
+      "the post-image shading must remain after the intervening image"
+    );
+
+    const parsedPhotoOverlayPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
+      sourceKind: "pdf",
+      pages: "13"
+    });
+    const photoOverlayLayers = listSceneRasterLayers(parsedPhotoOverlayPdf.scene);
+    assert.equal(photoOverlayLayers.length, 3, "page 13 must retain its three selective raster layers");
+    assert.equal(parsedPhotoOverlayPdf.scene.segmentCount, 56, "page 13 strokes must remain vector-rendered");
+    assert.equal(parsedPhotoOverlayPdf.scene.fillPathCount, 16, "page 13 fills must remain vector-rendered");
+    assert.equal(parsedPhotoOverlayPdf.scene.textInstanceCount, 976, "page 13 text must remain vector-rendered");
+    assert.ok(
+      photoOverlayLayers.reduce((sum, layer) => sum + layer.width * layer.height, 0) < 3_000_000,
+      "paint-order correction must not flatten page 13 into an additional full-page texture"
+    );
+    assert.ok(
+      photoOverlayLayers[0].width > 1_200 && photoOverlayLayers[0].height > 1_700,
+      "the main photo must be the first raster paint"
+    );
+    assert.ok(
+      photoOverlayLayers[1].width >= 590 && photoOverlayLayers[1].width <= 610 &&
+        photoOverlayLayers[1].height >= 340 && photoOverlayLayers[1].height <= 355,
+      "the soft-masked gradient must follow the photo"
+    );
+    assert.ok(
+      photoOverlayLayers[2].width >= 720 && photoOverlayLayers[2].height <= 145,
+      "the signature image must remain after the gradient"
+    );
+    const photoOverlapPixel = sampleRasterLayerAtWorld(photoOverlayLayers[0], 650, 100);
+    const gradientOverlapPixel = sampleRasterLayerAtWorld(photoOverlayLayers[1], 650, 100);
+    assert.ok(
+      Math.abs(photoOverlapPixel[0] - 146) <= 2 &&
+        Math.abs(photoOverlapPixel[1] - 168) <= 2 &&
+        Math.abs(photoOverlapPixel[2] - 198) <= 2 &&
+        photoOverlapPixel[3] >= 253,
+      "the first overlap paint must contain the opaque photo"
+    );
+    assert.ok(
+      gradientOverlapPixel[0] >= 253 &&
+        Math.abs(gradientOverlapPixel[1] - 76) <= 3 &&
+        Math.abs(gradientOverlapPixel[2] - 42) <= 3 &&
+        gradientOverlapPixel[3] >= 130 && gradientOverlapPixel[3] <= 138,
+      "the second overlap paint must contain the translucent gradient"
+    );
+    const gradientAlpha = gradientOverlapPixel[3] / 255;
+    const compositedOverlapPixel = gradientOverlapPixel.slice(0, 3).map((component, index) =>
+      Math.round(component * gradientAlpha + photoOverlapPixel[index] * (1 - gradientAlpha))
+    );
+    assert.ok(
+      Math.abs(compositedOverlapPixel[0] - 203) <= 2 &&
+        Math.abs(compositedOverlapPixel[1] - 120) <= 2 &&
+        Math.abs(compositedOverlapPixel[2] - 116) <= 2,
+      "raster array order must composite the gradient over the photo"
+    );
+
+    const photoOverlayZipBlob = await buildParsedDataZip(parsedPhotoOverlayPdf.scene, {
+      sourceLabel: "photo-overlay.pdf",
+      encodeRasterImages: false,
+      compression: "store"
+    });
+    const photoOverlayRoundTrip = await loadSceneFromParsedDataZip(await photoOverlayZipBlob.arrayBuffer());
+    const roundTripPhotoOverlayLayers = listSceneRasterLayers(photoOverlayRoundTrip);
+    assert.equal(roundTripPhotoOverlayLayers.length, photoOverlayLayers.length);
+    for (let i = 0; i < photoOverlayLayers.length; i += 1) {
+      assert.equal(roundTripPhotoOverlayLayers[i].width, photoOverlayLayers[i].width);
+      assert.equal(roundTripPhotoOverlayLayers[i].height, photoOverlayLayers[i].height);
+      assert.deepEqual(
+        Array.from(roundTripPhotoOverlayLayers[i].matrix),
+        Array.from(photoOverlayLayers[i].matrix)
+      );
+    }
+
     const parsedBackdropBlendPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
       sourceKind: "pdf",
       pages: "14"

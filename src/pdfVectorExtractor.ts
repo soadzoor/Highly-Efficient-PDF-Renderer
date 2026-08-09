@@ -2332,6 +2332,8 @@ interface ExtractedRasterLayer {
   height: number;
   data: Uint8Array;
   matrix: Mat2D;
+  /** Display-list painter order used only while assembling a page's raster array. */
+  paintOrder?: number;
 }
 
 interface RasterLayerExtractResult {
@@ -5761,14 +5763,109 @@ function combineRasterLayerResults(
   first: RasterLayerExtractResult,
   second: RasterLayerExtractResult
 ): RasterLayerExtractResult {
+  const layers = [...first.layers, ...second.layers];
+  if (
+    layers.length > 1 &&
+    layers.every((layer) => typeof layer.paintOrder === "number" && Number.isFinite(layer.paintOrder))
+  ) {
+    // Array order is the raster painter order persisted into VectorScene/ZIP.
+    // Modern JS sorting is stable, so equal display-list anchors retain capture order.
+    layers.sort((left, right) => (left.paintOrder as number) - (right.paintOrder as number));
+  }
   return {
-    layers: [...first.layers, ...second.layers],
+    layers,
     bounds: combineBounds(first.bounds, second.bounds),
     suppressedSourcePaintMask: combinePaintMasks(
       first.suppressedSourcePaintMask,
       second.suppressedSourcePaintMask
     )
   };
+}
+
+function isCapturedShadingPaint(
+  operatorList: { fnArray: number[] },
+  rasterPlan: RasterOperatorPlan,
+  index: number,
+  includeEarlyStrokeUnderlay: boolean
+): boolean {
+  return (
+    operatorList.fnArray[index] === OPS.shadingFill ||
+    rasterPlan.softMaskPaintMask[index] === 1 ||
+    (includeEarlyStrokeUnderlay && rasterPlan.earlyStrokeUnderlayMask[index] === 1)
+  );
+}
+
+function resolveAggregateShadingPaintOrder(
+  operatorList: { fnArray: number[] },
+  rasterPlan: RasterOperatorPlan,
+  includeEarlyStrokeUnderlay: boolean
+): number | null {
+  let firstPaintIndex = -1;
+  let lastPaintIndex = -1;
+  for (let index = 0; index < operatorList.fnArray.length; index += 1) {
+    if (!isCapturedShadingPaint(operatorList, rasterPlan, index, includeEarlyStrokeUnderlay)) {
+      continue;
+    }
+    if (firstPaintIndex < 0) {
+      firstPaintIndex = index;
+    }
+    lastPaintIndex = index;
+  }
+  if (firstPaintIndex < 0) {
+    return null;
+  }
+
+  // All selected shadings currently share one texture. It has one exact raster
+  // painter position only when no separately captured image lies inside its span.
+  for (let index = firstPaintIndex + 1; index < lastPaintIndex; index += 1) {
+    if (
+      isImagePaintOperator(operatorList.fnArray[index]) &&
+      rasterPlan.softMaskPaintMask[index] === 0
+    ) {
+      return null;
+    }
+  }
+  return lastPaintIndex;
+}
+
+function resolveAggregateImagePaintOrder(
+  operatorList: { fnArray: number[] },
+  rasterPlan: RasterOperatorPlan,
+  includeEarlyStrokeUnderlay: boolean
+): number | null {
+  let firstPaintIndex = -1;
+  let lastPaintIndex = -1;
+  for (let index = 0; index < operatorList.fnArray.length; index += 1) {
+    if (
+      !isImagePaintOperator(operatorList.fnArray[index]) ||
+      rasterPlan.softMaskPaintMask[index] === 1
+    ) {
+      continue;
+    }
+    if (firstPaintIndex < 0) {
+      firstPaintIndex = index;
+    }
+    lastPaintIndex = index;
+  }
+  if (firstPaintIndex < 0) {
+    return null;
+  }
+
+  for (let index = firstPaintIndex + 1; index < lastPaintIndex; index += 1) {
+    if (isCapturedShadingPaint(operatorList, rasterPlan, index, includeEarlyStrokeUnderlay)) {
+      return null;
+    }
+  }
+  return lastPaintIndex;
+}
+
+function setRasterLayerPaintOrder(result: RasterLayerExtractResult, paintOrder: number | null): void {
+  if (paintOrder === null || !Number.isFinite(paintOrder)) {
+    return;
+  }
+  for (const layer of result.layers) {
+    layer.paintOrder = paintOrder;
+  }
 }
 
 function combinePaintMasks(first?: Uint8Array, second?: Uint8Array): Uint8Array | undefined {
@@ -5787,6 +5884,26 @@ function combinePaintMasks(first?: Uint8Array, second?: Uint8Array): Uint8Array 
     }
   }
   return combined;
+}
+
+function applyCapturedRasterSuppression(
+  result: RasterLayerExtractResult,
+  rasterPlan: RasterOperatorPlan,
+  sourceRasterPlan: RasterOperatorPlan,
+  includeEarlyStrokeUnderlay: boolean
+): void {
+  if (
+    rasterPlan.softMaskCompositeCount > 0 &&
+    rasterPlan.softMaskCompositeCount === sourceRasterPlan.softMaskCompositeCount
+  ) {
+    result.suppressedSourcePaintMask = sourceRasterPlan.softMaskPaintMask;
+  }
+  if (includeEarlyStrokeUnderlay) {
+    result.suppressedSourcePaintMask = combinePaintMasks(
+      result.suppressedSourcePaintMask,
+      sourceRasterPlan.earlyStrokeUnderlayMask
+    );
+  }
 }
 
 interface RasterPageLike {
@@ -5943,6 +6060,11 @@ async function extractRasterLayerData(
   const backdropBlendMatches =
     rasterPlan.backdropBlendCount > 0 &&
     rasterPlan.backdropBlendCount === sourceRasterPlan.backdropBlendCount;
+  const shadingPaintOrder = resolveAggregateShadingPaintOrder(
+    filterOperatorList,
+    rasterPlan,
+    earlyStrokeUnderlayMatches
+  );
 
   const rotation = normalizeRotationDegrees(pageLike.rotate);
   const baseViewport = pageLike.getViewport({ scale: 1, rotation, dontFlip: false });
@@ -5950,6 +6072,17 @@ async function extractRasterLayerData(
   const baseHeight = Math.max(1, Math.ceil(baseViewport.height));
   const completeImageScan = scanRasterImageOps(filterOperatorList);
   const scan = scanRasterImageOps(filterOperatorList, rasterPlan.softMaskPaintMask);
+  const perImagePlans =
+    scan.plans && scan.plans.length > 0 && scan.plans.length <= RASTER_MAX_IMAGE_LAYERS
+      ? scan.plans
+      : null;
+  const aggregateImagePaintOrder = rasterPlan.hasImagePaintOps
+    ? resolveAggregateImagePaintOrder(
+      filterOperatorList,
+      rasterPlan,
+      earlyStrokeUnderlayMatches
+    )
+    : null;
   const buildViewport = (rasterScale: number): { transform: unknown; width: number; height: number } =>
     rasterScale === 1 ? baseViewport : pageLike.getViewport({ scale: rasterScale, rotation, dontFlip: false });
 
@@ -6004,6 +6137,73 @@ async function extractRasterLayerData(
     // cannot be allocated or rendered.
   }
 
+  const hasCapturedShadingPaints =
+    rasterPlan.hasShadingFillOps || rasterPlan.hasSoftMaskPaintOps || earlyStrokeUnderlayMatches;
+  let orderedRasterCompositeAttempted = false;
+  const renderOrderedRasterComposite = async (): Promise<RasterLayerExtractResult | null> => {
+    orderedRasterCompositeAttempted = true;
+    // One aggregate shading texture cannot be inserted on both sides of an
+    // intervening image. Replay just the raster-backed paints together so PDF.js
+    // preserves their source order and mutual compositing in one layer.
+    const orderedRasterScale = chooseRasterExtractionScale(
+      baseWidth,
+      baseHeight,
+      Math.max(RASTER_SHADING_TARGET_SCALE, completeImageScan.nativeScaleHint ?? 1)
+    );
+    const viewport = buildViewport(orderedRasterScale);
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      const imageOnlyMask = rasterPlan.imageOnlyMask;
+      const shadingOnlyMask = rasterPlan.shadingOnlyMask;
+      const earlyStrokeUnderlayMask = rasterPlan.earlyStrokeUnderlayMask;
+      const filter = (index: number): boolean =>
+        index >= 0 &&
+        index < shadingOnlyMask.length &&
+        (imageOnlyMask[index] === 1 ||
+          shadingOnlyMask[index] === 1 ||
+          (earlyStrokeUnderlayMatches && earlyStrokeUnderlayMask[index] === 1));
+      const orderedRasterRgba = await renderRasterLayerRgba(
+        pageLike,
+        viewport,
+        width,
+        height,
+        filter
+      );
+      if (orderedRasterRgba && hasVisibleAlphaPixels(orderedRasterRgba)) {
+        const orderedRasterResult = finalizeCroppedRasterLayerResult(
+          width,
+          height,
+          orderedRasterRgba,
+          viewport,
+          pageMatrix
+        );
+        applyCapturedRasterSuppression(
+          orderedRasterResult,
+          rasterPlan,
+          sourceRasterPlan,
+          earlyStrokeUnderlayMatches
+        );
+        return orderedRasterResult.layers.length > 0 ? orderedRasterResult : null;
+      }
+    }
+    return null;
+  };
+
+  if (
+    displayOperatorList &&
+    rasterPlan.hasImagePaintOps &&
+    hasCapturedShadingPaints &&
+    (shadingPaintOrder === null || (perImagePlans === null && aggregateImagePaintOrder === null))
+  ) {
+    const orderedRasterResult = await renderOrderedRasterComposite();
+    if (orderedRasterResult) {
+      return orderedRasterResult;
+    }
+    // If the ordered composite cannot be rendered, keep the selective legacy
+    // fallback below rather than dropping raster content.
+  }
+
   let rgba: Uint8Array | null = null;
   let shadingResult = createEmptyRasterLayerResult();
   if (
@@ -6025,18 +6225,16 @@ async function extractRasterLayerData(
       rgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
       if (rgba && hasVisibleAlphaPixels(rgba)) {
         shadingResult = finalizeCroppedRasterLayerResult(width, height, rgba, viewport, pageMatrix);
-        if (
-          rasterPlan.softMaskCompositeCount > 0 &&
-          rasterPlan.softMaskCompositeCount === sourceRasterPlan.softMaskCompositeCount
-        ) {
-          shadingResult.suppressedSourcePaintMask = sourceRasterPlan.softMaskPaintMask;
-        }
-        if (earlyStrokeUnderlayMatches) {
-          shadingResult.suppressedSourcePaintMask = combinePaintMasks(
-            shadingResult.suppressedSourcePaintMask,
-            sourceRasterPlan.earlyStrokeUnderlayMask
-          );
-        }
+        setRasterLayerPaintOrder(shadingResult, shadingPaintOrder);
+      }
+
+      if (shadingResult.layers.length > 0) {
+        applyCapturedRasterSuppression(
+          shadingResult,
+          rasterPlan,
+          sourceRasterPlan,
+          earlyStrokeUnderlayMatches
+        );
       }
     }
   }
@@ -6045,13 +6243,28 @@ async function extractRasterLayerData(
   if (
     displayOperatorList &&
     rasterPlan.hasImagePaintOps &&
-    scan.plans &&
-    scan.plans.length > 0 &&
-    scan.plans.length <= RASTER_MAX_IMAGE_LAYERS
+    perImagePlans
   ) {
-    const perImage = await renderPerImageRasterLayers(pageLike, scan.plans, rasterPlan.imageStateMask, pageMatrix, rotation, baseViewport);
+    const perImage = await renderPerImageRasterLayers(
+      pageLike,
+      perImagePlans,
+      rasterPlan.imageStateMask,
+      pageMatrix,
+      rotation,
+      baseViewport
+    );
     if (perImage) {
       return combineRasterLayerResults(shadingResult, perImage);
+    }
+    if (
+      hasCapturedShadingPaints &&
+      aggregateImagePaintOrder === null &&
+      !orderedRasterCompositeAttempted
+    ) {
+      const orderedRasterResult = await renderOrderedRasterComposite();
+      if (orderedRasterResult) {
+        return orderedRasterResult;
+      }
     }
   }
 
@@ -6072,6 +6285,7 @@ async function extractRasterLayerData(
       rgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
       if (rgba && hasVisibleAlphaPixels(rgba)) {
         const imageResult = finalizeCroppedRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+        setRasterLayerPaintOrder(imageResult, aggregateImagePaintOrder);
         return combineRasterLayerResults(shadingResult, imageResult);
       }
     }
@@ -6171,7 +6385,7 @@ async function renderPerImageRasterLayers(
     }
 
     const matrix = buildRasterLayerMatrix(width, height, cropMinX, cropMinY, scaledTransform, pageMatrix);
-    layers.push({ width, height, data: rgba, matrix });
+    layers.push({ width, height, data: rgba, matrix, paintOrder: plan.opIndex });
     bounds = combineBounds(bounds, transformBounds(UNIT_BOUNDS, matrix));
   }
 

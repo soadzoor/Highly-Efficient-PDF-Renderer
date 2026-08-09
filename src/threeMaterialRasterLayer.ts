@@ -80,10 +80,17 @@ export class ThreeMaterialRasterLayer {
       this.group.add(entry.mesh);
     }
 
-    for (const source of getSceneRasterLayers(scene)) {
+    const rasterSources = getSceneRasterLayers(scene);
+    for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
+      const source = rasterSources[rasterIndex];
       const texture = createRasterTexture(source);
       this.ownedTextures.add(texture);
-      const entry = this.createEntry(texture, source.matrix, HEPR_THREE_LAYER_ORDER_RASTER);
+      const rasterOrderOffset = (rasterIndex + 1) / (rasterSources.length + 1);
+      const entry = this.createEntry(
+        texture,
+        source.matrix,
+        HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset
+      );
       this.entries.push(entry);
       this.group.add(entry.mesh);
     }
