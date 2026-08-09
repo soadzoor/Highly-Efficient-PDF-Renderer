@@ -83,6 +83,46 @@ function hasStagedChanges(directoryPath) {
   throw new Error(`git diff --cached --quiet failed in ${directoryPath}: ${details}`);
 }
 
+function gitSucceeds(args, cwd) {
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8"
+  });
+  return result.status === 0;
+}
+
+function synchronizeDeployBranch(deployBranch) {
+  const status = runGit(["status", "--porcelain"], deployDir);
+  if (status) {
+    throw new Error(
+      `Deploy checkout has uncommitted changes: ${deployDir}. ` +
+        "Commit or discard them before deploying."
+    );
+  }
+
+  runGit(["fetch", "origin", deployBranch], deployDir);
+
+  const remoteRef = `refs/remotes/origin/${deployBranch}`;
+  const localHead = runGit(["rev-parse", "HEAD"], deployDir);
+  const remoteHead = runGit(["rev-parse", "--verify", remoteRef], deployDir);
+
+  if (localHead === remoteHead) {
+    return;
+  }
+
+  if (gitSucceeds(["merge-base", "--is-ancestor", localHead, remoteHead], deployDir)) {
+    runGit(["merge", "--ff-only", remoteRef], deployDir);
+    return;
+  }
+
+  if (!gitSucceeds(["merge-base", "--is-ancestor", remoteHead, localHead], deployDir)) {
+    throw new Error(
+      `Deploy branch "${deployBranch}" has diverged from origin/${deployBranch} in ` +
+        `${deployDir}. Reconcile the deploy checkout manually before deploying.`
+    );
+  }
+}
+
 function resolveMainRef() {
   const result = spawnSync("git", ["show-ref", "--verify", "--quiet", "refs/heads/main"], {
     cwd: repoRoot,
@@ -91,8 +131,28 @@ function resolveMainRef() {
   return result.status === 0 ? "main" : "HEAD";
 }
 
+function resolveLastDeployedSourceRevision(deployHead, mainRef) {
+  const recordedRevision = runGit(
+    ["log", "-1", "--format=%(trailers:key=Source-Revision,valueonly)", deployHead],
+    deployDir
+  ).trim();
+
+  if (
+    recordedRevision &&
+    gitSucceeds(["merge-base", "--is-ancestor", recordedRevision, mainRef], repoRoot)
+  ) {
+    return recordedRevision;
+  }
+
+  // Older deploy commits did not record the source revision. Their timestamp is
+  // the best available boundary, because deploy commits are created after builds.
+  const deployedAt = runGit(["show", "-s", "--format=%cI", deployHead], deployDir);
+  return runGit(["rev-list", "-1", `--before=${deployedAt}`, mainRef], repoRoot);
+}
+
 function commitSubjectsSince(baseRevision, fromRevision) {
-  const output = runGit(["log", "--format=%s", `${baseRevision}..${fromRevision}`], repoRoot);
+  const revisionRange = baseRevision ? `${baseRevision}..${fromRevision}` : fromRevision;
+  const output = runGit(["log", "--format=%s", revisionRange], repoRoot);
   if (output === "") {
     return [];
   }
@@ -110,9 +170,13 @@ async function main() {
     throw new Error(`Deploy worktree is not on a branch: ${deployDir}`);
   }
 
-  const ghPagesHead = runGit(["rev-parse", "HEAD"], deployDir);
+  synchronizeDeployBranch(deployBranch);
+
+  const deployHead = runGit(["rev-parse", "HEAD"], deployDir);
   const mainRef = resolveMainRef();
-  const subjects = commitSubjectsSince(ghPagesHead, mainRef);
+  const sourceRevision = runGit(["rev-parse", mainRef], repoRoot);
+  const previousSourceRevision = resolveLastDeployedSourceRevision(deployHead, mainRef);
+  const subjects = commitSubjectsSince(previousSourceRevision, mainRef);
 
   await clearNonHiddenRootEntries(deployDir);
   await copyDirectoryContents(distDir, deployDir);
@@ -129,9 +193,12 @@ async function main() {
     const body =
       subjects.length > 0
         ? subjects.map((subject) => `- ${subject}`).join("\n")
-        : "- No new main commits since current gh-pages HEAD.";
+        : "- No new main commits since the previous deployment.";
 
-    runGit(["commit", "-m", title, "-m", body], deployDir);
+    runGit(
+      ["commit", "-m", title, "-m", body, "-m", `Source-Revision: ${sourceRevision}`],
+      deployDir
+    );
     console.log(`Committed deploy artifacts to ${deployDir}`);
   }
 
