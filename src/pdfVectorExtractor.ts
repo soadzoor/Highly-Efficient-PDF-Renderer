@@ -6394,12 +6394,43 @@ function nativePaintHasEarlierOrdinaryVectorHazard(
   return false;
 }
 
+function hasNativeGradientCandidateOperators(operatorList: PdfOperatorListLike): boolean {
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    if (fn === OPS.shadingFill) {
+      return true;
+    }
+    if (
+      (fn === OPS.setFillColorN || fn === OPS.setStrokeColorN) &&
+      readNativePatternReference(operatorList.argsArray[i])
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function buildNativeGradientPlan(
   page: unknown,
   operatorList: PdfOperatorListLike,
   pageMatrix: Mat2D,
   pageBounds: Bounds
 ): NativeGradientPlan {
+  // The state scan retains a snapshot for every paint operator so candidate
+  // gradients can be reconstructed with their exact PDF graphics state. Most
+  // PDFs have no gradient-capable operators at all; skipping the scan matters
+  // especially for CAD exports with millions of ordinary path paints.
+  if (!hasNativeGradientCandidateOperators(operatorList)) {
+    return {
+      gradients: [],
+      paints: [],
+      nativePathPaintMask: new Uint8Array(0),
+      rasterExcludedPaintMask: new Uint8Array(0),
+      paintTopologySignature: "",
+      nativeTopologySignature: ""
+    };
+  }
+
   const gradients: NativeGradientDefinition[] = [];
   const paints: NativeGradientPaint[] = [];
   const nativePathPaintMask = new Uint8Array(operatorList.fnArray.length);
