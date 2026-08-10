@@ -782,7 +782,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       );
     } else {
       const parseStart = performance.now();
-      setParsingLoader(true, "Parsing / loading 0.00%");
+      setParsingLoader(true, "0.00% Parsing / loading");
       setStatus(
         `Parsing ${label} with PDF.js... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
@@ -894,7 +894,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
 
   try {
     const parseStart = performance.now();
-    setParsingLoader(true, "Parsing / loading 0.00%");
+    setParsingLoader(true, "0.00% Parsing / loading");
     setStatus(`Loading parsed data from ${label}...`);
     const scene = await loadSceneFromParsedDataZip(buffer, {
       onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "zip" }).toCallback()
@@ -1087,7 +1087,7 @@ function clearLoadedStatus(): void {
   statusTextElement.hidden = true;
 }
 
-function setParsingLoader(isVisible: boolean, text = "Parsing / loading..."): void {
+function setParsingLoader(isVisible: boolean, text = "0.00% Parsing / loading..."): void {
   parsingLoaderElement.hidden = !isVisible;
   parsingLoaderTextElement.textContent = isVisible ? text : "";
 }
@@ -1095,7 +1095,7 @@ function setParsingLoader(isVisible: boolean, text = "Parsing / loading..."): vo
 function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
   const stageLabel = formatLoadProgressStage(progress.stage);
   const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
-  setParsingLoader(true, `${stageLabel} ${(value * 100).toFixed(2)}%`);
+  setParsingLoader(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
 }
 
 async function prebuildVectorLodForScene(

@@ -790,7 +790,7 @@ async function loadSource(
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
-  setLoadingProgress(true, "Parsing / loading 0.00%");
+  setLoadingProgress(true, "0.00% Parsing / loading");
   setLoadControlsEnabled(false);
   setDownloadDataButtonState(false);
   setDownloadPdfButtonState(false);
@@ -875,7 +875,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   let targetInstalled = false;
 
   setStatus(`Reloading ${previousObject.sourceLabel} with ${formatBackendLabel(backend)}...`);
-  setLoadingProgress(true, "Parsing / loading 0.00%");
+  setLoadingProgress(true, "0.00% Parsing / loading");
   setLoadControlsEnabled(false);
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), true);
@@ -1231,7 +1231,7 @@ function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
   }
   const stageLabel = formatLoadProgressStage(progress.stage);
   const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
-  setLoadingProgress(true, `${stageLabel} ${(value * 100).toFixed(2)}%`);
+  setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
 }
 
 function setLoadingProgress(visible: boolean, text = ""): void {
