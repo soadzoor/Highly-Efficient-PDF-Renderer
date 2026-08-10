@@ -38,6 +38,9 @@ export interface RendererApi {
   /** Enable or disable native raster rendering. */
   setRasterRenderingEnabled?(enabled: boolean): void;
 
+  /** Allocate or release native raster GPU textures without losing scene data. */
+  setRasterTextureResidency?(resident: boolean): void;
+
   /** Enable or disable native fill rendering. */
   setFillRenderingEnabled?(enabled: boolean): void;
 

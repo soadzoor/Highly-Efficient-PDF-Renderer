@@ -1355,6 +1355,7 @@ export class WebGpuFloorplanRenderer {
 
   private textInstanceTextureC: any = null;
   private rasterLayerResources: WebGpuRasterLayerResource[] = [];
+  private rasterTextureResidency = true;
   private pageBackgroundResources: WebGpuRasterLayerResource[] = [];
 
   private textGlyphMetaTextureA: any = null;
@@ -1430,6 +1431,7 @@ export class WebGpuFloorplanRenderer {
 
   private rafHandle = 0;
   private externalFrameDriver = false;
+  private isDisposed = false;
   private externalFramePending = false;
 
   private cameraCenterX = 0;
@@ -1974,19 +1976,29 @@ export class WebGpuFloorplanRenderer {
     }
 
     const device = await adapter.requestDevice();
-    if (typeof device.addEventListener === "function") {
-      device.addEventListener("uncapturederror", (event: any) => {
-        const message = event?.error?.message || event?.error || event;
-        console.warn("[WebGPU uncaptured error]", message);
-      });
-    }
-    const context = canvas.getContext("webgpu");
-    if (!context) {
-      throw new Error("Failed to acquire a WebGPU canvas context.");
-    }
+    let context: any = null;
+    try {
+      if (typeof device.addEventListener === "function") {
+        device.addEventListener("uncapturederror", (event: any) => {
+          const message = event?.error?.message || event?.error || event;
+          console.warn("[WebGPU uncaptured error]", message);
+        });
+      }
+      context = canvas.getContext("webgpu");
+      if (!context) {
+        throw new Error("Failed to acquire a WebGPU canvas context.");
+      }
 
-    const presentationFormat = nav.gpu.getPreferredCanvasFormat?.() ?? "bgra8unorm";
-    return new WebGpuFloorplanRenderer(canvas, device, context, presentationFormat);
+      const presentationFormat = nav.gpu.getPreferredCanvasFormat?.() ?? "bgra8unorm";
+      return new WebGpuFloorplanRenderer(canvas, device, context, presentationFormat);
+    } catch (error) {
+      try {
+        releaseOwnedWebGpuDevice(device, context);
+      } catch {
+        // Preserve the original initialization error.
+      }
+      throw error;
+    }
   }
 
   setFrameListener(listener: FrameListener | null): void {
@@ -2066,6 +2078,31 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.rasterRenderingEnabled = nextEnabled;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setRasterTextureResidency(resident: boolean): void {
+    const nextResident = Boolean(resident);
+    if (this.rasterTextureResidency === nextResident || this.isDisposed) {
+      return;
+    }
+
+    this.rasterTextureResidency = nextResident;
+    if (nextResident) {
+      if (this.scene) {
+        try {
+          this.configureRasterLayers(this.scene);
+        } catch (error) {
+          this.rasterTextureResidency = false;
+          this.destroyRasterLayerResources();
+          throw error;
+        }
+      }
+    } else {
+      this.destroyRasterLayerResources();
+    }
     this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -2228,6 +2265,9 @@ export class WebGpuFloorplanRenderer {
   }
 
   setScene(scene: VectorScene): SceneStats {
+    if (this.isDisposed) {
+      throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
+    }
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
@@ -2301,7 +2341,10 @@ export class WebGpuFloorplanRenderer {
       : this.createR8Texture(1, 1, new Uint8Array([0]));
 
     this.configurePageBackgroundResources(scene);
-    this.configureRasterLayers(scene);
+    this.destroyRasterLayerResources();
+    if (this.rasterTextureResidency) {
+      this.configureRasterLayers(scene);
+    }
     this.configureGradientPaint(scene, maxTextureSize);
 
     this.allSegmentIds = new Uint32Array(this.segmentCount);
@@ -2785,6 +2828,10 @@ export class WebGpuFloorplanRenderer {
   }
 
   dispose(): void {
+    if (this.isDisposed) {
+      return;
+    }
+    this.isDisposed = true;
     if (this.rafHandle !== 0) {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = 0;
@@ -2794,6 +2841,10 @@ export class WebGpuFloorplanRenderer {
     this.destroyPanCacheResources();
     this.destroyVectorMinifyResources();
     this.destroyDataResources();
+    this.rasterLayerResources = [];
+    this.scene = null;
+    this.grid = null;
+    this.sceneStats = null;
 
     if (this.segmentIdBufferAll) {
       this.segmentIdBufferAll.destroy();
@@ -2835,6 +2886,7 @@ export class WebGpuFloorplanRenderer {
       this.pageBackgroundTexture.destroy();
       this.pageBackgroundTexture = null;
     }
+    releaseOwnedWebGpuDevice(this.gpuDevice, this.gpuContext);
   }
 
   private configureContext(): void {
@@ -3958,28 +4010,44 @@ export class WebGpuFloorplanRenderer {
   }
 
   private configureRasterLayers(scene: VectorScene): void {
+    const rasterSources = this.getSceneRasterLayers(scene);
+    const maxRasterTextureSize = this.maxTextureSize();
+    for (const [index, source] of rasterSources.entries()) {
+      if (source.width > maxRasterTextureSize || source.height > maxRasterTextureSize) {
+        throw new Error(
+          `Raster layer ${index} requires a ${source.width}x${source.height} texture, ` +
+          `but this WebGPU device supports at most ${maxRasterTextureSize}x${maxRasterTextureSize}.`
+        );
+      }
+    }
+
     this.destroyRasterLayerResources();
 
-    for (const source of this.getSceneRasterLayers(scene)) {
-      const matrix = new Float32Array(6);
-      if (source.matrix.length >= 6) {
-        matrix[0] = source.matrix[0];
-        matrix[1] = source.matrix[1];
-        matrix[2] = source.matrix[2];
-        matrix[3] = source.matrix[3];
-        matrix[4] = source.matrix[4];
-        matrix[5] = source.matrix[5];
-      } else {
-        matrix[0] = 1;
-        matrix[3] = 1;
-      }
+    try {
+      for (const source of rasterSources) {
+        const matrix = new Float32Array(6);
+        if (source.matrix.length >= 6) {
+          matrix.set(source.matrix.subarray(0, 6));
+        } else {
+          matrix[0] = 1;
+          matrix[3] = 1;
+        }
 
-      const rgba = source.data.subarray(0, source.width * source.height * 4);
-      const premultiplied = premultiplyRgba(rgba);
-      const texture = this.createRgba8Texture(source.width, source.height, premultiplied);
-      this.rasterLayerResources.push(
-        this.createRasterLayerResource(matrix, texture, source.paintOrder, source.pageIndex)
-      );
+        const rgba = source.data.subarray(0, source.width * source.height * 4);
+        const premultiplied = premultiplyRgba(rgba);
+        const texture = this.createRgba8Texture(source.width, source.height, premultiplied);
+        try {
+          this.rasterLayerResources.push(
+            this.createRasterLayerResource(matrix, texture, source.paintOrder, source.pageIndex)
+          );
+        } catch (error) {
+          texture.destroy();
+          throw error;
+        }
+      }
+    } catch (error) {
+      this.destroyRasterLayerResources();
+      throw error;
     }
   }
 
@@ -4058,7 +4126,10 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
-    this.orderedGradientPaintCommands = buildOrderedGradientPaintCommands(this.rasterLayerResources, data);
+    this.orderedGradientPaintCommands = buildOrderedGradientPaintCommands(
+      this.getSceneRasterLayers(scene),
+      data
+    );
     this.gradientPaintRequiresDirectRendering = orderedGradientPaintNeedsDirectRendering(
       this.orderedGradientPaintCommands
     );
@@ -4120,8 +4191,8 @@ export class WebGpuFloorplanRenderer {
           height,
           data: layer.data,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
-          paintOrder: Number(layer.paintOrder),
-          pageIndex: Number(layer.pageIndex)
+          paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+          pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
         });
       }
     }
@@ -4208,37 +4279,46 @@ export class WebGpuFloorplanRenderer {
       size: RASTER_UNIFORM_BUFFER_BYTES,
       usage: gpuBufferUsage.UNIFORM | gpuBufferUsage.COPY_DST
     });
-    this.gpuDevice.queue.writeBuffer(uniformBuffer, 0, rasterUniforms);
+    try {
+      this.gpuDevice.queue.writeBuffer(uniformBuffer, 0, rasterUniforms);
 
-    const bindGroup = this.gpuDevice.createBindGroup({
-      layout: this.rasterPipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
-        },
-        {
-          binding: 1,
-          resource: { buffer: uniformBuffer, size: RASTER_UNIFORM_BUFFER_BYTES }
-        },
-        {
-          binding: 2,
-          resource: this.rasterLayerSampler
-        },
-        {
-          binding: 3,
-          resource: texture.createView()
-        }
-      ]
-    });
+      const bindGroup = this.gpuDevice.createBindGroup({
+        layout: this.rasterPipeline.getBindGroupLayout(0),
+        entries: [
+          {
+            binding: 0,
+            resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES }
+          },
+          {
+            binding: 1,
+            resource: { buffer: uniformBuffer, size: RASTER_UNIFORM_BUFFER_BYTES }
+          },
+          {
+            binding: 2,
+            resource: this.rasterLayerSampler
+          },
+          {
+            binding: 3,
+            resource: texture.createView()
+          }
+        ]
+      });
 
-    return {
-      texture,
-      uniformBuffer,
-      bindGroup,
-      paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
-      pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
-    };
+      return {
+        texture,
+        uniformBuffer,
+        bindGroup,
+        paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
+        pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
+      };
+    } catch (error) {
+      try {
+        uniformBuffer.destroy();
+      } catch {
+        // Preserve the resource-creation error.
+      }
+      throw error;
+    }
   }
 
   private createFloatTexture(width: number, height: number, source: Float32Array): any {
@@ -4902,6 +4982,29 @@ function normalizePageRects(scene: VectorScene): Float32Array {
     scene.pageBounds.maxX,
     scene.pageBounds.maxY
   ]);
+}
+
+function releaseOwnedWebGpuDevice(device: any, context: any): void {
+  let firstError: unknown = null;
+  try {
+    if (typeof context?.unconfigure === "function") {
+      context.unconfigure();
+    }
+  } catch (error) {
+    firstError = error;
+  }
+
+  try {
+    if (typeof device?.destroy === "function") {
+      device.destroy();
+    }
+  } catch (error) {
+    firstError ??= error;
+  }
+
+  if (firstError !== null) {
+    throw firstError;
+  }
 }
 
 function alignTo(value: number, alignment: number): number {

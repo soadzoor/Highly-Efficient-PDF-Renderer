@@ -35,6 +35,9 @@ export interface ParsedDataZipEncodingOptions {
 
   /** Receives normalized progress for the complete parse-and-build operation. */
   onProgress?: LoadProgressCallback;
+
+  /** Cancels raster compression and parsed-ZIP generation when aborted. */
+  signal?: AbortSignal;
 }
 
 /** Options when building parsed data directly from an accepted PDF source. */
@@ -90,6 +93,7 @@ export async function buildParsedDataZip(
   options: BuildParsedDataZipFromPdfOptions | BuildParsedDataZipFromSceneOptions = {}
 ): Promise<Blob> {
   validateEncodingOptions(options);
+  options.signal?.throwIfAborted();
   if (isVectorScene(input)) {
     return buildParsedDataZipFromScene(input, options as BuildParsedDataZipFromSceneOptions);
   }
@@ -109,7 +113,8 @@ async function buildParsedDataZipFromPdf(
     maxPagesPerRow: options.maxPagesPerRow,
     sourceKind: "pdf",
     onProgress: (payload) => forwardParseProgress(parseProgress, payload)
-  });
+  }, options.signal);
+  options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(loaded.scene);
   const sourcePdfBytes = needsSourcePdfFallback(loaded.scene, rasterLayers.length)
     ? loaded.sourceBytes
@@ -132,6 +137,7 @@ async function buildParsedDataZipFromScene(
   options: BuildParsedDataZipFromSceneOptions
 ): Promise<Blob> {
   const progress = createLoadProgressReporter(options.onProgress);
+  options.signal?.throwIfAborted();
   const rasterLayers = listSceneRasterLayers(scene);
   const needsFallback = needsSourcePdfFallback(scene, rasterLayers.length);
   let sourcePdfBytes: Uint8Array | null = null;
@@ -147,8 +153,10 @@ async function buildParsedDataZipFromScene(
     buildStart = 0.16;
     sourcePdfBytes = await readPdfObjectSourceBytes(
       options.sourcePdf,
-      progress.child(0, buildStart, { sourceType: "pdf" })
+      progress.child(0, buildStart, { sourceType: "pdf" }),
+      options.signal
     );
+    options.signal?.throwIfAborted();
     if (!hasPdfHeader(sourcePdfBytes)) {
       throw new Error("options.sourcePdf does not contain PDF data.");
     }
@@ -191,8 +199,14 @@ async function buildSceneZip(
       zipCompression: options.compression === "store" ? "STORE" : "DEFLATE",
       zipDeflateLevel: compressionLevel,
       sourcePdfPages,
-      onBuildProgress: (value) => {
-        progress.report(value, { stage: "zip-build" });
+      signal: options.signal,
+      onBuildProgress: (value, buildProgress) => {
+        progress.report(value, {
+          stage: buildProgress.stage,
+          unit: buildProgress.unit,
+          processed: buildProgress.processed,
+          total: buildProgress.total
+        });
       }
     }
   );

@@ -170,7 +170,15 @@ an `application/zip` `Blob` that can be downloaded, uploaded, or stored:
 import { buildParsedDataZip } from "@soadzoor/hepr";
 
 // URL, File, Blob, Uint8Array, ArrayBuffer, base64, or data URL
-const zipBlob = await buildParsedDataZip(pdfSource);
+const controller = new AbortController();
+const zipBlob = await buildParsedDataZip(pdfSource, {
+  // Default: store each raster as the smaller of WebP/PNG, with RGBA fallback.
+  encodeRasterImages: true,
+  signal: controller.signal,
+  onProgress: ({ value, stage }) => {
+    console.log(`${(value * 100).toFixed(1)}%`, stage);
+  }
+});
 ```
 
 If the PDF is already loaded, pass its parsed scene to avoid parsing it again:
@@ -459,7 +467,11 @@ The exported ZIP contains parsed scene data:
 - optional raster layers
 - optional embedded source PDF fallback
 
-Parsed ZIPs are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported ZIPs are typically smaller than the source PDFs themselves. Only the current format version is supported: ZIPs exported with older versions are rejected at load with a clear error and need to be re-exported.
+Parsed ZIPs are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported ZIPs are typically smaller than the source PDFs themselves. Format v6 stores each raster layer whole as WebP or PNG, whichever is smaller, and falls back to RGBA8 when image encoding is unavailable. WebP/PNG entries are already compressed and are therefore stored without redundant ZIP compression.
+
+Exports report separate `raster-encode` and `zip-build` progress stages. Pass an `AbortSignal` as `signal` to cancel source fetching/PDF.js parsing, between raster encodes, or while the ZIP stream is being generated. Cancellation inside synchronous extraction work takes effect at the next asynchronous/check boundary. The loader accepts format v6 only; older or experimental format versions must be re-exported.
+
+The Three.js integration keeps only one raster GPU owner active at a time. Its material textures are released before the native-canvas fallback allocates raster textures, and native raster textures remain nonresident while the Three.js material path is active. This avoids the previous persistent duplicate raster allocation across the two renderer paths. The active texture set is still ordinary RGBA8 with mipmaps; this is an ownership fix, not GPU texture compression.
 
 The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make ZIPs much larger than the original parsed scene.
 

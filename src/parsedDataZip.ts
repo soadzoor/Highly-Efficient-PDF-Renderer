@@ -14,6 +14,12 @@ import {
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
 import {
+  decodeRasterImageToRgba,
+  encodeRasterRgbaAsBestImage,
+  inspectRasterImage,
+  rasterImageEncodingFromPath
+} from "./rasterImageCodec";
+import {
   decodeByteShuffledFloat32,
   decodeChannelMajorFloat32,
   decodeXorDeltaByteShuffledFloat32,
@@ -87,7 +93,15 @@ export interface BuildParsedDataZipOptions {
   zipCompression?: "STORE" | "DEFLATE";
   zipDeflateLevel?: number;
   sourcePdfPages?: string;
-  onBuildProgress?: (value: number) => void;
+  signal?: AbortSignal;
+  onBuildProgress?: (value: number, progress: ParsedDataZipBuildProgress) => void;
+}
+
+export interface ParsedDataZipBuildProgress {
+  stage: "raster-encode" | "zip-build";
+  unit?: "texels";
+  processed?: number;
+  total?: number;
 }
 
 export interface LoadParsedDataZipOptions {
@@ -204,6 +218,7 @@ export async function buildParsedDataZipBlobForLayout(
   sceneRasterLayers: RasterLayer[],
   options: BuildParsedDataZipOptions = {}
 ): Promise<ParsedDataZipBlobResult> {
+  throwIfBuildAborted(options.signal);
   const encodeRasterImages = options.encodeRasterImages ?? true;
   const zipCompression = options.zipCompression ?? "DEFLATE";
   const zipDeflateLevel = options.zipDeflateLevel ?? 9;
@@ -212,7 +227,21 @@ export async function buildParsedDataZipBlobForLayout(
       ? options.sourcePdfPages.trim()
       : undefined;
 
-  options.onBuildProgress?.(0);
+  const totalRasterTexels = encodeRasterImages
+    ? countRasterTexelsToEncode(sceneRasterLayers)
+    : 0;
+  const zipBuildStart = totalRasterTexels > 0 ? 0.4 : 0;
+  options.onBuildProgress?.(
+    0,
+    totalRasterTexels > 0
+      ? {
+          stage: "raster-encode",
+          unit: "texels",
+          processed: 0,
+          total: totalRasterTexels
+        }
+      : { stage: "zip-build" }
+  );
   const zip = new JSZip();
   const textureEntries = buildTextureExportEntries(scene, sceneStats, textureLayout);
   const includeSourcePdf = !!sourcePdfBytes && sourcePdfBytes.length > 0 && scene.imagePaintOpCount > 0;
@@ -221,6 +250,7 @@ export async function buildParsedDataZipBlobForLayout(
   const sourcePdfFile = useSourcePdfFallback ? "source/source.pdf" : undefined;
 
   for (const entry of textureEntries) {
+    throwIfBuildAborted(options.signal);
     const bytes = serializeTextureExportEntry(entry);
     zip.file(entry.filePath, bytes);
   }
@@ -264,34 +294,75 @@ export async function buildParsedDataZipBlobForLayout(
   }
 
   const serializedRasterLayers: SerializedRasterLayerEntry[] = [];
+  let encodedRasterTexels = 0;
   for (let i = 0; i < rasterLayers.length; i += 1) {
+    throwIfBuildAborted(options.signal);
     const layer = rasterLayers[i];
     const expectedBytes = layer.width * layer.height * 4;
+    if (
+      !Number.isSafeInteger(expectedBytes) ||
+      layer.width <= 0 ||
+      layer.height <= 0 ||
+      !(layer.data instanceof Uint8Array) ||
+      layer.data.byteLength < expectedBytes
+    ) {
+      throw new Error(`Raster layer ${i} has invalid dimensions or insufficient RGBA data.`);
+    }
+    const serializedMatrix = Array.from(layer.matrix);
+    if (
+      serializedMatrix.length !== 6 ||
+      serializedMatrix.some((component) => !Number.isFinite(component))
+    ) {
+      throw new Error(`Raster layer ${i} has an invalid transform matrix.`);
+    }
     const rasterBytes = layer.data.subarray(0, expectedBytes);
     let filePath = `raster/layer-${i}.rgba`;
     let encoding: "webp" | "png" | "rgba" = "rgba";
     let layerBytes: Uint8Array = rasterBytes;
     if (encodeRasterImages) {
-      const encodedImage = await encodeRasterLayerAsBestImage(layer.width, layer.height, rasterBytes);
+      const encodedImage = await encodeRasterRgbaAsBestImage(
+        layer.width,
+        layer.height,
+        rasterBytes
+      );
+      throwIfBuildAborted(options.signal);
       if (encodedImage) {
-        filePath = `raster/layer-${i}.${encodedImage.extension}`;
+        filePath = `raster/layer-${i}.${encodedImage.encoding}`;
         encoding = encodedImage.encoding;
         layerBytes = encodedImage.bytes;
       }
     }
-    zip.file(filePath, layerBytes, { compression: "STORE" });
+    if (encoding === "rgba") {
+      zip.file(filePath, layerBytes);
+    } else {
+      // WebP and PNG already carry entropy compression; deflating them again
+      // wastes export time and normally cannot recover meaningful bytes.
+      zip.file(filePath, layerBytes, { compression: "STORE" });
+    }
     serializedRasterLayers.push({
       width: layer.width,
       height: layer.height,
-      matrix: Array.from(layer.matrix),
+      matrix: serializedMatrix,
       file: filePath,
       encoding,
       paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
       pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
     });
-    options.onBuildProgress?.(0.4 * ((i + 1) / rasterLayers.length));
+    if (encodeRasterImages) {
+      encodedRasterTexels += layer.width * layer.height;
+      options.onBuildProgress?.(
+        0.4 * (encodedRasterTexels / totalRasterTexels),
+        {
+          stage: "raster-encode",
+          unit: "texels",
+          processed: encodedRasterTexels,
+          total: totalRasterTexels
+        }
+      );
+    }
   }
-  options.onBuildProgress?.(0.4);
+  throwIfBuildAborted(options.signal);
+  options.onBuildProgress?.(zipBuildStart, { stage: "zip-build" });
 
   const manifest = {
     formatVersion: PARSED_DATA_FORMAT_VERSION,
@@ -368,6 +439,7 @@ export async function buildParsedDataZipBlobForLayout(
     }))
   };
 
+  throwIfBuildAborted(options.signal);
   zip.file("manifest.json", JSON.stringify(manifest, null, 2));
   const zipGenerateOptions =
     zipCompression === "DEFLATE"
@@ -383,10 +455,17 @@ export async function buildParsedDataZipBlobForLayout(
           mimeType: "application/zip"
         };
 
-  const zipBlob = await zip.generateAsync(zipGenerateOptions, (metadata) => {
-    options.onBuildProgress?.(0.4 + 0.6 * (metadata.percent / 100));
-  });
-  options.onBuildProgress?.(1);
+  const onZipProgress = (metadata: { percent: number }): void => {
+    options.onBuildProgress?.(
+      zipBuildStart + (1 - zipBuildStart) * (metadata.percent / 100),
+      { stage: "zip-build" }
+    );
+  };
+  const zipBlob = options.signal
+    ? await generateZipBlobWithAbort(zip, zipGenerateOptions, options.signal, onZipProgress)
+    : await zip.generateAsync(zipGenerateOptions, onZipProgress);
+  throwIfBuildAborted(options.signal);
+  options.onBuildProgress?.(1, { stage: "zip-build" });
 
   return {
     blob: zipBlob,
@@ -397,8 +476,88 @@ export async function buildParsedDataZipBlobForLayout(
   };
 }
 
+function countRasterTexelsToEncode(rasterLayers: readonly RasterLayer[]): number {
+  let total = 0;
+  for (let i = 0; i < rasterLayers.length; i += 1) {
+    const layer = rasterLayers[i];
+    const texels = layer.width * layer.height;
+    if (
+      !Number.isSafeInteger(layer.width) ||
+      !Number.isSafeInteger(layer.height) ||
+      layer.width <= 0 ||
+      layer.height <= 0 ||
+      !Number.isSafeInteger(texels)
+    ) {
+      throw new Error(`Raster layer ${i} has invalid dimensions.`);
+    }
+    total += texels;
+    if (!Number.isSafeInteger(total)) {
+      throw new Error("Raster layers contain too many texels to encode safely.");
+    }
+  }
+  return total;
+}
+
+function throwIfBuildAborted(signal: AbortSignal | undefined): void {
+  signal?.throwIfAborted();
+}
+
+async function generateZipBlobWithAbort(
+  zip: JSZip,
+  options: JSZip.JSZipGeneratorOptions<"blob">,
+  signal: AbortSignal,
+  onProgress: (metadata: JSZip.JSZipMetadata) => void
+): Promise<Blob> {
+  throwIfBuildAborted(signal);
+  const stream = zip.generateInternalStream(options);
+
+  return new Promise<Blob>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => {
+      stream.pause();
+      finish(() => {
+        try {
+          signal.throwIfAborted();
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        reject(new DOMException("The parsed ZIP build was aborted.", "AbortError"));
+      });
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    stream.accumulate((metadata) => {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      onProgress(metadata);
+    }).then(
+      (blob) => finish(() => resolve(blob)),
+      (error: unknown) => finish(() => reject(error))
+    );
+  });
+}
+
 /** v6 adds first-class analytic gradient and soft-mask paint resources. */
 const PARSED_DATA_FORMAT_VERSION = 6;
+const MAX_PARSED_RASTER_LAYER_COUNT = 4_096;
+const MAX_PARSED_RASTER_DIMENSION = 16_384;
+const MAX_PARSED_RASTER_TEXELS_PER_LAYER = 134_217_728;
+const MAX_PARSED_RASTER_PAYLOAD_BYTES = 768 * 1024 * 1024;
+const MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES = 1024 * 1024 * 1024;
+const MAX_PARSED_RASTER_TOTAL_TEXELS = 2 * MAX_PARSED_RASTER_TEXELS_PER_LAYER;
+const MAX_EMBEDDED_SOURCE_PDF_BYTES = 512 * 1024 * 1024;
+const MAX_PARSED_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
@@ -1099,6 +1258,10 @@ export async function loadSceneFromParsedDataZip(
   if (!manifestFile) {
     throw new Error("Parsed data zip is missing manifest.json.");
   }
+  const manifestByteLength = readZipEntryUncompressedSize(manifestFile);
+  if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
+    throw new Error("Parsed data manifest size is invalid or exceeds the memory budget.");
+  }
 
   const manifestJson = await progress.child(0.16, 0.22, { sourceType: "zip" }).withIndeterminateProgress(
     manifestFile.async("string"),
@@ -1112,10 +1275,9 @@ export async function loadSceneFromParsedDataZip(
     throw new Error(`Invalid manifest.json: ${message}`);
   }
 
-  const formatVersion = readNonNegativeInt(manifest.formatVersion, 0);
-  if (formatVersion !== PARSED_DATA_FORMAT_VERSION) {
+  if (manifest.formatVersion !== PARSED_DATA_FORMAT_VERSION) {
     throw new Error(
-      `Parsed data zip format v${formatVersion} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}. Re-export the zip with the current version.`
+      `Parsed data zip format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}. Re-export the zip with the current version.`
     );
   }
 
@@ -1920,7 +2082,7 @@ function parsePageTextRanges(value: unknown, pageCount: number, textInstanceCoun
 }
 
 function parseMat2D(value: unknown): Float32Array | null {
-  if (!Array.isArray(value) || value.length < 6) {
+  if (!Array.isArray(value) || value.length !== 6) {
     return null;
   }
 
@@ -1931,13 +2093,20 @@ function parseMat2D(value: unknown): Float32Array | null {
       return null;
     }
     out[i] = component;
+    if (!Number.isFinite(out[i])) {
+      return null;
+    }
   }
   return out;
 }
 
 async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedDataManifest): Promise<Uint8Array | null> {
   const manifestPath = readNonEmptyString(manifest.sourcePdfFile);
-  const manifestUrl = readNonEmptyString(manifest.sourcePdfUrl);
+  const manifestSize = typeof manifest.sourcePdfSizeBytes === "number" &&
+    Number.isSafeInteger(manifest.sourcePdfSizeBytes) &&
+    manifest.sourcePdfSizeBytes > 0
+    ? manifest.sourcePdfSizeBytes
+    : null;
   const candidatePaths = [
     manifestPath,
     "source/source.pdf",
@@ -1953,6 +2122,15 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
       continue;
     }
 
+    const entrySize = readZipEntryUncompressedSize(zipEntry);
+    if (
+      entrySize === null ||
+      entrySize > MAX_EMBEDDED_SOURCE_PDF_BYTES ||
+      (candidatePath === manifestPath && manifestSize !== null && entrySize !== manifestSize)
+    ) {
+      throw new Error("Embedded source PDF size is invalid or exceeds the memory budget.");
+    }
+
     const fileBuffer = await zipEntry.async("arraybuffer");
     const bytes = new Uint8Array(fileBuffer);
     if (hasPdfHeader(bytes)) {
@@ -1960,262 +2138,7 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
     }
   }
 
-  if (manifestUrl) {
-    try {
-      const response = await fetch(resolveAppAssetUrl(manifestUrl));
-      if (response.ok) {
-        const fileBuffer = await response.arrayBuffer();
-        const bytes = new Uint8Array(fileBuffer);
-        if (hasPdfHeader(bytes)) {
-          return bytes;
-        }
-      }
-    } catch {
-      // Best-effort fallback only.
-    }
-  }
-
   return null;
-}
-
-interface EncodedRasterImage {
-  bytes: Uint8Array;
-  encoding: "webp" | "png";
-  extension: "webp" | "png";
-}
-
-interface NodeRasterCanvasContext {
-  putImageData: (imageData: unknown, x: number, y: number) => void;
-  drawImage: (image: unknown, x: number, y: number) => void;
-  getImageData: (x: number, y: number, width: number, height: number) => { data: Uint8Array | Uint8ClampedArray };
-}
-
-interface NodeRasterImageEncoder {
-  createCanvas: (width: number, height: number) => {
-    width: number;
-    height: number;
-    getContext: (kind: "2d") => NodeRasterCanvasContext | null;
-    encode: (format: "png" | "webp") => Promise<Uint8Array>;
-  };
-  ImageData: new (data: Uint8ClampedArray, width: number, height: number) => unknown;
-  loadImage?: (encoded: Uint8Array) => Promise<{ width: number; height: number }>;
-}
-
-let cachedNodeRasterImageEncoder: NodeRasterImageEncoder | null | undefined;
-
-async function encodeRasterLayerAsBestImage(width: number, height: number, rgba: Uint8Array): Promise<EncodedRasterImage | null> {
-  const [webp, png] = await Promise.all([
-    encodeRasterLayerAsImage(width, height, rgba, "image/webp"),
-    encodeRasterLayerAsImage(width, height, rgba, "image/png")
-  ]);
-
-  if (!webp && !png) {
-    return null;
-  }
-  if (webp && !png) {
-    return { bytes: webp, encoding: "webp", extension: "webp" };
-  }
-  if (png && !webp) {
-    return { bytes: png, encoding: "png", extension: "png" };
-  }
-
-  if (!webp || !png) {
-    return null;
-  }
-  return webp.byteLength < png.byteLength
-    ? { bytes: webp, encoding: "webp", extension: "webp" }
-    : { bytes: png, encoding: "png", extension: "png" };
-}
-
-async function encodeRasterLayerAsImage(
-  width: number,
-  height: number,
-  rgba: Uint8Array,
-  mimeType: "image/png" | "image/webp"
-): Promise<Uint8Array | null> {
-  if (typeof document === "undefined") {
-    return encodeRasterLayerAsNodeImage(width, height, rgba, mimeType);
-  }
-
-  const expectedBytes = width * height * 4;
-  if (width <= 0 || height <= 0 || rgba.length < expectedBytes) {
-    return null;
-  }
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-
-  const context = canvas.getContext("2d", { alpha: true });
-  if (!context) {
-    canvas.width = 0;
-    canvas.height = 0;
-    return null;
-  }
-
-  const clamped = new Uint8ClampedArray(expectedBytes);
-  clamped.set(rgba.subarray(0, expectedBytes));
-  const imageData = new ImageData(clamped, width, height);
-  context.putImageData(imageData, 0, 0);
-
-  const blob = await new Promise<Blob | null>((resolve) => {
-    canvas.toBlob(resolve, mimeType);
-  });
-  canvas.width = 0;
-  canvas.height = 0;
-  if (!blob) {
-    return null;
-  }
-
-  const buffer = await blob.arrayBuffer();
-  return new Uint8Array(buffer);
-}
-
-async function encodeRasterLayerAsNodeImage(
-  width: number,
-  height: number,
-  rgba: Uint8Array,
-  mimeType: "image/png" | "image/webp"
-): Promise<Uint8Array | null> {
-  const expectedBytes = width * height * 4;
-  if (width <= 0 || height <= 0 || rgba.length < expectedBytes) {
-    return null;
-  }
-
-  const encoder = await getNodeRasterImageEncoder();
-  if (!encoder) {
-    return null;
-  }
-
-  const canvas = encoder.createCanvas(width, height);
-  try {
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return null;
-    }
-
-    const clamped = new Uint8ClampedArray(expectedBytes);
-    clamped.set(rgba.subarray(0, expectedBytes));
-    context.putImageData(new encoder.ImageData(clamped, width, height), 0, 0);
-    const encoded = await canvas.encode(mimeType === "image/webp" ? "webp" : "png");
-    return new Uint8Array(encoded);
-  } catch {
-    return null;
-  } finally {
-    canvas.width = 0;
-    canvas.height = 0;
-  }
-}
-
-async function getNodeRasterImageEncoder(): Promise<NodeRasterImageEncoder | null> {
-  if (cachedNodeRasterImageEncoder !== undefined) {
-    return cachedNodeRasterImageEncoder;
-  }
-
-  try {
-    const moduleName = "@napi-rs/canvas";
-    const mod = await import(
-      /* @vite-ignore */
-      moduleName
-    ) as { createCanvas?: unknown; ImageData?: unknown; loadImage?: unknown };
-    if (typeof mod.createCanvas !== "function" || typeof mod.ImageData !== "function") {
-      cachedNodeRasterImageEncoder = null;
-      return null;
-    }
-
-    cachedNodeRasterImageEncoder = {
-      createCanvas: mod.createCanvas as NodeRasterImageEncoder["createCanvas"],
-      ImageData: mod.ImageData as NodeRasterImageEncoder["ImageData"],
-      loadImage: typeof mod.loadImage === "function"
-        ? mod.loadImage as NodeRasterImageEncoder["loadImage"]
-        : undefined
-    };
-    return cachedNodeRasterImageEncoder;
-  } catch {
-    cachedNodeRasterImageEncoder = null;
-    return null;
-  }
-}
-
-function getMimeTypeForRasterPath(path: string): string | null {
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".png")) {
-    return "image/png";
-  }
-  if (lower.endsWith(".webp")) {
-    return "image/webp";
-  }
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
-    return "image/jpeg";
-  }
-  return null;
-}
-
-async function decodeRasterImageToRgba(path: string, encoded: Uint8Array): Promise<{ width: number; height: number; data: Uint8Array } | null> {
-  if (typeof document === "undefined") {
-    const decoder = await getNodeRasterImageEncoder();
-    if (!decoder?.loadImage) {
-      return null;
-    }
-    try {
-      const image = await decoder.loadImage(encoded);
-      const width = Math.max(0, Math.trunc(image.width));
-      const height = Math.max(0, Math.trunc(image.height));
-      if (width <= 0 || height <= 0) {
-        return null;
-      }
-      const canvas = decoder.createCanvas(width, height);
-      try {
-        const context = canvas.getContext("2d");
-        if (!context) {
-          return null;
-        }
-        context.drawImage(image, 0, 0);
-        const imageData = context.getImageData(0, 0, width, height);
-        return { width, height, data: new Uint8Array(imageData.data) };
-      } finally {
-        canvas.width = 0;
-        canvas.height = 0;
-      }
-    } catch {
-      return null;
-    }
-  }
-  const mimeType = getMimeTypeForRasterPath(path);
-  if (!mimeType) {
-    return null;
-  }
-
-  const encodedCopy = new Uint8Array(encoded.length);
-  encodedCopy.set(encoded);
-  const blob = new Blob([encodedCopy], { type: mimeType });
-  const bitmap = await createImageBitmap(blob);
-  try {
-    const width = bitmap.width;
-    const height = bitmap.height;
-    if (width <= 0 || height <= 0) {
-      return null;
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d", { alpha: true, willReadFrequently: true });
-    if (!context) {
-      canvas.width = 0;
-      canvas.height = 0;
-      return null;
-    }
-
-    context.drawImage(bitmap, 0, 0);
-    const imageData = context.getImageData(0, 0, width, height);
-    const rgba = new Uint8Array(imageData.data);
-    canvas.width = 0;
-    canvas.height = 0;
-    return { width, height, data: rgba };
-  } finally {
-    bitmap.close();
-  }
 }
 
 export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8Array): Promise<Uint8Array | null> {
@@ -2224,6 +2147,10 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
     const manifestFile = zip.file("manifest.json");
     let sourcePdfFile: string | null = null;
     if (manifestFile) {
+      const manifestByteLength = readZipEntryUncompressedSize(manifestFile);
+      if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
+        return null;
+      }
       const manifestJson = await manifestFile.async("string");
       try {
         const manifest = JSON.parse(manifestJson) as ParsedDataManifest;
@@ -2242,6 +2169,13 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
       if (!entry) {
         continue;
       }
+      const sourcePdfByteLength = readZipEntryUncompressedSize(entry);
+      if (
+        sourcePdfByteLength === null ||
+        sourcePdfByteLength > MAX_EMBEDDED_SOURCE_PDF_BYTES
+      ) {
+        return null;
+      }
       const fileBuffer = await entry.async("arraybuffer");
       const bytes = new Uint8Array(fileBuffer);
       if (hasPdfHeader(bytes)) {
@@ -2255,12 +2189,17 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
   return null;
 }
 
-async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataSceneEntry): Promise<RasterLayer[]> {
+async function readRasterLayersFromParsedData(
+  zip: JSZip,
+  sceneMeta: ParsedDataSceneEntry
+): Promise<RasterLayer[]> {
   const layers: RasterLayer[] = [];
-
   const sceneRasterLayers = Array.isArray(sceneMeta.rasterLayers)
     ? sceneMeta.rasterLayers
     : [];
+
+  validateRasterLayerBudgets(zip, sceneRasterLayers);
+
   for (let i = 0; i < sceneRasterLayers.length; i += 1) {
     const entry = sceneRasterLayers[i];
     if (!entry || typeof entry !== "object") {
@@ -2268,34 +2207,36 @@ async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataS
     }
 
     const layerMeta = entry as ParsedDataRasterLayerEntry;
-    const width = readNonNegativeInt(layerMeta.width, 0);
-    const height = readNonNegativeInt(layerMeta.height, 0);
+    const width = readPositiveSafeMetadataInteger(layerMeta.width);
+    const height = readPositiveSafeMetadataInteger(layerMeta.height);
     const path = readNonEmptyString(layerMeta.file);
     const matrix = parseMat2D(layerMeta.matrix);
     const paintOrder = layerMeta.paintOrder;
     const pageIndex = layerMeta.pageIndex;
     if (
-      width <= 0 ||
-      height <= 0 ||
+      width === null ||
+      height === null ||
       !path ||
       !matrix ||
       typeof paintOrder !== "number" ||
-      !Number.isFinite(paintOrder) ||
+      !Number.isSafeInteger(paintOrder) ||
       paintOrder < 0 ||
       typeof pageIndex !== "number" ||
-      !Number.isInteger(pageIndex) ||
+      !Number.isSafeInteger(pageIndex) ||
       pageIndex < 0
     ) {
       throw new Error(`Raster layer ${i} has incomplete or invalid v6 metadata.`);
     }
+
     const decoded = await readRasterLayerFromZip(zip, path, width, height);
     if (!decoded) {
       throw new Error(`Parsed data zip is missing or cannot decode raster layer ${i}: ${path}.`);
     }
+    const expectedByteLength = width * height * 4;
     if (
       decoded.width !== width ||
       decoded.height !== height ||
-      decoded.data.length < width * height * 4
+      decoded.data.byteLength !== expectedByteLength
     ) {
       throw new Error(`Raster layer ${i} dimensions do not match its v6 metadata.`);
     }
@@ -2326,31 +2267,114 @@ async function readRasterLayerFromZip(
 
   const buffer = await zipEntry.async("arraybuffer");
   const bytes = new Uint8Array(buffer);
+  const imageEncoding = rasterImageEncodingFromPath(path);
+  if (imageEncoding) {
+    const metadata = inspectRasterImage(imageEncoding, bytes);
+    if (
+      !metadata ||
+      metadata.width !== widthHint ||
+      metadata.height !== heightHint
+    ) {
+      throw new Error(
+        `Raster image ${path} header dimensions do not match its v6 metadata.`
+      );
+    }
 
-  const decodedImage = await decodeRasterImageToRgba(path, bytes);
-  if (decodedImage) {
+    const decodedImage = await decodeRasterImageToRgba(imageEncoding, bytes);
+    if (!decodedImage) {
+      throw new Error(
+        `Unable to decode raster image ${path}; the image is invalid or no compatible image decoder is available.`
+      );
+    }
     return decodedImage;
   }
 
-  if (getMimeTypeForRasterPath(path)) {
-    throw new Error(
-      `Unable to decode raster image ${path}; the image is invalid or no compatible image decoder is available.`
-    );
-  }
-
-  if (widthHint <= 0 || heightHint <= 0) {
-    return null;
-  }
-
   const expectedLength = widthHint * heightHint * 4;
-  if (bytes.length < expectedLength) {
-    throw new Error(`Raster layer data is truncated (${bytes.length} < ${expectedLength}).`);
+  if (bytes.byteLength !== expectedLength) {
+    throw new Error(
+      `Raster layer data size does not match its metadata (${bytes.byteLength} !== ${expectedLength}).`
+    );
   }
   return {
     width: widthHint,
     height: heightHint,
-    data: bytes.length === expectedLength ? bytes : bytes.slice(0, expectedLength)
+    data: bytes
   };
+}
+
+/**
+ * Bound raster allocation using central-directory sizes before inflating or
+ * decoding any entry. Parsed ZIPs may come from untrusted drag-and-drop input.
+ */
+function validateRasterLayerBudgets(
+  zip: JSZip,
+  sceneRasterLayers: unknown[]
+): void {
+  if (sceneRasterLayers.length > MAX_PARSED_RASTER_LAYER_COUNT) {
+    throw new Error(
+      `Parsed data contains ${sceneRasterLayers.length} raster layers; ` +
+      `the limit is ${MAX_PARSED_RASTER_LAYER_COUNT}.`
+    );
+  }
+
+  let totalPayloadBytes = 0;
+  let totalTexels = 0;
+  for (let i = 0; i < sceneRasterLayers.length; i += 1) {
+    const entry = sceneRasterLayers[i];
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`Raster layer ${i} has invalid metadata.`);
+    }
+
+    const layerMeta = entry as ParsedDataRasterLayerEntry;
+    const width = readPositiveSafeMetadataInteger(layerMeta.width);
+    const height = readPositiveSafeMetadataInteger(layerMeta.height);
+    const path = readNonEmptyString(layerMeta.file);
+    const texels = width !== null && height !== null ? width * height : 0;
+    if (
+      width === null ||
+      height === null ||
+      width > MAX_PARSED_RASTER_DIMENSION ||
+      height > MAX_PARSED_RASTER_DIMENSION ||
+      !Number.isSafeInteger(texels) ||
+      texels > MAX_PARSED_RASTER_TEXELS_PER_LAYER ||
+      !path
+    ) {
+      throw new Error(`Raster layer ${i} has inconsistent v6 texture metadata.`);
+    }
+
+    const zipEntry = zip.file(path);
+    if (!zipEntry) {
+      throw new Error(`Parsed data zip is missing raster layer ${i}: ${path}.`);
+    }
+    const byteLength = readZipEntryUncompressedSize(zipEntry);
+    if (
+      byteLength === null ||
+      byteLength > MAX_PARSED_RASTER_PAYLOAD_BYTES
+    ) {
+      throw new Error(
+        `Raster layer ${i} ZIP entry size is invalid or exceeds the memory budget.`
+      );
+    }
+
+    if (rasterImageEncodingFromPath(path) === null && byteLength !== texels * 4) {
+      throw new Error(`Raster layer ${i} raw byte length does not match its metadata.`);
+    }
+
+    totalPayloadBytes += byteLength;
+    totalTexels += texels;
+    if (
+      totalPayloadBytes > MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES ||
+      totalTexels > MAX_PARSED_RASTER_TOTAL_TEXELS
+    ) {
+      throw new Error("Parsed data raster payloads exceed the aggregate memory budget.");
+    }
+  }
+}
+
+function readPositiveSafeMetadataInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : null;
 }
 
 function computeMaxHalfWidth(styles: Float32Array, segmentCount: number): number {
@@ -2372,6 +2396,13 @@ function readNonNegativeInt(value: unknown, fallback: number): number {
     return Math.max(0, Math.trunc(fallback));
   }
   return Math.max(0, Math.trunc(number));
+}
+
+function readZipEntryUncompressedSize(entry: unknown): number | null {
+  const value = (entry as { _data?: { uncompressedSize?: unknown } })._data?.uncompressedSize;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -2737,22 +2768,6 @@ function readQuantizationVector(value: unknown, textureName: string, label: stri
     out[i] = number;
   }
   return out;
-}
-
-const ABSOLUTE_URL_PATTERN = /^[a-z][a-z\d+.-]*:/i;
-const APP_BASE_URL = new URL(
-  import.meta.env.BASE_URL,
-  typeof window !== "undefined" ? window.location.href : "file:///"
-);
-
-function resolveAppAssetUrl(inputPath: string): string {
-  const trimmedPath = inputPath.trim();
-  if (ABSOLUTE_URL_PATTERN.test(trimmedPath)) {
-    return trimmedPath;
-  }
-
-  const normalizedPath = trimmedPath.replace(/^\/+/, "");
-  return new URL(normalizedPath, APP_BASE_URL).toString();
 }
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {

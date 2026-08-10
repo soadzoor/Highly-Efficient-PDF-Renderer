@@ -237,6 +237,7 @@ let lastLoadTimingText = "-";
 let renderedFrameSerial = 0;
 let touchControlsAvailable = hasTouchCapability();
 let isDropDragActive = false;
+let activeParsedZipExportController: AbortController | null = null;
 const pendingRenderedFrameResolvers: Array<() => void> = [];
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 const exampleDropdown = createExampleDropdown({
@@ -758,6 +759,8 @@ function disposeExample(): void {
     return;
   }
   lifetimeAbortController.abort();
+  activeParsedZipExportController?.abort();
+  activeParsedZipExportController = null;
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
@@ -783,6 +786,7 @@ async function loadSource(
   source: File | string,
   options: { pdfDownloadHint?: PdfDownloadSource | null } = {}
 ): Promise<void> {
+  cancelActiveParsedZipExport();
   const activeLoadToken = ++loadToken;
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
@@ -1056,7 +1060,8 @@ function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): voi
 
 function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
   downloadPdfButtonElement.hidden = !hasPdf;
-  downloadPdfButtonElement.disabled = !hasPdf || isBusy;
+  downloadPdfButtonElement.disabled =
+    !hasPdf || isBusy || activeParsedZipExportController !== null;
   downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
 }
 
@@ -1123,29 +1128,99 @@ async function downloadParsedDataZip(): Promise<boolean> {
     setStatus("No parsed floorplan data available to export.");
     return false;
   }
+  if (activeParsedZipExportController !== null) {
+    return false;
+  }
 
+  const sourcePdf =
+    pdfObject.sourceKind === "pdf" && lastLoadedSource
+      ? lastLoadedSource
+      : lastDownloadablePdf?.bytes ??
+        lastDownloadablePdf?.blob ??
+        lastDownloadablePdf?.url;
+
+  const exportController = new AbortController();
+  activeParsedZipExportController = exportController;
   setDownloadDataButtonState(true, true);
+  setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+  setLoadControlsEnabled(false);
+  backendSelectElement.disabled = true;
+  vectorLodSelectElement.disabled = true;
+  setLoadingProgress(true, "0.00% Preparing parsed ZIP export...");
   try {
+    await yieldToBrowserPaint();
     const zipBlob = await buildParsedDataZip(pdfObject.sceneData, {
       sourceLabel: pdfObject.sourceLabel,
-      sourcePdf:
-        pdfObject.sourceKind === "pdf" && lastLoadedSource
-          ? lastLoadedSource
-          : lastDownloadablePdf?.bytes ??
-            lastDownloadablePdf?.blob ??
-            lastDownloadablePdf?.url
+      signal: exportController.signal,
+      onProgress: (progress) => {
+        if (activeParsedZipExportController !== exportController) {
+          return;
+        }
+        const stageLabel = formatLoadProgressStage(progress.stage);
+        const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
+        setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
+      },
+      sourcePdf
     });
+
+    if (activeParsedZipExportController !== exportController) {
+      return false;
+    }
 
     const zipFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.zip`;
     triggerBrowserDownload(zipBlob, zipFileName);
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Failed to download parsed data: ${message}`);
+    if (activeParsedZipExportController === exportController) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Failed to download parsed data: ${message}`);
+    }
     return false;
   } finally {
-    setDownloadDataButtonState(Boolean(currentPdfObject), false);
+    if (activeParsedZipExportController === exportController) {
+      activeParsedZipExportController = null;
+      setLoadingProgress(false);
+      setLoadControlsEnabled(true);
+      backendSelectElement.disabled = false;
+      vectorLodSelectElement.disabled = false;
+      setDownloadDataButtonState(Boolean(currentPdfObject), false);
+      setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+    }
   }
+}
+
+function cancelActiveParsedZipExport(): void {
+  const controller = activeParsedZipExportController;
+  if (!controller) {
+    return;
+  }
+  activeParsedZipExportController = null;
+  controller.abort();
+  setLoadingProgress(false);
+  setLoadControlsEnabled(true);
+  backendSelectElement.disabled = false;
+  vectorLodSelectElement.disabled = false;
+  setDownloadDataButtonState(Boolean(currentPdfObject), false);
+  setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+}
+
+function yieldToBrowserPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let animationFrame = 0;
+    let fallbackTimer = 0;
+    const finish = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.cancelAnimationFrame(animationFrame);
+      window.clearTimeout(fallbackTimer);
+      resolve();
+    };
+    animationFrame = window.requestAnimationFrame(finish);
+    fallbackTimer = window.setTimeout(finish, 100);
+  });
 }
 
 async function downloadSourcePdf(): Promise<boolean> {

@@ -351,8 +351,12 @@ let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
 let loadToken = 0;
+let activeSceneLoadToken: number | null = null;
+let pendingSourceLoadCount = 0;
+let sourceLoadSerial = 0;
 let isDropDragActive = false;
 let isBatchExampleExportRunning = false;
+let activeParsedZipExportController: AbortController | null = null;
 
 const pageQuery = new URLSearchParams(window.location.search);
 const bulkZipExportEnabled = pageQuery.get("bulkZip") === "1" || pageQuery.get("downloadAllZips") === "1";
@@ -416,6 +420,10 @@ backendSwitcher = createBackendSwitcher({
   resetPointerInteractionState: () => {
     canvasInteractionController.resetState();
   },
+  isOperationActive: () =>
+    pendingSourceLoadCount > 0 ||
+    activeSceneLoadToken !== null ||
+    activeParsedZipExportController !== null,
   getSceneSnapshot: () => ({
     scene: lastParsedScene,
     label: lastParsedSceneLabel,
@@ -465,6 +473,10 @@ downloadPdfButtonElement.addEventListener("click", () => {
 downloadAllDataButtonElement.addEventListener("click", () => {
   void downloadAllExampleParsedZips();
 });
+
+window.addEventListener("beforeunload", () => {
+  activeParsedZipExportController?.abort();
+}, { once: true });
 
 toggleHudButtonElement.addEventListener("click", () => {
   const currentlyCollapsed = hudPanelElement.classList.contains("collapsed");
@@ -657,6 +669,8 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     return;
   }
 
+  cancelActiveParsedZipExport();
+  const sourceLoadToken = beginSourceLoad();
   exampleDropdown.setDisabled(true);
   try {
     const modeLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
@@ -667,6 +681,9 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     }
 
     const fileBuffer = await response.arrayBuffer();
+    if (!isCurrentSourceLoad(sourceLoadToken)) {
+      return;
+    }
     const bytes = cloneSourceBytes(fileBuffer);
     parsedPdfPageCache = null;
 
@@ -701,9 +718,13 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
       });
     }
   } catch (error) {
+    if (!isCurrentSourceLoad(sourceLoadToken)) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load example: ${message}`);
   } finally {
+    finishSourceLoad();
     exampleDropdown.setDisabled(false);
   }
 }
@@ -723,37 +744,62 @@ function isParsedDataZipFile(file: File): boolean {
 }
 
 async function loadPdfFile(file: File): Promise<void> {
-  setStatus(`Reading ${file.name}...`);
-  setDownloadPdfButtonState(false);
-  const buffer = await file.arrayBuffer();
-  const bytes = cloneSourceBytes(buffer);
-  lastLoadedSource = { kind: "pdf", bytes, label: file.name };
-  lastDownloadablePdf = { label: file.name, bytes };
-  setDownloadPdfButtonState(true);
-  parsedPdfPageCache = null;
-  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+  cancelActiveParsedZipExport();
+  const sourceLoadToken = beginSourceLoad();
+  try {
+    setStatus(`Reading ${file.name}...`);
+    setDownloadPdfButtonState(false);
+    const buffer = await file.arrayBuffer();
+    if (!isCurrentSourceLoad(sourceLoadToken)) {
+      return;
+    }
+    const bytes = cloneSourceBytes(buffer);
+    lastLoadedSource = { kind: "pdf", bytes, label: file.name };
+    lastDownloadablePdf = { label: file.name, bytes };
+    setDownloadPdfButtonState(true);
+    parsedPdfPageCache = null;
+    await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+  } finally {
+    finishSourceLoad();
+  }
 }
 
 async function loadParsedDataZipFile(file: File): Promise<void> {
-  setStatus(`Reading ${file.name}...`);
-  lastDownloadablePdf = null;
-  setDownloadPdfButtonState(false);
-  const buffer = await file.arrayBuffer();
-  const bytes = cloneSourceBytes(buffer);
-  lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
-  parsedPdfPageCache = null;
-  await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
-  if (lastLoadedSource?.bytes === bytes) {
-    const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(bytes);
-    if (sourcePdfBytes && sourcePdfBytes.length > 0) {
-      lastDownloadablePdf = { label: file.name, bytes: sourcePdfBytes };
-      setDownloadPdfButtonState(true);
+  cancelActiveParsedZipExport();
+  const sourceLoadToken = beginSourceLoad();
+  try {
+    setStatus(`Reading ${file.name}...`);
+    lastDownloadablePdf = null;
+    setDownloadPdfButtonState(false);
+    const buffer = await file.arrayBuffer();
+    if (!isCurrentSourceLoad(sourceLoadToken)) {
+      return;
     }
+    const bytes = cloneSourceBytes(buffer);
+    lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
+    parsedPdfPageCache = null;
+    await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+    if (isCurrentSourceLoad(sourceLoadToken) && lastLoadedSource?.bytes === bytes) {
+      const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(bytes);
+      if (sourcePdfBytes && sourcePdfBytes.length > 0) {
+        lastDownloadablePdf = { label: file.name, bytes: sourcePdfBytes };
+        setDownloadPdfButtonState(true);
+      }
+    }
+  } finally {
+    finishSourceLoad();
   }
 }
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
-  const activeLoadToken = ++loadToken;
+  const activeLoadToken = await backendSwitcher!.runWhenIdle(() => {
+    const nextLoadToken = ++loadToken;
+    beginSceneLoad(nextLoadToken);
+    return nextLoadToken;
+  });
+  if (activeLoadToken !== loadToken) {
+    return;
+  }
   const loadStart = performance.now();
   const extractionOptions = getExtractionOptions();
   const pageSceneOptionsKey = buildPdfPageCacheKey();
@@ -832,11 +878,12 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "pdf" });
     const uploadStart = performance.now();
-    const sceneStats = renderer.setScene(scene);
+    const targetRenderer = renderer;
+    const sceneStats = targetRenderer.setScene(scene);
     const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     if (!options.preserveView) {
-      renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
+      targetRenderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
@@ -873,6 +920,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     setStatus(`Failed to render PDF: ${message}`);
     runtimeTextElement.textContent = "";
     setMetricPlaceholder(label);
+  } finally {
+    finishSceneLoad(activeLoadToken);
   }
 }
 
@@ -884,7 +933,14 @@ async function reloadLastPdfWithCurrentOptions(): Promise<void> {
 }
 
 async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
-  const activeLoadToken = ++loadToken;
+  const activeLoadToken = await backendSwitcher!.runWhenIdle(() => {
+    const nextLoadToken = ++loadToken;
+    beginSceneLoad(nextLoadToken);
+    return nextLoadToken;
+  });
+  if (activeLoadToken !== loadToken) {
+    return;
+  }
   const loadStart = performance.now();
   const progress = createLoadProgressReporter((payload) => {
     if (activeLoadToken === loadToken) {
@@ -929,11 +985,12 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     }
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "zip" });
     const uploadStart = performance.now();
-    const sceneStats = renderer.setScene(scene);
+    const targetRenderer = renderer;
+    const sceneStats = targetRenderer.setScene(scene);
     const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     if (!options.preserveView) {
-      renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
+      targetRenderer.fitToBounds(resolveSceneFitBounds(scene), 64);
     }
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
@@ -970,6 +1027,8 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     setStatus(`Failed to load parsed data zip: ${message}`);
     runtimeTextElement.textContent = "";
     setMetricPlaceholder(label);
+  } finally {
+    finishSceneLoad(activeLoadToken);
   }
 }
 
@@ -1092,6 +1151,42 @@ function setParsingLoader(isVisible: boolean, text = "0.00% Parsing / loading...
   parsingLoaderTextElement.textContent = isVisible ? text : "";
 }
 
+function beginSceneLoad(token: number): void {
+  activeSceneLoadToken = token;
+  updateBackendSelectDisabledState();
+}
+
+function beginSourceLoad(): number {
+  pendingSourceLoadCount += 1;
+  sourceLoadSerial += 1;
+  updateBackendSelectDisabledState();
+  return sourceLoadSerial;
+}
+
+function isCurrentSourceLoad(token: number): boolean {
+  return token === sourceLoadSerial;
+}
+
+function finishSourceLoad(): void {
+  pendingSourceLoadCount = Math.max(0, pendingSourceLoadCount - 1);
+  updateBackendSelectDisabledState();
+}
+
+function finishSceneLoad(token: number): void {
+  if (activeSceneLoadToken !== token) {
+    return;
+  }
+  activeSceneLoadToken = null;
+  updateBackendSelectDisabledState();
+}
+
+function updateBackendSelectDisabledState(): void {
+  backendSelectElement.disabled =
+    pendingSourceLoadCount > 0 ||
+    activeSceneLoadToken !== null ||
+    activeParsedZipExportController !== null;
+}
+
 function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
   const stageLabel = formatLoadProgressStage(progress.stage);
   const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
@@ -1147,7 +1242,11 @@ function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): voi
 
 function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
   downloadPdfButtonElement.hidden = !hasPdf;
-  downloadPdfButtonElement.disabled = !hasPdf || isBusy || isBatchExampleExportRunning;
+  downloadPdfButtonElement.disabled =
+    !hasPdf ||
+    isBusy ||
+    isBatchExampleExportRunning ||
+    activeParsedZipExportController !== null;
   downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
 }
 
@@ -1173,7 +1272,14 @@ function setHudCollapsed(collapsed: boolean): void {
 }
 
 async function downloadAllExampleParsedZips(): Promise<void> {
-  if (!bulkZipExportEnabled || isBatchExampleExportRunning) {
+  if (
+    !bulkZipExportEnabled ||
+    isBatchExampleExportRunning ||
+    activeParsedZipExportController !== null ||
+    pendingSourceLoadCount > 0 ||
+    activeSceneLoadToken !== null ||
+    backendSwitcher?.isSwitchInFlight() === true
+  ) {
     return;
   }
 
@@ -1184,68 +1290,137 @@ async function downloadAllExampleParsedZips(): Promise<void> {
   }
 
   isBatchExampleExportRunning = true;
+  const exportController = new AbortController();
+  activeParsedZipExportController = exportController;
   setPrimaryLoadControlsEnabled(false);
+  updateBackendSelectDisabledState();
   setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(true, true, `Exporting 0/${pdfEntries.length}...`);
+  setParsingLoader(true, "0.00% Preparing parsed ZIP export...");
 
   try {
+    await yieldToBrowserPaint();
     for (let index = 0; index < pdfEntries.length; index += 1) {
+      exportController.signal.throwIfAborted();
       const entry = pdfEntries[index];
       const step = index + 1;
       setDownloadAllDataButtonState(true, true, `Exporting ${step}/${pdfEntries.length}...`);
       setStatus(`Batch ${step}/${pdfEntries.length}: loading ${entry.name}...`);
 
-      const response = await fetch(entry.pdfPath, { cache: "no-store" });
+      const response = await fetch(entry.pdfPath, {
+        cache: "no-store",
+        signal: exportController.signal
+      });
       if (!response.ok) {
         throw new Error(`${entry.name}: HTTP ${response.status}`);
       }
 
       const bytes = cloneSourceBytes(await response.arrayBuffer());
-      const zipBlob = await buildParsedDataZip(bytes, { sourceLabel: entry.name });
+      const zipBlob = await buildParsedDataZip(bytes, {
+        sourceLabel: entry.name,
+        signal: exportController.signal,
+        onProgress: (progress) => {
+          if (activeParsedZipExportController !== exportController) {
+            return;
+          }
+          const overallValue = (index + progress.value) / pdfEntries.length;
+          const stageLabel = formatLoadProgressStage(progress.stage);
+          setParsingLoader(
+            true,
+            `${(overallValue * 100).toFixed(2)}% ${stageLabel} (${step}/${pdfEntries.length})`
+          );
+        }
+      });
       const zipFileName = `${sanitizeDownloadName(entry.name)}-parsed-data.zip`;
       setStatus(`Batch ${step}/${pdfEntries.length}: downloading ${entry.name} parsed ZIP...`);
       triggerBrowserDownload(zipBlob, zipFileName);
       await delayMilliseconds(200);
     }
 
-    setStatus(`Batch export complete: ${pdfEntries.length.toLocaleString()} parsed ZIP files downloaded.`);
+    if (activeParsedZipExportController === exportController) {
+      setStatus(`Batch export complete: ${pdfEntries.length.toLocaleString()} parsed ZIP files downloaded.`);
+    }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Batch export failed: ${message}`);
+    if (activeParsedZipExportController === exportController) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Batch export failed: ${message}`);
+    }
   } finally {
-    isBatchExampleExportRunning = false;
-    setPrimaryLoadControlsEnabled(true);
-    setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
-    setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
-    setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+    const ownsExportUi = activeParsedZipExportController === exportController;
+    if (ownsExportUi) {
+      activeParsedZipExportController = null;
+      setParsingLoader(false);
+    }
+    if (ownsExportUi) {
+      isBatchExampleExportRunning = false;
+      setPrimaryLoadControlsEnabled(true);
+      updateBackendSelectDisabledState();
+      setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
+      setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+      setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+    }
   }
 }
 
 async function downloadParsedDataZip(): Promise<boolean> {
+  if (backendSwitcher?.isSwitchInFlight()) {
+    setStatus("Wait for the renderer backend switch to finish before exporting parsed data.");
+    return false;
+  }
+  if (activeSceneLoadToken !== null) {
+    setStatus("Wait for the current document load to finish before exporting parsed data.");
+    return false;
+  }
+  if (pendingSourceLoadCount > 0) {
+    setStatus("Wait for the current source read to finish before exporting parsed data.");
+    return false;
+  }
   if (!lastParsedScene || !lastParsedSceneLabel) {
     setStatus("No parsed floorplan data available to export.");
+    return false;
+  }
+  if (activeParsedZipExportController !== null) {
     return false;
   }
 
   const scene = lastParsedScene;
   const label = lastParsedSceneLabel;
+  const sourcePdf =
+    lastLoadedSource?.kind === "pdf"
+      ? lastLoadedSource.bytes
+      : lastDownloadablePdf?.bytes ??
+        lastDownloadablePdf?.blob ??
+        lastDownloadablePdf?.url;
   const previousStatusText = statusTextElement.textContent;
 
+  const exportController = new AbortController();
+  activeParsedZipExportController = exportController;
   setDownloadDataButtonState(true, true);
+  setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+  setDownloadAllDataButtonState(exampleManifestEntries.length > 0, true, "Export in progress...");
+  setPrimaryLoadControlsEnabled(false);
+  updateBackendSelectDisabledState();
   statusTextElement.hidden = false;
   statusTextElement.textContent = "Preparing parsed texture data zip...";
+  setParsingLoader(true, "0.00% Preparing parsed ZIP export...");
 
   try {
+    await yieldToBrowserPaint();
     const zipBlob = await buildParsedDataZip(scene, {
       sourceLabel: label,
-      sourcePdf:
-        lastLoadedSource?.kind === "pdf"
-          ? lastLoadedSource.bytes
-          : lastDownloadablePdf?.bytes ??
-            lastDownloadablePdf?.blob ??
-            lastDownloadablePdf?.url
+      signal: exportController.signal,
+      onProgress: (progress) => {
+        if (activeParsedZipExportController === exportController) {
+          updateParsingLoaderProgress(progress);
+        }
+      },
+      sourcePdf
     });
+
+    if (activeParsedZipExportController !== exportController) {
+      return false;
+    }
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
     triggerBrowserDownload(zipBlob, zipFileName);
@@ -1257,11 +1432,21 @@ async function downloadParsedDataZip(): Promise<boolean> {
     statusTextElement.hidden = restoredStatus.trim().length === 0;
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Failed to download parsed data: ${message}`);
+    if (activeParsedZipExportController === exportController) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Failed to download parsed data: ${message}`);
+    }
     return false;
   } finally {
-    setDownloadDataButtonState(true, false);
+    if (activeParsedZipExportController === exportController) {
+      activeParsedZipExportController = null;
+      setParsingLoader(false);
+      setPrimaryLoadControlsEnabled(true);
+      updateBackendSelectDisabledState();
+      setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
+      setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+      setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+    }
   }
 }
 
@@ -1308,6 +1493,41 @@ function delayMilliseconds(durationMs: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, Math.max(0, durationMs));
   });
+}
+
+function yieldToBrowserPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let animationFrame = 0;
+    let fallbackTimer = 0;
+    const finish = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.cancelAnimationFrame(animationFrame);
+      window.clearTimeout(fallbackTimer);
+      resolve();
+    };
+    animationFrame = window.requestAnimationFrame(finish);
+    fallbackTimer = window.setTimeout(finish, 100);
+  });
+}
+
+function cancelActiveParsedZipExport(): void {
+  const controller = activeParsedZipExportController;
+  if (!controller) {
+    return;
+  }
+  activeParsedZipExportController = null;
+  controller.abort();
+  isBatchExampleExportRunning = false;
+  setParsingLoader(false);
+  setPrimaryLoadControlsEnabled(true);
+  updateBackendSelectDisabledState();
+  setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
+  setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
+  setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
 }
 
 function setMetricPlaceholder(label: string = "-"): void {

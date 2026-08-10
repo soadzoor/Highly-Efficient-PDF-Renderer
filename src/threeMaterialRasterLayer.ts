@@ -22,17 +22,22 @@ interface ViewportPixels {
   height: number;
 }
 
+interface RasterLayerEntry {
+  mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
+  material: THREE.Material;
+  webGpuState?: ThreeWebGpuRasterMaterialState;
+}
+
+interface ResidentRasterLayerEntry extends RasterLayerEntry {
+  texture: THREE.Texture;
+  resident: boolean;
+}
+
 interface RasterLayerSource {
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
   matrix: Float32Array;
-}
-
-interface RasterLayerEntry {
-  mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
-  material: THREE.Material;
-  webGpuState?: ThreeWebGpuRasterMaterialState;
 }
 
 export class ThreeMaterialRasterLayer {
@@ -42,7 +47,10 @@ export class ThreeMaterialRasterLayer {
   private readonly materialBackend: "webgl" | "webgpu";
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
+  private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
+  private readonly maxRasterTextureDimension: number;
+  private rasterTextureResidencyEnabled = false;
 
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
@@ -75,12 +83,20 @@ export class ThreeMaterialRasterLayer {
       const width = Math.max(maxX - minX, 1e-6);
       const height = Math.max(maxY - minY, 1e-6);
       const matrix = new Float32Array([width, 0, 0, height, minX, minY]);
-      const entry = this.createEntry(this.pageBackgroundTexture, matrix, HEPR_THREE_LAYER_ORDER_PAGE_BACKGROUND);
+      const entry = this.createEntry(
+        this.pageBackgroundTexture,
+        matrix,
+        HEPR_THREE_LAYER_ORDER_PAGE_BACKGROUND
+      );
       this.entries.push(entry);
       this.group.add(entry.mesh);
     }
 
     const rasterSources = getSceneRasterLayers(scene);
+    this.maxRasterTextureDimension = rasterSources.reduce(
+      (maximum, source) => Math.max(maximum, source.width, source.height),
+      0
+    );
     for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
       const source = rasterSources[rasterIndex];
       const texture = createRasterTexture(source);
@@ -91,13 +107,42 @@ export class ThreeMaterialRasterLayer {
         source.matrix,
         HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset
       );
+      entry.mesh.visible = false;
       this.entries.push(entry);
+      this.rasterEntries.push({
+        ...entry,
+        texture,
+        resident: false
+      });
       this.group.add(entry.mesh);
     }
   }
 
   setVisible(visible: boolean): void {
     this.group.visible = visible;
+  }
+
+  getMaxRasterTextureDimension(): number {
+    return this.maxRasterTextureDimension;
+  }
+
+  /** Allocate or release only raster GPU textures, retaining their CPU pixel data. */
+  setTextureResidency(resident: boolean): void {
+    if (resident === this.rasterTextureResidencyEnabled) {
+      return;
+    }
+    this.rasterTextureResidencyEnabled = resident;
+    if (resident) {
+      for (const entry of this.rasterEntries) {
+        entry.texture.needsUpdate = true;
+        entry.resident = true;
+        entry.mesh.visible = true;
+      }
+      return;
+    }
+    for (const entry of this.rasterEntries) {
+      this.evictRasterEntry(entry);
+    }
   }
 
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
@@ -164,6 +209,16 @@ export class ThreeMaterialRasterLayer {
       texture.dispose();
     }
     this.ownedTextures.clear();
+    this.rasterEntries.length = 0;
+  }
+
+  private evictRasterEntry(entry: ResidentRasterLayerEntry): void {
+    entry.mesh.visible = false;
+    if (!entry.resident) {
+      return;
+    }
+    entry.texture.dispose();
+    entry.resident = false;
   }
 
   private createEntry(

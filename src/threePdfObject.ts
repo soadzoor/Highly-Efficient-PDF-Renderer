@@ -166,9 +166,17 @@ interface ViewportPixels {
 }
 
 interface ThreeHostRenderer {
+  readonly isWebGLRenderer?: boolean;
+  readonly isWebGPURenderer?: boolean;
   readonly domElement: HTMLCanvasElement | OffscreenCanvas;
   readonly capabilities?: {
     getMaxAnisotropy?: () => number;
+    maxTextureSize?: number;
+  };
+  readonly backend?: {
+    readonly device?: {
+      readonly limits?: { readonly maxTextureDimension2D?: number };
+    };
   };
   getContext?: () => unknown;
   getDrawingBufferSize?: (target: THREE.Vector2) => THREE.Vector2;
@@ -282,6 +290,8 @@ export class HeprThreePdfObject extends THREE.Group {
   private skipNextBeforeRenderCallback = false;
   private warnedThreeCameraUnsupported = false;
   private warnedThreeCameraPerspectiveFallback = false;
+  private warnedHostRasterTextureFallback = false;
+  private warnedHostBackendFallback = false;
   private hookedScene: THREE.Scene | null = null;
   private readonly pagePlane = new THREE.Plane();
   private readonly pagePlanePoint = new THREE.Vector3();
@@ -311,8 +321,17 @@ export class HeprThreePdfObject extends THREE.Group {
     this.refreshSceneRenderHook();
   };
   private readonly handleRemovedFromParent = (): void => {
-    this.detachSceneRenderHook();
+    this.configureDormantPipeline();
+    this.refreshSceneRenderHook();
   };
+  private readonly handleAncestorAdded = (): void => {
+    this.refreshSceneRenderHook();
+  };
+  private readonly handleAncestorRemoved = (): void => {
+    this.configureDormantPipeline();
+    this.refreshSceneRenderHook();
+  };
+  private readonly ancestorHookWatchers: THREE.Object3D[] = [];
 
   /**
    * Internal constructor used by the PDF object factory.
@@ -411,7 +430,7 @@ export class HeprThreePdfObject extends THREE.Group {
       renderer: this.renderer
     };
 
-    this.configureThreeMaterialPipeline();
+    this.configureDormantPipeline();
   }
 
   /**
@@ -1029,6 +1048,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.removeEventListener("added", this.handleAddedToParent);
     this.removeEventListener("removed", this.handleRemovedFromParent);
     this.detachSceneRenderHook();
+    this.clearAncestorHookWatchers();
     this.pageMesh.onBeforeRender = () => {};
     this.pageMesh.geometry.dispose();
     this.pageMesh.material.dispose();
@@ -1140,7 +1160,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.lastUploadedFrameSerial = -1;
     this.lastViewportWidth = 0;
     this.lastViewportHeight = 0;
-    this.configureThreeMaterialPipeline();
+    this.configureDormantPipeline();
   }
 
   handleBeforeRender(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
@@ -1157,20 +1177,40 @@ export class HeprThreePdfObject extends THREE.Group {
       return;
     }
     const scene = findAncestorScene(this);
-    if (scene === this.hookedScene) {
-      if (scene) {
-        installSceneRenderHook(scene, this);
-      }
+    if (scene && scene === this.hookedScene) {
+      installSceneRenderHook(scene, this);
+      this.watchAncestorsForSceneChanges();
       return;
     }
 
     this.detachSceneRenderHook();
     if (!scene) {
+      this.watchAncestorsForSceneChanges();
       return;
     }
 
     installSceneRenderHook(scene, this);
     this.hookedScene = scene;
+    this.watchAncestorsForSceneChanges();
+  }
+
+  private watchAncestorsForSceneChanges(): void {
+    this.clearAncestorHookWatchers();
+    let ancestor = this.parent;
+    while (ancestor && (ancestor as { isScene?: boolean }).isScene !== true) {
+      ancestor.addEventListener("added", this.handleAncestorAdded);
+      ancestor.addEventListener("removed", this.handleAncestorRemoved);
+      this.ancestorHookWatchers.push(ancestor);
+      ancestor = ancestor.parent;
+    }
+  }
+
+  private clearAncestorHookWatchers(): void {
+    for (const ancestor of this.ancestorHookWatchers) {
+      ancestor.removeEventListener("added", this.handleAncestorAdded);
+      ancestor.removeEventListener("removed", this.handleAncestorRemoved);
+    }
+    this.ancestorHookWatchers.length = 0;
   }
 
   private detachSceneRenderHook(): void {
@@ -1192,7 +1232,27 @@ export class HeprThreePdfObject extends THREE.Group {
     const cameraType = camera as { isPerspectiveCamera?: boolean };
     const perspectiveThreeCameraMode = cameraType.isPerspectiveCamera === true;
     const derivedView = this.deriveViewStateFromThreeCamera(camera, rendererViewport);
-    const cameraDrivenMaterialPipelineEnabled = this.hasCompleteMaterialLayers() && derivedView !== null;
+    const hostUsesMaterialBackend = this.hostUsesMaterialBackend(renderer);
+    const hostSupportsRasterTextures =
+      hostUsesMaterialBackend && this.hostSupportsRasterTextures(renderer);
+    const cameraDrivenMaterialPipelineEnabled =
+      this.hasCompleteMaterialLayers() && derivedView !== null && hostSupportsRasterTextures;
+
+    if (!hostSupportsRasterTextures) {
+      if (!hostUsesMaterialBackend) {
+        if (!this.warnedHostBackendFallback) {
+          this.warnedHostBackendFallback = true;
+          console.warn(
+            `[HEPR] rendererType=${this.rendererType} does not match the host three.js renderer; using the native texture fallback.`
+          );
+        }
+      } else if (!this.warnedHostRasterTextureFallback) {
+        this.warnedHostRasterTextureFallback = true;
+        console.warn(
+          "[HEPR] A raster layer exceeds the host three.js texture-size limit; using the native texture fallback."
+        );
+      }
+    }
 
     let nativeViewport = rendererViewport;
     let nativeViewChanged = false;
@@ -1367,6 +1427,17 @@ export class HeprThreePdfObject extends THREE.Group {
     return this.hasThreeStrokeMaterialLayer();
   }
 
+  private hostSupportsRasterTextures(renderer: ThreeHostRenderer): boolean {
+    const maxTextureSize = readThreeRendererMaxTextureSize(renderer);
+    return this.rasterMaterialLayer.getMaxRasterTextureDimension() <= maxTextureSize;
+  }
+
+  private hostUsesMaterialBackend(renderer: ThreeHostRenderer): boolean {
+    return this.rendererType === "webgpu"
+      ? renderer.isWebGPURenderer === true
+      : renderer.isWebGLRenderer === true;
+  }
+
   private hasThreeStrokeMaterialLayer(): boolean {
     return (
       this.strokeMaterialLayer !== null ||
@@ -1376,11 +1447,10 @@ export class HeprThreePdfObject extends THREE.Group {
     );
   }
 
-  private configureNativeTexturePipeline(): void {
-    const wasMaterialPipelineActive = this.materialPipelineActive;
+  private configureDormantPipeline(): void {
     this.materialPipelineActive = false;
-
     this.rasterMaterialLayer.setVisible(false);
+    this.rasterMaterialLayer.setTextureResidency(false);
     this.gradientMaterialLayer.setVisible(false);
     this.fillMaterialLayer.setVisible(false);
     this.strokeMaterialLayer?.setVisible(false);
@@ -1388,6 +1458,41 @@ export class HeprThreePdfObject extends THREE.Group {
     this.vectorLodStrokeLayer?.deactivate();
     this.compactedStrokeLayer?.deactivate();
     this.textMaterialLayer.setVisible(false);
+    this.detachThreeMaterialObjects();
+    this.renderer.setRasterRenderingEnabled?.(false);
+    this.renderer.setRasterTextureResidency?.(false);
+    this.renderer.setFillRenderingEnabled?.(false);
+    this.renderer.setStrokeRenderingEnabled?.(false);
+    this.renderer.setTextRenderingEnabled?.(false);
+
+    if (this.renderTexture) {
+      this.renderTexture.dispose();
+      this.renderTexture = null;
+    }
+    if (this.pageMesh.material.colorWrite !== false) {
+      const previousMaterial = this.pageMesh.material;
+      this.pageMesh.material = createInvisiblePageMaterial();
+      previousMaterial.dispose();
+    }
+    this.pageMesh.frustumCulled = false;
+    this.pageMesh.renderOrder = HEPR_THREE_LAYER_ORDER_PAGE_DEPTH;
+  }
+
+  private configureNativeTexturePipeline(): void {
+    const wasMaterialPipelineActive = this.materialPipelineActive;
+    this.materialPipelineActive = false;
+
+    this.rasterMaterialLayer.setVisible(false);
+    this.rasterMaterialLayer.setTextureResidency(false);
+    this.gradientMaterialLayer.setVisible(false);
+    this.fillMaterialLayer.setVisible(false);
+    this.strokeMaterialLayer?.setVisible(false);
+    this.triangleStrokeLayer?.setVisible(false);
+    this.vectorLodStrokeLayer?.deactivate();
+    this.compactedStrokeLayer?.deactivate();
+    this.textMaterialLayer.setVisible(false);
+    this.detachThreeMaterialObjects();
+    this.renderer.setRasterTextureResidency?.(true);
     this.renderer.setRasterRenderingEnabled?.(true);
     this.renderer.setFillRenderingEnabled?.(true);
     this.renderer.setStrokeRenderingEnabled?.(true);
@@ -1419,7 +1524,11 @@ export class HeprThreePdfObject extends THREE.Group {
 
     const wasMaterialPipelineActive = this.materialPipelineActive;
     this.materialPipelineActive = true;
+    this.attachThreeMaterialObjects();
 
+    this.renderer.setRasterRenderingEnabled?.(false);
+    this.renderer.setRasterTextureResidency?.(false);
+    this.rasterMaterialLayer.setTextureResidency(true);
     this.rasterMaterialLayer.setVisible(true);
     this.rasterMaterialLayer.setPageBackgroundColor(
       this.rendererConfig.pageBackground[0],
@@ -1492,7 +1601,6 @@ export class HeprThreePdfObject extends THREE.Group {
       this.rendererConfig.vectorOverride[3]
     );
 
-    this.renderer.setRasterRenderingEnabled?.(false);
     this.renderer.setFillRenderingEnabled?.(false);
     this.renderer.setStrokeRenderingEnabled?.(false);
     this.renderer.setTextRenderingEnabled?.(false);
@@ -1521,6 +1629,44 @@ export class HeprThreePdfObject extends THREE.Group {
       this.lastViewportWidth = 0;
       this.lastViewportHeight = 0;
     }
+  }
+
+  private attachThreeMaterialObjects(): void {
+    for (const object of this.listThreeMaterialObjects()) {
+      if (object.parent !== this) {
+        this.add(object);
+      }
+    }
+  }
+
+  private detachThreeMaterialObjects(): void {
+    for (const object of this.listThreeMaterialObjects()) {
+      if (object.parent === this) {
+        this.remove(object);
+      }
+    }
+  }
+
+  private listThreeMaterialObjects(): THREE.Object3D[] {
+    const objects: THREE.Object3D[] = [
+      this.rasterMaterialLayer.group,
+      this.gradientMaterialLayer.group,
+      this.fillMaterialLayer.mesh,
+      this.textMaterialLayer.mesh
+    ];
+    if (this.strokeMaterialLayer) {
+      objects.push(this.strokeMaterialLayer.mesh);
+    }
+    if (this.triangleStrokeLayer) {
+      objects.push(this.triangleStrokeLayer.mesh);
+    }
+    if (this.vectorLodStrokeLayer) {
+      objects.push(this.vectorLodStrokeLayer.group);
+    }
+    if (this.compactedStrokeLayer) {
+      objects.push(this.compactedStrokeLayer.group);
+    }
+    return objects;
   }
 
   private updateMaterialLayerTransforms(
@@ -2086,31 +2232,29 @@ function installSceneRenderHook(scene: THREE.Scene, object: HeprThreePdfObject):
   const existingHook = sceneRenderHooks.get(scene);
   if (existingHook) {
     existingHook.objects.add(object);
-    if (scene.onBeforeRender !== existingHook.callback) {
-      existingHook.previous = scene.onBeforeRender;
-      scene.onBeforeRender = existingHook.callback;
-    }
+    // Do not take the callback back from application code. A common wrapper
+    // captures our callback and invokes it before/after its own work; chaining
+    // that wrapper back as `previous` would create an immediate recursion.
     return;
   }
 
   let hook: HeprSceneRenderHook;
   const callback = ((...args: Parameters<ThreeSceneRenderCallback>) => {
-    hook.previous(...args);
+    hook.previous.apply(scene, args);
 
     const renderer = args[0] as unknown as ThreeHostRenderer;
-    const activeScene = args[1] as THREE.Scene;
     const camera = args[2] as THREE.Camera;
 
     for (const pdfObject of Array.from(hook.objects)) {
-      if (findAncestorScene(pdfObject) !== activeScene) {
+      if (findAncestorScene(pdfObject) !== scene) {
         hook.objects.delete(pdfObject);
         continue;
       }
       pdfObject.prepareFrameForThreeRenderer(renderer, camera);
     }
 
-    if (hook.objects.size === 0) {
-      removeSceneRenderHookObject(activeScene, object);
+    if (hook.objects.size === 0 && sceneRenderHooks.get(scene) === hook) {
+      removeSceneRenderHookObject(scene, object);
     }
   }) as ThreeSceneRenderCallback;
 
@@ -2138,6 +2282,29 @@ function removeSceneRenderHookObject(scene: THREE.Scene, object: HeprThreePdfObj
     scene.onBeforeRender = hook.previous;
   }
   sceneRenderHooks.delete(scene);
+}
+
+function readThreeRendererMaxTextureSize(renderer: ThreeHostRenderer): number {
+  const reportedLimit = renderer.isWebGPURenderer === true
+    ? renderer.backend?.device?.limits?.maxTextureDimension2D
+    : renderer.capabilities?.maxTextureSize;
+  if (Number.isFinite(reportedLimit) && (reportedLimit as number) >= 1) {
+    return Math.floor(reportedLimit as number);
+  }
+
+  if (renderer.isWebGLRenderer === true) {
+    const context = renderer.getContext?.() as {
+      MAX_TEXTURE_SIZE?: number;
+      getParameter?: (parameter: number) => unknown;
+    } | undefined;
+    const parameter = context?.MAX_TEXTURE_SIZE;
+    const contextLimit = parameter === undefined ? undefined : context?.getParameter?.(parameter);
+    if (typeof contextLimit === "number" && Number.isFinite(contextLimit) && contextLimit >= 1) {
+      return Math.floor(contextLimit);
+    }
+  }
+
+  return Number.POSITIVE_INFINITY;
 }
 
 function findAncestorScene(object: THREE.Object3D): THREE.Scene | null {
@@ -2176,113 +2343,123 @@ export async function createThreePdfObject(
       rendererConfig.vectorLodMode,
       rendererType,
       loadedScene.scene.segmentCount
-    );
+  );
   const nativeRenderer = await createNativeRenderer(rendererType, renderCanvas);
-  applyRendererConfig(nativeRenderer, rendererConfig);
-  if (useVectorLodStrokeLayer) {
-    nativeRenderer.setVectorLodMode?.("off");
+  try {
+    applyRendererConfig(nativeRenderer, rendererConfig);
+    if (useVectorLodStrokeLayer) {
+      nativeRenderer.setVectorLodMode?.("off");
+    }
+    nativeRenderer.setExternalFrameDriver?.(true);
+    nativeRenderer.setRasterTextureResidency?.(false);
+    nativeRenderer.setScene(loadedScene.scene);
+
+    const materialBackend = rendererType === "webgpu" ? "webgpu" : "webgl";
+
+    const rasterMaterialLayer = new ThreeMaterialRasterLayer(loadedScene.scene, {
+      materialBackend,
+      pageBackground: rendererConfig.pageBackground
+    });
+
+    const gradientMaterialLayer = new ThreeMaterialGradientLayer(loadedScene.scene, {
+      materialBackend,
+      strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
+      vectorOverride: rendererConfig.vectorOverride
+    });
+    applyThreePdfOverlayPaintOrder(
+      loadedScene.scene,
+      rasterMaterialLayer.group,
+      gradientMaterialLayer.getOrderedPaintMeshes()
+    );
+
+    const fillMaterialLayer = new ThreeMaterialFillLayer(loadedScene.scene, {
+      materialBackend,
+      vectorOverride: rendererConfig.vectorOverride
+    });
+
+    const strokeMaterialLayer =
+      !useVectorLodStrokeLayer
+        ? new ThreeMaterialStrokeLayer(loadedScene.scene, {
+          materialBackend,
+          strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
+          vectorOverride: rendererConfig.vectorOverride
+        })
+        : null;
+
+    const triangleStrokeLayer = null;
+
+    const vectorLodStrokeLayer =
+      useVectorLodStrokeLayer
+        ? new ThreeVectorLodStrokeLayer(loadedScene.scene, {
+          materialBackend,
+          strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
+          vectorOverride: rendererConfig.vectorOverride
+        })
+        : null;
+
+    const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
+
+    const textMaterialLayer = new ThreeMaterialTextLayer(loadedScene.scene, {
+      materialBackend,
+      strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
+      textVectorOnly: rendererConfig.textVectorOnly,
+      vectorOverride: rendererConfig.vectorOverride
+    });
+
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array([
+      sceneBounds.minX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
+      sceneBounds.maxX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
+      sceneBounds.maxX - sceneCenterX, sceneBounds.maxY - sceneCenterY, 0,
+      sceneBounds.minX - sceneCenterX, sceneBounds.maxY - sceneCenterY, 0
+    ]);
+    const uvArray = new Float32Array([
+      0, 0,
+      1, 0,
+      1, 1,
+      0, 1
+    ]);
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    const uvAttribute = new THREE.BufferAttribute(uvArray, 2);
+    geometry.setAttribute("uv", uvAttribute);
+    geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
+
+    const material = createInvisiblePageMaterial();
+
+    const pageMesh = new THREE.Mesh(geometry, material);
+    const object = new HeprThreePdfObject(
+      loadedScene,
+      rendererType,
+      nativeRenderer,
+      renderCanvas,
+      null,
+      rendererConfig,
+      initialFitPaddingPixels,
+      rasterMaterialLayer,
+      gradientMaterialLayer,
+      fillMaterialLayer,
+      strokeMaterialLayer,
+      triangleStrokeLayer,
+      vectorLodStrokeLayer,
+      compactedStrokeLayer,
+      textMaterialLayer,
+      pageMesh,
+      uvArray,
+      uvAttribute
+    );
+    pageMesh.onBeforeRender = (renderer, _scene, camera) => {
+      object.handleBeforeRender(renderer as ThreeHostRenderer, camera as THREE.Camera);
+    };
+
+    return object;
+  } catch (error) {
+    try {
+      nativeRenderer.dispose();
+    } catch {
+      // Preserve the original initialization error.
+    }
+    throw error;
   }
-  nativeRenderer.setExternalFrameDriver?.(true);
-  nativeRenderer.setScene(loadedScene.scene);
-
-  const materialBackend = rendererType === "webgpu" ? "webgpu" : "webgl";
-
-  const rasterMaterialLayer = new ThreeMaterialRasterLayer(loadedScene.scene, {
-    materialBackend,
-    pageBackground: rendererConfig.pageBackground
-  });
-
-  const gradientMaterialLayer = new ThreeMaterialGradientLayer(loadedScene.scene, {
-    materialBackend,
-    strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
-    vectorOverride: rendererConfig.vectorOverride
-  });
-  applyThreePdfOverlayPaintOrder(
-    loadedScene.scene,
-    rasterMaterialLayer.group,
-    gradientMaterialLayer.getOrderedPaintMeshes()
-  );
-
-  const fillMaterialLayer = new ThreeMaterialFillLayer(loadedScene.scene, {
-    materialBackend,
-    vectorOverride: rendererConfig.vectorOverride
-  });
-
-  const strokeMaterialLayer =
-    !useVectorLodStrokeLayer
-      ? new ThreeMaterialStrokeLayer(loadedScene.scene, {
-        materialBackend,
-        strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
-        vectorOverride: rendererConfig.vectorOverride
-      })
-      : null;
-
-  const triangleStrokeLayer = null;
-
-  const vectorLodStrokeLayer =
-    useVectorLodStrokeLayer
-      ? new ThreeVectorLodStrokeLayer(loadedScene.scene, {
-        materialBackend,
-        strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
-        vectorOverride: rendererConfig.vectorOverride
-      })
-      : null;
-
-  const compactedStrokeLayer: ThreeCompactedStrokeLayer | null = null;
-
-  const textMaterialLayer = new ThreeMaterialTextLayer(loadedScene.scene, {
-    materialBackend,
-    strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
-    textVectorOnly: rendererConfig.textVectorOnly,
-    vectorOverride: rendererConfig.vectorOverride
-  });
-
-  const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array([
-    sceneBounds.minX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
-    sceneBounds.maxX - sceneCenterX, sceneBounds.minY - sceneCenterY, 0,
-    sceneBounds.maxX - sceneCenterX, sceneBounds.maxY - sceneCenterY, 0,
-    sceneBounds.minX - sceneCenterX, sceneBounds.maxY - sceneCenterY, 0
-  ]);
-  const uvArray = new Float32Array([
-    0, 0,
-    1, 0,
-    1, 1,
-    0, 1
-  ]);
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  const uvAttribute = new THREE.BufferAttribute(uvArray, 2);
-  geometry.setAttribute("uv", uvAttribute);
-  geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
-
-  const material = createInvisiblePageMaterial();
-
-  const pageMesh = new THREE.Mesh(geometry, material);
-  const object = new HeprThreePdfObject(
-    loadedScene,
-    rendererType,
-    nativeRenderer,
-    renderCanvas,
-    null,
-    rendererConfig,
-    initialFitPaddingPixels,
-    rasterMaterialLayer,
-    gradientMaterialLayer,
-    fillMaterialLayer,
-    strokeMaterialLayer,
-    triangleStrokeLayer,
-    vectorLodStrokeLayer,
-    compactedStrokeLayer,
-    textMaterialLayer,
-    pageMesh,
-    uvArray,
-    uvAttribute
-  );
-  pageMesh.onBeforeRender = (renderer, _scene, camera) => {
-    object.handleBeforeRender(renderer as ThreeHostRenderer, camera as THREE.Camera);
-  };
-
-  return object;
 }
 
 async function createNativeRenderer(

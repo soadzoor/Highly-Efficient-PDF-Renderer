@@ -430,7 +430,13 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
   });
 }
 
-export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene[]> {
+export async function extractPdfPageScenes(
+  pdfData: ArrayBuffer,
+  options: VectorExtractOptions = {},
+  /** @internal Used by parsed-ZIP export to cancel PDF.js work. */
+  signal?: AbortSignal
+): Promise<VectorScene[]> {
+  signal?.throwIfAborted();
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
   const enableTextContent = options.extractTextContent === true;
@@ -447,10 +453,26 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     verbosity: PDFJS_VERBOSITY_ERRORS,
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
-  const pdf = await loadingTask.promise;
-  progress.report(0.06, { stage: "pdf-page", sourceType: "pdf" });
+  const destroyOnAbort = (): void => {
+    void loadingTask.destroy().catch(() => {
+      // The main control path preserves the AbortSignal reason.
+    });
+  };
+  signal?.addEventListener("abort", destroyOnAbort, { once: true });
 
   try {
+    signal?.throwIfAborted();
+    let pdf: Awaited<typeof loadingTask.promise>;
+    try {
+      pdf = await loadingTask.promise;
+    } catch (error) {
+      signal?.throwIfAborted();
+      throw error;
+    }
+    signal?.throwIfAborted();
+    progress.report(0.06, { stage: "pdf-page", sourceType: "pdf" });
+    signal?.throwIfAborted();
+
     const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
     const pageNumbers = resolvePdfPageNumbers(pdfPageCount, options.pages);
     const extractedPageCount = pageNumbers.length;
@@ -459,6 +481,7 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     const pageProgressRange = 0.84;
 
     for (let selectionIndex = 0; selectionIndex < extractedPageCount; selectionIndex += 1) {
+      signal?.throwIfAborted();
       const pageNumber = pageNumbers[selectionIndex];
       const sourcePageIndex = pageNumber - 1;
       const pageStart = pageProgressStart + (selectionIndex / extractedPageCount) * pageProgressRange;
@@ -474,7 +497,9 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
         sourcePageIndex,
         sourcePageCount: pdfPageCount
       });
+      signal?.throwIfAborted();
       const page = await pdf.getPage(pageNumber);
+      signal?.throwIfAborted();
       progress.report(lerpNumber(pageStart, pageEnd, 0.28), {
         stage: "pdf-operators",
         sourceType: "pdf",
@@ -486,7 +511,9 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
         sourcePageIndex,
         sourcePageCount: pdfPageCount
       });
+      signal?.throwIfAborted();
       const operatorList = await page.getOperatorList();
+      signal?.throwIfAborted();
       progress.report(lerpNumber(pageStart, pageEnd, 0.58), {
         stage: "compile",
         sourceType: "pdf",
@@ -498,12 +525,15 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
         sourcePageIndex,
         sourcePageCount: pdfPageCount
       });
+      signal?.throwIfAborted();
       const pageScene = await extractSinglePageVectors(page, operatorList, {
         enableSegmentMerge,
         enableInvisibleCull
       });
+      signal?.throwIfAborted();
       if (enableTextContent) {
         pageScene.textContent = await extractPageTextContent(page);
+        signal?.throwIfAborted();
       }
       pageScenes.push(pageScene);
       progress.report(pageEnd, {
@@ -517,12 +547,24 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
         sourcePageIndex,
         sourcePageCount: pdfPageCount
       });
+      signal?.throwIfAborted();
     }
 
     progress.report(0.94, { stage: "compile", sourceType: "pdf" });
+    signal?.throwIfAborted();
     return pageScenes;
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw error;
   } finally {
-    await loadingTask.destroy();
+    signal?.removeEventListener("abort", destroyOnAbort);
+    try {
+      await loadingTask.destroy();
+    } catch (error) {
+      if (!signal?.aborted) {
+        throw error;
+      }
+    }
   }
 }
 

@@ -20,6 +20,7 @@ export interface BackendSwitcherOptions {
   createWebGpuRenderer: (canvas: HTMLCanvasElement) => Promise<RendererApi>;
   attachCanvasInteractionListeners: (canvas: HTMLCanvasElement) => void;
   resetPointerInteractionState: () => void;
+  isOperationActive?: () => boolean;
   getSceneSnapshot: () => SceneSnapshot;
   setSceneStats: (stats: SceneStats | null) => void;
   updateMetricsAfterSwitch: (label: string, scene: VectorScene, sceneStats: SceneStats) => void;
@@ -32,6 +33,8 @@ export interface BackendSwitcherOptions {
 export interface BackendSwitcher {
   readonly webGpuSupported: boolean;
   getActiveBackend(): RendererBackend;
+  isSwitchInFlight(): boolean;
+  runWhenIdle<T>(action: () => T): Promise<T>;
   initializeToggleState(): void;
   applyPreference(targetBackend: RendererBackend): Promise<void>;
 }
@@ -40,6 +43,15 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
   const webGpuSupported = isWebGpuSupported();
   let activeRendererBackend: RendererBackend = "webgl";
   let backendSwitchInFlight = false;
+  let backendSwitchCompletion: Promise<void> = Promise.resolve();
+  let resolveBackendSwitchCompletion: (() => void) | null = null;
+
+  async function runWhenIdle<T>(action: () => T): Promise<T> {
+    while (backendSwitchInFlight) {
+      await backendSwitchCompletion;
+    }
+    return action();
+  }
 
   function initializeToggleState(): void {
     options.backendSelectElement.value = activeRendererBackend;
@@ -70,37 +82,86 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
       return;
     }
 
-    backendSwitchInFlight = true;
-    const previousRenderer = options.getRenderer();
-    const previousViewState = previousRenderer.getViewState();
-    const sceneSnapshot = options.getSceneSnapshot();
-    const previousCanvas = options.getCanvasElement();
-    const replacementCanvas = cloneViewportCanvas(previousCanvas);
-
-    options.setStatus(`Switching renderer backend to ${targetBackend.toUpperCase()}...`);
-
-    try {
-      previousCanvas.replaceWith(replacementCanvas);
-      options.setCanvasElement(replacementCanvas);
-      options.attachCanvasInteractionListeners(replacementCanvas);
-
-      const nextRenderer =
-        targetBackend === "webgpu"
-          ? await options.createWebGpuRenderer(replacementCanvas)
-          : options.createWebGlRenderer(replacementCanvas);
-
-      options.setRenderer(nextRenderer);
-      activeRendererBackend = targetBackend;
+    if (options.isOperationActive?.()) {
       options.backendSelectElement.value = activeRendererBackend;
-      options.resetPointerInteractionState();
+      options.setStatus("Wait for the current document operation to finish before switching renderer backend.");
+      return;
+    }
 
-      previousRenderer.setFrameListener(null);
-      previousRenderer.dispose();
+    backendSwitchInFlight = true;
+    backendSwitchCompletion = new Promise<void>((resolve) => {
+      resolveBackendSwitchCompletion = resolve;
+    });
 
-      if (sceneSnapshot.scene && sceneSnapshot.label) {
-        const nextSceneStats = nextRenderer.setScene(sceneSnapshot.scene);
-        options.setSceneStats(nextSceneStats);
+    let switchCommitted = false;
+    try {
+      const previousRenderer = options.getRenderer();
+      const previousViewState = previousRenderer.getViewState();
+      const sceneSnapshot = options.getSceneSnapshot();
+      const previousCanvas = options.getCanvasElement();
+      const replacementCanvas = cloneViewportCanvas(previousCanvas);
+
+      options.setStatus(`Switching renderer backend to ${targetBackend.toUpperCase()}...`);
+
+      let nextRenderer: RendererApi | null = null;
+      let nextSceneStats: SceneStats | null = null;
+
+      try {
+        nextRenderer =
+          targetBackend === "webgpu"
+            ? await options.createWebGpuRenderer(replacementCanvas)
+            : options.createWebGlRenderer(replacementCanvas);
+
+        if (sceneSnapshot.scene && sceneSnapshot.label) {
+          nextSceneStats = nextRenderer.setScene(sceneSnapshot.scene);
+        }
         nextRenderer.setViewState(previousViewState);
+      } catch (error) {
+        disposeProvisionalRenderer(nextRenderer);
+        reportSwitchFailure(options, activeRendererBackend, error);
+        return;
+      }
+
+      let replacementCanvasInstalled = false;
+      try {
+        previousCanvas.replaceWith(replacementCanvas);
+        replacementCanvasInstalled = true;
+        options.setCanvasElement(replacementCanvas);
+        options.attachCanvasInteractionListeners(replacementCanvas);
+        options.setRenderer(nextRenderer);
+        options.resetPointerInteractionState();
+        options.backendSelectElement.value = targetBackend;
+      } catch (error) {
+        const rollbackError = restorePreviousRendererAndCanvas(
+          options,
+          previousRenderer,
+          previousCanvas,
+          replacementCanvas,
+          replacementCanvasInstalled,
+          nextRenderer
+        );
+        disposeProvisionalRenderer(nextRenderer);
+        reportSwitchFailure(
+          options,
+          activeRendererBackend,
+          rollbackError ? combineSwitchErrors(error, rollbackError) : error
+        );
+        return;
+      }
+
+      activeRendererBackend = targetBackend;
+      switchCommitted = true;
+
+      disposePreviousRenderer(previousRenderer);
+
+      try {
+        nextRenderer.resize();
+      } catch (error) {
+        console.warn("[HEPR] Backend switched, but the replacement renderer could not resize immediately.", error);
+      }
+
+      if (sceneSnapshot.scene && sceneSnapshot.label && nextSceneStats) {
+        options.setSceneStats(nextSceneStats);
         options.updateMetricsAfterSwitch(sceneSnapshot.label, sceneSnapshot.scene, nextSceneStats);
         options.setMetricTimesText("parse -, vector lod -, upload - (backend switch)");
 
@@ -108,30 +169,47 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
         options.setBaseStatus(statusBase);
         options.setStatusText(statusBase);
       } else {
-        nextRenderer.setViewState(previousViewState);
         options.setStatus(`Switched to ${targetBackend.toUpperCase()} backend.`);
       }
     } catch (error) {
-      if (options.getCanvasElement() === replacementCanvas) {
-        replacementCanvas.replaceWith(previousCanvas);
-        options.setCanvasElement(previousCanvas);
-        options.resetPointerInteractionState();
+      if (switchCommitted) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn("[HEPR] Renderer backend switched, but finalization failed.", error);
+        options.backendSelectElement.value = activeRendererBackend;
+        options.setStatus(
+          `Switched to ${activeRendererBackend.toUpperCase()}, but finalization failed: ${message}`
+        );
+      } else {
+        reportSwitchFailure(options, activeRendererBackend, error);
       }
-
-      const message = error instanceof Error ? error.message : String(error);
-      options.backendSelectElement.value = activeRendererBackend;
-      options.setStatus(`Failed to switch backend: ${message}`);
     } finally {
       backendSwitchInFlight = false;
+      resolveBackendSwitchCompletion?.();
+      resolveBackendSwitchCompletion = null;
     }
   }
 
   return {
     webGpuSupported,
     getActiveBackend: () => activeRendererBackend,
+    isSwitchInFlight: () => backendSwitchInFlight,
+    runWhenIdle,
     initializeToggleState,
     applyPreference
   };
+}
+
+function disposePreviousRenderer(renderer: RendererApi): void {
+  try {
+    renderer.setFrameListener(null);
+  } catch (error) {
+    console.warn("[HEPR] Failed to detach the previous renderer frame listener.", error);
+  }
+  try {
+    renderer.dispose();
+  } catch (error) {
+    console.warn("[HEPR] Failed to dispose the previous renderer after a backend switch.", error);
+  }
 }
 
 function isWebGpuSupported(): boolean {
@@ -144,4 +222,73 @@ function cloneViewportCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
   clone.width = source.width;
   clone.height = source.height;
   return clone;
+}
+
+function restorePreviousRendererAndCanvas(
+  options: BackendSwitcherOptions,
+  previousRenderer: RendererApi,
+  previousCanvas: HTMLCanvasElement,
+  replacementCanvas: HTMLCanvasElement,
+  replacementCanvasInstalled: boolean,
+  provisionalRenderer: RendererApi
+): unknown | null {
+  let firstError: unknown | null = null;
+  const attempt = (restore: () => void): void => {
+    try {
+      restore();
+    } catch (error) {
+      firstError ??= error;
+    }
+  };
+
+  attempt(() => {
+    if (options.getRenderer() === provisionalRenderer) {
+      options.setRenderer(previousRenderer);
+    }
+  });
+  attempt(() => {
+    if (replacementCanvasInstalled) {
+      replacementCanvas.replaceWith(previousCanvas);
+    }
+  });
+  attempt(() => {
+    if (options.getCanvasElement() !== previousCanvas) {
+      options.setCanvasElement(previousCanvas);
+    }
+  });
+  attempt(() => options.attachCanvasInteractionListeners(previousCanvas));
+  attempt(() => options.resetPointerInteractionState());
+  return firstError;
+}
+
+function disposeProvisionalRenderer(renderer: RendererApi | null): void {
+  if (!renderer) {
+    return;
+  }
+  try {
+    renderer.setFrameListener(null);
+  } catch {
+    // Preserve the original backend-switch failure.
+  }
+  try {
+    renderer.dispose();
+  } catch {
+    // Preserve the original backend-switch failure.
+  }
+}
+
+function reportSwitchFailure(
+  options: BackendSwitcherOptions,
+  activeRendererBackend: RendererBackend,
+  error: unknown
+): void {
+  const message = error instanceof Error ? error.message : String(error);
+  options.backendSelectElement.value = activeRendererBackend;
+  options.setStatus(`Failed to switch backend: ${message}`);
+}
+
+function combineSwitchErrors(switchError: unknown, rollbackError: unknown): Error {
+  const switchMessage = switchError instanceof Error ? switchError.message : String(switchError);
+  const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+  return new Error(`${switchMessage} (rollback also failed: ${rollbackMessage})`);
 }

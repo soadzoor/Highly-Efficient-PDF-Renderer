@@ -120,10 +120,18 @@ let isPdfWorkerConfigured = false;
  */
 export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
-  options: PdfObjectGeneratorOptions = {}
+  options: PdfObjectGeneratorOptions = {},
+  /** @internal Used by parsed-ZIP export to cancel source loading and parsing. */
+  signal?: AbortSignal
 ): Promise<LoadedPdfScene> {
+  signal?.throwIfAborted();
   const progress = createLoadProgressReporter(options.onProgress);
-  const sourceBytes = await readPdfObjectSourceBytes(source, progress.child(0, 0.16));
+  const sourceBytes = await readPdfObjectSourceBytes(
+    source,
+    progress.child(0, 0.16),
+    signal
+  );
+  signal?.throwIfAborted();
   const sourceKind = resolveSourceKind(source, sourceBytes, options.sourceKind);
   const sourceLabel = resolveSourceLabel(source, sourceKind);
 
@@ -136,11 +144,19 @@ export async function loadPdfSceneFromSource(
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
-    const pageScenes = await extractPdfPageScenes(createParseBuffer(sourceBytes), extractOptions);
+    const pageScenes = await extractPdfPageScenes(
+      createParseBuffer(sourceBytes),
+      extractOptions,
+      signal
+    );
+    signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
     const scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
+    signal?.throwIfAborted();
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
+    signal?.throwIfAborted();
     progress.complete({ sourceType: "pdf" });
+    signal?.throwIfAborted();
     return {
       scene,
       sourceLabel,
@@ -149,10 +165,15 @@ export async function loadPdfSceneFromSource(
     };
   }
 
-  const scene = await loadSceneFromParsedDataZip(createParseBuffer(sourceBytes), {
-    onProgress: progress.child(0.16, 0.95, { sourceType: "zip" }).toCallback()
-  });
+  const scene = await waitForPromiseWithAbort(
+    loadSceneFromParsedDataZip(createParseBuffer(sourceBytes), {
+      onProgress: progress.child(0.16, 0.95, { sourceType: "zip" }).toCallback()
+    }),
+    signal
+  );
+  signal?.throwIfAborted();
   progress.complete({ sourceType: "zip" });
+  signal?.throwIfAborted();
   return {
     scene,
     sourceLabel,
@@ -179,34 +200,50 @@ function ensurePdfWorkerConfigured(): void {
 /** @internal Read an accepted HEPR source without parsing it. */
 export async function readPdfObjectSourceBytes(
   source: PdfObjectSource,
-  progress?: LoadProgressReporter
+  progress?: LoadProgressReporter,
+  /** @internal Used by parsed-ZIP export to cancel source reads. */
+  signal?: AbortSignal
 ): Promise<Uint8Array> {
+  signal?.throwIfAborted();
   progress?.report(0, { stage: "source", unit: "bytes" });
+  signal?.throwIfAborted();
   if (source instanceof Uint8Array) {
     const bytes = new Uint8Array(source);
     progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    signal?.throwIfAborted();
     return bytes;
   }
   if (source instanceof ArrayBuffer) {
     const bytes = new Uint8Array(source).slice();
     progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    signal?.throwIfAborted();
     return bytes;
   }
   if (isBlobLike(source)) {
-    const bytes = new Uint8Array(await source.arrayBuffer()).slice();
+    const buffer = await waitForPromiseWithAbort(source.arrayBuffer(), signal);
+    signal?.throwIfAborted();
+    const bytes = new Uint8Array(buffer).slice();
     progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    signal?.throwIfAborted();
     return bytes;
   }
   if (typeof source === "string") {
-    const bytes = await readStringSourceBytes(source, progress);
+    const bytes = await readStringSourceBytes(source, progress, signal);
+    signal?.throwIfAborted();
     progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
+    signal?.throwIfAborted();
     return bytes;
   }
 
   throw new Error("Unsupported source type. Expected File, Blob, Uint8Array, ArrayBuffer, or string.");
 }
 
-async function readStringSourceBytes(source: string, progress?: LoadProgressReporter): Promise<Uint8Array> {
+async function readStringSourceBytes(
+  source: string,
+  progress?: LoadProgressReporter,
+  signal?: AbortSignal
+): Promise<Uint8Array> {
+  signal?.throwIfAborted();
   const trimmed = source.trim();
   if (trimmed.length === 0) {
     throw new Error("Source string is empty.");
@@ -214,28 +251,40 @@ async function readStringSourceBytes(source: string, progress?: LoadProgressRepo
 
   if (looksLikeDataUrl(trimmed)) {
     const bytes = decodeDataUrlBytes(trimmed);
+    signal?.throwIfAborted();
     progress?.report(1, { stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
     return bytes;
   }
 
   const decodedBase64 = tryDecodeBase64Bytes(trimmed);
   if (decodedBase64 && (hasPdfHeader(decodedBase64) || looksLikeZipBytes(decodedBase64))) {
+    signal?.throwIfAborted();
     progress?.report(1, { stage: "source", unit: "bytes", processed: decodedBase64.length, total: decodedBase64.length });
     return decodedBase64;
   }
 
-  const response = await fetch(trimmed, { cache: "no-store" });
+  const response = await waitForPromiseWithAbort(
+    fetch(trimmed, { cache: "no-store", signal }),
+    signal
+  );
+  signal?.throwIfAborted();
   if (!response.ok) {
     throw new Error(`Failed to load source path/URL (${response.status} ${response.statusText}).`);
   }
-  return readResponseBytesWithProgress(response, progress);
+  return readResponseBytesWithProgress(response, progress, signal);
 }
 
-async function readResponseBytesWithProgress(response: Response, progress?: LoadProgressReporter): Promise<Uint8Array> {
+async function readResponseBytesWithProgress(
+  response: Response,
+  progress?: LoadProgressReporter,
+  signal?: AbortSignal
+): Promise<Uint8Array> {
+  signal?.throwIfAborted();
   const totalHeader = Number(response.headers.get("content-length"));
   const total = Number.isFinite(totalHeader) && totalHeader > 0 ? Math.trunc(totalHeader) : undefined;
   if (!response.body || !progress?.enabled) {
-    const buffer = await response.arrayBuffer();
+    const buffer = await waitForPromiseWithAbort(response.arrayBuffer(), signal);
+    signal?.throwIfAborted();
     const bytes = new Uint8Array(buffer);
     progress?.report(1, {
       stage: "source",
@@ -243,6 +292,7 @@ async function readResponseBytesWithProgress(response: Response, progress?: Load
       processed: bytes.length,
       total: total ?? bytes.length
     });
+    signal?.throwIfAborted();
     return bytes;
   }
 
@@ -251,24 +301,38 @@ async function readResponseBytesWithProgress(response: Response, progress?: Load
   let received = 0;
   progress.report(0, { stage: "source", unit: "bytes", processed: 0, total });
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+  const cancelReader = (): void => {
+    void reader.cancel(readAbortReason(signal)).catch(() => {
+      // The fetch signal may already have errored the stream.
+    });
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
+
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) {
+        break;
+      }
+      if (!value) {
+        continue;
+      }
+      chunks.push(value);
+      received += value.length;
+      if (total) {
+        progress.report(received / total, {
+          stage: "source",
+          unit: "bytes",
+          processed: received,
+          total
+        });
+      }
     }
-    if (!value) {
-      continue;
-    }
-    chunks.push(value);
-    received += value.length;
-    if (total) {
-      progress.report(received / total, {
-        stage: "source",
-        unit: "bytes",
-        processed: received,
-        total
-      });
-    }
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    reader.releaseLock();
   }
 
   const bytes = new Uint8Array(received);
@@ -283,7 +347,53 @@ async function readResponseBytesWithProgress(response: Response, progress?: Load
     processed: received,
     total: total ?? received
   });
+  signal?.throwIfAborted();
   return bytes;
+}
+
+function readAbortReason(signal: AbortSignal | undefined): unknown {
+  if (signal?.aborted) {
+    try {
+      signal.throwIfAborted();
+    } catch (error) {
+      return error;
+    }
+  }
+  return new DOMException("The PDF source load was aborted.", "AbortError");
+}
+
+async function waitForPromiseWithAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined
+): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  signal.throwIfAborted();
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => {
+      finish(() => reject(readAbortReason(signal)));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error))
+    );
+  });
 }
 
 function resolveSourceKind(

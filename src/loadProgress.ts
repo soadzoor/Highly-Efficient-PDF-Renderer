@@ -11,6 +11,7 @@ export type PDFLoadStage =
   | "zip-open"
   | "zip-manifest"
   | "zip-file"
+  | "raster-encode"
   | "zip-build"
   | "vector-lod"
   | "upload"
@@ -44,7 +45,7 @@ export interface PDFLoadProgress {
   sourceType?: "pdf" | "zip";
 
   /** Unit represented by `processed` and `total`, when available. */
-  unit?: "bytes" | "operators" | "files" | "pages";
+  unit?: "bytes" | "operators" | "files" | "pages" | "texels";
 
   /** Completed units for the current stage. */
   processed?: number;
@@ -194,7 +195,7 @@ export class LoadProgressReporter {
     options: {
       stage: PDFLoadStage;
       sourceType?: "pdf" | "zip";
-      unit?: "bytes" | "operators" | "files" | "pages";
+      unit?: "bytes" | "operators" | "files" | "pages" | "texels";
       processed?: number;
       total?: number;
       pageIndex?: number;
@@ -268,6 +269,8 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Reading manifest";
     case "zip-file":
       return "Decoding ZIP";
+    case "raster-encode":
+      return "Compressing raster images";
     case "zip-build":
       return "Building ZIP";
     case "vector-lod":

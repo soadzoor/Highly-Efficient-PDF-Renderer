@@ -1633,6 +1633,8 @@ export class WebGlFloorplanRenderer {
 
   private rasterLayers: RasterLayerGpu[] = [];
 
+  private rasterTextureResidencyEnabled = true;
+
   private gradientData: GradientSceneData | null = null;
 
   private orderedGradientPaintCommands: OrderedGradientPaintCommand[] = [];
@@ -2172,6 +2174,34 @@ export class WebGlFloorplanRenderer {
     this.requestFrame();
   }
 
+  /**
+   * Controls whether native raster textures occupy GPU memory independently
+   * from whether raster paint is visible in native frames.
+   */
+  setRasterTextureResidency(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.rasterTextureResidencyEnabled === nextEnabled || this.isDisposed) {
+      return;
+    }
+    this.rasterTextureResidencyEnabled = nextEnabled;
+    if (nextEnabled) {
+      if (this.scene) {
+        try {
+          this.uploadRasterLayers(this.scene);
+        } catch (error) {
+          this.rasterTextureResidencyEnabled = false;
+          this.destroyRasterLayerTextures();
+          throw error;
+        }
+      }
+    } else {
+      this.destroyRasterLayerTextures();
+    }
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   setStrokeRenderingEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.strokeRenderingEnabled === nextEnabled) {
@@ -2324,6 +2354,9 @@ export class WebGlFloorplanRenderer {
   }
 
   setScene(scene: VectorScene): SceneStats {
+    if (this.isDisposed) {
+      throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
+    }
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
@@ -2340,7 +2373,10 @@ export class WebGlFloorplanRenderer {
     this.panCacheValid = false;
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
-    this.uploadRasterLayers(scene);
+    this.destroyRasterLayerTextures();
+    if (this.rasterTextureResidencyEnabled) {
+      this.uploadRasterLayers(scene);
+    }
     this.uploadGradientPaintData(scene);
     const fillTextureStats = this.uploadFillPaths(scene);
     const textureStats = this.uploadSegments(scene);
@@ -2595,9 +2631,7 @@ export class WebGlFloorplanRenderer {
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
     const gl = this.gl;
-    for (const layer of this.rasterLayers) {
-      gl.deleteTexture(layer.texture);
-    }
+    this.destroyRasterLayerTextures();
     this.rasterLayers = [];
 
     const textures: WebGLTexture[] = [
@@ -4272,45 +4306,72 @@ export class WebGlFloorplanRenderer {
     ranges.push({ start: clampedStart, count: clampedCount });
   }
 
-  private uploadRasterLayers(scene: VectorScene): void {
+  private destroyRasterLayerTextures(): void {
     const gl = this.gl;
     for (const layer of this.rasterLayers) {
       gl.deleteTexture(layer.texture);
     }
     this.rasterLayers = [];
+  }
 
-    for (const source of this.getSceneRasterLayers(scene)) {
-      const texture = gl.createTexture();
-      if (!texture) {
-        continue;
+  private uploadRasterLayers(scene: VectorScene): void {
+    const rasterSources = this.getSceneRasterLayers(scene);
+    const maxRasterTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
+    for (const [index, source] of rasterSources.entries()) {
+      if (source.width > maxRasterTextureSize || source.height > maxRasterTextureSize) {
+        throw new Error(
+          `Raster layer ${index} requires a ${source.width}x${source.height} texture, ` +
+          `but this WebGL2 context supports at most ${maxRasterTextureSize}x${maxRasterTextureSize}.`
+        );
       }
+    }
 
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      configureRasterTexture(gl);
-      const pixels = source.data.subarray(0, source.width * source.height * 4);
-      const premultiplied = premultiplyRgba(pixels);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, source.width, source.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultiplied);
-      gl.generateMipmap(gl.TEXTURE_2D);
+    this.destroyRasterLayerTextures();
+    const gl = this.gl;
 
-      const matrix = new Float32Array(6);
-      if (source.matrix.length >= 6) {
-        matrix[0] = source.matrix[0];
-        matrix[1] = source.matrix[1];
-        matrix[2] = source.matrix[2];
-        matrix[3] = source.matrix[3];
-        matrix[4] = source.matrix[4];
-        matrix[5] = source.matrix[5];
-      } else {
-        matrix[0] = 1;
-        matrix[3] = 1;
+    try {
+      for (const source of rasterSources) {
+        const texture = this.mustCreateTexture();
+        try {
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          configureRasterTexture(gl);
+          const pixels = source.data.subarray(0, source.width * source.height * 4);
+          const premultiplied = premultiplyRgba(pixels);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            source.width,
+            source.height,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            premultiplied
+          );
+          gl.generateMipmap(gl.TEXTURE_2D);
+        } catch (error) {
+          gl.deleteTexture(texture);
+          throw error;
+        }
+
+        const matrix = new Float32Array(6);
+        if (source.matrix.length >= 6) {
+          matrix.set(source.matrix.subarray(0, 6));
+        } else {
+          matrix[0] = 1;
+          matrix[3] = 1;
+        }
+
+        this.rasterLayers.push({
+          texture,
+          matrix,
+          paintOrder: source.paintOrder,
+          pageIndex: source.pageIndex
+        });
       }
-
-      this.rasterLayers.push({
-        texture,
-        matrix,
-        paintOrder: Number.isFinite(source.paintOrder) ? source.paintOrder : 0,
-        pageIndex: Number.isFinite(source.pageIndex) ? Math.max(0, Math.trunc(source.pageIndex)) : 0
-      });
+    } catch (error) {
+      this.destroyRasterLayerTextures();
+      throw error;
     }
   }
 
@@ -4344,8 +4405,8 @@ export class WebGlFloorplanRenderer {
           height,
           data: layer.data,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
-          paintOrder: Number(layer.paintOrder),
-          pageIndex: Number(layer.pageIndex)
+          paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+          pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
         });
       }
     }
@@ -4466,7 +4527,10 @@ export class WebGlFloorplanRenderer {
       );
     }
 
-    this.orderedGradientPaintCommands = buildOrderedGradientPaintCommands(this.rasterLayers, data);
+    this.orderedGradientPaintCommands = buildOrderedGradientPaintCommands(
+      this.getSceneRasterLayers(scene),
+      data
+    );
     this.gradientPaintRequiresDirectRendering = orderedGradientPaintNeedsDirectRendering(
       this.orderedGradientPaintCommands
     );

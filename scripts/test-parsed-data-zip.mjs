@@ -1065,7 +1065,7 @@ async function run() {
     });
     await assert.rejects(
       loadSceneFromParsedDataZip(missingRasterPayloadBytes),
-      /missing or cannot decode raster layer 0/,
+      /missing raster layer 0/,
       "missing raster payload must be rejected"
     );
 
