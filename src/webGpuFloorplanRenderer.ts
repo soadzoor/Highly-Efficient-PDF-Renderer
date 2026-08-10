@@ -1,4 +1,13 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import {
+  buildOrderedGradientPaintCommands,
+  GRADIENT_LUT_WIDTH,
+  orderedGradientPaintNeedsDirectRendering,
+  readGradientSceneData,
+  type GradientSceneData,
+  type OrderedGradientPaintCommand
+} from "./orderedGradientPaint";
+import { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } from "./nativeGradientWebGpuShaders";
 import type { DrawStats, SceneStats, SearchHighlightSet, ViewState } from "./webGlFloorplanRenderer";
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
@@ -21,6 +30,8 @@ interface WebGpuRasterLayerResource {
   texture: any;
   uniformBuffer: any;
   bindGroup: any;
+  paintOrder: number;
+  pageIndex: number;
 }
 
 interface WebGpuVectorLodLevelResource {
@@ -1163,6 +1174,10 @@ export class WebGpuFloorplanRenderer {
 
   private readonly fillPipeline: any;
 
+  private readonly gradientFillPipeline: any;
+
+  private readonly gradientStrokePipeline: any;
+
   private readonly textPipeline: any;
 
   private readonly rasterPipeline: any;
@@ -1211,11 +1226,17 @@ export class WebGpuFloorplanRenderer {
 
   private readonly rasterLayerSampler: any;
 
+  private readonly gradientSampler: any;
+
   private readonly vectorCompositeSampler: any;
 
   private readonly strokeBindGroupLayout: any;
 
   private readonly fillBindGroupLayout: any;
+
+  private readonly gradientFillBindGroupLayout: any;
+
+  private readonly gradientStrokeBindGroupLayout: any;
 
   private readonly textBindGroupLayout: any;
 
@@ -1230,6 +1251,10 @@ export class WebGpuFloorplanRenderer {
   private strokeBindGroupVisible: any = null;
 
   private fillBindGroup: any = null;
+
+  private gradientFillBindGroup: any = null;
+
+  private gradientStrokeBindGroup: any = null;
 
   private textBindGroup: any = null;
 
@@ -1276,6 +1301,20 @@ export class WebGpuFloorplanRenderer {
 
   private textRasterAtlasTexture: any = null;
   private pageBackgroundTexture: any = null;
+
+  private gradientMetaTextures: any[] = [];
+
+  private gradientLutTexture: any = null;
+
+  private gradientFillTextures: any[] = [];
+
+  private gradientStrokeTextures: any[] = [];
+
+  private gradientData: GradientSceneData | null = null;
+
+  private orderedGradientPaintCommands: OrderedGradientPaintCommand[] = [];
+
+  private gradientPaintRequiresDirectRendering = false;
 
   private segmentIdBufferAll: any = null;
 
@@ -1561,6 +1600,66 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
+    this.gradientFillBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        ...[1, 2, 3, 4].map((binding) => ({
+          binding,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        })),
+        ...[5, 6, 7, 8, 9, 10, 11].map((binding) => ({
+          binding,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        })),
+        {
+          binding: 12,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 13,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        }
+      ]
+    });
+
+    this.gradientStrokeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES }
+        },
+        ...[1, 2, 3, 4, 5].map((binding) => ({
+          binding,
+          visibility: gpuShaderStage.VERTEX,
+          texture: { sampleType: "unfilterable-float" }
+        })),
+        ...[6, 7, 8, 9, 10].map((binding) => ({
+          binding,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        })),
+        {
+          binding: 11,
+          visibility: gpuShaderStage.FRAGMENT,
+          sampler: { type: "filtering" }
+        },
+        {
+          binding: 12,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        }
+      ]
+    });
+
     this.textBindGroupLayout = this.gpuDevice.createBindGroupLayout({
       entries: [
         {
@@ -1712,6 +1811,12 @@ export class WebGpuFloorplanRenderer {
     const fillPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.fillBindGroupLayout]
     });
+    const gradientFillPipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.gradientFillBindGroupLayout]
+    });
+    const gradientStrokePipelineLayout = this.gpuDevice.createPipelineLayout({
+      bindGroupLayouts: [this.gradientStrokeBindGroupLayout]
+    });
     const textPipelineLayout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [this.textBindGroupLayout]
     });
@@ -1732,6 +1837,8 @@ export class WebGpuFloorplanRenderer {
     this.strokePipeline = this.createPipeline(STROKE_SHADER_SOURCE, "vsMain", "fsMain", strokePipelineLayout);
     this.highlightPipeline = this.createPipeline(HIGHLIGHT_SHADER_SOURCE, "vsMain", "fsMain", highlightPipelineLayout);
     this.fillPipeline = this.createPipeline(FILL_SHADER_SOURCE, "vsMain", "fsMain", fillPipelineLayout);
+    this.gradientFillPipeline = this.createPipeline(GRADIENT_FILL_WGSL, "vsMain", "fsMain", gradientFillPipelineLayout);
+    this.gradientStrokePipeline = this.createPipeline(GRADIENT_STROKE_WGSL, "vsMain", "fsMain", gradientStrokePipelineLayout);
     this.textPipeline = this.createPipeline(TEXT_SHADER_SOURCE, "vsMain", "fsMain", textPipelineLayout);
     this.rasterPipeline = this.createPipeline(RASTER_SHADER_SOURCE, "vsMain", "fsMain", rasterPipelineLayout, true);
     this.blitPipeline = this.createPipeline(BLIT_SHADER_SOURCE, "vsMain", "fsMain", blitPipelineLayout);
@@ -1755,6 +1862,14 @@ export class WebGpuFloorplanRenderer {
       magFilter: "linear",
       minFilter: "linear",
       mipmapFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge"
+    });
+
+    this.gradientSampler = this.gpuDevice.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "nearest",
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge"
     });
@@ -2119,6 +2234,7 @@ export class WebGpuFloorplanRenderer {
 
     this.configurePageBackgroundResources(scene);
     this.configureRasterLayers(scene);
+    this.configureGradientPaint(scene, maxTextureSize);
 
     this.allSegmentIds = new Uint32Array(this.segmentCount);
     for (let i = 0; i < this.segmentCount; i += 1) {
@@ -2761,6 +2877,8 @@ export class WebGpuFloorplanRenderer {
       (this.segmentCount === 0 &&
         this.fillPathCount === 0 &&
         this.textInstanceCount === 0 &&
+        (this.gradientData?.gradientFillPathCount ?? 0) === 0 &&
+        (this.gradientData?.gradientStrokeRunCount ?? 0) === 0 &&
         this.rasterLayerResources.length === 0 &&
         this.pageBackgroundResources.length === 0)
     ) {
@@ -2925,13 +3043,19 @@ export class WebGpuFloorplanRenderer {
   private hasVectorContent(): boolean {
     return (
       (this.fillRenderingEnabled && this.fillPathCount > 0) ||
+      (this.fillRenderingEnabled && (this.gradientData?.gradientFillPathCount ?? 0) > 0) ||
       (this.strokeRenderingEnabled && this.segmentCount > 0) ||
+      (this.strokeRenderingEnabled && (this.gradientData?.gradientStrokeRunCount ?? 0) > 0) ||
       (this.textRenderingEnabled && this.textInstanceCount > 0)
     );
   }
 
   private shouldUseVectorMinifyPath(): boolean {
-    if (this.textVectorOnly || !this.hasVectorContent()) {
+    if (
+      this.textVectorOnly ||
+      (this.rasterRenderingEnabled && this.gradientPaintRequiresDirectRendering) ||
+      !this.hasVectorContent()
+    ) {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
@@ -2969,6 +3093,7 @@ export class WebGpuFloorplanRenderer {
     });
 
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    this.drawOrderedGradientVectorsIntoPass(pass);
     const renderedSegments = this.drawVectorContentIntoPass(pass);
     pass.end();
     this.gpuDevice.queue.submit([encoder.finish()]);
@@ -3071,8 +3196,76 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number
   ): number {
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY);
-    this.drawRasterContentIntoPass(pass);
+    this.drawOrderedGradientPaintIntoPass(pass);
     return this.drawVectorContentIntoPass(pass);
+  }
+
+  private drawPageBackgroundContentIntoPass(pass: any): void {
+    if (!this.rasterRenderingEnabled || this.pageBackgroundResources.length === 0) {
+      return;
+    }
+    pass.setPipeline(this.rasterPipeline);
+    for (const layer of this.pageBackgroundResources) {
+      pass.setBindGroup(0, layer.bindGroup);
+      pass.draw(4, 1, 0, 0);
+    }
+  }
+
+  private drawOrderedGradientPaintIntoPass(pass: any): void {
+    this.drawPageBackgroundContentIntoPass(pass);
+    for (const command of this.orderedGradientPaintCommands) {
+      if (command.kind === "raster") {
+        if (!this.rasterRenderingEnabled) {
+          continue;
+        }
+        const resource = this.rasterLayerResources[command.index];
+        if (resource) {
+          pass.setPipeline(this.rasterPipeline);
+          pass.setBindGroup(0, resource.bindGroup);
+          pass.draw(4, 1, 0, 0);
+        }
+      } else if (command.kind === "gradient-fill") {
+        if (this.fillRenderingEnabled) {
+          this.drawGradientFillIntoPass(pass, command.index);
+        }
+      } else if (this.strokeRenderingEnabled) {
+        this.drawGradientStrokeIntoPass(pass, command.index);
+      }
+    }
+  }
+
+  private drawOrderedGradientVectorsIntoPass(pass: any): void {
+    for (const command of this.orderedGradientPaintCommands) {
+      if (command.kind === "gradient-fill" && this.fillRenderingEnabled) {
+        this.drawGradientFillIntoPass(pass, command.index);
+      } else if (command.kind === "gradient-stroke" && this.strokeRenderingEnabled) {
+        this.drawGradientStrokeIntoPass(pass, command.index);
+      }
+    }
+  }
+
+  private drawGradientFillIntoPass(pass: any, pathIndex: number): void {
+    const data = this.gradientData;
+    if (!data || !this.gradientFillBindGroup || pathIndex < 0 || pathIndex >= data.gradientFillPathCount) {
+      return;
+    }
+    pass.setPipeline(this.gradientFillPipeline);
+    pass.setBindGroup(0, this.gradientFillBindGroup);
+    pass.draw(4, 1, pathIndex * 4, 0);
+  }
+
+  private drawGradientStrokeIntoPass(pass: any, runIndex: number): void {
+    const data = this.gradientData;
+    if (!data || !this.gradientStrokeBindGroup || runIndex < 0 || runIndex >= data.gradientStrokeRunCount) {
+      return;
+    }
+    const segmentCount = Math.max(0, Math.trunc(data.gradientStrokeRunMetaA[runIndex * 4 + 1] ?? 0));
+    if (segmentCount === 0) {
+      return;
+    }
+    pass.setPipeline(this.gradientStrokePipeline);
+    pass.setBindGroup(0, this.gradientStrokeBindGroup);
+    pass.draw(4, segmentCount, runIndex * 4, 0);
   }
 
   private drawRasterContentIntoPass(pass: any): void {
@@ -3080,19 +3273,19 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
-    if (this.pageBackgroundResources.length > 0) {
-      pass.setPipeline(this.rasterPipeline);
-      for (const layer of this.pageBackgroundResources) {
-        pass.setBindGroup(0, layer.bindGroup);
-        pass.draw(4, 1, 0, 0);
-      }
-    }
+    this.drawPageBackgroundContentIntoPass(pass);
 
     if (this.rasterLayerResources.length > 0) {
       pass.setPipeline(this.rasterPipeline);
-      for (const layer of this.rasterLayerResources) {
-        pass.setBindGroup(0, layer.bindGroup);
-        pass.draw(4, 1, 0, 0);
+      for (const command of this.orderedGradientPaintCommands) {
+        if (command.kind !== "raster") {
+          continue;
+        }
+        const layer = this.rasterLayerResources[command.index];
+        if (layer) {
+          pass.setBindGroup(0, layer.bindGroup);
+          pass.draw(4, 1, 0, 0);
+        }
       }
     }
   }
@@ -3689,8 +3882,91 @@ export class WebGpuFloorplanRenderer {
       const rgba = source.data.subarray(0, source.width * source.height * 4);
       const premultiplied = premultiplyRgba(rgba);
       const texture = this.createRgba8Texture(source.width, source.height, premultiplied);
-      this.rasterLayerResources.push(this.createRasterLayerResource(matrix, texture));
+      this.rasterLayerResources.push(
+        this.createRasterLayerResource(matrix, texture, source.paintOrder, source.pageIndex)
+      );
     }
+  }
+
+  private configureGradientPaint(scene: VectorScene, maxTextureSize: number): void {
+    const data = readGradientSceneData(scene);
+    this.gradientData = data;
+    const gradientDims = chooseTextureDimensions(data.gradientCount, maxTextureSize);
+    const fillPathDims = chooseTextureDimensions(data.gradientFillPathCount, maxTextureSize);
+    const fillSegmentDims = chooseTextureDimensions(data.gradientFillSegmentCount, maxTextureSize);
+    const strokeRunDims = chooseTextureDimensions(data.gradientStrokeRunCount, maxTextureSize);
+    const strokeSegmentDims = chooseTextureDimensions(data.gradientStrokeSegmentCount, maxTextureSize);
+
+    this.gradientMetaTextures = [
+      data.gradientMetaA,
+      data.gradientMetaB,
+      data.gradientMetaC,
+      data.gradientMetaD,
+      data.gradientMetaE
+    ].map((source) => this.createFloatTexture(gradientDims.width, gradientDims.height, source));
+
+    if (data.gradientCount > 0) {
+      const byteLength = GRADIENT_LUT_WIDTH * data.gradientCount * 4;
+      const lut = new Uint8Array(byteLength);
+      lut.set(data.gradientLut.subarray(0, byteLength));
+      this.gradientLutTexture = this.createRgba8DataTexture(GRADIENT_LUT_WIDTH, data.gradientCount, lut);
+    } else {
+      this.gradientLutTexture = this.createRgba8DataTexture(1, 1, new Uint8Array(4));
+    }
+
+    this.gradientFillTextures = [
+      this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaA),
+      this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaB),
+      this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaC),
+      this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPaintMeta),
+      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsA),
+      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsB)
+    ];
+    this.gradientStrokeTextures = [
+      this.createFloatTexture(strokeRunDims.width, strokeRunDims.height, data.gradientStrokeRunMetaA),
+      this.createFloatTexture(strokeSegmentDims.width, strokeSegmentDims.height, data.gradientStrokeEndpoints),
+      this.createFloatTexture(strokeSegmentDims.width, strokeSegmentDims.height, data.gradientStrokePrimitiveMeta),
+      this.createFloatTexture(strokeSegmentDims.width, strokeSegmentDims.height, data.gradientStrokePrimitiveBounds),
+      this.createFloatTexture(strokeSegmentDims.width, strokeSegmentDims.height, data.gradientStrokeStyles)
+    ];
+
+    this.gradientFillBindGroup = this.gpuDevice.createBindGroup({
+      layout: this.gradientFillBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES } },
+        ...this.gradientFillTextures.map((texture, index) => ({
+          binding: index + 1,
+          resource: texture.createView()
+        })),
+        ...this.gradientMetaTextures.map((texture, index) => ({
+          binding: index + 7,
+          resource: texture.createView()
+        })),
+        { binding: 12, resource: this.gradientSampler },
+        { binding: 13, resource: this.gradientLutTexture.createView() }
+      ]
+    });
+    this.gradientStrokeBindGroup = this.gpuDevice.createBindGroup({
+      layout: this.gradientStrokeBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES } },
+        ...this.gradientStrokeTextures.map((texture, index) => ({
+          binding: index + 1,
+          resource: texture.createView()
+        })),
+        ...this.gradientMetaTextures.map((texture, index) => ({
+          binding: index + 6,
+          resource: texture.createView()
+        })),
+        { binding: 11, resource: this.gradientSampler },
+        { binding: 12, resource: this.gradientLutTexture.createView() }
+      ]
+    });
+
+    this.orderedGradientPaintCommands = buildOrderedGradientPaintCommands(this.rasterLayerResources, data);
+    this.gradientPaintRequiresDirectRendering = orderedGradientPaintNeedsDirectRendering(
+      this.orderedGradientPaintCommands
+    );
   }
 
   private configurePageBackgroundResources(scene: VectorScene): void {
@@ -3721,8 +3997,22 @@ export class WebGpuFloorplanRenderer {
 
   private getSceneRasterLayers(
     scene: VectorScene
-  ): Array<{ width: number; height: number; data: Uint8Array<ArrayBufferLike>; matrix: Float32Array }> {
-    const out: Array<{ width: number; height: number; data: Uint8Array<ArrayBufferLike>; matrix: Float32Array }> = [];
+  ): Array<{
+    width: number;
+    height: number;
+    data: Uint8Array<ArrayBufferLike>;
+    matrix: Float32Array;
+    paintOrder: number;
+    pageIndex: number;
+  }> {
+    const out: Array<{
+      width: number;
+      height: number;
+      data: Uint8Array<ArrayBufferLike>;
+      matrix: Float32Array;
+      paintOrder: number;
+      pageIndex: number;
+    }> = [];
     if (Array.isArray(scene.rasterLayers)) {
       for (const layer of scene.rasterLayers) {
         const width = Math.max(0, Math.trunc(layer?.width ?? 0));
@@ -3734,7 +4024,9 @@ export class WebGpuFloorplanRenderer {
           width,
           height,
           data: layer.data,
-          matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix)
+          matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
+          paintOrder: Number(layer.paintOrder),
+          pageIndex: Number(layer.pageIndex)
         });
       }
     }
@@ -3753,7 +4045,9 @@ export class WebGpuFloorplanRenderer {
       width: legacyWidth,
       height: legacyHeight,
       data: scene.rasterLayerData,
-      matrix: scene.rasterLayerMatrix
+      matrix: scene.rasterLayerMatrix,
+      paintOrder: 0,
+      pageIndex: 0
     });
     return out;
   }
@@ -3797,7 +4091,12 @@ export class WebGpuFloorplanRenderer {
     this.writeRgba8Texture(this.pageBackgroundTexture, 1, 1, rgba, 0);
   }
 
-  private createRasterLayerResource(matrix: Float32Array, texture: any): WebGpuRasterLayerResource {
+  private createRasterLayerResource(
+    matrix: Float32Array,
+    texture: any,
+    paintOrder = 0,
+    pageIndex = 0
+  ): WebGpuRasterLayerResource {
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
     rasterUniforms[0] = matrix[0];
@@ -3838,7 +4137,13 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
-    return { texture, uniformBuffer, bindGroup };
+    return {
+      texture,
+      uniformBuffer,
+      bindGroup,
+      paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
+      pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
+    };
   }
 
   private createFloatTexture(width: number, height: number, source: Float32Array): any {
@@ -4067,6 +4372,8 @@ export class WebGpuFloorplanRenderer {
     this.strokeBindGroupAll = null;
     this.strokeBindGroupVisible = null;
     this.fillBindGroup = null;
+    this.gradientFillBindGroup = null;
+    this.gradientStrokeBindGroup = null;
     this.textBindGroup = null;
     this.destroyPageBackgroundResources();
     this.destroyRasterLayerResources();
@@ -4089,7 +4396,11 @@ export class WebGpuFloorplanRenderer {
       this.textGlyphRasterMetaTexture,
       this.textGlyphSegmentTextureA,
       this.textGlyphSegmentTextureB,
-      this.textRasterAtlasTexture
+      this.textRasterAtlasTexture,
+      ...this.gradientMetaTextures,
+      this.gradientLutTexture,
+      ...this.gradientFillTextures,
+      ...this.gradientStrokeTextures
     ];
 
     for (const texture of textures) {
@@ -4116,6 +4427,13 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphSegmentTextureA = null;
     this.textGlyphSegmentTextureB = null;
     this.textRasterAtlasTexture = null;
+    this.gradientMetaTextures = [];
+    this.gradientLutTexture = null;
+    this.gradientFillTextures = [];
+    this.gradientStrokeTextures = [];
+    this.gradientData = null;
+    this.orderedGradientPaintCommands = [];
+    this.gradientPaintRequiresDirectRendering = false;
   }
 
   clientToScenePoint(clientX: number, clientY: number): { x: number; y: number } | null {

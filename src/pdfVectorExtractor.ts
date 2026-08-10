@@ -63,6 +63,10 @@ export interface RasterLayer {
   height: number;
   data: Uint8Array<ArrayBufferLike>;
   matrix: Float32Array;
+  /** Dense PDF paint ordinal within `pageIndex`. */
+  paintOrder: number;
+  /** Zero-based page slot in the composed scene. */
+  pageIndex: number;
 }
 
 /** Searchable text for one page, in scene space (Y-up, page placement baked in). */
@@ -118,6 +122,29 @@ export interface VectorScene {
   fillPathMetaC: Float32Array;
   fillSegmentsA: Float32Array;
   fillSegmentsB: Float32Array;
+  gradientCount: number;
+  gradientMetaA: Float32Array;
+  gradientMetaB: Float32Array;
+  gradientMetaC: Float32Array;
+  gradientMetaD: Float32Array;
+  gradientMetaE: Float32Array;
+  gradientLut: Uint8Array;
+  gradientFillPathCount: number;
+  gradientFillSegmentCount: number;
+  gradientFillPathMetaA: Float32Array;
+  gradientFillPathMetaB: Float32Array;
+  gradientFillPathMetaC: Float32Array;
+  gradientFillPaintMeta: Float32Array;
+  gradientFillSegmentsA: Float32Array;
+  gradientFillSegmentsB: Float32Array;
+  gradientStrokeRunCount: number;
+  gradientStrokeSegmentCount: number;
+  gradientStrokeRunMetaA: Float32Array;
+  gradientStrokeRunMetaB: Float32Array;
+  gradientStrokeEndpoints: Float32Array;
+  gradientStrokePrimitiveMeta: Float32Array;
+  gradientStrokePrimitiveBounds: Float32Array;
+  gradientStrokeStyles: Float32Array;
   segmentCount: number;
   sourceSegmentCount: number;
   mergedSegmentCount: number;
@@ -357,6 +384,7 @@ const RASTER_CROP_PADDING_PX = 2;
 const RASTER_MAX_SCALE = 24;
 const RASTER_MAX_DIMENSION = 16384;
 const RASTER_MAX_PIXELS = 134_217_728;
+export const GRADIENT_LUT_WIDTH = 1024;
 
 const FILL_RULE_NONZERO = 0;
 const FILL_RULE_EVEN_ODD = 1;
@@ -634,7 +662,9 @@ async function extractSinglePageRasterOnly(
     width: layer.width,
     height: layer.height,
     data: layer.data,
-    matrix: new Float32Array(layer.matrix)
+    matrix: new Float32Array(layer.matrix),
+    paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+    pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
   }));
 
   const base = createEmptyVectorScene();
@@ -678,9 +708,63 @@ async function extractSinglePageVectors(
   });
   const pageBounds = transformBounds(rawPageBounds, pageMatrix);
   const imagePaintOpCount = countImagePaintOps(operatorList);
+  const sourceNativeGradientPlan = buildNativeGradientPlan(
+    page,
+    operatorList,
+    pageMatrix,
+    pageBounds
+  );
+  let nativeGradientPlan: NativeGradientPlan | null = null;
+  let displayNativeGradientPlan: NativeGradientPlan | null = null;
+  let preparedDisplayOperatorList: PdfOperatorListLike | null | undefined;
+  if (sourceNativeGradientPlan.paints.length > 0) {
+    preparedDisplayOperatorList = await prepareDisplayOperatorList(page as RasterPageLike);
+    if (preparedDisplayOperatorList) {
+      displayNativeGradientPlan = buildNativeGradientPlan(
+        page,
+        preparedDisplayOperatorList,
+        pageMatrix,
+        pageBounds
+      );
+      const displayExcludedPaintMask = displayNativeGradientPlan.rasterExcludedPaintMask;
+      const displayHasExternalImagePaint = preparedDisplayOperatorList.fnArray.some(
+        (fn, index) => isImagePaintOperator(fn) && displayExcludedPaintMask[index] !== 1
+      );
+      const displayImageScan = displayHasExternalImagePaint
+        ? scanRasterImageOps(preparedDisplayOperatorList, displayExcludedPaintMask)
+        : null;
+      const nativeImageOrderingIsRepresentable =
+        !displayHasExternalImagePaint ||
+        (displayImageScan?.plans !== null &&
+          displayImageScan?.plans !== undefined &&
+          displayImageScan.plans.length <= RASTER_MAX_IMAGE_LAYERS);
+      if (
+        nativeGradientTopologyMatches(sourceNativeGradientPlan, displayNativeGradientPlan) &&
+        nativeImageOrderingIsRepresentable
+      ) {
+        nativeGradientPlan = sourceNativeGradientPlan;
+      } else {
+        displayNativeGradientPlan = null;
+      }
+    }
+  }
   let rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
-    allowFullPageFallback: false
+    allowFullPageFallback: false,
+    preparedDisplayOperatorList,
+    nativeSourcePlan: nativeGradientPlan,
+    nativeDisplayPlan: displayNativeGradientPlan
   });
+  if (nativeGradientPlan && rasterExtract.nativeOrderingFailed) {
+    // A nominally measurable image can still fail its individual crop/render
+    // at runtime. Revert the whole page to its established atomic raster plan
+    // instead of flattening images across a sparse native paint.
+    nativeGradientPlan = null;
+    displayNativeGradientPlan = null;
+    rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
+      allowFullPageFallback: false,
+      preparedDisplayOperatorList
+    });
+  }
   const suppressedPaintMask = rasterExtract.suppressedSourcePaintMask;
 
   const endpointBuilder = new Float4Builder();
@@ -692,6 +776,18 @@ async function extractSinglePageVectors(
   const fillPathMetaCBuilder = new Float4Builder(8_192);
   const fillSegmentBuilderA = new Float4Builder(65_536);
   const fillSegmentBuilderB = new Float4Builder(65_536);
+  const gradientFillPathMetaABuilder = new Float4Builder(128);
+  const gradientFillPathMetaBBuilder = new Float4Builder(128);
+  const gradientFillPathMetaCBuilder = new Float4Builder(128);
+  const gradientFillPaintMetaBuilder = new Float4Builder(128);
+  const gradientFillSegmentBuilderA = new Float4Builder(1_024);
+  const gradientFillSegmentBuilderB = new Float4Builder(1_024);
+  const gradientStrokeRunMetaABuilder = new Float4Builder(128);
+  const gradientStrokeRunMetaBBuilder = new Float4Builder(128);
+  const gradientStrokeEndpointBuilder = new Float4Builder(1_024);
+  const gradientStrokePrimitiveMetaBuilder = new Float4Builder(1_024);
+  const gradientStrokePrimitiveBoundsBuilder = new Float4Builder(1_024);
+  const gradientStrokeStyleBuilder = new Float4Builder(1_024);
 
   const bounds: Bounds = {
     minX: Number.POSITIVE_INFINITY,
@@ -705,10 +801,17 @@ async function extractSinglePageVectors(
     maxX: Number.NEGATIVE_INFINITY,
     maxY: Number.NEGATIVE_INFINITY
   };
+  const gradientBounds: Bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY
+  };
 
   let pathCount = 0;
   let sourceSegmentCount = 0;
   let maxHalfWidth = 0;
+  let gradientMaxHalfWidth = 0;
   let fillPathCount = 0;
 
   const stateStack: GraphicsState[] = [];
@@ -961,6 +1064,11 @@ async function extractSinglePageVectors(
       continue;
     }
 
+    if (nativeGradientPlan?.nativePathPaintMask[i] === 1) {
+      pathCount += 1;
+      continue;
+    }
+
     if (currentState.clipBounds && !isNonEmptyBounds(intersectBounds(currentState.clipBounds, transformedPathBounds))) {
       continue;
     }
@@ -1035,6 +1143,119 @@ async function extractSinglePageVectors(
     }
   }
 
+  if (nativeGradientPlan) {
+    for (const paint of nativeGradientPlan.paints) {
+      if (paint.kind === "fill") {
+        const pathStart = gradientFillPathMetaABuilder.quadCount;
+        const sourceIsSolid = paint.sourceGradientIndex < 0;
+        const emittedPathCount = emitFilledPathFromPath(
+          paint.pathData,
+          paint.matrix,
+          paint.fillRule,
+          false,
+          sourceIsSolid ? clamp01(paint.state.fillR) : 0,
+          sourceIsSolid ? clamp01(paint.state.fillG) : 0,
+          sourceIsSolid ? clamp01(paint.state.fillB) : 0,
+          effectiveNativeFillAlpha(paint.state),
+          gradientFillPathMetaABuilder,
+          gradientFillPathMetaBBuilder,
+          gradientFillPathMetaCBuilder,
+          gradientFillSegmentBuilderA,
+          gradientFillSegmentBuilderB,
+          gradientBounds,
+          paint.state.clipBounds,
+          null,
+          pageBounds,
+          true,
+          false
+        );
+        for (let i = 0; i < emittedPathCount; i += 1) {
+          gradientFillPaintMetaBuilder.push(
+            paint.sourceGradientIndex,
+            paint.maskGradientIndex,
+            paint.paintOrdinal,
+            0
+          );
+        }
+        if (gradientFillPathMetaABuilder.quadCount - pathStart !== emittedPathCount) {
+          throw new Error("Native gradient fill metadata is out of sync with its path geometry.");
+        }
+        continue;
+      }
+
+      const segmentStart = gradientStrokeEndpointBuilder.quadCount;
+      const isHairlineStroke = paint.state.lineWidth <= 0;
+      const widthScale = matrixScale(paint.matrix);
+      const strokeWidth = isHairlineStroke ? 0 : paint.state.lineWidth * widthScale;
+      const halfWidth = Math.max(0, strokeWidth * 0.5);
+      gradientMaxHalfWidth = Math.max(gradientMaxHalfWidth, halfWidth);
+      let styleFlags = isHairlineStroke ? STROKE_STYLE_FLAG_HAIRLINE : 0;
+      if (paint.state.lineCap === 1) {
+        styleFlags |= STROKE_STYLE_FLAG_ROUND_CAP;
+      }
+      const sourceIsSolid = paint.sourceGradientIndex < 0;
+      emitSegmentsFromPath(
+        paint.pathData,
+        paint.matrix,
+        halfWidth,
+        sourceIsSolid ? clamp01(paint.state.strokeR) : 0,
+        sourceIsSolid ? clamp01(paint.state.strokeG) : 0,
+        sourceIsSolid ? clamp01(paint.state.strokeB) : 0,
+        effectiveNativeStrokeAlpha(paint.state),
+        styleFlags,
+        paint.state.lineDash,
+        paint.state.dashPhase,
+        options.enableSegmentMerge,
+        gradientStrokeEndpointBuilder,
+        gradientStrokePrimitiveMetaBuilder,
+        gradientStrokeStyleBuilder,
+        gradientStrokePrimitiveBoundsBuilder,
+        gradientBounds,
+        paint.state.clipBounds,
+        true
+      );
+      const segmentCount = gradientStrokeEndpointBuilder.quadCount - segmentStart;
+      if (segmentCount > 0) {
+        gradientStrokeRunMetaABuilder.push(
+          segmentStart,
+          segmentCount,
+          paint.sourceGradientIndex,
+          paint.maskGradientIndex
+        );
+        gradientStrokeRunMetaBBuilder.push(paint.paintOrdinal, 0, 0, 0);
+      }
+    }
+  }
+
+  const gradientCount = nativeGradientPlan?.gradients.length ?? 0;
+  const gradientMetaA = new Float32Array(gradientCount * 4);
+  const gradientMetaB = new Float32Array(gradientCount * 4);
+  const gradientMetaC = new Float32Array(gradientCount * 4);
+  const gradientMetaD = new Float32Array(gradientCount * 4);
+  const gradientMetaE = new Float32Array(gradientCount * 4);
+  const gradientLut = new Uint8Array(gradientCount * GRADIENT_LUT_WIDTH * 4);
+  if (nativeGradientPlan) {
+    for (let i = 0; i < nativeGradientPlan.gradients.length; i += 1) {
+      const gradient = nativeGradientPlan.gradients[i];
+      const offset = i * 4;
+      gradientMetaA[offset] = gradient.kind;
+      gradientMetaA[offset + 1] = gradient.bbox ? 1 : 0;
+      gradientMetaB.set(gradient.sceneToGradient.slice(0, 4), offset);
+      gradientMetaC[offset] = gradient.sceneToGradient[4];
+      gradientMetaC[offset + 1] = gradient.sceneToGradient[5];
+      gradientMetaC[offset + 2] = gradient.p0[0];
+      gradientMetaC[offset + 3] = gradient.p0[1];
+      gradientMetaD[offset] = gradient.p1[0];
+      gradientMetaD[offset + 1] = gradient.p1[1];
+      gradientMetaD[offset + 2] = gradient.r0;
+      gradientMetaD[offset + 3] = gradient.r1;
+      if (gradient.bbox) {
+        gradientMetaE.set(gradient.bbox, offset);
+      }
+      gradientLut.set(gradient.lut, i * GRADIENT_LUT_WIDTH * 4);
+    }
+  }
+
   const mergedSegmentCount = endpointBuilder.quadCount;
   const mergedEndpoints = endpointBuilder.toTypedArray();
   const mergedPrimitiveMeta = primitiveMetaBuilder.toTypedArray();
@@ -1047,6 +1268,25 @@ async function extractSinglePageVectors(
   const fillSegmentsA = fillSegmentBuilderA.toTypedArray();
   const fillSegmentsB = fillSegmentBuilderB.toTypedArray();
   const resolvedFillBounds = fillPathCount > 0 ? fillBounds : null;
+  const gradientFillPathCount = gradientFillPathMetaABuilder.quadCount;
+  const gradientFillSegmentCount = gradientFillSegmentBuilderA.quadCount;
+  const gradientFillPathMetaA = gradientFillPathMetaABuilder.toTypedArray();
+  const gradientFillPathMetaB = gradientFillPathMetaBBuilder.toTypedArray();
+  const gradientFillPathMetaC = gradientFillPathMetaCBuilder.toTypedArray();
+  const gradientFillPaintMeta = gradientFillPaintMetaBuilder.toTypedArray();
+  const gradientFillSegmentsA = gradientFillSegmentBuilderA.toTypedArray();
+  const gradientFillSegmentsB = gradientFillSegmentBuilderB.toTypedArray();
+  const gradientStrokeRunCount = gradientStrokeRunMetaABuilder.quadCount;
+  const gradientStrokeSegmentCount = gradientStrokeEndpointBuilder.quadCount;
+  const gradientStrokeRunMetaA = gradientStrokeRunMetaABuilder.toTypedArray();
+  const gradientStrokeRunMetaB = gradientStrokeRunMetaBBuilder.toTypedArray();
+  const gradientStrokeEndpoints = gradientStrokeEndpointBuilder.toTypedArray();
+  const gradientStrokePrimitiveMeta = gradientStrokePrimitiveMetaBuilder.toTypedArray();
+  const gradientStrokePrimitiveBounds = gradientStrokePrimitiveBoundsBuilder.toTypedArray();
+  const gradientStrokeStyles = gradientStrokeStyleBuilder.toTypedArray();
+  const resolvedGradientBounds = gradientFillPathCount > 0 || gradientStrokeSegmentCount > 0
+    ? gradientBounds
+    : null;
 
   let segmentCount = mergedSegmentCount;
   let endpoints = mergedEndpoints;
@@ -1089,7 +1329,12 @@ async function extractSinglePageVectors(
     textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds, suppressedPaintMask);
   }
 
-  const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
+  const allowFullPageRasterFallback =
+    segmentCount === 0 &&
+    fillPathCount === 0 &&
+    gradientFillPathCount === 0 &&
+    gradientStrokeSegmentCount === 0 &&
+    textData.instanceCount === 0;
   if (allowFullPageRasterFallback) {
     rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
       allowFullPageFallback: true
@@ -1099,10 +1344,18 @@ async function extractSinglePageVectors(
     width: layer.width,
     height: layer.height,
     data: layer.data,
-    matrix: new Float32Array(layer.matrix)
+    matrix: new Float32Array(layer.matrix),
+    paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+    pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
   }));
   const combinedBounds =
-    combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterExtract.bounds) ??
+    combineBounds(
+      combineBounds(
+        combineBounds(combineBounds(segmentBounds, resolvedFillBounds), resolvedGradientBounds),
+        textData.bounds
+      ),
+      rasterExtract.bounds
+    ) ??
     { ...pageBounds };
 
   return {
@@ -1118,6 +1371,29 @@ async function extractSinglePageVectors(
     fillPathMetaC,
     fillSegmentsA,
     fillSegmentsB,
+    gradientCount,
+    gradientMetaA,
+    gradientMetaB,
+    gradientMetaC,
+    gradientMetaD,
+    gradientMetaE,
+    gradientLut,
+    gradientFillPathCount,
+    gradientFillSegmentCount,
+    gradientFillPathMetaA,
+    gradientFillPathMetaB,
+    gradientFillPathMetaC,
+    gradientFillPaintMeta,
+    gradientFillSegmentsA,
+    gradientFillSegmentsB,
+    gradientStrokeRunCount,
+    gradientStrokeSegmentCount,
+    gradientStrokeRunMetaA,
+    gradientStrokeRunMetaB,
+    gradientStrokeEndpoints,
+    gradientStrokePrimitiveMeta,
+    gradientStrokePrimitiveBounds,
+    gradientStrokeStyles,
     segmentCount,
     sourceSegmentCount,
     mergedSegmentCount,
@@ -1145,7 +1421,7 @@ async function extractSinglePageVectors(
     styles,
     bounds: combinedBounds,
     pageBounds,
-    maxHalfWidth: resolvedMaxHalfWidth,
+    maxHalfWidth: Math.max(resolvedMaxHalfWidth, gradientMaxHalfWidth),
     imagePaintOpCount,
     operatorCount: operatorList.fnArray.length,
     pathCount,
@@ -1175,6 +1451,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   let totalFillPathCount = 0;
   let totalFillSegmentCount = 0;
+  let totalGradientCount = 0;
+  let totalGradientFillPathCount = 0;
+  let totalGradientFillSegmentCount = 0;
+  let totalGradientStrokeRunCount = 0;
+  let totalGradientStrokeSegmentCount = 0;
   let totalSegmentCount = 0;
   let totalSourceSegmentCount = 0;
   let totalMergedSegmentCount = 0;
@@ -1199,6 +1480,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     hasAnyTextIndex = hasAnyTextIndex || scene.textIndex !== null;
     totalFillPathCount += scene.fillPathCount;
     totalFillSegmentCount += scene.fillSegmentCount;
+    totalGradientCount += scene.gradientCount;
+    totalGradientFillPathCount += scene.gradientFillPathCount;
+    totalGradientFillSegmentCount += scene.gradientFillSegmentCount;
+    totalGradientStrokeRunCount += scene.gradientStrokeRunCount;
+    totalGradientStrokeSegmentCount += scene.gradientStrokeSegmentCount;
     totalSegmentCount += scene.segmentCount;
     totalSourceSegmentCount += scene.sourceSegmentCount;
     totalMergedSegmentCount += scene.mergedSegmentCount;
@@ -1225,6 +1511,24 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const fillPathMetaC = new Float32Array(totalFillPathCount * 4);
   const fillSegmentsA = new Float32Array(totalFillSegmentCount * 4);
   const fillSegmentsB = new Float32Array(totalFillSegmentCount * 4);
+  const gradientMetaA = new Float32Array(totalGradientCount * 4);
+  const gradientMetaB = new Float32Array(totalGradientCount * 4);
+  const gradientMetaC = new Float32Array(totalGradientCount * 4);
+  const gradientMetaD = new Float32Array(totalGradientCount * 4);
+  const gradientMetaE = new Float32Array(totalGradientCount * 4);
+  const gradientLut = new Uint8Array(totalGradientCount * GRADIENT_LUT_WIDTH * 4);
+  const gradientFillPathMetaA = new Float32Array(totalGradientFillPathCount * 4);
+  const gradientFillPathMetaB = new Float32Array(totalGradientFillPathCount * 4);
+  const gradientFillPathMetaC = new Float32Array(totalGradientFillPathCount * 4);
+  const gradientFillPaintMeta = new Float32Array(totalGradientFillPathCount * 4);
+  const gradientFillSegmentsA = new Float32Array(totalGradientFillSegmentCount * 4);
+  const gradientFillSegmentsB = new Float32Array(totalGradientFillSegmentCount * 4);
+  const gradientStrokeRunMetaA = new Float32Array(totalGradientStrokeRunCount * 4);
+  const gradientStrokeRunMetaB = new Float32Array(totalGradientStrokeRunCount * 4);
+  const gradientStrokeEndpoints = new Float32Array(totalGradientStrokeSegmentCount * 4);
+  const gradientStrokePrimitiveMeta = new Float32Array(totalGradientStrokeSegmentCount * 4);
+  const gradientStrokePrimitiveBounds = new Float32Array(totalGradientStrokeSegmentCount * 4);
+  const gradientStrokeStyles = new Float32Array(totalGradientStrokeSegmentCount * 4);
   const endpoints = new Float32Array(totalSegmentCount * 4);
   const primitiveMeta = new Float32Array(totalSegmentCount * 4);
   const primitiveBounds = new Float32Array(totalSegmentCount * 4);
@@ -1241,6 +1545,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   let fillPathOffset = 0;
   let fillSegmentOffset = 0;
+  let gradientOffset = 0;
+  let gradientFillPathOffset = 0;
+  let gradientFillSegmentOffset = 0;
+  let gradientStrokeRunOffset = 0;
+  let gradientStrokeSegmentOffset = 0;
   let segmentOffset = 0;
   let textInstanceOffset = 0;
   let textGlyphOffset = 0;
@@ -1306,6 +1615,91 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       fillSegmentsB[dst + 1] = scene.fillSegmentsB[src + 1] + ty;
       fillSegmentsB[dst + 2] = scene.fillSegmentsB[src + 2];
       fillSegmentsB[dst + 3] = scene.fillSegmentsB[src + 3];
+    }
+
+    for (let i = 0; i < scene.gradientCount; i += 1) {
+      const src = i * 4;
+      const dst = (gradientOffset + i) * 4;
+      gradientMetaA.set(scene.gradientMetaA.subarray(src, src + 4), dst);
+      gradientMetaB.set(scene.gradientMetaB.subarray(src, src + 4), dst);
+      gradientMetaC[dst] = scene.gradientMetaC[src] - scene.gradientMetaB[src] * tx - scene.gradientMetaB[src + 2] * ty;
+      gradientMetaC[dst + 1] = scene.gradientMetaC[src + 1] - scene.gradientMetaB[src + 1] * tx - scene.gradientMetaB[src + 3] * ty;
+      gradientMetaC[dst + 2] = scene.gradientMetaC[src + 2];
+      gradientMetaC[dst + 3] = scene.gradientMetaC[src + 3];
+      gradientMetaD.set(scene.gradientMetaD.subarray(src, src + 4), dst);
+      gradientMetaE.set(scene.gradientMetaE.subarray(src, src + 4), dst);
+      const lutSourceOffset = i * GRADIENT_LUT_WIDTH * 4;
+      const lutTargetOffset = (gradientOffset + i) * GRADIENT_LUT_WIDTH * 4;
+      gradientLut.set(
+        scene.gradientLut.subarray(lutSourceOffset, lutSourceOffset + GRADIENT_LUT_WIDTH * 4),
+        lutTargetOffset
+      );
+    }
+
+    for (let i = 0; i < scene.gradientFillPathCount; i += 1) {
+      const src = i * 4;
+      const dst = (gradientFillPathOffset + i) * 4;
+      gradientFillPathMetaA[dst] = scene.gradientFillPathMetaA[src] + gradientFillSegmentOffset;
+      gradientFillPathMetaA[dst + 1] = scene.gradientFillPathMetaA[src + 1];
+      gradientFillPathMetaA[dst + 2] = scene.gradientFillPathMetaA[src + 2] + tx;
+      gradientFillPathMetaA[dst + 3] = scene.gradientFillPathMetaA[src + 3] + ty;
+      gradientFillPathMetaB[dst] = scene.gradientFillPathMetaB[src] + tx;
+      gradientFillPathMetaB[dst + 1] = scene.gradientFillPathMetaB[src + 1] + ty;
+      gradientFillPathMetaB[dst + 2] = scene.gradientFillPathMetaB[src + 2];
+      gradientFillPathMetaB[dst + 3] = scene.gradientFillPathMetaB[src + 3];
+      gradientFillPathMetaC.set(scene.gradientFillPathMetaC.subarray(src, src + 4), dst);
+      const sourceGradientIndex = scene.gradientFillPaintMeta[src];
+      const maskGradientIndex = scene.gradientFillPaintMeta[src + 1];
+      gradientFillPaintMeta[dst] = sourceGradientIndex >= 0 ? sourceGradientIndex + gradientOffset : -1;
+      gradientFillPaintMeta[dst + 1] = maskGradientIndex >= 0 ? maskGradientIndex + gradientOffset : -1;
+      gradientFillPaintMeta[dst + 2] = scene.gradientFillPaintMeta[src + 2];
+      gradientFillPaintMeta[dst + 3] = pageRectBase + scene.gradientFillPaintMeta[src + 3];
+    }
+
+    for (let i = 0; i < scene.gradientFillSegmentCount; i += 1) {
+      const src = i * 4;
+      const dst = (gradientFillSegmentOffset + i) * 4;
+      gradientFillSegmentsA[dst] = scene.gradientFillSegmentsA[src] + tx;
+      gradientFillSegmentsA[dst + 1] = scene.gradientFillSegmentsA[src + 1] + ty;
+      gradientFillSegmentsA[dst + 2] = scene.gradientFillSegmentsA[src + 2] + tx;
+      gradientFillSegmentsA[dst + 3] = scene.gradientFillSegmentsA[src + 3] + ty;
+      gradientFillSegmentsB[dst] = scene.gradientFillSegmentsB[src] + tx;
+      gradientFillSegmentsB[dst + 1] = scene.gradientFillSegmentsB[src + 1] + ty;
+      gradientFillSegmentsB[dst + 2] = scene.gradientFillSegmentsB[src + 2];
+      gradientFillSegmentsB[dst + 3] = scene.gradientFillSegmentsB[src + 3];
+    }
+
+    for (let i = 0; i < scene.gradientStrokeRunCount; i += 1) {
+      const src = i * 4;
+      const dst = (gradientStrokeRunOffset + i) * 4;
+      gradientStrokeRunMetaA[dst] = scene.gradientStrokeRunMetaA[src] + gradientStrokeSegmentOffset;
+      gradientStrokeRunMetaA[dst + 1] = scene.gradientStrokeRunMetaA[src + 1];
+      const sourceGradientIndex = scene.gradientStrokeRunMetaA[src + 2];
+      const maskGradientIndex = scene.gradientStrokeRunMetaA[src + 3];
+      gradientStrokeRunMetaA[dst + 2] = sourceGradientIndex >= 0 ? sourceGradientIndex + gradientOffset : -1;
+      gradientStrokeRunMetaA[dst + 3] = maskGradientIndex >= 0 ? maskGradientIndex + gradientOffset : -1;
+      gradientStrokeRunMetaB[dst] = scene.gradientStrokeRunMetaB[src];
+      gradientStrokeRunMetaB[dst + 1] = pageRectBase + scene.gradientStrokeRunMetaB[src + 1];
+      gradientStrokeRunMetaB[dst + 2] = 0;
+      gradientStrokeRunMetaB[dst + 3] = 0;
+    }
+
+    for (let i = 0; i < scene.gradientStrokeSegmentCount; i += 1) {
+      const src = i * 4;
+      const dst = (gradientStrokeSegmentOffset + i) * 4;
+      gradientStrokeEndpoints[dst] = scene.gradientStrokeEndpoints[src] + tx;
+      gradientStrokeEndpoints[dst + 1] = scene.gradientStrokeEndpoints[src + 1] + ty;
+      gradientStrokeEndpoints[dst + 2] = scene.gradientStrokeEndpoints[src + 2] + tx;
+      gradientStrokeEndpoints[dst + 3] = scene.gradientStrokeEndpoints[src + 3] + ty;
+      gradientStrokePrimitiveMeta[dst] = scene.gradientStrokePrimitiveMeta[src] + tx;
+      gradientStrokePrimitiveMeta[dst + 1] = scene.gradientStrokePrimitiveMeta[src + 1] + ty;
+      gradientStrokePrimitiveMeta[dst + 2] = scene.gradientStrokePrimitiveMeta[src + 2];
+      gradientStrokePrimitiveMeta[dst + 3] = scene.gradientStrokePrimitiveMeta[src + 3];
+      gradientStrokePrimitiveBounds[dst] = scene.gradientStrokePrimitiveBounds[src] + tx;
+      gradientStrokePrimitiveBounds[dst + 1] = scene.gradientStrokePrimitiveBounds[src + 1] + ty;
+      gradientStrokePrimitiveBounds[dst + 2] = scene.gradientStrokePrimitiveBounds[src + 2] + tx;
+      gradientStrokePrimitiveBounds[dst + 3] = scene.gradientStrokePrimitiveBounds[src + 3] + ty;
+      gradientStrokeStyles.set(scene.gradientStrokeStyles.subarray(src, src + 4), dst);
     }
 
     for (let i = 0; i < scene.segmentCount; i += 1) {
@@ -1412,12 +1806,19 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         width: layer.width,
         height: layer.height,
         data: layer.data,
-        matrix
+        matrix,
+        paintOrder: layer.paintOrder,
+        pageIndex: pageRectBase + layer.pageIndex
       });
     }
 
     fillPathOffset += scene.fillPathCount;
     fillSegmentOffset += scene.fillSegmentCount;
+    gradientOffset += scene.gradientCount;
+    gradientFillPathOffset += scene.gradientFillPathCount;
+    gradientFillSegmentOffset += scene.gradientFillSegmentCount;
+    gradientStrokeRunOffset += scene.gradientStrokeRunCount;
+    gradientStrokeSegmentOffset += scene.gradientStrokeSegmentCount;
     segmentOffset += scene.segmentCount;
     textInstanceOffset += scene.textInstanceCount;
     textGlyphOffset += scene.textGlyphCount;
@@ -1439,6 +1840,29 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     fillPathMetaC,
     fillSegmentsA,
     fillSegmentsB,
+    gradientCount: totalGradientCount,
+    gradientMetaA,
+    gradientMetaB,
+    gradientMetaC,
+    gradientMetaD,
+    gradientMetaE,
+    gradientLut,
+    gradientFillPathCount: totalGradientFillPathCount,
+    gradientFillSegmentCount: totalGradientFillSegmentCount,
+    gradientFillPathMetaA,
+    gradientFillPathMetaB,
+    gradientFillPathMetaC,
+    gradientFillPaintMeta,
+    gradientFillSegmentsA,
+    gradientFillSegmentsB,
+    gradientStrokeRunCount: totalGradientStrokeRunCount,
+    gradientStrokeSegmentCount: totalGradientStrokeSegmentCount,
+    gradientStrokeRunMetaA,
+    gradientStrokeRunMetaB,
+    gradientStrokeEndpoints,
+    gradientStrokePrimitiveMeta,
+    gradientStrokePrimitiveBounds,
+    gradientStrokeStyles,
     segmentCount: totalSegmentCount,
     sourceSegmentCount: totalSourceSegmentCount,
     mergedSegmentCount: totalMergedSegmentCount,
@@ -1917,7 +2341,9 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
         width,
         height,
         data: layer.data,
-        matrix
+        matrix,
+        paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+        pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
       });
     }
   }
@@ -1945,7 +2371,9 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
     width: legacyWidth,
     height: legacyHeight,
     data: scene.rasterLayerData,
-    matrix
+    matrix,
+    paintOrder: 0,
+    pageIndex: 0
   });
   return out;
 }
@@ -1964,6 +2392,29 @@ function createEmptyVectorScene(): VectorScene {
     fillPathMetaC: new Float32Array(0),
     fillSegmentsA: new Float32Array(0),
     fillSegmentsB: new Float32Array(0),
+    gradientCount: 0,
+    gradientMetaA: new Float32Array(0),
+    gradientMetaB: new Float32Array(0),
+    gradientMetaC: new Float32Array(0),
+    gradientMetaD: new Float32Array(0),
+    gradientMetaE: new Float32Array(0),
+    gradientLut: new Uint8Array(0),
+    gradientFillPathCount: 0,
+    gradientFillSegmentCount: 0,
+    gradientFillPathMetaA: new Float32Array(0),
+    gradientFillPathMetaB: new Float32Array(0),
+    gradientFillPathMetaC: new Float32Array(0),
+    gradientFillPaintMeta: new Float32Array(0),
+    gradientFillSegmentsA: new Float32Array(0),
+    gradientFillSegmentsB: new Float32Array(0),
+    gradientStrokeRunCount: 0,
+    gradientStrokeSegmentCount: 0,
+    gradientStrokeRunMetaA: new Float32Array(0),
+    gradientStrokeRunMetaB: new Float32Array(0),
+    gradientStrokeEndpoints: new Float32Array(0),
+    gradientStrokePrimitiveMeta: new Float32Array(0),
+    gradientStrokePrimitiveBounds: new Float32Array(0),
+    gradientStrokeStyles: new Float32Array(0),
     segmentCount: 0,
     sourceSegmentCount: 0,
     mergedSegmentCount: 0,
@@ -2332,8 +2783,9 @@ interface ExtractedRasterLayer {
   height: number;
   data: Uint8Array;
   matrix: Mat2D;
-  /** Display-list painter order used only while assembling a page's raster array. */
-  paintOrder?: number;
+  /** Dense display-list paint ordinal used while assembling the page. */
+  paintOrder: number;
+  pageIndex: number;
 }
 
 interface RasterLayerExtractResult {
@@ -2341,10 +2793,88 @@ interface RasterLayerExtractResult {
   bounds: Bounds | null;
   /** Source-list paints already represented by a captured soft-mask composite. */
   suppressedSourcePaintMask?: Uint8Array;
+  /** A native sparse plan must be disabled and raster extraction retried atomically. */
+  nativeOrderingFailed?: boolean;
 }
 
 interface RasterLayerExtractOptions {
   allowFullPageFallback: boolean;
+  preparedDisplayOperatorList?: PdfOperatorListLike | null;
+  nativeSourcePlan?: NativeGradientPlan | null;
+  nativeDisplayPlan?: NativeGradientPlan | null;
+}
+
+interface NativeGradientDefinition {
+  kind: 0 | 1;
+  sceneToGradient: Mat2D;
+  p0: [number, number];
+  p1: [number, number];
+  r0: number;
+  r1: number;
+  bbox: [number, number, number, number] | null;
+  lut: Uint8Array;
+}
+
+interface NativeClipGeometry {
+  pathData: Float32Array;
+  matrix: Mat2D;
+  fillRule: number;
+  bounds: Bounds;
+  isAxisAlignedRectangle: boolean;
+}
+
+interface NativeGradientPaintState {
+  matrix: Mat2D;
+  patternBaseMatrix: Mat2D;
+  clipBounds: Bounds | null;
+  clipGeometry: NativeClipGeometry | null;
+  fillR: number;
+  fillG: number;
+  fillB: number;
+  fillAlpha: number;
+  groupFillAlpha: number;
+  fillAlphaVersion: number;
+  groupFillAlphaVersion: number;
+  strokeR: number;
+  strokeG: number;
+  strokeB: number;
+  strokeAlpha: number;
+  groupStrokeAlpha: number;
+  strokeAlphaVersion: number;
+  groupStrokeAlphaVersion: number;
+  lineWidth: number;
+  lineCap: number;
+  lineDash: number[];
+  dashPhase: number;
+  fillPattern: NativePatternReference | null;
+  strokePattern: NativePatternReference | null;
+  blendMode: string;
+}
+
+interface NativePatternReference {
+  patternId: string;
+  matrix: Mat2D;
+}
+
+interface NativeGradientPaint {
+  opIndex: number;
+  paintOrdinal: number;
+  kind: "fill" | "stroke";
+  pathData: Float32Array;
+  matrix: Mat2D;
+  fillRule: number;
+  state: NativeGradientPaintState;
+  sourceGradientIndex: number;
+  maskGradientIndex: number;
+}
+
+interface NativeGradientPlan {
+  gradients: NativeGradientDefinition[];
+  paints: NativeGradientPaint[];
+  nativePathPaintMask: Uint8Array;
+  rasterExcludedPaintMask: Uint8Array;
+  paintTopologySignature: string;
+  nativeTopologySignature: string;
 }
 
 interface RasterRenderSurface {
@@ -2736,7 +3266,8 @@ function emitSegmentsFromPath(
   styles: Float4Builder,
   primitiveBounds: Float4Builder,
   bounds: Bounds,
-  clipBounds: Bounds | null
+  clipBounds: Bounds | null,
+  clipExpandedStroke = true
 ): number {
   let sourceSegmentCount = 0;
   let cursorX = 0;
@@ -2772,16 +3303,26 @@ function emitSegmentsFromPath(
     const minY = Math.min(p0y, p1y, p2y);
     const maxX = Math.max(p0x, p1x, p2x);
     const maxY = Math.max(p0y, p1y, p2y);
-    const visibleBounds = clipBounds ? intersectBounds(clipBounds, { minX, minY, maxX, maxY }) : { minX, minY, maxX, maxY };
-    if (!isNonEmptyBounds(visibleBounds)) {
+    const geometryBounds = { minX, minY, maxX, maxY };
+    const paintBounds = clipExpandedStroke
+      ? {
+        minX: minX - halfWidth,
+        minY: minY - halfWidth,
+        maxX: maxX + halfWidth,
+        maxY: maxY + halfWidth
+      }
+      : geometryBounds;
+    const visiblePaintBounds = clipBounds ? intersectBounds(clipBounds, paintBounds) : { ...paintBounds };
+    if (!isNonEmptyBounds(visiblePaintBounds)) {
       return;
     }
     const wasClipped =
       Boolean(clipBounds) &&
-      (visibleBounds.minX > minX + 1e-6 ||
-        visibleBounds.minY > minY + 1e-6 ||
-        visibleBounds.maxX < maxX - 1e-6 ||
-        visibleBounds.maxY < maxY - 1e-6);
+      (visiblePaintBounds.minX > paintBounds.minX + 1e-6 ||
+        visiblePaintBounds.minY > paintBounds.minY + 1e-6 ||
+        visiblePaintBounds.maxX < paintBounds.maxX - 1e-6 ||
+        visiblePaintBounds.maxY < paintBounds.maxY - 1e-6);
+    const visibleBounds = wasClipped ? visiblePaintBounds : geometryBounds;
 
     endpoints.push(p0x, p0y, p1x, p1y);
     const visibleStyleFlags = wasClipped ? styleFlags | STROKE_STYLE_FLAG_CLIPPED : styleFlags;
@@ -3143,7 +3684,8 @@ function emitFilledPathFromPath(
   clipBounds: Bounds | null,
   clipMask: ClipMask | null,
   pageBounds: Bounds,
-  allowSubpathSplit = true
+  allowSubpathSplit = true,
+  allowOpaqueWhiteCull = true
 ): number {
   if (allowSubpathSplit && fillRule === FILL_RULE_NONZERO && countPathMoveOps(pathData) >= FILL_SUBPATH_SPLIT_MIN_SUBPATHS) {
     const splitPaths = splitPathIntoDrawableSubpaths(pathData, matrix, clipBounds);
@@ -3169,7 +3711,8 @@ function emitFilledPathFromPath(
           splitClipBounds,
           clipMask,
           pageBounds,
-          false
+          false,
+          allowOpaqueWhiteCull
         );
       }
       return emittedCount;
@@ -3360,11 +3903,12 @@ function emitFilledPathFromPath(
       null,
       null,
       pageBounds,
-      false
+      false,
+      allowOpaqueWhiteCull
     );
   }
 
-  if (isOpaqueWhiteBackgroundFill(visibleBounds, pageBounds, colorR, colorG, colorB, alpha)) {
+  if (allowOpaqueWhiteCull && isOpaqueWhiteBackgroundFill(visibleBounds, pageBounds, colorR, colorG, colorB, alpha)) {
     segmentsA.truncateQuads(segmentStart);
     segmentsB.truncateQuads(segmentStart);
     return 0;
@@ -5018,6 +5562,1239 @@ async function warmUpTextPathCache(page: unknown): Promise<void> {
   }
 }
 
+interface NativeGradientScan {
+  states: Map<number, NativeGradientPaintState>;
+  softMaskGroupEntryStates: Map<number, NativeGradientPaintState>;
+  paintOrdinalByOp: Int32Array;
+  paintTopologySignature: string;
+}
+
+interface NativeSoftMaskRange {
+  definitionStart: number;
+  definitionEnd: number;
+  definitionPaint: number;
+  consumerStart: number;
+  consumerEnd: number;
+  consumerPaint: number;
+  subtype: "Alpha" | "Luminosity";
+  backdrop: string | null;
+  transferMap: Uint8Array | null;
+}
+
+function isNativeDensePaintOperator(fn: number, args: unknown): boolean {
+  if (fn === OPS.shadingFill || isNativeDenseImagePaintOperator(fn) || isTextPaintOperator(fn)) {
+    return true;
+  }
+  if (fn !== OPS.constructPath) {
+    return false;
+  }
+  const paintOp = readNumber(args, 0, OPS.endPath);
+  return isFillPaintOp(paintOp) || isStrokePaintOp(paintOp);
+}
+
+function isNativeDenseImagePaintOperator(fn: number): boolean {
+  return (
+    isImagePaintOperator(fn) &&
+    fn !== OPS.beginInlineImage &&
+    fn !== OPS.beginImageData &&
+    fn !== OPS.endInlineImage
+  );
+}
+
+function cloneNativeClipGeometry(value: NativeClipGeometry | null): NativeClipGeometry | null {
+  if (!value) {
+    return null;
+  }
+  return {
+    pathData: value.pathData,
+    matrix: [...value.matrix],
+    fillRule: value.fillRule,
+    bounds: { ...value.bounds },
+    isAxisAlignedRectangle: value.isAxisAlignedRectangle
+  };
+}
+
+function cloneNativeGradientPaintState(state: NativeGradientPaintState): NativeGradientPaintState {
+  return {
+    ...state,
+    matrix: [...state.matrix],
+    patternBaseMatrix: [...state.patternBaseMatrix],
+    clipBounds: cloneBoundsOrNull(state.clipBounds),
+    clipGeometry: cloneNativeClipGeometry(state.clipGeometry),
+    lineDash: [...state.lineDash],
+    fillPattern: state.fillPattern
+      ? { patternId: state.fillPattern.patternId, matrix: [...state.fillPattern.matrix] }
+      : null,
+    strokePattern: state.strokePattern
+      ? { patternId: state.strokePattern.patternId, matrix: [...state.strokePattern.matrix] }
+      : null
+  };
+}
+
+function createNativeRectangleClip(bounds: Bounds): NativeClipGeometry {
+  return {
+    pathData: new Float32Array([
+      DRAW_MOVE_TO, bounds.minX, bounds.minY,
+      DRAW_LINE_TO, bounds.maxX, bounds.minY,
+      DRAW_LINE_TO, bounds.maxX, bounds.maxY,
+      DRAW_LINE_TO, bounds.minX, bounds.maxY,
+      DRAW_CLOSE
+    ]),
+    matrix: [...IDENTITY_MATRIX],
+    fillRule: FILL_RULE_NONZERO,
+    bounds: { ...bounds },
+    isAxisAlignedRectangle: true
+  };
+}
+
+function nativeMatrixPreservesAxisAlignedRectangles(matrix: Mat2D): boolean {
+  const epsilon = 1e-8;
+  return (
+    (Math.abs(matrix[1]) <= epsilon && Math.abs(matrix[2]) <= epsilon) ||
+    (Math.abs(matrix[0]) <= epsilon && Math.abs(matrix[3]) <= epsilon)
+  );
+}
+
+function nativeBoundsContains(outer: Bounds, inner: Bounds): boolean {
+  const epsilon = 1e-4;
+  return (
+    outer.minX <= inner.minX + epsilon &&
+    outer.minY <= inner.minY + epsilon &&
+    outer.maxX + epsilon >= inner.maxX &&
+    outer.maxY + epsilon >= inner.maxY
+  );
+}
+
+function nativeBoundsEqual(left: Bounds | null, right: Bounds | null): boolean {
+  if (!left || !right) {
+    return left === right;
+  }
+  const epsilon = 1e-4;
+  return (
+    Math.abs(left.minX - right.minX) <= epsilon &&
+    Math.abs(left.minY - right.minY) <= epsilon &&
+    Math.abs(left.maxX - right.maxX) <= epsilon &&
+    Math.abs(left.maxY - right.maxY) <= epsilon
+  );
+}
+
+function applyNativeClipGeometry(
+  state: NativeGradientPaintState,
+  geometry: NativeClipGeometry
+): void {
+  const previousBounds = state.clipBounds;
+  const nextBounds = intersectBounds(previousBounds, geometry.bounds);
+  state.clipBounds = nextBounds;
+  if (!nextBounds) {
+    state.clipGeometry = null;
+    return;
+  }
+  if (state.clipGeometry?.isAxisAlignedRectangle && geometry.isAxisAlignedRectangle) {
+    state.clipGeometry = createNativeRectangleClip(nextBounds);
+    return;
+  }
+  if (!previousBounds || nativeBoundsContains(previousBounds, geometry.bounds)) {
+    state.clipGeometry = geometry;
+    return;
+  }
+  if (nativeBoundsContains(geometry.bounds, previousBounds)) {
+    return;
+  }
+  // A general intersection of two arbitrary PDF clips needs boolean path
+  // geometry. Keep its bounds for culling, but make native shading ineligible.
+  state.clipGeometry = null;
+}
+
+function readNativePatternReference(args: unknown): NativePatternReference | null {
+  if (readArg(args, 0) !== "Shading") {
+    return null;
+  }
+  const patternId = readArg(args, 1);
+  const matrix = readTransform(readArg(args, 2));
+  return typeof patternId === "string" && matrix
+    ? { patternId, matrix }
+    : null;
+}
+
+function readNativeBlendMode(entries: unknown, fallback: string): string {
+  if (!Array.isArray(entries)) {
+    return fallback;
+  }
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry[0] !== "BM") {
+      continue;
+    }
+    const raw = Array.isArray(entry[1]) ? entry[1][0] : entry[1];
+    return typeof raw === "string" ? raw : fallback;
+  }
+  return fallback;
+}
+
+function isNativeNormalBlendMode(value: string): boolean {
+  return value === "source-over" || value === "normal" || value === "Normal";
+}
+
+function effectiveNativeFillAlpha(state: NativeGradientPaintState): number {
+  return state.fillAlphaVersion === state.groupFillAlphaVersion
+    ? clamp01(state.groupFillAlpha)
+    : clamp01(state.groupFillAlpha * state.fillAlpha);
+}
+
+function effectiveNativeStrokeAlpha(state: NativeGradientPaintState): number {
+  return state.strokeAlphaVersion === state.groupStrokeAlphaVersion
+    ? clamp01(state.groupStrokeAlpha)
+    : clamp01(state.groupStrokeAlpha * state.strokeAlpha);
+}
+
+function scanNativeGradientStates(
+  operatorList: PdfOperatorListLike,
+  pageMatrix: Mat2D,
+  pageBounds: Bounds
+): NativeGradientScan {
+  const states = new Map<number, NativeGradientPaintState>();
+  const softMaskGroupEntryStates = new Map<number, NativeGradientPaintState>();
+  const paintOrdinalByOp = new Int32Array(operatorList.fnArray.length);
+  paintOrdinalByOp.fill(-1);
+  const topology: string[] = [];
+  const stateStack: NativeGradientPaintState[] = [];
+  const formStateStack: NativeGradientPaintState[] = [];
+  const annotationStateStack: NativeGradientPaintState[] = [];
+  const groupStateStack: NativeGradientPaintState[] = [];
+  let state: NativeGradientPaintState = {
+    matrix: [...pageMatrix],
+    patternBaseMatrix: [...pageMatrix],
+    clipBounds: { ...pageBounds },
+    clipGeometry: createNativeRectangleClip(pageBounds),
+    fillR: 0,
+    fillG: 0,
+    fillB: 0,
+    fillAlpha: 1,
+    groupFillAlpha: 1,
+    fillAlphaVersion: 0,
+    groupFillAlphaVersion: -1,
+    strokeR: 0,
+    strokeG: 0,
+    strokeB: 0,
+    strokeAlpha: 1,
+    groupStrokeAlpha: 1,
+    strokeAlphaVersion: 0,
+    groupStrokeAlphaVersion: -1,
+    lineWidth: 1,
+    lineCap: 0,
+    lineDash: [],
+    dashPhase: 0,
+    fillPattern: null,
+    strokePattern: null,
+    blendMode: "source-over"
+  };
+  let pendingClipRule: number | null = null;
+  let pendingClipGeometry: NativeClipGeometry | null = null;
+  let paintOrdinal = 0;
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+
+    if (isNativeDensePaintOperator(fn, args)) {
+      paintOrdinalByOp[i] = paintOrdinal;
+      const paintOp = fn === OPS.constructPath ? readNumber(args, 0, -1) : -1;
+      topology.push(
+        fn === OPS.shadingFill ? "G" :
+          isNativeDenseImagePaintOperator(fn) ? "I" :
+            isTextPaintOperator(fn) ? "T" :
+              isFillPaintOp(paintOp) && isStrokePaintOp(paintOp) ? "B" :
+                isFillPaintOp(paintOp) ? "F" : "S"
+      );
+      states.set(i, cloneNativeGradientPaintState(state));
+      paintOrdinal += 1;
+    }
+
+    if (fn === OPS.beginGroup && readNativeSoftMaskMetadata(args)) {
+      softMaskGroupEntryStates.set(i, cloneNativeGradientPaintState(state));
+    }
+
+    if (fn === OPS.save) {
+      stateStack.push(cloneNativeGradientPaintState(state));
+      continue;
+    }
+    if (fn === OPS.restore) {
+      state = stateStack.pop() ?? state;
+      pendingClipRule = null;
+      pendingClipGeometry = null;
+      continue;
+    }
+    if (fn === OPS.transform) {
+      const matrix = readTransform(args);
+      if (matrix) {
+        state.matrix = multiplyMatrices(state.matrix, matrix);
+      }
+      continue;
+    }
+    if (fn === OPS.paintFormXObjectBegin) {
+      formStateStack.push(cloneNativeGradientPaintState(state));
+      const matrix = readTransform(args);
+      if (matrix) {
+        state.matrix = multiplyMatrices(state.matrix, matrix);
+      }
+      state.patternBaseMatrix = [...state.matrix];
+      continue;
+    }
+    if (fn === OPS.paintFormXObjectEnd) {
+      state = formStateStack.pop() ?? state;
+      pendingClipRule = null;
+      pendingClipGeometry = null;
+      continue;
+    }
+    if (fn === OPS.beginAnnotation) {
+      annotationStateStack.push(cloneNativeGradientPaintState(state));
+      const matrix = readAnnotationTransform(args);
+      if (matrix) {
+        state.matrix = multiplyMatrices(state.matrix, matrix);
+        state.patternBaseMatrix = [...state.matrix];
+      }
+      continue;
+    }
+    if (fn === OPS.endAnnotation) {
+      state = annotationStateStack.pop() ?? state;
+      pendingClipRule = null;
+      pendingClipGeometry = null;
+      continue;
+    }
+    if (fn === OPS.beginGroup) {
+      groupStateStack.push(cloneNativeGradientPaintState(state));
+      state.groupFillAlpha = effectiveNativeFillAlpha(state);
+      state.groupStrokeAlpha = effectiveNativeStrokeAlpha(state);
+      state.groupFillAlphaVersion = state.fillAlphaVersion;
+      state.groupStrokeAlphaVersion = state.strokeAlphaVersion;
+      const group = readArg(args, 0) as { matrix?: unknown; bbox?: unknown } | null;
+      const groupMatrix = readTransform(group?.matrix);
+      if (groupMatrix) {
+        state.matrix = multiplyMatrices(state.matrix, groupMatrix);
+      }
+      const bbox = asNumberArrayLike(group?.bbox);
+      if (bbox && bbox.length >= 4) {
+        const x0 = Number(bbox[0]);
+        const y0 = Number(bbox[1]);
+        const x1 = Number(bbox[2]);
+        const y1 = Number(bbox[3]);
+        if (![x0, y0, x1, y1].every(Number.isFinite)) {
+          state.clipGeometry = null;
+          continue;
+        }
+        const localBounds: Bounds = {
+          minX: Math.min(x0, x1),
+          minY: Math.min(y0, y1),
+          maxX: Math.max(x0, x1),
+          maxY: Math.max(y0, y1)
+        };
+        const geometry = createNativeRectangleClip(localBounds);
+        geometry.matrix = [...state.matrix];
+        geometry.bounds = transformBounds(localBounds, state.matrix);
+        geometry.isAxisAlignedRectangle = nativeMatrixPreservesAxisAlignedRectangles(state.matrix);
+        applyNativeClipGeometry(state, geometry);
+      }
+      continue;
+    }
+    if (fn === OPS.endGroup) {
+      state = groupStateStack.pop() ?? state;
+      pendingClipRule = null;
+      pendingClipGeometry = null;
+      continue;
+    }
+
+    if (fn === OPS.clip || fn === OPS.eoClip) {
+      if (pendingClipGeometry) {
+        pendingClipGeometry.fillRule = fn === OPS.eoClip ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
+        applyNativeClipGeometry(state, pendingClipGeometry);
+        pendingClipGeometry = null;
+      } else {
+        pendingClipRule = fn === OPS.eoClip ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
+      }
+      continue;
+    }
+    if (fn === OPS.constructPath) {
+      const pathData = readPathData(args);
+      if (pathData) {
+        const localBounds = computeTransformedPathBounds(pathData, state.matrix);
+        if (!localBounds) {
+          pendingClipGeometry = null;
+          pendingClipRule = null;
+          continue;
+        }
+        const geometry: NativeClipGeometry = {
+          pathData,
+          matrix: [...state.matrix],
+          fillRule: pendingClipRule ?? FILL_RULE_NONZERO,
+          bounds: localBounds,
+          isAxisAlignedRectangle: (() => {
+            const rectangleMask = extractSimpleEvenOddRectangleClipMask(pathData, state.matrix);
+            return Boolean(rectangleMask && rectangleMask.exclusionBounds.length === 0);
+          })()
+        };
+        if (pendingClipRule !== null) {
+          applyNativeClipGeometry(state, geometry);
+          pendingClipRule = null;
+        } else if (readNumber(args, 0, -1) === OPS.endPath) {
+          pendingClipGeometry = geometry;
+        } else {
+          pendingClipGeometry = null;
+        }
+      }
+      continue;
+    }
+    if (fn === OPS.endPath) {
+      pendingClipGeometry = null;
+      pendingClipRule = null;
+      continue;
+    }
+
+    if (fn === OPS.setLineWidth) {
+      state.lineWidth = Math.max(0, readNumber(args, 0, state.lineWidth));
+      continue;
+    }
+    if (fn === OPS.setLineCap) {
+      state.lineCap = Math.min(2, Math.max(0, Math.trunc(readNumber(args, 0, state.lineCap))));
+      continue;
+    }
+    if (fn === OPS.setDash) {
+      const dash = readLineDash(args);
+      if (dash) {
+        state.lineDash = dash.pattern;
+        state.dashPhase = dash.phase;
+      }
+      continue;
+    }
+    if (fn === OPS.setFillColorN) {
+      state.fillPattern = readNativePatternReference(args);
+      continue;
+    }
+    if (fn === OPS.setStrokeColorN) {
+      state.strokePattern = readNativePatternReference(args);
+      continue;
+    }
+    if (isSolidFillColorOperator(fn)) {
+      state.fillPattern = null;
+      if (fn === OPS.setFillCMYKColor) {
+        [state.fillR, state.fillG, state.fillB] = parseCmykColorFromOperatorArgs(args, [state.fillR, state.fillG, state.fillB]);
+      } else if (fn === OPS.setFillGray) {
+        const [gray] = parseGrayColor(readArg(args, 0), state.fillR);
+        state.fillR = state.fillG = state.fillB = gray;
+      } else if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor) {
+        [state.fillR, state.fillG, state.fillB] = parseColorFromOperatorArgs(args, [state.fillR, state.fillG, state.fillB]);
+      }
+      continue;
+    }
+    if (isSolidStrokeColorOperator(fn)) {
+      state.strokePattern = null;
+      if (fn === OPS.setStrokeCMYKColor) {
+        [state.strokeR, state.strokeG, state.strokeB] = parseCmykColorFromOperatorArgs(args, [state.strokeR, state.strokeG, state.strokeB]);
+      } else if (fn === OPS.setStrokeGray) {
+        const [gray] = parseGrayColor(readArg(args, 0), state.strokeR);
+        state.strokeR = state.strokeG = state.strokeB = gray;
+      } else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeColor) {
+        [state.strokeR, state.strokeG, state.strokeB] = parseColorFromOperatorArgs(args, [state.strokeR, state.strokeG, state.strokeB]);
+      }
+      continue;
+    }
+    if (fn === OPS.setGState) {
+      const entries = readArg(args, 0);
+      state.blendMode = readNativeBlendMode(entries, state.blendMode);
+      if (Array.isArray(entries)) {
+        for (const entry of entries) {
+          if (!Array.isArray(entry) || entry.length < 2) {
+            continue;
+          }
+          if (entry[0] === "ca") {
+            const alpha = Number(entry[1]);
+            if (Number.isFinite(alpha)) {
+              state.fillAlpha = clamp01(alpha);
+              state.fillAlphaVersion += 1;
+            }
+          } else if (entry[0] === "CA") {
+            const alpha = Number(entry[1]);
+            if (Number.isFinite(alpha)) {
+              state.strokeAlpha = clamp01(alpha);
+              state.strokeAlphaVersion += 1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    states,
+    softMaskGroupEntryStates,
+    paintOrdinalByOp,
+    paintTopologySignature: topology.join("")
+  };
+}
+
+type NativeGradientStop = [number, number, number, number, number];
+
+function parseNativeGradientColor(value: unknown): [number, number, number, number] | null {
+  if (value === "transparent") {
+    return [0, 0, 0, 0];
+  }
+  if (typeof value !== "string" || !/^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(value)) {
+    return null;
+  }
+  const [r, g, b] = parseHexColor(value);
+  return [r / 255, g / 255, b / 255, 1];
+}
+
+function buildNativeGradientLut(stops: NativeGradientStop[]): Uint8Array {
+  const lut = new Uint8Array(GRADIENT_LUT_WIDTH * 4);
+  let stopIndex = 0;
+  for (let i = 0; i < GRADIENT_LUT_WIDTH; i += 1) {
+    const t = GRADIENT_LUT_WIDTH > 1 ? i / (GRADIENT_LUT_WIDTH - 1) : 0;
+    while (stopIndex + 1 < stops.length && stops[stopIndex + 1][0] <= t) {
+      stopIndex += 1;
+    }
+    const left = stops[stopIndex];
+    const right = stops[Math.min(stops.length - 1, stopIndex + 1)];
+    const span = right[0] - left[0];
+    const ratio = span > 1e-9 ? clamp01((t - left[0]) / span) : 0;
+    const offset = i * 4;
+    const leftAlpha = left[4];
+    const rightAlpha = right[4];
+    const alpha = leftAlpha + (rightAlpha - leftAlpha) * ratio;
+    for (let channel = 0; channel < 3; channel += 1) {
+      const leftPremultiplied = left[channel + 1] * leftAlpha;
+      const rightPremultiplied = right[channel + 1] * rightAlpha;
+      const premultiplied = leftPremultiplied + (rightPremultiplied - leftPremultiplied) * ratio;
+      const value = alpha > 1e-9 ? premultiplied / alpha : 0;
+      lut[offset + channel] = Math.round(clamp01(value) * 255);
+    }
+    lut[offset + 3] = Math.round(clamp01(alpha) * 255);
+  }
+  return lut;
+}
+
+function parseNativeRadialAxialGradient(
+  page: unknown,
+  patternId: string,
+  gradientToScene: Mat2D
+): NativeGradientDefinition | null {
+  const objects = (page as { objs?: { get?: (id: string) => unknown } }).objs;
+  if (!objects || typeof objects.get !== "function") {
+    return null;
+  }
+  let raw: unknown;
+  try {
+    raw = objects.get(patternId);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(raw) || raw[0] !== "RadialAxial") {
+    return null;
+  }
+  const kind = raw[1] === "axial" ? 0 : raw[1] === "radial" ? 1 : -1;
+  if (kind < 0) {
+    return null;
+  }
+  const p0 = asNumberArrayLike(raw[4]);
+  const p1 = asNumberArrayLike(raw[5]);
+  if (!p0 || !p1 || p0.length < 2 || p1.length < 2) {
+    return null;
+  }
+  const p0x = Number(p0[0]);
+  const p0y = Number(p0[1]);
+  const p1x = Number(p1[0]);
+  const p1y = Number(p1[1]);
+  let r0 = kind === 1 ? Number(raw[6]) : 0;
+  let r1 = kind === 1 ? Number(raw[7]) : 0;
+  if (![...gradientToScene, p0x, p0y, p1x, p1y, r0, r1].every(Number.isFinite)) {
+    return null;
+  }
+  if (kind === 0 && Math.hypot(p1x - p0x, p1y - p0y) <= 1e-9) {
+    return null;
+  }
+  if (kind === 1) {
+    if (r0 < 0 || r1 < 0) {
+      return null;
+    }
+    const centerDistance = Math.hypot(p0x - p1x, p0y - p1y);
+    if (centerDistance <= 1e-9 && Math.abs(r1 - r0) <= 1e-9) {
+      return null;
+    }
+    // PDF.js needs a second reversed Canvas gradient for intersecting/conic
+    // radial circles. Keep that uncommon topology on the exact raster path.
+    if (centerDistance + r1 > r0 && centerDistance + r0 > r1) {
+      return null;
+    }
+  }
+  const sceneToGradient = invertMatrix(gradientToScene);
+  if (!sceneToGradient) {
+    return null;
+  }
+  const rawStops = Array.isArray(raw[3]) ? raw[3] : [];
+  const stops: NativeGradientStop[] = [];
+  for (const entry of rawStops) {
+    if (!Array.isArray(entry) || entry.length < 2) {
+      return null;
+    }
+    const offset = Number(entry[0]);
+    const color = parseNativeGradientColor(entry[1]);
+    if (!Number.isFinite(offset) || !color) {
+      return null;
+    }
+    stops.push([clamp01(offset), color[0], color[1], color[2], color[3]]);
+  }
+  if (stops.length === 0) {
+    return null;
+  }
+  stops.sort((left, right) => left[0] - right[0]);
+  if (stops[0][0] > 0) {
+    stops.unshift([0, stops[0][1], stops[0][2], stops[0][3], stops[0][4]]);
+  }
+  if (stops[stops.length - 1][0] < 1) {
+    const last = stops[stops.length - 1];
+    stops.push([1, last[1], last[2], last[3], last[4]]);
+  }
+  let bbox: [number, number, number, number] | null = null;
+  if (raw[2] !== null && raw[2] !== undefined) {
+    const values = asNumberArrayLike(raw[2]);
+    if (!values || values.length < 4) {
+      return null;
+    }
+    const x0 = Number(values[0]);
+    const y0 = Number(values[1]);
+    const x1 = Number(values[2]);
+    const y1 = Number(values[3]);
+    if (![x0, y0, x1, y1].every(Number.isFinite)) {
+      return null;
+    }
+    bbox = [
+      Math.min(x0, x1),
+      Math.min(y0, y1),
+      Math.max(x0, x1),
+      Math.max(y0, y1)
+    ];
+  }
+  return {
+    kind: kind as 0 | 1,
+    sceneToGradient,
+    p0: [p0x, p0y],
+    p1: [p1x, p1y],
+    r0,
+    r1,
+    bbox,
+    lut: buildNativeGradientLut(stops)
+  };
+}
+
+function readNativeSoftMaskMetadata(args: unknown): {
+  subtype: "Alpha" | "Luminosity";
+  backdrop: string | null;
+  transferMap: Uint8Array | null;
+} | null {
+  const group = readArg(args, 0) as { smask?: unknown } | null;
+  const smask = group?.smask as { subtype?: unknown; backdrop?: unknown; transferMap?: unknown } | null;
+  if (!smask || (smask.subtype !== "Alpha" && smask.subtype !== "Luminosity")) {
+    return null;
+  }
+  const backdrop = typeof smask.backdrop === "string" ? smask.backdrop : null;
+  if (smask.transferMap !== null && smask.transferMap !== undefined && !(smask.transferMap instanceof Uint8Array)) {
+    return null;
+  }
+  const transferMap = smask.transferMap instanceof Uint8Array ? smask.transferMap : null;
+  return { subtype: smask.subtype, backdrop, transferMap };
+}
+
+function collectNativeSoftMaskRanges(operatorList: PdfOperatorListLike): {
+  ranges: NativeSoftMaskRange[];
+  structuralMask: Uint8Array;
+} {
+  const ranges: NativeSoftMaskRange[] = [];
+  const structuralMask = new Uint8Array(operatorList.fnArray.length);
+  for (let start = 0; start < operatorList.fnArray.length; start += 1) {
+    if (operatorList.fnArray[start] !== OPS.beginGroup) {
+      continue;
+    }
+    const metadata = readNativeSoftMaskMetadata(operatorList.argsArray[start]);
+    if (!metadata) {
+      continue;
+    }
+    const definitionEnd = findMatchingGroupEnd(operatorList.fnArray, start);
+    if (definitionEnd < 0) {
+      break;
+    }
+    let definitionPaint = -1;
+    let definitionPaintCount = 0;
+    for (let i = start + 1; i < definitionEnd; i += 1) {
+      if (isNativeDensePaintOperator(operatorList.fnArray[i], operatorList.argsArray[i])) {
+        definitionPaint = i;
+        definitionPaintCount += 1;
+      }
+    }
+
+    let activated = false;
+    let consumerStart = -1;
+    let consumerEnd = -1;
+    for (let i = definitionEnd + 1; i < operatorList.fnArray.length; i += 1) {
+      const fn = operatorList.fnArray[i];
+      if (fn === OPS.setGState) {
+        const toggle = readGraphicsStateSoftMaskToggle(operatorList.argsArray[i]);
+        if (toggle !== null) {
+          activated = toggle;
+        }
+        continue;
+      }
+      if (!activated) {
+        if (isNativeDensePaintOperator(fn, operatorList.argsArray[i]) || fn === OPS.restore || fn === OPS.paintFormXObjectEnd) {
+          break;
+        }
+        continue;
+      }
+      if (fn === OPS.beginGroup) {
+        consumerStart = i;
+        consumerEnd = findMatchingGroupEnd(operatorList.fnArray, i);
+        break;
+      }
+      if (isNativeDensePaintOperator(fn, operatorList.argsArray[i])) {
+        consumerStart = consumerEnd = i;
+        break;
+      }
+      if (fn === OPS.restore || fn === OPS.paintFormXObjectEnd || fn === OPS.endGroup) {
+        break;
+      }
+    }
+    if (consumerStart < 0 || consumerEnd < consumerStart) {
+      structuralMask.fill(1, start, definitionEnd + 1);
+      start = definitionEnd;
+      continue;
+    }
+    structuralMask.fill(1, start, consumerEnd + 1);
+    let consumerPaint = -1;
+    let consumerPaintCount = 0;
+    for (let i = consumerStart; i <= consumerEnd; i += 1) {
+      if (isNativeDensePaintOperator(operatorList.fnArray[i], operatorList.argsArray[i])) {
+        consumerPaint = i;
+        consumerPaintCount += 1;
+      }
+    }
+    if (
+      definitionPaintCount === 1 &&
+      operatorList.fnArray[definitionPaint] === OPS.shadingFill &&
+      consumerPaintCount === 1
+    ) {
+      ranges.push({
+        definitionStart: start,
+        definitionEnd,
+        definitionPaint,
+        consumerStart,
+        consumerEnd,
+        consumerPaint,
+        ...metadata
+      });
+    }
+    start = definitionEnd;
+  }
+  return { ranges, structuralMask };
+}
+
+function bakeNativeMaskGradient(
+  source: NativeGradientDefinition,
+  subtype: "Alpha" | "Luminosity",
+  backdrop: string | null,
+  transferMap: Uint8Array | null,
+  definitionOpacity: number
+): NativeGradientDefinition | null {
+  if (subtype === "Alpha" && backdrop) {
+    return null;
+  }
+  const backdropColor = backdrop ? parseNativeGradientColor(backdrop) : null;
+  if (backdrop && !backdropColor) {
+    return null;
+  }
+  const lut = new Uint8Array(source.lut.length);
+  for (let i = 0; i < GRADIENT_LUT_WIDTH; i += 1) {
+    const offset = i * 4;
+    const alpha = (source.lut[offset + 3] / 255) * clamp01(definitionOpacity);
+    let mask: number;
+    if (subtype === "Alpha") {
+      mask = alpha;
+    } else {
+      let r = source.lut[offset] / 255;
+      let g = source.lut[offset + 1] / 255;
+      let b = source.lut[offset + 2] / 255;
+      if (backdropColor) {
+        r = r * alpha + backdropColor[0] * (1 - alpha);
+        g = g * alpha + backdropColor[1] * (1 - alpha);
+        b = b * alpha + backdropColor[2] * (1 - alpha);
+      } else if (alpha < 1) {
+        r *= alpha;
+        g *= alpha;
+        b *= alpha;
+      }
+      mask = clamp01(0.3 * r + 0.59 * g + 0.11 * b);
+    }
+    let byte = Math.round(mask * 255);
+    if (transferMap && transferMap.length >= 256) {
+      byte = transferMap[byte];
+    }
+    lut[offset] = 255;
+    lut[offset + 1] = 255;
+    lut[offset + 2] = 255;
+    lut[offset + 3] = byte;
+  }
+  return { ...source, sceneToGradient: [...source.sceneToGradient], lut };
+}
+
+function constrainNativeMaskGradientToDefinitionClip(
+  gradient: NativeGradientDefinition,
+  state: NativeGradientPaintState
+): boolean {
+  if (
+    !state.clipBounds ||
+    !isNonEmptyBounds(state.clipBounds) ||
+    !state.clipGeometry?.isAxisAlignedRectangle ||
+    !nativeMatrixPreservesAxisAlignedRectangles(gradient.sceneToGradient)
+  ) {
+    return false;
+  }
+  const clipInGradientSpace = transformBounds(state.clipBounds, gradient.sceneToGradient);
+  const existingBounds = gradient.bbox
+    ? { minX: gradient.bbox[0], minY: gradient.bbox[1], maxX: gradient.bbox[2], maxY: gradient.bbox[3] }
+    : null;
+  const constrained = intersectBounds(existingBounds, clipInGradientSpace);
+  if (!constrained || !isNonEmptyBounds(constrained)) {
+    return false;
+  }
+  gradient.bbox = [constrained.minX, constrained.minY, constrained.maxX, constrained.maxY];
+  return true;
+}
+
+function nativeGradientTopologyMatches(source: NativeGradientPlan, display: NativeGradientPlan): boolean {
+  return (
+    source.paintTopologySignature === display.paintTopologySignature &&
+    source.nativeTopologySignature === display.nativeTopologySignature
+  );
+}
+
+function nativePaintHasEarlierOrdinaryVectorHazard(
+  operatorList: PdfOperatorListLike,
+  opIndex: number,
+  alreadyNativePathOps: ReadonlySet<number>
+): boolean {
+  for (let i = 0; i < opIndex; i += 1) {
+    const fn = operatorList.fnArray[i];
+    if (isTextPaintOperator(fn)) {
+      return true;
+    }
+    if (fn !== OPS.constructPath || alreadyNativePathOps.has(i)) {
+      continue;
+    }
+    const paintOp = readNumber(operatorList.argsArray[i], 0, OPS.endPath);
+    if (isFillPaintOp(paintOp) || isStrokePaintOp(paintOp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildNativeGradientPlan(
+  page: unknown,
+  operatorList: PdfOperatorListLike,
+  pageMatrix: Mat2D,
+  pageBounds: Bounds
+): NativeGradientPlan {
+  const gradients: NativeGradientDefinition[] = [];
+  const paints: NativeGradientPaint[] = [];
+  const nativePathPaintMask = new Uint8Array(operatorList.fnArray.length);
+  const rasterExcludedPaintMask = new Uint8Array(operatorList.fnArray.length);
+  const scan = scanNativeGradientStates(operatorList, pageMatrix, pageBounds);
+  const masks = collectNativeSoftMaskRanges(operatorList);
+  const reservedMask = masks.structuralMask;
+  const nativeConsumerOps = new Set<number>();
+  const nativeLeadingStrokeOps = new Set<number>();
+  const nativeOrderedPathOps = new Set<number>();
+  const topology: string[] = [];
+
+  // Existing exact graphics-composite fallback owns the whole page when a
+  // backdrop-dependent blend is present. Do not layer native paints over it.
+  if (operatorList.fnArray.some((fn, index) => fn === OPS.setGState && graphicsStateHasBackdropDependentBlend(operatorList.argsArray[index]))) {
+    return {
+      gradients,
+      paints,
+      nativePathPaintMask,
+      rasterExcludedPaintMask,
+      paintTopologySignature: scan.paintTopologySignature,
+      nativeTopologySignature: ""
+    };
+  }
+
+  const addGradient = (gradient: NativeGradientDefinition): number => {
+    gradients.push(gradient);
+    return gradients.length - 1;
+  };
+  const addPaint = (paint: NativeGradientPaint): void => {
+    paints.push(paint);
+    if (operatorList.fnArray[paint.opIndex] === OPS.constructPath) {
+      nativePathPaintMask[paint.opIndex] = 1;
+      nativeOrderedPathOps.add(paint.opIndex);
+    }
+    rasterExcludedPaintMask[paint.opIndex] = 1;
+    topology.push(`${paint.paintOrdinal}:${paint.kind}:${paint.sourceGradientIndex >= 0 ? "g" : "s"}:${paint.maskGradientIndex >= 0 ? "m" : "-"}`);
+  };
+
+  // A patterned stroke is only order-safe in the current split vector scene
+  // when it belongs to the first visible, stroke-only paint run. Move that
+  // complete run (including its solid-color companion arcs) into ordered
+  // gradient stroke runs. Pattern paints later in the page keep using the
+  // existing atomic graphics raster fallback.
+  const leadingStrokeOps: number[] = [];
+  let leadingRunHasPattern = false;
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+    if (fn === OPS.constructPath) {
+      const paintOp = readNumber(args, 0, -1);
+      if (paintOp === OPS.endPath) {
+        continue;
+      }
+      if (!isStrokePaintOp(paintOp) || isFillPaintOp(paintOp)) {
+        break;
+      }
+      const state = scan.states.get(i);
+      if (
+        !state ||
+        !isNativeNormalBlendMode(state.blendMode) ||
+        !state.clipBounds ||
+        !isNonEmptyBounds(state.clipBounds) ||
+        !state.clipGeometry?.isAxisAlignedRectangle ||
+        reservedMask[i] === 1
+      ) {
+        leadingStrokeOps.length = 0;
+        break;
+      }
+      leadingStrokeOps.push(i);
+      leadingRunHasPattern = leadingRunHasPattern || state.strokePattern !== null;
+      continue;
+    }
+    if (fn === OPS.shadingFill || isImagePaintOperator(fn) || isTextPaintOperator(fn) || fn === OPS.paintXObject) {
+      break;
+    }
+  }
+  if (leadingRunHasPattern && leadingStrokeOps.length > 0) {
+    const compiledLeadingRun: Array<{
+      opIndex: number;
+      pathData: Float32Array;
+      state: NativeGradientPaintState;
+      gradient: NativeGradientDefinition | null;
+    }> = [];
+    for (const opIndex of leadingStrokeOps) {
+      const state = scan.states.get(opIndex);
+      const pathData = readPathData(operatorList.argsArray[opIndex]);
+      if (!state || !pathData) {
+        compiledLeadingRun.length = 0;
+        break;
+      }
+      let gradient: NativeGradientDefinition | null = null;
+      if (state.strokePattern) {
+        gradient = parseNativeRadialAxialGradient(
+          page,
+          state.strokePattern.patternId,
+          multiplyMatrices(state.patternBaseMatrix, state.strokePattern.matrix)
+        );
+        if (!gradient) {
+          compiledLeadingRun.length = 0;
+          break;
+        }
+      }
+      compiledLeadingRun.push({ opIndex, pathData, state, gradient });
+    }
+    if (compiledLeadingRun.length === leadingStrokeOps.length) {
+      for (const entry of compiledLeadingRun) {
+        addPaint({
+          opIndex: entry.opIndex,
+          paintOrdinal: scan.paintOrdinalByOp[entry.opIndex],
+          kind: "stroke",
+          pathData: entry.pathData,
+          matrix: [...entry.state.matrix],
+          fillRule: FILL_RULE_NONZERO,
+          state: entry.state,
+          sourceGradientIndex: entry.gradient ? addGradient(entry.gradient) : -1,
+          maskGradientIndex: -1
+        });
+        nativeLeadingStrokeOps.add(entry.opIndex);
+      }
+    }
+  }
+
+  for (const range of masks.ranges) {
+    const definitionState = scan.states.get(range.definitionPaint);
+    const definitionGroupEntryState = scan.softMaskGroupEntryStates.get(range.definitionStart);
+    const consumerState = scan.states.get(range.consumerPaint);
+    if (
+      !definitionState ||
+      !definitionGroupEntryState ||
+      !consumerState ||
+      !consumerState.clipBounds ||
+      !isNonEmptyBounds(consumerState.clipBounds) ||
+      !consumerState.clipGeometry?.isAxisAlignedRectangle ||
+      !isNativeNormalBlendMode(definitionState.blendMode) ||
+      !isNativeNormalBlendMode(consumerState.blendMode) ||
+      nativePaintHasEarlierOrdinaryVectorHazard(
+        operatorList,
+        range.consumerPaint,
+        nativeOrderedPathOps
+      )
+    ) {
+      continue;
+    }
+    const definitionId = readArg(operatorList.argsArray[range.definitionPaint], 0);
+    if (typeof definitionId !== "string") {
+      continue;
+    }
+    const maskSource = parseNativeRadialAxialGradient(page, definitionId, definitionState.matrix);
+    const definitionGroupEntryAlpha = effectiveNativeFillAlpha(definitionGroupEntryState);
+    if (definitionGroupEntryAlpha <= ALPHA_INVISIBLE_EPSILON) {
+      continue;
+    }
+    const definitionLocalOpacity = clamp01(
+      effectiveNativeFillAlpha(definitionState) / definitionGroupEntryAlpha
+    );
+    const bakedMask = maskSource
+      ? bakeNativeMaskGradient(
+        maskSource,
+        range.subtype,
+        range.backdrop,
+        range.transferMap,
+        definitionLocalOpacity
+      )
+      : null;
+    if (!bakedMask) {
+      continue;
+    }
+    const definitionClipSharedByConsumer =
+      definitionState.clipGeometry?.isAxisAlignedRectangle === true &&
+      consumerState.clipGeometry?.isAxisAlignedRectangle === true &&
+      nativeBoundsEqual(definitionState.clipBounds, consumerState.clipBounds);
+    if (
+      !definitionClipSharedByConsumer &&
+      !constrainNativeMaskGradientToDefinitionClip(bakedMask, definitionState)
+    ) {
+      continue;
+    }
+    const consumerFn = operatorList.fnArray[range.consumerPaint];
+    const consumerArgs = operatorList.argsArray[range.consumerPaint];
+    let paint: NativeGradientPaint | null = null;
+    let sourceGradient: NativeGradientDefinition | null = null;
+    if (consumerFn === OPS.constructPath) {
+      const paintOp = readNumber(consumerArgs, 0, -1);
+      const fill = isFillPaintOp(paintOp);
+      const stroke = isStrokePaintOp(paintOp);
+      const pathData = readPathData(consumerArgs);
+      if (!pathData || fill === stroke) {
+        continue;
+      }
+      const pattern = fill ? consumerState.fillPattern : consumerState.strokePattern;
+      if (pattern) {
+        sourceGradient = parseNativeRadialAxialGradient(
+          page,
+          pattern.patternId,
+          multiplyMatrices(consumerState.patternBaseMatrix, pattern.matrix)
+        );
+        if (!sourceGradient) {
+          continue;
+        }
+      }
+      paint = {
+        opIndex: range.consumerPaint,
+        paintOrdinal: scan.paintOrdinalByOp[range.consumerPaint],
+        kind: fill ? "fill" : "stroke",
+        pathData,
+        matrix: [...consumerState.matrix],
+        fillRule: isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO,
+        state: consumerState,
+        sourceGradientIndex: -1,
+        maskGradientIndex: -1
+      };
+    } else if (
+      consumerFn === OPS.shadingFill &&
+      consumerState.clipGeometry?.isAxisAlignedRectangle
+    ) {
+      const patternId = readArg(consumerArgs, 0);
+      if (typeof patternId !== "string") {
+        continue;
+      }
+      sourceGradient = parseNativeRadialAxialGradient(page, patternId, consumerState.matrix);
+      if (!sourceGradient) {
+        continue;
+      }
+      paint = {
+        opIndex: range.consumerPaint,
+        paintOrdinal: scan.paintOrdinalByOp[range.consumerPaint],
+        kind: "fill",
+        pathData: consumerState.clipGeometry.pathData,
+        matrix: [...consumerState.clipGeometry.matrix],
+        fillRule: consumerState.clipGeometry.fillRule,
+        state: consumerState,
+        sourceGradientIndex: -1,
+        maskGradientIndex: -1
+      };
+    }
+    if (!paint) {
+      continue;
+    }
+    const consumerBounds = computeTransformedPathBounds(paint.pathData, paint.matrix);
+    if (
+      !consumerBounds ||
+      (
+        consumerState.clipBounds &&
+        !nativeBoundsContains(consumerState.clipBounds, consumerBounds) &&
+        !consumerState.clipGeometry?.isAxisAlignedRectangle
+      )
+    ) {
+      // Dedicated path geometry supports bounds clipping only for a scene-axis
+      // rectangle. A clipped consumer under an arbitrary PDF clip remains an
+      // atomic raster composite.
+      continue;
+    }
+    if (sourceGradient) {
+      paint.sourceGradientIndex = addGradient(sourceGradient);
+    }
+    paint.maskGradientIndex = addGradient(bakedMask);
+    addPaint(paint);
+    nativeConsumerOps.add(range.consumerPaint);
+    rasterExcludedPaintMask[range.definitionPaint] = 1;
+  }
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    if (reservedMask[i] === 1 || nativeConsumerOps.has(i) || nativeLeadingStrokeOps.has(i)) {
+      continue;
+    }
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+    const state = scan.states.get(i);
+    if (!state || !isNativeNormalBlendMode(state.blendMode)) {
+      continue;
+    }
+    if (fn === OPS.shadingFill) {
+      if (nativePaintHasEarlierOrdinaryVectorHazard(operatorList, i, nativeOrderedPathOps)) {
+        continue;
+      }
+      const patternId = readArg(args, 0);
+      if (typeof patternId !== "string" || !state.clipGeometry?.isAxisAlignedRectangle) {
+        continue;
+      }
+      const gradient = parseNativeRadialAxialGradient(page, patternId, state.matrix);
+      if (!gradient) {
+        continue;
+      }
+      addPaint({
+        opIndex: i,
+        paintOrdinal: scan.paintOrdinalByOp[i],
+        kind: "fill",
+        pathData: state.clipGeometry.pathData,
+        matrix: [...state.clipGeometry.matrix],
+        fillRule: state.clipGeometry.fillRule,
+        state,
+        sourceGradientIndex: addGradient(gradient),
+        maskGradientIndex: -1
+      });
+      continue;
+    }
+    if (fn !== OPS.constructPath) {
+      continue;
+    }
+    const paintOp = readNumber(args, 0, -1);
+    const pathData = readPathData(args);
+    if (!pathData) {
+      continue;
+    }
+    const fill = isFillPaintOp(paintOp);
+    const stroke = isStrokePaintOp(paintOp);
+    if (fill === stroke) {
+      continue;
+    }
+    const pattern = fill ? state.fillPattern : state.strokePattern;
+    if (!pattern) {
+      continue;
+    }
+    // Non-leading ColorN paths cannot be placed safely relative to the
+    // ordinary fill/stroke/text bands, so leave their complete graphics run to
+    // the existing ordered raster fallback.
+  }
+
+  const hasNonLeadingPatternPaint = operatorList.fnArray.some((fn, i) => {
+    if (fn !== OPS.constructPath || nativeOrderedPathOps.has(i)) {
+      return false;
+    }
+    const state = scan.states.get(i);
+    if (!state) {
+      return false;
+    }
+    const paintOp = readNumber(operatorList.argsArray[i], 0, OPS.endPath);
+    return (
+      (isFillPaintOp(paintOp) && state.fillPattern !== null) ||
+      (isStrokePaintOp(paintOp) && state.strokePattern !== null)
+    );
+  });
+  if (hasNonLeadingPatternPaint) {
+    // The ordered-pattern fallback replays the complete graphics backdrop.
+    // Mixing that atomic layer with native sparse paints would duplicate or
+    // straddle them, so keep the whole page on the established fallback.
+    return {
+      gradients: [],
+      paints: [],
+      nativePathPaintMask: new Uint8Array(operatorList.fnArray.length),
+      rasterExcludedPaintMask: new Uint8Array(operatorList.fnArray.length),
+      paintTopologySignature: scan.paintTopologySignature,
+      nativeTopologySignature: ""
+    };
+  }
+
+  if (buildSoftMaskPaintMask(operatorList, rasterExcludedPaintMask).compositeCount > 0) {
+    // Unsupported soft-mask groups are captured atomically by PDF.js. Their
+    // group span has no single safe sparse paint anchor, so do not interleave
+    // native paints elsewhere on the same page.
+    return {
+      gradients: [],
+      paints: [],
+      nativePathPaintMask: new Uint8Array(operatorList.fnArray.length),
+      rasterExcludedPaintMask: new Uint8Array(operatorList.fnArray.length),
+      paintTopologySignature: scan.paintTopologySignature,
+      nativeTopologySignature: ""
+    };
+  }
+
+  const residualRasterPlan = buildRasterOperatorPlan(operatorList, rasterExcludedPaintMask);
+  const residualShadingSpan = resolveAggregateShadingPaintSpan(
+    operatorList,
+    residualRasterPlan,
+    residualRasterPlan.hasEarlyStrokeUnderlayOps
+  );
+  if (
+    residualShadingSpan &&
+    paints.some((paint) => nativePaintOrdinalIsInsideSpan(paint.paintOrdinal, residualShadingSpan))
+  ) {
+    // A selective shading/soft-mask texture has one painter anchor. Include
+    // consumer ordinals in its span and keep the page atomic when a native
+    // paint would split that span.
+    return {
+      gradients: [],
+      paints: [],
+      nativePathPaintMask: new Uint8Array(operatorList.fnArray.length),
+      rasterExcludedPaintMask: new Uint8Array(operatorList.fnArray.length),
+      paintTopologySignature: scan.paintTopologySignature,
+      nativeTopologySignature: ""
+    };
+  }
+
+  paints.sort((left, right) => left.paintOrdinal - right.paintOrdinal);
+  return {
+    gradients,
+    paints,
+    nativePathPaintMask,
+    rasterExcludedPaintMask,
+    paintTopologySignature: scan.paintTopologySignature,
+    nativeTopologySignature: topology.sort().join("|")
+  };
+}
+
 interface RasterOperatorPlan {
   hasImagePaintOps: boolean;
   hasShadingFillOps: boolean;
@@ -5139,7 +6916,8 @@ function findMatchingGroupEnd(fnArray: number[], beginIndex: number): number {
 }
 
 function buildSoftMaskPaintMask(
-  operatorList: { fnArray: number[]; argsArray: unknown[] }
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  excludedPaintMask?: Uint8Array
 ): { mask: Uint8Array; compositeCount: number } {
   const { fnArray, argsArray } = operatorList;
   const mask = new Uint8Array(fnArray.length);
@@ -5153,6 +6931,19 @@ function buildSoftMaskPaintMask(
     const definitionEnd = findMatchingGroupEnd(fnArray, definitionStart);
     if (definitionEnd < 0) {
       break;
+    }
+    let definitionIsNative = false;
+    if (excludedPaintMask) {
+      for (let i = definitionStart; i <= definitionEnd; i += 1) {
+        if (excludedPaintMask[i] === 1) {
+          definitionIsNative = true;
+          break;
+        }
+      }
+    }
+    if (definitionIsNative) {
+      definitionStart = definitionEnd;
+      continue;
     }
 
     let softMaskActive = false;
@@ -5242,7 +7033,8 @@ function isSolidFillColorOperator(fn: number): boolean {
  * pattern stroke.
  */
 function buildEarlyStrokeUnderlayMask(
-  operatorList: { fnArray: number[]; argsArray: unknown[] }
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  excludedPaintMask?: Uint8Array
 ): { mask: Uint8Array; count: number; signature: string } {
   const { fnArray, argsArray } = operatorList;
   if (!fnArray.includes(OPS.setStrokeColorN)) {
@@ -5301,6 +7093,9 @@ function buildEarlyStrokeUnderlayMask(
         }
         continue;
       }
+      if (excludedPaintMask?.[i] === 1) {
+        continue;
+      }
       mask[i] = 1;
       patternStates.push(strokeUsesPattern);
       continue;
@@ -5329,7 +7124,8 @@ function buildEarlyStrokeUnderlayMask(
 
 function buildOrderedPatternPaintPlan(
   operatorList: { fnArray: number[]; argsArray: unknown[] },
-  earlyStrokeUnderlayMask?: Uint8Array
+  earlyStrokeUnderlayMask?: Uint8Array,
+  excludedPaintMask?: Uint8Array
 ): { count: number; signature: string } {
   const { fnArray, argsArray } = operatorList;
   if (!fnArray.includes(OPS.setStrokeColorN) && !fnArray.includes(OPS.setFillColorN)) {
@@ -5398,7 +7194,7 @@ function buildOrderedPatternPaintPlan(
       continue;
     }
 
-    if (fn !== OPS.constructPath || earlyStrokeUnderlayMask?.[i] === 1) {
+    if (fn !== OPS.constructPath || earlyStrokeUnderlayMask?.[i] === 1 || excludedPaintMask?.[i] === 1) {
       continue;
     }
 
@@ -5493,18 +7289,22 @@ function isImageRasterStateOperator(fn: number, args: unknown): boolean {
   return false;
 }
 
-function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: unknown[] }): RasterOperatorPlan {
+function buildRasterOperatorPlan(
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  excludedPaintMask?: Uint8Array
+): RasterOperatorPlan {
   const imageOnlyMask = new Uint8Array(operatorList.fnArray.length);
   const shadingOnlyMask = new Uint8Array(operatorList.fnArray.length);
   const imageStateMask = new Uint8Array(operatorList.fnArray.length);
   const graphicsOnlyMask = new Uint8Array(operatorList.fnArray.length);
   const vectorPaintMask = new Uint8Array(operatorList.fnArray.length);
-  const softMaskPlan = buildSoftMaskPaintMask(operatorList);
+  const softMaskPlan = buildSoftMaskPaintMask(operatorList, excludedPaintMask);
   const softMaskPaintMask = softMaskPlan.mask;
-  const earlyStrokeUnderlayPlan = buildEarlyStrokeUnderlayMask(operatorList);
+  const earlyStrokeUnderlayPlan = buildEarlyStrokeUnderlayMask(operatorList, excludedPaintMask);
   const orderedPatternPlan = buildOrderedPatternPaintPlan(
     operatorList,
-    earlyStrokeUnderlayPlan.mask
+    earlyStrokeUnderlayPlan.mask,
+    excludedPaintMask
   );
   let hasImagePaintOps = false;
   let hasShadingFillOps = false;
@@ -5518,6 +7318,7 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
     const args = operatorList.argsArray[i];
+    const nativePaint = excludedPaintMask?.[i] === 1;
 
     if (!isTextPaintOperator(fn)) {
       graphicsOnlyMask[i] = 1;
@@ -5525,14 +7326,14 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
     if (isTextPaintOperator(fn)) {
       firstTextPaintIndex = Math.min(firstTextPaintIndex, i);
     }
-    if (fn === OPS.constructPath) {
+    if (fn === OPS.constructPath && !nativePaint) {
       const paintOp = readNumber(args, 0, -1);
       if (isStrokePaintOp(paintOp) || isFillPaintOp(paintOp)) {
         vectorPaintMask[i] = 1;
         lastGraphicsPaintIndex = i;
       }
     }
-    if (fn === OPS.shadingFill || isImagePaintOperator(fn) || fn === OPS.paintXObject) {
+    if (!nativePaint && (fn === OPS.shadingFill || isImagePaintOperator(fn) || fn === OPS.paintXObject)) {
       lastGraphicsPaintIndex = i;
     }
     if (fn === OPS.setGState && graphicsStateHasBackdropDependentBlend(args)) {
@@ -5544,25 +7345,25 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
       hasFormXObjectOps = true;
     }
 
-    if (softMaskPaintMask[i] === 1) {
+    if (!nativePaint && softMaskPaintMask[i] === 1) {
       hasSoftMaskPaintOps = true;
       shadingOnlyMask[i] = 1;
     }
 
-    if (fn === OPS.shadingFill) {
+    if (fn === OPS.shadingFill && !nativePaint) {
       hasShadingFillOps = true;
       if (softMaskPaintMask[i] === 0) {
         shadingOnlyMask[i] = 1;
       }
     }
 
-    if (isImagePaintOperator(fn) && softMaskPaintMask[i] === 0) {
+    if (isImagePaintOperator(fn) && softMaskPaintMask[i] === 0 && !nativePaint) {
       hasImagePaintOps = true;
       imageOnlyMask[i] = 1;
       continue;
     }
 
-    if (fn === OPS.shadingFill || softMaskPaintMask[i] === 1) {
+    if ((fn === OPS.shadingFill && !nativePaint) || softMaskPaintMask[i] === 1) {
       continue;
     }
 
@@ -5600,6 +7401,7 @@ function buildRasterOperatorPlan(operatorList: { fnArray: number[]; argsArray: u
 
 interface RasterImageOpPlan {
   opIndex: number;
+  paintOrder: number;
   /** PDF-user-space CTM at the op; the image covers the unit square under this matrix. */
   ctm: Mat2D;
   /** Source pixels per page point; null for scale-free paints (solid-color masks). */
@@ -5623,10 +7425,12 @@ function scanRasterImageOps(
   const plans: RasterImageOpPlan[] = [];
   let plansValid = true;
   let hintValid = true;
+  let paintOrdinal = 0;
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
     const args = operatorList.argsArray[i];
+    const currentPaintOrdinal = isNativeDensePaintOperator(fn, args) ? paintOrdinal++ : -1;
 
     if (fn === OPS.save) {
       matrixStack.push([...currentMatrix]);
@@ -5696,7 +7500,7 @@ function scanRasterImageOps(
 
     // Solid-color mask paints carry no pixel data, so they don't constrain resolution.
     if (fn === OPS.paintSolidColorImageMask) {
-      plans.push({ opIndex: i, ctm: [...currentMatrix], nativeScale: null });
+      plans.push({ opIndex: i, paintOrder: currentPaintOrdinal, ctm: [...currentMatrix], nativeScale: null });
       continue;
     }
 
@@ -5714,7 +7518,7 @@ function scanRasterImageOps(
       continue;
     }
 
-    plans.push({ opIndex: i, ctm: [...currentMatrix], nativeScale: Math.max(1, nativeScale) });
+    plans.push({ opIndex: i, paintOrder: currentPaintOrdinal, ctm: [...currentMatrix], nativeScale: Math.max(1, nativeScale) });
     if (nativeScale > maxScaleHint) {
       maxScaleHint = nativeScale;
     }
@@ -5759,6 +7563,14 @@ function createEmptyRasterLayerResult(): RasterLayerExtractResult {
   };
 }
 
+function createNativeOrderingFailureRasterResult(): RasterLayerExtractResult {
+  return {
+    layers: [],
+    bounds: null,
+    nativeOrderingFailed: true
+  };
+}
+
 function combineRasterLayerResults(
   first: RasterLayerExtractResult,
   second: RasterLayerExtractResult
@@ -5783,80 +7595,152 @@ function combineRasterLayerResults(
 }
 
 function isCapturedShadingPaint(
-  operatorList: { fnArray: number[] },
   rasterPlan: RasterOperatorPlan,
   index: number,
   includeEarlyStrokeUnderlay: boolean
 ): boolean {
   return (
-    operatorList.fnArray[index] === OPS.shadingFill ||
-    rasterPlan.softMaskPaintMask[index] === 1 ||
+    rasterPlan.shadingOnlyMask[index] === 1 ||
     (includeEarlyStrokeUnderlay && rasterPlan.earlyStrokeUnderlayMask[index] === 1)
   );
 }
 
+function buildDensePaintOrdinalByOp(
+  operatorList: { fnArray: number[]; argsArray?: unknown[] }
+): Int32Array {
+  const ordinals = new Int32Array(operatorList.fnArray.length);
+  ordinals.fill(-1);
+  let paintOrdinal = 0;
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const args = operatorList.argsArray?.[i];
+    if (!isNativeDensePaintOperator(operatorList.fnArray[i], args)) {
+      continue;
+    }
+    ordinals[i] = paintOrdinal;
+    paintOrdinal += 1;
+  }
+  return ordinals;
+}
+
+interface DensePaintSpan {
+  first: number;
+  last: number;
+}
+
+function resolveDensePaintSpan(
+  operatorList: { fnArray: number[]; argsArray?: unknown[] },
+  include: (index: number) => boolean
+): DensePaintSpan | null {
+  const ordinals = buildDensePaintOrdinalByOp(operatorList);
+  let first = Number.POSITIVE_INFINITY;
+  let last = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < ordinals.length; i += 1) {
+    const ordinal = ordinals[i];
+    if (ordinal < 0 || !include(i)) {
+      continue;
+    }
+    first = Math.min(first, ordinal);
+    last = Math.max(last, ordinal);
+  }
+  return Number.isFinite(first) && Number.isFinite(last) ? { first, last } : null;
+}
+
+function nativePaintOrdinalIsInsideSpan(paintOrdinal: number, span: DensePaintSpan): boolean {
+  return paintOrdinal > span.first && paintOrdinal < span.last;
+}
+
+function densePaintSelectionFallsInsideSpan(
+  operatorList: { fnArray: number[]; argsArray?: unknown[] },
+  span: DensePaintSpan,
+  include: (index: number) => boolean
+): boolean {
+  const ordinals = buildDensePaintOrdinalByOp(operatorList);
+  for (let i = 0; i < ordinals.length; i += 1) {
+    if (include(i) && nativePaintOrdinalIsInsideSpan(ordinals[i], span)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveAggregateShadingPaintSpan(
+  operatorList: { fnArray: number[]; argsArray?: unknown[] },
+  rasterPlan: RasterOperatorPlan,
+  includeEarlyStrokeUnderlay: boolean
+): DensePaintSpan | null {
+  return resolveDensePaintSpan(
+    operatorList,
+    (index) => isCapturedShadingPaint(rasterPlan, index, includeEarlyStrokeUnderlay)
+  );
+}
+
+function resolveAggregateImagePaintSpan(
+  operatorList: { fnArray: number[]; argsArray?: unknown[] },
+  rasterPlan: RasterOperatorPlan
+): DensePaintSpan | null {
+  return resolveDensePaintSpan(
+    operatorList,
+    (index) =>
+      isNativeDenseImagePaintOperator(operatorList.fnArray[index]) &&
+      rasterPlan.softMaskPaintMask[index] === 0
+  );
+}
+
+function combineDensePaintSpans(
+  first: DensePaintSpan | null,
+  second: DensePaintSpan | null
+): DensePaintSpan | null {
+  if (!first) {
+    return second;
+  }
+  if (!second) {
+    return first;
+  }
+  return { first: Math.min(first.first, second.first), last: Math.max(first.last, second.last) };
+}
+
 function resolveAggregateShadingPaintOrder(
-  operatorList: { fnArray: number[] },
+  operatorList: { fnArray: number[]; argsArray?: unknown[] },
   rasterPlan: RasterOperatorPlan,
   includeEarlyStrokeUnderlay: boolean
 ): number | null {
-  let firstPaintIndex = -1;
-  let lastPaintIndex = -1;
-  for (let index = 0; index < operatorList.fnArray.length; index += 1) {
-    if (!isCapturedShadingPaint(operatorList, rasterPlan, index, includeEarlyStrokeUnderlay)) {
-      continue;
-    }
-    if (firstPaintIndex < 0) {
-      firstPaintIndex = index;
-    }
-    lastPaintIndex = index;
-  }
-  if (firstPaintIndex < 0) {
+  const span = resolveAggregateShadingPaintSpan(operatorList, rasterPlan, includeEarlyStrokeUnderlay);
+  if (!span) {
     return null;
   }
 
   // All selected shadings currently share one texture. It has one exact raster
   // painter position only when no separately captured image lies inside its span.
-  for (let index = firstPaintIndex + 1; index < lastPaintIndex; index += 1) {
-    if (
-      isImagePaintOperator(operatorList.fnArray[index]) &&
+  if (densePaintSelectionFallsInsideSpan(
+    operatorList,
+    span,
+    (index) =>
+      isNativeDenseImagePaintOperator(operatorList.fnArray[index]) &&
       rasterPlan.softMaskPaintMask[index] === 0
-    ) {
-      return null;
-    }
+  )) {
+    return null;
   }
-  return lastPaintIndex;
+  return span.last;
 }
 
 function resolveAggregateImagePaintOrder(
-  operatorList: { fnArray: number[] },
+  operatorList: { fnArray: number[]; argsArray?: unknown[] },
   rasterPlan: RasterOperatorPlan,
   includeEarlyStrokeUnderlay: boolean
 ): number | null {
-  let firstPaintIndex = -1;
-  let lastPaintIndex = -1;
-  for (let index = 0; index < operatorList.fnArray.length; index += 1) {
-    if (
-      !isImagePaintOperator(operatorList.fnArray[index]) ||
-      rasterPlan.softMaskPaintMask[index] === 1
-    ) {
-      continue;
-    }
-    if (firstPaintIndex < 0) {
-      firstPaintIndex = index;
-    }
-    lastPaintIndex = index;
-  }
-  if (firstPaintIndex < 0) {
+  const span = resolveAggregateImagePaintSpan(operatorList, rasterPlan);
+  if (!span) {
     return null;
   }
 
-  for (let index = firstPaintIndex + 1; index < lastPaintIndex; index += 1) {
-    if (isCapturedShadingPaint(operatorList, rasterPlan, index, includeEarlyStrokeUnderlay)) {
-      return null;
-    }
+  if (densePaintSelectionFallsInsideSpan(
+    operatorList,
+    span,
+    (index) => isCapturedShadingPaint(rasterPlan, index, includeEarlyStrokeUnderlay)
+  )) {
+    return null;
   }
-  return lastPaintIndex;
+  return span.last;
 }
 
 function setRasterLayerPaintOrder(result: RasterLayerExtractResult, paintOrder: number | null): void {
@@ -6008,7 +7892,10 @@ async function extractRasterLayerData(
   pageMatrix: Mat2D,
   options: RasterLayerExtractOptions
 ): Promise<RasterLayerExtractResult> {
-  const sourceRasterPlan = buildRasterOperatorPlan(operatorList);
+  const sourceRasterPlan = buildRasterOperatorPlan(
+    operatorList,
+    options.nativeSourcePlan?.rasterExcludedPaintMask
+  );
   if (
     !sourceRasterPlan.hasImagePaintOps &&
     !sourceRasterPlan.hasShadingFillOps &&
@@ -6030,9 +7917,14 @@ async function extractRasterLayerData(
     return createEmptyRasterLayerResult();
   }
 
-  const displayOperatorList = await prepareDisplayOperatorList(pageLike);
+  const displayOperatorList = options.preparedDisplayOperatorList !== undefined
+    ? options.preparedDisplayOperatorList
+    : await prepareDisplayOperatorList(pageLike);
   const filterOperatorList = displayOperatorList ?? operatorList;
-  const rasterPlan = buildRasterOperatorPlan(filterOperatorList);
+  const rasterPlan = buildRasterOperatorPlan(
+    filterOperatorList,
+    displayOperatorList ? options.nativeDisplayPlan?.rasterExcludedPaintMask : options.nativeSourcePlan?.rasterExcludedPaintMask
+  );
   const earlyStrokeUnderlayMatches =
     rasterPlan.earlyStrokeUnderlayCount > 0 &&
     rasterPlan.earlyStrokeUnderlayCount === sourceRasterPlan.earlyStrokeUnderlayCount &&
@@ -6083,6 +7975,20 @@ async function extractRasterLayerData(
       earlyStrokeUnderlayMatches
     )
     : null;
+  const shadingPaintSpan = resolveAggregateShadingPaintSpan(
+    filterOperatorList,
+    rasterPlan,
+    earlyStrokeUnderlayMatches
+  );
+  const imagePaintSpan = resolveAggregateImagePaintSpan(filterOperatorList, rasterPlan);
+  const orderedRasterPaintSpan = combineDensePaintSpans(shadingPaintSpan, imagePaintSpan);
+  const nativePaintFallsInside = (span: DensePaintSpan | null): boolean =>
+    Boolean(
+      span &&
+      options.nativeDisplayPlan?.paints.some((paint) =>
+        nativePaintOrdinalIsInsideSpan(paint.paintOrdinal, span)
+      )
+    );
   const buildViewport = (rasterScale: number): { transform: unknown; width: number; height: number } =>
     rasterScale === 1 ? baseViewport : pageLike.getViewport({ scale: rasterScale, rotation, dontFlip: false });
 
@@ -6101,7 +8007,10 @@ async function extractRasterLayerData(
     if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
       const fallbackRgba = await renderRasterLayerRgba(pageLike, viewport, width, height);
       if (fallbackRgba && hasVisibleAlphaPixels(fallbackRgba)) {
-        return finalizeSingleRasterLayerResult(width, height, fallbackRgba, viewport, pageMatrix);
+        const fallbackResult = finalizeSingleRasterLayerResult(width, height, fallbackRgba, viewport, pageMatrix);
+        const fullPaintSpan = resolveDensePaintSpan(filterOperatorList, () => true);
+        setRasterLayerPaintOrder(fallbackResult, fullPaintSpan?.last ?? null);
+        return fallbackResult;
       }
     }
     // If the larger full-page allocation/render fails, retain the selective
@@ -6129,6 +8038,11 @@ async function extractRasterLayerData(
       const graphicsRgba = await renderRasterLayerRgba(pageLike, viewport, width, height, filter);
       if (graphicsRgba && hasVisibleAlphaPixels(graphicsRgba)) {
         const graphicsResult = finalizeCroppedRasterLayerResult(width, height, graphicsRgba, viewport, pageMatrix);
+        const graphicsPaintSpan = resolveDensePaintSpan(
+          filterOperatorList,
+          (index) => graphicsOnlyMask[index] === 1
+        );
+        setRasterLayerPaintOrder(graphicsResult, graphicsPaintSpan?.last ?? null);
         graphicsResult.suppressedSourcePaintMask = sourceRasterPlan.vectorPaintMask;
         return graphicsResult;
       }
@@ -6178,6 +8092,7 @@ async function extractRasterLayerData(
           viewport,
           pageMatrix
         );
+        setRasterLayerPaintOrder(orderedRasterResult, orderedRasterPaintSpan?.last ?? null);
         applyCapturedRasterSuppression(
           orderedRasterResult,
           rasterPlan,
@@ -6196,9 +8111,15 @@ async function extractRasterLayerData(
     hasCapturedShadingPaints &&
     (shadingPaintOrder === null || (perImagePlans === null && aggregateImagePaintOrder === null))
   ) {
+    if (nativePaintFallsInside(orderedRasterPaintSpan)) {
+      return createNativeOrderingFailureRasterResult();
+    }
     const orderedRasterResult = await renderOrderedRasterComposite();
     if (orderedRasterResult) {
       return orderedRasterResult;
+    }
+    if (options.nativeDisplayPlan?.paints.length) {
+      return createNativeOrderingFailureRasterResult();
     }
     // If the ordered composite cannot be rendered, keep the selective legacy
     // fallback below rather than dropping raster content.
@@ -6256,19 +8177,31 @@ async function extractRasterLayerData(
     if (perImage) {
       return combineRasterLayerResults(shadingResult, perImage);
     }
+    if (nativePaintFallsInside(imagePaintSpan)) {
+      return createNativeOrderingFailureRasterResult();
+    }
     if (
       hasCapturedShadingPaints &&
       aggregateImagePaintOrder === null &&
       !orderedRasterCompositeAttempted
     ) {
+      if (nativePaintFallsInside(orderedRasterPaintSpan)) {
+        return createNativeOrderingFailureRasterResult();
+      }
       const orderedRasterResult = await renderOrderedRasterComposite();
       if (orderedRasterResult) {
         return orderedRasterResult;
+      }
+      if (options.nativeDisplayPlan?.paints.length) {
+        return createNativeOrderingFailureRasterResult();
       }
     }
   }
 
   if (displayOperatorList && rasterPlan.hasImagePaintOps) {
+    if (nativePaintFallsInside(imagePaintSpan)) {
+      return createNativeOrderingFailureRasterResult();
+    }
     // Flattened-image fallback: per-image placement is unavailable (repeat/group
     // ops, unreadable sizes) or there are too many image ops for individual layers.
     const imageScale = chooseRasterExtractionScale(
@@ -6312,7 +8245,10 @@ async function extractRasterLayerData(
     const height = Math.max(1, Math.ceil(viewport.height));
     rgba = await renderRasterLayerRgba(pageLike, viewport, width, height);
     if (rgba && hasVisibleAlphaPixels(rgba)) {
-      return finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+      const fallbackResult = finalizeSingleRasterLayerResult(width, height, rgba, viewport, pageMatrix);
+      const fullPaintSpan = resolveDensePaintSpan(operatorList, () => true);
+      setRasterLayerPaintOrder(fallbackResult, fullPaintSpan?.last ?? null);
+      return fallbackResult;
     }
   }
 
@@ -6379,13 +8315,16 @@ async function renderPerImageRasterLayers(
     const filter = (index: number): boolean =>
       index === opIndex || (index >= 0 && index < imageStateMask.length && imageStateMask[index] === 1);
     const rgba = await renderRasterLayerRgba(pageLike, renderViewport, width, height, filter);
-    if (!rgba || !hasVisibleAlphaPixels(rgba)) {
+    if (!rgba) {
+      return null;
+    }
+    if (!hasVisibleAlphaPixels(rgba)) {
       // Fully clipped away or transparent — nothing worth storing.
       continue;
     }
 
     const matrix = buildRasterLayerMatrix(width, height, cropMinX, cropMinY, scaledTransform, pageMatrix);
-    layers.push({ width, height, data: rgba, matrix, paintOrder: plan.opIndex });
+    layers.push({ width, height, data: rgba, matrix, paintOrder: plan.paintOrder, pageIndex: 0 });
     bounds = combineBounds(bounds, transformBounds(UNIT_BOUNDS, matrix));
   }
 
@@ -6562,7 +8501,7 @@ function finalizeSingleRasterLayerResult(
   const bounds = transformBounds(UNIT_BOUNDS, matrix);
 
   return {
-    layers: [{ width, height, data: rgba, matrix }],
+    layers: [{ width, height, data: rgba, matrix, paintOrder: 0, pageIndex: 0 }],
     bounds
   };
 }
@@ -6613,7 +8552,7 @@ function finalizeCroppedRasterLayerResult(
   const transform = readTransform((viewport as { transform?: unknown }).transform) ?? [...IDENTITY_MATRIX];
   const matrix = buildRasterLayerMatrix(cropWidth, cropHeight, cropMinX, cropMinY, transform, pageMatrix);
   return {
-    layers: [{ width: cropWidth, height: cropHeight, data: cropped, matrix }],
+    layers: [{ width: cropWidth, height: cropHeight, data: cropped, matrix, paintOrder: 0, pageIndex: 0 }],
     bounds: transformBounds(UNIT_BOUNDS, matrix)
   };
 }

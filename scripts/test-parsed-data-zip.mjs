@@ -48,6 +48,22 @@ async function readZip(blob) {
   return JSZip.loadAsync(await blob.arrayBuffer());
 }
 
+async function mutateInterleavedFloat32Texture(zip, manifest, textureName, mutate) {
+  const texture = manifest.textures.find((entry) => entry.name === textureName);
+  assert.ok(texture, `missing ${textureName} manifest entry`);
+  assert.equal(texture.componentType, "float32");
+  assert.equal(texture.layout, "interleaved");
+  assert.equal(texture.byteShuffle, false);
+  assert.equal(texture.predictor, "none");
+  const zipEntry = zip.file(texture.file);
+  assert.ok(zipEntry, `missing ${textureName} payload`);
+  const bytes = (await zipEntry.async("uint8array")).slice();
+  assert.equal(bytes.byteLength % 4, 0);
+  const values = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+  mutate(values);
+  zip.file(texture.file, bytes, { compression: "STORE" });
+}
+
 function sampleRasterLayerAtWorld(layer, worldX, worldY) {
   const [a, b, c, d, e, f] = layer.matrix;
   const det = a * d - b * c;
@@ -63,7 +79,186 @@ function sampleRasterLayerAtWorld(layer, worldX, worldY) {
   return Array.from(layer.data.subarray(offset, offset + 4));
 }
 
+function evaluateSceneGradientParameter(scene, gradientIndex, worldX, worldY) {
+  assert.ok(gradientIndex >= 0 && gradientIndex < scene.gradientCount);
+  const offset = gradientIndex * 4;
+  const a = scene.gradientMetaB[offset];
+  const b = scene.gradientMetaB[offset + 1];
+  const c = scene.gradientMetaB[offset + 2];
+  const d = scene.gradientMetaB[offset + 3];
+  const e = scene.gradientMetaC[offset];
+  const f = scene.gradientMetaC[offset + 1];
+  const qx = a * worldX + c * worldY + e;
+  const qy = b * worldX + d * worldY + f;
+  if (
+    scene.gradientMetaA[offset + 1] >= 0.5 &&
+    (
+      qx < scene.gradientMetaE[offset] ||
+      qy < scene.gradientMetaE[offset + 1] ||
+      qx > scene.gradientMetaE[offset + 2] ||
+      qy > scene.gradientMetaE[offset + 3]
+    )
+  ) {
+    return null;
+  }
+  const p0x = scene.gradientMetaC[offset + 2];
+  const p0y = scene.gradientMetaC[offset + 3];
+  const p1x = scene.gradientMetaD[offset];
+  const p1y = scene.gradientMetaD[offset + 1];
+  const kind = Math.round(scene.gradientMetaA[offset]);
+  if (kind === 0) {
+    const dx = p1x - p0x;
+    const dy = p1y - p0y;
+    const denominator = dx * dx + dy * dy;
+    return denominator > 1e-12
+      ? ((qx - p0x) * dx + (qy - p0y) * dy) / denominator
+      : null;
+  }
+
+  assert.equal(kind, 1, `gradient ${gradientIndex} must be axial or radial`);
+  const dcx = p1x - p0x;
+  const dcy = p1y - p0y;
+  const radius0 = scene.gradientMetaD[offset + 2];
+  const dr = scene.gradientMetaD[offset + 3] - radius0;
+  const px = qx - p0x;
+  const py = qy - p0y;
+  const qa = dcx * dcx + dcy * dcy - dr * dr;
+  const qb = -2 * (px * dcx + py * dcy + radius0 * dr);
+  const qc = px * px + py * py - radius0 ** 2;
+  let roots;
+  if (Math.abs(qa) <= 1e-10) {
+    if (Math.abs(qb) <= 1e-10) {
+      return null;
+    }
+    roots = [-qc / qb];
+  } else {
+    const discriminant = qb * qb - 4 * qa * qc;
+    if (discriminant < 0) {
+      return null;
+    }
+    const rootDelta = Math.sqrt(Math.max(0, discriminant));
+    roots = [(-qb - rootDelta) / (2 * qa), (-qb + rootDelta) / (2 * qa)];
+  }
+
+  let bestRoot = null;
+  for (const root of roots) {
+    if (
+      Number.isFinite(root) &&
+      radius0 + root * dr >= 0 &&
+      (bestRoot === null || root > bestRoot)
+    ) {
+      bestRoot = root;
+    }
+  }
+  return bestRoot;
+}
+
+function sampleSceneGradient(scene, gradientIndex, worldX, worldY) {
+  const t = evaluateSceneGradientParameter(scene, gradientIndex, worldX, worldY);
+  if (t === null) {
+    return [0, 0, 0, 0];
+  }
+  const sampleX = Math.min(1, Math.max(0, t)) * 1023;
+  const x0 = Math.floor(sampleX);
+  const x1 = Math.min(1023, x0 + 1);
+  const amount = sampleX - x0;
+  const rowOffset = gradientIndex * 1024 * 4;
+  return [0, 1, 2, 3].map((channel) => {
+    const left = scene.gradientLut[rowOffset + x0 * 4 + channel];
+    const right = scene.gradientLut[rowOffset + x1 * 4 + channel];
+    return left + (right - left) * amount;
+  });
+}
+
+function assertApprox(actual, expected, tolerance, context) {
+  assert.ok(
+    Number.isFinite(actual) && Math.abs(actual - expected) <= tolerance,
+    `${context}: expected ${expected} +/- ${tolerance}, got ${actual}`
+  );
+}
+
+function testSyntheticRadialGradientMath() {
+  const scene = {
+    gradientCount: 3,
+    gradientMetaA: new Float32Array([
+      1, 0, 0, 0,
+      1, 0, 0, 0,
+      1, 0, 0, 0
+    ]),
+    gradientMetaB: new Float32Array([
+      1, 0, 0, 1,
+      0.5, 0, 0, 0.25,
+      1, 0, 0, 1
+    ]),
+    gradientMetaC: new Float32Array([
+      0, 0, 0, 0,
+      -1, -3, 0, 0,
+      0, 0, 0, 0
+    ]),
+    gradientMetaD: new Float32Array([
+      0, 0, 0, 10,
+      2, 0, 1, 3,
+      1, 0, 4, 1
+    ]),
+    gradientMetaE: new Float32Array(12)
+  };
+
+  assertApprox(
+    evaluateSceneGradientParameter(scene, 0, 5, 0),
+    0.5,
+    1e-9,
+    "concentric expanding radial gradient"
+  );
+  assertApprox(
+    evaluateSceneGradientParameter(scene, 1, 8, 12),
+    0.5,
+    1e-9,
+    "translated tangent radial gradient linear root"
+  );
+  assertApprox(
+    evaluateSceneGradientParameter(scene, 2, 3, 0),
+    0.5,
+    1e-9,
+    "shrinking radial gradient must ignore its negative-radius root"
+  );
+}
+
+function assertNativeGradientResourcesEqual(actual, expected, context) {
+  for (const key of [
+    "gradientCount",
+    "gradientFillPathCount",
+    "gradientFillSegmentCount",
+    "gradientStrokeRunCount",
+    "gradientStrokeSegmentCount"
+  ]) {
+    assert.equal(actual[key], expected[key], `${context}: ${key} changed`);
+  }
+  for (const key of [
+    "gradientMetaA",
+    "gradientMetaB",
+    "gradientMetaC",
+    "gradientMetaD",
+    "gradientMetaE",
+    "gradientLut",
+    "gradientFillPathMetaA",
+    "gradientFillPathMetaB",
+    "gradientFillPathMetaC",
+    "gradientFillPaintMeta",
+    "gradientFillSegmentsA",
+    "gradientFillSegmentsB",
+    "gradientStrokeRunMetaA",
+    "gradientStrokeRunMetaB",
+    "gradientStrokeEndpoints",
+    "gradientStrokePrimitiveMeta",
+    "gradientStrokePrimitiveBounds",
+    "gradientStrokeStyles"
+  ]) {
+    assert.deepEqual(Array.from(actual[key]), Array.from(expected[key]), `${context}: ${key} changed`);
+  }
+}
+
 async function run() {
+  testSyntheticRadialGradientMath();
   const viteServer = await createServer({
     configFile: false,
     root: repoRootDir,
@@ -77,11 +272,13 @@ async function run() {
     const [
       { buildParsedDataZip },
       { loadPdfSceneFromSource },
-      { listSceneRasterLayers, loadSceneFromParsedDataZip }
+      { listSceneRasterLayers, loadSceneFromParsedDataZip },
+      { composeVectorScenesInGrid }
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/index.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
-      viteServer.ssrLoadModule("/src/parsedDataZip.ts")
+      viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
+      viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts")
     ]);
     const pdfBytes = await readFile(fixturePath);
     const parsedPdf = await loadPdfSceneFromSource(pdfBytes, { sourceKind: "pdf" });
@@ -101,8 +298,26 @@ async function run() {
     assert.ok(sourceStages.includes("zip-build"));
     assert.equal(sourceStages.at(-1), "complete");
 
+    const sourceZipArchive = await JSZip.loadAsync(sourceZipBytes);
+    const sourceManifest = JSON.parse(await sourceZipArchive.file("manifest.json").async("string"));
+    assert.equal(sourceManifest.formatVersion, 6, "native gradient scenes require the v6 ZIP schema");
+    for (const unsupportedVersion of [5, 7]) {
+      const incompatibleZip = await JSZip.loadAsync(sourceZipBytes);
+      const incompatibleManifest = {
+        ...sourceManifest,
+        formatVersion: unsupportedVersion
+      };
+      incompatibleZip.file("manifest.json", JSON.stringify(incompatibleManifest));
+      const incompatibleBytes = await incompatibleZip.generateAsync({ type: "arraybuffer", compression: "STORE" });
+      await assert.rejects(
+        loadSceneFromParsedDataZip(incompatibleBytes),
+        new RegExp(`format v${unsupportedVersion} is not supported`)
+      );
+    }
+
     const sourceRoundTrip = await loadSceneFromParsedDataZip(sourceZipBytes.buffer);
     assertSceneCountsEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
+    assertNativeGradientResourcesEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
 
     const base64ZipBlob = await buildParsedDataZip(pdfBytes.toString("base64"), {
       encodeRasterImages: false,
@@ -124,6 +339,7 @@ async function run() {
     assert.equal(sceneManifest.sourceFile, "already-parsed.pdf");
     const sceneRoundTrip = await loadSceneFromParsedDataZip(await sceneZipBlob.arrayBuffer());
     assertSceneCountsEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
+    assertNativeGradientResourcesEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
 
     const missingRasterScene = {
       ...parsedPdf.scene,
@@ -201,14 +417,44 @@ async function run() {
       pages: "11"
     });
     const orderedUnderlayLayers = listSceneRasterLayers(parsedOrderedUnderlayPdf.scene);
-    assert.equal(orderedUnderlayLayers.length, 1, "leading patterned strokes must share the page underlay capture");
-    assert.ok(
-      orderedUnderlayLayers[0].width >= 1_700 && orderedUnderlayLayers[0].height >= 1_200,
-      "the decorative-circle underlay must retain its full-page arc extent"
-    );
-    assert.equal(parsedOrderedUnderlayPdf.scene.segmentCount, 2_322, "decorative circles must not remain above table fills");
-    assert.equal(parsedOrderedUnderlayPdf.scene.fillPathCount, 156, "ordered underlay capture must preserve vector tables");
-    assert.equal(parsedOrderedUnderlayPdf.scene.textInstanceCount, 2_608, "ordered underlay capture must preserve vector text");
+    assert.equal(orderedUnderlayLayers.length, 1, "the later page shading must remain a selective raster paint");
+    assert.equal(orderedUnderlayLayers[0].width, 1_663);
+    assert.equal(orderedUnderlayLayers[0].height, 250);
+    assert.equal(orderedUnderlayLayers[0].paintOrder, 501);
+    assert.equal(orderedUnderlayLayers[0].pageIndex, 0);
+    assert.equal(parsedOrderedUnderlayPdf.scene.gradientCount, 5, "ColorN strokes must retain five native gradients");
+    assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeRunCount, 13, "the complete visible circle prefix must retain ordered native runs");
+    assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeSegmentCount, 550);
+    const nativeCircleSourceRefs = [];
+    const nativeCirclePaintOrders = [];
+    const nativeCircleSegmentCounts = [];
+    for (let i = 0; i < parsedOrderedUnderlayPdf.scene.gradientStrokeRunCount; i += 1) {
+      const offset = i * 4;
+      nativeCircleSourceRefs.push(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaA[offset + 2]);
+      nativeCirclePaintOrders.push(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaB[offset]);
+      nativeCircleSegmentCounts.push(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaA[offset + 1]);
+      assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaA[offset + 3], -1);
+      assert.equal(parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaB[offset + 1], 0);
+      assert.ok(
+        parsedOrderedUnderlayPdf.scene.gradientStrokeRunMetaB[offset] < orderedUnderlayLayers[0].paintOrder,
+        "the decorative-circle prefix must remain below later raster paints"
+      );
+    }
+    assert.deepEqual(nativeCircleSourceRefs, [0, 1, 2, 3, 4, -1, -1, -1, -1, -1, -1, -1, -1]);
+    assert.deepEqual(nativeCirclePaintOrders, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14]);
+    assert.deepEqual(nativeCircleSegmentCounts, [71, 71, 15, 40, 6, 84, 52, 37, 84, 8, 41, 39, 2]);
+    for (let gradientIndex = 0; gradientIndex < 5; gradientIndex += 1) {
+      const colors = new Set();
+      const rowOffset = gradientIndex * 1024 * 4;
+      for (let x = 0; x < 1024; x += 32) {
+        const offset = rowOffset + x * 4;
+        colors.add(Array.from(parsedOrderedUnderlayPdf.scene.gradientLut.subarray(offset, offset + 4)).join(","));
+      }
+      assert.ok(colors.size > 4, `native circle gradient ${gradientIndex} must retain color variation`);
+    }
+    assert.equal(parsedOrderedUnderlayPdf.scene.segmentCount, 2_322, "decorative circles must not remain in the ordinary stroke batch");
+    assert.equal(parsedOrderedUnderlayPdf.scene.fillPathCount, 156, "native circle extraction must preserve vector tables");
+    assert.equal(parsedOrderedUnderlayPdf.scene.textInstanceCount, 2_608, "native circle extraction must preserve vector text");
     let blackStrokeCount = 0;
     let burgundyStrokeCount = 0;
     for (let i = 0; i < parsedOrderedUnderlayPdf.scene.segmentCount; i += 1) {
@@ -228,29 +474,9 @@ async function run() {
       }
     }
     assert.equal(blackStrokeCount, 0, "ColorN pattern strokes must not fall back to black vectors");
-    assert.equal(burgundyStrokeCount, 0, "the complete decorative-circle run must stay below the tables");
-    const orderedCirclePixel = sampleRasterLayerAtWorld(orderedUnderlayLayers[0], 361, 694);
-    assert.ok(
-      Math.abs(orderedCirclePixel[0] - 244) <= 2 &&
-        Math.abs(orderedCirclePixel[1] - 154) <= 2 &&
-        Math.abs(orderedCirclePixel[2] - 127) <= 2 &&
-        orderedCirclePixel[3] >= 253,
-      "ColorN circle strokes must retain their PDF shading pattern"
-    );
+    assert.equal(burgundyStrokeCount, 0, "solid companion circles must stay in the ordered native prefix");
     const tableOverlapX = 724.574;
     const tableOverlapY = 352.798;
-    const underTableCirclePixel = sampleRasterLayerAtWorld(
-      orderedUnderlayLayers[0],
-      tableOverlapX,
-      tableOverlapY
-    );
-    assert.ok(
-      underTableCirclePixel[0] > 245 &&
-        underTableCirclePixel[1] < 100 &&
-        underTableCirclePixel[2] < 80 &&
-        underTableCirclePixel[3] > 220,
-      "the circle paint must exist in the underlay at the table intersection"
-    );
     let hasOpaqueCreamTableFill = false;
     for (let i = 0; i < parsedOrderedUnderlayPdf.scene.fillPathCount; i += 1) {
       const offset = i * 4;
@@ -275,6 +501,22 @@ async function run() {
       }
     }
     assert.ok(hasOpaqueCreamTableFill, "an opaque table fill must remain vector-rendered above the circle underlay");
+
+    const nativeCircleZipBlob = await buildParsedDataZip(parsedOrderedUnderlayPdf.scene, {
+      sourceLabel: "native-circle-strokes.pdf",
+      encodeRasterImages: false,
+      compression: "store"
+    });
+    const nativeCircleRoundTrip = await loadSceneFromParsedDataZip(await nativeCircleZipBlob.arrayBuffer());
+    assertNativeGradientResourcesEqual(
+      nativeCircleRoundTrip,
+      parsedOrderedUnderlayPdf.scene,
+      "page 11 native gradient stroke round trip"
+    );
+    const roundTripCircleLayers = listSceneRasterLayers(nativeCircleRoundTrip);
+    assert.equal(roundTripCircleLayers.length, 1);
+    assert.equal(roundTripCircleLayers[0].paintOrder, 501);
+    assert.equal(roundTripCircleLayers[0].pageIndex, 0);
 
     const parsedOrderedPatternPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
       sourceKind: "pdf",
@@ -430,29 +672,46 @@ async function run() {
       pages: "13"
     });
     const photoOverlayLayers = listSceneRasterLayers(parsedPhotoOverlayPdf.scene);
-    assert.equal(photoOverlayLayers.length, 3, "page 13 must retain its three selective raster layers");
+    const photoOverlayScene = parsedPhotoOverlayPdf.scene;
+    assert.equal(photoOverlayLayers.length, 2, "page 13 must retain only its photo and signature raster paints");
     assert.equal(parsedPhotoOverlayPdf.scene.segmentCount, 56, "page 13 strokes must remain vector-rendered");
     assert.equal(parsedPhotoOverlayPdf.scene.fillPathCount, 16, "page 13 fills must remain vector-rendered");
     assert.equal(parsedPhotoOverlayPdf.scene.textInstanceCount, 976, "page 13 text must remain vector-rendered");
+    assert.equal(photoOverlayScene.gradientCount, 1, "the soft-mask definition must become one native gradient");
+    assert.equal(photoOverlayScene.gradientFillPathCount, 1, "the salmon circle must become one native masked fill");
+    assert.equal(photoOverlayScene.gradientFillSegmentCount, 16);
+    assert.equal(photoOverlayScene.gradientStrokeRunCount, 0);
+    assert.equal(photoOverlayScene.gradientStrokeSegmentCount, 0);
+    assert.deepEqual(Array.from(photoOverlayScene.gradientFillPaintMeta), [-1, 0, 2, 0]);
     assert.ok(
       photoOverlayLayers.reduce((sum, layer) => sum + layer.width * layer.height, 0) < 3_000_000,
-      "paint-order correction must not flatten page 13 into an additional full-page texture"
+      "native mask extraction must not flatten page 13 into an additional full-page texture"
+    );
+    assert.equal(photoOverlayLayers[0].width, 1_243);
+    assert.equal(photoOverlayLayers[0].height, 1_755);
+    assert.equal(photoOverlayLayers[0].paintOrder, 0, "the main photo must be the first ordered paint");
+    assert.equal(photoOverlayLayers[0].pageIndex, 0);
+    assert.equal(photoOverlayLayers[1].width, 732);
+    assert.equal(photoOverlayLayers[1].height, 137);
+    assert.equal(photoOverlayLayers[1].paintOrder, 25, "the signature must remain after the native gradient");
+    assert.equal(photoOverlayLayers[1].pageIndex, 0);
+    assert.ok(
+      photoOverlayLayers[0].paintOrder < photoOverlayScene.gradientFillPaintMeta[2] &&
+        photoOverlayScene.gradientFillPaintMeta[2] < photoOverlayLayers[1].paintOrder,
+      "paint order must remain photo -> native masked fill -> signature"
     );
     assert.ok(
-      photoOverlayLayers[0].width > 1_200 && photoOverlayLayers[0].height > 1_700,
-      "the main photo must be the first raster paint"
+      photoOverlayLayers.every((layer) => !(layer.width >= 590 && layer.width <= 610 && layer.height >= 340 && layer.height <= 355)),
+      "the former soft-mask raster must not remain in the scene"
     );
-    assert.ok(
-      photoOverlayLayers[1].width >= 590 && photoOverlayLayers[1].width <= 610 &&
-        photoOverlayLayers[1].height >= 340 && photoOverlayLayers[1].height <= 355,
-      "the soft-masked gradient must follow the photo"
-    );
-    assert.ok(
-      photoOverlayLayers[2].width >= 720 && photoOverlayLayers[2].height <= 145,
-      "the signature image must remain after the gradient"
-    );
+    assertApprox(photoOverlayScene.gradientFillPathMetaB[2], 1, 1e-6, "native circle red");
+    assertApprox(photoOverlayScene.gradientFillPathMetaB[3], 76 / 255, 1e-6, "native circle green");
+    assertApprox(photoOverlayScene.gradientFillPathMetaC[2], 41 / 255, 1e-6, "native circle blue");
+    assertApprox(photoOverlayScene.gradientFillPathMetaC[3], 0.800003, 1e-5, "native circle group alpha");
+    assert.deepEqual(Array.from(photoOverlayScene.gradientMetaA.subarray(0, 4)), [0, 0, 0, 0]);
+    assert.deepEqual(Array.from(photoOverlayScene.gradientLut.subarray(0, 4)), [255, 255, 255, 255]);
+    assert.deepEqual(Array.from(photoOverlayScene.gradientLut.subarray(1023 * 4, 1024 * 4)), [255, 255, 255, 0]);
     const photoOverlapPixel = sampleRasterLayerAtWorld(photoOverlayLayers[0], 650, 100);
-    const gradientOverlapPixel = sampleRasterLayerAtWorld(photoOverlayLayers[1], 650, 100);
     assert.ok(
       Math.abs(photoOverlapPixel[0] - 146) <= 2 &&
         Math.abs(photoOverlapPixel[1] - 168) <= 2 &&
@@ -460,30 +719,136 @@ async function run() {
         photoOverlapPixel[3] >= 253,
       "the first overlap paint must contain the opaque photo"
     );
-    assert.ok(
-      gradientOverlapPixel[0] >= 253 &&
-        Math.abs(gradientOverlapPixel[1] - 76) <= 3 &&
-        Math.abs(gradientOverlapPixel[2] - 42) <= 3 &&
-        gradientOverlapPixel[3] >= 130 && gradientOverlapPixel[3] <= 138,
-      "the second overlap paint must contain the translucent gradient"
+    assertApprox(
+      evaluateSceneGradientParameter(photoOverlayScene, 0, 650, 100),
+      0.342696,
+      1e-5,
+      "page 13 native mask parameter"
     );
-    const gradientAlpha = gradientOverlapPixel[3] / 255;
-    const compositedOverlapPixel = gradientOverlapPixel.slice(0, 3).map((component, index) =>
-      Math.round(component * gradientAlpha + photoOverlapPixel[index] * (1 - gradientAlpha))
+    const maskOverlapPixel = sampleSceneGradient(photoOverlayScene, 0, 650, 100);
+    assert.ok(
+      maskOverlapPixel.slice(0, 3).every((component) => component >= 254) &&
+        maskOverlapPixel[3] >= 166 && maskOverlapPixel[3] <= 170,
+      "the native luminosity mask must retain its white-to-transparent coverage"
+    );
+    const nativeGradientAlpha = photoOverlayScene.gradientFillPathMetaC[3] * maskOverlapPixel[3] / 255;
+    assertApprox(nativeGradientAlpha * 255, 134, 2, "native circle effective alpha");
+    const nativeGradientColor = [
+      photoOverlayScene.gradientFillPathMetaB[2] * 255,
+      photoOverlayScene.gradientFillPathMetaB[3] * 255,
+      photoOverlayScene.gradientFillPathMetaC[2] * 255
+    ];
+    const compositedOverlapPixel = nativeGradientColor.map((component, index) =>
+      Math.round(component * nativeGradientAlpha + photoOverlapPixel[index] * (1 - nativeGradientAlpha))
     );
     assert.ok(
       Math.abs(compositedOverlapPixel[0] - 203) <= 2 &&
         Math.abs(compositedOverlapPixel[1] - 120) <= 2 &&
         Math.abs(compositedOverlapPixel[2] - 116) <= 2,
-      "raster array order must composite the gradient over the photo"
+      "native mask coverage must composite the gradient over the photo"
     );
+
+    const composedGradientScene = composeVectorScenesInGrid(
+      [parsedOrderedUnderlayPdf.scene, photoOverlayScene],
+      2
+    );
+    const underlayGradientCount = parsedOrderedUnderlayPdf.scene.gradientCount;
+    const translatedGradientIndex = underlayGradientCount;
+    const translatedGradientOffset = translatedGradientIndex * 4;
+    const translatedFillIndex = parsedOrderedUnderlayPdf.scene.gradientFillPathCount;
+    const translatedFillOffset = translatedFillIndex * 4;
+    const translatedPageRectOffset = 4;
+    const translateX = composedGradientScene.pageRects[translatedPageRectOffset] - photoOverlayScene.pageRects[0];
+    const translateY = composedGradientScene.pageRects[translatedPageRectOffset + 1] - photoOverlayScene.pageRects[1];
+    assert.equal(composedGradientScene.pageCount, 2);
+    assert.equal(composedGradientScene.gradientCount, underlayGradientCount + photoOverlayScene.gradientCount);
+    assert.equal(composedGradientScene.gradientStrokeRunCount, parsedOrderedUnderlayPdf.scene.gradientStrokeRunCount);
+    assert.equal(composedGradientScene.gradientFillPathCount, 1);
+    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset], -1);
+    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset + 1], translatedGradientIndex);
+    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset + 2], 2);
+    assert.equal(composedGradientScene.gradientFillPaintMeta[translatedFillOffset + 3], 1);
+    const sourceGradientB = photoOverlayScene.gradientMetaB;
+    const sourceGradientC = photoOverlayScene.gradientMetaC;
+    assertApprox(
+      composedGradientScene.gradientMetaC[translatedGradientOffset],
+      sourceGradientC[0] - sourceGradientB[0] * translateX - sourceGradientB[2] * translateY,
+      1e-4,
+      "grid-composed gradient e translation"
+    );
+    assertApprox(
+      composedGradientScene.gradientMetaC[translatedGradientOffset + 1],
+      sourceGradientC[1] - sourceGradientB[1] * translateX - sourceGradientB[3] * translateY,
+      1e-4,
+      "grid-composed gradient f translation"
+    );
+    assertApprox(
+      composedGradientScene.gradientFillPathMetaA[translatedFillOffset + 2],
+      photoOverlayScene.gradientFillPathMetaA[2] + translateX,
+      1e-4,
+      "grid-composed gradient fill min-x translation"
+    );
+    assertApprox(
+      composedGradientScene.gradientFillPathMetaA[translatedFillOffset + 3],
+      photoOverlayScene.gradientFillPathMetaA[3] + translateY,
+      1e-4,
+      "grid-composed gradient fill min-y translation"
+    );
+    const originalMaskSample = sampleSceneGradient(photoOverlayScene, 0, 650, 100);
+    const translatedMaskSample = sampleSceneGradient(
+      composedGradientScene,
+      translatedGradientIndex,
+      650 + translateX,
+      100 + translateY
+    );
+    for (let channel = 0; channel < 4; channel += 1) {
+      assertApprox(translatedMaskSample[channel], originalMaskSample[channel], 0.25, `grid gradient sample channel ${channel}`);
+    }
+    const composedRasterLayers = listSceneRasterLayers(composedGradientScene);
+    const translatedPhotoLayers = composedRasterLayers.filter((layer) => layer.pageIndex === 1);
+    assert.equal(translatedPhotoLayers.length, 2);
+    for (let i = 0; i < photoOverlayLayers.length; i += 1) {
+      assert.equal(translatedPhotoLayers[i].paintOrder, photoOverlayLayers[i].paintOrder);
+      assertApprox(
+        translatedPhotoLayers[i].matrix[4],
+        photoOverlayLayers[i].matrix[4] + translateX,
+        1e-4,
+        `grid raster ${i} x translation`
+      );
+      assertApprox(
+        translatedPhotoLayers[i].matrix[5],
+        photoOverlayLayers[i].matrix[5] + translateY,
+        1e-4,
+        `grid raster ${i} y translation`
+      );
+    }
 
     const photoOverlayZipBlob = await buildParsedDataZip(parsedPhotoOverlayPdf.scene, {
       sourceLabel: "photo-overlay.pdf",
       encodeRasterImages: false,
       compression: "store"
     });
+    const photoOverlayZip = await readZip(photoOverlayZipBlob);
+    const photoOverlayManifest = JSON.parse(await photoOverlayZip.file("manifest.json").async("string"));
+    assert.equal(photoOverlayManifest.formatVersion, 6);
+    assert.equal(photoOverlayManifest.scene.gradientCount, 1);
+    assert.equal(photoOverlayManifest.scene.gradientFillPathCount, 1);
+    assert.equal(photoOverlayManifest.scene.gradientFillSegmentCount, 16);
+    assert.deepEqual(
+      photoOverlayManifest.gradientLut,
+      {
+        file: "textures/gradient-lut.rgba",
+        width: 1024,
+        height: 1,
+        byteLength: 4096
+      }
+    );
+    assert.equal(
+      (await photoOverlayZip.file(photoOverlayManifest.gradientLut.file).async("uint8array")).length,
+      4096
+    );
     const photoOverlayRoundTrip = await loadSceneFromParsedDataZip(await photoOverlayZipBlob.arrayBuffer());
+    assertNativeGradientResourcesEqual(photoOverlayRoundTrip, photoOverlayScene, "page 13 native gradient round trip");
     const roundTripPhotoOverlayLayers = listSceneRasterLayers(photoOverlayRoundTrip);
     assert.equal(roundTripPhotoOverlayLayers.length, photoOverlayLayers.length);
     for (let i = 0; i < photoOverlayLayers.length; i += 1) {
@@ -493,7 +858,96 @@ async function run() {
         Array.from(roundTripPhotoOverlayLayers[i].matrix),
         Array.from(photoOverlayLayers[i].matrix)
       );
+      assert.equal(roundTripPhotoOverlayLayers[i].paintOrder, photoOverlayLayers[i].paintOrder);
+      assert.equal(roundTripPhotoOverlayLayers[i].pageIndex, photoOverlayLayers[i].pageIndex);
     }
+    const corruptGradientLutZip = await readZip(photoOverlayZipBlob);
+    corruptGradientLutZip.remove(photoOverlayManifest.gradientLut.file);
+    const corruptGradientLutBytes = await corruptGradientLutZip.generateAsync({
+      type: "arraybuffer",
+      compression: "STORE"
+    });
+    await assert.rejects(
+      loadSceneFromParsedDataZip(corruptGradientLutBytes),
+      /missing its gradient LUT payload/
+    );
+
+    for (const radialCase of [
+      {
+        label: "identical",
+        p1x: photoOverlayScene.gradientMetaC[2],
+        expectedError: /identical start and end circles/
+      },
+      {
+        label: "intersecting",
+        p1x: photoOverlayScene.gradientMetaC[2] + 1,
+        expectedError: /unsupported intersecting-circle topology/
+      }
+    ]) {
+      const corruptRadialZip = await readZip(photoOverlayZipBlob);
+      await mutateInterleavedFloat32Texture(
+        corruptRadialZip,
+        photoOverlayManifest,
+        "gradient-meta-a",
+        (values) => {
+          values[0] = 1;
+        }
+      );
+      await mutateInterleavedFloat32Texture(
+        corruptRadialZip,
+        photoOverlayManifest,
+        "gradient-meta-d",
+        (values) => {
+          values[0] = radialCase.p1x;
+          values[1] = photoOverlayScene.gradientMetaC[3];
+          values[2] = 1;
+          values[3] = 1;
+        }
+      );
+      const corruptRadialBytes = await corruptRadialZip.generateAsync({
+        type: "arraybuffer",
+        compression: "STORE"
+      });
+      await assert.rejects(
+        loadSceneFromParsedDataZip(corruptRadialBytes),
+        radialCase.expectedError,
+        `${radialCase.label} radial metadata must be rejected`
+      );
+    }
+
+    for (const missingField of ["paintOrder", "pageIndex"]) {
+      const incompleteRasterZip = await readZip(photoOverlayZipBlob);
+      const incompleteRasterManifest = JSON.parse(
+        await incompleteRasterZip.file("manifest.json").async("string")
+      );
+      delete incompleteRasterManifest.scene.rasterLayers[0][missingField];
+      incompleteRasterZip.file("manifest.json", JSON.stringify(incompleteRasterManifest));
+      const incompleteRasterBytes = await incompleteRasterZip.generateAsync({
+        type: "arraybuffer",
+        compression: "STORE"
+      });
+      await assert.rejects(
+        loadSceneFromParsedDataZip(incompleteRasterBytes),
+        /Raster layer 0 has incomplete or invalid v6 metadata/,
+        `missing raster ${missingField} must be rejected`
+      );
+    }
+
+    const missingRasterPayloadZip = await readZip(photoOverlayZipBlob);
+    const missingRasterPayloadManifest = JSON.parse(
+      await missingRasterPayloadZip.file("manifest.json").async("string")
+    );
+    const missingRasterPayloadPath = missingRasterPayloadManifest.scene.rasterLayers[0].file;
+    missingRasterPayloadZip.remove(missingRasterPayloadPath);
+    const missingRasterPayloadBytes = await missingRasterPayloadZip.generateAsync({
+      type: "arraybuffer",
+      compression: "STORE"
+    });
+    await assert.rejects(
+      loadSceneFromParsedDataZip(missingRasterPayloadBytes),
+      /missing or cannot decode raster layer 0/,
+      "missing raster payload must be rejected"
+    );
 
     const parsedBackdropBlendPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
       sourceKind: "pdf",

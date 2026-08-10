@@ -176,6 +176,7 @@ async function buildSceneZip(
   options: ParsedDataZipEncodingOptions,
   progress: ReturnType<typeof createLoadProgressReporter>
 ): Promise<Blob> {
+  assertCurrentVectorScene(scene);
   const compressionLevel =
     options.compression === "store" ? 9 : normalizeCompressionLevel(options.compressionLevel);
   const result = await buildParsedDataZipBlobForLayout(
@@ -198,6 +199,44 @@ async function buildSceneZip(
   return result.blob;
 }
 
+function assertCurrentVectorScene(scene: VectorScene): void {
+  const counts = [
+    scene.gradientCount,
+    scene.gradientFillPathCount,
+    scene.gradientFillSegmentCount,
+    scene.gradientStrokeRunCount,
+    scene.gradientStrokeSegmentCount
+  ];
+  const floatResources = [
+    scene.gradientMetaA,
+    scene.gradientMetaB,
+    scene.gradientMetaC,
+    scene.gradientMetaD,
+    scene.gradientMetaE,
+    scene.gradientFillPathMetaA,
+    scene.gradientFillPathMetaB,
+    scene.gradientFillPathMetaC,
+    scene.gradientFillPaintMeta,
+    scene.gradientFillSegmentsA,
+    scene.gradientFillSegmentsB,
+    scene.gradientStrokeRunMetaA,
+    scene.gradientStrokeRunMetaB,
+    scene.gradientStrokeEndpoints,
+    scene.gradientStrokePrimitiveMeta,
+    scene.gradientStrokePrimitiveBounds,
+    scene.gradientStrokeStyles
+  ];
+  if (
+    counts.some((value) => !Number.isInteger(value) || value < 0) ||
+    floatResources.some((value) => !(value instanceof Float32Array)) ||
+    !(scene.gradientLut instanceof Uint8Array)
+  ) {
+    throw new Error(
+      "VectorScene is missing the native-gradient resources required by parsed-data ZIP format v6."
+    );
+  }
+}
+
 function buildSceneTextureStats(scene: VectorScene): SceneTextureStats {
   const fillPath = chooseTextureDimensions(scene.fillPathCount);
   const fillSegment = chooseTextureDimensions(scene.fillSegmentCount);
@@ -205,6 +244,11 @@ function buildSceneTextureStats(scene: VectorScene): SceneTextureStats {
   const textInstance = chooseTextureDimensions(scene.textInstanceCount);
   const textGlyph = chooseTextureDimensions(scene.textGlyphCount);
   const textSegment = chooseTextureDimensions(scene.textGlyphSegmentCount);
+  const gradient = chooseTextureDimensions(scene.gradientCount);
+  const gradientFillPath = chooseTextureDimensions(scene.gradientFillPathCount);
+  const gradientFillSegment = chooseTextureDimensions(scene.gradientFillSegmentCount);
+  const gradientStrokeRun = chooseTextureDimensions(scene.gradientStrokeRunCount);
+  const gradientStrokeSegment = chooseTextureDimensions(scene.gradientStrokeSegmentCount);
   return {
     fillPathTextureWidth: fillPath.width,
     fillPathTextureHeight: fillPath.height,
@@ -217,7 +261,17 @@ function buildSceneTextureStats(scene: VectorScene): SceneTextureStats {
     textGlyphTextureWidth: textGlyph.width,
     textGlyphTextureHeight: textGlyph.height,
     textSegmentTextureWidth: textSegment.width,
-    textSegmentTextureHeight: textSegment.height
+    textSegmentTextureHeight: textSegment.height,
+    gradientTextureWidth: gradient.width,
+    gradientTextureHeight: gradient.height,
+    gradientFillPathTextureWidth: gradientFillPath.width,
+    gradientFillPathTextureHeight: gradientFillPath.height,
+    gradientFillSegmentTextureWidth: gradientFillSegment.width,
+    gradientFillSegmentTextureHeight: gradientFillSegment.height,
+    gradientStrokeRunTextureWidth: gradientStrokeRun.width,
+    gradientStrokeRunTextureHeight: gradientStrokeRun.height,
+    gradientStrokeSegmentTextureWidth: gradientStrokeSegment.width,
+    gradientStrokeSegmentTextureHeight: gradientStrokeSegment.height
   };
 }
 

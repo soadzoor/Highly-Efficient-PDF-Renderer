@@ -2,6 +2,7 @@ import JSZip from "jszip";
 
 import {
   extractPdfRasterScene,
+  GRADIENT_LUT_WIDTH,
   inferPageTextRanges,
   optimizeVectorSceneTextGlyphs,
   type Bounds,
@@ -62,6 +63,16 @@ export interface SceneTextureStats {
   textGlyphTextureHeight: number;
   textSegmentTextureWidth: number;
   textSegmentTextureHeight: number;
+  gradientTextureWidth: number;
+  gradientTextureHeight: number;
+  gradientFillPathTextureWidth: number;
+  gradientFillPathTextureHeight: number;
+  gradientFillSegmentTextureWidth: number;
+  gradientFillSegmentTextureHeight: number;
+  gradientStrokeRunTextureWidth: number;
+  gradientStrokeRunTextureHeight: number;
+  gradientStrokeSegmentTextureWidth: number;
+  gradientStrokeSegmentTextureHeight: number;
 }
 
 export type TextureLayout = "interleaved" | "channel-major";
@@ -103,6 +114,8 @@ interface ParsedDataRasterLayerEntry {
   matrix?: unknown;
   file?: unknown;
   encoding?: unknown;
+  paintOrder?: unknown;
+  pageIndex?: unknown;
 }
 
 interface ParsedDataSceneEntry {
@@ -121,6 +134,11 @@ interface ParsedDataSceneEntry {
   segmentCount?: unknown;
   fillPathCount?: unknown;
   fillSegmentCount?: unknown;
+  gradientCount?: unknown;
+  gradientFillPathCount?: unknown;
+  gradientFillSegmentCount?: unknown;
+  gradientStrokeRunCount?: unknown;
+  gradientStrokeSegmentCount?: unknown;
   sourceTextCount?: unknown;
   textInstanceCount?: unknown;
   textGlyphCount?: unknown;
@@ -147,6 +165,14 @@ interface ParsedDataManifest {
   textIndex?: unknown;
   strokeGeometry?: unknown;
   textInstances?: unknown;
+  gradientLut?: unknown;
+}
+
+interface ParsedDataGradientLutEntry {
+  file?: unknown;
+  width?: unknown;
+  height?: unknown;
+  byteLength?: unknown;
 }
 
 export interface ParsedDataZipBlobResult {
@@ -163,7 +189,11 @@ interface SerializedRasterLayerEntry {
   matrix: number[];
   file: string;
   encoding: "webp" | "png" | "rgba";
+  paintOrder: number;
+  pageIndex: number;
 }
+
+const GRADIENT_LUT_PATH = "textures/gradient-lut.rgba";
 
 export async function buildParsedDataZipBlobForLayout(
   scene: VectorScene,
@@ -193,6 +223,19 @@ export async function buildParsedDataZipBlobForLayout(
   for (const entry of textureEntries) {
     const bytes = serializeTextureExportEntry(entry);
     zip.file(entry.filePath, bytes);
+  }
+
+  const gradientLutByteLength = scene.gradientCount * GRADIENT_LUT_WIDTH * 4;
+  if (scene.gradientLut.length < gradientLutByteLength) {
+    throw new Error(
+      `Gradient LUT has insufficient data (${scene.gradientLut.length} < ${gradientLutByteLength}).`
+    );
+  }
+  if (gradientLutByteLength > 0) {
+    zip.file(
+      GRADIENT_LUT_PATH,
+      scene.gradientLut.subarray(0, gradientLutByteLength)
+    );
   }
 
   if (sourcePdfFile && sourcePdfBytes) {
@@ -242,7 +285,9 @@ export async function buildParsedDataZipBlobForLayout(
       height: layer.height,
       matrix: Array.from(layer.matrix),
       file: filePath,
-      encoding
+      encoding,
+      paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
     });
     options.onBuildProgress?.(0.4 * ((i + 1) / rasterLayers.length));
   }
@@ -257,6 +302,14 @@ export async function buildParsedDataZipBlobForLayout(
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,
     textInstances: textInstancesExport?.manifest,
+    gradientLut: gradientLutByteLength > 0
+      ? {
+        file: GRADIENT_LUT_PATH,
+        width: GRADIENT_LUT_WIDTH,
+        height: scene.gradientCount,
+        byteLength: gradientLutByteLength
+      }
+      : undefined,
     textIndex: textIndexExport
       ? {
         version: 2,
@@ -285,6 +338,11 @@ export async function buildParsedDataZipBlobForLayout(
       segmentCount: scene.segmentCount,
       fillPathCount: scene.fillPathCount,
       fillSegmentCount: scene.fillSegmentCount,
+      gradientCount: scene.gradientCount,
+      gradientFillPathCount: scene.gradientFillPathCount,
+      gradientFillSegmentCount: scene.gradientFillSegmentCount,
+      gradientStrokeRunCount: scene.gradientStrokeRunCount,
+      gradientStrokeSegmentCount: scene.gradientStrokeSegmentCount,
       textInstanceCount: scene.textInstanceCount,
       textGlyphCount: scene.textGlyphCount,
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
@@ -333,14 +391,14 @@ export async function buildParsedDataZipBlobForLayout(
   return {
     blob: zipBlob,
     byteLength: zipBlob.size,
-    textureCount: textureEntries.length,
+    textureCount: textureEntries.length + (gradientLutByteLength > 0 ? 1 : 0),
     rasterLayerCount: rasterLayers.length,
     layout: textureLayout
   };
 }
 
-/** Only zips written with this format version (or newer) can be loaded. */
-const PARSED_DATA_FORMAT_VERSION = 5;
+/** v6 adds first-class analytic gradient and soft-mask paint resources. */
+const PARSED_DATA_FORMAT_VERSION = 6;
 
 const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
@@ -846,7 +904,7 @@ interface StrokeGeometryExport {
 }
 
 /**
- * v5 stroke storage: uint16 range-quantized coordinates stored as chained
+ * Stroke storage (retained in v6): uint16 range-quantized coordinates stored as chained
  * per-column zigzag-varint deltas (start chains to the previous end, end is
  * relative to its own start) plus a type bitset, a raw u16 packed style
  * column, and control-point deltas only for curve segments.
@@ -941,7 +999,7 @@ interface TextInstancesExport {
 }
 
 /**
- * v5 text instance storage: e/f as fixed-point 1/512 per-column varint deltas
+ * Text instance storage (retained in v6): e/f as fixed-point 1/512 per-column varint deltas
  * (quantization approved: max error 1/1024 scene unit), glyph indices as a
  * raw u16/u32 column. The always-zero 4th channel is dropped.
  */
@@ -1007,7 +1065,24 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
     createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
     createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
     createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout),
-    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout)
+    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout),
+    createTextureExportEntry("gradient-meta-a", scene.gradientMetaA, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
+    createTextureExportEntry("gradient-meta-b", scene.gradientMetaB, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
+    createTextureExportEntry("gradient-meta-c", scene.gradientMetaC, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
+    createTextureExportEntry("gradient-meta-d", scene.gradientMetaD, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
+    createTextureExportEntry("gradient-meta-e", scene.gradientMetaE, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
+    createTextureExportEntry("gradient-fill-path-meta-a", scene.gradientFillPathMetaA, sceneStats.gradientFillPathTextureWidth, sceneStats.gradientFillPathTextureHeight, scene.gradientFillPathCount, textureLayout),
+    createTextureExportEntry("gradient-fill-path-meta-b", scene.gradientFillPathMetaB, sceneStats.gradientFillPathTextureWidth, sceneStats.gradientFillPathTextureHeight, scene.gradientFillPathCount, textureLayout),
+    createTextureExportEntry("gradient-fill-path-meta-c", scene.gradientFillPathMetaC, sceneStats.gradientFillPathTextureWidth, sceneStats.gradientFillPathTextureHeight, scene.gradientFillPathCount, textureLayout),
+    createTextureExportEntry("gradient-fill-paint-meta", scene.gradientFillPaintMeta, sceneStats.gradientFillPathTextureWidth, sceneStats.gradientFillPathTextureHeight, scene.gradientFillPathCount, textureLayout),
+    createTextureExportEntry("gradient-fill-primitives-a", scene.gradientFillSegmentsA, sceneStats.gradientFillSegmentTextureWidth, sceneStats.gradientFillSegmentTextureHeight, scene.gradientFillSegmentCount, textureLayout),
+    createTextureExportEntry("gradient-fill-primitives-b", scene.gradientFillSegmentsB, sceneStats.gradientFillSegmentTextureWidth, sceneStats.gradientFillSegmentTextureHeight, scene.gradientFillSegmentCount, textureLayout),
+    createTextureExportEntry("gradient-stroke-run-meta-a", scene.gradientStrokeRunMetaA, sceneStats.gradientStrokeRunTextureWidth, sceneStats.gradientStrokeRunTextureHeight, scene.gradientStrokeRunCount, textureLayout),
+    createTextureExportEntry("gradient-stroke-run-meta-b", scene.gradientStrokeRunMetaB, sceneStats.gradientStrokeRunTextureWidth, sceneStats.gradientStrokeRunTextureHeight, scene.gradientStrokeRunCount, textureLayout),
+    createTextureExportEntry("gradient-stroke-endpoints", scene.gradientStrokeEndpoints, sceneStats.gradientStrokeSegmentTextureWidth, sceneStats.gradientStrokeSegmentTextureHeight, scene.gradientStrokeSegmentCount, textureLayout),
+    createTextureExportEntry("gradient-stroke-primitive-meta", scene.gradientStrokePrimitiveMeta, sceneStats.gradientStrokeSegmentTextureWidth, sceneStats.gradientStrokeSegmentTextureHeight, scene.gradientStrokeSegmentCount, textureLayout),
+    createTextureExportEntry("gradient-stroke-primitive-bounds", scene.gradientStrokePrimitiveBounds, sceneStats.gradientStrokeSegmentTextureWidth, sceneStats.gradientStrokeSegmentTextureHeight, scene.gradientStrokeSegmentCount, textureLayout),
+    createTextureExportEntry("gradient-stroke-styles", scene.gradientStrokeStyles, sceneStats.gradientStrokeSegmentTextureWidth, sceneStats.gradientStrokeSegmentTextureHeight, scene.gradientStrokeSegmentCount, textureLayout)
   ];
 }
 
@@ -1038,9 +1113,9 @@ export async function loadSceneFromParsedDataZip(
   }
 
   const formatVersion = readNonNegativeInt(manifest.formatVersion, 0);
-  if (formatVersion < PARSED_DATA_FORMAT_VERSION) {
+  if (formatVersion !== PARSED_DATA_FORMAT_VERSION) {
     throw new Error(
-      `Parsed data zip format v${formatVersion} is no longer supported; re-export the zip with the current version.`
+      `Parsed data zip format v${formatVersion} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}. Re-export the zip with the current version.`
     );
   }
 
@@ -1051,7 +1126,7 @@ export async function loadSceneFromParsedDataZip(
   const textInstancesSection = parseTextInstancesSection(manifest.textInstances);
 
   const textureByName = new Map<string, ParsedDataTextureEntry>();
-  const textureReadTotal = 12;
+  const textureReadTotal = 29;
   let textureReadCount = 0;
   const reportTextureProgress = (): void => {
     progress.report(0.22 + (textureReadCount / textureReadTotal) * 0.58, {
@@ -1116,6 +1191,23 @@ export async function loadSceneFromParsedDataZip(
   const textGlyphMetaBEntry = await readTexture("text-glyph-meta-b", false);
   const textGlyphPrimitiveAEntry = await readTexture("text-glyph-primitives-a", false);
   const textGlyphPrimitiveBEntry = await readTexture("text-glyph-primitives-b", false);
+  const gradientMetaAEntry = await readTexture("gradient-meta-a", false);
+  const gradientMetaBEntry = await readTexture("gradient-meta-b", false);
+  const gradientMetaCEntry = await readTexture("gradient-meta-c", false);
+  const gradientMetaDEntry = await readTexture("gradient-meta-d", false);
+  const gradientMetaEEntry = await readTexture("gradient-meta-e", false);
+  const gradientFillPathMetaAEntry = await readTexture("gradient-fill-path-meta-a", false);
+  const gradientFillPathMetaBEntry = await readTexture("gradient-fill-path-meta-b", false);
+  const gradientFillPathMetaCEntry = await readTexture("gradient-fill-path-meta-c", false);
+  const gradientFillPaintMetaEntry = await readTexture("gradient-fill-paint-meta", false);
+  const gradientFillPrimitiveAEntry = await readTexture("gradient-fill-primitives-a", false);
+  const gradientFillPrimitiveBEntry = await readTexture("gradient-fill-primitives-b", false);
+  const gradientStrokeRunMetaAEntry = await readTexture("gradient-stroke-run-meta-a", false);
+  const gradientStrokeRunMetaBEntry = await readTexture("gradient-stroke-run-meta-b", false);
+  const gradientStrokeEndpointsEntry = await readTexture("gradient-stroke-endpoints", false);
+  const gradientStrokePrimitiveMetaEntry = await readTexture("gradient-stroke-primitive-meta", false);
+  const gradientStrokePrimitiveBoundsEntry = await readTexture("gradient-stroke-primitive-bounds", false);
+  const gradientStrokeStylesEntry = await readTexture("gradient-stroke-styles", false);
 
   const fillPathCount = readNonNegativeInt(sceneMeta.fillPathCount, fillPathMetaAEntry?.logicalItemCount ?? 0);
   const fillSegmentCount = readNonNegativeInt(sceneMeta.fillSegmentCount, fillPrimitiveAEntry?.logicalItemCount ?? 0);
@@ -1126,6 +1218,51 @@ export async function loadSceneFromParsedDataZip(
     sceneMeta.textGlyphPrimitiveCount,
     readNonNegativeInt(sceneMeta.textGlyphSegmentCount, textGlyphPrimitiveAEntry?.logicalItemCount ?? 0)
   );
+  const gradientCount = readNonNegativeInt(sceneMeta.gradientCount, gradientMetaAEntry?.logicalItemCount ?? 0);
+  const gradientFillPathCount = readNonNegativeInt(
+    sceneMeta.gradientFillPathCount,
+    gradientFillPathMetaAEntry?.logicalItemCount ?? 0
+  );
+  const gradientFillSegmentCount = readNonNegativeInt(
+    sceneMeta.gradientFillSegmentCount,
+    gradientFillPrimitiveAEntry?.logicalItemCount ?? 0
+  );
+  const gradientStrokeRunCount = readNonNegativeInt(
+    sceneMeta.gradientStrokeRunCount,
+    gradientStrokeRunMetaAEntry?.logicalItemCount ?? 0
+  );
+  const gradientStrokeSegmentCount = readNonNegativeInt(
+    sceneMeta.gradientStrokeSegmentCount,
+    gradientStrokeEndpointsEntry?.logicalItemCount ?? 0
+  );
+  for (const [label, entry, expectedCount] of [
+    ["gradient-meta-a", gradientMetaAEntry, gradientCount],
+    ["gradient-meta-b", gradientMetaBEntry, gradientCount],
+    ["gradient-meta-c", gradientMetaCEntry, gradientCount],
+    ["gradient-meta-d", gradientMetaDEntry, gradientCount],
+    ["gradient-meta-e", gradientMetaEEntry, gradientCount],
+    ["gradient-fill-path-meta-a", gradientFillPathMetaAEntry, gradientFillPathCount],
+    ["gradient-fill-path-meta-b", gradientFillPathMetaBEntry, gradientFillPathCount],
+    ["gradient-fill-path-meta-c", gradientFillPathMetaCEntry, gradientFillPathCount],
+    ["gradient-fill-paint-meta", gradientFillPaintMetaEntry, gradientFillPathCount],
+    ["gradient-fill-primitives-a", gradientFillPrimitiveAEntry, gradientFillSegmentCount],
+    ["gradient-fill-primitives-b", gradientFillPrimitiveBEntry, gradientFillSegmentCount],
+    ["gradient-stroke-run-meta-a", gradientStrokeRunMetaAEntry, gradientStrokeRunCount],
+    ["gradient-stroke-run-meta-b", gradientStrokeRunMetaBEntry, gradientStrokeRunCount],
+    ["gradient-stroke-endpoints", gradientStrokeEndpointsEntry, gradientStrokeSegmentCount],
+    ["gradient-stroke-primitive-meta", gradientStrokePrimitiveMetaEntry, gradientStrokeSegmentCount],
+    ["gradient-stroke-primitive-bounds", gradientStrokePrimitiveBoundsEntry, gradientStrokeSegmentCount],
+    ["gradient-stroke-styles", gradientStrokeStylesEntry, gradientStrokeSegmentCount]
+  ] as const) {
+    if (expectedCount > 0 && !entry) {
+      throw new Error(`Parsed data zip is missing required texture: ${label}.`);
+    }
+    if (entry && entry.logicalItemCount !== expectedCount) {
+      throw new Error(
+        `Texture ${label} item count does not match scene metadata (${entry.logicalItemCount} != ${expectedCount}).`
+      );
+    }
+  }
 
   if (segmentCount > 0 && !strokeStylesEntry) {
     throw new Error("Parsed data zip is missing the stroke-styles texture.");
@@ -1136,6 +1273,49 @@ export async function loadSceneFromParsedDataZip(
   const fillPathMetaC = trimTextureForItemCount(fillPathMetaCEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-c");
   const fillSegmentsA = trimTextureForItemCount(fillPrimitiveAEntry?.data ?? new Float32Array(0), fillSegmentCount, "fill-primitives-a");
   const fillSegmentsB = trimTextureForItemCount(fillPrimitiveBEntry?.data ?? new Float32Array(0), fillSegmentCount, "fill-primitives-b");
+  const gradientMetaA = trimTextureForItemCount(gradientMetaAEntry?.data ?? new Float32Array(0), gradientCount, "gradient-meta-a");
+  const gradientMetaB = trimTextureForItemCount(gradientMetaBEntry?.data ?? new Float32Array(0), gradientCount, "gradient-meta-b");
+  const gradientMetaC = trimTextureForItemCount(gradientMetaCEntry?.data ?? new Float32Array(0), gradientCount, "gradient-meta-c");
+  const gradientMetaD = trimTextureForItemCount(gradientMetaDEntry?.data ?? new Float32Array(0), gradientCount, "gradient-meta-d");
+  const gradientMetaE = trimTextureForItemCount(gradientMetaEEntry?.data ?? new Float32Array(0), gradientCount, "gradient-meta-e");
+  const gradientFillPathMetaA = trimTextureForItemCount(gradientFillPathMetaAEntry?.data ?? new Float32Array(0), gradientFillPathCount, "gradient-fill-path-meta-a");
+  const gradientFillPathMetaB = trimTextureForItemCount(gradientFillPathMetaBEntry?.data ?? new Float32Array(0), gradientFillPathCount, "gradient-fill-path-meta-b");
+  const gradientFillPathMetaC = trimTextureForItemCount(gradientFillPathMetaCEntry?.data ?? new Float32Array(0), gradientFillPathCount, "gradient-fill-path-meta-c");
+  const gradientFillPaintMeta = trimTextureForItemCount(gradientFillPaintMetaEntry?.data ?? new Float32Array(0), gradientFillPathCount, "gradient-fill-paint-meta");
+  const gradientFillSegmentsA = trimTextureForItemCount(gradientFillPrimitiveAEntry?.data ?? new Float32Array(0), gradientFillSegmentCount, "gradient-fill-primitives-a");
+  const gradientFillSegmentsB = trimTextureForItemCount(gradientFillPrimitiveBEntry?.data ?? new Float32Array(0), gradientFillSegmentCount, "gradient-fill-primitives-b");
+  const gradientStrokeRunMetaA = trimTextureForItemCount(gradientStrokeRunMetaAEntry?.data ?? new Float32Array(0), gradientStrokeRunCount, "gradient-stroke-run-meta-a");
+  const gradientStrokeRunMetaB = trimTextureForItemCount(gradientStrokeRunMetaBEntry?.data ?? new Float32Array(0), gradientStrokeRunCount, "gradient-stroke-run-meta-b");
+  const gradientStrokeEndpoints = trimTextureForItemCount(gradientStrokeEndpointsEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-endpoints");
+  const gradientStrokePrimitiveMeta = trimTextureForItemCount(gradientStrokePrimitiveMetaEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-primitive-meta");
+  const gradientStrokePrimitiveBounds = trimTextureForItemCount(gradientStrokePrimitiveBoundsEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-primitive-bounds");
+  const gradientStrokeStyles = trimTextureForItemCount(gradientStrokeStylesEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-styles");
+  const gradientLut = await readGradientLutFromParsedData(zip, manifest.gradientLut, gradientCount);
+  const nativeGradientResources: NativeGradientResources = {
+    gradientCount,
+    gradientMetaA,
+    gradientMetaB,
+    gradientMetaC,
+    gradientMetaD,
+    gradientMetaE,
+    gradientLut,
+    gradientFillPathCount,
+    gradientFillSegmentCount,
+    gradientFillPathMetaA,
+    gradientFillPathMetaB,
+    gradientFillPathMetaC,
+    gradientFillPaintMeta,
+    gradientFillSegmentsA,
+    gradientFillSegmentsB,
+    gradientStrokeRunCount,
+    gradientStrokeSegmentCount,
+    gradientStrokeRunMetaA,
+    gradientStrokeRunMetaB,
+    gradientStrokeEndpoints,
+    gradientStrokePrimitiveMeta,
+    gradientStrokePrimitiveBounds,
+    gradientStrokeStyles
+  };
 
   const strokeDecodeStart = performance.now();
   const strokeGeometry = strokeGeometrySection ? await readStrokeGeometryFromSection(zip, strokeGeometrySection) : null;
@@ -1153,7 +1333,7 @@ export async function loadSceneFromParsedDataZip(
   if (strokeGeometrySection || textInstancesSection) {
     const textDecodeMs = performance.now() - textDecodeStart;
     console.log(
-      `[Parsed data load] v5 geometry decode: strokes ${strokeDecodeMs.toFixed(0)} ms (${segmentCount.toLocaleString()} segments), text ${textDecodeMs.toFixed(0)} ms (${textInstanceCount.toLocaleString()} instances)`
+      `[Parsed data load] geometry decode: strokes ${strokeDecodeMs.toFixed(0)} ms (${segmentCount.toLocaleString()} segments), text ${textDecodeMs.toFixed(0)} ms (${textInstanceCount.toLocaleString()} instances)`
     );
   }
   const textInstanceC = trimTextureForItemCount(textInstanceCEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-c");
@@ -1177,8 +1357,14 @@ export async function loadSceneFromParsedDataZip(
   const textOutOfPageCount = readNonNegativeInt(sceneMeta.textOutOfPageCount, Math.max(0, sourceTextCount - textInPageCount));
   const pageCount = Math.max(1, readNonNegativeInt(sceneMeta.pageCount, 1));
   const pagesPerRow = Math.max(1, readNonNegativeInt(sceneMeta.pagesPerRow, 1));
+  validateNativeGradientResources(nativeGradientResources, pageCount);
   progress.report(0.82, { stage: "zip-file", sourceType: "zip", unit: "files" });
   let rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta);
+  for (const layer of rasterLayers) {
+    if (layer.pageIndex >= pageCount) {
+      throw new Error(`Raster layer references invalid page ${layer.pageIndex}.`);
+    }
+  }
   progress.report(0.88, { stage: "compile", sourceType: "zip" });
   if (rasterLayers.length === 0) {
     const sourcePdfBytes = await readSourcePdfBytesFromParsedData(zip, manifest);
@@ -1216,8 +1402,14 @@ export async function loadSceneFromParsedDataZip(
   const parsedPageBounds = parseBounds(sceneMeta.pageBounds);
   const fallbackBounds =
     mergeBounds(
-      boundsFromPrimitiveBounds(primitiveBounds, segmentCount),
-      boundsFromFillPathMeta(fillPathMetaA, fillPathMetaB, fillPathCount)
+      mergeBounds(
+        boundsFromPrimitiveBounds(primitiveBounds, segmentCount),
+        boundsFromFillPathMeta(fillPathMetaA, fillPathMetaB, fillPathCount)
+      ),
+      mergeBounds(
+        boundsFromPrimitiveBounds(gradientStrokePrimitiveBounds, gradientStrokeSegmentCount),
+        boundsFromFillPathMeta(gradientFillPathMetaA, gradientFillPathMetaB, gradientFillPathCount)
+      )
     ) ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 };
   const bounds = parsedBounds ?? fallbackBounds;
   const pageBounds = parsedPageBounds ?? bounds;
@@ -1240,6 +1432,29 @@ export async function loadSceneFromParsedDataZip(
     fillPathMetaC,
     fillSegmentsA,
     fillSegmentsB,
+    gradientCount,
+    gradientMetaA,
+    gradientMetaB,
+    gradientMetaC,
+    gradientMetaD,
+    gradientMetaE,
+    gradientLut,
+    gradientFillPathCount,
+    gradientFillSegmentCount,
+    gradientFillPathMetaA,
+    gradientFillPathMetaB,
+    gradientFillPathMetaC,
+    gradientFillPaintMeta,
+    gradientFillSegmentsA,
+    gradientFillSegmentsB,
+    gradientStrokeRunCount,
+    gradientStrokeSegmentCount,
+    gradientStrokeRunMetaA,
+    gradientStrokeRunMetaB,
+    gradientStrokeEndpoints,
+    gradientStrokePrimitiveMeta,
+    gradientStrokePrimitiveBounds,
+    gradientStrokeStyles,
     segmentCount,
     sourceSegmentCount,
     mergedSegmentCount,
@@ -1297,7 +1512,9 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
         width,
         height,
         data: layer.data,
-        matrix
+        matrix,
+        paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
+        pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
       });
     }
   }
@@ -1316,9 +1533,210 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
     width: legacyWidth,
     height: legacyHeight,
     data: scene.rasterLayerData,
-    matrix: scene.rasterLayerMatrix
+    matrix: scene.rasterLayerMatrix,
+    paintOrder: 0,
+    pageIndex: 0
   });
   return out;
+}
+
+async function readGradientLutFromParsedData(
+  zip: JSZip,
+  rawEntry: unknown,
+  gradientCount: number
+): Promise<Uint8Array> {
+  const expectedByteLength = gradientCount * GRADIENT_LUT_WIDTH * 4;
+  if (expectedByteLength === 0) {
+    return new Uint8Array(0);
+  }
+  if (!rawEntry || typeof rawEntry !== "object") {
+    throw new Error("Parsed data zip is missing its gradient LUT metadata.");
+  }
+  const entry = rawEntry as ParsedDataGradientLutEntry;
+  const width = readNonNegativeInt(entry.width, 0);
+  const height = readNonNegativeInt(entry.height, 0);
+  const byteLength = readNonNegativeInt(entry.byteLength, 0);
+  const file = typeof entry.file === "string" ? entry.file : "";
+  if (width !== GRADIENT_LUT_WIDTH || height !== gradientCount || byteLength !== expectedByteLength) {
+    throw new Error("Parsed data gradient LUT dimensions do not match the scene metadata.");
+  }
+  const zipEntry = file ? zip.file(file) : null;
+  if (!zipEntry) {
+    throw new Error("Parsed data zip is missing its gradient LUT payload.");
+  }
+  const bytes = new Uint8Array(await zipEntry.async("arraybuffer"));
+  if (bytes.length !== expectedByteLength) {
+    throw new Error(
+      `Gradient LUT byte length is invalid (${bytes.length} != ${expectedByteLength}).`
+    );
+  }
+  return bytes;
+}
+
+interface NativeGradientResources {
+  gradientCount: number;
+  gradientMetaA: Float32Array;
+  gradientMetaB: Float32Array;
+  gradientMetaC: Float32Array;
+  gradientMetaD: Float32Array;
+  gradientMetaE: Float32Array;
+  gradientLut: Uint8Array;
+  gradientFillPathCount: number;
+  gradientFillSegmentCount: number;
+  gradientFillPathMetaA: Float32Array;
+  gradientFillPathMetaB: Float32Array;
+  gradientFillPathMetaC: Float32Array;
+  gradientFillPaintMeta: Float32Array;
+  gradientFillSegmentsA: Float32Array;
+  gradientFillSegmentsB: Float32Array;
+  gradientStrokeRunCount: number;
+  gradientStrokeSegmentCount: number;
+  gradientStrokeRunMetaA: Float32Array;
+  gradientStrokeRunMetaB: Float32Array;
+  gradientStrokeEndpoints: Float32Array;
+  gradientStrokePrimitiveMeta: Float32Array;
+  gradientStrokePrimitiveBounds: Float32Array;
+  gradientStrokeStyles: Float32Array;
+}
+
+function validateNativeGradientResources(resources: NativeGradientResources, pageCount: number): void {
+  const {
+    gradientCount,
+    gradientMetaA,
+    gradientMetaB,
+    gradientMetaC,
+    gradientMetaD,
+    gradientMetaE,
+    gradientLut,
+    gradientFillPathCount,
+    gradientFillSegmentCount,
+    gradientFillPathMetaA,
+    gradientFillPaintMeta,
+    gradientStrokeRunCount,
+    gradientStrokeSegmentCount,
+    gradientStrokeRunMetaA,
+    gradientStrokeRunMetaB
+  } = resources;
+
+  for (const [label, values] of [
+    ["gradient metadata A", resources.gradientMetaA],
+    ["gradient metadata B", resources.gradientMetaB],
+    ["gradient metadata C", resources.gradientMetaC],
+    ["gradient metadata D", resources.gradientMetaD],
+    ["gradient metadata E", resources.gradientMetaE],
+    ["gradient fill metadata A", resources.gradientFillPathMetaA],
+    ["gradient fill metadata B", resources.gradientFillPathMetaB],
+    ["gradient fill metadata C", resources.gradientFillPathMetaC],
+    ["gradient fill paint metadata", resources.gradientFillPaintMeta],
+    ["gradient fill primitives A", resources.gradientFillSegmentsA],
+    ["gradient fill primitives B", resources.gradientFillSegmentsB],
+    ["gradient stroke run metadata A", resources.gradientStrokeRunMetaA],
+    ["gradient stroke run metadata B", resources.gradientStrokeRunMetaB],
+    ["gradient stroke endpoints", resources.gradientStrokeEndpoints],
+    ["gradient stroke primitive metadata", resources.gradientStrokePrimitiveMeta],
+    ["gradient stroke primitive bounds", resources.gradientStrokePrimitiveBounds],
+    ["gradient stroke styles", resources.gradientStrokeStyles]
+  ] as const) {
+    if (!values.every(Number.isFinite)) {
+      throw new Error(`Parsed data ${label} contains non-finite values.`);
+    }
+  }
+
+  if (gradientLut.length !== gradientCount * GRADIENT_LUT_WIDTH * 4) {
+    throw new Error("Gradient LUT length does not match gradientCount.");
+  }
+  for (let i = 0; i < gradientCount; i += 1) {
+    const offset = i * 4;
+    const kind = gradientMetaA[offset];
+    const hasBBox = gradientMetaA[offset + 1];
+    if ((kind !== 0 && kind !== 1) || (hasBBox !== 0 && hasBBox !== 1)) {
+      throw new Error(`Gradient ${i} has an invalid kind or bounding-box flag.`);
+    }
+    const values = [
+      ...gradientMetaB.subarray(offset, offset + 4),
+      ...gradientMetaC.subarray(offset, offset + 4),
+      ...gradientMetaD.subarray(offset, offset + 4)
+    ];
+    if (!values.every(Number.isFinite)) {
+      throw new Error(`Gradient ${i} contains non-finite metadata.`);
+    }
+    const det = gradientMetaB[offset] * gradientMetaB[offset + 3] -
+      gradientMetaB[offset + 1] * gradientMetaB[offset + 2];
+    if (Math.abs(det) <= 1e-12) {
+      throw new Error(`Gradient ${i} has a singular scene-to-gradient transform.`);
+    }
+    const dx = gradientMetaD[offset] - gradientMetaC[offset + 2];
+    const dy = gradientMetaD[offset + 1] - gradientMetaC[offset + 3];
+    if (kind === 0 && dx * dx + dy * dy <= 1e-18) {
+      throw new Error(`Axial gradient ${i} has a degenerate axis.`);
+    }
+    if (kind === 1) {
+      const radius0 = gradientMetaD[offset + 2];
+      const radius1 = gradientMetaD[offset + 3];
+      if (radius0 < 0 || radius1 < 0) {
+        throw new Error(`Radial gradient ${i} has a negative radius.`);
+      }
+      const centerDistance = Math.hypot(dx, dy);
+      if (centerDistance <= 1e-9 && Math.abs(radius1 - radius0) <= 1e-9) {
+        throw new Error(`Radial gradient ${i} has identical start and end circles.`);
+      }
+      if (centerDistance + radius1 > radius0 && centerDistance + radius0 > radius1) {
+        throw new Error(`Radial gradient ${i} uses an unsupported intersecting-circle topology.`);
+      }
+    }
+    if (hasBBox === 1) {
+      const bbox = gradientMetaE.subarray(offset, offset + 4);
+      if (!bbox.every(Number.isFinite) || bbox[2] < bbox[0] || bbox[3] < bbox[1]) {
+        throw new Error(`Gradient ${i} has an invalid bounding box.`);
+      }
+    }
+  }
+
+  const validateGradientRef = (value: number, label: string): void => {
+    if (!Number.isInteger(value) || value < -1 || value >= gradientCount) {
+      throw new Error(`${label} references invalid gradient ${value}.`);
+    }
+  };
+  for (let i = 0; i < gradientFillPathCount; i += 1) {
+    const offset = i * 4;
+    const segmentStart = gradientFillPathMetaA[offset];
+    const segmentCount = gradientFillPathMetaA[offset + 1];
+    if (
+      !Number.isInteger(segmentStart) || !Number.isInteger(segmentCount) ||
+      segmentStart < 0 || segmentCount <= 0 || segmentStart + segmentCount > gradientFillSegmentCount
+    ) {
+      throw new Error(`Gradient fill ${i} has an invalid primitive range.`);
+    }
+    validateGradientRef(gradientFillPaintMeta[offset], `Gradient fill ${i}`);
+    validateGradientRef(gradientFillPaintMeta[offset + 1], `Gradient fill mask ${i}`);
+    if (
+      !Number.isFinite(gradientFillPaintMeta[offset + 2]) || gradientFillPaintMeta[offset + 2] < 0 ||
+      !Number.isInteger(gradientFillPaintMeta[offset + 3]) ||
+      gradientFillPaintMeta[offset + 3] < 0 || gradientFillPaintMeta[offset + 3] >= pageCount
+    ) {
+      throw new Error(`Gradient fill ${i} has invalid paint metadata.`);
+    }
+  }
+  for (let i = 0; i < gradientStrokeRunCount; i += 1) {
+    const offset = i * 4;
+    const segmentStart = gradientStrokeRunMetaA[offset];
+    const segmentCount = gradientStrokeRunMetaA[offset + 1];
+    if (
+      !Number.isInteger(segmentStart) || !Number.isInteger(segmentCount) ||
+      segmentStart < 0 || segmentCount <= 0 || segmentStart + segmentCount > gradientStrokeSegmentCount
+    ) {
+      throw new Error(`Gradient stroke run ${i} has an invalid segment range.`);
+    }
+    validateGradientRef(gradientStrokeRunMetaA[offset + 2], `Gradient stroke run ${i}`);
+    validateGradientRef(gradientStrokeRunMetaA[offset + 3], `Gradient stroke mask ${i}`);
+    if (
+      !Number.isFinite(gradientStrokeRunMetaB[offset]) || gradientStrokeRunMetaB[offset] < 0 ||
+      !Number.isInteger(gradientStrokeRunMetaB[offset + 1]) ||
+      gradientStrokeRunMetaB[offset + 1] < 0 || gradientStrokeRunMetaB[offset + 1] >= pageCount
+    ) {
+      throw new Error(`Gradient stroke run ${i} has invalid paint metadata.`);
+    }
+  }
 }
 
 function trimTextureForItemCount(source: Float32Array, itemCount: number, label: string): Float32Array {
@@ -1846,20 +2264,50 @@ async function readRasterLayersFromParsedData(zip: JSZip, sceneMeta: ParsedDataS
   for (let i = 0; i < sceneRasterLayers.length; i += 1) {
     const entry = sceneRasterLayers[i];
     if (!entry || typeof entry !== "object") {
-      continue;
+      throw new Error(`Raster layer ${i} has invalid metadata.`);
     }
 
     const layerMeta = entry as ParsedDataRasterLayerEntry;
     const width = readNonNegativeInt(layerMeta.width, 0);
     const height = readNonNegativeInt(layerMeta.height, 0);
-    const path = typeof layerMeta.file === "string" ? layerMeta.file : `raster/layer-${i}.rgba`;
-    const matrix = parseMat2D(layerMeta.matrix) ?? new Float32Array([1, 0, 0, 1, 0, 0]);
+    const path = readNonEmptyString(layerMeta.file);
+    const matrix = parseMat2D(layerMeta.matrix);
+    const paintOrder = layerMeta.paintOrder;
+    const pageIndex = layerMeta.pageIndex;
+    if (
+      width <= 0 ||
+      height <= 0 ||
+      !path ||
+      !matrix ||
+      typeof paintOrder !== "number" ||
+      !Number.isFinite(paintOrder) ||
+      paintOrder < 0 ||
+      typeof pageIndex !== "number" ||
+      !Number.isInteger(pageIndex) ||
+      pageIndex < 0
+    ) {
+      throw new Error(`Raster layer ${i} has incomplete or invalid v6 metadata.`);
+    }
     const decoded = await readRasterLayerFromZip(zip, path, width, height);
-    if (!decoded || decoded.width <= 0 || decoded.height <= 0 || decoded.data.length < decoded.width * decoded.height * 4) {
-      continue;
+    if (!decoded) {
+      throw new Error(`Parsed data zip is missing or cannot decode raster layer ${i}: ${path}.`);
+    }
+    if (
+      decoded.width !== width ||
+      decoded.height !== height ||
+      decoded.data.length < width * height * 4
+    ) {
+      throw new Error(`Raster layer ${i} dimensions do not match its v6 metadata.`);
     }
 
-    layers.push({ width: decoded.width, height: decoded.height, matrix, data: decoded.data });
+    layers.push({
+      width,
+      height,
+      matrix,
+      data: decoded.data,
+      paintOrder,
+      pageIndex
+    });
   }
 
   return layers;
