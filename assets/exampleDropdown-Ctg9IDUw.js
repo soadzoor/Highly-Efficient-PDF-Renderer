@@ -3246,10 +3246,12 @@ float heprThreeLinearCoverageToOutputAlpha(float coverage) {
   return clamp(coverage, 0.0, 1.0);
 }
 `;function Yy(e,t=!1){let n=e.replace(/^\s*#version\s+300\s+es\s*/m,``);return t?nb(n):n}function Xy(e){return Yy(eb($y(e)),!0)}function Zy(e){return Yy(tb(e),!0)}var Qy=`
+const int HEPR_THREE_TEXT_WINDING_SUBDIVISIONS = 6;
+
 void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding) {
   vec2 prev = a;
-  for (int i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i += 1) {
-    float t = float(i) / float(QUAD_WINDING_SUBDIVISIONS);
+  for (int i = 1; i <= HEPR_THREE_TEXT_WINDING_SUBDIVISIONS; i += 1) {
+    float t = float(i) / float(HEPR_THREE_TEXT_WINDING_SUBDIVISIONS);
     vec2 next = evaluateQuadratic(a, b, c, t);
     accumulateLineCrossing(prev, next, p, winding);
     prev = next;
