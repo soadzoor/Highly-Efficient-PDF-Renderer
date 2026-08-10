@@ -295,6 +295,10 @@ fn heprGradientFillFragment(
   fillAAScreenPx: f32,
   vectorOverride: vec4<f32>
 ) -> vec4<f32> {
+  // WGSL derivatives must execute before any divergent branch, loop exit, or
+  // discard. Flat-interpolated paint metadata is not statically uniform.
+  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
+  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
   let segmentStart = i32(metaA.x + 0.5);
   let segmentCount = i32(metaA.y + 0.5);
   if (segmentCount <= 0 || metaC.w <= 0.001) { discard; }
@@ -325,8 +329,6 @@ fn heprGradientFillFragment(
     coverage = select(0.0, 1.0, inside);
   } else {
     let signedDistance = select(minDistance, -minDistance, inside);
-    let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-    let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
     let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * fillAAScreenPx, 0.0001);
     coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
   }
@@ -388,6 +390,9 @@ fn heprGradientStrokeFragment(
   gradientMetaE: texture_2d<f32>, gradientLut: texture_2d<f32>, gradientMetaWidth: f32,
   sourceGradientIndex: f32, maskGradientIndex: f32
 ) -> vec4<f32> {
+  // Evaluate derivatives in uniform control flow before alpha/clip discards.
+  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
+  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
   let styleFlags = floor(primitiveB.w / 2.0 + 0.000001);
   let alphaStyle = primitiveB.w - styleFlags * 2.0;
   if (alphaStyle <= 0.001) { discard; }
@@ -398,8 +403,6 @@ fn heprGradientStrokeFragment(
     heprDistanceToQuadraticBezier(local, primitiveA.xy, primitiveA.zw, primitiveB.xy),
     strokeCurveEnabled >= 0.5 && primitiveB.z >= 0.5
   );
-  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
   let localPerPixel = max(max(pixelToLocalX, pixelToLocalY), 0.000001);
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let halfWidth = select(halfWidthFromVertex, max(0.5 * localPerPixel, 0.00001), isHairline);

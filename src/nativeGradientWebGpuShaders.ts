@@ -260,6 +260,10 @@ fn accumulateCrossing(start : vec2f, end : vec2f, point : vec2f, winding : ptr<f
 
 @fragment
 fn fsMain(inData : FillOut) -> @location(0) vec4f {
+  // Derivatives must be evaluated before any potentially non-uniform branch,
+  // loop exit, or discard in the fragment shader.
+  let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
+  let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) { discard; }
   let dimensions = textureDimensions(uSegmentsA);
   var minDistance = 1e20;
@@ -289,8 +293,6 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   let inside = select(winding != 0, (crossings & 1) == 1, inData.fillRule >= 0.5);
   var coverage = select(0.0, 1.0, inside);
   if (inData.companionStroke < 0.5) {
-    let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
-    let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
     let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
     let signedDistance = select(minDistance, -minDistance, inside);
     coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
@@ -399,6 +401,10 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
 @fragment
 fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
+  // Keep derivative evaluation in uniform control flow, before clipping and
+  // alpha tests can discard individual fragments.
+  let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
+  let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
   if (inData.alpha <= 0.001) { discard; }
   if (
     inData.hasClipBounds >= 0.5 &&
@@ -410,8 +416,6 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
     distanceToQuadratic(inData.local, inData.p0, inData.p1, inData.p2),
     uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5
   );
-  let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
-  let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
   let localPerPixel = max(max(dx, dy), 1e-6);
   let aaWorld = max(localPerPixel * uCamera.strokeAAScreenPx, 5e-5);
   let coverage = 1.0 - smoothstep(inData.halfWidth - aaWorld, inData.halfWidth + aaWorld, distanceValue);

@@ -58,6 +58,7 @@
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
     "test:example-assets": "node --experimental-strip-types scripts/test-example-assets.mjs",
+    "test:ordered-gradient": "node --experimental-strip-types scripts/test-ordered-gradient-paint.mjs",
     "test:parsed-zip": "node scripts/test-parsed-data-zip.mjs",
     "test:parsed-zip:package": "npm run build:lib && node scripts/test-parsed-data-zip-package.mjs",
     "test:rooms": "node scripts/test-room-detector.mjs",

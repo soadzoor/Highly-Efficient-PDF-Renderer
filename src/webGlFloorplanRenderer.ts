@@ -3,6 +3,7 @@ import {
   buildOrderedGradientPaintCommands,
   GRADIENT_LUT_WIDTH,
   orderedGradientPaintNeedsDirectRendering,
+  planOrderedGradientMinify,
   readGradientSceneData,
   type GradientSceneData,
   type OrderedGradientPaintCommand
@@ -2803,14 +2804,29 @@ export class WebGlFloorplanRenderer {
 
     let instanceCount = 0;
     if (useVectorMinify) {
-      if (this.rasterRenderingEnabled) {
+      const minifyPlan = this.getOrderedGradientMinifyPlan();
+      if (minifyPlan.splitOrderedGradientPrefix) {
+        // Sparse native gradients participate in PDF paint order with raster
+        // layers, while ordinary fills/strokes/text are guaranteed to follow
+        // them by extraction. Draw the interleaved prefix directly, then
+        // composite only the supersampled ordinary-vector layer.
+        this.drawOrderedGradientPaint(
+          this.canvas.width,
+          this.canvas.height,
+          this.cameraCenterX,
+          this.cameraCenterY
+        );
+      } else if (this.rasterRenderingEnabled) {
+        // When no raster follows a gradient, keep native gradients in the
+        // supersampled vector layer so thin gradient strokes retain their AA.
         this.drawRasterLayer(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
       }
       instanceCount = this.renderVectorLayerIntoMinifyTarget(
         this.vectorMinifyWidth,
         this.vectorMinifyHeight,
         this.cameraCenterX,
-        this.cameraCenterY
+        this.cameraCenterY,
+        minifyPlan.includeGradientPaint
       );
       this.compositeVectorMinifyLayer();
     } else {
@@ -2834,22 +2850,28 @@ export class WebGlFloorplanRenderer {
     });
   }
 
-  private hasVectorContent(): boolean {
+  private hasOrdinaryVectorContent(): boolean {
     return (
       (this.fillRenderingEnabled && this.fillPathCount > 0) ||
-      (this.fillRenderingEnabled && (this.gradientData?.gradientFillPathCount ?? 0) > 0) ||
       (this.strokeRenderingEnabled && this.segmentCount > 0) ||
-      (this.strokeRenderingEnabled && (this.gradientData?.gradientStrokeRunCount ?? 0) > 0) ||
       (this.textRenderingEnabled && this.textInstanceCount > 0)
     );
   }
 
+  private hasVectorContent(): boolean {
+    return (
+      this.hasOrdinaryVectorContent() ||
+      (this.fillRenderingEnabled && (this.gradientData?.gradientFillPathCount ?? 0) > 0) ||
+      (this.strokeRenderingEnabled && (this.gradientData?.gradientStrokeRunCount ?? 0) > 0)
+    );
+  }
+
   private shouldUseVectorMinifyPath(): boolean {
+    const minifyPlan = this.getOrderedGradientMinifyPlan();
     if (
       this.vectorLodRuntime ||
       this.textVectorOnly ||
-      (this.rasterRenderingEnabled && this.gradientPaintRequiresDirectRendering) ||
-      !this.hasVectorContent()
+      !minifyPlan.hasMinifiableContent
     ) {
       return false;
     }
@@ -2857,6 +2879,15 @@ export class WebGlFloorplanRenderer {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
+  }
+
+  private getOrderedGradientMinifyPlan() {
+    return planOrderedGradientMinify(
+      this.rasterRenderingEnabled,
+      this.gradientPaintRequiresDirectRendering,
+      this.hasOrdinaryVectorContent(),
+      this.hasVectorContent()
+    );
   }
 
   private computeVectorMinifyZoom(viewportWidth: number, viewportHeight: number): number {
@@ -2930,7 +2961,8 @@ export class WebGlFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    includeGradientPaint: boolean
   ): number {
     if (!this.vectorMinifyFramebuffer || !this.vectorMinifyTexture) {
       return 0;
@@ -2945,7 +2977,9 @@ export class WebGlFloorplanRenderer {
     // Offscreen vector layer needs straight-alpha color blending with correct alpha accumulation.
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-    this.drawOrderedGradientVectors(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    if (includeGradientPaint) {
+      this.drawOrderedGradientVectors(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    }
 
     if (this.fillRenderingEnabled) {
       this.drawFilledPaths(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);

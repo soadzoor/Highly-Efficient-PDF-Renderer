@@ -3,6 +3,7 @@ import {
   buildOrderedGradientPaintCommands,
   GRADIENT_LUT_WIDTH,
   orderedGradientPaintNeedsDirectRendering,
+  planOrderedGradientMinify,
   readGradientSceneData,
   type GradientSceneData,
   type OrderedGradientPaintCommand
@@ -2976,11 +2977,13 @@ export class WebGpuFloorplanRenderer {
     }
 
     if (useVectorMinify) {
+      const minifyPlan = this.getOrderedGradientMinifyPlan();
       const renderedSegments = this.renderVectorLayerIntoMinifyTarget(
         this.vectorMinifyWidth,
         this.vectorMinifyHeight,
         this.cameraCenterX,
-        this.cameraCenterY
+        this.cameraCenterY,
+        minifyPlan.includeGradientPaint
       );
 
       const view = this.gpuContext.getCurrentTexture().createView();
@@ -2997,7 +3000,14 @@ export class WebGpuFloorplanRenderer {
       });
 
       this.updateCameraUniforms(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
-      this.drawRasterContentIntoPass(pass);
+      if (minifyPlan.splitOrderedGradientPrefix) {
+        // Keep the raster/native-gradient prefix in exact PDF order and only
+        // supersample the ordinary vector suffix. Extraction guarantees
+        // accepted native gradient paints precede ordinary vector content.
+        this.drawOrderedGradientPaintIntoPass(pass);
+      } else {
+        this.drawRasterContentIntoPass(pass);
+      }
       this.drawVectorMinifyCompositeIntoPass(pass, this.canvas.width, this.canvas.height);
       this.drawHighlightsIntoPass(pass, this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom);
 
@@ -3040,25 +3050,40 @@ export class WebGpuFloorplanRenderer {
     });
   }
 
-  private hasVectorContent(): boolean {
+  private hasOrdinaryVectorContent(): boolean {
     return (
       (this.fillRenderingEnabled && this.fillPathCount > 0) ||
-      (this.fillRenderingEnabled && (this.gradientData?.gradientFillPathCount ?? 0) > 0) ||
       (this.strokeRenderingEnabled && this.segmentCount > 0) ||
-      (this.strokeRenderingEnabled && (this.gradientData?.gradientStrokeRunCount ?? 0) > 0) ||
       (this.textRenderingEnabled && this.textInstanceCount > 0)
     );
   }
 
+  private hasVectorContent(): boolean {
+    return (
+      this.hasOrdinaryVectorContent() ||
+      (this.fillRenderingEnabled && (this.gradientData?.gradientFillPathCount ?? 0) > 0) ||
+      (this.strokeRenderingEnabled && (this.gradientData?.gradientStrokeRunCount ?? 0) > 0)
+    );
+  }
+
   private shouldUseVectorMinifyPath(): boolean {
+    const minifyPlan = this.getOrderedGradientMinifyPlan();
     if (
       this.textVectorOnly ||
-      (this.rasterRenderingEnabled && this.gradientPaintRequiresDirectRendering) ||
-      !this.hasVectorContent()
+      !minifyPlan.hasMinifiableContent
     ) {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
+  }
+
+  private getOrderedGradientMinifyPlan() {
+    return planOrderedGradientMinify(
+      this.rasterRenderingEnabled,
+      this.gradientPaintRequiresDirectRendering,
+      this.hasOrdinaryVectorContent(),
+      this.hasVectorContent()
+    );
   }
 
   private computeVectorMinifyZoom(viewportWidth: number, viewportHeight: number): number {
@@ -3073,7 +3098,8 @@ export class WebGpuFloorplanRenderer {
     viewportWidth: number,
     viewportHeight: number,
     cameraCenterX: number,
-    cameraCenterY: number
+    cameraCenterY: number,
+    includeGradientPaint: boolean
   ): number {
     if (!this.vectorMinifyTexture) {
       return 0;
@@ -3093,7 +3119,9 @@ export class WebGpuFloorplanRenderer {
     });
 
     this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
-    this.drawOrderedGradientVectorsIntoPass(pass);
+    if (includeGradientPaint) {
+      this.drawOrderedGradientVectorsIntoPass(pass);
+    }
     const renderedSegments = this.drawVectorContentIntoPass(pass);
     pass.end();
     this.gpuDevice.queue.submit([encoder.finish()]);

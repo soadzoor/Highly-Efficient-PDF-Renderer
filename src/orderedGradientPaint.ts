@@ -38,6 +38,12 @@ export type OrderedGradientPaintCommand =
   | { kind: "gradient-fill"; index: number; paintOrder: number; pageIndex: number }
   | { kind: "gradient-stroke"; index: number; paintOrder: number; pageIndex: number };
 
+export interface OrderedGradientMinifyPlan {
+  splitOrderedGradientPrefix: boolean;
+  includeGradientPaint: boolean;
+  hasMinifiableContent: boolean;
+}
+
 const EMPTY_FLOATS = new Float32Array(0);
 const EMPTY_BYTES = new Uint8Array(0);
 
@@ -130,9 +136,10 @@ export function buildOrderedGradientPaintCommands(
 }
 
 /**
- * The low-zoom minify path renders every raster first and composites one vector
- * texture afterwards. It is exact only when a page has no raster paint following
- * a sparse gradient vector paint.
+ * The ordinary-vector minify target can also contain sparse gradient paints
+ * unless a raster on the same page follows one of them. In that case the
+ * raster/gradient prefix must be drawn directly in painter order and only the
+ * ordinary fill/stroke/text suffix is minified.
  */
 export function orderedGradientPaintNeedsDirectRendering(
   commands: readonly OrderedGradientPaintCommand[]
@@ -148,6 +155,23 @@ export function orderedGradientPaintNeedsDirectRendering(
     pagesWithGradientPaint.add(command.pageIndex);
   }
   return false;
+}
+
+export function planOrderedGradientMinify(
+  rasterRenderingEnabled: boolean,
+  gradientPaintRequiresDirectRendering: boolean,
+  hasOrdinaryVectorContent: boolean,
+  hasVectorContent: boolean
+): OrderedGradientMinifyPlan {
+  const splitOrderedGradientPrefix =
+    rasterRenderingEnabled && gradientPaintRequiresDirectRendering;
+  return {
+    splitOrderedGradientPrefix,
+    includeGradientPaint: !splitOrderedGradientPrefix,
+    hasMinifiableContent: splitOrderedGradientPrefix
+      ? hasOrdinaryVectorContent
+      : hasVectorContent
+  };
 }
 
 function commandKindRank(kind: OrderedGradientPaintCommand["kind"]): number {
