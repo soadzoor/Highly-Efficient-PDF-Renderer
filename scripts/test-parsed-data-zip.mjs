@@ -44,6 +44,125 @@ function assertSceneCountsEqual(actual, expected, context) {
   }
 }
 
+function lineWindingDelta(ax, ay, bx, by, px, py) {
+  const upward = ay <= py && by > py;
+  const downward = ay > py && by <= py;
+  if (!upward && !downward) {
+    return 0;
+  }
+  const denominator = by - ay;
+  if (Math.abs(denominator) <= 1e-6) {
+    return 0;
+  }
+  const xCross = ax + ((py - ay) * (bx - ax)) / denominator;
+  return xCross > px ? (upward ? 1 : -1) : 0;
+}
+
+function quadraticWindingDelta(ax, ay, bx, by, cx, cy, px, py) {
+  const quadraticY = ay - 2 * by + cy;
+  const linearY = 2 * (by - ay);
+  const constantY = ay - py;
+  const roots = [];
+  if (Math.abs(quadraticY) <= 1e-8) {
+    if (Math.abs(linearY) > 1e-8) {
+      roots.push(-constantY / linearY);
+    }
+  } else {
+    const discriminant = linearY * linearY - 4 * quadraticY * constantY;
+    if (discriminant >= 0) {
+      const sqrtDiscriminant = Math.sqrt(discriminant);
+      roots.push(
+        (-linearY - sqrtDiscriminant) / (2 * quadraticY),
+        (-linearY + sqrtDiscriminant) / (2 * quadraticY)
+      );
+    }
+  }
+
+  let winding = 0;
+  let previousRoot = Number.NaN;
+  for (const root of roots) {
+    if (root < -1e-5 || root >= 1 - 1e-5 || Math.abs(root - previousRoot) <= 1e-5) {
+      continue;
+    }
+    previousRoot = root;
+    const t = Math.max(0, Math.min(1, root));
+    const oneMinusT = 1 - t;
+    const xCross = oneMinusT * oneMinusT * ax + 2 * oneMinusT * t * bx + t * t * cx;
+    const derivativeY = linearY + 2 * quadraticY * t;
+    if (xCross > px && Math.abs(derivativeY) > 1e-6) {
+      winding += derivativeY > 0 ? 1 : -1;
+    }
+  }
+  return winding;
+}
+
+function textGlyphWindingAt(scene, glyphIndex, x, y) {
+  const glyphOffset = glyphIndex * 4;
+  const segmentStart = Math.max(0, Math.trunc(scene.textGlyphMetaA[glyphOffset]));
+  const segmentCount = Math.max(0, Math.trunc(scene.textGlyphMetaA[glyphOffset + 1]));
+  let winding = 0;
+  for (let i = 0; i < segmentCount; i += 1) {
+    const offset = (segmentStart + i) * 4;
+    const ax = scene.textGlyphSegmentsA[offset];
+    const ay = scene.textGlyphSegmentsA[offset + 1];
+    const bx = scene.textGlyphSegmentsA[offset + 2];
+    const by = scene.textGlyphSegmentsA[offset + 3];
+    const cx = scene.textGlyphSegmentsB[offset];
+    const cy = scene.textGlyphSegmentsB[offset + 1];
+    winding += scene.textGlyphSegmentsB[offset + 2] >= 1
+      ? quadraticWindingDelta(ax, ay, bx, by, cx, cy, x, y)
+      : lineWindingDelta(ax, ay, cx, cy, x, y);
+  }
+  return winding;
+}
+
+function midpointCoverageAcrossWindings(first, second) {
+  if ((first !== 0) !== (second !== 0)) {
+    return 0.5;
+  }
+  return first !== 0 ? 1 : 0;
+}
+
+function assertBrochureOverlapCoverage(scene) {
+  const page = scene.textIndex?.pages[0];
+  assert.ok(page, "brochure page must expose a searchable text index");
+  const wordStart = page.text.indexOf("zuverlässig");
+  assert.notEqual(wordStart, -1, "brochure fixture must contain zuverlässig");
+  const instanceIndex = page.charInstance[wordStart + 3];
+  assert.ok(instanceIndex >= 0, "the first e in zuverlässig must have vector geometry");
+  const glyphIndex = Math.trunc(scene.textInstanceB[instanceIndex * 4 + 2]);
+  const probe = 1e-5;
+
+  const internalEdgeWindings = [
+    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.291015625 + probe),
+    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.291015625 - probe)
+  ];
+  assert.ok(
+    internalEdgeWindings.every((winding) => winding !== 0),
+    "the brochure e crossbar edge must be filled on both sides"
+  );
+  assert.equal(
+    midpointCoverageAcrossWindings(...internalEdgeWindings),
+    1,
+    "an overlap-only contour edge must stay fully opaque"
+  );
+
+  const coincidentExteriorWindings = [
+    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.196533203 + probe),
+    textGlyphWindingAt(scene, glyphIndex, 0.4, 0.196533203 - probe)
+  ];
+  assert.ok(
+    coincidentExteriorWindings.includes(0) &&
+      coincidentExteriorWindings.some((winding) => Math.abs(winding) === 2),
+    "the brochure e lower edge must retain its coincident two-contour transition"
+  );
+  assert.equal(
+    midpointCoverageAcrossWindings(...coincidentExteriorWindings),
+    0.5,
+    "coincident exterior contours must be antialiased as one boundary"
+  );
+}
+
 async function readZip(blob) {
   return JSZip.loadAsync(await blob.arrayBuffer());
 }
@@ -406,6 +525,7 @@ async function run() {
       sourceKind: "pdf",
       pages: "1"
     });
+    assertBrochureOverlapCoverage(parsedOptimizedRasterPdf.scene);
     assert.ok(parsedOptimizedRasterPdf.scene.imagePaintOpCount > 0);
     assert.ok(
       listSceneRasterLayers(parsedOptimizedRasterPdf.scene).length > 0,

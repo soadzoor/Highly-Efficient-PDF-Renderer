@@ -672,7 +672,6 @@ ${GLSL_OUTPUT_COLOR_HELPERS}
 
 const int MAX_GLYPH_PRIMITIVES = 256;
 const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
-const int QUAD_WINDING_SUBDIVISIONS = 6;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
@@ -680,17 +679,25 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(x, y);
 }
 
-float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
+vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
+  float oneMinusT = 1.0 - t;
+  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
+}
+
+vec4 textLineDistanceInfo(vec2 p, vec2 a, vec2 b) {
   vec2 ab = b - a;
   float abLenSq = dot(ab, ab);
   if (abLenSq <= 1e-10) {
-    return length(p - a);
+    return vec4(length(p - a), 0.0, 1.0, 0.0);
   }
   float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
+  vec2 offset = p - (a + ab * t);
+  vec2 tangent = ab * inversesqrt(abLenSq);
+  vec2 leftNormal = vec2(-tangent.y, tangent.x);
+  return vec4(length(offset), t, leftNormal);
 }
 
-float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
+vec4 textQuadraticDistanceInfo(vec2 p, vec2 a, vec2 b, vec2 c) {
   vec2 aa = b - a;
   vec2 bb = a - 2.0 * b + c;
   vec2 cc = aa * 2.0;
@@ -698,27 +705,26 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
 
   float bbLenSq = dot(bb, bb);
   if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
+    return textLineDistanceInfo(p, a, c);
   }
 
   float inv = 1.0 / bbLenSq;
   float kx = inv * dot(aa, bb);
   float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
   float kz = inv * dot(dd, aa);
-
   float pValue = ky - kx * kx;
   float pCube = pValue * pValue * pValue;
   float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
   float hValue = qValue * qValue + 4.0 * pCube;
-
   float best = 1e20;
+  float closestT = 0.0;
 
   if (hValue >= 0.0) {
     float hSqrt = sqrt(hValue);
     vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
     vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * t) * t;
+    closestT = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    vec2 delta = dd + (cc + bb * closestT) * closestT;
     best = dot(delta, delta);
   } else {
     float z = sqrt(-pValue);
@@ -729,19 +735,33 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
     vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
 
     vec2 delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
+    best = dot(delta, delta);
+    closestT = t.x;
     delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
+    float candidate = dot(delta, delta);
+    if (candidate < best) {
+      best = candidate;
+      closestT = t.y;
+    }
     delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
+    candidate = dot(delta, delta);
+    if (candidate < best) {
+      best = candidate;
+      closestT = t.z;
+    }
   }
 
-  return sqrt(max(best, 0.0));
-}
-
-vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
-  float oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
+  vec2 closestPoint = evaluateQuadratic(a, b, c, closestT);
+  vec2 tangent = 2.0 * ((1.0 - closestT) * (b - a) + closestT * (c - b));
+  float tangentLenSq = dot(tangent, tangent);
+  if (tangentLenSq <= 1e-12) {
+    tangent = c - a;
+    tangentLenSq = dot(tangent, tangent);
+  }
+  vec2 leftNormal = tangentLenSq > 1e-12
+    ? vec2(-tangent.y, tangent.x) * inversesqrt(tangentLenSq)
+    : vec2(1.0, 0.0);
+  return vec4(sqrt(max(best, 0.0)), closestT, leftNormal);
 }
 
 void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding) {
@@ -822,6 +842,13 @@ void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int windi
 }
 
 void main() {
+  vec2 localDx = dFdx(vLocal);
+  vec2 localDy = dFdy(vLocal);
+  float pixelToLocalX = length(vec2(localDx.x, localDy.x));
+  float pixelToLocalY = length(vec2(localDx.y, localDy.y));
+  float localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
+
   if (vSegmentCount <= 0) {
     discard;
   }
@@ -857,7 +884,15 @@ void main() {
     }
   }
 
+  float coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
+
+  // A tiny deterministic offset keeps exact-on-edge winding tests stable.
+  vec2 queryLocal = vLocal + 0.001 * (localDx + 0.37 * localDy);
   float minDistance = 1e20;
+  float nearestT = 0.0;
+  vec2 nearestPoint = vec2(0.0);
+  vec2 nearestNormal = vec2(1.0, 0.0);
+  int nearestSideMultiplicity = 0;
   int winding = 0;
 
   for (int i = 0; i < MAX_GLYPH_PRIMITIVES; i += 1) {
@@ -872,25 +907,53 @@ void main() {
     vec2 p2 = primitiveB.xy;
     float primitiveType = primitiveB.z;
 
+    vec4 distanceInfo;
+    vec2 closestPoint;
     if (uTextCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
-      minDistance = min(minDistance, distanceToQuadraticBezier(vLocal, p0, p1, p2));
-      accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding);
+      distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
+      closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
+      accumulateQuadraticCrossing(p0, p1, p2, queryLocal, winding);
     } else {
-      minDistance = min(minDistance, distanceToLineSegment(vLocal, p0, p2));
-      accumulateLineCrossing(p0, p2, vLocal, winding);
+      distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
+      closestPoint = mix(p0, p2, distanceInfo.y);
+      accumulateLineCrossing(p0, p2, queryLocal, winding);
+    }
+
+    float signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
+    int sideStep = signedOffset >= 0.0 ? 1 : -1;
+    if (distanceInfo.x + coincidentEpsilon < minDistance) {
+      minDistance = distanceInfo.x;
+      nearestT = distanceInfo.y;
+      nearestPoint = closestPoint;
+      nearestNormal = distanceInfo.zw;
+      nearestSideMultiplicity = sideStep;
+    } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
+      float normalAlignment = dot(distanceInfo.zw, nearestNormal);
+      bool bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
+        nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
+      bool sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
+        abs(normalAlignment) >= 0.9999;
+      if (sameEdge) {
+        nearestSideMultiplicity += sideStep;
+        minDistance = min(minDistance, distanceInfo.x);
+      } else if (distanceInfo.x < minDistance) {
+        minDistance = distanceInfo.x;
+        nearestT = distanceInfo.y;
+        nearestPoint = closestPoint;
+        nearestNormal = distanceInfo.zw;
+        nearestSideMultiplicity = sideStep;
+      }
     }
   }
 
-  bool insideWinding = winding != 0;
-  bool inside = insideWinding;
+  bool inside = winding != 0;
+  int acrossWinding = winding - nearestSideMultiplicity;
+  bool nearestSeparatesFill = inside != (acrossWinding != 0);
   float signedDistance = inside ? -minDistance : minDistance;
-
-  float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-  float localPerPixel = max(pixelToLocalX, pixelToLocalY);
-
-  float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
-  float alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  float edgeAlpha = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  // Nonzero fill stays opaque across overlap-only contour edges. Coincident
+  // exterior edges are grouped above and antialiased as one true boundary.
+  float alphaBase = nearestSeparatesFill ? edgeAlpha : (inside ? 1.0 : 0.0);
   float alpha = heprThreeLinearCoverageToOutputAlpha(alphaBase) * vColorAlpha;
   if (alpha <= 0.001) {
     discard;

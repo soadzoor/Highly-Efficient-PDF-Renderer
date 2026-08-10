@@ -111,19 +111,22 @@ fn heprTextClipPosition(
 `);
 
 const distanceToLineSegmentFn = TSL.wgslFn(`
-fn heprDistanceToLineSegment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+fn heprLineDistanceInfo(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> vec4<f32> {
   let ab = b - a;
   let abLenSq = dot(ab, ab);
   if (abLenSq <= 0.0000000001) {
-    return length(p - a);
+    return vec4<f32>(length(p - a), 0.0, 1.0, 0.0);
   }
   let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
+  let offset = p - (a + ab * t);
+  let tangent = ab * inverseSqrt(abLenSq);
+  let leftNormal = vec2<f32>(-tangent.y, tangent.x);
+  return vec4<f32>(length(offset), t, leftNormal);
 }
 `);
 
 const distanceToQuadraticBezierFn = TSL.wgslFn(`
-fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> f32 {
+fn heprQuadraticDistanceInfo(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> vec4<f32> {
   let aa = b - a;
   let bb = a - 2.0 * b + c;
   let cc = aa * 2.0;
@@ -131,7 +134,7 @@ fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: ve
 
   let bbLenSq = dot(bb, bb);
   if (bbLenSq <= 0.000000000001) {
-    return heprDistanceToLineSegment(p, a, c);
+    return heprLineDistanceInfo(p, a, c);
   }
 
   let inv = 1.0 / bbLenSq;
@@ -143,6 +146,7 @@ fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: ve
   let qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
   let hValue = qValue * qValue + 4.0 * pCube;
   var best = 100000000000000000000.0;
+  var closestT = 0.0;
 
   if (hValue >= 0.0) {
     let hSqrt = sqrt(hValue);
@@ -151,6 +155,7 @@ fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: ve
     let t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
     let delta = dd + (cc + bb * t) * t;
     best = dot(delta, delta);
+    closestT = t;
   } else {
     let z = sqrt(-pValue);
     let acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
@@ -164,13 +169,36 @@ fn heprDistanceToQuadraticBezier(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: ve
     );
 
     var delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
+    best = dot(delta, delta);
+    closestT = t.x;
     delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
+    var candidate = dot(delta, delta);
+    if (candidate < best) {
+      best = candidate;
+      closestT = t.y;
+    }
     delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
+    candidate = dot(delta, delta);
+    if (candidate < best) {
+      best = candidate;
+      closestT = t.z;
+    }
   }
-  return sqrt(max(best, 0.0));
+
+  let oneMinusT = 1.0 - closestT;
+  let closestPoint = oneMinusT * oneMinusT * a +
+    2.0 * oneMinusT * closestT * b + closestT * closestT * c;
+  var tangent = 2.0 * (oneMinusT * (b - a) + closestT * (c - b));
+  var tangentLenSq = dot(tangent, tangent);
+  if (tangentLenSq <= 0.000000000001) {
+    tangent = c - a;
+    tangentLenSq = dot(tangent, tangent);
+  }
+  var leftNormal = vec2<f32>(1.0, 0.0);
+  if (tangentLenSq > 0.000000000001) {
+    leftNormal = vec2<f32>(-tangent.y, tangent.x) * inverseSqrt(tangentLenSq);
+  }
+  return vec4<f32>(sqrt(max(best, 0.0)), closestT, leftNormal);
 }
 `, [includeNode(distanceToLineSegmentFn)]);
 
@@ -195,19 +223,52 @@ fn heprLineWindingDelta(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> i32 {
   return 0;
 }
 
-fn heprEvaluateQuadratic(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, t: f32) -> vec2<f32> {
-  let oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
+fn heprQuadraticCrossingRootDelta(
+  a: vec2<f32>,
+  b: vec2<f32>,
+  c: vec2<f32>,
+  p: vec2<f32>,
+  ay: f32,
+  by: f32,
+  t: f32
+) -> i32 {
+  if (t < -0.00001 || t >= 0.99999) {
+    return 0;
+  }
+  let tc = clamp(t, 0.0, 1.0);
+  let oneMinusT = 1.0 - tc;
+  let xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
+  if (xCross <= p.x) {
+    return 0;
+  }
+  let dy = by + 2.0 * ay * tc;
+  if (abs(dy) <= 0.000001) {
+    return 0;
+  }
+  return select(-1, 1, dy > 0.0);
 }
 
 fn heprQuadraticWindingDelta(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>) -> i32 {
-  var delta = 0;
-  var prev = a;
-  for (var i = 1; i <= 6; i = i + 1) {
-    let t = f32(i) / 6.0;
-    let next = heprEvaluateQuadratic(a, b, c, t);
-    delta = delta + heprLineWindingDelta(prev, next, p);
-    prev = next;
+  let ay = a.y - 2.0 * b.y + c.y;
+  let by = 2.0 * (b.y - a.y);
+  let cy = a.y - p.y;
+  if (abs(ay) <= 0.00000001) {
+    if (abs(by) <= 0.00000001) {
+      return 0;
+    }
+    return heprQuadraticCrossingRootDelta(a, b, c, p, ay, by, -cy / by);
+  }
+  let discriminant = by * by - 4.0 * ay * cy;
+  if (discriminant < 0.0) {
+    return 0;
+  }
+  let sqrtDiscriminant = sqrt(max(discriminant, 0.0));
+  let invDen = 0.5 / ay;
+  let t0 = (-by - sqrtDiscriminant) * invDen;
+  let t1 = (-by + sqrtDiscriminant) * invDen;
+  var delta = heprQuadraticCrossingRootDelta(a, b, c, p, ay, by, t0);
+  if (abs(t1 - t0) > 0.00001) {
+    delta = delta + heprQuadraticCrossingRootDelta(a, b, c, p, ay, by, t1);
   }
   return delta;
 }
@@ -225,13 +286,28 @@ fn heprTextFragment(
   textCurveEnabled: f32,
   vectorOverride: vec4<f32>
 ) -> vec4<f32> {
+  let localDx = dpdx(local);
+  let localDy = dpdy(local);
+  let pixelToLocalX = length(vec2<f32>(localDx.x, localDy.x));
+  let pixelToLocalY = length(vec2<f32>(localDx.y, localDy.y));
+  let localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  let baseAAWidth = max(localPerPixel * textAAScreenPx, 0.0001);
+
   let segmentStart = i32(glyphMetaA.x + 0.5);
   let segmentCount = i32(glyphMetaA.y + 0.5);
   if (segmentCount <= 0 || instanceColor.a <= 0.001) {
     discard;
   }
 
+  let coincidentEpsilon = max(baseAAWidth * 0.0001, 0.0000001);
+
+  // A tiny deterministic offset keeps exact-on-edge winding tests stable.
+  let queryLocal = local + 0.001 * (localDx + 0.37 * localDy);
   var minDistance = 100000000000000000000.0;
+  var nearestT = 0.0;
+  var nearestPoint = vec2<f32>(0.0);
+  var nearestNormal = vec2<f32>(1.0, 0.0);
+  var nearestSideMultiplicity = 0;
   var winding = 0;
   let safeWidth = max(i32(segmentTexWidth), 1);
 
@@ -249,22 +325,55 @@ fn heprTextFragment(
     let p2 = primitiveB.xy;
     let primitiveType = primitiveB.z;
 
+    var distanceInfo: vec4<f32>;
+    var closestPoint: vec2<f32>;
     if (textCurveEnabled >= 0.5 && primitiveType >= 1.0) {
-      minDistance = min(minDistance, heprDistanceToQuadraticBezier(local, p0, p1, p2));
-      winding = winding + heprQuadraticWindingDelta(p0, p1, p2, local);
+      distanceInfo = heprQuadraticDistanceInfo(queryLocal, p0, p1, p2);
+      let oneMinusT = 1.0 - distanceInfo.y;
+      closestPoint = oneMinusT * oneMinusT * p0 +
+        2.0 * oneMinusT * distanceInfo.y * p1 + distanceInfo.y * distanceInfo.y * p2;
+      winding = winding + heprQuadraticWindingDelta(p0, p1, p2, queryLocal);
     } else {
-      minDistance = min(minDistance, heprDistanceToLineSegment(local, p0, p2));
-      winding = winding + heprLineWindingDelta(p0, p2, local);
+      distanceInfo = heprLineDistanceInfo(queryLocal, p0, p2);
+      closestPoint = mix(p0, p2, distanceInfo.y);
+      winding = winding + heprLineWindingDelta(p0, p2, queryLocal);
+    }
+
+    let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
+    let sideStep = select(-1, 1, signedOffset >= 0.0);
+    if (distanceInfo.x + coincidentEpsilon < minDistance) {
+      minDistance = distanceInfo.x;
+      nearestT = distanceInfo.y;
+      nearestPoint = closestPoint;
+      nearestNormal = distanceInfo.zw;
+      nearestSideMultiplicity = sideStep;
+    } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
+      let normalAlignment = dot(distanceInfo.zw, nearestNormal);
+      let bothInterior = distanceInfo.y > 0.0001 && distanceInfo.y < 0.9999 &&
+        nearestT > 0.0001 && nearestT < 0.9999;
+      let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
+        abs(normalAlignment) >= 0.9999;
+      if (sameEdge) {
+        nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
+        minDistance = min(minDistance, distanceInfo.x);
+      } else if (distanceInfo.x < minDistance) {
+        minDistance = distanceInfo.x;
+        nearestT = distanceInfo.y;
+        nearestPoint = closestPoint;
+        nearestNormal = distanceInfo.zw;
+        nearestSideMultiplicity = sideStep;
+      }
     }
   }
 
   let inside = winding != 0;
+  let acrossWinding = winding - nearestSideMultiplicity;
+  let nearestSeparatesFill = inside != (acrossWinding != 0);
   let signedDistance = select(minDistance, -minDistance, inside);
-  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
-  let localPerPixel = max(pixelToLocalX, pixelToLocalY);
-  let baseAAWidth = max(localPerPixel * textAAScreenPx, 0.0001);
-  let alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  let edgeAlpha = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  // Nonzero fill stays opaque across overlap-only contour edges. Coincident
+  // exterior edges are grouped above and antialiased as one true boundary.
+  let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
   let alpha = alphaBase * instanceColor.a;
   if (alpha <= 0.001) {
     discard;

@@ -577,7 +577,6 @@ ${WGSL_OUTPUT_COLOR_HELPERS}
 
 const MAX_GLYPH_PRIMITIVES : i32 = 256;
 const TEXT_PRIMITIVE_QUADRATIC : f32 = 1.0;
-const QUAD_WINDING_SUBDIVISIONS : i32 = 6;
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
   switch (vertexIndex) {
@@ -600,17 +599,20 @@ fn coordFromIndex(index : i32, width : i32) -> vec2<i32> {
   return vec2<i32>(index % width, index / width);
 }
 
-fn distanceToLineSegment(p : vec2f, a : vec2f, b : vec2f) -> f32 {
+fn textLineDistanceInfo(p : vec2f, a : vec2f, b : vec2f) -> vec4f {
   let ab = b - a;
   let abLenSq = dot(ab, ab);
   if (abLenSq <= 1e-10) {
-    return length(p - a);
+    return vec4f(length(p - a), 0.0, 1.0, 0.0);
   }
   let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
+  let offset = p - (a + ab * t);
+  let tangent = ab * inverseSqrt(abLenSq);
+  let leftNormal = vec2f(-tangent.y, tangent.x);
+  return vec4f(length(offset), t, leftNormal);
 }
 
-fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 {
+fn textQuadraticDistanceInfo(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> vec4f {
   let aa = b - a;
   let bb = a - 2.0 * b + c;
   let cc = aa * 2.0;
@@ -618,7 +620,7 @@ fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 
 
   let bbLenSq = dot(bb, bb);
   if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
+    return textLineDistanceInfo(p, a, c);
   }
 
   let inv = 1.0 / bbLenSq;
@@ -632,13 +634,14 @@ fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 
   let hValue = qValue * qValue + 4.0 * pCube;
 
   var best = 1e20;
+  var closestT = 0.0;
 
   if (hValue >= 0.0) {
     let hSqrt = sqrt(hValue);
     let roots = (vec2f(hSqrt, -hSqrt) - qValue) * 0.5;
     let uv = sign(roots) * pow(abs(roots), vec2f(1.0 / 3.0));
-    let t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    let delta = dd + (cc + bb * t) * t;
+    closestT = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    let delta = dd + (cc + bb * closestT) * closestT;
     best = dot(delta, delta);
   } else {
     let z = sqrt(-pValue);
@@ -649,14 +652,34 @@ fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 
     let t = clamp(vec3f(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, vec3f(0.0), vec3f(1.0));
 
     var delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
+    best = dot(delta, delta);
+    closestT = t.x;
     delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
+    var candidate = dot(delta, delta);
+    if (candidate < best) {
+      best = candidate;
+      closestT = t.y;
+    }
     delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
+    candidate = dot(delta, delta);
+    if (candidate < best) {
+      best = candidate;
+      closestT = t.z;
+    }
   }
 
-  return sqrt(max(best, 0.0));
+  let closestPoint = evaluateQuadratic(a, b, c, closestT);
+  var tangent = 2.0 * ((1.0 - closestT) * (b - a) + closestT * (c - b));
+  var tangentLenSq = dot(tangent, tangent);
+  if (tangentLenSq <= 1e-12) {
+    tangent = c - a;
+    tangentLenSq = dot(tangent, tangent);
+  }
+  var leftNormal = vec2f(1.0, 0.0);
+  if (tangentLenSq > 1e-12) {
+    leftNormal = vec2f(-tangent.y, tangent.x) * inverseSqrt(tangentLenSq);
+  }
+  return vec4f(sqrt(max(best, 0.0)), closestT, leftNormal);
 }
 
 fn evaluateQuadratic(a : vec2f, b : vec2f, c : vec2f, t : f32) -> vec2f {
@@ -800,8 +823,10 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  let pixelToLocalX = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
-  let pixelToLocalY = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
+  let localDx = dpdx(inData.local);
+  let localDy = dpdy(inData.local);
+  let pixelToLocalX = length(vec2f(localDx.x, localDy.x));
+  let pixelToLocalY = length(vec2f(localDx.y, localDy.y));
   let localPerPixel = max(pixelToLocalX, pixelToLocalY);
   let baseAAWidth = max(localPerPixel * uCamera.textAAScreenPx, 1e-4);
   let atlasDims = vec2f(textureDimensions(uTextRasterAtlasTex));
@@ -849,7 +874,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
   let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
 
+  let coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
+  // A tiny deterministic offset keeps exact-on-edge winding tests stable.
+  let queryLocal = inData.local + 0.001 * (localDx + 0.37 * localDy);
   var minDistance = 1e20;
+  var nearestT = 0.0;
+  var nearestPoint = vec2f(0.0);
+  var nearestNormal = vec2f(1.0, 0.0);
+  var nearestSideMultiplicity = 0;
   var winding = 0;
 
   for (var i = 0; i < MAX_GLYPH_PRIMITIVES; i = i + 1) {
@@ -867,18 +899,53 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     let p2 = primitiveB.xy;
     let primitiveType = primitiveB.z;
 
+    var distanceInfo : vec4f;
+    var closestPoint : vec2f;
     if (uCamera.textCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
-      minDistance = min(minDistance, distanceToQuadraticBezier(inData.local, p0, p1, p2));
-      accumulateQuadraticCrossing(p0, p1, p2, inData.local, &winding);
+      distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
+      closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
+      accumulateQuadraticCrossing(p0, p1, p2, queryLocal, &winding);
     } else {
-      minDistance = min(minDistance, distanceToLineSegment(inData.local, p0, p2));
-      accumulateLineCrossing(p0, p2, inData.local, &winding);
+      distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
+      closestPoint = mix(p0, p2, distanceInfo.y);
+      accumulateLineCrossing(p0, p2, queryLocal, &winding);
+    }
+
+    let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
+    let sideStep = select(-1, 1, signedOffset >= 0.0);
+    if (distanceInfo.x + coincidentEpsilon < minDistance) {
+      minDistance = distanceInfo.x;
+      nearestT = distanceInfo.y;
+      nearestPoint = closestPoint;
+      nearestNormal = distanceInfo.zw;
+      nearestSideMultiplicity = sideStep;
+    } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
+      let normalAlignment = dot(distanceInfo.zw, nearestNormal);
+      let bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
+        nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
+      let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
+        abs(normalAlignment) >= 0.9999;
+      if (sameEdge) {
+        nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
+        minDistance = min(minDistance, distanceInfo.x);
+      } else if (distanceInfo.x < minDistance) {
+        minDistance = distanceInfo.x;
+        nearestT = distanceInfo.y;
+        nearestPoint = closestPoint;
+        nearestNormal = distanceInfo.zw;
+        nearestSideMultiplicity = sideStep;
+      }
     }
   }
 
   let inside = winding != 0;
+  let acrossWinding = winding - nearestSideMultiplicity;
+  let nearestSeparatesFill = inside != (acrossWinding != 0);
   let signedDistance = select(minDistance, -minDistance, inside);
-  let alphaBase = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  let edgeAlpha = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  // Nonzero fill stays opaque across overlap-only contour edges. Coincident
+  // exterior edges are grouped above and antialiased as one true boundary.
+  let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
   let alpha = heprLinearCoverageToOutputAlpha(alphaBase) * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
