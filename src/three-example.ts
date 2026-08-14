@@ -1397,8 +1397,12 @@ function updateDrawStatsMeter(): void {
     : nativeDrawStats?.usedCulling
       ? "culled"
       : "full";
+  const textStats = currentPdfObject.getTextInstanceStats();
+  const textPart = textStats && textStats.total > 0
+    ? ` | ${textStats.rendered.toLocaleString()}/${textStats.total.toLocaleString()} glyphs`
+    : "";
   setDrawStatsText(
-    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments | mode: ${mode}`
+    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments${textPart} | mode: ${mode}`
   );
 }
 

@@ -875,6 +875,10 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
 
   let coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
+  // Outside the antialiasing band the smoothstep below saturates, so the winding
+  // number alone decides the pixel and exact distances stop mattering. The small
+  // margin keeps coincident-edge grouping from losing a tie candidate.
+  let aaCullDistance = baseAAWidth * 1.05 + coincidentEpsilon;
   // A tiny deterministic offset keeps exact-on-edge winding tests stable.
   let queryLocal = inData.local + 0.001 * (localDx + 0.37 * localDy);
   var minDistance = 1e20;
@@ -898,42 +902,73 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     let p1 = primitiveA.zw;
     let p2 = primitiveB.xy;
     let primitiveType = primitiveB.z;
+    let isQuadratic = uCamera.textCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC;
 
-    var distanceInfo : vec4f;
-    var closestPoint : vec2f;
-    if (uCamera.textCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
-      distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
-      closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
-      accumulateQuadraticCrossing(p0, p1, p2, queryLocal, &winding);
-    } else {
-      distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
-      closestPoint = mix(p0, p2, distanceInfo.y);
-      accumulateLineCrossing(p0, p2, queryLocal, &winding);
+    // A quadratic stays inside the hull of its control points, so this box
+    // contains the primitive for both curve and line cases.
+    var hullMin = min(p0, p2);
+    var hullMax = max(p0, p2);
+    if (isQuadratic) {
+      hullMin = min(hullMin, p1);
+      hullMax = max(hullMax, p1);
     }
 
-    let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
-    let sideStep = select(-1, 1, signedOffset >= 0.0);
-    if (distanceInfo.x + coincidentEpsilon < minDistance) {
-      minDistance = distanceInfo.x;
-      nearestT = distanceInfo.y;
-      nearestPoint = closestPoint;
-      nearestNormal = distanceInfo.zw;
-      nearestSideMultiplicity = sideStep;
-    } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
-      let normalAlignment = dot(distanceInfo.zw, nearestNormal);
-      let bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
-        nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
-      let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
-        abs(normalAlignment) >= 0.9999;
-      if (sameEdge) {
-        nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
-        minDistance = min(minDistance, distanceInfo.x);
-      } else if (distanceInfo.x < minDistance) {
+    // The ray used for the winding test travels along +x, so it can only cross
+    // this primitive within the box's y span and to the right of the query point.
+    let mayCross = queryLocal.y >= hullMin.y && queryLocal.y <= hullMax.y && hullMax.x > queryLocal.x;
+
+    // Distance to the box lower-bounds the distance to the primitive inside it.
+    let boundOffset = max(max(hullMin - queryLocal, queryLocal - hullMax), vec2f(0.0));
+    let cullDistance = min(aaCullDistance, minDistance + coincidentEpsilon);
+    let mayBeNearest = dot(boundOffset, boundOffset) <= cullDistance * cullDistance;
+
+    if (!mayCross && !mayBeNearest) {
+      continue;
+    }
+
+    if (mayBeNearest) {
+      var distanceInfo : vec4f;
+      var closestPoint : vec2f;
+      if (isQuadratic) {
+        distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
+        closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
+      } else {
+        distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
+        closestPoint = mix(p0, p2, distanceInfo.y);
+      }
+
+      let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
+      let sideStep = select(-1, 1, signedOffset >= 0.0);
+      if (distanceInfo.x + coincidentEpsilon < minDistance) {
         minDistance = distanceInfo.x;
         nearestT = distanceInfo.y;
         nearestPoint = closestPoint;
         nearestNormal = distanceInfo.zw;
         nearestSideMultiplicity = sideStep;
+      } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
+        let normalAlignment = dot(distanceInfo.zw, nearestNormal);
+        let bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
+          nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
+        let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
+          abs(normalAlignment) >= 0.9999;
+        if (sameEdge) {
+          nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
+          minDistance = min(minDistance, distanceInfo.x);
+        } else if (distanceInfo.x < minDistance) {
+          minDistance = distanceInfo.x;
+          nearestT = distanceInfo.y;
+          nearestPoint = closestPoint;
+          nearestNormal = distanceInfo.zw;
+          nearestSideMultiplicity = sideStep;
+        }
+      }
+    }
+
+    if (mayCross) {
+      if (isQuadratic) {
+        accumulateQuadraticCrossing(p0, p1, p2, queryLocal, &winding);
+      } else {
+        accumulateLineCrossing(p0, p2, queryLocal, &winding);
       }
     }
   }

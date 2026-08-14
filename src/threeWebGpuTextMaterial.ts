@@ -22,8 +22,11 @@ interface ThreeWebGpuTextMaterialOptions {
   textInstanceTextureC: THREE.DataTexture;
   textGlyphMetaTextureA: THREE.DataTexture;
   textGlyphMetaTextureB: THREE.DataTexture;
+  textGlyphRasterMetaTexture: THREE.DataTexture;
   textGlyphSegmentTextureA: THREE.DataTexture;
   textGlyphSegmentTextureB: THREE.DataTexture;
+  textRasterAtlasTexture: THREE.DataTexture;
+  textRasterAtlasSize: THREE.Vector2;
   textInstanceTextureWidth: number;
   textGlyphTextureWidth: number;
   textSegmentTextureWidth: number;
@@ -50,6 +53,20 @@ function callNode(fn: unknown, params: Record<string, unknown>): never {
 
 function varyingNode(node: unknown): never {
   return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
+}
+
+/**
+ * Sample the glyph coverage atlas at an explicit mip level.
+ *
+ * `wgslFn` parameters cannot carry a sampler, so the filtered taps happen here
+ * as TSL nodes and only the resulting coverage is handed to the shader code.
+ */
+function sampleRasterAtlasCoverage(texture: THREE.Texture, uv: unknown, level: unknown): never {
+  const textureNode = (TSL.texture as unknown as (
+    value: THREE.Texture,
+    uv: unknown
+  ) => { level: (level: unknown) => { r: unknown } })(texture, uv);
+  return textureNode.level(level).r as never;
 }
 
 const coordFromIndexFn = TSL.wgslFn(`
@@ -107,6 +124,57 @@ fn heprTextClipPosition(
   let screen = (world - cameraCenter) * zoom + 0.5 * safeViewport;
   let clip = (screen / (0.5 * safeViewport)) - vec2<f32>(1.0);
   return vec4<f32>(clip, 0.0, 1.0);
+}
+`);
+
+const textNormCoordFn = TSL.wgslFn(`
+fn heprTextNormCoord(local: vec2<f32>, glyphMetaA: vec4<f32>, glyphMetaB: vec4<f32>) -> vec2<f32> {
+  let minBounds = glyphMetaA.zw;
+  let maxBounds = glyphMetaB.xy;
+  let span = max(maxBounds - minBounds, vec2<f32>(0.000001));
+  return clamp((local - minBounds) / span, vec2<f32>(0.0), vec2<f32>(1.0));
+}
+`);
+
+const textRasterAtlasPixelsFn = TSL.wgslFn(`
+fn heprTextRasterAtlasPixels(
+  normCoord: vec2<f32>,
+  rasterRect: vec4<f32>,
+  atlasSize: vec2<f32>
+) -> vec2<f32> {
+  let dims = max(atlasSize, vec2<f32>(1.0));
+  return vec2<f32>(normCoord.x, 1.0 - normCoord.y) * (rasterRect.zw * dims);
+}
+`);
+
+const textRasterAtlasLodFn = TSL.wgslFn(`
+fn heprTextRasterAtlasLod(atlasPixels: vec2<f32>) -> f32 {
+  let mipBias = -1.25;
+  let footprint = max(max(fwidth(atlasPixels.x), fwidth(atlasPixels.y)), 0.000001);
+  return max(log2(footprint) + mipBias, 0.0);
+}
+`);
+
+const textRasterAtlasTapUvFn = TSL.wgslFn(`
+fn heprTextRasterAtlasTapUv(
+  normCoord: vec2<f32>,
+  atlasPixels: vec2<f32>,
+  rasterRect: vec4<f32>,
+  atlasSize: vec2<f32>,
+  offsetX: f32,
+  offsetY: f32
+) -> vec2<f32> {
+  let dims = max(atlasSize, vec2<f32>(1.0));
+  let texel = 1.0 / dims;
+  let uvCenter = vec2<f32>(
+    rasterRect.x + normCoord.x * rasterRect.z,
+    rasterRect.y + (1.0 - normCoord.y) * rasterRect.w
+  );
+  let uvMin = rasterRect.xy + texel * 0.5;
+  let uvMax = rasterRect.xy + rasterRect.zw - texel * 0.5;
+  let dx = dpdx(atlasPixels) * 0.33 * texel;
+  let dy = dpdy(atlasPixels) * 0.33 * texel;
+  return clamp(uvCenter + dx * offsetX + dy * offsetY, uvMin, uvMax);
 }
 `);
 
@@ -279,6 +347,15 @@ fn heprTextFragment(
   local: vec2<f32>,
   glyphMetaA: vec4<f32>,
   instanceColor: vec4<f32>,
+  normCoord: vec2<f32>,
+  atlasPixels: vec2<f32>,
+  rasterRect: vec4<f32>,
+  rasterCenterTap: f32,
+  rasterTapNegNeg: f32,
+  rasterTapNegPos: f32,
+  rasterTapPosNeg: f32,
+  rasterTapPosPos: f32,
+  vectorOnly: f32,
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
@@ -292,6 +369,9 @@ fn heprTextFragment(
   let pixelToLocalY = length(vec2<f32>(localDx.y, localDy.y));
   let localPerPixel = max(pixelToLocalX, pixelToLocalY);
   let baseAAWidth = max(localPerPixel * textAAScreenPx, 0.0001);
+  // Derivatives must be taken before any discard, so the atlas footprint is
+  // measured here even when the vector path ends up handling the pixel.
+  let atlasFootprint = min(fwidth(atlasPixels.x), fwidth(atlasPixels.y));
 
   let segmentStart = i32(glyphMetaA.x + 0.5);
   let segmentCount = i32(glyphMetaA.y + 0.5);
@@ -299,7 +379,27 @@ fn heprTextFragment(
     discard;
   }
 
+  let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
+  let tintedColor = instanceColor.rgb * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
+
+  // Once a glyph is minified past roughly two atlas texels per pixel, the
+  // mipmapped coverage atlas is both cheaper and less aliased than evaluating
+  // the outline per pixel.
+  if (vectorOnly < 0.5 && rasterRect.z > 0.0 && rasterRect.w > 0.0 && atlasFootprint > 2.0) {
+    let rasterCoverage = (1.0 / 3.0) * rasterCenterTap +
+      (1.0 / 6.0) * (rasterTapNegNeg + rasterTapNegPos + rasterTapPosNeg + rasterTapPosPos);
+    let rasterAlpha = clamp(rasterCoverage, 0.0, 1.0) * instanceColor.a;
+    if (rasterAlpha <= 0.001) {
+      discard;
+    }
+    return vec4<f32>(heprThreeOutputSrgbToLinear(tintedColor), rasterAlpha);
+  }
+
   let coincidentEpsilon = max(baseAAWidth * 0.0001, 0.0000001);
+  // Outside the antialiasing band the smoothstep below saturates, so the winding
+  // number alone decides the pixel and exact distances stop mattering. The small
+  // margin keeps coincident-edge grouping from losing a tie candidate.
+  let aaCullDistance = baseAAWidth * 1.05 + coincidentEpsilon;
 
   // A tiny deterministic offset keeps exact-on-edge winding tests stable.
   let queryLocal = local + 0.001 * (localDx + 0.37 * localDy);
@@ -324,44 +424,75 @@ fn heprTextFragment(
     let p1 = primitiveA.zw;
     let p2 = primitiveB.xy;
     let primitiveType = primitiveB.z;
+    let isQuadratic = textCurveEnabled >= 0.5 && primitiveType >= 1.0;
 
-    var distanceInfo: vec4<f32>;
-    var closestPoint: vec2<f32>;
-    if (textCurveEnabled >= 0.5 && primitiveType >= 1.0) {
-      distanceInfo = heprQuadraticDistanceInfo(queryLocal, p0, p1, p2);
-      let oneMinusT = 1.0 - distanceInfo.y;
-      closestPoint = oneMinusT * oneMinusT * p0 +
-        2.0 * oneMinusT * distanceInfo.y * p1 + distanceInfo.y * distanceInfo.y * p2;
-      winding = winding + heprQuadraticWindingDelta(p0, p1, p2, queryLocal);
-    } else {
-      distanceInfo = heprLineDistanceInfo(queryLocal, p0, p2);
-      closestPoint = mix(p0, p2, distanceInfo.y);
-      winding = winding + heprLineWindingDelta(p0, p2, queryLocal);
+    // A quadratic stays inside the hull of its control points, so this box
+    // contains the primitive for both curve and line cases.
+    var hullMin = min(p0, p2);
+    var hullMax = max(p0, p2);
+    if (isQuadratic) {
+      hullMin = min(hullMin, p1);
+      hullMax = max(hullMax, p1);
     }
 
-    let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
-    let sideStep = select(-1, 1, signedOffset >= 0.0);
-    if (distanceInfo.x + coincidentEpsilon < minDistance) {
-      minDistance = distanceInfo.x;
-      nearestT = distanceInfo.y;
-      nearestPoint = closestPoint;
-      nearestNormal = distanceInfo.zw;
-      nearestSideMultiplicity = sideStep;
-    } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
-      let normalAlignment = dot(distanceInfo.zw, nearestNormal);
-      let bothInterior = distanceInfo.y > 0.0001 && distanceInfo.y < 0.9999 &&
-        nearestT > 0.0001 && nearestT < 0.9999;
-      let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
-        abs(normalAlignment) >= 0.9999;
-      if (sameEdge) {
-        nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
-        minDistance = min(minDistance, distanceInfo.x);
-      } else if (distanceInfo.x < minDistance) {
+    // The ray used for the winding test travels along +x, so it can only cross
+    // this primitive within the box's y span and to the right of the query point.
+    let mayCross = queryLocal.y >= hullMin.y && queryLocal.y <= hullMax.y && hullMax.x > queryLocal.x;
+
+    // Distance to the box lower-bounds the distance to the primitive inside it.
+    let boundOffset = max(max(hullMin - queryLocal, queryLocal - hullMax), vec2<f32>(0.0));
+    let cullDistance = min(aaCullDistance, minDistance + coincidentEpsilon);
+    let mayBeNearest = dot(boundOffset, boundOffset) <= cullDistance * cullDistance;
+
+    if (!mayCross && !mayBeNearest) {
+      continue;
+    }
+
+    if (mayBeNearest) {
+      var distanceInfo: vec4<f32>;
+      var closestPoint: vec2<f32>;
+      if (isQuadratic) {
+        distanceInfo = heprQuadraticDistanceInfo(queryLocal, p0, p1, p2);
+        let oneMinusT = 1.0 - distanceInfo.y;
+        closestPoint = oneMinusT * oneMinusT * p0 +
+          2.0 * oneMinusT * distanceInfo.y * p1 + distanceInfo.y * distanceInfo.y * p2;
+      } else {
+        distanceInfo = heprLineDistanceInfo(queryLocal, p0, p2);
+        closestPoint = mix(p0, p2, distanceInfo.y);
+      }
+
+      let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
+      let sideStep = select(-1, 1, signedOffset >= 0.0);
+      if (distanceInfo.x + coincidentEpsilon < minDistance) {
         minDistance = distanceInfo.x;
         nearestT = distanceInfo.y;
         nearestPoint = closestPoint;
         nearestNormal = distanceInfo.zw;
         nearestSideMultiplicity = sideStep;
+      } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
+        let normalAlignment = dot(distanceInfo.zw, nearestNormal);
+        let bothInterior = distanceInfo.y > 0.0001 && distanceInfo.y < 0.9999 &&
+          nearestT > 0.0001 && nearestT < 0.9999;
+        let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
+          abs(normalAlignment) >= 0.9999;
+        if (sameEdge) {
+          nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
+          minDistance = min(minDistance, distanceInfo.x);
+        } else if (distanceInfo.x < minDistance) {
+          minDistance = distanceInfo.x;
+          nearestT = distanceInfo.y;
+          nearestPoint = closestPoint;
+          nearestNormal = distanceInfo.zw;
+          nearestSideMultiplicity = sideStep;
+        }
+      }
+    }
+
+    if (mayCross) {
+      if (isQuadratic) {
+        winding = winding + heprQuadraticWindingDelta(p0, p1, p2, queryLocal);
+      } else {
+        winding = winding + heprLineWindingDelta(p0, p2, queryLocal);
       }
     }
   }
@@ -379,9 +510,7 @@ fn heprTextFragment(
     discard;
   }
 
-  let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
-  let color = instanceColor.rgb * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
-  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
+  return vec4<f32>(heprThreeOutputSrgbToLinear(tintedColor), alpha);
 }
 `, [
   includeNode(threeWebGpuOutputSrgbToLinearFn),
@@ -427,6 +556,7 @@ export function createThreeWebGpuTextMaterial(
   });
   const glyphMetaA = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, glyphCoord, 0));
   const glyphMetaB = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0));
+  const rasterRect = varyingNode(TSL.textureLoad(options.textGlyphRasterMetaTexture, glyphCoord, 0));
   const vertexPack = varyingNode(callNode(textVertexPackFn, {
     corner,
     instanceA,
@@ -444,10 +574,45 @@ export function createThreeWebGpuTextMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: TSL.uniform(options.localToClip)
   });
+
+  const rasterAtlasSizeUniform = TSL.uniform(options.textRasterAtlasSize);
+  const normCoord = callNode(textNormCoordFn, {
+    local: vertexPackValue.zw,
+    glyphMetaA,
+    glyphMetaB
+  });
+  const atlasPixels = callNode(textRasterAtlasPixelsFn, {
+    normCoord,
+    rasterRect,
+    atlasSize: rasterAtlasSizeUniform
+  });
+  const rasterAtlasLod = callNode(textRasterAtlasLodFn, { atlasPixels });
+  const rasterTap = (offsetX: number, offsetY: number): never => sampleRasterAtlasCoverage(
+    options.textRasterAtlasTexture,
+    callNode(textRasterAtlasTapUvFn, {
+      normCoord,
+      atlasPixels,
+      rasterRect,
+      atlasSize: rasterAtlasSizeUniform,
+      offsetX: TSL.float(offsetX),
+      offsetY: TSL.float(offsetY)
+    }),
+    rasterAtlasLod
+  );
+
   material.fragmentNode = callNode(textFragmentFn, {
     local: vertexPackValue.zw,
     glyphMetaA,
     instanceColor,
+    normCoord,
+    atlasPixels,
+    rasterRect,
+    rasterCenterTap: rasterTap(0, 0),
+    rasterTapNegNeg: rasterTap(-1, -1),
+    rasterTapNegPos: rasterTap(-1, 1),
+    rasterTapPosNeg: rasterTap(1, -1),
+    rasterTapPosPos: rasterTap(1, 1),
+    vectorOnly: vectorOnlyUniform,
     segmentTexA: TSL.textureLoad(options.textGlyphSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.textGlyphSegmentTextureB),
     segmentTexWidth: segmentTextureWidthUniform,

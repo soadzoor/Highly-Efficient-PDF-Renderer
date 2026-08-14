@@ -578,6 +578,7 @@ uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
+uniform float uTextVectorOnly;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
@@ -602,7 +603,6 @@ void main() {
   int glyphIndex = int(instanceB.z + 0.5);
   vec4 glyphMetaA = texelFetch(uTextGlyphMetaTexA, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
   vec4 glyphMetaB = texelFetch(uTextGlyphMetaTexB, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
-  vec4 glyphRasterMeta = texelFetch(uTextGlyphRasterMetaTex, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
 
   int segmentCount = int(glyphMetaA.y + 0.5);
   if (segmentCount <= 0) {
@@ -615,6 +615,13 @@ void main() {
     vNormCoord = vec2(0.0);
     vLocal = vec2(0.0);
     return;
+  }
+
+  // The raster atlas rect is only read by the minified branch of the fragment
+  // shader, so vector-only rendering skips one of six fetches per vertex.
+  vec4 glyphRasterMeta = vec4(0.0);
+  if (uTextVectorOnly < 0.5) {
+    glyphRasterMeta = texelFetch(uTextGlyphRasterMetaTex, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
   }
 
   vec2 minBounds = glyphMetaA.zw;
@@ -885,6 +892,10 @@ void main() {
   }
 
   float coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
+  // Outside the antialiasing band the smoothstep below saturates, so the winding
+  // number alone decides the pixel and exact distances stop mattering. The small
+  // margin keeps coincident-edge grouping from losing a tie candidate.
+  float aaCullDistance = baseAAWidth * 1.05 + coincidentEpsilon;
 
   // A tiny deterministic offset keeps exact-on-edge winding tests stable.
   vec2 queryLocal = vLocal + 0.001 * (localDx + 0.37 * localDy);
@@ -906,42 +917,73 @@ void main() {
     vec2 p1 = primitiveA.zw;
     vec2 p2 = primitiveB.xy;
     float primitiveType = primitiveB.z;
+    bool isQuadratic = uTextCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC;
 
-    vec4 distanceInfo;
-    vec2 closestPoint;
-    if (uTextCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
-      distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
-      closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
-      accumulateQuadraticCrossing(p0, p1, p2, queryLocal, winding);
-    } else {
-      distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
-      closestPoint = mix(p0, p2, distanceInfo.y);
-      accumulateLineCrossing(p0, p2, queryLocal, winding);
+    // A quadratic stays inside the hull of its control points, so this box
+    // contains the primitive for both curve and line cases.
+    vec2 hullMin = min(p0, p2);
+    vec2 hullMax = max(p0, p2);
+    if (isQuadratic) {
+      hullMin = min(hullMin, p1);
+      hullMax = max(hullMax, p1);
     }
 
-    float signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
-    int sideStep = signedOffset >= 0.0 ? 1 : -1;
-    if (distanceInfo.x + coincidentEpsilon < minDistance) {
-      minDistance = distanceInfo.x;
-      nearestT = distanceInfo.y;
-      nearestPoint = closestPoint;
-      nearestNormal = distanceInfo.zw;
-      nearestSideMultiplicity = sideStep;
-    } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
-      float normalAlignment = dot(distanceInfo.zw, nearestNormal);
-      bool bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
-        nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
-      bool sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
-        abs(normalAlignment) >= 0.9999;
-      if (sameEdge) {
-        nearestSideMultiplicity += sideStep;
-        minDistance = min(minDistance, distanceInfo.x);
-      } else if (distanceInfo.x < minDistance) {
+    // The ray used for the winding test travels along +x, so it can only cross
+    // this primitive within the box's y span and to the right of the query point.
+    bool mayCross = queryLocal.y >= hullMin.y && queryLocal.y <= hullMax.y && hullMax.x > queryLocal.x;
+
+    // Distance to the box lower-bounds the distance to the primitive inside it.
+    vec2 boundOffset = max(max(hullMin - queryLocal, queryLocal - hullMax), vec2(0.0));
+    float cullDistance = min(aaCullDistance, minDistance + coincidentEpsilon);
+    bool mayBeNearest = dot(boundOffset, boundOffset) <= cullDistance * cullDistance;
+
+    if (!mayCross && !mayBeNearest) {
+      continue;
+    }
+
+    if (mayBeNearest) {
+      vec4 distanceInfo;
+      vec2 closestPoint;
+      if (isQuadratic) {
+        distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
+        closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
+      } else {
+        distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
+        closestPoint = mix(p0, p2, distanceInfo.y);
+      }
+
+      float signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
+      int sideStep = signedOffset >= 0.0 ? 1 : -1;
+      if (distanceInfo.x + coincidentEpsilon < minDistance) {
         minDistance = distanceInfo.x;
         nearestT = distanceInfo.y;
         nearestPoint = closestPoint;
         nearestNormal = distanceInfo.zw;
         nearestSideMultiplicity = sideStep;
+      } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
+        float normalAlignment = dot(distanceInfo.zw, nearestNormal);
+        bool bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
+          nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
+        bool sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
+          abs(normalAlignment) >= 0.9999;
+        if (sameEdge) {
+          nearestSideMultiplicity += sideStep;
+          minDistance = min(minDistance, distanceInfo.x);
+        } else if (distanceInfo.x < minDistance) {
+          minDistance = distanceInfo.x;
+          nearestT = distanceInfo.y;
+          nearestPoint = closestPoint;
+          nearestNormal = distanceInfo.zw;
+          nearestSideMultiplicity = sideStep;
+        }
+      }
+    }
+
+    if (mayCross) {
+      if (isQuadratic) {
+        accumulateQuadraticCrossing(p0, p1, p2, queryLocal, winding);
+      } else {
+        accumulateLineCrossing(p0, p2, queryLocal, winding);
       }
     }
   }

@@ -901,6 +901,21 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   /**
+   * Return the rendered and total text instance counts when the material text
+   * layer is active, or `null` when text is drawn by the native pipeline.
+   */
+  getTextInstanceStats(): { rendered: number; total: number } | null {
+    if (!this.textMaterialLayer.mesh.visible) {
+      return null;
+    }
+
+    return {
+      rendered: this.textMaterialLayer.getRenderedTextInstanceCount(),
+      total: this.textMaterialLayer.getTextInstanceCount()
+    };
+  }
+
+  /**
    * Return the most recent native renderer draw stats, or `null` before the
    * first native frame.
    */
@@ -1374,7 +1389,7 @@ export class HeprThreePdfObject extends THREE.Group {
         this.vectorLodStrokeLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
       if (this.textMaterialLayer.mesh.visible) {
-        this.textMaterialLayer.updateFrame(viewState, materialLayerViewport);
+        this.textMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
       this.lastSyncedFrameSerial = presentedFrameSerial;
       this.lastViewportWidth = nativeViewport.width;
