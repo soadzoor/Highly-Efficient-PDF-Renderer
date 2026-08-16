@@ -537,6 +537,13 @@
         </select>
       </div>
       <div class="number-row">
+        <label for="text-lod-select">Text LOD</label>
+        <select id="text-lod-select" aria-label="Text LOD mode">
+          <option value="auto" selected>Auto</option>
+          <option value="off">Off</option>
+        </select>
+      </div>
+      <div class="number-row">
         <label for="page-bg-color">Page Background</label>
         <div class="color-controls">
           <input id="page-bg-color" type="color" value="#ffffff" />
@@ -572,7 +579,7 @@
         <span id="visible-segments-value" class="meter-value">-</span>
       </div>
       <div class="row meter-row">
-        <span class="meter-label">Parse / Upload</span>
+        <span class="meter-label">Parse / Prepare</span>
         <span id="times-value" class="meter-value">-</span>
       </div>
       <div class="row meter-row">
@@ -586,6 +593,10 @@
       <div class="row meter-row">
         <span class="meter-label">Vector LOD</span>
         <span id="lod-stats-value" class="meter-value">-</span>
+      </div>
+      <div class="row meter-row">
+        <span class="meter-label">Text LOD</span>
+        <span id="text-lod-stats-value" class="meter-value">-</span>
       </div>
       </div>
     </div>

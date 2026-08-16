@@ -351,7 +351,9 @@ function createFillGeometry(fillPathIds: Float32Array, fillPathCount: number): T
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
 
   const fillPathIndexAttribute = new THREE.InstancedBufferAttribute(fillPathIds, 1);
-  fillPathIndexAttribute.setUsage(THREE.DynamicDrawUsage);
+  // Avoid Three's unconditional per-render upload for DynamicDrawUsage. The
+  // culling path explicitly marks this stream dirty whenever its IDs change.
+  fillPathIndexAttribute.setUsage(THREE.StreamDrawUsage);
   geometry.setAttribute("aFillPathIndex", fillPathIndexAttribute);
   geometry.instanceCount = Math.max(0, fillPathCount | 0);
 

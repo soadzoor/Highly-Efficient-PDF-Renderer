@@ -446,7 +446,9 @@ function createStrokeGeometry(segmentIds: Float32Array, segmentCount: number): T
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
 
   const segmentIndexAttribute = new THREE.InstancedBufferAttribute(segmentIds, 1);
-  segmentIndexAttribute.setUsage(THREE.DynamicDrawUsage);
+  // Avoid Three's unconditional per-render upload for DynamicDrawUsage. The
+  // culling path explicitly marks this stream dirty whenever its IDs change.
+  segmentIndexAttribute.setUsage(THREE.StreamDrawUsage);
   geometry.setAttribute("aSegmentIndex", segmentIndexAttribute);
   geometry.instanceCount = Math.max(0, segmentCount | 0);
 

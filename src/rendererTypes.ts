@@ -1,4 +1,5 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { TextLodMode, TextLodStats } from "./textLodCore";
 import type { DrawStats, ProjectedFrameOptions, SceneStats, SearchHighlightSet, ViewState } from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
@@ -14,6 +15,14 @@ export interface ViewStateUpdateOptions {
 
   /** Mark the update as part of an active pointer interaction. */
   interacting?: boolean;
+
+  /**
+   * Whether the renderer should schedule a frame of its own. Hosts that drive
+   * the camera but present through their own pipeline set this to false: the
+   * view state still has to stay current for hit testing and pipeline switches,
+   * but rendering it would draw a second copy of the document nobody sees.
+   */
+  scheduleFrame?: boolean;
 }
 
 /**
@@ -52,6 +61,9 @@ export interface RendererApi {
 
   /** Change Vector LOD mode. */
   setVectorLodMode?(mode: VectorLodMode): void;
+
+  /** Change clustered text LOD mode. */
+  setTextLodMode?(mode: TextLodMode): void;
 
   /** Enable or disable curve-aware stroke rendering. */
   setStrokeCurveEnabled(enabled: boolean): void;
@@ -93,6 +105,9 @@ export interface RendererApi {
 
   /** Return Vector LOD diagnostics, if active. */
   getVectorStrokeLodStats?(): VectorStrokeLodStats | null;
+
+  /** Return clustered text LOD diagnostics, if available. */
+  getTextLodStats?(): TextLodStats | null;
 
   /** Draw search-highlight rectangles as part of every rendered frame. */
   setSearchHighlights?(highlights: SearchHighlightSet | null): void;

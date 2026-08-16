@@ -15,6 +15,19 @@ import {
   GRADIENT_STROKE_VERTEX_SHADER_SOURCE
 } from "./nativeGradientWebGlShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import {
+  appendTextLodCombinedPayload,
+  TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+  type TextLodBuildData
+} from "./textGreekLod";
+import { createOrthographicLocalToClip } from "./planarProjection";
+import {
+  getCachedTextLod,
+  getOrBuildTextLod,
+  TextLodRuntime,
+  type TextLodMode,
+  type TextLodStats
+} from "./textLodCore";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
@@ -853,7 +866,9 @@ void main() {
   vec2 localDy = dFdy(vLocal);
   float pixelToLocalX = length(vec2(localDx.x, localDy.x));
   float pixelToLocalY = length(vec2(localDx.y, localDy.y));
-  float localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  // The Frobenius norm conservatively bounds stretch along every possible
+  // edge normal. Final coverage below uses the tighter directional width.
+  float localPerPixel = length(vec2(pixelToLocalX, pixelToLocalY));
   float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
 
   if (vSegmentCount <= 0) {
@@ -992,7 +1007,15 @@ void main() {
   int acrossWinding = winding - nearestSideMultiplicity;
   bool nearestSeparatesFill = inside != (acrossWinding != 0);
   float signedDistance = inside ? -minDistance : minDistance;
-  float edgeAlpha = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  // Use the screen-space derivative along the nearest edge normal for final
+  // coverage. baseAAWidth intentionally remains conservative above for
+  // primitive culling, while this directional width avoids widening tilted
+  // glyph edges into dark/grey bands.
+  float edgeAAWidth = max(
+    length(vec2(dot(localDx, nearestNormal), dot(localDy, nearestNormal))) * uTextAAScreenPx,
+    1e-4
+  );
+  float edgeAlpha = 1.0 - smoothstep(-edgeAAWidth, edgeAAWidth, signedDistance);
   // Nonzero fill stays opaque across overlap-only contour edges. Coincident
   // exterior edges are grouped above and antialiased as one true boundary.
   float alphaBase = nearestSeparatesFill ? edgeAlpha : (inside ? 1.0 : 0.0);
@@ -1192,6 +1215,7 @@ const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
 const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
+const VECTOR_MINIFY_MAX_TEXT_INSTANCES = 100_000;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
@@ -1337,6 +1361,14 @@ export interface ViewStateUpdateOptions {
 
   /** Whether the update occurs during an active interaction. */
   interacting?: boolean;
+
+  /**
+   * Whether the renderer should schedule a frame of its own. Hosts that drive
+   * the camera but present through their own pipeline set this to false: the
+   * view state still has to stay current for hit testing and pipeline switches,
+   * but rendering it would draw a second copy of the document nobody sees.
+   */
+  scheduleFrame?: boolean;
 }
 
 /** WebGL native renderer construction options. */
@@ -1422,6 +1454,9 @@ export class WebGlFloorplanRenderer {
   private readonly allFillPathIdBuffer: WebGLBuffer;
 
   private readonly allTextInstanceIdBuffer: WebGLBuffer;
+
+  /** Source-ordered exact/coarse selection used only while text LOD is active. */
+  private readonly selectedTextInstanceIdBuffer: WebGLBuffer;
 
   private readonly highlightOthersBuffer: WebGLBuffer;
 
@@ -1654,6 +1689,16 @@ export class WebGlFloorplanRenderer {
   private allFillPathIds = new Float32Array(0);
 
   private allTextInstanceIds = new Float32Array(0);
+
+  private textLodMode: TextLodMode = "auto";
+
+  private textLodRuntime: TextLodRuntime | null = null;
+
+  private textLodGpuActive = false;
+
+  private selectedTextInstanceIds = new Float32Array(0);
+
+  private selectedTextInstanceCount = 0;
 
   private segmentMarks = new Uint32Array(0);
 
@@ -1904,6 +1949,7 @@ export class WebGlFloorplanRenderer {
     this.visibleSegmentIdBuffer = this.mustCreateBuffer();
     this.allFillPathIdBuffer = this.mustCreateBuffer();
     this.allTextInstanceIdBuffer = this.mustCreateBuffer();
+    this.selectedTextInstanceIdBuffer = this.mustCreateBuffer();
     this.highlightOthersBuffer = this.mustCreateBuffer();
     this.highlightCurrentBuffer = this.mustCreateBuffer();
     this.highlightSelectionBuffer = this.mustCreateBuffer();
@@ -2196,6 +2242,28 @@ export class WebGlFloorplanRenderer {
     return this.vectorLodStats ? { ...this.vectorLodStats, activeLevels: this.vectorLodStats.activeLevels.map((level) => ({ ...level })) } : null;
   }
 
+  setTextLodMode(mode: TextLodMode): void {
+    const nextMode: TextLodMode = mode === "off" ? "off" : "auto";
+    if (this.textLodMode === nextMode) {
+      return;
+    }
+    this.textLodMode = nextMode;
+    if (nextMode === "auto" && this.scene && !this.textLodGpuActive) {
+      this.setScene(this.scene);
+      return;
+    }
+    this.textLodRuntime?.setMode(nextMode);
+    this.selectedTextInstanceCount = 0;
+    this.destroyPanCacheResources();
+    this.destroyVectorMinifyResources();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  getTextLodStats(): TextLodStats | null {
+    return this.textLodRuntime?.getStats() ?? null;
+  }
+
   setStrokeCurveEnabled(enabled: boolean): void {
     const nextEnabled = Boolean(enabled);
     if (this.strokeCurveEnabled === nextEnabled) {
@@ -2405,6 +2473,15 @@ export class WebGlFloorplanRenderer {
     this.textInstanceCount = scene.textInstanceCount;
     this.pageRects = normalizePageRects(scene);
     this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
+    this.textLodRuntime?.dispose();
+    const textLodBuildResult = this.textLodMode === "auto"
+      ? getOrBuildTextLod(scene)
+      : getCachedTextLod(scene);
+    this.textLodRuntime = textLodBuildResult
+      ? new TextLodRuntime(textLodBuildResult, this.textLodMode)
+      : null;
+    this.textLodGpuActive = false;
+    this.selectedTextInstanceCount = 0;
     if (this.visiblePageRectIndices.length < Math.floor(this.pageRects.length / 4)) {
       this.visiblePageRectIndices = new Uint32Array(Math.floor(this.pageRects.length / 4));
     }
@@ -2424,7 +2501,36 @@ export class WebGlFloorplanRenderer {
     const textureStats = this.uploadSegments(scene);
     const vectorLodActive = this.rebuildVectorLod(scene);
     this.grid = !vectorLodActive && this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
-    const textTextureStats = this.uploadTextData(scene);
+    let textLodUploadData: TextLodBuildData | null = null;
+    if (this.textLodMode === "auto" && textLodBuildResult?.data) {
+      const data = textLodBuildResult.data;
+      const maxTextTextureSize = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) as number;
+      const fitsGpuTextures =
+        canFitTextureItems(data.combinedInstanceCount, maxTextTextureSize) &&
+        canFitTextureItems(scene.textGlyphCount + 1, maxTextTextureSize) &&
+        canFitTextureItems(
+          scene.textGlyphSegmentCount + TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+          maxTextTextureSize
+        );
+      if (fitsGpuTextures && data.combinedInstanceCount <= 16_777_216) {
+        textLodUploadData = data;
+        this.textLodGpuActive = true;
+      } else {
+        this.textLodRuntime?.setResourceFallback("resource-capacity");
+      }
+    }
+    let textTextureStats;
+    try {
+      textTextureStats = this.uploadTextData(scene, textLodUploadData);
+    } catch (error) {
+      if (!textLodUploadData) {
+        throw error;
+      }
+      this.textLodRuntime?.setResourceFallback("resource-capacity");
+      this.textLodGpuActive = false;
+      textLodUploadData = null;
+      textTextureStats = this.uploadTextData(scene, null);
+    }
     this.sceneStats = {
       gridWidth: this.grid?.gridWidth ?? 0,
       gridHeight: this.grid?.gridHeight ?? 0,
@@ -2461,6 +2567,10 @@ export class WebGlFloorplanRenderer {
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.allFillPathIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, this.allFillPathIds, this.gl.STATIC_DRAW);
 
+    // Ordinary exact-range draws never address the coarse suffix. Clustered
+    // LOD uses selectedTextInstanceIdBuffer instead, so keeping this identity
+    // buffer exact-sized avoids an optional LOD allocation defeating the
+    // exact-resource fallback above.
     this.allTextInstanceIds = new Float32Array(this.textInstanceCount);
     for (let i = 0; i < this.textInstanceCount; i += 1) {
       this.allTextInstanceIds[i] = i;
@@ -2560,7 +2670,9 @@ export class WebGlFloorplanRenderer {
     this.presentedCameraCenterY = this.cameraCenterY;
     this.presentedZoom = this.zoom;
     this.needsVisibleSetUpdate = true;
-    this.requestFrame();
+    if (options.scheduleFrame !== false) {
+      this.requestFrame();
+    }
   }
 
   setSearchHighlights(highlights: SearchHighlightSet | null): void {
@@ -2711,6 +2823,7 @@ export class WebGlFloorplanRenderer {
       this.visibleSegmentIdBuffer,
       this.allFillPathIdBuffer,
       this.allTextInstanceIdBuffer,
+      this.selectedTextInstanceIdBuffer,
       this.highlightOthersBuffer,
       this.highlightCurrentBuffer,
       this.highlightSelectionBuffer
@@ -2766,6 +2879,11 @@ export class WebGlFloorplanRenderer {
     this.pageTextRanges = new Uint32Array(0);
     this.visiblePageRectIndices = new Uint32Array(0);
     this.visibleTextRanges = [];
+    this.textLodRuntime?.dispose();
+    this.textLodRuntime = null;
+    this.textLodGpuActive = false;
+    this.selectedTextInstanceIds = new Float32Array(0);
+    this.selectedTextInstanceCount = 0;
     this.gradientData = null;
     this.orderedGradientPaintCommands = [];
   }
@@ -2892,8 +3010,21 @@ export class WebGlFloorplanRenderer {
     this.presentedFrameSerial += 1;
   }
 
+  /**
+   * A book-like scene: enough glyphs to be expensive, and no strokes whose
+   * thickness could shift between the cached and direct paths. These already opt
+   * out of the supersampled minify path, so caching pans costs no sharpness the
+   * still frame would otherwise keep.
+   */
+  private isTextHeavyStrokeFreeScene(): boolean {
+    return this.textInstanceCount > VECTOR_MINIFY_MAX_TEXT_INSTANCES && this.segmentCount === 0;
+  }
+
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (this.vectorLodRuntime || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
+    if (this.vectorLodRuntime) {
+      return false;
+    }
+    if (this.segmentCount < PAN_CACHE_MIN_SEGMENTS && !this.isTextHeavyStrokeFreeScene()) {
       return false;
     }
     if (this.isPanInteracting) {
@@ -3014,7 +3145,7 @@ export class WebGlFloorplanRenderer {
     ) {
       return false;
     }
-    if (this.textInstanceCount > 100_000 && this.segmentCount === 0) {
+    if (this.isTextHeavyStrokeFreeScene()) {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
@@ -3127,7 +3258,20 @@ export class WebGlFloorplanRenderer {
       ? this.drawVisibleSegments(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom)
       : 0;
     if (this.textRenderingEnabled) {
-      this.drawTextInstances(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+      this.drawTextInstances(
+        viewportWidth,
+        viewportHeight,
+        cameraCenterX,
+        cameraCenterY,
+        effectiveZoom,
+        {
+          viewportWidth: this.canvas.width,
+          viewportHeight: this.canvas.height,
+          cameraCenterX,
+          cameraCenterY,
+          zoom: this.zoom
+        }
+      );
     }
 
     gl.bindTexture(gl.TEXTURE_2D, this.vectorMinifyTexture);
@@ -3833,12 +3977,27 @@ export class WebGlFloorplanRenderer {
     viewportHeight: number,
     cameraCenterX: number,
     cameraCenterY: number,
-    zoomValue = this.zoom
+    zoomValue = this.zoom,
+    textLodProjection?: {
+      viewportWidth: number;
+      viewportHeight: number;
+      cameraCenterX: number;
+      cameraCenterY: number;
+      zoom: number;
+    }
   ): number {
     if (!this.scene || this.textInstanceCount <= 0) {
       return 0;
     }
-    if (this.visibleTextRanges.length === 0) {
+
+    const useTextLodSelection = this.updateTextLodSelection(
+      textLodProjection?.viewportWidth ?? viewportWidth,
+      textLodProjection?.viewportHeight ?? viewportHeight,
+      textLodProjection?.cameraCenterX ?? cameraCenterX,
+      textLodProjection?.cameraCenterY ?? cameraCenterY,
+      textLodProjection?.zoom ?? zoomValue
+    );
+    if (useTextLodSelection ? this.selectedTextInstanceCount <= 0 : this.visibleTextRanges.length === 0) {
       return 0;
     }
 
@@ -3846,7 +4005,10 @@ export class WebGlFloorplanRenderer {
 
     gl.useProgram(this.textProgram);
     gl.bindVertexArray(this.textVao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.allTextInstanceIdBuffer);
+    gl.bindBuffer(
+      gl.ARRAY_BUFFER,
+      useTextLodSelection ? this.selectedTextInstanceIdBuffer : this.allTextInstanceIdBuffer
+    );
     gl.enableVertexAttribArray(2);
     gl.vertexAttribDivisor(2, 1);
 
@@ -3900,8 +4062,64 @@ export class WebGlFloorplanRenderer {
       this.vectorOverrideOpacity
     );
 
+    if (useTextLodSelection) {
+      gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 4, 0);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.selectedTextInstanceCount);
+      return this.selectedTextInstanceCount;
+    }
+    return this.drawTextInstanceRanges(this.visibleTextRanges);
+  }
+
+  private updateTextLodSelection(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): boolean {
+    const runtime = this.textLodRuntime;
+    if (!runtime || !this.textLodGpuActive || this.textLodMode === "off") {
+      return false;
+    }
+
+    const localToClip = this.localToClipRenderingEnabled
+      ? this.localToClipMatrix
+      : createOrthographicLocalToClip(
+          cameraCenterX,
+          cameraCenterY,
+          zoomValue,
+          viewportWidth,
+          viewportHeight
+        );
+    const selection = runtime.update({
+      localToClip,
+      viewportWidth,
+      viewportHeight
+    });
+    this.selectedTextInstanceCount = selection.instanceIds.length;
+    if (!selection.changed) {
+      return true;
+    }
+
+    if (this.selectedTextInstanceIds.length < selection.instanceIds.length) {
+      this.selectedTextInstanceIds = new Float32Array(selection.instanceIds.length);
+    }
+    for (let i = 0; i < selection.instanceIds.length; i += 1) {
+      this.selectedTextInstanceIds[i] = selection.instanceIds[i];
+    }
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.selectedTextInstanceIdBuffer);
+    this.gl.bufferData(
+      this.gl.ARRAY_BUFFER,
+      this.selectedTextInstanceIds.subarray(0, selection.instanceIds.length),
+      this.gl.DYNAMIC_DRAW
+    );
+    return true;
+  }
+
+  private drawTextInstanceRanges(ranges: InstanceRange[]): number {
+    const gl = this.gl;
     let renderedInstanceCount = 0;
-    for (const range of this.visibleTextRanges) {
+    for (const range of ranges) {
       if (range.count <= 0) {
         continue;
       }
@@ -4325,6 +4543,7 @@ export class WebGlFloorplanRenderer {
       const start = this.pageTextRanges[rangeOffset] ?? 0;
       const count = this.pageTextRanges[rangeOffset + 1] ?? 0;
       this.appendVisibleTextRange(nextTextRanges, start, count);
+
     }
 
     this.visiblePageRectCount = visiblePageCount;
@@ -4332,8 +4551,19 @@ export class WebGlFloorplanRenderer {
   }
 
   private appendVisibleTextRange(ranges: InstanceRange[], start: number, count: number): void {
-    const clampedStart = clamp(Math.trunc(start), 0, this.textInstanceCount);
-    const clampedCount = clamp(Math.trunc(count), 0, this.textInstanceCount - clampedStart);
+    this.appendVisibleInstanceRange(ranges, start, count, 0, this.textInstanceCount);
+  }
+
+  private appendVisibleInstanceRange(
+    ranges: InstanceRange[],
+    start: number,
+    count: number,
+    regionStart: number,
+    regionCount: number
+  ): void {
+    const regionEnd = regionStart + regionCount;
+    const clampedStart = clamp(Math.trunc(start), regionStart, regionEnd);
+    const clampedCount = clamp(Math.trunc(count), 0, regionEnd - clampedStart);
     if (clampedCount <= 0) {
       return;
     }
@@ -4868,7 +5098,7 @@ export class WebGlFloorplanRenderer {
     this.vectorLodStats = null;
   }
 
-  private uploadTextData(scene: VectorScene): {
+  private uploadTextData(scene: VectorScene, textLodData: TextLodBuildData | null): {
     instanceTextureWidth: number;
     instanceTextureHeight: number;
     glyphMetaTextureWidth: number;
@@ -4879,9 +5109,13 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
-    const instanceDims = chooseTextureDimensions(scene.textInstanceCount, maxTextureSize);
-    const glyphMetaDims = chooseTextureDimensions(scene.textGlyphCount, maxTextureSize);
-    const glyphSegmentDims = chooseTextureDimensions(scene.textGlyphSegmentCount, maxTextureSize);
+    const uploadInstanceCount = textLodData?.combinedInstanceCount ?? scene.textInstanceCount;
+    const uploadGlyphCount = scene.textGlyphCount + (textLodData ? 1 : 0);
+    const uploadSegmentCount = scene.textGlyphSegmentCount +
+      (textLodData ? TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT : 0);
+    const instanceDims = chooseTextureDimensions(uploadInstanceCount, maxTextureSize);
+    const glyphMetaDims = chooseTextureDimensions(uploadGlyphCount, maxTextureSize);
+    const glyphSegmentDims = chooseTextureDimensions(uploadSegmentCount, maxTextureSize);
 
     this.textInstanceTextureWidth = instanceDims.width;
     this.textInstanceTextureHeight = instanceDims.height;
@@ -4895,18 +5129,11 @@ export class WebGlFloorplanRenderer {
     const glyphSegmentTexelCount = glyphSegmentDims.width * glyphSegmentDims.height;
 
     const instanceAData = new Float32Array(instanceTexelCount * 4);
-    instanceAData.set(scene.textInstanceA);
-
     const instanceBData = new Float32Array(instanceTexelCount * 4);
-    instanceBData.set(scene.textInstanceB);
-
-    const instanceCData = packNormalizedUint8TextureData(scene.textInstanceC, instanceTexelCount);
+    const instanceCFloatData = new Float32Array(instanceTexelCount * 4);
 
     const glyphMetaAData = new Float32Array(glyphMetaTexelCount * 4);
-    glyphMetaAData.set(scene.textGlyphMetaA);
-
     const glyphMetaBData = new Float32Array(glyphMetaTexelCount * 4);
-    glyphMetaBData.set(scene.textGlyphMetaB);
 
     const glyphRasterMetaData = new Float32Array(glyphMetaTexelCount * 4);
     const textRasterAtlas = buildTextRasterAtlas(scene, maxTextureSize);
@@ -4920,10 +5147,27 @@ export class WebGlFloorplanRenderer {
     }
 
     const glyphSegmentDataA = new Float32Array(glyphSegmentTexelCount * 4);
-    glyphSegmentDataA.set(scene.textGlyphSegmentsA);
-
     const glyphSegmentDataB = new Float32Array(glyphSegmentTexelCount * 4);
-    glyphSegmentDataB.set(scene.textGlyphSegmentsB);
+    if (textLodData) {
+      appendTextLodCombinedPayload(scene, textLodData, {
+        textInstanceA: instanceAData,
+        textInstanceB: instanceBData,
+        textInstanceC: instanceCFloatData,
+        textGlyphMetaA: glyphMetaAData,
+        textGlyphMetaB: glyphMetaBData,
+        textGlyphSegmentsA: glyphSegmentDataA,
+        textGlyphSegmentsB: glyphSegmentDataB
+      });
+    } else {
+      instanceAData.set(scene.textInstanceA);
+      instanceBData.set(scene.textInstanceB);
+      instanceCFloatData.set(scene.textInstanceC);
+      glyphMetaAData.set(scene.textGlyphMetaA);
+      glyphMetaBData.set(scene.textGlyphMetaB);
+      glyphSegmentDataA.set(scene.textGlyphSegmentsA);
+      glyphSegmentDataB.set(scene.textGlyphSegmentsB);
+    }
+    const instanceCData = packNormalizedUint8TextureData(instanceCFloatData, instanceTexelCount);
 
     gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureA);
     configureFloatTexture(gl);
@@ -5038,7 +5282,7 @@ export class WebGlFloorplanRenderer {
     );
 
     gl.bindTexture(gl.TEXTURE_2D, this.textRasterAtlasTexture);
-    configureRasterTexture(gl);
+    configureGlyphRasterTexture(gl);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     if (textRasterAtlas) {
       gl.texImage2D(
@@ -5537,6 +5781,18 @@ function configureRasterTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }
 
+function configureGlyphRasterTexture(gl: WebGL2RenderingContext): void {
+  configureRasterTexture(gl);
+  const anisotropy = gl.getExtension("EXT_texture_filter_anisotropic");
+  if (!anisotropy) {
+    return;
+  }
+  const supported = Number(gl.getParameter(anisotropy.MAX_TEXTURE_MAX_ANISOTROPY_EXT));
+  if (Number.isFinite(supported) && supported > 1) {
+    gl.texParameterf(gl.TEXTURE_2D, anisotropy.TEXTURE_MAX_ANISOTROPY_EXT, supported);
+  }
+}
+
 function premultiplyRgba(source: Uint8Array): Uint8Array {
   const out = new Uint8Array(source.length);
   for (let i = 0; i + 3 < source.length; i += 4) {
@@ -5586,6 +5842,10 @@ function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { w
   }
 
   return { width, height };
+}
+
+function canFitTextureItems(itemCount: number, maxTextureSize: number): boolean {
+  return maxTextureSize >= 1 && Math.max(1, itemCount) / maxTextureSize <= maxTextureSize;
 }
 
 function normalizePageRects(scene: VectorScene): Float32Array {

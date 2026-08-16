@@ -71,8 +71,8 @@ export interface PdfObjectGeneratorOptions {
   maxPagesPerRow?: number;
 
   /**
-   * Progress callback for source loading, PDF parsing, ZIP loading, Vector LOD
-   * building, and upload preparation.
+   * Progress callback for source loading, PDF parsing, ZIP loading, vector/text
+   * LOD building, and upload preparation.
    */
   onProgress?: LoadProgressCallback;
 

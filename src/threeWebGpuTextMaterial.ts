@@ -55,20 +55,6 @@ function varyingNode(node: unknown): never {
   return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
-/**
- * Sample the glyph coverage atlas at an explicit mip level.
- *
- * `wgslFn` parameters cannot carry a sampler, so the filtered taps happen here
- * as TSL nodes and only the resulting coverage is handed to the shader code.
- */
-function sampleRasterAtlasCoverage(texture: THREE.Texture, uv: unknown, level: unknown): never {
-  const textureNode = (TSL.texture as unknown as (
-    value: THREE.Texture,
-    uv: unknown
-  ) => { level: (level: unknown) => { r: unknown } })(texture, uv);
-  return textureNode.level(level).r as never;
-}
-
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
   let itemIndex = i32(index + 0.5);
@@ -144,37 +130,6 @@ fn heprTextRasterAtlasPixels(
 ) -> vec2<f32> {
   let dims = max(atlasSize, vec2<f32>(1.0));
   return vec2<f32>(normCoord.x, 1.0 - normCoord.y) * (rasterRect.zw * dims);
-}
-`);
-
-const textRasterAtlasLodFn = TSL.wgslFn(`
-fn heprTextRasterAtlasLod(atlasPixels: vec2<f32>) -> f32 {
-  let mipBias = -1.25;
-  let footprint = max(max(fwidth(atlasPixels.x), fwidth(atlasPixels.y)), 0.000001);
-  return max(log2(footprint) + mipBias, 0.0);
-}
-`);
-
-const textRasterAtlasTapUvFn = TSL.wgslFn(`
-fn heprTextRasterAtlasTapUv(
-  normCoord: vec2<f32>,
-  atlasPixels: vec2<f32>,
-  rasterRect: vec4<f32>,
-  atlasSize: vec2<f32>,
-  offsetX: f32,
-  offsetY: f32
-) -> vec2<f32> {
-  let dims = max(atlasSize, vec2<f32>(1.0));
-  let texel = 1.0 / dims;
-  let uvCenter = vec2<f32>(
-    rasterRect.x + normCoord.x * rasterRect.z,
-    rasterRect.y + (1.0 - normCoord.y) * rasterRect.w
-  );
-  let uvMin = rasterRect.xy + texel * 0.5;
-  let uvMax = rasterRect.xy + rasterRect.zw - texel * 0.5;
-  let dx = dpdx(atlasPixels) * 0.33 * texel;
-  let dy = dpdy(atlasPixels) * 0.33 * texel;
-  return clamp(uvCenter + dx * offsetX + dy * offsetY, uvMin, uvMax);
 }
 `);
 
@@ -350,11 +305,9 @@ fn heprTextFragment(
   normCoord: vec2<f32>,
   atlasPixels: vec2<f32>,
   rasterRect: vec4<f32>,
-  rasterCenterTap: f32,
-  rasterTapNegNeg: f32,
-  rasterTapNegPos: f32,
-  rasterTapPosNeg: f32,
-  rasterTapPosPos: f32,
+  rasterAtlasTex: texture_2d<f32>,
+  rasterAtlasSampler: sampler,
+  rasterAtlasSize: vec2<f32>,
   vectorOnly: f32,
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
@@ -367,11 +320,19 @@ fn heprTextFragment(
   let localDy = dpdy(local);
   let pixelToLocalX = length(vec2<f32>(localDx.x, localDy.x));
   let pixelToLocalY = length(vec2<f32>(localDx.y, localDy.y));
-  let localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  // Frobenius conservatively bounds primitive-culling distance for any edge
+  // normal; the final smoothstep uses the tighter projected-normal width.
+  let localPerPixel = length(vec2<f32>(pixelToLocalX, pixelToLocalY));
   let baseAAWidth = max(localPerPixel * textAAScreenPx, 0.0001);
-  // Derivatives must be taken before any discard, so the atlas footprint is
-  // measured here even when the vector path ends up handling the pixel.
-  let atlasFootprint = min(fwidth(atlasPixels.x), fwidth(atlasPixels.y));
+  // Derivatives must be taken before any discard or divergent branch. Supplying
+  // them explicitly below makes conditional atlas sampling valid WGSL while
+  // retaining the footprint used by the anisotropic sampler.
+  let atlasPixelsDx = dpdx(atlasPixels);
+  let atlasPixelsDy = dpdy(atlasPixels);
+  let atlasFootprint = min(
+    abs(atlasPixelsDx.x) + abs(atlasPixelsDy.x),
+    abs(atlasPixelsDx.y) + abs(atlasPixelsDy.y)
+  );
 
   let segmentStart = i32(glyphMetaA.x + 0.5);
   let segmentCount = i32(glyphMetaA.y + 0.5);
@@ -386,8 +347,56 @@ fn heprTextFragment(
   // mipmapped coverage atlas is both cheaper and less aliased than evaluating
   // the outline per pixel.
   if (vectorOnly < 0.5 && rasterRect.z > 0.0 && rasterRect.w > 0.0 && atlasFootprint > 2.0) {
-    let rasterCoverage = (1.0 / 3.0) * rasterCenterTap +
-      (1.0 / 6.0) * (rasterTapNegNeg + rasterTapNegPos + rasterTapPosNeg + rasterTapPosPos);
+    let atlasDims = max(rasterAtlasSize, vec2<f32>(1.0));
+    let texel = 1.0 / atlasDims;
+    let uvCenter = vec2<f32>(
+      rasterRect.x + normCoord.x * rasterRect.z,
+      rasterRect.y + (1.0 - normCoord.y) * rasterRect.w
+    );
+    let uvMin = rasterRect.xy + texel * 0.5;
+    let uvMax = rasterRect.xy + rasterRect.zw - texel * 0.5;
+    let tapDx = atlasPixelsDx * 0.33 * texel;
+    let tapDy = atlasPixelsDy * 0.33 * texel;
+    // Scaling both explicit gradients by exp2(-1.25) preserves the previous
+    // negative mip bias without discarding their anisotropic direction/ratio.
+    let mipBiasedUvDx = atlasPixelsDx * texel * 0.42044820762685725;
+    let mipBiasedUvDy = atlasPixelsDy * texel * 0.42044820762685725;
+    let rasterCoverage = (1.0 / 3.0) * textureSampleGrad(
+      rasterAtlasTex,
+      rasterAtlasSampler,
+      clamp(uvCenter, uvMin, uvMax),
+      mipBiasedUvDx,
+      mipBiasedUvDy
+    ).r + (1.0 / 6.0) * (
+      textureSampleGrad(
+        rasterAtlasTex,
+        rasterAtlasSampler,
+        clamp(uvCenter - tapDx - tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+      textureSampleGrad(
+        rasterAtlasTex,
+        rasterAtlasSampler,
+        clamp(uvCenter - tapDx + tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+      textureSampleGrad(
+        rasterAtlasTex,
+        rasterAtlasSampler,
+        clamp(uvCenter + tapDx - tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+      textureSampleGrad(
+        rasterAtlasTex,
+        rasterAtlasSampler,
+        clamp(uvCenter + tapDx + tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r
+    );
     let rasterAlpha = clamp(rasterCoverage, 0.0, 1.0) * instanceColor.a;
     if (rasterAlpha <= 0.001) {
       discard;
@@ -501,7 +510,15 @@ fn heprTextFragment(
   let acrossWinding = winding - nearestSideMultiplicity;
   let nearestSeparatesFill = inside != (acrossWinding != 0);
   let signedDistance = select(minDistance, -minDistance, inside);
-  let edgeAlpha = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  // The conservative maximum derivative above is appropriate for rejecting
+  // primitives, but it over-blurs edges under anisotropic perspective tilt.
+  // Project the local-space pixel derivatives onto the nearest edge normal for
+  // the actual coverage band so only motion across that edge contributes.
+  let normalAAWidth = max(
+    length(vec2<f32>(dot(localDx, nearestNormal), dot(localDy, nearestNormal))) * textAAScreenPx,
+    0.0001
+  );
+  let edgeAlpha = 1.0 - smoothstep(-normalAAWidth, normalAAWidth, signedDistance);
   // Nonzero fill stays opaque across overlap-only contour edges. Coincident
   // exterior edges are grouped above and antialiased as one true boundary.
   let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
@@ -586,19 +603,6 @@ export function createThreeWebGpuTextMaterial(
     rasterRect,
     atlasSize: rasterAtlasSizeUniform
   });
-  const rasterAtlasLod = callNode(textRasterAtlasLodFn, { atlasPixels });
-  const rasterTap = (offsetX: number, offsetY: number): never => sampleRasterAtlasCoverage(
-    options.textRasterAtlasTexture,
-    callNode(textRasterAtlasTapUvFn, {
-      normCoord,
-      atlasPixels,
-      rasterRect,
-      atlasSize: rasterAtlasSizeUniform,
-      offsetX: TSL.float(offsetX),
-      offsetY: TSL.float(offsetY)
-    }),
-    rasterAtlasLod
-  );
 
   material.fragmentNode = callNode(textFragmentFn, {
     local: vertexPackValue.zw,
@@ -607,11 +611,9 @@ export function createThreeWebGpuTextMaterial(
     normCoord,
     atlasPixels,
     rasterRect,
-    rasterCenterTap: rasterTap(0, 0),
-    rasterTapNegNeg: rasterTap(-1, -1),
-    rasterTapNegPos: rasterTap(-1, 1),
-    rasterTapPosNeg: rasterTap(1, -1),
-    rasterTapPosPos: rasterTap(1, 1),
+    rasterAtlasTex: TSL.texture(options.textRasterAtlasTexture),
+    rasterAtlasSampler: TSL.sampler(options.textRasterAtlasTexture),
+    rasterAtlasSize: rasterAtlasSizeUniform,
     vectorOnly: vectorOnlyUniform,
     segmentTexA: TSL.textureLoad(options.textGlyphSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.textGlyphSegmentTextureB),

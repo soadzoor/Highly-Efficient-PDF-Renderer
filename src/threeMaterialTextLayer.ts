@@ -21,6 +21,11 @@ interface TextLayerOptions {
   textVectorOnly: boolean;
   vectorOverride: [number, number, number, number];
   maxRasterAtlasTextureSize?: number;
+  /**
+   * Prefix of real glyphs eligible for raster-atlas sampling. Clustered Text
+   * LOD appends an analytic solid-square glyph after this prefix.
+   */
+  rasterAtlasGlyphCount?: number;
 }
 
 interface ViewportPixels {
@@ -77,6 +82,8 @@ export class ThreeMaterialTextLayer {
   private readonly previousRangeCounts: Uint32Array;
   private previousRangeCount = -1;
   private usingAllTextInstances = true;
+  private usingExternalSelection = false;
+  private externalSelectionCount = -1;
   private useLocalToClip = false;
   private renderedTextInstanceCount: number;
 
@@ -123,8 +130,16 @@ export class ThreeMaterialTextLayer {
     );
 
     const rasterMetaData = new Float32Array(glyphMetaTextureSize.width * glyphMetaTextureSize.height * 4);
+    const rasterAtlasGlyphCount = clampInt(
+      options.rasterAtlasGlyphCount ?? textGlyphCount,
+      0,
+      textGlyphCount
+    );
+    const rasterAtlasScene = rasterAtlasGlyphCount === textGlyphCount
+      ? scene
+      : { ...scene, textGlyphCount: rasterAtlasGlyphCount };
     const rasterAtlas = buildTextRasterAtlas(
-      scene,
+      rasterAtlasScene,
       clampInt(
         options.maxRasterAtlasTextureSize ?? DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE,
         256,
@@ -299,6 +314,15 @@ export class ThreeMaterialTextLayer {
     this.vectorOverrideUniform.set(red, green, blue, opacity);
   }
 
+  setRasterAtlasAnisotropy(anisotropy: number): void {
+    const supported = Math.max(1, Math.floor(Number.isFinite(anisotropy) ? anisotropy : 1));
+    if (this.textRasterAtlasTexture.anisotropy === supported) {
+      return;
+    }
+    this.textRasterAtlasTexture.anisotropy = supported;
+    this.textRasterAtlasTexture.needsUpdate = true;
+  }
+
   setScreenSpaceTransform(): void {
     this.useLocalToClip = false;
     this.useLocalToClipUniform.value = 0;
@@ -324,12 +348,80 @@ export class ThreeMaterialTextLayer {
     return this.textInstanceCount;
   }
 
+  /**
+   * Replace the draw's instance indirection with an already source-ordered
+   * selection. Clustered text LOD uses this to choose either the exact glyphs
+   * or the coarse run for each visible cluster while retaining one text draw.
+   *
+   * Supplying the same IDs is a no-op, so a stationary camera causes no GPU
+   * selection upload. `instanceIds` may alias a buffer the caller reuses, so it
+   * is copied here and never retained.
+   */
+  setSelectedTextInstanceIds(instanceIds: Uint32Array): boolean {
+    const count = instanceIds.length;
+    if (count > this.textInstanceIds.length) {
+      throw new RangeError(
+        `Text selection contains ${count} instances, but the layer capacity is ${this.textInstanceIds.length}.`
+      );
+    }
+    // The ids are derived from immutable build data, so an out-of-range value
+    // would be a wiring bug that shows up on the first selection. Auditing every
+    // element on adoption catches that without scanning the whole selection on
+    // each frame of a camera move, which the checks below already avoid.
+    if (!this.usingExternalSelection) {
+      for (let i = 0; i < count; i += 1) {
+        const instanceId = instanceIds[i];
+        if (!Number.isInteger(instanceId) || instanceId < 0 || instanceId >= this.textInstanceCount) {
+          throw new RangeError(`Text selection instance ID ${instanceId} is outside the uploaded text payload.`);
+        }
+      }
+    }
+
+    let changed = !this.usingExternalSelection || this.externalSelectionCount !== count;
+    if (!changed) {
+      for (let i = 0; i < count; i += 1) {
+        if (this.textInstanceIds[i] !== instanceIds[i]) {
+          changed = true;
+          break;
+        }
+      }
+    }
+
+    this.usingExternalSelection = true;
+    this.externalSelectionCount = count;
+    this.renderedTextInstanceCount = count;
+    this.mesh.geometry.instanceCount = count;
+    if (!changed) {
+      return false;
+    }
+
+    this.textInstanceIds.set(instanceIds, 0);
+    if (count > 0) {
+      markAttributeForUpdate(this.textInstanceIndexAttribute, count);
+    }
+    return true;
+  }
+
+  /** Restore the ordinary page-range culling path. */
+  clearSelectedTextInstanceIds(): void {
+    if (!this.usingExternalSelection) {
+      return;
+    }
+    this.usingExternalSelection = false;
+    this.externalSelectionCount = -1;
+    this.usingAllTextInstances = false;
+    this.previousRangeCount = -1;
+  }
+
   updateFrame(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): void {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
     if (this.webGpuState) {
       this.webGpuState.zoomUniform.value = this.zoomUniform.value;
+    }
+    if (this.usingExternalSelection) {
+      return;
     }
     this.updateVisibleTextInstances(viewState, viewport, cullingBounds);
   }
@@ -432,8 +524,7 @@ export class ThreeMaterialTextLayer {
     this.rememberRanges(rangeCount);
     this.usingAllTextInstances = false;
     if (outCount > 0) {
-      this.textInstanceIndexAttribute.addUpdateRange(0, outCount);
-      this.textInstanceIndexAttribute.needsUpdate = true;
+      markAttributeForUpdate(this.textInstanceIndexAttribute, outCount);
     }
   }
 
@@ -444,8 +535,7 @@ export class ThreeMaterialTextLayer {
       }
       this.previousRangeCount = -1;
       if (this.textInstanceCount > 0) {
-        this.textInstanceIndexAttribute.addUpdateRange(0, this.textInstanceCount);
-        this.textInstanceIndexAttribute.needsUpdate = true;
+        markAttributeForUpdate(this.textInstanceIndexAttribute, this.textInstanceCount);
       }
     }
     this.usingAllTextInstances = true;
@@ -574,11 +664,31 @@ function createTextGeometry(
 
   const instanceCount = Math.max(0, textInstanceCount | 0);
   const textInstanceIndexAttribute = new THREE.InstancedBufferAttribute(textInstanceIds, 1);
-  textInstanceIndexAttribute.setUsage(THREE.DynamicDrawUsage);
+  // Three's common renderer uploads DynamicDrawUsage attributes on every
+  // render. StreamDrawUsage still describes this mutable indirection buffer
+  // to WebGL while letting the explicit `needsUpdate` calls control uploads.
+  textInstanceIndexAttribute.setUsage(THREE.StreamDrawUsage);
   geometry.setAttribute("aTextInstanceIndex", textInstanceIndexAttribute);
   geometry.instanceCount = instanceCount;
 
   return geometry;
+}
+
+/**
+ * Partial update ranges were added after the oldest supported three.js peer.
+ * Older hosts still upload correctly through `needsUpdate`, just without the
+ * smaller modern range hint.
+ */
+function markAttributeForUpdate(attribute: THREE.InstancedBufferAttribute, count: number): void {
+  const ranged = attribute as THREE.InstancedBufferAttribute & {
+    clearUpdateRanges?: () => void;
+    addUpdateRange?: (start: number, count: number) => void;
+  };
+  if (typeof ranged.clearUpdateRanges === "function" && typeof ranged.addUpdateRange === "function") {
+    ranged.clearUpdateRanges();
+    ranged.addUpdateRange(0, count);
+  }
+  attribute.needsUpdate = true;
 }
 
 interface PageLayout {

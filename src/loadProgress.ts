@@ -14,6 +14,7 @@ export type PDFLoadStage =
   | "raster-encode"
   | "zip-build"
   | "vector-lod"
+  | "text-lod"
   | "upload"
   | "first-render"
   | "complete";
@@ -275,6 +276,8 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Building ZIP";
     case "vector-lod":
       return "Building Vector LOD";
+    case "text-lod":
+      return "Building Text LOD";
     case "upload":
       return "Uploading";
     case "first-render":

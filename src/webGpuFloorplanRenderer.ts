@@ -9,13 +9,32 @@ import {
   type OrderedGradientPaintCommand
 } from "./orderedGradientPaint";
 import { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } from "./nativeGradientWebGpuShaders";
-import type { DrawStats, SceneStats, SearchHighlightSet, ViewState } from "./webGlFloorplanRenderer";
+import type {
+  DrawStats,
+  SceneStats,
+  SearchHighlightSet,
+  ViewState,
+  ViewStateUpdateOptions
+} from "./webGlFloorplanRenderer";
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,
   CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
   CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE
 } from "./coreWgslShaders";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import {
+  appendTextLodCombinedPayload,
+  TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+  type TextLodBuildData
+} from "./textGreekLod";
+import { createOrthographicLocalToClip } from "./planarProjection";
+import {
+  getCachedTextLod,
+  getOrBuildTextLod,
+  TextLodRuntime,
+  type TextLodMode,
+  type TextLodStats
+} from "./textLodCore";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
@@ -45,6 +64,21 @@ interface WebGpuVectorLodLevelResource {
   visibleSegmentIdBuffer: any;
   bindGroup: any;
   ownsTextures: boolean;
+}
+
+interface TextureDimensions {
+  width: number;
+  height: number;
+}
+
+interface NativeTextUploadArrays {
+  textInstanceA: Float32Array;
+  textInstanceB: Float32Array;
+  textInstanceC: Float32Array;
+  textGlyphMetaA: Float32Array;
+  textGlyphMetaB: Float32Array;
+  textGlyphSegmentsA: Float32Array;
+  textGlyphSegmentsB: Float32Array;
 }
 
 const INTERACTION_DECAY_MS = 140;
@@ -562,6 +596,12 @@ struct CameraUniforms {
 @group(0) @binding(9) var uTextRasterSampler : sampler;
 @group(0) @binding(10) var uTextRasterAtlasTex : texture_2d<f32>;
 
+struct TextInstanceIdBuffer {
+  values : array<u32>,
+};
+
+@group(0) @binding(11) var<storage, read> uTextInstanceIds : TextInstanceIdBuffer;
+
 struct VsOut {
   @builtin(position) position : vec4f,
   @location(0) local : vec2f,
@@ -769,7 +809,13 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let instanceDims = textureDimensions(uTextInstanceTexA);
   let glyphMetaDims = textureDimensions(uTextGlyphMetaTexA);
 
-  let instanceIndexI = i32(instanceIndex);
+  // pad0 is an indirection flag for the LOD pipeline. Ordinary scenes retain
+  // the original direct instance-index path and do not read the ID buffer.
+  var selectedInstanceIndex = instanceIndex;
+  if (uCamera.pad0 >= 0.5) {
+    selectedInstanceIndex = uTextInstanceIds.values[instanceIndex];
+  }
+  let instanceIndexI = i32(selectedInstanceIndex);
   let instanceCoord = coordFromIndex(instanceIndexI, i32(instanceDims.x));
 
   let instanceA = textureLoad(uTextInstanceTexA, instanceCoord, 0);
@@ -827,14 +873,16 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let localDy = dpdy(inData.local);
   let pixelToLocalX = length(vec2f(localDx.x, localDy.x));
   let pixelToLocalY = length(vec2f(localDx.y, localDy.y));
-  let localPerPixel = max(pixelToLocalX, pixelToLocalY);
+  // Frobenius is a conservative bound for primitive culling in every normal
+  // direction; final coverage below uses the tighter projected-normal width.
+  let localPerPixel = length(vec2f(pixelToLocalX, pixelToLocalY));
   let baseAAWidth = max(localPerPixel * uCamera.textAAScreenPx, 1e-4);
   let atlasDims = vec2f(textureDimensions(uTextRasterAtlasTex));
   let nc = vec2f(inData.normCoord.x, 1.0 - inData.normCoord.y) * (inData.rasterRect.zw * atlasDims);
-  let ncFwidthX = fwidth(nc.x);
-  let ncFwidthY = fwidth(nc.y);
   let dncDx = dpdx(nc);
   let dncDy = dpdy(nc);
+  let ncFwidthX = abs(dncDx.x) + abs(dncDy.x);
+  let ncFwidthY = abs(dncDx.y) + abs(dncDy.y);
 
   if (inData.segmentCount <= 0) {
     discard;
@@ -853,17 +901,49 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
     let uvMin = inData.rasterRect.xy + texel * 0.5;
     let uvMax = inData.rasterRect.xy + inData.rasterRect.zw - texel * 0.5;
-    let dx = dncDx * 0.33 * texel;
-    let dy = dncDy * 0.33 * texel;
-    let mipBias = -1.25;
-    let lod = max(log2(max(max(ncFwidthX, ncFwidthY), 1e-6)) + mipBias, 0.0);
-    let alphaRaster = (1.0 / 3.0) * textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter, uvMin, uvMax), lod).r +
-      (1.0 / 6.0) * (
-        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx - dy, uvMin, uvMax), lod).r +
-        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx + dy, uvMin, uvMax), lod).r +
-        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx - dy, uvMin, uvMax), lod).r +
-        textureSampleLevel(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx + dy, uvMin, uvMax), lod).r
-      );
+    let tapDx = dncDx * 0.33 * texel;
+    let tapDy = dncDy * 0.33 * texel;
+    // textureSampleGrad is valid in non-uniform control flow. The gradients
+    // were evaluated above the branch for derivative-uniformity and retain the
+    // anisotropic footprint. Scaling by exp2(-1.25) preserves the old mip bias.
+    let mipBiasedUvDx = dncDx * texel * 0.42044820762685725;
+    let mipBiasedUvDy = dncDy * texel * 0.42044820762685725;
+    let alphaRaster = (1.0 / 3.0) * textureSampleGrad(
+      uTextRasterAtlasTex,
+      uTextRasterSampler,
+      clamp(uvCenter, uvMin, uvMax),
+      mipBiasedUvDx,
+      mipBiasedUvDy
+    ).r + (1.0 / 6.0) * (
+      textureSampleGrad(
+        uTextRasterAtlasTex,
+        uTextRasterSampler,
+        clamp(uvCenter - tapDx - tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+      textureSampleGrad(
+        uTextRasterAtlasTex,
+        uTextRasterSampler,
+        clamp(uvCenter - tapDx + tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+      textureSampleGrad(
+        uTextRasterAtlasTex,
+        uTextRasterSampler,
+        clamp(uvCenter + tapDx - tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+      textureSampleGrad(
+        uTextRasterAtlasTex,
+        uTextRasterSampler,
+        clamp(uvCenter + tapDx + tapDy, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r
+    );
     let alpha = heprLinearCoverageToOutputAlpha(alphaRaster) * inData.colorAlpha;
     if (alpha <= 0.001) {
       discard;
@@ -977,7 +1057,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let acrossWinding = winding - nearestSideMultiplicity;
   let nearestSeparatesFill = inside != (acrossWinding != 0);
   let signedDistance = select(minDistance, -minDistance, inside);
-  let edgeAlpha = 1.0 - smoothstep(-baseAAWidth, baseAAWidth, signedDistance);
+  // Keep the maximum derivative above for conservative primitive culling, but
+  // resolve final coverage with the derivative along the nearest edge normal.
+  // This prevents tilted glyph edges from acquiring over-wide grey bands.
+  let edgeAAWidth = max(
+    length(vec2f(dot(localDx, nearestNormal), dot(localDy, nearestNormal))) * uCamera.textAAScreenPx,
+    1e-4
+  );
+  let edgeAlpha = 1.0 - smoothstep(-edgeAAWidth, edgeAAWidth, signedDistance);
   // Nonzero fill stays opaque across overlap-only contour edges. Coincident
   // exterior edges are grouped above and antialiased as one true boundary.
   let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
@@ -1329,6 +1416,8 @@ export class WebGpuFloorplanRenderer {
 
   private readonly rasterLayerSampler: any;
 
+  private readonly textRasterSampler: any;
+
   private readonly gradientSampler: any;
 
   private readonly vectorCompositeSampler: any;
@@ -1423,6 +1512,9 @@ export class WebGpuFloorplanRenderer {
   private segmentIdBufferAll: any = null;
 
   private segmentIdBufferVisible: any = null;
+
+  /** Source-ordered exact/coarse IDs, bound only through the LOD shader path. */
+  private textInstanceIdBuffer: any = null;
 
   private panCacheTexture: any = null;
 
@@ -1541,6 +1633,16 @@ export class WebGpuFloorplanRenderer {
   private fillPathCount = 0;
 
   private textInstanceCount = 0;
+
+  private textLodMode: TextLodMode = "auto";
+
+  private textLodRuntime: TextLodRuntime | null = null;
+
+  private textLodGpuActive = false;
+
+  private selectedTextInstanceCount = 0;
+
+  private useTextInstanceIndirection = false;
 
   private visibleSegmentCount = 0;
 
@@ -1821,6 +1923,11 @@ export class WebGpuFloorplanRenderer {
           binding: 10,
           visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "float" }
+        },
+        {
+          binding: 11,
+          visibility: gpuShaderStage.VERTEX,
+          buffer: { type: "read-only-storage" }
         }
       ]
     });
@@ -1971,6 +2078,18 @@ export class WebGpuFloorplanRenderer {
       addressModeV: "clamp-to-edge"
     });
 
+    // WebGPU guarantees sampler anisotropy values through 16. Keep the glyph
+    // atlas sharp when a PDF plane is viewed at a steep angle without changing
+    // the sampling policy of ordinary raster-image layers.
+    this.textRasterSampler = this.gpuDevice.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+      maxAnisotropy: 16
+    });
+
     this.gradientSampler = this.gpuDevice.createSampler({
       magFilter: "linear",
       minFilter: "linear",
@@ -2094,6 +2213,29 @@ export class WebGpuFloorplanRenderer {
         activeLevels: this.vectorLodStats.activeLevels.map((level) => ({ ...level }))
       }
       : null;
+  }
+
+  setTextLodMode(mode: TextLodMode): void {
+    const nextMode: TextLodMode = mode === "off" ? "off" : "auto";
+    if (this.textLodMode === nextMode) {
+      return;
+    }
+    this.textLodMode = nextMode;
+    if (nextMode === "auto" && this.scene && !this.textLodGpuActive) {
+      this.setScene(this.scene);
+      return;
+    }
+    this.textLodRuntime?.setMode(nextMode);
+    this.selectedTextInstanceCount = 0;
+    this.useTextInstanceIndirection = false;
+    this.destroyPanCacheResources();
+    this.destroyVectorMinifyResources();
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  getTextLodStats(): TextLodStats | null {
+    return this.textLodRuntime?.getStats() ?? null;
   }
 
   setStrokeCurveEnabled(enabled: boolean): void {
@@ -2307,6 +2449,11 @@ export class WebGpuFloorplanRenderer {
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
     this.textInstanceCount = scene.textInstanceCount;
+    this.textLodRuntime?.dispose();
+    this.textLodRuntime = null;
+    this.textLodGpuActive = false;
+    this.selectedTextInstanceCount = 0;
+    this.useTextInstanceIndirection = false;
     this.buildSegmentBounds(scene);
 
     this.isPanInteracting = false;
@@ -2317,12 +2464,72 @@ export class WebGpuFloorplanRenderer {
 
     const maxTextureSize = this.maxTextureSize();
 
+    const textLodBuildResult = this.textLodMode === "auto"
+      ? getOrBuildTextLod(scene)
+      : getCachedTextLod(scene);
+    this.textLodRuntime = textLodBuildResult
+      ? new TextLodRuntime(textLodBuildResult, this.textLodMode)
+      : null;
+    let textLodUploadData: TextLodBuildData | null = null;
+    if (this.textLodMode === "auto" && textLodBuildResult?.data) {
+      const data = textLodBuildResult.data;
+      const fitsGpuResources =
+        canFitTextureItems(data.combinedInstanceCount, maxTextureSize) &&
+        canFitTextureItems(scene.textGlyphCount + 1, maxTextureSize) &&
+        canFitTextureItems(
+          scene.textGlyphSegmentCount + TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+          maxTextureSize
+        ) &&
+        this.canFitTextLodStorageBuffer(scene.textInstanceCount);
+      if (fitsGpuResources) {
+        textLodUploadData = data;
+        this.textLodGpuActive = true;
+      } else {
+        this.textLodRuntime?.setResourceFallback("resource-capacity");
+      }
+    }
+
     const segmentDims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
     const fillSegmentDims = chooseTextureDimensions(scene.fillSegmentCount, maxTextureSize);
-    const textInstanceDims = chooseTextureDimensions(scene.textInstanceCount, maxTextureSize);
-    const textGlyphDims = chooseTextureDimensions(scene.textGlyphCount, maxTextureSize);
-    const textSegmentDims = chooseTextureDimensions(scene.textGlyphSegmentCount, maxTextureSize);
+    let textInstanceDims = chooseTextureDimensions(
+      textLodUploadData?.combinedInstanceCount ?? scene.textInstanceCount,
+      maxTextureSize
+    );
+    let textGlyphDims = chooseTextureDimensions(scene.textGlyphCount + (textLodUploadData ? 1 : 0), maxTextureSize);
+    let textSegmentDims = chooseTextureDimensions(
+      scene.textGlyphSegmentCount + (textLodUploadData ? TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT : 0),
+      maxTextureSize
+    );
+
+    this.destroyDataResources();
+    let textCpuPayload: NativeTextUploadArrays;
+    try {
+      textCpuPayload = prepareNativeTextUploadArrays(
+        scene,
+        textLodUploadData,
+        textInstanceDims,
+        textGlyphDims,
+        textSegmentDims
+      );
+    } catch (error) {
+      if (!textLodUploadData) {
+        throw error;
+      }
+      this.textLodRuntime?.setResourceFallback("resource-capacity");
+      this.textLodGpuActive = false;
+      textLodUploadData = null;
+      textInstanceDims = chooseTextureDimensions(scene.textInstanceCount, maxTextureSize);
+      textGlyphDims = chooseTextureDimensions(scene.textGlyphCount, maxTextureSize);
+      textSegmentDims = chooseTextureDimensions(scene.textGlyphSegmentCount, maxTextureSize);
+      textCpuPayload = prepareNativeTextUploadArrays(
+        scene,
+        null,
+        textInstanceDims,
+        textGlyphDims,
+        textSegmentDims
+      );
+    }
 
     this.segmentTextureWidth = segmentDims.width;
     this.segmentTextureHeight = segmentDims.height;
@@ -2337,8 +2544,6 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphSegmentTextureWidth = textSegmentDims.width;
     this.textGlyphSegmentTextureHeight = textSegmentDims.height;
 
-    this.destroyDataResources();
-
     this.segmentTextureA = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.endpoints);
     this.segmentTextureB = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.primitiveMeta);
     this.segmentTextureC = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, scene.styles);
@@ -2350,17 +2555,42 @@ export class WebGpuFloorplanRenderer {
     this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsA);
     this.fillSegmentTextureB = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsB);
 
-    this.textInstanceTextureA = this.createFloatTexture(this.textInstanceTextureWidth, this.textInstanceTextureHeight, scene.textInstanceA);
-    this.textInstanceTextureB = this.createFloatTexture(this.textInstanceTextureWidth, this.textInstanceTextureHeight, scene.textInstanceB);
+    const textInstanceTexels = this.textInstanceTextureWidth * this.textInstanceTextureHeight;
+    this.textInstanceTextureA = this.createFloatTexture(
+      this.textInstanceTextureWidth,
+      this.textInstanceTextureHeight,
+      textCpuPayload.textInstanceA
+    );
+    this.textInstanceTextureB = this.createFloatTexture(
+      this.textInstanceTextureWidth,
+      this.textInstanceTextureHeight,
+      textCpuPayload.textInstanceB
+    );
     this.textInstanceTextureC = this.createRgba8DataTexture(
       this.textInstanceTextureWidth,
       this.textInstanceTextureHeight,
-      packNormalizedUint8TextureData(scene.textInstanceC, this.textInstanceTextureWidth * this.textInstanceTextureHeight)
+      packNormalizedUint8TextureData(textCpuPayload.textInstanceC, textInstanceTexels)
     );
-    this.textGlyphMetaTextureA = this.createFloatTexture(this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight, scene.textGlyphMetaA);
-    this.textGlyphMetaTextureB = this.createFloatTexture(this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight, scene.textGlyphMetaB);
-    this.textGlyphSegmentTextureA = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsA);
-    this.textGlyphSegmentTextureB = this.createFloatTexture(this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight, scene.textGlyphSegmentsB);
+    this.textGlyphMetaTextureA = this.createFloatTexture(
+      this.textGlyphMetaTextureWidth,
+      this.textGlyphMetaTextureHeight,
+      textCpuPayload.textGlyphMetaA
+    );
+    this.textGlyphMetaTextureB = this.createFloatTexture(
+      this.textGlyphMetaTextureWidth,
+      this.textGlyphMetaTextureHeight,
+      textCpuPayload.textGlyphMetaB
+    );
+    this.textGlyphSegmentTextureA = this.createFloatTexture(
+      this.textGlyphSegmentTextureWidth,
+      this.textGlyphSegmentTextureHeight,
+      textCpuPayload.textGlyphSegmentsA
+    );
+    this.textGlyphSegmentTextureB = this.createFloatTexture(
+      this.textGlyphSegmentTextureWidth,
+      this.textGlyphSegmentTextureHeight,
+      textCpuPayload.textGlyphSegmentsB
+    );
     const glyphRasterMetaData = new Float32Array(this.textGlyphMetaTextureWidth * this.textGlyphMetaTextureHeight * 4);
     const textRasterAtlas = buildTextRasterAtlas(scene, maxTextureSize);
     if (textRasterAtlas) {
@@ -2392,6 +2622,7 @@ export class WebGpuFloorplanRenderer {
       this.gpuDevice.queue.writeBuffer(this.segmentIdBufferAll, 0, this.allSegmentIds);
       this.gpuDevice.queue.writeBuffer(this.segmentIdBufferVisible, 0, this.allSegmentIds);
     }
+    this.ensureTextInstanceIdBuffer(this.textLodGpuActive ? this.textInstanceCount : 1);
 
     this.fillBindGroup = this.gpuDevice.createBindGroup({
       layout: this.fillPipeline.getBindGroupLayout(0),
@@ -2464,11 +2695,15 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 9,
-          resource: this.rasterLayerSampler
+          resource: this.textRasterSampler
         },
         {
           binding: 10,
           resource: this.textRasterAtlasTexture.createView()
+        },
+        {
+          binding: 11,
+          resource: { buffer: this.textInstanceIdBuffer }
         }
       ]
     });
@@ -2602,7 +2837,7 @@ export class WebGpuFloorplanRenderer {
     return this.presentedFrameSerial;
   }
 
-  setViewState(viewState: ViewState, _options: { preservePanCache?: boolean; interacting?: boolean } = {}): void {
+  setViewState(viewState: ViewState, options: ViewStateUpdateOptions = {}): void {
     const nextCenterX = Number(viewState.cameraCenterX);
     const nextCenterY = Number(viewState.cameraCenterY);
     const nextZoom = Number(viewState.zoom);
@@ -2625,7 +2860,9 @@ export class WebGpuFloorplanRenderer {
     this.presentedCameraCenterY = this.cameraCenterY;
     this.presentedZoom = this.zoom;
     this.needsVisibleSetUpdate = true;
-    this.requestFrame();
+    if (options.scheduleFrame !== false) {
+      this.requestFrame();
+    }
   }
 
   setSearchHighlights(highlights: SearchHighlightSet | null): void {
@@ -2889,6 +3126,16 @@ export class WebGpuFloorplanRenderer {
       this.segmentIdBufferVisible.destroy();
       this.segmentIdBufferVisible = null;
     }
+    if (this.textInstanceIdBuffer) {
+      this.textInstanceIdBuffer.destroy();
+      this.textInstanceIdBuffer = null;
+    }
+
+    this.textLodRuntime?.dispose();
+    this.textLodRuntime = null;
+    this.textLodGpuActive = false;
+    this.selectedTextInstanceCount = 0;
+    this.useTextInstanceIndirection = false;
 
     if (this.cameraUniformBuffer) {
       this.cameraUniformBuffer.destroy();
@@ -2997,6 +3244,19 @@ export class WebGpuFloorplanRenderer {
 
     this.segmentIdBufferAll = this.createSegmentIdStorageBuffer(nextBytes);
     this.segmentIdBufferVisible = this.createSegmentIdStorageBuffer(nextBytes);
+  }
+
+  private canFitTextLodStorageBuffer(instanceCapacity: number): boolean {
+    const requiredBytes = Math.max(1, instanceCapacity) * 4;
+    const storageLimit = Number(this.gpuDevice?.limits?.maxStorageBufferBindingSize);
+    const bufferLimit = Number(this.gpuDevice?.limits?.maxBufferSize);
+    return (!Number.isFinite(storageLimit) || requiredBytes <= storageLimit) &&
+      (!Number.isFinite(bufferLimit) || requiredBytes <= bufferLimit);
+  }
+
+  private ensureTextInstanceIdBuffer(instanceCapacity: number): void {
+    this.textInstanceIdBuffer?.destroy();
+    this.textInstanceIdBuffer = this.createSegmentIdStorageBuffer(Math.max(1, instanceCapacity), false);
   }
 
   private createSegmentIdStorageBuffer(byteSizeOrCapacity: number, sizeIsBytes = true): any {
@@ -3153,7 +3413,7 @@ export class WebGpuFloorplanRenderer {
         ]
       });
 
-      this.updateCameraUniforms(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+      this.updateCameraUniforms(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY, this.zoom, false);
       if (minifyPlan.splitOrderedGradientPrefix) {
         // Keep the raster/native-gradient prefix in exact PDF order and only
         // supersample the ordinary vector suffix. Extraction guarantees
@@ -3272,7 +3532,21 @@ export class WebGpuFloorplanRenderer {
       ]
     });
 
-    this.updateCameraUniforms(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, effectiveZoom);
+    this.updateCameraUniforms(
+      viewportWidth,
+      viewportHeight,
+      cameraCenterX,
+      cameraCenterY,
+      effectiveZoom,
+      true,
+      {
+        viewportWidth: this.canvas.width,
+        viewportHeight: this.canvas.height,
+        cameraCenterX,
+        cameraCenterY,
+        zoom: this.zoom
+      }
+    );
     if (includeGradientPaint) {
       this.drawOrderedGradientVectorsIntoPass(pass);
     }
@@ -3508,9 +3782,15 @@ export class WebGpuFloorplanRenderer {
     }
 
     if (this.textRenderingEnabled && this.textInstanceCount > 0 && this.textBindGroup) {
+      const textDrawCount = this.useTextInstanceIndirection
+        ? this.selectedTextInstanceCount
+        : this.textInstanceCount;
+      if (textDrawCount <= 0) {
+        return strokeInstanceCount;
+      }
       pass.setPipeline(this.textPipeline);
       pass.setBindGroup(0, this.textBindGroup);
-      pass.draw(4, this.textInstanceCount, 0, 0);
+      pass.draw(4, textDrawCount, 0, 0);
     }
 
     return strokeInstanceCount;
@@ -3521,8 +3801,25 @@ export class WebGpuFloorplanRenderer {
     viewportHeight: number,
     cameraCenterX: number,
     cameraCenterY: number,
-    zoomValue = this.zoom
+    zoomValue = this.zoom,
+    prepareTextLodSelection = true,
+    textLodProjection?: {
+      viewportWidth: number;
+      viewportHeight: number;
+      cameraCenterX: number;
+      cameraCenterY: number;
+      zoom: number;
+    }
   ): void {
+    if (prepareTextLodSelection) {
+      this.useTextInstanceIndirection = this.updateTextLodSelection(
+        textLodProjection?.viewportWidth ?? viewportWidth,
+        textLodProjection?.viewportHeight ?? viewportHeight,
+        textLodProjection?.cameraCenterX ?? cameraCenterX,
+        textLodProjection?.cameraCenterY ?? cameraCenterY,
+        textLodProjection?.zoom ?? zoomValue
+      );
+    }
     const data = new Float32Array(CAMERA_UNIFORM_FLOATS);
     data[0] = viewportWidth;
     data[1] = viewportHeight;
@@ -3535,7 +3832,7 @@ export class WebGpuFloorplanRenderer {
     data[8] = this.strokeCurveEnabled ? 1 : 0;
     data[9] = 1.0;
     data[10] = this.textVectorOnly ? 1 : 0;
-    data[11] = 0;
+    data[11] = prepareTextLodSelection && this.useTextInstanceIndirection ? 1 : 0;
     data[12] = this.vectorOverrideColor[0];
     data[13] = this.vectorOverrideColor[1];
     data[14] = this.vectorOverrideColor[2];
@@ -3543,6 +3840,37 @@ export class WebGpuFloorplanRenderer {
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
+  }
+
+  private updateTextLodSelection(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoomValue: number
+  ): boolean {
+    const runtime = this.textLodRuntime;
+    if (!runtime || !this.textLodGpuActive || this.textLodMode === "off" || !this.textInstanceIdBuffer) {
+      this.selectedTextInstanceCount = 0;
+      return false;
+    }
+
+    const selection = runtime.update({
+      localToClip: createOrthographicLocalToClip(
+        cameraCenterX,
+        cameraCenterY,
+        zoomValue,
+        viewportWidth,
+        viewportHeight
+      ),
+      viewportWidth,
+      viewportHeight
+    });
+    this.selectedTextInstanceCount = selection.instanceIds.length;
+    if (selection.changed && selection.instanceIds.length > 0) {
+      this.gpuDevice.queue.writeBuffer(this.textInstanceIdBuffer, 0, selection.instanceIds);
+    }
+    return true;
   }
 
   private updateVectorCompositeUniforms(viewportWidth: number, viewportHeight: number): void {
@@ -4585,6 +4913,10 @@ export class WebGpuFloorplanRenderer {
     this.gradientFillBindGroup = null;
     this.gradientStrokeBindGroup = null;
     this.textBindGroup = null;
+    if (this.textInstanceIdBuffer) {
+      this.textInstanceIdBuffer.destroy();
+      this.textInstanceIdBuffer = null;
+    }
     this.destroyPageBackgroundResources();
     this.destroyRasterLayerResources();
 
@@ -4993,6 +5325,36 @@ function assertUniformBufferSizeMatches(data: Float32Array, requiredBytes: numbe
   }
 }
 
+function prepareNativeTextUploadArrays(
+  scene: VectorScene,
+  textLodData: TextLodBuildData | null,
+  instanceDims: TextureDimensions,
+  glyphDims: TextureDimensions,
+  segmentDims: TextureDimensions
+): NativeTextUploadArrays {
+  const arrays: NativeTextUploadArrays = {
+    textInstanceA: new Float32Array(instanceDims.width * instanceDims.height * 4),
+    textInstanceB: new Float32Array(instanceDims.width * instanceDims.height * 4),
+    textInstanceC: new Float32Array(instanceDims.width * instanceDims.height * 4),
+    textGlyphMetaA: new Float32Array(glyphDims.width * glyphDims.height * 4),
+    textGlyphMetaB: new Float32Array(glyphDims.width * glyphDims.height * 4),
+    textGlyphSegmentsA: new Float32Array(segmentDims.width * segmentDims.height * 4),
+    textGlyphSegmentsB: new Float32Array(segmentDims.width * segmentDims.height * 4)
+  };
+  if (textLodData) {
+    appendTextLodCombinedPayload(scene, textLodData, arrays);
+  } else {
+    arrays.textInstanceA.set(scene.textInstanceA);
+    arrays.textInstanceB.set(scene.textInstanceB);
+    arrays.textInstanceC.set(scene.textInstanceC);
+    arrays.textGlyphMetaA.set(scene.textGlyphMetaA);
+    arrays.textGlyphMetaB.set(scene.textGlyphMetaB);
+    arrays.textGlyphSegmentsA.set(scene.textGlyphSegmentsA);
+    arrays.textGlyphSegmentsB.set(scene.textGlyphSegmentsB);
+  }
+  return arrays;
+}
+
 function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { width: number; height: number } {
   const safeCount = Math.max(1, itemCount);
   const preferredWidth = Math.ceil(Math.sqrt(safeCount));
@@ -5004,6 +5366,10 @@ function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { w
   }
 
   return { width, height };
+}
+
+function canFitTextureItems(itemCount: number, maxTextureSize: number): boolean {
+  return maxTextureSize >= 1 && Math.max(1, itemCount) / maxTextureSize <= maxTextureSize;
 }
 
 function normalizePageRects(scene: VectorScene): Float32Array {
