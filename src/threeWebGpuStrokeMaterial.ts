@@ -7,7 +7,10 @@ import {
   CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE
 } from "./coreWgslShaders";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
+import {
+  createThreeWebGpuOutputFragmentFns,
+  type ThreeColorCompositing
+} from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -22,6 +25,7 @@ export interface ThreeWebGpuStrokeMaterialState {
 }
 
 interface ThreeWebGpuStrokeMaterialOptions {
+  colorCompositing: ThreeColorCompositing;
   segmentTextureA: THREE.DataTexture;
   segmentTextureB: THREE.DataTexture;
   segmentStyleTexture: THREE.DataTexture;
@@ -158,7 +162,7 @@ const distanceToQuadraticBezierFn = TSL.wgslFn(
   [includeNode(distanceToLineSegmentFn)]
 );
 
-const fragmentFn = TSL.wgslFn(`
+const fragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprStrokeFragment(
   local: vec2<f32>,
   primitiveA: vec4<f32>,
@@ -216,10 +220,9 @@ fn heprStrokeFragment(
   let mixAmount = clamp(vectorOverride.a, 0.0, 1.0);
   let baseColor = style.yzw;
   let color = baseColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
-  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
+  return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
 `, [
-  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(floatModFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn)
@@ -285,7 +288,7 @@ export function createThreeWebGpuStrokeMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: localToClipUniform
   });
-  material.fragmentNode = callNode(fragmentFn, {
+  material.fragmentNode = callNode(fragmentFns[options.colorCompositing], {
     local: worldPackValue.xy,
     primitiveA,
     primitiveB,

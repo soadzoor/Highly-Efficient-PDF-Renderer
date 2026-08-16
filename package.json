@@ -67,6 +67,7 @@
     "test:text-lod-native": "node scripts/test-native-text-lod.mjs",
     "test:text-lod-three": "node scripts/test-three-text-lod.mjs",
     "test:deferred-renderer": "node --experimental-strip-types scripts/test-deferred-renderer-api.mjs",
+    "test:three-color": "node scripts/test-three-color-parity.mjs",
     "test:three-performance": "node scripts/test-three-instance-buffer-updates.mjs",
     "test:parsed-zip": "node scripts/test-parsed-data-zip.mjs",
     "test:parsed-zip:package": "npm run build:lib && node scripts/test-parsed-data-zip-package.mjs",

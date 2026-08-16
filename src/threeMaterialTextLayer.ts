@@ -13,10 +13,12 @@ import {
   normalizeThreeTextRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
 import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
+import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TextLayerOptions {
   materialBackend?: "webgl" | "webgpu";
+  colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   textVectorOnly: boolean;
   vectorOverride: [number, number, number, number];
@@ -219,6 +221,7 @@ export class ThreeMaterialTextLayer {
     let material: THREE.Material;
     if (materialBackend === "webgpu") {
       const state = createThreeWebGpuTextMaterial({
+        colorCompositing: options.colorCompositing ?? "linear",
         textInstanceTextureA: this.textInstanceTextureA,
         textInstanceTextureB: this.textInstanceTextureB,
         textInstanceTextureC: this.textInstanceTextureC,

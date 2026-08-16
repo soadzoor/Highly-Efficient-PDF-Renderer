@@ -280,7 +280,7 @@ function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLR
     premultipliedAlpha: false,
     powerPreference: "high-performance"
   });
-  configureThreeRenderer(nextRenderer);
+  configureThreeRenderer(nextRenderer, THREE.SRGBColorSpace);
   return nextRenderer;
 }
 
@@ -297,7 +297,10 @@ async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promi
     // bandwidth and memory for Three's default half-float intermediate target.
     outputBufferType: THREE.UnsignedByteType
   } as WebGpuRendererParametersWithCanvas);
-  configureThreeRenderer(nextRenderer);
+  // HEPR's native renderers and Three/WebGL composite extracted PDF display
+  // values directly. Disable Three's linear intermediate/output transform for
+  // this dedicated comparison renderer so Three/WebGPU does the same.
+  configureThreeRenderer(nextRenderer, THREE.LinearSRGBColorSpace);
   await nextRenderer.init();
   stopThreeInternalAnimationLoop(nextRenderer);
   return nextRenderer;
@@ -330,25 +333,25 @@ function stopThreeInternalAnimationLoop(nextRenderer: ThreeExampleRenderer): voi
   }
 }
 
-function configureThreeRenderer(nextRenderer: ThreeExampleRenderer): void {
+function configureThreeRenderer(
+  nextRenderer: ThreeExampleRenderer,
+  outputColorSpace: string
+): void {
   nextRenderer.toneMapping = THREE.NoToneMapping;
-  nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
-  // Clearing through the render pass rather than standalone clear() calls: on
-  // WebGPU each manual clear is its own backend clear plus a full-screen output
-  // pass, because an sRGB output color space forces an intermediate framebuffer
-  // target. Autoclear folds it into the pass load operation instead.
+  nextRenderer.outputColorSpace = outputColorSpace;
+  // Fold the clear into the render pass load operation on both backends.
   nextRenderer.autoClear = true;
-  nextRenderer.setClearColor(createNativeClearColor(), 1);
+  nextRenderer.setClearColor(createNativeClearColor(outputColorSpace), 1);
   nextRenderer.setPixelRatio(window.devicePixelRatio || 1);
   nextRenderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
 }
 
-function createNativeClearColor(): THREE.Color {
+function createNativeClearColor(outputColorSpace: string): THREE.Color {
   return new THREE.Color().setRGB(
     NATIVE_CLEAR_COLOR_R,
     NATIVE_CLEAR_COLOR_G,
     NATIVE_CLEAR_COLOR_B,
-    THREE.SRGBColorSpace
+    outputColorSpace
   );
 }
 
@@ -864,6 +867,7 @@ function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> 
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
+    threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
     textLod: readTextLodMode(),
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],

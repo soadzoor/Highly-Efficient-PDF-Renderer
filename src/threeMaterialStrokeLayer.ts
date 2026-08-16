@@ -13,10 +13,12 @@ import {
   normalizeThreeStrokeRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
 import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
+import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface StrokeLayerOptions {
   materialBackend?: "webgl" | "webgpu";
+  colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
 }
@@ -131,6 +133,7 @@ export class ThreeMaterialStrokeLayer {
     let material: THREE.Material;
     if (materialBackend === "webgpu") {
       const webGpuMaterial = createThreeWebGpuStrokeMaterial({
+        colorCompositing: options.colorCompositing ?? "linear",
         segmentTextureA: this.segmentTextureA,
         segmentTextureB: this.segmentTextureB,
         segmentStyleTexture: this.segmentStyleTexture,

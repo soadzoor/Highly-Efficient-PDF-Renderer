@@ -10,10 +10,12 @@ import {
   HEPR_THREE_LAYER_ORDER_RASTER
 } from "./threeLayerOrder";
 import { createThreeWebGpuRasterMaterial, type ThreeWebGpuRasterMaterialState } from "./threeWebGpuRasterMaterial";
+import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface RasterLayerOptions {
   materialBackend?: "webgl" | "webgpu";
+  colorCompositing?: ThreeColorCompositing;
   pageBackground: [number, number, number, number];
 }
 
@@ -46,6 +48,7 @@ export class ThreeMaterialRasterLayer {
   private readonly geometry: THREE.BufferGeometry;
   private readonly pageBackgroundGeometry: THREE.BufferGeometry | null;
   private readonly materialBackend: "webgl" | "webgpu";
+  private readonly colorCompositing: ThreeColorCompositing;
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
@@ -61,6 +64,7 @@ export class ThreeMaterialRasterLayer {
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
     this.materialBackend = options.materialBackend ?? "webgl";
+    this.colorCompositing = options.colorCompositing ?? "linear";
     this.group = new THREE.Group();
     this.group.visible = false;
 
@@ -228,6 +232,7 @@ export class ThreeMaterialRasterLayer {
 
     if (this.materialBackend === "webgpu") {
       const state = createThreeWebGpuRasterMaterial({
+        colorCompositing: this.colorCompositing,
         texture,
         matrixABCD: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]),
         matrixEF: new THREE.Vector2(matrix[4], matrix[5]),

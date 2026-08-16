@@ -1,7 +1,10 @@
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
-import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
+import {
+  createThreeWebGpuOutputFragmentFns,
+  type ThreeColorCompositing
+} from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -14,6 +17,7 @@ export interface ThreeWebGpuRasterMaterialState {
 }
 
 interface ThreeWebGpuRasterMaterialOptions {
+  colorCompositing: ThreeColorCompositing;
   texture: THREE.Texture;
   matrixABCD: THREE.Vector4;
   matrixEF: THREE.Vector2;
@@ -70,16 +74,16 @@ fn heprRasterClipPosition(
 }
 `);
 
-const rasterFragmentFn = TSL.wgslFn(`
+const rasterFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprRasterFragment(color: vec4<f32>) -> vec4<f32> {
   if (color.a <= 0.001) {
     discard;
   }
   let straightSrgb = clamp(color.rgb / color.a, vec3<f32>(0.0), vec3<f32>(1.0));
-  let linearPremultiplied = heprThreeOutputSrgbToLinear(straightSrgb) * color.a;
-  return vec4<f32>(linearPremultiplied, color.a);
+  let outputPremultiplied = heprThreeOutputColor(straightSrgb) * color.a;
+  return vec4<f32>(outputPremultiplied, color.a);
 }
-`, [threeWebGpuOutputSrgbToLinearFn as never]);
+`);
 
 export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions
@@ -116,7 +120,7 @@ export function createThreeWebGpuRasterMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: TSL.uniform(options.localToClip)
   });
-  material.fragmentNode = callNode(rasterFragmentFn, {
+  material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
     color: TSL.texture(options.texture, rasterPackValue.zw as never)
   });
 

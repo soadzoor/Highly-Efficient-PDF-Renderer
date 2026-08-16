@@ -7,6 +7,7 @@ import {
 import {
   createThreePdfObject,
   type HeprRendererType,
+  type ThreeColorCompositing,
   type HeprThreeObjectOptions,
   type HeprColorInput,
   type HeprThreePdfObject
@@ -151,6 +152,7 @@ export type {
   PdfObjectSourceKind,
   PdfObjectGeneratorOptions,
   HeprRendererType,
+  ThreeColorCompositing,
   HeprThreeObjectOptions,
   HeprColorInput,
   HeprThreePdfObject,

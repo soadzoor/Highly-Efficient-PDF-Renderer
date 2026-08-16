@@ -2,7 +2,10 @@ import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
+import {
+  createThreeWebGpuOutputFragmentFns,
+  type ThreeColorCompositing
+} from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -17,6 +20,7 @@ export interface ThreeWebGpuTextMaterialState {
 }
 
 interface ThreeWebGpuTextMaterialOptions {
+  colorCompositing: ThreeColorCompositing;
   textInstanceTextureA: THREE.DataTexture;
   textInstanceTextureB: THREE.DataTexture;
   textInstanceTextureC: THREE.DataTexture;
@@ -297,7 +301,7 @@ fn heprQuadraticWindingDelta(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f
 }
 `);
 
-const textFragmentFn = TSL.wgslFn(`
+const textFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprTextFragment(
   local: vec2<f32>,
   glyphMetaA: vec4<f32>,
@@ -401,7 +405,7 @@ fn heprTextFragment(
     if (rasterAlpha <= 0.001) {
       discard;
     }
-    return vec4<f32>(heprThreeOutputSrgbToLinear(tintedColor), rasterAlpha);
+    return vec4<f32>(heprThreeOutputColor(tintedColor), rasterAlpha);
   }
 
   let coincidentEpsilon = max(baseAAWidth * 0.0001, 0.0000001);
@@ -527,10 +531,9 @@ fn heprTextFragment(
     discard;
   }
 
-  return vec4<f32>(heprThreeOutputSrgbToLinear(tintedColor), alpha);
+  return vec4<f32>(heprThreeOutputColor(tintedColor), alpha);
 }
 `, [
-  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
   includeNode(textCrossingFns)
@@ -604,7 +607,7 @@ export function createThreeWebGpuTextMaterial(
     atlasSize: rasterAtlasSizeUniform
   });
 
-  material.fragmentNode = callNode(textFragmentFn, {
+  material.fragmentNode = callNode(textFragmentFns[options.colorCompositing], {
     local: vertexPackValue.zw,
     glyphMetaA,
     instanceColor,

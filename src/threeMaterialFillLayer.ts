@@ -9,10 +9,12 @@ import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { HEPR_THREE_LAYER_ORDER_FILL } from "./threeLayerOrder";
 import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
 import { createThreeWebGpuFillMaterial, type ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
+import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface FillLayerOptions {
   materialBackend?: "webgl" | "webgpu";
+  colorCompositing?: ThreeColorCompositing;
   vectorOverride: [number, number, number, number];
 }
 
@@ -130,6 +132,7 @@ export class ThreeMaterialFillLayer {
     let material: THREE.Material;
     if ((options.materialBackend ?? "webgl") === "webgpu") {
       const state = createThreeWebGpuFillMaterial({
+        colorCompositing: options.colorCompositing ?? "linear",
         fillPathMetaTextureA: this.fillPathMetaTextureA,
         fillPathMetaTextureB: this.fillPathMetaTextureB,
         fillPathMetaTextureC: this.fillPathMetaTextureC,
