@@ -1,9 +1,10 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import type { SearchHighlightSet } from "./searchHighlights";
 import type { TextLodMode, TextLodStats } from "./textLodCore";
-import type { DrawStats, ProjectedFrameOptions, SceneStats, SearchHighlightSet, ViewState } from "./webGlFloorplanRenderer";
+import type { DrawStats, ProjectedFrameOptions, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import type { VectorLodMode, VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
-export type { SearchHighlightSet };
+export type { SearchHighlightSet } from "./searchHighlights";
 
 /** Native HEPR renderer backend identifier. */
 export type RendererBackend = "webgl" | "webgpu";

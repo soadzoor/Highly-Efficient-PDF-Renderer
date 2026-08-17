@@ -62,6 +62,7 @@
     "test:pdf-cancel": "node scripts/test-pdf-source-cancellation.mjs",
     "test:raster-archive": "node scripts/test-raster-image-zip.mjs",
     "test:raster-ownership": "node scripts/test-raster-texture-ownership.mjs",
+    "test:text-search": "node scripts/test-text-search.mjs",
     "test:text-glyph-coverage": "node scripts/test-text-glyph-coverage.mjs",
     "test:text-lod-core": "node --experimental-strip-types scripts/test-text-lod-core.mjs",
     "test:text-lod-native": "node --experimental-strip-types scripts/test-native-text-lod.mjs",

@@ -34,6 +34,7 @@ import {
   type TextLodStats
 } from "./textLodCore";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
+import { prepareSearchHighlights, type SearchHighlightSet } from "./searchHighlights";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
@@ -1344,17 +1345,7 @@ export interface ViewState {
   zoom: number;
 }
 
-/**
- * Search-highlight rectangles drawn natively by the renderer, in the same
- * frame and with the same camera transform as the scene (no overlay lag).
- */
-export interface SearchHighlightSet {
-  /** 4 floats per rectangle: minX, minY, maxX, maxY in scene space. */
-  rects: Float32Array;
-  count: number;
-  /** Rectangle drawn with the emphasized "current match" style, or -1. */
-  currentIndex: number;
-}
+export type { SearchHighlightSet } from "./searchHighlights";
 
 /** Parameters for rendering a native frame through an external projection. */
 export interface ProjectedFrameOptions {
@@ -1486,7 +1477,7 @@ export class WebGlFloorplanRenderer {
 
   private highlightOthersCount = 0;
 
-  private highlightHasCurrent = false;
+  private highlightCurrentCount = 0;
 
   private highlightSelectionCount = 0;
 
@@ -2701,39 +2692,26 @@ export class WebGlFloorplanRenderer {
       return;
     }
     const gl = this.gl;
-    const count = highlights ? Math.min(Math.max(0, highlights.count), Math.floor(highlights.rects.length / 4)) : 0;
-    if (!highlights || count === 0) {
-      if (this.highlightOthersCount !== 0 || this.highlightHasCurrent) {
+    const prepared = prepareSearchHighlights(highlights);
+    if (!prepared) {
+      if (this.highlightOthersCount !== 0 || this.highlightCurrentCount !== 0) {
         this.highlightOthersCount = 0;
-        this.highlightHasCurrent = false;
+        this.highlightCurrentCount = 0;
         this.requestFrame();
       }
       return;
     }
 
-    const rects = highlights.rects;
-    const currentIndex = highlights.currentIndex >= 0 && highlights.currentIndex < count ? highlights.currentIndex : -1;
-    const othersCount = currentIndex >= 0 ? count - 1 : count;
-
-    const others = new Float32Array(othersCount * 4);
-    let cursor = 0;
-    for (let i = 0; i < count; i += 1) {
-      if (i === currentIndex) {
-        continue;
-      }
-      others.set(rects.subarray(i * 4, i * 4 + 4), cursor * 4);
-      cursor += 1;
-    }
     gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightOthersBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, others, gl.DYNAMIC_DRAW);
-    if (currentIndex >= 0) {
+    gl.bufferData(gl.ARRAY_BUFFER, prepared.otherRects, gl.DYNAMIC_DRAW);
+    if (prepared.currentCount > 0) {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.highlightCurrentBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, rects.subarray(currentIndex * 4, currentIndex * 4 + 4), gl.DYNAMIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, prepared.currentRects, gl.DYNAMIC_DRAW);
     }
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    this.highlightOthersCount = othersCount;
-    this.highlightHasCurrent = currentIndex >= 0;
+    this.highlightOthersCount = prepared.otherCount;
+    this.highlightCurrentCount = prepared.currentCount;
     this.requestFrame();
   }
 
@@ -3777,7 +3755,7 @@ export class WebGlFloorplanRenderer {
     cameraCenterY: number,
     zoomValue = this.zoom
   ): void {
-    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent && this.highlightSelectionCount === 0) {
+    if (this.highlightOthersCount === 0 && this.highlightCurrentCount === 0 && this.highlightSelectionCount === 0) {
       return;
     }
 
@@ -3801,9 +3779,14 @@ export class WebGlFloorplanRenderer {
       gl.bindVertexArray(this.highlightOthersVao);
       this.drawHighlightBatch(this.highlightOthersCount, HIGHLIGHT_OTHER_FILL, HIGHLIGHT_OTHER_BORDER, HIGHLIGHT_OTHER_BORDER_PX);
     }
-    if (this.highlightHasCurrent) {
+    if (this.highlightCurrentCount > 0) {
       gl.bindVertexArray(this.highlightCurrentVao);
-      this.drawHighlightBatch(1, HIGHLIGHT_CURRENT_FILL, HIGHLIGHT_CURRENT_BORDER, HIGHLIGHT_CURRENT_BORDER_PX);
+      this.drawHighlightBatch(
+        this.highlightCurrentCount,
+        HIGHLIGHT_CURRENT_FILL,
+        HIGHLIGHT_CURRENT_BORDER,
+        HIGHLIGHT_CURRENT_BORDER_PX
+      );
     }
     gl.bindVertexArray(null);
   }

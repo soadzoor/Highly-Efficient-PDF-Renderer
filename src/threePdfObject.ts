@@ -23,6 +23,8 @@ import { applyThreePdfOverlayPaintOrder } from "./threePdfPaintOrder";
 import type { Bounds } from "./pdfVectorExtractor";
 import {
   createSceneTextSearcher,
+  flattenSearchMatchHighlightBounds,
+  getSearchMatchHighlightBounds,
   type SceneTextSearcher,
   type SceneTextSearchOptions,
   type TextSearchMatch
@@ -49,6 +51,8 @@ export interface HeprTextSearchMatch extends TextSearchMatch {
    * a three.js camera on the match.
    */
   localBounds: Bounds;
+  /** Per-line local highlight rectangles; optional for legacy match objects. */
+  localHighlightBounds?: Bounds[];
 }
 
 const DEFAULT_FIT_PADDING_PIXELS = 64;
@@ -542,9 +546,10 @@ export class HeprThreePdfObject extends THREE.Group {
    * Matching is case-insensitive unless `options.caseSensitive` is set, and
    * whitespace in the query matches across line breaks. Matches come back in
    * composed page/reading order with `bounds` in PDF scene space and
-   * `localBounds` in this object's local space; feed them to
-   * `setSearchHighlights` and frame your camera on `localBounds` to implement
-   * a find feature.
+   * `localBounds` in this object's local space. Wrapped matches additionally
+   * carry tight per-line `highlightBounds` / `localHighlightBounds`; feed the
+   * matches to `setSearchHighlights` and frame your camera on `localBounds` to
+   * implement a find feature.
    */
   searchText(query: string, options: SceneTextSearchOptions = {}): HeprTextSearchMatch[] {
     if (this.isDisposed) {
@@ -558,7 +563,13 @@ export class HeprThreePdfObject extends THREE.Group {
         minY: match.bounds.minY - this.sceneCenterY,
         maxX: match.bounds.maxX - this.sceneCenterX,
         maxY: match.bounds.maxY - this.sceneCenterY
-      }
+      },
+      localHighlightBounds: getSearchMatchHighlightBounds(match).map((bounds) => ({
+        minX: bounds.minX - this.sceneCenterX,
+        minY: bounds.minY - this.sceneCenterY,
+        maxX: bounds.maxX - this.sceneCenterX,
+        maxY: bounds.maxY - this.sceneCenterY
+      }))
     }));
   }
 
@@ -571,7 +582,11 @@ export class HeprThreePdfObject extends THREE.Group {
    * clear.
    */
   setSearchHighlights(
-    matches: ReadonlyArray<Pick<TextSearchMatch, "bounds">> | null,
+    matches:
+      | ReadonlyArray<
+          Pick<TextSearchMatch, "bounds"> & Partial<Pick<TextSearchMatch, "highlightBounds">>
+        >
+      | null,
     options: { currentIndex?: number } = {}
   ): void {
     if (this.isDisposed) {
@@ -591,19 +606,26 @@ export class HeprThreePdfObject extends THREE.Group {
         ? options.currentIndex
         : -1;
 
-    const othersCount = currentIndex >= 0 ? list.length - 1 : list.length;
+    const flattened = flattenSearchMatchHighlightBounds(list, currentIndex);
+    const totalRectCount = flattened.bounds.length;
+    const currentRectCount = flattened.currentCount;
+    const othersCount = totalRectCount - currentRectCount;
     const othersPositions = new Float32Array(othersCount * 18);
     const othersOutlinePositions = new Float32Array(othersCount * 24);
-    const currentPositions = new Float32Array(currentIndex >= 0 ? 18 : 0);
-    const currentOutlinePositions = new Float32Array(currentIndex >= 0 ? 24 : 0);
+    const currentPositions = new Float32Array(currentRectCount * 18);
+    const currentOutlinePositions = new Float32Array(currentRectCount * 24);
     let othersIndex = 0;
-    for (let i = 0; i < list.length; i += 1) {
-      if (i === currentIndex) {
-        this.writeHighlightQuad(currentPositions, 0, list[i].bounds);
-        this.writeHighlightOutline(currentOutlinePositions, 0, list[i].bounds);
+    let currentRectIndex = 0;
+    const currentEnd = flattened.currentIndex + currentRectCount;
+    for (let rectIndex = 0; rectIndex < totalRectCount; rectIndex += 1) {
+      const bounds = flattened.bounds[rectIndex];
+      if (rectIndex >= flattened.currentIndex && rectIndex < currentEnd) {
+        this.writeHighlightQuad(currentPositions, currentRectIndex * 18, bounds);
+        this.writeHighlightOutline(currentOutlinePositions, currentRectIndex * 24, bounds);
+        currentRectIndex += 1;
       } else {
-        this.writeHighlightQuad(othersPositions, othersIndex * 18, list[i].bounds);
-        this.writeHighlightOutline(othersOutlinePositions, othersIndex * 24, list[i].bounds);
+        this.writeHighlightQuad(othersPositions, othersIndex * 18, bounds);
+        this.writeHighlightOutline(othersOutlinePositions, othersIndex * 24, bounds);
         othersIndex += 1;
       }
     }

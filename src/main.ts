@@ -50,7 +50,12 @@ import {
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
 import { prebuildTextLod, type TextLodMode } from "./textLodCore";
-import { createTextSearchController, type TextSearchController, type TextSearchMatch } from "./textSearch";
+import {
+  createSearchHighlightSet,
+  createTextSearchController,
+  type TextSearchController,
+  type TextSearchMatch
+} from "./textSearch";
 import { createTextSearchWidget } from "./textSearchWidget";
 import { createTextSelectionController } from "./textSelection";
 import type { SearchHighlightSet } from "./rendererTypes";
@@ -220,23 +225,7 @@ let textSearchController: TextSearchController;
 let lastSearchHighlights: SearchHighlightSet | null = null;
 
 function applySearchHighlights(current: TextSearchMatch | null, all: TextSearchMatch[]): void {
-  if (all.length === 0) {
-    lastSearchHighlights = null;
-  } else {
-    const rects = new Float32Array(all.length * 4);
-    let currentIndex = -1;
-    for (let i = 0; i < all.length; i += 1) {
-      const bounds = all[i].bounds;
-      rects[i * 4] = bounds.minX;
-      rects[i * 4 + 1] = bounds.minY;
-      rects[i * 4 + 2] = bounds.maxX;
-      rects[i * 4 + 3] = bounds.maxY;
-      if (all[i] === current) {
-        currentIndex = i;
-      }
-    }
-    lastSearchHighlights = { rects, count: all.length, currentIndex };
-  }
+  lastSearchHighlights = createSearchHighlightSet(all, current ? all.indexOf(current) : -1);
   renderer.setSearchHighlights?.(lastSearchHighlights);
 }
 

@@ -14,10 +14,10 @@ import {
   NATIVE_VECTOR_MINIFY_ENABLED,
   shouldUseNativePanCacheForFrame
 } from "./nativeRenderPolicy";
+import { prepareSearchHighlights, type SearchHighlightSet } from "./searchHighlights";
 import type {
   DrawStats,
   SceneStats,
-  SearchHighlightSet,
   ViewState,
   ViewStateUpdateOptions
 } from "./webGlFloorplanRenderer";
@@ -1398,6 +1398,8 @@ export class WebGpuFloorplanRenderer {
 
   private highlightCurrentRectBuffer: any = null;
 
+  private highlightCurrentCapacityBytes = 0;
+
   private highlightSelectionRectsBuffer: any = null;
 
   private highlightSelectionCapacityBytes = 0;
@@ -1410,7 +1412,7 @@ export class WebGpuFloorplanRenderer {
 
   private highlightOthersCount = 0;
 
-  private highlightHasCurrent = false;
+  private highlightCurrentCount = 0;
 
   private highlightSelectionCount = 0;
 
@@ -2872,63 +2874,51 @@ export class WebGpuFloorplanRenderer {
   }
 
   setSearchHighlights(highlights: SearchHighlightSet | null): void {
-    const count = highlights ? Math.min(Math.max(0, highlights.count), Math.floor(highlights.rects.length / 4)) : 0;
-    if (!highlights || count === 0) {
-      if (this.highlightOthersCount !== 0 || this.highlightHasCurrent) {
+    const prepared = prepareSearchHighlights(highlights);
+    if (!prepared) {
+      if (this.highlightOthersCount !== 0 || this.highlightCurrentCount !== 0) {
         this.highlightOthersCount = 0;
-        this.highlightHasCurrent = false;
+        this.highlightCurrentCount = 0;
         this.requestFrame();
       }
       return;
     }
 
-    const rects = highlights.rects;
-    const currentIndex = highlights.currentIndex >= 0 && highlights.currentIndex < count ? highlights.currentIndex : -1;
-    const othersCount = currentIndex >= 0 ? count - 1 : count;
-
-    const others = new Float32Array(Math.max(1, othersCount) * 4);
-    let cursor = 0;
-    for (let i = 0; i < count; i += 1) {
-      if (i === currentIndex) {
-        continue;
-      }
-      others.set(rects.subarray(i * 4, i * 4 + 4), cursor * 4);
-      cursor += 1;
-    }
+    const otherRects =
+      prepared.otherCount > 0 ? prepared.otherRects : new Float32Array(4);
 
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     let bindGroupsInvalid = false;
-    if (!this.highlightOthersRectsBuffer || this.highlightOthersCapacityBytes < others.byteLength) {
+    if (!this.highlightOthersRectsBuffer || this.highlightOthersCapacityBytes < otherRects.byteLength) {
       this.highlightOthersRectsBuffer?.destroy();
-      this.highlightOthersCapacityBytes = Math.max(others.byteLength, 16 * 64);
+      this.highlightOthersCapacityBytes = Math.max(otherRects.byteLength, 16 * 64);
       this.highlightOthersRectsBuffer = this.gpuDevice.createBuffer({
         size: this.highlightOthersCapacityBytes,
         usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
       });
       bindGroupsInvalid = true;
     }
-    if (!this.highlightCurrentRectBuffer) {
+    const currentByteLength = Math.max(16, prepared.currentRects.byteLength);
+    if (!this.highlightCurrentRectBuffer || this.highlightCurrentCapacityBytes < currentByteLength) {
+      this.highlightCurrentRectBuffer?.destroy();
+      this.highlightCurrentCapacityBytes = Math.max(currentByteLength, 16 * 64);
       this.highlightCurrentRectBuffer = this.gpuDevice.createBuffer({
-        size: 16,
+        size: this.highlightCurrentCapacityBytes,
         usage: gpuBufferUsage.STORAGE | gpuBufferUsage.COPY_DST
       });
       bindGroupsInvalid = true;
     }
-    this.gpuDevice.queue.writeBuffer(this.highlightOthersRectsBuffer, 0, others);
-    if (currentIndex >= 0) {
-      this.gpuDevice.queue.writeBuffer(
-        this.highlightCurrentRectBuffer,
-        0,
-        rects.slice(currentIndex * 4, currentIndex * 4 + 4)
-      );
+    this.gpuDevice.queue.writeBuffer(this.highlightOthersRectsBuffer, 0, otherRects);
+    if (prepared.currentCount > 0) {
+      this.gpuDevice.queue.writeBuffer(this.highlightCurrentRectBuffer, 0, prepared.currentRects);
     }
 
     if (bindGroupsInvalid || this.highlightOthersBindGroups.length === 0) {
       this.rebuildHighlightBindGroups();
     }
 
-    this.highlightOthersCount = othersCount;
-    this.highlightHasCurrent = currentIndex >= 0;
+    this.highlightOthersCount = prepared.otherCount;
+    this.highlightCurrentCount = prepared.currentCount;
     this.requestFrame();
   }
 
@@ -2995,7 +2985,7 @@ export class WebGpuFloorplanRenderer {
     cameraCenterY: number,
     zoomValue: number
   ): void {
-    if (this.highlightOthersCount === 0 && !this.highlightHasCurrent && this.highlightSelectionCount === 0) {
+    if (this.highlightOthersCount === 0 && this.highlightCurrentCount === 0 && this.highlightSelectionCount === 0) {
       return;
     }
 
@@ -3017,9 +3007,9 @@ export class WebGpuFloorplanRenderer {
       pass.setBindGroup(0, this.highlightOthersBindGroups[0]);
       pass.draw(4, this.highlightOthersCount, 0, 0);
     }
-    if (this.highlightHasCurrent && this.highlightCurrentBindGroups.length === 1) {
+    if (this.highlightCurrentCount > 0 && this.highlightCurrentBindGroups.length === 1) {
       pass.setBindGroup(0, this.highlightCurrentBindGroups[0]);
-      pass.draw(4, 1, 0, 0);
+      pass.draw(4, this.highlightCurrentCount, 0, 0);
     }
   }
 
@@ -3165,6 +3155,7 @@ export class WebGpuFloorplanRenderer {
     if (this.highlightCurrentRectBuffer) {
       this.highlightCurrentRectBuffer.destroy();
       this.highlightCurrentRectBuffer = null;
+      this.highlightCurrentCapacityBytes = 0;
     }
     if (this.highlightSelectionRectsBuffer) {
       this.highlightSelectionRectsBuffer.destroy();
