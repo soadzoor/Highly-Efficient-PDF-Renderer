@@ -12,6 +12,7 @@ import {
   type HeprTextSearchMatch,
   type HeprThreeObjectOptions,
   type HeprThreePdfObject,
+  type TextLodMode,
   type VectorLodMode,
   type PDFLoadProgress
 } from "./index";
@@ -25,6 +26,7 @@ import {
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
+import { formatTextLodStats } from "./textLodStatsFormat";
 import { tryReadSourcePdfBytesFromExistingParsedZip } from "./parsedDataZip";
 import {
   filenameFromUrl,
@@ -48,6 +50,7 @@ const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-
 const downloadPdfButton = document.querySelector<HTMLButtonElement>("#download-pdf");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-select");
+const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-select");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const touchRotateRow = document.querySelector<HTMLElement>("#touch-rotate-row");
@@ -67,6 +70,7 @@ const timesValue = document.querySelector<HTMLSpanElement>("#times-value");
 const fpsValue = document.querySelector<HTMLSpanElement>("#fps-value");
 const drawStatsValue = document.querySelector<HTMLSpanElement>("#draw-stats-value");
 const lodStatsValue = document.querySelector<HTMLSpanElement>("#lod-stats-value");
+const textLodStatsValue = document.querySelector<HTMLSpanElement>("#text-lod-stats-value");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const textSearchInput = document.querySelector<HTMLInputElement>("#text-search-input");
 const textSearchCount = document.querySelector<HTMLSpanElement>("#text-search-count");
@@ -89,6 +93,7 @@ if (
   !downloadPdfButton ||
   !backendSelect ||
   !vectorLodSelect ||
+  !textLodSelect ||
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
   !touchRotateRow ||
@@ -108,6 +113,7 @@ if (
   !fpsValue ||
   !drawStatsValue ||
   !lodStatsValue ||
+  !textLodStatsValue ||
   !dropIndicator ||
   !textSearchInput ||
   !textSearchCount ||
@@ -128,6 +134,7 @@ const downloadDataButtonElement = downloadDataButton;
 const downloadPdfButtonElement = downloadPdfButton;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
+const textLodSelectElement = textLodSelect;
 const touchRotateCheckboxElement = touchRotateCheckbox;
 const textSelectionCheckboxElement = textSelectionCheckbox;
 const touchRotateRowElement = touchRotateRow;
@@ -147,6 +154,7 @@ const timesValueElement = timesValue;
 const fpsValueElement = fpsValue;
 const drawStatsValueElement = drawStatsValue;
 const lodStatsValueElement = lodStatsValue;
+const textLodStatsValueElement = textLodStatsValue;
 const dropIndicatorElement = dropIndicator;
 const textSearchInputElement = textSearchInput;
 const textSearchCountElement = textSearchCount;
@@ -189,6 +197,7 @@ type WebGpuRendererParametersWithCanvas = ConstructorParameters<typeof WebGPURen
 
 let activeThreeRendererBackend: HeprRendererType = "webgl";
 let renderer: ThreeExampleRenderer = createWebGlThreeRenderer(canvasElement);
+const manuallyDrivenThreeRenderers = new WeakSet<ThreeExampleRenderer>();
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(
@@ -232,7 +241,11 @@ let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
 let lastNativeDrawStats: DrawStats | null = null;
 let drawStatsLastText = "";
+const HUD_TEXT_UPDATE_INTERVAL_MS = 100;
+let hudTextLastUpdateTime = 0;
+let fpsTextLastUpdateTime = 0;
 let lodStatsLastText = "";
+let textLodStatsLastText = "";
 let lastLoadTimingText = "-";
 let renderedFrameSerial = 0;
 let touchControlsAvailable = hasTouchCapability();
@@ -260,45 +273,87 @@ refreshDropIndicator();
 function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLRenderer {
   const nextRenderer = new THREE.WebGLRenderer({
     canvas: targetCanvas,
-    antialias: true,
+    // HEPR already applies analytic AA; stay single-sample like the native renderers.
+    antialias: false,
     alpha: false,
     depth: true,
     stencil: false,
     premultipliedAlpha: false,
     powerPreference: "high-performance"
   });
-  configureThreeRenderer(nextRenderer);
+  configureThreeRenderer(nextRenderer, THREE.SRGBColorSpace);
   return nextRenderer;
 }
 
 async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promise<WebGPURenderer> {
   const nextRenderer = new WebGPURenderer({
     canvas: targetCanvas,
-    antialias: true,
+    // HEPR already applies analytic AA; stay single-sample like the native renderers.
+    antialias: false,
     alpha: false,
     depth: true,
-    stencil: false
+    stencil: false,
+    // Keep the comparison on the same GPU class as WebGL on dual-GPU systems.
+    powerPreference: "high-performance",
+    // Match WebGL's 8-bit presentation precision instead of paying twice the
+    // bandwidth and memory for Three's default half-float intermediate target.
+    outputBufferType: THREE.UnsignedByteType
   } as WebGpuRendererParametersWithCanvas);
-  configureThreeRenderer(nextRenderer);
+  // HEPR's native renderers and Three/WebGL composite extracted PDF display
+  // values directly. Disable Three's linear intermediate/output transform for
+  // this dedicated comparison renderer so Three/WebGPU does the same.
+  configureThreeRenderer(nextRenderer, THREE.LinearSRGBColorSpace);
   await nextRenderer.init();
+  stopThreeInternalAnimationLoop(nextRenderer);
   return nextRenderer;
 }
 
-function configureThreeRenderer(nextRenderer: ThreeExampleRenderer): void {
+/**
+ * Stop the renderer's own animation loop.
+ *
+ * `WebGPURenderer.init()` starts a self-perpetuating requestAnimationFrame chain
+ * whether or not the application ever calls `setAnimationLoop`, and
+ * `setAnimationLoop(null)` only clears the callback without stopping the chain.
+ * This example renders on demand, so leaving it running keeps the page awake at
+ * the display refresh rate for no benefit. `prepareThreeRendererFrame()` keeps
+ * the per-frame node state in sync only when the application actually renders.
+ */
+function stopThreeInternalAnimationLoop(nextRenderer: ThreeExampleRenderer): void {
+  const commonRenderer = nextRenderer as ThreeExampleRenderer & {
+    _animation?: { stop?: () => void };
+    _nodes?: { nodeFrame?: { update?: () => void } };
+  };
+  // These are private Three fields, so only take over the loop when both sides
+  // of the installed r185 contract are available. A future Three release then
+  // falls back safely to its own RAF instead of losing node-frame updates.
+  if (
+    typeof commonRenderer._animation?.stop === "function" &&
+    typeof commonRenderer._nodes?.nodeFrame?.update === "function"
+  ) {
+    commonRenderer._animation.stop();
+    manuallyDrivenThreeRenderers.add(nextRenderer);
+  }
+}
+
+function configureThreeRenderer(
+  nextRenderer: ThreeExampleRenderer,
+  outputColorSpace: string
+): void {
   nextRenderer.toneMapping = THREE.NoToneMapping;
-  nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
-  nextRenderer.autoClear = false;
-  nextRenderer.setClearColor(createNativeClearColor(), 1);
+  nextRenderer.outputColorSpace = outputColorSpace;
+  // Fold the clear into the render pass load operation on both backends.
+  nextRenderer.autoClear = true;
+  nextRenderer.setClearColor(createNativeClearColor(outputColorSpace), 1);
   nextRenderer.setPixelRatio(window.devicePixelRatio || 1);
   nextRenderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
 }
 
-function createNativeClearColor(): THREE.Color {
+function createNativeClearColor(outputColorSpace: string): THREE.Color {
   return new THREE.Color().setRGB(
     NATIVE_CLEAR_COLOR_R,
     NATIVE_CLEAR_COLOR_G,
     NATIVE_CLEAR_COLOR_B,
-    THREE.SRGBColorSpace
+    outputColorSpace
   );
 }
 
@@ -355,6 +410,7 @@ async function ensureThreeRendererBackend(
   canvasResizeObserver.observe(nextCanvas);
   renderer = nextRenderer;
   activeThreeRendererBackend = backend;
+  resetFpsMeter();
   controls = createMapControls();
   controls.target.copy(previousControlsTarget);
   updatePerspectiveCameraProjection();
@@ -371,16 +427,42 @@ function renderFrame(now: number = performance.now()): void {
   updateFpsMeter(now);
   const controlsChanged = controls.update();
   updateCameraClipping();
-  renderer.clear(true, true, true);
-  renderer.clearDepth();
+  prepareThreeRendererFrame(renderer);
   renderer.render(scene, camera);
   textSelection.updateOverlay();
-  updateDrawStatsMeter();
-  updateLodStatsMeter();
+  // Writing the readouts every frame costs a style recalc, layout and paint per
+  // frame, which at high refresh rates dwarfs the numbers being reported. The
+  // panels stay legible at ~10Hz; anything that changes them outside the render
+  // loop still updates them directly.
+  if (now - hudTextLastUpdateTime >= HUD_TEXT_UPDATE_INTERVAL_MS) {
+    hudTextLastUpdateTime = now;
+    updateDrawStatsMeter();
+    updateLodStatsMeter();
+  }
   renderedFrameSerial += 1;
   resolveRenderedFrameWaiters();
   if (controlsChanged) {
     requestRender();
+  }
+}
+
+/** Mirror the useful bookkeeping from Three's stopped WebGPU animation loop. */
+function prepareThreeRendererFrame(nextRenderer: ThreeExampleRenderer): void {
+  if (!manuallyDrivenThreeRenderers.has(nextRenderer)) {
+    return;
+  }
+
+  const commonRenderer = nextRenderer as ThreeExampleRenderer & {
+    _nodes?: { nodeFrame?: { frameId: number; update: () => void } };
+    info: ThreeExampleRenderer["info"] & { frame: number };
+  };
+  if (commonRenderer.info.autoReset) {
+    commonRenderer.info.reset();
+  }
+  commonRenderer._nodes?.nodeFrame?.update();
+  const frameId = commonRenderer._nodes?.nodeFrame?.frameId;
+  if (typeof frameId === "number") {
+    commonRenderer.info.frame = frameId;
   }
 }
 
@@ -485,6 +567,19 @@ vectorLodSelectElement.addEventListener("change", () => {
   }
   currentPdfObject?.setVectorLodMode(vectorLod);
   setStatus(`Vector LOD mode set to ${formatVectorLodMode(vectorLod)}.`);
+  updateDrawStatsMeter();
+  updateLodStatsMeter();
+  requestRender();
+}, { signal: lifetimeSignal });
+
+textLodSelectElement.addEventListener("change", () => {
+  const textLod = readTextLodMode();
+  if (!lastLoadedSource) {
+    setStatus(`Text LOD mode set to ${formatTextLodMode(textLod)}. Load a source to render.`);
+    return;
+  }
+  currentPdfObject?.setTextLodMode(textLod);
+  setStatus(`Text LOD mode set to ${formatTextLodMode(textLod)}.`);
   updateDrawStatsMeter();
   updateLodStatsMeter();
   requestRender();
@@ -774,7 +869,9 @@ function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> 
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
+    threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
+    textLod: readTextLodMode(),
     pageBackground: [pageBackground[0], pageBackground[1], pageBackground[2]],
     pageBackgroundOpacity: pageBackground[3],
     vectorOverrideColor: [vectorOverride[0], vectorOverride[1], vectorOverride[2]],
@@ -800,6 +897,7 @@ async function loadSource(
   setDownloadPdfButtonState(false);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
+  textLodSelectElement.disabled = true;
 
   try {
     const loadStart = performance.now();
@@ -835,12 +933,12 @@ async function loadSource(
       stage: "first-render",
       sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "zip"
     });
-    const firstRenderStart = performance.now();
+    const firstSubmitStart = performance.now();
     requestRender();
     await waitForNextRenderedFrame(activeLoadToken);
-    const firstRenderMs = performance.now() - firstRenderStart;
+    const firstSubmitMs = performance.now() - firstSubmitStart;
     const totalLoadMs = performance.now() - loadStart;
-    lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstRenderMs, objectReadyMs);
+    lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
     clearLoadedStatus();
     updateSceneMetrics(nextObject);
   } catch (error) {
@@ -860,6 +958,7 @@ async function loadSource(
       setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
+      textLodSelectElement.disabled = false;
     }
   }
 }
@@ -885,6 +984,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), true);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
+  textLodSelectElement.disabled = true;
 
   try {
     const loadStart = performance.now();
@@ -924,16 +1024,16 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       stage: "first-render",
       sourceType: installedObject.sourceKind === "pdf" ? "pdf" : "zip"
     });
-    const firstRenderStart = performance.now();
+    const firstSubmitStart = performance.now();
     requestRender();
     await waitForNextRenderedFrame(activeLoadToken);
-    const firstRenderMs = performance.now() - firstRenderStart;
+    const firstSubmitMs = performance.now() - firstSubmitStart;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(
       totalLoadMs,
       lodTiming.elapsedMs,
       lodTiming.buildCount,
-      firstRenderMs,
+      firstSubmitMs,
       objectReadyMs
     );
     updateSceneMetrics(installedObject);
@@ -972,6 +1072,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
+      textLodSelectElement.disabled = false;
       updateDrawStatsMeter();
       updateLodStatsMeter();
       requestRender();
@@ -988,6 +1089,7 @@ function replacePdfObject(nextObject: HeprThreePdfObject, options: { fitCamera?:
   disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
   scene.add(nextObject);
+  resetFpsMeter();
   refreshDropIndicator();
   if (options.fitCamera !== false) {
     fitCameraToPdfObject(nextObject);
@@ -1022,6 +1124,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
     timesValueElement.textContent = "-";
     setDrawStatsText("-");
     setLodStatsText("-");
+    setTextLodStatsText("-");
     setDownloadDataButtonState(false);
     setDownloadPdfButtonState(false);
   }
@@ -1146,6 +1249,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
   setLoadControlsEnabled(false);
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
+  textLodSelectElement.disabled = true;
   setLoadingProgress(true, "0.00% Preparing parsed ZIP export...");
   try {
     await yieldToBrowserPaint();
@@ -1183,6 +1287,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
       setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
       vectorLodSelectElement.disabled = false;
+      textLodSelectElement.disabled = false;
       setDownloadDataButtonState(Boolean(currentPdfObject), false);
       setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
     }
@@ -1200,6 +1305,7 @@ function cancelActiveParsedZipExport(): void {
   setLoadControlsEnabled(true);
   backendSelectElement.disabled = false;
   vectorLodSelectElement.disabled = false;
+  textLodSelectElement.disabled = false;
   setDownloadDataButtonState(Boolean(currentPdfObject), false);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
 }
@@ -1292,12 +1398,15 @@ function formatLoadTiming(
   totalLoadMs: number,
   lodMs: number,
   lodBuildCount: number,
-  firstRenderMs: number,
+  firstSubmitMs: number,
   objectReadyMs: number
 ): string {
-  const otherMs = Math.max(0, objectReadyMs - Math.max(0, lodMs));
+  const prepareMs = Math.max(0, objectReadyMs - Math.max(0, lodMs));
   const lodText = lodBuildCount > 0 ? `${lodMs.toFixed(0)} ms` : "-";
-  return `total ${totalLoadMs.toFixed(0)} ms, parse/upload ${otherMs.toFixed(0)} ms, vector lod ${lodText}, first render ${firstRenderMs.toFixed(0)} ms`;
+  // renderer.render() submits work but does not wait for WebGPU completion, so
+  // describing this as GPU render time would make the backend comparison
+  // misleading. It is the CPU-side latency until the first frame is submitted.
+  return `total ${totalLoadMs.toFixed(0)} ms, parse/prepare ${prepareMs.toFixed(0)} ms, vector lod ${lodText}, first submit ${firstSubmitMs.toFixed(0)} ms`;
 }
 
 function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
@@ -1375,11 +1484,24 @@ function updateFpsMeter(now: number): void {
     const deltaMs = now - fpsLastSampleTime;
     if (deltaMs > 0 && deltaMs < 1000) {
       const fpsNow = 1000 / deltaMs;
+      // Sample every frame so the average stays honest, but write the DOM at a
+      // readable rate: the text assignment forces layout and paint, which at
+      // 240Hz costs more than the frame it is measuring.
       fpsSmoothed = fpsSmoothed === 0 ? fpsNow : fpsSmoothed * 0.85 + fpsNow * 0.15;
-      fpsValueElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
+      if (now - fpsTextLastUpdateTime >= HUD_TEXT_UPDATE_INTERVAL_MS) {
+        fpsTextLastUpdateTime = now;
+        fpsValueElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
+      }
     }
   }
   fpsLastSampleTime = now;
+}
+
+function resetFpsMeter(): void {
+  fpsLastSampleTime = 0;
+  fpsSmoothed = 0;
+  fpsTextLastUpdateTime = 0;
+  fpsValueElement.textContent = "-";
 }
 
 function updateDrawStatsMeter(): void {
@@ -1397,8 +1519,12 @@ function updateDrawStatsMeter(): void {
     : nativeDrawStats?.usedCulling
       ? "culled"
       : "full";
+  const textStats = currentPdfObject.getTextInstanceStats();
+  const textPart = textStats && textStats.total > 0
+    ? ` | ${textStats.rendered.toLocaleString()}/${textStats.total.toLocaleString()} text (${textStats.mode})`
+    : "";
   setDrawStatsText(
-    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments | mode: ${mode}`
+    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments${textPart} | mode: ${mode}`
   );
 }
 
@@ -1413,6 +1539,8 @@ function setDrawStatsText(text: string): void {
 function updateLodStatsMeter(): void {
   const stats = currentPdfObject?.getVectorStrokeLodStats() ?? null;
   setLodStatsText(formatVectorStrokeLodStats(stats) || "-");
+  const textStats = currentPdfObject?.getTextLodStats() ?? null;
+  setTextLodStatsText(formatTextLodStats(textStats) || "-");
 }
 
 function setLodStatsText(text: string): void {
@@ -1421,6 +1549,14 @@ function setLodStatsText(text: string): void {
   }
   lodStatsLastText = text;
   lodStatsValueElement.textContent = text;
+}
+
+function setTextLodStatsText(text: string): void {
+  if (text === textLodStatsLastText) {
+    return;
+  }
+  textLodStatsLastText = text;
+  textLodStatsValueElement.textContent = text;
 }
 
 async function loadExampleManifest(): Promise<void> {
@@ -1538,6 +1674,10 @@ function readVectorLodMode(): VectorLodMode {
   return value === "off" || value === "force" ? value : "auto";
 }
 
+function readTextLodMode(): TextLodMode {
+  return textLodSelectElement.value === "off" ? "off" : "auto";
+}
+
 function readBackendMode(): HeprRendererType {
   return backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
 }
@@ -1574,6 +1714,10 @@ function hasTouchCapability(): boolean {
 
 function formatVectorLodMode(mode: VectorLodMode): string {
   return mode === "off" ? "Off" : mode === "force" ? "Force" : "Auto";
+}
+
+function formatTextLodMode(mode: TextLodMode): string {
+  return mode === "off" ? "Off" : "Auto";
 }
 
 type ExampleSelectionKind = "pdf" | "zip";

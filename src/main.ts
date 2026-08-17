@@ -48,7 +48,14 @@ import {
   type VectorStrokeLodBuildTiming
 } from "./vectorStrokeLodCore";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
-import { createTextSearchController, type TextSearchController, type TextSearchMatch } from "./textSearch";
+import { formatTextLodStats } from "./textLodStatsFormat";
+import { prebuildTextLod, type TextLodMode } from "./textLodCore";
+import {
+  createSearchHighlightSet,
+  createTextSearchController,
+  type TextSearchController,
+  type TextSearchMatch
+} from "./textSearch";
 import { createTextSearchWidget } from "./textSearchWidget";
 import { createTextSelectionController } from "./textSelection";
 import type { SearchHighlightSet } from "./rendererTypes";
@@ -87,6 +94,7 @@ const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metri
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const backendSelect = document.querySelector<HTMLSelectElement>("#backend-select");
 const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-mode");
+const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-mode");
 const pageBackgroundColorInput = document.querySelector<HTMLInputElement>("#page-bg-color");
 const pageBackgroundOpacitySlider = document.querySelector<HTMLInputElement>("#page-bg-opacity-slider");
 const pageBackgroundOpacityInput = document.querySelector<HTMLInputElement>("#page-bg-opacity");
@@ -133,6 +141,7 @@ if (
   !dropIndicator ||
   !backendSelect ||
   !vectorLodSelect ||
+  !textLodSelect ||
   !pageBackgroundColorInput ||
   !pageBackgroundOpacitySlider ||
   !pageBackgroundOpacityInput ||
@@ -186,6 +195,7 @@ const metricGridMaxCellTextElement = metricGridMaxCellElement;
 const dropIndicatorElement = dropIndicator;
 const backendSelectElement = backendSelect;
 const vectorLodSelectElement = vectorLodSelect;
+const textLodSelectElement = textLodSelect;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
 const pageBackgroundOpacityInputElement = pageBackgroundOpacityInput;
@@ -198,6 +208,7 @@ let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 const uiControlManager = createUiControlManager(
   {
     vectorLodSelect: vectorLodSelectElement,
+    textLodSelect: textLodSelectElement,
     pageBackgroundColorInput: pageBackgroundColorInputElement,
     pageBackgroundOpacitySlider: pageBackgroundOpacitySliderElement,
     pageBackgroundOpacityInput: pageBackgroundOpacityInputElement,
@@ -214,23 +225,7 @@ let textSearchController: TextSearchController;
 let lastSearchHighlights: SearchHighlightSet | null = null;
 
 function applySearchHighlights(current: TextSearchMatch | null, all: TextSearchMatch[]): void {
-  if (all.length === 0) {
-    lastSearchHighlights = null;
-  } else {
-    const rects = new Float32Array(all.length * 4);
-    let currentIndex = -1;
-    for (let i = 0; i < all.length; i += 1) {
-      const bounds = all[i].bounds;
-      rects[i * 4] = bounds.minX;
-      rects[i * 4 + 1] = bounds.minY;
-      rects[i * 4 + 2] = bounds.maxX;
-      rects[i * 4 + 3] = bounds.maxY;
-      if (all[i] === current) {
-        currentIndex = i;
-      }
-    }
-    lastSearchHighlights = { rects, count: all.length, currentIndex };
-  }
+  lastSearchHighlights = createSearchHighlightSet(all, current ? all.indexOf(current) : -1);
   renderer.setSearchHighlights?.(lastSearchHighlights);
 }
 
@@ -297,13 +292,16 @@ function onRendererFrame(stats: DrawStats): void {
   const activeBackendLabel = (backendSwitcher?.getActiveBackend() ?? "webgl").toUpperCase();
   const vectorLodStats = formatVectorStrokeLodStats(renderer.getVectorStrokeLodStats?.() ?? null);
   const vectorLodSuffix = vectorLodStats ? ` | ${vectorLodStats}` : "";
+  const textLodStats = formatTextLodStats(renderer.getTextLodStats?.() ?? null);
+  const textLodSuffix = textLodStats ? ` | text: ${textLodStats}` : "";
   runtimeTextElement.textContent =
-    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}`;
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}`;
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
   rendererApi.resize();
   rendererApi.setVectorLodMode?.(uiControlManager.readVectorLodModeInput());
+  rendererApi.setTextLodMode?.(uiControlManager.readTextLodModeInput());
   rendererApi.setStrokeCurveEnabled(true);
   rendererApi.setTextVectorOnly(false);
   const pageBackgroundColor = uiControlManager.readPageBackgroundColorInput();
@@ -377,7 +375,9 @@ interface LoadPdfOptions {
 const LOAD_PROGRESS_PARSE_END = 0.34;
 const LOAD_PROGRESS_COMPILE = 0.36;
 const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
-const LOAD_PROGRESS_VECTOR_LOD_END = 0.96;
+const LOAD_PROGRESS_VECTOR_LOD_END = 0.66;
+const LOAD_PROGRESS_TEXT_LOD_START = LOAD_PROGRESS_VECTOR_LOD_END;
+const LOAD_PROGRESS_TEXT_LOD_END = 0.96;
 const LOAD_PROGRESS_UPLOAD = 0.98;
 
 type ExampleSelectionKind = "pdf" | "zip";
@@ -506,11 +506,18 @@ backendSelectElement.addEventListener("change", () => {
 uiControlManager.bindEventListeners({
   onVectorLodModeChange: (mode) => {
     applyVectorLodMode(mode);
+  },
+  onTextLodModeChange: (mode) => {
+    applyTextLodMode(mode);
   }
 });
 
 function applyVectorLodMode(mode: VectorLodMode): void {
   renderer.setVectorLodMode?.(mode);
+}
+
+function applyTextLodMode(mode: TextLodMode): void {
+  renderer.setTextLodMode?.(mode);
 }
 
 canvasInteractionController.attach(canvasElement);
@@ -870,9 +877,10 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     setStatus(
-      `Building Vector LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
+      `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
     const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "pdf", activeLoadToken);
+    await prebuildTextLodForScene(scene, progress, "pdf", activeLoadToken);
     if (activeLoadToken !== loadToken) {
       return;
     }
@@ -977,9 +985,10 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     }
 
     setStatus(
-      `Building Vector LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
+      `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
     const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "zip", activeLoadToken);
+    await prebuildTextLodForScene(scene, progress, "zip", activeLoadToken);
     if (activeLoadToken !== loadToken) {
       return;
     }
@@ -1220,6 +1229,32 @@ async function prebuildVectorLodForScene(
     }
   );
   return consumeVectorStrokeLodBuildTiming();
+}
+
+async function prebuildTextLodForScene(
+  scene: VectorScene,
+  progress: ReturnType<typeof createLoadProgressReporter>,
+  sourceType: "pdf" | "zip",
+  activeLoadToken: number
+): Promise<void> {
+  progress.report(LOAD_PROGRESS_TEXT_LOD_START, { stage: "text-lod", sourceType });
+  if (uiControlManager.readTextLodModeInput() === "off") {
+    progress.report(LOAD_PROGRESS_TEXT_LOD_END, { stage: "text-lod", sourceType });
+    return;
+  }
+  await prebuildTextLod(scene, {
+    yieldIntervalMs: 50,
+    shouldCancel: () => activeLoadToken !== loadToken,
+    onProgress: (lodProgress) => {
+      if (activeLoadToken !== loadToken) {
+        return;
+      }
+      const value =
+        LOAD_PROGRESS_TEXT_LOD_START +
+        lodProgress.value * (LOAD_PROGRESS_TEXT_LOD_END - LOAD_PROGRESS_TEXT_LOD_START);
+      progress.report(value, { stage: "text-lod", sourceType });
+    }
+  });
 }
 
 function combineVectorLodTimings(

@@ -23,9 +23,11 @@ import {
   type ViewportPixels
 } from "./vectorStrokeLodCore";
 import type { ViewState } from "./webGlFloorplanRenderer";
+import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 interface VectorStrokeLodLayerOptions {
   materialBackend?: "webgl" | "webgpu";
+  colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
 }

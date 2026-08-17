@@ -7,6 +7,9 @@ export interface TextRasterAtlas {
   glyphUvRects: Float32Array;
 }
 
+/** Shared ceiling so native and Three choose the same glyph-atlas quality. */
+export const TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE = 4096;
+
 interface GlyphPlacement {
   index: number;
   segmentStart: number;
@@ -36,7 +39,11 @@ export function buildTextRasterAtlas(scene: VectorScene, maxTextureSize: number)
   }
 
   const glyphUvRects = new Float32Array(scene.textGlyphCount * 4);
-  const atlasSizeLimit = clamp(Math.trunc(maxTextureSize) || 4096, 256, 8192);
+  const atlasSizeLimit = clamp(
+    Math.trunc(maxTextureSize) || TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,
+    256,
+    TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
+  );
 
   let selected: { placements: GlyphPlacement[]; width: number; height: number } | null = null;
 

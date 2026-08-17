@@ -7,7 +7,10 @@ import {
   CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE
 } from "./coreWgslShaders";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
+import {
+  createThreeWebGpuOutputFragmentFns,
+  type ThreeColorCompositing
+} from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -26,6 +29,7 @@ interface GradientTextureOptions {
 }
 
 interface CommonMaterialOptions extends GradientTextureOptions {
+  colorCompositing: ThreeColorCompositing;
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
@@ -274,7 +278,7 @@ fn heprGradientQuadraticCrossing(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: ve
 }
 `, [includeNode(lineCrossingFn)]);
 
-const fillFragmentFn = TSL.wgslFn(`
+const fillFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprGradientFillFragment(
   local: vec2<f32>,
   metaA: vec4<f32>,
@@ -341,10 +345,9 @@ fn heprGradientFillFragment(
   let color = resolvedColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
   let alpha = coverage * metaC.w * source.a * mask.a;
   if (alpha <= 0.001) { discard; }
-  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
+  return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
 `, [
-  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(gradientSampleFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
@@ -380,7 +383,7 @@ fn heprGradientStrokeWorldPack(
 }
 `, [includeNode(floatModFn), includeNode(strokeQuadWorldPositionFn)]);
 
-const strokeFragmentFn = TSL.wgslFn(`
+const strokeFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprGradientStrokeFragment(
   local: vec2<f32>, primitiveA: vec4<f32>, primitiveB: vec4<f32>, style: vec4<f32>,
   primitiveBounds: vec4<f32>, halfWidthFromVertex: f32, strokeCurveEnabled: f32,
@@ -415,10 +418,9 @@ fn heprGradientStrokeFragment(
   let color = resolvedColor * (1.0 - mixAmount) + vectorOverride.rgb * mixAmount;
   let alpha = coverage * alphaStyle * source.a * mask.a;
   if (alpha <= 0.001) { discard; }
-  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
+  return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
 `, [
-  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(floatModFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
@@ -451,7 +453,7 @@ export function createThreeWebGpuGradientFillMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: TSL.uniform(options.localToClip)
   });
-  material.fragmentNode = callNode(fillFragmentFn, {
+  material.fragmentNode = callNode(fillFragmentFns[options.colorCompositing], {
     local: vertexValue.xy, metaA, metaB, metaC,
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
@@ -495,7 +497,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
     zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,
     localToClip: TSL.uniform(options.localToClip)
   });
-  material.fragmentNode = callNode(strokeFragmentFn, {
+  material.fragmentNode = callNode(strokeFragmentFns[options.colorCompositing], {
     local: worldValue.xy, primitiveA, primitiveB, style, primitiveBounds,
     halfWidthFromVertex: worldValue.z, strokeCurveEnabled: curveUniform,
     aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride),

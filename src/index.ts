@@ -7,6 +7,7 @@ import {
 import {
   createThreePdfObject,
   type HeprRendererType,
+  type ThreeColorCompositing,
   type HeprThreeObjectOptions,
   type HeprColorInput,
   type HeprThreePdfObject
@@ -17,6 +18,7 @@ import {
 } from "./canvasInteractions";
 import { createLoadProgressReporter } from "./loadProgress";
 import { prebuildVectorStrokeLodRuntime } from "./vectorStrokeLod";
+import { prebuildTextLod } from "./textLodCore";
 
 /**
  * Combined options for `pdfObjectGenerator`.
@@ -30,7 +32,9 @@ export interface PdfObjectGeneratorRuntimeOptions
 
 const LOAD_PROGRESS_SCENE_END = 0.34;
 const LOAD_PROGRESS_VECTOR_LOD_START = 0.38;
-const LOAD_PROGRESS_VECTOR_LOD_END = 0.96;
+const LOAD_PROGRESS_VECTOR_LOD_END = 0.66;
+const LOAD_PROGRESS_TEXT_LOD_START = LOAD_PROGRESS_VECTOR_LOD_END;
+const LOAD_PROGRESS_TEXT_LOD_END = 0.96;
 const LOAD_PROGRESS_UPLOAD = 0.98;
 
 /**
@@ -51,6 +55,7 @@ const LOAD_PROGRESS_UPLOAD = 0.98;
  *
  * const pdfObject = await pdfObjectGenerator(file, {
  *   vectorLod: "auto",
+ *   textLod: "auto",
  *   pageBackground: "#ffffff",
  *   onProgress: (progress) => {
  *     console.log(progress.stage, progress.value);
@@ -90,6 +95,20 @@ export async function pdfObjectGenerator(
       progress.report(value, { stage: "vector-lod", sourceType });
     }
   });
+  progress.report(LOAD_PROGRESS_TEXT_LOD_START, { stage: "text-lod", sourceType });
+  if (options.textLod !== "off") {
+    await prebuildTextLod(loadedScene.scene, {
+      yieldIntervalMs: 50,
+      onProgress: (lodProgress) => {
+        const value =
+          LOAD_PROGRESS_TEXT_LOD_START +
+          lodProgress.value * (LOAD_PROGRESS_TEXT_LOD_END - LOAD_PROGRESS_TEXT_LOD_START);
+        progress.report(value, { stage: "text-lod", sourceType });
+      }
+    });
+  } else {
+    progress.report(LOAD_PROGRESS_TEXT_LOD_END, { stage: "text-lod", sourceType });
+  }
   progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType });
   await yieldToHostFrame();
   const object = await createThreePdfObject(loadedScene, {
@@ -133,6 +152,7 @@ export type {
   PdfObjectSourceKind,
   PdfObjectGeneratorOptions,
   HeprRendererType,
+  ThreeColorCompositing,
   HeprThreeObjectOptions,
   HeprColorInput,
   HeprThreePdfObject,
@@ -191,6 +211,29 @@ export type {
   VectorStrokeLodStats,
   VectorLodMode
 } from "./vectorStrokeLod";
+
+export type {
+  TextLodMode,
+  TextLodStats
+} from "./textLodCore";
+
+export type {
+  TextLodAsyncBuildOptions,
+  TextLodBuildData,
+  TextLodBuildProgress,
+  TextLodBuildResult,
+  TextLodCluster,
+  TextLodPageNode,
+  TextLodRun
+} from "./textGreekLod";
+
+export {
+  getCachedTextLod,
+  prebuildTextLod,
+  TEXT_LOD_COARSE_ENTER_PX,
+  TEXT_LOD_EXACT_ENTER_PX,
+  TEXT_LOD_SOFT_EXACT_GLYPH_BUDGET
+} from "./textLodCore";
 
 export {
   consumeVectorStrokeLodBuildTiming,

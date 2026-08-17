@@ -16,10 +16,12 @@ import {
   type ThreeWebGpuGradientFillMaterialState,
   type ThreeWebGpuGradientStrokeMaterialState
 } from "./threeWebGpuGradientMaterial";
+import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface GradientLayerOptions {
   materialBackend?: "webgl" | "webgpu";
+  colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
 }
@@ -87,10 +89,12 @@ export class ThreeMaterialGradientLayer {
   private readonly localUnitsPerPixelUniform = { value: 1 };
   private readonly curveUniform: { value: number };
   private readonly vectorOverrideUniform: THREE.Vector4;
+  private readonly colorCompositing: ThreeColorCompositing;
 
   constructor(scene: VectorScene, options: GradientLayerOptions) {
     this.group = new THREE.Group();
     this.group.visible = false;
+    this.colorCompositing = options.colorCompositing ?? "linear";
     this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
     this.vectorOverrideUniform = new THREE.Vector4(...options.vectorOverride);
 
@@ -375,7 +379,8 @@ export class ThreeMaterialGradientLayer {
       viewport: this.viewportUniform,
       cameraCenter: this.cameraCenterUniform,
       localToClip: this.localToClipUniform,
-      vectorOverride: this.vectorOverrideUniform
+      vectorOverride: this.vectorOverrideUniform,
+      colorCompositing: this.colorCompositing
     };
   }
 

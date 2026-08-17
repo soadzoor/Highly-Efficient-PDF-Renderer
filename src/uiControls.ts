@@ -1,4 +1,5 @@
 import type { RendererApi } from "./rendererTypes";
+import type { TextLodMode } from "./textLodCore";
 import type { VectorLodMode } from "./vectorStrokeLodCore";
 
 type ColorRgba = [number, number, number, number];
@@ -7,6 +8,7 @@ type ColorRenderer = Pick<RendererApi, "setPageBackgroundColor" | "setVectorColo
 
 export interface UiControlElements {
   vectorLodSelect: HTMLSelectElement;
+  textLodSelect: HTMLSelectElement;
   pageBackgroundColorInput: HTMLInputElement;
   pageBackgroundOpacitySlider: HTMLInputElement;
   pageBackgroundOpacityInput: HTMLInputElement;
@@ -17,11 +19,13 @@ export interface UiControlElements {
 
 export interface UiControlCallbacks {
   onVectorLodModeChange(mode: VectorLodMode): void;
+  onTextLodModeChange(mode: TextLodMode): void;
 }
 
 export interface UiControlManager {
   bindEventListeners(callbacks: UiControlCallbacks): void;
   readVectorLodModeInput(): VectorLodMode;
+  readTextLodModeInput(): TextLodMode;
   readPageBackgroundColorInput(): ColorRgba;
   readVectorColorOverrideInput(): ColorRgba;
   applyPageBackgroundColorFromControls(): void;
@@ -35,6 +39,10 @@ export function createUiControlManager(
   function readVectorLodModeInput(): VectorLodMode {
     const value = elements.vectorLodSelect.value;
     return value === "off" || value === "force" ? value : "auto";
+  }
+
+  function readTextLodModeInput(): TextLodMode {
+    return elements.textLodSelect.value === "off" ? "off" : "auto";
   }
 
   function readPageBackgroundOpacityPercent(value: string): number {
@@ -132,6 +140,10 @@ export function createUiControlManager(
       callbacks.onVectorLodModeChange(readVectorLodModeInput());
     });
 
+    elements.textLodSelect.addEventListener("change", () => {
+      callbacks.onTextLodModeChange(readTextLodModeInput());
+    });
+
     elements.pageBackgroundColorInput.addEventListener("input", () => {
       applyPageBackgroundColorFromControls();
     });
@@ -168,6 +180,7 @@ export function createUiControlManager(
   return {
     bindEventListeners,
     readVectorLodModeInput,
+    readTextLodModeInput,
     readPageBackgroundColorInput,
     readVectorColorOverrideInput,
     applyPageBackgroundColorFromControls,

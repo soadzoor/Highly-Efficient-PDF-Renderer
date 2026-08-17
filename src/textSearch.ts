@@ -1,6 +1,6 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { RendererApi } from "./rendererTypes";
-import { computeCharRangeBounds } from "./sceneTextGeometry";
+import type { RendererApi, SearchHighlightSet } from "./rendererTypes";
+import { computeCharRangeHighlightBounds } from "./sceneTextGeometry";
 
 export interface TextSearchMatch {
   /** Zero-based page index in the composed scene. */
@@ -8,8 +8,13 @@ export interface TextSearchMatch {
   /** UTF-16 offset into the page's indexed text. */
   startChar: number;
   length: number;
-  /** Scene-space union of the matched characters' quads. */
+  /** Scene-space union used to frame or navigate to the logical match. */
   bounds: Bounds;
+  /**
+   * Tight scene-space rectangles for drawing each visual-line fragment.
+   * Searcher-produced matches populate this; optional for legacy match objects.
+   */
+  highlightBounds?: Bounds[];
 }
 
 export interface TextSearchState {
@@ -67,10 +72,97 @@ export interface SceneTextSearcher {
   /**
    * Finds non-overlapping matches in composed page order. Whitespace runs in
    * the query are collapsed to single spaces to mirror the index's word-gap
-   * encoding, so phrases match across line breaks. Match bounds are scene-space
-   * rectangles derived from the glyph geometry.
+   * encoding, so phrases match across line breaks. Each match has union bounds
+   * for navigation plus tight per-line highlight bounds derived from the glyph
+   * geometry.
    */
   search(query: string, options?: SceneTextSearchOptions): TextSearchMatch[];
+}
+
+type SearchHighlightMatch = Pick<TextSearchMatch, "bounds" | "highlightBounds">;
+
+/** Backward-compatible drawing bounds for matches created before line splitting. */
+export function getSearchMatchHighlightBounds(match: SearchHighlightMatch): readonly Bounds[] {
+  return match.highlightBounds && match.highlightBounds.length > 0 ? match.highlightBounds : [match.bounds];
+}
+
+interface FlattenedSearchHighlightBounds {
+  bounds: Bounds[];
+  currentIndex: number;
+  currentCount: number;
+}
+
+/** Flattens logical matches while retaining the active match's rectangle range. */
+export function flattenSearchMatchHighlightBounds(
+  matches: ReadonlyArray<SearchHighlightMatch>,
+  currentMatchIndex = -1
+): FlattenedSearchHighlightBounds {
+  const validCurrentMatchIndex =
+    currentMatchIndex >= 0 && currentMatchIndex < matches.length ? currentMatchIndex : -1;
+  const bounds: Bounds[] = [];
+  let currentIndex = -1;
+  let currentCount = 0;
+  for (let matchIndex = 0; matchIndex < matches.length; matchIndex += 1) {
+    const matchBounds = getSearchMatchHighlightBounds(matches[matchIndex]);
+    if (matchIndex === validCurrentMatchIndex) {
+      currentIndex = bounds.length;
+      currentCount = matchBounds.length;
+    }
+    bounds.push(...matchBounds);
+  }
+  return { bounds, currentIndex, currentCount };
+}
+
+/**
+ * Packs logical matches into the flat rectangle payload consumed by the
+ * native renderers. Every fragment of the current logical match is kept in a
+ * contiguous emphasized range.
+ */
+export function createSearchHighlightSet(
+  matches: ReadonlyArray<SearchHighlightMatch>,
+  currentMatchIndex = -1
+): SearchHighlightSet | null {
+  if (matches.length === 0) {
+    return null;
+  }
+  const flattened = flattenSearchMatchHighlightBounds(matches, currentMatchIndex);
+  const rectCount = flattened.bounds.length;
+  if (rectCount === 0) {
+    return null;
+  }
+
+  const rects = new Float32Array(rectCount * 4);
+  for (let rectIndex = 0; rectIndex < rectCount; rectIndex += 1) {
+    const bounds = flattened.bounds[rectIndex];
+    const offset = rectIndex * 4;
+    rects[offset] = bounds.minX;
+    rects[offset + 1] = bounds.minY;
+    rects[offset + 2] = bounds.maxX;
+    rects[offset + 3] = bounds.maxY;
+  }
+  return {
+    rects,
+    count: rectCount,
+    currentIndex: flattened.currentIndex,
+    currentCount: flattened.currentCount
+  };
+}
+
+function unionHighlightBounds(rects: readonly Bounds[]): Bounds {
+  if (rects.length === 0) {
+    return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  }
+  let minX = rects[0].minX;
+  let minY = rects[0].minY;
+  let maxX = rects[0].maxX;
+  let maxY = rects[0].maxY;
+  for (let i = 1; i < rects.length; i += 1) {
+    minX = Math.min(minX, rects[i].minX);
+    minY = Math.min(minY, rects[i].minY);
+    maxX = Math.max(maxX, rects[i].maxX);
+    maxY = Math.max(maxY, rects[i].maxY);
+  }
+  return { minX, minY, maxX, maxY };
 }
 
 export function createSceneTextSearcher(scene: VectorScene): SceneTextSearcher {
@@ -117,11 +209,18 @@ export function createSceneTextSearcher(scene: VectorScene): SceneTextSearcher {
           if (found < 0) {
             break;
           }
+          const highlightBounds = computeCharRangeHighlightBounds(
+            scene,
+            pages[pageIndex],
+            found,
+            needle.length
+          );
           matches.push({
             pageIndex,
             startChar: found,
             length: needle.length,
-            bounds: computeCharRangeBounds(scene, pages[pageIndex], found, needle.length)
+            bounds: unionHighlightBounds(highlightBounds),
+            highlightBounds
           });
           fromIndex = found + needle.length;
         }

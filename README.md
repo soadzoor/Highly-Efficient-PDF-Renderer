@@ -262,7 +262,8 @@ if (pdfObject.hasSearchableText) {
 
   // Frame your own camera on the current match. `localBounds` is in the PDF
   // object's local space (the space of the THREE.Group's children);
-  // `bounds` is the same rectangle in PDF scene coordinates.
+  // `bounds` is the same union in PDF scene coordinates. Wrapped matches also
+  // expose tight per-line `localHighlightBounds` / `highlightBounds` arrays.
   const target = matches[0].localBounds;
   const centerX = (target.minX + target.maxX) / 2;
   const centerY = (target.minY + target.maxY) / 2;
@@ -289,13 +290,17 @@ import { createSceneTextSearcher } from "@soadzoor/hepr";
 
 const searcher = createSceneTextSearcher(pdfObject.sceneData);
 const matches = searcher.search("room 101", { maxMatches: 100 });
-// matches[i].bounds is the scene-space rectangle of each hit.
+// matches[i].bounds frames the whole hit. For drawing, use
+// matches[i].highlightBounds ?? [matches[i].bounds] (tight wrap-aware rects).
 ```
 
 The native renderers (`WebGlFloorplanRenderer` / `WebGpuFloorplanRenderer`)
-also accept `setSearchHighlights({ rects, count, currentIndex })` and draw the
-rectangles as part of every frame with the live camera transform, so
-highlights never lag behind pans or zooms.
+also accept `setSearchHighlights({ rects, count, currentIndex, currentCount })`.
+Here `count` is the rectangle count; `currentIndex` and optional `currentCount`
+identify a consecutive rectangle range for the active logical match
+(`currentCount` defaults to `1`). The renderers draw the rectangles as part of
+every frame with the live camera transform, so highlights never lag behind
+pans or zooms.
 
 Advanced render pipelines can call
 `pdfObject.prepareFrameForThreeRenderer(renderer, camera)` manually before

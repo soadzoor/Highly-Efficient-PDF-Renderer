@@ -2,7 +2,10 @@ import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
-import { threeWebGpuOutputSrgbToLinearFn } from "./threeWebGpuColorSpace";
+import {
+  createThreeWebGpuOutputFragmentFns,
+  type ThreeColorCompositing
+} from "./threeWebGpuColorSpace";
 
 interface MutableUniform<T> {
   value: T;
@@ -15,6 +18,7 @@ export interface ThreeWebGpuFillMaterialState {
 }
 
 interface ThreeWebGpuFillMaterialOptions {
+  colorCompositing: ThreeColorCompositing;
   fillPathMetaTextureA: THREE.DataTexture;
   fillPathMetaTextureB: THREE.DataTexture;
   fillPathMetaTextureC: THREE.DataTexture;
@@ -99,7 +103,7 @@ fn heprFillClipPosition(
 }
 `);
 
-const fillFragmentFn = TSL.wgslFn(`
+const fillFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprFillFragment(
   local: vec2<f32>,
   metaA: vec4<f32>,
@@ -162,7 +166,7 @@ fn heprFillFragment(
     if (alpha <= 0.001) {
       discard;
     }
-    return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
+    return vec4<f32>(heprThreeOutputColor(color), alpha);
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
@@ -174,10 +178,9 @@ fn heprFillFragment(
     discard;
   }
 
-  return vec4<f32>(heprThreeOutputSrgbToLinear(color), alpha);
+  return vec4<f32>(heprThreeOutputColor(color), alpha);
 }
 `, [
-  includeNode(threeWebGpuOutputSrgbToLinearFn),
   includeNode(TSL.wgslFn(`
 fn heprDistanceToLineSegment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
   let ab = b - a;
@@ -327,7 +330,7 @@ export function createThreeWebGpuFillMaterial(
     useLocalToClip: useLocalToClipUniform,
     localToClip: TSL.uniform(options.localToClip)
   });
-  material.fragmentNode = callNode(fillFragmentFn, {
+  material.fragmentNode = callNode(fillFragmentFns[options.colorCompositing], {
     local: vertexPackValue.xy,
     metaA,
     metaB,
