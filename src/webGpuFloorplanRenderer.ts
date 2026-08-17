@@ -11,7 +11,8 @@ import {
 import { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } from "./nativeGradientWebGpuShaders";
 import {
   isNativeTextHeavyStrokeFreeScene,
-  NATIVE_VECTOR_MINIFY_ENABLED
+  NATIVE_VECTOR_MINIFY_ENABLED,
+  shouldUseNativePanCacheForFrame
 } from "./nativeRenderPolicy";
 import type {
   DrawStats,
@@ -3080,6 +3081,7 @@ export class WebGpuFloorplanRenderer {
     this.markInteraction();
     const anchorWorld = this.clientToWorld(clientX, clientY);
     const nextZoom = clamp(this.targetZoom * clampedFactor, this.minZoom, this.maxZoom);
+    const zoomTargetChanged = nextZoom !== this.targetZoom;
     this.hasZoomAnchor = true;
     this.zoomAnchorClientX = clientX;
     this.zoomAnchorClientY = clientY;
@@ -3095,6 +3097,11 @@ export class WebGpuFloorplanRenderer {
     );
     this.targetCameraCenterX = targetCenter.x;
     this.targetCameraCenterY = targetCenter.y;
+    if (zoomTargetChanged) {
+      // A later pan must not revive pixels rendered with an old hysteretic LOD
+      // selection merely because the zoom eventually returns to this scale.
+      this.panCacheValid = false;
+    }
 
     this.needsVisibleSetUpdate = true;
     this.panVelocityWorldX = 0;
@@ -3363,16 +3370,18 @@ export class WebGpuFloorplanRenderer {
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (this.vectorLodRuntime) {
-      return false;
-    }
-    if (this.segmentCount < PAN_CACHE_MIN_SEGMENTS && !this.isTextHeavyStrokeFreeScene()) {
-      return false;
-    }
-    if (this.isPanInteracting) {
-      return true;
-    }
-    return isCameraAnimating;
+    const sceneEligible =
+      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene();
+    const vectorLodActive = this.vectorLodRuntime !== null;
+    const zoomAnimating =
+      Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
+    return shouldUseNativePanCacheForFrame(
+      sceneEligible,
+      vectorLodActive,
+      this.isPanInteracting,
+      isCameraAnimating,
+      zoomAnimating
+    );
   }
 
   private renderDirectToScreen(): void {

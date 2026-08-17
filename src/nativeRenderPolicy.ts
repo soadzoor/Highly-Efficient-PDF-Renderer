@@ -19,3 +19,24 @@ export function isNativeTextHeavyStrokeFreeScene(
 ): boolean {
   return textInstanceCount > TEXT_HEAVY_INSTANCE_THRESHOLD && strokeSegmentCount === 0;
 }
+
+/**
+ * Decide whether a native frame may reuse the oversized pan cache.
+ *
+ * Zoom must render directly: scaling the previous cache postpones both text-LOD
+ * selection and glyph-atlas sampling until the damped camera settles, producing
+ * a visible late "sharpen" step. Translation-only drag and inertia may still
+ * reuse the cache because they do not change the screen-space text scale.
+ */
+export function shouldUseNativePanCacheForFrame(
+  sceneEligible: boolean,
+  vectorLodActive: boolean,
+  panInteracting: boolean,
+  cameraAnimating: boolean,
+  zoomAnimating: boolean
+): boolean {
+  if (!sceneEligible || vectorLodActive || zoomAnimating) {
+    return false;
+  }
+  return panInteracting || cameraAnimating;
+}
