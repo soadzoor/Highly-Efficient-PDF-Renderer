@@ -64,7 +64,7 @@
     "test:raster-ownership": "node scripts/test-raster-texture-ownership.mjs",
     "test:text-glyph-coverage": "node scripts/test-text-glyph-coverage.mjs",
     "test:text-lod-core": "node --experimental-strip-types scripts/test-text-lod-core.mjs",
-    "test:text-lod-native": "node scripts/test-native-text-lod.mjs",
+    "test:text-lod-native": "node --experimental-strip-types scripts/test-native-text-lod.mjs",
     "test:text-lod-three": "node scripts/test-three-text-lod.mjs",
     "test:deferred-renderer": "node --experimental-strip-types scripts/test-deferred-renderer-api.mjs",
     "test:three-color": "node scripts/test-three-color-parity.mjs",

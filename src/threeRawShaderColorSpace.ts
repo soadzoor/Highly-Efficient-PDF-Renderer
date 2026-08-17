@@ -25,41 +25,13 @@ export function encodeThreeShaderOutputToSrgb(source: string): string {
 
 export function normalizeThreeTextRawFragmentShaderSource(source: string): string {
   return normalizeThreeRawShaderSource(
-    useGammaCorrectTextCoverage(useWebGpuTextWinding(source)),
+    useGammaCorrectTextCoverage(source),
     true
   );
 }
 
 export function normalizeThreeStrokeRawFragmentShaderSource(source: string): string {
   return normalizeThreeRawShaderSource(useGammaCorrectStrokeCoverage(source), true);
-}
-
-const WEBGPU_TEXT_WINDING_GLSL = `
-const int HEPR_THREE_TEXT_WINDING_SUBDIVISIONS = 6;
-
-void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding) {
-  vec2 prev = a;
-  for (int i = 1; i <= HEPR_THREE_TEXT_WINDING_SUBDIVISIONS; i += 1) {
-    float t = float(i) / float(HEPR_THREE_TEXT_WINDING_SUBDIVISIONS);
-    vec2 next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding);
-    prev = next;
-  }
-}
-`;
-
-function useWebGpuTextWinding(source: string): string {
-  const start = source.indexOf("void accumulateQuadraticCrossingRoot(");
-  if (start < 0) {
-    return source;
-  }
-
-  const end = source.indexOf("void main()", start);
-  if (end < 0) {
-    return source;
-  }
-
-  return `${source.slice(0, start)}${WEBGPU_TEXT_WINDING_GLSL}\n${source.slice(end)}`;
 }
 
 function useGammaCorrectTextCoverage(source: string): string {

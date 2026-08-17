@@ -9,6 +9,10 @@ import {
   type OrderedGradientPaintCommand
 } from "./orderedGradientPaint";
 import { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } from "./nativeGradientWebGpuShaders";
+import {
+  isNativeTextHeavyStrokeFreeScene,
+  NATIVE_VECTOR_MINIFY_ENABLED
+} from "./nativeRenderPolicy";
 import type {
   DrawStats,
   SceneStats,
@@ -35,6 +39,7 @@ import {
   type TextLodMode,
   type TextLodStats
 } from "./textLodCore";
+import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
@@ -2424,8 +2429,8 @@ export class WebGpuFloorplanRenderer {
 
   resize(): void {
     const devicePixelRatio = window.devicePixelRatio || 1;
-    const nextWidth = Math.max(1, Math.round(this.canvas.clientWidth * devicePixelRatio));
-    const nextHeight = Math.max(1, Math.round(this.canvas.clientHeight * devicePixelRatio));
+    const nextWidth = Math.max(1, Math.floor(this.canvas.clientWidth * devicePixelRatio));
+    const nextHeight = Math.max(1, Math.floor(this.canvas.clientHeight * devicePixelRatio));
 
     if (this.canvas.width === nextWidth && this.canvas.height === nextHeight) {
       return;
@@ -3353,8 +3358,15 @@ export class WebGpuFloorplanRenderer {
     this.presentedFrameSerial += 1;
   }
 
+  private isTextHeavyStrokeFreeScene(): boolean {
+    return isNativeTextHeavyStrokeFreeScene(this.textInstanceCount, this.segmentCount);
+  }
+
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (this.vectorLodRuntime || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
+    if (this.vectorLodRuntime) {
+      return false;
+    }
+    if (this.segmentCount < PAN_CACHE_MIN_SEGMENTS && !this.isTextHeavyStrokeFreeScene()) {
       return false;
     }
     if (this.isPanInteracting) {
@@ -3481,11 +3493,18 @@ export class WebGpuFloorplanRenderer {
   }
 
   private shouldUseVectorMinifyPath(): boolean {
+    if (!NATIVE_VECTOR_MINIFY_ENABLED) {
+      return false;
+    }
     const minifyPlan = this.getOrderedGradientMinifyPlan();
     if (
+      this.vectorLodRuntime ||
       this.textVectorOnly ||
       !minifyPlan.hasMinifiableContent
     ) {
+      return false;
+    }
+    if (this.isTextHeavyStrokeFreeScene()) {
       return false;
     }
     return this.zoom <= VECTOR_MINIFY_MAX_ZOOM;
@@ -4728,7 +4747,7 @@ export class WebGpuFloorplanRenderer {
 
   private createR8Texture(width: number, height: number, source: Uint8Array): any {
     const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
-    const mipChain = buildSingleChannelMipChain(source, width, height);
+    const mipChain = buildSingleChannelUint8MipChain(source, width, height);
 
     const texture = this.gpuDevice.createTexture({
       size: {
@@ -5266,46 +5285,6 @@ function buildRgbaMipChain(source: Uint8Array, width: number, height: number): A
         nextData[outIndex + 1] = ((levelData[i00 + 1] + levelData[i01 + 1] + levelData[i10 + 1] + levelData[i11 + 1]) + 2) >> 2;
         nextData[outIndex + 2] = ((levelData[i00 + 2] + levelData[i01 + 2] + levelData[i10 + 2] + levelData[i11 + 2]) + 2) >> 2;
         nextData[outIndex + 3] = ((levelData[i00 + 3] + levelData[i01 + 3] + levelData[i10 + 3] + levelData[i11 + 3]) + 2) >> 2;
-      }
-    }
-
-    chain.push({ width: nextWidth, height: nextHeight, data: nextData });
-    levelWidth = nextWidth;
-    levelHeight = nextHeight;
-    levelData = nextData;
-  }
-
-  return chain;
-}
-
-function buildSingleChannelMipChain(source: Uint8Array, width: number, height: number): Array<{ width: number; height: number; data: Uint8Array }> {
-  const chain: Array<{ width: number; height: number; data: Uint8Array }> = [];
-  let levelWidth = Math.max(1, Math.trunc(width));
-  let levelHeight = Math.max(1, Math.trunc(height));
-  let levelData = source;
-
-  chain.push({ width: levelWidth, height: levelHeight, data: levelData });
-
-  while (levelWidth > 1 || levelHeight > 1) {
-    const nextWidth = Math.max(1, levelWidth >> 1);
-    const nextHeight = Math.max(1, levelHeight >> 1);
-    const nextData = new Uint8Array(nextWidth * nextHeight);
-
-    for (let y = 0; y < nextHeight; y += 1) {
-      const srcY0 = Math.min(levelHeight - 1, y * 2);
-      const srcY1 = Math.min(levelHeight - 1, srcY0 + 1);
-
-      for (let x = 0; x < nextWidth; x += 1) {
-        const srcX0 = Math.min(levelWidth - 1, x * 2);
-        const srcX1 = Math.min(levelWidth - 1, srcX0 + 1);
-
-        const i00 = srcY0 * levelWidth + srcX0;
-        const i01 = srcY0 * levelWidth + srcX1;
-        const i10 = srcY1 * levelWidth + srcX0;
-        const i11 = srcY1 * levelWidth + srcX1;
-
-        nextData[y * nextWidth + x] =
-          ((levelData[i00] + levelData[i01] + levelData[i10] + levelData[i11]) + 2) >> 2;
       }
     }
 

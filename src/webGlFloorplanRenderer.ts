@@ -14,6 +14,10 @@ import {
   GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE,
   GRADIENT_STROKE_VERTEX_SHADER_SOURCE
 } from "./nativeGradientWebGlShaders";
+import {
+  isNativeTextHeavyStrokeFreeScene,
+  NATIVE_VECTOR_MINIFY_ENABLED
+} from "./nativeRenderPolicy";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import {
   appendTextLodCombinedPayload,
@@ -28,6 +32,7 @@ import {
   type TextLodMode,
   type TextLodStats
 } from "./textLodCore";
+import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
@@ -870,40 +875,55 @@ void main() {
   // edge normal. Final coverage below uses the tighter directional width.
   float localPerPixel = length(vec2(pixelToLocalX, pixelToLocalY));
   float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
+  vec2 atlasPxSize = max(uTextRasterAtlasSize, vec2(1.0));
+  vec2 nc = vec2(vNormCoord.x, 1.0 - vNormCoord.y) * (vRasterRect.zw * atlasPxSize);
+  vec2 dncDx = dFdx(nc);
+  vec2 dncDy = dFdy(nc);
+  float ncFwidthX = abs(dncDx.x) + abs(dncDy.x);
+  float ncFwidthY = abs(dncDx.y) + abs(dncDy.y);
 
   if (vSegmentCount <= 0) {
     discard;
   }
 
-  if (uTextVectorOnly < 0.5 && vRasterRect.z > 0.0 && vRasterRect.w > 0.0) {
-    vec2 atlasPxSize = max(uTextRasterAtlasSize, vec2(1.0));
-    vec2 nc = vec2(vNormCoord.x, 1.0 - vNormCoord.y) * (vRasterRect.zw * atlasPxSize);
-    if (min(fwidth(nc.x), fwidth(nc.y)) > 2.0) {
-      vec2 uvCenter = vec2(
-        vRasterRect.x + vNormCoord.x * vRasterRect.z,
-        vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
+  if (
+    uTextVectorOnly < 0.5 &&
+    vRasterRect.z > 0.0 &&
+    vRasterRect.w > 0.0 &&
+    min(ncFwidthX, ncFwidthY) > 2.0
+  ) {
+    vec2 uvCenter = vec2(
+      vRasterRect.x + vNormCoord.x * vRasterRect.z,
+      vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
+    );
+    vec2 texel = 1.0 / atlasPxSize;
+    vec2 uvMin = vRasterRect.xy + texel * 0.5;
+    vec2 uvMax = vRasterRect.xy + vRasterRect.zw - texel * 0.5;
+    vec2 tapDx = dncDx * 0.33 * texel;
+    vec2 tapDy = dncDy * 0.33 * texel;
+    // Scale explicit gradients by exp2(-1.25) to preserve the previous mip
+    // bias while matching the WGSL anisotropic footprint exactly.
+    vec2 mipBiasedUvDx = dncDx * texel * 0.42044820762685725;
+    vec2 mipBiasedUvDy = dncDy * texel * 0.42044820762685725;
+    float alpha = (1.0 / 3.0) * textureGrad(
+      uTextRasterAtlasTex,
+      clamp(uvCenter, uvMin, uvMax),
+      mipBiasedUvDx,
+      mipBiasedUvDy
+    ).r +
+      (1.0 / 6.0) * (
+        textureGrad(uTextRasterAtlasTex, clamp(uvCenter - tapDx - tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
+        textureGrad(uTextRasterAtlasTex, clamp(uvCenter - tapDx + tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
+        textureGrad(uTextRasterAtlasTex, clamp(uvCenter + tapDx - tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
+        textureGrad(uTextRasterAtlasTex, clamp(uvCenter + tapDx + tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r
       );
-      vec2 texel = 1.0 / atlasPxSize;
-      vec2 uvMin = vRasterRect.xy + texel * 0.5;
-      vec2 uvMax = vRasterRect.xy + vRasterRect.zw - texel * 0.5;
-      vec2 dx = dFdx(nc) * 0.33 * texel;
-      vec2 dy = dFdy(nc) * 0.33 * texel;
-      float mipBias = -1.25;
-      float alpha = (1.0 / 3.0) * texture(uTextRasterAtlasTex, clamp(uvCenter, uvMin, uvMax), mipBias).r +
-        (1.0 / 6.0) * (
-          texture(uTextRasterAtlasTex, clamp(uvCenter - dx - dy, uvMin, uvMax), mipBias).r +
-          texture(uTextRasterAtlasTex, clamp(uvCenter - dx + dy, uvMin, uvMax), mipBias).r +
-          texture(uTextRasterAtlasTex, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias).r +
-          texture(uTextRasterAtlasTex, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias).r
-        );
-      alpha = heprThreeLinearCoverageToOutputAlpha(alpha) * vColorAlpha;
-      if (alpha <= 0.001) {
-        discard;
-      }
-      vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-      outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
-      return;
+    alpha = heprThreeLinearCoverageToOutputAlpha(alpha) * vColorAlpha;
+    if (alpha <= 0.001) {
+      discard;
     }
+    vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
+    outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
+    return;
   }
 
   float coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
@@ -1215,7 +1235,6 @@ const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
 const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
-const VECTOR_MINIFY_MAX_TEXT_INSTANCES = 100_000;
 const VECTOR_MINIFY_SUPERSAMPLE = 2;
 const VECTOR_MINIFY_MAX_ZOOM = 2.25;
 const CAMERA_DAMPING_POSITION_RATE = 24;
@@ -1910,6 +1929,7 @@ export class WebGlFloorplanRenderer {
       stencil: false,
       alpha: false,
       premultipliedAlpha: false,
+      powerPreference: "high-performance",
       preserveDrawingBuffer: options.preserveDrawingBuffer === true
     });
 
@@ -2447,8 +2467,8 @@ export class WebGlFloorplanRenderer {
 
   resize(): void {
     const devicePixelRatio = window.devicePixelRatio || 1;
-    const nextWidth = Math.max(1, Math.round(this.canvas.clientWidth * devicePixelRatio));
-    const nextHeight = Math.max(1, Math.round(this.canvas.clientHeight * devicePixelRatio));
+    const nextWidth = Math.max(1, Math.floor(this.canvas.clientWidth * devicePixelRatio));
+    const nextHeight = Math.max(1, Math.floor(this.canvas.clientHeight * devicePixelRatio));
 
     if (this.canvas.width === nextWidth && this.canvas.height === nextHeight) {
       return;
@@ -3011,13 +3031,12 @@ export class WebGlFloorplanRenderer {
   }
 
   /**
-   * A book-like scene: enough glyphs to be expensive, and no strokes whose
-   * thickness could shift between the cached and direct paths. These already opt
-   * out of the supersampled minify path, so caching pans costs no sharpness the
-   * still frame would otherwise keep.
+   * A book-like scene: enough glyphs to benefit from cached panning even though
+   * it does not meet the ordinary stroke-count threshold. The shared direct
+   * rendering policy keeps its cached and settled coverage scale consistent.
    */
   private isTextHeavyStrokeFreeScene(): boolean {
-    return this.textInstanceCount > VECTOR_MINIFY_MAX_TEXT_INSTANCES && this.segmentCount === 0;
+    return isNativeTextHeavyStrokeFreeScene(this.textInstanceCount, this.segmentCount);
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
@@ -3137,6 +3156,9 @@ export class WebGlFloorplanRenderer {
   }
 
   private shouldUseVectorMinifyPath(): boolean {
+    if (!NATIVE_VECTOR_MINIFY_ENABLED) {
+      return false;
+    }
     const minifyPlan = this.getOrderedGradientMinifyPlan();
     if (
       this.vectorLodRuntime ||
@@ -5284,24 +5306,28 @@ export class WebGlFloorplanRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.textRasterAtlasTexture);
     configureGlyphRasterTexture(gl);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    if (textRasterAtlas) {
+    const atlasMipChain = buildSingleChannelUint8MipChain(
+      textRasterAtlas?.alpha ?? new Uint8Array([0]),
+      this.textRasterAtlasWidth,
+      this.textRasterAtlasHeight
+    );
+    for (let mipLevel = 0; mipLevel < atlasMipChain.length; mipLevel += 1) {
+      const level = atlasMipChain[mipLevel];
       gl.texImage2D(
         gl.TEXTURE_2D,
-        0,
+        mipLevel,
         gl.R8,
-        this.textRasterAtlasWidth,
-        this.textRasterAtlasHeight,
+        level.width,
+        level.height,
         0,
         gl.RED,
         gl.UNSIGNED_BYTE,
-        textRasterAtlas.alpha
+        level.data
       );
-    } else {
-      const transparent = new Uint8Array([0]);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, transparent);
     }
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, atlasMipChain.length - 1);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    gl.generateMipmap(gl.TEXTURE_2D);
 
     return {
       instanceTextureWidth: this.textInstanceTextureWidth,
@@ -5789,7 +5815,7 @@ function configureGlyphRasterTexture(gl: WebGL2RenderingContext): void {
   }
   const supported = Number(gl.getParameter(anisotropy.MAX_TEXTURE_MAX_ANISOTROPY_EXT));
   if (Number.isFinite(supported) && supported > 1) {
-    gl.texParameterf(gl.TEXTURE_2D, anisotropy.TEXTURE_MAX_ANISOTROPY_EXT, supported);
+    gl.texParameterf(gl.TEXTURE_2D, anisotropy.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(16, supported));
   }
 }
 

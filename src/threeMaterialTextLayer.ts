@@ -5,7 +5,11 @@ import {
   CORE_TEXT_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
-import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
+import {
+  buildTextRasterAtlas,
+  TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
+} from "./textRasterAtlas";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import {
@@ -41,8 +45,6 @@ interface CullingBounds {
   maxX: number;
   maxY: number;
 }
-
-const DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE = 4096;
 
 export class ThreeMaterialTextLayer {
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
@@ -143,9 +145,9 @@ export class ThreeMaterialTextLayer {
     const rasterAtlas = buildTextRasterAtlas(
       rasterAtlasScene,
       clampInt(
-        options.maxRasterAtlasTextureSize ?? DEFAULT_MAX_RASTER_ATLAS_TEXTURE_SIZE,
+        options.maxRasterAtlasTextureSize ?? TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE,
         256,
-        8192
+        TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE
       )
     );
     if (rasterAtlas) {
@@ -318,7 +320,7 @@ export class ThreeMaterialTextLayer {
   }
 
   setRasterAtlasAnisotropy(anisotropy: number): void {
-    const supported = Math.max(1, Math.floor(Number.isFinite(anisotropy) ? anisotropy : 1));
+    const supported = Math.min(16, Math.max(1, Math.floor(Number.isFinite(anisotropy) ? anisotropy : 1)));
     if (this.textRasterAtlasTexture.anisotropy === supported) {
       return;
     }
@@ -639,12 +641,13 @@ function createNormalizedByteTexture(
 
 function createRasterAtlasTexture(data: Uint8Array, width: number, height: number): THREE.DataTexture {
   const texture = new THREE.DataTexture(data, width, height, THREE.RedFormat, THREE.UnsignedByteType);
+  texture.mipmaps = buildSingleChannelUint8MipChain(data, width, height);
   texture.magFilter = THREE.LinearFilter;
   texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
   texture.flipY = false;
-  texture.generateMipmaps = true;
+  texture.generateMipmaps = false;
   texture.unpackAlignment = 1;
   texture.needsUpdate = true;
   return texture;

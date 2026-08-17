@@ -40,6 +40,19 @@ function assertThreeExampleContract(source) {
   const rendererConfiguration = extractFunction(source, "configureThreeRenderer");
   const objectOptions = extractFunction(source, "readThreeObjectOptions");
 
+  for (const [backend, factory] of [["WebGL", webGlFactory], ["WebGPU", webGpuFactory]]) {
+    assert.match(
+      factory,
+      /antialias\s*:\s*false/,
+      `the Three ${backend} example must stay single-sample like the native analytic-AA renderer`
+    );
+    assert.doesNotMatch(
+      factory,
+      /antialias\s*:\s*true/,
+      `the Three ${backend} example must not add MSAA coverage on top of HEPR analytic AA`
+    );
+  }
+
   assert.match(
     source,
     /THREE\.LinearSRGBColorSpace/,

@@ -44,6 +44,21 @@ assert.match(
   /rasterAtlasGlyphCount[\s\S]*?\{ \.\.\.scene, textGlyphCount: rasterAtlasGlyphCount \}/,
   "Three must exclude the appended solid LOD glyph from its raster atlas"
 );
+assert.match(
+  material,
+  /texture\.mipmaps = buildSingleChannelUint8MipChain\(data, width, height\);[\s\S]*?texture\.generateMipmaps = false;/,
+  "Three must upload the shared deterministic glyph-atlas mip chain"
+);
+assert.match(
+  material,
+  /Math\.min\(16, Math\.max\(1, Math\.floor\(/,
+  "Three glyph-atlas anisotropy must use the native WebGPU ceiling"
+);
+assert.match(
+  material,
+  /options\.maxRasterAtlasTextureSize \?\? TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE/,
+  "Three must use the same glyph-atlas size ceiling as the native renderers"
+);
 
 assert.match(object, /textLodLayer\.getRenderScene\(\)/, "the Three text mesh must use the combined payload");
 assert.match(object, /updateTextLodSelection/, "camera frames must update clustered selection");

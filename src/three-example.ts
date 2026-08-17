@@ -273,7 +273,8 @@ refreshDropIndicator();
 function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLRenderer {
   const nextRenderer = new THREE.WebGLRenderer({
     canvas: targetCanvas,
-    antialias: true,
+    // HEPR already applies analytic AA; stay single-sample like the native renderers.
+    antialias: false,
     alpha: false,
     depth: true,
     stencil: false,
@@ -287,7 +288,8 @@ function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLR
 async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promise<WebGPURenderer> {
   const nextRenderer = new WebGPURenderer({
     canvas: targetCanvas,
-    antialias: true,
+    // HEPR already applies analytic AA; stay single-sample like the native renderers.
+    antialias: false,
     alpha: false,
     depth: true,
     stencil: false,

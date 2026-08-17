@@ -118,4 +118,33 @@ const threeMaterialSource = await readFile(
 );
 assert.doesNotMatch(threeMaterialSource, /uTextLodBlend|setTextLodBlend/, "Three WebGL must preserve the public core text shader contract");
 
+const coreShaderSource = await readFile(
+  path.resolve(scriptDir, "../src/webGlFloorplanRenderer.ts"),
+  "utf8"
+);
+const threeRawShaderColorSpaceSource = await readFile(
+  path.resolve(scriptDir, "../src/threeRawShaderColorSpace.ts"),
+  "utf8"
+);
+assert.match(
+  coreShaderSource,
+  /void accumulateQuadraticCrossingRoot\s*\(/,
+  "the shared core text shader must retain its exact quadratic crossing solver"
+);
+assert.match(
+  threeMaterialSource,
+  /normalizeThreeTextRawFragmentShaderSource\(CORE_TEXT_FRAGMENT_SHADER_SOURCE\)/,
+  "Three WebGL must normalize the shared core text fragment shader"
+);
+assert.doesNotMatch(
+  threeRawShaderColorSpaceSource,
+  /useWebGpuTextWinding|HEPR_THREE_TEXT_WINDING_SUBDIVISIONS/,
+  "Three WebGL must not replace exact quadratic winding with a segmented approximation"
+);
+assert.match(
+  threeRawShaderColorSpaceSource,
+  /useGammaCorrectTextCoverage\(source\)/,
+  "Three WebGL text normalization must preserve the core solver while adapting coverage output"
+);
+
 console.log("Text glyph overlap coverage tests passed");
