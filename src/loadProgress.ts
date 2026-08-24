@@ -205,6 +205,7 @@ export class LoadProgressReporter {
       sourcePageCount?: number;
       tickMs?: number;
       ceiling?: number;
+      timeConstantMs?: number;
     }
   ): Promise<T> {
     if (!this.enabled) {
@@ -213,6 +214,10 @@ export class LoadProgressReporter {
 
     const tickMs = Math.max(50, Math.trunc(options.tickMs ?? 90));
     const ceiling = clamp(options.ceiling ?? 0.9, 0.1, 0.999);
+    const timeConstantMs = Math.max(
+      1,
+      Number.isFinite(options.timeConstantMs) ? options.timeConstantMs! : 800
+    );
     const startedAt = nowMs();
     const meta: Partial<ProgressMetadata> = {
       stage: options.stage,
@@ -229,7 +234,7 @@ export class LoadProgressReporter {
     this.report(0, meta);
     const intervalId = globalThis.setInterval(() => {
       const elapsedMs = Math.max(0, nowMs() - startedAt);
-      const ratio = elapsedMs / 800;
+      const ratio = elapsedMs / timeConstantMs;
       this.report(Math.min(ceiling, ceiling * (1 - 1 / (1 + ratio))), meta);
     }, tickMs);
 

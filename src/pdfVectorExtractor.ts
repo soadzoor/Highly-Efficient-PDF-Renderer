@@ -1,4 +1,5 @@
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
+import { collectPdfOperatorList } from "./pdfOperatorList";
 import { assertPdfBytes } from "./pdfSignature";
 
 const pdfJsModule = (
@@ -500,21 +501,30 @@ export async function extractPdfPageScenes(
       signal?.throwIfAborted();
       const page = await pdf.getPage(pageNumber);
       signal?.throwIfAborted();
-      progress.report(lerpNumber(pageStart, pageEnd, 0.28), {
-        stage: "pdf-operators",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
+      const operatorProgressStart = lerpNumber(pageStart, pageEnd, 0.28);
+      const operatorProgressEnd = lerpNumber(pageStart, pageEnd, 0.58);
+      const operatorList = await progress
+        .child(operatorProgressStart, operatorProgressEnd)
+        .withIndeterminateProgress(
+          () => {
+            signal?.throwIfAborted();
+            return collectPdfOperatorList(page);
+          },
+          {
+            stage: "pdf-operators",
+            sourceType: "pdf",
+            unit: "operators",
+            pageIndex: selectionIndex,
+            pageCount: extractedPageCount,
+            sourcePageIndex,
+            sourcePageCount: pdfPageCount,
+            tickMs: 200,
+            ceiling: 0.97,
+            timeConstantMs: 15_000
+          }
+        );
       signal?.throwIfAborted();
-      const operatorList = await page.getOperatorList();
-      signal?.throwIfAborted();
-      progress.report(lerpNumber(pageStart, pageEnd, 0.58), {
+      progress.report(operatorProgressEnd, {
         stage: "compile",
         sourceType: "pdf",
         unit: "operators",
@@ -626,7 +636,7 @@ export async function extractPdfRasterPageScenes(
         sourcePageCount: pdfPageCount
       });
       const page = await pdf.getPage(pageNumber);
-      const operatorList = await page.getOperatorList();
+      const operatorList = await collectPdfOperatorList(page);
       progress.report(lerpNumber(pageStart, pageEnd, 0.4), {
         stage: "pdf-raster",
         sourceType: "pdf",
