@@ -4,6 +4,8 @@
 export type PDFLoadStage =
   | "source"
   | "pdf-page"
+  | "pdf-fast-check"
+  | "pdf-fast-decode"
   | "pdf-operators"
   | "pdf-text"
   | "pdf-raster"
@@ -19,8 +21,12 @@ export type PDFLoadStage =
   | "first-render"
   | "complete";
 
-/** Where PDF operator parsing is running. */
-export type PDFLoadExecutionPath = "worker" | "main-thread" | "main-thread-fallback";
+/** Where PDF parsing is running. */
+export type PDFLoadExecutionPath =
+  | "worker"
+  | "dense-vector-worker"
+  | "main-thread"
+  | "main-thread-fallback";
 
 /**
  * Progress event emitted by HEPR loaders.
@@ -195,6 +201,7 @@ export class LoadProgressReporter {
     work: Promise<T> | (() => Promise<T>),
     options: {
       stage: PDFLoadStage;
+      executionPath?: PDFLoadExecutionPath;
       sourceType?: "pdf" | "zip";
       unit?: "bytes" | "operators" | "files" | "pages" | "texels";
       processed?: number;
@@ -221,6 +228,7 @@ export class LoadProgressReporter {
     const startedAt = nowMs();
     const meta: Partial<ProgressMetadata> = {
       stage: options.stage,
+      executionPath: options.executionPath,
       sourceType: options.sourceType,
       unit: options.unit,
       processed: options.processed,
@@ -261,6 +269,10 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Reading source";
     case "pdf-page":
       return "Processing pages";
+    case "pdf-fast-check":
+      return "Checking fast PDF path";
+    case "pdf-fast-decode":
+      return "Decoding PDF vectors";
     case "pdf-operators":
       return "Scanning operators";
     case "pdf-text":

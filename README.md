@@ -224,6 +224,20 @@ within the normalized composed subset. Page-scoped progress events expose both
 the composed `pageIndex` / `pageCount` and the original PDF's
 `sourcePageIndex` / `sourcePageCount`.
 
+Compatible vector-dense PDFs are compiled automatically in a short-lived
+worker without materializing PDF.js's full operator list. Eligibility is
+content-driven and requires every selected page to use the supported path,
+color, clipping, and text subset; other PDFs fall back atomically to PDF.js.
+The accepted graphics-state subset is deliberately narrow: `/OPM 0` or
+`/OPM 1` with overprint disabled is treated as inert, and even-odd clips use
+the same AABB/compact nested-rectangle representation as ordinary HEPR
+extraction. Alpha, blending, soft masks, active overprint, and other graphics
+state features still fall back to PDF.js.
+Set `pdfFastPath: "off"` to disable this optimization for diagnostics or
+differential testing. Fast-path progress uses
+`executionPath: "dense-vector-worker"` and reports inspection and
+decompression before operator scanning and compilation.
+
 Useful object APIs:
 
 - `pdfObject.getViewState()`

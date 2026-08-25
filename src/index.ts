@@ -170,6 +170,7 @@ export type {
 
 export type {
   LoadProgressCallback,
+  PDFLoadExecutionPath,
   PDFLoadProgress,
   PDFLoadStage
 } from "./loadProgress";

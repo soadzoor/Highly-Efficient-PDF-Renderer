@@ -4,6 +4,9 @@ import { defineConfig } from "vite";
 export default defineConfig(({ mode }) => {
   if (mode === "lib") {
     return {
+      // Keep worker chunks relative to the package entry so consumers do not
+      // accidentally request them from the host application's root.
+      base: "./",
       publicDir: false,
       build: {
         lib: {
