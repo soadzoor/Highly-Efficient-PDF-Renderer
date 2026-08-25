@@ -50,6 +50,17 @@ export interface PdfObjectGeneratorOptions {
   invisibleCull?: boolean;
 
   /**
+   * Use HEPR's specialized worker path for compatible, unusually dense vector
+   * PDFs. In `"auto"` mode HEPR checks each page and transparently falls back
+   * to PDF.js when the fast path does not support its content.
+   *
+   * PDF sources only; parsed-data ZIP sources ignore this option.
+   *
+   * @default "auto"
+   */
+  pdfFastPath?: "auto" | "off";
+
+  /**
    * One-based PDF pages to parse, using Chrome-style ASCII print syntax.
    * Separate individual page numbers or inclusive ranges with commas.
    * Open ranges such as `"5-"` and `"-3"` are also supported.
@@ -140,6 +151,7 @@ export async function loadPdfSceneFromSource(
     const extractOptions: VectorExtractOptions = {
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
+      pdfFastPath: options.pdfFastPath ?? "auto",
       pages: options.pages,
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()

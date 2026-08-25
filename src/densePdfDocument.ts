@@ -1,0 +1,1537 @@
+import {
+  EncryptedPDFError,
+  ParseSpeeds,
+  PDFArray,
+  PDFBool,
+  PDFDict,
+  PDFDocument,
+  PDFHexString,
+  PDFName,
+  PDFNumber,
+  PDFObjectCopier,
+  PDFRawStream,
+  PDFRef,
+  PDFStream,
+  PDFString,
+  decodePDFRawStream,
+  type PDFContext,
+  type PDFObject,
+  type PDFPage
+} from "pdf-lib";
+
+/** Why a PDF cannot use the conservative dense-page compiler path. */
+export type DensePdfFallbackReason =
+  | "encrypted"
+  | "annotations"
+  | "optional-content"
+  | "unsupported-resource"
+  | "unsupported-filter"
+  | "invalid-structure";
+
+export interface DensePdfPreflightOptions {
+  /** One-based Chrome-style page selection, for example `"1-5, 8"`. */
+  pages?: string;
+
+  /** Target size of decoded content chunks yielded to the compiler. @default 262144 */
+  decodedChunkSize?: number;
+}
+
+/** An exact PDF page rectangle in `[left, bottom, right, top]` coordinates. */
+export interface DensePdfPageBox {
+  left: number;
+  bottom: number;
+  right: number;
+  top: number;
+}
+
+export interface DensePdfDecodeTiming {
+  readonly elapsedMs: number;
+  readonly decodedBytes: number;
+  readonly chunkCount: number;
+  /** False when the consumer stopped early or decoding threw. */
+  readonly completed: boolean;
+}
+
+export interface DensePdfSelectedPage {
+  /** Zero-based page index in the source PDF. */
+  readonly sourcePageIndex: number;
+  /** One-based page number in the source PDF. */
+  readonly sourcePageNumber: number;
+  readonly mediaBox: DensePdfPageBox;
+  readonly cropBox: DensePdfPageBox;
+  readonly bleedBox?: DensePdfPageBox;
+  readonly trimBox?: DensePdfPageBox;
+  readonly artBox?: DensePdfPageBox;
+  /** The effective source `/Rotate` value, in degrees. */
+  readonly rotation: number;
+  /** The effective source `/UserUnit`, defaulting to 1. */
+  readonly userUnit: number;
+  readonly contentStreamCount: number;
+  readonly encodedContentBytes: number;
+  /** Decoded PDF resource names, without their leading slash. */
+  readonly availableFonts: readonly string[];
+  /** Decoded PDF resource names, without their leading slash. */
+  readonly availableProperties: readonly string[];
+  /** Names of validated, behaviorally inert `/ExtGState` resources. */
+  readonly availableExtGStates: readonly string[];
+  readonly decodeTiming: DensePdfDecodeTiming;
+
+  /**
+   * Decode the page's content streams in PDF concatenation order.
+   *
+   * A newline is inserted between streams so adjacent tokens cannot merge.
+   * The iterable may be consumed once at a time and may be requested again
+   * until `buildDenseTextMiniPdf` releases the source content objects.
+   */
+  decodedContentChunks(): AsyncIterable<Uint8Array>;
+}
+
+export interface DensePdfPreflightTiming {
+  readonly loadMs: number;
+  readonly inspectMs: number;
+  readonly totalMs: number;
+}
+
+/** Opaque source document retained only until the mini PDF has been built. */
+export interface DensePdfDocument {
+  readonly sourcePageCount: number;
+  readonly pages: readonly DensePdfSelectedPage[];
+  readonly timing: DensePdfPreflightTiming;
+}
+
+export interface DensePdfFallback {
+  readonly eligible: false;
+  readonly reason: DensePdfFallbackReason;
+  readonly message: string;
+  readonly sourcePageIndex?: number;
+  readonly resourceName?: string;
+  readonly filterName?: string;
+  readonly timing: DensePdfPreflightTiming;
+}
+
+export type DensePdfPreflightResult =
+  | {
+      readonly eligible: true;
+      readonly document: DensePdfDocument;
+      readonly timing: DensePdfPreflightTiming;
+    }
+  | DensePdfFallback;
+
+export interface DensePdfCompiledPage {
+  readonly sourcePageIndex: number;
+  /** Canonical text/state/clip/marked-content bytes retained by the compiler. */
+  readonly retainedTextContent: Uint8Array;
+  /** Font resource names used by retained `Tf` operators. */
+  readonly referencedFonts: ReadonlySet<string>;
+  /** Property resource names used by retained `BDC` operators. */
+  readonly referencedProperties: ReadonlySet<string>;
+}
+
+export interface DensePdfMiniPdfTiming {
+  readonly resourceCopyMs: number;
+  readonly contentBuildMs: number;
+  readonly sourceReleaseMs: number;
+  readonly saveMs: number;
+  readonly totalMs: number;
+}
+
+export interface DensePdfMiniPdfResult {
+  readonly bytes: Uint8Array;
+  readonly timing: DensePdfMiniPdfTiming;
+  readonly releasedSourceContentObjects: number;
+}
+
+export type DensePdfBuildErrorCode =
+  | "foreign-document"
+  | "source-released"
+  | "compiled-page-mismatch"
+  | "missing-resource";
+
+export class DensePdfBuildError extends Error {
+  readonly code: DensePdfBuildErrorCode;
+
+  constructor(code: DensePdfBuildErrorCode, message: string) {
+    super(message);
+    this.name = "DensePdfBuildError";
+    this.code = code;
+  }
+}
+
+interface MutableDecodeTiming {
+  elapsedMs: number;
+  decodedBytes: number;
+  chunkCount: number;
+  completed: boolean;
+}
+
+interface ContentStreamDescriptor {
+  readonly stream: PDFRawStream;
+  readonly filters: readonly string[];
+  readonly useNativeFlate: boolean;
+}
+
+interface DensePdfPrivatePage {
+  readonly publicPage: DensePdfSelectedPage;
+  readonly sourcePage: PDFPage;
+  readonly streams: ContentStreamDescriptor[];
+  readonly contentObjectRefs: PDFRef[];
+  readonly fontResources: PDFDict | null;
+  readonly propertyResources: PDFDict | null;
+  readonly procSetResource: PDFObject | undefined;
+  readonly fontNames: ReadonlyMap<string, PDFName>;
+  readonly propertyNames: ReadonlyMap<string, PDFName>;
+  readonly decodeTiming: MutableDecodeTiming;
+  owner: DensePdfPrivateDocument | null;
+  decodeActive: boolean;
+}
+
+interface DensePdfPrivateDocument {
+  readonly sourceDocument: PDFDocument;
+  readonly pages: readonly DensePdfPrivatePage[];
+  readonly catalogLanguage: PDFString | PDFHexString | PDFName | null;
+  released: boolean;
+}
+
+interface PreflightRejectionDetails {
+  sourcePageIndex?: number;
+  resourceName?: string;
+  filterName?: string;
+}
+
+class PreflightRejection extends Error {
+  readonly reason: DensePdfFallbackReason;
+  readonly details: PreflightRejectionDetails;
+
+  constructor(
+    reason: DensePdfFallbackReason,
+    message: string,
+    details: PreflightRejectionDetails = {}
+  ) {
+    super(message);
+    this.name = "PreflightRejection";
+    this.reason = reason;
+    this.details = details;
+  }
+}
+
+const DEFAULT_DECODE_CHUNK_SIZE = 256 * 1024;
+const MIN_DECODE_CHUNK_SIZE = 4 * 1024;
+const MAX_DECODE_CHUNK_SIZE = 4 * 1024 * 1024;
+const STREAM_SEPARATOR = new Uint8Array([0x0a]);
+const SUPPORTED_CONTENT_FILTERS = new Set([
+  "FlateDecode",
+  "LZWDecode",
+  "ASCII85Decode",
+  "ASCIIHexDecode",
+  "RunLengthDecode"
+]);
+const ALLOWED_RESOURCE_KEYS = new Set([
+  "ExtGState",
+  "Font",
+  "Properties",
+  "ProcSet"
+]);
+const denseDocumentState = new WeakMap<object, DensePdfPrivateDocument>();
+
+/**
+ * Structurally inspect selected pages without asking PDF.js to build an
+ * operator list. Eligibility is deliberately conservative: the v1 dense
+ * compiler only accepts fonts, property lists, graphics/text state operators,
+ * clipping, and marked content.
+ *
+ * Invalid `pages` syntax/ranges are caller errors and throw. A valid document
+ * that needs the ordinary PDF.js path returns `eligible: false` instead.
+ */
+export async function preflightDensePdfDocument(
+  pdfBytes: Uint8Array | ArrayBuffer,
+  options: DensePdfPreflightOptions = {}
+): Promise<DensePdfPreflightResult> {
+  const totalStart = now();
+  const chunkSize = normalizeDecodeChunkSize(options.decodedChunkSize);
+  const loadStart = now();
+  let sourceDocument: PDFDocument;
+
+  try {
+    sourceDocument = await PDFDocument.load(pdfBytes, {
+      parseSpeed: ParseSpeeds.Fastest,
+      updateMetadata: false,
+      throwOnInvalidObject: true,
+      ignoreEncryption: false
+    });
+  } catch (error) {
+    const loadMs = elapsed(loadStart);
+    const encrypted =
+      error instanceof EncryptedPDFError ||
+      (error instanceof Error && /encrypted/i.test(error.message));
+    return makeFallback(
+      encrypted ? "encrypted" : "invalid-structure",
+      encrypted
+        ? "Encrypted PDFs are not supported by the dense compiler."
+        : `pdf-lib could not parse the PDF structure: ${errorMessage(error)}`,
+      { loadMs, inspectMs: 0, totalMs: elapsed(totalStart) }
+    );
+  }
+
+  const loadMs = elapsed(loadStart);
+  const sourcePageCount = sourceDocument.getPageCount();
+  if (sourcePageCount < 1) {
+    return makeFallback(
+      "invalid-structure",
+      "The PDF does not contain any pages.",
+      { loadMs, inspectMs: 0, totalMs: elapsed(totalStart) }
+    );
+  }
+  // Selection errors intentionally escape rather than becoming eligibility
+  // fallbacks, matching the public PDF loader's existing behavior.
+  const selectedPageNumbers = resolvePdfPageNumbers(sourcePageCount, options.pages);
+  const inspectStart = now();
+
+  try {
+    rejectDocumentLevelFeatures(sourceDocument);
+    const catalogLanguage = readCatalogLanguage(sourceDocument);
+    const privatePages = selectedPageNumbers.map((sourcePageNumber) =>
+      inspectSelectedPage(sourceDocument, sourcePageNumber - 1, chunkSize)
+    );
+    const inspectMs = elapsed(inspectStart);
+    const timing: DensePdfPreflightTiming = {
+      loadMs,
+      inspectMs,
+      totalMs: elapsed(totalStart)
+    };
+    const document: DensePdfDocument = {
+      sourcePageCount,
+      pages: Object.freeze(privatePages.map((page) => page.publicPage)),
+      timing
+    };
+    const privateDocument: DensePdfPrivateDocument = {
+      sourceDocument,
+      pages: privatePages,
+      catalogLanguage,
+      released: false
+    };
+    for (const page of privatePages) {
+      page.owner = privateDocument;
+    }
+    denseDocumentState.set(document, privateDocument);
+    return { eligible: true, document, timing };
+  } catch (error) {
+    const inspectMs = elapsed(inspectStart);
+    const timing: DensePdfPreflightTiming = {
+      loadMs,
+      inspectMs,
+      totalMs: elapsed(totalStart)
+    };
+    if (error instanceof PreflightRejection) {
+      return makeFallback(error.reason, error.message, timing, error.details);
+    }
+    return makeFallback(
+      "invalid-structure",
+      `The selected PDF structure is not supported: ${errorMessage(error)}`,
+      timing
+    );
+  }
+}
+
+/**
+ * Build a small PDF containing only compiler-retained content and the exact
+ * source font/property resource subgraphs that content references.
+ *
+ * This consumes the preflight document. Source content stream objects are
+ * detached and deleted from pdf-lib's source context before serialization.
+ */
+export async function buildDenseTextMiniPdf(
+  document: DensePdfDocument,
+  compiledPages: readonly DensePdfCompiledPage[]
+): Promise<DensePdfMiniPdfResult> {
+  const privateDocument = denseDocumentState.get(document);
+  if (!privateDocument) {
+    throw new DensePdfBuildError(
+      "foreign-document",
+      "The dense PDF document was not created by preflightDensePdfDocument()."
+    );
+  }
+  if (privateDocument.released) {
+    throw new DensePdfBuildError(
+      "source-released",
+      "The dense PDF source content has already been released."
+    );
+  }
+
+  const compiledByPageIndex = validateCompiledPages(privateDocument.pages, compiledPages);
+  const totalStart = now();
+  const outputDocument = await PDFDocument.create({ updateMetadata: false });
+  if (privateDocument.catalogLanguage) {
+    outputDocument.catalog.set(
+      PDFName.of("Lang"),
+      privateDocument.catalogLanguage.clone()
+    );
+  }
+  const copier = PDFObjectCopier.for(
+    privateDocument.sourceDocument.context,
+    outputDocument.context
+  );
+  let resourceCopyMs = 0;
+  let contentBuildMs = 0;
+
+  for (const privatePage of privateDocument.pages) {
+    const compiledPage = compiledByPageIndex.get(privatePage.publicPage.sourcePageIndex)!;
+    const contentStart = now();
+    const outputPage = outputDocument.addPage([
+      Math.abs(privatePage.publicPage.mediaBox.right - privatePage.publicPage.mediaBox.left),
+      Math.abs(privatePage.publicPage.mediaBox.top - privatePage.publicPage.mediaBox.bottom)
+    ]);
+    copyPageGeometry(outputPage, privatePage.publicPage);
+    const contentStream = outputDocument.context.flateStream(
+      compiledPage.retainedTextContent
+    );
+    const contentStreamRef = outputDocument.context.register(contentStream);
+    outputPage.node.set(PDFName.Contents, contentStreamRef);
+    contentBuildMs += elapsed(contentStart);
+
+    const resourceStart = now();
+    const resources = copyRetainedResources(
+      outputDocument.context,
+      copier,
+      privatePage,
+      compiledPage
+    );
+    outputPage.node.set(PDFName.Resources, resources);
+    resourceCopyMs += elapsed(resourceStart);
+  }
+
+  const releaseStart = now();
+  const releasedSourceContentObjects = releaseSourceContentObjects(privateDocument);
+  const sourceReleaseMs = elapsed(releaseStart);
+
+  const saveStart = now();
+  const bytes = await outputDocument.save({
+    useObjectStreams: false,
+    addDefaultPage: false,
+    updateFieldAppearances: false
+  });
+  const saveMs = elapsed(saveStart);
+
+  return {
+    bytes,
+    releasedSourceContentObjects,
+    timing: {
+      resourceCopyMs,
+      contentBuildMs,
+      sourceReleaseMs,
+      saveMs,
+      totalMs: elapsed(totalStart)
+    }
+  };
+}
+
+function inspectSelectedPage(
+  sourceDocument: PDFDocument,
+  sourcePageIndex: number,
+  chunkSize: number
+): DensePdfPrivatePage {
+  const sourcePage = sourceDocument.getPage(sourcePageIndex);
+  const context = sourceDocument.context;
+  if (sourcePage.node.get(PDFName.of("OC"))) {
+    throw new PreflightRejection(
+      "optional-content",
+      `PDF page ${sourcePageIndex + 1} is controlled by optional content.`,
+      { sourcePageIndex }
+    );
+  }
+  if (sourcePage.node.get(PDFName.of("Group"))) {
+    throw new PreflightRejection(
+      "unsupported-resource",
+      `PDF page ${sourcePageIndex + 1} uses a page-level transparency/group dictionary.`,
+      { sourcePageIndex, resourceName: "Group" }
+    );
+  }
+  const annotations = sourcePage.node.Annots();
+  if (annotations && annotations.size() > 0) {
+    throw new PreflightRejection(
+      "annotations",
+      `PDF page ${sourcePageIndex + 1} contains annotations.`,
+      { sourcePageIndex }
+    );
+  }
+
+  const resources = sourcePage.node.Resources();
+  validatePageResources(resources, context, sourcePageIndex);
+  const fontResources = lookupResourceDictionary(resources, PDFName.Font, context);
+  const propertyResources = lookupResourceDictionary(
+    resources,
+    PDFName.of("Properties"),
+    context
+  );
+  const extGStateResources = lookupResourceDictionary(
+    resources,
+    PDFName.ExtGState,
+    context
+  );
+  rejectOptionalContentProperties(propertyResources, context, sourcePageIndex);
+
+  const content = readPageContentStreams(sourcePage, context, sourcePageIndex);
+  const mediaBox = readPageBox(sourcePage.node.MediaBox(), "MediaBox", sourcePageIndex);
+  const cropBoxArray = sourcePage.node.CropBox();
+  const cropBox = cropBoxArray
+    ? readPageBox(cropBoxArray, "CropBox", sourcePageIndex)
+    : cloneBox(mediaBox);
+  const bleedBox = readOptionalPageBox(
+    sourcePage.node.BleedBox(),
+    "BleedBox",
+    sourcePageIndex
+  );
+  const trimBox = readOptionalPageBox(
+    sourcePage.node.TrimBox(),
+    "TrimBox",
+    sourcePageIndex
+  );
+  const artBox = readOptionalPageBox(
+    sourcePage.node.ArtBox(),
+    "ArtBox",
+    sourcePageIndex
+  );
+  const rotation = sourcePage.node.Rotate()?.asNumber() ?? 0;
+  if (!Number.isFinite(rotation) || rotation % 90 !== 0) {
+    throw new PreflightRejection(
+      "invalid-structure",
+      `PDF page ${sourcePageIndex + 1} has an invalid Rotate value.`,
+      { sourcePageIndex }
+    );
+  }
+  const userUnit = readUserUnit(sourcePage, context, sourcePageIndex);
+  const fontNames = readResourceNames(fontResources);
+  const propertyNames = readResourceNames(propertyResources);
+  const extGStateNames = readResourceNames(extGStateResources);
+  const mutableDecodeTiming: MutableDecodeTiming = {
+    elapsedMs: 0,
+    decodedBytes: 0,
+    chunkCount: 0,
+    completed: false
+  };
+
+  let privatePage!: DensePdfPrivatePage;
+  const publicPage: DensePdfSelectedPage = {
+    sourcePageIndex,
+    sourcePageNumber: sourcePageIndex + 1,
+    mediaBox,
+    cropBox,
+    ...(bleedBox ? { bleedBox } : {}),
+    ...(trimBox ? { trimBox } : {}),
+    ...(artBox ? { artBox } : {}),
+    rotation,
+    userUnit,
+    contentStreamCount: content.streams.length,
+    encodedContentBytes: content.streams.reduce(
+      (total, descriptor) => total + descriptor.stream.contents.byteLength,
+      0
+    ),
+    availableFonts: Object.freeze([...fontNames.keys()].sort()),
+    availableProperties: Object.freeze([...propertyNames.keys()].sort()),
+    availableExtGStates: Object.freeze([...extGStateNames.keys()].sort()),
+    get decodeTiming(): DensePdfDecodeTiming {
+      return { ...mutableDecodeTiming };
+    },
+    decodedContentChunks(): AsyncIterable<Uint8Array> {
+      return decodePageContentChunks(privatePage, chunkSize);
+    }
+  };
+
+  privatePage = {
+    publicPage,
+    sourcePage,
+    streams: content.streams,
+    contentObjectRefs: content.objectRefs,
+    fontResources,
+    propertyResources,
+    procSetResource: resources?.get(PDFName.of("ProcSet")),
+    fontNames,
+    propertyNames,
+    decodeTiming: mutableDecodeTiming,
+    owner: null,
+    decodeActive: false
+  };
+  return privatePage;
+}
+
+async function* decodePageContentChunks(
+  page: DensePdfPrivatePage,
+  chunkSize: number
+): AsyncIterable<Uint8Array> {
+  if (page.decodeActive) {
+    throw new Error(`PDF page ${page.publicPage.sourcePageNumber} is already being decoded.`);
+  }
+  const privateDocument = page.owner;
+  if (privateDocument?.released) {
+    throw new DensePdfBuildError(
+      "source-released",
+      "The source content streams were released after building the mini PDF."
+    );
+  }
+
+  page.decodeActive = true;
+  page.decodeTiming.elapsedMs = 0;
+  page.decodeTiming.decodedBytes = 0;
+  page.decodeTiming.chunkCount = 0;
+  page.decodeTiming.completed = false;
+  const start = now();
+  let completed = false;
+
+  try {
+    for (let streamIndex = 0; streamIndex < page.streams.length; streamIndex += 1) {
+      if (streamIndex > 0) {
+        page.decodeTiming.decodedBytes += STREAM_SEPARATOR.length;
+        page.decodeTiming.chunkCount += 1;
+        yield STREAM_SEPARATOR;
+      }
+      const descriptor = page.streams[streamIndex];
+      const chunks = descriptor.useNativeFlate
+        ? decodeNativeFlateChunks(descriptor.stream.contents, chunkSize)
+        : decodeWithPdfLibChunks(descriptor.stream, chunkSize);
+      for await (const chunk of chunks) {
+        if (chunk.length === 0) {
+          continue;
+        }
+        page.decodeTiming.decodedBytes += chunk.length;
+        page.decodeTiming.chunkCount += 1;
+        yield chunk;
+      }
+    }
+    completed = true;
+  } finally {
+    page.decodeTiming.elapsedMs = elapsed(start);
+    page.decodeTiming.completed = completed;
+    page.decodeActive = false;
+  }
+}
+
+async function* decodeNativeFlateChunks(
+  compressed: Uint8Array,
+  chunkSize: number
+): AsyncIterable<Uint8Array> {
+  const decompressor = new DecompressionStream("deflate");
+  const reader = decompressor.readable.getReader();
+  const writer = decompressor.writable.getWriter();
+  const writePromise = writer
+    .write(compressed as Uint8Array<ArrayBuffer>)
+    .then(() => writer.close());
+  let pending = new Uint8Array(chunkSize);
+  let pendingLength = 0;
+  let completed = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        completed = true;
+        break;
+      }
+      let sourceOffset = 0;
+      while (sourceOffset < value.length) {
+        const copied = Math.min(
+          value.length - sourceOffset,
+          pending.length - pendingLength
+        );
+        pending.set(value.subarray(sourceOffset, sourceOffset + copied), pendingLength);
+        pendingLength += copied;
+        sourceOffset += copied;
+        if (pendingLength === pending.length) {
+          yield pending;
+          pending = new Uint8Array(chunkSize);
+          pendingLength = 0;
+        }
+      }
+    }
+    if (pendingLength > 0) {
+      yield pending.subarray(0, pendingLength);
+    }
+  } finally {
+    if (!completed) {
+      await reader.cancel().catch(() => {
+        // A decompression error may already have closed the readable side.
+      });
+    }
+    reader.releaseLock();
+    await writePromise.catch((error: unknown) => {
+      if (completed) {
+        throw error;
+      }
+    });
+  }
+}
+
+async function* decodeWithPdfLibChunks(
+  stream: PDFRawStream,
+  chunkSize: number
+): AsyncIterable<Uint8Array> {
+  const decoder = decodePDFRawStream(stream);
+  while (!decoder.isEmpty) {
+    const bytes = decoder.getBytes(chunkSize);
+    if (bytes.length === 0) {
+      break;
+    }
+    yield bytes instanceof Uint8Array
+      ? bytes
+      : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+}
+
+function rejectDocumentLevelFeatures(sourceDocument: PDFDocument): void {
+  if (sourceDocument.isEncrypted || sourceDocument.context.trailerInfo.Encrypt) {
+    throw new PreflightRejection(
+      "encrypted",
+      "Encrypted PDFs are not supported by the dense compiler."
+    );
+  }
+  if (sourceDocument.catalog.get(PDFName.of("OCProperties"))) {
+    throw new PreflightRejection(
+      "optional-content",
+      "PDF optional-content groups are not supported by the dense compiler."
+    );
+  }
+  if (sourceDocument.catalog.get(PDFName.of("AcroForm"))) {
+    throw new PreflightRejection(
+      "annotations",
+      "Interactive forms and widget annotations are not supported by the dense compiler."
+    );
+  }
+}
+
+function readCatalogLanguage(
+  sourceDocument: PDFDocument
+): PDFString | PDFHexString | PDFName | null {
+  const rawLanguage = sourceDocument.catalog.get(PDFName.of("Lang"));
+  if (!rawLanguage) {
+    return null;
+  }
+  const language = sourceDocument.context.lookup(rawLanguage);
+  if (
+    !(language instanceof PDFString) &&
+    !(language instanceof PDFHexString) &&
+    !(language instanceof PDFName)
+  ) {
+    throw new PreflightRejection(
+      "invalid-structure",
+      "The PDF catalog /Lang entry is not a string or name."
+    );
+  }
+  try {
+    if (language.decodeText().trim().length === 0) {
+      throw new Error("empty language value");
+    }
+  } catch {
+    throw new PreflightRejection(
+      "invalid-structure",
+      "The PDF catalog /Lang entry does not contain a valid language value."
+    );
+  }
+  return language.clone();
+}
+
+function validatePageResources(
+  resources: PDFDict | undefined,
+  context: PDFContext,
+  sourcePageIndex: number
+): void {
+  if (!resources) {
+    return;
+  }
+  for (const [key, rawValue] of resources.entries()) {
+    const name = decodePdfName(key);
+    if (ALLOWED_RESOURCE_KEYS.has(name)) {
+      continue;
+    }
+    const value = context.lookup(rawValue);
+    const empty =
+      (value instanceof PDFDict && value.keys().length === 0) ||
+      (value instanceof PDFArray && value.size() === 0);
+    if (!empty) {
+      throw new PreflightRejection(
+        "unsupported-resource",
+        `PDF page ${sourcePageIndex + 1} uses unsupported /${name} resources.`,
+        { sourcePageIndex, resourceName: name }
+      );
+    }
+  }
+
+  const font = resources.get(PDFName.Font);
+  if (font) {
+    const fontDictionary = context.lookup(font);
+    if (!(fontDictionary instanceof PDFDict)) {
+      throw invalidPageStructure(sourcePageIndex, "Font resources are not a dictionary.");
+    }
+    validateNamedDictionaryValues(
+      fontDictionary,
+      context,
+      sourcePageIndex,
+      "Font"
+    );
+    rejectType3Fonts(fontDictionary, context, sourcePageIndex);
+  }
+  const properties = resources.get(PDFName.of("Properties"));
+  if (properties) {
+    const propertyDictionary = context.lookup(properties);
+    if (!(propertyDictionary instanceof PDFDict)) {
+      throw invalidPageStructure(sourcePageIndex, "Properties resources are not a dictionary.");
+    }
+    validateNamedDictionaryValues(
+      propertyDictionary,
+      context,
+      sourcePageIndex,
+      "Properties"
+    );
+  }
+  const procSet = resources.get(PDFName.of("ProcSet"));
+  if (procSet) {
+    const procSetArray = context.lookup(procSet);
+    if (!(procSetArray instanceof PDFArray)) {
+      throw invalidPageStructure(sourcePageIndex, "ProcSet resources are not an array.");
+    }
+    for (let index = 0; index < procSetArray.size(); index += 1) {
+      if (!(procSetArray.lookup(index) instanceof PDFName)) {
+        throw invalidPageStructure(sourcePageIndex, "ProcSet contains a value that is not a name.");
+      }
+    }
+  }
+  const extGStates = resources.get(PDFName.ExtGState);
+  if (extGStates) {
+    const extGStateDictionary = context.lookup(extGStates);
+    if (!(extGStateDictionary instanceof PDFDict)) {
+      throw invalidPageStructure(
+        sourcePageIndex,
+        "ExtGState resources are not a dictionary."
+      );
+    }
+    validateNamedDictionaryValues(
+      extGStateDictionary,
+      context,
+      sourcePageIndex,
+      "ExtGState"
+    );
+    validateInertExtGStates(extGStateDictionary, context, sourcePageIndex);
+  }
+}
+
+/**
+ * Accept only graphics-state resources that cannot change rendering. `/OPM`
+ * selects an overprint algorithm, but has no effect while both stroking and
+ * nonstroking overprint remain disabled (their PDF defaults). This narrow
+ * allowance covers CAD producers that emit `/OPM 1` without enabling
+ * overprint, while opacity, blending, masks, and every other state still take
+ * the ordinary PDF.js path.
+ */
+function validateInertExtGStates(
+  extGStates: PDFDict,
+  context: PDFContext,
+  sourcePageIndex: number
+): void {
+  for (const [name, rawValue] of extGStates.entries()) {
+    const resourceName = decodePdfName(name);
+    const state = context.lookup(rawValue);
+    // validateNamedDictionaryValues has already rejected this case.
+    if (!(state instanceof PDFDict)) {
+      continue;
+    }
+
+    for (const [key, rawStateValue] of state.entries()) {
+      const keyName = decodePdfName(key);
+      const stateValue = context.lookup(rawStateValue);
+      if (keyName === "Type") {
+        if (
+          stateValue instanceof PDFName &&
+          decodePdfName(stateValue) === "ExtGState"
+        ) {
+          continue;
+        }
+        throw unsupportedExtGState(
+          sourcePageIndex,
+          resourceName,
+          "has a /Type other than /ExtGState"
+        );
+      }
+      if (keyName === "OPM") {
+        const overprintMode = stateValue instanceof PDFNumber
+          ? stateValue.asNumber()
+          : Number.NaN;
+        if (overprintMode === 0 || overprintMode === 1) {
+          continue;
+        }
+        throw unsupportedExtGState(
+          sourcePageIndex,
+          resourceName,
+          "has an /OPM value other than 0 or 1"
+        );
+      }
+      if (keyName === "OP" || keyName === "op") {
+        if (stateValue instanceof PDFBool && !stateValue.asBoolean()) {
+          continue;
+        }
+        throw unsupportedExtGState(
+          sourcePageIndex,
+          resourceName,
+          `enables or has an invalid /${keyName} overprint value`
+        );
+      }
+      throw unsupportedExtGState(
+        sourcePageIndex,
+        resourceName,
+        `uses unsupported /${keyName}`
+      );
+    }
+  }
+}
+
+function unsupportedExtGState(
+  sourcePageIndex: number,
+  resourceName: string,
+  detail: string
+): PreflightRejection {
+  return new PreflightRejection(
+    "unsupported-resource",
+    `PDF page ${sourcePageIndex + 1} ExtGState /${resourceName} ${detail}.`,
+    { sourcePageIndex, resourceName }
+  );
+}
+
+function validateNamedDictionaryValues(
+  dictionary: PDFDict,
+  context: PDFContext,
+  sourcePageIndex: number,
+  label: string
+): void {
+  for (const [name, rawValue] of dictionary.entries()) {
+    if (!(context.lookup(rawValue) instanceof PDFDict)) {
+      throw invalidPageStructure(
+        sourcePageIndex,
+        `${label} resource /${decodePdfName(name)} has an invalid value.`
+      );
+    }
+  }
+}
+
+function rejectType3Fonts(
+  fonts: PDFDict,
+  context: PDFContext,
+  sourcePageIndex: number
+): void {
+  for (const [name, rawValue] of fonts.entries()) {
+    const font = context.lookup(rawValue);
+    // validateNamedDictionaryValues has already rejected this case.
+    if (!(font instanceof PDFDict)) {
+      continue;
+    }
+    const subtype = font.lookup(PDFName.of("Subtype"));
+    if (subtype instanceof PDFName && decodePdfName(subtype) === "Type3") {
+      const fontName = decodePdfName(name);
+      throw new PreflightRejection(
+        "unsupported-resource",
+        `PDF page ${sourcePageIndex + 1} uses unsupported Type3 font /${fontName}.`,
+        { sourcePageIndex, resourceName: fontName }
+      );
+    }
+  }
+}
+
+function rejectOptionalContentProperties(
+  properties: PDFDict | null,
+  context: PDFContext,
+  sourcePageIndex: number
+): void {
+  if (!properties) {
+    return;
+  }
+  for (const [name, value] of properties.entries()) {
+    if (objectGraphContainsOptionalContent(value, context, new Set(), { count: 0 })) {
+      throw new PreflightRejection(
+        "optional-content",
+        `PDF page ${sourcePageIndex + 1} property /${decodePdfName(name)} uses optional content.`,
+        { sourcePageIndex, resourceName: decodePdfName(name) }
+      );
+    }
+  }
+}
+
+function objectGraphContainsOptionalContent(
+  rawObject: PDFObject,
+  context: PDFContext,
+  visitedRefs: Set<string>,
+  budget: { count: number }
+): boolean {
+  budget.count += 1;
+  if (budget.count > 10_000) {
+    throw new PreflightRejection(
+      "invalid-structure",
+      "A PDF property resource exceeds the dense compiler's structure budget."
+    );
+  }
+  if (rawObject instanceof PDFRef) {
+    if (visitedRefs.has(rawObject.tag)) {
+      return false;
+    }
+    visitedRefs.add(rawObject.tag);
+    const resolved = context.lookup(rawObject);
+    if (!resolved) {
+      throw new PreflightRejection(
+        "invalid-structure",
+        `A PDF property resource references missing object ${rawObject.toString()}.`
+      );
+    }
+    return objectGraphContainsOptionalContent(resolved, context, visitedRefs, budget);
+  }
+  if (rawObject instanceof PDFName) {
+    const name = decodePdfName(rawObject);
+    return name === "OCG" || name === "OCMD";
+  }
+  if (rawObject instanceof PDFArray) {
+    for (let index = 0; index < rawObject.size(); index += 1) {
+      if (objectGraphContainsOptionalContent(rawObject.get(index), context, visitedRefs, budget)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const dictionary = rawObject instanceof PDFStream ? rawObject.dict : rawObject;
+  if (dictionary instanceof PDFDict) {
+    if (dictionary.has(PDFName.of("OC")) || dictionary.has(PDFName.of("OCProperties"))) {
+      return true;
+    }
+    const type = dictionary.get(PDFName.Type);
+    if (type && objectGraphContainsOptionalContent(type, context, visitedRefs, budget)) {
+      return true;
+    }
+    for (const [key, value] of dictionary.entries()) {
+      const keyName = decodePdfName(key);
+      if (keyName === "Type" || keyName === "OC" || keyName === "OCProperties") {
+        continue;
+      }
+      if (objectGraphContainsOptionalContent(value, context, visitedRefs, budget)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function readPageContentStreams(
+  sourcePage: PDFPage,
+  context: PDFContext,
+  sourcePageIndex: number
+): { streams: ContentStreamDescriptor[]; objectRefs: PDFRef[] } {
+  const rawContents = sourcePage.node.get(PDFName.Contents);
+  if (!rawContents) {
+    return { streams: [], objectRefs: [] };
+  }
+  const objectRefs = new Map<string, PDFRef>();
+  if (rawContents instanceof PDFRef) {
+    objectRefs.set(rawContents.tag, rawContents);
+  }
+  const contents = context.lookup(rawContents);
+  const rawStreams = contents instanceof PDFArray
+    ? contents.asArray()
+    : contents
+      ? [rawContents]
+      : [];
+  const streams: ContentStreamDescriptor[] = [];
+
+  for (const rawStream of rawStreams) {
+    if (rawStream instanceof PDFRef) {
+      objectRefs.set(rawStream.tag, rawStream);
+    }
+    const stream = context.lookup(rawStream);
+    if (!(stream instanceof PDFRawStream)) {
+      throw invalidPageStructure(
+        sourcePageIndex,
+        "Contents contains an object that is not a raw stream."
+      );
+    }
+    const streamRef = context.getObjectRef(stream);
+    if (streamRef) {
+      objectRefs.set(streamRef.tag, streamRef);
+    }
+    streams.push(inspectContentStream(stream, sourcePageIndex));
+  }
+
+  return { streams, objectRefs: [...objectRefs.values()] };
+}
+
+function inspectContentStream(
+  stream: PDFRawStream,
+  sourcePageIndex: number
+): ContentStreamDescriptor {
+  const filterObject = stream.dict.lookup(PDFName.of("Filter"));
+  let filterNames: string[] = [];
+  if (filterObject instanceof PDFName) {
+    filterNames = [decodePdfName(filterObject)];
+  } else if (filterObject instanceof PDFArray) {
+    filterNames = [];
+    for (let index = 0; index < filterObject.size(); index += 1) {
+      const filter = filterObject.lookup(index);
+      if (!(filter instanceof PDFName)) {
+        throw invalidPageStructure(sourcePageIndex, "A content Filter entry is not a name.");
+      }
+      filterNames.push(decodePdfName(filter));
+    }
+  } else if (filterObject) {
+    throw invalidPageStructure(sourcePageIndex, "A content Filter is not a name or array.");
+  }
+
+  for (const filterName of filterNames) {
+    if (!SUPPORTED_CONTENT_FILTERS.has(filterName)) {
+      throw new PreflightRejection(
+        "unsupported-filter",
+        `PDF page ${sourcePageIndex + 1} uses unsupported content filter /${filterName}.`,
+        { sourcePageIndex, filterName }
+      );
+    }
+  }
+
+  const decodeParms = stream.dict.lookup(PDFName.of("DecodeParms"));
+  validateDecodeParameters(decodeParms, filterNames, sourcePageIndex);
+  const useNativeFlate =
+    filterNames.length === 1 &&
+    filterNames[0] === "FlateDecode" &&
+    decodeParametersAreNativeFlateSafe(decodeParms);
+  if (useNativeFlate && typeof DecompressionStream !== "function") {
+    throw new PreflightRejection(
+      "unsupported-filter",
+      `PDF page ${sourcePageIndex + 1} requires native Flate decompression, but DecompressionStream is unavailable.`,
+      { sourcePageIndex, filterName: "FlateDecode" }
+    );
+  }
+  return { stream, filters: filterNames, useNativeFlate };
+}
+
+function validateDecodeParameters(
+  decodeParms: PDFObject | undefined,
+  filters: readonly string[],
+  sourcePageIndex: number
+): void {
+  if (!decodeParms) {
+    return;
+  }
+  if (decodeParms instanceof PDFArray) {
+    if (decodeParms.size() > filters.length) {
+      throw invalidPageStructure(sourcePageIndex, "DecodeParms has more entries than Filter.");
+    }
+    for (let index = 0; index < decodeParms.size(); index += 1) {
+      const entry = decodeParms.lookup(index);
+      if (entry) {
+        validateSingleDecodeParameters(entry, filters[index], sourcePageIndex);
+      }
+    }
+    return;
+  }
+  validateSingleDecodeParameters(decodeParms, filters[0], sourcePageIndex);
+}
+
+function validateSingleDecodeParameters(
+  params: PDFObject,
+  filter: string | undefined,
+  sourcePageIndex: number
+): void {
+  if (!(params instanceof PDFDict)) {
+    throw invalidPageStructure(sourcePageIndex, "DecodeParms is not a dictionary or array.");
+  }
+  if (filter === "LZWDecode") {
+    const earlyChange = params.lookup(PDFName.of("EarlyChange"));
+    if (
+      earlyChange &&
+      (!(earlyChange instanceof PDFNumber) ||
+        (earlyChange.asNumber() !== 0 && earlyChange.asNumber() !== 1))
+    ) {
+      throw invalidPageStructure(sourcePageIndex, "LZW EarlyChange is not 0 or 1.");
+    }
+  }
+  const predictor = params.lookup(PDFName.of("Predictor"));
+  if (predictor && !(predictor instanceof PDFNumber)) {
+    throw invalidPageStructure(sourcePageIndex, "A content-stream Predictor is not a number.");
+  }
+  if (predictor && predictor.asNumber() !== 1) {
+    throw new PreflightRejection(
+      "unsupported-filter",
+      `PDF page ${sourcePageIndex + 1} uses an unsupported content-stream predictor.`,
+      { sourcePageIndex, filterName: filter }
+    );
+  }
+}
+
+function decodeParametersAreNativeFlateSafe(decodeParms: PDFObject | undefined): boolean {
+  if (!decodeParms) {
+    return true;
+  }
+  const params = decodeParms instanceof PDFArray ? decodeParms.lookup(0) : decodeParms;
+  if (!params) {
+    return true;
+  }
+  if (!(params instanceof PDFDict)) {
+    return false;
+  }
+  const predictor = params.lookup(PDFName.of("Predictor"));
+  return !predictor || (predictor instanceof PDFNumber && predictor.asNumber() === 1);
+}
+
+function copyRetainedResources(
+  outputContext: PDFContext,
+  copier: PDFObjectCopier,
+  page: DensePdfPrivatePage,
+  compiledPage: DensePdfCompiledPage
+): PDFDict {
+  const resources = outputContext.obj({});
+  const fonts = copyNamedResourceDictionary(
+    outputContext,
+    copier,
+    page.fontResources,
+    page.fontNames,
+    compiledPage.referencedFonts,
+    "Font",
+    page.publicPage.sourcePageIndex
+  );
+  if (fonts.keys().length > 0) {
+    resources.set(PDFName.Font, fonts);
+  }
+  const properties = copyNamedResourceDictionary(
+    outputContext,
+    copier,
+    page.propertyResources,
+    page.propertyNames,
+    compiledPage.referencedProperties,
+    "Properties",
+    page.publicPage.sourcePageIndex
+  );
+  if (properties.keys().length > 0) {
+    resources.set(PDFName.of("Properties"), properties);
+  }
+  if (page.procSetResource) {
+    resources.set(PDFName.of("ProcSet"), copier.copy(page.procSetResource));
+  }
+  return resources;
+}
+
+function copyNamedResourceDictionary(
+  outputContext: PDFContext,
+  copier: PDFObjectCopier,
+  sourceDictionary: PDFDict | null,
+  sourceNames: ReadonlyMap<string, PDFName>,
+  requestedNames: ReadonlySet<string>,
+  resourceKind: "Font" | "Properties",
+  sourcePageIndex: number
+): PDFDict {
+  const output = outputContext.obj({});
+  for (const requestedName of requestedNames) {
+    const normalizedName = normalizeCompilerResourceName(requestedName);
+    const sourceName = sourceNames.get(normalizedName);
+    const sourceValue = sourceName && sourceDictionary?.get(sourceName);
+    if (!sourceName || !sourceValue) {
+      throw new DensePdfBuildError(
+        "missing-resource",
+        `Compiler retained missing ${resourceKind} resource /${normalizedName} on PDF page ${sourcePageIndex + 1}.`
+      );
+    }
+    output.set(sourceName.clone(), copier.copy(sourceValue));
+  }
+  return output;
+}
+
+function copyPageGeometry(outputPage: PDFPage, sourcePage: DensePdfSelectedPage): void {
+  const context = outputPage.doc.context;
+  outputPage.node.set(PDFName.MediaBox, context.obj(boxToArray(sourcePage.mediaBox)));
+  outputPage.node.set(PDFName.CropBox, context.obj(boxToArray(sourcePage.cropBox)));
+  if (sourcePage.bleedBox) {
+    outputPage.node.set(PDFName.BleedBox, context.obj(boxToArray(sourcePage.bleedBox)));
+  }
+  if (sourcePage.trimBox) {
+    outputPage.node.set(PDFName.TrimBox, context.obj(boxToArray(sourcePage.trimBox)));
+  }
+  if (sourcePage.artBox) {
+    outputPage.node.set(PDFName.ArtBox, context.obj(boxToArray(sourcePage.artBox)));
+  }
+  outputPage.node.set(PDFName.Rotate, context.obj(sourcePage.rotation));
+  outputPage.node.set(PDFName.of("UserUnit"), context.obj(sourcePage.userUnit));
+}
+
+function validateCompiledPages(
+  sourcePages: readonly DensePdfPrivatePage[],
+  compiledPages: readonly DensePdfCompiledPage[]
+): Map<number, DensePdfCompiledPage> {
+  if (compiledPages.length !== sourcePages.length) {
+    throw new DensePdfBuildError(
+      "compiled-page-mismatch",
+      `Expected ${sourcePages.length} compiled page(s), received ${compiledPages.length}.`
+    );
+  }
+  const expected = new Set(sourcePages.map((page) => page.publicPage.sourcePageIndex));
+  const out = new Map<number, DensePdfCompiledPage>();
+  for (const page of compiledPages) {
+    if (
+      !Number.isSafeInteger(page.sourcePageIndex) ||
+      !expected.has(page.sourcePageIndex) ||
+      out.has(page.sourcePageIndex) ||
+      !(page.retainedTextContent instanceof Uint8Array) ||
+      !isReadonlyStringSet(page.referencedFonts) ||
+      !isReadonlyStringSet(page.referencedProperties)
+    ) {
+      throw new DensePdfBuildError(
+        "compiled-page-mismatch",
+        "Compiled pages do not match the selected source pages or contain invalid data."
+      );
+    }
+    out.set(page.sourcePageIndex, page);
+  }
+  return out;
+}
+
+function releaseSourceContentObjects(document: DensePdfPrivateDocument): number {
+  const refs = new Map<string, PDFRef>();
+  const context = document.sourceDocument.context;
+  for (const sourcePage of document.sourceDocument.getPages()) {
+    const rawContents = sourcePage.node.get(PDFName.Contents);
+    if (rawContents) {
+      collectContentObjectRefs(rawContents, context, refs);
+    }
+    sourcePage.node.delete(PDFName.Contents);
+  }
+  let released = 0;
+  for (const ref of refs.values()) {
+    if (context.delete(ref)) {
+      released += 1;
+    }
+  }
+
+  // The destination document already owns deep copies of every retained
+  // resource. Clear the remaining source object table as well, so embedded
+  // font streams and unreachable source objects do not overlap the writer's
+  // peak memory. In particular, no original page content stream can survive
+  // into outputDocument.save().
+  for (const [ref] of context.enumerateIndirectObjects()) {
+    context.delete(ref);
+  }
+  for (const page of document.pages) {
+    page.streams.length = 0;
+    page.contentObjectRefs.length = 0;
+  }
+  document.released = true;
+  return released;
+}
+
+function collectContentObjectRefs(
+  rawContents: PDFObject,
+  context: PDFContext,
+  refs: Map<string, PDFRef>
+): void {
+  if (rawContents instanceof PDFRef) {
+    refs.set(rawContents.tag, rawContents);
+  }
+  const contents = context.lookup(rawContents);
+  if (contents instanceof PDFArray) {
+    for (const rawStream of contents.asArray()) {
+      if (rawStream instanceof PDFRef) {
+        refs.set(rawStream.tag, rawStream);
+      }
+      const stream = context.lookup(rawStream);
+      const streamRef = stream ? context.getObjectRef(stream) : undefined;
+      if (streamRef) {
+        refs.set(streamRef.tag, streamRef);
+      }
+    }
+    return;
+  }
+  const streamRef = contents ? context.getObjectRef(contents) : undefined;
+  if (streamRef) {
+    refs.set(streamRef.tag, streamRef);
+  }
+}
+
+function readUserUnit(
+  page: PDFPage,
+  context: PDFContext,
+  sourcePageIndex: number
+): number {
+  const raw = page.node.getInheritableAttribute(PDFName.of("UserUnit"));
+  if (!raw) {
+    return 1;
+  }
+  const value = context.lookup(raw);
+  if (!(value instanceof PDFNumber) || !Number.isFinite(value.asNumber()) || value.asNumber() <= 0) {
+    throw invalidPageStructure(sourcePageIndex, "UserUnit is not a positive number.");
+  }
+  return value.asNumber();
+}
+
+function readPageBox(
+  array: PDFArray,
+  label: string,
+  sourcePageIndex: number
+): DensePdfPageBox {
+  if (array.size() !== 4) {
+    throw invalidPageStructure(sourcePageIndex, `${label} does not contain four numbers.`);
+  }
+  const values: number[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    const value = array.lookup(index);
+    if (!(value instanceof PDFNumber) || !Number.isFinite(value.asNumber())) {
+      throw invalidPageStructure(sourcePageIndex, `${label} contains a non-finite number.`);
+    }
+    values.push(value.asNumber());
+  }
+  if (!(values[2] > values[0]) || !(values[3] > values[1])) {
+    throw invalidPageStructure(sourcePageIndex, `${label} has non-positive dimensions.`);
+  }
+  return {
+    left: values[0],
+    bottom: values[1],
+    right: values[2],
+    top: values[3]
+  };
+}
+
+function readOptionalPageBox(
+  array: PDFArray | undefined,
+  label: string,
+  sourcePageIndex: number
+): DensePdfPageBox | undefined {
+  return array ? readPageBox(array, label, sourcePageIndex) : undefined;
+}
+
+function readResourceNames(dictionary: PDFDict | null): ReadonlyMap<string, PDFName> {
+  const names = new Map<string, PDFName>();
+  for (const key of dictionary?.keys() ?? []) {
+    names.set(decodePdfName(key), key);
+  }
+  return names;
+}
+
+function lookupResourceDictionary(
+  resources: PDFDict | undefined,
+  key: PDFName,
+  context: PDFContext
+): PDFDict | null {
+  const raw = resources?.get(key);
+  if (!raw) {
+    return null;
+  }
+  const value = context.lookup(raw);
+  return value instanceof PDFDict ? value : null;
+}
+
+function normalizeCompilerResourceName(value: string): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  return trimmed.startsWith("/") ? trimmed.slice(1) : trimmed;
+}
+
+function isReadonlyStringSet(value: unknown): value is ReadonlySet<string> {
+  if (!(value instanceof Set)) {
+    return false;
+  }
+  for (const item of value) {
+    if (typeof item !== "string" || normalizeCompilerResourceName(item).length === 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function decodePdfName(name: PDFName): string {
+  return name.decodeText();
+}
+
+function boxToArray(box: DensePdfPageBox): [number, number, number, number] {
+  return [box.left, box.bottom, box.right, box.top];
+}
+
+function cloneBox(box: DensePdfPageBox): DensePdfPageBox {
+  return { ...box };
+}
+
+function invalidPageStructure(sourcePageIndex: number, detail: string): PreflightRejection {
+  return new PreflightRejection(
+    "invalid-structure",
+    `PDF page ${sourcePageIndex + 1} has an invalid structure: ${detail}`,
+    { sourcePageIndex }
+  );
+}
+
+function normalizeDecodeChunkSize(value: number | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_DECODE_CHUNK_SIZE;
+  }
+  if (!Number.isSafeInteger(value) || value < MIN_DECODE_CHUNK_SIZE || value > MAX_DECODE_CHUNK_SIZE) {
+    throw new RangeError(
+      `decodedChunkSize must be an integer from ${MIN_DECODE_CHUNK_SIZE} to ${MAX_DECODE_CHUNK_SIZE}.`
+    );
+  }
+  return value;
+}
+
+function resolvePdfPageNumbers(pdfPageCount: number, pages: string | undefined): number[] {
+  if (pages !== undefined && typeof pages !== "string") {
+    throw new TypeError("pages must be a string.");
+  }
+  const selection = pages?.trim() ?? "";
+  if (selection.length === 0) {
+    return Array.from({ length: pdfPageCount }, (_value, index) => index + 1);
+  }
+
+  const seen = new Set<number>();
+  for (const rawPart of selection.split(",")) {
+    const part = rawPart.trim();
+    const singlePageMatch = /^(\d+)$/.exec(part);
+    const rangeMatch = /^(\d*)\s*-\s*(\d*)$/.exec(part);
+    if (!singlePageMatch && !rangeMatch) {
+      throw new RangeError(
+        `Invalid pages value "${pages}". Use comma-separated page numbers or inclusive ranges such as "1-5, 8, 11-13".`
+      );
+    }
+
+    const firstPage = singlePageMatch
+      ? Number(singlePageMatch[1])
+      : rangeMatch?.[1]
+        ? Number(rangeMatch[1])
+        : 1;
+    const lastPage = singlePageMatch
+      ? firstPage
+      : rangeMatch?.[2]
+        ? Number(rangeMatch[2])
+        : pdfPageCount;
+    if (!Number.isSafeInteger(firstPage) || !Number.isSafeInteger(lastPage)) {
+      throw new RangeError(`Invalid page range "${part}": page numbers must be safe integers.`);
+    }
+    if (firstPage < 1 || firstPage > pdfPageCount || lastPage < 1 || lastPage > pdfPageCount) {
+      const invalidPage = firstPage < 1 || firstPage > pdfPageCount ? firstPage : lastPage;
+      throw new RangeError(
+        `PDF page number ${invalidPage} is out of range; the document contains ${pdfPageCount} page${pdfPageCount === 1 ? "" : "s"}.`
+      );
+    }
+    if (firstPage > lastPage) {
+      throw new RangeError(`Invalid page range "${part}": the first page must not exceed the last page.`);
+    }
+    for (let pageNumber = firstPage; pageNumber <= lastPage; pageNumber += 1) {
+      seen.add(pageNumber);
+    }
+  }
+  return Array.from(seen).sort((left, right) => left - right);
+}
+
+function makeFallback(
+  reason: DensePdfFallbackReason,
+  message: string,
+  timing: DensePdfPreflightTiming,
+  details: PreflightRejectionDetails = {}
+): DensePdfFallback {
+  return { eligible: false, reason, message, timing, ...details };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function now(): number {
+  return typeof performance === "object" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function elapsed(start: number): number {
+  return Math.max(0, now() - start);
+}

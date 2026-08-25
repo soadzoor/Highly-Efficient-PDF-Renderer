@@ -1,4 +1,15 @@
-import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
+import {
+  createLoadProgressReporter,
+  type LoadProgressCallback,
+  type LoadProgressReporter
+} from "./loadProgress";
+import {
+  compileDensePdfInWorker,
+  type DensePdfFastCompiledPage,
+  type DensePdfFastWorkerProgress,
+  type DensePdfFastWorkerSuccess
+} from "./densePdfFastWorkerClient";
+import { collectPdfOperatorList } from "./pdfOperatorList";
 import { assertPdfBytes } from "./pdfSignature";
 
 const pdfJsModule = (
@@ -191,6 +202,8 @@ export interface VectorScene {
 export interface VectorExtractOptions {
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
+  /** Use the content-gated dense-vector PDF compiler when available. Default `"auto"`. */
+  pdfFastPath?: "auto" | "off";
   /** One-based PDF page selection such as `"1-5, 8, 11-13"`. */
   pages?: string;
   maxPagesPerRow?: number;
@@ -409,6 +422,8 @@ const STROKE_STYLE_FLAG_OFFSET = 2;
 const PAGE_GRID_GAP_FACTOR = 0.08;
 const PAGE_GRID_MIN_GAP = 24;
 const PDFJS_VERBOSITY_ERRORS = VerbosityLevel?.ERRORS ?? 0;
+const DENSE_PDF_FAST_ATTEMPT_PROGRESS_END = 0.18;
+const DENSE_PDF_TEXT_PROGRESS_END = 0.45;
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   const normalizedAlpha = clamp01(alpha);
@@ -435,6 +450,324 @@ export async function extractPdfPageScenes(
   options: VectorExtractOptions = {},
   /** @internal Used by parsed-ZIP export to cancel PDF.js work. */
   signal?: AbortSignal
+): Promise<VectorScene[]> {
+  signal?.throwIfAborted();
+  if (options.pdfFastPath === "off") {
+    return extractPdfPageScenesWithPdfJs(pdfData, options, signal);
+  }
+
+  const progress = createLoadProgressReporter(options.onProgress);
+  const fastProgress = progress.child(0, DENSE_PDF_FAST_ATTEMPT_PROGRESS_END);
+  let sawFastProgress = false;
+  let fastResult: Awaited<ReturnType<typeof compileDensePdfInWorker>> | null = null;
+  try {
+    fastResult = await compileDensePdfInWorker(pdfData, {
+      pages: options.pages,
+      enableSegmentMerge: options.enableSegmentMerge,
+      enableInvisibleCull: options.enableInvisibleCull,
+      signal,
+      onProgress: (event) => {
+        sawFastProgress = true;
+        reportDenseWorkerProgress(fastProgress, event);
+      }
+    });
+  } catch (error) {
+    signal?.throwIfAborted();
+    console.info(`[hepr] dense PDF fast path unavailable: ${formatErrorMessage(error)}`);
+    return extractPdfPageScenesWithPdfJs(
+      pdfData,
+      withRemappedProgress(options, progress, sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0, 1),
+      signal
+    );
+  }
+  signal?.throwIfAborted();
+
+  if (!fastResult) {
+    console.info("[hepr] dense PDF fast path fallback: worker completed without a result");
+    return extractPdfPageScenesWithPdfJs(
+      pdfData,
+      withRemappedProgress(options, progress, sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0, 1),
+      signal
+    );
+  }
+
+  if (fastResult.kind !== "success") {
+    const reason = fastResult.kind === "fallback"
+      ? `${fastResult.reason}: ${fastResult.message}`
+      : `${fastResult.error.name}: ${fastResult.error.message}`;
+    console.info(`[hepr] dense PDF fast path fallback: ${reason}`);
+    return extractPdfPageScenesWithPdfJs(
+      pdfData,
+      withRemappedProgress(options, progress, sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0, 1),
+      signal
+    );
+  }
+
+  try {
+    return await finishDensePdfPageScenes(fastResult, options, progress, signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    console.info(`[hepr] dense PDF fast path text/finalization fallback: ${formatErrorMessage(error)}`);
+    // Do not retain hundreds of megabytes of speculative packed geometry while
+    // PDF.js builds the fallback operator list.
+    fastResult = null;
+    return extractPdfPageScenesWithPdfJs(
+      pdfData,
+      withRemappedProgress(options, progress, DENSE_PDF_TEXT_PROGRESS_END, 1),
+      signal
+    );
+  }
+}
+
+function reportDenseWorkerProgress(
+  reporter: LoadProgressReporter,
+  event: DensePdfFastWorkerProgress
+): void {
+  reporter.report(event.value, event);
+}
+
+function withRemappedProgress(
+  options: VectorExtractOptions,
+  reporter: LoadProgressReporter,
+  start: number,
+  end: number
+): VectorExtractOptions {
+  const fallbackProgress = reporter.child(start, end);
+  return {
+    ...options,
+    pdfFastPath: "off",
+    onProgress: (event) => {
+      fallbackProgress.report(event.value, {
+        ...event,
+        executionPath: "main-thread-fallback"
+      });
+    }
+  };
+}
+
+function formatErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.name || "Error"}: ${error.message || String(error)}`;
+  }
+  return String(error);
+}
+
+async function finishDensePdfPageScenes(
+  result: DensePdfFastWorkerSuccess,
+  options: VectorExtractOptions,
+  progress: LoadProgressReporter,
+  signal?: AbortSignal
+): Promise<VectorScene[]> {
+  signal?.throwIfAborted();
+  if (result.pages.length === 0) {
+    throw new Error("The dense PDF worker returned no selected pages.");
+  }
+
+  const geometryScenes = result.pages.map(createDenseGeometryScene);
+  const hasText = result.pages.some((page) => page.compiled.textShowOpCount > 0);
+  let pageScenes = geometryScenes;
+  let pdfJsTextMs = 0;
+
+  if (hasText) {
+    const textStartedAt = readHighResolutionTime();
+    const ownedMiniPdf = new Uint8Array(result.textMiniPdfBytes);
+    const textProgress = progress.child(
+      DENSE_PDF_FAST_ATTEMPT_PROGRESS_END,
+      DENSE_PDF_TEXT_PROGRESS_END
+    );
+    const textScenes = await extractPdfPageScenesWithPdfJs(
+      ownedMiniPdf.buffer,
+      {
+        ...options,
+        pages: undefined,
+        pdfFastPath: "off",
+        enableSegmentMerge: false,
+        enableInvisibleCull: false,
+        onProgress: (event) => {
+          textProgress.report(event.value, {
+            ...event,
+            stage: "pdf-text",
+            executionPath: "dense-vector-worker",
+            sourceType: "pdf"
+          });
+        }
+      },
+      signal,
+      { suppressFullPageRasterFallback: true }
+    );
+    pdfJsTextMs = readHighResolutionTime() - textStartedAt;
+    if (textScenes.length !== geometryScenes.length) {
+      throw new Error(
+        `Dense PDF text page count mismatch: expected ${geometryScenes.length}, received ${textScenes.length}.`
+      );
+    }
+    pageScenes = geometryScenes.map((geometry, index) => {
+      assertDenseTextSceneParity(geometry, textScenes[index], index);
+      return mergeDenseGeometryWithText(geometry, textScenes[index]);
+    });
+  } else {
+    progress.report(DENSE_PDF_TEXT_PROGRESS_END, {
+      stage: "pdf-text",
+      executionPath: "dense-vector-worker",
+      sourceType: "pdf",
+      unit: "pages",
+      processed: result.pages.length,
+      total: result.pages.length,
+      pageCount: result.pages.length,
+      sourcePageCount: result.sourcePageCount
+    });
+  }
+
+  signal?.throwIfAborted();
+  progress.report(0.94, {
+    stage: "compile",
+    executionPath: "dense-vector-worker",
+    sourceType: "pdf",
+    unit: "pages",
+    processed: pageScenes.length,
+    total: pageScenes.length,
+    pageCount: pageScenes.length,
+    sourcePageCount: result.sourcePageCount
+  });
+
+  const totalDecodedBytes = result.pages.reduce(
+    (total, page) => total + page.decodedContentBytes,
+    0
+  );
+  console.info(
+    `[hepr] dense PDF fast path: pages=${pageScenes.length}, decoded=${totalDecodedBytes.toLocaleString()} bytes, ` +
+    `preflight=${result.timing.preflightMs.toFixed(1)}ms, decode=${result.timing.decodeMs.toFixed(1)}ms, ` +
+    `compile=${result.timing.compileMs.toFixed(1)}ms, ` +
+    `text-mini=${result.timing.textMiniPdfMs.toFixed(1)}ms, pdfjs-text=${pdfJsTextMs.toFixed(1)}ms, ` +
+    `worker-total=${result.timing.totalMs.toFixed(1)}ms`
+  );
+  return pageScenes;
+}
+
+function assertDenseTextSceneParity(
+  geometry: VectorScene,
+  text: VectorScene,
+  pageIndex: number
+): void {
+  if (text.pageCount !== 1 || !boundsNearlyEqual(geometry.pageBounds, text.pageBounds)) {
+    throw new Error(`Dense PDF text page ${pageIndex + 1} has mismatched page geometry.`);
+  }
+  const unexpectedPaintCount =
+    text.segmentCount +
+    text.fillPathCount +
+    text.fillSegmentCount +
+    text.gradientCount +
+    text.gradientFillPathCount +
+    text.gradientFillSegmentCount +
+    text.gradientStrokeRunCount +
+    text.gradientStrokeSegmentCount +
+    text.imagePaintOpCount +
+    text.pathCount +
+    text.rasterLayers.length +
+    text.rasterLayerData.length;
+  if (unexpectedPaintCount !== 0) {
+    throw new Error(
+      `Dense PDF text page ${pageIndex + 1} produced non-text paint that cannot be merged safely.`
+    );
+  }
+}
+
+function createDenseGeometryScene(page: DensePdfFastCompiledPage): VectorScene {
+  const scene = createEmptyVectorScene();
+  const { compiled } = page;
+  const pageBounds: Bounds = { ...page.pageBounds };
+  return {
+    ...scene,
+    pageCount: 1,
+    pagesPerRow: 1,
+    pageRects: new Float32Array([
+      pageBounds.minX,
+      pageBounds.minY,
+      pageBounds.maxX,
+      pageBounds.maxY
+    ]),
+    pageTextRanges: new Uint32Array([0, 0]),
+    textIndex: {
+      version: 2,
+      pages: [{
+        text: "",
+        charInstance: new Int32Array(0),
+        fallbackQuads: new Float32Array(0)
+      }]
+    },
+    fillPathCount: compiled.fillPathCount,
+    fillSegmentCount: compiled.fillSegmentCount,
+    fillPathMetaA: compiled.fillPathMetaA,
+    fillPathMetaB: compiled.fillPathMetaB,
+    fillPathMetaC: compiled.fillPathMetaC,
+    fillSegmentsA: compiled.fillSegmentsA,
+    fillSegmentsB: compiled.fillSegmentsB,
+    segmentCount: compiled.segmentCount,
+    sourceSegmentCount: compiled.sourceSegmentCount,
+    mergedSegmentCount: compiled.mergedSegmentCount,
+    endpoints: compiled.endpoints,
+    primitiveMeta: compiled.primitiveMeta,
+    primitiveBounds: compiled.primitiveBounds,
+    styles: compiled.styles,
+    bounds: { ...compiled.bounds },
+    pageBounds,
+    maxHalfWidth: compiled.maxHalfWidth,
+    operatorCount: compiled.operatorCount,
+    imagePaintOpCount: 0,
+    pathCount: compiled.pathCount,
+    discardedTransparentCount: compiled.discardedTransparentCount,
+    discardedDegenerateCount: compiled.discardedDegenerateCount,
+    discardedDuplicateCount: compiled.discardedDuplicateCount,
+    discardedContainedCount: compiled.discardedContainedCount
+  };
+}
+
+function mergeDenseGeometryWithText(
+  geometry: VectorScene,
+  text: VectorScene
+): VectorScene {
+  const hasGeometryBounds = geometry.segmentCount > 0 || geometry.fillPathCount > 0;
+  const hasTextBounds = text.sourceTextCount > 0 || text.textInstanceCount > 0;
+  const combinedBounds = hasGeometryBounds
+    ? hasTextBounds
+      ? combineBounds(geometry.bounds, text.bounds) ?? geometry.bounds
+      : geometry.bounds
+    : hasTextBounds
+      ? { ...text.bounds }
+      : { ...geometry.pageBounds };
+  return {
+    ...geometry,
+    pageTextRanges: new Uint32Array([0, text.textInstanceCount]),
+    textIndex: text.textIndex,
+    sourceTextCount: text.sourceTextCount,
+    textInstanceCount: text.textInstanceCount,
+    textGlyphCount: text.textGlyphCount,
+    textGlyphSegmentCount: text.textGlyphSegmentCount,
+    textInPageCount: text.textInPageCount,
+    textOutOfPageCount: text.textOutOfPageCount,
+    textInstanceA: text.textInstanceA,
+    textInstanceB: text.textInstanceB,
+    textInstanceC: text.textInstanceC,
+    textGlyphMetaA: text.textGlyphMetaA,
+    textGlyphMetaB: text.textGlyphMetaB,
+    textGlyphSegmentsA: text.textGlyphSegmentsA,
+    textGlyphSegmentsB: text.textGlyphSegmentsB,
+    bounds: combinedBounds,
+    ...(text.textContent ? { textContent: text.textContent } : {})
+  };
+}
+
+function readHighResolutionTime(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+async function extractPdfPageScenesWithPdfJs(
+  pdfData: ArrayBuffer,
+  options: VectorExtractOptions,
+  signal?: AbortSignal,
+  internalOptions: { suppressFullPageRasterFallback?: boolean } = {}
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
   const enableSegmentMerge = options.enableSegmentMerge !== false;
@@ -500,21 +833,30 @@ export async function extractPdfPageScenes(
       signal?.throwIfAborted();
       const page = await pdf.getPage(pageNumber);
       signal?.throwIfAborted();
-      progress.report(lerpNumber(pageStart, pageEnd, 0.28), {
-        stage: "pdf-operators",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
+      const operatorProgressStart = lerpNumber(pageStart, pageEnd, 0.28);
+      const operatorProgressEnd = lerpNumber(pageStart, pageEnd, 0.58);
+      const operatorList = await progress
+        .child(operatorProgressStart, operatorProgressEnd)
+        .withIndeterminateProgress(
+          () => {
+            signal?.throwIfAborted();
+            return collectPdfOperatorList(page);
+          },
+          {
+            stage: "pdf-operators",
+            sourceType: "pdf",
+            unit: "operators",
+            pageIndex: selectionIndex,
+            pageCount: extractedPageCount,
+            sourcePageIndex,
+            sourcePageCount: pdfPageCount,
+            tickMs: 200,
+            ceiling: 0.97,
+            timeConstantMs: 15_000
+          }
+        );
       signal?.throwIfAborted();
-      const operatorList = await page.getOperatorList();
-      signal?.throwIfAborted();
-      progress.report(lerpNumber(pageStart, pageEnd, 0.58), {
+      progress.report(operatorProgressEnd, {
         stage: "compile",
         sourceType: "pdf",
         unit: "operators",
@@ -528,7 +870,8 @@ export async function extractPdfPageScenes(
       signal?.throwIfAborted();
       const pageScene = await extractSinglePageVectors(page, operatorList, {
         enableSegmentMerge,
-        enableInvisibleCull
+        enableInvisibleCull,
+        allowFullPageRasterFallback: internalOptions.suppressFullPageRasterFallback !== true
       });
       signal?.throwIfAborted();
       if (enableTextContent) {
@@ -626,7 +969,7 @@ export async function extractPdfRasterPageScenes(
         sourcePageCount: pdfPageCount
       });
       const page = await pdf.getPage(pageNumber);
-      const operatorList = await page.getOperatorList();
+      const operatorList = await collectPdfOperatorList(page);
       progress.report(lerpNumber(pageStart, pageEnd, 0.4), {
         stage: "pdf-raster",
         sourceType: "pdf",
@@ -672,6 +1015,7 @@ export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: Vecto
 interface SinglePageExtractOptions {
   enableSegmentMerge: boolean;
   enableInvisibleCull: boolean;
+  allowFullPageRasterFallback: boolean;
 }
 
 interface PagePlacement {
@@ -1372,6 +1716,7 @@ async function extractSinglePageVectors(
   }
 
   const allowFullPageRasterFallback =
+    options.allowFullPageRasterFallback &&
     segmentCount === 0 &&
     fillPathCount === 0 &&
     gradientFillPathCount === 0 &&

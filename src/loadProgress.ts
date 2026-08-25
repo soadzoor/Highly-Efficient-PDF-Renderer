@@ -4,6 +4,8 @@
 export type PDFLoadStage =
   | "source"
   | "pdf-page"
+  | "pdf-fast-check"
+  | "pdf-fast-decode"
   | "pdf-operators"
   | "pdf-text"
   | "pdf-raster"
@@ -19,8 +21,12 @@ export type PDFLoadStage =
   | "first-render"
   | "complete";
 
-/** Where PDF operator parsing is running. */
-export type PDFLoadExecutionPath = "worker" | "main-thread" | "main-thread-fallback";
+/** Where PDF parsing is running. */
+export type PDFLoadExecutionPath =
+  | "worker"
+  | "dense-vector-worker"
+  | "main-thread"
+  | "main-thread-fallback";
 
 /**
  * Progress event emitted by HEPR loaders.
@@ -195,6 +201,7 @@ export class LoadProgressReporter {
     work: Promise<T> | (() => Promise<T>),
     options: {
       stage: PDFLoadStage;
+      executionPath?: PDFLoadExecutionPath;
       sourceType?: "pdf" | "zip";
       unit?: "bytes" | "operators" | "files" | "pages" | "texels";
       processed?: number;
@@ -205,6 +212,7 @@ export class LoadProgressReporter {
       sourcePageCount?: number;
       tickMs?: number;
       ceiling?: number;
+      timeConstantMs?: number;
     }
   ): Promise<T> {
     if (!this.enabled) {
@@ -213,9 +221,14 @@ export class LoadProgressReporter {
 
     const tickMs = Math.max(50, Math.trunc(options.tickMs ?? 90));
     const ceiling = clamp(options.ceiling ?? 0.9, 0.1, 0.999);
+    const timeConstantMs = Math.max(
+      1,
+      Number.isFinite(options.timeConstantMs) ? options.timeConstantMs! : 800
+    );
     const startedAt = nowMs();
     const meta: Partial<ProgressMetadata> = {
       stage: options.stage,
+      executionPath: options.executionPath,
       sourceType: options.sourceType,
       unit: options.unit,
       processed: options.processed,
@@ -229,7 +242,7 @@ export class LoadProgressReporter {
     this.report(0, meta);
     const intervalId = globalThis.setInterval(() => {
       const elapsedMs = Math.max(0, nowMs() - startedAt);
-      const ratio = elapsedMs / 800;
+      const ratio = elapsedMs / timeConstantMs;
       this.report(Math.min(ceiling, ceiling * (1 - 1 / (1 + ratio))), meta);
     }, tickMs);
 
@@ -256,6 +269,10 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Reading source";
     case "pdf-page":
       return "Processing pages";
+    case "pdf-fast-check":
+      return "Checking fast PDF path";
+    case "pdf-fast-decode":
+      return "Decoding PDF vectors";
     case "pdf-operators":
       return "Scanning operators";
     case "pdf-text":

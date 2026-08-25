@@ -84,14 +84,14 @@ try {
   }
 
   const parseController = new AbortController();
-  let reachedPdfJs = false;
+  let reachedOperatorScan = false;
   const pendingParse = pdfObjectGenerator.loadPdfSceneFromSource(
     createMinimalPdfBytes(),
     {
       sourceKind: "pdf",
       onProgress: (event) => {
-        if (event.stage === "pdf-page" && !parseController.signal.aborted) {
-          reachedPdfJs = true;
+        if (event.stage === "pdf-operators" && !parseController.signal.aborted) {
+          reachedOperatorScan = true;
           parseController.abort();
         }
       }
@@ -99,7 +99,7 @@ try {
     parseController.signal
   );
   await assert.rejects(pendingParse, (error) => error?.name === "AbortError");
-  assert.equal(reachedPdfJs, true, "the test must abort after PDF.js opens the document");
+  assert.equal(reachedOperatorScan, true, "the test must abort when PDF operator scanning starts");
 
   console.log("PDF source cancellation smoke test passed.");
 } finally {
