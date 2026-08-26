@@ -31,33 +31,33 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRootDir = path.resolve(scriptDir, "..");
 const outputRootDir = path.resolve(repoRootDir, "public", "examples");
 const outputPdfDir = path.resolve(outputRootDir, "pdfs");
-const outputZipDir = path.resolve(outputRootDir, "zips");
+const outputHepDir = path.resolve(outputRootDir, "heps");
 const outputManifestPath = path.resolve(outputRootDir, "manifest.json");
 
 async function main(): Promise<void> {
-  const pdfFiles = await readFilesWithExtension(outputPdfDir, ".pdf");
-  const zipFiles = await readFilesWithExtension(outputZipDir, ".zip");
+  const pdfFiles = await readFilesWithExtensions(outputPdfDir, [".pdf"]);
+  const hepFiles = await readFilesWithExtensions(outputHepDir, [".hep"]);
 
   if (pdfFiles.length === 0) {
     throw new Error(`No PDFs found in ${outputPdfDir}`);
   }
-  if (zipFiles.length === 0) {
-    throw new Error(`No ZIPs found in ${outputZipDir}`);
+  if (hepFiles.length === 0) {
+    throw new Error(`No HEP files found in ${outputHepDir}`);
   }
 
-  const zipBuckets = buildZipBuckets(zipFiles);
+  const hepBuckets = buildHepBuckets(hepFiles);
   const usedIds = new Set<string>();
   const manifestEntries: ExampleOptionManifestEntry[] = [];
-  const missingZipPdfs: string[] = [];
+  const missingHepPdfs: string[] = [];
 
   for (const pdf of pdfFiles) {
     const pdfStem = path.parse(pdf.name).name;
     const comparableKey = normalizeComparableStem(pdfStem);
-    const zipList = zipBuckets.get(comparableKey);
-    const matchedZip = zipList && zipList.length > 0 ? zipList.shift() : undefined;
+    const hepList = hepBuckets.get(comparableKey);
+    const matchedHep = hepList && hepList.length > 0 ? hepList.shift() : undefined;
 
-    if (!matchedZip) {
-      missingZipPdfs.push(pdf.name);
+    if (!matchedHep) {
+      missingHepPdfs.push(pdf.name);
       continue;
     }
 
@@ -70,15 +70,15 @@ async function main(): Promise<void> {
         sizeBytes: pdf.sizeBytes
       },
       parsedZip: {
-        path: `examples/zips/${encodeExampleAssetPathSegment(matchedZip.name)}`,
-        sizeBytes: matchedZip.sizeBytes
+        path: `examples/heps/${encodeExampleAssetPathSegment(matchedHep.name)}`,
+        sizeBytes: matchedHep.sizeBytes
       }
     });
   }
 
   manifestEntries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
 
-  const unusedZipNames = collectUnusedZipNames(zipBuckets);
+  const unusedHepNames = collectUnusedHepNames(hepBuckets);
   const manifest: ExampleManifest = {
     generatedAt: new Date().toISOString(),
     examples: manifestEntries
@@ -86,17 +86,17 @@ async function main(): Promise<void> {
 
   await fs.writeFile(outputManifestPath, JSON.stringify(manifest, null, 2), "utf8");
   console.log(`[examples] manifest written: ${outputManifestPath}`);
-  console.log(`[examples] matched ${manifestEntries.length} PDF/ZIP pair(s).`);
+  console.log(`[examples] matched ${manifestEntries.length} PDF/HEP pair(s).`);
 
-  if (missingZipPdfs.length > 0) {
-    console.warn(`[examples] PDFs without matching ZIP (${missingZipPdfs.length}): ${missingZipPdfs.join(", ")}`);
+  if (missingHepPdfs.length > 0) {
+    console.warn(`[examples] PDFs without matching HEP (${missingHepPdfs.length}): ${missingHepPdfs.join(", ")}`);
   }
-  if (unusedZipNames.length > 0) {
-    console.warn(`[examples] ZIPs without matching PDF (${unusedZipNames.length}): ${unusedZipNames.join(", ")}`);
+  if (unusedHepNames.length > 0) {
+    console.warn(`[examples] HEP files without matching PDF (${unusedHepNames.length}): ${unusedHepNames.join(", ")}`);
   }
 }
 
-async function readFilesWithExtension(dirPath: string, extension: string): Promise<NamedFile[]> {
+async function readFilesWithExtensions(dirPath: string, extensions: readonly string[]): Promise<NamedFile[]> {
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
   const out: NamedFile[] = [];
 
@@ -104,7 +104,8 @@ async function readFilesWithExtension(dirPath: string, extension: string): Promi
     if (!entry.isFile()) {
       continue;
     }
-    if (!entry.name.toLowerCase().endsWith(extension)) {
+    const lowerName = entry.name.toLowerCase();
+    if (!extensions.some((extension) => lowerName.endsWith(extension))) {
       continue;
     }
 
@@ -120,23 +121,23 @@ async function readFilesWithExtension(dirPath: string, extension: string): Promi
   return out;
 }
 
-function buildZipBuckets(zipFiles: NamedFile[]): Map<string, NamedFile[]> {
+function buildHepBuckets(hepFiles: NamedFile[]): Map<string, NamedFile[]> {
   const buckets = new Map<string, NamedFile[]>();
 
-  for (const zip of zipFiles) {
-    const zipStem = path.parse(zip.name).name;
-    const comparable = normalizeComparableStem(stripParsedDataSuffix(zipStem));
+  for (const hep of hepFiles) {
+    const hepStem = path.parse(hep.name).name;
+    const comparable = normalizeComparableStem(stripParsedDataSuffix(hepStem));
     if (!comparable) {
       continue;
     }
 
     const bucket = buckets.get(comparable) ?? [];
-    bucket.push(zip);
+    bucket.push(hep);
     buckets.set(comparable, bucket);
   }
 
   for (const bucket of buckets.values()) {
-    bucket.sort((a, b) => scoreZipName(a.name) - scoreZipName(b.name) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+    bucket.sort((a, b) => scoreHepName(a.name) - scoreHepName(b.name) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
   }
 
   return buckets;
@@ -146,25 +147,26 @@ function stripParsedDataSuffix(stem: string): string {
   return stem.replace(/[._-]?parsed[._-]?data$/i, "");
 }
 
-function scoreZipName(name: string): number {
+function scoreHepName(name: string): number {
   const lower = name.toLowerCase();
-  if (lower.endsWith("-parsed-data.zip")) {
+  const stem = lower.replace(/\.hep$/i, "");
+  if (stem.endsWith("-parsed-data")) {
     return 0;
   }
-  if (lower.endsWith(".parsed-data.zip")) {
+  if (stem.endsWith(".parsed-data")) {
     return 1;
   }
-  if (lower.endsWith("_parsed_data.zip")) {
+  if (stem.endsWith("_parsed_data")) {
     return 2;
   }
   return 3;
 }
 
-function collectUnusedZipNames(zipBuckets: Map<string, NamedFile[]>): string[] {
+function collectUnusedHepNames(hepBuckets: Map<string, NamedFile[]>): string[] {
   const names: string[] = [];
-  for (const bucket of zipBuckets.values()) {
-    for (const zip of bucket) {
-      names.push(zip.name);
+  for (const bucket of hepBuckets.values()) {
+    for (const hep of bucket) {
+      names.push(hep.name);
     }
   }
   names.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));

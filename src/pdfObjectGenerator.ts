@@ -24,7 +24,7 @@ import { hasPdfHeader } from "./pdfSignature";
  * Source input accepted by HEPR loaders.
  *
  * String sources may be URLs/paths, base64 payloads, or base64 data URLs.
- * Binary sources may contain either a PDF or a HEPR parsed-data ZIP.
+ * Binary sources may contain either a PDF or a HEP parsed-data file.
  */
 export type PdfObjectSource = ArrayBuffer | Uint8Array | Blob | File | string;
 
@@ -54,7 +54,7 @@ export interface PdfObjectGeneratorOptions {
    * PDFs. In `"auto"` mode HEPR checks each page and transparently falls back
    * to PDF.js when the fast path does not support its content.
    *
-   * PDF sources only; parsed-data ZIP sources ignore this option.
+   * PDF sources only; HEP sources ignore this option.
    *
    * @default "auto"
    */
@@ -69,7 +69,7 @@ export interface PdfObjectGeneratorOptions {
    * are ignored, and pages are composed in ascending document order. Invalid
    * string selections reject with a `RangeError`.
    *
-   * PDF sources only; parsed-data ZIP sources ignore this option.
+   * PDF sources only; HEP sources ignore this option.
    *
    * @example "1-5, 8, 11-13"
    */
@@ -82,7 +82,7 @@ export interface PdfObjectGeneratorOptions {
   maxPagesPerRow?: number;
 
   /**
-   * Progress callback for source loading, PDF parsing, ZIP loading, vector/text
+   * Progress callback for source loading, PDF parsing, HEP loading, vector/text
    * LOD building, and upload preparation.
    */
   onProgress?: LoadProgressCallback;
@@ -91,7 +91,7 @@ export interface PdfObjectGeneratorOptions {
    * Also extract text strings with scene-space bounding boxes into
    * `VectorScene.textContent` (used for example by `detectRooms` to seed room
    * detection from room labels). Only PDF sources support this option;
-   * parsed-zip sources ignore it — their searchable text index serves as the
+   * HEP (`parsed-zip`) sources ignore it — their searchable text index serves as the
    * room-detection seed source instead.
    *
    * @default false
@@ -117,7 +117,7 @@ export interface LoadedPdfScene {
   /** Human-readable source label, usually a file name or URL basename. */
   sourceLabel: string;
 
-  /** Whether the source was loaded as a PDF or parsed-data ZIP. */
+  /** Whether the source was loaded as a PDF or HEP parsed-data file. */
   sourceKind: PdfObjectSourceKind;
 
   /** Original source bytes. */
@@ -132,7 +132,7 @@ let isPdfWorkerConfigured = false;
 export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions = {},
-  /** @internal Used by parsed-ZIP export to cancel source loading and parsing. */
+  /** @internal Used by HEP export to cancel source loading and parsing. */
   signal?: AbortSignal
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
@@ -213,7 +213,7 @@ function ensurePdfWorkerConfigured(): void {
 export async function readPdfObjectSourceBytes(
   source: PdfObjectSource,
   progress?: LoadProgressReporter,
-  /** @internal Used by parsed-ZIP export to cancel source reads. */
+  /** @internal Used by HEP export to cancel source reads. */
   signal?: AbortSignal
 ): Promise<Uint8Array> {
   signal?.throwIfAborted();
@@ -423,7 +423,7 @@ function resolveSourceKind(
     if (lowered.endsWith(".pdf")) {
       return "pdf";
     }
-    if (lowered.endsWith(".zip")) {
+    if (lowered.endsWith(".hep") || lowered.endsWith(".zip")) {
       return "parsed-zip";
     }
   }
@@ -445,7 +445,7 @@ function resolveSourceLabel(source: PdfObjectSource, sourceKind: PdfObjectSource
   if (sourceName) {
     return sourceName;
   }
-  return sourceKind === "pdf" ? "document.pdf" : "parsed-data.zip";
+  return sourceKind === "pdf" ? "document.pdf" : "parsed-data.hep";
 }
 
 function readSourceName(source: PdfObjectSource): string | null {
@@ -471,7 +471,7 @@ function readSourceNameFromString(source: string): string | null {
       return "inline.pdf";
     }
     if (mime === "application/zip" || mime === "application/x-zip-compressed") {
-      return "inline.zip";
+      return "inline.hep";
     }
     return "inline-data.bin";
   }

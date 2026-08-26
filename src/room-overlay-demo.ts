@@ -88,7 +88,7 @@ interface GeneratedRoomTsv {
 }
 
 interface ClassifiedRoomDemoFiles {
-  /** PDF or HEPR parsed-data ZIP. */
+  /** PDF or HEP parsed-data file. */
   sourceFile: File | null;
   tsvFile: File | null;
   error: string | null;
@@ -191,7 +191,7 @@ loadFilesButton.addEventListener("click", () => {
 
 clearTsvButton.addEventListener("click", () => {
   clearRoomOverlay();
-  setStatus(currentPdfObject ? "TSV overlay cleared." : "Load a PDF or parsed ZIP to begin.");
+  setStatus(currentPdfObject ? "TSV overlay cleared." : "Load a PDF or HEP file to begin.");
 });
 
 detectRoomsButton.addEventListener("click", () => {
@@ -281,12 +281,12 @@ async function loadFiles(files: FileList | File[], _source: "picker" | "drop"): 
 
   const { sourceFile, tsvFile } = classified;
   if (!sourceFile && !tsvFile) {
-    setStatus("Select or drop a PDF or parsed ZIP, a TSV, or one of each.");
+    setStatus("Select or drop a PDF or HEP file, a TSV, or one of each.");
     return;
   }
 
   if (!sourceFile && tsvFile && !currentPdfObject) {
-    setStatus("Load or drop a PDF or parsed ZIP with this TSV first.");
+    setStatus("Load or drop a PDF or HEP file with this TSV first.");
     return;
   }
 
@@ -321,7 +321,7 @@ function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFile
     return {
       sourceFile: null,
       tsvFile: null,
-      error: "Select or drop only one PDF or parsed ZIP at a time."
+      error: "Select or drop only one PDF or HEP file at a time."
     };
   }
 
@@ -337,7 +337,7 @@ function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFile
     return {
       sourceFile: null,
       tsvFile: null,
-      error: "Select or drop a PDF or parsed ZIP, a TSV, or one of each."
+      error: "Select or drop a PDF or HEP file, a TSV, or one of each."
     };
   }
 
@@ -355,7 +355,12 @@ function isPdfFile(file: File): boolean {
 
 function isZipFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
-  return file.type === "application/zip" || file.type === "application/x-zip-compressed" || lowerName.endsWith(".zip");
+  return (
+    lowerName.endsWith(".hep") ||
+    lowerName.endsWith(".zip") ||
+    file.type === "application/zip" ||
+    file.type === "application/x-zip-compressed"
+  );
 }
 
 function isTsvFile(file: File): boolean {
@@ -408,9 +413,9 @@ async function loadExampleManifest(): Promise<void> {
           },
           {
             key: `${entry.id}:zip`,
-            label: "ZIP",
+            label: "HEP",
             sizeLabel: formatFileSize(entry.zipSizeBytes),
-            title: `Load precomputed parsed data for ${entry.name}`
+            title: `Load precomputed HEP data for ${entry.name}`
           }
         ]
       };
@@ -433,7 +438,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
 
   exampleDropdown.setDisabled(true);
   try {
-    setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "parsed ZIP"})...`);
+    setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "HEP"})...`);
     const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.zipPath, { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
@@ -443,7 +448,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     const file =
       kind === "pdf"
         ? new File([bytes], `${baseName}.pdf`, { type: "application/pdf" })
-        : new File([bytes], `${baseName}.zip`, { type: "application/zip" });
+        : new File([bytes], `${baseName}.hep`, { type: "application/zip" });
     await loadSceneSource(file);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -492,7 +497,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
       return false;
     }
 
-    // Parsed ZIPs carry no source PDF to derive the TSV coordinate transform from;
+    // HEP files carry no source PDF to derive the TSV coordinate transform from;
     // identity matches the common case (origin-0, unrotated pages).
     currentPdfCoordinateTransform = isZip
       ? createIdentityPdfCoordinateTransform()
@@ -515,7 +520,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
       return false;
     }
     const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Failed to load ${isZip ? "parsed ZIP" : "PDF"}: ${message}`);
+    setStatus(`Failed to load ${isZip ? "HEP file" : "PDF"}: ${message}`);
     return false;
   } finally {
     if (activeToken === loadToken) {
@@ -528,7 +533,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
 
 async function loadTsv(file: File): Promise<boolean> {
   if (!currentPdfObject) {
-    setStatus("Load a PDF or parsed ZIP before adding a TSV overlay.");
+    setStatus("Load a PDF or HEP file before adding a TSV overlay.");
     return false;
   }
 
@@ -561,7 +566,7 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
 
   const pdfObject = currentPdfObject;
   if (!pdfObject) {
-    setStatus("Load a PDF or parsed ZIP before running room detection.");
+    setStatus("Load a PDF or HEP file before running room detection.");
     return;
   }
 

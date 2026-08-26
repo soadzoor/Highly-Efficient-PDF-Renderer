@@ -3,7 +3,7 @@
 // Vite runs in middleware mode only; this script never binds a network port.
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -97,6 +97,27 @@ async function run() {
 
   const manifestPath = path.join(repoRootDir, "public/examples/manifest.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  assert.ok(manifest.examples.length > 0, "example manifest must not be empty");
+  for (const entry of manifest.examples) {
+    assert.match(entry.parsedZip.path, /\.hep$/i, `${entry.name} must use the canonical .hep extension`);
+    const hepAssetPath = decodeURIComponent(entry.parsedZip.path);
+    const hepStat = await stat(path.join(repoRootDir, "public", hepAssetPath));
+    assert.equal(hepStat.size, entry.parsedZip.sizeBytes, `${entry.name} HEP size must match the manifest`);
+  }
+
+  for (const htmlName of ["index.html", "three-example.html", "room-overlay-demo.html"]) {
+    const html = await readFile(path.join(repoRootDir, htmlName), "utf8");
+    const accept = html.match(/<input\b(?=[^>]*\bid="file-input")[^>]*\baccept="([^"]+)"/i)?.[1];
+    assert.ok(accept, `${htmlName} must define a file-input accept filter`);
+    assert.match(accept, /(?:^|,)\.hep(?:,|$)/i, `${htmlName} must advertise .hep files`);
+    assert.doesNotMatch(accept, /(?:\.zip|application\/(?:x-)?zip)/i, `${htmlName} must not advertise generic ZIP files`);
+  }
+
+  for (const sourceName of ["src/main.ts", "src/three-example.ts"]) {
+    const source = await readFile(path.join(repoRootDir, sourceName), "utf8");
+    assert.match(source, /-parsed-data\.hep/, `${sourceName} must export .hep filenames`);
+    assert.doesNotMatch(source, /-parsed-data\.zip/, `${sourceName} must not export .zip filenames`);
+  }
   const brochure = manifest.examples.find((entry) => entry.name.includes("Broschuere_Leo_B2C"));
   assert.ok(brochure, "brochure example must be present in the generated manifest");
   assert.equal(
@@ -124,20 +145,35 @@ async function run() {
     assert.equal(servedPdf.body.length, brochure.pdf.sizeBytes);
     assert.equal(servedPdf.body.subarray(0, 5).toString("ascii"), "%PDF-");
 
+    const smallestHep = manifest.examples.reduce((smallest, entry) =>
+      entry.parsedZip.sizeBytes < smallest.parsedZip.sizeBytes ? entry : smallest
+    );
+    const hepRequestPath = new URL(smallestHep.parsedZip.path, "http://example.test/").pathname;
+    const servedHep = await requestViteMiddleware(viteServer, hepRequestPath);
+    assert.equal(servedHep.status, 200);
+    assert.equal(servedHep.body.length, smallestHep.parsedZip.sizeBytes);
+    assert.equal(servedHep.body.subarray(0, 2).toString("ascii"), "PK");
+
     const [
       { assertPdfBytes, hasPdfHeader },
-      { readPdfDownloadBlob },
+      { formatPdfDownloadFilename, readPdfDownloadBlob },
       { loadPdfSceneFromSource },
+      { loadSceneFromParsedDataZip },
       { extractPdfPageScenes }
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/pdfSignature.ts"),
       viteServer.ssrLoadModule("/src/downloadUtils.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
+      viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
       viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts")
     ]);
     const prefixedPdf = new Uint8Array([0, 1, 2, 0x25, 0x50, 0x44, 0x46, 0x2d]);
     assert.doesNotThrow(() => assertPdfBytes(prefixedPdf, { contentType: "application/octet-stream" }));
     assert.doesNotThrow(() => assertPdfBytes(prefixedPdf, { contentType: "text/html" }));
+    assert.equal(formatPdfDownloadFilename("floorplan.hep"), "floorplan.pdf");
+    assert.equal(formatPdfDownloadFilename("floorplan-parsed-data.hep"), "floorplan.pdf");
+    assert.equal(formatPdfDownloadFilename("floorplan.pdf (HEP)"), "floorplan.pdf");
+    assert.equal(formatPdfDownloadFilename("legacy.zip"), "legacy.pdf");
 
     const htmlFallback = await requestViteMiddleware(viteServer, "/index.html");
     assert.equal(htmlFallback.status, 200);
@@ -176,9 +212,39 @@ async function run() {
     assert.equal(hasPdfHeader(ambiguousZipBytes), true, "fixture must contain a PDF header in its first 1 KiB");
     await assert.rejects(
       loadPdfSceneFromSource(ambiguousZipBytes),
-      /Parsed data zip is missing manifest\.json/,
+      /not a valid HEP file.*Compressing a PDF into a ZIP does not create a HEP file/is,
       "ZIP magic must take precedence over an embedded PDF signature"
     );
+    await assert.rejects(
+      loadPdfSceneFromSource(new File(["%PDF-1.4\n"], "renamed-pdf.hep")),
+      /Unable to open HEP file.*renaming or compressing a PDF does not create one/is,
+      ".hep filenames must be recognized before byte-signature fallback"
+    );
+
+    const hepSource = new File([servedHep.body], "example.hep");
+    const loadedHep = await loadPdfSceneFromSource(hepSource);
+    assert.equal(loadedHep.sourceKind, "parsed-zip");
+    assert.equal(loadedHep.sourceLabel, "example.hep");
+
+    const progressCallbackError = new Error("progress callback sentinel");
+    await assert.rejects(
+      loadSceneFromParsedDataZip(Uint8Array.from(servedHep.body).buffer, {
+        onProgress: (progress) => {
+          if (progress.stage === "zip-open") {
+            throw progressCallbackError;
+          }
+        }
+      }),
+      (error) => error === progressCallbackError,
+      "HEP-open guidance must not replace consumer progress callback errors"
+    );
+
+    const legacyZipSource = new File([servedHep.body], "legacy-example.zip", {
+      type: "application/zip"
+    });
+    const loadedLegacyZip = await loadPdfSceneFromSource(legacyZipSource);
+    assert.equal(loadedLegacyZip.sourceKind, "parsed-zip");
+    assert.equal(loadedLegacyZip.sourceLabel, "legacy-example.zip");
 
     console.log("Example asset regressions passed");
   } finally {

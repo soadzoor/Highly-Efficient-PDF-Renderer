@@ -38,7 +38,7 @@ const LOAD_PROGRESS_TEXT_LOD_END = 0.96;
 const LOAD_PROGRESS_UPLOAD = 0.98;
 
 /**
- * Load a PDF or HEPR parsed-data ZIP and return a three.js object.
+ * Load a PDF or HEP parsed-data file and return a three.js object.
  *
  * This is the package's public PDF-object construction entry point for
  * three.js applications. The returned object is a `THREE.Group`; add it to
@@ -70,7 +70,7 @@ const LOAD_PROGRESS_UPLOAD = 0.98;
  * }
  * ```
  *
- * @param source PDF/ZIP bytes, a `File`/`Blob`, a URL/path string, or a base64 string.
+ * @param source PDF/HEP bytes, a `File`/`Blob`, a URL/path string, or a base64 string.
  * @param options Parsing and three.js rendering options.
  * @param rendererType Native backend to use internally. Defaults to `"webgl"`.
  */

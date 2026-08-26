@@ -57,10 +57,13 @@ export async function readPdfDownloadBytes(source: PdfDownloadSource): Promise<U
 
 export function formatPdfDownloadFilename(label: string): string {
   const trimmed = label.trim();
-  const withoutKnownSuffix = trimmed
-    .replace(/\s*\(parsed zip\)\s*$/i, "")
-    .replace(/\.(pdf|zip)$/i, "");
-  const normalized = withoutKnownSuffix.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
+  const withoutFormatLabel = trimmed.replace(/\s*\((?:hep|parsed zip)\)\s*$/i, "");
+  const isParsedDataFile = /\.(?:hep|zip)$/i.test(withoutFormatLabel);
+  const withoutExtension = withoutFormatLabel.replace(/\.(?:pdf|hep|zip)$/i, "");
+  const withoutParsedDataSuffix = isParsedDataFile
+    ? withoutExtension.replace(/[._-]?parsed[._-]?data$/i, "")
+    : withoutExtension;
+  const normalized = withoutParsedDataSuffix.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
   return `${normalized.length > 0 ? normalized : "document"}.pdf`;
 }
 

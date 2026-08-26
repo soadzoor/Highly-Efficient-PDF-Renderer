@@ -282,15 +282,15 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
     case "compile":
       return "Compiling";
     case "zip-open":
-      return "Opening ZIP";
+      return "Opening HEP";
     case "zip-manifest":
       return "Reading manifest";
     case "zip-file":
-      return "Decoding ZIP";
+      return "Decoding HEP";
     case "raster-encode":
       return "Compressing raster images";
     case "zip-build":
-      return "Building ZIP";
+      return "Building HEP";
     case "vector-lod":
       return "Building Vector LOD";
     case "text-lod":

@@ -530,7 +530,7 @@ async function generateZipBlobWithAbort(
           reject(error);
           return;
         }
-        reject(new DOMException("The parsed ZIP build was aborted.", "AbortError"));
+        reject(new DOMException("The HEP build was aborted.", "AbortError"));
       });
     };
 
@@ -846,7 +846,7 @@ function parseStrokeGeometrySection(value: unknown): StrokeGeometrySectionMeta |
     !endpointColumnByteLengths ||
     endpointColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0)
   ) {
-    throw new Error("Parsed data zip has an invalid strokeGeometry section.");
+    throw new Error("HEP file has an invalid strokeGeometry section.");
   }
   return {
     endpointsFile,
@@ -880,7 +880,7 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
     !positionColumnByteLengths ||
     positionColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0)
   ) {
-    throw new Error("Parsed data zip has an invalid textInstances section.");
+    throw new Error("HEP file has an invalid textInstances section.");
   }
   return { positionsFile, glyphIndexFile, glyphIndexFormat, count, positionColumnByteLengths };
 }
@@ -905,7 +905,7 @@ async function readStrokeGeometryFromSection(
   const endpointsEntry = zip.file(section.endpointsFile);
   const metaEntry = zip.file(section.metaFile);
   if (!endpointsEntry || !metaEntry) {
-    throw new Error("Parsed data zip is missing v5 stroke geometry files.");
+    throw new Error("HEP file is missing v5 stroke geometry files.");
   }
   const [endpointBuffer, metaBuffer] = await Promise.all([
     endpointsEntry.async("arraybuffer"),
@@ -916,7 +916,7 @@ async function readStrokeGeometryFromSection(
 
   const columnLengths = section.endpointColumnByteLengths;
   if (columnLengths[0] + columnLengths[1] + columnLengths[2] + columnLengths[3] !== endpointBytes.length) {
-    throw new Error("Parsed data zip stroke endpoint columns have a length mismatch.");
+    throw new Error("HEP file stroke endpoint columns have a length mismatch.");
   }
   const col0End = columnLengths[0];
   const col1End = col0End + columnLengths[1];
@@ -930,7 +930,7 @@ async function readStrokeGeometryFromSection(
   const ch3Start = bitsetLength;
   const ctrlStart = bitsetLength + segmentCount * 2;
   if (metaBytes.length < ctrlStart) {
-    throw new Error("Parsed data zip stroke meta stream is truncated.");
+    throw new Error("HEP file stroke meta stream is truncated.");
   }
   const ctrl = new VarintCursor(metaBytes, ctrlStart, metaBytes.length);
 
@@ -983,7 +983,7 @@ async function readStrokeGeometryFromSection(
   endY.expectEnd("stroke end-y column");
   ctrl.expectEnd("stroke control-point stream");
   if (curvesSeen !== section.curveCount) {
-    throw new Error(`Parsed data zip stroke curve count mismatch (${curvesSeen} vs ${section.curveCount}).`);
+    throw new Error(`HEP file stroke curve count mismatch (${curvesSeen} vs ${section.curveCount}).`);
   }
 
   return { endpoints, primitiveMeta };
@@ -1000,7 +1000,7 @@ async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSe
   const positionsEntry = zip.file(section.positionsFile);
   const glyphIndexEntry = zip.file(section.glyphIndexFile);
   if (!positionsEntry || !glyphIndexEntry) {
-    throw new Error("Parsed data zip is missing v5 text instance files.");
+    throw new Error("HEP file is missing v5 text instance files.");
   }
   const [positionsBuffer, glyphIndexBuffer] = await Promise.all([
     positionsEntry.async("arraybuffer"),
@@ -1009,7 +1009,7 @@ async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSe
   const positionBytes = new Uint8Array(positionsBuffer);
   const [eLength, fLength] = section.positionColumnByteLengths;
   if (eLength + fLength !== positionBytes.length) {
-    throw new Error("Parsed data zip text instance position columns have a length mismatch.");
+    throw new Error("HEP file text instance position columns have a length mismatch.");
   }
 
   decodeFixed512DeltaColumnInto(positionBytes, 0, eLength, instanceB, count, 4, 0);
@@ -1017,7 +1017,7 @@ async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSe
 
   if (section.glyphIndexFormat === "u32") {
     if (glyphIndexBuffer.byteLength !== count * 4) {
-      throw new Error("Parsed data zip glyph index stream has a length mismatch.");
+      throw new Error("HEP file glyph index stream has a length mismatch.");
     }
     const glyphIndices = new Uint32Array(glyphIndexBuffer);
     for (let i = 0; i < count; i += 1) {
@@ -1025,7 +1025,7 @@ async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSe
     }
   } else {
     if (glyphIndexBuffer.byteLength !== count * 2) {
-      throw new Error("Parsed data zip glyph index stream has a length mismatch.");
+      throw new Error("HEP file glyph index stream has a length mismatch.");
     }
     const glyphIndices = new Uint16Array(glyphIndexBuffer);
     for (let i = 0; i < count; i += 1) {
@@ -1251,12 +1251,22 @@ export async function loadSceneFromParsedDataZip(
 ): Promise<VectorScene> {
   const progress = createLoadProgressReporter(options.onProgress);
   const zip = await progress.child(0, 0.16, { sourceType: "zip" }).withIndeterminateProgress(
-    JSZip.loadAsync(buffer),
+    () => JSZip.loadAsync(buffer).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Unable to open HEP file: ${message}. ` +
+        "A HEP file must be exported by HEPR; renaming or compressing a PDF does not create one.",
+        { cause: error }
+      );
+    }),
     { stage: "zip-open", sourceType: "zip" }
   );
   const manifestFile = zip.file("manifest.json");
   if (!manifestFile) {
-    throw new Error("Parsed data zip is missing manifest.json.");
+    throw new Error(
+      "This is not a valid HEP file: manifest.json is missing. " +
+      "Compressing a PDF into a ZIP does not create a HEP file; load the PDF directly or export it from HEPR."
+    );
   }
   const manifestByteLength = readZipEntryUncompressedSize(manifestFile);
   if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
@@ -1277,7 +1287,7 @@ export async function loadSceneFromParsedDataZip(
 
   if (manifest.formatVersion !== PARSED_DATA_FORMAT_VERSION) {
     throw new Error(
-      `Parsed data zip format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}. Re-export the zip with the current version.`
+      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}. Re-export the HEP file with the current version.`
     );
   }
 
@@ -1318,7 +1328,7 @@ export async function loadSceneFromParsedDataZip(
       const zipEntry = path ? zip.file(path) : null;
       if (!entry || !zipEntry) {
         if (required) {
-          throw new Error(`Parsed data zip is missing required texture: ${name}.`);
+          throw new Error(`HEP file is missing required texture: ${name}.`);
         }
         return null;
       }
@@ -1417,7 +1427,7 @@ export async function loadSceneFromParsedDataZip(
     ["gradient-stroke-styles", gradientStrokeStylesEntry, gradientStrokeSegmentCount]
   ] as const) {
     if (expectedCount > 0 && !entry) {
-      throw new Error(`Parsed data zip is missing required texture: ${label}.`);
+      throw new Error(`HEP file is missing required texture: ${label}.`);
     }
     if (entry && entry.logicalItemCount !== expectedCount) {
       throw new Error(
@@ -1427,7 +1437,7 @@ export async function loadSceneFromParsedDataZip(
   }
 
   if (segmentCount > 0 && !strokeStylesEntry) {
-    throw new Error("Parsed data zip is missing the stroke-styles texture.");
+    throw new Error("HEP file is missing the stroke-styles texture.");
   }
 
   const fillPathMetaA = trimTextureForItemCount(fillPathMetaAEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-a");
@@ -1712,7 +1722,7 @@ async function readGradientLutFromParsedData(
     return new Uint8Array(0);
   }
   if (!rawEntry || typeof rawEntry !== "object") {
-    throw new Error("Parsed data zip is missing its gradient LUT metadata.");
+    throw new Error("HEP file is missing its gradient LUT metadata.");
   }
   const entry = rawEntry as ParsedDataGradientLutEntry;
   const width = readNonNegativeInt(entry.width, 0);
@@ -1724,7 +1734,7 @@ async function readGradientLutFromParsedData(
   }
   const zipEntry = file ? zip.file(file) : null;
   if (!zipEntry) {
-    throw new Error("Parsed data zip is missing its gradient LUT payload.");
+    throw new Error("HEP file is missing its gradient LUT payload.");
   }
   const bytes = new Uint8Array(await zipEntry.async("arraybuffer"));
   if (bytes.length !== expectedByteLength) {
@@ -2230,7 +2240,7 @@ async function readRasterLayersFromParsedData(
 
     const decoded = await readRasterLayerFromZip(zip, path, width, height);
     if (!decoded) {
-      throw new Error(`Parsed data zip is missing or cannot decode raster layer ${i}: ${path}.`);
+      throw new Error(`HEP file is missing or cannot decode raster layer ${i}: ${path}.`);
     }
     const expectedByteLength = width * height * 4;
     if (
@@ -2304,7 +2314,7 @@ async function readRasterLayerFromZip(
 
 /**
  * Bound raster allocation using central-directory sizes before inflating or
- * decoding any entry. Parsed ZIPs may come from untrusted drag-and-drop input.
+ * decoding any entry. HEP files may come from untrusted drag-and-drop input.
  */
 function validateRasterLayerBudgets(
   zip: JSZip,
@@ -2344,7 +2354,7 @@ function validateRasterLayerBudgets(
 
     const zipEntry = zip.file(path);
     if (!zipEntry) {
-      throw new Error(`Parsed data zip is missing raster layer ${i}: ${path}.`);
+      throw new Error(`HEP file is missing raster layer ${i}: ${path}.`);
     }
     const byteLength = readZipEntryUncompressedSize(zipEntry);
     if (

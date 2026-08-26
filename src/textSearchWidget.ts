@@ -30,7 +30,7 @@ const QUERY_DEBOUNCE_MS = 150;
 const PLACEHOLDER_BY_AVAILABILITY: Record<TextSearchAvailability, string> = {
   ready: "Find in document...",
   "no-scene": "Load a document to search",
-  "no-text-index": "No text data in this ZIP - re-export to enable search"
+  "no-text-index": "No searchable text in this document"
 };
 
 export function createTextSearchWidget(

@@ -12,7 +12,7 @@
 //   node scripts/eval-rooms.mjs --run tweak --opts '{"doorGapFactor":8}' --jobs 4 --score
 //   node scripts/eval-rooms.mjs --run live --filter Murietta --from-pdf --png
 //   node scripts/eval-rooms.mjs --run example --pdf public/examples/pdfs/plan.pdf --png
-//   node scripts/eval-rooms.mjs --run cached --zip public/examples/zips/plan-parsed-data.zip --png
+//   node scripts/eval-rooms.mjs --run cached --hep public/examples/heps/plan-parsed-data.hep --png
 //
 // Flags:
 //   --run NAME        output folder name under .eval/ (default: "run")
@@ -22,7 +22,7 @@
 //   --png             collect debug info and write overlay + region-map PNGs
 //   --from-pdf        extract the scene live from pdf-tsv/<folder>/<stem>.pdf instead of the dump
 //   --pdf PATH        evaluate one standalone PDF directly (implies --from-pdf)
-//   --zip PATH        evaluate one standalone HEPR parsed-data ZIP directly
+//   --hep PATH        evaluate one standalone HEP file directly (`--zip` is a legacy alias)
 //   --jobs N          fork N shards (each loads its own Vite server)
 //   --score           run the noise-aware dependency-free scorer afterwards
 //   --score-args STR  extra args appended to the scorer (e.g. "--resolution 1024 --iou 0.7")
@@ -73,7 +73,7 @@ function parseArgs(argv) {
     } else if (value === "--pdf") {
       args.pdfPath = argv[++i];
       args.fromPdf = true;
-    } else if (value === "--zip") {
+    } else if (value === "--hep" || value === "--zip") {
       args.zipPath = argv[++i];
     } else if (value === "--jobs") {
       args.jobs = Math.max(1, Number(argv[++i]) || 1);
@@ -376,7 +376,7 @@ function forkShard(args, shardIndex) {
       ...(Object.keys(args.opts).length > 0 ? ["--opts", JSON.stringify(args.opts)] : []),
       ...(args.png ? ["--png"] : []),
       ...(args.pdfPath ? ["--pdf", args.pdfPath] : []),
-      ...(args.zipPath ? ["--zip", args.zipPath] : []),
+      ...(args.zipPath ? ["--hep", args.zipPath] : []),
       ...(args.fromPdf ? ["--from-pdf"] : [])
     ];
     const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...forwarded], { stdio: "inherit" });

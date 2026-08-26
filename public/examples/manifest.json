@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-10T09:32:11.927Z",
+  "generatedAt": "2026-08-26T06:16:17.579Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -9,7 +9,7 @@
         "sizeBytes": 3357354
       },
       "parsedZip": {
-        "path": "examples/zips/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.zip",
+        "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
         "sizeBytes": 1843699
       }
     },
@@ -21,7 +21,7 @@
         "sizeBytes": 5231679
       },
       "parsedZip": {
-        "path": "examples/zips/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.zip",
+        "path": "examples/heps/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.hep",
         "sizeBytes": 881332
       }
     },
@@ -33,7 +33,7 @@
         "sizeBytes": 666826
       },
       "parsedZip": {
-        "path": "examples/zips/Chino_MOB_FLOOR_1-parsed-data.zip",
+        "path": "examples/heps/Chino_MOB_FLOOR_1-parsed-data.hep",
         "sizeBytes": 196841
       }
     },
@@ -45,7 +45,7 @@
         "sizeBytes": 2918857
       },
       "parsedZip": {
-        "path": "examples/zips/Dublin_1st_Floor_2018_06_01-parsed-data.zip",
+        "path": "examples/heps/Dublin_1st_Floor_2018_06_01-parsed-data.hep",
         "sizeBytes": 1063181
       }
     },
@@ -57,7 +57,7 @@
         "sizeBytes": 31445683
       },
       "parsedZip": {
-        "path": "examples/zips/Level_1-parsed-data.zip",
+        "path": "examples/heps/Level_1-parsed-data.hep",
         "sizeBytes": 2952209
       }
     },
@@ -69,7 +69,7 @@
         "sizeBytes": 9263862
       },
       "parsedZip": {
-        "path": "examples/zips/Livermore_L1-parsed-data.zip",
+        "path": "examples/heps/Livermore_L1-parsed-data.hep",
         "sizeBytes": 1391815
       }
     },
@@ -81,7 +81,7 @@
         "sizeBytes": 30175
       },
       "parsedZip": {
-        "path": "examples/zips/LK_Office_Level_1-parsed-data.zip",
+        "path": "examples/heps/LK_Office_Level_1-parsed-data.hep",
         "sizeBytes": 15045
       }
     },
@@ -93,7 +93,7 @@
         "sizeBytes": 51313557
       },
       "parsedZip": {
-        "path": "examples/zips/Lower_Level-parsed-data.zip",
+        "path": "examples/heps/Lower_Level-parsed-data.hep",
         "sizeBytes": 1700830
       }
     },
@@ -105,7 +105,7 @@
         "sizeBytes": 4001014
       },
       "parsedZip": {
-        "path": "examples/zips/Murietta_Level1-parsed-data.zip",
+        "path": "examples/heps/Murietta_Level1-parsed-data.hep",
         "sizeBytes": 1180613
       }
     },
@@ -117,7 +117,7 @@
         "sizeBytes": 1848238
       },
       "parsedZip": {
-        "path": "examples/zips/optimizing_cpp-parsed-data.zip",
+        "path": "examples/heps/optimizing_cpp-parsed-data.hep",
         "sizeBytes": 885520
       }
     },
@@ -129,7 +129,7 @@
         "sizeBytes": 916550
       },
       "parsedZip": {
-        "path": "examples/zips/SimiValleyBehavioralHealth_SR_20180403-parsed-data.zip",
+        "path": "examples/heps/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
         "sizeBytes": 234305
       }
     },
@@ -141,7 +141,7 @@
         "sizeBytes": 18277813
       },
       "parsedZip": {
-        "path": "examples/zips/stn_arch_kp-ontario_177920237_detached-parsed-data.zip",
+        "path": "examples/heps/stn_arch_kp-ontario_177920237_detached-parsed-data.hep",
         "sizeBytes": 2448623
       }
     },
@@ -153,7 +153,7 @@
         "sizeBytes": 2833537
       },
       "parsedZip": {
-        "path": "examples/zips/thesis-parsed-data.zip",
+        "path": "examples/heps/thesis-parsed-data.hep",
         "sizeBytes": 1610456
       }
     },
@@ -165,7 +165,7 @@
         "sizeBytes": 6964852
       },
       "parsedZip": {
-        "path": "examples/zips/WarAndPeace-parsed-data.zip",
+        "path": "examples/heps/WarAndPeace-parsed-data.hep",
         "sizeBytes": 5301283
       }
     }

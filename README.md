@@ -30,7 +30,7 @@ HEPR was mostly inspired by the PDF GPU-text rendering work shared at <https://w
 - Stroked paths, filled paths, vector text, and embedded raster image layers.
 - Browser-style find-in-text: full-document search over the extracted text with GPU-drawn match highlights, exposed through the package API.
 - Native-viewer text selection: drag to select on desktop (with a `text` cursor over selectable text), long-press with drag handles and a Copy popup on touch devices, blue GPU-drawn highlights, and clipboard copy — optional and exposed through the package API.
-- Parsed-data ZIP export/import to skip repeated PDF extraction, with delta/varint-compressed geometry and a searchable text index (exported ZIPs are typically smaller than the source PDFs).
+- Highly Efficient PDF (HEP, `.hep`) export/import to skip repeated PDF extraction, with delta/varint-compressed geometry and a searchable text index (exported HEP files are typically smaller than the source PDFs).
 - Runtime diagnostics for FPS, draw counts, Vector LOD state, parse/upload timing, texture usage, and culling stats.
 
 ## Nanite-Inspired Vector LOD
@@ -98,7 +98,7 @@ preserve the camera where possible.
 ## npm Package API ([`@soadzoor/hepr`](https://www.npmjs.com/package/@soadzoor/hepr))
 
 Use `pdfObjectGenerator`, the package's single PDF-object construction entry
-point, to load a PDF or parsed ZIP and create a `THREE.Group`. The three.js
+point, to load a PDF or HEP file and create a `THREE.Group`. The three.js
 wrapper is camera-driven by default, so the PDF follows your existing
 `THREE.Camera` and controls.
 The generated TypeScript declaration files include JSDoc comments for the main
@@ -159,19 +159,21 @@ Supported `source` inputs:
 
 - `File` / `Blob`
 - `Uint8Array` / `ArrayBuffer`
-- `string` path or URL to `.pdf` / `.zip`
-- base64 payload string (`PDF` or `ZIP`)
-- base64 data URL (`data:application/pdf;base64,...`)
+- `string` path or URL to `.pdf` / `.hep` (legacy `.zip` exports remain supported)
+- base64 payload string (PDF or HEP)
+- base64 data URL (`application/pdf`, or `application/zip` when transporting HEP)
 
-Build a parsed-data ZIP directly from any supported PDF input. The result is
-an `application/zip` `Blob` that can be downloaded, uploaded, or stored:
+Build a HEP file directly from any supported PDF input. The public builder
+retains its existing `buildParsedDataZip` name for API compatibility. Its result
+is an `application/zip` `Blob` because HEP uses ZIP internally; save or upload it
+with a `.hep` filename:
 
 ```ts
 import { buildParsedDataZip } from "@soadzoor/hepr";
 
 // URL, File, Blob, Uint8Array, ArrayBuffer, base64, or data URL
 const controller = new AbortController();
-const zipBlob = await buildParsedDataZip(pdfSource, {
+const hepBlob = await buildParsedDataZip(pdfSource, {
   // Default: store each raster as the smaller of WebP/PNG, with RGBA fallback.
   encodeRasterImages: true,
   signal: controller.signal,
@@ -184,7 +186,7 @@ const zipBlob = await buildParsedDataZip(pdfSource, {
 If the PDF is already loaded, pass its parsed scene to avoid parsing it again:
 
 ```ts
-const zipBlob = await buildParsedDataZip(pdfObject.sceneData, {
+const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
   sourceLabel: pdfObject.sourceLabel,
   // Needed only if the scene has PDF image operations but no raster layers.
   sourcePdf: originalPdfSource,
@@ -216,7 +218,7 @@ Ranges are inclusive. Whitespace is allowed, overlaps and duplicates are
 ignored, and selected pages are composed in ascending document order. Open
 ranges are supported too: `"5-"` means page 5 through the end, while `"-3"`
 means the first three pages. Omitting `pages` or passing a blank string selects
-every page. Page selection applies to PDF sources; parsed-data ZIPs already
+every page. Page selection applies to PDF sources; HEP files already
 contain one composed scene and currently ignore this option.
 
 Page indexes returned by scene search/selection APIs are zero-based positions
@@ -293,7 +295,7 @@ state and call `setSearchHighlights(matches, { currentIndex })` again — the
 highlights update in place. See `src/three-example.ts` for a complete working
 implementation (input field, match counter, case toggle, and camera fly-to).
 
-Search works on scenes loaded from PDFs and from parsed-data ZIPs (the ZIP
+Search works on scenes loaded from PDFs and from HEP files (the HEP container
 stores a compact text index alongside the geometry).
 
 For custom pipelines that do not use the three.js wrapper, the same search
@@ -409,7 +411,7 @@ Notes:
   (highlights live in renderer-owned GPU buffers).
 - The controller resets itself automatically when `adapter.getScene()` starts
   returning a different scene (new document loaded).
-- Selection works on scenes loaded from PDFs and from parsed-data ZIPs, and
+- Selection works on scenes loaded from PDFs and from HEP files, and
   coexists with search highlights (the current search match stays visible on
   top of a selection).
 - Rotated/vertical text falls back to axis-aligned boxes, mirroring search.
@@ -439,7 +441,7 @@ Parse-time optimizations include segment merging, invisible/contained stroke cul
 
 `src/pdfObjectGenerator.ts` and `src/main.ts` handle:
 
-- PDF or parsed ZIP source detection
+- PDF or HEP source detection
 - page extraction
 - page-grid composition
 - Vector LOD prebuild with progress callbacks
@@ -475,9 +477,17 @@ WebGPU-compatible three.js materials live in:
 - `src/threeWebGpuTextMaterial.ts`
 - `src/threeWebGpuRasterMaterial.ts`
 
-## Parsed Data ZIP Format
+## HEP File Format
 
-The exported ZIP contains parsed scene data:
+A `.hep` (Highly Efficient PDF) file is HEPR's pre-parsed document format. It
+uses a ZIP container internally, but the public extension is `.hep` so it is not mistaken for an
+ordinary user-created archive. Compressing a PDF with 7-Zip or another archive
+tool does not create a HEP file; load the PDF directly or export it through HEPR.
+Legacy `.zip` exports remain loadable through the package API and drag-and-drop;
+the demos intentionally advertise only `.hep` in their file choosers to keep
+ordinary ZIP files out of the normal workflow.
+
+The HEP container includes:
 
 - `manifest.json`
 - vector texture payloads
@@ -486,22 +496,22 @@ The exported ZIP contains parsed scene data:
 - optional raster layers
 - optional embedded source PDF fallback
 
-Parsed ZIPs are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported ZIPs are typically smaller than the source PDFs themselves. Format v6 stores each raster layer whole as WebP or PNG, whichever is smaller, and falls back to RGBA8 when image encoding is unavailable. WebP/PNG entries are already compressed and are therefore stored without redundant ZIP compression.
+HEP files are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported HEP files are typically smaller than the source PDFs themselves. Format v6 stores each raster layer whole as WebP or PNG, whichever is smaller, and falls back to RGBA8 when image encoding is unavailable. WebP/PNG entries are already compressed and are therefore stored without redundant ZIP compression.
 
 Exports report separate `raster-encode` and `zip-build` progress stages. Pass an `AbortSignal` as `signal` to cancel source fetching/PDF.js parsing, between raster encodes, or while the ZIP stream is being generated. Cancellation inside synchronous extraction work takes effect at the next asynchronous/check boundary. The loader accepts format v6 only; older or experimental format versions must be re-exported.
 
 The Three.js integration keeps only one raster GPU owner active at a time. Its material textures are released before the native-canvas fallback allocates raster textures, and native raster textures remain nonresident while the Three.js material path is active. This avoids the previous persistent duplicate raster allocation across the two renderer paths. The active texture set is still ordinary RGBA8 with mipmaps; this is an ownership fix, not GPU texture compression.
 
-The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make ZIPs much larger than the original parsed scene.
+The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make HEP files much larger than the original parsed scene.
 
-Open the native demo with `?bulkZip=1` or `?downloadAllZips=1` to reveal the `Download All Example ZIPs` button.
+Open the native demo with `?bulkHep=1` or `?downloadAllHeps=1` to reveal the `Download All Example HEP Files` button. The old ZIP-named query parameters remain supported.
 
 ## Example Assets
 
 Folder layout:
 
 - `public/examples/pdfs/`
-- `public/examples/zips/`
+- `public/examples/heps/`
 - `public/examples/manifest.json`
 
 Regenerate the example manifest with:
@@ -622,5 +632,5 @@ npm run preview
 - WebGPU requires browser and GPU support.
 - Three.js WebGPU support is implemented through Three's WebGPU renderer/material path, not by mixing a WebGPU-rendered canvas texture into a WebGL scene.
 - Embedded PDF image layers remain raster images by definition; the "no raster fallback" rule applies to vector floorplan geometry.
-- Parsed ZIPs improve load time by skipping PDF extraction, but large stroke-heavy scenes may still spend time building Vector LOD.
+- HEP files improve load time by skipping PDF extraction, but large stroke-heavy scenes may still spend time building Vector LOD.
 - Most of this repo was "vibe-coded" with Codex and Fable. It would've taken a lot more time (~forever) without AI tools to get to this stage for me, even though I'm a professional graphical programmer. The know-hows, and technical details about PDFs are way out of my expertise.

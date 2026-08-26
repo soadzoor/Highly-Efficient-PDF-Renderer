@@ -16,12 +16,12 @@ import {
 } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
 
-/** Compression algorithm used for a generated parsed-data ZIP. */
+/** Compression algorithm used inside a generated HEP file. */
 export type ParsedDataZipCompression = "deflate" | "store";
 
-/** Options shared by PDF-source and already-parsed scene ZIP builds. */
+/** Options shared by PDF-source and already-parsed scene HEP builds. */
 export interface ParsedDataZipEncodingOptions {
-  /** Override the source name written to the ZIP manifest. */
+  /** Override the source name written to the HEP manifest. */
   sourceLabel?: string;
 
   /** Encode raster layers as WebP/PNG when supported; otherwise store raw RGBA. @default true */
@@ -36,7 +36,7 @@ export interface ParsedDataZipEncodingOptions {
   /** Receives normalized progress for the complete parse-and-build operation. */
   onProgress?: LoadProgressCallback;
 
-  /** Cancels raster compression and parsed-ZIP generation when aborted. */
+  /** Cancels raster compression and HEP generation when aborted. */
   signal?: AbortSignal;
 }
 
@@ -65,14 +65,14 @@ export interface BuildParsedDataZipFromSceneOptions extends ParsedDataZipEncodin
 
   /**
    * Original PDF pages represented by the scene, used when restoring raster
-   * layers from `sourcePdf` after loading the generated ZIP. Supply this when
+   * layers from `sourcePdf` after loading the generated HEP file. Supply this when
    * the scene was parsed from a non-prefix selection such as `"3-5"`.
    */
   sourcePdfPages?: string;
 }
 
 /**
- * Build a HEPR parsed-data ZIP from a PDF source.
+ * Build a HEP parsed-data file from a PDF source.
  *
  * Accepted inputs are URLs/paths, raw base64 or data URLs, `File`, `Blob`,
  * `Uint8Array`, and `ArrayBuffer` values.
@@ -82,7 +82,7 @@ export function buildParsedDataZip(
   options?: BuildParsedDataZipFromPdfOptions
 ): Promise<Blob>;
 
-/** Build a HEPR parsed-data ZIP from an already-parsed scene without parsing again. */
+/** Build a HEP parsed-data file from an already-parsed scene without parsing again. */
 export function buildParsedDataZip(
   scene: VectorScene,
   options?: BuildParsedDataZipFromSceneOptions
@@ -147,7 +147,7 @@ async function buildParsedDataZipFromScene(
     if (options.sourcePdf === undefined) {
       throw new Error(
         "This scene contains PDF image operations but no extracted raster layers. " +
-        "Pass options.sourcePdf so the generated ZIP can preserve the missing image content."
+        "Pass options.sourcePdf so the generated HEP file can preserve the missing image content."
       );
     }
     buildStart = 0.16;
@@ -246,7 +246,7 @@ function assertCurrentVectorScene(scene: VectorScene): void {
     !(scene.gradientLut instanceof Uint8Array)
   ) {
     throw new Error(
-      "VectorScene is missing the native-gradient resources required by parsed-data ZIP format v6."
+      "VectorScene is missing the native-gradient resources required by HEP format v6."
     );
   }
 }

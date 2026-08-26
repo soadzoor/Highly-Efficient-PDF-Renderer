@@ -70,9 +70,9 @@ function createRasterScene(seedScene, width, height, data) {
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRootDir = path.resolve(scriptDir, "..");
-const seedZipPath = path.join(
+const seedHepPath = path.join(
   repoRootDir,
-  "public/examples/zips/LK_Office_Level_1-parsed-data.zip"
+  "public/examples/heps/LK_Office_Level_1-parsed-data.hep"
 );
 
 // Middleware mode only transforms TypeScript modules; it does not listen on a
@@ -92,7 +92,7 @@ try {
     viteServer.ssrLoadModule("/src/parsedDataZip.ts")
   ]);
 
-  const seedBytes = await readFile(seedZipPath);
+  const seedBytes = await readFile(seedHepPath);
   const seedScene = await parsedData.loadSceneFromParsedDataZip(
     seedBytes.buffer.slice(seedBytes.byteOffset, seedBytes.byteOffset + seedBytes.byteLength)
   );

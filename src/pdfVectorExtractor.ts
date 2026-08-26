@@ -173,7 +173,7 @@ export interface VectorScene {
   textGlyphSegmentsA: Float32Array;
   textGlyphSegmentsB: Float32Array;
   rasterLayers: RasterLayer[];
-  // Legacy single-layer fields kept for backward compatibility with old parsed-data ZIPs.
+  // Legacy single-layer fields kept for backward compatibility with old HEP files.
   rasterLayerWidth: number;
   rasterLayerHeight: number;
   rasterLayerData: Uint8Array<ArrayBufferLike>;
@@ -448,7 +448,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 export async function extractPdfPageScenes(
   pdfData: ArrayBuffer,
   options: VectorExtractOptions = {},
-  /** @internal Used by parsed-ZIP export to cancel PDF.js work. */
+  /** @internal Used by HEP export to cancel PDF.js work. */
   signal?: AbortSignal
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();

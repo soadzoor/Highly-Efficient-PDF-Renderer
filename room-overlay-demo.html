@@ -416,9 +416,9 @@
     <div id="room-label-layer" aria-hidden="true"></div>
     <div id="panel">
       <div class="toolbar">
-        <button id="load-files" type="button">Load PDF/ZIP + TSV</button>
+        <button id="load-files" type="button" title="Open a PDF or HEPR-exported .hep file, optionally with a TSV">Load PDF/HEP + TSV</button>
         <div id="example-dropdown" class="example-dropdown">
-          <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+          <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
             <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
             <span class="example-trigger-chevron" aria-hidden="true">▾</span>
           </button>
@@ -430,7 +430,7 @@
         </button>
         <button id="download-generated-tsv" type="button" disabled>Download Generated TSV</button>
         <button id="clear-tsv" type="button" disabled>Clear TSV</button>
-        <input id="file-input" type="file" accept=".pdf,.zip,.tsv,application/pdf,application/zip,text/tab-separated-values,text/plain" multiple hidden />
+        <input id="file-input" type="file" accept=".pdf,.hep,.tsv,application/pdf,text/tab-separated-values,text/plain" multiple hidden />
       </div>
       <div class="toggles">
         <label class="toggle">
@@ -446,9 +446,9 @@
           <span>Room numbers</span>
         </label>
       </div>
-      <div id="status" class="status">Load a PDF or parsed ZIP to begin.</div>
+      <div id="status" class="status">Load a PDF or HEP file to begin.</div>
       <div class="metrics">
-        <div class="metric-row"><span class="metric-label">PDF</span><span id="pdf-value" class="metric-value">-</span></div>
+        <div class="metric-row"><span class="metric-label">Source</span><span id="pdf-value" class="metric-value">-</span></div>
         <div class="metric-row"><span class="metric-label">TSV</span><span id="tsv-value" class="metric-value">-</span></div>
         <div class="metric-row"><span class="metric-label">Rooms</span><span id="rooms-value" class="metric-value">-</span></div>
       </div>

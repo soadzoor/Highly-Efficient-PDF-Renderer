@@ -638,7 +638,7 @@ window.addEventListener("drop", (event) => {
   const supported = files.find((file) => isPdfFile(file) || isParsedDataZipFile(file));
 
   if (!supported) {
-    setStatus("Dropped file is not a supported PDF or parsed zip.");
+    setStatus("Dropped file is not a supported PDF or HEP file.");
     return;
   }
 
@@ -686,7 +686,7 @@ function refreshSearchAvailability(): void {
     ? "Load a document to search"
     : searchable
       ? "Find in document..."
-      : "No text data in this ZIP - re-export to enable search";
+      : "No searchable text in this document";
   if (!searchable) {
     searchState.matches = [];
     searchState.currentIndex = -1;
@@ -1158,7 +1158,7 @@ function setLoadControlsEnabled(enabled: boolean): void {
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
   downloadDataButtonElement.hidden = !hasParsedData;
   downloadDataButtonElement.disabled = !hasParsedData || isBusy;
-  downloadDataButtonElement.textContent = isBusy ? "Preparing ZIP..." : "Download Parsed Data";
+  downloadDataButtonElement.textContent = isBusy ? "Preparing HEP..." : "Download HEP";
 }
 
 function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
@@ -1190,6 +1190,7 @@ function isPdfFile(file: File): boolean {
 function isParsedDataZipFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
+    lowerName.endsWith(".hep") ||
     lowerName.endsWith(".zip") ||
     file.type === "application/zip" ||
     file.type === "application/x-zip-compressed"
@@ -1218,7 +1219,8 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
   const sourceSegments = sceneData.sourceSegmentCount;
   const visibleSegments = sceneData.segmentCount;
   const totalReduction = sourceSegments > 0 ? (1 - visibleSegments / sourceSegments) * 100 : 0;
-  fileValueElement.textContent = `${pdfObject.sourceLabel} (${pdfObject.sourceKind})`;
+  const sourceKindLabel = pdfObject.sourceKind === "pdf" ? "PDF" : "HEP";
+  fileValueElement.textContent = `${pdfObject.sourceLabel} (${sourceKindLabel})`;
   sourceSegmentsValueElement.textContent = sourceSegments.toLocaleString();
   visibleSegmentsValueElement.textContent =
     `${visibleSegments.toLocaleString()} (${Math.max(0, totalReduction).toFixed(1)}% total reduction), fills ${sceneData.fillPathCount.toLocaleString()}, text ${sceneData.textInstanceCount.toLocaleString()} instances, pages ${sceneData.pageCount.toLocaleString()} (${sceneData.pagesPerRow.toLocaleString()}/row)`;
@@ -1250,7 +1252,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
   backendSelectElement.disabled = true;
   vectorLodSelectElement.disabled = true;
   textLodSelectElement.disabled = true;
-  setLoadingProgress(true, "0.00% Preparing parsed ZIP export...");
+  setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
     await yieldToBrowserPaint();
     const zipBlob = await buildParsedDataZip(pdfObject.sceneData, {
@@ -1271,7 +1273,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
       return false;
     }
 
-    const zipFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.zip`;
+    const zipFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.hep`;
     triggerBrowserDownload(zipBlob, zipFileName);
     return true;
   } catch (error) {
@@ -1618,9 +1620,9 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
         },
         {
           key: zipKey,
-          label: "ZIP",
+          label: "HEP",
           sizeLabel: formatFileSize(entry.zipSizeBytes),
-          title: `Load precomputed parsed data for ${entry.name}`
+          title: `Load precomputed HEP data for ${entry.name}`
         }
       ]
     });
@@ -1637,7 +1639,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
 
   exampleDropdown.setDisabled(true);
   try {
-    const modeLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
+    const modeLabel = selection.kind === "pdf" ? "PDF" : "HEP";
     setStatus(`Loading example ${selection.sourceName} (${modeLabel})...`);
     await loadSource(selection.path, {
       pdfDownloadHint: {
@@ -1664,8 +1666,13 @@ function formatFileSize(sizeBytes: number): string {
 }
 
 function sanitizeDownloadName(label: string): string {
-  const withoutExtension = label.replace(/\.pdf$/i, "");
-  const normalized = withoutExtension.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
+  const withoutFormatLabel = label.replace(/\s*\((?:hep|parsed zip)\)\s*$/i, "");
+  const isParsedDataFile = /\.(?:hep|zip)$/i.test(withoutFormatLabel);
+  const withoutExtension = withoutFormatLabel.replace(/\.(?:pdf|hep|zip)$/i, "");
+  const withoutParsedDataSuffix = isParsedDataFile
+    ? withoutExtension.replace(/[._-]?parsed[._-]?data$/i, "")
+    : withoutExtension;
+  const normalized = withoutParsedDataSuffix.trim().replace(/[^a-zA-Z0-9._-]+/g, "_");
   return normalized.length > 0 ? normalized : "floorplan";
 }
 

@@ -252,7 +252,7 @@ interface RendererConfig {
 }
 
 /**
- * A three.js `Group` that represents a loaded PDF or parsed HEPR ZIP scene.
+ * A three.js `Group` that represents a loaded PDF or HEP scene.
  *
  * Add it to your scene like any other object. HEPR derives its PDF view from
  * your `THREE.Camera` and synchronizes itself from three.js `onBeforeRender`,
@@ -274,7 +274,7 @@ export class HeprThreePdfObject extends THREE.Group {
   /** Human-readable source label, usually the file name or URL basename. */
   readonly sourceLabel: string;
 
-  /** Whether this object was loaded from a PDF or a parsed-data ZIP. */
+  /** Whether this object was loaded from a PDF or HEP parsed-data file. */
   readonly sourceKind: LoadedPdfScene["sourceKind"];
 
   /** Native renderer backend used internally by this object. */
