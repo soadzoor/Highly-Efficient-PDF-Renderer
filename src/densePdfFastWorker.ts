@@ -1,16 +1,20 @@
 import {
   compileDensePdfContent,
+  scanDensePdfXObjectReferences,
   DensePdfSyntaxError,
   DensePdfUnsupportedError,
   type DensePdfBounds,
   type DensePdfContentSource,
-  type DensePdfMatrix
+  type DensePdfMatrix,
+  type DensePdfTextFormSummary
 } from "./densePdfContentCompiler";
 import {
   DensePdfBuildError,
   buildDenseTextMiniPdf,
   preflightDensePdfDocument,
-  type DensePdfPageBox
+  type DensePdfPageBox,
+  type DensePdfFormXObject,
+  type DensePdfSelectedPage
 } from "./densePdfDocument";
 import type {
   DensePdfFastCompiledPage,
@@ -53,6 +57,10 @@ const PROGRESS_HEARTBEAT_MS = 150;
 const COMPILE_YIELD_INTERVAL_MS = 50;
 const PREFLIGHT_PROGRESS_END = 0.08;
 const PAGE_PROGRESS_END = 0.92;
+const MAX_FORM_RECURSION_DEPTH = 16;
+const MAX_CLASSIFIED_FORM_COUNT = 256;
+const MAX_DECODED_FORM_BYTES = 64 * 1024 * 1024;
+const MAX_RETAINED_FORM_TRACE_WORDS = 4_000_000;
 
 const workerScope = typeof self === "object" && typeof document === "undefined"
   ? self as unknown as DensePdfWorkerScope
@@ -220,6 +228,14 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
         sourcePageCount
       }, true);
 
+      // Form XObjects are classified independently before the page is
+      // compiled. Summaries let `/Name Do` retain visible text-only Forms,
+      // omit painted Forms whose transformed BBox is clipped out, and fall
+      // back without silently dropping visible vector or raster paint.
+      const availableTextFormXObjects = await classifyDensePdfTextFormXObjects(page, {
+        yieldIntervalMs: COMPILE_YIELD_INTERVAL_MS
+      });
+
       const decodedChunks = observeDecodedChunks(
         page.decodedContentChunks(),
         (processedBytes) => {
@@ -261,7 +277,12 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
       const compiled = await compileDensePdfContent(decodedChunks, {
         pageMatrix,
         pageBounds,
+        fontDependencyKeys: resourceDependencyMap(page.fontDependencies),
         availableExtGStates: page.availableExtGStates,
+        extGStates: page.extGStates,
+        alwaysVisibleOptionalContentProperties:
+          page.alwaysVisibleOptionalContentProperties,
+        availableTextFormXObjects,
         enableSegmentMerge: request.options.enableSegmentMerge,
         enableInvisibleCull: request.options.enableInvisibleCull,
         yieldIntervalMs: COMPILE_YIELD_INTERVAL_MS,
@@ -335,7 +356,9 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
         sourcePageIndex,
         retainedTextContent: compiled.retainedTextContent,
         referencedFonts: new Set(compiled.referencedFonts),
-        referencedProperties: new Set(compiled.referencedProperties)
+        referencedProperties: new Set(compiled.referencedProperties),
+        referencedExtGStates: new Set(compiled.referencedExtGStates),
+        referencedXObjects: new Set(compiled.referencedXObjects)
       }))
     );
     const textMiniPdfMs = nowMs() - textMiniPdfStartedAt;
@@ -345,8 +368,10 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
     // Dropping them avoids cloning/transferring a second text program.
     for (const page of compiledPages) {
       page.compiled.retainedTextContent = new Uint8Array(0);
+      page.compiled.dependencyKeys = [];
       page.compiled.referencedFonts = [];
       page.compiled.referencedProperties = [];
+      page.compiled.referencedExtGStates = [];
     }
 
     progress.update({
@@ -399,6 +424,208 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
     }
     postResult(progress, { kind: "error", error: serializeError(error) });
   }
+}
+
+/**
+ * Recursively classify referenced Form streams. Image/non-Form resources are
+ * ignored while unused, but an actual `Do` must resolve to a supported Form.
+ * Classification is bounded and cycle-safe before any summary reaches the
+ * page compiler.
+ */
+export async function classifyDensePdfTextFormXObjects(
+  page: Pick<DensePdfSelectedPage, "formXObjects">,
+  options: { signal?: AbortSignal; yieldIntervalMs?: number } = {}
+): Promise<ReadonlyMap<string, DensePdfTextFormSummary>> {
+  const state: DensePdfFormClassificationState = {
+    active: new Set(),
+    cache: new Map(),
+    formCount: 0,
+    decodedBytes: 0,
+    retainedTraceWords: 0
+  };
+  const summaries = new Map<string, DensePdfTextFormSummary>();
+  for (const form of page.formXObjects) {
+    options.signal?.throwIfAborted();
+    summaries.set(
+      form.resourceName,
+      await classifyDensePdfForm(form, 0, state, options)
+    );
+  }
+  return summaries;
+}
+
+interface DensePdfFormClassificationState {
+  readonly active: Set<string>;
+  readonly cache: Map<string, Promise<DensePdfTextFormSummary>>;
+  formCount: number;
+  decodedBytes: number;
+  retainedTraceWords: number;
+}
+
+async function classifyDensePdfForm(
+  form: DensePdfFormXObject,
+  depth: number,
+  state: DensePdfFormClassificationState,
+  options: { signal?: AbortSignal; yieldIntervalMs?: number }
+): Promise<DensePdfTextFormSummary> {
+  if (depth > MAX_FORM_RECURSION_DEPTH) {
+    throw new DensePdfUnsupportedError(
+      `Form XObject recursion exceeds the depth limit of ${MAX_FORM_RECURSION_DEPTH}.`,
+      "Do"
+    );
+  }
+  if (state.active.has(form.dependencyKey)) {
+    throw new DensePdfUnsupportedError(
+      `Form XObject /${form.resourceName} participates in a resource cycle.`,
+      "Do"
+    );
+  }
+  const cached = state.cache.get(form.dependencyKey);
+  if (cached) return cached;
+
+  const pending = classifyDensePdfFormUncached(form, depth, state, options);
+  state.cache.set(form.dependencyKey, pending);
+  try {
+    return await pending;
+  } catch (error) {
+    state.cache.delete(form.dependencyKey);
+    throw error;
+  }
+}
+
+async function classifyDensePdfFormUncached(
+  form: DensePdfFormXObject,
+  depth: number,
+  state: DensePdfFormClassificationState,
+  options: { signal?: AbortSignal; yieldIntervalMs?: number }
+): Promise<DensePdfTextFormSummary> {
+  state.formCount += 1;
+  if (state.formCount > MAX_CLASSIFIED_FORM_COUNT) {
+    throw new DensePdfUnsupportedError(
+      `Referenced Form XObjects exceed the limit of ${MAX_CLASSIFIED_FORM_COUNT}.`,
+      "Do"
+    );
+  }
+  state.active.add(form.dependencyKey);
+  try {
+    const content = await collectFormContent(form, state, options.signal);
+    const referencedNames = scanDensePdfXObjectReferences(content);
+    const nestedSummaries = new Map<string, DensePdfTextFormSummary>();
+    for (const resourceName of referencedNames) {
+      options.signal?.throwIfAborted();
+      let nestedForm: DensePdfFormXObject | null;
+      try {
+        nestedForm = form.resolveFormXObject(resourceName);
+      } catch (error) {
+        throw new DensePdfUnsupportedError(
+          `Form XObject /${form.resourceName} cannot resolve /${resourceName}: ${error instanceof Error ? error.message : String(error)}`,
+          "Do"
+        );
+      }
+      if (!nestedForm) {
+        throw new DensePdfUnsupportedError(
+          `Form XObject /${form.resourceName} invokes missing or non-Form XObject /${resourceName}.`,
+          "Do"
+        );
+      }
+      nestedSummaries.set(
+        resourceName,
+        await classifyDensePdfForm(nestedForm, depth + 1, state, options)
+      );
+    }
+
+    const compiled = await compileDensePdfContent(content, {
+      pageMatrix: [1, 0, 0, 1, 0, 0],
+      pageBounds: boxBounds(form.bbox),
+      fontDependencyKeys: resourceDependencyMap(form.fontDependencies),
+      availableExtGStates: form.availableExtGStates,
+      extGStates: form.extGStates,
+      // The original Form is copied verbatim when retained, but the text mini
+      // PDF deliberately has no OCProperties catalog. Reject Form-local `/OC`
+      // marked content instead of treating an all-on source layer as portable.
+      alwaysVisibleOptionalContentProperties: [],
+      availableTextFormXObjects: nestedSummaries,
+      allowPaintedFormXObjects: true,
+      rejectPathPainting: false,
+      classificationOnly: true,
+      enableSegmentMerge: false,
+      enableInvisibleCull: false,
+      totalBytes: content.length,
+      signal: options.signal,
+      yieldIntervalMs: options.yieldIntervalMs ?? COMPILE_YIELD_INTERVAL_MS
+    });
+    if (!compiled.operatorCountTrace) {
+      throw new DensePdfSyntaxError(
+        `Form XObject /${form.resourceName} did not produce an operator-count trace.`
+      );
+    }
+    const retainedTraceWords =
+      compiled.operatorCountTrace.genericRuns.length +
+      compiled.operatorCountTrace.semanticEvents.length +
+      compiled.operatorCountTrace.fontDependencyKeys.length;
+    if (
+      state.retainedTraceWords + retainedTraceWords >
+      MAX_RETAINED_FORM_TRACE_WORDS
+    ) {
+      throw new DensePdfUnsupportedError(
+        `Retained Form operator traces exceed the ${MAX_RETAINED_FORM_TRACE_WORDS}-word safety budget.`,
+        "Do"
+      );
+    }
+    state.retainedTraceWords += retainedTraceWords;
+    return Object.freeze({
+      dependencyKey: form.dependencyKey,
+      bbox: boxBounds(form.bbox),
+      matrix: [...form.matrix] as DensePdfMatrix,
+      operatorCount: compiled.operatorCount,
+      dependencyOpCount: compiled.dependencyOpCount,
+      dependencyKeys: Object.freeze([...compiled.dependencyKeys]),
+      operatorCountTrace: compiled.operatorCountTrace,
+      textShowOpCount: compiled.textShowOpCount,
+      hasNonTextPaint:
+        compiled.pathCount > 0 ||
+        [...nestedSummaries.values()].some((summary) => summary.hasNonTextPaint)
+    });
+  } finally {
+    state.active.delete(form.dependencyKey);
+  }
+}
+
+async function collectFormContent(
+  form: DensePdfFormXObject,
+  state: DensePdfFormClassificationState,
+  signal?: AbortSignal
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  for await (const chunk of form.decodedContentChunks()) {
+    signal?.throwIfAborted();
+    byteLength += chunk.length;
+    if (state.decodedBytes + byteLength > MAX_DECODED_FORM_BYTES) {
+      throw new DensePdfUnsupportedError(
+        `Decoded Form XObjects exceed the ${MAX_DECODED_FORM_BYTES}-byte safety budget.`,
+        "Do"
+      );
+    }
+    chunks.push(chunk);
+  }
+  state.decodedBytes += byteLength;
+  const content = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    content.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return content;
+}
+
+function resourceDependencyMap(
+  dependencies: readonly { resourceName: string; dependencyKey: string }[]
+): ReadonlyMap<string, string> {
+  return new Map(dependencies.map(({ resourceName, dependencyKey }) => [
+    resourceName,
+    dependencyKey
+  ]));
 }
 
 class WorkerProgressEmitter {
@@ -582,6 +809,11 @@ function isDensePdfPageBox(value: DensePdfPageBoxInput): value is DensePdfPageBo
 
 function copyBox(value: DensePdfPageBoxInput, label: string): [number, number, number, number] {
   return normalizeBox(value, label);
+}
+
+function boxBounds(value: DensePdfPageBoxInput): DensePdfBounds {
+  const [minX, minY, maxX, maxY] = normalizeBox(value, "Form XObject BBox");
+  return { minX, minY, maxX, maxY };
 }
 
 function computePdfJsViewBox(

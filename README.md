@@ -195,6 +195,59 @@ const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
 });
 ```
 
+### Server-side PDF to HEP conversion
+
+From a repository checkout, the included Node.js CLI uses the same PDF
+extraction and HEP v6 writer as the client export. Node.js 22.13 or newer is
+required. After installing dependencies, convert either one PDF or every PDF
+below a directory:
+
+```bash
+npm install
+node PDFtoHEP.js ./Level1.pdf
+node PDFtoHEP.js ./path/to/pdf-folder
+```
+
+Use a normal checkout install here: the CLI loads the repository source through
+the development tooling and is not included in the published npm artifact.
+
+Directory scans are recursive and sequential, so large documents do not have
+multiple canvas/parser working sets resident at once. Each PDF runs in a fresh
+child process, which also guarantees that PDF.js and native-canvas memory is
+returned to the operating system before the next file. Inside that process,
+Node's `worker_threads` runs the same dense-PDF worker and `pdf-lib` compiler as
+the browser path, including progress, transferable buffers, and fast-path
+fallback decisions. Conversion workers use a 12,288 MiB V8 heap ceiling by
+default because exceptionally dense plans can exceed Node's standard heap
+limit. An explicit Node
+`--max-old-space-size=<MiB>` argument is preserved for the workers, and
+`HEPR_PDF_TO_HEP_HEAP_MB` provides the same override for automation.
+
+After every attempted conversion, the CLI prints its complete worker wall time
+in hours, minutes, and seconds. The final output includes a per-PDF conversion
+time summary and the total attempted conversion time. PDFs skipped during the
+initial existing-output scan are not timed because no conversion was started;
+an all-skipped run reports that no conversions were attempted.
+
+Each output is placed next to its input using the client naming convention; for
+example, `Level1.pdf` becomes `Level1-parsed-data.hep`. Existing outputs are
+skipped by default. To replace them only after a new HEP has been built
+successfully:
+
+```bash
+node PDFtoHEP.js --force ./path/to/pdf-folder
+```
+
+The Node path uses `@napi-rs/canvas` for PDF raster rendering and WebP/PNG
+encoding. Vector extraction, text indexing, compression, and HEP serialization
+share the client implementation. The shared raster codec explicitly uses WebP
+quality `0.8` in browsers and the equivalent quality `80` in Node so the two
+paths do not inherit different encoder defaults. Browser and Node exports are
+semantically compatible and should have closely comparable raster payload
+sizes, but are not expected to be byte-identical: their canvas/image codecs can
+still produce slightly different pixels or compressed streams, and each
+manifest contains its generation time.
+
 Select pages with Chrome-style, one-based ASCII print syntax:
 
 ```ts
@@ -231,10 +284,25 @@ worker without materializing PDF.js's full operator list. Eligibility is
 content-driven and requires every selected page to use the supported path,
 color, clipping, and text subset; other PDFs fall back atomically to PDF.js.
 The accepted graphics-state subset is deliberately narrow: `/OPM 0` or
-`/OPM 1` with overprint disabled is treated as inert, and even-odd clips use
-the same AABB/compact nested-rectangle representation as ordinary HEPR
-extraction. Alpha, blending, soft masks, active overprint, and other graphics
-state features still fall back to PDF.js.
+`/OPM 1` with overprint disabled, `/SA false`, and a valid `/SM` smoothness
+tolerance on pages without shading-capable resources are treated as inert.
+Normal blending with finite `/CA` and `/ca` opacity is represented in packed
+stroke/fill styles. Even-odd clips use the same AABB/compact nested-rectangle
+representation as ordinary HEPR extraction. Bounded, recursively nested
+text/state/clip-only Form XObjects are preserved in the text mini-PDF,
+including native matrices, bounding boxes, and locally scoped fonts. Declared
+but unused image XObjects are ignored; invoking an image, or invoking a painted
+Form whose transformed bounding box intersects the active clip, falls back to
+PDF.js.
+
+The preflight also recognizes exact nonvisual zero-border Link/Square
+annotations, exact default-all-on CAD optional-content catalogs, and the
+default opaque, non-isolated, non-knockout `/DeviceRGB` page transparency
+group. Accepted annotations are omitted (their interactivity is not retained),
+and accepted optional-content groups are flattened into a static all-visible
+view. Visible annotation appearances, hidden or usage-controlled layers,
+non-Normal blend modes, soft masks, active overprint, and other graphics-state
+features still fall back to PDF.js.
 Set `pdfFastPath: "off"` to disable this optimization for diagnostics or
 differential testing. Fast-path progress uses
 `executionPath: "dense-vector-worker"` and reports inspection and

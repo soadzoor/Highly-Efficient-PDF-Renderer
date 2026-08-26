@@ -64,7 +64,10 @@ const [compilerModule, documentModule, workerModule, extractorModule] = await Pr
 ]);
 const { compileDensePdfContent } = compilerModule;
 const { buildDenseTextMiniPdf, preflightDensePdfDocument } = documentModule;
-const { computeDensePdfPageGeometry } = workerModule;
+const {
+  classifyDensePdfTextFormXObjects,
+  computeDensePdfPageGeometry
+} = workerModule;
 const { extractPdfPageScenes } = extractorModule;
 
 const absoluteInputPath = resolve(inputPath ?? DEFAULT_PDF);
@@ -93,13 +96,21 @@ const pageTimings = [];
 for (let pageIndex = 0; pageIndex < preflight.document.pages.length; pageIndex += 1) {
   const page = preflight.document.pages[pageIndex];
   const geometry = computeDensePdfPageGeometry(page);
+  const availableTextFormXObjects = await classifyDensePdfTextFormXObjects(page);
   const decodeTiming = { elapsedMs: 0, decodedBytes: 0, chunkCount: 0 };
   const measuredContent = measureDecodedContent(page.decodedContentChunks(), decodeTiming);
   let lastProgressAt = 0;
   const compileStartedAt = performance.now();
   const compiled = await compileDensePdfContent(measuredContent, {
     ...geometry,
+    fontDependencyKeys: new Map(page.fontDependencies.map(
+      ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
+    )),
     availableExtGStates: page.availableExtGStates,
+    extGStates: page.extGStates,
+    alwaysVisibleOptionalContentProperties:
+      page.alwaysVisibleOptionalContentProperties,
+    availableTextFormXObjects,
     enableSegmentMerge: true,
     enableInvisibleCull: true,
     yieldIntervalMs: 50,
@@ -123,6 +134,8 @@ for (let pageIndex = 0; pageIndex < preflight.document.pages.length; pageIndex +
     retainedTextContent: compiled.retainedTextContent,
     referencedFonts: new Set(compiled.referencedFonts),
     referencedProperties: new Set(compiled.referencedProperties),
+    referencedExtGStates: new Set(compiled.referencedExtGStates),
+    referencedXObjects: new Set(compiled.referencedXObjects),
     compiled
   });
   pageTimings.push({
@@ -142,7 +155,9 @@ const miniPdf = await buildDenseTextMiniPdf(
     sourcePageIndex: page.sourcePageIndex,
     retainedTextContent: page.retainedTextContent,
     referencedFonts: page.referencedFonts,
-    referencedProperties: page.referencedProperties
+    referencedProperties: page.referencedProperties,
+    referencedExtGStates: page.referencedExtGStates,
+    referencedXObjects: page.referencedXObjects
   }))
 );
 const miniPdfWallMs = performance.now() - miniPdfStartedAt;
@@ -160,6 +175,27 @@ assert.equal(
   compiledPages.length,
   "The text mini-PDF must produce one PDF.js scene per compiled page."
 );
+for (let pageIndex = 0; pageIndex < textScenes.length; pageIndex += 1) {
+  const scene = textScenes[pageIndex];
+  const unexpectedPaintCount =
+    scene.segmentCount +
+    scene.fillPathCount +
+    scene.fillSegmentCount +
+    scene.gradientCount +
+    scene.gradientFillPathCount +
+    scene.gradientFillSegmentCount +
+    scene.gradientStrokeRunCount +
+    scene.gradientStrokeSegmentCount +
+    scene.imagePaintOpCount +
+    scene.pathCount +
+    scene.rasterLayers.length +
+    scene.rasterLayerData.length;
+  assert.equal(
+    unexpectedPaintCount,
+    0,
+    `Text mini-PDF page ${pageIndex + 1} unexpectedly retained visible paint.`
+  );
+}
 
 const fastCounts = summarizeFastCounts(compiledPages, textScenes);
 const totalDecodeMs = sum(pageTimings, "decodeMs");

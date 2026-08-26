@@ -5,6 +5,7 @@ import {
   PDFDocument,
   PDFHexString,
   PDFName,
+  PDFRawStream,
   StandardFonts
 } from "pdf-lib";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
@@ -62,6 +63,15 @@ async function makeEligibleFixture() {
       op: false
     }))
   );
+  extGStates.set(
+    PDFName.of("Alpha"),
+    document.context.register(document.context.obj({
+      Type: "ExtGState",
+      BM: "Normal",
+      CA: 0.4,
+      ca: 0.2
+    }))
+  );
   page.node.Resources().set(PDFName.ExtGState, extGStates);
 
   return document.save({ useObjectStreams: false });
@@ -102,6 +112,59 @@ async function makeExtGStateFixture(entries, resourceName = "GS0") {
   return document.save({ useObjectStreams: false });
 }
 
+async function makeAnnotationFixture(subtype, entries = {}) {
+  const document = await PDFDocument.create({ updateMetadata: false });
+  const page = document.addPage([100, 80]);
+  const { useBorderStyleOnly = false, ...annotationEntries } = entries;
+  const annotation = document.context.register(document.context.obj({
+    Type: "Annot",
+    Subtype: subtype,
+    Rect: [0, 0, 10, 10],
+    ...(useBorderStyleOnly ? {} : { Border: [0, 0, 0] }),
+    ...annotationEntries
+  }));
+  page.node.set(PDFName.Annots, document.context.obj([annotation]));
+  return document.save({ useObjectStreams: false });
+}
+
+async function makeOptionalContentFixture({
+  hidden = false,
+  defaultConfigEntries = {},
+  groupEntries = {},
+  membership = false
+} = {}) {
+  const document = await PDFDocument.create({ updateMetadata: false });
+  const page = document.addPage([100, 80]);
+  const group = document.context.register(document.context.obj({
+    Type: "OCG",
+    Name: PDFHexString.fromText("Visible layer"),
+    ...groupEntries
+  }));
+  document.catalog.set(PDFName.of("OCProperties"), document.context.obj({
+    OCGs: [group],
+    D: {
+      Order: [group],
+      OFF: hidden ? [group] : [],
+      ...defaultConfigEntries
+    }
+  }));
+  const properties = document.context.obj({});
+  properties.set(
+    PDFName.of("Layer"),
+    membership
+      ? document.context.register(document.context.obj({ Type: "OCMD", OCGs: [group] }))
+      : group
+  );
+  page.node.Resources().set(PDFName.of("Properties"), properties);
+  page.node.set(
+    PDFName.Contents,
+    document.context.register(
+      document.context.stream(encoder.encode("/OC /Layer BDC 0 0 m 10 0 l S EMC\n"))
+    )
+  );
+  return document.save({ useObjectStreams: false });
+}
+
 async function readTextLanguage(bytes) {
   const loadingTask = getDocument({ data: new Uint8Array(bytes), verbosity: 0 });
   const pdf = await loadingTask.promise;
@@ -131,7 +194,17 @@ async function run() {
   assert.equal(page.userUnit, 2);
   assert.equal(page.availableFonts.length, 1);
   assert.deepEqual(page.availableProperties, ["MC0"]);
-  assert.deepEqual(page.availableExtGStates, ["GSFalse", "R10"]);
+  assert.deepEqual(page.availableExtGStates, ["Alpha", "GSFalse", "R10"]);
+  assert.deepEqual(page.extGStates, [
+    {
+      resourceName: "Alpha",
+      strokeAlpha: 0.4,
+      fillAlpha: 0.2,
+      emitsPdfJsOperator: true
+    },
+    { resourceName: "GSFalse", emitsPdfJsOperator: false },
+    { resourceName: "R10", emitsPdfJsOperator: false }
+  ]);
 
   const decodedContent = await collectChunks(page.decodedContentChunks());
   assert.ok(decodedContent.length > 0);
@@ -142,7 +215,9 @@ async function run() {
     sourcePageIndex: 0,
     retainedTextContent: decodedContent,
     referencedFonts: new Set(page.availableFonts),
-    referencedProperties: new Set(page.availableProperties)
+    referencedProperties: new Set(page.availableProperties),
+    referencedExtGStates: new Set(["Alpha"]),
+    referencedXObjects: new Set()
   }]);
   assert.ok(mini.bytes.length > 0);
   assert.ok(mini.releasedSourceContentObjects >= 1);
@@ -159,8 +234,10 @@ async function run() {
   const miniResources = miniPage.node.Resources();
   const miniFonts = miniResources.lookup(PDFName.Font, PDFDict);
   const miniProperties = miniResources.lookup(PDFName.of("Properties"), PDFDict);
+  const miniExtGStates = miniResources.lookup(PDFName.ExtGState, PDFDict);
   assert.equal(miniFonts.keys().length, 1);
   assert.deepEqual(miniProperties.keys().map((name) => name.decodeText()), ["MC0"]);
+  assert.deepEqual(miniExtGStates.keys().map((name) => name.decodeText()), ["Alpha"]);
 
   await assert.rejects(
     async () => collectChunks(page.decodedContentChunks()),
@@ -171,7 +248,8 @@ async function run() {
       sourcePageIndex: 0,
       retainedTextContent: encoder.encode("q Q\n"),
       referencedFonts: new Set(),
-      referencedProperties: new Set()
+      referencedProperties: new Set(),
+      referencedXObjects: new Set()
     }]),
     (error) => error instanceof DensePdfBuildError && error.code === "source-released"
   );
@@ -219,7 +297,8 @@ async function run() {
     sourcePageIndex: 0,
     retainedTextContent: encoder.encode("q Q\n"),
     referencedFonts: new Set(),
-    referencedProperties: new Set()
+    referencedProperties: new Set(),
+    referencedXObjects: new Set()
   }]);
 
   const annotated = await PDFDocument.create({ updateMetadata: false });
@@ -235,6 +314,49 @@ async function run() {
     "annotations"
   );
 
+  const nonVisualLink = await preflightDensePdfDocument(
+    await makeAnnotationFixture("Link", { Dest: [null, "Fit"] })
+  );
+  assert.equal(nonVisualLink.eligible, true);
+  const nonVisualSquare = await preflightDensePdfDocument(
+    await makeAnnotationFixture("Square", {
+      Contents: "Review note",
+      F: 4,
+      NM: "square-1",
+      T: "Reviewer"
+    })
+  );
+  assert.equal(nonVisualSquare.eligible, true);
+  const nonVisualBorderStyleLink = await preflightDensePdfDocument(
+    await makeAnnotationFixture("Link", {
+      useBorderStyleOnly: true,
+      BS: { W: 0 },
+      A: { S: "URI", URI: "https://example.invalid/" },
+      StructParent: 1,
+      F: 4
+    })
+  );
+  assert.equal(nonVisualBorderStyleLink.eligible, true);
+  await expectFallback(
+    await makeAnnotationFixture("Link", { Border: [0, 0, 1] }),
+    "annotations"
+  );
+  await expectFallback(
+    await makeAnnotationFixture("Link", { AP: {} }),
+    "annotations"
+  );
+  await expectFallback(
+    await makeAnnotationFixture("Link", {
+      useBorderStyleOnly: true,
+      BS: { W: 1 }
+    }),
+    "annotations"
+  );
+  await expectFallback(
+    await makeAnnotationFixture("Square", { IC: [1, 0, 0] }),
+    "annotations"
+  );
+
   const optionalContent = await PDFDocument.create({ updateMetadata: false });
   optionalContent.addPage();
   optionalContent.catalog.set(
@@ -243,6 +365,31 @@ async function run() {
   );
   await expectFallback(
     await optionalContent.save({ useObjectStreams: false }),
+    "optional-content"
+  );
+
+  const allVisibleOptionalContent = await preflightDensePdfDocument(
+    await makeOptionalContentFixture()
+  );
+  assert.equal(allVisibleOptionalContent.eligible, true);
+  assert.deepEqual(
+    allVisibleOptionalContent.document.pages[0].alwaysVisibleOptionalContentProperties,
+    ["Layer"]
+  );
+  await expectFallback(
+    await makeOptionalContentFixture({ hidden: true }),
+    "optional-content"
+  );
+  await expectFallback(
+    await makeOptionalContentFixture({ defaultConfigEntries: { AS: [] } }),
+    "optional-content"
+  );
+  await expectFallback(
+    await makeOptionalContentFixture({ groupEntries: { Usage: {} } }),
+    "optional-content"
+  );
+  await expectFallback(
+    await makeOptionalContentFixture({ membership: true }),
     "optional-content"
   );
 
@@ -269,6 +416,207 @@ async function run() {
     "unsupported-resource"
   );
 
+  const inertTransparencyGroup = await PDFDocument.create({ updateMetadata: false });
+  const inertGroupedPage = inertTransparencyGroup.addPage();
+  inertGroupedPage.node.set(
+    PDFName.of("Group"),
+    inertTransparencyGroup.context.obj({
+      Type: "Group",
+      S: "Transparency",
+      CS: "DeviceRGB",
+      I: false,
+      K: false
+    })
+  );
+  assert.equal(
+    (await preflightDensePdfDocument(
+      await inertTransparencyGroup.save({ useObjectStreams: false })
+    )).eligible,
+    true
+  );
+
+  for (const groupEntries of [
+    { Type: "Group", S: "Transparency", CS: "DeviceRGB", K: true },
+    { Type: "Group", S: "Transparency", CS: "DeviceCMYK" },
+    { Type: "Group", S: "Transparency", CS: "DeviceRGB", Extra: 1 }
+  ]) {
+    const unsupportedGroupDocument = await PDFDocument.create({
+      updateMetadata: false
+    });
+    unsupportedGroupDocument.addPage().node.set(
+      PDFName.of("Group"),
+      unsupportedGroupDocument.context.obj(groupEntries)
+    );
+    await expectFallback(
+      await unsupportedGroupDocument.save({ useObjectStreams: false }),
+      "unsupported-resource"
+    );
+  }
+
+  const translucentPageGroup = await PDFDocument.create({ updateMetadata: false });
+  const translucentGroupedPage = translucentPageGroup.addPage();
+  translucentGroupedPage.node.set(
+    PDFName.of("Group"),
+    translucentPageGroup.context.obj({
+      Type: "Group",
+      S: "Transparency",
+      CS: "DeviceRGB"
+    })
+  );
+  translucentGroupedPage.node.Resources().set(
+    PDFName.ExtGState,
+    translucentPageGroup.context.obj({
+      Alpha: translucentPageGroup.context.register(
+        translucentPageGroup.context.obj({
+          Type: "ExtGState",
+          BM: "Normal",
+          CA: 0.5,
+          ca: 0.5
+        })
+      )
+    })
+  );
+  await expectFallback(
+    await translucentPageGroup.save({ useObjectStreams: false }),
+    "unsupported-resource"
+  );
+
+  const formDocument = await PDFDocument.create({ updateMetadata: false });
+  const formPage = formDocument.addPage([200, 100]);
+  const formFont = await formDocument.embedFont(StandardFonts.HelveticaBold);
+  const formFonts = formDocument.context.obj({});
+  formFonts.set(PDFName.of("FLocal"), formFont.ref);
+  const formResources = formDocument.context.obj({});
+  formResources.set(PDFName.Font, formFonts);
+  formResources.set(PDFName.ExtGState, formDocument.context.obj({
+    Alpha: formDocument.context.register(formDocument.context.obj({
+      Type: "ExtGState",
+      BM: "Normal",
+      CA: 0.5,
+      ca: 0.5
+    }))
+  }));
+  const formStream = formDocument.context.flateStream(
+    encoder.encode("/Alpha gs BT /FLocal 12 Tf (Form text) Tj ET\n")
+  );
+  formStream.dict.set(PDFName.Type, PDFName.XObject);
+  formStream.dict.set(PDFName.of("Subtype"), PDFName.of("Form"));
+  formStream.dict.set(PDFName.of("FormType"), formDocument.context.obj(1));
+  formStream.dict.set(PDFName.of("BBox"), formDocument.context.obj([0, 0, 80, 20]));
+  formStream.dict.set(
+    PDFName.of("Matrix"),
+    formDocument.context.obj([1, 0, 0, 1, 10, 15])
+  );
+  formStream.dict.set(
+    PDFName.Resources,
+    formDocument.context.register(formResources)
+  );
+  const formRef = formDocument.context.register(formStream);
+  const unusedFormStream = formDocument.context.stream(encoder.encode("q Q\n"), {
+    Type: "XObject",
+    Subtype: "Form",
+    BBox: [0, 0, 1, 1],
+    Resources: {}
+  });
+  const unusedFormRef = formDocument.context.register(unusedFormStream);
+  const formResourcesByName = formDocument.context.obj({});
+  formResourcesByName.set(PDFName.of("Fm0"), formRef);
+  formResourcesByName.set(PDFName.of("FmAlias"), formRef);
+  formResourcesByName.set(PDFName.of("FmUnused"), unusedFormRef);
+  formPage.node.Resources().set(PDFName.XObject, formResourcesByName);
+  const invokeForm = formDocument.context.register(
+    formDocument.context.stream(encoder.encode("/Fm0 Do\n"))
+  );
+  formPage.node.set(PDFName.Contents, invokeForm);
+
+  const formBytes = await formDocument.save({ useObjectStreams: false });
+  const formResult = await preflightDensePdfDocument(formBytes);
+  assert.equal(formResult.eligible, true);
+  const selectedFormPage = formResult.document.pages[0];
+  assert.equal(selectedFormPage.formXObjects.length, 3);
+  const selectedForm = selectedFormPage.formXObjects.find(
+    (form) => form.resourceName === "Fm0"
+  );
+  const selectedFormAlias = selectedFormPage.formXObjects.find(
+    (form) => form.resourceName === "FmAlias"
+  );
+  assert.ok(selectedForm);
+  assert.ok(selectedFormAlias);
+  assert.equal(selectedForm.resourceName, "Fm0");
+  assert.deepEqual(selectedForm.bbox, {
+    left: 0,
+    bottom: 0,
+    right: 80,
+    top: 20
+  });
+  assert.deepEqual(selectedForm.matrix, [1, 0, 0, 1, 10, 15]);
+  assert.equal(selectedForm.encodedContentBytes, formStream.contents.byteLength);
+  assert.deepEqual(selectedForm.availableExtGStates, ["Alpha"]);
+  assert.deepEqual(selectedForm.extGStates, [{
+    resourceName: "Alpha",
+    strokeAlpha: 0.5,
+    fillAlpha: 0.5,
+    emitsPdfJsOperator: true
+  }]);
+  assert.equal(
+    new TextDecoder().decode(await collectChunks(selectedForm.decodedContentChunks())),
+    "/Alpha gs BT /FLocal 12 Tf (Form text) Tj ET\n"
+  );
+
+  const formMini = await buildDenseTextMiniPdf(formResult.document, [{
+    sourcePageIndex: 0,
+    retainedTextContent: encoder.encode("/Fm0 Do\n"),
+    referencedFonts: new Set(),
+    referencedProperties: new Set(),
+    referencedXObjects: new Set(["Fm0"])
+  }]);
+  const formMiniDocument = await PDFDocument.load(formMini.bytes, {
+    updateMetadata: false
+  });
+  const copiedXObjects = formMiniDocument
+    .getPage(0)
+    .node.Resources()
+    .lookup(PDFName.XObject, PDFDict);
+  assert.deepEqual(
+    copiedXObjects.keys().map((name) => name.decodeText()),
+    ["Fm0"]
+  );
+  const copiedForm = formMiniDocument.context.lookup(
+    copiedXObjects.get(PDFName.of("Fm0"))
+  );
+  assert.ok(copiedForm instanceof PDFRawStream);
+  const copiedFormResources = copiedForm.dict.lookup(PDFName.Resources, PDFDict);
+  assert.equal(copiedFormResources.lookup(PDFName.Font, PDFDict).keys().length, 1);
+  assert.equal(copiedFormResources.lookup(PDFName.ExtGState, PDFDict).keys().length, 1);
+  await assert.rejects(
+    async () => collectChunks(selectedForm.decodedContentChunks()),
+    (error) => error instanceof DensePdfBuildError && error.code === "source-released"
+  );
+  await assert.rejects(
+    async () => collectChunks(selectedFormAlias.decodedContentChunks()),
+    (error) => error instanceof DensePdfBuildError && error.code === "source-released"
+  );
+
+  const optionalFormDocument = await PDFDocument.create({ updateMetadata: false });
+  const optionalFormPage = optionalFormDocument.addPage();
+  const optionalForm = optionalFormDocument.context.stream(encoder.encode("q Q\n"), {
+    Type: "XObject",
+    Subtype: "Form",
+    BBox: [0, 0, 10, 10],
+    Resources: {},
+    OC: { Type: "OCG", Name: PDFHexString.fromText("Optional form") }
+  });
+  optionalFormPage.node.Resources().set(
+    PDFName.XObject,
+    optionalFormDocument.context.obj({
+      FmOptional: optionalFormDocument.context.register(optionalForm)
+    })
+  );
+  await expectFallback(
+    await optionalFormDocument.save({ useObjectStreams: false }),
+    "optional-content"
+  );
+
   const unsupportedResource = await PDFDocument.create({ updateMetadata: false });
   const resourcePage = unsupportedResource.addPage();
   const xObject = unsupportedResource.context.register(
@@ -280,10 +628,41 @@ async function run() {
   const xObjects = unsupportedResource.context.obj({});
   xObjects.set(PDFName.of("X0"), xObject);
   resourcePage.node.Resources().set(PDFName.XObject, xObjects);
-  await expectFallback(
-    await unsupportedResource.save({ useObjectStreams: false }),
-    "unsupported-resource"
+  const unusedImageResult = await preflightDensePdfDocument(
+    await unsupportedResource.save({ useObjectStreams: false })
   );
+  assert.equal(unusedImageResult.eligible, true);
+  assert.deepEqual(unusedImageResult.document.pages[0].formXObjects, []);
+
+  const nestedXObjectDocument = await PDFDocument.create({ updateMetadata: false });
+  const nestedXObjectPage = nestedXObjectDocument.addPage();
+  const nestedImage = nestedXObjectDocument.context.register(
+    nestedXObjectDocument.context.stream(new Uint8Array([0]), {
+      Type: "XObject",
+      Subtype: "Image"
+    })
+  );
+  const nestedObjects = nestedXObjectDocument.context.obj({});
+  nestedObjects.set(PDFName.of("Im0"), nestedImage);
+  const nestedFormResources = nestedXObjectDocument.context.obj({});
+  nestedFormResources.set(PDFName.XObject, nestedObjects);
+  const nestedForm = nestedXObjectDocument.context.stream(encoder.encode("/Im0 Do\n"), {
+    Type: "XObject",
+    Subtype: "Form",
+    BBox: [0, 0, 10, 10]
+  });
+  nestedForm.dict.set(PDFName.Resources, nestedFormResources);
+  const nestedFormRef = nestedXObjectDocument.context.register(nestedForm);
+  const outerObjects = nestedXObjectDocument.context.obj({});
+  outerObjects.set(PDFName.of("Fm0"), nestedFormRef);
+  nestedXObjectPage.node.Resources().set(PDFName.XObject, outerObjects);
+  const nestedImageResult = await preflightDensePdfDocument(
+    await nestedXObjectDocument.save({ useObjectStreams: false })
+  );
+  assert.equal(nestedImageResult.eligible, true);
+  const nestedImageForm = nestedImageResult.document.pages[0].formXObjects[0];
+  assert.equal(nestedImageForm.resourceName, "Fm0");
+  assert.equal(nestedImageForm.resolveFormXObject("Im0"), null);
 
   // `/OPM` only selects the algorithm used if overprint is enabled. CAD PDFs
   // commonly emit it while leaving `/OP` and `/op` at their false defaults.
@@ -302,6 +681,29 @@ async function run() {
     ["GSOff"]
   );
 
+  const inertStrokeSettings = await preflightDensePdfDocument(
+    await makeExtGStateFixture({ SA: false, SM: 0.5 }, "GSStrokeDefaults")
+  );
+  assert.equal(inertStrokeSettings.eligible, true);
+  assert.deepEqual(
+    inertStrokeSettings.document.pages[0].availableExtGStates,
+    ["GSStrokeDefaults"]
+  );
+
+  const normalAlpha = await preflightDensePdfDocument(
+    await makeExtGStateFixture(
+      { Type: "ExtGState", BM: "Normal", CA: 0.4, ca: 0.2 },
+      "Alpha"
+    )
+  );
+  assert.equal(normalAlpha.eligible, true);
+  assert.deepEqual(normalAlpha.document.pages[0].extGStates, [{
+    resourceName: "Alpha",
+    strokeAlpha: 0.4,
+    fillAlpha: 0.2,
+    emitsPdfJsOperator: true
+  }]);
+
   for (const [entries, resourceName] of [
     [{ Type: "ExtGState", OP: true }, "StrokeOverprint"],
     [{ Type: "ExtGState", op: true }, "FillOverprint"],
@@ -309,10 +711,16 @@ async function run() {
     [{ Type: "ExtGState", OPM: 0.5 }, "BadModeInteger"],
     [{ Type: "ExtGState", OPM: "invalid" }, "BadMode"],
     [{ Type: "NotExtGState", OPM: 1 }, "BadType"],
-    [{ Type: "ExtGState", CA: 1 }, "StrokeOpacity"],
-    [{ Type: "ExtGState", ca: 1 }, "FillOpacity"],
-    [{ Type: "ExtGState", BM: "Normal" }, "BlendMode"],
-    [{ Type: "ExtGState", SMask: "None" }, "SoftMask"]
+    [{ Type: "ExtGState", CA: -0.1 }, "BadStrokeOpacityLow"],
+    [{ Type: "ExtGState", CA: 1.1 }, "BadStrokeOpacityHigh"],
+    [{ Type: "ExtGState", ca: "invalid" }, "BadFillOpacity"],
+    [{ Type: "ExtGState", BM: "Multiply" }, "BlendMode"],
+    [{ Type: "ExtGState", SMask: "None" }, "SoftMask"],
+    [{ Type: "ExtGState", SA: true }, "StrokeAdjustment"],
+    [{ Type: "ExtGState", SA: 0 }, "BadStrokeAdjustment"],
+    [{ Type: "ExtGState", SM: -0.1 }, "BadSmoothnessLow"],
+    [{ Type: "ExtGState", SM: 1.1 }, "BadSmoothnessHigh"],
+    [{ Type: "ExtGState", SM: "invalid" }, "BadSmoothnessType"]
   ]) {
     const fallback = await expectFallback(
       await makeExtGStateFixture(entries, resourceName),

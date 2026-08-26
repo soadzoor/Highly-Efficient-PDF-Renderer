@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createCanvas, ImageData as NodeImageData } from "@napi-rs/canvas";
 import JSZip from "jszip";
 import { createServer } from "vite";
 
@@ -68,6 +69,111 @@ function createRasterScene(seedScene, width, height, data) {
   };
 }
 
+async function assertRasterWebpQualityParity(rasterImageCodec) {
+  const width = 192;
+  const height = 128;
+  const rgba = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      rgba[offset] = (x * 3 + y * 2 + (x * y) % 17) & 0xff;
+      rgba[offset + 1] = (x + y * 5 + (x * y) % 31) & 0xff;
+      rgba[offset + 2] = (x * 7 + y * 3 + (x ^ y)) & 0xff;
+      rgba[offset + 3] = 0xff;
+    }
+  }
+
+  const canvas = createCanvas(width, height);
+  let quality80Webp;
+  let quality92Webp;
+  let png;
+  try {
+    const context = canvas.getContext("2d");
+    context.putImageData(
+      new NodeImageData(new Uint8ClampedArray(rgba), width, height),
+      0,
+      0
+    );
+    [quality80Webp, quality92Webp, png] = await Promise.all([
+      canvas.encode("webp", 80),
+      canvas.encode("webp", 92),
+      canvas.encode("png")
+    ]);
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+
+  const nodeEncoded = await rasterImageCodec.encodeRasterRgbaAsBestImage(
+    width,
+    height,
+    rgba
+  );
+  assert.equal(rasterImageCodec.RASTER_WEBP_QUALITY, 0.8);
+  assert.equal(nodeEncoded?.encoding, "webp");
+  assert.deepEqual(nodeEncoded?.bytes, new Uint8Array(quality80Webp));
+  assert.ok(
+    nodeEncoded.bytes.byteLength < quality92Webp.byteLength,
+    "the parity quality must avoid @napi-rs/canvas's larger quality-92 default"
+  );
+
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const previousImageData = Object.getOwnPropertyDescriptor(globalThis, "ImageData");
+  const browserCalls = [];
+  try {
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: {
+        createElement(tagName) {
+          assert.equal(tagName, "canvas");
+          return {
+            width: 0,
+            height: 0,
+            getContext: () => ({ putImageData() {} }),
+            toBlob(callback, mimeType, quality) {
+              browserCalls.push({ mimeType, quality });
+              const bytes = mimeType === "image/webp" ? quality80Webp : png;
+              callback(new Blob([bytes], { type: mimeType }));
+            }
+          };
+        }
+      }
+    });
+    Object.defineProperty(globalThis, "ImageData", {
+      configurable: true,
+      value: class SyntheticBrowserImageData {
+        constructor(data, imageWidth, imageHeight) {
+          this.data = data;
+          this.width = imageWidth;
+          this.height = imageHeight;
+        }
+      }
+    });
+
+    const browserEncoded = await rasterImageCodec.encodeRasterRgbaAsBestImage(
+      width,
+      height,
+      rgba
+    );
+    assert.equal(browserEncoded?.encoding, "webp");
+    assert.deepEqual(browserCalls, [
+      { mimeType: "image/webp", quality: 0.8 },
+      { mimeType: "image/png", quality: undefined }
+    ]);
+  } finally {
+    if (previousDocument) {
+      Object.defineProperty(globalThis, "document", previousDocument);
+    } else {
+      delete globalThis.document;
+    }
+    if (previousImageData) {
+      Object.defineProperty(globalThis, "ImageData", previousImageData);
+    } else {
+      delete globalThis.ImageData;
+    }
+  }
+}
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRootDir = path.resolve(scriptDir, "..");
 const seedHepPath = path.join(
@@ -87,10 +193,13 @@ const viteServer = await createServer({
 });
 
 try {
-  const [zipBuilder, parsedData] = await Promise.all([
+  const [zipBuilder, parsedData, rasterImageCodec] = await Promise.all([
     viteServer.ssrLoadModule("/src/parsedDataZipBuilder.ts"),
-    viteServer.ssrLoadModule("/src/parsedDataZip.ts")
+    viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
+    viteServer.ssrLoadModule("/src/rasterImageCodec.ts")
   ]);
+
+  await assertRasterWebpQualityParity(rasterImageCodec);
 
   const seedBytes = await readFile(seedHepPath);
   const seedScene = await parsedData.loadSceneFromParsedDataZip(

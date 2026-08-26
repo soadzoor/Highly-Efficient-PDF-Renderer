@@ -21,6 +21,9 @@ await testPathsTransformsAndCurves();
 await testClippingAndDashes();
 await testDeviceColorsAndMetadataCounts();
 await testTextAndMarkedContentRetention();
+await testExtGStateOpacityAndOptionalContent();
+await testTextFormXObjects();
+await testClassificationOnlyAccounting();
 await testUnsupportedAndMalformedContent();
 await testCancellationAndProgress();
 await testMergeCullAndFillBoundaries();
@@ -37,6 +40,14 @@ async function compile(content, options = {}) {
     pageMatrix: options.pageMatrix ?? [...DEFAULT_OPTIONS.pageMatrix],
     pageBounds: options.pageBounds ?? { ...DEFAULT_OPTIONS.pageBounds }
   });
+}
+
+function operatorCountTrace(genericRuns, semanticEvents = [], fontDependencyKeys = []) {
+  return {
+    genericRuns: Uint32Array.from(genericRuns),
+    semanticEvents: Uint32Array.from(semanticEvents),
+    fontDependencyKeys
+  };
 }
 
 async function testChunkBoundaryLexer() {
@@ -267,6 +278,269 @@ async function testTextAndMarkedContentRetention() {
   assert.equal((await compile("/Point MP /Point << /MCID 1 >> DP")).operatorCount, 0);
 }
 
+async function testExtGStateOpacityAndOptionalContent() {
+  const extGStates = [
+    {
+      resourceName: "Alpha",
+      strokeAlpha: 0.4,
+      fillAlpha: 0.2,
+      emitsPdfJsOperator: true
+    },
+    {
+      resourceName: "Opaque",
+      strokeAlpha: 1,
+      fillAlpha: 1,
+      emitsPdfJsOperator: true
+    }
+  ];
+  const scene = await compile([
+    "/Alpha gs",
+    "0 0 m 10 0 l S",
+    "0 0 2 2 re f",
+    "q /Opaque gs 0 1 m 10 1 l S Q",
+    "0 2 m 10 2 l S"
+  ].join("\n"), {
+    extGStates,
+    enableInvisibleCull: false
+  });
+  assert.equal(scene.operatorCount, 8);
+  assert.deepEqual(scene.referencedExtGStates, ["Alpha", "Opaque"]);
+  assert.match(decoder.decode(scene.retainedTextContent), /\/Alpha gs/);
+  assert.match(decoder.decode(scene.retainedTextContent), /\/Opaque gs/);
+  assert.ok(Math.abs(scene.primitiveMeta[3] - 0.4) < 1e-6);
+  assert.ok(Math.abs(scene.primitiveMeta[7] - 1) < 1e-6);
+  assert.ok(Math.abs(scene.primitiveMeta[11] - 0.4) < 1e-6);
+  assert.ok(Math.abs(scene.fillPathMetaC[3] - 0.2) < 1e-6);
+
+  const translucentDuplicates = await compile(
+    "/Alpha gs 0 0 m 10 0 l S 10 0 m 0 0 l S",
+    { extGStates }
+  );
+  assert.equal(translucentDuplicates.segmentCount, 2);
+  assert.equal(translucentDuplicates.discardedDuplicateCount, 0);
+
+  const transparent = await compile(
+    "/Invisible gs 0 0 m 10 0 l S 0 0 2 2 re f",
+    {
+      extGStates: [{
+        resourceName: "Invisible",
+        strokeAlpha: 0,
+        fillAlpha: 0,
+        emitsPdfJsOperator: true
+      }]
+    }
+  );
+  assert.equal(transparent.segmentCount, 0);
+  assert.equal(transparent.fillPathCount, 0);
+  assert.equal(transparent.discardedTransparentCount, 1);
+
+  const flattenedLayer = await compile(
+    "/OC /VisibleLayer BDC 0 0 m 10 0 l S EMC",
+    { alwaysVisibleOptionalContentProperties: ["VisibleLayer"] }
+  );
+  assert.equal(flattenedLayer.operatorCount, 3);
+  assert.deepEqual(flattenedLayer.referencedProperties, []);
+  assert.equal(
+    decoder.decode(flattenedLayer.retainedTextContent),
+    "/Span BMC\nEMC\n"
+  );
+  await expectUnsupported("/OC /HiddenLayer BDC EMC", "BDC", {
+    alwaysVisibleOptionalContentProperties: ["VisibleLayer"]
+  });
+}
+
+async function testTextFormXObjects() {
+  const formBounds = { minX: 0, minY: 0, maxX: 10, maxY: 10 };
+  const availableTextFormXObjects = new Map([
+    ["Footer", {
+      dependencyKey: "12 0 R",
+      bbox: formBounds,
+      matrix: [1, 0, 0, 1, 0, 0],
+      operatorCount: 7,
+      dependencyOpCount: 1,
+      dependencyKeys: ["20 0 R"],
+      operatorCountTrace: operatorCountTrace([0, 5], [1], ["20 0 R"]),
+      textShowOpCount: 2,
+      hasNonTextPaint: false
+    }],
+    ["FooterAlias", {
+      dependencyKey: "12 0 R",
+      bbox: formBounds,
+      matrix: [1, 0, 0, 1, 0, 0],
+      operatorCount: 7,
+      dependencyOpCount: 1,
+      dependencyKeys: ["20 0 R"],
+      operatorCountTrace: operatorCountTrace([0, 5], [1], ["20 0 R"]),
+      textShowOpCount: 2,
+      hasNonTextPaint: false
+    }]
+  ]);
+  const scene = await compile("/Footer Do /FooterAlias Do", {
+    availableTextFormXObjects
+  });
+  assert.equal(scene.operatorCount, 17);
+  assert.equal(scene.dependencyOpCount, 1);
+  assert.equal(scene.textShowOpCount, 4);
+  assert.deepEqual(scene.referencedXObjects, ["Footer", "FooterAlias"]);
+  assert.equal(
+    decoder.decode(scene.retainedTextContent),
+    "/Footer Do\n/FooterAlias Do\n"
+  );
+
+  const sharedPageAndFormFont = await compile(
+    "BT /PageAlias 10 Tf (page) Tj ET /Footer Do",
+    {
+      availableTextFormXObjects,
+      fontDependencyKeys: new Map([["PageAlias", "20 0 R"]])
+    }
+  );
+  assert.equal(sharedPageAndFormFont.dependencyOpCount, 1);
+  assert.deepEqual(sharedPageAndFormFont.dependencyKeys, ["20 0 R"]);
+
+  // PDF.js flushes an OperatorList after 1000 weighted ops, or on Q/ET once
+  // it reaches 995. The caller's 980-op prefix shifts a flush into this Form,
+  // so its font dependency must be emitted a second time. An aggregate Form
+  // count underreported this fixture as 1003; the semantic trace yields 1004.
+  const repeatedTextFormContent = Array.from(
+    { length: 5 },
+    (_, index) => `BT /F1 10 Tf (${index}) Tj ET`
+  ).join("\n");
+  const classifiedRepeatedTextForm = await compile(repeatedTextFormContent, {
+    classificationOnly: true,
+    fontDependencyKeys: new Map([["F1", "20 0 R"]]),
+    enableSegmentMerge: false,
+    enableInvisibleCull: false
+  });
+  assert.ok(classifiedRepeatedTextForm.operatorCountTrace);
+  const shiftedFlushSummary = new Map([["Shifted", {
+    dependencyKey: "40 0 R",
+    bbox: formBounds,
+    matrix: [1, 0, 0, 1, 0, 0],
+    operatorCount: classifiedRepeatedTextForm.operatorCount,
+    dependencyOpCount: classifiedRepeatedTextForm.dependencyOpCount,
+    dependencyKeys: classifiedRepeatedTextForm.dependencyKeys,
+    operatorCountTrace: classifiedRepeatedTextForm.operatorCountTrace,
+    textShowOpCount: classifiedRepeatedTextForm.textShowOpCount,
+    hasNonTextPaint: false
+  }]]);
+  const shiftedFlush = await compile(
+    `${Array.from({ length: 490 }, () => "q Q").join("\n")}\n/Shifted Do`,
+    { availableTextFormXObjects: shiftedFlushSummary }
+  );
+  assert.equal(shiftedFlush.operatorCount, 1_004);
+  assert.equal(shiftedFlush.dependencyOpCount, 2);
+  assert.deepEqual(shiftedFlush.dependencyKeys, ["20 0 R", "20 0 R"]);
+  assert.equal(shiftedFlush.operatorCountTrace, undefined);
+
+  const repeatedNestedEventCount = 500_001;
+  const repeatedNestedTrace = operatorCountTrace(
+    new Uint32Array(repeatedNestedEventCount + 1),
+    new Uint32Array(repeatedNestedEventCount)
+  );
+  await expectUnsupported("/Large Do /Large Do", undefined, {
+    classificationOnly: true,
+    availableTextFormXObjects: new Map([["Large", {
+      dependencyKey: "50 0 R",
+      bbox: formBounds,
+      matrix: [1, 0, 0, 1, 0, 0],
+      operatorCount: repeatedNestedEventCount,
+      dependencyOpCount: 0,
+      dependencyKeys: [],
+      operatorCountTrace: repeatedNestedTrace,
+      textShowOpCount: 0,
+      hasNonTextPaint: false
+    }]])
+  });
+
+  const visiblePainted = new Map([["Painted", {
+    dependencyKey: "30 0 R",
+    bbox: formBounds,
+    matrix: [1, 0, 0, 1, 0, 0],
+    operatorCount: 3,
+    dependencyOpCount: 0,
+    dependencyKeys: [],
+    operatorCountTrace: operatorCountTrace([3]),
+    textShowOpCount: 1,
+    hasNonTextPaint: true
+  }]]);
+  await expectUnsupported("/Painted Do", "Do", {
+    availableTextFormXObjects: visiblePainted
+  });
+
+  const rotatedOffPagePainted = new Map([["Painted", {
+    ...visiblePainted.get("Painted"),
+    matrix: [0, 1, -1, 0, 0, -2_000]
+  }]]);
+  const omittedPainted = await compile("/Painted Do", {
+    availableTextFormXObjects: rotatedOffPagePainted
+  });
+  assert.equal(omittedPainted.operatorCount, 5);
+  assert.equal(omittedPainted.textShowOpCount, 1);
+  assert.deepEqual(omittedPainted.referencedXObjects, ["Painted"]);
+  assert.equal(
+    decoder.decode(omittedPainted.retainedTextContent),
+    "/Painted Do\n"
+  );
+
+  await expectUnsupported("0 0 m /Footer Do", "Do", {
+    availableTextFormXObjects
+  });
+
+  const clippedText = await compile(
+    "0 0 10 10 re W n BT /F1 10 Tf (text) Tj ET",
+    { rejectPathPainting: true }
+  );
+  assert.equal(clippedText.pathCount, 0);
+  assert.equal(clippedText.textShowOpCount, 1);
+  for (const operator of ["S", "s", "f", "F", "f*", "B", "B*", "b", "b*"]) {
+    await expectUnsupported(`0 0 10 10 re ${operator}`, operator, {
+      rejectPathPainting: true
+    });
+  }
+}
+
+async function testClassificationOnlyAccounting() {
+  const content = [
+    "BT /F1 10 Tf (classified) Tj ET",
+    "0 0 m 10 0 l S",
+    "20 20 5 5 re f"
+  ].join("\n");
+  const options = {
+    fontDependencyKeys: new Map([["F1", "20 0 R"]]),
+    enableSegmentMerge: false,
+    enableInvisibleCull: false
+  };
+  const retained = await compile(content, options);
+  const classified = await compile(content, {
+    ...options,
+    classificationOnly: true
+  });
+
+  assert.equal(classified.operatorCount, retained.operatorCount);
+  assert.equal(classified.dependencyOpCount, retained.dependencyOpCount);
+  assert.deepEqual(classified.dependencyKeys, retained.dependencyKeys);
+  assert.equal(classified.textShowOpCount, retained.textShowOpCount);
+  assert.equal(classified.pathCount, retained.pathCount);
+  assert.deepEqual(classified.referencedFonts, retained.referencedFonts);
+  assert.equal(classified.sourceSegmentCount, 0);
+  assert.equal(classified.segmentCount, 0);
+  assert.equal(classified.fillPathCount, 0);
+  assert.equal(classified.fillSegmentCount, 0);
+  for (const key of [
+    "endpoints",
+    "primitiveMeta",
+    "primitiveBounds",
+    "styles",
+    "fillPathMetaA",
+    "fillPathMetaB",
+    "fillPathMetaC",
+    "fillSegmentsA",
+    "fillSegmentsB"
+  ]) {
+    assert.equal(classified[key].length, 0, key);
+  }
+}
+
 async function testUnsupportedAndMalformedContent() {
   const inertGraphicsState = await compile("/R10 gs 0 0 m 10 0 l S", {
     availableExtGStates: ["R10"]
@@ -425,9 +699,9 @@ async function* delayedChunks(bytes, chunkSize) {
   }
 }
 
-async function expectUnsupported(content, operator) {
+async function expectUnsupported(content, operator, options = {}) {
   await assert.rejects(
-    compile(content),
+    compile(content, options),
     (error) => {
       assert.ok(
         error instanceof DensePdfUnsupportedError,

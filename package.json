@@ -69,6 +69,8 @@
     "test:dense-pdf-integration": "node --experimental-strip-types scripts/test-dense-pdf-integration.mjs",
     "test:dense-pdf-package": "node scripts/test-dense-pdf-package.mjs",
     "test:pdf-fast-progress": "node --experimental-strip-types scripts/test-pdf-fast-progress.mjs",
+    "test:pdf-to-hep-cli": "node scripts/test-pdf-to-hep-cli.mjs",
+    "test:pdf-to-hep-node-worker": "node scripts/test-pdf-to-hep-node-dense-worker.mjs",
     "test:raster-archive": "node scripts/test-raster-image-zip.mjs",
     "test:raster-ownership": "node scripts/test-raster-texture-ownership.mjs",
     "test:text-search": "node scripts/test-text-search.mjs",
@@ -91,6 +93,7 @@
     "three": ">=0.170.0"
   },
   "dependencies": {
+    "@napi-rs/canvas": "1.0.6",
     "jszip": "3.10.1",
     "pdf-lib": "1.17.1",
     "pdfjs-dist": "6.1.200"

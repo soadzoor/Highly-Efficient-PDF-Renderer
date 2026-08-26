@@ -63,7 +63,10 @@ try {
   ]);
   const { compileDensePdfContent } = compilerModule;
   const { buildDenseTextMiniPdf, preflightDensePdfDocument } = documentModule;
-  const { computeDensePdfPageGeometry } = workerModule;
+  const {
+    classifyDensePdfTextFormXObjects,
+    computeDensePdfPageGeometry
+  } = workerModule;
   const { extractPdfPageScenes } = extractorModule;
 
   const absoluteInputPath = resolve(inputPath ?? DEFAULT_PDF);
@@ -84,6 +87,7 @@ try {
     compileDensePdfContent,
     buildDenseTextMiniPdf,
     preflightDensePdfDocument,
+    classifyDensePdfTextFormXObjects,
     computeDensePdfPageGeometry,
     extractPdfPageScenes
   });
@@ -156,6 +160,7 @@ async function runFastPath({
   compileDensePdfContent,
   buildDenseTextMiniPdf,
   preflightDensePdfDocument,
+  classifyDensePdfTextFormXObjects,
   computeDensePdfPageGeometry,
   extractPdfPageScenes
 }) {
@@ -175,6 +180,9 @@ async function runFastPath({
   for (let pageIndex = 0; pageIndex < preflight.document.pages.length; pageIndex += 1) {
     const selectedPage = preflight.document.pages[pageIndex];
     const geometry = computeDensePdfPageGeometry(selectedPage);
+    const availableTextFormXObjects = await classifyDensePdfTextFormXObjects(
+      selectedPage
+    );
     const decodeTiming = { elapsedMs: 0, decodedBytes: 0 };
     let lastProgressAt = 0;
     const compileStartedAt = performance.now();
@@ -182,7 +190,14 @@ async function runFastPath({
       measureDecodedContent(selectedPage.decodedContentChunks(), decodeTiming),
       {
         ...geometry,
+        fontDependencyKeys: new Map(selectedPage.fontDependencies.map(
+          ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
+        )),
         availableExtGStates: selectedPage.availableExtGStates,
+        extGStates: selectedPage.extGStates,
+        alwaysVisibleOptionalContentProperties:
+          selectedPage.alwaysVisibleOptionalContentProperties,
+        availableTextFormXObjects,
         enableSegmentMerge: true,
         enableInvisibleCull: true,
         yieldIntervalMs: 50,
@@ -213,7 +228,9 @@ async function runFastPath({
       sourcePageIndex: selectedPage.sourcePageIndex,
       retainedTextContent: compiled.retainedTextContent,
       referencedFonts: new Set(compiled.referencedFonts),
-      referencedProperties: new Set(compiled.referencedProperties)
+      referencedProperties: new Set(compiled.referencedProperties),
+      referencedExtGStates: new Set(compiled.referencedExtGStates),
+      referencedXObjects: new Set(compiled.referencedXObjects)
     }))
   );
   const textMiniPdfMs = performance.now() - miniStartedAt;
@@ -222,6 +239,7 @@ async function runFastPath({
     compiled.retainedTextContent = new Uint8Array(0);
     compiled.referencedFonts = [];
     compiled.referencedProperties = [];
+    compiled.referencedXObjects = [];
   }
 
   let workerResult = {

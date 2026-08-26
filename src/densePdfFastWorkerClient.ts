@@ -118,7 +118,8 @@ export async function compileDensePdfInWorker(
     return {
       kind: "fallback",
       reason: "worker-unavailable",
-      message: "The dense PDF path requires browser Worker support."
+      message:
+        "The dense PDF path requires a browser Worker or configured server Worker backend."
     };
   }
 

@@ -17,6 +17,10 @@ export interface RasterImageMetadata {
   height: number;
 }
 
+/** Shared lossy WebP quality; browser canvas uses 0..1 and Node canvas uses 0..100. */
+export const RASTER_WEBP_QUALITY = 0.8;
+const NODE_RASTER_WEBP_QUALITY = RASTER_WEBP_QUALITY * 100;
+
 interface NodeRasterCanvasContext {
   putImageData: (imageData: unknown, x: number, y: number) => void;
   drawImage: (image: unknown, x: number, y: number) => void;
@@ -363,7 +367,11 @@ async function encodeRasterRgbaAsImage(
     clamped.set(rgba.subarray(0, expectedBytes));
     context.putImageData(new ImageData(clamped, width, height), 0, 0);
     const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, rasterImageMimeType(encoding));
+      canvas.toBlob(
+        resolve,
+        rasterImageMimeType(encoding),
+        encoding === "webp" ? RASTER_WEBP_QUALITY : undefined
+      );
     });
     if (!blob || blob.type !== rasterImageMimeType(encoding)) {
       return null;
@@ -444,7 +452,9 @@ async function encodeRasterRgbaAsNodeImage(
     clamped.set(rgba.subarray(0, expectedBytes));
     context.putImageData(new codec.ImageData(clamped, width, height), 0, 0);
     const encoded = new Uint8Array(
-      await canvas.encode(encoding)
+      encoding === "webp"
+        ? await canvas.encode(encoding, NODE_RASTER_WEBP_QUALITY)
+        : await canvas.encode(encoding)
     );
     return hasRasterImageSignature(encoding, encoded) ? encoded : null;
   } catch {

@@ -52,6 +52,49 @@ export interface DensePdfDecodeTiming {
   readonly completed: boolean;
 }
 
+/** A conservatively validated `/ExtGState` that the dense compiler can apply. */
+export interface DensePdfExtGState {
+  readonly resourceName: string;
+  /** Present only when the dictionary explicitly sets stroking opacity (`/CA`). */
+  readonly strokeAlpha?: number;
+  /** Present only when the dictionary explicitly sets nonstroking opacity (`/ca`). */
+  readonly fillAlpha?: number;
+  /** Whether PDF.js emits a `setGState` op for this dictionary. */
+  readonly emitsPdfJsOperator: boolean;
+}
+
+/** Stable identity for a named resource whose PDF.js dependency op is deduplicated. */
+export interface DensePdfResourceDependency {
+  readonly resourceName: string;
+  readonly dependencyKey: string;
+}
+
+/** A conservatively validated `/Subtype /Form` XObject. */
+export interface DensePdfFormXObject {
+  /** Decoded PDF resource name, without its leading slash. */
+  readonly resourceName: string;
+  /** Stable source-object identity used to deduplicate PDF.js dependencies. */
+  readonly dependencyKey: string;
+  readonly bbox: DensePdfPageBox;
+  /** The form's `/Matrix`, defaulting to the identity matrix. */
+  readonly matrix: readonly [number, number, number, number, number, number];
+  readonly encodedContentBytes: number;
+  /** Names of validated `/ExtGState` resources supported by the dense compiler. */
+  readonly availableExtGStates: readonly string[];
+  /** Validated graphics-state behavior keyed by `resourceName`. */
+  readonly extGStates: readonly DensePdfExtGState[];
+  /** `/Properties` names whose direct OCG is visible in the default configuration. */
+  readonly alwaysVisibleOptionalContentProperties: readonly string[];
+  /** Stable identities for this Form's local font resources. */
+  readonly fontDependencies: readonly DensePdfResourceDependency[];
+
+  /** Resolve a Form-local XObject only when its `Do` operator is actually used. */
+  resolveFormXObject(resourceName: string): DensePdfFormXObject | null;
+
+  /** Decode the form stream. Only one active consumer is allowed per form. */
+  decodedContentChunks(): AsyncIterable<Uint8Array>;
+}
+
 export interface DensePdfSelectedPage {
   /** Zero-based page index in the source PDF. */
   readonly sourcePageIndex: number;
@@ -72,8 +115,16 @@ export interface DensePdfSelectedPage {
   readonly availableFonts: readonly string[];
   /** Decoded PDF resource names, without their leading slash. */
   readonly availableProperties: readonly string[];
-  /** Names of validated, behaviorally inert `/ExtGState` resources. */
+  /** Names of validated `/ExtGState` resources supported by the dense compiler. */
   readonly availableExtGStates: readonly string[];
+  /** Validated graphics-state behavior keyed by `resourceName`. */
+  readonly extGStates: readonly DensePdfExtGState[];
+  /** `/Properties` names whose direct OCG is visible in the default configuration. */
+  readonly alwaysVisibleOptionalContentProperties: readonly string[];
+  /** Stable identities for page font resources. */
+  readonly fontDependencies: readonly DensePdfResourceDependency[];
+  /** Plain Form XObjects in the page resource scope that may be invoked by `Do`. */
+  readonly formXObjects: readonly DensePdfFormXObject[];
   readonly decodeTiming: DensePdfDecodeTiming;
 
   /**
@@ -125,6 +176,10 @@ export interface DensePdfCompiledPage {
   readonly referencedFonts: ReadonlySet<string>;
   /** Property resource names used by retained `BDC` operators. */
   readonly referencedProperties: ReadonlySet<string>;
+  /** ExtGState resource names used by retained `gs` operators. */
+  readonly referencedExtGStates?: ReadonlySet<string>;
+  /** Form XObject resource names used by retained `Do` operators. */
+  readonly referencedXObjects: ReadonlySet<string>;
 }
 
 export interface DensePdfMiniPdfTiming {
@@ -177,11 +232,30 @@ interface DensePdfPrivatePage {
   readonly contentObjectRefs: PDFRef[];
   readonly fontResources: PDFDict | null;
   readonly propertyResources: PDFDict | null;
+  readonly extGStateResources: PDFDict | null;
+  readonly xObjectResources: PDFDict | null;
   readonly procSetResource: PDFObject | undefined;
   readonly fontNames: ReadonlyMap<string, PDFName>;
   readonly propertyNames: ReadonlyMap<string, PDFName>;
+  readonly extGStateNames: ReadonlyMap<string, PDFName>;
+  readonly xObjectNames: ReadonlyMap<string, PDFName>;
+  readonly formXObjects: readonly DensePdfPrivateFormXObject[];
   readonly decodeTiming: MutableDecodeTiming;
   owner: DensePdfPrivateDocument | null;
+  decodeActive: boolean;
+}
+
+interface DensePdfPrivateFormXObject {
+  readonly publicForm: DensePdfFormXObject;
+  readonly context: PDFContext;
+  readonly sourcePageIndex: number;
+  readonly chunkSize: number;
+  readonly optionalContent: DensePdfOptionalContentConfig;
+  readonly xObjectResources: PDFDict | null;
+  readonly xObjectNames: ReadonlyMap<string, PDFName>;
+  readonly nestedForms: Map<string, DensePdfPrivateFormXObject | null>;
+  descriptor: ContentStreamDescriptor | null;
+  owner: DensePdfPrivatePage | null;
   decodeActive: boolean;
 }
 
@@ -196,6 +270,10 @@ interface PreflightRejectionDetails {
   sourcePageIndex?: number;
   resourceName?: string;
   filterName?: string;
+}
+
+interface DensePdfOptionalContentConfig {
+  readonly alwaysVisibleGroupRefs: ReadonlySet<string>;
 }
 
 class PreflightRejection extends Error {
@@ -225,19 +303,65 @@ const SUPPORTED_CONTENT_FILTERS = new Set([
   "ASCIIHexDecode",
   "RunLengthDecode"
 ]);
-const ALLOWED_RESOURCE_KEYS = new Set([
+const ALLOWED_PAGE_RESOURCE_KEYS = new Set([
   "ExtGState",
   "Font",
   "Properties",
-  "ProcSet"
+  "ProcSet",
+  "XObject"
+]);
+const ALLOWED_FORM_RESOURCE_KEYS = new Set([
+  "ExtGState",
+  "Font",
+  "Properties",
+  "ProcSet",
+  "XObject"
+]);
+const ALLOWED_FORM_STREAM_KEYS = new Set([
+  "BBox",
+  "DecodeParms",
+  "Filter",
+  "FormType",
+  "Length",
+  "Matrix",
+  "Resources",
+  "Subtype",
+  "Type"
+]);
+const MAX_PAGE_GROUP_FORM_INSPECTION = 256;
+const SAFE_LINK_ANNOTATION_KEYS = new Set([
+  "A",
+  "BS",
+  "Border",
+  "Dest",
+  "F",
+  "NM",
+  "P",
+  "Rect",
+  "StructParent",
+  "Subtype",
+  "Type"
+]);
+const SAFE_SQUARE_ANNOTATION_KEYS = new Set([
+  "Border",
+  "Contents",
+  "F",
+  "NM",
+  "P",
+  "Rect",
+  "Subtype",
+  "T",
+  "Type"
 ]);
 const denseDocumentState = new WeakMap<object, DensePdfPrivateDocument>();
+const directResourceDependencyKeys = new WeakMap<object, string>();
+let nextDirectResourceDependencyKey = 1;
 
 /**
  * Structurally inspect selected pages without asking PDF.js to build an
  * operator list. Eligibility is deliberately conservative: the v1 dense
  * compiler only accepts fonts, property lists, graphics/text state operators,
- * clipping, and marked content.
+ * clipping, marked content, and conservatively validated text-only Forms.
  *
  * Invalid `pages` syntax/ranges are caller errors and throw. A valid document
  * that needs the ordinary PDF.js path returns `eligible: false` instead.
@@ -287,10 +411,15 @@ export async function preflightDensePdfDocument(
   const inspectStart = now();
 
   try {
-    rejectDocumentLevelFeatures(sourceDocument);
+    const optionalContent = inspectDocumentLevelFeatures(sourceDocument);
     const catalogLanguage = readCatalogLanguage(sourceDocument);
     const privatePages = selectedPageNumbers.map((sourcePageNumber) =>
-      inspectSelectedPage(sourceDocument, sourcePageNumber - 1, chunkSize)
+      inspectSelectedPage(
+        sourceDocument,
+        sourcePageNumber - 1,
+        chunkSize,
+        optionalContent
+      )
     );
     const inspectMs = elapsed(inspectStart);
     const timing: DensePdfPreflightTiming = {
@@ -427,7 +556,8 @@ export async function buildDenseTextMiniPdf(
 function inspectSelectedPage(
   sourceDocument: PDFDocument,
   sourcePageIndex: number,
-  chunkSize: number
+  chunkSize: number,
+  optionalContent: DensePdfOptionalContentConfig
 ): DensePdfPrivatePage {
   const sourcePage = sourceDocument.getPage(sourcePageIndex);
   const context = sourceDocument.context;
@@ -438,20 +568,10 @@ function inspectSelectedPage(
       { sourcePageIndex }
     );
   }
-  if (sourcePage.node.get(PDFName.of("Group"))) {
-    throw new PreflightRejection(
-      "unsupported-resource",
-      `PDF page ${sourcePageIndex + 1} uses a page-level transparency/group dictionary.`,
-      { sourcePageIndex, resourceName: "Group" }
-    );
-  }
+  const pageGroup = sourcePage.node.get(PDFName.of("Group"));
   const annotations = sourcePage.node.Annots();
   if (annotations && annotations.size() > 0) {
-    throw new PreflightRejection(
-      "annotations",
-      `PDF page ${sourcePageIndex + 1} contains annotations.`,
-      { sourcePageIndex }
-    );
+    validateNonVisualAnnotations(annotations, context, sourcePageIndex);
   }
 
   const resources = sourcePage.node.Resources();
@@ -467,7 +587,36 @@ function inspectSelectedPage(
     PDFName.ExtGState,
     context
   );
-  rejectOptionalContentProperties(propertyResources, context, sourcePageIndex);
+  const xObjectResources = lookupResourceDictionary(
+    resources,
+    PDFName.XObject,
+    context
+  );
+  const alwaysVisibleOptionalContentProperties = inspectOptionalContentProperties(
+    propertyResources,
+    context,
+    sourcePageIndex,
+    optionalContent
+  );
+  const extGStates = inspectSupportedExtGStates(
+    extGStateResources,
+    context,
+    sourcePageIndex
+  );
+  const formXObjects = inspectFormXObjects(
+    xObjectResources,
+    context,
+    sourcePageIndex,
+    chunkSize,
+    optionalContent
+  );
+  validateInertPageGroup(
+    pageGroup,
+    context,
+    sourcePageIndex,
+    extGStates,
+    formXObjects
+  );
 
   const content = readPageContentStreams(sourcePage, context, sourcePageIndex);
   const mediaBox = readPageBox(sourcePage.node.MediaBox(), "MediaBox", sourcePageIndex);
@@ -502,6 +651,7 @@ function inspectSelectedPage(
   const fontNames = readResourceNames(fontResources);
   const propertyNames = readResourceNames(propertyResources);
   const extGStateNames = readResourceNames(extGStateResources);
+  const xObjectNames = readResourceNames(xObjectResources);
   const mutableDecodeTiming: MutableDecodeTiming = {
     elapsedMs: 0,
     decodedBytes: 0,
@@ -528,6 +678,10 @@ function inspectSelectedPage(
     availableFonts: Object.freeze([...fontNames.keys()].sort()),
     availableProperties: Object.freeze([...propertyNames.keys()].sort()),
     availableExtGStates: Object.freeze([...extGStateNames.keys()].sort()),
+    extGStates,
+    alwaysVisibleOptionalContentProperties,
+    fontDependencies: readResourceDependencies(fontResources, context),
+    formXObjects: Object.freeze(formXObjects.map((form) => form.publicForm)),
     get decodeTiming(): DensePdfDecodeTiming {
       return { ...mutableDecodeTiming };
     },
@@ -543,14 +697,459 @@ function inspectSelectedPage(
     contentObjectRefs: content.objectRefs,
     fontResources,
     propertyResources,
+    extGStateResources,
+    xObjectResources,
     procSetResource: resources?.get(PDFName.of("ProcSet")),
     fontNames,
     propertyNames,
+    extGStateNames,
+    xObjectNames,
+    formXObjects,
     decodeTiming: mutableDecodeTiming,
     owner: null,
     decodeActive: false
   };
+  for (const form of formXObjects) {
+    form.owner = privatePage;
+  }
   return privatePage;
+}
+
+/**
+ * PDF.js does not expose the common opaque page-level transparency-group
+ * wrapper in its page operator list. It is safe to ignore only the exact
+ * default, non-isolated `/DeviceRGB` shape while every admitted graphics
+ * state in the page and its Forms remains fully opaque. Groups with any
+ * additional behavior continue through the ordinary PDF.js path.
+ */
+function validateInertPageGroup(
+  rawGroup: PDFObject | undefined,
+  context: PDFContext,
+  sourcePageIndex: number,
+  extGStates: readonly DensePdfExtGState[],
+  forms: readonly DensePdfPrivateFormXObject[]
+): void {
+  if (!rawGroup) return;
+  const group = context.lookup(rawGroup);
+  const allowedKeys = new Set(["CS", "I", "K", "S", "Type"]);
+  const type = group instanceof PDFDict ? group.lookup(PDFName.Type) : undefined;
+  const subtype = group instanceof PDFDict
+    ? group.lookup(PDFName.of("S"))
+    : undefined;
+  const colorSpace = group instanceof PDFDict
+    ? group.lookup(PDFName.of("CS"))
+    : undefined;
+  const isolated = group instanceof PDFDict
+    ? group.lookup(PDFName.of("I"))
+    : undefined;
+  const knockout = group instanceof PDFDict
+    ? group.lookup(PDFName.of("K"))
+    : undefined;
+  const exactDefaultShape =
+    group instanceof PDFDict &&
+    group.keys().every((key) => allowedKeys.has(decodePdfName(key))) &&
+    type instanceof PDFName &&
+    decodePdfName(type) === "Group" &&
+    subtype instanceof PDFName &&
+    decodePdfName(subtype) === "Transparency" &&
+    colorSpace instanceof PDFName &&
+    decodePdfName(colorSpace) === "DeviceRGB" &&
+    (!isolated || (isolated instanceof PDFBool && !isolated.asBoolean())) &&
+    (!knockout || (knockout instanceof PDFBool && !knockout.asBoolean()));
+  const allOpaque =
+    extGStates.every(isOpaqueExtGState) &&
+    forms.every((form) => isOpaqueFormResourceTree(
+      form,
+      new Set(),
+      new Set(),
+      { count: 0 }
+    ));
+  if (exactDefaultShape && allOpaque) return;
+
+  throw new PreflightRejection(
+    "unsupported-resource",
+    `PDF page ${sourcePageIndex + 1} uses a page-level transparency group that is not provably inert.`,
+    { sourcePageIndex, resourceName: "Group" }
+  );
+}
+
+function isOpaqueFormResourceTree(
+  form: DensePdfPrivateFormXObject,
+  active: Set<string>,
+  visited: Set<string>,
+  budget: { count: number }
+): boolean {
+  const key = form.publicForm.dependencyKey;
+  if (visited.has(key)) return true;
+  if (active.has(key)) return false;
+  budget.count += 1;
+  if (budget.count > MAX_PAGE_GROUP_FORM_INSPECTION) return false;
+  if (!form.publicForm.extGStates.every(isOpaqueExtGState)) return false;
+  active.add(key);
+  try {
+    for (const resourceName of form.xObjectNames.keys()) {
+      let nested: DensePdfPrivateFormXObject | null;
+      try {
+        nested = resolveNestedFormXObject(form, resourceName);
+      } catch {
+        return false;
+      }
+      // Images and other non-Form resources may carry alpha. An inert page
+      // group must prove every reachable resource scope opaque without relying
+      // on later content discovery.
+      if (!nested || !isOpaqueFormResourceTree(nested, active, visited, budget)) {
+        return false;
+      }
+    }
+    visited.add(key);
+    return true;
+  } finally {
+    active.delete(key);
+  }
+}
+
+function isOpaqueExtGState(state: DensePdfExtGState): boolean {
+  return (
+    (state.strokeAlpha === undefined || state.strokeAlpha === 1) &&
+    (state.fillAlpha === undefined || state.fillAlpha === 1)
+  );
+}
+
+/**
+ * Annotation interactivity is not represented in HEP. Ignore only annotation
+ * dictionaries that are provably unable to paint into the page view.
+ */
+function validateNonVisualAnnotations(
+  annotations: PDFArray,
+  context: PDFContext,
+  sourcePageIndex: number
+): void {
+  for (let index = 0; index < annotations.size(); index += 1) {
+    const annotation = context.lookup(annotations.get(index));
+    if (!(annotation instanceof PDFDict)) {
+      throw invalidPageStructure(sourcePageIndex, "Annots contains a non-dictionary value.");
+    }
+    const subtype = annotation.lookup(PDFName.of("Subtype"));
+    const subtypeName = subtype instanceof PDFName ? decodePdfName(subtype) : "";
+    const allowedKeys = subtypeName === "Link"
+      ? SAFE_LINK_ANNOTATION_KEYS
+      : subtypeName === "Square"
+        ? SAFE_SQUARE_ANNOTATION_KEYS
+        : null;
+    const type = annotation.lookup(PDFName.Type);
+    const safeType = !type || (type instanceof PDFName && decodePdfName(type) === "Annot");
+    if (
+      !allowedKeys ||
+      !safeType ||
+      annotation.keys().some((key) => !allowedKeys.has(decodePdfName(key))) ||
+      !hasValidAnnotationRectangle(annotation) ||
+      !(subtypeName === "Link"
+        ? hasExplicitZeroLinkBorder(annotation)
+        : hasExplicitZeroAnnotationBorder(annotation))
+    ) {
+      throw new PreflightRejection(
+        "annotations",
+        `PDF page ${sourcePageIndex + 1} annotation ${index + 1} may have a visible appearance.`,
+        { sourcePageIndex }
+      );
+    }
+  }
+}
+
+function hasExplicitZeroLinkBorder(annotation: PDFDict): boolean {
+  const hasBorder = annotation.has(PDFName.of("Border"));
+  const hasBorderStyle = annotation.has(PDFName.of("BS"));
+  if (!hasBorder && !hasBorderStyle) return false;
+  if (hasBorder && !hasExplicitZeroAnnotationBorder(annotation)) return false;
+  if (!hasBorderStyle) return true;
+  const borderStyle = annotation.lookup(PDFName.of("BS"));
+  if (
+    !(borderStyle instanceof PDFDict) ||
+    !dictionaryHasExactlyKeys(borderStyle, ["W"])
+  ) return false;
+  const width = borderStyle.lookup(PDFName.of("W"));
+  return width instanceof PDFNumber && Number.isFinite(width.asNumber()) && width.asNumber() === 0;
+}
+
+function hasValidAnnotationRectangle(annotation: PDFDict): boolean {
+  const rect = annotation.lookup(PDFName.of("Rect"));
+  if (!(rect instanceof PDFArray) || rect.size() !== 4) return false;
+  for (let index = 0; index < rect.size(); index += 1) {
+    const value = rect.lookup(index);
+    if (!(value instanceof PDFNumber) || !Number.isFinite(value.asNumber())) return false;
+  }
+  return true;
+}
+
+function hasExplicitZeroAnnotationBorder(annotation: PDFDict): boolean {
+  const border = annotation.lookup(PDFName.of("Border"));
+  if (!(border instanceof PDFArray) || border.size() !== 3) return false;
+  for (let index = 0; index < border.size(); index += 1) {
+    const value = border.lookup(index);
+    if (!(value instanceof PDFNumber) || !Number.isFinite(value.asNumber())) return false;
+    if (index === 2 && value.asNumber() !== 0) return false;
+  }
+  return true;
+}
+
+function inspectFormXObjects(
+  xObjects: PDFDict | null,
+  context: PDFContext,
+  sourcePageIndex: number,
+  chunkSize: number,
+  optionalContent: DensePdfOptionalContentConfig
+): DensePdfPrivateFormXObject[] {
+  if (!xObjects) {
+    return [];
+  }
+
+  const forms: DensePdfPrivateFormXObject[] = [];
+  for (const [name, rawValue] of xObjects.entries()) {
+    const resourceName = decodePdfName(name);
+    const stream = context.lookup(rawValue);
+    // Image and malformed entries are deliberately left unresolved. They are
+    // harmless when unused, while an actual `Do` cannot obtain a Form summary
+    // and therefore falls back atomically during content compilation.
+    if (!isFormXObjectStream(stream)) {
+      continue;
+    }
+    forms.push(inspectFormXObject(
+      rawValue,
+      stream,
+      resourceName,
+      context,
+      sourcePageIndex,
+      chunkSize,
+      optionalContent
+    ));
+  }
+  return forms;
+}
+
+function inspectFormXObject(
+  rawValue: PDFObject,
+  stream: PDFRawStream,
+  resourceName: string,
+  context: PDFContext,
+  sourcePageIndex: number,
+  chunkSize: number,
+  optionalContent: DensePdfOptionalContentConfig
+): DensePdfPrivateFormXObject {
+  validatePlainFormStreamDictionary(stream, resourceName, sourcePageIndex);
+  const rawFormResources = stream.dict.get(PDFName.Resources);
+  const formResources = rawFormResources
+    ? context.lookup(rawFormResources)
+    : undefined;
+  if (!(formResources instanceof PDFDict)) {
+    throw new PreflightRejection(
+      "unsupported-resource",
+      `PDF page ${sourcePageIndex + 1} Form XObject /${resourceName} does not have a valid /Resources dictionary.`,
+      { sourcePageIndex, resourceName }
+    );
+  }
+  validatePageResources(
+    formResources,
+    context,
+    sourcePageIndex,
+    ALLOWED_FORM_RESOURCE_KEYS
+  );
+  const fontResources = lookupResourceDictionary(
+    formResources,
+    PDFName.Font,
+    context
+  );
+  const properties = lookupResourceDictionary(
+    formResources,
+    PDFName.of("Properties"),
+    context
+  );
+  const alwaysVisibleOptionalContentProperties = inspectOptionalContentProperties(
+    properties,
+    context,
+    sourcePageIndex,
+    optionalContent
+  );
+
+  const bboxObject = stream.dict.lookup(PDFName.of("BBox"));
+  if (!(bboxObject instanceof PDFArray)) {
+    throw invalidPageStructure(
+      sourcePageIndex,
+      `Form XObject /${resourceName} does not have a valid BBox.`
+    );
+  }
+  const bbox = readPageBox(
+    bboxObject,
+    `Form XObject /${resourceName} BBox`,
+    sourcePageIndex
+  );
+  const matrix = readFormMatrix(stream, resourceName, sourcePageIndex);
+  const descriptor = inspectContentStream(stream, sourcePageIndex);
+  const extGStates = lookupResourceDictionary(
+    formResources,
+    PDFName.ExtGState,
+    context
+  );
+  const supportedExtGStates = inspectSupportedExtGStates(
+    extGStates,
+    context,
+    sourcePageIndex
+  );
+  const xObjectResources = lookupResourceDictionary(
+    formResources,
+    PDFName.XObject,
+    context
+  );
+  const xObjectNames = readResourceNames(xObjectResources);
+
+  let privateForm!: DensePdfPrivateFormXObject;
+  const publicForm: DensePdfFormXObject = {
+    resourceName,
+    dependencyKey: resourceDependencyKey(
+      rawValue,
+      stream,
+      `direct-form:${sourcePageIndex}:${resourceName}`
+    ),
+    bbox,
+    matrix,
+    encodedContentBytes: stream.contents.byteLength,
+    availableExtGStates: Object.freeze([...readResourceNames(extGStates).keys()].sort()),
+    extGStates: supportedExtGStates,
+    alwaysVisibleOptionalContentProperties,
+    fontDependencies: readResourceDependencies(fontResources, context),
+    resolveFormXObject(name: string): DensePdfFormXObject | null {
+      return resolveNestedFormXObject(privateForm, name)?.publicForm ?? null;
+    },
+    decodedContentChunks(): AsyncIterable<Uint8Array> {
+      return decodeFormContentChunks(privateForm, chunkSize);
+    }
+  };
+  privateForm = {
+    publicForm,
+    context,
+    sourcePageIndex,
+    chunkSize,
+    optionalContent,
+    xObjectResources,
+    xObjectNames,
+    nestedForms: new Map(),
+    descriptor,
+    owner: null,
+    decodeActive: false
+  };
+  return privateForm;
+}
+
+function resolveNestedFormXObject(
+  parent: DensePdfPrivateFormXObject,
+  resourceName: string
+): DensePdfPrivateFormXObject | null {
+  const normalizedName = normalizeCompilerResourceName(resourceName);
+  if (parent.nestedForms.has(normalizedName)) {
+    return parent.nestedForms.get(normalizedName) ?? null;
+  }
+  const sourceName = parent.xObjectNames.get(normalizedName);
+  const rawValue = sourceName && parent.xObjectResources?.get(sourceName);
+  const stream = rawValue ? parent.context.lookup(rawValue) : undefined;
+  if (!rawValue || !isFormXObjectStream(stream)) {
+    parent.nestedForms.set(normalizedName, null);
+    return null;
+  }
+  const nested = inspectFormXObject(
+    rawValue,
+    stream,
+    normalizedName,
+    parent.context,
+    parent.sourcePageIndex,
+    parent.chunkSize,
+    parent.optionalContent
+  );
+  nested.owner = parent.owner;
+  parent.nestedForms.set(normalizedName, nested);
+  return nested;
+}
+
+function isFormXObjectStream(value: unknown): value is PDFRawStream {
+  if (!(value instanceof PDFRawStream)) return false;
+  const subtype = value.dict.lookup(PDFName.of("Subtype"));
+  return subtype instanceof PDFName && decodePdfName(subtype) === "Form";
+}
+
+function validatePlainFormStreamDictionary(
+  stream: PDFRawStream,
+  resourceName: string,
+  sourcePageIndex: number
+): void {
+  for (const key of stream.dict.keys()) {
+    const keyName = decodePdfName(key);
+    if (!ALLOWED_FORM_STREAM_KEYS.has(keyName)) {
+      const reason = keyName === "OC" ? "optional-content" : "unsupported-resource";
+      throw new PreflightRejection(
+        reason,
+        `PDF page ${sourcePageIndex + 1} Form XObject /${resourceName} uses unsupported /${keyName}.`,
+        { sourcePageIndex, resourceName }
+      );
+    }
+  }
+
+  const type = stream.dict.lookup(PDFName.Type);
+  if (
+    type &&
+    (!(type instanceof PDFName) || decodePdfName(type) !== "XObject")
+  ) {
+    throw new PreflightRejection(
+      "unsupported-resource",
+      `PDF page ${sourcePageIndex + 1} XObject /${resourceName} has an invalid /Type.`,
+      { sourcePageIndex, resourceName }
+    );
+  }
+  const subtype = stream.dict.lookup(PDFName.of("Subtype"));
+  if (!(subtype instanceof PDFName) || decodePdfName(subtype) !== "Form") {
+    throw new PreflightRejection(
+      "unsupported-resource",
+      `PDF page ${sourcePageIndex + 1} XObject /${resourceName} is not a Form XObject.`,
+      { sourcePageIndex, resourceName }
+    );
+  }
+  const formType = stream.dict.lookup(PDFName.of("FormType"));
+  if (
+    formType &&
+    (!(formType instanceof PDFNumber) || formType.asNumber() !== 1)
+  ) {
+    throw new PreflightRejection(
+      "unsupported-resource",
+      `PDF page ${sourcePageIndex + 1} Form XObject /${resourceName} has a /FormType other than 1.`,
+      { sourcePageIndex, resourceName }
+    );
+  }
+}
+
+function readFormMatrix(
+  stream: PDFRawStream,
+  resourceName: string,
+  sourcePageIndex: number
+): readonly [number, number, number, number, number, number] {
+  const matrixObject = stream.dict.lookup(PDFName.of("Matrix"));
+  if (!matrixObject) {
+    return Object.freeze([1, 0, 0, 1, 0, 0]);
+  }
+  if (!(matrixObject instanceof PDFArray) || matrixObject.size() !== 6) {
+    throw invalidPageStructure(
+      sourcePageIndex,
+      `Form XObject /${resourceName} Matrix does not contain six numbers.`
+    );
+  }
+  const values: number[] = [];
+  for (let index = 0; index < 6; index += 1) {
+    const value = matrixObject.lookup(index);
+    if (!(value instanceof PDFNumber) || !Number.isFinite(value.asNumber())) {
+      throw invalidPageStructure(
+        sourcePageIndex,
+        `Form XObject /${resourceName} Matrix contains a non-finite number.`
+      );
+    }
+    values.push(value.asNumber());
+  }
+  return Object.freeze(values) as readonly [number, number, number, number, number, number];
 }
 
 async function* decodePageContentChunks(
@@ -601,6 +1200,38 @@ async function* decodePageContentChunks(
     page.decodeTiming.elapsedMs = elapsed(start);
     page.decodeTiming.completed = completed;
     page.decodeActive = false;
+  }
+}
+
+async function* decodeFormContentChunks(
+  form: DensePdfPrivateFormXObject,
+  chunkSize: number
+): AsyncIterable<Uint8Array> {
+  if (form.decodeActive) {
+    throw new Error(
+      `PDF Form XObject /${form.publicForm.resourceName} is already being decoded.`
+    );
+  }
+  const descriptor = form.descriptor;
+  if (form.owner?.owner?.released || !descriptor) {
+    throw new DensePdfBuildError(
+      "source-released",
+      "The source Form XObject streams were released after building the mini PDF."
+    );
+  }
+
+  form.decodeActive = true;
+  try {
+    const chunks = descriptor.useNativeFlate
+      ? decodeNativeFlateChunks(descriptor.stream.contents, chunkSize)
+      : decodeWithPdfLibChunks(descriptor.stream, chunkSize);
+    for await (const chunk of chunks) {
+      if (chunk.length > 0) {
+        yield chunk;
+      }
+    }
+  } finally {
+    form.decodeActive = false;
   }
 }
 
@@ -675,17 +1306,13 @@ async function* decodeWithPdfLibChunks(
   }
 }
 
-function rejectDocumentLevelFeatures(sourceDocument: PDFDocument): void {
+function inspectDocumentLevelFeatures(
+  sourceDocument: PDFDocument
+): DensePdfOptionalContentConfig {
   if (sourceDocument.isEncrypted || sourceDocument.context.trailerInfo.Encrypt) {
     throw new PreflightRejection(
       "encrypted",
       "Encrypted PDFs are not supported by the dense compiler."
-    );
-  }
-  if (sourceDocument.catalog.get(PDFName.of("OCProperties"))) {
-    throw new PreflightRejection(
-      "optional-content",
-      "PDF optional-content groups are not supported by the dense compiler."
     );
   }
   if (sourceDocument.catalog.get(PDFName.of("AcroForm"))) {
@@ -694,6 +1321,98 @@ function rejectDocumentLevelFeatures(sourceDocument: PDFDocument): void {
       "Interactive forms and widget annotations are not supported by the dense compiler."
     );
   }
+  return inspectAlwaysVisibleOptionalContent(sourceDocument);
+}
+
+/**
+ * Recognize only the all-on CAD layer shape exercised by the dense fixtures.
+ * The resulting HEP captures that default view and deliberately does not
+ * preserve interactive layer controls.
+ */
+function inspectAlwaysVisibleOptionalContent(
+  sourceDocument: PDFDocument
+): DensePdfOptionalContentConfig {
+  const rawProperties = sourceDocument.catalog.get(PDFName.of("OCProperties"));
+  if (!rawProperties) {
+    return { alwaysVisibleGroupRefs: new Set() };
+  }
+  const context = sourceDocument.context;
+  const properties = context.lookup(rawProperties);
+  if (
+    !(properties instanceof PDFDict) ||
+    !dictionaryHasExactlyKeys(properties, ["D", "OCGs"])
+  ) {
+    throw unsupportedOptionalContent(
+      "PDF optional-content properties do not use the supported all-visible CAD layer shape."
+    );
+  }
+  const groups = properties.lookup(PDFName.of("OCGs"));
+  const defaultConfig = properties.lookup(PDFName.of("D"));
+  if (!(groups instanceof PDFArray) || !(defaultConfig instanceof PDFDict)) {
+    throw unsupportedOptionalContent(
+      "PDF optional-content groups or their default configuration are malformed."
+    );
+  }
+  if (!dictionaryHasExactlyKeys(defaultConfig, ["OFF", "Order"])) {
+    throw unsupportedOptionalContent(
+      "PDF optional-content default configuration is not the supported all-on shape."
+    );
+  }
+  const off = defaultConfig.lookup(PDFName.of("OFF"));
+  const order = defaultConfig.lookup(PDFName.of("Order"));
+  if (!(off instanceof PDFArray) || off.size() !== 0 || !(order instanceof PDFArray)) {
+    throw unsupportedOptionalContent(
+      "PDF optional-content default configuration contains hidden layers or malformed ordering."
+    );
+  }
+
+  const alwaysVisibleGroupRefs = new Set<string>();
+  for (let index = 0; index < groups.size(); index += 1) {
+    const rawGroup = groups.get(index);
+    if (!(rawGroup instanceof PDFRef) || alwaysVisibleGroupRefs.has(rawGroup.tag)) {
+      throw unsupportedOptionalContent(
+        "PDF optional-content groups must be unique indirect objects."
+      );
+    }
+    const group = context.lookup(rawGroup);
+    if (
+      !(group instanceof PDFDict) ||
+      !dictionaryHasExactlyKeys(group, ["Name", "Type"])
+    ) {
+      throw unsupportedOptionalContent(
+        "PDF optional-content group dictionaries contain unsupported behavior."
+      );
+    }
+    const type = group.lookup(PDFName.Type);
+    const name = group.lookup(PDFName.of("Name"));
+    if (
+      !(type instanceof PDFName) ||
+      decodePdfName(type) !== "OCG" ||
+      (!(name instanceof PDFString) && !(name instanceof PDFHexString))
+    ) {
+      throw unsupportedOptionalContent(
+        "PDF optional-content group dictionaries are malformed."
+      );
+    }
+    alwaysVisibleGroupRefs.add(rawGroup.tag);
+  }
+  return { alwaysVisibleGroupRefs };
+}
+
+function unsupportedOptionalContent(message: string): PreflightRejection {
+  return new PreflightRejection("optional-content", message);
+}
+
+function dictionaryHasExactlyKeys(
+  dictionary: PDFDict,
+  expectedKeys: readonly string[]
+): boolean {
+  const actual = dictionary.keys().map(decodePdfName).sort();
+  const expected = [...expectedKeys].sort();
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  );
 }
 
 function readCatalogLanguage(
@@ -730,14 +1449,15 @@ function readCatalogLanguage(
 function validatePageResources(
   resources: PDFDict | undefined,
   context: PDFContext,
-  sourcePageIndex: number
+  sourcePageIndex: number,
+  allowedResourceKeys: ReadonlySet<string> = ALLOWED_PAGE_RESOURCE_KEYS
 ): void {
   if (!resources) {
     return;
   }
   for (const [key, rawValue] of resources.entries()) {
     const name = decodePdfName(key);
-    if (ALLOWED_RESOURCE_KEYS.has(name)) {
+    if (allowedResourceKeys.has(name)) {
       continue;
     }
     const value = context.lookup(rawValue);
@@ -807,23 +1527,38 @@ function validatePageResources(
       sourcePageIndex,
       "ExtGState"
     );
-    validateInertExtGStates(extGStateDictionary, context, sourcePageIndex);
+  }
+  if (allowedResourceKeys.has("XObject")) {
+    const xObjects = resources.get(PDFName.XObject);
+    if (xObjects && !(context.lookup(xObjects) instanceof PDFDict)) {
+      throw invalidPageStructure(
+        sourcePageIndex,
+        "XObject resources are not a dictionary."
+      );
+    }
   }
 }
 
 /**
- * Accept only graphics-state resources that cannot change rendering. `/OPM`
- * selects an overprint algorithm, but has no effect while both stroking and
- * nonstroking overprint remain disabled (their PDF defaults). This narrow
+ * Accept only graphics-state resources whose rendering behavior the dense
+ * compiler models. `/OPM` selects an overprint algorithm, but has no effect
+ * while both stroking and nonstroking overprint remain disabled (their PDF
+ * defaults). This narrow
  * allowance covers CAD producers that emit `/OPM 1` without enabling
- * overprint, while opacity, blending, masks, and every other state still take
- * the ordinary PDF.js path.
+ * overprint. `/SA false` is the default, while `/SM` can only affect shadings;
+ * shading-capable resources are rejected elsewhere in this preflight. Normal
+ * source-over blending plus constant stroke/fill opacity are represented in
+ * the packed dense styles; masks and every other state still take PDF.js.
  */
-function validateInertExtGStates(
-  extGStates: PDFDict,
+function inspectSupportedExtGStates(
+  extGStates: PDFDict | null,
   context: PDFContext,
   sourcePageIndex: number
-): void {
+): readonly DensePdfExtGState[] {
+  if (!extGStates) {
+    return Object.freeze([]);
+  }
+  const supported: DensePdfExtGState[] = [];
   for (const [name, rawValue] of extGStates.entries()) {
     const resourceName = decodePdfName(name);
     const state = context.lookup(rawValue);
@@ -831,6 +1566,9 @@ function validateInertExtGStates(
     if (!(state instanceof PDFDict)) {
       continue;
     }
+    let strokeAlpha: number | undefined;
+    let fillAlpha: number | undefined;
+    let emitsPdfJsOperator = false;
 
     for (const [key, rawStateValue] of state.entries()) {
       const keyName = decodePdfName(key);
@@ -871,13 +1609,74 @@ function validateInertExtGStates(
           `enables or has an invalid /${keyName} overprint value`
         );
       }
+      if (keyName === "SA") {
+        if (stateValue instanceof PDFBool && !stateValue.asBoolean()) {
+          continue;
+        }
+        throw unsupportedExtGState(
+          sourcePageIndex,
+          resourceName,
+          "enables or has an invalid /SA automatic stroke-adjustment value"
+        );
+      }
+      if (keyName === "SM") {
+        const smoothness = stateValue instanceof PDFNumber
+          ? stateValue.asNumber()
+          : Number.NaN;
+        if (Number.isFinite(smoothness) && smoothness >= 0 && smoothness <= 1) {
+          continue;
+        }
+        throw unsupportedExtGState(
+          sourcePageIndex,
+          resourceName,
+          "has an /SM smoothness tolerance outside the range 0 to 1"
+        );
+      }
+      if (keyName === "BM") {
+        if (
+          stateValue instanceof PDFName &&
+          decodePdfName(stateValue) === "Normal"
+        ) {
+          emitsPdfJsOperator = true;
+          continue;
+        }
+        throw unsupportedExtGState(
+          sourcePageIndex,
+          resourceName,
+          "uses a blend mode other than /Normal"
+        );
+      }
+      if (keyName === "CA" || keyName === "ca") {
+        const alpha = stateValue instanceof PDFNumber
+          ? stateValue.asNumber()
+          : Number.NaN;
+        if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
+          throw unsupportedExtGState(
+            sourcePageIndex,
+            resourceName,
+            `has an invalid /${keyName} opacity outside the range 0 to 1`
+          );
+        }
+        if (keyName === "CA") strokeAlpha = alpha;
+        else fillAlpha = alpha;
+        emitsPdfJsOperator = true;
+        continue;
+      }
       throw unsupportedExtGState(
         sourcePageIndex,
         resourceName,
         `uses unsupported /${keyName}`
       );
     }
+    supported.push(Object.freeze({
+      resourceName,
+      ...(strokeAlpha === undefined ? {} : { strokeAlpha }),
+      ...(fillAlpha === undefined ? {} : { fillAlpha }),
+      emitsPdfJsOperator
+    }));
   }
+  supported.sort((a, b) => a.resourceName.localeCompare(b.resourceName));
+  return Object.freeze(supported);
 }
 
 function unsupportedExtGState(
@@ -931,23 +1730,35 @@ function rejectType3Fonts(
   }
 }
 
-function rejectOptionalContentProperties(
+function inspectOptionalContentProperties(
   properties: PDFDict | null,
   context: PDFContext,
-  sourcePageIndex: number
-): void {
+  sourcePageIndex: number,
+  optionalContent: DensePdfOptionalContentConfig
+): readonly string[] {
   if (!properties) {
-    return;
+    return Object.freeze([]);
   }
+  const alwaysVisibleNames: string[] = [];
   for (const [name, value] of properties.entries()) {
+    const propertyName = decodePdfName(name);
+    if (
+      value instanceof PDFRef &&
+      optionalContent.alwaysVisibleGroupRefs.has(value.tag)
+    ) {
+      alwaysVisibleNames.push(propertyName);
+      continue;
+    }
     if (objectGraphContainsOptionalContent(value, context, new Set(), { count: 0 })) {
       throw new PreflightRejection(
         "optional-content",
-        `PDF page ${sourcePageIndex + 1} property /${decodePdfName(name)} uses optional content.`,
-        { sourcePageIndex, resourceName: decodePdfName(name) }
+        `PDF page ${sourcePageIndex + 1} property /${propertyName} uses unsupported optional content.`,
+        { sourcePageIndex, resourceName: propertyName }
       );
     }
   }
+  alwaysVisibleNames.sort();
+  return Object.freeze(alwaysVisibleNames);
 }
 
 function objectGraphContainsOptionalContent(
@@ -1200,6 +2011,30 @@ function copyRetainedResources(
   if (properties.keys().length > 0) {
     resources.set(PDFName.of("Properties"), properties);
   }
+  const extGStates = copyNamedResourceDictionary(
+    outputContext,
+    copier,
+    page.extGStateResources,
+    page.extGStateNames,
+    compiledPage.referencedExtGStates ?? new Set(),
+    "ExtGState",
+    page.publicPage.sourcePageIndex
+  );
+  if (extGStates.keys().length > 0) {
+    resources.set(PDFName.ExtGState, extGStates);
+  }
+  const xObjects = copyNamedResourceDictionary(
+    outputContext,
+    copier,
+    page.xObjectResources,
+    page.xObjectNames,
+    compiledPage.referencedXObjects,
+    "XObject",
+    page.publicPage.sourcePageIndex
+  );
+  if (xObjects.keys().length > 0) {
+    resources.set(PDFName.XObject, xObjects);
+  }
   if (page.procSetResource) {
     resources.set(PDFName.of("ProcSet"), copier.copy(page.procSetResource));
   }
@@ -1212,7 +2047,7 @@ function copyNamedResourceDictionary(
   sourceDictionary: PDFDict | null,
   sourceNames: ReadonlyMap<string, PDFName>,
   requestedNames: ReadonlySet<string>,
-  resourceKind: "Font" | "Properties",
+  resourceKind: "ExtGState" | "Font" | "Properties" | "XObject",
   sourcePageIndex: number
 ): PDFDict {
   const output = outputContext.obj({});
@@ -1267,7 +2102,10 @@ function validateCompiledPages(
       out.has(page.sourcePageIndex) ||
       !(page.retainedTextContent instanceof Uint8Array) ||
       !isReadonlyStringSet(page.referencedFonts) ||
-      !isReadonlyStringSet(page.referencedProperties)
+      !isReadonlyStringSet(page.referencedProperties) ||
+      (page.referencedExtGStates !== undefined &&
+        !isReadonlyStringSet(page.referencedExtGStates)) ||
+      !isReadonlyStringSet(page.referencedXObjects)
     ) {
       throw new DensePdfBuildError(
         "compiled-page-mismatch",
@@ -1307,9 +2145,25 @@ function releaseSourceContentObjects(document: DensePdfPrivateDocument): number 
   for (const page of document.pages) {
     page.streams.length = 0;
     page.contentObjectRefs.length = 0;
+    const visitedForms = new Set<DensePdfPrivateFormXObject>();
+    for (const form of page.formXObjects) {
+      releaseFormContentObjects(form, visitedForms);
+    }
   }
   document.released = true;
   return released;
+}
+
+function releaseFormContentObjects(
+  form: DensePdfPrivateFormXObject,
+  visited: Set<DensePdfPrivateFormXObject>
+): void {
+  if (visited.has(form)) return;
+  visited.add(form);
+  form.descriptor = null;
+  for (const nested of form.nestedForms.values()) {
+    if (nested) releaseFormContentObjects(nested, visited);
+  }
 }
 
 function collectContentObjectRefs(
@@ -1397,6 +2251,42 @@ function readResourceNames(dictionary: PDFDict | null): ReadonlyMap<string, PDFN
     names.set(decodePdfName(key), key);
   }
   return names;
+}
+
+function readResourceDependencies(
+  dictionary: PDFDict | null,
+  context: PDFContext
+): readonly DensePdfResourceDependency[] {
+  const dependencies: DensePdfResourceDependency[] = [];
+  for (const [name, rawValue] of dictionary?.entries() ?? []) {
+    const value = context.lookup(rawValue);
+    dependencies.push(Object.freeze({
+      resourceName: decodePdfName(name),
+      dependencyKey: resourceDependencyKey(
+        rawValue,
+        value,
+        `direct-resource:${decodePdfName(name)}`
+      )
+    }));
+  }
+  dependencies.sort((left, right) => left.resourceName.localeCompare(right.resourceName));
+  return Object.freeze(dependencies);
+}
+
+function resourceDependencyKey(
+  rawValue: PDFObject,
+  resolvedValue: PDFObject | undefined,
+  fallback: string
+): string {
+  if (rawValue instanceof PDFRef) return rawValue.tag;
+  if (typeof resolvedValue === "object" && resolvedValue !== null) {
+    const cached = directResourceDependencyKeys.get(resolvedValue);
+    if (cached) return cached;
+    const key = `${fallback}:${nextDirectResourceDependencyKey++}`;
+    directResourceDependencyKeys.set(resolvedValue, key);
+    return key;
+  }
+  return fallback;
 }
 
 function lookupResourceDictionary(

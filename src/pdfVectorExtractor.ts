@@ -564,7 +564,11 @@ async function finishDensePdfPageScenes(
   }
 
   const geometryScenes = result.pages.map(createDenseGeometryScene);
-  const hasText = result.pages.some((page) => page.compiled.textShowOpCount > 0);
+  const hasText = result.pages.some(
+    (page) =>
+      page.compiled.textShowOpCount > 0 ||
+      page.compiled.referencedXObjects.length > 0
+  );
   let pageScenes = geometryScenes;
   let pdfJsTextMs = 0;
 
@@ -4820,26 +4824,30 @@ function cullInvisibleSegments(
       }
     }
 
-    const duplicateKey = buildDuplicateKey(
-      x0,
-      y0,
-      cx,
-      cy,
-      x1,
-      y1,
-      primitiveType,
-      halfWidth,
-      colorR,
-      colorG,
-      colorB,
-      alpha,
-      styleFlags
-    );
-    if (seenDuplicates.has(duplicateKey)) {
-      discardedDuplicateCount += 1;
-      continue;
+    // Repainting a translucent source-over stroke increases accumulated
+    // opacity. Only effectively opaque primitives are visual duplicates.
+    if (alpha >= OPAQUE_ALPHA_EPSILON) {
+      const duplicateKey = buildDuplicateKey(
+        x0,
+        y0,
+        cx,
+        cy,
+        x1,
+        y1,
+        primitiveType,
+        halfWidth,
+        colorR,
+        colorG,
+        colorB,
+        alpha,
+        styleFlags
+      );
+      if (seenDuplicates.has(duplicateKey)) {
+        discardedDuplicateCount += 1;
+        continue;
+      }
+      seenDuplicates.add(duplicateKey);
     }
-    seenDuplicates.add(duplicateKey);
 
     keepMask[i] = 1;
 
@@ -5889,10 +5897,6 @@ function countImagePaintOps(operatorList: { fnArray: number[] }): number {
 }
 
 async function warmUpTextPathCache(page: unknown): Promise<void> {
-  if (typeof document === "undefined") {
-    return;
-  }
-
   const pageLike = page as {
     rotate: number;
     view: number[];
@@ -5908,44 +5912,38 @@ async function warmUpTextPathCache(page: unknown): Promise<void> {
     return;
   }
 
-  const pageWidth = Math.max(1, Math.abs(pageLike.view[2] - pageLike.view[0]));
-  const pageHeight = Math.max(1, Math.abs(pageLike.view[3] - pageLike.view[1]));
-  const maxDim = Math.max(pageWidth, pageHeight);
-  const targetMaxDim = 1024;
-  const scale = clamp01(targetMaxDim / maxDim) * 0.95 + 0.05;
-
-  const viewport = pageLike.getViewport({
-    scale,
-    rotation: normalizeRotationDegrees(pageLike.rotate),
-    dontFlip: true
-  });
-
-  const width = Math.max(1, Math.ceil(viewport.width));
-  const height = Math.max(1, Math.ceil(viewport.height));
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-
-  const context = canvas.getContext("2d", {
-    alpha: false
-  });
-
-  if (!context) {
-    return;
-  }
+  let surface: RasterRenderSurface | null = null;
 
   try {
+    const pageWidth = Math.max(1, Math.abs(pageLike.view[2] - pageLike.view[0]));
+    const pageHeight = Math.max(1, Math.abs(pageLike.view[3] - pageLike.view[1]));
+    const maxDim = Math.max(pageWidth, pageHeight);
+    const targetMaxDim = 1024;
+    const scale = clamp01(targetMaxDim / maxDim) * 0.95 + 0.05;
+    const viewport = pageLike.getViewport({
+      scale,
+      rotation: normalizeRotationDegrees(pageLike.rotate),
+      dontFlip: true
+    });
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+    surface = await createRasterRenderSurface(width, height, { alpha: false });
+    if (!surface) {
+      return;
+    }
     await pageLike.render({
-      canvasContext: context,
+      canvasContext: surface.context as CanvasRenderingContext2D,
       viewport,
       intent: "display"
     }).promise;
   } catch {
     // Best-effort warm-up only; extraction continues regardless.
   } finally {
-    canvas.width = 0;
-    canvas.height = 0;
+    try {
+      surface?.dispose();
+    } catch {
+      // A failed cleanup must not turn this optional warm-up into a parse failure.
+    }
   }
 }
 
@@ -8793,13 +8791,17 @@ async function getNodeCanvasModule():
   }
 }
 
-async function createRasterRenderSurface(width: number, height: number): Promise<RasterRenderSurface | null> {
+async function createRasterRenderSurface(
+  width: number,
+  height: number,
+  options: { alpha?: boolean } = {}
+): Promise<RasterRenderSurface | null> {
   if (typeof document !== "undefined") {
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
     const context = canvas.getContext("2d", {
-      alpha: true,
+      alpha: options.alpha ?? true,
       willReadFrequently: true
     });
     if (!context) {

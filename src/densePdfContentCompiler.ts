@@ -16,6 +16,21 @@ export interface DensePdfBounds {
   maxY: number;
 }
 
+/**
+ * Compact semantic trace used to replay PDF.js operator-list batching when a
+ * Form is inserted into its caller's live operator list.
+ *
+ * Each semantic event is preceded by the generic-operator run at the same
+ * index; the final run follows the last event. Event code 0 is a Q/ET
+ * early-flush checkpoint, while positive codes index `fontDependencyKeys`
+ * plus one and represent a conditional dependency followed by `Tf`.
+ */
+export interface DensePdfOperatorCountTrace {
+  readonly genericRuns: Uint32Array;
+  readonly semanticEvents: Uint32Array;
+  readonly fontDependencyKeys: readonly string[];
+}
+
 export type DensePdfContentSource =
   | Uint8Array
   | Iterable<Uint8Array>
@@ -29,11 +44,50 @@ export interface DensePdfCompileProgress {
   sourceSegmentCount: number;
 }
 
+/** Preflight metadata for a recursively classified Form XObject. */
+export interface DensePdfTextFormSummary {
+  /** Stable source Form identity; aliases must share the same key. */
+  dependencyKey: string;
+  bbox: DensePdfBounds;
+  matrix: DensePdfMatrix;
+  operatorCount: number;
+  dependencyOpCount: number;
+  /** Stable source-object identities for PDF.js font dependency ops. */
+  dependencyKeys: readonly string[];
+  /** Batch-aware semantic operator trace for insertion into a caller. */
+  operatorCountTrace: DensePdfOperatorCountTrace;
+  textShowOpCount: number;
+  /** True when this Form or a referenced nested Form paints non-text geometry. */
+  hasNonTextPaint: boolean;
+}
+
+/** Rendering behavior for a preflight-validated `/ExtGState` resource. */
+export interface DensePdfExtGStateDefinition {
+  resourceName: string;
+  strokeAlpha?: number;
+  fillAlpha?: number;
+  emitsPdfJsOperator: boolean;
+}
+
 export interface DensePdfContentCompileOptions {
   pageMatrix: DensePdfMatrix;
   pageBounds: DensePdfBounds;
   /** Names of page `/ExtGState` resources preflight proved behaviorally inert. */
   availableExtGStates?: readonly string[];
+  /** Supported page `/ExtGState` behavior discovered during preflight. */
+  extGStates?: readonly DensePdfExtGStateDefinition[];
+  /** Property names whose direct OCG is visible in the default configuration. */
+  alwaysVisibleOptionalContentProperties?: readonly string[];
+  /** Recursively classified Form XObjects available for retention or BBox culling. */
+  availableTextFormXObjects?: ReadonlyMap<string, DensePdfTextFormSummary>;
+  /** Stable source identities for font names in the active resource scope. */
+  fontDependencyKeys?: ReadonlyMap<string, string>;
+  /** Classification-only mode: account for painted nested Forms without retaining them. */
+  allowPaintedFormXObjects?: boolean;
+  /** Used while preflighting text-only forms; clipping/end-path operations remain valid. */
+  rejectPathPainting?: boolean;
+  /** Validate and account for Form content without allocating packed paint geometry. */
+  classificationOnly?: boolean;
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
   totalBytes?: number;
@@ -45,6 +99,9 @@ export interface DensePdfContentCompileOptions {
 export interface DensePdfCompiledPage {
   operatorCount: number;
   dependencyOpCount: number;
+  dependencyKeys: string[];
+  /** Present only for classification-only Form compiles. */
+  operatorCountTrace?: DensePdfOperatorCountTrace;
   pathCount: number;
   sourceSegmentCount: number;
   mergedSegmentCount: number;
@@ -71,6 +128,8 @@ export interface DensePdfCompiledPage {
   retainedTextContent: Uint8Array;
   referencedFonts: string[];
   referencedProperties: string[];
+  referencedExtGStates: string[];
+  referencedXObjects: string[];
   textShowOpCount: number;
 }
 
@@ -133,6 +192,7 @@ const DEFAULT_YIELD_INTERVAL_MS = 50;
 const MAX_OPERAND_COUNT = 1_000_000;
 const MAX_PAINT_PATH_FLOATS = 65_536;
 const MAX_COVERAGE_GROUP_SIZE = 8_192;
+const MAX_OPERATOR_TRACE_SEMANTIC_EVENTS = 1_000_000;
 const UTF8_ENCODER = new TextEncoder();
 
 interface PdfNameValue {
@@ -195,6 +255,8 @@ interface GraphicsState {
   fillB: number;
   strokeColorSpace: DeviceColorSpace;
   fillColorSpace: DeviceColorSpace;
+  strokeAlpha: number;
+  fillAlpha: number;
 }
 
 interface DensePdfClipMask {
@@ -221,6 +283,18 @@ interface StrokeFinalizeResult {
   bounds: DensePdfBounds | null;
   maxHalfWidth: number;
   discardedContainedCount: number;
+}
+
+function emptyStrokeFinalizeResult(): StrokeFinalizeResult {
+  return {
+    endpoints: new Float32Array(0),
+    primitiveMeta: new Float32Array(0),
+    primitiveBounds: new Float32Array(0),
+    styles: new Float32Array(0),
+    bounds: null,
+    maxHalfWidth: 0,
+    discardedContainedCount: 0
+  };
 }
 
 /** Compile already-decoded page content without materializing a PDF.js operator list. */
@@ -294,22 +368,67 @@ export async function compileDensePdfContent(
   return result;
 }
 
+/** Discover top-level `/Name Do` operands using the compiler's exact lexer. */
+export function scanDensePdfXObjectReferences(
+  content: Uint8Array
+): readonly string[] {
+  const scanner = new DenseXObjectReferenceScanner();
+  const lexer = new IncrementalPdfLexer((token) => scanner.consumeToken(token));
+  lexer.feed(content, false);
+  lexer.finish();
+  scanner.finish();
+  return Object.freeze([...scanner.references]);
+}
+
+function normalizeExtGStateDefinitions(
+  options: DensePdfContentCompileOptions
+): ReadonlyMap<string, DensePdfExtGStateDefinition> {
+  const definitions = new Map<string, DensePdfExtGStateDefinition>();
+  for (const resourceName of options.availableExtGStates ?? []) {
+    if (typeof resourceName !== "string" || resourceName.length === 0) {
+      throw new TypeError("availableExtGStates contains an invalid resource name.");
+    }
+    definitions.set(resourceName, {
+      resourceName,
+      emitsPdfJsOperator: false
+    });
+  }
+  for (const definition of options.extGStates ?? []) {
+    if (
+      !definition ||
+      typeof definition.resourceName !== "string" ||
+      definition.resourceName.length === 0 ||
+      typeof definition.emitsPdfJsOperator !== "boolean" ||
+      !isOptionalUnitInterval(definition.strokeAlpha) ||
+      !isOptionalUnitInterval(definition.fillAlpha)
+    ) {
+      throw new TypeError("extGStates contains an invalid supported graphics-state definition.");
+    }
+    definitions.set(definition.resourceName, { ...definition });
+  }
+  return definitions;
+}
+
+function isOptionalUnitInterval(value: number | undefined): boolean {
+  return value === undefined || (Number.isFinite(value) && value >= 0 && value <= 1);
+}
+
 class DenseContentCompiler {
   readonly options: DensePdfContentCompileOptions;
 
   readonly path = new ReusablePathBuilder();
 
-  readonly strokes: DenseStrokeBuilder;
+  readonly strokes: DenseStrokeBuilder | null;
 
-  readonly fillPathMetaA = new Float4Builder(2_048);
+  readonly fillPathMetaA: Float4Builder | null;
 
-  readonly fillPathMetaB = new Float4Builder(2_048);
+  readonly fillPathMetaB: Float4Builder | null;
 
-  readonly fillPathMetaC = new Float4Builder(2_048);
+  readonly fillPathMetaC: Float4Builder | null;
 
-  readonly fillSegmentsA = new Float4Builder(16_384);
+  readonly fillSegmentsA: Float4Builder | null;
 
-  readonly fillSegmentsB = new Float4Builder(16_384);
+  readonly fillSegmentsB: Float4Builder | null;
 
   readonly textProgram = new PdfProgramBuilder();
 
@@ -317,15 +436,23 @@ class DenseContentCompiler {
 
   readonly referencedProperties = new Set<string>();
 
+  readonly referencedExtGStates = new Set<string>();
+
+  readonly referencedXObjects = new Set<string>();
+
   readonly operands: PdfValue[] = [];
 
   readonly containers: ParserContainer[] = [];
 
   readonly stateStack: GraphicsState[] = [];
 
-  readonly operatorTracker = new PdfJsOperatorCountTracker();
+  readonly operatorTracker: PdfJsOperatorCountTracker;
 
-  readonly availableExtGStates: ReadonlySet<string>;
+  readonly extGStates: ReadonlyMap<string, DensePdfExtGStateDefinition>;
+
+  readonly alwaysVisibleOptionalContentProperties: ReadonlySet<string>;
+
+  readonly fontDependencyKeys: ReadonlyMap<string, string>;
 
   private state: GraphicsState;
 
@@ -347,7 +474,14 @@ class DenseContentCompiler {
 
   constructor(options: DensePdfContentCompileOptions) {
     this.options = options;
-    this.availableExtGStates = new Set(options.availableExtGStates ?? []);
+    this.operatorTracker = new PdfJsOperatorCountTracker(
+      options.classificationOnly === true
+    );
+    this.extGStates = normalizeExtGStateDefinitions(options);
+    this.alwaysVisibleOptionalContentProperties = new Set(
+      options.alwaysVisibleOptionalContentProperties ?? []
+    );
+    this.fontDependencyKeys = options.fontDependencyKeys ?? new Map();
     this.state = {
       matrix: [...options.pageMatrix],
       matrixScale: matrixScale(options.pageMatrix),
@@ -364,9 +498,19 @@ class DenseContentCompiler {
       fillG: 0,
       fillB: 0,
       strokeColorSpace: "DeviceGray",
-      fillColorSpace: "DeviceGray"
+      fillColorSpace: "DeviceGray",
+      strokeAlpha: 1,
+      fillAlpha: 1
     };
-    this.strokes = new DenseStrokeBuilder(options.enableInvisibleCull !== false);
+    const collectGeometry = options.classificationOnly !== true;
+    this.strokes = collectGeometry
+      ? new DenseStrokeBuilder(options.enableInvisibleCull !== false)
+      : null;
+    this.fillPathMetaA = collectGeometry ? new Float4Builder(2_048) : null;
+    this.fillPathMetaB = collectGeometry ? new Float4Builder(2_048) : null;
+    this.fillPathMetaC = collectGeometry ? new Float4Builder(2_048) : null;
+    this.fillSegmentsA = collectGeometry ? new Float4Builder(16_384) : null;
+    this.fillSegmentsB = collectGeometry ? new Float4Builder(16_384) : null;
   }
 
   get operatorCount(): number {
@@ -374,7 +518,7 @@ class DenseContentCompiler {
   }
 
   get sourceSegmentCount(): number {
-    return this.strokes.sourceSegmentCount;
+    return this.strokes?.sourceSegmentCount ?? 0;
   }
 
   consumeToken(token: LexerToken): void {
@@ -450,21 +594,26 @@ class DenseContentCompiler {
       }
     }
 
-    const strokeResult = await this.strokes.finalize(checkpoint);
-    const fillPathMetaA = this.fillPathMetaA.toTypedArray();
-    const fillPathMetaB = this.fillPathMetaB.toTypedArray();
-    const fillPathMetaC = this.fillPathMetaC.toTypedArray();
-    const fillSegmentsA = this.fillSegmentsA.toTypedArray();
-    const fillSegmentsB = this.fillSegmentsB.toTypedArray();
+    const strokeResult = this.strokes
+      ? await this.strokes.finalize(checkpoint)
+      : emptyStrokeFinalizeResult();
+    const fillPathMetaA = this.fillPathMetaA?.toTypedArray() ?? new Float32Array(0);
+    const fillPathMetaB = this.fillPathMetaB?.toTypedArray() ?? new Float32Array(0);
+    const fillPathMetaC = this.fillPathMetaC?.toTypedArray() ?? new Float32Array(0);
+    const fillSegmentsA = this.fillSegmentsA?.toTypedArray() ?? new Float32Array(0);
+    const fillSegmentsB = this.fillSegmentsB?.toTypedArray() ?? new Float32Array(0);
     const combinedBounds = combineBounds(strokeResult.bounds, this.fillBounds) ?? {
       ...this.options.pageBounds
     };
+    const operatorCountTrace = this.operatorTracker.finishTrace();
     return {
       operatorCount: this.operatorTracker.operatorCount,
       dependencyOpCount: this.operatorTracker.dependencyOpCount,
+      dependencyKeys: [...this.operatorTracker.dependencyKeys],
+      ...(operatorCountTrace ? { operatorCountTrace } : {}),
       pathCount: this.pathCount,
-      sourceSegmentCount: this.strokes.sourceSegmentCount,
-      mergedSegmentCount: this.strokes.mergedSegmentCount,
+      sourceSegmentCount: this.strokes?.sourceSegmentCount ?? 0,
+      mergedSegmentCount: this.strokes?.mergedSegmentCount ?? 0,
       segmentCount: strokeResult.endpoints.length >> 2,
       endpoints: strokeResult.endpoints,
       primitiveMeta: strokeResult.primitiveMeta,
@@ -481,13 +630,15 @@ class DenseContentCompiler {
       strokeBounds: strokeResult.bounds,
       fillBounds: this.fillBounds,
       maxHalfWidth: strokeResult.maxHalfWidth,
-      discardedTransparentCount: this.strokes.discardedTransparentCount,
-      discardedDegenerateCount: this.strokes.discardedDegenerateCount,
-      discardedDuplicateCount: this.strokes.discardedDuplicateCount,
+      discardedTransparentCount: this.strokes?.discardedTransparentCount ?? 0,
+      discardedDegenerateCount: this.strokes?.discardedDegenerateCount ?? 0,
+      discardedDuplicateCount: this.strokes?.discardedDuplicateCount ?? 0,
       discardedContainedCount: strokeResult.discardedContainedCount,
       retainedTextContent: this.textProgram.toUint8Array(),
       referencedFonts: [...this.referencedFonts],
       referencedProperties: [...this.referencedProperties],
+      referencedExtGStates: [...this.referencedExtGStates],
+      referencedXObjects: [...this.referencedXObjects],
       textShowOpCount: this.textShowOpCount
     };
   }
@@ -594,6 +745,12 @@ class DenseContentCompiler {
       case "b*":
       case "n":
         this.requireArgs(operator, args, 0);
+        if (operator !== "n" && this.options.rejectPathPainting) {
+          throw new DensePdfUnsupportedError(
+            `Path-painting operator ${operator} is not allowed in a text-only Form XObject.`,
+            operator
+          );
+        }
         this.paintPath(operator);
         return;
       case "q":
@@ -653,15 +810,25 @@ class DenseContentCompiler {
       case "gs": {
         this.requireArgs(operator, args, 1);
         const resourceName = nameArg(args, 0);
-        if (!this.availableExtGStates.has(resourceName)) {
+        const definition = this.extGStates.get(resourceName);
+        if (!definition) {
           throw new DensePdfUnsupportedError(
-            `Graphics state /${resourceName} was not validated as behaviorally inert.`,
+            `Graphics state /${resourceName} was not validated for the dense-vector path.`,
             operator
           );
         }
-        // PDF.js omits OPM-only/overprint-disabled ExtGState applications from
-        // its operator list. They have no rendering or text-state effect, so
-        // consume the source operator without retaining or counting it.
+        if (definition.strokeAlpha !== undefined) {
+          this.state.strokeAlpha = definition.strokeAlpha;
+        }
+        if (definition.fillAlpha !== undefined) {
+          this.state.fillAlpha = definition.fillAlpha;
+        }
+        if (definition.emitsPdfJsOperator) {
+          this.referencedExtGStates.add(resourceName);
+          this.trackAndRetainState(args, operator);
+        }
+        // PDF.js omits OPM-only/overprint-disabled dictionaries from its
+        // operator list. Those definitions are consumed without counting.
         return;
       }
       case "G":
@@ -734,6 +901,48 @@ class DenseContentCompiler {
         this.trackAndRetainState(args, operator);
         return;
       }
+      case "Do": {
+        this.requireArgs(operator, args, 1);
+        this.rejectTransformChangeInsidePath(operator);
+        const resourceName = nameArg(args, 0);
+        const summary = this.options.availableTextFormXObjects?.get(resourceName);
+        if (!summary) {
+          throw new DensePdfUnsupportedError(
+            `XObject /${resourceName} is missing, is an image, or was not validated as a supported Form XObject.`,
+            operator
+          );
+        }
+        assertValidTextFormSummary(summary, resourceName);
+        this.operatorTracker.addTextFormXObject(resourceName, summary);
+        this.textShowOpCount += summary.textShowOpCount;
+        const formBounds = transformRectangleBounds(
+          summary.bbox,
+          multiplyMatrices(this.state.matrix, summary.matrix)
+        );
+        const visible = boundsIntersectNullable(formBounds, this.state.clipBounds);
+        if (!visible) {
+          // The Form BBox is an implicit clip. Retaining an off-clip Form that
+          // contains text preserves PDF.js's source-text/font accounting while
+          // its vector paint remains provably unable to reach the page.
+          if (summary.textShowOpCount > 0) {
+            this.referencedXObjects.add(resourceName);
+            this.textProgram.pushStatement(args, operator);
+          }
+          return;
+        }
+        if (summary.hasNonTextPaint) {
+          if (this.options.allowPaintedFormXObjects) {
+            return;
+          }
+          throw new DensePdfUnsupportedError(
+            `Visible Form XObject /${resourceName} contains non-text paint.`,
+            operator
+          );
+        }
+        this.referencedXObjects.add(resourceName);
+        this.textProgram.pushStatement(args, operator);
+        return;
+      }
       case "BT":
       case "ET":
       case "T*":
@@ -787,7 +996,10 @@ class DenseContentCompiler {
         const font = nameArg(args, 0);
         numberArg(args, 1);
         this.referencedFonts.add(font);
-        this.operatorTracker.addFontOperator(font);
+        this.operatorTracker.addFontOperator(
+          font,
+          this.fontDependencyKeys.get(font) ?? font
+        );
         this.textProgram.pushStatement(args, operator);
         return;
       }
@@ -841,7 +1053,22 @@ class DenseContentCompiler {
         this.requireArgs(operator, args, 2);
         const tag = nameArg(args, 0);
         if (tag === "OC") {
-          throw new DensePdfUnsupportedError("Optional-content marked content requires PDF.js.", operator);
+          const property = args[1];
+          if (
+            !isPdfName(property) ||
+            !this.alwaysVisibleOptionalContentProperties.has(property.value)
+          ) {
+            throw new DensePdfUnsupportedError(
+              "Optional-content marked content is not provably visible in the default configuration.",
+              operator
+            );
+          }
+          // HEP captures the default all-visible view rather than preserving
+          // interactive layer controls. A plain marked-content wrapper keeps
+          // PDF.js operator counts and text scoping without copying OCG state.
+          this.operatorTracker.addOperator(operator);
+          this.textProgram.pushBytes(UTF8_ENCODER.encode("/Span BMC\n"));
+          return;
         }
         const property = args[1];
         if (isPdfName(property)) {
@@ -907,6 +1134,7 @@ class DenseContentCompiler {
     }
 
     if (
+      !this.options.classificationOnly &&
       operator === "S" &&
       this.pendingClipRule === null &&
       this.state.lineDash.length === 0 &&
@@ -954,6 +1182,38 @@ class DenseContentCompiler {
       this.pathCount += 1;
     }
 
+    const fillRule = fillPaint
+      ? operator.includes("*") ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO
+      : null;
+    if (
+      pathVisible &&
+      fillRule === FILL_RULE_NONZERO &&
+      countPathMoveOps(pathData) >= 100
+    ) {
+      throw new DensePdfUnsupportedError(
+        "Large disconnected nonzero fills require HEPR's PDF.js subpath splitter.",
+        operator
+      );
+    }
+
+    if (this.options.classificationOnly) {
+      this.clearPaintPathState();
+      return;
+    }
+
+    const strokes = this.strokes;
+    const fillPathMetaA = this.fillPathMetaA;
+    const fillPathMetaB = this.fillPathMetaB;
+    const fillPathMetaC = this.fillPathMetaC;
+    const fillSegmentsA = this.fillSegmentsA;
+    const fillSegmentsB = this.fillSegmentsB;
+    if (
+      !strokes || !fillPathMetaA || !fillPathMetaB || !fillPathMetaC ||
+      !fillSegmentsA || !fillSegmentsB
+    ) {
+      throw new DensePdfSyntaxError("Dense PDF geometry builders are unavailable.");
+    }
+
     if (pathVisible && strokePaint) {
       const isHairline = this.state.lineWidth <= 0;
       const halfWidth = isHairline ? 0 : this.state.lineWidth * this.state.matrixScale * 0.5;
@@ -961,7 +1221,7 @@ class DenseContentCompiler {
       // bounds intersect the clip, even when every primitive of that path is
       // later rejected by primitive-level clipping. Preserve that no-cull
       // metadata boundary independently from primitive emission.
-      this.strokes.recordPathHalfWidth(halfWidth);
+      strokes.recordPathHalfWidth(halfWidth);
       let flags = isHairline ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0;
       if (this.state.lineCap === 1) {
         flags |= STROKE_STYLE_FLAG_ROUND_CAP;
@@ -973,55 +1233,54 @@ class DenseContentCompiler {
         this.state.strokeR,
         this.state.strokeG,
         this.state.strokeB,
-        1,
+        this.state.strokeAlpha,
         flags,
         this.state.lineDash,
         this.state.dashPhase,
         this.options.enableSegmentMerge !== false,
-        this.strokes,
+        strokes,
         this.state.clipBounds
       );
     }
 
     if (pathVisible && fillPaint) {
-      const fillRule = operator.includes("*") ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
-      if (fillRule === FILL_RULE_NONZERO && countPathMoveOps(pathData) >= 100) {
-        throw new DensePdfUnsupportedError(
-          "Large disconnected nonzero fills require HEPR's PDF.js subpath splitter.",
-          operator
-        );
+      if (fillRule === null) {
+        throw new DensePdfSyntaxError("Missing PDF fill rule for a painted fill path.");
       }
-      const emittedBounds = emitFilledPathFromPath(
-        pathData,
-        this.state.matrix,
-        fillRule,
-        strokePaint,
-        this.state.fillR,
-        this.state.fillG,
-        this.state.fillB,
-        1,
-        this.fillPathMetaA,
-        this.fillPathMetaB,
-        this.fillPathMetaC,
-        this.fillSegmentsA,
-        this.fillSegmentsB,
-        this.state.clipBounds,
-        this.state.clipMask,
-        this.options.pageBounds
-      );
+      const emittedBounds = this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON
+        ? emitFilledPathFromPath(
+            pathData,
+            this.state.matrix,
+            fillRule,
+            strokePaint && this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON,
+            this.state.fillR,
+            this.state.fillG,
+            this.state.fillB,
+            this.state.fillAlpha,
+            fillPathMetaA,
+            fillPathMetaB,
+            fillPathMetaC,
+            fillSegmentsA,
+            fillSegmentsB,
+            this.state.clipBounds,
+            this.state.clipMask,
+            this.options.pageBounds
+          )
+        : null;
       if (emittedBounds) {
         this.fillPathCount += 1;
         this.fillBounds = combineBounds(this.fillBounds, emittedBounds);
       }
     }
 
-    this.path.clear();
-    this.pendingTextClipPath = null;
-    this.pendingTextClipStatement = null;
-    this.pendingClipRule = null;
+    this.clearPaintPathState();
   }
 
   private paintSimpleStrokeLine(): void {
+    const strokes = this.strokes;
+    if (!strokes) {
+      throw new DensePdfSyntaxError("Dense PDF stroke builder is unavailable.");
+    }
     this.operatorTracker.addOperator("constructPath");
     const data = this.path.rawData();
     const matrix = this.state.matrix;
@@ -1047,7 +1306,7 @@ class DenseContentCompiler {
     const halfWidth = hairline
       ? 0
       : this.state.lineWidth * this.state.matrixScale * 0.5;
-    this.strokes.recordPathHalfWidth(halfWidth);
+    strokes.recordPathHalfWidth(halfWidth);
     const dx = x1 - x0;
     const dy = y1 - y0;
     const zeroLength = dx * dx + dy * dy < 1e-10;
@@ -1055,7 +1314,7 @@ class DenseContentCompiler {
       this.path.clear();
       return;
     }
-    this.strokes.sourceSegmentCount += 1;
+    strokes.sourceSegmentCount += 1;
     let flags = hairline ? DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE : 0;
     if (this.state.lineCap === 1) flags |= STROKE_STYLE_FLAG_ROUND_CAP;
     const paintMinX = geometryMinX - halfWidth;
@@ -1071,11 +1330,11 @@ class DenseContentCompiler {
         visibleMinX > paintMinX + 1e-6 || visibleMinY > paintMinY + 1e-6 ||
         visibleMaxX < paintMaxX - 1e-6 || visibleMaxY < paintMaxY - 1e-6;
       if (clipped) flags |= STROKE_STYLE_FLAG_CLIPPED;
-      this.strokes.emitPrimitive(
+      strokes.emitPrimitive(
         x0, y0, x1, y1, x1, y1, STROKE_PRIMITIVE_LINE,
         halfWidth,
         this.state.strokeR, this.state.strokeG, this.state.strokeB,
-        1, flags,
+        this.state.strokeAlpha, flags,
         clipped ? visibleMinX : geometryMinX,
         clipped ? visibleMinY : geometryMinY,
         clipped ? visibleMaxX : geometryMaxX,
@@ -1083,6 +1342,13 @@ class DenseContentCompiler {
       );
     }
     this.path.clear();
+  }
+
+  private clearPaintPathState(): void {
+    this.path.clear();
+    this.pendingTextClipPath = null;
+    this.pendingTextClipStatement = null;
+    this.pendingClipRule = null;
   }
 
   private flushTextClip(): void {
@@ -1117,6 +1383,109 @@ class DenseContentCompiler {
         operator
       );
     }
+  }
+}
+
+class DenseXObjectReferenceScanner {
+  readonly references = new Set<string>();
+
+  private readonly operands: PdfValue[] = [];
+
+  private readonly containers: ParserContainer[] = [];
+
+  consumeToken(token: LexerToken): void {
+    if (token.kind === "array-start") {
+      this.containers.push({ kind: "array", values: [], entries: [], pendingKey: null });
+      return;
+    }
+    if (token.kind === "dict-start") {
+      this.containers.push({ kind: "dictionary", values: [], entries: [], pendingKey: null });
+      return;
+    }
+    if (token.kind === "array-end" || token.kind === "dict-end") {
+      this.closeContainer(token.kind);
+      return;
+    }
+    if (token.kind === "number") {
+      this.appendValue(token.value);
+      return;
+    }
+    if (token.kind === "name") {
+      this.appendValue({ kind: "name", value: token.value });
+      return;
+    }
+    if (token.kind === "string") {
+      this.appendValue({ kind: "string", value: token.value });
+      return;
+    }
+    if (token.kind !== "word") {
+      throw new DensePdfSyntaxError(`Unexpected ${token.kind} token in PDF content.`);
+    }
+    if (token.value === "true" || token.value === "false" || token.value === "null") {
+      this.appendValue(token.value === "null" ? null : token.value === "true");
+      return;
+    }
+    if (this.containers.length > 0) {
+      throw new DensePdfSyntaxError(
+        `Unexpected keyword ${token.value} inside a content-stream object.`
+      );
+    }
+    if (token.value === "Do") {
+      if (this.operands.length !== 1 || !isPdfName(this.operands[0])) {
+        throw new DensePdfSyntaxError("Do requires exactly one name operand.");
+      }
+      this.references.add(this.operands[0].value);
+    }
+    this.operands.length = 0;
+  }
+
+  finish(): void {
+    if (this.containers.length > 0) {
+      throw new DensePdfSyntaxError("Unterminated array or dictionary in PDF content.");
+    }
+    if (this.operands.length > 0) {
+      throw new DensePdfSyntaxError("Dangling operands at the end of PDF content.");
+    }
+  }
+
+  private appendValue(value: PdfValue): void {
+    const container = this.containers.at(-1);
+    if (!container) {
+      if (this.operands.length >= MAX_OPERAND_COUNT) {
+        throw new DensePdfSyntaxError("PDF content operand stack exceeded its safety limit.");
+      }
+      this.operands.push(value);
+      return;
+    }
+    if (container.kind === "array") {
+      container.values.push(value);
+      return;
+    }
+    if (container.pendingKey === null) {
+      if (!isPdfName(value)) {
+        throw new DensePdfSyntaxError("PDF dictionary keys must be names.");
+      }
+      container.pendingKey = value.value;
+      return;
+    }
+    container.entries.push([container.pendingKey, value]);
+    container.pendingKey = null;
+  }
+
+  private closeContainer(kind: "array-end" | "dict-end"): void {
+    const container = this.containers.pop();
+    const expected = kind === "array-end" ? "array" : "dictionary";
+    if (!container || container.kind !== expected) {
+      throw new DensePdfSyntaxError(`Unexpected ${kind} token in PDF content.`);
+    }
+    if (container.kind === "dictionary" && container.pendingKey !== null) {
+      throw new DensePdfSyntaxError("PDF dictionary ended without a value for its final key.");
+    }
+    this.appendValue(
+      container.kind === "array"
+        ? { kind: "array", value: container.values }
+        : { kind: "dictionary", value: container.entries }
+    );
   }
 }
 
@@ -1513,20 +1882,84 @@ class PdfJsOperatorCountTracker {
 
   dependencyOpCount = 0;
 
+  readonly dependencyKeys: string[] = [];
+
   private weight = 0;
 
   private readonly fontDependencies = new Set<string>();
 
-  addFontOperator(fontName: string): void {
-    if (!this.fontDependencies.has(fontName)) {
-      this.fontDependencies.add(fontName);
+  private readonly traceBuilder: PdfJsOperatorCountTraceBuilder | null;
+
+  constructor(recordTrace = false) {
+    this.traceBuilder = recordTrace ? new PdfJsOperatorCountTraceBuilder() : null;
+  }
+
+  addFontOperator(fontName: string, dependencyKey: string): void {
+    this.traceBuilder?.addFontDependency(dependencyKey);
+    if (!this.fontDependencies.has(dependencyKey)) {
+      this.fontDependencies.add(dependencyKey);
       this.dependencyOpCount += 1;
-      this.addOperator("dependency");
+      this.dependencyKeys.push(dependencyKey);
+      this.addOperatorWithoutTrace("dependency");
     }
-    this.addOperator("Tf");
+    this.addOperatorWithoutTrace("Tf");
+  }
+
+  addTextFormXObject(
+    _resourceName: string,
+    summary: DensePdfTextFormSummary
+  ): void {
+    // PDF.js surrounds a Form's evaluated operator list with begin/end ops.
+    // Replaying the inner semantic trace against the caller's current weight
+    // is necessary because a 1000-op (or Q/ET near-1000) flush can land at a
+    // different position than it did when the Form was classified in isolation.
+    this.addGenericOperatorRun(1);
+    this.replayTrace(summary.operatorCountTrace);
+    this.addGenericOperatorRun(1);
   }
 
   addOperator(operator: string): void {
+    if (operator === "Q" || operator === "ET") {
+      this.traceBuilder?.addEarlyFlushOperator();
+    } else {
+      this.traceBuilder?.addGenericOperators(1);
+    }
+    this.addOperatorWithoutTrace(operator);
+  }
+
+  finishTrace(): DensePdfOperatorCountTrace | undefined {
+    return this.traceBuilder?.finish();
+  }
+
+  private replayTrace(trace: DensePdfOperatorCountTrace): void {
+    const { genericRuns, semanticEvents, fontDependencyKeys } = trace;
+    for (let index = 0; index < semanticEvents.length; index += 1) {
+      this.addGenericOperatorRun(genericRuns[index]);
+      const event = semanticEvents[index];
+      if (event === 0) {
+        // Q and ET have identical OperatorList early-flush behavior.
+        this.addOperator("Q");
+      } else {
+        this.addFontOperator("", fontDependencyKeys[event - 1]);
+      }
+    }
+    this.addGenericOperatorRun(genericRuns[semanticEvents.length]);
+  }
+
+  private addGenericOperatorRun(count: number): void {
+    if (count === 0) return;
+    this.traceBuilder?.addGenericOperators(count);
+    this.operatorCount += count;
+    const combinedWeight = this.weight + count;
+    if (combinedWeight >= 1_000) {
+      this.weight = combinedWeight % 1_000;
+      this.fontDependencies.clear();
+    } else {
+      this.weight = combinedWeight;
+    }
+  }
+
+  private addOperatorWithoutTrace(operator: string): void {
     this.operatorCount += 1;
     this.weight += 1;
     if (
@@ -1535,6 +1968,139 @@ class PdfJsOperatorCountTracker {
     ) {
       this.weight = 0;
       this.fontDependencies.clear();
+    }
+  }
+}
+
+class PdfJsOperatorCountTraceBuilder {
+  private readonly genericRuns: number[] = [0];
+
+  private readonly semanticEvents: number[] = [];
+
+  private readonly fontDependencyKeys: string[] = [];
+
+  private readonly fontDependencyIndices = new Map<string, number>();
+
+  private finishedTrace: DensePdfOperatorCountTrace | null = null;
+
+  addGenericOperators(count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new DensePdfSyntaxError("Operator trace received an invalid generic run length.");
+    }
+    const index = this.genericRuns.length - 1;
+    const combined = this.genericRuns[index] + count;
+    if (combined > 0xffff_ffff) {
+      throw new DensePdfUnsupportedError(
+        "A Form XObject operator run exceeds the dense compiler's trace limit."
+      );
+    }
+    this.genericRuns[index] = combined;
+  }
+
+  addEarlyFlushOperator(): void {
+    this.reserveSemanticEvent();
+    this.semanticEvents.push(0);
+    this.genericRuns.push(0);
+  }
+
+  addFontDependency(dependencyKey: string): void {
+    this.reserveSemanticEvent();
+    let index = this.fontDependencyIndices.get(dependencyKey);
+    if (index === undefined) {
+      index = this.fontDependencyKeys.length;
+      this.fontDependencyKeys.push(dependencyKey);
+      this.fontDependencyIndices.set(dependencyKey, index);
+    }
+    this.semanticEvents.push(index + 1);
+    this.genericRuns.push(0);
+  }
+
+  finish(): DensePdfOperatorCountTrace {
+    if (!this.finishedTrace) {
+      this.finishedTrace = Object.freeze({
+        genericRuns: Uint32Array.from(this.genericRuns),
+        semanticEvents: Uint32Array.from(this.semanticEvents),
+        fontDependencyKeys: Object.freeze([...this.fontDependencyKeys])
+      });
+    }
+    return this.finishedTrace;
+  }
+
+  private reserveSemanticEvent(): void {
+    if (this.semanticEvents.length >= MAX_OPERATOR_TRACE_SEMANTIC_EVENTS) {
+      throw new DensePdfUnsupportedError(
+        `A Form XObject operator trace exceeds the ${MAX_OPERATOR_TRACE_SEMANTIC_EVENTS.toLocaleString()}-event safety limit.`
+      );
+    }
+  }
+}
+
+function assertValidTextFormSummary(
+  summary: DensePdfTextFormSummary,
+  resourceName: string
+): void {
+  if (typeof summary.dependencyKey !== "string" || summary.dependencyKey.length === 0) {
+    throw new DensePdfSyntaxError(
+      `Form XObject /${resourceName} has an invalid dependencyKey.`
+    );
+  }
+  for (const [label, value] of [
+    ["operatorCount", summary.operatorCount],
+    ["dependencyOpCount", summary.dependencyOpCount],
+    ["textShowOpCount", summary.textShowOpCount]
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new DensePdfSyntaxError(
+        `Form XObject /${resourceName} has an invalid ${label}.`
+      );
+    }
+  }
+  if (summary.dependencyOpCount > summary.operatorCount) {
+    throw new DensePdfSyntaxError(
+      `Form XObject /${resourceName} has more dependencies than operators.`
+    );
+  }
+  if (
+    !Array.isArray(summary.dependencyKeys) ||
+    summary.dependencyKeys.some((key) => typeof key !== "string" || key.length === 0) ||
+    summary.dependencyKeys.length !== summary.dependencyOpCount
+  ) {
+    throw new DensePdfSyntaxError(
+      `Form XObject /${resourceName} has invalid dependency identities.`
+    );
+  }
+  assertValidOperatorCountTrace(summary.operatorCountTrace, resourceName);
+  assertValidBounds(summary.bbox, `Form XObject /${resourceName} BBox`);
+  assertFiniteMatrix(summary.matrix);
+  if (typeof summary.hasNonTextPaint !== "boolean") {
+    throw new DensePdfSyntaxError(
+      `Form XObject /${resourceName} has an invalid paint classification.`
+    );
+  }
+}
+
+function assertValidOperatorCountTrace(
+  trace: DensePdfOperatorCountTrace,
+  resourceName: string
+): void {
+  if (
+    !trace ||
+    !(trace.genericRuns instanceof Uint32Array) ||
+    !(trace.semanticEvents instanceof Uint32Array) ||
+    trace.semanticEvents.length > MAX_OPERATOR_TRACE_SEMANTIC_EVENTS ||
+    trace.genericRuns.length !== trace.semanticEvents.length + 1 ||
+    !Array.isArray(trace.fontDependencyKeys) ||
+    trace.fontDependencyKeys.some((key) => typeof key !== "string" || key.length === 0)
+  ) {
+    throw new DensePdfSyntaxError(
+      `Form XObject /${resourceName} has an invalid operator-count trace.`
+    );
+  }
+  for (const event of trace.semanticEvents) {
+    if (event > trace.fontDependencyKeys.length) {
+      throw new DensePdfSyntaxError(
+        `Form XObject /${resourceName} has an invalid operator-count trace event.`
+      );
     }
   }
 }
@@ -1647,19 +2213,24 @@ class DenseStrokeBuilder {
           return;
         }
       }
-      fillDuplicateTuple(
-        this.duplicateTuple,
-        x0, y0, cx, cy, x1, y1, type, width, r, g, b, decodedAlpha,
-        decodedFlags
-      );
-      if (this.duplicateIndex.hasOrInsert(
-        this.duplicateTuple,
-        this.duplicateTupleWords,
-        this.endpoints.quadCount,
-        this.duplicateEquals
-      )) {
-        this.discardedDuplicateCount += 1;
-        return;
+      // Repainting the same translucent primitive increases its accumulated
+      // opacity, so it is not a visual duplicate. Only effectively opaque
+      // source-over strokes are safe to collapse.
+      if (decodedAlpha >= OPAQUE_ALPHA_EPSILON) {
+        fillDuplicateTuple(
+          this.duplicateTuple,
+          x0, y0, cx, cy, x1, y1, type, width, r, g, b, decodedAlpha,
+          decodedFlags
+        );
+        if (this.duplicateIndex.hasOrInsert(
+          this.duplicateTuple,
+          this.duplicateTupleWords,
+          this.endpoints.quadCount,
+          this.duplicateEquals
+        )) {
+          this.discardedDuplicateCount += 1;
+          return;
+        }
       }
     }
 
@@ -3138,6 +3709,24 @@ function applyMatrix(matrix: DensePdfMatrix, x: number, y: number): [number, num
     matrix[0] * x + matrix[2] * y + matrix[4],
     matrix[1] * x + matrix[3] * y + matrix[5]
   ];
+}
+
+function transformRectangleBounds(
+  bounds: DensePdfBounds,
+  matrix: DensePdfMatrix
+): DensePdfBounds {
+  const points = [
+    applyMatrix(matrix, bounds.minX, bounds.minY),
+    applyMatrix(matrix, bounds.minX, bounds.maxY),
+    applyMatrix(matrix, bounds.maxX, bounds.minY),
+    applyMatrix(matrix, bounds.maxX, bounds.maxY)
+  ];
+  return {
+    minX: Math.min(...points.map(([x]) => x)),
+    minY: Math.min(...points.map(([, y]) => y)),
+    maxX: Math.max(...points.map(([x]) => x)),
+    maxY: Math.max(...points.map(([, y]) => y))
+  };
 }
 
 function matrixScale(matrix: DensePdfMatrix): number {

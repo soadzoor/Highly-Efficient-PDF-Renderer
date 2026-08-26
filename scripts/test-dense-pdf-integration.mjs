@@ -4,6 +4,7 @@ import { registerHooks } from "node:module";
 import {
   PDFArray,
   PDFDocument,
+  PDFHexString,
   PDFName,
   StandardFonts,
   degrees,
@@ -44,7 +45,10 @@ try {
   ]);
   const { compileDensePdfContent } = compilerModule;
   const { buildDenseTextMiniPdf, preflightDensePdfDocument } = documentModule;
-  const { computeDensePdfPageGeometry } = workerModule;
+  const {
+    classifyDensePdfTextFormXObjects,
+    computeDensePdfPageGeometry
+  } = workerModule;
   const { extractPdfPageScenes } = extractorModule;
 
   const pdfBytes = await createFixture();
@@ -54,7 +58,7 @@ try {
     enableInvisibleCull: true,
     extractTextContent: true
   });
-  assert.equal(forcedScenes.length, 4);
+  assert.equal(forcedScenes.length, 5);
 
   const preflight = await preflightDensePdfDocument(pdfBytes);
   assert.equal(
@@ -65,9 +69,19 @@ try {
   const compiledPages = [];
   for (const selectedPage of preflight.document.pages) {
     const geometry = computeDensePdfPageGeometry(selectedPage);
+    const availableTextFormXObjects = await classifyDensePdfTextFormXObjects(
+      selectedPage
+    );
     const compiled = await compileDensePdfContent(selectedPage.decodedContentChunks(), {
       ...geometry,
+      fontDependencyKeys: new Map(selectedPage.fontDependencies.map(
+        ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
+      )),
       availableExtGStates: selectedPage.availableExtGStates,
+      extGStates: selectedPage.extGStates,
+      alwaysVisibleOptionalContentProperties:
+        selectedPage.alwaysVisibleOptionalContentProperties,
+      availableTextFormXObjects,
       enableSegmentMerge: true,
       enableInvisibleCull: true
     });
@@ -79,7 +93,9 @@ try {
       sourcePageIndex: selectedPage.sourcePageIndex,
       retainedTextContent: compiled.retainedTextContent,
       referencedFonts: new Set(compiled.referencedFonts),
-      referencedProperties: new Set(compiled.referencedProperties)
+      referencedProperties: new Set(compiled.referencedProperties),
+      referencedExtGStates: new Set(compiled.referencedExtGStates),
+      referencedXObjects: new Set(compiled.referencedXObjects)
     }))
   );
 
@@ -173,7 +189,7 @@ try {
   });
 
   assert.equal(workers.length, 1);
-  assert.equal(fastScenes.length, 4);
+  assert.equal(fastScenes.length, 5);
   assert.deepEqual(fastScenes, forcedScenes);
   assert.equal(fastScenes[1].segmentCount, 0);
   assert.equal(fastScenes[1].fillPathCount, 0);
@@ -290,6 +306,42 @@ async function testRawStateDifferentials({
       "q 10 10 60 50 re 25 20 20 15 re W* n 10 10 60 50 re f Q\n"
     )))
   );
+  const alphaPage = document.addPage([100, 80]);
+  const alphaState = document.context.register(document.context.obj({
+    Type: "ExtGState",
+    BM: "Normal",
+    CA: 0.4,
+    ca: 0.2
+  }));
+  alphaPage.node.Resources().set(
+    PDFName.ExtGState,
+    document.context.obj({ Alpha: alphaState })
+  );
+  alphaPage.node.set(
+    PDFName.Contents,
+    document.context.register(document.context.stream(new TextEncoder().encode(
+      "/Alpha gs 2 w 10 10 m 70 10 l S 70 10 m 10 10 l S 20 20 30 20 re f\n"
+    )))
+  );
+  const optionalContentPage = document.addPage([100, 80]);
+  const visibleGroup = document.context.register(document.context.obj({
+    Type: "OCG",
+    Name: PDFHexString.fromText("Visible layer")
+  }));
+  document.catalog.set(PDFName.of("OCProperties"), document.context.obj({
+    OCGs: [visibleGroup],
+    D: { Order: [visibleGroup], OFF: [] }
+  }));
+  optionalContentPage.node.Resources().set(
+    PDFName.of("Properties"),
+    document.context.obj({ Visible: visibleGroup })
+  );
+  optionalContentPage.node.set(
+    PDFName.Contents,
+    document.context.register(document.context.stream(new TextEncoder().encode(
+      "/OC /Visible BDC 10 10 m 70 10 l S EMC\n"
+    )))
+  );
   const bytes = new Uint8Array(await document.save({ useObjectStreams: false }));
 
   for (const enableInvisibleCull of [false, true]) {
@@ -305,7 +357,13 @@ async function testRawStateDifferentials({
       const page = preflight.document.pages[index];
       const compiled = await compileDensePdfContent(page.decodedContentChunks(), {
         ...computeDensePdfPageGeometry(page),
+        fontDependencyKeys: new Map(page.fontDependencies.map(
+          ({ resourceName, dependencyKey }) => [resourceName, dependencyKey]
+        )),
         availableExtGStates: page.availableExtGStates,
+        extGStates: page.extGStates,
+        alwaysVisibleOptionalContentProperties:
+          page.alwaysVisibleOptionalContentProperties,
         enableSegmentMerge: true,
         enableInvisibleCull
       });
@@ -326,6 +384,21 @@ async function testRawStateDifferentials({
     );
     assert.equal(forced[4].fillPathCount, 1, "irregular W* must retain its clipped fill");
     assert.equal(forced[5].fillPathCount, 1, "rectangle exclusion mask must retain its fill");
+    assert.ok(
+      Math.abs(forced[6].primitiveMeta[3] - 0.4) < 1e-6,
+      "Normal-blend stroking opacity must survive packed geometry"
+    );
+    assert.ok(
+      Math.abs(forced[6].fillPathMetaC[3] - 0.2) < 1e-6,
+      "Normal-blend fill opacity must survive packed geometry"
+    );
+    assert.equal(
+      forced[6].segmentCount,
+      2,
+      "repeated translucent strokes must retain their accumulated opacity"
+    );
+    assert.equal(forced[6].discardedDuplicateCount, 0);
+    assert.equal(forced[7].segmentCount, 1, "default-visible OCG content must be flattened");
   }
 }
 
@@ -367,6 +440,7 @@ async function createFixture() {
   page.setCropBox(5, 7, 205, 125);
   page.setRotation(degrees(90));
   const font = await document.embedFont(StandardFonts.Helvetica);
+  const formFont = await document.embedFont(StandardFonts.CourierBold);
   page.drawText("Dense floorplan text", {
     font,
     x: 25,
@@ -389,6 +463,34 @@ async function createFixture() {
       ""
     ].join("\n"))
   ));
+  const formFonts = document.context.obj({ FLocal: formFont.ref });
+  const formResources = document.context.obj({ Font: formFonts });
+  const textForm = document.context.flateStream(new TextEncoder().encode([
+    "q",
+    "0 0 120 24 re W n",
+    "BT /FLocal 9 Tf 1 0 0 1 4 8 Tm (FORM TEXT) Tj ET",
+    "Q",
+    ""
+  ].join("\n")));
+  textForm.dict.set(PDFName.Type, PDFName.XObject);
+  textForm.dict.set(PDFName.of("Subtype"), PDFName.of("Form"));
+  textForm.dict.set(PDFName.of("FormType"), document.context.obj(1));
+  textForm.dict.set(PDFName.of("BBox"), document.context.obj([0, 0, 120, 24]));
+  textForm.dict.set(PDFName.of("Matrix"), document.context.obj([1, 0, 0, 1, 12, 16]));
+  textForm.dict.set(PDFName.Resources, formResources);
+  const textFormRef = document.context.register(textForm);
+  const xObjects = document.context.obj({
+    FmText: textFormRef,
+    FmAlias: textFormRef
+  });
+  page.node.Resources().set(PDFName.XObject, xObjects);
+  const formInvocation = document.context.register(document.context.stream(
+    new TextEncoder().encode([
+      "q 1 0 0 1 20 10 cm /FmText Do Q",
+      "q 1 0 0 1 55 32 cm /FmAlias Do Q",
+      ""
+    ].join("\n"))
+  ));
   const contents = document.context.obj([]);
   assert.ok(contents instanceof PDFArray);
   const resolvedExistingContents = document.context.lookup(existingContents);
@@ -400,6 +502,7 @@ async function createFixture() {
     contents.push(existingContents);
   }
   contents.push(extraContents);
+  contents.push(formInvocation);
   page.node.set(PDFName.Contents, contents);
 
   const textOnlyPage = document.addPage([180, 100]);
@@ -410,6 +513,23 @@ async function createFixture() {
     size: 11,
     color: rgb(0.2, 0.1, 0.4)
   });
+  const nonVisualLink = document.context.register(document.context.obj({
+    Type: "Annot",
+    Subtype: "Link",
+    Rect: [10, 10, 40, 25],
+    Border: [0, 0, 0]
+  }));
+  const nonVisualSquare = document.context.register(document.context.obj({
+    Type: "Annot",
+    Subtype: "Square",
+    Rect: [50, 10, 80, 25],
+    Border: [0, 0, 0],
+    Contents: PDFHexString.fromText("Nonvisual regression annotation")
+  }));
+  textOnlyPage.node.set(
+    PDFName.Annots,
+    document.context.obj([nonVisualLink, nonVisualSquare])
+  );
 
   const postClipPage = document.addPage([100, 90]);
   const postClipFonts = document.context.obj({ FClip: font.ref });
@@ -442,6 +562,51 @@ async function createFixture() {
     ].join("\n"))
   ));
   operatorPage.node.set(PDFName.Contents, operatorContents);
+
+  const groupedPage = document.addPage([150, 100]);
+  const visibleGroup = document.context.register(document.context.obj({
+    Type: "OCG",
+    Name: PDFHexString.fromText("Visible grouped content")
+  }));
+  document.catalog.set(
+    PDFName.of("OCProperties"),
+    document.context.obj({
+      OCGs: [visibleGroup],
+      D: { Order: [visibleGroup], OFF: [] }
+    })
+  );
+  groupedPage.node.set(
+    PDFName.of("Group"),
+    document.context.obj({
+      Type: "Group",
+      S: "Transparency",
+      CS: "DeviceRGB",
+      I: false,
+      K: false
+    })
+  );
+  groupedPage.node.Resources().set(
+    PDFName.Font,
+    document.context.obj({ FGroup: font.ref })
+  );
+  groupedPage.node.Resources().set(
+    PDFName.of("Properties"),
+    document.context.obj({ Visible: visibleGroup })
+  );
+  groupedPage.node.set(
+    PDFName.Contents,
+    document.context.register(document.context.stream(new TextEncoder().encode([
+      "q",
+      "/OC /Visible BDC",
+      "0.1 0.2 0.3 0.1 K 2 w 10 20 m 135 20 l S",
+      "0.2 0.1 0.3 0.05 k 20 35 55 25 re f",
+      "BT /FGroup 10 Tf 1 0 0 1 15 78 Tm (VISIBLE OCG TEXT) Tj ET",
+      "EMC",
+      "Q",
+      "BT /FGroup 8 Tf 1 0 0 1 15 8 Tm (OUTSIDE OCG) Tj ET",
+      ""
+    ].join("\n"))))
+  );
   return new Uint8Array(await document.save({ useObjectStreams: false }));
 }
 
