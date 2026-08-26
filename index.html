@@ -4,11 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
-    <script type="module" crossorigin src="./assets/main-jz5ZvBLy.js"></script>
+    <script type="module" crossorigin src="./assets/main-Bpt_DOZH.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/preload-helper-HclGiUj8.js">
-    <link rel="modulepreload" crossorigin href="./assets/exampleDropdown-CiNvHR3a.js">
+    <link rel="modulepreload" crossorigin href="./assets/exampleDropdown-BArzI8Mq.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-Bjqswiq5.js">
-    <link rel="modulepreload" crossorigin href="./assets/textLodStatsFormat-BAe5we4y.js">
+    <link rel="modulepreload" crossorigin href="./assets/textLodStatsFormat-CZe9SwEM.js">
     <link rel="stylesheet" crossorigin href="./assets/main-KgzcWCM1.css">
   </head>
   <body>
@@ -16,18 +16,18 @@
     <div id="hud" class="panel">
       <div class="panel-header">
         <div class="toolbar">
-          <button id="open-file" type="button">Open PDF / ZIP</button>
+          <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
           <div id="example-dropdown" class="example-dropdown">
-            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or parsed ZIP" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
+            <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
               <span id="example-select-label" class="example-trigger-label">Examples (loading...)</span>
               <span class="example-trigger-chevron" aria-hidden="true">▾</span>
             </button>
             <div id="example-menu" class="example-menu" hidden></div>
           </div>
-          <button id="download-data" type="button" hidden disabled>Download Parsed Data</button>
+          <button id="download-data" type="button" hidden disabled>Download HEP</button>
           <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
-          <button id="download-all-data" type="button" hidden disabled>Download All Example ZIPs</button>
-          <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />
+          <button id="download-all-data" type="button" hidden disabled>Download All Example HEP Files</button>
+          <input id="file-input" type="file" accept=".pdf,.hep,application/pdf" hidden />
         </div>
         <button id="toggle-hud" class="chevron-button" type="button" aria-expanded="true" aria-controls="hud-content" title="Collapse panel">
           <span id="toggle-hud-icon" aria-hidden="true">▾</span>
@@ -92,7 +92,7 @@
             <span class="color-suffix">%</span>
           </div>
         </div>
-        <div id="status" class="status">Waiting for PDF or parsed ZIP...</div>
+        <div id="status" class="status">Waiting for PDF or HEP file...</div>
         <div id="parse-loader" class="parse-loader" hidden>
           <span class="loader-spinner" aria-hidden="true"></span>
           <span id="parse-loader-text">0.00% Parsing / loading...</span>
@@ -111,9 +111,9 @@
           <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
         </div>
-        <div class="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
+        <div class="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or HEPR-exported .hep file.</div>
       </div>
     </div>
-    <div id="drop-indicator" class="drop-indicator">Drop PDF or parsed ZIP to render</div>
+    <div id="drop-indicator" class="drop-indicator">Drop PDF or HEP file to render</div>
   </body>
 </html>
