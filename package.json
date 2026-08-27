@@ -1,6 +1,6 @@
 {
   "name": "@soadzoor/hepr",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Highly-Efficient-PDF-Renderer is a GPU-first PDF renderer for large technical documents, floorplans, books, and more, using the latest technologies and various tricks to achieve high performance and visual fidelity.",
   "license": "MIT",
   "type": "module",
