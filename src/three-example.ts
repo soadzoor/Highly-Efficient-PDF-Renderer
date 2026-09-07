@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { waitForLoad } from "./loadCancellation";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
@@ -164,6 +165,7 @@ const textSearchCaseButtonElement = textSearchCaseButton;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
 let loadToken = 0;
+let sourceLoadController: AbortController | null = null;
 const CAMERA_FIT_PADDING_PIXELS = 64;
 const MIN_OBJECT_EXTENT = 1e-3;
 const DEFAULT_PERSPECTIVE_FOV_DEGREES = 45;
@@ -854,6 +856,8 @@ function disposeExample(): void {
     return;
   }
   lifetimeAbortController.abort();
+  loadToken += 1;
+  sourceLoadController?.abort();
   activeHepExportController?.abort();
   activeHepExportController = null;
   if (animationFrameId !== 0) {
@@ -885,11 +889,15 @@ async function loadSource(
 ): Promise<void> {
   cancelActiveHepExport();
   const activeLoadToken = ++loadToken;
+  sourceLoadController?.abort();
+  const controller = new AbortController();
+  sourceLoadController = controller;
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
   const objectOptions = readThreeObjectOptions();
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
+  let pendingObject: HeprThreePdfObject | null = null;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "0.00% Parsing / loading");
   setLoadControlsEnabled(false);
@@ -910,22 +918,31 @@ async function loadSource(
       source,
       {
         ...objectOptions,
+        signal: controller.signal,
         onProgress: (progress) => {
           updateLoadingProgress(activeLoadToken, progress);
         }
       },
       backend as HeprRendererType
     );
+    pendingObject = nextObject;
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
 
     if (activeLoadToken !== loadToken) {
       nextObject.dispose();
+      pendingObject = null;
       return;
     }
+    const downloadablePdf = await resolveDownloadablePdfSource(
+      source, nextObject, options.pdfDownloadHint ?? null, controller.signal
+    );
+    controller.signal.throwIfAborted();
+    if (activeLoadToken !== loadToken) return;
     replacePdfObject(nextObject);
+    pendingObject = null;
     lastLoadedSource = source;
-    lastDownloadablePdf = await resolveDownloadablePdfSource(source, nextObject, options.pdfDownloadHint ?? null);
+    lastDownloadablePdf = downloadablePdf;
     setDownloadDataButtonState(true);
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     updateLoadingProgress(activeLoadToken, {
@@ -935,7 +952,8 @@ async function loadSource(
     });
     const firstSubmitStart = performance.now();
     requestRender();
-    await waitForNextRenderedFrame(activeLoadToken);
+    await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
+    if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
@@ -953,7 +971,9 @@ async function loadSource(
     }
     setStatus(`Failed to load source: ${message}`);
   } finally {
+    if (pendingObject && pendingObject !== currentPdfObject) pendingObject.dispose();
     if (activeLoadToken === loadToken) {
+      sourceLoadController = null;
       setLoadingProgress(false);
       setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
@@ -971,6 +991,9 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   }
 
   const activeLoadToken = ++loadToken;
+  sourceLoadController?.abort();
+  const controller = new AbortController();
+  sourceLoadController = controller;
   const previousBackend = activeThreeRendererBackend;
   const cameraSnapshot = captureCameraSnapshot();
   const objectOptions = readThreeObjectOptions();
@@ -993,6 +1016,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       source,
       {
         ...objectOptions,
+        signal: controller.signal,
         onProgress: (progress) => {
           updateLoadingProgress(activeLoadToken, progress);
         }
@@ -1026,7 +1050,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
     });
     const firstSubmitStart = performance.now();
     requestRender();
-    await waitForNextRenderedFrame(activeLoadToken);
+    await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
+    if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(
@@ -1066,6 +1091,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
     );
   } finally {
     if (activeLoadToken === loadToken) {
+      sourceLoadController = null;
       setLoadingProgress(false);
       setLoadControlsEnabled(true);
       setDownloadDataButtonState(Boolean(currentPdfObject));
@@ -1354,7 +1380,8 @@ async function downloadSourcePdf(): Promise<boolean> {
 async function resolveDownloadablePdfSource(
   source: File | string,
   pdfObject: HeprThreePdfObject,
-  hint: PdfDownloadSource | null
+  hint: PdfDownloadSource | null,
+  signal?: AbortSignal
 ): Promise<PdfDownloadSource | null> {
   if (pdfObject.sourceKind === "pdf") {
     if (source instanceof File) {
@@ -1370,28 +1397,30 @@ async function resolveDownloadablePdfSource(
     return hint;
   }
 
-  const hepBytes = await readHepBytesForSource(source);
+  const hepBytes = await readHepBytesForSource(source, signal);
+  signal?.throwIfAborted();
   if (!hepBytes) {
     return null;
   }
-  const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(hepBytes);
+  const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingParsedZip(hepBytes), signal);
   return sourcePdfBytes && sourcePdfBytes.length > 0
     ? { label: pdfObject.sourceLabel, bytes: sourcePdfBytes }
     : null;
 }
 
-async function readHepBytesForSource(source: File | string): Promise<Uint8Array | null> {
+async function readHepBytesForSource(source: File | string, signal?: AbortSignal): Promise<Uint8Array | null> {
   try {
     if (source instanceof File) {
-      return new Uint8Array(await source.arrayBuffer());
+      return new Uint8Array(await waitForLoad(source.arrayBuffer(), signal));
     }
 
-    const response = await fetch(source, { cache: "no-store" });
+    const response = await fetch(source, { cache: "no-store", signal });
     if (!response.ok) {
       return null;
     }
-    return new Uint8Array(await response.arrayBuffer());
+    return new Uint8Array(await waitForLoad(response.arrayBuffer(), signal));
   } catch {
+    signal?.throwIfAborted();
     return null;
   }
 }

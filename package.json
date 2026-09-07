@@ -61,6 +61,13 @@
     "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
+    "test": "npm run typecheck && npm run test:fast",
+    "typecheck": "tsc --noEmit",
+    "test:fast": "node scripts/test-fast.mjs",
+    "test:document-loading": "node --experimental-strip-types scripts/test-document-loading.mjs",
+    "test:public-load-cancellation": "node --experimental-strip-types scripts/test-public-load-cancellation.mjs",
+    "test:room-overlay-page-matrix": "node --experimental-strip-types scripts/test-room-overlay-page-matrix.mjs",
+    "test:vector-stroke-clip-lod": "node --experimental-strip-types scripts/test-vector-stroke-clip-lod.mjs",
     "dev": "vite",
     "build": "tsc && npm run test:persistent-viewer && vite build",
     "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:dense-pdf-package",
@@ -108,7 +115,7 @@
     "score:rooms": "node scripts/score-rooms.mjs",
     "audit:rooms": "node scripts/audit-room-topology.mjs",
     "gold:rooms": "node scripts/room-gold-set.mjs",
-    "prepublishOnly": "npm run build:all",
+    "prepublishOnly": "npm test && npm run build:all",
     "clean:lib": "node scripts/clean-lib-output.mjs",
     "oracle:validate": "npm --prefix oracle run validate",
     "oracle:compare": "npm --prefix oracle run compare --",

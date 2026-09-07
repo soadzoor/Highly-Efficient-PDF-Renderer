@@ -1,4 +1,5 @@
 import JSZip from "jszip";
+import { waitForLoad } from "./loadCancellation";
 
 import {
   extractPdfRasterScene,
@@ -105,6 +106,8 @@ export interface ParsedDataZipBuildProgress {
 }
 
 export interface LoadParsedDataZipOptions {
+  /** Stop loading between archive entries, image decodes, and recovery work. */
+  signal?: AbortSignal;
   onProgress?: LoadProgressCallback;
 }
 
@@ -1485,7 +1488,18 @@ export async function loadSceneFromParsedDataZip(
   buffer: ArrayBuffer,
   options: LoadParsedDataZipOptions = {}
 ): Promise<VectorScene> {
-  const progress = createLoadProgressReporter(options.onProgress);
+  options.signal?.throwIfAborted();
+  return waitForLoad(loadSceneFromParsedDataZipInternal(buffer, options), options.signal);
+}
+
+async function loadSceneFromParsedDataZipInternal(
+  buffer: ArrayBuffer,
+  options: LoadParsedDataZipOptions
+): Promise<VectorScene> {
+  const signal = options.signal;
+  const progress = createLoadProgressReporter(options.onProgress ? (event) => {
+    if (!signal?.aborted) options.onProgress?.(event);
+  } : undefined);
   const zip = await progress.child(0, 0.16, { sourceType: "zip" }).withIndeterminateProgress(
     () => JSZip.loadAsync(buffer).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -1497,6 +1511,7 @@ export async function loadSceneFromParsedDataZip(
     }),
     { stage: "zip-open", sourceType: "zip" }
   );
+  signal?.throwIfAborted();
   const manifestFile = zip.file("manifest.json");
   if (!manifestFile) {
     throw new Error(
@@ -1513,6 +1528,7 @@ export async function loadSceneFromParsedDataZip(
     manifestFile.async("string"),
     { stage: "zip-manifest", sourceType: "zip" }
   );
+  signal?.throwIfAborted();
   let manifest: ParsedDataManifest;
   try {
     manifest = JSON.parse(manifestJson) as ParsedDataManifest;
@@ -1558,6 +1574,7 @@ export async function loadSceneFromParsedDataZip(
     required: boolean
   ): Promise<{ data: Float32Array; logicalItemCount: number } | null> => {
     try {
+      signal?.throwIfAborted();
       reportTextureProgress();
       const entry = textureByName.get(name);
       const path = entry && typeof entry.file === "string" ? entry.file : null;
@@ -1570,6 +1587,7 @@ export async function loadSceneFromParsedDataZip(
       }
 
       const fileBuffer = await zipEntry.async("arraybuffer");
+      signal?.throwIfAborted();
       const raw = readTexturePayloadAsFloat32(fileBuffer, entry, name);
       const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
       if (logicalFloatCount > raw.length) {
@@ -1789,7 +1807,9 @@ export async function loadSceneFromParsedDataZip(
   const pagesPerRow = Math.max(1, readNonNegativeInt(sceneMeta.pagesPerRow, 1));
   validateNativeGradientResources(nativeGradientResources, pageCount);
   progress.report(0.82, { stage: "zip-file", sourceType: "zip", unit: "files" });
-  let rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta);
+  signal?.throwIfAborted();
+  let rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta, signal);
+  signal?.throwIfAborted();
   for (const layer of rasterLayers) {
     if (layer.pageIndex >= pageCount) {
       throw new Error(`Raster layer references invalid page ${layer.pageIndex}.`);
@@ -1798,13 +1818,14 @@ export async function loadSceneFromParsedDataZip(
   progress.report(0.88, { stage: "compile", sourceType: "zip" });
   if (rasterLayers.length === 0) {
     const sourcePdfBytes = await readSourcePdfBytesFromParsedData(zip, manifest);
+    signal?.throwIfAborted();
     if (sourcePdfBytes) {
       try {
         const sourcePdfPages = readNonEmptyString(manifest.sourcePdfPages);
         const rasterScene = await extractPdfRasterScene(createParseBuffer(sourcePdfBytes), {
           pages: sourcePdfPages ?? (pageCount === 1 ? "1" : `1-${pageCount}`),
           maxPagesPerRow: pagesPerRow
-        });
+        }, signal);
         if (rasterScene.pageCount !== pageCount) {
           throw new Error(
             `Embedded source PDF restored ${rasterScene.pageCount} page(s); expected ${pageCount}.`
@@ -1817,6 +1838,7 @@ export async function loadSceneFromParsedDataZip(
           );
         }
       } catch (error) {
+        signal?.throwIfAborted();
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`[Parsed data load] Failed to restore raster layers from source PDF: ${message}`);
       }
@@ -1824,6 +1846,7 @@ export async function loadSceneFromParsedDataZip(
   }
   const primaryRasterLayer = rasterLayers[0] ?? null;
   const textIndex = await readSceneTextIndexFromParsedData(zip, manifest);
+  signal?.throwIfAborted();
   const maxHalfWidth =
     readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
     computeMaxHalfWidth(styles, segmentCount);
@@ -2472,7 +2495,8 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
 
 async function readRasterLayersFromParsedData(
   zip: JSZip,
-  sceneMeta: ParsedDataSceneEntry
+  sceneMeta: ParsedDataSceneEntry,
+  signal?: AbortSignal
 ): Promise<RasterLayer[]> {
   const layers: RasterLayer[] = [];
   const sceneRasterLayers = Array.isArray(sceneMeta.rasterLayers)
@@ -2482,6 +2506,7 @@ async function readRasterLayersFromParsedData(
   validateRasterLayerBudgets(zip, sceneRasterLayers);
 
   for (let i = 0; i < sceneRasterLayers.length; i += 1) {
+    signal?.throwIfAborted();
     const entry = sceneRasterLayers[i];
     if (!entry || typeof entry !== "object") {
       throw new Error(`Raster layer ${i} has invalid metadata.`);
@@ -2510,6 +2535,7 @@ async function readRasterLayersFromParsedData(
     }
 
     const decoded = await readRasterLayerFromZip(zip, path, width, height);
+    signal?.throwIfAborted();
     if (!decoded) {
       throw new Error(`HEP file is missing or cannot decode raster layer ${i}: ${path}.`);
     }

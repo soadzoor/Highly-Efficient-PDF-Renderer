@@ -7,6 +7,7 @@ import {
 import { loadSceneFromParsedDataZip, prepareSceneForHepRendering } from "./hep";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
+import { waitForLoad } from "./loadCancellation";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -23,6 +24,9 @@ export type PdfObjectSourceKind = "pdf" | "parsed-zip";
  * Options used while loading and parsing a source into HEPR scene data.
  */
 export interface PdfObjectGeneratorOptions {
+  /** Cancel source reading, parsing, LOD preparation, and object creation. */
+  signal?: AbortSignal;
+
   /**
    * Merge compatible adjacent vector stroke segments during parse.
    *
@@ -119,6 +123,15 @@ export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions = {},
   /** @internal Used by HEP export to cancel source loading and parsing. */
+  signal: AbortSignal | undefined = options.signal
+): Promise<LoadedPdfScene> {
+  signal?.throwIfAborted();
+  return waitForLoad(loadPdfSceneFromSourceInternal(source, options, signal), signal);
+}
+
+async function loadPdfSceneFromSourceInternal(
+  source: PdfObjectSource,
+  options: PdfObjectGeneratorOptions,
   signal?: AbortSignal
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
@@ -164,6 +177,7 @@ export async function loadPdfSceneFromSource(
 
   const scene = await waitForPromiseWithAbort(
     loadSceneFromParsedDataZip(createParseBuffer(sourceBytes), {
+      signal,
       onProgress: progress.child(0.16, 0.95, { sourceType: "zip" }).toCallback()
     }),
     signal

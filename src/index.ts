@@ -19,6 +19,7 @@ import {
 import { createLoadProgressReporter } from "./loadProgress";
 import { prebuildVectorStrokeLodRuntime } from "./vectorStrokeLod";
 import { prebuildTextLod } from "./textLodCore";
+import { yieldForLoad } from "./loadCancellation";
 
 /**
  * Combined options for `pdfObjectGenerator`.
@@ -79,56 +80,67 @@ export async function pdfObjectGenerator(
   options: PdfObjectGeneratorRuntimeOptions = {},
   rendererType: HeprRendererType = "webgl"
 ): Promise<HeprThreePdfObject> {
-  const progress = createLoadProgressReporter(options.onProgress);
-  const loadedScene = await loadPdfSceneFromSource(source, {
-    ...options,
-    onProgress: progress.child(0, LOAD_PROGRESS_SCENE_END).toCallback()
-  });
-  const sourceType = loadedScene.sourceKind === "pdf" ? "pdf" : "zip";
-  progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
-  await prebuildVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
-    yieldIntervalMs: 500,
-    onProgress: (lodProgress) => {
-      const value =
-        LOAD_PROGRESS_VECTOR_LOD_START +
-        lodProgress.value * (LOAD_PROGRESS_VECTOR_LOD_END - LOAD_PROGRESS_VECTOR_LOD_START);
-      progress.report(value, { stage: "vector-lod", sourceType });
-    }
-  });
-  progress.report(LOAD_PROGRESS_TEXT_LOD_START, { stage: "text-lod", sourceType });
-  if (options.textLod !== "off") {
-    await prebuildTextLod(loadedScene.scene, {
-      yieldIntervalMs: 50,
+  const signal = options.signal;
+  signal?.throwIfAborted();
+  try {
+    const progress = createLoadProgressReporter(options.onProgress);
+    const loadedScene = await loadPdfSceneFromSource(source, {
+      ...options,
+      onProgress: progress.child(0, LOAD_PROGRESS_SCENE_END).toCallback()
+    });
+    signal?.throwIfAborted();
+    const sourceType = loadedScene.sourceKind === "pdf" ? "pdf" : "zip";
+    progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
+    await prebuildVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
+      yieldIntervalMs: 500,
+      shouldCancel: () => signal?.aborted === true,
       onProgress: (lodProgress) => {
         const value =
-          LOAD_PROGRESS_TEXT_LOD_START +
-          lodProgress.value * (LOAD_PROGRESS_TEXT_LOD_END - LOAD_PROGRESS_TEXT_LOD_START);
-        progress.report(value, { stage: "text-lod", sourceType });
+          LOAD_PROGRESS_VECTOR_LOD_START +
+          lodProgress.value * (LOAD_PROGRESS_VECTOR_LOD_END - LOAD_PROGRESS_VECTOR_LOD_START);
+        progress.report(value, { stage: "vector-lod", sourceType });
       }
     });
-  } else {
-    progress.report(LOAD_PROGRESS_TEXT_LOD_END, { stage: "text-lod", sourceType });
+    signal?.throwIfAborted();
+    progress.report(LOAD_PROGRESS_TEXT_LOD_START, { stage: "text-lod", sourceType });
+    if (options.textLod !== "off") {
+      await prebuildTextLod(loadedScene.scene, {
+        yieldIntervalMs: 50,
+        signal,
+        onProgress: (lodProgress) => {
+          const value =
+            LOAD_PROGRESS_TEXT_LOD_START +
+            lodProgress.value * (LOAD_PROGRESS_TEXT_LOD_END - LOAD_PROGRESS_TEXT_LOD_START);
+          progress.report(value, { stage: "text-lod", sourceType });
+        }
+      });
+    } else {
+      progress.report(LOAD_PROGRESS_TEXT_LOD_END, { stage: "text-lod", sourceType });
+    }
+    signal?.throwIfAborted();
+    progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType });
+    await yieldForLoad(signal);
+    const object = await createThreePdfObject(loadedScene, {
+      ...options,
+      rendererType
+    }, signal);
+    try {
+      signal?.throwIfAborted();
+      progress.complete({ sourceType });
+      signal?.throwIfAborted();
+      return object;
+    } catch (error) {
+      try {
+        object.dispose();
+      } catch {
+        // Keep the original cancellation/progress error.
+      }
+      throw error;
+    }
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw error;
   }
-  progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType });
-  await yieldToHostFrame();
-  const object = await createThreePdfObject(loadedScene, {
-    ...options,
-    rendererType
-  });
-  progress.complete({ sourceType });
-  return object;
-}
-
-async function yieldToHostFrame(): Promise<void> {
-  if (typeof requestAnimationFrame === "function") {
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => resolve());
-    });
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, 0);
-  });
 }
 
 export { createCanvasInteractionController };

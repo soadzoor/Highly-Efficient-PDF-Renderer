@@ -163,6 +163,30 @@ Supported `source` inputs:
 - base64 payload string (PDF or HEP)
 - base64 data URL (`application/pdf`, or `application/zip` when transporting HEP)
 
+Pass an `AbortSignal` to cancel a load when switching documents or closing a viewer:
+
+```ts
+const controller = new AbortController();
+const pendingObject = pdfObjectGenerator(source, { signal: controller.signal });
+
+// Call from your document-switch or teardown handler:
+controller.abort();
+
+try {
+  const object = await pendingObject;
+  scene.add(object);
+} catch (error) {
+  if (!controller.signal.aborted) throw error;
+}
+```
+
+Cancellation covers source reads, parser workers, HEP loading, LOD preparation,
+and provisional renderer creation. Synchronous work stops at its next cooperative
+checkpoint; an image/archive decode already running may finish before releasing
+its temporary data. An object already returned belongs to the caller and still
+needs `object.dispose()`. The demos cancel superseded loads and keep the previous
+document's scene and download source until a replacement is ready.
+
 Build a HEP file directly from any supported PDF input. The public builder
 retains its existing `buildParsedDataZip` name for API compatibility. Its result
 is an `application/zip` `Blob` because HEP uses ZIP internally; save or upload it
@@ -665,6 +689,11 @@ Build app:
 npm run build
 ```
 
+Run the type check and bounded regression suite with `npm test`. These checks
+also run on pull requests and before npm publishing. See
+[Development validation](docs/development-validation.md) for the CI scope and
+the separate manual browser/corpus checks.
+
 Build library artifacts:
 
 ```bash
@@ -717,7 +746,9 @@ alone does not establish either.
 
 For production-bundle comparisons, measured results, and outstanding gates,
 see [Parser benchmark](docs/parser-benchmark.md). The image-heavy brochure
-remains a performance regression; the migration is not release-qualified yet.
+improved to an 8.5% lower median parser time than the reference in the latest
+recorded Node sample, with overlapping run ranges. Browser fidelity and
+full-corpus release gates remain outstanding; this is not a release qualification.
 
 To measure only the native parser and its direct `VectorScene` compilation for
 one page (excluding HEP, LOD, upload, rendering, and viewer work), run:

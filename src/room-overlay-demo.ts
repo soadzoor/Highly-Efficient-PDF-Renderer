@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { waitForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
@@ -157,6 +158,7 @@ let currentParsedTsv: ParsedRoomTsv | null = null;
 let currentGeneratedTsv: GeneratedRoomTsv | null = null;
 let currentPdfCoordinateTransform: PdfCoordinateTransform = createIdentityPdfCoordinateTransform();
 let loadToken = 0;
+let sourceLoadController: AbortController | null = null;
 let roomDetectionToken = 0;
 let animationFrameId = 0;
 let needsRender = false;
@@ -430,14 +432,22 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     return;
   }
 
+  const activeToken = ++loadToken;
+  sourceLoadController?.abort();
+  const controller = new AbortController();
+  sourceLoadController = controller;
+  setBusy(true);
   exampleDropdown.setDisabled(true);
   try {
     setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "HEP"})...`);
-    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.hepPath, { cache: "no-store" });
+    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.hepPath, {
+      cache: "no-store", signal: controller.signal
+    });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-    const bytes = await response.arrayBuffer();
+    const bytes = await waitForLoad(response.arrayBuffer(), controller.signal);
+    if (activeToken !== loadToken) return;
     const baseName = entry.name.replace(/\.pdf$/i, "");
     const file =
       kind === "pdf"
@@ -445,10 +455,16 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
         : new File([bytes], `${baseName}.hep`, { type: "application/zip" });
     await loadSceneSource(file);
   } catch (error) {
+    if (activeToken !== loadToken || controller.signal.aborted) return;
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load example ${entry.name}: ${message}`);
   } finally {
-    exampleDropdown.setDisabled(isBusy);
+    if (activeToken === loadToken) {
+      sourceLoadController = null;
+      setBusy(false);
+      syncControlsEnabled();
+    }
+    if (!isDisposed) exampleDropdown.setDisabled(isBusy);
   }
 }
 
@@ -468,15 +484,18 @@ function formatFileSize(sizeBytes: number): string {
 async function loadSceneSource(file: File): Promise<boolean> {
   const isHep = isHepFile(file);
   const activeToken = ++loadToken;
+  sourceLoadController?.abort();
+  const controller = new AbortController();
+  sourceLoadController = controller;
+  let pendingObject: HeprThreePdfObject | null = null;
   setBusy(true);
   setStatus(`Loading ${file.name}...`);
-  clearCurrentPdfObject();
-  setBusy(true);
 
   try {
     const pdfObject = await pdfObjectGenerator(
       file,
       {
+        signal: controller.signal,
         vectorLod: "auto",
         pageBackground: "#ffffff",
         pageBackgroundOpacity: 1,
@@ -485,23 +504,29 @@ async function loadSceneSource(file: File): Promise<boolean> {
       },
       "webgl"
     );
+    pendingObject = pdfObject;
 
     if (activeToken !== loadToken) {
       pdfObject.dispose();
+      pendingObject = null;
       return false;
     }
 
     // HEP files carry no source PDF to derive the TSV coordinate transform from;
     // identity matches the common case (origin-0, unrotated pages).
-    currentPdfCoordinateTransform = isHep
+    const coordinateTransform = isHep
       ? createIdentityPdfCoordinateTransform()
-      : await readFirstPageCoordinateTransform(file);
+      : await readFirstPageCoordinateTransform(file, controller.signal);
     if (activeToken !== loadToken) {
       pdfObject.dispose();
+      pendingObject = null;
       return false;
     }
 
+    clearCurrentPdfObject();
+    currentPdfCoordinateTransform = coordinateTransform;
     currentPdfObject = pdfObject;
+    pendingObject = null;
     currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
     scene.add(pdfObject);
@@ -517,7 +542,9 @@ async function loadSceneSource(file: File): Promise<boolean> {
     setStatus(`Failed to load ${isHep ? "HEP file" : "PDF"}: ${message}`);
     return false;
   } finally {
+    pendingObject?.dispose();
     if (activeToken === loadToken) {
+      sourceLoadController = null;
       setBusy(false);
       syncControlsEnabled();
       requestRender();
@@ -1022,13 +1049,13 @@ function computeLocalPolygonCentroid(points: THREE.Vector2[]): THREE.Vector2 {
   return new THREE.Vector2(x / (3 * twiceArea), y / (3 * twiceArea));
 }
 
-async function readFirstPageCoordinateTransform(file: File): Promise<PdfCoordinateTransform> {
+async function readFirstPageCoordinateTransform(file: File, signal?: AbortSignal): Promise<PdfCoordinateTransform> {
   const { computePageGeometry, openPdf } = await import("./pdfSession");
   const session = await openPdf({
     kind: "blob",
     blob: file,
     label: file.name
-  });
+  }, { signal });
 
   try {
     const firstPage = session.info.pages[0];
@@ -1493,6 +1520,8 @@ function disposeDemo(): void {
     return;
   }
   isDisposed = true;
+  loadToken += 1;
+  sourceLoadController?.abort();
   canvasResizeObserver.disconnect();
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);
