@@ -24,6 +24,6 @@ const zipBytes = new Uint8Array(await zipBlob.arrayBuffer());
 assert.deepEqual(Array.from(zipBytes.subarray(0, 2)), [0x50, 0x4b]);
 
 const declarations = await readFile(declarationPath, "utf8");
-assert.match(declarations, /export \{ buildParsedDataZip \} from "\.\/parsedDataZipBuilder";/);
+assert.match(declarations, /export \{ buildParsedDataZip \} from "\.\/hepBuilder";/);
 
-console.log("Built-package parsed-data ZIP smoke test passed");
+console.log("Built-package HEP smoke test passed");

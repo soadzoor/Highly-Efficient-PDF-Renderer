@@ -14,8 +14,8 @@ try {
     await import("../src/sceneStatistics.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
-  const { buildParsedDataZip } = await import("../src/parsedDataZipBuilder.ts");
-  const { loadSceneFromParsedDataZip } = await import("../src/parsedDataZip.ts");
+  const { buildParsedDataZip } = await import("../src/hepBuilder.ts");
+  const { loadSceneFromParsedDataZip } = await import("../src/hep.ts");
 
   const brochure = { sourceSegmentCount: 11257, mergedSegmentCount: 10028, segmentCount: 8834,
     discardedTransparentCount: 0, discardedDegenerateCount: 0, discardedDuplicateCount: 10,

@@ -32,8 +32,8 @@ try {
     { listSceneRasterLayers, loadSceneFromParsedDataZip },
     { extractPdfRasterScene }
   ] = await Promise.all([
-    import("../src/parsedDataZipBuilder.ts"),
-    import("../src/parsedDataZip.ts"),
+    import("../src/hepBuilder.ts"),
+    import("../src/hep.ts"),
     import("../src/pdfVectorExtractor.ts")
   ]);
 

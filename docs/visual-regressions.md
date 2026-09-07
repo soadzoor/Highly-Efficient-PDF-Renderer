@@ -123,7 +123,7 @@ No new performance claim is made by this regression/statistics work.
 
 - Accounting: `src/pdf/nativeContentCompiler.ts`, `src/pdfSession.ts`,
   `src/pdf/nativeVectorPage.ts`, `src/pdfVectorExtractor.ts`,
-  `src/sceneStatistics.ts`, `src/parsedDataZip.ts`.
+  `src/sceneStatistics.ts`, `src/hep.ts`.
 - Metric labels/output only: `index.html`, `src/main.ts`.
 - Coverage: `scripts/test-native-visual-regressions.mjs`,
   `scripts/test-scene-statistics.mjs`, `scripts/lib/selectionTestHost.mjs`,

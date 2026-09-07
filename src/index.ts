@@ -159,14 +159,14 @@ export type {
   CanvasInteractionController
 };
 
-export { buildParsedDataZip } from "./parsedDataZipBuilder";
+export { buildParsedDataZip } from "./hepBuilder";
 
 export type {
   BuildParsedDataZipFromPdfOptions,
   BuildParsedDataZipFromSceneOptions,
   ParsedDataZipCompression,
   ParsedDataZipEncodingOptions
-} from "./parsedDataZipBuilder";
+} from "./hepBuilder";
 
 export type {
   LoadProgressCallback,

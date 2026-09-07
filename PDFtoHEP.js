@@ -311,7 +311,7 @@ export async function loadSourceHepBuilder(dependencies = {}) {
   });
 
   try {
-    const builderModule = await viteServer.ssrLoadModule("/src/parsedDataZipBuilder.ts");
+    const builderModule = await viteServer.ssrLoadModule("/src/hepBuilder.ts");
     if (typeof builderModule.buildParsedDataZip !== "function") {
       throw new Error("The HEPR source builder did not export buildParsedDataZip().");
     }

@@ -558,6 +558,20 @@ The Three.js integration keeps only one raster GPU owner active at a time. Its m
 
 The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make HEP files much larger than the original parsed scene.
 
+PDF loading in the demos and package API applies the same vector quantization
+as HEP after page layout and before LOD/GPU preparation. Stroke geometry, fill
+outlines, glyph outlines, text positions, and text colors therefore use the
+same precision in both paths. Cached parser pages retain their original
+coordinates for later layout changes. Exporting a displayed scene reuses its
+compact stroke encoding to avoid a second quantization pass; the v6 format and
+HEP storage precision remain unchanged.
+
+Containment culling uses a total ordering of candidate strokes so JavaScript
+sorting implementations cannot change which strokes survive. HEP files store
+the result of that culling pass: archives exported with the older epsilon-based
+ordering must be re-exported from the PDF for exact parity with the current
+parser. Loading an old archive cannot recover strokes discarded at export time.
+
 Open the native demo with `?bulkHep=1` or `?downloadAllHeps=1` to reveal the `Download All Example HEP Files` button. The old ZIP-named query parameters remain supported.
 
 ## Example Assets

@@ -15,8 +15,9 @@ import { buildParsedDataZip } from "./index";
 import {
   listSceneRasterLayers,
   loadSceneFromParsedDataZip,
+  prepareSceneForHepRendering,
   tryReadSourcePdfBytesFromExistingParsedZip
-} from "./parsedDataZip";
+} from "./hep";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
 import {
@@ -871,6 +872,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
 
+    scene = prepareSceneForHepRendering(scene);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
     if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {

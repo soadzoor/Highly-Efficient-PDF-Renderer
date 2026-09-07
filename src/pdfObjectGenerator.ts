@@ -4,7 +4,7 @@ import {
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
-import { loadSceneFromParsedDataZip } from "./parsedDataZip";
+import { loadSceneFromParsedDataZip, prepareSceneForHepRendering } from "./hep";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
 
@@ -148,7 +148,7 @@ export async function loadPdfSceneFromSource(
     );
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
-    const scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
+    const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pageScenes, pagesPerRow));
     signal?.throwIfAborted();
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
     signal?.throwIfAborted();

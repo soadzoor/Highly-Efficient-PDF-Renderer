@@ -27,7 +27,7 @@ import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdo
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
-import { tryReadSourcePdfBytesFromExistingParsedZip } from "./parsedDataZip";
+import { tryReadSourcePdfBytesFromExistingParsedZip } from "./hep";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,

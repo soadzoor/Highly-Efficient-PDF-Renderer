@@ -298,7 +298,7 @@ async function runShard(args, entries) {
     if (args.hepPath && typeof globalThis.window === "undefined") {
       globalThis.window = { location: { href: "http://localhost/" } };
     }
-    const parsedDataModule = args.hepPath ? await viteServer.ssrLoadModule("/src/parsedDataZip.ts") : null;
+    const parsedDataModule = args.hepPath ? await viteServer.ssrLoadModule("/src/hep.ts") : null;
 
     for (const [index, entry] of entries.entries()) {
       const key = `${entry.folder}/${entry.stem}`;

@@ -13,8 +13,8 @@ try {
   const { NativeTextClipTester } = await import("../src/pdf/nativeTextClip.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { createSceneTextSearcher } = await import("../src/textSearch.ts");
-  const { buildParsedDataZip } = await import("../src/parsedDataZipBuilder.ts");
-  const { loadSceneFromParsedDataZip } = await import("../src/parsedDataZip.ts");
+  const { buildParsedDataZip } = await import("../src/hepBuilder.ts");
+  const { loadSceneFromParsedDataZip } = await import("../src/hep.ts");
   const tester = new NativeTextClipTester();
   const lShape = clip([0, 0, 0, 1, 100, 0, 1, 100, 100, 1, 50, 100, 1, 50, 50, 1, 0, 50, 4]);
   assert(tester.isFullyOutside(box(10, 70, 20, 80), lShape));

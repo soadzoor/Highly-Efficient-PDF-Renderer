@@ -194,8 +194,8 @@ const viteServer = await createServer({
 
 try {
   const [zipBuilder, parsedData, rasterImageCodec] = await Promise.all([
-    viteServer.ssrLoadModule("/src/parsedDataZipBuilder.ts"),
-    viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
+    viteServer.ssrLoadModule("/src/hepBuilder.ts"),
+    viteServer.ssrLoadModule("/src/hep.ts"),
     viteServer.ssrLoadModule("/src/rasterImageCodec.ts")
   ]);
 

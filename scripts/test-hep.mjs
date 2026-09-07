@@ -1,4 +1,4 @@
-// Focused public API and round-trip regressions for parsed-data ZIP creation.
+// Focused public API and round-trip regressions for HEP creation.
 //
 // Vite is used only as an in-process TypeScript/SSR transformer. Middleware mode
 // does not bind a network listener, and HMR/WebSocket support is disabled.
@@ -396,7 +396,7 @@ async function run() {
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/index.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
-      viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
+      viteServer.ssrLoadModule("/src/hep.ts"),
       viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts")
     ]);
     const pdfBytes = await readFile(fixturePath);
@@ -419,7 +419,7 @@ async function run() {
 
     const sourceZipArchive = await JSZip.loadAsync(sourceZipBytes);
     const sourceManifest = JSON.parse(await sourceZipArchive.file("manifest.json").async("string"));
-    assert.equal(sourceManifest.formatVersion, 6, "native gradient scenes require the v6 ZIP schema");
+    assert.equal(sourceManifest.formatVersion, 6, "native gradient scenes require the v6 HEP schema");
     for (const unsupportedVersion of [5, 7]) {
       const incompatibleZip = await JSZip.loadAsync(sourceZipBytes);
       const incompatibleManifest = {
@@ -814,10 +814,10 @@ async function run() {
     assert.match(encodedShading.file, /\.(?:png|webp)$/);
     assert.match(encodedShading.encoding, /^(?:png|webp)$/);
     const encodedShadingBytes = await shadingZip.file(encodedShading.file).async("uint8array");
-    assert.ok(encodedShadingBytes.length < shadingLayers[0].data.length, "Node ZIP builds must compress raster layers");
+    assert.ok(encodedShadingBytes.length < shadingLayers[0].data.length, "Node HEP builds must compress raster layers");
     const encodedShadingRoundTrip = await loadSceneFromParsedDataZip(await shadingZipBlob.arrayBuffer());
     const decodedShadingLayers = listSceneRasterLayers(encodedShadingRoundTrip);
-    assert.equal(decodedShadingLayers.length, 1, "Node ZIP loads must decode encoded raster layers");
+    assert.equal(decodedShadingLayers.length, 1, "Node HEP loads must decode encoded raster layers");
     assert.equal(decodedShadingLayers[0].width, shadingLayers[0].width);
     assert.equal(decodedShadingLayers[0].height, shadingLayers[0].height);
     const decodedCenterDotPixel = sampleRasterLayerAtWorld(decodedShadingLayers[0], 800, 436.4);
@@ -826,7 +826,7 @@ async function run() {
         decodedCenterDotPixel[1] > 170 &&
         decodedCenterDotPixel[2] > 160 &&
         decodedCenterDotPixel[3] > 245,
-      "encoded soft-mask composites must survive the Node ZIP round trip"
+      "encoded soft-mask composites must survive the Node HEP round trip"
     );
 
     const parsedInterleavedRasterPdf = await loadPdfSceneFromSource(optimizedRasterPdfBytes, {
@@ -1182,7 +1182,7 @@ async function run() {
       /compression must be either "deflate" or "store"/
     );
 
-    console.log("Parsed-data ZIP regressions passed");
+    console.log("HEP regressions passed");
   } finally {
     await viteServer.close();
   }

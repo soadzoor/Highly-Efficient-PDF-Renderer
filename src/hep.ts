@@ -285,10 +285,10 @@ export async function buildParsedDataZipBlobForLayout(
 
   const strokeGeometryExport = buildStrokeGeometryExport(scene);
   if (strokeGeometryExport) {
-    zip.file(STROKE_ENDPOINTS_PATH, strokeGeometryExport.endpointsBytes);
-    zip.file(STROKE_META_PATH, strokeGeometryExport.metaBytes);
+    zip.file(strokeGeometryExport.manifest.endpointsFile, strokeGeometryExport.endpointsBytes);
+    zip.file(strokeGeometryExport.manifest.metaFile, strokeGeometryExport.metaBytes);
     if (strokeGeometryExport.clipBoundsBytes) {
-      zip.file(STROKE_CLIP_BOUNDS_PATH, strokeGeometryExport.clipBoundsBytes);
+      zip.file(strokeGeometryExport.manifest.clipBoundsFile!, strokeGeometryExport.clipBoundsBytes);
     }
   }
 
@@ -936,29 +936,43 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
 async function readStrokeGeometryFromSection(
   zip: JSZip,
   section: StrokeGeometrySectionMeta
-): Promise<{
+): Promise<ReturnType<typeof decodeStrokeGeometry> & { encoded: StrokeGeometryExport }> {
+  const endpointsEntry = zip.file(section.endpointsFile);
+  const metaEntry = zip.file(section.metaFile);
+  if (!endpointsEntry || !metaEntry) {
+    throw new Error("HEP file is missing v5 stroke geometry files.");
+  }
+  const [endpointsBytes, metaBytes] = await Promise.all([
+    endpointsEntry.async("uint8array"),
+    metaEntry.async("uint8array")
+  ]);
+  let clipBoundsBytes: Uint8Array | undefined;
+  if (section.clipBoundsFile) {
+    const entry = zip.file(section.clipBoundsFile);
+    if (!entry) {
+      throw new Error("HEP file is missing clipped stroke bounds.");
+    }
+    // The sparse float32 clip payload needs an aligned backing buffer.
+    clipBoundsBytes = new Uint8Array(await entry.async("arraybuffer"));
+  }
+  const encoded = { endpointsBytes, metaBytes, clipBoundsBytes, manifest: section };
+  return { ...decodeStrokeGeometry(encoded), encoded };
+}
+
+function decodeStrokeGeometry(encoded: StrokeGeometryExport): {
   endpoints: Float32Array;
   primitiveMeta: Float32Array;
   primitiveBounds: Float32Array;
-}> {
+} {
+  const section = encoded.manifest;
   const segmentCount = section.segmentCount;
   const endpoints = new Float32Array(segmentCount * 4);
   const primitiveMeta = new Float32Array(segmentCount * 4);
   if (segmentCount === 0) {
     return { endpoints, primitiveMeta, primitiveBounds: new Float32Array(0) };
   }
-
-  const endpointsEntry = zip.file(section.endpointsFile);
-  const metaEntry = zip.file(section.metaFile);
-  if (!endpointsEntry || !metaEntry) {
-    throw new Error("HEP file is missing v5 stroke geometry files.");
-  }
-  const [endpointBuffer, metaBuffer] = await Promise.all([
-    endpointsEntry.async("arraybuffer"),
-    metaEntry.async("arraybuffer")
-  ]);
-  const endpointBytes = new Uint8Array(endpointBuffer);
-  const metaBytes = new Uint8Array(metaBuffer);
+  const endpointBytes = encoded.endpointsBytes;
+  const metaBytes = encoded.metaBytes;
 
   const columnLengths = section.endpointColumnByteLengths;
   if (columnLengths[0] + columnLengths[1] + columnLengths[2] + columnLengths[3] !== endpointBytes.length) {
@@ -1034,16 +1048,15 @@ async function readStrokeGeometryFromSection(
 
   const primitiveBounds = derivePrimitiveBounds(endpoints, primitiveMeta, segmentCount);
   if (section.clipBoundsFile) {
-    const clipBoundsEntry = zip.file(section.clipBoundsFile);
-    if (!clipBoundsEntry) {
+    const clipBoundsBytes = encoded.clipBoundsBytes;
+    if (!clipBoundsBytes) {
       throw new Error("HEP file is missing clipped stroke bounds.");
     }
-    const clipBoundsBuffer = await clipBoundsEntry.async("arraybuffer");
     const expectedBytes = section.clippedSegmentCount! * 4 * Float32Array.BYTES_PER_ELEMENT;
-    if (clipBoundsBuffer.byteLength !== expectedBytes) {
+    if (clipBoundsBytes.byteLength !== expectedBytes) {
       throw new Error("HEP file clipped stroke bounds have a length mismatch.");
     }
-    const clipBounds = new Float32Array(clipBoundsBuffer);
+    const clipBounds = new Float32Array(clipBoundsBytes.buffer, clipBoundsBytes.byteOffset, clipBoundsBytes.byteLength / 4);
     let clipIndex = 0;
     for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
       const offset = segmentIndex * 4;
@@ -1157,6 +1170,61 @@ interface StrokeGeometryExport {
   manifest: StrokeGeometrySectionMeta;
 }
 
+// Retain compact streams so re-encoding decoded curve/line mixtures cannot
+// change their per-channel ranges and introduce drift.
+const preparedStrokeGeometry = new WeakMap<VectorScene, StrokeGeometryExport>();
+const preparedHepScenes = new WeakSet<VectorScene>();
+
+/**
+ * Apply HEP's existing vector precision after page layout and before LOD/GPU
+ * preparation. Cached parser pages remain untouched. No ZIP is generated.
+ */
+export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
+  if (preparedHepScenes.has(scene)) {
+    return scene;
+  }
+  const encodedStrokes = buildStrokeGeometryExport(scene);
+  const strokes = encodedStrokes ? decodeStrokeGeometry(encodedStrokes) : {};
+  const quantizeTexture = (name: string, values: Float32Array, count: number): Float32Array => {
+    const packed = packTextureForZip(name, values.subarray(0, count * 4), "interleaved");
+    return readTexturePayloadAsFloat32(
+      packed.data.buffer.slice(packed.data.byteOffset, packed.data.byteOffset + packed.data.byteLength) as ArrayBuffer,
+      { ...packed, logicalItemCount: count },
+      name
+    );
+  };
+  const quantizePositions = (values: Float32Array, count: number, channels: number): Float32Array => {
+    const result = values.slice(0, count * 4);
+    for (let channel = 0; channel < channels; channel += 1) {
+      const bytes = encodeFixed512DeltaColumn(values, count, 4, channel);
+      decodeFixed512DeltaColumnInto(bytes, 0, bytes.length, result, count, 4, channel);
+    }
+    return result;
+  };
+  const prepared = optimizeVectorSceneTextGlyphs({
+    ...scene,
+    ...strokes,
+    fillSegmentsA: quantizeTexture("fill-primitives-a", scene.fillSegmentsA, scene.fillSegmentCount),
+    fillSegmentsB: quantizeTexture("fill-primitives-b", scene.fillSegmentsB, scene.fillSegmentCount),
+    textGlyphSegmentsA: quantizeTexture("text-glyph-primitives-a", scene.textGlyphSegmentsA, scene.textGlyphSegmentCount),
+    textGlyphSegmentsB: quantizeTexture("text-glyph-primitives-b", scene.textGlyphSegmentsB, scene.textGlyphSegmentCount),
+    textInstanceB: quantizePositions(scene.textInstanceB, scene.textInstanceCount, 2),
+    textInstanceC: quantizeTexture("text-instance-c", scene.textInstanceC, scene.textInstanceCount),
+    textIndex: scene.textIndex ? {
+      ...scene.textIndex,
+      pages: scene.textIndex.pages.map((page) => ({
+        ...page,
+        fallbackQuads: quantizePositions(page.fallbackQuads, page.fallbackQuads.length / 4, 4)
+      }))
+    } : null
+  });
+  if (encodedStrokes) {
+    preparedStrokeGeometry.set(prepared, encodedStrokes);
+  }
+  preparedHepScenes.add(prepared);
+  return prepared;
+}
+
 /**
  * Stroke storage (retained in v6): uint16 range-quantized coordinates stored as chained
  * per-column zigzag-varint deltas (start chains to the previous end, end is
@@ -1164,6 +1232,10 @@ interface StrokeGeometryExport {
  * column, and control-point deltas only for curve segments.
  */
 function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExport | null {
+  const prepared = preparedStrokeGeometry.get(scene);
+  if (prepared) {
+    return prepared;
+  }
   const segmentCount = Math.max(0, Math.trunc(scene.segmentCount));
   if (segmentCount === 0) {
     return null;
@@ -1860,6 +1932,10 @@ export async function loadSceneFromParsedDataZip(
     discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
   });
+  if (strokeGeometry) {
+    preparedStrokeGeometry.set(scene, strokeGeometry.encoded);
+  }
+  preparedHepScenes.add(scene);
   progress.complete({ sourceType: "zip" });
   return scene;
 }

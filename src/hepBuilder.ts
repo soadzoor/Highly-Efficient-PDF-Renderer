@@ -7,7 +7,7 @@ import {
   buildParsedDataZipBlobForLayout,
   listSceneRasterLayers,
   type SceneTextureStats
-} from "./parsedDataZip";
+} from "./hep";
 import type { VectorScene } from "./pdfVectorExtractor";
 import {
   createLoadProgressReporter,

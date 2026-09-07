@@ -53,7 +53,7 @@ const viteServer = await createServer({
 
 try {
   const [zipBuilder, pdfObjectGenerator] = await Promise.all([
-    viteServer.ssrLoadModule("/src/parsedDataZipBuilder.ts"),
+    viteServer.ssrLoadModule("/src/hepBuilder.ts"),
     viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts")
   ]);
 

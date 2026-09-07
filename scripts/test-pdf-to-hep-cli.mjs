@@ -96,7 +96,7 @@ const sourceBuilder = await loadSourceHepBuilder({
     sourceBuilderViteOptions = options;
     return {
       async ssrLoadModule(moduleId) {
-        assert.equal(moduleId, "/src/parsedDataZipBuilder.ts");
+        assert.equal(moduleId, "/src/hepBuilder.ts");
         return { buildParsedDataZip: fakeBuildParsedDataZip };
       },
       async close() {

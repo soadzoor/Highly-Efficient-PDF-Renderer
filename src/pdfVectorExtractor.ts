@@ -5055,19 +5055,14 @@ function cullInvisibleSegments(
   }
 
   for (const candidates of coverageGroups.values()) {
-    candidates.sort((a, b) => {
-      if (Math.abs(a.halfWidth - b.halfWidth) > COVER_HALF_WIDTH_EPSILON) {
-        return b.halfWidth - a.halfWidth;
-      }
-
-      const lenA = a.end - a.start;
-      const lenB = b.end - b.start;
-      if (Math.abs(lenA - lenB) > COVER_INTERVAL_EPSILON) {
-        return lenB - lenA;
-      }
-
-      return a.start - b.start;
-    });
+    // Use a total order across runtimes; epsilon ties are non-transitive.
+    // Apply coverage tolerances only in the containment checks below.
+    candidates.sort((a, b) =>
+      b.halfWidth - a.halfWidth ||
+      (b.end - b.start) - (a.end - a.start) ||
+      a.start - b.start ||
+      a.index - b.index
+    );
 
     const opaqueCovers: CoverageCandidate[] = [];
 

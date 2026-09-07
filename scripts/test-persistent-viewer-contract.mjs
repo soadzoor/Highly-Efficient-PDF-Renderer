@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 
 const mainSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
-const zipSource = await readFile(new URL("../src/parsedDataZip.ts", import.meta.url), "utf8");
+const zipSource = await readFile(new URL("../src/hep.ts", import.meta.url), "utf8");
 
 assert.match(
   mainSource,

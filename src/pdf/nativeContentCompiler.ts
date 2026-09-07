@@ -5627,10 +5627,7 @@ class CoverageObjectSorter {
     primitiveMeta: Float32Array,
     checkpoint: (force?: boolean) => Promise<void>
   ): Promise<void> {
-    // Baseline coverage buckets are created with push and therefore have V8's
-    // PACKED_ELEMENTS representation. Do not pre-size this array: assigning
-    // into pre-created holes keeps it HOLEY_ELEMENTS and can change comparison
-    // order for the established non-transitive epsilon comparator.
+    // Reuse candidate objects to bound allocation across dense coverage groups.
     this.work.length = 0;
     for (let offset = 0; offset < values.length; offset += 1) {
       const index = values[offset];
@@ -5656,21 +5653,14 @@ class CoverageObjectSorter {
       this.work.push(candidate);
     }
 
-    // Match the established cull's packed-object sort representation as well
-    // as its comparator. The epsilon comparator is not globally transitive,
-    // so changing V8 element representation can otherwise change native
-    // containment choices within the same browser runtime.
-    this.work.sort((a, b) => {
-      if (Math.abs(a.halfWidth - b.halfWidth) > COVER_HALF_WIDTH_EPSILON) {
-        return b.halfWidth - a.halfWidth;
-      }
-      const lenA = a.end - a.start;
-      const lenB = b.end - b.start;
-      if (Math.abs(lenA - lenB) > COVER_INTERVAL_EPSILON) {
-        return lenB - lenA;
-      }
-      return a.start - b.start;
-    });
+    // Use a total order across runtimes; epsilon ties are non-transitive.
+    // Apply coverage tolerances only in the containment checks.
+    this.work.sort((a, b) =>
+      b.halfWidth - a.halfWidth ||
+      (b.end - b.start) - (a.end - a.start) ||
+      a.start - b.start ||
+      a.index - b.index
+    );
     for (let offset = 0; offset < values.length; offset += 1) {
       values[offset] = this.work[offset].index;
     }

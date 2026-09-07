@@ -164,7 +164,7 @@ async function run() {
       viteServer.ssrLoadModule("/src/pdfSignature.ts"),
       viteServer.ssrLoadModule("/src/downloadUtils.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
-      viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
+      viteServer.ssrLoadModule("/src/hep.ts"),
       viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts")
     ]);
     const prefixedPdf = new Uint8Array([0, 1, 2, 0x25, 0x50, 0x44, 0x46, 0x2d]);
