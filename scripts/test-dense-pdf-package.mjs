@@ -3,6 +3,7 @@ import { access, readFile, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker as NodeWorker } from "node:worker_threads";
+import { parseAst } from "vite";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
@@ -38,7 +39,6 @@ for (const field of ["dependencies", "devDependencies", "optionalDependencies", 
     );
   }
 }
-const entrySource = await readFile(entryPath, "utf8");
 const listFilesRecursively = async (directory) => {
   const files = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -67,11 +67,34 @@ for (const path of packagedFiles) {
     `published artifact must not contain a PDF.js/pdf-lib runtime reference: ${packagedPath}`
   );
 }
-const workerUrlMatch = entrySource.match(
-  /new URL\((['"])([^'"]*densePdfFastWorker-[^'"]+\.js)\1,\s*import\.meta\.url\)/
-);
+// Shared code can move out of index.js when optional features are split into chunks.
+// Follow only static imports/re-exports so an unrelated lazy chunk cannot satisfy this check.
+const pendingModulePaths = [entryPath];
+const visitedModulePaths = new Set();
+let workerModulePath = null;
+let workerUrlMatch = null;
+while (pendingModulePaths.length && !workerUrlMatch) {
+  const modulePath = pendingModulePaths.pop();
+  if (visitedModulePaths.has(modulePath)) continue;
+  visitedModulePaths.add(modulePath);
+  const source = await readFile(modulePath, "utf8");
+  workerUrlMatch = source.match(
+    /new URL\((['"])([^'"]*densePdfFastWorker-[^'"]+\.js)\1,\s*import\.meta\.url\)/
+  );
+  if (workerUrlMatch) {
+    workerModulePath = modulePath;
+    break;
+  }
+  for (const statement of parseAst(source).body) {
+    if (!["ImportDeclaration", "ExportNamedDeclaration", "ExportAllDeclaration"].includes(statement.type)) continue;
+    const reference = statement.source?.value;
+    if (typeof reference === "string" && /^\.\.?\//.test(reference)) {
+      pendingModulePaths.push(fileURLToPath(new URL(reference, pathToFileURL(modulePath))));
+    }
+  }
+}
 
-assert.ok(workerUrlMatch, "library entry must reference the dense PDF worker asset");
+assert.ok(workerUrlMatch, "library entry or its static dependencies must reference the dense PDF worker asset");
 
 const workerReference = workerUrlMatch[2];
 assert.ok(
@@ -79,7 +102,7 @@ assert.ok(
   `dense PDF worker reference must be package-relative, received ${workerReference}`
 );
 
-const workerPath = fileURLToPath(new URL(workerReference, pathToFileURL(entryPath)));
+const workerPath = fileURLToPath(new URL(workerReference, pathToFileURL(workerModulePath)));
 const workerRelativePath = relative(libDir, workerPath);
 assert.ok(
   workerRelativePath.length > 0 && !workerRelativePath.startsWith("..") && !isAbsolute(workerRelativePath),

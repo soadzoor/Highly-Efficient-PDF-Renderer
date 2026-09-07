@@ -4,7 +4,7 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
-import { detectRooms, type DetectedRoom, type RoomDetectionResult } from "./roomDetector";
+import type { DetectedRoom, RoomDetectionResult } from "./roomDetector";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import {
   normalizeExampleManifestEntries,
@@ -593,11 +593,16 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
 
   const activeToken = ++roomDetectionToken;
   setBusy(true);
-  setStatus("Preparing room detection...");
+  setStatus("Loading room detector...");
 
   try {
-    setStatus("Detecting rooms from the extracted vector scene...");
     detectRoomsSpinner.hidden = false;
+    const { detectRooms } = await import("./roomDetector");
+    if (activeToken !== roomDetectionToken) {
+      return;
+    }
+
+    setStatus("Detecting rooms from the extracted vector scene...");
 
     // detectRooms runs synchronously and can take a few seconds; yield two frames so
     // the browser paints the spinner and status before the main thread blocks (the
@@ -1209,6 +1214,7 @@ function isFiniteBounds(bounds: Bounds): boolean {
 }
 
 function clearCurrentPdfObject(): void {
+  roomDetectionToken += 1;
   clearRoomOverlay({ silent: true });
   currentParsedTsv = null;
   currentGeneratedTsv = null;
