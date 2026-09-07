@@ -154,9 +154,10 @@ export async function openPdfInNodeWorker(
 
 /**
  * Node rejects `--input-type` when a worker has a file/URL entry. It also
- * rejects V8 heap/stack flags and process-wide `--title` in Worker `execArgv`;
- * callers must use Worker `resourceLimits` for those concerns. Preserve other
- * inherited runtime flags (loaders, warnings, debugging, strip-types).
+ * rejects V8 heap/stack flags and process-wide options in Worker `execArgv`,
+ * including defaults forwarded by Node's test runner. Use Worker `resourceLimits`
+ * for heap/stack limits. Preserve inherited loaders, warnings, debugging and
+ * strip-types options.
  */
 export function sanitizeNodePdfWorkerExecArgv(
   execArgv: readonly string[]
@@ -169,7 +170,7 @@ export function sanitizeNodePdfWorkerExecArgv(
       if (!argument.includes("=")) index += 1;
       continue;
     }
-    if (NODE_PDF_WORKER_BOOLEAN_V8_FLAGS.has(optionName)) {
+    if (NODE_PDF_WORKER_BOOLEAN_FLAGS.has(optionName)) {
       continue;
     }
     if (argument === "--input-type") {
@@ -190,12 +191,19 @@ const NODE_PDF_WORKER_VALUE_FLAGS = new Set([
   "--heap-growing-percent",
   "--stack-size",
   "--stack-trace-limit",
-  "--title"
+  "--title",
+  "--v8-pool-size",
+  "--trace-event-file-pattern",
+  "--secure-heap-min",
+  "--tls-cipher-list",
+  "--use-largepages",
+  "--secure-heap"
 ]);
 
-const NODE_PDF_WORKER_BOOLEAN_V8_FLAGS = new Set([
+const NODE_PDF_WORKER_BOOLEAN_FLAGS = new Set([
   "--huge-max-old-generation-size",
-  "--optimize-for-size"
+  "--optimize-for-size",
+  "--node-snapshot"
 ]);
 
 function defaultNodePdfWorkerUrl(): URL {

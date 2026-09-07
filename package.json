@@ -76,7 +76,7 @@
     "build": "tsc && npm run test:file -- scripts/test-persistent-viewer-contract.mjs && vite build",
     "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:package",
     "build:all": "npm run build && npm run build:lib",
-    "release-new-version": "npm run build:all && npm version patch && git push --follow-tags",
+    "release-new-version": "npm test && npm run build:all && npm version patch && git push --follow-tags",
     "pack:local": "npm run build:lib && npm pack",
     "publish:dry-run": "npm publish --access public --dry-run",
     "preview": "vite preview",

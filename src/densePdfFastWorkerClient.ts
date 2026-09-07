@@ -336,6 +336,8 @@ async function createNodeDensePdfWorker(): Promise<DensePdfWorkerLike> {
   return adaptNodeDensePdfWorker(worker);
 }
 
+// Node's test runner can forward process-wide defaults as explicit arguments.
+// Filter those along with V8 limits while retaining worker runtime options.
 function sanitizeNodeDenseWorkerExecArgv(execArgv: readonly string[]): string[] {
   const output: string[] = [];
   for (let index = 0; index < execArgv.length; index += 1) {
@@ -345,7 +347,7 @@ function sanitizeNodeDenseWorkerExecArgv(execArgv: readonly string[]): string[] 
       if (!argument.includes("=")) index += 1;
       continue;
     }
-    if (NODE_DENSE_WORKER_BOOLEAN_V8_FLAGS.has(optionName)) continue;
+    if (NODE_DENSE_WORKER_BOOLEAN_FLAGS.has(optionName)) continue;
     if (argument === "--input-type") {
       index += 1;
       continue;
@@ -364,12 +366,19 @@ const NODE_DENSE_WORKER_VALUE_FLAGS = new Set([
   "--heap-growing-percent",
   "--stack-size",
   "--stack-trace-limit",
-  "--title"
+  "--title",
+  "--v8-pool-size",
+  "--trace-event-file-pattern",
+  "--secure-heap-min",
+  "--tls-cipher-list",
+  "--use-largepages",
+  "--secure-heap"
 ]);
 
-const NODE_DENSE_WORKER_BOOLEAN_V8_FLAGS = new Set([
+const NODE_DENSE_WORKER_BOOLEAN_FLAGS = new Set([
   "--huge-max-old-generation-size",
-  "--optimize-for-size"
+  "--optimize-for-size",
+  "--node-snapshot"
 ]);
 
 function resolveNodeDenseWorkerHeapMb(

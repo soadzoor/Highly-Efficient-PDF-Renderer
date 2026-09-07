@@ -23,6 +23,7 @@ export const fastTests = [
   "pdf-range-transport",
   "pdf-session",
   "pdf-session-worker",
+  "pdf-node-worker-runtime",
   "native-content-compiler",
   "native-vector-page",
   "native-composite-lifetime",

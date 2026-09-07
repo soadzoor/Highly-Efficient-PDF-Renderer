@@ -66,6 +66,12 @@ The npm `prepublishOnly` hook runs the same checks. No server is started by
 these commands. Dependencies currently use `npm install` because the repository
 does not track a lockfile.
 
+`npm run release-new-version` runs `npm test` and `npm run build:all` before
+bumping the patch version and pushing its tag. The fast suite includes real
+Node worker startup with process-wide flags from CI, covering both the full
+and dense PDF workers. A successful local release command means the tag was
+pushed; check the separate **Publish to npm** workflow for publishing success.
+
 ## Manual checks
 
 Build with `npm run build:all`, then start `npm run preview` yourself.

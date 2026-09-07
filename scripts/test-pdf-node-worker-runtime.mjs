@@ -19,10 +19,12 @@ try {
       openPdfInNodeWorker,
       sanitizeNodePdfWorkerExecArgv
     },
-    { extractPdfPageScenes }
+    { extractPdfPageScenes },
+    { compileDensePdfInWorker }
   ] = await Promise.all([
     import("../src/pdf/workerClient.ts"),
-    import("../src/pdfVectorExtractor.ts")
+    import("../src/pdfVectorExtractor.ts"),
+    import("../src/densePdfFastWorkerClient.ts")
   ]);
   assert.deepEqual(
     sanitizeNodePdfWorkerExecArgv([
@@ -59,6 +61,52 @@ try {
       { number: 4, body: tinyPdfStream("", "1 0 0 rg 1 2 3 4 re f\n") }
     ]
   });
+  // Node 24's test runner can forward process-wide defaults in execArgv.
+  // Reproduce the publish failure on older Node versions too, without changing
+  // the host's actual TLS, heap, or snapshot configuration.
+  const processWideFlags = [
+    "--v8-pool-size=4",
+    "--trace-event-file-pattern=node_trace.${rotation}.log",
+    "--secure-heap-min=2",
+    "--tls-cipher-list=TLS_AES_256_GCM_SHA384",
+    "--use-largepages=off",
+    "--node-snapshot",
+    "--secure-heap=0"
+  ];
+  const splitFlags = processWideFlags.flatMap((argument) => {
+    const separator = argument.indexOf("=");
+    return separator < 0 ? [argument] : [
+      `--${argument.slice(2, separator).replaceAll("-", "_")}`,
+      argument.slice(separator + 1)
+    ];
+  });
+  for (const inheritedFlags of [processWideFlags, splitFlags]) {
+    const originalExecArgv = process.execArgv.slice();
+    process.execArgv.push(...inheritedFlags);
+    try {
+      const flagSession = await openPdfInNodeWorker({ kind: "bytes", bytes: fixture });
+      try {
+        const flagPage = await flagSession.compilePage(0);
+        assert.ok(flagPage.stores.paths.fillPathMetaA.length > 0);
+      } finally {
+        await flagSession.close();
+      }
+      const denseResult = await compileDensePdfInWorker(fixture);
+      assert.equal(denseResult.kind, "success", JSON.stringify(denseResult));
+      assert.equal(denseResult.pages[0].compiled.fillPathCount, 1);
+    } finally {
+      process.execArgv.splice(0, process.execArgv.length, ...originalExecArgv);
+    }
+    const workerFlags = [
+      "--trace-warnings", "--experimental-strip-types", "--inspect=0",
+      "--import", "./preload.mjs", "--loader=./loader.mjs"
+    ];
+    assert.deepEqual(
+      sanitizeNodePdfWorkerExecArgv([...inheritedFlags, ...workerFlags]),
+      workerFlags,
+      "filter process-wide arguments while preserving worker runtime options"
+    );
+  }
   const workerUrl = sourceWorkerBootstrapUrl(
     new URL("../src/pdf/pdfWorkerEntry.ts", import.meta.url)
   );
