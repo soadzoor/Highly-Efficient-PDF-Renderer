@@ -1037,7 +1037,6 @@ class DenseContentCompiler {
         numberArg(args, 1);
         this.referencedFonts.add(font);
         this.operatorTracker.addFontOperator(
-          font,
           this.fontDependencyKeys.get(font) ?? font
         );
         this.retainStatement(args, operator);
@@ -1969,7 +1968,7 @@ class PdfJsOperatorCountTracker {
     this.traceBuilder = recordTrace ? new PdfJsOperatorCountTraceBuilder() : null;
   }
 
-  addFontOperator(fontName: string, dependencyKey: string): void {
+  addFontOperator(dependencyKey: string): void {
     this.traceBuilder?.addFontDependency(dependencyKey);
     if (!this.fontDependencies.has(dependencyKey)) {
       this.fontDependencies.add(dependencyKey);
@@ -2015,7 +2014,7 @@ class PdfJsOperatorCountTracker {
         // Q and ET have identical OperatorList early-flush behavior.
         this.addOperator("Q");
       } else {
-        this.addFontOperator("", fontDependencyKeys[event - 1]);
+        this.addFontOperator(fontDependencyKeys[event - 1]);
       }
     }
     this.addGenericOperatorRun(genericRuns[semanticEvents.length]);
@@ -4109,11 +4108,6 @@ function normalizeDeviceColor(
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   return clamp01(alpha) + Math.max(0, Math.trunc(styleFlags + 1e-6)) * STROKE_STYLE_FLAG_OFFSET;
-}
-
-function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: number } {
-  const styleFlags = Math.max(0, Math.trunc(encoded / STROKE_STYLE_FLAG_OFFSET + 1e-6));
-  return { alpha: clamp01(encoded - styleFlags * STROKE_STYLE_FLAG_OFFSET), styleFlags };
 }
 
 function emptyBounds(): DensePdfBounds {

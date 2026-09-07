@@ -400,7 +400,8 @@ class CachedReader implements PdfRandomAccessReader {
       promise = span.then((bytes) => {
         const blockBytes = this.backend.stableReadViews
           ? bytes.subarray(blockOffset, blockOffset + blockLength)
-          : bytes.slice(blockOffset, blockOffset + blockLength);
+          // A range callback may return a Node Buffer, whose slice() shares memory.
+          : new Uint8Array(bytes.subarray(blockOffset, blockOffset + blockLength));
         if (!this.closed) this.storeBlock(block, blockBytes);
         return blockBytes;
       }).finally(() => {

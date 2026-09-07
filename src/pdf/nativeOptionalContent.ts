@@ -5,7 +5,6 @@ import {
   isPdfString,
   pdfRefKey,
   type PdfDictionary,
-  type PdfRef,
   type PdfValue
 } from "./nativeCos";
 import {

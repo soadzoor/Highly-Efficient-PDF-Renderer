@@ -2427,7 +2427,7 @@ export class HeprThreePdfObject extends THREE.Group {
     camera: THREE.PerspectiveCamera,
     viewport: ViewportPixels
   ): { width: number; height: number } | null {
-    const bounds = this.measureProjectedPageNdcBounds(camera, viewport);
+    const bounds = this.measureProjectedPageNdcBounds(camera);
     if (!bounds) {
       return null;
     }
@@ -2450,8 +2450,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private measureProjectedPageNdcBounds(
-    camera: THREE.Camera,
-    viewport: ViewportPixels
+    camera: THREE.Camera
   ): { minX: number; minY: number; maxX: number; maxY: number; longRatio: number } | null {
     const localX0 = this.localSceneBounds.minX;
     const localY0 = this.localSceneBounds.minY;

@@ -7,7 +7,6 @@ import {
   pdfRefKey,
   type PdfDictionary,
   type PdfName,
-  type PdfStream,
   type PdfValue
 } from "./nativeCos";
 import type { NativePdfDocument } from "./nativeDocument";

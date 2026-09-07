@@ -628,7 +628,7 @@ function applyPredictor(
     );
   }
   if (predictor >= 10 && predictor <= 15) {
-    return decodePngPredictor(input, colors, bits, rowBytes, predictor, limit, signal);
+    return decodePngPredictor(input, colors, bits, rowBytes, limit, signal);
   }
   throw new PdfError("unsupported-filter", `Unsupported PDF predictor ${predictor}.`, {
     details: { predictor }
@@ -665,7 +665,6 @@ function decodePngPredictor(
   colors: number,
   bits: number,
   rowBytes: number,
-  predictor: number,
   limit: number,
   signal?: AbortSignal
 ): Uint8Array {

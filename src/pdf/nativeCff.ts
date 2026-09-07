@@ -448,7 +448,6 @@ class Type2Interpreter {
   private readonly charString: Uint8Array;
   private readonly localSubrs: readonly Uint8Array[];
   private readonly globalSubrs: readonly Uint8Array[];
-  private readonly defaultWidthX: number;
   private readonly nominalWidthX: number;
   private readonly limits: Readonly<NativeCffParserLimits>;
   private readonly budget: Type2Budget;
@@ -478,7 +477,6 @@ class Type2Interpreter {
     this.charString = options.charString;
     this.localSubrs = options.localSubrs;
     this.globalSubrs = options.globalSubrs;
-    this.defaultWidthX = options.defaultWidthX;
     this.nominalWidthX = options.nominalWidthX;
     this.limits = options.limits;
     this.budget = options.budget;

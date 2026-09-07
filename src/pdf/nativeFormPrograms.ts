@@ -12,8 +12,7 @@ import {
 import {
   isPdfName,
   isPdfStream,
-  type PdfDictionary,
-  type PdfValue
+  type PdfDictionary
 } from "./nativeCos";
 import type { NativePdfDocument } from "./nativeDocument";
 import type { NativeOptionalContentRegistry } from "./nativeOptionalContent";

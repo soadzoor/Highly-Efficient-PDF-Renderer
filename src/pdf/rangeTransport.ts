@@ -109,7 +109,7 @@ export function servePdfRangeSource(
       if (closed || controller.signal.aborted) return;
       // Always transfer a tightly owned buffer. A callback is permitted to
       // return a view into a cache that must remain valid on the host.
-      const bytes = received.slice();
+      const bytes = new Uint8Array(received);
       endpoint.postMessage(
         { type: "pdf-range-result", requestId: message.requestId, ok: true, bytes },
         [bytes.buffer]

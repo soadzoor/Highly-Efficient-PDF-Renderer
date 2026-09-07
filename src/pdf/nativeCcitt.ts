@@ -590,12 +590,12 @@ function decodeCode<T>(
     const bit = reader.readRequired(`Truncated CCITT ${label} code.`);
     const next = bit === 0 ? node.zero : node.one;
     if (!next) {
-      throw malformedAt(reader, start, `Malformed CCITT ${label} code.`, "ccitt-invalid-code");
+      throw malformedAt(start, `Malformed CCITT ${label} code.`, "ccitt-invalid-code");
     }
     node = next;
     if (node.value !== undefined) return node.value;
   }
-  throw malformedAt(reader, start, `Oversized CCITT ${label} code.`, "ccitt-oversized-code");
+  throw malformedAt(start, `Oversized CCITT ${label} code.`, "ccitt-oversized-code");
 }
 
 function findReferenceTransition(
@@ -1073,11 +1073,10 @@ function malformed(
   message: string,
   reason: string
 ): PdfError {
-  return malformedAt(reader, reader.position, message, reason);
+  return malformedAt(reader.position, message, reason);
 }
 
 function malformedAt(
-  reader: MsbBitReader,
   bitOffset: number,
   message: string,
   reason: string

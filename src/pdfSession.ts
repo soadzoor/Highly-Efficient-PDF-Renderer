@@ -2090,7 +2090,6 @@ async function flattenNativeVectorFormOccurrences(
         }
         seenGlyphRuns[localIndex] = 1;
         const localMeta = localIndex * 3;
-        const first = sidecar.glyphRunMeta[localMeta];
         const count = sidecar.glyphRunMeta[localMeta + 1];
         const renderingMode = sidecar.glyphRunMeta[localMeta + 2];
         const globalFirst = textAccumulator.appendRun(occurrence.text, localIndex);
@@ -3093,24 +3092,6 @@ async function renderNativeCompositePixels(
   } finally {
     options.surfaceFactory.releaseScratch();
   }
-}
-
-function countHeprCommandPaints(page: HeprPageData, command: HeprDisplayCommand): number {
-  if (command.kind === "draw") return 1;
-  const commands = command.kind === "invoke-program"
-    ? page.displayProgram.programs[command.programIndex]?.commands
-    : page.displayProgram.groups[command.groupIndex]?.commands;
-  let count = 0;
-  if (command.kind === "invoke-group") {
-    const group = page.displayProgram.groups[command.groupIndex];
-    if (group && group.softMaskGroupIndex >= 0) {
-      for (const nested of page.displayProgram.groups[group.softMaskGroupIndex]?.commands ?? []) {
-        count += countHeprCommandPaints(page, nested);
-      }
-    }
-  }
-  for (const nested of commands ?? []) count += countHeprCommandPaints(page, nested);
-  return count;
 }
 
 function heprCommandContainsGlyph(

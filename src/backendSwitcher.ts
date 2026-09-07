@@ -22,7 +22,6 @@ export interface BackendSwitcherOptions {
   resetPointerInteractionState: () => void;
   isOperationActive?: () => boolean;
   getSceneSnapshot: () => SceneSnapshot;
-  setSceneStats: (stats: SceneStats | null) => void;
   updateMetricsAfterSwitch: (label: string, scene: VectorScene, sceneStats: SceneStats) => void;
   setMetricTimesText: (text: string) => void;
   setBaseStatus: (status: string) => void;
@@ -161,7 +160,6 @@ export function createBackendSwitcher(options: BackendSwitcherOptions): BackendS
       }
 
       if (sceneSnapshot.scene && sceneSnapshot.label && nextSceneStats) {
-        options.setSceneStats(nextSceneStats);
         options.updateMetricsAfterSwitch(sceneSnapshot.label, sceneSnapshot.scene, nextSceneStats);
         options.setMetricTimesText("parse -, vector lod -, upload - (backend switch)");
 

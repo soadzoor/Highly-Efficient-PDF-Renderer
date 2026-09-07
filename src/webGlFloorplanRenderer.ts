@@ -1246,7 +1246,6 @@ const HIGHLIGHT_SELECTION_BORDER: readonly number[] = [0.106, 0.365, 0.788, 1];
 const HIGHLIGHT_SELECTION_BORDER_PX = 1;
 const HIGHLIGHT_MIN_SIZE_PX = 2;
 
-const INTERACTION_DECAY_MS = 140;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
@@ -1869,8 +1868,6 @@ export class WebGlFloorplanRenderer {
 
   private maxZoom = 4_096;
 
-  private lastInteractionTime = Number.NEGATIVE_INFINITY;
-
   private isPanInteracting = false;
 
   private panCacheTexture: WebGLTexture | null = null;
@@ -2446,7 +2443,6 @@ export class WebGlFloorplanRenderer {
     this.lastPanFrameCameraY = this.cameraCenterY;
     this.lastPanFrameTimeMs = 0;
     this.isPanInteracting = true;
-    this.markInteraction();
   }
 
   endPanInteraction(): void {
@@ -2468,7 +2464,6 @@ export class WebGlFloorplanRenderer {
     this.panVelocityWorldY = 0;
     this.lastPanVelocityUpdateTimeMs = 0;
     this.lastPanFrameTimeMs = 0;
-    this.markInteraction();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
   }
@@ -2909,7 +2904,6 @@ export class WebGlFloorplanRenderer {
     }
 
     this.hasCameraInteractionSinceSceneLoad = true;
-    this.markInteraction();
     this.hasZoomAnchor = false;
     const pixelScale = this.resolveClientToPixelScale();
     const worldDeltaX = -(deltaX * pixelScale.x) / this.zoom;
@@ -2928,7 +2922,6 @@ export class WebGlFloorplanRenderer {
   zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void {
     const clampedFactor = clamp(zoomFactor, 0.1, 10);
     this.hasCameraInteractionSinceSceneLoad = true;
-    this.markInteraction();
     const anchorWorld = this.clientToWorld(clientX, clientY);
     const nextZoom = clamp(this.targetZoom * clampedFactor, this.minZoom, this.maxZoom);
     const zoomTargetChanged = nextZoom !== this.targetZoom;
@@ -5377,14 +5370,6 @@ export class WebGlFloorplanRenderer {
     }
   }
 
-  private markInteraction(): void {
-    this.lastInteractionTime = performance.now();
-  }
-
-  private isInteractionActive(): boolean {
-    return performance.now() - this.lastInteractionTime <= INTERACTION_DECAY_MS;
-  }
-
   private initializeGeometry(): void {
     const gl = this.gl;
 
@@ -5642,7 +5627,6 @@ export class WebGlFloorplanRenderer {
       }
     }
 
-    this.markInteraction();
     this.needsVisibleSetUpdate = true;
 
     needsPosition =

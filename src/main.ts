@@ -349,7 +349,6 @@ interface LoadedSource {
 
 let lastLoadedSource: LoadedSource | null = null;
 let lastParsedScene: VectorScene | null = null;
-let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
 let loadToken = 0;
 let activeSceneLoadToken: number | null = null;
@@ -440,9 +439,6 @@ backendSwitcher = createBackendSwitcher({
     label: lastParsedSceneLabel,
     loadedSourceKind: lastLoadedSource?.kind ?? null
   }),
-  setSceneStats: (stats) => {
-    lastParsedSceneStats = stats;
-  },
   updateMetricsAfterSwitch: (label, scene, sceneStats) => {
     updateMetricsPanel(label, scene, sceneStats, 0, 0, null, null);
   },
@@ -912,7 +908,6 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     logTextureSizeStats(label, scene, sceneStats);
 
     lastParsedScene = scene;
-    lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
     commitLoadedSource(options);
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
@@ -1010,7 +1005,6 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     logTextureSizeStats(label, scene, sceneStats);
 
     lastParsedScene = scene;
-    lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
     commitLoadedSource(options);
     parsedPdfPageCache = null;

@@ -99,7 +99,7 @@ It introduces no viewer changes or lower-resolution rendering.
 
 Routing success is not a visual, search/selection, or general PDF-feature
 conformance result. Production Chrome/Firefox/Safari comparisons, cold tiny-PDF
-startup, Node 22.13 compatibility, full corpus timing/memory gates, and manual
+startup, Node 22.15 compatibility, full corpus timing/memory gates, and manual
 HEP v6 export/reload checks remain outstanding. No HEP format migration or
 corpus HEP regeneration is part of this parser-performance validation.
 

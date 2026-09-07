@@ -1211,8 +1211,6 @@ class DenseContentCompiler {
 
   private legacyPathSpanStartOrdinal = 0;
 
-  private legacyPathSpanEligible = true;
-
   private legacyPathSpanHasPaint = false;
 
   private legacyPathSpanSourceOffset = -1;
@@ -1267,8 +1265,6 @@ class DenseContentCompiler {
   private retainedDashValues = 0;
 
   private legacyPaintOrdinal = 0;
-
-  private legacySawOrdinaryPaint = false;
 
   private legacySawVisibleText = false;
 
@@ -2265,7 +2261,6 @@ class DenseContentCompiler {
             this.legacyPathSpanStartFillCount = this.fillPathCount;
             this.legacyPathSpanStartStrokeCount = this.strokes.primitiveCount;
             this.legacyPathSpanStartOrdinal = ordinal + 1;
-            this.legacyPathSpanEligible = true;
           } else {
             this.recordShadingPaint(gradientIndex);
           }
@@ -2827,7 +2822,6 @@ class DenseContentCompiler {
         this.operatorSourceLength
       );
       this.legacySelectivePaintOrdinalSpans.push(ordinal, ordinal);
-      this.legacyPathSpanEligible = false;
       finishClip();
       this.clearPaintPathState();
       return;
@@ -3277,7 +3271,6 @@ class DenseContentCompiler {
     this.assertLegacyVectorComposite(role, operator);
     this.nextLegacyPaintOrdinal(operator);
     this.recordLegacyOrdinaryPaintBarrier(operator);
-    this.legacySawOrdinaryPaint = true;
   }
 
   private recordLegacyPathPaint(
@@ -3299,7 +3292,6 @@ class DenseContentCompiler {
   ): void {
     this.assertLegacyVectorComposite(role, operator);
     this.recordLegacyOrdinaryPaintBarrier(operator);
-    this.legacySawOrdinaryPaint = true;
     this.legacySawPathPaint = true;
   }
 
@@ -3485,7 +3477,6 @@ class DenseContentCompiler {
             glyphRunIndex,
             "Tj"
           );
-          this.legacyPathSpanEligible = false;
           return;
         }
         throw new DensePdfUnsupportedError(
@@ -3517,7 +3508,6 @@ class DenseContentCompiler {
       glyphRunIndex,
       "Tj"
     );
-    this.legacyPathSpanEligible = false;
   }
 
   private commitTextClip(): void {
@@ -3573,7 +3563,6 @@ class DenseContentCompiler {
         const ordinal = this.nextLegacyPaintOrdinal(operator);
         this.legacySelectivePaintSourceSpans.push(sourceOffset, sourceLength);
         this.legacySelectivePaintOrdinalSpans.push(ordinal, ordinal);
-        this.legacyPathSpanEligible = false;
         return;
       }
       let overlappingPathSpan = false;
@@ -3597,7 +3586,6 @@ class DenseContentCompiler {
         this.legacySelectivePaintOrdinalSpans.push(ordinal, ordinal);
         this.legacyPathSpanStartFillCount = this.fillPathCount;
         this.legacyPathSpanStartStrokeCount = this.strokes.primitiveCount;
-        this.legacyPathSpanEligible = true;
         return;
       }
       if (!this.state.clipIsDefault && !this.state.clipIsExactRectangle) {
@@ -3652,7 +3640,6 @@ class DenseContentCompiler {
       this.legacyPathSpanStartFillCount = this.fillPathCount;
       this.legacyPathSpanStartStrokeCount = this.strokes.primitiveCount;
       this.legacyPathSpanStartOrdinal = ordinal + 1;
-      this.legacyPathSpanEligible = true;
       this.legacyPathSpanHasPaint = false;
       this.legacyPathSpanSourceOffset = -1;
       this.legacyPathSpanSourceLength = -1;
@@ -3771,7 +3758,6 @@ class DenseContentCompiler {
         paintIndex,
         "Do"
       );
-      this.legacyPathSpanEligible = false;
       return;
     }
     if (!this.options.preservePaintOrder) return;
@@ -4864,7 +4850,7 @@ class DenseDuplicateIndex {
     if ((this.size + 1) * 10 >= this.hashes.length * 7) {
       this.grow();
     }
-    const hash = hashFloatTuple(tuple, tupleWords);
+    const hash = hashFloatTuple(tupleWords);
     let slot = hash & (this.hashes.length - 1);
     while (this.hashes[slot] !== 0) {
       if (this.hashes[slot] === hash && equals(this.indices[slot] - 1, tuple)) {
@@ -5692,7 +5678,7 @@ class DenseCoverageGroupIndex {
     if ((this.size + 1) * 10 >= this.hashes.length * 7) {
       this.grow();
     }
-    const hash = hashFloatTuple(tuple, tupleWords);
+    const hash = hashFloatTuple(tupleWords);
     let slot = hash & (this.hashes.length - 1);
     while (this.hashes[slot] !== 0) {
       if (
@@ -6569,33 +6555,8 @@ function fallbackDeviceColorSpace(
   });
 }
 
-function normalizeDeviceColor(
-  colorSpace: DeviceColorSpace,
-  args: PdfValue[],
-  operator: string
-): [number, number, number] {
-  const componentCount = colorSpace === "DeviceGray" ? 1 : colorSpace === "DeviceRGB" ? 3 : 4;
-  if (args.length !== componentCount) {
-    throw new DensePdfSyntaxError(
-      `${operator} expected ${componentCount} components for ${colorSpace}.`
-    );
-  }
-  if (colorSpace === "DeviceGray") return normalizeGray(numberArg(args, 0));
-  if (colorSpace === "DeviceRGB") {
-    return normalizeRgb(numberArg(args, 0), numberArg(args, 1), numberArg(args, 2));
-  }
-  return normalizeCmyk(
-    numberArg(args, 0), numberArg(args, 1), numberArg(args, 2), numberArg(args, 3)
-  );
-}
-
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   return clamp01(alpha) + Math.max(0, Math.trunc(styleFlags + 1e-6)) * STROKE_STYLE_FLAG_OFFSET;
-}
-
-function decodeStrokeStyleMeta(encoded: number): { alpha: number; styleFlags: number } {
-  const styleFlags = Math.max(0, Math.trunc(encoded / STROKE_STYLE_FLAG_OFFSET + 1e-6));
-  return { alpha: clamp01(encoded - styleFlags * STROKE_STYLE_FLAG_OFFSET), styleFlags };
 }
 
 function emptyBounds(): DensePdfBounds {
@@ -7052,7 +7013,7 @@ function fillDuplicateTuple(
   tuple[16] = clipped ? Math.fround(clipMaxY) : 0;
 }
 
-function hashFloatTuple(tuple: Float64Array, words: Uint32Array): number {
+function hashFloatTuple(words: Uint32Array): number {
   let hash = 0x811c9dc5;
   for (let index = 0; index < words.length; index += 1) {
     let value = words[index];

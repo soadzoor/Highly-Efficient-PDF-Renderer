@@ -1823,7 +1823,6 @@ function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: bo
 
   const objectWidth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.x);
   const objectHeight = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.y);
-  const objectDepth = Math.max(MIN_OBJECT_EXTENT, tempObjectSize.z);
   const viewport = resolveRendererViewportPixels();
   const widthPaddingFactor = viewport.width / Math.max(1, viewport.width - CAMERA_FIT_PADDING_PIXELS * 2);
   const heightPaddingFactor = viewport.height / Math.max(1, viewport.height - CAMERA_FIT_PADDING_PIXELS * 2);

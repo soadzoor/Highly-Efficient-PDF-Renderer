@@ -31,6 +31,7 @@ try {
   await testAlignedCoalescingAndDedup(createPdfRandomAccessReader, PDF_SOURCE_BLOCK_BYTES);
   await testByteExactLru(createPdfRandomAccessReader, PDF_SOURCE_BLOCK_BYTES);
   await testRangeOversizedBackingIsolation(createPdfRandomAccessReader, PDF_SOURCE_BLOCK_BYTES);
+  await testRangeOversizedBackingIsolation(createPdfRandomAccessReader, PDF_SOURCE_BLOCK_BYTES, Buffer);
   await testRangeCountsAndCloseRace(createPdfRandomAccessReader);
   await testHttpRangeIdentity(createPdfRandomAccessReader, PDF_SOURCE_BLOCK_BYTES, PdfError);
   await testHttpFallbacksAndLimits(createPdfRandomAccessReader, PdfError);
@@ -206,9 +207,9 @@ async function testByteExactLru(createReader, blockBytes) {
   await undersized.close();
 }
 
-async function testRangeOversizedBackingIsolation(createReader, blockBytes) {
+async function testRangeOversizedBackingIsolation(createReader, blockBytes, Bytes = Uint8Array) {
   const input = patternedBytes(blockBytes + 23);
-  const oversizedBacking = new Uint8Array(blockBytes * 8);
+  const oversizedBacking = Bytes.from(new Uint8Array(blockBytes * 8));
   let rangeReads = 0;
   const reader = await createReader({
     kind: "range",

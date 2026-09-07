@@ -392,6 +392,17 @@ async function testMissingFontResolution() {
     "resolver byte ownership must be isolated from later caller mutation"
   );
 
+  const callerBuffer = Buffer.from(buildTinySfnt());
+  const bufferSubstitute = await parseNativePdfFont(missingSimple, resolver, {
+    missingFontResolver: () => callerBuffer
+  });
+  callerBuffer.fill(0);
+  assert.equal(
+    bufferSubstitute.getGlyphOutline(1).commands[0].kind,
+    "move",
+    "Node Buffer resolver bytes must also be copied before retaining sfnt tables"
+  );
+
   const fingerprintedA = await parseNativePdfFont(simpleFontDictionary, resolver, {
     missingFontResolver: () => buildTinySfnt()
   });

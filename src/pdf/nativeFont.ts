@@ -2580,7 +2580,7 @@ async function resolveMissingSfnt(
   }
   // The parser retains the sfnt through DataView-backed tables, so copy caller
   // bytes before validation to make ownership and subsequent output stable.
-  const ownedBytes = result.sfntBytes.slice();
+  const ownedBytes = new Uint8Array(result.sfntBytes);
   if (!looksLikeSfnt(ownedBytes)) {
     throw unsupportedFont("The missing-font resolver returned bytes without a valid sfnt signature.");
   }

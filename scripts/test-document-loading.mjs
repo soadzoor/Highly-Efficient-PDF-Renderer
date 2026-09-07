@@ -21,7 +21,7 @@ const context = vm.createContext({
   loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
   sourceLoadController: null, activeHepExportController: null,
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
-  lastParsedSceneLabel: null, lastParsedSceneStats: null, parsedPdfPageCache: null,
+  lastParsedSceneLabel: null, parsedPdfPageCache: null,
   exampleManifestEntries: [], exampleSelectionMap: new Map(),
   exampleDropdown: { setDisabled: noop },
   statusTextElement: { textContent: "", hidden: true }, baseStatus: "",

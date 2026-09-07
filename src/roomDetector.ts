@@ -885,7 +885,7 @@ function detectRoomsOnPage(
   const seeds = collectPageSeeds(scene, pageIndex, pageMinX, pageMinY, pageMaxX, pageMaxY, providedSeeds);
 
   // Stage A: wall candidate filtering by stroke width statistics.
-  const stageA = collectWallSegments(scene, pageIndex, pageMinX, pageMinY, pageMaxX, pageMaxY, pageDiagonal, options);
+  const stageA = collectWallSegments(scene, pageMinX, pageMinY, pageMaxX, pageMaxY, pageDiagonal, options);
   const stats: RoomDetectionPageStats = {
     pageIndex,
     eligibleSegmentCount: stageA.eligibleSegmentCount,
@@ -1058,7 +1058,7 @@ function detectRoomsOnPage(
   for (let i = 0; i < wallCount; i += 1) {
     maxWallHalfWidth = Math.max(maxWallHalfWidth, walls[i * WALL_STRIDE + 4]);
   }
-  const grid = new WallGrid(walls, wallCount, pageMinX, pageMinY, pageMaxX, pageMaxY, Math.max(doorGapMax, wallWidth * 4));
+  const grid = new WallGrid(walls, wallCount, pageMinX, pageMinY, pageMaxX, Math.max(doorGapMax, wallWidth * 4));
 
   // Stage B: bridge door openings by extending wall ends until they contact other walls.
   // Closures are tracked separately from structural occupancy so access evidence can
@@ -1096,7 +1096,6 @@ function detectRoomsOnPage(
       pageMinX,
       pageMinY,
       pageMaxX,
-      pageMaxY,
       Math.max(doorGapMax, wallWidth * 4)
     );
     pairedDoorArcs = filterDoorArcComponents(
@@ -2448,7 +2447,6 @@ interface StageAResult {
 
 function collectWallSegments(
   scene: VectorScene,
-  pageIndex: number,
   pageMinX: number,
   pageMinY: number,
   pageMaxX: number,
@@ -3856,12 +3854,11 @@ class WallGrid {
   private readonly cols: number;
 
   constructor(
-    private readonly walls: Float64Array,
+    walls: Float64Array,
     wallCount: number,
     private readonly minX: number,
     private readonly minY: number,
     maxX: number,
-    maxY: number,
     private readonly cellSize: number
   ) {
     this.cols = Math.max(1, Math.ceil((maxX - minX) / cellSize) + 2);
@@ -7739,7 +7736,6 @@ function repairPairedWallRectangularEnvelope(
   let wallMinX = Infinity;
   let wallMinY = Infinity;
   let wallMaxX = -Infinity;
-  let wallMaxY = -Infinity;
   for (let wallIndex = 0; wallIndex < pairedWallCount; wallIndex += 1) {
     const base = wallIndex * WALL_STRIDE;
     let x0 = pairedWalls[base];
@@ -7784,7 +7780,6 @@ function repairPairedWallRectangularEnvelope(
     wallMinX = Math.min(wallMinX, x0, x1);
     wallMinY = Math.min(wallMinY, y0, y1);
     wallMaxX = Math.max(wallMaxX, x0, x1);
-    wallMaxY = Math.max(wallMaxY, y0, y1);
   }
   if (indexedWalls.length < 3) {
     return 0;
@@ -7795,7 +7790,6 @@ function repairPairedWallRectangularEnvelope(
     wallMinX - doorGapMax,
     wallMinY - doorGapMax,
     wallMaxX + doorGapMax,
-    wallMaxY + doorGapMax,
     doorGapMax
   );
 

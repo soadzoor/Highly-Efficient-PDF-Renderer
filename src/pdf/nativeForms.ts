@@ -6,7 +6,6 @@ import {
   isPdfString,
   pdfRefKey,
   type PdfDictionary,
-  type PdfName,
   type PdfRef,
   type PdfStream,
   type PdfString,
@@ -422,7 +421,6 @@ export class NativePdfFormAppearanceRegistry {
       const rectangle = await this.readRectangle(
         dictionary.get("Rect"),
         `annotation ${annotationIndex} /Rect`,
-        pageIndex,
         signal
       );
       const flags = await this.readFlagInteger(
@@ -657,7 +655,7 @@ export class NativePdfFormAppearanceRegistry {
         details: { reason: "unsupported-form-type" }
       });
     }
-    const resourceScope = await this.resolveFormResources(dictionary, inheritedResources, label, signal);
+    const resourceScope = await this.resolveFormResources(dictionary, inheritedResources, signal);
     const sourceIdentity = this.sourceIdentity(rawValue, resolved);
     const semanticIdentity = `${sourceIdentity}|resources:${resourceScope.identity}`;
     const cached = this.formCache.get(semanticIdentity);
@@ -695,7 +693,7 @@ export class NativePdfFormAppearanceRegistry {
     label: string,
     signal?: AbortSignal
   ): Promise<FormRecord> {
-    const bbox = await this.readRectangle(dictionaryValue(stream, "BBox"), `${label} /BBox`, undefined, signal);
+    const bbox = await this.readRectangle(dictionaryValue(stream, "BBox"), `${label} /BBox`, signal);
     const rawMatrix = stream.dictionary.get("Matrix");
     const matrix = rawMatrix === undefined || rawMatrix === null
       ? IDENTITY_MATRIX
@@ -721,7 +719,6 @@ export class NativePdfFormAppearanceRegistry {
   private async resolveFormResources(
     dictionary: PdfDictionary,
     inheritedResources: PdfDictionary | undefined,
-    label: string,
     signal?: AbortSignal
   ): Promise<EffectiveResourceScope> {
     const raw = dictionary.get("Resources");
@@ -1253,7 +1250,6 @@ export class NativePdfFormAppearanceRegistry {
   private async readRectangle(
     value: PdfValue | undefined,
     label: string,
-    pageIndex: number | undefined,
     signal?: AbortSignal
   ): Promise<NativePdfRectangle> {
     const values = await this.readNumberArray(value, 4, label, signal);

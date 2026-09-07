@@ -247,14 +247,16 @@ command and a reminder to regenerate the files. Repository installs already
 include it as a development dependency for the CLI and tests.
 
 From a repository checkout, the included Node.js CLI uses the same PDF
-extraction and HEP v6 writer as the client export. Node.js 22.13 or newer is
-required. After installing dependencies, convert either one PDF or every PDF
+extraction and HEP v6 writer as the client export. Node.js 22.15+, 23.5+, or 24+
+is required for the source workers' [module hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions).
+After installing dependencies, convert either one PDF or every PDF
 below a directory:
 
 ```bash
 npm install
 node PDFtoHEP.js ./Level1.pdf
 node PDFtoHEP.js ./path/to/pdf-folder
+node PDFtoHEP.js --output-dir=./heps ./path/to/pdf-folder
 ```
 
 Use a normal checkout install here: the CLI loads the repository source through
@@ -278,8 +280,12 @@ time summary and the total attempted conversion time. PDFs skipped during the
 initial existing-output scan are not timed because no conversion was started;
 an all-skipped run reports that no conversions were attempted.
 
-Each output is placed next to its input using the client naming convention; for
-example, `Level1.pdf` becomes `Level1-parsed-data.hep`. Existing outputs are
+Each output is placed next to its input unless `--output-dir=<directory>` is
+supplied. Outputs use the client naming convention; for example, `Level1.pdf`
+becomes `Level1-parsed-data.hep`. A shared output directory rejects colliding
+names, including PDFs in different input subdirectories. `npm run regenerate:heps`
+writes directly to `public/examples/heps`, where the example manifest reads them.
+Existing outputs are
 skipped by default. To replace them only after a new HEP has been built
 successfully:
 

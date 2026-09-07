@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import {
   link,
   lstat,
+  mkdir,
   open,
   readFile,
   readdir,
@@ -30,11 +30,12 @@ const PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE = 3;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const PDF_TO_HEP_USAGE = `Usage:
-  node PDFtoHEP.js [--force] <pdf-or-directory>
+  node PDFtoHEP.js [--force] [--output-dir=<directory>] <pdf-or-directory>
 
 Options:
   -f, --force  Replace existing regular HEP files after conversion succeeds.
   -h, --help   Show this help text.
+  --output-dir=<directory>  Write all HEP files into this directory.
 
 Examples:
   node PDFtoHEP.js ./Level1.pdf
@@ -43,7 +44,8 @@ Examples:
 
 When given a directory, the script scans it recursively and processes regular
 .pdf files in isolated child processes, one at a time. Outputs use the client
-export convention <name>-parsed-data.hep and are written beside their PDFs.
+export convention <name>-parsed-data.hep and are written beside their PDFs,
+unless --output-dir is supplied. Output name collisions are rejected.
 
 Existing HEP files are skipped unless --force is supplied.`;
 
@@ -60,6 +62,7 @@ export function parsePdfToHepArguments(args) {
   let help = false;
   let positionalOnly = false;
   let inputPath;
+  let outputDirectory;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -72,6 +75,14 @@ export function parsePdfToHepArguments(args) {
     }
     if (!positionalOnly && (argument === "--force" || argument === "-f")) {
       force = true;
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--output-dir=")) {
+      const value = argument.slice("--output-dir=".length);
+      if (!value || outputDirectory !== undefined) {
+        throw new Error("Pass exactly one non-empty --output-dir=<directory>.");
+      }
+      outputDirectory = path.resolve(value);
       continue;
     }
     if (!positionalOnly && argument.startsWith("-")) {
@@ -87,7 +98,7 @@ export function parsePdfToHepArguments(args) {
     throw new Error("Pass a PDF file or directory.");
   }
 
-  return { force, help, inputPath };
+  return { force, help, inputPath, ...(outputDirectory === undefined ? {} : { outputDirectory }) };
 }
 
 export async function discoverPdfFiles(inputPath) {
@@ -154,15 +165,15 @@ export function sanitizeHepSourceName(sourceLabel) {
   return normalized.length > 0 ? normalized : "floorplan";
 }
 
-export function hepOutputPathForPdf(pdfPath) {
+export function hepOutputPathForPdf(pdfPath, outputDirectory) {
   const outputName = `${sanitizeHepSourceName(path.basename(pdfPath))}-parsed-data.hep`;
-  return path.join(path.dirname(pdfPath), outputName);
+  return path.join(outputDirectory ?? path.dirname(pdfPath), outputName);
 }
 
-export function assertUniqueHepOutputs(pdfPaths) {
+export function assertUniqueHepOutputs(pdfPaths, outputDirectory) {
   const sourceByOutput = new Map();
   for (const pdfPath of pdfPaths) {
-    const outputPath = hepOutputPathForPdf(pdfPath);
+    const outputPath = hepOutputPathForPdf(pdfPath, outputDirectory);
     // Treat case-only differences as collisions even on a case-sensitive host;
     // the same batch should remain safe when moved to Windows or macOS.
     const key = path.resolve(outputPath).toLocaleLowerCase("en-US");
@@ -176,11 +187,15 @@ export function assertUniqueHepOutputs(pdfPaths) {
   }
 }
 
-function assertSupportedNodeVersion() {
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  if (!Number.isInteger(major) || major < 22 || (major === 22 && minor < 13)) {
+export function assertSupportedNodeVersion(version = process.versions.node) {
+  const [major, minor] = version.split(".").map(Number);
+  // Source workers use node:module.registerHooks(), added in 22.15 and 23.5.
+  if (
+    !Number.isInteger(major) || !Number.isInteger(minor) || major < 22 ||
+    (major === 22 && minor < 15) || (major === 23 && minor < 5)
+  ) {
     throw new Error(
-      `Node.js 22.13 or newer is required (current version: ${process.versions.node}).`
+      `Node.js 22.15+, 23.5+, or 24+ is required (current version: ${version}).`
     );
   }
 }
@@ -219,11 +234,12 @@ function parseWorkerHeapMb(value, label) {
   return heapMb;
 }
 
-export function pdfToHepWorkerArguments(pdfPath, force, heapMb) {
+export function pdfToHepWorkerArguments(pdfPath, force, heapMb, outputDirectory) {
   return [
     `--max-old-space-size=${heapMb}`,
     scriptPath,
     ...(force ? ["--force"] : []),
+    ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
     "--",
     pdfPath
   ];
@@ -244,18 +260,6 @@ function readWorkerBatchPosition(fallbackIndex, fallbackTotal) {
       ? configuredTotal
       : fallbackTotal
   };
-}
-
-function installPdfJsCompatibilityShims() {
-  Promise.try ??= (callback, ...args) => Promise.resolve().then(() => callback(...args));
-  Uint8Array.prototype.toHex ??= function toHex() {
-    return Buffer.from(this.buffer, this.byteOffset, this.byteLength).toString("hex");
-  };
-  Uint8Array.prototype.toBase64 ??= function toBase64() {
-    return Buffer.from(this.buffer, this.byteOffset, this.byteLength).toString("base64");
-  };
-  Uint8Array.fromHex ??= (value) => new Uint8Array(Buffer.from(value, "hex"));
-  Uint8Array.fromBase64 ??= (value) => new Uint8Array(Buffer.from(value, "base64"));
 }
 
 async function assertNodeCanvasAvailable() {
@@ -483,7 +487,7 @@ export function startPdfToHepWorker(
   const workerToken = randomUUID();
   const child = spawnImplementation(
     process.execPath,
-    pdfToHepWorkerArguments(item.pdfPath, force, heapMb),
+    pdfToHepWorkerArguments(item.pdfPath, force, heapMb, item.outputDirectory),
     {
       stdio: "inherit",
       shell: false,
@@ -734,13 +738,13 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
   assertSupportedNodeVersion();
   const workerProcess = isPdfToHepWorkerProcess();
   const pdfPaths = await discoverPdfFiles(options.inputPath);
-  assertUniqueHepOutputs(pdfPaths);
+  assertUniqueHepOutputs(pdfPaths, options.outputDirectory);
 
   const pending = [];
   let skippedCount = 0;
   for (let index = 0; index < pdfPaths.length; index += 1) {
     const pdfPath = pdfPaths[index];
-    const outputPath = hepOutputPathForPdf(pdfPath);
+    const outputPath = hepOutputPathForPdf(pdfPath, options.outputDirectory);
     const outputExists = await regularOutputExists(outputPath);
     if (!options.force && outputExists) {
       console.log(`Skipping existing ${outputPath}`);
@@ -749,6 +753,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
       pending.push({
         pdfPath,
         outputPath,
+        outputDirectory: options.outputDirectory,
         fileNumber: index + 1,
         fileCount: pdfPaths.length
       });
@@ -764,6 +769,9 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
     return 0;
   }
 
+  if (options.outputDirectory !== undefined) {
+    await mkdir(options.outputDirectory, { recursive: true });
+  }
   if (!workerProcess) {
     return runPdfToHepWorkerBatch(pending, options, skippedCount);
   }
@@ -771,7 +779,6 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
     throw new Error("An internal PDF-to-HEP worker must receive exactly one PDF.");
   }
 
-  installPdfJsCompatibilityShims();
   await assertNodeCanvasAvailable();
 
   const abortController = new AbortController();

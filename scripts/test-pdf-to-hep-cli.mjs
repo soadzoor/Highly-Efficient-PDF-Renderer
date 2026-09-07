@@ -6,6 +6,7 @@ import path from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 
 import {
+  assertSupportedNodeVersion,
   assertUniqueHepOutputs,
   discoverPdfFiles,
   formatPdfToHepDuration,
@@ -21,6 +22,13 @@ import {
   startPdfToHepWorker,
   writeHepBlobAtomically
 } from "../PDFtoHEP.js";
+
+for (const version of ["20.19.0", "22.13.0", "22.14.0", "23.0.0", "23.4.0"]) {
+  assert.throws(() => assertSupportedNodeVersion(version), /Node.js 22\.15\+/);
+}
+for (const version of ["22.15.0", "22.20.0", "23.5.0", "24.0.0", "26.0.0"]) {
+  assert.doesNotThrow(() => assertSupportedNodeVersion(version));
+}
 
 assert.deepEqual(parsePdfToHepArguments(["./Level1.pdf"]), {
   force: false,
@@ -45,6 +53,17 @@ assert.deepEqual(parsePdfToHepArguments(["--help"]), {
 assert.throws(() => parsePdfToHepArguments([]), /Pass a PDF file or directory/);
 assert.throws(() => parsePdfToHepArguments(["--unknown", "input"]), /Unknown option/);
 assert.throws(() => parsePdfToHepArguments(["one", "two"]), /exactly one/);
+assert.deepEqual(parsePdfToHepArguments(["--output-dir=./heps", "./pdfs"]), {
+  force: false,
+  help: false,
+  inputPath: "./pdfs",
+  outputDirectory: path.resolve("./heps")
+});
+assert.throws(() => parsePdfToHepArguments(["--output-dir=", "input"]), /non-empty/);
+assert.throws(
+  () => parsePdfToHepArguments(["--output-dir=one", "--output-dir=two", "input"]),
+  /exactly one/
+);
 
 assert.equal(sanitizeHepSourceName("Level 1.pdf"), "Level_1");
 assert.equal(sanitizeHepSourceName("Mürrieta 楼.pdf"), "M_rrieta_");
@@ -121,6 +140,13 @@ assert.ok(path.isAbsolute(workerArguments[1]));
 assert.equal(workerArguments.at(-3), "--force");
 assert.equal(workerArguments.at(-2), "--");
 assert.equal(workerArguments.at(-1), unusualWorkerPdf);
+const workerOutputDirectory = path.resolve("heps with spaces");
+const redirectedWorkerArguments = pdfToHepWorkerArguments(unusualWorkerPdf, true, 8_192, workerOutputDirectory);
+assert.equal(
+  parsePdfToHepArguments(redirectedWorkerArguments.slice(2)).outputDirectory,
+  workerOutputDirectory,
+  "worker arguments must preserve the output directory"
+);
 
 let spawnInvocation;
 class FakeChild extends EventEmitter {
@@ -134,7 +160,7 @@ class FakeChild extends EventEmitter {
 }
 const fakeChild = new FakeChild();
 const fakeWorker = startPdfToHepWorker(
-  { pdfPath: unusualWorkerPdf, fileNumber: 2, fileCount: 5 },
+  { pdfPath: unusualWorkerPdf, fileNumber: 2, fileCount: 5, outputDirectory: workerOutputDirectory },
   true,
   8_192,
   (command, args, options) => {
@@ -143,7 +169,7 @@ const fakeWorker = startPdfToHepWorker(
   }
 );
 assert.equal(spawnInvocation.command, process.execPath);
-assert.deepEqual(spawnInvocation.args, workerArguments);
+assert.deepEqual(spawnInvocation.args, redirectedWorkerArguments);
 assert.equal(spawnInvocation.options.shell, false);
 assert.equal(spawnInvocation.options.stdio, "inherit");
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER, "1");
@@ -357,6 +383,24 @@ try {
     "Conversion time summary: no PDF conversions were attempted."
   ]);
   assert.equal(await readFile(existingHepPath, "utf8"), "existing HEP sentinel");
+
+  const outputDirectory = path.join(temporaryRoot, "heps");
+  await mkdir(outputDirectory);
+  const redirectedHepPath = hepOutputPathForPdf(topPdf, outputDirectory);
+  assert.equal(redirectedHepPath, path.join(outputDirectory, "Level_1-parsed-data.hep"));
+  await writeFile(redirectedHepPath, "redirected HEP sentinel");
+  try {
+    console.log = () => {};
+    assert.equal(await runPdfToHep([`--output-dir=${outputDirectory}`, topPdf]), 0);
+  } finally {
+    console.log = originalConsoleLog;
+  }
+  assert.equal(await readFile(redirectedHepPath, "utf8"), "redirected HEP sentinel");
+  assert.throws(
+    () => assertUniqueHepOutputs([topPdf, path.join(nestedDirectory, "Level 1.pdf")], outputDirectory),
+    /PDF output collision/,
+    "flattened output directories must reject collisions across input folders"
+  );
 
   const previousWorkerFlag = process.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER;
   try {

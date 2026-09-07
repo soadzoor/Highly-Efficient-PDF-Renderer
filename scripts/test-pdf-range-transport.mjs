@@ -75,6 +75,7 @@ assert.equal(closeCount, 1);
 await testUnexpectedHostByteCounts(servePdfRangeSource, createRemoteRangePdfSource);
 await testRemoteEndpointFailures(createRemoteRangePdfSource);
 await testHostCloseFailure(servePdfRangeSource, createRemoteRangePdfSource);
+await testHostBufferOwnership();
 
 console.log("PDF worker range transport tests passed.");
 hooks.deregister();
@@ -98,14 +99,38 @@ function endpoint() {
     removeEventListener(type, listener) {
       if (type === "message") listeners.delete(listener);
     },
-    postMessage(message) {
-      this.send(message);
+    postMessage(message, transfer = []) {
+      this.send(structuredClone(message, { transfer }));
     },
     dispatch(message) {
       this.received.push(message);
       for (const listener of listeners) listener({ data: message });
     }
   };
+}
+
+async function testHostBufferOwnership() {
+  for (const input of [Buffer.from([1, 2, 3, 4]), Buffer.alloc(8_192, 7)]) {
+    const snapshot = Uint8Array.from(input);
+    const [hostEndpoint, workerEndpoint] = linkedEndpoints();
+    const host = servePdfRangeSource({
+      kind: "range",
+      byteLength: input.length,
+      async read(offset, length) { return input.subarray(offset, offset + length); }
+    }, hostEndpoint);
+    const remote = createRemoteRangePdfSource(input.length, workerEndpoint);
+    try {
+      const received = await remote.read(1, 2, new AbortController().signal);
+      assert.deepEqual(received, snapshot.subarray(1, 3));
+      assert.equal(received.buffer.byteLength, 2, "transfer only the requested bytes");
+      assert.deepEqual(Uint8Array.from(input), snapshot, "do not detach the host's Buffer");
+      received.fill(0);
+      assert.deepEqual(await remote.read(1, 2, new AbortController().signal), snapshot.subarray(1, 3));
+    } finally {
+      await remote.close();
+      await host.close();
+    }
+  }
 }
 
 async function testUnexpectedHostByteCounts(serve, createRemote) {
