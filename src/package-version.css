@@ -1,0 +1,18 @@
+.package-version {
+  align-self: center;
+  padding: 3px 7px;
+  border: 1px solid currentColor;
+  border-radius: 5px;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-decoration: none;
+  opacity: 0.75;
+}
+
+.package-version:hover,
+.package-version:focus-visible {
+  opacity: 1;
+  text-decoration: underline;
+}

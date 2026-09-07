@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HEPR Room Overlay Demo</title>
+    <link rel="stylesheet" href="/src/package-version.css" />
     <style>
       :root {
         color-scheme: light;
@@ -416,6 +417,7 @@
     <div id="room-label-layer" aria-hidden="true"></div>
     <div id="panel">
       <div class="toolbar">
+        <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v%HEPR_PACKAGE_VERSION%</a>
         <button id="load-files" type="button" title="Open a PDF or HEPR-exported .hep file, optionally with a TSV">Load PDF/HEP + TSV</button>
         <div id="example-dropdown" class="example-dropdown">
           <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
