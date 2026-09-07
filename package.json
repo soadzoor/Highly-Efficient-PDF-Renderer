@@ -71,6 +71,7 @@
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
+    "regenerate:heps": "node PDFtoHEP.js --force public/examples/pdfs && npm run generate-manifest",
     "benchmark:dense-pdf": "node --max-old-space-size=12288 --experimental-strip-types scripts/benchmark-dense-pdf.mjs",
     "benchmark:livermore-pdf": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-livermore-fast-path.mjs",
     "benchmark:native-vector-page": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-native-vector-page.mjs",
