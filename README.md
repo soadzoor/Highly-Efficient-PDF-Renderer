@@ -542,8 +542,12 @@ for (const room of result.rooms) {
 ```
 
 **API change:** `detectRooms` now returns `Promise<RoomDetectionResult>`;
-existing package callers must add `await`. Later calls reuse the loaded
-module. Detection itself still runs on the calling thread.
+existing package callers must add `await`. In browsers, detection runs in a
+Web Worker so panning, zooming, and other UI interactions remain responsive.
+Only stroke and text inputs are copied; the renderer keeps its original buffers.
+Each worker is released when detection completes or fails. Pass an AbortSignal
+as `signal` to cancel detection and terminate its worker. Outside the browser,
+environments without `Worker` use the loaded detector on the calling thread.
 
 Package exports:
 

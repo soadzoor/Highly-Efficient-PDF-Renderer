@@ -263,17 +263,19 @@ export type { Bounds, SceneTextItem, VectorScene } from "./pdfVectorExtractor";
 
 /**
  * Load the optional room detector on first use, then detect closed wall-bounded
- * regions in a vector scene. Subsequent calls reuse the loaded module.
+ * regions in a vector scene. Browser detection runs in a worker so the UI stays
+ * responsive; non-browser environments without Worker run on the calling thread.
  *
  * Await the result: `const result = await detectRooms(pdfObject.sceneData)`.
- * Loading is asynchronous; detection itself runs on the calling thread.
+ * Pass `options.signal` to cancel an active browser worker.
  */
 export async function detectRooms(
   scene: VectorScene,
   options: RoomDetectionOptions = {}
 ): Promise<RoomDetectionResult> {
-  const { detectRooms: detect } = await import("./roomDetector");
-  return detect(scene, options);
+  options.signal?.throwIfAborted();
+  const { detectRoomsInWorker } = await import("./roomDetectorClient");
+  return detectRoomsInWorker(scene, options);
 }
 
 export type {

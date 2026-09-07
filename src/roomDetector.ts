@@ -6,6 +6,22 @@ import {
   type VectorScene
 } from "./pdfVectorExtractor";
 
+/** Scene data consumed by detection, excluding unrelated rendering payloads. @internal */
+export type RoomDetectionScene = Pick<VectorScene,
+  | "pageRects"
+  | "segmentCount"
+  | "endpoints"
+  | "primitiveMeta"
+  | "primitiveBounds"
+  | "styles"
+  | "textContent"
+  | "textIndex"
+  | "textInstanceA"
+  | "textInstanceB"
+  | "textGlyphMetaA"
+  | "textGlyphMetaB"
+>;
+
 /**
  * A seed point for room detection, in scene coordinates. Detection flood-fills the open
  * space around each seed; seeds that do not sit inside a wall-bounded region are
@@ -25,6 +41,9 @@ export interface RoomSeed {
  * enabled.
  */
 export interface RoomDetectionOptions {
+  /** Cancel the asynchronous package API; in browsers this terminates its worker. */
+  signal?: AbortSignal;
+
   /** Pages to process. Defaults to every page in the scene. */
   pageIndexes?: number[];
 
@@ -417,7 +436,7 @@ const EXTERIOR_REGION_ID = 65535;
  * }
  * ```
  */
-export function detectRooms(scene: VectorScene, options: RoomDetectionOptions = {}): RoomDetectionResult {
+export function detectRooms(scene: RoomDetectionScene, options: RoomDetectionOptions = {}): RoomDetectionResult {
   const resolved: ResolvedOptions = {
     wallHalfWidthThreshold: normalizePositive(options.wallHalfWidthThreshold, null),
     wallCoverageFraction: normalizePositive(options.wallCoverageFraction, 0.06),
@@ -859,7 +878,7 @@ export function detectRooms(scene: VectorScene, options: RoomDetectionOptions = 
 }
 
 function detectRoomsOnPage(
-  scene: VectorScene,
+  scene: RoomDetectionScene,
   pageIndex: number,
   options: ResolvedOptions,
   providedSeeds: RoomSeed[] | null,
@@ -2257,7 +2276,7 @@ function detectRoomsOnPage(
 }
 
 function collectPageSeeds(
-  scene: VectorScene,
+  scene: RoomDetectionScene,
   pageIndex: number,
   pageMinX: number,
   pageMinY: number,
@@ -2312,7 +2331,7 @@ function collectPageSeeds(
  * (the text carrier of HEP sources). Runs between separator chars become one
  * item each; bounds come from the same glyph-instance math the text search uses.
  */
-function deriveTextItemsFromIndex(scene: VectorScene, pageIndex: number): SceneTextItem[] {
+function deriveTextItemsFromIndex(scene: RoomDetectionScene, pageIndex: number): SceneTextItem[] {
   const page = scene.textIndex?.pages[pageIndex];
   const items: SceneTextItem[] = [];
   if (!page || page.text.length === 0) {
@@ -2347,7 +2366,7 @@ function deriveTextItemsFromIndex(scene: VectorScene, pageIndex: number): SceneT
  * chars use their stored quad (same math as the text-search highlight bounds).
  */
 function computeTextRunBounds(
-  scene: VectorScene,
+  scene: RoomDetectionScene,
   page: PageTextIndex,
   startChar: number,
   endChar: number
@@ -2446,7 +2465,7 @@ interface StageAResult {
 }
 
 function collectWallSegments(
-  scene: VectorScene,
+  scene: RoomDetectionScene,
   pageMinX: number,
   pageMinY: number,
   pageMaxX: number,

@@ -75,7 +75,7 @@ function collectReachableChunks(includeDynamicImports) {
 }
 
 const detectorChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>
-  /\/roomDetector(?:-[^/]+)?\.js$/.test(id)
+  /\/roomDetector(?:Client)?(?:-[^/]+)?\.js$/.test(id)
 ));
 assert.ok(detectorChunks.length > 0, "the package must emit the room detector as a separate chunk");
 const staticChunks = collectReachableChunks(false);
@@ -93,8 +93,11 @@ console.log("Room detector remains lazy when all public exports are retained.");
 console.log(`All-exports entry: ${size(entry.code)}`);
 console.log(`All ${chunks.length} JavaScript chunks: ${(chunks.reduce((sum, file) => sum + Buffer.byteLength(file.code), 0) / 1000).toFixed(1)} kB / ${(chunks.reduce((sum, file) => sum + gzipSync(file.code).length, 0) / 1000).toFixed(1)} kB gzip (sum per chunk).`);
 console.log("Worker files and fonts are separate assets, excluded from these JavaScript totals.");
-for (const name of (await readdir(`${libDir}assets`)).sort()) {
-  if (/^(?:densePdfFastWorker|pdfWorkerEntry)-.*\.js$/.test(name)) {
+const assets = (await readdir(`${libDir}assets`)).sort();
+assert.ok(assets.some(name => /^roomDetectorWorker-.*\.js$/.test(name)),
+  "the package must ship the browser room detector worker");
+for (const name of assets) {
+  if (/^(?:densePdfFastWorker|pdfWorkerEntry|roomDetectorWorker)-.*\.js$/.test(name)) {
     const source = await readFile(`${libDir}assets/${name}`);
     console.log(`Browser worker entry ${name}: ${size(source)} (lazy helper/CMap chunks excluded).`);
   }
