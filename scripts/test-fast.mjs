@@ -9,6 +9,7 @@ const suites = [
   "persistent-viewer-contract",
   "pdf-compiler-boundary",
   "native-parser-boundary",
+  "optional-node-canvas",
   "native-pdf-core",
   "native-document-semantics",
   "native-source-range-edge-cases",

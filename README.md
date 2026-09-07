@@ -97,6 +97,16 @@ preserve the camera where possible.
 
 ## npm Package API ([`@soadzoor/hepr`](https://www.npmjs.com/package/@soadzoor/hepr))
 
+Install HEPR alongside three.js for browser use:
+
+```bash
+npm install @soadzoor/hepr three
+```
+
+Browser PDF/HEP rendering and HEP creation use browser canvas APIs and do not
+require `@napi-rs/canvas`. It is an optional peer dependency and is not installed
+automatically for package consumers.
+
 Use `pdfObjectGenerator`, the package's single PDF-object construction entry
 point, to load a PDF or HEP file and create a `THREE.Group`. The three.js
 wrapper is camera-driven by default, so the PDF follows your existing
@@ -220,6 +230,21 @@ const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
 ```
 
 ### Server-side PDF to HEP conversion
+
+Node.js package consumers should also install the optional native canvas backend
+for PDF compositing/rasterization, WebP/PNG encoding, and reading HEP files with
+encoded raster images:
+
+```bash
+npm install @napi-rs/canvas
+```
+
+Vector/text-only PDF extraction does not require this backend. HEP image encoding
+falls back to raw RGBA when it is unavailable, but PDF operations that need
+Canvas2D and encoded HEP image decoding require it. The first encoding fallback
+logs a warning that HEP files may be much larger, with the canvas installation
+command and a reminder to regenerate the files. Repository installs already
+include it as a development dependency for the CLI and tests.
 
 From a repository checkout, the included Node.js CLI uses the same PDF
 extraction and HEP v6 writer as the client export. Node.js 22.13 or newer is

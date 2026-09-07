@@ -1,4 +1,5 @@
 import { findRgbaAlphaBounds } from "./rgbaBounds";
+import { loadNodeCanvas } from "./nodeCanvas";
 import {
   DENSE_PDF_LEGACY_VECTOR_EVENT_FORM,
   DENSE_PDF_LEGACY_VECTOR_EVENT_GLYPH,
@@ -3161,17 +3162,17 @@ async function createNativeCompositeSurfaceFactory() {
       return { canvas, context: context as unknown as CanvasRenderingContext2D };
     }, lifetime);
   }
-  const moduleName = "@napi-rs/canvas";
-  let module: { createCanvas?: (width: number, height: number) => HTMLCanvasElement };
+  let module: { createCanvas?: (width: number, height: number) => HTMLCanvasElement } | null;
   try {
-    module = await import(/* @vite-ignore */ moduleName) as typeof module;
+    module = loadNodeCanvas() as typeof module;
   } catch (cause) {
-    throw new PdfError("unsupported-content", "No worker Canvas2D surface is available.", {
+    const message = cause instanceof Error ? cause.message : "No worker Canvas2D surface is available.";
+    throw new PdfError("unsupported-content", message, {
       cause,
       details: { reason: "selective-composite-surface" }
     });
   }
-  if (typeof module.createCanvas !== "function") {
+  if (typeof module?.createCanvas !== "function") {
     throw new PdfError("unsupported-content", "No worker Canvas2D surface is available.", {
       details: { reason: "selective-composite-surface" }
     });

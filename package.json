@@ -70,7 +70,7 @@
     "test:vector-stroke-clip-lod": "node --experimental-strip-types scripts/test-vector-stroke-clip-lod.mjs",
     "dev": "vite",
     "build": "tsc && npm run test:persistent-viewer && vite build",
-    "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:dense-pdf-package",
+    "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:dense-pdf-package && npm run test:browser-package",
     "build:all": "npm run build && npm run build:lib",
     "release-new-version": "npm run build:all && npm version patch && git push --follow-tags",
     "pack:local": "npm run build:lib && npm pack",
@@ -93,6 +93,7 @@
     "test:dense-pdf-worker": "node --experimental-strip-types scripts/test-dense-pdf-fast-worker.mjs",
     "test:dense-pdf-integration": "node --experimental-strip-types scripts/test-dense-pdf-integration.mjs",
     "test:dense-pdf-package": "node scripts/test-dense-pdf-package.mjs",
+    "test:browser-package": "node scripts/test-browser-package.mjs",
     "test:pdf-fast-progress": "node --experimental-strip-types scripts/test-pdf-fast-progress.mjs",
     "test:pdf-to-hep-cli": "node scripts/test-pdf-to-hep-cli.mjs",
     "test:pdf-to-hep-node-worker": "node scripts/test-pdf-to-hep-node-dense-worker.mjs",
@@ -187,6 +188,7 @@
     "test:pdf-session-worker": "node --experimental-strip-types scripts/test-pdf-session-worker.mjs",
     "test:pdf-node-worker-runtime": "node --experimental-strip-types scripts/test-pdf-node-worker-runtime.mjs",
     "test:node-pdf-source": "node --experimental-strip-types scripts/test-node-pdf-source.mjs",
+    "test:optional-node-canvas": "node --experimental-strip-types scripts/test-optional-node-canvas.mjs",
     "test:room-segment-extractor": "node scripts/test-room-segment-extractor.mjs",
     "test:native-content-compiler": "node --experimental-strip-types scripts/test-native-content-compiler.mjs",
     "test:native-fast-resource-scanner": "node --experimental-strip-types scripts/test-native-fast-resource-scanner.mjs",
@@ -209,16 +211,22 @@
     "test:native-text-content-sidecar": "node --experimental-strip-types scripts/test-native-text-content-sidecar.mjs"
   },
   "dependencies": {
-    "@napi-rs/canvas": "1.0.6",
     "jszip": "3.10.1"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "1.0.8",
     "@types/three": "0.185.1",
     "three": "0.185.1",
     "typescript": "7.0.2",
     "vite": "8.1.4"
   },
   "peerDependencies": {
+    "@napi-rs/canvas": ">=1.0.8",
     "three": ">=0.170.0"
+  },
+  "peerDependenciesMeta": {
+    "@napi-rs/canvas": {
+      "optional": true
+    }
   }
 }
