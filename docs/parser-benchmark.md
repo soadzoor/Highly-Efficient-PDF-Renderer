@@ -289,3 +289,95 @@ for masks, overlaps, and image edges at high zoom, then search/selection and
 one HEP v6 export/reload. Also smoke-test Dublin/Level 1 zoom/pan/search. Browser
 performance/visual checks, other supported browser/Node versions, and the
 long corpus/release gates remain manual; no full HEP regeneration is needed.
+
+## Text-heavy PDF parsing follow-up
+
+WarAndPeace and optimizing_cpp both use the dense production route. The native
+cutover added a second content compilation for retained text, with three costs
+that accumulate across pages:
+
+- Each compiler eagerly allocated 12 MiB of stroke/duplicate-detection buffers,
+  plus fill buffers, even for text-only content. Both passes now allocate these
+  buffers only on first use, preserving the original capacity and growth policy
+  for dense geometry. This avoids allocation and garbage-collection work; it is
+  not a claim that all those temporary buffers were simultaneously retained.
+- Simple-font encoding setup repeatedly rebuilt and searched `Object.entries(AGL)`
+  for each Unicode character. A single inverse map now preserves the first AGL
+  alias with constant-time lookups. Font substitution and glyph selection rules
+  are unchanged.
+- Forced finalization checkpoints used `setTimeout(0)` in both passes. Their
+  host-timer delays accumulated per page, including the new retained-text pass.
+  Checkpoints now use message-channel tasks, closing both ports after delivery,
+  with the timer fallback retained for hosts without `MessageChannel`. Progress
+  events and cancellation checks still run at the same checkpoints.
+
+HEP loading bypasses these compilation stages, explaining why it did not show
+the PDF parsing regression. There are no HEP, renderer, or text-quality changes.
+
+In the direct source benchmark, optimizing_cpp went from 7,676 ms to 4,785 ms
+(single diagnostic runs; the first was CPU-profiled). Its geometry/text semantic
+hash was unchanged. A separate full-field fingerprint comparison against a
+source snapshot of the original branch passed on **all 1,259 WarAndPeace pages
+and all 179 optimizing_cpp pages**, including every compiled geometry field and
+text scene field. Those comparisons generate no HEP archives.
+
+Final production comparison: three fresh-process runs per build/document,
+alternating current/main, on the same Intel i5-7600K / Node 24.5.0 environment
+recorded above. The reference snapshot's parser sources and configuration
+match `main` at `6f32df2`. Input reading, package import, LOD, upload, and
+rendering are excluded. All runs used the dense route without fallback.
+
+| PDF | main median parser | Fixed branch median parser | Time change |
+| --- | ---: | ---: | ---: |
+| WarAndPeace (1,259 pages) | 27,399 ms | 23,682 ms | −13.6% |
+| optimizing_cpp (179 pages) | 5,476 ms | 4,812 ms | −12.1% |
+
+Individual parser times (ms): WarAndPeace main 26,055 / 28,319 / 27,399,
+current 23,682 / 23,371 / 27,370; optimizing_cpp main 5,476 / 6,301 / 5,179,
+current 4,812 / 6,646 / 4,561. Earlier exploratory runs coincided with much
+higher host load and are separate from this final series; every sample in the
+final series is included. The overlapping ranges do not guarantee that each
+individual run beats main. These are Node measurements, not browser timings.
+Raw final reports are `/tmp/hepr-text-war-final-{current,main}-{1,2,3}.json`
+and `/tmp/hepr-text-optimizing-quiet-{current,main}-{1,2,3}.json`.
+
+Reproduce using separately built packages and the production driver described
+at the start of this document:
+
+```sh
+npm run benchmark:production-parser -- public/examples/pdfs/WarAndPeace.pdf --runs 3 --fail-on-pdfjs-fallback
+npm run benchmark:production-parser -- public/examples/pdfs/optimizing_cpp.pdf --runs 3 --fail-on-pdfjs-fallback
+```
+
+Validation passed: `npm run build`, `npm run build:lib`, `git diff --check`, and
+these 12 focused suites:
+
+```sh
+npm run test:text-parser-work
+npm run test:dense-pdf-content
+npm run test:native-content-compiler
+npm run test:native-font-text
+npm run test:native-font-cmap-semantics
+npm run test:native-retained-text
+npm run test:native-text-semantics
+npm run test:dense-pdf-worker
+npm run test:dense-pdf-integration
+npm run test:pdf-fast-progress
+npm run test:native-vector-page
+npm run test:pdf-session-worker
+```
+
+The new test counts backing allocations rather than sampling retained memory;
+text-only compilation must allocate less than 64 KiB of geometry arrays. It
+also checks first-stroke duplicate detection across separate compilations,
+progress, cancellation, message-port cleanup, and the timer fallback.
+
+Changed files: `src/densePdfContentCompiler.ts`,
+`src/pdf/nativeContentCompiler.ts`, `src/pdf/nativeFont.ts`,
+`scripts/test-text-parser-work.mjs`, `package.json`, and this document.
+
+Manual verification: use the rebuilt demo in the same browser as main, reload
+between each original PDF load, and compare the `[Page grid] ... parsed ... ms`
+values. Check page appearance at high zoom and search/selection in both books,
+then load their existing HEP files. The user starts any server; no browser,
+server, HEP regeneration, or git-history operation was run during this fix.

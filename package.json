@@ -81,6 +81,7 @@
     "test:ordered-gradient": "node --experimental-strip-types scripts/test-ordered-gradient-paint.mjs",
     "test:pdf-cancel": "node scripts/test-pdf-source-cancellation.mjs",
     "test:dense-pdf-content": "node --experimental-strip-types scripts/test-dense-pdf-content-compiler.mjs",
+    "test:text-parser-work": "node --experimental-strip-types scripts/test-text-parser-work.mjs",
     "test:dense-pdf-document": "node --experimental-strip-types scripts/test-dense-pdf-document.mjs",
     "test:dense-pdf-worker": "node --experimental-strip-types scripts/test-dense-pdf-fast-worker.mjs",
     "test:dense-pdf-integration": "node --experimental-strip-types scripts/test-dense-pdf-integration.mjs",

@@ -4557,12 +4557,15 @@ class ReusablePathBuilder {
 }
 
 class Float4Builder {
-  private data: Float32Array;
+  private data = new Float32Array(0);
+
+  private readonly initialLength: number;
 
   private length = 0;
 
   constructor(initialQuads = 32_768) {
-    this.data = new Float32Array(Math.max(1, initialQuads) * 4);
+    // Text-only pages never need the large geometry backing stores.
+    this.initialLength = Math.max(1, initialQuads) * 4;
   }
 
   get quadCount(): number {
@@ -4611,7 +4614,7 @@ class Float4Builder {
     if (this.length + extra <= this.data.length) {
       return;
     }
-    let length = this.data.length;
+    let length = this.data.length || this.initialLength;
     while (this.length + extra > length) {
       length *= 2;
     }
@@ -4846,9 +4849,9 @@ class DenseStrokeBuilder {
 }
 
 class DenseDuplicateIndex {
-  private hashes = new Uint32Array(1 << 20);
+  private hashes = new Uint32Array(0);
 
-  private indices = new Uint32Array(1 << 20);
+  private indices = new Uint32Array(0);
 
   private size = 0;
 
@@ -4884,8 +4887,8 @@ class DenseDuplicateIndex {
   private grow(): void {
     const oldHashes = this.hashes;
     const oldIndices = this.indices;
-    this.hashes = new Uint32Array(oldHashes.length * 2);
-    this.indices = new Uint32Array(oldIndices.length * 2);
+    this.hashes = new Uint32Array(oldHashes.length === 0 ? 1 << 20 : oldHashes.length * 2);
+    this.indices = new Uint32Array(this.hashes.length);
     const mask = this.hashes.length - 1;
     for (let i = 0; i < oldHashes.length; i += 1) {
       const hash = oldHashes[i];
@@ -5908,8 +5911,21 @@ function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
+/** Yield parser work to a host task without accumulating nested-timer delays. */
 function yieldToHost(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+  return new Promise((resolve) => {
+    if (typeof MessageChannel === "undefined") {
+      setTimeout(resolve, 0);
+      return;
+    }
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
 }
 
 function assertFiniteMatrix(matrix: DensePdfMatrix): void {

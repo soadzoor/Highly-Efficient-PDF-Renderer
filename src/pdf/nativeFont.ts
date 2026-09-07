@@ -4528,6 +4528,12 @@ function fillSymbolEncoding(
   }
 }
 
+// Preserve the first AGL alias, matching the previous ordered lookup.
+const PREFERRED_GLYPH_NAMES = new Map<string, string>();
+for (const [name, unicode] of Object.entries(AGL)) {
+  if (!PREFERRED_GLYPH_NAMES.has(unicode)) PREFERRED_GLYPH_NAMES.set(unicode, name);
+}
+
 function asciiGlyphName(code: number): string {
   if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) return String.fromCharCode(code);
   if (code >= 48 && code <= 57) return ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"][code - 48];
@@ -4543,7 +4549,8 @@ function asciiGlyphName(code: number): string {
 }
 
 function unicodeToPreferredGlyphName(value: string): string | null {
-  for (const [name, unicode] of Object.entries(AGL)) if (unicode === value) return name;
+  const preferred = PREFERRED_GLYPH_NAMES.get(value);
+  if (preferred !== undefined) return preferred;
   const composedName = unicodeToComposedGlyphName(value);
   if (composedName !== null) return composedName;
   const scalar = value.codePointAt(0);
