@@ -37,6 +37,7 @@ export const fastTests = [
   "ordered-gradient-paint",
   "deferred-renderer-api",
   "room-overlay-page-matrix",
+  "room-detector-worker",
   "vector-stroke-clip-lod"
 ];
 

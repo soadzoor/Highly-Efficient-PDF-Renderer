@@ -526,6 +526,29 @@ Notes:
 - See `src/three-example.ts` and `src/main.ts` for the two complete working
   integrations.
 
+### Optional Room Detection
+
+Room detection loads on first use, so viewing PDFs or displaying an imported
+TSV overlay does not download the detector. The room overlay demo loads it
+when you click **Detect Rooms**.
+
+```ts
+import { detectRooms } from "@soadzoor/hepr";
+
+const result = await detectRooms(pdfObject.sceneData, { pageIndexes: [0] });
+for (const room of result.rooms) {
+  console.log(room.labelText, room.area, room.polygon);
+}
+```
+
+**API change:** `detectRooms` now returns `Promise<RoomDetectionResult>`;
+existing package callers must add `await`. In browsers, detection runs in a
+Web Worker so panning, zooming, and other UI interactions remain responsive.
+Only stroke and text inputs are copied; the renderer keeps its original buffers.
+Each worker is released when detection completes or fails. Pass an AbortSignal
+as `signal` to cancel detection and terminate its worker. Outside the browser,
+environments without `Worker` use the loaded detector on the calling thread.
+
 Package exports:
 
 - `@soadzoor/hepr`

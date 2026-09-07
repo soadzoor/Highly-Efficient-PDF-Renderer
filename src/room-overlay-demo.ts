@@ -1,10 +1,10 @@
 import * as THREE from "three";
-import { waitForLoad } from "./loadCancellation";
+import { waitForLoad, yieldForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
-import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
+import { detectRooms, pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
-import { detectRooms, type DetectedRoom, type RoomDetectionResult } from "./roomDetector";
+import type { DetectedRoom, RoomDetectionResult } from "./roomDetector";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import {
   normalizeExampleManifestEntries,
@@ -160,6 +160,7 @@ let currentPdfCoordinateTransform: PdfCoordinateTransform = createIdentityPdfCoo
 let loadToken = 0;
 let sourceLoadController: AbortController | null = null;
 let roomDetectionToken = 0;
+let roomDetectionController: AbortController | null = null;
 let animationFrameId = 0;
 let needsRender = false;
 let isDisposed = false;
@@ -592,26 +593,25 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
   }
 
   const activeToken = ++roomDetectionToken;
+  const controller = new AbortController();
+  roomDetectionController = controller;
   setBusy(true);
-  setStatus("Preparing room detection...");
+  setStatus("Detecting rooms from the extracted vector scene...");
 
   try {
-    setStatus("Detecting rooms from the extracted vector scene...");
     detectRoomsSpinner.hidden = false;
-
-    // detectRooms runs synchronously and can take a few seconds; yield two frames so
-    // the browser paints the spinner and status before the main thread blocks (the
-    // transform-based spinner animation keeps running on the compositor).
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-    });
+    // Yield before copying the detection inputs into the worker.
+    await yieldForLoad(controller.signal);
     if (activeToken !== roomDetectionToken) {
       return;
     }
 
     // Deterministic detection on the extracted stroke segments; seeds come from
     // scene.textContent (extracted at load time via extractText: true).
-    const result = detectRooms(pdfObject.sceneData, { pageIndexes: [0] });
+    const result = await detectRooms(pdfObject.sceneData, {
+      pageIndexes: [0],
+      signal: controller.signal
+    });
     if (activeToken !== roomDetectionToken) {
       return;
     }
@@ -643,6 +643,7 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
     setStatus(`Room detection failed: ${message}`);
   } finally {
     if (activeToken === roomDetectionToken) {
+      roomDetectionController = null;
       setBusy(false);
       syncControlsEnabled();
       requestRender();
@@ -1209,6 +1210,9 @@ function isFiniteBounds(bounds: Bounds): boolean {
 }
 
 function clearCurrentPdfObject(): void {
+  roomDetectionToken += 1;
+  roomDetectionController?.abort();
+  roomDetectionController = null;
   clearRoomOverlay({ silent: true });
   currentParsedTsv = null;
   currentGeneratedTsv = null;
