@@ -676,7 +676,7 @@ apply.
 Run the synthetic topology regressions with:
 
 ```bash
-npm run test:rooms
+npm run test:file -- scripts/test-room-detector.mjs
 ```
 
 For corpus evaluation, `scripts/eval-rooms.mjs --from-pdf` exercises the same live text

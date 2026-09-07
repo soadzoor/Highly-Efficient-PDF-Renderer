@@ -7,9 +7,9 @@ resolution, or search/selection implementation. HEP remains v6.
 ## Automated coverage
 
 ```sh
-npm run test:native-visual-regressions
-npm run test:native-text-clip-index
-npm run test:scene-statistics
+npm run test:file -- scripts/test-native-visual-regressions.mjs
+npm run test:file -- scripts/test-native-text-clip-index.mjs
+npm run test:file -- scripts/test-scene-statistics.mjs
 ```
 
 The visual suite compiles only physical brochure page 5 (zero-based source

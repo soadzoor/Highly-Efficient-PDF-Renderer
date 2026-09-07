@@ -94,7 +94,7 @@ The image work is in `src/pdf/nativeImage.ts`, `src/pdf/nativeColor.ts`, and
 `src/pdf/deviceCmyk.ts`; parser-owned surface cleanup is in `src/pdfSession.ts`.
 Regression coverage is in `scripts/test-native-image-semantics.mjs`,
 `scripts/test-native-color-semantics.mjs`, and
-`scripts/test-native-composite-lifetime.mjs` (registered in `package.json`).
+`scripts/test-native-composite-lifetime.mjs` (selected through the shared test runner).
 It introduces no viewer changes or lower-resolution rendering.
 
 Routing success is not a visual, search/selection, or general PDF-feature
@@ -234,9 +234,9 @@ Reproduce the internal diagnostic comparison without changing public options:
 ```sh
 npm run benchmark:native-vector-page -- "path/to/brochure.pdf" --page-index 6 --no-composite-reuse --no-bounded-composite --json /tmp/hepr-composite-off.json
 npm run benchmark:native-vector-page -- "path/to/brochure.pdf" --page-index 6 --json /tmp/hepr-composite-on.json
-npm run test:native-composite-reuse
+npm run test:file -- scripts/test-native-composite-reuse.mjs
 # Optional: exact comparison of each page; no HEP output is generated.
-npm run test:native-composite-reuse -- "path/to/brochure.pdf"
+npm run test:file -- scripts/test-native-composite-reuse.mjs "path/to/brochure.pdf"
 ```
 
 The internal switches retain the common alpha-bounds scan and mask-loop
@@ -353,18 +353,18 @@ Validation passed: `npm run build`, `npm run build:lib`, `git diff --check`, and
 these 12 focused suites:
 
 ```sh
-npm run test:text-parser-work
-npm run test:dense-pdf-content
-npm run test:native-content-compiler
-npm run test:native-font-text
-npm run test:native-font-cmap-semantics
-npm run test:native-retained-text
-npm run test:native-text-semantics
-npm run test:dense-pdf-worker
-npm run test:dense-pdf-integration
-npm run test:pdf-fast-progress
-npm run test:native-vector-page
-npm run test:pdf-session-worker
+npm run test:file -- scripts/test-text-parser-work.mjs
+npm run test:file -- scripts/test-dense-pdf-content-compiler.mjs
+npm run test:file -- scripts/test-native-content-compiler.mjs
+npm run test:file -- scripts/test-native-font-text.mjs
+npm run test:file -- scripts/test-native-font-cmap-semantics.mjs
+npm run test:file -- scripts/test-native-retained-text-compiler.mjs
+npm run test:file -- scripts/test-native-text-semantics.mjs
+npm run test:file -- scripts/test-dense-pdf-fast-worker.mjs
+npm run test:file -- scripts/test-dense-pdf-integration.mjs
+npm run test:file -- scripts/test-pdf-fast-progress.mjs
+npm run test:file -- scripts/test-native-vector-page.mjs
+npm run test:file -- scripts/test-pdf-session-worker.mjs
 ```
 
 The new test counts backing allocations rather than sampling retained memory;

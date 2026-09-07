@@ -1,16 +1,64 @@
 # Development validation
 
-`npm test` runs the TypeScript check and `npm run test:fast`. The fast runner has
-an explicit list of 25 suites covering document replacement/export ownership,
-public load cancellation, native parser/session/worker boundaries, compositing,
-text/search, LOD, and scene statistics. It includes the room-overlay page-matrix
-and stroke-clip LOD tests, which also have individual package scripts.
+`package.json` exposes suite commands. Individual tests remain in `scripts/`
+and are selected by `scripts/run-tests.mjs`, using Node's built-in test runner.
+No additional test framework is required.
 
-Each suite runs in a fresh Node process with a 60-second timeout. The runner
-stops launching tests after ten minutes, reports failures, and exits nonzero.
-It does not discover every `test-*.mjs` automatically: several other repository
-tests require production artifacts, large corpus inputs, or Vite middleware.
-Add new fast regressions explicitly to `scripts/test-fast.mjs`.
+| Command | Scope |
+| --- | --- |
+| `npm test` | Typecheck plus the bounded fast regression suite. |
+| `npm run test:fast` | Explicit CI selection covering loading, cancellation, parsing, workers, compositing, text/search, LOD, and the runner itself. |
+| `npm run test:unit` | Discovered algorithm and source-contract tests. |
+| `npm run test:integration` | Discovered Node session, worker, codec, and component-interaction tests. |
+| `npm run test:package` | Built worker resolution and browser bundling; requires library artifacts. |
+| `npm run test:browser` | Opt-in Vite middleware and browser-facing checks; may start Vite. |
+| `npm run test:conversion` | Opt-in HEP serialization/conversion tests; some require Vite, corpus files, and built artifacts. |
+| `npm run test:corpus` | Opt-in tests using the PDFs in `public/examples/pdfs`. |
+| `npm run test:oracle` | The separately installed oracle harness. |
+| `npm run test:file -- <path>` | Run one file, forwarding any following arguments to it. |
+
+The shared runner executes each file in a fresh Node process, sequentially,
+with TypeScript stripping enabled. It enforces a 60-second per-file timeout
+and a ten-minute suite budget, reports failures, and exits nonzero. The total
+budget cancels running and queued tests. These defaults also apply to individual
+files; increase them explicitly for a longer manual check.
+
+Preview a selection without importing or executing any test:
+
+```bash
+npm run test:fast -- --list
+npm run test:conversion -- --list
+```
+
+Run an individual test or pass arguments to it:
+
+```bash
+npm run test:file -- scripts/test-optional-node-canvas.mjs
+npm run test:file -- --timeout=300000 scripts/test-native-composite-reuse.mjs "path/to/brochure.pdf"
+npm run test:corpus -- --timeout=300000 --budget=1200000
+```
+
+Runner options go before the file path; everything after it is passed to the
+test (an optional `--` separator is removed). Test paths are resolved from the
+repository root. The former per-file npm aliases have been removed; use the
+corresponding `scripts/test-*.mjs` path instead. `scripts/test-fast.mjs` remains
+as a compatibility entry point for direct callers.
+
+Suite selection is defined in `scripts/lib/testSuites.mjs`. Ordinary files are
+discovered by the `scripts/test-*.mjs` naming convention. Integration prefixes
+are matched there; remaining ordinary files join `unit`. Register tests needing
+servers, corpus data, or conversions in the explicit opt-in suites before adding
+them. Add fast regressions explicitly to `fastTests`; discovery never expands
+the CI gate. Tiny synthetic in-memory scene/HEP roundtrips already in the fast
+selection remain there. Corpus PDF-to-HEP conversion stays opt-in.
+
+`build:lib` builds the artifacts and then runs `test:package`. The HEP package
+conversion test is deliberately separate to preserve the existing build gate:
+
+```bash
+npm run build:lib
+npm run test:file -- scripts/test-hep-package.mjs
+```
 
 The `Validate` GitHub workflow uses Node 24 and runs `npm test` plus
 `npm run build:all` for pull requests, main-branch pushes, and manual dispatch.
