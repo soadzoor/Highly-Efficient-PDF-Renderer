@@ -745,6 +745,10 @@ interface GlyphPlacement {
 function readGlyphPlacement(context: BuildContext, instanceIndex: number): GlyphPlacement | null {
   const {scene} = context;
   const offset = instanceIndex * 4;
+  // Coarse clustering replaces several glyphs with one rectangle and cannot
+  // preserve an instance-local PDF clip. Keep clipped glyphs exact at every
+  // LOD level.
+  if ((scene.textInstanceB[offset + 3] ?? 0) > 0) return null;
   const a = scene.textInstanceA[offset];
   const b = scene.textInstanceA[offset + 1];
   const c = scene.textInstanceA[offset + 2];

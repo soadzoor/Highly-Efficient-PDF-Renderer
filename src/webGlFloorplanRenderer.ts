@@ -607,6 +607,8 @@ flat out float vColorAlpha;
 flat out vec4 vRasterRect;
 out vec2 vNormCoord;
 out vec2 vLocal;
+out vec2 vWorld;
+flat out vec4 vClipRect;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
@@ -634,6 +636,8 @@ void main() {
     vRasterRect = vec4(0.0);
     vNormCoord = vec2(0.0);
     vLocal = vec2(0.0);
+    vWorld = vec2(0.0);
+    vClipRect = vec4(0.0);
     return;
   }
 
@@ -653,6 +657,10 @@ void main() {
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
     instanceA.y * local.x + instanceA.w * local.y + instanceB.y
   );
+  int clipRef = int(instanceB.w + 0.5);
+  vClipRect = clipRef > 0
+    ? texelFetch(uTextGlyphMetaTexA, coordFromIndex(clipRef - 1, uTextGlyphMetaTexSize), 0)
+    : vec4(0.0);
 
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
@@ -668,6 +676,7 @@ void main() {
   vRasterRect = glyphRasterMeta;
   vNormCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2(1e-6)), 0.0, 1.0);
   vLocal = local;
+  vWorld = world;
 }
 `;
 
@@ -688,6 +697,8 @@ uniform vec4 uVectorOverride;
 flat in int vSegmentStart;
 flat in int vSegmentCount;
 flat in vec3 vColor;
+flat in vec4 vClipRect;
+in vec2 vWorld;
 flat in float vColorAlpha;
 flat in vec4 vRasterRect;
 in vec2 vNormCoord;
@@ -869,6 +880,11 @@ void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int windi
 }
 
 void main() {
+  if (vClipRect.z > vClipRect.x && vClipRect.w > vClipRect.y &&
+      (vWorld.x < vClipRect.x || vWorld.y < vClipRect.y ||
+       vWorld.x > vClipRect.z || vWorld.y > vClipRect.w)) {
+    discard;
+  }
   vec2 localDx = dFdx(vLocal);
   vec2 localDy = dFdy(vLocal);
   float pixelToLocalX = length(vec2(localDx.x, localDy.x));
@@ -5124,7 +5140,8 @@ export class WebGlFloorplanRenderer {
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
 
     const uploadInstanceCount = textLodData?.combinedInstanceCount ?? scene.textInstanceCount;
-    const uploadGlyphCount = scene.textGlyphCount + (textLodData ? 1 : 0);
+    const clipRectCount = Math.floor((scene.textClipRects?.length ?? 0) / 4);
+    const uploadGlyphCount = scene.textGlyphCount + (textLodData ? 1 : 0) + clipRectCount;
     const uploadSegmentCount = scene.textGlyphSegmentCount +
       (textLodData ? TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT : 0);
     const instanceDims = chooseTextureDimensions(uploadInstanceCount, maxTextureSize);
@@ -5180,6 +5197,15 @@ export class WebGlFloorplanRenderer {
       glyphMetaBData.set(scene.textGlyphMetaB);
       glyphSegmentDataA.set(scene.textGlyphSegmentsA);
       glyphSegmentDataB.set(scene.textGlyphSegmentsB);
+    }
+    const clipMetaOffset = scene.textGlyphCount + (textLodData ? 1 : 0);
+    if (clipRectCount > 0) {
+      glyphMetaAData.set(scene.textClipRects!, clipMetaOffset * 4);
+      for (let instance = 0; instance < scene.textInstanceCount; instance += 1) {
+        const offset = instance * 4 + 3;
+        const reference = instanceBData[offset];
+        if (reference > 0) instanceBData[offset] = clipMetaOffset + reference;
+      }
     }
     const instanceCData = packNormalizedUint8TextureData(instanceCFloatData, instanceTexelCount);
 

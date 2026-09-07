@@ -17,14 +17,9 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Worker as NodeThreadWorker } from "node:worker_threads";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const scriptPath = fileURLToPath(import.meta.url);
-const densePdfNodeWorkerBootstrapUrl = new URL(
-  "./scripts/pdf-to-hep-dense-worker.mjs",
-  import.meta.url
-);
 const PDF_TO_HEP_WORKER_ENV = "HEPR_PDF_TO_HEP_INTERNAL_WORKER";
 const PDF_TO_HEP_BATCH_INDEX_ENV = "HEPR_PDF_TO_HEP_BATCH_INDEX";
 const PDF_TO_HEP_BATCH_TOTAL_ENV = "HEPR_PDF_TO_HEP_BATCH_TOTAL";
@@ -222,142 +217,6 @@ function parseWorkerHeapMb(value, label) {
     throw new Error(`${label} must be an integer between 512 and 131072 MiB.`);
   }
   return heapMb;
-}
-
-function createNodeDensePdfWorkerConstructor(
-  heapMb,
-  WorkerImplementation = NodeThreadWorker,
-  bootstrapUrl = densePdfNodeWorkerBootstrapUrl
-) {
-  const maxOldGenerationSizeMb = parseWorkerHeapMb(heapMb, "Dense PDF worker heap");
-
-  return class NodeDensePdfWorker {
-    #worker;
-
-    #listeners = {
-      message: new Set(),
-      error: new Set(),
-      messageerror: new Set()
-    };
-
-    #terminationRequested = false;
-
-    #resultReceived = false;
-
-    constructor(moduleUrl, options = {}) {
-      const resolvedModuleUrl = moduleUrl instanceof URL
-        ? moduleUrl
-        : new URL(String(moduleUrl));
-      if (resolvedModuleUrl.protocol !== "file:") {
-        throw new TypeError(
-          `The Node dense PDF worker requires a file URL, received ${resolvedModuleUrl.href}`
-        );
-      }
-
-      this.#worker = new WorkerImplementation(bootstrapUrl, {
-        workerData: { moduleUrl: resolvedModuleUrl.href },
-        // Node 22 needs this flag to execute the repository's TypeScript source.
-        // V8 heap flags cannot be passed in Worker execArgv; resourceLimits is
-        // the Worker API equivalent, while the CLI process-wide flag also wins.
-        execArgv: ["--experimental-strip-types"],
-        resourceLimits: { maxOldGenerationSizeMb },
-        name: typeof options.name === "string" ? options.name : "hepr-dense-pdf"
-      });
-
-      // Keep permanent EventEmitter listeners installed. In particular, a Node
-      // Worker "error" event with no listener would terminate the parent process
-      // after the browser-style client removes its temporary listeners.
-      this.#worker.on("message", (data) => {
-        if (data?.type === "result" && data.result) {
-          this.#resultReceived = true;
-        }
-        this.#dispatch("message", { data });
-      });
-      this.#worker.on("messageerror", (error) => {
-        this.#dispatch("messageerror", { data: error });
-      });
-      this.#worker.on("error", (error) => {
-        this.#dispatchError(error);
-      });
-      this.#worker.on("exit", (code) => {
-        if (!this.#terminationRequested && !this.#resultReceived) {
-          this.#dispatchError(
-            new Error(`The Node dense PDF worker exited before returning a result (code ${code}).`)
-          );
-        }
-      });
-    }
-
-    addEventListener(type, listener) {
-      this.#listeners[type]?.add(listener);
-    }
-
-    removeEventListener(type, listener) {
-      this.#listeners[type]?.delete(listener);
-    }
-
-    postMessage(value, transfer = []) {
-      this.#worker.postMessage(value, transfer);
-    }
-
-    terminate() {
-      if (this.#terminationRequested) {
-        return;
-      }
-      this.#terminationRequested = true;
-      void Promise.resolve(this.#worker.terminate()).catch(() => {
-        // The worker may already have stopped after posting its final result.
-      });
-    }
-
-    #dispatch(type, event) {
-      for (const listener of [...(this.#listeners[type] ?? [])]) {
-        if (typeof listener === "function") {
-          listener.call(this, event);
-        } else {
-          listener?.handleEvent?.(event);
-        }
-      }
-    }
-
-    #dispatchError(error) {
-      this.#dispatch("error", {
-        message: error instanceof Error ? error.message : String(error),
-        error,
-        preventDefault() {}
-      });
-    }
-  };
-}
-
-export function installNodeDensePdfWorkerSupport(
-  heapMb = resolvePdfToHepWorkerHeapMb(),
-  dependencies = {}
-) {
-  const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
-  const WorkerConstructor = createNodeDensePdfWorkerConstructor(
-    heapMb,
-    dependencies.WorkerImplementation ?? NodeThreadWorker,
-    dependencies.bootstrapUrl ?? densePdfNodeWorkerBootstrapUrl
-  );
-  Object.defineProperty(globalThis, "Worker", {
-    configurable: true,
-    writable: true,
-    value: WorkerConstructor
-  });
-
-  let restored = false;
-  return () => {
-    if (restored) {
-      return;
-    }
-    restored = true;
-    if (previousDescriptor) {
-      Object.defineProperty(globalThis, "Worker", previousDescriptor);
-    } else {
-      delete globalThis.Worker;
-    }
-  };
 }
 
 export function pdfToHepWorkerArguments(pdfPath, force, heapMb) {
@@ -936,13 +795,8 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
   const failures = [];
   let generatedCount = 0;
   let builder;
-  let restoreNodeDensePdfWorker = () => {};
   try {
     builder = await loadSourceHepBuilder();
-    // PDF.js has already initialized in its Node mode at this point. Install
-    // the adapter only for HEPR's dense compiler so its existing browser Worker
-    // client can use a real worker_threads isolate without affecting PDF.js.
-    restoreNodeDensePdfWorker = installNodeDensePdfWorkerSupport();
     for (let index = 0; index < pending.length; index += 1) {
       abortController.signal.throwIfAborted();
       const { pdfPath, outputPath } = pending[index];
@@ -991,11 +845,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
   } finally {
     process.off("SIGINT", onSigInt);
     process.off("SIGTERM", onSigTerm);
-    try {
-      await builder?.close();
-    } finally {
-      restoreNodeDensePdfWorker();
-    }
+    await builder?.close();
   }
 
   if (abortController.signal.aborted) {

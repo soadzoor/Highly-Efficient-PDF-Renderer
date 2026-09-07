@@ -77,45 +77,20 @@ async function listPdfFiles(root, only) {
   return entries;
 }
 
-function multiplyMatrices(left, right) {
-  return [
-    left[0] * right[0] + left[2] * right[1],
-    left[1] * right[0] + left[3] * right[1],
-    left[0] * right[2] + left[2] * right[3],
-    left[1] * right[2] + left[3] * right[3],
-    left[0] * right[4] + left[2] * right[5] + left[4],
-    left[1] * right[4] + left[3] * right[5] + left[5]
-  ];
-}
-
 function applyMatrix(matrix, x, y) {
   return [matrix[0] * x + matrix[2] * y + matrix[4], matrix[1] * x + matrix[3] * y + matrix[5]];
 }
 
-function normalizeRotationDegrees(value) {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  let normalized = value % 360;
-  if (normalized < 0) {
-    normalized += 360;
-  }
-  return normalized;
-}
-
-// Mirrors buildPageMatrix in src/pdfVectorExtractor.ts (Y-up scene space).
-function buildSceneMatrix(page) {
-  const rotation = normalizeRotationDegrees(page.rotate);
-  const viewport = page.getViewport({ scale: 1, rotation, dontFlip: false });
-  const transform = viewport.transform;
-  if (!Array.isArray(transform) || transform.length < 6) {
-    return { rotation, viewport, sceneMatrix: [1, 0, 0, 1, 0, 0] };
-  }
-  const base = transform.slice(0, 6).map(Number);
-  const sceneMatrix = Number.isFinite(Number(viewport.height))
-    ? multiplyMatrices([1, 0, 0, -1, 0, Number(viewport.height)], base)
-    : base;
-  return { rotation, viewport, sceneMatrix };
+function intersectBoxes(first, second) {
+  const intersection = [
+    Math.max(first[0], second[0]),
+    Math.max(first[1], second[1]),
+    Math.min(first[2], second[2]),
+    Math.min(first[3], second[3])
+  ];
+  return intersection[2] > intersection[0] && intersection[3] > intersection[1]
+    ? intersection
+    : [...first];
 }
 
 function transformedViewBounds(viewBox, matrix) {
@@ -212,8 +187,7 @@ async function main() {
     if (typeof extractFirstPageVectors !== "function") {
       throw new Error("extractFirstPageVectors not found in src/pdfVectorExtractor.ts");
     }
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    const standardFontDataUrl = `${path.join(repoRootDir, "node_modules", "pdfjs-dist", "standard_fonts")}/`;
+    const { computePageGeometry, openPdf } = await viteServer.ssrLoadModule("/src/pdfSession.ts");
 
     for (const [index, entry] of entries.entries()) {
       const relativePdf = path.relative(repoRootDir, entry.pdfPath);
@@ -268,31 +242,36 @@ async function main() {
           }
         });
 
-        // Page metadata (view box, rotation, scene matrix) via pdf.js directly.
-        const loadingTask = pdfjs.getDocument({
-          data: new Uint8Array(pdfData),
-          disableFontFace: true,
-          fontExtraProperties: true,
-          verbosity: 0,
-          standardFontDataUrl
-        });
-        const pdfDocument = await loadingTask.promise;
+        // Page metadata comes from the native structure parser, while the dump
+        // itself remains the exact VectorScene consumed by the browser demo.
+        const pdfSession = await openPdf({ kind: "bytes", bytes: new Uint8Array(pdfData) });
         let pageMeta;
         try {
-          const page = await pdfDocument.getPage(1);
-          const viewBox = Array.isArray(page.view) ? page.view.slice(0, 4).map(Number) : [0, 0, 1, 1];
-          const { rotation, viewport, sceneMatrix } = buildSceneMatrix(page);
+          const page = pdfSession.info.pages[0];
+          if (!page) {
+            throw new Error("The PDF does not contain a first page.");
+          }
+          const viewBox = intersectBoxes(page.mediaBox, page.cropBox);
+          const { pageMatrix } = computePageGeometry(page);
+          const sceneMatrix = [...pageMatrix];
           pageMeta = {
-            pageCount: Number(pdfDocument.numPages) || 1,
+            pageCount: pdfSession.info.pageCount,
             viewBox,
-            rotation,
-            viewportTransform: Array.isArray(viewport.transform) ? viewport.transform.slice(0, 6).map(Number) : null,
-            viewportWidth: Number(viewport.width),
-            viewportHeight: Number(viewport.height),
+            rotation: page.rotation,
+            viewportTransform: [
+              pageMatrix[0],
+              -pageMatrix[1],
+              pageMatrix[2],
+              -pageMatrix[3],
+              pageMatrix[4],
+              page.height - pageMatrix[5]
+            ],
+            viewportWidth: page.width,
+            viewportHeight: page.height,
             sceneMatrix
           };
         } finally {
-          await loadingTask.destroy();
+          await pdfSession.close();
         }
 
         // Sanity: view box mapped through sceneMatrix must match the scene's page bounds.

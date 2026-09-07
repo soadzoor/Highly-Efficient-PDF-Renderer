@@ -1,7 +1,5 @@
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
-import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
@@ -92,10 +90,6 @@ interface ClassifiedRoomDemoFiles {
   sourceFile: File | null;
   tsvFile: File | null;
   error: string | null;
-}
-
-if (!GlobalWorkerOptions.workerSrc) {
-  GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 }
 
 const canvas = requireElement<HTMLCanvasElement>("#viewport");
@@ -1029,78 +1023,25 @@ function computeLocalPolygonCentroid(points: THREE.Vector2[]): THREE.Vector2 {
 }
 
 async function readFirstPageCoordinateTransform(file: File): Promise<PdfCoordinateTransform> {
-  const loadingTask = getDocument({
-    data: new Uint8Array(await file.arrayBuffer())
+  const { computePageGeometry, openPdf } = await import("./pdfSession");
+  const session = await openPdf({
+    kind: "blob",
+    blob: file,
+    label: file.name
   });
 
   try {
-    const pdfDocument = await loadingTask.promise;
-    const firstPage = await pdfDocument.getPage(1);
-    const pageLike = firstPage as {
-      rotate: number;
-      getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => {
-        transform: unknown;
-        height: number;
-      };
-    };
+    const firstPage = session.info.pages[0];
+    if (!firstPage) {
+      throw new Error("The PDF does not contain a first page.");
+    }
+    const { pageMatrix } = computePageGeometry(firstPage);
     return {
-      matrix: buildPageMatrix(pageLike)
+      matrix: [...pageMatrix]
     };
   } finally {
-    await loadingTask.destroy();
+    await session.close();
   }
-}
-
-function buildPageMatrix(page: {
-  rotate: number;
-  getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => {
-    transform: unknown;
-    height: number;
-  };
-}): Mat2D {
-  const rotation = normalizeRotationDegrees(page.rotate);
-  const viewport = page.getViewport({ scale: 1, rotation, dontFlip: false });
-  const transform = viewport.transform;
-
-  if (!Array.isArray(transform) || transform.length < 6) {
-    return createIdentityMatrix();
-  }
-
-  const pageMatrix: Mat2D = [
-    Number(transform[0]),
-    Number(transform[1]),
-    Number(transform[2]),
-    Number(transform[3]),
-    Number(transform[4]),
-    Number(transform[5])
-  ];
-
-  if (!pageMatrix.every(Number.isFinite)) {
-    return createIdentityMatrix();
-  }
-
-  const viewportHeight = Number(viewport.height);
-  if (!Number.isFinite(viewportHeight)) {
-    return pageMatrix;
-  }
-
-  return multiplyMatrices([1, 0, 0, -1, 0, viewportHeight], pageMatrix);
-}
-
-function normalizeRotationDegrees(rotation: number): number {
-  const normalized = ((Math.round(rotation / 90) * 90) % 360 + 360) % 360;
-  return normalized === 360 ? 0 : normalized;
-}
-
-function multiplyMatrices(left: Mat2D, right: Mat2D): Mat2D {
-  return [
-    left[0] * right[0] + left[2] * right[1],
-    left[1] * right[0] + left[3] * right[1],
-    left[0] * right[2] + left[2] * right[3],
-    left[1] * right[2] + left[3] * right[3],
-    left[0] * right[4] + left[2] * right[5] + left[4],
-    left[1] * right[4] + left[3] * right[5] + left[5]
-  ];
 }
 
 function applyMatrix(matrix: Mat2D, x: number, y: number): RoomPoint {

@@ -1,0 +1,517 @@
+HEPR third-party notices
+========================
+
+This file covers third-party material shipped in the published package. The
+private differential oracle and development-only dependencies are not part of
+the package.
+
+PDF.js DeviceCMYK fallback
+--------------------------
+
+HEPR's uncalibrated DeviceCMYK-to-sRGB fallback polynomial is adapted from
+Mozilla PDF.js. PDF.js is licensed under the Apache License, Version 2.0.
+Source: https://github.com/mozilla/pdf.js
+License: https://www.apache.org/licenses/LICENSE-2.0
+
+Adobe Core 35 AFM advance-width facts
+--------------------------------------
+
+Source: Adobe Core 35 AFM Files with 314 Glyph Entries
+Archive: Adobe-Core35_AFMs-314.tar.gz
+Source URL: https://mirrors.ctan.org/fonts/adobe/afm/Adobe-Core35_AFMs-314.tar.gz
+Archive SHA-256: 6e6c53064ef6f40891ad72c06fab9f3c8fdcda80e03c9d0b21244cb1d4bf030b
+
+HEPR includes a compact representation of the Standard-14 glyph advance-width
+facts extracted from the AFM files. Modification notice: HEPR omits all other
+AFM fields, shares identical face tables, and stores names and widths in a
+different representation. The AFM files themselves are not shipped. HEPR's
+separate Latin-Euro compatibility fallback uses the corresponding lining-
+figure width and is not represented as an AFM-sourced entry.
+
+Copyright (c) 1989, 1990, 1991, 1992, 1993, 1997 Adobe Systems Incorporated.
+All Rights Reserved.
+Copyright (c) 1989, 1990, 1991, 1993, 1997 Adobe Systems Incorporated.
+All Rights Reserved.
+Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated.
+All Rights Reserved. Helvetica is a trademark of Linotype-Hell AG and/or its
+subsidiaries.
+Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated.
+All Rights Reserved. Times is a trademark of Linotype-Hell AG and/or its
+subsidiaries.
+Copyright (c) 1985, 1987, 1988, 1989, 1997 Adobe Systems Incorporated.
+All Rights Reserved. ITC Zapf Dingbats is a registered trademark of
+International Typeface Corporation.
+
+This file and the 35 PostScript(R) AFM files it accompanies may be used,
+copied, and distributed for any purpose and without charge, with or without
+modification, provided that all copyright notices are retained; that the AFM
+files are not distributed without this file; that all modifications to this
+file or any of the AFM files are prominently noted in the modified file(s);
+and that this paragraph is not modified. Adobe Systems has no responsibility
+or obligation to support the use of the AFM files.
+
+Liberation Fonts 2.1.5
+----------------------
+
+Source: https://github.com/liberationfonts/liberation-fonts/releases/tag/2.1.5
+Binary archive: liberation-fonts-ttf-2.1.5.tar.gz
+Archive SHA-256: 7191c669bf38899f73a2094ed00f7b800553364f90e2637010a69c0e268f25d0
+
+HEPR includes the Regular, Bold, Italic, and Bold Italic TTF faces from the
+Liberation Mono, Sans, and Serif families.
+
+Digitized data copyright (c) 2010 Google Corporation
+with Reserved Font Arimo, Tinos and Cousine.
+Copyright (c) 2012 Red Hat, Inc.
+with Reserved Font Name Liberation.
+
+Noto Sans Math 3.000 and Noto Sans Symbols 2 2.008
+--------------------------------------------------
+
+Sources:
+- https://github.com/notofonts/math/releases/tag/NotoSansMath-v3.000
+  (commit 00e9941d95b2a355399a66f3990ffde6e4985676; archive SHA-256
+  ac351837b41f8a897f020b97fb0f075ad574c1e9669fb5839ada1f92fd748356)
+- https://github.com/notofonts/symbols/releases/tag/NotoSansSymbols2-v2.008
+  (commit 25b00f0d3f40873a005287514ba2a48558655314; archive SHA-256
+  346c930bbe8eb946701a05c54e9c11a2094dee1d93c387bf1771c0a3e335688f)
+
+HEPR includes the unhinted NotoSansMath-Regular.ttf and
+NotoSansSymbols2-Regular.ttf faces.
+
+Copyright 2022 The Noto Project Authors (https://github.com/notofonts/math)
+Copyright 2022 The Noto Project Authors (https://github.com/notofonts/symbols)
+
+Liberation Fonts and Noto Sans Symbols are licensed under the following terms:
+
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The fonts,
+including any derivative works, can be bundled, embedded, redistributed
+and/or sold with any software provided that any reserved names are not used
+by derivative works. The fonts and derivatives, however, cannot be released
+under any other type of license. The requirement for fonts to remain under
+this license does not apply to any document created using the fonts or their
+derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may include
+source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical writer or
+other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of the Font Software, to use, study, copy, merge, embed, modify, redistribute,
+and sell modified and unmodified copies of the Font Software, subject to the
+following conditions:
+
+1) Neither the Font Software nor any of its individual components, in Original
+or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy contains
+the above copyright notice and this license. These can be included either as
+stand-alone text files, human-readable headers or in the appropriate
+machine-readable metadata fields within text or binary files as long as those
+fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font Name(s)
+unless explicit written permission is granted by the corresponding Copyright
+Holder. This restriction only applies to the primary font name as presented to
+the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font Software
+shall not be used to promote, endorse or advertise any Modified Version, except
+to acknowledge the contribution(s) of the Copyright Holder(s) and the Author(s)
+or with their explicit written permission.
+
+5) The Font Software, modified or unmodified, in part or in whole, must be
+distributed entirely under this license, and must not be distributed under any
+other license. The requirement for fonts to remain under this license does not
+apply to any document created using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are not met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT,
+TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR
+ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL,
+INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE
+THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
+
+Adobe CMap Resources 20231115
+-----------------------------
+
+Source: https://github.com/adobe-type-tools/cmap-resources/releases/tag/20231115
+Pinned tag/commit: 20231115 (f5cf3bc)
+Source archive SHA-256: a88c3beee8d2f139b47f9d7e932ec198be24991dd46fcaef2961b4b5ea855ea2
+
+HEPR ships 202 compact HCM3 mapping shards generated from the CMap resources
+for Adobe-Identity-0, Adobe-CNS1-7, Adobe-GB1-6, Adobe-Japan1-7,
+Adobe-Korea1-2, Adobe-KR-9, Adobe-Manga1-0, and the deprecated
+Adobe-Japan2-0 collection. The PostScript source files are not shipped.
+Per-source and generated-shard hashes are recorded in
+src/pdf/cmaps/generated/manifest.json.
+
+Copyright 1990-2023 Adobe. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be used to
+endorse or promote products derived from this software without specific prior
+written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+Adobe PDF Mapping Resources
+---------------------------
+
+Source: https://github.com/adobe-type-tools/mapping-resources-pdf
+Pinned commit: 2dd5e53fb74a01718b9dfd448a0d1cce6fff2aa5
+Source archive SHA-256: bde04d598ec4f8c77c905b2a395aac5016a169758aeef2146413a430fca98e4a
+License SHA-256: feb8b068a417681821823ef2e8995072aa111121fa11f8664038f78717f4497c
+
+HEPR ships five compact HCU1 CID-to-Unicode shards generated from the
+Adobe-CNS1, Adobe-GB1, Adobe-Japan1, Adobe-KR, and Adobe-Korea1 PDF mapping
+resources. The source mapping files are not shipped. Per-source and generated
+shard hashes are recorded in
+src/pdf/cmaps/unicodeGenerated/manifest.json.
+
+Copyright 1990-2019 Adobe. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be used to
+endorse or promote products derived from this software without specific prior
+written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+Adobe Glyph List and ITC Zapf Dingbats Glyph List
+-------------------------------------------------
+
+Source: https://github.com/adobe-type-tools/agl-aglfn
+Pinned commit: 4036a9ca80a62f64f9de4f7321a9a045ad0ecfd6
+glyphlist.txt SHA-256: a3b2f61ced9f3644cc0d4ecde5c59df34ca286c689d9484a43a710a81c466789
+zapfdingbats.txt SHA-256: f6394e3cb8a447e84a1dad75d4baaf2aa7f45dc104faf369f4720e1a774ef2dc
+
+HEPR ships compact generated Symbol, Zapf, and MacExpert mapping shards, not
+the source text files.
+
+Copyright 2002-2019 Adobe (http://www.adobe.com/).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of Adobe nor the names of its contributors may be used to
+   endorse or promote products derived from this software without specific
+   prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Adobe Font Development Kit for OpenType MacExpertEncoding data
+---------------------------------------------------------------
+
+Source: https://github.com/adobe-type-tools/afdko
+Pinned commit: a843a0a87d9db0ea62d5ce719900acf5749c143e
+Source file: c/shared/resource/macexprt.h
+Source file SHA-256: b7c30ca40c251eacff5ec247f1209b33ecfe80f37bf22362e6aa97556a6efd46
+
+HEPR ships a compact TypeScript representation of the 256-slot Mac Expert
+encoding vector, not the AFDKO source file.
+
+Copyright 2014 Adobe Systems Incorporated (http://www.adobe.com/). All Rights
+Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+libjpeg-turbo 2.0.4 WebAssembly JPEG decoder
+--------------------------------------------
+
+Upstream source: https://github.com/libjpeg-turbo/libjpeg-turbo/tree/2.0.4
+WebAssembly build source: https://github.com/LinusU/cwasm-jpeg-turbo
+Pinned build commit: 61bcc6c3fa933c796ee9b64c5ea9821966ef8e42
+Source package: @cwasm/jpeg-turbo 0.1.3
+Package integrity: sha512-FkZxwwC6r4zhzlqM0nYGaMj/MDSrZPxLOdPdM6ySlgsMfOpNAZcLQkpNF4jP+DmsuUvRoeUD0YSMBvg3jYfK6w==
+Package tarball SHA-256: 0ab9fcd1134d1190d8188d1a4110843613b563864f26cd740f91092be5807c0b
+Shipped WASM byte length: 139151
+Shipped WASM SHA-256: 80ed55eef2d0ff276f837ef521fad8181ccdfa6f298f652f6e45aed7fbbbc871
+
+The pinned build uses Ubuntu 18.04, WASI SDK 10.0, Binaryen 1.39.1, disables
+SIMD, and exports only memory allocation plus the TurboJPEG in-memory
+decompression entry points used by HEPR. HEPR ships the resulting WASM binary,
+not the @cwasm JavaScript wrapper or any of its runtime dependencies. The build
+package declares the build integration as MIT licensed. Its notice is retained
+below even though HEPR does not ship the package's JavaScript wrapper.
+
+The libjpeg-turbo 2.0.4 license also identifies a zlib-licensed SIMD extension.
+That code is not present in this artifact: the pinned Docker build passes
+`-DWITH_SIMD=0`, compiles `jsimd_none.c`, and includes no source below the
+upstream `simd/` directory.
+
+This software is based in part on the work of the Independent JPEG Group.
+
+Independent JPEG Group license
+
+The authors make NO WARRANTY or representation, either express or implied,
+with respect to this software, its quality, accuracy, merchantability, or
+fitness for a particular purpose.  This software is provided "AS IS", and you,
+its user, assume the entire risk as to its quality and accuracy.
+
+This software is copyright (C) 1991-2016, Thomas G. Lane, Guido Vollbeding.
+All Rights Reserved except as specified below.
+
+Permission is hereby granted to use, copy, modify, and distribute this
+software (or portions thereof) for any purpose, without fee, subject to these
+conditions:
+(1) If any part of the source code for this software is distributed, then this
+README file must be included, with this copyright and no-warranty notice
+unaltered; and any additions, deletions, or changes to the original files
+must be clearly indicated in accompanying documentation.
+
+(2) If only executable code is distributed, then the accompanying
+documentation must state that "this software is based in part on the work of
+the Independent JPEG Group".
+
+(3) Permission for use of this software is granted only if the user accepts
+full responsibility for any undesirable consequences; the authors accept
+NO LIABILITY for damages of any kind.
+
+These conditions apply to any software derived from or based on the IJG code,
+not just to the unmodified library.  If you use our work, you ought to
+acknowledge us.
+
+Permission is NOT granted for the use of any IJG author's name or company name
+in advertising or publicity relating to this software or products derived
+from it.  This software may be referred to only as "the Independent JPEG
+Group's software".
+
+We specifically permit and encourage the use of this software as the basis of
+commercial products, provided that all warranty or liability claims are
+assumed by the product vendor.
+
+The Modified (3-clause) BSD License
+
+Copyright (C)2009-2019 D. R. Commander.  All Rights Reserved.
+Copyright (C)2015 Viktor Szathmáry.  All Rights Reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+- Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+- Neither the name of the libjpeg-turbo Project nor the names of its
+  contributors may be used to endorse or promote products derived from this
+  software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS",
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+MIT License for the @cwasm/jpeg-turbo build integration
+
+Copyright (c) Linus Unnebäck and @cwasm/jpeg-turbo contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+WASI SDK 10.0 and wasi-libc
+---------------------------
+
+WASI SDK source: https://github.com/WebAssembly/wasi-sdk/tree/wasi-sdk-10
+WASI SDK commit: 6b453df18725a09a1ee998662ee8696c16ba7ec1
+wasi-libc source: https://github.com/CraneStation/wasi-libc
+wasi-libc commit: 7b92f334e69c60a1d1c5d3e289790d790b9a185b
+
+The @cwasm build linked against the WASI SDK 10.0 sysroot. The resulting
+module exports wasi-libc's `malloc` and `free` and imports WASI environment,
+file-descriptor, and process-exit functions, so this is linked runtime code,
+not merely build tooling. wasi-libc is multi-licensed; this distribution uses
+its MIT option and retains the compatible notices for linked third-party
+portions below.
+
+wasi-libc MIT license
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+dlmalloc 2.8.6
+
+The linked allocator is Doug Lea's dlmalloc 2.8.6, released to the public
+domain under CC0 1.0: https://creativecommons.org/publicdomain/zero/1.0/
+
+Cloudlibc and libpreopen BSD-2-Clause notices
+
+Copyright (c) 2015-2017 Nuxi (https://nuxi.nl/) and contributors.
+Copyright (c) 2016-2017 Stanley Uche Godfrey
+Copyright (c) 2016-2018 Jonathan Anderson
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND ANY
+EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+musl libc
+
+Copyright © 2005-2020 Rich Felker, et al.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

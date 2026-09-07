@@ -89,6 +89,18 @@ export function computeCharQuad(
   out[outOffset + 1] = Math.min(y00, y01, y10, y11);
   out[outOffset + 2] = Math.max(x00, x01, x10, x11);
   out[outOffset + 3] = Math.max(y00, y01, y10, y11);
+  const clipReference = Math.trunc(instanceB[o + 3]);
+  const clipOffset = (clipReference - 1) * 4;
+  if (clipReference > 0 && scene.textClipRects &&
+      clipOffset + 3 < scene.textClipRects.length) {
+    out[outOffset] = Math.max(out[outOffset], scene.textClipRects[clipOffset]);
+    out[outOffset + 1] = Math.max(out[outOffset + 1], scene.textClipRects[clipOffset + 1]);
+    out[outOffset + 2] = Math.min(out[outOffset + 2], scene.textClipRects[clipOffset + 2]);
+    out[outOffset + 3] = Math.min(out[outOffset + 3], scene.textClipRects[clipOffset + 3]);
+    if (out[outOffset] > out[outOffset + 2] || out[outOffset + 1] > out[outOffset + 3]) {
+      return false;
+    }
+  }
   return true;
 }
 

@@ -141,6 +141,8 @@ interface ParsedDataSceneEntry {
   pagesPerRow?: unknown;
   maxHalfWidth?: unknown;
   operatorCount?: unknown;
+  operatorCountKind?: unknown;
+  imageLayerSegmentCount?: unknown;
   imagePaintOpCount?: unknown;
   pathCount?: unknown;
   sourceSegmentCount?: unknown;
@@ -285,12 +287,19 @@ export async function buildParsedDataZipBlobForLayout(
   if (strokeGeometryExport) {
     zip.file(STROKE_ENDPOINTS_PATH, strokeGeometryExport.endpointsBytes);
     zip.file(STROKE_META_PATH, strokeGeometryExport.metaBytes);
+    if (strokeGeometryExport.clipBoundsBytes) {
+      zip.file(STROKE_CLIP_BOUNDS_PATH, strokeGeometryExport.clipBoundsBytes);
+    }
   }
 
   const textInstancesExport = buildTextInstancesExport(scene);
   if (textInstancesExport) {
     zip.file(textInstancesExport.manifest.positionsFile, textInstancesExport.positionsBytes);
     zip.file(textInstancesExport.manifest.glyphIndexFile, textInstancesExport.glyphIndexBytes);
+    if (textInstancesExport.clipReferenceBytes && textInstancesExport.clipRectBytes) {
+      zip.file(TEXT_INSTANCE_CLIP_REFS_PATH, textInstancesExport.clipReferenceBytes);
+      zip.file(TEXT_CLIP_RECTS_PATH, textInstancesExport.clipRectBytes);
+    }
   }
 
   const serializedRasterLayers: SerializedRasterLayerEntry[] = [];
@@ -402,6 +411,12 @@ export async function buildParsedDataZipBlobForLayout(
       pagesPerRow: scene.pagesPerRow,
       maxHalfWidth: scene.maxHalfWidth,
       operatorCount: scene.operatorCount,
+      operatorCountKind: scene.operatorCountKind,
+      imageLayerSegmentCount: scene.imageLayerSegmentCount,
+      discardedTransparentCount: scene.discardedTransparentCount,
+      discardedDegenerateCount: scene.discardedDegenerateCount,
+      discardedDuplicateCount: scene.discardedDuplicateCount,
+      discardedContainedCount: scene.discardedContainedCount,
       imagePaintOpCount: scene.imagePaintOpCount,
       pathCount: scene.pathCount,
       sourceSegmentCount: scene.sourceSegmentCount,
@@ -786,6 +801,8 @@ async function readTextIndexV2(
 interface StrokeGeometrySectionMeta {
   endpointsFile: string;
   metaFile: string;
+  clipBoundsFile?: string;
+  clippedSegmentCount?: number;
   segmentCount: number;
   curveCount: number;
   quantizationMin: number[];
@@ -801,6 +818,9 @@ interface TextInstancesSectionMeta {
   glyphIndexFormat: "u16" | "u32";
   count: number;
   positionColumnByteLengths: number[];
+  clipRectsFile?: string;
+  clipReferencesFile?: string;
+  clipRectCount?: number;
 }
 
 function readFiniteNumberArray(value: unknown, expectedLength: number): number[] | null {
@@ -825,6 +845,12 @@ function parseStrokeGeometrySection(value: unknown): StrokeGeometrySectionMeta |
   const raw = value as Record<string, unknown>;
   const endpointsFile = typeof raw.endpointsFile === "string" ? raw.endpointsFile : null;
   const metaFile = typeof raw.metaFile === "string" ? raw.metaFile : null;
+  const clipBoundsFile = typeof raw.clipBoundsFile === "string"
+    ? raw.clipBoundsFile
+    : undefined;
+  const clippedSegmentCount = raw.clippedSegmentCount === undefined
+    ? undefined
+    : Number(raw.clippedSegmentCount);
   const segmentCount = Number(raw.segmentCount);
   const curveCount = Number(raw.curveCount);
   const quantizationMin = readFiniteNumberArray(raw.quantizationMin, 4);
@@ -844,13 +870,18 @@ function parseStrokeGeometrySection(value: unknown): StrokeGeometrySectionMeta |
     !ctrlQuantizationMin ||
     !ctrlQuantizationMax ||
     !endpointColumnByteLengths ||
-    endpointColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0)
+    endpointColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0) ||
+    ((clipBoundsFile === undefined) !== (clippedSegmentCount === undefined)) ||
+    (clippedSegmentCount !== undefined &&
+      (!Number.isInteger(clippedSegmentCount) ||
+       clippedSegmentCount <= 0 || clippedSegmentCount > segmentCount))
   ) {
     throw new Error("HEP file has an invalid strokeGeometry section.");
   }
   return {
     endpointsFile,
     metaFile,
+    ...(clipBoundsFile === undefined ? {} : { clipBoundsFile, clippedSegmentCount }),
     segmentCount,
     curveCount,
     quantizationMin,
@@ -871,6 +902,11 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
   const glyphIndexFormat = raw.glyphIndexFormat === "u32" ? "u32" : raw.glyphIndexFormat === "u16" ? "u16" : null;
   const count = Number(raw.count);
   const positionColumnByteLengths = readFiniteNumberArray(raw.positionColumnByteLengths, 2);
+  const clipRectsFile = typeof raw.clipRectsFile === "string" ? raw.clipRectsFile : undefined;
+  const clipReferencesFile = typeof raw.clipReferencesFile === "string"
+    ? raw.clipReferencesFile
+    : undefined;
+  const clipRectCount = raw.clipRectCount === undefined ? undefined : Number(raw.clipRectCount);
   if (
     !positionsFile ||
     !glyphIndexFile ||
@@ -879,10 +915,16 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
     count < 0 ||
     !positionColumnByteLengths ||
     positionColumnByteLengths.some((length) => !Number.isInteger(length) || length < 0)
+    || ((clipRectsFile === undefined) !== (clipReferencesFile === undefined))
+    || ((clipRectsFile === undefined) !== (clipRectCount === undefined))
+    || (clipRectCount !== undefined && (!Number.isInteger(clipRectCount) || clipRectCount < 0))
   ) {
     throw new Error("HEP file has an invalid textInstances section.");
   }
-  return { positionsFile, glyphIndexFile, glyphIndexFormat, count, positionColumnByteLengths };
+  return {
+    positionsFile, glyphIndexFile, glyphIndexFormat, count, positionColumnByteLengths,
+    ...(clipRectsFile === undefined ? {} : { clipRectsFile, clipReferencesFile, clipRectCount })
+  };
 }
 
 /**
@@ -894,12 +936,16 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
 async function readStrokeGeometryFromSection(
   zip: JSZip,
   section: StrokeGeometrySectionMeta
-): Promise<{ endpoints: Float32Array; primitiveMeta: Float32Array }> {
+): Promise<{
+  endpoints: Float32Array;
+  primitiveMeta: Float32Array;
+  primitiveBounds: Float32Array;
+}> {
   const segmentCount = section.segmentCount;
   const endpoints = new Float32Array(segmentCount * 4);
   const primitiveMeta = new Float32Array(segmentCount * 4);
   if (segmentCount === 0) {
-    return { endpoints, primitiveMeta };
+    return { endpoints, primitiveMeta, primitiveBounds: new Float32Array(0) };
   }
 
   const endpointsEntry = zip.file(section.endpointsFile);
@@ -986,7 +1032,44 @@ async function readStrokeGeometryFromSection(
     throw new Error(`HEP file stroke curve count mismatch (${curvesSeen} vs ${section.curveCount}).`);
   }
 
-  return { endpoints, primitiveMeta };
+  const primitiveBounds = derivePrimitiveBounds(endpoints, primitiveMeta, segmentCount);
+  if (section.clipBoundsFile) {
+    const clipBoundsEntry = zip.file(section.clipBoundsFile);
+    if (!clipBoundsEntry) {
+      throw new Error("HEP file is missing clipped stroke bounds.");
+    }
+    const clipBoundsBuffer = await clipBoundsEntry.async("arraybuffer");
+    const expectedBytes = section.clippedSegmentCount! * 4 * Float32Array.BYTES_PER_ELEMENT;
+    if (clipBoundsBuffer.byteLength !== expectedBytes) {
+      throw new Error("HEP file clipped stroke bounds have a length mismatch.");
+    }
+    const clipBounds = new Float32Array(clipBoundsBuffer);
+    let clipIndex = 0;
+    for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
+      const offset = segmentIndex * 4;
+      const styleFlags = decodePackedStrokeStyleFlags(primitiveMeta[offset + 3]);
+      if ((styleFlags & STROKE_STYLE_FLAG_CLIPPED) === 0) continue;
+      if (clipIndex >= section.clippedSegmentCount!) {
+        throw new Error("HEP file clipped stroke count does not match its style flags.");
+      }
+      const clipOffset = clipIndex * 4;
+      const minX = clipBounds[clipOffset];
+      const minY = clipBounds[clipOffset + 1];
+      const maxX = clipBounds[clipOffset + 2];
+      const maxY = clipBounds[clipOffset + 3];
+      if (![minX, minY, maxX, maxY].every(Number.isFinite) ||
+          minX > maxX || minY > maxY) {
+        throw new Error("HEP file contains invalid clipped stroke bounds.");
+      }
+      primitiveBounds.set(clipBounds.subarray(clipOffset, clipOffset + 4), offset);
+      clipIndex += 1;
+    }
+    if (clipIndex !== section.clippedSegmentCount) {
+      throw new Error("HEP file clipped stroke count does not match its style flags.");
+    }
+  }
+
+  return { endpoints, primitiveMeta, primitiveBounds };
 }
 
 /** Decodes the v5 text instance section back into the interleaved textInstanceB array. */
@@ -1038,9 +1121,20 @@ async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSe
 
 const STROKE_ENDPOINTS_PATH = "geometry/stroke-endpoints.csq16";
 const STROKE_META_PATH = "geometry/stroke-meta.bin";
+const STROKE_CLIP_BOUNDS_PATH = "geometry/stroke-clip-bounds.f32";
 const TEXT_INSTANCE_POSITIONS_PATH = "geometry/text-instance-ef.d512";
 const TEXT_INSTANCE_GLYPHS_U16_PATH = "geometry/text-instance-glyphs.u16";
 const TEXT_INSTANCE_GLYPHS_U32_PATH = "geometry/text-instance-glyphs.u32";
+const TEXT_INSTANCE_CLIP_REFS_PATH = "geometry/text-instance-clips.u32";
+const TEXT_CLIP_RECTS_PATH = "geometry/text-clip-rects.f32";
+const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
+const STROKE_STYLE_FLAG_OFFSET = 2;
+
+function decodePackedStrokeStyleFlags(value: number): number {
+  return Number.isFinite(value)
+    ? Math.max(0, Math.trunc(value / STROKE_STYLE_FLAG_OFFSET + 1e-6))
+    : 0;
+}
 
 function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
   let total = 0;
@@ -1059,6 +1153,7 @@ function concatByteChunks(chunks: Uint8Array[]): Uint8Array {
 interface StrokeGeometryExport {
   endpointsBytes: Uint8Array;
   metaBytes: Uint8Array;
+  clipBoundsBytes?: Uint8Array;
   manifest: StrokeGeometrySectionMeta;
 }
 
@@ -1087,6 +1182,7 @@ function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExport | n
   const endYColumn = new ByteWriter(segmentCount);
   const bitset = new Uint8Array(Math.ceil(segmentCount / 8));
   const ctrl = new ByteWriter(256);
+  const clippedBounds: number[] = [];
 
   let prevEndXInt = 0;
   let prevEndYInt = 0;
@@ -1118,6 +1214,22 @@ function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExport | n
       ctrl.writeZigzagVarint(aInts[offset + 2] - predictedX);
       ctrl.writeZigzagVarint(aInts[offset + 3] - predictedY);
     }
+
+    const styleFlags = decodePackedStrokeStyleFlags(metaSource[offset + 3]);
+    if ((styleFlags & STROKE_STYLE_FLAG_CLIPPED) !== 0) {
+      if (scene.primitiveBounds.length < offset + 4) {
+        throw new Error(`Clipped stroke ${i} has no clip bounds.`);
+      }
+      const minX = scene.primitiveBounds[offset];
+      const minY = scene.primitiveBounds[offset + 1];
+      const maxX = scene.primitiveBounds[offset + 2];
+      const maxY = scene.primitiveBounds[offset + 3];
+      if (![minX, minY, maxX, maxY].every(Number.isFinite) ||
+          minX > maxX || minY > maxY) {
+        throw new Error(`Clipped stroke ${i} has invalid clip bounds.`);
+      }
+      clippedBounds.push(minX, minY, maxX, maxY);
+    }
   }
 
   const meta = new ByteWriter(bitset.length + segmentCount * 2 + ctrl.length);
@@ -1133,13 +1245,28 @@ function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExport | n
     endXColumn.toUint8Array(),
     endYColumn.toUint8Array()
   ];
+  const clippedSegmentCount = clippedBounds.length / 4;
+  const clipBounds = clippedSegmentCount > 0
+    ? Float32Array.from(clippedBounds)
+    : null;
 
   return {
     endpointsBytes: concatByteChunks(columns),
     metaBytes: meta.toUint8Array(),
+    ...(clipBounds ? {
+      clipBoundsBytes: new Uint8Array(
+        clipBounds.buffer,
+        clipBounds.byteOffset,
+        clipBounds.byteLength
+      )
+    } : {}),
     manifest: {
       endpointsFile: STROKE_ENDPOINTS_PATH,
       metaFile: STROKE_META_PATH,
+      ...(clipBounds ? {
+        clipBoundsFile: STROKE_CLIP_BOUNDS_PATH,
+        clippedSegmentCount
+      } : {}),
       segmentCount,
       curveCount,
       quantizationMin: [packedA.min[0], packedA.min[1], packedB.min[0], packedB.min[1]],
@@ -1154,6 +1281,8 @@ function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExport | n
 interface TextInstancesExport {
   positionsBytes: Uint8Array;
   glyphIndexBytes: Uint8Array;
+  clipReferenceBytes?: Uint8Array;
+  clipRectBytes?: Uint8Array;
   manifest: TextInstancesSectionMeta;
 }
 
@@ -1169,6 +1298,24 @@ function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | nul
   }
 
   const source = scene.textInstanceB.subarray(0, count * 4);
+  const clipRects = scene.textClipRects;
+  const clipRectCount = Math.floor((clipRects?.length ?? 0) / 4);
+  if ((clipRects?.length ?? 0) % 4 !== 0 || clipRects?.some((value) => !Number.isFinite(value))) {
+    throw new Error("Text clip rectangles are invalid.");
+  }
+  for (let index = 0; index < clipRectCount; index += 1) {
+    const offset = index * 4;
+    if (clipRects![offset] >= clipRects![offset + 2] ||
+        clipRects![offset + 1] >= clipRects![offset + 3]) {
+      throw new Error("Text clip rectangle is empty or reversed.");
+    }
+  }
+  for (let index = 0; index < count; index += 1) {
+    const reference = source[index * 4 + 3];
+    if (!Number.isInteger(reference) || reference < 0 || reference > clipRectCount) {
+      throw new Error("Text clip reference is out of range.");
+    }
+  }
   const eColumn = encodeFixed512DeltaColumn(source, count, 4, 0);
   const fColumn = encodeFixed512DeltaColumn(source, count, 4, 1);
 
@@ -1198,12 +1345,28 @@ function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | nul
   return {
     positionsBytes: concatByteChunks([eColumn, fColumn]),
     glyphIndexBytes,
+    ...(clipRects && clipRects.length > 0 ? {
+      clipReferenceBytes: new Uint8Array(Uint32Array.from(
+        { length: count },
+        (_, index) => Math.max(0, Math.trunc(source[index * 4 + 3]))
+      ).buffer),
+      clipRectBytes: new Uint8Array(
+        clipRects.buffer,
+        clipRects.byteOffset,
+        clipRects.byteLength
+      )
+    } : {}),
     manifest: {
       positionsFile: TEXT_INSTANCE_POSITIONS_PATH,
       glyphIndexFile: useU32 ? TEXT_INSTANCE_GLYPHS_U32_PATH : TEXT_INSTANCE_GLYPHS_U16_PATH,
       glyphIndexFormat: useU32 ? "u32" : "u16",
       count,
-      positionColumnByteLengths: [eColumn.length, fColumn.length]
+      positionColumnByteLengths: [eColumn.length, fColumn.length],
+      ...(clipRects && clipRects.length > 0 ? {
+        clipRectsFile: TEXT_CLIP_RECTS_PATH,
+        clipReferencesFile: TEXT_INSTANCE_CLIP_REFS_PATH,
+        clipRectCount
+      } : {})
     }
   };
 }
@@ -1215,8 +1378,9 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
     createTextureExportEntry("fill-path-meta-c", scene.fillPathMetaC, sceneStats.fillPathTextureWidth, sceneStats.fillPathTextureHeight, scene.fillPathCount, textureLayout),
     createTextureExportEntry("fill-primitives-a", scene.fillSegmentsA, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount, textureLayout),
     createTextureExportEntry("fill-primitives-b", scene.fillSegmentsB, sceneStats.fillSegmentTextureWidth, sceneStats.fillSegmentTextureHeight, scene.fillSegmentCount, textureLayout),
-    // Stroke endpoints/meta live in the v5 strokeGeometry section; stroke
-    // bounds are derived on load either way.
+    // Stroke endpoints/meta live in the v5 strokeGeometry section. Ordinary
+    // bounds are derived on load; sparse semantic clip bounds live alongside
+    // that section only when clipped strokes exist.
     createTextureExportEntry("stroke-styles", scene.styles, sceneStats.textureWidth, sceneStats.textureHeight, scene.segmentCount, textureLayout),
     createTextureExportEntry("text-instance-a", scene.textInstanceA, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
     // text-instance-b lives in the v5 textInstances section.
@@ -1495,13 +1659,35 @@ export async function loadSceneFromParsedDataZip(
   const endpoints = strokeGeometry?.endpoints ?? new Float32Array(0);
   const styles = trimTextureForItemCount(strokeStylesEntry?.data ?? new Float32Array(0), segmentCount, "stroke-styles");
   const primitiveMeta = strokeGeometry?.primitiveMeta ?? new Float32Array(0);
-  const primitiveBounds = derivePrimitiveBounds(endpoints, primitiveMeta, segmentCount);
+  const primitiveBounds = strokeGeometry?.primitiveBounds ?? new Float32Array(0);
 
   const textInstanceA = trimTextureForItemCount(textInstanceAEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-a");
   const textDecodeStart = performance.now();
   const textInstanceB = textInstancesSection
     ? await readTextInstancesFromSection(zip, textInstancesSection)
     : new Float32Array(0);
+  let textClipRects: Float32Array | undefined;
+  if (textInstancesSection?.clipRectsFile && textInstancesSection.clipReferencesFile) {
+    const rectEntry = zip.file(textInstancesSection.clipRectsFile);
+    const refEntry = zip.file(textInstancesSection.clipReferencesFile);
+    if (!rectEntry || !refEntry) throw new Error("HEP file is missing text clip files.");
+    const [rectBuffer, refBuffer] = await Promise.all([
+      rectEntry.async("arraybuffer"),
+      refEntry.async("arraybuffer")
+    ]);
+    if (rectBuffer.byteLength !== textInstancesSection.clipRectCount! * 16 ||
+        refBuffer.byteLength !== textInstanceCount * 4) {
+      throw new Error("HEP file text clip data has a length mismatch.");
+    }
+    textClipRects = new Float32Array(rectBuffer);
+    const references = new Uint32Array(refBuffer);
+    for (let index = 0; index < references.length; index += 1) {
+      if (references[index] > textInstancesSection.clipRectCount!) {
+        throw new Error("HEP file text clip reference is out of range.");
+      }
+      textInstanceB[index * 4 + 3] = references[index];
+    }
+  }
   if (strokeGeometrySection || textInstancesSection) {
     const textDecodeMs = performance.now() - textDecodeStart;
     console.log(
@@ -1639,6 +1825,7 @@ export async function loadSceneFromParsedDataZip(
     textInstanceA,
     textInstanceB,
     textInstanceC,
+    ...(textClipRects ? { textClipRects } : {}),
     textGlyphMetaA,
     textGlyphMetaB,
     textGlyphSegmentsA,
@@ -1659,6 +1846,14 @@ export async function loadSceneFromParsedDataZip(
     maxHalfWidth,
     imagePaintOpCount: readNonNegativeInt(sceneMeta.imagePaintOpCount, 0),
     operatorCount: readNonNegativeInt(sceneMeta.operatorCount, 0),
+    ...(sceneMeta.operatorCountKind === "native-estimate" || sceneMeta.operatorCountKind === "mixed"
+      ? { operatorCountKind: sceneMeta.operatorCountKind } : {}),
+    ...(typeof sceneMeta.imageLayerSegmentCount === "number" &&
+        Number.isSafeInteger(sceneMeta.imageLayerSegmentCount) && sceneMeta.imageLayerSegmentCount >= 0 &&
+        [sceneMeta.discardedTransparentCount, sceneMeta.discardedDegenerateCount,
+          sceneMeta.discardedDuplicateCount, sceneMeta.discardedContainedCount].every(
+          (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+      ? { imageLayerSegmentCount: sceneMeta.imageLayerSegmentCount } : {}),
     pathCount: readNonNegativeInt(sceneMeta.pathCount, 0),
     discardedTransparentCount: readNonNegativeInt(sceneMeta.discardedTransparentCount, 0),
     discardedDegenerateCount: readNonNegativeInt(sceneMeta.discardedDegenerateCount, 0),

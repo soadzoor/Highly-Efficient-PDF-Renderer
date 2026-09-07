@@ -1,7 +1,9 @@
 import {
   createLoadProgressReporter,
   type LoadProgressCallback,
-  type LoadProgressReporter
+  type LoadProgressReporter,
+  type PDFLoadExecutionPath,
+  type PDFLoadStage
 } from "./loadProgress";
 import {
   compileDensePdfInWorker,
@@ -9,20 +11,10 @@ import {
   type DensePdfFastWorkerProgress,
   type DensePdfFastWorkerSuccess
 } from "./densePdfFastWorkerClient";
-import { collectPdfOperatorList } from "./pdfOperatorList";
-import { assertPdfBytes } from "./pdfSignature";
-
-const pdfJsModule = (
-  typeof window === "undefined"
-    ? await import("pdfjs-dist/legacy/build/pdf.mjs")
-    : await import("pdfjs-dist")
-) as {
-  getDocument: typeof import("pdfjs-dist").getDocument;
-  OPS: typeof import("pdfjs-dist").OPS;
-  VerbosityLevel: typeof import("pdfjs-dist").VerbosityLevel;
-};
-
-const { getDocument, OPS, VerbosityLevel } = pdfJsModule;
+import { LEGACY_DISPLAY_OPS as OPS } from "./legacyDisplayOperatorCodes";
+import type { PdfProgress } from "./heprDocumentData";
+import type { NativeMissingFontResolver } from "./pdf/nativeFont";
+import type { NativeVectorPdfSession, PdfSession } from "./pdfSession";
 
 const DRAW_MOVE_TO = 0;
 const DRAW_LINE_TO = 1;
@@ -106,9 +98,8 @@ export interface SceneTextIndex {
 }
 
 /**
- * One text string extracted from a PDF page via pdf.js `getTextContent()`, with its
- * axis-aligned bounding box in composed scene coordinates (Y-up, same space as
- * `VectorScene.endpoints`).
+ * One text string with its axis-aligned bounding box in composed scene
+ * coordinates (Y-up, same space as `VectorScene.endpoints`).
  */
 export interface SceneTextItem {
   text: string;
@@ -159,6 +150,8 @@ export interface VectorScene {
   segmentCount: number;
   sourceSegmentCount: number;
   mergedSegmentCount: number;
+  /** Post-cull stroke segments still painted in image layers; absent in older HEP files. */
+  imageLayerSegmentCount?: number;
   sourceTextCount: number;
   textInstanceCount: number;
   textGlyphCount: number;
@@ -168,6 +161,8 @@ export interface VectorScene {
   textInstanceA: Float32Array;
   textInstanceB: Float32Array;
   textInstanceC: Float32Array;
+  /** Optional page-space clip rectangles; `textInstanceB.w` stores index + 1. */
+  textClipRects?: Float32Array;
   textGlyphMetaA: Float32Array;
   textGlyphMetaB: Float32Array;
   textGlyphSegmentsA: Float32Array;
@@ -186,6 +181,8 @@ export interface VectorScene {
   pageBounds: Bounds;
   maxHalfWidth: number;
   operatorCount: number;
+  /** Engine-specific diagnostic units, not raw PDF operators or GPU draw calls. */
+  operatorCountKind?: "native-estimate" | "mixed";
   imagePaintOpCount: number;
   pathCount: number;
   discardedTransparentCount: number;
@@ -208,7 +205,7 @@ export interface VectorExtractOptions {
   pages?: string;
   maxPagesPerRow?: number;
   onProgress?: LoadProgressCallback;
-  /** Also extract text strings with positions via pdf.js `getTextContent()`. Default false. */
+  /** Also expose word-level text strings with scene-space positions. Default false. */
   extractTextContent?: boolean;
 }
 
@@ -421,9 +418,9 @@ const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
 const STROKE_STYLE_FLAG_OFFSET = 2;
 const PAGE_GRID_GAP_FACTOR = 0.08;
 const PAGE_GRID_MIN_GAP = 24;
-const PDFJS_VERBOSITY_ERRORS = VerbosityLevel?.ERRORS ?? 0;
 const DENSE_PDF_FAST_ATTEMPT_PROGRESS_END = 0.18;
 const DENSE_PDF_TEXT_PROGRESS_END = 0.45;
+const NATIVE_PDF_SUCCESS_PROGRESS_END = 0.94;
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   const normalizedAlpha = clamp01(alpha);
@@ -448,15 +445,21 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 export async function extractPdfPageScenes(
   pdfData: ArrayBuffer,
   options: VectorExtractOptions = {},
-  /** @internal Used by HEP export to cancel PDF.js work. */
+  /** @internal Used by HEP export to cancel active PDF parser work. */
   signal?: AbortSignal
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
+  const progress = createLoadProgressReporter(options.onProgress);
   if (options.pdfFastPath === "off") {
-    return extractPdfPageScenesWithPdfJs(pdfData, options, signal);
+    return extractPdfPageScenesWithNativeTier(
+      pdfData,
+      options,
+      progress,
+      0,
+      signal
+    );
   }
 
-  const progress = createLoadProgressReporter(options.onProgress);
   const fastProgress = progress.child(0, DENSE_PDF_FAST_ATTEMPT_PROGRESS_END);
   let sawFastProgress = false;
   let fastResult: Awaited<ReturnType<typeof compileDensePdfInWorker>> | null = null;
@@ -474,9 +477,11 @@ export async function extractPdfPageScenes(
   } catch (error) {
     signal?.throwIfAborted();
     console.info(`[hepr] dense PDF fast path unavailable: ${formatErrorMessage(error)}`);
-    return extractPdfPageScenesWithPdfJs(
+    return extractPdfPageScenesWithNativeTier(
       pdfData,
-      withRemappedProgress(options, progress, sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0, 1),
+      options,
+      progress,
+      sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0,
       signal
     );
   }
@@ -484,9 +489,11 @@ export async function extractPdfPageScenes(
 
   if (!fastResult) {
     console.info("[hepr] dense PDF fast path fallback: worker completed without a result");
-    return extractPdfPageScenesWithPdfJs(
+    return extractPdfPageScenesWithNativeTier(
       pdfData,
-      withRemappedProgress(options, progress, sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0, 1),
+      options,
+      progress,
+      sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0,
       signal
     );
   }
@@ -496,9 +503,11 @@ export async function extractPdfPageScenes(
       ? `${fastResult.reason}: ${fastResult.message}`
       : `${fastResult.error.name}: ${fastResult.error.message}`;
     console.info(`[hepr] dense PDF fast path fallback: ${reason}`);
-    return extractPdfPageScenesWithPdfJs(
+    return extractPdfPageScenesWithNativeTier(
       pdfData,
-      withRemappedProgress(options, progress, sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0, 1),
+      options,
+      progress,
+      sawFastProgress ? DENSE_PDF_FAST_ATTEMPT_PROGRESS_END : 0,
       signal
     );
   }
@@ -509,11 +518,13 @@ export async function extractPdfPageScenes(
     signal?.throwIfAborted();
     console.info(`[hepr] dense PDF fast path text/finalization fallback: ${formatErrorMessage(error)}`);
     // Do not retain hundreds of megabytes of speculative packed geometry while
-    // PDF.js builds the fallback operator list.
+    // the full native parser builds its resource-aware page representation.
     fastResult = null;
-    return extractPdfPageScenesWithPdfJs(
+    return extractPdfPageScenesWithNativeTier(
       pdfData,
-      withRemappedProgress(options, progress, DENSE_PDF_TEXT_PROGRESS_END, 1),
+      options,
+      progress,
+      DENSE_PDF_TEXT_PROGRESS_END,
       signal
     );
   }
@@ -530,19 +541,289 @@ function withRemappedProgress(
   options: VectorExtractOptions,
   reporter: LoadProgressReporter,
   start: number,
-  end: number
+  end: number,
+  executionPath: PDFLoadExecutionPath
 ): VectorExtractOptions {
-  const fallbackProgress = reporter.child(start, end);
+  const phaseProgress = reporter.child(start, end);
   return {
     ...options,
     pdfFastPath: "off",
     onProgress: (event) => {
-      fallbackProgress.report(event.value, {
+      phaseProgress.report(event.value, {
         ...event,
-        executionPath: "main-thread-fallback"
+        executionPath
       });
     }
   };
+}
+
+async function extractPdfPageScenesWithNativeTier(
+  pdfData: ArrayBuffer,
+  options: VectorExtractOptions,
+  progress: LoadProgressReporter,
+  start: number,
+  signal?: AbortSignal
+): Promise<VectorScene[]> {
+  const pageScenes = await extractPdfPageScenesWithNative(
+    pdfData,
+    withRemappedProgress(
+      options,
+      progress,
+      start,
+      NATIVE_PDF_SUCCESS_PROGRESS_END,
+      "worker"
+    ),
+    signal
+  );
+  progress.report(NATIVE_PDF_SUCCESS_PROGRESS_END, {
+    stage: "compile",
+    executionPath: "worker",
+    sourceType: "pdf",
+    unit: "pages",
+    processed: pageScenes.length,
+    total: pageScenes.length,
+    pageCount: pageScenes.length
+  });
+  return pageScenes;
+}
+
+async function extractPdfPageScenesWithNative(
+  pdfData: ArrayBuffer,
+  options: VectorExtractOptions,
+  signal?: AbortSignal
+): Promise<VectorScene[]> {
+  signal?.throwIfAborted();
+  const {
+    openPdfInBrowserWorker,
+    openPdfInNodeWorker
+  } = await import("./pdf/workerClient");
+  signal?.throwIfAborted();
+  const progress = createLoadProgressReporter(options.onProgress);
+  progress.report(0, {
+    stage: "source",
+    executionPath: "worker",
+    sourceType: "pdf",
+    unit: "bytes",
+    processed: 0,
+    total: pdfData.byteLength
+  });
+
+  let selectionIndex = -1;
+  let selectedPageCount = 0;
+  let sourcePageCount = 0;
+  const reportProgress = (event: Readonly<PdfProgress>): void => {
+    reportNativePdfProgress(progress, event, {
+      selectionIndex,
+      selectedPageCount,
+      sourcePageCount
+    });
+  };
+  let session: PdfSession | null = null;
+  let failed = false;
+  try {
+    const source = {
+      kind: "bytes",
+      bytes: new Uint8Array(pdfData),
+      ownership: "copy"
+    } as const;
+    const missingFontResolver = await nativeVectorMissingFontResolver();
+    const openOptions = {
+      repair: "safe",
+      signal,
+      missingFontResolver,
+      onProgress: reportProgress
+    } as const;
+    session = isNodeRuntime()
+      ? await openPdfInNodeWorker(source, openOptions)
+      : await openPdfInBrowserWorker(source, openOptions);
+    const vectorSession = readNativeVectorSession(session);
+    sourcePageCount = vectorSession.info.pageCount;
+    const pageNumbers = resolvePdfPageNumbers(sourcePageCount, options.pages);
+    selectedPageCount = pageNumbers.length;
+    const pageScenes: VectorScene[] = [];
+
+    for (selectionIndex = 0; selectionIndex < selectedPageCount; selectionIndex += 1) {
+      signal?.throwIfAborted();
+      const sourcePageIndex = pageNumbers[selectionIndex] - 1;
+      const pageStart = 0.12 + (selectionIndex / selectedPageCount) * 0.82;
+      const pageEnd = 0.12 + ((selectionIndex + 1) / selectedPageCount) * 0.82;
+      progress.report(pageStart, {
+        stage: "pdf-page",
+        executionPath: "worker",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: selectionIndex,
+        total: selectedPageCount,
+        pageIndex: selectionIndex,
+        pageCount: selectedPageCount,
+        sourcePageIndex,
+        sourcePageCount
+      });
+      const scene = await vectorSession.compileVectorPage(sourcePageIndex, {
+        signal,
+        optimization:
+          options.enableSegmentMerge === false && options.enableInvisibleCull === false
+            ? "none"
+            : "safe",
+        enableSegmentMerge: options.enableSegmentMerge !== false,
+        enableInvisibleCull: options.enableInvisibleCull !== false,
+        onProgress: reportProgress
+      });
+      signal?.throwIfAborted();
+      if (options.extractTextContent === true) {
+        scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
+      }
+      pageScenes.push(scene);
+      progress.report(pageEnd, {
+        stage: "pdf-page",
+        executionPath: "worker",
+        sourceType: "pdf",
+        unit: "pages",
+        processed: selectionIndex + 1,
+        total: selectedPageCount,
+        pageIndex: selectionIndex,
+        pageCount: selectedPageCount,
+        sourcePageIndex,
+        sourcePageCount
+      });
+    }
+
+    signal?.throwIfAborted();
+    progress.report(1, {
+      stage: "compile",
+      executionPath: "worker",
+      sourceType: "pdf",
+      unit: "pages",
+      processed: pageScenes.length,
+      total: pageScenes.length,
+      pageCount: pageScenes.length,
+      sourcePageCount
+    });
+    return pageScenes;
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    try {
+      await session?.close();
+    } catch (closeError) {
+      if (!failed) throw closeError;
+    }
+  }
+}
+
+let nativeVectorMissingFontResolverPromise: Promise<NativeMissingFontResolver> | undefined;
+
+/**
+ * The full native compatibility tier owns deterministic substitutes just like
+ * the dense worker. Keep the resolver on the host so browser and Node workers
+ * share one lazy face cache through the existing request protocol.
+ */
+function nativeVectorMissingFontResolver(): Promise<NativeMissingFontResolver> {
+  nativeVectorMissingFontResolverPromise ??= isNodeRuntime()
+    ? import("./nodePdfSource").then(({ createNodeBundledStandardFontResolver }) =>
+        createNodeBundledStandardFontResolver())
+    : import("./standardFontResolver").then(({ createBundledStandardFontResolver }) =>
+        createBundledStandardFontResolver());
+  return nativeVectorMissingFontResolverPromise;
+}
+
+function isNodeRuntime(): boolean {
+  const nodeProcess = (globalThis as {
+    readonly process?: { readonly versions?: { readonly node?: string } };
+  }).process;
+  return typeof nodeProcess?.versions?.node === "string";
+}
+
+function readNativeVectorSession(session: PdfSession): NativeVectorPdfSession {
+  const candidate = session as Partial<NativeVectorPdfSession>;
+  if (typeof candidate.compileVectorPage !== "function") {
+    throw new TypeError("The native PDF session does not expose VectorScene compilation.");
+  }
+  return session as NativeVectorPdfSession;
+}
+
+function reportNativePdfProgress(
+  reporter: LoadProgressReporter,
+  event: Readonly<PdfProgress>,
+  context: {
+    readonly selectionIndex: number;
+    readonly selectedPageCount: number;
+    readonly sourcePageCount: number;
+  }
+): void {
+  const stage = nativePdfLoadStage(event.stage);
+  const pageSelected = context.selectionIndex >= 0 && context.selectedPageCount > 0;
+  const ratio = event.total && event.total > 0
+    ? Math.max(0, Math.min(1, event.completed / event.total))
+    : 0;
+  let value: number;
+  if (!pageSelected) {
+    value = event.stage === "source-read"
+      ? 0.02 * ratio
+      : event.stage === "xref"
+        ? 0.05
+        : event.stage === "catalog"
+          ? 0.09
+          : 0.11;
+  } else {
+    const pageStart = 0.12 + (context.selectionIndex / context.selectedPageCount) * 0.82;
+    const pageSpan = 0.82 / context.selectedPageCount;
+    const local = event.stage === "content"
+      ? 0.08 + ratio * 0.56
+      : event.stage === "optimize"
+        ? 0.66 + ratio * 0.24
+        : event.stage === "font"
+          ? 0.92
+          : event.stage === "image" || event.stage === "color"
+            ? 0.96
+            : 0.04;
+    value = pageStart + pageSpan * local;
+  }
+  reporter.report(value, {
+    stage,
+    executionPath: "worker",
+    sourceType: "pdf",
+    unit: nativePdfLoadUnit(event.stage),
+    processed: event.completed,
+    ...(event.total === null ? {} : { total: event.total }),
+    ...(pageSelected ? {
+      pageIndex: context.selectionIndex,
+      pageCount: context.selectedPageCount
+    } : {}),
+    ...(event.sourcePageIndex === null ? {} : { sourcePageIndex: event.sourcePageIndex }),
+    ...(context.sourcePageCount > 0 ? { sourcePageCount: context.sourcePageCount } : {})
+  });
+}
+
+function nativePdfLoadStage(stage: PdfProgress["stage"]): PDFLoadStage {
+  switch (stage) {
+    case "source-read":
+    case "xref":
+    case "catalog":
+      return "source";
+    case "page":
+      return "pdf-page";
+    case "content":
+      return "pdf-operators";
+    case "font":
+      return "pdf-text";
+    case "image":
+    case "color":
+      return "pdf-raster";
+    case "optimize":
+      return "pdf-optimize";
+    default:
+      return "compile";
+  }
+}
+
+function nativePdfLoadUnit(
+  stage: PdfProgress["stage"]
+): "bytes" | "pages" | undefined {
+  if (stage === "source-read" || stage === "content" || stage === "optimize") return "bytes";
+  if (stage === "page") return "pages";
+  return undefined;
 }
 
 function formatErrorMessage(error: unknown): string {
@@ -564,52 +845,50 @@ async function finishDensePdfPageScenes(
   }
 
   const geometryScenes = result.pages.map(createDenseGeometryScene);
-  const hasText = result.pages.some(
-    (page) =>
-      page.compiled.textShowOpCount > 0 ||
-      page.compiled.referencedXObjects.length > 0
-  );
+  const hasText = result.pages.some((page) => page.compiled.textShowOpCount > 0);
   let pageScenes = geometryScenes;
-  let pdfJsTextMs = 0;
+  const nativeTextMs = result.timing.nativeTextMs ?? 0;
 
   if (hasText) {
-    const textStartedAt = readHighResolutionTime();
-    const ownedMiniPdf = new Uint8Array(result.textMiniPdfBytes);
     const textProgress = progress.child(
       DENSE_PDF_FAST_ATTEMPT_PROGRESS_END,
       DENSE_PDF_TEXT_PROGRESS_END
     );
-    const textScenes = await extractPdfPageScenesWithPdfJs(
-      ownedMiniPdf.buffer,
-      {
-        ...options,
-        pages: undefined,
-        pdfFastPath: "off",
-        enableSegmentMerge: false,
-        enableInvisibleCull: false,
-        onProgress: (event) => {
-          textProgress.report(event.value, {
-            ...event,
-            stage: "pdf-text",
-            executionPath: "dense-vector-worker",
-            sourceType: "pdf"
-          });
-        }
-      },
-      signal,
-      { suppressFullPageRasterFallback: true }
-    );
-    pdfJsTextMs = readHighResolutionTime() - textStartedAt;
+    const textScenes = result.nativeTextScenes;
+    if (!textScenes) {
+      throw new Error("The native dense worker returned no text scene for a text-bearing page.");
+    }
     if (textScenes.length !== geometryScenes.length) {
       throw new Error(
-        `Dense PDF text page count mismatch: expected ${geometryScenes.length}, received ${textScenes.length}.`
+        `Dense PDF text page count mismatch: expected ${geometryScenes.length}, ` +
+        `received ${textScenes.length}.`
       );
     }
+    for (let index = 0; index < geometryScenes.length; index += 1) {
+      assertDenseTextSceneParity(geometryScenes[index], textScenes[index], index);
+    }
+    textProgress.report(1, {
+      stage: "pdf-text",
+      executionPath: "dense-vector-worker",
+      sourceType: "pdf",
+      unit: "pages",
+      processed: textScenes.length,
+      total: textScenes.length,
+      pageCount: textScenes.length,
+      sourcePageCount: result.sourcePageCount
+    });
     pageScenes = geometryScenes.map((geometry, index) => {
       assertDenseTextSceneParity(geometry, textScenes[index], index);
-      return mergeDenseGeometryWithText(geometry, textScenes[index]);
+      const scene = mergeDenseGeometryWithText(geometry, textScenes[index]);
+      if (options.extractTextContent === true && !scene.textContent) {
+        scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
+      }
+      return scene;
     });
   } else {
+    if (options.extractTextContent === true) {
+      for (const scene of pageScenes) scene.textContent = [];
+    }
     progress.report(DENSE_PDF_TEXT_PROGRESS_END, {
       stage: "pdf-text",
       executionPath: "dense-vector-worker",
@@ -639,13 +918,120 @@ async function finishDensePdfPageScenes(
     0
   );
   console.info(
-    `[hepr] dense PDF fast path: pages=${pageScenes.length}, decoded=${totalDecodedBytes.toLocaleString()} bytes, ` +
+    `[hepr] dense PDF fast path: backend=${result.structureBackend}, ` +
+    `pages=${pageScenes.length}, decoded=${totalDecodedBytes.toLocaleString()} bytes, ` +
     `preflight=${result.timing.preflightMs.toFixed(1)}ms, decode=${result.timing.decodeMs.toFixed(1)}ms, ` +
     `compile=${result.timing.compileMs.toFixed(1)}ms, ` +
-    `text-mini=${result.timing.textMiniPdfMs.toFixed(1)}ms, pdfjs-text=${pdfJsTextMs.toFixed(1)}ms, ` +
+    `native-text=${nativeTextMs.toFixed(1)}ms, ` +
     `worker-total=${result.timing.totalMs.toFixed(1)}ms`
   );
   return pageScenes;
+}
+
+/** Build the legacy room-detection text side channel from the native text index. @internal */
+export function deriveSceneTextContentFromIndex(
+  scene: VectorScene,
+  pageIndex: number
+): SceneTextItem[] {
+  const page = scene.textIndex?.pages[pageIndex];
+  const items: SceneTextItem[] = [];
+  if (!page || page.text.length === 0) return items;
+
+  let runStart = -1;
+  for (let index = 0; index <= page.charInstance.length; index += 1) {
+    const separator = index === page.charInstance.length || page.charInstance[index] === -1;
+    if (!separator) {
+      if (runStart < 0) runStart = index;
+      continue;
+    }
+    if (runStart < 0) continue;
+    const text = page.text.slice(runStart, index).trim();
+    const bounds = textRunBounds(scene, page, runStart, index);
+    if (text.length !== 0 && bounds) items.push({ text, ...bounds, pageIndex });
+    runStart = -1;
+  }
+  return items;
+}
+
+function textRunBounds(
+  scene: VectorScene,
+  page: PageTextIndex,
+  start: number,
+  end: number
+): Bounds | null {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (let index = start; index < Math.min(end, page.charInstance.length); index += 1) {
+    const reference = page.charInstance[index];
+    if (reference === -1) continue;
+    if (reference <= -2) {
+      const offset = (-reference - 2) * 4;
+      if (offset + 3 < page.fallbackQuads.length) {
+        minX = Math.min(minX, page.fallbackQuads[offset]);
+        minY = Math.min(minY, page.fallbackQuads[offset + 1]);
+        maxX = Math.max(maxX, page.fallbackQuads[offset + 2]);
+        maxY = Math.max(maxY, page.fallbackQuads[offset + 3]);
+      }
+      continue;
+    }
+
+    const instanceOffset = reference * 4;
+    if (
+      instanceOffset + 3 >= scene.textInstanceA.length ||
+      instanceOffset + 3 >= scene.textInstanceB.length
+    ) continue;
+    const glyphOffset = Math.trunc(scene.textInstanceB[instanceOffset + 2]) * 4;
+    if (
+      glyphOffset < 0 ||
+      glyphOffset + 3 >= scene.textGlyphMetaA.length ||
+      glyphOffset + 1 >= scene.textGlyphMetaB.length
+    ) continue;
+
+    const a = scene.textInstanceA[instanceOffset];
+    const b = scene.textInstanceA[instanceOffset + 1];
+    const c = scene.textInstanceA[instanceOffset + 2];
+    const d = scene.textInstanceA[instanceOffset + 3];
+    const e = scene.textInstanceB[instanceOffset];
+    const f = scene.textInstanceB[instanceOffset + 1];
+    const inkMinX = scene.textGlyphMetaA[glyphOffset + 2];
+    const inkMinY = scene.textGlyphMetaA[glyphOffset + 3];
+    const inkMaxX = scene.textGlyphMetaB[glyphOffset];
+    const inkMaxY = scene.textGlyphMetaB[glyphOffset + 1];
+    const x00 = a * inkMinX + c * inkMinY + e;
+    const y00 = b * inkMinX + d * inkMinY + f;
+    const x01 = a * inkMinX + c * inkMaxY + e;
+    const y01 = b * inkMinX + d * inkMaxY + f;
+    const x10 = a * inkMaxX + c * inkMinY + e;
+    const y10 = b * inkMaxX + d * inkMinY + f;
+    const x11 = a * inkMaxX + c * inkMaxY + e;
+    const y11 = b * inkMaxX + d * inkMaxY + f;
+    let glyphMinX = Math.min(x00, x01, x10, x11);
+    let glyphMinY = Math.min(y00, y01, y10, y11);
+    let glyphMaxX = Math.max(x00, x01, x10, x11);
+    let glyphMaxY = Math.max(y00, y01, y10, y11);
+    const clipReference = Math.trunc(scene.textInstanceB[instanceOffset + 3]);
+    const clipOffset = (clipReference - 1) * 4;
+    if (clipReference > 0 && scene.textClipRects &&
+        clipOffset + 3 < scene.textClipRects.length) {
+      glyphMinX = Math.max(glyphMinX, scene.textClipRects[clipOffset]);
+      glyphMinY = Math.max(glyphMinY, scene.textClipRects[clipOffset + 1]);
+      glyphMaxX = Math.min(glyphMaxX, scene.textClipRects[clipOffset + 2]);
+      glyphMaxY = Math.min(glyphMaxY, scene.textClipRects[clipOffset + 3]);
+    }
+    if (glyphMinX <= glyphMaxX && glyphMinY <= glyphMaxY) {
+      minX = Math.min(minX, glyphMinX);
+      minY = Math.min(minY, glyphMinY);
+      maxX = Math.max(maxX, glyphMaxX);
+      maxY = Math.max(maxY, glyphMaxY);
+    }
+  }
+
+  return Number.isFinite(minX) && Number.isFinite(minY) && maxX > minX && maxY > minY
+    ? { minX, minY, maxX, maxY }
+    : null;
 }
 
 function assertDenseTextSceneParity(
@@ -709,6 +1095,8 @@ function createDenseGeometryScene(page: DensePdfFastCompiledPage): VectorScene {
     segmentCount: compiled.segmentCount,
     sourceSegmentCount: compiled.sourceSegmentCount,
     mergedSegmentCount: compiled.mergedSegmentCount,
+    imageLayerSegmentCount: 0,
+    operatorCountKind: "native-estimate",
     endpoints: compiled.endpoints,
     primitiveMeta: compiled.primitiveMeta,
     primitiveBounds: compiled.primitiveBounds,
@@ -752,6 +1140,7 @@ function mergeDenseGeometryWithText(
     textInstanceA: text.textInstanceA,
     textInstanceB: text.textInstanceB,
     textInstanceC: text.textInstanceC,
+    ...(text.textClipRects ? { textClipRects: text.textClipRects } : {}),
     textGlyphMetaA: text.textGlyphMetaA,
     textGlyphMetaB: text.textGlyphMetaB,
     textGlyphSegmentsA: text.textGlyphSegmentsA,
@@ -765,154 +1154,6 @@ function readHighResolutionTime(): number {
   return typeof performance !== "undefined" && typeof performance.now === "function"
     ? performance.now()
     : Date.now();
-}
-
-async function extractPdfPageScenesWithPdfJs(
-  pdfData: ArrayBuffer,
-  options: VectorExtractOptions,
-  signal?: AbortSignal,
-  internalOptions: { suppressFullPageRasterFallback?: boolean } = {}
-): Promise<VectorScene[]> {
-  signal?.throwIfAborted();
-  const enableSegmentMerge = options.enableSegmentMerge !== false;
-  const enableInvisibleCull = options.enableInvisibleCull !== false;
-  const enableTextContent = options.extractTextContent === true;
-  const standardFontDataUrl = resolveStandardFontDataUrl();
-  const progress = createLoadProgressReporter(options.onProgress);
-  progress.report(0, { stage: "source", sourceType: "pdf" });
-  const pdfBytes = new Uint8Array(pdfData);
-  assertPdfBytes(pdfBytes);
-
-  const loadingTask = getDocument({
-    data: pdfBytes,
-    disableFontFace: true,
-    fontExtraProperties: true,
-    verbosity: PDFJS_VERBOSITY_ERRORS,
-    ...(standardFontDataUrl ? { standardFontDataUrl } : {})
-  });
-  const destroyOnAbort = (): void => {
-    void loadingTask.destroy().catch(() => {
-      // The main control path preserves the AbortSignal reason.
-    });
-  };
-  signal?.addEventListener("abort", destroyOnAbort, { once: true });
-
-  try {
-    signal?.throwIfAborted();
-    let pdf: Awaited<typeof loadingTask.promise>;
-    try {
-      pdf = await loadingTask.promise;
-    } catch (error) {
-      signal?.throwIfAborted();
-      throw error;
-    }
-    signal?.throwIfAborted();
-    progress.report(0.06, { stage: "pdf-page", sourceType: "pdf" });
-    signal?.throwIfAborted();
-
-    const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
-    const pageNumbers = resolvePdfPageNumbers(pdfPageCount, options.pages);
-    const extractedPageCount = pageNumbers.length;
-    const pageScenes: VectorScene[] = [];
-    const pageProgressStart = 0.08;
-    const pageProgressRange = 0.84;
-
-    for (let selectionIndex = 0; selectionIndex < extractedPageCount; selectionIndex += 1) {
-      signal?.throwIfAborted();
-      const pageNumber = pageNumbers[selectionIndex];
-      const sourcePageIndex = pageNumber - 1;
-      const pageStart = pageProgressStart + (selectionIndex / extractedPageCount) * pageProgressRange;
-      const pageEnd = pageProgressStart + ((selectionIndex + 1) / extractedPageCount) * pageProgressRange;
-      progress.report(pageStart, {
-        stage: "pdf-page",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
-      signal?.throwIfAborted();
-      const page = await pdf.getPage(pageNumber);
-      signal?.throwIfAborted();
-      const operatorProgressStart = lerpNumber(pageStart, pageEnd, 0.28);
-      const operatorProgressEnd = lerpNumber(pageStart, pageEnd, 0.58);
-      const operatorList = await progress
-        .child(operatorProgressStart, operatorProgressEnd)
-        .withIndeterminateProgress(
-          () => {
-            signal?.throwIfAborted();
-            return collectPdfOperatorList(page);
-          },
-          {
-            stage: "pdf-operators",
-            sourceType: "pdf",
-            unit: "operators",
-            pageIndex: selectionIndex,
-            pageCount: extractedPageCount,
-            sourcePageIndex,
-            sourcePageCount: pdfPageCount,
-            tickMs: 200,
-            ceiling: 0.97,
-            timeConstantMs: 15_000
-          }
-        );
-      signal?.throwIfAborted();
-      progress.report(operatorProgressEnd, {
-        stage: "compile",
-        sourceType: "pdf",
-        unit: "operators",
-        processed: operatorList.fnArray.length,
-        total: operatorList.fnArray.length,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
-      signal?.throwIfAborted();
-      const pageScene = await extractSinglePageVectors(page, operatorList, {
-        enableSegmentMerge,
-        enableInvisibleCull,
-        allowFullPageRasterFallback: internalOptions.suppressFullPageRasterFallback !== true
-      });
-      signal?.throwIfAborted();
-      if (enableTextContent) {
-        pageScene.textContent = await extractPageTextContent(page);
-        signal?.throwIfAborted();
-      }
-      pageScenes.push(pageScene);
-      progress.report(pageEnd, {
-        stage: "pdf-page",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex + 1,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
-      signal?.throwIfAborted();
-    }
-
-    progress.report(0.94, { stage: "compile", sourceType: "pdf" });
-    signal?.throwIfAborted();
-    return pageScenes;
-  } catch (error) {
-    signal?.throwIfAborted();
-    throw error;
-  } finally {
-    signal?.removeEventListener("abort", destroyOnAbort);
-    try {
-      await loadingTask.destroy();
-    } catch (error) {
-      if (!signal?.aborted) {
-        throw error;
-      }
-    }
-  }
 }
 
 export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number): VectorScene {
@@ -933,77 +1174,13 @@ export async function extractPdfRasterPageScenes(
   pdfData: ArrayBuffer,
   options: VectorExtractOptions = {}
 ): Promise<VectorScene[]> {
-  const standardFontDataUrl = resolveStandardFontDataUrl();
-  const progress = createLoadProgressReporter(options.onProgress);
-  progress.report(0, { stage: "source", sourceType: "pdf" });
-  const pdfBytes = new Uint8Array(pdfData);
-  assertPdfBytes(pdfBytes);
-  const loadingTask = getDocument({
-    data: pdfBytes,
-    disableFontFace: true,
-    fontExtraProperties: true,
-    verbosity: PDFJS_VERBOSITY_ERRORS,
-    ...(standardFontDataUrl ? { standardFontDataUrl } : {})
+  const pageScenes = await extractPdfPageScenesWithNative(pdfData, {
+    ...options,
+    // Embedded-source recovery needs only the image paints. Avoid retaining a
+    // second searchable-text sidecar while loading the surrounding HEP scene.
+    extractTextContent: false
   });
-  const pdf = await loadingTask.promise;
-  progress.report(0.06, { stage: "pdf-page", sourceType: "pdf" });
-
-  try {
-    const pdfPageCount = normalizePositiveInt((pdf as { numPages?: unknown }).numPages, 1, 1, Number.MAX_SAFE_INTEGER);
-    const pageNumbers = resolvePdfPageNumbers(pdfPageCount, options.pages);
-    const extractedPageCount = pageNumbers.length;
-    const pageScenes: VectorScene[] = [];
-    const pageProgressStart = 0.08;
-    const pageProgressRange = 0.84;
-
-    for (let selectionIndex = 0; selectionIndex < extractedPageCount; selectionIndex += 1) {
-      const pageNumber = pageNumbers[selectionIndex];
-      const sourcePageIndex = pageNumber - 1;
-      const pageStart = pageProgressStart + (selectionIndex / extractedPageCount) * pageProgressRange;
-      const pageEnd = pageProgressStart + ((selectionIndex + 1) / extractedPageCount) * pageProgressRange;
-      progress.report(pageStart, {
-        stage: "pdf-page",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
-      const page = await pdf.getPage(pageNumber);
-      const operatorList = await collectPdfOperatorList(page);
-      progress.report(lerpNumber(pageStart, pageEnd, 0.4), {
-        stage: "pdf-raster",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
-      pageScenes.push(await extractSinglePageRasterOnly(page, operatorList));
-      progress.report(pageEnd, {
-        stage: "pdf-page",
-        sourceType: "pdf",
-        unit: "pages",
-        processed: selectionIndex + 1,
-        total: extractedPageCount,
-        pageIndex: selectionIndex,
-        pageCount: extractedPageCount,
-        sourcePageIndex,
-        sourcePageCount: pdfPageCount
-      });
-    }
-
-    progress.report(0.94, { stage: "compile", sourceType: "pdf" });
-    return pageScenes;
-  } finally {
-    await loadingTask.destroy();
-  }
+  return pageScenes.map(createNativeRasterOnlyPageScene);
 }
 
 export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
@@ -1016,6 +1193,62 @@ export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: Vecto
   return scene;
 }
 
+/**
+ * Retain only the image resources from a native one-page VectorScene.
+ *
+ * HEP v6 may embed its source PDF when an older producer could count image
+ * paints but could not serialize their pixels. Recovery must not merge the
+ * freshly compiled vector/text data into the already-decoded HEP scene; only
+ * the ordered raster layers cross this compatibility boundary.
+ */
+function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
+  const pageBounds = normalizeSceneBounds(scene.pageBounds, scene.bounds);
+  const rasterLayers = listSceneRasterLayers(scene).map((layer) => ({
+    ...layer,
+    pageIndex: 0
+  }));
+  let rasterBounds: Bounds | null = null;
+  for (const layer of rasterLayers) {
+    const matrix: Mat2D = [
+      layer.matrix[0],
+      layer.matrix[1],
+      layer.matrix[2],
+      layer.matrix[3],
+      layer.matrix[4],
+      layer.matrix[5]
+    ];
+    rasterBounds = combineBounds(
+      rasterBounds,
+      transformBounds({ minX: 0, minY: 0, maxX: 1, maxY: 1 }, matrix)
+    );
+  }
+
+  const base = createEmptyVectorScene();
+  const primaryRasterLayer = rasterLayers[0] ?? null;
+  return {
+    ...base,
+    pageCount: 1,
+    pagesPerRow: 1,
+    pageRects: new Float32Array([
+      pageBounds.minX,
+      pageBounds.minY,
+      pageBounds.maxX,
+      pageBounds.maxY
+    ]),
+    pageTextRanges: new Uint32Array([0, 0]),
+    rasterLayers,
+    rasterLayerWidth: primaryRasterLayer?.width ?? 0,
+    rasterLayerHeight: primaryRasterLayer?.height ?? 0,
+    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    rasterLayerMatrix:
+      primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
+    bounds: combineBounds(pageBounds, rasterBounds) ?? pageBounds,
+    pageBounds,
+    imagePaintOpCount: scene.imagePaintOpCount,
+    operatorCount: scene.operatorCount
+  };
+}
+
 interface SinglePageExtractOptions {
   enableSegmentMerge: boolean;
   enableInvisibleCull: boolean;
@@ -1025,58 +1258,6 @@ interface SinglePageExtractOptions {
 interface PagePlacement {
   translateX: number;
   translateY: number;
-}
-
-async function extractSinglePageRasterOnly(
-  page: unknown,
-  operatorList: { fnArray: number[]; argsArray: unknown[] }
-): Promise<VectorScene> {
-  const pageView = (page as { view?: unknown }).view;
-  const pageBoundsInput = Array.isArray(pageView) ? pageView : [0, 0, 1, 1];
-  const rawPageBounds: Bounds = {
-    minX: Math.min(Number(pageBoundsInput[0]) || 0, Number(pageBoundsInput[2]) || 1),
-    minY: Math.min(Number(pageBoundsInput[1]) || 0, Number(pageBoundsInput[3]) || 1),
-    maxX: Math.max(Number(pageBoundsInput[0]) || 0, Number(pageBoundsInput[2]) || 1),
-    maxY: Math.max(Number(pageBoundsInput[1]) || 0, Number(pageBoundsInput[3]) || 1)
-  };
-  const pageMatrix = buildPageMatrix(page as {
-    rotate: number;
-    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; height: number };
-  });
-  const pageBounds = transformBounds(rawPageBounds, pageMatrix);
-  const imagePaintOpCount = countImagePaintOps(operatorList);
-  const rasterExtract = await extractRasterLayerData(page, operatorList, pageMatrix, {
-    allowFullPageFallback: true
-  });
-  const rasterLayers: RasterLayer[] = rasterExtract.layers.map((layer) => ({
-    width: layer.width,
-    height: layer.height,
-    data: layer.data,
-    matrix: new Float32Array(layer.matrix),
-    paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
-    pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
-  }));
-
-  const base = createEmptyVectorScene();
-  const primaryRasterLayer = rasterLayers[0] ?? null;
-  const combinedBounds = combineBounds(pageBounds, rasterExtract.bounds) ?? pageBounds;
-
-  return {
-    ...base,
-    pageCount: 1,
-    pagesPerRow: 1,
-    pageRects: new Float32Array([pageBounds.minX, pageBounds.minY, pageBounds.maxX, pageBounds.maxY]),
-    pageTextRanges: new Uint32Array([0, 0]),
-    rasterLayers,
-    rasterLayerWidth: primaryRasterLayer?.width ?? 0,
-    rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
-    rasterLayerMatrix: primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
-    bounds: combinedBounds,
-    pageBounds,
-    imagePaintOpCount,
-    operatorCount: operatorList.fnArray.length
-  };
 }
 
 async function extractSinglePageVectors(
@@ -1854,6 +2035,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let totalTextInstanceCount = 0;
   let totalTextGlyphCount = 0;
   let totalTextGlyphSegmentCount = 0;
+  let totalTextClipRectCount = 0;
   let totalTextInPageCount = 0;
   let totalTextOutOfPageCount = 0;
   let totalOperatorCount = 0;
@@ -1883,6 +2065,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     totalTextInstanceCount += scene.textInstanceCount;
     totalTextGlyphCount += scene.textGlyphCount;
     totalTextGlyphSegmentCount += scene.textGlyphSegmentCount;
+    totalTextClipRectCount += Math.floor((scene.textClipRects?.length ?? 0) / 4);
     totalTextInPageCount += scene.textInPageCount;
     totalTextOutOfPageCount += scene.textOutOfPageCount;
     totalOperatorCount += scene.operatorCount;
@@ -1927,6 +2110,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textInstanceA = new Float32Array(totalTextInstanceCount * 4);
   const textInstanceB = new Float32Array(totalTextInstanceCount * 4);
   const textInstanceC = new Float32Array(totalTextInstanceCount * 4);
+  const textClipRects = new Float32Array(totalTextClipRectCount * 4);
   const textGlyphMetaA = new Float32Array(totalTextGlyphCount * 4);
   const textGlyphMetaB = new Float32Array(totalTextGlyphCount * 4);
   const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
@@ -1945,6 +2129,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let textInstanceOffset = 0;
   let textGlyphOffset = 0;
   let textGlyphSegmentOffset = 0;
+  let textClipRectOffset = 0;
   let pageRectOffset = 0;
   let combinedBounds: Bounds | null = null;
   let combinedPageBounds: Bounds | null = null;
@@ -2126,7 +2311,21 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       textInstanceB[dst] = scene.textInstanceB[src] + tx;
       textInstanceB[dst + 1] = scene.textInstanceB[src + 1] + ty;
       textInstanceB[dst + 2] = scene.textInstanceB[src + 2] + textGlyphOffset;
-      textInstanceB[dst + 3] = scene.textInstanceB[src + 3];
+      const clipReference = scene.textInstanceB[src + 3];
+      textInstanceB[dst + 3] = clipReference > 0
+        ? clipReference + textClipRectOffset
+        : 0;
+    }
+    const sceneClipRects = scene.textClipRects;
+    if (sceneClipRects) {
+      for (let i = 0; i < sceneClipRects.length; i += 4) {
+        const dst = textClipRectOffset * 4 + i;
+        textClipRects[dst] = sceneClipRects[i] + tx;
+        textClipRects[dst + 1] = sceneClipRects[i + 1] + ty;
+        textClipRects[dst + 2] = sceneClipRects[i + 2] + tx;
+        textClipRects[dst + 3] = sceneClipRects[i + 3] + ty;
+      }
+      textClipRectOffset += sceneClipRects.length / 4;
     }
 
     for (let i = 0; i < scene.textGlyphCount; i += 1) {
@@ -2257,6 +2456,13 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     segmentCount: totalSegmentCount,
     sourceSegmentCount: totalSourceSegmentCount,
     mergedSegmentCount: totalMergedSegmentCount,
+    ...(pageScenes.every((scene) => scene.imageLayerSegmentCount !== undefined)
+      ? { imageLayerSegmentCount: pageScenes.reduce((sum, scene) => sum + scene.imageLayerSegmentCount!, 0) }
+      : {}),
+    ...(pageScenes.every((scene) => scene.operatorCountKind === "native-estimate")
+      ? { operatorCountKind: "native-estimate" as const }
+      : pageScenes.some((scene) => scene.operatorCountKind !== undefined)
+        ? { operatorCountKind: "mixed" as const } : {}),
     sourceTextCount: totalSourceTextCount,
     textInstanceCount: totalTextInstanceCount,
     textGlyphCount: totalTextGlyphCount,
@@ -2266,6 +2472,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     textInstanceA,
     textInstanceB,
     textInstanceC,
+    ...(textClipRects.length === 0 ? {} : { textClipRects }),
     textGlyphMetaA,
     textGlyphMetaB,
     textGlyphSegmentsA,
@@ -3061,28 +3268,6 @@ function normalizeRotationDegrees(value: number): number {
     normalized += 360;
   }
   return normalized;
-}
-
-function resolveStandardFontDataUrl(): string | undefined {
-  if (typeof window !== "undefined" && window.location) {
-    return new URL("pdfjs-standard-fonts/", window.location.href).toString();
-  }
-
-  if (typeof window === "undefined") {
-    // Node-side extraction (example ZIP generation) needs an explicit local font directory.
-    const nodeFontUrl = new URL(
-      /* @vite-ignore */
-      "../node_modules/pdfjs-dist/standard_fonts/",
-      import.meta.url
-    );
-    if (nodeFontUrl.protocol === "file:") {
-      const directoryPath = decodeURIComponent(nodeFontUrl.pathname);
-      return directoryPath.endsWith("/") ? directoryPath : `${directoryPath}/`;
-    }
-    return nodeFontUrl.toString();
-  }
-
-  return undefined;
 }
 
 function chooseRasterExtractionScale(baseWidth: number, baseHeight: number, targetScale: number): number {

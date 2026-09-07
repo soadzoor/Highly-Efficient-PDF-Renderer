@@ -1,8 +1,5 @@
 import "./style.css";
 
-import { GlobalWorkerOptions } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import {
@@ -58,9 +55,13 @@ import {
 } from "./textSearch";
 import { createTextSearchWidget } from "./textSearchWidget";
 import { createTextSelectionController } from "./textSelection";
+import {
+  describeSceneOperatorCount,
+  formatSceneSegmentAccounting,
+  getSceneSegmentAccounting,
+  OPERATOR_COUNT_EXPLANATION
+} from "./sceneStatistics";
 import type { SearchHighlightSet } from "./rendererTypes";
-
-GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
@@ -842,7 +843,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       const parseStart = performance.now();
       setParsingLoader(true, "0.00% Parsing / loading");
       setStatus(
-        `Parsing ${label} with PDF.js... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
+        `Parsing ${label}... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
       const pageScenes = await extractPdfPageScenes(buffer, {
         ...extractionOptions,
@@ -1620,8 +1621,6 @@ function updateMetricsPanel(
   const fillPaths = scene.fillPathCount;
 
   const mergeReduction = sourceSegments > 0 ? (1 - mergedSegments / sourceSegments) * 100 : 0;
-  const cullReduction = mergedSegments > 0 ? (1 - visibleSegments / mergedSegments) * 100 : 0;
-  const totalReduction = sourceSegments > 0 ? (1 - visibleSegments / sourceSegments) * 100 : 0;
   const textureUtilization = computeTextureAreaUtilizationPercent(
     sceneStats.textureWidth,
     sceneStats.textureHeight,
@@ -1630,15 +1629,16 @@ function updateMetricsPanel(
   const rasterSummary = formatRasterLayerSummary(scene);
 
   metricFileTextElement.textContent = label;
-  metricOperatorsTextElement.textContent = scene.operatorCount.toLocaleString();
+  metricOperatorsTextElement.textContent = describeSceneOperatorCount(scene);
+  metricOperatorsTextElement.title = OPERATOR_COUNT_EXPLANATION;
   metricSourceSegmentsTextElement.textContent = sourceSegments.toLocaleString();
   metricMergedSegmentsTextElement.textContent = `${mergedSegments.toLocaleString()} (${formatPercent(mergeReduction)} reduction)`;
   metricVisibleSegmentsTextElement.textContent =
-    `${visibleSegments.toLocaleString()} (${formatPercent(totalReduction)} total reduction), fills ${fillPaths.toLocaleString()}, text ${scene.textInstanceCount.toLocaleString()} instances, pages ${scene.pageCount.toLocaleString()} (${scene.pagesPerRow.toLocaleString()}/row)`;
-  metricReductionsTextElement.textContent =
-    `merge ${formatPercent(mergeReduction)}, invisible-cull ${formatPercent(cullReduction)}, total ${formatPercent(totalReduction)}`;
-  metricCullDiscardsTextElement.textContent =
-    `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}, glyphs ${scene.textGlyphCount.toLocaleString()} / glyph segments ${scene.textGlyphSegmentCount.toLocaleString()}`;
+    `${visibleSegments.toLocaleString()}, fills ${fillPaths.toLocaleString()}, text ${scene.textInstanceCount.toLocaleString()} instances (${scene.textGlyphCount.toLocaleString()} glyphs / ${scene.textGlyphSegmentCount.toLocaleString()} glyph segments), pages ${scene.pageCount.toLocaleString()} (${scene.pagesPerRow.toLocaleString()}/row)`;
+  metricReductionsTextElement.textContent = formatSceneSegmentAccounting(scene);
+  metricCullDiscardsTextElement.textContent = getSceneSegmentAccounting(scene).culled === null
+    ? "Unavailable in this scene / HEP metadata"
+    : `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}`;
   const lodMs = lodTiming?.elapsedMs ?? 0;
   const lodSuffix = lodTiming && lodTiming.buildCount > 0
     ? `, vector lod ${lodMs.toFixed(0)} ms (${lodTiming.levelCount.toLocaleString()} levels)`
@@ -1728,12 +1728,9 @@ function logInvisibleCullStats(label: string, scene: VectorScene): void {
     return;
   }
 
-  const visible = scene.segmentCount;
-  const merged = scene.mergedSegmentCount;
-  const reduction = merged > 0 ? (1 - visible / merged) * 100 : 0;
-
   console.log(
-    `[Invisible cull] ${label}: ${visible.toLocaleString()} visible / ${merged.toLocaleString()} merged (${reduction.toFixed(1)}% reduction, transparent=${scene.discardedTransparentCount.toLocaleString()}, degenerate=${scene.discardedDegenerateCount.toLocaleString()}, duplicates=${scene.discardedDuplicateCount.toLocaleString()}, contained=${scene.discardedContainedCount.toLocaleString()})`
+    `[Stroke accounting] ${label}: ${formatSceneSegmentAccounting(scene)}; ` +
+    `${scene.segmentCount.toLocaleString()} emitted vector segments`
   );
 }
 

@@ -96,9 +96,10 @@ export class ThreeMaterialTextLayer {
     const textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
     const textGlyphCount = Math.max(0, scene.textGlyphCount | 0);
     const textGlyphSegmentCount = Math.max(0, scene.textGlyphSegmentCount | 0);
+    const textClipRectCount = Math.floor((scene.textClipRects?.length ?? 0) / 4);
 
     const instanceTextureSize = chooseTextureSize(textInstanceCount);
-    const glyphMetaTextureSize = chooseTextureSize(textGlyphCount);
+    const glyphMetaTextureSize = chooseTextureSize(textGlyphCount + textClipRectCount);
     const glyphSegmentTextureSize = chooseTextureSize(textGlyphSegmentCount);
 
     this.textInstanceTextureA = createFloatTexture(
@@ -107,8 +108,22 @@ export class ThreeMaterialTextLayer {
       instanceTextureSize.width,
       instanceTextureSize.height
     );
+    const instanceB = textClipRectCount > 0
+      ? new Float32Array(scene.textInstanceB)
+      : scene.textInstanceB;
+    const glyphMetaA = textClipRectCount > 0
+      ? new Float32Array(glyphMetaTextureSize.width * glyphMetaTextureSize.height * 4)
+      : scene.textGlyphMetaA;
+    if (textClipRectCount > 0) {
+      glyphMetaA.set(scene.textGlyphMetaA);
+      glyphMetaA.set(scene.textClipRects!, textGlyphCount * 4);
+      for (let instance = 0; instance < textInstanceCount; instance += 1) {
+        const offset = instance * 4 + 3;
+        if (instanceB[offset] > 0) instanceB[offset] += textGlyphCount;
+      }
+    }
     this.textInstanceTextureB = createFloatTexture(
-      scene.textInstanceB,
+      instanceB,
       textInstanceCount,
       instanceTextureSize.width,
       instanceTextureSize.height
@@ -121,8 +136,8 @@ export class ThreeMaterialTextLayer {
     );
 
     this.textGlyphMetaTextureA = createFloatTexture(
-      scene.textGlyphMetaA,
-      textGlyphCount,
+      glyphMetaA,
+      textGlyphCount + textClipRectCount,
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height
     );

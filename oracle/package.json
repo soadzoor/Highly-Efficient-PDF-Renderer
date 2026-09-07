@@ -1,0 +1,18 @@
+{
+  "name": "@soadzoor/hepr-differential-oracle",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Development-only differential oracle for the HEPR v1 migration.",
+  "scripts": {
+    "compare": "node scripts/differential-baseline.mjs",
+    "compare:hepr": "node scripts/differential-baseline.mjs --adapter ./scripts/adapters/hepr.mjs",
+    "test": "node scripts/test-differential-baseline.mjs && npm run test:hepr",
+    "test:hepr": "node --experimental-strip-types scripts/test-hepr-adapter.mjs",
+    "write": "node scripts/differential-baseline.mjs --write",
+    "validate": "node scripts/differential-baseline.mjs --validate-config"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "1.0.6",
+    "pdfjs-dist": "6.1.200"
+  }
+}

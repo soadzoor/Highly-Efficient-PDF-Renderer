@@ -4,18 +4,27 @@ import {
   DensePdfSyntaxError,
   DensePdfUnsupportedError,
   type DensePdfBounds,
+  type DensePdfCompileProgress,
   type DensePdfContentSource,
   type DensePdfMatrix,
   type DensePdfTextFormSummary
 } from "./densePdfContentCompiler";
+import type {
+  DensePdfDocument,
+  DensePdfPageBox,
+  DensePdfFormXObject,
+  DensePdfPreflightResult,
+  DensePdfSelectedPage
+} from "./densePdfDocumentTypes";
 import {
-  DensePdfBuildError,
-  buildDenseTextMiniPdf,
-  preflightDensePdfDocument,
-  type DensePdfPageBox,
-  type DensePdfFormXObject,
-  type DensePdfSelectedPage
-} from "./densePdfDocument";
+  closeNativeDensePdfDocument,
+  getNativeDenseSourceDocument,
+  preflightNativeDensePdfDocument
+} from "./nativeDensePdfDocument";
+import {
+  createBundledStandardFontResolver,
+  type BundledStandardFontAsset
+} from "./standardFontResolver";
 import type {
   DensePdfFastCompiledPage,
   DensePdfFastWorkerProgress,
@@ -57,11 +66,16 @@ const PROGRESS_HEARTBEAT_MS = 150;
 const COMPILE_YIELD_INTERVAL_MS = 50;
 const PREFLIGHT_PROGRESS_END = 0.08;
 const PAGE_PROGRESS_END = 0.92;
+const PAGE_SCAN_PROGRESS_START = 0.1;
+const PAGE_SCAN_PROGRESS_END = 0.72;
+const PAGE_OPTIMIZE_PROGRESS_END = 0.99;
 const MAX_FORM_RECURSION_DEPTH = 16;
 const MAX_CLASSIFIED_FORM_COUNT = 256;
 const MAX_DECODED_FORM_BYTES = 64 * 1024 * 1024;
 const MAX_RETAINED_FORM_TRACE_WORDS = 4_000_000;
-
+const denseWorkerMissingFontResolver = createBundledStandardFontResolver({
+  loadAsset: loadDenseWorkerFontAsset
+});
 const workerScope = typeof self === "object" && typeof document === "undefined"
   ? self as unknown as DensePdfWorkerScope
   : null;
@@ -161,6 +175,7 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
   }
   const progress = new WorkerProgressEmitter(workerScope);
   const totalStartedAt = nowMs();
+  let nativeDenseDocument: DensePdfDocument | null = null;
   progress.start({
     value: 0,
     stage: "pdf-fast-check",
@@ -175,9 +190,10 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
     }
 
     const preflightStartedAt = nowMs();
-    const preflight = await preflightDensePdfDocument(request.pdfBytes, {
-      pages: request.options.pages
-    });
+    const preflight: DensePdfPreflightResult = await preflightNativeDensePdfDocument(
+      request.pdfBytes,
+      { pages: request.options.pages }
+    );
     const preflightMs = nowMs() - preflightStartedAt;
     progress.update({
       value: PREFLIGHT_PROGRESS_END,
@@ -200,11 +216,13 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
       });
       return;
     }
+    nativeDenseDocument = preflight.document;
 
     const document = preflight.document;
     const pages = document.pages;
     const sourcePageCount = readSourcePageCount(document, pages);
     const compiledPages: DensePdfFastCompiledPage[] = [];
+    const pageFormSummaries: ReadonlyMap<string, DensePdfTextFormSummary>[] = [];
     let decodeMs = 0;
     let compileMs = 0;
 
@@ -235,6 +253,7 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
       const availableTextFormXObjects = await classifyDensePdfTextFormXObjects(page, {
         yieldIntervalMs: COMPILE_YIELD_INTERVAL_MS
       });
+      pageFormSummaries.push(availableTextFormXObjects);
 
       const decodedChunks = observeDecodedChunks(
         page.decodedContentChunks(),
@@ -290,15 +309,26 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
           operatorStageStarted = true;
           decodedContentBytes = Math.max(decodedContentBytes, compilerProgress.processedBytes);
           const elapsedMs = nowMs() - pageStartedAt;
-          const indeterminate = Math.min(0.9, 0.1 + 0.8 * elapsedMs / (elapsedMs + 4_000));
-          const stage = compilerProgress.phase === "finalizing"
-            ? "compile"
-            : "pdf-operators";
+          const scanningRatio = compilerProgress.totalBytes !== undefined &&
+              compilerProgress.totalBytes > 0
+            ? clamp01(compilerProgress.processedBytes / compilerProgress.totalBytes)
+            : elapsedMs / (elapsedMs + 4_000);
+          const finalization = compilerProgress.finalization;
+          const finalizationRatio = finalization
+            ? denseFinalizeProgressRatio(finalization)
+            : Math.min(0.95, elapsedMs / (elapsedMs + 4_000));
+          const finalizing = compilerProgress.phase === "finalizing";
+          const pageValue = finalizing
+            ? PAGE_SCAN_PROGRESS_END +
+              (PAGE_OPTIMIZE_PROGRESS_END - PAGE_SCAN_PROGRESS_END) * finalizationRatio
+            : PAGE_SCAN_PROGRESS_START +
+              (PAGE_SCAN_PROGRESS_END - PAGE_SCAN_PROGRESS_START) * scanningRatio;
           progress.update({
-            value: interpolatePageProgress(pageIndex, pages.length, indeterminate),
-            stage,
-            unit: "operators",
-            processed: compilerProgress.operatorCount,
+            value: interpolatePageProgress(pageIndex, pages.length, pageValue),
+            stage: finalizing ? "pdf-optimize" : "pdf-operators",
+            unit: finalization ? "segments" : "operators",
+            processed: finalization?.completed ?? compilerProgress.operatorCount,
+            total: finalization?.total,
             pageIndex,
             pageCount: pages.length,
             sourcePageIndex: page.sourcePageIndex,
@@ -349,19 +379,76 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
       pageCount: pages.length,
       sourcePageCount
     }, true);
-    const textMiniPdfStartedAt = nowMs();
-    const textMiniPdf = await buildDenseTextMiniPdf(
-      document,
-      compiledPages.map(({ sourcePageIndex, compiled }) => ({
-        sourcePageIndex,
-        retainedTextContent: compiled.retainedTextContent,
-        referencedFonts: new Set(compiled.referencedFonts),
-        referencedProperties: new Set(compiled.referencedProperties),
-        referencedExtGStates: new Set(compiled.referencedExtGStates),
-        referencedXObjects: new Set(compiled.referencedXObjects)
-      }))
-    );
-    const textMiniPdfMs = nowMs() - textMiniPdfStartedAt;
+    // Form summaries contribute their nested text-show count to the page.
+    // A referenced text-only Form with a zero count therefore needs no text
+    // compilation merely because the `Do` operator was retained.
+    const hasText = compiledPages.some(({ compiled }) => compiled.textShowOpCount > 0);
+    let nativeTextScenes: import("./pdfVectorExtractor").VectorScene[] | undefined;
+    let nativeTextMs = 0;
+    if (!nativeDenseDocument) {
+      throw new Error("The native dense parser did not retain its source document.");
+    }
+    if (hasText) {
+      progress.update({
+        value: 0.995,
+        stage: "pdf-text",
+        unit: "pages",
+        processed: 0,
+        total: pages.length,
+        pageCount: pages.length,
+        sourcePageCount
+      }, true);
+      const nativeTextStartedAt = nowMs();
+      try {
+        const sourceDocument = getNativeDenseSourceDocument(nativeDenseDocument);
+        if (!sourceDocument) {
+          throw new Error("The native dense source document was closed before text compilation.");
+        }
+        const { compileNativeDenseRetainedTextPage } = await import(
+          "./nativeDenseRetainedTextCompiler"
+        );
+        const scenes: import("./pdfVectorExtractor").VectorScene[] = [];
+        for (let pageIndex = 0; pageIndex < compiledPages.length; pageIndex += 1) {
+          const compiledPage = compiledPages[pageIndex];
+          const sourcePage = sourceDocument.getPage(compiledPage.sourcePageIndex);
+          const structuralPage = pages[pageIndex];
+          scenes.push(await compileNativeDenseRetainedTextPage(
+            sourceDocument,
+            sourcePage,
+            compiledPage.compiled.retainedTextContent,
+            compiledPage.compiled.referencedFonts,
+            {
+              missingFontResolver: denseWorkerMissingFontResolver,
+              formSummaries: pageFormSummaries[pageIndex],
+              extGStates: structuralPage.extGStates,
+              alwaysVisibleOptionalContentProperties:
+                structuralPage.alwaysVisibleOptionalContentProperties
+            }
+          ));
+          progress.update({
+            value: 0.995,
+            stage: "pdf-text",
+            unit: "pages",
+            processed: pageIndex + 1,
+            total: pages.length,
+            pageIndex,
+            pageCount: pages.length,
+            sourcePageIndex: compiledPage.sourcePageIndex,
+            sourcePageCount
+          });
+        }
+        nativeTextScenes = scenes;
+      } catch (error) {
+        postResult(progress, {
+          kind: "fallback",
+          reason: "native-text",
+          message: `Direct native text compilation failed: ${serializeError(error).message}`
+        });
+        return;
+      } finally {
+        nativeTextMs = nowMs() - nativeTextStartedAt;
+      }
+    }
 
     // These fields are worker-only inputs to the mini-PDF builder. The main
     // thread needs only the text-show count plus the packed scene buffers.
@@ -385,14 +472,17 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
     }, true);
     postResult(progress, {
       kind: "success",
+      structureBackend: "hepr-native",
       sourcePageCount,
       pages: compiledPages,
-      textMiniPdfBytes: textMiniPdf.bytes,
+      textMiniPdfBytes: new Uint8Array(0),
+      ...(nativeTextScenes ? { nativeTextScenes } : {}),
       timing: {
         preflightMs,
         decodeMs,
         compileMs,
-        textMiniPdfMs,
+        textMiniPdfMs: 0,
+        nativeTextMs,
         totalMs: nowMs() - totalStartedAt
       }
     });
@@ -414,16 +504,45 @@ async function handleCompileRequest(request: DensePdfFastWorkerRequest): Promise
       });
       return;
     }
-    if (error instanceof DensePdfBuildError && error.code === "missing-resource") {
-      postResult(progress, {
-        kind: "fallback",
-        reason: "unsupported-resource",
-        message: error.message
-      });
-      return;
-    }
     postResult(progress, { kind: "error", error: serializeError(error) });
+  } finally {
+    if (nativeDenseDocument) {
+      await closeNativeDensePdfDocument(nativeDenseDocument)
+        .catch(() => undefined);
+    }
   }
+}
+
+async function loadDenseWorkerFontAsset(
+  asset: Readonly<BundledStandardFontAsset>,
+  signal?: AbortSignal
+): Promise<Uint8Array> {
+  signal?.throwIfAborted();
+  const nodeProcess = (globalThis as {
+    readonly process?: { readonly versions?: { readonly node?: string } };
+  }).process;
+  if (asset.url.protocol === "file:" && nodeProcess?.versions?.node) {
+    const specifier = "node:fs/promises";
+    const fs = await import(/* @vite-ignore */ specifier) as {
+      readFile(path: URL): Promise<Uint8Array>;
+    };
+    const fileUrl = new URL(asset.url);
+    fileUrl.search = "";
+    fileUrl.hash = "";
+    const bytes = await fs.readFile(fileUrl);
+    signal?.throwIfAborted();
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  if (typeof fetch !== "function") {
+    throw new Error(`No asset loader is available for bundled font ${asset.id}.`);
+  }
+  const response = await fetch(asset.url, { signal });
+  if (!response.ok) {
+    throw new Error(
+      `Could not load bundled font ${asset.id}: HTTP ${response.status} ${response.statusText}.`
+    );
+  }
+  return new Uint8Array(await response.arrayBuffer());
 }
 
 /**
@@ -584,7 +703,9 @@ async function classifyDensePdfFormUncached(
       textShowOpCount: compiled.textShowOpCount,
       hasNonTextPaint:
         compiled.pathCount > 0 ||
-        [...nestedSummaries.values()].some((summary) => summary.hasNonTextPaint)
+        [...nestedSummaries.values()].some((summary) => summary.hasNonTextPaint),
+      retainedTextContent: compiled.retainedTextContent,
+      nestedForms: new Map(nestedSummaries)
     });
   } finally {
     state.active.delete(form.dependencyKey);
@@ -913,11 +1034,21 @@ function clamp01(value: number): number {
 }
 
 function advanceHeartbeatValue(progress: DensePdfFastWorkerProgress): number {
+  // Finalization reports bounded, stage-local work. Keep heartbeat messages
+  // alive without speculatively moving ahead of that determinate progress.
+  if (progress.stage === "pdf-optimize" && progress.total !== undefined) {
+    return progress.value;
+  }
   let ceiling = 0.99;
   if (progress.stage === "pdf-fast-check") {
     ceiling = PREFLIGHT_PROGRESS_END - 0.001;
   } else if (progress.pageIndex !== undefined && progress.pageCount) {
-    ceiling = interpolatePageProgress(progress.pageIndex, progress.pageCount, 0.99);
+    const pageCeiling = progress.stage === "pdf-fast-decode"
+      ? PAGE_SCAN_PROGRESS_START - 0.001
+      : progress.stage === "pdf-operators"
+        ? PAGE_SCAN_PROGRESS_END - 0.001
+        : PAGE_OPTIMIZE_PROGRESS_END;
+    ceiling = interpolatePageProgress(progress.pageIndex, progress.pageCount, pageCeiling);
   }
   const remaining = Math.max(0, ceiling - progress.value);
   if (remaining === 0) {
@@ -926,6 +1057,30 @@ function advanceHeartbeatValue(progress: DensePdfFastWorkerProgress): number {
   return clamp01(
     progress.value + Math.min(remaining, Math.max(0.0001, remaining * 0.04))
   );
+}
+
+function denseFinalizeProgressRatio(
+  progress: NonNullable<DensePdfCompileProgress["finalization"]>
+): number {
+  const localRatio = progress.total > 0
+    ? clamp01(progress.completed / progress.total)
+    : progress.stage === "complete" ? 1 : 0;
+  switch (progress.stage) {
+    case "copy":
+      return 0.7 * localRatio;
+    case "bounds":
+      return 0.7 + 0.3 * localRatio;
+    case "index":
+      return 0.25 * localRatio;
+    case "cull":
+      return 0.25 + 0.55 * localRatio;
+    case "compact":
+      return 0.8 + 0.2 * localRatio;
+    case "complete":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 function nowMs(): number {

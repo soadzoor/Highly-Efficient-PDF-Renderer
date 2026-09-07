@@ -437,6 +437,7 @@ async function run() {
     const sourceRoundTrip = await loadSceneFromParsedDataZip(sourceZipBytes.buffer);
     assertSceneCountsEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
     assertNativeGradientResourcesEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
+    assert.equal(sourceRoundTrip.textClipRects, undefined, "older v6 scenes omit text clips");
 
     const base64ZipBlob = await buildParsedDataZip(pdfBytes.toString("base64"), {
       encodeRasterImages: false,
@@ -459,6 +460,86 @@ async function run() {
     const sceneRoundTrip = await loadSceneFromParsedDataZip(await sceneZipBlob.arrayBuffer());
     assertSceneCountsEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
     assertNativeGradientResourcesEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
+
+    if (parsedPdf.scene.textInstanceCount > 0) {
+      const clippedInstanceB = new Float32Array(parsedPdf.scene.textInstanceB);
+      clippedInstanceB[3] = 1;
+      const clippedScene = {
+        ...parsedPdf.scene,
+        textInstanceB: clippedInstanceB,
+        textClipRects: new Float32Array([1, 2, 30, 40])
+      };
+      const clippedZip = await buildParsedDataZip(clippedScene, {
+        sourceLabel: "clipped-scene.pdf",
+        sourcePdf: pdfBytes,
+        encodeRasterImages: false,
+        compression: "store"
+      });
+      const clippedRoundTrip = await loadSceneFromParsedDataZip(await clippedZip.arrayBuffer());
+      assert.deepEqual([...clippedRoundTrip.textClipRects], [1, 2, 30, 40]);
+      assert.equal(clippedRoundTrip.textInstanceB[3], 1);
+      assert.deepEqual(
+        [...clippedRoundTrip.textInstanceB.subarray(4)],
+        [...parsedPdf.scene.textInstanceB.subarray(4)],
+        "unclipped v6 text-instance channels remain byte-exact"
+      );
+    }
+
+    if (parsedPdf.scene.segmentCount > 0) {
+      const clippedPrimitiveMeta = new Float32Array(parsedPdf.scene.primitiveMeta);
+      const clippedPrimitiveBounds = new Float32Array(parsedPdf.scene.primitiveBounds);
+      const packedStyle = clippedPrimitiveMeta[3];
+      const originalFlags = Math.max(0, Math.trunc(packedStyle / 2 + 1e-6));
+      const alpha = packedStyle - originalFlags * 2;
+      clippedPrimitiveMeta[3] = alpha + (originalFlags | 4) * 2;
+      const exactStrokeClip = [-3.25, -4.5, 33.75, 44.125];
+      clippedPrimitiveBounds.set(exactStrokeClip, 0);
+      const clippedStrokeScene = {
+        ...parsedPdf.scene,
+        primitiveMeta: clippedPrimitiveMeta,
+        primitiveBounds: clippedPrimitiveBounds
+      };
+      const clippedStrokeZipBlob = await buildParsedDataZip(clippedStrokeScene, {
+        sourceLabel: "clipped-stroke-scene.pdf",
+        sourcePdf: pdfBytes,
+        encodeRasterImages: false,
+        compression: "store"
+      });
+      const clippedStrokeZip = await readZip(clippedStrokeZipBlob);
+      const clippedStrokeManifest = JSON.parse(
+        await clippedStrokeZip.file("manifest.json").async("string")
+      );
+      assert.equal(
+        clippedStrokeManifest.strokeGeometry.clipBoundsFile,
+        "geometry/stroke-clip-bounds.f32"
+      );
+      assert.ok(clippedStrokeManifest.strokeGeometry.clippedSegmentCount >= 1);
+      assert.ok(clippedStrokeZip.file(clippedStrokeManifest.strokeGeometry.clipBoundsFile));
+      const clippedStrokeRoundTrip = await loadSceneFromParsedDataZip(
+        await clippedStrokeZipBlob.arrayBuffer()
+      );
+      assert.deepEqual(
+        [...clippedStrokeRoundTrip.primitiveBounds.subarray(0, 4)],
+        exactStrokeClip,
+        "HEP v6 must retain exact clipped-stroke bounds instead of deriving endpoint bounds"
+      );
+      assert.equal(Math.trunc(clippedStrokeRoundTrip.primitiveMeta[3] / 2 + 1e-6) & 4, 4);
+
+      const incompleteStrokeClipZip = await readZip(clippedStrokeZipBlob);
+      const incompleteStrokeClipManifest = JSON.parse(
+        await incompleteStrokeClipZip.file("manifest.json").async("string")
+      );
+      delete incompleteStrokeClipManifest.strokeGeometry.clippedSegmentCount;
+      incompleteStrokeClipZip.file("manifest.json", JSON.stringify(incompleteStrokeClipManifest));
+      const incompleteStrokeClipBytes = await incompleteStrokeClipZip.generateAsync({
+        type: "arraybuffer",
+        compression: "STORE"
+      });
+      await assert.rejects(
+        loadSceneFromParsedDataZip(incompleteStrokeClipBytes),
+        /invalid strokeGeometry section/
+      );
+    }
 
     const missingRasterScene = {
       ...parsedPdf.scene,

@@ -1,15 +1,3 @@
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-
-const pdfJsModule = (
-  typeof window === "undefined"
-    ? await import("pdfjs-dist/legacy/build/pdf.mjs")
-    : await import("pdfjs-dist")
-) as {
-  GlobalWorkerOptions: typeof import("pdfjs-dist").GlobalWorkerOptions;
-};
-
-const { GlobalWorkerOptions } = pdfJsModule;
-
 import {
   composeVectorScenesInGrid,
   extractPdfPageScenes,
@@ -51,8 +39,8 @@ export interface PdfObjectGeneratorOptions {
 
   /**
    * Use HEPR's specialized worker path for compatible, unusually dense vector
-   * PDFs. In `"auto"` mode HEPR checks each page and transparently falls back
-   * to PDF.js when the fast path does not support its content.
+   * PDFs. In `"auto"` mode HEPR checks each page and transparently continues
+   * with its full native parser when the dense tier does not support content.
    *
    * PDF sources only; HEP sources ignore this option.
    *
@@ -124,8 +112,6 @@ export interface LoadedPdfScene {
   sourceBytes: Uint8Array;
 }
 
-let isPdfWorkerConfigured = false;
-
 /**
  * Internal source-loading step used by `pdfObjectGenerator`.
  */
@@ -147,7 +133,6 @@ export async function loadPdfSceneFromSource(
   const sourceLabel = resolveSourceLabel(source, sourceKind);
 
   if (sourceKind === "pdf") {
-    ensurePdfWorkerConfigured();
     const extractOptions: VectorExtractOptions = {
       enableSegmentMerge: options.segmentMerge !== false,
       enableInvisibleCull: options.invisibleCull !== false,
@@ -192,21 +177,6 @@ export async function loadPdfSceneFromSource(
     sourceKind,
     sourceBytes
   };
-}
-
-function ensurePdfWorkerConfigured(): void {
-  if (isPdfWorkerConfigured) {
-    return;
-  }
-  // Vite inlines this URL in the published library. In source-level Node/SSR
-  // execution it may instead be a browser-only root path, so retain the
-  // legacy PDF.js module's own worker path there.
-  const currentWorkerSrc = GlobalWorkerOptions.workerSrc;
-  const usesPdfJsDefault = !currentWorkerSrc || currentWorkerSrc === "./pdf.worker.mjs";
-  if (usesPdfJsDefault && (typeof window !== "undefined" || pdfWorkerUrl.startsWith("data:"))) {
-    GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-  }
-  isPdfWorkerConfigured = true;
 }
 
 /** @internal Read an accepted HEPR source without parsing it. */
