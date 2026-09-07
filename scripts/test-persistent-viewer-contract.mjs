@@ -32,11 +32,11 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /async\s+function\s+downloadParsedDataZip\b[\s\S]*?\bbuildParsedDataZip\s*\(\s*scene\s*,\s*\{/,
+  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildParsedDataZip\s*\(\s*scene\s*,\s*\{/,
   "HEP export must serialize the already-loaded VectorScene"
 );
 assert.doesNotMatch(
-  readFunctionBody(mainSource, "downloadParsedDataZip"),
+  readFunctionBody(mainSource, "downloadHep"),
   /\bopenPdf\b|\bparsePdf\b|\bcompilePdfForBatchExport\b/,
   "HEP export must not parse the source PDF a second time or switch data models"
 );

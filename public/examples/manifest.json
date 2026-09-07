@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-07T13:17:23.842Z",
+  "generatedAt": "2026-09-07T13:25:19.895Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -8,9 +8,9 @@
         "path": "examples/pdfs/20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
         "sizeBytes": 3357354
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 1843699
+        "sizeBytes": 1890836
       }
     },
     {
@@ -20,9 +20,9 @@
         "path": "examples/pdfs/Baldwin%20Park%20ED%20Remodel_Floor%201.pdf",
         "sizeBytes": 5231679
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.hep",
-        "sizeBytes": 881332
+        "sizeBytes": 799252
       }
     },
     {
@@ -32,9 +32,9 @@
         "path": "examples/pdfs/Chino%20MOB_FLOOR%201.pdf",
         "sizeBytes": 666826
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Chino_MOB_FLOOR_1-parsed-data.hep",
-        "sizeBytes": 196841
+        "sizeBytes": 197431
       }
     },
     {
@@ -44,9 +44,9 @@
         "path": "examples/pdfs/Dublin%201st%20Floor%202018%2006%2001.pdf",
         "sizeBytes": 2918857
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Dublin_1st_Floor_2018_06_01-parsed-data.hep",
-        "sizeBytes": 1063181
+        "sizeBytes": 1063088
       }
     },
     {
@@ -56,9 +56,9 @@
         "path": "examples/pdfs/Level%201.pdf",
         "sizeBytes": 31445683
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Level_1-parsed-data.hep",
-        "sizeBytes": 2952209
+        "sizeBytes": 2954373
       }
     },
     {
@@ -68,9 +68,9 @@
         "path": "examples/pdfs/Livermore_L1.pdf",
         "sizeBytes": 9263862
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Livermore_L1-parsed-data.hep",
-        "sizeBytes": 1391815
+        "sizeBytes": 1432724
       }
     },
     {
@@ -80,9 +80,9 @@
         "path": "examples/pdfs/LK%20Office%20Level%201.pdf",
         "sizeBytes": 30175
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/LK_Office_Level_1-parsed-data.hep",
-        "sizeBytes": 15045
+        "sizeBytes": 15087
       }
     },
     {
@@ -92,9 +92,9 @@
         "path": "examples/pdfs/Lower%20Level.pdf",
         "sizeBytes": 51313557
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Lower_Level-parsed-data.hep",
-        "sizeBytes": 1700830
+        "sizeBytes": 1701081
       }
     },
     {
@@ -104,9 +104,9 @@
         "path": "examples/pdfs/Murietta_Level1.pdf",
         "sizeBytes": 4001014
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/Murietta_Level1-parsed-data.hep",
-        "sizeBytes": 1180613
+        "sizeBytes": 1210699
       }
     },
     {
@@ -116,9 +116,9 @@
         "path": "examples/pdfs/optimizing_cpp.pdf",
         "sizeBytes": 1848238
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/optimizing_cpp-parsed-data.hep",
-        "sizeBytes": 885520
+        "sizeBytes": 889041
       }
     },
     {
@@ -128,9 +128,9 @@
         "path": "examples/pdfs/SimiValleyBehavioralHealth_SR_20180403.pdf",
         "sizeBytes": 916550
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
-        "sizeBytes": 234305
+        "sizeBytes": 234219
       }
     },
     {
@@ -140,9 +140,9 @@
         "path": "examples/pdfs/stn_arch_kp-ontario_177920237_detached.pdf",
         "sizeBytes": 18277813
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/stn_arch_kp-ontario_177920237_detached-parsed-data.hep",
-        "sizeBytes": 2448623
+        "sizeBytes": 2448747
       }
     },
     {
@@ -152,9 +152,9 @@
         "path": "examples/pdfs/thesis.pdf",
         "sizeBytes": 2833537
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
-        "sizeBytes": 1610456
+        "sizeBytes": 1494355
       }
     },
     {
@@ -164,9 +164,9 @@
         "path": "examples/pdfs/WarAndPeace.pdf",
         "sizeBytes": 6964852
       },
-      "parsedZip": {
+      "hep": {
         "path": "examples/heps/WarAndPeace-parsed-data.hep",
-        "sizeBytes": 5301283
+        "sizeBytes": 5347387
       }
     }
   ]

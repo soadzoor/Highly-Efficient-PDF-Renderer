@@ -5,7 +5,7 @@ export interface ExampleAssetManifestEntry {
     path?: unknown;
     sizeBytes?: unknown;
   };
-  parsedZip?: {
+  hep?: {
     path?: unknown;
     sizeBytes?: unknown;
   };
@@ -21,8 +21,8 @@ export interface NormalizedExampleEntry {
   name: string;
   pdfPath: string;
   pdfSizeBytes: number;
-  zipPath: string;
-  zipSizeBytes: number;
+  hepPath: string;
+  hepSizeBytes: number;
 }
 
 const ABSOLUTE_URL_PATTERN = /^[a-z][a-z\d+.-]*:/i;
@@ -53,10 +53,10 @@ export function normalizeExampleManifestEntries(manifest: ExampleAssetManifest):
 
     const idCandidate = readNonEmptyString(raw?.id) ?? `example-${i + 1}`;
     const rawPdfPath = readNonEmptyString(raw?.pdf?.path);
-    const rawZipPath = readNonEmptyString(raw?.parsedZip?.path);
+    const rawHepPath = readNonEmptyString(raw?.hep?.path);
     const pdfPath = rawPdfPath ? resolveAppAssetUrl(rawPdfPath) : null;
-    const zipPath = rawZipPath ? resolveAppAssetUrl(rawZipPath) : null;
-    if (!pdfPath || !zipPath) {
+    const hepPath = rawHepPath ? resolveAppAssetUrl(rawHepPath) : null;
+    if (!pdfPath || !hepPath) {
       continue;
     }
 
@@ -65,8 +65,8 @@ export function normalizeExampleManifestEntries(manifest: ExampleAssetManifest):
       name,
       pdfPath,
       pdfSizeBytes: readNonNegativeInt(raw?.pdf?.sizeBytes, 0),
-      zipPath,
-      zipSizeBytes: readNonNegativeInt(raw?.parsedZip?.sizeBytes, 0)
+      hepPath,
+      hepSizeBytes: readNonNegativeInt(raw?.hep?.sizeBytes, 0)
     });
   }
 

@@ -2,7 +2,7 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import type { SceneStats } from "./webGlFloorplanRenderer";
 import type { RendererApi, RendererBackend } from "./rendererTypes";
 
-type LoadedSourceKind = "pdf" | "parsed-zip" | null;
+type LoadedSourceKind = "pdf" | "hep" | null;
 
 interface SceneSnapshot {
   scene: VectorScene | null;

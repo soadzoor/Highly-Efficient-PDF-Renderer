@@ -301,7 +301,7 @@ function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFile
   const supportedTsvFiles: File[] = [];
 
   for (const file of Array.from(files)) {
-    if (isPdfFile(file) || isZipFile(file)) {
+    if (isPdfFile(file) || isHepFile(file)) {
       supportedSourceFiles.push(file);
       continue;
     }
@@ -347,7 +347,7 @@ function isPdfFile(file: File): boolean {
   return file.type === "application/pdf" || lowerName.endsWith(".pdf");
 }
 
-function isZipFile(file: File): boolean {
+function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
@@ -406,9 +406,9 @@ async function loadExampleManifest(): Promise<void> {
             title: `Parse ${entry.name} from the original PDF`
           },
           {
-            key: `${entry.id}:zip`,
+            key: `${entry.id}:hep`,
             label: "HEP",
-            sizeLabel: formatFileSize(entry.zipSizeBytes),
+            sizeLabel: formatFileSize(entry.hepSizeBytes),
             title: `Load precomputed HEP data for ${entry.name}`
           }
         ]
@@ -425,7 +425,7 @@ async function loadExampleManifest(): Promise<void> {
 async function loadExampleSelection(selectionKey: string): Promise<void> {
   const separatorIndex = selectionKey.lastIndexOf(":");
   const entry = exampleEntryMap.get(selectionKey.slice(0, separatorIndex));
-  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "zip";
+  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "hep";
   if (!entry || isBusy) {
     return;
   }
@@ -433,7 +433,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
   exampleDropdown.setDisabled(true);
   try {
     setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "HEP"})...`);
-    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.zipPath, { cache: "no-store" });
+    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.hepPath, { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -466,7 +466,7 @@ function formatFileSize(sizeBytes: number): string {
 }
 
 async function loadSceneSource(file: File): Promise<boolean> {
-  const isZip = isZipFile(file);
+  const isHep = isHepFile(file);
   const activeToken = ++loadToken;
   setBusy(true);
   setStatus(`Loading ${file.name}...`);
@@ -493,7 +493,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
 
     // HEP files carry no source PDF to derive the TSV coordinate transform from;
     // identity matches the common case (origin-0, unrotated pages).
-    currentPdfCoordinateTransform = isZip
+    currentPdfCoordinateTransform = isHep
       ? createIdentityPdfCoordinateTransform()
       : await readFirstPageCoordinateTransform(file);
     if (activeToken !== loadToken) {
@@ -514,7 +514,7 @@ async function loadSceneSource(file: File): Promise<boolean> {
       return false;
     }
     const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Failed to load ${isZip ? "HEP file" : "PDF"}: ${message}`);
+    setStatus(`Failed to load ${isHep ? "HEP file" : "PDF"}: ${message}`);
     return false;
   } finally {
     if (activeToken === loadToken) {

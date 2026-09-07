@@ -250,7 +250,7 @@ let lastLoadTimingText = "-";
 let renderedFrameSerial = 0;
 let touchControlsAvailable = hasTouchCapability();
 let isDropDragActive = false;
-let activeParsedZipExportController: AbortController | null = null;
+let activeHepExportController: AbortController | null = null;
 const pendingRenderedFrameResolvers: Array<() => void> = [];
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 const exampleDropdown = createExampleDropdown({
@@ -526,7 +526,7 @@ togglePanelButtonElement.addEventListener("click", () => {
 }, { signal: lifetimeSignal });
 
 downloadDataButtonElement.addEventListener("click", () => {
-  void downloadParsedDataZip();
+  void downloadHep();
 }, { signal: lifetimeSignal });
 
 downloadPdfButtonElement.addEventListener("click", () => {
@@ -635,7 +635,7 @@ window.addEventListener("drop", (event) => {
   refreshDropIndicator();
 
   const files = Array.from(event.dataTransfer?.files || []);
-  const supported = files.find((file) => isPdfFile(file) || isParsedDataZipFile(file));
+  const supported = files.find((file) => isPdfFile(file) || isHepFile(file));
 
   if (!supported) {
     setStatus("Dropped file is not a supported PDF or HEP file.");
@@ -854,8 +854,8 @@ function disposeExample(): void {
     return;
   }
   lifetimeAbortController.abort();
-  activeParsedZipExportController?.abort();
-  activeParsedZipExportController = null;
+  activeHepExportController?.abort();
+  activeHepExportController = null;
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
@@ -883,7 +883,7 @@ async function loadSource(
   source: File | string,
   options: { pdfDownloadHint?: PdfDownloadSource | null } = {}
 ): Promise<void> {
-  cancelActiveParsedZipExport();
+  cancelActiveHepExport();
   const activeLoadToken = ++loadToken;
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
@@ -1164,7 +1164,7 @@ function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): voi
 function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
   downloadPdfButtonElement.hidden = !hasPdf;
   downloadPdfButtonElement.disabled =
-    !hasPdf || isBusy || activeParsedZipExportController !== null;
+    !hasPdf || isBusy || activeHepExportController !== null;
   downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
 }
 
@@ -1175,7 +1175,7 @@ function refreshDropIndicator(): void {
 }
 
 async function loadSupportedFile(file: File): Promise<void> {
-  if (!isPdfFile(file) && !isParsedDataZipFile(file)) {
+  if (!isPdfFile(file) && !isHepFile(file)) {
     setStatus(`Unsupported file type: ${file.name}`);
     return;
   }
@@ -1187,7 +1187,7 @@ function isPdfFile(file: File): boolean {
   return file.type === "application/pdf" || lowerName.endsWith(".pdf");
 }
 
-function isParsedDataZipFile(file: File): boolean {
+function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
@@ -1227,13 +1227,13 @@ function updateSceneMetrics(pdfObject: HeprThreePdfObject): void {
   timesValueElement.textContent = lastLoadTimingText;
 }
 
-async function downloadParsedDataZip(): Promise<boolean> {
+async function downloadHep(): Promise<boolean> {
   const pdfObject = currentPdfObject;
   if (!pdfObject) {
     setStatus("No parsed floorplan data available to export.");
     return false;
   }
-  if (activeParsedZipExportController !== null) {
+  if (activeHepExportController !== null) {
     return false;
   }
 
@@ -1245,7 +1245,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
         lastDownloadablePdf?.url;
 
   const exportController = new AbortController();
-  activeParsedZipExportController = exportController;
+  activeHepExportController = exportController;
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setLoadControlsEnabled(false);
@@ -1255,11 +1255,11 @@ async function downloadParsedDataZip(): Promise<boolean> {
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
     await yieldToBrowserPaint();
-    const zipBlob = await buildParsedDataZip(pdfObject.sceneData, {
+    const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
       sourceLabel: pdfObject.sourceLabel,
       signal: exportController.signal,
       onProgress: (progress) => {
-        if (activeParsedZipExportController !== exportController) {
+        if (activeHepExportController !== exportController) {
           return;
         }
         const stageLabel = formatLoadProgressStage(progress.stage);
@@ -1269,22 +1269,22 @@ async function downloadParsedDataZip(): Promise<boolean> {
       sourcePdf
     });
 
-    if (activeParsedZipExportController !== exportController) {
+    if (activeHepExportController !== exportController) {
       return false;
     }
 
-    const zipFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.hep`;
-    triggerBrowserDownload(zipBlob, zipFileName);
+    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.hep`;
+    triggerBrowserDownload(hepBlob, hepFileName);
     return true;
   } catch (error) {
-    if (activeParsedZipExportController === exportController) {
+    if (activeHepExportController === exportController) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Failed to download parsed data: ${message}`);
     }
     return false;
   } finally {
-    if (activeParsedZipExportController === exportController) {
-      activeParsedZipExportController = null;
+    if (activeHepExportController === exportController) {
+      activeHepExportController = null;
       setLoadingProgress(false);
       setLoadControlsEnabled(true);
       backendSelectElement.disabled = false;
@@ -1296,12 +1296,12 @@ async function downloadParsedDataZip(): Promise<boolean> {
   }
 }
 
-function cancelActiveParsedZipExport(): void {
-  const controller = activeParsedZipExportController;
+function cancelActiveHepExport(): void {
+  const controller = activeHepExportController;
   if (!controller) {
     return;
   }
-  activeParsedZipExportController = null;
+  activeHepExportController = null;
   controller.abort();
   setLoadingProgress(false);
   setLoadControlsEnabled(true);
@@ -1370,17 +1370,17 @@ async function resolveDownloadablePdfSource(
     return hint;
   }
 
-  const zipBytes = await readParsedZipBytesForSource(source);
-  if (!zipBytes) {
+  const hepBytes = await readHepBytesForSource(source);
+  if (!hepBytes) {
     return null;
   }
-  const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(zipBytes);
+  const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(hepBytes);
   return sourcePdfBytes && sourcePdfBytes.length > 0
     ? { label: pdfObject.sourceLabel, bytes: sourcePdfBytes }
     : null;
 }
 
-async function readParsedZipBytesForSource(source: File | string): Promise<Uint8Array | null> {
+async function readHepBytesForSource(source: File | string): Promise<Uint8Array | null> {
   try {
     if (source instanceof File) {
       return new Uint8Array(await source.arrayBuffer());
@@ -1592,7 +1592,7 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
 
   for (const entry of entries) {
     const pdfKey = `${entry.id}:pdf`;
-    const zipKey = `${entry.id}:zip`;
+    const hepKey = `${entry.id}:hep`;
 
     exampleSelectionMap.set(pdfKey, {
       id: entry.id,
@@ -1601,11 +1601,11 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
       path: entry.pdfPath,
       pdfPath: entry.pdfPath
     });
-    exampleSelectionMap.set(zipKey, {
+    exampleSelectionMap.set(hepKey, {
       id: entry.id,
       sourceName: entry.name,
-      kind: "zip",
-      path: entry.zipPath,
+      kind: "hep",
+      path: entry.hepPath,
       pdfPath: entry.pdfPath
     });
 
@@ -1619,9 +1619,9 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
           title: `Parse ${entry.name} from the original PDF`
         },
         {
-          key: zipKey,
+          key: hepKey,
           label: "HEP",
-          sizeLabel: formatFileSize(entry.zipSizeBytes),
+          sizeLabel: formatFileSize(entry.hepSizeBytes),
           title: `Load precomputed HEP data for ${entry.name}`
         }
       ]
@@ -1727,7 +1727,7 @@ function formatTextLodMode(mode: TextLodMode): string {
   return mode === "off" ? "Off" : "Auto";
 }
 
-type ExampleSelectionKind = "pdf" | "zip";
+type ExampleSelectionKind = "pdf" | "hep";
 
 interface ExampleSelection {
   id: string;

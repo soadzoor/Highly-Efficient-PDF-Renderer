@@ -335,7 +335,7 @@ export interface RoomDetectionResult {
   /**
    * Where the flood-fill seeds came from: caller-provided, `scene.textContent`
    * (PDF sources with `extractTextContent`), the scene's searchable text index
-   * (parsed-zip sources), or nothing (only unlabeled rooms are detected).
+   * (HEP sources), or nothing (only unlabeled rooms are detected).
    */
   seedSource: "textContent" | "textIndex" | "provided" | "none";
   debug?: RoomDetectionDebugInfo;
@@ -404,7 +404,7 @@ const EXTERIOR_REGION_ID = 65535;
  *
  * Seeds default to `scene.textContent` (PDF sources with text extraction enabled via
  * `extractText` / `extractTextContent`); scenes without it fall back to word-level items
- * derived from the searchable text index (`scene.textIndex`), which parsed-zip sources
+ * derived from the searchable text index (`scene.textIndex`), which HEP sources
  * carry. Without either, only unlabeled rooms are detected.
  *
  * Example:
@@ -2284,7 +2284,7 @@ function collectPageSeeds(
     return seeds;
   }
 
-  // PDF sources carry text items directly; parsed-zip sources carry the searchable
+  // PDF sources carry text items directly; HEP sources carry the searchable
   // text index instead, from which word-level items are derived.
   const textContent = scene.textContent ?? deriveTextItemsFromIndex(scene, pageIndex);
   for (const item of textContent) {
@@ -2310,7 +2310,7 @@ function collectPageSeeds(
 
 /**
  * Word-level text items derived from one page of the scene's searchable text index
- * (the text carrier of parsed-zip sources). Runs between separator chars become one
+ * (the text carrier of HEP sources). Runs between separator chars become one
  * item each; bounds come from the same glyph-instance math the text search uses.
  */
 function deriveTextItemsFromIndex(scene: VectorScene, pageIndex: number): SceneTextItem[] {

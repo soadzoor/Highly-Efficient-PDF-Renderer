@@ -11,7 +11,7 @@ interface ExampleOptionManifestEntry {
     path: string;
     sizeBytes: number;
   };
-  parsedZip: {
+  hep: {
     path: string;
     sizeBytes: number;
   };
@@ -69,7 +69,7 @@ async function main(): Promise<void> {
         path: `examples/pdfs/${encodeExampleAssetPathSegment(pdf.name)}`,
         sizeBytes: pdf.sizeBytes
       },
-      parsedZip: {
+      hep: {
         path: `examples/heps/${encodeExampleAssetPathSegment(matchedHep.name)}`,
         sizeBytes: matchedHep.sizeBytes
       }

@@ -191,7 +191,7 @@ export interface VectorScene {
   discardedContainedCount: number;
   /**
    * Text strings with scene-space bounding boxes, present only when extracted from a PDF
-   * source with `extractTextContent` enabled (parsed-zip sources do not carry strings).
+   * source with `extractTextContent` enabled (HEP sources do not carry strings).
    */
   textContent?: SceneTextItem[];
 }
@@ -8181,7 +8181,7 @@ function combineRasterLayerResults(
     layers.length > 1 &&
     layers.every((layer) => typeof layer.paintOrder === "number" && Number.isFinite(layer.paintOrder))
   ) {
-    // Array order is the raster painter order persisted into VectorScene/ZIP.
+    // Array order is the raster painter order persisted into VectorScene/HEP.
     // Modern JS sorting is stable, so equal display-list anchors retain capture order.
     layers.sort((left, right) => (left.paintOrder as number) - (right.paintOrder as number));
   }
