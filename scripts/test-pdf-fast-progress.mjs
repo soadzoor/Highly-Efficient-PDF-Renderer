@@ -8,6 +8,7 @@ import {
 assert.equal(formatLoadProgressStage("pdf-fast-check"), "Checking fast PDF path");
 assert.equal(formatLoadProgressStage("pdf-fast-decode"), "Decoding PDF vectors");
 assert.equal(formatLoadProgressStage("pdf-operators"), "Scanning operators");
+assert.equal(formatLoadProgressStage("pdf-optimize"), "Optimizing geometry");
 
 const directEvents = [];
 const directReporter = createLoadProgressReporter(

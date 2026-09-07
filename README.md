@@ -97,6 +97,16 @@ preserve the camera where possible.
 
 ## npm Package API ([`@soadzoor/hepr`](https://www.npmjs.com/package/@soadzoor/hepr))
 
+Install HEPR alongside three.js for browser use:
+
+```bash
+npm install @soadzoor/hepr three
+```
+
+Browser PDF/HEP rendering and HEP creation use browser canvas APIs and do not
+require `@napi-rs/canvas`. It is an optional peer dependency and is not installed
+automatically for package consumers.
+
 Use `pdfObjectGenerator`, the package's single PDF-object construction entry
 point, to load a PDF or HEP file and create a `THREE.Group`. The three.js
 wrapper is camera-driven by default, so the PDF follows your existing
@@ -163,6 +173,30 @@ Supported `source` inputs:
 - base64 payload string (PDF or HEP)
 - base64 data URL (`application/pdf`, or `application/zip` when transporting HEP)
 
+Pass an `AbortSignal` to cancel a load when switching documents or closing a viewer:
+
+```ts
+const controller = new AbortController();
+const pendingObject = pdfObjectGenerator(source, { signal: controller.signal });
+
+// Call from your document-switch or teardown handler:
+controller.abort();
+
+try {
+  const object = await pendingObject;
+  scene.add(object);
+} catch (error) {
+  if (!controller.signal.aborted) throw error;
+}
+```
+
+Cancellation covers source reads, parser workers, HEP loading, LOD preparation,
+and provisional renderer creation. Synchronous work stops at its next cooperative
+checkpoint; an image/archive decode already running may finish before releasing
+its temporary data. An object already returned belongs to the caller and still
+needs `object.dispose()`. The demos cancel superseded loads and keep the previous
+document's scene and download source until a replacement is ready.
+
 Build a HEP file directly from any supported PDF input. The public builder
 retains its existing `buildParsedDataZip` name for API compatibility. Its result
 is an `application/zip` `Blob` because HEP uses ZIP internally; save or upload it
@@ -197,15 +231,32 @@ const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
 
 ### Server-side PDF to HEP conversion
 
+Node.js package consumers should also install the optional native canvas backend
+for PDF compositing/rasterization, WebP/PNG encoding, and reading HEP files with
+encoded raster images:
+
+```bash
+npm install @napi-rs/canvas
+```
+
+Vector/text-only PDF extraction does not require this backend. HEP image encoding
+falls back to raw RGBA when it is unavailable, but PDF operations that need
+Canvas2D and encoded HEP image decoding require it. The first encoding fallback
+logs a warning that HEP files may be much larger, with the canvas installation
+command and a reminder to regenerate the files. Repository installs already
+include it as a development dependency for the CLI and tests.
+
 From a repository checkout, the included Node.js CLI uses the same PDF
-extraction and HEP v6 writer as the client export. Node.js 22.13 or newer is
-required. After installing dependencies, convert either one PDF or every PDF
+extraction and HEP v6 writer as the client export. Node.js 22.15+, 23.5+, or 24+
+is required for the source workers' [module hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions).
+After installing dependencies, convert either one PDF or every PDF
 below a directory:
 
 ```bash
 npm install
 node PDFtoHEP.js ./Level1.pdf
 node PDFtoHEP.js ./path/to/pdf-folder
+node PDFtoHEP.js --output-dir=./heps ./path/to/pdf-folder
 ```
 
 Use a normal checkout install here: the CLI loads the repository source through
@@ -213,11 +264,11 @@ the development tooling and is not included in the published npm artifact.
 
 Directory scans are recursive and sequential, so large documents do not have
 multiple canvas/parser working sets resident at once. Each PDF runs in a fresh
-child process, which also guarantees that PDF.js and native-canvas memory is
-returned to the operating system before the next file. Inside that process,
-Node's `worker_threads` runs the same dense-PDF worker and `pdf-lib` compiler as
-the browser path, including progress, transferable buffers, and fast-path
-fallback decisions. Conversion workers use a 12,288 MiB V8 heap ceiling by
+child process, which also guarantees that native parser and native-canvas
+memory is returned to the operating system before the next file. Inside that
+process, Node's `worker_threads` runs the same dependency-free PDF parser and
+`VectorScene` compiler as the browser path, including progress and transferable
+buffers. Conversion workers use a 12,288 MiB V8 heap ceiling by
 default because exceptionally dense plans can exceed Node's standard heap
 limit. An explicit Node
 `--max-old-space-size=<MiB>` argument is preserved for the workers, and
@@ -229,8 +280,12 @@ time summary and the total attempted conversion time. PDFs skipped during the
 initial existing-output scan are not timed because no conversion was started;
 an all-skipped run reports that no conversions were attempted.
 
-Each output is placed next to its input using the client naming convention; for
-example, `Level1.pdf` becomes `Level1-parsed-data.hep`. Existing outputs are
+Each output is placed next to its input unless `--output-dir=<directory>` is
+supplied. Outputs use the client naming convention; for example, `Level1.pdf`
+becomes `Level1-parsed-data.hep`. A shared output directory rejects colliding
+names, including PDFs in different input subdirectories. `npm run regenerate:heps`
+writes directly to `public/examples/heps`, where the example manifest reads them.
+Existing outputs are
 skipped by default. To replace them only after a new HEP has been built
 successfully:
 
@@ -279,34 +334,19 @@ within the normalized composed subset. Page-scoped progress events expose both
 the composed `pageIndex` / `pageCount` and the original PDF's
 `sourcePageIndex` / `sourcePageCount`.
 
-Compatible vector-dense PDFs are compiled automatically in a short-lived
-worker without materializing PDF.js's full operator list. Eligibility is
-content-driven and requires every selected page to use the supported path,
-color, clipping, and text subset; other PDFs fall back atomically to PDF.js.
-The accepted graphics-state subset is deliberately narrow: `/OPM 0` or
-`/OPM 1` with overprint disabled, `/SA false`, and a valid `/SM` smoothness
-tolerance on pages without shading-capable resources are treated as inert.
-Normal blending with finite `/CA` and `/ca` opacity is represented in packed
-stroke/fill styles. Even-odd clips use the same AABB/compact nested-rectangle
-representation as ordinary HEPR extraction. Bounded, recursively nested
-text/state/clip-only Form XObjects are preserved in the text mini-PDF,
-including native matrices, bounding boxes, and locally scoped fonts. Declared
-but unused image XObjects are ignored; invoking an image, or invoking a painted
-Form whose transformed bounding box intersects the active clip, falls back to
-PDF.js.
+PDFs are parsed and compiled in a worker by HEPR's dependency-free native PDF
+engine. The compiler preserves the existing `VectorScene`, page layout, text,
+LOD, HEP v6, and renderer contracts; replacing the parser does not replace the
+viewer. Dense pages still use the allocation-conscious streaming content
+compiler, while resource-heavy pages are handled by the full native session
+compiler. Both routes produce the same scene representation and neither loads
+PDF.js or pdf-lib as a fallback.
 
-The preflight also recognizes exact nonvisual zero-border Link/Square
-annotations, exact default-all-on CAD optional-content catalogs, and the
-default opaque, non-isolated, non-knockout `/DeviceRGB` page transparency
-group. Accepted annotations are omitted (their interactivity is not retained),
-and accepted optional-content groups are flattened into a static all-visible
-view. Visible annotation appearances, hidden or usage-controlled layers,
-non-Normal blend modes, soft masks, active overprint, and other graphics-state
-features still fall back to PDF.js.
-Set `pdfFastPath: "off"` to disable this optimization for diagnostics or
-differential testing. Fast-path progress uses
-`executionPath: "dense-vector-worker"` and reports inspection and
-decompression before operator scanning and compilation.
+Unsupported visible content, malformed resources that cannot be repaired
+within the configured limits, and encrypted documents fail with typed native
+PDF errors instead of being silently omitted. Parser progress uses worker
+execution paths and reports source inspection, decompression, compilation,
+text, image, and optimization work as applicable.
 
 Useful object APIs:
 
@@ -495,7 +535,8 @@ Package exports:
 
 ### 1. PDF Extraction
 
-`src/pdfVectorExtractor.ts` uses `pdfjs-dist` operator streams to build structured scene data:
+`src/pdfVectorExtractor.ts` routes HEPR's native PDF compiler output into the
+existing structured scene data:
 
 - stroke primitives and style metadata
 - fill path primitives
@@ -566,11 +607,25 @@ The HEP container includes:
 
 HEP files are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported HEP files are typically smaller than the source PDFs themselves. Format v6 stores each raster layer whole as WebP or PNG, whichever is smaller, and falls back to RGBA8 when image encoding is unavailable. WebP/PNG entries are already compressed and are therefore stored without redundant ZIP compression.
 
-Exports report separate `raster-encode` and `zip-build` progress stages. Pass an `AbortSignal` as `signal` to cancel source fetching/PDF.js parsing, between raster encodes, or while the ZIP stream is being generated. Cancellation inside synchronous extraction work takes effect at the next asynchronous/check boundary. The loader accepts format v6 only; older or experimental format versions must be re-exported.
+Exports report separate `raster-encode` and `zip-build` progress stages. Pass an `AbortSignal` as `signal` to cancel source fetching/native PDF parsing, between raster encodes, or while the ZIP stream is being generated. Cancellation inside synchronous extraction work takes effect at the next asynchronous/check boundary. The loader accepts format v6 only; older or experimental format versions must be re-exported.
 
 The Three.js integration keeps only one raster GPU owner active at a time. Its material textures are released before the native-canvas fallback allocates raster textures, and native raster textures remain nonresident while the Three.js material path is active. This avoids the previous persistent duplicate raster allocation across the two renderer paths. The active texture set is still ordinary RGBA8 with mipmaps; this is an ownership fix, not GPU texture compression.
 
 The runtime Vector LOD hierarchy is currently rebuilt from parsed vector data at load time instead of being persisted, because storing every LOD level can make HEP files much larger than the original parsed scene.
+
+PDF loading in the demos and package API applies the same vector quantization
+as HEP after page layout and before LOD/GPU preparation. Stroke geometry, fill
+outlines, glyph outlines, text positions, and text colors therefore use the
+same precision in both paths. Cached parser pages retain their original
+coordinates for later layout changes. Exporting a displayed scene reuses its
+compact stroke encoding to avoid a second quantization pass; the v6 format and
+HEP storage precision remain unchanged.
+
+Containment culling uses a total ordering of candidate strokes so JavaScript
+sorting implementations cannot change which strokes survive. HEP files store
+the result of that culling pass: archives exported with the older epsilon-based
+ordering must be re-exported from the PDF for exact parity with the current
+parser. Loading an old archive cannot recover strokes discarded at export time.
 
 Open the native demo with `?bulkHep=1` or `?downloadAllHeps=1` to reveal the `Download All Example HEP Files` button. The old ZIP-named query parameters remain supported.
 
@@ -627,7 +682,7 @@ apply.
 Run the synthetic topology regressions with:
 
 ```bash
-npm run test:rooms
+npm run test:file -- scripts/test-room-detector.mjs
 ```
 
 For corpus evaluation, `scripts/eval-rooms.mjs --from-pdf` exercises the same live text
@@ -665,6 +720,11 @@ Build app:
 npm run build
 ```
 
+Run the type check and bounded regression suite with `npm test`. These checks
+also run on pull requests and before npm publishing. See
+[Development validation](docs/development-validation.md) for the CI scope and
+the separate manual browser/corpus checks.
+
 Build library artifacts:
 
 ```bash
@@ -693,6 +753,39 @@ Preview production build:
 
 ```bash
 npm run preview
+```
+
+## Native parser
+
+The dependency-free parser replaces only PDF extraction. It does not replace
+the viewer, renderer, scene layout, LOD pipeline, interaction controls, or HEP
+v6 format. Its output is the existing `VectorScene` representation consumed by
+those systems:
+
+```text
+PDF bytes -> parser/extractor -> VectorScene -> existing LOD and GPU renderers
+```
+
+The published runtime does not include or resolve PDF.js or pdf-lib. HEP export
+continues to serialize an already-loaded `VectorScene` and does not parse the
+source PDF a second time.
+
+The temporary differential oracle under `oracle/` has a separate, opt-in
+installation and is excluded from the published package. Corpus fidelity and
+production browser performance are release gates; passing a routing audit
+alone does not establish either.
+
+For production-bundle comparisons, measured results, and outstanding gates,
+see [Parser benchmark](docs/parser-benchmark.md). The image-heavy brochure
+improved to an 8.5% lower median parser time than the reference in the latest
+recorded Node sample, with overlapping run ranges. Browser fidelity and
+full-corpus release gates remain outstanding; this is not a release qualification.
+
+To measure only the native parser and its direct `VectorScene` compilation for
+one page (excluding HEP, LOD, upload, rendering, and viewer work), run:
+
+```bash
+npm run benchmark:native-vector-page -- "path/to/document.pdf" --warmups 1 --iterations 3
 ```
 
 ## Notes

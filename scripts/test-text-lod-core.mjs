@@ -48,6 +48,20 @@ assert.ok(result.buildTimeMs <= syncBuildElapsedMs + 1);
 assert.ok(syncBuildElapsedMs - result.buildTimeMs < 5, "sync timing must include hierarchy finalization and array trims");
 const data = result.data;
 
+const clippedInstanceB = new Float32Array(scene.textInstanceB);
+clippedInstanceB[3] = 1;
+const clippedLod = buildTextLod({
+  ...scene,
+  textInstanceB: clippedInstanceB,
+  textClipRects: new Float32Array([0, 0, 10, 10])
+});
+assert.ok(clippedLod.data);
+assert.equal(
+  clippedLod.data.runs.find((run) => run.exactStart === 0)?.eligible,
+  false,
+  "a clipped glyph stays exact instead of entering coarse clustering"
+);
+
 const cancelled = new AbortController();
 cancelled.abort();
 await assert.rejects(

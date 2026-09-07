@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "manifest": "../public/examples/manifest.json",
+  "assetRoot": "../public",
+  "expectedDocumentCount": 14,
+  "documents": [
+    { "id": "20260415_broschuere_leo_b2c_rz_online_reduz", "sizeBytes": 3357354 },
+    { "id": "baldwin_park_ed_remodel_floor_1", "sizeBytes": 5231679 },
+    { "id": "chino_mob_floor_1", "sizeBytes": 666826 },
+    { "id": "dublin_1st_floor_2018_06_01", "sizeBytes": 2918857 },
+    { "id": "level_1", "sizeBytes": 31445683 },
+    { "id": "livermore_l1", "sizeBytes": 9263862 },
+    { "id": "lk_office_level_1", "sizeBytes": 30175 },
+    { "id": "lower_level", "sizeBytes": 51313557 },
+    { "id": "murietta_level1", "sizeBytes": 4001014 },
+    { "id": "optimizing_cpp", "sizeBytes": 1848238 },
+    { "id": "simivalleybehavioralhealth_sr_20180403", "sizeBytes": 916550 },
+    { "id": "stn_arch_kp_ontario_177920237_detached", "sizeBytes": 18277813 },
+    { "id": "thesis", "sizeBytes": 2833537 },
+    { "id": "warandpeace", "sizeBytes": 6964852 }
+  ]
+}

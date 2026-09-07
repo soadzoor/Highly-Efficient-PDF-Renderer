@@ -1,7 +1,5 @@
 import "./style.css";
-
-import { GlobalWorkerOptions } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { waitForLoad } from "./loadCancellation";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
@@ -18,8 +16,9 @@ import { buildParsedDataZip } from "./index";
 import {
   listSceneRasterLayers,
   loadSceneFromParsedDataZip,
+  prepareSceneForHepRendering,
   tryReadSourcePdfBytesFromExistingParsedZip
-} from "./parsedDataZip";
+} from "./hep";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
 import {
@@ -58,9 +57,13 @@ import {
 } from "./textSearch";
 import { createTextSearchWidget } from "./textSearchWidget";
 import { createTextSelectionController } from "./textSelection";
+import {
+  describeSceneOperatorCount,
+  formatSceneSegmentAccounting,
+  getSceneSegmentAccounting,
+  OPERATOR_COUNT_EXPLANATION
+} from "./sceneStatistics";
 import type { SearchHighlightSet } from "./rendererTypes";
-
-GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
@@ -336,7 +339,7 @@ async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<Re
 renderer = createWebGlRenderer(canvasElement);
 
 let baseStatus = "Waiting for PDF or HEP file...";
-type LoadedSourceKind = "pdf" | "parsed-zip";
+type LoadedSourceKind = "pdf" | "hep";
 
 interface LoadedSource {
   kind: LoadedSourceKind;
@@ -346,18 +349,18 @@ interface LoadedSource {
 
 let lastLoadedSource: LoadedSource | null = null;
 let lastParsedScene: VectorScene | null = null;
-let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
 let loadToken = 0;
 let activeSceneLoadToken: number | null = null;
 let pendingSourceLoadCount = 0;
 let sourceLoadSerial = 0;
+let sourceLoadController: AbortController | null = null;
 let isDropDragActive = false;
 let isBatchExampleExportRunning = false;
-let activeParsedZipExportController: AbortController | null = null;
+let activeHepExportController: AbortController | null = null;
 
 const pageQuery = new URLSearchParams(window.location.search);
-const bulkZipExportEnabled =
+const bulkHepExportEnabled =
   pageQuery.get("bulkHep") === "1" ||
   pageQuery.get("downloadAllHeps") === "1" ||
   pageQuery.get("bulkZip") === "1" ||
@@ -373,6 +376,9 @@ interface ParsedPdfPageCache {
 let parsedPdfPageCache: ParsedPdfPageCache | null = null;
 
 interface LoadPdfOptions {
+  source: LoadedSource;
+  downloadablePdf: PdfDownloadSource | null;
+  signal: AbortSignal;
   preserveView?: boolean;
 }
 
@@ -384,7 +390,7 @@ const LOAD_PROGRESS_TEXT_LOD_START = LOAD_PROGRESS_VECTOR_LOD_END;
 const LOAD_PROGRESS_TEXT_LOD_END = 0.96;
 const LOAD_PROGRESS_UPLOAD = 0.98;
 
-type ExampleSelectionKind = "pdf" | "zip";
+type ExampleSelectionKind = "pdf" | "hep";
 
 interface ExampleSelection {
   id: string;
@@ -427,15 +433,12 @@ backendSwitcher = createBackendSwitcher({
   isOperationActive: () =>
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
-    activeParsedZipExportController !== null,
+    activeHepExportController !== null,
   getSceneSnapshot: () => ({
     scene: lastParsedScene,
     label: lastParsedSceneLabel,
     loadedSourceKind: lastLoadedSource?.kind ?? null
   }),
-  setSceneStats: (stats) => {
-    lastParsedSceneStats = stats;
-  },
   updateMetricsAfterSwitch: (label, scene, sceneStats) => {
     updateMetricsPanel(label, scene, sceneStats, 0, 0, null, null);
   },
@@ -467,7 +470,7 @@ openButtonElement.addEventListener("click", () => {
 });
 
 downloadDataButtonElement.addEventListener("click", () => {
-  void downloadParsedDataZip();
+  void downloadHep();
 });
 
 downloadPdfButtonElement.addEventListener("click", () => {
@@ -475,11 +478,12 @@ downloadPdfButtonElement.addEventListener("click", () => {
 });
 
 downloadAllDataButtonElement.addEventListener("click", () => {
-  void downloadAllExampleParsedZips();
+  void downloadAllExampleHeps();
 });
 
 window.addEventListener("beforeunload", () => {
-  activeParsedZipExportController?.abort();
+  activeHepExportController?.abort();
+  sourceLoadController?.abort();
 }, { once: true });
 
 toggleHudButtonElement.addEventListener("click", () => {
@@ -494,8 +498,8 @@ fileInputElement.addEventListener("change", async () => {
   }
   if (isPdfFile(file)) {
     await loadPdfFile(file);
-  } else if (isParsedDataZipFile(file)) {
-    await loadParsedDataZipFile(file);
+  } else if (isHepFile(file)) {
+    await loadHepFile(file);
   } else {
     setStatus(`Unsupported file type: ${file.name}`);
   }
@@ -578,7 +582,7 @@ window.addEventListener("drop", async (event) => {
   refreshDropIndicator();
 
   const files = Array.from(event.dataTransfer?.files || []);
-  const supported = files.find((file) => isPdfFile(file) || isParsedDataZipFile(file));
+  const supported = files.find((file) => isPdfFile(file) || isHepFile(file));
 
   if (!supported) {
     setStatus("Dropped file is not a supported PDF or HEP file.");
@@ -588,7 +592,7 @@ window.addEventListener("drop", async (event) => {
   if (isPdfFile(supported)) {
     await loadPdfFile(supported);
   } else {
-    await loadParsedDataZipFile(supported);
+    await loadHepFile(supported);
   }
 });
 
@@ -634,7 +638,7 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
 
   for (const entry of entries) {
     const pdfKey = `${entry.id}:pdf`;
-    const zipKey = `${entry.id}:zip`;
+    const hepKey = `${entry.id}:hep`;
 
     exampleSelectionMap.set(pdfKey, {
       id: entry.id,
@@ -643,11 +647,11 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
       path: entry.pdfPath,
       pdfPath: entry.pdfPath
     });
-    exampleSelectionMap.set(zipKey, {
+    exampleSelectionMap.set(hepKey, {
       id: entry.id,
       sourceName: entry.name,
-      kind: "zip",
-      path: entry.zipPath,
+      kind: "hep",
+      path: entry.hepPath,
       pdfPath: entry.pdfPath
     });
 
@@ -661,9 +665,9 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
           title: `Parse ${entry.name} from the original PDF`
         },
         {
-          key: zipKey,
+          key: hepKey,
           label: "HEP",
-          sizeLabel: formatFileSize(entry.zipSizeBytes),
+          sizeLabel: formatFileSize(entry.hepSizeBytes),
           title: `Load precomputed HEP data for ${entry.name}`
         }
       ]
@@ -680,51 +684,36 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     return;
   }
 
-  cancelActiveParsedZipExport();
+  cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
+  const signal = sourceLoadController!.signal;
   exampleDropdown.setDisabled(true);
   try {
     const modeLabel = selection.kind === "pdf" ? "PDF" : "HEP";
     setStatus(`Loading example ${selection.sourceName} (${modeLabel})...`);
-    const response = await fetch(selection.path, { cache: "no-store" });
+    const response = await fetch(selection.path, { cache: "no-store", signal });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    const fileBuffer = await response.arrayBuffer();
+    const fileBuffer = await waitForLoad(response.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
       return;
     }
     const bytes = cloneSourceBytes(fileBuffer);
-    parsedPdfPageCache = null;
-
     if (selection.kind === "pdf") {
-      lastLoadedSource = {
-        kind: "pdf",
-        bytes,
-        label: selection.sourceName
-      };
-      lastDownloadablePdf = {
-        label: selection.sourceName,
-        bytes
-      };
-      setDownloadPdfButtonState(true);
       await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
+        source: { kind: "pdf", bytes, label: selection.sourceName },
+        downloadablePdf: { label: selection.sourceName, bytes },
+        signal,
         preserveView: false
       });
     } else {
-      const zipLabel = `${selection.sourceName} (HEP)`;
-      lastLoadedSource = {
-        kind: "parsed-zip",
-        bytes,
-        label: zipLabel
-      };
-      lastDownloadablePdf = {
-        label: selection.sourceName,
-        url: selection.pdfPath
-      };
-      setDownloadPdfButtonState(true);
-      await loadParsedDataZipBuffer(createParseBuffer(bytes), zipLabel, {
+      const hepLabel = `${selection.sourceName} (HEP)`;
+      await loadHepBuffer(createParseBuffer(bytes), hepLabel, {
+        source: { kind: "hep", bytes, label: hepLabel },
+        downloadablePdf: { label: selection.sourceName, url: selection.pdfPath },
+        signal,
         preserveView: false
       });
     }
@@ -735,8 +724,8 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load example: ${message}`);
   } finally {
-    finishSourceLoad();
-    exampleDropdown.setDisabled(false);
+    finishSourceLoad(sourceLoadToken);
+    if (isCurrentSourceLoad(sourceLoadToken)) exampleDropdown.setDisabled(false);
   }
 }
 
@@ -745,7 +734,7 @@ function isPdfFile(file: File): boolean {
   return file.type === "application/pdf" || lowerName.endsWith(".pdf");
 }
 
-function isParsedDataZipFile(file: File): boolean {
+function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
@@ -756,66 +745,73 @@ function isParsedDataZipFile(file: File): boolean {
 }
 
 async function loadPdfFile(file: File): Promise<void> {
-  cancelActiveParsedZipExport();
+  cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
+  const signal = sourceLoadController!.signal;
   try {
     setStatus(`Reading ${file.name}...`);
-    setDownloadPdfButtonState(false);
-    const buffer = await file.arrayBuffer();
+    const buffer = await waitForLoad(file.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
       return;
     }
     const bytes = cloneSourceBytes(buffer);
-    lastLoadedSource = { kind: "pdf", bytes, label: file.name };
-    lastDownloadablePdf = { label: file.name, bytes };
-    setDownloadPdfButtonState(true);
-    parsedPdfPageCache = null;
-    await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+    await loadPdfBuffer(createParseBuffer(bytes), file.name, {
+      source: { kind: "pdf", bytes, label: file.name },
+      downloadablePdf: { label: file.name, bytes },
+      signal,
+      preserveView: false
+    });
+  } catch (error) {
+    if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
+      setStatus(`Failed to read PDF: ${error instanceof Error ? error.message : String(error)}`);
+    }
   } finally {
-    finishSourceLoad();
+    finishSourceLoad(sourceLoadToken);
   }
 }
 
-async function loadParsedDataZipFile(file: File): Promise<void> {
-  cancelActiveParsedZipExport();
+async function loadHepFile(file: File): Promise<void> {
+  cancelActiveHepExport();
   const sourceLoadToken = beginSourceLoad();
+  const signal = sourceLoadController!.signal;
   try {
     setStatus(`Reading ${file.name}...`);
-    lastDownloadablePdf = null;
-    setDownloadPdfButtonState(false);
-    const buffer = await file.arrayBuffer();
+    const buffer = await waitForLoad(file.arrayBuffer(), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) {
       return;
     }
     const bytes = cloneSourceBytes(buffer);
-    lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
-    parsedPdfPageCache = null;
-    await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
-    if (isCurrentSourceLoad(sourceLoadToken) && lastLoadedSource?.bytes === bytes) {
-      const sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(bytes);
-      if (sourcePdfBytes && sourcePdfBytes.length > 0) {
-        lastDownloadablePdf = { label: file.name, bytes: sourcePdfBytes };
-        setDownloadPdfButtonState(true);
-      }
+    const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingParsedZip(bytes), signal);
+    if (!isCurrentSourceLoad(sourceLoadToken)) return;
+    await loadHepBuffer(createParseBuffer(bytes), file.name, {
+      source: { kind: "hep", bytes, label: file.name },
+      downloadablePdf: sourcePdfBytes?.length ? { label: file.name, bytes: sourcePdfBytes } : null,
+      signal,
+      preserveView: false
+    });
+  } catch (error) {
+    if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
+      setStatus(`Failed to read HEP file: ${error instanceof Error ? error.message : String(error)}`);
     }
   } finally {
-    finishSourceLoad();
+    finishSourceLoad(sourceLoadToken);
   }
 }
 
-async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
+async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions): Promise<void> {
   const activeLoadToken = await backendSwitcher!.runWhenIdle(() => {
+    options.signal.throwIfAborted();
     const nextLoadToken = ++loadToken;
     beginSceneLoad(nextLoadToken);
     return nextLoadToken;
   });
-  if (activeLoadToken !== loadToken) {
+  if (activeLoadToken !== loadToken || options.signal.aborted) {
     return;
   }
   const loadStart = performance.now();
   const extractionOptions = getExtractionOptions();
   const pageSceneOptionsKey = buildPdfPageCacheKey();
-  const cachedPageScenes = getCachedPdfPageScenes(label, pageSceneOptionsKey);
+  const cachedPageScenes = getCachedPdfPageScenes(options.source, pageSceneOptionsKey);
   const progress = createLoadProgressReporter((payload) => {
     if (activeLoadToken === loadToken) {
       updateParsingLoaderProgress(payload);
@@ -824,6 +820,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
   try {
     let scene: VectorScene;
+    let parsedPages: VectorScene[] | null = null;
     let parseMs = 0;
 
     if (cachedPageScenes) {
@@ -842,12 +839,12 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       const parseStart = performance.now();
       setParsingLoader(true, "0.00% Parsing / loading");
       setStatus(
-        `Parsing ${label} with PDF.js... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
+        `Parsing ${label}... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
       const pageScenes = await extractPdfPageScenes(buffer, {
         ...extractionOptions,
         onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
-      });
+      }, options.signal);
       parseMs = performance.now() - parseStart;
 
       if (activeLoadToken === loadToken) {
@@ -860,7 +857,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
       const pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
       scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
-      storeCachedPdfPageScenes(label, pageSceneOptionsKey, pageScenes);
+      parsedPages = pageScenes;
       console.log(
         `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
       );
@@ -870,34 +867,30 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
 
+    scene = prepareSceneForHepRendering(scene);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
     if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
       setParsingLoader(false);
       setStatus(`No visible geometry was extracted from ${label}.`);
-      runtimeTextElement.textContent = "";
-      setMetricPlaceholder(label);
-      setDownloadDataButtonState(false);
       return;
     }
 
     setStatus(
       `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
-    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "pdf", activeLoadToken);
-    await prebuildTextLodForScene(scene, progress, "pdf", activeLoadToken);
+    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "pdf", activeLoadToken, options.signal);
+    await prebuildTextLodForScene(scene, progress, "pdf", activeLoadToken, options.signal);
     if (activeLoadToken !== loadToken) {
       return;
     }
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "pdf" });
     const uploadStart = performance.now();
     const targetRenderer = renderer;
-    const sceneStats = targetRenderer.setScene(scene);
+    options.signal.throwIfAborted();
+    const sceneStats = uploadSceneWithRollback(targetRenderer, scene, options.preserveView);
     const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
-    if (!options.preserveView) {
-      targetRenderer.fitToBounds(resolveSceneFitBounds(scene), 64);
-    }
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
     progress.complete({ sourceType: "pdf" });
@@ -915,8 +908,9 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     logTextureSizeStats(label, scene, sceneStats);
 
     lastParsedScene = scene;
-    lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    commitLoadedSource(options);
+    if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
     applyTextSearchScene(scene);
     refreshDropIndicator();
     setDownloadDataButtonState(true);
@@ -924,29 +918,21 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming, performance.now() - loadStart);
     clearLoadedStatus();
   } catch (error) {
-    if (activeLoadToken !== loadToken) {
+    if (activeLoadToken !== loadToken || options.signal.aborted) {
       return;
     }
 
     setParsingLoader(false);
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to render PDF: ${message}`);
-    runtimeTextElement.textContent = "";
-    setMetricPlaceholder(label);
   } finally {
     finishSceneLoad(activeLoadToken);
   }
 }
 
-async function reloadLastPdfWithCurrentOptions(): Promise<void> {
-  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
-    return;
-  }
-  await loadPdfBuffer(createParseBuffer(lastLoadedSource.bytes), lastLoadedSource.label, { preserveView: true });
-}
-
-async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
+async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions): Promise<void> {
   const activeLoadToken = await backendSwitcher!.runWhenIdle(() => {
+    options.signal.throwIfAborted();
     const nextLoadToken = ++loadToken;
     beginSceneLoad(nextLoadToken);
     return nextLoadToken;
@@ -966,6 +952,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     setParsingLoader(true, "0.00% Parsing / loading");
     setStatus(`Loading parsed data from ${label}...`);
     const scene = await loadSceneFromParsedDataZip(buffer, {
+      signal: options.signal,
       onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "zip" }).toCallback()
     });
     const parseEnd = performance.now();
@@ -983,29 +970,24 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
       setParsingLoader(false);
       setStatus(`No visible geometry was found in ${label}.`);
-      runtimeTextElement.textContent = "";
-      setMetricPlaceholder(label);
-      setDownloadDataButtonState(false);
       return;
     }
 
     setStatus(
       `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
-    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "zip", activeLoadToken);
-    await prebuildTextLodForScene(scene, progress, "zip", activeLoadToken);
+    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "zip", activeLoadToken, options.signal);
+    await prebuildTextLodForScene(scene, progress, "zip", activeLoadToken, options.signal);
     if (activeLoadToken !== loadToken) {
       return;
     }
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "zip" });
     const uploadStart = performance.now();
     const targetRenderer = renderer;
-    const sceneStats = targetRenderer.setScene(scene);
+    options.signal.throwIfAborted();
+    const sceneStats = uploadSceneWithRollback(targetRenderer, scene, options.preserveView);
     const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
-    if (!options.preserveView) {
-      targetRenderer.fitToBounds(resolveSceneFitBounds(scene), 64);
-    }
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
     progress.complete({ sourceType: "zip" });
@@ -1023,8 +1005,9 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     logTextureSizeStats(label, scene, sceneStats);
 
     lastParsedScene = scene;
-    lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    commitLoadedSource(options);
+    parsedPdfPageCache = null;
     applyTextSearchScene(scene);
     refreshDropIndicator();
     setDownloadDataButtonState(true);
@@ -1032,17 +1015,39 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadMs, lodTiming, performance.now() - loadStart);
     clearLoadedStatus();
   } catch (error) {
-    if (activeLoadToken !== loadToken) {
+    if (activeLoadToken !== loadToken || options.signal.aborted) {
       return;
     }
 
     setParsingLoader(false);
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load HEP file: ${message}`);
-    runtimeTextElement.textContent = "";
-    setMetricPlaceholder(label);
   } finally {
     finishSceneLoad(activeLoadToken);
+  }
+}
+
+function commitLoadedSource(options: LoadPdfOptions): void {
+  lastLoadedSource = options.source;
+  lastDownloadablePdf = options.downloadablePdf;
+  setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+}
+
+function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preserveView?: boolean): SceneStats {
+  const previousScene = lastParsedScene;
+  const previousView = target.getViewState();
+  try {
+    const stats = target.setScene(scene);
+    if (!preserveView) target.fitToBounds(resolveSceneFitBounds(scene), 64);
+    return stats;
+  } catch (error) {
+    try {
+      if (previousScene) target.setScene(previousScene);
+      target.setViewState(previousView);
+    } catch (restoreError) {
+      console.warn("[HEPR] Failed to restore the previous scene after an upload error.", restoreError);
+    }
+    throw error;
   }
 }
 
@@ -1057,14 +1062,14 @@ function buildPdfPageCacheKey(): string {
   return "merge:1|cull:1";
 }
 
-function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[] | null {
-  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf" || !parsedPdfPageCache) {
+function getCachedPdfPageScenes(source: LoadedSource, optionsKey: string): VectorScene[] | null {
+  if (source.kind !== "pdf" || !parsedPdfPageCache) {
     return null;
   }
-  if (parsedPdfPageCache.sourceBytes !== lastLoadedSource.bytes) {
+  if (parsedPdfPageCache.sourceBytes !== source.bytes) {
     return null;
   }
-  if (parsedPdfPageCache.sourceLabel !== label) {
+  if (parsedPdfPageCache.sourceLabel !== source.label) {
     return null;
   }
   if (parsedPdfPageCache.optionsKey !== optionsKey) {
@@ -1073,13 +1078,10 @@ function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[
   return parsedPdfPageCache.pageScenes;
 }
 
-function storeCachedPdfPageScenes(label: string, optionsKey: string, pageScenes: VectorScene[]): void {
-  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
-    return;
-  }
+function storeCachedPdfPageScenes(source: LoadedSource, optionsKey: string, pageScenes: VectorScene[]): void {
   parsedPdfPageCache = {
-    sourceBytes: lastLoadedSource.bytes,
-    sourceLabel: label,
+    sourceBytes: source.bytes,
+    sourceLabel: source.label,
     optionsKey,
     pageScenes
   };
@@ -1171,6 +1173,10 @@ function beginSceneLoad(token: number): void {
 }
 
 function beginSourceLoad(): number {
+  sourceLoadController?.abort();
+  sourceLoadController = new AbortController();
+  // Invalidate parsing/LOD immediately, even while the next source is reading.
+  loadToken += 1;
   pendingSourceLoadCount += 1;
   sourceLoadSerial += 1;
   updateBackendSelectDisabledState();
@@ -1181,8 +1187,15 @@ function isCurrentSourceLoad(token: number): boolean {
   return token === sourceLoadSerial;
 }
 
-function finishSourceLoad(): void {
+function finishSourceLoad(token: number): void {
   pendingSourceLoadCount = Math.max(0, pendingSourceLoadCount - 1);
+  if (isCurrentSourceLoad(token)) {
+    sourceLoadController = null;
+    setParsingLoader(false);
+    exampleDropdown.setDisabled(false);
+    setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel));
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+  }
   updateBackendSelectDisabledState();
 }
 
@@ -1198,7 +1211,7 @@ function updateBackendSelectDisabledState(): void {
   backendSelectElement.disabled =
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
-    activeParsedZipExportController !== null;
+    activeHepExportController !== null;
 }
 
 function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
@@ -1211,7 +1224,8 @@ async function prebuildVectorLodForScene(
   scene: VectorScene,
   progress: ReturnType<typeof createLoadProgressReporter>,
   sourceType: "pdf" | "zip",
-  activeLoadToken: number
+  activeLoadToken: number,
+  signal?: AbortSignal
 ): Promise<VectorStrokeLodBuildTiming> {
   resetVectorStrokeLodBuildTiming();
   progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
@@ -1221,7 +1235,7 @@ async function prebuildVectorLodForScene(
     backendSwitcher?.getActiveBackend() ?? "webgl",
     {
       yieldIntervalMs: 500,
-      shouldCancel: () => activeLoadToken !== loadToken,
+      shouldCancel: () => activeLoadToken !== loadToken || signal?.aborted === true,
       onProgress: (lodProgress) => {
         if (activeLoadToken !== loadToken) {
           return;
@@ -1240,7 +1254,8 @@ async function prebuildTextLodForScene(
   scene: VectorScene,
   progress: ReturnType<typeof createLoadProgressReporter>,
   sourceType: "pdf" | "zip",
-  activeLoadToken: number
+  activeLoadToken: number,
+  signal?: AbortSignal
 ): Promise<void> {
   progress.report(LOAD_PROGRESS_TEXT_LOD_START, { stage: "text-lod", sourceType });
   if (uiControlManager.readTextLodModeInput() === "off") {
@@ -1249,6 +1264,7 @@ async function prebuildTextLodForScene(
   }
   await prebuildTextLod(scene, {
     yieldIntervalMs: 50,
+    signal,
     shouldCancel: () => activeLoadToken !== loadToken,
     onProgress: (lodProgress) => {
       if (activeLoadToken !== loadToken) {
@@ -1284,15 +1300,16 @@ function setDownloadPdfButtonState(hasPdf: boolean, isBusy = false): void {
   downloadPdfButtonElement.hidden = !hasPdf;
   downloadPdfButtonElement.disabled =
     !hasPdf ||
+    pendingSourceLoadCount > 0 ||
     isBusy ||
     isBatchExampleExportRunning ||
-    activeParsedZipExportController !== null;
+    activeHepExportController !== null;
   downloadPdfButtonElement.textContent = isBusy ? "Preparing PDF..." : "Download PDF";
 }
 
 function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, progressText?: string): void {
-  downloadAllDataButtonElement.hidden = !bulkZipExportEnabled;
-  downloadAllDataButtonElement.disabled = !bulkZipExportEnabled || !hasExamples || isBusy;
+  downloadAllDataButtonElement.hidden = !bulkHepExportEnabled;
+  downloadAllDataButtonElement.disabled = !bulkHepExportEnabled || !hasExamples || isBusy;
   downloadAllDataButtonElement.textContent = isBusy
     ? progressText ?? "Exporting Example HEP Files..."
     : "Download All Example HEP Files";
@@ -1311,11 +1328,11 @@ function setHudCollapsed(collapsed: boolean): void {
   toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
 }
 
-async function downloadAllExampleParsedZips(): Promise<void> {
+async function downloadAllExampleHeps(): Promise<void> {
   if (
-    !bulkZipExportEnabled ||
+    !bulkHepExportEnabled ||
     isBatchExampleExportRunning ||
-    activeParsedZipExportController !== null ||
+    activeHepExportController !== null ||
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
     backendSwitcher?.isSwitchInFlight() === true
@@ -1331,7 +1348,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
 
   isBatchExampleExportRunning = true;
   const exportController = new AbortController();
-  activeParsedZipExportController = exportController;
+  activeHepExportController = exportController;
   setPrimaryLoadControlsEnabled(false);
   updateBackendSelectDisabledState();
   setDownloadDataButtonState(Boolean(lastParsedScene && lastParsedSceneLabel), false);
@@ -1357,11 +1374,11 @@ async function downloadAllExampleParsedZips(): Promise<void> {
       }
 
       const bytes = cloneSourceBytes(await response.arrayBuffer());
-      const zipBlob = await buildParsedDataZip(bytes, {
+      const hepBlob = await buildParsedDataZip(bytes, {
         sourceLabel: entry.name,
         signal: exportController.signal,
         onProgress: (progress) => {
-          if (activeParsedZipExportController !== exportController) {
+          if (activeHepExportController !== exportController) {
             return;
           }
           const overallValue = (index + progress.value) / pdfEntries.length;
@@ -1372,24 +1389,24 @@ async function downloadAllExampleParsedZips(): Promise<void> {
           );
         }
       });
-      const zipFileName = `${sanitizeDownloadName(entry.name)}-parsed-data.hep`;
+      const hepFileName = `${sanitizeDownloadName(entry.name)}-parsed-data.hep`;
       setStatus(`Batch ${step}/${pdfEntries.length}: downloading ${entry.name} HEP file...`);
-      triggerBrowserDownload(zipBlob, zipFileName);
+      triggerBrowserDownload(hepBlob, hepFileName);
       await delayMilliseconds(200);
     }
 
-    if (activeParsedZipExportController === exportController) {
+    if (activeHepExportController === exportController) {
       setStatus(`Batch export complete: ${pdfEntries.length.toLocaleString()} HEP files downloaded.`);
     }
   } catch (error) {
-    if (activeParsedZipExportController === exportController) {
+    if (activeHepExportController === exportController) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Batch export failed: ${message}`);
     }
   } finally {
-    const ownsExportUi = activeParsedZipExportController === exportController;
+    const ownsExportUi = activeHepExportController === exportController;
     if (ownsExportUi) {
-      activeParsedZipExportController = null;
+      activeHepExportController = null;
       setParsingLoader(false);
     }
     if (ownsExportUi) {
@@ -1403,7 +1420,7 @@ async function downloadAllExampleParsedZips(): Promise<void> {
   }
 }
 
-async function downloadParsedDataZip(): Promise<boolean> {
+async function downloadHep(): Promise<boolean> {
   if (backendSwitcher?.isSwitchInFlight()) {
     setStatus("Wait for the renderer backend switch to finish before exporting parsed data.");
     return false;
@@ -1420,7 +1437,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
     setStatus("No parsed floorplan data available to export.");
     return false;
   }
-  if (activeParsedZipExportController !== null) {
+  if (activeHepExportController !== null) {
     return false;
   }
 
@@ -1435,7 +1452,7 @@ async function downloadParsedDataZip(): Promise<boolean> {
   const previousStatusText = statusTextElement.textContent;
 
   const exportController = new AbortController();
-  activeParsedZipExportController = exportController;
+  activeHepExportController = exportController;
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(exampleManifestEntries.length > 0, true, "Export in progress...");
@@ -1447,39 +1464,39 @@ async function downloadParsedDataZip(): Promise<boolean> {
 
   try {
     await yieldToBrowserPaint();
-    const zipBlob = await buildParsedDataZip(scene, {
+    const hepBlob = await buildParsedDataZip(scene, {
       sourceLabel: label,
       signal: exportController.signal,
       onProgress: (progress) => {
-        if (activeParsedZipExportController === exportController) {
+        if (activeHepExportController === exportController) {
           updateParsingLoaderProgress(progress);
         }
       },
       sourcePdf
     });
 
-    if (activeParsedZipExportController !== exportController) {
+    if (activeHepExportController !== exportController) {
       return false;
     }
 
-    const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.hep`;
-    triggerBrowserDownload(zipBlob, zipFileName);
+    const hepFileName = `${sanitizeDownloadName(label)}-parsed-data.hep`;
+    triggerBrowserDownload(hepBlob, hepFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${zipFileName} (${formatFileSize(zipBlob.size)})`
+      `[Parsed data export] ${label}: wrote ${hepFileName} (${formatFileSize(hepBlob.size)})`
     );
     const restoredStatus = previousStatusText || baseStatus;
     statusTextElement.textContent = restoredStatus;
     statusTextElement.hidden = restoredStatus.trim().length === 0;
     return true;
   } catch (error) {
-    if (activeParsedZipExportController === exportController) {
+    if (activeHepExportController === exportController) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Failed to download parsed data: ${message}`);
     }
     return false;
   } finally {
-    if (activeParsedZipExportController === exportController) {
-      activeParsedZipExportController = null;
+    if (activeHepExportController === exportController) {
+      activeHepExportController = null;
       setParsingLoader(false);
       setPrimaryLoadControlsEnabled(true);
       updateBackendSelectDisabledState();
@@ -1559,12 +1576,12 @@ function yieldToBrowserPaint(): Promise<void> {
   });
 }
 
-function cancelActiveParsedZipExport(): void {
-  const controller = activeParsedZipExportController;
+function cancelActiveHepExport(): void {
+  const controller = activeHepExportController;
   if (!controller) {
     return;
   }
-  activeParsedZipExportController = null;
+  activeHepExportController = null;
   controller.abort();
   isBatchExampleExportRunning = false;
   setParsingLoader(false);
@@ -1620,8 +1637,6 @@ function updateMetricsPanel(
   const fillPaths = scene.fillPathCount;
 
   const mergeReduction = sourceSegments > 0 ? (1 - mergedSegments / sourceSegments) * 100 : 0;
-  const cullReduction = mergedSegments > 0 ? (1 - visibleSegments / mergedSegments) * 100 : 0;
-  const totalReduction = sourceSegments > 0 ? (1 - visibleSegments / sourceSegments) * 100 : 0;
   const textureUtilization = computeTextureAreaUtilizationPercent(
     sceneStats.textureWidth,
     sceneStats.textureHeight,
@@ -1630,15 +1645,16 @@ function updateMetricsPanel(
   const rasterSummary = formatRasterLayerSummary(scene);
 
   metricFileTextElement.textContent = label;
-  metricOperatorsTextElement.textContent = scene.operatorCount.toLocaleString();
+  metricOperatorsTextElement.textContent = describeSceneOperatorCount(scene);
+  metricOperatorsTextElement.title = OPERATOR_COUNT_EXPLANATION;
   metricSourceSegmentsTextElement.textContent = sourceSegments.toLocaleString();
   metricMergedSegmentsTextElement.textContent = `${mergedSegments.toLocaleString()} (${formatPercent(mergeReduction)} reduction)`;
   metricVisibleSegmentsTextElement.textContent =
-    `${visibleSegments.toLocaleString()} (${formatPercent(totalReduction)} total reduction), fills ${fillPaths.toLocaleString()}, text ${scene.textInstanceCount.toLocaleString()} instances, pages ${scene.pageCount.toLocaleString()} (${scene.pagesPerRow.toLocaleString()}/row)`;
-  metricReductionsTextElement.textContent =
-    `merge ${formatPercent(mergeReduction)}, invisible-cull ${formatPercent(cullReduction)}, total ${formatPercent(totalReduction)}`;
-  metricCullDiscardsTextElement.textContent =
-    `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}, glyphs ${scene.textGlyphCount.toLocaleString()} / glyph segments ${scene.textGlyphSegmentCount.toLocaleString()}`;
+    `${visibleSegments.toLocaleString()}, fills ${fillPaths.toLocaleString()}, text ${scene.textInstanceCount.toLocaleString()} instances (${scene.textGlyphCount.toLocaleString()} glyphs / ${scene.textGlyphSegmentCount.toLocaleString()} glyph segments), pages ${scene.pageCount.toLocaleString()} (${scene.pagesPerRow.toLocaleString()}/row)`;
+  metricReductionsTextElement.textContent = formatSceneSegmentAccounting(scene);
+  metricCullDiscardsTextElement.textContent = getSceneSegmentAccounting(scene).culled === null
+    ? "Unavailable in this scene / HEP metadata"
+    : `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}`;
   const lodMs = lodTiming?.elapsedMs ?? 0;
   const lodSuffix = lodTiming && lodTiming.buildCount > 0
     ? `, vector lod ${lodMs.toFixed(0)} ms (${lodTiming.levelCount.toLocaleString()} levels)`
@@ -1728,12 +1744,9 @@ function logInvisibleCullStats(label: string, scene: VectorScene): void {
     return;
   }
 
-  const visible = scene.segmentCount;
-  const merged = scene.mergedSegmentCount;
-  const reduction = merged > 0 ? (1 - visible / merged) * 100 : 0;
-
   console.log(
-    `[Invisible cull] ${label}: ${visible.toLocaleString()} visible / ${merged.toLocaleString()} merged (${reduction.toFixed(1)}% reduction, transparent=${scene.discardedTransparentCount.toLocaleString()}, degenerate=${scene.discardedDegenerateCount.toLocaleString()}, duplicates=${scene.discardedDuplicateCount.toLocaleString()}, contained=${scene.discardedContainedCount.toLocaleString()})`
+    `[Stroke accounting] ${label}: ${formatSceneSegmentAccounting(scene)}; ` +
+    `${scene.segmentCount.toLocaleString()} emitted vector segments`
   );
 }
 

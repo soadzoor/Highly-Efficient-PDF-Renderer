@@ -7,6 +7,7 @@ export type PDFLoadStage =
   | "pdf-fast-check"
   | "pdf-fast-decode"
   | "pdf-operators"
+  | "pdf-optimize"
   | "pdf-text"
   | "pdf-raster"
   | "compile"
@@ -25,8 +26,7 @@ export type PDFLoadStage =
 export type PDFLoadExecutionPath =
   | "worker"
   | "dense-vector-worker"
-  | "main-thread"
-  | "main-thread-fallback";
+  | "main-thread";
 
 /**
  * Progress event emitted by HEPR loaders.
@@ -52,7 +52,7 @@ export interface PDFLoadProgress {
   sourceType?: "pdf" | "zip";
 
   /** Unit represented by `processed` and `total`, when available. */
-  unit?: "bytes" | "operators" | "files" | "pages" | "texels";
+  unit?: "bytes" | "operators" | "segments" | "files" | "pages" | "texels";
 
   /** Completed units for the current stage. */
   processed?: number;
@@ -203,7 +203,7 @@ export class LoadProgressReporter {
       stage: PDFLoadStage;
       executionPath?: PDFLoadExecutionPath;
       sourceType?: "pdf" | "zip";
-      unit?: "bytes" | "operators" | "files" | "pages" | "texels";
+      unit?: "bytes" | "operators" | "segments" | "files" | "pages" | "texels";
       processed?: number;
       total?: number;
       pageIndex?: number;
@@ -275,6 +275,8 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Decoding PDF vectors";
     case "pdf-operators":
       return "Scanning operators";
+    case "pdf-optimize":
+      return "Optimizing geometry";
     case "pdf-text":
       return "Extracting text";
     case "pdf-raster":

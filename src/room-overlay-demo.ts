@@ -1,7 +1,6 @@
 import * as THREE from "three";
+import { waitForLoad } from "./loadCancellation";
 import { MapControls } from "three/addons/controls/MapControls.js";
-import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import { pdfObjectGenerator, type HeprThreePdfObject, type PDFLoadProgress } from "./index";
 import { formatLoadProgressStage } from "./loadProgress";
@@ -94,10 +93,6 @@ interface ClassifiedRoomDemoFiles {
   error: string | null;
 }
 
-if (!GlobalWorkerOptions.workerSrc) {
-  GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-}
-
 const canvas = requireElement<HTMLCanvasElement>("#viewport");
 const loadFilesButton = requireElement<HTMLButtonElement>("#load-files");
 const detectRoomsButton = requireElement<HTMLButtonElement>("#detect-rooms");
@@ -163,6 +158,7 @@ let currentParsedTsv: ParsedRoomTsv | null = null;
 let currentGeneratedTsv: GeneratedRoomTsv | null = null;
 let currentPdfCoordinateTransform: PdfCoordinateTransform = createIdentityPdfCoordinateTransform();
 let loadToken = 0;
+let sourceLoadController: AbortController | null = null;
 let roomDetectionToken = 0;
 let animationFrameId = 0;
 let needsRender = false;
@@ -307,7 +303,7 @@ function classifyRoomDemoFiles(files: FileList | File[]): ClassifiedRoomDemoFile
   const supportedTsvFiles: File[] = [];
 
   for (const file of Array.from(files)) {
-    if (isPdfFile(file) || isZipFile(file)) {
+    if (isPdfFile(file) || isHepFile(file)) {
       supportedSourceFiles.push(file);
       continue;
     }
@@ -353,7 +349,7 @@ function isPdfFile(file: File): boolean {
   return file.type === "application/pdf" || lowerName.endsWith(".pdf");
 }
 
-function isZipFile(file: File): boolean {
+function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
@@ -412,9 +408,9 @@ async function loadExampleManifest(): Promise<void> {
             title: `Parse ${entry.name} from the original PDF`
           },
           {
-            key: `${entry.id}:zip`,
+            key: `${entry.id}:hep`,
             label: "HEP",
-            sizeLabel: formatFileSize(entry.zipSizeBytes),
+            sizeLabel: formatFileSize(entry.hepSizeBytes),
             title: `Load precomputed HEP data for ${entry.name}`
           }
         ]
@@ -431,19 +427,27 @@ async function loadExampleManifest(): Promise<void> {
 async function loadExampleSelection(selectionKey: string): Promise<void> {
   const separatorIndex = selectionKey.lastIndexOf(":");
   const entry = exampleEntryMap.get(selectionKey.slice(0, separatorIndex));
-  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "zip";
+  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "hep";
   if (!entry || isBusy) {
     return;
   }
 
+  const activeToken = ++loadToken;
+  sourceLoadController?.abort();
+  const controller = new AbortController();
+  sourceLoadController = controller;
+  setBusy(true);
   exampleDropdown.setDisabled(true);
   try {
     setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "HEP"})...`);
-    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.zipPath, { cache: "no-store" });
+    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.hepPath, {
+      cache: "no-store", signal: controller.signal
+    });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-    const bytes = await response.arrayBuffer();
+    const bytes = await waitForLoad(response.arrayBuffer(), controller.signal);
+    if (activeToken !== loadToken) return;
     const baseName = entry.name.replace(/\.pdf$/i, "");
     const file =
       kind === "pdf"
@@ -451,10 +455,16 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
         : new File([bytes], `${baseName}.hep`, { type: "application/zip" });
     await loadSceneSource(file);
   } catch (error) {
+    if (activeToken !== loadToken || controller.signal.aborted) return;
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load example ${entry.name}: ${message}`);
   } finally {
-    exampleDropdown.setDisabled(isBusy);
+    if (activeToken === loadToken) {
+      sourceLoadController = null;
+      setBusy(false);
+      syncControlsEnabled();
+    }
+    if (!isDisposed) exampleDropdown.setDisabled(isBusy);
   }
 }
 
@@ -472,17 +482,20 @@ function formatFileSize(sizeBytes: number): string {
 }
 
 async function loadSceneSource(file: File): Promise<boolean> {
-  const isZip = isZipFile(file);
+  const isHep = isHepFile(file);
   const activeToken = ++loadToken;
+  sourceLoadController?.abort();
+  const controller = new AbortController();
+  sourceLoadController = controller;
+  let pendingObject: HeprThreePdfObject | null = null;
   setBusy(true);
   setStatus(`Loading ${file.name}...`);
-  clearCurrentPdfObject();
-  setBusy(true);
 
   try {
     const pdfObject = await pdfObjectGenerator(
       file,
       {
+        signal: controller.signal,
         vectorLod: "auto",
         pageBackground: "#ffffff",
         pageBackgroundOpacity: 1,
@@ -491,23 +504,29 @@ async function loadSceneSource(file: File): Promise<boolean> {
       },
       "webgl"
     );
+    pendingObject = pdfObject;
 
     if (activeToken !== loadToken) {
       pdfObject.dispose();
+      pendingObject = null;
       return false;
     }
 
     // HEP files carry no source PDF to derive the TSV coordinate transform from;
     // identity matches the common case (origin-0, unrotated pages).
-    currentPdfCoordinateTransform = isZip
+    const coordinateTransform = isHep
       ? createIdentityPdfCoordinateTransform()
-      : await readFirstPageCoordinateTransform(file);
+      : await readFirstPageCoordinateTransform(file, controller.signal);
     if (activeToken !== loadToken) {
       pdfObject.dispose();
+      pendingObject = null;
       return false;
     }
 
+    clearCurrentPdfObject();
+    currentPdfCoordinateTransform = coordinateTransform;
     currentPdfObject = pdfObject;
+    pendingObject = null;
     currentGeneratedTsv = null;
     pdfObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
     scene.add(pdfObject);
@@ -520,10 +539,12 @@ async function loadSceneSource(file: File): Promise<boolean> {
       return false;
     }
     const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Failed to load ${isZip ? "HEP file" : "PDF"}: ${message}`);
+    setStatus(`Failed to load ${isHep ? "HEP file" : "PDF"}: ${message}`);
     return false;
   } finally {
+    pendingObject?.dispose();
     if (activeToken === loadToken) {
+      sourceLoadController = null;
       setBusy(false);
       syncControlsEnabled();
       requestRender();
@@ -1028,79 +1049,26 @@ function computeLocalPolygonCentroid(points: THREE.Vector2[]): THREE.Vector2 {
   return new THREE.Vector2(x / (3 * twiceArea), y / (3 * twiceArea));
 }
 
-async function readFirstPageCoordinateTransform(file: File): Promise<PdfCoordinateTransform> {
-  const loadingTask = getDocument({
-    data: new Uint8Array(await file.arrayBuffer())
-  });
+async function readFirstPageCoordinateTransform(file: File, signal?: AbortSignal): Promise<PdfCoordinateTransform> {
+  const { computePageGeometry, openPdf } = await import("./pdfSession");
+  const session = await openPdf({
+    kind: "blob",
+    blob: file,
+    label: file.name
+  }, { signal });
 
   try {
-    const pdfDocument = await loadingTask.promise;
-    const firstPage = await pdfDocument.getPage(1);
-    const pageLike = firstPage as {
-      rotate: number;
-      getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => {
-        transform: unknown;
-        height: number;
-      };
-    };
+    const firstPage = session.info.pages[0];
+    if (!firstPage) {
+      throw new Error("The PDF does not contain a first page.");
+    }
+    const { pageMatrix } = computePageGeometry(firstPage);
     return {
-      matrix: buildPageMatrix(pageLike)
+      matrix: [...pageMatrix]
     };
   } finally {
-    await loadingTask.destroy();
+    await session.close();
   }
-}
-
-function buildPageMatrix(page: {
-  rotate: number;
-  getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => {
-    transform: unknown;
-    height: number;
-  };
-}): Mat2D {
-  const rotation = normalizeRotationDegrees(page.rotate);
-  const viewport = page.getViewport({ scale: 1, rotation, dontFlip: false });
-  const transform = viewport.transform;
-
-  if (!Array.isArray(transform) || transform.length < 6) {
-    return createIdentityMatrix();
-  }
-
-  const pageMatrix: Mat2D = [
-    Number(transform[0]),
-    Number(transform[1]),
-    Number(transform[2]),
-    Number(transform[3]),
-    Number(transform[4]),
-    Number(transform[5])
-  ];
-
-  if (!pageMatrix.every(Number.isFinite)) {
-    return createIdentityMatrix();
-  }
-
-  const viewportHeight = Number(viewport.height);
-  if (!Number.isFinite(viewportHeight)) {
-    return pageMatrix;
-  }
-
-  return multiplyMatrices([1, 0, 0, -1, 0, viewportHeight], pageMatrix);
-}
-
-function normalizeRotationDegrees(rotation: number): number {
-  const normalized = ((Math.round(rotation / 90) * 90) % 360 + 360) % 360;
-  return normalized === 360 ? 0 : normalized;
-}
-
-function multiplyMatrices(left: Mat2D, right: Mat2D): Mat2D {
-  return [
-    left[0] * right[0] + left[2] * right[1],
-    left[1] * right[0] + left[3] * right[1],
-    left[0] * right[2] + left[2] * right[3],
-    left[1] * right[2] + left[3] * right[3],
-    left[0] * right[4] + left[2] * right[5] + left[4],
-    left[1] * right[4] + left[3] * right[5] + left[5]
-  ];
 }
 
 function applyMatrix(matrix: Mat2D, x: number, y: number): RoomPoint {
@@ -1552,6 +1520,8 @@ function disposeDemo(): void {
     return;
   }
   isDisposed = true;
+  loadToken += 1;
+  sourceLoadController?.abort();
   canvasResizeObserver.disconnect();
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);

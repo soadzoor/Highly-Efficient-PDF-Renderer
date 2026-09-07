@@ -38,18 +38,43 @@
       "types": "./dist/types/index.d.ts",
       "import": "./dist/lib/index.js",
       "default": "./dist/lib/index.js"
+    },
+    "./node": {
+      "types": "./dist/types/nodePdfSource.d.ts",
+      "import": "./dist/lib/node.js",
+      "default": "./dist/lib/node.js"
+    },
+    "./experimental/pdf-worker": {
+      "import": "./dist/lib/pdf-worker.js",
+      "default": "./dist/lib/pdf-worker.js"
+    },
+    "./experimental/dense-pdf-worker": {
+      "import": "./dist/lib/dense-pdf-worker.js",
+      "default": "./dist/lib/dense-pdf-worker.js"
     }
   },
   "files": [
     "dist/lib",
     "dist/types",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
+    "test": "npm run typecheck && npm run test:fast",
+    "typecheck": "tsc --noEmit",
+    "test:fast": "node scripts/run-tests.mjs fast",
+    "test:unit": "node scripts/run-tests.mjs unit",
+    "test:integration": "node scripts/run-tests.mjs integration",
+    "test:package": "node scripts/run-tests.mjs package",
+    "test:browser": "node scripts/run-tests.mjs browser",
+    "test:conversion": "node scripts/run-tests.mjs conversion",
+    "test:corpus": "node scripts/run-tests.mjs corpus",
+    "test:file": "node scripts/run-tests.mjs file",
+    "test:oracle": "npm --prefix oracle test",
     "dev": "vite",
-    "build": "tsc && vite build",
-    "build:lib": "tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:dense-pdf-package",
+    "build": "tsc && npm run test:file -- scripts/test-persistent-viewer-contract.mjs && vite build",
+    "build:lib": "npm run clean:lib && tsc -p tsconfig.lib.json && vite build --mode lib && npm run test:package",
     "build:all": "npm run build && npm run build:lib",
     "release-new-version": "npm run build:all && npm version patch && git push --follow-tags",
     "pack:local": "npm run build:lib && npm pack",
@@ -57,51 +82,39 @@
     "preview": "vite preview",
     "deploy": "npm run build && node scripts/deploy.mjs",
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
+    "regenerate:heps": "node PDFtoHEP.js --force --output-dir=public/examples/heps public/examples/pdfs && npm run generate-manifest",
     "benchmark:dense-pdf": "node --max-old-space-size=12288 --experimental-strip-types scripts/benchmark-dense-pdf.mjs",
     "benchmark:livermore-pdf": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-livermore-fast-path.mjs",
-    "test:example-assets": "node --experimental-strip-types scripts/test-example-assets.mjs",
-    "test:ordered-gradient": "node --experimental-strip-types scripts/test-ordered-gradient-paint.mjs",
-    "test:pdf-cancel": "node scripts/test-pdf-source-cancellation.mjs",
-    "test:pdf-operators": "node --experimental-strip-types scripts/test-pdf-operator-loading.mjs",
-    "test:dense-pdf-content": "node --experimental-strip-types scripts/test-dense-pdf-content-compiler.mjs",
-    "test:dense-pdf-document": "node --experimental-strip-types scripts/test-dense-pdf-document.mjs",
-    "test:dense-pdf-worker": "node --experimental-strip-types scripts/test-dense-pdf-fast-worker.mjs",
-    "test:dense-pdf-integration": "node --experimental-strip-types scripts/test-dense-pdf-integration.mjs",
-    "test:dense-pdf-package": "node scripts/test-dense-pdf-package.mjs",
-    "test:pdf-fast-progress": "node --experimental-strip-types scripts/test-pdf-fast-progress.mjs",
-    "test:pdf-to-hep-cli": "node scripts/test-pdf-to-hep-cli.mjs",
-    "test:pdf-to-hep-node-worker": "node scripts/test-pdf-to-hep-node-dense-worker.mjs",
-    "test:raster-archive": "node scripts/test-raster-image-zip.mjs",
-    "test:raster-ownership": "node scripts/test-raster-texture-ownership.mjs",
-    "test:text-search": "node scripts/test-text-search.mjs",
-    "test:text-glyph-coverage": "node scripts/test-text-glyph-coverage.mjs",
-    "test:text-lod-core": "node --experimental-strip-types scripts/test-text-lod-core.mjs",
-    "test:text-lod-native": "node --experimental-strip-types scripts/test-native-text-lod.mjs",
-    "test:text-lod-three": "node scripts/test-three-text-lod.mjs",
-    "test:deferred-renderer": "node --experimental-strip-types scripts/test-deferred-renderer-api.mjs",
-    "test:three-color": "node scripts/test-three-color-parity.mjs",
-    "test:three-performance": "node scripts/test-three-instance-buffer-updates.mjs",
-    "test:parsed-zip": "node scripts/test-parsed-data-zip.mjs",
-    "test:parsed-zip:package": "npm run build:lib && node scripts/test-parsed-data-zip-package.mjs",
-    "test:rooms": "node scripts/test-room-detector.mjs",
+    "benchmark:native-vector-page": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-native-vector-page.mjs",
+    "benchmark:native-dense-cutover": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-native-dense-cutover.mjs",
+    "benchmark:production-parser": "node --max-old-space-size=12288 --expose-gc scripts/benchmark-production-parser.mjs",
     "score:rooms": "node scripts/score-rooms.mjs",
     "audit:rooms": "node scripts/audit-room-topology.mjs",
     "gold:rooms": "node scripts/room-gold-set.mjs",
-    "prepublishOnly": "npm run build:all"
-  },
-  "peerDependencies": {
-    "three": ">=0.170.0"
+    "prepublishOnly": "npm test && npm run build:all",
+    "clean:lib": "node scripts/clean-lib-output.mjs",
+    "oracle:validate": "npm --prefix oracle run validate",
+    "oracle:compare": "npm --prefix oracle run compare --",
+    "oracle:compare:hepr": "npm --prefix oracle run compare:hepr --",
+    "oracle:write": "npm --prefix oracle run write --"
   },
   "dependencies": {
-    "@napi-rs/canvas": "1.0.6",
-    "jszip": "3.10.1",
-    "pdf-lib": "1.17.1",
-    "pdfjs-dist": "6.1.200"
+    "jszip": "3.10.1"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "1.0.8",
     "@types/three": "0.185.1",
     "three": "0.185.1",
     "typescript": "7.0.2",
     "vite": "8.1.4"
+  },
+  "peerDependencies": {
+    "@napi-rs/canvas": ">=1.0.8",
+    "three": ">=0.170.0"
+  },
+  "peerDependenciesMeta": {
+    "@napi-rs/canvas": {
+      "optional": true
+    }
   }
 }

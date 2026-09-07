@@ -73,6 +73,24 @@ async function testChunkBoundaryLexer() {
   assert.equal(actual.operatorCount, 1);
   assert.equal(actual.pathCount, 1);
   assert.equal(actual.sourceSegmentCount, 1);
+
+  // A retained statement must observe the logical operand count rather than
+  // stale slots left by an earlier, wider operator in the reusable stack.
+  const reusedOperandStack = await compile(
+    "q 1 0 0 1 2 3 cm BT /F1 12 Tf (x) Tj ET Q"
+  );
+  assert.equal(
+    decoder.decode(reusedOperandStack.retainedTextContent),
+    "q\n1 0 0 1 2 3 cm\nBT\n/F1 12 Tf\n<78> Tj\nET\nQ\n"
+  );
+
+  for (const malformed of ["+ m", ". m", "1e2 0 m", "1..2 0 m"]) {
+    const malformedBytes = encoder.encode(malformed);
+    await assert.rejects(
+      compile(delayedChunks(malformedBytes, 1)),
+      (error) => error instanceof DensePdfSyntaxError
+    );
+  }
 }
 
 async function testPathsTransformsAndCurves() {
@@ -618,11 +636,28 @@ async function testCancellationAndProgress() {
   assert.equal(scene.segmentCount, 24_000);
   assert.ok(progress.filter(({ phase }) => phase === "scanning").length >= 3);
   assert.ok(progress.filter(({ phase }) => phase === "finalizing").length >= 2);
+  assert.deepEqual(
+    uniqueFinalizationStages(progress),
+    ["prepare", "copy", "bounds", "complete"]
+  );
+  assertValidFinalizationProgress(progress);
   for (let index = 1; index < progress.length; index += 1) {
     assert.ok(progress[index].processedBytes >= progress[index - 1].processedBytes);
     assert.ok(progress[index].operatorCount >= progress[index - 1].operatorCount);
     assert.ok(progress[index].at - progress[index - 1].at < 200);
   }
+
+  const cullProgress = [];
+  const culled = await compile(
+    "2 w 0 0 m 20 0 l S 1 w 5 0 m 15 0 l S",
+    { onProgress: (event) => cullProgress.push(event) }
+  );
+  assert.equal(culled.discardedContainedCount, 1);
+  assert.deepEqual(
+    uniqueFinalizationStages(cullProgress),
+    ["prepare", "index", "cull", "compact", "complete"]
+  );
+  assertValidFinalizationProgress(cullProgress);
 
   const midAbort = new AbortController();
   await assert.rejects(
@@ -636,6 +671,28 @@ async function testCancellationAndProgress() {
     }),
     { name: "AbortError" }
   );
+}
+
+function uniqueFinalizationStages(progress) {
+  return [...new Set(progress
+    .map(({ finalization }) => finalization?.stage)
+    .filter(Boolean))];
+}
+
+function assertValidFinalizationProgress(progress) {
+  const completedByStage = new Map();
+  for (const { finalization } of progress) {
+    if (!finalization) continue;
+    assert.ok(Number.isFinite(finalization.completed));
+    assert.ok(Number.isFinite(finalization.total) && finalization.total > 0);
+    assert.ok(finalization.completed >= 0 && finalization.completed <= finalization.total);
+    const previous = completedByStage.get(finalization.stage) ?? 0;
+    assert.ok(
+      finalization.completed >= previous,
+      `${finalization.stage} finalization progress must be monotonic`
+    );
+    completedByStage.set(finalization.stage, finalization.completed);
+  }
 }
 
 async function testMergeCullAndFillBoundaries() {
@@ -656,17 +713,66 @@ async function testMergeCullAndFillBoundaries() {
   assert.equal(contained.discardedContainedCount, 1);
   assert.equal(contained.segmentCount, 1);
 
+  const transferDescriptor = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    "transferToFixedLength"
+  );
+  if (transferDescriptor?.configurable) {
+    Object.defineProperty(ArrayBuffer.prototype, "transferToFixedLength", {
+      ...transferDescriptor,
+      value: undefined
+    });
+    try {
+      const fallbackCompaction = await compile(
+        "2 w 0 0 m 20 0 l S 1 w 5 0 m 15 0 l S"
+      );
+      assertSceneGeometryEqual(fallbackCompaction, contained);
+      assert.equal(fallbackCompaction.endpoints.buffer.detached, false);
+    } finally {
+      Object.defineProperty(
+        ArrayBuffer.prototype,
+        "transferToFixedLength",
+        transferDescriptor
+      );
+    }
+  }
+
+  const reversedRepresentative = await compile(
+    "2 w 20 0 m 0 0 l S 1 w 5 0 m 15 0 l S"
+  );
+  assert.equal(
+    reversedRepresentative.discardedContainedCount,
+    1,
+    "coverage-key recomputation must preserve canonical reversed-line grouping"
+  );
+  assert.equal(reversedRepresentative.segmentCount, 1);
+
   const fills = await compile(
     "0 0 10 10 re 20 20 5 5 re f 40 40 10 10 re 42 42 2 2 re f*"
   );
   assert.equal(fills.fillPathCount, 2);
   assert.equal(fills.fillSegmentCount, 16);
+
+  // Cross the initially reserved 65,536 group-tail slots. Every y offset is
+  // a distinct coverage group, exercising dynamic growth without changing
+  // insertion order or singleton handling.
+  const distinctGroups = 65_537;
+  const groupCommands = new Array(distinctGroups);
+  for (let index = 0; index < distinctGroups; index += 1) {
+    groupCommands[index] = `0 ${index} m 1 ${index} l S`;
+  }
+  const grownGroups = await compile(groupCommands.join("\n"), {
+    pageBounds: { minX: -1, minY: -1, maxX: 2, maxY: distinctGroups + 1 },
+    enableSegmentMerge: false
+  });
+  assert.equal(grownGroups.segmentCount, distinctGroups);
+  assert.equal(grownGroups.discardedContainedCount, 0);
 }
 
 async function testLosslessExtremeCoordinateKeys() {
   // These two y coordinates produced the same wrapped Int32 tuple at both the
-  // duplicate (x1000) and coverage-offset (x200) scales. Float64 key storage
-  // must keep the physically distant lines distinct.
+  // duplicate (x1000) and coverage-offset (x200) scales. Recomputing the exact
+  // Float64 tuple from a representative segment must keep them distinct.
   const scene = await compile(
     "0 -0.48 m 10 -0.48 l S 0 21474836 m 10 21474836 l S",
     {

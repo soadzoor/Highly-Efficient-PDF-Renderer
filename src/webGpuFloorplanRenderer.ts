@@ -617,6 +617,8 @@ struct VsOut {
   @location(4) @interpolate(flat) colorAlpha : f32,
   @location(5) @interpolate(flat) rasterRect : vec4f,
   @location(6) normCoord : vec2f,
+  @location(7) world : vec2f,
+  @location(8) @interpolate(flat) clipRect : vec4f,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
@@ -846,6 +848,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.colorAlpha = 0.0;
     out.rasterRect = vec4f(0.0, 0.0, 0.0, 0.0);
     out.normCoord = vec2f(0.0, 0.0);
+    out.world = vec2f(0.0, 0.0);
+    out.clipRect = vec4f(0.0, 0.0, 0.0, 0.0);
     return out;
   }
 
@@ -858,6 +862,15 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
     instanceA.y * local.x + instanceA.w * local.y + instanceB.y
   );
+  let clipRef = i32(instanceB.w + 0.5);
+  out.clipRect = vec4f(0.0, 0.0, 0.0, 0.0);
+  if (clipRef > 0) {
+    out.clipRect = textureLoad(
+      uTextGlyphMetaTexA,
+      coordFromIndex(clipRef - 1, i32(glyphMetaDims.x)),
+      0
+    );
+  }
 
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
@@ -870,11 +883,17 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.colorAlpha = instanceC.w;
   out.rasterRect = glyphRasterMeta;
   out.normCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2f(1e-6, 1e-6)), vec2f(0.0), vec2f(1.0));
+  out.world = world;
   return out;
 }
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
+  if (inData.clipRect.z > inData.clipRect.x && inData.clipRect.w > inData.clipRect.y &&
+      (inData.world.x < inData.clipRect.x || inData.world.y < inData.clipRect.y ||
+       inData.world.x > inData.clipRect.z || inData.world.y > inData.clipRect.w)) {
+    discard;
+  }
   let localDx = dpdx(inData.local);
   let localDy = dpdy(inData.local);
   let pixelToLocalX = length(vec2f(localDx.x, localDy.x));
@@ -2504,7 +2523,11 @@ export class WebGpuFloorplanRenderer {
       textLodUploadData?.combinedInstanceCount ?? scene.textInstanceCount,
       maxTextureSize
     );
-    let textGlyphDims = chooseTextureDimensions(scene.textGlyphCount + (textLodUploadData ? 1 : 0), maxTextureSize);
+    const textClipRectCount = Math.floor((scene.textClipRects?.length ?? 0) / 4);
+    let textGlyphDims = chooseTextureDimensions(
+      scene.textGlyphCount + (textLodUploadData ? 1 : 0) + textClipRectCount,
+      maxTextureSize
+    );
     let textSegmentDims = chooseTextureDimensions(
       scene.textGlyphSegmentCount + (textLodUploadData ? TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT : 0),
       maxTextureSize
@@ -2528,7 +2551,7 @@ export class WebGpuFloorplanRenderer {
       this.textLodGpuActive = false;
       textLodUploadData = null;
       textInstanceDims = chooseTextureDimensions(scene.textInstanceCount, maxTextureSize);
-      textGlyphDims = chooseTextureDimensions(scene.textGlyphCount, maxTextureSize);
+      textGlyphDims = chooseTextureDimensions(scene.textGlyphCount + textClipRectCount, maxTextureSize);
       textSegmentDims = chooseTextureDimensions(scene.textGlyphSegmentCount, maxTextureSize);
       textCpuPayload = prepareNativeTextUploadArrays(
         scene,
@@ -5330,6 +5353,16 @@ function prepareNativeTextUploadArrays(
     arrays.textGlyphMetaB.set(scene.textGlyphMetaB);
     arrays.textGlyphSegmentsA.set(scene.textGlyphSegmentsA);
     arrays.textGlyphSegmentsB.set(scene.textGlyphSegmentsB);
+  }
+  const clipRectCount = Math.floor((scene.textClipRects?.length ?? 0) / 4);
+  if (clipRectCount > 0) {
+    const clipMetaOffset = scene.textGlyphCount + (textLodData ? 1 : 0);
+    arrays.textGlyphMetaA.set(scene.textClipRects!, clipMetaOffset * 4);
+    for (let instance = 0; instance < scene.textInstanceCount; instance += 1) {
+      const offset = instance * 4 + 3;
+      const reference = arrays.textInstanceB[offset];
+      if (reference > 0) arrays.textInstanceB[offset] = clipMetaOffset + reference;
+    }
   }
   return arrays;
 }

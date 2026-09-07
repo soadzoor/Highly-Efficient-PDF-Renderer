@@ -1,0 +1,41 @@
+{
+  "sourceSha256": "732a0c9ed7f79ef3033a18fc3b3e08a36210c20f1da3d4c11b343a71abb36756",
+  "sourcePageIndex": 4,
+  "paintHash": "a1fc7cafbba1ed9c28f54c292fdd761fdc5ca63dd3df32d3133b4c56d6cffee6",
+  "paintAndTextHash": "7b289f3ffb2f38f560e7552956bc0ebc78455d17d82f51391e9cea5a36f58e10",
+  "textSha256": "1e7552a3de7f0600d7a965bc054d2ee41d047f24d04d72d9bb6fadd51c559be6",
+  "imageLayers": [
+    { "width": 902, "height": 424, "matrix": [601.3333129882812, 0, 0, -282.6666564941406, 589.3333129882812, 771.8900146484375], "paintOrder": 19, "rgbaSha256": "a150b7f5baea4b1f55c2abef09aca1836d8482744ece467b15aca37878a67b1b" },
+    { "width": 399, "height": 56, "matrix": [266, 0, 0, -37.33333206176758, 612.6666870117188, 382.5566711425781], "paintOrder": 83, "rgbaSha256": "dd53aae7fb2fd91d5d926769c44abd104b7db1cf1bc83a9057b142bab52a6080" },
+    { "width": 588, "height": 345, "matrix": [392, 0, 0, -230, 785.3333129882812, 597.8900146484375], "paintOrder": 98, "rgbaSha256": "e0a88665b883a63f21f993a25739e36da8c830fe7f1a8551751e70b8235b771b" },
+    { "width": 427, "height": 102, "matrix": [284.6666564941406, 0, 0, -68, 892, 399.22332763671875], "paintOrder": 122, "rgbaSha256": "6205a0200c8e83ea457c54e5ebfe81c29839f388fb04d2d6743d725c6f42e797" },
+    { "width": 52, "height": 27, "matrix": [34.66666793823242, 0, 0, -18, 907.3333129882812, 303.8900146484375], "paintOrder": 128, "rgbaSha256": "95803a2a49fa2ee4379dd2dc3af27c2981773969556fc76df98a861bed2cbce2" },
+    { "width": 391, "height": 255, "matrix": [260.6666564941406, 0, 0, -170, 806.6666870117188, 402.5566711425781], "paintOrder": 144, "rgbaSha256": "aaf73dc16625f3250cc20b36f5cec077c6c703a2666153ad24b969465d58a2ae" },
+    { "width": 553, "height": 474, "matrix": [368.6666564941406, 0, 0, -316, 797.3333129882812, 583.8900146484375], "paintOrder": 254, "rgbaSha256": "0faba7696ad1202b0513a4dd09c41f24e6b9f3ca1b1aa066f2a98902e6ea64df" },
+    { "width": 122, "height": 136, "matrix": [81.33333587646484, 0, 0, -90.66666412353516, 607.3333129882812, 442.5566711425781], "paintOrder": 264, "rgbaSha256": "5267c73d0d632e8de0b01fb0286317908c62665e2fed968fd44f82ba9efed492" },
+    { "width": 156, "height": 9, "matrix": [104, 0, 0, -6, 607.3333129882812, 444.5566711425781], "paintOrder": 266, "rgbaSha256": "a302ee8d9c9408a75c627553ae6e6986f157d6b2279dafb4e07ccd03debd067e" },
+    { "width": 278, "height": 25, "matrix": [185.3333282470703, 0, 0, -16.66666603088379, 607.3333129882812, 446.5566711425781], "paintOrder": 268, "rgbaSha256": "784c093e06132b9f986e2ba0489b22ffad37a0bcd7e31fa4a3b8a0d197f59809" },
+    { "width": 600, "height": 299, "matrix": [400, 0, 0, -199.3333282470703, 684.6666870117188, 513.2233276367188], "paintOrder": 302, "rgbaSha256": "39f82e8ab4e779a06d47fee757aa2423e644cac97eaab79d1d05b255c0830ccd" }
+  ],
+  "accounting": { "mergedAway": 24, "culled": 6, "imageLayers": 0 },
+  "diagramMatches": [
+    { "query": "SolvisLeo", "pageIndex": 0, "startChar": 351, "length": 9,
+      "bounds": { "minX": 725.3405395507813, "minY": 314.35435791015624, "maxX": 768.831640625, "maxY": 323.6238525390625 },
+      "highlightBounds": [{ "minX": 725.3405395507813, "minY": 314.35435791015624, "maxX": 768.831640625, "maxY": 323.6238525390625 }] },
+    { "query": "Wechselrichter", "pageIndex": 0, "startChar": 363, "length": 14,
+      "bounds": { "minX": 725.2304931640625, "minY": 292.70164794921874, "maxX": 795.12607421875, "maxY": 301.9546325683594 },
+      "highlightBounds": [{ "minX": 725.2304931640625, "minY": 292.70164794921874, "maxX": 795.12607421875, "maxY": 301.9546325683594 }] },
+    { "query": "Batteriespeicher", "pageIndex": 0, "startChar": 380, "length": 16,
+      "bounds": { "minX": 725.7025250244141, "minY": 269.259267578125, "maxX": 803.5233660888672, "maxY": 280.2872106933594 },
+      "highlightBounds": [{ "minX": 725.7025250244141, "minY": 269.259267578125, "maxX": 803.5233660888672, "maxY": 280.2872106933594 }] },
+    { "query": "Wärmepumpe", "pageIndex": 0, "startChar": 399, "length": 10,
+      "bounds": { "minX": 725.2268630981446, "minY": 247.58479919433594, "maxX": 790.6053512573242, "maxY": 258.5683074951172 },
+      "highlightBounds": [{ "minX": 725.2268630981446, "minY": 247.58479919433594, "maxX": 790.6053512573242, "maxY": 258.5683074951172 }] },
+    { "query": "Wallbox", "pageIndex": 0, "startChar": 412, "length": 7,
+      "bounds": { "minX": 725.2281832885742, "minY": 227.6726446533203, "maxX": 761.5310330200195, "maxY": 236.87436767578126 },
+      "highlightBounds": [{ "minX": 725.2281832885742, "minY": 227.6726446533203, "maxX": 761.5310330200195, "maxY": 236.87436767578126 }] },
+    { "query": "Photovoltaik", "pageIndex": 0, "startChar": 422, "length": 12,
+      "bounds": { "minX": 725.703515625, "minY": 206.00796813964843, "maxX": 785.1457885742187, "maxY": 215.27744750976564 },
+      "highlightBounds": [{ "minX": 725.703515625, "minY": 206.00796813964843, "maxX": 785.1457885742187, "maxY": 215.27744750976564 }] }
+  ]
+}

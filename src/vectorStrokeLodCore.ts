@@ -182,7 +182,7 @@ interface StrokePrimitive {
   colorR: number;
   colorG: number;
   colorB: number;
-  /** Clip-intersected bounds; only set for primitives carrying the clipped flag. */
+  /** Exact fragment clip; only set for primitives carrying the clipped flag. */
   visibleBounds?: Bounds;
 }
 
@@ -1681,7 +1681,14 @@ function resolveIntervalGroup(
     `${Math.round(primitive.colorR * 255)},${Math.round(primitive.colorG * 255)},` +
     `${Math.round(primitive.colorB * 255)},${Math.round(primitive.alpha * 255)}`;
   const flags = primitive.flags & (STROKE_STYLE_FLAG_HAIRLINE | STROKE_STYLE_FLAG_ROUND_CAP | STROKE_STYLE_FLAG_CLIPPED);
-  const key = `${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
+  // A clipped primitive's bounds are semantic fragment-clip data, not merely
+  // culling bounds. Keep distinct rectangles in distinct merge groups so an
+  // approximate LOD level cannot replace their intersection with a union.
+  const clip = primitive.visibleBounds;
+  const baseKey = `${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
+  const key = clip
+    ? `${baseKey}|clip:${clip.minX},${clip.minY},${clip.maxX},${clip.maxY}`
+    : baseKey;
 
   let group = groups.get(key);
   if (!group) {
@@ -1717,11 +1724,9 @@ function resolveIntervalGroup(
   group.offsetSum += offset * memberWeight;
   group.offsetWeightSum += memberWeight;
 
-  // Clipped groups keep the union of their members' clip rects so merged
-  // strokes can still be clip-discarded at render time. The union may span
-  // multiple clip regions merged into one group; any resulting bleed is
-  // bounded by the interval trim extension, i.e. the level's error budget.
-  const clip = primitive.visibleBounds;
+  // The exact clip rectangle is part of the group key above. Repeating these
+  // min/max operations is harmless for same-rectangle members and avoids a
+  // second initialization branch without ever widening across clip regions.
   if (clip) {
     group.clipMinX = Math.min(group.clipMinX, clip.minX);
     group.clipMinY = Math.min(group.clipMinY, clip.minY);

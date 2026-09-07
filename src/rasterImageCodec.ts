@@ -1,3 +1,5 @@
+import { loadNodeCanvas } from "./nodeCanvas";
+
 export type RasterImageEncoding = "webp" | "png";
 export type DecodableRasterImageEncoding = RasterImageEncoding | "jpeg";
 
@@ -44,6 +46,8 @@ interface NodeRasterImageCodec {
 }
 
 let cachedNodeRasterImageCodec: NodeRasterImageCodec | null | undefined;
+let nodeRasterImageCodecError: unknown;
+let warnedAboutNodeRasterFallback = false;
 
 /**
  * Encode straight-alpha RGBA8 as the smallest supported browser image.
@@ -89,6 +93,9 @@ export async function decodeRasterImageToRgba(
   if (typeof document === "undefined") {
     const codec = await getNodeRasterImageCodec();
     if (!codec?.loadImage) {
+      // Encoding can fall back to RGBA, but reading an encoded HEP image needs
+      // a decoder. Preserve the backend's actionable installation error.
+      if (nodeRasterImageCodecError) throw nodeRasterImageCodecError;
       return null;
     }
     try {
@@ -437,6 +444,14 @@ async function encodeRasterRgbaAsNodeImage(
 ): Promise<Uint8Array | null> {
   const codec = await getNodeRasterImageCodec();
   if (!codec) {
+    if (nodeRasterImageCodecError && !warnedAboutNodeRasterFallback) {
+      warnedAboutNodeRasterFallback = true;
+      console.warn(
+        '[HEPR] WARNING: The optional @napi-rs/canvas backend is unavailable. ' +
+        "Storing raster images as raw RGBA instead of WebP/PNG can make generated HEP files much larger. " +
+        'Install it with "npm install @napi-rs/canvas" and regenerate the HEP files.'
+      );
+    }
     return null;
   }
 
@@ -471,12 +486,8 @@ async function getNodeRasterImageCodec(): Promise<NodeRasterImageCodec | null> {
   }
 
   try {
-    const moduleName = "@napi-rs/canvas";
-    const mod = await import(
-      /* @vite-ignore */
-      moduleName
-    ) as { createCanvas?: unknown; ImageData?: unknown; loadImage?: unknown };
-    if (typeof mod.createCanvas !== "function" || typeof mod.ImageData !== "function") {
+    const mod = loadNodeCanvas() as { createCanvas?: unknown; ImageData?: unknown; loadImage?: unknown } | null;
+    if (typeof mod?.createCanvas !== "function" || typeof mod?.ImageData !== "function") {
       cachedNodeRasterImageCodec = null;
       return null;
     }
@@ -489,7 +500,8 @@ async function getNodeRasterImageCodec(): Promise<NodeRasterImageCodec | null> {
         : undefined
     };
     return cachedNodeRasterImageCodec;
-  } catch {
+  } catch (cause) {
+    nodeRasterImageCodecError = cause;
     cachedNodeRasterImageCodec = null;
     return null;
   }

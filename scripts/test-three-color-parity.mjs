@@ -14,6 +14,10 @@ const sourcePaths = {
   fill: "src/threeWebGpuFillMaterial.ts",
   stroke: "src/threeWebGpuStrokeMaterial.ts",
   text: "src/threeWebGpuTextMaterial.ts",
+  textLayer: "src/threeMaterialTextLayer.ts",
+  strokeLayer: "src/threeMaterialStrokeLayer.ts",
+  directWebGl: "src/webGlFloorplanRenderer.ts",
+  directWebGpu: "src/webGpuFloorplanRenderer.ts",
   gradient: "src/threeWebGpuGradientMaterial.ts"
 };
 
@@ -29,6 +33,8 @@ const sources = Object.fromEntries(
 assertThreeExampleContract(sources.example);
 assertColorHelperVariants(sources.colorSpace);
 assertWebGpuMaterialFamilies(sources);
+assertTextClipPaths(sources);
+assertStrokeClipPaths(sources);
 assertThreeObjectContract(sources.object);
 assertBlendReferenceMath();
 
@@ -108,6 +114,31 @@ function assertBackendConfiguration(factory, configuration, backend, expectedCol
     backendIndex >= 0 && colorSpaceIndex >= 0,
     `${backend} renderer configuration must pair its backend with ${expectedColorSpace}`
   );
+}
+
+function assertTextClipPaths(sourceMap) {
+  assert.match(sourceMap.directWebGl, /vWorld\.x < vClipRect\.x/);
+  assert.match(sourceMap.directWebGpu, /inData\.world\.x < inData\.clipRect\.x/);
+  assert.match(sourceMap.text, /world\.x < clipRect\.x/);
+  assert.match(sourceMap.textLayer, /textClipRects/);
+  for (const name of ["directWebGl", "directWebGpu", "text"]) {
+    assert.match(
+      sourceMap[name],
+      /clipRef|clipReference/,
+      `${name} must gate page-space clipping with an optional instance reference`
+    );
+  }
+}
+
+function assertStrokeClipPaths(sourceMap) {
+  assert.match(sourceMap.directWebGl, /vHasClipBounds\s*>=\s*0\.5/);
+  assert.match(sourceMap.directWebGl, /vLocal\.x\s*<\s*vClipBounds\.x/);
+  assert.match(sourceMap.directWebGpu, /inData\.hasClipBounds\s*>=\s*0\.5/);
+  assert.match(sourceMap.directWebGpu, /inData\.local\.x\s*<\s*inData\.clipBounds\.x/);
+  assert.match(sourceMap.stroke, /hasClipBounds\s*&&/);
+  assert.match(sourceMap.stroke, /local\.x\s*<\s*primitiveBounds\.x/);
+  assert.match(sourceMap.strokeLayer, /CORE_STROKE_FRAGMENT_SHADER_SOURCE/);
+  assert.match(sourceMap.strokeLayer, /CORE_STROKE_VERTEX_SHADER_SOURCE/);
 }
 
 function assertColorHelperVariants(source) {

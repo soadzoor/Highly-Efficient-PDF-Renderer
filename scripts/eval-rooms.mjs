@@ -50,7 +50,7 @@ function parseArgs(argv) {
     png: false,
     fromPdf: false,
     pdfPath: null,
-    zipPath: null,
+    hepPath: null,
     jobs: 1,
     shard: null,
     score: false,
@@ -74,7 +74,7 @@ function parseArgs(argv) {
       args.pdfPath = argv[++i];
       args.fromPdf = true;
     } else if (value === "--hep" || value === "--zip") {
-      args.zipPath = argv[++i];
+      args.hepPath = argv[++i];
     } else if (value === "--jobs") {
       args.jobs = Math.max(1, Number(argv[++i]) || 1);
     } else if (value === "--shard") {
@@ -103,11 +103,11 @@ async function readJsonGz(filePath) {
 }
 
 async function listEntries(args) {
-  if (args.zipPath) {
-    const zipPath = path.resolve(repoRootDir, args.zipPath);
+  if (args.hepPath) {
+    const hepPath = path.resolve(repoRootDir, args.hepPath);
     const parsedSuffix = /-parsed-data$/i;
-    const stem = path.basename(zipPath, path.extname(zipPath)).replace(parsedSuffix, "");
-    return [{ folder: "standalone", stem, zipPath }];
+    const stem = path.basename(hepPath, path.extname(hepPath)).replace(parsedSuffix, "");
+    return [{ folder: "standalone", stem, hepPath }];
   }
   if (args.pdfPath) {
     const pdfPath = path.resolve(repoRootDir, args.pdfPath);
@@ -295,18 +295,18 @@ async function runShard(args, entries) {
     const { detectRooms } = detectorModule;
     const png = args.png ? await import("./lib/roomEvalPng.mjs") : null;
     const extractorModule = args.fromPdf ? await viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts") : null;
-    if (args.zipPath && typeof globalThis.window === "undefined") {
+    if (args.hepPath && typeof globalThis.window === "undefined") {
       globalThis.window = { location: { href: "http://localhost/" } };
     }
-    const parsedDataModule = args.zipPath ? await viteServer.ssrLoadModule("/src/parsedDataZip.ts") : null;
+    const parsedDataModule = args.hepPath ? await viteServer.ssrLoadModule("/src/hep.ts") : null;
 
     for (const [index, entry] of entries.entries()) {
       const key = `${entry.folder}/${entry.stem}`;
       try {
         let scene;
         let sceneMatrix = null;
-        if (entry.zipPath) {
-          const bytes = await fs.readFile(entry.zipPath);
+        if (entry.hepPath) {
+          const bytes = await fs.readFile(entry.hepPath);
           const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
           scene = await parsedDataModule.loadSceneFromParsedDataZip(buffer);
         } else if (args.fromPdf) {
@@ -376,7 +376,7 @@ function forkShard(args, shardIndex) {
       ...(Object.keys(args.opts).length > 0 ? ["--opts", JSON.stringify(args.opts)] : []),
       ...(args.png ? ["--png"] : []),
       ...(args.pdfPath ? ["--pdf", args.pdfPath] : []),
-      ...(args.zipPath ? ["--hep", args.zipPath] : []),
+      ...(args.hepPath ? ["--hep", args.hepPath] : []),
       ...(args.fromPdf ? ["--from-pdf"] : [])
     ];
     const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...forwarded], { stdio: "inherit" });
@@ -413,7 +413,7 @@ async function main() {
   if (entries.length === 0) {
     throw new Error(`No entries match (split=${args.split}${args.filter ? `, filter=${args.filter}` : ""})`);
   }
-  console.log(JSON.stringify({ event: "eval_config", run: args.run, entries: entries.length, split: args.split, opts: args.opts, png: args.png, fromPdf: args.fromPdf, pdf: args.pdfPath, zip: args.zipPath, jobs: args.jobs }));
+  console.log(JSON.stringify({ event: "eval_config", run: args.run, entries: entries.length, split: args.split, opts: args.opts, png: args.png, fromPdf: args.fromPdf, pdf: args.pdfPath, hep: args.hepPath, jobs: args.jobs }));
 
   if (args.jobs > 1) {
     await Promise.all(Array.from({ length: args.jobs }, (_, index) => forkShard(args, index)));

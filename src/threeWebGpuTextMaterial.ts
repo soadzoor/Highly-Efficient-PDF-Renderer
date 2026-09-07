@@ -67,6 +67,14 @@ fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
 }
 `);
 
+const clipCoordFromReferenceFn = TSL.wgslFn(`
+fn heprClipCoordFromReference(reference: f32, width: f32) -> vec2<i32> {
+  let itemIndex = max(i32(reference + 0.5) - 1, 0);
+  let safeWidth = max(i32(width), 1);
+  return vec2<i32>(itemIndex % safeWidth, itemIndex / safeWidth);
+}
+`);
+
 const textVertexPackFn = TSL.wgslFn(`
 fn heprTextVertexPack(
   corner: vec2<f32>,
@@ -304,6 +312,9 @@ fn heprQuadraticWindingDelta(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f
 const textFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprTextFragment(
   local: vec2<f32>,
+  world: vec2<f32>,
+  clipReference: f32,
+  clipRect: vec4<f32>,
   glyphMetaA: vec4<f32>,
   instanceColor: vec4<f32>,
   normCoord: vec2<f32>,
@@ -320,6 +331,11 @@ fn heprTextFragment(
   textCurveEnabled: f32,
   vectorOverride: vec4<f32>
 ) -> vec4<f32> {
+  if (clipReference > 0.0 &&
+      (world.x < clipRect.x || world.y < clipRect.y ||
+       world.x > clipRect.z || world.y > clipRect.w)) {
+    discard;
+  }
   let localDx = dpdx(local);
   let localDy = dpdy(local);
   let pixelToLocalX = length(vec2<f32>(localDx.x, localDy.x));
@@ -585,6 +601,11 @@ export function createThreeWebGpuTextMaterial(
     glyphMetaB
   }));
   const vertexPackValue = vertexPack as { zw: unknown };
+  const clipCoord = callNode(clipCoordFromReferenceFn, {
+    reference: (instanceB as { w: unknown }).w,
+    width: glyphTextureWidthUniform
+  });
+  const clipRect = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, clipCoord, 0));
 
   material.vertexNode = callNode(textClipFn, {
     vertexPack,
@@ -609,6 +630,9 @@ export function createThreeWebGpuTextMaterial(
 
   material.fragmentNode = callNode(textFragmentFns[options.colorCompositing], {
     local: vertexPackValue.zw,
+    world: (vertexPack as { xy: unknown }).xy,
+    clipReference: (instanceB as { w: unknown }).w,
+    clipRect,
     glyphMetaA,
     instanceColor,
     normCoord,

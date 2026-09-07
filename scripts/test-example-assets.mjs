@@ -99,10 +99,10 @@ async function run() {
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   assert.ok(manifest.examples.length > 0, "example manifest must not be empty");
   for (const entry of manifest.examples) {
-    assert.match(entry.parsedZip.path, /\.hep$/i, `${entry.name} must use the canonical .hep extension`);
-    const hepAssetPath = decodeURIComponent(entry.parsedZip.path);
+    assert.match(entry.hep.path, /\.hep$/i, `${entry.name} must use the canonical .hep extension`);
+    const hepAssetPath = decodeURIComponent(entry.hep.path);
     const hepStat = await stat(path.join(repoRootDir, "public", hepAssetPath));
-    assert.equal(hepStat.size, entry.parsedZip.sizeBytes, `${entry.name} HEP size must match the manifest`);
+    assert.equal(hepStat.size, entry.hep.sizeBytes, `${entry.name} HEP size must match the manifest`);
   }
 
   for (const htmlName of ["index.html", "three-example.html", "room-overlay-demo.html"]) {
@@ -146,12 +146,12 @@ async function run() {
     assert.equal(servedPdf.body.subarray(0, 5).toString("ascii"), "%PDF-");
 
     const smallestHep = manifest.examples.reduce((smallest, entry) =>
-      entry.parsedZip.sizeBytes < smallest.parsedZip.sizeBytes ? entry : smallest
+      entry.hep.sizeBytes < smallest.hep.sizeBytes ? entry : smallest
     );
-    const hepRequestPath = new URL(smallestHep.parsedZip.path, "http://example.test/").pathname;
+    const hepRequestPath = new URL(smallestHep.hep.path, "http://example.test/").pathname;
     const servedHep = await requestViteMiddleware(viteServer, hepRequestPath);
     assert.equal(servedHep.status, 200);
-    assert.equal(servedHep.body.length, smallestHep.parsedZip.sizeBytes);
+    assert.equal(servedHep.body.length, smallestHep.hep.sizeBytes);
     assert.equal(servedHep.body.subarray(0, 2).toString("ascii"), "PK");
 
     const [
@@ -164,7 +164,7 @@ async function run() {
       viteServer.ssrLoadModule("/src/pdfSignature.ts"),
       viteServer.ssrLoadModule("/src/downloadUtils.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
-      viteServer.ssrLoadModule("/src/parsedDataZip.ts"),
+      viteServer.ssrLoadModule("/src/hep.ts"),
       viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts")
     ]);
     const prefixedPdf = new Uint8Array([0, 1, 2, 0x25, 0x50, 0x44, 0x46, 0x2d]);
