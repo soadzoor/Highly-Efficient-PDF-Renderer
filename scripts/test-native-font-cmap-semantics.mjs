@@ -241,6 +241,25 @@ async function testCidUnicodeFallbackAndRos() {
   ]), identityResolver);
   assert.equal(explicitOverride.decode(Uint8Array.of(0x81, 0x40)).unicode, "Z");
 
+  // Some producers write /Registry and /Ordering as fixed-width strings and
+  // pad them with trailing NULs. The padding is not part of the collection
+  // name, so it has to be trimmed rather than rejected, and it must not be
+  // carried into the name either: a padded Japan1 font resolves the Japan1
+  // collection exactly like the unpadded one above.
+  const paddedSystemInfo = await parseNativePdfFont(
+    compositeFont(name("Identity-H"), new Map([
+      ["Subtype", name("CIDFontType2")],
+      ["CIDSystemInfo", new Map([
+        ["Registry", nulPaddedPdfString("Adobe")],
+        ["Ordering", nulPaddedPdfString("Japan1")],
+        ["Supplement", 7]
+      ])]
+    ])),
+    identityResolver
+  );
+  assert.equal(paddedSystemInfo.decode(Uint8Array.of(0x02, 0x79)).unicode, "\u3000");
+  assert.equal(paddedSystemInfo.decode(Uint8Array.of(0x20, 0x67)).unicode, "XIII");
+
   const gbDiagnostics = [];
   const gb = await parseNativePdfFont(
     compositeFont(name("Identity-H"), cidFont("GB1", 6)),
@@ -298,6 +317,24 @@ async function testCidUnicodeFallbackAndRos() {
     identityResolver
   );
   assert.equal(embeddedJapan.decode(Uint8Array.of(0x41)).unicode, "\u3000");
+
+  // The embedded-CMap validator duplicates the dictionary rule above and has
+  // to trim the same fixed-width NUL padding. <4a6170616e310000> is Japan1
+  // padded to eight bytes, <41646f626500> is Adobe padded to six.
+  const paddedEmbeddedEncoding = stream(`
+    /CIDSystemInfo 3 dict dup begin
+      /Registry <41646f626500> def
+      /Ordering <4a6170616e310000> def
+      /Supplement 7 def
+    end def
+    1 begincodespacerange <00> <ff> endcodespacerange
+    1 begincidchar <41> 633 endcidchar
+  `);
+  const paddedEmbedded = await parseNativePdfFont(
+    compositeFont(paddedEmbeddedEncoding, cidFont("Japan1", 7)),
+    identityResolver
+  );
+  assert.equal(paddedEmbedded.decode(Uint8Array.of(0x41)).unicode, "\u3000");
   await assert.rejects(
     parseNativePdfFont(
       compositeFont(embeddedJapanEncoding, cidFont("GB1", 6)),
@@ -715,6 +752,10 @@ function cidSystemInfo(ordering, supplement) {
     ["Ordering", pdfString(ordering)],
     ["Supplement", supplement]
   ]);
+}
+
+function nulPaddedPdfString(value) {
+  return { kind: "string", bytes: Uint8Array.of(...encoder.encode(value), 0, 0), hex: false };
 }
 
 function pdfString(value) {

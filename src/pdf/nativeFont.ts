@@ -846,8 +846,21 @@ async function readCidSystemInfoString(
       "font-cid-system-info-string"
     );
   }
+  // Producers routinely emit these as fixed-width strings padded with
+  // trailing NULs. The padding carries no part of the collection name, so it
+  // is trimmed before the character check; every other byte outside
+  // printable ASCII remains an error.
+  let length = value.bytes.length;
+  while (length > 0 && value.bytes[length - 1] === 0) length -= 1;
+  if (length < 1) {
+    throw cidSystemInfoError(
+      `${label} /${key} must contain at least one non-NUL byte.`,
+      "font-cid-system-info-string"
+    );
+  }
   let result = "";
-  for (const byte of value.bytes) {
+  for (let index = 0; index < length; index += 1) {
+    const byte = value.bytes[index];
     if (byte < 0x20 || byte > 0x7e) {
       throw cidSystemInfoError(
         `${label} /${key} must contain printable ASCII.`,
@@ -2027,8 +2040,20 @@ function requireCMapSystemInfoString(
   ) {
     throw unsupportedFont(`CMap /CIDSystemInfo has no valid /${key} string.`);
   }
+  // Mirrors readCidSystemInfoString: fixed-width padding with trailing NULs
+  // is not part of the collection name, so it is trimmed before the
+  // character check; every other non-printable byte remains an error.
+  const bytes = values[0].value;
+  let length = bytes.length;
+  while (length > 0 && bytes[length - 1] === 0) length -= 1;
+  if (length < 1) {
+    throw unsupportedFont(
+      `CMap /CIDSystemInfo /${key} must contain at least one non-NUL byte.`
+    );
+  }
   let result = "";
-  for (const byte of values[0].value) {
+  for (let index = 0; index < length; index += 1) {
+    const byte = bytes[index];
     if (byte < 0x20 || byte > 0x7e) {
       throw unsupportedFont(`CMap /CIDSystemInfo /${key} must contain printable ASCII.`);
     }
