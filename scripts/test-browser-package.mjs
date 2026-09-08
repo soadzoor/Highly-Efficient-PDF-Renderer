@@ -7,6 +7,8 @@ import { build } from "vite";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const libDir = fileURLToPath(new URL("../dist/lib/", import.meta.url));
 const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+assert.deepEqual(Object.keys(manifest.dependencies ?? {}), [],
+  "HEPR must have no regular runtime dependencies");
 assert.equal(manifest.dependencies?.["@napi-rs/canvas"], undefined);
 assert.equal(manifest.optionalDependencies?.["@napi-rs/canvas"], undefined,
   "browser consumers must not install native canvas automatically");
@@ -51,6 +53,8 @@ const result = await build({
 });
 const chunks = result.output.filter(file => file.type === "chunk");
 for (const chunk of chunks) {
+  assert.ok(Object.keys(chunk.modules).every(id => !/\/node_modules\/(?:jszip|pako)\//.test(id)),
+    "browser chunks must not contain JSZip or its compression dependency");
   assert.ok(Object.keys(chunk.modules).every(id => !id.includes("/@napi-rs/canvas")),
     "browser chunks must not contain native canvas modules");
 }

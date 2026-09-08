@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import vm from "node:vm";
-import JSZip from "jszip";
+import { HepArchive } from "../src/hepContainer.ts";
 import { waitForLoad, yieldForLoad } from "../src/loadCancellation.ts";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
@@ -63,14 +63,14 @@ try {
   }
 
   // An original, tiny archive fixture; no PDF conversion or corpus files.
-  const zip = new JSZip();
+  const zip = new HepArchive();
   zip.file("manifest.json", JSON.stringify({ formatVersion: 6, scene: {}, textures: [] }));
   const archive = await zip.generateAsync({ type: "uint8array" });
   const archiveController = new AbortController();
   await assert.rejects(loadPdfSceneFromSource(archive, {
     signal: archiveController.signal,
     onProgress: (event) => {
-      if (event.stage === "zip-manifest") archiveController.abort(reason);
+      if (event.stage === "hep-manifest") archiveController.abort(reason);
     }
   }), (error) => error === reason);
 

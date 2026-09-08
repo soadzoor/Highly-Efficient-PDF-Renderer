@@ -57,6 +57,7 @@
     "dist/lib",
     "dist/types",
     "README.md",
+    "docs/HEP_CONTAINER.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES"
   ],
@@ -98,9 +99,7 @@
     "oracle:compare:hepr": "npm --prefix oracle run compare:hepr --",
     "oracle:write": "npm --prefix oracle run write --"
   },
-  "dependencies": {
-    "jszip": "3.10.1"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@napi-rs/canvas": "1.0.8",
     "@types/three": "0.185.1",

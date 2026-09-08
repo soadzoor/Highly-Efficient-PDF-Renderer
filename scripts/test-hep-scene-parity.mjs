@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
-import JSZip from "jszip";
+import { HepArchive } from "../src/hepContainer.ts";
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -15,8 +15,8 @@ const hooks = registerHooks({
 
 try {
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
-  const { buildParsedDataZip } = await import("../src/hepBuilder.ts");
-  const { loadSceneFromParsedDataZip, prepareSceneForHepRendering } = await import("../src/hep.ts");
+  const { buildHep } = await import("../src/hepBuilder.ts");
+  const { loadSceneFromHep, prepareSceneForHepRendering } = await import("../src/hep.ts");
   const { buildVectorStrokeLodScenes, VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
 
   // A floorplan-sized extent with closely spaced hatch lines. Tiny coordinate
@@ -118,14 +118,14 @@ try {
   }
 
   const options = { sourceLabel: "fixture.pdf", compression: "store" };
-  const blob = await buildParsedDataZip(scene, options);
-  const rawZip = await JSZip.loadAsync(await blob.arrayBuffer());
+  const blob = await buildHep(scene, options);
+  const rawZip = await HepArchive.loadAsync(await blob.arrayBuffer());
   const rawManifest = JSON.parse(await rawZip.file("manifest.json").async("string"));
   assert.equal(rawManifest.formatVersion, 6);
   assert.equal(rawManifest.strokeGeometry.endpointsFile, "geometry/stroke-endpoints.csq16");
   assert.equal(rawManifest.strokeGeometry.encoding, undefined, "keep the existing compact format");
   assert.equal(rawManifest.strokeGeometry.boundsFile, undefined, "do not add full float32 bounds");
-  const loaded = await loadSceneFromParsedDataZip(await blob.arrayBuffer());
+  const loaded = await loadSceneFromHep(await blob.arrayBuffer());
   assertBuffersEqual(prepared, loaded, visualFields, "PDF vs original HEP");
   assert.deepEqual(prepared.textIndex, loaded.textIndex);
   assertLodEqual(prepared, loaded);
@@ -133,9 +133,9 @@ try {
   for (const compression of ["store", "deflate"]) {
     let exportedScene = prepared;
     for (let round = 0; round < 2; round += 1) {
-      const exported = await buildParsedDataZip(exportedScene, { ...options, compression });
+      const exported = await buildHep(exportedScene, { ...options, compression });
       if (compression === "store") assert.ok(exported.size <= blob.size, "HEPs must not grow");
-      const zip = await JSZip.loadAsync(await exported.arrayBuffer());
+      const zip = await HepArchive.loadAsync(await exported.arrayBuffer());
       const manifest = JSON.parse(await zip.file("manifest.json").async("string"));
       assert.deepEqual(manifest.strokeGeometry, rawManifest.strokeGeometry);
       for (const path of [manifest.strokeGeometry.endpointsFile, manifest.strokeGeometry.metaFile,
@@ -143,7 +143,7 @@ try {
         assert.deepEqual(await zip.file(path).async("uint8array"),
           await rawZip.file(path).async("uint8array"), "reuse the original compact stroke encoding");
       }
-      exportedScene = await loadSceneFromParsedDataZip(await exported.arrayBuffer());
+      exportedScene = await loadSceneFromHep(await exported.arrayBuffer());
       assertBuffersEqual(exportedScene, prepared, visualFields, `round ${round}, ${compression}`);
       assert.deepEqual(exportedScene.textIndex, prepared.textIndex);
     }
@@ -153,14 +153,14 @@ try {
   // changes coordinate ranges. Repeated rearrangements must start from raw pages.
   for (const columns of [1, 2, 1]) {
     const composed = composeVectorScenesInGrid([scene, scene], columns);
-    const expected = await loadSceneFromParsedDataZip(await (await buildParsedDataZip(composed, options)).arrayBuffer());
+    const expected = await loadSceneFromHep(await (await buildHep(composed, options)).arrayBuffer());
     const actual = prepareSceneForHepRendering(composed);
     assertBuffersEqual(actual, expected, visualFields, `page columns ${columns}`);
   }
   assert.deepEqual(scene, snapshot, "rearranging pages must not accumulate rounding");
 
   async function mutateArchive(mutate) {
-    const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+    const zip = await HepArchive.loadAsync(await blob.arrayBuffer());
     const manifest = JSON.parse(await zip.file("manifest.json").async("string"));
     await mutate(zip, manifest);
     zip.file("manifest.json", JSON.stringify(manifest));
@@ -173,7 +173,7 @@ try {
     [(zip, manifest) => { zip.file(manifest.strokeGeometry.metaFile, new Uint8Array(4)); }, /truncated/],
     [(zip, manifest) => { zip.remove(manifest.strokeGeometry.clipBoundsFile); }, /missing clipped stroke bounds/]
   ]) {
-    await assert.rejects(loadSceneFromParsedDataZip(await mutateArchive(mutate)), expectedError);
+    await assert.rejects(loadSceneFromHep(await mutateArchive(mutate)), expectedError);
   }
 
   // Hand-authored legacy v6 payload: one clipped quadratic, with integer
@@ -197,24 +197,24 @@ try {
     zip.file("geometry/legacy.bin", new Uint8Array([1, 255, 79, 10, 60]));
     zip.file("geometry/legacy-clip.f32", new Float32Array([11, 22, 29, 50]).buffer);
   });
-  const legacy = await loadSceneFromParsedDataZip(legacyBytes);
+  const legacy = await loadSceneFromHep(legacyBytes);
   assert.deepEqual([...legacy.endpoints], [10, 20, 25, 60]);
   assert.deepEqual([...legacy.primitiveMeta], [30, 40, 1, 9]);
   assert.deepEqual([...legacy.primitiveBounds], [11, 22, 29, 50]);
-  const legacyReexport = await loadSceneFromParsedDataZip(
-    await (await buildParsedDataZip(legacy, options)).arrayBuffer()
+  const legacyReexport = await loadSceneFromHep(
+    await (await buildHep(legacy, options)).arrayBuffer()
   );
   assertBuffersEqual(legacyReexport, legacy, strokeFields, "legacy paths after re-export");
-  const invalidLegacy = await JSZip.loadAsync(legacyBytes);
+  const invalidLegacy = await HepArchive.loadAsync(legacyBytes);
   const invalidLegacyManifest = JSON.parse(await invalidLegacy.file("manifest.json").async("string"));
   delete invalidLegacyManifest.strokeGeometry.clippedSegmentCount;
   invalidLegacy.file("manifest.json", JSON.stringify(invalidLegacyManifest));
-  await assert.rejects(loadSceneFromParsedDataZip(await invalidLegacy.generateAsync({
+  await assert.rejects(loadSceneFromHep(await invalidLegacy.generateAsync({
     type: "arraybuffer", compression: "STORE"
   })), /invalid strokeGeometry/);
 
-  const emptyBlob = await buildParsedDataZip(composeVectorScenesInGrid([], 1), { compression: "store" });
-  assert.equal((await loadSceneFromParsedDataZip(await emptyBlob.arrayBuffer())).segmentCount, 0);
+  const emptyBlob = await buildHep(composeVectorScenesInGrid([], 1), { compression: "store" });
+  assert.equal((await loadSceneFromHep(await emptyBlob.arrayBuffer())).segmentCount, 0);
   console.log("PDF/HEP scene parity regression tests passed.");
 } finally {
   hooks.deregister();

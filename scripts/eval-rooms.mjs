@@ -308,7 +308,7 @@ async function runShard(args, entries) {
         if (entry.hepPath) {
           const bytes = await fs.readFile(entry.hepPath);
           const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-          scene = await parsedDataModule.loadSceneFromParsedDataZip(buffer);
+          scene = await parsedDataModule.loadSceneFromHep(buffer);
         } else if (args.fromPdf) {
           const pdfPath = entry.pdfPath ?? path.join(pdfTsvDir, entry.folder, `${entry.stem}.pdf`);
           const bytes = await fs.readFile(pdfPath);

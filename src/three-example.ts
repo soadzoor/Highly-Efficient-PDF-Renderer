@@ -4,7 +4,7 @@ import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
-  buildParsedDataZip,
+  buildHep,
   createTextSelectionController,
   pdfObjectGenerator,
   consumeVectorStrokeLodBuildTiming,
@@ -28,7 +28,7 @@ import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdo
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
-import { tryReadSourcePdfBytesFromExistingParsedZip } from "./hep";
+import { tryReadSourcePdfBytesFromExistingHep } from "./hep";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
@@ -948,7 +948,7 @@ async function loadSource(
     updateLoadingProgress(activeLoadToken, {
       value: 1,
       stage: "first-render",
-      sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "zip"
+      sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "hep"
     });
     const firstSubmitStart = performance.now();
     requestRender();
@@ -1046,7 +1046,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
     updateLoadingProgress(activeLoadToken, {
       value: 1,
       stage: "first-render",
-      sourceType: installedObject.sourceKind === "pdf" ? "pdf" : "zip"
+      sourceType: installedObject.sourceKind === "pdf" ? "pdf" : "hep"
     });
     const firstSubmitStart = performance.now();
     requestRender();
@@ -1217,6 +1217,7 @@ function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
+    file.type === "application/x-hep" ||
     lowerName.endsWith(".zip") ||
     file.type === "application/zip" ||
     file.type === "application/x-zip-compressed"
@@ -1281,7 +1282,7 @@ async function downloadHep(): Promise<boolean> {
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
     await yieldToBrowserPaint();
-    const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
+    const hepBlob = await buildHep(pdfObject.sceneData, {
       sourceLabel: pdfObject.sourceLabel,
       signal: exportController.signal,
       onProgress: (progress) => {
@@ -1402,7 +1403,7 @@ async function resolveDownloadablePdfSource(
   if (!hepBytes) {
     return null;
   }
-  const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingParsedZip(hepBytes), signal);
+  const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingHep(hepBytes, signal), signal);
   return sourcePdfBytes && sourcePdfBytes.length > 0
     ? { label: pdfObject.sourceLabel, bytes: sourcePdfBytes }
     : null;

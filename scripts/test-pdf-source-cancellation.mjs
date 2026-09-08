@@ -72,7 +72,7 @@ try {
       });
     };
 
-    const pendingExport = zipBuilder.buildParsedDataZip(
+    const pendingExport = zipBuilder.buildHep(
       "https://example.test/slow.pdf",
       { signal: fetchController.signal }
     );

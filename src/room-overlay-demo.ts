@@ -354,6 +354,7 @@ function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
+    file.type === "application/x-hep" ||
     lowerName.endsWith(".zip") ||
     file.type === "application/zip" ||
     file.type === "application/x-zip-compressed"
@@ -453,7 +454,7 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
     const file =
       kind === "pdf"
         ? new File([bytes], `${baseName}.pdf`, { type: "application/pdf" })
-        : new File([bytes], `${baseName}.hep`, { type: "application/zip" });
+        : new File([bytes], `${baseName}.hep`, { type: "application/x-hep" });
     await loadSceneSource(file);
   } catch (error) {
     if (activeToken !== loadToken || controller.signal.aborted) return;

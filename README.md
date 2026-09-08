@@ -169,9 +169,13 @@ Supported `source` inputs:
 
 - `File` / `Blob`
 - `Uint8Array` / `ArrayBuffer`
-- `string` path or URL to `.pdf` / `.hep` (legacy `.zip` exports remain supported)
+- `string` path or URL to `.pdf` / `.hep`
 - base64 payload string (PDF or HEP)
-- base64 data URL (`application/pdf`, or `application/zip` when transporting HEP)
+- base64 data URL (`application/pdf`, or `application/x-hep` when transporting HEP)
+
+Source detection accepts PDF and HEP signatures. Use `sourceKind: "pdf"` or
+`sourceKind: "hep"` to explicitly select the format. Legacy ZIP-based HEP exports
+must be repacked before loading; see [HEP File Format](#hep-file-format).
 
 Pass an `AbortSignal` to cancel a load when switching documents or closing a viewer:
 
@@ -192,22 +196,20 @@ try {
 
 Cancellation covers source reads, parser workers, HEP loading, LOD preparation,
 and provisional renderer creation. Synchronous work stops at its next cooperative
-checkpoint; an image/archive decode already running may finish before releasing
+checkpoint; an image decode already running may finish before releasing
 its temporary data. An object already returned belongs to the caller and still
 needs `object.dispose()`. The demos cancel superseded loads and keep the previous
 document's scene and download source until a replacement is ready.
 
-Build a HEP file directly from any supported PDF input. The public builder
-retains its existing `buildParsedDataZip` name for API compatibility. Its result
-is an `application/zip` `Blob` because HEP uses ZIP internally; save or upload it
-with a `.hep` filename:
+Build a HEP file directly from any supported PDF input with `buildHep`. Its result
+is an `application/x-hep` `Blob`; save or upload it with a `.hep` filename:
 
 ```ts
-import { buildParsedDataZip } from "@soadzoor/hepr";
+import { buildHep } from "@soadzoor/hepr";
 
 // URL, File, Blob, Uint8Array, ArrayBuffer, base64, or data URL
 const controller = new AbortController();
-const hepBlob = await buildParsedDataZip(pdfSource, {
+const hepBlob = await buildHep(pdfSource, {
   // Default: store each raster as the smaller of WebP/PNG, with RGBA fallback.
   encodeRasterImages: true,
   signal: controller.signal,
@@ -220,7 +222,7 @@ const hepBlob = await buildParsedDataZip(pdfSource, {
 If the PDF is already loaded, pass its parsed scene to avoid parsing it again:
 
 ```ts
-const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
+const hepBlob = await buildHep(pdfObject.sceneData, {
   sourceLabel: pdfObject.sourceLabel,
   // Needed only if the scene has PDF image operations but no raster layers.
   sourcePdf: originalPdfSource,
@@ -228,6 +230,21 @@ const hepBlob = await buildParsedDataZip(pdfObject.sceneData, {
   sourcePdfPages: "3-5"
 });
 ```
+
+The shared writer works in Node and modern browsers using native
+`CompressionStream("deflate")`; loading compressed HEP data uses
+`DecompressionStream("deflate")`. Files are interchangeable between the two
+environments. Compression and the container need no runtime package dependency.
+Use `compression: "store"` to write uncompressed sections, which can also be read
+without native compression APIs. The default is `compression: "deflate"`.
+Native streams do not expose compression levels, so `compressionLevel` was removed
+and supplied values are rejected. Missing native stream APIs produce an error
+explaining the required platform support.
+
+The builder's exported types are `BuildHepFromPdfOptions`,
+`BuildHepFromSceneOptions`, `HepCompression`, and `HepEncodingOptions`.
+The old ZIP-named builder, types, source kind, and progress identifiers have no
+deprecated aliases.
 
 ### Server-side PDF to HEP conversion
 
@@ -612,12 +629,33 @@ WebGPU-compatible three.js materials live in:
 ## HEP File Format
 
 A `.hep` (Highly Efficient PDF) file is HEPR's pre-parsed document format. It
-uses a ZIP container internally, but the public extension is `.hep` so it is not mistaken for an
-ordinary user-created archive. Compressing a PDF with 7-Zip or another archive
-tool does not create a HEP file; load the PDF directly or export it through HEPR.
-Legacy `.zip` exports remain loadable through the package API and drag-and-drop;
-the demos intentionally advertise only `.hep` in their file choosers to keep
-ordinary ZIP files out of the normal workflow.
+uses HEP container version 1 with a `HEP\0` signature, a compact index, and
+independently stored or DEFLATE-compressed chunks. The scene schema remains
+version 6; the separate page-based v7 document model is not serialized by this
+container. Page streaming is not implemented by this change.
+
+The [binary container specification](docs/HEP_CONTAINER.md) describes the index,
+chunk layout, codecs, alignment, checksums, grouping, and resource limits.
+
+Legacy ZIP-based HEP files, including old `.hep` exports, are rejected with a
+migration instruction. The development-only `scripts/repack-heps.mjs` utility
+can migrate supported v6 exports without parsing their source PDFs. It preserves
+the decoded scene sections and checks their integrity before writing the new
+container. Ordinary ZIP files and unsupported ZIP features are rejected.
+
+From a repository checkout, validate old exports and then repack them in place:
+
+```bash
+node scripts/repack-heps.mjs --dry-run path/to/document.hep
+node scripts/repack-heps.mjs path/to/document.hep
+node scripts/repack-heps.mjs --check path/to/document.hep
+```
+
+The utility accepts files or directories and has a 60-second default deadline
+(`--timeout-ms=60000`). To migrate bundled examples and update their manifest
+sizes, use `node scripts/repack-heps.mjs public/examples/heps`. It validates and
+stages all output before replacing files; files already using the new container
+are verified and left unchanged.
 
 The HEP container includes:
 
@@ -628,9 +666,15 @@ The HEP container includes:
 - optional raster layers
 - optional embedded source PDF fallback
 
-HEP files are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported HEP files are typically smaller than the source PDFs themselves. Format v6 stores each raster layer whole as WebP or PNG, whichever is smaller, and falls back to RGBA8 when image encoding is unavailable. WebP/PNG entries are already compressed and are therefore stored without redundant ZIP compression.
+HEP files are designed to skip expensive PDF extraction. Thanks to the delta/varint encoding, exported HEP files are typically smaller than the source PDFs themselves. Scene schema v6 stores each raster layer whole as WebP or PNG, whichever is smaller, and falls back to RGBA8 when image encoding is unavailable. WebP/PNG sections are already compressed and are therefore stored directly. Small related sections share chunks to reduce overhead; larger sections, raster layers, source PDFs, and the compact JSON manifest remain independent. Other chunks use stored bytes when DEFLATE would enlarge them.
 
-Exports report separate `raster-encode` and `zip-build` progress stages. Pass an `AbortSignal` as `signal` to cancel source fetching/native PDF parsing, between raster encodes, or while the ZIP stream is being generated. Cancellation inside synchronous extraction work takes effect at the next asynchronous/check boundary. The loader accepts format v6 only; older or experimental format versions must be re-exported.
+Exports report separate `raster-encode` and `hep-build` progress stages. Loading
+uses `hep-open`, `hep-manifest`, and `hep-section`, with source type `"hep"` and
+section counts using the `"sections"` unit. Pass an `AbortSignal` as `signal` to
+cancel source fetching/native PDF parsing, between raster encodes, or during
+container compression/decompression. Cancellation inside synchronous extraction
+work takes effect at the next asynchronous/check boundary. The loader accepts
+container v1 with scene schema v6 only; other scene schemas must be re-exported.
 
 The Three.js integration keeps only one raster GPU owner active at a time. Its material textures are released before the native-canvas fallback allocates raster textures, and native raster textures remain nonresident while the Three.js material path is active. This avoids the previous persistent duplicate raster allocation across the two renderer paths. The active texture set is still ordinary RGBA8 with mipmaps; this is an ownership fix, not GPU texture compression.
 
@@ -650,7 +694,7 @@ the result of that culling pass: archives exported with the older epsilon-based
 ordering must be re-exported from the PDF for exact parity with the current
 parser. Loading an old archive cannot recover strokes discarded at export time.
 
-Open the native demo with `?bulkHep=1` or `?downloadAllHeps=1` to reveal the `Download All Example HEP Files` button. The old ZIP-named query parameters remain supported.
+Open the native demo with `?bulkHep=1` or `?downloadAllHeps=1` to reveal the `Download All Example HEP Files` button.
 
 ## Example Assets
 

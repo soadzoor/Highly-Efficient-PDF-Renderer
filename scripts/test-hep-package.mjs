@@ -11,19 +11,19 @@ const declarationPath = path.join(repoRootDir, "dist/types/index.d.ts");
 const fixturePath = path.join(repoRootDir, "public/examples/pdfs/LK Office Level 1.pdf");
 
 const library = await import("@soadzoor/hepr");
-assert.equal(typeof library.buildParsedDataZip, "function");
+assert.equal(typeof library.buildHep, "function");
 
 const pdfBytes = await readFile(fixturePath);
-const zipBlob = await library.buildParsedDataZip(pdfBytes, {
+const zipBlob = await library.buildHep(pdfBytes, {
   compression: "store",
   encodeRasterImages: false
 });
 assert.ok(zipBlob instanceof Blob);
-assert.equal(zipBlob.type, "application/zip");
+assert.equal(zipBlob.type, "application/x-hep");
 const zipBytes = new Uint8Array(await zipBlob.arrayBuffer());
-assert.deepEqual(Array.from(zipBytes.subarray(0, 2)), [0x50, 0x4b]);
+assert.deepEqual(Array.from(zipBytes.subarray(0, 4)), [0x48, 0x45, 0x50, 0]);
 
 const declarations = await readFile(declarationPath, "utf8");
-assert.match(declarations, /export \{ buildParsedDataZip \} from "\.\/hepBuilder";/);
+assert.match(declarations, /export \{ buildHep \} from "\.\/hepBuilder";/);
 
 console.log("Built-package HEP smoke test passed");

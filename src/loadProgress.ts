@@ -11,11 +11,11 @@ export type PDFLoadStage =
   | "pdf-text"
   | "pdf-raster"
   | "compile"
-  | "zip-open"
-  | "zip-manifest"
-  | "zip-file"
+  | "hep-open"
+  | "hep-manifest"
+  | "hep-section"
   | "raster-encode"
-  | "zip-build"
+  | "hep-build"
   | "vector-lod"
   | "text-lod"
   | "upload"
@@ -49,10 +49,10 @@ export interface PDFLoadProgress {
   executionPath?: PDFLoadExecutionPath;
 
   /** Source family currently being processed. */
-  sourceType?: "pdf" | "zip";
+  sourceType?: "pdf" | "hep";
 
   /** Unit represented by `processed` and `total`, when available. */
-  unit?: "bytes" | "operators" | "segments" | "files" | "pages" | "texels";
+  unit?: "bytes" | "operators" | "segments" | "sections" | "pages" | "texels";
 
   /** Completed units for the current stage. */
   processed?: number;
@@ -202,8 +202,8 @@ export class LoadProgressReporter {
     options: {
       stage: PDFLoadStage;
       executionPath?: PDFLoadExecutionPath;
-      sourceType?: "pdf" | "zip";
-      unit?: "bytes" | "operators" | "segments" | "files" | "pages" | "texels";
+      sourceType?: "pdf" | "hep";
+      unit?: "bytes" | "operators" | "segments" | "sections" | "pages" | "texels";
       processed?: number;
       total?: number;
       pageIndex?: number;
@@ -283,15 +283,15 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Extracting rasters";
     case "compile":
       return "Compiling";
-    case "zip-open":
+    case "hep-open":
       return "Opening HEP";
-    case "zip-manifest":
+    case "hep-manifest":
       return "Reading manifest";
-    case "zip-file":
+    case "hep-section":
       return "Decoding HEP";
     case "raster-encode":
       return "Compressing raster images";
-    case "zip-build":
+    case "hep-build":
       return "Building HEP";
     case "vector-lod":
       return "Building Vector LOD";

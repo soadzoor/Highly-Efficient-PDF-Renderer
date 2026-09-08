@@ -109,14 +109,14 @@ assert.throws(
 
 let sourceBuilderViteOptions;
 let sourceBuilderCloseCount = 0;
-const fakeBuildParsedDataZip = () => {};
+const fakeBuildHep = () => {};
 const sourceBuilder = await loadSourceHepBuilder({
   async createServer(options) {
     sourceBuilderViteOptions = options;
     return {
       async ssrLoadModule(moduleId) {
         assert.equal(moduleId, "/src/hepBuilder.ts");
-        return { buildParsedDataZip: fakeBuildParsedDataZip };
+        return { buildHep: fakeBuildHep };
       },
       async close() {
         sourceBuilderCloseCount += 1;
@@ -129,7 +129,7 @@ assert.equal(
   null,
   "the one-shot builder must not watch generated HEP files under public/"
 );
-assert.equal(sourceBuilder.buildParsedDataZip, fakeBuildParsedDataZip);
+assert.equal(sourceBuilder.buildHep, fakeBuildHep);
 await sourceBuilder.close();
 assert.equal(sourceBuilderCloseCount, 1);
 

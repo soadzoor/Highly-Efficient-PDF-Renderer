@@ -316,11 +316,11 @@ export async function loadSourceHepBuilder(dependencies = {}) {
 
   try {
     const builderModule = await viteServer.ssrLoadModule("/src/hepBuilder.ts");
-    if (typeof builderModule.buildParsedDataZip !== "function") {
-      throw new Error("The HEPR source builder did not export buildParsedDataZip().");
+    if (typeof builderModule.buildHep !== "function") {
+      throw new Error("The HEPR source builder did not export buildHep().");
     }
     return {
-      buildParsedDataZip: builderModule.buildParsedDataZip,
+      buildHep: builderModule.buildHep,
       close: () => viteServer.close()
     };
   } catch (error) {
@@ -816,7 +816,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
       try {
         const pdfBytes = await readFile(pdfPath, { signal: abortController.signal });
         abortController.signal.throwIfAborted();
-        const hepBlob = await builder.buildParsedDataZip(pdfBytes, {
+        const hepBlob = await builder.buildHep(pdfBytes, {
           sourceLabel,
           signal: abortController.signal,
           onProgress: createProgressLogger(sourceLabel, itemNumber, itemCount)

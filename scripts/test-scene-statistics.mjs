@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import JSZip from "jszip";
+import { HepArchive } from "../src/hepContainer.ts";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
 const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
@@ -14,8 +14,8 @@ try {
     await import("../src/sceneStatistics.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
-  const { buildParsedDataZip } = await import("../src/hepBuilder.ts");
-  const { loadSceneFromParsedDataZip } = await import("../src/hep.ts");
+  const { buildHep } = await import("../src/hepBuilder.ts");
+  const { loadSceneFromHep } = await import("../src/hep.ts");
 
   const brochure = { sourceSegmentCount: 11257, mergedSegmentCount: 10028, segmentCount: 8834,
     discardedTransparentCount: 0, discardedDegenerateCount: 0, discardedDuplicateCount: 10,
@@ -58,15 +58,15 @@ try {
       assert.equal(unknownGrid.operatorCountKind, "mixed");
 
       // Tiny synthetic archive only; no tracked PDF / HEP regeneration.
-      const hep = await buildParsedDataZip(grid, { encodeRasterImages: false, compression: "store" });
+      const hep = await buildHep(grid, { encodeRasterImages: false, compression: "store" });
       const bytes = await hep.arrayBuffer();
-      const restored = await loadSceneFromParsedDataZip(bytes);
+      const restored = await loadSceneFromHep(bytes);
       assert.deepEqual(getSceneSegmentAccounting(restored), getSceneSegmentAccounting(grid));
       assert.equal(restored.operatorCountKind, "native-estimate");
       for (const key of ["discardedTransparentCount", "discardedDegenerateCount",
         "discardedDuplicateCount", "discardedContainedCount"]) assert.equal(restored[key], grid[key]);
 
-      const archive = await JSZip.loadAsync(bytes);
+      const archive = await HepArchive.loadAsync(bytes);
       const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
       assert.equal(manifest.formatVersion, 6, "additive metadata must not change the HEP format");
       delete manifest.scene.imageLayerSegmentCount;
@@ -74,7 +74,7 @@ try {
       for (const key of ["discardedTransparentCount", "discardedDegenerateCount",
         "discardedDuplicateCount", "discardedContainedCount"]) delete manifest.scene[key];
       archive.file("manifest.json", JSON.stringify(manifest));
-      const old = await loadSceneFromParsedDataZip(await archive.generateAsync({ type: "arraybuffer" }));
+      const old = await loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer" }));
       assert.equal(old.segmentCount, grid.segmentCount);
       assert.equal(old.imageLayerSegmentCount, undefined);
       assert.equal(getSceneSegmentAccounting(old).culled, null, "older v6 files cannot fabricate cull counts");
@@ -82,7 +82,7 @@ try {
       // An image-transfer field without all cull metadata is still incomplete.
       manifest.scene.imageLayerSegmentCount = 0;
       archive.file("manifest.json", JSON.stringify(manifest));
-      const incomplete = await loadSceneFromParsedDataZip(await archive.generateAsync({ type: "arraybuffer" }));
+      const incomplete = await loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer" }));
       assert.equal(incomplete.imageLayerSegmentCount, undefined);
     }
   } finally {

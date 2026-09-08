@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
-import JSZip from "jszip";
+import { HepArchive } from "../src/hepContainer.ts";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 
@@ -28,8 +28,8 @@ const hooks = registerHooks({
 
 try {
   const [
-    { buildParsedDataZip },
-    { listSceneRasterLayers, loadSceneFromParsedDataZip },
+    { buildHep },
+    { listSceneRasterLayers, loadSceneFromHep },
     { extractPdfRasterScene }
   ] = await Promise.all([
     import("../src/hepBuilder.ts"),
@@ -58,7 +58,7 @@ try {
     rasterLayerData: new Uint8Array(0),
     rasterLayerMatrix: new Float32Array([1, 0, 0, 1, 0, 0])
   };
-  const hep = await buildParsedDataZip(missingRasterScene, {
+  const hep = await buildHep(missingRasterScene, {
     sourceLabel: "native-raster-recovery.pdf",
     sourcePdf,
     sourcePdfPages: "1-2",
@@ -66,7 +66,7 @@ try {
     compression: "store"
   });
   const hepBytes = await hep.arrayBuffer();
-  const archive = await JSZip.loadAsync(hepBytes);
+  const archive = await HepArchive.loadAsync(hepBytes);
   const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
   assert.equal(manifest.formatVersion, 6);
   assert.equal(manifest.sourcePdfFile, "source/source.pdf");
@@ -74,7 +74,7 @@ try {
   assert.ok(archive.file("source/source.pdf"));
   assert.deepEqual(manifest.scene.rasterLayers, []);
 
-  const recoveredScene = await loadSceneFromParsedDataZip(hepBytes);
+  const recoveredScene = await loadSceneFromHep(hepBytes);
   const recoveredLayers = listSceneRasterLayers(recoveredScene);
   assert.equal(recoveredScene.pageCount, 2);
   assert.equal(recoveredScene.pagesPerRow, 2);

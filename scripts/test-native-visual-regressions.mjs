@@ -39,11 +39,11 @@ try {
     assert.deepEqual(sample(11, 17), [0, 0, 255, 255], "the clipped-out half of A must not leak over the blue image");
     assert.deepEqual(sample(13, 11), [255, 0, 0, 255], "the retained label ink paints above the background image");
     assert.deepEqual(sample(16, 11), [0, 255, 0, 255], "a later image covers the label, preserving source order");
-    const { buildParsedDataZip } = await import("../src/hepBuilder.ts");
-    const { loadSceneFromParsedDataZip } = await import("../src/hep.ts");
+    const { buildHep } = await import("../src/hepBuilder.ts");
+    const { loadSceneFromHep } = await import("../src/hep.ts");
     // Only this tiny in-memory fixture is exported, never the tracked brochure.
-    const hep = await buildParsedDataZip(scene, { encodeRasterImages: false, compression: "store" });
-    const restored = await loadSceneFromParsedDataZip(await hep.arrayBuffer());
+    const hep = await buildHep(scene, { encodeRasterImages: false, compression: "store" });
+    const restored = await loadSceneFromHep(await hep.arrayBuffer());
     assert.deepEqual(rasterPreview(restored).data(), canvas.data(), "HEP preserves overlap pixels");
     checkSelection(restored, createSceneTextSearcher(restored).search("A")[0], "A");
   } finally {

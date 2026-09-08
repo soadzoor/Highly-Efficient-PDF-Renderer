@@ -12,12 +12,12 @@ import {
 } from "./pdfVectorExtractor";
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
-import { buildParsedDataZip } from "./index";
+import { buildHep } from "./index";
 import {
   listSceneRasterLayers,
-  loadSceneFromParsedDataZip,
+  loadSceneFromHep,
   prepareSceneForHepRendering,
-  tryReadSourcePdfBytesFromExistingParsedZip
+  tryReadSourcePdfBytesFromExistingHep
 } from "./hep";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
@@ -362,9 +362,7 @@ let activeHepExportController: AbortController | null = null;
 const pageQuery = new URLSearchParams(window.location.search);
 const bulkHepExportEnabled =
   pageQuery.get("bulkHep") === "1" ||
-  pageQuery.get("downloadAllHeps") === "1" ||
-  pageQuery.get("bulkZip") === "1" ||
-  pageQuery.get("downloadAllZips") === "1";
+  pageQuery.get("downloadAllHeps") === "1";
 
 interface ParsedPdfPageCache {
   sourceBytes: Uint8Array;
@@ -738,6 +736,7 @@ function isHepFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();
   return (
     lowerName.endsWith(".hep") ||
+    file.type === "application/x-hep" ||
     lowerName.endsWith(".zip") ||
     file.type === "application/zip" ||
     file.type === "application/x-zip-compressed"
@@ -781,7 +780,7 @@ async function loadHepFile(file: File): Promise<void> {
       return;
     }
     const bytes = cloneSourceBytes(buffer);
-    const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingParsedZip(bytes), signal);
+    const sourcePdfBytes = await waitForLoad(tryReadSourcePdfBytesFromExistingHep(bytes, signal), signal);
     if (!isCurrentSourceLoad(sourceLoadToken)) return;
     await loadHepBuffer(createParseBuffer(bytes), file.name, {
       source: { kind: "hep", bytes, label: file.name },
@@ -951,14 +950,14 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const parseStart = performance.now();
     setParsingLoader(true, "0.00% Parsing / loading");
     setStatus(`Loading parsed data from ${label}...`);
-    const scene = await loadSceneFromParsedDataZip(buffer, {
+    const scene = await loadSceneFromHep(buffer, {
       signal: options.signal,
-      onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "zip" }).toCallback()
+      onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "hep" }).toCallback()
     });
     const parseEnd = performance.now();
 
     if (activeLoadToken === loadToken) {
-      progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType: "zip" });
+      progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType: "hep" });
     }
 
     if (activeLoadToken !== loadToken) {
@@ -976,12 +975,12 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     setStatus(
       `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
-    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "zip", activeLoadToken, options.signal);
-    await prebuildTextLodForScene(scene, progress, "zip", activeLoadToken, options.signal);
+    const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "hep", activeLoadToken, options.signal);
+    await prebuildTextLodForScene(scene, progress, "hep", activeLoadToken, options.signal);
     if (activeLoadToken !== loadToken) {
       return;
     }
-    progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "zip" });
+    progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "hep" });
     const uploadStart = performance.now();
     const targetRenderer = renderer;
     options.signal.throwIfAborted();
@@ -990,7 +989,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
-    progress.complete({ sourceType: "zip" });
+    progress.complete({ sourceType: "hep" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
     }
@@ -1223,7 +1222,7 @@ function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
 async function prebuildVectorLodForScene(
   scene: VectorScene,
   progress: ReturnType<typeof createLoadProgressReporter>,
-  sourceType: "pdf" | "zip",
+  sourceType: "pdf" | "hep",
   activeLoadToken: number,
   signal?: AbortSignal
 ): Promise<VectorStrokeLodBuildTiming> {
@@ -1253,7 +1252,7 @@ async function prebuildVectorLodForScene(
 async function prebuildTextLodForScene(
   scene: VectorScene,
   progress: ReturnType<typeof createLoadProgressReporter>,
-  sourceType: "pdf" | "zip",
+  sourceType: "pdf" | "hep",
   activeLoadToken: number,
   signal?: AbortSignal
 ): Promise<void> {
@@ -1374,7 +1373,7 @@ async function downloadAllExampleHeps(): Promise<void> {
       }
 
       const bytes = cloneSourceBytes(await response.arrayBuffer());
-      const hepBlob = await buildParsedDataZip(bytes, {
+      const hepBlob = await buildHep(bytes, {
         sourceLabel: entry.name,
         signal: exportController.signal,
         onProgress: (progress) => {
@@ -1464,7 +1463,7 @@ async function downloadHep(): Promise<boolean> {
 
   try {
     await yieldToBrowserPaint();
-    const hepBlob = await buildParsedDataZip(scene, {
+    const hepBlob = await buildHep(scene, {
       sourceLabel: label,
       signal: exportController.signal,
       onProgress: (progress) => {

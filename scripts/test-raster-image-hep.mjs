@@ -4,8 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createCanvas, ImageData as NodeImageData } from "@napi-rs/canvas";
-import JSZip from "jszip";
-import { createServer } from "vite";
+import { HepArchive, crc32 } from "../src/hepContainer.ts";
+import { registerHooks } from "node:module";
 
 Promise.try ??= (callback, ...args) => Promise.resolve().then(() => callback(...args));
 Uint8Array.prototype.toHex ??= function toHex() {
@@ -17,36 +17,32 @@ Uint8Array.prototype.toBase64 ??= function toBase64() {
 Uint8Array.fromHex ??= (value) => new Uint8Array(Buffer.from(value, "hex"));
 Uint8Array.fromBase64 ??= (value) => new Uint8Array(Buffer.from(value, "base64"));
 
-function patchZipEntryUncompressedSize(buffer, filePath, byteLength) {
+// Change declared decoded length without allocating an oversized raster payload.
+function patchHepEntryUncompressedSize(buffer, filePath, byteLength) {
   const bytes = new Uint8Array(buffer.slice(0));
   const view = new DataView(bytes.buffer);
-  const encodedPath = new TextEncoder().encode(filePath);
+  const entryCount = view.getUint32(8, true);
+  const chunkCount = view.getUint32(12, true);
+  const indexLength = view.getUint32(16, true);
+  let offset = 32 + chunkCount * 20;
   let patchedCount = 0;
-  for (let offset = 0; offset + 46 <= bytes.byteLength; offset += 1) {
-    if (view.getUint32(offset, true) !== 0x02014b50) {
-      continue;
-    }
-    const fileNameLength = view.getUint16(offset + 28, true);
-    if (
-      fileNameLength !== encodedPath.byteLength ||
-      offset + 46 + fileNameLength > bytes.byteLength
-    ) {
-      continue;
-    }
-    let matches = true;
-    for (let index = 0; index < fileNameLength; index += 1) {
-      if (bytes[offset + 46 + index] !== encodedPath[index]) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) {
-      view.setUint32(offset + 24, byteLength, true);
+  for (let index = 0; index < entryCount; index += 1) {
+    const nameLength = view.getUint16(offset, true);
+    const name = new TextDecoder().decode(bytes.subarray(offset + 16, offset + 16 + nameLength));
+    if (name === filePath) {
+      const chunkOffset = 32 + view.getUint32(offset + 4, true) * 20;
+      view.setUint32(chunkOffset + 8, byteLength, true);
+      // Allow different stored/decoded lengths; the loader must reject the
+      // declared raster size before trying to decompress this payload.
+      view.setUint8(chunkOffset + 16, 1);
+      view.setUint32(offset + 12, byteLength, true);
       patchedCount += 1;
     }
+    offset = Math.ceil((offset + 16 + nameLength) / 4) * 4;
   }
-  assert.equal(patchedCount, 1, `expected one central-directory entry for ${filePath}`);
-  return bytes;
+  assert.equal(patchedCount, 1, `expected one HEP entry for ${filePath}`);
+  view.setUint32(20, crc32(bytes.subarray(32, 32 + indexLength)), true);
+  return bytes.buffer;
 }
 
 function createRasterScene(seedScene, width, height, data) {
@@ -181,28 +177,24 @@ const seedHepPath = path.join(
   "public/examples/heps/LK_Office_Level_1-parsed-data.hep"
 );
 
-// Middleware mode only transforms TypeScript modules; it does not listen on a
-// port or start the application's development server.
-const viteServer = await createServer({
-  configFile: false,
-  root: repoRootDir,
-  logLevel: "error",
-  server: { middlewareMode: true, hmr: false, ws: false },
-  optimizeDeps: { noDiscovery: true },
-  appType: "custom"
-});
+// Resolve TypeScript imports directly; no Vite middleware or server is needed.
+const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
+  if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) &&
+      !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)) return nextResolve(`${specifier}.ts`, context);
+  return nextResolve(specifier, context);
+} });
 
 try {
   const [zipBuilder, parsedData, rasterImageCodec] = await Promise.all([
-    viteServer.ssrLoadModule("/src/hepBuilder.ts"),
-    viteServer.ssrLoadModule("/src/hep.ts"),
-    viteServer.ssrLoadModule("/src/rasterImageCodec.ts")
+    import("../src/hepBuilder.ts"),
+    import("../src/hep.ts"),
+    import("../src/rasterImageCodec.ts")
   ]);
 
   await assertRasterWebpQualityParity(rasterImageCodec);
 
   const seedBytes = await readFile(seedHepPath);
-  const seedScene = await parsedData.loadSceneFromParsedDataZip(
+  const seedScene = await parsedData.loadSceneFromHep(
     seedBytes.buffer.slice(seedBytes.byteOffset, seedBytes.byteOffset + seedBytes.byteLength)
   );
 
@@ -217,12 +209,12 @@ try {
   }
   const scene = createRasterScene(seedScene, width, height, rgba);
   const progress = [];
-  const encodedBlob = await zipBuilder.buildParsedDataZip(scene, {
+  const encodedBlob = await zipBuilder.buildHep(scene, {
     compression: "store",
     onProgress: (event) => progress.push({ ...event })
   });
   const encodedBytes = await encodedBlob.arrayBuffer();
-  const encodedArchive = await JSZip.loadAsync(encodedBytes);
+  const encodedArchive = await HepArchive.loadAsync(encodedBytes);
   const encodedManifest = JSON.parse(
     await encodedArchive.file("manifest.json").async("string")
   );
@@ -236,9 +228,9 @@ try {
   assert.equal(encodedEntry.paintOrder, 4);
   assert.equal(encodedEntry.pageIndex, 0);
   assert.ok(progress.some((event) => event.stage === "raster-encode"));
-  assert.ok(progress.some((event) => event.stage === "zip-build"));
+  assert.ok(progress.some((event) => event.stage === "hep-build"));
 
-  const roundTrip = await parsedData.loadSceneFromParsedDataZip(encodedBytes);
+  const roundTrip = await parsedData.loadSceneFromHep(encodedBytes);
   assert.equal(roundTrip.rasterLayers.length, 1);
   assert.equal(roundTrip.rasterLayers[0].width, width);
   assert.equal(roundTrip.rasterLayers[0].height, height);
@@ -246,11 +238,11 @@ try {
   assert.deepEqual(Array.from(roundTrip.rasterLayers[0].matrix), [64, 0, 0, 64, 2, 3]);
 
   const tinyRgba = new Uint8Array([12, 34, 56, 78]);
-  const rawBlob = await zipBuilder.buildParsedDataZip(
+  const rawBlob = await zipBuilder.buildHep(
     createRasterScene(seedScene, 1, 1, tinyRgba),
     { compression: "store" }
   );
-  const rawArchive = await JSZip.loadAsync(await rawBlob.arrayBuffer());
+  const rawArchive = await HepArchive.loadAsync(await rawBlob.arrayBuffer());
   const rawManifest = JSON.parse(await rawArchive.file("manifest.json").async("string"));
   assert.equal(rawManifest.scene.rasterLayers[0].encoding, "rgba");
   assert.match(rawManifest.scene.rasterLayers[0].file, /\.rgba$/);
@@ -258,27 +250,27 @@ try {
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(
-    zipBuilder.buildParsedDataZip(scene, { signal: controller.signal }),
+    zipBuilder.buildHep(scene, { signal: controller.signal }),
     (error) => error?.name === "AbortError"
   );
 
   await assert.rejects(
-    parsedData.loadSceneFromParsedDataZip(
-      patchZipEntryUncompressedSize(
+    parsedData.loadSceneFromHep(
+      patchHepEntryUncompressedSize(
         encodedBytes,
         encodedEntry.file,
         768 * 1024 * 1024 + 1
       )
     ),
-    /ZIP entry size is invalid or exceeds the memory budget/
+    /section .* exceeds its decoded byte limit|HEP section size is invalid or exceeds the memory budget/
   );
 
-  const mismatchedArchive = await JSZip.loadAsync(encodedBytes);
+  const mismatchedArchive = await HepArchive.loadAsync(encodedBytes);
   const mismatchedManifest = structuredClone(encodedManifest);
   mismatchedManifest.scene.rasterLayers[0].width += 1;
   mismatchedArchive.file("manifest.json", JSON.stringify(mismatchedManifest));
   await assert.rejects(
-    parsedData.loadSceneFromParsedDataZip(
+    parsedData.loadSceneFromHep(
       await mismatchedArchive.generateAsync({ type: "arraybuffer", compression: "STORE" })
     ),
     /header dimensions do not match its v6 metadata/
@@ -286,5 +278,5 @@ try {
 
   console.log("Synthetic v6 raster archive smoke test passed.");
 } finally {
-  await viteServer.close();
+  hooks.deregister();
 }

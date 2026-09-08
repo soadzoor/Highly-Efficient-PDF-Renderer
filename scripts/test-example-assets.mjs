@@ -8,7 +8,7 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import JSZip from "jszip";
+import { HepArchive } from "../src/hepContainer.ts";
 import { createServer } from "vite";
 
 import { encodeExampleAssetPathSegment } from "./example-asset-path.ts";
@@ -152,13 +152,13 @@ async function run() {
     const servedHep = await requestViteMiddleware(viteServer, hepRequestPath);
     assert.equal(servedHep.status, 200);
     assert.equal(servedHep.body.length, smallestHep.hep.sizeBytes);
-    assert.equal(servedHep.body.subarray(0, 2).toString("ascii"), "PK");
+    assert.deepEqual([...servedHep.body.subarray(0, 4)], [0x48, 0x45, 0x50, 0]);
 
     const [
       { assertPdfBytes, hasPdfHeader },
       { formatPdfDownloadFilename, readPdfDownloadBlob },
       { loadPdfSceneFromSource },
-      { loadSceneFromParsedDataZip },
+      { loadSceneFromHep },
       { extractPdfPageScenes }
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/pdfSignature.ts"),
@@ -206,14 +206,14 @@ async function run() {
       globalThis.fetch = originalFetch;
     }
 
-    const ambiguousZip = new JSZip();
+    const ambiguousZip = new HepArchive();
     ambiguousZip.file("source.pdf", "%PDF-1.4\n");
     const ambiguousZipBytes = await ambiguousZip.generateAsync({ type: "uint8array", compression: "STORE" });
     assert.equal(hasPdfHeader(ambiguousZipBytes), true, "fixture must contain a PDF header in its first 1 KiB");
     await assert.rejects(
       loadPdfSceneFromSource(ambiguousZipBytes),
       /not a valid HEP file.*Compressing a PDF into a ZIP does not create a HEP file/is,
-      "ZIP magic must take precedence over an embedded PDF signature"
+      "HEP magic must take precedence over an embedded PDF signature"
     );
     await assert.rejects(
       loadPdfSceneFromSource(new File(["%PDF-1.4\n"], "renamed-pdf.hep")),
@@ -223,14 +223,14 @@ async function run() {
 
     const hepSource = new File([servedHep.body], "example.hep");
     const loadedHep = await loadPdfSceneFromSource(hepSource);
-    assert.equal(loadedHep.sourceKind, "parsed-zip");
+    assert.equal(loadedHep.sourceKind, "hep");
     assert.equal(loadedHep.sourceLabel, "example.hep");
 
     const progressCallbackError = new Error("progress callback sentinel");
     await assert.rejects(
-      loadSceneFromParsedDataZip(Uint8Array.from(servedHep.body).buffer, {
+      loadSceneFromHep(Uint8Array.from(servedHep.body).buffer, {
         onProgress: (progress) => {
-          if (progress.stage === "zip-open") {
+          if (progress.stage === "hep-open") {
             throw progressCallbackError;
           }
         }
@@ -239,12 +239,12 @@ async function run() {
       "HEP-open guidance must not replace consumer progress callback errors"
     );
 
-    const legacyZipSource = new File([servedHep.body], "legacy-example.zip", {
+    const mislabeledHepSource = new File([servedHep.body], "mislabeled-example.zip", {
       type: "application/zip"
     });
-    const loadedLegacyZip = await loadPdfSceneFromSource(legacyZipSource);
-    assert.equal(loadedLegacyZip.sourceKind, "parsed-zip");
-    assert.equal(loadedLegacyZip.sourceLabel, "legacy-example.zip");
+    const loadedMislabeledHep = await loadPdfSceneFromSource(mislabeledHepSource);
+    assert.equal(loadedMislabeledHep.sourceKind, "hep");
+    assert.equal(loadedMislabeledHep.sourceLabel, "mislabeled-example.zip");
 
     console.log("Example asset regressions passed");
   } finally {

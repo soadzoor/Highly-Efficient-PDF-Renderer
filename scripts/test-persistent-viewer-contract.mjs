@@ -32,7 +32,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildParsedDataZip\s*\(\s*scene\s*,\s*\{/,
+  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildHep\s*\(\s*scene\s*,\s*\{/,
   "HEP export must serialize the already-loaded VectorScene"
 );
 assert.doesNotMatch(
@@ -45,7 +45,7 @@ assert.doesNotMatch(
   /\brenderHeprPageToCanvas2d\b/,
   "the parser's selective Canvas2D compositor must stay out of the viewer"
 );
-assert.match(mainSource, /\bloadSceneFromParsedDataZip\b/);
+assert.match(mainSource, /\bloadSceneFromHep\b/);
 assert.match(
   zipSource,
   /const\s+PARSED_DATA_FORMAT_VERSION\s*=\s*6\s*;/,

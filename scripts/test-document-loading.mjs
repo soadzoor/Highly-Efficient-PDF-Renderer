@@ -37,8 +37,8 @@ const context = vm.createContext({
   logTextureSizeStats: noop, applyTextSearchScene: noop, refreshDropIndicator: noop,
   updateMetricsPanel: noop,
   extractPdfPageScenes: (buffer, options, signal) => nextParse(buffer, options, signal),
-  loadSceneFromParsedDataZip: async (buffer, options) => (await nextParse(buffer, {}, options.signal))[0],
-  tryReadSourcePdfBytesFromExistingParsedZip: async () => null,
+  loadSceneFromHep: async (buffer, options) => (await nextParse(buffer, {}, options.signal))[0],
+  tryReadSourcePdfBytesFromExistingHep: async () => null,
   computeAutoPagesPerRow: () => 1,
   composeVectorScenesInGrid: (pages) => pages[0],
   prepareSceneForHepRendering: (value) => value,
@@ -47,7 +47,7 @@ const context = vm.createContext({
   consumeVectorStrokeLodBuildTiming: () => timing, combineVectorLodTimings: () => timing,
   yieldToBrowserPaint: async () => {}, sanitizeDownloadName: (label) => label,
   triggerBrowserDownload: noop, formatFileSize: String,
-  buildParsedDataZip: async (value, options) => {
+  buildHep: async (value, options) => {
     exports.push({ scene: value, source: options.sourcePdf, label: options.sourceLabel });
     return { size: 1 };
   },

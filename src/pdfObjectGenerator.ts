@@ -4,7 +4,8 @@ import {
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
-import { loadSceneFromParsedDataZip, prepareSceneForHepRendering } from "./hep";
+import { loadSceneFromHep, prepareSceneForHepRendering } from "./hep";
+import { hasHepSignature, hasLegacyZipSignature } from "./hepContainer";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
 import { waitForLoad } from "./loadCancellation";
@@ -18,7 +19,7 @@ import { waitForLoad } from "./loadCancellation";
 export type PdfObjectSource = ArrayBuffer | Uint8Array | Blob | File | string;
 
 /** Detected or declared source format. */
-export type PdfObjectSourceKind = "pdf" | "parsed-zip";
+export type PdfObjectSourceKind = "pdf" | "hep";
 
 /**
  * Options used while loading and parsing a source into HEPR scene data.
@@ -83,7 +84,7 @@ export interface PdfObjectGeneratorOptions {
    * Also extract text strings with scene-space bounding boxes into
    * `VectorScene.textContent` (used for example by `detectRooms` to seed room
    * detection from room labels). Only PDF sources support this option;
-   * HEP (`parsed-zip`) sources ignore it — their searchable text index serves as the
+   * HEP sources ignore it — their searchable text index serves as the
    * room-detection seed source instead.
    *
    * @default false
@@ -176,14 +177,14 @@ async function loadPdfSceneFromSourceInternal(
   }
 
   const scene = await waitForPromiseWithAbort(
-    loadSceneFromParsedDataZip(createParseBuffer(sourceBytes), {
+    loadSceneFromHep(createParseBuffer(sourceBytes), {
       signal,
-      onProgress: progress.child(0.16, 0.95, { sourceType: "zip" }).toCallback()
+      onProgress: progress.child(0.16, 0.95, { sourceType: "hep" }).toCallback()
     }),
     signal
   );
   signal?.throwIfAborted();
-  progress.complete({ sourceType: "zip" });
+  progress.complete({ sourceType: "hep" });
   signal?.throwIfAborted();
   return {
     scene,
@@ -253,7 +254,9 @@ async function readStringSourceBytes(
   }
 
   const decodedBase64 = tryDecodeBase64Bytes(trimmed);
-  if (decodedBase64 && (hasPdfHeader(decodedBase64) || looksLikeZipBytes(decodedBase64))) {
+  if (decodedBase64 && (
+    hasPdfHeader(decodedBase64) || hasHepSignature(decodedBase64) || hasLegacyZipSignature(decodedBase64)
+  )) {
     signal?.throwIfAborted();
     progress?.report(1, { stage: "source", unit: "bytes", processed: decodedBase64.length, total: decodedBase64.length });
     return decodedBase64;
@@ -397,8 +400,11 @@ function resolveSourceKind(
   sourceBytes: Uint8Array,
   sourceKindOption: PdfObjectGeneratorOptions["sourceKind"]
 ): PdfObjectSourceKind {
-  if (sourceKindOption === "pdf" || sourceKindOption === "parsed-zip") {
+  if (sourceKindOption === "pdf" || sourceKindOption === "hep") {
     return sourceKindOption;
+  }
+  if (sourceKindOption !== undefined && sourceKindOption !== "auto") {
+    throw new Error('sourceKind must be "pdf", "hep", or "auto".');
   }
 
   const sourceName = readSourceName(source);
@@ -408,19 +414,20 @@ function resolveSourceKind(
       return "pdf";
     }
     if (lowered.endsWith(".hep") || lowered.endsWith(".zip")) {
-      return "parsed-zip";
+      return "hep";
     }
   }
 
-  if (looksLikeZipBytes(sourceBytes)) {
-    return "parsed-zip";
+  // Recognize old archives so the HEP reader can report how to migrate them.
+  if (hasHepSignature(sourceBytes) || hasLegacyZipSignature(sourceBytes)) {
+    return "hep";
   }
   if (hasPdfHeader(sourceBytes)) {
     return "pdf";
   }
 
   throw new Error(
-    "Unable to detect source kind. Pass options.sourceKind as \"pdf\" or \"parsed-zip\"."
+    "Unable to detect source kind. Pass options.sourceKind as \"pdf\" or \"hep\"."
   );
 }
 
@@ -454,7 +461,7 @@ function readSourceNameFromString(source: string): string | null {
     if (mime === "application/pdf") {
       return "inline.pdf";
     }
-    if (mime === "application/zip" || mime === "application/x-zip-compressed") {
+    if (mime === "application/x-hep" || mime === "application/zip" || mime === "application/x-zip-compressed") {
       return "inline.hep";
     }
     return "inline-data.bin";
@@ -497,17 +504,6 @@ function looksLikeRawBase64Source(value: string): boolean {
     normalized.length >= 64 &&
     normalized.length % 4 === 0 &&
     /^[A-Za-z0-9+/]+={0,2}$/.test(normalized)
-  );
-}
-
-function looksLikeZipBytes(bytes: Uint8Array): boolean {
-  if (bytes.length < 4) {
-    return false;
-  }
-  return (
-    (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) ||
-    (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x05 && bytes[3] === 0x06) ||
-    (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x07 && bytes[3] === 0x08)
   );
 }
 

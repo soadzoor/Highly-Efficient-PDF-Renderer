@@ -4,7 +4,7 @@ import {
   type PdfObjectSource
 } from "./pdfObjectGenerator";
 import {
-  buildParsedDataZipBlobForLayout,
+  buildHepBlobForLayout,
   listSceneRasterLayers,
   type SceneTextureStats
 } from "./hep";
@@ -17,21 +17,18 @@ import {
 import { hasPdfHeader } from "./pdfSignature";
 
 /** Compression algorithm used inside a generated HEP file. */
-export type ParsedDataZipCompression = "deflate" | "store";
+export type HepCompression = "deflate" | "store";
 
 /** Options shared by PDF-source and already-parsed scene HEP builds. */
-export interface ParsedDataZipEncodingOptions {
+export interface HepEncodingOptions {
   /** Override the source name written to the HEP manifest. */
   sourceLabel?: string;
 
   /** Encode raster layers as WebP/PNG when supported; otherwise store raw RGBA. @default true */
   encodeRasterImages?: boolean;
 
-  /** ZIP compression algorithm. @default "deflate" */
-  compression?: ParsedDataZipCompression;
-
-  /** DEFLATE compression level from 1 (fastest) to 9 (smallest). @default 9 */
-  compressionLevel?: number;
+  /** HEP compression algorithm. @default "deflate" */
+  compression?: HepCompression;
 
   /** Receives normalized progress for the complete parse-and-build operation. */
   onProgress?: LoadProgressCallback;
@@ -41,7 +38,7 @@ export interface ParsedDataZipEncodingOptions {
 }
 
 /** Options when building parsed data directly from an accepted PDF source. */
-export interface BuildParsedDataZipFromPdfOptions extends ParsedDataZipEncodingOptions {
+export interface BuildHepFromPdfOptions extends HepEncodingOptions {
   /** Merge compatible adjacent vector stroke segments during parsing. @default true */
   segmentMerge?: boolean;
 
@@ -56,7 +53,7 @@ export interface BuildParsedDataZipFromPdfOptions extends ParsedDataZipEncodingO
 }
 
 /** Options when building parsed data from an existing HEPR scene. */
-export interface BuildParsedDataZipFromSceneOptions extends ParsedDataZipEncodingOptions {
+export interface BuildHepFromSceneOptions extends HepEncodingOptions {
   /**
    * Original PDF source used only when the scene reports images but contains no
    * extracted raster layers. It accepts the same source forms as `pdfObjectGenerator`.
@@ -77,32 +74,32 @@ export interface BuildParsedDataZipFromSceneOptions extends ParsedDataZipEncodin
  * Accepted inputs are URLs/paths, raw base64 or data URLs, `File`, `Blob`,
  * `Uint8Array`, and `ArrayBuffer` values.
  */
-export function buildParsedDataZip(
+export function buildHep(
   source: PdfObjectSource,
-  options?: BuildParsedDataZipFromPdfOptions
+  options?: BuildHepFromPdfOptions
 ): Promise<Blob>;
 
 /** Build a HEP parsed-data file from an already-parsed scene without parsing again. */
-export function buildParsedDataZip(
+export function buildHep(
   scene: VectorScene,
-  options?: BuildParsedDataZipFromSceneOptions
+  options?: BuildHepFromSceneOptions
 ): Promise<Blob>;
 
-export async function buildParsedDataZip(
+export async function buildHep(
   input: PdfObjectSource | VectorScene,
-  options: BuildParsedDataZipFromPdfOptions | BuildParsedDataZipFromSceneOptions = {}
+  options: BuildHepFromPdfOptions | BuildHepFromSceneOptions = {}
 ): Promise<Blob> {
   validateEncodingOptions(options);
   options.signal?.throwIfAborted();
   if (isVectorScene(input)) {
-    return buildParsedDataZipFromScene(input, options as BuildParsedDataZipFromSceneOptions);
+    return buildHepFromScene(input, options as BuildHepFromSceneOptions);
   }
-  return buildParsedDataZipFromPdf(input, options as BuildParsedDataZipFromPdfOptions);
+  return buildHepFromPdf(input, options as BuildHepFromPdfOptions);
 }
 
-async function buildParsedDataZipFromPdf(
+async function buildHepFromPdf(
   source: PdfObjectSource,
-  options: BuildParsedDataZipFromPdfOptions
+  options: BuildHepFromPdfOptions
 ): Promise<Blob> {
   const progress = createLoadProgressReporter(options.onProgress);
   const parseProgress = progress.child(0, 0.82, { sourceType: "pdf" });
@@ -119,7 +116,7 @@ async function buildParsedDataZipFromPdf(
   const sourcePdfBytes = needsSourcePdfFallback(loaded.scene, rasterLayers.length)
     ? loaded.sourceBytes
     : null;
-  const result = await buildSceneZip(
+  const result = await buildSceneHep(
     loaded.scene,
     normalizeSourceLabel(options.sourceLabel, loaded.sourceLabel),
     sourcePdfBytes,
@@ -129,12 +126,13 @@ async function buildParsedDataZipFromPdf(
     progress.child(0.82, 1, { sourceType: "pdf" })
   );
   progress.complete({ sourceType: "pdf" });
+  options.signal?.throwIfAborted();
   return result;
 }
 
-async function buildParsedDataZipFromScene(
+async function buildHepFromScene(
   scene: VectorScene,
-  options: BuildParsedDataZipFromSceneOptions
+  options: BuildHepFromSceneOptions
 ): Promise<Blob> {
   const progress = createLoadProgressReporter(options.onProgress);
   options.signal?.throwIfAborted();
@@ -162,7 +160,7 @@ async function buildParsedDataZipFromScene(
     }
   }
 
-  const result = await buildSceneZip(
+  const result = await buildSceneHep(
     scene,
     normalizeSourceLabel(options.sourceLabel, "document.pdf"),
     sourcePdfBytes,
@@ -172,22 +170,21 @@ async function buildParsedDataZipFromScene(
     progress.child(buildStart, 1)
   );
   progress.complete();
+  options.signal?.throwIfAborted();
   return result;
 }
 
-async function buildSceneZip(
+async function buildSceneHep(
   scene: VectorScene,
   sourceLabel: string,
   sourcePdfBytes: Uint8Array | null,
   rasterLayers: ReturnType<typeof listSceneRasterLayers>,
   sourcePdfPages: string | undefined,
-  options: ParsedDataZipEncodingOptions,
+  options: HepEncodingOptions,
   progress: ReturnType<typeof createLoadProgressReporter>
 ): Promise<Blob> {
   assertCurrentVectorScene(scene);
-  const compressionLevel =
-    options.compression === "store" ? 9 : normalizeCompressionLevel(options.compressionLevel);
-  const result = await buildParsedDataZipBlobForLayout(
+  const result = await buildHepBlobForLayout(
     scene,
     buildSceneTextureStats(scene),
     sourceLabel,
@@ -196,8 +193,7 @@ async function buildSceneZip(
     rasterLayers,
     {
       encodeRasterImages: options.encodeRasterImages ?? true,
-      zipCompression: options.compression === "store" ? "STORE" : "DEFLATE",
-      zipDeflateLevel: compressionLevel,
+      compression: options.compression === "store" ? "STORE" : "DEFLATE",
       sourcePdfPages,
       signal: options.signal,
       onBuildProgress: (value, buildProgress) => {
@@ -315,26 +311,16 @@ function normalizeSourceLabel(value: string | undefined, fallback: string): stri
   return trimmed ? trimmed : fallback;
 }
 
-function normalizeCompressionLevel(value: number | undefined): number {
-  if (value === undefined) {
-    return 9;
+function validateEncodingOptions(options: HepEncodingOptions): void {
+  if ("compressionLevel" in options) {
+    throw new RangeError("compressionLevel is no longer supported; native HEP compression uses the platform default.");
   }
-  if (!Number.isInteger(value) || value < 1 || value > 9) {
-    throw new RangeError("compressionLevel must be an integer from 1 to 9.");
-  }
-  return value;
-}
-
-function validateEncodingOptions(options: ParsedDataZipEncodingOptions): void {
   if (
     options.compression !== undefined &&
     options.compression !== "deflate" &&
     options.compression !== "store"
   ) {
     throw new RangeError('compression must be either "deflate" or "store".');
-  }
-  if (options.compression !== "store") {
-    normalizeCompressionLevel(options.compressionLevel);
   }
 }
 

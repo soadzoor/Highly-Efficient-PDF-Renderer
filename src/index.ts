@@ -91,7 +91,7 @@ export async function pdfObjectGenerator(
       onProgress: progress.child(0, LOAD_PROGRESS_SCENE_END).toCallback()
     });
     signal?.throwIfAborted();
-    const sourceType = loadedScene.sourceKind === "pdf" ? "pdf" : "zip";
+    const sourceType = loadedScene.sourceKind === "pdf" ? "pdf" : "hep";
     progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
     await prebuildVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
       yieldIntervalMs: 500,
@@ -173,13 +173,13 @@ export type {
   CanvasInteractionController
 };
 
-export { buildParsedDataZip } from "./hepBuilder";
+export { buildHep } from "./hepBuilder";
 
 export type {
-  BuildParsedDataZipFromPdfOptions,
-  BuildParsedDataZipFromSceneOptions,
-  ParsedDataZipCompression,
-  ParsedDataZipEncodingOptions
+  BuildHepFromPdfOptions,
+  BuildHepFromSceneOptions,
+  HepCompression,
+  HepEncodingOptions
 } from "./hepBuilder";
 
 export type {

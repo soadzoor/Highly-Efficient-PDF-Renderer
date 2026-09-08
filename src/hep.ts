@@ -1,4 +1,4 @@
-import JSZip from "jszip";
+import { HepArchive, type HepArchiveEntry } from "./hepContainer";
 import { waitForLoad } from "./loadCancellation";
 
 import {
@@ -89,23 +89,22 @@ type TextureComponentType =
   | "uint16-normalized-range"
   | "uint16-range-delta-columns";
 
-export interface BuildParsedDataZipOptions {
+export interface BuildHepBlobOptions {
   encodeRasterImages?: boolean;
-  zipCompression?: "STORE" | "DEFLATE";
-  zipDeflateLevel?: number;
+  compression?: "STORE" | "DEFLATE";
   sourcePdfPages?: string;
   signal?: AbortSignal;
-  onBuildProgress?: (value: number, progress: ParsedDataZipBuildProgress) => void;
+  onBuildProgress?: (value: number, progress: HepBuildProgress) => void;
 }
 
-export interface ParsedDataZipBuildProgress {
-  stage: "raster-encode" | "zip-build";
+export interface HepBuildProgress {
+  stage: "raster-encode" | "hep-build";
   unit?: "texels";
   processed?: number;
   total?: number;
 }
 
-export interface LoadParsedDataZipOptions {
+export interface LoadHepOptions {
   /** Stop loading between archive entries, image decodes, and recovery work. */
   signal?: AbortSignal;
   onProgress?: LoadProgressCallback;
@@ -194,7 +193,7 @@ interface ParsedDataGradientLutEntry {
   byteLength?: unknown;
 }
 
-export interface ParsedDataZipBlobResult {
+export interface HepBlobResult {
   blob: Blob;
   byteLength: number;
   textureCount: number;
@@ -214,19 +213,18 @@ interface SerializedRasterLayerEntry {
 
 const GRADIENT_LUT_PATH = "textures/gradient-lut.rgba";
 
-export async function buildParsedDataZipBlobForLayout(
+export async function buildHepBlobForLayout(
   scene: VectorScene,
   sceneStats: SceneTextureStats,
   label: string,
   sourcePdfBytes: Uint8Array | null,
   textureLayout: TextureLayout,
   sceneRasterLayers: RasterLayer[],
-  options: BuildParsedDataZipOptions = {}
-): Promise<ParsedDataZipBlobResult> {
+  options: BuildHepBlobOptions = {}
+): Promise<HepBlobResult> {
   throwIfBuildAborted(options.signal);
   const encodeRasterImages = options.encodeRasterImages ?? true;
-  const zipCompression = options.zipCompression ?? "DEFLATE";
-  const zipDeflateLevel = options.zipDeflateLevel ?? 9;
+  const compression = options.compression ?? "DEFLATE";
   const sourcePdfPages =
     typeof options.sourcePdfPages === "string" && options.sourcePdfPages.trim().length > 0
       ? options.sourcePdfPages.trim()
@@ -235,7 +233,7 @@ export async function buildParsedDataZipBlobForLayout(
   const totalRasterTexels = encodeRasterImages
     ? countRasterTexelsToEncode(sceneRasterLayers)
     : 0;
-  const zipBuildStart = totalRasterTexels > 0 ? 0.4 : 0;
+  const hepBuildStart = totalRasterTexels > 0 ? 0.4 : 0;
   options.onBuildProgress?.(
     0,
     totalRasterTexels > 0
@@ -245,9 +243,9 @@ export async function buildParsedDataZipBlobForLayout(
           processed: 0,
           total: totalRasterTexels
         }
-      : { stage: "zip-build" }
+      : { stage: "hep-build" }
   );
-  const zip = new JSZip();
+  const archive = new HepArchive();
   const textureEntries = buildTextureExportEntries(scene, sceneStats, textureLayout);
   const includeSourcePdf = !!sourcePdfBytes && sourcePdfBytes.length > 0 && scene.imagePaintOpCount > 0;
   const useSourcePdfFallback = includeSourcePdf && sceneRasterLayers.length === 0;
@@ -257,7 +255,7 @@ export async function buildParsedDataZipBlobForLayout(
   for (const entry of textureEntries) {
     throwIfBuildAborted(options.signal);
     const bytes = serializeTextureExportEntry(entry);
-    zip.file(entry.filePath, bytes);
+    archive.file(entry.filePath, bytes);
   }
 
   const gradientLutByteLength = scene.gradientCount * GRADIENT_LUT_WIDTH * 4;
@@ -267,41 +265,41 @@ export async function buildParsedDataZipBlobForLayout(
     );
   }
   if (gradientLutByteLength > 0) {
-    zip.file(
+    archive.file(
       GRADIENT_LUT_PATH,
       scene.gradientLut.subarray(0, gradientLutByteLength)
     );
   }
 
   if (sourcePdfFile && sourcePdfBytes) {
-    zip.file(sourcePdfFile, sourcePdfBytes);
+    archive.file(sourcePdfFile, sourcePdfBytes);
   }
 
   const textIndexExport = buildTextIndexExport(scene);
   if (textIndexExport) {
-    zip.file(TEXT_INDEX_JSON_PATH, textIndexExport.json);
-    zip.file(TEXT_CHAR_MAP_PATH, textIndexExport.charMapBytes);
+    archive.file(TEXT_INDEX_JSON_PATH, textIndexExport.json);
+    archive.file(TEXT_CHAR_MAP_PATH, textIndexExport.charMapBytes);
     if (textIndexExport.fallbackBytes) {
-      zip.file(TEXT_FALLBACK_PATH, textIndexExport.fallbackBytes);
+      archive.file(TEXT_FALLBACK_PATH, textIndexExport.fallbackBytes);
     }
   }
 
   const strokeGeometryExport = buildStrokeGeometryExport(scene);
   if (strokeGeometryExport) {
-    zip.file(strokeGeometryExport.manifest.endpointsFile, strokeGeometryExport.endpointsBytes);
-    zip.file(strokeGeometryExport.manifest.metaFile, strokeGeometryExport.metaBytes);
+    archive.file(strokeGeometryExport.manifest.endpointsFile, strokeGeometryExport.endpointsBytes);
+    archive.file(strokeGeometryExport.manifest.metaFile, strokeGeometryExport.metaBytes);
     if (strokeGeometryExport.clipBoundsBytes) {
-      zip.file(strokeGeometryExport.manifest.clipBoundsFile!, strokeGeometryExport.clipBoundsBytes);
+      archive.file(strokeGeometryExport.manifest.clipBoundsFile!, strokeGeometryExport.clipBoundsBytes);
     }
   }
 
   const textInstancesExport = buildTextInstancesExport(scene);
   if (textInstancesExport) {
-    zip.file(textInstancesExport.manifest.positionsFile, textInstancesExport.positionsBytes);
-    zip.file(textInstancesExport.manifest.glyphIndexFile, textInstancesExport.glyphIndexBytes);
+    archive.file(textInstancesExport.manifest.positionsFile, textInstancesExport.positionsBytes);
+    archive.file(textInstancesExport.manifest.glyphIndexFile, textInstancesExport.glyphIndexBytes);
     if (textInstancesExport.clipReferenceBytes && textInstancesExport.clipRectBytes) {
-      zip.file(TEXT_INSTANCE_CLIP_REFS_PATH, textInstancesExport.clipReferenceBytes);
-      zip.file(TEXT_CLIP_RECTS_PATH, textInstancesExport.clipRectBytes);
+      archive.file(TEXT_INSTANCE_CLIP_REFS_PATH, textInstancesExport.clipReferenceBytes);
+      archive.file(TEXT_CLIP_RECTS_PATH, textInstancesExport.clipRectBytes);
     }
   }
 
@@ -345,11 +343,11 @@ export async function buildParsedDataZipBlobForLayout(
       }
     }
     if (encoding === "rgba") {
-      zip.file(filePath, layerBytes);
+      archive.file(filePath, layerBytes);
     } else {
       // WebP and PNG already carry entropy compression; deflating them again
       // wastes export time and normally cannot recover meaningful bytes.
-      zip.file(filePath, layerBytes, { compression: "STORE" });
+      archive.file(filePath, layerBytes, { compression: "STORE" });
     }
     serializedRasterLayers.push({
       width: layer.width,
@@ -374,7 +372,7 @@ export async function buildParsedDataZipBlobForLayout(
     }
   }
   throwIfBuildAborted(options.signal);
-  options.onBuildProgress?.(zipBuildStart, { stage: "zip-build" });
+  options.onBuildProgress?.(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
     formatVersion: PARSED_DATA_FORMAT_VERSION,
@@ -458,36 +456,25 @@ export async function buildParsedDataZipBlobForLayout(
   };
 
   throwIfBuildAborted(options.signal);
-  zip.file("manifest.json", JSON.stringify(manifest, null, 2));
-  const zipGenerateOptions =
-    zipCompression === "DEFLATE"
-      ? {
-          type: "blob" as const,
-          compression: "DEFLATE" as const,
-          compressionOptions: { level: zipDeflateLevel },
-          mimeType: "application/zip"
-        }
-      : {
-          type: "blob" as const,
-          compression: "STORE" as const,
-          mimeType: "application/zip"
-        };
-
-  const onZipProgress = (metadata: { percent: number }): void => {
+  archive.file("manifest.json", JSON.stringify(manifest));
+  const onHepProgress = (metadata: { percent: number }): void => {
     options.onBuildProgress?.(
-      zipBuildStart + (1 - zipBuildStart) * (metadata.percent / 100),
-      { stage: "zip-build" }
+      hepBuildStart + (1 - hepBuildStart) * (metadata.percent / 100),
+      { stage: "hep-build" }
     );
   };
-  const zipBlob = options.signal
-    ? await generateZipBlobWithAbort(zip, zipGenerateOptions, options.signal, onZipProgress)
-    : await zip.generateAsync(zipGenerateOptions, onZipProgress);
+  const hepBlob = await archive.generateAsync({
+    type: "blob",
+    compression,
+    signal: options.signal
+  }, onHepProgress);
   throwIfBuildAborted(options.signal);
-  options.onBuildProgress?.(1, { stage: "zip-build" });
+  options.onBuildProgress?.(1, { stage: "hep-build" });
+  throwIfBuildAborted(options.signal);
 
   return {
-    blob: zipBlob,
-    byteLength: zipBlob.size,
+    blob: hepBlob,
+    byteLength: hepBlob.size,
     textureCount: textureEntries.length + (gradientLutByteLength > 0 ? 1 : 0),
     rasterLayerCount: rasterLayers.length,
     layout: textureLayout
@@ -518,52 +505,6 @@ function countRasterTexelsToEncode(rasterLayers: readonly RasterLayer[]): number
 
 function throwIfBuildAborted(signal: AbortSignal | undefined): void {
   signal?.throwIfAborted();
-}
-
-async function generateZipBlobWithAbort(
-  zip: JSZip,
-  options: JSZip.JSZipGeneratorOptions<"blob">,
-  signal: AbortSignal,
-  onProgress: (metadata: JSZip.JSZipMetadata) => void
-): Promise<Blob> {
-  throwIfBuildAborted(signal);
-  const stream = zip.generateInternalStream(options);
-
-  return new Promise<Blob>((resolve, reject) => {
-    let settled = false;
-    const finish = (callback: () => void): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      signal.removeEventListener("abort", onAbort);
-      callback();
-    };
-    const onAbort = (): void => {
-      stream.pause();
-      finish(() => {
-        try {
-          signal.throwIfAborted();
-        } catch (error) {
-          reject(error);
-          return;
-        }
-        reject(new DOMException("The HEP build was aborted.", "AbortError"));
-      });
-    };
-
-    signal.addEventListener("abort", onAbort, { once: true });
-    stream.accumulate((metadata) => {
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      onProgress(metadata);
-    }).then(
-      (blob) => finish(() => resolve(blob)),
-      (error: unknown) => finish(() => reject(error))
-    );
-  });
 }
 
 /** v6 adds first-class analytic gradient and soft-mask paint resources. */
@@ -689,14 +630,14 @@ interface TextIndexPageEntry {
   fallbackCount?: unknown;
 }
 
-async function readSceneTextIndexFromParsedData(zip: JSZip, manifest: ParsedDataManifest): Promise<SceneTextIndex | null> {
+async function readSceneTextIndexFromParsedData(archive: HepArchive, manifest: ParsedDataManifest): Promise<SceneTextIndex | null> {
   try {
     const meta =
       typeof manifest.textIndex === "object" && manifest.textIndex
         ? (manifest.textIndex as TextIndexManifestMeta)
         : {};
     const jsonPath = typeof meta.file === "string" ? meta.file : TEXT_INDEX_JSON_PATH;
-    const jsonEntry = zip.file(jsonPath);
+    const jsonEntry = archive.file(jsonPath);
     if (!jsonEntry) {
       return null;
     }
@@ -709,11 +650,11 @@ async function readSceneTextIndexFromParsedData(zip: JSZip, manifest: ParsedData
     }
 
     const charMapPath = typeof meta.charMapFile === "string" ? meta.charMapFile : TEXT_CHAR_MAP_PATH;
-    const charMapEntry = zip.file(charMapPath);
+    const charMapEntry = archive.file(charMapPath);
     if (!charMapEntry) {
       return null;
     }
-    return await readTextIndexV2(zip, meta, pageEntries, charMapEntry);
+    return await readTextIndexV2(archive, meta, pageEntries, charMapEntry);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[Parsed data load] Failed to read text index: ${message}`);
@@ -722,10 +663,10 @@ async function readSceneTextIndexFromParsedData(zip: JSZip, manifest: ParsedData
 }
 
 async function readTextIndexV2(
-  zip: JSZip,
+  archive: HepArchive,
   meta: TextIndexManifestMeta,
   pageEntries: TextIndexPageEntry[],
-  charMapEntry: JSZip.JSZipObject
+  charMapEntry: HepArchiveEntry
 ): Promise<SceneTextIndex | null> {
   const charMapBytes = new Uint8Array(await charMapEntry.async("arraybuffer"));
 
@@ -737,7 +678,7 @@ async function readTextIndexV2(
   let fallbackAll: Float32Array | null = null;
   if (totalFallbackCount > 0) {
     const fallbackPath = typeof meta.fallbackFile === "string" ? meta.fallbackFile : TEXT_FALLBACK_PATH;
-    const fallbackEntry = zip.file(fallbackPath);
+    const fallbackEntry = archive.file(fallbackPath);
     const lengths = Array.isArray(meta.fallbackColumnByteLengths) ? meta.fallbackColumnByteLengths.map(Number) : null;
     if (!fallbackEntry || !lengths || lengths.length !== 4 || lengths.some((value) => !Number.isFinite(value) || value < 0)) {
       console.warn("[Parsed data load] Text index fallback quads are missing or invalid; ignoring text index.");
@@ -937,11 +878,11 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
  * are stored as deltas against the quantized chord midpoint.
  */
 async function readStrokeGeometryFromSection(
-  zip: JSZip,
+  archive: HepArchive,
   section: StrokeGeometrySectionMeta
 ): Promise<ReturnType<typeof decodeStrokeGeometry> & { encoded: StrokeGeometryExport }> {
-  const endpointsEntry = zip.file(section.endpointsFile);
-  const metaEntry = zip.file(section.metaFile);
+  const endpointsEntry = archive.file(section.endpointsFile);
+  const metaEntry = archive.file(section.metaFile);
   if (!endpointsEntry || !metaEntry) {
     throw new Error("HEP file is missing v5 stroke geometry files.");
   }
@@ -951,7 +892,7 @@ async function readStrokeGeometryFromSection(
   ]);
   let clipBoundsBytes: Uint8Array | undefined;
   if (section.clipBoundsFile) {
-    const entry = zip.file(section.clipBoundsFile);
+    const entry = archive.file(section.clipBoundsFile);
     if (!entry) {
       throw new Error("HEP file is missing clipped stroke bounds.");
     }
@@ -1089,15 +1030,15 @@ function decodeStrokeGeometry(encoded: StrokeGeometryExport): {
 }
 
 /** Decodes the v5 text instance section back into the interleaved textInstanceB array. */
-async function readTextInstancesFromSection(zip: JSZip, section: TextInstancesSectionMeta): Promise<Float32Array> {
+async function readTextInstancesFromSection(archive: HepArchive, section: TextInstancesSectionMeta): Promise<Float32Array> {
   const count = section.count;
   const instanceB = new Float32Array(count * 4);
   if (count === 0) {
     return instanceB;
   }
 
-  const positionsEntry = zip.file(section.positionsFile);
-  const glyphIndexEntry = zip.file(section.glyphIndexFile);
+  const positionsEntry = archive.file(section.positionsFile);
+  const glyphIndexEntry = archive.file(section.glyphIndexFile);
   if (!positionsEntry || !glyphIndexEntry) {
     throw new Error("HEP file is missing v5 text instance files.");
   }
@@ -1180,7 +1121,7 @@ const preparedHepScenes = new WeakSet<VectorScene>();
 
 /**
  * Apply HEP's existing vector precision after page layout and before LOD/GPU
- * preparation. Cached parser pages remain untouched. No ZIP is generated.
+ * preparation. Cached parser pages remain untouched. No archive is generated.
  */
 export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
   if (preparedHepScenes.has(scene)) {
@@ -1484,24 +1425,25 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
   ];
 }
 
-export async function loadSceneFromParsedDataZip(
+export async function loadSceneFromHep(
   buffer: ArrayBuffer,
-  options: LoadParsedDataZipOptions = {}
+  options: LoadHepOptions = {}
 ): Promise<VectorScene> {
   options.signal?.throwIfAborted();
-  return waitForLoad(loadSceneFromParsedDataZipInternal(buffer, options), options.signal);
+  return waitForLoad(loadSceneFromHepInternal(buffer, options), options.signal);
 }
 
-async function loadSceneFromParsedDataZipInternal(
+async function loadSceneFromHepInternal(
   buffer: ArrayBuffer,
-  options: LoadParsedDataZipOptions
+  options: LoadHepOptions
 ): Promise<VectorScene> {
   const signal = options.signal;
   const progress = createLoadProgressReporter(options.onProgress ? (event) => {
     if (!signal?.aborted) options.onProgress?.(event);
   } : undefined);
-  const zip = await progress.child(0, 0.16, { sourceType: "zip" }).withIndeterminateProgress(
-    () => JSZip.loadAsync(buffer).catch((error: unknown) => {
+  const archive = await progress.child(0, 0.16, { sourceType: "hep" }).withIndeterminateProgress(
+    () => HepArchive.loadAsync(buffer, { signal }).catch((error: unknown) => {
+      signal?.throwIfAborted();
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
         `Unable to open HEP file: ${message}. ` +
@@ -1509,24 +1451,24 @@ async function loadSceneFromParsedDataZipInternal(
         { cause: error }
       );
     }),
-    { stage: "zip-open", sourceType: "zip" }
+    { stage: "hep-open", sourceType: "hep" }
   );
   signal?.throwIfAborted();
-  const manifestFile = zip.file("manifest.json");
+  const manifestFile = archive.file("manifest.json");
   if (!manifestFile) {
     throw new Error(
       "This is not a valid HEP file: manifest.json is missing. " +
       "Compressing a PDF into a ZIP does not create a HEP file; load the PDF directly or export it from HEPR."
     );
   }
-  const manifestByteLength = readZipEntryUncompressedSize(manifestFile);
+  const manifestByteLength = readHepEntryUncompressedSize(manifestFile);
   if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
     throw new Error("Parsed data manifest size is invalid or exceeds the memory budget.");
   }
 
-  const manifestJson = await progress.child(0.16, 0.22, { sourceType: "zip" }).withIndeterminateProgress(
-    manifestFile.async("string"),
-    { stage: "zip-manifest", sourceType: "zip" }
+  const manifestJson = await progress.child(0.16, 0.22, { sourceType: "hep" }).withIndeterminateProgress(
+    () => manifestFile.async("string"),
+    { stage: "hep-manifest", sourceType: "hep" }
   );
   signal?.throwIfAborted();
   let manifest: ParsedDataManifest;
@@ -1554,9 +1496,9 @@ async function loadSceneFromParsedDataZipInternal(
   let textureReadCount = 0;
   const reportTextureProgress = (): void => {
     progress.report(0.22 + (textureReadCount / textureReadTotal) * 0.58, {
-      stage: "zip-file",
-      sourceType: "zip",
-      unit: "files",
+      stage: "hep-section",
+      sourceType: "hep",
+      unit: "sections",
       processed: textureReadCount,
       total: textureReadTotal
     });
@@ -1578,15 +1520,15 @@ async function loadSceneFromParsedDataZipInternal(
       reportTextureProgress();
       const entry = textureByName.get(name);
       const path = entry && typeof entry.file === "string" ? entry.file : null;
-      const zipEntry = path ? zip.file(path) : null;
-      if (!entry || !zipEntry) {
+      const archiveEntry = path ? archive.file(path) : null;
+      if (!entry || !archiveEntry) {
         if (required) {
           throw new Error(`HEP file is missing required texture: ${name}.`);
         }
         return null;
       }
 
-      const fileBuffer = await zipEntry.async("arraybuffer");
+      const fileBuffer = await archiveEntry.async("arraybuffer");
       signal?.throwIfAborted();
       const raw = readTexturePayloadAsFloat32(fileBuffer, entry, name);
       const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
@@ -1716,7 +1658,7 @@ async function loadSceneFromParsedDataZipInternal(
   const gradientStrokePrimitiveMeta = trimTextureForItemCount(gradientStrokePrimitiveMetaEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-primitive-meta");
   const gradientStrokePrimitiveBounds = trimTextureForItemCount(gradientStrokePrimitiveBoundsEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-primitive-bounds");
   const gradientStrokeStyles = trimTextureForItemCount(gradientStrokeStylesEntry?.data ?? new Float32Array(0), gradientStrokeSegmentCount, "gradient-stroke-styles");
-  const gradientLut = await readGradientLutFromParsedData(zip, manifest.gradientLut, gradientCount);
+  const gradientLut = await readGradientLutFromParsedData(archive, manifest.gradientLut, gradientCount);
   const nativeGradientResources: NativeGradientResources = {
     gradientCount,
     gradientMetaA,
@@ -1744,7 +1686,7 @@ async function loadSceneFromParsedDataZipInternal(
   };
 
   const strokeDecodeStart = performance.now();
-  const strokeGeometry = strokeGeometrySection ? await readStrokeGeometryFromSection(zip, strokeGeometrySection) : null;
+  const strokeGeometry = strokeGeometrySection ? await readStrokeGeometryFromSection(archive, strokeGeometrySection) : null;
   const strokeDecodeMs = performance.now() - strokeDecodeStart;
   const endpoints = strokeGeometry?.endpoints ?? new Float32Array(0);
   const styles = trimTextureForItemCount(strokeStylesEntry?.data ?? new Float32Array(0), segmentCount, "stroke-styles");
@@ -1754,12 +1696,12 @@ async function loadSceneFromParsedDataZipInternal(
   const textInstanceA = trimTextureForItemCount(textInstanceAEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-a");
   const textDecodeStart = performance.now();
   const textInstanceB = textInstancesSection
-    ? await readTextInstancesFromSection(zip, textInstancesSection)
+    ? await readTextInstancesFromSection(archive, textInstancesSection)
     : new Float32Array(0);
   let textClipRects: Float32Array | undefined;
   if (textInstancesSection?.clipRectsFile && textInstancesSection.clipReferencesFile) {
-    const rectEntry = zip.file(textInstancesSection.clipRectsFile);
-    const refEntry = zip.file(textInstancesSection.clipReferencesFile);
+    const rectEntry = archive.file(textInstancesSection.clipRectsFile);
+    const refEntry = archive.file(textInstancesSection.clipReferencesFile);
     if (!rectEntry || !refEntry) throw new Error("HEP file is missing text clip files.");
     const [rectBuffer, refBuffer] = await Promise.all([
       rectEntry.async("arraybuffer"),
@@ -1806,18 +1748,18 @@ async function loadSceneFromParsedDataZipInternal(
   const pageCount = Math.max(1, readNonNegativeInt(sceneMeta.pageCount, 1));
   const pagesPerRow = Math.max(1, readNonNegativeInt(sceneMeta.pagesPerRow, 1));
   validateNativeGradientResources(nativeGradientResources, pageCount);
-  progress.report(0.82, { stage: "zip-file", sourceType: "zip", unit: "files" });
+  progress.report(0.82, { stage: "hep-section", sourceType: "hep", unit: "sections" });
   signal?.throwIfAborted();
-  let rasterLayers = await readRasterLayersFromParsedData(zip, sceneMeta, signal);
+  let rasterLayers = await readRasterLayersFromParsedData(archive, sceneMeta, signal);
   signal?.throwIfAborted();
   for (const layer of rasterLayers) {
     if (layer.pageIndex >= pageCount) {
       throw new Error(`Raster layer references invalid page ${layer.pageIndex}.`);
     }
   }
-  progress.report(0.88, { stage: "compile", sourceType: "zip" });
+  progress.report(0.88, { stage: "compile", sourceType: "hep" });
   if (rasterLayers.length === 0) {
-    const sourcePdfBytes = await readSourcePdfBytesFromParsedData(zip, manifest);
+    const sourcePdfBytes = await readSourcePdfBytesFromParsedData(archive, manifest);
     signal?.throwIfAborted();
     if (sourcePdfBytes) {
       try {
@@ -1845,7 +1787,7 @@ async function loadSceneFromParsedDataZipInternal(
     }
   }
   const primaryRasterLayer = rasterLayers[0] ?? null;
-  const textIndex = await readSceneTextIndexFromParsedData(zip, manifest);
+  const textIndex = await readSceneTextIndexFromParsedData(archive, manifest);
   signal?.throwIfAborted();
   const maxHalfWidth =
     readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
@@ -1872,7 +1814,7 @@ async function loadSceneFromParsedDataZipInternal(
     Math.max(1, Math.floor(pageRects.length / 4)),
     textInstanceCount
   ) ?? inferPageTextRanges(pageRects, textInstanceB, textInstanceCount);
-  progress.report(0.96, { stage: "compile", sourceType: "zip" });
+  progress.report(0.96, { stage: "compile", sourceType: "hep" });
 
   const scene = optimizeVectorSceneTextGlyphs({
     pageRects,
@@ -1959,7 +1901,7 @@ async function loadSceneFromParsedDataZipInternal(
     preparedStrokeGeometry.set(scene, strokeGeometry.encoded);
   }
   preparedHepScenes.add(scene);
-  progress.complete({ sourceType: "zip" });
+  progress.complete({ sourceType: "hep" });
   return scene;
 }
 
@@ -2007,7 +1949,7 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
 }
 
 async function readGradientLutFromParsedData(
-  zip: JSZip,
+  archive: HepArchive,
   rawEntry: unknown,
   gradientCount: number
 ): Promise<Uint8Array> {
@@ -2026,11 +1968,11 @@ async function readGradientLutFromParsedData(
   if (width !== GRADIENT_LUT_WIDTH || height !== gradientCount || byteLength !== expectedByteLength) {
     throw new Error("Parsed data gradient LUT dimensions do not match the scene metadata.");
   }
-  const zipEntry = file ? zip.file(file) : null;
-  if (!zipEntry) {
+  const archiveEntry = file ? archive.file(file) : null;
+  if (!archiveEntry) {
     throw new Error("HEP file is missing its gradient LUT payload.");
   }
-  const bytes = new Uint8Array(await zipEntry.async("arraybuffer"));
+  const bytes = new Uint8Array(await archiveEntry.async("arraybuffer"));
   if (bytes.length !== expectedByteLength) {
     throw new Error(
       `Gradient LUT byte length is invalid (${bytes.length} != ${expectedByteLength}).`
@@ -2404,7 +2346,7 @@ function parseMat2D(value: unknown): Float32Array | null {
   return out;
 }
 
-async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedDataManifest): Promise<Uint8Array | null> {
+async function readSourcePdfBytesFromParsedData(archive: HepArchive, manifest: ParsedDataManifest): Promise<Uint8Array | null> {
   const manifestPath = readNonEmptyString(manifest.sourcePdfFile);
   const manifestSize = typeof manifest.sourcePdfSizeBytes === "number" &&
     Number.isSafeInteger(manifest.sourcePdfSizeBytes) &&
@@ -2421,12 +2363,12 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
     if (!candidatePath) {
       continue;
     }
-    const zipEntry = zip.file(candidatePath);
-    if (!zipEntry) {
+    const archiveEntry = archive.file(candidatePath);
+    if (!archiveEntry) {
       continue;
     }
 
-    const entrySize = readZipEntryUncompressedSize(zipEntry);
+    const entrySize = readHepEntryUncompressedSize(archiveEntry);
     if (
       entrySize === null ||
       entrySize > MAX_EMBEDDED_SOURCE_PDF_BYTES ||
@@ -2435,7 +2377,7 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
       throw new Error("Embedded source PDF size is invalid or exceeds the memory budget.");
     }
 
-    const fileBuffer = await zipEntry.async("arraybuffer");
+    const fileBuffer = await archiveEntry.async("arraybuffer");
     const bytes = new Uint8Array(fileBuffer);
     if (hasPdfHeader(bytes)) {
       return bytes;
@@ -2445,13 +2387,16 @@ async function readSourcePdfBytesFromParsedData(zip: JSZip, manifest: ParsedData
   return null;
 }
 
-export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8Array): Promise<Uint8Array | null> {
+export async function tryReadSourcePdfBytesFromExistingHep(
+  hepBytes: Uint8Array,
+  signal?: AbortSignal
+): Promise<Uint8Array | null> {
   try {
-    const zip = await JSZip.loadAsync(zipBytes);
-    const manifestFile = zip.file("manifest.json");
+    const archive = await HepArchive.loadAsync(hepBytes, { signal });
+    const manifestFile = archive.file("manifest.json");
     let sourcePdfFile: string | null = null;
     if (manifestFile) {
-      const manifestByteLength = readZipEntryUncompressedSize(manifestFile);
+      const manifestByteLength = readHepEntryUncompressedSize(manifestFile);
       if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
         return null;
       }
@@ -2469,11 +2414,11 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
       if (!candidatePath) {
         continue;
       }
-      const entry = zip.file(candidatePath);
+      const entry = archive.file(candidatePath);
       if (!entry) {
         continue;
       }
-      const sourcePdfByteLength = readZipEntryUncompressedSize(entry);
+      const sourcePdfByteLength = readHepEntryUncompressedSize(entry);
       if (
         sourcePdfByteLength === null ||
         sourcePdfByteLength > MAX_EMBEDDED_SOURCE_PDF_BYTES
@@ -2487,14 +2432,15 @@ export async function tryReadSourcePdfBytesFromExistingParsedZip(zipBytes: Uint8
       }
     }
   } catch {
-    // Best-effort only.
+    signal?.throwIfAborted();
+    // Source recovery is best-effort, but cancellation must still propagate.
   }
 
   return null;
 }
 
 async function readRasterLayersFromParsedData(
-  zip: JSZip,
+  archive: HepArchive,
   sceneMeta: ParsedDataSceneEntry,
   signal?: AbortSignal
 ): Promise<RasterLayer[]> {
@@ -2503,7 +2449,7 @@ async function readRasterLayersFromParsedData(
     ? sceneMeta.rasterLayers
     : [];
 
-  validateRasterLayerBudgets(zip, sceneRasterLayers);
+  validateRasterLayerBudgets(archive, sceneRasterLayers);
 
   for (let i = 0; i < sceneRasterLayers.length; i += 1) {
     signal?.throwIfAborted();
@@ -2534,7 +2480,7 @@ async function readRasterLayersFromParsedData(
       throw new Error(`Raster layer ${i} has incomplete or invalid v6 metadata.`);
     }
 
-    const decoded = await readRasterLayerFromZip(zip, path, width, height);
+    const decoded = await readRasterLayerFromZip(archive, path, width, height);
     signal?.throwIfAborted();
     if (!decoded) {
       throw new Error(`HEP file is missing or cannot decode raster layer ${i}: ${path}.`);
@@ -2562,17 +2508,17 @@ async function readRasterLayersFromParsedData(
 }
 
 async function readRasterLayerFromZip(
-  zip: JSZip,
+  archive: HepArchive,
   path: string,
   widthHint: number,
   heightHint: number
 ): Promise<{ width: number; height: number; data: Uint8Array } | null> {
-  const zipEntry = zip.file(path);
-  if (!zipEntry) {
+  const archiveEntry = archive.file(path);
+  if (!archiveEntry) {
     return null;
   }
 
-  const buffer = await zipEntry.async("arraybuffer");
+  const buffer = await archiveEntry.async("arraybuffer");
   const bytes = new Uint8Array(buffer);
   const imageEncoding = rasterImageEncodingFromPath(path);
   if (imageEncoding) {
@@ -2614,7 +2560,7 @@ async function readRasterLayerFromZip(
  * decoding any entry. HEP files may come from untrusted drag-and-drop input.
  */
 function validateRasterLayerBudgets(
-  zip: JSZip,
+  archive: HepArchive,
   sceneRasterLayers: unknown[]
 ): void {
   if (sceneRasterLayers.length > MAX_PARSED_RASTER_LAYER_COUNT) {
@@ -2649,17 +2595,17 @@ function validateRasterLayerBudgets(
       throw new Error(`Raster layer ${i} has inconsistent v6 texture metadata.`);
     }
 
-    const zipEntry = zip.file(path);
-    if (!zipEntry) {
+    const archiveEntry = archive.file(path);
+    if (!archiveEntry) {
       throw new Error(`HEP file is missing raster layer ${i}: ${path}.`);
     }
-    const byteLength = readZipEntryUncompressedSize(zipEntry);
+    const byteLength = readHepEntryUncompressedSize(archiveEntry);
     if (
       byteLength === null ||
       byteLength > MAX_PARSED_RASTER_PAYLOAD_BYTES
     ) {
       throw new Error(
-        `Raster layer ${i} ZIP entry size is invalid or exceeds the memory budget.`
+        `Raster layer ${i} HEP section size is invalid or exceeds the memory budget.`
       );
     }
 
@@ -2705,8 +2651,8 @@ function readNonNegativeInt(value: unknown, fallback: number): number {
   return Math.max(0, Math.trunc(number));
 }
 
-function readZipEntryUncompressedSize(entry: unknown): number | null {
-  const value = (entry as { _data?: { uncompressedSize?: unknown } })._data?.uncompressedSize;
+function readHepEntryUncompressedSize(entry: unknown): number | null {
+  const value = (entry as { uncompressedSize?: unknown }).uncompressedSize;
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;

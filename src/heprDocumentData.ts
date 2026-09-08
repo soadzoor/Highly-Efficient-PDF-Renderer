@@ -6,8 +6,9 @@
  * resource references are page-local, zero-based indexes. `-1` is the only
  * sentinel value and always means "none".
  *
- * HEP archives persist this exact v7 model. A page is self-contained: rendering
- * it never requires the source PDF or another page.
+ * This v7 page model is separate from the v6 scene schema persisted in HEP
+ * container v1. A page is self-contained: rendering it never requires the source
+ * PDF or another page.
  */
 
 import type {

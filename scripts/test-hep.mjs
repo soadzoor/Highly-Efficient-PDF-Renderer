@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import JSZip from "jszip";
+import { HepArchive } from "../src/hepContainer.ts";
 import { createServer } from "vite";
 
 Promise.try ??= (callback, ...args) => Promise.resolve().then(() => callback(...args));
@@ -164,7 +164,7 @@ function assertBrochureOverlapCoverage(scene) {
 }
 
 async function readZip(blob) {
-  return JSZip.loadAsync(await blob.arrayBuffer());
+  return HepArchive.loadAsync(await blob.arrayBuffer());
 }
 
 async function mutateInterleavedFloat32Texture(zip, manifest, textureName, mutate) {
@@ -389,9 +389,9 @@ async function run() {
 
   try {
     const [
-      { buildParsedDataZip },
+      { buildHep },
       { loadPdfSceneFromSource },
-      { listSceneRasterLayers, loadSceneFromParsedDataZip },
+      { listSceneRasterLayers, loadSceneFromHep },
       { composeVectorScenesInGrid }
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/index.ts"),
@@ -403,25 +403,24 @@ async function run() {
     const parsedPdf = await loadPdfSceneFromSource(pdfBytes, { sourceKind: "pdf" });
 
     const sourceStages = [];
-    const sourceZipBlob = await buildParsedDataZip(pdfBytes, {
+    const sourceZipBlob = await buildHep(pdfBytes, {
       sourceLabel: "fixture.pdf",
       encodeRasterImages: false,
       compression: "store",
-      compressionLevel: 0,
       onProgress: (progress) => sourceStages.push(progress.stage)
     });
     assert.ok(sourceZipBlob instanceof Blob);
-    assert.equal(sourceZipBlob.type, "application/zip");
+    assert.equal(sourceZipBlob.type, "application/x-hep");
     const sourceZipBytes = new Uint8Array(await sourceZipBlob.arrayBuffer());
-    assert.deepEqual(Array.from(sourceZipBytes.subarray(0, 2)), [0x50, 0x4b]);
-    assert.ok(sourceStages.includes("zip-build"));
+    assert.deepEqual(Array.from(sourceZipBytes.subarray(0, 4)), [0x48, 0x45, 0x50, 0]);
+    assert.ok(sourceStages.includes("hep-build"));
     assert.equal(sourceStages.at(-1), "complete");
 
-    const sourceZipArchive = await JSZip.loadAsync(sourceZipBytes);
+    const sourceZipArchive = await HepArchive.loadAsync(sourceZipBytes);
     const sourceManifest = JSON.parse(await sourceZipArchive.file("manifest.json").async("string"));
     assert.equal(sourceManifest.formatVersion, 6, "native gradient scenes require the v6 HEP schema");
     for (const unsupportedVersion of [5, 7]) {
-      const incompatibleZip = await JSZip.loadAsync(sourceZipBytes);
+      const incompatibleZip = await HepArchive.loadAsync(sourceZipBytes);
       const incompatibleManifest = {
         ...sourceManifest,
         formatVersion: unsupportedVersion
@@ -429,17 +428,17 @@ async function run() {
       incompatibleZip.file("manifest.json", JSON.stringify(incompatibleManifest));
       const incompatibleBytes = await incompatibleZip.generateAsync({ type: "arraybuffer", compression: "STORE" });
       await assert.rejects(
-        loadSceneFromParsedDataZip(incompatibleBytes),
+        loadSceneFromHep(incompatibleBytes),
         new RegExp(`format v${unsupportedVersion} is not supported`)
       );
     }
 
-    const sourceRoundTrip = await loadSceneFromParsedDataZip(sourceZipBytes.buffer);
+    const sourceRoundTrip = await loadSceneFromHep(sourceZipBytes.buffer);
     assertSceneCountsEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
     assertNativeGradientResourcesEqual(sourceRoundTrip, parsedPdf.scene, "PDF source round trip");
     assert.equal(sourceRoundTrip.textClipRects, undefined, "older v6 scenes omit text clips");
 
-    const base64ZipBlob = await buildParsedDataZip(pdfBytes.toString("base64"), {
+    const base64ZipBlob = await buildHep(pdfBytes.toString("base64"), {
       encodeRasterImages: false,
       compression: "store"
     });
@@ -447,17 +446,16 @@ async function run() {
     const base64Manifest = JSON.parse(await base64Zip.file("manifest.json").async("string"));
     assert.equal(base64Manifest.sourceFile, "document.pdf");
 
-    const sceneZipBlob = await buildParsedDataZip(parsedPdf.scene, {
+    const sceneZipBlob = await buildHep(parsedPdf.scene, {
       sourceLabel: "already-parsed.pdf",
       sourcePdf: pdfBytes,
       encodeRasterImages: false,
-      compression: "store",
-      compressionLevel: 0
+      compression: "store"
     });
     const sceneZip = await readZip(sceneZipBlob);
     const sceneManifest = JSON.parse(await sceneZip.file("manifest.json").async("string"));
     assert.equal(sceneManifest.sourceFile, "already-parsed.pdf");
-    const sceneRoundTrip = await loadSceneFromParsedDataZip(await sceneZipBlob.arrayBuffer());
+    const sceneRoundTrip = await loadSceneFromHep(await sceneZipBlob.arrayBuffer());
     assertSceneCountsEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
     assertNativeGradientResourcesEqual(sceneRoundTrip, parsedPdf.scene, "parsed scene round trip");
 
@@ -469,13 +467,13 @@ async function run() {
         textInstanceB: clippedInstanceB,
         textClipRects: new Float32Array([1, 2, 30, 40])
       };
-      const clippedZip = await buildParsedDataZip(clippedScene, {
+      const clippedZip = await buildHep(clippedScene, {
         sourceLabel: "clipped-scene.pdf",
         sourcePdf: pdfBytes,
         encodeRasterImages: false,
         compression: "store"
       });
-      const clippedRoundTrip = await loadSceneFromParsedDataZip(await clippedZip.arrayBuffer());
+      const clippedRoundTrip = await loadSceneFromHep(await clippedZip.arrayBuffer());
       assert.deepEqual([...clippedRoundTrip.textClipRects], [1, 2, 30, 40]);
       assert.equal(clippedRoundTrip.textInstanceB[3], 1);
       assert.deepEqual(
@@ -499,7 +497,7 @@ async function run() {
         primitiveMeta: clippedPrimitiveMeta,
         primitiveBounds: clippedPrimitiveBounds
       };
-      const clippedStrokeZipBlob = await buildParsedDataZip(clippedStrokeScene, {
+      const clippedStrokeZipBlob = await buildHep(clippedStrokeScene, {
         sourceLabel: "clipped-stroke-scene.pdf",
         sourcePdf: pdfBytes,
         encodeRasterImages: false,
@@ -515,7 +513,7 @@ async function run() {
       );
       assert.ok(clippedStrokeManifest.strokeGeometry.clippedSegmentCount >= 1);
       assert.ok(clippedStrokeZip.file(clippedStrokeManifest.strokeGeometry.clipBoundsFile));
-      const clippedStrokeRoundTrip = await loadSceneFromParsedDataZip(
+      const clippedStrokeRoundTrip = await loadSceneFromHep(
         await clippedStrokeZipBlob.arrayBuffer()
       );
       assert.deepEqual(
@@ -536,7 +534,7 @@ async function run() {
         compression: "STORE"
       });
       await assert.rejects(
-        loadSceneFromParsedDataZip(incompleteStrokeClipBytes),
+        loadSceneFromHep(incompleteStrokeClipBytes),
         /invalid strokeGeometry section/
       );
     }
@@ -551,11 +549,11 @@ async function run() {
       rasterLayerMatrix: new Float32Array([1, 0, 0, 1, 0, 0])
     };
     await assert.rejects(
-      buildParsedDataZip(missingRasterScene, { encodeRasterImages: false }),
+      buildHep(missingRasterScene, { encodeRasterImages: false }),
       /Pass options\.sourcePdf/
     );
     await assert.rejects(
-      buildParsedDataZip(missingRasterScene, {
+      buildHep(missingRasterScene, {
         sourcePdf: new Uint8Array([1, 2, 3, 4]),
         encodeRasterImages: false
       }),
@@ -577,7 +575,7 @@ async function run() {
       rasterLayerData: new Uint8Array(0),
       rasterLayerMatrix: new Float32Array([1, 0, 0, 1, 0, 0])
     };
-    const fallbackZipBlob = await buildParsedDataZip(rasterFallbackScene, {
+    const fallbackZipBlob = await buildHep(rasterFallbackScene, {
       sourceLabel: "fallback.pdf",
       sourcePdf: rasterPdfBytes,
       sourcePdfPages: "13",
@@ -589,7 +587,7 @@ async function run() {
     assert.equal(fallbackManifest.sourcePdfFile, "source/source.pdf");
     assert.equal(fallbackManifest.sourcePdfPages, "13");
     assert.ok(fallbackZip.file("source/source.pdf"));
-    const fallbackRoundTrip = await loadSceneFromParsedDataZip(await fallbackZipBlob.arrayBuffer());
+    const fallbackRoundTrip = await loadSceneFromHep(await fallbackZipBlob.arrayBuffer());
     const restoredRasterLayers = listSceneRasterLayers(fallbackRoundTrip);
     assert.equal(restoredRasterLayers.length, expectedRasterLayers.length);
     for (let i = 0; i < expectedRasterLayers.length; i += 1) {
@@ -703,12 +701,12 @@ async function run() {
     }
     assert.ok(hasOpaqueCreamTableFill, "an opaque table fill must remain vector-rendered above the circle underlay");
 
-    const nativeCircleZipBlob = await buildParsedDataZip(parsedOrderedUnderlayPdf.scene, {
+    const nativeCircleZipBlob = await buildHep(parsedOrderedUnderlayPdf.scene, {
       sourceLabel: "native-circle-strokes.pdf",
       encodeRasterImages: false,
       compression: "store"
     });
-    const nativeCircleRoundTrip = await loadSceneFromParsedDataZip(await nativeCircleZipBlob.arrayBuffer());
+    const nativeCircleRoundTrip = await loadSceneFromHep(await nativeCircleZipBlob.arrayBuffer());
     assertNativeGradientResourcesEqual(
       nativeCircleRoundTrip,
       parsedOrderedUnderlayPdf.scene,
@@ -804,7 +802,7 @@ async function run() {
     }
     assert.equal(darkTableTextCount, 1_649, "PDF display/sRGB text colors must survive extraction unchanged");
 
-    const shadingZipBlob = await buildParsedDataZip(parsedShadingAndDashPdf.scene, {
+    const shadingZipBlob = await buildHep(parsedShadingAndDashPdf.scene, {
       sourceLabel: "shading-and-dash.pdf",
       compression: "store"
     });
@@ -815,7 +813,7 @@ async function run() {
     assert.match(encodedShading.encoding, /^(?:png|webp)$/);
     const encodedShadingBytes = await shadingZip.file(encodedShading.file).async("uint8array");
     assert.ok(encodedShadingBytes.length < shadingLayers[0].data.length, "Node HEP builds must compress raster layers");
-    const encodedShadingRoundTrip = await loadSceneFromParsedDataZip(await shadingZipBlob.arrayBuffer());
+    const encodedShadingRoundTrip = await loadSceneFromHep(await shadingZipBlob.arrayBuffer());
     const decodedShadingLayers = listSceneRasterLayers(encodedShadingRoundTrip);
     assert.equal(decodedShadingLayers.length, 1, "Node HEP loads must decode encoded raster layers");
     assert.equal(decodedShadingLayers[0].width, shadingLayers[0].width);
@@ -1024,7 +1022,7 @@ async function run() {
       );
     }
 
-    const photoOverlayZipBlob = await buildParsedDataZip(parsedPhotoOverlayPdf.scene, {
+    const photoOverlayZipBlob = await buildHep(parsedPhotoOverlayPdf.scene, {
       sourceLabel: "photo-overlay.pdf",
       encodeRasterImages: false,
       compression: "store"
@@ -1048,7 +1046,7 @@ async function run() {
       (await photoOverlayZip.file(photoOverlayManifest.gradientLut.file).async("uint8array")).length,
       4096
     );
-    const photoOverlayRoundTrip = await loadSceneFromParsedDataZip(await photoOverlayZipBlob.arrayBuffer());
+    const photoOverlayRoundTrip = await loadSceneFromHep(await photoOverlayZipBlob.arrayBuffer());
     assertNativeGradientResourcesEqual(photoOverlayRoundTrip, photoOverlayScene, "page 13 native gradient round trip");
     const roundTripPhotoOverlayLayers = listSceneRasterLayers(photoOverlayRoundTrip);
     assert.equal(roundTripPhotoOverlayLayers.length, photoOverlayLayers.length);
@@ -1069,7 +1067,7 @@ async function run() {
       compression: "STORE"
     });
     await assert.rejects(
-      loadSceneFromParsedDataZip(corruptGradientLutBytes),
+      loadSceneFromHep(corruptGradientLutBytes),
       /missing its gradient LUT payload/
     );
 
@@ -1110,7 +1108,7 @@ async function run() {
         compression: "STORE"
       });
       await assert.rejects(
-        loadSceneFromParsedDataZip(corruptRadialBytes),
+        loadSceneFromHep(corruptRadialBytes),
         radialCase.expectedError,
         `${radialCase.label} radial metadata must be rejected`
       );
@@ -1128,7 +1126,7 @@ async function run() {
         compression: "STORE"
       });
       await assert.rejects(
-        loadSceneFromParsedDataZip(incompleteRasterBytes),
+        loadSceneFromHep(incompleteRasterBytes),
         /Raster layer 0 has incomplete or invalid v6 metadata/,
         `missing raster ${missingField} must be rejected`
       );
@@ -1145,7 +1143,7 @@ async function run() {
       compression: "STORE"
     });
     await assert.rejects(
-      loadSceneFromParsedDataZip(missingRasterPayloadBytes),
+      loadSceneFromHep(missingRasterPayloadBytes),
       /missing raster layer 0/,
       "missing raster payload must be rejected"
     );
@@ -1174,11 +1172,11 @@ async function run() {
     );
 
     await assert.rejects(
-      buildParsedDataZip(new Uint8Array([1]), { compression: "deflate", compressionLevel: 0 }),
-      /compressionLevel must be an integer from 1 to 9/
+      buildHep(new Uint8Array([1]), { compression: "deflate", compressionLevel: 0 }),
+      /compressionLevel is no longer supported/
     );
     await assert.rejects(
-      buildParsedDataZip(new Uint8Array([1]), { compression: "gzip" }),
+      buildHep(new Uint8Array([1]), { compression: "gzip" }),
       /compression must be either "deflate" or "store"/
     );
 
