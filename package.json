@@ -102,10 +102,10 @@
   "dependencies": {},
   "devDependencies": {
     "@napi-rs/canvas": "1.0.8",
-    "@types/three": "0.185.1",
+    "@types/three": "0.185.4",
     "three": "0.185.1",
     "typescript": "7.0.2",
-    "vite": "8.1.4"
+    "vite": "8.2.2"
   },
   "peerDependencies": {
     "@napi-rs/canvas": ">=1.0.8",
