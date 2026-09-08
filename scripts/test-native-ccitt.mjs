@@ -344,6 +344,18 @@ function testGroup4ModesAndEofb() {
     0x0f, 0xf0, 0x00
   ]);
 
+  // T.6 defines b1 as the first changing element on the reference line
+  // strictly to the right of a0, where a0 starts every row on the imaginary
+  // changing element positioned just before column 0. Here the reference row
+  // changes to black exactly at column 3 and the coding row reaches column 3
+  // in white, so b1 must skip that coincident element rather than return a0
+  // itself. Reference row: H + white(3) + black(1) + V(0), black span [3,4).
+  // Coding row: V_L(2), V_L(1), V_L(1), V(0), black spans [1,3) and [7,8).
+  const coincidentReferenceElement = decode(bits(
+    `001 1000 010 1 000010 010 010 1 ${eofb}`
+  ), { K: -1, Columns: 8, EndOfBlock: true, BlackIs1: true });
+  assertResult(coincidentReferenceElement, [0x10, 0x61], 8, 2, "end-of-block");
+
   assert.throws(
     () => decode(bits("1"), { K: -1, Columns: 8, EndOfBlock: true }),
     hasPdfError("invalid-object", /without an EOFB/)

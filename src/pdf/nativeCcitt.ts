@@ -486,6 +486,10 @@ function decodeTwoDimensionalRow(
   const transitions: number[] = [];
   let position = 0;
   let black = false;
+  // T.4 4.2.1.3.1 starts every coding line on an imaginary changing element
+  // situated just before its first picture element. Only that first element
+  // allows b1 to sit on column 0; afterwards a0 is the last decoded position.
+  let atRowStart = true;
   while (position < columns) {
     budget.consume();
     const mode = decodeCode(reader, MODE_CODES, 7, "two-dimensional mode");
@@ -495,7 +499,9 @@ function decodeTwoDimensionalRow(
         details: { reason: "ccitt-extension-mode", bitOffset: reader.position }
       });
     }
-    const referencePoint = findReferenceTransition(reference, position, black, columns);
+    const a0 = atRowStart ? -1 : position;
+    atRowStart = false;
+    const referencePoint = findReferenceTransition(reference, a0, black, columns);
     if (mode.kind === "pass") {
       if (referencePoint.b2 <= position) {
         throw malformed(reader, "CCITT pass mode does not advance the row.", "ccitt-pass-no-progress");
@@ -600,7 +606,7 @@ function decodeCode<T>(
 
 function findReferenceTransition(
   transitions: readonly number[],
-  position: number,
+  a0: number,
   black: boolean,
   columns: number
 ): { readonly b1: number; readonly b2: number } {
@@ -608,7 +614,10 @@ function findReferenceTransition(
   let high = transitions.length;
   while (low < high) {
     const middle = (low + high) >>> 1;
-    if (transitions[middle] < position) low = middle + 1;
+    // T.4 4.2.1.3.2 places b1 strictly to the right of a0. A reference
+    // element that coincides with a0 belongs to the run already coded, so
+    // skipping it is what keeps a vertical mode from moving backwards.
+    if (transitions[middle] <= a0) low = middle + 1;
     else high = middle;
   }
   // Even transition indexes enter black; odd indexes enter white. b1 enters
