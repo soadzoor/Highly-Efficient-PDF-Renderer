@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-07T18:22:22.012Z",
+  "generatedAt": "2026-09-08T08:29:05.241Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -10,7 +10,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 1890836
+        "sizeBytes": 1886212
       }
     },
     {
@@ -22,7 +22,7 @@
       },
       "hep": {
         "path": "examples/heps/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.hep",
-        "sizeBytes": 799251
+        "sizeBytes": 803392
       }
     },
     {
@@ -34,7 +34,7 @@
       },
       "hep": {
         "path": "examples/heps/Chino_MOB_FLOOR_1-parsed-data.hep",
-        "sizeBytes": 197486
+        "sizeBytes": 198184
       }
     },
     {
@@ -46,7 +46,7 @@
       },
       "hep": {
         "path": "examples/heps/Dublin_1st_Floor_2018_06_01-parsed-data.hep",
-        "sizeBytes": 1063092
+        "sizeBytes": 1071216
       }
     },
     {
@@ -58,7 +58,7 @@
       },
       "hep": {
         "path": "examples/heps/Level_1-parsed-data.hep",
-        "sizeBytes": 2954778
+        "sizeBytes": 3004728
       }
     },
     {
@@ -70,7 +70,7 @@
       },
       "hep": {
         "path": "examples/heps/Livermore_L1-parsed-data.hep",
-        "sizeBytes": 1432725
+        "sizeBytes": 1446872
       }
     },
     {
@@ -82,7 +82,7 @@
       },
       "hep": {
         "path": "examples/heps/LK_Office_Level_1-parsed-data.hep",
-        "sizeBytes": 15088
+        "sizeBytes": 11208
       }
     },
     {
@@ -94,7 +94,7 @@
       },
       "hep": {
         "path": "examples/heps/Lower_Level-parsed-data.hep",
-        "sizeBytes": 1703299
+        "sizeBytes": 1760436
       }
     },
     {
@@ -106,7 +106,7 @@
       },
       "hep": {
         "path": "examples/heps/Murietta_Level1-parsed-data.hep",
-        "sizeBytes": 1210699
+        "sizeBytes": 1221444
       }
     },
     {
@@ -118,7 +118,7 @@
       },
       "hep": {
         "path": "examples/heps/optimizing_cpp-parsed-data.hep",
-        "sizeBytes": 889041
+        "sizeBytes": 900436
       }
     },
     {
@@ -130,7 +130,7 @@
       },
       "hep": {
         "path": "examples/heps/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
-        "sizeBytes": 234219
+        "sizeBytes": 234588
       }
     },
     {
@@ -142,7 +142,7 @@
       },
       "hep": {
         "path": "examples/heps/stn_arch_kp-ontario_177920237_detached-parsed-data.hep",
-        "sizeBytes": 2446473
+        "sizeBytes": 2475860
       }
     },
     {
@@ -154,7 +154,7 @@
       },
       "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
-        "sizeBytes": 1494356
+        "sizeBytes": 1491936
       }
     },
     {
@@ -166,7 +166,7 @@
       },
       "hep": {
         "path": "examples/heps/WarAndPeace-parsed-data.hep",
-        "sizeBytes": 5347388
+        "sizeBytes": 5468616
       }
     }
   ]
