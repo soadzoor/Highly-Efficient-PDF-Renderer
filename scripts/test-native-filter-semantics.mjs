@@ -135,6 +135,29 @@ async function testFlate() {
     hasPdfError("invalid-object", /empty/)
   );
 
+  // PDF 32000-1 7.3.8.1 puts an EOL marker after the stream data and excludes
+  // it from /Length. Producers that count it anyway leave a stray CR, LF, or
+  // CRLF after an otherwise complete zlib stream. The marker is not data, and
+  // the payload it follows decodes to exactly the same bytes.
+  for (const marker of [[0x0a], [0x0d], [0x0d, 0x0a]]) {
+    assert.deepEqual(
+      await decodeOne(concat(zlib, Uint8Array.from(marker)), "FlateDecode"),
+      decoded,
+      `zlib stream followed by a ${marker.length}-byte EOL marker`
+    );
+  }
+
+  // Only that marker is specified to sit there. Other trailing bytes, other
+  // whitespace, and more than one marker stay errors.
+  for (const junk of [[0x20], [0x09], [0x0a, 0x0a], [0x0a, 0x0d], [0x0d, 0x0a, 0x0a]]) {
+    await assert.rejects(
+      decodeOne(concat(zlib, Uint8Array.from(junk)), "FlateDecode"),
+      hasPdfError("invalid-object", /FlateDecode/),
+      `zlib stream followed by ${JSON.stringify(junk)}`
+    );
+  }
+
+
   // 0x7820 has a valid FCHECK and advertises FDICT. PDF Flate streams cannot
   // supply the external dictionary, so this is a deterministic typed failure.
   await assert.rejects(

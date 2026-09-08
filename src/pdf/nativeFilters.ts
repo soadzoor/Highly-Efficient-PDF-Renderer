@@ -252,6 +252,46 @@ async function* decodeFlateChunks(
   }
 }
 
+/**
+ * True when `inputs` end with a single EOL marker whose removal yields a
+ * stream that decodes to exactly `producedLength` bytes. Nothing else is
+ * trimmed: NUL, spaces, tabs and repeated markers stay decode failures.
+ */
+async function decodesIdenticallyWithoutEolMarker(
+  inputs: readonly Uint8Array[],
+  format: "deflate" | "deflate-raw",
+  limit: number,
+  signal: AbortSignal | undefined,
+  producedLength: number
+): Promise<boolean> {
+  const trimmed = withoutTrailingEolMarker(inputs);
+  if (!trimmed) return false;
+  const state: PlatformInflateState = { length: 0 };
+  try {
+    for await (const chunk of inflatePlatformChunks(trimmed, format, limit, signal, state, false)) {
+      void chunk;
+    }
+  } catch {
+    return false;
+  }
+  return state.length === producedLength;
+}
+
+/** The trailing CR, LF, or CRLF removed, or null when there is no marker. */
+function withoutTrailingEolMarker(
+  inputs: readonly Uint8Array[]
+): readonly Uint8Array[] | null {
+  let lastIndex = inputs.length - 1;
+  while (lastIndex >= 0 && inputs[lastIndex].length === 0) lastIndex -= 1;
+  if (lastIndex < 0) return null;
+  const last = inputs[lastIndex];
+  let end = last.length;
+  if (last[end - 1] === 0x0a) end -= 1;
+  if (end > 0 && last[end - 1] === 0x0d) end -= 1;
+  if (end === last.length || end === 0) return null;
+  return [...inputs.slice(0, lastIndex), last.subarray(0, end)];
+}
+
 function classifyFlateWrapper(input: Uint8Array): "zlib" | "raw" {
   if (input.length === 0) throw new PdfError("invalid-object", "FlateDecode stream is empty.");
   const cmf = input[0];
@@ -303,7 +343,8 @@ async function* inflatePlatformChunks(
   format: "deflate" | "deflate-raw",
   limit: number,
   signal: AbortSignal | undefined,
-  state: PlatformInflateState
+  state: PlatformInflateState,
+  recoverEolMarker = true
 ): AsyncIterable<Uint8Array> {
   if (typeof DecompressionStream !== "function") {
     throw new PdfError("unsupported-filter", "FlateDecode requires DecompressionStream support.");
@@ -348,6 +389,19 @@ async function* inflatePlatformChunks(
     await reader.cancel().catch(() => undefined);
     if (cause instanceof PdfError) throw cause;
     if (signal?.aborted) throwIfAborted(signal);
+    // PDF 32000-1 7.3.8.1 places an EOL marker after the stream data and keeps
+    // it out of /Length. Producers that count it leave a stray CR, LF, or CRLF
+    // that platform decoders reject as trailing junk, discarding a payload that
+    // was already complete. Accept that marker, but only after re-decoding
+    // without it proves the same byte count: a truncated stream cannot be
+    // rescued this way, and any other trailing byte remains an error.
+    if (
+      recoverEolMarker &&
+      await decodesIdenticallyWithoutEolMarker(inputs, format, limit, signal, state.length)
+    ) {
+      completed = true;
+      return;
+    }
     throw new PdfError("invalid-object", "Malformed FlateDecode stream.", { cause });
   } finally {
     if (!completed) {
