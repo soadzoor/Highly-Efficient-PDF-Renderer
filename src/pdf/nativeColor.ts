@@ -1062,11 +1062,20 @@ export class NativePdfColorRegistry {
           break;
         }
         if (!this.iccKernel || !record.iccMetadata) {
-          throw new PdfError(
-            "unsupported-color",
-            "ICCBased color conversion requires a caller-owned ICC transform resolver.",
-            { details: { componentCount: record.componentCount } }
+          // ISO 32000-1 8.6.5.5: the alternate space stands in when the profile
+          // itself cannot be used. One is always present -- /Alternate when the
+          // space supplies it, and the Device space matching /N otherwise -- and
+          // its component count was checked when the space was parsed. Failing
+          // the whole render instead would discard a page over colour fidelity
+          // that the format itself declares optional.
+          rgb = this.convertInternal(
+            record.alternateSpaceIndex,
+            normalized,
+            next,
+            depth + 1,
+            signal
           );
+          break;
         }
         try {
           rgb = validateKernelRgb(this.iccKernel.convertToSrgb(

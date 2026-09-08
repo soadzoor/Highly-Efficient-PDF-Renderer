@@ -146,7 +146,7 @@ function iccSpace({
   range,
   profile = iccProfile()
 } = {}) {
-  const entries = { N: count, Alternate: alternate };
+  const entries = alternate === null ? { N: count } : { N: count, Alternate: alternate };
   if (range !== undefined) entries.Range = range;
   return [name("ICCBased"), stream(entries, profile)];
 }
@@ -389,7 +389,11 @@ async function testIccProfilesAndKernelBoundary() {
   assert.equal(indirectDescription.kind, "ICCBased");
   assert.equal(indirectDescription.profile.length, 128, "bytes after the declared ICC size are discarded");
   assert.deepEqual(colors.defaultDecode(indirect), [0, 1, 0, 1, 0, 1]);
-  throwsCode(() => colors.convertToSrgb(indirect, [0, 0, 0]), "unsupported-color");
+  // No ICC resolver is configured here, so nothing has asked for profile
+  // fidelity and 8.6.5.5 hands the conversion to the alternate space. A
+  // resolver that is present and fails still raises; see the transform-result
+  // cases in test-pdf-session-icc-transform-resolver.mjs.
+  assert.deepEqual(colors.convertToSrgb(indirect, [0.25, 0.5, 0.75]), [0.25, 0.5, 0.75]);
 
   await rejectsCode(
     () => colors.add(iccSpace({ count: 2, profile: iccProfile() })),
@@ -429,6 +433,31 @@ async function testIccProfilesAndKernelBoundary() {
     })),
     "resource-limit"
   );
+
+  // ISO 32000-1 8.6.5.5: when the profile cannot be used, the alternate space
+  // stands in for it. One is always available -- /Alternate when supplied, and
+  // the Device space matching /N otherwise -- so having no ICC resolver must
+  // degrade the colour, not fail the document.
+  const withoutResolver = new NativePdfColorRegistry(document);
+  const explicitAlternate = await withoutResolver.add(iccSpace());
+  assert.deepEqual(
+    withoutResolver.convertToSrgb(explicitAlternate, [0.25, 0.5, 0.75]),
+    [0.25, 0.5, 0.75]
+  );
+
+  const impliedAlternate = await withoutResolver.add(iccSpace({ alternate: null }));
+  assert.deepEqual(
+    withoutResolver.convertToSrgb(impliedAlternate, [1, 0, 0]),
+    [1, 0, 0],
+    "/N 3 implies DeviceRGB when /Alternate is absent"
+  );
+
+  // /Range still maps the components onto [0, 1] before the alternate space
+  // sees them, exactly as it does for a resolver-backed profile above.
+  const rangedFallback = await withoutResolver.add(iccSpace({
+    range: [0.1, 0.9, 0.2, 0.8, 0.3, 0.7]
+  }));
+  closeRgb(withoutResolver.convertToSrgb(rangedFallback, [-1, 2, 0.5]), [0, 1, 0.5], 1e-12);
 
   let received = null;
   const kernelColors = new NativePdfColorRegistry(document, undefined, {

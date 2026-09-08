@@ -159,7 +159,10 @@ try {
       { number: 5, body: tinyPdfStream("/N 3 /Alternate /DeviceRGB", profile) }
     ]
   });
-  await assertCompileCode(openPdf, iccBytes, "unsupported-color");
+  // An ICCBased space with no configured resolver compiles through its
+  // /Alternate. A resolver that is present and returns an invalid transform
+  // still fails; see test-pdf-session-icc-transform-resolver.mjs.
+  await assertCompiles(openPdf, iccBytes);
 
   const patternBytes = simplePagePdf(
     "/Resources << /ColorSpace << /P [/Pattern /DeviceRGB] >> >>",
@@ -206,6 +209,15 @@ function simplePagePdf(resourceEntries, content, extraObjects = []) {
       ...extraObjects
     ]
   });
+}
+
+async function assertCompiles(openPdf, bytes) {
+  const session = await openPdf({ kind: "bytes", bytes });
+  try {
+    await session.compilePage(0);
+  } finally {
+    await session.close();
+  }
 }
 
 async function assertCompileCode(openPdf, bytes, code) {
