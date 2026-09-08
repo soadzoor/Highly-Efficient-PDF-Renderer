@@ -208,8 +208,12 @@ export class NativePdfAppearanceSynthesizer {
       await this.requireMissingNormalAppearance(annotation, signal);
       return await this.synthesizeLinkBorder(annotation, optionalContentIndex, signal);
     }
+    if (annotation.subtype === "Square") {
+      await this.requireMissingNormalAppearance(annotation, signal);
+      return await this.synthesizeSquare(annotation, optionalContentIndex, signal);
+    }
     if (annotation.subtype !== "Widget" || !annotation.widget) {
-      throw synthesisError(annotation, "Only AcroForm Widgets and Link borders have synthesizable appearances.", {
+      throw synthesisError(annotation, "Only AcroForm Widgets, Link borders, and Squares have synthesizable appearances.", {
         reason: "appearance-synthesis-unsupported-subtype",
         subtype: annotation.subtype
       });
@@ -373,7 +377,7 @@ export class NativePdfAppearanceSynthesizer {
     optionalContentIndex: number,
     signal?: AbortSignal
   ): Promise<NativePdfSynthesizedAppearance | null> {
-    const border = await this.readLinkBorderStyle(annotation, signal);
+    const border = await this.readAnnotationBorderStyle(annotation, "Link", signal);
     // A zero-width border is explicitly non-painting. It is not an unsupported
     // visible annotation and therefore needs neither a display command nor a
     // synthetic empty Form.
@@ -404,7 +408,7 @@ export class NativePdfAppearanceSynthesizer {
       });
     }
 
-    const geometry = this.readLinkGeometry(annotation);
+    const geometry = this.readAnnotationGeometry(annotation, "Link");
     if (!geometry) return null;
     if (border.width > Math.min(geometry.width, geometry.height)) {
       throw new PdfError("invalid-object", "Link border width exceeds its appearance bounds.", {
@@ -457,14 +461,94 @@ export class NativePdfAppearanceSynthesizer {
     );
   }
 
-  private readLinkGeometry(
-    annotation: NativePdfAnnotationAppearance
+  /**
+   * ISO 32000-1 12.5.6.8. The square is drawn inside /Rect, on a path inset by
+   * half the border width, stroked with /C and filled with /IC. A square with
+   * neither a painting border nor an interior colour paints nothing at all:
+   * like a zero-width Link border it is not an unsupported visible annotation,
+   * and real drawings carry such squares as pure metadata markers.
+   */
+  private async synthesizeSquare(
+    annotation: NativePdfAnnotationAppearance,
+    optionalContentIndex: number,
+    signal?: AbortSignal
+  ): Promise<NativePdfSynthesizedAppearance | null> {
+    const border = await this.readAnnotationBorderStyle(annotation, "Square", signal);
+    const strokeColor = border.width > 0
+      ? await this.readAnnotationColor(annotation, "C", DEFAULT_COLOR, "Square annotation", signal)
+      : null;
+    // /IC has no default: an absent interior colour leaves the square unfilled,
+    // unlike /C, which falls back to black for a border that does paint.
+    const fillColor = await this.readAnnotationColor(annotation, "IC", null, "Square annotation", signal);
+    if (!strokeColor && !fillColor) return null;
+
+    const opacity = await optionalFiniteNumber(
+      this.document,
+      annotation.dictionary,
+      "CA",
+      1,
+      signal,
+      "Square annotation"
+    );
+    if (opacity < 0 || opacity > 1) {
+      throw new PdfError("invalid-object", "Square annotation /CA must be from 0 through 1.", {
+        pageIndex: annotation.pageIndex,
+        details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
+      });
+    }
+    if (opacity === 0) return null;
+    if (opacity !== 1) {
+      throw synthesisError(annotation, "A translucent Square annotation is not yet synthesizable.", {
+        reason: "appearance-square-opacity-unsupported",
+        opacity
+      });
+    }
+
+    const geometry = this.readAnnotationGeometry(annotation, "Square");
+    if (!geometry) return null;
+    if (border.width > Math.min(geometry.width, geometry.height)) {
+      throw new PdfError("invalid-object", "Square border width exceeds its appearance bounds.", {
+        pageIndex: annotation.pageIndex,
+        details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
+      });
+    }
+
+    // The border straddles the path, so the path is inset by half of it. A
+    // transparent /C still reserves that width: the colour decides what is
+    // painted, the declared width decides where the path runs.
+    const inset = border.width / 2;
+    const lines = ["q"];
+    if (fillColor) lines.push(fillColorOperator(fillColor));
+    if (strokeColor) {
+      lines.push(strokeColorOperator(strokeColor), `${pdfNumber(border.width)} w`);
+      if (border.style === "dashed") {
+        lines.push(`[${border.dash.map(pdfNumber).join(" ")}] 0 d`);
+      }
+    }
+    lines.push(
+      `${pdfNumber(inset)} ${pdfNumber(inset)} ${pdfNumber(geometry.width - border.width)} ` +
+      `${pdfNumber(geometry.height - border.width)} re ${fillColor ? (strokeColor ? "B" : "f") : "S"}`,
+      "Q"
+    );
+    return this.finishSynthesis(
+      annotation,
+      geometry,
+      encodeContent(lines),
+      new Map<string, PdfValue>(),
+      "empty",
+      optionalContentIndex
+    );
+  }
+
+  private readAnnotationGeometry(
+    annotation: NativePdfAnnotationAppearance,
+    label: string
   ): LogicalAppearanceGeometry | null {
     const width = annotation.rectangle[2] - annotation.rectangle[0];
     const height = annotation.rectangle[3] - annotation.rectangle[1];
     if (width === 0 || height === 0) return null;
     if (width >= 1e20 || height >= 1e20) {
-      throw new PdfError("resource-limit", "A Link /Rect exceeds the synthesized appearance coordinate limit.", {
+      throw new PdfError("resource-limit", `A ${label} /Rect exceeds the synthesized appearance coordinate limit.`, {
         pageIndex: annotation.pageIndex,
         details: {
           annotationIndex: annotation.annotationIndex,
@@ -922,14 +1006,24 @@ export class NativePdfAppearanceSynthesizer {
     annotation: NativePdfAnnotationAppearance,
     signal?: AbortSignal
   ): Promise<AppearanceColor | null> {
-    const raw = await this.document.resolveValue(annotation.dictionary.get("C"), signal);
     // Annotation colour has no explicit ISO default. Black is the interoperable
     // default used by existing processors when a Link has a painting border.
-    if (raw === undefined || raw === null) return DEFAULT_COLOR;
+    return await this.readAnnotationColor(annotation, "C", DEFAULT_COLOR, "Link annotation", signal);
+  }
+
+  private async readAnnotationColor(
+    annotation: NativePdfAnnotationAppearance,
+    key: "C" | "IC",
+    missing: AppearanceColor | null,
+    label: string,
+    signal?: AbortSignal
+  ): Promise<AppearanceColor | null> {
+    const raw = await this.document.resolveValue(annotation.dictionary.get(key), signal);
+    if (raw === undefined || raw === null) return missing;
     if (!Array.isArray(raw) || ![0, 1, 3, 4].includes(raw.length)) {
       throw new PdfError(
         "invalid-object",
-        "Link annotation /C is not a transparent, DeviceGray, RGB, or CMYK color array.",
+        `${label} /${key} is not a transparent, DeviceGray, RGB, or CMYK color array.`,
         {
           pageIndex: annotation.pageIndex,
           details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
@@ -944,7 +1038,7 @@ export class NativePdfAppearanceSynthesizer {
         typeof component !== "number" || !Number.isFinite(component) ||
         component < 0 || component > 1
       ) {
-        throw new PdfError("invalid-object", "Link annotation /C contains an invalid component.", {
+        throw new PdfError("invalid-object", `${label} /${key} contains an invalid component.`, {
           pageIndex: annotation.pageIndex,
           details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
         });
@@ -954,8 +1048,9 @@ export class NativePdfAppearanceSynthesizer {
     return Object.freeze({ components: Object.freeze(components) });
   }
 
-  private async readLinkBorderStyle(
+  private async readAnnotationBorderStyle(
     annotation: NativePdfAnnotationAppearance,
+    label: string,
     signal?: AbortSignal
   ): Promise<LinkBorderStyle> {
     const rawStyle = annotation.dictionary.get("BS");
@@ -963,10 +1058,10 @@ export class NativePdfAppearanceSynthesizer {
       const dictionary = await this.document.resolveDictionary(rawStyle, signal);
       const type = await this.document.resolveValue(dictionary.get("Type"), signal);
       if (type !== undefined && type !== null && !isPdfName(type, "Border")) {
-        throw invalidBorder(annotation, "Link /BS has an invalid /Type.");
+        throw invalidBorder(annotation, `${label} /BS has an invalid /Type.`);
       }
-      const width = await optionalFiniteNumber(this.document, dictionary, "W", 1, signal, "Link /BS");
-      if (width < 0) throw invalidBorder(annotation, "Link /BS /W cannot be negative.");
+      const width = await optionalFiniteNumber(this.document, dictionary, "W", 1, signal, `${label} /BS`);
+      if (width < 0) throw invalidBorder(annotation, `${label} /BS /W cannot be negative.`);
       if (width === 0) {
         return Object.freeze({
           width,
@@ -978,17 +1073,17 @@ export class NativePdfAppearanceSynthesizer {
       }
       const rawName = await this.document.resolveValue(dictionary.get("S"), signal);
       if (rawName !== undefined && rawName !== null && !isPdfName(rawName)) {
-        throw invalidBorder(annotation, "Link /BS /S is not a name.");
+        throw invalidBorder(annotation, `${label} /BS /S is not a name.`);
       }
       const name = rawName?.value ?? "S";
       if (name === "B" || name === "I") {
-        throw synthesisError(annotation, "Beveled and inset Link borders are not safely synthesizable.", {
+        throw synthesisError(annotation, `Beveled and inset ${label} borders are not safely synthesizable.`, {
           reason: "appearance-border-style-unsupported",
           borderStyle: name
         });
       }
       if (name !== "S" && name !== "D" && name !== "U") {
-        throw synthesisError(annotation, `Link border style /${name} is unsupported.`, {
+        throw synthesisError(annotation, `${label} border style /${name} is unsupported.`, {
           reason: "appearance-border-style-unsupported",
           borderStyle: name
         });
@@ -1016,7 +1111,7 @@ export class NativePdfAppearanceSynthesizer {
       });
     }
     if (!Array.isArray(rawBorder) || (rawBorder.length !== 3 && rawBorder.length !== 4)) {
-      throw invalidBorder(annotation, "Link /Border is not a three- or four-element array.");
+      throw invalidBorder(annotation, `${label} /Border is not a three- or four-element array.`);
     }
     const values: PdfValue[] = [];
     for (let index = 0; index < 3; index += 1) {
@@ -1024,16 +1119,16 @@ export class NativePdfAppearanceSynthesizer {
     }
     for (let index = 0; index < 3; index += 1) {
       if (typeof values[index] !== "number" || !Number.isFinite(values[index] as number)) {
-        throw invalidBorder(annotation, "Link /Border contains an invalid number.");
+        throw invalidBorder(annotation, `${label} /Border contains an invalid number.`);
       }
     }
     const horizontalRadius = values[0] as number;
     const verticalRadius = values[1] as number;
     const width = values[2] as number;
     if (horizontalRadius < 0 || verticalRadius < 0) {
-      throw invalidBorder(annotation, "Link /Border corner radii cannot be negative.");
+      throw invalidBorder(annotation, `${label} /Border corner radii cannot be negative.`);
     }
-    if (width < 0) throw invalidBorder(annotation, "Link /Border width cannot be negative.");
+    if (width < 0) throw invalidBorder(annotation, `${label} /Border width cannot be negative.`);
     if (width === 0) {
       return Object.freeze({
         width,
@@ -1164,7 +1259,8 @@ export async function resolveNativePdfAnnotationAppearanceWithSynthesis(
       !(error instanceof PdfError) ||
       error.code !== "unsupported-content" ||
       error.details?.reason !== "appearance-synthesis-not-implemented" ||
-      (annotation.subtype !== "Link" && (annotation.subtype !== "Widget" || !annotation.widget))
+      (annotation.subtype !== "Link" && annotation.subtype !== "Square" &&
+        (annotation.subtype !== "Widget" || !annotation.widget))
     ) {
       throw error;
     }

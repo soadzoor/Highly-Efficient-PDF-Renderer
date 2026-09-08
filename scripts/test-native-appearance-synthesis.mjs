@@ -161,6 +161,7 @@ try {
     diagnostic.code === "annotation.appearance-synthesized"
   ));
   await testLinkAppearanceSynthesis();
+  await testSquareAppearanceSynthesis();
 } finally {
   await document.close();
   hooks.deregister();
@@ -386,6 +387,91 @@ function fixture() {
       { number: 65, body: "<< /FT /Ch /T (List) /Ff 2097152 /Opt [(One) (Two) (Three) (Four)] /V [(Two) (Four)] /I [1 3] /TI 1 /DA (/Helv 9 Tf 0 g) /Kids [24 0 R] >>" },
       { number: 66, body: "<< /FT /Tx /T (Comb) /Ff 16777216 /MaxLen 4 /V (123) /Q 2 /Kids [25 0 R] >>" },
       { number: 99, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 1 1]", "") }
+    ]
+  });
+}
+
+async function testSquareAppearanceSynthesis() {
+  const squareDocument = await openNativePdfDocument({
+    kind: "bytes",
+    bytes: squareFixture()
+  });
+  try {
+    const registry = new NativePdfFormAppearanceRegistry(squareDocument);
+    const synthesizer = new NativePdfAppearanceSynthesizer(squareDocument);
+    const annotations = await registry.listPageAnnotations(0);
+    assert.equal(annotations.length, 6);
+    const resolve = (annotation) =>
+      resolveNativePdfAnnotationAppearanceWithSynthesis(registry, synthesizer, annotation);
+
+    // A zero-width border with no interior colour paints nothing at all. Such
+    // an annotation must not fail the page: real drawings carry these as pure
+    // metadata markers.
+    assert.equal(await resolve(annotations[0]), null);
+
+    // /C is absent, so the border takes the interoperable black default, and
+    // the stroked rectangle is inset by half the border width.
+    const defaulted = await resolve(annotations[1]);
+    assert(defaulted?.synthesized);
+    const defaultedContent = decoder.decode(defaulted.decodedContent);
+    assert.match(defaultedContent, /0 G/);
+    assert.match(defaultedContent, /2 w/);
+    assert.match(defaultedContent, /1 1 38 18 re S/);
+
+    // An interior colour paints even when the border width is zero.
+    const filledOnly = await resolve(annotations[2]);
+    assert(filledOnly?.synthesized);
+    const filledOnlyContent = decoder.decode(filledOnly.decodedContent);
+    assert.match(filledOnlyContent, /1 0 0 rg/);
+    assert.match(filledOnlyContent, /0 0 40 20 re f/);
+    assert.doesNotMatch(filledOnlyContent, / S/);
+
+    // Border and interior together fill and stroke the same inset rectangle.
+    const both = await resolve(annotations[3]);
+    assert(both?.synthesized);
+    const bothContent = decoder.decode(both.decodedContent);
+    assert.match(bothContent, /1 1 0 rg/);
+    assert.match(bothContent, /0 0 1 RG/);
+    assert.match(bothContent, /1 1 38 18 re B/);
+
+    // An empty /C is transparent, so the interior is painted on its own. The
+    // declared border width still positions the path: colour decides what is
+    // painted, width decides where the path runs, so the fill stays inset.
+    const transparentBorder = await resolve(annotations[4]);
+    assert(transparentBorder?.synthesized);
+    const transparentContent = decoder.decode(transparentBorder.decodedContent);
+    assert.match(transparentContent, /0 1 0 rg/);
+    assert.match(transparentContent, /1 1 38 18 re f/);
+    assert.doesNotMatch(transparentContent, / re B/);
+
+    // A fully transparent annotation contributes no display command.
+    assert.equal(await resolve(annotations[5]), null);
+  } finally {
+    await squareDocument.close();
+  }
+}
+
+function squareFixture() {
+  return writeTinyPdf({
+    objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      {
+        number: 3,
+        body: [
+          "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Resources << >>",
+          "/Annots [10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R] >>"
+        ].join(" ")
+      },
+      { number: 10, body: "<< /Type /Annot /Subtype /Square /Rect [0 0 40 20] /Border [0 0 0] >>" },
+      { number: 11, body: "<< /Type /Annot /Subtype /Square /Rect [45 0 85 20] /Border [0 0 2] >>" },
+      { number: 12, body: "<< /Type /Annot /Subtype /Square /Rect [90 0 130 20] /Border [0 0 0] /IC [1 0 0] >>" },
+      {
+        number: 13,
+        body: "<< /Type /Annot /Subtype /Square /Rect [135 0 175 20] /Border [0 0 2] /C [0 0 1] /IC [1 1 0] >>"
+      },
+      { number: 14, body: "<< /Type /Annot /Subtype /Square /Rect [180 0 220 20] /Border [0 0 2] /C [] /IC [0 1 0] >>" },
+      { number: 15, body: "<< /Type /Annot /Subtype /Square /Rect [0 30 40 50] /Border [0 0 2] /C [0 0 1] /CA 0 >>" }
     ]
   });
 }
