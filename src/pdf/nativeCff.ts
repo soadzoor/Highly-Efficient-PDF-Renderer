@@ -170,9 +170,13 @@ export class NativeCffFont {
         "cff-cid-not-supported"
       );
     }
-    if (top.has(dictOperator(12, 20)) || top.has(dictOperator(12, 23))) {
+    // 12 20 is SyntheticBase: those glyphs are defined against another font and
+    // cannot be read from this CharStrings INDEX alone. 12 23 is BaseFontBlend,
+    // a delta left behind by Multiple Master tooling that carries no blend axes
+    // and no interpolation state, so a font holding it is read normally.
+    if (top.has(dictOperator(12, 20))) {
       throw cffUnsupported(
-        "Synthetic or Multiple Master CFF fonts are not supported.",
+        "Synthetic CFF fonts are not supported.",
         "cff-synthetic-not-supported"
       );
     }

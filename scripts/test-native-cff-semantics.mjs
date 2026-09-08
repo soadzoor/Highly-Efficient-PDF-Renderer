@@ -64,6 +64,23 @@ function testCffStructureAndType2Outlines() {
   assert.deepEqual(flex.bounds, [0, 0, 90, 50]);
 }
 
+function testBaseFontBlendIsNotMultipleMaster() {
+  // Top DICT 12 23 is BaseFontBlend, a delta left behind by Multiple Master
+  // tooling. It carries no interpolation state and no blend axes: the glyphs
+  // stay exactly the ones in CharStrings. Rejecting it as a Multiple Master
+  // font discards documents whose outlines are perfectly ordinary.
+  const baseline = NativeCffFont.parse(buildCffFixture());
+  const blended = NativeCffFont.parse(buildCffFixture({
+    topDictExtra: concat(dictInteger(408), dictInteger(-397), Uint8Array.of(12, 23))
+  }));
+  assert.equal(blended.numGlyphs, baseline.numGlyphs);
+  assert.deepEqual(blended.glyphNames, baseline.glyphNames);
+  assert.deepEqual(
+    blended.getGlyphOutline(1).commands,
+    baseline.getGlyphOutline(1).commands
+  );
+}
+
 function testFontMatrixNormalization() {
   const font = NativeCffFont.parse(buildCffFixture({
     fontMatrix: [0.002, 0, 0, 0.003, 0.01, -0.02]
@@ -224,7 +241,8 @@ function buildCffFixture(options = {}) {
   assert.equal(privateDictionary.length, 18);
   const localSubrsIndex = cffIndex(localSubrs);
   const fontMatrix = options.fontMatrix ?? null;
-  const placeholderTop = topDictionary(0, 0, 0, privateDictionary.length, 0, fontMatrix);
+  const topDictExtra = options.topDictExtra ?? new Uint8Array();
+  const placeholderTop = topDictionary(0, 0, 0, privateDictionary.length, 0, fontMatrix, topDictExtra);
   const placeholderTopIndex = cffIndex([placeholderTop]);
   const prefixLength = header.length + nameIndex.length + placeholderTopIndex.length +
     stringIndex.length + globalSubrsIndex.length;
@@ -238,7 +256,8 @@ function buildCffFixture(options = {}) {
     charStringsOffset,
     privateDictionary.length,
     privateOffset,
-    fontMatrix
+    fontMatrix,
+    topDictExtra
   );
   assert.equal(top.length, placeholderTop.length);
 
@@ -257,12 +276,13 @@ function buildCffFixture(options = {}) {
   );
 }
 
-function topDictionary(charset, encoding, charStrings, privateSize, privateOffset, fontMatrix) {
+function topDictionary(charset, encoding, charStrings, privateSize, privateOffset, fontMatrix, extra = new Uint8Array()) {
   const matrix = fontMatrix === null
     ? new Uint8Array()
     : concat(...fontMatrix.map((value) => dictReal(value)), Uint8Array.of(12, 7));
   return concat(
     matrix,
+    extra,
     dictInteger(charset), Uint8Array.of(15),
     dictInteger(encoding), Uint8Array.of(16),
     dictInteger(charStrings), Uint8Array.of(17),
@@ -381,6 +401,7 @@ function expectPdf(callback, code, message) {
 
 testCffStructureAndType2Outlines();
 testFontMatrixNormalization();
+testBaseFontBlendIsNotMultipleMaster();
 await testPdfFontSelectionIsSeparateFromToUnicode();
 testMalformedProgramsAndLimits();
 testDeprecatedPdfDotsectionCompatibility();
