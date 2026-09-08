@@ -38,6 +38,9 @@ export const fastTests = [
   "deferred-renderer-api",
   "room-overlay-page-matrix",
   "room-detector-worker",
+  "room-boundary-geometry",
+  "room-detector-seeds",
+  "room-geometry-fallback",
   "vector-stroke-clip-lod"
 ];
 

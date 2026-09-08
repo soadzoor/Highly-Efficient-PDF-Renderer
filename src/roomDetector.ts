@@ -1421,24 +1421,6 @@ function detectRoomsOnPage(
         continue;
       }
       clearance ??= buildClearanceField(occupancy, rasterWidth, rasterHeight);
-      // Annotation-only clusters join their nearest room-label cluster.
-      for (const cluster of clusters) {
-        if (cluster.roomLike) {
-          continue;
-        }
-        let best = roomClusters[0];
-        let bestDistance = Number.POSITIVE_INFINITY;
-        for (const candidate of roomClusters) {
-          const distance = Math.hypot(candidate.x - cluster.x, candidate.y - cluster.y);
-          if (distance < bestDistance) {
-            bestDistance = distance;
-            best = candidate;
-          }
-        }
-        best.seeds.push(...cluster.seeds);
-        best.probes.push(...cluster.probes);
-      }
-
       const newIds = roomClusters.map(() => {
         const id = nextRegionId;
         nextRegionId += 1;
@@ -1545,6 +1527,30 @@ function detectRoomsOnPage(
           });
         }
         continue;
+      }
+
+      // Annotation positions describe their containing room; they must not become
+      // extra watershed markers for the nearest label across a wall. Attach their
+      // metadata only after the architectural split and all merge-backs are final.
+      const clusterById = new Map<number, SeedCluster>();
+      for (let clusterIndex = 0; clusterIndex < roomClusters.length; clusterIndex += 1) {
+        if (absorbedClusters[clusterIndex] === 0) {
+          const canonical = canonicalOf.get(findGroup(clusterIndex)) as number;
+          clusterById.set(newIds[canonical], roomClusters[clusterIndex]);
+        }
+      }
+      for (const cluster of clusters) {
+        if (cluster.roomLike) {
+          continue;
+        }
+        for (let seedIndex = 0; seedIndex < cluster.seeds.length; seedIndex += 1) {
+          const probe = cluster.probes[seedIndex];
+          const target = clusterById.get(regionMap[probe]);
+          if (target) {
+            target.seeds.push(cluster.seeds[seedIndex]);
+            target.probes.push(probe);
+          }
+        }
       }
 
       region.failure = "duplicate"; // parent retired in favor of its splits
@@ -2160,7 +2166,8 @@ function detectRoomsOnPage(
     rooms,
     roomPreOffsetPolygons,
     roomRawPolygons,
-    scale
+    scale,
+    options.simplifyTolerancePx
   );
   stats.geometryRepairCount = geometryRepair.repairCount;
   stats.geometryConflictSuppressionCount = geometryRepair.suppressedRoomIndices.size;
@@ -2319,11 +2326,19 @@ function collectPageSeeds(
       continue;
     }
     seeds.push({ x, y, label: text, item, probeRadius: 0.75 * (item.maxY - item.minY), asRoomSeed: { x, y, label: text, pageIndex } });
-    if (seeds.length >= MAX_SEEDS_PER_PAGE) {
-      break;
-    }
   }
-  return seeds;
+  if (seeds.length <= MAX_SEEDS_PER_PAGE) {
+    return seeds;
+  }
+  // CAD exports often write equipment and dimensions first, with architectural room
+  // labels near the end of the page's text stream. Apply the work limit only after
+  // examining the whole page, reserving capacity for plausible room labels. Keep the
+  // retained seeds in their original order so clipping does not otherwise reorder
+  // marker growth or label metadata. Explicit caller seeds retain their own ordering.
+  const roomLike = seeds.map((seed) => isRoomLikeLabel(seed.label));
+  let roomBudget = Math.min(MAX_SEEDS_PER_PAGE, roomLike.reduce((count, value) => count + Number(value), 0));
+  let annotationBudget = MAX_SEEDS_PER_PAGE - roomBudget;
+  return seeds.filter((_seed, index) => roomLike[index] ? roomBudget-- > 0 : annotationBudget-- > 0);
 }
 
 /**
@@ -4706,7 +4721,6 @@ function traceRegionContour(
   let px = startX;
   let py = startY;
   let dir = 0;
-  let prevDir = 0;
   const maxSteps = 4 * (bboxMaxX - bboxMinX + 3) * (bboxMaxY - bboxMinY + 3) + 16;
 
   for (let step = 0; step < maxSteps; step += 1) {
@@ -4777,13 +4791,11 @@ function traceRegionContour(
       }
     }
 
-    if (nextDir !== prevDir) {
+    // Emit the corner where the walk changes direction. Extending the last emitted
+    // point on straight steps would overwrite the preceding corner, turning even a
+    // rectangular component into a slanted polygon and losing part of its area.
+    if (nextDir !== dir) {
       points.push(cornerX, cornerY);
-      prevDir = nextDir;
-    } else {
-      // Extend the previous emitted point along the same direction.
-      points[points.length - 2] = cornerX;
-      points[points.length - 1] = cornerY;
     }
 
     px = nextPx;
@@ -4891,18 +4903,44 @@ function snapAxisAlignedEdges(points: number[], axisSnapTan: number): number[] {
     return points;
   }
   const snapped = [...points];
+  const directions = new Int8Array(vertexCount);
   for (let i = 0; i < vertexCount; i += 1) {
     const j = (i + 1) % vertexCount;
-    const dx = Math.abs(snapped[j * 2] - snapped[i * 2]);
-    const dy = Math.abs(snapped[j * 2 + 1] - snapped[i * 2 + 1]);
-    if (dx >= dy && dy <= dx * axisSnapTan) {
-      const meanY = (snapped[i * 2 + 1] + snapped[j * 2 + 1]) / 2;
-      snapped[i * 2 + 1] = meanY;
-      snapped[j * 2 + 1] = meanY;
-    } else if (dy > dx && dx <= dy * axisSnapTan) {
-      const meanX = (snapped[i * 2] + snapped[j * 2]) / 2;
-      snapped[i * 2] = meanX;
-      snapped[j * 2] = meanX;
+    const dx = points[j * 2] - points[i * 2];
+    const dy = points[j * 2 + 1] - points[i * 2 + 1];
+    if (Math.abs(dx) > 0 && Math.abs(dy) <= Math.abs(dx) * axisSnapTan) {
+      directions[i] = Math.sign(dx);
+    } else if (Math.abs(dy) > 0 && Math.abs(dx) <= Math.abs(dy) * axisSnapTan) {
+      directions[i] = 2 * Math.sign(dy);
+    }
+  }
+  // Fit each contiguous run from immutable input coordinates. Averaging endpoints
+  // one edge at a time lets the next edge undo the previous edge's alignment, leaving
+  // straight walls wavy and making the result depend on the contour's starting point.
+  for (let start = 0; start < vertexCount; start += 1) {
+    const direction = directions[start];
+    if (direction === 0 || direction === directions[(start + vertexCount - 1) % vertexCount]) {
+      continue;
+    }
+    const coordinate = Math.abs(direction) === 1 ? 1 : 0;
+    let totalWeight = 0;
+    let weightedCoordinate = 0;
+    let end = start;
+    do {
+      const next = (end + 1) % vertexCount;
+      const weight = Math.abs(points[next * 2 + 1 - coordinate] - points[end * 2 + 1 - coordinate]);
+      totalWeight += weight;
+      weightedCoordinate += weight * (points[end * 2 + coordinate] + points[next * 2 + coordinate]) / 2;
+      end = next;
+    } while (end !== start && directions[end] === direction);
+    const mean = weightedCoordinate / totalWeight;
+    let index = start;
+    for (;;) {
+      snapped[index * 2 + coordinate] = mean;
+      if (index === end) {
+        break;
+      }
+      index = (index + 1) % vertexCount;
     }
   }
 
@@ -4946,9 +4984,11 @@ function snapPolygonToWallFaces(
   const angleTolerance = Math.cos((6 * Math.PI) / 180);
   const queryRadius = wallWidth * 2.5;
   const maxVertexShift = wallWidth * 3;
+  const interiorSide = signedPolygonArea(polygon) >= 0 ? 1 : -1;
 
   // Per edge: a supporting line as point (lx, ly) + unit direction (ldx, ldy).
   const lines = new Float64Array(vertexCount * 4);
+  const supportingWalls = new Int32Array(vertexCount).fill(-1);
   for (let i = 0; i < vertexCount; i += 1) {
     const j = (i + 1) % vertexCount;
     const x0 = polygon[i * 2];
@@ -4980,8 +5020,8 @@ function snapPolygonToWallFaces(
         }
         const wallDirX = (wx1 - wx0) / wallLength;
         const wallDirY = (wy1 - wy0) / wallLength;
-        const alignment = Math.abs(wallDirX * lineDirX + wallDirY * lineDirY);
-        if (alignment < angleTolerance) {
+        const alignment = wallDirX * lineDirX + wallDirY * lineDirY;
+        if (Math.abs(alignment) < angleTolerance) {
           return;
         }
         // Signed distance from the edge midpoint to the wall centerline.
@@ -4992,18 +5032,34 @@ function snapPolygonToWallFaces(
           return;
         }
         const signedDistance = offsetX * -wallDirY + offsetY * wallDirX;
-        const faceError = Math.abs(Math.abs(signedDistance) - wallHalfWidth);
+        // Raster quantization can put the contour just across a thin stroke's
+        // centerline. Winding still identifies the face toward the room reliably.
+        const side = alignment >= 0 ? interiorSide : -interiorSide;
+        const faceError = Math.abs(signedDistance - side * wallHalfWidth);
         if (faceError > wallHalfWidth + rasterErrorWorld) {
           return;
         }
-        if (faceError < bestScore) {
-          bestScore = faceError;
+        const firstDistance = (x0 - wx0) * -wallDirY + (y0 - wy0) * wallDirX;
+        const lastDistance = (x1 - wx0) * -wallDirY + (y1 - wy0) * wallDirX;
+        const endpointError = Math.max(
+          Math.abs(firstDistance - side * wallHalfWidth),
+          Math.abs(lastDistance - side * wallHalfWidth)
+        );
+        // A short nearby fragment must not rotate a long edge merely because its
+        // midpoint is close. The chosen face must explain both ends of the edge.
+        if (endpointError > wallHalfWidth + rasterErrorWorld) {
+          return;
+        }
+        const score = faceError + endpointError;
+        if (score < bestScore) {
+          bestScore = score;
           bestWall = wallIndex;
-          bestSide = signedDistance >= 0 ? 1 : -1;
+          bestSide = side;
         }
       });
 
       if (bestWall >= 0) {
+        supportingWalls[i] = bestWall;
         const base = bestWall * WALL_STRIDE;
         const wx0 = walls[base];
         const wy0 = walls[base + 1];
@@ -5050,7 +5106,60 @@ function snapPolygonToWallFaces(
       result[i * 2 + 1] = iy;
     }
   }
-  return result;
+
+  // Round raster stamps can leave a tiny unsupported bevel between two real wall
+  // faces. Reconstruct their intersection only when both finite wall segments reach
+  // that corner. Real diagonal walls retain their own support and are left intact.
+  const cornerError = Math.max(wallWidth, rasterErrorWorld);
+  const corners = new Map<number, [number, number]>();
+  for (let i = 0; i < vertexCount; i += 1) {
+    const previous = (i + vertexCount - 1) % vertexCount;
+    const next = (i + 1) % vertexCount;
+    if (supportingWalls[i] >= 0 || supportingWalls[previous] < 0 || supportingWalls[next] < 0) {
+      continue;
+    }
+    const px = lines[previous * 4];
+    const py = lines[previous * 4 + 1];
+    const pdx = lines[previous * 4 + 2];
+    const pdy = lines[previous * 4 + 3];
+    const nx = lines[next * 4];
+    const ny = lines[next * 4 + 1];
+    const ndx = lines[next * 4 + 2];
+    const ndy = lines[next * 4 + 3];
+    const cross = pdx * ndy - pdy * ndx;
+    if (Math.abs(cross) < 0.5) {
+      continue;
+    }
+    const t = ((nx - px) * ndy - (ny - py) * ndx) / cross;
+    const x = px + pdx * t;
+    const y = py + pdy * t;
+    if (
+      Math.hypot(x - polygon[i * 2], y - polygon[i * 2 + 1]) > cornerError ||
+      Math.hypot(x - polygon[next * 2], y - polygon[next * 2 + 1]) > cornerError
+    ) {
+      continue;
+    }
+    const wallsReachCorner = [previous, next].every((edge) => {
+      const base = supportingWalls[edge] * WALL_STRIDE;
+      return distanceToSegmentSquared(x, y, walls[base], walls[base + 1], walls[base + 2], walls[base + 3]) <=
+        (walls[base + 4] + rasterErrorWorld) ** 2;
+    });
+    if (wallsReachCorner) {
+      corners.set(i, [x, y]);
+    }
+  }
+  if (corners.size === 0 || vertexCount - corners.size < 3) {
+    return result;
+  }
+  const crisp: number[] = [];
+  for (let i = 0; i < vertexCount; i += 1) {
+    if (corners.has((i + vertexCount - 1) % vertexCount)) {
+      continue;
+    }
+    const corner = corners.get(i);
+    crisp.push(corner?.[0] ?? result[i * 2], corner?.[1] ?? result[i * 2 + 1]);
+  }
+  return Float64Array.from(crisp);
 }
 
 /**
@@ -5179,7 +5288,11 @@ function clusterLabelSeeds(seeds: PageSeed[], probes: number[]): SeedCluster[] {
     return root;
   };
 
-  const heights = seeds.map((seed) => (seed.item ? Math.max(1e-6, seed.item.maxY - seed.item.minY) : 0));
+  // The shorter dimension estimates font height for horizontal and rotated text.
+  // Using only the Y extent lets a long vertical dimension bridge separate labels.
+  const heights = seeds.map((seed) => seed.item
+    ? Math.max(1e-6, Math.min(seed.item.maxX - seed.item.minX, seed.item.maxY - seed.item.minY))
+    : 0);
   for (let i = 0; i < count; i += 1) {
     for (let j = i + 1; j < count; j += 1) {
       const reach = 2.5 * (heights[i] + heights[j]);
@@ -8615,7 +8728,7 @@ function repairPairedWallRectangularEnvelope(
 
 /**
  * Prefer the high-accuracy snapped/offset polygon, but retreat to its pre-offset form,
- * exact raster contour, and then progressively deeper sub-pixel contour insets when
+ * compact inset contours, exact raster contour, and then deeper contour insets when
  * geometry processing violates the room-cell topology. These levels handle rare
  * interleaving, hole-riddled components whose single outer-ring representations still
  * cross even though their raster pixels are disjoint. If every simple fallback remains
@@ -8625,7 +8738,8 @@ function repairRoomGeometryConflicts(
   rooms: DetectedRoom[],
   preOffsetPolygons: Float32Array[],
   rawPolygons: Float32Array[],
-  rasterScale: number
+  rasterScale: number,
+  simplifyTolerancePx = 1.5
 ): { repairCount: number; suppressedRoomIndices: Set<number> } {
   const count = Math.min(rooms.length, preOffsetPolygons.length, rawPolygons.length);
   if (count === 0) {
@@ -8636,6 +8750,42 @@ function repairRoomGeometryConflicts(
   // much more than this absolute tolerance. Page-scaled epsilons can hide long, narrow
   // crossings whose integrated area is positive, so topology deliberately stays strict.
   const epsilon = 1e-9;
+  // Independent simplification of a shared raster frontier can make adjacent rooms
+  // overlap. Before falling back to every pixel stair step, try a compact contour
+  // with a small inward margin. The same global overlap checks still decide whether
+  // it is usable; small/narrow rooms retain their exact outline if erosion is material.
+  const compactInsetDistancesPx = [0, 0.55, 1.1, 2.2];
+  const compactPolygons: Array<Array<Float32Array | null | undefined>> = compactInsetDistancesPx.map(() =>
+    Array<Float32Array | null | undefined>(count)
+  );
+  const compactPolygon = (insetIndex: number, roomIndex: number): Float32Array | null => {
+    const cached = compactPolygons[insetIndex][roomIndex];
+    if (cached !== undefined) {
+      return cached;
+    }
+    const raw = rawPolygons[roomIndex];
+    const simplified = simplifyClosedPolyline(Array.from(raw), simplifyTolerancePx / Math.max(rasterScale, 1e-9));
+    const candidate = new Float32Array(offsetPolygonOutward(
+      new Float64Array(simplified),
+      -compactInsetDistancesPx[insetIndex] / Math.max(rasterScale, 1e-9)
+    ));
+    const rawArea = signedPolygonArea(raw);
+    const candidateArea = signedPolygonArea(candidate);
+    const room = rooms[roomIndex];
+    const usable = rawArea > 0 && candidateArea > 0 && candidate.length <= 0.8 * raw.length &&
+      candidateArea >= 0.95 * rawArea && candidateArea <= rawArea &&
+      isSimplePolygon(candidate, epsilon) &&
+      // An anchor already outside a concave raw ring is not evidence against its
+      // cleanup, but a valid interior label must stay in its own room.
+      (!pointInPolygon(room.labelX, room.labelY, raw) || pointInPolygon(room.labelX, room.labelY, candidate)) &&
+      room.labels.every((label) => {
+        const x = (label.minX + label.maxX) / 2;
+        const y = (label.minY + label.maxY) / 2;
+        return !pointInPolygon(x, y, raw) || pointInPolygon(x, y, candidate);
+      });
+    compactPolygons[insetIndex][roomIndex] = usable ? candidate : null;
+    return compactPolygons[insetIndex][roomIndex] as Float32Array | null;
+  };
   const insetDistancesPx = [0.55, 1.1, 2.2, 4.4, 8.8];
   const insetRawPolygons: Array<Array<Float32Array | null>> = insetDistancesPx.map(() =>
     Array<Float32Array | null>(count).fill(null)
@@ -8674,16 +8824,18 @@ function repairRoomGeometryConflicts(
   const preOffsetIsSimple = (index: number): boolean =>
     cachedSimple(preOffsetSimpleState, preOffsetPolygons[index], index);
   const rawIsSimple = (index: number): boolean => cachedSimple(rawSimpleState, rawPolygons[index], index);
-  const maxLevel = 2 + insetDistancesPx.length;
-  // 0 = offset, 1 = pre-offset, 2 = raw, 3+ = successively deeper raw insets.
+  const rawLevel = 2 + compactInsetDistancesPx.length;
+  const maxLevel = rawLevel + insetDistancesPx.length;
+  // 0 = offset, 1 = pre-offset, then compact insets, raw, and deeper raw insets.
   const levels = new Uint8Array(count);
   const advance = (index: number): boolean => {
     const previous = levels[index];
     for (let candidate = previous + 1; candidate <= maxLevel; candidate += 1) {
       if (
         (candidate === 1 && preOffsetIsSimple(index)) ||
-        (candidate === 2 && rawIsSimple(index)) ||
-        (candidate >= 3 && insetIsSimple(candidate - 3, index))
+        (candidate >= 2 && candidate < rawLevel && compactPolygon(candidate - 2, index) !== null) ||
+        (candidate === rawLevel && rawIsSimple(index)) ||
+        (candidate > rawLevel && insetIsSimple(candidate - rawLevel - 1, index))
       ) {
         levels[index] = candidate;
         return true;
@@ -8696,9 +8848,11 @@ function repairRoomGeometryConflicts(
       ? rooms[index].polygon
       : levels[index] === 1
         ? preOffsetPolygons[index]
-        : levels[index] === 2
-          ? rawPolygons[index]
-          : insetPolygon(levels[index] - 3, index);
+        : levels[index] < rawLevel
+          ? compactPolygon(levels[index] - 2, index) as Float32Array
+          : levels[index] === rawLevel
+            ? rawPolygons[index]
+            : insetPolygon(levels[index] - rawLevel - 1, index);
 
   for (let index = 0; index < count; index += 1) {
     if (!isSimplePolygon(rooms[index].polygon, epsilon)) {
@@ -8743,11 +8897,7 @@ function repairRoomGeometryConflicts(
     if (levels[index] === 0) {
       continue;
     }
-    const repaired = levels[index] === 1
-      ? preOffsetPolygons[index]
-      : levels[index] === 2
-        ? rawPolygons[index]
-        : insetPolygon(levels[index] - 3, index);
+    const repaired = selected(index);
     rooms[index].polygon = new Float32Array(repaired);
     rooms[index].area = Math.abs(signedPolygonArea(repaired));
     repairCount += 1;

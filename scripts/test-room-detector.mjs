@@ -538,9 +538,11 @@ async function run() {
       assert.equal(result.rooms.length, 1);
       assert.equal(result.failedSeeds.length, 0);
       assert.equal(result.debug?.pageStats.get(0)?.pairedDoorRecoveryCount, 0);
-      assert.equal(result.debug?.pageStats.get(0)?.geometryRepairCount, 0);
+      // Topology repair may retain the exact raster contour around the small wall
+      // returns. Assert the architectural bay survives, independently of that fallback.
       assert.ok(result.rooms[0].polygon.length / 2 >= 12, "the paired bay was flattened");
       assert.ok(result.rooms[0].area < clean.rooms[0].area - 50, "the structural bay was filled");
+      assert.ok(result.rooms[0].area > clean.rooms[0].area - 90, "the structural bay removed unrelated room area");
       assert.ok(
         Array.from({ length: result.rooms[0].polygon.length / 2 }, (_, index) => [
           result.rooms[0].polygon[index * 2],
@@ -638,7 +640,10 @@ async function run() {
       const room = result.rooms.find((candidate) => candidate.roomNumber === "102");
       assert.ok(room);
       assert.equal(room.polygon.length / 2, 7);
-      assert.ok(room.area < 3_010, `the real chamfer was filled: ${room.area}`);
+      const unchamferedArea = (89.45 - 45.3) * (89.45 - 10.55) - 10 * (52.3 - 10.55);
+      const chamferTriangleArea = 10 * 9.25 / 2;
+      assert.ok(room.area < unchamferedArea - 0.75 * chamferTriangleArea, `the real chamfer was filled: ${room.area}`);
+      assert.ok(room.area > unchamferedArea - 1.5 * chamferTriangleArea, `the chamfer removed unrelated room area: ${room.area}`);
       assert.ok(
         Array.from({ length: room.polygon.length / 2 }, (_, index) => [
           room.polygon[index * 2],
