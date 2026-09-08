@@ -283,6 +283,22 @@ async function testExponentialAndStitchingFunctions() {
   closeTo(registry.evaluate(joined, [0.5])[0], 10);
   closeTo(registry.evaluate(joined, [1])[0], 20);
 
+  // ISO 32000-1 7.10.4 orders Bounds by increasing value, and producers do
+  // repeat one. That is an empty subdomain, not a disordered array: selection
+  // takes the first bound strictly above the input, so the segment between two
+  // equal bounds can never be chosen and its subfunction is never evaluated.
+  // Here that unreachable segment is `high`, whose outputs start at 10, so
+  // picking it up would be unmistakable.
+  const plateau = await registry.add(stitching({
+    range: [0, 20],
+    functions: [low, high, low],
+    bounds: [0.5, 0.5],
+    encode: [0, 1, 0, 1, 0, 1]
+  }));
+  closeTo(registry.evaluate(plateau, [0.25])[0], 0.5);
+  closeTo(registry.evaluate(plateau, [0.5])[0], 0);
+  closeTo(registry.evaluate(plateau, [1])[0], 1);
+
   const oneDegenerate = await registry.add(stitching({
     domain: [1, 1],
     range: [0, 1],

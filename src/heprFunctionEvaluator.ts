@@ -534,7 +534,10 @@ function decodeRecord(
     for (let boundIndex = 0; boundIndex < bounds.length; boundIndex += 1) {
       const bound = bounds[boundIndex];
       const last = boundIndex === bounds.length - 1;
-      if (!(bound > previous && (bound < domain[1] || (last && bound === domain[1])))) {
+      // Repeated bounds describe an empty subdomain, not disorder: selection
+      // above takes the first bound strictly greater than the input, so that
+      // segment is unreachable. Only a decreasing bound is disorder.
+      if (!(bound >= previous && (bound < domain[1] || (last && bound === domain[1])))) {
         invalidFunction(path, "stitching bounds are unordered");
       }
       previous = bound;

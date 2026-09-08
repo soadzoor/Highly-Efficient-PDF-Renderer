@@ -208,6 +208,15 @@ try {
     bounds: [0.5],
     encode: [0, 1, 0, 1]
   }));
+  // Repeated Bounds describe an empty subdomain, which selection can never
+  // reach. The unreachable segment here is `high`, whose outputs start at 10.
+  const plateau = await registry.add(stitching({
+    range: [0, 20],
+    functions: [low, high, low],
+    bounds: [0.5, 0.5],
+    encode: [0, 1, 0, 1, 0, 1]
+  }));
+
   const conditional = await registry.add(calculator(
     "{ dup .5 lt { 2 mul } { 1 exch sub 4 mul } ifelse }"
   ));
@@ -252,6 +261,7 @@ try {
     [cubic, [[0], [0.25], [0.5], [0.75], [1]]],
     [clampedExponential, [[-100], [0], [0.5], [1], [100]]],
     [joined, [[0], [0.25], [0.5], [0.75], [1]]],
+    [plateau, [[0], [0.25], [0.5], [0.75], [1]]],
     [conditional, [[0], [0.25], [0.5], [0.75], [1]]],
     [nestedConditional, [[0], [0.5], [1]]],
     [arithmetic, [[0]]],

@@ -609,7 +609,11 @@ export class NativePdfFunctionRegistry {
       const isLast = index === bounds.length - 1;
       // The one explicit ISO exception permits only the last bound to equal
       // Domain[1]. That creates a final point subdomain evaluated at Encode[2i].
-      if (!(bound > previous && (bound < domain[1] || (isLast && bound === domain[1])))) {
+      // Repeated bounds are accepted as the empty subdomain they describe, not
+      // rejected as disorder: evaluateStitching selects the first bound strictly
+      // above the input, so a segment between two equal bounds is unreachable and
+      // its subfunction is never evaluated. Only a decreasing bound is disorder.
+      if (!(bound >= previous && (bound < domain[1] || (isLast && bound === domain[1])))) {
         throw new PdfError("invalid-object", "A stitching PDF function has unordered Bounds.");
       }
       previous = bound;
