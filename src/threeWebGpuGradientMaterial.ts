@@ -82,8 +82,14 @@ function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
 }
 
-function varyingNode(node: unknown): never {
-  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
+// `flat` mirrors the `flat` qualifier the GLSL shaders and the
+// `@interpolate(flat)` attribute the native WGSL shaders use for per-primitive
+// values. Only positions, which really do vary across the quad, stay
+// interpolated.
+function varyingNode(node: unknown, flat = false): never {
+  const varying = (TSL.varying as unknown as (node: unknown) =>
+    { setInterpolation(type: string): unknown })(node);
+  return (flat ? varying.setInterpolation("flat") : varying) as never;
 }
 
 const coordFromIndexFn = TSL.wgslFn(`
@@ -419,9 +425,9 @@ export function createThreeWebGpuGradientFillMaterial(
   const gradientWidth = TSL.uniform(Math.max(1, options.gradientMetaTextureWidth));
   const pathIndex = TSL.attribute("aFillPathIndex", "float");
   const pathCoord = callNode(coordFromIndexFn, { index: pathIndex, width: pathWidth });
-  const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0));
-  const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0));
-  const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0));
+  const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0), true);
+  const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0), true);
+  const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0), true);
   const vertexPack = varyingNode(options.mesh ? TSL.vec4(TSL.attribute("aMeshPosition", "vec2") as never, 1, 0) : callNode(fillVertexPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC, shapeOnly
   }));
@@ -467,10 +473,10 @@ export function createThreeWebGpuGradientStrokeMaterial(
   const gradientWidth = TSL.uniform(Math.max(1, options.gradientMetaTextureWidth));
   const segmentIndex = TSL.attribute("aSegmentIndex", "float");
   const coord = callNode(coordFromIndexFn, { index: segmentIndex, width: segmentWidth });
-  const primitiveA = varyingNode(TSL.textureLoad(options.segmentTextureA, coord, 0));
-  const primitiveB = varyingNode(TSL.textureLoad(options.segmentTextureB, coord, 0));
-  const style = varyingNode(TSL.textureLoad(options.segmentStyleTexture, coord, 0));
-  const primitiveBounds = varyingNode(TSL.textureLoad(options.segmentBoundsTexture, coord, 0));
+  const primitiveA = varyingNode(TSL.textureLoad(options.segmentTextureA, coord, 0), true);
+  const primitiveB = varyingNode(TSL.textureLoad(options.segmentTextureB, coord, 0), true);
+  const style = varyingNode(TSL.textureLoad(options.segmentStyleTexture, coord, 0), true);
+  const primitiveBounds = varyingNode(TSL.textureLoad(options.segmentBoundsTexture, coord, 0), true);
   const worldPack = varyingNode(callNode(strokeWorldPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), primitiveA, primitiveB, style, primitiveBounds,
     zoom: zoomUniform, useLocalToClip: useLocalToClipUniform,

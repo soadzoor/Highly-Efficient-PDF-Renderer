@@ -61,7 +61,7 @@ try {
     restoreShape();
 
     const compositor = new ThreePaintCompositor(backend);
-    const host = makeRenderer();
+    const host = makeRenderer(backend);
     const state = snapshot(host);
     const roots = [stroke.mesh, raster.group];
     compositor.render(host, scene, roots, 32, 24, () => true);
@@ -104,8 +104,9 @@ try {
   console.log("Three PDF compositor state, canonical subsets, shape coverage, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
 
-function makeRenderer() {
+function makeRenderer(backend = "webgpu") {
   return {
+    coordinateSystem: backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem,
     target: new THREE.RenderTarget(7, 9), viewport: new THREE.Vector4(3, 4, 17, 19),
     scissor: new THREE.Vector4(5, 6, 11, 13), scissorTest: true, clearColor: new THREE.Color(0.2, 0.3, 0.4),
     clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], fail: false,
@@ -117,7 +118,16 @@ function makeRenderer() {
     getScissorTest() { return this.scissorTest; }, setScissorTest(value) { this.scissorTest = value; },
     getClearColor(out) { return out.copy(this.clearColor); }, getClearAlpha() { return this.clearAlpha; },
     setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; }, clear() {},
-    render(scene) {
+    render(scene, camera) {
+      // Mirrors Renderer._updateCamera: the first render whose coordinate
+      // system differs from the camera's rebuilds the projection. The abstract
+      // THREE.Camera base class has no updateProjectionMatrix, so a compositor
+      // built on it throws on its first composited WebGPU frame.
+      assert.ok(camera?.isCamera, "the compositor renders through a camera");
+      if (camera.coordinateSystem !== this.coordinateSystem) {
+        camera.coordinateSystem = this.coordinateSystem;
+        camera.updateProjectionMatrix();
+      }
       if (this.fail) throw new Error("synthetic draw failure");
       for (const mesh of scene.children) {
         const ids = mesh.geometry.getAttribute("aSegmentIndex");

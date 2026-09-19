@@ -77,7 +77,11 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private readonly passMaterial: THREE.Material;
   private readonly passMesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
   private readonly internalScene = new THREE.Scene();
-  private readonly camera = new THREE.Camera();
+  // Every pass and proxy material writes clip position itself, so this camera
+  // only satisfies `renderer.render(scene, camera)`. It must still be a concrete
+  // camera: WebGPURenderer rebuilds the projection for its own coordinate system
+  // on first use, and the abstract base class has no updateProjectionMatrix.
+  private readonly camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly pool: THREE.RenderTarget[] = [];
   private readonly surfaces = new Set<THREE.RenderTarget>();
   private readonly proxies = new Map<THREE.Object3D, ProxyEntry>();

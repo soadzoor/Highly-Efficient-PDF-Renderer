@@ -57,8 +57,14 @@ function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
 }
 
-function varyingNode(node: unknown): never {
-  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
+// `flat` mirrors the `flat` qualifier the GLSL shaders and the
+// `@interpolate(flat)` attribute the native WGSL shaders use for per-primitive
+// values. Only positions, which really do vary across the quad, stay
+// interpolated.
+function varyingNode(node: unknown, flat = false): never {
+  const varying = (TSL.varying as unknown as (node: unknown) =>
+    { setInterpolation(type: string): unknown })(node);
+  return (flat ? varying.setInterpolation("flat") : varying) as never;
 }
 
 const coordFromIndexFn = TSL.wgslFn(`
@@ -593,16 +599,16 @@ export function createThreeWebGpuTextMaterial(
     index: instanceIndex,
     width: instanceTextureWidthUniform
   });
-  const instanceA = varyingNode(TSL.textureLoad(options.textInstanceTextureA, instanceCoord, 0));
-  const instanceB = varyingNode(TSL.textureLoad(options.textInstanceTextureB, instanceCoord, 0));
-  const instanceColor = varyingNode(TSL.textureLoad(options.textInstanceTextureC, instanceCoord, 0));
+  const instanceA = varyingNode(TSL.textureLoad(options.textInstanceTextureA, instanceCoord, 0), true);
+  const instanceB = varyingNode(TSL.textureLoad(options.textInstanceTextureB, instanceCoord, 0), true);
+  const instanceColor = varyingNode(TSL.textureLoad(options.textInstanceTextureC, instanceCoord, 0), true);
   const glyphCoord = callNode(coordFromIndexFn, {
     index: (instanceB as { z: unknown }).z,
     width: glyphTextureWidthUniform
   });
-  const glyphMetaA = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, glyphCoord, 0));
-  const glyphMetaB = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0));
-  const rasterRect = varyingNode(TSL.textureLoad(options.textGlyphRasterMetaTexture, glyphCoord, 0));
+  const glyphMetaA = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, glyphCoord, 0), true);
+  const glyphMetaB = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureB, glyphCoord, 0), true);
+  const rasterRect = varyingNode(TSL.textureLoad(options.textGlyphRasterMetaTexture, glyphCoord, 0), true);
   const vertexPack = varyingNode(callNode(textVertexPackFn, {
     corner,
     instanceA,
@@ -615,7 +621,7 @@ export function createThreeWebGpuTextMaterial(
     reference: (instanceB as { w: unknown }).w,
     width: glyphTextureWidthUniform
   });
-  const clipRect = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, clipCoord, 0));
+  const clipRect = varyingNode(TSL.textureLoad(options.textGlyphMetaTextureA, clipCoord, 0), true);
 
   material.vertexNode = callNode(textClipFn, {
     vertexPack,

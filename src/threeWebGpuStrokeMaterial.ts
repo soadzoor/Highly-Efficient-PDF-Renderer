@@ -53,8 +53,14 @@ function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (...args: unknown[]) => unknown)(params) as never;
 }
 
-function varyingNode(node: unknown): never {
-  return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
+// `flat` mirrors the `flat` qualifier the GLSL shaders and the
+// `@interpolate(flat)` attribute the native WGSL shaders use for per-primitive
+// values. Only positions, which really do vary across the quad, stay
+// interpolated.
+function varyingNode(node: unknown, flat = false): never {
+  const varying = (TSL.varying as unknown as (node: unknown) =>
+    { setInterpolation(type: string): unknown })(node);
+  return (flat ? varying.setInterpolation("flat") : varying) as never;
 }
 
 const segmentCoordFn = TSL.wgslFn(`
@@ -261,10 +267,10 @@ export function createThreeWebGpuStrokeMaterial(
     width: segmentTextureWidthUniform
   });
 
-  const primitiveA = varyingNode(TSL.textureLoad(options.segmentTextureA, coord, 0));
-  const primitiveB = varyingNode(TSL.textureLoad(options.segmentTextureB, coord, 0));
-  const style = varyingNode(TSL.textureLoad(options.segmentStyleTexture, coord, 0));
-  const primitiveBounds = varyingNode(TSL.textureLoad(options.segmentBoundsTexture, coord, 0));
+  const primitiveA = varyingNode(TSL.textureLoad(options.segmentTextureA, coord, 0), true);
+  const primitiveB = varyingNode(TSL.textureLoad(options.segmentTextureB, coord, 0), true);
+  const style = varyingNode(TSL.textureLoad(options.segmentStyleTexture, coord, 0), true);
+  const primitiveBounds = varyingNode(TSL.textureLoad(options.segmentBoundsTexture, coord, 0), true);
   const worldPack = varyingNode(callNode(worldPackFn, {
     corner,
     primitiveA,
