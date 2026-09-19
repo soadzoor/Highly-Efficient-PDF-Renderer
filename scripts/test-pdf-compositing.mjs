@@ -27,15 +27,17 @@ try {
 
   function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1) {
     const alive = new Set(); let draws=0;
+    render.spans=[];
     const zero = [0,0,0,0];
     const adapter = {
       acquire() { const s={pixel:[...zero]}; alive.add(s); return s; },
       release(s) { assert(alive.delete(s),"surface released exactly once"); },
       clear(s,c=zero) { s.pixel=[...c]; },
       copy(a,b) { b.pixel=[...a.pixel]; },
-      draw(run,s,shapeOnly) {
+      draw(runs,s,shapeOnly) {
         if (++draws===failAt) throw Error("synthetic GPU failure");
-        for(let i=run.first;i<run.first+run.count;i++) {
+        render.spans.push(runs.length);
+        for(const run of runs) for(let i=run.first;i<run.first+run.count;i++) {
           const paint=paints[i];
           s.pixel=compositePdfPixel(s.pixel,shapeOnly?[paint.shape,paint.shape,paint.shape,paint.shape]:paint.color);
         }
@@ -65,6 +67,15 @@ try {
   close(render([g([d(0),d(1)],{alpha:0.5})],[red,blue]),[0.5,0.5,1,1],1e-7);
   close(render([g([d(0),d(1)],{knockout:true})],[red,halfBlue]),[0.5,0.5,1,1]);
   close(render([g([d(0),d(1)])],[red,halfBlue]),[0.5,0,0.5,1]);
+  // Source-over is associative, so an uninterrupted Normal-blend span composites
+  // once for the whole span instead of once per draw run. The pixel assertions
+  // above and below are what prove the batched union stays equivalent.
+  assert.deepEqual(render.spans,[2,2],"a Normal-blend span batches into one color draw and one shape draw");
+  close(render([g([d(0),d(1)])],[red,{...halfBlue,blendMode:"Multiply"}]),
+    compositePdfPixel(compositePdfPixel([0,0,0,0],red.color),halfBlue.color,"Multiply"));
+  assert.deepEqual(render.spans,[1,1,1,1],"a non-Normal blend ends the span and composites on its own");
+  render([g([d(0),d(1)],{knockout:true})],[red,halfBlue]);
+  assert.deepEqual(render.spans,[1,1,1,1],"knockout groups keep compositing object by object");
   close(render([g([d(0),d(1)],{knockout:true})],[red,{color:[0,0,0,0],shape:1}]),[1,1,1,1]);
   // A non-isolated group's first Multiply observes the initial gray backdrop.
   close(render([g([d(0)],{isolated:false})],[{...red,blendMode:"Multiply"}],[0.5,0.5,0.5,1]),[0.5,0,0,1]);

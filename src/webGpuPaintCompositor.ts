@@ -119,9 +119,11 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   copy(source: Surface, destination: Surface): void {
     this.encoder.copyTextureToTexture({ texture: source.texture }, { texture: destination.texture }, [this.width, this.height]);
   }
-  draw(run: VectorDrawRun, destination: Surface, shapeOnly: boolean): void {
+  draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void {
+    if (runs.length === 0) return;
+    // A whole span shares one render pass; source order is the call order.
     const pass = this.encoder.beginRenderPass({ colorAttachments: [{ view: destination.view, loadOp: "load", storeOp: "store" }] });
-    try { this.drawRun!(run, pass, shapeOnly); } finally { pass.end(); }
+    try { for (const run of runs) this.drawRun!(run, pass, shapeOnly); } finally { pass.end(); }
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const pass = this.encoder.beginRenderPass({ colorAttachments: [{ view: destination.view, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] }] });

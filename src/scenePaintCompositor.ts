@@ -22,7 +22,8 @@ export interface ScenePaintCompositorAdapter<Surface> {
   release(surface: Surface): void;
   clear(surface: Surface, color?: readonly [number, number, number, number]): void;
   copy(source: Surface, destination: Surface): void;
-  draw(run: VectorDrawRun, destination: Surface, shapeOnly: boolean): void;
+  /** Draws a span of runs in the given order, as one batch. */
+  draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void;
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void;
 }
 
@@ -40,10 +41,10 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
   const blank = (): Surface => { const surface = take(); adapter.clear(surface); return surface; };
   const copy = (source: Surface): Surface => { const surface = take(); adapter.copy(source, surface); return surface; };
   let white: Surface;
-  const draw = (run: VectorDrawRun): PaintResult<Surface> => {
+  const draw = (runs: readonly VectorDrawRun[]): PaintResult<Surface> => {
     const color = blank(), shape = blank();
-    adapter.draw({ ...run, blendMode: undefined }, color, false);
-    adapter.draw({ ...run, blendMode: undefined }, shape, true);
+    adapter.draw(runs, color, false);
+    adapter.draw(runs, shape, true);
     return { color, shape };
   };
 
@@ -61,9 +62,23 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
       [stats, nextStats] = [nextStats, stats];
       drop(result.color); drop(result.shape);
     };
+    // Source-over is associative in color, in accumulated group alpha and in
+    // shape coverage alike, so an uninterrupted span of Normal-blend leaves
+    // composites identically whether it is unioned first or applied one leaf
+    // at a time. Batching each span costs one composite per span instead of
+    // one per draw run, which is what stops a single transparency group from
+    // dragging every unrelated paint in the document through the compositor.
+    let span: VectorDrawRun[] = [];
+    const flushSpan = (): void => {
+      if (span.length === 0) return;
+      const runs = span;
+      span = [];
+      paint(draw(runs), 0);
+    };
     for (const node of nodes) {
       if (!visible(node.optionalContent)) continue;
       if (node.kind === "group") {
+        flushSpan();
         const result = group(node.children, settings.knockout ? initial : current, node, depth + 1);
         paint(result, PDF_BLEND_MODES.indexOf(node.blendMode));
       } else {
@@ -72,12 +87,15 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
         if (!visible(run.optionalContent)) continue;
         // Knockout and non-normal blends apply to individual objects, not a batched union.
         if (settings.knockout || run.blendMode) {
+          flushSpan();
           for (let i = run.first; i < run.first + run.count; i++) {
-            paint(draw({ ...run, first: i, count: 1 }), PDF_BLEND_MODES.indexOf(run.blendMode ?? "Normal"));
+            paint(draw([{ ...run, first: i, count: 1, blendMode: undefined }]),
+              PDF_BLEND_MODES.indexOf(run.blendMode ?? "Normal"));
           }
-        } else paint(draw(run), 0);
+        } else span.push({ ...run, blendMode: undefined });
       }
     }
+    flushSpan();
     let mask = white;
     if (settings.softMask) {
       const maskInitial = blank();

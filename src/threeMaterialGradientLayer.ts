@@ -645,8 +645,66 @@ vec4 heprSamplePdfGradient(vec2 world, float gradientIndexInput) {
 }
 `;
 
+/**
+ * Development probe. When the gradient paint is wrong but the shape and
+ * coverage are right, the cause is either the parameter that indexes the ramp
+ * or the ramp lookup itself, and the rendered colour cannot tell them apart.
+ * Setting `HEPR_DEBUG_GRADIENT_PROBE` before loading paints the parameter
+ * instead: a black-to-white ramp means the parameter is fine and the lookup is
+ * at fault, a flat shade means the parameter is stuck, and magenta means the
+ * gradient reported the point as uncovered.
+ */
+let gradientProbeAnnounced = false;
+
+function gradientProbeEnabled(): boolean {
+  // The shader is built once per layer, so a global alone is easy to lose: a
+  // page reload clears it before the layer is ever constructed. Accept a query
+  // parameter too, which survives the reload, and say so once so an inactive
+  // probe is never mistaken for its own output.
+  const scope = globalThis as { HEPR_DEBUG_GRADIENT_PROBE?: boolean; location?: { search?: string } };
+  const search = typeof scope.location?.search === "string" ? scope.location.search : "";
+  const enabled = scope.HEPR_DEBUG_GRADIENT_PROBE === true ||
+    /[?&]heprGradientProbe=1(?:&|$)/.test(search);
+  if (enabled && !gradientProbeAnnounced) {
+    gradientProbeAnnounced = true;
+    console.info("[HEPR] Gradient probe active: gradient fills paint their inputs, not their paint.");
+  }
+  return enabled;
+}
+
+const GLSL_GRADIENT_PROBE = `
+vec3 heprPdfGradientProbe(vec2 world, float gradientIndexInput) {
+  // Blue: the gradient index never reached the shader.
+  if (gradientIndexInput < -0.5) return vec3(0.0, 0.0, 1.0);
+  // Yellow: the metadata texture size never reached the shader, so the texel
+  // coordinate below would divide by zero.
+  if (uGradientMetaTexSize.x <= 0) return vec3(1.0, 1.0, 0.0);
+  int gradientIndex = int(gradientIndexInput + 0.5);
+  ivec2 coord = ivec2(gradientIndex % uGradientMetaTexSize.x, gradientIndex / uGradientMetaTexSize.x);
+  vec4 metaA = texelFetch(uGradientMetaTexA, coord, 0);
+  vec4 metaB = texelFetch(uGradientMetaTexB, coord, 0);
+  vec4 metaC = texelFetch(uGradientMetaTexC, coord, 0);
+  vec4 metaD = texelFetch(uGradientMetaTexD, coord, 0);
+  vec2 q = vec2(
+    metaB.x * world.x + metaB.z * world.y + metaC.x,
+    metaB.y * world.x + metaB.w * world.y + metaC.y
+  );
+  vec2 parameter = heprGradientParameter(metaA, metaC, metaD, q);
+  // Magenta: the gradient reports this point as uncovered.
+  if (parameter.y < 0.5) return vec3(1.0, 0.0, 1.0);
+  // Otherwise each channel reports one input: red is the ramp parameter, green
+  // scales the gradient index, and blue is lit whenever the metadata fetch
+  // returned anything at all. Pure black therefore means the fetch came back
+  // empty, which no correct gradient can produce.
+  float red = clamp(parameter.x, 0.0, 1.0);
+  float green = clamp(gradientIndexInput / 31.0, 0.0, 1.0);
+  float blue = metaB == vec4(0.0) && metaC == vec4(0.0) && metaD == vec4(0.0) ? 0.0 : 1.0;
+  return vec3(red, green, blue);
+}
+`;
+
 function buildGradientFillFragmentShader(): string {
-  return CORE_FILL_FRAGMENT_SHADER_SOURCE
+  const source = CORE_FILL_FRAGMENT_SHADER_SOURCE
     .replace("uniform vec4 uVectorOverride;", `uniform vec4 uVectorOverride;\n${GLSL_GRADIENT_DECLARATIONS}`)
     .replace(
       "  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));",
@@ -660,6 +718,13 @@ function buildGradientFillFragmentShader(): string {
     .replace(/float alpha = inside \? ([^;]+) : 0\.0;/, "float alpha = inside ? ($1) * paintAlpha : 0.0;")
     .replace(/float alpha = (heprThreeLinearCoverageToOutputAlpha\(coverage\) \* [^;]+);/,
       "float alpha = $1 * paintAlpha;");
+  if (!gradientProbeEnabled()) return source;
+  return source
+    .replace("uniform vec4 uPrimitiveColor;", `uniform vec4 uPrimitiveColor;\n${GLSL_GRADIENT_PROBE}`)
+    .replace(
+      "  vec3 baseColor = uSourceGradientIndex >= -0.5 ? sourcePaint.rgb : vColor;",
+      "  vec3 baseColor = heprPdfGradientProbe(vLocal, uSourceGradientIndex);"
+    );
 }
 
 function buildGradientStrokeFragmentShader(): string {

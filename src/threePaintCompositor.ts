@@ -30,6 +30,16 @@ export interface ThreePaintHostRenderer {
 }
 
 interface TextureBinding { value: THREE.Texture }
+interface GPUDeviceLike {
+  pushErrorScope(filter: string): void;
+  popErrorScope(): Promise<{ message: string } | null>;
+}
+
+/** Stable per-surface identity for diagnostics; Three ids are unique per texture. */
+function surfaceLabel(target: THREE.RenderTarget): string {
+  return `#${target.texture.id}(${target.width}x${target.height})`;
+}
+
 interface ProxyEntry {
   source: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
@@ -100,13 +110,25 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private height = 0;
   private rendering = false;
   private warnedResolution = false;
+  private readonly backend: "webgl" | "webgpu";
+  private bindingVersion = 0;
+  /**
+   * Opt-in WebGPU pass attribution. A texture used as both a binding and a
+   * render attachment inside one pass is reported by the device asynchronously,
+   * with no way back to the call that encoded it. Setting this, or the
+   * `HEPR_DEBUG_COMPOSITOR_VALIDATION` global, brackets every compositor render
+   * in an error scope so the failing operation names itself.
+   */
+  debugValidation = false;
 
   constructor(backend: "webgl" | "webgpu") {
+    this.backend = backend;
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute("position", new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
     this.geometry.setAttribute("uv", new THREE.Float32BufferAttribute([0, 0, 2, 0, 0, 2], 2));
     this.zero = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
     this.zero.needsUpdate = true;
+    this.stampBindingVersion(this.zero);
     const names = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask", "uTransfer"];
     if (backend === "webgl") {
       const uniforms: Record<string, THREE.IUniform> = {
@@ -179,6 +201,14 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       clear: renderer.getClearColor(new THREE.Color()), alpha: renderer.getClearAlpha(), autoClear: renderer.autoClear,
       xr: renderer.xr?.enabled };
     let backdrop: THREE.RenderTarget | null = null;
+    // The presented surface stays bound to the presentation material, and that
+    // mesh is live in the host scene, so recycling it as a render attachment
+    // now would leave one texture both sampled and written inside a single
+    // frame. Hide the mesh while compositing, and hand the surface back to the
+    // pool only once a new output has taken over the binding.
+    this.mesh.visible = false;
+    let presented = this.output;
+    this.output = null;
     try {
       const resolution = choosePdfCompositeResolution(scene, width, height);
       width = resolution.width; height = resolution.height;
@@ -187,17 +217,22 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         console.warn("[HEPR] PDF transparency groups use reduced resolution to stay within the 512 MiB compositor budget.");
       }
       if (width !== this.width || height !== this.height) {
-        this.releaseSurfaces(); this.width = Math.max(1, Math.floor(width)); this.height = Math.max(1, Math.floor(height));
-      } else if (this.output) { this.release(this.output); this.output = null; }
+        // releaseSurfaces disposes the presented surface along with the rest.
+        this.releaseSurfaces(); presented = null;
+        this.width = Math.max(1, Math.floor(width)); this.height = Math.max(1, Math.floor(height));
+      }
       renderer.autoClear = false;
       if (renderer.xr) renderer.xr.enabled = false;
       renderer.setScissorTest(false);
       this.collect(roots);
       backdrop = this.acquire(); this.clear(backdrop);
+      const backgrounds: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
       for (const proxy of this.proxies.values()) if (proxy.source.userData.heprPageBackground) {
         proxy.mesh.geometry = proxy.source.geometry; proxy.mesh.material = proxy.source.material;
-        this.drawProxy(proxy, backdrop, false);
+        proxy.mesh.renderOrder = backgrounds.length;
+        backgrounds.push(proxy.mesh);
       }
+      this.drawMeshes(backgrounds, backdrop, false);
       this.output = compositeScenePaintGraph(scene, this, backdrop, visible);
       this.presentationBinding.value = this.output.texture;
       // Raw GL paints use display values internally. A postprocessing target
@@ -205,6 +240,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.linearPresentation.value = saved.target || renderer.outputColorSpace === THREE.LinearSRGBColorSpace ? 1 : 0;
       this.mesh.visible = true;
     } finally {
+      if (presented) this.release(presented);
       if (backdrop) this.release(backdrop);
       this.internalScene.clear();
       renderer.setViewport(saved.viewport); renderer.setScissor(saved.scissor); renderer.setScissorTest(saved.scissorTest);
@@ -224,6 +260,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     }
     const target = new THREE.RenderTarget(this.width, this.height, { depthBuffer: false, stencilBuffer: false,
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, colorSpace: THREE.NoColorSpace });
+    this.stampBindingVersion(target.texture);
     this.surfaces.add(target); return target;
   }
   release(target: THREE.RenderTarget): void { this.pool.push(target); }
@@ -232,24 +269,44 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.renderer!.clear(true, false, false);
   }
   copy(source: THREE.RenderTarget, destination: THREE.RenderTarget): void { this.pass({ operation: 5, source }, destination); }
-  draw(run: VectorDrawRun, destination: THREE.RenderTarget, shapeOnly: boolean): void {
-    const candidates = this.runsByKind.get(run.kind) ?? [];
-    let low = 0, high = candidates.length;
-    while (low < high) {
-      const middle = (low + high) >>> 1, source = candidates[middle].run!;
-      if (source.first + source.count <= run.first) low = middle + 1; else high = middle;
+  draw(runs: readonly VectorDrawRun[], destination: THREE.RenderTarget, shapeOnly: boolean): void {
+    // One proxy can back several runs of a batched span, and geometryForRun
+    // rebuilds a single shared partial buffer per proxy. Collect each proxy's
+    // runs first so every proxy is prepared exactly once, then submit the whole
+    // span as a single host render. The runs are kept individually rather than
+    // merged into one range: a span skips paints whose optional content is
+    // hidden, so its range can have holes that a merged range would repaint.
+    const ordered: ProxyEntry[] = [];
+    const byProxy = new Map<ProxyEntry, VectorDrawRun[]>();
+    for (const run of runs) {
+      const candidates = this.runsByKind.get(run.kind) ?? [];
+      let low = 0, high = candidates.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1, source = candidates[middle].run!;
+        if (source.first + source.count <= run.first) low = middle + 1; else high = middle;
+      }
+      for (let index = low; index < candidates.length; index++) {
+        const proxy = candidates[index];
+        const sourceRun = proxy.run;
+        if (sourceRun && sourceRun.first >= run.first + run.count) break;
+        if (!sourceRun || sourceRun.kind !== run.kind || sourceRun.first >= run.first + run.count ||
+            sourceRun.first + sourceRun.count <= run.first) continue;
+        const previous = byProxy.get(proxy);
+        if (previous) previous.push(run);
+        else { byProxy.set(proxy, [run]); ordered.push(proxy); }
+      }
     }
-    for (let index = low; index < candidates.length; index++) {
-      const proxy = candidates[index];
-      const sourceRun = proxy.run;
-      if (sourceRun && sourceRun.first >= run.first + run.count) break;
-      if (!sourceRun || sourceRun.kind !== run.kind || sourceRun.first >= run.first + run.count ||
-          sourceRun.first + sourceRun.count <= run.first) continue;
+    const meshes: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
+    for (const proxy of ordered) {
       proxy.mesh.material = proxy.source.material;
-      proxy.mesh.geometry = this.geometryForRun(proxy, run);
+      proxy.mesh.geometry = this.geometryForRuns(proxy, byProxy.get(proxy)!);
       if (proxy.mesh.geometry instanceof THREE.InstancedBufferGeometry && proxy.mesh.geometry.instanceCount === 0) continue;
-      this.drawProxy(proxy, destination, shapeOnly);
+      // Proxy meshes are private to the compositor, so an explicit order keeps
+      // source order without depending on the layer's own render order.
+      proxy.mesh.renderOrder = meshes.length;
+      meshes.push(proxy.mesh);
     }
+    this.drawMeshes(meshes, destination, shapeOnly);
   }
   pass(operation: PdfCompositeOperation<THREE.RenderTarget>, destination: THREE.RenderTarget): void {
     const sources = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
@@ -260,7 +317,10 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.extra.set(operation.alphaIsShape ? 1 : 0, operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, 0);
     this.backdropColor.fromArray(operation.softMask?.backdrop ?? [0, 0, 0]);
     this.target(destination); this.internalScene.add(this.passMesh);
-    try { this.renderer!.render(this.internalScene, this.camera); } finally { this.internalScene.remove(this.passMesh); }
+    try {
+      this.hostRender(() => `pass op${operation.operation} -> ${surfaceLabel(destination)} ` +
+        `sources ${sources.map(source => source ? surfaceLabel(source) : "-").join(",")}`);
+    } finally { this.internalScene.remove(this.passMesh); }
   }
   dispose(): void {
     this.releaseSurfaces();
@@ -271,12 +331,50 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.transfers.clear(); this.zero.dispose(); this.geometry.dispose(); this.passMaterial.dispose(); this.mesh.material.dispose();
     this.mesh.removeFromParent();
   }
+  /**
+   * Every pass rebinds this compositor's shared inputs to different surfaces.
+   * Three only rebuilds a bind group when the newly bound texture reports a
+   * different `generation`, and that generation is the texture's `version`,
+   * which render-target textures never raise. Two surfaces therefore look
+   * identical to that check and the previous texture stays bound, so a pass can
+   * end up sampling the surface it is writing - which WebGPU rejects as a
+   * read/write overlap. Giving every texture that reaches a binding its own
+   * version makes the comparison meaningful. WebGL rebinds its samplers on
+   * every draw and never reads a stale binding, so it is left untouched.
+   */
+  private stampBindingVersion(texture: THREE.Texture): void {
+    if (this.backend === "webgpu") texture.version = ++this.bindingVersion;
+  }
   private target(target: THREE.RenderTarget): void { this.renderer!.setRenderTarget(target); }
-  private drawProxy(proxy: ProxyEntry, destination: THREE.RenderTarget, shapeOnly: boolean): void {
-    const restore = setThreePdfShapeOnly(proxy.mesh.material, shapeOnly);
-    this.target(destination); this.internalScene.add(proxy.mesh);
+  private hostRender(label: () => string): void {
+    const enabled = this.debugValidation ||
+      (globalThis as { HEPR_DEBUG_COMPOSITOR_VALIDATION?: boolean }).HEPR_DEBUG_COMPOSITOR_VALIDATION === true;
+    const device = enabled
+      ? (this.renderer as { backend?: { device?: GPUDeviceLike } }).backend?.device
+      : undefined;
+    if (!device) { this.renderer!.render(this.internalScene, this.camera); return; }
+    device.pushErrorScope("validation");
     try { this.renderer!.render(this.internalScene, this.camera); }
-    finally { this.internalScene.remove(proxy.mesh); restore(); }
+    finally {
+      const described = label();
+      void device.popErrorScope().then(error => {
+        if (error) console.error(`[HEPR compositor] ${described}: ${error.message}`);
+      });
+    }
+  }
+  private drawMeshes(meshes: readonly THREE.Mesh<THREE.BufferGeometry, THREE.Material>[],
+    destination: THREE.RenderTarget, shapeOnly: boolean): void {
+    if (meshes.length === 0) return;
+    // Clip clones share one shape input, so restore in reverse: the last
+    // writer of a shared uniform must be the first to put it back.
+    const restores = meshes.map(mesh => setThreePdfShapeOnly(mesh.material, shapeOnly));
+    this.target(destination);
+    for (const mesh of meshes) this.internalScene.add(mesh);
+    try { this.hostRender(() => `draw ${meshes.length} mesh(es) -> ${surfaceLabel(destination)}`); }
+    finally {
+      for (const mesh of meshes) this.internalScene.remove(mesh);
+      for (let index = restores.length - 1; index >= 0; index--) restores[index]();
+    }
   }
   private collect(roots: readonly THREE.Object3D[]): void {
     let changed = false;
@@ -304,24 +402,27 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     }
     if (changed) for (const runs of this.runsByKind.values()) runs.sort((a, b) => a.run!.first - b.run!.first);
   }
-  private geometryForRun(proxy: ProxyEntry, run: VectorDrawRun): THREE.BufferGeometry {
+  private geometryForRuns(proxy: ProxyEntry, runs: readonly VectorDrawRun[]): THREE.BufferGeometry {
     const geometry = proxy.source.geometry;
-    if (!proxy.attribute || !proxy.run || (proxy.run.first >= run.first && proxy.run.first + proxy.run.count <= run.first + run.count)) return geometry;
+    const covered = (run: VectorDrawRun): boolean =>
+      proxy.run!.first >= run.first && proxy.run!.first + proxy.run!.count <= run.first + run.count;
+    if (!proxy.attribute || !proxy.run || runs.some(covered)) return geometry;
     const source = geometry.getAttribute(proxy.attribute);
+    const capacity = runs.reduce((total, run) => total + run.count, 0);
     if (!proxy.partialGeometry) {
       const partial = new THREE.InstancedBufferGeometry();
       for (const [name, attribute] of Object.entries(geometry.attributes)) if (name !== proxy.attribute) partial.setAttribute(name, attribute);
       partial.setIndex(geometry.index); proxy.partialGeometry = partial;
     }
-    if (!proxy.partialIds || proxy.partialIds.count < run.count) {
-      proxy.partialIds = new THREE.InstancedBufferAttribute(new Float32Array(run.count), 1);
+    if (!proxy.partialIds || proxy.partialIds.count < capacity) {
+      proxy.partialIds = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
       proxy.partialIds.setUsage(THREE.StreamDrawUsage);
       proxy.partialGeometry.setAttribute(proxy.attribute, proxy.partialIds);
     }
     let count = 0;
     for (let item = 0; item < (geometry as THREE.InstancedBufferGeometry).instanceCount; item++) {
       const index = source.getX(item);
-      if (index >= run.first && index < run.first + run.count) proxy.partialIds.setX(count++, index);
+      if (runs.some(run => index >= run.first && index < run.first + run.count)) proxy.partialIds.setX(count++, index);
     }
     proxy.partialGeometry.instanceCount = count; proxy.partialIds.needsUpdate = true;
     return proxy.partialGeometry;
@@ -336,6 +437,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     const pixels = new Float32Array(width * height); pixels.set(values);
     const texture = new THREE.DataTexture(pixels, width, height, THREE.RedFormat, THREE.FloatType);
     texture.minFilter = texture.magFilter = THREE.NearestFilter; texture.needsUpdate = true;
+    this.stampBindingVersion(texture);
     this.transfers.set(values, texture); return texture;
   }
 }

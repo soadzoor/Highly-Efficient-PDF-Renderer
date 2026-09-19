@@ -122,10 +122,13 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source.framebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destination.framebuffer);
     gl.blitFramebuffer(0, 0, this.width, this.height, 0, 0, this.width, this.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
   }
-  draw(run: VectorDrawRun, destination: Surface, shapeOnly: boolean): void {
+  draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void {
+    if (runs.length === 0) return;
     const gl = this.gl; this.target(destination); gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    this.drawRun!(run, shapeOnly);
+    // One framebuffer binding and blend setup for the whole span; source order
+    // is the call order.
+    for (const run of runs) this.drawRun!(run, shapeOnly);
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const gl = this.gl;

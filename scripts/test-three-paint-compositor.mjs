@@ -72,10 +72,42 @@ try {
     if (backend === "webgl") assert.deepEqual(strokes.map(draw => draw.shape), [0, 1, 0, 1]);
     assert.equal(stroke.mesh.children.length, 1, "the graph handles Multiply without legacy duplicate passes");
     assert.equal(stroke.mesh.children[0].geometry.instanceCount, 2, "subset draws cannot alter ordinary culling buffers");
-    const surfaces = compositor.surfaces.size;
     host.draws.length = 0;
     compositor.render(host, scene, roots, 32, 24, () => true);
+    // The presented surface is withheld from the pool for one frame so it is
+    // never a render attachment while the presentation material still samples
+    // it. That costs one extra surface once, and then pooling is steady.
+    const surfaces = compositor.surfaces.size;
+    compositor.render(host, scene, roots, 32, 24, () => true);
     assert.equal(compositor.surfaces.size, surfaces, "unchanged frames reuse render targets");
+    assert.equal(compositor.mesh.visible, true, "the presentation mesh is shown again after compositing");
+
+    // Three rebuilds a bind group only when the newly bound texture reports a
+    // different generation, and that generation is the texture's version.
+    // Render-target textures never raise it, so equal versions leave the
+    // previous texture bound and a pass can sample the surface it is writing.
+    const versions = [...compositor.surfaces].map(target => target.texture.version);
+    assert.ok(versions.length > 1, "the frame pooled several surfaces");
+    if (backend === "webgpu") {
+      assert.equal(new Set(versions).size, versions.length,
+        "every WebGPU compositor surface carries its own texture version");
+      assert.ok(versions.every(version => version > 0), "and one Three treats as initialized");
+    } else {
+      assert.equal(new Set(versions).size, 1,
+        "WebGL rebinds samplers per draw, so its surfaces keep Three's default version");
+    }
+
+    // The presentation material samples the previous frame's output for as long
+    // as that mesh is in the host scene. Handing the same surface straight back
+    // to the pool made it a render attachment while it was still bound, which
+    // WebGPU rejects as a read/write overlap inside one frame.
+    const presented = compositor.output;
+    assert.ok(presented, "a composited frame presents a surface");
+    host.targets.length = 0;
+    compositor.render(host, scene, roots, 32, 24, () => true);
+    assert.ok(!host.targets.includes(presented),
+      "the surface the presentation material still samples is never a render attachment");
+    assert.notEqual(compositor.output, presented, "the next frame presents a different surface");
 
     // Mask transfer samples may exceed the GPU's maximum single-row texture width.
     const transfer = Float32Array.from({ length: 65536 }, (_, index) => index / 65535);
@@ -98,6 +130,31 @@ try {
     assert.equal(warnings.length, 1);
     assert.deepEqual(snapshot(host), state);
     assert.deepEqual(scene.rasterLayers[0].data, original);
+    // An uninterrupted Normal-blend span is one composite, so its paints reach
+    // the host as a single render in source order. Group alpha keeps the scene
+    // on the compositing path; without it the runs would flatten instead.
+    const spanScene = Object.assign(createEmptyVectorScene(), {
+      pageRects: f([0, 0, 10, 10]), pageBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+      bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 }, segmentCount: 2, maxHalfWidth: 1,
+      endpoints: f([1, 2, 0, 0, 1, 4, 0, 0]), primitiveMeta: f([9, 2, 0, 0.5, 9, 4, 0, 0.5]),
+      styles: f([1, 1, 0, 0, 1, 0, 0, 1]), primitiveBounds: f([0, 0, 10, 3, 0, 3, 10, 5]),
+      drawRuns: [{ kind: "stroke", first: 0, count: 1 }, { kind: "stroke", first: 1, count: 1 }],
+      paintGraph: { roots: [{ kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
+        children: [{ kind: "draw", runIndex: 0 }, { kind: "draw", runIndex: 1 }] }] }
+    });
+    const spanStroke = new ThreeMaterialStrokeLayer(spanScene, { materialBackend: backend,
+      strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
+    const spanCompositor = new ThreePaintCompositor(backend);
+    const spanHost = makeRenderer(backend);
+    spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 32, 24, () => true);
+    const spanDraws = spanHost.draws.filter(draw => draw.ids);
+    assert.deepEqual(spanDraws.map(draw => draw.ids), [[0], [1], [0], [1]],
+      "both paints of the span are drawn, in source order, for the color and shape surfaces");
+    assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 2,
+      "the span costs one host render for color and one for shape, not one per paint");
+    assert.equal(spanDraws[0].call, spanDraws[1].call, "a span's paints share a single render");
+    spanCompositor.dispose(); spanStroke.dispose();
+
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
   }
@@ -109,9 +166,9 @@ function makeRenderer(backend = "webgpu") {
     coordinateSystem: backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem,
     target: new THREE.RenderTarget(7, 9), viewport: new THREE.Vector4(3, 4, 17, 19),
     scissor: new THREE.Vector4(5, 6, 11, 13), scissorTest: true, clearColor: new THREE.Color(0.2, 0.3, 0.4),
-    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], fail: false,
+    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], targets: [], fail: false,
     getRenderTarget() { return this.target; },
-    setRenderTarget(target, cube = 0, mip = 0) { this.target = target; this.cube = cube; this.mip = mip; },
+    setRenderTarget(target, cube = 0, mip = 0) { this.target = target; this.cube = cube; this.mip = mip; this.targets.push(target); },
     getActiveCubeFace() { return this.cube; }, getActiveMipmapLevel() { return this.mip; },
     getViewport(out) { return out.copy(this.viewport); }, setViewport(value) { this.viewport.copy(value); },
     getScissor(out) { return out.copy(this.scissor); }, setScissor(value) { this.scissor.copy(value); },
@@ -119,6 +176,7 @@ function makeRenderer(backend = "webgpu") {
     getClearColor(out) { return out.copy(this.clearColor); }, getClearAlpha() { return this.clearAlpha; },
     setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; }, clear() {},
     render(scene, camera) {
+      this.call = (this.call ?? 0) + 1;
       // Mirrors Renderer._updateCamera: the first render whose coordinate
       // system differs from the camera's rebuilds the projection. The abstract
       // THREE.Camera base class has no updateProjectionMatrix, so a compositor
@@ -131,7 +189,8 @@ function makeRenderer(backend = "webgpu") {
       if (this.fail) throw new Error("synthetic draw failure");
       for (const mesh of scene.children) {
         const ids = mesh.geometry.getAttribute("aSegmentIndex");
-        this.draws.push({ ids: ids && Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
+        this.draws.push({ call: this.call,
+          ids: ids && Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
           shape: mesh.material.uniforms?.uPdfShapeOnly?.value });
       }
     }

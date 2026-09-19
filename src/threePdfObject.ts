@@ -1882,7 +1882,8 @@ export class HeprThreePdfObject extends THREE.Group {
       this.renderTexture.needsUpdate = true;
       this.lastUploadedFrameSerial = presentedFrameSerial;
     }
-    if (cameraDrivenMaterialPipelineEnabled && this.paintVisibility.requiresCompositing) {
+    if (cameraDrivenMaterialPipelineEnabled && this.paintVisibility.requiresCompositing &&
+      !threeCompositorDisabled()) {
       if (!this.paintCompositor) {
         this.paintCompositor = new ThreePaintCompositor(this.rendererType);
         this.add(this.paintCompositor.mesh);
@@ -3159,6 +3160,17 @@ async function createNativeRenderer(
     return WebGpuFloorplanRenderer.create(renderCanvas);
   }
   return new WebGlFloorplanRenderer(renderCanvas);
+}
+
+/**
+ * Development bisection switch. Transparency groups, blend modes and soft masks
+ * all route through the paint compositor, so when something only misbehaves on
+ * a compositing document there is no way to tell the compositor apart from the
+ * layers it draws. Setting `HEPR_DEBUG_DISABLE_COMPOSITOR` renders the layers
+ * directly instead, which drops PDF group semantics but isolates the cause.
+ */
+function threeCompositorDisabled(): boolean {
+  return (globalThis as { HEPR_DEBUG_DISABLE_COMPOSITOR?: boolean }).HEPR_DEBUG_DISABLE_COMPOSITOR === true;
 }
 
 function createInvisiblePageMaterial(): THREE.MeshBasicMaterial {
