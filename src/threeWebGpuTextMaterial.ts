@@ -105,13 +105,18 @@ fn heprTextVertexPack(
 const textClipFn = TSL.wgslFn(`
 fn heprTextClipPosition(
   vertexPack: vec4<f32>,
+  glyphMetaA: vec4<f32>,
   viewport: vec2<f32>,
   cameraCenter: vec2<f32>,
   zoom: f32,
   useLocalToClip: f32,
   localToClip: mat4x4<f32>
 ) -> vec4<f32> {
-  if (vertexPack.z <= -1.5 && vertexPack.w <= -1.5) {
+  // Cull on the glyph's own segment count, like the GLSL and native WGSL text
+  // shaders. vertexPack.zw carries glyph-space coordinates, so any sentinel
+  // packed there would also match real glyphs whose bounds reach far enough
+  // below the origin, dragging one quad corner off-screen.
+  if (i32(glyphMetaA.y + 0.5) <= 0) {
     return vec4<f32>(-2.0, -2.0, 0.0, 1.0);
   }
 
@@ -614,6 +619,7 @@ export function createThreeWebGpuTextMaterial(
 
   material.vertexNode = callNode(textClipFn, {
     vertexPack,
+    glyphMetaA,
     viewport: TSL.uniform(options.viewport),
     cameraCenter: TSL.uniform(options.cameraCenter),
     zoom: zoomUniform,

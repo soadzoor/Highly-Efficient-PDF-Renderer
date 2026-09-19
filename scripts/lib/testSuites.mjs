@@ -28,6 +28,7 @@ export const fastTests = [
   "three-raster-strip-batches",
   "three-raster-paint-order",
   "three-webgpu-raster-strip-material",
+  "three-webgpu-text-material",
   "hep-repack",
   "persistent-viewer-contract",
   "pdf-compiler-boundary",
