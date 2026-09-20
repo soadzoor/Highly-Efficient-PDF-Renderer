@@ -58,6 +58,23 @@ function callNode(fn: unknown, params: Record<string, unknown>): never {
   return (fn as (params: Record<string, unknown>) => unknown)(params) as never;
 }
 
+/**
+ * Three keys a texture uniform by the bound texture's UUID, so several texture
+ * nodes that hold the same texture when the shader is built collapse onto one
+ * binding. Every composite input starts on the shared placeholder, and
+ * `current`/`initial` legitimately name one surface in the final pass, so the
+ * pass shader was generated with a single texture that all seven inputs read:
+ * the composite math then saw its own source in every channel and resolved to
+ * nothing. Pin each input to its own hash so the seven bindings stay separate
+ * whatever they point at, and name them after the GLSL uniforms they mirror.
+ */
+function bindCompositeTexture(node: unknown, name: string): TextureBinding {
+  const uniform = node as { name: string; getUniformHash: () => string };
+  uniform.name = name;
+  uniform.getUniformHash = () => `hepr-composite-${name}`;
+  return node as TextureBinding;
+}
+
 const compositeNodeFn: unknown = TSL.wgslFn(`
 fn heprComposite(source:vec4f, shape:vec4f, current:vec4f, stats:vec4f, initial:vec4f,
   mask:vec4f, transferTex:texture_2d<f32>, p:vec4f, q:vec4f, backdrop:vec3f) -> vec4f {
@@ -100,6 +117,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private paintSelection: Uint8Array | null = null;
   private readonly transfers = new Map<Float32Array, THREE.DataTexture>();
   private readonly zero: THREE.DataTexture;
+  private readonly presentZero: THREE.DataTexture;
   private readonly bindings: TextureBinding[] = [];
   private readonly params = new THREE.Vector4();
   private readonly extra = new THREE.Vector4();
@@ -131,6 +149,19 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.zero = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
     this.zero.needsUpdate = true;
     this.stampBindingVersion(this.zero);
+    // Three decides at shader-generation time whether a sampled texture is
+    // filterable, and it reads that from whatever the node holds then. A
+    // DataTexture defaults to nearest on both filters, which compiled the
+    // presentation material to a point fetch, so the surfaces the 512 MiB
+    // budget scales below the viewport came back blocky where the GL path
+    // filtered them. The presented surface therefore starts on its own
+    // filterable placeholder. The pass inputs keep the nearest one: they are
+    // explicit texture loads, and a filterable value would add an unused
+    // sampler binding per input to every composite pass.
+    this.presentZero = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
+    this.presentZero.minFilter = this.presentZero.magFilter = THREE.LinearFilter;
+    this.presentZero.needsUpdate = true;
+    this.stampBindingVersion(this.presentZero);
     const names = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask", "uTransfer"];
     if (backend === "webgl") {
       const uniforms: Record<string, THREE.IUniform> = {
@@ -139,7 +170,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       for (const name of names) { const binding = { value: this.zero as THREE.Texture }; this.bindings.push(binding); uniforms[name] = binding; }
       this.passMaterial = new THREE.RawShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: FULLSCREEN_VERTEX,
         fragmentShader: PDF_COMPOSITE_FRAGMENT_GLSL.replace(/^#version 300 es\s*/, ""), uniforms });
-      this.presentationBinding = { value: this.zero };
+      this.presentationBinding = { value: this.presentZero };
       const material = new THREE.RawShaderMaterial({ glslVersion: THREE.GLSL3,
         vertexShader: `precision highp float; in vec3 position; out vec2 vUv;
           void main(){vUv=position.xy*0.5+0.5; gl_Position=vec4(position.xy,0.0,1.0);}`,
@@ -157,19 +188,20 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.mesh = new THREE.Mesh(this.geometry, material);
     } else {
       const material = new NodeMaterial();
-      const textures = names.map(() => TSL.textureLoad(this.zero, TSL.screenCoordinate));
-      this.bindings.push(...textures as unknown as TextureBinding[]);
+      const textures = names.slice(0, 6).map(name =>
+        bindCompositeTexture(TSL.textureLoad(this.zero, TSL.screenCoordinate), name));
+      this.bindings.push(...textures);
       material.vertexNode = TSL.vec4(TSL.positionLocal.xy, 0, 1);
       // A texture-valued function argument must stay a texture node rather than a sampled vec4.
-      const transfer = TSL.textureLoad(this.zero);
-      this.bindings[6] = transfer as unknown as TextureBinding;
+      const transfer = bindCompositeTexture(TSL.textureLoad(this.zero), names[6]);
+      this.bindings.push(transfer);
       material.fragmentNode = callNode(compositeNodeFn, { source: textures[0], shape: textures[1], current: textures[2],
         stats: textures[3], initial: textures[4], mask: textures[5], transferTex: transfer,
         p: TSL.uniform(this.params), q: TSL.uniform(this.extra), backdrop: TSL.uniform(this.backdropColor) });
       this.passMaterial = material;
       const present = new NodeMaterial();
       present.vertexNode = TSL.vec4(TSL.positionLocal.xy, 0, 1);
-      const texture = TSL.texture(this.zero, TSL.uv().flipY());
+      const texture = TSL.texture(this.presentZero, TSL.uv().flipY());
       // Three applies the host output transfer to straight color before blending.
       present.fragmentNode = callNode(presentNodeFn, { color: texture });
       this.presentationBinding = texture as unknown as TextureBinding;
@@ -331,7 +363,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.proxies.clear();
     this.runsByKind.clear();
     for (const texture of this.transfers.values()) texture.dispose();
-    this.transfers.clear(); this.zero.dispose(); this.geometry.dispose(); this.passMaterial.dispose(); this.mesh.material.dispose();
+    this.transfers.clear(); this.zero.dispose(); this.presentZero.dispose(); this.geometry.dispose(); this.passMaterial.dispose(); this.mesh.material.dispose();
     this.mesh.removeFromParent();
   }
   /**
