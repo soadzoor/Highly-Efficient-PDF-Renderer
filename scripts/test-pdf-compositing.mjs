@@ -25,12 +25,12 @@ try {
     close(actual, [reference[0]*reference[3],reference[1]*reference[3],reference[2]*reference[3],reference[3]], 3/255);
   }
 
-  function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1) {
+  function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null) {
     const alive = new Set(); let draws=0;
-    render.spans=[];
+    render.spans=[]; render.passes=0; render.surfaces=0;
     const zero = [0,0,0,0];
     const adapter = {
-      acquire() { const s={pixel:[...zero]}; alive.add(s); return s; },
+      acquire() { render.surfaces++; const s={pixel:[...zero]}; alive.add(s); return s; },
       release(s) { assert(alive.delete(s),"surface released exactly once"); },
       clear(s,c=zero) { s.pixel=[...c]; },
       copy(a,b) { b.pixel=[...a.pixel]; },
@@ -43,6 +43,7 @@ try {
         }
       },
       pass(op,s) {
+        render.passes++;
         const source=op.source?.pixel??zero, shape=op.shape?.pixel??zero, current=op.current?.pixel??zero;
         const stats=op.stats?.pixel??zero, initial=op.initial?.pixel??zero, mask=op.mask?.pixel??zero;
         if(op.operation===0) {
@@ -57,7 +58,7 @@ try {
     };
     const scene={paintGraph:{roots},drawRuns:paints.map((p,i)=>({kind:"fill",first:i,count:1,blendMode:p.blendMode,optionalContent:p.condition}))};
     try {
-      const result=compositeScenePaintGraph(scene,adapter,{pixel:backdrop},visible);
+      const result=compositeScenePaintGraph(scene,adapter,{pixel:backdrop},visible,selected);
       const pixel=[...result.pixel]; adapter.release(result); assert.equal(alive.size,0); return pixel;
     } catch(error) { assert.equal(alive.size,0,"failed frame releases transient resources"); throw error; }
   }
@@ -93,6 +94,18 @@ try {
   const mask={children:[d(1)],subtype:"Luminosity",transfer:new Float32Array([1,0])};
   close(render([g([d(0)],{softMask:mask})],[red,{color:[0,1,0,1],shape:1}]),[1,0.59,0.59,1]);
   close(render([g([d(0)])],[{...red,condition:0}],undefined,id=>id===undefined),[1,1,1,1]);
+  // Every surface covers the viewport, so a paint the caller culled out of view
+  // contributes nothing and drops out exactly like a hidden one.
+  close(render([g([d(0),d(1),d(2)])],[red,halfBlue,blue],undefined,undefined,-1,Uint8Array.of(1,0,1)),[0,0,1,1]);
+  assert.deepEqual(render.spans,[2],"culling leaves a hole rather than merging across the dropped paint");
+  // A group with nothing left to paint composites to nothing under any blend
+  // mode or knockout, so it costs neither surfaces nor passes.
+  const nested=[g([d(0)]),g([d(1)],{blendMode:"Multiply",alpha:0.25,softMask:{children:[d(1)],subtype:"Alpha"}})];
+  const emptied=render(nested,[red,blue],undefined,undefined,-1,Uint8Array.of(1,0));
+  const cost={spans:render.spans,passes:render.passes,surfaces:render.surfaces};
+  close(emptied,render([g([d(0)])],[red]));
+  assert.deepEqual(cost,{spans:render.spans,passes:render.passes,surfaces:render.surfaces},
+    "an emptied group costs exactly what leaving it out of the graph would");
   assert.throws(()=>render([g([d(0)])],[red],undefined,undefined,1),/synthetic GPU failure/);
   assert(PDF_COMPOSITE_FRAGMENT_GLSL.includes("pdfSetLum"));
   assert(PDF_COMPOSITE_WGSL.includes("fn pdfSetLum"));

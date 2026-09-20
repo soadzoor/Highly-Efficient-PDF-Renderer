@@ -3,6 +3,8 @@ import { createThreeVectorClipMaterial } from "./threeVectorClips";
 import * as THREE from "three";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
+import { scenePaintRunNeighbours } from "./scenePaintGraph";
+import { vectorDrawRunsShareSubmission } from "./vectorDrawOrder";
 import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { HEPR_THREE_LAYER_ORDER_RASTER, HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
@@ -48,6 +50,9 @@ export class ThreeVectorDrawRuns {
     this.strokeCandidates = this.strokeRedundancy ? new Uint32Array(source.count) : null;
     this.sourceCount = parent.geometry.instanceCount;
     const runs = scene.drawRuns!;
+    const neighbours = this.visibility.requiresCompositing ? scenePaintRunNeighbours(scene) : null;
+    const runIndices = new Map<VectorDrawRun, number>();
+    runs.forEach((run, index) => runIndices.set(run, index));
     const create = (ranges: readonly VectorDrawRun[], first: number, count: number, order: number, pass?: 0 | 1): void => {
       const run = ranges[0];
       const geometry = new THREE.InstancedBufferGeometry();
@@ -72,6 +77,10 @@ export class ThreeVectorDrawRuns {
       }
       const mesh = new THREE.Mesh(geometry, material);
       mesh.userData.heprDrawRun = { ...run, first, count };
+      // The canonical paints behind this mesh. A mesh with nothing left to draw
+      // tells the compositor those paints are off screen, which is what lets it
+      // drop the transparency groups that no longer contain anything.
+      mesh.userData.heprDrawRunIndices = ranges.map(range => runIndices.get(range)!);
       mesh.userData.heprInstanceAttribute = attribute;
       mesh.frustumCulled = false;
       mesh.renderOrder = vectorDrawRunRenderOrder(order, scene.drawRuns!.length);
@@ -92,11 +101,14 @@ export class ThreeVectorDrawRuns {
         // Render-only batching removes OCG boundaries from draw submissions.
         // Canonical ranges remain separate for inspection and visibility. Real
         // graph groups and non-normal blends keep their original pass boundaries.
-        if (!this.visibility.requiresCompositing && !run.blendMode) {
+        // A composited scene merges too, but only across paints the graph keeps
+        // side by side, so one mesh never straddles a group or reorders a paint.
+        // A span that then covers only part of a mesh still renders that subset.
+        if (!run.blendMode) {
           while (index + 1 < runs.length) {
+            if (neighbours !== null && !neighbours[index]) break;
             const next = runs[index + 1];
-            if (next.kind !== kind || next.clipIndex !== run.clipIndex || next.blendMode ||
-                next.first !== run.first + count) break;
+            if (!vectorDrawRunsShareSubmission({ ...run, count }, next)) break;
             ranges.push(next); count += next.count; index++;
           }
         }

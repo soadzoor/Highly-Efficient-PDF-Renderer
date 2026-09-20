@@ -1,5 +1,6 @@
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { PDF_BLEND_MODES, type ScenePaintGroup, type ScenePaintMask, type ScenePaintNode } from "./scenePaintGraph";
+import { vectorDrawRunsShareSubmission } from "./vectorDrawOrder";
 
 export interface PdfCompositeOperation<Surface> {
   operation: 0 | 1 | 2 | 3 | 4 | 5;
@@ -32,9 +33,15 @@ interface PaintResult<Surface> { color: Surface; shape: Surface }
 /**
  * Source-ordered PDF compositing, shared by all GPU adapters. Separate group alpha
  * and geometric shape surfaces preserve non-isolation and translucent knockout.
+ *
+ * Every surface covers the viewport, so a paint whose bounds fall outside it
+ * contributes nothing to any composite channel. `selected`, when given, is the
+ * caller's per-run-index view culling: it drops those paints exactly as the
+ * non-compositing path already does. Retained raster nodes carry no run index
+ * and are always kept.
  */
 export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAdapter<Surface>,
-  backdrop: Surface, visible: (condition?: number) => boolean): Surface {
+  backdrop: Surface, visible: (condition?: number) => boolean, selected: Uint8Array | null = null): Surface {
   const owned = new Set<Surface>();
   const take = (): Surface => { const surface = adapter.acquire(); owned.add(surface); return surface; };
   const drop = (surface: Surface): void => { if (owned.delete(surface)) adapter.release(surface); };
@@ -53,6 +60,34 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     const shape = blank();
     adapter.draw(runs, shape, true);
     return { color, shape };
+  };
+
+  /**
+   * Whether anything under these nodes still paints. Compositing a fully
+   * transparent source leaves color, group alpha and shape coverage untouched
+   * under every blend mode and under knockout alike, so a group whose contents
+   * are all hidden or culled can be dropped surfaces, passes and all. Visibility
+   * and culling are fixed for the frame, so each child list is answered once
+   * rather than again for every group that encloses it.
+   */
+  const painted = new Map<readonly ScenePaintNode[], boolean>();
+  const paints = (nodes: readonly ScenePaintNode[]): boolean => {
+    const cached = painted.get(nodes);
+    if (cached !== undefined) return cached;
+    let result = false;
+    for (const node of nodes) {
+      if (!visible(node.optionalContent)) continue;
+      if (node.kind === "group") {
+        if (!paints(node.children)) continue;
+      } else if (node.kind === "draw") {
+        if (selected && !selected[node.runIndex]) continue;
+        if (!visible(scene.drawRuns![node.runIndex].optionalContent)) continue;
+      }
+      result = true;
+      break;
+    }
+    painted.set(nodes, result);
+    return result;
   };
 
   const group = (nodes: readonly ScenePaintNode[], initialBackdrop: Surface, settings: ScenePaintGroup, depth: number,
@@ -85,10 +120,8 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     // left by hidden optional content break contiguity and stay separate.
     const extend = (run: VectorDrawRun): void => {
       const previous = span[span.length - 1];
-      if (previous && previous.kind === run.kind && previous.clipIndex === run.clipIndex &&
-          previous.optionalContent === run.optionalContent && previous.first + previous.count === run.first) {
-        previous.count += run.count;
-      } else span.push({ ...run, blendMode: undefined });
+      if (vectorDrawRunsShareSubmission(previous, run)) previous.count += run.count;
+      else span.push({ ...run, blendMode: undefined });
     };
     const flushSpan = (): void => {
       if (span.length === 0) return;
@@ -99,10 +132,14 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     for (const node of nodes) {
       if (!visible(node.optionalContent)) continue;
       if (node.kind === "group") {
+        // An empty group composites to nothing, and its soft mask cannot
+        // reintroduce coverage that no paint contributed in the first place.
+        if (!paints(node.children)) continue;
         flushSpan();
         const result = group(node.children, settings.knockout ? initial : current, node, depth + 1, needsShape);
         paint(result, PDF_BLEND_MODES.indexOf(node.blendMode));
       } else {
+        if (node.kind === "draw" && selected && !selected[node.runIndex]) continue;
         const run = node.kind === "draw" ? scene.drawRuns![node.runIndex] :
           { kind: "raster" as const, first: node.rasterIndex, count: 1 };
         if (!visible(run.optionalContent)) continue;

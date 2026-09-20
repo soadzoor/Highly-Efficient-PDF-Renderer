@@ -97,6 +97,34 @@ export function validateScenePaintGraph(scene: VectorScene): void {
   if (coverage.some(value => value !== 1)) throw new RangeError("PDF paint graph omits a canonical draw run.");
 }
 
+/**
+ * Marks each draw run whose successor is the very next paint in the same list.
+ * Only such a pair can share one submission: anything else has a group
+ * boundary or another paint between it, and the graph is free to visit run
+ * indices in an order of its own, so merging by index alone could repaint them
+ * out of sequence. Absent graph means no constraint, and null says so.
+ */
+export function scenePaintRunNeighbours(scene: VectorScene): Uint8Array | null {
+  if (!scene.paintGraph || !scene.drawRuns) return null;
+  const neighbours = new Uint8Array(scene.drawRuns.length);
+  const visit = (nodes: readonly ScenePaintNode[]): void => {
+    let previous = -1;
+    for (const node of nodes) {
+      if (node.kind === "draw") {
+        if (previous >= 0 && node.runIndex === previous + 1) neighbours[previous] = 1;
+        previous = node.runIndex;
+        continue;
+      }
+      previous = -1;
+      if (node.kind !== "group") continue;
+      if (node.softMask) visit(node.softMask.children);
+      visit(node.children);
+    }
+  };
+  visit(scene.paintGraph.roots);
+  return neighbours;
+}
+
 export type ScenePaintPass =
   | { kind: "draw"; runIndex: number }
   | { kind: "retained"; node: ScenePaintRetained }

@@ -44,6 +44,7 @@ interface ProxyEntry {
   source: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
   run?: VectorDrawRun;
+  runIndices?: readonly number[];
   attribute?: string;
   partialGeometry?: THREE.InstancedBufferGeometry;
   partialIds?: THREE.InstancedBufferAttribute;
@@ -96,6 +97,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private readonly surfaces = new Set<THREE.RenderTarget>();
   private readonly proxies = new Map<THREE.Object3D, ProxyEntry>();
   private readonly runsByKind = new Map<VectorDrawRun["kind"], ProxyEntry[]>();
+  private paintSelection: Uint8Array | null = null;
   private readonly transfers = new Map<Float32Array, THREE.DataTexture>();
   private readonly zero: THREE.DataTexture;
   private readonly bindings: TextureBinding[] = [];
@@ -225,6 +227,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       if (renderer.xr) renderer.xr.enabled = false;
       renderer.setScissorTest(false);
       this.collect(roots);
+      const selected = this.selectPaints(scene);
       backdrop = this.acquire(); this.clear(backdrop);
       const backgrounds: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
       for (const proxy of this.proxies.values()) if (proxy.source.userData.heprPageBackground) {
@@ -233,7 +236,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         backgrounds.push(proxy.mesh);
       }
       this.drawMeshes(backgrounds, backdrop, false);
-      this.output = compositeScenePaintGraph(scene, this, backdrop, visible);
+      this.output = compositeScenePaintGraph(scene, this, backdrop, visible, selected);
       this.presentationBinding.value = this.output.texture;
       // Raw GL paints use display values internally. A postprocessing target
       // expects working-linear color and applies its output transfer afterward.
@@ -376,6 +379,29 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       for (let index = restores.length - 1; index >= 0; index--) restores[index]();
     }
   }
+  /**
+   * Which paints still have something on screen, taken from the instance
+   * culling the layers already did. The test matches the one `draw` applies to
+   * each mesh, so this drops exactly the paints that would have submitted
+   * nothing. A batched mesh reports for every paint behind it at once, which
+   * can keep a group standing that might have been dropped but never removes a
+   * paint that still draws. Paints no mesh owns, such as raster and gradient
+   * slots, are always kept. null means nothing was culled.
+   */
+  private selectPaints(scene: VectorScene): Uint8Array | null {
+    const runs = scene.drawRuns;
+    if (!runs) return null;
+    const selected = this.paintSelection?.length === runs.length
+      ? this.paintSelection : (this.paintSelection = new Uint8Array(runs.length));
+    selected.fill(1);
+    let culled = false;
+    for (const proxy of this.proxies.values()) {
+      if (!proxy.runIndices || (proxy.source.geometry as THREE.InstancedBufferGeometry).instanceCount > 0) continue;
+      for (const index of proxy.runIndices) { selected[index] = 0; culled = true; }
+    }
+    return culled ? selected : null;
+  }
+
   private collect(roots: readonly THREE.Object3D[]): void {
     let changed = false;
     const present = new Set<THREE.Object3D>();
@@ -385,7 +411,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       if (this.proxies.has(object)) return;
       const source = object as THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
       const mesh = new THREE.Mesh(source.geometry, source.material); mesh.frustumCulled = false;
-      const entry = { source, mesh, run: object.userData.heprDrawRun as VectorDrawRun | undefined, attribute: object.userData.heprInstanceAttribute };
+      const entry = { source, mesh, run: object.userData.heprDrawRun as VectorDrawRun | undefined,
+        runIndices: object.userData.heprDrawRunIndices as readonly number[] | undefined,
+        attribute: object.userData.heprInstanceAttribute };
       this.proxies.set(object, entry);
       if (entry.run) {
         let runs = this.runsByKind.get(entry.run.kind);

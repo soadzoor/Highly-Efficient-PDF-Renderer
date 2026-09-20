@@ -4381,7 +4381,8 @@ export class WebGlFloorplanRenderer {
           const previous = strokes;
           draw(run);
           if (shapeOnly) strokes = previous;
-        }, condition => condition === undefined || visibility?.conditions[condition] === 1);
+        }, condition => condition === undefined || visibility?.conditions[condition] === 1,
+        this.orderedRunCuller?.selected ?? null);
       } finally {
         this.paintShapeOnly = false; this.vectorClipIndex = -1;
         profile?.endSection("drawSubmission");

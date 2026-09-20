@@ -8,6 +8,21 @@ export function appendVectorDrawRun(runs: VectorDrawRun[], kind: VectorDrawRun["
   else runs.push({ kind, first, count, ...(clipIndex === undefined ? {} : { clipIndex }), ...(blendMode ? { blendMode } : {}), ...(optionalContent === undefined ? {} : { optionalContent }) });
 }
 
+/**
+ * Whether two paints submit identically as one instanced range: same program,
+ * same clip, same blend, over adjacent instances. Every render-time batcher
+ * coalesces on exactly these terms, so the backends agree on what one draw is.
+ *
+ * Optional content is deliberately not part of it. Both callers have already
+ * established that the paints are showing this frame, and a hidden paint
+ * between them breaks the contiguity test anyway. Canonical ranges, which must
+ * keep each condition addressable, are built by appendVectorDrawRun instead.
+ */
+export function vectorDrawRunsShareSubmission(previous: VectorDrawRun | undefined, run: VectorDrawRun): boolean {
+  return previous !== undefined && previous.kind === run.kind && previous.clipIndex === run.clipIndex &&
+    previous.blendMode === run.blendMode && previous.first + previous.count === run.first;
+}
+
 /** Fixed-pass order for older scenes and pages that do not need interleaving. */
 export function defaultVectorDrawRuns(scene: VectorScene): VectorDrawRun[] {
   const paints: { kind: VectorDrawRun["kind"]; first: number; page: number; order: number }[] = [];

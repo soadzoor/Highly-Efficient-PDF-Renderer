@@ -11,10 +11,15 @@ try {
   const culler = new VectorDrawRunCuller(scene);
   const view = { minX: -2, minY: -2, maxX: 12, maxY: 12 };
   assert.deepEqual([...culler.select(view, 0.01)], [scene.drawRuns[0], scene.drawRuns[2], scene.drawRuns[4]]);
+  // Callers that address runs by index read the same decision off the flags.
+  assert.deepEqual([...culler.selected], [1, 0, 1, 0, 1]);
   assert.equal(culler.select(null, 1), scene.drawRuns, "unknown perspective bounds retain all paints");
+  assert.equal(culler.selected, null, "retaining every paint needs no per-run index test");
   assert.deepEqual([...culler.select({ minX: 90, minY: 90, maxX: 112, maxY: 112 }, 0.01)], [scene.drawRuns[1], scene.drawRuns[3]]);
+  assert.deepEqual([...culler.selected], [0, 1, 0, 1, 0]);
   const overview = { minX: -1000, minY: -1000, maxX: 1000, maxY: 1000 };
   assert.equal(culler.select(overview, 0.01), scene.drawRuns, "full visibility returns the immutable source list");
+  assert.equal(culler.selected, null);
   const visible = culler.visible;
   visible.push = () => { throw new Error("overview must not scan runs into a new visible list"); };
   assert.equal(culler.select({ ...overview, minX: -999 }, 0.01), scene.drawRuns);

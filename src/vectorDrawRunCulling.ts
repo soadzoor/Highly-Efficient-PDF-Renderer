@@ -2,6 +2,13 @@ import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 
 /** Conservative paint bounds. Filtering retains the original order and instance ranges. */
 export class VectorDrawRunCuller {
+  /**
+   * Per-run membership from the most recent select(), for callers that address
+   * runs by index instead of walking the returned array. null means every run
+   * passed, so an index test is unnecessary.
+   */
+  selected: Uint8Array | null = null;
+  private selectedFlags: Uint8Array | null = null;
   private readonly bounds: Float64Array;
   private readonly visible: VectorDrawRun[] = [];
   private readonly scene: VectorScene;
@@ -90,6 +97,7 @@ export class VectorDrawRunCuller {
 
   select(view: Readonly<Bounds> | null, unitsPerPixel: number, extraMargin = 0): readonly VectorDrawRun[] {
     const runs = this.scene.drawRuns ?? [];
+    this.selected = null;
     if (!view) return runs;
     // Hairlines and analytic antialiasing grow in screen pixels, independently of source widths.
     const pad = Math.max(extraMargin, 0.001, unitsPerPixel * 4);
@@ -114,15 +122,21 @@ export class VectorDrawRunCuller {
     if (all && view.minX <= all.minX && view.minY <= all.minY && view.maxX >= all.maxX && view.maxY >= all.maxY) return runs;
     this.visible.length = 0;
     const bounds = this.paddedBounds;
+    if (!this.selectedFlags || this.selectedFlags.length !== runs.length) this.selectedFlags = new Uint8Array(runs.length);
+    const flags = this.selectedFlags;
+    flags.fill(0);
     for (let index = 0; index < runs.length; index++) {
       const offset = index * 4;
       const minX = bounds[offset], minY = bounds[offset + 1];
       const maxX = bounds[offset + 2], maxY = bounds[offset + 3];
       if (minX > maxX || minY > maxY || maxX < view.minX || maxY < view.minY ||
           minX > view.maxX || minY > view.maxY) continue;
+      flags[index] = 1;
       this.visible.push(runs[index]);
     }
-    return this.visible.length === runs.length ? runs : this.visible;
+    if (this.visible.length === runs.length) return runs;
+    this.selected = flags;
+    return this.visible;
   }
 }
 

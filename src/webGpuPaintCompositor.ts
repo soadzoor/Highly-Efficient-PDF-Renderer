@@ -58,7 +58,8 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   }
 
   render(scene: VectorScene, parentPass: any, width: number, height: number,
-    draw: (run: VectorDrawRun, pass: any, shapeOnly: boolean) => void, visible: (condition?: number) => boolean): void {
+    draw: (run: VectorDrawRun, pass: any, shapeOnly: boolean) => void, visible: (condition?: number) => boolean,
+    selected: Uint8Array | null = null): void {
     const info = managedPasses.get(parentPass);
     if (!info) throw new Error("PDF compositing requires a managed render pass.");
     if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0)
@@ -90,7 +91,7 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     try {
       backdrop = this.acquire();
       this.pass({ operation: 5, source: { view: info.descriptor.colorAttachments[0].view, texture: null } }, backdrop);
-      result = compositeScenePaintGraph(scene, this, backdrop, visible);
+      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected);
       const pass = info.resume();
       resumed = true;
       this.encode({ operation: 5, source: result }, pass, width, height);

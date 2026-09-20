@@ -4221,7 +4221,8 @@ export class WebGpuFloorplanRenderer {
             const previous = strokes;
             draw(run);
             if (shapeOnly) strokes = previous;
-          }, condition => condition === undefined || visibility?.conditions[condition] === 1);
+          }, condition => condition === undefined || visibility?.conditions[condition] === 1,
+          this.orderedRunCuller?.selected ?? null);
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }

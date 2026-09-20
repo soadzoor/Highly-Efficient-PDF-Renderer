@@ -148,12 +148,47 @@ try {
     const spanHost = makeRenderer(backend);
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 32, 24, () => true);
     const spanDraws = spanHost.draws.filter(draw => draw.ids);
-    assert.deepEqual(spanDraws.map(draw => draw.ids), [[0], [1]],
-      "both paints of the span are drawn, in source order, for the color surface");
+    // Side-by-side paints sharing a program and clip become one mesh, exactly
+    // as they do when the scene needs no compositing at all.
+    assert.deepEqual(spanDraws.map(draw => draw.ids), [[0, 1]],
+      "the span's paints are batched into one submission, in source order");
     assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 1,
       "the span costs one host render, and without a knockout it renders no shape at all");
-    assert.equal(spanDraws[0].call, spanDraws[1].call, "a span's paints share a single render");
     spanCompositor.dispose(); spanStroke.dispose();
+
+    // The graph may paint adjacent runs back to front. A mesh renders its
+    // instances in id order, so merging those two would silently swap them:
+    // batching must follow the graph's own sequence, not the run indices.
+    const splitScene = Object.assign(createEmptyVectorScene(), {
+      pageRects: f([0, 0, 10, 10]), pageBounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 },
+      bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 }, segmentCount: 2, maxHalfWidth: 1,
+      endpoints: f([1, 2, 0, 0, 1, 4, 0, 0]), primitiveMeta: f([9, 2, 0, 0.5, 9, 4, 0, 0.5]),
+      styles: f([1, 1, 0, 0, 1, 0, 0, 1]), primitiveBounds: f([0, 0, 10, 3, 0, 3, 10, 5]),
+      drawRuns: [{ kind: "stroke", first: 0, count: 1 }, { kind: "stroke", first: 1, count: 1 }],
+      // One list, contiguous and otherwise mergeable, but painted back to front.
+      paintGraph: { roots: [{ kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
+        children: [{ kind: "draw", runIndex: 1 }, { kind: "draw", runIndex: 0 }] }] }
+    });
+    const splitStroke = new ThreeMaterialStrokeLayer(splitScene, { materialBackend: backend,
+      strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
+    const splitCompositor = new ThreePaintCompositor(backend);
+    const splitHost = makeRenderer(backend);
+    splitCompositor.render(splitHost, splitScene, [splitStroke.mesh], 32, 24, () => true);
+    assert.deepEqual(splitHost.draws.filter(draw => draw.ids).map(draw => draw.ids), [[1], [0]],
+      "paints the graph reverses stay separate meshes, in the graph's order");
+    const splitPasses = splitHost.draws.length;
+    // Once the layer's own culling empties a mesh, its group has nothing left
+    // to composite, so the whole group drops out with its surfaces and passes.
+    for (const mesh of splitStroke.mesh.children) mesh.geometry.instanceCount = 0;
+    splitHost.draws.length = 0;
+    splitCompositor.render(splitHost, splitScene, [splitStroke.mesh], 32, 24, () => true);
+    assert.deepEqual(splitHost.draws.filter(draw => draw.ids).map(draw => draw.ids), [],
+      "culled paints submit nothing");
+    // Dropping the only group leaves just the root's own machinery: 4 host
+    // renders here against 13, where merely skipping its empty draw costs 11.
+    assert.ok(splitHost.draws.length * 2 < splitPasses,
+      `an emptied group drops its surfaces and passes too (${splitHost.draws.length} vs ${splitPasses})`);
+    splitCompositor.dispose(); splitStroke.dispose();
 
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
