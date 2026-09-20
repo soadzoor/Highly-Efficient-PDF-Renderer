@@ -48,6 +48,7 @@ try {
   }, { get(target, key) { return target[key] ?? (() => {}); } });
   const gl = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), flags, {
     gl: glApi, drawPageBackgrounds() {}, vectorClipUniforms: new Map(),
+    paintShapeUniforms: new Map(), orderedUniformPrograms: new Set(), orderedPaintUniformStates: new Map(),
     gradientFillProgram: "fill", gradientStrokeProgram: "stroke",
     gradientFillUniforms: {}, gradientStrokeUniforms: {}, gradientFillTextures: [], gradientStrokeTextures: [],
     gradientMetaTextures: [], vectorOverrideColor: [0, 0, 0], vectorOverrideOpacity: 0,
@@ -72,8 +73,24 @@ try {
   for (const materialBackend of ["webgl", "webgpu"]) {
     const layer = new ThreeMaterialGradientLayer(scene, { materialBackend,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
-    const materials = layer.getOrderedPaintMeshes().map(entry => entry.mesh.material);
+    const entries = layer.getOrderedPaintMeshes();
+    const materials = entries.map(entry => entry.mesh.material);
     assert.equal(materials.length, 3);
+
+    // A default-constructed THREE.Vector4 carries w = 1, which would mix every
+    // gradient to the unset primitive color (solid black) before any override.
+    assert.deepEqual(entries.map(entry => entry.primitiveColor.w), [0, 0, 0],
+      "gradients keep their own paint until a primitive color is requested");
+    const fill = { kind: "gradient-fill", index: 0 };
+    layer.setPrimitiveColorUpdates([{ ref: fill, color: [1, 0, 0] }]);
+    assert.deepEqual(entries.map(entry => [...entry.primitiveColor]),
+      [[1, 0, 0, 1], [0, 0, 0, 0], [0, 0, 0, 0]], "only the requested paint is recolored");
+    layer.setPrimitiveColorUpdates([{ ref: fill, color: null }]);
+    assert.deepEqual([...entries[0].primitiveColor], [0, 0, 0, 0], "clearing restores the source paint");
+    if (materialBackend === "webgl") {
+      assert(entries.every(entry => entry.mesh.material.uniforms.uPrimitiveColor.value === entry.primitiveColor),
+        "clipped gradient materials share the entry's live primitive color");
+    }
     if (materialBackend === "webgl") {
       assert.deepEqual(materials.map(m => m.uniforms.uVectorClipIndex.value), [1, -1, 0]);
       assert.equal(materials[0].uniforms.uVectorClipTex.value, materials[2].uniforms.uVectorClipTex.value);

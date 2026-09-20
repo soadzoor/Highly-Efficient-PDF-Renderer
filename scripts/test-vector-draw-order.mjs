@@ -20,7 +20,7 @@ try {
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { initializeThreeVectorClip, createThreeVectorClipTexture } = await import("../src/threeVectorClips.ts");
-  const { ThreeVectorDrawRuns } = await import("../src/threeVectorDrawRuns.ts");
+  const { ThreeVectorDrawRuns, vectorDrawRunRenderOrder } = await import("../src/threeVectorDrawRuns.ts");
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
   const { HepArchive } = await import("../src/hepContainer.ts");
 
@@ -185,6 +185,29 @@ try {
   applyThreePdfOverlayPaintOrder(scene, rasterGroup, []);
   assert(mesh.children[0].renderOrder < rasterGroup.children[1].renderOrder);
   assert(rasterGroup.children[1].renderOrder < mesh.children[1].renderOrder);
+
+  // A grid merges every page background into one tagged mesh, so image meshes
+  // must be found through their canonical draw run rather than by counting one
+  // background child per page.
+  const gridGroup = new THREE.Group();
+  const gridBackground = new THREE.Mesh();
+  gridBackground.userData.heprPageBackground = true;
+  gridGroup.add(gridBackground);
+  const gridImages = grid.rasterLayers.map((_layer, first) => {
+    const image = new THREE.Mesh();
+    image.userData.heprDrawRun = { kind: "raster", first, count: 1 };
+    gridGroup.add(image);
+    return image;
+  });
+  applyThreePdfOverlayPaintOrder(grid, gridGroup, []);
+  const gridRasterRuns = grid.drawRuns.flatMap((run, index) => run.kind === "raster" ? [index] : []);
+  assert.equal(gridImages.length, 2, "both composed pages contribute an image");
+  assert.equal(gridRasterRuns.length, 2, "each page keeps its own image run");
+  assert.deepEqual(gridImages.map(image => image.renderOrder),
+    gridRasterRuns.map(index => vectorDrawRunRenderOrder(index, grid.drawRuns.length)),
+    "each image mesh takes the paint order of its own draw run");
+  assert.equal(gridBackground.renderOrder, 0,
+    "the merged page-background mesh must not be ordered as an image layer");
   ordered.beginUpdate();
   ids.setX(0, 1); ids.needsUpdate = true;
   geometry.instanceCount = 1;

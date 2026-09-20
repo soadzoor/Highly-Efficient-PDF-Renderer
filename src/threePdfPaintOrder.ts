@@ -11,6 +11,9 @@ export interface ThreePdfOrderedPaintMesh {
   mesh: THREE.Object3D;
   pageIndex: number;
   paintOrder: number;
+  /** Source primitive this mesh paints; the gradient layer skips empty runs. */
+  primitiveKind?: "gradient-fill" | "gradient-stroke";
+  primitiveIndex?: number;
 }
 
 interface OrderedRasterLayer {
@@ -37,6 +40,7 @@ export function applyThreePdfOverlayPaintOrder(
 ): void {
   const rasterMeshes = collectRasterPaintMeshes(scene, rasterGroup);
   if (scene.drawRuns) {
+    const gradientMeshes = collectGradientPaintMeshes(scene, nativePaints);
     scene.drawRuns.forEach((run, index) => {
       if (run.kind !== "raster" && run.kind !== "gradient-fill" && run.kind !== "gradient-stroke") return;
       for (let item = run.first; item < run.first + run.count; item++) {
@@ -52,8 +56,7 @@ export function applyThreePdfOverlayPaintOrder(
             if (item + entry.count <= run.first + run.count) assign(entry.mesh);
           }
         } else {
-          const mesh = run.kind === "gradient-fill" ? nativePaints[item]?.mesh
-            : nativePaints[scene.gradientFillPathCount + item]?.mesh;
+          const mesh = (run.kind === "gradient-fill" ? gradientMeshes.fills : gradientMeshes.strokes).get(item);
           if (mesh) assign(mesh);
         }
       }
@@ -119,6 +122,27 @@ export function applyThreePdfOverlayPaintOrder(
     const renderOrder = HEPR_THREE_LAYER_ORDER_RASTER + span * ((i + 1) / (ordered.length + 1));
     for (const mesh of ordered[i].meshes) mesh.renderOrder = renderOrder;
   }
+}
+
+/**
+ * Key the gradient meshes by the primitive each one paints. Empty or truncated
+ * gradient runs are skipped when the layer is built, so mesh positions are not
+ * interchangeable with scene primitive indices.
+ */
+function collectGradientPaintMeshes(
+  scene: VectorScene,
+  nativePaints: readonly ThreePdfOrderedPaintMesh[]
+): { fills: Map<number, THREE.Object3D>; strokes: Map<number, THREE.Object3D> } {
+  const fills = new Map<number, THREE.Object3D>();
+  const strokes = new Map<number, THREE.Object3D>();
+  nativePaints.forEach((paint, position) => {
+    const fill = paint.primitiveKind === undefined
+      ? position < scene.gradientFillPathCount
+      : paint.primitiveKind === "gradient-fill";
+    const index = paint.primitiveIndex ?? (fill ? position : position - scene.gradientFillPathCount);
+    (fill ? fills : strokes).set(index, paint.mesh);
+  });
+  return { fills, strokes };
 }
 
 /** Originals and render-only batches can share a canonical first image. */
