@@ -35,6 +35,7 @@ import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
 import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
+import { RenderPerformanceProfiler, type RenderPerformanceOptions } from "./renderPerformance";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
@@ -459,6 +460,9 @@ async function ensureThreeRendererBackend(
   renderer = nextRenderer;
   activeThreeRendererBackend = backend;
   resetFpsMeter();
+  // The capture's GPU timer queries belong to the context being replaced.
+  captureProfiler?.dispose();
+  captureProfiler = null;
   drawCallMeter.reset();
   controls = createMapControls();
   controls.target.copy(previousControlsTarget);
@@ -475,12 +479,22 @@ function renderFrame(now: number = performance.now()): void {
   }
   needsRender = false;
   updateFpsMeter(now);
+  const profile = captureProfiler?.enabled ? captureProfiler : null;
+  profile?.beginFrame(now);
+  profile?.beginSection("controls");
   const controlsChanged = controls.update();
   updateCameraClipping();
+  profile?.endSection("controls");
   prepareThreeRendererFrame(renderer);
-  drawCallMeter.update(drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
+  profile?.beginSection("render");
+  const drawCalls = drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera));
+  profile?.endSection("render");
+  drawCallMeter.update(drawCalls);
+  if (profile) recordCaptureCounters(profile, drawCalls);
+  profile?.beginSection("overlays");
   drawingSelection.onFrame();
   textSelection.updateOverlay();
+  profile?.endSection("overlays");
   // Writing the readouts every frame costs a style recalc, layout and paint per
   // frame, which at high refresh rates dwarfs the numbers being reported. The
   // panels stay legible at ~10Hz; anything that changes them outside the render
@@ -492,6 +506,7 @@ function renderFrame(now: number = performance.now()): void {
   }
   renderedFrameSerial += 1;
   resolveRenderedFrameWaiters();
+  profile?.endFrame();
   if (controlsChanged) {
     requestRender();
   }
@@ -887,6 +902,74 @@ textSearchCaseButtonElement.addEventListener("click", () => {
   runSearch(textSearchInputElement.value);
 }, { signal: lifetimeSignal });
 
+/**
+ * Opt-in render capture, mirroring `heprPerf` in the native viewer so the two
+ * backends can be compared with the same report shape.
+ *
+ * Start it from the console with `heprPerf.start()`, or with `?perf=1` in the
+ * URL to capture from the first frame, then read it back with `heprPerf.stop()`.
+ * GPU timings need the WebGL backend's timer-query extension; WebGPU reports
+ * CPU sections only.
+ */
+let captureProfiler: RenderPerformanceProfiler | null = null;
+let captureContext: Record<string, unknown> | null = null;
+const performanceCapture = {
+  start(options: RenderPerformanceOptions = {}): string {
+    captureProfiler?.dispose();
+    const gl = activeThreeRendererBackend === "webgl"
+      ? (renderer as THREE.WebGLRenderer).getContext() : undefined;
+    captureProfiler = new RenderPerformanceProfiler({
+      gl: gl instanceof WebGL2RenderingContext ? gl : undefined
+    });
+    captureContext = {
+      document: currentPdfObject?.sourceLabel ?? null, backend: `three-${activeThreeRendererBackend}`,
+      canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
+      vectorLod: vectorLodSelectElement.value, textLod: textLodSelectElement.value,
+      drawingSelection: drawingSelection.isEnabled(),
+      sourceSegments: currentPdfObject?.sceneData.segmentCount ?? 0,
+      sourcePaints: currentPdfObject?.sceneData.drawRuns?.length ?? 0
+    };
+    captureProfiler.start(options);
+    requestRender();
+    return `Capturing up to ${options.maxFrames ?? 600} rendered frames. Pan or zoom, then run heprPerf.stop().`;
+  },
+  report() {
+    if (!captureProfiler) throw new Error("Start a capture with heprPerf.start() first.");
+    // `?perf=1` starts before any document exists, so name it once one is open.
+    if (captureContext && captureContext.document === null) {
+      captureContext.document = currentPdfObject?.sourceLabel ?? null;
+      captureContext.sourceSegments = currentPdfObject?.sceneData.segmentCount ?? 0;
+      captureContext.sourcePaints = currentPdfObject?.sceneData.drawRuns?.length ?? 0;
+    }
+    return { context: captureContext, ...captureProfiler.getReport() };
+  },
+  stop() {
+    captureProfiler?.stop();
+    const report = performanceCapture.report();
+    console.table({ frameCpu: report.frameCpuMs, frameInterval: report.frameIntervalMs,
+      ...report.cpuSections, gpuCommandSpan: report.gpu.frameMs });
+    console.table(report.counters);
+    return report;
+  },
+  json(): string { return JSON.stringify(performanceCapture.report(), null, 2); }
+};
+// Temporary, opt-in console diagnostics. Nothing is captured until start().
+Object.assign(window, { heprPerf: performanceCapture });
+// `?perf=1` starts the capture before the first frame, so the first
+// interactions with a freshly loaded document are already in the report.
+if (new URLSearchParams(window.location.search).get("perf") === "1") {
+  console.info(performanceCapture.start());
+}
+
+function recordCaptureCounters(profile: RenderPerformanceProfiler, drawCalls: number | null): void {
+  if (drawCalls !== null) profile.add("drawCalls", drawCalls);
+  const segments = currentPdfObject?.getRenderedStrokeSegmentCount();
+  if (segments !== null && segments !== undefined) profile.add("renderedSegments", segments);
+  const text = currentPdfObject?.getTextInstanceStats();
+  if (text) profile.add("renderedTextInstances", text.rendered);
+  profile.setFrameContext({ viewportWidth: canvasElement.width, viewportHeight: canvasElement.height });
+}
+
 void loadExampleManifest();
 
 window.addEventListener("beforeunload", () => {
@@ -912,6 +995,8 @@ function disposeExample(): void {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
   }
+  captureProfiler?.dispose();
+  captureProfiler = null;
   layerControls.dispose();
   drawingSelection.dispose();
   textSelection.dispose();

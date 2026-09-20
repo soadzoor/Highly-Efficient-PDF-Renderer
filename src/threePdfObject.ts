@@ -33,6 +33,7 @@ import {
   HEPR_THREE_LAYER_ORDER_TEXT_SELECTION
 } from "./threeLayerOrder";
 import { applyThreePdfOverlayPaintOrder } from "./threePdfPaintOrder";
+import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import type { Bounds } from "./pdfVectorExtractor";
 import {
   createSceneTextSearcher,
@@ -400,6 +401,8 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly clipFromLocalMatrix = new THREE.Matrix4();
   private readonly clipFromDataMatrix = new THREE.Matrix4();
   private readonly dataToLocalMatrix = new THREE.Matrix4();
+  private readonly drawPlan: ThreeVectorDrawPlan | null;
+  private appliedDrawPlanVersion = -1;
   private readonly ndcOrigin = new THREE.Vector3();
   private readonly ndcLocalX = new THREE.Vector3();
   private readonly ndcLocalY = new THREE.Vector3();
@@ -493,6 +496,7 @@ export class HeprThreePdfObject extends THREE.Group {
       maxY: this.sceneBounds.maxY - this.sceneCenterY
     };
     this.dataToLocalMatrix.makeTranslation(-this.sceneCenterX, -this.sceneCenterY, 0);
+    this.drawPlan = this.sceneData.drawRuns ? getThreeVectorDrawPlan(this.sceneData) : null;
     this.interactionController = createCanvasInteractionController(() => this.renderer);
     this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
     this.attachNativeFrameListener(this.renderer);
@@ -721,6 +725,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.fillMaterialLayer.setPrimitiveColorUpdates(updates, this.sceneData);
     this.textMaterialLayer.setPrimitiveColorUpdates(updates, this.sceneData);
     this.gradientMaterialLayer.setPrimitiveColorUpdates(updates);
+    this.setVectorDrawPlanColorCommutation();
     if (updates.some(update => update.ref.kind === "text")) this.setTextLodMode(this.rendererConfig.textLodMode);
     if (this.hasUploadedNativeScene()) {
       this.renderer.setPrimitiveColorUpdates?.(this.nativePrimitiveColorsReplayed
@@ -1823,6 +1828,7 @@ export class HeprThreePdfObject extends THREE.Group {
       materialLayerViewport,
       cameraDrivenMaterialPipelineEnabled
     );
+    this.updateVectorDrawPlan(localUnitsPerPixel, cameraDrivenMaterialPipelineEnabled);
     this.updateStrokeLodVisibility(localUnitsPerPixel, cameraDrivenMaterialPipelineEnabled);
 
     const presentedFrameSerial = this.renderer.getPresentedFrameSerial();
@@ -2340,6 +2346,49 @@ export class HeprThreePdfObject extends THREE.Group {
     this.textMaterialLayer.setLocalToClipTransform(this.clipFromDataMatrix);
     this.textLodLayer?.setLocalToClipTransform(this.clipFromDataMatrix);
     return localUnitsPerPixel;
+  }
+
+  /** Recoloured primitives no longer match their source RGB, so equal-colour paints stop commuting. */
+  private setVectorDrawPlanColorCommutation(): void {
+    const commutes = !this.primitiveAppearance.hasOverrides("stroke") &&
+      !this.primitiveAppearance.hasOverrides("fill") && !this.primitiveAppearance.hasOverrides("text");
+    this.drawPlan?.setColorCommutationEnabled(commutes);
+    this.syncVectorDrawPlanOrder();
+  }
+
+  /**
+   * Replan the shared submission order for the current pixel scale.
+   *
+   * Commuting paints are grouped so the material layers can submit a few dozen
+   * instanced draws instead of one per canonical paint. The scale is the same
+   * one the material shaders derive their antialiasing from, which is what the
+   * schedule pads its overlap tests with.
+   */
+  private updateVectorDrawPlan(localUnitsPerPixel: number | null, vectorPipelineActive: boolean): void {
+    // Only the material layers submit from this plan. While the native renderer
+    // draws into a texture instead, replanning would rebuild batches nothing draws.
+    if (!vectorPipelineActive) return;
+    this.drawPlan?.update(localUnitsPerPixel);
+    this.syncVectorDrawPlanOrder();
+  }
+
+  /**
+   * Renumber the image and gradient meshes for the current submission order.
+   *
+   * The order is global, so these have to move with the batched vector paints.
+   * Tracking the version applied here rather than trusting the plan's own
+   * "changed" answer also covers a plan this object inherited already scheduled,
+   * from an earlier object over the same scene such as a backend switch.
+   */
+  private syncVectorDrawPlanOrder(): void {
+    if (!this.drawPlan || this.drawPlan.version === this.appliedDrawPlanVersion) return;
+    this.appliedDrawPlanVersion = this.drawPlan.version;
+    applyThreePdfOverlayPaintOrder(
+      this.sceneData,
+      this.rasterMaterialLayer.group,
+      this.gradientMaterialLayer.getOrderedPaintMeshes(),
+      this.drawPlan.positions
+    );
   }
 
   private updateStrokeLodVisibility(localUnitsPerPixel: number | null, vectorPipelineActive: boolean): void {

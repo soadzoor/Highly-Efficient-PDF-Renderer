@@ -32,23 +32,29 @@ interface RasterPaintMesh {
 /**
  * Interleave sparse native gradient paints with extracted image layers while
  * keeping the complete group below the ordinary-fill band.
+ *
+ * `positions` maps each canonical paint to its position in the shared
+ * submission order. It is required whenever that order has been replanned, so
+ * images and gradients stay interleaved with the batched vector paints.
  */
 export function applyThreePdfOverlayPaintOrder(
   scene: VectorScene,
   rasterGroup: THREE.Group,
-  nativePaints: readonly ThreePdfOrderedPaintMesh[]
+  nativePaints: readonly ThreePdfOrderedPaintMesh[],
+  positions?: Int32Array | null
 ): void {
   const rasterMeshes = collectRasterPaintMeshes(scene, rasterGroup);
   if (scene.drawRuns) {
     const gradientMeshes = collectGradientPaintMeshes(scene, nativePaints);
     scene.drawRuns.forEach((run, index) => {
       if (run.kind !== "raster" && run.kind !== "gradient-fill" && run.kind !== "gradient-stroke") return;
+      const position = positions?.length === scene.drawRuns!.length ? positions[index] : index;
       for (let item = run.first; item < run.first + run.count; item++) {
         const assign = (mesh: THREE.Object3D): void => {
-          mesh.renderOrder = vectorDrawRunRenderOrder(index + (item - run.first) / run.count, scene.drawRuns!.length);
+          mesh.renderOrder = vectorDrawRunRenderOrder(position + (item - run.first) / run.count, scene.drawRuns!.length);
           for (const child of mesh.children) {
             if (child.userData.heprMultiplyCompletion) child.renderOrder = vectorDrawRunRenderOrder(
-              index + (item - run.first + 0.5) / run.count, scene.drawRuns!.length);
+              position + (item - run.first + 0.5) / run.count, scene.drawRuns!.length);
           }
         };
         if (run.kind === "raster") {
