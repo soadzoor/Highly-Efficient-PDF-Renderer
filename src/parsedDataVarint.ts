@@ -120,6 +120,20 @@ export class ByteWriter {
     this.used += source.length;
   }
 
+  /** Little-endian float32, for values whose source is already float32. */
+  writeFloat32(value: number): void {
+    this.ensureCapacity(4);
+    new DataView(this.data.buffer, this.data.byteOffset + this.used, 4).setFloat32(0, value, true);
+    this.used += 4;
+  }
+
+  /** Little-endian float64, for the few plain numbers that must round-trip exactly. */
+  writeFloat64(value: number): void {
+    this.ensureCapacity(8);
+    new DataView(this.data.buffer, this.data.byteOffset + this.used, 8).setFloat64(0, value, true);
+    this.used += 8;
+  }
+
   toUint8Array(): Uint8Array {
     return this.data.slice(0, this.used);
   }
@@ -146,10 +160,44 @@ export class VarintCursor {
 
   private readonly end: number;
 
+  private readonly view: DataView;
+
   constructor(bytes: Uint8Array, byteStart = 0, byteEnd = bytes.length) {
     this.bytes = bytes;
     this.offset = byteStart;
     this.end = byteEnd;
+    this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+
+  /** Position of the next unread byte, for sections that embed sized columns. */
+  get byteOffset(): number {
+    return this.offset;
+  }
+
+  /** Untrusted streams must not read past their declared range. */
+  private require(byteCount: number, label: string): void {
+    if (this.offset + byteCount > this.end) {
+      throw new Error(`${label}: varint stream ended early (at ${this.offset}, expected ${this.end}).`);
+    }
+  }
+
+  readByte(label = "byte"): number {
+    this.require(1, label);
+    return this.bytes[this.offset++];
+  }
+
+  readFloat32(label = "float32"): number {
+    this.require(4, label);
+    const value = this.view.getFloat32(this.offset, true);
+    this.offset += 4;
+    return value;
+  }
+
+  readFloat64(label = "float64"): number {
+    this.require(8, label);
+    const value = this.view.getFloat64(this.offset, true);
+    this.offset += 8;
+    return value;
   }
 
   readVarUint32(): number {

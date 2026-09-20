@@ -4,6 +4,17 @@ import { validateSceneRetainedPages } from "./retainedPageData";
 import { encodeHeprPageData, decodeHeprPageData } from "./heprPageEncoding";
 import type { HeprPageData } from "./heprDocumentData";
 import { validateScenePaintGraph } from "./scenePaintGraph";
+import {
+  SCENE_CLIP_PATHS_PATH,
+  SCENE_DRAW_RUNS_PATH,
+  SCENE_PAINT_GRAPH_PATH,
+  decodeSceneClipPaths,
+  decodeSceneDrawRuns,
+  decodeScenePaintGraph,
+  encodeSceneClipPaths,
+  encodeSceneDrawRuns,
+  encodeScenePaintGraph
+} from "./hepSceneSections";
 import { readHepGradientMesh, writeHepGradientMesh, validateGradientMesh } from "./hepGradientMesh";
 import { HepArchive, type HepArchiveEntry } from "./hepContainer";
 import { waitForLoad } from "./loadCancellation";
@@ -305,6 +316,28 @@ export async function buildHepBlobForLayout(
     }
   }
 
+  // Scene structure sections. Their manifest entries are descriptors only, so a
+  // clip-heavy page no longer prints tens of thousands of coordinates as JSON.
+  let clipPathsManifest: { file: string; count: number; edgeCount: number } | undefined;
+  if (scene.clipPaths) {
+    throwIfBuildAborted(options.signal);
+    archive.file(SCENE_CLIP_PATHS_PATH, encodeSceneClipPaths(scene.clipPaths));
+    clipPathsManifest = { file: SCENE_CLIP_PATHS_PATH, count: scene.clipPaths.length,
+      edgeCount: scene.clipPaths.reduce((total, clip) => total + clip.edges.length / 4, 0) };
+  }
+  let drawRunsManifest: { file: string; count: number } | undefined;
+  if (scene.drawRuns) {
+    throwIfBuildAborted(options.signal);
+    archive.file(SCENE_DRAW_RUNS_PATH, encodeSceneDrawRuns(scene.drawRuns));
+    drawRunsManifest = { file: SCENE_DRAW_RUNS_PATH, count: scene.drawRuns.length };
+  }
+  let paintGraphManifest: { file: string; rootCount: number } | undefined;
+  if (scene.paintGraph) {
+    throwIfBuildAborted(options.signal);
+    archive.file(SCENE_PAINT_GRAPH_PATH, encodeScenePaintGraph(scene.paintGraph));
+    paintGraphManifest = { file: SCENE_PAINT_GRAPH_PATH, rootCount: scene.paintGraph.roots.length };
+  }
+
   const textInstancesExport = buildTextInstancesExport(scene);
   if (textInstancesExport) {
     archive.file(textInstancesExport.manifest.positionsFile, textInstancesExport.positionsBytes);
@@ -428,12 +461,11 @@ export async function buildHepBlobForLayout(
       maxHalfWidth: scene.maxHalfWidth,
       operatorCount: scene.operatorCount,
       operatorCountKind: scene.operatorCountKind,
-      drawRuns: scene.drawRuns,
+      drawRuns: drawRunsManifest,
       optionalContent: scene.optionalContent,
       retainedPages,
-      paintGraph: scene.paintGraph ? JSON.parse(JSON.stringify(scene.paintGraph,
-        (_key, value: unknown) => value instanceof Float32Array ? Array.from(value) : value)) : undefined,
-      clipPaths: scene.clipPaths?.map(clip => ({ ...clip, edges: Array.from(clip.edges) })),
+      paintGraph: paintGraphManifest,
+      clipPaths: clipPathsManifest,
       imageLayerSegmentCount: scene.imageLayerSegmentCount,
       discardedTransparentCount: scene.discardedTransparentCount,
       discardedDegenerateCount: scene.discardedDegenerateCount,
@@ -528,8 +560,12 @@ function throwIfBuildAborted(signal: AbortSignal | undefined): void {
   signal?.throwIfAborted();
 }
 
-/** v7 retains PDF layer definitions, conditions and initially hidden content. */
-const PARSED_DATA_FORMAT_VERSION = 7;
+/**
+ * v7 retained PDF layer definitions, conditions and initially hidden content.
+ * v8 moves the scene clip paths, draw runs and paint graph out of the manifest
+ * into binary sections; see docs/HEP_CONTAINER.md.
+ */
+const PARSED_DATA_FORMAT_VERSION = 8;
 const MAX_PARSED_RASTER_LAYER_COUNT = 4_096;
 const MAX_PARSED_RASTER_DIMENSION = 16_384;
 const MAX_PARSED_RASTER_TEXELS_PER_LAYER = 134_217_728;
@@ -1923,17 +1959,20 @@ async function loadSceneFromHepInternal(
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
   });
   if (sceneMeta.clipPaths !== undefined) {
-    if (!Array.isArray(sceneMeta.clipPaths)) throw new Error("Invalid scene clip paths.");
-    scene.clipPaths = sceneMeta.clipPaths.map(clip => {
-      if (!clip || !Array.isArray(clip.edges) ||
-          !clip.edges.every((value: unknown) => typeof value === "number" && Number.isFinite(value))) {
-        throw new Error("Invalid scene clip edges.");
-      }
-      return { parent: clip.parent, fillRule: clip.fillRule, edges: Float32Array.from(clip.edges) };
-    });
+    const meta = readSceneSectionDescriptor(sceneMeta.clipPaths, SCENE_CLIP_PATHS_PATH, "clip paths");
+    const count = readSceneSectionCount(meta, "count", "clip paths");
+    const edgeCount = readSceneSectionCount(meta, "edgeCount", "clip paths");
+    scene.clipPaths = decodeSceneClipPaths(await readSceneSectionBytes(archive, SCENE_CLIP_PATHS_PATH, signal));
+    if (scene.clipPaths.length !== count ||
+        scene.clipPaths.reduce((total, clip) => total + clip.edges.length / 4, 0) !== edgeCount) {
+      throw new Error("Scene clip paths do not match their manifest entry.");
+    }
   }
   if (sceneMeta.drawRuns !== undefined) {
-    scene.drawRuns = sceneMeta.drawRuns as VectorScene["drawRuns"];
+    const meta = readSceneSectionDescriptor(sceneMeta.drawRuns, SCENE_DRAW_RUNS_PATH, "draw runs");
+    const count = readSceneSectionCount(meta, "count", "draw runs");
+    scene.drawRuns = decodeSceneDrawRuns(await readSceneSectionBytes(archive, SCENE_DRAW_RUNS_PATH, signal));
+    if (scene.drawRuns.length !== count) throw new Error("Scene draw runs do not match their manifest entry.");
   }
   if (sceneMeta.optionalContent !== undefined) {
     validateSceneOptionalContent(sceneMeta.optionalContent);
@@ -1964,28 +2003,12 @@ async function loadSceneFromHepInternal(
     }
   }
   if (sceneMeta.paintGraph !== undefined) {
-    const graph = sceneMeta.paintGraph as NonNullable<VectorScene["paintGraph"]>;
-    let count = 0;
-    const readNodes = (nodes: unknown, depth: number): void => {
-      if (!Array.isArray(nodes) || depth > 64) throw new Error("Invalid scene paint graph.");
-      for (const node of nodes) {
-        if (++count > 1_000_000 || !node || typeof node !== "object") throw new Error("Invalid scene paint node.");
-        if (node.kind === "group") {
-          readNodes(node.children, depth + 1);
-          if (node.softMask) {
-            readNodes(node.softMask.children, depth + 1);
-            if (node.softMask.transfer !== undefined) {
-              if (!Array.isArray(node.softMask.transfer) || !node.softMask.transfer.every((value: unknown) => typeof value === "number" && Number.isFinite(value))) {
-                throw new Error("Invalid scene mask transfer function.");
-              }
-              node.softMask.transfer = Float32Array.from(node.softMask.transfer);
-            }
-          }
-        }
-      }
-    };
-    if (!graph || typeof graph !== "object") throw new Error("Invalid scene paint graph.");
-    readNodes(graph.roots, 0); scene.paintGraph = graph;
+    const meta = readSceneSectionDescriptor(sceneMeta.paintGraph, SCENE_PAINT_GRAPH_PATH, "paint graph");
+    const rootCount = readSceneSectionCount(meta, "rootCount", "paint graph");
+    scene.paintGraph = decodeScenePaintGraph(await readSceneSectionBytes(archive, SCENE_PAINT_GRAPH_PATH, signal));
+    if (scene.paintGraph.roots.length !== rootCount) {
+      throw new Error("Scene paint graph does not match its manifest entry.");
+    }
   }
   validateVectorDrawRuns(scene);
   validateSceneOptionalContentReferences(scene);
@@ -2649,6 +2672,50 @@ function computeMaxHalfWidth(styles: Float32Array, segmentCount: number): number
 function readFiniteNumber(value: unknown, fallback: number): number {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+/**
+ * A v8 scene structure lives in its own section and the manifest only points at
+ * it, with the counts a reader checks the decoded section against.
+ */
+function readSceneSectionDescriptor(
+  value: unknown,
+  expectedFile: string,
+  label: string
+): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid scene ${label} entry.`);
+  }
+  const descriptor = value as Record<string, unknown>;
+  if (descriptor.file !== expectedFile) {
+    throw new Error(`Scene ${label} entry does not name ${expectedFile}.`);
+  }
+  return descriptor;
+}
+
+function readSceneSectionCount(
+  descriptor: Record<string, unknown>,
+  key: string,
+  label: string
+): number {
+  const count = descriptor[key];
+  if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) {
+    throw new Error(`Invalid scene ${label} ${key}.`);
+  }
+  return count;
+}
+
+async function readSceneSectionBytes(
+  archive: HepArchive,
+  file: string,
+  signal: AbortSignal | undefined
+): Promise<Uint8Array> {
+  signal?.throwIfAborted();
+  const entry = archive.file(file);
+  if (!entry) throw new Error(`Missing scene section ${file}.`);
+  const bytes = await entry.async("uint8array");
+  signal?.throwIfAborted();
+  return bytes;
 }
 
 function readNonNegativeInt(value: unknown, fallback: number): number {

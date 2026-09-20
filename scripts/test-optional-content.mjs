@@ -169,14 +169,14 @@ try {
     const bytes = await blob.arrayBuffer();
     const archive = await HepArchive.loadAsync(bytes);
     const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
-    assert.equal(manifest.formatVersion, 7);
-    assert.equal(manifest.scene.drawRuns[0].optionalContent, 1);
+    assert.equal(manifest.formatVersion, 8);
     const loaded = await loadSceneFromHep(bytes);
+    assert.equal(loaded.drawRuns[0].optionalContent, 1, "v8 carries the condition in the draw-run section");
     assert.deepEqual(loaded.optionalContent, original.optionalContent);
     assert.deepEqual(loaded.textIndex.pages[0].optionalContent, new Int32Array([1]));
     assert.equal(new OptionalContentController(loaded).isVisible(1), false, "exports retain source defaults");
-    manifest.formatVersion = 6; archive.file("manifest.json", JSON.stringify(manifest));
-    await assert.rejects(loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer" })), /v6.*not supported.*v7.*Re-export/);
+    manifest.formatVersion = 7; archive.file("manifest.json", JSON.stringify(manifest));
+    await assert.rejects(loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer" })), /v7.*not supported.*v8.*Re-export/);
   }
   for (const mutate of [s => { s.optionalContent.conditions[0] = { kind: "not", operand: 0 }; },
     s => { s.optionalContent.conditions[0] = { kind: "group", groupId: "missing" }; },

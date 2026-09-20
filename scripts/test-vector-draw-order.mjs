@@ -69,22 +69,43 @@ try {
   const restored = await loadSceneFromHep(bytes);
   assert.deepEqual(restored.drawRuns, grid.drawRuns);
   assert.deepEqual(restored.clipPaths, grid.clipPaths);
-  const archive = await HepArchive.loadAsync(bytes);
-  const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
-  manifest.scene.drawRuns[0].count++;
-  archive.file("manifest.json", JSON.stringify(manifest));
-  await assert.rejects(loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer", compression: "STORE" })), /overlap|outside/);
-
-  const validManifest = JSON.parse(await (await HepArchive.loadAsync(bytes)).file("manifest.json").async("string"));
-  for (const corrupt of [
-    manifest => { manifest.scene.clipPaths[0].parent = 0; },
-    manifest => { manifest.scene.clipPaths[0].edges[0] = null; },
-    manifest => { manifest.scene.drawRuns[0].clipIndex = manifest.scene.clipPaths.length; }
+  // v8 keeps the scene structures in their own sections; the manifest carries
+  // only the counts a reader checks the decoded sections against.
+  const { SCENE_CLIP_PATHS_PATH, SCENE_DRAW_RUNS_PATH, SCENE_PAINT_GRAPH_PATH, encodeSceneDrawRuns } =
+    await import("../src/hepSceneSections.ts");
+  const rebuild = async mutate => {
+    const archive = await HepArchive.loadAsync(bytes);
+    const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+    await mutate(manifest, archive);
+    archive.file("manifest.json", JSON.stringify(manifest));
+    return archive.generateAsync({ type: "arraybuffer", compression: "STORE" });
+  };
+  const pristine = JSON.parse(await (await HepArchive.loadAsync(bytes)).file("manifest.json").async("string"));
+  for (const [corrupt, pattern] of [
+    [manifest => { manifest.scene.drawRuns.count += 1; }, /draw runs do not match/],
+    [manifest => { manifest.scene.clipPaths.count += 1; }, /clip paths do not match/],
+    [manifest => { manifest.scene.clipPaths.edgeCount += 1; }, /clip paths do not match/],
+    [manifest => { manifest.scene.clipPaths.file = "geometry/elsewhere.d512"; }, /does not name/],
+    [manifest => { manifest.scene.drawRuns.count = -1; }, /Invalid scene draw runs count/],
+    ...(pristine.scene.paintGraph
+      ? [[manifest => { manifest.scene.paintGraph.rootCount += 1; }, /paint graph does not match/]]
+      : [])
   ]) {
-    const malformed = structuredClone(validManifest); corrupt(malformed);
-    archive.file("manifest.json", JSON.stringify(malformed));
-    await assert.rejects(loadSceneFromHep(await archive.generateAsync({ type: "arraybuffer", compression: "STORE" })), /clip/);
+    await assert.rejects(loadSceneFromHep(await rebuild(corrupt)), pattern);
   }
+  // A truncated section must be rejected rather than silently decoded short.
+  for (const section of [SCENE_CLIP_PATHS_PATH, SCENE_DRAW_RUNS_PATH, SCENE_PAINT_GRAPH_PATH].filter(
+    name => pristine.scene.paintGraph || name !== SCENE_PAINT_GRAPH_PATH)) {
+    await assert.rejects(loadSceneFromHep(await rebuild(async (_manifest, archive) => {
+      const original = await archive.file(section).async("uint8array");
+      archive.file(section, original.subarray(0, original.length - 1));
+    })), error => error instanceof Error);
+  }
+  // A draw run may not reference a clip path that does not exist.
+  await assert.rejects(loadSceneFromHep(await rebuild(async (_manifest, archive) => {
+    archive.file(SCENE_DRAW_RUNS_PATH, encodeSceneDrawRuns(
+      grid.drawRuns.map((run, index) => index === 0 ? { ...run, clipIndex: grid.clipPaths.length } : run)));
+  })), /clip/);
 
   // Exercise production dispatch without a browser or GPU context.
   const expected = scene.drawRuns.map(run => [run.kind, run.first, run.count]);

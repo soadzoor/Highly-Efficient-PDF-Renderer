@@ -1,11 +1,12 @@
 # HEP container version 1
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-version **1** wraps **scene schema version 7**, recorded in
+version **1** wraps **scene schema version 8**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
-document model is not this container's scene schema. Readers require scene v7;
-older HEP files must be regenerated from their original PDF. Container repacking
-preserves section bytes and does not upgrade a scene or restore omitted layers.
+document model is a different thing that happens to share a number; it is not
+this container's scene schema. Readers require scene v8; older HEP files must be
+regenerated from their original PDF. Container repacking preserves section bytes
+and does not upgrade a scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
 There are no directory records, timestamps, encryption, ZIP structures, or
@@ -86,6 +87,46 @@ with XOR `0xffffffff` (the same convention as ZIP and zlib).
 
 ## Scene draw order
 
+### Scene structure sections
+
+Scene v8 keeps `clipPaths`, `drawRuns` and `paintGraph` in their own sections
+rather than as JSON in the manifest. Each manifest entry is a descriptor that
+names its section and the counts a reader checks the decoded section against; a
+mismatch, a descriptor naming any other section, or a truncated section is
+rejected. Clip edges alone were 84,048 decimal coordinates on a 15-page
+brochure, 84% of that document's manifest, and deflate cannot compress unique
+decimal text.
+
+| Field | Descriptor | Section |
+| --- | --- | --- |
+| `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
+| `drawRuns` | `{file, count}` | `geometry/draw-runs.varint` |
+| `paintGraph` | `{file, rootCount}` | `geometry/paint-graph.varint` |
+
+Every integer is an unsigned LEB128 varint unless described as zigzag, which is
+the signed mapping. `geometry/clip-paths.d512` holds `pathCount`, then per path
+a zigzag `parent`, a `fillRule` byte and an edge count, then four column byte
+lengths and the columns. Each column carries one component of every
+`[x0, y0, x1, y1]` edge across all paths, delta-coded against the previous edge
+in that column on the same 1/512 fixed-point grid as text instance origins:
+about 1/430,000 of a page and far below one device pixel. A `parent` must
+reference an earlier path.
+
+`geometry/draw-runs.varint` holds `runCount` then one record each: a flags byte
+with the kind in bits 0-2 and presence bits for a clip index (8), a visibility
+condition (16) and Multiply blending (32); then a zigzag `first` delta-coded per
+kind, a `count`, and the present optional fields. Bits 6-7 must be zero.
+
+`geometry/paint-graph.varint` is a pre-order walk. Each list opens with its
+length; each node opens with a header byte carrying the kind in bits 0-1 and a
+condition bit (4). A draw leaf then holds a zigzag run-index delta, which is
+most of the graph. A retained leaf holds its page, first command, count and
+raster slot. A group uses bits 3-7 for isolated, knockout, bounds, soft mask and
+`alphaIsShape`, then a blend-mode byte, a float64 alpha, and its optional parts
+before its children. Group alpha, bounds and mask backdrop are float64 because a
+scene holds them at full precision; mask transfer samples are float32 because
+they are already a `Float32Array`.
+
 ### Optional content (PDF layers)
 
 The optional `manifest.scene.optionalContent` object contains `groups`,
@@ -133,10 +174,9 @@ are rejected. The existing 16 MiB manifest limit still applies.
 `scene.paintGraph.roots` retains the ordered hierarchy of draw leaves, composite
 groups, and retained fallback leaves. Draw leaves reference a draw-run index.
 Groups retain alpha, isolation, knockout, blend mode, bounds, optional visibility
-condition, and an optional alpha/luminosity mask subtree. Mask transfer samples
-are JSON arrays on disk and Float32Array values after loading. Each canonical
-draw run is covered once, including singleton raster runs substituted by a
-retained leaf. Repeated/cyclic nodes and nesting beyond 64 are rejected.
+condition, and an optional alpha/luminosity mask subtree. Each canonical draw run
+is covered once, including singleton raster runs substituted by a retained leaf.
+Repeated/cyclic nodes and nesting beyond 64 are rejected.
 
 `scene.retainedPages` entries contain a resource `file`, a six-value page-to-scene
 `matrix`, and an `optionalContentConditions` array mapping retained memberships
@@ -173,7 +213,7 @@ payload, lengths count elements, and multibyte values are little-endian. Repeate
 references reuse one array. Metadata is limited to 16 MiB and the payload to
 768 MiB; array ranges and the complete retained-page schema are validated.
 Ordinary scenes omit these resources. Old embedded-PDF raster recovery is not
-part of scene v7.
+part of scene v8.
 
 ### Gradient meshes and image opacity
 

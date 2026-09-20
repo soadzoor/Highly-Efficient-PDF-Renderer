@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-19T17:02:59.862Z",
+  "generatedAt": "2026-09-20T06:42:46.653Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -10,7 +10,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 3788844
+        "sizeBytes": 2145836
       }
     },
     {
@@ -34,7 +34,7 @@
       },
       "hep": {
         "path": "examples/heps/Chino_MOB_FLOOR_1-parsed-data.hep",
-        "sizeBytes": 198168
+        "sizeBytes": 198172
       }
     },
     {
@@ -46,7 +46,7 @@
       },
       "hep": {
         "path": "examples/heps/Dublin_1st_Floor_2018_06_01-parsed-data.hep",
-        "sizeBytes": 1264432
+        "sizeBytes": 1221624
       }
     },
     {
@@ -58,7 +58,7 @@
       },
       "hep": {
         "path": "examples/heps/layers-parsed-data.hep",
-        "sizeBytes": 9452
+        "sizeBytes": 9484
       }
     },
     {
@@ -142,7 +142,7 @@
       },
       "hep": {
         "path": "examples/heps/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
-        "sizeBytes": 266492
+        "sizeBytes": 253472
       }
     },
     {
@@ -154,7 +154,7 @@
       },
       "hep": {
         "path": "examples/heps/stn_arch_kp-ontario_177920237_detached-parsed-data.hep",
-        "sizeBytes": 2475848
+        "sizeBytes": 2475852
       }
     },
     {
@@ -166,7 +166,7 @@
       },
       "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
-        "sizeBytes": 1597616
+        "sizeBytes": 1588552
       }
     },
     {

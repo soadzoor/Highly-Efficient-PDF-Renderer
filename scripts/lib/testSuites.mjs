@@ -13,6 +13,7 @@ export const fastTests = [
   "public-load-cancellation",
   "hep-container",
   "hep-api",
+  "hep-scene-sections",
   "optional-content",
   "retained-page-replay",
   "retained-vector-page",

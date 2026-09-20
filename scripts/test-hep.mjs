@@ -418,7 +418,7 @@ async function run() {
 
     const sourceZipArchive = await HepArchive.loadAsync(sourceZipBytes);
     const sourceManifest = JSON.parse(await sourceZipArchive.file("manifest.json").async("string"));
-    assert.equal(sourceManifest.formatVersion, 7, "new scenes use the v7 HEP schema");
+    assert.equal(sourceManifest.formatVersion, 8, "new scenes use the v8 HEP schema");
     for (const unsupportedVersion of [5, 6, 8]) {
       const incompatibleZip = await HepArchive.loadAsync(sourceZipBytes);
       const incompatibleManifest = {
@@ -1016,7 +1016,7 @@ async function run() {
     });
     const photoOverlayZip = await readZip(photoOverlayZipBlob);
     const photoOverlayManifest = JSON.parse(await photoOverlayZip.file("manifest.json").async("string"));
-    assert.equal(photoOverlayManifest.formatVersion, 7);
+    assert.equal(photoOverlayManifest.formatVersion, 8);
     assert.equal(photoOverlayManifest.scene.gradientCount, 1);
     assert.equal(photoOverlayManifest.scene.gradientFillPathCount, 1);
     assert.equal(photoOverlayManifest.scene.gradientFillSegmentCount, 16);

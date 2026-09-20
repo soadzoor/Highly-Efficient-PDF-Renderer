@@ -48,8 +48,8 @@ assert.doesNotMatch(
 assert.match(mainSource, /\bloadSceneFromHep\b/);
 assert.match(
   zipSource,
-  /const\s+PARSED_DATA_FORMAT_VERSION\s*=\s*7\s*;/,
-  "HEP v7 retains optional content and replay resources as the viewer/export contract"
+  /const\s+PARSED_DATA_FORMAT_VERSION\s*=\s*8\s*;/,
+  "HEP v8 retains optional content and replay resources as the viewer/export contract"
 );
 
 const backendSelect = readSelect(html, "backend-select");

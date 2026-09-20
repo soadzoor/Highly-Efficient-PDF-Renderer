@@ -94,7 +94,16 @@ try {
   const archive = await buildHep(persisted.scene, { encodeRasterImages: false, compression: "store" });
   const restored = await loadSceneFromHep(await archive.arrayBuffer());
   assert.deepEqual(restored.drawRuns, persisted.scene.drawRuns);
-  assert.deepEqual(restored.clipPaths, persisted.scene.clipPaths);
+  // v8 stores clip edges on the shared 1/512 fixed-point grid.
+  assert.equal(restored.clipPaths.length, persisted.scene.clipPaths.length);
+  restored.clipPaths.forEach((clip, index) => {
+    const source = persisted.scene.clipPaths[index];
+    assert.equal(clip.parent, source.parent);
+    assert.equal(clip.fillRule, source.fillRule);
+    assert.equal(clip.edges.length, source.edges.length);
+    clip.edges.forEach((value, offset) => assert(Math.abs(value - source.edges[offset]) <= 1 / 1024,
+      `clip ${index} edge ${offset}: ${value} vs ${source.edges[offset]}`));
+  });
   assertPixelsClose(renderScene(restored, restored.drawRuns ?? defaultVectorDrawRuns(restored)), persisted.pixels,
     "gradient HEP roundtrip");
   console.log(`native vector shadings: ${cases.length} independent Canvas comparisons, limits, ordering and HEP roundtrip passed`);

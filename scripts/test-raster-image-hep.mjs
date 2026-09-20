@@ -208,7 +208,7 @@ try {
   );
   const encodedEntry = encodedManifest.scene.rasterLayers[0];
 
-  assert.equal(encodedManifest.formatVersion, 7);
+  assert.equal(encodedManifest.formatVersion, 8);
   assert.equal(encodedManifest.scene.rasterLayers.length, 1);
   assert.ok(encodedEntry.encoding === "webp" || encodedEntry.encoding === "png");
   assert.equal("textureWidth" in encodedEntry, false);
