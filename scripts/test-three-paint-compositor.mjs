@@ -148,10 +148,10 @@ try {
     const spanHost = makeRenderer(backend);
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 32, 24, () => true);
     const spanDraws = spanHost.draws.filter(draw => draw.ids);
-    assert.deepEqual(spanDraws.map(draw => draw.ids), [[0], [1], [0], [1]],
-      "both paints of the span are drawn, in source order, for the color and shape surfaces");
-    assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 2,
-      "the span costs one host render for color and one for shape, not one per paint");
+    assert.deepEqual(spanDraws.map(draw => draw.ids), [[0], [1]],
+      "both paints of the span are drawn, in source order, for the color surface");
+    assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 1,
+      "the span costs one host render, and without a knockout it renders no shape at all");
     assert.equal(spanDraws[0].call, spanDraws[1].call, "a span's paints share a single render");
     spanCompositor.dispose(); spanStroke.dispose();
 

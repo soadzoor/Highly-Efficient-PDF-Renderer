@@ -70,12 +70,22 @@ try {
   // Source-over is associative, so an uninterrupted Normal-blend span composites
   // once for the whole span instead of once per draw run. The pixel assertions
   // above and below are what prove the batched union stays equivalent.
-  assert.deepEqual(render.spans,[2,2],"a Normal-blend span batches into one color draw and one shape draw");
+  // Adjacent same-kind paints over a contiguous range also reach the adapter as
+  // one range, and without a knockout in the tree the shape pass is never read.
+  assert.deepEqual(render.spans,[1],"a Normal-blend span batches into a single coalesced color draw");
   close(render([g([d(0),d(1)])],[red,{...halfBlue,blendMode:"Multiply"}]),
     compositePdfPixel(compositePdfPixel([0,0,0,0],red.color),halfBlue.color,"Multiply"));
-  assert.deepEqual(render.spans,[1,1,1,1],"a non-Normal blend ends the span and composites on its own");
+  assert.deepEqual(render.spans,[1,1],"a non-Normal blend ends the span and composites on its own");
   render([g([d(0),d(1)],{knockout:true})],[red,halfBlue]);
-  assert.deepEqual(render.spans,[1,1,1,1],"knockout groups keep compositing object by object");
+  assert.deepEqual(render.spans,[1,1,1,1],"knockout groups keep compositing object by object, shape included");
+  // Only a knockout reads geometric shape, so a nested group inside one keeps
+  // rendering its own shape surface while an ordinary tree never pays for it.
+  render([g([g([d(0),d(1)])],{knockout:true})],[red,halfBlue]);
+  assert.deepEqual(render.spans,[1,1],"a group under a knockout still renders its span's shape");
+  // A hidden paint leaves a hole, so the neighbours either side stay separate
+  // ranges inside the same submission instead of merging across the gap.
+  close(render([g([d(0),d(1),d(2)])],[red,{...halfBlue,condition:0},blue],undefined,id=>id!==0),[0,0,1,1]);
+  assert.deepEqual(render.spans,[2],"coalescing never bridges a hidden optional-content paint");
   close(render([g([d(0),d(1)],{knockout:true})],[red,{color:[0,0,0,0],shape:1}]),[1,1,1,1]);
   // A non-isolated group's first Multiply observes the initial gray backdrop.
   close(render([g([d(0)],{isolated:false})],[{...red,blendMode:"Multiply"}],[0.5,0.5,0.5,1]),[0.5,0,0,1]);

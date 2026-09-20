@@ -41,15 +41,24 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
   const blank = (): Surface => { const surface = take(); adapter.clear(surface); return surface; };
   const copy = (source: Surface): Surface => { const surface = take(); adapter.copy(source, surface); return surface; };
   let white: Surface;
-  const draw = (runs: readonly VectorDrawRun[]): PaintResult<Surface> => {
-    const color = blank(), shape = blank();
+  // Geometric shape only reaches a rendered pixel through a knockout group: the
+  // color pass reads it when this group knocks out, and the stats pass folds it
+  // into a coverage channel that nothing but an enclosing knockout ever samples.
+  // Documents without knockout therefore render every span once instead of twice.
+  let emptyShape: Surface | undefined;
+  const draw = (runs: readonly VectorDrawRun[], needsShape: boolean): PaintResult<Surface> => {
+    const color = blank();
     adapter.draw(runs, color, false);
+    if (!needsShape) return { color, shape: (emptyShape ??= blank()) };
+    const shape = blank();
     adapter.draw(runs, shape, true);
     return { color, shape };
   };
 
-  const group = (nodes: readonly ScenePaintNode[], initialBackdrop: Surface, settings: ScenePaintGroup, depth: number): PaintResult<Surface> => {
+  const group = (nodes: readonly ScenePaintNode[], initialBackdrop: Surface, settings: ScenePaintGroup, depth: number,
+    shapeConsumed: boolean): PaintResult<Surface> => {
     if (depth > 64) throw new RangeError("PDF compositor exceeds its group nesting budget.");
+    const needsShape = shapeConsumed || settings.knockout;
     const initial = settings.isolated ? blank() : copy(initialBackdrop);
     let current = copy(initial), stats = blank();
     let nextColor = take(), nextStats = take();
@@ -60,7 +69,8 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
       adapter.pass({ ...operation, operation: 1 }, nextStats);
       [current, nextColor] = [nextColor, current];
       [stats, nextStats] = [nextStats, stats];
-      drop(result.color); drop(result.shape);
+      drop(result.color);
+      if (result.shape !== emptyShape) drop(result.shape);
     };
     // Source-over is associative in color, in accumulated group alpha and in
     // shape coverage alike, so an uninterrupted span of Normal-blend leaves
@@ -69,17 +79,28 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     // one per draw run, which is what stops a single transparency group from
     // dragging every unrelated paint in the document through the compositor.
     let span: VectorDrawRun[] = [];
+    // Adjacent same-kind paints that share a clip and cover a contiguous
+    // primitive range submit identically as one range, so a span reaches the
+    // adapter as a handful of draws rather than one per source paint. Holes
+    // left by hidden optional content break contiguity and stay separate.
+    const extend = (run: VectorDrawRun): void => {
+      const previous = span[span.length - 1];
+      if (previous && previous.kind === run.kind && previous.clipIndex === run.clipIndex &&
+          previous.optionalContent === run.optionalContent && previous.first + previous.count === run.first) {
+        previous.count += run.count;
+      } else span.push({ ...run, blendMode: undefined });
+    };
     const flushSpan = (): void => {
       if (span.length === 0) return;
       const runs = span;
       span = [];
-      paint(draw(runs), 0);
+      paint(draw(runs, needsShape), 0);
     };
     for (const node of nodes) {
       if (!visible(node.optionalContent)) continue;
       if (node.kind === "group") {
         flushSpan();
-        const result = group(node.children, settings.knockout ? initial : current, node, depth + 1);
+        const result = group(node.children, settings.knockout ? initial : current, node, depth + 1, needsShape);
         paint(result, PDF_BLEND_MODES.indexOf(node.blendMode));
       } else {
         const run = node.kind === "draw" ? scene.drawRuns![node.runIndex] :
@@ -89,10 +110,10 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
         if (settings.knockout || run.blendMode) {
           flushSpan();
           for (let i = run.first; i < run.first + run.count; i++) {
-            paint(draw([{ ...run, first: i, count: 1, blendMode: undefined }]),
+            paint(draw([{ ...run, first: i, count: 1, blendMode: undefined }], needsShape),
               PDF_BLEND_MODES.indexOf(run.blendMode ?? "Normal"));
           }
-        } else span.push({ ...run, blendMode: undefined });
+        } else extend(run);
       }
     }
     flushSpan();
@@ -100,15 +121,17 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     if (settings.softMask) {
       const maskInitial = blank();
       const rendered = group(settings.softMask.children, maskInitial,
-        { kind: "group", children: [], alpha: 1, isolated: true, knockout: false, blendMode: "Normal" }, depth + 1);
+        { kind: "group", children: [], alpha: 1, isolated: true, knockout: false, blendMode: "Normal" }, depth + 1, false);
       mask = take();
       adapter.pass({ operation: 4, source: rendered.color, softMask: settings.softMask }, mask);
-      drop(rendered.color); drop(rendered.shape); drop(maskInitial);
+      drop(rendered.color);
+      if (rendered.shape !== emptyShape) drop(rendered.shape);
+      drop(maskInitial);
     }
-    const result = { color: take(), shape: take() };
+    const result = { color: take(), shape: shapeConsumed ? take() : (emptyShape ??= blank()) };
     const extraction = { current, stats, initial, mask, opacity: settings.alpha, alphaIsShape: settings.alphaIsShape };
     adapter.pass({ ...extraction, operation: 2 }, result.color);
-    adapter.pass({ ...extraction, operation: 3 }, result.shape);
+    if (shapeConsumed) adapter.pass({ ...extraction, operation: 3 }, result.shape);
     if (mask !== white) drop(mask);
     for (const surface of [initial, current, stats, nextColor, nextStats]) drop(surface);
     return result;
@@ -118,7 +141,7 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     adapter.clear(white, [1, 1, 1, 1]);
     const settings: ScenePaintGroup = { kind: "group", children: scene.paintGraph?.roots ?? [], alpha: 1,
       isolated: false, knockout: false, blendMode: "Normal" };
-    const source = group(settings.children, backdrop, settings, 0);
+    const source = group(settings.children, backdrop, settings, 0, false);
     const result = take();
     adapter.pass({ operation: 0, source: source.color, shape: source.shape, current: backdrop, initial: backdrop }, result);
     // Transfer only the result's ownership to the caller.

@@ -69,7 +69,14 @@ try {
     "composites encoded before one queue submit must use distinct uniform buffers");
   assert(firstTextures.every(texture => !texture.destroyed),
     "resizing within an encoder cannot destroy textures referenced by earlier commands");
-  assert.deepEqual(draws.map(draw => draw.shapeOnly), [false, true, false, true]);
+  // Geometric shape is only ever sampled through a knockout group, so an
+  // ordinary tree submits its geometry once per composite instead of twice.
+  assert.deepEqual(draws.map(draw => draw.shapeOnly), [false, false]);
+  const knockout = { ...scene, paintGraph: { roots: [{ kind: "group", children: scene.paintGraph.roots,
+    isolated: true, knockout: true, alpha: 1, blendMode: "Normal" }] } };
+  draws.length = 0;
+  compositor.render(knockout, parent, 6, 6, draw, () => true);
+  assert.deepEqual(draws.map(draw => draw.shapeOnly), [false, true], "knockout groups still render their shape");
   assert.deepEqual([...writes.at(-1).values.slice(8, 10)], [6, 6], "final copy explicitly addresses the destination dimensions");
   parent.end(); encoder.finish();
 

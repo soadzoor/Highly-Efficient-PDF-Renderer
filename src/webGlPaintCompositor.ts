@@ -5,11 +5,14 @@ import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 
 interface Surface { texture: WebGLTexture; framebuffer: WebGLFramebuffer }
 
+const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
+
 /** Transient GL surfaces for the shared PDF pass executor. */
 export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface> {
   private readonly gl: WebGL2RenderingContext;
   private readonly onDraw: (() => void) | undefined;
   private readonly program: WebGLProgram;
+  private readonly uniforms: Record<string, WebGLUniformLocation | null>;
   private readonly vao: WebGLVertexArrayObject;
   private readonly zero: WebGLTexture;
   private readonly transfers = new Map<Float32Array, WebGLTexture>();
@@ -33,6 +36,10 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       const reason = gl.getProgramInfoLog(program); gl.deleteProgram(program); throw new Error(`PDF compositor: ${reason}`);
     }
     this.program = program;
+    // Every composite pass binds the same uniforms. Resolving their locations
+    // once keeps a page with hundreds of passes off the synchronous GL queries.
+    this.uniforms = Object.fromEntries(SAMPLER_NAMES.concat(["uTransfer", "uParams", "uExtra", "uMaskBackdrop"])
+      .map(name => [name, gl.getUniformLocation(program, name)]));
     this.vao = gl.createVertexArray()!;
     this.zero = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.zero);
@@ -134,19 +141,18 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     const gl = this.gl;
     this.target(destination); gl.disable(gl.BLEND); gl.useProgram(this.program); gl.bindVertexArray(this.vao);
     const textures = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
-    const names = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
     for (let i = 0; i < textures.length; i++) {
       gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, textures[i]?.texture ?? this.zero);
-      gl.uniform1i(gl.getUniformLocation(this.program, names[i]), i);
+      gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], i);
     }
     const transfer = operation.softMask?.transfer;
     gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, transfer ? this.transferTexture(transfer) : this.zero);
-    gl.uniform1i(gl.getUniformLocation(this.program, "uTransfer"), 6);
-    gl.uniform4f(gl.getUniformLocation(this.program, "uParams"), operation.operation, operation.blendMode ?? 0,
+    gl.uniform1i(this.uniforms.uTransfer, 6);
+    gl.uniform4f(this.uniforms.uParams, operation.operation, operation.blendMode ?? 0,
       operation.knockout ? 1 : 0, operation.opacity ?? 1);
-    gl.uniform4f(gl.getUniformLocation(this.program, "uExtra"), operation.alphaIsShape ? 1 : 0,
+    gl.uniform4f(this.uniforms.uExtra, operation.alphaIsShape ? 1 : 0,
       operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, 0);
-    gl.uniform3fv(gl.getUniformLocation(this.program, "uMaskBackdrop"), operation.softMask?.backdrop ?? [0, 0, 0]);
+    gl.uniform3fv(this.uniforms.uMaskBackdrop, operation.softMask?.backdrop ?? [0, 0, 0]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.onDraw?.();
   }
