@@ -537,6 +537,7 @@ export class NativePdfImageRegistry {
               colorKeyMask,
               colorSpaceIndex,
               this.colors,
+              true,
               signal
             );
             data = converted.data;
@@ -699,6 +700,8 @@ export class NativePdfImageRegistry {
               colorKeyMask,
               colorSpaceIndex,
               this.colors,
+              // applyEmbeddedOpacity writes into an RGBA alpha channel.
+              separated.opacity === null,
               signal
             );
             if (separated.opacity) {
@@ -748,6 +751,7 @@ export class NativePdfImageRegistry {
           colorKeyMask,
           colorSpaceIndex,
           this.colors,
+          true,
           signal
         );
         data = converted.data;
@@ -1238,6 +1242,7 @@ function convertSamplesToSrgb(
   colorKeyMask: readonly number[],
   colorSpaceIndex: number,
   colors: NativePdfColorRegistry,
+  allowGrayOutput: boolean,
   signal?: AbortSignal
 ): { data: Uint8Array; format: number } {
   const color = colors.describe(colorSpaceIndex);
@@ -1245,6 +1250,14 @@ function convertSamplesToSrgb(
   const maximum = (2 ** bitsPerComponent) - 1;
   const sixteenBit = bitsPerComponent === 16;
   const bytesPerComponent = sixteenBit ? 2 : 1;
+  // A DeviceGray byte is already its own sRGB value, so an RGBA8 result repeats
+  // it three times beside a constant alpha. Keeping the single channel leaves a
+  // retained page's serialized image store four times smaller; consumers that
+  // need a texture widen it through expandHeprImageToRgba8.
+  if (bitsPerComponent === 8 && width * height >= 256 && allowGrayOutput &&
+      color.kind === "DeviceGray") {
+    return convertDeviceGraySamplesToSrgb8(samples, width * height, decode, colorKeyMask, signal);
+  }
   const output = allocateBytes(width * height * 4 * bytesPerComponent, "converted image output");
   // Amortize the 256-entry Decode tables; tiny images use the scalar path.
   if (bitsPerComponent === 8 && width * height >= 256 &&
@@ -1290,6 +1303,44 @@ function convertSamplesToSrgb(
   return {
     data: output,
     format: sixteenBit ? HEPR_IMAGE_FORMAT.Rgba16 : HEPR_IMAGE_FORMAT.Rgba8
+  };
+}
+
+/**
+ * One-channel counterpart of convertDeviceSamplesToSrgb8. The Decode table,
+ * clamping and rounding are identical, so widening the result reproduces the
+ * former RGBA8 payload byte for byte. A color-key Mask needs a real alpha
+ * channel and yields GrayAlpha8; without one, coverage is implicit.
+ */
+function convertDeviceGraySamplesToSrgb8(
+  samples: Uint16Array,
+  pixelCount: number,
+  decode: readonly number[],
+  colorKeyMask: readonly number[],
+  signal?: AbortSignal
+): { data: Uint8Array; format: number } {
+  const decoded = new Uint8Array(256);
+  for (let sample = 0; sample < 256; sample += 1) {
+    decoded[sample] = Math.round(clamp01(interpolate(
+      sample / 255, 0, 1, decode[0], decode[1]
+    )) * 255);
+  }
+  const keyed = colorKeyMask.length > 0;
+  const output = allocateBytes(pixelCount * (keyed ? 2 : 1), "converted image output");
+  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
+    if ((pixel & 0xfff) === 0) throwIfAborted(signal);
+    const raw = samples[pixel];
+    if (!keyed) {
+      output[pixel] = decoded[raw];
+      continue;
+    }
+    const offset = pixel * 2;
+    output[offset] = decoded[raw];
+    output[offset + 1] = raw >= colorKeyMask[0] && raw <= colorKeyMask[1] ? 0 : 255;
+  }
+  return {
+    data: output,
+    format: keyed ? HEPR_IMAGE_FORMAT.GrayAlpha8 : HEPR_IMAGE_FORMAT.Gray8
   };
 }
 

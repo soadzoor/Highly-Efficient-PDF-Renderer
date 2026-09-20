@@ -117,6 +117,12 @@ also associates fallback text quads that have no rendered glyph instance.
 The section must have exactly the declared text length and valid condition
 references. Scenes without such associations omit this section.
 
+The char map addresses fallback quads by position, so a page carries exactly one
+quad per fallback character and its declared `fallbackCount` must equal that
+number. Characters that share a glyph, such as the members of a ligature, each
+own a quad holding the same rectangle; a shared quad would leave the two counts
+disagreeing and a reader then discards the whole text index.
+
 Layer tables are limited to 100,000 groups, 1,000,000 condition nodes/operands,
 and nesting depth 64. IDs and references must be valid and unique where required;
 cyclic conditions, invalid draw-run references and malformed text associations
@@ -137,7 +143,16 @@ retained leaf. Repeated/cyclic nodes and nesting beyond 64 are rejected.
 to scene conditions (`-1` means unconditional). A resource is shared by all
 fallback islands that replay that page. Its file is `retained/page-N.bin` and
 contains self-contained retained drawing commands and typed stores, never a PDF
-that must be reparsed. Runtime visibility updates copy only membership bytes and
+that must be reparsed. Its image store keeps each decoded payload in the
+narrowest layout that represents it exactly: a DeviceGray source stays `Gray8`,
+or `GrayAlpha8` when a color-key Mask can make a pixel transparent, and only a
+consumer that uploads a texture widens it to straight RGBA8. A grayscale soft
+mask is therefore stored once rather than as three redundant channels.
+Replay is driven only by an optional-content change, so
+an exporter writes `scene.retainedPages` and its retained paint-graph leaves
+only for a document that has toggleable layers; without them the baked raster
+slots already carry the page, and the section is omitted rather than shipped
+unreachable. Runtime visibility updates copy only membership bytes and
 rebuild affected raster slots before an atomic presentation change. Slots use a
 fixed full-page structural quad, so their canonical identity and picking bounds
 remain valid when previously hidden content becomes visible.

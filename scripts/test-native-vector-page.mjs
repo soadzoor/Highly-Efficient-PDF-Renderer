@@ -246,6 +246,46 @@ try {
     "only a masked image allocates compatibility pixels"
   );
 
+  // A DeviceGray source is stored as Gray8/GrayAlpha8, so both a grayscale base
+  // and a grayscale soft mask must widen to exactly the RGBA8 result above.
+  const grayColors = {
+    describe(index) { return { componentCount: index === 1 ? 1 : 3 }; },
+    convertToSrgb(index, components) { return components; }
+  };
+  const grayMaskedScene = buildNativeVectorPage({
+    ...input,
+    imageRegistry: {
+      size: 2,
+      describe(index) {
+        if (index === 0) return softMaskedBase;
+        if (index === 1) return { ...softMask, format: 1, data: new Uint8Array([128]) };
+        throw new RangeError(`missing image ${index}`);
+      },
+      colors: grayColors
+    }
+  });
+  assert.deepEqual(
+    [...grayMaskedScene.rasterLayers[0].data],
+    [255, 128, 64, 100],
+    "a Gray8 soft mask samples the same coverage as its RGBA8 equivalent"
+  );
+  const grayBaseScene = buildNativeVectorPage({
+    ...input,
+    imageRegistry: {
+      size: 1,
+      describe(index) {
+        if (index === 0) return { ...imageRegistry.describe(0), colorSpaceIndex: 1, format: 1, data: new Uint8Array([200]) };
+        throw new RangeError(`missing image ${index}`);
+      },
+      colors: grayColors
+    }
+  });
+  assert.deepEqual(
+    [...grayBaseScene.rasterLayers[0].data],
+    [200, 200, 200, 255],
+    "a Gray8 underlay widens to an opaque straight-RGBA raster layer"
+  );
+
   const disjointLateImageScene = buildNativeVectorPage({
     ...input,
     compiled: {

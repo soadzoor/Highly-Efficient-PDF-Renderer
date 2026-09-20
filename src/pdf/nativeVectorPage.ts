@@ -10,7 +10,7 @@ import type {
   RasterLayer,
   VectorScene
 } from "../pdfVectorExtractor";
-import { HEPR_IMAGE_FORMAT } from "../heprDocumentData";
+import { HEPR_IMAGE_FORMAT, expandHeprImageToRgba8, heprRawImageBytesPerPixel } from "../heprDocumentData";
 import {
   DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
   DENSE_PDF_VECTOR_SCENE_EVENT_STROKE,
@@ -1682,19 +1682,20 @@ function buildRasterLayers(
     }
     const image = registry.describe(imageIndex);
     let imageData: Uint8Array;
-    if (image.softMaskImageIndex >= 0) {
-      compositedImages ??= new Map<number, Uint8Array>();
-      imageData = compositedImages.get(imageIndex) ?? compositeVectorSoftMaskedImage(
-        registry,
-        image,
-        imageIndex,
-        pageIndex,
-        signal
-      );
-      compositedImages.set(imageIndex, imageData);
+    compositedImages ??= new Map<number, Uint8Array>();
+    const prepared = compositedImages.get(imageIndex);
+    if (prepared) {
+      imageData = prepared;
     } else {
-      validateVectorImage(image, imageIndex, pageIndex, false);
-      imageData = image.data;
+      if (image.softMaskImageIndex >= 0) {
+        imageData = compositeVectorSoftMaskedImage(registry, image, imageIndex, pageIndex, signal);
+      } else {
+        validateVectorImage(image, imageIndex, pageIndex, false);
+        // A scene raster layer is straight RGBA8; a grayscale payload widens once.
+        imageData = expandHeprImageToRgba8(image.data, image.format, image.width, image.height, signal) ??
+          invalidImageFormat(image, imageIndex, pageIndex);
+      }
+      compositedImages.set(imageIndex, imageData);
     }
     const transformOffset = invocation * 6;
     const transform = sidecar.imageTransforms.subarray(transformOffset, transformOffset + 6);
@@ -1969,14 +1970,18 @@ function validateVectorImage(
   pageIndex: number,
   allowSoftMask: boolean
 ): void {
-  const expectedBytes = image.width * image.height * 4;
+  // The registry has already unpacked source samples into a raw layout: RGBA8,
+  // or one of the grayscale layouts a DeviceGray source keeps at rest.
+  const rawBytesPerPixel = image.format === HEPR_IMAGE_FORMAT.Rgba8 ||
+      image.format === HEPR_IMAGE_FORMAT.Gray8 || image.format === HEPR_IMAGE_FORMAT.GrayAlpha8
+    ? heprRawImageBytesPerPixel(image.format)
+    : 0;
+  const expectedBytes = image.width * image.height * rawBytesPerPixel;
   if (
     !Number.isSafeInteger(image.width) || image.width <= 0 ||
     !Number.isSafeInteger(image.height) || image.height <= 0 ||
-    !Number.isSafeInteger(expectedBytes) ||
+    rawBytesPerPixel === 0 || !Number.isSafeInteger(expectedBytes) ||
     !(image.data instanceof Uint8Array) || image.data.length !== expectedBytes ||
-    // The registry has already expanded packed source samples to RGBA8.
-    image.format !== HEPR_IMAGE_FORMAT.Rgba8 ||
     image.imageMask || image.codecRequest !== null ||
     (allowSoftMask
       ? image.softMaskImageIndex < 0 || image.maskKind !== "soft"
@@ -1984,28 +1989,36 @@ function validateVectorImage(
         (image.maskKind !== "none" && image.maskKind !== "color-key") ||
         image.matte.length !== 0)
   ) {
-    throw new PdfError(
-      "unsupported-image",
-      `Image ${imageIndex} is not a directly renderable RGBA8 underlay.`,
-      {
-        pageIndex,
-        details: {
-          reason: "legacy-vector-image-format",
-          imageIndex,
-          width: image.width,
-          height: image.height,
-          sourceBitsPerComponent: image.sourceBitsPerComponent,
-          format: image.format,
-          interpolate: image.interpolate,
-          imageMask: image.imageMask,
-          softMaskImageIndex: image.softMaskImageIndex,
-          maskKind: image.maskKind,
-          matteComponents: image.matte.length,
-          pendingCodec: image.codecRequest?.codec ?? null
-        }
-      }
-    );
+    invalidImageFormat(image, imageIndex, pageIndex);
   }
+}
+
+function invalidImageFormat(
+  image: Readonly<NativePdfImageDescription>,
+  imageIndex: number,
+  pageIndex: number
+): never {
+  throw new PdfError(
+    "unsupported-image",
+    `Image ${imageIndex} is not a directly renderable RGBA8 underlay.`,
+    {
+      pageIndex,
+      details: {
+        reason: "legacy-vector-image-format",
+        imageIndex,
+        width: image.width,
+        height: image.height,
+        sourceBitsPerComponent: image.sourceBitsPerComponent,
+        format: image.format,
+        interpolate: image.interpolate,
+        imageMask: image.imageMask,
+        softMaskImageIndex: image.softMaskImageIndex,
+        maskKind: image.maskKind,
+        matteComponents: image.matte.length,
+        pendingCodec: image.codecRequest?.codec ?? null
+      }
+    }
+  );
 }
 
 /**
@@ -2047,8 +2060,11 @@ function compositeVectorSoftMaskedImage(
     matteRgb = [clampUnit(converted[0]), clampUnit(converted[1]), clampUnit(converted[2])];
   }
 
-  const output = new Uint8Array(image.data.length);
-  output.set(image.data);
+  // Composite in place over a private straight-RGBA8 copy of the base image.
+  const widened = expandHeprImageToRgba8(image.data, image.format, image.width, image.height, signal) ??
+    invalidImageFormat(image, imageIndex, pageIndex);
+  const output = widened === image.data ? new Uint8Array(image.data) : widened;
+  const maskStride = heprRawImageBytesPerPixel(mask.format);
   const pixelCount = image.width * image.height;
   for (let pixel = 0; pixel < pixelCount; pixel += 1) {
     if ((pixel & 0x3fff) === 0) throwIfAborted(signal);
@@ -2056,6 +2072,7 @@ function compositeVectorSoftMaskedImage(
     const y = Math.floor(pixel / image.width);
     const factor = sampleVectorImageMask(
       mask,
+      maskStride,
       x,
       y,
       image.width,
@@ -2082,6 +2099,7 @@ function compositeVectorSoftMaskedImage(
 
 function sampleVectorImageMask(
   image: Readonly<NativePdfImageDescription>,
+  stride: number,
   x: number,
   y: number,
   targetWidth: number,
@@ -2091,7 +2109,7 @@ function sampleVectorImageMask(
   if (!interpolate) {
     const sourceX = Math.min(image.width - 1, Math.floor((x + 0.5) * image.width / targetWidth));
     const sourceY = Math.min(image.height - 1, Math.floor((y + 0.5) * image.height / targetHeight));
-    return vectorImageMaskPixel(image, sourceX, sourceY);
+    return vectorImageMaskPixel(image, stride, sourceX, sourceY);
   }
   const sourceX = (x + 0.5) * image.width / targetWidth - 0.5;
   const sourceY = (y + 0.5) * image.height / targetHeight - 0.5;
@@ -2103,20 +2121,23 @@ function sampleVectorImageMask(
   const y1 = Math.min(image.height - 1, y0 + 1);
   const tx = clampUnit(sourceX - floorX);
   const ty = clampUnit(sourceY - floorY);
-  const top = vectorImageMaskPixel(image, x0, y0) * (1 - tx) +
-    vectorImageMaskPixel(image, x1, y0) * tx;
-  const bottom = vectorImageMaskPixel(image, x0, y1) * (1 - tx) +
-    vectorImageMaskPixel(image, x1, y1) * tx;
+  const top = vectorImageMaskPixel(image, stride, x0, y0) * (1 - tx) +
+    vectorImageMaskPixel(image, stride, x1, y0) * tx;
+  const bottom = vectorImageMaskPixel(image, stride, x0, y1) * (1 - tx) +
+    vectorImageMaskPixel(image, stride, x1, y1) * tx;
   return top * (1 - ty) + bottom * ty;
 }
 
 function vectorImageMaskPixel(
   image: Readonly<NativePdfImageDescription>,
+  stride: number,
   x: number,
   y: number
 ): number {
-  const offset = (y * image.width + x) * 4;
-  return image.data[offset] / 255 * (image.data[offset + 3] / 255);
+  const offset = (y * image.width + x) * stride;
+  // Alpha is the payload's last channel; a Gray8 mask carries none and is opaque.
+  const alpha = stride === 1 ? 255 : image.data[offset + stride - 1];
+  return image.data[offset] / 255 * (alpha / 255);
 }
 
 function clampInteger(value: number, minimum: number, maximum: number): number {

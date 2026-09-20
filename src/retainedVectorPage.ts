@@ -1,5 +1,5 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { HEPR_COLOR_SPACE_KIND, HEPR_IMAGE_FORMAT, HEPR_PAINT_KIND, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
+import { HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
   type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionState } from "./heprDisplayExecutor";
 import { visitHeprPath } from "./heprPathGeometry";
@@ -60,6 +60,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     (indices, inputs) => indices.flatMap(index => [...functions.evaluate(index, inputs, { signal })]), signal);
   const gradients: GradientSceneData[] = [];
   const imagePixels = new Map<number, Uint8Array>();
+  const glyphAtlas = new Map<string, number>();
   let gradientSegments = 0, meshVertices = 0, meshIndices = 0;
   let count = 0, coordinates = 0, cells = 0, lastYield = performance.now();
   const fail = (message: string): never => { throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason: "vector-retained-program" } }); };
@@ -180,12 +181,36 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     fillsA.push(first, g.a.length / 4, g.bounds.minX, g.bounds.minY); fillsB.push(g.bounds.maxX, g.bounds.maxY, rgba[0], rgba[1]); fillsC.push(rule, 0, rgba[2], rgba[3]);
     appendRun("fill", index, 1, clip, condition);
   };
-  const text = (g: Geometry, rgba: Color, clip: DensePdfTextClip | null, condition?: number): void => {
-    if (!g.a.length) return; budget(g.a.length + g.b.length);
-    const index = textA.length / 4, first = glyphA.length / 4;
-    append(glyphA, g.a); append(glyphB, g.b);
-    glyphMetaA.push(first, g.a.length / 4, g.bounds.minX, g.bounds.minY); glyphMetaB.push(g.bounds.maxX, g.bounds.maxY, 0, 0);
-    textA.push(1, 0, 0, 1); textB.push(0, 0, index, 0); textC.push(...rgba);
+  /**
+   * Glyph outlines are shared. An atlas entry holds the outline with its 2x2
+   * applied but no placement; the instance carries the translation, so a
+   * repeated glyph costs one instance instead of another copy of its curves.
+   * Baking placement into the outline would give every drawn glyph its own
+   * entry, which `optimizeVectorSceneTextGlyphs` cannot merge because the
+   * coordinates differ. The 2x2 stays in the key so cubic flattening keeps the
+   * absolute tolerance it already resolved at, never a font-unit scale.
+   */
+  const text = (glyph: number, indices: readonly number[], placement: PdfMatrix, rgba: Color,
+    clip: DensePdfTextClip | null, condition?: number): void => {
+    const { fontIndices, glyphIds } = page.stores.glyphs;
+    const [a, b, c, d, e, f] = placement;
+    const key = `${fontIndices[glyph]}:${glyphIds[glyph]}:${a}:${b}:${c}:${d}`;
+    let atlas = glyphAtlas.get(key);
+    if (atlas === undefined) {
+      const g = geometry(indices, [a, b, c, d, 0, 0]);
+      if (!g.a.length) { glyphAtlas.set(key, -1); return; }
+      budget(g.a.length + g.b.length);
+      atlas = glyphMetaA.length / 4;
+      const first = glyphA.length / 4;
+      append(glyphA, g.a); append(glyphB, g.b);
+      glyphMetaA.push(first, g.a.length / 4, g.bounds.minX, g.bounds.minY); glyphMetaB.push(g.bounds.maxX, g.bounds.maxY, 0, 0);
+      glyphAtlas.set(key, atlas);
+    } else {
+      if (atlas < 0) return;
+      budget(0);
+    }
+    const index = textA.length / 4;
+    textA.push(1, 0, 0, 1); textB.push(e, f, atlas, 0); textC.push(...rgba);
     appendRun("text", index, 1, clip, condition);
   };
   const strokeGeometry = (indices: readonly number[], matrix: PdfMatrix, style: number): Geometry | null => {
@@ -347,7 +372,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       for (let glyph = command.first; glyph < command.first + command.count; glyph++) {
         glyphConditions[glyph] = condition ?? -1;
         const indices = glyphPaths(glyph), local = multiplyHeprMatrices(matrix, transform(page.stores.glyphs.transformIndices[glyph]));
-        if ([0, 2, 4, 6].includes(command.renderingMode) && command.fillPaintIndex >= 0) text(geometry(indices, local), color(command.fillPaintIndex, execution.state), clip, condition);
+        if ([0, 2, 4, 6].includes(command.renderingMode) && command.fillPaintIndex >= 0) text(glyph, indices, local, color(command.fillPaintIndex, execution.state), clip, condition);
         if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) strokePath(indices, local, command.strokeStyleIndex, color(command.strokePaintIndex, execution.state), clip, condition);
       }
     } else if (command.source === "gradients") {
@@ -355,9 +380,15 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     } else if (command.source === "images") {
       const images = page.stores.images;
       for (let index = command.first; index < command.first + command.count; index++) {
-        if (images.formats[index] !== HEPR_IMAGE_FORMAT.Rgba8 || images.imageMask[index] || images.softMaskImageIndices[index] >= 0 || images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("image requires mask or codec preparation.");
+        if (images.imageMask[index] || images.softMaskImageIndices[index] >= 0 || images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("image requires mask or codec preparation.");
         let data = imagePixels.get(index);
-        if (!data) { data = images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]); imagePixels.set(index, data); }
+        if (!data) {
+          // Raster layers are straight RGBA8; a grayscale store widens once here.
+          const expanded = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]),
+            images.formats[index], images.widths[index], images.heights[index], signal);
+          if (!expanded) return fail("image requires mask or codec preparation.");
+          data = expanded; imagePixels.set(index, data);
+        }
         const first = scene.rasterLayers.length; budget(6);
         scene.rasterLayers.push({ width: images.widths[index], height: images.heights[index], data, matrix: Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1])), paintOrder: first, pageIndex: 0 });
         appendRun("raster", first, 1, clip, condition);

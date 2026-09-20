@@ -35,23 +35,35 @@ export function buildNativeFallbackTextIndex(page: HeprPageData, signal: AbortSi
   const index = page.textIndex;
   const references = new Int32Array(index.charGlyphIndices.length);
   const { fonts, glyphs, transforms, paths } = page.stores;
+  // One quad per referencing character, never one per glyph. A ligature's
+  // characters share a single glyph, but the char map addresses fallback quads
+  // by position, so a shared quad leaves fewer quads than fallback characters
+  // and a reader discards the whole text index.
   // Typed slots keep the extra search geometry bounded by the existing glyph
   // limit, without a large JS number array or per-glyph Map allocation.
   const converted = new Int32Array(glyphs.glyphIds.length);
   let count = 0;
   for (let i = 0; i < index.charGlyphIndices.length; i += 1) {
     if ((i & 1023) === 0) signal.throwIfAborted();
-    const glyph = index.charGlyphIndices[i];
-    if (glyph >= 0 && converted[glyph] === 0) converted[glyph] = ++count;
+    if (index.charGlyphIndices[i] >= 0) count += 1;
   }
   const quads = new Float32Array(index.fallbackQuads.length + count * 4);
   quads.set(index.fallbackQuads);
+  let nextQuad = index.fallbackQuads.length / 4;
   for (let i = 0; i < references.length; i += 1) {
     if ((i & 1023) === 0) signal.throwIfAborted();
     const glyph = index.charGlyphIndices[i];
     if (glyph < 0) { references[i] = glyph; continue; }
-    const slot = converted[glyph];
-    if (slot < 0) { references[i] = slot; continue; }
+    const known = converted[glyph];
+    if (known < 0) {
+      // A repeat of an already measured glyph copies its rectangle into its own
+      // slot, keeping one quad per character.
+      const source = (-known - 2) * 4;
+      const repeat = nextQuad++;
+      quads.copyWithin(repeat * 4, source, source + 4);
+      references[i] = -repeat - 2;
+      continue;
+    }
     const font = glyphs.fontIndices[glyph];
     let low = fonts.glyphOffsets[font];
     let high = fonts.glyphOffsets[font + 1];
@@ -81,7 +93,7 @@ export function buildNativeFallbackTextIndex(page: HeprPageData, signal: AbortSi
       a * maxX + c * minY + e, a * maxX + c * maxY + e];
     const ys = [b * minX + d * minY + f, b * minX + d * maxY + f,
       b * maxX + d * minY + f, b * maxX + d * maxY + f];
-    const quadIndex = index.fallbackQuads.length / 4 + slot - 1;
+    const quadIndex = nextQuad++;
     const reference = -quadIndex - 2;
     quads.set([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)], quadIndex * 4);
     converted[glyph] = reference;

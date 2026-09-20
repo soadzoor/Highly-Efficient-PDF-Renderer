@@ -20,7 +20,7 @@ const {
   unpackImageSamples,
   unpackNativeImageCodecRequest
 } = await import("../src/pdf/nativeImage.ts");
-const { createEmptyHeprPageData, HEPR_IMAGE_FORMAT } = await import("../src/heprDocumentData.ts");
+const { createEmptyHeprPageData, HEPR_IMAGE_FORMAT, expandHeprImageToRgba8 } = await import("../src/heprDocumentData.ts");
 const { validateHeprPageData } = await import("../src/heprDocumentDataValidation.ts");
 
 function ref(objectNumber) {
@@ -257,8 +257,13 @@ try {
           if (transparent) transparentCount += 1;
           expected.set([...rgb.map(value => Math.round(value * 255)), transparent ? 0 : 255], pixel * 4);
         }
-        assert.equal(result.format, HEPR_IMAGE_FORMAT.Rgba8);
-        assert.deepEqual(result.data, expected, `${device} byte conversion, Decode=${decode}, Mask=${mask}`);
+        // A DeviceGray source keeps one byte per pixel at rest, plus an alpha
+        // byte only when a color-key Mask can make a pixel transparent.
+        assert.equal(result.format, device !== "DeviceGray" ? HEPR_IMAGE_FORMAT.Rgba8
+          : mask.length ? HEPR_IMAGE_FORMAT.GrayAlpha8 : HEPR_IMAGE_FORMAT.Gray8);
+        // Widening must reproduce the RGBA8 conversion byte for byte.
+        assert.deepEqual(expandHeprImageToRgba8(result.data, result.format, width, height), expected,
+          `${device} byte conversion, Decode=${decode}, Mask=${mask}`);
         assert.deepEqual(samples, snapshot, "color conversion preserves borrowed samples");
         if (mask.length) assert(transparentCount > 0 && transparentCount < width * height);
       }

@@ -200,6 +200,55 @@ export const HEPR_IMAGE_FORMAT = {
   Ccitt: 7
 } as const;
 
+/** Bytes per pixel of a self-contained raw payload; zero for an encoded codec. */
+export function heprRawImageBytesPerPixel(format: number): number {
+  return format === HEPR_IMAGE_FORMAT.Gray8
+    ? 1
+    : format === HEPR_IMAGE_FORMAT.GrayAlpha8
+      ? 2
+      : format === HEPR_IMAGE_FORMAT.Rgba8
+        ? 4
+        : format === HEPR_IMAGE_FORMAT.Rgba16
+          ? 8
+          : 0;
+}
+
+/**
+ * Widen a raw grayscale payload to the straight RGBA8 layout renderers upload
+ * as a texture. A one-component source keeps its own byte per pixel at rest,
+ * because a retained page serializes this store verbatim and an RGBA8 copy of
+ * a grayscale soft mask is three redundant channels; only a consumer that needs
+ * a texture pays the widening. An `Rgba8` payload is returned as-is, so a caller
+ * that mutates the result must copy it first. Any other format returns null for
+ * the caller's own fallback.
+ */
+export function expandHeprImageToRgba8(
+  data: Uint8Array,
+  format: number,
+  width: number,
+  height: number,
+  signal?: AbortSignal
+): Uint8Array | null {
+  if (format === HEPR_IMAGE_FORMAT.Gray8 || format === HEPR_IMAGE_FORMAT.GrayAlpha8) {
+    const stride = format === HEPR_IMAGE_FORMAT.GrayAlpha8 ? 2 : 1;
+    const pixelCount = width * height;
+    if (!Number.isSafeInteger(pixelCount) || data.length !== pixelCount * stride) return null;
+    const output = new Uint8Array(pixelCount * 4);
+    for (let pixel = 0; pixel < pixelCount; pixel += 1) {
+      if ((pixel & 0x3fff) === 0) signal?.throwIfAborted();
+      const value = data[pixel * stride];
+      const offset = pixel * 4;
+      output[offset] = value;
+      output[offset + 1] = value;
+      output[offset + 2] = value;
+      output[offset + 3] = stride === 2 ? data[pixel * stride + 1] : 255;
+    }
+    return output;
+  }
+  if (format !== HEPR_IMAGE_FORMAT.Rgba8 || data.length !== width * height * 4) return null;
+  return data;
+}
+
 export const HEPR_MESH_KIND = {
   Triangles: 0,
   TensorPatch: 1,

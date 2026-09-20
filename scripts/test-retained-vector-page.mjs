@@ -134,16 +134,137 @@ try {
     assert.equal(scene.fillPathMetaC[3], 1, "paint alpha applies once to the completed outline");
   }
   {
+    const patternCell = tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 5 5] /XStep 10 /YStep 10 /Resources << >>", "0 0 1 rg 0 0 5 5 re f");
     const session = await openPdf({ kind: "bytes", bytes: fixture("/Pattern cs /P scn 0 0 20 20 re f", "/Pattern << /P 5 0 R >>", [
-      { number: 5, body: tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 5 5] /XStep 10 /YStep 10 /Resources << >>", "0 0 1 rg 0 0 5 5 re f") }
+      { number: 5, body: patternCell }
     ]) });
     try {
       const scene = await session.compileVectorPage(0, { retainedVectorMaxPatternCells: 1 });
-      assert.equal(scene.rasterLayers.length, 1); assert.equal(scene.retainedPages.length, 1);
-      assert.equal(scene.paintGraph.roots[0].kind, "retained");
-      assert.ok(session.getDiagnostics().some(diagnostic => diagnostic.code === "retained-raster-fallback"));
+      assert.equal(scene.rasterLayers.length, 1);
+      // A retained program only ever replays from an optional-content change, so a
+      // document without toggleable layers must not carry one into the scene or a HEP.
+      assert.equal(scene.retainedPages, undefined, "an unreachable replay program is not retained");
+      assert.equal(scene.paintGraph, undefined, "the baked raster slot needs no retained paint graph");
+      assert.ok(session.getDiagnostics().some(diagnostic =>
+        diagnostic.code === "retained-raster-fallback" && diagnostic.details.replayable === false));
       await assert.rejects(session.compileVectorPage(0, { retainedVectorMaxPatternCells: 1, vectorFallback: "error" }), error => error.details?.reason === "vector-expansion-limit");
       await assert.rejects(session.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }), error => error.code === "resource-limit" && error.details?.reason !== "vector-expansion-limit");
+    } finally { await session.close(); }
+    const layered = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /OCProperties 10 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P 5 0 R >> /Properties << /A 11 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", "/OC /A BDC /Pattern cs /P scn 0 0 20 20 re f EMC") },
+      { number: 5, body: patternCell },
+      { number: 10, body: "<< /OCGs [11 0 R] /D << >> >>" },
+      { number: 11, body: "<< /Type /OCG /Name (Fill) >>" }
+    ] }) });
+    try {
+      const scene = await layered.compileVectorPage(0, { retainedVectorMaxPatternCells: 1 });
+      assert.equal(scene.rasterLayers.length, 1); assert.equal(scene.retainedPages.length, 1);
+      assert.equal(scene.paintGraph.roots[0].kind, "retained");
+      assert.ok(layered.getDiagnostics().some(diagnostic =>
+        diagnostic.code === "retained-raster-fallback" && diagnostic.details.replayable === true));
+    } finally { await layered.close(); }
+  }
+  {
+    const { HEPR_IMAGE_FORMAT } = await import("../src/heprDocumentData.ts");
+    const size = 32;
+    const gray = Uint8Array.from({ length: size * size }, (_, index) => (index * 7 + 13) & 255);
+    const rgb = Uint8Array.from({ length: size * size * 3 }, (_, index) => (index * 37) & 255);
+    const image = (extra, bytes) => tinyPdfStream(
+      `/Type /XObject /Subtype /Image /Width ${size} /Height ${size} /BitsPerComponent 8 ${extra}`, bytes);
+    const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /XObject << /G 5 0 R /C 6 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", "q 90 0 0 90 5 5 cm /G Do Q\nq 90 0 0 90 100 5 cm /C Do Q") },
+      { number: 5, body: image("/ColorSpace /DeviceGray", gray) },
+      { number: 6, body: image("/ColorSpace /DeviceRGB", rgb) }
+    ] }) });
+    try {
+      const page = await session.compilePage(0, {});
+      const images = page.stores.images;
+      // A DeviceGray source keeps one byte per pixel in the store a retained
+      // page serializes; only the scene's raster layer is straight RGBA8.
+      assert.deepEqual([...images.formats], [HEPR_IMAGE_FORMAT.Gray8, HEPR_IMAGE_FORMAT.Rgba8]);
+      assert.equal(images.dataOffsets[1] - images.dataOffsets[0], size * size);
+      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      assert.equal(scene.rasterLayers.length, 2);
+      for (const layer of scene.rasterLayers) assert.equal(layer.data.length, size * size * 4);
+      const widened = scene.rasterLayers[0].data;
+      assert.deepEqual([...widened], [...gray].flatMap(value => [value, value, value, 255]),
+        "a Gray8 store widens to the straight RGBA8 a renderer uploads");
+    } finally { await session.close(); }
+  }
+  {
+    const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
+    const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>" },
+      // Two distinct glyphs, twelve placements, plus one run at a second size.
+      { number: 4, body: tinyPdfStream("", [
+          "BT /F 12 Tf 1 0 0 1 10 60 Tm (ABABABABAB) Tj ET",
+          "BT /F 24 Tf 1 0 0 1 10 20 Tm (AB) Tj ET"
+        ].join("\n")) },
+      { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /FirstChar 65 /LastChar 66 /Widths [500 600] /Encoding /WinAnsiEncoding >>" }
+    ] }) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-glyph-atlas-v1" }) });
+    try {
+      const page = await session.compilePage(0, {});
+      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      assert.equal(scene.textInstanceCount, 12, "every drawn glyph keeps its own instance");
+      // Outlines are shared per (font, glyph, 2x2), so two letters at two sizes
+      // need four atlas entries, not one per placement.
+      assert.equal(scene.textGlyphCount, 4, "repeated glyphs reuse one atlas outline");
+      const glyphOf = i => Math.trunc(scene.textInstanceB[i * 4 + 2]);
+      assert.equal(glyphOf(0), glyphOf(2), "the same letter at the same size shares an entry");
+      assert.notEqual(glyphOf(0), glyphOf(1), "different letters keep separate entries");
+      assert.notEqual(glyphOf(0), glyphOf(10), "a second size does not reuse the smaller outline");
+      // Placement must live on the instance, not be baked into the outline.
+      assert.notEqual(scene.textInstanceB[0], scene.textInstanceB[2 * 4],
+        "repeated glyphs advance through the instance origin");
+      for (let i = 0; i < scene.textInstanceCount; i += 1) {
+        assert.deepEqual([...scene.textInstanceA.subarray(i * 4, i * 4 + 4)], [1, 0, 0, 1],
+          "the 2x2 is resolved into the shared outline");
+      }
+    } finally { await session.close(); }
+  }
+  {
+    const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
+    // One glyph, three characters: the "ffi" ligature case. Each character must
+    // own a fallback quad, because the exported char map addresses quads by
+    // position and a reader drops the whole index when the counts disagree.
+    const toUnicode = tinyPdfStream("", [
+      "/CIDInit /ProcSet findresource begin 12 dict begin begincmap",
+      "1 begincodespacerange <00> <FF> endcodespacerange",
+      "1 beginbfchar <41> <006600660069> endbfchar",
+      "endcmap end end"
+    ].join("\n"));
+    const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", "BT /F 24 Tf 1 0 0 1 10 40 Tm (AB) Tj ET") },
+      { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /FirstChar 65 /LastChar 66 /Widths [500 600] /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>" },
+      { number: 6, body: toUnicode }
+    ] }) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-ligature-v1" }) });
+    try {
+      const page = await session.compilePage(0, {});
+      const shared = page.textIndex.charGlyphIndices;
+      assert.equal(page.textIndex.text, "ffiB", "the ToUnicode ligature expands to three characters");
+      assert.equal(shared[0], shared[1], "a ligature's characters share one glyph");
+      assert.equal(shared[1], shared[2], "a ligature's characters share one glyph");
+      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      const index = scene.textIndex.pages[0];
+      const fallbacks = [...index.charInstance].filter(value => value <= -2);
+      assert.equal(fallbacks.length, index.fallbackQuads.length / 4,
+        "every fallback character owns exactly one quad");
+      const quadOf = i => [...index.fallbackQuads.subarray((-index.charInstance[i] - 2) * 4, (-index.charInstance[i] - 2) * 4 + 4)];
+      assert.notEqual(index.charInstance[0], index.charInstance[1], "each character gets its own slot");
+      assert.deepEqual(quadOf(0), quadOf(1), "the ligature's characters keep the same rectangle");
+      assert.deepEqual(quadOf(1), quadOf(2), "the ligature's characters keep the same rectangle");
+      assert.notDeepEqual(quadOf(0), quadOf(3), "a different glyph keeps its own rectangle");
     } finally { await session.close(); }
   }
   console.log("Retained vector page tests passed.");

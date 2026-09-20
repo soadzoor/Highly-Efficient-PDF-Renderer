@@ -390,6 +390,21 @@ export async function parsePdf(
   }
 }
 
+/**
+ * A retained page program exists only so PDF layer toggles can replay a raster
+ * slot: `RetainedPageReplay` re-renders a span when an optional-content
+ * snapshot changes its visibility bytes. Without toggleable conditions every
+ * `optionalContentConditions` entry is `-1`, the visibility map can never
+ * differ, and the retained page — including its decoded image store — is
+ * unreachable weight in an exported HEP.
+ */
+function retainedReplayIsReachable(
+  optionalContent: VectorScene["optionalContent"],
+  page: HeprPageData
+): boolean {
+  return optionalContent !== undefined && page.stores.optionalContent.defaultVisible.length > 0;
+}
+
 class NativePdfSession implements NativeVectorPdfSession {
   readonly info: Readonly<PdfDocumentInfo>;
 
@@ -1015,7 +1030,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       const scene = buildScene(compositeRasterLayers);
       if (compositeTextIndex) scene.textIndex = compositeTextIndex;
       if (compositeRasterLayers.length > 0) {
-        if (retainedCompositePage) {
+        if (retainedCompositePage && retainedReplayIsReachable(scene.optionalContent, retainedCompositePage)) {
           const page = retainedCompositePage;
           scene.retainedPages = [{ page,
             optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
@@ -1073,13 +1088,17 @@ class NativePdfSession implements NativeVectorPdfSession {
     scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }];
     scene.optionalContent = options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined;
     if (scene.optionalContent && scene.textIndex) scene.optionalContent = await attachRetainedTextOptionalContent(page, scene.textIndex, scene.optionalContent, signal);
-    scene.retainedPages = [{ page,
-      optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
-      matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
-    scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count: commandCount, rasterIndex: 0 }] };
+    if (retainedReplayIsReachable(scene.optionalContent, page)) {
+      scene.retainedPages = [{ page,
+        optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
+        matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
+      scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count: commandCount, rasterIndex: 0 }] };
+    }
     this.appendDiagnostics([{ code: "retained-raster-fallback", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
-      message: "This paint program uses replayable raster rendering; PDF layer toggles remain available, with reduced drawing geometry.",
-      details: { reason: reason.message } }]);
+      message: scene.retainedPages
+        ? "This paint program uses replayable raster rendering; PDF layer toggles remain available, with reduced drawing geometry."
+        : "This paint program uses raster rendering, with reduced drawing geometry. This document has no toggleable layers, so no replay program is retained.",
+      details: { reason: reason.message, replayable: scene.retainedPages !== undefined } }]);
     return scene;
   }
 
@@ -1129,11 +1148,13 @@ class NativePdfSession implements NativeVectorPdfSession {
       if (count) {
         scene.optionalContent = options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined;
         if (scene.optionalContent && scene.textIndex) scene.optionalContent = await attachRetainedTextOptionalContent(page, scene.textIndex, scene.optionalContent, signal);
-        scene.retainedPages = [{ page,
-          optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
-          matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
-        scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }];
-        scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count, rasterIndex: 0 }] };
+        if (retainedReplayIsReachable(scene.optionalContent, page)) {
+          scene.retainedPages = [{ page,
+            optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
+            matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
+          scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }];
+          scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count, rasterIndex: 0 }] };
+        }
       }
       onDiagnostic({ code: "page-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
         message: "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable.",
