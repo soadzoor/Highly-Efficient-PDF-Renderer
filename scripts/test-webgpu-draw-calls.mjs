@@ -112,6 +112,25 @@ try {
     renderer.vectorLodLevelResources = [{ bindGroup: {} }, { bindGroup: {} }, { bindGroup: {} }];
     assert.equal(frame(), 9, "each visible LOD batch adds one call, and empty batches add none");
   }
+  {
+    // Minified pages hold the paint scheduler's coverage margin. Every path
+    // that reports stats forwards that, because neighbour order is relaxed.
+    const { renderer } = create();
+    let report;
+    renderer.setFrameListener(stats => { report = stats; });
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, false, "an exact schedule reports exact paint order");
+    renderer.orderedBatches = { paintOrderApproximated: true, culledSegmentCount: 0 };
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, true, "a held margin reaches the frame listener");
+    renderer.shouldUseVectorMinifyPath = () => true;
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, true, "including a minified composite");
+    renderer.shouldUsePanCache = () => true;
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, true, "and a cached frame");
+  }
+
   console.log("WebGPU draw calls: direct, ordered, culled, multiply, raster strips, gradients, LOD, minify, pan cache, highlights, compositing and empty frames passed.");
 } finally {
   for (const [key, value] of Object.entries(globals)) {

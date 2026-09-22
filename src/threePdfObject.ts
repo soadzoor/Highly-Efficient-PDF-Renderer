@@ -1290,6 +1290,17 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   /**
+   * Whether the active pipeline is holding the paint scheduler's coverage
+   * margin. Every paint is still drawn; on a thumbnail-sized page, paints
+   * within a fraction of a pixel of each other may swap to bound draw calls.
+   */
+  isPaintOrderApproximated(): boolean {
+    return this.materialPipelineActive
+      ? this.drawPlan?.paintOrderApproximated ?? false
+      : this.lastNativeDrawStats?.paintOrderApproximated ?? false;
+  }
+
+  /**
    * Return the most recent native renderer draw stats, or `null` before the
    * first native frame.
    */

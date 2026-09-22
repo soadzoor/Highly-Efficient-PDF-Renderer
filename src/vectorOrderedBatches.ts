@@ -37,6 +37,8 @@ export class VectorOrderedBatches {
   instanceCount = 0;
   /** Visible strokes omitted temporarily; canonical scene counts never change. */
   culledSegmentCount = 0;
+  /** True while minification relaxes paint order between sub-pixel neighbours. */
+  get paintOrderApproximated(): boolean { return this.scheduler?.paintOrderApproximated ?? false; }
   private readonly runtime: VectorStrokeLodRuntime | null;
   private readonly runIndices = new Map<VectorDrawRun, number>();
   private readonly rankToId: Uint32Array;

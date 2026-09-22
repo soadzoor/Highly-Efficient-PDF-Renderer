@@ -358,8 +358,11 @@ function onRendererFrame(stats: DrawStats): void {
   const textLodSuffix = textLodStats ? ` | text: ${textLodStats}` : "";
   const redundancySuffix = stats.redundantSegments
     ? ` | redundant strokes omitted: ${stats.redundantSegments.toLocaleString()}` : "";
+  // Minified pages hold the paint scheduler's coverage margin, which bounds the
+  // draw count by letting sub-pixel neighbours swap order.
+  const paintOrderSuffix = stats.paintOrderApproximated ? " | paint order: held" : "";
   runtimeTextElement.textContent =
-    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}${redundancySuffix}`;
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}${redundancySuffix}${paintOrderSuffix}`;
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {

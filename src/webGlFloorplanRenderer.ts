@@ -1397,6 +1397,14 @@ export interface DrawStats {
   /** Redundant visible strokes temporarily omitted; separate from extraction-time removals. */
   redundantSegments?: number;
 
+  /**
+   * Whether minification is holding the paint scheduler's coverage margin at
+   * its page-relative bound. Every paint is still drawn; paints within a
+   * fraction of a pixel of each other may swap order to keep the draw count
+   * bounded on a thumbnail-sized page.
+   */
+  paintOrderApproximated?: boolean;
+
   /** Whether renderer-side culling reduced the frame workload. */
   usedCulling: boolean;
 
@@ -2442,6 +2450,7 @@ export class WebGlFloorplanRenderer {
       renderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: 1 / localUnitsPerPixel
     };
@@ -3528,6 +3537,7 @@ export class WebGlFloorplanRenderer {
       renderedSegments: instanceCount,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
     };
@@ -3535,6 +3545,11 @@ export class WebGlFloorplanRenderer {
 
   private getRedundantSegmentCount(): number {
     return this.strokeRenderingEnabled ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
+  }
+
+  /** Paint order is relaxed only while the scheduler holds its coverage margin. */
+  private isPaintOrderApproximated(): boolean {
+    return this.orderedBatches?.paintOrderApproximated ?? false;
   }
 
   private hasOrdinaryVectorContent(): boolean {
@@ -3806,6 +3821,7 @@ export class WebGlFloorplanRenderer {
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     };

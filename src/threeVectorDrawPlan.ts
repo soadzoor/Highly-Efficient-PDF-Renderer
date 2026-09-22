@@ -45,6 +45,9 @@ export class ThreeVectorDrawPlan {
   /** Submission position of each canonical run, for `renderOrder` assignment. */
   get positions(): Int32Array { return this.positionOfRun; }
 
+  /** True while minification holds the scheduler's coverage margin. */
+  get paintOrderApproximated(): boolean { return this.scheduler?.paintOrderApproximated ?? false; }
+
   /** Temporary primitive colors invalidate the source-color commutation proof. */
   setColorCommutationEnabled(enabled: boolean): boolean {
     if (!this.scheduler?.setColorCommutationEnabled(enabled)) return false;

@@ -126,6 +126,8 @@ try {
   // A pixel scale coarse enough to make every paint overlap leaves the schedule
   // far less room to reorder, so it always produces a different set of batches.
   assert.equal(plan.update(100), true, "a coarse pixel scale replans the submission order");
+  assert.equal(plan.paintOrderApproximated, false,
+    "a scene this small keeps exact margins: holding them would win back no draws");
   for (const layer of Object.values(layers)) refresh(layer);
   assert.ok(totalMeshes(layers) > batchedMeshes, "overlapping paints must batch less aggressively");
   for (const geometry of replaced) {

@@ -46,6 +46,25 @@ try {
   frame(10); // Two pages, fill, stroke, two text ranges, and four overlay batches.
   frame(10); // Counts describe the current frame, rather than accumulating.
   assert.equal(frames.at(-1).renderedSegments, 100, "instances remain separate from draw calls");
+
+  // Minified pages hold the paint scheduler's coverage margin. Every path that
+  // reports stats forwards that, because order between neighbours is relaxed.
+  assert.equal(frames.at(-1).paintOrderApproximated, false, "an exact schedule reports exact paint order");
+  renderer.orderedBatches = { paintOrderApproximated: true, culledSegmentCount: 0 };
+  frame(10);
+  assert.equal(frames.at(-1).paintOrderApproximated, true, "a held margin reaches the frame listener");
+  renderer.shouldUsePanCache = () => true;
+  draws.length = 0;
+  renderer.renderExternalFrame();
+  assert.equal(frames.at(-1).paintOrderApproximated, true, "including a cached frame");
+  renderer.shouldUsePanCache = () => false;
+  draws.length = 0;
+  assert.equal(renderer.renderProjectedFrame({ viewportWidth: 100, viewportHeight: 100, localUnitsPerPixel: 1,
+    localToClip: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }).paintOrderApproximated, true,
+    "and a projected one");
+  renderer.orderedBatches = null;
+  renderer.panCacheValid = false;
+  frame(10);
   renderer.textRenderingEnabled = false;
   frame(8);
   renderer.textRenderingEnabled = true;

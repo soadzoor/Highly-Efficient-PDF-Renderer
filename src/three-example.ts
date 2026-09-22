@@ -1696,8 +1696,11 @@ function updateDrawStatsMeter(): void {
   const textPart = textStats && textStats.total > 0
     ? ` | ${textStats.rendered.toLocaleString()}/${textStats.total.toLocaleString()} text (${textStats.mode})`
     : "";
+  // Minified pages hold the paint scheduler's coverage margin, which bounds the
+  // draw count by letting sub-pixel neighbours swap order.
+  const paintOrderPart = currentPdfObject.isPaintOrderApproximated() ? " | paint order: held" : "";
   setDrawStatsText(
-    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments${textPart} | mode: ${mode}`
+    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments${textPart} | mode: ${mode}${paintOrderPart}`
   );
 }
 

@@ -3776,6 +3776,7 @@ export class WebGpuFloorplanRenderer {
         renderedSegments,
         totalSegments: this.segmentCount,
         redundantSegments: this.getRedundantSegmentCount(),
+        paintOrderApproximated: this.isPaintOrderApproximated(),
         usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
         zoom: this.zoom
       });
@@ -3806,6 +3807,7 @@ export class WebGpuFloorplanRenderer {
       renderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
     });
@@ -3813,6 +3815,11 @@ export class WebGpuFloorplanRenderer {
 
   private getRedundantSegmentCount(): number {
     return this.strokeRenderingEnabled ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
+  }
+
+  /** Paint order is relaxed only while the scheduler holds its coverage margin. */
+  private isPaintOrderApproximated(): boolean {
+    return this.orderedBatches?.paintOrderApproximated ?? false;
   }
 
   private hasOrdinaryVectorContent(): boolean {
@@ -4001,6 +4008,7 @@ export class WebGpuFloorplanRenderer {
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     });
