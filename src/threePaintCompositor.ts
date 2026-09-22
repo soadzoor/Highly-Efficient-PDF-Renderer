@@ -50,6 +50,9 @@ interface ProxyEntry {
   partialIds?: THREE.InstancedBufferAttribute;
 }
 
+/** Index of the soft-mask input in the shared composite binding order. */
+const MASK_BINDING = 5;
+
 const FULLSCREEN_VERTEX = `precision highp float;
 in vec3 position;
 void main() { gl_Position=vec4(position.xy,0.0,1.0); }`;
@@ -117,6 +120,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private paintSelection: Uint8Array | null = null;
   private readonly transfers = new Map<Float32Array, THREE.DataTexture>();
   private readonly zero: THREE.DataTexture;
+  // An absent soft mask must read as fully opaque, unlike every other input,
+  // whose neutral value is transparent black.
+  private readonly one: THREE.DataTexture;
   private readonly presentZero: THREE.DataTexture;
   private readonly bindings: TextureBinding[] = [];
   private readonly params = new THREE.Vector4();
@@ -149,6 +155,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.zero = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
     this.zero.needsUpdate = true;
     this.stampBindingVersion(this.zero);
+    this.one = new THREE.DataTexture(Uint8Array.of(255, 255, 255, 255), 1, 1, THREE.RGBAFormat);
+    this.one.needsUpdate = true;
+    this.stampBindingVersion(this.one);
     // Three decides at shader-generation time whether a sampled texture is
     // filterable, and it reads that from whatever the node holds then. A
     // DataTexture defaults to nearest on both filters, which compiled the
@@ -345,11 +354,14 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   }
   pass(operation: PdfCompositeOperation<THREE.RenderTarget>, destination: THREE.RenderTarget): void {
     const sources = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
-    for (let index = 0; index < sources.length; index++) this.bindings[index].value = sources[index]?.texture ?? this.zero;
+    for (let index = 0; index < sources.length; index++) {
+      this.bindings[index].value = sources[index]?.texture ?? (index === MASK_BINDING ? this.one : this.zero);
+    }
     const transfer = operation.softMask?.transfer;
     this.bindings[6].value = transfer ? this.transferTexture(transfer) : this.zero;
     this.params.set(operation.operation, operation.blendMode ?? 0, operation.knockout ? 1 : 0, operation.opacity ?? 1);
-    this.extra.set(operation.alphaIsShape ? 1 : 0, operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, 0);
+    this.extra.set(operation.alphaIsShape ? 1 : 0, operation.softMask?.subtype === "Luminosity" ? 1 : 0,
+      transfer?.length ?? 0, operation.isolated ? 1 : 0);
     this.backdropColor.fromArray(operation.softMask?.backdrop ?? [0, 0, 0]);
     this.target(destination); this.internalScene.add(this.passMesh);
     try {
@@ -363,7 +375,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.proxies.clear();
     this.runsByKind.clear();
     for (const texture of this.transfers.values()) texture.dispose();
-    this.transfers.clear(); this.zero.dispose(); this.presentZero.dispose(); this.geometry.dispose(); this.passMaterial.dispose(); this.mesh.material.dispose();
+    this.transfers.clear(); this.zero.dispose(); this.one.dispose(); this.presentZero.dispose(); this.geometry.dispose(); this.passMaterial.dispose(); this.mesh.material.dispose();
     this.mesh.removeFromParent();
   }
   /**

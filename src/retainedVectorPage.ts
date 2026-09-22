@@ -31,6 +31,29 @@ export interface RetainedVectorPageOptions {
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
+/**
+ * Folds an image's /SMask into its alpha, in place, over straight RGBA8.
+ *
+ * The mask's gray samples are the image's alpha, and the two are independent
+ * rasters that need not share a size, so the mask is point-sampled across the
+ * base's grid. Any alpha the base already carries is kept: the two multiply,
+ * as a mask and a source-alpha do when both apply.
+ */
+function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
+  mask: Uint8Array, maskWidth: number, maskHeight: number, signal?: AbortSignal): Uint8Array {
+  if (maskWidth <= 0 || maskHeight <= 0 || width <= 0 || height <= 0) return base;
+  for (let y = 0; y < height; y++) {
+    signal?.throwIfAborted();
+    const row = Math.min(maskHeight - 1, Math.floor(y * maskHeight / height)) * maskWidth;
+    for (let x = 0; x < width; x++) {
+      const column = Math.min(maskWidth - 1, Math.floor(x * maskWidth / width));
+      const offset = (y * width + x) * 4;
+      base[offset + 3] = Math.round(base[offset + 3] * mask[(row + column) * 4] / 255);
+    }
+  }
+  return base;
+}
+
 /** Lower self-contained reusable PDF programs into canonical geometry and a retained paint graph. */
 export async function lowerRetainedPageToVectorScene(source: HeprPageData, options: RetainedVectorPageOptions): Promise<VectorScene> {
   const { signal } = options;
@@ -53,6 +76,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const endpoints: number[] = [], primitiveMeta: number[] = [], primitiveBounds: number[] = [], styles: number[] = [];
   const clipBuilder = new NativeVectorClipBuilder(), clipCache = new WeakMap<HeprExecutionClipScope, DensePdfTextClip>();
   const glyphConditions = new Int32Array(page.stores.glyphs.glyphIds.length).fill(-1);
+  let reportedGlyphStrokeComplexity = false;
   const stack: ScenePaintNode[][] = [scene.paintGraph.roots];
   const masks = new WeakMap<HeprPageData, Map<number, { children: ScenePaintNode[]; backdrop?: [number, number, number] }>>();
   const functions = new HeprFunctionEvaluator(page.stores.functions);
@@ -213,14 +237,38 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     textA.push(1, 0, 0, 1); textB.push(e, f, atlas, 0); textC.push(...rgba);
     appendRun("text", index, 1, clip, condition);
   };
-  const strokeGeometry = (indices: readonly number[], matrix: PdfMatrix, style: number): Geometry | null => {
+  /**
+   * `omittable` says the shape survives without this outline, because a fill
+   * paints it too. Only then may an outline too intricate to build be left out;
+   * a shape that has nothing else would simply vanish, so its page falls back
+   * to a bounded raster instead, where the ink is at least still there.
+   */
+  const strokeGeometry = (indices: readonly number[], matrix: PdfMatrix, style: number,
+    omittable = false): Geometry | null => {
     const strokes = page.stores.strokes;
-    const g = buildNativeGlyphStroke(pathCommands(indices), matrix, { transform: matrix, width: strokes.lineWidths[style], lineCap: strokes.lineCaps[style] as 0 | 1 | 2,
-      lineJoin: strokes.lineJoins[style] as 0 | 1 | 2, miterLimit: strokes.miterLimits[style], dashArray: Array.from(strokes.dashValues.subarray(strokes.dashOffsets[style], strokes.dashOffsets[style + 1])), dashPhase: strokes.dashPhases[style] }, signal);
+    let g;
+    try {
+      g = buildNativeGlyphStroke(pathCommands(indices), matrix, { transform: matrix, width: strokes.lineWidths[style], lineCap: strokes.lineCaps[style] as 0 | 1 | 2,
+        lineJoin: strokes.lineJoins[style] as 0 | 1 | 2, miterLimit: strokes.miterLimits[style], dashArray: Array.from(strokes.dashValues.subarray(strokes.dashOffsets[style], strokes.dashOffsets[style + 1])), dashPhase: strokes.dashPhases[style] }, signal);
+    } catch (error) {
+      // One glyph too intricate to outline must not cost the page its vectors:
+      // everything else stays resolution independent and this outline is left
+      // out, reported once rather than for each glyph sharing the shape.
+      if (!omittable || !(error instanceof PdfError) ||
+        error.details?.reason !== "native-glyph-stroke-complexity") throw error;
+      if (!reportedGlyphStrokeComplexity) {
+        reportedGlyphStrokeComplexity = true;
+        options.onDiagnostic?.({ code: "glyph-stroke-complexity", severity: "warning",
+          message: "A glyph outline was too intricate to stroke and is omitted; the rest of the page stays vector.",
+          details: { reason: "native-glyph-stroke-complexity" } });
+      }
+      return null;
+    }
     return g ? { a: g.segmentsA, b: g.segmentsB, bounds: g.bounds } : null;
   };
-  const strokePath = (indices: readonly number[], matrix: PdfMatrix, style: number, rgba: Color, clip: DensePdfTextClip | null, condition?: number): void => {
-    const g = strokeGeometry(indices, matrix, style);
+  const strokePath = (indices: readonly number[], matrix: PdfMatrix, style: number, rgba: Color,
+    clip: DensePdfTextClip | null, condition?: number, omittable = false): void => {
+    const g = strokeGeometry(indices, matrix, style, omittable);
     if (g) fill(g, rgba, 0, clip, condition);
   };
   const gradient = async (index: number, matrix: PdfMatrix, alpha: number, clip: DensePdfTextClip | null,
@@ -373,21 +421,42 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         glyphConditions[glyph] = condition ?? -1;
         const indices = glyphPaths(glyph), local = multiplyHeprMatrices(matrix, transform(page.stores.glyphs.transformIndices[glyph]));
         if ([0, 2, 4, 6].includes(command.renderingMode) && command.fillPaintIndex >= 0) text(glyph, indices, local, color(command.fillPaintIndex, execution.state), clip, condition);
-        if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) strokePath(indices, local, command.strokeStyleIndex, color(command.strokePaintIndex, execution.state), clip, condition);
+        // Modes 2 and 6 fill the glyph as well, so its shape survives an
+        // outline this renderer cannot build; modes 1 and 5 have only the stroke.
+        if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) {
+          strokePath(indices, local, command.strokeStyleIndex, color(command.strokePaintIndex, execution.state),
+            clip, condition, command.renderingMode === 2 || command.renderingMode === 6);
+        }
       }
     } else if (command.source === "gradients") {
       for (let index = command.first; index < command.first + command.count; index++) await gradient(index, matrix, 1, clip, condition);
     } else if (command.source === "images") {
       const images = page.stores.images;
       for (let index = command.first; index < command.first + command.count; index++) {
-        if (images.imageMask[index] || images.softMaskImageIndices[index] >= 0 || images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("image requires mask or codec preparation.");
+        // Each of these needs a different preparation, and which one it is
+        // decides whether a page keeps its vectors, so name them apart.
+        // Each of these needs a different preparation, and which one it is
+        // decides whether a page keeps its vectors, so name them apart.
+        if (images.imageMask[index]) return fail("a stencil image mask requires preparation.");
+        if (images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("a pre-multiplied image matte requires preparation.");
         let data = imagePixels.get(index);
         if (!data) {
           // Raster layers are straight RGBA8; a grayscale store widens once here.
           const expanded = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]),
             images.formats[index], images.widths[index], images.heights[index], signal);
-          if (!expanded) return fail("image requires mask or codec preparation.");
-          data = expanded; imagePixels.set(index, data);
+          if (!expanded) return fail(`an image stored as format ${images.formats[index]} requires a codec.`);
+          const maskIndex = images.softMaskImageIndices[index];
+          if (maskIndex < 0) data = expanded;
+          else {
+            const mask = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[maskIndex], images.dataOffsets[maskIndex + 1]),
+              images.formats[maskIndex], images.widths[maskIndex], images.heights[maskIndex], signal);
+            if (!mask) return fail(`an image soft mask stored as format ${images.formats[maskIndex]} requires a codec.`);
+            // An Rgba8 store widens to itself, so the alpha is written into a
+            // copy rather than back into the page's own image bytes.
+            data = applyHeprImageSoftMask(Uint8Array.from(expanded), images.widths[index], images.heights[index],
+              mask, images.widths[maskIndex], images.heights[maskIndex], signal);
+          }
+          imagePixels.set(index, data);
         }
         const first = scene.rasterLayers.length; budget(6);
         scene.rasterLayers.push({ width: images.widths[index], height: images.heights[index], data, matrix: Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1])), paintOrder: first, pageIndex: 0 });

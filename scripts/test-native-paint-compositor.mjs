@@ -107,10 +107,10 @@ try {
   const live = new Set(), adapter = {
     acquire() { const surface = {}; live.add(surface); return surface; },
     release(surface) { assert(live.delete(surface)); },
-    clear() { throw new Error("clear failed"); }
+    copy() { throw new Error("copy failed"); }
   };
-  assert.throws(() => compositeScenePaintGraph(scene, adapter, {}, () => true), /clear failed/);
-  assert.equal(live.size, 0, "failure initializing the white mask surface must also clean up");
+  assert.throws(() => compositeScenePaintGraph(scene, adapter, {}, () => true), /copy failed/);
+  assert.equal(live.size, 0, "failure initializing the root accumulation surface must also clean up");
   let deleted = false;
   const partial = Object.create(WebGlPaintCompositor.prototype);
   Object.assign(partial, { pool: [], all: new Set(), width: 1, height: 1,

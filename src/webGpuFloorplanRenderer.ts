@@ -7,6 +7,8 @@ import { GRADIENT_MESH_WGSL, GRADIENT_MESH_VERTEX_LAYOUT } from "./gradientMeshS
 import { pdfShapeCoverageWgsl } from "./pdfShapeCoverage";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
+import { scenePaintSpanSegments } from "./scenePaintGraph";
+import { buildCanonicalRunLookup, submitPaintSpan, type CanonicalRunLookup } from "./scenePaintSpanDraws";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import { coalescePrimitiveColorTexels, NativePrimitiveColors, WebGpuPrimitiveGradientColors } from "./nativePrimitiveColors";
 import { WebGpuPrimitiveHighlights } from "./nativePrimitiveHighlights";
@@ -1646,11 +1648,17 @@ export class WebGpuFloorplanRenderer {
   private vectorClipBindGroups: any[] = [];
   private vectorClipIndex = -1;
   private orderedBatches: VectorOrderedBatches | null = null;
+  /** Per kind, canonical run indices sorted by their first primitive. */
+  private runLookup: CanonicalRunLookup | null = null;
   private orderedInstanceBuffer: any = null;
   private scene: VectorScene | null = null;
   private readonly rasterLayerUpdates = new Map<number, RasterLayer>();
   private paintCompositor: WebGpuPaintCompositor | null = null;
   private paintViewportWidth = 1;
+  /** Camera the paint pass was encoded with, for projecting composite rectangles. */
+  private paintCameraCenterX = 0;
+  private paintCameraCenterY = 0;
+  private paintZoom = 1;
   private paintViewportHeight = 1;
   private optionalContentVisibility: OptionalContentSnapshot | null = null;
   private scenePaintVisibility: ScenePaintVisibility | null = null;
@@ -3379,6 +3387,7 @@ export class WebGpuFloorplanRenderer {
     this.orderedInstanceBuffer?.destroy();
     this.orderedInstanceBuffer = null;
     this.orderedBatches = null;
+    this.runLookup = null;
     this.vectorClipTexture?.destroy();
     for (const buffer of this.vectorClipBuffers) buffer.destroy();
     this.vectorClipBuffers = [];
@@ -3803,8 +3812,7 @@ export class WebGpuFloorplanRenderer {
   }
 
   private getRedundantSegmentCount(): number {
-    return this.strokeRenderingEnabled && !this.scenePaintVisibility?.requiresCompositing
-      ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
+    return this.strokeRenderingEnabled ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
   }
 
   private hasOrdinaryVectorContent(): boolean {
@@ -4158,7 +4166,9 @@ export class WebGpuFloorplanRenderer {
     paintVisibility.setVisibility(visibility);
     const runs = paintVisibility.select(candidates);
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
-    const plan = paintVisibility.requiresCompositing ? null : this.orderedBatches;
+    // Paints reorder only within a compositor span, so the ordered instance
+    // plan is valid with or without transparency groups.
+    const plan = this.orderedBatches;
     const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     if (plan && rebuilt && plan.instanceCount > 0) {
@@ -4213,16 +4223,22 @@ export class WebGpuFloorplanRenderer {
         () => { this.frameDrawCalls += 1; });
       const parentPass = pass;
       try {
+        const segments = scenePaintSpanSegments(this.scene!);
         this.paintCompositor.render(this.scene!, parentPass, this.paintViewportWidth, this.paintViewportHeight,
-          (run, target, shapeOnly) => {
+          (spanRuns, target, shapeOnly) => {
             pass = shapeOnly ? new Proxy(target, { get: (object, key) => key === "setPipeline"
               ? (pipeline: any) => object.setPipeline(this.getPaintShapePipeline(pipeline))
               : typeof object[key] === "function" ? object[key].bind(object) : object[key] }) : target;
             const previous = strokes;
-            draw(run);
+            submitPaintSpan(spanRuns, plan, segments, this.runLookup, run => draw(run));
             if (shapeOnly) strokes = previous;
           }, condition => condition === undefined || visibility?.conditions[condition] === 1,
-          this.orderedRunCuller?.selected ?? null);
+          this.orderedRunCuller?.selected ?? null, bounds => ({
+            x: (bounds.minX - this.paintCameraCenterX) * this.paintZoom + this.paintViewportWidth / 2,
+            y: (bounds.minY - this.paintCameraCenterY) * this.paintZoom + this.paintViewportHeight / 2,
+            width: (bounds.maxX - bounds.minX) * this.paintZoom,
+            height: (bounds.maxY - bounds.minY) * this.paintZoom
+          }));
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
@@ -4325,6 +4341,7 @@ export class WebGpuFloorplanRenderer {
       );
     }
     this.paintViewportWidth = viewportWidth; this.paintViewportHeight = viewportHeight;
+    this.paintCameraCenterX = cameraCenterX; this.paintCameraCenterY = cameraCenterY; this.paintZoom = zoomValue;
     const data = new Float32Array(CAMERA_UNIFORM_FLOATS);
     data[0] = viewportWidth;
     data[1] = viewportHeight;
@@ -4746,6 +4763,7 @@ export class WebGpuFloorplanRenderer {
       this.vectorLodRuntime = null;
     }
     this.vectorLodStats = null;
+    this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&

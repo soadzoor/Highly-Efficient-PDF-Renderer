@@ -1,27 +1,36 @@
-import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
-import { compositeScenePaintGraph, type PdfCompositeOperation, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
+import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOperation,
+  type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
 import { PDF_COMPOSITE_FRAGMENT_GLSL, PDF_COMPOSITE_VERTEX_GLSL } from "./pdfCompositeShaders";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 
 interface Surface { texture: WebGLTexture; framebuffer: WebGLFramebuffer }
 
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
+// An absent soft mask must read as fully opaque, unlike every other input,
+// whose neutral value is transparent black.
+const MASK_SAMPLER = SAMPLER_NAMES.indexOf("uMask");
 
 /** Transient GL surfaces for the shared PDF pass executor. */
 export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface> {
+  readonly blendsPasses = true;
   private readonly gl: WebGL2RenderingContext;
   private readonly onDraw: (() => void) | undefined;
   private readonly program: WebGLProgram;
   private readonly uniforms: Record<string, WebGLUniformLocation | null>;
   private readonly vao: WebGLVertexArrayObject;
   private readonly zero: WebGLTexture;
+  private readonly one: WebGLTexture;
   private readonly transfers = new Map<Float32Array, WebGLTexture>();
   private readonly pool: Surface[] = [];
   private readonly all = new Set<Surface>();
   private width = 0;
   private height = 0;
   private approximationReported = false;
-  private drawRun: ((run: VectorDrawRun, shapeOnly: boolean) => void) | null = null;
+  private drawSpan: ((runs: readonly VectorDrawRun[], shapeOnly: boolean) => void) | null = null;
+  private project: PdfCompositeProjector | null = null;
+  private viewportWidth = 0;
+  private viewportHeight = 0;
 
   constructor(gl: WebGL2RenderingContext, onDraw?: () => void) {
     this.gl = gl;
@@ -41,15 +50,20 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     this.uniforms = Object.fromEntries(SAMPLER_NAMES.concat(["uTransfer", "uParams", "uExtra", "uMaskBackdrop"])
       .map(name => [name, gl.getUniformLocation(program, name)]));
     this.vao = gl.createVertexArray()!;
-    this.zero = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this.zero);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    this.zero = this.constant(new Uint8Array(4));
+    this.one = this.constant(Uint8Array.of(255, 255, 255, 255));
   }
 
-  render(scene: VectorScene, width: number, height: number, draw: (run: VectorDrawRun, shapeOnly: boolean) => void,
-    visible: (condition?: number) => boolean, selected: Uint8Array | null = null): void {
+  /**
+   * `draw` receives a whole span at a time. Every paint in one reaches the same
+   * surface with no composite pass between them, so a caller may batch and
+   * reorder within a span and may cache GL state across it; neither holds
+   * between spans.
+   */
+  render(scene: VectorScene, width: number, height: number,
+    draw: (runs: readonly VectorDrawRun[], shapeOnly: boolean) => void,
+    visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
+    project: PdfCompositeProjector | null = null): void {
     const gl = this.gl;
     const size = choosePdfCompositeResolution(scene, width, height);
     if (size.scale < 1 && !this.approximationReported) {
@@ -67,7 +81,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     const blendSrcRgb = gl.getParameter(gl.BLEND_SRC_RGB), blendDstRgb = gl.getParameter(gl.BLEND_DST_RGB);
     const blendSrcAlpha = gl.getParameter(gl.BLEND_SRC_ALPHA), blendDstAlpha = gl.getParameter(gl.BLEND_DST_ALPHA);
     const blendRgb = gl.getParameter(gl.BLEND_EQUATION_RGB), blendAlpha = gl.getParameter(gl.BLEND_EQUATION_ALPHA);
-    this.drawRun = draw;
+    this.drawSpan = draw;
+    this.project = project; this.viewportWidth = width; this.viewportHeight = height;
     let backdrop: Surface | null = null, result: Surface | null = null;
     try {
       gl.disable(gl.SCISSOR_TEST); gl.disable(gl.DEPTH_TEST);
@@ -84,7 +99,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     } finally {
       if (result) this.release(result);
       if (backdrop) this.release(backdrop);
-      this.drawRun = null;
+      this.drawSpan = null; this.project = null;
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
       gl.clearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
@@ -121,13 +136,25 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     const surface = { texture, framebuffer }; this.all.add(surface); return surface;
   }
   release(surface: Surface): void { this.pool.push(surface); }
-  clear(surface: Surface, color: readonly [number, number, number, number] = [0, 0, 0, 0]): void {
-    const gl = this.gl; this.target(surface); gl.clearColor(...color); gl.clear(gl.COLOR_BUFFER_BIT);
+  clear(surface: Surface, color: readonly [number, number, number, number] = [0, 0, 0, 0], bounds?: Bounds): void {
+    const gl = this.gl; this.target(surface); gl.clearColor(...color);
+    const rect = this.scissor(bounds);
+    if (rect) { gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x, rect.y, rect.width, rect.height); }
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (rect) gl.disable(gl.SCISSOR_TEST);
   }
-  copy(source: Surface, destination: Surface): void {
+  copy(source: Surface, destination: Surface, bounds?: Bounds): void {
     const gl = this.gl;
+    const rect = this.scissor(bounds) ?? { x: 0, y: 0, width: this.width, height: this.height };
+    if (rect.width === 0 || rect.height === 0) return;
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source.framebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destination.framebuffer);
-    gl.blitFramebuffer(0, 0, this.width, this.height, 0, 0, this.width, this.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    // An explicit blit rectangle needs no scissor, and copies nothing else.
+    gl.blitFramebuffer(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height,
+      rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+  }
+  /** Surface pixels an operation may touch, bottom-left origin; null covers it all. */
+  private scissor(bounds: Bounds | undefined): { x: number; y: number; width: number; height: number } | null {
+    return pdfCompositeScissorRect(bounds, this.project, this.viewportWidth, this.viewportHeight, this.width, this.height);
   }
   draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void {
     if (runs.length === 0) return;
@@ -135,14 +162,22 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     // One framebuffer binding and blend setup for the whole span; source order
     // is the call order.
-    for (const run of runs) this.drawRun!(run, shapeOnly);
+    this.drawSpan!(runs, shapeOnly);
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const gl = this.gl;
-    this.target(destination); gl.disable(gl.BLEND); gl.useProgram(this.program); gl.bindVertexArray(this.vao);
+    this.target(destination);
+    if (operation.blend) {
+      // Premultiplied source-over: exactly what operation 0 computes for a
+      // Normal composite, without reading the destination in the shader.
+      gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    } else gl.disable(gl.BLEND);
+    gl.useProgram(this.program); gl.bindVertexArray(this.vao);
     const textures = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
     for (let i = 0; i < textures.length; i++) {
-      gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, textures[i]?.texture ?? this.zero);
+      gl.activeTexture(gl.TEXTURE0 + i);
+      gl.bindTexture(gl.TEXTURE_2D, textures[i]?.texture ?? (i === MASK_SAMPLER ? this.one : this.zero));
       gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], i);
     }
     const transfer = operation.softMask?.transfer;
@@ -151,15 +186,28 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     gl.uniform4f(this.uniforms.uParams, operation.operation, operation.blendMode ?? 0,
       operation.knockout ? 1 : 0, operation.opacity ?? 1);
     gl.uniform4f(this.uniforms.uExtra, operation.alphaIsShape ? 1 : 0,
-      operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, 0);
+      operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, operation.isolated ? 1 : 0);
     gl.uniform3fv(this.uniforms.uMaskBackdrop, operation.softMask?.backdrop ?? [0, 0, 0]);
+    const rect = this.scissor(operation.bounds);
+    if (rect) { gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x, rect.y, rect.width, rect.height); }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (rect) gl.disable(gl.SCISSOR_TEST);
+    if (operation.blend) gl.disable(gl.BLEND);
     this.onDraw?.();
   }
   dispose(): void {
     this.releaseSurfaces();
     for (const texture of this.transfers.values()) this.gl.deleteTexture(texture);
-    this.transfers.clear(); this.gl.deleteTexture(this.zero); this.gl.deleteVertexArray(this.vao); this.gl.deleteProgram(this.program);
+    this.transfers.clear(); this.gl.deleteTexture(this.zero); this.gl.deleteTexture(this.one);
+    this.gl.deleteVertexArray(this.vao); this.gl.deleteProgram(this.program);
+  }
+  private constant(pixel: Uint8Array): WebGLTexture {
+    const gl = this.gl, texture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return texture;
   }
   private target(surface: Surface): void { this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, surface.framebuffer); this.gl.viewport(0, 0, this.width, this.height); }
   private releaseSurfaces(): void {

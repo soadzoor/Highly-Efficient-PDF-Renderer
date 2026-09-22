@@ -50,6 +50,10 @@ vec4 samplePdfGradient(int index, vec2 scenePoint) {
 
 export const GRADIENT_FILL_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+// GLSL ES defaults int to highp in a vertex shader and mediump in a
+// fragment one, so a uniform both stages declare must say which. Texel
+// indices into the segment stores also outrun mediump's 16-bit range.
+precision highp int;
 precision highp sampler2D;
 
 uniform sampler2D uPathMetaTexA;
@@ -57,6 +61,11 @@ uniform sampler2D uPathMetaTexB;
 uniform sampler2D uPathMetaTexC;
 uniform sampler2D uPaintMetaTex;
 uniform ivec2 uPathMetaTexSize;
+// The band index rides in the segment store after the segments, costing no
+// sampler unit of its own. A negative base means there is none.
+uniform sampler2D uSegmentTexA;
+uniform ivec2 uSegmentTexSize;
+uniform int uBandBase;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -65,6 +74,8 @@ uniform mat4 uLocalToClip;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
+/** (first band texel, band count, first band's y, band height); zero count scans linearly. */
+flat out vec4 vBands;
 flat out int vSourceGradientIndex;
 flat out int vMaskGradientIndex;
 flat out vec3 vSolidColor;
@@ -99,6 +110,7 @@ void main() {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
     vSegmentCount = 0;
+    vBands = vec4(0.0);
     vSourceGradientIndex = -1;
     vMaskGradientIndex = -1;
     vSolidColor = vec3(0.0);
@@ -120,6 +132,8 @@ void main() {
 
   vSegmentStart = int(metaA.x + 0.5);
   vSegmentCount = segmentCount;
+  vBands = uBandBase < 0 ? vec4(0.0)
+    : texelFetch(uSegmentTexA, coordFromIndex(uBandBase + pathIndex, uSegmentTexSize), 0);
   vSourceGradientIndex = int(round(paintMeta.x));
   vMaskGradientIndex = int(round(paintMeta.y));
   vSolidColor = vec3(metaB.z, metaB.w, metaC.z);
@@ -132,6 +146,10 @@ void main() {
 
 export const GRADIENT_FILL_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+// GLSL ES defaults int to highp in a vertex shader and mediump in a
+// fragment one, so a uniform both stages declare must say which. Texel
+// indices into the segment stores also outrun mediump's 16-bit range.
+precision highp int;
 precision highp sampler2D;
 
 uniform sampler2D uSegmentTexA;
@@ -140,10 +158,12 @@ uniform ivec2 uSegmentTexSize;
 uniform float uAAScreenPx;
 uniform vec4 uVectorOverride;
 uniform vec4 uPrimitiveOverride;
+uniform int uBandEntries;
 ${GRADIENT_COMMON}
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
+flat in vec4 vBands;
 flat in int vSourceGradientIndex;
 flat in int vMaskGradientIndex;
 flat in vec3 vSolidColor;
@@ -229,24 +249,64 @@ void main() {
   int winding = 0;
   int crossings = 0;
 
-  for (int primitiveIndex = 0; primitiveIndex < vSegmentCount; primitiveIndex += 1) {
-    ivec2 coord = coordFromIndex(vSegmentStart + primitiveIndex, uSegmentTexSize);
-    vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
-    vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);
-    vec2 p0 = primitiveA.xy;
-    vec2 p1 = primitiveA.zw;
-    vec2 p2 = primitiveB.xy;
-    if (primitiveB.z >= 0.5) {
-      minDistance = min(minDistance, distanceToQuadratic(vLocal, p0, p1, p2));
-      vec2 previous = p0;
-      for (int step = 1; step <= QUADRATIC_STEPS; step += 1) {
-        vec2 next = quadraticPoint(p0, p1, p2, float(step) / float(QUADRATIC_STEPS));
-        accumulateCrossing(previous, next, vLocal, winding, crossings);
-        previous = next;
+  float dxLocal = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float dyLocal = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float aaWidth = max(max(dxLocal, dyLocal) * uAAScreenPx, 1e-4);
+
+  int bandCount = int(vBands.y);
+  // Only a segment reaching this row can cross its ray, and only one within the
+  // antialiasing radius can still change coverage. Crossings are counted in the
+  // row's own band, where every segment that can cross it is listed, so a
+  // segment held by a neighbouring band too is not counted twice.
+  int firstBand = 0;
+  int lastBand = 0;
+  int rowBand = 0;
+  if (bandCount > 0) {
+    float searchRadius = vFillHasCompanionStroke >= 0.5 ? 0.0 : aaWidth;
+    float bandHeight = vBands.w;
+    rowBand = clamp(int(floor((vLocal.y - vBands.z) / bandHeight)), 0, bandCount - 1);
+    firstBand = clamp(int(floor((vLocal.y - searchRadius - vBands.z) / bandHeight)), 0, bandCount - 1);
+    lastBand = clamp(int(floor((vLocal.y + searchRadius - vBands.z) / bandHeight)), 0, bandCount - 1);
+  }
+
+  for (int band = firstBand; band <= lastBand; band += 1) {
+    int count = vSegmentCount;
+    int entry = 0;
+    bool counts = true;
+    if (bandCount > 0) {
+      vec4 range = texelFetch(uSegmentTexA, coordFromIndex(int(vBands.x) + band, uSegmentTexSize), 0);
+      entry = int(range.x);
+      count = int(range.y);
+      counts = band == rowBand;
+    }
+    for (int primitiveIndex = 0; primitiveIndex < count; primitiveIndex += 1) {
+      int segment = vSegmentStart + primitiveIndex;
+      if (bandCount > 0) {
+        int packedIndex = entry + primitiveIndex;
+        vec4 packed = texelFetch(uSegmentTexA,
+          coordFromIndex(uBandEntries + (packedIndex >> 2), uSegmentTexSize), 0);
+        segment = int(packed[packedIndex & 3]);
       }
-    } else {
-      minDistance = min(minDistance, distanceToLine(vLocal, p0, p2));
-      accumulateCrossing(p0, p2, vLocal, winding, crossings);
+      ivec2 coord = coordFromIndex(segment, uSegmentTexSize);
+      vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
+      vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);
+      vec2 p0 = primitiveA.xy;
+      vec2 p1 = primitiveA.zw;
+      vec2 p2 = primitiveB.xy;
+      if (primitiveB.z >= 0.5) {
+        minDistance = min(minDistance, distanceToQuadratic(vLocal, p0, p1, p2));
+        if (counts) {
+          vec2 previous = p0;
+          for (int step = 1; step <= QUADRATIC_STEPS; step += 1) {
+            vec2 next = quadraticPoint(p0, p1, p2, float(step) / float(QUADRATIC_STEPS));
+            accumulateCrossing(previous, next, vLocal, winding, crossings);
+            previous = next;
+          }
+        }
+      } else {
+        minDistance = min(minDistance, distanceToLine(vLocal, p0, p2));
+        if (counts) accumulateCrossing(p0, p2, vLocal, winding, crossings);
+      }
     }
   }
 
@@ -256,9 +316,6 @@ void main() {
     coverage = inside ? 1.0 : 0.0;
   } else {
     float signedDistance = inside ? -minDistance : minDistance;
-    float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-    float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-    float aaWidth = max(max(dx, dy) * uAAScreenPx, 1e-4);
     coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
   }
 

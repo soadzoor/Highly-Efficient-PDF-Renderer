@@ -44,15 +44,20 @@ export function pdfCompositeFunctions(language: "glsl" | "wgsl"): string {
       return V4((1.0-s.a)*b.rgb+(1.0-b.a)*s.rgb+b.a*s.a*pdfBlend(cb,cs,mode),s.a+b.a*(1.0-s.a));`),
     fn("pdfCompositePass", "V4 source, V4 shape, V4 current, V4 stats, V4 initial, V4 mask, V4 p, V4 q", "V4", `
       ${v("I", "operation", "I(p.x)")}
+      // A group accumulated into a single isolated surface is already its own
+      // extracted layer, so its opacity and soft mask are a uniform scale of
+      // premultiplied color. Applying it here, where the layer is read anyway,
+      // spares that group an extraction pass and a surface of its own.
+      ${v("V4", "src", "source")} if (q.w > 0.5) { src=source*(p.w*mask.r); }
       if (operation == 0) {
         ${v("V4", "backdrop", "current")} if (p.z > 0.5) { backdrop=initial; }
-        ${v("V4", "result", "pdfOver(backdrop,source,I(p.y))")}
+        ${v("V4", "result", "pdfOver(backdrop,src,I(p.y))")}
         if (p.z > 0.5) { result=result+(1.0-shape.a)*(current-initial); }
         return clamp(result,V4(0.0),V4(1.0));
       }
       if (operation == 1) {
-        ${v("F", "previousWeight", "1.0-source.a")} if (p.z > 0.5) { previousWeight=1.0-shape.a; }
-        return V4(source.a+previousWeight*stats.r,shape.a+(1.0-shape.a)*stats.g,0.0,1.0);
+        ${v("F", "previousWeight", "1.0-src.a")} if (p.z > 0.5) { previousWeight=1.0-shape.a; }
+        return V4(src.a+previousWeight*stats.r,shape.a+(1.0-shape.a)*stats.g,0.0,1.0);
       }
       if (operation == 2) {
         ${v("F", "opacity", "p.w*mask.r")}
@@ -62,7 +67,9 @@ export function pdfCompositeFunctions(language: "glsl" | "wgsl"): string {
         ${v("F", "coverage", "stats.g")} if (q.x > 0.5) { coverage=coverage*p.w*mask.r; }
         return V4(coverage);
       }
-      return source;
+      // Operation 6 emits the layer itself, for a destination whose blender
+      // performs the source-over that operation 0 would compute here.
+      return src;
     `)
   ].join("\n");
 }

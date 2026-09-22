@@ -7,7 +7,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 try {
   const { compositePdfPixel, extractPdfGroupPixel, knockoutPdfPixel, pdfMaskValue } = await import("../src/pdfComposite.ts");
-  const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
+  const { compositeScenePaintGraph, pdfCompositeScissorRect } = await import("../src/scenePaintCompositor.ts");
   const { PDF_BLEND_MODES } = await import("../src/scenePaintGraph.ts");
   const { PDF_COMPOSITE_FRAGMENT_GLSL, PDF_COMPOSITE_WGSL } = await import("../src/pdfCompositeShaders.ts");
   const close = (actual, expected, tolerance = 1e-7) => actual.forEach((v, i) => assert(Math.abs(v - expected[i]) <= tolerance,
@@ -25,11 +25,13 @@ try {
     close(actual, [reference[0]*reference[3],reference[1]*reference[3],reference[2]*reference[3],reference[3]], 3/255);
   }
 
+  render.blending = false;
   function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null) {
     const alive = new Set(); let draws=0;
     render.spans=[]; render.passes=0; render.surfaces=0;
-    const zero = [0,0,0,0];
+    const zero = [0,0,0,0], one = [1,1,1,1];
     const adapter = {
+      blendsPasses: render.blending,
       acquire() { render.surfaces++; const s={pixel:[...zero]}; alive.add(s); return s; },
       release(s) { assert(alive.delete(s),"surface released exactly once"); },
       clear(s,c=zero) { s.pixel=[...c]; },
@@ -45,14 +47,20 @@ try {
       pass(op,s) {
         render.passes++;
         const source=op.source?.pixel??zero, shape=op.shape?.pixel??zero, current=op.current?.pixel??zero;
-        const stats=op.stats?.pixel??zero, initial=op.initial?.pixel??zero, mask=op.mask?.pixel??zero;
+        const stats=op.stats?.pixel??zero, initial=op.initial?.pixel??zero, mask=op.mask?.pixel??one;
+        // An isolated group layer is its own extracted layer, so its opacity and
+        // soft mask are a uniform scale of premultiplied color applied on the way in.
+        const src=op.isolated?source.map(v=>v*(op.opacity??1)*mask[0]):source;
         if(op.operation===0) {
-          s.pixel=compositePdfPixel(op.knockout?initial:current,source,PDF_BLEND_MODES[op.blendMode??0]);
+          s.pixel=compositePdfPixel(op.knockout?initial:current,src,PDF_BLEND_MODES[op.blendMode??0]);
           if(op.knockout) s.pixel=knockoutPdfPixel(current,initial,s.pixel,shape[3]);
-        } else if(op.operation===1) s.pixel=[source[3]+(1-(op.knockout?shape[3]:source[3]))*stats[0],shape[3]+(1-shape[3])*stats[1],0,1];
+        } else if(op.operation===1) s.pixel=[src[3]+(1-(op.knockout?shape[3]:src[3]))*stats[0],shape[3]+(1-shape[3])*stats[1],0,1];
         else if(op.operation===2) s.pixel=extractPdfGroupPixel(current,initial,stats[0],(op.opacity??1)*mask[0]);
         else if(op.operation===3) s.pixel=Array(4).fill(stats[1]*(op.alphaIsShape?(op.opacity??1)*mask[0]:1));
         else if(op.operation===4) s.pixel=Array(4).fill(pdfMaskValue(source,op.softMask.subtype,op.softMask.backdrop,op.softMask.transfer));
+        // Operation 6 hands the layer to a blending destination, which performs
+        // the premultiplied source-over operation 0 would have computed.
+        else if(op.operation===6) s.pixel=src.map((v,i)=>i===3?v+s.pixel[3]*(1-src[3]):v+s.pixel[i]*(1-src[3]));
         else s.pixel=[...source];
       }
     };
@@ -81,7 +89,10 @@ try {
   assert.deepEqual(render.spans,[1,1,1,1],"knockout groups keep compositing object by object, shape included");
   // Only a knockout reads geometric shape, so a nested group inside one keeps
   // rendering its own shape surface while an ordinary tree never pays for it.
-  render([g([g([d(0),d(1)])],{knockout:true})],[red,halfBlue]);
+  // A knockout's immediate children are the units that knock each other out, so
+  // splicing a pass-through group into one would change which paints replace
+  // which. The union inside the inner group must survive as one object.
+  close(render([g([g([d(0),d(1)])],{knockout:true})],[red,halfBlue]),[0.5,0,0.5,1]);
   assert.deepEqual(render.spans,[1,1],"a group under a knockout still renders its span's shape");
   // A hidden paint leaves a hole, so the neighbours either side stay separate
   // ranges inside the same submission instead of merging across the gap.
@@ -106,7 +117,65 @@ try {
   close(emptied,render([g([d(0)])],[red]));
   assert.deepEqual(cost,{spans:render.spans,passes:render.passes,surfaces:render.surfaces},
     "an emptied group costs exactly what leaving it out of the graph would");
+  // A pass-through group - opaque, unmasked, Normal-blend and non-knockout -
+  // paints exactly where its parent would, so it is spliced away: it costs no
+  // surface and no pass, and leaves its parent one uninterrupted span.
+  close(render([g([d(0)]),d(1)],[red,halfBlue]),[0.5,0,0.5,1]);
+  assert.deepEqual({spans:render.spans,passes:render.passes,surfaces:render.surfaces},
+    {spans:[1],passes:0,surfaces:1},"a pass-through group costs nothing and never breaks a span");
+  // An isolated source-over group accumulates into one surface, so its own alpha
+  // is the group alpha and its opacity scales that surface inside the composite
+  // that reads it - no separate alpha accumulator, no extraction pass.
+  close(render([g([d(0),d(1)],{alpha:0.5})],[red,blue]),[0.5,0.5,1,1]);
+  assert.deepEqual({spans:render.spans,passes:render.passes},{spans:[1],passes:1},
+    "group opacity rides into the composite instead of costing an extraction pass");
+  // Isolation is immaterial to a subtree that only paints source-over, so a
+  // non-isolated group of ordinary paints takes the same single-surface path.
+  close(render([g([d(0),d(1)],{alpha:0.5,isolated:false})],[red,blue]),[0.5,0.5,1,1]);
+  assert.deepEqual({spans:render.spans,passes:render.passes},{spans:[1],passes:1},
+    "a source-over-only group needs no backdrop copy, isolated or not");
   assert.throws(()=>render([g([d(0)])],[red],undefined,undefined,1),/synthetic GPU failure/);
+  // Bounding a pass is only ever an optimization: it must cover everything the
+  // pass can change, with slack for coverage that bleeds past the geometry.
+  const project = bounds => ({ x: bounds.minX, y: bounds.minY,
+    width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
+  const rect = (bounds, project_ = project, vw = 100, vh = 100, sw = 100, sh = 100) =>
+    pdfCompositeScissorRect(bounds, project_, vw, vh, sw, sh);
+  assert.deepEqual(rect({ minX: 20, minY: 30, maxX: 40, maxY: 50 }), { x: 18, y: 28, width: 24, height: 24 },
+    "a bounded pass covers its rectangle plus a margin for coverage");
+  assert.equal(rect({ minX: 0, minY: 0, maxX: 100, maxY: 100 }), null, "a rectangle covering the surface is no restriction");
+  assert.equal(rect(undefined), null, "no bounds is no restriction");
+  assert.equal(rect({ minX: -Infinity, minY: 0, maxX: 10, maxY: 10 }), null, "an unbounded paint is no restriction");
+  assert.equal(rect({ minX: 0, minY: 0, maxX: 10, maxY: 10 }, null), null, "no projection is no restriction");
+  assert.equal(rect({ minX: 0, minY: 0, maxX: 10, maxY: 10 }, () => null), null, "a projection may decline");
+  assert.deepEqual(rect({ minX: -50, minY: -50, maxX: 10, maxY: 10 }), { x: 0, y: 0, width: 12, height: 12 },
+    "a rectangle reaching off-surface is clamped to it");
+  assert.deepEqual(rect({ minX: 200, minY: 200, maxX: 210, maxY: 210 }), { x: 100, y: 100, width: 0, height: 0 },
+    "a rectangle entirely off-surface covers nothing");
+  // Composite surfaces shrink under the memory budget; a rectangle scales with them.
+  assert.deepEqual(rect({ minX: 20, minY: 30, maxX: 40, maxY: 50 }, project, 100, 100, 50, 50),
+    { x: 9, y: 14, width: 12, height: 12 }, "a reduced surface scales the rectangle with it");
+  // A destination that blends computes source-over itself, so a Normal
+  // composite is one pass over the layer instead of a backdrop copy read back.
+  // Every pixel above must come out the same either way.
+  const withoutBlending = [];
+  const cases = [
+    [[g([d(0),d(1)],{alpha:0.5})],[red,blue]],
+    [[g([d(0),d(1)])],[red,halfBlue]],
+    [[g([d(0)],{isolated:false})],[{...red,blendMode:"Multiply"}],[0.5,0.5,0.5,1]],
+    [[g([d(0)],{softMask:{children:[d(1)],subtype:"Luminosity",transfer:new Float32Array([1,0])}})],
+      [red,{color:[0,1,0,1],shape:1}]],
+    [[g([d(0),d(1)],{knockout:true})],[red,halfBlue]]
+  ];
+  for (const [roots, paints, backdropColor] of cases) withoutBlending.push(render(roots, paints, backdropColor));
+  render.blending = true;
+  cases.forEach(([roots, paints, backdropColor], index) => {
+    close(render(roots, paints, backdropColor), withoutBlending[index], 1e-7);
+  });
+  close(render([g([d(0)]),d(1)],[red,halfBlue]),[0.5,0,0.5,1]);
+  assert.deepEqual({passes:render.passes,surfaces:render.surfaces},{passes:0,surfaces:1},
+    "a pass-through group still costs nothing when the destination blends");
+  render.blending = false;
   assert(PDF_COMPOSITE_FRAGMENT_GLSL.includes("pdfSetLum"));
   assert(PDF_COMPOSITE_WGSL.includes("fn pdfSetLum"));
   assert(!/\b(?:F|I|V3|V4)\b/.test(PDF_COMPOSITE_WGSL),"shared shader equation placeholders are fully lowered");

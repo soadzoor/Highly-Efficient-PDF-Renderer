@@ -559,7 +559,37 @@ export interface DensePdfVectorSceneData {
   readonly selectivePaintOrdinalSpans?: Uint32Array;
   /** Source offset/length pairs for individually captured root paint operators. */
   readonly selectivePaintSourceSpans?: Float64Array;
+  /**
+   * Distinct reasons paints were captured into bounded raster layers rather
+   * than kept as vectors, so a caller can report which feature cost fidelity
+   * instead of only that something did.
+   */
+  readonly selectivePaintReasons?: readonly string[];
 }
+
+/** Names the feature that cost a path paint its vector representation. */
+export function selectivePathPaintReason(largeDisconnectedFill: boolean, patternFill: boolean, patternStroke: boolean,
+  fillPatternKind: string | undefined, strokePatternKind: string | undefined): DensePdfSelectivePaintReason {
+  if (patternFill) return fillPatternKind === "shading" ? "shading-pattern-fill" : "tiling-pattern-fill";
+  if (patternStroke) return strokePatternKind === "shading" ? "shading-pattern-stroke" : "tiling-pattern-stroke";
+  if (largeDisconnectedFill) return "large-disconnected-fill";
+  return "clipped-path";
+}
+
+/** Why a paint could not stay vector; reported with the selective-raster diagnostic. */
+export type DensePdfSelectivePaintReason =
+  | "shading-pattern-fill"
+  | "shading-pattern-stroke"
+  | "tiling-pattern-fill"
+  | "tiling-pattern-stroke"
+  | "large-disconnected-fill"
+  | "clipped-path"
+  | "clipped-image"
+  | "image-over-text"
+  | "root-shading"
+  | "composited-glyphs"
+  /** A whole Form XObject captured as one layer, recorded by the flattener. */
+  | "composited-form";
 
 export interface DensePdfSolidPaint {
   readonly color: readonly [red: number, green: number, blue: number, alpha: number];
@@ -1311,6 +1341,7 @@ class DenseContentCompiler {
   readonly vectorImagePathSourceSpans: number[] = [];
 
   readonly vectorSelectivePaintOrdinalSpans: number[] = [];
+  private readonly vectorSelectivePaintReasons = new Set<string>();
 
   readonly vectorSelectivePaintSourceSpans: number[] = [];
 
@@ -1736,7 +1767,9 @@ class DenseContentCompiler {
           imagePathSpanCheckpoints: Uint32Array.from(this.vectorImagePathSpanCheckpoints),
           imagePathSourceSpans: Float64Array.from(this.vectorImagePathSourceSpans),
           selectivePaintOrdinalSpans: Uint32Array.from(this.vectorSelectivePaintOrdinalSpans),
-          selectivePaintSourceSpans: Float64Array.from(this.vectorSelectivePaintSourceSpans)
+          selectivePaintSourceSpans: Float64Array.from(this.vectorSelectivePaintSourceSpans),
+          ...(this.vectorSelectivePaintReasons.size
+            ? { selectivePaintReasons: Object.freeze([...this.vectorSelectivePaintReasons].sort()) } : {})
         }
       } : {}),
       paintRuns: Uint32Array.from(this.paintRuns),
@@ -2426,7 +2459,7 @@ class DenseContentCompiler {
                 this.operatorSourceOffset,
                 this.operatorSourceLength
               );
-              this.recordVectorSelectivePaint(ordinal);
+              this.recordVectorSelectivePaint(ordinal, "root-shading");
             }
             this.vectorPathSpanStartFillCount = this.fillPathCount;
             this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
@@ -2996,7 +3029,9 @@ class DenseContentCompiler {
         this.operatorSourceOffset,
         this.operatorSourceLength
       );
-      this.recordVectorSelectivePaint(ordinal);
+      this.recordVectorSelectivePaint(ordinal, selectivePathPaintReason(
+        largeDisconnectedFill, visiblePatternFill, visiblePatternStroke,
+        this.state.fillPattern?.kind, this.state.strokePattern?.kind));
       finishClip();
       this.clearPaintPathState();
       return;
@@ -3423,7 +3458,8 @@ class DenseContentCompiler {
     return this.vectorPaintOrdinal++;
   }
 
-  private recordVectorSelectivePaint(ordinal: number): void {
+  private recordVectorSelectivePaint(ordinal: number, reason: DensePdfSelectivePaintReason): void {
+    this.vectorSelectivePaintReasons.add(reason);
     this.vectorSelectivePaintOrdinalSpans.push(ordinal, ordinal);
     if (this.policy.orderedPaint) {
       this.recordVectorSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, ordinal, "paint");
@@ -3716,7 +3752,7 @@ class DenseContentCompiler {
   private recordVectorCompositeGlyphPaintRun(start: number, count: number, renderingMode: number): void {
     const ordinal = this.nextVectorPaintOrdinal("Tj");
     this.vectorSelectivePaintSourceSpans.push(this.operatorSourceOffset, this.operatorSourceLength);
-    this.recordVectorSelectivePaint(ordinal);
+    this.recordVectorSelectivePaint(ordinal, "composited-glyphs");
     const glyphRunIndex = this.vectorGlyphRunMeta.length / 3;
     this.vectorGlyphRunMeta.push(start, count, renderingMode);
     // Keep search/selection geometry while the display program paints the
@@ -3783,7 +3819,7 @@ class DenseContentCompiler {
         this.assertVectorSceneComposite("nonstroke", operator, false, false);
         const ordinal = this.nextVectorPaintOrdinal(operator);
         this.vectorSelectivePaintSourceSpans.push(sourceOffset, sourceLength);
-        this.recordVectorSelectivePaint(ordinal);
+        this.recordVectorSelectivePaint(ordinal, "clipped-image");
         return;
       }
       let overlappingPathSpan = false;
@@ -3804,7 +3840,7 @@ class DenseContentCompiler {
         this.assertVectorSceneComposite("nonstroke", operator, false, false);
         const ordinal = this.nextVectorPaintOrdinal(operator);
         this.vectorSelectivePaintSourceSpans.push(sourceOffset, sourceLength);
-        this.recordVectorSelectivePaint(ordinal);
+        this.recordVectorSelectivePaint(ordinal, "image-over-text");
         this.vectorPathSpanStartFillCount = this.fillPathCount;
         this.vectorPathSpanStartStrokeCount = this.strokes.primitiveCount;
         return;

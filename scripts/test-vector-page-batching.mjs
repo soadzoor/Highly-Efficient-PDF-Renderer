@@ -210,8 +210,10 @@ try {
     segmentCount: 6, visibleSegmentIds: Uint32Array.from([0, 1, 2, 3, 4, 5]), visibleSegmentCount: index ? 0 : 6 })) };
   const transition = new VectorOrderedBatches(transitionScene, transitionRuntime);
   let schedules = 0;
-  const compact = transition.scheduler.compact.bind(transition.scheduler);
-  transition.scheduler.compact = runs => { schedules++; return compact(runs); };
+  // Count actual replans rather than the per-span compaction underneath, which
+  // runs once for every span a document's transparency groups create.
+  const schedulePaints = transition.scheduler.schedulePaints.bind(transition.scheduler);
+  transition.scheduler.schedulePaints = runs => { schedules++; return schedulePaints(runs); };
   const compareFresh = (runs, scale) => {
     const fresh = new VectorOrderedBatches(transitionScene, transitionRuntime);
     fresh.update(runs, scale);
@@ -258,8 +260,8 @@ try {
   const nearbyScene = makePages([0, 5, 100, 200]);
   const nearby = new VectorOrderedBatches(nearbyScene, null);
   let nearbySchedules = 0;
-  const compactNearby = nearby.scheduler.compact.bind(nearby.scheduler);
-  nearby.scheduler.compact = runs => { nearbySchedules++; return compactNearby(runs); };
+  const scheduleNearby = nearby.scheduler.schedulePaints.bind(nearby.scheduler);
+  nearby.scheduler.schedulePaints = runs => { nearbySchedules++; return scheduleNearby(runs); };
   nearby.update(nearbyScene.drawRuns, 0.1);
   const template = paints(nearby), templateDraws = nearby.batches.length;
   const movingPaints = [];
@@ -405,8 +407,8 @@ try {
   densePlan.update(dense.drawRuns);
   const denseOriginal = paints(densePlan);
   let denseSchedules = 0;
-  const compactDense = densePlan.scheduler.compact.bind(densePlan.scheduler);
-  densePlan.scheduler.compact = runs => { denseSchedules++; return compactDense(runs); };
+  const scheduleDense = densePlan.scheduler.schedulePaints.bind(densePlan.scheduler);
+  densePlan.scheduler.schedulePaints = runs => { denseSchedules++; return scheduleDense(runs); };
   densePlan.update(dense.drawRuns, 0.1);
   assert(densePlan.batches.length <= 32, "batching continues throughout a dense interleaved drawing");
   assertOverlapOrder(densePlan, denseOriginal, dense);

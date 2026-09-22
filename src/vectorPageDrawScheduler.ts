@@ -33,23 +33,33 @@ export class VectorPageDrawScheduler {
   private readonly selectedPaints: Uint8Array;
   private readonly allPaints: readonly number[] | null;
   private readonly filtered: number[] = [];
+  private readonly segmentRuns: number[] = [];
+  private readonly segments: Uint32Array | null;
   private previousPaintCount = -1;
   private scheduleDirty = true;
   private padding = NaN;
   private enabled = false;
   private colorCommutationEnabled = true;
 
-  static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
+  /**
+   * `segments` restricts reordering to paints that share a compositor span; see
+   * scenePaintSpanSegments. Omitting it schedules the page as one span, which
+   * is what a document without transparency groups already is.
+   */
+  static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array,
+    segments: Uint32Array | null = null): VectorPageDrawScheduler | null {
     const pages = scene.pageRects.length / 4;
     // Bound setup work for arbitrary public scenes, including invalid layouts.
     if (!scene.drawRuns || pages < 1 || pages > 512 || !Number.isInteger(pages) ||
         !scene.pageRects.every(Number.isFinite)) return null;
-    return new VectorPageDrawScheduler(scene, strokes, sourceRuns);
+    if (segments && segments.length !== scene.drawRuns.length) return null;
+    return new VectorPageDrawScheduler(scene, strokes, sourceRuns, segments);
   }
 
-  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array) {
+  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array, segments: Uint32Array | null) {
     const runs = scene.drawRuns!;
     const pages = scene.pageRects.length / 4;
+    this.segments = segments;
     this.bounds = new VectorDrawRunCuller(scene, { scene: strokes, sourceRuns });
     this.pageForRun = new Uint16Array(runs.length);
     this.kindForRun = new Uint8Array(runs.length);
@@ -200,7 +210,25 @@ export class VectorPageDrawScheduler {
   }
 
   private schedulePaints(runs: readonly number[]): readonly number[] {
-    if (this.independentGroups <= 1) return this.compact(runs);
+    this.compacted.length = 0;
+    if (!this.segments) { this.appendSchedule(runs); return this.compacted; }
+    // Paints in different spans have a composite between them, so only paints
+    // sharing one may be reordered. Segment ids rise along the graph, so equal
+    // ids are already adjacent in this source-ordered list.
+    for (let first = 0; first < runs.length;) {
+      const segment = this.segments[runs[first]];
+      this.segmentRuns.length = 0;
+      while (first < runs.length && this.segments[runs[first]] === segment) this.segmentRuns.push(runs[first++]);
+      this.appendSchedule(this.segmentRuns);
+    }
+    return this.compacted;
+  }
+
+  private appendSchedule(runs: readonly number[]): void {
+    this.appendCompacted(this.independentGroups <= 1 ? runs : this.interleave(runs));
+  }
+
+  private interleave(runs: readonly number[]): readonly number[] {
     this.heads.fill(-1); this.tails.fill(-1); this.ordered.length = 0;
     for (const run of runs) {
       const group = this.components[this.pageForRun[run]];
@@ -223,13 +251,12 @@ export class VectorPageDrawScheduler {
         this.heads[group] = head;
       }
     }
-    return this.compact(this.ordered);
+    return this.ordered;
   }
 
   /** Disjoint paints and equal-RGB Normal paints commute under source-over. */
-  private compact(runs: readonly number[]): readonly number[] {
+  private appendCompacted(runs: readonly number[]): void {
     if (this.colorCommutationEnabled) runs = this.groupUniformColors(runs);
-    this.compacted.length = 0;
     for (let index = 0; index < runs.length; index++) this.next[runs[index]] = runs[index + 1] ?? -1;
     let head = runs[0] ?? -1;
     // Bound rebuild work when a document has many mutually overlapping paints.
@@ -260,7 +287,6 @@ export class VectorPageDrawScheduler {
         cursor = following;
       }
     }
-    return this.compacted;
   }
 
   /** Long monochrome drawing spans need linear grouping, not bounded swaps. */

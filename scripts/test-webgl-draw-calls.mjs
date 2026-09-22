@@ -72,8 +72,9 @@ try {
   assert.equal(renderer.renderProjectedFrame({ ...projected, localToClip: new Array(16).fill(NaN) }).drawCalls, 0);
   frame(10);
 
-  // The retained paint graph adds shape and compositing draws. Framebuffer
-  // copies and clears are not GPU draw commands and are not counted.
+  // The retained paint graph adds its compositing passes. Framebuffer copies
+  // and clears are not GPU draw commands and are not counted, and without a
+  // knockout above it no geometric shape pass is rendered at all.
   Object.assign(renderer, { pageRects: new Float32Array(), visiblePageRectCount: 0,
     highlightSelectionCount: 0, highlightOthersCount: 0, highlightCurrentCount: 0, primitiveHighlights: null });
   scene.drawRuns = [{ kind: "fill", first: 0, count: 1 }];
@@ -81,7 +82,8 @@ try {
     blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }] }] };
   draws.length = 0;
   renderer.renderExternalFrame();
-  assert(frames.at(-1).drawCalls > 2, "color, shape and compositor passes are all included");
+  assert.equal(frames.at(-1).drawCalls, 2,
+    "the group's own paint and the composite carrying its opacity are both included");
   const composedCalls = frames.at(-1).drawCalls;
   frame(composedCalls);
 

@@ -22,7 +22,13 @@ export interface NativeGlyphStrokeGeometry {
 type Point = readonly [number, number];
 interface Contour { points: Point[]; closed: boolean; hasSegment?: boolean; }
 
-const MAX_EDGES = 2048;
+/**
+ * Per-glyph bound on flattening work and on the stroke outline it produces.
+ * Outlined display text in real documents reaches a little over two thousand
+ * edges, so a tighter bound refuses ordinary headlines; the page-level
+ * coordinate and path limits are what actually protect the frame's memory.
+ */
+const MAX_EDGES = 4096;
 const MAX_INPUT_COMMANDS = 65536;
 const MAX_CURVE_DEPTH = 20;
 const EPSILON = 1e-12;

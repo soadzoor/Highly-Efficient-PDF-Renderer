@@ -1,6 +1,8 @@
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { VectorStrokeLodRuntime } from "./vectorStrokeLodCore";
 import { strokePaintOrigins } from "./vectorStrokePaintOrder";
+import { scenePaintSpanSegments } from "./scenePaintGraph";
+import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
 import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
 import { VectorRunClipElision } from "./vectorRunClipElision";
@@ -8,6 +10,26 @@ import { VectorRunClipElision } from "./vectorRunClipElision";
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
   readonly batches: VectorDrawRun[] = [];
+  /**
+   * The compositor span each batch belongs to, parallel to `batches`. Batches
+   * rise through the spans in graph order, so a caller compositing one span
+   * draws the contiguous stretch whose ids fall inside it. Empty without a
+   * paint graph, where the whole page is one span.
+   */
+  readonly batchSegments: number[] = [];
+  /**
+   * Whether `batchSegments` rises along `batches`. A consumer walking the spans
+   * in graph order can then take each one's batches as a contiguous stretch. A
+   * graph that visits its paints out of source order can break this, and such a
+   * consumer must fall back to submitting paints one at a time.
+   */
+  spanOrdered = true;
+  /**
+   * Which canonical runs this plan was given. Soft-mask contents are not page
+   * paints and never reach it, so a caller drawing a span of them has to submit
+   * them itself rather than look for batches that do not exist.
+   */
+  readonly scheduledRuns: Uint8Array;
   readonly floatInstances: Float32Array;
   readonly uintInstances: Uint32Array;
   readonly strokeScene: VectorScene;
@@ -31,6 +53,7 @@ export class VectorOrderedBatches {
   private readonly runRanges: Uint32Array;
   private readonly visiblePaints: number[] = [];
   private readonly scheduler: VectorPageDrawScheduler | null;
+  private readonly segments: Uint32Array | null;
   private readonly clipElision: VectorRunClipElision | null;
   private readonly redundancy: VectorStrokeRedundancy;
   private readonly redundancyIds: Uint32Array;
@@ -85,10 +108,15 @@ export class VectorOrderedBatches {
       this.idToRank[id] = rank;
       this.rankRun[rank] = strokeSourceRuns[id] = sourceRun[origins[id]];
     });
-    this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns);
+    // Paints reorder only within a compositor span. A page that never reaches
+    // the compositor is one span whatever its graph says, so it keeps the whole
+    // page to reorder in.
+    this.segments = sceneRequiresPaintCompositing(scene) ? scenePaintSpanSegments(scene) : null;
+    this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns, this.segments);
     this.clipElision = VectorRunClipElision.create(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
     this.redundancy = new VectorStrokeRedundancy(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
     this.redundancyIds = new Uint32Array(total);
+    this.scheduledRuns = new Uint8Array(runs.length);
     const capacity = Math.max(1, total + scene.fillPathCount + scene.textInstanceCount) * 2;
     this.floatInstances = new Float32Array(capacity);
     this.uintInstances = new Uint32Array(capacity);
@@ -182,12 +210,18 @@ export class VectorOrderedBatches {
     this.previousSelectedRanks.set(this.selectedRanks.subarray(0, selectedCount));
     this.previousRankCount = selectedCount;
     this.batches.length = 0;
+    this.batchSegments.length = 0;
+    this.spanOrdered = true;
     this.instanceCount = 0;
     this.culledSegmentCount = 0;
     this.visiblePaints.length = 0;
+    this.scheduledRuns.fill(0);
     let cursor = 0;
     for (const run of runs) {
       const runIndex = this.runIndices.get(run)!;
+      // Marked whether or not it survives LOD selection: a run culled down to
+      // nothing is still one this plan speaks for, and contributes no batch.
+      this.scheduledRuns[runIndex] = 1;
       let first = run.first, count = run.count;
       if (run.kind === "stroke" && this.runtime) {
         while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] < runIndex) cursor++;
@@ -217,9 +251,10 @@ export class VectorOrderedBatches {
     // final order. No intermediate instance copy or per-run array views.
     for (const runIndex of this.scheduler?.schedule(this.visiblePaints) ?? this.visiblePaints) {
       const run = this.sourceRuns[runIndex];
+      const segment = this.segments ? this.segments[runIndex] : 0;
       const start = this.runRanges[runIndex * 2], count = this.runRanges[runIndex * 2 + 1];
       if (run.kind !== "stroke" && run.kind !== "fill" && run.kind !== "text") {
-        this.batches.push({ ...run });
+        this.pushBatch({ ...run }, segment);
         continue;
       }
       const first = this.instanceCount;
@@ -237,11 +272,18 @@ export class VectorOrderedBatches {
       const retainedCount = this.instanceCount - first;
       if (!retainedCount) continue;
       const previous = this.batches[this.batches.length - 1];
-      if (previous?.kind === run.kind && previous.clipIndex === -2 && previous.blendMode === run.blendMode) previous.count += retainedCount;
-      else this.batches.push({ kind: run.kind, first, count: retainedCount, clipIndex: -2, ...(run.blendMode ? { blendMode: run.blendMode } : {}) });
+      if (previous?.kind === run.kind && previous.clipIndex === -2 && previous.blendMode === run.blendMode &&
+          this.batchSegments[this.batches.length - 1] === segment) previous.count += retainedCount;
+      else this.pushBatch({ kind: run.kind, first, count: retainedCount, clipIndex: -2, ...(run.blendMode ? { blendMode: run.blendMode } : {}) }, segment);
     }
     this.floatInstances.set(this.uintInstances.subarray(0, this.instanceCount * 2));
     return true;
+  }
+
+  private pushBatch(batch: VectorDrawRun, segment: number): void {
+    if (segment < (this.batchSegments[this.batchSegments.length - 1] ?? 0)) this.spanOrdered = false;
+    this.batches.push(batch);
+    this.batchSegments.push(segment);
   }
 
   private appendInstance(id: number, clipCode: number): void {
