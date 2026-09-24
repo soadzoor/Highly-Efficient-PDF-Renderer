@@ -167,11 +167,30 @@ The draw list is reused until visibility, LOD, or the AA scale bucket changes.
 Stroke paint ranks are computed at scene setup. When selection changes, a
 hierarchical bitmask filters that static order without comparison sorting.
 Unchanged selected IDs reuse their ordered instance list.
-For an orthographic overview containing every LOD's geometry and every paint
-bound, panning reuses both the LOD selection and the source paint list. A changed
-LOD budget, partial visibility, or explicit reset resumes selection work;
-arbitrary local-to-clip projections keep their existing update path.
+For a planar overview containing every LOD's geometry and every paint bound,
+panning reuses both the LOD selection and the source paint list. Partial views
+can reuse a bounded offscreen margin. Three.js also reuses the selection for a
+front-facing PerspectiveCamera when clip W is constant over the PDF plane and
+valid local culling bounds are available. Camera-control roundoff is tolerated
+only when its clip-W contribution across the entire drawing is at most 1e-12
+of constant W. Selection reuse compares the normalized XY basis with its cached
+value; near/far clipping changes affect depth only and do not invalidate it.
+Unchanged selections update camera uniforms and paint schedules without copying
+or scanning stroke IDs. A changed LOD budget, exhausted margin, screen scale or
+orientation change, or explicit reset resumes selection work; tilted perspective
+views keep their existing update path. The headless Three camera regression uses
+real MapControls and the PDF object's frame preparation on both material backends.
 Native WebGL/WebGPU ordered scenes use the existing soft 50,000-stroke LOD target;
 merging stays within each source paint, clip, and consecutive opaque color.
-Exact tile geometry returns when it fits the budget. The Draw counter reports
-selected strokes.
+Exact tile geometry returns when it fits the budget or the screen-error limit
+requires it; tile budgets and hysteresis cannot select a coarser level than that
+limit. Dense opaque marks use runtime-only negative primitive types to encode
+source-over multiplicity, preserving coincident coverage without widening the
+pen. Small spatial clusters use bounded cells and subdivision; hairlines,
+transparency effects, and isolated details remain exact. Density levels are
+excluded from tilted perspective views without a reliable uniform error bound.
+Canonical PDF/HEP geometry is unchanged. Native translation-only pan caching
+also supports active LOD: refresh selects vectors for the complete cache bounds
+at the current zoom. Zooming still renders directly, and scene/style/layer
+changes invalidate cached pixels. The Draw counter reports selected vector
+representatives, including those represented by a reused native pan cache.

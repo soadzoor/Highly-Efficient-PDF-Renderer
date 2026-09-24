@@ -38,6 +38,12 @@ try {
   const viewport = { width: 1920, height: 945 };
   const viewAt = (x, units = 1) => ({ cameraCenterX: x, cameraCenterY: 0, zoom: 1 / units });
   const boundsAt = (x, units = 1) => vectorViewBounds(viewport.width, viewport.height, x, 0, 1 / units);
+  // Perspective in 3D, but constant W on the PDF's z=0 plane. The matrix maps
+  // exactly the same viewport rectangle as boundsAt, including camera panning.
+  const projectionAt = (x, units = 1) => {
+    const w = 10, sx = 2 * w / (viewport.width * units), sy = 2 * w / (viewport.height * units);
+    return [sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, -1, -1, -x * sx, 0, 9, w];
+  };
   const culler = new VectorDrawRunCuller(scene);
   // Each reference culler is below the guard threshold, preserving exact-view
   // membership with the same geometric/AA rules as the large guarded culler.
@@ -131,9 +137,65 @@ try {
   runtime.resetVisible();
   assert(step(6000), "reset clears guarded IDs");
 
-  // Compare complete CPU selection + batch updates over 60 small pan frames.
-  // The identity local-to-clip reference has identical tile budgets but takes
-  // the uncached projection path, providing the exact-view selection baseline.
+  const projected = makeRuntime();
+  const projectedStep = (x, units = 1, matrix = projectionAt(x, units), bounds = boundsAt(x, units)) => {
+    projected.setLocalToClipTransform(matrix, units);
+    return projected.update(viewAt(x, units), viewport, bounds);
+  };
+  assert(projectedStep(6000));
+  const projectedMarks = projected.levels.map(level => level.markToken);
+  assert.equal(projectedStep(6020), false, "a front-facing perspective pan reuses guarded IDs");
+  assert.deepEqual(projected.levels.map(level => level.markToken), projectedMarks,
+    "translation updates no primitive selection buffers");
+  assert.equal(projected.localToClip[12], projectionAt(6020)[12], "cached selection still receives the new camera matrix");
+  const noisy = projectionAt(6020); noisy[3] = 1e-17; noisy[7] = -6.123233995736766e-17;
+  noisy[0] *= 1 + 4 * Number.EPSILON;
+  assert.equal(projectedStep(6020, 1, noisy), false, "scene-bounded camera roundoff retains selection");
+  const depthOnly = [...noisy]; depthOnly[2] = .02; depthOnly[6] = -.03; depthOnly[10] = -2; depthOnly[14] = 2;
+  assert.equal(projectedStep(6020, 1, depthOnly), false, "depth-only clipping changes leave projected density unchanged");
+  assert(projectedStep(6080), "projected pan leaving the guard refreshes IDs");
+  assert(projectedStep(6000, 8));
+  assert.equal(projectedStep(6020, 8), false, "projected full-page overview also reuses IDs");
+  assert(projectedStep(6000), "returning to detail replaces the overview selection");
+  const scaled = projectionAt(6000); scaled[0] *= 1.01;
+  assert(projectedStep(6000, 1, scaled), "a changed axis scale invalidates projected selection");
+  const rotated = projectionAt(6000); rotated[1] = rotated[0] * .1;
+  assert(projectedStep(6000, 1, rotated), "a changed orientation invalidates projected selection");
+  const tilted = projectionAt(6000); tilted[3] = .0001;
+  assert(projectedStep(6000, 1, tilted));
+  assert(projectedStep(6000, 1, tilted), "a varying-W perspective view always recomputes tile budgets");
+  const smallSlope = projectionAt(6000); smallSlope[3] = 1e-13;
+  assert(projectedStep(6000, 1, smallSlope));
+  assert(projectedStep(6000, 1, smallSlope), "a small raw slope is rejected when its scene-wide effect exceeds roundoff");
+  assert(projectedStep(6000));
+  for (let index = 1; index <= 4; index++) {
+    const drifting = projectionAt(6000); drifting[0] *= 1 + index * 4e-13;
+    const changed = projectedStep(6000, 1, drifting);
+    if (index === 1) assert.equal(changed, false, "one rounding-scale change retains selection");
+    if (index === 3) assert(changed, "accumulated scale drift is compared with the cached basis, not the last frame");
+  }
+  const invalid = projectionAt(6000); invalid[0] = NaN;
+  assert(projectedStep(6000, 1, invalid));
+  assert(projectedStep(6000, 1, invalid), "a sanitized nonfinite matrix cannot certify cache reuse");
+  const zeroW = projectionAt(6000); zeroW[15] = 0;
+  assert(projectedStep(6000, 1, zeroW));
+  assert(projectedStep(6000, 1, zeroW), "a zero clip W cannot certify cache reuse");
+  assert(projectedStep(6000, 1, projectionAt(6000), null));
+  assert(projectedStep(6000, 1, projectionAt(6000), null), "projection without trusted plane bounds stays uncached");
+  assert(projectedStep(6000));
+  projected.setForceExact(true);
+  assert(projectedStep(6000), "force-exact invalidates a projected cache");
+  assert.equal(projectedStep(6000), false);
+  projected.setForceExact(false);
+  assert(projectedStep(6000));
+  projected.resetVisible();
+  assert(projectedStep(6000), "reset invalidates a projected cache");
+  projected.setScreenSpaceTransform();
+  assert(projected.update(viewAt(6000), viewport), "leaving projection refreshes planar selection");
+
+  // Compare complete projected CPU selection + batch updates over 60 small pan
+  // frames. The reference deliberately clears reuse each frame and supplies no
+  // projected plane bounds, retaining the original exact-view filtering rule.
   const guardedRuntime = makeRuntime(), referenceRuntime = makeRuntime();
   referenceRuntime.setLocalToClipTransform(identity, 1);
   const guardedCuller = new VectorDrawRunCuller(scene);
@@ -143,8 +205,9 @@ try {
   const retainedIds = new Uint8Array(count);
   for (let frame = 0; frame < 60; frame++) {
     const x = 6000 + 20 * Math.sin(frame / 60 * Math.PI * 2);
-    guardedRuntime.updateForLocalUnitsPerPixel(1); referenceRuntime.updateForLocalUnitsPerPixel(1);
-    if (guardedRuntime.update(viewAt(x), viewport)) { guardedSelections++; guardedPlan.invalidate(); }
+    guardedRuntime.setLocalToClipTransform(projectionAt(x), 1);
+    referenceRuntime.resetVisible(); referenceRuntime.updateForLocalUnitsPerPixel(1);
+    if (guardedRuntime.update(viewAt(x), viewport, boundsAt(x))) { guardedSelections++; guardedPlan.invalidate(); }
     if (referenceRuntime.update(viewAt(x), viewport)) { referenceSelections++; referencePlan.invalidate(); }
     const guardedRuns = guardedCuller.select(boundsAt(x), 1), referenceRuns = exactRuns(boundsAt(x), 1);
     if (guardedPlan.update(guardedRuns, 1)) guardedRebuilds++;

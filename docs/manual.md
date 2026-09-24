@@ -115,9 +115,17 @@ vector content, raster layers, search highlights, and selection highlights.
 See the [API reference](api.md) for integration points.
 
 Vector LOD simplifies stroke geometry according to the current view. It keeps
-exact stroke geometry available and chooses detail per tile as you zoom.
-The visible-segment budget is a target, so it does not guarantee a fixed draw
-count. Embedded PDF images remain raster layers.
+exact stroke geometry available and chooses detail per tile as you zoom. Dense
+opaque marks can share weighted vector representatives that retain repeated
+stroke coverage; isolated small details and hairlines keep their geometry. The
+visible-segment budget is a target, subject to the current screen-error limit,
+so it does not guarantee a fixed draw count. Embedded PDF images remain raster
+layers.
+
+The Draw counter reports selected vector representatives. During native cached
+panning it describes the cached content, not a fresh submission of every stroke
+on each frame. Compare direct rendering as well as panning when profiling the
+native and Three.js viewers.
 
 | `vectorLod` | Behavior |
 | --- | --- |

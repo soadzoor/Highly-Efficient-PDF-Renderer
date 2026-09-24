@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
+import { STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
@@ -317,6 +317,7 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
 
 ${VECTOR_INSTANCE_CLIP_GLSL}
 ${STROKE_COVERAGE_GLSL}
+${STROKE_DENSITY_GLSL}
 
 void main() {
   if (vAlpha <= 0.001) {
@@ -342,8 +343,9 @@ void main() {
 
   float coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
+  alpha = heprStrokeLodAlpha(alpha, vPrimitiveType);
 
-  if (alpha <= 0.001) {
+  if (alpha <= 0.0) {
     discard;
   }
 
@@ -3443,12 +3445,10 @@ export class WebGlFloorplanRenderer {
     const sceneEligible =
       this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene() ||
       (this.scene?.drawRuns?.length ?? 0) >= NATIVE_PAN_CACHE_MIN_PAINTS;
-    const vectorLodActive = this.vectorLodRuntime !== null;
     const zoomAnimating =
       Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
     return shouldUseNativePanCacheForFrame(
       sceneEligible,
-      vectorLodActive,
       this.isPanInteracting,
       isCameraAnimating,
       zoomAnimating

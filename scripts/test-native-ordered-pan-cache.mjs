@@ -9,9 +9,12 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
-  for (const [backend, Renderer] of [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]]) {
+  const backends = [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]];
+  const cases = backends.flatMap(([backend, Renderer]) => [false, true].map(lodActive => [backend, Renderer, lodActive]));
+  for (const [backend, Renderer, lodActive] of cases) {
     const { renderer, events, render } = fixture(backend, Renderer);
-    const check = message => `${backend}: ${message}`;
+    renderer.vectorLodRuntime = lodActive ? {} : null;
+    const check = message => `${backend}${lodActive ? " with LOD" : ""}: ${message}`;
     assert.equal(renderer.shouldUsePanCache(true), true, check("paint-heavy ordered scenes qualify with few strokes"));
     renderer.isPanInteracting = false;
     assert.equal(renderer.shouldUsePanCache(true), true, check("translation inertia reuses cached paints"));
@@ -86,7 +89,13 @@ try {
     assert.equal(events.filter(event => event.kind === "direct").length, 1, check("unavailable cache resources fall back to direct rendering"));
     assert.equal(events.filter(event => event.kind === "blit").length, blitCount, check("allocation fallback never presents stale cached pixels"));
   }
-  console.log("Native source-ordered pan cache dispatch, reuse, invalidation, and overlay tests passed");
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { VectorStrokeLodRuntime, buildRuntimeTileBuckets } = await import("../src/vectorStrokeLodCore.ts");
+  const makeRuntime = lodFixture(createEmptyVectorScene, VectorStrokeLodRuntime, buildRuntimeTileBuckets);
+  for (const [backend, Renderer] of backends) {
+    checkLodCache(backend, Renderer, makeRuntime());
+  }
+  console.log("Native ordered and LOD pan cache dispatch, selection reuse, invalidation, and overlay tests passed");
 } finally {
   hooks.deregister();
 }
@@ -166,4 +175,146 @@ function fixture(backend, Renderer) {
     };
   }
   return { renderer, events, render: () => renderer.render(0) };
+}
+
+// Prebuilt levels keep the fixture bounded while exercising real selection and
+// native buffer uploads. Eight identical opaque dots become one density mark.
+function lodFixture(createEmptyVectorScene, VectorStrokeLodRuntime, buildRuntimeTileBuckets) {
+  const sceneFor = density => {
+    const count = 320_000 / density;
+    const scene = Object.assign(createEmptyVectorScene(), {
+      segmentCount: count, maxHalfWidth: .05,
+      bounds: { minX: -25, minY: -4, maxX: 25, maxY: 4 },
+      endpoints: new Float32Array(count * 4), primitiveMeta: new Float32Array(count * 4),
+      primitiveBounds: new Float32Array(count * 4), styles: new Float32Array(count * 4)
+    });
+    for (let index = 0; index < count; index++) {
+      const dot = Math.floor(index * density / 8), x = (dot % 500) * .1 - 25, y = Math.floor(dot / 500) * .1 - 4;
+      scene.endpoints.set([x, y, x, y], index * 4);
+      scene.primitiveMeta.set([x, y, 1 - density, 5], index * 4);
+      scene.primitiveBounds.set([x, y, x, y], index * 4);
+      scene.styles.set([.05, 0, 0, 1], index * 4);
+    }
+    return scene;
+  };
+  const source = sceneFor(1), coarse = sceneFor(8);
+  const tileGrid = { columns: 1, rows: 1, minX: -26, minY: -5, maxX: 26, maxY: 5,
+    tileWidth: 52, tileHeight: 10, xEdges: Float64Array.of(-26, 26), yEdges: Float64Array.of(-5, 5) };
+  const levels = [source, coarse].map((scene, index) => ({ scene, tolerance: index * .5,
+    segmentCount: scene.segmentCount, ...buildRuntimeTileBuckets(scene, tileGrid) }));
+  return () => new VectorStrokeLodRuntime(source, { tileGrid, elapsedMs: 0,
+    levels: levels.map(level => ({ ...level, visibleSegmentIds: new Uint32Array(level.segmentCount),
+      segmentMarks: new Uint32Array(level.segmentCount), visibleSegmentCount: 0, markToken: 0 })) });
+}
+
+function checkLodCache(backend, Renderer, runtime) {
+  const { renderer, events, render } = fixture(backend, Renderer);
+  const check = message => `${backend} actual LOD: ${message}`;
+  Object.assign(renderer, {
+    scene: runtime.levels[0].scene, segmentCount: runtime.levels[0].segmentCount,
+    vectorLodRuntime: runtime, orderedBatches: null, localToClipRenderingEnabled: false,
+    pageRects: new Float32Array(0), textInstanceCount: 0,
+    fillRenderingEnabled: false, textRenderingEnabled: false, rasterRenderingEnabled: false,
+    drawOrderedGradientPaint() {}, drawOrderedGradientPaintIntoPass() {}, bindVectorClip() {}
+  });
+  const buffers = new Map();
+  const upload = (buffer, ids) => {
+    buffers.set(buffer, Array.from(ids));
+    events.push({ kind: "upload", count: ids.length });
+  };
+  const submitted = (index, count, view) => {
+    const level = runtime.levels[index];
+    assert.deepEqual(buffers.get(index).slice(0, count), Array.from(level.visibleSegmentIds.subarray(0, count)),
+      check("submitted IDs are the current selected LOD buffer"));
+    events.push({ kind: "lod", index, count, view });
+  };
+  const originalUpdate = runtime.update.bind(runtime);
+  runtime.update = (...args) => {
+    const changed = originalUpdate(...args);
+    events.push({ kind: "selection", changed, viewport: args[1], zoom: args[0].zoom });
+    return changed;
+  };
+  if (backend === "WebGL") {
+    delete renderer.updateVisibleSet;
+    delete renderer.drawVisibleSegments;
+    let boundBuffer;
+    renderer.gl.bindBuffer = (_target, buffer) => { boundBuffer = buffer; };
+    renderer.gl.bufferData = (_target, ids) => upload(boundBuffer, ids);
+    renderer.vectorLodLevels = runtime.levels.map((level, index) => ({ index,
+      visibleSegmentIdBuffer: index, visibleSegmentIdsFloat: new Float32Array(level.segmentCount) }));
+    renderer.drawStrokeInstances = (level, _buffer, count, ...view) => submitted(level.index, count, view);
+  } else {
+    delete renderer.updateStrokeVisibleSet;
+    delete renderer.drawVectorContentIntoPass;
+    renderer.gpuDevice.queue.writeBuffer = (buffer, _offset, ids) => upload(buffer, ids);
+    renderer.vectorLodLevelResources = runtime.levels.map((_level, index) => ({
+      visibleSegmentIdBuffer: index, bindGroup: { index }
+    }));
+    renderer.strokePipeline = "stroke";
+    let view;
+    renderer.updateCameraUniforms = (width, height, x, y, zoom = renderer.zoom) => { view = [width, height, x, y, zoom]; };
+    const createEncoder = renderer.gpuDevice.createCommandEncoder;
+    renderer.gpuDevice.createCommandEncoder = () => {
+      const encoder = createEncoder(), begin = encoder.beginRenderPass;
+      encoder.beginRenderPass = descriptor => {
+        const pass = begin(descriptor), draw = pass.draw.bind(pass);
+        let pipeline, group;
+        pass.setPipeline = value => { pipeline = value; };
+        pass.setBindGroup = (_slot, value) => { group = value; };
+        pass.draw = (...args) => pipeline === "stroke" ? submitted(group.index, args[1], view) : draw(...args);
+        return pass;
+      };
+      return encoder;
+    };
+  }
+  const count = kind => events.filter(event => event.kind === kind).length;
+  assert(renderer.shouldUsePanCache(true), check("LOD does not disable the dense scene pan cache"));
+  render();
+  assert.equal(renderer.panCacheRenderedSegments, 40_000, check("refresh draws the simplified level, not all source strokes"));
+  assert.deepEqual(events.find(event => event.kind === "lod").view, [1800, 1080, 100, -200, .25],
+    check("LOD refresh uses overscan with the live camera and zoom"));
+  assert.deepEqual(events.find(event => event.kind === "selection").viewport, { width: 1800, height: 1080 });
+  const uploads = count("upload");
+  renderer.cameraCenterX += 100;
+  render();
+  assert.equal(count("selection"), 1, check("cache reuse performs no LOD scan"));
+  assert.equal(count("lod"), 1, check("cache reuse submits no stroke instances"));
+  assert.deepEqual(events.filter(event => event.kind === "blit").at(-1).transform, [25, 0, 1]);
+  assert.deepEqual(events.filter(event => event.kind === "highlight").at(-1).view, [1000, 600, 200, -200, .25],
+    check("highlights follow the live camera while geometry is cached"));
+
+  renderer.setStrokeCurveEnabled(false);
+  assert.equal(renderer.panCacheValid, false, check("style changes invalidate cached LOD pixels"));
+  render();
+  assert.equal(count("lod"), 2);
+  assert.equal(events.filter(event => event.kind === "selection").at(-1).changed, false,
+    check("an unchanged full-view selection can refresh styled pixels without rewriting IDs"));
+  assert.equal(count("upload"), uploads, check("update(false) keeps valid GPU IDs during the refresh"));
+
+  renderer.cameraCenterX += 2000;
+  render();
+  assert.equal(count("lod"), 3, check("coverage escape refreshes LOD geometry once"));
+  assert.equal(events.filter(event => event.kind === "selection").at(-1).changed, false,
+    check("a full-scene overscan refresh safely reuses the existing selection"));
+  assert.deepEqual(events.filter(event => event.kind === "lod").at(-1).view, [1800, 1080, 2200, -200, .25]);
+  assert.deepEqual(events.filter(event => event.kind === "blit").at(-1).transform, [0, 0, 1]);
+
+  renderer.targetZoom = 10;
+  render();
+  assert.equal(count("direct"), 1, check("active zoom still bypasses cached LOD pixels"));
+  assert.equal(count("lod"), 3, check("zoom does not rescale or refresh the old cache"));
+  renderer.cameraCenterX = renderer.cameraCenterY = 0;
+  renderer.zoom = renderer.targetZoom;
+  render();
+  assert.equal(renderer.panCacheZoom, 10);
+  assert.equal(renderer.panCacheRenderedSegments, 320_000, check("settled close zoom refreshes exact geometry before reuse"));
+  assert.equal(events.filter(event => event.kind === "lod").at(-1).index, 0);
+  assert.deepEqual(events.filter(event => event.kind === "lod").at(-1).view, [1800, 1080, 0, 0, 10]);
+  assert.deepEqual(events.filter(event => event.kind === "blit").at(-1).transform, [0, 0, 1]);
+
+  renderer.cameraCenterX = 1000;
+  render();
+  assert.equal(renderer.panCacheRenderedSegments, 0, check("leaving all geometry clears the cache instead of replaying stale IDs"));
+  assert.equal(runtime.getRenderedSegmentCount(), 0);
+  assert.equal(count("lod"), 4);
 }

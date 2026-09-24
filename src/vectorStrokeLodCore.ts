@@ -1,4 +1,5 @@
 import { strokePaintGroups, strokePaintOrigins, setStrokePaintOrigins } from "./vectorStrokePaintOrder";
+import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
 import type {ViewState} from "./webGlFloorplanRenderer";
 
@@ -213,6 +214,17 @@ interface IntervalGroup {
   intervals: number[];
 }
 
+interface DenseStrokeGroup {
+  /** Retain exact source IDs until the group is large enough to aggregate. */
+  members: number[];
+  count: number;
+  coincident: boolean;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 interface TileGrid {
   columns: number;
   rows: number;
@@ -297,6 +309,10 @@ const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
+// Relative to the entire drawing, not a world-space slope threshold. Three's
+// camera controls can introduce ~1e-16 roundoff in an otherwise planar view.
+const LOD_PLANAR_ROUNDOFF_EPSILON = 1e-12;
+const LOD_PLANAR_BASIS_INDICES = [0, 1, 4, 5] as const;
 const LOD_RUNTIME_TILE_TARGET_SEGMENTS = 512;
 const LOD_VISIBILITY_GUARD_PIXELS = 64;
 const LOD_RUNTIME_MIN_TILE_COUNT = 256;
@@ -323,6 +339,11 @@ const LOD_TILE_PROJECTED_PERSPECTIVE_RATIO = 0.015;
 // coverage. Merging them can close dash gaps or collapse neighbouring marks.
 const LOD_PRESERVE_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
+// A cell side spans at most 0.0625 pixels at its permitted screen-space tolerance.
+const LOD_DENSITY_CELL_FACTOR = 0.05;
+const LOD_DENSITY_MIN_MEMBERS = 8;
+const LOD_DENSITY_MAX_GROUPS = 250_000;
+const LOD_DENSITY_MAX_MULTIPLICITY = 65_535;
 const LOD_TILE_WORLD_FACTOR = 192;
 
 export class VectorStrokeLodRuntime {
@@ -332,10 +353,13 @@ export class VectorStrokeLodRuntime {
   private readonly tileSelectedLevelIndices: Int16Array;
   private readonly projectedTileAreas: Float32Array;
   private readonly maxHalfWidth: number;
+  private readonly densityLevels = new Set<RuntimeVectorStrokeLodLevel>();
   private activeLevelIndex = 0;
   private forceExact = false;
   private useLocalToClip = false;
+  private constantClipW = false;
   private readonly localToClip = new Float64Array(16);
+  private readonly selectionProjectionBasis = new Float64Array(4);
   private localUnitsPerPixel = 1;
   private lastVisibleSegmentCount = 0;
   private readonly allLevelBounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
@@ -361,6 +385,7 @@ export class VectorStrokeLodRuntime {
     });
     for (const level of this.levels) {
       for (let index = 0; index < level.segmentCount; index++) {
+        if (level.scene.primitiveMeta[index * 4 + 2] < 0) this.densityLevels.add(level);
         this.allLevelBounds.minX = Math.min(this.allLevelBounds.minX, level.segmentMinX[index]);
         this.allLevelBounds.minY = Math.min(this.allLevelBounds.minY, level.segmentMinY[index]);
         this.allLevelBounds.maxX = Math.max(this.allLevelBounds.maxX, level.segmentMaxX[index]);
@@ -394,12 +419,43 @@ export class VectorStrokeLodRuntime {
   }
 
   setLocalToClipTransform(localToClip: ArrayLike<number>, localUnitsPerPixel: number): void {
-    this.useLocalToClip = true;
-    this.selectionGuard = null;
-    this.fullViewBaselineLevelIndex = -1;
+    // Bound roundoff over the drawing: a tiny W slope alone is not safe for
+    // large coordinates. Keep the actual projection unchanged for rendering.
+    let finite = true;
+    let sameLinearTransform = this.useLocalToClip && this.constantClipW;
     for (let i = 0; i < 16; i += 1) {
-      this.localToClip[i] = Number(localToClip[i]) || 0;
+      const value = Number(localToClip[i]);
+      finite &&= Number.isFinite(value);
+      this.localToClip[i] = value || 0;
     }
+    const elements = this.localToClip;
+    const maxAbsX = Math.max(Math.abs(this.tileGrid.minX), Math.abs(this.tileGrid.maxX),
+      Math.abs(this.allLevelBounds.minX), Math.abs(this.allLevelBounds.maxX));
+    const maxAbsY = Math.max(Math.abs(this.tileGrid.minY), Math.abs(this.tileGrid.maxY),
+      Math.abs(this.allLevelBounds.minY), Math.abs(this.allLevelBounds.maxY));
+    const wOffset = elements[15];
+    const wVariation = Math.abs(elements[3]) * maxAbsX + Math.abs(elements[7]) * maxAbsY;
+    this.constantClipW = finite && Math.abs(wOffset) > 1e-8 && Number.isFinite(wVariation) &&
+      wVariation <= Math.abs(wOffset) * LOD_PLANAR_ROUNDOFF_EPSILON;
+    // Only the normalized XY basis changes projected density. The example
+    // adjusts near/far planes during pans; those change depth, not screen area.
+    // Compare with the last invalidated basis so repeated tiny changes cannot
+    // accumulate into an undetected scale/orientation change.
+    for (let row = 0; row < 2 && sameLinearTransform; row++) {
+      const x = elements[row] / wOffset, y = elements[row + 4] / wOffset;
+      const previousX = this.selectionProjectionBasis[row], previousY = this.selectionProjectionBasis[row + 2];
+      const epsilon = Math.max(Math.abs(x), Math.abs(y), Math.abs(previousX), Math.abs(previousY)) *
+        LOD_PLANAR_ROUNDOFF_EPSILON;
+      if (Math.abs(x - previousX) > epsilon || Math.abs(y - previousY) > epsilon) sameLinearTransform = false;
+    }
+    if (!this.constantClipW || !sameLinearTransform) {
+      this.selectionGuard = null;
+      this.fullViewBaselineLevelIndex = -1;
+      for (let i = 0; i < LOD_PLANAR_BASIS_INDICES.length; i++) {
+        this.selectionProjectionBasis[i] = elements[LOD_PLANAR_BASIS_INDICES[i]] / wOffset;
+      }
+    }
+    this.useLocalToClip = true;
     this.localUnitsPerPixel = normalizeLocalUnitsPerPixel(localUnitsPerPixel);
   }
 
@@ -451,7 +507,7 @@ export class VectorStrokeLodRuntime {
     if (this.forceExact) return 0;
     const maxTolerance = localUnitsPerPixel * LOD_SCREEN_ERROR_BUDGET_PX;
     for (let i = this.levels.length - 1; i >= 1; i -= 1) {
-      if (this.levels[i].tolerance <= maxTolerance) {
+      if (this.levels[i].tolerance <= maxTolerance && this.isLevelAllowed(i)) {
         return i;
       }
     }
@@ -466,15 +522,20 @@ export class VectorStrokeLodRuntime {
     const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth);
     const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
     const tileRange = tileRangeForBounds(viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY, this.tileGrid);
+    // Projected reuse needs caller-provided plane bounds; the scalar view state
+    // alone cannot certify what an arbitrary host camera sees.
+    const cacheableView = !this.useLocalToClip || (this.constantClipW && cullingBounds != null &&
+      [cullingBounds.minX, cullingBounds.minY, cullingBounds.maxX, cullingBounds.maxY].every(Number.isFinite) &&
+      cullingBounds.minX <= cullingBounds.maxX && cullingBounds.minY <= cullingBounds.maxY);
     // A static planar overview keeps the same tile budget and geometry while
     // every LOD's bounds remain visible. Panning needs no new selection scan.
-    const fullyVisible = !this.useLocalToClip && tileRange !== null &&
+    const fullyVisible = cacheableView && tileRange !== null &&
       tileRange.c0 === 0 && tileRange.r0 === 0 &&
       tileRange.c1 === this.tileGrid.columns - 1 && tileRange.r1 === this.tileGrid.rows - 1 &&
       viewBounds.minX <= this.allLevelBounds.minX && viewBounds.minY <= this.allLevelBounds.minY &&
       viewBounds.maxX >= this.allLevelBounds.maxX && viewBounds.maxY >= this.allLevelBounds.maxY;
     if (fullyVisible && this.fullViewBaselineLevelIndex === screenErrorLevelIndex) return false;
-    const guard = !this.useLocalToClip && this.levels[0].segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS &&
+    const guard = cacheableView && this.levels[0].segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS &&
       [viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY].every(Number.isFinite)
       ? LOD_VISIBILITY_GUARD_PIXELS * this.localUnitsPerPixel : 0;
     const cached = this.selectionGuard;
@@ -520,7 +581,7 @@ export class VectorStrokeLodRuntime {
           projectedTileAreaStats,
           this.projectedTileAreas[tileIndex]
         );
-        const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments);
+        const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments, screenErrorLevelIndex);
         const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
         if (baselineTileSegments > maxBaselineTileSegments) {
           maxBaselineTileSegments = baselineTileSegments;
@@ -562,8 +623,14 @@ export class VectorStrokeLodRuntime {
     }
   }
 
-  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
-    if (this.forceExact) {
+  private isLevelAllowed(index: number): boolean {
+    // A center-plane pixel scale cannot bound magnification on the near side
+    // of a tilted perspective plane. Keep its density representatives exact.
+    return !this.useLocalToClip || this.constantClipW || !this.densityLevels.has(this.levels[index]);
+  }
+
+  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number, maxLevelIndex: number): number {
+    if (this.forceExact || maxLevelIndex <= 0) {
       this.tileSelectedLevelIndices[tileIndex] = 0;
       return 0;
     }
@@ -573,10 +640,10 @@ export class VectorStrokeLodRuntime {
       this.tileSelectedLevelIndices[tileIndex] = 0;
       return 0;
     }
-    const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile);
+    const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile, maxLevelIndex);
     const previousLevelIndex = this.tileSelectedLevelIndices[tileIndex];
 
-    if (previousLevelIndex >= 0 && previousLevelIndex < this.levels.length) {
+    if (previousLevelIndex >= 0 && previousLevelIndex <= maxLevelIndex && this.isLevelAllowed(previousLevelIndex)) {
       const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
       const previousCount = this.levels[previousLevelIndex].tileCounts[tileIndex];
       if (previousCount <= softOvershootLimit) {
@@ -594,14 +661,15 @@ export class VectorStrokeLodRuntime {
     return bestIndex;
   }
 
-  private chooseTargetBalancedTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+  private chooseTargetBalancedTileLevel(tileIndex: number, targetSegmentsPerTile: number, maxLevelIndex: number): number {
     const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
     let bestIndex = -1;
     let bestScore = Number.POSITIVE_INFINITY;
     let smallestCount = Number.POSITIVE_INFINITY;
-    let smallestCountIndex = Math.max(0, this.levels.length - 1);
+    let smallestCountIndex = maxLevelIndex;
 
-    for (let i = 0; i < this.levels.length; i += 1) {
+    for (let i = 0; i <= maxLevelIndex; i += 1) {
+      if (!this.isLevelAllowed(i)) continue;
       const tileSegments = this.levels[i].tileCounts[tileIndex];
       if (tileSegments < smallestCount || (tileSegments === smallestCount && i < smallestCountIndex)) {
         smallestCount = tileSegments;
@@ -983,6 +1051,8 @@ async function buildSimplifiedStrokeSceneAsync(
 
   const grid = createTileGrid(scene.bounds, tolerance);
   const groups = new Map<string, IntervalGroup>();
+  const densityGroups = !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
+    ? new Map<string, DenseStrokeGroup>() : null;
   const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveMeta = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
@@ -990,6 +1060,7 @@ async function buildSimplifiedStrokeSceneAsync(
   const outBounds = createEmptyBounds();
   const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
   let maxHalfWidth = 0;
+  let densityR = NaN, densityG = NaN, densityB = NaN;
 
   for (let index = 0; index < segmentCount; index += 1) {
     if ((index & 4095) === 0) {
@@ -998,6 +1069,29 @@ async function buildSimplifiedStrokeSceneAsync(
     }
     const primitive = readStrokePrimitive(scene, index);
     if (!primitive || primitive.alpha <= 0.001) {
+      continue;
+    }
+    // Legacy scenes lack paint-origin sorting. Complete a same-color cohort
+    // before a differently colored exact mark can cover it in source order.
+    if (densityGroups && !scene.drawRuns && (primitive.colorR !== densityR ||
+        primitive.colorG !== densityG || primitive.colorB !== densityB)) {
+      let completedGroups = 0;
+      for (const group of densityGroups.values()) {
+        emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+          tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
+        if ((++completedGroups & 1023) === 0) {
+          await scheduler.maybeYield(false,
+            startValue + (endValue - startValue) * 0.72 * index / Math.max(1, segmentCount),
+            `Aggregating ${formatToleranceName(tolerance)}`);
+        }
+      }
+      densityGroups.clear();
+      densityR = primitive.colorR;
+      densityG = primitive.colorG;
+      densityB = primitive.colorB;
+    }
+    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance)) {
+      maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
     if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5 ||
@@ -1026,6 +1120,16 @@ async function buildSimplifiedStrokeSceneAsync(
     const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
     pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+  }
+
+  let densityGroupIndex = 0;
+  for (const group of densityGroups?.values() ?? []) {
+    emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+      tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
+    if ((++densityGroupIndex & 1023) === 0) {
+      await scheduler.maybeYield(false, startValue + (endValue - startValue) * 0.72,
+        `Aggregating ${formatToleranceName(tolerance)}`);
+    }
   }
 
   let groupIndex = 0;
@@ -1603,6 +1707,8 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
 
   const grid = createTileGrid(scene.bounds, tolerance);
   const groups = new Map<string, IntervalGroup>();
+  const densityGroups = !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
+    ? new Map<string, DenseStrokeGroup>() : null;
   const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveMeta = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
@@ -1610,10 +1716,28 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
   const outBounds = createEmptyBounds();
   const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
   let maxHalfWidth = 0;
+  let densityR = NaN, densityG = NaN, densityB = NaN;
 
   for (let index = 0; index < segmentCount; index += 1) {
     const primitive = readStrokePrimitive(scene, index);
     if (!primitive || primitive.alpha <= 0.001) {
+      continue;
+    }
+    // Legacy scenes lack paint-origin sorting. Complete a same-color cohort
+    // before a differently colored exact mark can cover it in source order.
+    if (densityGroups && !scene.drawRuns && (primitive.colorR !== densityR ||
+        primitive.colorG !== densityG || primitive.colorB !== densityB)) {
+      for (const group of densityGroups.values()) {
+        emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+          tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
+      }
+      densityGroups.clear();
+      densityR = primitive.colorR;
+      densityG = primitive.colorG;
+      densityB = primitive.colorB;
+    }
+    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance)) {
+      maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
     if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5 ||
@@ -1642,6 +1766,11 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
     const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
     pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+  }
+
+  for (const group of densityGroups?.values() ?? []) {
+    emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+      tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
   }
 
   for (const group of groups.values()) {
@@ -1714,6 +1843,123 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
     colorB: clamp01(scene.styles[offset + 3] ?? 0),
     visibleBounds
   };
+}
+
+/**
+ * Aggregate only dense, subpixel neighborhoods of the same opaque mark. The
+ * original pen width and mean endpoints survive; negative line type is a
+ * runtime-only source-over multiplicity, decoded by the shared stroke shader.
+ * This preserves repeated-dot coverage without inflating the vector radius.
+ */
+function collectDenseStroke(
+  groups: Map<string, DenseStrokeGroup>, primitive: StrokePrimitive, index: number, tolerance: number
+): boolean {
+  const dot = primitive.x0 === primitive.x1 && primitive.y0 === primitive.y1;
+  if (primitive.primitiveType !== STROKE_PRIMITIVE_LINE || primitive.alpha !== 1 ||
+      !(primitive.halfWidth > 0) || (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0 ||
+      (dot && (primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) === 0)) return false;
+  const cell = tolerance * LOD_DENSITY_CELL_FACTOR;
+  const cellX = Math.floor(primitive.x0 / cell), cellY = Math.floor(primitive.y0 / cell);
+  if (Math.floor(primitive.x1 / cell) !== cellX || Math.floor(primitive.y1 / cell) !== cellY) return false;
+  const reversed = primitive.x1 < primitive.x0 ||
+    (primitive.x1 === primitive.x0 && primitive.y1 < primitive.y0);
+  const direction = dot ? "point" : Math.round(Math.atan2(
+    reversed ? primitive.y0 - primitive.y1 : primitive.y1 - primitive.y0,
+    Math.abs(primitive.x1 - primitive.x0)) / ANGLE_STEP);
+  const clip = primitive.visibleBounds;
+  const key = `${primitive.paintGroup ?? ""}|${cellX},${cellY}|${direction}|${primitive.flags}|` +
+    `${primitive.halfWidth}|${primitive.colorR},${primitive.colorG},${primitive.colorB}` +
+    (clip ? `|${clip.minX},${clip.minY},${clip.maxX},${clip.maxY}` : "");
+  let group = groups.get(key);
+  if (!group) {
+    // Resource bounds reduce optimization only: unmatched marks still emit
+    // their complete source geometry through the normal preservation path.
+    if (groups.size >= LOD_DENSITY_MAX_GROUPS) return false;
+    group = createDenseStrokeGroup();
+    groups.set(key, group);
+  }
+  appendDenseStroke(group, primitive, index);
+  return true;
+}
+
+function createDenseStrokeGroup(): DenseStrokeGroup {
+  return { members: [], count: 0, coincident: true, x0: 0, y0: 0, x1: 0, y1: 0 };
+}
+
+function appendDenseStroke(group: DenseStrokeGroup, primitive: StrokePrimitive, index: number): void {
+  let x0 = primitive.x0, y0 = primitive.y0, x1 = primitive.x1, y1 = primitive.y1;
+  // Reversing a centerline leaves its coverage unchanged. Normalize it before
+  // averaging so reversed source paths do not collapse to dots.
+  if (x1 < x0 || (x1 === x0 && y1 < y0)) {
+    [x0, x1] = [x1, x0];
+    [y0, y1] = [y1, y0];
+  }
+  if (group.count > 0 && (x0 !== group.x0 / group.count || y0 !== group.y0 / group.count ||
+      x1 !== group.x1 / group.count || y1 !== group.y1 / group.count)) group.coincident = false;
+  group.members.push(index);
+  group.count++;
+  group.x0 += x0;
+  group.y0 += y0;
+  group.x1 += x1;
+  group.y1 += y1;
+}
+
+function emitDenseStrokeGroup(
+  scene: VectorScene, group: DenseStrokeGroup, endpoints: Float4Builder, primitiveMeta: Float4Builder,
+  primitiveBounds: Float4Builder, styles: Float4Builder, bounds: Bounds, cell: number,
+  paintOrigins?: number[], depth = 0
+): void {
+  if (group.coincident ? group.count < 2 : group.count < LOD_DENSITY_MIN_MEMBERS || depth >= 8) {
+    for (const index of group.members) {
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, readStrokePrimitive(scene, index)!, paintOrigins);
+    }
+    return;
+  }
+  if (!group.coincident && group.count > LOD_DENSITY_MIN_MEMBERS) {
+    // Chunking a crowded cell into repeated average representatives compounds
+    // the same spatial error. Subdivide instead, retaining its distribution.
+    const children = new Map<string, DenseStrokeGroup>();
+    const childCell = cell * 0.5;
+    for (const index of group.members) {
+      const primitive = readStrokePrimitive(scene, index)!;
+      const x = Math.floor(primitive.x0 / childCell), y = Math.floor(primitive.y0 / childCell);
+      if (Math.floor(primitive.x1 / childCell) !== x || Math.floor(primitive.y1 / childCell) !== y) {
+        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, primitive, paintOrigins);
+        continue;
+      }
+      const key = `${x},${y}`;
+      let child = children.get(key);
+      if (!child) children.set(key, child = createDenseStrokeGroup());
+      appendDenseStroke(child, primitive, index);
+    }
+    for (const child of children.values()) {
+      emitDenseStrokeGroup(scene, child, endpoints, primitiveMeta, primitiveBounds, styles, bounds,
+        childCell, paintOrigins, depth + 1);
+    }
+    return;
+  }
+  const primitive = readStrokePrimitive(scene, group.members[0])!;
+  primitive.x0 = group.x0 / group.count;
+  primitive.y0 = group.y0 / group.count;
+  primitive.x1 = primitive.cx = group.x1 / group.count;
+  primitive.y1 = primitive.cy = group.y1 / group.count;
+  const source = readStrokePrimitive(scene, group.members[0])!;
+  if ((source.x0 !== source.x1 || source.y0 !== source.y1) &&
+      Math.fround(primitive.x0) === Math.fround(primitive.x1) &&
+      Math.fround(primitive.y0) === Math.fround(primitive.y1)) {
+    for (const index of group.members) {
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, readStrokePrimitive(scene, index)!, paintOrigins);
+    }
+    return;
+  }
+  // Keep multiplicity exactly representable in Float32 metadata. Co-located
+  // representatives compose to the same total source-over coverage.
+  for (let remaining = group.count; remaining > 0;) {
+    const count = Math.min(remaining, LOD_DENSITY_MAX_MULTIPLICITY);
+    primitive.primitiveType = 1 - count;
+    emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, primitive, paintOrigins);
+    remaining -= count;
+  }
 }
 
 function shouldPreservePrimitiveAtTolerance(

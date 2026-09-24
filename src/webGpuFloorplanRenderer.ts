@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { vectorFillBandStore, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
@@ -169,6 +169,7 @@ fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
 
 const STROKE_SHADER_SOURCE = /* wgsl */ `
 ${STROKE_COVERAGE_WGSL}
+${STROKE_DENSITY_WGSL}
 struct CameraUniforms {
   viewport : vec2f,
   cameraCenter : vec2f,
@@ -344,9 +345,10 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   );
 
   let coverage = heprStrokeCoverage(distanceToSegment, inData.halfWidth, inData.aaWorld);
-  let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
+  var alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
+  alpha = heprStrokeLodAlpha(alpha, inData.primitiveType);
 
-  if (alpha <= 0.001) {
+  if (alpha <= 0.0) {
     discard;
   }
 
@@ -3721,12 +3723,10 @@ export class WebGpuFloorplanRenderer {
     const sceneEligible =
       this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene() ||
       (this.scene?.drawRuns?.length ?? 0) >= NATIVE_PAN_CACHE_MIN_PAINTS;
-    const vectorLodActive = this.vectorLodRuntime !== null;
     const zoomAnimating =
       Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
     return shouldUseNativePanCacheForFrame(
       sceneEligible,
-      vectorLodActive,
       this.isPanInteracting,
       isCameraAnimating,
       zoomAnimating

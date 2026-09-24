@@ -1,4 +1,4 @@
-import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
@@ -166,6 +166,7 @@ fn heprStrokeClipPosition(
 `);
 
 const strokeCoverageFn = TSL.wgslFn(STROKE_COVERAGE_WGSL);
+const strokeDensityFn = TSL.wgslFn(STROKE_DENSITY_WGSL);
 
 const distanceToLineSegmentFn = TSL.wgslFn(CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE);
 
@@ -225,8 +226,9 @@ fn heprStrokeFragment(
   }
 
   let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
-  let alpha = coverage * alphaStyle;
-  if (alpha <= 0.001) {
+  var alpha = coverage * alphaStyle;
+  alpha = heprStrokeLodAlpha(alpha, primitiveType);
+  if (alpha <= 0.0) {
     discard;
   }
 
@@ -238,6 +240,7 @@ fn heprStrokeFragment(
 `, [
   includeNode(floatModFn),
   includeNode(strokeCoverageFn),
+  includeNode(strokeDensityFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn)
 ]);

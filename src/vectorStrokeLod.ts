@@ -44,6 +44,7 @@ export class ThreeVectorLodStrokeLayer {
   private readonly runtime: VectorStrokeLodRuntime;
   private readonly layers: ThreeMaterialStrokeLayer[];
   private requestedVisible = false;
+  private selectionInitialized = false;
   private readonly combinedIds: Uint32Array | null;
   private readonly levelOffsets: number[] = [];
 
@@ -135,8 +136,15 @@ export class ThreeVectorLodStrokeLayer {
     if (!this.group.visible || this.layers.length <= 0) {
       return;
     }
-    this.runtime.update(viewState, viewport, cullingBounds);
-    this.updateLevelDraws(viewState, viewport);
+    const selectionChanged = this.runtime.update(viewState, viewport, cullingBounds);
+    if (selectionChanged || !this.selectionInitialized) {
+      this.updateLevelDraws(viewState, viewport);
+      this.selectionInitialized = true;
+    } else {
+      // Runtime reuse keeps every selected ID valid. Refresh camera uniforms
+      // and any changed paint schedule without repacking/scanning those IDs.
+      for (const layer of this.layers) layer.updateFrameWithUnchangedSelection(viewState, viewport);
+    }
   }
 
   estimateVisibleSegmentCount(): number {
@@ -156,6 +164,7 @@ export class ThreeVectorLodStrokeLayer {
 
   deactivate(): void {
     this.requestedVisible = false;
+    this.selectionInitialized = false;
     this.runtime.resetVisible();
     for (const layer of this.layers) {
       layer.setDrawEnabled(false);

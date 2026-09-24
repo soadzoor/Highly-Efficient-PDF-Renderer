@@ -292,6 +292,13 @@ export class ThreeMaterialStrokeLayer {
     this.orderedRuns?.finishUpdate();
   }
 
+  /** Reuse external selection IDs while refreshing camera and shared paint order. */
+  updateFrameWithUnchangedSelection(viewState: ViewState, viewport: ViewportPixels): void {
+    this.updateFrameUniforms(viewState, viewport);
+    this.orderedRuns?.beginUpdate();
+    this.orderedRuns?.finishUpdate();
+  }
+
   estimateVisibleSegmentCount(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): number {
     const estimate = this.collectVisibleSegments(viewState, viewport, cullingBounds, false);
     return estimate >= 0 ? estimate : this.segmentCount;

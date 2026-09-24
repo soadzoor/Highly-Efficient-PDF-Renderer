@@ -38,6 +38,7 @@ export const fastTests = [
   "three-raster-paint-order",
   "three-vector-draw-batching",
   "three-ordered-stroke-lod",
+  "three-camera-stroke-lod",
   "three-vector-instance-clip",
   "three-webgpu-composite-material",
   "three-webgpu-raster-strip-material",
@@ -110,7 +111,8 @@ export const fastTests = [
   "room-boundary-geometry",
   "room-detector-seeds",
   "room-geometry-fallback",
-  "vector-stroke-clip-lod"
+  "vector-stroke-clip-lod",
+  "vector-stroke-density-lod"
 ];
 
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
