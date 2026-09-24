@@ -656,8 +656,19 @@ vec4 heprSamplePdfGradient(vec2 world, float gradientIndexInput) {
 }
 `;
 
+// Gradient edges often come from the PDF clip instead of the paint path.
+// Evaluate their pixel footprint before the core shader's early discards.
+function withAntialiasedGradientClip(source: string): string {
+  return source
+    .replace("void main() {", `void main() {
+  float clipPixelX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float clipPixelY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float clipAAWidth = max(max(clipPixelX, clipPixelY), 1e-4);`)
+    .replaceAll("outColor *= heprVectorClip(vLocal);", "outColor.a *= heprVectorClipAA(vLocal, clipAAWidth);");
+}
+
 function buildGradientFillFragmentShader(): string {
-  return CORE_FILL_FRAGMENT_SHADER_SOURCE
+  return withAntialiasedGradientClip(CORE_FILL_FRAGMENT_SHADER_SOURCE)
     .replace("uniform vec4 uVectorOverride;", `uniform vec4 uVectorOverride;\n${GLSL_GRADIENT_DECLARATIONS}`)
     .replace(
       "  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));",
@@ -674,7 +685,7 @@ function buildGradientFillFragmentShader(): string {
 }
 
 function buildGradientStrokeFragmentShader(): string {
-  return CORE_STROKE_FRAGMENT_SHADER_SOURCE
+  return withAntialiasedGradientClip(CORE_STROKE_FRAGMENT_SHADER_SOURCE)
     .replace("uniform vec4 uVectorOverride;", `uniform vec4 uVectorOverride;\n${GLSL_GRADIENT_DECLARATIONS}`)
     .replace(
       "  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));\n  outColor = heprThreeEncodeOutputColor(vec4(color, alpha));",

@@ -1,6 +1,6 @@
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
-import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+import { VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
 
 const CAMERA_STRUCT = /* wgsl */ `
 struct CameraUniforms {
@@ -33,7 +33,7 @@ const GRADIENT_BINDINGS = /* wgsl */ `
 `;
 
 const GRADIENT_FUNCTIONS = /* wgsl */ `
-${VECTOR_CLIP_WGSL}
+${VECTOR_CLIP_AA_WGSL}
 fn gradientCoord(index : i32) -> vec2i {
   let dimensions = textureDimensions(uGradientMetaA);
   return vec2i(index % i32(dimensions.x), index / i32(dimensions.x));
@@ -239,12 +239,12 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   // loop exit, or discard in the fragment shader.
   let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
+  let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) { discard; }
   let dimensions = textureDimensions(uSegmentsA);
   var minDistance = 1e20;
   var winding = 0;
   var crossings = 0;
-  let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
   let searchRadius = select(aaWidth, 0.0, inData.companionStroke >= 0.5);
 ${vectorFillBandLoopWgsl({
     bands: "inData.bands",
@@ -290,7 +290,7 @@ ${vectorFillBandLoopWgsl({
   if (alpha <= 0.001) { discard; }
   let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
   let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
+  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.x, uVectorClipTex, aaWidth));
 }
 `;
 
@@ -393,6 +393,7 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
   // alpha tests can discard individual fragments.
   let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
+  let localPerPixel = max(max(dx, dy), 1e-6);
   if (inData.alpha <= 0.001) { discard; }
   if (
     inData.hasClipBounds >= 0.5 &&
@@ -404,7 +405,6 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
     distanceToQuadratic(inData.local, inData.p0, inData.p1, inData.p2),
     uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5
   );
-  let localPerPixel = max(max(dx, dy), 1e-6);
   let aaWorld = max(localPerPixel * uCamera.strokeAAScreenPx, 5e-5);
   let coverage = 1.0 - smoothstep(inData.halfWidth - aaWorld, inData.halfWidth + aaWorld, distanceValue);
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
@@ -413,6 +413,6 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
   if (alpha <= 0.001) { discard; }
   let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
   let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
+  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.x, uVectorClipTex, localPerPixel));
 }
 `;

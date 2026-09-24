@@ -244,14 +244,14 @@ void accumulateCrossing(vec2 start, vec2 end, vec2 point, inout int winding, ino
 }
 
 void main() {
+  // Evaluate the pixel footprint before alpha tests or per-fragment clipping.
+  float dxLocal = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float dyLocal = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float aaWidth = max(max(dxLocal, dyLocal) * uAAScreenPx, 1e-4);
   if (vSegmentCount <= 0 || vAlpha <= 0.001) discard;
   float minDistance = 1e20;
   int winding = 0;
   int crossings = 0;
-
-  float dxLocal = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float dyLocal = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-  float aaWidth = max(max(dxLocal, dyLocal) * uAAScreenPx, 1e-4);
 
   int bandCount = int(vBands.y);
   // Only a segment reaching this row can cross its ray, and only one within the
@@ -327,7 +327,7 @@ void main() {
   if (alpha <= 0.001) discard;
   vec3 baseColor = uPrimitiveOverride.a > 0.5 ? uPrimitiveOverride.rgb : source.rgb;
   vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
+  outColor = vec4(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(vLocal, aaWidth));
 }
 `;
 
@@ -527,6 +527,9 @@ float distanceToQuadratic(vec2 point, vec2 p0, vec2 p1, vec2 p2) {
 }
 
 void main() {
+  float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float localPerPixel = max(max(dx, dy), 1e-6);
   if (vAlpha <= 0.001) discard;
   if (
     vHasClipBounds >= 0.5 &&
@@ -536,9 +539,6 @@ void main() {
   float distanceValue = uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5
     ? distanceToQuadratic(vLocal, vP0, vP1, vP2)
     : distanceToLine(vLocal, vP0, vP2);
-  float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-  float localPerPixel = max(max(dx, dy), 1e-6);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
   float coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceValue);
@@ -551,6 +551,6 @@ void main() {
   if (alpha <= 0.001) discard;
   vec3 baseColor = uPrimitiveOverride.a > 0.5 ? uPrimitiveOverride.rgb : source.rgb;
   vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
+  outColor = vec4(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(vLocal, localPerPixel));
 }
 `;

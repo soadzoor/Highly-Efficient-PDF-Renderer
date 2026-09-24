@@ -468,7 +468,7 @@ export function createThreeWebGpuGradientFillMaterial(
     useMesh: TSL.uniform(options.mesh ? 1 : 0), shapeOnly,
     vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor)
   });
-  registerThreeNodeClipPosition(material, vertexValue.xy);
+  registerThreeNodeClipPosition(material, vertexValue.xy, true);
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,
@@ -512,7 +512,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
     aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor),
     ...createGradientNodes(options, gradientWidth)
   });
-  registerThreeNodeClipPosition(material, worldValue.xy);
+  registerThreeNodeClipPosition(material, worldValue.xy, true);
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,

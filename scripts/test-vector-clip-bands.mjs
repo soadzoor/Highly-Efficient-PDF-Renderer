@@ -10,12 +10,13 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 const f32 = Math.fround;
 const scratch = new DataView(new ArrayBuffer(4));
-let checkedRows = 0, checkedPoints = 0;
+let checkedRows = 0, checkedPoints = 0, checkedDistances = 0, checkedCoverage = 0;
 try {
   const { packVectorClips } = await import("../src/vectorClips.ts");
   const oval = ellipse(2945, 125, 70);
   const fixtures = [
     ["dense oval", oval],
+    ["subdivided rectangle with horizontal boundaries", subdividedRectangle(-125, -70, 125, 70)],
     ["rotated and sheared oval", ellipse(1536, 90, 30, ([x, y]) => [0.7 * x - 0.9 * y - 60, 0.6 * x + 1.1 * y + 25])],
     ["same-winding hole", join(ellipse(768, 90, 60), ellipse(512, 35, 25))],
     ["opposite-winding hole", join(ellipse(768, 90, 60), ellipse(512, 35, 25, p => p, true))],
@@ -47,6 +48,7 @@ try {
     const evenOddStats = bandStats(packed, 2);
     assert.deepEqual(evenOddStats, stats, "fill rule does not alter candidate selection");
     if (name === "dense oval") ovalStats = stats;
+    verifyDistanceCandidates(name, edges, packed, 1, padY);
 
     const ys = boundaryRows(edges, packed, 1);
     const stride = Math.max(1, Math.ceil(ys.length / 80));
@@ -83,6 +85,58 @@ try {
     const packed = packVectorClips([{ parent: -1, fillRule: 1, edges }]);
     assert.equal(packed[3], 1, `${name}: retain the complete linear scan`);
     assert.deepEqual(packed.subarray(packed[1] * 4), edges, `${name}: original edges remain intact`);
+    if (name === "small polygon") verifyDistanceCandidates(name, edges, packed, 0, 40);
+  }
+
+  // Compare the accelerated boundary probe and indexed samples against an
+  // independent 4x4 evaluation of the original complete clip geometry.
+  for (const edges of [oval, subdividedRectangle(-125, -70, 125, 70)]) {
+    for (const fillRule of [0, 1]) {
+      const clips = [{ parent: -1, fillRule, edges }], packed = packVectorClips(clips);
+      for (const width of [0.0625, 0.5, 4, 16]) for (const delta of [-1, -0.25, 0, 0.25, 1]) {
+        for (const [x, y] of [[125 + delta * width, 0], [0, 70 + delta * width]]) {
+          const { coverage } = verifyCoverage("axis edge", clips, packed, 0, x, y, width);
+          assert.equal(coverage, Math.max(0, Math.min(1, 0.5 - delta)),
+            `axis edge coverage at (${x}, ${y}), pixel width ${width}`);
+        }
+      }
+      for (const [x, y] of [[0, 0], [1000, 1000]]) {
+        assert.equal(verifyCoverage("far from boundary", clips, packed, 0, x, y, 1).samples, 0,
+          "full interior/exterior coverage does not need subpixel winding tests");
+      }
+    }
+  }
+
+  const contour = ellipse(512, 30, 20);
+  const compoundFixtures = [
+    ["overlapping nonzero contours", 0, join(contour, ellipse(512, 30, 20, ([x, y]) => [x + 20, y])),
+      [[30, 0], [-10, 0]], 1],
+    ["redundant nested nonzero contour", 0, join(contour, ellipse(256, 10, 8)), [[10, 0], [0, 8]], 1],
+    ["duplicate even-odd contours", 1, join(contour, contour), [[30, 0], [0, 20], [0, 0]], 0],
+    ["opposite coincident contours", 0, join(contour, ellipse(512, 30, 20, p => p, true)),
+      [[30, 0], [0, 20], [0, 0]], 0]
+  ];
+  for (const [name, fillRule, edges, points, expected] of compoundFixtures) {
+    const clips = [{ parent: -1, fillRule, edges }], packed = packVectorClips(clips);
+    for (const width of [0.0625, 0.5, 4]) for (const [x, y] of points) {
+      assert.equal(verifyCoverage(name, clips, packed, 0, x, y, width).coverage, expected,
+        `${name}: antialiasing preserves the compound path interior`);
+    }
+  }
+
+  const nested = [
+    { parent: -1, fillRule: 0, edges: rectangle(-20, -20, 0, 20) },
+    { parent: 0, fillRule: 0, edges: rectangle(-20, -20, 20, 0) },
+    { parent: 1, fillRule: 0, edges: rectangle(-20, -20, 20, 0) },
+    { parent: 0, fillRule: 0, edges: ellipse(512, 10, 10) }
+  ], nestedPacked = packVectorClips(nested);
+  for (const width of [0.0625, 0.5, 4]) {
+    for (const root of [1, 2]) {
+      assert.equal(verifyCoverage("intersecting rectangle ancestors", nested, nestedPacked, root, 0, 0, width).coverage,
+        0.25, "clip ancestors intersect each subpixel instead of multiplying or minimizing per-clip alpha");
+    }
+    assert.equal(verifyCoverage("polygon and rectangle ancestors", nested, nestedPacked, 3, 0, 10, width).coverage,
+      0.25, "polygon and rectangle clips use the same subpixel positions");
   }
 
   const clip = { parent: -1, fillRule: 0, edges: oval };
@@ -103,6 +157,7 @@ try {
     for (const root of [0, 1]) assert.equal(packedContains(mixed, root, x, y), windingContains(oval, root, x, y));
   }
   console.log(`Vector clip bands preserve crossings at ${checkedRows} boundary rows and Float32 winding at ${checkedPoints} points; ` +
+    `${checkedDistances} pixel footprints preserve boundary distance and ${checkedCoverage} preserve coverage; ` +
     `dense oval averages ${ovalStats.average.toFixed(1)} of 2945 edges (${ovalStats.maximum} maximum)`);
 } finally { hooks.deregister(); }
 
@@ -117,6 +172,13 @@ function ellipse(count, rx, ry, transform = p => p, reverse = false) {
   return polygon(reverse ? points.reverse() : points);
 }
 function rectangle(x0, y0, x1, y1) { return polygon([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]); }
+function subdividedRectangle(x0, y0, x1, y1) {
+  const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  return polygon(corners.flatMap(([x, y], index) => {
+    const [nextX, nextY] = corners[(index + 1) % corners.length];
+    return Array.from({ length: 64 }, (_, i) => [x + (nextX - x) * i / 64, y + (nextY - y) * i / 64]);
+  }));
+}
 function join(a, b) { return new Float32Array([...a, ...b]); }
 function edgeBounds(edges) {
   const bounds = [Infinity, Infinity, -Infinity, -Infinity];
@@ -141,6 +203,83 @@ function bandRange(packed, root, y) {
     Math.floor(f32(f32(y - packed[offset + 1]) / packed[offset + 2]))));
   const table = (packed[offset] + row) * 4;
   return [packed[table] * 4, packed[table + 1]];
+}
+function boundaryDistance(edges, x, y) {
+  let distance = Infinity;
+  for (let i = 0; i < edges.length; i += 4) {
+    const dx = edges[i + 2] - edges[i], dy = edges[i + 3] - edges[i + 1];
+    const lengthSquared = dx * dx + dy * dy;
+    const t = lengthSquared ? Math.max(0, Math.min(1,
+      ((x - edges[i]) * dx + (y - edges[i + 1]) * dy) / lengthSquared)) : 0;
+    distance = Math.min(distance, Math.hypot(x - edges[i] - t * dx, y - edges[i + 1] - t * dy));
+  }
+  return distance;
+}
+function packedBoundaryDistance(packed, root, x, y, width) {
+  const offset = packed[root * 4 + 1] * 4;
+  if (packed[root * 4 + 2] < 0) {
+    return boundaryDistance(rectangle(...packed.subarray(offset, offset + 4)), x, y);
+  }
+  if (packed[root * 4 + 3] < 2) {
+    return boundaryDistance(packed.subarray(offset, offset + packed[root * 4 + 2] * 4), x, y);
+  }
+  const bandCount = packed[offset + 3], table = packed[offset] * 4;
+  const row = value => Math.max(0, Math.min(bandCount - 1,
+    Math.floor(f32(f32(value - packed[offset + 1]) / packed[offset + 2]))));
+  let distance = Infinity;
+  // The conservative probe radius encloses every 4x4 subpixel sample. Nearby
+  // boundaries must be present even when the center row has no candidate edges.
+  const first = row(f32(y - width * 0.75)), last = row(f32(y + width * 0.75));
+  for (let band = first; band <= last; band++) {
+    const start = packed[table + band * 4] * 4, end = start + packed[table + band * 4 + 1] * 4;
+    distance = Math.min(distance, boundaryDistance(packed.subarray(start, end), x, y));
+  }
+  return distance;
+}
+function packedCoverage(packed, root, x, y, width) {
+  let nearBoundary = false;
+  for (let index = root; index >= 0; index = packed[index * 4]) {
+    if (packedBoundaryDistance(packed, index, x, y, width) <= width * 0.75) {
+      nearBoundary = true;
+      break;
+    }
+  }
+  if (!nearBoundary) return { coverage: Number(packedContains(packed, root, x, y)), samples: 0 };
+  let covered = 0;
+  for (const dx of [-0.375, -0.125, 0.125, 0.375]) for (const dy of [-0.375, -0.125, 0.125, 0.375]) {
+    covered += Number(packedContains(packed, root, f32(x + dx * width), f32(y + dy * width)));
+  }
+  return { coverage: covered / 16, samples: 16 };
+}
+function verifyCoverage(name, clips, packed, root, x, y, width) {
+  let expected = 0;
+  for (let row = 0; row < 4; row++) for (let column = 0; column < 4; column++) {
+    const sx = f32(x + ((column + 0.5) / 4 - 0.5) * width);
+    const sy = f32(y + ((row + 0.5) / 4 - 0.5) * width);
+    if (originalContains(clips, root, sx, sy)) expected += 1 / 16;
+  }
+  const actual = packedCoverage(packed, root, x, y, width);
+  assert.equal(actual.coverage, expected, `${name}: pixel width ${width} preserves sampled coverage at (${x}, ${y})`);
+  checkedCoverage++;
+  return actual;
+}
+function verifyDistanceCandidates(name, edges, packed, root, height) {
+  const stride = Math.max(4, Math.ceil(edges.length / 128) * 4);
+  for (let edge = 0; edge < edges.length; edge += stride) {
+    const dx = edges[edge + 2] - edges[edge], dy = edges[edge + 3] - edges[edge + 1];
+    const length = Math.hypot(dx, dy);
+    if (!length) continue;
+    for (const width of [height / 2048, height / 128, height / 8]) {
+      for (const shift of [-0.75, -0.25, 0, 0.25, 0.75]) {
+        const x = f32((edges[edge] + edges[edge + 2]) / 2 + shift * width * dy / length);
+        const y = f32((edges[edge + 1] + edges[edge + 3]) / 2 - shift * width * dx / length);
+        const expected = Math.min(width * 0.75, boundaryDistance(edges, x, y));
+        const actual = Math.min(width * 0.75, packedBoundaryDistance(packed, root, x, y, width));
+        assert.equal(actual, expected, `${name}: pixel width ${width} preserves nearest edge at (${x}, ${y})`);
+        checkedDistances++;
+      }
+    }
+  }
 }
 function boundaryRows(edges, packed, root) {
   const ys = new Set();

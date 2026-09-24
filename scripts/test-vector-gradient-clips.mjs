@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import * as THREE from "three";
+import { TSL, WGSLNodeBuilder } from "three/webgpu";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -28,11 +30,17 @@ try {
 
   for (const source of [GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE]) {
     assert.match(source, /uniform float uVectorClipIndex/);
-    assert.match(source, /\* heprVectorClip\(vLocal\)/);
+    assert.match(source, /vec4\(color, clamp\(alpha, 0\.0, 1\.0\) \* heprVectorClipAA\(vLocal, (aaWidth|localPerPixel)\)\)/,
+      "clip coverage scales alpha without darkening straight-alpha RGB");
+    const main = source.slice(source.lastIndexOf("void main() {"));
+    assert(main.indexOf("dFdx") < main.indexOf("discard"), "clip derivatives precede divergent discards");
   }
   for (const source of [GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL]) {
     assert.match(source, /@group\(1\) @binding\(0\) var uVectorClipTex/);
-    assert.match(source, /\* heprVectorClip\(inData.local, uVectorClip.x, uVectorClipTex\)/);
+    assert.match(source, /vec4f\(color, clamp\(alpha, 0\.0, 1\.0\) \* heprVectorClipAA\(inData.local, uVectorClip.x, uVectorClipTex, (aaWidth|localPerPixel)\)\)/,
+      "native WebGPU preserves straight-alpha RGB along clip boundaries");
+    const main = source.slice(source.lastIndexOf("fn fsMain(")).replace(/\/\/[^\n]*/g, "");
+    assert(main.indexOf("dpdx") < main.indexOf("discard"), "clip derivatives precede divergent discards");
   }
 
   // Dispatch real gradient methods against small command recorders. Each draw
@@ -169,11 +177,25 @@ try {
     if (materialBackend === "webgl") {
       assert.deepEqual(materials.map(m => m.uniforms.uVectorClipIndex.value), [1, -1, 0]);
       assert.equal(materials[0].uniforms.uVectorClipTex.value, materials[2].uniforms.uVectorClipTex.value);
-      assert(materials.every(m => m.fragmentShader.includes("heprVectorClip(vLocal)")));
+      for (const material of materials) {
+        assert(material.fragmentShader.includes("outColor.a *= heprVectorClipAA(vLocal, clipAAWidth)"));
+        assert(!material.fragmentShader.includes("outColor *= heprVectorClip(vLocal)"));
+        const main = material.fragmentShader.slice(material.fragmentShader.lastIndexOf("void main() {"));
+        assert(main.indexOf("float clipAAWidth") < main.indexOf("discard"),
+          "Three WebGL derives the clip footprint before paint discards");
+      }
     } else {
-      assert.equal(materials[0].fragmentNode.node.op, "*");
-      assert.equal(materials[2].fragmentNode.node.op, "*");
-      assert.notEqual(materials[1].fragmentNode.node?.op, "*");
+      for (const index of [0, 2]) {
+        const shader = buildNodeShader(entries[index].mesh).fragmentShader;
+        assert.match(shader, /fn heprVectorClipAA\s*\(/, "clipped gradient nodes use smooth clip coverage");
+        assert.match(shader, /vec4<f32>\( heprClipSource\.xyz, \( heprClipSource\.w \* heprVectorClipAA\(/,
+          "Three WebGPU scales only alpha at the clip boundary");
+        const main = shader.slice(shader.lastIndexOf("@fragment"));
+        assert(main.indexOf("heprClipAAWidth = heprClipPixelWidth") < main.indexOf("heprClipSource = heprGradient"),
+          `clip derivatives execute before the paint helper can discard: ${main}`);
+      }
+      assert(!/fn heprVectorClipAA\s*\(/.test(buildNodeShader(entries[1].mesh).fragmentShader),
+        "unclipped gradients do not evaluate clip coverage");
     }
     layer.updateFrame({ zoom: 2, cameraCenterX: 3, cameraCenterY: 4 }, { width: 200, height: 100 });
     layer.dispose();
@@ -208,4 +230,20 @@ function gradientScene() {
     gradientStrokeEndpoints: floats([0, 50, 100, 50]), gradientStrokePrimitiveMeta: floats([0, 0, 0, 0]),
     gradientStrokePrimitiveBounds: floats([0, 49, 100, 51]), gradientStrokeStyles: floats([1, 0, 0, 0])
   };
+}
+
+function buildNodeShader(mesh) {
+  // Exercise Three's real TSL/WGSL composition without a GPU device or browser.
+  const renderer = {
+    contextNode: TSL.context({}), library: { fromMaterial: value => value },
+    getRenderTarget: () => null, getMRT: () => null,
+    backend: { compatibilityMode: false, utils: { getTextureSampleData: () => ({ primarySamples: 1 }) },
+      capabilities: { getUniformBufferLimit: () => 65536 } },
+    hasFeature: () => false, hasCompatibility: () => false,
+    coordinateSystem: THREE.WebGPUCoordinateSystem
+  };
+  const builder = new WGSLNodeBuilder(mesh, renderer);
+  builder.scene = new THREE.Scene();
+  builder.camera = new THREE.PerspectiveCamera();
+  return builder.build();
 }

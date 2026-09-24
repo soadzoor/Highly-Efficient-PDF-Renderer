@@ -2,20 +2,30 @@ import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { packVectorClips } from "./vectorClips";
-import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+import { VECTOR_CLIP_WGSL, VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
 
 const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
+const antialiasedNodeClips = new WeakSet<THREE.Material>();
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
 const clipFn: unknown = TSL.wgslFn(VECTOR_CLIP_WGSL);
+const clipAAFn: unknown = TSL.wgslFn(VECTOR_CLIP_AA_WGSL);
+const clipPixelWidthFn: unknown = TSL.wgslFn(`
+fn heprClipPixelWidth(point: vec2<f32>) -> f32 {
+  let dx = length(vec2<f32>(dpdx(point.x), dpdy(point.x)));
+  let dy = length(vec2<f32>(dpdx(point.y), dpdy(point.y)));
+  return max(max(dx, dy), 0.0001);
+}
+`);
 
 /** Per-instance clip root, stored as `clipIndex + 1` so zero means unclipped. */
 export const VECTOR_CLIP_INSTANCE_ATTRIBUTE = "aVectorClipIndex";
 /** `uVectorClipIndex` value that selects the instance stream in the core shaders. */
 const INSTANCE_VECTOR_CLIP_UNIFORM = -2;
 
-export function registerThreeNodeClipPosition(material: THREE.Material, world: unknown): void {
+export function registerThreeNodeClipPosition(material: THREE.Material, world: unknown, antialias = false): void {
   nodeWorldPositions.set(material, world);
+  if (antialias) antialiasedNodeClips.add(material);
 }
 
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
@@ -78,10 +88,22 @@ function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): 
     const index = clipIndex === null
       ? TSL.sub(flatVarying(TSL.attribute(VECTOR_CLIP_INSTANCE_ATTRIBUTE, "float")), 1)
       : TSL.uniform(clipIndex);
-    const coverage = (clipFn as (params: Record<string, unknown>) => unknown)({
-      point: world, clipIndex: index, clipTexture: TSL.textureLoad(texture)
-    });
-    material.fragmentNode = TSL.mul(source.fragmentNode as never, coverage as never);
+    const clipParams = { point: world, clipIndex: index, clipTexture: TSL.textureLoad(texture) };
+    if (antialiasedNodeClips.has(source)) {
+      material.fragmentNode = TSL.Fn(() => {
+        // Force derivatives before the paint helper, which can discard. The
+        // straight-alpha blend must keep RGB intact along partially covered clips.
+        const aaWidth = TSL.property("float", "heprClipAAWidth");
+        aaWidth.assign((clipPixelWidthFn as (params: Record<string, unknown>) => never)({ point: world }));
+        const color = TSL.property("vec4", "heprClipSource");
+        color.assign(source.fragmentNode as never);
+        const coverage = (clipAAFn as (params: Record<string, unknown>) => never)({ ...clipParams, aaWidth });
+        return TSL.vec4(color.rgb, TSL.mul(color.a, coverage));
+      })();
+    } else {
+      const coverage = (clipFn as (params: Record<string, unknown>) => never)(clipParams);
+      material.fragmentNode = TSL.mul(source.fragmentNode as never, coverage);
+    }
   } else {
     throw new Error("Unsupported vector clip material.");
   }

@@ -78,8 +78,7 @@ function buildClipBands(edges: Float32Array): ClipBands | null {
   let entries = 0;
   for (let offset = 0; offset < edges.length; offset += 4) {
     const y0 = edges[offset + 1], y1 = edges[offset + 3];
-    // Horizontal edges never pass the shader's half-open crossing predicate.
-    if (y0 === y1) continue;
+    // Horizontal edges cannot change winding, but still bound edge coverage.
     // Match Float32 addressing, with one neighbouring band on each side for
     // backend rounding at a boundary. No geometry or crossing math is changed.
     const first = Math.max(0, clipBandRow(Math.min(y0, y1), minY, height, count) - 1);
@@ -160,7 +159,6 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
     }
     for (let offset = 0; offset < clip.edges.length; offset += 4) {
       const y0 = clip.edges[offset + 1], y1 = clip.edges[offset + 3];
-      if (y0 === y1) continue;
       const first = Math.max(0, clipBandRow(Math.min(y0, y1), bands.minY, bands.height, bandCount) - 1);
       const last = Math.min(bandCount - 1, clipBandRow(Math.max(y0, y1), bands.minY, bands.height, bandCount) + 1);
       for (let band = first; band <= last; band++) {
