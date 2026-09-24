@@ -125,6 +125,7 @@ export const explicitSuites = {
     "raster-image-hep"
   ],
   corpus: [
+    "brochure-page14-compositing",
     "dense-pdf-fast-worker",
     "native-dense-pdf-document",
     "native-text-content-sidecar",

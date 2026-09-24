@@ -39,6 +39,18 @@ try {
     "each composite argument samples the binding it names");
   assert.equal(transfer, "uTransfer", "the soft-mask transfer stays a texture argument of its own");
 
+  // An absent mask is a white 1×1 texture. Loading it at the viewport's
+  // coordinates returned zero away from the origin, hiding translucent groups
+  // such as the two diagonal ovals on Broschuere page 14. Check the generated
+  // GPU code: selecting the right fallback texture alone does not protect it.
+  const pixelLoads = new Map([...fragment.matchAll(/textureLoad\( (u\w+), ([^\n]*) \);/g)]
+    .map(match => [match[1], match[2].replace(/\s+/g, "")]));
+  for (const name of bindings.slice(0, 6)) {
+    assert.equal(pixelLoads.get(name),
+      `vec2<i32>(clamp(fragCoord.xy,vec2<f32>(0.0,0.0),(vec2<f32>(textureDimensions(${name},0))-vec2<f32>(1.0)))),u32(0u)`,
+      `${name} clamps pixel loads to its own dimensions, including neutral 1×1 inputs`);
+  }
+
   // Every pass input is an explicit texture load, so a filterable placeholder
   // would only add an unused sampler binding to each of them.
   assert.doesNotMatch(fragment, /: sampler;/, "the composite inputs bind no samplers");
@@ -51,7 +63,7 @@ try {
   assert.match(present, /textureSample\(/, "the presented surface is filtered, as it is on the GL path");
 
   compositor.dispose();
-  console.log("Three WebGPU compositor: one texture binding per composite input, filtered presentation.");
+  console.log("Three WebGPU compositor: independent texture bindings, bounded neutral inputs, filtered presentation.");
 } finally { hooks.deregister(); }
 
 function build(material, geometry) {

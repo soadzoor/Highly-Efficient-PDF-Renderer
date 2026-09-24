@@ -203,8 +203,14 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.mesh = new THREE.Mesh(this.geometry, material);
     } else {
       const material = new NodeMaterial();
-      const textures = names.slice(0, 6).map(name =>
-        bindCompositeTexture(TSL.textureLoad(this.zero, TSL.screenCoordinate), name));
+      const textures = names.slice(0, 6).map(name => {
+        const texture = TSL.textureLoad(this.zero, TSL.screenCoordinate);
+        // Missing inputs use 1×1 neutral textures. Integer texture loads do
+        // not apply sampler clamping, so keep every pixel inside its input.
+        const dimensions = TSL.vec2(TSL.textureSize(texture) as never);
+        texture.uvNode = TSL.clamp(TSL.screenCoordinate, TSL.vec2(0), dimensions.sub(1));
+        return bindCompositeTexture(texture, name);
+      });
       this.bindings.push(...textures);
       material.vertexNode = TSL.vec4(TSL.positionLocal.xy, 0, 1);
       // A texture-valued function argument must stay a texture node rather than a sampled vec4.

@@ -95,13 +95,18 @@ uniform vec4 uExtra;
 uniform vec3 uMaskBackdrop;
 out vec4 outColor;
 ${pdfCompositeFunctions("glsl")}
+// Pass inputs may be 1x1 neutral textures. Integer texel loads do not apply
+// sampler wrap modes, so bound each read to that input's actual dimensions.
+vec4 pdfCompositeLoad(sampler2D inputTexture, ivec2 point) {
+  return texelFetch(inputTexture,clamp(point,ivec2(0),textureSize(inputTexture,0)-ivec2(1)),0);
+}
 float pdfTransferSample(int index) {
   int width=textureSize(uTransfer,0).x;
   return texelFetch(uTransfer,ivec2(index%width,index/width),0).r;
 }
 void main() {
   ivec2 p=ivec2(gl_FragCoord.xy);
-  vec4 source=texelFetch(uSource,p,0);
+  vec4 source=pdfCompositeLoad(uSource,p);
   if (uParams.x==4.0) {
     float value=source.a;
     if (uExtra.y>0.5) value=pdfLum(source.rgb+(1.0-source.a)*uMaskBackdrop);
@@ -112,8 +117,8 @@ void main() {
     }
     outColor=vec4(value); return;
   }
-  outColor=pdfCompositePass(source,texelFetch(uShape,p,0),texelFetch(uCurrent,p,0),texelFetch(uStats,p,0),
-    texelFetch(uInitial,p,0),texelFetch(uMask,p,0),uParams,uExtra);
+  outColor=pdfCompositePass(source,pdfCompositeLoad(uShape,p),pdfCompositeLoad(uCurrent,p),pdfCompositeLoad(uStats,p),
+    pdfCompositeLoad(uInitial,p),pdfCompositeLoad(uMask,p),uParams,uExtra);
 }`;
 
 export const PDF_COMPOSITE_WGSL = `
@@ -127,6 +132,10 @@ struct Params { p:vec4f, q:vec4f, backdrop:vec4f }
 @group(0) @binding(6) var maskTex:texture_2d<f32>;
 @group(0) @binding(7) var transferTex:texture_2d<f32>;
 ${pdfCompositeFunctions("wgsl")}
+// Neutral pass inputs are 1x1, unlike the viewport-sized color surfaces.
+fn pdfCompositeLoad(inputTexture:texture_2d<f32>, point:vec2i)->vec4f {
+  return textureLoad(inputTexture,clamp(point,vec2i(0),vec2i(textureDimensions(inputTexture))-vec2i(1)),0);
+}
 fn pdfTransferSample(index:i32)->f32 {
   let width=i32(textureDimensions(transferTex).x);
   return textureLoad(transferTex,vec2i(index%width,index/width),0).r;
@@ -146,7 +155,7 @@ fn pdfTransferSample(index:i32)->f32 {
     let d=textureLoad(sourceTex,clamp(low+vec2i(1,1),vec2i(0),dimensions-vec2i(1)),0);
     return mix(mix(a,b,fraction.x),mix(c,d,fraction.x),fraction.y);
   }
-  let p=vec2i(position.xy); let source=textureLoad(sourceTex,p,0);
+  let p=vec2i(position.xy); let source=pdfCompositeLoad(sourceTex,p);
   if (params.p.x==4.0) {
     var value=source.a;
     if (params.q.y>0.5) { value=pdfLum(source.rgb+(1.0-source.a)*params.backdrop.rgb); }
@@ -157,6 +166,6 @@ fn pdfTransferSample(index:i32)->f32 {
     }
     return vec4f(value);
   }
-  return pdfCompositePass(source,textureLoad(shapeTex,p,0),textureLoad(currentTex,p,0),textureLoad(statsTex,p,0),
-    textureLoad(initialTex,p,0),textureLoad(maskTex,p,0),params.p,params.q);
+  return pdfCompositePass(source,pdfCompositeLoad(shapeTex,p),pdfCompositeLoad(currentTex,p),pdfCompositeLoad(statsTex,p),
+    pdfCompositeLoad(initialTex,p),pdfCompositeLoad(maskTex,p),params.p,params.q);
 }`;

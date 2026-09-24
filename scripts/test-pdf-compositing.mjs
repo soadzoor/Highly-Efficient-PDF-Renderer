@@ -179,5 +179,20 @@ try {
   assert(PDF_COMPOSITE_FRAGMENT_GLSL.includes("pdfSetLum"));
   assert(PDF_COMPOSITE_WGSL.includes("fn pdfSetLum"));
   assert(!/\b(?:F|I|V3|V4)\b/.test(PDF_COMPOSITE_WGSL),"shared shader equation placeholders are fully lowered");
+  // Missing pass inputs are 1x1 textures: opaque white for a missing mask,
+  // transparent black otherwise. Integer texel loads ignore sampler wrap
+  // modes, so screen coordinates must be bounded by EACH input's dimensions.
+  // Otherwise opacity groups containing masked artwork (Broschuere page 14)
+  // read zero from the absent outer mask and disappear away from pixel (0,0).
+  assert.match(PDF_COMPOSITE_FRAGMENT_GLSL,
+    /texelFetch\(inputTexture,\s*clamp\(point,\s*ivec2\(0\),\s*textureSize\(inputTexture,\s*0\)\s*-\s*ivec2\(1\)\),\s*0\)/);
+  assert.match(PDF_COMPOSITE_WGSL,
+    /textureLoad\(inputTexture,\s*clamp\(point,\s*vec2i\(0\),\s*vec2i\(textureDimensions\(inputTexture\)\)\s*-\s*vec2i\(1\)\),\s*0\)/);
+  for (const name of ["Source", "Shape", "Current", "Stats", "Initial", "Mask"]) {
+    assert.match(PDF_COMPOSITE_FRAGMENT_GLSL, new RegExp(`pdfCompositeLoad\\(u${name},\\s*p\\)`),
+      `${name}: GL loads both neutral and full-size textures in bounds`);
+    assert.match(PDF_COMPOSITE_WGSL, new RegExp(`pdfCompositeLoad\\(${name.toLowerCase()}Tex,\\s*p\\)`),
+      `${name}: GPU loads both neutral and full-size textures in bounds`);
+  }
   console.log("PDF compositing passed: independent 16-blend comparison, group opacity, non-isolation, knockout, masks and cleanup.");
 } finally { hooks.deregister(); }
