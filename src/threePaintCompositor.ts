@@ -7,6 +7,7 @@ import { setThreePdfShapeOnly } from "./threePdfShape";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 import { scenePaintNodeBounds } from "./scenePaintGraph";
+import { getThreeRenderPerformance } from "./threeRenderPerformance";
 
 /** Public renderer operations only, so Three retains ownership of its GPU state cache. */
 export interface ThreePaintHostRenderer {
@@ -257,6 +258,10 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   render(renderer: ThreePaintHostRenderer, scene: VectorScene, roots: readonly THREE.Object3D[], width: number, height: number,
     visible: (condition?: number) => boolean, project: PdfCompositeProjector | null = null): void {
     if (this.rendering) return;
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.compositor");
+    profile?.beginSection("three.compositorSetup");
+    profile?.add("three.compositorFrames");
     this.rendering = true;
     this.renderer = renderer;
     this.project = project; this.viewportWidth = width; this.viewportHeight = height;
@@ -289,8 +294,18 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       renderer.autoClear = false;
       if (renderer.xr) renderer.xr.enabled = false;
       renderer.setScissorTest(false);
+      profile?.beginSection("three.compositorCollect");
       this.collect(roots);
+      profile?.endSection("three.compositorCollect");
+      profile?.beginSection("three.compositorSelection");
       const selected = this.selectPaints(scene);
+      profile?.endSection("three.compositorSelection");
+      profile?.endSection("three.compositorSetup");
+      if (profile) {
+        profile.add("three.proxies", this.proxies.size);
+        profile.add("three.selectedPaints", selected ? selected.reduce((sum, value) => sum + value, 0) : scene.drawRuns?.length ?? 0);
+        profile.add("three.compositeWidth", width); profile.add("three.compositeHeight", height);
+      }
       backdrop = this.acquire(); this.clear(backdrop);
       const backgrounds: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
       for (const proxy of this.proxies.values()) if (proxy.source.userData.heprPageBackground) {
@@ -316,6 +331,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       renderer.setClearColor(saved.clear, saved.alpha); renderer.autoClear = saved.autoClear;
       if (renderer.xr && saved.xr !== undefined) renderer.xr.enabled = saved.xr;
       this.renderer = null; this.rendering = false; this.project = null;
+      profile?.add("three.surfaceBytes", this.surfaces.size * this.width * this.height * 4);
+      profile?.endSection("three.compositor");
     }
   }
 
@@ -327,7 +344,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     const target = new THREE.RenderTarget(this.width, this.height, { depthBuffer: false, stencilBuffer: false,
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, colorSpace: THREE.NoColorSpace });
     this.stampBindingVersion(target.texture);
-    this.surfaces.add(target); return target;
+    this.surfaces.add(target);
+    getThreeRenderPerformance()?.add("three.newSurfaces");
+    return target;
   }
   release(target: THREE.RenderTarget): void { this.pool.push(target); }
   clear(target: THREE.RenderTarget, color: readonly [number, number, number, number] = [0, 0, 0, 0], bounds?: Bounds): void {
@@ -338,6 +357,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     // keep that fast clear there. WebGL can restrict the existing clear call.
     this.target(target, this.backend === "webgl" ? rect : null);
     this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
+    const profile = getThreeRenderPerformance();
+    profile?.add("three.clears");
+    profile?.add("three.clearPixels", this.backend === "webgl" && rect ? rect.width * rect.height : this.width * this.height);
     this.renderer!.clear(true, false, false);
   }
   copy(source: THREE.RenderTarget, destination: THREE.RenderTarget, bounds?: Bounds): void {
@@ -350,6 +372,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     // span as a single host render. The runs are kept individually rather than
     // merged into one range: a span skips paints whose optional content is
     // hidden, so its range can have holes that a merged range would repaint.
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.batchLookup");
     const ordered: ProxyEntry[] = [];
     const byProxy = new Map<ProxyEntry, VectorDrawRun[]>();
     for (const run of runs) {
@@ -373,6 +397,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     if (ordered.some(proxy => proxy.source.userData.heprScheduled)) {
       ordered.sort((a, b) => a.source.renderOrder - b.source.renderOrder);
     }
+    profile?.endSection("three.batchLookup");
+    profile?.beginSection("three.batchGeometry");
     const meshes: THREE.Mesh<THREE.BufferGeometry, THREE.Material>[] = [];
     for (const proxy of ordered) {
       proxy.mesh.material = proxy.source.material;
@@ -381,14 +407,17 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       // Proxy meshes are private to the compositor, so an explicit order keeps
       // source order without depending on the layer's own render order.
       proxy.mesh.renderOrder = meshes.length;
+      if (proxy.run) profile?.add(`three.${proxy.run.kind}Draws`);
       meshes.push(proxy.mesh);
     }
+    profile?.endSection("three.batchGeometry");
     this.drawMeshes(meshes, destination, shapeOnly);
   }
   pass(operation: PdfCompositeOperation<THREE.RenderTarget>, destination: THREE.RenderTarget): void {
     const rect = pdfCompositeScissorRect(operation.bounds, this.project, this.viewportWidth, this.viewportHeight,
       this.width, this.height);
     if (rect && (rect.width === 0 || rect.height === 0)) return;
+    getThreeRenderPerformance()?.add("three.compositePasses");
     const sources = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
     for (let index = 0; index < sources.length; index++) {
       this.bindings[index].value = sources[index]?.texture ?? (index === MASK_BINDING ? this.one : this.zero);
@@ -436,12 +465,27 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     target.scissorTest = rect !== null;
     const y = rect && this.backend === "webgpu" ? target.height - rect.y - rect.height : rect?.y ?? 0;
     target.scissor.set(rect?.x ?? 0, y, rect?.width ?? target.width, rect?.height ?? target.height);
-    this.renderer!.setRenderTarget(target);
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.bindTarget");
+    try { this.renderer!.setRenderTarget(target); }
+    finally { profile?.endSection("three.bindTarget"); }
     // WebGPURenderer reads the renderer's scissor-test flag even for targets;
     // WebGLRenderer restores the target flag on bind. Set both through public APIs.
     this.renderer!.setScissorTest(rect !== null);
   }
   private hostRender(label: () => string): void {
+    const profile = getThreeRenderPerformance();
+    if (!profile) { this.hostRenderInternal(label); return; }
+    const section = this.internalScene.children[0] === this.passMesh ? "three.hostPass" : "three.hostDraw";
+    const start = performance.now();
+    try { this.hostRenderInternal(label); }
+    finally {
+      const duration = performance.now() - start;
+      profile.addSectionTime(section, duration);
+      if (duration >= 8) profile.recordEvent(label(), duration);
+    }
+  }
+  private hostRenderInternal(label: () => string): void {
     const enabled = this.debugValidation ||
       (globalThis as { HEPR_DEBUG_COMPOSITOR_VALIDATION?: boolean }).HEPR_DEBUG_COMPOSITOR_VALIDATION === true;
     const device = enabled
@@ -523,21 +567,24 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         ranges: object.userData.heprDrawRanges as ProxyEntry["ranges"],
         origins: object.userData.heprCanonicalOrigins as Uint32Array | undefined };
       this.proxies.set(object, entry);
-      if (entry.run) {
-        let runs = this.runsByKind.get(entry.run.kind);
-        if (!runs) this.runsByKind.set(entry.run.kind, runs = []);
-        for (const range of entry.ranges ?? [entry.run]) runs.push({ ...range, proxy: entry });
-        changed = true;
-      }
+      if (entry.run) changed = true;
     });
     for (const [object, entry] of this.proxies) if (!present.has(object)) {
       this.disposePartial(entry); this.proxies.delete(object); changed = true;
-      if (entry.run) {
-        const runs = this.runsByKind.get(entry.run.kind)!;
-        for (let index = runs.length - 1; index >= 0; index--) if (runs[index].proxy === entry) runs.splice(index, 1);
-      }
     }
-    if (changed) for (const runs of this.runsByKind.values()) runs.sort((a, b) => a.first - b.first);
+    if (changed) {
+      // A zoom replan can replace meshes owning thousands of canonical ranges.
+      // Removing each old range with splice repeatedly shifts the remaining
+      // index, including newly added ranges. Rebuild once from the live proxies
+      // instead; unchanged frames keep the existing index and subset buffers.
+      this.runsByKind.clear();
+      for (const entry of this.proxies.values()) if (entry.run) {
+        let runs = this.runsByKind.get(entry.run.kind);
+        if (!runs) this.runsByKind.set(entry.run.kind, runs = []);
+        for (const range of entry.ranges ?? [entry.run]) runs.push({ ...range, proxy: entry });
+      }
+      for (const runs of this.runsByKind.values()) runs.sort((a, b) => a.first - b.first);
+    }
   }
   private geometryForRuns(proxy: ProxyEntry, runs: readonly VectorDrawRun[]): THREE.BufferGeometry {
     const geometry = proxy.source.geometry;
@@ -604,6 +651,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       count++;
     }
     partial.instanceCount = count;
+    const profile = getThreeRenderPerformance();
+    profile?.add("three.partialInstances", count);
+    if (profile) for (const [, target] of attributes) profile.add("three.instanceUploadBytes", count * target.itemSize * target.array.BYTES_PER_ELEMENT);
     for (const [, target] of attributes) { target.clearUpdateRanges(); if (count) target.addUpdateRange(0, count * target.itemSize); target.needsUpdate = true; }
     return partial;
   }

@@ -26,6 +26,7 @@ import { RetainedPageReplay } from "./retainedPageReplay";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
+import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { ThreeTextLodLayer } from "./textLodLayer";
 import {
   HEPR_THREE_LAYER_ORDER_PAGE_DEPTH,
@@ -1678,10 +1679,19 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private syncBeforeRender(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.sync");
+    try { this.syncFrame(renderer, camera); }
+    finally { profile?.endSection("three.sync"); }
+  }
+
+  private syncFrame(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
     if (this.isDisposed) {
       return;
     }
 
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.camera");
     this.syncAuxiliaryOutputColorSpace(renderer);
     if (this.primitiveHighlightLayer) {
       const backend = renderer.isWebGPURenderer === true ? "webgpu" : "webgl";
@@ -1723,6 +1733,8 @@ export class HeprThreePdfObject extends THREE.Group {
     const cameraDrivenMaterialPipelineEnabled =
       this.hasCompleteMaterialLayers() && derivedView !== null && hostSupportsRasterTextures;
 
+    profile?.endSection("three.camera");
+    profile?.beginSection("three.pipeline");
     if (!hostSupportsRasterTextures) {
       if (!hostBackendMatches) {
         if (!this.warnedHostBackendFallback) {
@@ -1823,7 +1835,9 @@ export class HeprThreePdfObject extends THREE.Group {
     const shouldRenderExternally =
       shouldRenderThreeCameraFrame ||
       (this.rendererType === "webgpu" && !cameraDrivenMaterialPipelineEnabled);
+    profile?.endSection("three.pipeline");
     if (shouldRenderExternally) {
+      profile?.beginSection("three.nativeFallback");
       if (!this.nativePrimitiveColorsReplayed) {
         const deferred = this.renderer as Partial<DeferredSceneRendererApi>;
         deferred.ensureSceneUploaded?.();
@@ -1836,16 +1850,33 @@ export class HeprThreePdfObject extends THREE.Group {
         this.nativePrimitiveColorsReplayed = true;
       }
       this.renderer.renderExternalFrame?.(performance.now());
+      profile?.endSection("three.nativeFallback");
     }
 
     const materialLayerViewport = cameraDrivenMaterialPipelineEnabled ? rendererViewport : nativeViewport;
+    profile?.beginSection("three.transforms");
     const localUnitsPerPixel = this.updateMaterialLayerTransforms(
       camera,
       materialLayerViewport,
       cameraDrivenMaterialPipelineEnabled
     );
+    profile?.endSection("three.transforms");
+    profile?.beginSection("three.schedule");
+    const previousPlanVersion = this.drawPlan?.version;
     this.updateVectorDrawPlan(localUnitsPerPixel, cameraDrivenMaterialPipelineEnabled);
+    profile?.endSection("three.schedule");
+    if (profile) {
+      profile.add("three.scheduleChanges", this.drawPlan?.version !== previousPlanVersion ? 1 : 0);
+      profile.add("three.scheduleVersion", this.drawPlan?.version ?? 0);
+      profile.add("three.materialPipeline", cameraDrivenMaterialPipelineEnabled ? 1 : 0);
+      const view = derivedView?.viewState ?? this.renderer.getViewState();
+      profile.setFrameContext({ cameraCenterX: view.cameraCenterX, cameraCenterY: view.cameraCenterY,
+        zoom: view.zoom, unitsPerPixel: localUnitsPerPixel,
+        viewportWidth: materialLayerViewport.width, viewportHeight: materialLayerViewport.height });
+    }
+    profile?.beginSection("three.strokeLod");
     this.updateStrokeLodVisibility(localUnitsPerPixel, cameraDrivenMaterialPipelineEnabled);
+    profile?.endSection("three.strokeLod");
 
     const presentedFrameSerial = this.renderer.getPresentedFrameSerial();
     if (
@@ -1864,12 +1895,15 @@ export class HeprThreePdfObject extends THREE.Group {
           this.updateUvFromViewState(viewState, nativeViewport);
         }
       }
+      profile?.beginSection("three.imageGradientUpdate");
       if (this.rasterMaterialLayer.group.visible) {
         this.rasterMaterialLayer.updateFrame(viewState, materialLayerViewport);
       }
       if (this.gradientMaterialLayer.group.visible) {
         this.gradientMaterialLayer.updateFrame(viewState, materialLayerViewport);
       }
+      profile?.endSection("three.imageGradientUpdate");
+      profile?.beginSection("three.vectorUpdate");
       if (this.fillMaterialLayer.mesh.visible) {
         this.fillMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
@@ -1882,15 +1916,20 @@ export class HeprThreePdfObject extends THREE.Group {
       if (this.vectorLodStrokeLayer && this.vectorLodStrokeLayer.group.visible) {
         this.vectorLodStrokeLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
+      profile?.endSection("three.vectorUpdate");
+      profile?.beginSection("three.textLod");
       this.updateTextLodSelection(
         viewState,
         materialLayerViewport,
         materialCullingBounds,
         cameraDrivenMaterialPipelineEnabled
       );
+      profile?.endSection("three.textLod");
+      profile?.beginSection("three.textUpdate");
       if (this.textMaterialLayer.mesh.visible) {
         this.textMaterialLayer.updateFrame(viewState, materialLayerViewport, materialCullingBounds);
       }
+      profile?.endSection("three.textUpdate");
       this.lastSyncedFrameSerial = presentedFrameSerial;
       this.lastViewportWidth = nativeViewport.width;
       this.lastViewportHeight = nativeViewport.height;
@@ -1903,6 +1942,19 @@ export class HeprThreePdfObject extends THREE.Group {
     ) {
       this.renderTexture.needsUpdate = true;
       this.lastUploadedFrameSerial = presentedFrameSerial;
+    }
+    if (profile) {
+      // Read before the compositor hides these roots for presentation.
+      const strokes = this.getRenderedStrokeSegmentCount(), text = this.getTextInstanceStats();
+      if (strokes !== null) profile.add("renderedSegments", strokes);
+      if (text) profile.add("renderedTextInstances", text.rendered);
+      const strokeLod = this.getVectorStrokeLodStats(), textLod = this.getTextLodStats();
+      if (strokeLod) profile.add("three.strokeLodLevel", strokeLod.baselineLevelIndex);
+      if (textLod) {
+        profile.add("three.textExactClusters", textLod.exactClusters);
+        profile.add("three.textCoarseClusters", textLod.coarseClusters);
+        profile.add("three.textSelectionUploads", textLod.selectionUploads);
+      }
     }
     if (cameraDrivenMaterialPipelineEnabled && this.paintVisibility.requiresCompositing &&
       !threeCompositorDisabled()) {

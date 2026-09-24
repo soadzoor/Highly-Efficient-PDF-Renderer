@@ -1,5 +1,84 @@
 # Broschuere rendering performance investigation
 
+## HEP-only Three zoom stall: diagnosis and fix
+
+The two diagnostics-version-2 reports isolate the HEP pause to compositor
+setup during a draw-schedule change. Both use Three r185, WebGL, 1920 × 945,
+DPR 1, and automatic LOD. Their geometry counts match: 2,897 strokes, 3,574
+fills, 20,881 text instances, 64 gradient fills, 31 rasters, 184 clip paths,
+114 transparency groups and 35 masks. Their canonical paint-run counts differ:
+24,887 in the HEP versus 1,410 in the PDF, principally individual fill/text
+ranges versus coalesced runs. This describes the supplied scenes; it does not
+establish that HEP serialization changes the run count.
+
+| Capture frame | Frame CPU | Compositor setup | Schedule change |
+| --- | ---: | ---: | --- |
+| HEP 33 | 2,581.8 ms | 2,552.9 ms | version 2 |
+| HEP 85 | 2,926.1 ms | 2,906.2 ms | version 3 |
+| PDF 101 | 15.6 ms | 2.6 ms | yes |
+| PDF 145 | 14.0 ms | 6.4 ms | yes |
+| PDF 359 | 10.6 ms | 5.7 ms | yes |
+
+Both HEP stalls spend only single-digit milliseconds rebuilding batches and
+have no slow GL-call events. Their long GPU command spans overlap the CPU
+pause and must not be read as seconds of GPU shader execution. The PDF has
+no comparable pause: its maximum frame CPU time is 27.3 ms.
+
+The compositor appended the new meshes' ranges and then removed each old
+mesh's ranges individually using `splice`. With this HEP, every replan removed
+24,792 ranges and shifted approximately 659 million array entries. This
+quadratic cleanup explains why the scene with finer canonical runs stalls
+although its geometry matches the PDF. The fix collects the live proxies,
+releases removed proxies' owned subset buffers, then rebuilds and sorts the
+range index once when membership changes. Unchanged frames retain the index.
+Canonical IDs, paint order, source geometry, masks, resolution and surface
+caching are unchanged; the fix introduces no quality or caching tradeoff.
+
+A short headless reproduction loaded the existing HEP, kept one compositor
+alive across zooms, and updated the real Three draw plan and material layers.
+It did not parse a PDF or execute GPU commands. Zooms used the two stalled
+frames' camera positions/scales. The earlier benchmark below created a new
+compositor for each view, so it did not exercise removal after replanning.
+
+| Transition | Proxy collection before → after | Whole compositor before → after |
+| --- | ---: | ---: |
+| First zoom replan | 2,182.1 → 5.7 ms | 2,190.1 → 13.9 ms |
+| Second zoom replan | 2,918.7 → 6.8 ms | 2,924.3 → 19.9 ms |
+
+These are single local CPU samples, not browser FPS measurements. Submitted
+meshes, clear counts and requested clear pixels matched before/after in all
+four views (initial, both zooms and a subsequent pan). Browser rendering and
+visual parity still need manual verification. The steady 50–60 FPS versus
+native remains a separate issue: fit-all captures submit similar work in the
+HEP and PDF, and this cleanup only occurs when mesh membership changes.
+
+Diagnostics version 2 retains the expanded scheduling, LOD, batch, GL-call and
+frame-gap measurements described in [the manual](manual.md). Two additional
+sections, `three.compositorCollect` and `three.compositorSelection`, now separate
+index maintenance from visible-paint selection inside `three.compositorSetup`.
+Profiling is opt-in; `webglCalls: false` disables detailed GL timing.
+
+Modified for this fix: `src/threePaintCompositor.ts`,
+`scripts/test-three-paint-compositor.mjs`, `docs/manual.md`, and this report.
+The regression bounds indexed array work rather than wall time and failed on
+the old per-range removal. It covers thousands of disjoint ranges, mesh
+replacement, sorting, retained proxies/subset buffers, removal-only updates,
+and ownership/disposal on both backend configurations.
+
+Validation passed: TypeScript typecheck, `git diff --check`, and nine targeted
+headless test files: three-paint-compositor, three-render-performance,
+render-performance, three-vector-draw-batching, three-camera-stroke-lod,
+three-ordered-stroke-lod, three-webgpu-composite-material,
+composite-span-batching and native-paint-compositor.
+
+Manual verification: reload `three-example.html`, open the same HEP and repeat
+the zooms with the same viewport, DPR and LOD settings. Capture with
+`heprPerf.start({ maxFrames: 1200, maxFrameRecords: 240 })`, then stop and copy
+`heprPerf.json()`. Inspect `three.compositorCollect` on frames with
+`three.scheduleChanges`, and check text, clips and transparency while zooming
+in and back out. Compare PDF loading and repeat on WebGPU when available.
+No browser, development server or PDF conversion was run.
+
 ## Three WebGL follow-up, September 24
 
 The supplied Three WebGL capture contains 133 frames at 1920 × 945, DPR 1.

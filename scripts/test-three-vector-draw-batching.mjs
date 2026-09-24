@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
 import * as THREE from "three";
+import { RenderPerformanceProfiler } from "../src/renderPerformance.ts";
+import { withThreeRenderPerformance } from "../src/threeRenderPerformance.ts";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -40,8 +42,22 @@ try {
     "interleaved paints cannot batch in canonical order");
 
   assert.equal(plan.update(0.01), true, "a pixel scale replans the submission order");
-  for (const layer of Object.values(layers)) refresh(layer);
+  const profiler = new RenderPerformanceProfiler();
+  profiler.start({ gpu: false, maxFrames: 2 });
+  profiler.beginFrame();
+  withThreeRenderPerformance(profiler, () => { for (const layer of Object.values(layers)) refresh(layer); });
+  profiler.endFrame();
   const batchedMeshes = totalMeshes(layers);
+  profiler.beginFrame();
+  withThreeRenderPerformance(profiler, () => { for (const layer of Object.values(layers)) refresh(layer); });
+  profiler.endFrame();
+  const capture = profiler.getReport();
+  assert.equal(capture.counters["three.batchRebuilds"].total, 3, "all three replanned layers report a rebuild");
+  assert.equal(capture.counters["three.batchesCreated"].total, batchedMeshes);
+  assert.equal(capture.frameRecords[1].counters["three.batchRebuilds"], 0, "profiling never forces a rebuild");
+  assert.ok(capture.cpuSections["three.batchRebuild"]);
+  assert.ok(capture.cpuSections["three.batchUpdate"]);
+  profiler.dispose();
   assert.ok(batchedMeshes < canonicalMeshes,
     `the schedule must reduce the submitted draws (${batchedMeshes} of ${canonicalMeshes})`);
 

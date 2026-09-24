@@ -16,9 +16,13 @@ export interface RenderPerformanceFrameContext {
   viewportHeight?: number | null;
   unitsPerPixel?: number | null;
   schedulePadding?: number | null;
+  /** Raw interval, including gaps omitted from the frame-interval summary. */
+  frameGapMs?: number | null;
 }
 
-type FrameRecordReason = "slow-cpu" | "slow-gpu" | "high-batches" | "timeline";
+type FrameRecordReason = "slow-cpu" | "slow-gpu" | "high-batches" | "stall-neighbour" | "timeline";
+
+export interface RenderPerformanceEvent { name: string; durationMs: number }
 type FrameGpuStatus = "not-sampled" | "pending" | "available" | "discarded";
 
 export interface RenderPerformanceFrameRecord {
@@ -33,6 +37,8 @@ export interface RenderPerformanceFrameRecord {
   cpuSectionsMs: Record<string, number>;
   counters: Record<string, number>;
   reasons: readonly FrameRecordReason[];
+  /** Up to eight longest diagnostic events in this frame. */
+  events: RenderPerformanceEvent[];
 }
 
 export interface RenderPerformanceSummary {
@@ -79,13 +85,15 @@ const MAX_PENDING_QUERIES = 8;
 const MAX_METRIC_NAMES = 64;
 const IDLE_GAP_MS = 250;
 const FRAME_CONTEXT_KEYS = ["cameraCenterX", "cameraCenterY", "zoom", "viewportWidth", "viewportHeight",
-  "unitsPerPixel", "schedulePadding"] as const;
+  "unitsPerPixel", "schedulePadding", "frameGapMs"] as const;
 const NOTES = [
   "CPU times cover JavaScript and command submission, excluding asynchronous GPU execution.",
   "Frame intervals describe rendered frames, not a continuous FPS benchmark; gaps over 250 ms are omitted.",
   "GPU times sample every fourth rendered frame without waiting; unresolved or invalid samples are discarded.",
   "GPU timers measure the command-stream span, including possible gaps during CPU preparation, not pure GPU busy time. CPU and GPU measurements overlap and must not be added.",
   "Section and counter summaries include zero for completed frames in which that metric was absent.",
+  "Nested CPU sections overlap; do not add parent, child, and GL-call timings. Slow GL calls include driver waits, not just GPU execution.",
+  "Frame context frameGapMs preserves gaps omitted from interval summaries. Events retain up to eight longest instrumented calls per frame.",
   "Frame records are a bounded subset of slow CPU/GPU, high-batch and timeline frames; their selection is not a representative performance distribution."
 ] as const;
 
@@ -109,6 +117,8 @@ export class RenderPerformanceProfiler {
   private readonly frameStarts: number[] = [];
   private readonly recordedIntervals: (number | null)[] = [];
   private readonly frameContexts: RenderPerformanceFrameContext[] = [];
+  private readonly frameEvents: RenderPerformanceEvent[][] = [];
+  private events: RenderPerformanceEvent[] = [];
   private readonly frameGpuTimes: (number | null)[] = [];
   private readonly frameGpuStates: FrameGpuStatus[] = [];
   private readonly cpuSections = new Map<string, number[]>();
@@ -169,6 +179,7 @@ export class RenderPerformanceProfiler {
     const now = this.now();
     const frameTime = timestamp !== undefined && Number.isFinite(timestamp) ? timestamp : now;
     this.frameInterval = null;
+    const gap = this.previousFrame === null ? null : frameTime - this.previousFrame;
     if (this.previousFrame !== null) {
       const interval = frameTime - this.previousFrame;
       if (interval > IDLE_GAP_MS) this.ignoredFrameGaps++;
@@ -176,7 +187,8 @@ export class RenderPerformanceProfiler {
     }
     this.previousFrame = frameTime;
     this.frameStart = now;
-    this.frameContext = null;
+    this.frameContext = this.maxFrameRecords ? { frameGapMs: gap !== null && gap > 0 ? gap : null } : null;
+    this.events = [];
     this.pollGpu();
     if (this.gpuStatus !== "available" || this.frameCpu.length % GPU_SAMPLE_EVERY !== 0) return;
     if (this.maxFrameRecords) this.frameGpuStates[this.frameCpu.length] = "discarded";
@@ -206,6 +218,7 @@ export class RenderPerformanceProfiler {
       this.frameStarts.push(Math.max(0, this.frameStart - this.startedAt));
       this.recordedIntervals.push(this.frameInterval);
       this.frameContexts.push(this.frameContext ?? {});
+      this.frameEvents.push(this.events);
     }
     this.frameCpu.push(Math.max(0, now - this.frameStart));
     this.frameStart = null;
@@ -226,6 +239,22 @@ export class RenderPerformanceProfiler {
     if (start === undefined) return;
     this.openSections.delete(name);
     this.sectionTotals.set(name, (this.sectionTotals.get(name) ?? 0) + Math.max(0, this.now() - start));
+  }
+
+  /** Record a duration measured by an integration, including nested calls. */
+  addSectionTime(name: string, durationMs: number): void {
+    if (!this.active || this.frameStart === null || !Number.isFinite(durationMs) || durationMs < 0) return;
+    if (!this.ensureMetric(this.cpuSections, name)) return;
+    this.sectionTotals.set(name, (this.sectionTotals.get(name) ?? 0) + durationMs);
+  }
+
+  recordEvent(name: string, durationMs: number): void {
+    if (!this.active || this.frameStart === null || !this.maxFrameRecords ||
+        !Number.isFinite(durationMs) || durationMs < 0) return;
+    if (this.events.length === 8 && durationMs <= this.events[7].durationMs) return;
+    this.events.push({ name: name.slice(0, 96), durationMs });
+    this.events.sort((a, b) => b.durationMs - a.durationMs);
+    if (this.events.length > 8) this.events.length = 8;
   }
 
   add(name: string, value = 1): void {
@@ -258,7 +287,8 @@ export class RenderPerformanceProfiler {
     this.frameContext = null;
     this.ignoredFrameGaps = this.discardedMetricNames = this.droppedGpuSamples = 0;
     this.frameIntervals.length = this.frameCpu.length = this.gpuTimes.length = 0;
-    this.frameStarts.length = this.recordedIntervals.length = this.frameContexts.length = 0;
+    this.frameStarts.length = this.recordedIntervals.length = this.frameContexts.length = this.frameEvents.length = 0;
+    this.events = [];
     this.frameGpuTimes.length = this.frameGpuStates.length = 0;
     this.cpuSections.clear(); this.counters.clear();
     this.extension = null;
@@ -319,7 +349,7 @@ export class RenderPerformanceProfiler {
     highest(this.frameGpuTimes, "slow-gpu");
     // Integrations can report the total explicitly; older integrations already
     // expose per-kind batch counters, which are sufficient for correlation.
-    let batches = this.counters.get("drawBatches");
+    let batches = this.counters.get("drawBatches") ?? this.counters.get("drawCalls");
     if (!batches) {
       batches = new Array<number>(count).fill(0);
       for (const [name, values] of this.counters) if (name.endsWith("Batches")) {
@@ -327,6 +357,14 @@ export class RenderPerformanceProfiler {
       }
     }
     highest(batches, "high-batches");
+    // Keep transition evidence around major stalls, after preserving the
+    // highest CPU/GPU/batch samples and before filling baseline timeline slots.
+    const stalls = [...selected.keys()].filter(frame => this.frameCpu[frame] >= 100)
+      .sort((a, b) => this.frameCpu[b] - this.frameCpu[a]);
+    for (const frame of stalls) {
+      if (frame > 0) add(frame - 1, "stall-neighbour");
+      if (frame + 1 < count) add(frame + 1, "stall-neighbour");
+    }
     // Repeatedly bisect the timeline so remaining baseline slots span the whole
     // capture, even when the slow categories overlap heavily or select its ends.
     add(0, "timeline"); add(count - 1, "timeline");
@@ -342,7 +380,7 @@ export class RenderPerformanceProfiler {
       gpuStatus: this.frameGpuStates[frame] ?? "not-sampled", context: { ...this.frameContexts[frame] },
       cpuSectionsMs: Object.fromEntries([...this.cpuSections].map(([name, values]) => [name, values[frame] ?? 0])),
       counters: Object.fromEntries([...this.counters].map(([name, values]) => [name, values[frame] ?? 0])),
-      reasons: [...reasons]
+      reasons: [...reasons], events: this.frameEvents[frame].map(event => ({ ...event }))
     }));
   }
 

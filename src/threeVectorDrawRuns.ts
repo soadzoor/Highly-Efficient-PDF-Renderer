@@ -2,6 +2,7 @@ import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeInstanceVectorClipMaterial, createThreeVectorClipMaterial,
   VECTOR_CLIP_INSTANCE_ATTRIBUTE } from "./threeVectorClips";
 import * as THREE from "three";
+import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { scenePaintRunNeighbours } from "./scenePaintGraph";
@@ -143,6 +144,9 @@ export class ThreeVectorDrawRuns {
    * batch spanning several of them carries the root per instance instead.
    */
   private rebuildEntries(): void {
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.batchRebuild");
+    profile?.add("three.batchRebuilds");
     this.disposeEntries();
     this.planVersion = this.plan.version;
     const runs = this.scene.drawRuns!;
@@ -179,6 +183,8 @@ export class ThreeVectorDrawRuns {
       }
       this.createEntry(ranges, start);
     }
+    profile?.add("three.batchesCreated", this.entries.length);
+    profile?.endSection("three.batchRebuild");
   }
 
   /** Whether the next scheduled paint submits as part of the batch being built. */
@@ -233,7 +239,10 @@ export class ThreeVectorDrawRuns {
         material = createThreeMultiplyMaterial(clipped, pass);
         if (clipped !== this.parent.material) clipped.dispose();
       }
-      if (material !== this.parent.material) this.clipMaterials.set(key, material);
+      if (material !== this.parent.material) {
+        getThreeRenderPerformance()?.add("three.materialsCreated");
+        this.clipMaterials.set(key, material);
+      }
     }
     const mesh = new THREE.Mesh(geometry, material);
     mesh.userData.heprDrawRun = { ...ranges[0].run, first: ranges[0].first, count };
@@ -253,6 +262,8 @@ export class ThreeVectorDrawRuns {
   }
 
   private updateEntries(): void {
+    const profile = getThreeRenderPerformance();
+    profile?.beginSection("three.batchUpdate");
     if (this.strokeRedundancy && this.strokeCandidates && this.strokeRedundancyEnabled) {
       let count = 0;
       for (const entry of this.entries) {
@@ -291,6 +302,7 @@ export class ThreeVectorDrawRuns {
       if (changed) markInstanceUpdate(entry.ids, visible);
       if (clipsChanged && entry.clipCodes) markInstanceUpdate(entry.clipCodes, visible);
     }
+    profile?.endSection("three.batchUpdate");
   }
 
   setEnabled(enabled: boolean): void {
@@ -346,6 +358,7 @@ function createInstanceAttribute(count: number): THREE.InstancedBufferAttribute 
 }
 
 function markInstanceUpdate(attribute: THREE.InstancedBufferAttribute, count: number): void {
+  getThreeRenderPerformance()?.add("three.instanceUploadBytes", count * attribute.itemSize * attribute.array.BYTES_PER_ELEMENT);
   attribute.clearUpdateRanges();
   if (count > 0) attribute.addUpdateRange(0, count);
   attribute.needsUpdate = true;

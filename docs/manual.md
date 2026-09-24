@@ -345,6 +345,72 @@ starting again clears the previous capture. The report includes the starting vie
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
 
+The Three example also exposes `heprPerf`. Reports with
+`context.diagnosticsVersion: 2` include the source kind (PDF/HEP), scene
+geometry/clip/raster counts, transparency-group structure, Three revision,
+browser and shader-error-check setting. These describe the loaded scene, without
+exporting document text, shader source or image pixels.
+
+Three CPU sections split `render` into `three.sync` (PDF preparation and
+compositing) and the remaining outer host render. Inside `three.sync`,
+`three.schedule`, `three.strokeLod`, `three.textLod`,
+`three.vectorUpdate` and `three.textUpdate` identify camera-dependent work.
+`three.batchRebuild` and `three.batchUpdate` are nested within layer updates.
+`three.compositor` includes setup, batch lookup/geometry preparation, target
+binding, `three.hostDraw` (primitive submissions) and `three.hostPass`
+(composite submissions). Inside `three.compositorSetup`,
+`three.compositorCollect` measures proxy/range-index maintenance and
+`three.compositorSelection` measures visible-paint selection. Compare collection
+with `three.scheduleChanges` to diagnose zoom replans. These sections overlap:
+do not sum parent and child durations.
+
+During a Three WebGL capture, existing GL calls are timed by default. The
+`gl.*` sections distinguish shader-source setup, compilation, linking, program
+use, shader/state queries, buffer/texture uploads, drawing, clears, readbacks
+and synchronization. No additional GL query, shader check, readback, flush or
+wait is issued. `frameRecords[].events` retains up to eight longest instrumented
+calls of at least 8 ms, with names such as `gl.getProgramInfoLog` or
+`gl.bufferData`, plus slow compositor submissions. A slow GL call can include
+a driver wait; it does not establish pure GPU execution time.
+
+Per-frame counters include schedule changes, batch/material creation, selected
+paints, per-kind draw submissions, requested live-instance upload bytes, surface
+allocation/clear work, program/texture/geometry counts, and LOD selection.
+`three.surfaceBytes` is the compositor's RGBA surface estimate, not total GPU
+memory; `three.textSelectionUploads` is a cumulative LOD-runtime count, whose
+change between frames identifies an upload. Counts of rendered instances are
+sampled before compositing hides the layer meshes. `context.frameGapMs` on
+each frame preserves long gaps excluded from the interval summary, and the
+bounded record selection prioritizes neighbours of major CPU stalls after
+the slowest CPU/GPU and highest-draw frames.
+
+Detailed GL timing adds diagnostic overhead. Use
+`heprPerf.start({ webglCalls: false })` for a Three capture without GL-call
+wrappers; CPU phase timings and the existing optional GPU timer remain.
+Wrappers are removed on stop, automatic capture completion, backend replacement
+and disposal. `context.webglCalls` reports which methods could be instrumented.
+Three WebGPU reports phase/counter diagnostics without WebGL-call or GPU-query
+timings.
+
+To investigate the HEP-only Broschuere zoom pause, collect two reports:
+one HEP and one PDF, using a fresh page load for each and the same WebGL backend,
+viewport, DPR, layer visibility and LOD settings. Open the document, start
+capture before the first zoom, pan briefly, then zoom until the HEP stalls.
+Zoom out and repeat the movement once to distinguish first-use from repeat
+stalls. Follow the same movement for the PDF.
+
+```js
+heprPerf.start({ maxFrames: 1200, maxFrameRecords: 240 });
+// Pan/zoom, including the first zoom and one repeated zoom.
+heprPerf.stop();
+copy(heprPerf.json()); // Chrome/Edge DevTools helper
+```
+
+Send both complete JSON reports. They should identify whether the pause is in
+scheduling/LOD, resource uploads, shader/program queries, or another submission
+phase. A browser Performance trace may still be needed for browser-internal
+work such as garbage collection.
+
 Native WebGL also reports `panCacheRefreshes` and `panCacheReuses`. A refresh
 renders the ordered scene into the bounded cache; a reuse frame translates that
 image and draws live highlights without resubmitting the scene paints. Heavy
@@ -370,8 +436,8 @@ polygon nodes across the same chains, including repeat visits in separate draws;
 they confirm indexing is active, not how many candidate edges the GPU examines.
 Dense clips use horizontal bands over their original edges at upload time, with
 the existing full scan retained when indexing is unsuitable or exceeds its
-memory budget. Both native and Three WebGL/WebGPU rendering benefit; console
-profiling remains native WebGL only.
+memory budget. Both native and Three WebGL/WebGPU rendering benefit; these
+gradient-specific console counters remain native WebGL only.
 
 For analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad

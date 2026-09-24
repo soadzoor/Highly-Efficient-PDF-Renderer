@@ -70,6 +70,7 @@ export const fastTests = [
   "scene-statistics",
   "stroke-scene-builder",
   "render-performance",
+  "three-render-performance",
   "webgl-performance",
   "webgl-draw-calls",
   "webgpu-draw-calls",

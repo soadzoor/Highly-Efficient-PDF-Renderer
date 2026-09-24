@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import * as THREE from "three";
+import { RenderPerformanceProfiler } from "../src/renderPerformance.ts";
+import { withThreeRenderPerformance } from "../src/threeRenderPerformance.ts";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -78,7 +80,24 @@ try {
     // never a render attachment while the presentation material still samples
     // it. That costs one extra surface once, and then pooling is steady.
     const surfaces = compositor.surfaces.size;
-    compositor.render(host, scene, roots, 32, 24, () => true);
+    const profiler = new RenderPerformanceProfiler();
+    profiler.start({ gpu: false, maxFrames: 1 });
+    profiler.beginFrame();
+    withThreeRenderPerformance(profiler, () => compositor.render(host, scene, roots, 32, 24, () => true));
+    profiler.endFrame();
+    const measured = profiler.getReport();
+    assert.equal(measured.counters["three.compositorFrames"].total, 1);
+    assert.equal(measured.counters["three.surfaceBytes"].total, surfaces * 32 * 24 * 4);
+    assert.ok(measured.counters["three.strokeDraws"].total > 0);
+    assert.ok(measured.counters["three.compositePasses"].total > 0);
+    assert.ok(measured.cpuSections["three.compositorCollect"]);
+    assert.ok(measured.cpuSections["three.compositorSelection"]);
+    assert.ok(measured.cpuSections["three.batchLookup"]);
+    assert.ok(measured.cpuSections["three.batchGeometry"]);
+    assert.ok(measured.cpuSections["three.hostDraw"]);
+    assert.ok(measured.cpuSections["three.hostPass"]);
+    assert.equal(measured.discardedMetricNames, 0);
+    profiler.dispose();
     assert.equal(compositor.surfaces.size, surfaces, "unchanged frames reuse render targets");
     assert.equal(compositor.mesh.visible, true, "the presentation mesh is shown again after compositing");
 
@@ -347,6 +366,8 @@ try {
     slotCompositor.dispose();
     for (const mesh of slotMeshes) { mesh.geometry.dispose(); mesh.material.dispose(); }
 
+    testProxyReplacement(ThreePaintCompositor, backend);
+
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
   }
@@ -411,4 +432,91 @@ function snapshot(renderer) {
   return { target: renderer.target.uuid, viewport: renderer.viewport.toArray(), scissor: renderer.scissor.toArray(),
     scissorTest: renderer.scissorTest, color: renderer.clearColor.toArray(), alpha: renderer.clearAlpha,
     autoClear: renderer.autoClear, xr: renderer.xr.enabled, cube: renderer.cube, mip: renderer.mip };
+}
+
+// A zoom replan replaces the scheduled meshes but retains canonical paint IDs.
+// HEP scenes can have thousands of ranges behind only a few dozen meshes.
+function testProxyReplacement(ThreePaintCompositor, backend) {
+  const compositor = new ThreePaintCompositor(backend);
+  const batchCount = 16, rangesPerBatch = 256, rangeCount = batchCount * rangesPerBatch;
+  const material = new THREE.MeshBasicMaterial();
+  const geometries = [];
+  let sourceDisposals = 0, partialDisposals = 0;
+  const makeMesh = batch => {
+    const geometry = new THREE.InstancedBufferGeometry();
+    const ids = Float32Array.from({ length: rangesPerBatch }, (_, index) => index * batchCount + batch);
+    geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(ids, 1));
+    geometry.instanceCount = ids.length;
+    geometry.addEventListener("dispose", () => sourceDisposals++);
+    geometries.push(geometry);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.userData.heprDrawRun = { kind: "stroke", first: batch, count: 1 };
+    mesh.userData.heprDrawRanges = Array.from(ids, first => ({ first, count: 1 }));
+    mesh.userData.heprInstanceAttribute = "aSegmentIndex";
+    return mesh;
+  };
+  const meshes = Array.from({ length: batchCount }, (_, index) => makeMesh(index));
+  const retained = new THREE.Mesh(new THREE.BufferGeometry(), material);
+  retained.userData.heprDrawRun = { kind: "raster", first: 0, count: 1 };
+  const background = new THREE.Mesh(new THREE.BufferGeometry(), material);
+  background.userData.heprPageBackground = true;
+  compositor.collect([...meshes, retained, background, meshes[0]]);
+  assert.equal(compositor.proxies.size, batchCount + 2, "repeated roots do not duplicate proxies");
+  const retainedProxy = compositor.proxies.get(retained);
+  const survivor = meshes[0], survivorProxy = compositor.proxies.get(survivor);
+  for (const mesh of meshes) {
+    const proxy = compositor.proxies.get(mesh);
+    const partial = compositor.geometryForRuns(proxy, [mesh.userData.heprDrawRun]);
+    assert.notEqual(partial, mesh.geometry);
+    partial.addEventListener("dispose", () => partialDisposals++);
+  }
+  // Count array work instead of imposing a machine-dependent time threshold.
+  // Repeated per-range splice calls move a quadratic number of indexed slots.
+  let indexOperations = 0;
+  const countIndex = key => {
+    if (typeof key === "string" && /^\d+$/.test(key)) {
+      assert.ok(++indexOperations <= rangeCount * 16,
+        "replacing batched proxies must not repeatedly scan or shift the range index");
+    }
+  };
+  for (const [kind, ranges] of compositor.runsByKind) {
+    compositor.runsByKind.set(kind, new Proxy(ranges, {
+      get(target, key, receiver) { countIndex(key); return Reflect.get(target, key, receiver); },
+      set(target, key, value, receiver) { countIndex(key); return Reflect.set(target, key, value, receiver); }
+    }));
+  }
+  const replacements = meshes.map((mesh, index) => index === 0 ? mesh : makeMesh(index));
+  // Reverse root traversal so sorting is necessary; the retained proxy and its
+  // subset buffer must survive even while neighbouring meshes are replaced.
+  const roots = [...replacements].reverse().concat(retained, background);
+  compositor.collect(roots);
+  assert.equal(compositor.proxies.size, batchCount + 2);
+  assert.equal(compositor.proxies.get(retained), retainedProxy);
+  assert.equal(compositor.proxies.get(survivor), survivorProxy);
+  assert.ok(survivorProxy.partialGeometry);
+  assert.equal(partialDisposals, batchCount - 1, "only removed proxies release their subset buffers");
+  assert.equal(sourceDisposals, 0, "compositor cleanup never disposes borrowed layer geometry");
+  for (const mesh of meshes.slice(1)) assert.equal(compositor.proxies.has(mesh), false);
+  const ranges = compositor.runsByKind.get("stroke");
+  assert.equal(ranges.length, rangeCount, "every canonical range is indexed exactly once");
+  for (let index = 0; index < rangeCount; index++) {
+    assert.equal(ranges[index].first, index, "canonical lookup order survives mesh replacement");
+    assert.equal(ranges[index].count, 1);
+    assert.equal(ranges[index].proxy.source, replacements[index % batchCount]);
+  }
+  assert.equal(compositor.runsByKind.get("raster")[0].proxy, retainedProxy);
+  compositor.collect(roots);
+  assert.equal(compositor.runsByKind.get("stroke"), ranges, "unchanged frames retain the range index");
+  assert.equal(partialDisposals, batchCount - 1);
+  compositor.collect([retained, background]);
+  assert.equal(compositor.runsByKind.get("stroke")?.length ?? 0, 0, "removal-only updates retire stale ranges");
+  assert.equal(partialDisposals, batchCount);
+  assert.equal(compositor.runsByKind.get("raster")[0].proxy, retainedProxy);
+  compositor.collect([]);
+  assert.equal(compositor.proxies.size, 0);
+  assert.ok([...compositor.runsByKind.values()].every(runs => runs.length === 0));
+  compositor.dispose();
+  assert.equal(sourceDisposals, 0);
+  for (const geometry of geometries) geometry.dispose();
+  retained.geometry.dispose(); background.geometry.dispose(); material.dispose();
 }
