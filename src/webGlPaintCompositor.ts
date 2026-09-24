@@ -6,6 +6,21 @@ import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 
 interface Surface { texture: WebGLTexture; framebuffer: WebGLFramebuffer }
 
+/** Caller-known target and state to restore, avoiding synchronous GL queries. */
+export interface WebGlPaintCompositorState {
+  framebuffer: WebGLFramebuffer | null;
+  readFramebuffer: WebGLFramebuffer | null;
+  viewport: ArrayLike<number>;
+  clearColor: ArrayLike<number>;
+  scissor: boolean;
+  blend: boolean;
+  depth: boolean;
+  program: WebGLProgram | null;
+  vao: WebGLVertexArrayObject | null;
+  blendFunction: readonly [number, number, number, number];
+  blendEquation: readonly [number, number];
+}
+
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
 // An absent soft mask must read as fully opaque, unlike every other input,
 // whose neutral value is transparent black.
@@ -58,12 +73,13 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
    * `draw` receives a whole span at a time. Every paint in one reaches the same
    * surface with no composite pass between them, so a caller may batch and
    * reorder within a span and may cache GL state across it; neither holds
-   * between spans.
+   * between spans. A renderer that owns its context may supply the known target
+   * and desired return state; shared-context callers capture the current state.
    */
   render(scene: VectorScene, width: number, height: number,
     draw: (runs: readonly VectorDrawRun[], shapeOnly: boolean) => void,
     visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
-    project: PdfCompositeProjector | null = null): void {
+    project: PdfCompositeProjector | null = null, knownState?: WebGlPaintCompositorState): void {
     const gl = this.gl;
     const size = choosePdfCompositeResolution(scene, width, height);
     if (size.scale < 1 && !this.approximationReported) {
@@ -71,16 +87,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       console.warn(`[hepr] PDF composite surfaces use ${size.width}×${size.height} instead of ${width}×${height} to stay within the memory budget.`);
     }
     if (size.width !== this.width || size.height !== this.height) { this.releaseSurfaces(); this.width = size.width; this.height = size.height; }
-    const framebuffer = gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
-    const readFramebuffer = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
-    const viewport = gl.getParameter(gl.VIEWPORT) as Int32Array;
-    const scissor = gl.isEnabled(gl.SCISSOR_TEST), blend = gl.isEnabled(gl.BLEND), depth = gl.isEnabled(gl.DEPTH_TEST);
-    const oldProgram = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
-    const oldVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING) as WebGLVertexArrayObject | null;
-    const clearColor = gl.getParameter(gl.COLOR_CLEAR_VALUE) as Float32Array;
-    const blendSrcRgb = gl.getParameter(gl.BLEND_SRC_RGB), blendDstRgb = gl.getParameter(gl.BLEND_DST_RGB);
-    const blendSrcAlpha = gl.getParameter(gl.BLEND_SRC_ALPHA), blendDstAlpha = gl.getParameter(gl.BLEND_DST_ALPHA);
-    const blendRgb = gl.getParameter(gl.BLEND_EQUATION_RGB), blendAlpha = gl.getParameter(gl.BLEND_EQUATION_ALPHA);
+    const state = knownState ?? this.captureState();
+    const { framebuffer, viewport, clearColor } = state;
     this.drawSpan = draw;
     this.project = project; this.viewportWidth = width; this.viewportHeight = height;
     let backdrop: Surface | null = null, result: Surface | null = null;
@@ -100,16 +108,32 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       if (result) this.release(result);
       if (backdrop) this.release(backdrop);
       this.drawSpan = null; this.project = null;
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, state.readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
       gl.clearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
-      gl.blendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha);
-      gl.blendEquationSeparate(blendRgb, blendAlpha);
-      if (blend) gl.enable(gl.BLEND); else gl.disable(gl.BLEND);
-      if (scissor) gl.enable(gl.SCISSOR_TEST); else gl.disable(gl.SCISSOR_TEST);
-      if (depth) gl.enable(gl.DEPTH_TEST); else gl.disable(gl.DEPTH_TEST);
-      gl.useProgram(oldProgram); gl.bindVertexArray(oldVao);
+      gl.blendFuncSeparate(...state.blendFunction);
+      gl.blendEquationSeparate(...state.blendEquation);
+      if (state.blend) gl.enable(gl.BLEND); else gl.disable(gl.BLEND);
+      if (state.scissor) gl.enable(gl.SCISSOR_TEST); else gl.disable(gl.SCISSOR_TEST);
+      if (state.depth) gl.enable(gl.DEPTH_TEST); else gl.disable(gl.DEPTH_TEST);
+      gl.useProgram(state.program); gl.bindVertexArray(state.vao);
     }
+  }
+
+  private captureState(): WebGlPaintCompositorState {
+    const gl = this.gl;
+    return {
+      framebuffer: gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null,
+      readFramebuffer: gl.getParameter(gl.READ_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null,
+      viewport: gl.getParameter(gl.VIEWPORT) as Int32Array,
+      clearColor: gl.getParameter(gl.COLOR_CLEAR_VALUE) as Float32Array,
+      scissor: gl.isEnabled(gl.SCISSOR_TEST), blend: gl.isEnabled(gl.BLEND), depth: gl.isEnabled(gl.DEPTH_TEST),
+      program: gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null,
+      vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING) as WebGLVertexArrayObject | null,
+      blendFunction: [gl.getParameter(gl.BLEND_SRC_RGB), gl.getParameter(gl.BLEND_DST_RGB),
+        gl.getParameter(gl.BLEND_SRC_ALPHA), gl.getParameter(gl.BLEND_DST_ALPHA)],
+      blendEquation: [gl.getParameter(gl.BLEND_EQUATION_RGB), gl.getParameter(gl.BLEND_EQUATION_ALPHA)]
+    };
   }
 
   acquire(): Surface {

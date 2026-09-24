@@ -33,9 +33,11 @@ import {
 import { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } from "./nativeGradientWebGpuShaders";
 import {
   isNativeTextHeavyStrokeFreeScene,
+  NATIVE_PAN_CACHE_MIN_PAINTS,
   NATIVE_VECTOR_MINIFY_ENABLED,
   shouldUseNativePanCacheForFrame
 } from "./nativeRenderPolicy";
+import { chooseNativePanCacheSize } from "./nativePanCache";
 import { prepareSearchHighlights, type SearchHighlightSet } from "./searchHighlights";
 import type {
   DrawStats,
@@ -120,8 +122,6 @@ interface NativeTextUploadArrays {
 const INTERACTION_DECAY_MS = 140;
 const FULL_VIEW_FALLBACK_THRESHOLD = 0.92;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
-const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
-const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
 const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
@@ -2401,6 +2401,7 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.strokeCurveEnabled = nextEnabled;
+    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -3716,7 +3717,8 @@ export class WebGpuFloorplanRenderer {
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
     const sceneEligible =
-      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene();
+      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene() ||
+      (this.scene?.drawRuns?.length ?? 0) >= NATIVE_PAN_CACHE_MIN_PAINTS;
     const vectorLodActive = this.vectorLodRuntime !== null;
     const zoomAnimating =
       Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
@@ -4552,19 +4554,9 @@ export class WebGpuFloorplanRenderer {
 
   private ensurePanCacheResources(): boolean {
     const maxTextureSize = this.maxTextureSize();
-
-    const desiredWidth = Math.min(
-      maxTextureSize,
-      Math.max(this.canvas.width + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.width * PAN_CACHE_OVERSCAN_FACTOR))
-    );
-    const desiredHeight = Math.min(
-      maxTextureSize,
-      Math.max(this.canvas.height + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.height * PAN_CACHE_OVERSCAN_FACTOR))
-    );
-
-    if (desiredWidth < this.canvas.width || desiredHeight < this.canvas.height) {
-      return false;
-    }
+    const size = chooseNativePanCacheSize(this.scene, this.canvas.width, this.canvas.height, maxTextureSize);
+    if (!size) return false;
+    const { width: desiredWidth, height: desiredHeight } = size;
 
     if (
       this.panCacheTexture &&

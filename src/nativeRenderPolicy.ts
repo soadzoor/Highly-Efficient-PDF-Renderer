@@ -4,6 +4,9 @@
  */
 
 const TEXT_HEAVY_INSTANCE_THRESHOLD = 100_000;
+// Source-ordered pages can be expensive without many strokes: their gradients,
+// text and transparency groups all replay on every direct frame.
+export const NATIVE_PAN_CACHE_MIN_PAINTS = 4096;
 
 /**
  * Supersampled vector minification changes the effective coverage filter and

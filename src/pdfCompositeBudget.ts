@@ -3,6 +3,8 @@ import { normalizeScenePaintGraph, type ScenePaintNode } from "./scenePaintGraph
 
 export const PDF_COMPOSITE_MAX_BYTES = 512 * 1024 * 1024;
 
+const surfaceEstimates = new WeakMap<VectorScene, number>();
+
 /**
  * Opt-in diagnostic that shrinks every transient composite surface, set either
  * as a global or as `?compositeScale=0.5`, which survives a reload. Paint
@@ -27,18 +29,22 @@ export function choosePdfCompositeResolution(scene: VectorScene, width: number, 
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0 ||
       !Number.isFinite(byteBudget) || byteBudget <= 0 || !Number.isFinite(bytesPerPixel) || bytesPerPixel <= 0)
     throw new RangeError("Invalid PDF composite viewport or byte budget.");
-  const depth = (nodes: readonly ScenePaintNode[], level: number): number => {
-    if (level > 64) throw new RangeError("PDF compositor exceeds its group nesting budget.");
-    let maximum = level;
-    for (const node of nodes) if (node.kind === "group") {
-      maximum = Math.max(maximum, depth(node.children, level + 1));
-      if (node.softMask) maximum = Math.max(maximum, depth(node.softMask.children, level + 2));
-    }
-    return maximum;
-  };
-  // The compositor walks the normalized graph, which has no pass-through groups
-  // left to nest, so the levels it actually allocates for are counted there.
-  const estimatedSurfaces = 8 * (depth(normalizeScenePaintGraph(scene), 0) + 1) + 8;
+  let estimatedSurfaces = surfaceEstimates.get(scene);
+  if (estimatedSurfaces === undefined) {
+    const depth = (nodes: readonly ScenePaintNode[], level: number): number => {
+      if (level > 64) throw new RangeError("PDF compositor exceeds its group nesting budget.");
+      let maximum = level;
+      for (const node of nodes) if (node.kind === "group") {
+        maximum = Math.max(maximum, depth(node.children, level + 1));
+        if (node.softMask) maximum = Math.max(maximum, depth(node.softMask.children, level + 2));
+      }
+      return maximum;
+    };
+    // The normalized graph is immutable and already cached per scene. Count its
+    // actual nesting once, including when pan-cache sizing checks the budget.
+    estimatedSurfaces = 8 * (depth(normalizeScenePaintGraph(scene), 0) + 1) + 8;
+    surfaceEstimates.set(scene, estimatedSurfaces);
+  }
   const scale = Math.min(1, Math.sqrt(byteBudget / (width * height * bytesPerPixel * estimatedSurfaces)))
     * debugCompositeScale();
   return { width: Math.max(1, Math.floor(width * scale)), height: Math.max(1, Math.floor(height * scale)), scale, estimatedSurfaces };

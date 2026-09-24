@@ -117,6 +117,42 @@ try {
       `${name} bounds stay on the page`);
   }
 
+  // Profiling must not disable destination blending or lose scissor bounds:
+  // either change adds GPU work and makes the diagnostic measure itself.
+  const previousDebugStats = globalThis.HEPR_DEBUG_COMPOSITE_STATS;
+  const previousConsoleInfo = console.info;
+  try {
+    console.info = () => {};
+    for (const blendsPasses of [false, true]) {
+      const traces = [];
+      for (const enabled of [false, true]) {
+        globalThis.HEPR_DEBUG_COMPOSITE_STATS = enabled;
+        const trace = [];
+        let nextSurface = 0;
+        const tracedAdapter = {
+          blendsPasses,
+          acquire() { const surface = ++nextSurface; trace.push(["acquire", surface]); return surface; },
+          release: surface => trace.push(["release", surface]),
+          clear: (surface, color, bounds) => trace.push(["clear", surface, color, bounds]),
+          copy: (source, destination, bounds) => trace.push(["copy", source, destination, bounds]),
+          draw: (runs, destination, shapeOnly) => trace.push(["draw", runs, destination, shapeOnly]),
+          pass: (operation, destination) => trace.push(["pass", operation, destination])
+        };
+        const result = compositeScenePaintGraph(scene, tracedAdapter, 0, () => true, null);
+        tracedAdapter.release(result);
+        traces.push(trace);
+      }
+      assert.deepEqual(traces[1], traces[0],
+        `diagnostics preserve every operation, capability and bound with blendsPasses=${blendsPasses}`);
+      assert(traces[0].some(([name, operation]) => name === "pass" && operation.operation === (blendsPasses ? 6 : 0)),
+        "the fixture must exercise the destination blending decision");
+    }
+  } finally {
+    console.info = previousConsoleInfo;
+    if (previousDebugStats === undefined) delete globalThis.HEPR_DEBUG_COMPOSITE_STATS;
+    else globalThis.HEPR_DEBUG_COMPOSITE_STATS = previousDebugStats;
+  }
+
   // Without a plan, or with one whose spans do not rise, every paint is its own draw.
   const direct = [];
   submitPaintSpan(spans[0], null, segments, lookup, run => direct.push(run));

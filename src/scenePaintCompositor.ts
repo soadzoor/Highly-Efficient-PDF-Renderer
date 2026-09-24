@@ -69,11 +69,11 @@ interface CompositeDiagnostics {
 
 /**
  * Opt-in composite cost diagnostics, off until `HEPR_DEBUG_COMPOSITE_STATS` is
- * set on the global. Every clear, copy and pass covers the whole composite
- * surface, so their total is what a frame pays for transparency alone, and the
- * peak surface count is what it holds in GPU memory while doing it. The counts
- * are identical on every backend, so one line answers whether a document is
- * slow because of its paint graph or because of its geometry.
+ * set on the global. Counts include bounded and whole-surface operations;
+ * adapters may restrict their pixel work to the supplied bounds. The peak
+ * surface count describes the transient GPU storage in use. Instrumentation
+ * forwards every adapter capability and bound so it observes the same work
+ * the compositor would perform without diagnostics.
  *
  * Throttled to one line a second, since compositing runs once per frame.
  */
@@ -83,10 +83,11 @@ let lastCompositeStatsAt = -Infinity;
 function compositeStatsAdapter<Surface>(adapter: ScenePaintCompositorAdapter<Surface>,
   stats: CompositeDiagnostics): ScenePaintCompositorAdapter<Surface> {
   return {
+    blendsPasses: adapter.blendsPasses,
     acquire: () => { stats.peak = Math.max(stats.peak, ++stats.live); return adapter.acquire(); },
     release: surface => { stats.live--; adapter.release(surface); },
-    clear: (surface, color) => { stats.clears++; adapter.clear(surface, color); },
-    copy: (source, destination) => { stats.copies++; adapter.copy(source, destination); },
+    clear: (surface, color, bounds) => { stats.clears++; adapter.clear(surface, color, bounds); },
+    copy: (source, destination, bounds) => { stats.copies++; adapter.copy(source, destination, bounds); },
     draw: (runs, destination, shapeOnly) => {
       stats.spans++; stats.runs += runs.length; adapter.draw(runs, destination, shapeOnly);
     },
@@ -428,7 +429,7 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     for (const surface of owned) adapter.release(surface);
     if (stats && performance.now() - lastCompositeStatsAt >= COMPOSITE_STATS_INTERVAL_MS) {
       lastCompositeStatsAt = performance.now();
-      console.info(`[hepr] PDF composite frame: ${stats.clears + stats.copies + stats.passes} full-surface ops ` +
+      console.info(`[hepr] PDF composite frame: ${stats.clears + stats.copies + stats.passes} surface ops ` +
         `(${stats.passes} passes, ${stats.clears} clears, ${stats.copies} copies), ` +
         `${stats.spans} span draws over ${stats.runs} paints, ${stats.peak} peak surfaces.`);
     }

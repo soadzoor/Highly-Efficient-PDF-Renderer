@@ -332,6 +332,14 @@ starting again clears the previous capture. The report includes the starting vie
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
 
+Native WebGL also reports `panCacheRefreshes` and `panCacheReuses`. A refresh
+renders the ordered scene into the bounded cache; a reuse frame translates that
+image and draws live highlights without resubmitting the scene paints. Heavy
+source-ordered PDFs can use this path during panning; zooming and settled frames
+render directly. `panCacheFrames` counts attempts to use the cache, including
+frames that fall back to direct rendering when a suitable cache cannot fit.
+Compare refreshes and reuse frames separately when interpreting frame costs.
+
 Native WebGL captures include `gradientFillSubmission` and
 `gradientStrokeSubmission` CPU sections. These sum gradient setup and draw
 submission per frame and can overlap the broader `drawSubmission` section.

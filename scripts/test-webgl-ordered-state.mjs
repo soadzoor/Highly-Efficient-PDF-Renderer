@@ -7,6 +7,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
 try {
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { WebGlPaintCompositor } = await import("../src/webGlPaintCompositor.ts");
 
   for (const capacity of [16, 19, 32]) {
     const mock = mockGl(capacity);
@@ -111,8 +112,60 @@ try {
       r.drawRasterLayerAtIndex = r.drawGradientFillPath = r.drawGradientStrokeRun = clobber;
       mock.clear(); r.drawSourceOrderedContent(100, 100, 50, 50, 1); assertPaints();
     }
+
+    // Native screen/cache frames provide their known target; arbitrary
+    // projected frames retain the compositor's shared-context capture path.
+    const compositeStates = [];
+    r.paintCompositor = { render(...args) { compositeStates.push(args[7]); } };
+    scene.paintGraph = { roots: [{ kind: "group", isolated: true, knockout: false, alpha: 0.5,
+      blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }] }] };
+    r.scenePaintVisibility = null;
+    r.drawSourceOrderedContent(100, 90, 50, 50, 1);
+    assert.equal(compositeStates.at(-1).framebuffer, null);
+    assert.deepEqual(compositeStates.at(-1).viewport, [0, 0, 100, 90]);
+    const cacheFramebuffer = { name: "cache" };
+    r.drawSourceOrderedContent(120, 110, 50, 50, 1, cacheFramebuffer);
+    assert.equal(compositeStates.at(-1).framebuffer, cacheFramebuffer);
+    assert.equal(compositeStates.at(-1).readFramebuffer, cacheFramebuffer);
+    assert.deepEqual(compositeStates.at(-1).viewport, [0, 0, 120, 110]);
+    r.localToClipRenderingEnabled = true;
+    r.drawSourceOrderedContent(100, 90, 50, 50, 1);
+    assert.equal(compositeStates.at(-1), undefined);
   }
-  console.log("WebGL ordered state: sampler capacity, texture reuse, VAO state, paint flags, legacy and intervening paint replay passed");
+
+  const scene = { drawRuns: [{ kind: "fill", first: 0, count: 1 }],
+    paintGraph: { roots: [{ kind: "draw", runIndex: 0 }] } };
+  const original = { framebuffer: { name: "draw" }, readFramebuffer: { name: "read" },
+    viewport: [5, 7, 100, 90], clearColor: [0.1, 0.2, 0.3, 0.4],
+    scissor: true, blend: false, depth: true, program: { name: "program" }, vao: { name: "vao" },
+    blendFunction: ["ONE", "ZERO", "SRC_ALPHA", "ONE"], blendEquation: ["FUNC_SUBTRACT", "FUNC_ADD"] };
+  const owned = { ...original, framebuffer: null, readFramebuffer: null, viewport: [0, 0, 100, 90],
+    scissor: false, blend: true, depth: false, program: null, vao: null,
+    blendFunction: ["SRC_ALPHA", "ONE_MINUS_SRC_ALPHA", "ONE", "ONE_MINUS_SRC_ALPHA"],
+    blendEquation: ["FUNC_ADD", "FUNC_ADD"] };
+  for (const knownState of [undefined, owned]) {
+    for (const fail of [false, true]) {
+      const mock = mockCompositeGl(original);
+      const compositor = new WebGlPaintCompositor(mock.gl);
+      mock.calls.length = 0;
+      const render = () => compositor.render(scene, 100, 90, () => {
+        mock.gl.useProgram({ name: "paint" }); mock.gl.bindVertexArray({ name: "paint" });
+        if (fail) throw new Error("draw failed");
+      }, () => true, null, null, knownState);
+      if (fail) assert.throws(render, /draw failed/); else render();
+      const queries = mock.calls.filter(([name]) => name === "getParameter" || name === "isEnabled");
+      if (knownState) assert.equal(queries.length, 0, "native compositing must not query live GL state");
+      else assert(queries.length > 0, "shared-context compositing captures its caller's actual state");
+      assert.deepEqual(mock.state, knownState ?? original, "target and render state are restored, including after a draw failure");
+      assert.equal(compositor.pool.length, compositor.all.size, "all transient surfaces are returned after success or failure");
+      const blits = mock.calls.filter(([name]) => name === "blitFramebuffer");
+      const viewport = (knownState ?? original).viewport;
+      assert.deepEqual(blits[0].slice(1, 5), [viewport[0], viewport[1], viewport[0] + 100, viewport[1] + 90],
+        "backdrop reads the caller's target rectangle");
+      compositor.dispose();
+    }
+  }
+  console.log("WebGL ordered state: texture/VAO reuse, paint replay, native compositor query avoidance and shared state restoration passed");
 } finally { hooks.deregister(); }
 
 function mockGl(capacity) {
@@ -150,4 +203,43 @@ function mockGl(capacity) {
     }
   });
   return { gl, calls, paints, uniforms, clear() { calls.length = paints.length = 0; } };
+}
+
+function mockCompositeGl(initial) {
+  const state = { ...initial }, calls = [];
+  const parameters = { DRAW_FRAMEBUFFER_BINDING: "framebuffer", READ_FRAMEBUFFER_BINDING: "readFramebuffer",
+    VIEWPORT: "viewport", COLOR_CLEAR_VALUE: "clearColor", CURRENT_PROGRAM: "program", VERTEX_ARRAY_BINDING: "vao" };
+  const capabilities = { SCISSOR_TEST: "scissor", BLEND: "blend", DEPTH_TEST: "depth" };
+  const blendParameters = ["BLEND_SRC_RGB", "BLEND_DST_RGB", "BLEND_SRC_ALPHA", "BLEND_DST_ALPHA"];
+  const gl = new Proxy({}, { get(_target, name) {
+    if (name.toUpperCase() === name) return name;
+    return (...args) => {
+      calls.push([name, ...args]);
+      if (name.startsWith("create")) return {};
+      if (name === "getShaderParameter" || name === "getProgramParameter") return true;
+      if (name === "checkFramebufferStatus") return gl.FRAMEBUFFER_COMPLETE;
+      if (name === "getUniformLocation") return {};
+      if (name === "getParameter") {
+        if (parameters[args[0]]) return state[parameters[args[0]]];
+        if (blendParameters.includes(args[0])) return state.blendFunction[blendParameters.indexOf(args[0])];
+        if (args[0] === "BLEND_EQUATION_RGB") return state.blendEquation[0];
+        if (args[0] === "BLEND_EQUATION_ALPHA") return state.blendEquation[1];
+        assert.fail(`unexpected GL query ${args[0]}`);
+      }
+      if (name === "isEnabled") return state[capabilities[args[0]]];
+      if (name === "enable" || name === "disable") state[capabilities[args[0]]] = name === "enable";
+      if (name === "viewport") state.viewport = args;
+      if (name === "clearColor") state.clearColor = args;
+      if (name === "blendFuncSeparate") state.blendFunction = args;
+      if (name === "blendEquationSeparate") state.blendEquation = args;
+      if (name === "blendEquation") state.blendEquation = [args[0], args[0]];
+      if (name === "useProgram") state.program = args[0];
+      if (name === "bindVertexArray") state.vao = args[0];
+      if (name === "bindFramebuffer") {
+        if (args[0] !== gl.READ_FRAMEBUFFER) state.framebuffer = args[1];
+        if (args[0] !== gl.DRAW_FRAMEBUFFER) state.readFramebuffer = args[1];
+      }
+    };
+  } });
+  return { gl, state, calls };
 }

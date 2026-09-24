@@ -91,6 +91,8 @@ export const fastTests = [
   "three-paint-compositor",
   "native-primitive-interaction",
   "native-paint-compositor",
+  "native-ordered-pan-cache",
+  "native-pan-cache",
   "text-lod-core",
   "ordered-gradient-paint",
   "gradient-sampling",

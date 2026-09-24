@@ -1,4 +1,80 @@
-# Broschuere gradient zoom investigation
+# Broschuere rendering performance investigation
+
+## Fit-all panning after clip indexing
+
+The follow-up live-PDF WebGL capture confirms indexing is active: fit-all frames
+submit 22 indexed clip nodes, 223 paint batches and 64 analytic gradient fills.
+The 353-frame capture has a 19.59 ms average rendered-frame interval and a
+19.81 ms average GPU command span across 89 samples, with no dropped samples.
+It mixes panning and zooming, so those averages are not a fit-all-only benchmark.
+Retained fit-all samples are commonly about 22–24 ms; zoomed views with fewer
+visible paints are about 9–12 ms even though the estimated gradient quad area
+increases. That supports investigating per-frame submission and compositing
+costs alongside fragment clipping. GPU command spans include possible gaps
+between CPU submissions and must not be added to CPU frame time.
+
+Translation previously replayed the entire ordered paint graph every frame.
+WebGL explicitly excluded source-ordered scenes from its pan cache; WebGPU's
+stroke/text eligibility thresholds also excluded this brochure. Both native
+backends now admit source-ordered scenes with at least 4,096 draw runs, subject
+to the existing motion and vector-LOD rules. Cache refresh uses the ordinary
+ordered compositor, preserving clips, masks, blending and paint order. A covered
+pan at the same zoom then submits one image blit plus any live highlights.
+
+The cache is rebuilt on invalidation, changed zoom or exhausted overscan. Zoom
+animation and settled frames still render directly from vector data. Fractional
+translation can interpolate cached pixels; no scaled-cache zoom is introduced.
+The shared cache-size policy preserves the viewport's pixel-center alignment,
+caps the cache at 64 MiB and reserves room within the compositor's conservative
+512 MiB budget. It reduces overscan or uses direct rendering when a useful
+border cannot fit, rather than forcing extra compositor downscaling.
+
+Native WebGL compositing also receives its known framebuffer/state from the
+renderer, removing 12 `getParameter` and three `isEnabled` calls on each ordinary
+composited frame. Shared/projected rendering retains state capture/restoration.
+Compositor surface-budget estimates are cached per scene. The optional
+`HEPR_DEBUG_COMPOSITE_STATS` wrapper now preserves bounds and blending support;
+enabling it previously changed the operations it was meant to count.
+
+These changes are covered by headless cache-reuse, invalidation, source-order,
+overlay, state-restoration and memory-budget regressions. Runtime FPS and visual
+parity remain unmeasured. At 240 FPS the frame budget is 4.17 ms; a cached pan
+can avoid most of the recorded work, but cache refreshes and zoom redraws still
+need measurement and may exceed that budget.
+
+For comparison, capture fit-all panning and zooming separately at the same
+1920 × 945 viewport and DPR 1. In a WebGL `heprPerf` report, inspect
+`panCacheReuses` and `panCacheRefreshes` alongside CPU/GPU frame times. Reuse
+frames should have no scene paint batches; refreshes still submit the complete
+ordered content for the cache viewport. Visually check gradient/mask boundaries,
+page 14's translucent ovals, highlights, layer toggles and the end of a drag in
+both backends. No PDF conversion, development server or browser was run for this
+follow-up.
+
+Follow-up files:
+
+- `src/nativeRenderPolicy.ts`, `src/nativePanCache.ts`,
+  `src/webGlFloorplanRenderer.ts`, `src/webGpuFloorplanRenderer.ts`: cache
+  eligibility, bounded sizing, ordered refresh and curve-mode invalidation.
+- `src/webGlPaintCompositor.ts`, `src/pdfCompositeBudget.ts`,
+  `src/scenePaintCompositor.ts`: known native state, cached budget estimates and
+  transparent diagnostics.
+- `scripts/test-native-pan-cache.mjs`,
+  `scripts/test-native-ordered-pan-cache.mjs`,
+  `scripts/test-webgl-ordered-state.mjs`,
+  `scripts/test-composite-span-batching.mjs`, `scripts/lib/testSuites.mjs`:
+  regressions and fast-suite registration.
+- This report and `docs/manual.md`: capture interpretation and counter definitions.
+
+Validation passed: `npm run typecheck`, `git diff --check`, and the 12 headless
+files `test-native-pan-cache`, `test-native-ordered-pan-cache`,
+`test-webgl-ordered-state`, `test-composite-span-batching`,
+`test-pdf-compositing`, `test-native-paint-compositor`, `test-native-text-lod`,
+`test-webgl-performance`, `test-render-performance`, `test-webgl-draw-calls`,
+`test-webgpu-draw-calls`, and `test-native-primitive-interaction` (all `.mjs`).
+The full test suite and browser checks were not run.
+
+## Earlier gradient investigation
 
 The strongest identified hotspot is the polygon clip applied to the orange/red
 gradients. Before indexing, both native backends evaluated every edge of that

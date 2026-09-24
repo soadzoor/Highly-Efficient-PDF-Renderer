@@ -39,9 +39,11 @@ import {
 } from "./nativeGradientWebGlShaders";
 import {
   isNativeTextHeavyStrokeFreeScene,
+  NATIVE_PAN_CACHE_MIN_PAINTS,
   NATIVE_VECTOR_MINIFY_ENABLED,
   shouldUseNativePanCacheForFrame
 } from "./nativeRenderPolicy";
+import { chooseNativePanCacheSize } from "./nativePanCache";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import {
   appendTextLodCombinedPayload,
@@ -1348,8 +1350,6 @@ const HIGHLIGHT_SELECTION_BORDER_PX = 1;
 const HIGHLIGHT_MIN_SIZE_PX = 2;
 
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
-const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
-const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
 const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
@@ -2049,6 +2049,8 @@ export class WebGlFloorplanRenderer {
 
   private panCacheFramebuffer: WebGLFramebuffer | null = null;
 
+  private panCacheMaxTextureSize = 0;
+
   private panCacheWidth = 0;
 
   private panCacheHeight = 0;
@@ -2509,6 +2511,7 @@ export class WebGlFloorplanRenderer {
       return;
     }
     this.strokeCurveEnabled = nextEnabled;
+    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -3435,9 +3438,9 @@ export class WebGlFloorplanRenderer {
   }
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
-    if (this.scene?.drawRuns) return false;
     const sceneEligible =
-      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene();
+      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene() ||
+      (this.scene?.drawRuns?.length ?? 0) >= NATIVE_PAN_CACHE_MIN_PAINTS;
     const vectorLodActive = this.vectorLodRuntime !== null;
     const zoomAnimating =
       Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
@@ -3766,6 +3769,7 @@ export class WebGlFloorplanRenderer {
     const needsCacheRefresh = !this.panCacheValid || zoomOutOfRange || cacheOutOfCoverage || needsSharpRefresh;
 
     if (needsCacheRefresh) {
+      this.performanceProfiler?.add("panCacheRefreshes");
       this.panCacheCenterX = this.cameraCenterX;
       this.panCacheCenterY = this.cameraCenterY;
       this.panCacheZoom = this.zoom;
@@ -3779,35 +3783,42 @@ export class WebGlFloorplanRenderer {
       gl.clearColor(CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
-      this.drawOrderedGradientPaint(
-        this.panCacheWidth,
-        this.panCacheHeight,
-        this.panCacheCenterX,
-        this.panCacheCenterY
-      );
-      if (this.fillRenderingEnabled) {
-        this.drawFilledPaths(
+      if (this.scene?.drawRuns) {
+        this.panCacheRenderedSegments = this.drawSourceOrderedContent(
+          this.panCacheWidth, this.panCacheHeight, this.panCacheCenterX, this.panCacheCenterY,
+          this.zoom, this.panCacheFramebuffer
+        );
+      } else {
+        this.drawOrderedGradientPaint(
           this.panCacheWidth,
           this.panCacheHeight,
           this.panCacheCenterX,
           this.panCacheCenterY
         );
-      }
-      this.panCacheRenderedSegments = this.strokeRenderingEnabled
-        ? this.drawVisibleSegments(
-          this.panCacheWidth,
-          this.panCacheHeight,
-          this.panCacheCenterX,
-          this.panCacheCenterY
-        )
-        : 0;
-      if (this.textRenderingEnabled) {
-        this.drawTextInstances(
-          this.panCacheWidth,
-          this.panCacheHeight,
-          this.panCacheCenterX,
-          this.panCacheCenterY
-        );
+        if (this.fillRenderingEnabled) {
+          this.drawFilledPaths(
+            this.panCacheWidth,
+            this.panCacheHeight,
+            this.panCacheCenterX,
+            this.panCacheCenterY
+          );
+        }
+        this.panCacheRenderedSegments = this.strokeRenderingEnabled
+          ? this.drawVisibleSegments(
+            this.panCacheWidth,
+            this.panCacheHeight,
+            this.panCacheCenterX,
+            this.panCacheCenterY
+          )
+          : 0;
+        if (this.textRenderingEnabled) {
+          this.drawTextInstances(
+            this.panCacheWidth,
+            this.panCacheHeight,
+            this.panCacheCenterX,
+            this.panCacheCenterY
+          );
+        }
       }
       this.panCacheUsedCulling = this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments;
       this.panCacheValid = true;
@@ -3817,6 +3828,7 @@ export class WebGlFloorplanRenderer {
       offsetPxY = 0;
     }
 
+    if (!needsCacheRefresh) this.performanceProfiler?.add("panCacheReuses");
     this.blitPanCache(offsetPxX, offsetPxY, sampleScale);
 
     return {
@@ -4443,7 +4455,8 @@ export class WebGlFloorplanRenderer {
     }
   }
 
-  private drawSourceOrderedContent(width: number, height: number, x: number, y: number, zoom: number): number {
+  private drawSourceOrderedContent(width: number, height: number, x: number, y: number, zoom: number,
+    framebuffer: WebGLFramebuffer | null = null): number {
     const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
     this.orderedUniformPrograms?.clear();
     this.orderedPaintUniformStates?.clear();
@@ -4549,7 +4562,16 @@ export class WebGlFloorplanRenderer {
           y: (bounds.minY - y) * zoom + height / 2,
           width: (bounds.maxX - bounds.minX) * zoom,
           height: (bounds.maxY - bounds.minY) * zoom
-        }));
+        }), this.localToClipRenderingEnabled ? undefined : {
+          // Native frames own their screen or cache target. Reestablish the renderer's
+          // state without querying the driver and waiting for queued GPU work;
+          // subsequent draws bind their own program and VAO.
+          framebuffer, readFramebuffer: framebuffer, viewport: [0, 0, width, height],
+          clearColor: [CLEAR_COLOR_R, CLEAR_COLOR_G, CLEAR_COLOR_B, 1],
+          scissor: false, blend: true, depth: false, program: null, vao: null,
+          blendFunction: [this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA, this.gl.ONE, this.gl.ONE_MINUS_SRC_ALPHA],
+          blendEquation: [this.gl.FUNC_ADD, this.gl.FUNC_ADD]
+        });
       } finally {
         this.paintShapeOnly = false; this.vectorClipIndex = -1;
         profile?.endSection("drawSubmission");
@@ -4952,20 +4974,12 @@ export class WebGlFloorplanRenderer {
 
   private ensurePanCacheResources(): boolean {
     const gl = this.gl;
-    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-
-    const desiredWidth = Math.min(
-      maxTextureSize,
-      Math.max(this.canvas.width + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.width * PAN_CACHE_OVERSCAN_FACTOR))
-    );
-    const desiredHeight = Math.min(
-      maxTextureSize,
-      Math.max(this.canvas.height + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.height * PAN_CACHE_OVERSCAN_FACTOR))
-    );
-
-    if (desiredWidth < this.canvas.width || desiredHeight < this.canvas.height) {
-      return false;
-    }
+    // Device limits do not change between frames; querying them can synchronize GL.
+    const maxTextureSize = this.panCacheMaxTextureSize ||
+      (this.panCacheMaxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number);
+    const size = chooseNativePanCacheSize(this.scene, this.canvas.width, this.canvas.height, maxTextureSize);
+    if (!size) return false;
+    const { width: desiredWidth, height: desiredHeight } = size;
 
     if (
       this.panCacheTexture &&
