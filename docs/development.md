@@ -180,14 +180,21 @@ or scanning stroke IDs. A changed LOD budget, exhausted margin, screen scale or
 orientation change, or explicit reset resumes selection work; tilted perspective
 views keep their existing update path. The headless Three camera regression uses
 real MapControls and the PDF object's frame preparation on both material backends.
-Native WebGL/WebGPU ordered scenes use the existing soft 50,000-stroke LOD target;
-merging stays within each source paint, clip, and consecutive opaque color.
-Exact tile geometry returns when it fits the budget or the screen-error limit
-requires it; tile budgets and hysteresis cannot select a coarser level than that
-limit. Dense opaque marks use runtime-only negative primitive types to encode
-source-over multiplicity, preserving coincident coverage without widening the
-pen. Small spatial clusters use bounded cells and subdivision; hairlines,
-transparency effects, and isolated details remain exact. Density levels are
+Native and Three WebGL/WebGPU share the soft 50,000-stroke LOD target. Divide
+that target among occupied visible source tiles; per-tile quality floors must
+not multiply it into hundreds of thousands of strokes. Large simple scenes
+build a conservative fine level followed by overview levels that omit tiny
+geometry and merge parallel lines at the level's tolerance. They retain source
+paint/clip identity and flush legacy color cohorts in order. Effect scenes keep
+the conservative hierarchy. The fine level preserves weighted subpixel coverage
+and remains preferred when it fits the tile budget.
+
+The normal zoom baseline uses a 1.25-pixel tolerance. Tile pressure may choose
+coarser levels up to a 5-pixel nominal overview tolerance; below the first normal
+LOD threshold, selection and hysteresis must restore exact geometry. Visibility
+cache keys include both the normal baseline and the pressure limit, including
+when discarded build levels leave gaps in the tolerance sequence. Active-level
+stats mark overview approximations for the HUD. Density and overview levels are
 excluded from tilted perspective views without a reliable uniform error bound.
 Canonical PDF/HEP geometry is unchanged. Native translation-only pan caching
 also supports active LOD: refresh selects vectors for the complete cache bounds

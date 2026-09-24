@@ -114,13 +114,18 @@ The standalone viewer renders directly to its canvas through
 vector content, raster layers, search highlights, and selection highlights.
 See the [API reference](api.md) for integration points.
 
-Vector LOD simplifies stroke geometry according to the current view. It keeps
-exact stroke geometry available and chooses detail per tile as you zoom. Dense
-opaque marks can share weighted vector representatives that retain repeated
-stroke coverage; isolated small details and hairlines keep their geometry. The
-visible-segment budget is a target, subject to the current screen-error limit,
-so it does not guarantee a fixed draw count. Embedded PDF images remain raster
-layers.
+Vector LOD simplifies stroke geometry according to the current view, aiming for
+roughly 50,000 visible strokes. Large drawings keep a fine representation and
+additional overview levels. When a tile exceeds its budget, overview levels can
+omit tiny marks and merge nearby lines more aggressively. This trades some
+far-zoom detail and hatch density for performance while keeping vector rendering.
+The HUD labels these selections `(overview)` and shows the total target.
+
+Close zoom restores exact geometry, and tiles that fit their budget retain exact
+or fine geometry. The antialiasing filter still fades retained thin strokes
+continuously. The target is soft: limited simplification, clipping, or complex
+compositing can keep a document above it. Set Vector LOD to Off for exact strokes
+at every zoom. Embedded PDF images remain raster layers.
 
 The Draw counter reports selected vector representatives. During native cached
 panning it describes the cached content, not a fresh submission of every stroke

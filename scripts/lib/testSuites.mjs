@@ -112,7 +112,8 @@ export const fastTests = [
   "room-detector-seeds",
   "room-geometry-fallback",
   "vector-stroke-clip-lod",
-  "vector-stroke-density-lod"
+  "vector-stroke-density-lod",
+  "vector-overview-lod"
 ];
 
 // Suites with prerequisites are opt-in. HEP package conversion deliberately

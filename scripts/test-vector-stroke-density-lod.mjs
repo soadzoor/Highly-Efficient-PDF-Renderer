@@ -231,8 +231,8 @@ for (const change of [ { alpha: .5 }, { knockout: true }, { blendMode: "Multiply
 }
 
 // The reported draw count must reflect actual selected representatives. A
-// 16x16 grid gives a realistic overview tile budget without a giant fixture.
-const runtimeScene = makeScene(Array.from({ length: 2048 }, () => mark()));
+// concentrated cluster exceeds the shared budget without a giant fixture.
+const runtimeScene = makeScene(Array.from({ length: 60000 }, () => mark()));
 const levels = buildVectorStrokeLodScenes(runtimeScene);
 const edges = Float64Array.from({ length: 17 }, (_, id) => -2 + id / 4);
 const grid = { columns: 16, rows: 16, minX: -2, minY: -2, maxX: 2, maxY: 2,
@@ -246,21 +246,21 @@ const update = units => {
   assert.equal(runtime.getStats().renderedSegments, runtime.levels.reduce((sum, level) => sum + level.visibleSegmentCount, 0));
 };
 update(1);
-assert.equal(runtime.getRenderedSegmentCount(), 1, "overview uploads one weighted vector for 2,048 coincident marks");
+assert.equal(runtime.getRenderedSegmentCount(), 1, "overview uploads one weighted vector for 60,000 coincident marks");
 assert(runtime.getStats().activeLevels.every(level => level.tolerance <= 1.25));
 update(.001);
-assert.equal(runtime.getRenderedSegmentCount(), 2048, "detail zoom restores exact primitives despite tile pressure");
+assert.equal(runtime.getRenderedSegmentCount(), 60000, "detail zoom restores exact primitives despite tile pressure");
 update(1);
 runtime.setForceExact(true); update(1);
-assert.equal(runtime.getRenderedSegmentCount(), 2048, "selection/highlight force-exact disables weighted geometry");
+assert.equal(runtime.getRenderedSegmentCount(), 60000, "selection/highlight force-exact disables weighted geometry");
 runtime.setForceExact(false);
 const tilted = [1, 0, 0, .1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 runtime.setLocalToClipTransform(tilted, 1); update(1);
-assert.equal(runtime.getRenderedSegmentCount(), 2048, "varying-W perspective keeps exact density geometry");
+assert.equal(runtime.getRenderedSegmentCount(), 60000, "varying-W perspective keeps exact density geometry");
 
 const planar = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, -1, 0, 0, 9, 10];
 runtime.setLocalToClipTransform(planar, 1); update(1);
 assert.equal(runtime.getRenderedSegmentCount(), 1, "constant-W perspective on the PDF plane safely permits density LOD");
 
 const worst = Object.fromEntries(["relativeInkError", "relativeL1", "maxError"].map(key => [key, Math.max(...quality.map(row => row[key]))]));
-console.log(`Dense vector LOD preserves source-over tone and isolated detail; overview instances 2048 → 1; worst sampled errors ${JSON.stringify(worst)}.`);
+console.log(`Dense vector LOD preserves source-over tone and isolated detail; overview instances 60000 → 1; worst sampled errors ${JSON.stringify(worst)}.`);
