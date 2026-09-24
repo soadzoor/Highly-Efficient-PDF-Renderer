@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
@@ -227,6 +228,7 @@ fn heprGradientStrokeClipPosition(
 }
 `);
 
+const strokeCoverageFn = TSL.wgslFn(STROKE_COVERAGE_WGSL);
 const distanceToLineSegmentFn = TSL.wgslFn(CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE);
 const distanceToQuadraticBezierFn = TSL.wgslFn(
   CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
@@ -366,7 +368,7 @@ fn heprGradientStrokeWorldPack(
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let isRoundCap = heprGradientFloatMod(floor(styleFlags * 0.5), 2.0) >= 0.5;
   let geometryLength = select(length(primitiveB.xy - primitiveA.xy), length(primitiveA.zw - primitiveA.xy) + length(primitiveB.xy - primitiveA.zw), isQuadratic);
-  if ((geometryLength < 0.00001 && !isRoundCap) || (alpha <= 0.001 && shapeOnly < 0.5)) {
+  if ((geometryLength == 0.0 && !isRoundCap) || (alpha <= 0.001 && shapeOnly < 0.5)) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
   let localUnitsPerPixel = select(1.0 / max(zoom, 0.0001), max(localUnitsPerPixelInput, 0.000001), useLocalToClip >= 0.5);
@@ -406,7 +408,7 @@ fn heprGradientStrokeFragment(
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let halfWidth = select(halfWidthFromVertex, max(0.5 * localPerPixel, 0.00001), isHairline);
   let aaWorld = max(localPerPixel * aaScreenPx, 0.00005);
-  let coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
+  let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let mask = heprSamplePdfGradient(local, maskGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let sourceColor = select(style.yzw, source.rgb, sourceGradientIndex >= -0.5);
@@ -419,6 +421,7 @@ fn heprGradientStrokeFragment(
 }
 `, [
   includeNode(floatModFn),
+  includeNode(strokeCoverageFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
   includeNode(gradientSampleFn)

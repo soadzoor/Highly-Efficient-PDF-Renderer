@@ -123,6 +123,46 @@ try {
   close(render([g([d(0)]),d(1)],[red,halfBlue]),[0.5,0,0.5,1]);
   assert.deepEqual({spans:render.spans,passes:render.passes,surfaces:render.surfaces},
     {spans:[1],passes:0,surfaces:1},"a pass-through group costs nothing and never breaks a span");
+  // Layer-only wrappers share the parent's span after their condition moves to
+  // the child nodes. Run-owned conditions remain an independent intersection.
+  const halfGreen={color:[0,0.5,0,0.5],shape:1};
+  for (const isolated of [false,true]) for (const layerVisible of [false,true]) for (const runVisible of [false,true]) {
+    const roots=[d(0),g([d(1),{...d(2),optionalContent:0}],{isolated,optionalContent:0})];
+    const visible=id=>id===undefined||(id===0?layerVisible:runVisible);
+    let expected=red.color;
+    if(layerVisible) {
+      expected=compositePdfPixel(expected,halfBlue.color);
+      if(runVisible) expected=compositePdfPixel(expected,halfGreen.color);
+    }
+    close(render(roots,[red,halfBlue,{...halfGreen,condition:1}],undefined,visible),expected);
+    assert.equal(render.spans.length,1,"layer wrappers never split an ordinary source-over span");
+    assert.deepEqual({passes:render.passes,surfaces:render.surfaces},{passes:0,surfaces:1},
+      "visible and hidden layer wrappers need no composite surface");
+  }
+  // Distinct nested node conditions cannot occupy the same node slot. Keep
+  // their intersection by retaining a wrapper rather than replacing either.
+  for(const outerVisible of [false,true]) for(const innerVisible of [false,true]) {
+    const visible=id=>id===undefined||(id===0?outerVisible:innerVisible);
+    close(render([g([g([d(0)],{optionalContent:1})],{optionalContent:0}),d(1)],
+      [red,halfBlue],undefined,visible),outerVisible&&innerVisible?[0.5,0,0.5,1]:[0.5,0.5,1,1]);
+  }
+  // Layer inheritance cannot remove real group effects or change the unit that
+  // knocks out: the inner two-paint union must still be one knockout object.
+  close(render([g([g([d(0),d(1)],{optionalContent:0})],{knockout:true})],
+    [red,halfBlue]),[0.5,0,0.5,1]);
+  assert.deepEqual(render.spans,[1,1],"a layer group under knockout retains its union and shape");
+  close(render([g([d(0),d(1)],{alpha:0.5,optionalContent:0})],[red,blue]),[0.5,0.5,1,1]);
+  assert.equal(render.passes,1,"a layer condition cannot flatten group opacity");
+  close(render([g([d(0),d(1)],{alpha:0.5,optionalContent:0})],
+    [red,blue],undefined,id=>id!==0),[1,1,1,1]);
+  for(const isolated of [false,true]) {
+    close(render([g([d(0)],{isolated,optionalContent:0})],
+      [{...red,blendMode:"Multiply"}],[0.5,0.5,0.5,1]),isolated?[1,0,0,1]:[0.5,0,0,1]);
+  }
+  close(render([g([d(0)],{optionalContent:0,softMask:mask})],
+    [red,{color:[0,1,0,1],shape:1}]),[1,0.59,0.59,1]);
+  close(render([g([d(0)],{optionalContent:0,softMask:mask})],
+    [red,{color:[0,1,0,1],shape:1}],undefined,id=>id!==0),[1,1,1,1]);
   // An isolated source-over group accumulates into one surface, so its own alpha
   // is the group alpha and its opacity scales that surface inside the composite
   // that reads it - no separate alpha accumulator, no extraction pass.

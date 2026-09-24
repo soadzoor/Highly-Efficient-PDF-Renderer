@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
-  const { scenePaintSpanSegments } = await import("../src/scenePaintGraph.ts");
+  const { normalizeScenePaintGraph, planScenePaintPasses, scenePaintSpanSegments } = await import("../src/scenePaintGraph.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
   const { ScenePaintVisibility } = await import("../src/scenePaintVisibility.ts");
   const { buildCanonicalRunLookup, submitPaintSpan } = await import("../src/scenePaintSpanDraws.ts");
@@ -96,6 +96,56 @@ try {
   assert.deepEqual({ visible: visibleRuns.length, batches: plan.batches.length, spans: spans.length,
     submitted: submitted.length }, { visible: 27, batches: 11, spans: 7, submitted: 13 },
     "27 interleaved paints across 7 spans reach the GPU as 13 draws, the mask's two included");
+
+  // A genuine opacity group anywhere in a document selects the compositor
+  // globally. Ordinary layer wrappers elsewhere must still share one span.
+  const layerRuns = runs.slice(0, 8).map(run => ({ ...run }));
+  layerRuns[2].optionalContent = 1;
+  const inheritedChild = Object.freeze(draw(0));
+  const sameConditionChild = Object.freeze({ ...draw(2), optionalContent: 0 });
+  const layerRoots = [
+    group([inheritedChild], { optionalContent: 0 }),
+    group([draw(1)], { optionalContent: 0 }),
+    group([sameConditionChild], { optionalContent: 0 }),
+    draw(3), group([draw(4), draw(5)], { optionalContent: 0 }),
+    group([draw(6), draw(7)], { optionalContent: 0, alpha: 0.5 })
+  ];
+  const freezeNodes = nodes => {
+    for (const node of nodes) {
+      if (node.kind === "group") freezeNodes(node.children);
+      Object.freeze(node);
+    }
+    return Object.freeze(nodes);
+  };
+  const layerScene = { ...scene, drawRuns: layerRuns, paintGraph: { roots: freezeNodes(layerRoots) } };
+  const normalized = normalizeScenePaintGraph(layerScene);
+  assert.equal(normalized.length, 7, "ordinary layer wrappers flatten while the opacity group survives");
+  assert.equal(normalized[0].optionalContent, 0);
+  assert.notEqual(normalized[0], inheritedChild, "condition inheritance clones the source node");
+  assert.equal(inheritedChild.optionalContent, undefined, "the source graph is immutable");
+  assert.equal(normalized[2], sameConditionChild, "an identical existing condition needs no replacement");
+  assert.equal(normalized[6].alpha, 0.5, "real opacity remains a composite boundary");
+  assert.equal(normalizeScenePaintGraph(layerScene), normalized, "normalization is cached independently of visibility");
+  const layerSegments = scenePaintSpanSegments(layerScene);
+  assert.equal(new Set(layerSegments.slice(0, 6)).size, 1, "ordinary layers share one span");
+  assert.notEqual(layerSegments[5], layerSegments[6], "group opacity splits the span");
+  const layerPlan = new VectorOrderedBatches(layerScene, null);
+  layerPlan.update(layerRuns, 0.1);
+  assert.equal(layerPlan.batches.length, 4, "eight paints with an opacity boundary need only four batches");
+  const drawIndices = (target, visible) => planScenePaintPasses(target, visible)
+    .filter(pass => pass.kind === "draw").map(pass => pass.runIndex);
+  for (const layerVisible of [false, true]) for (const runVisible of [false, true]) {
+    const visible = id => id === undefined || (id === 0 ? layerVisible : runVisible);
+    const expected = drawIndices(layerScene, visible);
+    assert.deepEqual(drawIndices({ ...layerScene, paintGraph: { roots: normalized } }, visible), expected,
+      "inherited node conditions and run-owned conditions retain their intersection after a layer toggle");
+    const layerSpans = [];
+    compositeScenePaintGraph(layerScene, { ...adapter, draw: span => layerSpans.push(span) }, {}, visible, null);
+    const actual = layerSpans.flatMap(span => span.flatMap(range => layerRuns.flatMap((run, index) =>
+      run.kind === range.kind && run.first >= range.first && run.first + run.count <= range.first + range.count ? [index] : [])));
+    assert.deepEqual(actual, expected, "the compositor paints exactly the visible source paints");
+    assert.equal(layerSpans.length, layerVisible ? 2 : 1, "only the real opacity effect splits visible spans");
+  }
 
   // Every surface a group composites through is transparent outside the group's
   // own paints, so all but the root's backdrop copy carry a rectangle, and none

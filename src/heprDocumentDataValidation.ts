@@ -1708,9 +1708,10 @@ function validateCommand(
     } else if (command.source === "fill-paths" || command.source === "stroke-segments") {
       requireExactKeys(command, [...drawKeys, "paintIndex"], path);
     } else if (command.source === "glyphs") {
-      requireExactKeys(
+      requireAllowedKeys(
         command,
         [...drawKeys, "fillPaintIndex", "strokePaintIndex", "strokeStyleIndex", "renderingMode"],
+        ["strokeTransformIndex"],
         path
       );
     } else if (command.source === "images") {
@@ -1820,6 +1821,9 @@ function validateCommand(
     validateOptionalIndex(command.fillPaintIndex, counts.paints, `${path}.fillPaintIndex`);
     validateOptionalIndex(command.strokePaintIndex, counts.paints, `${path}.strokePaintIndex`);
     validateOptionalIndex(command.strokeStyleIndex, counts.strokeStyles, `${path}.strokeStyleIndex`);
+    if (command.strokeTransformIndex !== undefined) {
+      validateRequiredIndex(command.strokeTransformIndex, counts.transforms, `${path}.strokeTransformIndex`);
+    }
     if (!Number.isInteger(command.renderingMode) || command.renderingMode < 0 || command.renderingMode > 7) {
       fail(HEPR_DATA_VALIDATION_CODES.InvalidNumber, `${path}.renderingMode`, "expected PDF text mode 0..7");
     }
@@ -1827,6 +1831,13 @@ function validateCommand(
       command.renderingMode === 4 || command.renderingMode === 6;
     const expectsStroke = command.renderingMode === 1 || command.renderingMode === 2 ||
       command.renderingMode === 5 || command.renderingMode === 6;
+    if (!expectsStroke && command.strokeTransformIndex !== undefined) {
+      fail(
+        HEPR_DATA_VALIDATION_CODES.InvalidReference,
+        `${path}.strokeTransformIndex`,
+        "fill-only glyphs must not carry a stroke transform"
+      );
+    }
     const hasFillPaint = command.fillPaintIndex >= 0 ||
       (allowInheritedProgramPaint && expectsFill);
     const hasStrokePaint = command.strokePaintIndex >= 0 ||

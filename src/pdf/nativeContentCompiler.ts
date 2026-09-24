@@ -654,6 +654,8 @@ export interface DensePdfTextClip {
 }
 
 export interface DensePdfGlyphPaint {
+  /** Resource-space pen CTM, kept separately from each glyph placement. */
+  readonly strokeTransform?: DensePdfMatrix;
   readonly renderingMode: number;
   readonly patternColorApproximation?: boolean;
   readonly fill: readonly [red: number, green: number, blue: number, alpha: number];
@@ -1784,6 +1786,7 @@ class DenseContentCompiler {
       ),
       glyphPaints: Object.freeze(
         this.glyphPaints.map((paint) => Object.freeze({
+          ...(paint.strokeTransform ? { strokeTransform: Object.freeze([...paint.strokeTransform]) as unknown as DensePdfMatrix } : {}),
           renderingMode: paint.renderingMode,
           ...(paint.patternColorApproximation ? { patternColorApproximation: true } : {}),
           fill: Object.freeze([...paint.fill]) as DensePdfGlyphPaint["fill"],
@@ -3636,6 +3639,8 @@ class DenseContentCompiler {
       role
     );
     this.glyphPaints.push({
+      ...(this.state.lineWidth === 0 && [1, 2, 5, 6].includes(renderingMode)
+        ? { strokeTransform: [...this.state.matrix] as DensePdfMatrix } : {}),
       renderingMode,
       ...(patternColorApproximation ? { patternColorApproximation: true } : {}),
       fill: [
@@ -3671,7 +3676,7 @@ class DenseContentCompiler {
       );
     }
     const outlined = renderingMode === 1 || renderingMode === 2;
-    const vectorOutline = outlined && this.policy.orderedPaint && this.state.lineWidth > 0 &&
+    const vectorOutline = outlined && this.policy.orderedPaint && this.state.lineWidth >= 0 &&
       !this.state.strokeAdjustment;
     if (outlined && !vectorOutline && this.policy.selectiveRaster) {
       this.assertVectorSceneComposite("stroke", "Tj");

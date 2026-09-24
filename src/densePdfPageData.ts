@@ -981,6 +981,9 @@ export function createHeprPageDataFromDense(
               ], strokeComposite))
         : -1,
       strokeStyleIndex: strokes ? appendTextStrokeStyle(state) : -1,
+      strokeTransformIndex: strokes && state.lineWidth === 0 && paint.strokeTransform
+        ? appendTransform(paint.strokeTransform)
+        : undefined,
       wrapperComposite: Object.freeze({
         alpha: 1,
         alphaIsShape: composite.alphaIsShape,
@@ -1312,6 +1315,9 @@ export function createHeprPageDataFromDense(
           fillPaintIndex: paintResources.fillPaintIndex,
           strokePaintIndex: paintResources.strokePaintIndex,
           strokeStyleIndex: paintResources.strokeStyleIndex,
+          ...(paintResources.strokeTransformIndex === undefined ? {} : {
+            strokeTransformIndex: paintResources.strokeTransformIndex
+          }),
           renderingMode: textRun.renderingMode
         };
         if (textRun.renderingMode !== 3 && textRun.renderingMode !== 7) {
@@ -1554,6 +1560,9 @@ export function createHeprPageDataFromDense(
         fillPaintIndex: paintResources.fillPaintIndex,
         strokePaintIndex: paintResources.strokePaintIndex,
         strokeStyleIndex: paintResources.strokeStyleIndex,
+        ...(paintResources.strokeTransformIndex === undefined ? {} : {
+          strokeTransformIndex: paintResources.strokeTransformIndex
+        }),
         renderingMode: textRun.renderingMode
       };
       if (textRun.renderingMode === 3 || textRun.renderingMode === 7) target.push(command);

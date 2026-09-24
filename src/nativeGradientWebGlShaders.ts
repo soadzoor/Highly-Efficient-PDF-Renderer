@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
 import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
 
@@ -402,7 +403,7 @@ void main() {
     ? max(0.35 * localUnitsPerPixel, 5e-5)
     : max(localUnitsPerPixel, 0.0001) * uAAScreenPx;
   float geometryLength = primitiveType >= 0.5 ? length(p1 - p0) + length(p2 - p1) : length(p2 - p0);
-  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !isRoundCap) || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vAlpha = 0.0;
     return;
@@ -453,6 +454,7 @@ void main() {
 
 export const GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_COVERAGE_GLSL}
 precision highp sampler2D;
 
 uniform float uStrokeCurveEnabled;
@@ -541,7 +543,7 @@ void main() {
     : distanceToLine(vLocal, vP0, vP2);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
-  float coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceValue);
+  float coverage = heprStrokeCoverage(distanceValue, halfWidth, aaWorld);
 
   vec4 source = vSourceGradientIndex >= 0
     ? samplePdfGradient(vSourceGradientIndex, vLocal)

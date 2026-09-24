@@ -1044,14 +1044,25 @@ class NativePdfSession implements NativeVectorPdfSession {
           // Raster replay slots own singleton runs; ordinary raster images retain
           // their existing paint runs and do not acquire retained resources.
           const runs = scene.drawRuns ?? defaultVectorDrawRuns(scene);
-          scene.drawRuns = runs.flatMap(run => run.kind === "raster"
-            ? Array.from({ length: run.count }, (_, offset) => ({ ...run, first: run.first + offset, count: 1 })) : [run]);
-          scene.paintGraph = { roots: scene.drawRuns.map((run, runIndex) => {
+          const oldGraph = scene.paintGraph;
+          const remapped: number[][] = [];
+          let nextRun = 0;
+          scene.drawRuns = runs.flatMap(run => {
+            const split = run.kind === "raster"
+              ? Array.from({ length: run.count }, (_, offset) => ({ ...run, first: run.first + offset, count: 1 })) : [run];
+            remapped.push(split.map(() => nextRun++)); return split;
+          });
+          const nodes = scene.drawRuns.map((run, runIndex): import("./scenePaintGraph").ScenePaintNode => {
             const layer = run.kind === "raster" ? scene.rasterLayers[run.first] as NativeSelectiveRasterLayer : undefined;
-            return layer?.retainedFirstCommand === undefined ? { kind: "draw" as const, runIndex }
-              : { kind: "retained" as const, retainedPage: 0, firstCommand: layer.retainedFirstCommand,
+            return layer?.retainedFirstCommand === undefined ? { kind: "draw", runIndex }
+              : { kind: "retained", retainedPage: 0, firstCommand: layer.retainedFirstCommand,
                 count: layer.retainedCommandCount!, rasterIndex: run.first };
-          }) };
+          });
+          const remapGraph = (source: readonly import("./scenePaintGraph").ScenePaintNode[]): import("./scenePaintGraph").ScenePaintNode[] =>
+            source.flatMap(node => node.kind === "draw" ? remapped[node.runIndex].map(index => nodes[index])
+              : node.kind === "group" ? [{ ...node, children: remapGraph(node.children),
+                ...(node.softMask ? { softMask: { ...node.softMask, children: remapGraph(node.softMask.children) } } : {}) }] : [node]);
+          scene.paintGraph = { roots: oldGraph ? remapGraph(oldGraph.roots) : nodes };
         }
         // Naming the features turns "why is this pixelated?" into one line.
         const reasons = vectorCompiled.vectorSceneData?.selectivePaintReasons ?? [];

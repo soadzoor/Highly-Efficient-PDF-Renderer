@@ -153,7 +153,10 @@ try {
   const outlierRuntime = new VectorStrokeLodRuntime(dense, { tileGrid: lod.tileGrid, levels: outlierLevels, elapsedMs: 0 });
   outlierRuntime.updateForLocalUnitsPerPixel(10);
   assert(outlierRuntime.update(overview, viewport));
-  assert(outlierRuntime.update(overview, viewport), "bounds from every LOD level guard the overview cache");
+  assert.equal(outlierRuntime.fullViewBaselineLevelIndex, -1,
+    "bounds from every LOD level still prevent the unbounded full-overview shortcut");
+  assert.equal(outlierRuntime.update(overview, viewport), false,
+    "an unchanged partial view may reuse its bounded visibility guard");
 
   lod.updateForLocalUnitsPerPixel(0.01);
   lod.update({ cameraCenterX: 500, cameraCenterY: 500, zoom: 100 }, { width: 1000, height: 1000 });

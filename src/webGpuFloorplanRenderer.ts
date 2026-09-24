@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { vectorFillBandStore, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
@@ -167,6 +168,7 @@ fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
 `;
 
 const STROKE_SHADER_SOURCE = /* wgsl */ `
+${STROKE_COVERAGE_WGSL}
 struct CameraUniforms {
   viewport : vec2f,
   cameraCenter : vec2f,
@@ -268,7 +270,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   var out : VsOut;
   out.vectorClipIndex = uVectorClip.x;
   if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
-  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !isRoundCap) || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0, 0.0);
     out.p0 = vec2f(0.0, 0.0);
@@ -341,7 +343,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     useCurve
   );
 
-  let coverage = 1.0 - smoothstep(inData.halfWidth - inData.aaWorld, inData.halfWidth + inData.aaWorld, distanceToSegment);
+  let coverage = heprStrokeCoverage(distanceToSegment, inData.halfWidth, inData.aaWorld);
   let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
 
   if (alpha <= 0.001) {

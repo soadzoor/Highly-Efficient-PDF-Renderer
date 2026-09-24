@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
@@ -148,7 +149,7 @@ void main() {
     ? length(p1 - p0) + length(p2 - p1)
     : length(p2 - p0);
 
-  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !isRoundCap) || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vLocal = vec2(0.0);
     vP0 = vec2(0.0);
@@ -315,6 +316,7 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
 }
 
 ${VECTOR_INSTANCE_CLIP_GLSL}
+${STROKE_COVERAGE_GLSL}
 
 void main() {
   if (vAlpha <= 0.001) {
@@ -338,7 +340,7 @@ void main() {
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
 
-  float coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
+  float coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
 
   if (alpha <= 0.001) {

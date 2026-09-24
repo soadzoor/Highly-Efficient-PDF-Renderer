@@ -71,8 +71,7 @@ try {
     // Fine enough to outrun the per-glyph edge budget, which ordinary outlined
     // display text sits just under. Stroke-only text has nothing else to show,
     // so its page still falls back to a bounded raster.
-    ["glyph stroke edge budget", ".4 w [.01 .01] 0 d", "native-glyph-stroke-complexity"],
-    ["hairline glyph stroke", "0 w", "native-glyph-stroke"]
+    ["glyph stroke edge budget", ".4 w [.01 .01] 0 d", "native-glyph-stroke-complexity"]
   ]) {
     const warnings = [];
     const session = await openPdf({ kind: "bytes", bytes: fixture({

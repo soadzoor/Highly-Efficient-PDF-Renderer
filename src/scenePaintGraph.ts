@@ -203,8 +203,10 @@ function paintsSourceOverOnly(scene: VectorScene, nodes: readonly ScenePaintNode
  *   own alpha is the group alpha, instead of a backdrop copy plus a separate
  *   alpha accumulator.
  *
- * Groups carrying an optional-content condition stay put: the condition covers
- * the whole group and a spliced child could not inherit it alongside its own.
+ * A spliced child inherits its group's optional-content condition if it has no
+ * condition of its own. A different child condition keeps the group intact:
+ * both must hold, and a node has room for only one condition. Run conditions
+ * are checked independently, so they do not prevent this inheritance.
  */
 export function normalizeScenePaintGraph(scene: VectorScene): readonly ScenePaintNode[] {
   if (!scene.paintGraph) return [];
@@ -216,9 +218,12 @@ export function normalizeScenePaintGraph(scene: VectorScene): readonly ScenePain
       if (node.kind !== "group" || depth >= 64) { result.push(node); continue; }
       const sourceOverOnly = !node.knockout && paintsSourceOverOnly(scene, node.children, 0);
       const children = rewrite(node.children, depth + 1, node.knockout);
-      if (!knockoutParent && node.optionalContent === undefined && node.alpha === 1 && !node.softMask &&
-          !node.knockout && node.blendMode === "Normal" && (!node.isolated || sourceOverOnly)) {
-        result.push(...children);
+      if (!knockoutParent && node.alpha === 1 && !node.softMask &&
+          !node.knockout && node.blendMode === "Normal" && (!node.isolated || sourceOverOnly) &&
+          (node.optionalContent === undefined || children.every(child =>
+            child.optionalContent === undefined || child.optionalContent === node.optionalContent))) {
+        for (const child of children) result.push(node.optionalContent !== undefined && child.optionalContent === undefined
+          ? { ...child, optionalContent: node.optionalContent } : child);
         continue;
       }
       const softMask = node.softMask

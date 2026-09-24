@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import { VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
@@ -295,6 +296,7 @@ ${vectorFillBandLoopWgsl({
 `;
 
 export const GRADIENT_STROKE_WGSL = /* wgsl */ `
+${STROKE_COVERAGE_WGSL}
 ${CAMERA_STRUCT}
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
 @group(0) @binding(1) var uRunMetaA : texture_2d<f32>;
@@ -344,7 +346,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let clipped = (flags & 4) != 0;
   let geometryLength = select(length(p2 - p0), length(p1 - p0) + length(p2 - p1), primitiveB.z >= 0.5);
   var out : StrokeOut;
-  if ((geometryLength < 1e-5 && !roundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !roundCap) || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0);
     out.p0 = vec2f(0.0);
@@ -406,7 +408,7 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
     uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5
   );
   let aaWorld = max(localPerPixel * uCamera.strokeAAScreenPx, 5e-5);
-  let coverage = 1.0 - smoothstep(inData.halfWidth - aaWorld, inData.halfWidth + aaWorld, distanceValue);
+  let coverage = heprStrokeCoverage(distanceValue, inData.halfWidth, aaWorld);
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;

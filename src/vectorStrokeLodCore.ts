@@ -298,6 +298,7 @@ const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
 const LOD_RUNTIME_TILE_TARGET_SEGMENTS = 512;
+const LOD_VISIBILITY_GUARD_PIXELS = 64;
 const LOD_RUNTIME_MIN_TILE_COUNT = 256;
 const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
@@ -318,7 +319,9 @@ const LOD_TILE_PROJECTED_MIN_FACTOR = 0.1;
 const LOD_TILE_PROJECTED_MAX_FACTOR = 4096;
 const LOD_TILE_PROJECTED_DYNAMIC_AREA_RATIO = 1.25;
 const LOD_TILE_PROJECTED_PERSPECTIVE_RATIO = 0.015;
-const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
+// Small details retain their exact geometry and fade through analytic pixel
+// coverage. Merging them can close dash gaps or collapse neighbouring marks.
+const LOD_PRESERVE_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
 const LOD_TILE_WORLD_FACTOR = 192;
 
@@ -337,6 +340,7 @@ export class VectorStrokeLodRuntime {
   private lastVisibleSegmentCount = 0;
   private readonly allLevelBounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
   private fullViewBaselineLevelIndex = -1;
+  private selectionGuard: { bounds: CullingBounds; range: RuntimeTileRange; baseline: number } | null = null;
   private stats: VectorStrokeLodStats;
 
   constructor(scene: VectorScene, buildData?: VectorStrokeLodRuntimeBuildData) {
@@ -373,6 +377,10 @@ export class VectorStrokeLodRuntime {
   }
 
   setScreenSpaceTransform(): void {
+    if (this.useLocalToClip) {
+      this.selectionGuard = null;
+      this.fullViewBaselineLevelIndex = -1;
+    }
     this.useLocalToClip = false;
   }
 
@@ -380,12 +388,15 @@ export class VectorStrokeLodRuntime {
   setForceExact(enabled: boolean): void {
     if (this.forceExact === enabled) return;
     this.forceExact = enabled;
+    this.selectionGuard = null;
     this.fullViewBaselineLevelIndex = -1;
     this.tileSelectedLevelIndices.fill(-1);
   }
 
   setLocalToClipTransform(localToClip: ArrayLike<number>, localUnitsPerPixel: number): void {
     this.useLocalToClip = true;
+    this.selectionGuard = null;
+    this.fullViewBaselineLevelIndex = -1;
     for (let i = 0; i < 16; i += 1) {
       this.localToClip[i] = Number(localToClip[i]) || 0;
     }
@@ -417,6 +428,7 @@ export class VectorStrokeLodRuntime {
 
   resetVisible(): void {
     this.fullViewBaselineLevelIndex = -1;
+    this.selectionGuard = null;
     this.lastVisibleSegmentCount = 0;
     for (const level of this.levels) {
       level.visibleSegmentCount = 0;
@@ -462,6 +474,18 @@ export class VectorStrokeLodRuntime {
       viewBounds.minX <= this.allLevelBounds.minX && viewBounds.minY <= this.allLevelBounds.minY &&
       viewBounds.maxX >= this.allLevelBounds.maxX && viewBounds.maxY >= this.allLevelBounds.maxY;
     if (fullyVisible && this.fullViewBaselineLevelIndex === screenErrorLevelIndex) return false;
+    const guard = !this.useLocalToClip && this.levels[0].segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS &&
+      [viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY].every(Number.isFinite)
+      ? LOD_VISIBILITY_GUARD_PIXELS * this.localUnitsPerPixel : 0;
+    const cached = this.selectionGuard;
+    if (guard > 0 && cached && tileRange && cached.baseline === screenErrorLevelIndex &&
+        cached.range.c0 === tileRange.c0 && cached.range.c1 === tileRange.c1 &&
+        cached.range.r0 === tileRange.r0 && cached.range.r1 === tileRange.r1 &&
+        viewBounds.minX >= cached.bounds.minX && viewBounds.minY >= cached.bounds.minY &&
+        viewBounds.maxX <= cached.bounds.maxX && viewBounds.maxY <= cached.bounds.maxY &&
+        cached.bounds.maxX - cached.bounds.minX <= viewBounds.maxX - viewBounds.minX + guard * 4 &&
+        cached.bounds.maxY - cached.bounds.minY <= viewBounds.maxY - viewBounds.minY + guard * 4) return false;
+    this.selectionGuard = null;
     this.fullViewBaselineLevelIndex = -1;
     this.resetLevelDrawLists();
     if (!tileRange) {
@@ -470,6 +494,13 @@ export class VectorStrokeLodRuntime {
       return true;
     }
 
+    // Expand primitive filtering, not the tile range: tile density budgets and
+    // LOD choice remain exactly those of the actual viewport. A cached result
+    // is reusable only while that tile range and baseline level also agree.
+    const guardedBounds = guard > 0 ? { minX: viewBounds.minX - guard, minY: viewBounds.minY - guard,
+      maxX: viewBounds.maxX + guard, maxY: viewBounds.maxY + guard } : null;
+    const selectionBounds = guardedBounds && [guardedBounds.minX, guardedBounds.minY,
+      guardedBounds.maxX, guardedBounds.maxY].every(Number.isFinite) ? guardedBounds : viewBounds;
     this.activeLevelIndex = screenErrorLevelIndex;
     const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
     const targetSegmentsPerTile = targetSegmentsPerTileForVisibleTiles(visibleTileCount, screenErrorLevelIndex);
@@ -500,7 +531,7 @@ export class VectorStrokeLodRuntime {
           maxSelectedTileSegments = selectedTileSegments;
           maxSelectedTileLevelIndex = levelIndex;
         }
-        appendTileSegments(this.levels[levelIndex], tileIndex, viewBounds);
+        appendTileSegments(this.levels[levelIndex], tileIndex, selectionBounds);
         tileIndex += 1;
       }
     }
@@ -516,6 +547,7 @@ export class VectorStrokeLodRuntime {
       screenErrorLevelIndex
     );
     if (fullyVisible) this.fullViewBaselineLevelIndex = screenErrorLevelIndex;
+    if (selectionBounds !== viewBounds) this.selectionGuard = { bounds: selectionBounds, range: tileRange, baseline: screenErrorLevelIndex };
     return true;
   }
 
@@ -960,15 +992,16 @@ async function buildSimplifiedStrokeSceneAsync(
   let maxHalfWidth = 0;
 
   for (let index = 0; index < segmentCount; index += 1) {
+    if ((index & 4095) === 0) {
+      const value = startValue + (endValue - startValue) * 0.72 * (index / Math.max(1, segmentCount));
+      await scheduler.maybeYield(false, value, `Simplifying ${formatToleranceName(tolerance)}`);
+    }
     const primitive = readStrokePrimitive(scene, index);
     if (!primitive || primitive.alpha <= 0.001) {
       continue;
     }
-    if (shouldDropPrimitiveAtTolerance(scene, index, primitive, tolerance)) {
-      continue;
-    }
-
-    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
+    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5 ||
+        shouldPreservePrimitiveAtTolerance(primitive, tolerance)) {
       emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
@@ -976,7 +1009,7 @@ async function buildSimplifiedStrokeSceneAsync(
 
     const dx = primitive.x1 - primitive.x0;
     const dy = primitive.y1 - primitive.y0;
-    if (dx * dx + dy * dy <= 1e-10) {
+    if (dx === 0 && dy === 0) {
       if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
         emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
         maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
@@ -993,11 +1026,6 @@ async function buildSimplifiedStrokeSceneAsync(
     const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
     pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
-
-    if ((index & 4095) === 0) {
-      const value = startValue + (endValue - startValue) * 0.72 * (index / Math.max(1, segmentCount));
-      await scheduler.maybeYield(false, value, `Simplifying ${formatToleranceName(tolerance)}`);
-    }
   }
 
   let groupIndex = 0;
@@ -1588,11 +1616,8 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
     if (!primitive || primitive.alpha <= 0.001) {
       continue;
     }
-    if (shouldDropPrimitiveAtTolerance(scene, index, primitive, tolerance)) {
-      continue;
-    }
-
-    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
+    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5 ||
+        shouldPreservePrimitiveAtTolerance(primitive, tolerance)) {
       emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
@@ -1600,7 +1625,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
 
     const dx = primitive.x1 - primitive.x0;
     const dy = primitive.y1 - primitive.y0;
-    if (dx * dx + dy * dy <= 1e-10) {
+    if (dx === 0 && dy === 0) {
       if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
         emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
         maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
@@ -1691,19 +1716,18 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
   };
 }
 
-function shouldDropPrimitiveAtTolerance(
-  scene: VectorScene,
-  index: number,
+function shouldPreservePrimitiveAtTolerance(
   primitive: StrokePrimitive,
   tolerance: number
 ): boolean {
-  const offset = index * 4;
-  const minX = scene.primitiveBounds[offset] - primitive.halfWidth;
-  const minY = scene.primitiveBounds[offset + 1] - primitive.halfWidth;
-  const maxX = scene.primitiveBounds[offset + 2] + primitive.halfWidth;
-  const maxY = scene.primitiveBounds[offset + 3] + primitive.halfWidth;
-  const projectedDropLocalSize = tolerance * LOD_DROP_LOCAL_SIZE_FACTOR;
-  return Math.max(maxX - minX, maxY - minY) <= projectedDropLocalSize;
+  // Use centerline geometry rather than clip bounds: a tiny mark can carry a
+  // page-sized fragment clip, and its pen width does not make it mergeable.
+  const span = Math.max(
+    Math.max(primitive.x0, primitive.cx, primitive.x1) - Math.min(primitive.x0, primitive.cx, primitive.x1),
+    Math.max(primitive.y0, primitive.cy, primitive.y1) - Math.min(primitive.y0, primitive.cy, primitive.y1)
+  );
+  return span <= tolerance * LOD_PRESERVE_LOCAL_SIZE_FACTOR &&
+    (span > 0 || (primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0);
 }
 
 function resolveIntervalGroup(
@@ -1731,10 +1755,14 @@ function resolveIntervalGroup(
   const normalX = -axisY;
   const normalY = axisX;
   const offset = primitive.x0 * normalX + primitive.y0 * normalY;
-  const offsetKey = Math.round(offset / tolerance);
-  const widthKey = (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0
-    ? -1
-    : Math.round(primitive.halfWidth * 10_000);
+  const hairline = (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0;
+  // Overview tolerance must not collapse distinct thin hatch lines into one
+  // unchanged-width stroke. Bound offset rounding by 1% of the actual pen
+  // width so their accumulated ink survives minification and LOD switches.
+  const offsetStep = !hairline && primitive.halfWidth > 0
+    ? Math.min(tolerance, primitive.halfWidth * 0.02) : tolerance;
+  const offsetKey = Math.round(offset / offsetStep);
+  const widthKey = hairline ? -1 : primitive.halfWidth;
   const colorKey =
     `${Math.round(primitive.colorR * 255)},${Math.round(primitive.colorG * 255)},` +
     `${Math.round(primitive.colorB * 255)},${Math.round(primitive.alpha * 255)}`;
@@ -1758,7 +1786,7 @@ function resolveIntervalGroup(
       axisY,
       normalX,
       normalY,
-      offset: offsetKey * tolerance,
+      offset: offsetKey * offsetStep,
       offsetSum: 0,
       offsetWeightSum: 0,
       clipMinX: Number.POSITIVE_INFINITY,
@@ -1852,7 +1880,7 @@ function emitInterval(
   end: number,
   paintOrigins?: number[]
 ): void {
-  if (end - start <= 1e-6) {
+  if (end <= start) {
     return;
   }
   const hasClip =
@@ -1943,7 +1971,7 @@ function pushGroupInterval(group: IntervalGroup, primitive: StrokePrimitive, tol
     const extension = Math.max(primitive.halfWidth * 4, tolerance, 1e-3);
     start = Math.max(start, Math.min(p0, p1, p2, p3) - extension);
     end = Math.min(end, Math.max(p0, p1, p2, p3) + extension);
-    if (end - start <= 1e-6) {
+    if (end <= start) {
       return;
     }
   }
