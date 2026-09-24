@@ -121,8 +121,12 @@ omit tiny marks and merge nearby lines more aggressively. This trades some
 far-zoom detail and hatch density for performance while keeping vector rendering.
 The HUD labels these selections `(overview)` and shows the total target.
 
-Close zoom restores exact geometry, and tiles that fit their budget retain exact
-or fine geometry. The antialiasing filter still fades retained thin strokes
+Tiles that fit their budget retain exact or fine geometry. Very dense views can
+still use overview levels when zoomed in, but approximations stay within a
+5-pixel error limit, so close zoom restores exact geometry. Tilted three.js
+cameras choose detail per tile: content near the camera receives more of the
+budget and finer geometry, distant content thins out, and tiles outside the
+view are skipped. The antialiasing filter still fades retained thin strokes
 continuously. The target is soft: limited simplification, clipping, or complex
 compositing can keep a document above it. Set Vector LOD to Off for exact strokes
 at every zoom. Embedded PDF images remain raster layers.

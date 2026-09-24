@@ -92,9 +92,14 @@ try {
         }
         assert.equal(selections, 0, "60 real pan frames reuse the initial vector selection");
         lod.layers.forEach((layer, index) => { layer.updateFrameWithVisibleSegmentIds = updates[index]; });
-        // A real tilt still excludes density/overview LOD; returning to front-facing enables it.
+        // A real tilt keeps budgeted LOD: each tile's limit comes from its own
+        // projected scale instead of falling back to exact geometry.
         camera.position.set(0, 800, 3000); controls.target.set(0, 0, 0); frame();
-        assert.equal(object.getVectorStrokeLodStats().baselineLevelIndex, 0);
+        const tilted = object.getVectorStrokeLodStats();
+        assert(tilted.baselineLevelIndex > 0 && tilted.activeLevels.some(level => level.index > 0),
+          `${backend}/${ordered}: a tilted MapControls view keeps density/overview LOD`);
+        assert(object.getRenderedStrokeSegmentCount() > 0 && object.getRenderedStrokeSegmentCount() <= 82_500,
+          `${backend}/${ordered}: a tilted view follows the shared soft budget`);
         camera.position.set(0, 0, 3000); frame();
         assert(object.getVectorStrokeLodStats().baselineLevelIndex > 0);
         camera.position.set(0, 0, 10); frame();
@@ -103,7 +108,7 @@ try {
           assert(lod.runtime.getRenderedSegmentCount() > 0, "zoomed-in visible exact geometry remains rendered");
           assert(object.getVectorStrokeLodStats().activeLevels.every(level => level.index === 0));
         } else assert.equal(lod.runtime.getRenderedSegmentCount(), count);
-        console.log(`${overviewFixture ? "overview" : "density"}/${backend}/${ordered ? "ordered" : "legacy"}: Auto LOD ${count}→${initialCount}; 60 MapControls pans, zero reselections; tilt/zoom exact`);
+        console.log(`${overviewFixture ? "overview" : "density"}/${backend}/${ordered ? "ordered" : "legacy"}: Auto LOD ${count}→${initialCount}; 60 MapControls pans, zero reselections; tilt budgeted; close zoom exact`);
       } finally { object.dispose(); }
     }
   }

@@ -65,6 +65,14 @@ try {
   frame(.01, fullSceneViewport);
   assert.equal(runtime.getRenderedSegmentCount(), count, "close zoom restores every canonical primitive");
   assert.deepEqual(runtime.getStats().activeLevels.map(level => level.index), [0]);
+  // Past the normal threshold, pressure may still use overview levels within
+  // their 5 px limit; only zoom beyond every such level forces exact geometry.
+  frame(.3, fullSceneViewport);
+  const detailPressure = runtime.getStats();
+  assert.equal(detailPressure.baselineLevelIndex, 0, "the fixture is past the first normal LOD threshold");
+  assert(runtime.getRenderedSegmentCount() <= 82_500 && detailPressure.activeLevels.some(level => level.overview),
+    "a dense view past the normal threshold still follows the soft budget");
+  assert(detailPressure.activeLevels.every(level => level.tolerance <= .3 * 5), "pressure keeps the 5 px overview limit");
   runtime.setForceExact(true); frame(2);
   assert.equal(runtime.getRenderedSegmentCount(), count, "primitive styling can still require exact identity");
   runtime.setForceExact(false); frame(2);

@@ -254,9 +254,14 @@ update(1);
 runtime.setForceExact(true); update(1);
 assert.equal(runtime.getRenderedSegmentCount(), 60000, "selection/highlight force-exact disables weighted geometry");
 runtime.setForceExact(false);
+// Tilted views bound error per tile from the projection itself, not from the
+// host's center-plane scale: magnified marks stay exact, distant ones aggregate.
 const tilted = [1, 0, 0, .1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 runtime.setLocalToClipTransform(tilted, 1); update(1);
-assert.equal(runtime.getRenderedSegmentCount(), 60000, "varying-W perspective keeps exact density geometry");
+assert.equal(runtime.getRenderedSegmentCount(), 60000, "a magnified tilted view keeps exact density geometry");
+const distantTilt = [.02, 0, 0, .002, 0, .02, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+runtime.setLocalToClipTransform(distantTilt, 1); update(1);
+assert.equal(runtime.getRenderedSegmentCount(), 1, "a distant varying-W view aggregates dense marks");
 
 const planar = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, -1, 0, 0, 9, 10];
 runtime.setLocalToClipTransform(planar, 1); update(1);

@@ -114,7 +114,8 @@ export const fastTests = [
   "room-geometry-fallback",
   "vector-stroke-clip-lod",
   "vector-stroke-density-lod",
-  "vector-overview-lod"
+  "vector-overview-lod",
+  "vector-perspective-lod"
 ];
 
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
