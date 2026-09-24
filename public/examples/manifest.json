@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-20T06:42:46.653Z",
+  "generatedAt": "2026-09-24T14:51:15.894Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -10,7 +10,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 2145836
+        "sizeBytes": 2250628
       }
     },
     {
