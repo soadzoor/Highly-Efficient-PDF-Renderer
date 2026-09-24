@@ -1234,6 +1234,10 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
   const prepared = optimizeVectorSceneTextGlyphs({
     ...scene,
     ...strokes,
+    // HEP v8 rounds clip endpoints too; use the same grid after page layout.
+    ...(scene.clipPaths ? { clipPaths: scene.clipPaths.map(clip => ({
+      ...clip, edges: quantizePositions(clip.edges, clip.edges.length / 4, 4)
+    })) } : {}),
     fillSegmentsA: quantizeTexture("fill-primitives-a", scene.fillSegmentsA, scene.fillSegmentCount),
     fillSegmentsB: quantizeTexture("fill-primitives-b", scene.fillSegmentsB, scene.fillSegmentCount),
     textGlyphSegmentsA: quantizeTexture("text-glyph-primitives-a", scene.textGlyphSegmentsA, scene.textGlyphSegmentCount),

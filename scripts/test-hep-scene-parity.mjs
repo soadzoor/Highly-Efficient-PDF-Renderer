@@ -16,6 +16,7 @@ const hooks = registerHooks({
 try {
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { buildHep } = await import("../src/hepBuilder.ts");
+  const { packVectorClips } = await import("../src/vectorClips.ts");
   const { loadSceneFromHep, prepareSceneForHepRendering } = await import("../src/hep.ts");
   const { buildVectorStrokeLodScenes, VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
 
@@ -212,6 +213,41 @@ try {
   await assert.rejects(loadSceneFromHep(await invalidLegacy.generateAsync({
     type: "arraybuffer", compression: "STORE"
   })), /invalid strokeGeometry/);
+
+  // Scene schema v8 stores clip coordinates on the fixed 1/512 grid too.
+  // Exercise both fill rules, a parent chain and actual clipped draw references.
+  const clippedScene = { ...scene, clipPaths: [
+    { parent: -1, fillRule: 0, edges: Float32Array.from([
+      -0.123, 0.456, 3024.789, 0.456, 3024.789, 0.456, 3024.789, 2160.123,
+      3024.789, 2160.123, -0.123, 2160.123, -0.123, 2160.123, -0.123, 0.456
+    ]) },
+    { parent: 0, fillRule: 1, edges: Float32Array.from([
+      1 / 3, -0.7, 2999.123, 100.456, 2999.123, 100.456, 44.789, 2100.123,
+      44.789, 2100.123, 1 / 3, -0.7
+    ]) }
+  ], drawRuns: [
+    { kind: "stroke", first: 0, count: segmentCount, clipIndex: 0 },
+    { kind: "text", first: 0, count: 2, clipIndex: 1 }
+  ] };
+  const clipSnapshot = structuredClone(clippedScene);
+  const preparedClips = prepareSceneForHepRendering(clippedScene);
+  assert.notDeepEqual(preparedClips.clipPaths, clippedScene.clipPaths,
+    "PDF preparation must adopt HEP's clip coordinate precision");
+  assert.equal(prepareSceneForHepRendering(preparedClips), preparedClips);
+  for (const columns of [1, 2]) {
+    const composed = composeVectorScenesInGrid([clippedScene, clippedScene], columns);
+    const actual = prepareSceneForHepRendering(composed);
+    for (const compression of ["store", "deflate"]) {
+      const expected = await loadSceneFromHep(await (await buildHep(composed, { ...options, compression })).arrayBuffer());
+      assert.deepEqual(actual.clipPaths, expected.clipPaths, `clip geometry, parents and fill rules: ${columns}, ${compression}`);
+      assert.deepEqual(actual.drawRuns, expected.drawRuns, "clip references and paint order are unchanged");
+      assert.deepEqual(packVectorClips(actual.clipPaths), packVectorClips(expected.clipPaths),
+        "PDF and HEP upload identical polygon edges and rectangle fast paths");
+      const reloaded = await loadSceneFromHep(await (await buildHep(actual, { ...options, compression })).arrayBuffer());
+      assert.deepEqual(reloaded.clipPaths, actual.clipPaths, "re-export must not accumulate clip rounding");
+    }
+  }
+  assert.deepEqual(clippedScene, clipSnapshot, "preparation and page layout leave cached clip buffers untouched");
 
   const emptyBlob = await buildHep(composeVectorScenesInGrid([], 1), { compression: "store" });
   assert.equal((await loadSceneFromHep(await emptyBlob.arrayBuffer())).segmentCount, 0);

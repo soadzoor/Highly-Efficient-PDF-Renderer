@@ -19,7 +19,7 @@ import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { buildVectorFillBandIndex, vectorFillBandStore, vectorFillBandIndex } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
-import { packVectorClips } from "./vectorClips";
+import { MAX_VECTOR_CLIP_DEPTH, packVectorClips } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -1839,6 +1839,8 @@ export class WebGlFloorplanRenderer {
   private orderedCullingBounds: Bounds | null = null;
   private orderedRunsCulled = false;
   private vectorClipTexture: WebGLTexture | null = null;
+  /** Compact uploaded headers for opt-in clip-work diagnostics; no edge copy. */
+  private vectorClipHeaders: Float32Array | null = null;
   private vectorClipIndex = -1;
   private orderedBatches: VectorOrderedBatches | null = null;
   /** Per kind, canonical run indices sorted by their first primitive. */
@@ -3197,6 +3199,7 @@ export class WebGlFloorplanRenderer {
     this.runLookup = null;
     gl.deleteTexture(this.vectorClipTexture);
     this.vectorClipTexture = null;
+    this.vectorClipHeaders = null;
     this.vectorClipUniforms.clear();
 
     const buffers: WebGLBuffer[] = [
@@ -3936,6 +3939,8 @@ export class WebGlFloorplanRenderer {
     }
     const gl = this.gl;
     const meshCount = this.gradientMeshRanges?.[pathIndex * 2 + 1] ?? 0;
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    profile?.beginSection("gradientFillSubmission");
     const program = meshCount ? this.gradientMeshProgram! : this.gradientFillProgram;
     const uniforms = meshCount ? this.gradientMeshUniforms : this.gradientFillUniforms;
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -3981,6 +3986,32 @@ export class WebGlFloorplanRenderer {
       gl.drawArrays(gl.TRIANGLES, this.gradientMeshRanges[pathIndex * 2], meshCount);
     } else gl.drawArraysInstanced(gl.TRIANGLE_STRIP, pathIndex * 4, 4, 1);
     this.frameDrawCalls++;
+    profile?.endSection("gradientFillSubmission");
+    if (profile) {
+      const offset = pathIndex * 4;
+      const segmentCount = Math.max(0, Math.trunc(data.gradientFillPathMetaA[offset + 1] ?? 0));
+      const clipEdges = this.countGradientClipPolygonEdges();
+      profile.add("gradientFillClipPolygonEdges", clipEdges);
+      if (meshCount) {
+        profile.add("gradientMeshFillDraws");
+        profile.add("gradientMeshFillSegments", segmentCount);
+        profile.add("gradientMeshTriangles", meshCount / 3);
+      } else {
+        profile.add("gradientAnalyticFillDraws");
+        profile.add("gradientAnalyticFillSegments", segmentCount);
+        if (!this.localToClipRenderingEnabled) {
+          // Estimate rasterized quad pixels, before clipping or fragment discard.
+          // Round outward and clip to this pass's viewport; overlaps count again.
+          const minX = Math.max(0, Math.floor((data.gradientFillPathMetaA[offset + 2] - cameraCenterX) * zoomValue + viewportWidth / 2));
+          const minY = Math.max(0, Math.floor((data.gradientFillPathMetaA[offset + 3] - cameraCenterY) * zoomValue + viewportHeight / 2));
+          const maxX = Math.min(viewportWidth, Math.ceil((data.gradientFillPathMetaB[offset] - cameraCenterX) * zoomValue + viewportWidth / 2));
+          const maxY = Math.min(viewportHeight, Math.ceil((data.gradientFillPathMetaB[offset + 1] - cameraCenterY) * zoomValue + viewportHeight / 2));
+          const pixels = Math.max(0, maxX - minX) * Math.max(0, maxY - minY);
+          profile.add("gradientAnalyticFillBBoxPixelsEstimate", pixels);
+          profile.add("gradientAnalyticFillClipEdgeTestsEstimate", pixels * clipEdges);
+        }
+      }
+    }
   }
 
   private drawGradientStrokeRun(
@@ -4001,6 +4032,8 @@ export class WebGlFloorplanRenderer {
     }
     const gl = this.gl;
     const uniforms = this.gradientStrokeUniforms;
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    profile?.beginSection("gradientStrokeSubmission");
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.gradientStrokeProgram);
     this.bindVectorClip(this.gradientStrokeProgram);
@@ -4040,6 +4073,22 @@ export class WebGlFloorplanRenderer {
     gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, runIndex * 4, 4, segmentCount);
     this.frameDrawCalls++;
+    profile?.endSection("gradientStrokeSubmission");
+    profile?.add("gradientStrokeDraws");
+    profile?.add("gradientStrokeSegments", segmentCount);
+    if (profile) profile.add("gradientStrokeClipPolygonEdges", this.countGradientClipPolygonEdges());
+  }
+
+  private countGradientClipPolygonEdges(): number {
+    const headers = this.vectorClipHeaders;
+    if (!headers) return 0;
+    let index = this.vectorClipIndex, edges = 0;
+    for (let depth = 0; depth < MAX_VECTOR_CLIP_DEPTH && index >= 0 && index * 4 < headers.length; depth++) {
+      // Uploaded rectangles have a negative edge count and no polygon loop.
+      edges += Math.max(0, headers[index * 4 + 2]);
+      index = headers[index * 4];
+    }
+    return edges;
   }
 
   private setGradientUniforms(
@@ -4300,6 +4349,7 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     if (this.vectorClipTexture) gl.deleteTexture(this.vectorClipTexture);
     const data = packVectorClips(scene.clipPaths);
+    this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
     const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
     const height = Math.ceil(data.length / 4 / width);

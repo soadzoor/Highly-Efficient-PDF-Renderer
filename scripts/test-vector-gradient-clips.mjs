@@ -11,6 +11,7 @@ try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
   const { GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE } =
@@ -42,6 +43,8 @@ try {
   let program, clip;
   const glApi = new Proxy({
     useProgram(value) { program = value; },
+    getParameter() { return 1024; },
+    createTexture() { return {}; },
     getUniformLocation(_program, name) { return name; },
     uniform1f(name, value) { if (name === "uVectorClipIndex") clip = value; },
     drawArraysInstanced(_mode, first, _vertices, count) { calls.push([program, first, count, clip]); }
@@ -56,6 +59,66 @@ try {
   });
   gl.drawSourceOrderedContent(100, 100, 50, 50, 1);
   assert.deepEqual(calls, [["fill", 0, 1, 1], ["fill", 4, 1, -1], ["stroke", 0, 1, 0]]);
+  calls.length = 0;
+
+  // Profile actual draws with a polygon beneath two fused rectangle clips,
+  // then another polygon. Headers retain exact GPU clip-parent relationships.
+  gl.uploadVectorClips({ ...scene, clipPaths: [...scene.clipPaths,
+    { ...scene.clipPaths[1], parent: 1 }, { ...scene.clipPaths[0], parent: 2 }] });
+  assert.equal(gl.vectorClipHeaders.length, 16, "retain headers without retaining the edge store");
+  assert.equal(gl.vectorClipHeaders[8], 0, "consecutive rectangle ancestors are fused");
+  let time = 0;
+  const profile = new RenderPerformanceProfiler({ now: () => time++ });
+  gl.performanceProfiler = profile;
+  profile.start({ gpu: false });
+  profile.beginFrame();
+  gl.drawSourceOrderedContent(100, 100, 75, 50, 1);
+  profile.endFrame();
+  let record = profile.getReport().frameRecords[0];
+  assert.equal(record.counters.gradientAnalyticFillDraws, 2);
+  assert.equal(record.counters.gradientAnalyticFillSegments, 8);
+  assert.equal(record.counters.gradientFillClipPolygonEdges, 3, "rectangle edges do not add polygon work");
+  assert.equal(record.counters.gradientStrokeDraws, 1);
+  assert.equal(record.counters.gradientStrokeSegments, 1);
+  assert.equal(record.counters.gradientStrokeClipPolygonEdges, 3);
+  assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 15000,
+    "each 100x100 quad is clipped to 75x100 viewport pixels; overlapping draws count again");
+  assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 22500);
+  assert(record.cpuSectionsMs.gradientFillSubmission > 0);
+  assert(record.cpuSectionsMs.gradientStrokeSubmission > 0);
+
+  gl.gradientMeshRanges = new Uint32Array([0, 0, 0, 6]);
+  gl.gradientMeshProgram = "mesh"; gl.gradientMeshUniforms = {};
+  gl.vectorClipIndex = 3;
+  profile.beginFrame();
+  gl.drawGradientFillPath(0, 100, 100, 75, 50, 1);
+  gl.drawGradientFillPath(1, 100, 100, 75, 50, 1);
+  profile.endFrame();
+  record = profile.getReport().frameRecords[1];
+  assert.equal(record.counters.gradientFillClipPolygonEdges, 12, "both polygon ancestors count for both fills");
+  assert.equal(record.counters.gradientMeshFillDraws, 1);
+  assert.equal(record.counters.gradientMeshFillSegments, 4);
+  assert.equal(record.counters.gradientMeshTriangles, 2);
+  assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 7500, "mesh triangles are excluded from quad area");
+  assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 45000);
+
+  profile.beginFrame();
+  gl.localToClipRenderingEnabled = true;
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
+  gl.localToClipRenderingEnabled = false;
+  gl.drawGradientFillPath(0, 100, 100, 1000, 1000, 1);
+  profile.endFrame();
+  record = profile.getReport().frameRecords[2];
+  assert.equal(record.counters.gradientAnalyticFillDraws, 2);
+  assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 0,
+    "projected views are excluded and fully offscreen quads contribute zero pixels");
+  profile.stop();
+  Object.defineProperty(gl, "vectorClipHeaders", { get() { throw Error("disabled profiling must not read clip headers"); } });
+  gl.gradientData = { ...scene,
+    get gradientFillPathMetaA() { throw Error("disabled profiling must not read path metadata"); } };
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
+  gl.drawGradientStrokeRun(0, 100, 100, 50, 50, 1);
+  assert.equal(profile.getReport().frames, 3);
   calls.length = 0;
   const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
     drawPageBackgroundContentIntoPass() {}, gradientFillPipeline: "fill", gradientStrokePipeline: "stroke",

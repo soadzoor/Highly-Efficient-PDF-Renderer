@@ -332,6 +332,33 @@ starting again clears the previous capture. The report includes the starting vie
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
 
+Native WebGL captures include `gradientFillSubmission` and
+`gradientStrokeSubmission` CPU sections. These sum gradient setup and draw
+submission per frame and can overlap the broader `drawSubmission` section.
+`gradientAnalyticFillDraws` / `gradientMeshFillDraws` distinguish bounding-quad
+fills from mesh fills; the corresponding `...Segments` counters count submitted
+fill-path segments, and `gradientMeshTriangles` counts mesh triangles.
+`gradientStrokeDraws` and `gradientStrokeSegments` count submitted stroke runs
+and their segments. These include repeated draws in compositing passes.
+
+`gradientFillClipPolygonEdges` and `gradientStrokeClipPolygonEdges` sum the
+polygon edges in each submitted draw's clip chain; packed rectangle clips are
+excluded. A simple gradient can still be expensive when its clip has thousands
+of edges. For analytic fills in the main orthographic view,
+`gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad
+areas in framebuffer pixels, rounded outward. It includes overlap and ignores
+geometric clips, scissor rectangles, transparent pixels, and early exits;
+projected views and mesh fills are excluded. Multiplying each quad's estimate
+by its clip-chain polygon edge count produces
+`gradientAnalyticFillClipEdgeTestsEstimate`, an upper-work estimate rather than
+an actual GPU instruction count. Compare these with sampled GPU time when
+capturing fit-all and a zoomed gradient at the same viewport and DPR. Diagnostics
+do not scan fill segments or clip edges in the render loop and remain off
+unless a capture is active.
+
+The [Broschuere gradient investigation](broschuere-gradient-performance.md)
+documents a dense polygon-clip hotspot and recommended comparison captures.
+
 The report also includes up to 120 `frameRecords` with the camera and viewport,
 CPU phases, batch/instance counts, and GPU timing for the same frame when sampled.
 It selects slow frames and evenly spaced examples when the report is requested;
