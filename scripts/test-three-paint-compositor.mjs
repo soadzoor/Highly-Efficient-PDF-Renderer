@@ -160,6 +160,12 @@ try {
     const boundedProject = bounds => ({ x: bounds.minX + 100, y: bounds.minY + 80,
       width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true, boundedProject);
+    const boundedClears = spanHost.clears.filter(clear => clear.scissorTest);
+    if (backend === "webgl") {
+      assert.ok(boundedClears.length > 0, "WebGL clears use the effect bounds too");
+      assert.ok(boundedClears.every(clear => clear.scissor[2] < 30 && clear.scissor[3] < 30),
+        "small effects do not clear the full framebuffer");
+    } else assert.equal(boundedClears.length, 0, "WebGPU keeps its whole-attachment fast clear");
     const effects = spanHost.draws.filter(draw => !draw.ids);
     assert.equal(effects.length, 2, "one root copy and one direct source-over pass");
     const blended = effects.find(draw => draw.blending === THREE.CustomBlending);
@@ -174,9 +180,12 @@ try {
     assert.deepEqual(snapshot(spanHost), state, "bounded effects restore the host scissor and target");
     assert.ok(effects.some(draw => !draw.scissorTest), "pooled target scissors reset for the full root copy");
     spanHost.draws.length = 0;
+    spanHost.clears.length = 0;
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true,
       bounds => ({ ...boundedProject(bounds), x: 10000 }));
     assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 1, "offscreen effects skip their composite pass");
+    assert.equal(spanHost.clears.length, 1, "offscreen effects skip clears, keeping only the backdrop clear");
+    assert.equal(spanHost.clears[0].scissorTest, false, "a pooled scissor cannot restrict the backdrop clear");
 
     // A scheduled mesh can own disjoint canonical ranges, and LOD IDs can be
     // unrelated to those ranges. Every instanced attribute follows the selected
@@ -229,6 +238,31 @@ try {
     assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2, 4]]);
     assert.equal(geometry.getAttribute("aCorner"), borrowedCorner);
     assert.equal(geometry.index, borrowedIndex);
+    const originalGeometryForRuns = spanCompositor.geometryForRuns;
+    let inputCount = 0;
+    spanCompositor.geometryForRuns = function(entry, runs) {
+      inputCount = runs.length;
+      return originalGeometryForRuns.call(this, entry, runs);
+    };
+    spanCompositor.draw([{ kind: "stroke", first: 3, count: 7 }], partialTarget, false);
+    assert.equal(inputCount, 1, "a merged run reaching three ranges on one proxy is collected only once");
+    spanCompositor.geometryForRuns = originalGeometryForRuns;
+    assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: [{ first: 3, count: 7 }] }, [
+      { kind: "stroke", first: 7, count: 3 }, { kind: "stroke", first: 3, count: 4 }
+    ]), geometry, "adjacent inputs jointly cover a range without copying or uploading instances");
+    const overlap = spanCompositor.geometryForRuns(proxy, [
+      { kind: "stroke", first: 3, count: 7 }, { kind: "stroke", first: 7, count: 1 }
+    ]);
+    assert.equal(overlap, geometry, "a shorter overlapping input cannot hide the enclosing range's tail");
+    let rangeReads = 0;
+    const manyRanges = Array.from({ length: 4096 }, (_, index) => ({
+      get first() { rangeReads++; return index * 2; }, count: 1
+    }));
+    const manyRuns = manyRanges.map(range => ({ kind: "stroke", first: range.first, count: 1 }));
+    rangeReads = 0;
+    assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: manyRanges }, manyRuns), geometry);
+    assert.ok(rangeReads < manyRanges.length * 4,
+      "large scheduled meshes must not rescan the entire input span for each canonical range");
     let replacementDisposals = 0;
     proxy.partialGeometry.addEventListener("dispose", () => replacementDisposals++);
     spanCompositor.release(partialTarget); spanCompositor.renderer = null;
@@ -270,6 +304,49 @@ try {
       `an emptied group drops its surfaces and passes too (${splitHost.draws.length} vs ${splitPasses})`);
     splitCompositor.dispose(); splitStroke.dispose();
 
+    // Raster and gradient slots have no layer instance culling. Their projected
+    // bounds must drop the complete offscreen group, not only its final pass.
+    const slotScene = Object.assign(createEmptyVectorScene(), {
+      rasterLayers: [scene.rasterLayers[0]],
+      clipPaths: [{ parent: -1, fillRule: 0, edges: f([0, 0, 10, 0, 10, 0, 10, 10,
+        10, 10, 0, 10, 0, 10, 0, 0]) }],
+      drawRuns: [{ kind: "raster", first: 0, count: 1 },
+        { kind: "gradient-fill", first: 0, count: 1, clipIndex: 0 }],
+      paintGraph: { roots: [{ kind: "group", isolated: true, knockout: false, alpha: 0.5,
+        blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }, { kind: "draw", runIndex: 1 }] }] }
+    });
+    const slotMeshes = slotScene.drawRuns.map((run, index) => {
+      const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.RawShaderMaterial({
+        uniforms: { uTestTag: { value: index } }
+      }));
+      mesh.userData.heprDrawRun = run;
+      return mesh;
+    });
+    const slotCompositor = new ThreePaintCompositor(backend), slotHost = makeRenderer(backend);
+    const slotDraws = () => slotHost.draws.filter(draw => draw.tag !== undefined).map(draw => draw.tag);
+    const drawSlots = project => {
+      slotHost.draws.length = 0;
+      slotCompositor.render(slotHost, slotScene, slotMeshes, 320, 240, () => true, project);
+      return slotDraws();
+    };
+    assert.deepEqual(drawSlots(boundedProject), [0, 1], "visible slots retain source order");
+    const visiblePassCount = slotHost.draws.length;
+    assert.deepEqual(drawSlots(bounds => ({ ...boundedProject(bounds), x: 10000 })), []);
+    assert.ok(slotHost.draws.length < visiblePassCount, "offscreen slots also drop their group's passes");
+    assert.deepEqual(drawSlots(boundedProject), [0, 1], "panning back restores every slot");
+    assert.deepEqual(drawSlots(() => null), [0, 1], "uncertain perspective projections keep paints");
+    assert.deepEqual(drawSlots(null), [0, 1], "hosts without a projector keep paints");
+    assert.deepEqual(drawSlots(() => ({ x: 321, y: 10, width: 1, height: 10 })), [0, 1],
+      "the two-pixel AA guard keeps paints just outside the viewport");
+    const unboundedScene = { ...slotScene, drawRuns: [slotScene.drawRuns[0],
+      { kind: "gradient-fill", first: 0, count: 1 }] };
+    slotHost.draws.length = 0;
+    slotCompositor.render(slotHost, unboundedScene, slotMeshes, 320, 240, () => true,
+      bounds => ({ ...boundedProject(bounds), x: 10000 }));
+    assert.deepEqual(slotDraws(), [1], "an unbounded gradient cannot be discarded by projection");
+    slotCompositor.dispose();
+    for (const mesh of slotMeshes) { mesh.geometry.dispose(); mesh.material.dispose(); }
+
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
   }
@@ -293,7 +370,7 @@ function makeRenderer(backend = "webgpu") {
     coordinateSystem: backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem,
     target: new THREE.RenderTarget(7, 9), viewport: new THREE.Vector4(3, 4, 17, 19),
     scissor: new THREE.Vector4(5, 6, 11, 13), scissorTest: true, clearColor: new THREE.Color(0.2, 0.3, 0.4),
-    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], targets: [], fail: false,
+    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], clears: [], targets: [], fail: false,
     getRenderTarget() { return this.target; },
     setRenderTarget(target, cube = 0, mip = 0) { this.target = target; this.cube = cube; this.mip = mip; this.targets.push(target); },
     getActiveCubeFace() { return this.cube; }, getActiveMipmapLevel() { return this.mip; },
@@ -301,7 +378,8 @@ function makeRenderer(backend = "webgpu") {
     getScissor(out) { return out.copy(this.scissor); }, setScissor(value) { this.scissor.copy(value); },
     getScissorTest() { return this.scissorTest; }, setScissorTest(value) { this.scissorTest = value; },
     getClearColor(out) { return out.copy(this.clearColor); }, getClearAlpha() { return this.clearAlpha; },
-    setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; }, clear() {},
+    setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; },
+    clear() { this.clears.push({ scissorTest: this.target.scissorTest, scissor: this.target.scissor.toArray() }); },
     render(scene, camera) {
       this.call = (this.call ?? 0) + 1;
       // Mirrors Renderer._updateCamera: the first render whose coordinate
@@ -318,6 +396,7 @@ function makeRenderer(backend = "webgpu") {
       for (const mesh of scene.children) {
         const ids = mesh.geometry.getAttribute("aSegmentIndex");
         this.draws.push({ call: this.call,
+          tag: mesh.material.uniforms?.uTestTag?.value,
           ids: ids && Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
           shape: mesh.material.uniforms?.uPdfShapeOnly?.value,
           clips: mesh.geometry.getAttribute("aVectorClipIndex") && Array.from({ length: mesh.geometry.instanceCount },

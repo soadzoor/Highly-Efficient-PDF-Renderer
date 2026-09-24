@@ -6,6 +6,7 @@ import { PDF_COMPOSITE_FRAGMENT_GLSL, pdfCompositeFunctions } from "./pdfComposi
 import { setThreePdfShapeOnly } from "./threePdfShape";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
+import { scenePaintNodeBounds } from "./scenePaintGraph";
 
 /** Public renderer operations only, so Three retains ownership of its GPU state cache. */
 export interface ThreePaintHostRenderer {
@@ -329,8 +330,14 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.surfaces.add(target); return target;
   }
   release(target: THREE.RenderTarget): void { this.pool.push(target); }
-  clear(target: THREE.RenderTarget, color: readonly [number, number, number, number] = [0, 0, 0, 0]): void {
-    this.target(target); this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
+  clear(target: THREE.RenderTarget, color: readonly [number, number, number, number] = [0, 0, 0, 0], bounds?: Bounds): void {
+    const rect = pdfCompositeScissorRect(bounds, this.project, this.viewportWidth, this.viewportHeight,
+      this.width, this.height);
+    if (rect && (rect.width === 0 || rect.height === 0)) return;
+    // WebGPU attachment clears cover the whole surface regardless of scissor;
+    // keep that fast clear there. WebGL can restrict the existing clear call.
+    this.target(target, this.backend === "webgl" ? rect : null);
+    this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
     this.renderer!.clear(true, false, false);
   }
   copy(source: THREE.RenderTarget, destination: THREE.RenderTarget, bounds?: Bounds): void {
@@ -357,7 +364,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         if (sourceRun.first >= run.first + run.count) break;
         if (sourceRun.first + sourceRun.count <= run.first) continue;
         const previous = byProxy.get(proxy);
-        if (previous) previous.push(run);
+        // A merged run can intersect many ranges owned by the same proxy.
+        // It only needs to participate in that proxy's membership test once.
+        if (previous) { if (previous[previous.length - 1] !== run) previous.push(run); }
         else { byProxy.set(proxy, [run]); ordered.push(proxy); }
       }
     }
@@ -468,8 +477,10 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
    * each mesh, so this drops exactly the paints that would have submitted
    * nothing. A batched mesh reports for every paint behind it at once, which
    * can keep a group standing that might have been dropped but never removes a
-   * paint that still draws. Paints no mesh owns, such as raster and gradient
-   * slots, are always kept. null means nothing was culled.
+   * paint that still draws. Raster and gradient paints use the same conservative
+   * projected bounds as composite passes, including their AA margin. Unknown
+   * bounds or unsafe perspective projections keep the paint. null means nothing
+   * was culled.
    */
   private selectPaints(scene: VectorScene): Uint8Array | null {
     const runs = scene.drawRuns;
@@ -481,6 +492,18 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     for (const proxy of this.proxies.values()) {
       if (!proxy.runIndices || (proxy.source.geometry as THREE.InstancedBufferGeometry).instanceCount > 0) continue;
       for (const index of proxy.runIndices) { selected[index] = 0; culled = true; }
+    }
+    const bounds = this.project ? scenePaintNodeBounds(scene).runs : null;
+    if (bounds) for (let index = 0; index < runs.length; index++) {
+      const kind = runs[index].kind;
+      // Vector layers already account for their active LOD's coverage. Only
+      // the image/gradient slots lack that culling; leave vector choices alone.
+      if (kind !== "raster" && kind !== "gradient-fill" && kind !== "gradient-stroke") continue;
+      const offset = index * 4;
+      const rect = pdfCompositeScissorRect({ minX: bounds[offset], minY: bounds[offset + 1],
+        maxX: bounds[offset + 2], maxY: bounds[offset + 3] }, this.project,
+        this.viewportWidth, this.viewportHeight, this.width, this.height);
+      if (rect && (rect.width === 0 || rect.height === 0)) { selected[index] = 0; culled = true; }
     }
     return culled ? selected : null;
   }
@@ -518,10 +541,26 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   }
   private geometryForRuns(proxy: ProxyEntry, runs: readonly VectorDrawRun[]): THREE.BufferGeometry {
     const geometry = proxy.source.geometry;
+    if (!proxy.attribute || !proxy.run) return geometry;
+    // Scheduled meshes can own thousands of disjoint canonical ranges. Avoid
+    // searching the entire span for every range, and coalesce adjacent inputs
+    // so a fully covered mesh keeps its canonical GPU buffers.
+    const sorted: { first: number; count: number }[] = [];
+    for (const run of [...runs].sort((a, b) => a.first - b.first)) {
+      const previous = sorted[sorted.length - 1];
+      if (previous && run.first <= previous.first + previous.count) {
+        previous.count = Math.max(previous.count, run.first + run.count - previous.first);
+      } else sorted.push({ first: run.first, count: run.count });
+    }
+    const includes = (first: number, count = 1): boolean => {
+      let low = 0, high = sorted.length;
+      while (low < high) { const middle = (low + high) >>> 1;
+        if (sorted[middle].first <= first) low = middle + 1; else high = middle;
+      }
+      return low > 0 && first + count <= sorted[low - 1].first + sorted[low - 1].count;
+    };
     const ranges = proxy.ranges ?? (proxy.run ? [proxy.run] : []);
-    const covered = ranges.every(range => runs.some(run => range.first >= run.first &&
-      range.first + range.count <= run.first + run.count));
-    if (!proxy.attribute || !proxy.run || covered) return geometry;
+    if (ranges.every(range => includes(range.first, range.count))) return geometry;
     const source = geometry.getAttribute(proxy.attribute);
     const capacity = (geometry as THREE.InstancedBufferGeometry).instanceCount;
     // Dispose with the old owned attributes still attached: replacing an
@@ -552,14 +591,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       }
       attributes.push([attribute, target]);
     }
-    const sorted = [...runs].sort((a, b) => a.first - b.first);
-    const includes = (id: number): boolean => {
-      let low = 0, high = sorted.length;
-      while (low < high) { const middle = (low + high) >>> 1;
-        if (sorted[middle].first <= id) low = middle + 1; else high = middle;
-      }
-      return low > 0 && id < sorted[low - 1].first + sorted[low - 1].count;
-    };
+
     let count = 0;
     for (let item = 0; item < capacity; item++) {
       const id = source.getX(item), canonical = proxy.origins?.[id] ?? id;

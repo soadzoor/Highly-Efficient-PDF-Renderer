@@ -1,5 +1,87 @@
 # Broschuere rendering performance investigation
 
+## Three WebGL follow-up, September 24
+
+The supplied Three WebGL capture contains 133 frames at 1920 × 945, DPR 1.
+CPU p50 is 5.4 ms and p95 is 16.66 ms; sampled GPU command-span p50 is
+11.81 ms. Frame 61 spends 2,626.1 ms on the CPU (2,626 ms inside render) and
+has a 1,294.50 ms GPU command span, despite submitting only 188 draws.
+That one stall dominates the 26.99 ms CPU average. Frame intervals omit gaps
+over 250 ms, so their 12.5 ms median does not describe this hitch. CPU and GPU
+measurements overlap. The capture does not distinguish shader compilation,
+driver waits, batch preparation or allocation as its cause.
+
+Inspection and a short headless comparison used the existing HEP, without
+parsing a PDF or writing an archive. This copy has 24,887 draw runs, 2,897
+source segments, 64 gradient fills and 31 raster layers, matching the capture's
+two source counts. Earlier asset counts below describe earlier inspections.
+
+Three's compositor now removes three sources of redundant work:
+
+- A merged canonical run was added once for every intersected range owned by
+  a mesh. It is now added once per mesh. Coverage checks previously searched
+  the entire input span for each range; sorted, coalesced intervals now provide
+  binary-search membership and retain the original geometry when fully covered.
+  Partial selections still gather every instance attribute together, preserving
+  canonical LOD origins, clip roots and holes from hidden paints.
+- Raster and gradient slots previously stayed selected even when entirely
+  offscreen, keeping their transparency groups active. They now use the existing
+  conservative projected paint bounds and two-pixel AA margin. Unknown bounds
+  and unsafe perspective projections retain the paint. Vector LOD culling and
+  retained replay selection keep their existing behavior.
+- WebGL surface clears now use the same effect bounds as composite passes.
+  Wholly offscreen clears are skipped on both backends. WebGPU's attachment
+  clear still covers the whole surface; no replacement draw pass is added.
+
+The changes preserve paint order, geometry, masks, blending and rendering
+resolution. They add no raster cache or geometry approximation.
+
+The headless comparison loaded the real HEP into the Three WebGL material
+layers, updated the shared draw plan and ordinary instance culling, and invoked
+the compositor with a host that counted submissions and clear rectangles.
+Views fit the document or the named page at 90% of the 1920 × 945 viewport.
+It did not build the example's combined text/stroke LOD payloads or execute GPU
+commands, so these counts are not predictions of the example's exact draw count
+or FPS. They isolate the changed compositor work with identical layer inputs.
+
+| View | Submitted meshes before → after | Clear calls before → after | Clear pixels before → after |
+| --- | --- | --- | --- |
+| Fit all | 348 → 348 | 106 → 106 | 192,326,400 → 2,760,957 |
+| Page 14 | 113 → 56 | 38 → 20 | 68,947,200 → 5,176,895 |
+| Last page | 114 → 56 | 40 → 20 | 72,576,000 → 3,792,353 |
+
+Clear pixels count the requested rectangles, including repeated clears of a
+surface; they are not GPU memory-traffic or timing measurements. The comparison
+used the pre-change compositor from git as its baseline. Surface counts stayed
+at 11 for fit-all and 7 for the page views. Local warmed compositor preparation
+also decreased, but browser profiling is required to measure the end-to-end
+gain and establish whether the long stall persists.
+
+Modified files: `src/threePaintCompositor.ts`,
+`scripts/test-three-paint-compositor.mjs`, and this report.
+Validation passed: `npm run typecheck`, `git diff --check`, and nine headless
+regressions: `three-paint-compositor`, `three-vector-draw-batching`,
+`three-vector-instance-clip`, `three-ordered-stroke-lod`,
+`three-raster-strip-batches`, `three-webgpu-composite-material`,
+`composite-span-batching`, `pdf-compositing`, and `native-paint-compositor`
+(all `scripts/test-*.mjs`). New cases exercise bounded clears, offscreen
+groups, panning back, unknown bounds, perspective fallback, AA margins,
+overlapping/adjacent selections and bounded range-check work.
+
+Manual verification: run the viewer yourself and load the same HEP in
+`three-example.html`. Capture fit-all panning and zooming separately with
+`heprPerf`, including page 14 and the last page, at the same viewport and DPR.
+Check mask/gradient edges, the translucent ovals, layer toggles, and content
+returning after panning offscreen in Three WebGL and WebGPU. If the large pause
+persists, capture a browser Performance trace across it; the current render-only
+CPU section cannot identify the blocking call. No server or browser was run
+during this investigation.
+
+A Three pan cache remains a separate option: the native cache already avoids
+most compositing work during covered pans, but extending it to Three brings
+extra GPU storage and fractional-translation interpolation. That tradeoff needs
+discussion before implementation.
+
 ## Fit-all panning after clip indexing
 
 The follow-up live-PDF WebGL capture confirms indexing is active: fit-all frames
