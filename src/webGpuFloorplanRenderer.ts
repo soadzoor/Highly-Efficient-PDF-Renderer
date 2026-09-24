@@ -1952,7 +1952,7 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 4,
-          visibility: gpuShaderStage.FRAGMENT,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
         },
         {
@@ -1975,7 +1975,12 @@ export class WebGpuFloorplanRenderer {
           visibility: gpuShaderStage.VERTEX,
           texture: { sampleType: "unfilterable-float" }
         })),
-        ...[5, 6, 7, 8, 9, 10, 11].map((binding) => ({
+        {
+          binding: 5,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        ...[6, 7, 8, 9, 10, 11].map((binding) => ({
           binding,
           visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
