@@ -205,6 +205,68 @@ try {
   const gradientIndex = buildVectorFillBandIndex(vectorSceneGradientFillStore(gradientScene));
   assert.deepEqual([...gradientIndex.paths], [...index.paths], "the gradient store indexes identically");
 
+  // Every backend packs the identical segment prefix and index. Capacity
+  // pressure must retain the original linear geometry with a disabled lookup.
+  const { vectorFillBandStore } = await import("../src/vectorFillBands.ts");
+  const combined = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, index);
+  assert.equal(combined.pathBase, scene.fillSegmentCount);
+  assert.deepEqual(combined.data.subarray(0, scene.fillSegmentCount * 4), scene.fillSegmentsA);
+  assert.deepEqual(combined.data.subarray(scene.fillSegmentCount * 4), packed.data);
+  const limited = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, index, 44);
+  assert.equal(limited.pathBase, -1, "no room for metadata selects the complete linear scan");
+  assert.equal(limited.data, scene.fillSegmentsA, "linear fallback reuses its geometry");
+
+  const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
+  const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
+  for (const [segments, expectedBase] of [[dashedCircle(4), -1], [circle, circle.length]]) {
+    const solid = sceneWith([segments]);
+    solid.fillPathMetaC = new Float32Array([0, 0, 0, 1]);
+    solid.gradientFillPathCount = solid.fillPathCount;
+    solid.gradientFillSegmentCount = solid.fillSegmentCount;
+    for (const suffix of ["PathMetaA", "PathMetaB", "PathMetaC", "SegmentsA", "SegmentsB"]) {
+      solid[`gradientFill${suffix}`] = solid[`fill${suffix}`];
+    }
+    solid.gradientFillPaintMeta = new Float32Array([0, -1, 0, 0]);
+    const options = { vectorOverride: [0, 0, 0, 0], strokeCurveEnabled: true };
+    const fill = new ThreeMaterialFillLayer(solid, options);
+    const gradient = new ThreeMaterialGradientLayer(solid, options);
+    for (const mesh of [fill.mesh, gradient.group.children[0]]) {
+      const uniforms = mesh.material.uniforms;
+      assert.equal(uniforms.uFillBandBase.value, expectedBase,
+        "solid and gradient GL materials initialize the band binding, even without an index");
+      assert.equal(uniforms.uFillBandEntries.value, expectedBase < 0 ? 0 : combined.entryBase);
+      const geometryData = uniforms.uFillSegmentTexA.value.image.data;
+      assert.deepEqual(geometryData.subarray(0, solid.fillSegmentCount * 4), solid.fillSegmentsA);
+      if (expectedBase >= 0) assert.deepEqual(geometryData.subarray(expectedBase * 4, combined.data.length), packed.data);
+    }
+    fill.dispose(); gradient.dispose();
+  }
+
+  // The count pass must use the same Float32 band height as the write passes.
+  // With double precision, these first eight edges were counted in one band
+  // but written into two, leaving the final band's eight entries out of range.
+  {
+    const count = 24, segmentsA = new Float32Array(count * 4), segmentsB = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) {
+      const low = i % 3 === 0 ? 0 : i % 3 === 1 ? 2 : 4;
+      const high = i % 3 === 0 ? Math.fround(5 / 3) : low + .1;
+      segmentsA.set([i, low, i, high], i * 4); segmentsB.set([i, high, 0, 0], i * 4);
+    }
+    const boundaryIndex = buildVectorFillBandIndex({ pathCount: 1, segmentCount: count,
+      pathMetaA: Float32Array.of(0, count, 0, 0), pathMetaB: Float32Array.of(count, 5, 0, 0), segmentsA, segmentsB });
+    assert.equal(boundaryIndex.segments.length, 32, "all entries at rounded band boundaries are allocated");
+    for (let band = 0; band < boundaryIndex.bands.length; band += 2) {
+      assert.ok(boundaryIndex.bands[band] + boundaryIndex.bands[band + 1] <= boundaryIndex.segments.length);
+    }
+    for (let i = 2; i < count; i += 3) {
+      assert.ok(vectorFillBandSegments(boundaryIndex, 0, 4.05, 0).includes(i), "late-band edges survive packing");
+    }
+  }
+  const impreciseOffsets = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount,
+    { ...index, segments: { length: 0x1000001 } }, 8192);
+  assert.equal(impreciseOffsets.pathBase, -1, "scalar entry offsets beyond exact Float32 integers use the complete linear scan");
+  assert.equal(impreciseOffsets.data, scene.fillSegmentsA);
+
   console.log(`Vector fill bands: ${circle.length} segments narrow to at most ${worstBand} per row ` +
     `(${(totalBand / samples).toFixed(1)} average), matching a full scan at ${compared} sample points`);
 

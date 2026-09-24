@@ -13,7 +13,7 @@ import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
 import { NativeVectorClipBuilder } from "./pdf/nativeVectorClips";
 import { emitCubicAsQuadratics } from "./pdf/nativeVectorPage";
-import { buildNativeGlyphStroke } from "./pdf/nativeGlyphStroke";
+import { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey, type NativeGlyphStrokeStyle } from "./pdf/nativeGlyphStroke";
 import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
 import type { DensePdfTextClip } from "./pdf/nativeContentCompiler";
 import { PdfError } from "./pdf/nativeTypes";
@@ -214,15 +214,12 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
    * coordinates differ. The 2x2 stays in the key so cubic flattening keeps the
    * absolute tolerance it already resolved at, never a font-unit scale.
    */
-  const text = (glyph: number, indices: readonly number[], placement: PdfMatrix, rgba: Color,
-    clip: DensePdfTextClip | null, condition?: number): void => {
-    const { fontIndices, glyphIds } = page.stores.glyphs;
-    const [a, b, c, d, e, f] = placement;
-    const key = `${fontIndices[glyph]}:${glyphIds[glyph]}:${a}:${b}:${c}:${d}`;
+  const textGeometry = (key: string, placement: PdfMatrix, rgba: Color, clip: DensePdfTextClip | null,
+    condition: number | undefined, build: () => Geometry | null): void => {
     let atlas = glyphAtlas.get(key);
     if (atlas === undefined) {
-      const g = geometry(indices, [a, b, c, d, 0, 0]);
-      if (!g.a.length) { glyphAtlas.set(key, -1); return; }
+      const g = build();
+      if (!g?.a.length) { glyphAtlas.set(key, -1); return; }
       budget(g.a.length + g.b.length);
       atlas = glyphMetaA.length / 4;
       const first = glyphA.length / 4;
@@ -234,8 +231,31 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       budget(0);
     }
     const index = textA.length / 4;
-    textA.push(1, 0, 0, 1); textB.push(e, f, atlas, 0); textC.push(...rgba);
+    textA.push(1, 0, 0, 1); textB.push(placement[4], placement[5], atlas, 0); textC.push(...rgba);
     appendRun("text", index, 1, clip, condition);
+  };
+  const text = (glyph: number, indices: readonly number[], placement: PdfMatrix, rgba: Color,
+    clip: DensePdfTextClip | null, condition?: number): void => {
+    const { fontIndices, glyphIds } = page.stores.glyphs;
+    const [a, b, c, d] = placement;
+    textGeometry(`fill:${fontIndices[glyph]}:${glyphIds[glyph]}:${a}:${b}:${c}:${d}`, placement, rgba, clip, condition,
+      () => geometry(indices, [a, b, c, d, 0, 0]));
+  };
+  const strokeStyle = (index: number, matrix: PdfMatrix): NativeGlyphStrokeStyle => {
+    const strokes = page.stores.strokes;
+    return { transform: matrix, width: strokes.lineWidths[index], lineCap: strokes.lineCaps[index] as 0 | 1 | 2,
+      lineJoin: strokes.lineJoins[index] as 0 | 1 | 2, miterLimit: strokes.miterLimits[index],
+      dashArray: Array.from(strokes.dashValues.subarray(strokes.dashOffsets[index], strokes.dashOffsets[index + 1])),
+      dashPhase: strokes.dashPhases[index] };
+  };
+  const omitStrokeError = (error: unknown, omittable: boolean): void => {
+    if (!omittable || !(error instanceof PdfError) || error.details?.reason !== "native-glyph-stroke-complexity") throw error;
+    if (!reportedGlyphStrokeComplexity) {
+      reportedGlyphStrokeComplexity = true;
+      options.onDiagnostic?.({ code: "glyph-stroke-complexity", severity: "warning",
+        message: "A glyph outline was too intricate to stroke and is omitted; the rest of the page stays vector.",
+        details: { reason: "native-glyph-stroke-complexity" } });
+    }
   };
   /**
    * `omittable` says the shape survives without this outline, because a fill
@@ -245,23 +265,11 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
    */
   const strokeGeometry = (indices: readonly number[], matrix: PdfMatrix, style: number,
     omittable = false): Geometry | null => {
-    const strokes = page.stores.strokes;
     let g;
     try {
-      g = buildNativeGlyphStroke(pathCommands(indices), matrix, { transform: matrix, width: strokes.lineWidths[style], lineCap: strokes.lineCaps[style] as 0 | 1 | 2,
-        lineJoin: strokes.lineJoins[style] as 0 | 1 | 2, miterLimit: strokes.miterLimits[style], dashArray: Array.from(strokes.dashValues.subarray(strokes.dashOffsets[style], strokes.dashOffsets[style + 1])), dashPhase: strokes.dashPhases[style] }, signal);
+      g = buildNativeGlyphStroke(pathCommands(indices), matrix, strokeStyle(style, matrix), signal);
     } catch (error) {
-      // One glyph too intricate to outline must not cost the page its vectors:
-      // everything else stays resolution independent and this outline is left
-      // out, reported once rather than for each glyph sharing the shape.
-      if (!omittable || !(error instanceof PdfError) ||
-        error.details?.reason !== "native-glyph-stroke-complexity") throw error;
-      if (!reportedGlyphStrokeComplexity) {
-        reportedGlyphStrokeComplexity = true;
-        options.onDiagnostic?.({ code: "glyph-stroke-complexity", severity: "warning",
-          message: "A glyph outline was too intricate to stroke and is omitted; the rest of the page stays vector.",
-          details: { reason: "native-glyph-stroke-complexity" } });
-      }
+      omitStrokeError(error, omittable);
       return null;
     }
     return g ? { a: g.segmentsA, b: g.segmentsB, bounds: g.bounds } : null;
@@ -270,6 +278,17 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     clip: DensePdfTextClip | null, condition?: number, omittable = false): void => {
     const g = strokeGeometry(indices, matrix, style, omittable);
     if (g) fill(g, rgba, 0, clip, condition);
+  };
+  const strokeText = (glyph: number, indices: readonly number[], placement: PdfMatrix, pen: PdfMatrix,
+    style: number, rgba: Color, clip: DensePdfTextClip | null, condition: number | undefined, omittable: boolean): void => {
+    const stroke = strokeStyle(style, pen), { fontIndices, glyphIds } = page.stores.glyphs;
+    const key = `stroke:${nativeGlyphStrokeCacheKey(fontIndices[glyph], glyphIds[glyph], placement, stroke)}`;
+    try {
+      textGeometry(key, placement, rgba, clip, condition, () => {
+        const g = buildNativeGlyphStrokeAtOrigin(pathCommands(indices), placement, stroke, signal);
+        return g ? { a: g.segmentsA, b: g.segmentsB, bounds: g.bounds } : null;
+      });
+    } catch (error) { omitStrokeError(error, omittable); }
   };
   const gradient = async (index: number, matrix: PdfMatrix, alpha: number, clip: DensePdfTextClip | null,
     condition?: number, shape?: Geometry, paintBackground = false): Promise<void> => {
@@ -312,6 +331,20 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     gradients.push(data); appendRun("gradient-fill", paint, 1, clip, condition);
     if (grouped) stack.pop();
   };
+  const clipBoundsCache = new WeakMap<DensePdfTextClip, Bounds | null>();
+  const clipBounds = (clip: DensePdfTextClip): Bounds | null => {
+    if (clipBoundsCache.has(clip)) return clipBoundsCache.get(clip)!;
+    const bounds = emptyBounds(), { data, transform: matrix } = clip.path;
+    for (let offset = 0; offset < data.length;) {
+      const op = data[offset++], size = op === 0 || op === 1 ? 2 : op === 2 ? 6 : op === 3 ? 4 : op === 4 ? 0 : -1;
+      if (size < 0 || offset + size > data.length) { clipBoundsCache.set(clip, null); return null; }
+      for (let i = 0; i < size; i += 2) include(bounds, ...point(matrix, data[offset + i], data[offset + i + 1]));
+      offset += size;
+    }
+    // Bezier control hulls give conservative bounds, including for curved/text clips.
+    const result = Object.values(bounds).every(Number.isFinite) ? bounds : null;
+    clipBoundsCache.set(clip, result); return result;
+  };
   const patternActive = new Set<number>();
   let draw: (execution: HeprDrawRunExecution, inheritedClip?: DensePdfTextClip | null, inheritedCondition?: number) => Promise<void>;
   const pattern = async (paint: number, g: Geometry, matrix: PdfMatrix, clip: DensePdfTextClip | null, rule: number, condition?: number): Promise<void> => {
@@ -326,7 +359,15 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     const toScene = multiplyHeprMatrices(matrix, resolved.patternToOwnerTransform), [a, b, c, d, e, f] = toScene, det = a * d - b * c;
     if (Math.abs(det) < 1e-12) return fail("singular pattern transform.");
     const inverse: PdfMatrix = [d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det];
-    const bnd = g.bounds, points = [point(inverse, bnd.minX, bnd.minY), point(inverse, bnd.maxX, bnd.minY), point(inverse, bnd.minX, bnd.maxY), point(inverse, bnd.maxX, bnd.maxY)];
+    const bnd = { minX: Math.max(g.bounds.minX, scene.pageBounds.minX), minY: Math.max(g.bounds.minY, scene.pageBounds.minY),
+      maxX: Math.min(g.bounds.maxX, scene.pageBounds.maxX), maxY: Math.min(g.bounds.maxY, scene.pageBounds.maxY) };
+    for (let scope = clip; scope; scope = scope.parent) {
+      const bounds = clipBounds(scope);
+      if (bounds) { bnd.minX = Math.max(bnd.minX, bounds.minX); bnd.minY = Math.max(bnd.minY, bounds.minY);
+        bnd.maxX = Math.min(bnd.maxX, bounds.maxX); bnd.maxY = Math.min(bnd.maxY, bounds.maxY); }
+    }
+    if (bnd.maxX <= bnd.minX || bnd.maxY <= bnd.minY) return;
+    const points = [point(inverse, bnd.minX, bnd.minY), point(inverse, bnd.maxX, bnd.minY), point(inverse, bnd.minX, bnd.maxY), point(inverse, bnd.maxX, bnd.maxY)];
     const local = { minX: Math.min(...points.map(p => p[0])), maxX: Math.max(...points.map(p => p[0])), minY: Math.min(...points.map(p => p[1])), maxY: Math.max(...points.map(p => p[1])) };
     const patterns = page.stores.patterns, p = resolved.patternIndex, bounds = patterns.bounds.subarray(p * 4, p * 4 + 4), xs = patterns.xSteps[p], ys = patterns.ySteps[p];
     const range = (lo: number, hi: number, c0: number, c1: number, step: number): [number, number] => {
@@ -424,7 +465,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         // Modes 2 and 6 fill the glyph as well, so its shape survives an
         // outline this renderer cannot build; modes 1 and 5 have only the stroke.
         if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) {
-          strokePath(indices, local, command.strokeStyleIndex, color(command.strokePaintIndex, execution.state),
+          strokeText(glyph, indices, local, local, command.strokeStyleIndex, color(command.strokePaintIndex, execution.state),
             clip, condition, command.renderingMode === 2 || command.renderingMode === 6);
         }
       }

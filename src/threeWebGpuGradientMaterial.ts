@@ -1,3 +1,4 @@
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import * as THREE from "three";
@@ -49,6 +50,8 @@ export interface ThreeWebGpuGradientFillMaterialOptions extends CommonMaterialOp
   fillSegmentTextureB: THREE.DataTexture;
   fillPathTextureWidth: number;
   fillSegmentTextureWidth: number;
+  fillBandBase?: number;
+  fillBandEntries?: number;
 }
 
 export interface ThreeWebGpuGradientStrokeMaterialOptions extends CommonMaterialOptions {
@@ -91,6 +94,8 @@ function varyingNode(node: unknown, flat = false): never {
     { setInterpolation(type: string): unknown })(node);
   return (flat ? varying.setInterpolation("flat") : varying) as never;
 }
+
+const fillBandInfoFn = TSL.wgslFn(VECTOR_FILL_BAND_INFO_WGSL);
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprGradientCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
@@ -265,6 +270,8 @@ fn heprGradientFillFragment(
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
+  bands: vec4<f32>,
+  bandEntries: f32,
   gradientMetaA: texture_2d<f32>,
   gradientMetaB: texture_2d<f32>,
   gradientMetaC: texture_2d<f32>,
@@ -285,6 +292,7 @@ fn heprGradientFillFragment(
   // discard. Flat-interpolated paint metadata is not statically uniform.
   let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
   let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
+  let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * fillAAScreenPx, 0.0001);
   let segmentStart = i32(metaA.x + 0.5);
   let segmentCount = i32(metaA.y + 0.5);
   if (segmentCount <= 0 || (metaC.w <= 0.001 && shapeOnly < 0.5)) { discard; }
@@ -292,10 +300,16 @@ fn heprGradientFillFragment(
   var winding = 0;
   var crossings = 0;
   let safeWidth = max(i32(segmentTexWidth), 1);
-  for (var i = 0; i < segmentCount; i = i + 1) {
-    if (i >= segmentCount) { break; }
-    let index = segmentStart + i;
-    let coord = vec2<i32>(index % safeWidth, index / safeWidth);
+  let searchRadius = select(aaWidth, 0.0, metaC.y >= 0.5);
+${vectorFillBandLoopWgsl({
+    bands: "bands",
+    y: "local.y",
+    radius: "searchRadius",
+    count: "segmentCount",
+    start: "segmentStart",
+    texture: "segmentTexA",
+    entries: "bandEntries",
+    edge: `    let coord = vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
     let primitiveA = textureLoad(segmentTexA, coord, 0);
     let primitiveB = textureLoad(segmentTexB, coord, 0);
     var crossing = vec2<i32>(0);
@@ -306,16 +320,14 @@ fn heprGradientFillFragment(
       minDistance = min(minDistance, heprDistanceToLineSegment(local, primitiveA.xy, primitiveB.xy));
       crossing = heprGradientLineCrossing(primitiveA.xy, primitiveB.xy, local);
     }
-    winding = winding + crossing.x;
-    crossings = crossings + crossing.y;
-  }
+    if (countsCrossings) { winding += crossing.x; crossings += crossing.y; }`
+  })}
   let inside = select(winding != 0, (crossings % 2) == 1, metaC.x >= 0.5);
   var coverage: f32;
   if (metaC.y >= 0.5) {
     coverage = select(0.0, 1.0, inside);
   } else {
     let signedDistance = select(minDistance, -minDistance, inside);
-    let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * fillAAScreenPx, 0.0001);
     coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
   }
 
@@ -428,6 +440,10 @@ export function createThreeWebGpuGradientFillMaterial(
   const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0), true);
   const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0), true);
   const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0), true);
+  const bands = varyingNode(callNode(fillBandInfoFn, {
+    pathIndex: pathIndex, base: TSL.uniform(options.fillBandBase ?? -1),
+    segments: TSL.textureLoad(options.fillSegmentTextureA)
+  }), true);
   const vertexPack = varyingNode(options.mesh ? TSL.vec4(TSL.attribute("aMeshPosition", "vec2") as never, 1, 0) : callNode(fillVertexPackFn, {
     corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC, shapeOnly
   }));
@@ -445,6 +461,7 @@ export function createThreeWebGpuGradientFillMaterial(
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
     segmentTexWidth: segmentWidth,
+    bands, bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
     ...createGradientNodes(options, gradientWidth),
     fillAAScreenPx: TSL.uniform(1),
     meshColor: options.mesh ? varyingNode(TSL.attribute("aMeshColor", "vec4")) : TSL.vec4(0),

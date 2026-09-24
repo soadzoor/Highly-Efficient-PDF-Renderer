@@ -259,7 +259,7 @@ export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
   const retainedRuns = new Map<number, number>();
   runs.forEach((run, index) => { if (run.kind === "raster" && run.count === 1) retainedRuns.set(run.first, index); });
   let current = 0;
-  const visit = (nodes: readonly ScenePaintNode[], depth: number): void => {
+  const visit = (nodes: readonly ScenePaintNode[], depth: number, knockout = false): void => {
     if (depth > 64) return;
     current++;
     for (const node of nodes) {
@@ -269,7 +269,7 @@ export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
         // relative to the group's paints is free; both this walk and the
         // compositor take it first, which is also its place in the source.
         if (node.softMask) visit(node.softMask.children, depth + 1);
-        visit(node.children, depth + 1);
+        visit(node.children, depth + 1, node.knockout);
         current++;
         continue;
       }
@@ -277,7 +277,7 @@ export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
       if (index === undefined || index >= runs.length) continue;
       // A blend mode composites each object on its own, so such a paint shares
       // its span with nothing either side of it.
-      if (runs[index].blendMode) { current++; segments[index] = current; current++; }
+      if (knockout || runs[index].blendMode) { current++; segments[index] = current; current++; }
       else segments[index] = current;
     }
     current++;

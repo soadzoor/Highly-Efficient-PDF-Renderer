@@ -30,6 +30,7 @@ export class VectorOrderedBatches {
    * them itself rather than look for batches that do not exist.
    */
   readonly scheduledRuns: Uint8Array;
+  private readonly scheduledSpanPrefix: Uint32Array;
   readonly floatInstances: Float32Array;
   readonly uintInstances: Uint32Array;
   readonly strokeScene: VectorScene;
@@ -114,6 +115,9 @@ export class VectorOrderedBatches {
     // the compositor is one span whatever its graph says, so it keeps the whole
     // page to reorder in.
     this.segments = sceneRequiresPaintCompositing(scene) ? scenePaintSpanSegments(scene) : null;
+    let maxSpan = 0;
+    for (const span of this.segments ?? []) maxSpan = Math.max(maxSpan, span);
+    this.scheduledSpanPrefix = new Uint32Array(maxSpan + 2);
     this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns, this.segments);
     this.clipElision = VectorRunClipElision.create(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
     this.redundancy = new VectorStrokeRedundancy(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
@@ -122,6 +126,11 @@ export class VectorOrderedBatches {
     const capacity = Math.max(1, total + scene.fillPathCount + scene.textInstanceCount) * 2;
     this.floatInstances = new Float32Array(capacity);
     this.uintInstances = new Uint32Array(capacity);
+  }
+
+  /** Number of complete canonical runs represented by a span interval. */
+  scheduledSpanRunCount(first: number, last: number): number {
+    return this.scheduledSpanPrefix[last + 1] - this.scheduledSpanPrefix[first];
   }
 
   invalidate(): void { this.dirty = true; }
@@ -218,12 +227,14 @@ export class VectorOrderedBatches {
     this.culledSegmentCount = 0;
     this.visiblePaints.length = 0;
     this.scheduledRuns.fill(0);
+    this.scheduledSpanPrefix.fill(0);
     let cursor = 0;
     for (const run of runs) {
       const runIndex = this.runIndices.get(run)!;
       // Marked whether or not it survives LOD selection: a run culled down to
       // nothing is still one this plan speaks for, and contributes no batch.
       this.scheduledRuns[runIndex] = 1;
+      this.scheduledSpanPrefix[(this.segments?.[runIndex] ?? 0) + 1]++;
       let first = run.first, count = run.count;
       if (run.kind === "stroke" && this.runtime) {
         while (cursor < selectedCount && this.rankRun[this.selectedRanks[cursor]] < runIndex) cursor++;
@@ -235,6 +246,9 @@ export class VectorOrderedBatches {
       this.runRanges[runIndex * 2] = first;
       this.runRanges[runIndex * 2 + 1] = count;
       this.visiblePaints.push(runIndex);
+    }
+    for (let span = 1; span < this.scheduledSpanPrefix.length; span++) {
+      this.scheduledSpanPrefix[span] += this.scheduledSpanPrefix[span - 1];
     }
     if (this.redundancyEnabled) {
       let count = 0;

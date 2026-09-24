@@ -1,3 +1,4 @@
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
@@ -28,6 +29,8 @@ interface ThreeWebGpuFillMaterialOptions {
   fillSegmentTextureB: THREE.DataTexture;
   fillPathTextureWidth: number;
   fillSegmentTextureWidth: number;
+  fillBandBase?: number;
+  fillBandEntries?: number;
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
@@ -56,6 +59,8 @@ function varyingNode(node: unknown, flat = false): never {
     { setInterpolation(type: string): unknown })(node);
   return (flat ? varying.setInterpolation("flat") : varying) as never;
 }
+
+const fillBandInfoFn = TSL.wgslFn(VECTOR_FILL_BAND_INFO_WGSL);
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
@@ -121,10 +126,15 @@ fn heprFillFragment(
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
+  bands: vec4<f32>,
+  bandEntries: f32,
   fillAAScreenPx: f32,
   vectorOverride: vec4<f32>,
   shapeOnly: f32
 ) -> vec4<f32> {
+  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
+  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
+  let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * fillAAScreenPx, 0.0001);
   let segmentStart = i32(metaA.x + 0.5);
   let segmentCount = i32(metaA.y + 0.5);
   let alphaStyle = mix(metaC.w, 1.0, shapeOnly);
@@ -137,13 +147,16 @@ fn heprFillFragment(
   var crossings = 0;
   let safeWidth = max(i32(segmentTexWidth), 1);
 
-  for (var i = 0; i < segmentCount; i = i + 1) {
-    if (i >= segmentCount) {
-      break;
-    }
-
-    let primitiveIndex = segmentStart + i;
-    let coord = vec2<i32>(primitiveIndex % safeWidth, primitiveIndex / safeWidth);
+  let searchRadius = select(aaWidth, 0.0, metaC.y >= 0.5);
+${vectorFillBandLoopWgsl({
+    bands: "bands",
+    y: "local.y",
+    radius: "searchRadius",
+    count: "segmentCount",
+    start: "segmentStart",
+    texture: "segmentTexA",
+    entries: "bandEntries",
+    edge: `    let coord = vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
     let primitiveA = textureLoad(segmentTexA, coord, 0);
     let primitiveB = textureLoad(segmentTexB, coord, 0);
     let p0 = primitiveA.xy;
@@ -154,16 +167,13 @@ fn heprFillFragment(
     if (primitiveType >= 1.0) {
       minDistance = min(minDistance, heprDistanceToQuadraticBezier(local, p0, p1, p2));
       let crossingDelta = heprQuadraticCrossingDelta(p0, p1, p2, local);
-      winding = winding + crossingDelta.x;
-      crossings = crossings + crossingDelta.y;
+      if (countsCrossings) { winding += crossingDelta.x; crossings += crossingDelta.y; }
     } else {
       minDistance = min(minDistance, heprDistanceToLineSegment(local, p0, p2));
       let crossingDelta = heprLineCrossingDelta(p0, p2, local);
-      winding = winding + crossingDelta.x;
-      crossings = crossings + crossingDelta.y;
-    }
-  }
-
+      if (countsCrossings) { winding += crossingDelta.x; crossings += crossingDelta.y; }
+    }`
+  })}
   let insideNonZero = winding != 0;
   let insideEvenOdd = (crossings % 2) == 1;
   let inside = select(insideNonZero, insideEvenOdd, metaC.x >= 0.5);
@@ -180,9 +190,6 @@ fn heprFillFragment(
   }
 
   let signedDistance = select(minDistance, -minDistance, inside);
-  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
-  let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * fillAAScreenPx, 0.0001);
   let alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * alphaStyle;
   if (alpha <= 0.001) {
     discard;
@@ -326,6 +333,10 @@ export function createThreeWebGpuFillMaterial(
   const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0), true);
   const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0), true);
   const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0), true);
+  const bands = varyingNode(callNode(fillBandInfoFn, {
+    pathIndex: fillPathIndex, base: TSL.uniform(options.fillBandBase ?? -1),
+    segments: TSL.textureLoad(options.fillSegmentTextureA)
+  }), true);
   const vertexPack = varyingNode(callNode(fillVertexPackFn, {
     corner,
     metaA,
@@ -351,6 +362,7 @@ export function createThreeWebGpuFillMaterial(
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
     segmentTexWidth: fillSegmentTextureWidthUniform,
+    bands, bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
     fillAAScreenPx: fillAAScreenPxUniform,
     vectorOverride: TSL.uniform(options.vectorOverride),
     shapeOnly: shapeOnlyUniform

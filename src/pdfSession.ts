@@ -3156,7 +3156,7 @@ async function renderNativeSelectiveCompositeLayers(
       }
       if (unselectedGlyphOffset >= 0) onCompositeText?.();
       const layer = await renderNativeCompositeCommandSpan(page, first, last, paintOrder,
-        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, true, limits);
+        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, limits);
       if (layer) layers.push(layer);
     }
     return layers;
@@ -3182,7 +3182,7 @@ export async function renderNativeRetainedCommandSpan(
   try {
     return await renderNativeCompositeCommandSpan(page, firstCommand, firstCommand + count - 1,
       firstCommand + count - 1, signal, surfaceFactory, renderHeprPageToCanvas2d,
-      { imageSurfaces, boundSoftMasks: true }, true, true, limits);
+      { imageSurfaces, boundSoftMasks: true }, true, limits);
   } finally { imageSurfaces.dispose(); surfaceFactory.releaseAll(); }
 }
 
@@ -3192,7 +3192,6 @@ async function renderNativeCompositeCommandSpan(
   renderHeprPageToCanvas2d: NativeCompositeRenderer,
   renderInternals: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals,
   boundCompositeWork: boolean,
-  fullPage = false,
   limits?: Readonly<PdfResourceLimits>
 ): Promise<NativeSelectiveRasterLayer | null> {
   const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
@@ -3201,9 +3200,11 @@ async function renderNativeCompositeCommandSpan(
   const rendered = await renderNativeCompositePixels(createSelectiveCompositePage(page, commands), {
     scale, background: null, surfaceFactory, signal
   }, renderHeprPageToCanvas2d, renderInternals);
-  const crop = fullPage ? { x: 0, y: 0, width: rendered.width, height: rendered.height, data: new Uint8Array(rendered.rgba) }
-    : cropVisibleRgba(rendered.rgba, rendered.width, rendered.height, 2, signal);
-  if (!crop) return null;
+  // Keep the slot even when its current layers are empty. Retained page bounds
+  // describe where a later visibility revision can paint; its texture only
+  // needs the pixels visible now.
+  const crop = cropVisibleRgba(rendered.rgba, rendered.width, rendered.height, 2, signal) ??
+    { x: 0, y: 0, width: 1, height: 1, data: new Uint8Array(4) };
   const backdropGroups = collectHeprBackdropGroups(page, commands);
   const data = backdropGroups.size !== 0 && [...backdropGroups].every(groupIndex => heprBackdropGroupCanRender(page, groupIndex))
     ? await renderNativeBackdropCorrection({ page, rootCommands, first, last, selectionRgba: rendered.rgba,

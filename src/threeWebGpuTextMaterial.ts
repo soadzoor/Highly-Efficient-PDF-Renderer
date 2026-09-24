@@ -454,7 +454,7 @@ fn heprTextFragment(
   var winding = 0;
   let safeWidth = max(i32(segmentTexWidth), 1);
 
-  for (var i = 0; i < 2048; i = i + 1) {
+  for (var i = 0; i < segmentCount; i = i + 1) {
     if (i >= segmentCount) {
       break;
     }

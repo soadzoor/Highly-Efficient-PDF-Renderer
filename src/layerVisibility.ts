@@ -68,7 +68,11 @@ export function createLayerVisibilityController(options: LayerVisibilityOptions)
                 context.signal.throwIfAborted();
                 if (target !== options.getRenderer()) {
                   resources?.dispose(); target = options.getRenderer();
-                  resources = prepared ? target.prepareRasterLayerUpdates?.(prepared.layers) : undefined;
+                  // A replacement starts with canonical defaults. Include prior
+                  // applied revisions before overlaying this preparation's delta.
+                  const updates = new Map(owner?.getLayers());
+                  for (const [index, layer] of prepared?.layers ?? []) updates.set(index, layer);
+                  resources = prepared ? target.prepareRasterLayerUpdates?.(updates) : undefined;
                 }
                 hostCommit?.(); resources?.commit(); prepared?.commit();
               } finally { context.signal.removeEventListener("abort", abort); resources?.dispose(); }

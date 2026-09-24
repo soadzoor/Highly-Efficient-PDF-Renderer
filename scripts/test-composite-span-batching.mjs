@@ -127,5 +127,23 @@ try {
   assert.deepEqual(unordered, spans[0], "an out-of-order plan is not used");
   plan.spanOrdered = true;
 
+  const singleton = [];
+  submitPaintSpan([runs[0]], plan, segments, lookup, run => singleton.push(run));
+  assert.deepEqual(singleton, [runs[0]], "one canonical run cannot expand into neighbouring paints");
+
+  const knockout = { ...scene, drawRuns: [
+    { kind: "fill", first: 0, count: 2, blendMode: "Multiply" },
+    { kind: "fill", first: 2, count: 1 },
+    { kind: "stroke", first: 0, count: 1 }
+  ], paintGraph: { roots: [group([draw(0), draw(1), draw(2)], { knockout: true })] } };
+  const knockoutSegments = scenePaintSpanSegments(knockout);
+  assert.equal(new Set(knockoutSegments).size, 3, "each knockout child has an independent span");
+  const knockoutPlan = new VectorOrderedBatches(knockout, null);
+  knockoutPlan.update(knockout.drawRuns, 0.1);
+  const part = { ...knockout.drawRuns[0], first: 1, count: 1, blendMode: undefined };
+  const partial = [];
+  submitPaintSpan([part], knockoutPlan, knockoutSegments, buildCanonicalRunLookup(knockout), run => partial.push(run));
+  assert.deepEqual(partial, [part], "one blended primitive never expands to its multi-object canonical run");
+
   console.log("Composite span batching: span ids, plan coverage, soft-mask fallback and ordering passed");
 } finally { hooks.deregister(); }

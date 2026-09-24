@@ -1,3 +1,4 @@
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 
@@ -14,6 +15,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 `;
 
@@ -160,6 +162,7 @@ ${CAMERA_STRUCT}
 @group(0) @binding(6) var uSegmentsB : texture_2d<f32>;
 ${gradientBindings(7)}
 ${GRADIENT_FUNCTIONS}
+${VECTOR_FILL_BAND_INFO_WGSL}
 
 struct FillOut {
   @builtin(position) position : vec4f,
@@ -172,6 +175,7 @@ struct FillOut {
   @location(6) @interpolate(flat) companionStroke : f32,
   @location(7) @interpolate(flat) sourceGradient : i32,
   @location(8) @interpolate(flat) maskGradient : i32,
+  @location(9) @interpolate(flat) bands : vec4f,
 };
 
 @vertex
@@ -186,6 +190,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   let segmentCount = i32(metaA.y + 0.5);
   let alpha = metaC.w;
   var out : FillOut;
+  out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.z, uSegmentsA);
   if (segmentCount <= 0 || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0);
@@ -239,9 +244,20 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   var minDistance = 1e20;
   var winding = 0;
   var crossings = 0;
-  for (var primitiveIndex = 0; primitiveIndex < inData.segmentCount; primitiveIndex = primitiveIndex + 1) {
-    if (primitiveIndex >= inData.segmentCount) { break; }
-    let coord = coordFromIndex(inData.segmentStart + primitiveIndex, i32(dimensions.x));
+  let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
+  let searchRadius = select(aaWidth, 0.0, inData.companionStroke >= 0.5);
+${vectorFillBandLoopWgsl({
+    bands: "inData.bands",
+    y: "inData.local.y",
+    radius: "searchRadius",
+    count: "inData.segmentCount",
+    start: "inData.segmentStart",
+    texture: "uSegmentsA",
+    entries: "uCamera.fillBands.w",
+    edge: `
+      var edgeWinding = 0;
+      var edgeCrossings = 0;
+    let coord = coordFromIndex(segmentIndex, i32(dimensions.x));
     let primitiveA = textureLoad(uSegmentsA, coord, 0);
     let primitiveB = textureLoad(uSegmentsB, coord, 0);
     let p0 = primitiveA.xy;
@@ -252,18 +268,19 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
       var previous = p0;
       for (var step = 1; step <= 8; step = step + 1) {
         let next = quadraticPoint(p0, p1, p2, f32(step) / 8.0);
-        accumulateCrossing(previous, next, inData.local, &winding, &crossings);
+        accumulateCrossing(previous, next, inData.local, &edgeWinding, &edgeCrossings);
         previous = next;
       }
     } else {
       minDistance = min(minDistance, distanceToLine(inData.local, p0, p2));
-      accumulateCrossing(p0, p2, inData.local, &winding, &crossings);
+      accumulateCrossing(p0, p2, inData.local, &edgeWinding, &edgeCrossings);
     }
-  }
+      if (countsCrossings) { winding += edgeWinding; crossings += edgeCrossings; }
+`
+  })}
   let inside = select(winding != 0, (crossings & 1) == 1, inData.fillRule >= 0.5);
   var coverage = select(0.0, 1.0, inside);
   if (inData.companionStroke < 0.5) {
-    let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
     let signedDistance = select(minDistance, -minDistance, inside);
     coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
   }

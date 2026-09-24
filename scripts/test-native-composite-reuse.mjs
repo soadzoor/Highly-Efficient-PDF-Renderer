@@ -44,7 +44,7 @@ try {
               assert(after.imageSurfaces < before.imageSurfaces);
             }
             if (boundCompositeWork) assert(after.readbackPixels <= before.readbackPixels,
-              "replay slots retain a full structural page frame, while bounded work must not increase readback");
+              "bounded cropped fallback work must not increase readback");
           } else if (boundCompositeWork) {
             assert(after.softMaskPixels < before.softMaskPixels / 2);
           }

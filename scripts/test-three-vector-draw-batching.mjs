@@ -19,7 +19,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 try {
   const { ThreeVectorDrawRuns } = await import("../src/threeVectorDrawRuns.ts");
-  const { getThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
+  const { getThreeVectorDrawPlan, ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
   const { createThreeVectorClipTexture, initializeThreeVectorClip } =
     await import("../src/threeVectorClips.ts");
@@ -157,7 +157,41 @@ try {
     layer.clipTexture.dispose();
   }
 
-  function createLayer(sceneData, kind, attribute, count) {
+  // An effect constrains batching to its own source-over span; it does not
+  // force every unrelated paint back to an individual submission.
+  const composited = createInterleavedScene();
+  const split = Math.floor(composited.drawRuns.length / 2);
+  const group = children => ({ kind: "group", isolated: true, knockout: false, alpha: 0.5,
+    blendMode: "Normal", children });
+  composited.paintGraph = { roots: [group(composited.drawRuns.slice(0, split).map((_run, runIndex) => ({ kind: "draw", runIndex }))),
+    group(composited.drawRuns.slice(split).map((_run, index) => ({ kind: "draw", runIndex: split + index })))] };
+  const firstPlan = new ThreeVectorDrawPlan(composited), secondPlan = new ThreeVectorDrawPlan(composited);
+  const compositedLayers = {
+    stroke: createLayer(composited, "stroke", "aSegmentIndex", composited.segmentCount, firstPlan),
+    fill: createLayer(composited, "fill", "aFillPathIndex", composited.fillPathCount, firstPlan),
+    text: createLayer(composited, "text", "aTextInstanceIndex", composited.textInstanceCount, firstPlan)
+  };
+  const before = totalMeshes(compositedLayers);
+  firstPlan.update(0.01);
+  for (const layer of Object.values(compositedLayers)) refresh(layer);
+  assert.ok(totalMeshes(compositedLayers) < before, "ordinary paints inside effect spans still batch");
+  assert.equal(secondPlan.version, 0, "two objects over one scene keep independent view schedules");
+  assert.deepEqual(secondPlan.order, composited.drawRuns.map((_run, index) => index));
+  for (const layer of Object.values(compositedLayers)) {
+    for (const mesh of layer.mesh.children) {
+      assert.equal(new Set(mesh.userData.heprDrawRunIndices.map(index => firstPlan.segments[index])).size, 1,
+        "no mesh crosses a compositing boundary");
+      assert.equal(mesh.userData.heprDrawRanges.length, mesh.userData.heprDrawRunIndices.length,
+        "every canonical range remains available to compositor subset lookup");
+    }
+    layer.runs.dispose(); layer.clipTexture.dispose();
+  }
+  const reversed = { ...composited, paintGraph: { roots: [group(composited.drawRuns.map((_run, index) =>
+    ({ kind: "draw", runIndex: composited.drawRuns.length - 1 - index })))] } };
+  assert.equal(new ThreeVectorDrawPlan(reversed).update(0.01), false,
+    "an arbitrary graph visiting source paints backwards keeps its graph order");
+
+  function createLayer(sceneData, kind, attribute, count, drawPlan) {
     const geometry = new THREE.InstancedBufferGeometry();
     geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, -1, 1, -1, 1, 1, -1, 1], 2));
     geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
@@ -169,7 +203,7 @@ try {
     const clipTexture = createThreeVectorClipTexture(sceneData);
     initializeThreeVectorClip(material, clipTexture);
     const mesh = new THREE.Mesh(geometry, material);
-    const runs = ThreeVectorDrawRuns.create(sceneData, kind, mesh, attribute);
+    const runs = ThreeVectorDrawRuns.create(sceneData, kind, mesh, attribute, drawPlan);
     assert.ok(runs, `${kind} layer must build ordered draw runs`);
     return { mesh, runs, attribute, ids, count, clipTexture };
   }

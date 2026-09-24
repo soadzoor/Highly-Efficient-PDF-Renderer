@@ -1,4 +1,5 @@
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import { retainedRasterBounds } from "./retainedRasterBounds";
 
 /** Conservative paint bounds. Filtering retains the original order and instance ranges. */
 export class VectorDrawRunCuller {
@@ -61,6 +62,11 @@ export class VectorDrawRunCuller {
             }
           }
         } else if (run.kind === "raster") {
+          const retained = retainedRasterBounds(scene, index);
+          if (retained) {
+            include(retained.minX, retained.minY); include(retained.maxX, retained.maxY);
+            continue;
+          }
           const m = scene.rasterLayers[index].matrix;
           for (const x of [0, 1]) for (const y of [0, 1]) include(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
         } else {

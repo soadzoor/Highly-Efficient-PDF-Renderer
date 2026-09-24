@@ -1,3 +1,5 @@
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
+import { vectorFillBandStore, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
@@ -140,8 +142,8 @@ const CLEAR_COLOR = {
   a: 1
 };
 
-const CAMERA_UNIFORM_FLOATS = 16;
-const CAMERA_UNIFORM_BUFFER_BYTES = 64;
+const CAMERA_UNIFORM_FLOATS = 20;
+const CAMERA_UNIFORM_BUFFER_BYTES = 80;
 
 const BLIT_UNIFORM_FLOATS = 12;
 const BLIT_UNIFORM_BUFFER_BYTES = 48;
@@ -177,6 +179,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 struct SegmentIdBuffer {
@@ -363,6 +366,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -382,9 +386,11 @@ struct VsOut {
   @location(4) @interpolate(flat) alpha : f32,
   @location(5) @interpolate(flat) fillRule : f32,
   @location(6) @interpolate(flat) fillHasCompanionStroke : f32,
+  @location(7) @interpolate(flat) bands : vec4f,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
+${VECTOR_FILL_BAND_INFO_WGSL}
 
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
 const QUAD_WINDING_SUBDIVISIONS : i32 = 6;
@@ -518,6 +524,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let alpha = metaC.w;
 
   var out : VsOut;
+  out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.x, uFillSegmentTexA);
   out.vectorClipIndex = uVectorClip.x;
   if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if (segmentCount <= 0 || alpha <= 0.001) {
@@ -572,12 +579,18 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   var winding = 0;
   var crossings = 0;
 
-  for (var i = 0; i < inData.segmentCount; i = i + 1) {
-    if (i >= inData.segmentCount) {
-      break;
-    }
-
-    let segmentIndex = inData.segmentStart + i;
+  let searchRadius = select(aaWidth, 0.0, inData.fillHasCompanionStroke >= 0.5);
+${vectorFillBandLoopWgsl({
+    bands: "inData.bands",
+    y: "inData.local.y",
+    radius: "searchRadius",
+    count: "inData.segmentCount",
+    start: "inData.segmentStart",
+    texture: "uFillSegmentTexA",
+    entries: "uCamera.fillBands.y",
+    edge: `
+      var edgeWinding = 0;
+      var edgeCrossings = 0;
     let coord = coordFromIndex(segmentIndex, i32(fillSegDims.x));
 
     let primitiveA = textureLoad(uFillSegmentTexA, coord, 0);
@@ -589,12 +602,14 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
     if (primitiveType >= FILL_PRIMITIVE_QUADRATIC) {
       minDistance = min(minDistance, distanceToQuadraticBezier(inData.local, p0, p1, p2));
-      accumulateQuadraticCrossing(p0, p1, p2, inData.local, &winding, &crossings);
+      accumulateQuadraticCrossing(p0, p1, p2, inData.local, &edgeWinding, &edgeCrossings);
     } else {
       minDistance = min(minDistance, distanceToLineSegment(inData.local, p0, p2));
-      accumulateLineCrossing(p0, p2, inData.local, &winding, &crossings);
+      accumulateLineCrossing(p0, p2, inData.local, &edgeWinding, &edgeCrossings);
     }
-  }
+      if (countsCrossings) { winding += edgeWinding; crossings += edgeCrossings; }
+`
+  })}
 
   let insideNonZero = winding != 0;
   let insideEvenOdd = (crossings & 1) == 1;
@@ -634,6 +649,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -670,7 +686,6 @@ struct VsOut {
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
 
-const MAX_GLYPH_PRIMITIVES : i32 = 2048;
 const TEXT_PRIMITIVE_QUADRATIC : f32 = 1.0;
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -1049,7 +1064,7 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   var nearestSideMultiplicity = 0;
   var winding = 0;
 
-  for (var i = 0; i < MAX_GLYPH_PRIMITIVES; i = i + 1) {
+  for (var i = 0; i < inData.segmentCount; i = i + 1) {
     if (i >= inData.segmentCount) {
       break;
     }
@@ -1172,6 +1187,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 struct RasterUniforms {
@@ -1779,6 +1795,10 @@ export class WebGpuFloorplanRenderer {
 
   private segmentTextureHeight = 1;
 
+  private fillBandBase = -1;
+  private fillBandEntries = 0;
+  private gradientFillBandBase = -1;
+  private gradientFillBandEntries = 0;
   private fillPathMetaTextureWidth = 1;
 
   private fillPathMetaTextureHeight = 1;
@@ -2766,7 +2786,10 @@ export class WebGpuFloorplanRenderer {
 
     const segmentDims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
-    const fillSegmentDims = chooseTextureDimensions(scene.fillSegmentCount, maxTextureSize);
+    const fillBands = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, vectorFillBandIndex(scene), maxTextureSize);
+    this.fillBandBase = fillBands.pathBase;
+    this.fillBandEntries = fillBands.entryBase;
+    const fillSegmentDims = chooseTextureDimensions(fillBands.texels, maxTextureSize);
     let textInstanceDims = chooseTextureDimensions(
       textLodUploadData?.combinedInstanceCount ?? scene.textInstanceCount,
       maxTextureSize
@@ -2831,7 +2854,7 @@ export class WebGpuFloorplanRenderer {
     this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaA);
     this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaB);
     this.fillPathMetaTextureC = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaC);
-    this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsA);
+    this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillBands.data);
     this.fillSegmentTextureB = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsB);
 
     const textInstanceTexels = this.textInstanceTextureWidth * this.textInstanceTextureHeight;
@@ -4367,6 +4390,10 @@ export class WebGpuFloorplanRenderer {
     data[13] = this.vectorOverrideColor[1];
     data[14] = this.vectorOverrideColor[2];
     data[15] = this.vectorOverrideOpacity;
+    data[16] = this.fillBandBase;
+    data[17] = this.fillBandEntries;
+    data[18] = this.gradientFillBandBase;
+    data[19] = this.gradientFillBandEntries;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
@@ -5006,7 +5033,13 @@ export class WebGpuFloorplanRenderer {
     }
     const gradientDims = chooseTextureDimensions(data.gradientCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(data.gradientFillPathCount, maxTextureSize);
-    const fillSegmentDims = chooseTextureDimensions(data.gradientFillSegmentCount, maxTextureSize);
+    const fillBands = vectorFillBandStore(data.gradientFillSegmentsA, data.gradientFillSegmentCount,
+      buildVectorFillBandIndex({ pathCount: data.gradientFillPathCount, segmentCount: data.gradientFillSegmentCount,
+        pathMetaA: data.gradientFillPathMetaA, pathMetaB: data.gradientFillPathMetaB,
+        segmentsA: data.gradientFillSegmentsA, segmentsB: data.gradientFillSegmentsB }), maxTextureSize);
+    this.gradientFillBandBase = fillBands.pathBase;
+    this.gradientFillBandEntries = fillBands.entryBase;
+    const fillSegmentDims = chooseTextureDimensions(fillBands.texels, maxTextureSize);
     const strokeRunDims = chooseTextureDimensions(data.gradientStrokeRunCount, maxTextureSize);
     const strokeSegmentDims = chooseTextureDimensions(data.gradientStrokeSegmentCount, maxTextureSize);
 
@@ -5032,7 +5065,7 @@ export class WebGpuFloorplanRenderer {
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaB),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaC),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPaintMeta),
-      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsA),
+      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, fillBands.data),
       this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsB)
     ];
     this.gradientStrokeTextures = [

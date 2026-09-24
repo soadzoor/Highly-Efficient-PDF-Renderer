@@ -67,6 +67,7 @@ export class ThreeMaterialRasterLayer {
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
+  private readonly appliedRasterLayers: (RasterLayer | undefined)[];
   private readonly stripEntries: ResidentRasterLayerEntry[] = [];
   private activeEntries: RasterLayerEntry[] = [];
   private readonly multiplyMaterials: THREE.Material[] = [];
@@ -82,6 +83,7 @@ export class ThreeMaterialRasterLayer {
   private readonly localToClipUniform: THREE.Matrix4;
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
+    this.appliedRasterLayers = [...scene.rasterLayers];
     this.visibility = new ScenePaintVisibility(scene);
     this.snapshot = createDefaultOptionalContentSnapshot(scene);
     this.visibility.setVisibility(this.snapshot);
@@ -220,7 +222,9 @@ export class ThreeMaterialRasterLayer {
     }
     const staged: { index: number; layer: RasterLayer; texture: THREE.DataTexture }[] = [];
     try {
-      for (const [index, layer] of updates) staged.push({ index, layer, texture: createRasterTexture(layer) });
+      for (const [index, layer] of updates) {
+        if (this.appliedRasterLayers[index] !== layer) staged.push({ index, layer, texture: createRasterTexture(layer) });
+      }
     } catch (error) {
       for (const item of staged) item.texture.dispose();
       throw error;
@@ -237,6 +241,7 @@ export class ThreeMaterialRasterLayer {
         finished = true;
         if (staged.length > 0) this.destroyStripBatches();
         for (const { index, layer, texture } of staged) {
+          this.appliedRasterLayers[index] = layer;
           const entry = this.rasterEntries[index];
           const previous = entry.texture;
           entry.texture = texture;

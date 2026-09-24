@@ -16,7 +16,7 @@ import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePri
 import { WebGlPrimitiveHighlights } from "./nativePrimitiveHighlights";
 import { multiplyFragmentGlsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
-import { buildVectorFillBandIndex, packVectorFillBands, vectorFillBandIndex } from "./vectorFillBands";
+import { buildVectorFillBandIndex, vectorFillBandStore, vectorFillBandIndex } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
 import { packVectorClips } from "./vectorClips";
@@ -799,7 +799,6 @@ out vec4 outColor;
 
 ${GLSL_OUTPUT_COLOR_HELPERS}
 
-const int MAX_GLYPH_PRIMITIVES = 2048;
 const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
@@ -1053,7 +1052,7 @@ void main() {
   int nearestSideMultiplicity = 0;
   int winding = 0;
 
-  for (int i = 0; i < MAX_GLYPH_PRIMITIVES; i += 1) {
+  for (int i = 0; i < vSegmentCount; i += 1) {
     if (i >= vSegmentCount) {
       break;
     }
@@ -4441,7 +4440,8 @@ export class WebGlFloorplanRenderer {
         profile?.add("strokeInstances", run.count);
         const level = plan ? this.vectorLodLevels[0] : undefined;
         if (level) {
-          this.drawStrokeInstances(level, this.orderedInstanceBuffer!, run.count, width, height, x, y, zoom, run.first);
+          this.drawStrokeInstances(level, this.vectorClipIndex === -2 ? this.orderedInstanceBuffer! : this.allSegmentIdBuffer,
+            run.count, width, height, x, y, zoom, run.first);
           strokes += run.count;
         } else {
           strokes += this.drawVisibleSegments(width, height, x, y, zoom, { start: run.first, count: run.count });
@@ -5576,22 +5576,11 @@ export class WebGlFloorplanRenderer {
       pathMetaA: data.gradientFillPathMetaA, pathMetaB: data.gradientFillPathMetaB,
       segmentsA: data.gradientFillSegmentsA, segmentsB: data.gradientFillSegmentsB
     });
-    const packedFillBands = fillBands
-      ? packVectorFillBands(fillBands, data.gradientFillSegmentCount) : null;
-    let fillSegmentDims = chooseTextureDimensions(data.gradientFillSegmentCount, maxTextureSize);
-    this.gradientFillBandBase = -1;
-    this.gradientFillBandEntries = 0;
-    if (packedFillBands) {
-      try {
-        const withBands = chooseTextureDimensions(
-          data.gradientFillSegmentCount + packedFillBands.texels, maxTextureSize);
-        if (withBands.width * withBands.height >= data.gradientFillSegmentCount + packedFillBands.texels) {
-          fillSegmentDims = withBands;
-          this.gradientFillBandBase = packedFillBands.pathBase;
-          this.gradientFillBandEntries = packedFillBands.entryBase;
-        }
-      } catch { /* keep the unindexed dimensions */ }
-    }
+    const fillStore = vectorFillBandStore(data.gradientFillSegmentsA, data.gradientFillSegmentCount,
+      fillBands, maxTextureSize);
+    const fillSegmentDims = chooseTextureDimensions(fillStore.texels, maxTextureSize);
+    this.gradientFillBandBase = fillStore.pathBase;
+    this.gradientFillBandEntries = fillStore.entryBase;
     this.gradientFillPathTextureWidth = fillPathDims.width;
     this.gradientFillPathTextureHeight = fillPathDims.height;
     this.gradientFillSegmentTextureWidth = fillSegmentDims.width;
@@ -5612,10 +5601,9 @@ export class WebGlFloorplanRenderer {
     }
     this.uploadFloatDataTexture(
       this.gradientFillTextures[4],
-      data.gradientFillSegmentsA,
-      data.gradientFillSegmentCount,
-      fillSegmentDims,
-      this.gradientFillBandBase >= 0 ? packedFillBands!.data : undefined
+      fillStore.data,
+      fillStore.texels,
+      fillSegmentDims
     );
     this.uploadFloatDataTexture(
       this.gradientFillTextures[5],
@@ -5699,23 +5687,10 @@ export class WebGlFloorplanRenderer {
     const pathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
     // The band index follows the segments in the same store, so the texture is
     // sized for both. A store too large to hold it simply goes without.
-    const bandIndex = vectorFillBandIndex(scene);
-    const packed = bandIndex ? packVectorFillBands(bandIndex, scene.fillSegmentCount) : null;
-    let segmentDims = chooseTextureDimensions(scene.fillSegmentCount, maxTextureSize);
-    this.fillBandBase = -1;
-    this.fillBandEntries = 0;
-    if (packed) {
-      // A store with no room left for the index renders exactly as before,
-      // scanning each path in full, rather than failing to load at all.
-      try {
-        const withBands = chooseTextureDimensions(scene.fillSegmentCount + packed.texels, maxTextureSize);
-        if (withBands.width * withBands.height >= scene.fillSegmentCount + packed.texels) {
-          segmentDims = withBands;
-          this.fillBandBase = packed.pathBase;
-          this.fillBandEntries = packed.entryBase;
-        }
-      } catch { /* keep the unindexed dimensions */ }
-    }
+    const bands = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, vectorFillBandIndex(scene), maxTextureSize);
+    const segmentDims = chooseTextureDimensions(bands.texels, maxTextureSize);
+    this.fillBandBase = bands.pathBase;
+    this.fillBandEntries = bands.entryBase;
 
     this.fillPathMetaTextureWidth = pathDims.width;
     this.fillPathMetaTextureHeight = pathDims.height;
@@ -5735,9 +5710,7 @@ export class WebGlFloorplanRenderer {
     pathMetaCData.set(scene.fillPathMetaC);
 
     const segmentDataA = new Float32Array(segmentTexelCount * 4);
-    segmentDataA.set(scene.fillSegmentsA);
-    // Written after the segments, which own the texels it follows.
-    if (this.fillBandBase >= 0) segmentDataA.set(packed!.data, this.fillBandBase * 4);
+    segmentDataA.set(bands.data);
 
     const segmentDataB = new Float32Array(segmentTexelCount * 4);
     segmentDataB.set(scene.fillSegmentsB);

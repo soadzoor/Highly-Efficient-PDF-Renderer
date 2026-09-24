@@ -1,3 +1,6 @@
+import type { OptionalContentSnapshot } from "./optionalContent";
+import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
+import { strokePaintOrigins } from "./vectorStrokePaintOrder";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
 
@@ -27,6 +30,7 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 interface VectorStrokeLodLayerOptions {
+  drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
@@ -40,20 +44,46 @@ export class ThreeVectorLodStrokeLayer {
   private readonly runtime: VectorStrokeLodRuntime;
   private readonly layers: ThreeMaterialStrokeLayer[];
   private requestedVisible = false;
+  private readonly combinedIds: Uint32Array | null;
+  private readonly levelOffsets: number[] = [];
 
   constructor(scene: VectorScene, options: VectorStrokeLodLayerOptions) {
     this.scene = scene;
     this.group.name = "hepr-vector-lod-strokes";
     this.group.visible = false;
     this.runtime = takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
-    this.layers = this.runtime.levels.map((level) => {
-      const layer = new ThreeMaterialStrokeLayer(level.scene, options);
-      layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(level.tolerance)}`;
-      layer.setVisible(false);
-      layer.setDrawEnabled(false);
+    if (scene.drawRuns) {
+      let count = 0;
+      for (const level of this.runtime.levels) { this.levelOffsets.push(count); count += level.segmentCount; }
+      const combined = { ...scene, segmentCount: count };
+      const origins = new Uint32Array(count);
+      for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"] as const) {
+        combined[key] = new Float32Array(count * 4);
+        this.runtime.levels.forEach((level, index) => combined[key].set(level.scene[key], this.levelOffsets[index] * 4));
+      }
+      this.runtime.levels.forEach((level, index) => origins.set(strokePaintOrigins(level.scene)!, this.levelOffsets[index]));
+      const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
+      drawPlan.setStrokeSource(combined, origins);
+      const layer = new ThreeMaterialStrokeLayer(combined, { ...options, drawPlan, canonicalScene: scene, strokeOrigins: origins });
+      this.layers = [layer];
+      this.combinedIds = new Uint32Array(count);
+      layer.setVisible(false); layer.setDrawEnabled(false);
       this.group.add(layer.mesh);
-      return layer;
-    });
+    } else {
+      this.combinedIds = null;
+      this.layers = this.runtime.levels.map((level) => {
+        const layer = new ThreeMaterialStrokeLayer(level.scene, options);
+        layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(level.tolerance)}`;
+        layer.setVisible(false);
+        layer.setDrawEnabled(false);
+        this.group.add(layer.mesh);
+        return layer;
+      });
+    }
+  }
+
+  setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    for (const layer of this.layers) layer.setOptionalContentVisibility(snapshot);
   }
 
   setVisible(visible: boolean): void {
@@ -117,7 +147,7 @@ export class ThreeVectorLodStrokeLayer {
     if (!this.group.visible) {
       return 0;
     }
-    return this.runtime.getRenderedSegmentCount();
+    return this.combinedIds ? this.layers[0].getRenderedSegmentCount() : this.runtime.getRenderedSegmentCount();
   }
 
   getStats(): VectorStrokeLodStats {
@@ -144,6 +174,18 @@ export class ThreeVectorLodStrokeLayer {
 
   private updateLevelDraws(viewState: ViewState, viewport: ViewportPixels): void {
     const visible = this.requestedVisible && this.group.visible;
+    if (this.combinedIds) {
+      let count = 0;
+      this.runtime.levels.forEach((level, index) => {
+        if (!visible) return;
+        for (let item = 0; item < level.visibleSegmentCount; item++) {
+          this.combinedIds![count++] = this.levelOffsets[index] + level.visibleSegmentIds[item];
+        }
+      });
+      this.layers[0].updateFrameWithVisibleSegmentIds(viewState, viewport, this.combinedIds, count);
+      this.layers[0].setVisible(visible); this.layers[0].setDrawEnabled(count > 0);
+      return;
+    }
     for (let i = 0; i < this.layers.length; i += 1) {
       const layer = this.layers[i];
       const level = this.runtime.levels[i];
@@ -161,7 +203,7 @@ export class ThreeVectorLodStrokeLayer {
       const layer = this.layers[i];
       const level = this.runtime.levels[i];
       layer.setVisible(visible);
-      layer.setDrawEnabled(visible && level.visibleSegmentCount > 0);
+      layer.setDrawEnabled(visible && (this.combinedIds ? this.runtime.getRenderedSegmentCount() > 0 : level.visibleSegmentCount > 0));
     }
   }
 }

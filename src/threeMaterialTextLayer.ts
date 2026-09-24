@@ -3,6 +3,7 @@ import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
+import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import * as THREE from "three";
 
 import {
@@ -26,6 +27,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TextLayerOptions {
+  drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
@@ -319,7 +321,7 @@ export class ThreeMaterialTextLayer {
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
-    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex");
+    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex", options.drawPlan);
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {

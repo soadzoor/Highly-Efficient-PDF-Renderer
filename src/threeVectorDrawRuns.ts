@@ -21,6 +21,7 @@ interface DrawRunRange {
   index: number;
   first: number;
   count: number;
+  ids?: Uint32Array;
 }
 
 interface DrawRunEntry {
@@ -53,15 +54,20 @@ export class ThreeVectorDrawRuns {
   private readonly neighbours: Uint8Array | null;
   private readonly plan: ThreeVectorDrawPlan;
   private planVersion = -1;
+  private readonly origins: Uint32Array | undefined;
+  private readonly idsByRun = new Map<number, Uint32Array>();
 
   static create(scene: VectorScene, kind: VectorDrawRun["kind"],
-    parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string): ThreeVectorDrawRuns | null {
-    return scene.drawRuns ? new ThreeVectorDrawRuns(scene, kind, parent, attribute) : null;
+    parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
+    plan?: ThreeVectorDrawPlan, origins?: Uint32Array): ThreeVectorDrawRuns | null {
+    return scene.drawRuns ? new ThreeVectorDrawRuns(scene, kind, parent, attribute, plan, origins) : null;
   }
 
   private constructor(scene: VectorScene, kind: VectorDrawRun["kind"],
-    parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string) {
+    parent: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>, attribute: string,
+    plan?: ThreeVectorDrawPlan, origins?: Uint32Array) {
     this.scene = scene;
+    this.origins = origins;
     this.kind = kind;
     this.parent = parent;
     this.attribute = attribute;
@@ -70,12 +76,28 @@ export class ThreeVectorDrawRuns {
     this.visibility.setVisibility(this.snapshot);
     const source = parent.geometry.getAttribute(attribute);
     this.visibleIds = new Uint8Array(source.count);
-    this.strokeRedundancy = kind === "stroke" && !this.visibility.requiresCompositing
+    this.strokeRedundancy = kind === "stroke" && !origins && !this.visibility.requiresCompositing
       ? new VectorStrokeRedundancy(scene) : null;
     this.strokeCandidates = this.strokeRedundancy ? new Uint32Array(source.count) : null;
     this.sourceCount = parent.geometry.instanceCount;
     this.neighbours = this.visibility.requiresCompositing ? scenePaintRunNeighbours(scene) : null;
-    this.plan = getThreeVectorDrawPlan(scene);
+    this.plan = plan ?? getThreeVectorDrawPlan(scene);
+    if (origins) {
+      const sourceRuns = new Uint32Array(scene.segmentCount);
+      scene.drawRuns!.forEach((run, index) => {
+        if (run.kind === kind) sourceRuns.fill(index, run.first, run.first + run.count);
+      });
+      const lists = new Map<number, number[]>();
+      origins.forEach((origin, id) => {
+        const index = sourceRuns[origin];
+        const ids = lists.get(index);
+        if (ids) ids.push(id); else lists.set(index, [id]);
+      });
+      for (const [index, ids] of lists) {
+        ids.sort((a, b) => origins[a] - origins[b] || a - b);
+        this.idsByRun.set(index, Uint32Array.from(ids));
+      }
+    }
     this.rebuildEntries();
     this.finishUpdate();
     this.setEnabled(true);
@@ -131,13 +153,13 @@ export class ThreeVectorDrawRuns {
       if (run.kind !== this.kind) continue;
       if (!this.scene.paintGraph && run.blendMode === "Multiply") {
         for (let item = 0; item < run.count; item++) {
-          const range: DrawRunRange = { run, index, first: run.first + item, count: 1 };
+          const range = this.range(run, index, run.first + item, 1);
           this.createEntry([range], position + item / run.count, 0);
           this.createEntry([range], position + (item + 0.5) / run.count, 1);
         }
         continue;
       }
-      const ranges: DrawRunRange[] = [{ run, index, first: run.first, count: run.count }];
+      const ranges: DrawRunRange[] = [this.range(run, index)];
       const start = position;
       // Render-only batching removes OCG and clip boundaries from draw
       // submissions. Canonical ranges remain separate for inspection and
@@ -150,8 +172,8 @@ export class ThreeVectorDrawRuns {
         while (position + 1 < order.length) {
           const nextIndex = order[position + 1];
           const next = runs[nextIndex];
-          if (!this.canBatch(previous, order[position], next, end)) break;
-          ranges.push({ run: next, index: nextIndex, first: next.first, count: next.count });
+          if (!this.canBatch(previous, order[position], next, nextIndex, end)) break;
+          ranges.push(this.range(next, nextIndex));
           previous = next; end = next.first + next.count; position++;
         }
       }
@@ -160,13 +182,22 @@ export class ThreeVectorDrawRuns {
   }
 
   /** Whether the next scheduled paint submits as part of the batch being built. */
-  private canBatch(previous: VectorDrawRun, previousIndex: number, next: VectorDrawRun, end: number): boolean {
+  private canBatch(previous: VectorDrawRun, previousIndex: number, next: VectorDrawRun, nextIndex: number, end: number): boolean {
     if (previous.kind !== next.kind || next.blendMode) return false;
     if (this.neighbours === null) return true;
+    if (this.plan.segments && this.plan.version > 0) {
+      return this.plan.segments[previousIndex] === this.plan.segments[nextIndex];
+    }
     // Compositing keeps the canonical order and its transparency groups, so a
     // batch may only cover paints the graph lists next to each other, and the
     // compositor still addresses them as one contiguous instance range.
     return this.neighbours[previousIndex] === 1 && previous.clipIndex === next.clipIndex && end === next.first;
+  }
+
+  private range(run: VectorDrawRun, index: number, first = run.first, count = run.count): DrawRunRange {
+    const ids = this.idsByRun.get(index);
+    return { run, index, first, count, ids: ids && (first === run.first && count === run.count
+      ? ids : ids.filter(id => this.origins![id] >= first && this.origins![id] < first + count)) };
   }
 
   private createEntry(ranges: readonly DrawRunRange[], order: number, pass?: 0 | 1): void {
@@ -179,7 +210,7 @@ export class ThreeVectorDrawRuns {
     let clipIndex = ranges[0].run.clipIndex ?? -1;
     let mixedClips = false;
     for (const range of ranges) {
-      count += range.count;
+      count += range.ids?.length ?? range.count;
       if ((range.run.clipIndex ?? -1) !== clipIndex) mixedClips = true;
     }
     if (mixedClips) clipIndex = -1;
@@ -210,6 +241,9 @@ export class ThreeVectorDrawRuns {
     // tells the compositor those paints are off screen, which is what lets it
     // drop the transparency groups that no longer contain anything.
     mesh.userData.heprDrawRunIndices = ranges.map(range => range.index);
+    mesh.userData.heprDrawRanges = ranges.map(({ first, count }) => ({ first, count }));
+    mesh.userData.heprCanonicalOrigins = this.origins;
+    mesh.userData.heprScheduled = this.plan.version > 0;
     mesh.userData.heprInstanceAttribute = this.attribute;
     mesh.frustumCulled = false;
     mesh.renderOrder = vectorDrawRunRenderOrder(order, this.scene.drawRuns!.length);
@@ -241,9 +275,10 @@ export class ThreeVectorDrawRuns {
           ? range.run.optionalContent !== undefined && this.snapshot.conditions[range.run.optionalContent] === 0
           : !this.visibility.isRunVisible(range.run)) continue;
         const clipCode = (range.run.clipIndex ?? -1) + 1;
-        const end = range.first + range.count;
+        const count = range.ids?.length ?? range.count;
         const ids = entry.idValues, clips = entry.clipValues;
-        for (let id = range.first; id < end; id++) {
+        for (let item = 0; item < count; item++) {
+          const id = range.ids ? range.ids[item] : range.first + item;
           if (!this.visibleIds[id]) continue;
           if (this.strokeRedundancyEnabled && this.strokeRedundancy && !this.strokeRedundancy.isRetained(id)) continue;
           if (ids[visible] !== id) { ids[visible] = id; changed = true; }

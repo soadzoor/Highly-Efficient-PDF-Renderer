@@ -34,6 +34,7 @@ export const fastTests = [
   "three-raster-strip-batches",
   "three-raster-paint-order",
   "three-vector-draw-batching",
+  "three-ordered-stroke-lod",
   "three-vector-instance-clip",
   "three-webgpu-composite-material",
   "three-webgpu-raster-strip-material",

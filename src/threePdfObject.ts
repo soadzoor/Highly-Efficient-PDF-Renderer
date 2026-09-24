@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
+import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { ScenePrimitivePicker, getScenePrimitive, validatePrimitiveRef, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
   type PrimitiveKind } from "./scenePrimitives";
@@ -33,7 +33,7 @@ import {
   HEPR_THREE_LAYER_ORDER_TEXT_SELECTION
 } from "./threeLayerOrder";
 import { applyThreePdfOverlayPaintOrder } from "./threePdfPaintOrder";
-import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
+import { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import type { Bounds } from "./pdfVectorExtractor";
 import {
   createSceneTextSearcher,
@@ -460,7 +460,8 @@ export class HeprThreePdfObject extends THREE.Group {
     textLodLayer: ThreeTextLodLayer | null,
     pageMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>,
     uvArray: Float32Array,
-    uvAttribute: THREE.BufferAttribute
+    uvAttribute: THREE.BufferAttribute,
+    drawPlan?: ThreeVectorDrawPlan
   ) {
     super();
     this.sourceLabel = loadedScene.sourceLabel;
@@ -496,7 +497,7 @@ export class HeprThreePdfObject extends THREE.Group {
       maxY: this.sceneBounds.maxY - this.sceneCenterY
     };
     this.dataToLocalMatrix.makeTranslation(-this.sceneCenterX, -this.sceneCenterY, 0);
-    this.drawPlan = this.sceneData.drawRuns ? getThreeVectorDrawPlan(this.sceneData) : null;
+    this.drawPlan = this.sceneData.drawRuns ? drawPlan ?? new ThreeVectorDrawPlan(this.sceneData) : null;
     this.interactionController = createCanvasInteractionController(() => this.renderer);
     this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
     this.attachNativeFrameListener(this.renderer);
@@ -610,6 +611,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private applyLayerVisibility(snapshot: OptionalContentSnapshot): void {
     this.paintVisibility.setVisibility(snapshot);
     this.strokeMaterialLayer?.setOptionalContentVisibility(snapshot);
+    this.vectorLodStrokeLayer?.setOptionalContentVisibility(snapshot);
     this.fillMaterialLayer.setOptionalContentVisibility(snapshot);
     this.textMaterialLayer.setOptionalContentVisibility(snapshot);
     this.gradientMaterialLayer.setOptionalContentVisibility(snapshot);
@@ -1556,7 +1558,7 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private shouldUseThreeVectorLodLayer(mode: VectorLodMode): boolean {
-    return !this.sceneData.drawRuns && shouldUseVectorStrokeLod(mode, this.rendererType, this.sceneData.segmentCount);
+    return shouldUseVectorStrokeLod(mode, this.rendererType, this.sceneData.segmentCount);
   }
 
   private rebuildThreeStrokeLayer(useVectorLodLayer: boolean, useExactMaterialLayer: boolean): void {
@@ -1564,6 +1566,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
     if (useVectorLodLayer) {
       this.vectorLodStrokeLayer = new ThreeVectorLodStrokeLayer(this.sceneData, {
+        drawPlan: this.drawPlan ?? undefined,
         materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl",
         colorCompositing: this.rendererConfig.threeColorCompositing,
         strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
@@ -1576,6 +1579,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
     if (useExactMaterialLayer) {
       this.strokeMaterialLayer = new ThreeMaterialStrokeLayer(this.sceneData, {
+        drawPlan: this.drawPlan ?? undefined,
         materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl",
         colorCompositing: this.rendererConfig.threeColorCompositing,
         strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
@@ -1601,6 +1605,7 @@ export class HeprThreePdfObject extends THREE.Group {
 
   private resetRenderPipelinesAfterLayerChange(): void {
     this.strokeMaterialLayer?.setOptionalContentVisibility(this.layerVisibility.getSnapshot());
+    this.vectorLodStrokeLayer?.setOptionalContentVisibility(this.layerVisibility.getSnapshot());
     this.strokeMaterialLayer?.setVisible(false);
     this.triangleStrokeLayer?.setVisible(false);
     this.vectorLodStrokeLayer?.deactivate();
@@ -1908,9 +1913,11 @@ export class HeprThreePdfObject extends THREE.Group {
       const roots: THREE.Object3D[] = [this.rasterMaterialLayer.group, this.gradientMaterialLayer.group,
         this.fillMaterialLayer.mesh, this.textMaterialLayer.mesh];
       if (this.strokeMaterialLayer) roots.push(this.strokeMaterialLayer.mesh);
+      if (this.vectorLodStrokeLayer) roots.push(this.vectorLodStrokeLayer.group);
       this.paintCompositor.render(renderer as unknown as ThreePaintHostRenderer, this.sceneData, roots,
         materialLayerViewport.width, materialLayerViewport.height,
-        condition => this.layerVisibility.isVisible(condition));
+        condition => this.layerVisibility.isVisible(condition),
+        bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType));
       for (const root of roots) root.visible = false;
     } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }
@@ -2030,6 +2037,7 @@ export class HeprThreePdfObject extends THREE.Group {
     maxRasterAtlasTextureSize?: number
   ): ThreeMaterialTextLayer {
     return new ThreeMaterialTextLayer(scene, {
+      drawPlan: this.drawPlan ?? undefined,
       materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl",
       colorCompositing: this.rendererConfig.threeColorCompositing,
       strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
@@ -2387,9 +2395,8 @@ export class HeprThreePdfObject extends THREE.Group {
    * Renumber the image and gradient meshes for the current submission order.
    *
    * The order is global, so these have to move with the batched vector paints.
-   * Tracking the version applied here rather than trusting the plan's own
-   * "changed" answer also covers a plan this object inherited already scheduled,
-   * from an earlier object over the same scene such as a backend switch.
+   * Tracking the applied version also covers a plan invalidated by color
+   * overrides or by replacing the stroke LOD geometry.
    */
   private syncVectorDrawPlanOrder(): void {
     if (!this.drawPlan || this.drawPlan.version === this.appliedDrawPlanVersion) return;
@@ -3052,8 +3059,8 @@ export async function createThreePdfObject(
 
   const rendererConfig = normalizeRendererConfig(options);
   const initialFitPaddingPixels = DEFAULT_FIT_PADDING_PIXELS;
-  const useVectorLodStrokeLayer = !loadedScene.scene.drawRuns &&
-    shouldUseVectorStrokeLod(
+  const drawPlan = loadedScene.scene.drawRuns ? new ThreeVectorDrawPlan(loadedScene.scene) : undefined;
+  const useVectorLodStrokeLayer = shouldUseVectorStrokeLod(
       rendererConfig.vectorLodMode,
       rendererType,
       loadedScene.scene.segmentCount
@@ -3099,6 +3106,7 @@ export async function createThreePdfObject(
     );
 
     const fillMaterialLayer = new ThreeMaterialFillLayer(loadedScene.scene, {
+      drawPlan,
       materialBackend,
       colorCompositing: rendererConfig.threeColorCompositing,
       vectorOverride: rendererConfig.vectorOverride
@@ -3107,6 +3115,7 @@ export async function createThreePdfObject(
     const strokeMaterialLayer =
       !useVectorLodStrokeLayer
         ? new ThreeMaterialStrokeLayer(loadedScene.scene, {
+          drawPlan,
           materialBackend,
           colorCompositing: rendererConfig.threeColorCompositing,
           strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
@@ -3119,6 +3128,7 @@ export async function createThreePdfObject(
     const vectorLodStrokeLayer =
       useVectorLodStrokeLayer
         ? new ThreeVectorLodStrokeLayer(loadedScene.scene, {
+          drawPlan,
           materialBackend,
           colorCompositing: rendererConfig.threeColorCompositing,
           strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
@@ -3132,6 +3142,7 @@ export async function createThreePdfObject(
     let textMaterialLayer: ThreeMaterialTextLayer;
     try {
       textMaterialLayer = new ThreeMaterialTextLayer(textLodLayer.getRenderScene(), {
+        drawPlan,
         materialBackend,
         colorCompositing: rendererConfig.threeColorCompositing,
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
@@ -3145,6 +3156,7 @@ export async function createThreePdfObject(
       }
       textLodLayer.useExactResourceFallback("resource-capacity");
       textMaterialLayer = new ThreeMaterialTextLayer(loadedScene.scene, {
+        drawPlan,
         materialBackend,
         colorCompositing: rendererConfig.threeColorCompositing,
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
@@ -3195,7 +3207,8 @@ export async function createThreePdfObject(
       textLodLayer,
       pageMesh,
       uvArray,
-      uvAttribute
+      uvAttribute,
+      drawPlan
     );
     pageMesh.onBeforeRender = (renderer, _scene, camera) => {
       object.handleBeforeRender(renderer as ThreeHostRenderer, camera as THREE.Camera);

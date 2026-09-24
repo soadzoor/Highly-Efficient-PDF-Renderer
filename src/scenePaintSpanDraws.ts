@@ -1,7 +1,7 @@
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { VectorOrderedBatches } from "./vectorOrderedBatches";
 
-export type CanonicalRunLookup = Map<VectorDrawRun["kind"], { firsts: Int32Array; indices: Int32Array }>;
+export type CanonicalRunLookup = Map<VectorDrawRun["kind"], { firsts: Int32Array; ends: Int32Array; indices: Int32Array }>;
 
 /** Per kind, canonical run indices sorted by their first primitive. */
 export function buildCanonicalRunLookup(scene: VectorScene): CanonicalRunLookup | null {
@@ -15,13 +15,14 @@ export function buildCanonicalRunLookup(scene: VectorScene): CanonicalRunLookup 
   const lookup: CanonicalRunLookup = new Map();
   for (const [kind, list] of byKind) {
     list.sort((a, b) => runs[a].first - runs[b].first);
-    lookup.set(kind, { firsts: Int32Array.from(list, index => runs[index].first), indices: Int32Array.from(list) });
+    lookup.set(kind, { firsts: Int32Array.from(list, index => runs[index].first),
+      ends: Int32Array.from(list, index => runs[index].first + runs[index].count), indices: Int32Array.from(list) });
   }
   return lookup;
 }
 
 /** The canonical run of this kind holding that primitive, or -1. */
-function canonicalRunIndex(lookup: CanonicalRunLookup | null, kind: VectorDrawRun["kind"], primitive: number): number {
+function canonicalRunPosition(lookup: CanonicalRunLookup | null, kind: VectorDrawRun["kind"], primitive: number): number {
   const entry = lookup?.get(kind);
   if (!entry) return -1;
   let low = 0, high = entry.firsts.length - 1, found = -1;
@@ -29,7 +30,7 @@ function canonicalRunIndex(lookup: CanonicalRunLookup | null, kind: VectorDrawRu
     const middle = (low + high) >> 1;
     if (entry.firsts[middle] <= primitive) { found = middle; low = middle + 1; } else high = middle - 1;
   }
-  return found < 0 ? -1 : entry.indices[found];
+  return found < 0 || primitive >= entry.ends[found] ? -1 : found;
 }
 
 /**
@@ -45,15 +46,29 @@ export function submitPaintSpan(runs: readonly VectorDrawRun[], plan: VectorOrde
   segments: Uint32Array | null, lookup: CanonicalRunLookup | null, draw: (run: VectorDrawRun) => void): void {
   let low = Infinity, high = -Infinity;
   if (plan && segments && plan.spanOrdered) {
+    const covered = new Set<number>();
+    let complete = true;
     for (const run of runs) {
-      for (const primitive of [run.first, run.first + run.count - 1]) {
-        const index = canonicalRunIndex(lookup, run.kind, primitive);
-        if (index >= 0 && plan.scheduledRuns[index]) {
-          low = Math.min(low, segments[index]);
-          high = Math.max(high, segments[index]);
-        } else { low = Infinity; high = -Infinity; break; }
+      const entry = lookup?.get(run.kind);
+      let position = canonicalRunPosition(lookup, run.kind, run.first);
+      let primitive = run.first;
+      const end = primitive + run.count;
+      // Compositors may merge consecutive canonical runs, or request just one
+      // object of a blend/knockout run. Only complete runs may use the plan.
+      while (entry && position >= 0 && primitive < end) {
+        const index = entry.indices[position];
+        if (entry.firsts[position] !== primitive || entry.ends[position] > end ||
+            !plan.scheduledRuns[index] || covered.has(index)) break;
+        covered.add(index);
+        low = Math.min(low, segments[index]);
+        high = Math.max(high, segments[index]);
+        primitive = entry.ends[position++];
       }
-      if (low > high) break;
+      if (primitive !== end) { complete = false; break; }
+    }
+    // A singleton request inside a larger span must not draw its neighbours.
+    if (!complete || covered.size !== plan.scheduledSpanRunCount(low, high)) {
+      low = Infinity; high = -Infinity;
     }
   }
   if (!plan || low > high) {

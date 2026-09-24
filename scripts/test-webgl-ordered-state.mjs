@@ -91,6 +91,13 @@ try {
     assert.equal(mock.paints[2].uniforms.get("uTextInstanceTexA"), 2);
     assert.equal(mock.paints[2].uniforms.get("uTextRasterAtlasTex"), 13);
 
+    // A compositor's partial canonical span uses the exact IDs, even when
+    // the renderer also owns a reordered/LOD instance buffer for whole spans.
+    r.orderedBatches.batches = [{ kind: "stroke", first: 1, count: 1, clipIndex: 0 }];
+    mock.clear(); r.drawSourceOrderedContent(100, 100, 50, 50, 1);
+    assertPaints(false);
+    assert.equal(mock.paints[0].attributes.get(1).offset, 4, "canonical fallback indexes the exact stroke ID buffer");
+
     // An intervening gradient/raster pass can overwrite any of the sampler
     // slots. The ordered path must restore both textures and clip uniforms.
     for (const kind of ["raster", "gradient-fill", "gradient-stroke"]) {

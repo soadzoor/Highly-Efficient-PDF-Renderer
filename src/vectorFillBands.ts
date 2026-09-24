@@ -110,7 +110,11 @@ export function buildVectorFillBandIndex(store: VectorPathSegmentStore): VectorF
     let entries = 0;
     while (bands > 1) {
       entries = 0;
-      const bandHeight = height / bands;
+      // Count with the same Float32 height stored in `paths` and read below.
+      // A rounded boundary can put an edge in another band; using doubles
+      // here would underallocate the entry array and silently drop later edges.
+      const bandHeight = Math.fround(height / bands);
+      if (!(bandHeight > 0)) { bands = Math.floor(bands / 2); continue; }
       for (let segment = start; segment < start + count; segment++) {
         const [low, high] = extent(segment);
         const first = Math.max(0, Math.min(bands - 1, Math.floor((low - minY) / bandHeight)));
@@ -198,6 +202,35 @@ export interface PackedVectorFillBands {
   /** Texel index of the packed entry list, four segment indices per texel. */
   readonly entryBase: number;
   readonly texels: number;
+}
+
+/** Segment texture payload shared by the native and Three material backends. */
+export interface VectorFillBandStore {
+  readonly data: Float32Array;
+  readonly texels: number;
+  readonly pathBase: number;
+  readonly entryBase: number;
+}
+
+/**
+ * Append the optional index without consuming another sampler. The default
+ * capacity is WebGL2's guaranteed texture dimension, since Three materials
+ * can be constructed before a host renderer/device is available.
+ */
+export function vectorFillBandStore(segments: Float32Array, segmentCount: number,
+  index: VectorFillBandIndex | null, maxTextureSize = 2048): VectorFillBandStore {
+  const plain = { data: segments, texels: segmentCount, pathBase: -1, entryBase: 0 };
+  if (!index) return plain;
+  const extra = index.paths.length / 4 + index.bands.length / 2 + Math.ceil(index.segments.length / 4);
+  const texels = segmentCount + extra;
+  // Texel offsets, segment IDs and the scalar entry offsets in each band
+  // must all remain exact Float32 integers (entries are packed four per texel).
+  if (texels > Math.min(maxTextureSize * maxTextureSize, 0x1000000) || index.segments.length > 0x1000000) return plain;
+  const packed = packVectorFillBands(index, segmentCount);
+  const data = new Float32Array(texels * 4);
+  data.set(segments.subarray(0, segmentCount * 4));
+  data.set(packed.data, segmentCount * 4);
+  return { data, texels, pathBase: packed.pathBase, entryBase: packed.entryBase };
 }
 
 /**

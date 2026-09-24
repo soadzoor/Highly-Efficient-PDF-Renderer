@@ -11,7 +11,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { ThreePaintCompositor } = await import("../src/threePaintCompositor.ts");
+  const { ThreePaintCompositor, projectThreePdfCompositeBounds } = await import("../src/threePaintCompositor.ts");
   const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { setThreePdfShapeOnly } = await import("../src/threePdfShape.ts");
@@ -154,7 +154,87 @@ try {
       "the span's paints are batched into one submission, in source order");
     assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 1,
       "the span costs one host render, and without a knockout it renders no shape at all");
+    // Normal groups blend directly, and their effects touch only their projected
+    // rectangle. A root copy is still needed, but there is no per-group copy.
+    spanHost.draws.length = 0;
+    const boundedProject = bounds => ({ x: bounds.minX + 100, y: bounds.minY + 80,
+      width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
+    spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true, boundedProject);
+    const effects = spanHost.draws.filter(draw => !draw.ids);
+    assert.equal(effects.length, 2, "one root copy and one direct source-over pass");
+    const blended = effects.find(draw => draw.blending === THREE.CustomBlending);
+    assert.ok(blended, "group opacity uses the hardware blending pass");
+    assert.equal(blended.blendSrc, THREE.OneFactor, "effect output is premultiplied on both backends");
+    assert.equal(blended.blendDst, THREE.OneMinusSrcAlphaFactor);
+    assert.equal(blended.scissorTest, true);
+    assert.ok(backend === "webgpu" ? blended.scissor[1] > 140 : blended.scissor[1] < 100,
+      "WebGPU target scissors convert the shared bottom-left rectangle to top-left");
+    assert.ok(blended.scissor[2] < 30 && blended.scissor[3] < 30,
+      "a small effect does not shade the full target");
+    assert.deepEqual(snapshot(spanHost), state, "bounded effects restore the host scissor and target");
+    assert.ok(effects.some(draw => !draw.scissorTest), "pooled target scissors reset for the full root copy");
+    spanHost.draws.length = 0;
+    spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true,
+      bounds => ({ ...boundedProject(bounds), x: 10000 }));
+    assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 1, "offscreen effects skip their composite pass");
+
+    // A scheduled mesh can own disjoint canonical ranges, and LOD IDs can be
+    // unrelated to those ranges. Every instanced attribute follows the selected
+    // rows, including clip roots; filtering only IDs would clip the wrong paint.
+    const geometry = new THREE.InstancedBufferGeometry();
+    geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(f([10, 5, 12]), 1));
+    geometry.setAttribute("aVectorClipIndex", new THREE.InstancedBufferAttribute(f([1, 2, 3]), 1));
+    geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([0, 0], 2));
+    geometry.setIndex([0]);
+    geometry.instanceCount = 2;
+    const proxySource = new THREE.Mesh(geometry, new THREE.RawShaderMaterial());
+    const origins = new Uint32Array(13); origins[10] = 3; origins[5] = 7; origins[12] = 9;
+    Object.assign(proxySource.userData, { heprDrawRun: { kind: "stroke", first: 3, count: 3 },
+      heprDrawRanges: [{ first: 3, count: 1 }, { first: 7, count: 1 }, { first: 9, count: 1 }],
+      heprCanonicalOrigins: origins, heprInstanceAttribute: "aSegmentIndex" });
+    spanCompositor.collect([proxySource]);
+    spanCompositor.renderer = spanHost;
+    spanHost.draws.length = 0;
+    const partialTarget = spanCompositor.acquire();
+    spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    assert.deepEqual(spanHost.draws.map(draw => draw.ids), [[5]], "subset membership uses canonical origins");
+    assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2]], "clip roots are gathered with instance IDs");
+    const proxy = spanCompositor.proxies.get(proxySource);
+    const originalPartial = proxy.partialGeometry;
+    const originalIds = originalPartial.getAttribute("aSegmentIndex");
+    const originalClips = originalPartial.getAttribute("aVectorClipIndex");
+    const borrowedCorner = geometry.getAttribute("aCorner"), borrowedIndex = geometry.index;
+    let partialDisposals = 0;
+    originalPartial.addEventListener("dispose", () => {
+      partialDisposals++;
+      assert.equal(originalPartial.getAttribute("aSegmentIndex"), originalIds,
+        "old owned buffers remain attached while Three releases them");
+      assert.equal(originalPartial.getAttribute("aVectorClipIndex"), originalClips);
+      assert.equal(originalPartial.getAttribute("aCorner"), undefined, "borrowed attributes cannot be disposed");
+      assert.equal(originalPartial.index, null, "borrowed indices cannot be disposed");
+    });
+    geometry.instanceCount = 3;
+    spanCompositor.draw([{ kind: "stroke", first: 9, count: 1 }], partialTarget, false);
+    assert.equal(proxy.partialGeometry, originalPartial,
+      "revealing more instances reuses the source-sized partial allocation");
+    assert.equal(partialDisposals, 0);
+    geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(f([10, 5, 12, 5]), 1));
+    geometry.setAttribute("aVectorClipIndex", new THREE.InstancedBufferAttribute(f([1, 2, 3, 4]), 1));
+    geometry.instanceCount = 4;
+    spanHost.draws.length = 0;
+    spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    assert.equal(partialDisposals, 1, "growing source capacity retires the previous owned GPU buffers");
+    assert.notEqual(proxy.partialGeometry, originalPartial);
+    assert.deepEqual(spanHost.draws.map(draw => draw.ids), [[5, 5]]);
+    assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2, 4]]);
+    assert.equal(geometry.getAttribute("aCorner"), borrowedCorner);
+    assert.equal(geometry.index, borrowedIndex);
+    let replacementDisposals = 0;
+    proxy.partialGeometry.addEventListener("dispose", () => replacementDisposals++);
+    spanCompositor.release(partialTarget); spanCompositor.renderer = null;
     spanCompositor.dispose(); spanStroke.dispose();
+    assert.equal(partialDisposals, 1, "retired partial geometry is disposed only once");
+    assert.equal(replacementDisposals, 1, "the replacement allocation is released with the compositor");
 
     // The graph may paint adjacent runs back to front. A mesh renders its
     // instances in id order, so merging those two would silently swap them:
@@ -193,6 +273,18 @@ try {
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
   }
+  const matrix = new THREE.Matrix4();
+  assert.deepEqual(projectThreePdfCompositeBounds({ minX: -0.5, minY: -0.25, maxX: 0.5, maxY: 0.25 }, matrix, 200, 100),
+    { x: 50, y: 37.5, width: 100, height: 25 }, "projection uses physical viewport pixels");
+  matrix.elements[14] = -0.5;
+  assert.ok(projectThreePdfCompositeBounds({ minX: -0.5, minY: -0.25, maxX: 0.5, maxY: 0.25 }, matrix, 200, 100),
+    "WebGL keeps bounded passes in the negative half of its valid NDC depth range");
+  assert.equal(projectThreePdfCompositeBounds({ minX: -0.5, minY: -0.25, maxX: 0.5, maxY: 0.25 }, matrix, 200, 100, "webgpu"), null,
+    "WebGPU retains a full pass for the same rectangle crossing its nearer depth plane");
+  matrix.elements[14] = 0;
+  matrix.elements[3] = 4;
+  assert.equal(projectThreePdfCompositeBounds({ minX: -1, minY: -1, maxX: 1, maxY: 1 }, matrix, 200, 100), null,
+    "a rectangle crossing the perspective near plane conservatively keeps a full pass");
   console.log("Three PDF compositor state, canonical subsets, shape coverage, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
 
@@ -222,11 +314,16 @@ function makeRenderer(backend = "webgpu") {
         camera.updateProjectionMatrix();
       }
       if (this.fail) throw new Error("synthetic draw failure");
+      assert.equal(this.scissorTest, this.target.scissorTest, "WebGPU also needs the renderer scissor-test flag");
       for (const mesh of scene.children) {
         const ids = mesh.geometry.getAttribute("aSegmentIndex");
         this.draws.push({ call: this.call,
           ids: ids && Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
-          shape: mesh.material.uniforms?.uPdfShapeOnly?.value });
+          shape: mesh.material.uniforms?.uPdfShapeOnly?.value,
+          clips: mesh.geometry.getAttribute("aVectorClipIndex") && Array.from({ length: mesh.geometry.instanceCount },
+            (_, i) => mesh.geometry.getAttribute("aVectorClipIndex").getX(i)),
+          blending: mesh.material.blending, blendSrc: mesh.material.blendSrc, blendDst: mesh.material.blendDst,
+          scissor: this.target.scissor.toArray(), scissorTest: this.target.scissorTest });
       }
     }
   };

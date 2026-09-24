@@ -1,3 +1,4 @@
+import { buildVectorFillBandIndex, vectorFillBandStore, type VectorFillBandStore } from "./vectorFillBands";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
@@ -276,11 +277,15 @@ export class ThreeMaterialGradientLayer {
     }
 
     const pathSize = chooseTextureSize(pathCount);
-    const segmentSize = chooseTextureSize(segmentCount);
+    const bands = vectorFillBandStore(scene.gradientFillSegmentsA!, segmentCount, buildVectorFillBandIndex({
+      pathCount, segmentCount, pathMetaA: scene.gradientFillPathMetaA!, pathMetaB: scene.gradientFillPathMetaB!,
+      segmentsA: scene.gradientFillSegmentsA!, segmentsB: scene.gradientFillSegmentsB!
+    }));
+    const segmentSize = chooseTextureSize(bands.texels);
     const pathMetaA = this.own(createFloatTexture(scene.gradientFillPathMetaA, pathCount, pathSize.width, pathSize.height));
     const pathMetaB = this.own(createFloatTexture(scene.gradientFillPathMetaB, pathCount, pathSize.width, pathSize.height));
     const pathMetaC = this.own(createFloatTexture(scene.gradientFillPathMetaC, pathCount, pathSize.width, pathSize.height));
-    const segmentA = this.own(createFloatTexture(scene.gradientFillSegmentsA, segmentCount, segmentSize.width, segmentSize.height));
+    const segmentA = this.own(createFloatTexture(bands.data, bands.texels, segmentSize.width, segmentSize.height));
     const segmentB = this.own(createFloatTexture(scene.gradientFillSegmentsB, segmentCount, segmentSize.width, segmentSize.height));
 
     const meshes = this.scene.gradientMeshIndices?.length ? buildGradientMeshRenderData(this.scene) : null;
@@ -306,6 +311,8 @@ export class ThreeMaterialGradientLayer {
           fillSegmentTextureB: segmentB,
           fillPathTextureWidth: pathSize.width,
           fillSegmentTextureWidth: segmentSize.width,
+          fillBandBase: bands.pathBase,
+          fillBandEntries: bands.entryBase,
           ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex),
           primitiveColor
         });
@@ -321,7 +328,8 @@ export class ThreeMaterialGradientLayer {
           segmentSize,
           gradients,
           sourceGradientIndex,
-          maskGradientIndex
+          maskGradientIndex,
+          bands
         );
         if (meshCount) {
           const raw = material as THREE.RawShaderMaterial;
@@ -501,7 +509,8 @@ export class ThreeMaterialGradientLayer {
     segmentSize: { width: number; height: number },
     gradients: GradientTextureSet,
     sourceGradientIndex: number,
-    maskGradientIndex: number
+    maskGradientIndex: number,
+    bands: VectorFillBandStore
   ): THREE.RawShaderMaterial {
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -516,6 +525,8 @@ export class ThreeMaterialGradientLayer {
         uFillPathMetaTexA: { value: pathMetaA },
         uFillPathMetaTexB: { value: pathMetaB },
         uFillPathMetaTexC: { value: pathMetaC },
+        uFillBandBase: { value: bands.pathBase },
+        uFillBandEntries: { value: bands.entryBase },
         uFillSegmentTexA: { value: segmentA },
         uFillSegmentTexB: { value: segmentB },
         uFillPathMetaTexSize: { value: new Int32Array([pathSize.width, pathSize.height]) },

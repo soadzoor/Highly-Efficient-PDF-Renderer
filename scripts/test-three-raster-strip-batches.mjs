@@ -135,6 +135,10 @@ try {
     for (let index = 0; index < strips.length; index++) assert(strips[index].texture.version > dormantVersions[index]);
     assert.equal(visibleRasters(layer).length, 6);
 
+    const identical = originals.map(entry => entry.texture);
+    layer.prepareRasterLayerUpdates(new Map(scene.rasterLayers.map((value, index) => [index, value]))).commit();
+    assert.deepEqual(originals.map(entry => entry.texture), identical, "canonical raster identities do not allocate replacement textures");
+    assert.equal(layer.stripEntries.length, 2, "unchanged updates retain strip batches");
     const cancelled = layer.prepareRasterLayerUpdates(new Map([[0, image(20)]]));
     cancelled.dispose();
     layer.prepareRasterLayerUpdates(new Map()).commit();
@@ -148,6 +152,9 @@ try {
     assert.equal(layer.group.children.length, 14);
     assert.equal(visibleRasters(layer).length, 13);
     assert.equal(replacedTextureReleases(), 1);
+    const currentTexture = originals[0].texture;
+    layer.prepareRasterLayerUpdates(new Map([[0, replacement]])).commit();
+    assert.equal(originals[0].texture, currentTexture, "cached replay identities retain an already replaced texture");
     for (let index = 0; index < originals.length; index++) {
       assert.equal(originals[index].mesh.parent, layer.group);
       assert.equal(originals[index].mesh.renderOrder, originalOrders[index], "fallback preserves PDF paint order");

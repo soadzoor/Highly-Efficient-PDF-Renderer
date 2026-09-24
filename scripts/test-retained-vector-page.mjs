@@ -267,5 +267,60 @@ try {
       assert.notDeepEqual(quadOf(0), quadOf(3), "a different glyph keeps its own rectangle");
     } finally { await session.close(); }
   }
+  {
+    const patternFixture = (clip, xStep = 5, yStep = 5, matrix = "1 0 0 1 0 0", fill = "0 0 100 100 re") => fixture(
+      `${clip} /Pattern cs /P scn ${fill} f`, "/Pattern << /P 5 0 R >>", [
+        { number: 5, body: tinyPdfStream(`/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 5 5] /Matrix [${matrix}] /XStep ${xStep} /YStep ${yStep} /Resources << >>`, "0 0 1 rg 0 0 2 2 re f") }
+      ]);
+    for (const [name, clip, xStep, yStep, matrix, expected] of [
+      ["tiny clip", "0 0 1 1 re W n", 5, 5, "1 0 0 1 0 0", 1],
+      ["negative steps", "0 0 1 1 re W n", -5, -5, "1 0 0 1 0 0", 1],
+      ["nested clips", "0 0 80 80 re W n 0 0 1 1 re W n", 5, 5, "1 0 0 1 0 0", 1],
+      ["rotated pattern", "9 0 1 1 re W n", 5, 5, "0 1 -1 0 10 0", 1],
+      ["sheared pattern", "1 1 1 1 re W n", 5, 5, "1 0 .5 1 0 0", 1],
+      ["transformed clip", "2 0 0 2 0 0 cm 0 0 .5 .5 re W n .5 0 0 .5 0 0 cm", 5, 5, "1 0 0 1 0 0", 1],
+      ["curved clip hull", "0 0 m 0 1 1 1 1 0 c h W n", 5, 5, "1 0 0 1 0 0", 1],
+      ["clip outside page", "200 200 1 1 re W n", 5, 5, "1 0 0 1 0 0", 0]
+    ]) {
+      const session = await openPdf({ kind: "bytes", bytes: patternFixture(clip, xStep, yStep, matrix) });
+      try {
+        const page = await session.compilePage(0);
+        const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal, maxPatternCells: 1 });
+        assert.equal(scene.fillPathCount, expected, `${name}: cells outside the effective clip are not expanded or budgeted`);
+        if (expected) assert.ok(scene.drawRuns.every(run => run.clipIndex !== undefined), `${name}: exact clipping remains active`);
+      } finally { await session.close(); }
+    }
+    const session = await openPdf({ kind: "bytes", bytes: patternFixture("0 0 10 10 re 2 2 6 6 re W* n") });
+    try {
+      const scene = await lowerRetainedPageToVectorScene(await session.compilePage(0), { signal: new AbortController().signal });
+      assert.equal(scene.fillPathCount, 4, "even-odd holes do not remove potentially visible cells from the conservative range");
+      assert.ok(scene.clipPaths.some(clip => clip.fillRule === 1), "exact even-odd clip survives conservative bounds pruning");
+    } finally { await session.close(); }
+  }
+  {
+    const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
+    const session = await openPdf({ kind: "bytes", bytes: fixture(
+      "1 w 0 0 1 RG BT /F 80 Tf 1 Tr 10 10 Td (AA) Tj ET " +
+      "1 0 0 RG BT /F 80 Tf 1 Tr 10 30 Td (A) Tj ET " +
+      "2 w BT /F 80 Tf 1 Tr 10 50 Td (A) Tj ET", "/Font << /F 5 0 R >>", [
+        { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /Fixture /Encoding /WinAnsiEncoding >>" }
+      ]) }, { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "retained-stroke-sharing" }) });
+    try {
+      const page = await session.compilePage(0);
+      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      assert.equal(scene.fillPathCount, 0, "stroked glyphs use the shared atlas instead of copied fills");
+      assert.equal(scene.textInstanceCount, 4);
+      assert.equal(scene.textGlyphCount, 2, "translation and color share one outline; pen width separates another");
+      assert.equal(scene.textInstanceB[2], scene.textInstanceB[6]);
+      assert.equal(scene.textInstanceB[2], scene.textInstanceB[10]);
+      assert.notEqual(scene.textInstanceB[2], scene.textInstanceB[14]);
+      assert.equal(scene.textIndex.pages[0].text.replaceAll(/\s/g, ""), "AAAA", "sharing does not duplicate logical characters");
+      assert.ok(scene.drawRuns.every(run => run.kind === "text"));
+      const coordinates = scene.textGlyphSegmentsA.length + scene.textGlyphSegmentsB.length;
+      await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal, maxCoordinates: coordinates });
+      await assert.rejects(lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal, maxPrimitives: 3 }),
+        error => error.details?.reason === "vector-expansion-limit", "the primitive budget still counts each glyph instance");
+    } finally { await session.close(); }
+  }
   console.log("Retained vector page tests passed.");
 } finally { hooks.deregister(); }
