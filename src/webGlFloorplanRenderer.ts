@@ -3990,7 +3990,7 @@ export class WebGlFloorplanRenderer {
     if (profile) {
       const offset = pathIndex * 4;
       const segmentCount = Math.max(0, Math.trunc(data.gradientFillPathMetaA[offset + 1] ?? 0));
-      const clipEdges = this.countGradientClipPolygonEdges();
+      const clipEdges = this.countGradientClipPolygonEdges(profile, "gradientFillIndexedClipNodes");
       profile.add("gradientFillClipPolygonEdges", clipEdges);
       if (meshCount) {
         profile.add("gradientMeshFillDraws");
@@ -4008,6 +4008,7 @@ export class WebGlFloorplanRenderer {
           const maxY = Math.min(viewportHeight, Math.ceil((data.gradientFillPathMetaB[offset + 1] - cameraCenterY) * zoomValue + viewportHeight / 2));
           const pixels = Math.max(0, maxX - minX) * Math.max(0, maxY - minY);
           profile.add("gradientAnalyticFillBBoxPixelsEstimate", pixels);
+          // Keep the original full-scan baseline comparable after clip indexing.
           profile.add("gradientAnalyticFillClipEdgeTestsEstimate", pixels * clipEdges);
         }
       }
@@ -4076,18 +4077,23 @@ export class WebGlFloorplanRenderer {
     profile?.endSection("gradientStrokeSubmission");
     profile?.add("gradientStrokeDraws");
     profile?.add("gradientStrokeSegments", segmentCount);
-    if (profile) profile.add("gradientStrokeClipPolygonEdges", this.countGradientClipPolygonEdges());
+    if (profile) profile.add("gradientStrokeClipPolygonEdges",
+      this.countGradientClipPolygonEdges(profile, "gradientStrokeIndexedClipNodes"));
   }
 
-  private countGradientClipPolygonEdges(): number {
+  private countGradientClipPolygonEdges(profile: RenderPerformanceProfiler,
+    indexedCounter: "gradientFillIndexedClipNodes" | "gradientStrokeIndexedClipNodes"): number {
     const headers = this.vectorClipHeaders;
     if (!headers) return 0;
-    let index = this.vectorClipIndex, edges = 0;
+    let index = this.vectorClipIndex, edges = 0, indexedNodes = 0;
     for (let depth = 0; depth < MAX_VECTOR_CLIP_DEPTH && index >= 0 && index * 4 < headers.length; depth++) {
-      // Uploaded rectangles have a negative edge count and no polygon loop.
-      edges += Math.max(0, headers[index * 4 + 2]);
+      // Indexed nodes retain their original edge count; rectangles have no polygon loop.
+      const count = Math.max(0, headers[index * 4 + 2]);
+      edges += count;
+      if (count > 0 && headers[index * 4 + 3] >= 2) indexedNodes++;
       index = headers[index * 4];
     }
+    profile.add(indexedCounter, indexedNodes);
     return edges;
   }
 

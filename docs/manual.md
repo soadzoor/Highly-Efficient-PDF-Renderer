@@ -342,17 +342,27 @@ fill-path segments, and `gradientMeshTriangles` counts mesh triangles.
 and their segments. These include repeated draws in compositing passes.
 
 `gradientFillClipPolygonEdges` and `gradientStrokeClipPolygonEdges` sum the
-polygon edges in each submitted draw's clip chain; packed rectangle clips are
-excluded. A simple gradient can still be expensive when its clip has thousands
-of edges. For analytic fills in the main orthographic view,
+original polygon edges in each submitted draw's clip chain; packed rectangle
+clips are excluded. These counts stay unchanged when clip indexing is active.
+`gradientFillIndexedClipNodes` and `gradientStrokeIndexedClipNodes` count indexed
+polygon nodes across the same chains, including repeat visits in separate draws;
+they confirm indexing is active, not how many candidate edges the GPU examines.
+Dense clips use horizontal bands over their original edges at upload time, with
+the existing full scan retained when indexing is unsuitable or exceeds its
+memory budget. Both native and Three WebGL/WebGPU rendering benefit; console
+profiling remains native WebGL only.
+
+For analytic fills in the main orthographic view,
 `gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad
 areas in framebuffer pixels, rounded outward. It includes overlap and ignores
 geometric clips, scissor rectangles, transparent pixels, and early exits;
 projected views and mesh fills are excluded. Multiplying each quad's estimate
 by its clip-chain polygon edge count produces
-`gradientAnalyticFillClipEdgeTestsEstimate`, an upper-work estimate rather than
-an actual GPU instruction count. Compare these with sampled GPU time when
-capturing fit-all and a zoomed gradient at the same viewport and DPR. Diagnostics
+`gradientAnalyticFillClipEdgeTestsEstimate`, the **unindexed full-scan baseline**
+upper-work estimate. It is not the actual indexed candidate count or a GPU
+instruction count, and should not fall merely because clip indexing is enabled.
+Compare sampled GPU time and corresponding `frameRecords` before and after the
+change at the same zoom, viewport, DPR, and visible layers. Diagnostics
 do not scan fill segments or clip edges in the render loop and remain off
 unless a capture is active.
 

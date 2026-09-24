@@ -1,11 +1,12 @@
 # Broschuere gradient zoom investigation
 
 The strongest identified hotspot is the polygon clip applied to the orange/red
-gradients. Both native backends evaluate every edge of that clip for every
-fragment. Enlarging the object increases the number of fragments without
-reducing the edge list. The supplied live-PDF capture below supports a GPU
-bottleneck that grows with clipping work. Isolated pass timing or a before/after
-comparison is still needed to establish exactly how much time clipping accounts for.
+gradients. Before indexing, both native backends evaluated every edge of that
+clip for every fragment. Enlarging the object increased the number of fragments
+without reducing the edge list. The supplied live-PDF capture below supports a
+GPU bottleneck that grows with clipping work. The shared clip implementation now
+indexes dense polygons by horizontal bands while retaining their original edges.
+A before/after GPU capture is still needed to measure the speedup.
 
 Inspection used the existing
 `public/examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep`
@@ -35,12 +36,14 @@ PDF or another saved version.
 
 The relevant code is:
 
-- [vectorClipShaders.ts](../src/vectorClipShaders.ts): `heprVectorClip` fetches
-  every polygon edge and evaluates its crossing predicate per fragment in both
-  GLSL and WGSL. Polygon clips have no spatial index.
-- [vectorClips.ts](../src/vectorClips.ts): `packVectorClips` already replaces
-  exact rectangles with bounds checks and intersects consecutive rectangular
-  ancestors. Dense polygon children still retain their complete edge lists.
+- [vectorClipShaders.ts](../src/vectorClipShaders.ts): `heprVectorClip` now selects
+  the current row's candidate edges for indexed polygons in both GLSL and WGSL.
+  The crossing predicate and winding calculation are unchanged; unindexed
+  polygons retain their original full scan.
+- [vectorClips.ts](../src/vectorClips.ts): `packVectorClips` builds the optional
+  band index during upload and retains the exact-rectangle bounds checks and
+  intersection of consecutive rectangular ancestors. The shared packer and
+  shaders serve native and Three WebGL/WebGPU rendering.
 - [nativeVectorClips.ts](../src/pdf/nativeVectorClips.ts): curve subdivision uses
   a fixed `0.0001` coordinate-unit flatness tolerance, producing many line edges.
 - [nativeGradientWebGlShaders.ts](../src/nativeGradientWebGlShaders.ts) and
@@ -49,35 +52,46 @@ The relevant code is:
   itself is a projection followed by a lookup into the existing color table.
 
 For scale, a 4,096-edge clip evaluated over 1920 x 1080 framebuffer pixels implies
-about 8.49 billion edge-loop visits per draw. This is a work estimate, not a
-measurement of executed GPU instructions: clipping, discarded fragments, overlap,
-driver behavior, and the actual viewport all affect execution.
+about 8.49 billion edge-loop visits per draw with the original full scan. This is
+an unindexed work estimate, not a measurement of executed GPU instructions:
+clipping, discarded fragments, overlap, driver behavior, and the actual viewport
+all affect execution.
 
-The first recommended optimization is a horizontal-band index for polygon clips,
-modeled on [vectorFillBands.ts](../src/vectorFillBands.ts). Assign each original
-edge to every band touched by its vertical extent. A fragment reads its own band's
-candidate list and applies the unchanged crossing and winding calculation.
-Retain the original Float32 endpoints, fill rules, parent chains, and half-open
-endpoint comparisons; conservatively include boundaries with matching CPU/GPU
-Float32 addressing. Cap index memory and keep the full scan as a fallback for
-paths whose edges span most bands. This targets both backends through their shared
-clip implementation and needs no HEP regeneration or geometry simplification.
+The implemented horizontal-band index assigns each original edge to every band
+touched by its vertical extent, with conservative padding at Float32 boundaries.
+A fragment reads its own band's candidate list and applies the unchanged crossing
+and winding calculation. The original Float32 endpoints, fill rules, parent
+chains, and half-open endpoint comparisons are retained. No geometry is simplified
+and no fixed-resolution mask is introduced. Index memory is bounded; small paths,
+unsuitable edge distributions, and paths that would exceed the packing budget
+retain the original full scan. The index is built at runtime for both PDF and HEP
+loading, so existing HEP files benefit without regeneration.
 
-A static candidate-count experiment on the existing clip coordinates gives:
+Running the production packer over the saved HEP indexes 10 of its 103 clips.
+The resulting clip texture payload contains 65,852 texels (1,053,632 bytes),
+compared with 21,115 texels for raw headers and edge lists. The additional storage
+holds band tables and duplicates unchanged edges across candidate lists. The
+following counts include the production guard of one neighboring band on each
+side:
 
-| Clip | Original edges per fragment | Average candidates with 256 bands | Worst band | Middle band |
-| --- | --- | --- | --- | --- |
-| 15 (page 2) | 4,096 | 17.99 | 164 | 12 |
-| 82 (page 12) | 4,096 | 17.99 | 160 | 12 |
-| 101 (last page) | 2,945 | 13.50 | 191 | 7 |
+| Clip | Original edges per fragment | Bands | Average candidates | Worst band | Middle band |
+| --- | --- | --- | --- | --- | --- |
+| 15 (page 2) | 4,096 | 256 | 48.65 | 279 | 32 |
+| 20 / 21 (page 3) | 2,049 each | 256 | 25.80 | 68 | 18 |
+| 50 / 51 (page 7) | 1,027 each | 128 | 24.93 | 95 | 16 |
+| 60 / 61 (page 8) | 1,027 each | 128 | 24.99 | 96 | 16 |
+| 82 (page 12) | 4,096 | 256 | 48.70 | 274 | 30 |
+| 101 (last page) | 2,945 | 256 | 35.03 | 322 | 18 |
 
-These averages weight bands equally; they are not viewport-weighted GPU timings
-or predicted FPS improvements. The experiment includes both endpoints in band
-assignment and leaves the final crossing test unchanged. Production code still
-needs boundary, nesting, both-fill-rule, and GPU parity validation.
+These are static candidate counts from the actual packed texture, not measured
+GPU timings or predicted FPS improvements. Averages weight bands equally rather
+than weighting the visible viewport's pixels. Inspection read the existing HEP;
+no PDF conversion was performed. That HEP contains older geometry than the user's
+live-PDF capture below, so these counts do not describe that capture's exact scene.
+Manual visual parity checks and before/after GPU timing remain necessary.
 
-The user supplied a live-PDF WebGL capture at 1920 x 945 framebuffer pixels,
-DPR 1: 172 rendered frames and 43 available GPU timer samples, with no dropped
+Before clip indexing, the user supplied a live-PDF WebGL capture at
+1920 x 945 framebuffer pixels, DPR 1: 172 rendered frames and 43 available GPU timer samples, with no dropped
 samples or disjoint-clock warning. It includes both fit-all panning and a zoom
 transition, rather than three independent captures. The 120 retained frame
 records are selected examples; their statistics must not be treated as an
@@ -141,9 +155,9 @@ across page layouts, compression modes and re-export. Cached parser data remains
 untouched. This closes a precision gap; it does not reduce clip edge counts or
 explain the large measured slowdown. No Broschuere PDF conversion was performed.
 
-Polygon clip indexing belongs in the shared renderer preparation/shaders so that
-both PDF and HEP loading benefit. A comparison capture after that optimization is
-more useful now than repeating the same baseline; FPS improvement is unmeasured.
+Polygon clip indexing now runs in the shared upload preparation and shaders so
+that both PDF and HEP loading benefit. A comparison capture is more useful now
+than repeating the same baseline; FPS and GPU-time improvements are unmeasured.
 
 Additional options, in priority order:
 
@@ -158,11 +172,20 @@ Additional options, in priority order:
    uses this principle. Broschuere's stored gradient paths contain only lines, so
    this is secondary here.
 
-The investigation adds profiling diagnostics and the clip precision parity fix
-described above; clip-edge indexing is not yet implemented. Native WebGL's
-existing `heprPerf` captures now include gradient submission CPU sections,
-analytic/mesh counts, clip polygon edge counts, and estimated quad pixels and
-clip-edge visits. See [the manual](manual.md) for counter definitions. GPU timing
+The investigation adds profiling diagnostics, the clip precision parity fix,
+and shared clip-edge indexing. Native WebGL's `heprPerf` captures include gradient
+submission CPU sections, analytic/mesh counts, original clip polygon edge counts,
+and estimated quad pixels and unindexed clip-edge visits. The new
+`gradientFillIndexedClipNodes` and `gradientStrokeIndexedClipNodes` counters count
+indexed polygon nodes across submitted draw chains; repeated draws count again,
+and rectangles are excluded. They confirm that indexing is active without
+scanning candidate edges during profiling.
+
+`gradientAnalyticFillClipEdgeTestsEstimate` deliberately remains the unindexed
+full-scan baseline. It does not measure the optimized shader's actual candidate
+visits and should not decrease merely because indexing is enabled. The original
+edge-count counters also remain comparable with earlier captures.
+See [the manual](manual.md) for counter definitions. GPU timing
 uses asynchronous [WebGL timer queries](https://registry.khronos.org/webgl/extensions/EXT_disjoint_timer_query_webgl2/)
 when available. It measures the whole frame command span, not an isolated gradient
 shader, and overlaps CPU time. The console capture currently supports native
@@ -180,9 +203,11 @@ copy(heprPerf.json()); // Chrome DevTools helper; save each capture separately.
 ```
 
 Send the three JSON reports along with the browser and GPU model. Compare
-`frameCpuMs`, `gpu.frameMs`, the gradient clip-edge/pixel estimates, and correlated
-`frameRecords`. Low CPU time with rising GPU time and clip-edge estimates supports
-the clip bottleneck. If GPU timers are unavailable, the report says so explicitly.
+`frameCpuMs`, `gpu.frameMs`, indexed clip-node counts, the original clip-edge/pixel
+estimates, and correlated `frameRecords`. Compare matching camera views against
+the earlier unindexed captures; use GPU time to assess the improvement rather than
+expecting the baseline edge-check estimate to fall. If GPU timers are unavailable,
+the report says so explicitly.
 Rendering is demand-driven, so an idle view alone will not produce a useful sample.
 No development server or browser session was started during this investigation.
 
@@ -190,10 +215,20 @@ Validation passed: TypeScript typecheck and the headless render-performance,
 WebGL-performance, WebGL-draw-calls, and vector-gradient-clips tests. The latter
 also checks clip-chain counters, rectangle fast paths, viewport area estimates,
 mesh/projected exclusions, and inactive-capture behavior. The supplied GPU capture
-was analyzed without running a browser locally. Future shader optimizations still
+was analyzed without running a browser locally. The indexed shaders still
 need manual visual checks and before/after GPU measurements.
 
 The parity follow-up also passed TypeScript typecheck and the headless
 `test-hep-scene-parity.mjs` and `test-hep-scene-sections.mjs` tests. These build
 small synthetic in-memory scenes, not converted PDF assets. Manual PDF/exported-HEP
 visual comparison remains useful for checking clip boundaries at high zoom.
+
+The horizontal-band implementation passed TypeScript typecheck and the headless
+`test-vector-clip-bands.mjs`, `test-vector-clips.mjs`,
+`test-vector-gradient-clips.mjs`, `test-three-vector-instance-clip.mjs`,
+`test-webgl-shader-precision.mjs`, `test-vector-run-clip-elision.mjs`, and
+`test-hep-scene-parity.mjs` tests. The new band regression checks 24,679 endpoint
+and band-boundary rows and 20,128 Float32 winding comparisons, including both
+fill rules, transformed outlines, holes, self-intersections, nested rectangles,
+extreme coordinates, and storage-budget fallbacks. These checks do not replace
+compilation and visual inspection on actual WebGL/WebGPU drivers.

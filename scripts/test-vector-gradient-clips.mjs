@@ -81,6 +81,8 @@ try {
   assert.equal(record.counters.gradientStrokeDraws, 1);
   assert.equal(record.counters.gradientStrokeSegments, 1);
   assert.equal(record.counters.gradientStrokeClipPolygonEdges, 3);
+  assert.equal(record.counters.gradientFillIndexedClipNodes, 0, "small polygon clips retain full scans");
+  assert.equal(record.counters.gradientStrokeIndexedClipNodes, 0);
   assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 15000,
     "each 100x100 quad is clipped to 75x100 viewport pixels; overlapping draws count again");
   assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 22500);
@@ -90,17 +92,27 @@ try {
   gl.gradientMeshRanges = new Uint32Array([0, 0, 0, 6]);
   gl.gradientMeshProgram = "mesh"; gl.gradientMeshUniforms = {};
   gl.vectorClipIndex = 3;
+  // Header-only fixtures isolate profiling from shader execution: both fill-rule
+  // flags mark indexed polygons, while negative rectangle counts remain excluded.
+  gl.vectorClipHeaders[3] = 2;
+  gl.vectorClipHeaders[15] = 3;
+  gl.vectorClipHeaders[7] = gl.vectorClipHeaders[11] = 2;
   profile.beginFrame();
   gl.drawGradientFillPath(0, 100, 100, 75, 50, 1);
   gl.drawGradientFillPath(1, 100, 100, 75, 50, 1);
+  gl.drawGradientStrokeRun(0, 100, 100, 75, 50, 1);
   profile.endFrame();
   record = profile.getReport().frameRecords[1];
-  assert.equal(record.counters.gradientFillClipPolygonEdges, 12, "both polygon ancestors count for both fills");
+  assert.equal(record.counters.gradientFillClipPolygonEdges, 12, "indexed nodes retain original polygon edge counts");
+  assert.equal(record.counters.gradientFillIndexedClipNodes, 4, "both polygon ancestors count again for each fill draw");
+  assert.equal(record.counters.gradientStrokeIndexedClipNodes, 2, "indexed polygon ancestors count for strokes too");
+  assert.equal(record.counters.gradientStrokeClipPolygonEdges, 6);
   assert.equal(record.counters.gradientMeshFillDraws, 1);
   assert.equal(record.counters.gradientMeshFillSegments, 4);
   assert.equal(record.counters.gradientMeshTriangles, 2);
   assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 7500, "mesh triangles are excluded from quad area");
-  assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 45000);
+  assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 45000,
+    "edge-test estimates retain the unindexed baseline when polygon bands are active");
 
   profile.beginFrame();
   gl.localToClipRenderingEnabled = true;

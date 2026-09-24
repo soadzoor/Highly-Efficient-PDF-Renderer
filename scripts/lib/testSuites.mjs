@@ -71,6 +71,7 @@ export const fastTests = [
   "webgl-ordered-state",
   "vector-draw-order",
   "vector-clips",
+  "vector-clip-bands",
   "vector-draw-run-culling",
   "vector-run-clip-elision",
   "vector-ordered-batches",
