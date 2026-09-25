@@ -187,16 +187,10 @@ export function analyzePlanarBoundsProjectionInto(
   }
 
   const visible = !(outsideLeft || outsideRight || outsideBottom || outsideTop);
-  const affine = Math.abs(m3) <= Number.EPSILON && Math.abs(m7) <= Number.EPSILON;
+  const affine = isAffinePlanarLocalToClip(localToClip);
   let maxPixelsPerLocalUnit: number;
   if (affine) {
-    const inverseW = 1 / m15;
-    maxPixelsPerLocalUnit = largestSingularValue2x2(
-      m0 * inverseW * width * 0.5,
-      m1 * inverseW * height * 0.5,
-      m4 * inverseW * width * 0.5,
-      m5 * inverseW * height * 0.5
-    );
+    maxPixelsPerLocalUnit = affinePlanarPixelsPerLocalUnit(localToClip, width, height);
   } else {
     // d(X/W)/dx = (m0*W - X*m3) / W^2. The numerator is
     // affine (and in fact independent of x); its maximum absolute value over a
@@ -221,6 +215,63 @@ export function analyzePlanarBoundsProjectionInto(
   out.minY = projectedMinY;
   out.maxX = projectedMaxX;
   out.maxY = projectedMaxY;
+  return out;
+}
+
+/**
+ * True when clip W does not vary across the plane, so every local rectangle
+ * shares one pixel scale. {@link analyzePlanarBoundsProjectionInto} uses the
+ * same rule for its exact affine branch.
+ */
+export function isAffinePlanarLocalToClip(localToClip: ArrayLike<number>): boolean {
+  return localToClip.length >= 16 &&
+    Math.abs(localToClip[3]) <= Number.EPSILON && Math.abs(localToClip[7]) <= Number.EPSILON;
+}
+
+/** Exact pixels per local unit of an affine planar view, for every rectangle. */
+export function affinePlanarPixelsPerLocalUnit(localToClip: ArrayLike<number>, width: number, height: number): number {
+  const inverseW = 1 / localToClip[15];
+  return largestSingularValue2x2(
+    localToClip[0] * inverseW * width * 0.5,
+    localToClip[1] * inverseW * height * 0.5,
+    localToClip[4] * inverseW * width * 0.5,
+    localToClip[5] * inverseW * height * 0.5
+  );
+}
+
+/**
+ * Local-space bounds of the clip-space viewport for an affine planar view, or
+ * null when the view cannot be inverted or sits at/behind the camera plane.
+ */
+export function affinePlanarViewportBoundsInto(localToClip: ArrayLike<number>, out: Bounds): Bounds | null {
+  if (!isAffinePlanarLocalToClip(localToClip)) return null;
+  const m0 = localToClip[0], m1 = localToClip[1], m4 = localToClip[4], m5 = localToClip[5];
+  const m12 = localToClip[12], m13 = localToClip[13], w = localToClip[15];
+  const determinant = m0 * m5 - m4 * m1;
+  if (![m0, m1, m4, m5, m12, m13, w, determinant].every(Number.isFinite) || w <= CLIP_W_EPSILON ||
+      Math.abs(determinant) <= Number.EPSILON * Math.max(m0 * m0 + m1 * m1, m4 * m4 + m5 * m5)) {
+    return null;
+  }
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (let corner = 0; corner < 4; corner += 1) {
+    // Solve [m0 m4; m1 m5] * local = clip * w - translation at each NDC corner.
+    const rightX = ((corner & 1) === 0 ? -w : w) - m12;
+    const rightY = ((corner & 2) === 0 ? -w : w) - m13;
+    const x = (m5 * rightX - m4 * rightY) / determinant;
+    const y = (m0 * rightY - m1 * rightX) / determinant;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  }
+  if (![minX, minY, maxX, maxY].every(Number.isFinite)) return null;
+  out.minX = minX;
+  out.minY = minY;
+  out.maxX = maxX;
+  out.maxY = maxY;
   return out;
 }
 

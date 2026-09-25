@@ -379,6 +379,32 @@ const afterCulling = retentionRuntime.update({
 assert.equal(afterCulling.stats.coarseClusters, retainedCoarseCount, "offscreen cluster hysteresis state must be retained");
 retentionRuntime.dispose();
 
+// Affine (top-down) views share one pixel scale, so a pan reuses the selection
+// until its snapped visibility rectangle moves, and every moved selection still
+// covers each on-screen cluster at the correct level.
+const panRuntime = new TextLodRuntime(result);
+const panViewport = 420;
+const panAt = (x, y, zoom) => panRuntime.update({
+  localToClip: createOrthographicLocalToClip(x, y, zoom, panViewport, panViewport),
+  viewportWidth: panViewport,
+  viewportHeight: panViewport
+});
+const panStart = panAt(55, 291, 2);
+assertCoversOnScreenClusters(panStart, data, 55, 291, 2, panViewport);
+// Exact per-cluster culling changed the selection for this pan, as a cluster
+// edge crosses the viewport; both edges stay inside their visibility step.
+const panNudged = panAt(55, 295, 2);
+assert.equal(panNudged.changed, false, "a pan inside one visibility step must not rebuild the selection");
+assert.equal(panNudged.stats.selectionUploads, panStart.stats.selectionUploads);
+assert.strictEqual(panNudged.instanceIds, panStart.instanceIds);
+for (const [x, y, zoom] of [[55, 705, 2], [400, 60, 2], [55, 305, 0.3], [300, 900, 0.3], [55, 305, 2]]) {
+  const moved = panAt(x, y, zoom);
+  assert.equal(new Set(moved.instanceIds).size, moved.instanceIds.length);
+  assertSourceOrdered(moved.instanceIds, data);
+  assertCoversOnScreenClusters(moved, data, x, y, zoom, panViewport);
+}
+panRuntime.dispose();
+
 runtime.setResourceFallback("resource-capacity");
 const unavailable = runtime.update({
   localToClip: createOrthographicLocalToClip(centerX, centerY, 0.4, viewportWidth, viewportHeight),
@@ -513,6 +539,26 @@ function assertSourceOrdered(ids, data) {
     assert.ok(sourceStart >= previousSourceStart);
     previousSourceStart = sourceStart;
   }
+}
+
+/** Each cluster touching the view is selected at the level its fixed zoom implies. */
+function assertCoversOnScreenClusters(selection, data, centerX, centerY, zoom, viewport) {
+  const half = viewport / (2 * zoom);
+  const ids = new Set(selection.instanceIds);
+  let onScreen = 0;
+  for (const cluster of data.clusters) {
+    const bounds = cluster.bounds;
+    if (bounds.maxX < centerX - half || bounds.minX > centerX + half ||
+        bounds.maxY < centerY - half || bounds.minY > centerY + half) continue;
+    onScreen += 1;
+    const coarse = cluster.eligible && cluster.maxInkHeight * zoom <= TEXT_LOD_COARSE_ENTER_PX;
+    const start = coarse ? data.exactInstanceCount + cluster.coarseStart : cluster.exactStart;
+    const count = coarse ? cluster.coarseCount : cluster.exactCount;
+    for (let id = start; id < start + count; id += 1) {
+      assert.ok(ids.has(id), `on-screen cluster id ${id} at (${centerX}, ${centerY}) x${zoom} must be selected`);
+    }
+  }
+  assert.ok(onScreen > 0, "the probe view must contain text");
 }
 
 function assertConservativeAgainstSamples(bounds, matrix, viewport, bound) {

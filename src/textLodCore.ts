@@ -1,5 +1,7 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
+  affinePlanarPixelsPerLocalUnit,
+  affinePlanarViewportBoundsInto,
   analyzePlanarBoundsProjectionInto,
   createPlanarBoundsProjection,
   type PlanarBoundsProjection,
@@ -41,6 +43,8 @@ export const TEXT_LOD_EXACT_ENTER_PX = 0.75;
  * tested region identical until the view has moved a meaningful distance, at the
  * cost of selecting the clusters within one grid step of the viewport. The
  * snapped rectangle always contains the real one, so nothing pops in late.
+ * Affine views test clusters against this rectangle alone; projective views
+ * still refine it with each cluster's exact projection.
  */
 const TEXT_LOD_VISIBILITY_STEP_RATIO = 0.1;
 
@@ -157,6 +161,14 @@ export class TextLodRuntime {
   private readonly clusterProjection: PlanarBoundsProjection = createPlanarBoundsProjection();
   private readonly selectionViewportScratch: PlanarViewport = {width: 1, height: 1};
   private readonly visibilityBounds: Bounds = {minX: 0, minY: 0, maxX: 0, maxY: 0};
+  // Affine views have one pixel scale everywhere, so a selection is fully
+  // determined by that scale and the snapped visibility rectangle.
+  private readonly affineViewBounds: Bounds = {minX: 0, minY: 0, maxX: 0, maxY: 0};
+  private readonly affineVisibility: Bounds = {minX: 0, minY: 0, maxX: 0, maxY: 0};
+  private affineScale = 0;
+  private lastAffineValid = false;
+  private lastAffineScale = 0;
+  private readonly lastAffineVisibility = new Float64Array(4);
 
   constructor(result: TextLodBuildResult, mode: TextLodMode = "auto") {
     this.data = result.data;
@@ -184,6 +196,7 @@ export class TextLodRuntime {
     }
     this.selectionInitialized = false;
     this.lastUpdateValid = false;
+    this.lastAffineValid = false;
     this.stats = this.createEmptyStats();
   }
 
@@ -203,6 +216,7 @@ export class TextLodRuntime {
     this.resourceFallbackReason = normalized;
     this.selectionInitialized = false;
     this.lastUpdateValid = false;
+    this.lastAffineValid = false;
     this.stats = this.createEmptyStats();
   }
 
@@ -215,6 +229,16 @@ export class TextLodRuntime {
       return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};
     }
 
+    // An affine view (any top-down camera) has one exact pixel scale for every
+    // page and cluster, and its visibility is the snapped local rectangle alone.
+    // The same scale and rectangle therefore reproduce the previous selection,
+    // which lets a pan skip the whole pass until it crosses a visibility step.
+    const affine = this.resolveAffineView(update);
+    if (affine && this.selectionInitialized && this.isSameAffineSelection()) {
+      this.rememberSelectionUpdate(update);
+      return {instanceIds: this.selectedInstanceIds, changed: false, stats: this.getStats()};
+    }
+
     const forceSelectionRebuild = !this.selectionInitialized;
     let selectionDecisionChanged = false;
     let visibleClusters = 0;
@@ -222,7 +246,10 @@ export class TextLodRuntime {
     let coarseClusters = 0;
     let renderedGlyphs = 0;
     let renderedRuns = 0;
-    const cullingBounds = this.resolveVisibilityBounds(update.cullingBounds);
+    const cullingBounds = affine
+      ? this.affineVisibility
+      : this.resolveVisibilityBounds(update.cullingBounds);
+    const affineScale = this.affineScale;
 
     for (const page of data.pages) {
       if (cullingBounds && !boundsIntersect(page.bounds, cullingBounds)) {
@@ -231,18 +258,20 @@ export class TextLodRuntime {
         }
         continue;
       }
-      const pageProjection = analyzePlanarBoundsProjectionInto(
+      const pageProjection = affine ? null : analyzePlanarBoundsProjectionInto(
         page.bounds,
         update.localToClip,
         this.selectionViewport(update),
         this.pageProjection
       );
-      if (pageProjection.stable && !pageProjection.visible) {
+      if (pageProjection && pageProjection.stable && !pageProjection.visible) {
         if (markClustersInvisible(page.clusterStart, page.clusterCount, this.clusterVisibility)) {
           selectionDecisionChanged = true;
         }
         continue;
       }
+      const pageStable = pageProjection ? pageProjection.stable : true;
+      const pageScale = pageProjection ? pageProjection.maxPixelsPerLocalUnit : affineScale;
 
       // When the conservative scale over the complete page is already below
       // the applicable threshold, every child is safely coarse. This avoids
@@ -253,10 +282,10 @@ export class TextLodRuntime {
         ? TEXT_LOD_EXACT_ENTER_PX
         : TEXT_LOD_COARSE_ENTER_PX;
       const selectWholePageCoarse =
-        this.mode === "auto" && page.eligible && pageProjection.stable &&
+        this.mode === "auto" && page.eligible && pageStable &&
         (pageWasEntirelyCoarse
-          ? page.maxInkHeight * pageProjection.maxPixelsPerLocalUnit < pageCoarseThreshold
-          : page.maxInkHeight * pageProjection.maxPixelsPerLocalUnit <= pageCoarseThreshold);
+          ? page.maxInkHeight * pageScale < pageCoarseThreshold
+          : page.maxInkHeight * pageScale <= pageCoarseThreshold);
       if (selectWholePageCoarse) {
         const clusterEnd = page.clusterStart + page.clusterCount;
         for (let clusterIndex = page.clusterStart; clusterIndex < clusterEnd; clusterIndex += 1) {
@@ -283,13 +312,13 @@ export class TextLodRuntime {
           }
           continue;
         }
-        const projection = analyzePlanarBoundsProjectionInto(
+        const projection = affine ? null : analyzePlanarBoundsProjectionInto(
           cluster.bounds,
           update.localToClip,
           this.selectionViewport(update),
           this.clusterProjection
         );
-        if (projection.stable && !projection.visible) {
+        if (projection && projection.stable && !projection.visible) {
           if (setClusterValue(this.clusterVisibility, clusterIndex, 0)) {
             selectionDecisionChanged = true;
           }
@@ -300,9 +329,10 @@ export class TextLodRuntime {
         }
         visibleClusters += 1;
 
+        const clusterStable = projection ? projection.stable : true;
         let coarse = false;
-        if (this.mode === "auto" && cluster.eligible && projection.stable) {
-          const projectedInkHeight = cluster.maxInkHeight * projection.maxPixelsPerLocalUnit;
+        if (this.mode === "auto" && cluster.eligible && clusterStable) {
+          const projectedInkHeight = cluster.maxInkHeight * (projection ? projection.maxPixelsPerLocalUnit : affineScale);
           const wasCoarse = this.clusterStates[clusterIndex] === 1;
           coarse = wasCoarse
             ? projectedInkHeight < TEXT_LOD_EXACT_ENTER_PX
@@ -353,7 +383,59 @@ export class TextLodRuntime {
       exactBudgetOverage: Math.max(0, renderedGlyphs - TEXT_LOD_SOFT_EXACT_GLYPH_BUDGET)
     };
     this.rememberSelectionUpdate(update);
+    this.rememberAffineSelection(affine);
     return {instanceIds: this.selectedInstanceIds, changed, stats: this.getStats()};
+  }
+
+  /**
+   * For an affine view, store its uniform scale and the snapped visibility
+   * rectangle (the viewport's local bounds, narrowed by any culling bounds).
+   * Returns false for projective or degenerate views, which keep the exact
+   * per-page and per-cluster projection.
+   */
+  private resolveAffineView(update: TextLodSelectionUpdate): boolean {
+    const width = Math.max(1, update.viewportWidth);
+    const height = Math.max(1, update.viewportHeight);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
+    const view = affinePlanarViewportBoundsInto(update.localToClip, this.affineViewBounds);
+    if (!view) return false;
+    const scale = affinePlanarPixelsPerLocalUnit(update.localToClip, width, height);
+    if (!Number.isFinite(scale)) return false;
+    const culling = update.cullingBounds;
+    if (culling) {
+      view.minX = Math.max(view.minX, culling.minX);
+      view.minY = Math.max(view.minY, culling.minY);
+      view.maxX = Math.min(view.maxX, culling.maxX);
+      view.maxY = Math.min(view.maxY, culling.maxY);
+    }
+    const snapped = this.resolveVisibilityBounds(view) ?? view;
+    const out = this.affineVisibility;
+    out.minX = snapped.minX;
+    out.minY = snapped.minY;
+    out.maxX = snapped.maxX;
+    out.maxY = snapped.maxY;
+    this.affineScale = scale;
+    return true;
+  }
+
+  private isSameAffineSelection(): boolean {
+    const bounds = this.affineVisibility;
+    return this.lastAffineValid &&
+      this.affineScale === this.lastAffineScale &&
+      bounds.minX === this.lastAffineVisibility[0] &&
+      bounds.minY === this.lastAffineVisibility[1] &&
+      bounds.maxX === this.lastAffineVisibility[2] &&
+      bounds.maxY === this.lastAffineVisibility[3];
+  }
+
+  private rememberAffineSelection(affine: boolean): void {
+    this.lastAffineValid = affine;
+    if (!affine) return;
+    this.lastAffineScale = this.affineScale;
+    this.lastAffineVisibility[0] = this.affineVisibility.minX;
+    this.lastAffineVisibility[1] = this.affineVisibility.minY;
+    this.lastAffineVisibility[2] = this.affineVisibility.maxX;
+    this.lastAffineVisibility[3] = this.affineVisibility.maxY;
   }
 
   /**
@@ -402,6 +484,7 @@ export class TextLodRuntime {
     this.selectionScratch = new Uint32Array(0);
     this.selectionInitialized = false;
     this.lastUpdateValid = false;
+    this.lastAffineValid = false;
     this.stats = this.createEmptyStats();
   }
 
@@ -437,9 +520,12 @@ export class TextLodRuntime {
 
   /**
    * Every selected range is a contiguous slice of the combined payload, so the
-   * ids are always a run of consecutive integers. Copying them out of one
-   * identity array takes the engine's memcpy path instead of a per-element JS
-   * loop, and reusing the destination keeps the frame allocation-free.
+   * ids are always a run of consecutive integers. Neighbouring clusters in the
+   * same state continue each other's range, so ranges are merged first; long
+   * merged runs are copied out of one identity array on the engine's memcpy
+   * path, and short ones are written directly, since a typed-array view per
+   * cluster costs more than the few ids it copies. Reusing the destination
+   * keeps the frame allocation-free.
    *
    * The returned view aliases `selectionScratch` and is only valid until the
    * next selection; callers must copy it rather than retain it.
@@ -456,6 +542,8 @@ export class TextLodRuntime {
     const scratch = this.selectionScratch;
 
     let offset = 0;
+    let rangeStart = 0;
+    let rangeEnd = 0;
     for (let clusterIndex = 0; clusterIndex < data.clusters.length; clusterIndex += 1) {
       if (this.clusterVisibility[clusterIndex] === 0) {
         continue;
@@ -468,9 +556,15 @@ export class TextLodRuntime {
       if (count <= 0) {
         continue;
       }
-      scratch.set(identity.subarray(start, start + count), offset);
-      offset += count;
+      if (start === rangeEnd) {
+        rangeEnd += count;
+        continue;
+      }
+      offset = writeInstanceIdRange(scratch, offset, identity, rangeStart, rangeEnd);
+      rangeStart = start;
+      rangeEnd = start + count;
     }
+    offset = writeInstanceIdRange(scratch, offset, identity, rangeStart, rangeEnd);
     return scratch.subarray(0, offset);
   }
 
@@ -543,6 +637,26 @@ function quantizeVisibilityStep(step: number): number {
     return 0;
   }
   return Math.pow(2, Math.round(Math.log2(step)));
+}
+
+/** Below this many ids a direct loop beats creating a typed-array view to copy. */
+const INSTANCE_ID_COPY_MIN_RUN = 64;
+
+function writeInstanceIdRange(
+  destination: Uint32Array,
+  offset: number,
+  identity: Uint32Array,
+  start: number,
+  end: number
+): number {
+  const count = end - start;
+  if (count <= 0) return offset;
+  if (count >= INSTANCE_ID_COPY_MIN_RUN) {
+    destination.set(identity.subarray(start, end), offset);
+  } else {
+    for (let id = start; id < end; id += 1) destination[offset + id - start] = id;
+  }
+  return offset + count;
 }
 
 function markClustersInvisible(
