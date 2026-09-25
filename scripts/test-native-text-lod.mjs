@@ -56,44 +56,44 @@ assert.equal(
 );
 
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, false, true, true),
+  shouldUseNativePanCacheForFrame(true, false, true, true),
   false,
   "damped zoom must render directly so text LOD follows every camera frame"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, true, true, true),
+  shouldUseNativePanCacheForFrame(true, true, true, true),
   false,
   "combined pinch-pan and zoom must not display a stale scaled cache"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, false, false, true),
+  shouldUseNativePanCacheForFrame(true, false, false, true),
   false,
   "a zoom-changing frame must remain direct even without another camera animation flag"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, true, false, false),
+  shouldUseNativePanCacheForFrame(true, true, false, false),
   true,
   "translation-only pointer dragging may reuse the pan cache"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, false, true, false),
+  shouldUseNativePanCacheForFrame(true, false, true, false),
   true,
   "translation-only inertial animation may reuse the pan cache"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, false, false, false, false),
+  shouldUseNativePanCacheForFrame(true, false, false, false),
   false,
   "a stationary camera must render the settled direct frame"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(false, false, true, true, false),
+  shouldUseNativePanCacheForFrame(false, true, true, false),
   false,
   "an ineligible scene must not allocate or use the pan cache"
 );
 assert.equal(
-  shouldUseNativePanCacheForFrame(true, true, true, true, false),
-  false,
-  "Vector LOD must retain its direct-rendering policy"
+  shouldUseNativePanCacheForFrame(true, true, true, false),
+  true,
+  "translation remains cacheable independently of the stroke representation"
 );
 
 for (const [name, source] of [["WebGL", webGl], ["WebGPU", webGpu]]) {

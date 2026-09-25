@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import * as THREE from "three";
+import { RenderPerformanceProfiler } from "../src/renderPerformance.ts";
+import { withThreeRenderPerformance } from "../src/threeRenderPerformance.ts";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -11,7 +13,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { ThreePaintCompositor } = await import("../src/threePaintCompositor.ts");
+  const { ThreePaintCompositor, projectThreePdfCompositeBounds } = await import("../src/threePaintCompositor.ts");
   const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { setThreePdfShapeOnly } = await import("../src/threePdfShape.ts");
@@ -78,7 +80,24 @@ try {
     // never a render attachment while the presentation material still samples
     // it. That costs one extra surface once, and then pooling is steady.
     const surfaces = compositor.surfaces.size;
-    compositor.render(host, scene, roots, 32, 24, () => true);
+    const profiler = new RenderPerformanceProfiler();
+    profiler.start({ gpu: false, maxFrames: 1 });
+    profiler.beginFrame();
+    withThreeRenderPerformance(profiler, () => compositor.render(host, scene, roots, 32, 24, () => true));
+    profiler.endFrame();
+    const measured = profiler.getReport();
+    assert.equal(measured.counters["three.compositorFrames"].total, 1);
+    assert.equal(measured.counters["three.surfaceBytes"].total, surfaces * 32 * 24 * 4);
+    assert.ok(measured.counters["three.strokeDraws"].total > 0);
+    assert.ok(measured.counters["three.compositePasses"].total > 0);
+    assert.ok(measured.cpuSections["three.compositorCollect"]);
+    assert.ok(measured.cpuSections["three.compositorSelection"]);
+    assert.ok(measured.cpuSections["three.batchLookup"]);
+    assert.ok(measured.cpuSections["three.batchGeometry"]);
+    assert.ok(measured.cpuSections["three.hostDraw"]);
+    assert.ok(measured.cpuSections["three.hostPass"]);
+    assert.equal(measured.discardedMetricNames, 0);
+    profiler.dispose();
     assert.equal(compositor.surfaces.size, surfaces, "unchanged frames reuse render targets");
     assert.equal(compositor.mesh.visible, true, "the presentation mesh is shown again after compositing");
 
@@ -154,7 +173,121 @@ try {
       "the span's paints are batched into one submission, in source order");
     assert.equal(new Set(spanDraws.map(draw => draw.call)).size, 1,
       "the span costs one host render, and without a knockout it renders no shape at all");
+    // Normal groups blend directly, and their effects touch only their projected
+    // rectangle. A root copy is still needed, but there is no per-group copy.
+    spanHost.draws.length = 0;
+    const boundedProject = bounds => ({ x: bounds.minX + 100, y: bounds.minY + 80,
+      width: bounds.maxX - bounds.minX, height: bounds.maxY - bounds.minY });
+    spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true, boundedProject);
+    const boundedClears = spanHost.clears.filter(clear => clear.scissorTest);
+    if (backend === "webgl") {
+      assert.ok(boundedClears.length > 0, "WebGL clears use the effect bounds too");
+      assert.ok(boundedClears.every(clear => clear.scissor[2] < 30 && clear.scissor[3] < 30),
+        "small effects do not clear the full framebuffer");
+    } else assert.equal(boundedClears.length, 0, "WebGPU keeps its whole-attachment fast clear");
+    const effects = spanHost.draws.filter(draw => !draw.ids);
+    assert.equal(effects.length, 2, "one root copy and one direct source-over pass");
+    const blended = effects.find(draw => draw.blending === THREE.CustomBlending);
+    assert.ok(blended, "group opacity uses the hardware blending pass");
+    assert.equal(blended.blendSrc, THREE.OneFactor, "effect output is premultiplied on both backends");
+    assert.equal(blended.blendDst, THREE.OneMinusSrcAlphaFactor);
+    assert.equal(blended.scissorTest, true);
+    assert.ok(backend === "webgpu" ? blended.scissor[1] > 140 : blended.scissor[1] < 100,
+      "WebGPU target scissors convert the shared bottom-left rectangle to top-left");
+    assert.ok(blended.scissor[2] < 30 && blended.scissor[3] < 30,
+      "a small effect does not shade the full target");
+    assert.deepEqual(snapshot(spanHost), state, "bounded effects restore the host scissor and target");
+    assert.ok(effects.some(draw => !draw.scissorTest), "pooled target scissors reset for the full root copy");
+    spanHost.draws.length = 0;
+    spanHost.clears.length = 0;
+    spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 320, 240, () => true,
+      bounds => ({ ...boundedProject(bounds), x: 10000 }));
+    assert.equal(spanHost.draws.filter(draw => !draw.ids).length, 1, "offscreen effects skip their composite pass");
+    assert.equal(spanHost.clears.length, 1, "offscreen effects skip clears, keeping only the backdrop clear");
+    assert.equal(spanHost.clears[0].scissorTest, false, "a pooled scissor cannot restrict the backdrop clear");
+
+    // A scheduled mesh can own disjoint canonical ranges, and LOD IDs can be
+    // unrelated to those ranges. Every instanced attribute follows the selected
+    // rows, including clip roots; filtering only IDs would clip the wrong paint.
+    const geometry = new THREE.InstancedBufferGeometry();
+    geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(f([10, 5, 12]), 1));
+    geometry.setAttribute("aVectorClipIndex", new THREE.InstancedBufferAttribute(f([1, 2, 3]), 1));
+    geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([0, 0], 2));
+    geometry.setIndex([0]);
+    geometry.instanceCount = 2;
+    const proxySource = new THREE.Mesh(geometry, new THREE.RawShaderMaterial());
+    const origins = new Uint32Array(13); origins[10] = 3; origins[5] = 7; origins[12] = 9;
+    Object.assign(proxySource.userData, { heprDrawRun: { kind: "stroke", first: 3, count: 3 },
+      heprDrawRanges: [{ first: 3, count: 1 }, { first: 7, count: 1 }, { first: 9, count: 1 }],
+      heprCanonicalOrigins: origins, heprInstanceAttribute: "aSegmentIndex" });
+    spanCompositor.collect([proxySource]);
+    spanCompositor.renderer = spanHost;
+    spanHost.draws.length = 0;
+    const partialTarget = spanCompositor.acquire();
+    spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    assert.deepEqual(spanHost.draws.map(draw => draw.ids), [[5]], "subset membership uses canonical origins");
+    assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2]], "clip roots are gathered with instance IDs");
+    const proxy = spanCompositor.proxies.get(proxySource);
+    const originalPartial = proxy.partialGeometry;
+    const originalIds = originalPartial.getAttribute("aSegmentIndex");
+    const originalClips = originalPartial.getAttribute("aVectorClipIndex");
+    const borrowedCorner = geometry.getAttribute("aCorner"), borrowedIndex = geometry.index;
+    let partialDisposals = 0;
+    originalPartial.addEventListener("dispose", () => {
+      partialDisposals++;
+      assert.equal(originalPartial.getAttribute("aSegmentIndex"), originalIds,
+        "old owned buffers remain attached while Three releases them");
+      assert.equal(originalPartial.getAttribute("aVectorClipIndex"), originalClips);
+      assert.equal(originalPartial.getAttribute("aCorner"), undefined, "borrowed attributes cannot be disposed");
+      assert.equal(originalPartial.index, null, "borrowed indices cannot be disposed");
+    });
+    geometry.instanceCount = 3;
+    spanCompositor.draw([{ kind: "stroke", first: 9, count: 1 }], partialTarget, false);
+    assert.equal(proxy.partialGeometry, originalPartial,
+      "revealing more instances reuses the source-sized partial allocation");
+    assert.equal(partialDisposals, 0);
+    geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(f([10, 5, 12, 5]), 1));
+    geometry.setAttribute("aVectorClipIndex", new THREE.InstancedBufferAttribute(f([1, 2, 3, 4]), 1));
+    geometry.instanceCount = 4;
+    spanHost.draws.length = 0;
+    spanCompositor.draw([{ kind: "stroke", first: 7, count: 1 }], partialTarget, false);
+    assert.equal(partialDisposals, 1, "growing source capacity retires the previous owned GPU buffers");
+    assert.notEqual(proxy.partialGeometry, originalPartial);
+    assert.deepEqual(spanHost.draws.map(draw => draw.ids), [[5, 5]]);
+    assert.deepEqual(spanHost.draws.map(draw => draw.clips), [[2, 4]]);
+    assert.equal(geometry.getAttribute("aCorner"), borrowedCorner);
+    assert.equal(geometry.index, borrowedIndex);
+    const originalGeometryForRuns = spanCompositor.geometryForRuns;
+    let inputCount = 0;
+    spanCompositor.geometryForRuns = function(entry, runs) {
+      inputCount = runs.length;
+      return originalGeometryForRuns.call(this, entry, runs);
+    };
+    spanCompositor.draw([{ kind: "stroke", first: 3, count: 7 }], partialTarget, false);
+    assert.equal(inputCount, 1, "a merged run reaching three ranges on one proxy is collected only once");
+    spanCompositor.geometryForRuns = originalGeometryForRuns;
+    assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: [{ first: 3, count: 7 }] }, [
+      { kind: "stroke", first: 7, count: 3 }, { kind: "stroke", first: 3, count: 4 }
+    ]), geometry, "adjacent inputs jointly cover a range without copying or uploading instances");
+    const overlap = spanCompositor.geometryForRuns(proxy, [
+      { kind: "stroke", first: 3, count: 7 }, { kind: "stroke", first: 7, count: 1 }
+    ]);
+    assert.equal(overlap, geometry, "a shorter overlapping input cannot hide the enclosing range's tail");
+    let rangeReads = 0;
+    const manyRanges = Array.from({ length: 4096 }, (_, index) => ({
+      get first() { rangeReads++; return index * 2; }, count: 1
+    }));
+    const manyRuns = manyRanges.map(range => ({ kind: "stroke", first: range.first, count: 1 }));
+    rangeReads = 0;
+    assert.equal(spanCompositor.geometryForRuns({ ...proxy, ranges: manyRanges }, manyRuns), geometry);
+    assert.ok(rangeReads < manyRanges.length * 4,
+      "large scheduled meshes must not rescan the entire input span for each canonical range");
+    let replacementDisposals = 0;
+    proxy.partialGeometry.addEventListener("dispose", () => replacementDisposals++);
+    spanCompositor.release(partialTarget); spanCompositor.renderer = null;
     spanCompositor.dispose(); spanStroke.dispose();
+    assert.equal(partialDisposals, 1, "retired partial geometry is disposed only once");
+    assert.equal(replacementDisposals, 1, "the replacement allocation is released with the compositor");
 
     // The graph may paint adjacent runs back to front. A mesh renders its
     // instances in id order, so merging those two would silently swap them:
@@ -190,9 +323,66 @@ try {
       `an emptied group drops its surfaces and passes too (${splitHost.draws.length} vs ${splitPasses})`);
     splitCompositor.dispose(); splitStroke.dispose();
 
+    // Raster and gradient slots have no layer instance culling. Their projected
+    // bounds must drop the complete offscreen group, not only its final pass.
+    const slotScene = Object.assign(createEmptyVectorScene(), {
+      rasterLayers: [scene.rasterLayers[0]],
+      clipPaths: [{ parent: -1, fillRule: 0, edges: f([0, 0, 10, 0, 10, 0, 10, 10,
+        10, 10, 0, 10, 0, 10, 0, 0]) }],
+      drawRuns: [{ kind: "raster", first: 0, count: 1 },
+        { kind: "gradient-fill", first: 0, count: 1, clipIndex: 0 }],
+      paintGraph: { roots: [{ kind: "group", isolated: true, knockout: false, alpha: 0.5,
+        blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }, { kind: "draw", runIndex: 1 }] }] }
+    });
+    const slotMeshes = slotScene.drawRuns.map((run, index) => {
+      const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.RawShaderMaterial({
+        uniforms: { uTestTag: { value: index } }
+      }));
+      mesh.userData.heprDrawRun = run;
+      return mesh;
+    });
+    const slotCompositor = new ThreePaintCompositor(backend), slotHost = makeRenderer(backend);
+    const slotDraws = () => slotHost.draws.filter(draw => draw.tag !== undefined).map(draw => draw.tag);
+    const drawSlots = project => {
+      slotHost.draws.length = 0;
+      slotCompositor.render(slotHost, slotScene, slotMeshes, 320, 240, () => true, project);
+      return slotDraws();
+    };
+    assert.deepEqual(drawSlots(boundedProject), [0, 1], "visible slots retain source order");
+    const visiblePassCount = slotHost.draws.length;
+    assert.deepEqual(drawSlots(bounds => ({ ...boundedProject(bounds), x: 10000 })), []);
+    assert.ok(slotHost.draws.length < visiblePassCount, "offscreen slots also drop their group's passes");
+    assert.deepEqual(drawSlots(boundedProject), [0, 1], "panning back restores every slot");
+    assert.deepEqual(drawSlots(() => null), [0, 1], "uncertain perspective projections keep paints");
+    assert.deepEqual(drawSlots(null), [0, 1], "hosts without a projector keep paints");
+    assert.deepEqual(drawSlots(() => ({ x: 321, y: 10, width: 1, height: 10 })), [0, 1],
+      "the two-pixel AA guard keeps paints just outside the viewport");
+    const unboundedScene = { ...slotScene, drawRuns: [slotScene.drawRuns[0],
+      { kind: "gradient-fill", first: 0, count: 1 }] };
+    slotHost.draws.length = 0;
+    slotCompositor.render(slotHost, unboundedScene, slotMeshes, 320, 240, () => true,
+      bounds => ({ ...boundedProject(bounds), x: 10000 }));
+    assert.deepEqual(slotDraws(), [1], "an unbounded gradient cannot be discarded by projection");
+    slotCompositor.dispose();
+    for (const mesh of slotMeshes) { mesh.geometry.dispose(); mesh.material.dispose(); }
+
+    testProxyReplacement(ThreePaintCompositor, backend);
+
     compositor.dispose(); stroke.dispose(); raster.dispose();
     assert.throws(() => raster.prepareRasterLayerUpdates(new Map()), /disposed/);
   }
+  const matrix = new THREE.Matrix4();
+  assert.deepEqual(projectThreePdfCompositeBounds({ minX: -0.5, minY: -0.25, maxX: 0.5, maxY: 0.25 }, matrix, 200, 100),
+    { x: 50, y: 37.5, width: 100, height: 25 }, "projection uses physical viewport pixels");
+  matrix.elements[14] = -0.5;
+  assert.ok(projectThreePdfCompositeBounds({ minX: -0.5, minY: -0.25, maxX: 0.5, maxY: 0.25 }, matrix, 200, 100),
+    "WebGL keeps bounded passes in the negative half of its valid NDC depth range");
+  assert.equal(projectThreePdfCompositeBounds({ minX: -0.5, minY: -0.25, maxX: 0.5, maxY: 0.25 }, matrix, 200, 100, "webgpu"), null,
+    "WebGPU retains a full pass for the same rectangle crossing its nearer depth plane");
+  matrix.elements[14] = 0;
+  matrix.elements[3] = 4;
+  assert.equal(projectThreePdfCompositeBounds({ minX: -1, minY: -1, maxX: 1, maxY: 1 }, matrix, 200, 100), null,
+    "a rectangle crossing the perspective near plane conservatively keeps a full pass");
   console.log("Three PDF compositor state, canonical subsets, shape coverage, pooling, and staged raster updates passed");
 } finally { hooks.deregister(); }
 
@@ -201,7 +391,7 @@ function makeRenderer(backend = "webgpu") {
     coordinateSystem: backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem,
     target: new THREE.RenderTarget(7, 9), viewport: new THREE.Vector4(3, 4, 17, 19),
     scissor: new THREE.Vector4(5, 6, 11, 13), scissorTest: true, clearColor: new THREE.Color(0.2, 0.3, 0.4),
-    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], targets: [], fail: false,
+    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], clears: [], targets: [], fail: false,
     getRenderTarget() { return this.target; },
     setRenderTarget(target, cube = 0, mip = 0) { this.target = target; this.cube = cube; this.mip = mip; this.targets.push(target); },
     getActiveCubeFace() { return this.cube; }, getActiveMipmapLevel() { return this.mip; },
@@ -209,7 +399,8 @@ function makeRenderer(backend = "webgpu") {
     getScissor(out) { return out.copy(this.scissor); }, setScissor(value) { this.scissor.copy(value); },
     getScissorTest() { return this.scissorTest; }, setScissorTest(value) { this.scissorTest = value; },
     getClearColor(out) { return out.copy(this.clearColor); }, getClearAlpha() { return this.clearAlpha; },
-    setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; }, clear() {},
+    setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; },
+    clear() { this.clears.push({ scissorTest: this.target.scissorTest, scissor: this.target.scissor.toArray() }); },
     render(scene, camera) {
       this.call = (this.call ?? 0) + 1;
       // Mirrors Renderer._updateCamera: the first render whose coordinate
@@ -222,11 +413,17 @@ function makeRenderer(backend = "webgpu") {
         camera.updateProjectionMatrix();
       }
       if (this.fail) throw new Error("synthetic draw failure");
+      assert.equal(this.scissorTest, this.target.scissorTest, "WebGPU also needs the renderer scissor-test flag");
       for (const mesh of scene.children) {
         const ids = mesh.geometry.getAttribute("aSegmentIndex");
         this.draws.push({ call: this.call,
+          tag: mesh.material.uniforms?.uTestTag?.value,
           ids: ids && Array.from({ length: mesh.geometry.instanceCount }, (_, i) => ids.getX(i)),
-          shape: mesh.material.uniforms?.uPdfShapeOnly?.value });
+          shape: mesh.material.uniforms?.uPdfShapeOnly?.value,
+          clips: mesh.geometry.getAttribute("aVectorClipIndex") && Array.from({ length: mesh.geometry.instanceCount },
+            (_, i) => mesh.geometry.getAttribute("aVectorClipIndex").getX(i)),
+          blending: mesh.material.blending, blendSrc: mesh.material.blendSrc, blendDst: mesh.material.blendDst,
+          scissor: this.target.scissor.toArray(), scissorTest: this.target.scissorTest });
       }
     }
   };
@@ -235,4 +432,91 @@ function snapshot(renderer) {
   return { target: renderer.target.uuid, viewport: renderer.viewport.toArray(), scissor: renderer.scissor.toArray(),
     scissorTest: renderer.scissorTest, color: renderer.clearColor.toArray(), alpha: renderer.clearAlpha,
     autoClear: renderer.autoClear, xr: renderer.xr.enabled, cube: renderer.cube, mip: renderer.mip };
+}
+
+// A zoom replan replaces the scheduled meshes but retains canonical paint IDs.
+// HEP scenes can have thousands of ranges behind only a few dozen meshes.
+function testProxyReplacement(ThreePaintCompositor, backend) {
+  const compositor = new ThreePaintCompositor(backend);
+  const batchCount = 16, rangesPerBatch = 256, rangeCount = batchCount * rangesPerBatch;
+  const material = new THREE.MeshBasicMaterial();
+  const geometries = [];
+  let sourceDisposals = 0, partialDisposals = 0;
+  const makeMesh = batch => {
+    const geometry = new THREE.InstancedBufferGeometry();
+    const ids = Float32Array.from({ length: rangesPerBatch }, (_, index) => index * batchCount + batch);
+    geometry.setAttribute("aSegmentIndex", new THREE.InstancedBufferAttribute(ids, 1));
+    geometry.instanceCount = ids.length;
+    geometry.addEventListener("dispose", () => sourceDisposals++);
+    geometries.push(geometry);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.userData.heprDrawRun = { kind: "stroke", first: batch, count: 1 };
+    mesh.userData.heprDrawRanges = Array.from(ids, first => ({ first, count: 1 }));
+    mesh.userData.heprInstanceAttribute = "aSegmentIndex";
+    return mesh;
+  };
+  const meshes = Array.from({ length: batchCount }, (_, index) => makeMesh(index));
+  const retained = new THREE.Mesh(new THREE.BufferGeometry(), material);
+  retained.userData.heprDrawRun = { kind: "raster", first: 0, count: 1 };
+  const background = new THREE.Mesh(new THREE.BufferGeometry(), material);
+  background.userData.heprPageBackground = true;
+  compositor.collect([...meshes, retained, background, meshes[0]]);
+  assert.equal(compositor.proxies.size, batchCount + 2, "repeated roots do not duplicate proxies");
+  const retainedProxy = compositor.proxies.get(retained);
+  const survivor = meshes[0], survivorProxy = compositor.proxies.get(survivor);
+  for (const mesh of meshes) {
+    const proxy = compositor.proxies.get(mesh);
+    const partial = compositor.geometryForRuns(proxy, [mesh.userData.heprDrawRun]);
+    assert.notEqual(partial, mesh.geometry);
+    partial.addEventListener("dispose", () => partialDisposals++);
+  }
+  // Count array work instead of imposing a machine-dependent time threshold.
+  // Repeated per-range splice calls move a quadratic number of indexed slots.
+  let indexOperations = 0;
+  const countIndex = key => {
+    if (typeof key === "string" && /^\d+$/.test(key)) {
+      assert.ok(++indexOperations <= rangeCount * 16,
+        "replacing batched proxies must not repeatedly scan or shift the range index");
+    }
+  };
+  for (const [kind, ranges] of compositor.runsByKind) {
+    compositor.runsByKind.set(kind, new Proxy(ranges, {
+      get(target, key, receiver) { countIndex(key); return Reflect.get(target, key, receiver); },
+      set(target, key, value, receiver) { countIndex(key); return Reflect.set(target, key, value, receiver); }
+    }));
+  }
+  const replacements = meshes.map((mesh, index) => index === 0 ? mesh : makeMesh(index));
+  // Reverse root traversal so sorting is necessary; the retained proxy and its
+  // subset buffer must survive even while neighbouring meshes are replaced.
+  const roots = [...replacements].reverse().concat(retained, background);
+  compositor.collect(roots);
+  assert.equal(compositor.proxies.size, batchCount + 2);
+  assert.equal(compositor.proxies.get(retained), retainedProxy);
+  assert.equal(compositor.proxies.get(survivor), survivorProxy);
+  assert.ok(survivorProxy.partialGeometry);
+  assert.equal(partialDisposals, batchCount - 1, "only removed proxies release their subset buffers");
+  assert.equal(sourceDisposals, 0, "compositor cleanup never disposes borrowed layer geometry");
+  for (const mesh of meshes.slice(1)) assert.equal(compositor.proxies.has(mesh), false);
+  const ranges = compositor.runsByKind.get("stroke");
+  assert.equal(ranges.length, rangeCount, "every canonical range is indexed exactly once");
+  for (let index = 0; index < rangeCount; index++) {
+    assert.equal(ranges[index].first, index, "canonical lookup order survives mesh replacement");
+    assert.equal(ranges[index].count, 1);
+    assert.equal(ranges[index].proxy.source, replacements[index % batchCount]);
+  }
+  assert.equal(compositor.runsByKind.get("raster")[0].proxy, retainedProxy);
+  compositor.collect(roots);
+  assert.equal(compositor.runsByKind.get("stroke"), ranges, "unchanged frames retain the range index");
+  assert.equal(partialDisposals, batchCount - 1);
+  compositor.collect([retained, background]);
+  assert.equal(compositor.runsByKind.get("stroke")?.length ?? 0, 0, "removal-only updates retire stale ranges");
+  assert.equal(partialDisposals, batchCount);
+  assert.equal(compositor.runsByKind.get("raster")[0].proxy, retainedProxy);
+  compositor.collect([]);
+  assert.equal(compositor.proxies.size, 0);
+  assert.ok([...compositor.runsByKind.values()].every(runs => runs.length === 0));
+  compositor.dispose();
+  assert.equal(sourceDisposals, 0);
+  for (const geometry of geometries) geometry.dispose();
+  retained.geometry.dispose(); background.geometry.dispose(); material.dispose();
 }

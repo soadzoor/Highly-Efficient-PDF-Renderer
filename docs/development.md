@@ -167,11 +167,53 @@ The draw list is reused until visibility, LOD, or the AA scale bucket changes.
 Stroke paint ranks are computed at scene setup. When selection changes, a
 hierarchical bitmask filters that static order without comparison sorting.
 Unchanged selected IDs reuse their ordered instance list.
-For an orthographic overview containing every LOD's geometry and every paint
-bound, panning reuses both the LOD selection and the source paint list. A changed
-LOD budget, partial visibility, or explicit reset resumes selection work;
-arbitrary local-to-clip projections keep their existing update path.
-Native WebGL/WebGPU ordered scenes use the existing soft 50,000-stroke LOD target;
-merging stays within each source paint, clip, and consecutive opaque color.
-Exact tile geometry returns when it fits the budget. The Draw counter reports
-selected strokes.
+For a planar overview containing every LOD's geometry and every paint bound,
+panning reuses both the LOD selection and the source paint list. Partial views
+can reuse a bounded offscreen margin. Three.js also reuses the selection for a
+front-facing PerspectiveCamera when clip W is constant over the PDF plane and
+valid local culling bounds are available. Camera-control roundoff is tolerated
+only when its clip-W contribution across the entire drawing is at most 1e-12
+of constant W. Selection reuse compares the normalized XY basis with its cached
+value; near/far clipping changes affect depth only and do not invalidate it.
+Unchanged selections update camera uniforms and paint schedules without copying
+or scanning stroke IDs. A changed LOD budget, exhausted margin, screen scale or
+orientation change, or explicit reset resumes selection work; tilted perspective
+views keep their existing update path. The headless Three camera regression uses
+real MapControls and the PDF object's frame preparation on both material backends.
+Native and Three WebGL/WebGPU share the soft 50,000-stroke LOD target. Divide
+that target among occupied visible source tiles; per-tile quality floors must
+not multiply it into hundreds of thousands of strokes. Large simple scenes
+build a conservative fine level followed by overview levels that omit tiny
+geometry and merge parallel lines at the level's tolerance. They retain source
+paint/clip identity and flush legacy color cohorts in order. Effect scenes keep
+the conservative hierarchy. The fine level preserves weighted subpixel coverage
+and remains preferred when it fits the tile budget.
+
+The normal zoom baseline uses a 1.25-pixel tolerance. Tile pressure may choose
+coarser levels up to a 5-pixel nominal overview tolerance, also past the first
+normal LOD threshold. There, exact geometry returns whenever it fits the tile
+budget, and is certain once no overview level fits the 5-pixel limit. Effect
+scenes have no overview levels and stay exact past the threshold. Visibility
+cache keys include both the normal baseline and the pressure limit, including
+when discarded build levels leave gaps in the tolerance sequence. Active-level
+stats mark overview approximations for the HUD.
+
+Tilted perspective views have no uniform pixel scale, so each tile derives its
+limits from the projection. Tiles are clipped to the frustum side planes with a
+16-pixel margin. Hidden tiles are skipped, and primitives in cut tiles are
+culled against the same planes. The plane's pixel Jacobian is N / W^2 with N
+affine, so the vertex maxima of |N| and 1 / W^2 bound its largest singular value
+over a clipped polygon. That bound, over the tile widened by a quarter tile,
+sets the tile's baseline and pressure limit. The budget is shared by screen-area
+magnification, |det H| / W^3 for the plane homography H, normalized over the
+visible area of occupied tiles, so nearer tiles receive more strokes. Merged
+lines can reach far past their tile into nearer, more magnified tiles. A tile
+may use a level only while everything that level lists in it stays within the
+5-pixel limit wherever visible; these per-level tile bounds are built on first
+tilted use. The HUD reports the nearest tile's baseline and the mean tile target.
+Tilted selections are recomputed every frame.
+Canonical PDF/HEP geometry is unchanged. Native translation-only pan caching
+also supports active LOD: refresh selects vectors for the complete cache bounds
+at the current zoom. Zooming still renders directly, and scene/style/layer
+changes invalidate cached pixels. The Draw counter reports selected vector
+representatives, including those represented by a reused native pan cache.

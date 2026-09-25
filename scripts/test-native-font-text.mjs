@@ -191,6 +191,7 @@ assert.deepEqual(compoundOutline.bounds, [50, 0, 150, 100]);
 assert.equal(compoundOutline.commands[0].x, 50);
 
 await testMissingFontResolution();
+await testFixedPitchInferenceFromWidths();
 await testStandard14AdvanceMetrics();
 
 console.log("native font/text tests passed");
@@ -331,6 +332,46 @@ async function testStandard14AdvanceMetrics() {
     widthsFor(explicitWidth, "C")[0],
     432,
     "/MissingWidth wins outside an explicitly supplied /Widths range"
+  );
+}
+
+async function testFixedPitchInferenceFromWidths() {
+  // Nonembedded monospace faces such as LucidaConsole often carry only the
+  // Nonsymbolic flag; their uniform /Widths must still request a mono substitute.
+  const styleFor = async (firstChar, advances) => {
+    const requests = [];
+    await parseNativePdfFont(new Map([
+      ["Type", name("Font")],
+      ["Subtype", name("TrueType")],
+      ["BaseFont", name("FixtureCode")],
+      ["FirstChar", firstChar],
+      ["Widths", advances],
+      ["Encoding", name("WinAnsiEncoding")],
+      ["FontDescriptor", new Map([["Flags", 32]])]
+    ]), resolver, {
+      missingFontResolver(request) {
+        requests.push(request);
+        return null;
+      }
+    });
+    assert.equal(requests.length, 1);
+    return requests[0].style;
+  };
+  // Codes 32 (space), 105 (i), and 109 (m) relative to FirstChar 32.
+  const spaceIM = (space, i, m) =>
+    Array.from({ length: 78 }, (_, index) => index === 0 ? space : index === 73 ? i : index === 77 ? m : 0);
+
+  assert.equal((await styleFor(32, spaceIM(603, 603, 603))).fixedPitch, true);
+  assert.equal((await styleFor(32, spaceIM(278, 222, 833))).fixedPitch, false);
+  assert.equal(
+    (await styleFor(32, spaceIM(603, 603, 0))).fixedPitch,
+    false,
+    "uniform advances need both a narrow and a wide glyph"
+  );
+  assert.equal(
+    (await styleFor(48, Array(10).fill(546))).fixedPitch,
+    false,
+    "tabular figures alone do not make a face fixed-pitch"
   );
 }
 

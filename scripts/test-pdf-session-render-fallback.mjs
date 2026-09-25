@@ -68,8 +68,10 @@ try {
   }
 
   for (const [name, style, reason] of [
-    ["glyph stroke edge budget", ".4 w [.01 .01] 0 d", "native-glyph-stroke-complexity"],
-    ["hairline glyph stroke", "0 w", "native-glyph-stroke"]
+    // Fine enough to outrun the per-glyph edge budget, which ordinary outlined
+    // display text sits just under. Stroke-only text has nothing else to show,
+    // so its page still falls back to a bounded raster.
+    ["glyph stroke edge budget", ".4 w [.01 .01] 0 d", "native-glyph-stroke-complexity"]
   ]) {
     const warnings = [];
     const session = await openPdf({ kind: "bytes", bytes: fixture({
@@ -140,8 +142,10 @@ try {
     await assert.rejects(bounded.compileVectorPage(0, { signal: AbortSignal.abort() }));
     await assert.rejects(bounded.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
       error => error.code === "resource-limit");
+    // Stencil image masks still need preparation; the message names which of
+    // the image features it is, since a soft mask no longer stops the lowering.
     await assert.rejects(bounded.compileVectorPage(0, { vectorFallback: "error" }),
-      error => /mask or codec/.test(error.message));
+      error => /stencil image mask requires preparation/.test(error.message));
   } finally { await bounded.close(); }
 
   for (const transfer of ["/TR 9 0 R", "/TR2 [9 0 R /Identity 9 0 R /Identity]", "/UCR2 9 0 R /BG2 9 0 R /HT << /HalftoneType 1 >>"]) {

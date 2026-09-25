@@ -1,12 +1,12 @@
 # HEP container version 1
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-version **1** wraps **scene schema version 8**, recorded in
+version **1** wraps **scene schema version 9**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
-document model is a different thing that happens to share a number; it is not
-this container's scene schema. Readers require scene v8; older HEP files must be
-regenerated from their original PDF. Container repacking preserves section bytes
-and does not upgrade a scene or restore omitted layers.
+document model is a different thing; it is not this container's scene schema.
+Readers require scene v9; older HEP files must be regenerated from their
+original PDF. Container repacking preserves section bytes and does not upgrade a
+scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
 There are no directory records, timestamps, encryption, ZIP structures, or
@@ -102,6 +102,7 @@ decimal text.
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
 | `drawRuns` | `{file, count}` | `geometry/draw-runs.varint` |
 | `paintGraph` | `{file, rootCount}` | `geometry/paint-graph.varint` |
+| `rasterLayers` (v9) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
 the signed mapping. `geometry/clip-paths.d512` holds `pathCount`, then per path
@@ -126,6 +127,66 @@ raster slot. A group uses bits 3-7 for isolated, knockout, bounds, soft mask and
 before its children. Group alpha, bounds and mask backdrop are float64 because a
 scene holds them at full precision; mask transfer samples are float32 because
 they are already a `Float32Array`.
+
+### Raster layers and atlases
+
+PDFs can paint thousands of tiny images; a map sliced into one-pixel scanlines is
+common. Scene v8 gave each image its own PNG section and JSON record, and on a
+one-page map with 5,184 scanline images that overhead alone made the HEP 1.8 times
+the size of its PDF. Scene v9 keeps one binary record per canonical layer, so
+layer indices, transforms, paint order, pages and opacity are unchanged, and packs
+the pixels of small layers into shared atlas images. A reader crops every atlas
+cell back into that layer's own straight-alpha RGBA; atlases never reach the GPU.
+
+`geometry/raster-layers.varint` holds `atlasCount`, then per atlas an encoding
+byte (0 raw RGBA8, 1 PNG), `width` and `height`. Then `layerCount` and per layer
+a flags byte (bits 0-1 storage: 0 raw RGBA8, 1 PNG, 2 WebP, 3 atlas cell; bit 2
+opacity present; bits 3-7 zero), `width`, `height`, and zigzag deltas of
+`paintOrder` and `pageIndex` against the previous layer. An atlas cell follows
+with its atlas index and zigzag `x` and `y`, relative to the previous cell's right
+edge and row when that cell is in the same atlas and to zero otherwise; the cell
+must lie inside its atlas. Layers with identical pixels may share one cell, so a
+writer stores a repeated logo, symbol or scanline once. A present opacity is a
+float64 in `[0,1]`. The section ends with all float32 matrices in
+component-major order (every `a`, then every `b`, ... every `f`), XOR-delta coded
+against the previous value and byte-shuffled like `text-instance-a`; its length
+must be exactly `24 * layerCount`.
+
+Section names derive from indices: a standalone layer is `raster/layer-N.rgba`,
+`.png` or `.webp` by its layer index, and an atlas is `raster/atlas-N.rgba` or
+`.png`. A writer puts a layer of at most 16,384 texels, and at most 2,048 texels
+on each side, into an atlas unless lossy WebP, plus about 64 bytes of per-section
+cost, needs at most half the bytes of its lossless form, as photographs do.
+Atlases are shelf-packed in layer order, at most 2,048 texels square, and stored
+losslessly, since lossy blocks would bleed between unrelated cells; a single
+candidate stays standalone. Readers accept up to 262,144 layers and 4,096 image
+sections, and count decoded atlases and cropped cells toward the texel budget.
+
+### Text glyph outlines and origins
+
+Scene v9 stores glyph outline segments in the `manifest.textGlyphSegments`
+section `{file, segmentCount, quantizationMin, quantizationMax}` naming
+`geometry/text-glyph-segments.cq16`, in place of the two `text-glyph-primitives`
+textures. A segment is `A = [x0, y0, cx, cy]`, `B = [x1, y1, type, 0]`; a line's
+control point is its end and `type` is 1 for a quadratic. Every point uses one
+uint16 range grid per axis, `[x, y]` in the manifest, so contours chain exactly.
+The section holds `segmentCount`, a quadratic bitset and a control bitset of
+`ceil(segmentCount / 8)` bytes each (bit `i & 7` of byte `i >> 3`), six column
+byte lengths and six zigzag columns: start x/y against the previous end, end x/y
+against the start, and control x/y against the rounded-down chord midpoint for
+segments with the control bit. Every quadratic has it; a line has it only when
+its control point differs from its end. `B.w` decodes as zero.
+
+`manifest.textInstances.positionsFile` names `geometry/text-instance-ef.pd512`,
+and `positionColumnByteLengths` lists three zigzag streams on the 1/512 grid:
+origin `f` deltas; then, for an origin on the previous origin's baseline (equal
+quantized `f`), its `e` step minus a predicted advance, wrapped to int32; and
+otherwise its plain `e` step. The prediction is the step seen most often so far
+after the same glyph index at the same `text-instance-a` matrix `a`, ties keeping
+the earlier leader, and zero when none was seen. Readers decode the glyph index
+column and `text-instance-a` first and update the prediction in the same order.
+That leaves kerning and word spacing: a 396-page manual's origins shrank by a
+third, and with chained outlines its HEP went from 123% to 90% of its PDF.
 
 ### Optional content (PDF layers)
 
@@ -213,7 +274,7 @@ payload, lengths count elements, and multibyte values are little-endian. Repeate
 references reuse one array. Metadata is limited to 16 MiB and the payload to
 768 MiB; array ranges and the complete retained-page schema are validated.
 Ordinary scenes omit these resources. Old embedded-PDF raster recovery is not
-part of scene v8.
+part of scene v8 or v9.
 
 ### Gradient meshes and image opacity
 
@@ -231,7 +292,7 @@ For analytic gradients, `gradientMetaA.z` uses bit 0 to disable start extension
 and bit 1 to disable end extension. `gradientMetaA.w` is zero for no background,
 otherwise packed RGB8 plus one; a PDF `sh` paint does not use shading background.
 Radial gradients may have intersecting circles and retain the highest eligible
-real root with nonnegative radius. Raster-layer metadata optionally adds
+real root with nonnegative radius. A raster-layer record optionally carries
 `opacity` in `[0,1]`; absence means one. Opacity does not duplicate or rewrite the
 shared RGBA image bytes.
 

@@ -153,7 +153,10 @@ try {
   const outlierRuntime = new VectorStrokeLodRuntime(dense, { tileGrid: lod.tileGrid, levels: outlierLevels, elapsedMs: 0 });
   outlierRuntime.updateForLocalUnitsPerPixel(10);
   assert(outlierRuntime.update(overview, viewport));
-  assert(outlierRuntime.update(overview, viewport), "bounds from every LOD level guard the overview cache");
+  assert.equal(outlierRuntime.fullViewBaselineLevelIndex, -1,
+    "bounds from every LOD level still prevent the unbounded full-overview shortcut");
+  assert.equal(outlierRuntime.update(overview, viewport), false,
+    "an unchanged partial view may reuse its bounded visibility guard");
 
   lod.updateForLocalUnitsPerPixel(0.01);
   lod.update({ cameraCenterX: 500, cameraCenterY: 500, zoom: 100 }, { width: 1000, height: 1000 });
@@ -368,12 +371,11 @@ try {
   textureRenderer.drawPageBackgrounds = () => {};
   textureRenderer.drawVisibleSegments = () => { textureRenderer.bindOrderedTexture(0, "stroke"); return 1; };
   textureRenderer.drawFilledPaths = () => textureRenderer.bindOrderedTexture(7, "fill");
-  textureRenderer.drawRasterLayerAtIndex = () => {
-    textureRenderer.gl.activeTexture(100); textureRenderer.gl.bindTexture(200, "raster");
-  };
+  textureRenderer.drawRasterLayerAtIndex = () => textureRenderer.bindOrderedTexture(0, "raster");
   const textureSequence = [[0, "stroke"], [7, "fill"], [0, "raster"], [0, "stroke"]];
   textureRenderer.drawSourceOrderedContent(100, 100, 50, 50, 1);
-  assert.deepEqual(textureCalls, textureSequence, "compatible batches reuse texture bindings; raster paint invalidates them");
+  assert.deepEqual(textureCalls, textureSequence,
+    "compatible batches reuse texture bindings; a raster paint's binding is tracked and then replaced");
   textureCalls.length = 0;
   textureRenderer.drawSourceOrderedContent(100, 100, 50, 50, 1);
   assert.deepEqual(textureCalls, textureSequence, "each frame starts with fresh binding state");

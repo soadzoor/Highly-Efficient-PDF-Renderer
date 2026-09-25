@@ -392,13 +392,25 @@ async function run() {
       { buildHep },
       { loadPdfSceneFromSource },
       { listSceneRasterLayers, loadSceneFromHep },
-      { composeVectorScenesInGrid }
+      { composeVectorScenesInGrid },
+      { SCENE_RASTER_LAYERS_PATH, decodeRasterLayerTable, rasterAtlasFile, rasterLayerFile }
     ] = await Promise.all([
       viteServer.ssrLoadModule("/src/index.ts"),
       viteServer.ssrLoadModule("/src/pdfObjectGenerator.ts"),
       viteServer.ssrLoadModule("/src/hep.ts"),
-      viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts")
+      viteServer.ssrLoadModule("/src/pdfVectorExtractor.ts"),
+      viteServer.ssrLoadModule("/src/hepRasterLayers.ts")
     ]);
+    const readRasterLayerTable = async (zip) => decodeRasterLayerTable(
+      await zip.file(SCENE_RASTER_LAYERS_PATH).async("uint8array"),
+      { maxLayers: 262_144, maxAtlases: 4_096, maxDimension: 16_384 }
+    );
+    const rasterPayloadFile = (table, index) => {
+      const layer = table.layers[index];
+      return layer.cell
+        ? rasterAtlasFile(layer.cell.atlas, table.atlases[layer.cell.atlas].encoding)
+        : rasterLayerFile(index, layer.storage);
+    };
     const pdfBytes = await readFile(fixturePath);
     const parsedPdf = await loadPdfSceneFromSource(pdfBytes, { sourceKind: "pdf" });
 
@@ -418,8 +430,8 @@ async function run() {
 
     const sourceZipArchive = await HepArchive.loadAsync(sourceZipBytes);
     const sourceManifest = JSON.parse(await sourceZipArchive.file("manifest.json").async("string"));
-    assert.equal(sourceManifest.formatVersion, 8, "new scenes use the v8 HEP schema");
-    for (const unsupportedVersion of [5, 6, 8]) {
+    assert.equal(sourceManifest.formatVersion, 9, "new scenes use the v9 HEP schema");
+    for (const unsupportedVersion of [5, 6, 7, 8]) {
       const incompatibleZip = await HepArchive.loadAsync(sourceZipBytes);
       const incompatibleManifest = {
         ...sourceManifest,
@@ -794,11 +806,10 @@ async function run() {
       compression: "store"
     });
     const shadingZip = await readZip(shadingZipBlob);
-    const shadingManifest = JSON.parse(await shadingZip.file("manifest.json").async("string"));
-    const encodedShading = shadingManifest.scene.rasterLayers[0];
-    assert.match(encodedShading.file, /\.(?:png|webp)$/);
-    assert.match(encodedShading.encoding, /^(?:png|webp)$/);
-    const encodedShadingBytes = await shadingZip.file(encodedShading.file).async("uint8array");
+    const shadingTable = await readRasterLayerTable(shadingZip);
+    const encodedShading = shadingTable.layers[0];
+    assert.match(encodedShading.storage, /^(?:png|webp)$/, "large layers keep their own encoded section");
+    const encodedShadingBytes = await shadingZip.file(rasterPayloadFile(shadingTable, 0)).async("uint8array");
     assert.ok(encodedShadingBytes.length < shadingLayers[0].data.length, "Node HEP builds must compress raster layers");
     const encodedShadingRoundTrip = await loadSceneFromHep(await shadingZipBlob.arrayBuffer());
     const decodedShadingLayers = listSceneRasterLayers(encodedShadingRoundTrip);
@@ -1016,7 +1027,7 @@ async function run() {
     });
     const photoOverlayZip = await readZip(photoOverlayZipBlob);
     const photoOverlayManifest = JSON.parse(await photoOverlayZip.file("manifest.json").async("string"));
-    assert.equal(photoOverlayManifest.formatVersion, 8);
+    assert.equal(photoOverlayManifest.formatVersion, 9);
     assert.equal(photoOverlayManifest.scene.gradientCount, 1);
     assert.equal(photoOverlayManifest.scene.gradientFillPathCount, 1);
     assert.equal(photoOverlayManifest.scene.gradientFillSegmentCount, 16);
@@ -1096,37 +1107,74 @@ async function run() {
       );
     }
 
-    for (const missingField of ["paintOrder", "pageIndex"]) {
-      const incompleteRasterZip = await readZip(photoOverlayZipBlob);
-      const incompleteRasterManifest = JSON.parse(
-        await incompleteRasterZip.file("manifest.json").async("string")
-      );
-      delete incompleteRasterManifest.scene.rasterLayers[0][missingField];
-      incompleteRasterZip.file("manifest.json", JSON.stringify(incompleteRasterManifest));
-      const incompleteRasterBytes = await incompleteRasterZip.generateAsync({
-        type: "arraybuffer",
-        compression: "STORE"
-      });
+    const photoOverlayTableBytes = await photoOverlayZip.file(SCENE_RASTER_LAYERS_PATH).async("uint8array");
+    let firstLayerFlagsOffset = 0;
+    {
+      const readVarint = () => {
+        let value = 0;
+        for (let shift = 0; ; shift += 7) {
+          const byte = photoOverlayTableBytes[firstLayerFlagsOffset++];
+          value += (byte & 127) * 2 ** shift;
+          if (!(byte & 128)) return value;
+        }
+      };
+      const atlasCount = readVarint();
+      for (let atlas = 0; atlas < atlasCount; atlas += 1) {
+        firstLayerFlagsOffset += 1;
+        readVarint();
+        readVarint();
+      }
+      assert.ok(readVarint() > 0, "the photo overlay exports raster layers");
+    }
+    const corruptRasterTables = [
+      {
+        label: "reserved flag bits",
+        bytes: (() => {
+          const bytes = photoOverlayTableBytes.slice();
+          bytes[firstLayerFlagsOffset] |= 0x80;
+          return bytes;
+        })(),
+        expectedError: /layer 0 has reserved flag bits/
+      },
+      {
+        label: "truncated matrices",
+        bytes: photoOverlayTableBytes.slice(0, -1),
+        expectedError: /matrix data does not fill the section/
+      }
+    ];
+    for (const corruptCase of corruptRasterTables) {
+      const corruptRasterZip = await readZip(photoOverlayZipBlob);
+      corruptRasterZip.file(SCENE_RASTER_LAYERS_PATH, corruptCase.bytes);
       await assert.rejects(
-        loadSceneFromHep(incompleteRasterBytes),
-        /Raster layer 0 has incomplete or invalid v7 metadata/,
-        `missing raster ${missingField} must be rejected`
+        loadSceneFromHep(await corruptRasterZip.generateAsync({ type: "arraybuffer", compression: "STORE" })),
+        corruptCase.expectedError,
+        `raster layer table with ${corruptCase.label} must be rejected`
       );
     }
 
-    const missingRasterPayloadZip = await readZip(photoOverlayZipBlob);
-    const missingRasterPayloadManifest = JSON.parse(
-      await missingRasterPayloadZip.file("manifest.json").async("string")
+    const miscountedRasterZip = await readZip(photoOverlayZipBlob);
+    miscountedRasterZip.file("manifest.json", JSON.stringify({
+      ...photoOverlayManifest,
+      scene: {
+        ...photoOverlayManifest.scene,
+        rasterLayers: { ...photoOverlayManifest.scene.rasterLayers, count: photoOverlayManifest.scene.rasterLayers.count + 1 }
+      }
+    }));
+    await assert.rejects(
+      loadSceneFromHep(await miscountedRasterZip.generateAsync({ type: "arraybuffer", compression: "STORE" })),
+      /Scene raster layers do not match their manifest entry/,
+      "a raster layer count that disagrees with the table must be rejected"
     );
-    const missingRasterPayloadPath = missingRasterPayloadManifest.scene.rasterLayers[0].file;
-    missingRasterPayloadZip.remove(missingRasterPayloadPath);
+
+    const missingRasterPayloadZip = await readZip(photoOverlayZipBlob);
+    missingRasterPayloadZip.remove(rasterPayloadFile(await readRasterLayerTable(missingRasterPayloadZip), 0));
     const missingRasterPayloadBytes = await missingRasterPayloadZip.generateAsync({
       type: "arraybuffer",
       compression: "STORE"
     });
     await assert.rejects(
       loadSceneFromHep(missingRasterPayloadBytes),
-      /missing raster layer 0/,
+      /missing raster (?:layer|atlas) 0/,
       "missing raster payload must be rejected"
     );
 

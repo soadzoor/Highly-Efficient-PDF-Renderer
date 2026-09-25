@@ -21,9 +21,9 @@ try {
   assert.equal(culler.select(overview, 0.01), scene.drawRuns, "full visibility returns the immutable source list");
   assert.equal(culler.selected, null);
   const visible = culler.visible;
-  visible.push = () => { throw new Error("overview must not scan runs into a new visible list"); };
+  culler.visible = Object.freeze([]);
   assert.equal(culler.select({ ...overview, minX: -999 }, 0.01), scene.drawRuns);
-  delete visible.push;
+  culler.visible = visible;
   assert.deepEqual([...culler.select(view, 0.01)], [scene.drawRuns[0], scene.drawRuns[2], scene.drawRuns[4]],
     "panning into a detail resumes per-run culling");
   const wide = { ...scene, drawRuns: [scene.drawRuns[0]], styles: Float32Array.of(50, 0, 0, 0, 1, 0, 0, 0) };
@@ -38,6 +38,39 @@ try {
   assert.equal(new VectorDrawRunCuller(emptyClip).select(view, 1).length, 0);
   assert.equal(new VectorDrawRunCuller(emptyClip).select(overview, 1).length, 0,
     "full-scene reuse must not restore empty clipped paints");
+  const mixedClip = { ...scene, drawRuns: [scene.drawRuns[0], { ...scene.drawRuns[1], clipIndex: 0 }],
+    clipPaths: emptyClip.clipPaths };
+  const mixedCuller = new VectorDrawRunCuller(mixedClip);
+  const mixedOverview = mixedCuller.select(overview, 0.2);
+  assert.deepEqual([...mixedOverview], [mixedClip.drawRuns[0]]);
+  assert.deepEqual([...mixedCuller.selected], [1, 0]);
+  const getBounds = mixedCuller.getBounds.bind(mixedCuller);
+  let boundsVisits = 0;
+  mixedCuller.getBounds = (...args) => { boundsVisits++; return getBounds(...args); };
+  const mixedDetailResult = mixedCuller.visible;
+  mixedCuller.visible = Object.freeze([]);
+  assert.equal(mixedCuller.select(overview, 0.24), mixedOverview,
+    "zooming inside a conservative padding bucket reuses the overview excluding empty clips");
+  assert.equal(boundsVisits, 0, "animated zoom does not rebuild every paint bound");
+  assert.deepEqual([...mixedCuller.selected], [1, 0]);
+  mixedCuller.visible = mixedDetailResult;
+  assert.equal(mixedCuller.select({ minX: 900, minY: 900, maxX: 910, maxY: 910 }, 0.22).length, 0);
+  assert.deepEqual([...mixedCuller.selected], [0, 0]);
+  assert.equal(mixedCuller.select(overview, 0.23), mixedOverview);
+  assert.deepEqual([...mixedCuller.selected], [1, 0],
+    "detail culling cannot overwrite the cached overview membership");
+  assert.deepEqual([...mixedCuller.select(overview, 0.26)], [mixedClip.drawRuns[0]]);
+  assert.equal(boundsVisits, 2, "a larger padding bucket recomputes both paint bounds");
+
+  const nearClip = { ...hairline, drawRuns: [{ ...hairline.drawRuns[0], clipIndex: 0 }],
+    clipPaths: [{ parent: -1, fillRule: 0, edges: Float32Array.of(0,2,10,2,10,3,0,3) }] };
+  const nearClipCuller = new VectorDrawRunCuller(nearClip);
+  assert.equal(nearClipCuller.select(overview, 0.1).length, 0);
+  assert.equal(nearClipCuller.select(overview, 1).length, 1,
+    "a larger screen-space margin may restore a hairline previously outside its clip");
+  assert.equal(nearClipCuller.selected, null);
+  assert.equal(nearClipCuller.select(overview, 0.1).length, 0,
+    "zooming back refreshes the nonempty overview list too");
   assert.deepEqual(vectorViewBounds(20, 40, 5, 6, 2), { minX: 0, minY: -4, maxX: 10, maxY: 16 });
 
   // Production submission paths use the filtered list, in its original order.

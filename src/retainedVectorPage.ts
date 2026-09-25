@@ -1,5 +1,5 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
+import { HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, HEPR_STROKE_FLAG, expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
   type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionState } from "./heprDisplayExecutor";
 import { visitHeprPath } from "./heprPathGeometry";
@@ -13,7 +13,8 @@ import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
 import { NativeVectorClipBuilder } from "./pdf/nativeVectorClips";
 import { emitCubicAsQuadratics } from "./pdf/nativeVectorPage";
-import { buildNativeGlyphStroke } from "./pdf/nativeGlyphStroke";
+import { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey, type NativeGlyphStrokeStyle } from "./pdf/nativeGlyphStroke";
+import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
 import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
 import type { DensePdfTextClip } from "./pdf/nativeContentCompiler";
 import { PdfError } from "./pdf/nativeTypes";
@@ -31,6 +32,29 @@ export interface RetainedVectorPageOptions {
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
+/**
+ * Folds an image's /SMask into its alpha, in place, over straight RGBA8.
+ *
+ * The mask's gray samples are the image's alpha, and the two are independent
+ * rasters that need not share a size, so the mask is point-sampled across the
+ * base's grid. Any alpha the base already carries is kept: the two multiply,
+ * as a mask and a source-alpha do when both apply.
+ */
+function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
+  mask: Uint8Array, maskWidth: number, maskHeight: number, signal?: AbortSignal): Uint8Array {
+  if (maskWidth <= 0 || maskHeight <= 0 || width <= 0 || height <= 0) return base;
+  for (let y = 0; y < height; y++) {
+    signal?.throwIfAborted();
+    const row = Math.min(maskHeight - 1, Math.floor(y * maskHeight / height)) * maskWidth;
+    for (let x = 0; x < width; x++) {
+      const column = Math.min(maskWidth - 1, Math.floor(x * maskWidth / width));
+      const offset = (y * width + x) * 4;
+      base[offset + 3] = Math.round(base[offset + 3] * mask[(row + column) * 4] / 255);
+    }
+  }
+  return base;
+}
+
 /** Lower self-contained reusable PDF programs into canonical geometry and a retained paint graph. */
 export async function lowerRetainedPageToVectorScene(source: HeprPageData, options: RetainedVectorPageOptions): Promise<VectorScene> {
   const { signal } = options;
@@ -46,6 +70,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   scene.bounds = scene.pageBounds = { minX: 0, minY: 0, maxX: width, maxY: height };
   scene.pageRects = new Float32Array([0, 0, width, height]); scene.pageTextRanges = new Uint32Array([0, 0]);
   scene.drawRuns = []; scene.paintGraph = { roots: [] };
+  const runColors: (Color | undefined)[] = [];
   const conditions: OptionalContentCondition[] = [...(options.optionalContent?.conditions ?? [])];
   const conditionKeys = new Map<string, number>();
   const fillsA: number[] = [], fillsB: number[] = [], fillsC: number[] = [], segmentsA: number[] = [], segmentsB: number[] = [];
@@ -53,7 +78,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const endpoints: number[] = [], primitiveMeta: number[] = [], primitiveBounds: number[] = [], styles: number[] = [];
   const clipBuilder = new NativeVectorClipBuilder(), clipCache = new WeakMap<HeprExecutionClipScope, DensePdfTextClip>();
   const glyphConditions = new Int32Array(page.stores.glyphs.glyphIds.length).fill(-1);
+  let reportedGlyphStrokeComplexity = false, reportedHairlineCurveApproximation = false, reportedHairlineStyleApproximation = false;
   const stack: ScenePaintNode[][] = [scene.paintGraph.roots];
+  const knockoutScopes = new WeakSet<ScenePaintNode[]>();
+  const groupScopes = new WeakMap<ScenePaintNode[], ScenePaintGroup>();
   const masks = new WeakMap<HeprPageData, Map<number, { children: ScenePaintNode[]; backdrop?: [number, number, number] }>>();
   const functions = new HeprFunctionEvaluator(page.stores.functions);
   const colors = new HeprColorEvaluator(page.stores.colors,
@@ -61,6 +89,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const gradients: GradientSceneData[] = [];
   const imagePixels = new Map<number, Uint8Array>();
   const glyphAtlas = new Map<string, number>();
+  const hairlineAtlas = new Map<string, ReturnType<typeof buildNativeGlyphHairline>>();
   let gradientSegments = 0, meshVertices = 0, meshIndices = 0;
   let count = 0, coordinates = 0, cells = 0, lastYield = performance.now();
   const fail = (message: string): never => { throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason: "vector-retained-program" } }); };
@@ -169,8 +198,27 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     }
     if (result) clipCache.set(scope, result); return result;
   };
-  const appendRun = (kind: "fill" | "stroke" | "raster" | "text" | "gradient-fill", first: number, amount: number, clip: DensePdfTextClip | null, condition?: number): void => {
-    const runIndex = scene.drawRuns!.length, clipIndex = clipBuilder.add(clip, signal);
+  const appendRun = (kind: "fill" | "stroke" | "raster" | "text" | "gradient-fill", first: number, amount: number, clip: DensePdfTextClip | null, condition?: number, paintColor?: Color): void => {
+    const clipIndex = clipBuilder.add(clip, signal);
+    const siblings = stack.at(-1)!, previousNode = siblings.at(-1);
+    const previous = previousNode?.kind === "draw" ? scene.drawRuns![previousNode.runIndex] : undefined;
+    const previousColor = previousNode?.kind === "draw" ? runColors[previousNode.runIndex] : undefined;
+    // Keep RGB boundaries visible to the scheduler: a mixed-color run hides
+    // otherwise commuting paints behind one large, inseparable overlap bound.
+    // Alpha stays per primitive; equal RGB commutes at every coverage/opacity.
+    const sameColor = paintColor && previousColor &&
+      Math.fround(paintColor[0]) === Math.fround(previousColor[0]) &&
+      Math.fround(paintColor[1]) === Math.fround(previousColor[1]) &&
+      Math.fround(paintColor[2]) === Math.fround(previousColor[2]);
+    // Consecutive paints within one compositing scope may share a draw without
+    // moving any paint across a clip, layer, or transparency boundary.
+    if (sameColor && (kind === "stroke" || kind === "fill" || kind === "text") && !knockoutScopes.has(siblings) &&
+        previous?.kind === kind && previous.first + previous.count === first &&
+        previous.clipIndex === clipIndex && previous.optionalContent === condition) {
+      previous.count += amount; return;
+    }
+    const runIndex = scene.drawRuns!.length;
+    runColors.push(paintColor);
     scene.drawRuns!.push({ kind, first, count: amount, ...(clipIndex === undefined ? {} : { clipIndex }), ...(condition === undefined ? {} : { optionalContent: condition }) });
     stack.at(-1)!.push({ kind: "draw", runIndex });
   };
@@ -179,7 +227,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     const index = fillsA.length / 4, first = segmentsA.length / 4;
     append(segmentsA, g.a); append(segmentsB, g.b);
     fillsA.push(first, g.a.length / 4, g.bounds.minX, g.bounds.minY); fillsB.push(g.bounds.maxX, g.bounds.maxY, rgba[0], rgba[1]); fillsC.push(rule, 0, rgba[2], rgba[3]);
-    appendRun("fill", index, 1, clip, condition);
+    appendRun("fill", index, 1, clip, condition, rgba);
   };
   /**
    * Glyph outlines are shared. An atlas entry holds the outline with its 2x2
@@ -190,15 +238,12 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
    * coordinates differ. The 2x2 stays in the key so cubic flattening keeps the
    * absolute tolerance it already resolved at, never a font-unit scale.
    */
-  const text = (glyph: number, indices: readonly number[], placement: PdfMatrix, rgba: Color,
-    clip: DensePdfTextClip | null, condition?: number): void => {
-    const { fontIndices, glyphIds } = page.stores.glyphs;
-    const [a, b, c, d, e, f] = placement;
-    const key = `${fontIndices[glyph]}:${glyphIds[glyph]}:${a}:${b}:${c}:${d}`;
+  const textGeometry = (key: string, placement: PdfMatrix, rgba: Color, clip: DensePdfTextClip | null,
+    condition: number | undefined, build: () => Geometry | null): void => {
     let atlas = glyphAtlas.get(key);
     if (atlas === undefined) {
-      const g = geometry(indices, [a, b, c, d, 0, 0]);
-      if (!g.a.length) { glyphAtlas.set(key, -1); return; }
+      const g = build();
+      if (!g?.a.length) { glyphAtlas.set(key, -1); return; }
       budget(g.a.length + g.b.length);
       atlas = glyphMetaA.length / 4;
       const first = glyphA.length / 4;
@@ -210,18 +255,132 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       budget(0);
     }
     const index = textA.length / 4;
-    textA.push(1, 0, 0, 1); textB.push(e, f, atlas, 0); textC.push(...rgba);
-    appendRun("text", index, 1, clip, condition);
+    textA.push(1, 0, 0, 1); textB.push(placement[4], placement[5], atlas, 0); textC.push(...rgba);
+    appendRun("text", index, 1, clip, condition, rgba);
   };
-  const strokeGeometry = (indices: readonly number[], matrix: PdfMatrix, style: number): Geometry | null => {
+  const text = (glyph: number, indices: readonly number[], placement: PdfMatrix, rgba: Color,
+    clip: DensePdfTextClip | null, condition?: number): void => {
+    const { fontIndices, glyphIds } = page.stores.glyphs;
+    const [a, b, c, d] = placement;
+    textGeometry(`fill:${fontIndices[glyph]}:${glyphIds[glyph]}:${a}:${b}:${c}:${d}`, placement, rgba, clip, condition,
+      () => geometry(indices, [a, b, c, d, 0, 0]));
+  };
+  const strokeStyle = (index: number, matrix: PdfMatrix): NativeGlyphStrokeStyle => {
     const strokes = page.stores.strokes;
-    const g = buildNativeGlyphStroke(pathCommands(indices), matrix, { transform: matrix, width: strokes.lineWidths[style], lineCap: strokes.lineCaps[style] as 0 | 1 | 2,
-      lineJoin: strokes.lineJoins[style] as 0 | 1 | 2, miterLimit: strokes.miterLimits[style], dashArray: Array.from(strokes.dashValues.subarray(strokes.dashOffsets[style], strokes.dashOffsets[style + 1])), dashPhase: strokes.dashPhases[style] }, signal);
+    return { transform: matrix, width: strokes.lineWidths[index], lineCap: strokes.lineCaps[index] as 0 | 1 | 2,
+      lineJoin: strokes.lineJoins[index] as 0 | 1 | 2, miterLimit: strokes.miterLimits[index],
+      dashArray: Array.from(strokes.dashValues.subarray(strokes.dashOffsets[index], strokes.dashOffsets[index + 1])),
+      dashPhase: strokes.dashPhases[index] };
+  };
+  const packedStroke = (g: NonNullable<ReturnType<typeof buildNativeGlyphHairline>>, placement: ArrayLike<number>,
+    rgba: Color, clip: DensePdfTextClip | null, condition?: number, halfWidth = 0): void => {
+    // Opaque contour segments form a union in the isolated surface; apply the
+    // glyph/path opacity once so adjacent segments do not darken their joins.
+    const translucent = rgba[3] < 1;
+    if (translucent) {
+      const group: ScenePaintGroup = { kind: "group", children: [], alpha: rgba[3], isolated: true,
+        knockout: false, blendMode: "Normal", optionalContent: condition };
+      stack.at(-1)!.push(group); stack.push(group.children);
+    }
+    const first = endpoints.length / 4, x = placement[4], y = placement[5];
+    for (let offset = 0; offset < g.endpoints.length; offset += 4) {
+      budget(16);
+      endpoints.push(g.endpoints[offset] + x, g.endpoints[offset + 1] + y, g.endpoints[offset + 2] + x, g.endpoints[offset + 3] + y);
+      const flags = Math.floor(g.primitiveMeta[offset + 3] / 2);
+      primitiveMeta.push(g.primitiveMeta[offset] + x, g.primitiveMeta[offset + 1] + y, g.primitiveMeta[offset + 2],
+        (halfWidth > 0 ? flags & ~1 : flags) * 2 + 1);
+      primitiveBounds.push(g.primitiveBounds[offset] + x, g.primitiveBounds[offset + 1] + y, g.primitiveBounds[offset + 2] + x, g.primitiveBounds[offset + 3] + y);
+      styles.push(halfWidth, rgba[0], rgba[1], rgba[2]);
+    }
+    scene.maxHalfWidth = Math.max(scene.maxHalfWidth, halfWidth);
+    appendRun("stroke", first, g.endpoints.length / 4, clip, condition, rgba);
+    if (translucent) stack.pop();
+    if (g.approximated && !reportedHairlineCurveApproximation) {
+      reportedHairlineCurveApproximation = true;
+      options.onDiagnostic?.({ code: "glyph-stroke-curve-approximation", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+        message: "Stroke curves use vector centerlines with a maximum 0.01-point subdivision tolerance." });
+    }
+    if (g.approximateStyle && !reportedHairlineStyleApproximation) {
+      reportedHairlineStyleApproximation = true;
+      options.onDiagnostic?.({ code: "glyph-hairline-style-approximation", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+        message: "Hairline joins and square caps use rounded device-pixel coverage; their contours remain vector." });
+    }
+  };
+  const omitStrokeError = (error: unknown, omittable: boolean): void => {
+    if (!omittable || !(error instanceof PdfError) || error.details?.reason !== "native-glyph-stroke-complexity") throw error;
+    if (!reportedGlyphStrokeComplexity) {
+      reportedGlyphStrokeComplexity = true;
+      options.onDiagnostic?.({ code: "glyph-stroke-complexity", severity: "warning",
+        message: "A glyph outline was too intricate to stroke and is omitted; the rest of the page stays vector.",
+        details: { reason: "native-glyph-stroke-complexity" } });
+    }
+  };
+  /**
+   * `omittable` says the shape survives without this outline, because a fill
+   * paints it too. Only then may an outline too intricate to build be left out;
+   * a shape that has nothing else would simply vanish, so its page falls back
+   * to a bounded raster instead, where the ink is at least still there.
+   */
+  const strokeGeometry = (indices: readonly number[], matrix: PdfMatrix, style: number,
+    omittable = false): Geometry | null => {
+    let g;
+    try {
+      g = buildNativeGlyphStroke(pathCommands(indices), matrix, strokeStyle(style, matrix), signal);
+    } catch (error) {
+      omitStrokeError(error, omittable);
+      return null;
+    }
     return g ? { a: g.segmentsA, b: g.segmentsB, bounds: g.bounds } : null;
   };
-  const strokePath = (indices: readonly number[], matrix: PdfMatrix, style: number, rgba: Color, clip: DensePdfTextClip | null, condition?: number): void => {
-    const g = strokeGeometry(indices, matrix, style);
+  const strokePath = (indices: readonly number[], matrix: PdfMatrix, style: number, rgba: Color,
+    clip: DensePdfTextClip | null, condition?: number, omittable = false): void => {
+    if (page.stores.strokes.lineWidths[style] === 0) {
+      if (rgba[3] <= 1e-3) return;
+      const g = buildNativeGlyphHairline(pathCommands(indices), matrix, strokeStyle(style, matrix), signal);
+      if (g) packedStroke(g, IDENTITY, rgba, clip, condition);
+      return;
+    }
+    // Preserve the centerline when the packed renderer can represent the pen
+    // exactly. Expanding a thin line to a fill is both expensive and unstable
+    // under minification because its two edges can fall between pixel centers.
+    const stroke = strokeStyle(style, matrix), strokes = page.stores.strokes;
+    const scaleX = Math.hypot(matrix[0], matrix[1]), scaleY = Math.hypot(matrix[2], matrix[3]);
+    const uniform = scaleX > 0 && scaleY > 0 && Math.abs(scaleX - scaleY) <= 1e-6 * Math.max(scaleX, scaleY) &&
+      Math.abs(matrix[0] * matrix[2] + matrix[1] * matrix[3]) <= scaleX * scaleY * 1e-6;
+    if (uniform && stroke.dashArray.length === 0 && (strokes.flags[style] & HEPR_STROKE_FLAG.StrokeAdjust) === 0) {
+      const commands = pathCommands(indices);
+      const singleLine = commands.length === 2 && commands[0].kind === "move" && commands[1].kind === "line";
+      if (stroke.lineCap === 1 && (stroke.lineJoin === 1 || singleLine)) {
+        if (rgba[3] <= 1e-3) return;
+        const g = buildNativeGlyphHairline(commands, matrix, { ...stroke, width: 0 }, signal);
+        if (g) packedStroke(g, IDENTITY, rgba, clip, condition, stroke.width * scaleX * 0.5);
+        return;
+      }
+    }
+    const g = strokeGeometry(indices, matrix, style, omittable);
     if (g) fill(g, rgba, 0, clip, condition);
+  };
+  const strokeText = (glyph: number, indices: readonly number[], placement: PdfMatrix, pen: PdfMatrix,
+    style: number, rgba: Color, clip: DensePdfTextClip | null, condition: number | undefined, omittable: boolean): void => {
+    const stroke = strokeStyle(style, pen), { fontIndices, glyphIds } = page.stores.glyphs;
+    const key = `stroke:${nativeGlyphStrokeCacheKey(fontIndices[glyph], glyphIds[glyph], placement, stroke)}`;
+    if (stroke.width === 0) {
+      if (rgba[3] <= 1e-3) return;
+      let g = hairlineAtlas.get(key);
+      if (g === undefined) {
+        g = buildNativeGlyphHairline(pathCommands(indices), [placement[0], placement[1], placement[2], placement[3], 0, 0], stroke, signal);
+        hairlineAtlas.set(key, g);
+      }
+      if (!g) return;
+      packedStroke(g, placement, rgba, clip, condition);
+      return;
+    }
+    try {
+      textGeometry(key, placement, rgba, clip, condition, () => {
+        const g = buildNativeGlyphStrokeAtOrigin(pathCommands(indices), placement, stroke, signal);
+        return g ? { a: g.segmentsA, b: g.segmentsB, bounds: g.bounds } : null;
+      });
+    } catch (error) { omitStrokeError(error, omittable); }
   };
   const gradient = async (index: number, matrix: PdfMatrix, alpha: number, clip: DensePdfTextClip | null,
     condition?: number, shape?: Geometry, paintBackground = false): Promise<void> => {
@@ -264,6 +423,20 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     gradients.push(data); appendRun("gradient-fill", paint, 1, clip, condition);
     if (grouped) stack.pop();
   };
+  const clipBoundsCache = new WeakMap<DensePdfTextClip, Bounds | null>();
+  const clipBounds = (clip: DensePdfTextClip): Bounds | null => {
+    if (clipBoundsCache.has(clip)) return clipBoundsCache.get(clip)!;
+    const bounds = emptyBounds(), { data, transform: matrix } = clip.path;
+    for (let offset = 0; offset < data.length;) {
+      const op = data[offset++], size = op === 0 || op === 1 ? 2 : op === 2 ? 6 : op === 3 ? 4 : op === 4 ? 0 : -1;
+      if (size < 0 || offset + size > data.length) { clipBoundsCache.set(clip, null); return null; }
+      for (let i = 0; i < size; i += 2) include(bounds, ...point(matrix, data[offset + i], data[offset + i + 1]));
+      offset += size;
+    }
+    // Bezier control hulls give conservative bounds, including for curved/text clips.
+    const result = Object.values(bounds).every(Number.isFinite) ? bounds : null;
+    clipBoundsCache.set(clip, result); return result;
+  };
   const patternActive = new Set<number>();
   let draw: (execution: HeprDrawRunExecution, inheritedClip?: DensePdfTextClip | null, inheritedCondition?: number) => Promise<void>;
   const pattern = async (paint: number, g: Geometry, matrix: PdfMatrix, clip: DensePdfTextClip | null, rule: number, condition?: number): Promise<void> => {
@@ -278,7 +451,15 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     const toScene = multiplyHeprMatrices(matrix, resolved.patternToOwnerTransform), [a, b, c, d, e, f] = toScene, det = a * d - b * c;
     if (Math.abs(det) < 1e-12) return fail("singular pattern transform.");
     const inverse: PdfMatrix = [d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det];
-    const bnd = g.bounds, points = [point(inverse, bnd.minX, bnd.minY), point(inverse, bnd.maxX, bnd.minY), point(inverse, bnd.minX, bnd.maxY), point(inverse, bnd.maxX, bnd.maxY)];
+    const bnd = { minX: Math.max(g.bounds.minX, scene.pageBounds.minX), minY: Math.max(g.bounds.minY, scene.pageBounds.minY),
+      maxX: Math.min(g.bounds.maxX, scene.pageBounds.maxX), maxY: Math.min(g.bounds.maxY, scene.pageBounds.maxY) };
+    for (let scope = clip; scope; scope = scope.parent) {
+      const bounds = clipBounds(scope);
+      if (bounds) { bnd.minX = Math.max(bnd.minX, bounds.minX); bnd.minY = Math.max(bnd.minY, bounds.minY);
+        bnd.maxX = Math.min(bnd.maxX, bounds.maxX); bnd.maxY = Math.min(bnd.maxY, bounds.maxY); }
+    }
+    if (bnd.maxX <= bnd.minX || bnd.maxY <= bnd.minY) return;
+    const points = [point(inverse, bnd.minX, bnd.minY), point(inverse, bnd.maxX, bnd.minY), point(inverse, bnd.minX, bnd.maxY), point(inverse, bnd.maxX, bnd.maxY)];
     const local = { minX: Math.min(...points.map(p => p[0])), maxX: Math.max(...points.map(p => p[0])), minY: Math.min(...points.map(p => p[1])), maxY: Math.max(...points.map(p => p[1])) };
     const patterns = page.stores.patterns, p = resolved.patternIndex, bounds = patterns.bounds.subarray(p * 4, p * 4 + 4), xs = patterns.xSteps[p], ys = patterns.ySteps[p];
     const range = (lo: number, hi: number, c0: number, c1: number, step: number): [number, number] => {
@@ -373,21 +554,43 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         glyphConditions[glyph] = condition ?? -1;
         const indices = glyphPaths(glyph), local = multiplyHeprMatrices(matrix, transform(page.stores.glyphs.transformIndices[glyph]));
         if ([0, 2, 4, 6].includes(command.renderingMode) && command.fillPaintIndex >= 0) text(glyph, indices, local, color(command.fillPaintIndex, execution.state), clip, condition);
-        if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) strokePath(indices, local, command.strokeStyleIndex, color(command.strokePaintIndex, execution.state), clip, condition);
+        // Modes 2 and 6 fill the glyph as well, so its shape survives an
+        // outline this renderer cannot build; modes 1 and 5 have only the stroke.
+        if ([1, 2, 5, 6].includes(command.renderingMode) && command.strokePaintIndex >= 0) {
+          strokeText(glyph, indices, local, command.strokeTransformIndex === undefined ? local
+            : multiplyHeprMatrices(matrix, transform(command.strokeTransformIndex)), command.strokeStyleIndex, color(command.strokePaintIndex, execution.state),
+            clip, condition, command.renderingMode === 2 || command.renderingMode === 6);
+        }
       }
     } else if (command.source === "gradients") {
       for (let index = command.first; index < command.first + command.count; index++) await gradient(index, matrix, 1, clip, condition);
     } else if (command.source === "images") {
       const images = page.stores.images;
       for (let index = command.first; index < command.first + command.count; index++) {
-        if (images.imageMask[index] || images.softMaskImageIndices[index] >= 0 || images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("image requires mask or codec preparation.");
+        // Each of these needs a different preparation, and which one it is
+        // decides whether a page keeps its vectors, so name them apart.
+        // Each of these needs a different preparation, and which one it is
+        // decides whether a page keeps its vectors, so name them apart.
+        if (images.imageMask[index]) return fail("a stencil image mask requires preparation.");
+        if (images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("a pre-multiplied image matte requires preparation.");
         let data = imagePixels.get(index);
         if (!data) {
           // Raster layers are straight RGBA8; a grayscale store widens once here.
           const expanded = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]),
             images.formats[index], images.widths[index], images.heights[index], signal);
-          if (!expanded) return fail("image requires mask or codec preparation.");
-          data = expanded; imagePixels.set(index, data);
+          if (!expanded) return fail(`an image stored as format ${images.formats[index]} requires a codec.`);
+          const maskIndex = images.softMaskImageIndices[index];
+          if (maskIndex < 0) data = expanded;
+          else {
+            const mask = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[maskIndex], images.dataOffsets[maskIndex + 1]),
+              images.formats[maskIndex], images.widths[maskIndex], images.heights[maskIndex], signal);
+            if (!mask) return fail(`an image soft mask stored as format ${images.formats[maskIndex]} requires a codec.`);
+            // An Rgba8 store widens to itself, so the alpha is written into a
+            // copy rather than back into the page's own image bytes.
+            data = applyHeprImageSoftMask(Uint8Array.from(expanded), images.widths[index], images.heights[index],
+              mask, images.widths[maskIndex], images.heights[maskIndex], signal);
+          }
+          imagePixels.set(index, data);
         }
         const first = scene.rasterLayers.length; budget(6);
         scene.rasterLayers.push({ width: images.widths[index], height: images.heights[index], data, matrix: Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1])), paintOrder: first, pageIndex: 0 });
@@ -427,9 +630,29 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         executionMasks.set(execution.executionId, { children: [node], ...(rgba ? { backdrop: [rgba[0], rgba[1], rgba[2]] } : {}) });
       }
       else stack.at(-1)!.push(node);
+      if (node.knockout) knockoutScopes.add(children);
+      groupScopes.set(children, node);
       stack.push(children);
     },
-    endCompositeGroup() { stack.pop(); }
+    endCompositeGroup(_execution, outcome) {
+      const children = stack.pop()!, group = groupScopes.get(children);
+      if (outcome.status !== "complete" || !group || group.alpha === 1 || group.alphaIsShape ||
+          group.knockout || group.softMask || group.blendMode !== "Normal" || children.length !== 1 ||
+          stack.some(scope => knockoutScopes.has(scope) || groupScopes.get(scope)?.alphaIsShape)) return;
+      const child = children[0];
+      if (child.kind !== "draw") return;
+      const run = scene.drawRuns![child.runIndex];
+      if (run.count !== 1 || run.blendMode) return;
+      const output = run.kind === "fill" ? fillsC : run.kind === "text" ? textC : null;
+      if (!output) return;
+      // One analytic fill/glyph already evaluates its full coverage as a unit.
+      // Moving Normal group opacity onto that one paint gives identical
+      // source-over output, including antialiased edges, without a surface.
+      // Keep the node and its visibility scope; knockout/shape passes above
+      // deliberately keep their opacity boundary instead of changing shape.
+      output[run.first * 4 + 3] *= group.alpha;
+      group.alpha = 1;
+    }
   });
   await executeHeprDisplayProgram(page, backend(), { signal });
   scene.fillPathCount = fillsA.length / 4; scene.fillSegmentCount = segmentsA.length / 4;

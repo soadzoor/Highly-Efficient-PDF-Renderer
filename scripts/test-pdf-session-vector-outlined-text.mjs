@@ -72,6 +72,25 @@ try {
       }
     },
     {
+      name: "translated strokes share outlines across colors and independent clips", text: "AA", instances: 2,
+      content: "q 10 10 4 8 re W n 0 0 1 RG 2 w BT /F 80 Tf 1 Tr 10 10 Td (A) Tj ET Q " +
+        "q 30 10 8 4 re W n 1 0 0 RG 2 w BT /F 80 Tf 1 Tr 30 10 Td (A) Tj ET Q",
+      reference: `q 10 10 4 8 re W n 0 0 1 RG 2 w ${triangle(10, 10)} S Q ` +
+        `q 30 10 8 4 re W n 1 0 0 RG 2 w ${triangle(30, 10)} S Q`,
+      check(scene) {
+        assert.equal(scene.textInstanceB[2], scene.textInstanceB[6], "color, placement and clips do not duplicate the outline");
+        assert.notEqual(scene.textInstanceB[0], scene.textInstanceB[4], "placement stays on the instance");
+        assert.notEqual(scene.textInstanceB[3], scene.textInstanceB[7], "each instance preserves its own clip rectangle");
+      }
+    },
+    {
+      name: "different pen widths retain different outlines", text: "AA", instances: 2,
+      content: "0 0 1 RG 1 w BT /F 80 Tf 1 Tr 10 10 Td (A) Tj ET " +
+        "3 w BT /F 80 Tf 1 Tr 30 10 Td (A) Tj ET",
+      reference: `0 0 1 RG 1 w ${triangle(10, 10)} S 3 w ${triangle(30, 10)} S`,
+      check(scene) { assert.notEqual(scene.textInstanceB[2], scene.textInstanceB[6]); }
+    },
+    {
       name: "invisible fill leaves a searchable visible outline", text: "A", instances: 1,
       state: "/ca 0 /CA .5",
       content: "/Outer gs 1 0 0 rg 0 0 1 RG 2 w BT /F 80 Tf 2 Tr 10 10 Td (A) Tj ET",
@@ -158,7 +177,7 @@ try {
   assert.deepEqual(restored.clipPaths, persisted.scene.clipPaths);
   assert.deepEqual(restored.textIndex, persisted.scene.textIndex);
   assertPixelsClose(renderVectorText(restored, defaultVectorDrawRuns), persisted.pixels, "HEP outlined text roundtrip");
-  console.log("outlined text integration: 9 independent Canvas comparisons, search and HEP roundtrip passed");
+  console.log(`outlined text integration: ${cases.length + 2} independent Canvas comparisons, search and HEP roundtrip passed`);
 } finally { hooks.deregister(); }
 
 function surfaceFactory(width, height) {

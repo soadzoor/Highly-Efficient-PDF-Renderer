@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
 import * as THREE from "three";
+import { RenderPerformanceProfiler } from "../src/renderPerformance.ts";
+import { withThreeRenderPerformance } from "../src/threeRenderPerformance.ts";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -19,7 +21,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 try {
   const { ThreeVectorDrawRuns } = await import("../src/threeVectorDrawRuns.ts");
-  const { getThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
+  const { getThreeVectorDrawPlan, ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
   const { createThreeVectorClipTexture, initializeThreeVectorClip } =
     await import("../src/threeVectorClips.ts");
@@ -40,8 +42,22 @@ try {
     "interleaved paints cannot batch in canonical order");
 
   assert.equal(plan.update(0.01), true, "a pixel scale replans the submission order");
-  for (const layer of Object.values(layers)) refresh(layer);
+  const profiler = new RenderPerformanceProfiler();
+  profiler.start({ gpu: false, maxFrames: 2 });
+  profiler.beginFrame();
+  withThreeRenderPerformance(profiler, () => { for (const layer of Object.values(layers)) refresh(layer); });
+  profiler.endFrame();
   const batchedMeshes = totalMeshes(layers);
+  profiler.beginFrame();
+  withThreeRenderPerformance(profiler, () => { for (const layer of Object.values(layers)) refresh(layer); });
+  profiler.endFrame();
+  const capture = profiler.getReport();
+  assert.equal(capture.counters["three.batchRebuilds"].total, 3, "all three replanned layers report a rebuild");
+  assert.equal(capture.counters["three.batchesCreated"].total, batchedMeshes);
+  assert.equal(capture.frameRecords[1].counters["three.batchRebuilds"], 0, "profiling never forces a rebuild");
+  assert.ok(capture.cpuSections["three.batchRebuild"]);
+  assert.ok(capture.cpuSections["three.batchUpdate"]);
+  profiler.dispose();
   assert.ok(batchedMeshes < canonicalMeshes,
     `the schedule must reduce the submitted draws (${batchedMeshes} of ${canonicalMeshes})`);
 
@@ -126,6 +142,8 @@ try {
   // A pixel scale coarse enough to make every paint overlap leaves the schedule
   // far less room to reorder, so it always produces a different set of batches.
   assert.equal(plan.update(100), true, "a coarse pixel scale replans the submission order");
+  assert.equal(plan.paintOrderApproximated, false,
+    "a scene this small keeps exact margins: holding them would win back no draws");
   for (const layer of Object.values(layers)) refresh(layer);
   assert.ok(totalMeshes(layers) > batchedMeshes, "overlapping paints must batch less aggressively");
   for (const geometry of replaced) {
@@ -155,7 +173,41 @@ try {
     layer.clipTexture.dispose();
   }
 
-  function createLayer(sceneData, kind, attribute, count) {
+  // An effect constrains batching to its own source-over span; it does not
+  // force every unrelated paint back to an individual submission.
+  const composited = createInterleavedScene();
+  const split = Math.floor(composited.drawRuns.length / 2);
+  const group = children => ({ kind: "group", isolated: true, knockout: false, alpha: 0.5,
+    blendMode: "Normal", children });
+  composited.paintGraph = { roots: [group(composited.drawRuns.slice(0, split).map((_run, runIndex) => ({ kind: "draw", runIndex }))),
+    group(composited.drawRuns.slice(split).map((_run, index) => ({ kind: "draw", runIndex: split + index })))] };
+  const firstPlan = new ThreeVectorDrawPlan(composited), secondPlan = new ThreeVectorDrawPlan(composited);
+  const compositedLayers = {
+    stroke: createLayer(composited, "stroke", "aSegmentIndex", composited.segmentCount, firstPlan),
+    fill: createLayer(composited, "fill", "aFillPathIndex", composited.fillPathCount, firstPlan),
+    text: createLayer(composited, "text", "aTextInstanceIndex", composited.textInstanceCount, firstPlan)
+  };
+  const before = totalMeshes(compositedLayers);
+  firstPlan.update(0.01);
+  for (const layer of Object.values(compositedLayers)) refresh(layer);
+  assert.ok(totalMeshes(compositedLayers) < before, "ordinary paints inside effect spans still batch");
+  assert.equal(secondPlan.version, 0, "two objects over one scene keep independent view schedules");
+  assert.deepEqual(secondPlan.order, composited.drawRuns.map((_run, index) => index));
+  for (const layer of Object.values(compositedLayers)) {
+    for (const mesh of layer.mesh.children) {
+      assert.equal(new Set(mesh.userData.heprDrawRunIndices.map(index => firstPlan.segments[index])).size, 1,
+        "no mesh crosses a compositing boundary");
+      assert.equal(mesh.userData.heprDrawRanges.length, mesh.userData.heprDrawRunIndices.length,
+        "every canonical range remains available to compositor subset lookup");
+    }
+    layer.runs.dispose(); layer.clipTexture.dispose();
+  }
+  const reversed = { ...composited, paintGraph: { roots: [group(composited.drawRuns.map((_run, index) =>
+    ({ kind: "draw", runIndex: composited.drawRuns.length - 1 - index })))] } };
+  assert.equal(new ThreeVectorDrawPlan(reversed).update(0.01), false,
+    "an arbitrary graph visiting source paints backwards keeps its graph order");
+
+  function createLayer(sceneData, kind, attribute, count, drawPlan) {
     const geometry = new THREE.InstancedBufferGeometry();
     geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, -1, 1, -1, 1, 1, -1, 1], 2));
     geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
@@ -167,7 +219,7 @@ try {
     const clipTexture = createThreeVectorClipTexture(sceneData);
     initializeThreeVectorClip(material, clipTexture);
     const mesh = new THREE.Mesh(geometry, material);
-    const runs = ThreeVectorDrawRuns.create(sceneData, kind, mesh, attribute);
+    const runs = ThreeVectorDrawRuns.create(sceneData, kind, mesh, attribute, drawPlan);
     assert.ok(runs, `${kind} layer must build ordered draw runs`);
     return { mesh, runs, attribute, ids, count, clipTexture };
   }

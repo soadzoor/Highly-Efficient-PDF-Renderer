@@ -43,6 +43,8 @@ try {
   assert.equal(singlePlan.batches.length, 4, "a fill quad does not acquire the old four-pixel stroke margin");
   assert(singlePlan.update(single.drawRuns, 128));
   assert.equal(singlePlan.batches.length, 5, "actual stroke AA reaching the distant fill prevents the within-page swap");
+  assert.equal(singlePlan.scheduler.paintOrderApproximated, false,
+    "a handful of paints stays exact at any scale: there are no draw calls to win back");
   assert(singlePlan.update(single.drawRuns, 0.1));
   assert.equal(singlePlan.batches.length, 4, "zooming back restores safe batching");
 
@@ -210,8 +212,10 @@ try {
     segmentCount: 6, visibleSegmentIds: Uint32Array.from([0, 1, 2, 3, 4, 5]), visibleSegmentCount: index ? 0 : 6 })) };
   const transition = new VectorOrderedBatches(transitionScene, transitionRuntime);
   let schedules = 0;
-  const compact = transition.scheduler.compact.bind(transition.scheduler);
-  transition.scheduler.compact = runs => { schedules++; return compact(runs); };
+  // Count actual replans rather than the per-span compaction underneath, which
+  // runs once for every span a document's transparency groups create.
+  const schedulePaints = transition.scheduler.schedulePaints.bind(transition.scheduler);
+  transition.scheduler.schedulePaints = runs => { schedules++; return schedulePaints(runs); };
   const compareFresh = (runs, scale) => {
     const fresh = new VectorOrderedBatches(transitionScene, transitionRuntime);
     fresh.update(runs, scale);
@@ -258,8 +262,8 @@ try {
   const nearbyScene = makePages([0, 5, 100, 200]);
   const nearby = new VectorOrderedBatches(nearbyScene, null);
   let nearbySchedules = 0;
-  const compactNearby = nearby.scheduler.compact.bind(nearby.scheduler);
-  nearby.scheduler.compact = runs => { nearbySchedules++; return compactNearby(runs); };
+  const scheduleNearby = nearby.scheduler.schedulePaints.bind(nearby.scheduler);
+  nearby.scheduler.schedulePaints = runs => { nearbySchedules++; return scheduleNearby(runs); };
   nearby.update(nearbyScene.drawRuns, 0.1);
   const template = paints(nearby), templateDraws = nearby.batches.length;
   const movingPaints = [];
@@ -405,8 +409,8 @@ try {
   densePlan.update(dense.drawRuns);
   const denseOriginal = paints(densePlan);
   let denseSchedules = 0;
-  const compactDense = densePlan.scheduler.compact.bind(densePlan.scheduler);
-  densePlan.scheduler.compact = runs => { denseSchedules++; return compactDense(runs); };
+  const scheduleDense = densePlan.scheduler.schedulePaints.bind(densePlan.scheduler);
+  densePlan.scheduler.schedulePaints = runs => { denseSchedules++; return scheduleDense(runs); };
   densePlan.update(dense.drawRuns, 0.1);
   assert(densePlan.batches.length <= 32, "batching continues throughout a dense interleaved drawing");
   assertOverlapOrder(densePlan, denseOriginal, dense);
@@ -432,6 +436,37 @@ try {
   densePlan.update(dense.drawRuns, 0.1);
   assert.equal(denseSchedules, 5);
   assert.deepEqual(dense, denseSource, "render batching never changes source geometry, ranges, or layer membership");
+
+  // Coverage margins are screen-space, so minifying grows them without bound in
+  // page units until every paint fences every other one and the schedule costs
+  // a draw call per source paint. Below a thumbnail the margin is held instead.
+  const minified = pageGrid();
+  const minifiedPlan = new VectorOrderedBatches(minified, null);
+  minifiedPlan.update(minified.drawRuns, 1);
+  const resolved = paints(minifiedPlan);
+  assert.equal(minifiedPlan.paintOrderApproximated, false, "a page wider than a thumbnail keeps exact margins");
+  let held = null;
+  for (const scale of [16, 64, 128, 1024]) {
+    minifiedPlan.update(minified.drawRuns, scale);
+    assert(minifiedPlan.paintOrderApproximated, "a thumbnail-sized page holds its coverage margin");
+    held ??= minifiedPlan.batches.length;
+    assert.equal(minifiedPlan.batches.length, held, "minifying further cannot keep growing the draw count");
+    assert(held < minified.drawRuns.length / 16, "a held margin keeps batching a minified dense page");
+    assert.deepEqual(paints(minifiedPlan).slice().sort(), resolved.slice().sort(),
+      "holding the margin reorders paints, and keeps every one of them and its clip root");
+  }
+  minifiedPlan.update(minified.drawRuns, 1);
+  assert.equal(minifiedPlan.paintOrderApproximated, false, "zooming back in restores exact margins");
+  assert.deepEqual(paints(minifiedPlan), resolved, "and with them the exact schedule");
+  minifiedPlan.update(minified.drawRuns, null);
+  assert.equal(minifiedPlan.paintOrderApproximated, false, "an unknown projection scale disables scheduling outright");
+  // The same drawing on a page too large to reach thumbnail size keeps every
+  // margin, and pays the per-paint draw calls the held margin above saves.
+  const spread = pageGrid(64);
+  const spreadPlan = new VectorOrderedBatches(spread, null);
+  spreadPlan.update(spread.drawRuns, 64);
+  assert.equal(spreadPlan.paintOrderApproximated, false);
+  assert(spreadPlan.batches.length > held * 16, "exact margins fence a minified dense page into per-paint draws");
 
   // Exercise both production dispatchers, including disabling scheduling for
   // GL's arbitrary local-to-clip projection. These checks need no GPU/server.
@@ -496,6 +531,42 @@ try {
         { kind: "fill", first: page, count: 1 }, { kind: "stroke", first: page * 2 + 1, count: 1 },
         { kind: "text", first: page, count: 1 }, { kind: "raster", first: page, count: 1 });
     });
+    return scene;
+  }
+  /**
+   * A page-sized grid of small stroke/fill/text clusters, one color per column
+   * so neighbouring clusters never commute by color alone. `pageScale` stretches
+   * only the page rectangle, leaving the drawing itself untouched.
+   */
+  function pageGrid(pageScale = 1, cols = 48, rows = 24, width = 3024, height = 2160) {
+    const scene = createEmptyVectorScene();
+    const count = cols * rows;
+    scene.pageRects = Float32Array.of(0, 0, width * pageScale, height * pageScale);
+    scene.segmentCount = scene.fillPathCount = scene.textInstanceCount = count;
+    scene.textGlyphCount = 1;
+    scene.textGlyphMetaA = Float32Array.of(0, 0, 0, 0);
+    scene.textGlyphMetaB = Float32Array.of(1, 1, 0, 0);
+    for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles",
+      "fillPathMetaA", "fillPathMetaB", "fillPathMetaC", "textInstanceA", "textInstanceB", "textInstanceC"]) {
+      scene[key] = new Float32Array(count * 4);
+    }
+    scene.drawRuns = [];
+    for (let index = 0; index < count; index++) {
+      const x = (index % cols) * (width / cols), y = Math.floor(index / cols) * (height / rows);
+      const tint = (index % cols) / cols;
+      scene.endpoints.set([x, y, x + 4, y + 4], index * 4);
+      scene.primitiveMeta.set([x + 4, y + 4, 0, 0.5], index * 4);
+      scene.primitiveBounds.set([x, y, x + 4, y + 4], index * 4);
+      scene.styles.set([0.25, tint, 0, 0], index * 4);
+      scene.fillPathMetaA.set([0, 4, x, y], index * 4);
+      scene.fillPathMetaB.set([x + 4, y + 4, 1, 0], index * 4);
+      scene.fillPathMetaC.set([0, 0, tint, 1], index * 4);
+      scene.textInstanceA.set([4, 0, 0, 4], index * 4);
+      scene.textInstanceB.set([x, y, 0, 0], index * 4);
+      scene.textInstanceC.set([tint, 0, 0, 1], index * 4);
+      scene.drawRuns.push({ kind: "stroke", first: index, count: 1 },
+        { kind: "fill", first: index, count: 1 }, { kind: "text", first: index, count: 1 });
+    }
     return scene;
   }
   function paints(plan) {

@@ -36,6 +36,7 @@ import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
 import { createDrawCallMeter, createThreeDrawCallCounter } from "./drawCallMetrics";
 import { RenderPerformanceProfiler, type RenderPerformanceOptions } from "./renderPerformance";
+import { describeThreePerformanceScene, instrumentThreeWebGlCalls, withThreeRenderPerformance } from "./threeRenderPerformance";
 import {
   filenameFromUrl,
   formatPdfDownloadFilename,
@@ -461,6 +462,7 @@ async function ensureThreeRendererBackend(
   activeThreeRendererBackend = backend;
   resetFpsMeter();
   // The capture's GPU timer queries belong to the context being replaced.
+  captureGlCalls?.dispose(); captureGlCalls = null;
   captureProfiler?.dispose();
   captureProfiler = null;
   drawCallMeter.reset();
@@ -487,7 +489,8 @@ function renderFrame(now: number = performance.now()): void {
   profile?.endSection("controls");
   prepareThreeRendererFrame(renderer);
   profile?.beginSection("render");
-  const drawCalls = drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera));
+  const drawCalls = withThreeRenderPerformance(profile, () =>
+    drawCallCounter.measure(renderer.info, () => renderer.render(scene, camera)));
   profile?.endSection("render");
   drawCallMeter.update(drawCalls);
   if (profile) recordCaptureCounters(profile, drawCalls);
@@ -507,6 +510,7 @@ function renderFrame(now: number = performance.now()): void {
   renderedFrameSerial += 1;
   resolveRenderedFrameWaiters();
   profile?.endFrame();
+  if (profile && !profile.enabled) { captureGlCalls?.dispose(); captureGlCalls = null; }
   if (controlsChanged) {
     requestRender();
   }
@@ -912,9 +916,12 @@ textSearchCaseButtonElement.addEventListener("click", () => {
  * CPU sections only.
  */
 let captureProfiler: RenderPerformanceProfiler | null = null;
+let captureGlCalls: ReturnType<typeof instrumentThreeWebGlCalls> | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
-  start(options: RenderPerformanceOptions = {}): string {
+  start(options: RenderPerformanceOptions & { webglCalls?: boolean } = {}): string {
+    if (options.webglCalls !== undefined && typeof options.webglCalls !== "boolean") throw new TypeError("webglCalls must be a boolean.");
+    captureGlCalls?.dispose(); captureGlCalls = null;
     captureProfiler?.dispose();
     const gl = activeThreeRendererBackend === "webgl"
       ? (renderer as THREE.WebGLRenderer).getContext() : undefined;
@@ -922,7 +929,12 @@ const performanceCapture = {
       gl: gl instanceof WebGL2RenderingContext ? gl : undefined
     });
     captureContext = {
-      document: currentPdfObject?.sourceLabel ?? null, backend: `three-${activeThreeRendererBackend}`,
+      diagnosticsVersion: 2, threeRevision: THREE.REVISION, browser: navigator.userAgent,
+      shaderErrorChecks: activeThreeRendererBackend === "webgl" ? (renderer as THREE.WebGLRenderer).debug.checkShaderErrors : null,
+      initialTextLod: currentPdfObject?.getTextLodStats() ? { ...currentPdfObject.getTextLodStats() } : null,
+      document: currentPdfObject?.sourceLabel ?? null, sourceKind: currentPdfObject?.sourceKind ?? null,
+      scene: currentPdfObject ? describeThreePerformanceScene(currentPdfObject.sceneData) : null,
+      backend: `three-${activeThreeRendererBackend}`,
       canvasPixels: [canvasElement.width, canvasElement.height], dpr: window.devicePixelRatio,
       vectorLod: vectorLodSelectElement.value, textLod: textLodSelectElement.value,
       drawingSelection: drawingSelection.isEnabled(),
@@ -930,6 +942,12 @@ const performanceCapture = {
       sourcePaints: currentPdfObject?.sceneData.drawRuns?.length ?? 0
     };
     captureProfiler.start(options);
+    if (gl instanceof WebGL2RenderingContext && options.webglCalls !== false) {
+      captureGlCalls = instrumentThreeWebGlCalls(gl, captureProfiler);
+    }
+    captureContext.webglCalls = captureGlCalls ? {
+      installedMethods: [...captureGlCalls.installedMethods], unavailableMethods: [...captureGlCalls.unavailableMethods]
+    } : null;
     requestRender();
     return `Capturing up to ${options.maxFrames ?? 600} rendered frames. Pan or zoom, then run heprPerf.stop().`;
   },
@@ -938,6 +956,8 @@ const performanceCapture = {
     // `?perf=1` starts before any document exists, so name it once one is open.
     if (captureContext && captureContext.document === null) {
       captureContext.document = currentPdfObject?.sourceLabel ?? null;
+      captureContext.sourceKind = currentPdfObject?.sourceKind ?? null;
+      captureContext.scene = currentPdfObject ? describeThreePerformanceScene(currentPdfObject.sceneData) : null;
       captureContext.sourceSegments = currentPdfObject?.sceneData.segmentCount ?? 0;
       captureContext.sourcePaints = currentPdfObject?.sceneData.drawRuns?.length ?? 0;
     }
@@ -945,6 +965,7 @@ const performanceCapture = {
   },
   stop() {
     captureProfiler?.stop();
+    captureGlCalls?.dispose(); captureGlCalls = null;
     const report = performanceCapture.report();
     console.table({ frameCpu: report.frameCpuMs, frameInterval: report.frameIntervalMs,
       ...report.cpuSections, gpuCommandSpan: report.gpu.frameMs });
@@ -963,10 +984,10 @@ if (new URLSearchParams(window.location.search).get("perf") === "1") {
 
 function recordCaptureCounters(profile: RenderPerformanceProfiler, drawCalls: number | null): void {
   if (drawCalls !== null) profile.add("drawCalls", drawCalls);
-  const segments = currentPdfObject?.getRenderedStrokeSegmentCount();
-  if (segments !== null && segments !== undefined) profile.add("renderedSegments", segments);
-  const text = currentPdfObject?.getTextInstanceStats();
-  if (text) profile.add("renderedTextInstances", text.rendered);
+  profile.add("three.geometries", renderer.info.memory.geometries);
+  profile.add("three.textures", renderer.info.memory.textures);
+  const programs = (renderer.info as THREE.WebGLRenderer["info"]).programs;
+  if (programs) profile.add("three.programs", programs.length);
   profile.setFrameContext({ viewportWidth: canvasElement.width, viewportHeight: canvasElement.height });
 }
 
@@ -995,6 +1016,7 @@ function disposeExample(): void {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
   }
+  captureGlCalls?.dispose(); captureGlCalls = null;
   captureProfiler?.dispose();
   captureProfiler = null;
   layerControls.dispose();
@@ -1696,8 +1718,11 @@ function updateDrawStatsMeter(): void {
   const textPart = textStats && textStats.total > 0
     ? ` | ${textStats.rendered.toLocaleString()}/${textStats.total.toLocaleString()} text (${textStats.mode})`
     : "";
+  // Minified pages hold the paint scheduler's coverage margin, which bounds the
+  // draw count by letting sub-pixel neighbours swap order.
+  const paintOrderPart = currentPdfObject.isPaintOrderApproximated() ? " | paint order: held" : "";
   setDrawStatsText(
-    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments${textPart} | mode: ${mode}`
+    `${renderedSegments.toLocaleString()}/${totalSegments.toLocaleString()} segments${textPart} | mode: ${mode}${paintOrderPart}`
   );
 }
 

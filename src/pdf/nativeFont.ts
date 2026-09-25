@@ -491,7 +491,6 @@ async function parseSimpleFont(
   const signal = options.signal;
   const baseFont = optionalName(dictionary.get("BaseFont")) ?? "";
   const descriptor = await parseFontDescriptor(dictionary.get("FontDescriptor"), resolver, signal);
-  const style = deriveFontStyle(baseFont, descriptor);
   const embeddedSfnt = await readEmbeddedSfnt(
     dictionary,
     descriptor,
@@ -507,19 +506,6 @@ async function parseSimpleFont(
     signal
   );
   reportFontDiagnostics(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
-  const replacement = embeddedSfnt === null && embeddedCff === null &&
-    descriptor.embeddedKind === null && subtype !== "Type3"
-    ? await resolveMissingSfnt({
-        baseFont,
-        normalizedBaseFont: stripSubsetPrefix(baseFont),
-        subtype,
-        descendantSubtype: null,
-        writingMode: 0,
-        descriptor,
-        style
-      }, options)
-    : null;
-  const sfnt = embeddedSfnt ?? replacement?.sfnt ?? null;
   const encoding = await parseSimpleEncoding(
     dictionary.get("Encoding"),
     baseFont,
@@ -543,6 +529,24 @@ async function parseSimpleFont(
       if (width !== null) widths.set(firstChar + index, width);
     }
   }
+  const style = deriveFontStyle(
+    baseFont,
+    descriptor,
+    simpleWidthsSuggestFixedPitch(widths, encoding.glyphNames)
+  );
+  const replacement = embeddedSfnt === null && embeddedCff === null &&
+    descriptor.embeddedKind === null && subtype !== "Type3"
+    ? await resolveMissingSfnt({
+        baseFont,
+        normalizedBaseFont: stripSubsetPrefix(baseFont),
+        subtype,
+        descendantSubtype: null,
+        writingMode: 0,
+        descriptor,
+        style
+      }, options)
+    : null;
+  const sfnt = embeddedSfnt ?? replacement?.sfnt ?? null;
   const type3Matrix = subtype === "Type3" ? readNumberArray(dictionary.get("FontMatrix"), 6) : null;
   const unitsPerEm = sfnt?.unitsPerEm ?? embeddedCff?.unitsPerEm ?? (
     type3Matrix && type3Matrix[0] !== 0 ? Math.max(1, Math.round(1 / Math.abs(type3Matrix[0]))) : 1000
@@ -2528,7 +2532,8 @@ async function parseFontDescriptor(
 
 function deriveFontStyle(
   baseFont: string,
-  descriptor: NativeFontDescriptor
+  descriptor: NativeFontDescriptor,
+  widthsSuggestFixedPitch = false
 ): NativeFontStyleMetadata {
   const normalizedName = stripSubsetPrefix(baseFont);
   const forceBold = (descriptor.flags & (1 << 18)) !== 0;
@@ -2539,7 +2544,7 @@ function deriveFontStyle(
     weight: descriptor.weight ?? (forceBold || inferredBold ? 700 : 400),
     stretch: descriptor.stretch,
     italicAngle: descriptor.italicAngle,
-    fixedPitch: (descriptor.flags & 1) !== 0,
+    fixedPitch: (descriptor.flags & 1) !== 0 || widthsSuggestFixedPitch,
     serif: (descriptor.flags & (1 << 1)) !== 0,
     symbolic: (descriptor.flags & (1 << 2)) !== 0,
     script: (descriptor.flags & (1 << 3)) !== 0,
@@ -2548,6 +2553,38 @@ function deriveFontStyle(
     smallCaps: (descriptor.flags & (1 << 17)) !== 0,
     forceBold
   });
+}
+
+// Glyphs whose advances differ widely in every proportional design. A /Widths
+// array that gives one of each the same advance describes a fixed-pitch face.
+const PROPORTIONAL_NARROW_GLYPHS = new Set([
+  "space", "exclam", "quotesingle", "comma", "period", "colon", "semicolon",
+  "I", "f", "i", "j", "l", "t", "bar"
+]);
+const PROPORTIONAL_WIDE_GLYPHS = new Set(["M", "W", "m", "w"]);
+
+/**
+ * Producers often omit /FixedPitch for monospace faces such as Lucida
+ * Console. Uniform advances only count when they cover both a narrow and a wide
+ * glyph, so tabular-figure or single-glyph subsets stay proportional.
+ */
+function simpleWidthsSuggestFixedPitch(
+  widths: ReadonlyMap<number, number>,
+  glyphNames: readonly (string | null)[]
+): boolean {
+  let pitch = 0;
+  let narrow = false;
+  let wide = false;
+  for (const [code, width] of widths) {
+    if (!(width > 0)) continue;
+    if (pitch === 0) pitch = width;
+    else if (Math.abs(width - pitch) > 0.5) return false;
+    const glyphName = glyphNames[code];
+    if (!glyphName) continue;
+    if (PROPORTIONAL_NARROW_GLYPHS.has(glyphName)) narrow = true;
+    else if (PROPORTIONAL_WIDE_GLYPHS.has(glyphName)) wide = true;
+  }
+  return narrow && wide;
 }
 
 function inferFontFamily(baseFont: string): string | null {

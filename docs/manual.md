@@ -114,10 +114,27 @@ The standalone viewer renders directly to its canvas through
 vector content, raster layers, search highlights, and selection highlights.
 See the [API reference](api.md) for integration points.
 
-Vector LOD simplifies stroke geometry according to the current view. It keeps
-exact stroke geometry available and chooses detail per tile as you zoom.
-The visible-segment budget is a target, so it does not guarantee a fixed draw
-count. Embedded PDF images remain raster layers.
+Vector LOD simplifies stroke geometry according to the current view, aiming for
+roughly 50,000 visible strokes. Large drawings keep a fine representation and
+additional overview levels. When a tile exceeds its budget, overview levels can
+omit tiny marks and merge nearby lines more aggressively. This trades some
+far-zoom detail and hatch density for performance while keeping vector rendering.
+The HUD labels these selections `(overview)` and shows the total target.
+
+Tiles that fit their budget retain exact or fine geometry. Very dense views can
+still use overview levels when zoomed in, but approximations stay within a
+5-pixel error limit, so close zoom restores exact geometry. Tilted three.js
+cameras choose detail per tile: content near the camera receives more of the
+budget and finer geometry, distant content thins out, and tiles outside the
+view are skipped. The antialiasing filter still fades retained thin strokes
+continuously. The target is soft: limited simplification, clipping, or complex
+compositing can keep a document above it. Set Vector LOD to Off for exact strokes
+at every zoom. Embedded PDF images remain raster layers.
+
+The Draw counter reports selected vector representatives. During native cached
+panning it describes the cached content, not a fresh submission of every stroke
+on each frame. Compare direct rendering as well as panning when profiling the
+native and Three.js viewers.
 
 | `vectorLod` | Behavior |
 | --- | --- |
@@ -331,6 +348,153 @@ document or renderer is replaced. `heprPerf.report()` reads the current report;
 starting again clears the previous capture. The report includes the starting view,
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
+
+To see which GPU work fills that span, add `gpuOperations: true`:
+
+```js
+heprPerf.start({ maxFrames: 1200, gpuOperations: true });
+```
+
+On one frame in eight, never one sampled for the frame span, every draw, clear
+and blit gets its own GPU timer query. `gpu.operations` then reports:
+
+- `frameMs`, the summed operation time per timed frame. Compare it with
+  `gpu.frameMs`: a sum far below the span means the GPU spent the rest waiting
+  for commands, so submission (browser, ANGLE or driver) is the limit. A sum near
+  the span means GPU execution is the limit.
+- `byLabel`, time and operations per frame for each program and target, such as
+  `fill → offscreen` or `composite:softMask → offscreen`. Native WebGL names its
+  programs, and compositor passes by kind; other hosts show `program#N`.
+- `slowest`, the 16 slowest single operations, with vertex and instance counts,
+  viewport, scissor and blit area.
+
+Each timed operation runs between its own queries, so the GPU cannot overlap it
+with its neighbours, and those frames run slower. Operation times can therefore
+add up to more than an untimed span. The context's own methods are restored
+when the capture stops.
+
+The Three example also exposes `heprPerf`. Reports with
+`context.diagnosticsVersion: 2` include the source kind (PDF/HEP), scene
+geometry/clip/raster counts, transparency-group structure, Three revision,
+browser and shader-error-check setting. These describe the loaded scene, without
+exporting document text, shader source or image pixels.
+
+Three CPU sections split `render` into `three.sync` (PDF preparation and
+compositing) and the remaining outer host render. Inside `three.sync`,
+`three.schedule`, `three.strokeLod`, `three.textLod`,
+`three.vectorUpdate` and `three.textUpdate` identify camera-dependent work.
+`three.batchRebuild` and `three.batchUpdate` are nested within layer updates.
+`three.compositor` includes setup, batch lookup/geometry preparation, target
+binding, `three.hostDraw` (primitive submissions) and `three.hostPass`
+(composite submissions). Inside `three.compositorSetup`,
+`three.compositorCollect` measures proxy/range-index maintenance and
+`three.compositorSelection` measures visible-paint selection. Compare collection
+with `three.scheduleChanges` to diagnose zoom replans. These sections overlap:
+do not sum parent and child durations.
+
+During a Three WebGL capture, existing GL calls are timed by default. The
+`gl.*` sections distinguish shader-source setup, compilation, linking, program
+use, shader/state queries, buffer/texture uploads, drawing, clears, readbacks
+and synchronization. No additional GL query, shader check, readback, flush or
+wait is issued. `frameRecords[].events` retains up to eight longest instrumented
+calls of at least 8 ms, with names such as `gl.getProgramInfoLog` or
+`gl.bufferData`, plus slow compositor submissions. A slow GL call can include
+a driver wait; it does not establish pure GPU execution time.
+
+Per-frame counters include schedule changes, batch/material creation, selected
+paints, per-kind draw submissions, requested live-instance upload bytes, surface
+allocation/clear work, program/texture/geometry counts, and LOD selection.
+`three.surfaceBytes` is the compositor's RGBA surface estimate, not total GPU
+memory; `three.textSelectionUploads` is a cumulative LOD-runtime count, whose
+change between frames identifies an upload. Counts of rendered instances are
+sampled before compositing hides the layer meshes. `context.frameGapMs` on
+each frame preserves long gaps excluded from the interval summary, and the
+bounded record selection prioritizes neighbours of major CPU stalls after
+the slowest CPU/GPU and highest-draw frames.
+
+Detailed GL timing adds diagnostic overhead. Use
+`heprPerf.start({ webglCalls: false })` for a Three capture without GL-call
+wrappers; CPU phase timings and the existing optional GPU timer remain.
+Wrappers are removed on stop, automatic capture completion, backend replacement
+and disposal. `context.webglCalls` reports which methods could be instrumented.
+Three WebGPU reports phase/counter diagnostics without WebGL-call or GPU-query
+timings.
+
+To investigate the HEP-only Broschuere zoom pause, collect two reports:
+one HEP and one PDF, using a fresh page load for each and the same WebGL backend,
+viewport, DPR, layer visibility and LOD settings. Open the document, start
+capture before the first zoom, pan briefly, then zoom until the HEP stalls.
+Zoom out and repeat the movement once to distinguish first-use from repeat
+stalls. Follow the same movement for the PDF.
+
+```js
+heprPerf.start({ maxFrames: 1200, maxFrameRecords: 240 });
+// Pan/zoom, including the first zoom and one repeated zoom.
+heprPerf.stop();
+copy(heprPerf.json()); // Chrome/Edge DevTools helper
+```
+
+Send both complete JSON reports. They should identify whether the pause is in
+scheduling/LOD, resource uploads, shader/program queries, or another submission
+phase. A browser Performance trace may still be needed for browser-internal
+work such as garbage collection.
+
+Native WebGL also reports `panCacheRefreshes` and `panCacheReuses`. A refresh
+renders the ordered scene into the bounded cache; a reuse frame translates that
+image and draws live highlights without resubmitting the scene paints. Heavy
+source-ordered PDFs can use this path during panning; zooming and settled frames
+render directly. `panCacheFrames` counts attempts to use the cache, including
+frames that fall back to direct rendering when a suitable cache cannot fit.
+Compare refreshes and reuse frames separately when interpreting frame costs.
+
+Native WebGL captures include `gradientFillSubmission` and
+`gradientStrokeSubmission` CPU sections. These sum gradient setup and draw
+submission per frame and can overlap the broader `drawSubmission` section.
+`gradientAnalyticFillDraws` / `gradientMeshFillDraws` distinguish bounding-quad
+fills from mesh fills; the corresponding `...Segments` counters count submitted
+fill-path segments, and `gradientMeshTriangles` counts mesh triangles.
+`gradientStrokeDraws` and `gradientStrokeSegments` count submitted stroke runs
+and their segments. These include repeated draws in compositing passes.
+
+`gradientFillClipPolygonEdges` and `gradientStrokeClipPolygonEdges` sum the
+original polygon edges in each submitted draw's clip chain; packed rectangle
+clips are excluded. These counts stay unchanged when clip indexing is active.
+`gradientFillIndexedClipNodes` and `gradientStrokeIndexedClipNodes` count indexed
+polygon nodes across the same chains, including repeat visits in separate draws;
+they confirm indexing is active, not how many candidate edges the GPU examines.
+Dense clips use horizontal bands over their original edges at upload time, with
+the existing full scan retained when indexing is unsuitable or exceeds its
+memory budget. Both native and Three WebGL/WebGPU rendering benefit; these
+gradient-specific console counters remain native WebGL only.
+
+For analytic fills in the main orthographic view,
+`gradientAnalyticFillBBoxPixelsEstimate` sums viewport-clipped bounding-quad
+areas in framebuffer pixels, rounded outward. It includes overlap and ignores
+geometric clips, scissor rectangles, transparent pixels, and early exits;
+projected views and mesh fills are excluded. Multiplying each quad's estimate
+by its clip-chain polygon edge count produces
+`gradientAnalyticFillClipEdgeTestsEstimate`, the **unindexed full-scan baseline**
+upper-work estimate. It is not the actual indexed candidate count or a GPU
+instruction count, and should not fall merely because clip indexing is enabled.
+Compare sampled GPU time and corresponding `frameRecords` before and after the
+change at the same zoom, viewport, DPR, and visible layers. Diagnostics
+do not scan fill segments or clip edges in the render loop and remain off
+unless a capture is active.
+
+Both native renderers clamp each analytic gradient fill's quad to its clip
+chain's bounds, widened by the one-pixel coverage margin; nothing outside them
+survives the clip. `gradientAnalyticFillQuadPixelsEstimate` sums the clamped
+quads the same way, so it can be compared with the unclamped bounding-quad
+estimate above. Projected views keep whole quads and are excluded.
+
+`foldedPaints` counts compositor group chains drawn as a single paint. A chain
+of Normal-blend groups holding one fill path, analytic gradient fill or image
+(no knockout, at most one soft mask) scales that paint by the groups' opacity
+and mask instead of rendering group surfaces and composite passes. Native
+WebGL folds these chains; its soft mask is still prepared on its own surface.
+
+The [Broschuere gradient investigation](broschuere-gradient-performance.md)
+documents a dense polygon-clip hotspot and recommended comparison captures.
 
 The report also includes up to 120 `frameRecords` with the camera and viewport,
 CPU phases, batch/instance counts, and GPU timing for the same frame when sampled.

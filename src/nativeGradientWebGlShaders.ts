@@ -1,3 +1,5 @@
+import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
 import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
 
@@ -50,6 +52,10 @@ vec4 samplePdfGradient(int index, vec2 scenePoint) {
 
 export const GRADIENT_FILL_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+// GLSL ES defaults int to highp in a vertex shader and mediump in a
+// fragment one, so a uniform both stages declare must say which. Texel
+// indices into the segment stores also outrun mediump's 16-bit range.
+precision highp int;
 precision highp sampler2D;
 
 uniform sampler2D uPathMetaTexA;
@@ -57,14 +63,24 @@ uniform sampler2D uPathMetaTexB;
 uniform sampler2D uPathMetaTexC;
 uniform sampler2D uPaintMetaTex;
 uniform ivec2 uPathMetaTexSize;
+// The band index rides in the segment store after the segments, costing no
+// sampler unit of its own. A negative base means there is none.
+uniform sampler2D uSegmentTexA;
+uniform ivec2 uSegmentTexSize;
+uniform int uBandBase;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
+// World bounds of the paint's clip chain; nothing outside them survives the
+// clip. Unclipped and projected draws receive an unbounded rectangle.
+uniform vec4 uClipBounds;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
+/** (first band texel, band count, first band's y, band height); zero count scans linearly. */
+flat out vec4 vBands;
 flat out int vSourceGradientIndex;
 flat out int vMaskGradientIndex;
 flat out vec3 vSolidColor;
@@ -84,6 +100,8 @@ vec2 cornerFromIndex(int index) {
   return vec2(1.0, 1.0);
 }
 
+${FILL_COVERAGE_VERTEX_GLSL}
+
 void main() {
   int pathIndex = gl_VertexID / 4;
   int cornerIndex = gl_VertexID - pathIndex * 4;
@@ -95,10 +113,22 @@ void main() {
 
   int segmentCount = int(metaA.y + 0.5);
   float alpha = metaC.w;
-  if (segmentCount <= 0 || alpha <= 0.001) {
+  vec2 corner01 = cornerFromIndex(cornerIndex) * 0.5 + 0.5;
+  // Reach pixels whose footprint touches a path narrower than a pixel.
+  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(metaA.zw, metaB.xy, corner01),
+    uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  // A page-sized gradient under a small clip would otherwise shade the whole
+  // page. The clip's antialiasing reaches under a pixel past its bounds, so
+  // the same one-pixel margin keeps every covered fragment; a path and clip
+  // farther apart than that leave nothing to draw. Projected draws, whose
+  // corners have different margins, are never clamped.
+  vec2 low = max(metaA.zw, uClipBounds.xy) - margin;
+  vec2 high = min(metaB.xy, uClipBounds.zw) + margin;
+  if (segmentCount <= 0 || alpha <= 0.001 || any(greaterThan(low, high))) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
     vSegmentCount = 0;
+    vBands = vec4(0.0);
     vSourceGradientIndex = -1;
     vMaskGradientIndex = -1;
     vSolidColor = vec3(0.0);
@@ -109,8 +139,7 @@ void main() {
     return;
   }
 
-  vec2 corner01 = cornerFromIndex(cornerIndex) * 0.5 + 0.5;
-  vec2 world = mix(metaA.zw, metaB.xy, corner01);
+  vec2 world = mix(low, high, corner01);
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
   } else {
@@ -120,6 +149,8 @@ void main() {
 
   vSegmentStart = int(metaA.x + 0.5);
   vSegmentCount = segmentCount;
+  vBands = uBandBase < 0 ? vec4(0.0)
+    : texelFetch(uSegmentTexA, coordFromIndex(uBandBase + pathIndex, uSegmentTexSize), 0);
   vSourceGradientIndex = int(round(paintMeta.x));
   vMaskGradientIndex = int(round(paintMeta.y));
   vSolidColor = vec3(metaB.z, metaB.w, metaC.z);
@@ -132,6 +163,10 @@ void main() {
 
 export const GRADIENT_FILL_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+// GLSL ES defaults int to highp in a vertex shader and mediump in a
+// fragment one, so a uniform both stages declare must say which. Texel
+// indices into the segment stores also outrun mediump's 16-bit range.
+precision highp int;
 precision highp sampler2D;
 
 uniform sampler2D uSegmentTexA;
@@ -140,127 +175,75 @@ uniform ivec2 uSegmentTexSize;
 uniform float uAAScreenPx;
 uniform vec4 uVectorOverride;
 uniform vec4 uPrimitiveOverride;
+uniform int uBandEntries;
 ${GRADIENT_COMMON}
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
+flat in vec4 vBands;
 flat in int vSourceGradientIndex;
 flat in int vMaskGradientIndex;
 flat in vec3 vSolidColor;
 flat in float vAlpha;
 flat in float vFillRule;
-flat in float vFillHasCompanionStroke;
 in vec2 vLocal;
 
 out vec4 outColor;
-
-const int QUADRATIC_STEPS = 8;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(index % sizeValue.x, index / sizeValue.x);
 }
 
-float distanceToLine(vec2 point, vec2 start, vec2 end) {
-  vec2 delta = end - start;
-  float lengthSquared = dot(delta, delta);
-  if (lengthSquared <= 1e-10) return length(point - start);
-  float t = clamp(dot(point - start, delta) / lengthSquared, 0.0, 1.0);
-  return length(point - (start + delta * t));
-}
-
-float distanceToQuadratic(vec2 point, vec2 p0, vec2 p1, vec2 p2) {
-  vec2 aa = p1 - p0;
-  vec2 bb = p0 - 2.0 * p1 + p2;
-  vec2 cc = aa * 2.0;
-  vec2 dd = p0 - point;
-  float bbLengthSquared = dot(bb, bb);
-  if (bbLengthSquared <= 1e-12) return distanceToLine(point, p0, p2);
-  float inverse = 1.0 / bbLengthSquared;
-  float kx = inverse * dot(aa, bb);
-  float ky = inverse * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  float kz = inverse * dot(dd, aa);
-  float p = ky - kx * kx;
-  float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  float h = q * q + 4.0 * p * p * p;
-  float best = 1e20;
-  if (h >= 0.0) {
-    float hSqrt = sqrt(h);
-    vec2 roots = (vec2(hSqrt, -hSqrt) - q) * 0.5;
-    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    float z = sqrt(-p);
-    float angle = acos(clamp(q / (2.0 * p * z), -1.0, 1.0)) / 3.0;
-    float cosine = cos(angle);
-    float sine = sin(angle) * 1.732050808;
-    vec3 roots = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
-    for (int rootIndex = 0; rootIndex < 3; rootIndex += 1) {
-      float t = roots[rootIndex];
-      vec2 delta = dd + (cc + bb * t) * t;
-      best = min(best, dot(delta, delta));
-    }
-  }
-  return sqrt(max(best, 0.0));
-}
-
-vec2 quadraticPoint(vec2 p0, vec2 p1, vec2 p2, float t) {
-  float oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * p0 + 2.0 * oneMinusT * t * p1 + t * t * p2;
-}
-
-void accumulateCrossing(vec2 start, vec2 end, vec2 point, inout int winding, inout int crossings) {
-  bool upward = start.y <= point.y && end.y > point.y;
-  bool downward = start.y > point.y && end.y <= point.y;
-  if (!upward && !downward) return;
-  float denominator = end.y - start.y;
-  if (abs(denominator) <= 1e-6) return;
-  float x = start.x + (point.y - start.y) * (end.x - start.x) / denominator;
-  if (x > point.x) {
-    crossings += 1;
-    winding += upward ? 1 : -1;
-  }
-}
+${FILL_COVERAGE_GLSL}
 
 void main() {
+  // Evaluate the pixel footprint before alpha tests or per-fragment clipping.
+  float dxLocal = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float dyLocal = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float aaWidth = max(max(dxLocal, dyLocal) * uAAScreenPx, 1e-4);
+  vec2 footprint = max(vec2(dxLocal, dyLocal) * uAAScreenPx, vec2(1e-4));
   if (vSegmentCount <= 0 || vAlpha <= 0.001) discard;
-  float minDistance = 1e20;
-  int winding = 0;
-  int crossings = 0;
 
-  for (int primitiveIndex = 0; primitiveIndex < vSegmentCount; primitiveIndex += 1) {
-    ivec2 coord = coordFromIndex(vSegmentStart + primitiveIndex, uSegmentTexSize);
-    vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
-    vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);
-    vec2 p0 = primitiveA.xy;
-    vec2 p1 = primitiveA.zw;
-    vec2 p2 = primitiveB.xy;
-    if (primitiveB.z >= 0.5) {
-      minDistance = min(minDistance, distanceToQuadratic(vLocal, p0, p1, p2));
-      vec2 previous = p0;
-      for (int step = 1; step <= QUADRATIC_STEPS; step += 1) {
-        vec2 next = quadraticPoint(p0, p1, p2, float(step) / float(QUADRATIC_STEPS));
-        accumulateCrossing(previous, next, vLocal, winding, crossings);
-        previous = next;
+  // Average the winding number over the footprint box. The bands spanning the
+  // box's rows hold every segment that can contribute, and each integrates
+  // only its own rows, so a segment held by two bands is not counted twice.
+  vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
+  float winding = 0.0;
+  int bandCount = int(vBands.y);
+  int firstBand = 0;
+  int lastBand = 0;
+  if (bandCount > 0) {
+    float bandHeight = vBands.w;
+    firstBand = clamp(int(floor((box.y - vBands.z) / bandHeight)), 0, bandCount - 1);
+    lastBand = clamp(int(floor((box.y + footprint.y - vBands.z) / bandHeight)), 0, bandCount - 1);
+  }
+
+  for (int band = firstBand; band <= lastBand; band += 1) {
+    int count = vSegmentCount;
+    int entry = 0;
+    if (bandCount > 0) {
+      vec4 range = texelFetch(uSegmentTexA, coordFromIndex(int(vBands.x) + band, uSegmentTexSize), 0);
+      entry = int(range.x);
+      count = int(range.y);
+    }
+    vec2 rows = heprBandRows(vBands, band, bandCount, box);
+    for (int primitiveIndex = 0; primitiveIndex < count; primitiveIndex += 1) {
+      int segment = vSegmentStart + primitiveIndex;
+      if (bandCount > 0) {
+        int packedIndex = entry + primitiveIndex;
+        vec4 packed = texelFetch(uSegmentTexA,
+          coordFromIndex(uBandEntries + (packedIndex >> 2), uSegmentTexSize), 0);
+        segment = int(packed[packedIndex & 3]);
       }
-    } else {
-      minDistance = min(minDistance, distanceToLine(vLocal, p0, p2));
-      accumulateCrossing(p0, p2, vLocal, winding, crossings);
+      ivec2 coord = coordFromIndex(segment, uSegmentTexSize);
+      vec4 primitiveA = texelFetch(uSegmentTexA, coord, 0);
+      vec4 primitiveB = texelFetch(uSegmentTexB, coord, 0);
+      winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+        primitiveB.z >= 0.5, box, rows.x, rows.y);
     }
   }
 
-  bool inside = vFillRule >= 0.5 ? ((crossings & 1) == 1) : (winding != 0);
-  float coverage;
-  if (vFillHasCompanionStroke >= 0.5) {
-    coverage = inside ? 1.0 : 0.0;
-  } else {
-    float signedDistance = inside ? -minDistance : minDistance;
-    float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-    float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-    float aaWidth = max(max(dx, dy) * uAAScreenPx, 1e-4);
-    coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
-  }
+  float coverage = heprFillCoverage(winding, vFillRule >= 0.5);
 
   vec4 source = vSourceGradientIndex >= 0
     ? samplePdfGradient(vSourceGradientIndex, vLocal)
@@ -270,7 +253,7 @@ void main() {
   if (alpha <= 0.001) discard;
   vec3 baseColor = uPrimitiveOverride.a > 0.5 ? uPrimitiveOverride.rgb : source.rgb;
   vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
+  outColor = vec4(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(vLocal, aaWidth));
 }
 `;
 
@@ -345,7 +328,7 @@ void main() {
     ? max(0.35 * localUnitsPerPixel, 5e-5)
     : max(localUnitsPerPixel, 0.0001) * uAAScreenPx;
   float geometryLength = primitiveType >= 0.5 ? length(p1 - p0) + length(p2 - p1) : length(p2 - p0);
-  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !isRoundCap) || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vAlpha = 0.0;
     return;
@@ -396,6 +379,7 @@ void main() {
 
 export const GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_COVERAGE_GLSL}
 precision highp sampler2D;
 
 uniform float uStrokeCurveEnabled;
@@ -470,6 +454,9 @@ float distanceToQuadratic(vec2 point, vec2 p0, vec2 p1, vec2 p2) {
 }
 
 void main() {
+  float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float localPerPixel = max(max(dx, dy), 1e-6);
   if (vAlpha <= 0.001) discard;
   if (
     vHasClipBounds >= 0.5 &&
@@ -479,12 +466,9 @@ void main() {
   float distanceValue = uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5
     ? distanceToQuadratic(vLocal, vP0, vP1, vP2)
     : distanceToLine(vLocal, vP0, vP2);
-  float dx = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float dy = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-  float localPerPixel = max(max(dx, dy), 1e-6);
   float aaWorld = max(localPerPixel * uAAScreenPx, 5e-5);
   float halfWidth = vIsHairline >= 0.5 ? max(0.5 * localPerPixel, 1e-5) : vHalfWidth;
-  float coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceValue);
+  float coverage = heprStrokeCoverage(distanceValue, halfWidth, aaWorld);
 
   vec4 source = vSourceGradientIndex >= 0
     ? samplePdfGradient(vSourceGradientIndex, vLocal)
@@ -494,6 +478,6 @@ void main() {
   if (alpha <= 0.001) discard;
   vec3 baseColor = uPrimitiveOverride.a > 0.5 ? uPrimitiveOverride.rgb : source.rgb;
   vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  outColor = vec4(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(vLocal);
+  outColor = vec4(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(vLocal, localPerPixel));
 }
 `;

@@ -1,3 +1,7 @@
+import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
+import { vectorFillBandStore, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
@@ -7,6 +11,8 @@ import { GRADIENT_MESH_WGSL, GRADIENT_MESH_VERTEX_LAYOUT } from "./gradientMeshS
 import { pdfShapeCoverageWgsl } from "./pdfShapeCoverage";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
+import { scenePaintSpanSegments } from "./scenePaintGraph";
+import { buildCanonicalRunLookup, submitPaintSpan, type CanonicalRunLookup } from "./scenePaintSpanDraws";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import { coalescePrimitiveColorTexels, NativePrimitiveColors, WebGpuPrimitiveGradientColors } from "./nativePrimitiveColors";
 import { WebGpuPrimitiveHighlights } from "./nativePrimitiveHighlights";
@@ -14,7 +20,7 @@ import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
-import { packVectorClips } from "./vectorClips";
+import { packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -29,9 +35,11 @@ import {
 import { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } from "./nativeGradientWebGpuShaders";
 import {
   isNativeTextHeavyStrokeFreeScene,
+  NATIVE_PAN_CACHE_MIN_PAINTS,
   NATIVE_VECTOR_MINIFY_ENABLED,
   shouldUseNativePanCacheForFrame
 } from "./nativeRenderPolicy";
+import { chooseNativePanCacheSize } from "./nativePanCache";
 import { prepareSearchHighlights, type SearchHighlightSet } from "./searchHighlights";
 import type {
   DrawStats,
@@ -48,6 +56,7 @@ import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import {
   appendTextLodCombinedPayload,
   TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+  writeTextGlyphInkDensities,
   type TextLodBuildData
 } from "./textGreekLod";
 import { createOrthographicLocalToClip } from "./planarProjection";
@@ -59,7 +68,7 @@ import {
   type TextLodStats
 } from "./textLodCore";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
-import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { buildTextRasterAtlas, TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
   takePrebuiltVectorStrokeLodRuntime,
@@ -116,8 +125,6 @@ interface NativeTextUploadArrays {
 const INTERACTION_DECAY_MS = 140;
 const FULL_VIEW_FALLBACK_THRESHOLD = 0.92;
 const PAN_CACHE_MIN_SEGMENTS = 300_000;
-const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
-const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
 const PAN_CACHE_ZOOM_RATIO_MIN = 0.75;
 const PAN_CACHE_ZOOM_RATIO_MAX = 1.3333333333;
@@ -138,8 +145,8 @@ const CLEAR_COLOR = {
   a: 1
 };
 
-const CAMERA_UNIFORM_FLOATS = 16;
-const CAMERA_UNIFORM_BUFFER_BYTES = 64;
+const CAMERA_UNIFORM_FLOATS = 20;
+const CAMERA_UNIFORM_BUFFER_BYTES = 80;
 
 const BLIT_UNIFORM_FLOATS = 12;
 const BLIT_UNIFORM_BUFFER_BYTES = 48;
@@ -163,6 +170,8 @@ fn heprLinearCoverageToOutputAlpha(coverage : f32) -> f32 {
 `;
 
 const STROKE_SHADER_SOURCE = /* wgsl */ `
+${STROKE_COVERAGE_WGSL}
+${STROKE_DENSITY_WGSL}
 struct CameraUniforms {
   viewport : vec2f,
   cameraCenter : vec2f,
@@ -175,6 +184,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 struct SegmentIdBuffer {
@@ -263,7 +273,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   var out : VsOut;
   out.vectorClipIndex = uVectorClip.x;
   if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
-  if ((geometryLength < 1e-5 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !isRoundCap) || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0, 0.0);
     out.p0 = vec2f(0.0, 0.0);
@@ -336,10 +346,11 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     useCurve
   );
 
-  let coverage = 1.0 - smoothstep(inData.halfWidth - inData.aaWorld, inData.halfWidth + inData.aaWorld, distanceToSegment);
-  let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
+  let coverage = heprStrokeCoverage(distanceToSegment, inData.halfWidth, inData.aaWorld);
+  var alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
+  alpha = heprStrokeLodAlpha(alpha, inData.primitiveType);
 
-  if (alpha <= 0.001) {
+  if (alpha <= 0.0) {
     discard;
   }
 
@@ -361,6 +372,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -380,13 +392,13 @@ struct VsOut {
   @location(4) @interpolate(flat) alpha : f32,
   @location(5) @interpolate(flat) fillRule : f32,
   @location(6) @interpolate(flat) fillHasCompanionStroke : f32,
+  @location(7) @interpolate(flat) bands : vec4f,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
+${VECTOR_FILL_BAND_INFO_WGSL}
 
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
-const QUAD_WINDING_SUBDIVISIONS : i32 = 6;
-
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
   switch (vertexIndex) {
     case 0u: {
@@ -408,98 +420,8 @@ fn coordFromIndex(index : i32, width : i32) -> vec2<i32> {
   return vec2<i32>(index % width, index / width);
 }
 
-fn distanceToLineSegment(p : vec2f, a : vec2f, b : vec2f) -> f32 {
-  let ab = b - a;
-  let abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 {
-  let aa = b - a;
-  let bb = a - 2.0 * b + c;
-  let cc = aa * 2.0;
-  let dd = a - p;
-
-  let bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  let inv = 1.0 / bbLenSq;
-  let kx = inv * dot(aa, bb);
-  let ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  let kz = inv * dot(dd, aa);
-
-  let pValue = ky - kx * kx;
-  let pCube = pValue * pValue * pValue;
-  let qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  let hValue = qValue * qValue + 4.0 * pCube;
-
-  var best = 1e20;
-
-  if (hValue >= 0.0) {
-    let hSqrt = sqrt(hValue);
-    let roots = (vec2f(hSqrt, -hSqrt) - qValue) * 0.5;
-    let uv = sign(roots) * pow(abs(roots), vec2f(1.0 / 3.0));
-    let t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    let delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    let z = sqrt(-pValue);
-    let acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    let angle = acos(acosArg) / 3.0;
-    let cosine = cos(angle);
-    let sine = sin(angle) * 1.732050808;
-    let t = clamp(vec3f(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, vec3f(0.0), vec3f(1.0));
-
-    var delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
-
-fn evaluateQuadratic(a : vec2f, b : vec2f, c : vec2f, t : f32) -> vec2f {
-  let oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-fn accumulateLineCrossing(a : vec2f, b : vec2f, p : vec2f, winding : ptr<function, i32>, crossings : ptr<function, i32>) {
-  let upward = (a.y <= p.y) && (b.y > p.y);
-  let downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  let denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    *crossings = *crossings + 1;
-    *winding = *winding + select(-1, 1, upward);
-  }
-}
-
-fn accumulateQuadraticCrossing(a : vec2f, b : vec2f, c : vec2f, p : vec2f, winding : ptr<function, i32>, crossings : ptr<function, i32>) {
-  var prev = a;
-  for (var i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i = i + 1) {
-    let t = f32(i) / f32(QUAD_WINDING_SUBDIVISIONS);
-    let next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding, crossings);
-    prev = next;
-  }
-}
+${FILL_COVERAGE_WGSL}
+${FILL_COVERAGE_VERTEX_WGSL}
 
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
@@ -516,6 +438,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let alpha = metaC.w;
 
   var out : VsOut;
+  out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.x, uFillSegmentTexA);
   out.vectorClipIndex = uVectorClip.x;
   if (uVectorClip.x < -1.5) { out.vectorClipIndex = f32(uOrderedInstances[instanceIndex].y) - 1.0; }
   if (segmentCount <= 0 || alpha <= 0.001) {
@@ -533,7 +456,10 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let minBounds = metaA.zw;
   let maxBounds = metaB.xy;
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let world = mix(minBounds, maxBounds, corner01);
+  // Pixels whose footprint reaches the path need fragments even when the path
+  // is thinner than a pixel and falls between pixel centres.
+  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  let world = mix(minBounds - margin, maxBounds + margin, corner01);
 
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
@@ -556,9 +482,11 @@ ${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  let pixelToLocalX = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
-  let pixelToLocalY = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
-  let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uCamera.fillAAScreenPx, 1e-4);
+  // The path-space footprint of this pixel, taken before any discard.
+  let footprint = max(vec2f(
+    length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x))),
+    length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)))
+  ) * uCamera.fillAAScreenPx, vec2f(1e-4));
 
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) {
     discard;
@@ -566,50 +494,32 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
   let fillSegDims = textureDimensions(uFillSegmentTexA);
 
-  var minDistance = 1e20;
-  var winding = 0;
-  var crossings = 0;
-
-  for (var i = 0; i < inData.segmentCount; i = i + 1) {
-    if (i >= inData.segmentCount) {
-      break;
-    }
-
-    let segmentIndex = inData.segmentStart + i;
+  // Average the winding number over the footprint box. The bands spanning its
+  // rows hold every segment that can contribute; each integrates its own rows.
+  let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
+  var winding = 0.0;
+${vectorFillBandLoopWgsl({
+    bands: "inData.bands",
+    y: "inData.local.y",
+    radius: "0.5 * footprint.y",
+    count: "inData.segmentCount",
+    start: "inData.segmentStart",
+    texture: "uFillSegmentTexA",
+    entries: "uCamera.fillBands.y",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
+    edge: `
     let coord = coordFromIndex(segmentIndex, i32(fillSegDims.x));
-
     let primitiveA = textureLoad(uFillSegmentTexA, coord, 0);
     let primitiveB = textureLoad(uFillSegmentTexB, coord, 0);
-    let p0 = primitiveA.xy;
-    let p1 = primitiveA.zw;
-    let p2 = primitiveB.xy;
-    let primitiveType = primitiveB.z;
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
+`
+  })}
 
-    if (primitiveType >= FILL_PRIMITIVE_QUADRATIC) {
-      minDistance = min(minDistance, distanceToQuadraticBezier(inData.local, p0, p1, p2));
-      accumulateQuadraticCrossing(p0, p1, p2, inData.local, &winding, &crossings);
-    } else {
-      minDistance = min(minDistance, distanceToLineSegment(inData.local, p0, p2));
-      accumulateLineCrossing(p0, p2, inData.local, &winding, &crossings);
-    }
-  }
-
-  let insideNonZero = winding != 0;
-  let insideEvenOdd = (crossings & 1) == 1;
-  let inside = select(insideNonZero, insideEvenOdd, inData.fillRule >= 0.5);
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-
-  if (inData.fillHasCompanionStroke >= 0.5) {
-    let alpha = select(0.0, inData.alpha, inside);
-    if (alpha <= 0.001) {
-      discard;
-    }
-    return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.local, inData.vectorClipIndex, uVectorClipTex);
-  }
-
-  let signedDistance = select(minDistance, -minDistance, inside);
-
-  let coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  // A companion stroke no longer hides a hard fill edge: thin filled shapes
+  // need their own coverage, and wide strokes still cover the edge.
+  let coverage = heprFillCoverage(winding, inData.fillRule >= 0.5);
   let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
   if (alpha <= 0.001) {
     discard;
@@ -632,6 +542,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -664,11 +575,11 @@ struct VsOut {
   @location(6) normCoord : vec2f,
   @location(7) world : vec2f,
   @location(8) @interpolate(flat) clipRect : vec4f,
+  @location(9) @interpolate(flat) inkDensity : f32,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
 
-const MAX_GLYPH_PRIMITIVES : i32 = 2048;
 const TEXT_PRIMITIVE_QUADRATIC : f32 = 1.0;
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -692,170 +603,8 @@ fn coordFromIndex(index : i32, width : i32) -> vec2<i32> {
   return vec2<i32>(index % width, index / width);
 }
 
-fn textLineDistanceInfo(p : vec2f, a : vec2f, b : vec2f) -> vec4f {
-  let ab = b - a;
-  let abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return vec4f(length(p - a), 0.0, 1.0, 0.0);
-  }
-  let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  let offset = p - (a + ab * t);
-  let tangent = ab * inverseSqrt(abLenSq);
-  let leftNormal = vec2f(-tangent.y, tangent.x);
-  return vec4f(length(offset), t, leftNormal);
-}
-
-fn textQuadraticDistanceInfo(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> vec4f {
-  let aa = b - a;
-  let bb = a - 2.0 * b + c;
-  let cc = aa * 2.0;
-  let dd = a - p;
-
-  let bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return textLineDistanceInfo(p, a, c);
-  }
-
-  let inv = 1.0 / bbLenSq;
-  let kx = inv * dot(aa, bb);
-  let ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  let kz = inv * dot(dd, aa);
-
-  let pValue = ky - kx * kx;
-  let pCube = pValue * pValue * pValue;
-  let qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  let hValue = qValue * qValue + 4.0 * pCube;
-
-  var best = 1e20;
-  var closestT = 0.0;
-
-  if (hValue >= 0.0) {
-    let hSqrt = sqrt(hValue);
-    let roots = (vec2f(hSqrt, -hSqrt) - qValue) * 0.5;
-    let uv = sign(roots) * pow(abs(roots), vec2f(1.0 / 3.0));
-    closestT = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    let delta = dd + (cc + bb * closestT) * closestT;
-    best = dot(delta, delta);
-  } else {
-    let z = sqrt(-pValue);
-    let acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    let angle = acos(acosArg) / 3.0;
-    let cosine = cos(angle);
-    let sine = sin(angle) * 1.732050808;
-    let t = clamp(vec3f(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, vec3f(0.0), vec3f(1.0));
-
-    var delta = dd + (cc + bb * t.x) * t.x;
-    best = dot(delta, delta);
-    closestT = t.x;
-    delta = dd + (cc + bb * t.y) * t.y;
-    var candidate = dot(delta, delta);
-    if (candidate < best) {
-      best = candidate;
-      closestT = t.y;
-    }
-    delta = dd + (cc + bb * t.z) * t.z;
-    candidate = dot(delta, delta);
-    if (candidate < best) {
-      best = candidate;
-      closestT = t.z;
-    }
-  }
-
-  let closestPoint = evaluateQuadratic(a, b, c, closestT);
-  var tangent = 2.0 * ((1.0 - closestT) * (b - a) + closestT * (c - b));
-  var tangentLenSq = dot(tangent, tangent);
-  if (tangentLenSq <= 1e-12) {
-    tangent = c - a;
-    tangentLenSq = dot(tangent, tangent);
-  }
-  var leftNormal = vec2f(1.0, 0.0);
-  if (tangentLenSq > 1e-12) {
-    leftNormal = vec2f(-tangent.y, tangent.x) * inverseSqrt(tangentLenSq);
-  }
-  return vec4f(sqrt(max(best, 0.0)), closestT, leftNormal);
-}
-
-fn evaluateQuadratic(a : vec2f, b : vec2f, c : vec2f, t : f32) -> vec2f {
-  let oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-fn accumulateLineCrossing(a : vec2f, b : vec2f, p : vec2f, winding : ptr<function, i32>) {
-  let upward = (a.y <= p.y) && (b.y > p.y);
-  let downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  let denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    *winding = *winding + select(-1, 1, upward);
-  }
-}
-
-fn accumulateQuadraticCrossingRoot(
-  a : vec2f,
-  b : vec2f,
-  c : vec2f,
-  p : vec2f,
-  ay : f32,
-  by : f32,
-  t : f32,
-  winding : ptr<function, i32>
-) {
-  let rootEps = 1e-5;
-  if (t < -rootEps || t >= 1.0 - rootEps) {
-    return;
-  }
-
-  let tc = clamp(t, 0.0, 1.0);
-  let oneMinusT = 1.0 - tc;
-  let xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
-  if (xCross <= p.x) {
-    return;
-  }
-
-  let dy = by + 2.0 * ay * tc;
-  if (abs(dy) <= 1e-6) {
-    return;
-  }
-
-  *winding = *winding + select(-1, 1, dy > 0.0);
-}
-
-fn accumulateQuadraticCrossing(a : vec2f, b : vec2f, c : vec2f, p : vec2f, winding : ptr<function, i32>) {
-  let ay = a.y - 2.0 * b.y + c.y;
-  let by = 2.0 * (b.y - a.y);
-  let cy = a.y - p.y;
-
-  if (abs(ay) <= 1e-8) {
-    if (abs(by) <= 1e-8) {
-      return;
-    }
-    let t = -cy / by;
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t, winding);
-    return;
-  }
-
-  let discriminant = by * by - 4.0 * ay * cy;
-  if (discriminant < 0.0) {
-    return;
-  }
-
-  let sqrtDiscriminant = sqrt(max(discriminant, 0.0));
-  let invDen = 0.5 / ay;
-  let t0 = (-by - sqrtDiscriminant) * invDen;
-  let t1 = (-by + sqrtDiscriminant) * invDen;
-  accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t0, winding);
-  if (abs(t1 - t0) > 1e-5) {
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t1, winding);
-  }
-}
+${FILL_COVERAGE_WGSL}
+${FILL_COVERAGE_VERTEX_WGSL}
 
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
@@ -899,13 +648,17 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.normCoord = vec2f(0.0, 0.0);
     out.world = vec2f(0.0, 0.0);
     out.clipRect = vec4f(0.0, 0.0, 0.0, 0.0);
+    out.inkDensity = 0.0;
     return out;
   }
 
   let minBounds = glyphMetaA.zw;
   let maxBounds = glyphMetaB.xy;
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let local = mix(minBounds, maxBounds, corner01);
+  // Widen the glyph quad by a pixel in glyph space, so stems and dots thinner
+  // than a pixel reach every pixel their footprint touches.
+  let margin = heprCoverageMargin(uCamera.zoom * mat2x2f(instanceA.x, instanceA.y, instanceA.z, instanceA.w));
+  let local = mix(minBounds - margin, maxBounds + margin, corner01);
 
   let world = vec2f(
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
@@ -931,7 +684,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.color = instanceC.xyz;
   out.colorAlpha = instanceC.w;
   out.rasterRect = glyphRasterMeta;
-  out.normCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2f(1e-6, 1e-6)), vec2f(0.0), vec2f(1.0));
+  out.inkDensity = glyphMetaB.z;
+  // Unclamped, so the margin samples the atlas tile's transparent padding.
+  out.normCoord = (local - minBounds) / max(maxBounds - minBounds, vec2f(1e-6, 1e-6));
   out.world = world;
   return out;
 }
@@ -952,10 +707,10 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let localDy = dpdy(inData.local);
   let pixelToLocalX = length(vec2f(localDx.x, localDy.x));
   let pixelToLocalY = length(vec2f(localDx.y, localDy.y));
-  // Frobenius is a conservative bound for primitive culling in every normal
-  // direction; final coverage below uses the tighter projected-normal width.
-  let localPerPixel = length(vec2f(pixelToLocalX, pixelToLocalY));
-  let baseAAWidth = max(localPerPixel * uCamera.textAAScreenPx, 1e-4);
+  let glyphPixel = vec2f(
+    length(vec2f(dpdx(inData.normCoord.x), dpdy(inData.normCoord.x))),
+    length(vec2f(dpdx(inData.normCoord.y), dpdy(inData.normCoord.y)))
+  );
   let atlasDims = vec2f(textureDimensions(uTextRasterAtlasTex));
   let nc = vec2f(inData.normCoord.x, 1.0 - inData.normCoord.y) * (inData.rasterRect.zw * atlasDims);
   let dncDx = dpdx(nc);
@@ -967,187 +722,100 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  if (
-    uCamera.textVectorOnly < 0.5 &&
-    inData.rasterRect.z > 0.0 &&
-    inData.rasterRect.w > 0.0 &&
-    min(ncFwidthX, ncFwidthY) > 2.0
-  ) {
-    let uvCenter = vec2f(
-      inData.rasterRect.x + inData.normCoord.x * inData.rasterRect.z,
-      inData.rasterRect.y + (1.0 - inData.normCoord.y) * inData.rasterRect.w
-    );
-    let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
-    let uvMin = inData.rasterRect.xy + texel * 0.5;
-    let uvMax = inData.rasterRect.xy + inData.rasterRect.zw - texel * 0.5;
-    let tapDx = dncDx * 0.33 * texel;
-    let tapDy = dncDy * 0.33 * texel;
-    // textureSampleGrad is valid in non-uniform control flow. The gradients
-    // were evaluated above the branch for derivative-uniformity and retain the
-    // anisotropic footprint. Scaling by exp2(-1.25) preserves the old mip bias.
-    let mipBiasedUvDx = dncDx * texel * 0.42044820762685725;
-    let mipBiasedUvDy = dncDy * texel * 0.42044820762685725;
-    let alphaRaster = (1.0 / 3.0) * textureSampleGrad(
-      uTextRasterAtlasTex,
-      uTextRasterSampler,
-      clamp(uvCenter, uvMin, uvMax),
-      mipBiasedUvDx,
-      mipBiasedUvDy
-    ).r + (1.0 / 6.0) * (
-      textureSampleGrad(
+  // A glyph a few pixels across is its box at mean ink density, as coarse
+  // text LOD runs are, so switching between them changes nothing. Its shape
+  // fades in as it grows from 2.5 to 5 pixels.
+  let glyphPixels = 1.0 / max(min(glyphPixel.x, glyphPixel.y), 1e-6);
+  let detail = clamp((glyphPixels - 2.5) / 2.5, 0.0, 1.0);
+  let halfBox = max(0.5 * uCamera.textAAScreenPx * glyphPixel, vec2f(1e-6));
+  let boxOverlap = max(min(inData.normCoord + halfBox, vec2f(1.0)) - max(inData.normCoord - halfBox, vec2f(0.0)), vec2f(0.0)) /
+    (2.0 * halfBox);
+  var coverage = clamp(inData.inkDensity, 0.0, 1.0) * boxOverlap.x * boxOverlap.y;
+
+  if (detail > 0.0) {
+    var detailCoverage = 0.0;
+    if (
+      uCamera.textVectorOnly < 0.5 &&
+      inData.rasterRect.z > 0.0 &&
+      inData.rasterRect.w > 0.0 &&
+      min(ncFwidthX, ncFwidthY) > 2.0
+    ) {
+      let uvCenter = vec2f(
+        inData.rasterRect.x + inData.normCoord.x * inData.rasterRect.z,
+        inData.rasterRect.y + (1.0 - inData.normCoord.y) * inData.rasterRect.w
+      );
+      let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
+      // The widened quad reaches past the glyph box into its tile's transparent
+      // padding, which must read as empty rather than repeat the edge texels.
+      let padding = texel * ${TEXT_RASTER_ATLAS_PADDING_PX - 0.5};
+      let uvMin = inData.rasterRect.xy - padding;
+      let uvMax = inData.rasterRect.xy + inData.rasterRect.zw + padding;
+      let tapDx = dncDx * 0.33 * texel;
+      let tapDy = dncDy * 0.33 * texel;
+      // Coarser mips than the padding blend neighbouring glyphs' ink in.
+      let mipCap = min(1.0, ${TEXT_RASTER_ATLAS_PADDING_PX}.0 /
+        max(max(length(dncDx), length(dncDy)) * 0.42044820762685725, 1e-6));
+      // textureSampleGrad is valid in non-uniform control flow. The gradients
+      // were evaluated above the branch for derivative-uniformity and retain the
+      // anisotropic footprint. Scaling by exp2(-1.25) preserves the old mip bias.
+      let mipBiasedUvDx = dncDx * texel * 0.42044820762685725 * mipCap;
+      let mipBiasedUvDy = dncDy * texel * 0.42044820762685725 * mipCap;
+      detailCoverage = (1.0 / 3.0) * textureSampleGrad(
         uTextRasterAtlasTex,
         uTextRasterSampler,
-        clamp(uvCenter - tapDx - tapDy, uvMin, uvMax),
+        clamp(uvCenter, uvMin, uvMax),
         mipBiasedUvDx,
         mipBiasedUvDy
-      ).r +
-      textureSampleGrad(
-        uTextRasterAtlasTex,
-        uTextRasterSampler,
-        clamp(uvCenter - tapDx + tapDy, uvMin, uvMax),
-        mipBiasedUvDx,
-        mipBiasedUvDy
-      ).r +
-      textureSampleGrad(
-        uTextRasterAtlasTex,
-        uTextRasterSampler,
-        clamp(uvCenter + tapDx - tapDy, uvMin, uvMax),
-        mipBiasedUvDx,
-        mipBiasedUvDy
-      ).r +
-      textureSampleGrad(
-        uTextRasterAtlasTex,
-        uTextRasterSampler,
-        clamp(uvCenter + tapDx + tapDy, uvMin, uvMax),
-        mipBiasedUvDx,
-        mipBiasedUvDy
-      ).r
-    );
-    let alpha = heprLinearCoverageToOutputAlpha(alphaRaster) * inData.colorAlpha;
-    if (alpha <= 0.001) {
-      discard;
+      ).r + (1.0 / 6.0) * (
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter - tapDx - tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r +
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter - tapDx + tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r +
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter + tapDx - tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r +
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter + tapDx + tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r
+      );
+    } else {
+      // Average the glyph's nonzero winding number over the pixel footprint in
+      // glyph space. Thin stems keep their ink instead of snapping to pixels.
+      let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
+      let footprint = max(vec2f(pixelToLocalX, pixelToLocalY) * uCamera.textAAScreenPx, vec2f(1e-4));
+      let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
+      var winding = 0.0;
+      for (var i = 0; i < inData.segmentCount; i = i + 1) {
+        let coord = coordFromIndex(inData.segmentStart + i, i32(glyphSegDims.x));
+        let primitiveA = textureLoad(uTextGlyphSegmentTexA, coord, 0);
+        let primitiveB = textureLoad(uTextGlyphSegmentTexB, coord, 0);
+        winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+          uCamera.textCurveEnabled >= 0.5 && primitiveB.z >= TEXT_PRIMITIVE_QUADRATIC, box, 0.0, 1.0);
+      }
+      detailCoverage = heprFillCoverage(winding, false);
     }
-    let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-    return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.world, inData.vectorClipIndex, uVectorClipTex);
+    coverage = mix(coverage, detailCoverage, detail);
   }
 
-  let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
-
-  let coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
-  // Outside the antialiasing band the smoothstep below saturates, so the winding
-  // number alone decides the pixel and exact distances stop mattering. The small
-  // margin keeps coincident-edge grouping from losing a tie candidate.
-  let aaCullDistance = baseAAWidth * 1.05 + coincidentEpsilon;
-  // A tiny deterministic offset keeps exact-on-edge winding tests stable.
-  let queryLocal = inData.local + 0.001 * (localDx + 0.37 * localDy);
-  var minDistance = 1e20;
-  var nearestT = 0.0;
-  var nearestPoint = vec2f(0.0);
-  var nearestNormal = vec2f(1.0, 0.0);
-  var nearestSideMultiplicity = 0;
-  var winding = 0;
-
-  for (var i = 0; i < MAX_GLYPH_PRIMITIVES; i = i + 1) {
-    if (i >= inData.segmentCount) {
-      break;
-    }
-
-    let segmentIndex = inData.segmentStart + i;
-    let coord = coordFromIndex(segmentIndex, i32(glyphSegDims.x));
-
-    let primitiveA = textureLoad(uTextGlyphSegmentTexA, coord, 0);
-    let primitiveB = textureLoad(uTextGlyphSegmentTexB, coord, 0);
-    let p0 = primitiveA.xy;
-    let p1 = primitiveA.zw;
-    let p2 = primitiveB.xy;
-    let primitiveType = primitiveB.z;
-    let isQuadratic = uCamera.textCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC;
-
-    // A quadratic stays inside the hull of its control points, so this box
-    // contains the primitive for both curve and line cases.
-    var hullMin = min(p0, p2);
-    var hullMax = max(p0, p2);
-    if (isQuadratic) {
-      hullMin = min(hullMin, p1);
-      hullMax = max(hullMax, p1);
-    }
-
-    // The ray used for the winding test travels along +x, so it can only cross
-    // this primitive within the box's y span and to the right of the query point.
-    let mayCross = queryLocal.y >= hullMin.y && queryLocal.y <= hullMax.y && hullMax.x > queryLocal.x;
-
-    // Distance to the box lower-bounds the distance to the primitive inside it.
-    let boundOffset = max(max(hullMin - queryLocal, queryLocal - hullMax), vec2f(0.0));
-    let cullDistance = min(aaCullDistance, minDistance + coincidentEpsilon);
-    let mayBeNearest = dot(boundOffset, boundOffset) <= cullDistance * cullDistance;
-
-    if (!mayCross && !mayBeNearest) {
-      continue;
-    }
-
-    if (mayBeNearest) {
-      var distanceInfo : vec4f;
-      var closestPoint : vec2f;
-      if (isQuadratic) {
-        distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
-        closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
-      } else {
-        distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
-        closestPoint = mix(p0, p2, distanceInfo.y);
-      }
-
-      let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
-      let sideStep = select(-1, 1, signedOffset >= 0.0);
-      if (distanceInfo.x + coincidentEpsilon < minDistance) {
-        minDistance = distanceInfo.x;
-        nearestT = distanceInfo.y;
-        nearestPoint = closestPoint;
-        nearestNormal = distanceInfo.zw;
-        nearestSideMultiplicity = sideStep;
-      } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
-        let normalAlignment = dot(distanceInfo.zw, nearestNormal);
-        let bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
-          nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
-        let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
-          abs(normalAlignment) >= 0.9999;
-        if (sameEdge) {
-          nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
-          minDistance = min(minDistance, distanceInfo.x);
-        } else if (distanceInfo.x < minDistance) {
-          minDistance = distanceInfo.x;
-          nearestT = distanceInfo.y;
-          nearestPoint = closestPoint;
-          nearestNormal = distanceInfo.zw;
-          nearestSideMultiplicity = sideStep;
-        }
-      }
-    }
-
-    if (mayCross) {
-      if (isQuadratic) {
-        accumulateQuadraticCrossing(p0, p1, p2, queryLocal, &winding);
-      } else {
-        accumulateLineCrossing(p0, p2, queryLocal, &winding);
-      }
-    }
-  }
-
-  let inside = winding != 0;
-  let acrossWinding = winding - nearestSideMultiplicity;
-  let nearestSeparatesFill = inside != (acrossWinding != 0);
-  let signedDistance = select(minDistance, -minDistance, inside);
-  // Keep the maximum derivative above for conservative primitive culling, but
-  // resolve final coverage with the derivative along the nearest edge normal.
-  // This prevents tilted glyph edges from acquiring over-wide grey bands.
-  let edgeAAWidth = max(
-    length(vec2f(dot(localDx, nearestNormal), dot(localDy, nearestNormal))) * uCamera.textAAScreenPx,
-    1e-4
-  );
-  let edgeAlpha = 1.0 - smoothstep(-edgeAAWidth, edgeAAWidth, signedDistance);
-  // Nonzero fill stays opaque across overlap-only contour edges. Coincident
-  // exterior edges are grouped above and antialiased as one true boundary.
-  let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
-  let alpha = heprLinearCoverageToOutputAlpha(alphaBase) * inData.colorAlpha;
+  let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -1170,6 +838,7 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 
 struct RasterUniforms {
@@ -1645,12 +1314,20 @@ export class WebGpuFloorplanRenderer {
   private vectorClipBuffers: any[] = [];
   private vectorClipBindGroups: any[] = [];
   private vectorClipIndex = -1;
+  /** Per clip [minX, minY, maxX, maxY] intersected with its ancestors. */
+  private vectorClipBounds: Float32Array = new Float32Array(0);
   private orderedBatches: VectorOrderedBatches | null = null;
+  /** Per kind, canonical run indices sorted by their first primitive. */
+  private runLookup: CanonicalRunLookup | null = null;
   private orderedInstanceBuffer: any = null;
   private scene: VectorScene | null = null;
   private readonly rasterLayerUpdates = new Map<number, RasterLayer>();
   private paintCompositor: WebGpuPaintCompositor | null = null;
   private paintViewportWidth = 1;
+  /** Camera the paint pass was encoded with, for projecting composite rectangles. */
+  private paintCameraCenterX = 0;
+  private paintCameraCenterY = 0;
+  private paintZoom = 1;
   private paintViewportHeight = 1;
   private optionalContentVisibility: OptionalContentSnapshot | null = null;
   private scenePaintVisibility: ScenePaintVisibility | null = null;
@@ -1679,6 +1356,10 @@ export class WebGpuFloorplanRenderer {
   private externalFrameDriver = false;
   private isDisposed = false;
   private externalFramePending = false;
+  /** The GPU has not finished the last animation frame's work yet. */
+  private gpuFrameInFlight = false;
+  /** A frame was requested while the GPU was busy; schedule it once the GPU is done. */
+  private framePendingOnGpu = false;
 
   private cameraCenterX = 0;
 
@@ -1771,6 +1452,10 @@ export class WebGpuFloorplanRenderer {
 
   private segmentTextureHeight = 1;
 
+  private fillBandBase = -1;
+  private fillBandEntries = 0;
+  private gradientFillBandBase = -1;
+  private gradientFillBandEntries = 0;
   private fillPathMetaTextureWidth = 1;
 
   private fillPathMetaTextureHeight = 1;
@@ -1858,7 +1543,8 @@ export class WebGpuFloorplanRenderer {
 
     this.vectorClipBindGroupLayout = this.gpuDevice.createBindGroupLayout({ entries: [
       { binding: 0, visibility: gpuShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
-      { binding: 1, visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } },
+      // [clip index, 0, 0, 0] then the clip chain's bounds, which gradients clamp their quads to.
+      { binding: 1, visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 32 } },
       { binding: 2, visibility: gpuShaderStage.VERTEX, buffer: { type: "read-only-storage", minBindingSize: 8 } }
     ] });
     this.strokeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
@@ -1920,7 +1606,7 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 4,
-          visibility: gpuShaderStage.FRAGMENT,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
         },
         {
@@ -1943,7 +1629,12 @@ export class WebGpuFloorplanRenderer {
           visibility: gpuShaderStage.VERTEX,
           texture: { sampleType: "unfilterable-float" }
         })),
-        ...[5, 6, 7, 8, 9, 10, 11].map((binding) => ({
+        {
+          binding: 5,
+          visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "unfilterable-float" }
+        },
+        ...[6, 7, 8, 9, 10, 11].map((binding) => ({
           binding,
           visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "unfilterable-float" }
@@ -2373,6 +2064,7 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.strokeCurveEnabled = nextEnabled;
+    this.panCacheValid = false;
     this.requestFrame();
   }
 
@@ -2758,7 +2450,10 @@ export class WebGpuFloorplanRenderer {
 
     const segmentDims = chooseTextureDimensions(scene.segmentCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
-    const fillSegmentDims = chooseTextureDimensions(scene.fillSegmentCount, maxTextureSize);
+    const fillBands = vectorFillBandStore(scene.fillSegmentsA, scene.fillSegmentCount, vectorFillBandIndex(scene), maxTextureSize);
+    this.fillBandBase = fillBands.pathBase;
+    this.fillBandEntries = fillBands.entryBase;
+    const fillSegmentDims = chooseTextureDimensions(fillBands.texels, maxTextureSize);
     let textInstanceDims = chooseTextureDimensions(
       textLodUploadData?.combinedInstanceCount ?? scene.textInstanceCount,
       maxTextureSize
@@ -2823,7 +2518,7 @@ export class WebGpuFloorplanRenderer {
     this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaA);
     this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaB);
     this.fillPathMetaTextureC = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaC);
-    this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsA);
+    this.fillSegmentTextureA = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, fillBands.data);
     this.fillSegmentTextureB = this.createFloatTexture(this.fillSegmentTextureWidth, this.fillSegmentTextureHeight, scene.fillSegmentsB);
 
     const textInstanceTexels = this.textInstanceTextureWidth * this.textInstanceTextureHeight;
@@ -3379,6 +3074,7 @@ export class WebGpuFloorplanRenderer {
     this.orderedInstanceBuffer?.destroy();
     this.orderedInstanceBuffer = null;
     this.orderedBatches = null;
+    this.runLookup = null;
     this.vectorClipTexture?.destroy();
     for (const buffer of this.vectorClipBuffers) buffer.destroy();
     this.vectorClipBuffers = [];
@@ -3398,6 +3094,7 @@ export class WebGpuFloorplanRenderer {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = 0;
     }
+    this.framePendingOnGpu = false;
 
     this.frameListener = null;
     this.destroyPanCacheResources();
@@ -3599,11 +3296,43 @@ export class WebGpuFloorplanRenderer {
     if (this.rafHandle !== 0) {
       return;
     }
+    // WebGPU submission never blocks, so an animation-frame loop can queue
+    // frames faster than the GPU finishes them: input then lags behind the
+    // queue and the frame listener counts callbacks, not finished frames.
+    // Start the next frame only once the GPU has finished the previous one.
+    if (this.gpuFrameInFlight) {
+      this.framePendingOnGpu = true;
+      return;
+    }
 
     this.rafHandle = requestAnimationFrame((timestamp) => {
       this.rafHandle = 0;
-      this.render(timestamp);
+      // Requests made while rendering, such as continuing a camera animation,
+      // wait for this frame's GPU work as well.
+      this.gpuFrameInFlight = true;
+      try {
+        this.render(timestamp);
+      } finally {
+        this.waitForGpuFrame();
+      }
     });
+  }
+
+  private waitForGpuFrame(): void {
+    const finished = (): void => {
+      this.gpuFrameInFlight = false;
+      if (!this.framePendingOnGpu || this.isDisposed) {
+        return;
+      }
+      this.framePendingOnGpu = false;
+      this.requestFrame();
+    };
+    const queue = this.gpuDevice?.queue;
+    if (this.isDisposed || typeof queue?.onSubmittedWorkDone !== "function") {
+      finished();
+      return;
+    }
+    queue.onSubmittedWorkDone().then(finished, finished);
   }
 
   private render(timestamp: number = performance.now()): void {
@@ -3684,13 +3413,12 @@ export class WebGpuFloorplanRenderer {
 
   private shouldUsePanCache(isCameraAnimating: boolean): boolean {
     const sceneEligible =
-      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene();
-    const vectorLodActive = this.vectorLodRuntime !== null;
+      this.segmentCount >= PAN_CACHE_MIN_SEGMENTS || this.isTextHeavyStrokeFreeScene() ||
+      (this.scene?.drawRuns?.length ?? 0) >= NATIVE_PAN_CACHE_MIN_PAINTS;
     const zoomAnimating =
       Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
     return shouldUseNativePanCacheForFrame(
       sceneEligible,
-      vectorLodActive,
       this.isPanInteracting,
       isCameraAnimating,
       zoomAnimating
@@ -3767,6 +3495,7 @@ export class WebGpuFloorplanRenderer {
         renderedSegments,
         totalSegments: this.segmentCount,
         redundantSegments: this.getRedundantSegmentCount(),
+        paintOrderApproximated: this.isPaintOrderApproximated(),
         usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
         zoom: this.zoom
       });
@@ -3797,14 +3526,19 @@ export class WebGpuFloorplanRenderer {
       renderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.scene?.drawRuns ? this.orderedRunsCulled : !this.usingAllSegments,
       zoom: this.zoom
     });
   }
 
   private getRedundantSegmentCount(): number {
-    return this.strokeRenderingEnabled && !this.scenePaintVisibility?.requiresCompositing
-      ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
+    return this.strokeRenderingEnabled ? this.orderedBatches?.culledSegmentCount ?? 0 : 0;
+  }
+
+  /** Paint order is relaxed only while the scheduler holds its coverage margin. */
+  private isPaintOrderApproximated(): boolean {
+    return this.orderedBatches?.paintOrderApproximated ?? false;
   }
 
   private hasOrdinaryVectorContent(): boolean {
@@ -3993,6 +3727,7 @@ export class WebGpuFloorplanRenderer {
       renderedSegments: this.panCacheRenderedSegments,
       totalSegments: this.segmentCount,
       redundantSegments: this.getRedundantSegmentCount(),
+      paintOrderApproximated: this.isPaintOrderApproximated(),
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     });
@@ -4131,9 +3866,11 @@ export class WebGpuFloorplanRenderer {
     const dims = chooseTextureDimensions(data.length / 4, this.maxTextureSize());
     this.vectorClipTexture = this.createFloatTexture(dims.width, dims.height, data);
     const usage = (globalThis as any).GPUBufferUsage;
+    this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
     for (let index = -2; index < (scene.clipPaths?.length ?? 0); index++) {
-      const buffer = this.gpuDevice.createBuffer({ size: 16, usage: usage.UNIFORM | usage.COPY_DST });
-      this.gpuDevice.queue.writeBuffer(buffer, 0, new Float32Array([index, 0, 0, 0]));
+      const buffer = this.gpuDevice.createBuffer({ size: 32, usage: usage.UNIFORM | usage.COPY_DST });
+      const bounds = index >= 0 ? this.vectorClipBounds.subarray(index * 4, index * 4 + 4) : UNBOUNDED_VECTOR_CLIP_BOUNDS;
+      this.gpuDevice.queue.writeBuffer(buffer, 0, new Float32Array([index, 0, 0, 0, ...bounds]));
       this.vectorClipBuffers.push(buffer);
       this.vectorClipBindGroups.push(this.gpuDevice.createBindGroup({ layout: this.vectorClipBindGroupLayout, entries: [
         { binding: 0, resource: this.vectorClipTexture.createView() },
@@ -4158,7 +3895,9 @@ export class WebGpuFloorplanRenderer {
     paintVisibility.setVisibility(visibility);
     const runs = paintVisibility.select(candidates);
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
-    const plan = paintVisibility.requiresCompositing ? null : this.orderedBatches;
+    // Paints reorder only within a compositor span, so the ordered instance
+    // plan is valid with or without transparency groups.
+    const plan = this.orderedBatches;
     const rebuilt = plan?.update(runs, 1 / Math.max(this.zoom, 1e-6)) ?? false;
     this.orderedRunsCulled ||= this.strokeRenderingEnabled && (plan?.culledSegmentCount ?? 0) > 0;
     if (plan && rebuilt && plan.instanceCount > 0) {
@@ -4213,16 +3952,22 @@ export class WebGpuFloorplanRenderer {
         () => { this.frameDrawCalls += 1; });
       const parentPass = pass;
       try {
+        const segments = scenePaintSpanSegments(this.scene!);
         this.paintCompositor.render(this.scene!, parentPass, this.paintViewportWidth, this.paintViewportHeight,
-          (run, target, shapeOnly) => {
+          (spanRuns, target, shapeOnly) => {
             pass = shapeOnly ? new Proxy(target, { get: (object, key) => key === "setPipeline"
               ? (pipeline: any) => object.setPipeline(this.getPaintShapePipeline(pipeline))
               : typeof object[key] === "function" ? object[key].bind(object) : object[key] }) : target;
             const previous = strokes;
-            draw(run);
+            submitPaintSpan(spanRuns, plan, segments, this.runLookup, run => draw(run));
             if (shapeOnly) strokes = previous;
           }, condition => condition === undefined || visibility?.conditions[condition] === 1,
-          this.orderedRunCuller?.selected ?? null);
+          this.orderedRunCuller?.selected ?? null, bounds => ({
+            x: (bounds.minX - this.paintCameraCenterX) * this.paintZoom + this.paintViewportWidth / 2,
+            y: (bounds.minY - this.paintCameraCenterY) * this.paintZoom + this.paintViewportHeight / 2,
+            width: (bounds.maxX - bounds.minX) * this.paintZoom,
+            height: (bounds.maxY - bounds.minY) * this.paintZoom
+          }));
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
@@ -4325,6 +4070,7 @@ export class WebGpuFloorplanRenderer {
       );
     }
     this.paintViewportWidth = viewportWidth; this.paintViewportHeight = viewportHeight;
+    this.paintCameraCenterX = cameraCenterX; this.paintCameraCenterY = cameraCenterY; this.paintZoom = zoomValue;
     const data = new Float32Array(CAMERA_UNIFORM_FLOATS);
     data[0] = viewportWidth;
     data[1] = viewportHeight;
@@ -4342,6 +4088,10 @@ export class WebGpuFloorplanRenderer {
     data[13] = this.vectorOverrideColor[1];
     data[14] = this.vectorOverrideColor[2];
     data[15] = this.vectorOverrideOpacity;
+    data[16] = this.fillBandBase;
+    data[17] = this.fillBandEntries;
+    data[18] = this.gradientFillBandBase;
+    data[19] = this.gradientFillBandEntries;
 
     assertUniformBufferSizeMatches(data, CAMERA_UNIFORM_BUFFER_BYTES, "camera");
     this.gpuDevice.queue.writeBuffer(this.cameraUniformBuffer, 0, data);
@@ -4500,19 +4250,9 @@ export class WebGpuFloorplanRenderer {
 
   private ensurePanCacheResources(): boolean {
     const maxTextureSize = this.maxTextureSize();
-
-    const desiredWidth = Math.min(
-      maxTextureSize,
-      Math.max(this.canvas.width + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.width * PAN_CACHE_OVERSCAN_FACTOR))
-    );
-    const desiredHeight = Math.min(
-      maxTextureSize,
-      Math.max(this.canvas.height + PAN_CACHE_BORDER_PX * 2, Math.ceil(this.canvas.height * PAN_CACHE_OVERSCAN_FACTOR))
-    );
-
-    if (desiredWidth < this.canvas.width || desiredHeight < this.canvas.height) {
-      return false;
-    }
+    const size = chooseNativePanCacheSize(this.scene, this.canvas.width, this.canvas.height, maxTextureSize);
+    if (!size) return false;
+    const { width: desiredWidth, height: desiredHeight } = size;
 
     if (
       this.panCacheTexture &&
@@ -4746,6 +4486,7 @@ export class WebGpuFloorplanRenderer {
       this.vectorLodRuntime = null;
     }
     this.vectorLodStats = null;
+    this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
@@ -4980,7 +4721,13 @@ export class WebGpuFloorplanRenderer {
     }
     const gradientDims = chooseTextureDimensions(data.gradientCount, maxTextureSize);
     const fillPathDims = chooseTextureDimensions(data.gradientFillPathCount, maxTextureSize);
-    const fillSegmentDims = chooseTextureDimensions(data.gradientFillSegmentCount, maxTextureSize);
+    const fillBands = vectorFillBandStore(data.gradientFillSegmentsA, data.gradientFillSegmentCount,
+      buildVectorFillBandIndex({ pathCount: data.gradientFillPathCount, segmentCount: data.gradientFillSegmentCount,
+        pathMetaA: data.gradientFillPathMetaA, pathMetaB: data.gradientFillPathMetaB,
+        segmentsA: data.gradientFillSegmentsA, segmentsB: data.gradientFillSegmentsB }), maxTextureSize);
+    this.gradientFillBandBase = fillBands.pathBase;
+    this.gradientFillBandEntries = fillBands.entryBase;
+    const fillSegmentDims = chooseTextureDimensions(fillBands.texels, maxTextureSize);
     const strokeRunDims = chooseTextureDimensions(data.gradientStrokeRunCount, maxTextureSize);
     const strokeSegmentDims = chooseTextureDimensions(data.gradientStrokeSegmentCount, maxTextureSize);
 
@@ -5006,7 +4753,7 @@ export class WebGpuFloorplanRenderer {
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaB),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPathMetaC),
       this.createFloatTexture(fillPathDims.width, fillPathDims.height, data.gradientFillPaintMeta),
-      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsA),
+      this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, fillBands.data),
       this.createFloatTexture(fillSegmentDims.width, fillSegmentDims.height, data.gradientFillSegmentsB)
     ];
     this.gradientStrokeTextures = [
@@ -5938,6 +5685,8 @@ function prepareNativeTextUploadArrays(
     arrays.textGlyphSegmentsA.set(scene.textGlyphSegmentsA);
     arrays.textGlyphSegmentsB.set(scene.textGlyphSegmentsB);
   }
+  writeTextGlyphInkDensities(scene.textGlyphCount + (textLodData ? 1 : 0), arrays.textGlyphMetaA,
+    arrays.textGlyphMetaB, arrays.textGlyphSegmentsA, arrays.textGlyphSegmentsB);
   const clipRectCount = Math.floor((scene.textClipRects?.length ?? 0) / 4);
   if (clipRectCount > 0) {
     const clipMetaOffset = scene.textGlyphCount + (textLodData ? 1 : 0);

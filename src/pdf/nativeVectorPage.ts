@@ -2,7 +2,7 @@ import type { SceneOptionalContent } from "../optionalContentData";
 import { NativeVectorClipBuilder } from "./nativeVectorClips";
 import { buildNativeVectorGradients } from "./nativeVectorGradients";
 import type { NativePdfShadingRegistry } from "./nativeShadings";
-import { buildNativeVectorTextStrokes } from "./nativeVectorTextStroke";
+import { applyNativeHairlineTextOpacity, buildNativeVectorTextStrokes } from "./nativeVectorTextStroke";
 import { appendVectorDrawRun, simplifyVectorDrawRuns } from "../vectorDrawOrder";
 import type {
   Bounds,
@@ -197,6 +197,16 @@ export function buildNativeVectorPage(
   if (strokeText.approximated) input.onDiagnostic?.({ code: "glyph-stroke-curve-approximation", severity: "warning",
     pageIndex: pageInfo.sourcePageIndex,
     message: "Stroked glyph curves use vector outlines with a maximum 0.01-point centerline subdivision tolerance." });
+  if (strokeText.approximateHairlineStyle) input.onDiagnostic?.({ code: "glyph-hairline-style-approximation", severity: "warning",
+    pageIndex: pageInfo.sourcePageIndex,
+    message: "Hairline glyph joins and square caps use rounded device-pixel coverage; their contours remain vector." });
+  const hairlines = strokeText.hairlines;
+  const hairlineCount = (hairlines?.endpoints.length ?? 0) / 4;
+  const appendHairlines = (base: Float32Array, added: readonly number[] | undefined): Float32Array => {
+    if (!added?.length) return base;
+    const result = new Float32Array(base.length + added.length);
+    result.set(base); result.set(added, base.length); return result;
+  };
   const rasterLayers = buildRasterLayers(
     imageRegistry,
     sidecar,
@@ -218,6 +228,7 @@ export function buildNativeVectorPage(
   const visualBounds = emptyBounds();
   includePackedGeometryBounds(visualBounds, compiled);
   includeTextBounds(visualBounds, text);
+  if (hairlines) includeBounds(visualBounds, hairlines.bounds);
   for (const layer of rasterLayers) includeTransformedUnitBounds(visualBounds, layer.matrix);
   for (const paint of sidecar.shadingPaints ?? []) includeBounds(visualBounds, paint.clipBounds);
   if (visualBounds.empty) includeBounds(visualBounds, pageBounds);
@@ -249,9 +260,9 @@ export function buildNativeVectorPage(
     fillSegmentsA: compiled.fillSegmentsA,
     fillSegmentsB: compiled.fillSegmentsB,
     ...gradients,
-    segmentCount: compiled.segmentCount,
-    sourceSegmentCount: compiled.sourceSegmentCount,
-    mergedSegmentCount: compiled.mergedSegmentCount,
+    segmentCount: compiled.segmentCount + hairlineCount,
+    sourceSegmentCount: compiled.sourceSegmentCount + hairlineCount,
+    mergedSegmentCount: compiled.mergedSegmentCount + hairlineCount,
     imageLayerSegmentCount: compiled.imageLayerSegmentCount ?? 0,
     operatorCountKind: "native-estimate",
     sourceTextCount: text.sourceTextCount,
@@ -273,16 +284,16 @@ export function buildNativeVectorPage(
     rasterLayerHeight: firstRaster?.height ?? 0,
     rasterLayerData: firstRaster?.data ?? new Uint8Array(0),
     rasterLayerMatrix: firstRaster?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
-    endpoints: compiled.endpoints,
-    primitiveMeta: compiled.primitiveMeta,
-    primitiveBounds: compiled.primitiveBounds,
-    styles: compiled.styles,
+    endpoints: appendHairlines(compiled.endpoints, hairlines?.endpoints),
+    primitiveMeta: appendHairlines(compiled.primitiveMeta, hairlines?.primitiveMeta),
+    primitiveBounds: appendHairlines(compiled.primitiveBounds, hairlines?.primitiveBounds),
+    styles: appendHairlines(compiled.styles, hairlines?.styles),
     bounds: finalBounds(visualBounds),
     pageBounds: normalizedPageBounds,
     maxHalfWidth: compiled.maxHalfWidth,
     operatorCount: compiled.operatorCount,
     imagePaintOpCount: rasterLayers.length,
-    pathCount: compiled.pathCount,
+    pathCount: compiled.pathCount + (hairlines?.glyphCount ?? 0),
     discardedTransparentCount: compiled.discardedTransparentCount,
     discardedDegenerateCount: compiled.discardedDegenerateCount,
     discardedDuplicateCount: compiled.discardedDuplicateCount,
@@ -312,11 +323,26 @@ export function buildNativeVectorPage(
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {
         const first = sidecar.glyphRunMeta[index * 3];
         const end = first + sidecar.glyphRunMeta[index * 3 + 1];
+        // Packed hairlines have no per-instance text clip. Retain the page/run
+        // rectangle as well as the exact source clip on their stroke draw runs.
+        let hairlineClipIndex = clipIndex;
+        let hasHairline = false;
+        if (hairlines) for (let glyph = first; glyph < end; glyph++) hasHairline ||= hairlines.glyphRanges[glyph * 2 + 1] > 0;
+        if (hasHairline) {
+          const bounds = sidecar.glyphClipBounds?.subarray(index * 4, index * 4 + 4);
+          const x0 = Math.max(pageBounds.minX, bounds?.[0] ?? -Infinity), y0 = Math.max(pageBounds.minY, bounds?.[1] ?? -Infinity);
+          const x1 = Math.min(pageBounds.maxX, bounds?.[2] ?? Infinity), y1 = Math.min(pageBounds.maxY, bounds?.[3] ?? Infinity);
+          hairlineClipIndex = clipBuilder.add({ parent: sidecar.sourceClips?.[offset / 2] ?? null, fillRule: 0,
+            path: { data: Float32Array.of(0,x0,y0,1,x1,y0,1,x1,y1,1,x0,y1,4), transform: [1,0,0,1,0,0],
+              bounds: { minX: x0, minY: y0, maxX: x1, maxY: y1 } } }, signal);
+        }
         for (let glyph = first; glyph < end; glyph++) {
           const instance = text.glyphToInstance[glyph];
           if (instance >= 0) appendVectorDrawRun(runs, "text", instance, 1, clipIndex, blendMode, optionalContent);
           const strokeInstance = strokeText.glyphToInstance?.[glyph] ?? -1;
           if (strokeInstance >= 0) appendVectorDrawRun(runs, "text", strokeInstance, 1, clipIndex, blendMode, optionalContent);
+          const hairlineFirst = hairlines?.glyphRanges[glyph * 2] ?? 0, hairlineCount = hairlines?.glyphRanges[glyph * 2 + 1] ?? 0;
+          if (hairlineCount) appendVectorDrawRun(runs, "stroke", hairlineFirst, hairlineCount, hairlineClipIndex, blendMode, optionalContent);
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
         appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode, optionalContent);
@@ -332,6 +358,7 @@ export function buildNativeVectorPage(
     if (clipBuilder.paths.length) scene.clipPaths = clipBuilder.paths;
     if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "warning",
       pageIndex: pageInfo.sourcePageIndex, message: "Curved clip boundaries use vector edges with a 0.0001-point subdivision tolerance." });
+    applyNativeHairlineTextOpacity(scene, hairlines);
     simplifyVectorDrawRuns(scene);
   }
   return scene;

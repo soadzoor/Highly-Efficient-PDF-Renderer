@@ -1,3 +1,5 @@
+import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
+import { vectorFillBandIndex, vectorFillBandStore } from "./vectorFillBands";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
@@ -18,6 +20,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface FillLayerOptions {
+  drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   vectorOverride: [number, number, number, number];
@@ -74,7 +77,8 @@ export class ThreeMaterialFillLayer {
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
     const pathTextureSize = chooseTextureSize(fillPathCount);
-    const segmentTextureSize = chooseTextureSize(fillSegmentCount);
+    const bands = vectorFillBandStore(scene.fillSegmentsA, fillSegmentCount, vectorFillBandIndex(scene));
+    const segmentTextureSize = chooseTextureSize(bands.texels);
 
     this.fillPathMetaTextureA = createFloatTexture(
       scene.fillPathMetaA,
@@ -95,8 +99,8 @@ export class ThreeMaterialFillLayer {
       pathTextureSize.height
     );
     this.fillSegmentTextureA = createFloatTexture(
-      scene.fillSegmentsA,
-      fillSegmentCount,
+      bands.data,
+      bands.texels,
       segmentTextureSize.width,
       segmentTextureSize.height
     );
@@ -148,6 +152,8 @@ export class ThreeMaterialFillLayer {
         fillSegmentTextureB: this.fillSegmentTextureB,
         fillPathTextureWidth: pathTextureSize.width,
         fillSegmentTextureWidth: segmentTextureSize.width,
+        fillBandBase: bands.pathBase,
+        fillBandEntries: bands.entryBase,
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform,
@@ -171,6 +177,8 @@ export class ThreeMaterialFillLayer {
           uFillPathMetaTexA: { value: this.fillPathMetaTextureA },
           uFillPathMetaTexB: { value: this.fillPathMetaTextureB },
           uFillPathMetaTexC: { value: this.fillPathMetaTextureC },
+          uFillBandBase: { value: bands.pathBase },
+          uFillBandEntries: { value: bands.entryBase },
           uFillSegmentTexA: { value: this.fillSegmentTextureA },
           uFillSegmentTexB: { value: this.fillSegmentTextureB },
           uFillPathMetaTexSize: {
@@ -195,7 +203,7 @@ export class ThreeMaterialFillLayer {
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
-    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex");
+    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex", options.drawPlan);
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {

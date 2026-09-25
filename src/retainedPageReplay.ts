@@ -1,5 +1,6 @@
 import type { HeprPageData } from "./heprDocumentData";
-import type { OptionalContentSnapshot } from "./optionalContent";
+import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
+import { RetainedSpanDependencies } from "./retainedSpanDependencies";
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import type { SceneRetainedPage } from "./retainedPageData";
 import { planScenePaintPasses, type ScenePaintNode, type ScenePaintRetained } from "./scenePaintGraph";
@@ -20,6 +21,7 @@ export function applyRetainedPageVisibility(resource: SceneRetainedPage, snapsho
 
 type RenderSpan = (page: HeprPageData, first: number, count: number, signal: AbortSignal) => Promise<RasterLayer | null>;
 export interface RetainedPageReplayResult {
+  /** Only changed slots; getLayers() retains the complete applied cache. */
   readonly layers: ReadonlyMap<number, RasterLayer>;
   /** Adopt the prepared cache only after the view has accepted its resource replacements. */
   commit(): void;
@@ -29,6 +31,7 @@ export interface RetainedPageReplayResult {
 export class RetainedPageReplay {
   private readonly scene: VectorScene;
   private readonly nodes: ScenePaintRetained[] = [];
+  private readonly dependencies: Uint32Array[] = [];
   private readonly renderSpan: RenderSpan;
   private layers = new Map<number, RasterLayer>();
   private pageVisibility: Uint8Array[];
@@ -42,15 +45,17 @@ export class RetainedPageReplay {
       const { renderNativeRetainedCommandSpan } = await import("./pdfSession");
       return renderNativeRetainedCommandSpan(page, first, count, signal);
     });
+    const dependencies = scene.retainedPages?.map(resource => new RetainedSpanDependencies(resource.page)) ?? [];
     const collect = (nodes: readonly ScenePaintNode[]): void => {
       for (const node of nodes) if (node.kind === "retained") {
         this.nodes.push(node); this.layers.set(node.rasterIndex, scene.rasterLayers[node.rasterIndex]);
+        this.dependencies.push(dependencies[node.retainedPage].span(node.firstCommand, node.count));
       } else if (node.kind === "group") { collect(node.children); if (node.softMask) collect(node.softMask.children); }
     };
     if (scene.paintGraph) collect(scene.paintGraph.roots);
     this.pageVisibility = scene.retainedPages?.map(resource => resource.page.stores.optionalContent.defaultVisible.slice()) ?? [];
-    // Initial slots already represent parser-provided defaults; unknown initial graph visibility
-    // is deliberately replayed once before a view presents its first changed configuration.
+    // Parser-provided pixels already represent the default visibility.
+    this.visible = this.visibleSlots(createDefaultOptionalContentSnapshot(scene));
   }
   getLayers(): ReadonlyMap<number, RasterLayer> { return new Map(this.layers); }
   async prepare(snapshot: OptionalContentSnapshot, options: {
@@ -61,12 +66,10 @@ export class RetainedPageReplay {
     options.signal.throwIfAborted();
     const generation = ++this.generation;
     const layers = new Map(this.layers);
+    const updates = new Map<number, RasterLayer>();
     const pages = this.scene.retainedPages?.map(resource => applyRetainedPageVisibility(resource, snapshot)) ?? [];
     const pageVisibility = pages.map(page => page.stores.optionalContent.defaultVisible);
-    const changed = pageVisibility.map((bits, index) => bits.length !== this.pageVisibility[index]?.length ||
-      bits.some((bit, offset) => bit !== this.pageVisibility[index][offset]));
-    const visible = new Set(planScenePaintPasses(this.scene, condition => condition === undefined || snapshot.conditions[condition] !== 0)
-      .filter(pass => pass.kind === "retained").map(pass => pass.kind === "retained" ? pass.node.rasterIndex : -1));
+    const visible = this.visibleSlots(snapshot);
     const report = (value: number | null): void => {
       if (generation !== this.generation || this.disposed) return;
       try { options.onProgress?.(value); } catch { /* Observers do not own replay. */ }
@@ -76,9 +79,11 @@ export class RetainedPageReplay {
       for (let index = 0; index < this.nodes.length; index++) {
         options.signal.throwIfAborted();
         const node = this.nodes[index], original = this.scene.rasterLayers[node.rasterIndex];
+        const bits = pageVisibility[node.retainedPage], previous = this.pageVisibility[node.retainedPage];
+        const changed = this.dependencies[index].some(condition => bits[condition] !== previous[condition]);
         if (!visible.has(node.rasterIndex)) {
-          layers.set(node.rasterIndex, { ...original, width: 1, height: 1, data: new Uint8Array(4) });
-        } else if (changed[node.retainedPage] || !this.visible.has(node.rasterIndex)) {
+          if (this.visible.has(node.rasterIndex)) updates.set(node.rasterIndex, { ...original, width: 1, height: 1, data: new Uint8Array(4) });
+        } else if (changed || !this.visible.has(node.rasterIndex)) {
           await waitForLoad(new Promise<void>(resolve => setTimeout(resolve, 0)), options.signal);
           const rendered = await waitForLoad(this.renderSpan(pages[node.retainedPage], node.firstCommand, node.count, options.signal), options.signal);
           options.signal.throwIfAborted();
@@ -87,17 +92,22 @@ export class RetainedPageReplay {
             const matrix = new Float32Array([a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
               a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
               a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]]);
-            layers.set(node.rasterIndex, { ...rendered, matrix, paintOrder: original.paintOrder, pageIndex: original.pageIndex });
-          } else layers.set(node.rasterIndex, { ...original, width: 1, height: 1, data: new Uint8Array(4) });
+            updates.set(node.rasterIndex, { ...rendered, matrix, paintOrder: original.paintOrder, pageIndex: original.pageIndex });
+          } else updates.set(node.rasterIndex, { ...original, width: 1, height: 1, data: new Uint8Array(4) });
         }
         report(Math.floor((index + 1) / this.nodes.length * 100));
       }
-      return { layers, commit: () => {
+      for (const [index, layer] of updates) layers.set(index, layer);
+      return { layers: updates, commit: () => {
         options.signal.throwIfAborted();
         if (this.disposed || generation !== this.generation) throw new DOMException("Retained replay superseded.", "AbortError");
         this.layers = layers; this.pageVisibility = pageVisibility; this.visible = visible;
       } };
     } finally { report(null); }
+  }
+  private visibleSlots(snapshot: OptionalContentSnapshot): Set<number> {
+    return new Set(planScenePaintPasses(this.scene, condition => condition === undefined || snapshot.conditions[condition] !== 0)
+      .filter(pass => pass.kind === "retained").map(pass => pass.kind === "retained" ? pass.node.rasterIndex : -1));
   }
   dispose(): void { this.disposed = true; this.generation++; this.layers.clear(); this.visible.clear(); this.pageVisibility = []; }
 }

@@ -192,10 +192,17 @@ function comparePackedClips(clips, packed) {
     }
     let actual = true;
     for (let index = root; index >= 0; index = packed[index * 4]) {
-      const header = index * 4, offset = packed[header + 1] * 4, count = packed[header + 2];
+      const header = index * 4;
+      let offset = packed[header + 1] * 4, count = packed[header + 2];
+      if (count >= 0 && packed[header + 3] >= 2) {
+        const band = Math.max(0, Math.min(packed[offset + 3] - 1,
+          Math.floor(Math.fround(Math.fround(y - packed[offset + 1]) / packed[offset + 2]))));
+        const table = (packed[offset] + band) * 4;
+        offset = packed[table] * 4; count = packed[table + 1];
+      }
       const inside = count < 0
         ? x >= packed[offset] && y >= packed[offset + 1] && x < packed[offset + 2] && y < packed[offset + 3]
-        : windingContains(packed.subarray(offset, offset + count * 4), packed[header + 3], x, y);
+        : windingContains(packed.subarray(offset, offset + count * 4), packed[header + 3] & 1, x, y);
       if (!inside) { actual = false; break; }
     }
     assert.equal(actual, expected, `packed clip ${root} at (${x}, ${y})`);

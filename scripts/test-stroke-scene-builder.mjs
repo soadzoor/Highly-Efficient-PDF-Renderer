@@ -12,7 +12,8 @@ try {
   const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
   const { getSceneSegmentAccounting } = await import("../src/sceneStatistics.ts");
   const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
-  const { ThreeVectorLodStrokeLayer, prebuildVectorStrokeLodRuntime } = await import("../src/vectorStrokeLod.ts");
+  const { ThreeVectorLodStrokeLayer, prebuildVectorStrokeLodRuntime, VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS } =
+    await import("../src/vectorStrokeLod.ts");
   assert.equal(typeof createThreePdfObject, "function");
 
   const input = [
@@ -90,7 +91,10 @@ try {
     } finally { layer.dispose(); }
   }
 
-  const densePaths = Array.from({ length: 512 }, (_, i) => ({
+  // LOD keeps exact strokes while they fit the visible budget, so the cluster
+  // must exceed it before the overview can use simplified geometry.
+  const clusterCount = VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS + 10_000;
+  const densePaths = Array.from({ length: clusterCount }, (_, i) => ({
     points: [[(i % 20) * 0.01, 0], [(i % 20) * 0.01 + 10, 0]], width: 1
   }));
   // Sheet edges around a dense local cluster let zoom narrow the visible tiles.
@@ -117,7 +121,7 @@ try {
     lodLayer.setLocalToClipTransform(transform, 0.0001);
     lodLayer.updateForLocalUnitsPerPixel(0.0001);
     lodLayer.updateFrame({ cameraCenterX: 5, cameraCenterY: 0, zoom: 10_000 }, viewport);
-    assert.equal(lodLayer.getRenderedSegmentCount(), 512, "zoom restores exact strokes in the visible cluster");
+    assert.equal(lodLayer.getRenderedSegmentCount(), clusterCount, "zoom restores exact strokes in the visible cluster");
   } finally { lodLayer.dispose(); }
 
   console.log("Stroke scene builder: geometry, styles, validation, ownership, Three materials, culling and LOD passed.");

@@ -46,6 +46,25 @@ try {
   frame(10); // Two pages, fill, stroke, two text ranges, and four overlay batches.
   frame(10); // Counts describe the current frame, rather than accumulating.
   assert.equal(frames.at(-1).renderedSegments, 100, "instances remain separate from draw calls");
+
+  // Minified pages hold the paint scheduler's coverage margin. Every path that
+  // reports stats forwards that, because order between neighbours is relaxed.
+  assert.equal(frames.at(-1).paintOrderApproximated, false, "an exact schedule reports exact paint order");
+  renderer.orderedBatches = { paintOrderApproximated: true, culledSegmentCount: 0 };
+  frame(10);
+  assert.equal(frames.at(-1).paintOrderApproximated, true, "a held margin reaches the frame listener");
+  renderer.shouldUsePanCache = () => true;
+  draws.length = 0;
+  renderer.renderExternalFrame();
+  assert.equal(frames.at(-1).paintOrderApproximated, true, "including a cached frame");
+  renderer.shouldUsePanCache = () => false;
+  draws.length = 0;
+  assert.equal(renderer.renderProjectedFrame({ viewportWidth: 100, viewportHeight: 100, localUnitsPerPixel: 1,
+    localToClip: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }).paintOrderApproximated, true,
+    "and a projected one");
+  renderer.orderedBatches = null;
+  renderer.panCacheValid = false;
+  frame(10);
   renderer.textRenderingEnabled = false;
   frame(8);
   renderer.textRenderingEnabled = true;
@@ -72,8 +91,9 @@ try {
   assert.equal(renderer.renderProjectedFrame({ ...projected, localToClip: new Array(16).fill(NaN) }).drawCalls, 0);
   frame(10);
 
-  // The retained paint graph adds shape and compositing draws. Framebuffer
-  // copies and clears are not GPU draw commands and are not counted.
+  // The retained paint graph adds its compositing passes. Framebuffer copies
+  // and clears are not GPU draw commands and are not counted, and without a
+  // knockout above it no geometric shape pass is rendered at all.
   Object.assign(renderer, { pageRects: new Float32Array(), visiblePageRectCount: 0,
     highlightSelectionCount: 0, highlightOthersCount: 0, highlightCurrentCount: 0, primitiveHighlights: null });
   scene.drawRuns = [{ kind: "fill", first: 0, count: 1 }];
@@ -81,7 +101,15 @@ try {
     blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }] }] };
   draws.length = 0;
   renderer.renderExternalFrame();
-  assert(frames.at(-1).drawCalls > 2, "color, shape and compositor passes are all included");
+  assert.equal(frames.at(-1).drawCalls, 1,
+    "a group holding one fill path folds its opacity into that paint's own draw");
+  frame(1);
+  scene.drawRuns = [{ kind: "fill", first: 0, count: 2 }];
+  renderer.scenePaintVisibility = null;
+  draws.length = 0;
+  renderer.renderExternalFrame();
+  assert.equal(frames.at(-1).drawCalls, 2,
+    "paints that may overlap keep the group's own paint and the composite carrying its opacity");
   const composedCalls = frames.at(-1).drawCalls;
   frame(composedCalls);
 

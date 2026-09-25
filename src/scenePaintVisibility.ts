@@ -5,9 +5,26 @@ import { isScenePaintRunVisible } from "./scenePaintQuery";
 
 const compositeRequirements = new WeakMap<VectorScene, boolean>();
 
+/**
+ * Opt-in A/B switch for diagnosing frame cost, set either as a global before
+ * a document loads or as `?noComposite=1`, which survives the reload that
+ * opening a document does. Paints then reach the canvas in source order with
+ * no transparency groups at all, so group opacity, soft masks and blend modes
+ * render wrong - but the frame shows what compositing costs as opposed to what
+ * the document's geometry costs.
+ */
+function paintCompositingDisabled(): boolean {
+  const host = globalThis as { HEPR_DEBUG_DISABLE_COMPOSITING?: boolean; location?: { search?: unknown } };
+  if (host.HEPR_DEBUG_DISABLE_COMPOSITING === true) return true;
+  return typeof host.location?.search === "string" && new URLSearchParams(host.location.search).has("noComposite");
+}
+
 /** Ordinary source-over groups need no intermediate surfaces, even when isolated. */
 export function sceneRequiresPaintCompositing(scene: VectorScene): boolean {
   if (!scene.paintGraph) return false;
+  // Eligibility is decided once per view, so nothing is cached while the
+  // diagnostic switch is on and turning it back off restores the real answer.
+  if (paintCompositingDisabled()) return false;
   const cached = compositeRequirements.get(scene);
   if (cached !== undefined) return cached;
   const runs = scene.drawRuns ?? [];

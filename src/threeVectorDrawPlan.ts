@@ -1,3 +1,4 @@
+import { normalizeScenePaintGraph, scenePaintSpanSegments, type ScenePaintNode } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -14,29 +15,30 @@ const plans = new WeakMap<VectorScene, ThreeVectorDrawPlan>();
  * stroke, fill, text, raster and gradient layers: `renderOrder` is global, and
  * a paint may only move relative to paints it provably commutes with.
  *
- * One plan per scene therefore owns the schedule, and every layer reads its
- * positions from here. Scenes that need the paint compositor keep the canonical
- * order, exactly as the compositor's transparency groups require.
+ * Each PDF object owns one plan shared by its material layers. Compositing
+ * constrains reordering to source-over spans, preserving every effect boundary.
  */
 export class ThreeVectorDrawPlan {
   /** Bumped whenever {@link order} changes, so layers can rebuild their batches. */
   version = 0;
-  private readonly scheduler: VectorPageDrawScheduler | null;
+  private scheduler: VectorPageDrawScheduler | null;
+  readonly segments: Uint32Array | null;
+  private readonly scene: VectorScene;
+  private unitsPerPixel: number | null = null;
+  private colorCommutationEnabled = true;
   private readonly all: readonly number[];
   private ordered: number[];
   private readonly positionOfRun: Int32Array;
 
   constructor(scene: VectorScene) {
+    this.scene = scene;
     const runs = scene.drawRuns ?? [];
     this.all = Array.from({ length: runs.length }, (_, index) => index);
     this.ordered = [...this.all];
     this.positionOfRun = new Int32Array(runs.length);
     for (let index = 0; index < runs.length; index++) this.positionOfRun[index] = index;
-    // Reordering paints under the compositor would move draws across the
-    // transparency groups it renders into separate surfaces. Scenes without a
-    // page layout cannot be partitioned at all, so they keep the source order.
-    this.scheduler = runs.length > 0 && scene.pageRects?.length > 0 && !sceneRequiresPaintCompositing(scene)
-      ? VectorPageDrawScheduler.create(scene, scene, strokeSourceRuns(scene)) : null;
+    this.segments = sceneRequiresPaintCompositing(scene) ? scenePaintSpanSegments(scene) : null;
+    this.scheduler = this.createScheduler(scene, strokeSourceRuns(scene));
   }
 
   /** Scheduled run indices; canonical order until a pixel scale is supplied. */
@@ -45,8 +47,12 @@ export class ThreeVectorDrawPlan {
   /** Submission position of each canonical run, for `renderOrder` assignment. */
   get positions(): Int32Array { return this.positionOfRun; }
 
+  /** True while minification holds the scheduler's coverage margin. */
+  get paintOrderApproximated(): boolean { return this.scheduler?.paintOrderApproximated ?? false; }
+
   /** Temporary primitive colors invalidate the source-color commutation proof. */
   setColorCommutationEnabled(enabled: boolean): boolean {
+    this.colorCommutationEnabled = enabled;
     if (!this.scheduler?.setColorCommutationEnabled(enabled)) return false;
     return this.reschedule();
   }
@@ -57,8 +63,27 @@ export class ThreeVectorDrawPlan {
    */
   update(unitsPerPixel: number | null): boolean {
     const scale = Number.isFinite(unitsPerPixel) && (unitsPerPixel ?? 0) > 0 ? unitsPerPixel : null;
+    this.unitsPerPixel = scale;
     if (!(this.scheduler?.updateScale(scale) ?? false)) return false;
     return this.reschedule();
+  }
+
+  /** Include every LOD level in the commutation proof, even while it is dormant. */
+  setStrokeSource(strokes: VectorScene, origins: Uint32Array): void {
+    const canonical = strokeSourceRuns(this.scene);
+    const sourceRuns = Uint32Array.from(origins, origin => canonical[origin]);
+    this.scheduler = this.createScheduler(strokes, sourceRuns);
+    this.scheduler?.setColorCommutationEnabled(this.colorCommutationEnabled);
+    this.scheduler?.updateScale(this.unitsPerPixel);
+    this.reschedule();
+  }
+
+  private createScheduler(strokes: VectorScene, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
+    // Arbitrary public graphs can visit canonical runs backwards. Such graphs
+    // retain their source submissions rather than feeding a non-monotonic span
+    // sequence to the scheduler.
+    if (this.segments && !graphRunsInOrder(this.scene)) return null;
+    return VectorPageDrawScheduler.create(this.scene, strokes, sourceRuns, this.segments);
   }
 
   private reschedule(): boolean {
@@ -93,4 +118,24 @@ function strokeSourceRuns(scene: VectorScene): Uint32Array {
     if (run.kind === "stroke") sourceRuns.fill(index, run.first, run.first + run.count);
   }
   return sourceRuns;
+}
+
+function graphRunsInOrder(scene: VectorScene): boolean {
+  let previous = -1;
+  const raster = new Map<number, number>();
+  scene.drawRuns?.forEach((run, index) => { if (run.kind === "raster" && run.count === 1) raster.set(run.first, index); });
+  const visit = (nodes: readonly ScenePaintNode[]): boolean => {
+    for (const node of nodes) {
+      if (node.kind === "group") {
+        if (node.softMask && !visit(node.softMask.children)) return false;
+        if (!visit(node.children)) return false;
+      } else {
+        const index = node.kind === "draw" ? node.runIndex : raster.get(node.rasterIndex);
+        if (index === undefined || index <= previous) return false;
+        previous = index;
+      }
+    }
+    return true;
+  };
+  return visit(normalizeScenePaintGraph(scene));
 }

@@ -19,10 +19,31 @@ export interface NativeGlyphStrokeGeometry {
   readonly approximated: boolean;
 }
 
+/** Translation and paint color do not change a glyph's stroked silhouette. */
+export function nativeGlyphStrokeCacheKey(font: number, glyph: number, transform: ArrayLike<number>,
+  stroke: NativeGlyphStrokeStyle): string {
+  return [font, glyph, ...Array.from({ length: 4 }, (_, i) => transform[i]),
+    ...Array.from({ length: 4 }, (_, i) => stroke.transform[i]), stroke.width, stroke.lineCap,
+    stroke.lineJoin, stroke.miterLimit, stroke.dashPhase, ...stroke.dashArray].join(":");
+}
+
+/** Keep the placement on the instance and retain the complete transformed pen. */
+export function buildNativeGlyphStrokeAtOrigin(commands: readonly NativeGlyphPathCommand[],
+  transform: ArrayLike<number>, stroke: NativeGlyphStrokeStyle, signal?: AbortSignal): NativeGlyphStrokeGeometry | null {
+  return buildNativeGlyphStroke(commands, [transform[0], transform[1], transform[2], transform[3], 0, 0],
+    { ...stroke, transform: [stroke.transform[0], stroke.transform[1], stroke.transform[2], stroke.transform[3], 0, 0] }, signal);
+}
+
 type Point = readonly [number, number];
 interface Contour { points: Point[]; closed: boolean; hasSegment?: boolean; }
 
-const MAX_EDGES = 2048;
+/**
+ * Per-glyph bound on flattening work and on the stroke outline it produces.
+ * Outlined display text in real documents reaches a little over two thousand
+ * edges, so a tighter bound refuses ordinary headlines; the page-level
+ * coordinate and path limits are what actually protect the frame's memory.
+ */
+const MAX_EDGES = 4096;
 const MAX_INPUT_COMMANDS = 65536;
 const MAX_CURVE_DEPTH = 20;
 const EPSILON = 1e-12;

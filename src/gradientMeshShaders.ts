@@ -9,7 +9,7 @@ uniform int uMeshPathIndex;
 out vec4 vMeshColor;
 uniform sampler2D uPathMetaTexA;`)
   .replace("int pathIndex = gl_VertexID / 4;", "vMeshColor = aMeshColor;\n  int pathIndex = uMeshPathIndex;")
-  .replace("vec2 world = mix(metaA.zw, metaB.xy, corner01);", "vec2 world = aMeshPosition;");
+  .replace("vec2 world = mix(low, high, corner01);", "vec2 world = aMeshPosition;");
 
 export const GRADIENT_MESH_FRAGMENT_GLSL = GRADIENT_FILL_FRAGMENT_SHADER_SOURCE
   .replace("uniform sampler2D uSegmentTexA;", "in vec4 vMeshColor;\nuniform sampler2D uSegmentTexA;")
@@ -31,7 +31,7 @@ export const GRADIENT_MESH_WGSL = GRADIENT_FILL_WGSL
     @location(0) meshPosition : vec2f, @location(1) meshColor : vec4f) -> FillOut {`)
   .replace("let pathIndex = i32(vertexIndex / 4u);", "let pathIndex = i32(paintIndex);")
   .replace("var out : FillOut;", "var out : FillOut;\n  out.meshColor = meshColor;")
-  .replace("let world = mix(metaA.zw, metaB.xy, corner);", "let world = meshPosition;")
+  .replace("let world = mix(low, high, corner);", "let world = meshPosition;")
   .replace("let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);", `let source = inData.meshColor;
   let meshCoord = gradientCoord(inData.sourceGradient);
   let meshA = textureLoad(uGradientMetaA, meshCoord, 0);

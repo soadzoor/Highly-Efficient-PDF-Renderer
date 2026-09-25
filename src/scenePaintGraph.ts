@@ -1,5 +1,6 @@
 import type { PdfBlendMode } from "./heprDocumentData";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
+import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 
 interface ScenePaintScope {
   optionalContent?: number;
@@ -161,5 +162,202 @@ export function planScenePaintPasses(scene: VectorScene, visible: (condition?: n
   };
   if (scene.paintGraph) visit(scene.paintGraph.roots, 0);
   else scene.drawRuns?.forEach((run, runIndex) => { if (visible(run.optionalContent)) result.push({ kind: "draw", runIndex }); });
+  return result;
+}
+
+const normalizedGraphs = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
+
+/**
+ * Whether every paint under these nodes reaches its backdrop through plain
+ * Normal source-over. Isolation only decides which backdrop a blend or a
+ * knockout reads, so a subtree without either composites identically whether
+ * it starts from a transparent surface or from the enclosing one.
+ *
+ * A soft mask is always rendered against its own transparent backdrop, so what
+ * it contains never affects the isolation of the group carrying it.
+ */
+function paintsSourceOverOnly(scene: VectorScene, nodes: readonly ScenePaintNode[], depth: number): boolean {
+  if (depth > 64) return false;
+  for (const node of nodes) {
+    if (node.kind === "group") {
+      if (node.knockout || node.blendMode !== "Normal" || !paintsSourceOverOnly(scene, node.children, depth + 1)) return false;
+    } else if (node.kind === "draw" && scene.drawRuns?.[node.runIndex]?.blendMode) return false;
+  }
+  return true;
+}
+
+/**
+ * The rendering-equivalent paint graph, cached per scene. Source order, run
+ * indices and geometry are untouched; only the group structure the compositor
+ * has to allocate surfaces for changes:
+ *
+ * - A group that is fully opaque, unmasked, Normal-blend and non-knockout
+ *   paints exactly where its parent would, so it is spliced into the parent.
+ *   That leaves the parent one uninterrupted span instead of three, and costs
+ *   the frame neither surfaces nor composite passes. Knockout parents are left
+ *   alone: their children are the units that knock each other out, so splicing
+ *   one would change the picture.
+ * - A non-knockout group whose subtree is source-over only is marked isolated.
+ *   No pixel moves - its backdrop cancels out of its own extraction either way
+ *   - but the compositor can then accumulate it into a single surface whose
+ *   own alpha is the group alpha, instead of a backdrop copy plus a separate
+ *   alpha accumulator.
+ *
+ * A spliced child inherits its group's optional-content condition if it has no
+ * condition of its own. A different child condition keeps the group intact:
+ * both must hold, and a node has room for only one condition. Run conditions
+ * are checked independently, so they do not prevent this inheritance.
+ */
+export function normalizeScenePaintGraph(scene: VectorScene): readonly ScenePaintNode[] {
+  if (!scene.paintGraph) return [];
+  const cached = normalizedGraphs.get(scene);
+  if (cached) return cached;
+  const rewrite = (nodes: readonly ScenePaintNode[], depth: number, knockoutParent: boolean): ScenePaintNode[] => {
+    const result: ScenePaintNode[] = [];
+    for (const node of nodes) {
+      if (node.kind !== "group" || depth >= 64) { result.push(node); continue; }
+      const sourceOverOnly = !node.knockout && paintsSourceOverOnly(scene, node.children, 0);
+      const children = rewrite(node.children, depth + 1, node.knockout);
+      if (!knockoutParent && node.alpha === 1 && !node.softMask &&
+          !node.knockout && node.blendMode === "Normal" && (!node.isolated || sourceOverOnly) &&
+          (node.optionalContent === undefined || children.every(child =>
+            child.optionalContent === undefined || child.optionalContent === node.optionalContent))) {
+        for (const child of children) result.push(node.optionalContent !== undefined && child.optionalContent === undefined
+          ? { ...child, optionalContent: node.optionalContent } : child);
+        continue;
+      }
+      const softMask = node.softMask
+        ? { ...node.softMask, children: rewrite(node.softMask.children, depth + 1, false) } : undefined;
+      result.push({ ...node, children, softMask, isolated: node.isolated || sourceOverOnly });
+    }
+    return result;
+  };
+  const roots = rewrite(scene.paintGraph.roots, 0, false);
+  normalizedGraphs.set(scene, roots);
+  return roots;
+}
+
+const spanSegments = new WeakMap<VectorScene, Uint32Array>();
+
+/**
+ * The span each canonical draw run paints in, numbered in graph order.
+ *
+ * The compositor submits an uninterrupted stretch of Normal source-over paints
+ * as one span, onto one surface, and breaks that stretch at every group
+ * boundary and at every paint carrying its own blend mode. Within a span the
+ * paints compose onto the same surface with nothing in between, so reordering
+ * them is exactly as safe as reordering paints on a page without transparency
+ * groups at all; across spans it is not, because a composite intervenes.
+ *
+ * Numbering is monotonic in graph order, so the spans the compositor actually
+ * submits - which can be coarser, where an empty group left no composite
+ * between two stretches - always cover a contiguous range of these ids. Extra
+ * boundaries only cost batching, never correctness, so list starts and group
+ * edges each take one rather than being computed exactly.
+ */
+export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
+  if (!scene.paintGraph || !scene.drawRuns) return null;
+  const cached = spanSegments.get(scene);
+  if (cached) return cached;
+  const runs = scene.drawRuns;
+  const segments = new Uint32Array(runs.length);
+  const retainedRuns = new Map<number, number>();
+  runs.forEach((run, index) => { if (run.kind === "raster" && run.count === 1) retainedRuns.set(run.first, index); });
+  let current = 0;
+  const visit = (nodes: readonly ScenePaintNode[], depth: number, knockout = false): void => {
+    if (depth > 64) return;
+    current++;
+    for (const node of nodes) {
+      if (node.kind === "group") {
+        current++;
+        // A soft mask renders into a surface of its own, so where it falls
+        // relative to the group's paints is free; both this walk and the
+        // compositor take it first, which is also its place in the source.
+        if (node.softMask) visit(node.softMask.children, depth + 1);
+        visit(node.children, depth + 1, node.knockout);
+        current++;
+        continue;
+      }
+      const index = node.kind === "draw" ? node.runIndex : retainedRuns.get(node.rasterIndex);
+      if (index === undefined || index >= runs.length) continue;
+      // A blend mode composites each object on its own, so such a paint shares
+      // its span with nothing either side of it.
+      if (knockout || runs[index].blendMode) { current++; segments[index] = current; current++; }
+      else segments[index] = current;
+    }
+    current++;
+  };
+  visit(normalizeScenePaintGraph(scene), 0);
+  spanSegments.set(scene, segments);
+  return segments;
+}
+
+export interface ScenePaintExtents {
+  /** Per node list the compositor renders as a unit. */
+  nodes: Map<readonly ScenePaintNode[], Bounds>;
+  /** Four values per canonical draw run, or null when the scene cannot be measured. */
+  runs: Float64Array | null;
+}
+const nodeBounds = new WeakMap<VectorScene, ScenePaintExtents>();
+const UNBOUNDED: Bounds = { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity };
+
+/**
+ * The world extent each node list paints into, for every list the compositor
+ * renders as a unit: the normalized roots, each group's children and each soft
+ * mask's contents.
+ *
+ * A group composites onto its parent through a surface that is transparent
+ * everywhere its own paints do not reach, so every pass that carries it only
+ * has to touch this rectangle. Transparency groups in ordinary documents cover
+ * a logo or a shadow, not a page, which is what makes bounding them worth the
+ * lookup. A paint whose extent is unknown reports an unbounded rectangle, so a
+ * group containing one is never restricted.
+ */
+export function scenePaintNodeBounds(scene: VectorScene): ScenePaintExtents {
+  const cached = nodeBounds.get(scene);
+  if (cached) return cached;
+  const result: ScenePaintExtents = { nodes: new Map<readonly ScenePaintNode[], Bounds>(), runs: null };
+  const runs = scene.drawRuns;
+  if (!runs || !scene.paintGraph) { nodeBounds.set(scene, result); return result; }
+  // Bounds are only ever an optimization, so a scene this cannot measure -
+  // a synthetic one without the geometry stores, above all - simply reports
+  // nothing and every pass covers its whole surface, as it always did.
+  let culler: VectorDrawRunCuller;
+  try { culler = new VectorDrawRunCuller(scene); }
+  catch { nodeBounds.set(scene, result); return result; }
+  const box = [0, 0, 0, 0];
+  const perRun = new Float64Array(runs.length * 4);
+  const retainedRuns = new Map<number, number>();
+  runs.forEach((run, index) => { if (run.kind === "raster" && run.count === 1) retainedRuns.set(run.first, index); });
+  const visit = (nodes: readonly ScenePaintNode[], depth: number): Bounds => {
+    if (depth > 64) return UNBOUNDED;
+    const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    const include = (other: Bounds): void => {
+      bounds.minX = Math.min(bounds.minX, other.minX); bounds.minY = Math.min(bounds.minY, other.minY);
+      bounds.maxX = Math.max(bounds.maxX, other.maxX); bounds.maxY = Math.max(bounds.maxY, other.maxY);
+    };
+    for (const node of nodes) {
+      if (node.kind === "group") {
+        // A mask is its own surface with its own extent, and never widens the
+        // group: it can only take coverage away.
+        if (node.softMask) visit(node.softMask.children, depth + 1);
+        include(visit(node.children, depth + 1));
+        continue;
+      }
+      const index = node.kind === "draw" ? node.runIndex : retainedRuns.get(node.rasterIndex);
+      if (index === undefined || index >= runs.length) continue;
+      try { culler.getBounds(index, 0, box); }
+      catch { include(UNBOUNDED); continue; }
+      if (box.some(value => Number.isNaN(value))) { include(UNBOUNDED); continue; }
+      perRun.set(box, index * 4);
+      include({ minX: box[0], minY: box[1], maxX: box[2], maxY: box[3] });
+    }
+    result.nodes.set(nodes, bounds);
+    return bounds;
+  };
+  perRun.fill(Infinity);
+  visit(normalizeScenePaintGraph(scene), 0);
+  result.runs = perRun;
+  nodeBounds.set(scene, result);
   return result;
 }

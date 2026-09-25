@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -74,7 +75,7 @@ void main() {
 
   vec2 axis = p1 - p0;
   float axisLen = length(axis);
-  if ((axisLen <= 1e-6 && !isRoundCap) || alpha <= 0.001) {
+  if ((axisLen == 0.0 && !isRoundCap) || alpha <= 0.001) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vColor = vec4(0.0);
     vStrokeCoord = vec2(0.0);
@@ -125,6 +126,7 @@ void main() {
 
 const TRIANGLE_STROKE_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+${STROKE_COVERAGE_GLSL}
 
 in vec4 vColor;
 in vec2 vStrokeCoord;
@@ -150,7 +152,7 @@ void main() {
     edgeDistance = max(edgeDistance, max(-vStrokeCoord.x, vStrokeCoord.x - vAxisLength));
   }
 
-  float coverage = 1.0 - smoothstep(-vAAWorld, vAAWorld, edgeDistance);
+  float coverage = heprStrokeCoverage(edgeDistance + vHalfWidth, vHalfWidth, vAAWorld);
   float alpha = coverage * vColor.a;
   if (alpha <= 0.001) {
     discard;

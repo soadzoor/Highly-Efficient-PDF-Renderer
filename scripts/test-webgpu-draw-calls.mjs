@@ -45,6 +45,25 @@ try {
   };
 
   {
+    const { renderer, device, frame } = create();
+    const banded = device.shaders.filter(source => source.includes("heprFillBandInfo"));
+    assert.equal(banded.length, 2, "solid and gradient native pipelines include the shared band lookup");
+    for (const source of banded) {
+      assert.match(source, /heprBandRows\(bandInfo, band, bandCount, box\)/, "each band integrates only its own rows, so neighbouring bands cannot duplicate winding");
+      assert.match(source, /packedIndex & 3/, "band entries use packed component addressing");
+    }
+    const text = device.shaders.find(source => source.includes("uTextGlyphSegmentTexA"));
+    assert(text, "the actual native text pipeline is generated");
+    assert.doesNotMatch(text, /i < 2048/, "valid long outlines have no fixed shader ceiling");
+    assert.match(text, /i < inData.segmentCount/, "native text traverses the complete glyph");
+    frame();
+    assert.deepEqual(device.cameraData.slice(16), [-1, 0, -1, 0], "unindexed fill bindings are disabled");
+    Object.assign(renderer, { fillBandBase: 41, fillBandEntries: 87, gradientFillBandBase: 91, gradientFillBandEntries: 125 });
+    frame();
+    assert.deepEqual(device.cameraData.slice(16), [41, 87, 91, 125], "both fill stores upload distinct band addresses");
+  }
+
+  {
     const { renderer, frame } = create();
     assert.equal(frame(), 5, "background, raster, fill, stroke and text each submit one command");
     assert.equal(frame(), 5, "draw-call statistics reset each frame");
@@ -112,6 +131,25 @@ try {
     renderer.vectorLodLevelResources = [{ bindGroup: {} }, { bindGroup: {} }, { bindGroup: {} }];
     assert.equal(frame(), 9, "each visible LOD batch adds one call, and empty batches add none");
   }
+  {
+    // Minified pages hold the paint scheduler's coverage margin. Every path
+    // that reports stats forwards that, because neighbour order is relaxed.
+    const { renderer } = create();
+    let report;
+    renderer.setFrameListener(stats => { report = stats; });
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, false, "an exact schedule reports exact paint order");
+    renderer.orderedBatches = { paintOrderApproximated: true, culledSegmentCount: 0 };
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, true, "a held margin reaches the frame listener");
+    renderer.shouldUseVectorMinifyPath = () => true;
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, true, "including a minified composite");
+    renderer.shouldUsePanCache = () => true;
+    renderer.render(1);
+    assert.equal(report.paintOrderApproximated, true, "and a cached frame");
+  }
+
   console.log("WebGPU draw calls: direct, ordered, culled, multiply, raster strips, gradients, LOD, minify, pan cache, highlights, compositing and empty frames passed.");
 } finally {
   for (const [key, value] of Object.entries(globals)) {
@@ -122,10 +160,12 @@ try {
 
 function makeDevice() {
   const device = {
-    draws: 0, copies: 0,
+    draws: 0, copies: 0, shaders: [], cameraData: null,
     limits: { maxTextureDimension2D: 2048 },
-    queue: { writeBuffer() {}, writeTexture() {}, submit() {} },
-    createShaderModule: descriptor => descriptor,
+    queue: { writeBuffer(_buffer, _offset, data) {
+      if (data instanceof Float32Array && data.length === 20) device.cameraData = [...data];
+    }, writeTexture() {}, submit() {} },
+    createShaderModule: descriptor => { device.shaders.push(descriptor.code); return descriptor; },
     createBindGroupLayout: descriptor => descriptor,
     createPipelineLayout: descriptor => descriptor,
     createSampler: descriptor => descriptor,

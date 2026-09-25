@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import * as THREE from "three";
+import { TSL, WGSLNodeBuilder } from "three/webgpu";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -11,11 +13,14 @@ try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
+  const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
   const { GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE } =
     await import("../src/nativeGradientWebGlShaders.ts");
   const { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } = await import("../src/nativeGradientWebGpuShaders.ts");
+  const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
+  const { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_WGSL } = await import("../src/gradientMeshShaders.ts");
 
   const scene = gradientScene();
   validateVectorDrawRuns(scene);
@@ -27,12 +32,32 @@ try {
 
   for (const source of [GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE]) {
     assert.match(source, /uniform float uVectorClipIndex/);
-    assert.match(source, /\* heprVectorClip\(vLocal\)/);
+    assert.match(source, /vec4\(color, clamp\(alpha, 0\.0, 1\.0\) \* heprVectorClipAA\(vLocal, (aaWidth|localPerPixel)\)\)/,
+      "clip coverage scales alpha without darkening straight-alpha RGB");
+    const main = source.slice(source.lastIndexOf("void main() {"));
+    assert(main.indexOf("dFdx") < main.indexOf("discard"), "clip derivatives precede divergent discards");
   }
   for (const source of [GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL]) {
     assert.match(source, /@group\(1\) @binding\(0\) var uVectorClipTex/);
-    assert.match(source, /\* heprVectorClip\(inData.local, uVectorClip.x, uVectorClipTex\)/);
+    assert.match(source, /vec4f\(color, clamp\(alpha, 0\.0, 1\.0\) \* heprVectorClipAA\(inData.local, uVectorClip.index.x, uVectorClipTex, (aaWidth|localPerPixel)\)\)/,
+      "native WebGPU preserves straight-alpha RGB along clip boundaries");
+    const main = source.slice(source.lastIndexOf("fn fsMain(")).replace(/\/\/[^\n]*/g, "");
+    assert(main.indexOf("dpdx") < main.indexOf("discard"), "clip derivatives precede divergent discards");
   }
+
+  // Fill quads clamp to their clip chain's bounds, widened by the one-pixel
+  // coverage margin, and a path farther than that from its clip draws nothing.
+  // Meshes keep their own positions but share the empty-intersection cull.
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /vec2 low = max\(metaA\.zw, uClipBounds\.xy\) - margin;/);
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /vec2 high = min\(metaB\.xy, uClipBounds\.zw\) \+ margin;/);
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /any\(greaterThan\(low, high\)\)/);
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /vec2 world = mix\(low, high, corner01\);/);
+  assert.match(GRADIENT_MESH_VERTEX_GLSL, /vec2 world = aMeshPosition;/);
+  assert.match(GRADIENT_FILL_WGSL, /let low = max\(metaA\.zw, uVectorClip\.bounds\.xy\) - margin;/);
+  assert.match(GRADIENT_FILL_WGSL, /let high = min\(metaB\.xy, uVectorClip\.bounds\.zw\) \+ margin;/);
+  assert.match(GRADIENT_FILL_WGSL, /any\(low > high\)/);
+  assert.match(GRADIENT_FILL_WGSL, /let world = mix\(low, high, corner\);/);
+  assert.match(GRADIENT_MESH_WGSL, /let world = meshPosition;/);
 
   // Dispatch real gradient methods against small command recorders. Each draw
   // must use its clip, including restoring the unrestricted second fill.
@@ -42,6 +67,8 @@ try {
   let program, clip;
   const glApi = new Proxy({
     useProgram(value) { program = value; },
+    getParameter() { return 1024; },
+    createTexture() { return {}; },
     getUniformLocation(_program, name) { return name; },
     uniform1f(name, value) { if (name === "uVectorClipIndex") clip = value; },
     drawArraysInstanced(_mode, first, _vertices, count) { calls.push([program, first, count, clip]); }
@@ -57,6 +84,93 @@ try {
   gl.drawSourceOrderedContent(100, 100, 50, 50, 1);
   assert.deepEqual(calls, [["fill", 0, 1, 1], ["fill", 4, 1, -1], ["stroke", 0, 1, 0]]);
   calls.length = 0;
+
+  // Profile actual draws with a polygon beneath two fused rectangle clips,
+  // then another polygon. Headers retain exact GPU clip-parent relationships.
+  gl.uploadVectorClips({ ...scene, clipPaths: [...scene.clipPaths,
+    { ...scene.clipPaths[1], parent: 1 }, { ...scene.clipPaths[0], parent: 2 }] });
+  assert.equal(gl.vectorClipHeaders.length, 16, "retain headers without retaining the edge store");
+  assert.equal(gl.vectorClipHeaders[8], 0, "consecutive rectangle ancestors are fused");
+  const clipBounds = [];
+  glApi.uniform4f = (name, ...value) => { if (name === "uClipBounds") clipBounds.push(value); };
+  gl.gradientFillUniforms = { uClipBounds: "uClipBounds" };
+  gl.drawSourceOrderedContent(100, 100, 50, 50, 1);
+  assert.deepEqual(clipBounds, [[20, 20, 80, 80], [-1e38, -1e38, 1e38, 1e38]],
+    "the clipped fill clamps to its nested clip's bounds and the unclipped fill stays unbounded");
+  gl.localToClipRenderingEnabled = true;
+  gl.vectorClipIndex = 1;
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
+  gl.localToClipRenderingEnabled = false;
+  assert.deepEqual(clipBounds.at(-1), [-1e38, -1e38, 1e38, 1e38],
+    "projected corners have their own margins, so projected quads are never clamped");
+  calls.length = 0;
+  let time = 0;
+  const profile = new RenderPerformanceProfiler({ now: () => time++ });
+  gl.performanceProfiler = profile;
+  profile.start({ gpu: false });
+  profile.beginFrame();
+  gl.drawSourceOrderedContent(100, 100, 75, 50, 1);
+  profile.endFrame();
+  let record = profile.getReport().frameRecords[0];
+  assert.equal(record.counters.gradientAnalyticFillDraws, 2);
+  assert.equal(record.counters.gradientAnalyticFillSegments, 8);
+  assert.equal(record.counters.gradientFillClipPolygonEdges, 3, "rectangle edges do not add polygon work");
+  assert.equal(record.counters.gradientStrokeDraws, 1);
+  assert.equal(record.counters.gradientStrokeSegments, 1);
+  assert.equal(record.counters.gradientStrokeClipPolygonEdges, 3);
+  assert.equal(record.counters.gradientFillIndexedClipNodes, 0, "small polygon clips retain full scans");
+  assert.equal(record.counters.gradientStrokeIndexedClipNodes, 0);
+  assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 15000,
+    "each 100x100 quad is clipped to 75x100 viewport pixels; overlapping draws count again");
+  assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 22500);
+  assert.equal(record.counters.gradientAnalyticFillQuadPixelsEstimate, 56 * 62 + 76 * 100,
+    "the clipped quad shrinks to its clip bounds and margin; the unclipped quad keeps only its margin");
+  assert(record.cpuSectionsMs.gradientFillSubmission > 0);
+  assert(record.cpuSectionsMs.gradientStrokeSubmission > 0);
+
+  gl.gradientMeshRanges = new Uint32Array([0, 0, 0, 6]);
+  gl.gradientMeshProgram = "mesh"; gl.gradientMeshUniforms = {};
+  gl.vectorClipIndex = 3;
+  // Header-only fixtures isolate profiling from shader execution: both fill-rule
+  // flags mark indexed polygons, while negative rectangle counts remain excluded.
+  gl.vectorClipHeaders[3] = 2;
+  gl.vectorClipHeaders[15] = 3;
+  gl.vectorClipHeaders[7] = gl.vectorClipHeaders[11] = 2;
+  profile.beginFrame();
+  gl.drawGradientFillPath(0, 100, 100, 75, 50, 1);
+  gl.drawGradientFillPath(1, 100, 100, 75, 50, 1);
+  gl.drawGradientStrokeRun(0, 100, 100, 75, 50, 1);
+  profile.endFrame();
+  record = profile.getReport().frameRecords[1];
+  assert.equal(record.counters.gradientFillClipPolygonEdges, 12, "indexed nodes retain original polygon edge counts");
+  assert.equal(record.counters.gradientFillIndexedClipNodes, 4, "both polygon ancestors count again for each fill draw");
+  assert.equal(record.counters.gradientStrokeIndexedClipNodes, 2, "indexed polygon ancestors count for strokes too");
+  assert.equal(record.counters.gradientStrokeClipPolygonEdges, 6);
+  assert.equal(record.counters.gradientMeshFillDraws, 1);
+  assert.equal(record.counters.gradientMeshFillSegments, 4);
+  assert.equal(record.counters.gradientMeshTriangles, 2);
+  assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 7500, "mesh triangles are excluded from quad area");
+  assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 45000,
+    "edge-test estimates retain the unindexed baseline when polygon bands are active");
+
+  profile.beginFrame();
+  gl.localToClipRenderingEnabled = true;
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
+  gl.localToClipRenderingEnabled = false;
+  gl.drawGradientFillPath(0, 100, 100, 1000, 1000, 1);
+  profile.endFrame();
+  record = profile.getReport().frameRecords[2];
+  assert.equal(record.counters.gradientAnalyticFillDraws, 2);
+  assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 0,
+    "projected views are excluded and fully offscreen quads contribute zero pixels");
+  profile.stop();
+  Object.defineProperty(gl, "vectorClipHeaders", { get() { throw Error("disabled profiling must not read clip headers"); } });
+  gl.gradientData = { ...scene,
+    get gradientFillPathMetaA() { throw Error("disabled profiling must not read path metadata"); } };
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
+  gl.drawGradientStrokeRun(0, 100, 100, 50, 50, 1);
+  assert.equal(profile.getReport().frames, 3);
+  calls.length = 0;
   const gpu = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), flags, {
     drawPageBackgroundContentIntoPass() {}, gradientFillPipeline: "fill", gradientStrokePipeline: "stroke",
     primitiveGradientColors: { bindGroup() { return {}; } },
@@ -68,6 +182,20 @@ try {
     draw(_vertices, count, first) { calls.push([program, first, count, clip]); }
   });
   assert.deepEqual(calls, [["fill", 0, 1, 1], ["fill", 4, 1, -1], ["stroke", 0, 1, 0]]);
+
+  // Native WebGPU carries each clip's chain bounds beside its index.
+  const writes = [];
+  globalThis.GPUBufferUsage ??= { UNIFORM: 64, COPY_DST: 8 };
+  const upload = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+    vectorClipBuffers: [], vectorClipBindGroups: [], orderedInstanceBuffer: {},
+    gpuDevice: { createBuffer: descriptor => ({ size: descriptor.size, destroy() {} }), createBindGroup: value => value,
+      queue: { writeBuffer: (buffer, _offset, data) => writes.push([buffer.size, [...data]]) } },
+    createFloatTexture: () => ({ createView: () => ({}), destroy() {} }), maxTextureSize: () => 4096
+  });
+  upload.uploadVectorClips(scene);
+  const unbounded = [-1e38, -1e38, 1e38, 1e38].map(Math.fround);
+  assert.deepEqual(writes, [[32, [-2, 0, 0, 0, ...unbounded]], [32, [-1, 0, 0, 0, ...unbounded]],
+    [32, [0, 0, 0, 0, 0, 0, 100, 100]], [32, [1, 0, 0, 0, 20, 20, 80, 80]]]);
 
   // Construct Three materials without creating a browser or GPU session.
   for (const materialBackend of ["webgl", "webgpu"]) {
@@ -94,11 +222,25 @@ try {
     if (materialBackend === "webgl") {
       assert.deepEqual(materials.map(m => m.uniforms.uVectorClipIndex.value), [1, -1, 0]);
       assert.equal(materials[0].uniforms.uVectorClipTex.value, materials[2].uniforms.uVectorClipTex.value);
-      assert(materials.every(m => m.fragmentShader.includes("heprVectorClip(vLocal)")));
+      for (const material of materials) {
+        assert(material.fragmentShader.includes("outColor.a *= heprVectorClipAA(vLocal, clipAAWidth)"));
+        assert(!material.fragmentShader.includes("outColor *= heprVectorClip(vLocal)"));
+        const main = material.fragmentShader.slice(material.fragmentShader.lastIndexOf("void main() {"));
+        assert(main.indexOf("float clipAAWidth") < main.indexOf("discard"),
+          "Three WebGL derives the clip footprint before paint discards");
+      }
     } else {
-      assert.equal(materials[0].fragmentNode.node.op, "*");
-      assert.equal(materials[2].fragmentNode.node.op, "*");
-      assert.notEqual(materials[1].fragmentNode.node?.op, "*");
+      for (const index of [0, 2]) {
+        const shader = buildNodeShader(entries[index].mesh).fragmentShader;
+        assert.match(shader, /fn heprVectorClipAA\s*\(/, "clipped gradient nodes use smooth clip coverage");
+        assert.match(shader, /vec4<f32>\( heprClipSource\.xyz, \( heprClipSource\.w \* heprVectorClipAA\(/,
+          "Three WebGPU scales only alpha at the clip boundary");
+        const main = shader.slice(shader.lastIndexOf("@fragment"));
+        assert(main.indexOf("heprClipAAWidth = heprClipPixelWidth") < main.indexOf("heprClipSource = heprGradient"),
+          `clip derivatives execute before the paint helper can discard: ${main}`);
+      }
+      assert(!/fn heprVectorClipAA\s*\(/.test(buildNodeShader(entries[1].mesh).fragmentShader),
+        "unclipped gradients do not evaluate clip coverage");
     }
     layer.updateFrame({ zoom: 2, cameraCenterX: 3, cameraCenterY: 4 }, { width: 200, height: 100 });
     layer.dispose();
@@ -133,4 +275,20 @@ function gradientScene() {
     gradientStrokeEndpoints: floats([0, 50, 100, 50]), gradientStrokePrimitiveMeta: floats([0, 0, 0, 0]),
     gradientStrokePrimitiveBounds: floats([0, 49, 100, 51]), gradientStrokeStyles: floats([1, 0, 0, 0])
   };
+}
+
+function buildNodeShader(mesh) {
+  // Exercise Three's real TSL/WGSL composition without a GPU device or browser.
+  const renderer = {
+    contextNode: TSL.context({}), library: { fromMaterial: value => value },
+    getRenderTarget: () => null, getMRT: () => null,
+    backend: { compatibilityMode: false, utils: { getTextureSampleData: () => ({ primarySamples: 1 }) },
+      capabilities: { getUniformBufferLimit: () => 65536 } },
+    hasFeature: () => false, hasCompatibility: () => false,
+    coordinateSystem: THREE.WebGPUCoordinateSystem
+  };
+  const builder = new WGSLNodeBuilder(mesh, renderer);
+  builder.scene = new THREE.Scene();
+  builder.camera = new THREE.PerspectiveCamera();
+  return builder.build();
 }

@@ -867,6 +867,12 @@ class NativePdfSession implements NativeVectorPdfSession {
         const expansionLimit = error instanceof PdfError && error.code === "resource-limit" && error.details?.reason === "vector-expansion-limit";
         if (!isNativeVectorRepresentationFailure(error) && !expansionLimit) throw error;
         if (options.vectorFallback === "error") throw error;
+        // Naming what the retained lowering could not represent is the only
+        // record of why the page then needs raster layers at all; the capture
+        // itself reports which paints, not what defeated the vector path.
+        this.appendDiagnostics([{ code: "retained-vector-fallback", severity: "warning", pageIndex: sourcePageIndex,
+          message: `Retained vector lowering could not represent this page: ${(error as Error).message}`,
+          details: { reason: (error instanceof PdfError ? error.details?.reason : undefined) ?? "unrepresentable" } }]);
         // Layer visibility must be replayable even when a paint feature still
         // needs the reference renderer. Keep the all-command retained page.
         if (options.retainOptionalContent || expansionLimit) return this.buildRetainedRasterScene(page, options, signal, error as Error);
@@ -1038,18 +1044,33 @@ class NativePdfSession implements NativeVectorPdfSession {
           // Raster replay slots own singleton runs; ordinary raster images retain
           // their existing paint runs and do not acquire retained resources.
           const runs = scene.drawRuns ?? defaultVectorDrawRuns(scene);
-          scene.drawRuns = runs.flatMap(run => run.kind === "raster"
-            ? Array.from({ length: run.count }, (_, offset) => ({ ...run, first: run.first + offset, count: 1 })) : [run]);
-          scene.paintGraph = { roots: scene.drawRuns.map((run, runIndex) => {
+          const oldGraph = scene.paintGraph;
+          const remapped: number[][] = [];
+          let nextRun = 0;
+          scene.drawRuns = runs.flatMap(run => {
+            const split = run.kind === "raster"
+              ? Array.from({ length: run.count }, (_, offset) => ({ ...run, first: run.first + offset, count: 1 })) : [run];
+            remapped.push(split.map(() => nextRun++)); return split;
+          });
+          const nodes = scene.drawRuns.map((run, runIndex): import("./scenePaintGraph").ScenePaintNode => {
             const layer = run.kind === "raster" ? scene.rasterLayers[run.first] as NativeSelectiveRasterLayer : undefined;
-            return layer?.retainedFirstCommand === undefined ? { kind: "draw" as const, runIndex }
-              : { kind: "retained" as const, retainedPage: 0, firstCommand: layer.retainedFirstCommand,
+            return layer?.retainedFirstCommand === undefined ? { kind: "draw", runIndex }
+              : { kind: "retained", retainedPage: 0, firstCommand: layer.retainedFirstCommand,
                 count: layer.retainedCommandCount!, rasterIndex: run.first };
-          }) };
+          });
+          const remapGraph = (source: readonly import("./scenePaintGraph").ScenePaintNode[]): import("./scenePaintGraph").ScenePaintNode[] =>
+            source.flatMap(node => node.kind === "draw" ? remapped[node.runIndex].map(index => nodes[index])
+              : node.kind === "group" ? [{ ...node, children: remapGraph(node.children),
+                ...(node.softMask ? { softMask: { ...node.softMask, children: remapGraph(node.softMask.children) } } : {}) }] : [node]);
+          scene.paintGraph = { roots: oldGraph ? remapGraph(oldGraph.roots) : nodes };
         }
+        // Naming the features turns "why is this pixelated?" into one line.
+        const reasons = vectorCompiled.vectorSceneData?.selectivePaintReasons ?? [];
         this.appendDiagnostics([{ code: "selective-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
-          message: "Some unsupported paint or compositing features use bounded raster layers; surrounding vector content is retained.",
-          details: { layers: compositeRasterLayers.length } }]);
+          message: reasons.length === 0
+            ? "Some unsupported paint or compositing features use bounded raster layers; surrounding vector content is retained."
+            : `Paints using ${reasons.join(", ")} use bounded raster layers; surrounding vector content is retained.`,
+          details: { layers: compositeRasterLayers.length, ...(reasons.length ? { reasons: reasons.join(",") } : {}) } }]);
       }
       if (timings) {
         timings.vectorSceneAdaptationMs += nativeVectorTimingNow() - adaptationStartedAt;
@@ -2271,7 +2292,7 @@ async function flattenNativeVectorFormOccurrences(
   // Resolve complete subtrees before appending any geometry or text. If a nested
   // effect needs compositing, its outer invocation must be captured atomically.
   const children = new Map<NativeVectorCompiledOccurrence, (NativeVectorCompiledOccurrence | null)[]>();
-  const rejectedRootForms = new Set<number>();
+  const rejectedRootForms = new Map<number, string>();
   const preflightActive = new Set<number>();
   let preflightCommands = 0;
   let preflightPaths = 0;
@@ -2307,7 +2328,7 @@ async function flattenNativeVectorFormOccurrences(
       } catch (error) {
         if (owner.formDefinitionIndex !== -1 || !(isSelectiveCompositeCandidateError(error) ||
             isOrderedFormClipFailure(error))) throw error;
-        rejectedRootForms.add(i);
+        rejectedRootForms.set(i, describeSelectiveFormCause(error));
         resolved[i] = null;
       } finally {
         preflightActive.delete(paint.definitionIndex);
@@ -2350,6 +2371,9 @@ async function flattenNativeVectorFormOccurrences(
   let rootPackedFormSinceImage = false;
   let formOccurrenceCount = 0;
   const selectiveCompositeFormPaintIndices: number[] = [];
+  // Captured paints live in whichever occurrence painted them, so the reasons
+  // are gathered from every one rather than only the page's own content stream.
+  const selectivePaintReasons = new Set<string>();
   const selectiveCompositeFormPaintOrders: number[] = [];
 
   const registerOccurrence = (occurrence: NativeVectorCompiledOccurrence): void => {
@@ -2379,6 +2403,7 @@ async function flattenNativeVectorFormOccurrences(
     registerOccurrence(occurrence);
     textAccumulator.appendDiagnosticsFrom(occurrence.text);
     const sidecar = occurrence.compiled.vectorSceneData;
+    for (const reason of sidecar?.selectivePaintReasons ?? []) selectivePaintReasons.add(reason);
     if (!sidecar || !(sidecar.sourceEvents instanceof Uint32Array) ||
         sidecar.sourceEvents.length % 2 !== 0) {
       throw new PdfError("invalid-object", "A Form occurrence has no valid source-event tape.", {
@@ -2524,6 +2549,7 @@ async function flattenNativeVectorFormOccurrences(
         try {
           try {
             if (ordered && occurrence.formDefinitionIndex === -1 && rejectedRootForms.has(localIndex)) {
+              selectivePaintReasons.add(rejectedRootForms.get(localIndex) ?? "composited-form");
               selectiveCompositeFormPaintIndices.push(localIndex);
               selectiveCompositeFormPaintOrders.push(formPaintOrder);
               appendSourceEvent(DENSE_PDF_VECTOR_SCENE_EVENT_COMPOSITE, formPaintOrder, null, 0, condition);
@@ -2542,6 +2568,7 @@ async function flattenNativeVectorFormOccurrences(
             // Suppress only the outermost invocation. Its complete reusable
             // display-program subtree is captured later as one ordered layer,
             // so no nested paint can leak into the packed VectorScene stores.
+            selectivePaintReasons.add(describeSelectiveFormCause(error));
             selectiveCompositeFormPaintIndices.push(localIndex);
             selectiveCompositeFormPaintOrders.push(formPaintOrder);
           }
@@ -2629,6 +2656,7 @@ async function flattenNativeVectorFormOccurrences(
   };
 
   const selectiveImageSpans = suppressVectorSelectiveImageSpans(rootCompiled, pageIndex);
+  for (const reason of rootCompiled.vectorSceneData?.selectivePaintReasons ?? []) selectivePaintReasons.add(reason);
   const rootOccurrence = Object.freeze({
     compiled: selectiveImageSpans.compiled,
     text: rootText,
@@ -2655,7 +2683,9 @@ async function flattenNativeVectorFormOccurrences(
     imagePaintOrders: Uint32Array.from(imagePaintOrders),
     imageFlags: Uint8Array.from(imageFlags),
     imageOpacities: Float32Array.from(imageOpacities),
-    ...(shadingPaints.length ? { shadingPaints: Object.freeze(shadingPaints) } : {})
+    ...(shadingPaints.length ? { shadingPaints: Object.freeze(shadingPaints) } : {}),
+    ...(selectivePaintReasons.size
+      ? { selectivePaintReasons: Object.freeze([...selectivePaintReasons].sort()) } : {})
   });
   return Object.freeze({
     compiled: mergeNativeVectorOccurrences(
@@ -2921,6 +2951,24 @@ function isOrderedFormClipFailure(error: unknown): boolean {
       "vector-form-text-bbox", "vector-form-bbox-transform"].includes(String(error.details?.reason));
 }
 
+/**
+ * The feature that stopped a Form from compiling into vectors, named so the
+ * fallback warning says what to look for rather than only that a Form was
+ * captured. Unrecognized causes report their reason code verbatim.
+ */
+function describeSelectiveFormCause(error: unknown): string {
+  if (error instanceof DensePdfUnsupportedError) {
+    if (error.message.includes("alpha-as-shape")) return "composited-form:alpha-as-shape";
+    if (error.message.includes("soft mask")) return "composited-form:soft-mask";
+    if (/rendering mode/.test(error.message)) return "composited-form:text-rendering-mode";
+    const blend = /cannot represent \/(.+) blending/.exec(error.message);
+    if (blend) return `composited-form:blend-${blend[1].toLowerCase()}`;
+    return "composited-form";
+  }
+  const reason = error instanceof PdfError ? error.details?.reason : undefined;
+  return typeof reason === "string" ? `composited-form:${reason.replace(/^vector-form-/, "")}` : "composited-form";
+}
+
 function isSelectiveCompositeCandidateError(error: unknown): boolean {
   if (error instanceof DensePdfUnsupportedError) {
     return error.message === "VectorScene output cannot represent alpha-as-shape compositing." ||
@@ -3119,7 +3167,7 @@ async function renderNativeSelectiveCompositeLayers(
       }
       if (unselectedGlyphOffset >= 0) onCompositeText?.();
       const layer = await renderNativeCompositeCommandSpan(page, first, last, paintOrder,
-        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, true, limits);
+        signal, surfaceFactory, renderHeprPageToCanvas2d, renderInternals, boundCompositeWork, limits);
       if (layer) layers.push(layer);
     }
     return layers;
@@ -3145,7 +3193,7 @@ export async function renderNativeRetainedCommandSpan(
   try {
     return await renderNativeCompositeCommandSpan(page, firstCommand, firstCommand + count - 1,
       firstCommand + count - 1, signal, surfaceFactory, renderHeprPageToCanvas2d,
-      { imageSurfaces, boundSoftMasks: true }, true, true, limits);
+      { imageSurfaces, boundSoftMasks: true }, true, limits);
   } finally { imageSurfaces.dispose(); surfaceFactory.releaseAll(); }
 }
 
@@ -3155,7 +3203,6 @@ async function renderNativeCompositeCommandSpan(
   renderHeprPageToCanvas2d: NativeCompositeRenderer,
   renderInternals: import("./heprCanvas2dRenderer").HeprCanvas2dRenderInternals,
   boundCompositeWork: boolean,
-  fullPage = false,
   limits?: Readonly<PdfResourceLimits>
 ): Promise<NativeSelectiveRasterLayer | null> {
   const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
@@ -3164,9 +3211,11 @@ async function renderNativeCompositeCommandSpan(
   const rendered = await renderNativeCompositePixels(createSelectiveCompositePage(page, commands), {
     scale, background: null, surfaceFactory, signal
   }, renderHeprPageToCanvas2d, renderInternals);
-  const crop = fullPage ? { x: 0, y: 0, width: rendered.width, height: rendered.height, data: new Uint8Array(rendered.rgba) }
-    : cropVisibleRgba(rendered.rgba, rendered.width, rendered.height, 2, signal);
-  if (!crop) return null;
+  // Keep the slot even when its current layers are empty. Retained page bounds
+  // describe where a later visibility revision can paint; its texture only
+  // needs the pixels visible now.
+  const crop = cropVisibleRgba(rendered.rgba, rendered.width, rendered.height, 2, signal) ??
+    { x: 0, y: 0, width: 1, height: 1, data: new Uint8Array(4) };
   const backdropGroups = collectHeprBackdropGroups(page, commands);
   const data = backdropGroups.size !== 0 && [...backdropGroups].every(groupIndex => heprBackdropGroupCanRender(page, groupIndex))
     ? await renderNativeBackdropCorrection({ page, rootCommands, first, last, selectionRgba: rendered.rgba,

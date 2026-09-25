@@ -19,12 +19,21 @@ const square = [move(20, 20), line(65, 20), line(65, 65), line(20, 65), close];
 const corners = [move(15, 55), line(40, 20), line(65, 55), line(85, 20)];
 
 try {
-  const { buildNativeGlyphStroke } = await import("../src/pdf/nativeGlyphStroke.ts");
+  const { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey } = await import("../src/pdf/nativeGlyphStroke.ts");
   let comparisons = 0;
   const compare = (name, commands, options = {}, local = identity, zoom = 6) => {
     const style = { ...defaults, ...options };
     const geometry = buildNativeGlyphStroke(commands, multiply(style.transform, local), style);
     assert.ok(geometry, name);
+    const placement = multiply(style.transform, local);
+    const shared = buildNativeGlyphStrokeAtOrigin(commands, placement, style);
+    assert.equal(shared.segmentsA.length, geometry.segmentsA.length, `${name}: sharing preserves the stroke silhouette`);
+    for (let i = 0; i < geometry.segmentsA.length; i++) {
+      assert.ok(Math.abs(shared.segmentsA[i] + placement[4 + i % 2] - geometry.segmentsA[i]) < 1e-7,
+        `${name}: local stroke coordinates retain the complete transformed pen`);
+      const translation = i % 4 < 2 ? placement[4 + i % 2] : 0;
+      assert.ok(Math.abs(shared.segmentsB[i] + translation - geometry.segmentsB[i]) < 1e-7, name);
+    }
     assert.equal(geometry.segmentsA.length, geometry.segmentsB.length, name);
     assert.ok(geometry.segmentsA.length / 4 <= 2048, name);
     assert.ok(geometry.segmentsA.every(Number.isFinite), name);
@@ -125,6 +134,53 @@ try {
     if (index % 2) path.push(close);
     compare(`self-overlapping contour ${index}`, path, { lineCap: index % 3, lineJoin: index % 3, miterLimit: 2.5 });
   }
+
+  const cacheKey = nativeGlyphStrokeCacheKey(0, 65, identity, defaults);
+  assert.equal(nativeGlyphStrokeCacheKey(0, 65, [1, 0, 0, 1, 300, 40],
+    { ...defaults, transform: [1, 0, 0, 1, -17, 6] }), cacheKey, "glyph and pen translations do not duplicate geometry");
+  for (const change of [
+    { width: 2 }, { lineCap: 1 }, { lineJoin: 1 }, { miterLimit: 2 }, { dashPhase: 1 },
+    { dashArray: [1, 2] }, { transform: [1, .2, .3, 2, 0, 0] }
+  ]) assert.notEqual(nativeGlyphStrokeCacheKey(0, 65, identity, { ...defaults, ...change }), cacheKey);
+  assert.notEqual(nativeGlyphStrokeCacheKey(0, 65, [1, .2, .3, 2, 0, 0], defaults), cacheKey);
+  assert.notEqual(nativeGlyphStrokeCacheKey(1, 65, identity, defaults), cacheKey);
+  assert.notEqual(nativeGlyphStrokeCacheKey(0, 66, identity, defaults), cacheKey);
+
+  const { buildNativeVectorTextStrokes } = await import("../src/pdf/nativeVectorTextStroke.ts");
+  const count = 100, text = { glyphs: { glyphIds: new Uint32Array(count).fill(65), fontIndices: new Uint32Array(count),
+    flags: new Uint8Array(count), transformIndices: Uint32Array.from({ length: count }, (_, i) => i) },
+    transforms: { values: Float32Array.from(Array.from({ length: count }, (_, i) => [1, 0, 0, 1, i * 100, 0]).flat()) } };
+  const makeStores = () => Object.fromEntries(["instanceA", "instanceB", "instanceC", "glyphMetaA", "glyphMetaB", "glyphSegmentsA", "glyphSegmentsB"].map(key => [key, new Float32Array()]));
+  const compiled = { pathCount: 0, fillSegmentsA: [], fillSegmentsB: [], endpoints: [] };
+  const sidecar = { glyphRunMeta: [0, count, 0], glyphStrokePaints: [{ ...defaults, color: [0, 0, 0, 1] }] };
+  const stores = makeStores(), bounds = { minX: 0, minY: 0, maxX: count * 100, maxY: 100 };
+  const outline = buildNativeGlyphStrokeAtOrigin(curve, identity, defaults);
+  const coordinateBudget = outline.segmentsA.length + outline.segmentsB.length;
+  buildNativeVectorTextStrokes(compiled, sidecar, text, stores, [{ getGlyphOutline: () => ({ commands: curve }) }],
+    bounds, count, coordinateBudget);
+  assert.equal(stores.instanceA.length / 4, count);
+  assert.equal(stores.glyphMetaA.length / 4, 1, "100 translated glyphs use one outline");
+  assert.equal(stores.glyphSegmentsA.length + stores.glyphSegmentsB.length, coordinateBudget,
+    "coordinate budgets charge shared geometry once");
+  assert.throws(() => buildNativeVectorTextStrokes(compiled, sidecar, text, makeStores(),
+    [{ getGlyphOutline: () => ({ commands: curve }) }], bounds, count - 1, coordinateBudget),
+    error => error.details?.reason === "vector-glyph-stroke-limit", "path budgets still count glyph instances");
+
+  const denseContour = Array.from({ length: 1100 }, (_, i) => {
+    const angle = i * Math.PI * 2 / 1100;
+    return { kind: i ? "line" : "move", x: 40 + Math.cos(angle) * 20, y: 40 + Math.sin(angle) * 20 };
+  });
+  denseContour.push(close);
+  const denseGeometry = buildNativeGlyphStrokeAtOrigin(denseContour, identity, defaults), denseStores = makeStores();
+  const denseEdges = denseGeometry.segmentsA.length / 4;
+  assert.ok(denseEdges > 2048 && denseEdges <= 4096, "valid detailed strokes exceed the former shader ceiling");
+  buildNativeVectorTextStrokes(compiled, sidecar, text, denseStores,
+    [{ getGlyphOutline: () => ({ commands: denseContour }) }], bounds, count,
+    denseGeometry.segmentsA.length + denseGeometry.segmentsB.length);
+  assert.equal(denseStores.glyphMetaA.length / 4, 1, "large outlines are still shared");
+  assert.equal(denseStores.glyphMetaA[1], denseEdges, "the full valid outline reaches the shader metadata");
+  assert.deepEqual(denseStores.glyphSegmentsA, Float32Array.from(denseGeometry.segmentsA));
+  assert.deepEqual(denseStores.glyphSegmentsB, Float32Array.from(denseGeometry.segmentsB));
 
   assert.equal(buildNativeGlyphStroke([], identity, defaults), null);
   assert.throws(() => buildNativeGlyphStroke(square, identity, { ...defaults, width: 0 }),

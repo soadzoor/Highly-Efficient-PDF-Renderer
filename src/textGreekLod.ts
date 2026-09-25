@@ -4,8 +4,6 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 export const TEXT_LOD_MIN_TEXT_INSTANCES = 50_000;
 /** A coarse level that saves less than this is not worth keeping resident. */
 export const TEXT_LOD_MAX_COARSE_RUN_RATIO = 0.7;
-/** Value stored in the spare instance component for a coarse square. */
-export const TEXT_COARSE_INSTANCE_FLAG = 1;
 /** Maximum exact glyphs represented by one independently selected cluster. */
 export const TEXT_LOD_MAX_CLUSTER_GLYPHS = 512;
 /** Maximum coarse runs represented by one independently selected cluster. */
@@ -498,9 +496,12 @@ function buildPageRuns(
     ];
     const coarseIndex = context.coarse.count;
     const coverage = Math.min(1, Math.max(0, inkTotal / (width * height)));
+    // Instance B.w is the 1-based text clip reference. Clipped glyphs never
+    // enter a run, so the coarse square must stay unclipped (0); any other
+    // value makes renderers clip it against an unrelated clip rectangle.
     context.coarse.push(
       transform[0], transform[1], transform[2], transform[3],
-      transform[4], transform[5], 0, TEXT_COARSE_INSTANCE_FLAG,
+      transform[4], transform[5], 0, 0,
       first.red, first.green, first.blue, first.alpha * coverage
     );
     context.runs.push(freezeRun({
@@ -822,13 +823,43 @@ function hasValidCompletePageRanges(scene: VectorScene, instanceCount: number, p
   return cursor === instanceCount;
 }
 
+/**
+ * Glyphs a few pixels across render as their box at mean ink density, the way
+ * coarse runs do, so exact and coarse text agree where LOD switches between
+ * them. Stores each glyph's ink area over its box area in the spare third
+ * component of its meta B entry.
+ */
+export function writeTextGlyphInkDensities(
+  glyphCount: number,
+  metaA: Float32Array,
+  metaB: Float32Array,
+  segmentsA: Float32Array,
+  segmentsB: Float32Array
+): void {
+  const areas = glyphInkAreas(glyphCount, metaA, segmentsA, segmentsB);
+  for (let glyphIndex = 0; glyphIndex < glyphCount; glyphIndex += 1) {
+    const offset = glyphIndex * 4;
+    const boxArea = (metaB[offset] - metaA[offset + 2]) * (metaB[offset + 1] - metaA[offset + 3]);
+    metaB[offset + 2] = boxArea > 0 && Number.isFinite(boxArea) ? Math.min(1, areas[glyphIndex] / boxArea) : 0;
+  }
+}
+
 function computeGlyphInkAreas(scene: VectorScene): Float32Array {
-  const glyphCount = Math.max(0, scene.textGlyphCount | 0);
+  return glyphInkAreas(Math.max(0, scene.textGlyphCount | 0), scene.textGlyphMetaA,
+    scene.textGlyphSegmentsA, scene.textGlyphSegmentsB);
+}
+
+function glyphInkAreas(
+  glyphCount: number,
+  metaA: Float32Array,
+  segmentsA: Float32Array,
+  segmentsB: Float32Array
+): Float32Array {
   const areas = new Float32Array(glyphCount);
   for (let glyphIndex = 0; glyphIndex < glyphCount; glyphIndex += 1) {
     const glyphOffset = glyphIndex * 4;
-    const segmentStart = Math.max(0, Math.trunc(scene.textGlyphMetaA[glyphOffset] ?? 0));
-    const segmentCount = Math.max(0, Math.trunc(scene.textGlyphMetaA[glyphOffset + 1] ?? 0));
+    const segmentStart = Math.max(0, Math.trunc(metaA[glyphOffset] ?? 0));
+    const segmentCount = Math.max(0, Math.trunc(metaA[glyphOffset + 1] ?? 0));
     let cross2 = 0;
     let subpathOpen = false;
     let subpathStartX = 0;
@@ -837,16 +868,16 @@ function computeGlyphInkAreas(scene: VectorScene): Float32Array {
     let cursorY = 0;
     for (let i = 0; i < segmentCount; i += 1) {
       const segmentOffset = (segmentStart + i) * 4;
-      if (segmentOffset + 3 >= scene.textGlyphSegmentsA.length || segmentOffset + 3 >= scene.textGlyphSegmentsB.length) {
+      if (segmentOffset + 3 >= segmentsA.length || segmentOffset + 3 >= segmentsB.length) {
         break;
       }
-      const p0x = scene.textGlyphSegmentsA[segmentOffset];
-      const p0y = scene.textGlyphSegmentsA[segmentOffset + 1];
-      const cx = scene.textGlyphSegmentsA[segmentOffset + 2];
-      const cy = scene.textGlyphSegmentsA[segmentOffset + 3];
-      const p2x = scene.textGlyphSegmentsB[segmentOffset];
-      const p2y = scene.textGlyphSegmentsB[segmentOffset + 1];
-      const primitiveType = scene.textGlyphSegmentsB[segmentOffset + 2];
+      const p0x = segmentsA[segmentOffset];
+      const p0y = segmentsA[segmentOffset + 1];
+      const cx = segmentsA[segmentOffset + 2];
+      const cy = segmentsA[segmentOffset + 3];
+      const p2x = segmentsB[segmentOffset];
+      const p2y = segmentsB[segmentOffset + 1];
+      const primitiveType = segmentsB[segmentOffset + 2];
       if (![p0x, p0y, cx, cy, p2x, p2y, primitiveType].every(Number.isFinite)) continue;
       if (!subpathOpen || !pointsClose(p0x, p0y, cursorX, cursorY)) {
         if (subpathOpen) cross2 += cursorX * subpathStartY - cursorY * subpathStartX;

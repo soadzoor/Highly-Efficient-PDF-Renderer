@@ -1,4 +1,5 @@
 import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import { retainedRasterBounds } from "./retainedRasterBounds";
 import { defaultVectorDrawRuns } from "./vectorDrawOrder";
 import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import { sampleSceneGradientChannel } from "./gradientSampling";
@@ -248,9 +249,9 @@ function readSegment(store: SegmentStore, index: number): PrimitiveSegment {
     end: store.matrix ? transform(end, store.matrix) : end,
     ...(control ? { control: store.matrix ? transform(control, store.matrix) : control } : {}) };
 }
-function rasterQuad(scene: VectorScene, index: number): PrimitivePoint[] {
+function rasterQuad(scene: VectorScene, index: number, replacement?: RasterLayer): PrimitivePoint[] {
   return [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }]
-    .map(point => transform(point, scene.rasterLayers[index].matrix));
+    .map(point => transform(point, (replacement ?? scene.rasterLayers[index]).matrix));
 }
 function primitiveBounds(scene: VectorScene, ref: PrimitiveRef): Bounds {
   const i = ref.index * 4;
@@ -261,6 +262,8 @@ function primitiveBounds(scene: VectorScene, ref: PrimitiveRef): Bounds {
   }
   const bounds = emptyBounds();
   if (ref.kind === "raster") {
+    const retained = retainedRasterBounds(scene, ref.index);
+    if (retained) return { ...retained };
     for (const point of rasterQuad(scene, ref.index)) include(bounds, point);
   } else if (ref.kind === "text") {
     const glyph = Math.round(scene.textInstanceB[i + 2]) * 4;
@@ -920,10 +923,10 @@ export class ScenePrimitivePicker {
       const sampledLayer = shapeOnly ? { ...layer, opacity: 1 } : layer;
       if (rasterAlpha(scene, ref.index, options.point, sampledLayer) > ALPHA_EPSILON)
         return { primitive: { ...ref }, optionalContent: getPrimitiveOptionalContent(this.scene, ref), point: { ...options.point }, closestPoint: { ...options.point }, distancePx: 0 };
-      const uv = inverse(options.point, scene.rasterLayers[ref.index].matrix);
+      const uv = inverse(options.point, layer.matrix);
       // A transparent pixel inside the layer must not become a rectangle hit.
       if (!uv || (uv.x >= 0 && uv.x <= 1 && uv.y >= 0 && uv.y <= 1)) return null;
-      const quad = rasterQuad(scene, ref.index);
+      const quad = rasterQuad(scene, ref.index, layer);
       let nearest: Nearest | null = null;
       for (let j = 0; j < 4; j++) {
         const candidate = await nearestProjected({ start: quad[j], end: quad[(j + 1) % 4] }, options, work);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { deflateSync } from "node:zlib";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !specifier.endsWith(".ts")
@@ -109,5 +110,156 @@ try {
     assert.throws(() => encodeScenePaintGraph({ roots: [deep] }), /nesting is too deep/);
   }
 
-  console.log("HEP v8 scene section codecs passed.");
+  const {
+    SCENE_RASTER_LAYERS_PATH, encodeRasterLayerTable, decodeRasterLayerTable
+  } = await import("../src/hepRasterLayers.ts");
+  const {
+    TEXT_GLYPH_SEGMENTS_PATH, TEXT_INSTANCE_POSITIONS_PATH,
+    encodeTextGlyphSegments, decodeTextGlyphSegments,
+    encodeTextInstancePositions, decodeTextInstancePositionsInto
+  } = await import("../src/hepTextSections.ts");
+  const { decodeRangeUint16, encodeRangeUint16 } = await import("../src/parsedDataVarint.ts");
+
+  assert.equal(SCENE_RASTER_LAYERS_PATH, "geometry/raster-layers.varint");
+  assert.equal(TEXT_GLYPH_SEGMENTS_PATH, "geometry/text-glyph-segments.cq16");
+  assert.equal(TEXT_INSTANCE_POSITIONS_PATH, "geometry/text-instance-ef.pd512");
+
+  // ------------------------------------------------------- raster layers
+  {
+    const limits = { maxLayers: 100, maxAtlases: 4, maxDimension: 4096 };
+    const table = {
+      atlases: [{ encoding: "png", width: 300, height: 2 }, { encoding: "rgba", width: 8, height: 8 }],
+      layers: [
+        { width: 200, height: 1, matrix: Float32Array.from([24, 0, 0, -0.12, 100.5, 400.25]), paintOrder: 7, pageIndex: 0,
+          storage: "atlas", cell: { atlas: 0, x: 0, y: 0 } },
+        { width: 100, height: 1, matrix: Float32Array.from([12, 0, 0, -0.12, 100.5, 400.37]), paintOrder: 8, pageIndex: 0,
+          opacity: 0.3, storage: "atlas", cell: { atlas: 0, x: 200, y: 0 } },
+        { width: 640, height: 480, matrix: Float32Array.from([320, 10, -5, 240, 0, -1e-7]), paintOrder: 2, pageIndex: 3,
+          storage: "webp" },
+        { width: 8, height: 8, matrix: Float32Array.from([1, 0, 0, 1, 0, 0]), paintOrder: 0, pageIndex: 3,
+          storage: "atlas", cell: { atlas: 1, x: 0, y: 0 } },
+        { width: 1, height: 1, matrix: Float32Array.from([1, 0, 0, 1, 2, 3]), paintOrder: 1, pageIndex: 3, storage: "rgba" }
+      ]
+    };
+    const encoded = encodeRasterLayerTable(table);
+    // Records, including float32 matrices, round-trip exactly.
+    assert.deepEqual(decodeRasterLayerTable(encoded, limits), table);
+    assert.throws(() => decodeRasterLayerTable(encoded.subarray(0, encoded.length - 4), limits),
+      /matrix data does not fill the section/);
+    assert.throws(() => decodeRasterLayerTable(encoded, { ...limits, maxLayers: 4 }), /layer count is out of range/);
+    assert.throws(() => decodeRasterLayerTable(encoded, { ...limits, maxDimension: 256 }), /out of range/);
+    assert.throws(() => encodeRasterLayerTable({ atlases: [], layers: [{ ...table.layers[4], paintOrder: -1 }] }),
+      /paint order is out of range/);
+    assert.throws(() => encodeRasterLayerTable({ atlases: [], layers: [{ ...table.layers[4], matrix: Float32Array.from([NaN, 0, 0, 1, 0, 0]) }] }),
+      /non-finite matrix/);
+
+    // Thousands of scanline records cost a few bytes each, not a JSON object each.
+    const scanlines = {
+      atlases: [{ encoding: "png", width: 2048, height: 2048 }],
+      layers: Array.from({ length: 5000 }, (_, index) => ({
+        width: 20 + index % 400, height: 1, paintOrder: 5000 + index, pageIndex: 0, storage: "atlas",
+        cell: { atlas: 0, x: 0, y: index % 2048 },
+        matrix: Float32Array.from([(20 + index % 400) * 0.12, 0, 0, -0.12, 535 - (index % 400) * 0.12, 427 + index * 0.12])
+      }))
+    };
+    assert.ok(deflateSync(encodeRasterLayerTable(scanlines)).length < 5000 * 8,
+      "a scanline record costs a few bytes, not a ~190-byte JSON object");
+    assert.deepEqual(decodeRasterLayerTable(encodeRasterLayerTable(scanlines), { ...limits, maxLayers: 5000 }), scanlines);
+  }
+
+  // ------------------------------------------------------ glyph outlines
+  {
+    // A closed contour of a quadratic, two lines whose control points are not
+    // their ends and a plain line, then a second contour that starts elsewhere.
+    const segmentsA = Float32Array.from([
+      612, 616, 1000, 616,
+      1000, 973, 1000, 973,
+      1000, 973.5, 800, 1100,
+      700, 1251, 612, 616,
+      -229, -452, -229, -452
+    ]);
+    const segmentsB = Float32Array.from([
+      1000, 973, 1, 0,
+      1000, 973.5, 0, 0,
+      700, 1251, 0, 0,
+      612, 616, 0, 0,
+      2079, 1567, 1, 0
+    ]);
+    const { bytes, meta } = encodeTextGlyphSegments(segmentsA, segmentsB, 5);
+    assert.deepEqual(meta, {
+      file: TEXT_GLYPH_SEGMENTS_PATH, segmentCount: 5, quantizationMin: [-229, -452], quantizationMax: [2079, 1567]
+    });
+    const decoded = decodeTextGlyphSegments(bytes, meta);
+    const grid = (value, axis) => decodeRangeUint16(
+      encodeRangeUint16(value, meta.quantizationMin[axis], meta.quantizationMax[axis]),
+      meta.quantizationMin[axis], meta.quantizationMax[axis]
+    );
+    for (let index = 0; index < 5; index += 1) {
+      for (let channel = 0; channel < 4; channel += 1) {
+        assert.equal(decoded.segmentsA[index * 4 + channel], Math.fround(grid(segmentsA[index * 4 + channel], channel & 1)),
+          `segment ${index} A.${channel} lands on the shared uint16 grid`);
+      }
+      assert.equal(decoded.segmentsB[index * 4], Math.fround(grid(segmentsB[index * 4], 0)));
+      assert.equal(decoded.segmentsB[index * 4 + 1], Math.fround(grid(segmentsB[index * 4 + 1], 1)));
+      assert.equal(decoded.segmentsB[index * 4 + 2], segmentsB[index * 4 + 2]);
+      assert.equal(decoded.segmentsB[index * 4 + 3], 0);
+    }
+    // Chained points repeat exactly, so the next segment starts where one ends.
+    assert.equal(decoded.segmentsA[4], decoded.segmentsB[0]);
+    assert.throws(() => decodeTextGlyphSegments(bytes, { ...meta, segmentCount: 4 }), /segment count/);
+    assert.throws(() => decodeTextGlyphSegments(bytes.subarray(0, bytes.length - 1), meta), /column lengths/);
+  }
+
+  // ------------------------------------------------------- glyph origins
+  {
+    // Three lines of sparsely kerned text in two sizes, then a rotated run.
+    // Steps are whole 1/512 units so every origin is exactly on the grid.
+    const glyphs = [];
+    const instanceA = [];
+    const instanceB = [];
+    const advanceUnits = [0, 3123, 1690, 2816, 1382];
+    for (let line = 0; line < 3; line += 1) {
+      const scale = line === 1 ? 0.0122 : 0.0098;
+      let xUnits = 72 * 512;
+      for (let index = 0; index < 400; index += 1) {
+        const glyph = 1 + (index * 7 + line) % 4;
+        glyphs.push(glyph);
+        instanceA.push(scale, 0, 0, scale);
+        instanceB.push(xUnits / 512, 700 - line * 14, glyph, 0);
+        xUnits += advanceUnits[glyph] * (line === 1 ? 5 : 4) + (index % 5 === 0 ? 21 : 0);
+      }
+    }
+    for (let index = 0; index < 50; index += 1) {
+      glyphs.push(3);
+      instanceA.push(0, 0.01, -0.01, 0);
+      instanceB.push(300, 100 + index * 5.5, 3, 0);
+    }
+    const count = glyphs.length;
+    const a = Float32Array.from(instanceA);
+    const b = Float32Array.from(instanceB);
+    const { bytes, columnByteLengths } = encodeTextInstancePositions(a, b, Uint16Array.from(glyphs), count);
+    assert.equal(columnByteLengths.reduce((sum, length) => sum + length, 0), bytes.length);
+    const decoded = new Float32Array(count * 4);
+    decodeTextInstancePositionsInto(bytes, columnByteLengths, a, Uint16Array.from(glyphs), decoded, count);
+    for (let index = 0; index < count; index += 1) {
+      // Origins stay on the 1/512 grid, exactly as before the predictor.
+      assert.equal(decoded[index * 4], Math.fround(Math.round(b[index * 4] * 512) / 512), `instance ${index} e`);
+      assert.equal(decoded[index * 4 + 1], Math.fround(Math.round(b[index * 4 + 1] * 512) / 512), `instance ${index} f`);
+    }
+    // Predicted advances leave mostly zero residuals on the baseline stream.
+    const advanceBytes = bytes.subarray(columnByteLengths[0], columnByteLengths[0] + columnByteLengths[1]);
+    assert.ok(advanceBytes.filter(byte => byte === 0).length > advanceBytes.length * 0.5,
+      "repeated glyph advances are predicted");
+    // The reader must predict from the same glyphs the writer saw.
+    const shifted = Uint16Array.from(glyphs, glyph => glyph === 1 ? 2 : glyph);
+    const mispredicted = new Float32Array(count * 4);
+    decodeTextInstancePositionsInto(bytes, columnByteLengths, a, shifted, mispredicted, count);
+    assert.notDeepEqual(mispredicted, decoded);
+    assert.throws(() => decodeTextInstancePositionsInto(bytes, [columnByteLengths[0], columnByteLengths[1]], a,
+      Uint16Array.from(glyphs), new Float32Array(count * 4), count), /column lengths/);
+    assert.throws(() => decodeTextInstancePositionsInto(bytes, columnByteLengths, a.subarray(0, 8),
+      Uint16Array.from(glyphs), new Float32Array(count * 4), count), /instance data is incomplete/);
+  }
+
+  console.log("HEP v9 scene section codecs passed.");
 } finally { hooks.deregister(); }

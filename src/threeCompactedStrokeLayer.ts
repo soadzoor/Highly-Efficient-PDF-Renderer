@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_GLSL } from "./strokeCoverageShaders";
 import * as THREE from "three";
 
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
@@ -137,6 +138,7 @@ void main() {
 
 const COMPACTED_STROKE_FRAGMENT_SHADER = `
 precision highp float;
+${STROKE_COVERAGE_GLSL}
 
 varying vec4 vColor;
 varying vec2 vStrokeCoord;
@@ -161,7 +163,7 @@ void main() {
     edgeDistance = max(edgeDistance, max(-vStrokeCoord.x, vStrokeCoord.x - vAxisLength));
   }
 
-  float coverage = 1.0 - smoothstep(-vAAWorld, vAAWorld, edgeDistance);
+  float coverage = heprStrokeCoverage(edgeDistance + vHalfWidth, vHalfWidth, vAAWorld);
   float alpha = coverage * vColor.a;
   if (alpha <= 0.001) {
     discard;
@@ -352,7 +354,7 @@ function buildCompactedLevel(
     if (isQuadratic || !spec.mergeCollinear) {
       const dx = endX - x0;
       const dy = endY - y0;
-      if (dx * dx + dy * dy <= 1e-10 && (flags & STROKE_STYLE_FLAG_ROUND_CAP) === 0) {
+      if (dx * dx + dy * dy === 0 && (flags & STROKE_STYLE_FLAG_ROUND_CAP) === 0) {
         continue;
       }
       addSegmentToTile(tiles[tileIndex], {
@@ -373,7 +375,7 @@ function buildCompactedLevel(
     const dx = endX - x0;
     const dy = endY - y0;
     const lengthSq = dx * dx + dy * dy;
-    if (lengthSq <= 1e-10) {
+    if (lengthSq === 0) {
       if ((flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
         addSegmentToTile(tiles[tileIndex], {
           x0,
@@ -552,7 +554,7 @@ function emitIntervalSegment(
   start: number,
   end: number
 ): void {
-  if (end - start <= 1e-6) {
+  if (end <= start) {
     return;
   }
 

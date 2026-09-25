@@ -3,6 +3,7 @@ import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
+import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import * as THREE from "three";
 
 import {
@@ -10,6 +11,7 @@ import {
   CORE_TEXT_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
+import { writeTextGlyphInkDensities } from "./textGreekLod";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
 import {
   buildTextRasterAtlas,
@@ -26,6 +28,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TextLayerOptions {
+  drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
@@ -149,8 +152,11 @@ export class ThreeMaterialTextLayer {
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height
     );
+    const glyphMetaB = scene.textGlyphMetaB.slice(0, textGlyphCount * 4);
+    writeTextGlyphInkDensities(textGlyphCount, scene.textGlyphMetaA, glyphMetaB,
+      scene.textGlyphSegmentsA, scene.textGlyphSegmentsB);
     this.textGlyphMetaTextureB = createFloatTexture(
-      scene.textGlyphMetaB,
+      glyphMetaB,
       textGlyphCount,
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height
@@ -319,7 +325,7 @@ export class ThreeMaterialTextLayer {
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
-    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex");
+    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex", options.drawPlan);
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {

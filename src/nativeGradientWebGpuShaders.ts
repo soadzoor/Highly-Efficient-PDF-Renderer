@@ -1,5 +1,8 @@
+import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
-import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+import { VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
 
 const CAMERA_STRUCT = /* wgsl */ `
 struct CameraUniforms {
@@ -14,13 +17,17 @@ struct CameraUniforms {
   textVectorOnly : f32,
   pad0 : f32,
   vectorOverride : vec4f,
+  fillBands : vec4f,
 };
 `;
 
 const GRADIENT_BINDINGS = /* wgsl */ `
 @group(2) @binding(0) var<uniform> uPrimitiveOverride : vec4f;
 @group(1) @binding(0) var uVectorClipTex : texture_2d<f32>;
-@group(1) @binding(1) var<uniform> uVectorClip : vec4f;
+// x of index is the paint's clip; bounds are its clip chain's world bounds,
+// unbounded for unclipped and per-instance clips.
+struct VectorClipUniform { index : vec4f, bounds : vec4f };
+@group(1) @binding(1) var<uniform> uVectorClip : VectorClipUniform;
 @group(0) @binding(GRADIENT_META_A_BINDING) var uGradientMetaA : texture_2d<f32>;
 @group(0) @binding(GRADIENT_META_B_BINDING) var uGradientMetaB : texture_2d<f32>;
 @group(0) @binding(GRADIENT_META_C_BINDING) var uGradientMetaC : texture_2d<f32>;
@@ -31,7 +38,7 @@ const GRADIENT_BINDINGS = /* wgsl */ `
 `;
 
 const GRADIENT_FUNCTIONS = /* wgsl */ `
-${VECTOR_CLIP_WGSL}
+${VECTOR_CLIP_AA_WGSL}
 fn gradientCoord(index : i32) -> vec2i {
   let dimensions = textureDimensions(uGradientMetaA);
   return vec2i(index % i32(dimensions.x), index / i32(dimensions.x));
@@ -160,6 +167,9 @@ ${CAMERA_STRUCT}
 @group(0) @binding(6) var uSegmentsB : texture_2d<f32>;
 ${gradientBindings(7)}
 ${GRADIENT_FUNCTIONS}
+${VECTOR_FILL_BAND_INFO_WGSL}
+${FILL_COVERAGE_WGSL}
+${FILL_COVERAGE_VERTEX_WGSL}
 
 struct FillOut {
   @builtin(position) position : vec4f,
@@ -172,6 +182,7 @@ struct FillOut {
   @location(6) @interpolate(flat) companionStroke : f32,
   @location(7) @interpolate(flat) sourceGradient : i32,
   @location(8) @interpolate(flat) maskGradient : i32,
+  @location(9) @interpolate(flat) bands : vec4f,
 };
 
 @vertex
@@ -186,7 +197,14 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   let segmentCount = i32(metaA.y + 0.5);
   let alpha = metaC.w;
   var out : FillOut;
-  if (segmentCount <= 0 || alpha <= 0.001) {
+  out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.z, uSegmentsA);
+  // Reach pixels whose footprint touches a path narrower than a pixel.
+  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  // Clamp to the clip chain, whose antialiasing reaches under a pixel past its
+  // bounds; a path and clip farther apart than that leave nothing to draw.
+  let low = max(metaA.zw, uVectorClip.bounds.xy) - margin;
+  let high = min(metaB.xy, uVectorClip.bounds.zw) + margin;
+  if (segmentCount <= 0 || alpha <= 0.001 || any(low > high)) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0);
     out.segmentStart = 0;
@@ -200,7 +218,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
     return out;
   }
   let corner = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let world = mix(metaA.zw, metaB.xy, corner);
+  let world = mix(low, high, corner);
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   out.position = vec4f((screen / (0.5 * uCamera.viewport)) - 1.0, 0.0, 1.0);
   out.local = world;
@@ -215,69 +233,50 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   return out;
 }
 
-fn accumulateCrossing(start : vec2f, end : vec2f, point : vec2f, winding : ptr<function, i32>, crossings : ptr<function, i32>) {
-  let upward = start.y <= point.y && end.y > point.y;
-  let downward = start.y > point.y && end.y <= point.y;
-  if (!upward && !downward) { return; }
-  let denominator = end.y - start.y;
-  if (abs(denominator) <= 1e-6) { return; }
-  let x = start.x + (point.y - start.y) * (end.x - start.x) / denominator;
-  if (x > point.x) {
-    *crossings = *crossings + 1;
-    *winding = *winding + select(-1, 1, upward);
-  }
-}
-
 @fragment
 fn fsMain(inData : FillOut) -> @location(0) vec4f {
   // Derivatives must be evaluated before any potentially non-uniform branch,
   // loop exit, or discard in the fragment shader.
   let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
+  let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
+  let footprint = max(vec2f(dx, dy) * uCamera.fillAAScreenPx, vec2f(1e-4));
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) { discard; }
   let dimensions = textureDimensions(uSegmentsA);
-  var minDistance = 1e20;
-  var winding = 0;
-  var crossings = 0;
-  for (var primitiveIndex = 0; primitiveIndex < inData.segmentCount; primitiveIndex = primitiveIndex + 1) {
-    if (primitiveIndex >= inData.segmentCount) { break; }
-    let coord = coordFromIndex(inData.segmentStart + primitiveIndex, i32(dimensions.x));
+  // Average the winding number over the footprint box. The bands spanning its
+  // rows hold every segment that can contribute; each integrates its own rows.
+  let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
+  var winding = 0.0;
+${vectorFillBandLoopWgsl({
+    bands: "inData.bands",
+    y: "inData.local.y",
+    radius: "0.5 * footprint.y",
+    count: "inData.segmentCount",
+    start: "inData.segmentStart",
+    texture: "uSegmentsA",
+    entries: "uCamera.fillBands.w",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
+    edge: `
+    let coord = coordFromIndex(segmentIndex, i32(dimensions.x));
     let primitiveA = textureLoad(uSegmentsA, coord, 0);
     let primitiveB = textureLoad(uSegmentsB, coord, 0);
-    let p0 = primitiveA.xy;
-    let p1 = primitiveA.zw;
-    let p2 = primitiveB.xy;
-    if (primitiveB.z >= 0.5) {
-      minDistance = min(minDistance, distanceToQuadratic(inData.local, p0, p1, p2));
-      var previous = p0;
-      for (var step = 1; step <= 8; step = step + 1) {
-        let next = quadraticPoint(p0, p1, p2, f32(step) / 8.0);
-        accumulateCrossing(previous, next, inData.local, &winding, &crossings);
-        previous = next;
-      }
-    } else {
-      minDistance = min(minDistance, distanceToLine(inData.local, p0, p2));
-      accumulateCrossing(p0, p2, inData.local, &winding, &crossings);
-    }
-  }
-  let inside = select(winding != 0, (crossings & 1) == 1, inData.fillRule >= 0.5);
-  var coverage = select(0.0, 1.0, inside);
-  if (inData.companionStroke < 0.5) {
-    let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
-    let signedDistance = select(minDistance, -minDistance, inside);
-    coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
-  }
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= 0.5, box, rows.x, rows.y);
+`
+  })}
+  let coverage = heprFillCoverage(winding, inData.fillRule >= 0.5);
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;
   if (alpha <= 0.001) { discard; }
   let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
   let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
+  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.index.x, uVectorClipTex, aaWidth));
 }
 `;
 
 export const GRADIENT_STROKE_WGSL = /* wgsl */ `
+${STROKE_COVERAGE_WGSL}
 ${CAMERA_STRUCT}
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
 @group(0) @binding(1) var uRunMetaA : texture_2d<f32>;
@@ -327,7 +326,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let clipped = (flags & 4) != 0;
   let geometryLength = select(length(p2 - p0), length(p1 - p0) + length(p2 - p1), primitiveB.z >= 0.5);
   var out : StrokeOut;
-  if ((geometryLength < 1e-5 && !roundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !roundCap) || alpha <= 0.001) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0);
     out.p0 = vec2f(0.0);
@@ -376,6 +375,7 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
   // alpha tests can discard individual fragments.
   let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
+  let localPerPixel = max(max(dx, dy), 1e-6);
   if (inData.alpha <= 0.001) { discard; }
   if (
     inData.hasClipBounds >= 0.5 &&
@@ -387,15 +387,14 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
     distanceToQuadratic(inData.local, inData.p0, inData.p1, inData.p2),
     uCamera.strokeCurveEnabled >= 0.5 && inData.primitiveType >= 0.5
   );
-  let localPerPixel = max(max(dx, dy), 1e-6);
   let aaWorld = max(localPerPixel * uCamera.strokeAAScreenPx, 5e-5);
-  let coverage = 1.0 - smoothstep(inData.halfWidth - aaWorld, inData.halfWidth + aaWorld, distanceValue);
+  let coverage = heprStrokeCoverage(distanceValue, inData.halfWidth, aaWorld);
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;
   if (alpha <= 0.001) { discard; }
   let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
   let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0)) * heprVectorClip(inData.local, uVectorClip.x, uVectorClipTex);
+  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.index.x, uVectorClipTex, localPerPixel));
 }
 `;

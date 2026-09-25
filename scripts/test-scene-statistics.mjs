@@ -68,7 +68,7 @@ try {
 
       const archive = await HepArchive.loadAsync(bytes);
       const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
-      assert.equal(manifest.formatVersion, 8, "statistics roundtrips use the current HEP format");
+      assert.equal(manifest.formatVersion, 9, "statistics roundtrips use the current HEP format");
       delete manifest.scene.imageLayerSegmentCount;
       delete manifest.scene.operatorCountKind;
       for (const key of ["discardedTransparentCount", "discardedDegenerateCount",

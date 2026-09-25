@@ -21,49 +21,75 @@ try {
   assert.equal(root.commands.length, 2);
   root.commands[0].optionalContentIndex = 0;
   root.commands[1].optionalContentIndex = 1;
-  page.stores.optionalContent = { names: ["A", "B"], defaultVisible: new Uint8Array([1, 0]) };
-  const resource = { page, optionalContentConditions: new Int32Array([0, 1]), matrix: new Float32Array([2, 0, 0, 2, 30, 40]) };
+  page.stores.optionalContent = { names: ["A", "B", "Unused"], defaultVisible: new Uint8Array([1, 0, 1]) };
+  const resource = { page, optionalContentConditions: new Int32Array([0, 1, 2]), matrix: new Float32Array([2, 0, 0, 2, 30, 40]) };
   const original = structuredClone(page);
   const snapshot = conditions => ({ revision: 1, layers: [], conditions: new Uint8Array(conditions) });
-  const visiblePage = applyRetainedPageVisibility(resource, snapshot([0, 1]));
+  const visiblePage = applyRetainedPageVisibility(resource, snapshot([0, 1, 1]));
   assert.equal(visiblePage.stores.paths, page.stores.paths, "replay reuses canonical path buffers");
   assert.equal(visiblePage.displayProgram, page.displayProgram);
-  assert.deepEqual([...visiblePage.stores.optionalContent.defaultVisible], [0, 1]);
+  assert.deepEqual([...visiblePage.stores.optionalContent.defaultVisible], [0, 1, 1]);
   const signal = new AbortController().signal;
   const image = await renderNativeRetainedCommandSpan(visiblePage, 0, 2, signal);
   assert(image);
-  assert.deepEqual([...image.matrix], [12, 0, 0, -10, 0, 10], "runtime frames always cover full structural page bounds");
+  assert(image.width * image.height < 18 * 15, "small retained spans store cropped pixels");
   const sample = (layer, x, y) => {
-    const u = Math.min(layer.width - 1, Math.floor(x / 12 * layer.width));
-    const v = Math.min(layer.height - 1, Math.floor((10 - y) / 10 * layer.height));
+    const m = layer.matrix, dx = x - m[4], dy = y - m[5], det = m[0] * m[3] - m[1] * m[2];
+    const u = Math.floor((dx * m[3] - dy * m[2]) / det * layer.width);
+    const v = Math.floor((dy * m[0] - dx * m[1]) / det * layer.height);
+    if (u < 0 || v < 0 || u >= layer.width || v >= layer.height) return [0, 0, 0, 0];
     return [...layer.data.subarray((v * layer.width + u) * 4, (v * layer.width + u) * 4 + 4)];
   };
   assert.equal(sample(image, 3, 3)[3], 0, "hidden layer is absent from replay");
   assert.deepEqual(sample(image, 9, 3), [0, 0, 255, 255]);
   const scene = createEmptyVectorScene();
   scene.retainedPages = [resource];
-  scene.rasterLayers = [{ width: 1, height: 1, data: new Uint8Array(4), matrix: new Float32Array([24, 0, 0, -20, 30, 60]), paintOrder: 9, pageIndex: 2 }];
+  const initial = await renderNativeRetainedCommandSpan(page, 0, 2, signal);
+  scene.optionalContent = { groups: ["A", "B", "Unused"].map((id, i) => ({ id, name: id,
+    defaultVisible: i !== 1, locked: false, usedInView: true })),
+    conditions: ["A", "B", "Unused"].map(groupId => ({ kind: "group", groupId })), order: [], radioGroups: [] };
+  scene.rasterLayers = [{ ...initial, matrix: Float32Array.of(initial.matrix[0] * 2, 0, 0, initial.matrix[3] * 2,
+    initial.matrix[4] * 2 + 30, initial.matrix[5] * 2 + 40), paintOrder: 9, pageIndex: 2 }];
+  scene.drawRuns = [{ kind: "raster", first: 0, count: 1 }];
   scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count: 2, rasterIndex: 0 }] };
   let renders = 0;
   const replay = new RetainedPageReplay(scene, async (...args) => { renders++; return renderNativeRetainedCommandSpan(...args); });
-  const first = await replay.prepare(snapshot([1, 0]), { signal });
+  const first = await replay.prepare(snapshot([1, 0, 1]), { signal });
   assert.equal(replay.getLayers().get(0), scene.rasterLayers[0], "prepared resources cannot change committed state");
   first.commit();
-  assert.deepEqual([...replay.getLayers().get(0).matrix], [24, 0, 0, -20, 30, 60]);
+  assert.equal(first.layers.size, 0, "default pixels need no replay or upload");
   assert.equal(replay.getLayers().get(0).pageIndex, 2);
-  const repeated = await replay.prepare(snapshot([1, 0]), { signal }); repeated.commit();
-  assert.equal(renders, 1, "unchanged page visibility reuses replay pixels");
-  const changed = await replay.prepare(snapshot([0, 1]), { signal }); changed.commit();
-  assert.equal(renders, 2);
-  assert.deepEqual(sample(replay.getLayers().get(0), 9, 3), [0, 0, 255, 255]);
-  const stale = await replay.prepare(snapshot([1, 0]), { signal });
-  const current = await replay.prepare(snapshot([0, 1]), { signal });
+  const repeated = await replay.prepare(snapshot([1, 0, 1]), { signal }); repeated.commit();
+  assert.equal(renders, 0, "unchanged page visibility reuses parser-provided pixels");
+  const changed = await replay.prepare(snapshot([0, 1, 1]), { signal }); changed.commit();
+  assert.equal(renders, 1);
+  assert.deepEqual(sample(replay.getLayers().get(0), 48, 46), [0, 0, 255, 255]);
+  const unrelated = await replay.prepare(snapshot([0, 1, 0]), { signal }); unrelated.commit();
+  assert.equal(renders, 1, "unused document OCG does not invalidate retained pixels");
+  assert.equal(unrelated.layers.size, 0, "unchanged slots are absent from the upload delta");
+  const { VectorDrawRunCuller } = await import("../src/vectorDrawRunCulling.ts");
+  const { scenePaintNodeBounds } = await import("../src/scenePaintGraph.ts");
+  const { ScenePrimitivePicker } = await import("../src/scenePrimitives.ts");
+  const culler = new VectorDrawRunCuller(scene);
+  assert.equal(culler.select({ minX: 47, minY: 45, maxX: 49, maxY: 47 }, 0.001).length, 1,
+    "replayed content outside the initial crop remains a draw candidate");
+  assert.deepEqual([...scenePaintNodeBounds(scene).runs], [30, 40, 54, 60], "cached compositor extents use structural bounds");
+  const picker = new ScenePrimitivePicker(scene);
+  const point = { x: 48, y: 46 };
+  assert.equal((await picker.pick({ point, clientPoint: point, project: p => p, unproject: p => p,
+    tolerancePx: 0, kinds: ["raster"], rasterLayers: replay.getLayers() }))?.primitive.index, 0,
+    "cropped replacement pixels remain pickable outside the original texture");
+  picker.dispose();
+  const stale = await replay.prepare(snapshot([1, 0, 1]), { signal });
+  const current = await replay.prepare(snapshot([0, 1, 1]), { signal });
   assert.throws(() => stale.commit(), { name: "AbortError" }); current.commit();
   const aborted = AbortSignal.abort(new Error("cancel replay"));
-  await assert.rejects(replay.prepare(snapshot([1, 1]), { signal: aborted }), /cancel replay/);
+  await assert.rejects(replay.prepare(snapshot([1, 1, 1]), { signal: aborted }), /cancel replay/);
   assert.deepEqual(page, original, "all replay operations leave retained source data unchanged");
   replay.dispose();
-  await assert.rejects(replay.prepare(snapshot([1, 1]), { signal }), /disposed/);
+  await assert.rejects(replay.prepare(snapshot([1, 1, 1]), { signal }), /disposed/);
+  await testDependencies(page);
+  await testIndependentSpans({ page, RetainedPageReplay, renderNativeRetainedCommandSpan, createEmptyVectorScene, snapshot, sample, signal });
   await testBackdropReplay({ openPdf, renderNativeRetainedCommandSpan, RetainedPageReplay, createEmptyVectorScene, snapshot, sample, signal });
   console.log("Retained page replay passed: self-contained Canvas rendering, HEP backdrop changes, hidden resources, stable slots/quads, cache reuse, and cancellation.");
 } finally { hooks.deregister(); }
@@ -113,7 +139,7 @@ async function testBackdropReplay({ openPdf, renderNativeRetainedCommandSpan, Re
   const before = sample(replay.getLayers().get(1), 4, 4);
   const disabled = await replay.prepare(snapshot([0]), { signal }); disabled.commit();
   const after = sample(replay.getLayers().get(1), 4, 4);
-  assert.equal(calls, 3, "hiding the backdrop replays the unchanged blended island because its prefix changed");
+  assert.equal(calls, 1, "hiding the backdrop replays the unchanged blended island because its prefix changed");
   assert(before[0] >= 254 && before[2] >= 254 && Math.abs(before[3] - 128) <= 1,
     "Screen over opaque red needs a magenta correction layer");
   assert(after[0] <= 1 && after[2] >= 254 && Math.abs(after[3] - 128) <= 1,
@@ -124,4 +150,78 @@ async function testBackdropReplay({ openPdf, renderNativeRetainedCommandSpan, Re
   assert.deepEqual(loaded.retainedPages[0].page.stores.optionalContent.defaultVisible, Uint8Array.of(1));
   loaded.rasterLayers.forEach((layer, index) => assert.deepEqual(layer.data, canonical[index]));
   replay.dispose();
+}
+
+async function testIndependentSpans({ page, RetainedPageReplay, renderNativeRetainedCommandSpan, createEmptyVectorScene, snapshot, sample, signal }) {
+  const scene = createEmptyVectorScene();
+  scene.retainedPages = [{ page, optionalContentConditions: Int32Array.of(0, 1, 2), matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
+  scene.rasterLayers = await Promise.all([0, 1].map(first => renderNativeRetainedCommandSpan(page, first, 1, signal)));
+  assert.equal(scene.rasterLayers[1].data.byteLength, 4, "initially empty spans retain transparent 1x1 slots");
+  scene.drawRuns = [0, 1].map(first => ({ kind: "raster", first, count: 1 }));
+  scene.paintGraph = { roots: [0, 1].map(firstCommand => ({ kind: "retained", firstCommand, count: 1, retainedPage: 0, rasterIndex: firstCommand })) };
+  const calls = [];
+  const replay = new RetainedPageReplay(scene, async (...args) => { calls.push(args[1]); return renderNativeRetainedCommandSpan(...args); });
+  const first = await replay.prepare(snapshot([1, 1, 1]), { signal }); first.commit();
+  assert.deepEqual(calls, [1], "enabling one layer only renders its dependent span");
+  assert.deepEqual([...first.layers.keys()], [1]);
+  assert.equal(replay.getLayers().size, 2, "renderer replacement still receives the complete cache");
+  assert.equal(replay.getLayers().get(0), scene.rasterLayers[0]);
+  assert.deepEqual(sample(replay.getLayers().get(1), 9, 3), [0, 0, 255, 255]);
+  const repeated = await replay.prepare(snapshot([1, 1, 0]), { signal }); repeated.commit();
+  assert.equal(repeated.layers.size, 0);
+  assert.deepEqual(calls, [1]);
+  const hidden = await replay.prepare(snapshot([0, 1, 0]), { signal }); hidden.commit();
+  assert.deepEqual([...hidden.layers.keys()], [0]);
+  assert.equal(hidden.layers.get(0).data.byteLength, 4);
+  assert.deepEqual(calls, [1, 0]);
+  replay.dispose();
+
+  const { createLayerVisibilityController } = await import("../src/layerVisibility.ts");
+  scene.optionalContent = { groups: ["A", "B", "Unused"].map((id, i) => ({ id, name: id,
+    defaultVisible: i !== 1, locked: false, usedInView: true })),
+    conditions: ["A", "B", "Unused"].map(groupId => ({ kind: "group", groupId })), order: [], radioGroups: [] };
+  let swap = false, renderer;
+  const makeRenderer = () => ({
+    layers: new Map(scene.rasterLayers.map((layer, index) => [index, layer])),
+    setOptionalContentVisibility() {},
+    prepareRasterLayerUpdates(updates) {
+      if (swap && this === firstRenderer) { renderer = replacement; swap = false; }
+      return { commit: () => { for (const [index, layer] of updates) this.layers.set(index, layer); }, dispose() {} };
+    }
+  });
+  const firstRenderer = makeRenderer(), replacement = makeRenderer(); renderer = firstRenderer;
+  const controller = createLayerVisibilityController({ getScene: () => scene, getRenderer: () => renderer });
+  controller.sceneChanged();
+  await controller.setLayerVisibility("A", false);
+  swap = true;
+  await controller.setLayerVisibility("B", true);
+  assert.equal(renderer, replacement);
+  assert.equal(replacement.layers.get(0).data.byteLength, 4, "replacement receives earlier applied deltas as well as the pending one");
+  assert.deepEqual(sample(replacement.layers.get(1), 9, 3), [0, 0, 255, 255]);
+  controller.dispose();
+}
+
+async function testDependencies(source) {
+  const { RetainedSpanDependencies } = await import("../src/retainedSpanDependencies.ts");
+  const { HEPR_PAINT_KIND } = await import("../src/heprDocumentData.ts");
+  const page = structuredClone(source), root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
+  const draw = condition => ({ ...root.commands[0], optionalContentIndex: condition });
+  const invoke = { ...draw(0), kind: "invoke-program", programIndex: 0, type3PaintIndex: -1, viewTransformFlags: 0 };
+  const group = { ...root, isolated: true, commands: [draw(1)], softMaskGroupIndex: 2 };
+  page.displayProgram.groups = [root, group, { ...root, isolated: true, softMaskGroupIndex: -1, commands: [draw(2)] }];
+  page.displayProgram.rootGroupIndex = 0;
+  page.displayProgram.programs = [{ kind: "form", commands: [{ ...draw(-1), kind: "invoke-group", groupIndex: 1 }] }];
+  root.commands = [draw(0), { ...invoke, optionalContentIndex: -1 }];
+  const read = () => [...new RetainedSpanDependencies(page).span(1, 1)].sort();
+  assert.deepEqual(read(), [1, 2], "program and mask dependencies exclude an unrelated prefix");
+  group.blendMode = "Screen";
+  assert.deepEqual(read(), [0, 1, 2], "backdrop-dependent programs include prefix conditions");
+  group.blendMode = "Normal";
+  root.commands = [draw(0), { ...draw(-1), fillPaintIndex: 0 }];
+  page.stores.paints.kinds = Uint8Array.of(HEPR_PAINT_KIND.Pattern, HEPR_PAINT_KIND.SolidColor);
+  page.stores.paints.resourceIndices = Uint32Array.of(0, 0);
+  group.commands[0].fillPaintIndex = group.commands[0].paintIndex = 1;
+  page.displayProgram.groups[2].commands[0].fillPaintIndex = page.displayProgram.groups[2].commands[0].paintIndex = 1;
+  page.stores.patterns.programIndices = Int32Array.of(0);
+  assert.deepEqual(read(), [1, 2], "pattern paint programs retain their nested layer dependencies");
 }

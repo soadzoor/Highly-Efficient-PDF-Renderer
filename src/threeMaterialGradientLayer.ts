@@ -1,3 +1,4 @@
+import { buildVectorFillBandIndex, vectorFillBandStore, type VectorFillBandStore } from "./vectorFillBands";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_PARAMETER_GLSL, GRADIENT_BACKGROUND_GLSL } from "./gradientSampling";
@@ -276,11 +277,15 @@ export class ThreeMaterialGradientLayer {
     }
 
     const pathSize = chooseTextureSize(pathCount);
-    const segmentSize = chooseTextureSize(segmentCount);
+    const bands = vectorFillBandStore(scene.gradientFillSegmentsA!, segmentCount, buildVectorFillBandIndex({
+      pathCount, segmentCount, pathMetaA: scene.gradientFillPathMetaA!, pathMetaB: scene.gradientFillPathMetaB!,
+      segmentsA: scene.gradientFillSegmentsA!, segmentsB: scene.gradientFillSegmentsB!
+    }));
+    const segmentSize = chooseTextureSize(bands.texels);
     const pathMetaA = this.own(createFloatTexture(scene.gradientFillPathMetaA, pathCount, pathSize.width, pathSize.height));
     const pathMetaB = this.own(createFloatTexture(scene.gradientFillPathMetaB, pathCount, pathSize.width, pathSize.height));
     const pathMetaC = this.own(createFloatTexture(scene.gradientFillPathMetaC, pathCount, pathSize.width, pathSize.height));
-    const segmentA = this.own(createFloatTexture(scene.gradientFillSegmentsA, segmentCount, segmentSize.width, segmentSize.height));
+    const segmentA = this.own(createFloatTexture(bands.data, bands.texels, segmentSize.width, segmentSize.height));
     const segmentB = this.own(createFloatTexture(scene.gradientFillSegmentsB, segmentCount, segmentSize.width, segmentSize.height));
 
     const meshes = this.scene.gradientMeshIndices?.length ? buildGradientMeshRenderData(this.scene) : null;
@@ -306,6 +311,8 @@ export class ThreeMaterialGradientLayer {
           fillSegmentTextureB: segmentB,
           fillPathTextureWidth: pathSize.width,
           fillSegmentTextureWidth: segmentSize.width,
+          fillBandBase: bands.pathBase,
+          fillBandEntries: bands.entryBase,
           ...this.createWebGpuCommonOptions(gradients, sourceGradientIndex, maskGradientIndex),
           primitiveColor
         });
@@ -321,14 +328,15 @@ export class ThreeMaterialGradientLayer {
           segmentSize,
           gradients,
           sourceGradientIndex,
-          maskGradientIndex
+          maskGradientIndex,
+          bands
         );
         if (meshCount) {
           const raw = material as THREE.RawShaderMaterial;
           raw.vertexShader = raw.vertexShader
             .replace("layout(location = 0) in vec2 aCorner;", "in vec2 aMeshPosition;\nin vec4 aMeshColor;\nout vec4 vMeshColor;\nlayout(location = 0) in vec2 aCorner;")
             .replace("void main() {", "void main() {\n  vMeshColor = aMeshColor;")
-            .replace("vec2 world = mix(minBounds, maxBounds, corner01);", "vec2 world = aMeshPosition;");
+            .replace("vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);", "vec2 world = aMeshPosition;");
           raw.fragmentShader = raw.fragmentShader
             .replace("uniform vec4 uVectorOverride;", "in vec4 vMeshColor;\nuniform vec4 uVectorOverride;")
             .replace("vec4 sourcePaint = heprSamplePdfGradient(vLocal, uSourceGradientIndex);", "vec4 sourcePaint = vMeshColor * heprSamplePdfGradient(vLocal, uSourceGradientIndex).a;");
@@ -501,7 +509,8 @@ export class ThreeMaterialGradientLayer {
     segmentSize: { width: number; height: number },
     gradients: GradientTextureSet,
     sourceGradientIndex: number,
-    maskGradientIndex: number
+    maskGradientIndex: number,
+    bands: VectorFillBandStore
   ): THREE.RawShaderMaterial {
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -516,6 +525,8 @@ export class ThreeMaterialGradientLayer {
         uFillPathMetaTexA: { value: pathMetaA },
         uFillPathMetaTexB: { value: pathMetaB },
         uFillPathMetaTexC: { value: pathMetaC },
+        uFillBandBase: { value: bands.pathBase },
+        uFillBandEntries: { value: bands.entryBase },
         uFillSegmentTexA: { value: segmentA },
         uFillSegmentTexB: { value: segmentB },
         uFillPathMetaTexSize: { value: new Int32Array([pathSize.width, pathSize.height]) },
@@ -645,8 +656,19 @@ vec4 heprSamplePdfGradient(vec2 world, float gradientIndexInput) {
 }
 `;
 
+// Gradient edges often come from the PDF clip instead of the paint path.
+// Evaluate their pixel footprint before the core shader's early discards.
+function withAntialiasedGradientClip(source: string): string {
+  return source
+    .replace("void main() {", `void main() {
+  float clipPixelX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float clipPixelY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float clipAAWidth = max(max(clipPixelX, clipPixelY), 1e-4);`)
+    .replaceAll("outColor *= heprVectorClip(vLocal);", "outColor.a *= heprVectorClipAA(vLocal, clipAAWidth);");
+}
+
 function buildGradientFillFragmentShader(): string {
-  return CORE_FILL_FRAGMENT_SHADER_SOURCE
+  return withAntialiasedGradientClip(CORE_FILL_FRAGMENT_SHADER_SOURCE)
     .replace("uniform vec4 uVectorOverride;", `uniform vec4 uVectorOverride;\n${GLSL_GRADIENT_DECLARATIONS}`)
     .replace(
       "  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));",
@@ -657,13 +679,12 @@ function buildGradientFillFragmentShader(): string {
       `  baseColor = mix(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a);\n` +
       `  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));`
     )
-    .replace(/float alpha = inside \? ([^;]+) : 0\.0;/, "float alpha = inside ? ($1) * paintAlpha : 0.0;")
     .replace(/float alpha = (heprThreeLinearCoverageToOutputAlpha\(coverage\) \* [^;]+);/,
       "float alpha = $1 * paintAlpha;");
 }
 
 function buildGradientStrokeFragmentShader(): string {
-  return CORE_STROKE_FRAGMENT_SHADER_SOURCE
+  return withAntialiasedGradientClip(CORE_STROKE_FRAGMENT_SHADER_SOURCE)
     .replace("uniform vec4 uVectorOverride;", `uniform vec4 uVectorOverride;\n${GLSL_GRADIENT_DECLARATIONS}`)
     .replace(
       "  vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));\n  outColor = heprThreeEncodeOutputColor(vec4(color, alpha));",

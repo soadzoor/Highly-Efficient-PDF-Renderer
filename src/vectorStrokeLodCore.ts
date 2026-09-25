@@ -1,4 +1,5 @@
 import { strokePaintGroups, strokePaintOrigins, setStrokePaintOrigins } from "./vectorStrokePaintOrder";
+import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
 import type {ViewState} from "./webGlFloorplanRenderer";
 
@@ -22,6 +23,9 @@ export const VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS = 50_000;
 
 /** Per-level Vector LOD diagnostic stats. */
 export interface VectorStrokeLodLevelStats {
+  /** Budget-oriented approximation that may omit tiny marks. */
+  overview?: boolean;
+
   /** Zero-based LOD level index. */
   index: number;
 
@@ -132,6 +136,7 @@ export interface CullingBounds {
 }
 
 export interface VectorStrokeLodScene {
+  overview?: boolean;
   tolerance: number;
   scene: VectorScene;
 }
@@ -164,6 +169,7 @@ export interface RuntimeStrokeTileBuckets {
 }
 
 export interface RuntimeVectorStrokeLodLevel extends RuntimeStrokeTileBuckets {
+  overview?: boolean;
   tolerance: number;
   scene: VectorScene;
   segmentCount: number;
@@ -213,6 +219,17 @@ interface IntervalGroup {
   intervals: number[];
 }
 
+interface DenseStrokeGroup {
+  /** Retain exact source IDs until the group is large enough to aggregate. */
+  members: number[];
+  count: number;
+  coincident: boolean;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 interface TileGrid {
   columns: number;
   rows: number;
@@ -231,11 +248,6 @@ interface VectorStrokeLodRuntimeBuildData {
   tileGrid: RuntimeTileGrid;
   levels: RuntimeVectorStrokeLodLevel[];
   elapsedMs?: number;
-}
-
-interface ProjectedTileAreaStats {
-  averageArea: number;
-  useDynamicBudget: boolean;
 }
 
 let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
@@ -297,7 +309,15 @@ const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const MIN_LEVEL_REDUCTION_RATIO = 0.985;
 const LOD_SCREEN_ERROR_BUDGET_PX = 1.25;
+// Dense overview tiles may trade up to four times the normal tolerance for
+// the segment budget. The exact-zoom gate still takes priority over pressure.
+const LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX = 5;
+// Relative to the entire drawing, not a world-space slope threshold. Three's
+// camera controls can introduce ~1e-16 roundoff in an otherwise planar view.
+const LOD_PLANAR_ROUNDOFF_EPSILON = 1e-12;
+const LOD_PLANAR_BASIS_INDICES = [0, 1, 4, 5] as const;
 const LOD_RUNTIME_TILE_TARGET_SEGMENTS = 512;
+const LOD_VISIBILITY_GUARD_PIXELS = 64;
 const LOD_RUNTIME_MIN_TILE_COUNT = 256;
 const LOD_RUNTIME_MAX_TILE_COUNT = 4096;
 const LOD_RUNTIME_MIN_GRID_SIDE = 12;
@@ -307,19 +327,27 @@ const LOD_RUNTIME_EDGE_CENTER_WEIGHT = 0.45;
 const LOD_RUNTIME_EDGE_ENDPOINT_WEIGHT = 0.1;
 const LOD_RUNTIME_EDGE_STYLE_BIN_WEIGHT = 3.2;
 const LOD_RUNTIME_STYLE_BIN_KEY_STRIDE = 8192;
-const LOD_TILE_MIN_VISIBLE_SEGMENTS = 24;
-const LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS = 256;
-const LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS = 128;
-const LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS = 48;
+const LOD_TILE_MIN_VISIBLE_SEGMENTS = 1;
 const LOD_TILE_SOFT_OVERSHOOT_RATIO = 1.65;
 const LOD_TILE_SELECTION_HYSTERESIS_RATIO = 0.18;
 const LOD_TILE_UNDERSHOOT_SCORE_WEIGHT = 1.15;
-const LOD_TILE_PROJECTED_MIN_FACTOR = 0.1;
-const LOD_TILE_PROJECTED_MAX_FACTOR = 4096;
-const LOD_TILE_PROJECTED_DYNAMIC_AREA_RATIO = 1.25;
-const LOD_TILE_PROJECTED_PERSPECTIVE_RATIO = 0.015;
-const LOD_DROP_LOCAL_SIZE_FACTOR = 1.1;
+// Tilted views test tiles against the view frustum widened by this screen
+// margin, which covers antialiasing and pen width outside the viewport.
+const LOD_PROJECTED_MARGIN_PX = 16;
+// Four frustum side planes grow a clipped rectangle by at most four vertices.
+const LOD_PROJECTED_CLIP_MAX_VERTICES = 8;
+// Tile scale bounds cover this fraction of a tile beyond each side, where
+// most border-crossing primitives end.
+const LOD_PROJECTED_TILE_MARGIN = 0.25;
+// Small details retain their exact geometry and fade through analytic pixel
+// coverage. Merging them can close dash gaps or collapse neighbouring marks.
+const LOD_PRESERVE_LOCAL_SIZE_FACTOR = 1.1;
 const LOD_MERGE_GAP_FACTOR = 1.5;
+// A cell side spans at most 0.0625 pixels at its permitted screen-space tolerance.
+const LOD_DENSITY_CELL_FACTOR = 0.05;
+const LOD_DENSITY_MIN_MEMBERS = 8;
+const LOD_DENSITY_MAX_GROUPS = 250_000;
+const LOD_DENSITY_MAX_MULTIPLICITY = 65_535;
 const LOD_TILE_WORLD_FACTOR = 192;
 
 export class VectorStrokeLodRuntime {
@@ -327,16 +355,37 @@ export class VectorStrokeLodRuntime {
   readonly tileGrid: RuntimeTileGrid;
 
   private readonly tileSelectedLevelIndices: Int16Array;
-  private readonly projectedTileAreas: Float32Array;
+  // Tilted perspective views, per tile: the finest local units per pixel over
+  // its visible part (-1 outside the frustum), its relative screen-area
+  // magnification, its visible area fraction, and whether the frustum cuts it
+  // (its primitives then need culling).
+  private readonly projectedTileUnitsPerPixel: Float64Array;
+  private readonly projectedTileWeights: Float64Array;
+  private readonly projectedTileVisibleFractions: Float64Array;
+  private readonly projectedTilePartial: Uint8Array;
+  private readonly projectedPlanes = new Float64Array(12);
+  private readonly projectedClip = new Float64Array(LOD_PROJECTED_CLIP_MAX_VERTICES * 4);
+  private readonly projectedTileRect = new Float64Array(4);
+  private readonly levelTileReach: Array<Float32Array | undefined> = [];
+  private projectedHalfWidth = 1;
+  private projectedHalfHeight = 1;
+  private projectedClipCut = false;
+  private projectedRectDepth = 0;
+  private projectedRectArea = 0;
   private readonly maxHalfWidth: number;
   private activeLevelIndex = 0;
   private forceExact = false;
   private useLocalToClip = false;
+  private constantClipW = false;
+  private finiteLocalToClip = false;
   private readonly localToClip = new Float64Array(16);
+  private readonly selectionProjectionBasis = new Float64Array(4);
   private localUnitsPerPixel = 1;
   private lastVisibleSegmentCount = 0;
   private readonly allLevelBounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
   private fullViewBaselineLevelIndex = -1;
+  private fullViewMaxLevelIndex = -1;
+  private selectionGuard: { bounds: CullingBounds; range: RuntimeTileRange; baseline: number; maxLevel: number } | null = null;
   private stats: VectorStrokeLodStats;
 
   constructor(scene: VectorScene, buildData?: VectorStrokeLodRuntimeBuildData) {
@@ -344,12 +393,16 @@ export class VectorStrokeLodRuntime {
     this.tileGrid = buildData?.tileGrid ?? createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
     this.tileSelectedLevelIndices = new Int16Array(this.tileGrid.columns * this.tileGrid.rows);
     this.tileSelectedLevelIndices.fill(-1);
-    this.projectedTileAreas = new Float32Array(this.tileGrid.columns * this.tileGrid.rows);
+    this.projectedTileUnitsPerPixel = new Float64Array(this.tileGrid.columns * this.tileGrid.rows);
+    this.projectedTileWeights = new Float64Array(this.tileGrid.columns * this.tileGrid.rows);
+    this.projectedTileVisibleFractions = new Float64Array(this.tileGrid.columns * this.tileGrid.rows);
+    this.projectedTilePartial = new Uint8Array(this.tileGrid.columns * this.tileGrid.rows);
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.levels = buildData?.levels ?? buildVectorStrokeLodScenes(scene).map((levelScene) => {
       const tileData = buildRuntimeTileBuckets(levelScene.scene, this.tileGrid);
       return {
         tolerance: levelScene.tolerance,
+        overview: levelScene.overview,
         scene: levelScene.scene,
         segmentCount: Math.max(0, levelScene.scene.segmentCount | 0),
         ...tileData
@@ -373,6 +426,10 @@ export class VectorStrokeLodRuntime {
   }
 
   setScreenSpaceTransform(): void {
+    if (this.useLocalToClip) {
+      this.selectionGuard = null;
+      this.fullViewBaselineLevelIndex = -1;
+    }
     this.useLocalToClip = false;
   }
 
@@ -380,15 +437,50 @@ export class VectorStrokeLodRuntime {
   setForceExact(enabled: boolean): void {
     if (this.forceExact === enabled) return;
     this.forceExact = enabled;
+    this.selectionGuard = null;
     this.fullViewBaselineLevelIndex = -1;
     this.tileSelectedLevelIndices.fill(-1);
   }
 
   setLocalToClipTransform(localToClip: ArrayLike<number>, localUnitsPerPixel: number): void {
-    this.useLocalToClip = true;
+    // Bound roundoff over the drawing: a tiny W slope alone is not safe for
+    // large coordinates. Keep the actual projection unchanged for rendering.
+    let finite = true;
+    let sameLinearTransform = this.useLocalToClip && this.constantClipW;
     for (let i = 0; i < 16; i += 1) {
-      this.localToClip[i] = Number(localToClip[i]) || 0;
+      const value = Number(localToClip[i]);
+      finite &&= Number.isFinite(value);
+      this.localToClip[i] = value || 0;
     }
+    this.finiteLocalToClip = finite;
+    const elements = this.localToClip;
+    const maxAbsX = Math.max(Math.abs(this.tileGrid.minX), Math.abs(this.tileGrid.maxX),
+      Math.abs(this.allLevelBounds.minX), Math.abs(this.allLevelBounds.maxX));
+    const maxAbsY = Math.max(Math.abs(this.tileGrid.minY), Math.abs(this.tileGrid.maxY),
+      Math.abs(this.allLevelBounds.minY), Math.abs(this.allLevelBounds.maxY));
+    const wOffset = elements[15];
+    const wVariation = Math.abs(elements[3]) * maxAbsX + Math.abs(elements[7]) * maxAbsY;
+    this.constantClipW = finite && Math.abs(wOffset) > 1e-8 && Number.isFinite(wVariation) &&
+      wVariation <= Math.abs(wOffset) * LOD_PLANAR_ROUNDOFF_EPSILON;
+    // Only the normalized XY basis changes projected density. The example
+    // adjusts near/far planes during pans; those change depth, not screen area.
+    // Compare with the last invalidated basis so repeated tiny changes cannot
+    // accumulate into an undetected scale/orientation change.
+    for (let row = 0; row < 2 && sameLinearTransform; row++) {
+      const x = elements[row] / wOffset, y = elements[row + 4] / wOffset;
+      const previousX = this.selectionProjectionBasis[row], previousY = this.selectionProjectionBasis[row + 2];
+      const epsilon = Math.max(Math.abs(x), Math.abs(y), Math.abs(previousX), Math.abs(previousY)) *
+        LOD_PLANAR_ROUNDOFF_EPSILON;
+      if (Math.abs(x - previousX) > epsilon || Math.abs(y - previousY) > epsilon) sameLinearTransform = false;
+    }
+    if (!this.constantClipW || !sameLinearTransform) {
+      this.selectionGuard = null;
+      this.fullViewBaselineLevelIndex = -1;
+      for (let i = 0; i < LOD_PLANAR_BASIS_INDICES.length; i++) {
+        this.selectionProjectionBasis[i] = elements[LOD_PLANAR_BASIS_INDICES[i]] / wOffset;
+      }
+    }
+    this.useLocalToClip = true;
     this.localUnitsPerPixel = normalizeLocalUnitsPerPixel(localUnitsPerPixel);
   }
 
@@ -417,6 +509,7 @@ export class VectorStrokeLodRuntime {
 
   resetVisible(): void {
     this.fullViewBaselineLevelIndex = -1;
+    this.selectionGuard = null;
     this.lastVisibleSegmentCount = 0;
     for (const level of this.levels) {
       level.visibleSegmentCount = 0;
@@ -435,11 +528,11 @@ export class VectorStrokeLodRuntime {
     return this.lastVisibleSegmentCount;
   }
 
-  private chooseLevelIndex(localUnitsPerPixel: number): number {
+  private chooseLevelIndex(localUnitsPerPixel: number, errorBudget = LOD_SCREEN_ERROR_BUDGET_PX, overviewOnly = false): number {
     if (this.forceExact) return 0;
-    const maxTolerance = localUnitsPerPixel * LOD_SCREEN_ERROR_BUDGET_PX;
+    const maxTolerance = localUnitsPerPixel * errorBudget;
     for (let i = this.levels.length - 1; i >= 1; i -= 1) {
-      if (this.levels[i].tolerance <= maxTolerance) {
+      if ((!overviewOnly || this.levels[i].overview) && this.levels[i].tolerance <= maxTolerance) {
         return i;
       }
     }
@@ -453,15 +546,35 @@ export class VectorStrokeLodRuntime {
   ): boolean {
     const viewBounds = resolveStrokeViewBounds(viewState, viewport, cullingBounds, this.maxHalfWidth);
     const screenErrorLevelIndex = this.chooseLevelIndex(this.localUnitsPerPixel);
+    const maxLevelIndex = Math.max(screenErrorLevelIndex,
+      this.chooseLevelIndex(this.localUnitsPerPixel, LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX, true));
     const tileRange = tileRangeForBounds(viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY, this.tileGrid);
+    // Projected reuse needs caller-provided plane bounds; the scalar view state
+    // alone cannot certify what an arbitrary host camera sees.
+    const cacheableView = !this.useLocalToClip || (this.constantClipW && cullingBounds != null &&
+      [cullingBounds.minX, cullingBounds.minY, cullingBounds.maxX, cullingBounds.maxY].every(Number.isFinite) &&
+      cullingBounds.minX <= cullingBounds.maxX && cullingBounds.minY <= cullingBounds.maxY);
     // A static planar overview keeps the same tile budget and geometry while
     // every LOD's bounds remain visible. Panning needs no new selection scan.
-    const fullyVisible = !this.useLocalToClip && tileRange !== null &&
+    const fullyVisible = cacheableView && tileRange !== null &&
       tileRange.c0 === 0 && tileRange.r0 === 0 &&
       tileRange.c1 === this.tileGrid.columns - 1 && tileRange.r1 === this.tileGrid.rows - 1 &&
       viewBounds.minX <= this.allLevelBounds.minX && viewBounds.minY <= this.allLevelBounds.minY &&
       viewBounds.maxX >= this.allLevelBounds.maxX && viewBounds.maxY >= this.allLevelBounds.maxY;
-    if (fullyVisible && this.fullViewBaselineLevelIndex === screenErrorLevelIndex) return false;
+    if (fullyVisible && this.fullViewBaselineLevelIndex === screenErrorLevelIndex &&
+        this.fullViewMaxLevelIndex === maxLevelIndex) return false;
+    const guard = cacheableView && this.levels[0].segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS &&
+      [viewBounds.minX, viewBounds.minY, viewBounds.maxX, viewBounds.maxY].every(Number.isFinite)
+      ? LOD_VISIBILITY_GUARD_PIXELS * this.localUnitsPerPixel : 0;
+    const cached = this.selectionGuard;
+    if (guard > 0 && cached && tileRange && cached.baseline === screenErrorLevelIndex && cached.maxLevel === maxLevelIndex &&
+        cached.range.c0 === tileRange.c0 && cached.range.c1 === tileRange.c1 &&
+        cached.range.r0 === tileRange.r0 && cached.range.r1 === tileRange.r1 &&
+        viewBounds.minX >= cached.bounds.minX && viewBounds.minY >= cached.bounds.minY &&
+        viewBounds.maxX <= cached.bounds.maxX && viewBounds.maxY <= cached.bounds.maxY &&
+        cached.bounds.maxX - cached.bounds.minX <= viewBounds.maxX - viewBounds.minX + guard * 4 &&
+        cached.bounds.maxY - cached.bounds.minY <= viewBounds.maxY - viewBounds.minY + guard * 4) return false;
+    this.selectionGuard = null;
     this.fullViewBaselineLevelIndex = -1;
     this.resetLevelDrawLists();
     if (!tileRange) {
@@ -470,10 +583,35 @@ export class VectorStrokeLodRuntime {
       return true;
     }
 
-    this.activeLevelIndex = screenErrorLevelIndex;
-    const visibleTileCount = Math.max(1, (tileRange.c1 - tileRange.c0 + 1) * (tileRange.r1 - tileRange.r0 + 1));
-    const targetSegmentsPerTile = targetSegmentsPerTileForVisibleTiles(visibleTileCount, screenErrorLevelIndex);
-    const projectedTileAreaStats = this.computeProjectedTileAreaStats(tileRange, viewport);
+    // Expand primitive filtering, not the tile range: tile density budgets and
+    // LOD choice remain exactly those of the actual viewport. A cached result
+    // is reusable only while that tile range and baseline level also agree.
+    const guardedBounds = guard > 0 ? { minX: viewBounds.minX - guard, minY: viewBounds.minY - guard,
+      maxX: viewBounds.maxX + guard, maxY: viewBounds.maxY + guard } : null;
+    const selectionBounds = guardedBounds && [guardedBounds.minX, guardedBounds.minY,
+      guardedBounds.maxX, guardedBounds.maxY].every(Number.isFinite) ? guardedBounds : viewBounds;
+    // A tilted perspective view has no uniform pixel scale: a center-plane
+    // scale cannot bound magnification on its near side. Such views derive each
+    // tile's error limits from its own closest visible point and share the
+    // budget by screen area, so near content keeps detail while far content
+    // thins out. Tiles outside the view frustum are skipped.
+    const projectedWeightSum = this.useLocalToClip && !this.constantClipW
+      ? this.projectTiles(tileRange, viewport) : -1;
+    const projected = projectedWeightSum >= 0;
+    let visibleTileCount = 0;
+    let occupiedTileCount = 0;
+    for (let row = tileRange.r0; row <= tileRange.r1; row++) {
+      for (let column = tileRange.c0; column <= tileRange.c1; column++) {
+        const tileIndex = row * this.tileGrid.columns + column;
+        if (projected && this.projectedTileUnitsPerPixel[tileIndex] < 0) continue;
+        visibleTileCount++;
+        if (this.levels[0].tileCounts[tileIndex] > 0) occupiedTileCount++;
+      }
+    }
+    let targetSegmentsPerTile = Math.max(LOD_TILE_MIN_VISIBLE_SEGMENTS,
+      Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / Math.max(1, occupiedTileCount)));
+    let baselineLevelIndex = projected ? this.levels.length : screenErrorLevelIndex;
+    let projectedTargetSum = 0;
     let maxBaselineTileSegments = 0;
     let maxBaselineTileSelectedSegments = 0;
     let maxBaselineTileSelectedLevelIndex = screenErrorLevelIndex;
@@ -481,15 +619,30 @@ export class VectorStrokeLodRuntime {
     let maxSelectedTileLevelIndex = screenErrorLevelIndex;
 
     for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
-      let tileIndex = row * this.tileGrid.columns + tileRange.c0;
       for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
+        const tileIndex = row * this.tileGrid.columns + column;
         const baselineTileSegments = this.levels[0].tileCounts[tileIndex];
-        const tileTargetSegments = this.computeTileTargetSegments(
-          targetSegmentsPerTile,
-          projectedTileAreaStats,
-          this.projectedTileAreas[tileIndex]
-        );
-        const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments);
+        let tileBaselineLevelIndex = screenErrorLevelIndex;
+        let tileMaxLevelIndex = maxLevelIndex;
+        let tileTargetSegments = targetSegmentsPerTile;
+        let cullingPlanes: Float64Array | null = null;
+        if (projected) {
+          const unitsPerPixel = this.projectedTileUnitsPerPixel[tileIndex];
+          if (unitsPerPixel < 0 || baselineTileSegments === 0) continue;
+          tileBaselineLevelIndex = this.chooseLevelIndex(unitsPerPixel);
+          tileMaxLevelIndex = Math.max(tileBaselineLevelIndex,
+            this.chooseLevelIndex(unitsPerPixel, LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX, true));
+          while (tileMaxLevelIndex > 0 && !this.tileReachWithinBudget(tileIndex, tileMaxLevelIndex)) tileMaxLevelIndex--;
+          tileBaselineLevelIndex = Math.min(tileBaselineLevelIndex, tileMaxLevelIndex);
+          if (projectedWeightSum > 0) {
+            tileTargetSegments = Math.max(LOD_TILE_MIN_VISIBLE_SEGMENTS, Math.round(
+              VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS * this.projectedTileWeights[tileIndex] / projectedWeightSum));
+          }
+          projectedTargetSum += tileTargetSegments;
+          if (this.projectedTilePartial[tileIndex]) cullingPlanes = this.projectedPlanes;
+          baselineLevelIndex = Math.min(baselineLevelIndex, tileBaselineLevelIndex);
+        }
+        const levelIndex = this.chooseTileLevel(tileIndex, tileTargetSegments, tileBaselineLevelIndex, tileMaxLevelIndex);
         const selectedTileSegments = this.levels[levelIndex].tileCounts[tileIndex];
         if (baselineTileSegments > maxBaselineTileSegments) {
           maxBaselineTileSegments = baselineTileSegments;
@@ -500,10 +653,15 @@ export class VectorStrokeLodRuntime {
           maxSelectedTileSegments = selectedTileSegments;
           maxSelectedTileLevelIndex = levelIndex;
         }
-        appendTileSegments(this.levels[levelIndex], tileIndex, viewBounds);
-        tileIndex += 1;
+        appendTileSegments(this.levels[levelIndex], tileIndex, selectionBounds, cullingPlanes);
       }
     }
+    if (projected) {
+      // Report the nearest visible detail limit and the mean tile share.
+      if (baselineLevelIndex >= this.levels.length) baselineLevelIndex = screenErrorLevelIndex;
+      if (occupiedTileCount > 0) targetSegmentsPerTile = Math.round(projectedTargetSum / occupiedTileCount);
+    }
+    this.activeLevelIndex = baselineLevelIndex;
 
     this.updateLevelStats(
       visibleTileCount,
@@ -513,9 +671,15 @@ export class VectorStrokeLodRuntime {
       maxBaselineTileSelectedLevelIndex,
       maxSelectedTileSegments,
       maxSelectedTileLevelIndex,
-      screenErrorLevelIndex
+      baselineLevelIndex
     );
-    if (fullyVisible) this.fullViewBaselineLevelIndex = screenErrorLevelIndex;
+    if (fullyVisible) {
+      this.fullViewBaselineLevelIndex = screenErrorLevelIndex;
+      this.fullViewMaxLevelIndex = maxLevelIndex;
+    }
+    if (selectionBounds !== viewBounds) this.selectionGuard = {
+      bounds: selectionBounds, range: tileRange, baseline: screenErrorLevelIndex, maxLevel: maxLevelIndex
+    };
     return true;
   }
 
@@ -530,8 +694,11 @@ export class VectorStrokeLodRuntime {
     }
   }
 
-  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
-    if (this.forceExact) {
+  private chooseTileLevel(tileIndex: number, targetSegmentsPerTile: number, baselineLevelIndex: number, maxLevelIndex: number): number {
+    // Past the normal threshold (baseline 0), budget pressure may still use
+    // an overview level within its 5-pixel limit. Exact geometry is certain
+    // only when no approximation fits that limit.
+    if (this.forceExact || maxLevelIndex <= 0) {
       this.tileSelectedLevelIndices[tileIndex] = 0;
       return 0;
     }
@@ -541,10 +708,18 @@ export class VectorStrokeLodRuntime {
       this.tileSelectedLevelIndices[tileIndex] = 0;
       return 0;
     }
-    const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile);
+    // Use coverage-preserving geometry whenever it fits. Overview approximation is
+    // reserved for tiles whose finer representation exceeds the budget.
+    for (let index = 1; index <= baselineLevelIndex; index++) {
+      if (!this.levels[index].overview && this.levels[index].tileCounts[tileIndex] <= targetSegmentsPerTile) {
+        this.tileSelectedLevelIndices[tileIndex] = index;
+        return index;
+      }
+    }
+    const bestIndex = this.chooseTargetBalancedTileLevel(tileIndex, targetSegmentsPerTile, maxLevelIndex);
     const previousLevelIndex = this.tileSelectedLevelIndices[tileIndex];
 
-    if (previousLevelIndex >= 0 && previousLevelIndex < this.levels.length) {
+    if (previousLevelIndex >= 0 && previousLevelIndex <= maxLevelIndex) {
       const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
       const previousCount = this.levels[previousLevelIndex].tileCounts[tileIndex];
       if (previousCount <= softOvershootLimit) {
@@ -562,14 +737,14 @@ export class VectorStrokeLodRuntime {
     return bestIndex;
   }
 
-  private chooseTargetBalancedTileLevel(tileIndex: number, targetSegmentsPerTile: number): number {
+  private chooseTargetBalancedTileLevel(tileIndex: number, targetSegmentsPerTile: number, maxLevelIndex: number): number {
     const softOvershootLimit = Math.max(1, targetSegmentsPerTile * LOD_TILE_SOFT_OVERSHOOT_RATIO);
     let bestIndex = -1;
     let bestScore = Number.POSITIVE_INFINITY;
     let smallestCount = Number.POSITIVE_INFINITY;
-    let smallestCountIndex = Math.max(0, this.levels.length - 1);
+    let smallestCountIndex = maxLevelIndex;
 
-    for (let i = 0; i < this.levels.length; i += 1) {
+    for (let i = 0; i <= maxLevelIndex; i += 1) {
       const tileSegments = this.levels[i].tileCounts[tileIndex];
       if (tileSegments < smallestCount || (tileSegments === smallestCount && i < smallestCountIndex)) {
         smallestCount = tileSegments;
@@ -589,117 +764,224 @@ export class VectorStrokeLodRuntime {
     return bestIndex >= 0 ? bestIndex : smallestCountIndex;
   }
 
-  private computeProjectedTileAreaStats(tileRange: RuntimeTileRange, viewport: ViewportPixels): ProjectedTileAreaStats {
-    if (!this.useLocalToClip || !this.hasPerspectiveTileScaleVariation()) {
-      return {averageArea: 0, useDynamicBudget: false};
+  /**
+   * Project the tile range through a tilted perspective transform.
+   *
+   * Tiles whose widened rectangle is outside the view frustum get -1 units per
+   * pixel. Visible tiles get a conservative scale for the visible part of that
+   * rectangle, a budget weight proportional to its screen-area magnification,
+   * and a flag when the frustum cuts it. Returns the weight sum of occupied
+   * tiles scaled by their visible fraction, which is the expected share of
+   * rendered content, or -1 when the projection is unusable.
+   */
+  private projectTiles(tileRange: RuntimeTileRange, viewport: ViewportPixels): number {
+    if (!this.finiteLocalToClip) return -1;
+    const m = this.localToClip;
+    this.projectedHalfWidth = Math.max(1, viewport.width) * 0.5;
+    this.projectedHalfHeight = Math.max(1, viewport.height) * 0.5;
+    const planes = this.projectedPlanes;
+    for (let axis = 0; axis < 2; axis++) {
+      // |clip x| <= w and |clip y| <= w, widened by the screen margin. These
+      // planes all pass through the eye, so they also exclude W <= 0.
+      const widen = 1 + LOD_PROJECTED_MARGIN_PX / (axis === 0 ? this.projectedHalfWidth : this.projectedHalfHeight);
+      for (let side = 0; side < 2; side++) {
+        const sign = side === 0 ? 1 : -1;
+        const offset = (axis * 2 + side) * 3;
+        planes[offset] = m[3] * widen + sign * m[axis];
+        planes[offset + 1] = m[7] * widen + sign * m[4 + axis];
+        planes[offset + 2] = m[15] * widen + sign * m[12 + axis];
+      }
     }
 
-    let totalArea = 0;
-    let areaCount = 0;
-    let maxArea = 0;
-    for (let row = tileRange.r0; row <= tileRange.r1; row += 1) {
-      let tileIndex = row * this.tileGrid.columns + tileRange.c0;
-      for (let column = tileRange.c0; column <= tileRange.c1; column += 1) {
-        const area = this.computeProjectedTileArea(tileIndex, viewport);
-        this.projectedTileAreas[tileIndex] = area;
-        if (area > 0) {
-          totalArea += area;
-          areaCount += 1;
-          maxArea = Math.max(maxArea, area);
+    const grid = this.tileGrid;
+    const rect = this.projectedTileRect;
+    let minDepth = Number.POSITIVE_INFINITY;
+    for (let row = tileRange.r0; row <= tileRange.r1; row++) {
+      for (let column = tileRange.c0; column <= tileRange.c1; column++) {
+        const tileIndex = row * grid.columns + column;
+        this.readProjectedTileRect(tileIndex);
+        const unitsPerPixel = this.projectRect(rect[0], rect[1], rect[2], rect[3]);
+        this.projectedTileUnitsPerPixel[tileIndex] = unitsPerPixel;
+        if (unitsPerPixel < 0) continue;
+        minDepth = Math.min(minDepth, this.projectedRectDepth);
+        // Temporarily keep the depth; weights need the nearest depth first so
+        // that close tiles cannot overflow the scale.
+        this.projectedTileWeights[tileIndex] = this.projectedRectDepth;
+        this.projectedTilePartial[tileIndex] = this.projectedClipCut ? 1 : 0;
+        this.projectedTileVisibleFractions[tileIndex] =
+          Math.min(1, this.projectedRectArea / Math.max(1e-300, (rect[2] - rect[0]) * (rect[3] - rect[1])));
+      }
+    }
+
+    // Screen area per drawing area is |det H| / W^3 for the plane homography
+    // H, so relative weights need only the depth of each visible part.
+    let weightSum = 0;
+    for (let row = tileRange.r0; row <= tileRange.r1; row++) {
+      for (let column = tileRange.c0; column <= tileRange.c1; column++) {
+        const tileIndex = row * grid.columns + column;
+        if (this.projectedTileUnitsPerPixel[tileIndex] < 0) continue;
+        const depth = this.projectedTileWeights[tileIndex];
+        const ratio = minDepth > 0 ? minDepth / depth : (depth > 0 ? 0 : 1);
+        const weight = ratio * ratio * ratio;
+        this.projectedTileWeights[tileIndex] = weight;
+        if (this.levels[0].tileCounts[tileIndex] > 0) weightSum += weight * this.projectedTileVisibleFractions[tileIndex];
+      }
+    }
+    return weightSum;
+  }
+
+  /**
+   * Tile rectangle widened by a quarter tile, so that its scale bound also
+   * covers primitives that cross the tile border. Edge tiles also own the
+   * parts of primitives beyond the grid.
+   */
+  private readProjectedTileRect(tileIndex: number): void {
+    const grid = this.tileGrid;
+    const column = tileIndex % grid.columns;
+    const row = (tileIndex - column) / grid.columns;
+    const rect = this.projectedTileRect;
+    const marginX = (grid.xEdges[column + 1] - grid.xEdges[column]) * LOD_PROJECTED_TILE_MARGIN;
+    const marginY = (grid.yEdges[row + 1] - grid.yEdges[row]) * LOD_PROJECTED_TILE_MARGIN;
+    rect[0] = (column === 0 ? Math.min(grid.xEdges[0], this.allLevelBounds.minX) : grid.xEdges[column]) - marginX;
+    rect[1] = (row === 0 ? Math.min(grid.yEdges[0], this.allLevelBounds.minY) : grid.yEdges[row]) - marginY;
+    rect[2] = (column === grid.columns - 1
+      ? Math.max(grid.xEdges[column + 1], this.allLevelBounds.maxX) : grid.xEdges[column + 1]) + marginX;
+    rect[3] = (row === grid.rows - 1 ? Math.max(grid.yEdges[row + 1], this.allLevelBounds.maxY) : grid.yEdges[row + 1]) + marginY;
+  }
+
+  /**
+   * Bound the screen scale of a drawing-plane rectangle's visible part.
+   * Returns its finest local units per pixel, or -1 when it is outside the
+   * frustum. Also leaves that part's mean clip W and area in
+   * projectedRectDepth and projectedRectArea.
+   */
+  private projectRect(minX: number, minY: number, maxX: number, maxY: number): number {
+    const count = this.clipRectToFrustum(minX, minY, maxX, maxY);
+    if (count < 3) return -1;
+    const m = this.localToClip;
+    const clip = this.projectedClip;
+    const halfWidth = this.projectedHalfWidth, halfHeight = this.projectedHalfHeight;
+    let minW = Number.POSITIVE_INFINITY;
+    let maxNorm = 0;
+    let depthSum = 0;
+    let doubleArea = 0;
+    for (let vertex = 0; vertex < count; vertex++) {
+      const x = clip[vertex * 2], y = clip[vertex * 2 + 1];
+      const clipX = m[0] * x + m[4] * y + m[12];
+      const clipY = m[1] * x + m[5] * y + m[13];
+      const w = m[3] * x + m[7] * y + m[15];
+      // The pixel Jacobian is N / w^2 with N affine in (x, y). The norm of N
+      // is convex and 1 / w^2 peaks at the smallest W, so their maxima over
+      // the vertices bound the magnification anywhere in the polygon.
+      const a = (m[0] * w - clipX * m[3]) * halfWidth;
+      const b = (m[4] * w - clipX * m[7]) * halfWidth;
+      const c = (m[1] * w - clipY * m[3]) * halfHeight;
+      const d = (m[5] * w - clipY * m[7]) * halfHeight;
+      const sumSquares = a * a + b * b + c * c + d * d;
+      const determinant = a * d - b * c;
+      maxNorm = Math.max(maxNorm, Math.sqrt(0.5 * (sumSquares +
+        Math.sqrt(Math.max(0, sumSquares * sumSquares - 4 * determinant * determinant)))));
+      minW = Math.min(minW, w);
+      depthSum += w;
+      const next = vertex + 1 < count ? vertex + 1 : 0;
+      doubleArea += x * clip[next * 2 + 1] - clip[next * 2] * y;
+    }
+    this.projectedRectDepth = Math.max(0, depthSum / count);
+    this.projectedRectArea = Math.abs(doubleArea) * 0.5;
+    // A zero W can only be the eye itself: treat it as unbounded magnification.
+    return minW > 0 ? (maxNorm > 0 ? minW * minW / maxNorm : Infinity) : 0;
+  }
+
+  /**
+   * Whether a level's primitives listed in a tile stay within the overview
+   * error budget wherever they are visible. Merged lines can extend far past
+   * their tile, into nearer and more magnified parts of a tilted view.
+   */
+  private tileReachWithinBudget(tileIndex: number, levelIndex: number): boolean {
+    const reach = this.getLevelTileReach(levelIndex);
+    const offset = tileIndex * 4;
+    const minX = reach[offset], minY = reach[offset + 1], maxX = reach[offset + 2], maxY = reach[offset + 3];
+    if (!(minX <= maxX && minY <= maxY)) return true;
+    // The tile's own scale bound already covers its widened rectangle.
+    this.readProjectedTileRect(tileIndex);
+    const rect = this.projectedTileRect;
+    if (minX >= rect[0] && minY >= rect[1] && maxX <= rect[2] && maxY <= rect[3]) return true;
+    const unitsPerPixel = this.projectRect(minX, minY, maxX, maxY);
+    return unitsPerPixel < 0 || this.levels[levelIndex].tolerance <= unitsPerPixel * LOD_OVERVIEW_SCREEN_ERROR_BUDGET_PX;
+  }
+
+  /** Per tile, the bounds of every primitive the level lists in it. Built on first tilted use. */
+  private getLevelTileReach(levelIndex: number): Float32Array {
+    let reach = this.levelTileReach[levelIndex];
+    if (reach) return reach;
+    const level = this.levels[levelIndex];
+    const tileCount = this.tileGrid.columns * this.tileGrid.rows;
+    reach = new Float32Array(tileCount * 4);
+    for (let tileIndex = 0; tileIndex < tileCount; tileIndex++) {
+      let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY;
+      const start = level.tileOffsets[tileIndex], end = start + level.tileCounts[tileIndex];
+      for (let entry = start; entry < end; entry++) {
+        const segmentIndex = level.tileSegmentIds[entry];
+        minX = Math.min(minX, level.segmentMinX[segmentIndex]);
+        minY = Math.min(minY, level.segmentMinY[segmentIndex]);
+        maxX = Math.max(maxX, level.segmentMaxX[segmentIndex]);
+        maxY = Math.max(maxY, level.segmentMaxY[segmentIndex]);
+      }
+      reach[tileIndex * 4] = minX;
+      reach[tileIndex * 4 + 1] = minY;
+      reach[tileIndex * 4 + 2] = maxX;
+      reach[tileIndex * 4 + 3] = maxY;
+    }
+    this.levelTileReach[levelIndex] = reach;
+    return reach;
+  }
+
+  /** Clip a drawing-plane rectangle to the frustum planes. The result starts at projectedClip[0]. */
+  private clipRectToFrustum(minX: number, minY: number, maxX: number, maxY: number): number {
+    const clip = this.projectedClip;
+    const planes = this.projectedPlanes;
+    const stride = LOD_PROJECTED_CLIP_MAX_VERTICES * 2;
+    clip[0] = minX; clip[1] = minY;
+    clip[2] = maxX; clip[3] = minY;
+    clip[4] = maxX; clip[5] = maxY;
+    clip[6] = minX; clip[7] = maxY;
+    let count = 4;
+    let source = 0;
+    let cut = false;
+    for (let plane = 0; plane < planes.length && count > 0; plane += 3) {
+      const a = planes[plane], b = planes[plane + 1], c = planes[plane + 2];
+      const target = stride - source;
+      let outCount = 0;
+      let previousX = clip[source + count * 2 - 2];
+      let previousY = clip[source + count * 2 - 1];
+      let previousDistance = a * previousX + b * previousY + c;
+      for (let vertex = 0; vertex < count; vertex++) {
+        const x = clip[source + vertex * 2], y = clip[source + vertex * 2 + 1];
+        const distance = a * x + b * y + c;
+        if ((distance >= 0) !== (previousDistance >= 0) && outCount < LOD_PROJECTED_CLIP_MAX_VERTICES) {
+          const t = previousDistance / (previousDistance - distance);
+          clip[target + outCount * 2] = previousX + (x - previousX) * t;
+          clip[target + outCount * 2 + 1] = previousY + (y - previousY) * t;
+          outCount++;
         }
-        tileIndex += 1;
+        if (distance < 0) {
+          cut = true;
+        } else if (outCount < LOD_PROJECTED_CLIP_MAX_VERTICES) {
+          clip[target + outCount * 2] = x;
+          clip[target + outCount * 2 + 1] = y;
+          outCount++;
+        }
+        previousX = x;
+        previousY = y;
+        previousDistance = distance;
       }
+      count = outCount;
+      source = target;
     }
-    const averageArea = areaCount > 0 ? totalArea / areaCount : 0;
-    return {
-      averageArea,
-      useDynamicBudget: averageArea > 1 && maxArea / averageArea >= LOD_TILE_PROJECTED_DYNAMIC_AREA_RATIO
-    };
-  }
-
-  private computeTileTargetSegments(
-    baseTargetSegmentsPerTile: number,
-    projectedTileAreaStats: ProjectedTileAreaStats,
-    projectedArea: number
-  ): number {
-    if (!this.useLocalToClip || !projectedTileAreaStats.useDynamicBudget || projectedTileAreaStats.averageArea <= 1) {
-      return baseTargetSegmentsPerTile;
-    }
-
-    if (projectedArea <= 0) {
-      return LOD_TILE_MIN_VISIBLE_SEGMENTS;
-    }
-
-    const areaFactor = clampNumber(
-      projectedArea / projectedTileAreaStats.averageArea,
-      LOD_TILE_PROJECTED_MIN_FACTOR,
-      LOD_TILE_PROJECTED_MAX_FACTOR
-    );
-    return Math.max(LOD_TILE_MIN_VISIBLE_SEGMENTS, Math.round(baseTargetSegmentsPerTile * areaFactor));
-  }
-
-  private hasPerspectiveTileScaleVariation(): boolean {
-    const elements = this.localToClip;
-    const width = Math.max(0, this.tileGrid.maxX - this.tileGrid.minX);
-    const height = Math.max(0, this.tileGrid.maxY - this.tileGrid.minY);
-    const centerX = (this.tileGrid.minX + this.tileGrid.maxX) * 0.5;
-    const centerY = (this.tileGrid.minY + this.tileGrid.maxY) * 0.5;
-    const centerW = elements[3] * centerX + elements[7] * centerY + elements[15];
-    if (!Number.isFinite(centerW) || Math.abs(centerW) <= 1e-8) {
-      return false;
-    }
-
-    const wVariation = Math.abs(elements[3]) * width + Math.abs(elements[7]) * height;
-    return wVariation / Math.abs(centerW) >= LOD_TILE_PROJECTED_PERSPECTIVE_RATIO;
-  }
-
-  private computeProjectedTileArea(tileIndex: number, viewport: ViewportPixels): number {
-    const column = tileIndex % this.tileGrid.columns;
-    const row = Math.floor(tileIndex / this.tileGrid.columns);
-    const minX = this.tileGrid.xEdges[column];
-    const minY = this.tileGrid.yEdges[row];
-    const maxX = this.tileGrid.xEdges[column + 1];
-    const maxY = this.tileGrid.yEdges[row + 1];
-    const viewportWidth = Math.max(1, viewport.width);
-    const viewportHeight = Math.max(1, viewport.height);
-    const elements = this.localToClip;
-
-    let projectedMinX = Number.POSITIVE_INFINITY;
-    let projectedMinY = Number.POSITIVE_INFINITY;
-    let projectedMaxX = Number.NEGATIVE_INFINITY;
-    let projectedMaxY = Number.NEGATIVE_INFINITY;
-
-    for (let corner = 0; corner < 4; corner += 1) {
-      const x = (corner & 1) === 0 ? minX : maxX;
-      const y = (corner & 2) === 0 ? minY : maxY;
-      const clipX = elements[0] * x + elements[4] * y + elements[12];
-      const clipY = elements[1] * x + elements[5] * y + elements[13];
-      const clipW = elements[3] * x + elements[7] * y + elements[15];
-      if (!Number.isFinite(clipW) || Math.abs(clipW) <= 1e-8) {
-        continue;
-      }
-      const ndcX = clipX / clipW;
-      const ndcY = clipY / clipW;
-      if (!Number.isFinite(ndcX) || !Number.isFinite(ndcY)) {
-        continue;
-      }
-      const px = (ndcX * 0.5 + 0.5) * viewportWidth;
-      const py = (ndcY * 0.5 + 0.5) * viewportHeight;
-      projectedMinX = Math.min(projectedMinX, px);
-      projectedMinY = Math.min(projectedMinY, py);
-      projectedMaxX = Math.max(projectedMaxX, px);
-      projectedMaxY = Math.max(projectedMaxY, py);
-    }
-
-    if (!Number.isFinite(projectedMinX) || !Number.isFinite(projectedMinY)) {
-      return 0;
-    }
-
-    const clippedMinX = clampNumber(projectedMinX, 0, viewportWidth);
-    const clippedMinY = clampNumber(projectedMinY, 0, viewportHeight);
-    const clippedMaxX = clampNumber(projectedMaxX, 0, viewportWidth);
-    const clippedMaxY = clampNumber(projectedMaxY, 0, viewportHeight);
-    return Math.max(0, clippedMaxX - clippedMinX) * Math.max(0, clippedMaxY - clippedMinY);
+    this.projectedClipCut = cut;
+    // Four planes swap the halves an even number of times.
+    return count;
   }
 
   private updateLevelStats(
@@ -721,6 +1003,7 @@ export class VectorStrokeLodRuntime {
       if (drawCount > 0) {
         activeLevels.push({
           index: i,
+          overview: level.overview,
           tolerance: level.tolerance,
           renderedSegments: drawCount
         });
@@ -782,13 +1065,24 @@ export function shouldUseVectorStrokeLod(mode: VectorLodMode, rendererType: "web
   return segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS;
 }
 
+function strokeLodBuildSteps(scene: VectorScene): Array<{ tolerance: number; overview: boolean }> {
+  const overview = scene.segmentCount > VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS &&
+    !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode);
+  // Preserve a fine, coverage-weighted level before generating lossy overview
+  // levels. Small/effect scenes keep the existing conservative hierarchy.
+  return [
+    ...(overview ? [{ tolerance: VECTOR_STROKE_LOD_TOLERANCES[0], overview: false }] : []),
+    ...VECTOR_STROKE_LOD_TOLERANCES.map(tolerance => ({ tolerance, overview }))
+  ];
+}
+
 export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodScene[] {
   const baseCount = Math.max(0, scene.segmentCount | 0);
   const levels: VectorStrokeLodScene[] = [{tolerance: 0, scene}];
   let previousCount = baseCount;
 
-  for (const tolerance of VECTOR_STROKE_LOD_TOLERANCES) {
-    const simplified = buildSimplifiedStrokeScene(scene, tolerance);
+  for (const { tolerance, overview } of strokeLodBuildSteps(scene)) {
+    const simplified = buildSimplifiedStrokeScene(scene, tolerance, overview);
     if (!simplified || simplified.segmentCount <= 0) {
       continue;
     }
@@ -797,6 +1091,7 @@ export function buildVectorStrokeLodScenes(scene: VectorScene): VectorStrokeLodS
     }
     levels.push({
       tolerance,
+      overview,
       scene: {
         ...scene,
         segmentCount: simplified.segmentCount,
@@ -842,6 +1137,7 @@ export async function prebuildVectorStrokeLodRuntime(
     const tileData = await buildRuntimeTileBucketsAsync(levelScene.scene, tileGrid, scheduler, startValue, endValue);
     levels.push({
       tolerance: levelScene.tolerance,
+      overview: levelScene.overview,
       scene: levelScene.scene,
       segmentCount: Math.max(0, levelScene.scene.segmentCount | 0),
       ...tileData
@@ -894,14 +1190,15 @@ async function buildVectorStrokeLodScenesAsync(
   const baseCount = Math.max(0, scene.segmentCount | 0);
   const levels: VectorStrokeLodScene[] = [{tolerance: 0, scene}];
   let previousCount = baseCount;
-  const toleranceCount = VECTOR_STROKE_LOD_TOLERANCES.length;
+  const steps = strokeLodBuildSteps(scene);
+  const toleranceCount = steps.length;
 
   for (let i = 0; i < toleranceCount; i += 1) {
-    const tolerance = VECTOR_STROKE_LOD_TOLERANCES[i];
+    const { tolerance, overview } = steps[i];
     const startValue = 0.06 + i / toleranceCount * 0.62;
     const endValue = 0.06 + (i + 1) / toleranceCount * 0.62;
     scheduler.report(startValue, `Simplifying Vector LOD ${i + 1}/${toleranceCount}`);
-    const simplified = await buildSimplifiedStrokeSceneAsync(scene, tolerance, scheduler, startValue, endValue);
+    const simplified = await buildSimplifiedStrokeSceneAsync(scene, tolerance, scheduler, startValue, endValue, overview);
     if (!simplified || simplified.segmentCount <= 0) {
       continue;
     }
@@ -910,6 +1207,7 @@ async function buildVectorStrokeLodScenesAsync(
     }
     levels.push({
       tolerance,
+      overview,
       scene: {
         ...scene,
         segmentCount: simplified.segmentCount,
@@ -933,7 +1231,8 @@ async function buildSimplifiedStrokeSceneAsync(
   tolerance: number,
   scheduler: VectorStrokeLodYieldScheduler,
   startValue: number,
-  endValue: number
+  endValue: number,
+  overview = false
 ): Promise<{
   paintOrigins?: Uint32Array;
   segmentCount: number;
@@ -951,6 +1250,8 @@ async function buildSimplifiedStrokeSceneAsync(
 
   const grid = createTileGrid(scene.bounds, tolerance);
   const groups = new Map<string, IntervalGroup>();
+  const densityGroups = !overview && !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
+    ? new Map<string, DenseStrokeGroup>() : null;
   const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveMeta = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
@@ -958,17 +1259,54 @@ async function buildSimplifiedStrokeSceneAsync(
   const outBounds = createEmptyBounds();
   const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
   let maxHalfWidth = 0;
+  let densityR = NaN, densityG = NaN, densityB = NaN;
 
   for (let index = 0; index < segmentCount; index += 1) {
+    if ((index & 4095) === 0) {
+      const value = startValue + (endValue - startValue) * 0.72 * (index / Math.max(1, segmentCount));
+      await scheduler.maybeYield(false, value, `Simplifying ${formatToleranceName(tolerance)}`);
+    }
     const primitive = readStrokePrimitive(scene, index);
     if (!primitive || primitive.alpha <= 0.001) {
       continue;
     }
-    if (shouldDropPrimitiveAtTolerance(scene, index, primitive, tolerance)) {
+    // Legacy scenes lack paint-origin sorting. Complete a same-color cohort
+    // before a differently colored exact mark can cover it in source order.
+    if ((densityGroups || overview) && !scene.drawRuns && (primitive.colorR !== densityR ||
+        primitive.colorG !== densityG || primitive.colorB !== densityB)) {
+      let completedGroups = 0;
+      for (const group of densityGroups?.values() ?? []) {
+        emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+          tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
+        if ((++completedGroups & 1023) === 0) {
+          await scheduler.maybeYield(false,
+            startValue + (endValue - startValue) * 0.72 * index / Math.max(1, segmentCount),
+            `Aggregating ${formatToleranceName(tolerance)}`);
+        }
+      }
+      if (overview) {
+        for (const group of groups.values()) {
+          emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
+          if ((++completedGroups & 1023) === 0) {
+            await scheduler.maybeYield(false,
+              startValue + (endValue - startValue) * 0.72 * index / Math.max(1, segmentCount),
+              `Merging ${formatToleranceName(tolerance)}`);
+          }
+        }
+        groups.clear();
+      }
+      densityGroups?.clear();
+      densityR = primitive.colorR;
+      densityG = primitive.colorG;
+      densityB = primitive.colorB;
+    }
+    if (overview && shouldDropOverviewPrimitive(primitive, tolerance)) continue;
+    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance)) {
+      maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
-
-    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
+    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5 ||
+        (!overview && shouldPreservePrimitiveAtTolerance(primitive, tolerance))) {
       emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
@@ -976,7 +1314,7 @@ async function buildSimplifiedStrokeSceneAsync(
 
     const dx = primitive.x1 - primitive.x0;
     const dy = primitive.y1 - primitive.y0;
-    if (dx * dx + dy * dy <= 1e-10) {
+    if (dx === 0 && dy === 0) {
       if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
         emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
         maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
@@ -990,13 +1328,18 @@ async function buildSimplifiedStrokeSceneAsync(
       scene.bounds,
       grid
     );
-    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
+    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance, overview);
     pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+  }
 
-    if ((index & 4095) === 0) {
-      const value = startValue + (endValue - startValue) * 0.72 * (index / Math.max(1, segmentCount));
-      await scheduler.maybeYield(false, value, `Simplifying ${formatToleranceName(tolerance)}`);
+  let densityGroupIndex = 0;
+  for (const group of densityGroups?.values() ?? []) {
+    emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+      tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
+    if ((++densityGroupIndex & 1023) === 0) {
+      await scheduler.maybeYield(false, startValue + (endValue - startValue) * 0.72,
+        `Aggregating ${formatToleranceName(tolerance)}`);
     }
   }
 
@@ -1437,7 +1780,12 @@ export function resolveStrokeViewBounds(
     };
 }
 
-function appendTileSegments(level: RuntimeStrokeTileBuckets, tileIndex: number, viewBounds: CullingBounds): void {
+function appendTileSegments(
+  level: RuntimeStrokeTileBuckets,
+  tileIndex: number,
+  viewBounds: CullingBounds,
+  cullingPlanes: Float64Array | null = null
+): void {
   const start = level.tileOffsets[tileIndex];
   const end = start + level.tileCounts[tileIndex];
   let outCount = level.visibleSegmentCount;
@@ -1446,12 +1794,14 @@ function appendTileSegments(level: RuntimeStrokeTileBuckets, tileIndex: number, 
     if (level.segmentMarks[segmentIndex] === level.markToken) {
       continue;
     }
-    if (
-      level.segmentMaxX[segmentIndex] < viewBounds.minX ||
-      level.segmentMinX[segmentIndex] > viewBounds.maxX ||
-      level.segmentMaxY[segmentIndex] < viewBounds.minY ||
-      level.segmentMinY[segmentIndex] > viewBounds.maxY
-    ) {
+    const minX = level.segmentMinX[segmentIndex];
+    const minY = level.segmentMinY[segmentIndex];
+    const maxX = level.segmentMaxX[segmentIndex];
+    const maxY = level.segmentMaxY[segmentIndex];
+    if (maxX < viewBounds.minX || minX > viewBounds.maxX || maxY < viewBounds.minY || minY > viewBounds.maxY) {
+      continue;
+    }
+    if (cullingPlanes && !boundsIntersectPlanes(cullingPlanes, minX, minY, maxX, maxY)) {
       continue;
     }
     level.segmentMarks[segmentIndex] = level.markToken;
@@ -1459,6 +1809,15 @@ function appendTileSegments(level: RuntimeStrokeTileBuckets, tileIndex: number, 
     outCount += 1;
   }
   level.visibleSegmentCount = outCount;
+}
+
+/** False when the rectangle lies entirely outside one of the drawing-plane half-planes. */
+function boundsIntersectPlanes(planes: Float64Array, minX: number, minY: number, maxX: number, maxY: number): boolean {
+  for (let plane = 0; plane < planes.length; plane += 3) {
+    const a = planes[plane], b = planes[plane + 1];
+    if (a * (a >= 0 ? maxX : minX) + b * (b >= 0 ? maxY : minY) + planes[plane + 2] < 0) return false;
+  }
+  return true;
 }
 
 function buildRuntimeSegmentBounds(scene: VectorScene, segmentCount: number): {
@@ -1528,37 +1887,12 @@ function edgeUpperBound(edges: Float64Array, value: number): number {
   return edgeLowerBound(edges, value);
 }
 
-function minTileTargetForBaselineLevel(levelIndex: number): number {
-  if (levelIndex <= 0) {
-    return LOD_TILE_EXACT_MIN_VISIBLE_SEGMENTS;
-  }
-  if (levelIndex === 1) {
-    return LOD_TILE_FINE_MIN_VISIBLE_SEGMENTS;
-  }
-  if (levelIndex === 2) {
-    return LOD_TILE_MEDIUM_MIN_VISIBLE_SEGMENTS;
-  }
-  return LOD_TILE_MIN_VISIBLE_SEGMENTS;
-}
-
-function targetSegmentsPerTileForVisibleTiles(visibleTileCount: number, baselineLevelIndex: number): number {
-  const globalTarget = Math.max(
-    LOD_TILE_MIN_VISIBLE_SEGMENTS,
-    Math.ceil(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS / Math.max(1, visibleTileCount))
-  );
-  const qualityFloor = minTileTargetForBaselineLevel(baselineLevelIndex);
-  if (globalTarget >= qualityFloor) {
-    return globalTarget;
-  }
-  return Math.max(globalTarget, Math.ceil(Math.sqrt(globalTarget * qualityFloor)));
-}
-
 function tileLevelTargetScore(tileSegments: number, targetSegmentsPerTile: number): number {
   const delta = tileSegments - targetSegmentsPerTile;
   return delta >= 0 ? delta : -delta * LOD_TILE_UNDERSHOOT_SCORE_WEIGHT;
 }
 
-function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
+function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number, overview = false): {
   paintOrigins?: Uint32Array;
   segmentCount: number;
   endpoints: Float32Array;
@@ -1575,6 +1909,8 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
 
   const grid = createTileGrid(scene.bounds, tolerance);
   const groups = new Map<string, IntervalGroup>();
+  const densityGroups = !overview && !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
+    ? new Map<string, DenseStrokeGroup>() : null;
   const endpoints = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveMeta = new Float4Builder(Math.min(segmentCount, 65_536));
   const primitiveBounds = new Float4Builder(Math.min(segmentCount, 65_536));
@@ -1582,17 +1918,39 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
   const outBounds = createEmptyBounds();
   const paintOrigins = strokePaintOrigins(scene) ? [] as number[] : undefined;
   let maxHalfWidth = 0;
+  let densityR = NaN, densityG = NaN, densityB = NaN;
 
   for (let index = 0; index < segmentCount; index += 1) {
     const primitive = readStrokePrimitive(scene, index);
     if (!primitive || primitive.alpha <= 0.001) {
       continue;
     }
-    if (shouldDropPrimitiveAtTolerance(scene, index, primitive, tolerance)) {
+    // Legacy scenes lack paint-origin sorting. Complete a same-color cohort
+    // before a differently colored exact mark can cover it in source order.
+    if ((densityGroups || overview) && !scene.drawRuns && (primitive.colorR !== densityR ||
+        primitive.colorG !== densityG || primitive.colorB !== densityB)) {
+      for (const group of densityGroups?.values() ?? []) {
+        emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+          tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
+      }
+      if (overview) {
+        for (const group of groups.values()) {
+          emitMergedIntervals(group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds, tolerance, paintOrigins);
+        }
+        groups.clear();
+      }
+      densityGroups?.clear();
+      densityR = primitive.colorR;
+      densityG = primitive.colorG;
+      densityB = primitive.colorB;
+    }
+    if (overview && shouldDropOverviewPrimitive(primitive, tolerance)) continue;
+    if (densityGroups && collectDenseStroke(densityGroups, primitive, index, tolerance)) {
+      maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
     }
-
-    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5) {
+    if (primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5 ||
+        (!overview && shouldPreservePrimitiveAtTolerance(primitive, tolerance))) {
       emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
       maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
       continue;
@@ -1600,7 +1958,7 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
 
     const dx = primitive.x1 - primitive.x0;
     const dy = primitive.y1 - primitive.y0;
-    if (dx * dx + dy * dy <= 1e-10) {
+    if (dx === 0 && dy === 0) {
       if ((primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0) {
         emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, outBounds, primitive, paintOrigins);
         maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
@@ -1614,9 +1972,14 @@ function buildSimplifiedStrokeScene(scene: VectorScene, tolerance: number): {
       scene.bounds,
       grid
     );
-    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance);
+    const group = resolveIntervalGroup(groups, primitive, tileIndex, tolerance, overview);
     pushGroupInterval(group, primitive, tolerance);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
+  }
+
+  for (const group of densityGroups?.values() ?? []) {
+    emitDenseStrokeGroup(scene, group, endpoints, primitiveMeta, primitiveBounds, styles, outBounds,
+      tolerance * LOD_DENSITY_CELL_FACTOR, paintOrigins);
   }
 
   for (const group of groups.values()) {
@@ -1691,26 +2054,157 @@ function readStrokePrimitive(scene: VectorScene, index: number): StrokePrimitive
   };
 }
 
-function shouldDropPrimitiveAtTolerance(
-  scene: VectorScene,
-  index: number,
+/**
+ * Aggregate only dense, subpixel neighborhoods of the same opaque mark. The
+ * original pen width and mean endpoints survive; negative line type is a
+ * runtime-only source-over multiplicity, decoded by the shared stroke shader.
+ * This preserves repeated-dot coverage without inflating the vector radius.
+ */
+function collectDenseStroke(
+  groups: Map<string, DenseStrokeGroup>, primitive: StrokePrimitive, index: number, tolerance: number
+): boolean {
+  const dot = primitive.x0 === primitive.x1 && primitive.y0 === primitive.y1;
+  if (primitive.primitiveType !== STROKE_PRIMITIVE_LINE || primitive.alpha !== 1 ||
+      !(primitive.halfWidth > 0) || (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0 ||
+      (dot && (primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) === 0)) return false;
+  const cell = tolerance * LOD_DENSITY_CELL_FACTOR;
+  const cellX = Math.floor(primitive.x0 / cell), cellY = Math.floor(primitive.y0 / cell);
+  if (Math.floor(primitive.x1 / cell) !== cellX || Math.floor(primitive.y1 / cell) !== cellY) return false;
+  const reversed = primitive.x1 < primitive.x0 ||
+    (primitive.x1 === primitive.x0 && primitive.y1 < primitive.y0);
+  const direction = dot ? "point" : Math.round(Math.atan2(
+    reversed ? primitive.y0 - primitive.y1 : primitive.y1 - primitive.y0,
+    Math.abs(primitive.x1 - primitive.x0)) / ANGLE_STEP);
+  const clip = primitive.visibleBounds;
+  const key = `${primitive.paintGroup ?? ""}|${cellX},${cellY}|${direction}|${primitive.flags}|` +
+    `${primitive.halfWidth}|${primitive.colorR},${primitive.colorG},${primitive.colorB}` +
+    (clip ? `|${clip.minX},${clip.minY},${clip.maxX},${clip.maxY}` : "");
+  let group = groups.get(key);
+  if (!group) {
+    // Resource bounds reduce optimization only: unmatched marks still emit
+    // their complete source geometry through the normal preservation path.
+    if (groups.size >= LOD_DENSITY_MAX_GROUPS) return false;
+    group = createDenseStrokeGroup();
+    groups.set(key, group);
+  }
+  appendDenseStroke(group, primitive, index);
+  return true;
+}
+
+function createDenseStrokeGroup(): DenseStrokeGroup {
+  return { members: [], count: 0, coincident: true, x0: 0, y0: 0, x1: 0, y1: 0 };
+}
+
+function appendDenseStroke(group: DenseStrokeGroup, primitive: StrokePrimitive, index: number): void {
+  let x0 = primitive.x0, y0 = primitive.y0, x1 = primitive.x1, y1 = primitive.y1;
+  // Reversing a centerline leaves its coverage unchanged. Normalize it before
+  // averaging so reversed source paths do not collapse to dots.
+  if (x1 < x0 || (x1 === x0 && y1 < y0)) {
+    [x0, x1] = [x1, x0];
+    [y0, y1] = [y1, y0];
+  }
+  if (group.count > 0 && (x0 !== group.x0 / group.count || y0 !== group.y0 / group.count ||
+      x1 !== group.x1 / group.count || y1 !== group.y1 / group.count)) group.coincident = false;
+  group.members.push(index);
+  group.count++;
+  group.x0 += x0;
+  group.y0 += y0;
+  group.x1 += x1;
+  group.y1 += y1;
+}
+
+function emitDenseStrokeGroup(
+  scene: VectorScene, group: DenseStrokeGroup, endpoints: Float4Builder, primitiveMeta: Float4Builder,
+  primitiveBounds: Float4Builder, styles: Float4Builder, bounds: Bounds, cell: number,
+  paintOrigins?: number[], depth = 0
+): void {
+  if (group.coincident ? group.count < 2 : group.count < LOD_DENSITY_MIN_MEMBERS || depth >= 8) {
+    for (const index of group.members) {
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, readStrokePrimitive(scene, index)!, paintOrigins);
+    }
+    return;
+  }
+  if (!group.coincident && group.count > LOD_DENSITY_MIN_MEMBERS) {
+    // Chunking a crowded cell into repeated average representatives compounds
+    // the same spatial error. Subdivide instead, retaining its distribution.
+    const children = new Map<string, DenseStrokeGroup>();
+    const childCell = cell * 0.5;
+    for (const index of group.members) {
+      const primitive = readStrokePrimitive(scene, index)!;
+      const x = Math.floor(primitive.x0 / childCell), y = Math.floor(primitive.y0 / childCell);
+      if (Math.floor(primitive.x1 / childCell) !== x || Math.floor(primitive.y1 / childCell) !== y) {
+        emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, primitive, paintOrigins);
+        continue;
+      }
+      const key = `${x},${y}`;
+      let child = children.get(key);
+      if (!child) children.set(key, child = createDenseStrokeGroup());
+      appendDenseStroke(child, primitive, index);
+    }
+    for (const child of children.values()) {
+      emitDenseStrokeGroup(scene, child, endpoints, primitiveMeta, primitiveBounds, styles, bounds,
+        childCell, paintOrigins, depth + 1);
+    }
+    return;
+  }
+  const primitive = readStrokePrimitive(scene, group.members[0])!;
+  primitive.x0 = group.x0 / group.count;
+  primitive.y0 = group.y0 / group.count;
+  primitive.x1 = primitive.cx = group.x1 / group.count;
+  primitive.y1 = primitive.cy = group.y1 / group.count;
+  const source = readStrokePrimitive(scene, group.members[0])!;
+  if ((source.x0 !== source.x1 || source.y0 !== source.y1) &&
+      Math.fround(primitive.x0) === Math.fround(primitive.x1) &&
+      Math.fround(primitive.y0) === Math.fround(primitive.y1)) {
+    for (const index of group.members) {
+      emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, readStrokePrimitive(scene, index)!, paintOrigins);
+    }
+    return;
+  }
+  // Keep multiplicity exactly representable in Float32 metadata. Co-located
+  // representatives compose to the same total source-over coverage.
+  for (let remaining = group.count; remaining > 0;) {
+    const count = Math.min(remaining, LOD_DENSITY_MAX_MULTIPLICITY);
+    primitive.primitiveType = 1 - count;
+    emitPrimitive(endpoints, primitiveMeta, primitiveBounds, styles, bounds, primitive, paintOrigins);
+    remaining -= count;
+  }
+}
+
+function shouldDropOverviewPrimitive(primitive: StrokePrimitive, tolerance: number): boolean {
+  // Fragment clip rectangles do not measure the mark itself. Include pen width
+  // and curve controls so wide dots and curved features do not vanish as if
+  // they were tiny centerlines. The canonical scene is never modified.
+  const quadratic = primitive.primitiveType >= STROKE_PRIMITIVE_QUADRATIC - 0.5;
+  const cx = quadratic ? primitive.cx : primitive.x1;
+  const cy = quadratic ? primitive.cy : primitive.y1;
+  const span = Math.max(
+    Math.max(primitive.x0, cx, primitive.x1) - Math.min(primitive.x0, cx, primitive.x1),
+    Math.max(primitive.y0, cy, primitive.y1) - Math.min(primitive.y0, cy, primitive.y1)
+  ) + primitive.halfWidth * 2;
+  return span <= tolerance * LOD_PRESERVE_LOCAL_SIZE_FACTOR;
+}
+
+function shouldPreservePrimitiveAtTolerance(
   primitive: StrokePrimitive,
   tolerance: number
 ): boolean {
-  const offset = index * 4;
-  const minX = scene.primitiveBounds[offset] - primitive.halfWidth;
-  const minY = scene.primitiveBounds[offset + 1] - primitive.halfWidth;
-  const maxX = scene.primitiveBounds[offset + 2] + primitive.halfWidth;
-  const maxY = scene.primitiveBounds[offset + 3] + primitive.halfWidth;
-  const projectedDropLocalSize = tolerance * LOD_DROP_LOCAL_SIZE_FACTOR;
-  return Math.max(maxX - minX, maxY - minY) <= projectedDropLocalSize;
+  // Use centerline geometry rather than clip bounds: a tiny mark can carry a
+  // page-sized fragment clip, and its pen width does not make it mergeable.
+  const span = Math.max(
+    Math.max(primitive.x0, primitive.cx, primitive.x1) - Math.min(primitive.x0, primitive.cx, primitive.x1),
+    Math.max(primitive.y0, primitive.cy, primitive.y1) - Math.min(primitive.y0, primitive.cy, primitive.y1)
+  );
+  return span <= tolerance * LOD_PRESERVE_LOCAL_SIZE_FACTOR &&
+    (span > 0 || (primitive.flags & STROKE_STYLE_FLAG_ROUND_CAP) !== 0);
 }
 
 function resolveIntervalGroup(
   groups: Map<string, IntervalGroup>,
   primitive: StrokePrimitive,
   tileIndex: number,
-  tolerance: number
+  tolerance: number,
+  overview = false
 ): IntervalGroup {
   const dx = primitive.x1 - primitive.x0;
   const dy = primitive.y1 - primitive.y0;
@@ -1731,10 +2225,13 @@ function resolveIntervalGroup(
   const normalX = -axisY;
   const normalY = axisX;
   const offset = primitive.x0 * normalX + primitive.y0 * normalY;
-  const offsetKey = Math.round(offset / tolerance);
-  const widthKey = (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0
-    ? -1
-    : Math.round(primitive.halfWidth * 10_000);
+  const hairline = (primitive.flags & STROKE_STYLE_FLAG_HAIRLINE) !== 0;
+  // Fine LOD bounds offset rounding by 1% of pen width to preserve hatch
+  // density. Budget-oriented overview levels deliberately allow wider merges.
+  const offsetStep = !overview && !hairline && primitive.halfWidth > 0
+    ? Math.min(tolerance, primitive.halfWidth * 0.02) : tolerance;
+  const offsetKey = Math.round(offset / offsetStep);
+  const widthKey = hairline ? -1 : primitive.halfWidth;
   const colorKey =
     `${Math.round(primitive.colorR * 255)},${Math.round(primitive.colorG * 255)},` +
     `${Math.round(primitive.colorB * 255)},${Math.round(primitive.alpha * 255)}`;
@@ -1758,7 +2255,7 @@ function resolveIntervalGroup(
       axisY,
       normalX,
       normalY,
-      offset: offsetKey * tolerance,
+      offset: offsetKey * offsetStep,
       offsetSum: 0,
       offsetWeightSum: 0,
       clipMinX: Number.POSITIVE_INFINITY,
@@ -1852,7 +2349,7 @@ function emitInterval(
   end: number,
   paintOrigins?: number[]
 ): void {
-  if (end - start <= 1e-6) {
+  if (end <= start) {
     return;
   }
   const hasClip =
@@ -1943,7 +2440,7 @@ function pushGroupInterval(group: IntervalGroup, primitive: StrokePrimitive, tol
     const extension = Math.max(primitive.halfWidth * 4, tolerance, 1e-3);
     start = Math.max(start, Math.min(p0, p1, p2, p3) - extension);
     end = Math.min(end, Math.max(p0, p1, p2, p3) + extension);
-    if (end - start <= 1e-6) {
+    if (end <= start) {
       return;
     }
   }

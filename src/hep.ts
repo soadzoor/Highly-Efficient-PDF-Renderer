@@ -32,10 +32,35 @@ import {
 import { createLoadProgressReporter, type LoadProgressCallback } from "./loadProgress";
 import {
   decodeRasterImageToRgba,
-  encodeRasterRgbaAsBestImage,
+  encodeRasterRgbaAsPng,
+  encodeRasterRgbaCandidates,
   inspectRasterImage,
+  pickBestRasterImage,
   rasterImageEncodingFromPath
 } from "./rasterImageCodec";
+import {
+  IdenticalRasterFinder,
+  SCENE_RASTER_LAYERS_PATH,
+  copyRasterRect,
+  decodeRasterLayerTable,
+  encodeRasterLayerTable,
+  isRasterAtlasCandidate,
+  packRasterAtlases,
+  rasterAtlasFile,
+  rasterLayerFile,
+  type RasterAtlasRecord,
+  type RasterLayerRecord,
+  type RasterLayerTable
+} from "./hepRasterLayers";
+import {
+  TEXT_GLYPH_SEGMENTS_PATH,
+  TEXT_INSTANCE_POSITIONS_PATH,
+  decodeTextGlyphSegments,
+  decodeTextInstancePositionsInto,
+  encodeTextGlyphSegments,
+  encodeTextInstancePositions,
+  type TextGlyphSegmentsMeta
+} from "./hepTextSections";
 import {
   decodeByteShuffledFloat32,
   decodeChannelMajorFloat32,
@@ -102,7 +127,6 @@ export type TextureLayout = "interleaved" | "channel-major";
 type TextureComponentType =
   | "float32"
   | "uint8-normalized"
-  | "uint16-normalized-range"
   | "uint16-range-delta-columns";
 
 export interface BuildHepBlobOptions {
@@ -137,17 +161,6 @@ interface ParsedDataTextureEntry {
   logicalItemCount?: unknown;
   logicalFloatCount?: unknown;
   columnByteLengths?: unknown;
-}
-
-interface ParsedDataRasterLayerEntry {
-  opacity?: unknown;
-  width?: unknown;
-  height?: unknown;
-  matrix?: unknown;
-  file?: unknown;
-  encoding?: unknown;
-  paintOrder?: unknown;
-  pageIndex?: unknown;
 }
 
 interface ParsedDataSceneEntry {
@@ -200,6 +213,7 @@ interface ParsedDataManifest {
   textIndex?: unknown;
   strokeGeometry?: unknown;
   textInstances?: unknown;
+  textGlyphSegments?: unknown;
   gradientLut?: unknown;
   gradientMesh?: unknown;
 }
@@ -217,17 +231,6 @@ export interface HepBlobResult {
   textureCount: number;
   rasterLayerCount: number;
   layout: TextureLayout;
-}
-
-interface SerializedRasterLayerEntry {
-  opacity?: number;
-  width: number;
-  height: number;
-  matrix: number[];
-  file: string;
-  encoding: "webp" | "png" | "rgba";
-  paintOrder: number;
-  pageIndex: number;
 }
 
 const GRADIENT_LUT_PATH = "textures/gradient-lut.rgba";
@@ -348,78 +351,24 @@ export async function buildHepBlobForLayout(
     }
   }
 
-  const serializedRasterLayers: SerializedRasterLayerEntry[] = [];
-  let encodedRasterTexels = 0;
-  for (let i = 0; i < rasterLayers.length; i += 1) {
+  let textGlyphSegmentsManifest: TextGlyphSegmentsMeta | undefined;
+  if (scene.textGlyphSegmentCount > 0) {
     throwIfBuildAborted(options.signal);
-    const layer = rasterLayers[i];
-    const expectedBytes = layer.width * layer.height * 4;
-    if (
-      !Number.isSafeInteger(expectedBytes) ||
-      layer.width <= 0 ||
-      layer.height <= 0 ||
-      !(layer.data instanceof Uint8Array) ||
-      layer.data.byteLength < expectedBytes
-    ) {
-      throw new Error(`Raster layer ${i} has invalid dimensions or insufficient RGBA data.`);
-    }
-    if (layer.opacity !== undefined && (!Number.isFinite(layer.opacity) || layer.opacity < 0 || layer.opacity > 1)) {
-      throw new Error(`Raster layer ${i} has invalid opacity.`);
-    }
-    const serializedMatrix = Array.from(layer.matrix);
-    if (
-      serializedMatrix.length !== 6 ||
-      serializedMatrix.some((component) => !Number.isFinite(component))
-    ) {
-      throw new Error(`Raster layer ${i} has an invalid transform matrix.`);
-    }
-    const rasterBytes = layer.data.subarray(0, expectedBytes);
-    let filePath = `raster/layer-${i}.rgba`;
-    let encoding: "webp" | "png" | "rgba" = "rgba";
-    let layerBytes: Uint8Array = rasterBytes;
-    if (encodeRasterImages) {
-      const encodedImage = await encodeRasterRgbaAsBestImage(
-        layer.width,
-        layer.height,
-        rasterBytes
-      );
-      throwIfBuildAborted(options.signal);
-      if (encodedImage) {
-        filePath = `raster/layer-${i}.${encodedImage.encoding}`;
-        encoding = encodedImage.encoding;
-        layerBytes = encodedImage.bytes;
-      }
-    }
-    if (encoding === "rgba") {
-      archive.file(filePath, layerBytes);
-    } else {
-      // WebP and PNG already carry entropy compression; deflating them again
-      // wastes export time and normally cannot recover meaningful bytes.
-      archive.file(filePath, layerBytes, { compression: "STORE" });
-    }
-    serializedRasterLayers.push({
-      width: layer.width,
-      height: layer.height,
-      matrix: serializedMatrix,
-      file: filePath,
-      encoding,
-      paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
-      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
-      ...(layer.opacity === undefined ? {} : { opacity: layer.opacity })
-    });
-    if (encodeRasterImages) {
-      encodedRasterTexels += layer.width * layer.height;
-      options.onBuildProgress?.(
-        0.4 * (encodedRasterTexels / totalRasterTexels),
-        {
-          stage: "raster-encode",
-          unit: "texels",
-          processed: encodedRasterTexels,
-          total: totalRasterTexels
-        }
-      );
-    }
+    const glyphSegments = encodeTextGlyphSegments(
+      scene.textGlyphSegmentsA, scene.textGlyphSegmentsB, scene.textGlyphSegmentCount
+    );
+    archive.file(TEXT_GLYPH_SEGMENTS_PATH, glyphSegments.bytes);
+    textGlyphSegmentsManifest = glyphSegments.meta;
   }
+
+  const rasterLayersManifest = await writeHepRasterLayers(archive, rasterLayers, {
+    encodeRasterImages,
+    signal: options.signal,
+    onTexelsEncoded: (processed) => options.onBuildProgress?.(
+      0.4 * (processed / totalRasterTexels),
+      { stage: "raster-encode", unit: "texels", processed, total: totalRasterTexels }
+    )
+  });
   throwIfBuildAborted(options.signal);
   options.onBuildProgress?.(hepBuildStart, { stage: "hep-build" });
 
@@ -429,6 +378,7 @@ export async function buildHepBlobForLayout(
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,
     textInstances: textInstancesExport?.manifest,
+    textGlyphSegments: textGlyphSegmentsManifest,
     gradientLut: gradientLutByteLength > 0
       ? {
         file: GRADIENT_LUT_PATH,
@@ -486,7 +436,7 @@ export async function buildHepBlobForLayout(
       textInstanceCount: scene.textInstanceCount,
       textGlyphCount: scene.textGlyphCount,
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
-      rasterLayers: serializedRasterLayers
+      rasterLayers: rasterLayersManifest
     },
     textures: textureEntries.map((entry) => ({
       name: entry.name,
@@ -561,12 +511,165 @@ function throwIfBuildAborted(signal: AbortSignal | undefined): void {
 }
 
 /**
+ * A small layer keeps its own lossy WebP section only when that, with the
+ * section's own index record and image header, needs at most 1/N of the bytes
+ * of its lossless form, as photographs do. Thin strips and icons join an atlas
+ * even when WebP looks smaller: that lead is mostly per-image overhead the
+ * atlas does not pay.
+ */
+const RASTER_ATLAS_LOSSY_ADVANTAGE = 2;
+const RASTER_SECTION_OVERHEAD_BYTES = 64;
+
+/**
+ * Write the v9 raster layer table: every layer keeps its own record, and the
+ * pixels of small lossless layers share PNG atlases instead of paying for a
+ * section, a PNG header and a JSON record each. A repeated image is encoded
+ * once, and small repeats share one atlas cell. See `hepRasterLayers`.
+ */
+async function writeHepRasterLayers(
+  archive: HepArchive,
+  layers: readonly RasterLayer[],
+  options: {
+    encodeRasterImages: boolean;
+    signal?: AbortSignal;
+    onTexelsEncoded: (processed: number) => void;
+  }
+): Promise<{ file: string; count: number; atlasCount: number } | undefined> {
+  if (layers.length === 0) {
+    return undefined;
+  }
+  const records: RasterLayerRecord[] = [];
+  const pixels: Uint8Array[] = [];
+  const encoded: Array<{ storage: "png" | "webp"; bytes: Uint8Array } | null> = [];
+  const identical = new IdenticalRasterFinder();
+  /** The first earlier layer with identical pixels, or -1. */
+  const originals: number[] = [];
+  const joinsAtlas: boolean[] = [];
+  const atlasMembers: number[] = [];
+  let encodedTexels = 0;
+  for (let i = 0; i < layers.length; i += 1) {
+    throwIfBuildAborted(options.signal);
+    const layer = layers[i];
+    const expectedBytes = layer.width * layer.height * 4;
+    if (
+      !Number.isSafeInteger(expectedBytes) ||
+      layer.width <= 0 ||
+      layer.height <= 0 ||
+      !(layer.data instanceof Uint8Array) ||
+      layer.data.byteLength < expectedBytes
+    ) {
+      throw new Error(`Raster layer ${i} has invalid dimensions or insufficient RGBA data.`);
+    }
+    if (layer.opacity !== undefined && (!Number.isFinite(layer.opacity) || layer.opacity < 0 || layer.opacity > 1)) {
+      throw new Error(`Raster layer ${i} has invalid opacity.`);
+    }
+    if (layer.matrix.length !== 6 || !layer.matrix.every(Number.isFinite)) {
+      throw new Error(`Raster layer ${i} has an invalid transform matrix.`);
+    }
+    const rgba = layer.data.subarray(0, expectedBytes);
+    const original = identical.findOrAdd(i, layer.width, layer.height, rgba);
+    let best: { storage: "png" | "webp"; bytes: Uint8Array } | null = null;
+    let lossyWins = false;
+    if (original >= 0) {
+      // A repeated image reuses the first copy's encoding and atlas cell.
+      best = encoded[original];
+    } else if (options.encodeRasterImages) {
+      const candidates = await encodeRasterRgbaCandidates(layer.width, layer.height, rgba);
+      throwIfBuildAborted(options.signal);
+      const image = pickBestRasterImage(layer.width, layer.height, candidates);
+      best = image ? { storage: image.encoding, bytes: image.bytes } : null;
+      const losslessBytes = Math.min(candidates.png?.byteLength ?? expectedBytes, expectedBytes);
+      lossyWins = best?.storage === "webp" &&
+        (best.bytes.byteLength + RASTER_SECTION_OVERHEAD_BYTES) * RASTER_ATLAS_LOSSY_ADVANTAGE <= losslessBytes;
+    }
+    if (options.encodeRasterImages) {
+      encodedTexels += layer.width * layer.height;
+      options.onTexelsEncoded(encodedTexels);
+    }
+    pixels.push(rgba);
+    encoded.push(best);
+    originals.push(original);
+    joinsAtlas.push(original >= 0 ? joinsAtlas[original] : isRasterAtlasCandidate(layer.width, layer.height) && !lossyWins);
+    records.push({
+      width: layer.width,
+      height: layer.height,
+      matrix: layer.matrix,
+      paintOrder: Number.isFinite(layer.paintOrder) ? Math.max(0, Math.trunc(layer.paintOrder)) : 0,
+      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
+      ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
+      storage: best?.storage ?? "rgba"
+    });
+    if (joinsAtlas[i]) {
+      atlasMembers.push(i);
+    }
+  }
+
+  // A lone small layer gains nothing from an atlas of its own.
+  const atlases: RasterAtlasRecord[] = [];
+  if (atlasMembers.length >= 2) {
+    // Only first copies get cells; repeats point at their original's cell.
+    const packedMembers = atlasMembers.filter(index => originals[index] < 0);
+    const packed = packRasterAtlases(packedMembers.map(index => records[index]));
+    const atlasPixels = packed.atlases.map(({ width, height }) => new Uint8Array(width * height * 4));
+    packedMembers.forEach((layerIndex, member) => {
+      const cell = packed.cells[member];
+      const record = records[layerIndex];
+      copyRasterRect(
+        pixels[layerIndex], record.width, 0, 0,
+        atlasPixels[cell.atlas], packed.atlases[cell.atlas].width, cell.x, cell.y,
+        record.width, record.height
+      );
+      record.storage = "atlas";
+      record.cell = cell;
+    });
+    for (const layerIndex of atlasMembers) {
+      const original = originals[layerIndex];
+      if (original >= 0) {
+        records[layerIndex].storage = "atlas";
+        records[layerIndex].cell = { ...records[original].cell! };
+      }
+    }
+    for (let index = 0; index < atlasPixels.length; index += 1) {
+      throwIfBuildAborted(options.signal);
+      const { width, height } = packed.atlases[index];
+      // Lossless only: lossy blocks would bleed between unrelated cells.
+      const png = options.encodeRasterImages ? await encodeRasterRgbaAsPng(width, height, atlasPixels[index]) : null;
+      throwIfBuildAborted(options.signal);
+      if (png) {
+        archive.file(rasterAtlasFile(index, "png"), png, { compression: "STORE" });
+      } else {
+        archive.file(rasterAtlasFile(index, "rgba"), atlasPixels[index]);
+      }
+      atlases.push({ encoding: png ? "png" : "rgba", width, height });
+    }
+  }
+
+  records.forEach((record, index) => {
+    if (record.storage === "atlas") return;
+    const image = encoded[index];
+    if (image) {
+      // WebP and PNG already carry entropy compression; deflating them again
+      // wastes export time and normally cannot recover meaningful bytes.
+      archive.file(rasterLayerFile(index, image.storage), image.bytes, { compression: "STORE" });
+    } else {
+      archive.file(rasterLayerFile(index, "rgba"), pixels[index]);
+    }
+  });
+  archive.file(SCENE_RASTER_LAYERS_PATH, encodeRasterLayerTable({ atlases, layers: records }));
+  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length };
+}
+
+/**
  * v7 retained PDF layer definitions, conditions and initially hidden content.
  * v8 moves the scene clip paths, draw runs and paint graph out of the manifest
- * into binary sections; see docs/HEP_CONTAINER.md.
+ * into binary sections. v9 stores raster layers as a binary table with small
+ * images packed into atlases, chains glyph outline points and predicts glyph
+ * origins from their advances; see docs/HEP_CONTAINER.md.
  */
-const PARSED_DATA_FORMAT_VERSION = 8;
-const MAX_PARSED_RASTER_LAYER_COUNT = 4_096;
+const PARSED_DATA_FORMAT_VERSION = 9;
+/** Layers are records now; each atlas or standalone image is one section. */
+const MAX_PARSED_RASTER_LAYER_COUNT = 262_144;
+const MAX_PARSED_RASTER_SECTION_COUNT = 4_096;
 const MAX_PARSED_RASTER_DIMENSION = 16_384;
 const MAX_PARSED_RASTER_TEXELS_PER_LAYER = 134_217_728;
 const MAX_PARSED_RASTER_PAYLOAD_BYTES = 768 * 1024 * 1024;
@@ -927,7 +1030,7 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
   const glyphIndexFile = typeof raw.glyphIndexFile === "string" ? raw.glyphIndexFile : null;
   const glyphIndexFormat = raw.glyphIndexFormat === "u32" ? "u32" : raw.glyphIndexFormat === "u16" ? "u16" : null;
   const count = Number(raw.count);
-  const positionColumnByteLengths = readFiniteNumberArray(raw.positionColumnByteLengths, 2);
+  const positionColumnByteLengths = readFiniteNumberArray(raw.positionColumnByteLengths, 3);
   const clipRectsFile = typeof raw.clipRectsFile === "string" ? raw.clipRectsFile : undefined;
   const clipReferencesFile = typeof raw.clipReferencesFile === "string"
     ? raw.clipReferencesFile
@@ -951,6 +1054,27 @@ function parseTextInstancesSection(value: unknown): TextInstancesSectionMeta | n
     positionsFile, glyphIndexFile, glyphIndexFormat, count, positionColumnByteLengths,
     ...(clipRectsFile === undefined ? {} : { clipRectsFile, clipReferencesFile, clipRectCount })
   };
+}
+
+function parseTextGlyphSegmentsSection(value: unknown): TextGlyphSegmentsMeta | null {
+  if (value === undefined) {
+    return null;
+  }
+  const raw = typeof value === "object" && value ? value as Record<string, unknown> : {};
+  const segmentCount = raw.segmentCount;
+  const quantizationMin = readFiniteNumberArray(raw.quantizationMin, 2);
+  const quantizationMax = readFiniteNumberArray(raw.quantizationMax, 2);
+  if (
+    raw.file !== TEXT_GLYPH_SEGMENTS_PATH ||
+    typeof segmentCount !== "number" ||
+    !Number.isSafeInteger(segmentCount) ||
+    segmentCount < 0 ||
+    !quantizationMin ||
+    !quantizationMax
+  ) {
+    throw new Error("HEP file has an invalid textGlyphSegments section.");
+  }
+  return { file: TEXT_GLYPH_SEGMENTS_PATH, segmentCount, quantizationMin, quantizationMax };
 }
 
 /**
@@ -1111,8 +1235,16 @@ function decodeStrokeGeometry(encoded: StrokeGeometryExport): {
   return { endpoints, primitiveMeta, primitiveBounds };
 }
 
-/** Decodes the v5 text instance section back into the interleaved textInstanceB array. */
-async function readTextInstancesFromSection(archive: HepArchive, section: TextInstancesSectionMeta): Promise<Float32Array> {
+/**
+ * Decodes the text instance section back into the interleaved textInstanceB
+ * array. Origins are predicted from the glyph indices and the decoded
+ * `text-instance-a` matrices, so both are read first.
+ */
+async function readTextInstancesFromSection(
+  archive: HepArchive,
+  section: TextInstancesSectionMeta,
+  instanceA: Float32Array
+): Promise<Float32Array> {
   const count = section.count;
   const instanceB = new Float32Array(count * 4);
   if (count === 0) {
@@ -1122,38 +1254,31 @@ async function readTextInstancesFromSection(archive: HepArchive, section: TextIn
   const positionsEntry = archive.file(section.positionsFile);
   const glyphIndexEntry = archive.file(section.glyphIndexFile);
   if (!positionsEntry || !glyphIndexEntry) {
-    throw new Error("HEP file is missing v5 text instance files.");
+    throw new Error("HEP file is missing text instance files.");
   }
   const [positionsBuffer, glyphIndexBuffer] = await Promise.all([
     positionsEntry.async("arraybuffer"),
     glyphIndexEntry.async("arraybuffer")
   ]);
-  const positionBytes = new Uint8Array(positionsBuffer);
-  const [eLength, fLength] = section.positionColumnByteLengths;
-  if (eLength + fLength !== positionBytes.length) {
-    throw new Error("HEP file text instance position columns have a length mismatch.");
+  const bytesPerGlyph = section.glyphIndexFormat === "u32" ? 4 : 2;
+  if (glyphIndexBuffer.byteLength !== count * bytesPerGlyph) {
+    throw new Error("HEP file glyph index stream has a length mismatch.");
   }
-
-  decodeFixed512DeltaColumnInto(positionBytes, 0, eLength, instanceB, count, 4, 0);
-  decodeFixed512DeltaColumnInto(positionBytes, eLength, positionBytes.length, instanceB, count, 4, 1);
-
-  if (section.glyphIndexFormat === "u32") {
-    if (glyphIndexBuffer.byteLength !== count * 4) {
-      throw new Error("HEP file glyph index stream has a length mismatch.");
-    }
-    const glyphIndices = new Uint32Array(glyphIndexBuffer);
-    for (let i = 0; i < count; i += 1) {
-      instanceB[i * 4 + 2] = glyphIndices[i];
-    }
-  } else {
-    if (glyphIndexBuffer.byteLength !== count * 2) {
-      throw new Error("HEP file glyph index stream has a length mismatch.");
-    }
-    const glyphIndices = new Uint16Array(glyphIndexBuffer);
-    for (let i = 0; i < count; i += 1) {
-      instanceB[i * 4 + 2] = glyphIndices[i];
-    }
+  const glyphIndices = bytesPerGlyph === 4 ? new Uint32Array(glyphIndexBuffer) : new Uint16Array(glyphIndexBuffer);
+  for (let i = 0; i < count; i += 1) {
+    instanceB[i * 4 + 2] = glyphIndices[i];
   }
+  if (instanceA.length < count * 4) {
+    throw new Error("HEP file text instance matrices are missing or incomplete.");
+  }
+  decodeTextInstancePositionsInto(
+    new Uint8Array(positionsBuffer),
+    section.positionColumnByteLengths,
+    instanceA,
+    glyphIndices,
+    instanceB,
+    count
+  );
 
   return instanceB;
 }
@@ -1161,7 +1286,6 @@ async function readTextInstancesFromSection(archive: HepArchive, section: TextIn
 const STROKE_ENDPOINTS_PATH = "geometry/stroke-endpoints.csq16";
 const STROKE_META_PATH = "geometry/stroke-meta.bin";
 const STROKE_CLIP_BOUNDS_PATH = "geometry/stroke-clip-bounds.f32";
-const TEXT_INSTANCE_POSITIONS_PATH = "geometry/text-instance-ef.d512";
 const TEXT_INSTANCE_GLYPHS_U16_PATH = "geometry/text-instance-glyphs.u16";
 const TEXT_INSTANCE_GLYPHS_U32_PATH = "geometry/text-instance-glyphs.u32";
 const TEXT_INSTANCE_CLIP_REFS_PATH = "geometry/text-instance-clips.u32";
@@ -1231,13 +1355,21 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
     }
     return result;
   };
+  const quantizeGlyphSegments = (): Pick<VectorScene, "textGlyphSegmentsA" | "textGlyphSegmentsB"> => {
+    const encoded = encodeTextGlyphSegments(scene.textGlyphSegmentsA, scene.textGlyphSegmentsB, scene.textGlyphSegmentCount);
+    const decoded = decodeTextGlyphSegments(encoded.bytes, encoded.meta);
+    return { textGlyphSegmentsA: decoded.segmentsA, textGlyphSegmentsB: decoded.segmentsB };
+  };
   const prepared = optimizeVectorSceneTextGlyphs({
     ...scene,
     ...strokes,
+    ...(scene.textGlyphSegmentCount > 0 ? quantizeGlyphSegments() : {}),
+    // HEP v8 rounds clip endpoints too; use the same grid after page layout.
+    ...(scene.clipPaths ? { clipPaths: scene.clipPaths.map(clip => ({
+      ...clip, edges: quantizePositions(clip.edges, clip.edges.length / 4, 4)
+    })) } : {}),
     fillSegmentsA: quantizeTexture("fill-primitives-a", scene.fillSegmentsA, scene.fillSegmentCount),
     fillSegmentsB: quantizeTexture("fill-primitives-b", scene.fillSegmentsB, scene.fillSegmentCount),
-    textGlyphSegmentsA: quantizeTexture("text-glyph-primitives-a", scene.textGlyphSegmentsA, scene.textGlyphSegmentCount),
-    textGlyphSegmentsB: quantizeTexture("text-glyph-primitives-b", scene.textGlyphSegmentsB, scene.textGlyphSegmentCount),
     textInstanceB: quantizePositions(scene.textInstanceB, scene.textInstanceCount, 2),
     textInstanceC: quantizeTexture("text-instance-c", scene.textInstanceC, scene.textInstanceCount),
     textIndex: scene.textIndex ? {
@@ -1389,14 +1521,18 @@ interface TextInstancesExport {
 }
 
 /**
- * Text instance storage (retained in v7): e/f as fixed-point 1/512 per-column varint deltas
- * (quantization approved: max error 1/1024 scene unit), glyph indices as a
- * raw u16/u32 column. The always-zero 4th channel is dropped.
+ * Text instance storage: e/f on the fixed-point 1/512 grid (quantization
+ * approved: max error 1/1024 scene unit) with advance-predicted e steps (v9,
+ * see `hepTextSections`), glyph indices as a raw u16/u32 column. The 4th
+ * channel is stored only as the optional clip references.
  */
 function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | null {
   const count = Math.max(0, Math.trunc(scene.textInstanceCount));
   if (count === 0) {
     return null;
+  }
+  if (scene.textInstanceA.length < count * 4 || scene.textInstanceB.length < count * 4) {
+    throw new Error("Text instance data is incomplete.");
   }
 
   const source = scene.textInstanceB.subarray(0, count * 4);
@@ -1418,9 +1554,6 @@ function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | nul
       throw new Error("Text clip reference is out of range.");
     }
   }
-  const eColumn = encodeFixed512DeltaColumn(source, count, 4, 0);
-  const fColumn = encodeFixed512DeltaColumn(source, count, 4, 1);
-
   let maxGlyphIndex = 0;
   for (let i = 0; i < count; i += 1) {
     const glyphIndex = Math.max(0, Math.trunc(source[i * 4 + 2]));
@@ -1429,24 +1562,17 @@ function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | nul
     }
   }
   const useU32 = maxGlyphIndex > 65535;
-  let glyphIndexBytes: Uint8Array;
-  if (useU32) {
-    const glyphIndices = new Uint32Array(count);
-    for (let i = 0; i < count; i += 1) {
-      glyphIndices[i] = Math.max(0, Math.trunc(source[i * 4 + 2]));
-    }
-    glyphIndexBytes = new Uint8Array(glyphIndices.buffer);
-  } else {
-    const glyphIndices = new Uint16Array(count);
-    for (let i = 0; i < count; i += 1) {
-      glyphIndices[i] = Math.max(0, Math.trunc(source[i * 4 + 2]));
-    }
-    glyphIndexBytes = new Uint8Array(glyphIndices.buffer);
+  const glyphIndices = useU32 ? new Uint32Array(count) : new Uint16Array(count);
+  for (let i = 0; i < count; i += 1) {
+    glyphIndices[i] = Math.max(0, Math.trunc(source[i * 4 + 2]));
   }
+  // The reader predicts positions from the glyph indices and matrices it has
+  // already decoded, so the writer predicts from exactly the stored values.
+  const positions = encodeTextInstancePositions(scene.textInstanceA, source, glyphIndices, count);
 
   return {
-    positionsBytes: concatByteChunks([eColumn, fColumn]),
-    glyphIndexBytes,
+    positionsBytes: positions.bytes,
+    glyphIndexBytes: new Uint8Array(glyphIndices.buffer),
     ...(clipRects && clipRects.length > 0 ? {
       clipReferenceBytes: new Uint8Array(Uint32Array.from(
         { length: count },
@@ -1463,7 +1589,7 @@ function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | nul
       glyphIndexFile: useU32 ? TEXT_INSTANCE_GLYPHS_U32_PATH : TEXT_INSTANCE_GLYPHS_U16_PATH,
       glyphIndexFormat: useU32 ? "u32" : "u16",
       count,
-      positionColumnByteLengths: [eColumn.length, fColumn.length],
+      positionColumnByteLengths: positions.columnByteLengths,
       ...(clipRects && clipRects.length > 0 ? {
         clipRectsFile: TEXT_CLIP_RECTS_PATH,
         clipReferencesFile: TEXT_INSTANCE_CLIP_REFS_PATH,
@@ -1489,8 +1615,7 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneTextureS
     createTextureExportEntry("text-instance-c", scene.textInstanceC, sceneStats.textInstanceTextureWidth, sceneStats.textInstanceTextureHeight, scene.textInstanceCount, textureLayout),
     createTextureExportEntry("text-glyph-meta-a", scene.textGlyphMetaA, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
     createTextureExportEntry("text-glyph-meta-b", scene.textGlyphMetaB, sceneStats.textGlyphTextureWidth, sceneStats.textGlyphTextureHeight, scene.textGlyphCount, textureLayout),
-    createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout),
-    createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount, textureLayout),
+    // Glyph outlines live in the v9 textGlyphSegments section.
     createTextureExportEntry("gradient-meta-a", scene.gradientMetaA, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
     createTextureExportEntry("gradient-meta-b", scene.gradientMetaB, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
     createTextureExportEntry("gradient-meta-c", scene.gradientMetaC, sceneStats.gradientTextureWidth, sceneStats.gradientTextureHeight, scene.gradientCount, textureLayout),
@@ -1576,9 +1701,10 @@ async function loadSceneFromHepInternal(
 
   const strokeGeometrySection = parseStrokeGeometrySection(manifest.strokeGeometry);
   const textInstancesSection = parseTextInstancesSection(manifest.textInstances);
+  const textGlyphSegmentsSection = parseTextGlyphSegmentsSection(manifest.textGlyphSegments);
 
   const textureByName = new Map<string, ParsedDataTextureEntry>();
-  const textureReadTotal = 29;
+  const textureReadTotal = 27;
   let textureReadCount = 0;
   const reportTextureProgress = (): void => {
     progress.report(0.22 + (textureReadCount / textureReadTotal) * 0.58, {
@@ -1643,8 +1769,6 @@ async function loadSceneFromHepInternal(
   const textInstanceCEntry = await readTexture("text-instance-c", false);
   const textGlyphMetaAEntry = await readTexture("text-glyph-meta-a", false);
   const textGlyphMetaBEntry = await readTexture("text-glyph-meta-b", false);
-  const textGlyphPrimitiveAEntry = await readTexture("text-glyph-primitives-a", false);
-  const textGlyphPrimitiveBEntry = await readTexture("text-glyph-primitives-b", false);
   const gradientMetaAEntry = await readTexture("gradient-meta-a", false);
   const gradientMetaBEntry = await readTexture("gradient-meta-b", false);
   const gradientMetaCEntry = await readTexture("gradient-meta-c", false);
@@ -1668,10 +1792,10 @@ async function loadSceneFromHepInternal(
   const segmentCount = strokeGeometrySection?.segmentCount ?? 0;
   const textInstanceCount = textInstancesSection?.count ?? 0;
   const textGlyphCount = readNonNegativeInt(sceneMeta.textGlyphCount, textGlyphMetaAEntry?.logicalItemCount ?? 0);
-  const textGlyphSegmentCount = readNonNegativeInt(
-    sceneMeta.textGlyphPrimitiveCount,
-    readNonNegativeInt(sceneMeta.textGlyphSegmentCount, textGlyphPrimitiveAEntry?.logicalItemCount ?? 0)
-  );
+  const textGlyphSegmentCount = textGlyphSegmentsSection?.segmentCount ?? 0;
+  if (readNonNegativeInt(sceneMeta.textGlyphPrimitiveCount, textGlyphSegmentCount) !== textGlyphSegmentCount) {
+    throw new Error("HEP scene glyph segment count does not match its textGlyphSegments section.");
+  }
   const gradientCount = readNonNegativeInt(sceneMeta.gradientCount, gradientMetaAEntry?.logicalItemCount ?? 0);
   const gradientFillPathCount = readNonNegativeInt(
     sceneMeta.gradientFillPathCount,
@@ -1784,7 +1908,7 @@ async function loadSceneFromHepInternal(
   const textInstanceA = trimTextureForItemCount(textInstanceAEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-a");
   const textDecodeStart = performance.now();
   const textInstanceB = textInstancesSection
-    ? await readTextInstancesFromSection(archive, textInstancesSection)
+    ? await readTextInstancesFromSection(archive, textInstancesSection, textInstanceA)
     : new Float32Array(0);
   let textClipRects: Float32Array | undefined;
   if (textInstancesSection?.clipRectsFile && textInstancesSection.clipReferencesFile) {
@@ -1817,16 +1941,12 @@ async function loadSceneFromHepInternal(
   const textInstanceC = trimTextureForItemCount(textInstanceCEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-c");
   const textGlyphMetaA = trimTextureForItemCount(textGlyphMetaAEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-a");
   const textGlyphMetaB = trimTextureForItemCount(textGlyphMetaBEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-b");
-  const textGlyphSegmentsA = trimTextureForItemCount(
-    textGlyphPrimitiveAEntry?.data ?? new Float32Array(0),
-    textGlyphSegmentCount,
-    "text-glyph-primitives-a"
-  );
-  const textGlyphSegmentsB = trimTextureForItemCount(
-    textGlyphPrimitiveBEntry?.data ?? new Float32Array(0),
-    textGlyphSegmentCount,
-    "text-glyph-primitives-b"
-  );
+  const { segmentsA: textGlyphSegmentsA, segmentsB: textGlyphSegmentsB } = textGlyphSegmentsSection
+    ? decodeTextGlyphSegments(
+      await readSceneSectionBytes(archive, textGlyphSegmentsSection.file, signal),
+      textGlyphSegmentsSection
+    )
+    : { segmentsA: new Float32Array(0), segmentsB: new Float32Array(0) };
 
   const sourceSegmentCount = readNonNegativeInt(sceneMeta.sourceSegmentCount, segmentCount);
   const mergedSegmentCount = readNonNegativeInt(sceneMeta.mergedSegmentCount, segmentCount);
@@ -2448,217 +2568,170 @@ function parsePageTextRanges(value: unknown, pageCount: number, textInstanceCoun
   return out;
 }
 
-function parseMat2D(value: unknown): Float32Array | null {
-  if (!Array.isArray(value) || value.length !== 6) {
-    return null;
-  }
-
-  const out = new Float32Array(6);
-  for (let i = 0; i < 6; i += 1) {
-    const component = Number(value[i]);
-    if (!Number.isFinite(component)) {
-      return null;
-    }
-    out[i] = component;
-    if (!Number.isFinite(out[i])) {
-      return null;
-    }
-  }
-  return out;
-}
-
+/** A layer record is at most ~70 bytes; this bounds the table before inflating it. */
+const MAX_RASTER_RECORD_BYTES = 80;
 
 async function readRasterLayersFromParsedData(
   archive: HepArchive,
   sceneMeta: ParsedDataSceneEntry,
   signal?: AbortSignal
 ): Promise<RasterLayer[]> {
+  if (sceneMeta.rasterLayers === undefined) {
+    return [];
+  }
+  const meta = readSceneSectionDescriptor(sceneMeta.rasterLayers, SCENE_RASTER_LAYERS_PATH, "raster layers");
+  const count = readSceneSectionCount(meta, "count", "raster layers");
+  const atlasCount = readSceneSectionCount(meta, "atlasCount", "raster layers");
+  if (count > MAX_PARSED_RASTER_LAYER_COUNT) {
+    throw new Error(`Parsed data contains ${count} raster layers; the limit is ${MAX_PARSED_RASTER_LAYER_COUNT}.`);
+  }
+  const tableEntry = archive.file(SCENE_RASTER_LAYERS_PATH);
+  const tableByteLength = tableEntry ? readHepEntryUncompressedSize(tableEntry) : null;
+  if (tableByteLength === null || tableByteLength > (count + atlasCount + 1) * MAX_RASTER_RECORD_BYTES) {
+    throw new Error("Scene raster layer table is missing or larger than its records allow.");
+  }
+  const table = decodeRasterLayerTable(await readSceneSectionBytes(archive, SCENE_RASTER_LAYERS_PATH, signal), {
+    maxLayers: MAX_PARSED_RASTER_LAYER_COUNT,
+    maxAtlases: MAX_PARSED_RASTER_SECTION_COUNT,
+    maxDimension: MAX_PARSED_RASTER_DIMENSION
+  });
+  if (table.layers.length !== count || table.atlases.length !== atlasCount) {
+    throw new Error("Scene raster layers do not match their manifest entry.");
+  }
+  validateRasterLayerBudgets(archive, table);
+
+  // Decode an atlas when its first cell is needed and release it after its last.
+  const lastCellIndex = new Map<number, number>();
+  table.layers.forEach((layer, index) => {
+    if (layer.cell) lastCellIndex.set(layer.cell.atlas, index);
+  });
+  const atlasPixels = new Map<number, Uint8Array>();
   const layers: RasterLayer[] = [];
-  const sceneRasterLayers = Array.isArray(sceneMeta.rasterLayers)
-    ? sceneMeta.rasterLayers
-    : [];
-
-  validateRasterLayerBudgets(archive, sceneRasterLayers);
-
-  for (let i = 0; i < sceneRasterLayers.length; i += 1) {
+  for (let i = 0; i < table.layers.length; i += 1) {
     signal?.throwIfAborted();
-    const entry = sceneRasterLayers[i];
-    if (!entry || typeof entry !== "object") {
-      throw new Error(`Raster layer ${i} has invalid metadata.`);
+    const record = table.layers[i];
+    let data: Uint8Array;
+    if (record.storage === "atlas") {
+      const cell = record.cell!;
+      const atlas = table.atlases[cell.atlas];
+      let pixels = atlasPixels.get(cell.atlas);
+      if (!pixels) {
+        pixels = await readRasterImageSection(archive, rasterAtlasFile(cell.atlas, atlas.encoding), atlas.width, atlas.height);
+        signal?.throwIfAborted();
+        atlasPixels.set(cell.atlas, pixels);
+      }
+      data = new Uint8Array(record.width * record.height * 4);
+      copyRasterRect(pixels, atlas.width, cell.x, cell.y, data, record.width, 0, 0, record.width, record.height);
+      if (lastCellIndex.get(cell.atlas) === i) atlasPixels.delete(cell.atlas);
+    } else {
+      data = await readRasterImageSection(archive, rasterLayerFile(i, record.storage), record.width, record.height);
+      signal?.throwIfAborted();
     }
-
-    const layerMeta = entry as ParsedDataRasterLayerEntry;
-    const width = readPositiveSafeMetadataInteger(layerMeta.width);
-    const height = readPositiveSafeMetadataInteger(layerMeta.height);
-    const path = readNonEmptyString(layerMeta.file);
-    const matrix = parseMat2D(layerMeta.matrix);
-    const paintOrder = layerMeta.paintOrder;
-    const pageIndex = layerMeta.pageIndex;
-    const opacity = layerMeta.opacity;
-    if (
-      width === null ||
-      height === null ||
-      !path ||
-      !matrix ||
-      typeof paintOrder !== "number" ||
-      !Number.isSafeInteger(paintOrder) ||
-      paintOrder < 0 ||
-      typeof pageIndex !== "number" ||
-      !Number.isSafeInteger(pageIndex) ||
-      pageIndex < 0 || (opacity !== undefined && (typeof opacity !== "number" || !Number.isFinite(opacity) || opacity < 0 || opacity > 1))
-    ) {
-      throw new Error(`Raster layer ${i} has incomplete or invalid v7 metadata.`);
-    }
-
-    const decoded = await readRasterLayerFromZip(archive, path, width, height);
-    signal?.throwIfAborted();
-    if (!decoded) {
-      throw new Error(`HEP file is missing or cannot decode raster layer ${i}: ${path}.`);
-    }
-    const expectedByteLength = width * height * 4;
-    if (
-      decoded.width !== width ||
-      decoded.height !== height ||
-      decoded.data.byteLength !== expectedByteLength
-    ) {
-      throw new Error(`Raster layer ${i} dimensions do not match its v7 metadata.`);
-    }
-
     layers.push({
-      width,
-      height,
-      matrix,
-      data: decoded.data,
-      paintOrder,
-      pageIndex,
-      ...(opacity === undefined ? {} : { opacity: opacity as number })
+      width: record.width,
+      height: record.height,
+      matrix: record.matrix,
+      data,
+      paintOrder: record.paintOrder,
+      pageIndex: record.pageIndex,
+      ...(record.opacity === undefined ? {} : { opacity: record.opacity })
     });
   }
 
   return layers;
 }
 
-async function readRasterLayerFromZip(
+/** Straight-alpha RGBA8 of one raw, PNG or WebP section with known dimensions. */
+async function readRasterImageSection(
   archive: HepArchive,
   path: string,
-  widthHint: number,
-  heightHint: number
-): Promise<{ width: number; height: number; data: Uint8Array } | null> {
+  width: number,
+  height: number
+): Promise<Uint8Array> {
   const archiveEntry = archive.file(path);
   if (!archiveEntry) {
-    return null;
+    throw new Error(`HEP file is missing raster section ${path}.`);
   }
 
-  const buffer = await archiveEntry.async("arraybuffer");
-  const bytes = new Uint8Array(buffer);
+  const bytes = new Uint8Array(await archiveEntry.async("arraybuffer"));
+  const expectedLength = width * height * 4;
   const imageEncoding = rasterImageEncodingFromPath(path);
-  if (imageEncoding) {
-    const metadata = inspectRasterImage(imageEncoding, bytes);
-    if (
-      !metadata ||
-      metadata.width !== widthHint ||
-      metadata.height !== heightHint
-    ) {
+  if (!imageEncoding) {
+    if (bytes.byteLength !== expectedLength) {
       throw new Error(
-        `Raster image ${path} header dimensions do not match its v7 metadata.`
+        `Raster section ${path} size does not match its metadata (${bytes.byteLength} !== ${expectedLength}).`
       );
     }
-
-    const decodedImage = await decodeRasterImageToRgba(imageEncoding, bytes);
-    if (!decodedImage) {
-      throw new Error(
-        `Unable to decode raster image ${path}; the image is invalid or no compatible image decoder is available.`
-      );
-    }
-    return decodedImage;
+    return bytes;
   }
 
-  const expectedLength = widthHint * heightHint * 4;
-  if (bytes.byteLength !== expectedLength) {
+  const metadata = inspectRasterImage(imageEncoding, bytes);
+  if (!metadata || metadata.width !== width || metadata.height !== height) {
+    throw new Error(`Raster image ${path} header dimensions do not match its metadata.`);
+  }
+  const decodedImage = await decodeRasterImageToRgba(imageEncoding, bytes);
+  if (!decodedImage) {
     throw new Error(
-      `Raster layer data size does not match its metadata (${bytes.byteLength} !== ${expectedLength}).`
+      `Unable to decode raster image ${path}; the image is invalid or no compatible image decoder is available.`
     );
   }
-  return {
-    width: widthHint,
-    height: heightHint,
-    data: bytes
-  };
+  if (decodedImage.width !== width || decodedImage.height !== height ||
+      decodedImage.data.byteLength !== expectedLength) {
+    throw new Error(`Raster image ${path} dimensions do not match its metadata.`);
+  }
+  return decodedImage.data;
 }
 
 /**
- * Bound raster allocation using central-directory sizes before inflating or
- * decoding any entry. HEP files may come from untrusted drag-and-drop input.
+ * Bound raster allocation using index sizes before inflating or decoding any
+ * section. HEP files may come from untrusted drag-and-drop input. Decoded
+ * atlases and the layers cropped from them both count toward the texel budget.
  */
-function validateRasterLayerBudgets(
-  archive: HepArchive,
-  sceneRasterLayers: unknown[]
-): void {
-  if (sceneRasterLayers.length > MAX_PARSED_RASTER_LAYER_COUNT) {
-    throw new Error(
-      `Parsed data contains ${sceneRasterLayers.length} raster layers; ` +
-      `the limit is ${MAX_PARSED_RASTER_LAYER_COUNT}.`
-    );
-  }
-
+function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable): void {
+  let sectionCount = 0;
   let totalPayloadBytes = 0;
   let totalTexels = 0;
-  for (let i = 0; i < sceneRasterLayers.length; i += 1) {
-    const entry = sceneRasterLayers[i];
-    if (!entry || typeof entry !== "object") {
-      throw new Error(`Raster layer ${i} has invalid metadata.`);
+  const addTexels = (texels: number, label: string): void => {
+    if (texels > MAX_PARSED_RASTER_TEXELS_PER_LAYER) {
+      throw new Error(`${label} exceeds the per-image texel budget.`);
     }
-
-    const layerMeta = entry as ParsedDataRasterLayerEntry;
-    const width = readPositiveSafeMetadataInteger(layerMeta.width);
-    const height = readPositiveSafeMetadataInteger(layerMeta.height);
-    const path = readNonEmptyString(layerMeta.file);
-    const texels = width !== null && height !== null ? width * height : 0;
-    if (
-      width === null ||
-      height === null ||
-      width > MAX_PARSED_RASTER_DIMENSION ||
-      height > MAX_PARSED_RASTER_DIMENSION ||
-      !Number.isSafeInteger(texels) ||
-      texels > MAX_PARSED_RASTER_TEXELS_PER_LAYER ||
-      !path
-    ) {
-      throw new Error(`Raster layer ${i} has inconsistent v7 texture metadata.`);
-    }
-
+    totalTexels += texels;
+  };
+  const addSection = (path: string, texels: number, label: string): void => {
     const archiveEntry = archive.file(path);
     if (!archiveEntry) {
-      throw new Error(`HEP file is missing raster layer ${i}: ${path}.`);
+      throw new Error(`HEP file is missing ${label.toLowerCase()}: ${path}.`);
     }
     const byteLength = readHepEntryUncompressedSize(archiveEntry);
-    if (
-      byteLength === null ||
-      byteLength > MAX_PARSED_RASTER_PAYLOAD_BYTES
-    ) {
-      throw new Error(
-        `Raster layer ${i} HEP section size is invalid or exceeds the memory budget.`
-      );
+    if (byteLength === null || byteLength > MAX_PARSED_RASTER_PAYLOAD_BYTES) {
+      throw new Error(`${label} HEP section size is invalid or exceeds the memory budget.`);
     }
-
     if (rasterImageEncodingFromPath(path) === null && byteLength !== texels * 4) {
-      throw new Error(`Raster layer ${i} raw byte length does not match its metadata.`);
+      throw new Error(`${label} raw byte length does not match its metadata.`);
     }
-
+    sectionCount += 1;
     totalPayloadBytes += byteLength;
-    totalTexels += texels;
-    if (
-      totalPayloadBytes > MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES ||
-      totalTexels > MAX_PARSED_RASTER_TOTAL_TEXELS
-    ) {
-      throw new Error("Parsed data raster payloads exceed the aggregate memory budget.");
+  };
+  table.atlases.forEach((atlas, index) => {
+    const texels = atlas.width * atlas.height;
+    addTexels(texels, `Raster atlas ${index}`);
+    addSection(rasterAtlasFile(index, atlas.encoding), texels, `Raster atlas ${index}`);
+  });
+  table.layers.forEach((layer, index) => {
+    const texels = layer.width * layer.height;
+    addTexels(texels, `Raster layer ${index}`);
+    if (layer.storage !== "atlas") {
+      addSection(rasterLayerFile(index, layer.storage), texels, `Raster layer ${index}`);
     }
+  });
+  if (sectionCount > MAX_PARSED_RASTER_SECTION_COUNT) {
+    throw new Error(
+      `Parsed data contains ${sectionCount} raster sections; the limit is ${MAX_PARSED_RASTER_SECTION_COUNT}.`
+    );
   }
-}
-
-function readPositiveSafeMetadataInteger(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
-    ? value
-    : null;
+  if (totalPayloadBytes > MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES || totalTexels > MAX_PARSED_RASTER_TOTAL_TEXELS) {
+    throw new Error("Parsed data raster payloads exceed the aggregate memory budget.");
+  }
 }
 
 function computeMaxHalfWidth(styles: Float32Array, segmentCount: number): number {
@@ -2731,14 +2804,6 @@ function readHepEntryUncompressedSize(entry: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
-}
-
-function readNonEmptyString(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
 }
 
 function createTextureExportEntry(
@@ -2847,18 +2912,6 @@ function packTextureForZip(
     };
   }
 
-  if (usesRangeQuantizedUint16(name)) {
-    const packed = encodeUint16NormalizedRange(source);
-    return {
-      data: packed.data,
-      componentType: "uint16-normalized-range",
-      layout: "interleaved",
-      suffix: ".q16",
-      quantizationMin: Array.from(packed.min),
-      quantizationMax: Array.from(packed.max)
-    };
-  }
-
   const bytes = textureLayout === "channel-major"
     ? encodeChannelMajorFloat32(source)
     : new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice();
@@ -2868,11 +2921,6 @@ function packTextureForZip(
     layout: textureLayout,
     suffix: textureLayout === "channel-major" ? ".f32cm" : ".f32"
   };
-}
-
-function usesRangeQuantizedUint16(name: string): boolean {
-  return name === "text-glyph-primitives-a"
-    || name === "text-glyph-primitives-b";
 }
 
 function encodeNormalizedUint8(source: Float32Array): Uint8Array {
@@ -2979,9 +3027,6 @@ function readTexturePayloadAsFloat32(
   if (componentType === "uint8-normalized") {
     return decodeNormalizedUint8(new Uint8Array(fileBuffer));
   }
-  if (componentType === "uint16-normalized-range") {
-    return decodeUint16NormalizedRange(new Uint8Array(fileBuffer), entry, textureName);
-  }
   if (componentType === "uint16-range-delta-columns") {
     return decodeUint16RangeDeltaColumns(new Uint8Array(fileBuffer), entry, textureName);
   }
@@ -3027,27 +3072,6 @@ function decodeNormalizedUint8(bytes: Uint8Array): Float32Array {
   for (let i = 0; i < bytes.length; i += 1) {
     out[i] = bytes[i] / 255;
   }
-  return out;
-}
-
-function decodeUint16NormalizedRange(
-  bytes: Uint8Array,
-  entry: ParsedDataTextureEntry,
-  textureName: string
-): Float32Array {
-  if (bytes.byteLength % 2 !== 0) {
-    throw new Error(`Texture ${textureName} has invalid uint16 byte length (${bytes.byteLength}).`);
-  }
-  const min = readQuantizationVector(entry.quantizationMin, textureName, "quantizationMin");
-  const max = readQuantizationVector(entry.quantizationMax, textureName, "quantizationMax");
-  const quantized = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-  const out = new Float32Array(quantized.length);
-
-  for (let i = 0; i < quantized.length; i += 1) {
-    const channel = i & 3;
-    out[i] = decodeRangeUint16(quantized[i], min[channel], max[channel]);
-  }
-
   return out;
 }
 

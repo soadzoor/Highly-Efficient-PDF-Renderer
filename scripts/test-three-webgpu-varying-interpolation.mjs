@@ -53,7 +53,7 @@ try {
     ["stroke", createThreeWebGpuStrokeMaterial({ ...common, ...strokeTextures }),
       quadGeometry("aSegmentIndex"), { flat: 4, interpolated: 1 }],
     ["fill", createThreeWebGpuFillMaterial({ ...common, ...fillTextures }),
-      quadGeometry("aFillPathIndex"), { flat: 3, interpolated: 1 }],
+      quadGeometry("aFillPathIndex"), { flat: 4, interpolated: 1 }],
     ["text", createThreeWebGpuTextMaterial({
       ...common,
       textInstanceTextureA: dataTexture(), textInstanceTextureB: dataTexture(), textInstanceTextureC: dataTexture(),
@@ -64,17 +64,27 @@ try {
       strokeCurveEnabled: true, textVectorOnly: false
     }), quadGeometry("aTextInstanceIndex"), { flat: 6, interpolated: 1 }],
     ["gradient fill", createThreeWebGpuGradientFillMaterial({ ...gradient, ...fillTextures, mesh: false }),
-      quadGeometry("aFillPathIndex"), { flat: 3, interpolated: 1 }],
+      quadGeometry("aFillPathIndex"), { flat: 4, interpolated: 1 }],
     ["gradient stroke", createThreeWebGpuGradientStrokeMaterial({ ...gradient, ...strokeTextures }),
       quadGeometry("aSegmentIndex"), { flat: 4, interpolated: 1 }],
     // Patch meshes carry one path index for the whole geometry, so the path
     // metadata is still per-primitive; only the Gouraud colors interpolate.
     ["gradient patch mesh", createThreeWebGpuGradientFillMaterial({ ...gradient, ...fillTextures, mesh: true }),
-      meshGeometry(), { flat: 3, interpolated: 2 }]
+      meshGeometry(), { flat: 4, interpolated: 2 }]
   ];
 
   for (const [name, state, geometry, expected] of cases) {
-    const vertex = build(state.material, geometry).vertexShader;
+    const shaders = build(state.material, geometry);
+    const vertex = shaders.vertexShader;
+    if (name.includes("fill") || name === "gradient patch mesh") {
+      assert.match(vertex, /heprFillBandInfo/, `${name}: vertex loads per-path band metadata`);
+      assert.match(shaders.fragmentShader, /heprBandRows\(bandInfo, band, bandCount, box\)/, `${name}: each band integrates only its own rows`);
+      assert.match(shaders.fragmentShader, /packedIndex & 3/, `${name}: packed segment addressing is shared`);
+    }
+    if (name === "text") {
+      assert.doesNotMatch(shaders.fragmentShader, /i < 2048/, "outlined glyphs have no fixed 2048-edge ceiling");
+      assert.match(shaders.fragmentShader, /i < segmentCount/, "text traverses every outline edge");
+    }
     const struct = vertex.match(/struct VaryingsStruct \{[\s\S]*?\n\};/);
     assert(struct, `${name} declares a varyings struct`);
     const locations = struct[0].split("\n").filter(line => line.includes("@location("));

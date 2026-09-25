@@ -1,3 +1,6 @@
+import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
+import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import * as THREE from "three";
@@ -49,6 +52,8 @@ export interface ThreeWebGpuGradientFillMaterialOptions extends CommonMaterialOp
   fillSegmentTextureB: THREE.DataTexture;
   fillPathTextureWidth: number;
   fillSegmentTextureWidth: number;
+  fillBandBase?: number;
+  fillBandEntries?: number;
 }
 
 export interface ThreeWebGpuGradientStrokeMaterialOptions extends CommonMaterialOptions {
@@ -91,6 +96,8 @@ function varyingNode(node: unknown, flat = false): never {
     { setInterpolation(type: string): unknown })(node);
   return (flat ? varying.setInterpolation("flat") : varying) as never;
 }
+
+const fillBandInfoFn = TSL.wgslFn(VECTOR_FILL_BAND_INFO_WGSL);
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprGradientCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
@@ -157,13 +164,20 @@ fn heprSamplePdfGradient(
 }
 `, [includeNode(gradientParameterFn), includeNode(gradientBackgroundFn)]);
 
+const fillCoverageFn = TSL.wgslFn(FILL_COVERAGE_WGSL);
+const fillCoverageVertexFn = TSL.wgslFn(FILL_COVERAGE_VERTEX_WGSL);
+
 const fillVertexPackFn = TSL.wgslFn(`
 fn heprGradientFillVertexPack(
   corner: vec2<f32>,
   metaA: vec4<f32>,
   metaB: vec4<f32>,
   metaC: vec4<f32>,
-  shapeOnly: f32
+  shapeOnly: f32,
+  viewport: vec2<f32>,
+  zoom: f32,
+  useLocalToClip: f32,
+  localToClip: mat4x4<f32>
 ) -> vec4<f32> {
   let segmentCount = i32(metaA.y + 0.5);
   let alpha = metaC.w;
@@ -171,10 +185,13 @@ fn heprGradientFillVertexPack(
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
   let corner01 = corner * 0.5 + vec2<f32>(0.5);
-  let world = metaA.zw + (metaB.xy - metaA.zw) * corner01;
+  // Reach pixels whose footprint touches a path narrower than a pixel.
+  let margin = heprCoverageMargin(heprPathToPixel(metaA.zw + (metaB.xy - metaA.zw) * corner01,
+    useLocalToClip, localToClip, zoom, max(viewport, vec2<f32>(1.0))));
+  let world = metaA.zw - margin + (metaB.xy - metaA.zw + 2.0 * margin) * corner01;
   return vec4<f32>(world, 1.0, 0.0);
 }
-`);
+`, [includeNode(fillCoverageVertexFn)]);
 
 const clipPositionFn = TSL.wgslFn(`
 fn heprGradientClipPosition(
@@ -222,39 +239,12 @@ fn heprGradientStrokeClipPosition(
 }
 `);
 
+const strokeCoverageFn = TSL.wgslFn(STROKE_COVERAGE_WGSL);
 const distanceToLineSegmentFn = TSL.wgslFn(CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE);
 const distanceToQuadraticBezierFn = TSL.wgslFn(
   CORE_WGSL_DISTANCE_TO_QUADRATIC_BEZIER_SOURCE,
   [includeNode(distanceToLineSegmentFn)]
 );
-
-const lineCrossingFn = TSL.wgslFn(`
-fn heprGradientLineCrossing(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> vec2<i32> {
-  let upward = (a.y <= p.y) && (b.y > p.y);
-  let downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) { return vec2<i32>(0); }
-  let denom = b.y - a.y;
-  if (abs(denom) <= 0.000001) { return vec2<i32>(0); }
-  let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross <= p.x) { return vec2<i32>(0); }
-  return vec2<i32>(select(-1, 1, upward), 1);
-}
-`);
-
-const quadraticCrossingFn = TSL.wgslFn(`
-fn heprGradientQuadraticCrossing(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>) -> vec2<i32> {
-  var result = vec2<i32>(0);
-  var previous = a;
-  for (var i = 1; i <= 6; i = i + 1) {
-    let t = f32(i) / 6.0;
-    let mt = 1.0 - t;
-    let next = mt * mt * a + 2.0 * mt * t * b + t * t * c;
-    result = result + heprGradientLineCrossing(previous, next, p);
-    previous = next;
-  }
-  return result;
-}
-`, [includeNode(lineCrossingFn)]);
 
 const fillFragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprGradientFillFragment(
@@ -265,6 +255,8 @@ fn heprGradientFillFragment(
   segmentTexA: texture_2d<f32>,
   segmentTexB: texture_2d<f32>,
   segmentTexWidth: f32,
+  bands: vec4<f32>,
+  bandEntries: f32,
   gradientMetaA: texture_2d<f32>,
   gradientMetaB: texture_2d<f32>,
   gradientMetaC: texture_2d<f32>,
@@ -283,41 +275,34 @@ fn heprGradientFillFragment(
 ) -> vec4<f32> {
   // WGSL derivatives must execute before any divergent branch, loop exit, or
   // discard. Flat-interpolated paint metadata is not statically uniform.
-  let pixelToLocalX = length(vec2<f32>(dpdx(local.x), dpdy(local.x)));
-  let pixelToLocalY = length(vec2<f32>(dpdx(local.y), dpdy(local.y)));
+  let footprint = max(vec2<f32>(
+    length(vec2<f32>(dpdx(local.x), dpdy(local.x))),
+    length(vec2<f32>(dpdx(local.y), dpdy(local.y)))
+  ) * fillAAScreenPx, vec2<f32>(0.0001));
   let segmentStart = i32(metaA.x + 0.5);
   let segmentCount = i32(metaA.y + 0.5);
   if (segmentCount <= 0 || (metaC.w <= 0.001 && shapeOnly < 0.5)) { discard; }
-  var minDistance = 100000000000000000000.0;
-  var winding = 0;
-  var crossings = 0;
+  // Average the winding number over the footprint box. The bands spanning its
+  // rows hold every segment that can contribute; each integrates its own rows.
+  let box = vec4<f32>(local - 0.5 * footprint, 1.0 / footprint);
+  var winding = 0.0;
   let safeWidth = max(i32(segmentTexWidth), 1);
-  for (var i = 0; i < segmentCount; i = i + 1) {
-    if (i >= segmentCount) { break; }
-    let index = segmentStart + i;
-    let coord = vec2<i32>(index % safeWidth, index / safeWidth);
+${vectorFillBandLoopWgsl({
+    bands: "bands",
+    y: "local.y",
+    radius: "0.5 * footprint.y",
+    count: "segmentCount",
+    start: "segmentStart",
+    texture: "segmentTexA",
+    entries: "bandEntries",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
+    edge: `    let coord = vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
     let primitiveA = textureLoad(segmentTexA, coord, 0);
     let primitiveB = textureLoad(segmentTexB, coord, 0);
-    var crossing = vec2<i32>(0);
-    if (primitiveB.z >= 1.0) {
-      minDistance = min(minDistance, heprDistanceToQuadraticBezier(local, primitiveA.xy, primitiveA.zw, primitiveB.xy));
-      crossing = heprGradientQuadraticCrossing(primitiveA.xy, primitiveA.zw, primitiveB.xy, local);
-    } else {
-      minDistance = min(minDistance, heprDistanceToLineSegment(local, primitiveA.xy, primitiveB.xy));
-      crossing = heprGradientLineCrossing(primitiveA.xy, primitiveB.xy, local);
-    }
-    winding = winding + crossing.x;
-    crossings = crossings + crossing.y;
-  }
-  let inside = select(winding != 0, (crossings % 2) == 1, metaC.x >= 0.5);
-  var coverage: f32;
-  if (metaC.y >= 0.5) {
-    coverage = select(0.0, 1.0, inside);
-  } else {
-    let signedDistance = select(minDistance, -minDistance, inside);
-    let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * fillAAScreenPx, 0.0001);
-    coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
-  }
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= 1.0, box, rows.x, rows.y);`
+  })}
+  let coverage = heprFillCoverage(winding, metaC.x >= 0.5);
 
   let sampledSource = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let source = select(sampledSource, meshColor * sampledSource.a, useMesh > 0.5);
@@ -333,10 +318,7 @@ fn heprGradientFillFragment(
 }
 `, [
   includeNode(gradientSampleFn),
-  includeNode(distanceToLineSegmentFn),
-  includeNode(distanceToQuadraticBezierFn),
-  includeNode(lineCrossingFn),
-  includeNode(quadraticCrossingFn)
+  includeNode(fillCoverageFn)
 ]);
 
 const strokeQuadWorldPositionFn = TSL.wgslFn(CORE_WGSL_STROKE_QUAD_WORLD_POSITION_SOURCE);
@@ -354,7 +336,7 @@ fn heprGradientStrokeWorldPack(
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let isRoundCap = heprGradientFloatMod(floor(styleFlags * 0.5), 2.0) >= 0.5;
   let geometryLength = select(length(primitiveB.xy - primitiveA.xy), length(primitiveA.zw - primitiveA.xy) + length(primitiveB.xy - primitiveA.zw), isQuadratic);
-  if ((geometryLength < 0.00001 && !isRoundCap) || (alpha <= 0.001 && shapeOnly < 0.5)) {
+  if ((geometryLength == 0.0 && !isRoundCap) || (alpha <= 0.001 && shapeOnly < 0.5)) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
   let localUnitsPerPixel = select(1.0 / max(zoom, 0.0001), max(localUnitsPerPixelInput, 0.000001), useLocalToClip >= 0.5);
@@ -394,7 +376,7 @@ fn heprGradientStrokeFragment(
   let isHairline = heprGradientFloatMod(styleFlags, 2.0) >= 0.5;
   let halfWidth = select(halfWidthFromVertex, max(0.5 * localPerPixel, 0.00001), isHairline);
   let aaWorld = max(localPerPixel * aaScreenPx, 0.00005);
-  let coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
+  let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
   let source = heprSamplePdfGradient(local, sourceGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let mask = heprSamplePdfGradient(local, maskGradientIndex, gradientMetaA, gradientMetaB, gradientMetaC, gradientMetaD, gradientMetaE, gradientLut, gradientMetaWidth);
   let sourceColor = select(style.yzw, source.rgb, sourceGradientIndex >= -0.5);
@@ -407,6 +389,7 @@ fn heprGradientStrokeFragment(
 }
 `, [
   includeNode(floatModFn),
+  includeNode(strokeCoverageFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn),
   includeNode(gradientSampleFn)
@@ -428,30 +411,38 @@ export function createThreeWebGpuGradientFillMaterial(
   const metaA = varyingNode(TSL.textureLoad(options.fillPathMetaTextureA, pathCoord, 0), true);
   const metaB = varyingNode(TSL.textureLoad(options.fillPathMetaTextureB, pathCoord, 0), true);
   const metaC = varyingNode(TSL.textureLoad(options.fillPathMetaTextureC, pathCoord, 0), true);
+  const bands = varyingNode(callNode(fillBandInfoFn, {
+    pathIndex: pathIndex, base: TSL.uniform(options.fillBandBase ?? -1),
+    segments: TSL.textureLoad(options.fillSegmentTextureA)
+  }), true);
+  const viewportUniform = TSL.uniform(options.viewport);
+  const localToClipUniform = TSL.uniform(options.localToClip);
   const vertexPack = varyingNode(options.mesh ? TSL.vec4(TSL.attribute("aMeshPosition", "vec2") as never, 1, 0) : callNode(fillVertexPackFn, {
-    corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC, shapeOnly
+    corner: TSL.attribute("aCorner", "vec2"), metaA, metaB, metaC, shapeOnly,
+    viewport: viewportUniform, zoom: zoomUniform, useLocalToClip: useLocalToClipUniform, localToClip: localToClipUniform
   }));
   const vertexValue = vertexPack as { xy: unknown };
   material.vertexNode = callNode(clipPositionFn, {
     vertexPack,
-    viewport: TSL.uniform(options.viewport),
+    viewport: viewportUniform,
     cameraCenter: TSL.uniform(options.cameraCenter),
     zoom: zoomUniform,
     useLocalToClip: useLocalToClipUniform,
-    localToClip: TSL.uniform(options.localToClip)
+    localToClip: localToClipUniform
   });
   material.fragmentNode = callNode(fillFragmentFns[options.colorCompositing], {
     local: vertexValue.xy, metaA, metaB, metaC,
     segmentTexA: TSL.textureLoad(options.fillSegmentTextureA),
     segmentTexB: TSL.textureLoad(options.fillSegmentTextureB),
     segmentTexWidth: segmentWidth,
+    bands, bandEntries: TSL.uniform(options.fillBandEntries ?? 0),
     ...createGradientNodes(options, gradientWidth),
     fillAAScreenPx: TSL.uniform(1),
     meshColor: options.mesh ? varyingNode(TSL.attribute("aMeshColor", "vec4")) : TSL.vec4(0),
     useMesh: TSL.uniform(options.mesh ? 1 : 0), shapeOnly,
     vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor)
   });
-  registerThreeNodeClipPosition(material, vertexValue.xy);
+  registerThreeNodeClipPosition(material, vertexValue.xy, true);
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,
@@ -495,7 +486,7 @@ export function createThreeWebGpuGradientStrokeMaterial(
     aaScreenPx: TSL.uniform(1), vectorOverride: TSL.uniform(options.vectorOverride), primitiveColor: TSL.uniform(options.primitiveColor),
     ...createGradientNodes(options, gradientWidth)
   });
-  registerThreeNodeClipPosition(material, worldValue.xy);
+  registerThreeNodeClipPosition(material, worldValue.xy, true);
   return {
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,

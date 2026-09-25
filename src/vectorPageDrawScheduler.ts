@@ -11,10 +11,24 @@ const PAINT_CHECKS_PER_RUN = 128;
 const FULL_SCHEDULE_MIN_RUNS = 1024;
 // Large visibility changes should regroup draws instead of retaining a sparse schedule.
 const MIN_CACHED_PAINT_FRACTION = 0.875;
+// Coverage margins are a screen-space quantity, so minifying grows them without
+// bound in page units. Once the largest page is shorter than this on screen,
+// every paint's margin spans a noticeable share of it, the dependency graph
+// saturates, and the schedule degenerates to one draw per source paint for a
+// thumbnail-sized image. Holding the margin where it stands at this size keeps
+// the test discriminating: it stays exact above it, and below it only lets
+// paints commute that are within a fraction of a pixel of each other anyway.
+const MIN_RESOLVED_PAGE_PIXELS = 256;
+// Holding the margin trades exact order between those neighbours for draw
+// calls, which only pays on a page carrying far more paints than a minified
+// view can resolve. Smaller scenes are already cheap to draw in source order.
+const MIN_CLAMPED_PAINTS = 1024;
 
 /** Interleave independent paint streams; overlapping streams retain source order. */
 export class VectorPageDrawScheduler {
   independentGroups = 1;
+  /** True while minification holds the coverage margin at its page-relative bound. */
+  paintOrderApproximated = false;
   private readonly bounds: VectorDrawRunCuller;
   private readonly pageForRun: Uint16Array;
   private readonly kindForRun: Uint8Array;
@@ -33,23 +47,34 @@ export class VectorPageDrawScheduler {
   private readonly selectedPaints: Uint8Array;
   private readonly allPaints: readonly number[] | null;
   private readonly filtered: number[] = [];
+  private readonly segmentRuns: number[] = [];
+  private readonly segments: Uint32Array | null;
+  private readonly paddingLimit: number;
   private previousPaintCount = -1;
   private scheduleDirty = true;
   private padding = NaN;
   private enabled = false;
   private colorCommutationEnabled = true;
 
-  static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
+  /**
+   * `segments` restricts reordering to paints that share a compositor span; see
+   * scenePaintSpanSegments. Omitting it schedules the page as one span, which
+   * is what a document without transparency groups already is.
+   */
+  static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array,
+    segments: Uint32Array | null = null): VectorPageDrawScheduler | null {
     const pages = scene.pageRects.length / 4;
     // Bound setup work for arbitrary public scenes, including invalid layouts.
     if (!scene.drawRuns || pages < 1 || pages > 512 || !Number.isInteger(pages) ||
         !scene.pageRects.every(Number.isFinite)) return null;
-    return new VectorPageDrawScheduler(scene, strokes, sourceRuns);
+    if (segments && segments.length !== scene.drawRuns.length) return null;
+    return new VectorPageDrawScheduler(scene, strokes, sourceRuns, segments);
   }
 
-  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array) {
+  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array, segments: Uint32Array | null) {
     const runs = scene.drawRuns!;
     const pages = scene.pageRects.length / 4;
+    this.segments = segments;
     this.bounds = new VectorDrawRunCuller(scene, { scene: strokes, sourceRuns });
     this.pageForRun = new Uint16Array(runs.length);
     this.kindForRun = new Uint8Array(runs.length);
@@ -64,6 +89,15 @@ export class VectorPageDrawScheduler {
     this.selectedPaints = new Uint8Array(runs.length);
     this.allPaints = runs.length >= FULL_SCHEDULE_MIN_RUNS
       ? Array.from({ length: runs.length }, (_, index) => index) : null;
+    let longestPage = 0;
+    for (let page = 0; page < pages; page++) {
+      const offset = page * 4, rect = scene.pageRects;
+      longestPage = Math.max(longestPage, rect[offset + 2] - rect[offset], rect[offset + 3] - rect[offset + 1]);
+    }
+    // Margins below are four pixels wide, so this is the one the largest page
+    // reaches at MIN_RESOLVED_PAGE_PIXELS. A degenerate rect keeps exact margins.
+    this.paddingLimit = longestPage > 0 && runs.length >= MIN_CLAMPED_PAINTS
+      ? 4 * longestPage / MIN_RESOLVED_PAGE_PIXELS : Infinity;
     const box = [0, 0, 0, 0];
     runs.forEach((run, index) => {
       this.kindForRun[index] = kinds.indexOf(run.kind);
@@ -96,12 +130,18 @@ export class VectorPageDrawScheduler {
       const changed = this.enabled;
       this.enabled = false;
       this.independentGroups = 1;
+      this.paintOrderApproximated = false;
       return changed;
     }
     // A power-of-two upper bound avoids rebuilding the dependency partition
     // on every animated zoom step. Keep four pixels for the fallback kinds;
     // ordinary vector paints use their shader-specific coverage bounds below.
-    const padding = Math.max(0.001, 4 * 2 ** Math.ceil(Math.log2(Math.max(1e-6, unitsPerPixel))));
+    const pixelPadding = Math.max(0.001, 4 * 2 ** Math.ceil(Math.log2(Math.max(1e-6, unitsPerPixel))));
+    // Minification past a thumbnail otherwise fences every paint against every
+    // other one, which costs a draw call per source paint and buys ordering
+    // the page no longer has the pixels to show.
+    const padding = Math.min(pixelPadding, this.paddingLimit);
+    this.paintOrderApproximated = padding < pixelPadding;
     if (this.enabled && padding === this.padding) return false;
     this.enabled = true;
     this.padding = padding;
@@ -200,7 +240,25 @@ export class VectorPageDrawScheduler {
   }
 
   private schedulePaints(runs: readonly number[]): readonly number[] {
-    if (this.independentGroups <= 1) return this.compact(runs);
+    this.compacted.length = 0;
+    if (!this.segments) { this.appendSchedule(runs); return this.compacted; }
+    // Paints in different spans have a composite between them, so only paints
+    // sharing one may be reordered. Segment ids rise along the graph, so equal
+    // ids are already adjacent in this source-ordered list.
+    for (let first = 0; first < runs.length;) {
+      const segment = this.segments[runs[first]];
+      this.segmentRuns.length = 0;
+      while (first < runs.length && this.segments[runs[first]] === segment) this.segmentRuns.push(runs[first++]);
+      this.appendSchedule(this.segmentRuns);
+    }
+    return this.compacted;
+  }
+
+  private appendSchedule(runs: readonly number[]): void {
+    this.appendCompacted(this.independentGroups <= 1 ? runs : this.interleave(runs));
+  }
+
+  private interleave(runs: readonly number[]): readonly number[] {
     this.heads.fill(-1); this.tails.fill(-1); this.ordered.length = 0;
     for (const run of runs) {
       const group = this.components[this.pageForRun[run]];
@@ -223,13 +281,12 @@ export class VectorPageDrawScheduler {
         this.heads[group] = head;
       }
     }
-    return this.compact(this.ordered);
+    return this.ordered;
   }
 
   /** Disjoint paints and equal-RGB Normal paints commute under source-over. */
-  private compact(runs: readonly number[]): readonly number[] {
+  private appendCompacted(runs: readonly number[]): void {
     if (this.colorCommutationEnabled) runs = this.groupUniformColors(runs);
-    this.compacted.length = 0;
     for (let index = 0; index < runs.length; index++) this.next[runs[index]] = runs[index + 1] ?? -1;
     let head = runs[0] ?? -1;
     // Bound rebuild work when a document has many mutually overlapping paints.
@@ -260,7 +317,6 @@ export class VectorPageDrawScheduler {
         cursor = following;
       }
     }
-    return this.compacted;
   }
 
   /** Long monochrome drawing spans need linear grouping, not bounded swaps. */

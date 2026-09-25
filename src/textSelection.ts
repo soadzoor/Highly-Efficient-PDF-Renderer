@@ -142,38 +142,34 @@ interface PageTextLayout {
 interface CharHit {
   pageIndex: number;
   charIndex: number;
+  /** Index into the page layout's `lines`. */
+  line: number;
 }
 
 type SelectionGestureState = "idle" | "mouseSelecting" | "touchPending" | "touchSelecting" | "handleDragging";
 
 /**
- * Index of the line whose char range holds `offset`; offsets falling in the
- * separator gap between two runs resolve to the nearer one. Lines are char-
- * contiguous and ordered by startChar, so this is a binary search.
+ * Caret bound to the line run it was placed on. The text index may have no
+ * separator between two runs (e.g. a title-block field repositioned with Tm
+ * right before the next field), so one offset can both end a run and start
+ * the next one; only the run tells which side of that boundary is meant.
  */
-function lineIndexForOffset(layout: PageTextLayout, offset: number): number {
-  const lines = layout.lines;
-  if (lines.length === 0) {
-    return -1;
-  }
-  let low = 0;
-  let high = lines.length - 1;
-  while (low < high) {
-    const mid = (low + high + 1) >> 1;
-    if (lines[mid].startChar <= offset) {
-      low = mid;
-    } else {
-      high = mid - 1;
-    }
-  }
-  if (offset > lines[low].endChar && low + 1 < lines.length) {
-    const distanceToPrevious = offset - lines[low].endChar;
-    const distanceToNext = lines[low + 1].startChar - offset;
-    if (distanceToNext < distanceToPrevious) {
-      return low + 1;
-    }
-  }
-  return low;
+interface LineCaret extends TextSelectionCaret {
+  /** Index into the page layout's `lines`. */
+  line: number;
+}
+
+interface LineSelectionRange {
+  start: LineCaret;
+  end: LineCaret;
+}
+
+/** Public carets are plain offsets; the line binding stays internal. */
+function toPublicRange(range: LineSelectionRange): TextSelectionRange {
+  return {
+    start: { pageIndex: range.start.pageIndex, offset: range.start.offset },
+    end: { pageIndex: range.end.pageIndex, offset: range.end.offset }
+  };
 }
 
 /**
@@ -332,10 +328,10 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   const pageLayouts = new Map<number, PageTextLayout>();
 
   /** Selection model: normalized range plus the raw anchor for drag direction. */
-  let selectionRange: TextSelectionRange | null = null;
-  let anchorCaret: TextSelectionCaret | null = null;
+  let selectionRange: LineSelectionRange | null = null;
+  let anchorCaret: LineCaret | null = null;
   /** Word range at the gesture origin for word-granularity extension. */
-  let wordAnchor: TextSelectionRange | null = null;
+  let wordAnchor: LineSelectionRange | null = null;
   let wordGranularity = false;
   let selectionRects: Float32Array | null = null;
   let selectionIsTouch = false;
@@ -469,7 +465,8 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       ) {
         continue;
       }
-      for (const line of layout.lines) {
+      for (let lineIndex = 0; lineIndex < layout.lines.length; lineIndex += 1) {
+        const line = layout.lines[lineIndex];
         const inflate = (line.maxY - line.minY) * LINE_HIT_INFLATE_FACTOR;
         if (
           sceneX < line.minX - inflate ||
@@ -481,7 +478,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         }
         const charIndex = nearestCharInLine(layout, line, sceneX);
         if (charIndex >= 0) {
-          return { pageIndex, charIndex };
+          return { pageIndex, charIndex, line: lineIndex };
         }
       }
     }
@@ -507,7 +504,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   }
 
   /** Clamped caret for drags: nearest page -> nearest line -> insertion offset by quad midpoints. */
-  function nearestCaret(sceneX: number, sceneY: number): TextSelectionCaret | null {
+  function nearestCaret(sceneX: number, sceneY: number): LineCaret | null {
     const scene = getSceneChecked();
     if (!scene?.textIndex) {
       return null;
@@ -563,10 +560,12 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     // different font sizes can overlap vertically; prefer the one under the
     // pointer rather than a distant field with a slightly closer center.
     let bestLine: PageLineRun | null = null;
+    let bestLineIndex = -1;
     let bestOutside = Number.POSITIVE_INFINITY;
     let bestCenter = Number.POSITIVE_INFINITY;
     let bestHorizontal = Number.POSITIVE_INFINITY;
-    for (const line of layout.lines) {
+    for (let lineIndex = 0; lineIndex < layout.lines.length; lineIndex += 1) {
+      const line = layout.lines[lineIndex];
       const outside = sceneY < line.minY ? line.minY - sceneY : sceneY > line.maxY ? sceneY - line.maxY : 0;
       if (outside > bestOutside) {
         continue;
@@ -582,6 +581,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         bestCenter = center;
         bestHorizontal = horizontal;
         bestLine = line;
+        bestLineIndex = lineIndex;
       }
     }
     if (!bestLine) {
@@ -613,7 +613,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       }
     }
 
-    return { pageIndex: bestPage, offset: snapCaretOutsideLigature(scenePage, offset) };
+    return { pageIndex: bestPage, offset: snapCaretOutsideLigature(scenePage, offset), line: bestLineIndex };
   }
 
   /**
@@ -639,14 +639,25 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     return offset - runStart <= runEnd - offset ? runStart : runEnd;
   }
 
-  function wordRangeAt(page: PageTextIndex, pageIndex: number, charIndex: number): TextSelectionRange {
+  /**
+   * Word around `charIndex`, confined to its line run: runs without a
+   * separator between them would otherwise merge into one cross-field word.
+   */
+  function wordRangeAt(
+    page: PageTextIndex,
+    layout: PageTextLayout,
+    pageIndex: number,
+    lineIndex: number,
+    charIndex: number
+  ): LineSelectionRange {
     const text = page.text;
-    let index = Math.max(0, Math.min(charIndex, text.length - 1));
+    const line = layout.lines[lineIndex];
+    let index = Math.max(line.startChar, Math.min(charIndex, line.endChar - 1));
     // A hit on a separator space picks the nearer neighboring char.
     if (text[index] === " ") {
-      if (index + 1 < text.length && text[index + 1] !== " ") {
+      if (index + 1 < line.endChar && text[index + 1] !== " ") {
         index += 1;
-      } else if (index > 0 && text[index - 1] !== " ") {
+      } else if (index > line.startChar && text[index - 1] !== " ") {
         index -= 1;
       }
     }
@@ -654,16 +665,16 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     const matches = (ch: string): boolean => ch !== " " && WORD_CHAR_RE.test(ch) === isWord;
 
     let start = index;
-    while (start > 0 && matches(text[start - 1])) {
+    while (start > line.startChar && matches(text[start - 1])) {
       start -= 1;
     }
     let end = index + 1;
-    while (end < text.length && matches(text[end])) {
+    while (end < line.endChar && matches(text[end])) {
       end += 1;
     }
     return {
-      start: { pageIndex, offset: snapCaretOutsideLigature(page, start) },
-      end: { pageIndex, offset: snapCaretOutsideLigature(page, end) }
+      start: { pageIndex, offset: snapCaretOutsideLigature(page, start), line: lineIndex },
+      end: { pageIndex, offset: snapCaretOutsideLigature(page, end), line: lineIndex }
     };
   }
 
@@ -673,22 +684,17 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
    * Char (stream) order alone is wrong here — browser-print PDFs emit the
    * page header/footer after the body, so a drag reaching the footer would
    * otherwise pull the header (which sits between them in char order) into
-   * the selection.
+   * the selection. Carets on different lines differ even at the same offset.
    */
-  function compareCaretsVisual(a: TextSelectionCaret, b: TextSelectionCaret): number {
+  function compareCaretsVisual(a: LineCaret, b: LineCaret): number {
     if (a.pageIndex !== b.pageIndex) {
       return a.pageIndex - b.pageIndex;
     }
-    if (a.offset === b.offset) {
-      return 0;
-    }
-    const scene = lastScene;
-    const layout = scene ? getPageLayout(scene, a.pageIndex) : null;
-    if (layout) {
-      const lineA = lineIndexForOffset(layout, a.offset);
-      const lineB = lineIndexForOffset(layout, b.offset);
-      if (lineA >= 0 && lineB >= 0 && lineA !== lineB) {
-        const rankDelta = layout.visualRank[lineA] - layout.visualRank[lineB];
+    if (a.line !== b.line) {
+      const scene = lastScene;
+      const layout = scene ? getPageLayout(scene, a.pageIndex) : null;
+      if (layout) {
+        const rankDelta = layout.visualRank[a.line] - layout.visualRank[b.line];
         if (rankDelta !== 0) {
           return rankDelta;
         }
@@ -704,7 +710,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
    */
   function forEachSelectedLineSpan(
     scene: VectorScene,
-    range: TextSelectionRange,
+    range: LineSelectionRange,
     visit: (pageIndex: number, layout: PageTextLayout, line: PageLineRun, from: number, to: number) => void
   ): void {
     for (let pageIndex = range.start.pageIndex; pageIndex <= range.end.pageIndex; pageIndex += 1) {
@@ -714,11 +720,11 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       }
       const startRank =
         pageIndex === range.start.pageIndex
-          ? layout.visualRank[lineIndexForOffset(layout, range.start.offset)]
+          ? layout.visualRank[range.start.line]
           : 0;
       const endRank =
         pageIndex === range.end.pageIndex
-          ? layout.visualRank[lineIndexForOffset(layout, range.end.offset)]
+          ? layout.visualRank[range.end.line]
           : layout.lines.length - 1;
       for (let rank = startRank; rank <= endRank; rank += 1) {
         const line = layout.lines[layout.visualOrder[rank]];
@@ -737,7 +743,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     }
   }
 
-  function buildSelectionRects(scene: VectorScene, range: TextSelectionRange): Float32Array {
+  function buildSelectionRects(scene: VectorScene, range: LineSelectionRange): Float32Array {
     const rects: number[] = [];
     forEachSelectedLineSpan(scene, range, (_pageIndex, layout, _line, from, to) => {
       let minX = Number.POSITIVE_INFINITY;
@@ -768,7 +774,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     return new Float32Array(rects);
   }
 
-  function selectedTextFor(scene: VectorScene, range: TextSelectionRange): string {
+  function selectedTextFor(scene: VectorScene, range: LineSelectionRange): string {
     const pageParts = new Map<number, string[]>();
     forEachSelectedLineSpan(scene, range, (pageIndex, _layout, _line, from, to) => {
       const page = scene.textIndex?.pages[pageIndex];
@@ -789,7 +795,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     return Array.from(pageParts.values(), (parts) => parts.join(" ")).join("\n");
   }
 
-  function setSelection(range: TextSelectionRange | null): void {
+  function setSelection(range: LineSelectionRange | null): void {
     const scene = lastScene;
     if (!range || !scene || compareCaretsVisual(range.start, range.end) >= 0) {
       const hadSelection = selectionRange !== null;
@@ -804,7 +810,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     selectionRange = range;
     selectionRects = buildSelectionRects(scene, range);
     adapter.setSelectionHighlights(selectionRects.length > 0 ? selectionRects : null);
-    options.onSelectionChange?.(range, selectedTextFor(scene, range));
+    options.onSelectionChange?.(toPublicRange(range), selectedTextFor(scene, range));
   }
 
   function resetSelection(notify: boolean): void {
@@ -874,12 +880,12 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     document.getSelection()?.removeAllRanges();
   }
 
-  function extendSelectionTo(caret: TextSelectionCaret): void {
+  function extendSelectionTo(caret: LineCaret): void {
     if (wordGranularity && wordAnchor && lastScene?.textIndex) {
       const page = lastScene.textIndex.pages[caret.pageIndex];
-      if (page) {
-        const focusIndex = Math.max(0, Math.min(caret.offset, page.charInstance.length - 1));
-        const focusWord = wordRangeAt(page, caret.pageIndex, focusIndex);
+      const layout = getPageLayout(lastScene, caret.pageIndex);
+      if (page && layout) {
+        const focusWord = wordRangeAt(page, layout, caret.pageIndex, caret.line, caret.offset);
         const start = compareCaretsVisual(focusWord.start, wordAnchor.start) < 0 ? focusWord.start : wordAnchor.start;
         const end = compareCaretsVisual(focusWord.end, wordAnchor.end) > 0 ? focusWord.end : wordAnchor.end;
         setSelection({ start, end });
@@ -899,10 +905,11 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   function selectWordAt(hit: CharHit): boolean {
     const scene = lastScene;
     const page = scene?.textIndex?.pages[hit.pageIndex];
-    if (!page) {
+    const layout = scene ? getPageLayout(scene, hit.pageIndex) : null;
+    if (!page || !layout) {
       return false;
     }
-    const range = wordRangeAt(page, hit.pageIndex, hit.charIndex);
+    const range = wordRangeAt(page, layout, hit.pageIndex, hit.line, hit.charIndex);
     wordAnchor = range;
     wordGranularity = true;
     anchorCaret = range.start;
@@ -1324,7 +1331,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     },
 
     getSelectionRange(): TextSelectionRange | null {
-      return selectionRange;
+      return selectionRange ? toPublicRange(selectionRange) : null;
     },
 
     getSelectedText(): string {

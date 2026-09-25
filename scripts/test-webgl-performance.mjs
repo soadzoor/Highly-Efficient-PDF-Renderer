@@ -58,8 +58,8 @@ try {
   assert.equal(report.counters.drawBatches.average, 3);
   assert.equal(report.frameRecords.length, 2);
   assert.deepEqual(report.frameRecords.map(frame => frame.context), [
-    { cameraCenterX: 50, cameraCenterY: 50, zoom: 1, viewportWidth: 100, viewportHeight: 100, unitsPerPixel: 1 },
-    { cameraCenterX: 55, cameraCenterY: 50, zoom: 2, viewportWidth: 100, viewportHeight: 100, unitsPerPixel: 0.5 }
+    { cameraCenterX: 50, cameraCenterY: 50, zoom: 1, viewportWidth: 100, viewportHeight: 100, unitsPerPixel: 1, frameGapMs: null },
+    { cameraCenterX: 55, cameraCenterY: 50, zoom: 2, viewportWidth: 100, viewportHeight: 100, unitsPerPixel: 0.5, frameGapMs: 16 }
   ], "correlated frame details use the current camera rather than the capture's starting view");
   assert.deepEqual(report.frameRecords.map(frame => frame.counters.batchRebuilds), [1, 0]);
   assert.deepEqual(report.frameRecords.map(frame => frame.counters.drawBatches), [3, 3]);

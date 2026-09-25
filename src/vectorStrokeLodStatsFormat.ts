@@ -1,4 +1,4 @@
-import type { VectorStrokeLodStats } from "./vectorStrokeLodCore";
+import { VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS, type VectorStrokeLodStats } from "./vectorStrokeLodCore";
 
 export function formatVectorStrokeLodStats(stats: VectorStrokeLodStats | null): string {
   if (!stats || stats.totalLevels <= 1) {
@@ -12,9 +12,9 @@ export function formatVectorStrokeLodStats(stats: VectorStrokeLodStats | null): 
     : "none";
 
   return (
-    `lod ${formatCompactCount(stats.renderedSegments)} seg | ` +
+    `lod ${formatCompactCount(stats.renderedSegments)} seg${stats.activeLevels.some(level => level.overview) ? " (overview)" : ""} | ` +
     `${stats.visibleTileCount.toLocaleString()} tiles | ` +
-    `target ${formatCompactCount(stats.targetSegmentsPerTile)}/tile | ` +
+    `target ~${formatCompactCount(VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS)} total, ${formatCompactCount(stats.targetSegmentsPerTile)}/tile | ` +
     `zoom ${formatLodTolerance(stats.baselineTolerance)} | ` +
     `active ${activeLevels} | ` +
     `dense exact ${stats.maxBaselineTileSegments.toLocaleString()} -> ` +

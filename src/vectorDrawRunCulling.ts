@@ -1,4 +1,8 @@
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import { retainedRasterBounds } from "./retainedRasterBounds";
+
+const GUARDED_RUN_COUNT = 1024;
+const VISIBILITY_GUARD_PIXELS = 64;
 
 /** Conservative paint bounds. Filtering retains the original order and instance ranges. */
 export class VectorDrawRunCuller {
@@ -16,6 +20,12 @@ export class VectorDrawRunCuller {
   private paddedBounds: Float64Array | null = null;
   private padding = NaN;
   private allPaddedBounds: Bounds | null = null;
+  private readonly nonemptyRuns: VectorDrawRun[] = [];
+  private nonemptyFlags: Uint8Array | null = null;
+  private allPaddedRuns: readonly VectorDrawRun[] = [];
+  private guardBounds: Bounds | null = null;
+  private guardRuns: readonly VectorDrawRun[] = [];
+  private guardFlags: Uint8Array | null = null;
 
   constructor(scene: VectorScene, strokes?: { scene: VectorScene; sourceRuns: Uint32Array }) {
     this.scene = scene;
@@ -61,6 +71,11 @@ export class VectorDrawRunCuller {
             }
           }
         } else if (run.kind === "raster") {
+          const retained = retainedRasterBounds(scene, index);
+          if (retained) {
+            include(retained.minX, retained.minY); include(retained.maxX, retained.maxY);
+            continue;
+          }
           const m = scene.rasterLayers[index].matrix;
           for (const x of [0, 1]) for (const y of [0, 1]) include(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
         } else {
@@ -98,29 +113,64 @@ export class VectorDrawRunCuller {
   select(view: Readonly<Bounds> | null, unitsPerPixel: number, extraMargin = 0): readonly VectorDrawRun[] {
     const runs = this.scene.drawRuns ?? [];
     this.selected = null;
-    if (!view) return runs;
+    if (!view || ![view.minX, view.minY, view.maxX, view.maxY].every(Number.isFinite)) {
+      this.guardBounds = null;
+      return runs;
+    }
     // Hairlines and analytic antialiasing grow in screen pixels, independently of source widths.
-    const pad = Math.max(extraMargin, 0.001, unitsPerPixel * 4);
+    const requiredPadding = Math.max(extraMargin, 0.001, unitsPerPixel * 4);
+    if (!Number.isFinite(requiredPadding)) { this.guardBounds = null; return runs; }
+    // A conservative scale bucket reuses the clipped bounds during animated
+    // zooms. Enlarging the culling margin can only retain extra paints; geometry,
+    // coverage and source ordering still use their original values.
+    const pad = 2 ** Math.ceil(Math.log2(requiredPadding));
     // Panning changes the view, but not paint extents. Intersect clip bounds
-    // once per padding change instead of for every run on every frame.
+    // once per padding bucket instead of for every run on every frame.
     if (!this.paddedBounds || this.padding !== pad) {
       this.paddedBounds ??= new Float64Array(this.bounds.length);
       this.padding = pad;
+      this.guardBounds = null;
       const box = [0, 0, 0, 0];
       const all = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-      let allNonempty = true;
+      this.nonemptyRuns.length = 0;
+      this.nonemptyFlags ??= new Uint8Array(runs.length);
+      this.nonemptyFlags.fill(0);
       for (let index = 0; index < runs.length; index++) {
         this.getBounds(index, pad, box);
         this.paddedBounds.set(box, index * 4);
-        if (box[0] > box[2] || box[1] > box[3]) allNonempty = false;
+        if (box[0] > box[2] || box[1] > box[3]) continue;
+        this.nonemptyRuns.push(runs[index]);
+        this.nonemptyFlags[index] = 1;
         all.minX = Math.min(all.minX, box[0]); all.minY = Math.min(all.minY, box[1]);
         all.maxX = Math.max(all.maxX, box[2]); all.maxY = Math.max(all.maxY, box[3]);
       }
-      this.allPaddedBounds = allNonempty ? all : null;
+      this.allPaddedBounds = all;
+      this.allPaddedRuns = this.nonemptyRuns.length === runs.length ? runs : this.nonemptyRuns;
     }
+    // Keep a small offscreen margin for large drawings. Tiny camera moves then
+    // retain the same vector instances instead of rewriting the whole upload.
+    // Reuse is safe only within the bounds selected with this AA-padding bucket.
+    // Bound old-window overdraw too, so zooming into a detail refreshes it.
+    const guard = runs.length >= GUARDED_RUN_COUNT && unitsPerPixel > 0 ? VISIBILITY_GUARD_PIXELS * unitsPerPixel : 0;
+    if (guard > 0 && this.guardBounds && view.minX >= this.guardBounds.minX && view.minY >= this.guardBounds.minY &&
+        view.maxX <= this.guardBounds.maxX && view.maxY <= this.guardBounds.maxY &&
+        this.guardBounds.maxX - this.guardBounds.minX <= view.maxX - view.minX + guard * 4 &&
+        this.guardBounds.maxY - this.guardBounds.minY <= view.maxY - view.minY + guard * 4) {
+      this.selected = this.guardFlags;
+      return this.guardRuns;
+    }
+    let guarded = guard > 0 ? { minX: view.minX - guard, minY: view.minY - guard,
+      maxX: view.maxX + guard, maxY: view.maxY + guard } : null;
+    if (guarded && [guarded.minX, guarded.minY, guarded.maxX, guarded.maxY].every(Number.isFinite)) view = guarded;
+    else { guarded = null; this.guardBounds = null; }
     const all = this.allPaddedBounds;
-    if (all && view.minX <= all.minX && view.minY <= all.minY && view.maxX >= all.maxX && view.maxY >= all.maxY) return runs;
-    this.visible.length = 0;
+    if (all && view.minX <= all.minX && view.minY <= all.minY && view.maxX >= all.maxX && view.maxY >= all.maxY) {
+      // Empty clipped paints must stay excluded without defeating overview reuse.
+      return this.rememberSelection(guarded, this.allPaddedRuns, this.allPaddedRuns === runs ? null : this.nonemptyFlags);
+    }
+    // Overwrite the retained result storage; clearing it before each animated
+    // frame discards the array capacity and repeatedly grows the same list.
+    let visibleCount = 0;
     const bounds = this.paddedBounds;
     if (!this.selectedFlags || this.selectedFlags.length !== runs.length) this.selectedFlags = new Uint8Array(runs.length);
     const flags = this.selectedFlags;
@@ -132,11 +182,18 @@ export class VectorDrawRunCuller {
       if (minX > maxX || minY > maxY || maxX < view.minX || maxY < view.minY ||
           minX > view.maxX || minY > view.maxY) continue;
       flags[index] = 1;
-      this.visible.push(runs[index]);
+      this.visible[visibleCount++] = runs[index];
     }
-    if (this.visible.length === runs.length) return runs;
-    this.selected = flags;
-    return this.visible;
+    this.visible.length = visibleCount;
+    return this.rememberSelection(guarded, visibleCount === runs.length ? runs : this.visible,
+      visibleCount === runs.length ? null : flags);
+  }
+
+  private rememberSelection(bounds: Bounds | null, runs: readonly VectorDrawRun[], flags: Uint8Array | null): readonly VectorDrawRun[] {
+    this.guardBounds = bounds;
+    this.guardRuns = runs;
+    this.guardFlags = this.selected = flags;
+    return runs;
   }
 }
 

@@ -3,6 +3,7 @@ import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
+import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import * as THREE from "three";
 
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -22,6 +23,9 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface StrokeLayerOptions {
+  drawPlan?: ThreeVectorDrawPlan;
+  canonicalScene?: VectorScene;
+  strokeOrigins?: Uint32Array;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
@@ -106,7 +110,7 @@ export class ThreeMaterialStrokeLayer {
       segmentTextureSize.height
     );
 
-    this.grid = segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    this.grid = segmentCount > 0 && !options.strokeOrigins ? buildSpatialGrid(scene) : null;
     this.segmentMarks = new Uint32Array(segmentCount);
     this.visibleSegmentIds = new Float32Array(Math.max(1, segmentCount));
     this.allSegmentIds = new Float32Array(Math.max(1, segmentCount));
@@ -195,7 +199,7 @@ export class ThreeMaterialStrokeLayer {
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
-    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "stroke", this.mesh, "aSegmentIndex");
+    this.orderedRuns = ThreeVectorDrawRuns.create(options.canonicalScene ?? scene, "stroke", this.mesh, "aSegmentIndex", options.drawPlan, options.strokeOrigins);
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -271,17 +275,28 @@ export class ThreeMaterialStrokeLayer {
     segmentIdCount: number
   ): void {
     this.updateFrameUniforms(viewState, viewport);
+    this.orderedRuns?.beginUpdate();
     const outCount = Math.max(0, Math.min(segmentIdCount | 0, this.segmentCount, this.visibleSegmentIds.length));
+    let changed = false;
     for (let i = 0; i < outCount; i += 1) {
-      this.visibleSegmentIds[i] = segmentIds[i];
+      if (this.visibleSegmentIds[i] !== segmentIds[i]) { this.visibleSegmentIds[i] = segmentIds[i]; changed = true; }
     }
     this.usingAllSegments = false;
     this.drawInstanceCount = outCount;
     this.mesh.geometry.instanceCount = outCount;
-    if (outCount > 0) {
+    if (changed && outCount > 0) {
+      this.segmentIndexAttribute.clearUpdateRanges();
       this.segmentIndexAttribute.addUpdateRange(0, outCount);
       this.segmentIndexAttribute.needsUpdate = true;
     }
+    this.orderedRuns?.finishUpdate();
+  }
+
+  /** Reuse external selection IDs while refreshing camera and shared paint order. */
+  updateFrameWithUnchangedSelection(viewState: ViewState, viewport: ViewportPixels): void {
+    this.updateFrameUniforms(viewState, viewport);
+    this.orderedRuns?.beginUpdate();
+    this.orderedRuns?.finishUpdate();
   }
 
   estimateVisibleSegmentCount(viewState: ViewState, viewport: ViewportPixels, cullingBounds?: CullingBounds | null): number {

@@ -214,17 +214,20 @@ try {
   const levels = [scene, coarse].map((value, index) => ({ tolerance: index, scene: value,
     segmentCount: value.segmentCount, ...buildRuntimeTileBuckets(value, tileGrid) }));
   const runtime = new VectorStrokeLodRuntime(scene, { tileGrid, levels, elapsedMs: 0 });
-  assert.equal(runtime.chooseTileLevel(0, 1), 1);
+  // Tile 0 under a one-stroke budget, with the coarse level inside both its
+  // normal screen-error limit and its budget-pressure limit.
+  const chooseTile = target => target.chooseTileLevel(0, 1, 1, 1);
+  assert.equal(chooseTile(runtime), 1);
   runtime.setForceExact(true);
-  assert.equal(runtime.chooseTileLevel(0, 1), 0);
+  assert.equal(chooseTile(runtime), 0);
   runtime.update({ cameraCenterX: 5, cameraCenterY: 0.5, zoom: 1 }, { width: 100, height: 100 });
   assert.equal(runtime.levels[0].visibleSegmentCount, 2);
   assert.equal(runtime.levels[1].visibleSegmentCount, 0);
   runtime.setForceExact(false);
-  assert.equal(runtime.chooseTileLevel(0, 1), 1);
+  assert.equal(chooseTile(runtime), 1);
   runtime.setForceExact(true);
   storePrebuiltVectorStrokeLodRuntime(scene, runtime);
-  assert.equal(takePrebuiltVectorStrokeLodRuntime(scene).chooseTileLevel(0, 1), 1,
+  assert.equal(chooseTile(takePrebuiltVectorStrokeLodRuntime(scene)), 1,
     "temporary appearance must not leak to another viewer through the runtime cache");
 
   for (const [key, value] of Object.entries(original)) assert.deepEqual(scene[key], value, `${key} remains immutable`);

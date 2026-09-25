@@ -1,3 +1,4 @@
+import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeVectorClips";
 import * as THREE from "three";
@@ -111,7 +112,7 @@ fn heprStrokeWorldPack(
     geometryLength = length(p2 - p0);
   }
 
-  if ((geometryLength < 0.00001 && !isRoundCap) || alpha <= 0.001) {
+  if ((geometryLength == 0.0 && !isRoundCap) || alpha <= 0.001) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
 
@@ -163,6 +164,9 @@ fn heprStrokeClipPosition(
   return vec4<f32>(clip, 0.0, 1.0);
 }
 `);
+
+const strokeCoverageFn = TSL.wgslFn(STROKE_COVERAGE_WGSL);
+const strokeDensityFn = TSL.wgslFn(STROKE_DENSITY_WGSL);
 
 const distanceToLineSegmentFn = TSL.wgslFn(CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE);
 
@@ -221,9 +225,10 @@ fn heprStrokeFragment(
     halfWidth = max(0.5 * localPerPixel, 0.00001);
   }
 
-  let coverage = 1.0 - smoothstep(halfWidth - aaWorld, halfWidth + aaWorld, distanceToSegment);
-  let alpha = coverage * alphaStyle;
-  if (alpha <= 0.001) {
+  let coverage = heprStrokeCoverage(distanceToSegment, halfWidth, aaWorld);
+  var alpha = coverage * alphaStyle;
+  alpha = heprStrokeLodAlpha(alpha, primitiveType);
+  if (alpha <= 0.0) {
     discard;
   }
 
@@ -234,6 +239,8 @@ fn heprStrokeFragment(
 }
 `, [
   includeNode(floatModFn),
+  includeNode(strokeCoverageFn),
+  includeNode(strokeDensityFn),
   includeNode(distanceToLineSegmentFn),
   includeNode(distanceToQuadraticBezierFn)
 ]);

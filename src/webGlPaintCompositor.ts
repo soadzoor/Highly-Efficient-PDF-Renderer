@@ -1,27 +1,78 @@
-import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
-import { compositeScenePaintGraph, type PdfCompositeOperation, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
+import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
+import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOperation,
+  type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
 import { PDF_COMPOSITE_FRAGMENT_GLSL, PDF_COMPOSITE_VERTEX_GLSL } from "./pdfCompositeShaders";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 
 interface Surface { texture: WebGLTexture; framebuffer: WebGLFramebuffer }
 
+/** Caller-known target and state to restore, avoiding synchronous GL queries. */
+export interface WebGlPaintCompositorState {
+  framebuffer: WebGLFramebuffer | null;
+  readFramebuffer: WebGLFramebuffer | null;
+  viewport: ArrayLike<number>;
+  clearColor: ArrayLike<number>;
+  scissor: boolean;
+  blend: boolean;
+  depth: boolean;
+  program: WebGLProgram | null;
+  vao: WebGLVertexArrayObject | null;
+  blendFunction: readonly [number, number, number, number];
+  blendEquation: readonly [number, number];
+}
+
+/**
+ * The renderer's side of folded paints: which leaves it can draw with an
+ * opacity and mask of their own, and drawing one onto the bound surface.
+ */
+export interface WebGlPaintFolding {
+  canFold(run: VectorDrawRun): boolean;
+  draw(run: VectorDrawRun, opacity: number, mask: WebGLTexture | null): void;
+}
+
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
+/** Diagnostic names of the shared executor's pass operations, by number. */
+const PASS_NAMES = ["composite", "stats", "extract", "shapeExtract", "softMask", "copy", "blendLayer"];
+// An absent soft mask must read as fully opaque, unlike every other input,
+// whose neutral value is transparent black.
+const MASK_SAMPLER = SAMPLER_NAMES.indexOf("uMask");
+/**
+ * Passes sample from texture units 19-25 when the context has them. WebGL2
+ * guarantees 32, and the native renderer's paint programs stay below 19, so
+ * neither side disturbs the other's bindings between spans.
+ */
+const DEDICATED_FIRST_UNIT = 19;
+const TRANSFER_UNIT = SAMPLER_NAMES.length;
+const SAMPLER_UNITS = SAMPLER_NAMES.length + 1;
 
 /** Transient GL surfaces for the shared PDF pass executor. */
 export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface> {
+  readonly blendsPasses = true;
   private readonly gl: WebGL2RenderingContext;
   private readonly onDraw: (() => void) | undefined;
-  private readonly program: WebGLProgram;
+  /** Exposed for diagnostics, which name its draws; see `lastPassName`. */
+  readonly program: WebGLProgram;
+  /** The kind of the most recent pass, for diagnostics timing its draw. */
+  lastPassName = "composite";
   private readonly uniforms: Record<string, WebGLUniformLocation | null>;
   private readonly vao: WebGLVertexArrayObject;
   private readonly zero: WebGLTexture;
+  private readonly one: WebGLTexture;
   private readonly transfers = new Map<Float32Array, WebGLTexture>();
   private readonly pool: Surface[] = [];
   private readonly all = new Set<Surface>();
   private width = 0;
   private height = 0;
   private approximationReported = false;
-  private drawRun: ((run: VectorDrawRun, shapeOnly: boolean) => void) | null = null;
+  private drawSpan: ((runs: readonly VectorDrawRun[], shapeOnly: boolean) => void) | null = null;
+  private folding: WebGlPaintFolding | null = null;
+  private project: PdfCompositeProjector | null = null;
+  private viewportWidth = 0;
+  private viewportHeight = 0;
+  /** First of this compositor's texture units: dedicated ones, or 0 without them. */
+  readonly firstUnit: number;
+  /** Units this compositor has bound during the current render, by offset. */
+  private readonly bound: (WebGLTexture | null)[] = [];
 
   constructor(gl: WebGL2RenderingContext, onDraw?: () => void) {
     this.gl = gl;
@@ -40,16 +91,32 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     // once keeps a page with hundreds of passes off the synchronous GL queries.
     this.uniforms = Object.fromEntries(SAMPLER_NAMES.concat(["uTransfer", "uParams", "uExtra", "uMaskBackdrop"])
       .map(name => [name, gl.getUniformLocation(program, name)]));
+    const units = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) as number;
+    this.firstUnit = units >= DEDICATED_FIRST_UNIT + SAMPLER_UNITS ? DEDICATED_FIRST_UNIT : 0;
+    // Sampler units never change, so they are set once rather than per pass.
+    // A shared context keeps its program; construction queries it only once.
+    const previous = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
+    gl.useProgram(program);
+    for (let i = 0; i < SAMPLER_NAMES.length; i++) gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], this.firstUnit + i);
+    gl.uniform1i(this.uniforms.uTransfer, this.firstUnit + TRANSFER_UNIT);
+    gl.useProgram(previous);
     this.vao = gl.createVertexArray()!;
-    this.zero = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this.zero);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    this.zero = this.constant(new Uint8Array(4));
+    this.one = this.constant(Uint8Array.of(255, 255, 255, 255));
   }
 
-  render(scene: VectorScene, width: number, height: number, draw: (run: VectorDrawRun, shapeOnly: boolean) => void,
-    visible: (condition?: number) => boolean, selected: Uint8Array | null = null): void {
+  /**
+   * `draw` receives a whole span at a time. Every paint in one reaches the same
+   * surface with no composite pass between them, so a caller may batch and
+   * reorder within a span and may cache GL state across it; neither holds
+   * between spans. A renderer that owns its context may supply the known target
+   * and desired return state; shared-context callers capture the current state.
+   */
+  render(scene: VectorScene, width: number, height: number,
+    draw: (runs: readonly VectorDrawRun[], shapeOnly: boolean) => void,
+    visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
+    project: PdfCompositeProjector | null = null, knownState?: WebGlPaintCompositorState,
+    folding: WebGlPaintFolding | null = null): void {
     const gl = this.gl;
     const size = choosePdfCompositeResolution(scene, width, height);
     if (size.scale < 1 && !this.approximationReported) {
@@ -57,17 +124,12 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       console.warn(`[hepr] PDF composite surfaces use ${size.width}×${size.height} instead of ${width}×${height} to stay within the memory budget.`);
     }
     if (size.width !== this.width || size.height !== this.height) { this.releaseSurfaces(); this.width = size.width; this.height = size.height; }
-    const framebuffer = gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
-    const readFramebuffer = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
-    const viewport = gl.getParameter(gl.VIEWPORT) as Int32Array;
-    const scissor = gl.isEnabled(gl.SCISSOR_TEST), blend = gl.isEnabled(gl.BLEND), depth = gl.isEnabled(gl.DEPTH_TEST);
-    const oldProgram = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
-    const oldVao = gl.getParameter(gl.VERTEX_ARRAY_BINDING) as WebGLVertexArrayObject | null;
-    const clearColor = gl.getParameter(gl.COLOR_CLEAR_VALUE) as Float32Array;
-    const blendSrcRgb = gl.getParameter(gl.BLEND_SRC_RGB), blendDstRgb = gl.getParameter(gl.BLEND_DST_RGB);
-    const blendSrcAlpha = gl.getParameter(gl.BLEND_SRC_ALPHA), blendDstAlpha = gl.getParameter(gl.BLEND_DST_ALPHA);
-    const blendRgb = gl.getParameter(gl.BLEND_EQUATION_RGB), blendAlpha = gl.getParameter(gl.BLEND_EQUATION_ALPHA);
-    this.drawRun = draw;
+    const state = knownState ?? this.captureState();
+    const { framebuffer, viewport, clearColor } = state;
+    // Whatever ran since the last render may have rebound these units.
+    this.bound.length = 0;
+    this.drawSpan = draw; this.folding = folding;
+    this.project = project; this.viewportWidth = width; this.viewportHeight = height;
     let backdrop: Surface | null = null, result: Surface | null = null;
     try {
       gl.disable(gl.SCISSOR_TEST); gl.disable(gl.DEPTH_TEST);
@@ -84,17 +146,33 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     } finally {
       if (result) this.release(result);
       if (backdrop) this.release(backdrop);
-      this.drawRun = null;
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
+      this.drawSpan = null; this.folding = null; this.project = null;
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, state.readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
       gl.clearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
-      gl.blendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha);
-      gl.blendEquationSeparate(blendRgb, blendAlpha);
-      if (blend) gl.enable(gl.BLEND); else gl.disable(gl.BLEND);
-      if (scissor) gl.enable(gl.SCISSOR_TEST); else gl.disable(gl.SCISSOR_TEST);
-      if (depth) gl.enable(gl.DEPTH_TEST); else gl.disable(gl.DEPTH_TEST);
-      gl.useProgram(oldProgram); gl.bindVertexArray(oldVao);
+      gl.blendFuncSeparate(...state.blendFunction);
+      gl.blendEquationSeparate(...state.blendEquation);
+      if (state.blend) gl.enable(gl.BLEND); else gl.disable(gl.BLEND);
+      if (state.scissor) gl.enable(gl.SCISSOR_TEST); else gl.disable(gl.SCISSOR_TEST);
+      if (state.depth) gl.enable(gl.DEPTH_TEST); else gl.disable(gl.DEPTH_TEST);
+      gl.useProgram(state.program); gl.bindVertexArray(state.vao);
     }
+  }
+
+  private captureState(): WebGlPaintCompositorState {
+    const gl = this.gl;
+    return {
+      framebuffer: gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null,
+      readFramebuffer: gl.getParameter(gl.READ_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null,
+      viewport: gl.getParameter(gl.VIEWPORT) as Int32Array,
+      clearColor: gl.getParameter(gl.COLOR_CLEAR_VALUE) as Float32Array,
+      scissor: gl.isEnabled(gl.SCISSOR_TEST), blend: gl.isEnabled(gl.BLEND), depth: gl.isEnabled(gl.DEPTH_TEST),
+      program: gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null,
+      vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING) as WebGLVertexArrayObject | null,
+      blendFunction: [gl.getParameter(gl.BLEND_SRC_RGB), gl.getParameter(gl.BLEND_DST_RGB),
+        gl.getParameter(gl.BLEND_SRC_ALPHA), gl.getParameter(gl.BLEND_DST_ALPHA)],
+      blendEquation: [gl.getParameter(gl.BLEND_EQUATION_RGB), gl.getParameter(gl.BLEND_EQUATION_ALPHA)]
+    };
   }
 
   acquire(): Surface {
@@ -107,7 +185,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       if (framebuffer) gl.deleteFramebuffer(framebuffer);
       throw new Error("Unable to allocate PDF compositing surface.");
     }
-    gl.bindTexture(gl.TEXTURE_2D, texture);
+    this.stage(texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -121,13 +199,25 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     const surface = { texture, framebuffer }; this.all.add(surface); return surface;
   }
   release(surface: Surface): void { this.pool.push(surface); }
-  clear(surface: Surface, color: readonly [number, number, number, number] = [0, 0, 0, 0]): void {
-    const gl = this.gl; this.target(surface); gl.clearColor(...color); gl.clear(gl.COLOR_BUFFER_BIT);
+  clear(surface: Surface, color: readonly [number, number, number, number] = [0, 0, 0, 0], bounds?: Bounds): void {
+    const gl = this.gl; this.target(surface); gl.clearColor(...color);
+    const rect = this.scissor(bounds);
+    if (rect) { gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x, rect.y, rect.width, rect.height); }
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (rect) gl.disable(gl.SCISSOR_TEST);
   }
-  copy(source: Surface, destination: Surface): void {
+  copy(source: Surface, destination: Surface, bounds?: Bounds): void {
     const gl = this.gl;
+    const rect = this.scissor(bounds) ?? { x: 0, y: 0, width: this.width, height: this.height };
+    if (rect.width === 0 || rect.height === 0) return;
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source.framebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destination.framebuffer);
-    gl.blitFramebuffer(0, 0, this.width, this.height, 0, 0, this.width, this.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    // An explicit blit rectangle needs no scissor, and copies nothing else.
+    gl.blitFramebuffer(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height,
+      rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+  }
+  /** Surface pixels an operation may touch, bottom-left origin; null covers it all. */
+  private scissor(bounds: Bounds | undefined): { x: number; y: number; width: number; height: number } | null {
+    return pdfCompositeScissorRect(bounds, this.project, this.viewportWidth, this.viewportHeight, this.width, this.height);
   }
   draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void {
     if (runs.length === 0) return;
@@ -135,32 +225,73 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     // One framebuffer binding and blend setup for the whole span; source order
     // is the call order.
-    for (const run of runs) this.drawRun!(run, shapeOnly);
+    this.drawSpan!(runs, shapeOnly);
+  }
+  canFold(run: VectorDrawRun): boolean { return this.folding?.canFold(run) ?? false; }
+  drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined): void {
+    const gl = this.gl; this.target(destination); gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.folding!.draw(run, opacity, mask?.texture ?? null);
   }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const gl = this.gl;
-    this.target(destination); gl.disable(gl.BLEND); gl.useProgram(this.program); gl.bindVertexArray(this.vao);
+    this.target(destination);
+    if (operation.blend) {
+      // Premultiplied source-over: exactly what operation 0 computes for a
+      // Normal composite, without reading the destination in the shader.
+      gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    } else gl.disable(gl.BLEND);
+    gl.useProgram(this.program); gl.bindVertexArray(this.vao);
+    this.lastPassName = PASS_NAMES[operation.operation];
     const textures = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
+    // Every input is bound on every pass, so no unit can keep a surface this
+    // pass renders into; the cache only skips rebinding the same texture.
     for (let i = 0; i < textures.length; i++) {
-      gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, textures[i]?.texture ?? this.zero);
-      gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], i);
+      this.bind(i, textures[i]?.texture ?? (i === MASK_SAMPLER ? this.one : this.zero));
     }
     const transfer = operation.softMask?.transfer;
-    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, transfer ? this.transferTexture(transfer) : this.zero);
-    gl.uniform1i(this.uniforms.uTransfer, 6);
+    this.bind(TRANSFER_UNIT, transfer ? this.transferTexture(transfer) : this.zero);
     gl.uniform4f(this.uniforms.uParams, operation.operation, operation.blendMode ?? 0,
       operation.knockout ? 1 : 0, operation.opacity ?? 1);
     gl.uniform4f(this.uniforms.uExtra, operation.alphaIsShape ? 1 : 0,
-      operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, 0);
+      operation.softMask?.subtype === "Luminosity" ? 1 : 0, transfer?.length ?? 0, operation.isolated ? 1 : 0);
     gl.uniform3fv(this.uniforms.uMaskBackdrop, operation.softMask?.backdrop ?? [0, 0, 0]);
+    const rect = this.scissor(operation.bounds);
+    if (rect) { gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x, rect.y, rect.width, rect.height); }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (rect) gl.disable(gl.SCISSOR_TEST);
+    if (operation.blend) gl.disable(gl.BLEND);
     this.onDraw?.();
   }
   dispose(): void {
     this.releaseSurfaces();
     for (const texture of this.transfers.values()) this.gl.deleteTexture(texture);
-    this.transfers.clear(); this.gl.deleteTexture(this.zero); this.gl.deleteVertexArray(this.vao); this.gl.deleteProgram(this.program);
+    this.transfers.clear(); this.gl.deleteTexture(this.zero); this.gl.deleteTexture(this.one);
+    this.gl.deleteVertexArray(this.vao); this.gl.deleteProgram(this.program);
   }
+  private constant(pixel: Uint8Array): WebGLTexture {
+    const gl = this.gl, texture = gl.createTexture()!;
+    this.stage(texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return texture;
+  }
+  private bind(offset: number, texture: WebGLTexture): void {
+    if (this.bound[offset] === texture) return;
+    this.bound[offset] = texture;
+    this.gl.activeTexture(this.gl.TEXTURE0 + this.firstUnit + offset);
+    this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
+  }
+  /**
+   * Binds a texture this compositor is creating on one of its own units. A
+   * surface allocated mid-frame must not land on whichever unit is active: a
+   * renderer caching its paint bindings would keep sampling that unit and
+   * then draw into the surface, a feedback loop WebGL rejects. Every pass
+   * rebinds all its units, so leaving the texture here is harmless.
+   */
+  private stage(texture: WebGLTexture): void { this.bind(TRANSFER_UNIT, texture); }
   private target(surface: Surface): void { this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, surface.framebuffer); this.gl.viewport(0, 0, this.width, this.height); }
   private releaseSurfaces(): void {
     for (const surface of this.all) { this.gl.deleteTexture(surface.texture); this.gl.deleteFramebuffer(surface.framebuffer); }
@@ -170,7 +301,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     let texture = this.transfers.get(values);
     if (texture) return texture;
     const gl = this.gl;
-    texture = gl.createTexture()!; gl.bindTexture(gl.TEXTURE_2D, texture);
+    texture = gl.createTexture()!; this.stage(texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     const width = Math.min(values.length, gl.getParameter(gl.MAX_TEXTURE_SIZE) as number), height = Math.ceil(values.length / width);
     const pixels = new Float32Array(width * height); pixels.set(values);
