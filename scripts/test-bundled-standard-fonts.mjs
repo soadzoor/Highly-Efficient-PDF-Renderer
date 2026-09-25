@@ -90,6 +90,8 @@ try {
     }), "liberation-serif-bold-italic"],
     [request("Times-BoldItalic"), "liberation-serif-bold-italic"],
     [request("Courier-Oblique"), "liberation-mono-italic"],
+    [request("LucidaConsole"), "liberation-mono-regular"],
+    [request("Consolas,Bold", { style: { weight: 700 } }), "liberation-mono-bold"],
     [request("Symbol"), "noto-sans-math"],
     [request("ZapfDingbats"), "noto-sans-symbols-2"],
     [request("Unknown", { style: { fixedPitch: true, weight: 700 } }), "liberation-mono-bold"],

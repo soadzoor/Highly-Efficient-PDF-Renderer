@@ -152,6 +152,22 @@ for (let i = 0; i < data.coarseInstanceCount; i += 1) {
   assert.equal(combined.scene.textInstanceB[(data.exactInstanceCount + i) * 4 + 2], data.solidGlyphIndex);
 }
 
+// Instance B.w is the 1-based text clip reference. Renderers remap every
+// nonzero reference onto the scene's clip rectangles, so a nonzero coarse value
+// clipped zoomed-out text against an unrelated rectangle (blank Three pages).
+const clippedCombined = createTextLodCombinedPayload(
+  {...scene, textInstanceB: clippedInstanceB, textClipRects: new Float32Array([0, 0, 10, 10])},
+  clippedLod.data
+);
+assert.ok(clippedLod.data.coarseInstanceCount > 0);
+for (let i = 0; i < clippedLod.data.coarseInstanceCount; i += 1) {
+  assert.equal(
+    clippedCombined.scene.textInstanceB[(clippedLod.data.exactInstanceCount + i) * 4 + 3],
+    0,
+    "coarse runs never contain clipped glyphs, so they must carry no clip reference"
+  );
+}
+
 assert.equal(largestSingularValue2x2(3, 0, 0, 2), 3);
 assert.ok(Math.abs(largestSingularValue2x2(1, 2, 3, 4) - 5.464985704219043) < 1e-12);
 const affineBounds = {minX: -1, minY: -2, maxX: 3, maxY: 4};
@@ -196,6 +212,32 @@ assertConservativeAgainstSamples(
   yDerivativeDominant,
   {width: 1600, height: 900},
   yDominantProjection.maxPixelsPerLocalUnit
+);
+
+for (const [bounds, matrix, viewport, projection] of [
+  [nearBounds, perspectiveMatrix, {width: 1000, height: 800}, nearProjection],
+  [farBounds, perspectiveMatrix, {width: 1000, height: 800}, farProjection],
+  [{minX: 0, minY: 0, maxX: 8, maxY: 8}, yDerivativeDominant, {width: 1600, height: 900}, yDominantProjection]
+]) {
+  assert.ok(projection.minPixelsPerLocalUnit > 0, "a sign-stable projective view must give a positive lower bound");
+  assertLowerBoundAgainstSamples(bounds, matrix, viewport, projection.minPixelsPerLocalUnit);
+}
+
+// A nearly affine projective view must stay close to its exact affine scale.
+// The previous entrywise Frobenius bound inflated it by sqrt(2), which marked
+// far more tilted text exact than a flat view of the same size.
+const nearlyAffine = new Float64Array([
+  0.01, 0, 0, 0,
+  0, 0.01, 0, 1e-9,
+  0, 0, 1, 0,
+  0, 0, 0, 1
+]);
+const nearlyAffineProjection = analyzePlanarBoundsProjection(
+  {minX: 0, minY: 0, maxX: 10, maxY: 10}, nearlyAffine, {width: 1000, height: 1000}
+);
+assert.ok(
+  Math.abs(nearlyAffineProjection.maxPixelsPerLocalUnit - 5) < 1e-3,
+  `projective bound ${nearlyAffineProjection.maxPixelsPerLocalUnit} must match the affine scale 5`
 );
 
 const crossingMatrix = perspectiveMatrix.slice();
@@ -363,6 +405,71 @@ const afterCulling = retentionRuntime.update({
 assert.equal(afterCulling.stats.coarseClusters, retainedCoarseCount, "offscreen cluster hysteresis state must be retained");
 retentionRuntime.dispose();
 
+// Affine (top-down) views share one pixel scale, so a pan reuses the selection
+// until its snapped visibility rectangle moves, and every moved selection still
+// covers each on-screen cluster at the correct level.
+const panRuntime = new TextLodRuntime(result);
+const panViewport = 420;
+const panAt = (x, y, zoom) => panRuntime.update({
+  localToClip: createOrthographicLocalToClip(x, y, zoom, panViewport, panViewport),
+  viewportWidth: panViewport,
+  viewportHeight: panViewport
+});
+// The first frame at a new scale tests the exact view; the pan's first step
+// then settles onto the snapped rectangle.
+assertCoversOnScreenClusters(panAt(55, 291.5, 2), data, 55, 291.5, 2, panViewport);
+const panStart = panAt(55, 291, 2);
+assertCoversOnScreenClusters(panStart, data, 55, 291, 2, panViewport);
+// Exact per-cluster culling changed the selection for this pan, as a cluster
+// edge crosses the viewport; both edges stay inside their visibility step.
+const panNudged = panAt(55, 295, 2);
+assert.equal(panNudged.changed, false, "a pan inside one visibility step must not rebuild the selection");
+assert.equal(panNudged.stats.selectionUploads, panStart.stats.selectionUploads);
+assert.strictEqual(panNudged.instanceIds, panStart.instanceIds);
+for (const [x, y, zoom] of [[55, 705, 2], [400, 60, 2], [55, 305, 0.3], [300, 900, 0.3], [55, 305, 2]]) {
+  const moved = panAt(x, y, zoom);
+  assert.equal(new Set(moved.instanceIds).size, moved.instanceIds.length);
+  assertSourceOrdered(moved.instanceIds, data);
+  assertCoversOnScreenClusters(moved, data, x, y, zoom, panViewport);
+}
+panRuntime.dispose();
+
+// A tilted view of a page drawn wholly on screen decides clusters from the
+// page's scale bounds. The selection must equal projecting every cluster.
+const tiltScene = {...scene, pageRects: new Float32Array([-10, -10, 620, 1010])};
+const tiltData = buildTextLod(tiltScene).data;
+assert.ok(tiltData);
+const tiltViewport = {width: 1000, height: 1000};
+const tiltMatrix = new Float64Array([
+  0.0012, 0, 0, 0,
+  0, 0.0012, 0, 0.8 / 1020,
+  0, 0, 1, 0,
+  -0.37, -0.6, 0, 0.8 + 8 / 1020
+]);
+const tiltPage = analyzePlanarBoundsProjection(tiltData.pages[0].bounds, tiltMatrix, tiltViewport);
+assert.ok(tiltPage.stable && tiltPage.minX >= 0 && tiltPage.minY >= 0 &&
+  tiltPage.maxX <= tiltViewport.width && tiltPage.maxY <= tiltViewport.height, "the tilted page must lie inside the view");
+const tiltSelection = new TextLodRuntime({data: tiltData, fallbackReason: null, buildTimeMs: 0}).update({
+  localToClip: tiltMatrix,
+  viewportWidth: tiltViewport.width,
+  viewportHeight: tiltViewport.height
+});
+const expectedTiltIds = [];
+let tiltExact = 0;
+let tiltCoarse = 0;
+for (const cluster of tiltData.clusters) {
+  const projection = analyzePlanarBoundsProjection(cluster.bounds, tiltMatrix, tiltViewport);
+  if (projection.stable && !projection.visible) continue;
+  const coarse = cluster.eligible && projection.stable &&
+    cluster.maxInkHeight * projection.maxPixelsPerLocalUnit <= TEXT_LOD_COARSE_ENTER_PX;
+  if (coarse) tiltCoarse += 1; else tiltExact += 1;
+  const start = coarse ? tiltData.exactInstanceCount + cluster.coarseStart : cluster.exactStart;
+  const count = coarse ? cluster.coarseCount : cluster.exactCount;
+  for (let id = start; id < start + count; id += 1) expectedTiltIds.push(id);
+}
+assert.ok(tiltExact > 0 && tiltCoarse > 0, "the tilt must place clusters on both sides of the threshold");
+assert.deepEqual(Array.from(tiltSelection.instanceIds), expectedTiltIds);
+
 runtime.setResourceFallback("resource-capacity");
 const unavailable = runtime.update({
   localToClip: createOrthographicLocalToClip(centerX, centerY, 0.4, viewportWidth, viewportHeight),
@@ -497,6 +604,38 @@ function assertSourceOrdered(ids, data) {
     assert.ok(sourceStart >= previousSourceStart);
     previousSourceStart = sourceStart;
   }
+}
+
+/** Each cluster touching the view is selected at the level its fixed zoom implies. */
+function assertCoversOnScreenClusters(selection, data, centerX, centerY, zoom, viewport) {
+  const half = viewport / (2 * zoom);
+  const ids = new Set(selection.instanceIds);
+  let onScreen = 0;
+  for (const cluster of data.clusters) {
+    const bounds = cluster.bounds;
+    if (bounds.maxX < centerX - half || bounds.minX > centerX + half ||
+        bounds.maxY < centerY - half || bounds.minY > centerY + half) continue;
+    onScreen += 1;
+    const coarse = cluster.eligible && cluster.maxInkHeight * zoom <= TEXT_LOD_COARSE_ENTER_PX;
+    const start = coarse ? data.exactInstanceCount + cluster.coarseStart : cluster.exactStart;
+    const count = coarse ? cluster.coarseCount : cluster.exactCount;
+    for (let id = start; id < start + count; id += 1) {
+      assert.ok(ids.has(id), `on-screen cluster id ${id} at (${centerX}, ${centerY}) x${zoom} must be selected`);
+    }
+  }
+  assert.ok(onScreen > 0, "the probe view must contain text");
+}
+
+function assertLowerBoundAgainstSamples(bounds, matrix, viewport, bound) {
+  let sampledMinimum = Number.POSITIVE_INFINITY;
+  for (let yi = 0; yi <= 10; yi += 1) {
+    const y = bounds.minY + (bounds.maxY - bounds.minY) * yi / 10;
+    for (let xi = 0; xi <= 10; xi += 1) {
+      const x = bounds.minX + (bounds.maxX - bounds.minX) * xi / 10;
+      sampledMinimum = Math.min(sampledMinimum, exactPixelJacobianSigma(x, y, matrix, viewport));
+    }
+  }
+  assert.ok(bound <= sampledMinimum + 1e-9, `${bound} must not exceed the sampled minimum stretch ${sampledMinimum}`);
 }
 
 function assertConservativeAgainstSamples(bounds, matrix, viewport, bound) {
