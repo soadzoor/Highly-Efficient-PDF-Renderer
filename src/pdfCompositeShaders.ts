@@ -49,27 +49,27 @@ export function pdfCompositeFunctions(language: "glsl" | "wgsl"): string {
       // premultiplied color. Applying it here, where the layer is read anyway,
       // spares that group an extraction pass and a surface of its own.
       ${v("V4", "src", "source")} if (q.w > 0.5) { src=source*(p.w*mask.r); }
-      if (operation == 0) {
-        ${v("V4", "backdrop", "current")} if (p.z > 0.5) { backdrop=initial; }
-        ${v("V4", "result", "pdfOver(backdrop,src,I(p.y))")}
-        if (p.z > 0.5) { result=result+(1.0-shape.a)*(current-initial); }
-        return clamp(result,V4(0.0),V4(1.0));
-      }
-      if (operation == 1) {
-        ${v("F", "previousWeight", "1.0-src.a")} if (p.z > 0.5) { previousWeight=1.0-shape.a; }
-        return V4(src.a+previousWeight*stats.r,shape.a+(1.0-shape.a)*stats.g,0.0,1.0);
-      }
-      if (operation == 2) {
-        ${v("F", "opacity", "p.w*mask.r")}
-        return V4(clamp(current.rgb-initial.rgb*(1.0-stats.r),V3(0.0),V3(1.0))*opacity,stats.r*opacity);
-      }
-      if (operation == 3) {
-        ${v("F", "coverage", "stats.g")} if (q.x > 0.5) { coverage=coverage*p.w*mask.r; }
-        return V4(coverage);
-      }
       // Operation 6 emits the layer itself, for a destination whose blender
       // performs the source-over that operation 0 would compute here.
-      return src;
+      // One exit: D3D's FXC (under ANGLE) cannot prove that early returns
+      // here cover every path and warns X4000 about the result.
+      ${v("V4", "result", "src")}
+      if (operation == 0) {
+        ${v("V4", "backdrop", "current")} if (p.z > 0.5) { backdrop=initial; }
+        result=pdfOver(backdrop,src,I(p.y));
+        if (p.z > 0.5) { result=result+(1.0-shape.a)*(current-initial); }
+        result=clamp(result,V4(0.0),V4(1.0));
+      } else if (operation == 1) {
+        ${v("F", "previousWeight", "1.0-src.a")} if (p.z > 0.5) { previousWeight=1.0-shape.a; }
+        result=V4(src.a+previousWeight*stats.r,shape.a+(1.0-shape.a)*stats.g,0.0,1.0);
+      } else if (operation == 2) {
+        ${v("F", "opacity", "p.w*mask.r")}
+        result=V4(clamp(current.rgb-initial.rgb*(1.0-stats.r),V3(0.0),V3(1.0))*opacity,stats.r*opacity);
+      } else if (operation == 3) {
+        ${v("F", "coverage", "stats.g")} if (q.x > 0.5) { coverage=coverage*p.w*mask.r; }
+        result=V4(coverage);
+      }
+      return result;
     `)
   ].join("\n");
 }

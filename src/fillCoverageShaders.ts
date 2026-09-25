@@ -147,11 +147,16 @@ float heprQuadraticCoverage(vec2 a, vec2 b, vec2 c, float low, float high) {
 float heprSegmentCoverage(vec2 p0, vec2 p1, vec2 p2, bool quadratic, vec4 box, float low, float high) {
   vec2 a = vec2((p0.x - box.x) * box.z, (p0.y - box.y) * box.w);
   vec2 c = vec2((p2.x - box.x) * box.z, (p2.y - box.y) * box.w);
-  if (!quadratic) {
-    return heprLineCoverage(a, c, low, high);
+  // One exit: D3D's FXC (under ANGLE) cannot prove that an early return here
+  // covers every path and warns X4000 about the result.
+  float coverage = 0.0;
+  if (quadratic) {
+    vec2 b = vec2((p1.x - box.x) * box.z, (p1.y - box.y) * box.w);
+    coverage = heprQuadraticCoverage(a, b, c, low, high);
+  } else {
+    coverage = heprLineCoverage(a, c, low, high);
   }
-  vec2 b = vec2((p1.x - box.x) * box.z, (p1.y - box.y) * box.w);
-  return heprQuadraticCoverage(a, b, c, low, high);
+  return coverage;
 }
 
 vec2 heprBandRows(vec4 bandInfo, int band, int bandCount, vec4 box) {
