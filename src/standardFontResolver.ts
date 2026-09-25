@@ -214,7 +214,11 @@ export function resolveBundledStandardFontAsset(
   const bold = request.style.weight >= 600 || /(?:bold|black|heavy|demi|semi)/.test(name);
   const italic = request.style.italic || request.descriptor.italicAngle !== 0 ||
     /(?:italic|oblique)/.test(name);
-  const family = request.style.fixedPitch || /(?:courier|mono|typewriter)/.test(name)
+  // Monospace families that commonly arrive nonembedded without /FixedPitch
+  // (e.g. LucidaConsole, Consolas) need a fixed-pitch substitute; proportional
+  // glyphs visibly drift inside the document's uniform /Widths advances.
+  const family = request.style.fixedPitch ||
+    /(?:courier|mono|typewriter|consol|menlo|monaco|fixedsys|lettergothic)/.test(name)
     ? "mono"
     : request.style.serif || /(?:times|serif|roman|georgia)/.test(name)
       ? "serif"
