@@ -29,6 +29,7 @@ export const fastTests = [
   "vector-fill-bands",
   "webgl-shader-precision",
   "subpixel-stroke-coverage",
+  "fill-area-coverage",
   "pdf-layer-controls",
   "raster-layer-updates",
   "raster-strip-batches",

@@ -11,6 +11,7 @@ import {
   CORE_TEXT_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
 import type { VectorScene } from "./pdfVectorExtractor";
+import { writeTextGlyphInkDensities } from "./textGreekLod";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
 import {
   buildTextRasterAtlas,
@@ -151,8 +152,11 @@ export class ThreeMaterialTextLayer {
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height
     );
+    const glyphMetaB = scene.textGlyphMetaB.slice(0, textGlyphCount * 4);
+    writeTextGlyphInkDensities(textGlyphCount, scene.textGlyphMetaA, glyphMetaB,
+      scene.textGlyphSegmentsA, scene.textGlyphSegmentsB);
     this.textGlyphMetaTextureB = createFloatTexture(
-      scene.textGlyphMetaB,
+      glyphMetaB,
       textGlyphCount,
       glyphMetaTextureSize.width,
       glyphMetaTextureSize.height

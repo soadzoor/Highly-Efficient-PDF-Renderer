@@ -78,7 +78,7 @@ try {
     const vertex = shaders.vertexShader;
     if (name.includes("fill") || name === "gradient patch mesh") {
       assert.match(vertex, /heprFillBandInfo/, `${name}: vertex loads per-path band metadata`);
-      assert.match(shaders.fragmentShader, /countsCrossings/, `${name}: only the row band counts winding`);
+      assert.match(shaders.fragmentShader, /heprBandRows\(bandInfo, band, bandCount, box\)/, `${name}: each band integrates only its own rows`);
       assert.match(shaders.fragmentShader, /packedIndex & 3/, `${name}: packed segment addressing is shared`);
     }
     if (name === "text") {

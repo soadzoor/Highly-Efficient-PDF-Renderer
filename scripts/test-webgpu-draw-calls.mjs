@@ -49,7 +49,7 @@ try {
     const banded = device.shaders.filter(source => source.includes("heprFillBandInfo"));
     assert.equal(banded.length, 2, "solid and gradient native pipelines include the shared band lookup");
     for (const source of banded) {
-      assert.match(source, /countsCrossings/, "neighbouring AA bands cannot duplicate winding");
+      assert.match(source, /heprBandRows\(bandInfo, band, bandCount, box\)/, "each band integrates only its own rows, so neighbouring bands cannot duplicate winding");
       assert.match(source, /packedIndex & 3/, "band entries use packed component addressing");
     }
     const text = device.shaders.find(source => source.includes("uTextGlyphSegmentTexA"));

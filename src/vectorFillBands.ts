@@ -3,17 +3,15 @@ import type { VectorScene } from "./pdfVectorExtractor";
 /**
  * Horizontal-band index over a fill path's segments.
  *
- * Analytic fill coverage asks two questions at every pixel: which side of the
- * path it lies on, and how far the nearest edge is. The first is answered by
- * casting a horizontal ray, so only segments whose y-range contains the pixel
- * can ever change the answer - every other segment in the path is loop
- * iterations and texture fetches spent proving it does not matter. The second
- * only decides anything within half a pixel of an edge, because coverage
- * saturates beyond that.
+ * Analytic fill coverage averages the winding number over a pixel's footprint
+ * box, which sums, over the segments crossing the box's rows, how much of each
+ * row lies left of them. Only segments whose y-range reaches those rows can
+ * contribute - every other segment in the path is loop iterations and texture
+ * fetches spent proving it does not matter.
  *
- * Partitioning a path into horizontal bands answers both exactly: a pixel reads
- * the band holding its own row, widened by the antialiasing radius so the
- * nearest edge cannot be missed where it still affects coverage. A circle drawn
+ * Partitioning a path into horizontal bands answers this exactly: a pixel reads
+ * the bands its footprint's rows span, and integrates each band over its own
+ * rows only, so a segment listed in two bands still counts once. A circle drawn
  * as a thousand dash quads goes from a thousand segments per pixel to a handful,
  * with identical output - the geometry is untouched, only the search over it.
  */

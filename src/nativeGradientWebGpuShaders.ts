@@ -1,4 +1,5 @@
 import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import { VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
@@ -164,6 +165,8 @@ ${CAMERA_STRUCT}
 ${gradientBindings(7)}
 ${GRADIENT_FUNCTIONS}
 ${VECTOR_FILL_BAND_INFO_WGSL}
+${FILL_COVERAGE_WGSL}
+${FILL_COVERAGE_VERTEX_WGSL}
 
 struct FillOut {
   @builtin(position) position : vec4f,
@@ -206,7 +209,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
     return out;
   }
   let corner = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let world = mix(metaA.zw, metaB.xy, corner);
+  // Reach pixels whose footprint touches a path narrower than a pixel.
+  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  let world = mix(metaA.zw - margin, metaB.xy + margin, corner);
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   out.position = vec4f((screen / (0.5 * uCamera.viewport)) - 1.0, 0.0, 1.0);
   out.local = world;
@@ -221,19 +226,6 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   return out;
 }
 
-fn accumulateCrossing(start : vec2f, end : vec2f, point : vec2f, winding : ptr<function, i32>, crossings : ptr<function, i32>) {
-  let upward = start.y <= point.y && end.y > point.y;
-  let downward = start.y > point.y && end.y <= point.y;
-  if (!upward && !downward) { return; }
-  let denominator = end.y - start.y;
-  if (abs(denominator) <= 1e-6) { return; }
-  let x = start.x + (point.y - start.y) * (end.x - start.x) / denominator;
-  if (x > point.x) {
-    *crossings = *crossings + 1;
-    *winding = *winding + select(-1, 1, upward);
-  }
-}
-
 @fragment
 fn fsMain(inData : FillOut) -> @location(0) vec4f {
   // Derivatives must be evaluated before any potentially non-uniform branch,
@@ -241,50 +233,31 @@ fn fsMain(inData : FillOut) -> @location(0) vec4f {
   let dx = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
   let dy = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
   let aaWidth = max(max(dx, dy) * uCamera.fillAAScreenPx, 1e-4);
+  let footprint = max(vec2f(dx, dy) * uCamera.fillAAScreenPx, vec2f(1e-4));
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) { discard; }
   let dimensions = textureDimensions(uSegmentsA);
-  var minDistance = 1e20;
-  var winding = 0;
-  var crossings = 0;
-  let searchRadius = select(aaWidth, 0.0, inData.companionStroke >= 0.5);
+  // Average the winding number over the footprint box. The bands spanning its
+  // rows hold every segment that can contribute; each integrates its own rows.
+  let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
+  var winding = 0.0;
 ${vectorFillBandLoopWgsl({
     bands: "inData.bands",
     y: "inData.local.y",
-    radius: "searchRadius",
+    radius: "0.5 * footprint.y",
     count: "inData.segmentCount",
     start: "inData.segmentStart",
     texture: "uSegmentsA",
     entries: "uCamera.fillBands.w",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
     edge: `
-      var edgeWinding = 0;
-      var edgeCrossings = 0;
     let coord = coordFromIndex(segmentIndex, i32(dimensions.x));
     let primitiveA = textureLoad(uSegmentsA, coord, 0);
     let primitiveB = textureLoad(uSegmentsB, coord, 0);
-    let p0 = primitiveA.xy;
-    let p1 = primitiveA.zw;
-    let p2 = primitiveB.xy;
-    if (primitiveB.z >= 0.5) {
-      minDistance = min(minDistance, distanceToQuadratic(inData.local, p0, p1, p2));
-      var previous = p0;
-      for (var step = 1; step <= 8; step = step + 1) {
-        let next = quadraticPoint(p0, p1, p2, f32(step) / 8.0);
-        accumulateCrossing(previous, next, inData.local, &edgeWinding, &edgeCrossings);
-        previous = next;
-      }
-    } else {
-      minDistance = min(minDistance, distanceToLine(inData.local, p0, p2));
-      accumulateCrossing(p0, p2, inData.local, &edgeWinding, &edgeCrossings);
-    }
-      if (countsCrossings) { winding += edgeWinding; crossings += edgeCrossings; }
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= 0.5, box, rows.x, rows.y);
 `
   })}
-  let inside = select(winding != 0, (crossings & 1) == 1, inData.fillRule >= 0.5);
-  var coverage = select(0.0, 1.0, inside);
-  if (inData.companionStroke < 0.5) {
-    let signedDistance = select(minDistance, -minDistance, inside);
-    coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
-  }
+  let coverage = heprFillCoverage(winding, inData.fillRule >= 0.5);
   let source = select(vec4f(inData.solidColor, 1.0), samplePdfGradient(inData.sourceGradient, inData.local), inData.sourceGradient >= 0);
   let maskAlpha = select(1.0, samplePdfGradient(inData.maskGradient, inData.local).a, inData.maskGradient >= 0);
   let alpha = coverage * inData.alpha * source.a * maskAlpha;

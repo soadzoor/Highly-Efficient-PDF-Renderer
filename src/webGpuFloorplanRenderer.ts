@@ -1,4 +1,5 @@
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { vectorFillBandStore, vectorFillBandIndex, buildVectorFillBandIndex } from "./vectorFillBands";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
@@ -55,6 +56,7 @@ import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import {
   appendTextLodCombinedPayload,
   TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+  writeTextGlyphInkDensities,
   type TextLodBuildData
 } from "./textGreekLod";
 import { createOrthographicLocalToClip } from "./planarProjection";
@@ -66,7 +68,7 @@ import {
   type TextLodStats
 } from "./textLodCore";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
-import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { buildTextRasterAtlas, TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
   takePrebuiltVectorStrokeLodRuntime,
@@ -397,8 +399,6 @@ ${WGSL_OUTPUT_COLOR_HELPERS}
 ${VECTOR_FILL_BAND_INFO_WGSL}
 
 const FILL_PRIMITIVE_QUADRATIC : f32 = 1.0;
-const QUAD_WINDING_SUBDIVISIONS : i32 = 6;
-
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
   switch (vertexIndex) {
     case 0u: {
@@ -420,98 +420,8 @@ fn coordFromIndex(index : i32, width : i32) -> vec2<i32> {
   return vec2<i32>(index % width, index / width);
 }
 
-fn distanceToLineSegment(p : vec2f, a : vec2f, b : vec2f) -> f32 {
-  let ab = b - a;
-  let abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-fn distanceToQuadraticBezier(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> f32 {
-  let aa = b - a;
-  let bb = a - 2.0 * b + c;
-  let cc = aa * 2.0;
-  let dd = a - p;
-
-  let bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  let inv = 1.0 / bbLenSq;
-  let kx = inv * dot(aa, bb);
-  let ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  let kz = inv * dot(dd, aa);
-
-  let pValue = ky - kx * kx;
-  let pCube = pValue * pValue * pValue;
-  let qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  let hValue = qValue * qValue + 4.0 * pCube;
-
-  var best = 1e20;
-
-  if (hValue >= 0.0) {
-    let hSqrt = sqrt(hValue);
-    let roots = (vec2f(hSqrt, -hSqrt) - qValue) * 0.5;
-    let uv = sign(roots) * pow(abs(roots), vec2f(1.0 / 3.0));
-    let t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    let delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    let z = sqrt(-pValue);
-    let acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    let angle = acos(acosArg) / 3.0;
-    let cosine = cos(angle);
-    let sine = sin(angle) * 1.732050808;
-    let t = clamp(vec3f(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, vec3f(0.0), vec3f(1.0));
-
-    var delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
-
-fn evaluateQuadratic(a : vec2f, b : vec2f, c : vec2f, t : f32) -> vec2f {
-  let oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-fn accumulateLineCrossing(a : vec2f, b : vec2f, p : vec2f, winding : ptr<function, i32>, crossings : ptr<function, i32>) {
-  let upward = (a.y <= p.y) && (b.y > p.y);
-  let downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  let denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    *crossings = *crossings + 1;
-    *winding = *winding + select(-1, 1, upward);
-  }
-}
-
-fn accumulateQuadraticCrossing(a : vec2f, b : vec2f, c : vec2f, p : vec2f, winding : ptr<function, i32>, crossings : ptr<function, i32>) {
-  var prev = a;
-  for (var i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i = i + 1) {
-    let t = f32(i) / f32(QUAD_WINDING_SUBDIVISIONS);
-    let next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding, crossings);
-    prev = next;
-  }
-}
+${FILL_COVERAGE_WGSL}
+${FILL_COVERAGE_VERTEX_WGSL}
 
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
@@ -546,7 +456,10 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let minBounds = metaA.zw;
   let maxBounds = metaB.xy;
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let world = mix(minBounds, maxBounds, corner01);
+  // Pixels whose footprint reaches the path need fragments even when the path
+  // is thinner than a pixel and falls between pixel centres.
+  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  let world = mix(minBounds - margin, maxBounds + margin, corner01);
 
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   let clip = (screen / (0.5 * uCamera.viewport)) - 1.0;
@@ -569,9 +482,11 @@ ${VECTOR_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  let pixelToLocalX = length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x)));
-  let pixelToLocalY = length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)));
-  let aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uCamera.fillAAScreenPx, 1e-4);
+  // The path-space footprint of this pixel, taken before any discard.
+  let footprint = max(vec2f(
+    length(vec2f(dpdx(inData.local.x), dpdy(inData.local.x))),
+    length(vec2f(dpdx(inData.local.y), dpdy(inData.local.y)))
+  ) * uCamera.fillAAScreenPx, vec2f(1e-4));
 
   if (inData.segmentCount <= 0 || inData.alpha <= 0.001) {
     discard;
@@ -579,58 +494,32 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
 
   let fillSegDims = textureDimensions(uFillSegmentTexA);
 
-  var minDistance = 1e20;
-  var winding = 0;
-  var crossings = 0;
-
-  let searchRadius = select(aaWidth, 0.0, inData.fillHasCompanionStroke >= 0.5);
+  // Average the winding number over the footprint box. The bands spanning its
+  // rows hold every segment that can contribute; each integrates its own rows.
+  let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
+  var winding = 0.0;
 ${vectorFillBandLoopWgsl({
     bands: "inData.bands",
     y: "inData.local.y",
-    radius: "searchRadius",
+    radius: "0.5 * footprint.y",
     count: "inData.segmentCount",
     start: "inData.segmentStart",
     texture: "uFillSegmentTexA",
     entries: "uCamera.fillBands.y",
+    setup: "let rows = heprBandRows(bandInfo, band, bandCount, box);",
     edge: `
-      var edgeWinding = 0;
-      var edgeCrossings = 0;
     let coord = coordFromIndex(segmentIndex, i32(fillSegDims.x));
-
     let primitiveA = textureLoad(uFillSegmentTexA, coord, 0);
     let primitiveB = textureLoad(uFillSegmentTexB, coord, 0);
-    let p0 = primitiveA.xy;
-    let p1 = primitiveA.zw;
-    let p2 = primitiveB.xy;
-    let primitiveType = primitiveB.z;
-
-    if (primitiveType >= FILL_PRIMITIVE_QUADRATIC) {
-      minDistance = min(minDistance, distanceToQuadraticBezier(inData.local, p0, p1, p2));
-      accumulateQuadraticCrossing(p0, p1, p2, inData.local, &edgeWinding, &edgeCrossings);
-    } else {
-      minDistance = min(minDistance, distanceToLineSegment(inData.local, p0, p2));
-      accumulateLineCrossing(p0, p2, inData.local, &edgeWinding, &edgeCrossings);
-    }
-      if (countsCrossings) { winding += edgeWinding; crossings += edgeCrossings; }
+    winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+      primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
 `
   })}
 
-  let insideNonZero = winding != 0;
-  let insideEvenOdd = (crossings & 1) == 1;
-  let inside = select(insideNonZero, insideEvenOdd, inData.fillRule >= 0.5);
   let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-
-  if (inData.fillHasCompanionStroke >= 0.5) {
-    let alpha = select(0.0, inData.alpha, inside);
-    if (alpha <= 0.001) {
-      discard;
-    }
-    return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.local, inData.vectorClipIndex, uVectorClipTex);
-  }
-
-  let signedDistance = select(minDistance, -minDistance, inside);
-
-  let coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  // A companion stroke no longer hides a hard fill edge: thin filled shapes
+  // need their own coverage, and wide strokes still cover the edge.
+  let coverage = heprFillCoverage(winding, inData.fillRule >= 0.5);
   let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.alpha;
   if (alpha <= 0.001) {
     discard;
@@ -686,6 +575,7 @@ struct VsOut {
   @location(6) normCoord : vec2f,
   @location(7) world : vec2f,
   @location(8) @interpolate(flat) clipRect : vec4f,
+  @location(9) @interpolate(flat) inkDensity : f32,
 };
 
 ${WGSL_OUTPUT_COLOR_HELPERS}
@@ -713,170 +603,8 @@ fn coordFromIndex(index : i32, width : i32) -> vec2<i32> {
   return vec2<i32>(index % width, index / width);
 }
 
-fn textLineDistanceInfo(p : vec2f, a : vec2f, b : vec2f) -> vec4f {
-  let ab = b - a;
-  let abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return vec4f(length(p - a), 0.0, 1.0, 0.0);
-  }
-  let t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  let offset = p - (a + ab * t);
-  let tangent = ab * inverseSqrt(abLenSq);
-  let leftNormal = vec2f(-tangent.y, tangent.x);
-  return vec4f(length(offset), t, leftNormal);
-}
-
-fn textQuadraticDistanceInfo(p : vec2f, a : vec2f, b : vec2f, c : vec2f) -> vec4f {
-  let aa = b - a;
-  let bb = a - 2.0 * b + c;
-  let cc = aa * 2.0;
-  let dd = a - p;
-
-  let bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return textLineDistanceInfo(p, a, c);
-  }
-
-  let inv = 1.0 / bbLenSq;
-  let kx = inv * dot(aa, bb);
-  let ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  let kz = inv * dot(dd, aa);
-
-  let pValue = ky - kx * kx;
-  let pCube = pValue * pValue * pValue;
-  let qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  let hValue = qValue * qValue + 4.0 * pCube;
-
-  var best = 1e20;
-  var closestT = 0.0;
-
-  if (hValue >= 0.0) {
-    let hSqrt = sqrt(hValue);
-    let roots = (vec2f(hSqrt, -hSqrt) - qValue) * 0.5;
-    let uv = sign(roots) * pow(abs(roots), vec2f(1.0 / 3.0));
-    closestT = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    let delta = dd + (cc + bb * closestT) * closestT;
-    best = dot(delta, delta);
-  } else {
-    let z = sqrt(-pValue);
-    let acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    let angle = acos(acosArg) / 3.0;
-    let cosine = cos(angle);
-    let sine = sin(angle) * 1.732050808;
-    let t = clamp(vec3f(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, vec3f(0.0), vec3f(1.0));
-
-    var delta = dd + (cc + bb * t.x) * t.x;
-    best = dot(delta, delta);
-    closestT = t.x;
-    delta = dd + (cc + bb * t.y) * t.y;
-    var candidate = dot(delta, delta);
-    if (candidate < best) {
-      best = candidate;
-      closestT = t.y;
-    }
-    delta = dd + (cc + bb * t.z) * t.z;
-    candidate = dot(delta, delta);
-    if (candidate < best) {
-      best = candidate;
-      closestT = t.z;
-    }
-  }
-
-  let closestPoint = evaluateQuadratic(a, b, c, closestT);
-  var tangent = 2.0 * ((1.0 - closestT) * (b - a) + closestT * (c - b));
-  var tangentLenSq = dot(tangent, tangent);
-  if (tangentLenSq <= 1e-12) {
-    tangent = c - a;
-    tangentLenSq = dot(tangent, tangent);
-  }
-  var leftNormal = vec2f(1.0, 0.0);
-  if (tangentLenSq > 1e-12) {
-    leftNormal = vec2f(-tangent.y, tangent.x) * inverseSqrt(tangentLenSq);
-  }
-  return vec4f(sqrt(max(best, 0.0)), closestT, leftNormal);
-}
-
-fn evaluateQuadratic(a : vec2f, b : vec2f, c : vec2f, t : f32) -> vec2f {
-  let oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-fn accumulateLineCrossing(a : vec2f, b : vec2f, p : vec2f, winding : ptr<function, i32>) {
-  let upward = (a.y <= p.y) && (b.y > p.y);
-  let downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  let denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  let xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    *winding = *winding + select(-1, 1, upward);
-  }
-}
-
-fn accumulateQuadraticCrossingRoot(
-  a : vec2f,
-  b : vec2f,
-  c : vec2f,
-  p : vec2f,
-  ay : f32,
-  by : f32,
-  t : f32,
-  winding : ptr<function, i32>
-) {
-  let rootEps = 1e-5;
-  if (t < -rootEps || t >= 1.0 - rootEps) {
-    return;
-  }
-
-  let tc = clamp(t, 0.0, 1.0);
-  let oneMinusT = 1.0 - tc;
-  let xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
-  if (xCross <= p.x) {
-    return;
-  }
-
-  let dy = by + 2.0 * ay * tc;
-  if (abs(dy) <= 1e-6) {
-    return;
-  }
-
-  *winding = *winding + select(-1, 1, dy > 0.0);
-}
-
-fn accumulateQuadraticCrossing(a : vec2f, b : vec2f, c : vec2f, p : vec2f, winding : ptr<function, i32>) {
-  let ay = a.y - 2.0 * b.y + c.y;
-  let by = 2.0 * (b.y - a.y);
-  let cy = a.y - p.y;
-
-  if (abs(ay) <= 1e-8) {
-    if (abs(by) <= 1e-8) {
-      return;
-    }
-    let t = -cy / by;
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t, winding);
-    return;
-  }
-
-  let discriminant = by * by - 4.0 * ay * cy;
-  if (discriminant < 0.0) {
-    return;
-  }
-
-  let sqrtDiscriminant = sqrt(max(discriminant, 0.0));
-  let invDen = 0.5 / ay;
-  let t0 = (-by - sqrtDiscriminant) * invDen;
-  let t1 = (-by + sqrtDiscriminant) * invDen;
-  accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t0, winding);
-  if (abs(t1 - t0) > 1e-5) {
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t1, winding);
-  }
-}
+${FILL_COVERAGE_WGSL}
+${FILL_COVERAGE_VERTEX_WGSL}
 
 @vertex
 fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> VsOut {
@@ -920,13 +648,17 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     out.normCoord = vec2f(0.0, 0.0);
     out.world = vec2f(0.0, 0.0);
     out.clipRect = vec4f(0.0, 0.0, 0.0, 0.0);
+    out.inkDensity = 0.0;
     return out;
   }
 
   let minBounds = glyphMetaA.zw;
   let maxBounds = glyphMetaB.xy;
   let corner01 = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  let local = mix(minBounds, maxBounds, corner01);
+  // Widen the glyph quad by a pixel in glyph space, so stems and dots thinner
+  // than a pixel reach every pixel their footprint touches.
+  let margin = heprCoverageMargin(uCamera.zoom * mat2x2f(instanceA.x, instanceA.y, instanceA.z, instanceA.w));
+  let local = mix(minBounds - margin, maxBounds + margin, corner01);
 
   let world = vec2f(
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
@@ -952,7 +684,9 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   out.color = instanceC.xyz;
   out.colorAlpha = instanceC.w;
   out.rasterRect = glyphRasterMeta;
-  out.normCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2f(1e-6, 1e-6)), vec2f(0.0), vec2f(1.0));
+  out.inkDensity = glyphMetaB.z;
+  // Unclamped, so the margin samples the atlas tile's transparent padding.
+  out.normCoord = (local - minBounds) / max(maxBounds - minBounds, vec2f(1e-6, 1e-6));
   out.world = world;
   return out;
 }
@@ -973,10 +707,10 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let localDy = dpdy(inData.local);
   let pixelToLocalX = length(vec2f(localDx.x, localDy.x));
   let pixelToLocalY = length(vec2f(localDx.y, localDy.y));
-  // Frobenius is a conservative bound for primitive culling in every normal
-  // direction; final coverage below uses the tighter projected-normal width.
-  let localPerPixel = length(vec2f(pixelToLocalX, pixelToLocalY));
-  let baseAAWidth = max(localPerPixel * uCamera.textAAScreenPx, 1e-4);
+  let glyphPixel = vec2f(
+    length(vec2f(dpdx(inData.normCoord.x), dpdy(inData.normCoord.x))),
+    length(vec2f(dpdx(inData.normCoord.y), dpdy(inData.normCoord.y)))
+  );
   let atlasDims = vec2f(textureDimensions(uTextRasterAtlasTex));
   let nc = vec2f(inData.normCoord.x, 1.0 - inData.normCoord.y) * (inData.rasterRect.zw * atlasDims);
   let dncDx = dpdx(nc);
@@ -988,187 +722,100 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     discard;
   }
 
-  if (
-    uCamera.textVectorOnly < 0.5 &&
-    inData.rasterRect.z > 0.0 &&
-    inData.rasterRect.w > 0.0 &&
-    min(ncFwidthX, ncFwidthY) > 2.0
-  ) {
-    let uvCenter = vec2f(
-      inData.rasterRect.x + inData.normCoord.x * inData.rasterRect.z,
-      inData.rasterRect.y + (1.0 - inData.normCoord.y) * inData.rasterRect.w
-    );
-    let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
-    let uvMin = inData.rasterRect.xy + texel * 0.5;
-    let uvMax = inData.rasterRect.xy + inData.rasterRect.zw - texel * 0.5;
-    let tapDx = dncDx * 0.33 * texel;
-    let tapDy = dncDy * 0.33 * texel;
-    // textureSampleGrad is valid in non-uniform control flow. The gradients
-    // were evaluated above the branch for derivative-uniformity and retain the
-    // anisotropic footprint. Scaling by exp2(-1.25) preserves the old mip bias.
-    let mipBiasedUvDx = dncDx * texel * 0.42044820762685725;
-    let mipBiasedUvDy = dncDy * texel * 0.42044820762685725;
-    let alphaRaster = (1.0 / 3.0) * textureSampleGrad(
-      uTextRasterAtlasTex,
-      uTextRasterSampler,
-      clamp(uvCenter, uvMin, uvMax),
-      mipBiasedUvDx,
-      mipBiasedUvDy
-    ).r + (1.0 / 6.0) * (
-      textureSampleGrad(
+  // A glyph a few pixels across is its box at mean ink density, as coarse
+  // text LOD runs are, so switching between them changes nothing. Its shape
+  // fades in as it grows from 2.5 to 5 pixels.
+  let glyphPixels = 1.0 / max(min(glyphPixel.x, glyphPixel.y), 1e-6);
+  let detail = clamp((glyphPixels - 2.5) / 2.5, 0.0, 1.0);
+  let halfBox = max(0.5 * uCamera.textAAScreenPx * glyphPixel, vec2f(1e-6));
+  let boxOverlap = max(min(inData.normCoord + halfBox, vec2f(1.0)) - max(inData.normCoord - halfBox, vec2f(0.0)), vec2f(0.0)) /
+    (2.0 * halfBox);
+  var coverage = clamp(inData.inkDensity, 0.0, 1.0) * boxOverlap.x * boxOverlap.y;
+
+  if (detail > 0.0) {
+    var detailCoverage = 0.0;
+    if (
+      uCamera.textVectorOnly < 0.5 &&
+      inData.rasterRect.z > 0.0 &&
+      inData.rasterRect.w > 0.0 &&
+      min(ncFwidthX, ncFwidthY) > 2.0
+    ) {
+      let uvCenter = vec2f(
+        inData.rasterRect.x + inData.normCoord.x * inData.rasterRect.z,
+        inData.rasterRect.y + (1.0 - inData.normCoord.y) * inData.rasterRect.w
+      );
+      let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
+      // The widened quad reaches past the glyph box into its tile's transparent
+      // padding, which must read as empty rather than repeat the edge texels.
+      let padding = texel * ${TEXT_RASTER_ATLAS_PADDING_PX - 0.5};
+      let uvMin = inData.rasterRect.xy - padding;
+      let uvMax = inData.rasterRect.xy + inData.rasterRect.zw + padding;
+      let tapDx = dncDx * 0.33 * texel;
+      let tapDy = dncDy * 0.33 * texel;
+      // Coarser mips than the padding blend neighbouring glyphs' ink in.
+      let mipCap = min(1.0, ${TEXT_RASTER_ATLAS_PADDING_PX}.0 /
+        max(max(length(dncDx), length(dncDy)) * 0.42044820762685725, 1e-6));
+      // textureSampleGrad is valid in non-uniform control flow. The gradients
+      // were evaluated above the branch for derivative-uniformity and retain the
+      // anisotropic footprint. Scaling by exp2(-1.25) preserves the old mip bias.
+      let mipBiasedUvDx = dncDx * texel * 0.42044820762685725 * mipCap;
+      let mipBiasedUvDy = dncDy * texel * 0.42044820762685725 * mipCap;
+      detailCoverage = (1.0 / 3.0) * textureSampleGrad(
         uTextRasterAtlasTex,
         uTextRasterSampler,
-        clamp(uvCenter - tapDx - tapDy, uvMin, uvMax),
+        clamp(uvCenter, uvMin, uvMax),
         mipBiasedUvDx,
         mipBiasedUvDy
-      ).r +
-      textureSampleGrad(
-        uTextRasterAtlasTex,
-        uTextRasterSampler,
-        clamp(uvCenter - tapDx + tapDy, uvMin, uvMax),
-        mipBiasedUvDx,
-        mipBiasedUvDy
-      ).r +
-      textureSampleGrad(
-        uTextRasterAtlasTex,
-        uTextRasterSampler,
-        clamp(uvCenter + tapDx - tapDy, uvMin, uvMax),
-        mipBiasedUvDx,
-        mipBiasedUvDy
-      ).r +
-      textureSampleGrad(
-        uTextRasterAtlasTex,
-        uTextRasterSampler,
-        clamp(uvCenter + tapDx + tapDy, uvMin, uvMax),
-        mipBiasedUvDx,
-        mipBiasedUvDy
-      ).r
-    );
-    let alpha = heprLinearCoverageToOutputAlpha(alphaRaster) * inData.colorAlpha;
-    if (alpha <= 0.001) {
-      discard;
+      ).r + (1.0 / 6.0) * (
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter - tapDx - tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r +
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter - tapDx + tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r +
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter + tapDx - tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r +
+        textureSampleGrad(
+          uTextRasterAtlasTex,
+          uTextRasterSampler,
+          clamp(uvCenter + tapDx + tapDy, uvMin, uvMax),
+          mipBiasedUvDx,
+          mipBiasedUvDy
+        ).r
+      );
+    } else {
+      // Average the glyph's nonzero winding number over the pixel footprint in
+      // glyph space. Thin stems keep their ink instead of snapping to pixels.
+      let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
+      let footprint = max(vec2f(pixelToLocalX, pixelToLocalY) * uCamera.textAAScreenPx, vec2f(1e-4));
+      let box = vec4f(inData.local - 0.5 * footprint, 1.0 / footprint);
+      var winding = 0.0;
+      for (var i = 0; i < inData.segmentCount; i = i + 1) {
+        let coord = coordFromIndex(inData.segmentStart + i, i32(glyphSegDims.x));
+        let primitiveA = textureLoad(uTextGlyphSegmentTexA, coord, 0);
+        let primitiveB = textureLoad(uTextGlyphSegmentTexB, coord, 0);
+        winding = winding + heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+          uCamera.textCurveEnabled >= 0.5 && primitiveB.z >= TEXT_PRIMITIVE_QUADRATIC, box, 0.0, 1.0);
+      }
+      detailCoverage = heprFillCoverage(winding, false);
     }
-    let color = mix(inData.color, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-    return heprEncodeOutputColor(vec4f(color, alpha)) * heprVectorClip(inData.world, inData.vectorClipIndex, uVectorClipTex);
+    coverage = mix(coverage, detailCoverage, detail);
   }
 
-  let glyphSegDims = textureDimensions(uTextGlyphSegmentTexA);
-
-  let coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
-  // Outside the antialiasing band the smoothstep below saturates, so the winding
-  // number alone decides the pixel and exact distances stop mattering. The small
-  // margin keeps coincident-edge grouping from losing a tie candidate.
-  let aaCullDistance = baseAAWidth * 1.05 + coincidentEpsilon;
-  // A tiny deterministic offset keeps exact-on-edge winding tests stable.
-  let queryLocal = inData.local + 0.001 * (localDx + 0.37 * localDy);
-  var minDistance = 1e20;
-  var nearestT = 0.0;
-  var nearestPoint = vec2f(0.0);
-  var nearestNormal = vec2f(1.0, 0.0);
-  var nearestSideMultiplicity = 0;
-  var winding = 0;
-
-  for (var i = 0; i < inData.segmentCount; i = i + 1) {
-    if (i >= inData.segmentCount) {
-      break;
-    }
-
-    let segmentIndex = inData.segmentStart + i;
-    let coord = coordFromIndex(segmentIndex, i32(glyphSegDims.x));
-
-    let primitiveA = textureLoad(uTextGlyphSegmentTexA, coord, 0);
-    let primitiveB = textureLoad(uTextGlyphSegmentTexB, coord, 0);
-    let p0 = primitiveA.xy;
-    let p1 = primitiveA.zw;
-    let p2 = primitiveB.xy;
-    let primitiveType = primitiveB.z;
-    let isQuadratic = uCamera.textCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC;
-
-    // A quadratic stays inside the hull of its control points, so this box
-    // contains the primitive for both curve and line cases.
-    var hullMin = min(p0, p2);
-    var hullMax = max(p0, p2);
-    if (isQuadratic) {
-      hullMin = min(hullMin, p1);
-      hullMax = max(hullMax, p1);
-    }
-
-    // The ray used for the winding test travels along +x, so it can only cross
-    // this primitive within the box's y span and to the right of the query point.
-    let mayCross = queryLocal.y >= hullMin.y && queryLocal.y <= hullMax.y && hullMax.x > queryLocal.x;
-
-    // Distance to the box lower-bounds the distance to the primitive inside it.
-    let boundOffset = max(max(hullMin - queryLocal, queryLocal - hullMax), vec2f(0.0));
-    let cullDistance = min(aaCullDistance, minDistance + coincidentEpsilon);
-    let mayBeNearest = dot(boundOffset, boundOffset) <= cullDistance * cullDistance;
-
-    if (!mayCross && !mayBeNearest) {
-      continue;
-    }
-
-    if (mayBeNearest) {
-      var distanceInfo : vec4f;
-      var closestPoint : vec2f;
-      if (isQuadratic) {
-        distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
-        closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
-      } else {
-        distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
-        closestPoint = mix(p0, p2, distanceInfo.y);
-      }
-
-      let signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
-      let sideStep = select(-1, 1, signedOffset >= 0.0);
-      if (distanceInfo.x + coincidentEpsilon < minDistance) {
-        minDistance = distanceInfo.x;
-        nearestT = distanceInfo.y;
-        nearestPoint = closestPoint;
-        nearestNormal = distanceInfo.zw;
-        nearestSideMultiplicity = sideStep;
-      } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
-        let normalAlignment = dot(distanceInfo.zw, nearestNormal);
-        let bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
-          nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
-        let sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
-          abs(normalAlignment) >= 0.9999;
-        if (sameEdge) {
-          nearestSideMultiplicity = nearestSideMultiplicity + sideStep;
-          minDistance = min(minDistance, distanceInfo.x);
-        } else if (distanceInfo.x < minDistance) {
-          minDistance = distanceInfo.x;
-          nearestT = distanceInfo.y;
-          nearestPoint = closestPoint;
-          nearestNormal = distanceInfo.zw;
-          nearestSideMultiplicity = sideStep;
-        }
-      }
-    }
-
-    if (mayCross) {
-      if (isQuadratic) {
-        accumulateQuadraticCrossing(p0, p1, p2, queryLocal, &winding);
-      } else {
-        accumulateLineCrossing(p0, p2, queryLocal, &winding);
-      }
-    }
-  }
-
-  let inside = winding != 0;
-  let acrossWinding = winding - nearestSideMultiplicity;
-  let nearestSeparatesFill = inside != (acrossWinding != 0);
-  let signedDistance = select(minDistance, -minDistance, inside);
-  // Keep the maximum derivative above for conservative primitive culling, but
-  // resolve final coverage with the derivative along the nearest edge normal.
-  // This prevents tilted glyph edges from acquiring over-wide grey bands.
-  let edgeAAWidth = max(
-    length(vec2f(dot(localDx, nearestNormal), dot(localDy, nearestNormal))) * uCamera.textAAScreenPx,
-    1e-4
-  );
-  let edgeAlpha = 1.0 - smoothstep(-edgeAAWidth, edgeAAWidth, signedDistance);
-  // Nonzero fill stays opaque across overlap-only contour edges. Coincident
-  // exterior edges are grouped above and antialiased as one true boundary.
-  let alphaBase = select(select(0.0, 1.0, inside), edgeAlpha, nearestSeparatesFill);
-  let alpha = heprLinearCoverageToOutputAlpha(alphaBase) * inData.colorAlpha;
+  let alpha = heprLinearCoverageToOutputAlpha(coverage) * inData.colorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -5996,6 +5643,8 @@ function prepareNativeTextUploadArrays(
     arrays.textGlyphSegmentsA.set(scene.textGlyphSegmentsA);
     arrays.textGlyphSegmentsB.set(scene.textGlyphSegmentsB);
   }
+  writeTextGlyphInkDensities(scene.textGlyphCount + (textLodData ? 1 : 0), arrays.textGlyphMetaA,
+    arrays.textGlyphMetaB, arrays.textGlyphSegmentsA, arrays.textGlyphSegmentsB);
   const clipRectCount = Math.floor((scene.textClipRects?.length ?? 0) / 4);
   if (clipRectCount > 0) {
     const clipMetaOffset = scene.textGlyphCount + (textLodData ? 1 : 0);

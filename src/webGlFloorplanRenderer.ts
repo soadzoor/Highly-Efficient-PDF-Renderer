@@ -1,4 +1,5 @@
 import { STROKE_COVERAGE_GLSL, STROKE_DENSITY_GLSL } from "./strokeCoverageShaders";
+import { FILL_COVERAGE_GLSL, FILL_COVERAGE_VERTEX_GLSL } from "./fillCoverageShaders";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
@@ -49,6 +50,7 @@ import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import {
   appendTextLodCombinedPayload,
   TEXT_LOD_SOLID_GLYPH_SEGMENT_COUNT,
+  writeTextGlyphInkDensities,
   type TextLodBuildData
 } from "./textGreekLod";
 import { createOrthographicLocalToClip } from "./planarProjection";
@@ -61,7 +63,7 @@ import {
 } from "./textLodCore";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
 import { prepareSearchHighlights, type SearchHighlightSet } from "./searchHighlights";
-import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { buildTextRasterAtlas, TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlas";
 import {
   shouldUseVectorStrokeLod,
   takePrebuiltVectorStrokeLodRuntime,
@@ -399,6 +401,8 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(x, y);
 }
 
+${FILL_COVERAGE_VERTEX_GLSL}
+
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
   int pathIndex = int(aFillPathIndex + 0.5);
@@ -424,7 +428,11 @@ void main() {
   vec2 minBounds = metaA.zw;
   vec2 maxBounds = metaB.xy;
   vec2 corner01 = aCorner * 0.5 + 0.5;
-  vec2 world = mix(minBounds, maxBounds, corner01);
+  // Pixels whose footprint reaches the path need fragments even when the path
+  // is thinner than a pixel and falls between pixel centres.
+  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(minBounds, maxBounds, corner01),
+    uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);
 
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
@@ -467,7 +475,6 @@ flat in vec4 vFillBands;
 flat in vec3 vColor;
 flat in float vAlpha;
 flat in float vFillRule;
-flat in float vFillHasCompanionStroke;
 in vec2 vLocal;
 
 out vec4 outColor;
@@ -475,7 +482,6 @@ out vec4 outColor;
 ${GLSL_OUTPUT_COLOR_HELPERS}
 
 const float FILL_PRIMITIVE_QUADRATIC = 1.0;
-const int QUAD_WINDING_SUBDIVISIONS = 6;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
@@ -483,143 +489,45 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(x, y);
 }
 
-float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  float abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
-  vec2 aa = b - a;
-  vec2 bb = a - 2.0 * b + c;
-  vec2 cc = aa * 2.0;
-  vec2 dd = a - p;
-
-  float bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  float inv = 1.0 / bbLenSq;
-  float kx = inv * dot(aa, bb);
-  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  float kz = inv * dot(dd, aa);
-
-  float pValue = ky - kx * kx;
-  float pCube = pValue * pValue * pValue;
-  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  float hValue = qValue * qValue + 4.0 * pCube;
-
-  float best = 1e20;
-
-  if (hValue >= 0.0) {
-    float hSqrt = sqrt(hValue);
-    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
-    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    float z = sqrt(-pValue);
-    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    float angle = acos(acosArg) / 3.0;
-    float cosine = cos(angle);
-    float sine = sin(angle) * 1.732050808;
-    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
-
-    vec2 delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
-
-vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
-  float oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding, inout int crossings) {
-  bool upward = (a.y <= p.y) && (b.y > p.y);
-  bool downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  float denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    crossings += 1;
-    winding += upward ? 1 : -1;
-  }
-}
-
-void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding, inout int crossings) {
-  vec2 prev = a;
-  for (int i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i += 1) {
-    float t = float(i) / float(QUAD_WINDING_SUBDIVISIONS);
-    vec2 next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding, crossings);
-    prev = next;
-  }
-}
+${FILL_COVERAGE_GLSL}
 
 ${VECTOR_INSTANCE_CLIP_GLSL}
 
 void main() {
+  // The path-space footprint of this pixel, taken before any discard.
+  vec2 footprint = max(vec2(
+    length(vec2(dFdx(vLocal.x), dFdy(vLocal.x))),
+    length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)))
+  ) * uFillAAScreenPx, vec2(1e-4));
   if (vSegmentCount <= 0 || vAlpha <= 0.001) {
     discard;
   }
 
-  float minDistance = 1e20;
-  int winding = 0;
-  int crossings = 0;
-
-  float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
-  float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
-  float aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uFillAAScreenPx, 1e-4);
-
+  // Average the winding number over the footprint box. Only a segment that
+  // reaches the box's rows can contribute, so the bands spanning those rows
+  // are the whole search. Each band integrates only its own rows, so a
+  // segment listed in two bands contributes each part once.
+  vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
+  float winding = 0.0;
   int bandCount = int(vFillBands.y);
-  // Only a segment whose vertical extent reaches this row can cross its ray,
-  // and only one within the antialiasing radius can still change coverage, so
-  // the bands spanning that reach are the whole search. Crossings are counted
-  // in the row's own band alone, which is where every segment that can cross
-  // it must be listed; a segment listed in a neighbouring band as well then
-  // contributes its distance without being counted twice.
   int firstBand = 0;
   int lastBand = 0;
-  int rowBand = 0;
   if (bandCount > 0) {
-    float searchRadius = vFillHasCompanionStroke >= 0.5 ? 0.0 : aaWidth;
     float bandHeight = vFillBands.w;
-    rowBand = clamp(int(floor((vLocal.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-    firstBand = clamp(int(floor((vLocal.y - searchRadius - vFillBands.z) / bandHeight)), 0, bandCount - 1);
-    lastBand = clamp(int(floor((vLocal.y + searchRadius - vFillBands.z) / bandHeight)), 0, bandCount - 1);
+    firstBand = clamp(int(floor((box.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
+    lastBand = clamp(int(floor((box.y + footprint.y - vFillBands.z) / bandHeight)), 0, bandCount - 1);
   }
 
   for (int band = firstBand; band <= lastBand; band += 1) {
     int count = vSegmentCount;
     int entry = 0;
-    bool counts = true;
     if (bandCount > 0) {
       vec4 range = texelFetch(uFillSegmentTexA,
         coordFromIndex(int(vFillBands.x) + band, uFillSegmentTexSize), 0);
       entry = int(range.x);
       count = int(range.y);
-      counts = band == rowBand;
     }
+    vec2 rows = heprBandRows(vFillBands, band, bandCount, box);
     for (int i = 0; i < count; i += 1) {
       int segment = vSegmentStart + i;
       if (bandCount > 0) {
@@ -630,38 +538,15 @@ void main() {
       }
       vec4 primitiveA = texelFetch(uFillSegmentTexA, coordFromIndex(segment, uFillSegmentTexSize), 0);
       vec4 primitiveB = texelFetch(uFillSegmentTexB, coordFromIndex(segment, uFillSegmentTexSize), 0);
-      vec2 p0 = primitiveA.xy;
-      vec2 p1 = primitiveA.zw;
-      vec2 p2 = primitiveB.xy;
-      float primitiveType = primitiveB.z;
-
-      if (primitiveType >= FILL_PRIMITIVE_QUADRATIC) {
-        minDistance = min(minDistance, distanceToQuadraticBezier(vLocal, p0, p1, p2));
-        if (counts) accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding, crossings);
-      } else {
-        minDistance = min(minDistance, distanceToLineSegment(vLocal, p0, p2));
-        if (counts) accumulateLineCrossing(p0, p2, vLocal, winding, crossings);
-      }
+      winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+        primitiveB.z >= FILL_PRIMITIVE_QUADRATIC, box, rows.x, rows.y);
     }
   }
 
-  bool insideNonZero = winding != 0;
-  bool insideEvenOdd = (crossings & 1) == 1;
-  bool inside = vFillRule >= 0.5 ? insideEvenOdd : insideNonZero;
   vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-  if (vFillHasCompanionStroke >= 0.5) {
-    float alpha = inside ? vAlpha : 0.0;
-    if (alpha <= 0.001) {
-      discard;
-    }
-    outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
-    outColor *= heprVectorClip(vLocal);
-    return;
-  }
-
-  float signedDistance = inside ? -minDistance : minDistance;
-
-  float coverage = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  // A companion stroke no longer hides a hard fill edge: thin filled shapes
+  // need their own coverage, and wide strokes still cover the edge.
+  float coverage = heprFillCoverage(winding, vFillRule >= 0.5);
   float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vAlpha;
   if (alpha <= 0.001) {
     discard;
@@ -701,6 +586,7 @@ flat out int vSegmentCount;
 flat out vec3 vColor;
 flat out float vColorAlpha;
 flat out vec4 vRasterRect;
+flat out float vInkDensity;
 out vec2 vNormCoord;
 out vec2 vLocal;
 out vec2 vWorld;
@@ -711,6 +597,8 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int y = index / sizeValue.x;
   return ivec2(x, y);
 }
+
+${FILL_COVERAGE_VERTEX_GLSL}
 
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
@@ -731,6 +619,7 @@ void main() {
     vColor = vec3(0.0);
     vColorAlpha = 0.0;
     vRasterRect = vec4(0.0);
+    vInkDensity = 0.0;
     vNormCoord = vec2(0.0);
     vLocal = vec2(0.0);
     vWorld = vec2(0.0);
@@ -748,7 +637,13 @@ void main() {
   vec2 minBounds = glyphMetaA.zw;
   vec2 maxBounds = glyphMetaB.xy;
   vec2 corner01 = aCorner * 0.5 + 0.5;
-  vec2 local = mix(minBounds, maxBounds, corner01);
+  // Widen the glyph quad by a pixel in glyph space, so stems and dots thinner
+  // than a pixel reach every pixel their footprint touches.
+  mat2 glyphToWorld = mat2(instanceA.x, instanceA.y, instanceA.z, instanceA.w);
+  vec2 margin = heprCoverageMargin(heprPathToPixel(
+    glyphToWorld * mix(minBounds, maxBounds, corner01) + instanceB.xy,
+    uUseLocalToClip, uLocalToClip, uZoom, uViewport) * glyphToWorld);
+  vec2 local = mix(minBounds - margin, maxBounds + margin, corner01);
 
   vec2 world = vec2(
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
@@ -771,7 +666,9 @@ void main() {
   vColor = instanceC.rgb;
   vColorAlpha = instanceC.a;
   vRasterRect = glyphRasterMeta;
-  vNormCoord = clamp((local - minBounds) / max(maxBounds - minBounds, vec2(1e-6)), 0.0, 1.0);
+  vInkDensity = glyphMetaB.z;
+  // Unclamped, so the margin samples the atlas tile's transparent padding.
+  vNormCoord = (local - minBounds) / max(maxBounds - minBounds, vec2(1e-6));
   vLocal = local;
   vWorld = world;
 }
@@ -798,6 +695,7 @@ flat in vec4 vClipRect;
 in vec2 vWorld;
 flat in float vColorAlpha;
 flat in vec4 vRasterRect;
+flat in float vInkDensity;
 in vec2 vNormCoord;
 in vec2 vLocal;
 
@@ -813,167 +711,7 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(x, y);
 }
 
-vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
-  float oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-vec4 textLineDistanceInfo(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  float abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return vec4(length(p - a), 0.0, 1.0, 0.0);
-  }
-  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  vec2 offset = p - (a + ab * t);
-  vec2 tangent = ab * inversesqrt(abLenSq);
-  vec2 leftNormal = vec2(-tangent.y, tangent.x);
-  return vec4(length(offset), t, leftNormal);
-}
-
-vec4 textQuadraticDistanceInfo(vec2 p, vec2 a, vec2 b, vec2 c) {
-  vec2 aa = b - a;
-  vec2 bb = a - 2.0 * b + c;
-  vec2 cc = aa * 2.0;
-  vec2 dd = a - p;
-
-  float bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return textLineDistanceInfo(p, a, c);
-  }
-
-  float inv = 1.0 / bbLenSq;
-  float kx = inv * dot(aa, bb);
-  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  float kz = inv * dot(dd, aa);
-  float pValue = ky - kx * kx;
-  float pCube = pValue * pValue * pValue;
-  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  float hValue = qValue * qValue + 4.0 * pCube;
-  float best = 1e20;
-  float closestT = 0.0;
-
-  if (hValue >= 0.0) {
-    float hSqrt = sqrt(hValue);
-    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
-    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    closestT = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * closestT) * closestT;
-    best = dot(delta, delta);
-  } else {
-    float z = sqrt(-pValue);
-    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    float angle = acos(acosArg) / 3.0;
-    float cosine = cos(angle);
-    float sine = sin(angle) * 1.732050808;
-    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
-
-    vec2 delta = dd + (cc + bb * t.x) * t.x;
-    best = dot(delta, delta);
-    closestT = t.x;
-    delta = dd + (cc + bb * t.y) * t.y;
-    float candidate = dot(delta, delta);
-    if (candidate < best) {
-      best = candidate;
-      closestT = t.y;
-    }
-    delta = dd + (cc + bb * t.z) * t.z;
-    candidate = dot(delta, delta);
-    if (candidate < best) {
-      best = candidate;
-      closestT = t.z;
-    }
-  }
-
-  vec2 closestPoint = evaluateQuadratic(a, b, c, closestT);
-  vec2 tangent = 2.0 * ((1.0 - closestT) * (b - a) + closestT * (c - b));
-  float tangentLenSq = dot(tangent, tangent);
-  if (tangentLenSq <= 1e-12) {
-    tangent = c - a;
-    tangentLenSq = dot(tangent, tangent);
-  }
-  vec2 leftNormal = tangentLenSq > 1e-12
-    ? vec2(-tangent.y, tangent.x) * inversesqrt(tangentLenSq)
-    : vec2(1.0, 0.0);
-  return vec4(sqrt(max(best, 0.0)), closestT, leftNormal);
-}
-
-void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding) {
-  bool upward = (a.y <= p.y) && (b.y > p.y);
-  bool downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  float denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    winding += upward ? 1 : -1;
-  }
-}
-
-void accumulateQuadraticCrossingRoot(
-  vec2 a,
-  vec2 b,
-  vec2 c,
-  vec2 p,
-  float ay,
-  float by,
-  float t,
-  inout int winding
-) {
-  const float ROOT_EPS = 1e-5;
-  if (t < -ROOT_EPS || t >= 1.0 - ROOT_EPS) {
-    return;
-  }
-
-  float tc = clamp(t, 0.0, 1.0);
-  float oneMinusT = 1.0 - tc;
-  float xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
-  if (xCross <= p.x) {
-    return;
-  }
-
-  float dy = by + 2.0 * ay * tc;
-  if (abs(dy) <= 1e-6) {
-    return;
-  }
-
-  winding += dy > 0.0 ? 1 : -1;
-}
-
-void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding) {
-  float ay = a.y - 2.0 * b.y + c.y;
-  float by = 2.0 * (b.y - a.y);
-  float cy = a.y - p.y;
-
-  if (abs(ay) <= 1e-8) {
-    if (abs(by) <= 1e-8) {
-      return;
-    }
-    float t = -cy / by;
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t, winding);
-    return;
-  }
-
-  float discriminant = by * by - 4.0 * ay * cy;
-  if (discriminant < 0.0) {
-    return;
-  }
-
-  float sqrtDiscriminant = sqrt(max(discriminant, 0.0));
-  float invDen = 0.5 / ay;
-  float t0 = (-by - sqrtDiscriminant) * invDen;
-  float t1 = (-by + sqrtDiscriminant) * invDen;
-  accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t0, winding);
-  if (abs(t1 - t0) > 1e-5) {
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t1, winding);
-  }
-}
+${FILL_COVERAGE_GLSL}
 
 ${VECTOR_INSTANCE_CLIP_GLSL}
 
@@ -987,10 +725,10 @@ void main() {
   vec2 localDy = dFdy(vLocal);
   float pixelToLocalX = length(vec2(localDx.x, localDy.x));
   float pixelToLocalY = length(vec2(localDx.y, localDy.y));
-  // The Frobenius norm conservatively bounds stretch along every possible
-  // edge normal. Final coverage below uses the tighter directional width.
-  float localPerPixel = length(vec2(pixelToLocalX, pixelToLocalY));
-  float baseAAWidth = max(localPerPixel * uTextAAScreenPx, 1e-4);
+  vec2 glyphPixel = vec2(
+    length(vec2(dFdx(vNormCoord.x), dFdy(vNormCoord.x))),
+    length(vec2(dFdx(vNormCoord.y), dFdy(vNormCoord.y)))
+  );
   vec2 atlasPxSize = max(uTextRasterAtlasSize, vec2(1.0));
   vec2 nc = vec2(vNormCoord.x, 1.0 - vNormCoord.y) * (vRasterRect.zw * atlasPxSize);
   vec2 dncDx = dFdx(nc);
@@ -1002,161 +740,75 @@ void main() {
     discard;
   }
 
-  if (
-    uTextVectorOnly < 0.5 &&
-    vRasterRect.z > 0.0 &&
-    vRasterRect.w > 0.0 &&
-    min(ncFwidthX, ncFwidthY) > 2.0
-  ) {
-    vec2 uvCenter = vec2(
-      vRasterRect.x + vNormCoord.x * vRasterRect.z,
-      vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
-    );
-    vec2 texel = 1.0 / atlasPxSize;
-    vec2 uvMin = vRasterRect.xy + texel * 0.5;
-    vec2 uvMax = vRasterRect.xy + vRasterRect.zw - texel * 0.5;
-    vec2 tapDx = dncDx * 0.33 * texel;
-    vec2 tapDy = dncDy * 0.33 * texel;
-    // Scale explicit gradients by exp2(-1.25) to preserve the previous mip
-    // bias while matching the WGSL anisotropic footprint exactly.
-    vec2 mipBiasedUvDx = dncDx * texel * 0.42044820762685725;
-    vec2 mipBiasedUvDy = dncDy * texel * 0.42044820762685725;
-    float alpha = (1.0 / 3.0) * textureGrad(
-      uTextRasterAtlasTex,
-      clamp(uvCenter, uvMin, uvMax),
-      mipBiasedUvDx,
-      mipBiasedUvDy
-    ).r +
-      (1.0 / 6.0) * (
-        textureGrad(uTextRasterAtlasTex, clamp(uvCenter - tapDx - tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
-        textureGrad(uTextRasterAtlasTex, clamp(uvCenter - tapDx + tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
-        textureGrad(uTextRasterAtlasTex, clamp(uvCenter + tapDx - tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
-        textureGrad(uTextRasterAtlasTex, clamp(uvCenter + tapDx + tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r
+  // A glyph a few pixels across is its box at mean ink density, as coarse
+  // text LOD runs are, so switching between them changes nothing. Its shape
+  // fades in as it grows from 2.5 to 5 pixels.
+  float glyphPixels = 1.0 / max(min(glyphPixel.x, glyphPixel.y), 1e-6);
+  float detail = clamp((glyphPixels - 2.5) / 2.5, 0.0, 1.0);
+  vec2 halfBox = max(0.5 * uTextAAScreenPx * glyphPixel, vec2(1e-6));
+  vec2 boxOverlap = max(min(vNormCoord + halfBox, vec2(1.0)) - max(vNormCoord - halfBox, vec2(0.0)), vec2(0.0)) /
+    (2.0 * halfBox);
+  float coverage = clamp(vInkDensity, 0.0, 1.0) * boxOverlap.x * boxOverlap.y;
+
+  if (detail > 0.0) {
+    float detailCoverage = 0.0;
+    if (
+      uTextVectorOnly < 0.5 &&
+      vRasterRect.z > 0.0 &&
+      vRasterRect.w > 0.0 &&
+      min(ncFwidthX, ncFwidthY) > 2.0
+    ) {
+      vec2 uvCenter = vec2(
+        vRasterRect.x + vNormCoord.x * vRasterRect.z,
+        vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
       );
-    alpha = heprThreeLinearCoverageToOutputAlpha(alpha) * vColorAlpha;
-    if (alpha <= 0.001) {
-      discard;
+      vec2 texel = 1.0 / atlasPxSize;
+      // The widened quad reaches past the glyph box into its tile's transparent
+      // padding, which must read as empty rather than repeat the edge texels.
+      vec2 padding = texel * ${TEXT_RASTER_ATLAS_PADDING_PX - 0.5};
+      vec2 uvMin = vRasterRect.xy - padding;
+      vec2 uvMax = vRasterRect.xy + vRasterRect.zw + padding;
+      vec2 tapDx = dncDx * 0.33 * texel;
+      vec2 tapDy = dncDy * 0.33 * texel;
+      // Scale explicit gradients by exp2(-1.25) to preserve the previous mip
+      // bias while matching the WGSL anisotropic footprint exactly.
+      vec2 mipBiasedUvDx = dncDx * texel * 0.42044820762685725;
+      vec2 mipBiasedUvDy = dncDy * texel * 0.42044820762685725;
+      // Coarser mips than the padding blend neighbouring glyphs' ink in.
+      float mipCap = min(1.0, ${TEXT_RASTER_ATLAS_PADDING_PX}.0 /
+        max(max(length(dncDx), length(dncDy)) * 0.42044820762685725, 1e-6));
+      mipBiasedUvDx *= mipCap;
+      mipBiasedUvDy *= mipCap;
+      detailCoverage = (1.0 / 3.0) * textureGrad(
+        uTextRasterAtlasTex,
+        clamp(uvCenter, uvMin, uvMax),
+        mipBiasedUvDx,
+        mipBiasedUvDy
+      ).r +
+        (1.0 / 6.0) * (
+          textureGrad(uTextRasterAtlasTex, clamp(uvCenter - tapDx - tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
+          textureGrad(uTextRasterAtlasTex, clamp(uvCenter - tapDx + tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
+          textureGrad(uTextRasterAtlasTex, clamp(uvCenter + tapDx - tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r +
+          textureGrad(uTextRasterAtlasTex, clamp(uvCenter + tapDx + tapDy, uvMin, uvMax), mipBiasedUvDx, mipBiasedUvDy).r
+        );
+    } else {
+      // Average the glyph's nonzero winding number over the pixel footprint in
+      // glyph space. Thin stems keep their ink instead of snapping to pixels.
+      vec2 footprint = max(vec2(pixelToLocalX, pixelToLocalY) * uTextAAScreenPx, vec2(1e-4));
+      vec4 box = vec4(vLocal - 0.5 * footprint, 1.0 / footprint);
+      float winding = 0.0;
+      for (int i = 0; i < vSegmentCount; i += 1) {
+        vec4 primitiveA = texelFetch(uTextGlyphSegmentTexA, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
+        vec4 primitiveB = texelFetch(uTextGlyphSegmentTexB, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
+        winding += heprSegmentCoverage(primitiveA.xy, primitiveA.zw, primitiveB.xy,
+          uTextCurveEnabled >= 0.5 && primitiveB.z >= TEXT_PRIMITIVE_QUADRATIC, box, 0.0, 1.0);
+      }
+      detailCoverage = heprFillCoverage(winding, false);
     }
-    vec3 color = mix(vColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));
-    outColor = heprThreeEncodeOutputColor(vec4(color, alpha));
-    outColor *= heprVectorClip(vWorld);
-    return;
+    coverage = mix(coverage, detailCoverage, detail);
   }
 
-  float coincidentEpsilon = max(baseAAWidth * 1e-4, 1e-7);
-  // Outside the antialiasing band the smoothstep below saturates, so the winding
-  // number alone decides the pixel and exact distances stop mattering. The small
-  // margin keeps coincident-edge grouping from losing a tie candidate.
-  float aaCullDistance = baseAAWidth * 1.05 + coincidentEpsilon;
-
-  // A tiny deterministic offset keeps exact-on-edge winding tests stable.
-  vec2 queryLocal = vLocal + 0.001 * (localDx + 0.37 * localDy);
-  float minDistance = 1e20;
-  float nearestT = 0.0;
-  vec2 nearestPoint = vec2(0.0);
-  vec2 nearestNormal = vec2(1.0, 0.0);
-  int nearestSideMultiplicity = 0;
-  int winding = 0;
-
-  for (int i = 0; i < vSegmentCount; i += 1) {
-    if (i >= vSegmentCount) {
-      break;
-    }
-
-    vec4 primitiveA = texelFetch(uTextGlyphSegmentTexA, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
-    vec4 primitiveB = texelFetch(uTextGlyphSegmentTexB, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
-    vec2 p0 = primitiveA.xy;
-    vec2 p1 = primitiveA.zw;
-    vec2 p2 = primitiveB.xy;
-    float primitiveType = primitiveB.z;
-    bool isQuadratic = uTextCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC;
-
-    // A quadratic stays inside the hull of its control points, so this box
-    // contains the primitive for both curve and line cases.
-    vec2 hullMin = min(p0, p2);
-    vec2 hullMax = max(p0, p2);
-    if (isQuadratic) {
-      hullMin = min(hullMin, p1);
-      hullMax = max(hullMax, p1);
-    }
-
-    // The ray used for the winding test travels along +x, so it can only cross
-    // this primitive within the box's y span and to the right of the query point.
-    bool mayCross = queryLocal.y >= hullMin.y && queryLocal.y <= hullMax.y && hullMax.x > queryLocal.x;
-
-    // Distance to the box lower-bounds the distance to the primitive inside it.
-    vec2 boundOffset = max(max(hullMin - queryLocal, queryLocal - hullMax), vec2(0.0));
-    float cullDistance = min(aaCullDistance, minDistance + coincidentEpsilon);
-    bool mayBeNearest = dot(boundOffset, boundOffset) <= cullDistance * cullDistance;
-
-    if (!mayCross && !mayBeNearest) {
-      continue;
-    }
-
-    if (mayBeNearest) {
-      vec4 distanceInfo;
-      vec2 closestPoint;
-      if (isQuadratic) {
-        distanceInfo = textQuadraticDistanceInfo(queryLocal, p0, p1, p2);
-        closestPoint = evaluateQuadratic(p0, p1, p2, distanceInfo.y);
-      } else {
-        distanceInfo = textLineDistanceInfo(queryLocal, p0, p2);
-        closestPoint = mix(p0, p2, distanceInfo.y);
-      }
-
-      float signedOffset = dot(queryLocal - closestPoint, distanceInfo.zw);
-      int sideStep = signedOffset >= 0.0 ? 1 : -1;
-      if (distanceInfo.x + coincidentEpsilon < minDistance) {
-        minDistance = distanceInfo.x;
-        nearestT = distanceInfo.y;
-        nearestPoint = closestPoint;
-        nearestNormal = distanceInfo.zw;
-        nearestSideMultiplicity = sideStep;
-      } else if (abs(distanceInfo.x - minDistance) <= coincidentEpsilon) {
-        float normalAlignment = dot(distanceInfo.zw, nearestNormal);
-        bool bothInterior = distanceInfo.y > 1e-4 && distanceInfo.y < 1.0 - 1e-4 &&
-          nearestT > 1e-4 && nearestT < 1.0 - 1e-4;
-        bool sameEdge = bothInterior && distance(closestPoint, nearestPoint) <= coincidentEpsilon &&
-          abs(normalAlignment) >= 0.9999;
-        if (sameEdge) {
-          nearestSideMultiplicity += sideStep;
-          minDistance = min(minDistance, distanceInfo.x);
-        } else if (distanceInfo.x < minDistance) {
-          minDistance = distanceInfo.x;
-          nearestT = distanceInfo.y;
-          nearestPoint = closestPoint;
-          nearestNormal = distanceInfo.zw;
-          nearestSideMultiplicity = sideStep;
-        }
-      }
-    }
-
-    if (mayCross) {
-      if (isQuadratic) {
-        accumulateQuadraticCrossing(p0, p1, p2, queryLocal, winding);
-      } else {
-        accumulateLineCrossing(p0, p2, queryLocal, winding);
-      }
-    }
-  }
-
-  bool inside = winding != 0;
-  int acrossWinding = winding - nearestSideMultiplicity;
-  bool nearestSeparatesFill = inside != (acrossWinding != 0);
-  float signedDistance = inside ? -minDistance : minDistance;
-  // Use the screen-space derivative along the nearest edge normal for final
-  // coverage. baseAAWidth intentionally remains conservative above for
-  // primitive culling, while this directional width avoids widening tilted
-  // glyph edges into dark/grey bands.
-  float edgeAAWidth = max(
-    length(vec2(dot(localDx, nearestNormal), dot(localDy, nearestNormal))) * uTextAAScreenPx,
-    1e-4
-  );
-  float edgeAlpha = 1.0 - smoothstep(-edgeAAWidth, edgeAAWidth, signedDistance);
-  // Nonzero fill stays opaque across overlap-only contour edges. Coincident
-  // exterior edges are grouped above and antialiased as one true boundary.
-  float alphaBase = nearestSeparatesFill ? edgeAlpha : (inside ? 1.0 : 0.0);
-  float alpha = heprThreeLinearCoverageToOutputAlpha(alphaBase) * vColorAlpha;
+  float alpha = heprThreeLinearCoverageToOutputAlpha(coverage) * vColorAlpha;
   if (alpha <= 0.001) {
     discard;
   }
@@ -6108,6 +5760,7 @@ export class WebGlFloorplanRenderer {
       glyphSegmentDataB.set(scene.textGlyphSegmentsB);
     }
     const clipMetaOffset = scene.textGlyphCount + (textLodData ? 1 : 0);
+    writeTextGlyphInkDensities(clipMetaOffset, glyphMetaAData, glyphMetaBData, glyphSegmentDataA, glyphSegmentDataB);
     if (clipRectCount > 0) {
       glyphMetaAData.set(scene.textClipRects!, clipMetaOffset * 4);
       for (let instance = 0; instance < scene.textInstanceCount; instance += 1) {

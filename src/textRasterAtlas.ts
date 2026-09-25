@@ -30,7 +30,12 @@ const GLYPH_TARGET_MAX_DIM_PX = 96;
 const GLYPH_TARGET_MAX_DIM_FALLBACK = [1, 0.85, 0.7, 0.55, 0.4, 0.3];
 const GLYPH_MIN_DIM_PX = 8;
 const GLYPH_MAX_DIM_PX = 256;
-const GLYPH_PADDING_PX = 8;
+/**
+ * Transparent texels around each glyph's UV rect. Glyph quads reach a pixel
+ * past the glyph box, and samples there read this padding as empty.
+ */
+export const TEXT_RASTER_ATLAS_PADDING_PX = 8;
+const GLYPH_PADDING_PX = TEXT_RASTER_ATLAS_PADDING_PX;
 const CONNECTION_EPSILON = 1e-3;
 
 export function buildTextRasterAtlas(scene: VectorScene, maxTextureSize: number): TextRasterAtlas | null {

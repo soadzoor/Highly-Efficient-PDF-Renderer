@@ -64,7 +64,6 @@ try {
       const shader = gradient.entries[0].material.fragmentShader;
       assert.match(shader, /baseColor = mix\(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a\)/);
       assert.match(shader, /sourcePaint.a \* mix\(maskPaint.a, 1.0, uPdfShapeOnly\)/);
-      assert.match(shader, /float alpha = inside \? .* \* paintAlpha : 0.0;/);
       assert.match(shader, /float alpha = heprThreeLinearCoverageToOutputAlpha\(coverage\).* \* paintAlpha;/);
       assert.deepEqual(gradient.entries[0].material.uniforms.uVectorOverride.value.toArray(), options.vectorOverride);
     }

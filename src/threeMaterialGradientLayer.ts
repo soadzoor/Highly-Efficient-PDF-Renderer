@@ -336,7 +336,7 @@ export class ThreeMaterialGradientLayer {
           raw.vertexShader = raw.vertexShader
             .replace("layout(location = 0) in vec2 aCorner;", "in vec2 aMeshPosition;\nin vec4 aMeshColor;\nout vec4 vMeshColor;\nlayout(location = 0) in vec2 aCorner;")
             .replace("void main() {", "void main() {\n  vMeshColor = aMeshColor;")
-            .replace("vec2 world = mix(minBounds, maxBounds, corner01);", "vec2 world = aMeshPosition;");
+            .replace("vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);", "vec2 world = aMeshPosition;");
           raw.fragmentShader = raw.fragmentShader
             .replace("uniform vec4 uVectorOverride;", "in vec4 vMeshColor;\nuniform vec4 uVectorOverride;")
             .replace("vec4 sourcePaint = heprSamplePdfGradient(vLocal, uSourceGradientIndex);", "vec4 sourcePaint = vMeshColor * heprSamplePdfGradient(vLocal, uSourceGradientIndex).a;");
@@ -679,7 +679,6 @@ function buildGradientFillFragmentShader(): string {
       `  baseColor = mix(baseColor, uPrimitiveColor.rgb, uPrimitiveColor.a);\n` +
       `  vec3 color = mix(baseColor, uVectorOverride.rgb, clamp(uVectorOverride.a, 0.0, 1.0));`
     )
-    .replace(/float alpha = inside \? ([^;]+) : 0\.0;/, "float alpha = inside ? ($1) * paintAlpha : 0.0;")
     .replace(/float alpha = (heprThreeLinearCoverageToOutputAlpha\(coverage\) \* [^;]+);/,
       "float alpha = $1 * paintAlpha;");
 }
