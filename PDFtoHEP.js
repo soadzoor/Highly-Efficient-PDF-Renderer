@@ -859,6 +859,12 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         console.log(
           `[${itemNumber}/${itemCount}] Wrote ${outputPath} (${formatBytes(hepBlob.size)})`
         );
+        if (hepBlob.size > pdfBytes.byteLength) {
+          console.warn(
+            `[${itemNumber}/${itemCount}] Warning: ${sourceLabel} produced a HEP larger than its PDF ` +
+            `(${formatBytes(hepBlob.size)} > ${formatBytes(pdfBytes.byteLength)}).`
+          );
+        }
       } catch (error) {
         if (abortController.signal.aborted) {
           throw error;

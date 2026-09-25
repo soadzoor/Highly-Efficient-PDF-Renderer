@@ -61,23 +61,54 @@ export async function encodeRasterRgbaAsBestImage(
   height: number,
   rgba: Uint8Array<ArrayBufferLike>
 ): Promise<EncodedRasterImage | null> {
+  return pickBestRasterImage(width, height, await encodeRasterRgbaCandidates(width, height, rgba));
+}
+
+/** Both browser encodings of one image, each null when unavailable or invalid. */
+export interface RasterImageCandidates {
+  webp: Uint8Array | null;
+  png: Uint8Array | null;
+}
+
+export async function encodeRasterRgbaCandidates(
+  width: number,
+  height: number,
+  rgba: Uint8Array<ArrayBufferLike>
+): Promise<RasterImageCandidates> {
   const webp = await encodeRasterRgbaAsImage(width, height, rgba, "webp");
-  const validWebp = webp && rasterImageDimensionsMatch("webp", webp, width, height)
-    ? webp
-    : null;
   const png = await encodeRasterRgbaAsImage(width, height, rgba, "png");
-  const validPng = png && rasterImageDimensionsMatch("png", png, width, height)
-    ? png
-    : null;
-  const best = validPng && (!validWebp || validPng.byteLength < validWebp.byteLength)
-    ? { bytes: validPng, encoding: "png" as const }
-    : validWebp
-      ? { bytes: validWebp, encoding: "webp" as const }
+  return {
+    webp: webp && rasterImageDimensionsMatch("webp", webp, width, height) ? webp : null,
+    png: png && rasterImageDimensionsMatch("png", png, width, height) ? png : null
+  };
+}
+
+/** The smaller candidate, or null when neither beats raw RGBA storage. */
+export function pickBestRasterImage(
+  width: number,
+  height: number,
+  { webp, png }: RasterImageCandidates
+): EncodedRasterImage | null {
+  const best = png && (!webp || png.byteLength < webp.byteLength)
+    ? { bytes: png, encoding: "png" as const }
+    : webp
+      ? { bytes: webp, encoding: "webp" as const }
       : null;
   if (!best || best.bytes.byteLength >= width * height * 4) {
     return null;
   }
   return best;
+}
+
+/** Lossless PNG, or null when it would not beat raw RGBA storage. */
+export async function encodeRasterRgbaAsPng(
+  width: number,
+  height: number,
+  rgba: Uint8Array<ArrayBufferLike>
+): Promise<Uint8Array | null> {
+  const png = await encodeRasterRgbaAsImage(width, height, rgba, "png");
+  return png && rasterImageDimensionsMatch("png", png, width, height) &&
+    png.byteLength < width * height * 4 ? png : null;
 }
 
 /** Decode a browser image without changing its straight-alpha pixel convention. */

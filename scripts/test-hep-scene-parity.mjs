@@ -122,7 +122,7 @@ try {
   const blob = await buildHep(scene, options);
   const rawZip = await HepArchive.loadAsync(await blob.arrayBuffer());
   const rawManifest = JSON.parse(await rawZip.file("manifest.json").async("string"));
-  assert.equal(rawManifest.formatVersion, 8);
+  assert.equal(rawManifest.formatVersion, 9);
   assert.equal(rawManifest.strokeGeometry.endpointsFile, "geometry/stroke-endpoints.csq16");
   assert.equal(rawManifest.strokeGeometry.encoding, undefined, "keep the existing compact format");
   assert.equal(rawManifest.strokeGeometry.boundsFile, undefined, "do not add full float32 bounds");

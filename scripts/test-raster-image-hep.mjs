@@ -167,6 +167,120 @@ async function assertRasterWebpQualityParity(rasterImageCodec) {
   }
 }
 
+/**
+ * A picture sliced into one-pixel scanlines, as map PDFs paint inline images,
+ * plus one large layer. The scanlines must share an atlas yet come back as the
+ * same separate layers; the large layer keeps its own section.
+ */
+async function assertRasterAtlasRoundTrip(seedScene, zipBuilder, parsedData, rasterSections, readRasterTable) {
+  const packed = rasterSections.packRasterAtlases(Array.from({ length: 5_000 }, () => ({ width: 1_000, height: 1 })));
+  assert.deepEqual(packed.atlases, [{ width: 2_000, height: 2_048 }, { width: 2_000, height: 452 }]);
+  assert.deepEqual(packed.cells[4_095], { atlas: 0, x: 1_000, y: 2_047 });
+  assert.deepEqual(packed.cells[4_096], { atlas: 1, x: 0, y: 0 });
+  assert.throws(() => rasterSections.encodeRasterLayerTable({
+    atlases: [{ encoding: "png", width: 4, height: 1 }],
+    layers: [{
+      width: 3, height: 1, matrix: new Float32Array([1, 0, 0, 1, 0, 0]), paintOrder: 0, pageIndex: 0,
+      storage: "atlas", cell: { atlas: 0, x: 2, y: 0 }
+    }]
+  }), /cell x is out of range/, "cells must lie inside their atlas");
+
+  const layers = [];
+  for (let row = 0; row < 300; row += 1) {
+    // Every third scanline repeats the pixels of one painted earlier.
+    const repeated = row % 3 === 2 ? layers[row - 2] : null;
+    const width = repeated?.width ?? 20 + (row * 7) % 180;
+    const data = repeated ? repeated.data.slice() : new Uint8Array(width * 4);
+    // Flat runs, like a map's scanlines; lossy coding gains nothing here.
+    for (let x = 0; x < width && !repeated; x += 1) {
+      data.set([((x >> 4) * 40 + (row >> 3) * 16) & 255, (row >> 3) * 8 & 255, (x >> 4) * 90 & 255, 255], x * 4);
+    }
+    layers.push({
+      width,
+      height: 1,
+      data,
+      matrix: new Float32Array([width * 0.12, 0, 0, -0.12, 100 - row * 0.12, 400 + row * 0.12]),
+      paintOrder: 10 + row,
+      pageIndex: 0,
+      ...(row === 7 ? { opacity: 0.5 } : {})
+    });
+  }
+  const photo = new Uint8Array(200 * 150 * 4);
+  for (let offset = 0; offset < photo.length; offset += 4) {
+    photo.set([offset % 251, offset % 241, offset % 239, 255], offset);
+  }
+  layers.push({
+    width: 200, height: 150, data: photo, matrix: new Float32Array([200, 0, 0, 150, 5, 6]), paintOrder: 400, pageIndex: 0
+  }, {
+    width: 200, height: 150, data: photo.slice(), matrix: new Float32Array([200, 0, 0, 150, 5, 600]), paintOrder: 401, pageIndex: 0
+  });
+  const scene = {
+    ...createRasterScene(seedScene, layers[0].width, 1, layers[0].data),
+    imagePaintOpCount: layers.length,
+    rasterLayers: layers
+  };
+
+  for (const encodeRasterImages of [true, false]) {
+    const bytes = await (await zipBuilder.buildHep(scene, { compression: "store", encodeRasterImages })).arrayBuffer();
+    const archive = await HepArchive.loadAsync(bytes);
+    const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+    const table = await readRasterTable(archive);
+    const atlasEncoding = encodeRasterImages ? "png" : "rgba";
+    assert.deepEqual(manifest.scene.rasterLayers, {
+      file: rasterSections.SCENE_RASTER_LAYERS_PATH, count: 302, atlasCount: 1
+    });
+    assert.deepEqual(table.atlases.map(atlas => atlas.encoding), [atlasEncoding]);
+    assert.ok(table.layers.slice(0, 300).every(layer => layer.storage === "atlas"), "scanlines share the atlas");
+    for (let row = 2; row < 300; row += 3) {
+      assert.deepEqual(table.layers[row].cell, table.layers[row - 2].cell, `repeated scanline ${row} shares its cell`);
+    }
+    const distinctCells = new Set(table.layers.slice(0, 300).map(({ cell }) => `${cell.atlas}:${cell.x}:${cell.y}`));
+    assert.equal(distinctCells.size, 200, "each distinct scanline is packed once");
+    const distinctSizes = layers.slice(0, 300).filter((_, row) => row % 3 !== 2);
+    assert.deepEqual(
+      table.atlases.map(({ width, height }) => ({ width, height })),
+      rasterSections.packRasterAtlases(distinctSizes).atlases,
+      "the atlas holds only the distinct scanlines"
+    );
+    assert.notEqual(table.layers[300].storage, "atlas", "large layers keep their own section");
+    assert.equal(table.layers[301].storage, table.layers[300].storage, "a repeated large image reuses its encoding");
+    assert.deepEqual(
+      await archive.file(rasterSections.rasterLayerFile(301, table.layers[301].storage)).async("uint8array"),
+      await archive.file(rasterSections.rasterLayerFile(300, table.layers[300].storage)).async("uint8array"),
+      "a repeated large image is encoded once"
+    );
+    assert.deepEqual(
+      Object.keys(archive.files).filter(name => name.startsWith("raster/")).sort(),
+      [
+        `raster/atlas-0.${atlasEncoding}`,
+        rasterSections.rasterLayerFile(300, table.layers[300].storage),
+        rasterSections.rasterLayerFile(301, table.layers[301].storage)
+      ].sort(),
+      "atlas members have no sections of their own"
+    );
+
+    const roundTrip = await parsedData.loadSceneFromHep(bytes);
+    assert.equal(roundTrip.rasterLayers.length, 302);
+    for (let index = 0; index < 300; index += 1) {
+      const source = layers[index];
+      const loaded = roundTrip.rasterLayers[index];
+      assert.equal(loaded.width, source.width);
+      assert.equal(loaded.height, 1);
+      assert.deepEqual(loaded.data, source.data, `scanline ${index} pixels`);
+      assert.deepEqual(Array.from(loaded.matrix), Array.from(source.matrix), `scanline ${index} matrix`);
+      assert.equal(loaded.paintOrder, source.paintOrder);
+      assert.equal(loaded.pageIndex, 0);
+      assert.equal(loaded.opacity, source.opacity);
+    }
+    assert.equal(roundTrip.rasterLayers[300].width, 200);
+    assert.equal(roundTrip.rasterLayers[300].height, 150);
+    assert.deepEqual(roundTrip.rasterLayers[301].data, roundTrip.rasterLayers[300].data);
+    assert.notEqual(roundTrip.rasterLayers[301].data, roundTrip.rasterLayers[300].data,
+      "repeated layers still own separate pixel buffers");
+    assert.equal(roundTrip.rasterLayers[301].matrix[5], 600);
+  }
+}
+
 // Resolve TypeScript imports directly; no Vite middleware or server is needed.
 const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) &&
@@ -175,11 +289,16 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 } });
 
 try {
-  const [zipBuilder, parsedData, rasterImageCodec] = await Promise.all([
+  const [zipBuilder, parsedData, rasterImageCodec, rasterSections] = await Promise.all([
     import("../src/hepBuilder.ts"),
     import("../src/hep.ts"),
-    import("../src/rasterImageCodec.ts")
+    import("../src/rasterImageCodec.ts"),
+    import("../src/hepRasterLayers.ts")
   ]);
+  const readRasterTable = async (archive) => rasterSections.decodeRasterLayerTable(
+    await archive.file(rasterSections.SCENE_RASTER_LAYERS_PATH).async("uint8array"),
+    { maxLayers: 262_144, maxAtlases: 4_096, maxDimension: 16_384 }
+  );
 
   await assertRasterWebpQualityParity(rasterImageCodec);
 
@@ -206,13 +325,20 @@ try {
   const encodedManifest = JSON.parse(
     await encodedArchive.file("manifest.json").async("string")
   );
-  const encodedEntry = encodedManifest.scene.rasterLayers[0];
+  const encodedTable = await readRasterTable(encodedArchive);
+  const encodedEntry = encodedTable.layers[0];
+  const encodedFile = rasterSections.rasterLayerFile(0, encodedEntry.storage);
 
-  assert.equal(encodedManifest.formatVersion, 8);
-  assert.equal(encodedManifest.scene.rasterLayers.length, 1);
-  assert.ok(encodedEntry.encoding === "webp" || encodedEntry.encoding === "png");
-  assert.equal("textureWidth" in encodedEntry, false);
-  assert.deepEqual(encodedEntry.matrix, [64, 0, 0, 64, 2, 3]);
+  assert.equal(encodedManifest.formatVersion, 9);
+  assert.deepEqual(encodedManifest.scene.rasterLayers, {
+    file: rasterSections.SCENE_RASTER_LAYERS_PATH,
+    count: 1,
+    atlasCount: 0
+  });
+  assert.ok(encodedEntry.storage === "webp" || encodedEntry.storage === "png",
+    "a lone small layer keeps its own encoded section");
+  assert.ok(encodedArchive.file(encodedFile));
+  assert.deepEqual(Array.from(encodedEntry.matrix), [64, 0, 0, 64, 2, 3]);
   assert.equal(encodedEntry.paintOrder, 4);
   assert.equal(encodedEntry.pageIndex, 0);
   assert.ok(progress.some((event) => event.stage === "raster-encode"));
@@ -231,9 +357,8 @@ try {
     { compression: "store" }
   );
   const rawArchive = await HepArchive.loadAsync(await rawBlob.arrayBuffer());
-  const rawManifest = JSON.parse(await rawArchive.file("manifest.json").async("string"));
-  assert.equal(rawManifest.scene.rasterLayers[0].encoding, "rgba");
-  assert.match(rawManifest.scene.rasterLayers[0].file, /\.rgba$/);
+  assert.equal((await readRasterTable(rawArchive)).layers[0].storage, "rgba");
+  assert.ok(rawArchive.file("raster/layer-0.rgba"));
 
   const controller = new AbortController();
   controller.abort();
@@ -246,7 +371,7 @@ try {
     parsedData.loadSceneFromHep(
       patchHepEntryUncompressedSize(
         encodedBytes,
-        encodedEntry.file,
+        encodedFile,
         768 * 1024 * 1024 + 1
       )
     ),
@@ -254,17 +379,20 @@ try {
   );
 
   const mismatchedArchive = await HepArchive.loadAsync(encodedBytes);
-  const mismatchedManifest = structuredClone(encodedManifest);
-  mismatchedManifest.scene.rasterLayers[0].width += 1;
-  mismatchedArchive.file("manifest.json", JSON.stringify(mismatchedManifest));
+  mismatchedArchive.file(rasterSections.SCENE_RASTER_LAYERS_PATH, rasterSections.encodeRasterLayerTable({
+    atlases: encodedTable.atlases,
+    layers: [{ ...encodedEntry, width: encodedEntry.width + 1 }]
+  }));
   await assert.rejects(
     parsedData.loadSceneFromHep(
       await mismatchedArchive.generateAsync({ type: "arraybuffer", compression: "STORE" })
     ),
-    /header dimensions do not match its v7 metadata/
+    /header dimensions do not match its metadata/
   );
 
-  console.log("Synthetic v7 raster archive smoke test passed.");
+  await assertRasterAtlasRoundTrip(seedScene, zipBuilder, parsedData, rasterSections, readRasterTable);
+
+  console.log("Synthetic v9 raster archive smoke test passed.");
 } finally {
   hooks.deregister();
 }
