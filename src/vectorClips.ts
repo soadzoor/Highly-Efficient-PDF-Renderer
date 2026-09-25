@@ -25,6 +25,38 @@ export function validateVectorClips(scene: VectorScene): void {
   }
 }
 
+/** Clip-chain bounds that clamp nothing, for unclipped and per-instance draws. */
+export const UNBOUNDED_VECTOR_CLIP_BOUNDS: readonly number[] = [-1e38, -1e38, 1e38, 1e38];
+
+/**
+ * World bounds [minX, minY, maxX, maxY] per clip, intersected with every
+ * ancestor. Nothing outside them survives the clip chain, so a paint's quad
+ * may be clamped to them (widened by its antialiasing reach) without changing
+ * a pixel. An empty chain has minX > maxX or minY > maxY.
+ */
+export function vectorClipChainBounds(clips: readonly VectorClipPath[] = []): Float32Array {
+  const bounds = new Float32Array(clips.length * 4);
+  for (let index = 0; index < clips.length; index++) {
+    const edges = clips[index].edges;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let offset = 0; offset < edges.length; offset += 4) {
+      minX = Math.min(minX, edges[offset], edges[offset + 2]);
+      minY = Math.min(minY, edges[offset + 1], edges[offset + 3]);
+      maxX = Math.max(maxX, edges[offset], edges[offset + 2]);
+      maxY = Math.max(maxY, edges[offset + 1], edges[offset + 3]);
+    }
+    const parent = clips[index].parent;
+    if (parent >= 0) {
+      minX = Math.max(minX, bounds[parent * 4]);
+      minY = Math.max(minY, bounds[parent * 4 + 1]);
+      maxX = Math.min(maxX, bounds[parent * 4 + 2]);
+      maxY = Math.min(maxY, bounds[parent * 4 + 3]);
+    }
+    bounds.set([minX, minY, maxX, maxY], index * 4);
+  }
+  return bounds;
+}
+
 type ClipRectangle = [number, number, number, number];
 
 function clipRectangle(edges: Float32Array): ClipRectangle | undefined {

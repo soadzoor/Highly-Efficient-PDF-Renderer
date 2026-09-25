@@ -5,7 +5,8 @@ import { buildRasterStripBatches } from "./rasterStripBatches";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
-import { WebGlPaintCompositor } from "./webGlPaintCompositor";
+import { WebGlPaintCompositor, type WebGlPaintFolding } from "./webGlPaintCompositor";
+import { PAINT_FOLD_MASK_UNIT, paintFoldFragmentGlsl } from "./nativePaintFold";
 import { pdfShapeCoverageGlsl } from "./pdfShapeCoverage";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
@@ -21,7 +22,7 @@ import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { buildVectorFillBandIndex, vectorFillBandStore, vectorFillBandIndex } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
-import { MAX_VECTOR_CLIP_DEPTH, packVectorClips } from "./vectorClips";
+import { MAX_VECTOR_CLIP_DEPTH, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -1019,6 +1020,8 @@ const CAMERA_DAMPING_MAX_DT_MS = 64;
 const PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC = 5;
 const PAN_MAX_SPEED_WORLD_PER_SEC = 20_000;
 const PAN_INERTIA_VELOCITY_STALE_MS = 120;
+/** The last texture unit source-ordered paint programs use; compositing starts above it. */
+const ORDERED_PAINT_LAST_UNIT = 18;
 const CLEAR_COLOR_R = 160 / 255;
 const CLEAR_COLOR_G = 169 / 255;
 const CLEAR_COLOR_B = 175 / 255;
@@ -1497,6 +1500,8 @@ export class WebGlFloorplanRenderer {
   private vectorClipTexture: WebGLTexture | null = null;
   /** Compact uploaded headers for opt-in clip-work diagnostics; no edge copy. */
   private vectorClipHeaders: Float32Array | null = null;
+  /** Per clip [minX, minY, maxX, maxY] intersected with its ancestors. */
+  private vectorClipBounds: Float32Array = new Float32Array(0);
   private vectorClipIndex = -1;
   private orderedBatches: VectorOrderedBatches | null = null;
   /** Per kind, canonical run indices sorted by their first primitive. */
@@ -1506,6 +1511,23 @@ export class WebGlFloorplanRenderer {
   private readonly orderedTextureBindings: (WebGLTexture | null | undefined)[] = [];
   private readonly orderedDedicatedTextureUnits: boolean;
   private readonly orderedPaintUniformStates = new Map<WebGLProgram, number>();
+  /** Per program, the clip sampler unit and clip index its uniforms hold. */
+  private orderedClipStates?: Map<WebGLProgram, number>;
+  /**
+   * Set while a source-ordered frame draws. Every texture bound on the paint
+   * units then goes through the binding cache, and uniforms that hold for the
+   * whole frame are set once per program rather than once per draw.
+   */
+  private orderedStateActive = false;
+  /** The unit folded paints read their soft mask from; -1 disables folding. */
+  private readonly paintFoldUnit: number;
+  /** Bound on the fold unit whenever no folded paint is drawing, so no surface stays there. */
+  private paintFoldNeutralTexture: WebGLTexture | null = null;
+  /** The opacity and soft mask of the folded paint being drawn, if any. */
+  private paintFold: { opacity: number; mask: WebGLTexture | null } | null = null;
+  /** Per program, the fold uniform it holds: opacity, plus 2 when masked. */
+  private paintFoldStates?: Map<WebGLProgram, number>;
+  private readonly paintFoldUniforms = new Map<WebGLProgram, WebGLUniformLocation | null>();
   private readonly orderedInstanceVaos = new Set<number>();
   private readonly vectorClipUniforms = new Map<WebGLProgram, [WebGLUniformLocation | null, WebGLUniformLocation | null]>();
   private scene: VectorScene | null = null;
@@ -1778,13 +1800,19 @@ export class WebGlFloorplanRenderer {
     this.gl = context;
     // Separate sampler slots prevent stroke/fill/text switches from rebinding
     // one another's textures. Other rendering paths retain their existing slots.
-    this.orderedDedicatedTextureUnits = context.getParameter(context.MAX_COMBINED_TEXTURE_IMAGE_UNITS) >= 19;
+    const textureUnits = context.getParameter(context.MAX_COMBINED_TEXTURE_IMAGE_UNITS) as number;
+    this.orderedDedicatedTextureUnits = textureUnits >= 19;
+    // Folded group chains need a mask unit that nothing else binds a surface to.
+    this.paintFoldUnit = textureUnits > PAINT_FOLD_MASK_UNIT ? PAINT_FOLD_MASK_UNIT : -1;
+    const foldable = (source: string, premultiplied: boolean): string =>
+      this.paintFoldUnit >= 0 ? paintFoldFragmentGlsl(source, premultiplied) : source;
 
     this.segmentProgram = this.createProgram(VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(FRAGMENT_SHADER_SOURCE, true));
-    this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(FILL_FRAGMENT_SHADER_SOURCE, true));
+    this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE,
+      multiplyFragmentGlsl(foldable(FILL_FRAGMENT_SHADER_SOURCE, false), true));
     this.gradientFillProgram = this.createProgram(
       GRADIENT_FILL_VERTEX_SHADER_SOURCE,
-      GRADIENT_FILL_FRAGMENT_SHADER_SOURCE
+      foldable(GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, false)
     );
     this.gradientStrokeProgram = this.createProgram(
       GRADIENT_STROKE_VERTEX_SHADER_SOURCE,
@@ -1793,7 +1821,7 @@ export class WebGlFloorplanRenderer {
     this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, multiplyFragmentGlsl(TEXT_FRAGMENT_SHADER_SOURCE, true));
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
     this.vectorCompositeProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, VECTOR_COMPOSITE_FRAGMENT_SHADER_SOURCE);
-    this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, RASTER_FRAGMENT_SHADER_SOURCE);
+    this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE, foldable(RASTER_FRAGMENT_SHADER_SOURCE, true));
     this.highlightProgram = this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
@@ -1865,7 +1893,8 @@ export class WebGlFloorplanRenderer {
       "uVectorOverride",
       "uPrimitiveOverride",
       "uBandBase",
-      "uBandEntries"
+      "uBandEntries",
+      "uClipBounds"
     ]);
     this.gradientStrokeUniforms = this.mustGetUniformMap(this.gradientStrokeProgram, [
       "uRunMetaTexA",
@@ -1979,6 +2008,7 @@ export class WebGlFloorplanRenderer {
     this.uHighlightFillColor = this.mustGetUniformLocation(this.highlightProgram, "uFillColor");
     this.uHighlightBorderColor = this.mustGetUniformLocation(this.highlightProgram, "uBorderColor");
 
+    if (this.paintFoldUnit >= 0) this.initializePaintFold();
     this.initializeGeometry();
     this.initializeState();
     this.uploadPageBackgroundTexture();
@@ -2852,6 +2882,8 @@ export class WebGlFloorplanRenderer {
     for (const texture of textures) {
       gl.deleteTexture(texture);
     }
+    gl.deleteTexture(this.paintFoldNeutralTexture);
+    this.paintFoldNeutralTexture = null;
     gl.deleteBuffer(this.orderedInstanceBuffer);
     this.orderedInstanceBuffer = null;
     this.orderedBatches = null;
@@ -3612,41 +3644,43 @@ export class WebGlFloorplanRenderer {
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(program);
     this.bindVectorClip(program);
+    if (!meshCount) this.bindPaintFold(program);
     gl.bindVertexArray(meshCount ? this.gradientMeshVao : this.gradientPaintVao);
 
     for (let index = 0; index < this.gradientFillTextures.length; index += 1) {
-      gl.activeTexture(gl.TEXTURE0 + index);
-      gl.bindTexture(gl.TEXTURE_2D, this.gradientFillTextures[index]);
+      this.bindOrderedTexture(index, this.gradientFillTextures[index]);
     }
     for (let index = 0; index < this.gradientMetaTextures.length; index += 1) {
-      gl.activeTexture(gl.TEXTURE6 + index);
-      gl.bindTexture(gl.TEXTURE_2D, this.gradientMetaTextures[index]);
+      this.bindOrderedTexture(6 + index, this.gradientMetaTextures[index]);
     }
-    gl.activeTexture(gl.TEXTURE11);
-    gl.bindTexture(gl.TEXTURE_2D, this.gradientLutTexture);
+    this.bindOrderedTexture(11, this.gradientLutTexture);
 
-    gl.uniform1i(uniforms.uPathMetaTexA, 0);
-    gl.uniform1i(uniforms.uPathMetaTexB, 1);
-    gl.uniform1i(uniforms.uPathMetaTexC, 2);
-    gl.uniform1i(uniforms.uPaintMetaTex, 3);
-    gl.uniform1i(uniforms.uSegmentTexA, 4);
-    gl.uniform1i(uniforms.uSegmentTexB, 5);
-    this.setGradientUniforms(uniforms, 6, 11);
-    gl.uniform2i(uniforms.uPathMetaTexSize, this.gradientFillPathTextureWidth, this.gradientFillPathTextureHeight);
-    gl.uniform2i(uniforms.uSegmentTexSize, this.gradientFillSegmentTextureWidth, this.gradientFillSegmentTextureHeight);
-    gl.uniform1i(uniforms.uBandBase, this.gradientFillBandBase);
-    gl.uniform1i(uniforms.uBandEntries, this.gradientFillBandEntries);
-    this.setGradientViewUniforms(uniforms, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
-    gl.uniform1f(uniforms.uAAScreenPx, 1);
-    gl.uniform4f(
-      uniforms.uVectorOverride,
-      this.vectorOverrideColor[0],
-      this.vectorOverrideColor[1],
-      this.vectorOverrideColor[2],
-      this.vectorOverrideOpacity
-    );
+    if (this.prepareOrderedProgram(program)) {
+      gl.uniform1i(uniforms.uPathMetaTexA, 0);
+      gl.uniform1i(uniforms.uPathMetaTexB, 1);
+      gl.uniform1i(uniforms.uPathMetaTexC, 2);
+      gl.uniform1i(uniforms.uPaintMetaTex, 3);
+      gl.uniform1i(uniforms.uSegmentTexA, 4);
+      gl.uniform1i(uniforms.uSegmentTexB, 5);
+      this.setGradientUniforms(uniforms, 6, 11);
+      gl.uniform2i(uniforms.uPathMetaTexSize, this.gradientFillPathTextureWidth, this.gradientFillPathTextureHeight);
+      gl.uniform2i(uniforms.uSegmentTexSize, this.gradientFillSegmentTextureWidth, this.gradientFillSegmentTextureHeight);
+      gl.uniform1i(uniforms.uBandBase, this.gradientFillBandBase);
+      gl.uniform1i(uniforms.uBandEntries, this.gradientFillBandEntries);
+      this.setGradientViewUniforms(uniforms, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
+      gl.uniform1f(uniforms.uAAScreenPx, 1);
+      gl.uniform4f(
+        uniforms.uVectorOverride,
+        this.vectorOverrideColor[0],
+        this.vectorOverrideColor[1],
+        this.vectorOverrideColor[2],
+        this.vectorOverrideOpacity
+      );
+    }
     const primitiveColor = this.primitiveColors?.gradient("gradient-fill", pathIndex);
     gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
+    const clipBounds = this.gradientClipBounds();
+    gl.uniform4f(uniforms.uClipBounds, clipBounds[0], clipBounds[1], clipBounds[2], clipBounds[3]);
     if (meshCount) {
       gl.uniform1i(uniforms.uMeshPathIndex, pathIndex);
       gl.drawArrays(gl.TRIANGLES, this.gradientMeshRanges[pathIndex * 2], meshCount);
@@ -3676,9 +3710,35 @@ export class WebGlFloorplanRenderer {
           profile.add("gradientAnalyticFillBBoxPixelsEstimate", pixels);
           // Keep the original full-scan baseline comparable after clip indexing.
           profile.add("gradientAnalyticFillClipEdgeTestsEstimate", pixels * clipEdges);
+          // The quad actually rasterized, clamped to the clip chain by the
+          // vertex stage with its one-pixel margin; empty when they are apart.
+          const clipBounds = this.gradientClipBounds();
+          const margin = 1 / Math.max(zoomValue, 1e-6);
+          const low = [Math.max(data.gradientFillPathMetaA[offset + 2], clipBounds[0]) - margin,
+            Math.max(data.gradientFillPathMetaA[offset + 3], clipBounds[1]) - margin];
+          const high = [Math.min(data.gradientFillPathMetaB[offset], clipBounds[2]) + margin,
+            Math.min(data.gradientFillPathMetaB[offset + 1], clipBounds[3]) + margin];
+          const quadMinX = Math.max(0, Math.floor((low[0] - cameraCenterX) * zoomValue + viewportWidth / 2));
+          const quadMinY = Math.max(0, Math.floor((low[1] - cameraCenterY) * zoomValue + viewportHeight / 2));
+          const quadMaxX = Math.min(viewportWidth, Math.ceil((high[0] - cameraCenterX) * zoomValue + viewportWidth / 2));
+          const quadMaxY = Math.min(viewportHeight, Math.ceil((high[1] - cameraCenterY) * zoomValue + viewportHeight / 2));
+          const culled = low[0] > high[0] || low[1] > high[1];
+          profile.add("gradientAnalyticFillQuadPixelsEstimate",
+            culled ? 0 : Math.max(0, quadMaxX - quadMinX) * Math.max(0, quadMaxY - quadMinY));
         }
       }
     }
+  }
+
+  /**
+   * The current clip chain's bounds, which a gradient fill's vertex stage
+   * clamps its quad to. Unclipped draws stay unbounded, as do projected frames,
+   * whose per-corner margins a single clamped rectangle cannot honour.
+   */
+  private gradientClipBounds(): ArrayLike<number> {
+    const clip = this.vectorClipIndex, bounds = this.vectorClipBounds;
+    if (clip < 0 || this.localToClipRenderingEnabled || !bounds || clip * 4 + 3 >= bounds.length) return UNBOUNDED_VECTOR_CLIP_BOUNDS;
+    return bounds.subarray(clip * 4, clip * 4 + 4);
   }
 
   private drawGradientStrokeRun(
@@ -3707,15 +3767,12 @@ export class WebGlFloorplanRenderer {
     gl.bindVertexArray(this.gradientPaintVao);
 
     for (let index = 0; index < this.gradientStrokeTextures.length; index += 1) {
-      gl.activeTexture(gl.TEXTURE0 + index);
-      gl.bindTexture(gl.TEXTURE_2D, this.gradientStrokeTextures[index]);
+      this.bindOrderedTexture(index, this.gradientStrokeTextures[index]);
     }
     for (let index = 0; index < this.gradientMetaTextures.length; index += 1) {
-      gl.activeTexture(gl.TEXTURE5 + index);
-      gl.bindTexture(gl.TEXTURE_2D, this.gradientMetaTextures[index]);
+      this.bindOrderedTexture(5 + index, this.gradientMetaTextures[index]);
     }
-    gl.activeTexture(gl.TEXTURE10);
-    gl.bindTexture(gl.TEXTURE_2D, this.gradientLutTexture);
+    this.bindOrderedTexture(10, this.gradientLutTexture);
 
     gl.uniform1i(uniforms.uRunMetaTexA, 0);
     gl.uniform1i(uniforms.uEndpointsTex, 1);
@@ -3807,7 +3864,10 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     gl.useProgram(this.rasterProgram);
     this.bindVectorClip(this.rasterProgram);
+    this.bindPaintFold(this.rasterProgram);
     gl.bindVertexArray(this.blitVao);
+    if (!this.prepareOrderedProgram(this.rasterProgram)) return;
+    gl.uniform1i(this.uRasterTex, 12);
     gl.uniform2f(this.uRasterViewport, viewportWidth, viewportHeight);
     gl.uniform2f(this.uRasterCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uRasterZoom, zoomValue);
@@ -3829,10 +3889,8 @@ export class WebGlFloorplanRenderer {
     }
     const gl = this.gl;
     this.prepareRasterProgram(viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
-    gl.activeTexture(gl.TEXTURE12);
-    gl.bindTexture(gl.TEXTURE_2D, this.pageBackgroundTexture);
+    this.bindOrderedTexture(12, this.pageBackgroundTexture);
     gl.uniform1f(this.uRasterOpacity, 1);
-    gl.uniform1i(this.uRasterTex, 12);
     for (let i = 0; i < this.visiblePageRectCount; i += 1) {
       const rectOffset = this.visiblePageRectIndices[i] * 4;
       const minX = this.pageRects[rectOffset];
@@ -3871,10 +3929,8 @@ export class WebGlFloorplanRenderer {
       if (this.multiplyPass != null) this.setMultiplyBlend();
       else gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
-    gl.activeTexture(gl.TEXTURE12);
-    gl.bindTexture(gl.TEXTURE_2D, layer.texture);
+    this.bindOrderedTexture(12, layer.texture);
     gl.uniform1f(this.uRasterOpacity, layer.opacity);
-    gl.uniform1i(this.uRasterTex, 12);
     gl.uniform4f(this.uRasterMatrixABCD, layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
     gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -3902,8 +3958,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform1f(uniforms.uZoom, zoomValue);
     gl.uniform1f(uniforms.uUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
     if (this.localToClipRenderingEnabled) gl.uniformMatrix4fv(uniforms.uLocalToClip, false, this.localToClipMatrix);
-    gl.activeTexture(gl.TEXTURE12);
-    gl.bindTexture(gl.TEXTURE_2D, batch.texture);
+    this.bindOrderedTexture(12, batch.texture);
     gl.uniform1i(uniforms.uRasterStripTex, 12);
     gl.uniform2f(uniforms.uRasterStripSize, batch.width, batch.height);
     gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -4022,6 +4077,7 @@ export class WebGlFloorplanRenderer {
     if (this.vectorClipTexture) gl.deleteTexture(this.vectorClipTexture);
     const data = packVectorClips(scene.clipPaths);
     this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
+    this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
     const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
     const height = Math.ceil(data.length / 4 / width);
@@ -4038,57 +4094,137 @@ export class WebGlFloorplanRenderer {
 
   private bindVectorClip(program: WebGLProgram): void {
     const ordered = this.vectorClipIndex === -2;
+    // Uniforms are per program, so within an ordered frame each holds its last
+    // value until this program itself needs another.
+    const cached = ordered || this.orderedStateActive;
     const paintState = (this.paintShapeOnly ? 1 : 0) | (this.multiplyPass == null ? 0 : 2);
-    if (!ordered || this.orderedPaintUniformStates?.get(program) !== paintState) {
+    if (!cached || this.orderedPaintUniformStates?.get(program) !== paintState) {
       if (!this.paintShapeUniforms.has(program)) this.paintShapeUniforms.set(program, this.gl.getUniformLocation(program, "uPdfShapeOnly"));
       this.gl.uniform1f(this.paintShapeUniforms.get(program)!, this.paintShapeOnly ? 1 : 0);
       if (this.multiplyUniforms) {
         if (!this.multiplyUniforms.has(program)) this.multiplyUniforms.set(program, this.gl.getUniformLocation(program, "uHeprMultiply"));
         this.gl.uniform1i(this.multiplyUniforms.get(program)!, this.multiplyPass == null ? 0 : 1);
       }
-      if (ordered) this.orderedPaintUniformStates?.set(program, paintState);
+      if (cached) this.orderedPaintUniformStates?.set(program, paintState);
       else this.orderedPaintUniformStates?.delete(program);
     }
-    if (ordered && this.orderedUniformPrograms.has(program)) return;
     const gl = this.gl;
     let locations = this.vectorClipUniforms.get(program);
     if (!locations) {
       locations = [gl.getUniformLocation(program, "uVectorClipTex"), gl.getUniformLocation(program, "uVectorClipIndex")];
       this.vectorClipUniforms.set(program, locations);
     }
-    const unit = ordered && this.orderedDedicatedTextureUnits ? 18 : 15;
+    const unit = this.usesDedicatedPaintUnits() ? 18 : 15;
     this.bindOrderedTexture(unit, this.vectorClipTexture);
+    const clipState = this.vectorClipIndex * 32 + unit;
+    if (cached && this.orderedClipStates?.get(program) === clipState) return;
     gl.uniform1i(locations[0], unit);
     gl.uniform1f(locations[1], this.vectorClipIndex);
+    if (cached) (this.orderedClipStates ??= new Map()).set(program, clipState);
+    else this.orderedClipStates?.delete(program);
   }
 
   private bindOrderedTexture(unit: number, texture: WebGLTexture | null): void {
-    if (this.vectorClipIndex === -2) {
-      if (this.orderedTextureBindings[unit] === texture) {
+    const bindings = this.orderedTextureBindings;
+    if (bindings && (this.vectorClipIndex === -2 || this.orderedStateActive)) {
+      if (bindings[unit] === texture) {
         return;
       }
-      this.orderedTextureBindings[unit] = texture;
+      bindings[unit] = texture;
     }
     this.gl.activeTexture(this.gl.TEXTURE0 + unit);
     this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
   }
 
+  private initializePaintFold(): void {
+    const gl = this.gl;
+    const texture = this.mustCreateTexture();
+    gl.activeTexture(gl.TEXTURE0 + this.paintFoldUnit);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, Uint8Array.of(255, 255, 255, 255));
+    gl.activeTexture(gl.TEXTURE0);
+    this.paintFoldNeutralTexture = texture;
+    for (const program of [this.fillProgram, this.gradientFillProgram, this.rasterProgram]) {
+      gl.useProgram(program);
+      gl.uniform2f(this.paintFoldLocation(program), 1, 0);
+      gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit);
+      (this.paintFoldStates ??= new Map()).set(program, 1);
+    }
+    gl.useProgram(null);
+  }
+
+  private paintFoldLocation(program: WebGLProgram): WebGLUniformLocation | null {
+    let location = this.paintFoldUniforms.get(program);
+    if (location === undefined) {
+      location = this.gl.getUniformLocation(program, "uPaintFold");
+      this.paintFoldUniforms.set(program, location);
+    }
+    return location;
+  }
+
+  /** Gives a foldable paint program the current fold, or none. */
+  private bindPaintFold(program: WebGLProgram): void {
+    if (!(this.paintFoldUnit >= 0)) return;
+    const fold = this.paintFold;
+    const opacity = fold?.opacity ?? 1, masked = fold?.mask ? 1 : 0;
+    if (fold?.mask) this.bindOrderedTexture(this.paintFoldUnit, fold.mask);
+    const state = opacity + masked * 2;
+    const states = this.paintFoldStates ??= new Map();
+    if (states.get(program) === state) return;
+    states.set(program, state);
+    this.gl.uniform2f(this.paintFoldLocation(program), opacity, masked);
+  }
+
+  /**
+   * A leaf whose group chain can fold onto it: one fill path, analytic
+   * gradient fill or image, each covering a pixel at most once. Mesh
+   * gradients may overlap themselves and keep their group.
+   */
+  private canFoldPaint(run: VectorDrawRun): boolean {
+    if (!(this.paintFoldUnit >= 0) || run.count !== 1) return false;
+    if (run.kind === "fill" || run.kind === "raster") return true;
+    return run.kind === "gradient-fill" && !(this.gradientMeshRanges?.[run.first * 2 + 1] ?? 0);
+  }
+
   /**
    * Drops what the ordered binding cache believes about GL state. It holds for
-   * a frame of ordered batches, but a composite pass between two spans binds
-   * its own program and sampler units, so each span starts afresh.
+   * a frame of ordered batches. A composite pass between two spans binds its
+   * own program and sampler units; only when those units overlap the paint
+   * units (0-18) does each span have to start afresh.
    */
   private invalidateOrderedState(): void {
+    if ((this.paintCompositor?.firstUnit ?? 0) > ORDERED_PAINT_LAST_UNIT) return;
+    this.resetOrderedState();
+  }
+
+  private resetOrderedState(): void {
     if (this.orderedTextureBindings) this.orderedTextureBindings.length = 0;
     this.orderedUniformPrograms?.clear();
     this.orderedPaintUniformStates?.clear();
+    this.orderedClipStates?.clear();
   }
 
+  /**
+   * Whether a draw must set its program's frame-invariant uniforms. Ordered
+   * frames set them once per program: instance-clipped batches and canonical
+   * paints share the dedicated sampler slots there, and only the clip index,
+   * which `bindVectorClip` tracks, tells them apart.
+   */
   private prepareOrderedProgram(program: WebGLProgram): boolean {
-    if (this.vectorClipIndex !== -2) return true;
+    if (this.vectorClipIndex !== -2 && !this.orderedStateActive) return true;
     if (this.orderedUniformPrograms.has(program)) return false;
     this.orderedUniformPrograms.add(program);
     return true;
+  }
+
+  /**
+   * Stroke, fill and text textures keep separate sampler slots whenever an
+   * ordered frame or batch draws; other paths retain their original slots.
+   */
+  private usesDedicatedPaintUnits(): boolean {
+    return (this.vectorClipIndex === -2 || this.orderedStateActive) && this.orderedDedicatedTextureUnits;
   }
 
   private bindOrderedInstanceAttribute(location: number, first: number): void {
@@ -4111,11 +4247,20 @@ export class WebGlFloorplanRenderer {
 
   private drawSourceOrderedContent(width: number, height: number, x: number, y: number, zoom: number,
     framebuffer: WebGLFramebuffer | null = null): number {
-    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
-    this.orderedUniformPrograms?.clear();
-    this.orderedPaintUniformStates?.clear();
+    // A new frame trusts no GL state left by uploads, overlays or other paths.
+    this.resetOrderedState();
     this.orderedInstanceVaos?.clear();
-    if (this.orderedTextureBindings) this.orderedTextureBindings.length = 0;
+    this.orderedStateActive = true;
+    try {
+      return this.drawSourceOrderedFrame(width, height, x, y, zoom, framebuffer);
+    } finally {
+      this.orderedStateActive = false;
+    }
+  }
+
+  private drawSourceOrderedFrame(width: number, height: number, x: number, y: number, zoom: number,
+    framebuffer: WebGLFramebuffer | null): number {
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
     this.vectorClipIndex = -1;
     if (this.rasterRenderingEnabled) this.drawPageBackgrounds(width, height, x, y, zoom);
     let strokes = 0;
@@ -4146,12 +4291,9 @@ export class WebGlFloorplanRenderer {
       profile?.endSection("instanceUpload");
     }
     const draw = (run: NonNullable<VectorScene["drawRuns"]>[number]): void => {
+      // Every paint binds through the frame's cache, so canonical paints and
+      // gradients between batches need no invalidation of their own.
       this.vectorClipIndex = run.clipIndex ?? -1;
-      if (this.vectorClipIndex !== -2) {
-        if (this.orderedTextureBindings) this.orderedTextureBindings.length = 0;
-        this.orderedUniformPrograms?.clear();
-        this.orderedPaintUniformStates?.clear();
-      }
       if (run.kind === "fill" && this.fillRenderingEnabled) {
         profile?.add("drawBatches");
         profile?.add("fillBatches");
@@ -4199,6 +4341,24 @@ export class WebGlFloorplanRenderer {
     profile?.beginSection("drawSubmission");
     if (paintVisibility.requiresCompositing) {
       this.paintCompositor ??= new WebGlPaintCompositor(this.gl, () => { this.frameDrawCalls++; });
+      // A group chain holding one paint draws it straight onto the surface,
+      // scaled by the chain's opacity and soft mask.
+      const folding: WebGlPaintFolding | null = this.paintFoldUnit >= 0 ? {
+        canFold: run => this.canFoldPaint(run),
+        draw: (run, opacity, mask) => {
+          this.invalidateOrderedState();
+          this.paintShapeOnly = false;
+          this.paintFold = { opacity, mask };
+          profile?.add("foldedPaints");
+          try {
+            draw(run);
+          } finally {
+            this.paintFold = null;
+            // The mask surface may later be drawn into; it must not stay bound.
+            if (mask) this.bindOrderedTexture(this.paintFoldUnit, this.paintFoldNeutralTexture);
+          }
+        }
+      } : null;
       const segments = scenePaintSpanSegments(this.scene!);
       try {
         this.paintCompositor.render(this.scene!, width, height, (spanRuns, shapeOnly) => {
@@ -4225,7 +4385,7 @@ export class WebGlFloorplanRenderer {
           scissor: false, blend: true, depth: false, program: null, vao: null,
           blendFunction: [this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA, this.gl.ONE, this.gl.ONE_MINUS_SRC_ALPHA],
           blendEquation: [this.gl.FUNC_ADD, this.gl.FUNC_ADD]
-        });
+        }, folding);
       } finally {
         this.paintShapeOnly = false; this.vectorClipIndex = -1;
         profile?.endSection("drawSubmission");
@@ -4269,9 +4429,10 @@ export class WebGlFloorplanRenderer {
 
     gl.useProgram(this.fillProgram);
     this.bindVectorClip(this.fillProgram);
+    this.bindPaintFold(this.fillProgram);
     gl.bindVertexArray(this.fillVao);
 
-    const textureUnit = this.vectorClipIndex === -2 && this.orderedDedicatedTextureUnits ? 4 : 7;
+    const textureUnit = this.usesDedicatedPaintUnits() ? 4 : 7;
     this.bindOrderedTexture(textureUnit, this.fillPathMetaTextureA);
     this.bindOrderedTexture(textureUnit + 1, this.fillPathMetaTextureB);
     this.bindOrderedTexture(textureUnit + 2, this.fillPathMetaTextureC);
@@ -4481,7 +4642,7 @@ export class WebGlFloorplanRenderer {
       useTextLodSelection ? this.selectedTextInstanceIdBuffer : this.allTextInstanceIdBuffer
     );
 
-    const dedicatedUnits = this.vectorClipIndex === -2 && this.orderedDedicatedTextureUnits;
+    const dedicatedUnits = this.usesDedicatedPaintUnits();
     const textureUnit = dedicatedUnits ? 9 : 2;
     const atlasUnit = dedicatedUnits ? 17 : 13;
     this.bindOrderedTexture(textureUnit, this.textInstanceTextureA);

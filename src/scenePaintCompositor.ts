@@ -55,6 +55,18 @@ export interface ScenePaintCompositorAdapter<Surface> {
   /** Draws a span of runs in the given order, as one batch, over the destination's contents. */
   draw(runs: readonly VectorDrawRun[], destination: Surface, shapeOnly: boolean): void;
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void;
+  /**
+   * Whether `drawFolded` can draw this leaf: one paint that covers each pixel
+   * at most once, such as a single fill path, gradient fill or image.
+   */
+  canFold?(run: VectorDrawRun): boolean;
+  /**
+   * Draws that leaf with Normal source-over straight onto the destination, its
+   * alpha scaled by `opacity` and, given a mask surface, by the mask's red
+   * channel at each pixel. A group chain holding only that leaf then needs no
+   * surface or composite pass of its own.
+   */
+  drawFolded?(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined): void;
 }
 
 interface CompositeDiagnostics {
@@ -63,6 +75,7 @@ interface CompositeDiagnostics {
   passes: number;
   spans: number;
   runs: number;
+  folds: number;
   live: number;
   peak: number;
 }
@@ -91,7 +104,11 @@ function compositeStatsAdapter<Surface>(adapter: ScenePaintCompositorAdapter<Sur
     draw: (runs, destination, shapeOnly) => {
       stats.spans++; stats.runs += runs.length; adapter.draw(runs, destination, shapeOnly);
     },
-    pass: (operation, destination) => { stats.passes++; adapter.pass(operation, destination); }
+    pass: (operation, destination) => { stats.passes++; adapter.pass(operation, destination); },
+    canFold: adapter.canFold && (run => adapter.canFold!(run)),
+    drawFolded: adapter.drawFolded && ((run, destination, opacity, mask) => {
+      stats.folds++; adapter.drawFolded!(run, destination, opacity, mask);
+    })
   };
 }
 
@@ -151,7 +168,7 @@ interface PaintResult<Surface> {
 export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAdapter<Surface>,
   backdrop: Surface, visible: (condition?: number) => boolean, selected: Uint8Array | null = null): Surface {
   const stats = (globalThis as { HEPR_DEBUG_COMPOSITE_STATS?: boolean }).HEPR_DEBUG_COMPOSITE_STATS === true
-    ? { clears: 0, copies: 0, passes: 0, spans: 0, runs: 0, live: 0, peak: 0 } : null;
+    ? { clears: 0, copies: 0, passes: 0, spans: 0, runs: 0, folds: 0, live: 0, peak: 0 } : null;
   if (stats) adapter = compositeStatsAdapter(adapter, stats);
   const owned = new Set<Surface>();
   const take = (): Surface => { const surface = adapter.acquire(); owned.add(surface); return surface; };
@@ -228,6 +245,51 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     return visible(run.optionalContent) ? run : null;
   };
 
+  /** The one node of a list that still paints this frame, or null for none or several. */
+  const soleChild = (nodes: readonly ScenePaintNode[]): ScenePaintNode | null => {
+    let found: ScenePaintNode | null = null;
+    for (const child of nodes) {
+      if (!visible(child.optionalContent)) continue;
+      if (child.kind === "group" ? !paints(child.children) : !leaf(child)) continue;
+      if (found) return null;
+      found = child;
+    }
+    return found;
+  };
+
+  /**
+   * A group chain that holds a single paint covering each pixel at most once
+   * scales that paint's premultiplied colour uniformly: by each group's
+   * opacity and by at most one soft mask. Composited with Normal source-over,
+   * the chain is exactly the paint drawn with those factors, so it needs no
+   * surface or pass of its own. An inner group or the paint may carry another
+   * blend mode only inside an isolated parent, whose transparent backdrop
+   * makes every blend mode yield the source. Knockout, a second mask, several
+   * paints or a paint the adapter cannot fold keep the full composite.
+   */
+  const fold = (outer: ScenePaintGroup): { run: VectorDrawRun; opacity: number; mask?: ScenePaintGroup } | null => {
+    if (!adapter.drawFolded || outer.blendMode !== "Normal") return null;
+    let node: ScenePaintNode = outer, opacity = 1, parentIsolated = false;
+    let mask: ScenePaintGroup | undefined;
+    while (node.kind === "group") {
+      if (node.knockout || (node !== outer && node.blendMode !== "Normal" && !parentIsolated)) return null;
+      if (node.softMask) {
+        if (mask) return null;
+        mask = node;
+      }
+      opacity *= node.alpha;
+      parentIsolated = node.isolated;
+      const child = soleChild(node.children);
+      if (!child) return null;
+      node = child;
+    }
+    if (node.kind !== "draw") return null;
+    const run = leaf(node);
+    if (!run || run.count !== 1 || (run.blendMode && !parentIsolated)) return null;
+    if (!adapter.canFold?.(run)) return null;
+    return { run: { ...run, blendMode: undefined }, opacity, mask };
+  };
+
   /**
    * Plain source-over accumulation into one surface, for a list of nodes whose
    * enclosing group neither knocks out nor reads its own geometric shape.
@@ -283,6 +345,14 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
         // reintroduce coverage that no paint contributed in the first place.
         if (!paints(node.children)) continue;
         flushSpan();
+        const folded = fold(node);
+        if (folded) {
+          // The mask renders exactly as the group would have prepared it.
+          const mask = folded.mask && maskSurface(folded.mask.softMask!, depth + 2, boundsOf(folded.mask.children));
+          adapter.drawFolded!(folded.run, current, folded.opacity, mask);
+          if (mask) drop(mask);
+          continue;
+        }
         over(group(node.children, current, node, depth + 1, false), PDF_BLEND_MODES.indexOf(node.blendMode),
           boundsOf(node.children));
         continue;
@@ -431,7 +501,7 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
       lastCompositeStatsAt = performance.now();
       console.info(`[hepr] PDF composite frame: ${stats.clears + stats.copies + stats.passes} surface ops ` +
         `(${stats.passes} passes, ${stats.clears} clears, ${stats.copies} copies), ` +
-        `${stats.spans} span draws over ${stats.runs} paints, ${stats.peak} peak surfaces.`);
+        `${stats.spans} span draws over ${stats.runs} paints, ${stats.folds} folded paints, ${stats.peak} peak surfaces.`);
     }
   }
 }

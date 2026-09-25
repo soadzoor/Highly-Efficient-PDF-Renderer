@@ -101,8 +101,15 @@ try {
     blendMode: "Normal", children: [{ kind: "draw", runIndex: 0 }] }] };
   draws.length = 0;
   renderer.renderExternalFrame();
+  assert.equal(frames.at(-1).drawCalls, 1,
+    "a group holding one fill path folds its opacity into that paint's own draw");
+  frame(1);
+  scene.drawRuns = [{ kind: "fill", first: 0, count: 2 }];
+  renderer.scenePaintVisibility = null;
+  draws.length = 0;
+  renderer.renderExternalFrame();
   assert.equal(frames.at(-1).drawCalls, 2,
-    "the group's own paint and the composite carrying its opacity are both included");
+    "paints that may overlap keep the group's own paint and the composite carrying its opacity");
   const composedCalls = frames.at(-1).drawCalls;
   frame(composedCalls);
 

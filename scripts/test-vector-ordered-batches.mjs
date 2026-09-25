@@ -371,12 +371,11 @@ try {
   textureRenderer.drawPageBackgrounds = () => {};
   textureRenderer.drawVisibleSegments = () => { textureRenderer.bindOrderedTexture(0, "stroke"); return 1; };
   textureRenderer.drawFilledPaths = () => textureRenderer.bindOrderedTexture(7, "fill");
-  textureRenderer.drawRasterLayerAtIndex = () => {
-    textureRenderer.gl.activeTexture(100); textureRenderer.gl.bindTexture(200, "raster");
-  };
+  textureRenderer.drawRasterLayerAtIndex = () => textureRenderer.bindOrderedTexture(0, "raster");
   const textureSequence = [[0, "stroke"], [7, "fill"], [0, "raster"], [0, "stroke"]];
   textureRenderer.drawSourceOrderedContent(100, 100, 50, 50, 1);
-  assert.deepEqual(textureCalls, textureSequence, "compatible batches reuse texture bindings; raster paint invalidates them");
+  assert.deepEqual(textureCalls, textureSequence,
+    "compatible batches reuse texture bindings; a raster paint's binding is tracked and then replaced");
   textureCalls.length = 0;
   textureRenderer.drawSourceOrderedContent(100, 100, 50, 50, 1);
   assert.deepEqual(textureCalls, textureSequence, "each frame starts with fresh binding state");

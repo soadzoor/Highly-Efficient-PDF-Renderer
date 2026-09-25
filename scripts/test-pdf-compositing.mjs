@@ -26,9 +26,10 @@ try {
   }
 
   render.blending = false;
+  render.folding = false;
   function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null) {
     const alive = new Set(); let draws=0;
-    render.spans=[]; render.passes=0; render.surfaces=0;
+    render.spans=[]; render.passes=0; render.surfaces=0; render.folds=0;
     const zero = [0,0,0,0], one = [1,1,1,1];
     const adapter = {
       blendsPasses: render.blending,
@@ -62,7 +63,17 @@ try {
         // the premultiplied source-over operation 0 would have computed.
         else if(op.operation===6) s.pixel=src.map((v,i)=>i===3?v+s.pixel[3]*(1-src[3]):v+s.pixel[i]*(1-src[3]));
         else s.pixel=[...source];
-      }
+      },
+      // A folded leaf scales its premultiplied colour by the chain's opacity and
+      // mask, then composites Normal onto the destination in a single draw.
+      ...(render.folding ? {
+        canFold: run => run.count === 1,
+        drawFolded(run, s, opacity, mask) {
+          render.folds++;
+          const scale = opacity * (mask ? mask.pixel[0] : 1);
+          s.pixel = compositePdfPixel(s.pixel, paints[run.first].color.map(v => v * scale));
+        }
+      } : {})
     };
     const scene={paintGraph:{roots},drawRuns:paints.map((p,i)=>({kind:"fill",first:i,count:1,blendMode:p.blendMode,optionalContent:p.condition}))};
     try {
@@ -216,6 +227,62 @@ try {
   assert.deepEqual({passes:render.passes,surfaces:render.surfaces},{passes:0,surfaces:1},
     "a pass-through group still costs nothing when the destination blends");
   render.blending = false;
+
+  // Broschuere's fades: an opacity group around a soft-masked group around one
+  // fill. Folding draws that fill once, scaled by 0.47 and the mask; only the
+  // mask's own conversion pass remains.
+  const fade = [g([g([d(0)],{softMask:{children:[d(1)],subtype:"Luminosity"}})],{alpha:0.47})];
+  const fadePaints = [red, {color:[0.2,0.6,0.3,0.8],shape:1}];
+  for (const blending of [false, true]) {
+    render.blending = blending;
+    const composed = render(fade, fadePaints, [0.3,0.4,0.5,1]);
+    const composedPasses = render.passes, composedSurfaces = render.surfaces;
+    render.folding = true;
+    close(render(fade, fadePaints, [0.3,0.4,0.5,1]), composed, 1e-12);
+    assert.deepEqual({folds:render.folds,passes:render.passes}, {folds:1,passes:1},
+      "the fade draws once, keeping only the mask's luminosity pass");
+    assert(render.surfaces < composedSurfaces && render.passes < composedPasses, "folding saves surfaces and passes");
+    render.folding = false;
+  }
+
+  // Randomized graphs: folding changes nothing but cost. Isolation, knockout,
+  // blend modes on groups and paints, nested opacities, alpha and luminosity
+  // masks with backdrops and transfers, hidden paints and several-paint groups.
+  let seed = 0x9e3779b9;
+  const random = () => ((seed = Math.imul(seed ^ (seed >>> 15), 0x2c1b3c6d) + 0x6d2b79f5 | 0) >>> 0) / 4294967296;
+  const pick = values => values[Math.floor(random() * values.length)];
+  let folded = 0;
+  for (let trial = 0; trial < 1500; trial++) {
+    const paints = [];
+    const paint = () => {
+      const alpha = pick([1, 0.8, 0.5, 0.25]);
+      paints.push({ color: [random() * alpha, random() * alpha, random() * alpha, alpha], shape: 1,
+        ...(random() < 0.15 ? { blendMode: "Multiply" } : {}), ...(random() < 0.05 ? { condition: 0 } : {}) });
+      return d(paints.length - 1);
+    };
+    const node = depth => {
+      if (depth > 2 || random() < 0.35) return paint();
+      const children = Array.from({ length: random() < 0.7 ? 1 : 2 }, () => node(depth + 1));
+      const extra = { alpha: pick([1, 1, 0.7, 0.4]), isolated: random() < 0.7, knockout: random() < 0.1,
+        blendMode: random() < 0.75 ? "Normal" : pick(["Multiply", "Screen", "HardLight", "Darken"]) };
+      if (random() < 0.4) extra.softMask = { children: [paint()], subtype: random() < 0.7 ? "Luminosity" : "Alpha",
+        ...(random() < 0.3 ? { backdrop: [random(), random(), random()] } : {}),
+        ...(random() < 0.2 ? { transfer: new Float32Array([0.1, 0.7, 1]) } : {}) };
+      return g(children, extra);
+    };
+    const roots = Array.from({ length: 1 + Math.floor(random() * 2) }, () => node(0));
+    const backdrop = [random() * 0.9, random() * 0.9, random() * 0.9, 1];
+    const visible = random() < 0.2 ? id => id !== 0 : () => true;
+    render.blending = random() < 0.5;
+    const expected = render(roots, paints, backdrop, visible);
+    render.folding = true;
+    close(render(roots, paints, backdrop, visible), expected, 1e-9);
+    folded += render.folds;
+    render.folding = false;
+  }
+  assert(folded > 300, `randomized graphs exercise folding (${folded} folded paints)`);
+  render.blending = false;
+
   assert(PDF_COMPOSITE_FRAGMENT_GLSL.includes("pdfSetLum"));
   assert(PDF_COMPOSITE_WGSL.includes("fn pdfSetLum"));
   assert(!/\b(?:F|I|V3|V4)\b/.test(PDF_COMPOSITE_WGSL),"shared shader equation placeholders are fully lowered");

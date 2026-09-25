@@ -10,9 +10,10 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 const f32 = Math.fround;
 const scratch = new DataView(new ArrayBuffer(4));
-let checkedRows = 0, checkedPoints = 0, checkedDistances = 0, checkedCoverage = 0;
+let checkedRows = 0, checkedPoints = 0, checkedDistances = 0, checkedCoverage = 0, checkedClamps = 0;
+let clampMarginUsed = false;
 try {
-  const { packVectorClips } = await import("../src/vectorClips.ts");
+  const { packVectorClips, vectorClipChainBounds } = await import("../src/vectorClips.ts");
   const oval = ellipse(2945, 125, 70);
   const fixtures = [
     ["dense oval", oval],
@@ -41,6 +42,7 @@ try {
     ];
     const snapshot = structuredClone(clips), packed = packVectorClips(clips);
     assert.deepEqual(clips, snapshot, `${name}: packing preserves retained geometry`);
+    verifyChainClamp(name, clips, packed, vectorClipChainBounds(clips));
     assert.equal(packed[1 * 4 + 3], 2, `${name}: nonzero clip is indexed`);
     assert.equal(packed[2 * 4 + 3], 3, `${name}: even-odd clip is indexed`);
     assert.equal(packed[1 * 4 + 2], edges.length / 4, "headers retain the original edge count");
@@ -139,6 +141,17 @@ try {
       0.25, "polygon and rectangle clips use the same subpixel positions");
   }
 
+  // Chain bounds intersect every ancestor; a chain that keeps nothing is empty.
+  const chained = vectorClipChainBounds([
+    { parent: -1, fillRule: 0, edges: rectangle(0, 0, 10, 10) },
+    { parent: 0, fillRule: 0, edges: ellipse(64, 20, 3) },
+    { parent: 1, fillRule: 1, edges: rectangle(12, -5, 30, 5) },
+    { parent: -1, fillRule: 0, edges: new Float32Array(0) }
+  ]);
+  assert.deepEqual([...chained.subarray(0, 8)], [0, 0, 10, 10, 0, 0, 10, 3], "a polygon is bounded by its ancestors");
+  assert(chained[8] > chained[10], "disjoint ancestors leave an empty chain");
+  assert(!(chained[12] <= chained[14]) && !(chained[13] <= chained[15]), "an edgeless clip keeps nothing");
+
   const clip = { parent: -1, fillRule: 0, edges: oval };
   const rawTexels = 1 + oval.length / 4;
   const limited = packVectorClips([clip], rawTexels);
@@ -156,8 +169,10 @@ try {
   for (const y of [-70, -25, 0, 20, 70]) for (const x of [-125, -30, 0, 50, 125]) {
     for (const root of [0, 1]) assert.equal(packedContains(mixed, root, x, y), windingContains(oval, root, x, y));
   }
+  assert(clampMarginUsed, "antialiased coverage reaches past the chain bounds, so the clamp needs its margin");
   console.log(`Vector clip bands preserve crossings at ${checkedRows} boundary rows and Float32 winding at ${checkedPoints} points; ` +
     `${checkedDistances} pixel footprints preserve boundary distance and ${checkedCoverage} preserve coverage; ` +
+    `${checkedClamps} points past clamped chain bounds are uncovered; ` +
     `dense oval averages ${ovalStats.average.toFixed(1)} of 2945 edges (${ovalStats.maximum} maximum)`);
 } finally { hooks.deregister(); }
 
@@ -250,6 +265,31 @@ function packedCoverage(packed, root, x, y, width) {
     covered += Number(packedContains(packed, root, f32(x + dx * width), f32(y + dy * width)));
   }
   return { coverage: covered / 16, samples: 16 };
+}
+/**
+ * Gradient quads are clamped to each clip chain's bounds widened by one pixel.
+ * Every fragment the clamp drops must have zero antialiased coverage, while
+ * fragments within the margin can still be partly covered.
+ */
+function verifyChainClamp(name, clips, packed, chain) {
+  for (let root = 0; root < clips.length; root++) {
+    const [x0, y0, x1, y1] = chain.subarray(root * 4, root * 4 + 4);
+    if (!(x0 <= x1 && y0 <= y1)) continue;
+    const size = Math.max(x1 - x0, y1 - y0);
+    for (const width of [size / 512, size / 16]) for (const t of [0, 0.125, 0.5, 0.875, 1]) {
+      const x = f32(x0 + (x1 - x0) * t), y = f32(y0 + (y1 - y0) * t);
+      for (const beyond of [1.0001, 1.5, 4]) {
+        for (const [px, py] of [[x1 + beyond * width, y], [x0 - beyond * width, y], [x, y1 + beyond * width], [x, y0 - beyond * width]]) {
+          assert.equal(packedCoverage(packed, root, f32(px), f32(py), width).coverage, 0,
+            `${name}: root ${root} covers nothing ${beyond} pixels of width ${width} past its chain bounds`);
+          checkedClamps++;
+        }
+      }
+      for (const [px, py] of [[x1 + 0.25 * width, y], [x0 - 0.25 * width, y], [x, y1 + 0.25 * width], [x, y0 - 0.25 * width]]) {
+        if (packedCoverage(packed, root, f32(px), f32(py), width).coverage > 0) clampMarginUsed = true;
+      }
+    }
+  }
 }
 function verifyCoverage(name, clips, packed, root, x, y, width) {
   let expected = 0;

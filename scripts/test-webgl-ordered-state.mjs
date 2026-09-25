@@ -100,14 +100,13 @@ try {
     assert.equal(mock.paints[0].attributes.get(1).offset, 4, "canonical fallback indexes the exact stroke ID buffer");
 
     // An intervening gradient/raster pass can overwrite any of the sampler
-    // slots. The ordered path must restore both textures and clip uniforms.
+    // slots. It binds through the frame's cache, so the ordered path must
+    // restore both textures and clip uniforms without resetting everything.
     for (const kind of ["raster", "gradient-fill", "gradient-stroke"]) {
       r.orderedBatches.batches = [batches[0], { kind, first: 0, count: 1, clipIndex: 0 }, ...batches];
       r.rasterRenderingEnabled = true; r.drawPageBackgrounds = () => {};
       const clobber = () => {
-        for (let unit = 0; unit < Math.min(capacity, 19); unit++) {
-          mock.gl.activeTexture(mock.gl.TEXTURE0 + unit); mock.gl.bindTexture(mock.gl.TEXTURE_2D, { unit });
-        }
+        for (let unit = 0; unit < Math.min(capacity, 19); unit++) r.bindOrderedTexture(unit, { unit });
       };
       r.drawRasterLayerAtIndex = r.drawGradientFillPath = r.drawGradientStrokeRun = clobber;
       mock.clear(); r.drawSourceOrderedContent(100, 100, 50, 50, 1); assertPaints();
@@ -147,6 +146,8 @@ try {
     for (const fail of [false, true]) {
       const mock = mockCompositeGl(original);
       const compositor = new WebGlPaintCompositor(mock.gl);
+      assert.equal(compositor.firstUnit, 19, "composite passes sample above the native paint units");
+      assert.deepEqual(mock.state, original, "construction restores the caller's program");
       mock.calls.length = 0;
       const render = () => compositor.render(scene, 100, 90, () => {
         mock.gl.useProgram({ name: "paint" }); mock.gl.bindVertexArray({ name: "paint" });
@@ -165,6 +166,8 @@ try {
       compositor.dispose();
     }
   }
+  const small = mockCompositeGl({ ...original, units: 16 });
+  assert.equal(new WebGlPaintCompositor(small.gl).firstUnit, 0, "a context without spare units shares the paint units");
   console.log("WebGL ordered state: texture/VAO reuse, paint replay, native compositor query avoidance and shared state restoration passed");
 } finally { hooks.deregister(); }
 
@@ -220,6 +223,7 @@ function mockCompositeGl(initial) {
       if (name === "checkFramebufferStatus") return gl.FRAMEBUFFER_COMPLETE;
       if (name === "getUniformLocation") return {};
       if (name === "getParameter") {
+        if (args[0] === "MAX_COMBINED_TEXTURE_IMAGE_UNITS") return state.units ?? 32;
         if (parameters[args[0]]) return state[parameters[args[0]]];
         if (blendParameters.includes(args[0])) return state.blendFunction[blendParameters.indexOf(args[0])];
         if (args[0] === "BLEND_EQUATION_RGB") return state.blendEquation[0];

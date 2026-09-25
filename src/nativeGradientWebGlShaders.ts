@@ -73,6 +73,9 @@ uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uUseLocalToClip;
 uniform mat4 uLocalToClip;
+// World bounds of the paint's clip chain; nothing outside them survives the
+// clip. Unclipped and projected draws receive an unbounded rectangle.
+uniform vec4 uClipBounds;
 
 flat out int vSegmentStart;
 flat out int vSegmentCount;
@@ -110,7 +113,18 @@ void main() {
 
   int segmentCount = int(metaA.y + 0.5);
   float alpha = metaC.w;
-  if (segmentCount <= 0 || alpha <= 0.001) {
+  vec2 corner01 = cornerFromIndex(cornerIndex) * 0.5 + 0.5;
+  // Reach pixels whose footprint touches a path narrower than a pixel.
+  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(metaA.zw, metaB.xy, corner01),
+    uUseLocalToClip, uLocalToClip, uZoom, uViewport));
+  // A page-sized gradient under a small clip would otherwise shade the whole
+  // page. The clip's antialiasing reaches under a pixel past its bounds, so
+  // the same one-pixel margin keeps every covered fragment; a path and clip
+  // farther apart than that leave nothing to draw. Projected draws, whose
+  // corners have different margins, are never clamped.
+  vec2 low = max(metaA.zw, uClipBounds.xy) - margin;
+  vec2 high = min(metaB.xy, uClipBounds.zw) + margin;
+  if (segmentCount <= 0 || alpha <= 0.001 || any(greaterThan(low, high))) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
     vSegmentCount = 0;
@@ -125,11 +139,7 @@ void main() {
     return;
   }
 
-  vec2 corner01 = cornerFromIndex(cornerIndex) * 0.5 + 0.5;
-  // Reach pixels whose footprint touches a path narrower than a pixel.
-  vec2 margin = heprCoverageMargin(heprPathToPixel(mix(metaA.zw, metaB.xy, corner01),
-    uUseLocalToClip, uLocalToClip, uZoom, uViewport));
-  vec2 world = mix(metaA.zw - margin, metaB.xy + margin, corner01);
+  vec2 world = mix(low, high, corner01);
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
   } else {

@@ -24,7 +24,10 @@ struct CameraUniforms {
 const GRADIENT_BINDINGS = /* wgsl */ `
 @group(2) @binding(0) var<uniform> uPrimitiveOverride : vec4f;
 @group(1) @binding(0) var uVectorClipTex : texture_2d<f32>;
-@group(1) @binding(1) var<uniform> uVectorClip : vec4f;
+// x of index is the paint's clip; bounds are its clip chain's world bounds,
+// unbounded for unclipped and per-instance clips.
+struct VectorClipUniform { index : vec4f, bounds : vec4f };
+@group(1) @binding(1) var<uniform> uVectorClip : VectorClipUniform;
 @group(0) @binding(GRADIENT_META_A_BINDING) var uGradientMetaA : texture_2d<f32>;
 @group(0) @binding(GRADIENT_META_B_BINDING) var uGradientMetaB : texture_2d<f32>;
 @group(0) @binding(GRADIENT_META_C_BINDING) var uGradientMetaC : texture_2d<f32>;
@@ -195,7 +198,13 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   let alpha = metaC.w;
   var out : FillOut;
   out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.z, uSegmentsA);
-  if (segmentCount <= 0 || alpha <= 0.001) {
+  // Reach pixels whose footprint touches a path narrower than a pixel.
+  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
+  // Clamp to the clip chain, whose antialiasing reaches under a pixel past its
+  // bounds; a path and clip farther apart than that leave nothing to draw.
+  let low = max(metaA.zw, uVectorClip.bounds.xy) - margin;
+  let high = min(metaB.xy, uVectorClip.bounds.zw) + margin;
+  if (segmentCount <= 0 || alpha <= 0.001 || any(low > high)) {
     out.position = vec4f(-2.0, -2.0, 0.0, 1.0);
     out.local = vec2f(0.0);
     out.segmentStart = 0;
@@ -209,9 +218,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
     return out;
   }
   let corner = cornerFromVertexIndex(vertexIndex) * 0.5 + 0.5;
-  // Reach pixels whose footprint touches a path narrower than a pixel.
-  let margin = heprCoverageMargin(mat2x2f(uCamera.zoom, 0.0, 0.0, uCamera.zoom));
-  let world = mix(metaA.zw - margin, metaB.xy + margin, corner);
+  let world = mix(low, high, corner);
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   out.position = vec4f((screen / (0.5 * uCamera.viewport)) - 1.0, 0.0, 1.0);
   out.local = world;
@@ -264,7 +271,7 @@ ${vectorFillBandLoopWgsl({
   if (alpha <= 0.001) { discard; }
   let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
   let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.x, uVectorClipTex, aaWidth));
+  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.index.x, uVectorClipTex, aaWidth));
 }
 `;
 
@@ -388,6 +395,6 @@ fn fsMain(inData : StrokeOut) -> @location(0) vec4f {
   if (alpha <= 0.001) { discard; }
   let baseColor = select(source.rgb, uPrimitiveOverride.rgb, uPrimitiveOverride.a > 0.5);
   let color = mix(baseColor, uCamera.vectorOverride.xyz, clamp(uCamera.vectorOverride.w, 0.0, 1.0));
-  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.x, uVectorClipTex, localPerPixel));
+  return vec4f(color, clamp(alpha, 0.0, 1.0) * heprVectorClipAA(inData.local, uVectorClip.index.x, uVectorClipTex, localPerPixel));
 }
 `;

@@ -19,6 +19,8 @@ try {
   const { GRADIENT_FILL_FRAGMENT_SHADER_SOURCE, GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE } =
     await import("../src/nativeGradientWebGlShaders.ts");
   const { GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL } = await import("../src/nativeGradientWebGpuShaders.ts");
+  const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
+  const { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_WGSL } = await import("../src/gradientMeshShaders.ts");
 
   const scene = gradientScene();
   validateVectorDrawRuns(scene);
@@ -37,11 +39,25 @@ try {
   }
   for (const source of [GRADIENT_FILL_WGSL, GRADIENT_STROKE_WGSL]) {
     assert.match(source, /@group\(1\) @binding\(0\) var uVectorClipTex/);
-    assert.match(source, /vec4f\(color, clamp\(alpha, 0\.0, 1\.0\) \* heprVectorClipAA\(inData.local, uVectorClip.x, uVectorClipTex, (aaWidth|localPerPixel)\)\)/,
+    assert.match(source, /vec4f\(color, clamp\(alpha, 0\.0, 1\.0\) \* heprVectorClipAA\(inData.local, uVectorClip.index.x, uVectorClipTex, (aaWidth|localPerPixel)\)\)/,
       "native WebGPU preserves straight-alpha RGB along clip boundaries");
     const main = source.slice(source.lastIndexOf("fn fsMain(")).replace(/\/\/[^\n]*/g, "");
     assert(main.indexOf("dpdx") < main.indexOf("discard"), "clip derivatives precede divergent discards");
   }
+
+  // Fill quads clamp to their clip chain's bounds, widened by the one-pixel
+  // coverage margin, and a path farther than that from its clip draws nothing.
+  // Meshes keep their own positions but share the empty-intersection cull.
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /vec2 low = max\(metaA\.zw, uClipBounds\.xy\) - margin;/);
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /vec2 high = min\(metaB\.xy, uClipBounds\.zw\) \+ margin;/);
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /any\(greaterThan\(low, high\)\)/);
+  assert.match(GRADIENT_FILL_VERTEX_SHADER_SOURCE, /vec2 world = mix\(low, high, corner01\);/);
+  assert.match(GRADIENT_MESH_VERTEX_GLSL, /vec2 world = aMeshPosition;/);
+  assert.match(GRADIENT_FILL_WGSL, /let low = max\(metaA\.zw, uVectorClip\.bounds\.xy\) - margin;/);
+  assert.match(GRADIENT_FILL_WGSL, /let high = min\(metaB\.xy, uVectorClip\.bounds\.zw\) \+ margin;/);
+  assert.match(GRADIENT_FILL_WGSL, /any\(low > high\)/);
+  assert.match(GRADIENT_FILL_WGSL, /let world = mix\(low, high, corner\);/);
+  assert.match(GRADIENT_MESH_WGSL, /let world = meshPosition;/);
 
   // Dispatch real gradient methods against small command recorders. Each draw
   // must use its clip, including restoring the unrestricted second fill.
@@ -75,6 +91,19 @@ try {
     { ...scene.clipPaths[1], parent: 1 }, { ...scene.clipPaths[0], parent: 2 }] });
   assert.equal(gl.vectorClipHeaders.length, 16, "retain headers without retaining the edge store");
   assert.equal(gl.vectorClipHeaders[8], 0, "consecutive rectangle ancestors are fused");
+  const clipBounds = [];
+  glApi.uniform4f = (name, ...value) => { if (name === "uClipBounds") clipBounds.push(value); };
+  gl.gradientFillUniforms = { uClipBounds: "uClipBounds" };
+  gl.drawSourceOrderedContent(100, 100, 50, 50, 1);
+  assert.deepEqual(clipBounds, [[20, 20, 80, 80], [-1e38, -1e38, 1e38, 1e38]],
+    "the clipped fill clamps to its nested clip's bounds and the unclipped fill stays unbounded");
+  gl.localToClipRenderingEnabled = true;
+  gl.vectorClipIndex = 1;
+  gl.drawGradientFillPath(0, 100, 100, 50, 50, 1);
+  gl.localToClipRenderingEnabled = false;
+  assert.deepEqual(clipBounds.at(-1), [-1e38, -1e38, 1e38, 1e38],
+    "projected corners have their own margins, so projected quads are never clamped");
+  calls.length = 0;
   let time = 0;
   const profile = new RenderPerformanceProfiler({ now: () => time++ });
   gl.performanceProfiler = profile;
@@ -94,6 +123,8 @@ try {
   assert.equal(record.counters.gradientAnalyticFillBBoxPixelsEstimate, 15000,
     "each 100x100 quad is clipped to 75x100 viewport pixels; overlapping draws count again");
   assert.equal(record.counters.gradientAnalyticFillClipEdgeTestsEstimate, 22500);
+  assert.equal(record.counters.gradientAnalyticFillQuadPixelsEstimate, 56 * 62 + 76 * 100,
+    "the clipped quad shrinks to its clip bounds and margin; the unclipped quad keeps only its margin");
   assert(record.cpuSectionsMs.gradientFillSubmission > 0);
   assert(record.cpuSectionsMs.gradientStrokeSubmission > 0);
 
@@ -151,6 +182,20 @@ try {
     draw(_vertices, count, first) { calls.push([program, first, count, clip]); }
   });
   assert.deepEqual(calls, [["fill", 0, 1, 1], ["fill", 4, 1, -1], ["stroke", 0, 1, 0]]);
+
+  // Native WebGPU carries each clip's chain bounds beside its index.
+  const writes = [];
+  globalThis.GPUBufferUsage ??= { UNIFORM: 64, COPY_DST: 8 };
+  const upload = Object.assign(Object.create(WebGpuFloorplanRenderer.prototype), {
+    vectorClipBuffers: [], vectorClipBindGroups: [], orderedInstanceBuffer: {},
+    gpuDevice: { createBuffer: descriptor => ({ size: descriptor.size, destroy() {} }), createBindGroup: value => value,
+      queue: { writeBuffer: (buffer, _offset, data) => writes.push([buffer.size, [...data]]) } },
+    createFloatTexture: () => ({ createView: () => ({}), destroy() {} }), maxTextureSize: () => 4096
+  });
+  upload.uploadVectorClips(scene);
+  const unbounded = [-1e38, -1e38, 1e38, 1e38].map(Math.fround);
+  assert.deepEqual(writes, [[32, [-2, 0, 0, 0, ...unbounded]], [32, [-1, 0, 0, 0, ...unbounded]],
+    [32, [0, 0, 0, 0, 0, 0, 100, 100]], [32, [1, 0, 0, 0, 20, 20, 80, 80]]]);
 
   // Construct Three materials without creating a browser or GPU session.
   for (const materialBackend of ["webgl", "webgpu"]) {

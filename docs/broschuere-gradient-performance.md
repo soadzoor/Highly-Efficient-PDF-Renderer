@@ -1,5 +1,83 @@
 # Broschuere rendering performance investigation
 
+## Native WebGL fit-all: submission-bound, then clip-bound (September 25)
+
+The supplied native WebGL capture (HEP, 1920 × 945, DPR 1, automatic LOD)
+samples GPU command spans of about 17 ms at fit-all (zoom 0.224), 17–19 ms at
+zoom 0.103 and 8–9 ms at zoom 0.557. The HEP loaded in Node matches the
+capture's source counts (1,410 paints, 2,897 strokes, 3,574 fills, 20,881
+glyphs). Two headless tools were run against it; neither executes GPU work:
+
+- A recording WebGL2 context under the real `WebGlFloorplanRenderer` traced the
+  complete command stream of one frame at the capture's camera positions.
+- A cost model replayed each traced draw's fragment control flow (quads from
+  the uploaded textures, band loops, clip-chain walks, antialiased clip probes)
+  using the shipped coverage functions.
+
+Zooming out to 0.103 cuts modelled fragment work to a third, yet the capture
+shows no GPU saving; zooming in to 0.557 increases it, yet the span halves.
+Across the five captured zoom levels the span instead follows the WebGL call
+count at roughly 1.2 µs per call (14,011 calls at fit-all), except at 0.557,
+where fragment work is the larger term. Fit-all is therefore bound by command
+submission (Chrome's GPU process and ANGLE), with fragment work second. This
+is a correlation across one capture, not a measured attribution.
+
+| Fit-all frame (traced/modelled) | Before | After |
+| --- | ---: | ---: |
+| WebGL calls | 14,011 | 5,221 |
+| Texture binds / uniform calls | 2,395 / 5,562 | 810 / 841 |
+| Draws / clears / blits | 343 / 105 / 14 | 294 / 56 / 14 |
+| Render-target switches | 229 | 160 |
+| Gradient fragments (modelled) | 2.81 M | 0.38 M |
+| Texel fetches, whole frame (modelled) | 260 M | 105 M |
+
+At zoom 0.557 calls fall from 4,177 to 1,701 and modelled fetches from 300 M to
+81 M; at 0.103 fetches fall from 82 M to 39 M. These are counts and estimates,
+not timings; only a new capture can show the resulting frame time.
+
+Three changes produced these reductions; none rasterizes or caches content:
+
+1. **Gradient quads clamp to their clip chain.** 31 of the 35 soft masks are a
+   page-sized gradient rectangle under a small clip, and every pixel of the
+   page walked the clip's candidate edges. Each native gradient fill now clamps
+   its quad to the intersection of its clip chain's bounds, widened by the
+   one-pixel coverage margin, and drops quads farther than that from the clip.
+   Antialiased clip coverage cannot reach past that margin, so no pixel
+   changes; `test-vector-clip-bands` verifies 5,400 points just past clamped
+   bounds are uncovered. Native WebGL and WebGPU both clamp; Three keeps whole
+   quads.
+2. **Native WebGL stops resending constant state.** The compositor sampled from
+   units 0–6, the same units as stroke and fill data, so every span reset the
+   renderer's binding cache and every draw re-sent its sampler units, texture
+   sizes and camera. Composite passes now use units 19–26 with sampler uniforms
+   set once, gradient and raster paints bind through the frame's texture cache,
+   and frame-invariant uniforms are set once per program per ordered frame.
+3. **Single-paint group chains fold into one draw.** The dominant pattern is an
+   opacity group around a soft-masked group around one fill: three surfaces,
+   three composite passes and about six render-target switches for one shape.
+   When a Normal-blend chain holds exactly one fill path, analytic gradient fill
+   or image (no knockout, at most one soft mask), the compositor draws that paint
+   straight onto the running surface with its alpha scaled by the opacities and
+   the mask value at the pixel. The mask surface is still prepared as before.
+   The shared compositor decides, so WebGPU and Three can adopt the same adapter
+   methods; only native WebGL implements them so far. A randomized differential
+   test (1,500 graphs with isolation, knockout, blend modes, nested opacity,
+   alpha/luminosity masks with backdrops and transfers) matches unfolded
+   compositing to 1e-9, and fails when any fold condition is loosened.
+
+Remaining fit-all work, for follow-up: the 35 mask surfaces (a clear, a gradient
+draw and a luminosity pass each, about 105 of 364 operations) could be
+evaluated analytically in the folded paint, since each is one gradient under
+rectangle clips. Fill coverage loops dominate the remaining modelled fragment
+work. WebGPU and Three still composite every group; WebGPU also records a
+render pass, bind group and uniform write per composite operation.
+
+Validation: `npm run typecheck`, `git diff --check` and the 110-file fast suite
+passed. The new GLSL was compiled with glslangValidator (ESSL 3.00, every shader
+the traced renderer submits plus the mesh variants); the WGSL gradient shaders
+were validated with naga. No browser, development server or PDF conversion was
+run, so visual parity and frame times still need a manual capture.
+
 ## HEP-only Three zoom stall: diagnosis and fix
 
 The two diagnostics-version-2 reports isolate the HEP pause to compositor

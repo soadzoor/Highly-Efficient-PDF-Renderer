@@ -20,7 +20,7 @@ import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
-import { packVectorClips } from "./vectorClips";
+import { packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -1314,6 +1314,8 @@ export class WebGpuFloorplanRenderer {
   private vectorClipBuffers: any[] = [];
   private vectorClipBindGroups: any[] = [];
   private vectorClipIndex = -1;
+  /** Per clip [minX, minY, maxX, maxY] intersected with its ancestors. */
+  private vectorClipBounds: Float32Array = new Float32Array(0);
   private orderedBatches: VectorOrderedBatches | null = null;
   /** Per kind, canonical run indices sorted by their first primitive. */
   private runLookup: CanonicalRunLookup | null = null;
@@ -1541,7 +1543,8 @@ export class WebGpuFloorplanRenderer {
 
     this.vectorClipBindGroupLayout = this.gpuDevice.createBindGroupLayout({ entries: [
       { binding: 0, visibility: gpuShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
-      { binding: 1, visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } },
+      // [clip index, 0, 0, 0] then the clip chain's bounds, which gradients clamp their quads to.
+      { binding: 1, visibility: gpuShaderStage.VERTEX | gpuShaderStage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 32 } },
       { binding: 2, visibility: gpuShaderStage.VERTEX, buffer: { type: "read-only-storage", minBindingSize: 8 } }
     ] });
     this.strokeBindGroupLayout = this.gpuDevice.createBindGroupLayout({
@@ -3863,9 +3866,11 @@ export class WebGpuFloorplanRenderer {
     const dims = chooseTextureDimensions(data.length / 4, this.maxTextureSize());
     this.vectorClipTexture = this.createFloatTexture(dims.width, dims.height, data);
     const usage = (globalThis as any).GPUBufferUsage;
+    this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
     for (let index = -2; index < (scene.clipPaths?.length ?? 0); index++) {
-      const buffer = this.gpuDevice.createBuffer({ size: 16, usage: usage.UNIFORM | usage.COPY_DST });
-      this.gpuDevice.queue.writeBuffer(buffer, 0, new Float32Array([index, 0, 0, 0]));
+      const buffer = this.gpuDevice.createBuffer({ size: 32, usage: usage.UNIFORM | usage.COPY_DST });
+      const bounds = index >= 0 ? this.vectorClipBounds.subarray(index * 4, index * 4 + 4) : UNBOUNDED_VECTOR_CLIP_BOUNDS;
+      this.gpuDevice.queue.writeBuffer(buffer, 0, new Float32Array([index, 0, 0, 0, ...bounds]));
       this.vectorClipBuffers.push(buffer);
       this.vectorClipBindGroups.push(this.gpuDevice.createBindGroup({ layout: this.vectorClipBindGroupLayout, entries: [
         { binding: 0, resource: this.vectorClipTexture.createView() },

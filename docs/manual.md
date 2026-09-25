@@ -457,6 +457,18 @@ change at the same zoom, viewport, DPR, and visible layers. Diagnostics
 do not scan fill segments or clip edges in the render loop and remain off
 unless a capture is active.
 
+Both native renderers clamp each analytic gradient fill's quad to its clip
+chain's bounds, widened by the one-pixel coverage margin; nothing outside them
+survives the clip. `gradientAnalyticFillQuadPixelsEstimate` sums the clamped
+quads the same way, so it can be compared with the unclamped bounding-quad
+estimate above. Projected views keep whole quads and are excluded.
+
+`foldedPaints` counts compositor group chains drawn as a single paint. A chain
+of Normal-blend groups holding one fill path, analytic gradient fill or image
+(no knockout, at most one soft mask) scales that paint by the groups' opacity
+and mask instead of rendering group surfaces and composite passes. Native
+WebGL folds these chains; its soft mask is still prepared on its own surface.
+
 The [Broschuere gradient investigation](broschuere-gradient-performance.md)
 documents a dense polygon-clip hotspot and recommended comparison captures.
 

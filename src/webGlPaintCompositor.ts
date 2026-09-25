@@ -21,10 +21,26 @@ export interface WebGlPaintCompositorState {
   blendEquation: readonly [number, number];
 }
 
+/**
+ * The renderer's side of folded paints: which leaves it can draw with an
+ * opacity and mask of their own, and drawing one onto the bound surface.
+ */
+export interface WebGlPaintFolding {
+  canFold(run: VectorDrawRun): boolean;
+  draw(run: VectorDrawRun, opacity: number, mask: WebGLTexture | null): void;
+}
+
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
 // An absent soft mask must read as fully opaque, unlike every other input,
 // whose neutral value is transparent black.
 const MASK_SAMPLER = SAMPLER_NAMES.indexOf("uMask");
+/**
+ * Passes sample from texture units 19-26 when the context has them. WebGL2
+ * guarantees 32, and the native renderer's paint programs stay below 19, so
+ * neither side disturbs the other's bindings between spans.
+ */
+const DEDICATED_FIRST_UNIT = 19;
+const SAMPLER_UNITS = SAMPLER_NAMES.length + 1;
 
 /** Transient GL surfaces for the shared PDF pass executor. */
 export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface> {
@@ -43,9 +59,14 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   private height = 0;
   private approximationReported = false;
   private drawSpan: ((runs: readonly VectorDrawRun[], shapeOnly: boolean) => void) | null = null;
+  private folding: WebGlPaintFolding | null = null;
   private project: PdfCompositeProjector | null = null;
   private viewportWidth = 0;
   private viewportHeight = 0;
+  /** First of this compositor's texture units: dedicated ones, or 0 without them. */
+  readonly firstUnit: number;
+  /** Units this compositor has bound during the current render, by offset. */
+  private readonly bound: (WebGLTexture | null)[] = [];
 
   constructor(gl: WebGL2RenderingContext, onDraw?: () => void) {
     this.gl = gl;
@@ -64,6 +85,15 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     // once keeps a page with hundreds of passes off the synchronous GL queries.
     this.uniforms = Object.fromEntries(SAMPLER_NAMES.concat(["uTransfer", "uParams", "uExtra", "uMaskBackdrop"])
       .map(name => [name, gl.getUniformLocation(program, name)]));
+    const units = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) as number;
+    this.firstUnit = units >= DEDICATED_FIRST_UNIT + SAMPLER_UNITS ? DEDICATED_FIRST_UNIT : 0;
+    // Sampler units never change, so they are set once rather than per pass.
+    // A shared context keeps its program; construction queries it only once.
+    const previous = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
+    gl.useProgram(program);
+    for (let i = 0; i < SAMPLER_NAMES.length; i++) gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], this.firstUnit + i);
+    gl.uniform1i(this.uniforms.uTransfer, this.firstUnit + SAMPLER_NAMES.length);
+    gl.useProgram(previous);
     this.vao = gl.createVertexArray()!;
     this.zero = this.constant(new Uint8Array(4));
     this.one = this.constant(Uint8Array.of(255, 255, 255, 255));
@@ -79,7 +109,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   render(scene: VectorScene, width: number, height: number,
     draw: (runs: readonly VectorDrawRun[], shapeOnly: boolean) => void,
     visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
-    project: PdfCompositeProjector | null = null, knownState?: WebGlPaintCompositorState): void {
+    project: PdfCompositeProjector | null = null, knownState?: WebGlPaintCompositorState,
+    folding: WebGlPaintFolding | null = null): void {
     const gl = this.gl;
     const size = choosePdfCompositeResolution(scene, width, height);
     if (size.scale < 1 && !this.approximationReported) {
@@ -89,7 +120,9 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     if (size.width !== this.width || size.height !== this.height) { this.releaseSurfaces(); this.width = size.width; this.height = size.height; }
     const state = knownState ?? this.captureState();
     const { framebuffer, viewport, clearColor } = state;
-    this.drawSpan = draw;
+    // Whatever ran since the last render may have rebound these units.
+    this.bound.length = 0;
+    this.drawSpan = draw; this.folding = folding;
     this.project = project; this.viewportWidth = width; this.viewportHeight = height;
     let backdrop: Surface | null = null, result: Surface | null = null;
     try {
@@ -107,7 +140,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     } finally {
       if (result) this.release(result);
       if (backdrop) this.release(backdrop);
-      this.drawSpan = null; this.project = null;
+      this.drawSpan = null; this.folding = null; this.project = null;
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, state.readFramebuffer); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
       gl.clearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
@@ -188,6 +221,12 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     // is the call order.
     this.drawSpan!(runs, shapeOnly);
   }
+  canFold(run: VectorDrawRun): boolean { return this.folding?.canFold(run) ?? false; }
+  drawFolded(run: VectorDrawRun, destination: Surface, opacity: number, mask: Surface | undefined): void {
+    const gl = this.gl; this.target(destination); gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.folding!.draw(run, opacity, mask?.texture ?? null);
+  }
   pass(operation: PdfCompositeOperation<Surface>, destination: Surface): void {
     const gl = this.gl;
     this.target(destination);
@@ -199,14 +238,13 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     } else gl.disable(gl.BLEND);
     gl.useProgram(this.program); gl.bindVertexArray(this.vao);
     const textures = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
+    // Every input is bound on every pass, so no unit can keep a surface this
+    // pass renders into; the cache only skips rebinding the same texture.
     for (let i = 0; i < textures.length; i++) {
-      gl.activeTexture(gl.TEXTURE0 + i);
-      gl.bindTexture(gl.TEXTURE_2D, textures[i]?.texture ?? (i === MASK_SAMPLER ? this.one : this.zero));
-      gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], i);
+      this.bind(i, textures[i]?.texture ?? (i === MASK_SAMPLER ? this.one : this.zero));
     }
     const transfer = operation.softMask?.transfer;
-    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, transfer ? this.transferTexture(transfer) : this.zero);
-    gl.uniform1i(this.uniforms.uTransfer, 6);
+    this.bind(SAMPLER_NAMES.length, transfer ? this.transferTexture(transfer) : this.zero);
     gl.uniform4f(this.uniforms.uParams, operation.operation, operation.blendMode ?? 0,
       operation.knockout ? 1 : 0, operation.opacity ?? 1);
     gl.uniform4f(this.uniforms.uExtra, operation.alphaIsShape ? 1 : 0,
@@ -233,6 +271,12 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
     return texture;
   }
+  private bind(offset: number, texture: WebGLTexture): void {
+    if (this.bound[offset] === texture) return;
+    this.bound[offset] = texture;
+    this.gl.activeTexture(this.gl.TEXTURE0 + this.firstUnit + offset);
+    this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
+  }
   private target(surface: Surface): void { this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, surface.framebuffer); this.gl.viewport(0, 0, this.width, this.height); }
   private releaseSurfaces(): void {
     for (const surface of this.all) { this.gl.deleteTexture(surface.texture); this.gl.deleteFramebuffer(surface.framebuffer); }
@@ -247,6 +291,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     const width = Math.min(values.length, gl.getParameter(gl.MAX_TEXTURE_SIZE) as number), height = Math.ceil(values.length / width);
     const pixels = new Float32Array(width * height); pixels.set(values);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, pixels);
+    // The upload bound it to whichever unit was active.
+    this.bound.length = 0;
     this.transfers.set(values, texture); return texture;
   }
   private shader(type: number, source: string): WebGLShader {
