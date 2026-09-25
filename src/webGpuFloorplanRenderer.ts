@@ -1354,6 +1354,10 @@ export class WebGpuFloorplanRenderer {
   private externalFrameDriver = false;
   private isDisposed = false;
   private externalFramePending = false;
+  /** The GPU has not finished the last animation frame's work yet. */
+  private gpuFrameInFlight = false;
+  /** A frame was requested while the GPU was busy; schedule it once the GPU is done. */
+  private framePendingOnGpu = false;
 
   private cameraCenterX = 0;
 
@@ -3087,6 +3091,7 @@ export class WebGpuFloorplanRenderer {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = 0;
     }
+    this.framePendingOnGpu = false;
 
     this.frameListener = null;
     this.destroyPanCacheResources();
@@ -3288,11 +3293,43 @@ export class WebGpuFloorplanRenderer {
     if (this.rafHandle !== 0) {
       return;
     }
+    // WebGPU submission never blocks, so an animation-frame loop can queue
+    // frames faster than the GPU finishes them: input then lags behind the
+    // queue and the frame listener counts callbacks, not finished frames.
+    // Start the next frame only once the GPU has finished the previous one.
+    if (this.gpuFrameInFlight) {
+      this.framePendingOnGpu = true;
+      return;
+    }
 
     this.rafHandle = requestAnimationFrame((timestamp) => {
       this.rafHandle = 0;
-      this.render(timestamp);
+      // Requests made while rendering, such as continuing a camera animation,
+      // wait for this frame's GPU work as well.
+      this.gpuFrameInFlight = true;
+      try {
+        this.render(timestamp);
+      } finally {
+        this.waitForGpuFrame();
+      }
     });
+  }
+
+  private waitForGpuFrame(): void {
+    const finished = (): void => {
+      this.gpuFrameInFlight = false;
+      if (!this.framePendingOnGpu || this.isDisposed) {
+        return;
+      }
+      this.framePendingOnGpu = false;
+      this.requestFrame();
+    };
+    const queue = this.gpuDevice?.queue;
+    if (this.isDisposed || typeof queue?.onSubmittedWorkDone !== "function") {
+      finished();
+      return;
+    }
+    queue.onSubmittedWorkDone().then(finished, finished);
   }
 
   private render(timestamp: number = performance.now()): void {

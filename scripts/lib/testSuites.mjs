@@ -75,6 +75,7 @@ export const fastTests = [
   "webgl-performance",
   "webgl-draw-calls",
   "webgpu-draw-calls",
+  "webgpu-frame-pacing",
   "draw-call-metrics",
   "webgl-ordered-state",
   "vector-draw-order",
