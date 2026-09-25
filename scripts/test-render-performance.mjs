@@ -153,6 +153,57 @@ assert.equal(occupied.queries.length, 0, "profiling does not replace a host appl
 assert.equal(host.getReport().gpu.droppedSamples, 1);
 assert(occupied.current, "the host query remains active");
 
+// Operation timing: every draw, clear and blit of one frame in eight gets its
+// own query, never in a frame holding the frame-span query, and the context's
+// methods are restored when the capture ends.
+{
+  const operations = operationGl();
+  const fill = { name: "fill" }, other = { name: "other" }, surface = {};
+  const described = new RenderPerformanceProfiler({ gl: operations.gl, now,
+    describeProgram: program => program === fill ? "fill" : null });
+  assert.throws(() => described.start({ gpuOperations: "yes" }), /gpuOperations/);
+  assert.throws(() => described.start({ gpuOperations: true, gpu: false }), /requires gpu/);
+  described.start({ maxFrames: 20 });
+  assert(!Object.hasOwn(operations.gl, "drawArrays"), "operation timing is opt-in");
+  described.stop();
+  described.start({ maxFrames: 20, gpuOperations: true });
+  assert(Object.hasOwn(operations.gl, "drawArrays"));
+  const gl = operations.gl;
+  for (let frame = 0; frame < 20; frame++) {
+    time = frame * 16; described.beginFrame();
+    gl.useProgram(fill); gl.bindFramebuffer(gl.FRAMEBUFFER, surface); gl.viewport(0, 0, 100, 50);
+    gl.drawArraysInstanced(4, 0, 4, 10);
+    gl.enable(gl.SCISSOR_TEST); gl.scissor(1, 2, 3, 4); gl.clear(16384); gl.disable(gl.SCISSOR_TEST);
+    gl.useProgram(other); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    gl.drawArrays(4, 0, 3);
+    gl.blitFramebuffer(0, 0, 10, 10, 0, 0, 20, 30, 16384, 9728);
+    time++; described.endFrame();
+    operations.complete();
+  }
+  const timed = operations.queries.filter(query => query.call !== "frame");
+  assert.deepEqual([...new Set(timed.map(query => query.frame))], [2, 10, 18], "one frame in eight, offset from span frames");
+  assert.equal(timed.length, 12, "four operations in each of three frames");
+  assert.equal(operations.draws, 80, "every operation is still issued exactly once");
+  const report = described.getReport().gpu.operations;
+  assert.equal(report.status, "available");
+  assert.equal(report.frameMs.samples, 3);
+  assert.equal(report.frameMs.average, 3 + 1 + 0.5 + 0.25);
+  assert.equal(report.operationsPerFrame.average, 4);
+  assert.deepEqual(report.byLabel.map(entry => [entry.label, entry.operationsPerFrame, entry.msPerFrame]),
+    [["fill → offscreen", 1, 3], ["clear → offscreen", 1, 1], ["program#1 → screen", 1, 0.5], ["blit → screen", 1, 0.25]],
+    "undescribed programs get a stable ordinal and targets follow framebuffer bindings");
+  const [slowest] = report.slowest;
+  assert.deepEqual({ ...slowest }, { label: "fill → offscreen", ms: 3, order: 0, call: "drawArraysInstanced",
+    vertices: 4, instances: 10, pixels: null, target: "offscreen", viewport: [100, 50], scissor: null });
+  assert.deepEqual(report.slowest.find(detail => detail.call === "clear").scissor, [1, 2, 3, 4]);
+  assert.equal(report.slowest.find(detail => detail.call === "blitFramebuffer").pixels, 600);
+  assert.equal(report.slowest.length, 12);
+  assert(!Object.hasOwn(operations.gl, "drawArrays") && !Object.hasOwn(operations.gl, "useProgram"),
+    "a finished capture restores the context's own methods");
+  assert(operations.queries.every(query => query.deleted), "every operation query is released");
+  assert.doesNotThrow(() => JSON.stringify(described.getReport()));
+}
+
 const missing = new RenderPerformanceProfiler({ now });
 missing.start();
 assert.equal(missing.getReport().gpu.status, "unavailable");
@@ -254,5 +305,44 @@ function fakeGl(options = {}) {
     finish() { state.calls.push("finish"); throw Error("GPU waits are forbidden"); },
     flush() { state.calls.push("flush"); throw Error("Forced submission is forbidden"); }
   };
+  return state;
+}
+
+function operationGl() {
+  // A query around exactly one call timed that operation; frame-span queries
+  // contain the whole frame.
+  const state = { queries: [], current: null, draws: 0, frame: 0 };
+  const durations = { drawArraysInstanced: 3, clear: 1, drawArrays: 0.5, blitFramebuffer: 0.25, frame: 5 };
+  class FakeGl {
+    get CURRENT_QUERY() { return 10; } get QUERY_RESULT_AVAILABLE() { return 11; } get QUERY_RESULT() { return 12; }
+    get FRAMEBUFFER() { return 30; } get DRAW_FRAMEBUFFER() { return 31; } get SCISSOR_TEST() { return 32; }
+    get CURRENT_PROGRAM() { return 33; } get DRAW_FRAMEBUFFER_BINDING() { return 34; } get VIEWPORT() { return 35; }
+    get SCISSOR_BOX() { return 36; }
+    getExtension() { return { TIME_ELAPSED_EXT: 20, GPU_DISJOINT_EXT: 21 }; }
+    getParameter(value) {
+      if (value === 21) return false;
+      if (value === 35 || value === 36) return [0, 0, 0, 0];
+      return null;
+    }
+    isEnabled() { return false; }
+    getQuery() { return state.current; }
+    createQuery() { const query = { available: false, deleted: false, frame: state.frame, calls: [] }; state.queries.push(query); return query; }
+    beginQuery(_target, query) { assert.equal(state.current, null, "timer queries never nest"); state.current = query; }
+    endQuery() {
+      const query = state.current; assert(query); state.current = null;
+      query.call = query.calls.length === 1 ? query.calls[0] : "frame";
+    }
+    getQueryParameter(query, parameter) {
+      assert.equal(query.deleted, false);
+      return parameter === 11 ? query.available : durations[query.call] * 1_000_000;
+    }
+    deleteQuery(query) { assert.equal(query.deleted, false); query.deleted = true; }
+    useProgram() {} bindFramebuffer() {} viewport() {} scissor() {} enable() {} disable() {}
+    drawArrays() { this.count("drawArrays"); } drawArraysInstanced() { this.count("drawArraysInstanced"); }
+    clear() { this.count("clear"); } blitFramebuffer() { this.count("blitFramebuffer"); }
+    count(call) { state.draws++; state.current?.calls.push(call); }
+  }
+  state.gl = new FakeGl();
+  state.complete = () => { for (const query of state.queries) query.available = true; state.frame++; };
   return state;
 }

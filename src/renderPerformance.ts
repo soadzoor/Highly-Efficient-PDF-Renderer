@@ -6,6 +6,11 @@ export interface RenderPerformanceOptions {
   maxFrameRecords?: number;
   /** Defaults to true. Requires a WebGL2 context with the timer-query extension. */
   gpu?: boolean;
+  /**
+   * Defaults to false. Also times every draw, clear and blit of one frame in
+   * eight with its own GPU query; requires `gpu`. Those frames run slower.
+   */
+  gpuOperations?: boolean;
 }
 
 export interface RenderPerformanceFrameContext {
@@ -74,6 +79,18 @@ export interface RenderPerformanceReport {
     pendingSamples: number;
     droppedSamples: number;
     sampleEvery: number;
+    /** Per-operation timings; null unless requested with `gpuOperations`. */
+    operations: {
+      status: "available" | "unavailable" | "disjoint";
+      reason: string | null;
+      sampleEvery: number;
+      droppedFrames: number;
+      /** Summed operation time and operation count of each timed frame. */
+      frameMs: RenderPerformanceSummary;
+      operationsPerFrame: RenderPerformanceSummary;
+      byLabel: { label: string; operationsPerFrame: number; msPerFrame: number; maxMs: number }[];
+      slowest: GpuOperationDetail[];
+    } | null;
   };
   notes: readonly string[];
 }
@@ -94,7 +111,8 @@ const NOTES = [
   "Section and counter summaries include zero for completed frames in which that metric was absent.",
   "Nested CPU sections overlap; do not add parent, child, and GL-call timings. Slow GL calls include driver waits, not just GPU execution.",
   "Frame context frameGapMs preserves gaps omitted from interval summaries. Events retain up to eight longest instrumented calls per frame.",
-  "Frame records are a bounded subset of slow CPU/GPU, high-batch and timeline frames; their selection is not a representative performance distribution."
+  "Frame records are a bounded subset of slow CPU/GPU, high-batch and timeline frames; their selection is not a representative performance distribution.",
+  "GPU operation timings put each draw, clear and blit between its own timer queries, so the GPU cannot overlap it with neighbours; their sum can exceed an untimed span. A sum far below the frame span means the GPU spent that time waiting for commands."
 ] as const;
 
 export class RenderPerformanceProfiler {
@@ -133,10 +151,15 @@ export class RenderPerformanceProfiler {
   private readonly pendingQueries: PendingGpuQuery[] = [];
   private readonly gpuTimes: number[] = [];
   private droppedGpuSamples = 0;
+  private readonly describeProgram: ((program: WebGLProgram | null) => string | null) | undefined;
+  private operations: GpuOperationTimer | null = null;
 
-  constructor(options: { gl?: WebGL2RenderingContext; now?: () => number } = {}) {
+  /** `describeProgram` names programs in operation timings; it runs only in timed frames. */
+  constructor(options: { gl?: WebGL2RenderingContext; now?: () => number;
+    describeProgram?: (program: WebGLProgram | null) => string | null } = {}) {
     this.gl = options.gl;
     this.now = options.now ?? (() => performance.now());
+    this.describeProgram = options.describeProgram;
   }
 
   get enabled(): boolean { return this.active; }
@@ -152,6 +175,10 @@ export class RenderPerformanceProfiler {
       throw new RangeError("maxFrameRecords must be an integer from 0 to 1000.");
     }
     if (options.gpu !== undefined && typeof options.gpu !== "boolean") throw new TypeError("gpu must be a boolean.");
+    if (options.gpuOperations !== undefined && typeof options.gpuOperations !== "boolean") {
+      throw new TypeError("gpuOperations must be a boolean.");
+    }
+    if (options.gpuOperations && options.gpu === false) throw new TypeError("gpuOperations requires gpu timing.");
     this.reset();
     this.maxFrames = maxFrames;
     this.maxFrameRecords = maxFrameRecords;
@@ -168,6 +195,9 @@ export class RenderPerformanceProfiler {
       this.extension = this.gl.getExtension("EXT_disjoint_timer_query_webgl2") as TimerExtension | null;
       this.gpuStatus = this.extension ? "available" : "unavailable";
       this.gpuReason = this.extension ? null : "EXT_disjoint_timer_query_webgl2 is unavailable.";
+      if (this.extension && options.gpuOperations) {
+        this.operations = new GpuOperationTimer(this.gl, this.extension, this.describeProgram);
+      }
     } catch {
       this.gpuStatus = "unavailable";
       this.gpuReason = "The WebGL timer-query extension could not be initialized.";
@@ -190,6 +220,8 @@ export class RenderPerformanceProfiler {
     this.frameContext = this.maxFrameRecords ? { frameGapMs: gap !== null && gap > 0 ? gap : null } : null;
     this.events = [];
     this.pollGpu();
+    // Operation frames never coincide with frame-span frames: one query at a time.
+    if (this.gpuStatus === "available") this.operations?.beginFrame(this.frameCpu.length);
     if (this.gpuStatus !== "available" || this.frameCpu.length % GPU_SAMPLE_EVERY !== 0) return;
     if (this.maxFrameRecords) this.frameGpuStates[this.frameCpu.length] = "discarded";
     if (this.pendingQueries.length >= MAX_PENDING_QUERIES) { this.droppedGpuSamples++; return; }
@@ -223,6 +255,7 @@ export class RenderPerformanceProfiler {
     this.frameCpu.push(Math.max(0, now - this.frameStart));
     this.frameStart = null;
     this.endedAt = now;
+    this.operations?.endFrame();
     this.finishGpuQuery();
     if (this.frameCpu.length >= this.maxFrames) this.finish();
   }
@@ -291,6 +324,7 @@ export class RenderPerformanceProfiler {
     this.events = [];
     this.frameGpuTimes.length = this.frameGpuStates.length = 0;
     this.cpuSections.clear(); this.counters.clear();
+    this.operations = null;
     this.extension = null;
     this.gpuStatus = "disabled";
     this.gpuReason = null;
@@ -307,12 +341,19 @@ export class RenderPerformanceProfiler {
       ignoredFrameGaps: this.ignoredFrameGaps, discardedMetricNames: this.discardedMetricNames,
       gpu: { status: this.gpuStatus, reason: this.gpuReason, frameMs: summarize(this.gpuTimes),
         pendingSamples: this.pendingQueries.length + (this.activeQuery ? 1 : 0),
-        droppedSamples: this.droppedGpuSamples, sampleEvery: GPU_SAMPLE_EVERY },
+        droppedSamples: this.droppedGpuSamples, sampleEvery: GPU_SAMPLE_EVERY,
+        operations: this.operationReport() },
       notes: [...NOTES]
     };
   }
 
   dispose(): void { this.finish(); this.disposed = true; }
+
+  private operationReport(): RenderPerformanceReport["gpu"]["operations"] {
+    if (!this.operations) return null;
+    const { frameMs, frameOperations, ...totals } = this.operations.totals();
+    return { ...totals, frameMs: summarize(frameMs), operationsPerFrame: summarize(frameOperations) };
+  }
 
   private ensureMetric(metrics: Map<string, number[]>, name: string): boolean {
     if (metrics.has(name)) return true;
@@ -390,6 +431,7 @@ export class RenderPerformanceProfiler {
     this.finishGpuQuery();
     this.pollGpu();
     this.releaseQueries();
+    this.operations?.dispose();
     this.active = false;
     this.frameStart = null;
     this.openSections.clear(); this.sectionTotals.clear(); this.counterTotals.clear();
@@ -417,6 +459,7 @@ export class RenderPerformanceProfiler {
       if (gl.getParameter(this.extension!.GPU_DISJOINT_EXT)) {
         this.gpuStatus = "disjoint";
         this.gpuReason = "GPU clock disjoint detected; GPU timings were discarded for this capture.";
+        this.operations?.discardPending();
         this.droppedGpuSamples += this.gpuTimes.length;
         this.gpuTimes.length = 0;
         for (let frame = 0; frame < this.frameGpuStates.length; frame++) {
@@ -439,6 +482,7 @@ export class RenderPerformanceProfiler {
           }
         } else { this.droppedGpuSamples++; this.discardFrameGpu(pending.frame); }
       }
+      this.operations?.poll();
     } catch { this.disableGpu("WebGL timer-query results could not be read."); }
   }
 
@@ -479,4 +523,273 @@ function summarize(samples: readonly number[]): RenderPerformanceSummary {
   };
   return { samples: samples.length, total, average: total / samples.length,
     p50: percentile(0.5), p95: percentile(0.95), min: sorted[0], max: sorted[sorted.length - 1] };
+}
+
+/** One timed operation, as reported among the slowest of a capture. */
+export interface GpuOperationDetail {
+  label: string;
+  ms: number;
+  /** Zero-based position among its frame's timed operations. */
+  order: number;
+  call: string;
+  vertices: number | null;
+  instances: number | null;
+  /** Destination pixels of a blit; null for other calls. */
+  pixels: number | null;
+  target: "screen" | "offscreen";
+  viewport: [number, number];
+  scissor: [number, number, number, number] | null;
+}
+
+interface GpuOperationTotals {
+  status: "available" | "unavailable" | "disjoint";
+  reason: string | null;
+  sampleEvery: number;
+  droppedFrames: number;
+  /** Per completed frame: summed operation time, and operations timed. */
+  frameMs: number[];
+  frameOperations: number[];
+  byLabel: { label: string; operationsPerFrame: number; msPerFrame: number; maxMs: number }[];
+  slowest: GpuOperationDetail[];
+}
+
+interface PendingOperation extends Omit<GpuOperationDetail, "ms"> { query: WebGLQuery }
+
+/** Frames sampled: one in eight, never those holding the frame-span query. */
+const GPU_OPERATION_SAMPLE_EVERY = 8;
+const GPU_OPERATION_SAMPLE_OFFSET = 2;
+const MAX_PENDING_FRAMES = 2;
+const MAX_OPERATIONS_PER_FRAME = 4096;
+const SLOWEST = 16;
+const TIMED = {
+  drawArrays: (args: unknown[]) => [args[2], 1],
+  drawArraysInstanced: (args: unknown[]) => [args[2], args[3]],
+  drawElements: (args: unknown[]) => [args[1], 1],
+  drawElementsInstanced: (args: unknown[]) => [args[1], args[4]],
+  clear: () => [null, null],
+  blitFramebuffer: () => [null, null]
+} as const satisfies Record<string, (args: unknown[]) => unknown[]>;
+
+/**
+ * Opt-in GPU timing of individual draws, clears and blits. Every eighth frame
+ * that has no frame-span query, each such call gets its own timer query, so a
+ * report can say which operations take the GPU's time and whether their sum
+ * accounts for the frame's command span at all.
+ */
+class GpuOperationTimer {
+  private readonly gl: WebGL2RenderingContext;
+  private readonly extension: TimerExtension;
+  private readonly describe: (program: WebGLProgram | null) => string | null;
+  private readonly restores: (() => void)[] = [];
+  private readonly ordinals = new Map<WebGLProgram, number>();
+  private installed = true;
+  private timing = false;
+  private program: WebGLProgram | null = null;
+  private offscreen = false;
+  private viewportSize: [number, number] = [0, 0];
+  private scissorEnabled = false;
+  private scissorBox: [number, number, number, number] = [0, 0, 0, 0];
+  private frame: PendingOperation[] = [];
+  private readonly pending: PendingOperation[][] = [];
+  private readonly frameMs: number[] = [];
+  private readonly frameOperations: number[] = [];
+  private readonly labels = new Map<string, { calls: number; ms: number; maxMs: number }>();
+  private slowest: GpuOperationDetail[] = [];
+  private droppedFrames = 0;
+  private status: GpuOperationTotals["status"] = "available";
+  private reason: string | null = null;
+
+  constructor(gl: WebGL2RenderingContext, extension: TimerExtension,
+    describe: (program: WebGLProgram | null) => string | null = () => null) {
+    this.gl = gl; this.extension = extension; this.describe = describe;
+    // Starting state is read once, outside any frame; wrappers track it after.
+    try {
+      this.program = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
+      this.offscreen = gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) !== null;
+      const viewport = gl.getParameter(gl.VIEWPORT) as ArrayLike<number> | null;
+      if (viewport) this.viewportSize = [viewport[2], viewport[3]];
+      const box = gl.getParameter(gl.SCISSOR_BOX) as ArrayLike<number> | null;
+      if (box) this.scissorBox = [box[0], box[1], box[2], box[3]];
+      this.scissorEnabled = gl.isEnabled(gl.SCISSOR_TEST);
+    } catch { /* Tracking corrects itself once the renderer sets its state. */ }
+    this.install();
+  }
+
+  /** Whether this frame's operations are timed; `frame` is zero-based. */
+  beginFrame(frame: number): void {
+    this.timing = false;
+    if (!this.installed || this.status !== "available") return;
+    if (frame % GPU_OPERATION_SAMPLE_EVERY !== GPU_OPERATION_SAMPLE_OFFSET) return;
+    if (this.pending.length >= MAX_PENDING_FRAMES) { this.droppedFrames++; return; }
+    try {
+      // A host query in flight would make every begin fail.
+      if (this.gl.getQuery(this.extension.TIME_ELAPSED_EXT, this.gl.CURRENT_QUERY)) { this.droppedFrames++; return; }
+    } catch { this.disable("WebGL timer queries could not be inspected."); return; }
+    this.timing = true;
+  }
+
+  endFrame(): void {
+    if (this.timing && this.frame.length) this.pending.push(this.frame);
+    this.frame = [];
+    this.timing = false;
+  }
+
+  /** Reads frames whose results have arrived, oldest first, without waiting. */
+  poll(): void {
+    const gl = this.gl;
+    try {
+      while (this.pending.length) {
+        const operations = this.pending[0];
+        if (!gl.getQueryParameter(operations[operations.length - 1].query, gl.QUERY_RESULT_AVAILABLE)) return;
+        this.pending.shift();
+        let total = 0, valid = true;
+        const times = operations.map(operation => {
+          const nanoseconds = Number(gl.getQueryParameter(operation.query, gl.QUERY_RESULT));
+          gl.deleteQuery(operation.query);
+          if (!Number.isFinite(nanoseconds) || nanoseconds < 0) valid = false;
+          return nanoseconds / 1_000_000;
+        });
+        if (!valid) { this.droppedFrames++; continue; }
+        operations.forEach((operation, index) => {
+          const ms = times[index];
+          total += ms;
+          const entry = this.labels.get(operation.label) ?? { calls: 0, ms: 0, maxMs: 0 };
+          entry.calls++; entry.ms += ms; entry.maxMs = Math.max(entry.maxMs, ms);
+          this.labels.set(operation.label, entry);
+          if (this.slowest.length < SLOWEST || ms > this.slowest[this.slowest.length - 1].ms) {
+            const { query: _query, ...detail } = operation;
+            this.slowest.push({ ...detail, ms });
+            this.slowest.sort((a, b) => b.ms - a.ms);
+            this.slowest.length = Math.min(this.slowest.length, SLOWEST);
+          }
+        });
+        this.frameMs.push(total);
+        this.frameOperations.push(operations.length);
+      }
+    } catch { this.disable("WebGL timer-query results could not be read."); }
+  }
+
+  /** The GPU clock was disjoint: everything in flight is unusable. */
+  discardPending(): void {
+    this.droppedFrames += this.pending.length;
+    this.release();
+    this.status = "disjoint";
+    this.reason = "GPU clock disjoint detected; operation timings in flight were discarded.";
+  }
+
+  totals(): GpuOperationTotals {
+    const frames = Math.max(1, this.frameMs.length);
+    return {
+      status: this.status, reason: this.reason, sampleEvery: GPU_OPERATION_SAMPLE_EVERY,
+      droppedFrames: this.droppedFrames, frameMs: [...this.frameMs], frameOperations: [...this.frameOperations],
+      byLabel: [...this.labels].map(([label, entry]) => ({ label, operationsPerFrame: entry.calls / frames,
+        msPerFrame: entry.ms / frames, maxMs: entry.maxMs })).sort((a, b) => b.msPerFrame - a.msPerFrame),
+      slowest: this.slowest.map(detail => ({ ...detail, viewport: [...detail.viewport] as [number, number],
+        scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null }))
+    };
+  }
+
+  /** Restores the context's methods and frees queries; totals stay readable. */
+  dispose(): void {
+    this.endFrame();
+    this.release();
+    this.installed = false;
+    for (const restore of this.restores) restore();
+    this.restores.length = 0;
+  }
+
+  private label(call: string): string {
+    if (call === "clear" || call === "blitFramebuffer") {
+      return `${call === "clear" ? "clear" : "blit"} → ${this.offscreen ? "offscreen" : "screen"}`;
+    }
+    let name = this.describe(this.program);
+    if (!name) {
+      if (!this.program) name = "no program";
+      else {
+        let ordinal = this.ordinals.get(this.program);
+        if (ordinal === undefined) this.ordinals.set(this.program, ordinal = this.ordinals.size + 1);
+        name = `program#${ordinal}`;
+      }
+    }
+    return `${name} → ${this.offscreen ? "offscreen" : "screen"}`;
+  }
+
+  private install(): void {
+    const gl = this.gl, target = gl as unknown as Record<string, unknown>;
+    const wrap = (name: string, make: (original: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown): void => {
+      const original = target[name];
+      if (typeof original !== "function") return;
+      const descriptor = Object.getOwnPropertyDescriptor(target, name);
+      const call = (...args: unknown[]): unknown => Reflect.apply(original, gl, args);
+      const inner = make(call);
+      // Another inspector may wrap over this one and restore it later, so a
+      // disposed timer stays in place as a plain pass-through.
+      const wrapped = function(this: unknown, ...args: unknown[]): unknown {
+        return timer.installed ? inner(...args) : Reflect.apply(original, this, args);
+      };
+      try {
+        Object.defineProperty(target, name, { configurable: true, writable: true, value: wrapped });
+        this.restores.push(() => {
+          if (target[name] !== wrapped) return;
+          if (descriptor) Object.defineProperty(target, name, descriptor);
+          else delete target[name];
+        });
+      } catch { /* Operations through this method stay untimed. */ }
+    };
+    const timer = this;
+    wrap("useProgram", original => (...args) => { timer.program = args[0] as WebGLProgram | null; return original(...args); });
+    wrap("bindFramebuffer", original => (...args) => {
+      if (args[0] === gl.FRAMEBUFFER || args[0] === gl.DRAW_FRAMEBUFFER) timer.offscreen = args[1] !== null;
+      return original(...args);
+    });
+    wrap("viewport", original => (...args) => { timer.viewportSize = [args[2] as number, args[3] as number]; return original(...args); });
+    wrap("scissor", original => (...args) => {
+      timer.scissorBox = [args[0] as number, args[1] as number, args[2] as number, args[3] as number];
+      return original(...args);
+    });
+    for (const toggle of ["enable", "disable"]) {
+      wrap(toggle, original => (...args) => {
+        if (args[0] === gl.SCISSOR_TEST) timer.scissorEnabled = toggle === "enable";
+        return original(...args);
+      });
+    }
+    for (const [name, counts] of Object.entries(TIMED)) {
+      wrap(name, original => (...args) => {
+        if (!timer.timing || timer.frame.length >= MAX_OPERATIONS_PER_FRAME) return original(...args);
+        let query: WebGLQuery | null = null;
+        try {
+          query = gl.createQuery();
+          if (query) gl.beginQuery(timer.extension.TIME_ELAPSED_EXT, query);
+        } catch { timer.disable("A WebGL timer query could not be started."); query = null; }
+        try { return original(...args); } finally {
+          if (query) {
+            try {
+              gl.endQuery(timer.extension.TIME_ELAPSED_EXT);
+              const [vertices, instances] = counts(args) as [number | null, number | null];
+              const pixels = name === "blitFramebuffer"
+                ? Math.abs((args[6] as number) - (args[4] as number)) * Math.abs((args[7] as number) - (args[5] as number)) : null;
+              timer.frame.push({ query, label: timer.label(name), order: timer.frame.length, call: name,
+                vertices, instances, pixels, target: timer.offscreen ? "offscreen" : "screen",
+                viewport: [...timer.viewportSize], scissor: timer.scissorEnabled ? [...timer.scissorBox] : null });
+            } catch { timer.disable("A WebGL timer query could not be completed."); }
+          }
+        }
+      });
+    }
+  }
+
+  private disable(reason: string): void {
+    this.timing = false;
+    this.release();
+    this.status = "unavailable";
+    this.reason = reason;
+  }
+
+  private release(): void {
+    for (const operation of [...this.frame, ...this.pending.flat()]) {
+      try { this.gl.deleteQuery(operation.query); } catch { /* A lost context may reject cleanup. */ }
+    }
+    this.frame = [];
+    this.pending.length = 0;
+  }
 }

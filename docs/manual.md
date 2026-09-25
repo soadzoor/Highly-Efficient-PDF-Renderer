@@ -349,6 +349,30 @@ starting again clears the previous capture. The report includes the starting vie
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
 
+To see which GPU work fills that span, add `gpuOperations: true`:
+
+```js
+heprPerf.start({ maxFrames: 1200, gpuOperations: true });
+```
+
+On one frame in eight, never one sampled for the frame span, every draw, clear
+and blit gets its own GPU timer query. `gpu.operations` then reports:
+
+- `frameMs`, the summed operation time per timed frame. Compare it with
+  `gpu.frameMs`: a sum far below the span means the GPU spent the rest waiting
+  for commands, so submission (browser, ANGLE or driver) is the limit. A sum near
+  the span means GPU execution is the limit.
+- `byLabel`, time and operations per frame for each program and target, such as
+  `fill → offscreen` or `composite:softMask → offscreen`. Native WebGL names its
+  programs, and compositor passes by kind; other hosts show `program#N`.
+- `slowest`, the 16 slowest single operations, with vertex and instance counts,
+  viewport, scissor and blit area.
+
+Each timed operation runs between its own queries, so the GPU cannot overlap it
+with its neighbours, and those frames run slower. Operation times can therefore
+add up to more than an untimed span. The context's own methods are restored
+when the capture stops.
+
 The Three example also exposes `heprPerf`. Reports with
 `context.diagnosticsVersion: 2` include the source kind (PDF/HEP), scene
 geometry/clip/raster counts, transparency-group structure, Three revision,

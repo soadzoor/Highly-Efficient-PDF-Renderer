@@ -1,6 +1,6 @@
 /**
  * The texture unit native WebGL paint programs read a folded paint's soft mask
- * from: above the paint units (0-18) and the compositor's (19-26).
+ * from: above the paint units (0-18) and the compositor's (19-25).
  */
 export const PAINT_FOLD_MASK_UNIT = 27;
 

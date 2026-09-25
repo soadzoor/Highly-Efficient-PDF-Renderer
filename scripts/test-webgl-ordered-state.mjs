@@ -168,6 +168,28 @@ try {
   }
   const small = mockCompositeGl({ ...original, units: 16 });
   assert.equal(new WebGlPaintCompositor(small.gl).firstUnit, 0, "a context without spare units shares the paint units");
+
+  // Surfaces, constants and transfer tables are created mid-frame. Creating
+  // one binds it, and that must happen on the compositor's own units: the
+  // native renderer caches its paint bindings across a frame, so a surface
+  // left on a paint unit would be sampled while being drawn into, which
+  // WebGL rejects as a feedback loop (and skips the draw).
+  const units = mockCompositeGl(original);
+  const unitCompositor = new WebGlPaintCompositor(units.gl);
+  const masked = { drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "fill", first: 1, count: 1 }],
+    paintGraph: { roots: [{ kind: "group", isolated: true, knockout: false, alpha: 0.5, blendMode: "Multiply",
+      softMask: { children: [{ kind: "draw", runIndex: 1 }], subtype: "Luminosity", transfer: new Float32Array([1, 0.5, 0]) },
+      children: [{ kind: "draw", runIndex: 0 }] }] } };
+  let spans = 0;
+  unitCompositor.render(masked, 100, 90, () => {
+    // Paints leave their own units active, as the native renderer does.
+    spans++; units.gl.activeTexture(units.gl.TEXTURE0 + 11); units.gl.bindTexture("TEXTURE_2D", { paint: true });
+    units.textureUnits.pop();
+  }, () => true, null, null, owned);
+  assert(spans >= 2 && unitCompositor.all.size >= 3, "the graph allocates surfaces and draws the paint and its mask");
+  assert(units.textureUnits.length > 0);
+  assert(units.textureUnits.every(unit => unit >= 19 && unit <= 25),
+    `compositor textures bind only on units 19-25, not ${[...new Set(units.textureUnits)].join(",")}`);
   console.log("WebGL ordered state: texture/VAO reuse, paint replay, native compositor query avoidance and shared state restoration passed");
 } finally { hooks.deregister(); }
 
@@ -214,16 +236,22 @@ function mockCompositeGl(initial) {
     VIEWPORT: "viewport", COLOR_CLEAR_VALUE: "clearColor", CURRENT_PROGRAM: "program", VERTEX_ARRAY_BINDING: "vao" };
   const capabilities = { SCISSOR_TEST: "scissor", BLEND: "blend", DEPTH_TEST: "depth" };
   const blendParameters = ["BLEND_SRC_RGB", "BLEND_DST_RGB", "BLEND_SRC_ALPHA", "BLEND_DST_ALPHA"];
+  const TEXTURE0 = 0x84C0, textureUnits = [];
+  let active = 0;
   const gl = new Proxy({}, { get(_target, name) {
+    if (name === "TEXTURE0") return TEXTURE0;
     if (name.toUpperCase() === name) return name;
     return (...args) => {
       calls.push([name, ...args]);
+      if (name === "activeTexture") active = args[0] - TEXTURE0;
+      if (name === "bindTexture") textureUnits.push(active);
       if (name.startsWith("create")) return {};
       if (name === "getShaderParameter" || name === "getProgramParameter") return true;
       if (name === "checkFramebufferStatus") return gl.FRAMEBUFFER_COMPLETE;
       if (name === "getUniformLocation") return {};
       if (name === "getParameter") {
         if (args[0] === "MAX_COMBINED_TEXTURE_IMAGE_UNITS") return state.units ?? 32;
+        if (args[0] === "MAX_TEXTURE_SIZE") return 4096;
         if (parameters[args[0]]) return state[parameters[args[0]]];
         if (blendParameters.includes(args[0])) return state.blendFunction[blendParameters.indexOf(args[0])];
         if (args[0] === "BLEND_EQUATION_RGB") return state.blendEquation[0];
@@ -245,5 +273,5 @@ function mockCompositeGl(initial) {
       }
     };
   } });
-  return { gl, state, calls };
+  return { gl, state, calls, textureUnits };
 }

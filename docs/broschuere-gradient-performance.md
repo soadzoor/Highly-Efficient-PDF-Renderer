@@ -1,5 +1,32 @@
 # Broschuere rendering performance investigation
 
+## Native WebGL fit-all: follow-up capture (September 25)
+
+A capture after the changes below (same document, viewport, DPR, zoom 0.224,
+panning) samples a GPU command span of 15.3 ms p50 (16.0 ms mean) against about
+17 ms before. CPU time per frame is 2.1 ms p50, so the frame is limited by the
+span. Cutting WebGL calls by 63% bought about 10%, which rules out the
+per-call hypothesis below. Across the two captures the span follows the number
+of draws (343 to 294, −14%) more closely than calls, clears (−47%) or
+render-target switches (−30%): roughly 50 µs of span per draw. The capture
+cannot tell whether that is GPU execution or command submission, and the cost
+model, which estimates a few milliseconds of shading, disagrees with the span.
+
+`heprPerf.start({ gpuOperations: true })` now times each draw, clear and blit
+of one frame in eight with its own GPU query (see the manual). If the summed
+operation times fall far below the span, the GPU is waiting for commands; if
+they approach it, the per-label totals and the slowest operations identify the
+work to reduce.
+
+The capture also reported `GL_INVALID_OPERATION: Feedback loop formed between
+Framebuffer and active Texture`, which makes WebGL skip the draw. A composite
+surface allocated mid-frame was bound on whichever texture unit was active, a
+paint unit the renderer's frame-wide binding cache believed held its own
+texture; a later paint into that surface then sampled it. The traced cold
+frame showed three such draws, all on unit 11. Warm frames reuse pooled
+surfaces, which is why the first trace missed it. The compositor now binds
+textures it creates on its own units only.
+
 ## Native WebGL fit-all: submission-bound, then clip-bound (September 25)
 
 The supplied native WebGL capture (HEP, 1920 × 945, DPR 1, automatic LOD)
@@ -20,7 +47,8 @@ Across the five captured zoom levels the span instead follows the WebGL call
 count at roughly 1.2 µs per call (14,011 calls at fit-all), except at 0.557,
 where fragment work is the larger term. Fit-all is therefore bound by command
 submission (Chrome's GPU process and ANGLE), with fragment work second. This
-is a correlation across one capture, not a measured attribution.
+is a correlation across one capture, not a measured attribution; the
+follow-up capture above contradicts the per-call reading.
 
 | Fit-all frame (traced/modelled) | Before | After |
 | --- | ---: | ---: |
@@ -49,7 +77,7 @@ Three changes produced these reductions; none rasterizes or caches content:
 2. **Native WebGL stops resending constant state.** The compositor sampled from
    units 0–6, the same units as stroke and fill data, so every span reset the
    renderer's binding cache and every draw re-sent its sampler units, texture
-   sizes and camera. Composite passes now use units 19–26 with sampler uniforms
+   sizes and camera. Composite passes now use units 19–25 with sampler uniforms
    set once, gradient and raster paints bind through the frame's texture cache,
    and frame-invariant uniforms are set once per program per ordered frame.
 3. **Single-paint group chains fold into one draw.** The dominant pattern is an

@@ -2021,7 +2021,21 @@ export class WebGlFloorplanRenderer {
   /** Opt-in diagnostics; allocates nothing until requested by the host. */
   getPerformanceProfiler(): RenderPerformanceProfiler {
     if (this.isDisposed) throw new Error("Cannot profile a disposed renderer.");
-    return this.performanceProfiler ??= new RenderPerformanceProfiler({ gl: this.gl });
+    return this.performanceProfiler ??= new RenderPerformanceProfiler({ gl: this.gl,
+      describeProgram: program => this.describeProgram(program) });
+  }
+
+  /** Names a program in GPU operation timings; composite passes by their kind. */
+  private describeProgram(program: WebGLProgram | null): string | null {
+    if (!program) return null;
+    const compositor = this.paintCompositor;
+    if (compositor && program === compositor.program) return `composite:${compositor.lastPassName}`;
+    const names: [WebGLProgram | null | undefined, string][] = [
+      [this.segmentProgram, "stroke"], [this.fillProgram, "fill"], [this.gradientFillProgram, "gradientFill"],
+      [this.gradientMeshProgram, "gradientMesh"], [this.gradientStrokeProgram, "gradientStroke"],
+      [this.textProgram, "text"], [this.rasterProgram, "raster"], [this.rasterStripProgram?.program, "rasterStrip"],
+      [this.blitProgram, "blit"], [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
+    return names.find(([candidate]) => candidate === program)?.[1] ?? null;
   }
 
   private emitFrameStats(stats: DrawStats): void {

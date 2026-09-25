@@ -31,15 +31,18 @@ export interface WebGlPaintFolding {
 }
 
 const SAMPLER_NAMES = ["uSource", "uShape", "uCurrent", "uStats", "uInitial", "uMask"];
+/** Diagnostic names of the shared executor's pass operations, by number. */
+const PASS_NAMES = ["composite", "stats", "extract", "shapeExtract", "softMask", "copy", "blendLayer"];
 // An absent soft mask must read as fully opaque, unlike every other input,
 // whose neutral value is transparent black.
 const MASK_SAMPLER = SAMPLER_NAMES.indexOf("uMask");
 /**
- * Passes sample from texture units 19-26 when the context has them. WebGL2
+ * Passes sample from texture units 19-25 when the context has them. WebGL2
  * guarantees 32, and the native renderer's paint programs stay below 19, so
  * neither side disturbs the other's bindings between spans.
  */
 const DEDICATED_FIRST_UNIT = 19;
+const TRANSFER_UNIT = SAMPLER_NAMES.length;
 const SAMPLER_UNITS = SAMPLER_NAMES.length + 1;
 
 /** Transient GL surfaces for the shared PDF pass executor. */
@@ -47,7 +50,10 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   readonly blendsPasses = true;
   private readonly gl: WebGL2RenderingContext;
   private readonly onDraw: (() => void) | undefined;
-  private readonly program: WebGLProgram;
+  /** Exposed for diagnostics, which name its draws; see `lastPassName`. */
+  readonly program: WebGLProgram;
+  /** The kind of the most recent pass, for diagnostics timing its draw. */
+  lastPassName = "composite";
   private readonly uniforms: Record<string, WebGLUniformLocation | null>;
   private readonly vao: WebGLVertexArrayObject;
   private readonly zero: WebGLTexture;
@@ -92,7 +98,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     const previous = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
     gl.useProgram(program);
     for (let i = 0; i < SAMPLER_NAMES.length; i++) gl.uniform1i(this.uniforms[SAMPLER_NAMES[i]], this.firstUnit + i);
-    gl.uniform1i(this.uniforms.uTransfer, this.firstUnit + SAMPLER_NAMES.length);
+    gl.uniform1i(this.uniforms.uTransfer, this.firstUnit + TRANSFER_UNIT);
     gl.useProgram(previous);
     this.vao = gl.createVertexArray()!;
     this.zero = this.constant(new Uint8Array(4));
@@ -179,7 +185,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       if (framebuffer) gl.deleteFramebuffer(framebuffer);
       throw new Error("Unable to allocate PDF compositing surface.");
     }
-    gl.bindTexture(gl.TEXTURE_2D, texture);
+    this.stage(texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -237,6 +243,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     } else gl.disable(gl.BLEND);
     gl.useProgram(this.program); gl.bindVertexArray(this.vao);
+    this.lastPassName = PASS_NAMES[operation.operation];
     const textures = [operation.source, operation.shape, operation.current, operation.stats, operation.initial, operation.mask];
     // Every input is bound on every pass, so no unit can keep a surface this
     // pass renders into; the cache only skips rebinding the same texture.
@@ -244,7 +251,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       this.bind(i, textures[i]?.texture ?? (i === MASK_SAMPLER ? this.one : this.zero));
     }
     const transfer = operation.softMask?.transfer;
-    this.bind(SAMPLER_NAMES.length, transfer ? this.transferTexture(transfer) : this.zero);
+    this.bind(TRANSFER_UNIT, transfer ? this.transferTexture(transfer) : this.zero);
     gl.uniform4f(this.uniforms.uParams, operation.operation, operation.blendMode ?? 0,
       operation.knockout ? 1 : 0, operation.opacity ?? 1);
     gl.uniform4f(this.uniforms.uExtra, operation.alphaIsShape ? 1 : 0,
@@ -265,7 +272,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   }
   private constant(pixel: Uint8Array): WebGLTexture {
     const gl = this.gl, texture = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, texture);
+    this.stage(texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
@@ -277,6 +284,14 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     this.gl.activeTexture(this.gl.TEXTURE0 + this.firstUnit + offset);
     this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
   }
+  /**
+   * Binds a texture this compositor is creating on one of its own units. A
+   * surface allocated mid-frame must not land on whichever unit is active: a
+   * renderer caching its paint bindings would keep sampling that unit and
+   * then draw into the surface, a feedback loop WebGL rejects. Every pass
+   * rebinds all its units, so leaving the texture here is harmless.
+   */
+  private stage(texture: WebGLTexture): void { this.bind(TRANSFER_UNIT, texture); }
   private target(surface: Surface): void { this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, surface.framebuffer); this.gl.viewport(0, 0, this.width, this.height); }
   private releaseSurfaces(): void {
     for (const surface of this.all) { this.gl.deleteTexture(surface.texture); this.gl.deleteFramebuffer(surface.framebuffer); }
@@ -286,13 +301,11 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     let texture = this.transfers.get(values);
     if (texture) return texture;
     const gl = this.gl;
-    texture = gl.createTexture()!; gl.bindTexture(gl.TEXTURE_2D, texture);
+    texture = gl.createTexture()!; this.stage(texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     const width = Math.min(values.length, gl.getParameter(gl.MAX_TEXTURE_SIZE) as number), height = Math.ceil(values.length / width);
     const pixels = new Float32Array(width * height); pixels.set(values);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, pixels);
-    // The upload bound it to whichever unit was active.
-    this.bound.length = 0;
     this.transfers.set(values, texture); return texture;
   }
   private shader(type: number, source: string): WebGLShader {
