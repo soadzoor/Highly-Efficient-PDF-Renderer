@@ -152,6 +152,22 @@ for (let i = 0; i < data.coarseInstanceCount; i += 1) {
   assert.equal(combined.scene.textInstanceB[(data.exactInstanceCount + i) * 4 + 2], data.solidGlyphIndex);
 }
 
+// Instance B.w is the 1-based text clip reference. Renderers remap every
+// nonzero reference onto the scene's clip rectangles, so a nonzero coarse value
+// clipped zoomed-out text against an unrelated rectangle (blank Three pages).
+const clippedCombined = createTextLodCombinedPayload(
+  {...scene, textInstanceB: clippedInstanceB, textClipRects: new Float32Array([0, 0, 10, 10])},
+  clippedLod.data
+);
+assert.ok(clippedLod.data.coarseInstanceCount > 0);
+for (let i = 0; i < clippedLod.data.coarseInstanceCount; i += 1) {
+  assert.equal(
+    clippedCombined.scene.textInstanceB[(clippedLod.data.exactInstanceCount + i) * 4 + 3],
+    0,
+    "coarse runs never contain clipped glyphs, so they must carry no clip reference"
+  );
+}
+
 assert.equal(largestSingularValue2x2(3, 0, 0, 2), 3);
 assert.ok(Math.abs(largestSingularValue2x2(1, 2, 3, 4) - 5.464985704219043) < 1e-12);
 const affineBounds = {minX: -1, minY: -2, maxX: 3, maxY: 4};

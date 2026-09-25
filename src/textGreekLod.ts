@@ -4,8 +4,6 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 export const TEXT_LOD_MIN_TEXT_INSTANCES = 50_000;
 /** A coarse level that saves less than this is not worth keeping resident. */
 export const TEXT_LOD_MAX_COARSE_RUN_RATIO = 0.7;
-/** Value stored in the spare instance component for a coarse square. */
-export const TEXT_COARSE_INSTANCE_FLAG = 1;
 /** Maximum exact glyphs represented by one independently selected cluster. */
 export const TEXT_LOD_MAX_CLUSTER_GLYPHS = 512;
 /** Maximum coarse runs represented by one independently selected cluster. */
@@ -498,9 +496,12 @@ function buildPageRuns(
     ];
     const coarseIndex = context.coarse.count;
     const coverage = Math.min(1, Math.max(0, inkTotal / (width * height)));
+    // Instance B.w is the 1-based text clip reference. Clipped glyphs never
+    // enter a run, so the coarse square must stay unclipped (0); any other
+    // value makes renderers clip it against an unrelated clip rectangle.
     context.coarse.push(
       transform[0], transform[1], transform[2], transform[3],
-      transform[4], transform[5], 0, TEXT_COARSE_INSTANCE_FLAG,
+      transform[4], transform[5], 0, 0,
       first.red, first.green, first.blue, first.alpha * coverage
     );
     context.runs.push(freezeRun({
