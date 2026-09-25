@@ -43,8 +43,9 @@ export const TEXT_LOD_EXACT_ENTER_PX = 0.75;
  * tested region identical until the view has moved a meaningful distance, at the
  * cost of selecting the clusters within one grid step of the viewport. The
  * snapped rectangle always contains the real one, so nothing pops in late.
- * Affine views test clusters against this rectangle alone; projective views
- * still refine it with each cluster's exact projection.
+ * Affine views test clusters against this rectangle alone, and snap only while
+ * the scale holds; projective views still refine it with each cluster's
+ * projection.
  */
 const TEXT_LOD_VISIBILITY_STEP_RATIO = 0.1;
 
@@ -303,6 +304,13 @@ export class TextLodRuntime {
         continue;
       }
 
+      // A projective page drawn wholly inside the viewport makes every child
+      // visible, and its scale bounds contain every child's: its upper bound
+      // proves a cluster coarse and its lower bound proves one exact, exactly as
+      // the cluster's own projection would. Only clusters between them, or on a
+      // page crossing the viewport edge, still need that projection.
+      const pageInsideView = pageProjection !== null && pageProjection.stable &&
+        isProjectionInsideViewport(pageProjection, update);
       const clusterEnd = page.clusterStart + page.clusterCount;
       for (let clusterIndex = page.clusterStart; clusterIndex < clusterEnd; clusterIndex += 1) {
         const cluster = data.clusters[clusterIndex];
@@ -312,32 +320,43 @@ export class TextLodRuntime {
           }
           continue;
         }
-        const projection = affine ? null : analyzePlanarBoundsProjectionInto(
-          cluster.bounds,
-          update.localToClip,
-          this.selectionViewport(update),
-          this.clusterProjection
-        );
-        if (projection && projection.stable && !projection.visible) {
-          if (setClusterValue(this.clusterVisibility, clusterIndex, 0)) {
-            selectionDecisionChanged = true;
+        const wasCoarse = this.clusterStates[clusterIndex] === 1;
+        const selectable = this.mode === "auto" && cluster.eligible;
+        // 1 coarse, 0 exact, -1 undecided until the cluster itself is projected.
+        let decision = -1;
+        if (!pageProjection) {
+          decision = selectable && isCoarseInkHeight(cluster.maxInkHeight * affineScale, wasCoarse) ? 1 : 0;
+        } else if (pageInsideView) {
+          if (!selectable) {
+            decision = 0;
+          } else if (isCoarseInkHeight(cluster.maxInkHeight * pageProjection.maxPixelsPerLocalUnit, wasCoarse)) {
+            decision = 1;
+          } else if (cluster.maxInkHeight * pageProjection.minPixelsPerLocalUnit >= TEXT_LOD_EXACT_ENTER_PX) {
+            decision = 0;
           }
-          continue;
+        }
+        if (decision < 0) {
+          const projection = analyzePlanarBoundsProjectionInto(
+            cluster.bounds,
+            update.localToClip,
+            this.selectionViewport(update),
+            this.clusterProjection
+          );
+          if (projection.stable && !projection.visible) {
+            if (setClusterValue(this.clusterVisibility, clusterIndex, 0)) {
+              selectionDecisionChanged = true;
+            }
+            continue;
+          }
+          decision = selectable && projection.stable &&
+            isCoarseInkHeight(cluster.maxInkHeight * projection.maxPixelsPerLocalUnit, wasCoarse) ? 1 : 0;
         }
         if (setClusterValue(this.clusterVisibility, clusterIndex, 1)) {
           selectionDecisionChanged = true;
         }
         visibleClusters += 1;
 
-        const clusterStable = projection ? projection.stable : true;
-        let coarse = false;
-        if (this.mode === "auto" && cluster.eligible && clusterStable) {
-          const projectedInkHeight = cluster.maxInkHeight * (projection ? projection.maxPixelsPerLocalUnit : affineScale);
-          const wasCoarse = this.clusterStates[clusterIndex] === 1;
-          coarse = wasCoarse
-            ? projectedInkHeight < TEXT_LOD_EXACT_ENTER_PX
-            : projectedInkHeight <= TEXT_LOD_COARSE_ENTER_PX;
-        }
+        const coarse = decision === 1;
         if (setClusterValue(this.clusterStates, clusterIndex, coarse ? 1 : 0)) {
           selectionDecisionChanged = true;
         }
@@ -388,10 +407,10 @@ export class TextLodRuntime {
   }
 
   /**
-   * For an affine view, store its uniform scale and the snapped visibility
-   * rectangle (the viewport's local bounds, narrowed by any culling bounds).
-   * Returns false for projective or degenerate views, which keep the exact
-   * per-page and per-cluster projection.
+   * For an affine view, store its uniform scale and its visibility rectangle:
+   * the viewport's local bounds, narrowed by any culling bounds, and snapped
+   * while the scale is unchanged. Returns false for projective or degenerate
+   * views, which keep per-page and per-cluster projection.
    */
   private resolveAffineView(update: TextLodSelectionUpdate): boolean {
     const width = Math.max(1, update.viewportWidth);
@@ -408,12 +427,16 @@ export class TextLodRuntime {
       view.maxX = Math.min(view.maxX, culling.maxX);
       view.maxY = Math.min(view.maxY, culling.maxY);
     }
-    const snapped = this.resolveVisibilityBounds(view) ?? view;
+    // Snapping pays off only while the scale holds, as in a pan. A zoom frame
+    // moves cluster decisions anyway, so it tests the exact view instead of
+    // drawing the snap margin's off-screen text.
+    const holdingScale = this.lastAffineValid && scale === this.lastAffineScale;
+    const visibility = holdingScale ? this.resolveVisibilityBounds(view) ?? view : view;
     const out = this.affineVisibility;
-    out.minX = snapped.minX;
-    out.minY = snapped.minY;
-    out.maxX = snapped.maxX;
-    out.maxY = snapped.maxY;
+    out.minX = visibility.minX;
+    out.minY = visibility.minY;
+    out.maxX = visibility.maxX;
+    out.maxY = visibility.maxY;
     this.affineScale = scale;
     return true;
   }
@@ -637,6 +660,22 @@ function quantizeVisibilityStep(step: number): number {
     return 0;
   }
   return Math.pow(2, Math.round(Math.log2(step)));
+}
+
+/** Hysteresis: a coarse cluster stays coarse below the exact threshold. */
+function isCoarseInkHeight(projectedInkHeight: number, wasCoarse: boolean): boolean {
+  return wasCoarse
+    ? projectedInkHeight < TEXT_LOD_EXACT_ENTER_PX
+    : projectedInkHeight <= TEXT_LOD_COARSE_ENTER_PX;
+}
+
+function isProjectionInsideViewport(
+  projection: PlanarBoundsProjection,
+  update: TextLodSelectionUpdate
+): boolean {
+  return projection.minX >= 0 && projection.minY >= 0 &&
+    projection.maxX <= Math.max(1, update.viewportWidth) &&
+    projection.maxY <= Math.max(1, update.viewportHeight);
 }
 
 /** Below this many ids a direct loop beats creating a typed-array view to copy. */

@@ -14,6 +14,12 @@ export interface PlanarBoundsProjection {
   stable: boolean;
   /** Conservative upper bound on screen pixels per local-space unit. */
   maxPixelsPerLocalUnit: number;
+  /**
+   * Conservative lower bound on the largest stretch at every point of the
+   * rectangle: no point magnifies less than this in its widest direction.
+   * Zero when unknown. Equal to the maximum for affine views.
+   */
+  minPixelsPerLocalUnit: number;
   /** Projected pixel bounds. Infinite when projection is unstable. */
   minX: number;
   minY: number;
@@ -66,11 +72,10 @@ export function createOrthographicLocalToClip(
  * Project a PDF-local rectangle through a column-major 4x4 matrix.
  *
  * For affine transforms the returned scale is the exact maximum singular value
- * of the local-to-pixel Jacobian. For projective transforms each Jacobian entry
- * is bounded analytically over the complete rectangle and combined with a
- * Frobenius-norm bound. This can choose exact text more often than necessary,
- * but can never under-estimate readable text merely because only a center point
- * was sampled.
+ * of the local-to-pixel Jacobian. For projective transforms the Jacobian is
+ * bounded analytically over the complete rectangle. This can choose exact text
+ * more often than necessary, but can never under-estimate readable text merely
+ * because only a center point was sampled.
  */
 export function analyzePlanarBoundsProjection(
   bounds: Bounds,
@@ -86,6 +91,7 @@ export function createPlanarBoundsProjection(): PlanarBoundsProjection {
     visible: true,
     stable: false,
     maxPixelsPerLocalUnit: Number.POSITIVE_INFINITY,
+    minPixelsPerLocalUnit: 0,
     minX: Number.NEGATIVE_INFINITY,
     minY: Number.NEGATIVE_INFINITY,
     maxX: Number.POSITIVE_INFINITY,
@@ -189,19 +195,52 @@ export function analyzePlanarBoundsProjectionInto(
   const visible = !(outsideLeft || outsideRight || outsideBottom || outsideTop);
   const affine = isAffinePlanarLocalToClip(localToClip);
   let maxPixelsPerLocalUnit: number;
+  let minPixelsPerLocalUnit: number;
   if (affine) {
     maxPixelsPerLocalUnit = affinePlanarPixelsPerLocalUnit(localToClip, width, height);
+    minPixelsPerLocalUnit = maxPixelsPerLocalUnit;
   } else {
-    // d(X/W)/dx = (m0*W - X*m3) / W^2. The numerator is
-    // affine (and in fact independent of x); its maximum absolute value over a
-    // rectangle occurs at a corner. Bound all four pixel-Jacobian entries and
-    // use their Frobenius norm as a conservative singular-value upper bound.
-    const invMinW2 = 1 / (minAbsW * minAbsW);
-    const dXdx = maxAbsProjectiveDerivativeNumerator(bounds, m0, m4, m12, m3, m7, m15, m0, m3) * invMinW2 * width * 0.5;
-    const dXdy = maxAbsProjectiveDerivativeNumerator(bounds, m0, m4, m12, m3, m7, m15, m4, m7) * invMinW2 * width * 0.5;
-    const dYdx = maxAbsProjectiveDerivativeNumerator(bounds, m1, m5, m13, m3, m7, m15, m1, m3) * invMinW2 * height * 0.5;
-    const dYdy = maxAbsProjectiveDerivativeNumerator(bounds, m1, m5, m13, m3, m7, m15, m5, m7) * invMinW2 * height * 0.5;
-    maxPixelsPerLocalUnit = Math.hypot(dXdx, dXdy, dYdx, dYdy);
+    // Each pixel-Jacobian entry is an affine numerator over W^2, for example
+    // d(X/W)/dx = (m0*W - X*m3) / W^2. The numerator matrix N is therefore an
+    // affine function of position, so its largest singular value is convex
+    // and peaks at a corner, while W^2 (W > 0 here) is smallest at a corner.
+    // Their ratio bounds the stretch everywhere inside the rectangle, without
+    // the up-to-sqrt(2) excess of an entrywise Frobenius bound. Conversely, a
+    // sign-stable entry keeps at least its smallest corner magnitude, which
+    // over the largest W^2 bounds the stretch from below.
+    const halfWidth = width * 0.5;
+    const halfHeight = height * 0.5;
+    let maxNumeratorSigma = 0;
+    let maxW2 = 0;
+    let minA = Number.POSITIVE_INFINITY, maxA = Number.NEGATIVE_INFINITY;
+    let minB = Number.POSITIVE_INFINITY, maxB = Number.NEGATIVE_INFINITY;
+    let minC = Number.POSITIVE_INFINITY, maxC = Number.NEGATIVE_INFINITY;
+    let minD = Number.POSITIVE_INFINITY, maxD = Number.NEGATIVE_INFINITY;
+    for (let corner = 0; corner < 4; corner += 1) {
+      const x = (corner & 1) === 0 ? bounds.minX : bounds.maxX;
+      const y = (corner & 2) === 0 ? bounds.minY : bounds.maxY;
+      const clipX = m0 * x + m4 * y + m12;
+      const clipY = m1 * x + m5 * y + m13;
+      const clipW = m3 * x + m7 * y + m15;
+      const a = (m0 * clipW - clipX * m3) * halfWidth;
+      const b = (m1 * clipW - clipY * m3) * halfHeight;
+      const c = (m4 * clipW - clipX * m7) * halfWidth;
+      const d = (m5 * clipW - clipY * m7) * halfHeight;
+      maxNumeratorSigma = Math.max(maxNumeratorSigma, largestSingularValue2x2(a, b, c, d));
+      maxW2 = Math.max(maxW2, clipW * clipW);
+      minA = Math.min(minA, a); maxA = Math.max(maxA, a);
+      minB = Math.min(minB, b); maxB = Math.max(maxB, b);
+      minC = Math.min(minC, c); maxC = Math.max(maxC, c);
+      minD = Math.min(minD, d); maxD = Math.max(maxD, d);
+    }
+    maxPixelsPerLocalUnit = maxNumeratorSigma / (minAbsW * minAbsW);
+    const minNumerator = Math.max(
+      signStableMinAbs(minA, maxA),
+      signStableMinAbs(minB, maxB),
+      signStableMinAbs(minC, maxC),
+      signStableMinAbs(minD, maxD)
+    );
+    minPixelsPerLocalUnit = maxW2 > 0 ? minNumerator / maxW2 : 0;
   }
 
   if (!Number.isFinite(maxPixelsPerLocalUnit)) {
@@ -211,6 +250,9 @@ export function analyzePlanarBoundsProjectionInto(
   out.visible = visible;
   out.stable = true;
   out.maxPixelsPerLocalUnit = maxPixelsPerLocalUnit;
+  out.minPixelsPerLocalUnit = Number.isFinite(minPixelsPerLocalUnit)
+    ? Math.min(minPixelsPerLocalUnit, maxPixelsPerLocalUnit)
+    : 0;
   out.minX = projectedMinX;
   out.minY = projectedMinY;
   out.maxX = projectedMaxX;
@@ -275,27 +317,11 @@ export function affinePlanarViewportBoundsInto(localToClip: ArrayLike<number>, o
   return out;
 }
 
-function maxAbsProjectiveDerivativeNumerator(
-  bounds: Bounds,
-  numeratorX: number,
-  numeratorY: number,
-  numeratorConstant: number,
-  wX: number,
-  wY: number,
-  wConstant: number,
-  derivativeNumerator: number,
-  derivativeW: number
-): number {
-  let maximum = 0;
-  for (let corner = 0; corner < 4; corner += 1) {
-    const x = (corner & 1) === 0 ? bounds.minX : bounds.maxX;
-    const y = (corner & 2) === 0 ? bounds.minY : bounds.maxY;
-    const numerator =
-      derivativeNumerator * (wX * x + wY * y + wConstant) -
-      (numeratorX * x + numeratorY * y + numeratorConstant) * derivativeW;
-    maximum = Math.max(maximum, Math.abs(numerator));
-  }
-  return maximum;
+/** Smallest magnitude of an affine quantity over its corner range, or 0 if it can vanish. */
+function signStableMinAbs(minimum: number, maximum: number): number {
+  if (minimum > 0) return minimum;
+  if (maximum < 0) return -maximum;
+  return 0;
 }
 
 function isFiniteBounds(bounds: Bounds): boolean {
@@ -308,6 +334,7 @@ function writeUnstableProjection(out: PlanarBoundsProjection): PlanarBoundsProje
   out.visible = true;
   out.stable = false;
   out.maxPixelsPerLocalUnit = Number.POSITIVE_INFINITY;
+  out.minPixelsPerLocalUnit = 0;
   out.minX = Number.NEGATIVE_INFINITY;
   out.minY = Number.NEGATIVE_INFINITY;
   out.maxX = Number.POSITIVE_INFINITY;
@@ -319,6 +346,7 @@ function writeCulledProjection(out: PlanarBoundsProjection): PlanarBoundsProject
   out.visible = false;
   out.stable = true;
   out.maxPixelsPerLocalUnit = 0;
+  out.minPixelsPerLocalUnit = 0;
   out.minX = 0;
   out.minY = 0;
   out.maxX = 0;
