@@ -4,11 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
-    <script type="module" crossorigin src="./assets/main-DAIU0kGK.js"></script>
+    <script type="module" crossorigin src="./assets/main-DxWTBzwx.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/nativeTypes-Fs-ZM2pm.js">
-    <link rel="modulepreload" crossorigin href="./assets/drawingSelectionControls-DS0QUOwF.js">
-    <link rel="modulepreload" crossorigin href="./assets/textLodStatsFormat-Cc3pLGuw.js">
-    <link rel="stylesheet" crossorigin href="./assets/drawingSelectionControls-_9u21QuI.css">
+    <link rel="modulepreload" crossorigin href="./assets/drawCallMetrics-usbKzG6S.js">
+    <link rel="modulepreload" crossorigin href="./assets/textLodStatsFormat-BAqZyxZC.js">
+    <link rel="stylesheet" crossorigin href="./assets/drawCallMetrics-_9u21QuI.css">
     <link rel="stylesheet" crossorigin href="./assets/main-KgzcWCM1.css">
   </head>
   <body>
@@ -16,7 +16,7 @@
     <div id="hud" class="panel">
       <div class="panel-header">
         <div class="toolbar">
-          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.1.32</a>
+          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.1.34</a>
           <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
           <div id="example-dropdown" class="example-dropdown">
             <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
@@ -111,6 +111,7 @@
           <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Draw calls / frame</span><span id="metric-draw-calls" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
         </div>
