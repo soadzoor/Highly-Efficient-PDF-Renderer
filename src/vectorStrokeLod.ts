@@ -3,7 +3,7 @@ import type { OptionalContentSnapshot } from "./optionalContent";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import {
-  getCombinedVectorStrokeLodStorage, vectorStrokeLodLevelUploadScene, vectorStrokeLodStorageOrigins,
+  getSplitVectorStrokeLodStorage, vectorStrokeLodLevelUploadScene, vectorStrokeLodStorageOrigins,
   type VectorStrokeLodStorageLayout
 } from "./vectorStrokeLodStorage";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
@@ -73,13 +73,14 @@ export class ThreeVectorLodStrokeLayer {
     this.runtime = preparedRuntime?.take(scene) ?? takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
     try {
       if (scene.drawRuns) {
-        const { scene: combined, layout } = getCombinedVectorStrokeLodStorage(scene, this.runtime.levels);
+        const { layout, records, textures } = getSplitVectorStrokeLodStorage(scene, this.runtime.levels);
         const origins = vectorStrokeLodStorageOrigins(layout)!;
         this.layout = layout;
         this.selectedStorageBits = new Uint32Array(Math.ceil(layout.count / 32));
         const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
-        drawPlan.setStrokeSource(combined, origins);
-        const layer = new ThreeMaterialStrokeLayer(combined, { ...options, drawPlan, canonicalScene: scene, strokeOrigins: origins });
+        drawPlan.setStrokeSource(records, origins);
+        const layer = new ThreeMaterialStrokeLayer(scene, { ...options, drawPlan, canonicalScene: scene,
+          strokeOrigins: origins, strokeRecords: records, strokeTextures: textures });
         this.layers.push(layer);
         this.combinedIds = new Uint32Array(0);
         layer.setVisible(false); layer.setDrawEnabled(false);

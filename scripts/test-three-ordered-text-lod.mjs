@@ -17,6 +17,7 @@ try {
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
   const { ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
+  const { sceneStrokeRecords } = await import("../src/strokeRecords.ts");
   const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
   const { withThreeRenderPerformance } = await import("../src/threeRenderPerformance.ts");
   const { sceneRequiresPaintCompositing } = await import("../src/scenePaintVisibility.ts");
@@ -92,7 +93,7 @@ try {
   assert.notDeepEqual(schedule.order,[0,1,2,3],"the fixture permits exact-geometry paint reordering");
   schedule.setTextLodEnabled(true);
   assert.deepEqual(schedule.order,[0,1,2,3],"enabling LOD restores canonical order before any layer updates");
-  schedule.setStrokeSource(scene,new Uint32Array());
+  schedule.setStrokeSource(sceneStrokeRecords(scene),new Uint32Array());
   assert.deepEqual(schedule.order,[0,1,2,3],"replacing the stroke hierarchy keeps the text ordering constraint");
   schedule.setTextLodEnabled(false);
   assert.notDeepEqual(schedule.order,[0,1,2,3],"exact text restores the ordinary shared scheduler");

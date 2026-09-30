@@ -35,6 +35,15 @@ interface ThreeWebGpuStrokeMaterialOptions {
   segmentStyleTexture: THREE.DataTexture;
   segmentBoundsTexture: THREE.DataTexture;
   segmentTextureWidth: number;
+  /** IDs from `split` read this second texture set; see splitStrokeTextures. */
+  segmentTail?: {
+    textureA: THREE.DataTexture;
+    textureB: THREE.DataTexture;
+    styleTexture: THREE.DataTexture;
+    boundsTexture: THREE.DataTexture;
+    width: number;
+    split: number;
+  };
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
@@ -71,6 +80,27 @@ fn heprSegmentCoord(index: f32, width: f32) -> vec2<i32> {
   let segmentIndex = i32(index + 0.5);
   let safeWidth = max(i32(width), 1);
   return vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
+}
+`);
+
+const splitSegmentTexelFn = TSL.wgslFn(`
+fn heprSplitSegmentTexel(
+  headTexture: texture_2d<f32>,
+  tailTexture: texture_2d<f32>,
+  index: f32,
+  headWidth: f32,
+  tailWidth: f32,
+  splitIndex: f32
+) -> vec4<f32> {
+  let segmentIndex = i32(index + 0.5);
+  let split = i32(splitIndex + 0.5);
+  if (segmentIndex >= split) {
+    let tailIndex = segmentIndex - split;
+    let width = max(i32(tailWidth), 1);
+    return textureLoad(tailTexture, vec2<i32>(tailIndex % width, tailIndex / width), 0);
+  }
+  let width = max(i32(headWidth), 1);
+  return textureLoad(headTexture, vec2<i32>(segmentIndex % width, segmentIndex / width), 0);
 }
 `);
 
@@ -277,10 +307,23 @@ export function createThreeWebGpuStrokeMaterial(
     width: segmentTextureWidthUniform
   });
 
-  const primitiveA = varyingNode(TSL.textureLoad(options.segmentTextureA, coord, 0), true);
-  const primitiveB = varyingNode(TSL.textureLoad(options.segmentTextureB, coord, 0), true);
-  const style = varyingNode(TSL.textureLoad(options.segmentStyleTexture, coord, 0), true);
-  const primitiveBounds = varyingNode(TSL.textureLoad(options.segmentBoundsTexture, coord, 0), true);
+  const tail = options.segmentTail;
+  const tailWidthUniform = tail ? TSL.uniform(Math.max(1, tail.width)) : null;
+  const splitUniform = tail ? TSL.uniform(tail.split) : null;
+  const load = (head: THREE.DataTexture, tailTexture: THREE.DataTexture | undefined): never => tailTexture
+    ? callNode(splitSegmentTexelFn, {
+      headTexture: TSL.textureLoad(head),
+      tailTexture: TSL.textureLoad(tailTexture),
+      index: segmentIndex,
+      headWidth: segmentTextureWidthUniform,
+      tailWidth: tailWidthUniform,
+      splitIndex: splitUniform
+    })
+    : TSL.textureLoad(head, coord, 0) as never;
+  const primitiveA = varyingNode(load(options.segmentTextureA, tail?.textureA), true);
+  const primitiveB = varyingNode(load(options.segmentTextureB, tail?.textureB), true);
+  const style = varyingNode(load(options.segmentStyleTexture, tail?.styleTexture), true);
+  const primitiveBounds = varyingNode(load(options.segmentBoundsTexture, tail?.boundsTexture), true);
   const worldPack = varyingNode(callNode(worldPackFn, {
     corner,
     primitiveA,

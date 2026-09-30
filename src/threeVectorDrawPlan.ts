@@ -1,7 +1,7 @@
 import { normalizeScenePaintGraph, scenePaintSpanSegments, type ScenePaintNode } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
-import { sceneStrokeRecords } from "./strokeRecords";
+import { sceneStrokeRecords, type StrokeRecords } from "./strokeRecords";
 import type { TextLodBuildData } from "./textLodCore";
 import type { VectorScene } from "./pdfVectorExtractor";
 
@@ -44,7 +44,7 @@ export class ThreeVectorDrawPlan {
     this.positionOfRun = new Int32Array(runs.length);
     for (let index = 0; index < runs.length; index++) this.positionOfRun[index] = index;
     this.segments = sceneRequiresPaintCompositing(scene) ? scenePaintSpanSegments(scene) : null;
-    this.scheduler = this.createScheduler(scene, strokeSourceRuns(scene));
+    this.scheduler = this.createScheduler(sceneStrokeRecords(scene), strokeSourceRuns(scene));
   }
 
   /** Scheduled run indices; canonical order until a pixel scale is supplied. */
@@ -91,7 +91,7 @@ export class ThreeVectorDrawPlan {
   }
 
   /** Include every LOD level in the commutation proof, even while it is dormant. */
-  setStrokeSource(strokes: VectorScene, origins: Uint32Array): void {
+  setStrokeSource(strokes: StrokeRecords, origins: Uint32Array): void {
     const canonical = strokeSourceRuns(this.scene);
     const sourceRuns = Uint32Array.from(origins, origin => canonical[origin]);
     this.scheduler = this.createScheduler(strokes, sourceRuns);
@@ -101,12 +101,12 @@ export class ThreeVectorDrawPlan {
     this.reschedule();
   }
 
-  private createScheduler(strokes: VectorScene, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
+  private createScheduler(strokes: StrokeRecords, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
     // Arbitrary public graphs can visit canonical runs backwards. Such graphs
     // retain their source submissions rather than feeding a non-monotonic span
     // sequence to the scheduler.
     if (this.segments && !graphRunsInOrder(this.scene)) return null;
-    return VectorPageDrawScheduler.create(this.scene, sceneStrokeRecords(strokes), sourceRuns, this.segments, this.independentPageRuns);
+    return VectorPageDrawScheduler.create(this.scene, strokes, sourceRuns, this.segments, this.independentPageRuns);
   }
 
   private reschedule(): boolean {

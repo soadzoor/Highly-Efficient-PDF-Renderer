@@ -107,3 +107,67 @@ export function* strokeTextureRows(
     row++;
   }
 }
+
+/** RGBA32F data of one stroke field texture, `width` by `height` texels. */
+export interface StrokeTextureData {
+  width: number;
+  height: number;
+  data: Float32Array;
+}
+
+/**
+ * Stroke records as two texture sets, for renderers whose textures upload one
+ * array each (Three data textures). IDs below `split` are the first scene's
+ * complete texture rows: its own arrays back the head textures, so they are
+ * never copied. The tail holds every ID from `split` on: the first scene's
+ * partial last row, then the later segments.
+ */
+export interface SplitStrokeTextures {
+  split: number;
+  head: Record<StrokeRecordField, StrokeTextureData>;
+  tail: Record<StrokeRecordField, StrokeTextureData>;
+}
+
+const STROKE_RECORD_FIELDS = ["endpoints", "primitiveMeta", "primitiveBounds", "styles"] as const;
+
+/**
+ * Build split texture data. Later segments' scenes are re-pointed to views of
+ * the tail data, so their records are not stored twice; the first scene's
+ * arrays are only viewed, never replaced or written.
+ */
+export function splitStrokeTextures(records: StrokeRecords): SplitStrokeTextures {
+  const first = records.segments[0];
+  const headCount = Math.max(0, first?.count ?? 0);
+  const headWidth = Math.max(1, Math.ceil(Math.sqrt(headCount)));
+  const headRows = Math.floor(headCount / headWidth);
+  const split = headWidth * headRows;
+  const tailCount = Math.max(0, records.count - split);
+  const tailWidth = Math.max(1, Math.ceil(Math.sqrt(tailCount)));
+  const tailRows = Math.max(1, Math.ceil(tailCount / tailWidth));
+  const head = {} as Record<StrokeRecordField, StrokeTextureData>;
+  const tail = {} as Record<StrokeRecordField, StrokeTextureData>;
+  for (const field of STROKE_RECORD_FIELDS) {
+    const source = first?.scene[field];
+    if (split === 0) {
+      head[field] = { width: 1, height: 1, data: new Float32Array(4) };
+    } else if (source && source.length >= split * 4) {
+      head[field] = { width: headWidth, height: headRows, data: source.subarray(0, split * 4) };
+    } else {
+      // A short source cannot back the texture; copy what it has.
+      const data = new Float32Array(split * 4);
+      if (source) data.set(source.subarray(0, Math.min(source.length, data.length)));
+      head[field] = { width: headWidth, height: headRows, data };
+    }
+    const data = new Float32Array(tailWidth * tailRows * 4);
+    for (const segment of records.segments) {
+      const from = Math.max(segment.first, split), to = segment.first + segment.count;
+      if (to <= from) continue;
+      const values = segment.scene[field];
+      const start = (from - segment.first) * 4, end = Math.min(values.length, (to - segment.first) * 4);
+      if (end > start) data.set(values.subarray(start, end), (from - split) * 4);
+      if (segment !== first) segment.scene[field] = data.subarray((segment.first - split) * 4, (to - split) * 4);
+    }
+    tail[field] = { width: tailWidth, height: tailRows, data };
+  }
+  return { split, head, tail };
+}

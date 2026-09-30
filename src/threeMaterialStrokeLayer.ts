@@ -2,7 +2,9 @@ import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTrans
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
-import { sharedVectorStrokeLodTextureData } from "./vectorStrokeLodStorage";
+import {
+  sceneStrokeRecords, splitStrokeTextures, type SplitStrokeTextures, type StrokeRecords, type StrokeTextureData
+} from "./strokeRecords";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
@@ -29,6 +31,10 @@ interface StrokeLayerOptions {
   drawPlan?: ThreeVectorDrawPlan;
   canonicalScene?: VectorScene;
   strokeOrigins?: Uint32Array;
+  /** Stroke records to draw instead of the scene's own; see vectorStrokeLodStorage. */
+  strokeRecords?: StrokeRecords;
+  /** Prepared texture data of `strokeRecords`, shared by every layer of one hierarchy. */
+  strokeTextures?: SplitStrokeTextures;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
@@ -57,8 +63,15 @@ export class ThreeMaterialStrokeLayer {
   private readonly segmentTextureA: THREE.DataTexture;
   private readonly segmentTextureB: THREE.DataTexture;
   private readonly segmentStyleTexture: THREE.DataTexture;
-  private styleTextureShared: boolean;
   private readonly segmentBoundsTexture: THREE.DataTexture;
+  // IDs from segmentSplit, after the scene's complete texture rows.
+  private readonly segmentTailTextureA: THREE.DataTexture;
+  private readonly segmentTailTextureB: THREE.DataTexture;
+  private readonly segmentTailStyleTexture: THREE.DataTexture;
+  private readonly segmentTailBoundsTexture: THREE.DataTexture;
+  private readonly segmentSplit: number;
+  /** Style data still belongs to the scene or LOD store; recoloring copies it first. */
+  private styleDataShared = true;
 
   private readonly viewportUniform: THREE.Vector2;
   private readonly cameraCenterUniform: THREE.Vector2;
@@ -86,35 +99,22 @@ export class ThreeMaterialStrokeLayer {
 
   constructor(scene: VectorScene, options: StrokeLayerOptions) {
     this.vectorClipTexture = createThreeVectorClipTexture(scene);
-    const segmentCount = Math.max(0, scene.segmentCount | 0);
+    const records = options.strokeRecords ?? sceneStrokeRecords(scene);
+    const segmentCount = Math.max(0, records.count | 0);
     this.segmentCount = segmentCount;
-    const segmentTextureSize = chooseSegmentTextureSize(segmentCount);
-
-    this.segmentTextureA = createSegmentDataTexture(
-      scene.endpoints,
-      segmentCount,
-      segmentTextureSize.width,
-      segmentTextureSize.height
-    );
-    this.segmentTextureB = createSegmentDataTexture(
-      scene.primitiveMeta,
-      segmentCount,
-      segmentTextureSize.width,
-      segmentTextureSize.height
-    );
-    this.segmentStyleTexture = createSegmentDataTexture(
-      scene.styles,
-      segmentCount,
-      segmentTextureSize.width,
-      segmentTextureSize.height
-    );
-    this.styleTextureShared = (this.segmentStyleTexture.image.data as Float32Array).buffer === scene.styles.buffer;
-    this.segmentBoundsTexture = createSegmentDataTexture(
-      scene.primitiveBounds,
-      segmentCount,
-      segmentTextureSize.width,
-      segmentTextureSize.height
-    );
+    // Data textures upload one array each. The scene's complete texture rows
+    // are views of its own arrays; only the remainder has a texture of its own.
+    const textures = options.strokeTextures ?? splitStrokeTextures(records);
+    const head = textures.head.endpoints, tail = textures.tail.endpoints;
+    this.segmentSplit = textures.split;
+    this.segmentTextureA = createSegmentDataTexture(textures.head.endpoints);
+    this.segmentTextureB = createSegmentDataTexture(textures.head.primitiveMeta);
+    this.segmentStyleTexture = createSegmentDataTexture(textures.head.styles);
+    this.segmentBoundsTexture = createSegmentDataTexture(textures.head.primitiveBounds);
+    this.segmentTailTextureA = createSegmentDataTexture(textures.tail.endpoints);
+    this.segmentTailTextureB = createSegmentDataTexture(textures.tail.primitiveMeta);
+    this.segmentTailStyleTexture = createSegmentDataTexture(textures.tail.styles);
+    this.segmentTailBoundsTexture = createSegmentDataTexture(textures.tail.primitiveBounds);
 
     this.grid = segmentCount > 0 && !options.strokeOrigins ? buildSpatialGrid(scene) : null;
     // Ordered LOD supplies an already culled selection. Its runtime owns the
@@ -161,7 +161,15 @@ export class ThreeMaterialStrokeLayer {
         segmentTextureB: this.segmentTextureB,
         segmentStyleTexture: this.segmentStyleTexture,
         segmentBoundsTexture: this.segmentBoundsTexture,
-        segmentTextureWidth: segmentTextureSize.width,
+        segmentTextureWidth: head.width,
+        segmentTail: {
+          textureA: this.segmentTailTextureA,
+          textureB: this.segmentTailTextureB,
+          styleTexture: this.segmentTailStyleTexture,
+          boundsTexture: this.segmentTailBoundsTexture,
+          width: tail.width,
+          split: textures.split
+        },
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform,
@@ -184,14 +192,23 @@ export class ThreeMaterialStrokeLayer {
         depthWrite: false,
         side: THREE.DoubleSide,
         toneMapped: false,
+        defines: { HEPR_SPLIT_STROKE_STORE: "" },
         uniforms: {
           uSegmentTexA: { value: this.segmentTextureA },
           uSegmentTexB: { value: this.segmentTextureB },
           uSegmentStyleTex: { value: this.segmentStyleTexture },
           uSegmentBoundsTex: { value: this.segmentBoundsTexture },
           uSegmentTexSize: {
-            value: new Int32Array([segmentTextureSize.width, segmentTextureSize.height])
+            value: new Int32Array([head.width, head.height])
           },
+          uSegmentTailTexA: { value: this.segmentTailTextureA },
+          uSegmentTailTexB: { value: this.segmentTailTextureB },
+          uSegmentTailStyleTex: { value: this.segmentTailStyleTexture },
+          uSegmentTailBoundsTex: { value: this.segmentTailBoundsTexture },
+          uSegmentTailTexSize: {
+            value: new Int32Array([tail.width, tail.height])
+          },
+          uSegmentSplit: { value: textures.split },
           uViewport: { value: this.viewportUniform },
           uCameraCenter: { value: this.cameraCenterUniform },
           uZoom: this.zoomUniform,
@@ -241,15 +258,17 @@ export class ThreeMaterialStrokeLayer {
   }
 
   setPrimitiveColorUpdates(updates: readonly PrimitiveColorUpdate[], scene: VectorScene): void {
-    if (this.styleTextureShared && updates.some(update => update.ref.kind === "stroke")) {
+    if (this.styleDataShared && updates.some(update => update.ref.kind === "stroke")) {
       // Keep canonical and simplified geometry immutable across renderers.
-      // Recoloring forces exact LOD, but edits still belong to this texture only.
-      this.segmentStyleTexture.image.data = (this.segmentStyleTexture.image.data as Float32Array).slice();
-      this.styleTextureShared = false;
+      // Recoloring forces exact LOD, but edits still belong to these textures only.
+      for (const texture of [this.segmentStyleTexture, this.segmentTailStyleTexture]) {
+        texture.image.data = (texture.image.data as Float32Array).slice();
+      }
+      this.styleDataShared = false;
     }
-    patchPrimitiveColorTexture(this.segmentStyleTexture, scene.styles, updates, "stroke", [
-      { source: 1, target: 1 }, { source: 2, target: 2 }, { source: 3, target: 3 }
-    ]);
+    const colorChannels = [{ source: 1, target: 1 }, { source: 2, target: 2 }, { source: 3, target: 3 }];
+    patchPrimitiveColorTexture(this.segmentStyleTexture, scene.styles, updates, "stroke", colorChannels, 0, this.segmentSplit);
+    patchPrimitiveColorTexture(this.segmentTailStyleTexture, scene.styles, updates, "stroke", colorChannels, this.segmentSplit);
     // The shared redundancy planner may cross same-color fill/text paints.
     // Recoloring any solid primitive therefore restores all stroke candidates,
     // until clearing the last override makes the original proof valid again.
@@ -333,6 +352,10 @@ export class ThreeMaterialStrokeLayer {
     this.segmentTextureB.dispose();
     this.segmentStyleTexture.dispose();
     this.segmentBoundsTexture.dispose();
+    this.segmentTailTextureA.dispose();
+    this.segmentTailTextureB.dispose();
+    this.segmentTailStyleTexture.dispose();
+    this.segmentTailBoundsTexture.dispose();
   }
 
   private updateVisibleSegments(
@@ -478,29 +501,8 @@ export class ThreeMaterialStrokeLayer {
   }
 }
 
-function chooseSegmentTextureSize(segmentCount: number): { width: number; height: number } {
-  if (segmentCount <= 0) {
-    return { width: 1, height: 1 };
-  }
-
-  const width = Math.max(1, Math.ceil(Math.sqrt(segmentCount)));
-  const height = Math.max(1, Math.ceil(segmentCount / width));
-  return { width, height };
-}
-
-function createSegmentDataTexture(
-  source: Float32Array,
-  count: number,
-  width: number,
-  height: number
-): THREE.DataTexture {
-  const shared = sharedVectorStrokeLodTextureData(source);
-  const data = shared?.length === width * height * 4 ? shared : new Float32Array(width * height * 4);
-  if (data !== shared) {
-    const sourceLength = Math.min(source.length, count * 4);
-    if (sourceLength > 0) data.set(source.subarray(0, sourceLength), 0);
-  }
-
+/** Uses the data as is: it may be a view of scene or LOD storage, never written here. */
+function createSegmentDataTexture({ data, width, height }: StrokeTextureData): THREE.DataTexture {
   const texture = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
   texture.magFilter = THREE.NearestFilter;
   texture.minFilter = THREE.NearestFilter;

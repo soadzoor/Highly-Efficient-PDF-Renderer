@@ -124,8 +124,17 @@ upload, while the standalone viewer still showed "65.72% Building Vector LOD".
 - Ordered batches and their culling, scheduling and redundancy helpers address
   storage IDs. Native WebGL/WebGPU upload the canonical strokes and LOD-only
   records into the shared textures directly from their arrays; only a texture
-  row spanning both is staged. Three still combines them once for its data
-  textures. Levels that select the same stored stroke submit it once.
+  row spanning both is staged. Levels that select the same stored stroke submit
+  it once.
+- Three data textures upload one array each, so Three stroke materials read
+  two texture sets, chosen by stroke ID. The canonical strokes' complete
+  texture rows are views of the scene's own arrays. The second set holds their
+  partial last row (fewer strokes than one row; 369 strokes, about 6 KB per
+  field, on Level 1) and the LOD-only records, which it now stores. This also applies with Vector LOD off,
+  where Three previously copied the canonical strokes into padded texture
+  arrays. The WebGL material opts in with the `HEPR_SPLIT_STROKE_STORE` define,
+  so the native renderer and the exported core stroke shader are unchanged.
+  Recoloring a stroke copies both style textures on first use.
 - Merge and density groups use exact numeric tuple keys instead of a template
   string per primitive, with the same equality (NaN equals NaN, -0 equals 0).
   The paint-group table is released after simplification, and canonical scenes
@@ -154,10 +163,23 @@ process memory rather than an iOS tab estimate.
 
 The GPU stroke store shrinks with the stored records: Level 1 from 5,664,343
 to 3,694,247 records (345.73 to 225.48 MiB of RGBA32F textures), Lower Level
-from 3,772,180 to 2,746,890 (230.24 to 167.66 MiB). The Three path keeps one
-combined CPU store. Measured separately, as typed-array memory after garbage
-collection, Level 1's LOD hierarchy plus that store falls from 709.7 MiB to
-520.5 MiB.
+from 3,772,180 to 2,746,890 (230.24 to 167.66 MiB).
+
+For the Three path, the Three stroke layer itself was constructed in Node for
+both implementations, measuring typed arrays after garbage collection. The
+figures are what the layer adds to the loaded scene; with LOD on, they include
+the prepared hierarchy.
+
+| Three stroke layer | Previous | New | Reduction |
+| --- | ---: | ---: | ---: |
+| Level 1, Vector LOD on | 646.7 MiB | 261.6 MiB | 59.5% |
+| Level 1, Vector LOD off | 528.0 MiB | 371.4 MiB | 29.7% |
+| Lower Level, Vector LOD on | 433.6 MiB | 167.7 MiB | 61.3% |
+| Lower Level, Vector LOD off | 294.5 MiB | 157.3 MiB | 46.6% |
+
+With LOD off, the Level 1 difference is 156.6 MiB, the size of the canonical
+strokes' four fields. GPU texture memory is unchanged by the split: the same
+texels are divided between two texture sets.
 
 ### Rendering difference
 
@@ -182,9 +204,13 @@ different order; apart from framebuffer rounding, that does not change blending.
   byte-identical ordered draw lists; the others differ only as described above.
 - `npm test` (typecheck and 143 files), `test:unit` (170 files) and
   `test:integration` (45 files) passed. New coverage exercises split texture
-  uploads (segment boundaries, empty and short sources, batching limits) and
-  references to unchanged strokes.
-- Device verification remains manual, as described above.
+  uploads (segment boundaries, empty and short sources, batching limits),
+  references to unchanged strokes, Three texture sharing, recoloring across
+  both texture sets, and the WGSL that Three generates for the split fetch.
+- Browser/device verification remains manual. Nothing here compiled the GLSL
+  or WGSL on a GPU: check `three-example.html` with both the WebGL and WebGPU
+  backends, LOD on and off, including recoloring a stroke. Then run the device
+  checks described above.
 
 ### Changed files
 
@@ -196,10 +222,14 @@ different order; apart from framebuffer rounding, that does not change blending.
   `src/vectorRunClipElision.ts`, `src/vectorStrokeRedundancy.ts`.
 - Renderers and viewer: `src/webGlFloorplanRenderer.ts`,
   `src/webGpuFloorplanRenderer.ts`, `src/vectorStrokeLod.ts`,
-  `src/threeVectorDrawPlan.ts`, `src/main.ts`.
+  `src/threeVectorDrawPlan.ts`, `src/threeMaterialStrokeLayer.ts`,
+  `src/threeWebGpuStrokeMaterial.ts`, `src/threePrimitiveColors.ts`,
+  `src/main.ts`.
 - Tests and tooling: `scripts/test-vector-lod-storage.mjs`,
   `scripts/test-native-stroke-upload-memory.mjs`,
   `scripts/test-vector-ordered-batches.mjs`,
   `scripts/test-vector-perspective-lod.mjs`, `scripts/test-document-loading.mjs`,
+  `scripts/test-three-webgpu-varying-interpolation.mjs`,
+  `scripts/test-three-ordered-text-lod.mjs`,
   `scripts/benchmark-vector-lod-memory.mjs`.
 - Documentation: `docs/manual.md`, `docs/vector-lod-memory.md`.

@@ -1,5 +1,5 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { StrokeRecords } from "./strokeRecords";
+import { splitStrokeTextures, type SplitStrokeTextures, type StrokeRecords } from "./strokeRecords";
 import {
   explicitStrokePaintOrigins, hasStrokePaintOrigins, setStrokePaintOrigins, strokePaintOrigin, strokePaintOrigins
 } from "./vectorStrokePaintOrder";
@@ -52,20 +52,15 @@ export interface VectorStrokeLodStorageLayout {
   bases: readonly number[];
 }
 
-interface CombinedStrokeLodStorage {
-  scene: VectorScene;
+interface SplitStrokeLodStorage {
   layout: VectorStrokeLodStorageLayout;
+  records: StrokeRecords;
+  textures: SplitStrokeTextures;
 }
 
 const layouts = new WeakMap<readonly StrokeLodStorageLevel[], VectorStrokeLodStorageLayout>();
-const combinedStores = new WeakMap<readonly StrokeLodStorageLevel[], CombinedStrokeLodStorage>();
-const textureData = new WeakMap<Float32Array, Float32Array>();
+const splitStores = new WeakMap<readonly StrokeLodStorageLevel[], SplitStrokeLodStorage>();
 const materializedLevels = new WeakMap<Uint32Array, VectorScene>();
-
-/** A texture-ready immutable view, available only for owned combined stores. */
-export function sharedVectorStrokeLodTextureData(source: Float32Array): Float32Array | undefined {
-  return textureData.get(source);
-}
 
 /**
  * Storage IDs for a hierarchy. Built hierarchies share one record store whose
@@ -137,48 +132,23 @@ export function vectorStrokeLodStorageOrigins(layout: VectorStrokeLodStorageLayo
 }
 
 /**
- * Immutable stroke storage shared by LOD selection and ordered rendering:
- * canonical strokes followed by LOD-only records, in storage-ID order. Store
- * literals and caller-built levels become views into this store, instead of
- * retaining a second copy of every derived record. Keep the caller's canonical
- * scene and its arrays untouched: picking, exports, and independent viewers
- * own that identity. Temporary colors belong to renderer-owned textures.
+ * Texture data for renderers whose textures each upload one array (Three).
+ * The canonical strokes' complete rows are views of the caller's arrays; the
+ * tail texture holds their partial last row and every LOD-only record, and
+ * becomes the only storage of those records. Nothing is stored twice, and the
+ * caller's canonical scene and its arrays stay untouched: picking, exports,
+ * and independent viewers own that identity. Temporary colors belong to
+ * renderer-owned copies.
  */
-export function getCombinedVectorStrokeLodStorage(
+export function getSplitVectorStrokeLodStorage(
   canonicalScene: VectorScene, levels: readonly StrokeLodStorageLevel[]
-): CombinedStrokeLodStorage {
-  const cached = combinedStores.get(levels);
+): SplitStrokeLodStorage {
+  const cached = splitStores.get(levels);
   if (cached) return cached;
   const layout = vectorStrokeLodStorageLayout(canonicalScene, levels);
-  if (layout.parts.length === 0) {
-    const storage = { scene: canonicalScene, layout };
-    combinedStores.set(levels, storage);
-    return storage;
-  }
-  const count = layout.count;
-  const canonicalCount = Math.max(0, canonicalScene.segmentCount | 0);
-  const scene = { ...canonicalScene, segmentCount: count };
-  // Match Three's square texture layout. One partial row of zeroes lets it
-  // upload this immutable store directly instead of retaining four padded copies.
-  const width = Math.max(1, Math.ceil(Math.sqrt(count)));
-  const paddedCount = width * Math.max(1, Math.ceil(count / width));
-  // Rebase one field at a time so each old LOD-only allocation can be
-  // collected before allocating the next combined field. Preserve every bit.
-  for (const key of STROKE_FIELDS) {
-    const data = new Float32Array(paddedCount * 4);
-    const values = data.subarray(0, count * 4);
-    textureData.set(values, data);
-    const canonical = canonicalScene[key];
-    values.set(canonical.subarray(0, Math.min(canonical.length, canonicalCount * 4)));
-    layout.parts.forEach((part, index) => {
-      const end = layout.parts[index + 1]?.base ?? count;
-      values.set(part.scene[key].subarray(0, (end - part.base) * 4), part.base * 4);
-      part.scene[key] = values.subarray(part.base * 4, end * 4);
-    });
-    scene[key] = values;
-  }
-  const storage = { scene, layout };
-  combinedStores.set(levels, storage);
+  const records = vectorStrokeLodStorageRecords(layout);
+  const storage = { layout, records, textures: splitStrokeTextures(records) };
+  splitStores.set(levels, storage);
   return storage;
 }
 

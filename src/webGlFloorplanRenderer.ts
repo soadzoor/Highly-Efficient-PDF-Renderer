@@ -101,6 +101,16 @@ uniform sampler2D uSegmentTexB;
 uniform sampler2D uSegmentStyleTex;
 uniform sampler2D uSegmentBoundsTex;
 uniform ivec2 uSegmentTexSize;
+#ifdef HEPR_SPLIT_STROKE_STORE
+// IDs from uSegmentSplit read a second texture set, so the first can share
+// the scene's own arrays (see splitStrokeTextures).
+uniform sampler2D uSegmentTailTexA;
+uniform sampler2D uSegmentTailTexB;
+uniform sampler2D uSegmentTailStyleTex;
+uniform sampler2D uSegmentTailBoundsTex;
+uniform ivec2 uSegmentTailTexSize;
+uniform int uSegmentSplit;
+#endif
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -131,10 +141,30 @@ ivec2 segmentCoord(int index) {
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
   int index = int(aSegmentIndex + 0.5);
+#ifdef HEPR_SPLIT_STROKE_STORE
+  vec4 primitiveA;
+  vec4 primitiveB;
+  vec4 style;
+  vec4 primitiveBounds;
+  if (index >= uSegmentSplit) {
+    int tailIndex = index - uSegmentSplit;
+    ivec2 tailCoord = ivec2(tailIndex % uSegmentTailTexSize.x, tailIndex / uSegmentTailTexSize.x);
+    primitiveA = texelFetch(uSegmentTailTexA, tailCoord, 0);
+    primitiveB = texelFetch(uSegmentTailTexB, tailCoord, 0);
+    style = texelFetch(uSegmentTailStyleTex, tailCoord, 0);
+    primitiveBounds = texelFetch(uSegmentTailBoundsTex, tailCoord, 0);
+  } else {
+    primitiveA = texelFetch(uSegmentTexA, segmentCoord(index), 0);
+    primitiveB = texelFetch(uSegmentTexB, segmentCoord(index), 0);
+    style = texelFetch(uSegmentStyleTex, segmentCoord(index), 0);
+    primitiveBounds = texelFetch(uSegmentBoundsTex, segmentCoord(index), 0);
+  }
+#else
   vec4 primitiveA = texelFetch(uSegmentTexA, segmentCoord(index), 0);
   vec4 primitiveB = texelFetch(uSegmentTexB, segmentCoord(index), 0);
   vec4 style = texelFetch(uSegmentStyleTex, segmentCoord(index), 0);
   vec4 primitiveBounds = texelFetch(uSegmentBoundsTex, segmentCoord(index), 0);
+#endif
 
   vec2 p0 = primitiveA.xy;
   vec2 p1 = primitiveA.zw;

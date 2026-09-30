@@ -128,9 +128,12 @@ a simplified record that is bit-identical to its source stroke refers to that
 stroke instead of copying it, and only records that differ are stored, once.
 Levels share culling bounds per stored stroke. Native backends upload the
 canonical strokes and these LOD-only records into shared exact/LOD GPU textures
-directly from their arrays, without a combined CPU copy. Three combines them
-once for its data textures, with a private style copy created only when an
-individual stroke is recolored. Selection scratch grows with visible work.
+directly from their arrays, without a combined CPU copy. Three data textures
+upload one array each, so Three stroke materials read two texture sets: the
+canonical strokes' complete rows, viewed in the scene's own arrays, and a
+second set holding their partial last row and the LOD-only records. Recoloring
+an individual stroke copies the style data of both sets on first use.
+Selection scratch grows with visible work.
 These storage changes preserve the geometry, paint order, clipping, and detail
 transitions of the existing LOD hierarchy; they do not skip levels to meet an
 allocation budget.

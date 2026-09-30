@@ -6,12 +6,12 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { getCombinedVectorStrokeLodStorage, sharedVectorStrokeLodTextureData, vectorStrokeLodStorageOrigins } =
-    await import("../src/vectorStrokeLodStorage.ts");
+  const { getSplitVectorStrokeLodStorage, vectorStrokeLodStorageOrigins } = await import("../src/vectorStrokeLodStorage.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { VectorStrokeLodRuntime, storePrebuiltVectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
   const { strokePaintOrigins, setStrokePaintOrigins } = await import("../src/vectorStrokePaintOrder.ts");
   const { ThreeVectorLodStrokeLayer } = await import("../src/vectorStrokeLod.ts");
+  const { ThreeMaterialStrokeLayer } = await import("../src/threeMaterialStrokeLayer.ts");
   const fields = ["endpoints", "primitiveMeta", "primitiveBounds", "styles"];
   const scene = { ...createEmptyVectorScene(), segmentCount: 320, maxHalfWidth: .5,
     bounds: { minX: 0, minY: 0, maxX: 100, maxY: 100 },
@@ -43,11 +43,19 @@ try {
   const snapshots = runtime.levels.map(level => fields.map(field => level.scene[field].slice()));
   const origins = runtime.levels.map(level => strokePaintOrigins(level.scene));
   assert.equal(runtime.levels[0].scene, scene, "the canonical level is the caller's scene");
-  const combined = getCombinedVectorStrokeLodStorage(scene, runtime.levels);
-  assert.equal(getCombinedVectorStrokeLodStorage(scene, runtime.levels), combined, "one immutable store per hierarchy");
-  const count = combined.layout.count;
+  const storage = getSplitVectorStrokeLodStorage(scene, runtime.levels);
+  assert.equal(getSplitVectorStrokeLodStorage(scene, runtime.levels), storage, "one immutable store per hierarchy");
+  const count = storage.layout.count;
   assert.equal(count, scene.segmentCount + literals.segmentCount, "canonical strokes, then only LOD-only records");
-  const storageOrigins = vectorStrokeLodStorageOrigins(combined.layout);
+  const storageOrigins = vectorStrokeLodStorageOrigins(storage.layout);
+  // Three uploads one array per texture. The canonical strokes' complete rows
+  // stay in the scene's arrays; the tail holds their last row and LOD records.
+  const { split, head, tail } = storage.textures;
+  const rowWidth = Math.ceil(Math.sqrt(scene.segmentCount));
+  assert.equal(split, rowWidth * Math.floor(scene.segmentCount / rowWidth));
+  assert(split < scene.segmentCount, "the fixture has a partial canonical row in the tail");
+  const texel = (field, id) => id < split ? head[field].data.subarray(id * 4, id * 4 + 4)
+    : tail[field].data.subarray((id - split) * 4, (id - split) * 4 + 4);
   const literalUses = new Uint32Array(literals.segmentCount);
   let references = 0;
   runtime.levels.forEach((level, index) => {
@@ -58,9 +66,9 @@ try {
       if (level.records && stored < scene.segmentCount) references++;
       if (stored >= scene.segmentCount) literalUses[stored - scene.segmentCount]++;
       fields.forEach((field, component) => assert.deepEqual(
-        new Uint32Array(combined.scene[field].slice(stored * 4, stored * 4 + 4).buffer),
+        new Uint32Array(texel(field, stored).slice().buffer),
         new Uint32Array(snapshots[index][component].slice(id * 4, id * 4 + 4).buffer),
-        "each level record resolves to its exact bits"));
+        "each level record resolves to its exact bits in the uploaded textures"));
     }
     if (index === 0) fields.forEach((field, component) => assert.equal(level.scene[field], canonical[component],
       "canonical arrays retain their identity"));
@@ -69,13 +77,18 @@ try {
   assert(references >= runtime.levels.length - 1);
   assert(literalUses.every(uses => uses === 1), "each LOD-only record is stored once and used by one level");
   fields.forEach(field => {
-    assert.equal(literals[field].buffer, combined.scene[field].buffer, "LOD-only records become views, not retained copies");
+    assert.equal(head[field].data.buffer, scene[field].buffer, "canonical texture rows are views of the caller's arrays");
+    assert.equal(head[field].data.length, head[field].width * head[field].height * 4);
+    assert.equal(head[field].width * head[field].height, split);
+    assert.equal(literals[field].buffer, tail[field].data.buffer, "LOD-only records become views of the tail, not retained copies");
     assert(!literalBuffers.has(literals[field].buffer));
+    assert.equal(tail[field].data.length, tail[field].width * tail[field].height * 4);
+    assert(tail[field].width * tail[field].height >= count - split);
   });
-  const buffers = new Set([scene, combined.scene, literals].flatMap(value => fields.map(field => value[field].buffer)));
+  const buffers = new Set([scene, literals].flatMap(value => fields.map(field => value[field].buffer)));
   assert.equal([...buffers].reduce((sum, buffer) => sum + buffer.byteLength, 0),
-    (scene.segmentCount + Math.ceil(Math.sqrt(count)) * Math.ceil(count / Math.ceil(Math.sqrt(count)))) * 64,
-    "LOD storage has no duplicate geometry allocation, only a partial texture row");
+    (scene.segmentCount + tail.endpoints.width * tail.endpoints.height) * 64,
+    "texture-ready storage copies only the canonical partial row, beside the LOD-only records");
 
   runtime.levels.forEach((level, index) => {
     level.visibleSegmentCount = index === runtime.levels.length - 1 ? level.segmentCount : 0;
@@ -139,39 +152,76 @@ try {
   assert.deepEqual(scene, original);
 
   const options = { materialBackend: "webgl", strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] };
+  const textureNames = { endpoints: "TextureA", primitiveMeta: "TextureB", styles: "StyleTexture", primitiveBounds: "BoundsTexture" };
+  const checkSplitMaterial = (material, expected) => {
+    for (const field of fields) {
+      assert.equal(material[`segment${textureNames[field]}`].image.data, expected.head[field].data,
+        "head textures upload the scene's own arrays");
+      assert.equal(material[`segmentTail${textureNames[field]}`].image.data, expected.tail[field].data,
+        "tail textures upload the shared tail data");
+    }
+    const shader = material.mesh.material;
+    assert("HEPR_SPLIT_STROKE_STORE" in shader.defines, "the WebGL material opts into the split fetch");
+    assert.match(shader.vertexShader, /#ifdef HEPR_SPLIT_STROKE_STORE[\s\S]*index >= uSegmentSplit/);
+    assert.equal(shader.uniforms.uSegmentSplit.value, expected.split);
+    assert.deepEqual([...shader.uniforms.uSegmentTexSize.value], [expected.head.endpoints.width, expected.head.endpoints.height]);
+    assert.deepEqual([...shader.uniforms.uSegmentTailTexSize.value], [expected.tail.endpoints.width, expected.tail.endpoints.height]);
+    for (const field of fields) {
+      assert.equal(shader.uniforms[`uSegmentTail${textureNames[field].replace("Texture", "Tex")}`].value,
+        material[`segmentTail${textureNames[field]}`], "the shader binds each tail texture");
+    }
+  };
   storePrebuiltVectorStrokeLodRuntime(scene, runtime);
   const layer = new ThreeVectorLodStrokeLayer(scene, options);
   try {
     assert.equal(layer.runtime, runtime);
-    const sourceColors = combined.scene.styles.slice();
     const material = layer.layers[0];
-    assert.equal(material.segmentTextureA.image.data.buffer, combined.scene.endpoints.buffer);
-    assert.equal(material.segmentTextureB.image.data.buffer, combined.scene.primitiveMeta.buffer);
-    assert.equal(material.segmentBoundsTexture.image.data.buffer, combined.scene.primitiveBounds.buffer);
-    assert.equal(material.segmentStyleTexture.image.data.buffer, combined.scene.styles.buffer,
-      "all immutable texture data shares the LOD store before recoloring");
+    checkSplitMaterial(material, storage.textures);
     assert.equal(material.segmentMarks.length + material.segmentMinX.length + material.segmentMinY.length +
       material.segmentMaxX.length + material.segmentMaxY.length + material.allSegmentIds.length, 0,
       "externally culled LOD does not duplicate unused spatial scratch");
     assert.equal(layer.combinedIds.length, 0, "Three LOD reserves selection IDs on demand");
-    const sharedStyle = sharedVectorStrokeLodTextureData(combined.scene.styles);
-    assert(sharedStyle.length >= combined.scene.styles.length);
-    assert(sharedStyle.subarray(combined.scene.styles.length).every(value => value === 0));
-    layer.setPrimitiveColorUpdates([{ ref: { kind: "stroke", index: 0 }, color: [1, 0, 0] }]);
-    assert.notEqual(material.segmentStyleTexture.image.data.buffer, combined.scene.styles.buffer,
-      "recoloring creates a private style texture on first write");
-    assert.deepEqual(combined.scene.styles, sourceColors, "temporary colors do not alter shared storage");
-    assert.deepEqual(scene, original, "temporary colors do not alter the canonical scene");
-    layer.setPrimitiveColorUpdates([{ ref: { kind: "stroke", index: 0 }, color: null }]);
-    assert.deepEqual(layer.layers[0].segmentStyleTexture.image.data.subarray(0, sourceColors.length), sourceColors,
+    // One recolored stroke in each texture set: canonical row 0, and the first
+    // canonical stroke of the partial row that lives in the tail.
+    const headColors = head.styles.data.slice(), tailColors = tail.styles.data.slice();
+    const recolored = [0, split];
+    layer.setPrimitiveColorUpdates(recolored.map(index => ({ ref: { kind: "stroke", index }, color: [1, 0, 0] })));
+    assert.notEqual(material.segmentStyleTexture.image.data.buffer, scene.styles.buffer,
+      "recoloring copies the head style data on first write");
+    assert.notEqual(material.segmentTailStyleTexture.image.data.buffer, tail.styles.data.buffer,
+      "and the shared tail style data");
+    assert.deepEqual([...material.segmentStyleTexture.image.data.subarray(1, 4)], [1, 0, 0]);
+    assert.deepEqual([...material.segmentTailStyleTexture.image.data.subarray(1, 4)], [1, 0, 0],
+      "a canonical stroke in the partial row is patched in the tail");
+    assert.deepEqual(head.styles.data, headColors, "temporary colors do not alter the canonical scene");
+    assert.deepEqual(tail.styles.data, tailColors, "temporary colors do not alter shared LOD storage");
+    assert.deepEqual(scene, original);
+    layer.setPrimitiveColorUpdates(recolored.map(index => ({ ref: { kind: "stroke", index }, color: null })));
+    assert.deepEqual(material.segmentStyleTexture.image.data, headColors,
       "clearing a temporary color restores its exact original value");
+    assert.deepEqual(material.segmentTailStyleTexture.image.data, tailColors);
   } finally { layer.dispose(); }
   const reopened = new ThreeVectorLodStrokeLayer(scene, options);
   try {
     assert.equal(reopened.runtime, runtime);
-    assert.equal(getCombinedVectorStrokeLodStorage(scene, reopened.runtime.levels), combined,
-      "backend reuse does not retain another combined geometry copy");
+    assert.equal(getSplitVectorStrokeLodStorage(scene, reopened.runtime.levels), storage,
+      "backend reuse does not retain another texture copy");
   } finally { reopened.dispose(); }
+
+  // Without LOD, Three also uploads the scene's own arrays, copying only its partial row.
+  const exact = new ThreeMaterialStrokeLayer(scene, options);
+  try {
+    const exactTextures = getSplitVectorStrokeLodStorage(scene, [{ scene, segmentCount: scene.segmentCount }]).textures;
+    for (const field of fields) {
+      assert.equal(exact[`segment${textureNames[field]}`].image.data.buffer, scene[field].buffer);
+      assert.equal(exact[`segmentTail${textureNames[field]}`].image.data.length,
+        exactTextures.tail[field].width * exactTextures.tail[field].height * 4);
+      assert.deepEqual(exact[`segmentTail${textureNames[field]}`].image.data.subarray(0, (scene.segmentCount - split) * 4),
+        scene[field].subarray(split * 4));
+    }
+    assert.equal(exactTextures.tail.endpoints.width * exactTextures.tail.endpoints.height, 16,
+      "only the 14-stroke partial row is copied, padded to a square");
+  } finally { exact.dispose(); }
 
   // Typed copies preserve signed zero and NaN payload bits, not just numeric equality.
   const edge = { ...createEmptyVectorScene(), segmentCount: 1 };
@@ -179,13 +229,12 @@ try {
   const derived = { ...edge };
   setStrokePaintOrigins(derived, Uint32Array.of(0));
   const edgeLevels = [{ scene: edge, segmentCount: 1 }, { scene: derived, segmentCount: 1 }];
-  const edgeStore = getCombinedVectorStrokeLodStorage(edge, edgeLevels);
+  const edgeTextures = getSplitVectorStrokeLodStorage(edge, edgeLevels).textures;
+  assert.equal(edgeTextures.split, 1);
   for (const field of fields) {
-    assert.deepEqual(new Uint32Array(edgeStore.scene[field].buffer),
-      Uint32Array.of(0x80000000, 0x7fc00001, 0x3f800000, 0, 0x80000000, 0x7fc00001, 0x3f800000, 0));
+    assert.equal(edgeTextures.head[field].data.buffer, edge[field].buffer);
+    assert.deepEqual(new Uint32Array(edgeTextures.tail[field].data.buffer), Uint32Array.of(0x80000000, 0x7fc00001, 0x3f800000, 0));
   }
-  assert.equal(getCombinedVectorStrokeLodStorage(scene, [{ scene, segmentCount: scene.segmentCount }]).scene, scene,
-    "a hierarchy with only exact geometry needs no combined copy");
 
   // Preserve the original default-run behavior for holes, overlapping runs,
   // and a simplified level whose paint origins are in arbitrary order.

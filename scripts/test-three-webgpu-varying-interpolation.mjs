@@ -49,8 +49,15 @@ try {
     segmentTextureWidth: 4, strokeCurveEnabled: true
   };
 
+  // Canonical rows and the remaining records live in two texture sets.
+  const splitStrokeTextures = { ...strokeTextures, segmentTail: {
+    textureA: dataTexture(), textureB: dataTexture(), styleTexture: dataTexture(), boundsTexture: dataTexture(),
+    width: 3, split: 12
+  } };
   const cases = [
     ["stroke", createThreeWebGpuStrokeMaterial({ ...common, ...strokeTextures }),
+      quadGeometry("aSegmentIndex"), { flat: 4, interpolated: 1 }],
+    ["split stroke", createThreeWebGpuStrokeMaterial({ ...common, ...splitStrokeTextures }),
       quadGeometry("aSegmentIndex"), { flat: 4, interpolated: 1 }],
     ["fill", createThreeWebGpuFillMaterial({ ...common, ...fillTextures }),
       quadGeometry("aFillPathIndex"), { flat: 5, interpolated: 1 }],
@@ -83,6 +90,17 @@ try {
       assert.match(vertex, /heprFillCellInfo/, `${name}: vertex loads per-path cell headers`);
       assert.match(shaders.fragmentShader, /heprCellWinding\(cells, metaA\.zw, box, footprint/,
         `${name}: an indexed path reads only the cells under the pixel`);
+    }
+    if (name === "split stroke") {
+      assert.match(vertex, /fn heprSplitSegmentTexel\s*\(/, "the split fetch helper is emitted");
+      const calls = vertex.match(/heprSplitSegmentTexel\(\s*\w+,\s*\w+,/g) ?? [];
+      assert.equal(calls.length, 4, "every stroke field reads through the split fetch");
+      const textures = new Set(calls.flatMap(call => call.match(/\(\s*(\w+),\s*(\w+),/).slice(1)));
+      assert.equal(textures.size, 8, "each call receives its own head and tail texture");
+      assert.doesNotMatch(vertex, /heprSegmentCoord/, "no single-texture fetch remains");
+    }
+    if (name === "stroke") {
+      assert.doesNotMatch(vertex, /heprSplitSegmentTexel/, "without a tail set, the material keeps its single fetch");
     }
     if (name === "text") {
       assert.doesNotMatch(shaders.fragmentShader, /i < 2048/, "outlined glyphs have no fixed 2048-edge ceiling");
