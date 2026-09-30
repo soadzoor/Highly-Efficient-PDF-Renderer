@@ -1,13 +1,17 @@
 import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { VectorStrokeLodRuntime } from "./vectorStrokeLodCore";
-import { strokePaintOrigins } from "./vectorStrokePaintOrder";
+import { explicitStrokePaintOrigins } from "./vectorStrokePaintOrder";
 import { scenePaintSpanSegments } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
 import { VectorStrokeRedundancy } from "./vectorStrokeRedundancy";
 import { VectorRunClipElision } from "./vectorRunClipElision";
-import { getCombinedVectorStrokeLodStorage } from "./vectorStrokeLodStorage";
+import {
+  vectorStrokeLodStorageLayout, vectorStrokeLodStorageOrigins, vectorStrokeLodStorageRecords,
+  type VectorStrokeLodStorageLayout
+} from "./vectorStrokeLodStorage";
+import { sceneStrokeRecords, type StrokeRecords } from "./strokeRecords";
 
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
@@ -48,7 +52,12 @@ export class VectorOrderedBatches {
     return this.floatInstanceData;
   }
   get uintInstances(): Uint32Array { return this.uintInstanceData; }
-  readonly strokeScene: VectorScene;
+  /**
+   * Stroke records addressed by instance IDs: canonical strokes, then Vector
+   * LOD records that differ from them. Renderers upload both in place; no
+   * combined copy is made.
+   */
+  readonly strokeRecords: StrokeRecords;
   readonly cullingPadding: number;
   instanceCount = 0;
   /** Visible strokes omitted temporarily; canonical scene counts never change. */
@@ -60,7 +69,10 @@ export class VectorOrderedBatches {
   private readonly rankToId: Uint32Array;
   private readonly idToRank: Uint32Array;
   private readonly runRankOffsets: Uint32Array;
-  private readonly offsets: number[] = [];
+  /** Storage IDs of every LOD level's records; see vectorStrokeLodStorage. */
+  private readonly layout: VectorStrokeLodStorageLayout | null = null;
+  /** Levels may select the same stored stroke, so their lists can exceed the store. */
+  private readonly selectionLimit: number;
   private selectedRanks = new Uint32Array(0);
   private readonly selectedRankBits: Uint32Array;
   private readonly selectedRankWords: Uint32Array;
@@ -97,24 +109,25 @@ export class VectorOrderedBatches {
       this.runIndices.set(run, index);
       if (run.kind === "stroke") sourceRun.fill(index, run.first, run.first + run.count);
     });
-    const levels = runtime?.levels ?? [{ scene, segmentCount: scene.segmentCount }];
-    let total = 0;
-    for (const level of levels) { this.offsets.push(total); total += level.segmentCount; }
     // One texture store lets adjacent strokes from different tile LOD levels
-    // share the same draw, in the original paint order.
-    this.strokeScene = scene;
+    // share the same draw, in the original paint order. Levels address it by
+    // storage ID, so a stroke they share is stored and selected only once.
+    this.strokeRecords = sceneStrokeRecords(scene);
+    // Needed only while ranking; a canonical scene is its own paint origin.
+    let origins = explicitStrokePaintOrigins(scene) ?? identityIds(scene.segmentCount);
+    this.selectionLimit = scene.segmentCount;
     if (runtime) {
-      this.strokeScene = getCombinedVectorStrokeLodStorage(scene, runtime.levels).scene;
+      this.layout = vectorStrokeLodStorageLayout(scene, runtime.levels);
+      this.strokeRecords = vectorStrokeLodStorageRecords(this.layout);
+      origins = vectorStrokeLodStorageOrigins(this.layout)!;
+      this.selectionLimit = runtime.levels.reduce((sum, level) => sum + level.segmentCount, 0);
     }
+    const total = this.strokeRecords.count;
     this.rankToId = new Uint32Array(total);
     this.idToRank = new Uint32Array(total);
     this.runRankOffsets = new Uint32Array(runs.length + 1);
     this.selectedRankBits = new Uint32Array(Math.ceil(total / 32));
     this.selectedRankWords = new Uint32Array(Math.ceil(this.selectedRankBits.length / 32));
-    const origins = new Uint32Array(total);
-    levels.forEach((level, index) => {
-      origins.set(strokePaintOrigins(level.scene)!, this.offsets[index]);
-    });
     // Stable counting scatter gives the same (paint run, source origin, ID)
     // order as comparison sorting millions of IDs, with bounded typed scratch.
     const originRanks = new Uint32Array(scene.segmentCount);
@@ -145,9 +158,9 @@ export class VectorOrderedBatches {
     let maxSpan = 0;
     for (const span of this.segments ?? []) maxSpan = Math.max(maxSpan, span);
     this.scheduledSpanPrefix = new Uint32Array(maxSpan + 2);
-    this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeScene, strokeSourceRuns, this.segments);
-    this.clipElision = VectorRunClipElision.create(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
-    this.redundancy = new VectorStrokeRedundancy(scene, { scene: this.strokeScene, sourceRuns: strokeSourceRuns });
+    this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeRecords, strokeSourceRuns, this.segments);
+    this.clipElision = VectorRunClipElision.create(scene, { records: this.strokeRecords, sourceRuns: strokeSourceRuns });
+    this.redundancy = new VectorStrokeRedundancy(scene, { records: this.strokeRecords, sourceRuns: strokeSourceRuns });
     this.scheduledRuns = new Uint8Array(runs.length);
   }
 
@@ -192,13 +205,15 @@ export class VectorOrderedBatches {
     let selectedCount = 0;
     let sameIds = this.initialized;
     if (this.runtime) {
+      const layout = this.layout!;
       const capacity = this.runtime.levels.reduce((sum, level) => sum + level.visibleSegmentCount, 0);
-      this.previousSelectedIds = growUint32(this.previousSelectedIds, capacity, this.idToRank.length, true);
+      this.previousSelectedIds = growUint32(this.previousSelectedIds, capacity, this.selectionLimit, true);
       this.selectedRanks = growUint32(this.selectedRanks, capacity, this.idToRank.length);
       this.runtime.levels.forEach((level, index) => {
-        const offset = this.offsets[index];
+        const records = layout.records[index], base = layout.bases[index];
         for (let i = 0; i < level.visibleSegmentCount; i++) {
-          const id = offset + level.visibleSegmentIds[i];
+          const local = level.visibleSegmentIds[i];
+          const id = records ? records[local] : base + local;
           if (this.previousSelectedIds[selectedCount] !== id) sameIds = false;
           this.previousSelectedIds[selectedCount++] = id;
         }
@@ -362,6 +377,12 @@ export class VectorOrderedBatches {
     this.uintInstances[offset + 1] = clipCode;
     this.instanceCount++;
   }
+}
+
+function identityIds(count: number): Uint32Array {
+  const ids = new Uint32Array(count);
+  for (let id = 0; id < count; id++) ids[id] = id;
+  return ids;
 }
 
 /** Selection buffers follow the visible set instead of every dormant LOD level. */

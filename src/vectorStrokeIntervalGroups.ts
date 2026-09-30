@@ -50,8 +50,117 @@ const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
 const ANGLE_BIN_COUNT = 720;
 const ANGLE_STEP = Math.PI / ANGLE_BIN_COUNT;
 const PAGE_SHIFT = 12;
+const INTERVAL_GROUP_KEY_LENGTH = 15;
 const PAGE_SIZE = 1 << PAGE_SHIFT;
 const PAGE_MASK = PAGE_SIZE - 1;
+
+/**
+ * Hash table of fixed-length number tuples with the equality of their string
+ * forms: NaN equals NaN and -0 equals 0. It replaces a template-string key per
+ * primitive, which dominated Vector LOD build garbage, without changing which
+ * primitives share a group. Fill `tuple`, then find(); insert() after a miss.
+ * Entries are numbered in insertion order.
+ */
+export class NumberTupleTable {
+  readonly tuple: Float64Array;
+  size = 0;
+  private readonly arity: number;
+  // Keys in insertion order, the table slot of each, and entry + 1 per slot.
+  private keys: Float64Array;
+  private keySlots: Int32Array;
+  private slots: Int32Array;
+  private pendingSlot = -1;
+  private readonly hashValue = new Float64Array(1);
+  private readonly hashWords = new Uint32Array(this.hashValue.buffer);
+
+  constructor(arity: number, initialEntries = 1024) {
+    this.arity = arity;
+    this.tuple = new Float64Array(arity);
+    this.keys = new Float64Array(initialEntries * arity);
+    this.keySlots = new Int32Array(initialEntries);
+    this.slots = new Int32Array(initialEntries * 2);
+  }
+
+  /** The entry holding `tuple`, or -1. A miss remembers where insert() stores it. */
+  find(): number {
+    const mask = this.slots.length - 1;
+    for (let slot = this.hash(this.tuple, 0) & mask; ; slot = (slot + 1) & mask) {
+      const entry = this.slots[slot] - 1;
+      if (entry < 0) {
+        this.pendingSlot = slot;
+        return -1;
+      }
+      if (this.matches(entry)) return entry;
+    }
+  }
+
+  /** Store the tuple of the last miss and return its entry. */
+  insert(): number {
+    if (this.size === this.keySlots.length) this.growEntries();
+    const entry = this.size++;
+    this.keys.set(this.tuple, entry * this.arity);
+    this.keySlots[entry] = this.pendingSlot;
+    this.slots[this.pendingSlot] = entry + 1;
+    this.pendingSlot = -1;
+    if (this.size * 2 > this.slots.length) this.rehash(this.slots.length * 2);
+    return entry;
+  }
+
+  clear(): void {
+    for (let entry = 0; entry < this.size; entry++) this.slots[this.keySlots[entry]] = 0;
+    this.size = 0;
+    this.pendingSlot = -1;
+  }
+
+  private matches(entry: number): boolean {
+    const offset = entry * this.arity;
+    for (let index = 0; index < this.arity; index++) {
+      const stored = this.keys[offset + index], value = this.tuple[index];
+      if (stored !== value && (stored === stored || value === value)) return false;
+    }
+    return true;
+  }
+
+  private hash(values: Float64Array, offset: number): number {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < this.arity; index++) {
+      const value = values[offset + index];
+      let low = 0, high = 0x7ff80000;
+      // Equal string forms hash alike: every NaN, and both zeroes.
+      if (value === value && value !== 0) {
+        this.hashValue[0] = value;
+        low = this.hashWords[0];
+        high = this.hashWords[1];
+      } else if (value === 0) {
+        high = 0;
+      }
+      hash = Math.imul(hash ^ low, 0x01000193);
+      hash = Math.imul(hash ^ high, 0x01000193);
+    }
+    hash ^= hash >>> 16;
+    return Math.imul(hash, 0x7feb352d) >>> 0;
+  }
+
+  private growEntries(): void {
+    const keys = new Float64Array(this.keys.length * 2);
+    keys.set(this.keys);
+    this.keys = keys;
+    const keySlots = new Int32Array(this.keySlots.length * 2);
+    keySlots.set(this.keySlots);
+    this.keySlots = keySlots;
+  }
+
+  private rehash(capacity: number): void {
+    this.slots = new Int32Array(capacity);
+    const mask = capacity - 1;
+    for (let entry = 0; entry < this.size; entry++) {
+      let slot = this.hash(this.keys, entry * this.arity) & mask;
+      while (this.slots[slot] !== 0) slot = (slot + 1) & mask;
+      this.slots[slot] = entry + 1;
+      this.keySlots[entry] = slot;
+    }
+  }
+}
 
 /** Fixed-size pages avoid growing/copying a document-sized backing array. */
 class PagedRecords {
@@ -95,7 +204,7 @@ class PagedRecords {
  * including the order of the weighted floating-point additions.
  */
 export class CompactStrokeIntervalGroups {
-  private readonly groupIds = new Map<string, number>();
+  private readonly groupIds = new NumberTupleTable(INTERVAL_GROUP_KEY_LENGTH);
   // Group: first member + 1, last member + 1, tile. Member: source ID, next + 1.
   private readonly groups = new PagedRecords(3);
   private readonly members = new PagedRecords(2);
@@ -113,12 +222,13 @@ export class CompactStrokeIntervalGroups {
   get size(): number { return this.groups.length; }
 
   add(primitive: StrokeIntervalPrimitive, sourceIndex: number, tileIndex: number): void {
-    const key = intervalGroupKey(primitive, tileIndex, this.tolerance, this.overview);
-    let groupIndex = this.groupIds.get(key);
+    writeIntervalGroupKey(this.groupIds.tuple, primitive, tileIndex, this.tolerance, this.overview);
+    // Groups and table entries are both numbered in insertion order.
+    let groupIndex = this.groupIds.find();
     const memberIndex = this.members.append(sourceIndex, 0);
-    if (groupIndex === undefined) {
+    if (groupIndex < 0) {
       groupIndex = this.groups.append(memberIndex + 1, memberIndex + 1, tileIndex);
-      this.groupIds.set(key, groupIndex);
+      this.groupIds.insert();
     } else {
       this.members.set(this.groups.get(groupIndex, 1) - 1, 1, memberIndex + 1);
       this.groups.set(groupIndex, 1, memberIndex + 1);
@@ -165,7 +275,14 @@ export class CompactStrokeIntervalGroups {
   }
 }
 
-function intervalGroupKey(primitive: StrokeIntervalPrimitive, tileIndex: number, tolerance: number, overview: boolean): string {
+/**
+ * The fields of the original key `paintGroup|tile|flags|width|r,g,b,a|angle|offset`,
+ * plus `|clip:minX,minY,maxX,maxY` for clipped primitives. Every field is a
+ * number, so tuple equality with string-form semantics groups exactly alike.
+ */
+function writeIntervalGroupKey(
+  key: Float64Array, primitive: StrokeIntervalPrimitive, tileIndex: number, tolerance: number, overview: boolean
+): void {
   const dx = primitive.x1 - primitive.x0;
   const dy = primitive.y1 - primitive.y0;
   let angle = Math.atan2(dy, dx);
@@ -192,20 +309,27 @@ function intervalGroupKey(primitive: StrokeIntervalPrimitive, tileIndex: number,
     ? Math.min(tolerance, primitive.halfWidth * 0.02) : tolerance;
   const offsetKey = Math.round(offset / offsetStep);
   const widthKey = hairline ? -1 : primitive.halfWidth;
-  const colorKey =
-    `${Math.round(primitive.colorR * 255)},${Math.round(primitive.colorG * 255)},` +
-    `${Math.round(primitive.colorB * 255)},${Math.round(primitive.alpha * 255)}`;
   const flags = primitive.flags & (STROKE_STYLE_FLAG_HAIRLINE | STROKE_STYLE_FLAG_ROUND_CAP | STROKE_STYLE_FLAG_CLIPPED);
   // A clipped primitive's bounds are semantic fragment-clip data, not merely
   // culling bounds. Keep distinct rectangles in distinct merge groups so an
   // approximate LOD level cannot replace their intersection with a union.
   const clip = primitive.visibleBounds;
-  const baseKey = `${primitive.paintGroup ?? ""}|${tileIndex}|${flags}|${widthKey}|${colorKey}|${angleBin}|${offsetKey}`;
-  const key = clip
-    ? `${baseKey}|clip:${clip.minX},${clip.minY},${clip.maxX},${clip.maxY}`
-    : baseKey;
-
-  return key;
+  // Paint groups are unsigned, so -1 stands for the absent group's empty field.
+  key[0] = primitive.paintGroup ?? -1;
+  key[1] = tileIndex;
+  key[2] = flags;
+  key[3] = widthKey;
+  key[4] = Math.round(primitive.colorR * 255);
+  key[5] = Math.round(primitive.colorG * 255);
+  key[6] = Math.round(primitive.colorB * 255);
+  key[7] = Math.round(primitive.alpha * 255);
+  key[8] = angleBin;
+  key[9] = offsetKey;
+  key[10] = clip ? 1 : 0;
+  key[11] = clip ? clip.minX : 0;
+  key[12] = clip ? clip.minY : 0;
+  key[13] = clip ? clip.maxX : 0;
+  key[14] = clip ? clip.maxY : 0;
 }
 
 function createStrokeIntervalGroup(

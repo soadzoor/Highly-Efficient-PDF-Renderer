@@ -6,7 +6,7 @@ import "./pdfLayerControls.css";
 import { createLayerVisibilityController } from "./layerVisibility";
 import { createPdfLayerControls } from "./pdfLayerControls";
 import { createPdfAnnotationControls } from "./pdfAnnotationControls";
-import { waitForLoad } from "./loadCancellation";
+import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
@@ -1042,6 +1042,12 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "pdf" });
+    // The scene upload below runs synchronously. Paint its stage first, so a
+    // slow device does not appear stuck at the end of Vector LOD.
+    await yieldAfterPaint(options.signal);
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
     const uploadStart = performance.now();
     const targetRenderer = renderer;
     options.signal.throwIfAborted();
@@ -1139,6 +1145,12 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
     progress.report(LOAD_PROGRESS_UPLOAD, { stage: "upload", sourceType: "hep" });
+    // The scene upload below runs synchronously. Paint its stage first, so a
+    // slow device does not appear stuck at the end of Vector LOD.
+    await yieldAfterPaint(options.signal);
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
     const uploadStart = performance.now();
     const targetRenderer = renderer;
     options.signal.throwIfAborted();

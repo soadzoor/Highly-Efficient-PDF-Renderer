@@ -10,6 +10,7 @@ try {
   const { VectorStrokeLodRuntime, prebuildVectorStrokeLodRuntime, buildVectorStrokeLodScenes } = await import("../src/vectorStrokeLodCore.ts");
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { strokeRecordSegment } = await import("../src/strokeRecords.ts");
 
   const scene = makeScene(60);
   scene.fillPathCount = 1;
@@ -54,7 +55,11 @@ try {
   const paintedOrigins = mixed.batches.filter(b => b.kind === "stroke").map(batch =>
     Array.from({ length: batch.count }, (_, i) => origins[mixed.uintInstances[(batch.first + i) * 2]]));
   assert.deepEqual(paintedOrigins, [[20, 20, 0, 0], [40, 40]]);
-  assert.deepEqual(mixed.strokeScene.endpoints.slice(60 * 4, 63 * 4), levels[1].scene.endpoints);
+  const storedEndpoints = Array.from(asyncLod.levels[1].records, id => {
+    const segment = strokeRecordSegment(mixed.strokeRecords, id);
+    return [...segment.scene.endpoints.subarray((id - segment.first) * 4, (id - segment.first + 1) * 4)];
+  }).flat();
+  assert.deepEqual(Float32Array.from(storedEndpoints), levels[1].scene.endpoints, "LOD records resolve in place");
 
   // Static paint ranks must never be comparison-sorted during selection.
   // Equal counts alone are insufficient: a different ID needs a new upload.
@@ -149,7 +154,8 @@ try {
 
   const outlierLevels = lod.levels.map(level => ({ ...level, visibleSegmentIds: level.visibleSegmentIds.slice(),
     segmentMarks: level.segmentMarks.slice(), segmentMaxX: level.segmentMaxX.slice() }));
-  outlierLevels[1].segmentMaxX[0] = 1_000_000;
+  // Level bounds are shared per stored stroke; widen this level's first record.
+  outlierLevels[1].segmentMaxX[outlierLevels[1].records?.[0] ?? 0] = 1_000_000;
   const outlierRuntime = new VectorStrokeLodRuntime(dense, { tileGrid: lod.tileGrid, levels: outlierLevels, elapsedMs: 0 });
   outlierRuntime.updateForLocalUnitsPerPixel(10);
   assert(outlierRuntime.update(overview, viewport));
@@ -334,13 +340,14 @@ try {
       renderer.uploadSegments = () => {};
       renderer.maxTextureSize = () => 4096;
       renderer.createFloatTexture = () => ({ destroy() {}, createView() { return {}; } });
+      renderer.createStrokeTextures = () => {};
       renderer.refreshStrokeBindGroups = () => {};
       renderer.destroyVectorLodResources = () => {};
       assert(renderer.rebuildVectorLod(scene));
-      assert(renderer.orderedBatches.strokeScene.segmentCount > scene.segmentCount);
+      assert(renderer.orderedBatches.strokeRecords.count > scene.segmentCount);
       renderer.vectorLodMode = "off";
       assert.equal(renderer.rebuildVectorLod(scene), false);
-      assert.equal(renderer.orderedBatches.strokeScene, scene);
+      assert.deepEqual(renderer.orderedBatches.strokeRecords.segments.map(segment => segment.scene), [scene]);
       assert.equal(renderer.vectorLodRuntime, null);
     }
   } finally {

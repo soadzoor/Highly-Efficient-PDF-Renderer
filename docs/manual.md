@@ -123,13 +123,17 @@ The HUD labels these selections `(overview)` and shows the total target.
 
 LOD construction keeps the original tolerances and level-selection rules. It
 streams completed paint groups, stores merge membership as compact source IDs,
-and builds geometry in fixed-size chunks. Ordered renderers share one immutable
-LOD geometry store; native backends upload bounded views directly and share
-exact/LOD GPU textures. Three uses the same store for its data textures, with a
-private style copy created only when an individual stroke is recolored. Selection
-scratch grows with visible work. These storage changes preserve the geometry,
-paint order, clipping, and detail transitions of the existing LOD hierarchy;
-they do not skip levels to meet an allocation budget.
+and builds geometry in fixed-size chunks. All levels share one stroke store:
+a simplified record that is bit-identical to its source stroke refers to that
+stroke instead of copying it, and only records that differ are stored, once.
+Levels share culling bounds per stored stroke. Native backends upload the
+canonical strokes and these LOD-only records into shared exact/LOD GPU textures
+directly from their arrays, without a combined CPU copy. Three combines them
+once for its data textures, with a private style copy created only when an
+individual stroke is recolored. Selection scratch grows with visible work.
+These storage changes preserve the geometry, paint order, clipping, and detail
+transitions of the existing LOD hierarchy; they do not skip levels to meet an
+allocation budget.
 
 For a bounded Node measurement on an existing HEP (without PDF conversion or a
 browser), run `node scripts/benchmark-vector-lod-memory.mjs path/to/file.hep`.

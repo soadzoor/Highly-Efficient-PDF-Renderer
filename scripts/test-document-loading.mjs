@@ -44,7 +44,8 @@ const context = vm.createContext({
   listSceneRasterLayers: () => [], resolveSceneFitBounds: () => ({}),
   prebuildVectorLodForScene: async () => timing, prebuildTextLodForScene: async () => {},
   consumeVectorStrokeLodBuildTiming: () => timing, combineVectorLodTimings: () => timing,
-  yieldToBrowserPaint: async () => {}, sanitizeDownloadName: (label) => label,
+  yieldToBrowserPaint: async () => {}, yieldAfterPaint: async (signal) => signal?.throwIfAborted(),
+  sanitizeDownloadName: (label) => label,
   triggerBrowserDownload: noop, formatFileSize: String,
   buildHep: async (value, options) => {
     exports.push({ scene: value, label: options.sourceLabel });

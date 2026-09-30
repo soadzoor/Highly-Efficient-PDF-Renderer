@@ -1,6 +1,7 @@
 import type { TextLodBuildData } from "./textGreekLod";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { retainedRasterBounds } from "./retainedRasterBounds";
+import { strokeSourceRecords, type StrokeRecordSource } from "./strokeRecords";
 
 const GUARDED_RUN_COUNT = 1024;
 const VISIBILITY_GUARD_PIXELS = 64;
@@ -28,7 +29,8 @@ export class VectorDrawRunCuller {
   private guardRuns: readonly VectorDrawRun[] = [];
   private guardFlags: Uint8Array | null = null;
 
-  constructor(scene: VectorScene, strokes?: { scene: VectorScene; sourceRuns: Uint32Array }) {
+  /** `strokes` replaces the scene's strokes, e.g. with every Vector LOD level; `sourceRuns` maps its IDs to runs. */
+  constructor(scene: VectorScene, strokes?: StrokeRecordSource & { sourceRuns: Uint32Array }) {
     this.scene = scene;
     const runs = scene.drawRuns ?? [];
     this.bounds = new Float64Array(runs.length * 4);
@@ -91,8 +93,10 @@ export class VectorDrawRunCuller {
       runs.forEach((run, index) => {
         if (run.kind === "stroke") this.bounds.set([Infinity, Infinity, -Infinity, -Infinity], index * 4);
       });
-      for (let index = 0; index < strokes.scene.segmentCount; index++) {
-        includeStroke(this.bounds, strokes.sourceRuns[index] * 4, strokes.scene, index);
+      for (const segment of strokeSourceRecords(strokes).segments) {
+        for (let index = 0; index < segment.count; index++) {
+          includeStroke(this.bounds, strokes.sourceRuns[segment.first + index] * 4, segment.scene, index);
+        }
       }
     }
   }

@@ -101,3 +101,105 @@ is claimed until this device check passes.
 - Documentation: `docs/manual.md`, `docs/vector-lod-memory.md`.
 
 Suggested commit: `Reduce vector LOD memory without changing rendered output`.
+
+## Follow-up: shared stroke store (2026-09-30)
+
+The changes above still stored every derived record in full, and ordered
+renderers copied all levels, including the canonical strokes, into one more
+combined store. Most derived records are unchanged source strokes: on Level 1,
+1,970,096 of 3,099,172 (64%), and 1,874,246 of the fine level's 2,344,881
+(80%). On devices the peak came after Vector LOD, during the synchronous scene
+upload, while the standalone viewer still showed "65.72% Building Vector LOD".
+
+### What changed
+
+- One record store per hierarchy. Storage IDs below the canonical stroke count
+  address the canonical scene; larger IDs address LOD-only records. A derived
+  record whose 16 Float32 words and paint origin equal its source stroke refers
+  to that stroke; any other record is stored once. Each level keeps its record
+  order and lists the storage ID of each record.
+- Culling bounds are computed once per stored stroke and shared by all levels
+  through their records. Selection stamps use one byte per record, resetting
+  every 255 selections.
+- Ordered batches and their culling, scheduling and redundancy helpers address
+  storage IDs. Native WebGL/WebGPU upload the canonical strokes and LOD-only
+  records into the shared textures directly from their arrays; only a texture
+  row spanning both is staged. Three still combines them once for its data
+  textures. Levels that select the same stored stroke submit it once.
+- Merge and density groups use exact numeric tuple keys instead of a template
+  string per primitive, with the same equality (NaN equals NaN, -0 equals 0).
+  The paint-group table is released after simplification, and canonical scenes
+  use their own IDs as paint origins instead of an identity table.
+- One generator implements both the synchronous and cooperative builds.
+- The standalone viewer paints its Uploading stage before the synchronous
+  scene upload, so progress no longer appears stuck at the end of Vector LOD.
+
+### Measurements
+
+`node scripts/benchmark-vector-lod-memory.mjs <file.hep> --ordered`, run for
+the previous and the new implementation in separate processes on the same
+machine. The same limitations as above apply: no GPU allocations, and Node
+process memory rather than an iOS tab estimate.
+
+| Measurement | Previous | New | Reduction |
+| --- | ---: | ---: | ---: |
+| Level 1: peak RSS through LOD construction | 888.1 MiB | 632.3 MiB | 28.8% |
+| Level 1: peak RSS through ordered preparation | 1,197.4 MiB | 708.3 MiB | 40.8% |
+| Level 1: reachable typed arrays after overview selection | 754.6 MiB | 403.5 MiB | 46.5% |
+| Level 1: LOD construction time | 7.16 s | 5.87 s | 18.0% |
+| Lower Level: peak RSS through LOD construction | 667.9 MiB | 501.9 MiB | 24.9% |
+| Lower Level: peak RSS through ordered preparation | 918.3 MiB | 561.0 MiB | 38.9% |
+| Lower Level: reachable typed arrays after overview selection | 536.5 MiB | 295.1 MiB | 45.0% |
+| Lower Level: LOD construction time | 5.17 s | 4.07 s | 21.3% |
+
+The GPU stroke store shrinks with the stored records: Level 1 from 5,664,343
+to 3,694,247 records (345.73 to 225.48 MiB of RGBA32F textures), Lower Level
+from 3,772,180 to 2,746,890 (230.24 to 167.66 MiB). The Three path keeps one
+combined CPU store. Measured separately, as typed-array memory after garbage
+collection, Level 1's LOD hierarchy plus that store falls from 709.7 MiB to
+520.5 MiB.
+
+### Rendering difference
+
+Every level is bit-identical, and per-level selections match in all sampled
+views. When neighbouring tiles select different levels, a stroke present in
+both was previously submitted twice, once per level. It is now submitted once.
+Across 11 sampled views of each drawing, the previous draw lists contained
+3,926 such repeats on Level 1 and 4,627 on Lower Level, all opaque round-cap
+lines. A second identical opaque draw changes only its antialiased edge (50%
+coverage becomes 75%), so these strokes now render as they do away from level
+seams. All other draw geometry, clip codes and paint order match. Records with
+the same paint origin share one color and alpha, and may now be submitted in a
+different order; apart from framebuffer rounding, that does not change blending.
+
+### Verification
+
+- `benchmark-vector-lod-memory.mjs --compare` against a snapshot of the previous
+  implementation passed on Level 1: byte-exact geometry, paint origins, bounds,
+  multiplicity, all nine levels, tile membership, sampled views and storage order.
+- A parity comparison of both drawings across 11 zoom/pan views, using a copy of
+  the previous sources, found identical levels and selections. Four views have
+  byte-identical ordered draw lists; the others differ only as described above.
+- `npm test` (typecheck and 143 files), `test:unit` (170 files) and
+  `test:integration` (45 files) passed. New coverage exercises split texture
+  uploads (segment boundaries, empty and short sources, batching limits) and
+  references to unchanged strokes.
+- Device verification remains manual, as described above.
+
+### Changed files
+
+- Core: `src/vectorStrokeLodCore.ts`, `src/vectorStrokeIntervalGroups.ts`,
+  `src/vectorStrokePaintOrder.ts`.
+- Storage, ordering and uploads: `src/vectorStrokeLodStorage.ts`,
+  `src/strokeRecords.ts` (new), `src/vectorOrderedBatches.ts`,
+  `src/vectorDrawRunCulling.ts`, `src/vectorPageDrawScheduler.ts`,
+  `src/vectorRunClipElision.ts`, `src/vectorStrokeRedundancy.ts`.
+- Renderers and viewer: `src/webGlFloorplanRenderer.ts`,
+  `src/webGpuFloorplanRenderer.ts`, `src/vectorStrokeLod.ts`,
+  `src/threeVectorDrawPlan.ts`, `src/main.ts`.
+- Tests and tooling: `scripts/test-vector-lod-storage.mjs`,
+  `scripts/test-native-stroke-upload-memory.mjs`,
+  `scripts/test-vector-ordered-batches.mjs`,
+  `scripts/test-vector-perspective-lod.mjs`, `scripts/test-document-loading.mjs`,
+  `scripts/benchmark-vector-lod-memory.mjs`.
+- Documentation: `docs/manual.md`, `docs/vector-lod-memory.md`.

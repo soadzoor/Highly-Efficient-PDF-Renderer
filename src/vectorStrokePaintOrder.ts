@@ -19,6 +19,30 @@ export function setStrokePaintOrigins(scene: VectorScene, values?: Uint32Array):
   if (values) origins.set(scene, values);
 }
 
+/**
+ * Explicit paint origins only. A scene with draw runs and none is canonical:
+ * each stroke is its own origin, which needs no identity table.
+ */
+export function explicitStrokePaintOrigins(scene: VectorScene): Uint32Array | undefined {
+  return origins.get(scene);
+}
+
+/** Whether strokes carry paint origins, explicit or implied by draw runs. */
+export function hasStrokePaintOrigins(scene: VectorScene): boolean {
+  return origins.has(scene) || scene.drawRuns !== undefined;
+}
+
+/** Paint origin of one stroke, without allocating an identity table. */
+export function strokePaintOrigin(scene: VectorScene, index: number): number | undefined {
+  const explicit = origins.get(scene);
+  return explicit ? explicit[index] : scene.drawRuns ? index : undefined;
+}
+
+/** Paint groups are only needed while simplifying; recompute them on demand. */
+export function releaseStrokePaintGroups(scene: VectorScene): void {
+  groups.delete(scene);
+}
+
 /** Merge only within one paint operation, clip, and consecutive opaque color. */
 export function strokePaintGroups(scene: VectorScene): Uint32Array | undefined {
   if (!scene.drawRuns) return undefined;

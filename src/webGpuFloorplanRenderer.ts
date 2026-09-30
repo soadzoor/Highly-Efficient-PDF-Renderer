@@ -80,6 +80,8 @@ import {
   type VectorLodMode,
   type VectorStrokeLodStats
 } from "./vectorStrokeLodCore";
+import { vectorStrokeLodLevelUploadScene } from "./vectorStrokeLodStorage";
+import { sceneStrokeRecords, strokeTextureRows, type StrokeRecordField, type StrokeRecords } from "./strokeRecords";
 
 type FrameListener = (stats: DrawStats) => void;
 
@@ -2390,8 +2392,8 @@ export class WebGpuFloorplanRenderer {
 
     this.destroyDataResources();
     const vectorLodActive = this.prepareVectorLod(scene);
-    const strokeScene = this.orderedBatches?.strokeScene ?? scene;
-    const segmentDims = chooseTextureDimensions(strokeScene.segmentCount, maxTextureSize);
+    const strokeRecords = this.orderedBatches?.strokeRecords ?? sceneStrokeRecords(scene);
+    const segmentDims = chooseTextureDimensions(strokeRecords.count, maxTextureSize);
     let textCpuPayload: NativeTextUploadArrays;
     try {
       textCpuPayload = prepareNativeTextUploadArrays(
@@ -2433,10 +2435,7 @@ export class WebGpuFloorplanRenderer {
     this.textGlyphSegmentTextureWidth = textSegmentDims.width;
     this.textGlyphSegmentTextureHeight = textSegmentDims.height;
 
-    this.segmentTextureA = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.endpoints);
-    this.segmentTextureB = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.primitiveMeta);
-    this.segmentTextureC = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.styles);
-    this.segmentTextureD = this.createFloatTexture(this.segmentTextureWidth, this.segmentTextureHeight, strokeScene.primitiveBounds);
+    this.createStrokeTextures(this.segmentTextureWidth, this.segmentTextureHeight, strokeRecords);
 
     this.fillPathMetaTextureA = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaA);
     this.fillPathMetaTextureB = this.createFloatTexture(this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight, scene.fillPathMetaB);
@@ -4227,17 +4226,14 @@ export class WebGpuFloorplanRenderer {
   private rebuildVectorLod(scene: VectorScene): boolean {
     this.destroyVectorLodResources();
     const active = this.prepareVectorLod(scene);
-    const strokeScene = this.orderedBatches?.strokeScene ?? scene;
-    const dims = chooseTextureDimensions(strokeScene.segmentCount, this.maxTextureSize());
+    const strokeRecords = this.orderedBatches?.strokeRecords ?? sceneStrokeRecords(scene);
+    const dims = chooseTextureDimensions(strokeRecords.count, this.maxTextureSize());
     for (const texture of [this.segmentTextureA, this.segmentTextureB, this.segmentTextureC, this.segmentTextureD]) {
       texture?.destroy();
     }
     this.segmentTextureWidth = dims.width;
     this.segmentTextureHeight = dims.height;
-    this.segmentTextureA = this.createFloatTexture(dims.width, dims.height, strokeScene.endpoints);
-    this.segmentTextureB = this.createFloatTexture(dims.width, dims.height, strokeScene.primitiveMeta);
-    this.segmentTextureC = this.createFloatTexture(dims.width, dims.height, strokeScene.styles);
-    this.segmentTextureD = this.createFloatTexture(dims.width, dims.height, strokeScene.primitiveBounds);
+    this.createStrokeTextures(dims.width, dims.height, strokeRecords);
     this.refreshStrokeBindGroups();
     this.uploadVectorLodLevels();
     return active;
@@ -4324,11 +4320,14 @@ export class WebGpuFloorplanRenderer {
         continue;
       }
 
-      const dims = chooseTextureDimensions(level.scene.segmentCount, maxTextureSize);
-      const textureA = this.createFloatTexture(dims.width, dims.height, level.scene.endpoints);
-      const textureB = this.createFloatTexture(dims.width, dims.height, level.scene.primitiveMeta);
-      const textureC = this.createFloatTexture(dims.width, dims.height, level.scene.styles);
-      const textureD = this.createFloatTexture(dims.width, dims.height, level.scene.primitiveBounds);
+      // Scenes without draw runs upload each level separately; a stored level
+      // is copied only for this upload.
+      const levelScene = vectorStrokeLodLevelUploadScene(level);
+      const dims = chooseTextureDimensions(levelScene.segmentCount, maxTextureSize);
+      const textureA = this.createFloatTexture(dims.width, dims.height, levelScene.endpoints);
+      const textureB = this.createFloatTexture(dims.width, dims.height, levelScene.primitiveMeta);
+      const textureC = this.createFloatTexture(dims.width, dims.height, levelScene.styles);
+      const textureD = this.createFloatTexture(dims.width, dims.height, levelScene.primitiveBounds);
       this.vectorLodLevelResources.push({
         textureA,
         textureB,
@@ -4879,6 +4878,33 @@ export class WebGpuFloorplanRenderer {
       }
       throw error;
     }
+  }
+
+  /** Canonical strokes and LOD-only records are written in place, never combined on the CPU. */
+  private createStrokeTextures(width: number, height: number, records: StrokeRecords): void {
+    this.segmentTextureA = this.createStrokeFieldTexture(width, height, records, "endpoints");
+    this.segmentTextureB = this.createStrokeFieldTexture(width, height, records, "primitiveMeta");
+    this.segmentTextureC = this.createStrokeFieldTexture(width, height, records, "styles");
+    this.segmentTextureD = this.createStrokeFieldTexture(width, height, records, "primitiveBounds");
+  }
+
+  private createStrokeFieldTexture(width: number, height: number, records: StrokeRecords, field: StrokeRecordField): any {
+    const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
+    if (records.count > width * height) {
+      throw new Error(`Texture source data exceeds texture size (${records.count} > ${width * height} texels).`);
+    }
+    const texture = this.gpuDevice.createTexture({
+      size: { width, height, depthOrArrayLayers: 1 },
+      format: "rgba32float",
+      usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
+    });
+    // writeTexture needs no 256-byte row alignment, and new textures start
+    // zero-filled, so every row is written straight from its source view.
+    for (const rows of strokeTextureRows(records, field, width)) {
+      this.gpuDevice.queue.writeTexture({ texture, origin: [0, rows.y] }, rows.data,
+        { bytesPerRow: rows.width * 16 }, { width: rows.width, height: rows.height, depthOrArrayLayers: 1 });
+    }
+    return texture;
   }
 
   private createFloatTexture(width: number, height: number, source: Float32Array): any {

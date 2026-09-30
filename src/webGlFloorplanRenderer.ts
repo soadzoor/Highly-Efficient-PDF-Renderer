@@ -72,6 +72,8 @@ import {
   type VectorLodMode,
   type VectorStrokeLodStats
 } from "./vectorStrokeLodCore";
+import { vectorStrokeLodLevelUploadScene } from "./vectorStrokeLodStorage";
+import { sceneStrokeRecords, strokeTextureRows, type StrokeRecords } from "./strokeRecords";
 
 const GLSL_OUTPUT_COLOR_HELPERS = `
 vec4 heprThreeEncodeOutputColor(vec4 color) {
@@ -5477,12 +5479,12 @@ export class WebGlFloorplanRenderer {
     };
   }
 
-  private uploadSegments(scene: VectorScene): {
+  private uploadSegments(records: StrokeRecords): {
     textureWidth: number;
     textureHeight: number;
     maxTextureSize: number;
   } {
-    const textureSet = this.uploadStrokeTextureSet(scene, {
+    const textureSet = this.uploadStrokeTextureSet(records, {
       textureA: this.segmentTextureA,
       textureB: this.segmentTextureB,
       textureC: this.segmentTextureC,
@@ -5498,7 +5500,7 @@ export class WebGlFloorplanRenderer {
   }
 
   private uploadStrokeTextureSet(
-    scene: VectorScene,
+    records: StrokeRecords,
     textures: {
       textureA: WebGLTexture;
       textureB: WebGLTexture;
@@ -5512,7 +5514,7 @@ export class WebGlFloorplanRenderer {
   } {
     const gl = this.gl;
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-    const segmentCount = Math.max(0, scene.segmentCount | 0);
+    const segmentCount = Math.max(0, records.count | 0);
     const preferredWidth = Math.ceil(Math.sqrt(segmentCount));
     const textureWidth = clamp(preferredWidth, 1, maxTextureSize);
     const textureHeight = Math.max(1, Math.ceil(segmentCount / textureWidth));
@@ -5521,33 +5523,18 @@ export class WebGlFloorplanRenderer {
       throw new Error("Segment texture exceeds GPU limits for this browser/GPU.");
     }
 
-    for (const [texture, source] of [
-      [textures.textureA, scene.endpoints], [textures.textureB, scene.primitiveMeta],
-      [textures.textureC, scene.styles], [textures.textureD, scene.primitiveBounds]
+    for (const [texture, field] of [
+      [textures.textureA, "endpoints"], [textures.textureB, "primitiveMeta"],
+      [textures.textureC, "styles"], [textures.textureD, "primitiveBounds"]
     ] as const) {
       gl.bindTexture(gl.TEXTURE_2D, texture);
       configureFloatTexture(gl);
-      // Allocate zero-initialized GPU storage, then upload views of the source.
-      // Four texture-sized padded arrays used to double CPU stroke memory here.
+      // Allocate zero-initialized GPU storage, then upload views of the sources.
+      // Texture-sized padded arrays, or a CPU copy combining canonical and LOD
+      // records, would double stroke memory here.
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, textureWidth, textureHeight, 0, gl.RGBA, gl.FLOAT, null);
-      const length = Math.min(source.length, segmentCount * 4);
-      const rowLength = textureWidth * 4;
-      const fullRows = Math.floor(length / rowLength);
-      const batchRows = Math.max(1, Math.floor(4 * 1024 * 1024 / (rowLength * 4)));
-      for (let row = 0; row < fullRows; row += batchRows) {
-        const rows = Math.min(batchRows, fullRows - row);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, row, textureWidth, rows, gl.RGBA, gl.FLOAT,
-          source.subarray(row * rowLength, (row + rows) * rowLength));
-      }
-      const remainder = length - fullRows * rowLength;
-      if (remainder > 0) {
-        let tail = source.subarray(fullRows * rowLength, length);
-        if (remainder % 4 !== 0) {
-          const padded = new Float32Array(Math.ceil(remainder / 4) * 4);
-          padded.set(tail);
-          tail = padded;
-        }
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, fullRows, tail.length / 4, 1, gl.RGBA, gl.FLOAT, tail);
+      for (const rows of strokeTextureRows(records, field, textureWidth)) {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, rows.y, rows.width, rows.height, gl.RGBA, gl.FLOAT, rows.data);
       }
     }
 
@@ -5571,7 +5558,7 @@ export class WebGlFloorplanRenderer {
 
     // The combined store starts with unchanged canonical IDs, so exact draws
     // and ordered LOD draws can share the same four GPU textures.
-    this.uploadSegments(this.orderedBatches?.strokeScene ?? scene);
+    this.uploadSegments(this.orderedBatches?.strokeRecords ?? sceneStrokeRecords(scene));
 
     if (!this.vectorLodRuntime || this.vectorLodRuntime.levels.length <= 1) {
       this.destroyVectorLodResources();
@@ -5620,7 +5607,10 @@ export class WebGlFloorplanRenderer {
       const textureB = this.mustCreateTexture();
       const textureC = this.mustCreateTexture();
       const textureD = this.mustCreateTexture();
-      const textureStats = this.uploadStrokeTextureSet(level.scene, { textureA, textureB, textureC, textureD });
+      // Scenes without draw runs upload each level separately; a stored level
+      // is copied only for this upload.
+      const textureStats = this.uploadStrokeTextureSet(sceneStrokeRecords(vectorStrokeLodLevelUploadScene(level)),
+        { textureA, textureB, textureC, textureD });
       this.vectorLodLevels.push({
         textureA,
         textureB,

@@ -1,6 +1,7 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 import { packVectorClips } from "./vectorClips";
+import type { StrokeRecordSource } from "./strokeRecords";
 
 /** Skip a redundant rectangle clip only when every possible instance stays inside. */
 export class VectorRunClipElision {
@@ -10,13 +11,13 @@ export class VectorRunClipElision {
   private readonly clearances: Float64Array;
   private padding = NaN;
 
-  static create(scene: VectorScene, strokes: { scene: VectorScene; sourceRuns: Uint32Array }): VectorRunClipElision | null {
+  static create(scene: VectorScene, strokes: StrokeRecordSource & { sourceRuns: Uint32Array }): VectorRunClipElision | null {
     if (!scene.clipPaths?.length || !scene.drawRuns?.some(run => run.clipIndex !== undefined &&
       (run.kind === "stroke" || run.kind === "fill" || run.kind === "text"))) return null;
     return new VectorRunClipElision(scene, strokes);
   }
 
-  private constructor(scene: VectorScene, strokes: { scene: VectorScene; sourceRuns: Uint32Array }) {
+  private constructor(scene: VectorScene, strokes: StrokeRecordSource & { sourceRuns: Uint32Array }) {
     const runs = scene.drawRuns!;
     this.clipCodes = Uint32Array.from(runs, run => (run.clipIndex ?? -1) + 1);
     this.originals = this.clipCodes.slice();

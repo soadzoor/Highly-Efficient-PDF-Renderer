@@ -1,6 +1,7 @@
 import { normalizeScenePaintGraph, scenePaintSpanSegments, type ScenePaintNode } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
+import { sceneStrokeRecords } from "./strokeRecords";
 import type { TextLodBuildData } from "./textLodCore";
 import type { VectorScene } from "./pdfVectorExtractor";
 
@@ -105,7 +106,7 @@ export class ThreeVectorDrawPlan {
     // retain their source submissions rather than feeding a non-monotonic span
     // sequence to the scheduler.
     if (this.segments && !graphRunsInOrder(this.scene)) return null;
-    return VectorPageDrawScheduler.create(this.scene, strokes, sourceRuns, this.segments, this.independentPageRuns);
+    return VectorPageDrawScheduler.create(this.scene, sceneStrokeRecords(strokes), sourceRuns, this.segments, this.independentPageRuns);
   }
 
   private reschedule(): boolean {

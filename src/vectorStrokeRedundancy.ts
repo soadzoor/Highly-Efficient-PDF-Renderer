@@ -1,8 +1,10 @@
 import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
+import {
+  sceneStrokeRecords, strokeRecordSegment, strokeSourceRecords, type StrokeRecords, type StrokeRecordSource
+} from "./strokeRecords";
 
-interface StrokeGeometry {
-  scene: VectorScene;
+interface StrokeGeometry extends StrokeRecordSource {
   /** Source draw-run index of each primitive in the supplied geometry (including LOD). */
   sourceRuns: Uint32Array;
 }
@@ -15,7 +17,7 @@ interface StrokeGeometry {
  */
 export class VectorStrokeRedundancy {
   culledCount = 0;
-  private readonly geometry: VectorScene;
+  private readonly records: StrokeRecords;
   private readonly groups: Uint32Array;
   private readonly groupOffsets: Uint32Array;
   private readonly groupAxes: Uint8Array;
@@ -33,9 +35,8 @@ export class VectorStrokeRedundancy {
   private revision = 0;
 
   constructor(scene: VectorScene, strokes?: StrokeGeometry) {
-    this.geometry = strokes?.scene ?? scene;
-    const geometry = this.geometry;
-    const count = geometry.segmentCount;
+    this.records = strokes ? strokeSourceRecords(strokes) : sceneStrokeRecords(scene);
+    const count = this.records.count;
     this.groups = new Uint32Array(count);
     this.startRanks = new Uint32Array(count);
     this.selected = new Uint32Array(count);
@@ -46,12 +47,12 @@ export class VectorStrokeRedundancy {
       if (run.kind === "stroke") sourceRuns.fill(index, run.first, run.first + run.count);
     });
     // Domains only classify strokes; skip scanning every fill and glyph without any.
-    const domains = count ? paintDomains(scene, geometry, sourceRuns, runs) : new Uint32Array(runs.length);
+    const domains = count ? paintDomains(scene, this.records, sourceRuns, runs) : new Uint32Array(runs.length);
     const lists: number[][] = [];
     const axes: number[] = [];
     const keys = new Map<string, number>();
-    if (!sceneRequiresPaintCompositing(scene)) for (let id = 0; id < count; id++) {
-      const offset = id * 4, run = runs[sourceRuns[id]];
+    if (!sceneRequiresPaintCompositing(scene)) for (const segment of this.records.segments) for (let local = 0; local < segment.count; local++) {
+      const geometry = segment.scene, id = segment.first + local, offset = local * 4, run = runs[sourceRuns[id]];
       if (!run || domains[sourceRuns[id]] === 0 || geometry.primitiveMeta[offset + 2] !== 0) continue;
       const encoded = geometry.primitiveMeta[offset + 3];
       const flags = Math.floor(encoded / 2 + 1e-6);
@@ -78,9 +79,10 @@ export class VectorStrokeRedundancy {
       } else {
         // Equal floating-point slopes/intercepts are only an index hint. Reject
         // cancellation collisions rather than merging nearby parallel geometry.
-        const representative = lists[group][0] * 4;
-        const rx = geometry.endpoints[representative], ry = geometry.endpoints[representative + 1];
-        const rdx = geometry.primitiveMeta[representative] - rx, rdy = geometry.primitiveMeta[representative + 1] - ry;
+        const first = lists[group][0], held = strokeRecordSegment(this.records, first);
+        const representative = (first - held.first) * 4, other = held.scene;
+        const rx = other.endpoints[representative], ry = other.endpoints[representative + 1];
+        const rdx = other.primitiveMeta[representative] - rx, rdy = other.primitiveMeta[representative + 1] - ry;
         if ((x0 - rx) * rdy !== (y0 - ry) * rdx || (x1 - rx) * rdy !== (y1 - ry) * rdx) continue;
       }
       lists[group].push(id);
@@ -113,8 +115,10 @@ export class VectorStrokeRedundancy {
         this.startRanks[id] = rank;
         this.groups[id] = group;
       }
-      const width = (id: number): number => (Math.floor(geometry.primitiveMeta[id * 4 + 3] / 2 + 1e-6) & 1) !== 0
-        ? 0 : geometry.styles[id * 4];
+      const width = (id: number): number => {
+        const segment = strokeRecordSegment(this.records, id), geometry = segment.scene, offset = (id - segment.first) * 4;
+        return (Math.floor(geometry.primitiveMeta[offset + 3] / 2 + 1e-6) & 1) !== 0 ? 0 : geometry.styles[offset];
+      };
       // A wider cover is processed first; equal-width containment puts the
       // earliest start and furthest end first. Exact duplicates prefer later paint.
       list.sort((a, b) => width(b) - width(a) || this.start(a, axis) - this.start(b, axis) ||
@@ -183,16 +187,18 @@ export class VectorStrokeRedundancy {
   isRetained(id: number): boolean { return this.removed[id] !== 1; }
 
   private start(id: number, axis: number): number {
-    return Math.min(this.geometry.endpoints[id * 4 + axis], this.geometry.primitiveMeta[id * 4 + axis]);
+    const segment = strokeRecordSegment(this.records, id), offset = (id - segment.first) * 4 + axis;
+    return Math.min(segment.scene.endpoints[offset], segment.scene.primitiveMeta[offset]);
   }
 
   private end(id: number, axis: number): number {
-    return Math.max(this.geometry.endpoints[id * 4 + axis], this.geometry.primitiveMeta[id * 4 + axis]);
+    const segment = strokeRecordSegment(this.records, id), offset = (id - segment.first) * 4 + axis;
+    return Math.max(segment.scene.endpoints[offset], segment.scene.primitiveMeta[offset]);
   }
 }
 
 /** Different colors, images, gradients and blends fence independent coverage domains. */
-function paintDomains(scene: VectorScene, geometry: VectorScene, sourceRuns: Uint32Array,
+function paintDomains(scene: VectorScene, strokes: StrokeRecords, sourceRuns: Uint32Array,
   runs: readonly VectorDrawRun[]): Uint32Array {
   const colors: (string | null | undefined)[] = new Array(runs.length).fill(undefined);
   const include = (run: number, r: number, g: number, b: number): void => {
@@ -213,9 +219,12 @@ function paintDomains(scene: VectorScene, geometry: VectorScene, sourceRuns: Uin
       else include(index, textColor(scene.textInstanceC[offset]), textColor(scene.textInstanceC[offset + 1]), textColor(scene.textInstanceC[offset + 2]));
     }
   });
-  for (let id = 0; id < geometry.segmentCount; id++) {
-    const run = sourceRuns[id];
-    if (runs[run]?.kind === "stroke") include(run, geometry.styles[id * 4 + 1], geometry.styles[id * 4 + 2], geometry.styles[id * 4 + 3]);
+  for (const segment of strokes.segments) {
+    const styles = segment.scene.styles;
+    for (let index = 0; index < segment.count; index++) {
+      const run = sourceRuns[segment.first + index];
+      if (runs[run]?.kind === "stroke") include(run, styles[index * 4 + 1], styles[index * 4 + 2], styles[index * 4 + 3]);
+    }
   }
   const domains = new Uint32Array(runs.length);
   let domain = 0, previous: string | null | undefined;

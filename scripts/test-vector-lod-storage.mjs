@@ -6,7 +6,8 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { getCombinedVectorStrokeLodStorage, sharedVectorStrokeLodTextureData } = await import("../src/vectorStrokeLodStorage.ts");
+  const { getCombinedVectorStrokeLodStorage, sharedVectorStrokeLodTextureData, vectorStrokeLodStorageOrigins } =
+    await import("../src/vectorStrokeLodStorage.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
   const { VectorStrokeLodRuntime, storePrebuiltVectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
   const { strokePaintOrigins, setStrokePaintOrigins } = await import("../src/vectorStrokePaintOrder.ts");
@@ -18,39 +19,63 @@ try {
   for (const field of fields) scene[field] = new Float32Array(scene.segmentCount * 4);
   for (let index = 0; index < scene.segmentCount; index++) {
     const y = Math.floor(index / 40) * 10;
-    scene.endpoints.set([0, y, 100, y], index * 4);
-    scene.primitiveMeta.set([100, y, 0, 1], index * 4);
-    scene.primitiveBounds.set([0, y, 100, y], index * 4);
+    // Overlapping lines in one merge tile become new, longer records.
+    const [x0, x1] = index % 2 ? [2, 52] : [0, 50];
+    scene.endpoints.set([x0, y, x1, y], index * 4);
+    scene.primitiveMeta.set([x1, y, 0, 1], index * 4);
+    scene.primitiveBounds.set([x0, y, x1, y], index * 4);
     scene.styles.set([.5, .25, .5, .75], index * 4);
   }
+  // One stroke that no level can merge or aggregate: every derived level keeps
+  // it unchanged, so every level must reference the canonical record.
+  scene.primitiveMeta[3] = 3;
+  scene.endpoints.set([10, 5, 10, 5], 0);
+  scene.primitiveMeta.set([10, 5.5, 1], 0);
+  scene.primitiveBounds.set([10, 5, 10, 5.5], 0);
   const canonical = fields.map(field => scene[field]);
   const original = structuredClone(scene);
   const runtime = new VectorStrokeLodRuntime(scene);
   assert(runtime.levels.length > 1);
+  const store = runtime.levels[1].store;
+  assert(runtime.levels.every(level => level.store === store), "levels share one record store");
+  const literals = store.literals;
+  const literalBuffers = new Set(fields.map(field => literals[field].buffer));
   const snapshots = runtime.levels.map(level => fields.map(field => level.scene[field].slice()));
   const origins = runtime.levels.map(level => strokePaintOrigins(level.scene));
-  const oldDerived = new Set(runtime.levels.slice(1).flatMap(level => fields.map(field => level.scene[field].buffer)));
+  assert.equal(runtime.levels[0].scene, scene, "the canonical level is the caller's scene");
   const combined = getCombinedVectorStrokeLodStorage(scene, runtime.levels);
   assert.equal(getCombinedVectorStrokeLodStorage(scene, runtime.levels), combined, "one immutable store per hierarchy");
-  let offset = 0;
+  const count = combined.layout.count;
+  assert.equal(count, scene.segmentCount + literals.segmentCount, "canonical strokes, then only LOD-only records");
+  const storageOrigins = vectorStrokeLodStorageOrigins(combined.layout);
+  const literalUses = new Uint32Array(literals.segmentCount);
+  let references = 0;
   runtime.levels.forEach((level, index) => {
-    assert.equal(combined.offsets[index], offset);
-    assert.equal(strokePaintOrigins(level.scene), origins[index], "paint metadata keeps scene identity");
-    fields.forEach((field, component) => {
-      assert.deepEqual(level.scene[field], snapshots[index][component]);
-      assert.deepEqual(combined.scene[field].subarray(offset * 4, (offset + level.segmentCount) * 4), snapshots[index][component]);
-      if (index > 0) {
-        assert.equal(level.scene[field].buffer, combined.scene[field].buffer, "derived geometry is a view, not a retained copy");
-        assert(!oldDerived.has(level.scene[field].buffer));
-      } else assert.equal(level.scene[field], canonical[component], "canonical arrays retain their identity");
-    });
-    offset += level.segmentCount;
+    assert.equal(strokePaintOrigins(level.scene), origins[index], "a materialized level keeps its scene identity");
+    for (let id = 0; id < level.segmentCount; id++) {
+      const stored = level.records ? level.records[id] : id;
+      assert.equal(storageOrigins[stored], origins[index][id], "stored records keep each level's paint origin");
+      if (level.records && stored < scene.segmentCount) references++;
+      if (stored >= scene.segmentCount) literalUses[stored - scene.segmentCount]++;
+      fields.forEach((field, component) => assert.deepEqual(
+        new Uint32Array(combined.scene[field].slice(stored * 4, stored * 4 + 4).buffer),
+        new Uint32Array(snapshots[index][component].slice(id * 4, id * 4 + 4).buffer),
+        "each level record resolves to its exact bits"));
+    }
+    if (index === 0) fields.forEach((field, component) => assert.equal(level.scene[field], canonical[component],
+      "canonical arrays retain their identity"));
   });
-  const buffers = new Set([scene, combined.scene, ...runtime.levels.map(level => level.scene)]
-    .flatMap(value => fields.map(field => value[field].buffer)));
+  assert(runtime.levels.slice(1).every(level => level.records[0] === 0), "unchanged strokes are references, not copies");
+  assert(references >= runtime.levels.length - 1);
+  assert(literalUses.every(uses => uses === 1), "each LOD-only record is stored once and used by one level");
+  fields.forEach(field => {
+    assert.equal(literals[field].buffer, combined.scene[field].buffer, "LOD-only records become views, not retained copies");
+    assert(!literalBuffers.has(literals[field].buffer));
+  });
+  const buffers = new Set([scene, combined.scene, literals].flatMap(value => fields.map(field => value[field].buffer)));
   assert.equal([...buffers].reduce((sum, buffer) => sum + buffer.byteLength, 0),
-    (scene.segmentCount + Math.ceil(Math.sqrt(offset)) * Math.ceil(offset / Math.ceil(Math.sqrt(offset)))) * 64,
-    "derived LOD storage has no duplicate geometry allocation, only a partial texture row");
+    (scene.segmentCount + Math.ceil(Math.sqrt(count)) * Math.ceil(count / Math.ceil(Math.sqrt(count)))) * 64,
+    "LOD storage has no duplicate geometry allocation, only a partial texture row");
 
   runtime.levels.forEach((level, index) => {
     level.visibleSegmentCount = index === runtime.levels.length - 1 ? level.segmentCount : 0;
@@ -59,13 +84,14 @@ try {
   });
   const plan = new VectorOrderedBatches(scene, runtime);
   const secondPlan = new VectorOrderedBatches(scene, runtime);
-  assert.equal(plan.strokeScene, combined.scene);
-  assert.equal(secondPlan.strokeScene, combined.scene, "independent consumers reuse immutable geometry");
-  const allOrigins = runtime.levels.flatMap(level => [...strokePaintOrigins(level.scene)]);
+  for (const consumer of [plan, secondPlan]) {
+    assert.deepEqual(consumer.strokeRecords.segments.map(segment => segment.scene), [scene, literals],
+      "ordered plans read canonical and LOD-only records in place");
+  }
   const sourceRuns = new Uint32Array(scene.segmentCount);
   scene.drawRuns.forEach((run, index) => sourceRuns.fill(index, run.first, run.first + run.count));
-  const expectedRanks = Array.from({ length: offset }, (_, id) => id).sort((a, b) =>
-    sourceRuns[allOrigins[a]] - sourceRuns[allOrigins[b]] || allOrigins[a] - allOrigins[b] || a - b);
+  const expectedRanks = Array.from({ length: count }, (_, id) => id).sort((a, b) =>
+    sourceRuns[storageOrigins[a]] - sourceRuns[storageOrigins[b]] || storageOrigins[a] - storageOrigins[b] || a - b);
   assert.deepEqual([...plan.rankToId], expectedRanks, "linear counting ranks exactly match canonical paint/origin/ID sorting");
   assert.equal(plan.selectedRanks.length, 0, "dormant levels do not reserve selection scratch");
   assert.equal(plan.previousSelectedIds.length, 0);
@@ -74,11 +100,11 @@ try {
   assert.equal(plan.uintInstances.length, 2);
   plan.update(scene.drawRuns);
   secondPlan.update(scene.drawRuns);
-  assert(plan.selectedRanks.length < offset, "selection scratch follows visible strokes");
+  assert(plan.selectedRanks.length < count, "selection scratch follows visible strokes");
   assert.equal(plan.floatInstanceData.length, 0, "integer submission does not generate float instance data");
   assert.deepEqual([...plan.floatInstances.subarray(0, plan.instanceCount * 2)],
     [...plan.uintInstances.subarray(0, plan.instanceCount * 2)], "WebGL lazily gets the same IDs and clips");
-  assert(plan.floatInstances.length < offset * 2);
+  assert(plan.floatInstances.length < count * 2);
   assert.deepEqual(plan.batches, secondPlan.batches);
   assert.deepEqual(plan.uintInstances, secondPlan.uintInstances);
   const firstCapacity = plan.uintInstances.length;

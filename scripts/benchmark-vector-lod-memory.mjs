@@ -154,14 +154,20 @@ function measureOrderedPreparation(OrderedBatches, scene, runtime) {
     visibleInstances: plan.instanceCount, visibleStrokes: runtime.getRenderedSegmentCount(),
     reachableTypedArrayBytes: retainedBufferBytes([scene, runtime, plan]) };
   const drawHash = createHash("sha256");
-  const fields = geometryFields.map(key => plan.strokeScene[key]);
+  // Older plans hold one combined scene; current plans read split records in place.
+  const records = plan.strokeRecords ?? { count: plan.strokeScene.segmentCount,
+    segments: [{ first: 0, count: plan.strokeScene.segmentCount, scene: plan.strokeScene }] };
+  const record = (key, id) => {
+    const segment = records.segments.findLast(candidate => id >= candidate.first);
+    return segment.scene[key].subarray((id - segment.first) * 4, (id - segment.first + 1) * 4);
+  };
   for (const batch of plan.batches) {
     drawHash.update(JSON.stringify(batch));
     if (batch.kind !== "stroke" && batch.kind !== "fill" && batch.kind !== "text") continue;
     for (let index = batch.first; index < batch.first + batch.count; index++) {
       const id = plan.uintInstances[index * 2];
       if (batch.kind === "stroke") {
-        for (const field of fields) drawHash.update(field.subarray(id * 4, id * 4 + 4));
+        for (const key of geometryFields) drawHash.update(record(key, id));
         drawHash.update(plan.uintInstances.subarray(index * 2 + 1, index * 2 + 2));
       } else drawHash.update(plan.uintInstances.subarray(index * 2, index * 2 + 2));
     }
@@ -194,7 +200,9 @@ function retainedBufferBytes(roots) {
 function fingerprintLevel(level, origins) {
   const count = level.segmentCount;
   const fields = geometryFields.map(key => bits(level.scene[key]));
-  const bounds = boundsFields.map(key => bits(level[key]));
+  // Store-backed levels share culling bounds per stored stroke, addressed by records.
+  const bounds = boundsFields.map(key => bits(level.records
+    ? Float32Array.from(level.records, id => level[key][id]) : level[key]));
   // A source origin determines the original paint and clip. Within the same
   // origin, sorting identical-style representatives removes harmless storage
   // reorderings while retaining every duplicate and every Float32 bit. Without

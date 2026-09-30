@@ -1,6 +1,7 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { TextLodBuildData } from "./textGreekLod";
 import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
+import type { StrokeRecords } from "./strokeRecords";
 
 const kinds = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
 const PAINT_LOOKAHEAD = 128;
@@ -65,7 +66,7 @@ export class VectorPageDrawScheduler {
    * `independentPageRuns` is only valid when the caller separately proves that
    * pages cannot paint over one another (or supplies an opaque depth pass).
    */
-  static create(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array,
+  static create(scene: VectorScene, strokes: StrokeRecords, sourceRuns: Uint32Array,
     segments: Uint32Array | null = null, independentPageRuns: Uint16Array | null = null): VectorPageDrawScheduler | null {
     // Bound setup work for arbitrary public scenes, including invalid layouts
     // and scenes that carry draw runs but no page rectangles.
@@ -77,12 +78,12 @@ export class VectorPageDrawScheduler {
     return new VectorPageDrawScheduler(scene, strokes, sourceRuns, segments, independentPageRuns);
   }
 
-  private constructor(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array, segments: Uint32Array | null, independentPageRuns: Uint16Array | null) {
+  private constructor(scene: VectorScene, strokes: StrokeRecords, sourceRuns: Uint32Array, segments: Uint32Array | null, independentPageRuns: Uint16Array | null) {
     const runs = scene.drawRuns!;
     const pages = scene.pageRects.length / 4;
     this.segments = segments;
     this.independentPages = independentPageRuns !== null;
-    this.bounds = new VectorDrawRunCuller(scene, { scene: strokes, sourceRuns });
+    this.bounds = new VectorDrawRunCuller(scene, { records: strokes, sourceRuns });
     this.pageForRun = new Uint16Array(runs.length);
     this.kindForRun = new Uint8Array(runs.length);
     this.colorForRun = uniformPaintColors(scene, strokes, sourceRuns);
@@ -381,7 +382,7 @@ export class VectorPageDrawScheduler {
 }
 
 /** Exact uploaded RGB only; blending modes and images retain overlap order. */
-function uniformPaintColors(scene: VectorScene, strokes: VectorScene, sourceRuns: Uint32Array): Int32Array {
+function uniformPaintColors(scene: VectorScene, strokes: StrokeRecords, sourceRuns: Uint32Array): Int32Array {
   const runs = scene.drawRuns!;
   const ids = new Int32Array(runs.length);
   const colors = new Float32Array(runs.length * 3);
@@ -413,9 +414,12 @@ function uniformPaintColors(scene: VectorScene, strokes: VectorScene, sourceRuns
   });
   // Include all LOD levels, even dormant ones, so tile/zoom changes can reuse
   // the schedule without assuming simplification preserves the original RGB.
-  for (let index = 0; index < strokes.segmentCount; index++) {
-    const offset = index * 4;
-    include(sourceRuns[index], strokes.styles[offset + 1], strokes.styles[offset + 2], strokes.styles[offset + 3]);
+  for (const segment of strokes.segments) {
+    const styles = segment.scene.styles;
+    for (let index = 0; index < segment.count; index++) {
+      const offset = index * 4;
+      include(sourceRuns[segment.first + index], styles[offset + 1], styles[offset + 2], styles[offset + 3]);
+    }
   }
   return ids;
 }

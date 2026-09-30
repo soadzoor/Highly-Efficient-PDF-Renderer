@@ -87,8 +87,10 @@ try {
     }
     return largest;
   };
+  // Store-backed levels address their shared culling bounds through records.
   const drawn = (subject = runtime) => subject.levels.flatMap((level, index) =>
-    Array.from(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount), id => ({ level, index, id })));
+    Array.from(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount),
+      id => ({ level, index, id: level.records?.[id] ?? id })));
   const screenErrors = (subject = runtime) => drawn(subject).filter(({ level }) => level.tolerance > 0).map(({ level, id }) =>
     level.tolerance * magnification(level.segmentMinX[id], level.segmentMinY[id], level.segmentMaxX[id], level.segmentMaxY[id]));
 

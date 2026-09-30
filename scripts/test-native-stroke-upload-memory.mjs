@@ -13,10 +13,52 @@ try {
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { sceneStrokeRecords, strokeTextureRows } = await import("../src/strokeRecords.ts");
   const sceneOf = count => Object.assign(createEmptyVectorScene(), {
     segmentCount: count, bounds: { minX: 0, minY: 0, maxX: Math.max(1, count), maxY: 1 }, maxHalfWidth: .1,
     ...Object.fromEntries(fields.map(key => [key, new Float32Array(count * 4)]))
   });
+  const recordField = (records, field) => {
+    const values = new Float32Array(records.count * 4);
+    for (const segment of records.segments) {
+      const source = segment.scene[field];
+      values.set(source.subarray(0, Math.min(source.length, segment.count * 4)), segment.first * 4);
+    }
+    return values;
+  };
+
+  // Canonical strokes and LOD-only records upload in place. Rows inside one
+  // source are views of it; only a row spanning sources, or an incomplete
+  // texel, is staged, one row at a time. Missing texels stay zero.
+  for (const [counts, width, shortBy = 0] of [[[5, 3], 4], [[8, 8], 4], [[1, 1, 1, 9], 3], [[4, 0, 5], 3],
+    [[7, 6], 5, 2], [[40, 37, 3], 6], [[12], 4], [[9, 16], 5]]) {
+    let first = 0;
+    const segments = counts.map((count, segment) => {
+      const scene = sceneOf(count);
+      fields.forEach((field, index) => {
+        if (segment === counts.length - 1 && shortBy) scene[field] = scene[field].subarray(0, count * 4 - shortBy);
+        const bits = new Uint32Array(scene[field].buffer, scene[field].byteOffset, scene[field].length);
+        for (let i = 0; i < bits.length; i++) {
+          bits[i] = [0x80000000, 0x7fc00001 + segment, 0x3f800001 + i, 0xbf800001 + segment * 7][(i + index) % 4];
+        }
+      });
+      first += count;
+      return { first: first - count, count, scene };
+    });
+    const records = { count: first, segments };
+    for (const field of fields) {
+      const height = Math.ceil(records.count / width);
+      const texture = { width, bpp: 16, destroyed: 0, bytes: new Uint8Array(width * height * 16) };
+      for (const upload of strokeTextureRows(records, field, width, 2 * width * 16)) {
+        const view = segments.some(segment => segment.scene[field].buffer === upload.data.buffer);
+        assert(view || (upload.height === 1 && upload.data.length <= width * 4), `${counts}/${width}: only a boundary row is staged`);
+        assert(upload.height <= 2, "row batches follow the byte limit");
+        assert.equal(upload.data.length, upload.width * upload.height * 4);
+        copy(texture, upload.data, 0, upload.y, upload.width, upload.height);
+      }
+      verifyBytes(texture, recordField(records, field), `${counts}/${width}: split records upload exact texels`);
+    }
+  }
 
   // Texture row boundaries, source subviews, signed zero and NaN payloads must
   // survive exactly; no complete texture may be copied into a staging array.
@@ -30,7 +72,7 @@ try {
     }
     const gl = glMock(), renderer = Object.assign(Object.create(WebGlFloorplanRenderer.prototype), { gl });
     const textures = Object.fromEntries(["A", "B", "C", "D"].map(key => [`texture${key}`, gl.createTexture()]));
-    const dims = renderer.uploadStrokeTextureSet(scene, textures);
+    const dims = renderer.uploadStrokeTextureSet(sceneStrokeRecords(scene), textures);
     for (const [index, texture] of Object.values(textures).entries()) {
       verifyBytes(texture, scene[fields[index]], `${count} WebGL texels`);
     }
@@ -87,12 +129,15 @@ try {
     const checkShared = () => {
       const levels = backend === "WebGL" ? renderer.vectorLodLevels : renderer.vectorLodLevelResources;
       assert.equal(levels.length, 1, `${backend}: one combined GPU store`);
-      const combined = renderer.orderedBatches.strokeScene;
-      assert(combined.segmentCount > scene.segmentCount);
+      const records = renderer.orderedBatches.strokeRecords;
+      assert(records.count > scene.segmentCount);
+      assert.equal(records.segments[0].scene, scene, `${backend}: canonical strokes upload in place`);
       for (const [index, suffix] of ["A", "B", "C", "D"].entries()) {
         const texture = renderer[`segmentTexture${suffix}`];
         assert.equal(texture, levels[0][`texture${suffix}`], `${backend}: exact and LOD share texture ${suffix}`);
-        if (suffix !== "C" || !renderer.primitiveColors?.has("stroke")) verifyBytes(texture, combined[fields[index]], `${backend} combined ${suffix}`);
+        if (suffix !== "C" || !renderer.primitiveColors?.has("stroke")) {
+          verifyBytes(texture, recordField(records, fields[index]), `${backend} combined ${suffix}`);
+        }
       }
       assert.equal(levels[0].ownsTextures, false, "LOD cannot destroy the canonical owner's textures");
     };

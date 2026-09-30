@@ -2,8 +2,10 @@ import type { ThreePageTransforms } from "./threePageTransforms";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
-import { strokePaintOrigins } from "./vectorStrokePaintOrder";
-import { getCombinedVectorStrokeLodStorage } from "./vectorStrokeLodStorage";
+import {
+  getCombinedVectorStrokeLodStorage, vectorStrokeLodLevelUploadScene, vectorStrokeLodStorageOrigins,
+  type VectorStrokeLodStorageLayout
+} from "./vectorStrokeLodStorage";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
 
@@ -53,7 +55,9 @@ export class ThreeVectorLodStrokeLayer {
   private selectionInitialized = false;
   private disposed = false;
   private combinedIds: Uint32Array | null;
-  private readonly levelOffsets: number[] = [];
+  private layout: VectorStrokeLodStorageLayout | null = null;
+  /** One bit per stored stroke: levels that share a stroke submit it once. */
+  private selectedStorageBits: Uint32Array | null = null;
 
   constructor(
     scene: VectorScene,
@@ -69,11 +73,10 @@ export class ThreeVectorLodStrokeLayer {
     this.runtime = preparedRuntime?.take(scene) ?? takePrebuiltVectorStrokeLodRuntime(scene) ?? new VectorStrokeLodRuntime(scene);
     try {
       if (scene.drawRuns) {
-        let count = 0;
-        for (const level of this.runtime.levels) { this.levelOffsets.push(count); count += level.segmentCount; }
-        const combined = getCombinedVectorStrokeLodStorage(scene, this.runtime.levels).scene;
-        const origins = new Uint32Array(count);
-        this.runtime.levels.forEach((level, index) => origins.set(strokePaintOrigins(level.scene)!, this.levelOffsets[index]));
+        const { scene: combined, layout } = getCombinedVectorStrokeLodStorage(scene, this.runtime.levels);
+        const origins = vectorStrokeLodStorageOrigins(layout)!;
+        this.layout = layout;
+        this.selectedStorageBits = new Uint32Array(Math.ceil(layout.count / 32));
         const drawPlan = options.drawPlan ?? getThreeVectorDrawPlan(scene);
         drawPlan.setStrokeSource(combined, origins);
         const layer = new ThreeMaterialStrokeLayer(combined, { ...options, drawPlan, canonicalScene: scene, strokeOrigins: origins });
@@ -84,7 +87,7 @@ export class ThreeVectorLodStrokeLayer {
       } else {
         this.combinedIds = null;
         for (const level of this.runtime.levels) {
-          const layer = new ThreeMaterialStrokeLayer(level.scene, options);
+          const layer = new ThreeMaterialStrokeLayer(vectorStrokeLodLevelUploadScene(level), options);
           this.layers.push(layer);
           layer.mesh.name = `hepr-vector-lod-strokes-${formatToleranceName(level.tolerance)}`;
           layer.setVisible(false);
@@ -220,12 +223,20 @@ export class ThreeVectorLodStrokeLayer {
         this.combinedIds = new Uint32Array(Math.max(selectedCount, this.combinedIds.length * 2, 256));
       }
       let count = 0;
+      const layout = this.layout!, selected = this.selectedStorageBits!;
       this.runtime.levels.forEach((level, index) => {
         if (!visible) return;
+        const records = layout.records[index], base = layout.bases[index];
         for (let item = 0; item < level.visibleSegmentCount; item++) {
-          this.combinedIds![count++] = this.levelOffsets[index] + level.visibleSegmentIds[item];
+          const local = level.visibleSegmentIds[item];
+          const id = records ? records[local] : base + local;
+          const word = id >>> 5, bit = 1 << (id & 31);
+          if ((selected[word] & bit) !== 0) continue;
+          selected[word] |= bit;
+          this.combinedIds![count++] = id;
         }
       });
+      for (let item = 0; item < count; item++) selected[this.combinedIds[item] >>> 5] = 0;
       this.layers[0].updateFrameWithVisibleSegmentIds(viewState, viewport, this.combinedIds, count);
       this.layers[0].setVisible(visible); this.layers[0].setDrawEnabled(count > 0);
       return;
