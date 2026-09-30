@@ -645,6 +645,9 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       isolated: true, knockout: false, blendMode: "Normal", optionalContent: condition };
     stack.at(-1)!.push(group); stack.push(group.children);
     try {
+      // Every tile reuses the same synthetic page with only the cell transform changed,
+      // so validate it for the first tile only instead of once per tile.
+      let firstTile = true;
       for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
         signal.throwIfAborted();
         const cellMatrix = multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]);
@@ -652,7 +655,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         const root = { ...page.displayProgram.groups[page.displayProgram.rootGroupIndex], alpha: 1, alphaIsShape: false, isolated: true, knockout: false, blendMode: "Normal" as const, softMaskGroupIndex: -1, softMaskSubtype: null, softMaskTransferFunctionIndex: -1, backdropPaintIndex: -1, blendingColorSpaceIndex: -1, clipIndex: -1,
           commands: [{ kind: "invoke-program" as const, transformIndex: baseTransform, clipIndex: -1, optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1, programIndex, type3PaintIndex: resolved.basePaintIndex, viewTransformFlags: 0 }] };
         const synthetic = { ...page, stores: { ...page.stores, transforms: { values: transforms } }, displayProgram: { ...page.displayProgram, programs, rootGroupIndex: page.displayProgram.groups.length, groups: [...page.displayProgram.groups, root] } };
-        await executeHeprDisplayProgram(synthetic, backend(paintedClip, condition, currentItem), { signal });
+        await executeHeprDisplayProgram(synthetic, backend(paintedClip, condition, currentItem), { signal, trustedPage: !firstTile });
+        firstTile = false;
       }
     } finally { stack.pop(); patternActive.delete(p); }
   };
