@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-29T15:45:20.289Z",
+  "generatedAt": "2026-09-30T11:19:41.033Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -10,7 +10,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 2024076
+        "sizeBytes": 2046984
       }
     },
     {
@@ -130,7 +130,7 @@
       },
       "hep": {
         "path": "examples/heps/optimizing_cpp-parsed-data.hep",
-        "sizeBytes": 822556
+        "sizeBytes": 973608
       }
     },
     {
@@ -154,7 +154,7 @@
       },
       "hep": {
         "path": "examples/heps/Preliminary_CS-MAP_Users_Guide-parsed-data.hep",
-        "sizeBytes": 1291980
+        "sizeBytes": 1294928
       }
     },
     {
@@ -190,7 +190,7 @@
       },
       "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
-        "sizeBytes": 1521740
+        "sizeBytes": 1537512
       }
     },
     {
@@ -202,7 +202,7 @@
       },
       "hep": {
         "path": "examples/heps/WarAndPeace-parsed-data.hep",
-        "sizeBytes": 4136480
+        "sizeBytes": 4143616
       }
     }
   ]
