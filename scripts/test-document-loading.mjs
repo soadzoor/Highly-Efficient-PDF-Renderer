@@ -15,6 +15,8 @@ let nextParse = async (buffer) => [scene(new Uint8Array(buffer)[0])];
 let failUpload = null;
 let uploadedScene = null;
 let view = { cameraCenterX: 0, cameraCenterY: 0, zoom: 1 };
+// The export dialog's default: Download with no LOD checked. null is Cancel.
+let hepLodChoice = {};
 const context = vm.createContext({
   performance, AbortController, Uint8Array, console: { log: noop, warn: noop },
   waitForLoad, createLoadProgressReporter,
@@ -46,6 +48,7 @@ const context = vm.createContext({
   consumeVectorStrokeLodBuildTiming: () => timing, combineVectorLodTimings: () => timing,
   yieldToBrowserPaint: async () => {}, yieldAfterPaint: async (signal) => signal?.throwIfAborted(),
   sanitizeDownloadName: (label) => label,
+  promptForHepLod: async () => hepLodChoice,
   triggerBrowserDownload: noop, formatFileSize: String,
   buildHep: async (value, options) => {
     exports.push({ scene: value, label: options.sourceLabel });
@@ -75,6 +78,11 @@ await context.loadPdfFile(file("A.pdf", 65));
 assertDocument(65, "A.pdf");
 const originalCache = context.parsedPdfPageCache;
 await assertExport(65, "A.pdf");
+hepLodChoice = null;
+const exportCount = exports.length;
+assert.equal(await context.downloadHep(), false, "cancelling the export dialog downloads nothing");
+assert.equal(exports.length, exportCount);
+hepLodChoice = {};
 
 nextParse = async () => { throw new Error("invalid PDF"); };
 await context.loadPdfFile(file("B.pdf", 66));
