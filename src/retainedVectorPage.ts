@@ -1,8 +1,8 @@
 import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
 import { placeSceneAnnotation } from "./annotationData";
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { HEPR_ANNOTATION_MARKED_CONTENT_TAG, HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, HEPR_STROKE_FLAG, expandHeprImageToRgba8,
-  type HeprPageData, type PdfMatrix } from "./heprDocumentData";
+import { HEPR_ANNOTATION_MARKED_CONTENT_TAG, HEPR_COLOR_SPACE_KIND, HEPR_IMAGE_FORMAT, HEPR_PAINT_KIND, HEPR_STROKE_FLAG,
+  expandHeprImageToRgba8, type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
   type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionIndexScope, type HeprExecutionState,
   type HeprResolvedPatternPaint } from "./heprDisplayExecutor";
@@ -28,6 +28,12 @@ import { PdfError } from "./pdf/nativeTypes";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
+/**
+ * Every stencil mask on a page becomes an RGBA8 image of its fill color. A
+ * scan stored as hundreds of overlapping 1-bit plates holds hundreds of
+ * megapixels, so they share the pixel budget of a page raster fallback.
+ */
+const MAX_RETAINED_STENCIL_PIXELS = 16_000_000;
 type Color = readonly [number, number, number, number];
 interface Geometry { a: number[]; b: number[]; bounds: Bounds }
 
@@ -104,6 +110,12 @@ export interface RetainedVectorPageOptions {
   readonly maxPrimitives?: number;
   readonly maxCoordinates?: number;
   readonly maxPatternCells?: number;
+  /**
+   * Pixels the page's stencil masks may use together once tinted. Beyond it,
+   * every mask keeps the same reduced share of its resolution.
+   * @default 16_000_000
+   */
+  readonly maxStencilPixels?: number;
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
@@ -128,6 +140,34 @@ function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
     }
   }
   return base;
+}
+
+/**
+ * Paints a stencil mask's gray coverage in a solid color, as a new straight
+ * RGBA8 raster. The color's alpha scales the coverage, as the reference
+ * Canvas2D renderer does. Below a scale of one, each output pixel averages
+ * the coverage of the source block it covers.
+ */
+function tintHeprStencilMask(coverage: Uint8Array, width: number, height: number, rgba: Color, scale: number,
+  signal?: AbortSignal): { readonly data: Uint8Array; readonly width: number; readonly height: number } {
+  const channel = (value: number): number => Math.round(Math.max(0, Math.min(1, value)) * 255);
+  const red = channel(rgba[0]), green = channel(rgba[1]), blue = channel(rgba[2]), alpha = Math.max(0, Math.min(1, rgba[3]));
+  const outWidth = Math.max(1, Math.min(width, Math.floor(width * scale)));
+  const outHeight = Math.max(1, Math.min(height, Math.floor(height * scale)));
+  const output = new Uint8Array(outWidth * outHeight * 4);
+  for (let y = 0; y < outHeight; y++) {
+    signal?.throwIfAborted();
+    const top = Math.floor(y * height / outHeight), bottom = Math.floor((y + 1) * height / outHeight);
+    for (let x = 0; x < outWidth; x++) {
+      const left = Math.floor(x * width / outWidth), right = Math.floor((x + 1) * width / outWidth);
+      let sum = 0;
+      for (let row = top; row < bottom; row++) for (let column = left; column < right; column++) sum += coverage[row * width + column];
+      const offset = (y * outWidth + x) * 4;
+      output[offset] = red; output[offset + 1] = green; output[offset + 2] = blue;
+      output[offset + 3] = Math.round(sum / ((bottom - top) * (right - left)) * alpha);
+    }
+  }
+  return { data: output, width: outWidth, height: outHeight };
 }
 
 /**
@@ -198,7 +238,14 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const colors = new HeprColorEvaluator(page.stores.colors,
     (indices, inputs) => indices.flatMap(index => [...functions.evaluate(index, inputs, { signal })]), signal);
   const gradients: GradientSceneData[] = [];
-  const imagePixels = new Map<number, Uint8Array>();
+  const imagePixels = new Map<number | string, { readonly data: Uint8Array; readonly width: number; readonly height: number }>();
+  let stencilPixels = 0, stencilCount = 0;
+  for (let index = 0; index < page.stores.images.imageMask.length; index++) {
+    if (!page.stores.images.imageMask[index]) continue;
+    stencilPixels += page.stores.images.widths[index] * page.stores.images.heights[index]; stencilCount++;
+  }
+  const maxStencilPixels = options.maxStencilPixels ?? MAX_RETAINED_STENCIL_PIXELS;
+  const stencilScale = stencilPixels > maxStencilPixels ? Math.sqrt(maxStencilPixels / stencilPixels) : 1;
   const glyphAtlas = new Map<string, number>();
   const hairlineAtlas = new Map<string, ReturnType<typeof buildNativeGlyphHairline>>();
   let gradientSegments = 0, meshVertices = 0, meshIndices = 0;
@@ -334,10 +381,18 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     }
     return { parent, fillRule: fillRule === 1 ? 1 : 0, path: { data: Float32Array.from(data), transform: [...IDENTITY], bounds: g.bounds } };
   };
+  // Every command under a clip opens its own scope. One clip resource under one
+  // transform and parent is still one clip, so its outlines are built and
+  // flattened once rather than once per path or glyph run it clips.
+  const resourceClips = new WeakMap<object, Map<string, DensePdfTextClip>>(), unclipped = {};
   const resourceClip = (index: number, outer: PdfMatrix, parent: DensePdfTextClip | null): DensePdfTextClip | null => {
     if (index < 0) return parent;
     const clips = page.stores.clips;
     parent = resourceClip(clips.parentIndices[index], outer, parent);
+    let siblings = resourceClips.get(parent ?? unclipped);
+    if (!siblings) resourceClips.set(parent ?? unclipped, siblings = new Map());
+    const key = `${index}:${outer.join(",")}`, existing = siblings.get(key);
+    if (existing) return existing;
     const matrix = multiplyHeprMatrices(outer, transform(clips.transformIndices[index]));
     let g: Geometry;
     if (clips.glyphCounts[index] > 0) {
@@ -347,7 +402,9 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         append(g.a, part.a); append(g.b, part.b); include(g.bounds, part.bounds.minX, part.bounds.minY); include(g.bounds, part.bounds.maxX, part.bounds.maxY);
       }
     } else g = geometry(Array.from({ length: clips.pathCounts[index] }, (_, offset) => clips.firstPaths[index] + offset), matrix);
-    return clipFromGeometry(g, parent, clips.fillRules[index]);
+    const result = clipFromGeometry(g, parent, clips.fillRules[index]);
+    siblings.set(key, result);
+    return result;
   };
   const clipScope = (scope: HeprExecutionClipScope | null): DensePdfTextClip | null => {
     if (!scope) return null;
@@ -764,31 +821,42 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       for (let index = command.first; index < command.first + command.count; index++) {
         // Each of these needs a different preparation, and which one it is
         // decides whether a page keeps its vectors, so name them apart.
-        // Each of these needs a different preparation, and which one it is
-        // decides whether a page keeps its vectors, so name them apart.
-        if (images.imageMask[index]) return fail("a stencil image mask requires preparation.");
         if (images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("a pre-multiplied image matte requires preparation.");
-        let data = imagePixels.get(index);
-        if (!data) {
-          // Raster layers are straight RGBA8; a grayscale store widens once here.
-          const expanded = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]),
-            images.formats[index], images.widths[index], images.heights[index], signal);
-          if (!expanded) return fail(`an image stored as format ${images.formats[index]} requires a codec.`);
+        // A stencil mask paints its coverage in the current fill color, so each
+        // color it is painted in is a raster of its own.
+        const stencil = images.imageMask[index] ? color(command.paintIndex, execution.state) : undefined;
+        const key = stencil ? `${index}:${stencil.join(",")}` : index;
+        let pixels = imagePixels.get(key);
+        if (!pixels) {
+          const source = images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]);
+          let width = images.widths[index], height = images.heights[index], data: Uint8Array, owned = false;
+          if (stencil) {
+            // A stencil's one-bit samples are stored as one coverage byte each.
+            if (images.formats[index] !== HEPR_IMAGE_FORMAT.Gray8 || source.length !== width * height) {
+              return fail(`a stencil image mask stored as format ${images.formats[index]} requires preparation.`);
+            }
+            ({ data, width, height } = tintHeprStencilMask(source, width, height, stencil, stencilScale, signal));
+            owned = true;
+          } else {
+            // Raster layers are straight RGBA8; a grayscale store widens once here.
+            const expanded = expandHeprImageToRgba8(source, images.formats[index], width, height, signal);
+            if (!expanded) return fail(`an image stored as format ${images.formats[index]} requires a codec.`);
+            data = expanded; owned = expanded !== source;
+          }
           const maskIndex = images.softMaskImageIndices[index];
-          if (maskIndex < 0) data = expanded;
-          else {
+          if (maskIndex >= 0) {
             const mask = expandHeprImageToRgba8(images.data.subarray(images.dataOffsets[maskIndex], images.dataOffsets[maskIndex + 1]),
               images.formats[maskIndex], images.widths[maskIndex], images.heights[maskIndex], signal);
             if (!mask) return fail(`an image soft mask stored as format ${images.formats[maskIndex]} requires a codec.`);
             // An Rgba8 store widens to itself, so the alpha is written into a
             // copy rather than back into the page's own image bytes.
-            data = applyHeprImageSoftMask(Uint8Array.from(expanded), images.widths[index], images.heights[index],
+            data = applyHeprImageSoftMask(owned ? data : Uint8Array.from(data), width, height,
               mask, images.widths[maskIndex], images.heights[maskIndex], signal);
           }
-          imagePixels.set(index, data);
+          imagePixels.set(key, pixels = { data, width, height });
         }
         const first = scene.rasterLayers.length; budget(6);
-        scene.rasterLayers.push({ width: images.widths[index], height: images.heights[index], data, matrix: Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1])), paintOrder: first, pageIndex: 0 });
+        scene.rasterLayers.push({ width: pixels.width, height: pixels.height, data: pixels.data, matrix: Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1])), paintOrder: first, pageIndex: 0 });
         appendRun("raster", first, 1, clip, condition);
       }
     } else return fail(`${command.source} requires a specialized vector adapter.`);
@@ -866,6 +934,13 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   scene.segmentCount = scene.endpoints.length / 4; scene.sourceSegmentCount = scene.segmentCount; scene.mergedSegmentCount = scene.segmentCount;
   scene.imageLayerSegmentCount = 0;
   scene.clipPaths = clipBuilder.paths;
+  const coarsenedClips = clipBuilder.coarseningDiagnostic(page.pageInfo.sourcePageIndex);
+  if (coarsenedClips) options.onDiagnostic?.(coarsenedClips);
+  if (stencilScale < 1) options.onDiagnostic?.({ code: "image.stencil-resolution-reduced", severity: "warning",
+    pageIndex: page.pageInfo.sourcePageIndex,
+    message: `${stencilCount} stencil image masks hold ${stencilPixels} pixels, more than the page's ${maxStencilPixels}-pixel ` +
+      `budget; each keeps ${Math.round(stencilScale * 1000) / 10}% of its width and height.`,
+    details: { stencilCount, pixels: stencilPixels, budget: maxStencilPixels, scale: stencilScale } });
   if (gradients.length) {
     const floats = (key: keyof GradientSceneData): Float32Array => {
       const parts = gradients.map(part => part[key] as Float32Array | undefined), result = new Float32Array(parts.reduce((sum, part) => sum + (part?.length ?? 0), 0));

@@ -14,6 +14,7 @@ try {
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { NativeVectorClipBuilder } = await import("../src/pdf/nativeVectorClips.ts");
+  const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
   const { packVectorClips, MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES } = await import("../src/vectorClips.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial,
@@ -29,7 +30,9 @@ try {
     fixture("q 0 0 m 40 0 l 0 40 l h W n /Fm Do Q q 40 40 m 0 40 l 40 0 l h W n /Fm Do Q"),
     // A clip is frozen in page space when W executes, before subsequent changes to the CTM.
     fixture("q 1 0 0 1 10 5 cm 0 0 m 30 0 l 0 30 l h W n 1 0 0 1 -10 -5 cm /Fm Do Q"),
-    fixture("q 5 5 m 5 55 55 55 55 5 c h W n /Fm Do Q")
+    fixture("q 5 5 m 5 55 55 55 55 5 c h W n /Fm Do Q"),
+    // Five stacked circles outgrow the edge budget at the usual curve tolerance.
+    fixture(`q ${"62 32 m 62 48.569 48.569 62 32 62 c 2 48.569 15.431 62 2 32 c 2 15.431 15.431 2 32 2 c 48.569 2 62 15.431 62 32 c h ".repeat(5)}W n /Fm Do Q`)
   ];
   let sample;
   for (const [fixtureIndex, bytes] of fixtures.entries()) {
@@ -42,6 +45,12 @@ try {
       assert(scene.fillPathCount > 0 && scene.clipPaths.length > 0);
       assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
       if (fixtureIndex === 5) assert(session.getDiagnostics().some(d => d.code === "clip-curve-approximation"));
+      if (fixtureIndex === 5) assert(!session.getDiagnostics().some(d => d.code === "clip-curve-coarsened"));
+      if (fixtureIndex === 6) {
+        assert(scene.clipPaths.every(clip => clip.edges.length / 4 <= MAX_VECTOR_CLIP_EDGES));
+        assert.equal(session.getDiagnostics().find(d => d.code === "clip-curve-coarsened")?.details.clipCount, 1,
+          "an oversized curved clip is flattened more coarsely, not refused");
+      }
       if (fixtureIndex === 0) {
         sample = scene;
         assert.equal(scene.drawRuns.at(-1).clipIndex, undefined, "Q restores the unclipped caller");
@@ -50,6 +59,14 @@ try {
       if (fixtureIndex === 1) assert.equal(contains(scene, scene.drawRuns[0].clipIndex, 25, 25), true, "nonzero overlap");
       if (fixtureIndex === 3) assert.notEqual(scene.drawRuns[0].clipIndex, scene.drawRuns[1].clipIndex);
       const page = await session.compilePage(0);
+      if (fixtureIndex === 6) {
+        const diagnostics = [];
+        const retained = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal,
+          onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+        assert.equal(retained.rasterLayers.length, 0);
+        assert(retained.clipPaths.length > 0 && retained.clipPaths.every(clip => clip.edges.length / 4 <= MAX_VECTOR_CLIP_EDGES));
+        assert(diagnostics.some(d => d.code === "clip-curve-coarsened"), "retained lowering coarsens the same clip");
+      }
       for (const scale of [2, 8, 24]) {
         const reference = await renderHeprPageToCanvas2d(page, { scale, surfaceFactory });
         const retained = renderRetainedFills(scene, scale);
@@ -101,6 +118,31 @@ try {
   assert.throws(() => builder.add(clip, AbortSignal.abort()));
   const emptyIndex = builder.add({ ...clip, path: { ...clip.path, data: new Float32Array([0, 1, 1]) } });
   assert.equal(contains({ clipPaths: builder.paths }, emptyIndex, 1, 1), false);
+  assert.equal(builder.coarseningDiagnostic(0), undefined, "clips within budget keep the usual tolerance");
+
+  // Curves give up precision before a clip is refused; straight edges have none to give.
+  const k = 300 * 0.5523;
+  const circle = [0, 300, 0, 2, 300, k, k, 300, 0, 300, 2, -k, 300, -300, k, -300, 0,
+    2, -300, -k, -k, -300, 0, -300, 2, k, -300, 300, -k, 300, 0, 4];
+  const curved = (data) => ({ parent: null, fillRule: 0, path: { data: Float32Array.from(data),
+    transform: [1, 0, 0, 1, 400, 400], bounds: { minX: -300, minY: -300, maxX: 300, maxY: 300 } } });
+  const coarse = new NativeVectorClipBuilder();
+  const coarseIndex = coarse.add(curved([...circle, ...circle, ...circle]));
+  const coarseEdges = coarse.paths[coarseIndex].edges.length / 4;
+  assert(coarseEdges <= MAX_VECTOR_CLIP_EDGES && coarseEdges > MAX_VECTOR_CLIP_EDGES / 4);
+  assert(contains({ clipPaths: coarse.paths }, coarseIndex, 400, 699.9) && !contains({ clipPaths: coarse.paths }, coarseIndex, 400, 700.1));
+  assert.equal(coarse.coarsenedClipCount, 1);
+  const coarsened = coarse.coarseningDiagnostic(3);
+  assert.equal(coarsened.code, "clip-curve-coarsened");
+  assert.equal(coarsened.pageIndex, 3);
+  assert.equal(coarsened.details.tolerance, coarse.coarsestCurveTolerance);
+  assert(coarse.coarsestCurveTolerance > 0.0001 && coarse.coarsestCurveTolerance < 0.01);
+  const fine = new NativeVectorClipBuilder();
+  assert(fine.paths[fine.add(curved(circle))].edges.length / 4 > coarseEdges / 3, "one circle keeps the usual tolerance");
+  assert.equal(fine.coarsenedClipCount, 0);
+  const sawtooth = [0, 0, 0, ...Array.from({ length: MAX_VECTOR_CLIP_EDGES + 8 }, (_, i) => [1, i + 1, i % 2]).flat()];
+  assert.throws(() => new NativeVectorClipBuilder().add(curved(sawtooth)),
+    error => error.details?.reason === "vector-clip-edge-limit");
 
   // Per-run material clones share live camera uniforms but keep independent clip roots.
   const texture = createThreeVectorClipTexture(sample);

@@ -948,6 +948,8 @@ text, and retained replay resources, with no source PDF needed when reopening it
 | `extgstate-approximation` | A print color/halftone setting or nonidentity transfer function was omitted for screen output. |
 | `image.resolution-reduced` | An image too large to decode within the stream limit was decoded at 1/2, 1/4, or 1/8 resolution. |
 | `image.ccitt-size-adjusted` | Fax image data had more or fewer columns or rows than the image declares; it was cropped or padded with white. |
+| `image.stencil-resolution-reduced` | A page's stencil image masks, each kept as an image of its fill color, held more than the 16-million-pixel budget; every mask was box-filtered by the same factor, given in details, instead of rasterizing the page. |
+| `clip-curve-coarsened` | A curved clip, such as a line of clipping text, exceeded the vector clip edge budget at the usual 0.0001-point curve tolerance and was flattened more coarsely (at most about 0.1 point) instead of rasterizing the page; details include the clip count and coarsest tolerance. |
 
 Stitching-function boundaries are sampled as hard color transitions. Gradient
 color-tolerance misses are nonfatal, but stop-count and other hard resource limits

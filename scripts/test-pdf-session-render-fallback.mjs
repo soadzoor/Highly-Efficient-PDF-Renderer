@@ -16,10 +16,15 @@ try {
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { computeCharQuad } = await import("../src/sceneTextGeometry.ts");
   const { openPdfInNodeWorker } = await import("../src/pdf/workerClient.ts");
+  const { MAX_VECTOR_CLIP_EDGES } = await import("../src/vectorClips.ts");
   const font = buildTinySfnt();
   const fontOptions = { missingFontResolver: () => ({ sfntBytes: font, identifier: "fallback-fixture" }) };
+  // More straight edges than a vector clip holds, and no curve to flatten more
+  // coarsely: neither vector path can represent the page.
+  const sawtooth = Array.from({ length: MAX_VECTOR_CLIP_EDGES + 100 },
+    (_, index) => `${(index * 40 / (MAX_VECTOR_CLIP_EDGES + 100)).toFixed(4)} ${index % 2 ? 1 : .5} l`).join(" ");
   const fallbackAnnotation = fixture({
-    annotations: true, image: true, stencil: true, content: "q /G gs 0 0 1 1 re f Q /Im Do", state: "/ca .5 /AIS true"
+    annotations: true, content: `q 0 0 m ${sawtooth} 40 0 l h W n /G gs 0 0 1 1 re f Q`, state: "/ca .5 /AIS true"
   });
   const cases = [
     ["annotation after unsupported page paint", fallbackAnnotation, (scene) => {
@@ -142,10 +147,9 @@ try {
     await assert.rejects(bounded.compileVectorPage(0, { signal: AbortSignal.abort() }));
     await assert.rejects(bounded.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
       error => error.code === "resource-limit");
-    // Stencil image masks still need preparation; the message names which of
-    // the image features it is, since a soft mask no longer stops the lowering.
+    // Strict vector mode names what the vector paths could not represent.
     await assert.rejects(bounded.compileVectorPage(0, { vectorFallback: "error" }),
-      error => /stencil image mask requires preparation/.test(error.message));
+      error => error.details?.reason === "vector-clip-edge-limit");
   } finally { await bounded.close(); }
 
   for (const transfer of ["/TR 9 0 R", "/TR2 [9 0 R /Identity 9 0 R /Identity]", "/UCR2 9 0 R /BG2 9 0 R /HT << /HalftoneType 1 >>"]) {
@@ -240,13 +244,13 @@ function assertPixel(scene, x, y, expected) {
   const offset = (Math.floor((height - y) / height * layer.height) * layer.width + Math.floor(x / width * layer.width)) * 4;
   assert.deepEqual([...layer.data.subarray(offset, offset + 4)], expected);
 }
-function fixture({ content = "", annotations = false, image = false, oneBit = false, stencil = false, font = false, state = "", width = 40, height = 20 } = {}) {
+function fixture({ content = "", annotations = false, image = false, oneBit = false, font = false, state = "", width = 40, height = 20 } = {}) {
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << ${image ? "/XObject << /Im 5 0 R >>" : ""} ${font ? "/Font << /F 7 0 R >>" : ""} ${state ? "/ExtGState << /G 8 0 R >>" : ""} >> /Contents 4 0 R ${annotations ? "/Annots [6 0 R]" : ""} >>` },
     { number: 4, body: tinyPdfStream("", content) },
-    { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${oneBit ? 2 : 1} /Height 1 /BitsPerComponent ${oneBit || stencil ? 1 : 8} ${stencil ? "/ImageMask true" : `/ColorSpace /Device${oneBit ? "Gray" : "RGB"}`}`, oneBit ? Uint8Array.of(0x40) : stencil ? Uint8Array.of(0) : Uint8Array.of(255, 0, 0)) },
+    { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${oneBit ? 2 : 1} /Height 1 /BitsPerComponent ${oneBit ? 1 : 8} /ColorSpace /Device${oneBit ? "Gray" : "RGB"}`, oneBit ? Uint8Array.of(0x40) : Uint8Array.of(255, 0, 0)) },
     { number: 6, body: "<< /Type /Annot /Subtype /Square /Rect [10 5 20 15] /IC [1 0 0] /Border [0 0 0] >>" },
     { number: 7, body: "<< /Type /Font /Subtype /TrueType /BaseFont /FallbackFixture /Encoding /WinAnsiEncoding >>" },
     { number: 8, body: `<< ${state} >>` },

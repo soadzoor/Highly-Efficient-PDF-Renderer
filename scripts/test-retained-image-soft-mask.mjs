@@ -10,6 +10,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
+  const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
 
   /**
    * An image whose /SMask supplies its alpha, inside a transparency-group Form.
@@ -74,5 +75,53 @@ try {
   assert.deepEqual([...plainLayer.data].filter((_, index) => index % 4 === 3), [255, 255, 255, 255],
     "an image without a soft mask is unchanged");
 
-  console.log("Retained image soft masks: alpha folded in, foreign mask sizes sampled, pages keep their vectors");
+  // A stencil mask is coverage painted in the current fill colour. Beside the
+  // same transparency-group Form it used to cost the page its vectors, too.
+  const stencilFixture = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: [
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R",
+      "/Resources << /XObject << /St 5 0 R /Fm 7 0 R >> /ExtGState << /G 6 0 R >> >> >>"
+    ].join(" ") },
+    { number: 4, body: tinyPdfStream("", [
+      "q /G gs 0 .5 1 rg 40 0 0 40 10 10 cm /St Do Q",
+      "q 1 0 0 rg 40 0 0 40 50 50 cm /St Do Q q /Fm Do Q"
+    ].join(" ")) },
+    // Zero samples paint: the diagonal of a 2x2 mask.
+    { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true /BitsPerComponent 1",
+      Uint8Array.of(0x40, 0x80)) },
+    { number: 6, body: "<< /ca .5 >>" },
+    { number: 7, body: tinyPdfStream([
+      "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+      "/Group << /S /Transparency /I true >>"
+    ].join(" "), "0 0 1 rg 60 10 20 20 re f") }
+  ] });
+  const stencil = await compile(stencilFixture);
+  assert.equal(stencil.diagnostics.find(d => d.code.endsWith("-fallback")), undefined,
+    "a stencil mask no longer defeats the page's retained lowering");
+  // One mask painted in two colours is two images. The /ca stays on the
+  // group around the first, as in the reference renderer, not in its pixels.
+  assert.deepEqual(stencil.scene.rasterLayers.map(entry => [...entry.data]), [
+    [0, 128, 255, 255, 0, 128, 255, 0, 0, 128, 255, 0, 0, 128, 255, 255],
+    [255, 0, 0, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255]
+  ], "the mask's coverage takes the fill colour of each paint");
+  const translucent = stencil.scene.paintGraph.roots[0].children[0];
+  assert.equal(translucent.alpha, 0.5);
+  assert.equal(stencil.scene.drawRuns[translucent.children[0].runIndex].kind, "raster");
+
+  // Masks share a pixel budget; past it, each averages its coverage down.
+  const session = await openPdf({ kind: "bytes", bytes: stencilFixture, label: "stencil" });
+  try {
+    const page = await session.compilePage(0);
+    const diagnostics = [];
+    const reduced = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal,
+      maxStencilPixels: 2, onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+    assert.deepEqual(reduced.rasterLayers.map(entry => [entry.width, entry.height, ...entry.data]), [
+      [1, 1, 0, 128, 255, 128], [1, 1, 255, 0, 0, 128]
+    ], "a 2x2 diagonal averages to half coverage");
+    assert.equal(diagnostics.find(d => d.code === "image.stencil-resolution-reduced")?.details.pixels, 4);
+  } finally { await session.close(); }
+
+  console.log("Retained images: soft-mask alpha folded in, foreign mask sizes sampled, stencil masks tinted, pages keep their vectors");
 } finally { hooks.deregister(); }

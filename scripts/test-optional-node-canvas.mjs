@@ -72,9 +72,18 @@ try {
 
   const stencilSession = await openPdf({ kind: "bytes", bytes: fixture("stencil") });
   try {
-    await assert.rejects(stencilSession.compileVectorPage(0),
-      error => error.code === "unsupported-content" && /npm install @napi-rs\/canvas/.test(error.message));
+    const attempts = canvasAttempts;
+    const stencil = await stencilSession.compileVectorPage(0);
+    assert.equal(canvasAttempts, attempts, "stencil masks no longer need a canvas backend");
+    assert.equal(stencil.rasterLayers[0].width, 2);
   } finally { await stencilSession.close(); }
+
+  // Only the page raster fallback needs canvas, and its error names the peer.
+  const fallbackSession = await openPdf({ kind: "bytes", bytes: fixture("unrepresentable") });
+  try {
+    await assert.rejects(fallbackSession.compileVectorPage(0),
+      error => error.code === "unsupported-content" && /npm install @napi-rs\/canvas/.test(error.message));
+  } finally { await fallbackSession.close(); }
 
   const processDescriptor = Object.getOwnPropertyDescriptor(globalThis, "process");
   const attemptsBeforeBrowser = canvasAttempts;
@@ -102,7 +111,7 @@ try {
     "raw RGBA is still preferred when it is smaller than the encoded image");
   assert.equal(warnings.length, 1, "working codecs and size-based RGBA selection must not warn");
 
-  const installedSession = await openPdf({ kind: "bytes", bytes: fixture("stencil") });
+  const installedSession = await openPdf({ kind: "bytes", bytes: fixture("unrepresentable") });
   try {
     const scene = await installedSession.compileVectorPage(0, { preserveDrawingOrder: false });
     assert.equal(scene.rasterLayers.length, 1);
@@ -121,9 +130,12 @@ function fixture(raster) {
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>" },
-    { number: 4, body: tinyPdfStream("", raster
-      ? "q 5 5 10 10 re W n 0 20 -20 0 20 0 cm /Im Do Q"
-      : "1 0 0 rg 1 2 3 4 re f") },
+    { number: 4, body: tinyPdfStream("", raster === "unrepresentable"
+      // More straight clip edges than a vector clip holds: only a raster shows it.
+      ? `q 0 0 m ${Array.from({ length: 8400 }, (_, i) => `${(i * 20 / 8400).toFixed(4)} ${i % 2 ? 2 : 1} l`).join(" ")} 20 0 l h W n 1 0 0 rg 0 0 20 20 re f Q`
+      : raster
+        ? "q 5 5 10 10 re W n 0 20 -20 0 20 0 cm /Im Do Q"
+        : "1 0 0 rg 1 2 3 4 re f") },
     { number: 5, body: raster === "stencil"
       ? tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true /BitsPerComponent 1", Uint8Array.of(0, 0))
       : tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8",
