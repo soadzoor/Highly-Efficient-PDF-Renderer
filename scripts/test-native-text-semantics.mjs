@@ -81,9 +81,17 @@ function testTextObjectLegalityAndPersistentState() {
   const openText = compilerFor([]);
   openText.beginText();
   expectPdfError(() => openText.build(), "unsupported-content");
-  const openGraphics = compilerFor([]);
+  // Like the content compiler, unterminated saves expire at the end of the
+  // content and keep the text already shown inside them.
+  const openGraphics = compilerFor([["F1", fontA]]);
   openGraphics.saveGraphicsState();
-  expectPdfError(() => openGraphics.build(), "unsupported-content");
+  openGraphics.concatTransform([2, 0, 0, 2, 0, 0]);
+  openGraphics.applyOperator("BT", []);
+  openGraphics.applyOperator("Tf", ["F1", 10]);
+  openGraphics.applyOperator("Tj", [binaryText(65)]);
+  openGraphics.applyOperator("ET", []);
+  openGraphics.saveGraphicsState();
+  assert.equal(openGraphics.build().glyphs.glyphIds.length, 1);
   expectPdfError(() => compilerFor([]).restoreGraphicsState(), "unsupported-content");
 }
 

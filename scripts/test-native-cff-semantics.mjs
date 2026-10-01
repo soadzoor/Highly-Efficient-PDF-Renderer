@@ -85,6 +85,17 @@ function testBaseFontBlendIsNotMultipleMaster() {
   }
 }
 
+function testLatin1StringsAreAccepted() {
+  // Producers put Latin-1 text such as a copyright sign into Notice or
+  // FullName strings although CFF calls for ASCII.
+  const baseline = NativeCffFont.parse(buildCffFixture());
+  const latin1 = NativeCffFont.parse(buildCffFixture({
+    extraStrings: [Uint8Array.of(0xa9, 0x20, 0x32, 0x30, 0x31, 0x39), Uint8Array.of(0x00, 0x7f, 0xff)]
+  }));
+  assert.deepEqual(latin1.glyphNames, baseline.glyphNames);
+  assert.deepEqual(latin1.getGlyphOutline(1), baseline.getGlyphOutline(1));
+}
+
 function testSyntheticBaseRemainsUnsupported() {
   const syntheticBase = concat(dictInteger(0), Uint8Array.of(12, 20));
   const baseFontBlend = concat(dictInteger(408), dictInteger(-397), Uint8Array.of(12, 23));
@@ -242,7 +253,7 @@ function buildCffFixture(options = {}) {
   ];
   const header = Uint8Array.of(1, 0, 4, 4);
   const nameIndex = cffIndex([ascii("FixtureCff")]);
-  const stringIndex = cffIndex([ascii("fixtureGlyph")]);
+  const stringIndex = cffIndex([ascii("fixtureGlyph"), ...(options.extraStrings ?? [])]);
   const globalSubrsIndex = cffIndex(globalSubrs);
   const encoding = Uint8Array.of(0, 4, 65, 194, 193, 66);
   const charset = Uint8Array.of(0, 0, 34, 0, 125, 0, 171, 1, 135);
@@ -583,6 +594,7 @@ testCffStructureAndType2Outlines();
 testFontMatrixNormalization();
 testBaseFontBlendIsNotMultipleMaster();
 testSyntheticBaseRemainsUnsupported();
+testLatin1StringsAreAccepted();
 await testPdfFontSelectionIsSeparateFromToUnicode();
 await testCidCffOutlinesAndPdfSelection();
 testMalformedProgramsAndLimits();

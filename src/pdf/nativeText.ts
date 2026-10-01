@@ -458,7 +458,9 @@ export class NativeTextCompiler {
   build(): NativeTextCompilation {
     this.checkCancellation();
     if (this.inTextObject) throw invalidText("The PDF content ends inside a BT/ET text object.");
-    if (this.graphicsStack.length !== 0) throw invalidText("The PDF content ends with an unbalanced q/Q stack.");
+    // Like the content compiler, let unterminated saves expire at the end of
+    // the content; viewers routinely accept content that never restores them.
+    this.graphicsStack.length = 0;
     return Object.freeze({
       transforms: { values: Float32Array.from(this.transforms) },
       glyphs: {

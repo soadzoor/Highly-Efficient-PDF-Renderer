@@ -92,16 +92,19 @@ try {
       assert(quad[0] >= grid.pageRects[4] && quad[2] <= grid.pageRects[6]);
       checkSelection(grid, translated, match.query);
     }
+    // Document metadata added beside the paint (annotations, tagged-content
+    // structure and source page records) is outside this paint reference.
+    const metadataKeys = ["annotations", "markedContent", "pdfPages", "structureElements"];
     const reference = {
       sourceSha256: sha(bytes), sourcePageIndex: 4,
       paintHash: sceneFingerprint(Object.fromEntries(Object.entries(scene).filter(([key]) =>
-        !["textIndex", "imageLayerSegmentCount", "sourceSegmentCount",
+        ![...metadataKeys, "textIndex", "imageLayerSegmentCount", "sourceSegmentCount",
           "mergedSegmentCount", "discardedTransparentCount", "discardedDegenerateCount",
           "discardedDuplicateCount", "discardedContainedCount"].includes(key)))),
       // Exact CPU output provided to the unchanged GPU viewer: includes every
       // geometry/text store, clip, transform, image pixel and paint-order value.
       paintAndTextHash: sceneFingerprint(Object.fromEntries(Object.entries(scene).filter(([key]) =>
-        !["imageLayerSegmentCount", "sourceSegmentCount",
+        ![...metadataKeys, "imageLayerSegmentCount", "sourceSegmentCount",
           "mergedSegmentCount", "discardedTransparentCount", "discardedDegenerateCount",
           "discardedDuplicateCount", "discardedContainedCount"].includes(key)))),
       textSha256: sha(scene.textIndex.pages[0].text),

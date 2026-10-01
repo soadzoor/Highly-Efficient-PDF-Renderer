@@ -369,7 +369,10 @@ async function validatesLinearizedForwardLink(
     return typeof linearized === "number" && linearized > 0 &&
       length === reader.byteLength &&
       typeof mainXrefHint === "number" && Number.isSafeInteger(mainXrefHint) &&
-      mainXrefHint >= linkedOffset && mainXrefHint - linkedOffset <= 256 &&
+      // /T names the white space before the main xref's first entry: after
+      // the `xref` header of a table, but often just before the object
+      // header of an xref stream.
+      Math.abs(mainXrefHint - linkedOffset) <= 256 &&
       typeof firstPageEnd === "number" && firstPageEnd > startXref &&
       typeof pageCount === "number" && Number.isSafeInteger(pageCount) && pageCount > 0;
   } catch (error) {

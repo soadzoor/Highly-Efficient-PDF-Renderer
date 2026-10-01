@@ -72,7 +72,10 @@ retaining searchable text. Such pages lose vector sharpness and drawing geometry
 Some unsupported color and gradient behavior is approximated with warnings.
 Use `onDiagnostic` to display these warnings; see [rendering compatibility](api.md#rendering-compatibility-and-diagnostics).
 
-Encrypted documents, unrecoverable malformed resources, resource-limit violations,
+PDFs encrypted with the standard password handler (RC4, AES-128 or AES-256)
+open when they need no password to view, as with documents that only restrict
+permissions. HEPR does not enforce those permission flags. Documents that require
+a password to open, unrecoverable malformed resources, resource-limit violations,
 and features unsupported by both paths can still reject the load. Display load
 errors in your application so users can tell when a document could not be opened.
 

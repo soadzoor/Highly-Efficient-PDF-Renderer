@@ -13,7 +13,8 @@ try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { sceneRequiresPaintCompositing } = await import("../src/scenePaintVisibility.ts");
   const options = { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "empty-group-vectors" }) };
-  for (const content of ["", "q\rQ\r", "\0\t% empty group\r\nq% save\nq\fQ Q % trailing comment"]) {
+  // An unterminated save expires with the content, as viewers accept it.
+  for (const content of ["", "q\rQ\r", "\0\t% empty group\r\nq% save\nq\fQ Q % trailing comment", "q q Q"]) {
     const session = await openPdf({ kind: "bytes", bytes: fixture({ content }) }, options);
     try {
       const scene = await session.compileVectorPage(0, { vectorFallback: "error" });
@@ -42,7 +43,7 @@ try {
       error => error.code === "resource-limit", "empty groups still enforce graphics-state depth");
   } finally { await deep.close(); }
 
-  for (const content of ["qQ", "Q", "q q Q"]) {
+  for (const content of ["qQ", "Q"]) {
     const session = await openPdf({ kind: "bytes", bytes: fixture({ content }) }, options);
     try {
       await assert.rejects(session.compileVectorPage(0, { vectorFallback: "error" }),

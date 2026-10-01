@@ -69,6 +69,7 @@ export const fastTests = [
   "native-parser-boundary",
   "optional-node-canvas",
   "native-pdf-core",
+  "native-encryption",
   "native-document-semantics",
   "native-source-range-edge-cases",
   "native-font-text",

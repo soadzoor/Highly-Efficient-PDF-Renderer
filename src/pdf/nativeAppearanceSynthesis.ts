@@ -224,13 +224,7 @@ export class NativePdfAppearanceSynthesizer {
 
     const geometry = await this.readGeometry(annotation, signal);
     const mk = await this.readAppearanceCharacteristics(annotation, signal);
-    const border = await this.readBorderStyle(annotation, signal);
-    if (border.width > Math.min(geometry.width, geometry.height)) {
-      throw new PdfError("invalid-object", "Widget border width exceeds its appearance bounds.", {
-        pageIndex: annotation.pageIndex,
-        details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
-      });
-    }
+    const border = this.fitBorderWidth(annotation, await this.readBorderStyle(annotation, signal), geometry);
     const defaultAppearance = annotation.widget.defaultAppearance
       ? parseDefaultAppearance(annotation.widget.defaultAppearance.bytes, annotation)
       : { fontResourceName: null, fontSize: 0, color: DEFAULT_COLOR };
@@ -396,16 +390,47 @@ export class NativePdfAppearanceSynthesizer {
     return this.finishSynthesis(annotation, geometry, built.content, built.resources, "empty", optionalContentIndex);
   }
 
+  /**
+   * A border wider than its rectangle is a producer quirk (for example a 1pt
+   * underline on a sub-point link). Narrow it to fit instead of refusing the
+   * page.
+   */
+  private fitBorderWidth<T extends BorderStyle>(
+    annotation: NativePdfAnnotationAppearance,
+    border: T,
+    geometry: { readonly width: number; readonly height: number }
+  ): T {
+    const limit = Math.min(geometry.width, geometry.height);
+    if (border.width <= limit) return border;
+    const diagnostic: PdfDiagnostic = {
+      code: "annotation.appearance-approximated",
+      severity: "warning",
+      pageIndex: annotation.pageIndex,
+      message: `/${annotation.subtype} annotation ${annotation.annotationIndex} border width ` +
+        `${pdfNumber(border.width)} exceeds its ${pdfNumber(geometry.width)}x${pdfNumber(geometry.height)} ` +
+        "rectangle; it was narrowed to fit.",
+      details: {
+        annotationIndex: annotation.annotationIndex,
+        subtype: annotation.subtype,
+        borderWidth: border.width,
+        fittedWidth: limit
+      }
+    };
+    this.diagnostics.push(diagnostic);
+    this.onDiagnostic?.(diagnostic);
+    return { ...border, width: limit };
+  }
+
   private async synthesizeLinkBorder(
     annotation: NativePdfAnnotationAppearance,
     optionalContentIndex: number,
     signal?: AbortSignal
   ): Promise<NativePdfSynthesizedAppearance | null> {
-    const border = await this.readAnnotationBorderStyle(annotation, "Link", signal);
+    const declaredBorder = await this.readAnnotationBorderStyle(annotation, "Link", signal);
     // A zero-width border is explicitly non-painting. It is not an unsupported
     // visible annotation and therefore needs neither a display command nor a
     // synthetic empty Form.
-    if (border.width === 0) return null;
+    if (declaredBorder.width === 0) return null;
     const color = await this.readLinkColor(annotation, signal);
     // ISO 32000 defines an empty /C array as transparent/no colour.
     if (!color) return null;
@@ -434,12 +459,7 @@ export class NativePdfAppearanceSynthesizer {
 
     const geometry = this.readAnnotationGeometry(annotation, "Link");
     if (!geometry) return null;
-    if (border.width > Math.min(geometry.width, geometry.height)) {
-      throw new PdfError("invalid-object", "Link border width exceeds its appearance bounds.", {
-        pageIndex: annotation.pageIndex,
-        details: { annotationIndex: annotation.annotationIndex, feature: "appearance-synthesis" }
-      });
-    }
+    const border = this.fitBorderWidth(annotation, declaredBorder, geometry);
 
     const inset = border.width / 2;
     const innerWidth = geometry.width - border.width;

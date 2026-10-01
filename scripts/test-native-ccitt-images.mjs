@@ -108,9 +108,30 @@ try {
     );
 
     await rejectsCode(images.add(ref(21)), "invalid-object");
-    await rejectsCode(images.add(ref(23)), "unsupported-image");
-    await rejectsCode(images.add(ref(24)), "unsupported-image");
     await rejectsCode(images.add(ref(29)), "unsupported-image");
+
+    // Fax data whose encoded size disagrees with the Image XObject is cropped
+    // or padded with white to the declared size, with a warning.
+    const sizeDiagnostics = [];
+    const adjusted = new NativePdfImageRegistry(document, undefined, {
+      onDiagnostic(diagnostic) { sizeDiagnostics.push(diagnostic); }
+    });
+    const cropped = adjusted.describe(await adjusted.add(ref(23)));
+    assert.deepEqual([...cropped.data], rgbaBits(Array(8).fill(1)), "default 1728 columns crop to /Width");
+    const padded = adjusted.describe(await adjusted.add(ref(24)));
+    assert.deepEqual(
+      [...padded.data],
+      [...rgbaBits([1, 1, 0, 0, 0, 0, 1, 1]), ...rgbaBits(Array(8).fill(1))],
+      "a missing encoded row is padded with white"
+    );
+    assert.deepEqual(
+      sizeDiagnostics.map((diagnostic) => [
+        diagnostic.code,
+        diagnostic.details.decodedColumns,
+        diagnostic.details.decodedRows
+      ]),
+      [["image.ccitt-size-adjusted", 1728, 1], ["image.ccitt-size-adjusted", 8, 1]]
+    );
 
     const extension = images.describe(await images.add(ref(22)));
     assert.equal(extension.format, HEPR_IMAGE_FORMAT.Ccitt);

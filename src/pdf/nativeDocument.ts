@@ -18,6 +18,7 @@ import {
   readDecodeParameters,
   readFilterNames
 } from "./nativeFilters";
+import { PdfSecurityHandler } from "./nativeEncryption";
 import { readIndirectObjectAt } from "./nativeObjects";
 import {
   createPdfRandomAccessReader,
@@ -137,6 +138,7 @@ export class NativePdfDocument {
   private readonly lifetime = new AbortController();
   private readonly reader: PdfRandomAccessReader;
   private readonly repairMalformedStreamFraming: boolean;
+  private readonly security: PdfSecurityHandler | null;
   private objectStreamCacheBytes = 0;
   private closed = false;
 
@@ -148,7 +150,8 @@ export class NativePdfDocument {
     info: NativePdfDocumentInfo,
     limits: Readonly<PdfResourceLimits>,
     diagnostics: PdfDiagnostic[],
-    repairMalformedStreamFraming: boolean
+    repairMalformedStreamFraming: boolean,
+    security: PdfSecurityHandler | null
   ) {
     this.reader = reader;
     this.xref = xref;
@@ -158,6 +161,7 @@ export class NativePdfDocument {
     this.limits = limits;
     this.diagnostics = diagnostics;
     this.repairMalformedStreamFraming = repairMalformedStreamFraming;
+    this.security = security;
   }
 
   static async open(source: PdfSource, options: NativePdfOpenOptions = {}): Promise<NativePdfDocument> {
@@ -183,11 +187,10 @@ export class NativePdfDocument {
         options.signal
       );
       const finishOpen = async (): Promise<NativePdfDocument> => {
-        rejectEncryption(xref);
         // Failed strict bootstraps must not leak partial or duplicate diagnostics
         // into the one repaired attempt.
         const attemptDiagnostics: PdfDiagnostic[] = [];
-        const bootstrap = new NativePdfDocument(
+        const createBootstrap = (security: PdfSecurityHandler | null): NativePdfDocument => new NativePdfDocument(
           reader,
           xref,
           new Map(),
@@ -204,8 +207,17 @@ export class NativePdfDocument {
           },
           limits,
           attemptDiagnostics,
-          (options.repair ?? "safe") === "safe"
+          (options.repair ?? "safe") === "safe",
+          security
         );
+        let security: PdfSecurityHandler | null = null;
+        if (xref.encrypted) {
+          // The encryption dictionary itself is never encrypted, so it is
+          // read through a plain resolver whose cache is then discarded.
+          security = await createBootstrap(null).readSecurityHandler(options.signal);
+          attemptDiagnostics.push(security.diagnostic);
+        }
+        const bootstrap = createBootstrap(security);
         const catalog = await bootstrap.findCatalog(options.signal);
         const version = effectivePdfVersion(
           headerVersion,
@@ -252,7 +264,8 @@ export class NativePdfDocument {
           info,
           limits,
           diagnostics,
-          (options.repair ?? "safe") === "safe"
+          (options.repair ?? "safe") === "safe",
+          security
         );
         // Preserve lazy objects resolved while bootstrapping the catalog/page tree.
         for (const [key, value] of bootstrap.objectCache) document.objectCache.set(key, value);
@@ -537,7 +550,9 @@ export class NativePdfDocument {
           objectNumber: ref.objectNumber
         });
       }
-      return indirect.value;
+      // Compressed objects need no decryption: their object stream was
+      // decrypted when it was loaded through this branch.
+      return this.security ? this.security.decryptObject(indirect.value, ref) : indirect.value;
     }
     const parsed = await this.resolveObjectStream(entry.objectStreamNumber, stack, signal);
     if (parsed.objectNumbersByIndex[entry.objectStreamIndex] !== ref.objectNumber) {
@@ -732,6 +747,47 @@ export class NativePdfDocument {
     if (decodedBytes === undefined) return;
     this.objectStreamCacheByteLengths.delete(objectStreamNumber);
     this.objectStreamCacheBytes -= decodedBytes;
+  }
+
+  private async readSecurityHandler(signal?: AbortSignal): Promise<PdfSecurityHandler> {
+    const value = newestTrailerValue(this.xref.trailers, "Encrypt");
+    const ref = isPdfRef(value) ? value : null;
+    if (ref && this.xref.entries.get(ref.objectNumber)?.kind === "compressed") {
+      throw new PdfError("encrypted", "The PDF encryption dictionary is stored inside an encrypted object stream.", {
+        objectNumber: ref.objectNumber,
+        details: { reason: "compressed-encryption-dictionary" }
+      });
+    }
+    const resolveTree = async (entry: PdfValue | undefined, depth: number): Promise<PdfValue | undefined> => {
+      const resolved = await this.resolveValue(entry, signal);
+      if (depth <= 0 || !isPdfDictionary(resolved)) return resolved;
+      const output: PdfDictionary = new Map();
+      for (const [key, child] of resolved) {
+        const resolvedChild = await resolveTree(child, depth - 1);
+        if (resolvedChild !== undefined) output.set(key, resolvedChild);
+      }
+      return output;
+    };
+    // Depth 3 covers /CF -> filter dictionary -> its entries.
+    const dictionary = await resolveTree(value, 3);
+    if (!isPdfDictionary(dictionary)) {
+      throw new PdfError("encrypted", "The PDF trailer /Encrypt entry is not a dictionary.", {
+        details: { reason: "malformed-encryption-dictionary" }
+      });
+    }
+    // Prefer the /ID written beside the active /Encrypt entry. Rewritten
+    // linearized files can carry a different /ID in another trailer.
+    const encryptTrailer = this.xref.trailers.find((trailer) => trailer.get("Encrypt") === value);
+    const fileIds = new Map<string, Uint8Array>();
+    for (const trailer of encryptTrailer ? [encryptTrailer, ...this.xref.trailers] : this.xref.trailers) {
+      const identifiers = trailer.get("ID");
+      const first = Array.isArray(identifiers) ? identifiers[0] : undefined;
+      if (isPdfString(first)) {
+        const key = binaryString(first.bytes);
+        if (!fileIds.has(key)) fileIds.set(key, first.bytes);
+      }
+    }
+    return PdfSecurityHandler.create({ dictionary, ref, fileIds: [...fileIds.values()] });
   }
 
   private async findCatalog(signal?: AbortSignal): Promise<PdfDictionary> {
@@ -1246,12 +1302,6 @@ async function readPdfHeader(reader: PdfRandomAccessReader, signal?: AbortSignal
     throw new PdfError("invalid-header", `Unsupported PDF header version ${version}.`);
   }
   return version;
-}
-
-function rejectEncryption(xref: NativeXrefResult): void {
-  if (xref.encrypted) {
-    throw new PdfError("encrypted", "Encrypted PDFs are not supported, including empty-password encryption.");
-  }
 }
 
 function isRepairableBootstrapError(error: unknown): boolean {

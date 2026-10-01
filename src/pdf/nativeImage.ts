@@ -24,6 +24,7 @@ import {
 import {
   PdfError,
   throwIfAborted,
+  type PdfDiagnostic,
   type PdfResourceLimits
 } from "./nativeTypes";
 import {
@@ -73,6 +74,13 @@ export interface NativeImageCodecRequest {
   readonly encoded: Uint8Array;
   readonly globals: Uint8Array;
   readonly decodeParameters: Readonly<Record<string, CodecMetadataValue>>;
+  /**
+   * When present, the codec may decode at `ceil(width / factor)` by
+   * `ceil(height / factor)` for a power-of-two factor up to this value, when
+   * the full-resolution decode would exceed its memory limits. HEPR reports
+   * such a reduction as a diagnostic. Without it, output must match exactly.
+   */
+  readonly maxReduction?: number;
 }
 
 /**
@@ -114,6 +122,8 @@ export interface NativePdfImageOptions {
   readonly trustedCodecResolver?: boolean;
   /** Per-compilation ceilings, which may only lower the session limits. */
   readonly limits?: Partial<Pick<PdfResourceLimits, "maxDecodedStreamBytes">>;
+  /** Receives warnings when an image is decoded with an approximation. */
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
 export interface NativePdfImageDescription {
@@ -152,6 +162,8 @@ const CODEC_IDS: Readonly<Record<NativeImageCodec, number>> = {
   jbig2: 3,
   ccitt: 4
 };
+/** Largest power-of-two resolution reduction a codec may apply to fit limits. */
+const MAX_CODEC_REDUCTION = 8;
 const CODECS_BY_ID: Readonly<Record<number, NativeImageCodec>> = {
   1: "jpeg",
   2: "jpeg2000",
@@ -169,6 +181,7 @@ export class NativePdfImageRegistry {
   private readonly codecResolver?: NativeImageCodecResolver;
   private readonly trustedCodecResolver: boolean;
   private readonly codecDecodedByteLimit: number;
+  private readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   private readonly records: NativePdfImageDescription[] = [];
   private readonly requests: NativeImageCodecRequest[] = [];
   private readonly refCache = new Map<string, Promise<number>>();
@@ -187,6 +200,7 @@ export class NativePdfImageRegistry {
     this.onCodecRequest = options.onCodecRequest;
     this.codecResolver = options.codecResolver;
     this.trustedCodecResolver = options.trustedCodecResolver === true;
+    this.onDiagnostic = options.onDiagnostic;
     this.codecDecodedByteLimit = Math.min(
       document.limits.maxDecodedStreamBytes,
       options.limits?.maxDecodedStreamBytes ?? document.limits.maxDecodedStreamBytes
@@ -452,6 +466,10 @@ export class NativePdfImageRegistry {
     let data: Uint8Array | null = null;
     let format: number | null = null;
     let codecRequest: NativeImageCodecRequest | null = null;
+    // A codec may reduce the resolution of a huge image; the image still
+    // spans the same unit square, so only its sample grid changes.
+    let decodedWidth = width;
+    let decodedHeight = height;
     if (terminalCodec) {
       const encoded = terminalIndex === 0
         ? value.bytes
@@ -471,51 +489,63 @@ export class NativePdfImageRegistry {
               { details: { componentCount } }
             );
           }
-          validateImageWorkingSet(
-            this.document,
-            width,
-            height,
-            1,
-            bitsPerComponent
-          );
           const ccittParameters = normalizeCcittDecodeParameters(
             decodeParameters[terminalIndex]
           );
-          validateCcittImageDimensions(
+          const encodedSize = readCcittEncodedSize(
             this.document,
             ccittParameters,
             width,
             height
+          );
+          validateImageWorkingSet(
+            this.document,
+            Math.max(width, encodedSize.columns),
+            Math.max(height, encodedSize.rows),
+            1,
+            bitsPerComponent
           );
           const ccitt = decodeNativeCcittFax(
             encoded,
             ccittParameters,
             {
               signal,
-              limits: imageCcittLimits(this.document, width, height)
+              limits: imageCcittLimits(this.document, encodedSize.columns, encodedSize.rows)
             }
           );
-          if (ccitt.columns !== width || ccitt.rows !== height) {
-            throw new PdfError(
-              "unsupported-image",
-              "CCITTFaxDecode dimensions disagree with the Image XObject.",
-              {
-                details: {
-                  imageWidth: width,
-                  imageHeight: height,
-                  decodedColumns: ccitt.columns,
-                  decodedRows: ccitt.rows
-                }
-              }
-            );
-          }
-          const normalizedBytes = normalizeCcittBlackPolarity(
+          let normalizedBytes = normalizeCcittBlackPolarity(
             ccitt.bytes,
             ccitt.columns,
             ccitt.rows,
             ccitt.blackIs1,
             signal
           );
+          // Producers occasionally encode a few more or fewer columns or rows
+          // than the Image XObject declares. Other viewers read the declared
+          // size from the decoded rows, so crop or pad with white to match.
+          if (ccitt.columns !== width || ccitt.rows !== height) {
+            normalizedBytes = fitPackedBitmap(
+              normalizedBytes,
+              ccitt.columns,
+              ccitt.rows,
+              width,
+              height,
+              signal
+            );
+            this.onDiagnostic?.({
+              code: "image.ccitt-size-adjusted",
+              severity: "warning",
+              message:
+                `CCITTFaxDecode data is ${ccitt.columns}x${ccitt.rows} pixels but the image is ` +
+                `${width}x${height}; it was cropped or padded with white to fit.`,
+              details: {
+                imageWidth: width,
+                imageHeight: height,
+                decodedColumns: ccitt.columns,
+                decodedRows: ccitt.rows
+              }
+            });
+          }
           const samples = unpackImageSamples(
             normalizedBytes,
             width,
@@ -586,6 +616,11 @@ export class NativePdfImageRegistry {
         }
         const requestEncoded = copyBytes(encoded, "owned image codec input");
         const requestGlobals = copyBytes(globals, "owned image codec globals");
+        // The package-owned JPEG codec can decode huge images at 1/2, 1/4 or
+        // 1/8 scale instead of failing. A Matte soft mask must keep the
+        // parent's exact dimensions, so it pins full resolution.
+        const reducible = terminalCodec === "jpeg" && this.trustedCodecResolver &&
+          !!this.codecResolver && mask.matte.length === 0;
         codecRequest = Object.freeze({
           codec: terminalCodec,
           width,
@@ -597,7 +632,8 @@ export class NativePdfImageRegistry {
           imageMask,
           encoded: requestEncoded,
           globals: requestGlobals,
-          decodeParameters: metadata
+          decodeParameters: metadata,
+          ...(reducible ? { maxReduction: MAX_CODEC_REDUCTION } : {})
         });
         let unresolvedPayload: Uint8Array | null = null;
         if (!this.codecResolver) {
@@ -628,7 +664,12 @@ export class NativePdfImageRegistry {
           // focused codec is allowed to allocate native or WASM output. JPX
           // may own its sample layout (zero components/precision), so its
           // result receives the same validation after resolution below.
-          if (codecRequest.components > 0 && codecRequest.bitsPerComponent > 0) {
+          // A reducible request is bounded by the codec, which picks a
+          // resolution that fits, and by the result validation below.
+          if (
+            codecRequest.components > 0 && codecRequest.bitsPerComponent > 0 &&
+            codecRequest.maxReduction === undefined
+          ) {
             validateImageWorkingSet(
               this.document,
               codecRequest.width,
@@ -661,10 +702,28 @@ export class NativePdfImageRegistry {
             signal
           );
           sourceBitsPerComponent = resolved.bitsPerComponent;
+          if (resolved.width !== width || resolved.height !== height) {
+            decodedWidth = resolved.width;
+            decodedHeight = resolved.height;
+            this.onDiagnostic?.({
+              code: "image.resolution-reduced",
+              severity: "warning",
+              message:
+                `A ${width}x${height} ${terminalCodec} image exceeds the decode memory limit; ` +
+                `it was decoded at ${decodedWidth}x${decodedHeight}.`,
+              details: {
+                codec: terminalCodec,
+                width,
+                height,
+                decodedWidth,
+                decodedHeight
+              }
+            });
+          }
           const decodedSamples = unpackImageSamples(
             resolved.samples,
-            width,
-            height,
+            decodedWidth,
+            decodedHeight,
             resolved.components,
             resolved.bitsPerComponent,
             signal
@@ -681,8 +740,8 @@ export class NativePdfImageRegistry {
             const separated = embeddedSoftMask.value === 1
               ? separateEmbeddedOpacity(
                   decodedSamples,
-                  width,
-                  height,
+                  decodedWidth,
+                  decodedHeight,
                   componentCount,
                   signal
                 )
@@ -693,8 +752,8 @@ export class NativePdfImageRegistry {
               : decode;
             const converted = convertSamplesToSrgb(
               separated.colors,
-              width,
-              height,
+              decodedWidth,
+              decodedHeight,
               resolved.bitsPerComponent,
               effectiveDecode,
               colorKeyMask,
@@ -762,8 +821,8 @@ export class NativePdfImageRegistry {
       throw new PdfError("invalid-object", "Image decoding produced no pixel payload.");
     }
     const record: NativePdfImageDescription = Object.freeze({
-      width,
-      height,
+      width: decodedWidth,
+      height: decodedHeight,
       sourceBitsPerComponent,
       format,
       colorSpaceIndex,
@@ -875,6 +934,8 @@ export class NativePdfImageRegistry {
 /**
  * Unpack packed PDF image rows. Each row starts at a byte boundary, including
  * 1/2/4-bpc images; returned values retain their exact integer precision.
+ * 8-bit rows have no padding and are already one sample per byte, so they are
+ * returned as the input view itself; callers treat samples as read-only.
  */
 export function unpackImageSamples(
   bytes: Uint8Array,
@@ -883,7 +944,7 @@ export function unpackImageSamples(
   componentCount: number,
   bitsPerComponent: number,
   signal?: AbortSignal
-): Uint16Array {
+): ImageSamples {
   throwIfAborted(signal);
   if (
     !Number.isSafeInteger(width) || width <= 0 ||
@@ -909,16 +970,9 @@ export function unpackImageSamples(
       details: { expectedBytes: required, actualBytes: bytes.length }
     });
   }
+  // Widening 8-bit samples to 16 bits would only double the image's memory.
+  if (bitsPerComponent === 8) return bytes;
   const output = allocateSamples(sampleCount);
-  // Byte-aligned samples have no row padding. Keep exact unsigned precision
-  // without visiting every bit, and bound the work between cancellation checks.
-  if (bitsPerComponent === 8) {
-    for (let offset = 0; offset < sampleCount; offset += 4096) {
-      throwIfAborted(signal);
-      output.set(bytes.subarray(offset, Math.min(offset + 4096, sampleCount)), offset);
-    }
-    return output;
-  }
   if (bitsPerComponent === 16) {
     for (let sample = 0; sample < sampleCount; sample += 1) {
       if ((sample & 0xfff) === 0) throwIfAborted(signal);
@@ -926,19 +980,18 @@ export function unpackImageSamples(
     }
     return output;
   }
+  // 1/2/4-bit samples never straddle a byte: shift each byte's samples out,
+  // most significant first, and drop the row's padding bits.
+  const sampleMask = (1 << bitsPerComponent) - 1;
   let outputOffset = 0;
   for (let row = 0; row < height; row += 1) {
     throwIfAborted(signal);
-    const rowOffset = row * rowBytes;
-    let bitOffset = 0;
-    for (let sample = 0; sample < samplesPerRow; sample += 1) {
-      if ((sample & 0xfff) === 0) throwIfAborted(signal);
-      let value = 0;
-      for (let bit = 0; bit < bitsPerComponent; bit += 1) {
-        const absolute = rowOffset * 8 + bitOffset++;
-        value = (value << 1) | ((bytes[absolute >>> 3] >>> (7 - (absolute & 7))) & 1);
+    const rowEnd = outputOffset + samplesPerRow;
+    for (let byteOffset = row * rowBytes; outputOffset < rowEnd; byteOffset += 1) {
+      const byte = bytes[byteOffset];
+      for (let shift = 8 - bitsPerComponent; shift >= 0 && outputOffset < rowEnd; shift -= bitsPerComponent) {
+        output[outputOffset++] = (byte >>> shift) & sampleMask;
       }
-      output[outputOffset++] = value;
     }
   }
   return output;
@@ -1064,7 +1117,10 @@ async function resolveCodecThroughCaller(
   ) {
     throw invalidCodecResult(request.codec, "The image codec resolver returned invalid sample metadata.");
   }
-  if (raw.width !== request.width || raw.height !== request.height) {
+  if (
+    (raw.width !== request.width || raw.height !== request.height) &&
+    !isAllowedCodecReduction(request, raw.width, raw.height)
+  ) {
     throw invalidCodecResult(
       request.codec,
       "The image codec resolver returned dimensions that disagree with the Image XObject.",
@@ -1145,8 +1201,22 @@ function invalidCodecResult(
   });
 }
 
+function isAllowedCodecReduction(
+  request: Readonly<NativeImageCodecRequest>,
+  width: number,
+  height: number
+): boolean {
+  const maxReduction = request.maxReduction ?? 1;
+  for (let factor = 2; factor <= maxReduction; factor *= 2) {
+    if (width === Math.ceil(request.width / factor) && height === Math.ceil(request.height / factor)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function separateEmbeddedOpacity(
-  samples: Uint16Array,
+  samples: ImageSamples,
   width: number,
   height: number,
   colorComponents: number,
@@ -1216,25 +1286,29 @@ function validateColorKeyMaskPrecision(
 }
 
 function convertStencilMask(
-  samples: Uint16Array,
+  samples: ImageSamples,
   decode: readonly number[],
   bitsPerComponent: number,
   signal?: AbortSignal
 ): Uint8Array {
   const maximum = (2 ** bitsPerComponent) - 1;
-  const output = allocateBytes(samples.length, "stencil image output");
-  for (let index = 0; index < samples.length; index += 1) {
-    if ((index & 0xfff) === 0) throwIfAborted(signal);
-    const sample = samples[index];
+  // Every sample value takes the same Decode mapping; tabulate it once.
+  const coverage = new Uint8Array(maximum + 1);
+  for (let sample = 0; sample <= maximum; sample += 1) {
     const decoded = interpolate(sample / maximum, 0, 1, decode[0], decode[1]);
     // In a PDF stencil image, zero selects the current paint by default.
-    output[index] = Math.round((1 - clamp01(decoded)) * 255);
+    coverage[sample] = Math.round((1 - clamp01(decoded)) * 255);
+  }
+  const output = allocateBytes(samples.length, "stencil image output");
+  for (let index = 0; index < samples.length; index += 1) {
+    if ((index & 0xffff) === 0) throwIfAborted(signal);
+    output[index] = coverage[samples[index]];
   }
   return output;
 }
 
 function convertSamplesToSrgb(
-  samples: Uint16Array,
+  samples: ImageSamples,
   width: number,
   height: number,
   bitsPerComponent: number,
@@ -1313,7 +1387,7 @@ function convertSamplesToSrgb(
  * channel and yields GrayAlpha8; without one, coverage is implicit.
  */
 function convertDeviceGraySamplesToSrgb8(
-  samples: Uint16Array,
+  samples: ImageSamples,
   pixelCount: number,
   decode: readonly number[],
   colorKeyMask: readonly number[],
@@ -1346,7 +1420,7 @@ function convertDeviceGraySamplesToSrgb8(
 
 /** Validated device-image samples need no per-pixel graph traversal or allocation. */
 function convertDeviceSamplesToSrgb8(
-  samples: Uint16Array,
+  samples: ImageSamples,
   output: Uint8Array,
   componentCount: number,
   decode: readonly number[],
@@ -1522,12 +1596,17 @@ function requireCcittBoolean(name: string, value: PdfValue): boolean {
   return value;
 }
 
-function validateCcittImageDimensions(
+/**
+ * The encoded fax size bounds the decoder. /Columns and a positive /Rows
+ * describe the encoded data exactly; Rows=0 means unknown and is resolved
+ * from RTC/EOFB or physical EOD, bounded by the image /Height.
+ */
+function readCcittEncodedSize(
   document: NativePdfDocument,
   parameters: NativeCcittParameters,
   width: number,
   height: number
-): void {
+): { readonly columns: number; readonly rows: number } {
   const columns = parameters.Columns ?? 1728;
   const rows = parameters.Rows ?? 0;
   // Leave invalid signs to the kernel so malformed DecodeParms keep their
@@ -1541,18 +1620,38 @@ function validateCcittImageDimensions(
       }
     });
   }
-  if (columns > 0 && columns !== width) {
-    throw new PdfError("unsupported-image", "CCITTFaxDecode /Columns disagrees with Image /Width.", {
-      details: { columns, width }
-    });
+  return {
+    columns: columns > 0 ? columns : width,
+    rows: rows > 0 ? rows : height
+  };
+}
+
+/** Crop or white-pad a packed 1-bit bitmap (one = white) to a new size. */
+function fitPackedBitmap(
+  source: Uint8Array,
+  sourceColumns: number,
+  sourceRows: number,
+  columns: number,
+  rows: number,
+  signal?: AbortSignal
+): Uint8Array {
+  const sourceStride = Math.ceil(sourceColumns / 8);
+  const stride = Math.ceil(columns / 8);
+  const output = new Uint8Array(stride * rows).fill(0xff);
+  const copiedColumns = Math.min(sourceColumns, columns);
+  const wholeBytes = copiedColumns >>> 3;
+  const tailBits = copiedColumns & 7;
+  const tailMask = (0xff << (8 - tailBits)) & 0xff;
+  for (let row = 0; row < Math.min(sourceRows, rows); row += 1) {
+    if ((row & 0x3ff) === 0) throwIfAborted(signal);
+    const sourceStart = row * sourceStride;
+    const start = row * stride;
+    output.set(source.subarray(sourceStart, sourceStart + wholeBytes), start);
+    if (tailBits !== 0) {
+      output[start + wholeBytes] = (source[sourceStart + wholeBytes] & tailMask) | (~tailMask & 0xff);
+    }
   }
-  // Rows=0 means unknown and is resolved from RTC/EOFB or physical EOD. A
-  // positive Rows value is an exact encoded height and must match /Height.
-  if (rows > 0 && rows !== height) {
-    throw new PdfError("unsupported-image", "CCITTFaxDecode /Rows disagrees with Image /Height.", {
-      details: { rows, height }
-    });
-  }
+  return output;
 }
 
 function imageCcittLimits(
@@ -2069,7 +2168,8 @@ function validateImageWorkingSet(
   const pixels = width * height;
   const rowBytes = Math.ceil(width * componentCount * bitsPerComponent / 8);
   const packedBytes = rowBytes * height;
-  const sampleBytes = pixels * componentCount * 2;
+  // 8-bit samples are used in place; other precisions widen to 16 bits.
+  const sampleBytes = bitsPerComponent === 8 ? 0 : pixels * componentCount * 2;
   const outputBytes = pixels * 4 * (bitsPerComponent === 16 ? 2 : 1);
   const limit = maxDecodedStreamBytes;
   if (
@@ -2107,6 +2207,9 @@ function allocateTypedArray<T>(
     });
   }
 }
+
+/** Unpacked image samples; 8-bit samples keep their byte storage. */
+type ImageSamples = Uint8Array | Uint16Array;
 
 function allocateSamples(length: number): Uint16Array {
   return allocateTypedArray(Uint16Array, length, "unpacked image samples");

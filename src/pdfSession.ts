@@ -7336,7 +7336,8 @@ async function loadPageImages(
     codecPolicy: "request",
     codecResolver: imageCodecResolver ?? createBundledImageCodecResolver(codecDecodedByteLimit),
     trustedCodecResolver: usesBundledCodec,
-    limits
+    limits,
+    onDiagnostic
   });
   const shadings = new NativePdfShadingRegistry(document, colors);
   const patterns = new NativePdfPatternRegistry(document, shadings);

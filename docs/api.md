@@ -913,6 +913,8 @@ text, and retained replay resources, with no source PDF needed when reopening it
 | `compositing-approximation` | Unsupported group/stroke behavior was approximated for screen output. |
 | `gradient-approximation` | Adaptive gradient sampling reached its depth limit before meeting the color tolerance. |
 | `extgstate-approximation` | A print color/halftone setting or nonidentity transfer function was omitted for screen output. |
+| `image.resolution-reduced` | An image too large to decode within the stream limit was decoded at 1/2, 1/4, or 1/8 resolution. |
+| `image.ccitt-size-adjusted` | Fax image data had more or fewer columns or rows than the image declares; it was cropped or padded with white. |
 
 Stitching-function boundaries are sampled as hard color transitions. Gradient
 color-tolerance misses are nonfatal, but stop-count and other hard resource limits

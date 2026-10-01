@@ -439,7 +439,8 @@ function testBinaryHmtxNormalizationFixtures() {
       numberOfHMetrics: 2,
       actualLength: 8,
       expectedLength: 10,
-      recoveredBearingCount: 1
+      recoveredBearingCount: 1,
+      exact: true
     }
   });
 
@@ -470,11 +471,13 @@ function testBinaryHmtxNormalizationFixtures() {
     missingInvariantView.getUint16(missingInvariantHead.offset + 16, false) & ~0x0002,
     false
   );
-  expectPdf(
-    () => NativeSfntFont.parse(missingInvariant, 0, undefined, "pdf-embedded"),
-    "unsupported-font",
-    /hhea\/hmtx/i
-  );
+  // Without head.flags bit 1, xMin is still the best available bearing; the
+  // outline is unaffected, so the font is used with an approximation warning.
+  const approximated = NativeSfntFont.parse(missingInvariant, 0, undefined, "pdf-embedded");
+  assert.deepEqual(approximated.getHorizontalMetric(2), { advanceWidth: 600, leftSideBearing: 50 });
+  assert.deepEqual(approximated.getGlyphOutline(2).bounds, [50, 0, 150, 100]);
+  assert.equal(approximated.diagnostics[0]?.details?.exact, false);
+  assert.match(approximated.diagnostics[0]?.message ?? "", /approximated by glyph xMin/);
 
   const missingLongMetricTables = cloneTables(buildFixture().tables);
   const missingLongMetricHead = new DataView(missingLongMetricTables.get("head").buffer);

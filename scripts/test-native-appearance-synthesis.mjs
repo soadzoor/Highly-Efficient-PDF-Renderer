@@ -182,7 +182,7 @@ async function testLinkAppearanceSynthesis() {
       onDiagnostic: (diagnostic) => emitted.push(diagnostic)
     });
     const annotations = await registry.listPageAnnotations(0);
-    assert.equal(annotations.length, 8);
+    assert.equal(annotations.length, 9);
 
     assert.equal(
       await resolveNativePdfAnnotationAppearanceWithSynthesis(
@@ -274,9 +274,23 @@ async function testLinkAppearanceSynthesis() {
       "a zero-width /BS takes precedence over otherwise painting or unsupported border entries"
     );
 
-    assert.equal(emitted.length, 3);
+    // A producer's 1pt underline on a sub-point link is narrowed to fit
+    // rather than failing the page.
+    const narrow = await resolveNativePdfAnnotationAppearanceWithSynthesis(
+      registry,
+      synthesizer,
+      annotations[8]
+    );
+    assert(narrow?.synthesized);
+    assert.match(decoder.decode(narrow.decodedContent), /0\.67 w/);
+    const fitted = emitted.find((diagnostic) => diagnostic.code === "annotation.appearance-approximated");
+    assert.equal(fitted?.details?.borderWidth, 1);
+    assert.ok(Math.abs(fitted?.details?.fittedWidth - 0.67) < 1e-9);
+
+    assert.equal(emitted.length, 5);
     assert.ok(emitted.every((diagnostic) =>
-      diagnostic.code === "annotation.appearance-synthesized" &&
+      (diagnostic.code === "annotation.appearance-synthesized" ||
+        diagnostic.code === "annotation.appearance-approximated") &&
       diagnostic.details?.subtype === "Link"
     ));
   } finally {
@@ -293,7 +307,7 @@ function linkFixture() {
         number: 3,
         body: [
           "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Resources << >>",
-          "/Annots [10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R 16 0 R 17 0 R] >>"
+          "/Annots [10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R 16 0 R 17 0 R 18 0 R] >>"
         ].join(" ")
       },
       { number: 10, body: "<< /Type /Annot /Subtype /Link /Rect [0 0 40 20] /Border [0 0 0] >>" },
@@ -306,7 +320,8 @@ function linkFixture() {
       { number: 14, body: "<< /Type /Annot /Subtype /Link /Rect [180 0 220 20] >>" },
       { number: 15, body: "<< /Type /Annot /Subtype /Link /Rect [0 30 40 50] /BS << /W 1 /S /B >> /C [0 0 1] >>" },
       { number: 16, body: "<< /Type /Annot /Subtype /Link /Rect [45 30 85 50] /Border [0 0 1] /C [0 0 1] /CA 0.5 >>" },
-      { number: 17, body: "<< /Type /Annot /Subtype /Link /Rect [90 30 130 50] /Border [0 0 2] /BS << /W 0 /S /B >> /C [2] >>" }
+      { number: 17, body: "<< /Type /Annot /Subtype /Link /Rect [90 30 130 50] /Border [0 0 2] /BS << /W 0 /S /B >> /C [2] >>" },
+      { number: 18, body: "<< /Type /Annot /Subtype /Link /Rect [140 30 140.67 31.81] /BS << /W 1 /S /U >> /C [0 0 1] >>" }
     ]
   });
 }

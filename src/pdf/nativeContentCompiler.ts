@@ -4307,7 +4307,8 @@ class DenseContentCompiler {
     sourceLength = -1,
     operator: "Do" | "BI" = "Do"
   ): void {
-    if (!this.state.clipBounds) return;
+    // An image under an empty clip intersection paints nothing.
+    if (!isNonEmptyBounds(this.state.clipBounds)) return;
     if (!this.policy.displayProgram && this.policy.vectorScene !== true) return;
     if (
       !Number.isSafeInteger(imageIndex) || imageIndex < 0 || imageIndex > 0xffff_ffff ||

@@ -600,7 +600,8 @@ async function testSeparationAndDeviceN() {
 
   const all = await colors.add(separation("All", name("DeviceRGB"), tint));
   const none = await colors.add(separation("None", name("DeviceRGB"), tint));
-  throwsCode(() => colors.convertToSrgb(all, [1]), "unsupported-color");
+  // Registration /All shows through its tint transform like any spot color.
+  closeRgb(colors.convertToSrgb(all, [1]), [0, 0, 1]);
   throwsCode(() => colors.convertToSrgb(none, [1]), "unsupported-color");
 
   const duoFunction = calculator("{ pop dup dup }", 2, 3);

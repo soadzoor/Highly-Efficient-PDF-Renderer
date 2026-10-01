@@ -211,6 +211,19 @@ async function testCompilationContexts() {
     ], "normal page and Form output preserve text/fill/image overlap order");
   }
 
+  // An image under an empty clip intersection paints nothing; it must not
+  // reach the image sidecar with an inverted clip rectangle.
+  for (const compiler of [compileDensePdfContent, compileVectorFormContent]) {
+    const emptyClip = await compile(
+      "q 0 0 10 10 re W n 50 50 10 10 re W n 2 0 0 2 0 0 cm /Im0 Do Q /Im0 Do",
+      { ...options, output: "vector-scene" },
+      compiler
+    );
+    assert.deepEqual([...emptyClip.vectorSceneData.imageIndices], [0]);
+    assert.deepEqual([...emptyClip.vectorSceneData.imageTransforms], [1, 0, 0, 1, 0, 0]);
+    assert.deepEqual([...emptyClip.vectorSceneData.imageClipBounds], [-1_000, -1_000, 1_000, 1_000]);
+  }
+
   const clip = "0 0 m 10 0 l 5 10 l h W n 0 0 10 10 re f";
   for (const compiler of [compileDensePdfContent, compileVectorFormContent]) {
     const clipped = await compile(clip, { output: "vector-scene" }, compiler);

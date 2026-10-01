@@ -159,13 +159,13 @@ export class NativeCffFont {
     }
     const stringsIndex = reader.readIndex(topIndexes.end, "String INDEX");
     let stringBytes = 0;
-    const customStrings = stringsIndex.objects.map((bytes, index) => {
+    const customStrings = stringsIndex.objects.map((bytes) => {
       stringBytes = checkedAdd(stringBytes, bytes.length, "CFF String INDEX bytes");
       if (stringBytes > limits.maxCffStringBytes) {
         throw cffLimit("The CFF String INDEX exceeds the configured byte limit.",
           "cff-string-byte-limit", limits.maxCffStringBytes);
       }
-      return readCffString(bytes, `CFF String INDEX entry ${index}`);
+      return readCffString(bytes);
     });
     const globalSubrsIndex = reader.readIndex(stringsIndex.end, "Global Subrs INDEX");
     const top = parseCffDict(topIndexes.objects[0], "Top DICT", TOP_DICT_OPERATORS);
@@ -1801,14 +1801,14 @@ function readCffName(bytes: Uint8Array, label: string): string {
   return result;
 }
 
-function readCffString(bytes: Uint8Array, label: string): string {
+/**
+ * The CFF specification calls for ASCII strings, but producers routinely put
+ * Latin-1 text such as a copyright sign into Notice or FullName. Strings that
+ * name glyphs are validated where they are used as names.
+ */
+function readCffString(bytes: Uint8Array): string {
   let result = "";
-  for (const byte of bytes) {
-    if (byte < 32 || byte > 126) {
-      throw cffUnsupported(`${label} contains a non-ASCII byte.`, "cff-string");
-    }
-    result += String.fromCharCode(byte);
-  }
+  for (const byte of bytes) result += String.fromCharCode(byte);
   return result;
 }
 

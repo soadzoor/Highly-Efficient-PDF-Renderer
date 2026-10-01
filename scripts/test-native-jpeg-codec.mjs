@@ -212,9 +212,75 @@ try {
 
   await verifyCodecPreflightLimit(openPdf, jpegPdfFixture(rgb, 64, 64));
   await verifyBundledAggregateLimit(openPdf, pdf);
+  await verifyReducedResolution(createBundledImageCodecResolver, openPdf);
   console.log("Bundled native JPEG codec tests passed.");
 } finally {
   hooks.deregister();
+}
+
+async function verifyReducedResolution(createBundledImageCodecResolver, openPdf) {
+  // A 1024x1024 RGB decode needs about 14 MiB of working set; half
+  // resolution needs under 5 MiB. A reducible request decodes at 1/2 scale.
+  const limit = 6 * 1024 * 1024;
+  const large = flatJpeg(1024, 1024, 3);
+  const largeRequest = request(large, 3, 1024, 1024);
+  await assert.rejects(
+    createBundledImageCodecResolver(limit)(largeRequest),
+    (error) => error?.code === "resource-limit" && error.details?.reason === "jpeg-aggregate-working-set",
+    "without maxReduction the codec still decodes only at full resolution"
+  );
+  // 8-bit samples are no longer widened to 16 bits, so a working set that
+  // only fitted without that copy now decodes at full resolution.
+  const full = await createBundledImageCodecResolver(16 * 1024 * 1024)({ ...largeRequest, maxReduction: 8 });
+  assert.equal(full.width, 1024);
+  assert.equal(full.height, 1024);
+  const reduced = await createBundledImageCodecResolver(limit)({ ...largeRequest, maxReduction: 8 });
+  assert.equal(reduced.width, 512);
+  assert.equal(reduced.height, 512);
+  assert.equal(reduced.samples.length, 512 * 512 * 3);
+  assert.ok(reduced.samples.every((sample) => sample === 128), "IDCT scaling preserves the flat image");
+
+  const diagnostics = [];
+  const session = await openPdf(
+    { kind: "bytes", bytes: jpegPdfFixture(large, 1024, 1024) },
+    { limits: { maxDecodedStreamBytes: limit }, onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) }
+  );
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    assert.equal(page.stores.images.widths[0], 512);
+    assert.equal(page.stores.images.heights[0], 512);
+    const reduction = diagnostics.find((diagnostic) => diagnostic.code === "image.resolution-reduced");
+    assert.equal(reduction?.severity, "warning");
+    assert.deepEqual(
+      [reduction?.details?.width, reduction?.details?.decodedWidth, reduction?.details?.decodedHeight],
+      [1024, 512, 512]
+    );
+  } finally {
+    await session.close();
+  }
+}
+
+/** A baseline JPEG whose blocks all have a zero DC difference and no AC terms. */
+function flatJpeg(width, height, components) {
+  const segment = (marker, payload) =>
+    [0xff, marker, (payload.length + 2) >> 8, (payload.length + 2) & 0xff, ...payload];
+  // One 1-bit code ("0") for symbol 0: DC category 0, or AC end-of-block.
+  const huffman = (tableClass) => [tableClass << 4, 1, ...Array(15).fill(0), 0];
+  const ids = Array.from({ length: components }, (_, index) => index + 1);
+  const bits = Math.ceil(width / 8) * Math.ceil(height / 8) * components * 2;
+  const scan = new Uint8Array(Math.ceil(bits / 8));
+  if (bits % 8 !== 0) scan[scan.length - 1] = 0xff >> (bits % 8);
+  return Uint8Array.from([
+    0xff, 0xd8,
+    ...segment(0xdb, [0, ...Array(64).fill(1)]),
+    ...segment(0xc0, [8, height >> 8, height & 0xff, width >> 8, width & 0xff, components,
+      ...ids.flatMap((id) => [id, 0x11, 0])]),
+    ...segment(0xc4, huffman(0)),
+    ...segment(0xc4, huffman(1)),
+    ...segment(0xda, [components, ...ids.flatMap((id) => [id, 0x00]), 0, 63, 0]),
+    ...scan,
+    0xff, 0xd9
+  ]);
 }
 
 async function verifyPinnedAsset(asset) {

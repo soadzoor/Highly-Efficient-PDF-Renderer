@@ -152,7 +152,7 @@ async function resolveBundledImageCodecWithLimit(
   }
   validateRequest(request);
   const decodePlan = preflightJpeg(request, signal);
-  validateAggregateWorkingSet(request, decodePlan, maxAggregateBytes);
+  const reduction = chooseJpegReduction(request, decodePlan, maxAggregateBytes);
 
   let module: WebAssembly.Module;
   try {
@@ -176,13 +176,14 @@ async function resolveBundledImageCodecWithLimit(
   }
   throwIfAborted(signal);
 
-  return decodeJpeg(instance, request, decodePlan, signal);
+  return decodeJpeg(instance, request, decodePlan, reduction, signal);
 }
 
 function decodeJpeg(
   instance: WebAssembly.Instance,
   request: Readonly<NativeImageCodecRequest>,
   decodePlan: Readonly<JpegDecodePlan>,
+  reduction: number,
   signal?: AbortSignal
 ): NativeImageCodecResult {
   const exports = readTurboJpegExports(instance);
@@ -217,12 +218,21 @@ function decodeJpeg(
       throw jpegError("The JPEG header is malformed.", "invalid-jpeg-header");
     }
     const metadata = new DataView(exports.memory.buffer, metadataPointer, 16);
-    const width = metadata.getInt32(0, true);
-    const height = metadata.getInt32(4, true);
     const colorSpace = metadata.getInt32(12, true);
-    validateHeader(request, decodePlan, width, height, colorSpace);
+    validateHeader(
+      request,
+      decodePlan,
+      metadata.getInt32(0, true),
+      metadata.getInt32(4, true),
+      colorSpace
+    );
     throwIfAborted(signal);
 
+    // TurboJPEG scales in the IDCT to the largest supported M/8 factor that
+    // fits the requested size; for power-of-two reductions of images at least
+    // eight pixels on a side that is exactly 1/reduction.
+    const width = Math.ceil(request.width / reduction);
+    const height = Math.ceil(request.height / reduction);
     const outputByteLength = checkedOutputByteLength(width, height, request.components);
     outputPointer = allocateWasm(exports, outputByteLength, "JPEG output");
     const pixelFormat = request.components === 1
@@ -386,12 +396,42 @@ function preflightJpeg(
   });
 }
 
-function validateAggregateWorkingSet(
+/**
+ * Pick the smallest power-of-two resolution reduction, up to the request's
+ * permitted maximum, whose decode working set fits the limit.
+ */
+function chooseJpegReduction(
   request: Readonly<NativeImageCodecRequest>,
   decodePlan: Readonly<JpegDecodePlan>,
   limit: number
+): number {
+  const maxReduction = Math.max(request.width, request.height) >= 8
+    ? request.maxReduction ?? 1
+    : 1;
+  let firstError: unknown;
+  for (let reduction = 1; reduction <= maxReduction; reduction *= 2) {
+    try {
+      validateAggregateWorkingSet(request, decodePlan, limit, reduction);
+      return reduction;
+    } catch (error) {
+      firstError ??= error;
+      if (!(error instanceof PdfError) || error.details?.reason !== "jpeg-aggregate-working-set") throw error;
+    }
+  }
+  throw firstError;
+}
+
+function validateAggregateWorkingSet(
+  request: Readonly<NativeImageCodecRequest>,
+  decodePlan: Readonly<JpegDecodePlan>,
+  limit: number,
+  reduction: number
 ): void {
-  const pixels = checkedAggregateProduct("pixels", request.width, request.height);
+  const pixels = checkedAggregateProduct(
+    "pixels",
+    Math.ceil(request.width / reduction),
+    Math.ceil(request.height / reduction)
+  );
   const rawBytes = checkedAggregateProduct("raw samples", pixels, request.components);
 
   // At codec invocation the document retains the original stream and the
@@ -403,17 +443,14 @@ function validateAggregateWorkingSet(
   );
   // Peak lifetime can overlap the WASM output, the resolver-owned JS result,
   // and the registry's validated owned copy before the instance is reclaimed.
+  // The image pipeline reads 8-bit samples in place without widening them.
   const rawCopies = checkedAggregateProduct("raw JPEG copies", rawBytes, 3);
-  const unpackedSamples = checkedAggregateProduct(
-    "unpacked JPEG samples",
-    rawBytes,
-    Uint16Array.BYTES_PER_ELEMENT
-  );
   const rgbaOutput = checkedAggregateProduct("JPEG RGBA output", pixels, 4);
 
   let progressiveCoefficients = 0;
   if (decodePlan.markers.progressive) {
-    // Progressive decoding retains all DCT coefficients. Sampling factors are
+    // Progressive decoding retains all full-resolution DCT coefficients, even
+    // when the IDCT scales the output down. Sampling factors are
     // at most four; adding three blocks per axis upper-bounds MCU padding for
     // every component without trusting attacker-provided sampling metadata.
     const blockColumns = Math.ceil(request.width / 8) + 3;
@@ -433,7 +470,6 @@ function validateAggregateWorkingSet(
     JPEG_CODEC_OVERHEAD_BYTES,
     encodedCopies,
     rawCopies,
-    unpackedSamples,
     rgbaOutput,
     progressiveCoefficients
   );
@@ -456,9 +492,9 @@ function validateAggregateWorkingSet(
           codecOverhead: JPEG_CODEC_OVERHEAD_BYTES,
           encodedCopies,
           rawCopies,
-          unpackedSamples,
           rgbaOutput,
-          progressiveCoefficients
+          progressiveCoefficients,
+          reduction
         }
       }
     );

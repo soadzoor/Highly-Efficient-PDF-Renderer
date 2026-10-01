@@ -431,10 +431,15 @@ try {
       }
       const snapshot = owned.slice();
       const actual = unpackImageSamples(bytes, width, height, components, precision);
-      assert.deepEqual(actual, expected, `${precision}-bit samples across chunk/row boundaries`);
+      assert.deepEqual([...actual], [...expected], `${precision}-bit samples across chunk/row boundaries`);
       assert.deepEqual(owned, snapshot, "sample expansion must preserve borrowed byte slices");
-      actual[0] = 0;
-      assert.deepEqual(owned, snapshot, "expanded samples must own their storage");
+      if (precision === 8) {
+        // Byte samples are read in place rather than widened to 16 bits.
+        assert.equal(actual, bytes, "8-bit samples reuse their byte view");
+      } else {
+        actual[0] = 0;
+        assert.deepEqual(owned, snapshot, "expanded samples must own their storage");
+      }
       assert.throws(
         () => unpackImageSamples(bytes.subarray(1), width, height, components, precision),
         (error) => error?.code === "unsupported-image"

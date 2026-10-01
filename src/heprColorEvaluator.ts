@@ -137,14 +137,10 @@ export class HeprColorEvaluator {
       case HEPR_COLOR_SPACE_KIND.Separation:
       case HEPR_COLOR_SPACE_KIND.DeviceN: {
         const names = colors.names.slice(colors.nameOffsets[index], colors.nameOffsets[index + 1]);
-        if (
-          (colors.spaceKinds[index] === HEPR_COLOR_SPACE_KIND.Separation &&
-            (names[0] === "All" || names[0] === "None")) ||
-          (colors.spaceKinds[index] === HEPR_COLOR_SPACE_KIND.DeviceN &&
-            names.every((name) => name === "None"))
-        ) {
+        // /All is displayed through its tint transform; /None never paints.
+        if (names.every((name) => name === "None")) {
           throw colorError(
-            "A special all/none colorant has no backdrop-independent sRGB value.",
+            "A special /None colorant has no backdrop-independent sRGB value.",
             path
           );
         }

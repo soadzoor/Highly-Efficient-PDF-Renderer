@@ -2798,7 +2798,8 @@ function embeddedHmtxDiagnostic(
   numberOfHMetrics: number,
   actualLength: number,
   expectedLength: number,
-  firstRecoveredGlyph: number
+  firstRecoveredGlyph: number,
+  recoveredExactly: boolean
 ): PdfDiagnostic {
   const missing = delta < 0;
   const details = missing
@@ -2808,7 +2809,8 @@ function embeddedHmtxDiagnostic(
         numberOfHMetrics,
         actualLength,
         expectedLength,
-        recoveredBearingCount: numGlyphs - firstRecoveredGlyph
+        recoveredBearingCount: numGlyphs - firstRecoveredGlyph,
+        exact: recoveredExactly
       })
     : Object.freeze({
         reason: "hmtx-trailing-bytes",
@@ -2822,7 +2824,9 @@ function embeddedHmtxDiagnostic(
     code: "font.sfnt-horizontal-metrics-normalized",
     severity: "warning",
     message: missing
-      ? "An embedded sfnt omitted trailing horizontal bearings; exact values were recovered from glyph xMin bounds."
+      ? recoveredExactly
+        ? "An embedded sfnt omitted trailing horizontal bearings; exact values were recovered from glyph xMin bounds."
+        : "An embedded sfnt omitted trailing horizontal bearings; they were approximated by glyph xMin bounds."
       : "An embedded sfnt contained a bounded unreachable hmtx tail; the tail was ignored.",
     details
   });
@@ -2990,9 +2994,11 @@ export class NativeSfntFont {
       checkedSfntMultiply(this.numGlyphs - this.numberOfHMetrics, 2, "hmtx bearings"),
       "hmtx length"
     );
-    // Some PDF subsetters omit a suffix of hmtx's trailing LSB array while
-    // preserving head.flags bit 1, which makes each omitted value exactly the
-    // corresponding glyph xMin. Others include final alignment bytes or two
+    // Some PDF subsetters omit a suffix of hmtx's trailing LSB array, up to
+    // the whole array. With head.flags bit 1 each omitted value is exactly the
+    // corresponding glyph xMin; without it xMin is the best available value.
+    // Outlines keep their absolute glyf coordinates either way, so only the
+    // reported bearing can differ. Others include final alignment bytes or two
     // stale trailing bearings. Keep strict fonts exact; for embedded subsets,
     // recover only the first form from fully bounded glyf/loca data and ignore
     // at most the already established four-byte unreachable tail.
@@ -3003,8 +3009,8 @@ export class NativeSfntFont {
     const canRecoverMissingBearings =
       validation === "pdf-embedded" && embeddedHmtxDelta < 0 &&
       availableBearingBytes >= 0 && availableBearingBytes % 2 === 0 &&
-      (this.u16(head.offset + 16, head) & 0x0002) !== 0 &&
       this.tables.has("glyf") && this.tables.has("loca");
+    const recoveredBearingsExact = (this.u16(head.offset + 16, head) & 0x0002) !== 0;
     const canIgnoreTrailingBytes =
       validation === "pdf-embedded" &&
       embeddedHmtxDelta > 0 && embeddedHmtxDelta <= 4;
@@ -3025,7 +3031,8 @@ export class NativeSfntFont {
           this.numberOfHMetrics,
           hmtx.length,
           expectedHmtxLength,
-          this.firstRecoveredHorizontalBearingGlyph
+          this.firstRecoveredHorizontalBearingGlyph,
+          recoveredBearingsExact
         )]);
     const maxpVersion = this.u32(maxp.offset, maxp);
     if (maxpVersion !== 0x00005000 && maxpVersion !== 0x00010000) {

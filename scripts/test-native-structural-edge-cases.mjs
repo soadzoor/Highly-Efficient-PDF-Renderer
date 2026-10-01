@@ -81,7 +81,7 @@ async function testHybridLookupOrder() {
 async function testHybridEncryptionDeclaration() {
   await assert.rejects(
     openStrict(hybridLookupFixture({ encryptInStream: true })),
-    hasPdfError("encrypted", /empty-password/),
+    hasPdfError("encrypted", /\/Encrypt entry is not a dictionary/),
     "an /Encrypt entry in the supplemental hybrid xref dictionary must not bypass rejection"
   );
 }
@@ -108,7 +108,7 @@ async function testRepairedXrefStreamEncryptionDeclaration() {
   broken.set(bytes("1".padStart(numberEnd - numberStart, "0")), numberStart);
   await assert.rejects(
     openNativePdfDocument({ kind: "bytes", bytes: broken }, { repair: "safe" }),
-    hasPdfError("encrypted", /empty-password/),
+    hasPdfError("encrypted", /\/Encrypt entry is not a dictionary/),
     "repair must treat an xref stream dictionary as a trailer before resolving any encrypted objects"
   );
 }
@@ -165,6 +165,16 @@ async function testLinearizedForwardRevisionChain() {
     assert.equal(document.info.repaired, false);
   } finally {
     await document.close();
+  }
+
+  // Producers writing an xref stream point /T at the white space before its
+  // object header, just ahead of the /Prev offset.
+  const hintBefore = await openStrict(linearizedForwardFixture({ hintBeforeMainXref: true }));
+  try {
+    assert.equal(hintBefore.info.pageCount, 1);
+    assert.equal(hintBefore.info.repaired, false);
+  } finally {
+    await hintBefore.close();
   }
 
   await assert.rejects(
@@ -953,7 +963,7 @@ function basicPageObjects() {
   ];
 }
 
-function linearizedForwardFixture({ staleLength = false, cycle = false } = {}) {
+function linearizedForwardFixture({ staleLength = false, cycle = false, hintBeforeMainXref = false } = {}) {
   const builder = new Builder();
   const offsets = new Map();
   builder.append("%PDF-1.7\n%test\n");
@@ -983,7 +993,7 @@ function linearizedForwardFixture({ staleLength = false, cycle = false } = {}) {
   return bytes(raw
     .replace("LLLLLLLLLL", fixed(staleLength ? sourceLength + 1 : sourceLength))
     .replace("EEEEEEEEEE", fixed(firstPageEnd))
-    .replace("TTTTTTTTTT", fixed(mainXref + "xref\n0 5\n".length))
+    .replace("TTTTTTTTTT", fixed(hintBeforeMainXref ? mainXref - 1 : mainXref + "xref\n0 5\n".length))
     .replace("PPPPPPPPPP", fixed(mainXref)));
 }
 

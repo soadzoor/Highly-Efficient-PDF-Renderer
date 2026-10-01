@@ -1176,13 +1176,13 @@ export class NativePdfColorRegistry {
       }
       case "Separation":
       case "DeviceN": {
-        if (
-          (record.kind === "Separation" && (record.names[0] === "All" || record.names[0] === "None"))
-          || (record.kind === "DeviceN" && record.names.every((name) => name === "None"))
-        ) {
+        // /All marks every device colorant at once (registration marks); a
+        // composite display shows it through its tint transform like any
+        // spot color. /None never paints, so it has no sRGB value at all.
+        if (record.names.every((name) => name === "None")) {
           throw new PdfError(
             "unsupported-color",
-            "A special all/none colorant has no backdrop-independent sRGB value."
+            "A special /None colorant has no backdrop-independent sRGB value."
           );
         }
         const tint = this.functions.evaluate(record.functionIndex, components.map(clamp01), signal);
