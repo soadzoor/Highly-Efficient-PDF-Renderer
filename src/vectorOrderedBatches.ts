@@ -313,14 +313,20 @@ export class VectorOrderedBatches {
     }
     this.uintInstanceData = growUint32(this.uintInstanceData, instanceCapacity * 2);
     if (this.redundancyEnabled) {
-      this.redundancyIds = growUint32(this.redundancyIds, strokeCount, this.rankToId.length);
+      // Only strokes that share a line with another stroke can be culled.
+      this.redundancyIds = growUint32(this.redundancyIds, Math.min(strokeCount, this.redundancy.candidateCount),
+        this.rankToId.length);
       let count = 0;
       for (const runIndex of this.visiblePaints) {
         const run = this.sourceRuns[runIndex];
         if (run.kind !== "stroke") continue;
         const start = this.runRanges[runIndex * 2], end = start + this.runRanges[runIndex * 2 + 1];
         for (let index = start; index < end; index++) {
-          this.redundancyIds[count++] = this.runtime ? this.rankToId[this.selectedRanks[index]] : index;
+          const id = this.runtime ? this.rankToId[this.selectedRanks[index]] : index;
+          if (!this.redundancy.isCandidate(id)) continue;
+          // Overlapping source runs can list an ID twice; update() counts it once.
+          if (count === this.redundancyIds.length) this.redundancyIds = growUint32(this.redundancyIds, count + 1, Infinity, true);
+          this.redundancyIds[count++] = id;
         }
       }
       this.redundancy.update(this.redundancyIds, count);

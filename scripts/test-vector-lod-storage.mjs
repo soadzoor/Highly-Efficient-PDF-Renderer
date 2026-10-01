@@ -177,9 +177,8 @@ try {
     assert.equal(layer.runtime, runtime);
     const material = layer.layers[0];
     checkSplitMaterial(material, storage.textures);
-    assert.equal(material.segmentMarks.length + material.segmentMinX.length + material.segmentMinY.length +
-      material.segmentMaxX.length + material.segmentMaxY.length + material.allSegmentIds.length, 0,
-      "externally culled LOD does not duplicate unused spatial scratch");
+    assert.equal(material.grid, null);
+    assert.equal(material.segmentMarks.length, 0, "externally culled LOD does not duplicate unused spatial scratch");
     assert.equal(layer.combinedIds.length, 0, "Three LOD reserves selection IDs on demand");
     // One recolored stroke in each texture set: canonical row 0, and the first
     // canonical stroke of the partial row that lives in the tail.

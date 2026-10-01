@@ -57,6 +57,7 @@ export const fastTests = [
   "three-sparse-lod-batches",
   "three-ordered-stroke-lod",
   "three-camera-stroke-lod",
+  "three-stroke-culling",
   "three-vector-instance-clip",
   "three-webgpu-composite-material",
   "three-webgpu-raster-strip-material",

@@ -46,7 +46,8 @@ export class ThreeVectorDrawRuns {
   private readonly clipMaterials = new Map<string, THREE.Material>();
   private readonly visibleIds: Uint8Array;
   private readonly strokeRedundancy: VectorStrokeRedundancy | null;
-  private readonly strokeCandidates: Uint32Array | null;
+  /** Visible IDs that may be culled; only strokes sharing a line qualify. */
+  private strokeCandidates: Uint32Array | null;
   private strokeRedundancyEnabled = true;
   private sourceCount: number;
   private sourceVersion = -1;
@@ -89,7 +90,7 @@ export class ThreeVectorDrawRuns {
     this.visibleIds = new Uint8Array(source.count);
     this.strokeRedundancy = kind === "stroke" && !origins && !this.visibility.requiresCompositing
       ? new VectorStrokeRedundancy(scene) : null;
-    this.strokeCandidates = this.strokeRedundancy ? new Uint32Array(source.count) : null;
+    this.strokeCandidates = this.strokeRedundancy ? new Uint32Array(this.strokeRedundancy.candidateCount) : null;
     this.sourceCount = parent.geometry.instanceCount;
     this.neighbours = this.visibility.requiresCompositing ? scenePaintRunNeighbours(scene) : null;
     this.plan = plan ?? getThreeVectorDrawPlan(scene);
@@ -337,18 +338,26 @@ export class ThreeVectorDrawRuns {
   private updateEntries(): void {
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.batchUpdate");
-    if (this.strokeRedundancy && this.strokeCandidates && this.strokeRedundancyEnabled) {
-      let count = 0;
+    const redundancy = this.strokeRedundancy;
+    if (redundancy && this.strokeCandidates && this.strokeRedundancyEnabled) {
+      let count = 0, candidates = this.strokeCandidates;
       for (const entry of this.entries) {
         for (const range of entry.ranges) {
           if (!this.visibility.isRunVisible(range.run)) continue;
           const end = range.first + range.count;
           for (let id = range.first; id < end; id++) {
-            if (this.visibleIds[id]) this.strokeCandidates[count++] = id;
+            if (!this.visibleIds[id] || !redundancy.isCandidate(id)) continue;
+            // Overlapping runs can list an ID twice; update() counts it once.
+            if (count === candidates.length) {
+              const grown = new Uint32Array(count * 2 + 16);
+              grown.set(candidates);
+              candidates = this.strokeCandidates = grown;
+            }
+            candidates[count++] = id;
           }
         }
       }
-      this.strokeRedundancy.update(this.strokeCandidates, count);
+      redundancy.update(candidates, count);
     }
     for (const entry of this.entries) {
       let visible = 0;

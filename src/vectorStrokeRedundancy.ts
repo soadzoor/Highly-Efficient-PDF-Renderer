@@ -18,10 +18,16 @@ interface StrokeGeometry extends StrokeRecordSource {
 export class VectorStrokeRedundancy {
   culledCount = 0;
   private readonly records: StrokeRecords;
-  private readonly groups: Uint32Array;
   private readonly groupOffsets: Uint32Array;
   private readonly groupAxes: Uint8Array;
+  // Few strokes share a line with another: millions of strokes typically yield
+  // hundreds of candidates. Only candidates have state, indexed by their slot
+  // in `candidates` (grouped, in processing order); one bit marks each.
   private readonly candidates: Uint32Array;
+  private readonly candidateBits: Uint32Array;
+  private readonly sortedCandidateIds: Uint32Array;
+  private readonly sortedCandidateSlots: Uint32Array;
+  private readonly slotGroups: Uint32Array;
   private readonly startRanks: Uint32Array;
   private readonly selected: Uint32Array;
   private readonly removed: Uint8Array;
@@ -29,18 +35,14 @@ export class VectorStrokeRedundancy {
   private readonly touched: Uint32Array;
   private readonly groupCulled: Uint32Array;
   private readonly coverage: Float64Array;
-  private activeIds: Uint32Array;
-  private previousIds: Uint32Array;
+  private activeSlots: Uint32Array;
+  private previousSlots: Uint32Array;
   private previousCount = 0;
   private revision = 0;
 
   constructor(scene: VectorScene, strokes?: StrokeGeometry) {
     this.records = strokes ? strokeSourceRecords(strokes) : sceneStrokeRecords(scene);
     const count = this.records.count;
-    this.groups = new Uint32Array(count);
-    this.startRanks = new Uint32Array(count);
-    this.selected = new Uint32Array(count);
-    this.removed = new Uint8Array(count);
     const runs = scene.drawRuns ?? [{ kind: "stroke", first: 0, count: scene.segmentCount }];
     const sourceRuns = strokes?.sourceRuns ?? new Uint32Array(count).fill(0xffffffff);
     if (!strokes) runs.forEach((run, index) => {
@@ -92,14 +94,19 @@ export class VectorStrokeRedundancy {
       total += list.length; groupCount++; largest = Math.max(largest, list.length);
     }
     this.candidates = new Uint32Array(total);
+    this.candidateBits = new Uint32Array(Math.ceil(count / 32));
+    this.slotGroups = new Uint32Array(total);
+    this.startRanks = new Uint32Array(total);
+    this.selected = new Uint32Array(total);
+    this.removed = new Uint8Array(total);
     this.groupOffsets = new Uint32Array(groupCount + 2);
     this.groupAxes = new Uint8Array(groupCount + 1);
     this.visited = new Uint32Array(groupCount + 1);
     this.touched = new Uint32Array(groupCount);
     this.groupCulled = new Uint32Array(groupCount + 1);
     this.coverage = new Float64Array(largest + 1);
-    this.activeIds = new Uint32Array(total);
-    this.previousIds = new Uint32Array(total);
+    this.activeSlots = new Uint32Array(total);
+    this.previousSlots = new Uint32Array(total);
     let cursor = 0, group = 0;
     lists.forEach((list, index) => {
       if (list.length < 2) return;
@@ -108,12 +115,12 @@ export class VectorStrokeRedundancy {
       this.groupAxes[group] = axis;
       this.groupOffsets[group] = cursor;
       list.sort((a, b) => this.start(a, axis) - this.start(b, axis));
+      const ranks = new Map<number, number>();
       let rank = 0, previous = -Infinity;
       for (const id of list) {
         const start = this.start(id, axis);
         if (start !== previous) { rank++; previous = start; }
-        this.startRanks[id] = rank;
-        this.groups[id] = group;
+        ranks.set(id, rank);
       }
       const width = (id: number): number => {
         const segment = strokeRecordSegment(this.records, id), geometry = segment.scene, offset = (id - segment.first) * 4;
@@ -123,10 +130,28 @@ export class VectorStrokeRedundancy {
       // earliest start and furthest end first. Exact duplicates prefer later paint.
       list.sort((a, b) => width(b) - width(a) || this.start(a, axis) - this.start(b, axis) ||
         this.end(b, axis) - this.end(a, axis) || sourceRuns[b] - sourceRuns[a] || b - a);
-      this.candidates.set(list, cursor);
-      cursor += list.length;
+      for (const id of list) {
+        this.candidates[cursor] = id;
+        this.slotGroups[cursor] = group;
+        this.startRanks[cursor] = ranks.get(id)!;
+        this.candidateBits[id >>> 5] |= 1 << (id & 31);
+        cursor++;
+      }
     });
     this.groupOffsets[group + 1] = cursor;
+    const order = Uint32Array.from({ length: total }, (_, slot) => slot)
+      .sort((a, b) => this.candidates[a] - this.candidates[b]);
+    this.sortedCandidateIds = Uint32Array.from(order, slot => this.candidates[slot]);
+    this.sortedCandidateSlots = order;
+  }
+
+  /** Only IDs that share a line with another stroke can be culled; update() ignores the rest. */
+  isCandidate(id: number): boolean {
+    return ((this.candidateBits[id >>> 5] >>> (id & 31)) & 1) !== 0;
+  }
+
+  get candidateCount(): number {
+    return this.candidates.length;
   }
 
   /** IDs may be in any order. Call only when visibility/LOD selection changes. */
@@ -138,25 +163,27 @@ export class VectorStrokeRedundancy {
     }
     let touched = 0, active = 0;
     for (let index = 0; index < count; index++) {
-      const id = ids[index], group = this.groups[id];
-      if (!group || this.selected[id] === this.revision) continue;
-      const added = previousRevision === 0 || this.selected[id] !== previousRevision;
-      this.selected[id] = this.revision;
-      this.activeIds[active++] = id;
+      const id = ids[index];
+      if (!this.isCandidate(id)) continue;
+      const slot = this.slotOf(id), group = this.slotGroups[slot];
+      if (this.selected[slot] === this.revision) continue;
+      const added = previousRevision === 0 || this.selected[slot] !== previousRevision;
+      this.selected[slot] = this.revision;
+      this.activeSlots[active++] = slot;
       if (!added || this.visited[group] === this.revision) continue;
       this.visited[group] = this.revision;
       this.touched[touched++] = group;
     }
     for (let index = 0; index < this.previousCount; index++) {
-      const id = this.previousIds[index];
-      if (this.selected[id] === this.revision) continue;
-      const group = this.groups[id];
+      const slot = this.previousSlots[index];
+      if (this.selected[slot] === this.revision) continue;
+      const group = this.slotGroups[slot];
       if (this.visited[group] === this.revision) continue;
       this.visited[group] = this.revision;
       this.touched[touched++] = group;
     }
-    const previous = this.previousIds;
-    this.previousIds = this.activeIds; this.activeIds = previous; this.previousCount = active;
+    const previous = this.previousSlots;
+    this.previousSlots = this.activeSlots; this.activeSlots = previous; this.previousCount = active;
     // Membership changes affect only their own collinear coverage groups.
     // Panning that changes a few viewport runs reuses all other decisions.
     for (let index = 0; index < touched; index++) {
@@ -166,15 +193,14 @@ export class VectorStrokeRedundancy {
       this.culledCount -= this.groupCulled[group];
       let removed = 0;
       this.coverage.fill(-Infinity, 0, size + 1);
-      for (let candidate = first; candidate < end; candidate++) {
-        const id = this.candidates[candidate];
-        this.removed[id] = 0;
-        if (this.selected[id] !== this.revision) continue;
-        const rank = this.startRanks[id], farEnd = this.end(id, axis);
+      for (let slot = first; slot < end; slot++) {
+        this.removed[slot] = 0;
+        if (this.selected[slot] !== this.revision) continue;
+        const rank = this.startRanks[slot], farEnd = this.end(this.candidates[slot], axis);
         let coveredEnd = -Infinity;
         for (let cursor = rank; cursor > 0; cursor -= cursor & -cursor) coveredEnd = Math.max(coveredEnd, this.coverage[cursor]);
         if (coveredEnd >= farEnd) {
-          this.removed[id] = 1; removed++;
+          this.removed[slot] = 1; removed++;
         } else for (let cursor = rank; cursor <= size; cursor += cursor & -cursor) {
           this.coverage[cursor] = Math.max(this.coverage[cursor], farEnd);
         }
@@ -184,7 +210,18 @@ export class VectorStrokeRedundancy {
     }
   }
 
-  isRetained(id: number): boolean { return this.removed[id] !== 1; }
+  isRetained(id: number): boolean { return !this.isCandidate(id) || this.removed[this.slotOf(id)] !== 1; }
+
+  private slotOf(id: number): number {
+    const ids = this.sortedCandidateIds;
+    let low = 0, high = ids.length - 1;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (ids[middle] < id) low = middle + 1;
+      else high = middle;
+    }
+    return this.sortedCandidateSlots[low];
+  }
 
   private start(id: number, axis: number): number {
     const segment = strokeRecordSegment(this.records, id), offset = (id - segment.first) * 4 + axis;

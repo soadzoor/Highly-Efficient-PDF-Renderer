@@ -233,3 +233,81 @@ different order; apart from framebuffer rounding, that does not change blending.
   `scripts/test-three-ordered-text-lod.mjs`,
   `scripts/benchmark-vector-lod-memory.mjs`.
 - Documentation: `docs/manual.md`, `docs/vector-lod-memory.md`.
+
+## Follow-up: Three culling structures and redundancy state (2026-09-30)
+
+Without Vector LOD, the Three stroke layer still added 371.4 MiB to Level 1,
+mostly per-stroke culling data. Three findings:
+
+- The spatial grid registered clipped strokes by their clip window, which
+  `primitiveBounds` stores instead of the stroke's extent. On Level 1, 275
+  clipped strokes with page-sized clips produced 60,486,250 of the grid's
+  64,788,273 cell entries (247.1 MiB). Every culling pass also revisited them in
+  each visible cell.
+- The layer stored Float32 culling bounds and an identity ID array per stroke.
+- The redundancy pass kept 13 bytes of state per stroke, but only strokes that
+  share a line with another can be culled: 587 of 2,565,171 on Level 1, and
+  10,398 of the 3,694,247 stored strokes in the native LOD path.
+
+### What changed
+
+- The grid registers a clipped stroke by the intersection of its clip window
+  and its control hull, widened by √2 half widths (a square cap's corner) plus
+  the usual 0.35 antialiasing margin. Unclipped strokes are registered exactly
+  as before. The Three stroke layer, the native renderers' path for scenes
+  without draw runs, and the triangle stroke layer share the grid.
+- The Three layer no longer stores per-stroke bounds. A stroke is registered
+  only in cells its bounds reach, so cells inside the view need no per-stroke
+  test; cells cut by the view edge, and grid border cells, compute bounds on
+  the fly, rounded to Float32 as the stored values were. Selection stamps use
+  one byte, and restoring the complete draw list rewrites and re-uploads only
+  the prefix that culling replaced, instead of copying an identity array.
+- Redundancy state exists only for candidates: one bit per stroke marks them,
+  and a sorted ID table finds their slots. Callers pass only candidates.
+
+### Measurements
+
+Typed arrays after garbage collection in Node, for the Three stroke layer
+without LOD (what it adds to the loaded scene), and the native LOD path through
+`benchmark-vector-lod-memory.mjs --ordered`.
+
+| Measurement | Previous | New |
+| --- | ---: | ---: |
+| Level 1: Three stroke layer, LOD off | 371.4 MiB | 43.1 MiB |
+| Lower Level: Three stroke layer, LOD off | 157.3 MiB | 37.3 MiB |
+| Level 1: grid cell entries | 64,788,273 | 4,305,721 |
+| Level 1: native LOD, reachable typed arrays after overview selection | 403.5 MiB | 358.2 MiB |
+| Lower Level: native LOD, reachable typed arrays after overview selection | 295.1 MiB | 261.4 MiB |
+
+Peak RSS of the native LOD path did not change measurably: its peak occurs
+while ordered batches are prepared, before the redundancy state is retained.
+Culling 30 views took 76.0 ms instead of 358.2 ms on Level 1, and 64.5 ms
+instead of 212.1 ms on Lower Level (Node, culling pass only, including JIT
+warm-up).
+
+### Verification
+
+- Culling results of the previous and new Three layers were compared over 30
+  views of each drawing, from overview to 512× zoom. No stroke was added. The
+  new culling omits 7,472 (Level 1) and 1,092 (Lower Level) stroke-views, each
+  with its whole drawable extent outside the view, so rendered pixels match.
+- The previous and new redundancy implementations made identical decisions for
+  every stroke over 25 successive random selections. This covered the canonical
+  scenes, and the native LOD store where 130,540 (Level 1) and 80,285 (Lower
+  Level) removals occurred. Ordered draw lists of 11 views remain byte-identical
+  to the verified shared-store run.
+- The new `test-three-stroke-culling.mjs` checks clipped-stroke reach, grid
+  registration, exact visible sets against a brute-force reference over 300
+  views, the prefix-only restore of the complete draw list, and candidate-only
+  redundancy state.
+- `npm test`, `test:unit`, `test:integration`, `test:package` and
+  `test:browser` passed. Browser checks remain manual: LOD off in
+  `three-example.html`, zoom and pan with both backends, and recolor a stroke.
+
+### Changed files
+
+- `src/spatialGrid.ts`, `src/threeMaterialStrokeLayer.ts`,
+  `src/vectorStrokeRedundancy.ts`, `src/threeVectorDrawRuns.ts`,
+  `src/vectorOrderedBatches.ts`.
+- `scripts/test-three-stroke-culling.mjs` (new), `scripts/lib/testSuites.mjs`,
+  `scripts/test-vector-lod-storage.mjs`, `docs/vector-lod-memory.md`.

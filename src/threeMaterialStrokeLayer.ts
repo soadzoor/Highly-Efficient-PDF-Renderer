@@ -15,7 +15,7 @@ import {
   CORE_STROKE_FRAGMENT_SHADER_SOURCE,
   CORE_STROKE_VERTEX_SHADER_SOURCE
 } from "./coreShaders";
-import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
+import { buildSpatialGrid, writeStrokeCullingBounds, type SpatialGrid } from "./spatialGrid";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { HEPR_THREE_LAYER_ORDER_STROKE } from "./threeLayerOrder";
 import {
@@ -83,14 +83,14 @@ export class ThreeMaterialStrokeLayer {
   private readonly vectorOverrideUniform: THREE.Vector4;
   private readonly segmentCount: number;
   private readonly segmentIndexAttribute: THREE.InstancedBufferAttribute;
-  private readonly allSegmentIds: Float32Array;
   private readonly visibleSegmentIds: Float32Array;
+  /** Entries past this prefix still hold their own index, here and on the GPU. */
+  private overwrittenSegmentIds = 0;
   private readonly grid: SpatialGrid | null;
-  private readonly segmentMarks: Uint32Array;
-  private readonly segmentMinX: Float32Array;
-  private readonly segmentMinY: Float32Array;
-  private readonly segmentMaxX: Float32Array;
-  private readonly segmentMaxY: Float32Array;
+  /** Grid culling computes stroke bounds from this scene instead of storing them. */
+  private readonly cullingScene: VectorScene;
+  private readonly strokeBounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  private readonly segmentMarks: Uint8Array;
   private readonly maxHalfWidth: number;
   private drawInstanceCount: number;
   private markToken = 1;
@@ -119,18 +119,10 @@ export class ThreeMaterialStrokeLayer {
     this.grid = segmentCount > 0 && !options.strokeOrigins ? buildSpatialGrid(scene) : null;
     // Ordered LOD supplies an already culled selection. Its runtime owns the
     // spatial bounds and marks; this layer never visits them without a grid.
-    this.segmentMarks = new Uint32Array(this.grid ? segmentCount : 0);
+    this.cullingScene = scene;
+    this.segmentMarks = new Uint8Array(this.grid ? segmentCount : 0);
     this.visibleSegmentIds = new Float32Array(Math.max(1, segmentCount));
-    this.allSegmentIds = new Float32Array(options.strokeOrigins ? 0 : Math.max(1, segmentCount));
-    for (let i = 0; i < segmentCount; i += 1) {
-      if (!options.strokeOrigins) this.allSegmentIds[i] = i;
-      this.visibleSegmentIds[i] = i;
-    }
-    const expandedBounds = buildExpandedSegmentBounds(scene, this.grid ? segmentCount : 0);
-    this.segmentMinX = expandedBounds.minX;
-    this.segmentMinY = expandedBounds.minY;
-    this.segmentMaxX = expandedBounds.maxX;
-    this.segmentMaxY = expandedBounds.maxY;
+    for (let i = 0; i < segmentCount; i += 1) this.visibleSegmentIds[i] = i;
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.drawInstanceCount = segmentCount;
 
@@ -316,6 +308,7 @@ export class ThreeMaterialStrokeLayer {
     this.updateFrameUniforms(viewState, viewport);
     this.orderedRuns?.beginUpdate();
     const outCount = Math.max(0, Math.min(segmentIdCount | 0, this.segmentCount, this.visibleSegmentIds.length));
+    this.overwrittenSegmentIds = Math.max(this.overwrittenSegmentIds, outCount);
     let changed = false;
     for (let i = 0; i < outCount; i += 1) {
       if (this.visibleSegmentIds[i] !== segmentIds[i]) { this.visibleSegmentIds[i] = segmentIds[i]; changed = true; }
@@ -446,16 +439,25 @@ export class ThreeMaterialStrokeLayer {
     const r0 = clampToGrid(Math.floor((viewMinY - grid.minY) / grid.cellHeight), grid.gridHeight);
     const r1 = clampToGrid(Math.floor((viewMaxY - grid.minY) / grid.cellHeight), grid.gridHeight);
 
+    // Byte stamps restart every 255 passes instead of costing four bytes per stroke.
     this.markToken += 1;
-    if (this.markToken === 0xffffffff) {
+    if (this.markToken === 0xff) {
       this.segmentMarks.fill(0);
       this.markToken = 1;
     }
 
     let outCount = 0;
+    const bounds = this.strokeBounds;
     for (let row = r0; row <= r1; row += 1) {
+      // A stroke is registered only in cells its bounds reach, so a cell inside
+      // the view needs no per-stroke test. Border cells also hold strokes
+      // clamped from beyond the grid, and are always tested.
+      const rowInside = row > 0 && row < grid.gridHeight - 1 &&
+        grid.minY + row * grid.cellHeight >= viewMinY && grid.minY + (row + 1) * grid.cellHeight <= viewMaxY;
       let cellIndex = row * grid.gridWidth + c0;
       for (let col = c0; col <= c1; col += 1) {
+        const inside = rowInside && col > 0 && col < grid.gridWidth - 1 &&
+          grid.minX + col * grid.cellWidth >= viewMinX && grid.minX + (col + 1) * grid.cellWidth <= viewMaxX;
         const offset = grid.offsets[cellIndex];
         const count = grid.counts[cellIndex];
         for (let i = 0; i < count; i += 1) {
@@ -465,12 +467,10 @@ export class ThreeMaterialStrokeLayer {
           }
           this.segmentMarks[segmentIndex] = this.markToken;
 
-          if (
-            this.segmentMaxX[segmentIndex] < viewMinX ||
-            this.segmentMinX[segmentIndex] > viewMaxX ||
-            this.segmentMaxY[segmentIndex] < viewMinY ||
-            this.segmentMinY[segmentIndex] > viewMaxY
-          ) {
+          // Rounded as the Float32 bounds this layer used to store per stroke.
+          if (!inside && (!writeStrokeCullingBounds(this.cullingScene, segmentIndex, bounds) ||
+              Math.fround(bounds.maxX) < viewMinX || Math.fround(bounds.minX) > viewMaxX ||
+              Math.fround(bounds.maxY) < viewMinY || Math.fround(bounds.minY) > viewMaxY)) {
             continue;
           }
 
@@ -482,17 +482,20 @@ export class ThreeMaterialStrokeLayer {
         cellIndex += 1;
       }
     }
+    if (writeVisibleIds) {
+      this.usingAllSegments = false;
+      this.overwrittenSegmentIds = Math.max(this.overwrittenSegmentIds, outCount);
+    }
     return outCount;
   }
 
   private setAllSegmentsVisible(): void {
-    if (!this.usingAllSegments) {
-      if (this.allSegmentIds.length >= this.segmentCount) {
-        this.visibleSegmentIds.set(this.allSegmentIds.subarray(0, this.segmentCount), 0);
-      } else {
-        for (let index = 0; index < this.segmentCount; index++) this.visibleSegmentIds[index] = index;
-      }
-      this.segmentIndexAttribute.addUpdateRange(0, this.segmentCount);
+    if (!this.usingAllSegments && this.overwrittenSegmentIds > 0) {
+      // Only culled passes replace IDs, from the start: restore that prefix.
+      const count = this.overwrittenSegmentIds;
+      for (let index = 0; index < count; index++) this.visibleSegmentIds[index] = index;
+      this.overwrittenSegmentIds = 0;
+      this.segmentIndexAttribute.addUpdateRange(0, count);
       this.segmentIndexAttribute.needsUpdate = true;
     }
     this.usingAllSegments = true;
@@ -534,31 +537,6 @@ function createStrokeGeometry(segmentIds: Float32Array, segmentCount: number): T
   geometry.instanceCount = Math.max(0, segmentCount | 0);
 
   return geometry;
-}
-
-function buildExpandedSegmentBounds(scene: VectorScene, segmentCount: number): {
-  minX: Float32Array;
-  minY: Float32Array;
-  maxX: Float32Array;
-  maxY: Float32Array;
-} {
-  const minX = new Float32Array(segmentCount);
-  const minY = new Float32Array(segmentCount);
-  const maxX = new Float32Array(segmentCount);
-  const maxY = new Float32Array(segmentCount);
-
-  for (let i = 0; i < segmentCount; i += 1) {
-    const primitiveBoundsOffset = i * 4;
-    const styleOffset = i * 4;
-    const margin = (scene.styles[styleOffset] ?? 0) + 0.35;
-
-    minX[i] = scene.primitiveBounds[primitiveBoundsOffset] - margin;
-    minY[i] = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
-    maxX[i] = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
-    maxY[i] = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
-  }
-
-  return { minX, minY, maxX, maxY };
 }
 
 function clampToGrid(value: number, side: number): number {

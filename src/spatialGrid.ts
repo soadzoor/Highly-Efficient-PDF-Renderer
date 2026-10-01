@@ -1,6 +1,9 @@
-import type { VectorScene } from "./pdfVectorExtractor";
+import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 
 const MIN_GRID_SIDE = 64;
+const STROKE_STYLE_FLAG_CLIPPED = 1 << 2;
+// Antialiasing reach of a stroke beyond its geometry, in scene units.
+const STROKE_CULLING_MARGIN = 0.35;
 const MAX_GRID_SIDE = 1024;
 const MIN_TARGET_CELLS = 30_000;
 const MAX_TARGET_CELLS = 220_000;
@@ -20,6 +23,34 @@ export interface SpatialGrid {
   maxCellPopulation: number;
 }
 
+/**
+ * Bounds of everything a stroke can draw, including the antialiasing margin;
+ * false when it can draw nothing. For a clipped stroke, primitiveBounds holds
+ * its clip window rather than its extent, and a page-sized clip would place a
+ * short stroke in every grid cell. Such strokes are also bounded by their
+ * control hull, widened by the largest cap extent: a square cap's corner lies
+ * √2 half widths from its endpoint.
+ */
+export function writeStrokeCullingBounds(scene: VectorScene, index: number, out: Bounds): boolean {
+  const offset = index * 4;
+  const halfWidth = scene.styles[offset];
+  const margin = halfWidth + STROKE_CULLING_MARGIN;
+  const bounds = scene.primitiveBounds;
+  out.minX = bounds[offset] - margin;
+  out.minY = bounds[offset + 1] - margin;
+  out.maxX = bounds[offset + 2] + margin;
+  out.maxY = bounds[offset + 3] + margin;
+  const meta = scene.primitiveMeta;
+  if ((Math.floor(meta[offset + 3] / 2 + 1e-6) & STROKE_STYLE_FLAG_CLIPPED) === 0) return true;
+  const endpoints = scene.endpoints;
+  const extent = Math.SQRT2 * Math.max(0, halfWidth) + STROKE_CULLING_MARGIN;
+  out.minX = Math.max(out.minX, Math.min(endpoints[offset], endpoints[offset + 2], meta[offset]) - extent);
+  out.minY = Math.max(out.minY, Math.min(endpoints[offset + 1], endpoints[offset + 3], meta[offset + 1]) - extent);
+  out.maxX = Math.min(out.maxX, Math.max(endpoints[offset], endpoints[offset + 2], meta[offset]) + extent);
+  out.maxY = Math.min(out.maxY, Math.max(endpoints[offset + 1], endpoints[offset + 3], meta[offset + 1]) + extent);
+  return out.minX <= out.maxX && out.minY <= out.maxY;
+}
+
 export function buildSpatialGrid(scene: VectorScene): SpatialGrid {
   const segmentCount = scene.segmentCount;
 
@@ -35,23 +66,15 @@ export function buildSpatialGrid(scene: VectorScene): SpatialGrid {
   const counts = new Uint32Array(cellCount);
 
   let maxCellPopulation = 0;
+  const bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const primitiveBoundsOffset = i * 4;
-    const styleOffset = i * 4;
+    if (!writeStrokeCullingBounds(scene, i, bounds)) continue;
 
-    const halfWidth = scene.styles[styleOffset];
-    const margin = halfWidth + 0.35;
-
-    const minX = scene.primitiveBounds[primitiveBoundsOffset] - margin;
-    const minY = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
-    const maxX = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
-    const maxY = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
-
-    const c0 = clampToCell(Math.floor((minX - scene.bounds.minX) / cellWidth), gridWidth);
-    const c1 = clampToCell(Math.floor((maxX - scene.bounds.minX) / cellWidth), gridWidth);
-    const r0 = clampToCell(Math.floor((minY - scene.bounds.minY) / cellHeight), gridHeight);
-    const r1 = clampToCell(Math.floor((maxY - scene.bounds.minY) / cellHeight), gridHeight);
+    const c0 = clampToCell(Math.floor((bounds.minX - scene.bounds.minX) / cellWidth), gridWidth);
+    const c1 = clampToCell(Math.floor((bounds.maxX - scene.bounds.minX) / cellWidth), gridWidth);
+    const r0 = clampToCell(Math.floor((bounds.minY - scene.bounds.minY) / cellHeight), gridHeight);
+    const r1 = clampToCell(Math.floor((bounds.maxY - scene.bounds.minY) / cellHeight), gridHeight);
 
     for (let row = r0; row <= r1; row += 1) {
       let cellIndex = row * gridWidth + c0;
@@ -76,21 +99,12 @@ export function buildSpatialGrid(scene: VectorScene): SpatialGrid {
   const cursors = offsets.slice(0, cellCount);
 
   for (let i = 0; i < segmentCount; i += 1) {
-    const primitiveBoundsOffset = i * 4;
-    const styleOffset = i * 4;
+    if (!writeStrokeCullingBounds(scene, i, bounds)) continue;
 
-    const halfWidth = scene.styles[styleOffset];
-    const margin = halfWidth + 0.35;
-
-    const minX = scene.primitiveBounds[primitiveBoundsOffset] - margin;
-    const minY = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
-    const maxX = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
-    const maxY = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
-
-    const c0 = clampToCell(Math.floor((minX - scene.bounds.minX) / cellWidth), gridWidth);
-    const c1 = clampToCell(Math.floor((maxX - scene.bounds.minX) / cellWidth), gridWidth);
-    const r0 = clampToCell(Math.floor((minY - scene.bounds.minY) / cellHeight), gridHeight);
-    const r1 = clampToCell(Math.floor((maxY - scene.bounds.minY) / cellHeight), gridHeight);
+    const c0 = clampToCell(Math.floor((bounds.minX - scene.bounds.minX) / cellWidth), gridWidth);
+    const c1 = clampToCell(Math.floor((bounds.maxX - scene.bounds.minX) / cellWidth), gridWidth);
+    const r0 = clampToCell(Math.floor((bounds.minY - scene.bounds.minY) / cellHeight), gridHeight);
+    const r1 = clampToCell(Math.floor((bounds.maxY - scene.bounds.minY) / cellHeight), gridHeight);
 
     for (let row = r0; row <= r1; row += 1) {
       let cellIndex = row * gridWidth + c0;
