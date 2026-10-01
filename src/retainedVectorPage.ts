@@ -18,7 +18,7 @@ import type { Bounds, SceneTextIndex, VectorScene } from "./pdfVectorExtractor";
 import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
 import { NativeTextClipTester } from "./pdf/nativeTextClip";
-import { NativeVectorClipBuilder } from "./pdf/nativeVectorClips";
+import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips } from "./pdf/nativeVectorClips";
 import { emitCubicAsQuadratics, VectorPageTextIndexBuilder } from "./pdf/nativeVectorPage";
 import { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey, type NativeGlyphStrokeStyle } from "./pdf/nativeGlyphStroke";
 import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
@@ -56,6 +56,10 @@ class RetainedStrokeBuffer {
     this.current[this.offset++] = c;
     this.current[this.offset++] = d;
     this.length += 4;
+  }
+
+  at(index: number): number {
+    return this.chunks[Math.floor(index / RetainedStrokeBuffer.chunkLength)][index % RetainedStrokeBuffer.chunkLength];
   }
 
   take(): Float32Array {
@@ -419,8 +423,37 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     }
     if (result) clipCache.set(scope, result); return result;
   };
+  // Content outside the crop box is cut at the page edge, as the direct
+  // compiler cuts its geometry. Only a run that reaches past the page, under
+  // no clip already inside it, pays for the page clip.
+  const withPageClip = pageRootedVectorClips(scene.pageBounds);
+  const leavesPage = (minX: number, minY: number, maxX: number, maxY: number): boolean =>
+    minX < -1e-3 || minY < -1e-3 || maxX > width + 1e-3 || maxY > height + 1e-3;
+  const runLeavesPage = (kind: "fill" | "stroke" | "raster" | "text" | "gradient-fill", first: number, amount: number,
+    clip: DensePdfTextClip | null): boolean => {
+    for (let node = clip; node; node = node.parent) {
+      const bounds = clipBounds(node);
+      if (bounds && !leavesPage(bounds.minX, bounds.minY, bounds.maxX, bounds.maxY)) return false;
+    }
+    if (kind === "gradient-fill") {
+      const { gradientFillPathMetaA: a, gradientFillPathMetaB: b } = gradients.at(-1)!;
+      return leavesPage(a[2], a[3], b[0], b[1]);
+    }
+    for (let index = first; index < first + amount; index++) {
+      const i = index * 4;
+      if (kind === "fill" && leavesPage(fillsA[i + 2], fillsA[i + 3], fillsB[i], fillsB[i + 1])) return true;
+      if (kind === "stroke" && leavesPage(primitiveBounds.at(i), primitiveBounds.at(i + 1), primitiveBounds.at(i + 2), primitiveBounds.at(i + 3))) return true;
+      if (kind === "text") {
+        const x = textB[i], y = textB[i + 1], atlas = textB[i + 2] * 4;
+        if (leavesPage(glyphMetaA[atlas + 2] + x, glyphMetaA[atlas + 3] + y, glyphMetaB[atlas] + x, glyphMetaB[atlas + 1] + y)) return true;
+      }
+      if (kind === "raster" && imageLeavesPage(scene.rasterLayers[index].matrix, scene.pageBounds)) return true;
+    }
+    return false;
+  };
   const appendRun = (kind: "fill" | "stroke" | "raster" | "text" | "gradient-fill", first: number, amount: number, clip: DensePdfTextClip | null, condition?: number, paintColor?: Color): void => {
     itemRanges.add(kind, first, amount, currentItem);
+    if (runLeavesPage(kind, first, amount, clip)) clip = withPageClip(clip);
     const clipIndex = clipBuilder.add(clip, signal);
     const siblings = stack.at(-1)!, previousNode = siblings.at(-1);
     const previous = previousNode?.kind === "draw" ? scene.drawRuns![previousNode.runIndex] : undefined;

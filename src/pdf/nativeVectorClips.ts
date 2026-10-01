@@ -11,6 +11,31 @@ export function rectangleVectorClip(bounds: Readonly<DensePdfBounds>, transform:
   ]), transform, bounds } };
 }
 
+/**
+ * Re-roots clip chains under the page rectangle, so content past the crop
+ * box is cut at the page edge. Each re-rooted node is shared, so a chain
+ * that many runs use is still flattened once.
+ */
+export function pageRootedVectorClips(pageBounds: Readonly<DensePdfBounds>): (clip: DensePdfTextClip | null) => DensePdfTextClip {
+  const page = rectangleVectorClip(pageBounds, [1, 0, 0, 1, 0, 0], null);
+  const rooted = new WeakMap<DensePdfTextClip, DensePdfTextClip>();
+  const under = (clip: DensePdfTextClip | null): DensePdfTextClip => {
+    if (!clip) return page;
+    let result = rooted.get(clip);
+    if (!result) rooted.set(clip, result = { ...clip, parent: under(clip.parent) });
+    return result;
+  };
+  return under;
+}
+
+/** Whether a unit-square image placed by `matrix` reaches past the page bounds. */
+export function imageLeavesPage(matrix: ArrayLike<number>, pageBounds: Readonly<DensePdfBounds>): boolean {
+  const [a, b, c, d, e, f] = Array.from({ length: 6 }, (_, index) => matrix[index]);
+  const xs = [e, a + e, c + e, a + c + e], ys = [f, b + f, d + f, b + d + f];
+  return Math.min(...xs) < pageBounds.minX - 1e-3 || Math.min(...ys) < pageBounds.minY - 1e-3 ||
+    Math.max(...xs) > pageBounds.maxX + 1e-3 || Math.max(...ys) > pageBounds.maxY + 1e-3;
+}
+
 /** Clip curves flatten within this many points, which stays subpixel at the viewer's deepest zoom. */
 const CLIP_CURVE_TOLERANCE = 0.0001;
 /**

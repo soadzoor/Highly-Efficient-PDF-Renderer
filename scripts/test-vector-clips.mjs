@@ -88,6 +88,38 @@ try {
     assert(!image.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
   } finally { await image.close(); }
 
+  // Content past the crop box is cut at the page edge. A transparency-group
+  // Form sends the page through the retained lowering; a lone image does not.
+  const cropped = (content) => writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /CropBox [20 20 80 80] /Contents 4 0 R /Resources << /XObject << /Fm 5 0 R /Im 6 0 R >> >> >>" },
+    { number: 4, body: tinyPdfStream("", content) },
+    { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency /I true >>", "0 0 1 rg 30 30 20 20 re f") },
+    { number: 6, body: tinyPdfStream("/Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8", Uint8Array.of(255, 0, 0, 0, 0, 255)) }
+  ] });
+  for (const [label, content, kind, retained] of [
+    ["retained fill", "1 0 0 rg 0 0 100 100 re f /Fm Do", "fill", true],
+    ["retained image", "q 100 0 0 100 0 0 cm /Im Do Q /Fm Do", "raster", true],
+    ["direct image", "q 100 0 0 100 0 0 cm /Im Do Q", "raster", false]
+  ]) {
+    const session = await openPdf({ kind: "bytes", bytes: cropped(content) });
+    try {
+      const scene = await session.compileVectorPage(0, { vectorFallback: "error" });
+      assert.deepEqual(scene.pageBounds, { minX: 0, minY: 0, maxX: 60, maxY: 60 });
+      const run = scene.drawRuns?.find(entry => entry.kind === kind);
+      assert(run?.clipIndex !== undefined, `${label} past the crop box is clipped`);
+      assert(contains(scene, run.clipIndex, 30, 30) && contains(scene, run.clipIndex, 1, 59), `${label} keeps the page`);
+      for (const [x, y] of [[-10, 30], [30, -10], [70, 30], [30, 70]]) {
+        assert(!contains(scene, run.clipIndex, x, y), `${label} is cut at the page edge (${x}, ${y})`);
+      }
+      const inside = scene.drawRuns.filter(entry => entry.kind === "fill" && entry !== run);
+      assert.equal(inside.length, retained ? 1 : 0);
+      // The Form's own fill lies inside the page: it keeps just its BBox clip.
+      if (retained) assert.equal(scene.clipPaths[inside[0].clipIndex].parent, -1);
+    } finally { await session.close(); }
+  }
+
   const grid = composeVectorScenesInGrid([sample, sample], 2);
   validateVectorDrawRuns(grid);
   const base = sample.clipPaths.length;

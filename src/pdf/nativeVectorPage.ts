@@ -1,7 +1,7 @@
 import type { SceneOptionalContent } from "../optionalContentData";
 import { AnnotationLayerBuilder } from "../annotationLayers";
 import { ContentItemRangeBuilder } from "../structureData";
-import { NativeVectorClipBuilder } from "./nativeVectorClips";
+import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips } from "./nativeVectorClips";
 import { buildNativeVectorGradients } from "./nativeVectorGradients";
 import type { NativePdfShadingRegistry } from "./nativeShadings";
 import { applyNativeHairlineTextOpacity, buildNativeVectorTextStrokes } from "./nativeVectorTextStroke";
@@ -308,6 +308,9 @@ export function buildNativeVectorPage(
   if (sidecar.pathPaintRanges) {
     const runs: NonNullable<VectorScene["drawRuns"]> = [];
     const clipBuilder = new NativeVectorClipBuilder();
+    // Paths and glyphs are already cut at the crop box; an image is placed
+    // whole, so one that reaches past the page also takes the page clip.
+    const pageRooted = pageRootedVectorClips(normalizedPageBounds);
     // Structure content items (MCIDs) are attributed per primitive range,
     // beside the runs, so tagged objects never split draw runs.
     const contentItems = sidecar.contentItems ?? [];
@@ -365,7 +368,10 @@ export function buildNativeVectorPage(
           if (hairlineCount) itemRanges.add("stroke", hairlineFirst, hairlineCount, item);
         }
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_IMAGE) {
-        appendVectorDrawRun(runs, "raster", imageLayers[index], 1, clipIndex, blendMode, optionalContent);
+        const layer = imageLayers[index];
+        const imageClipIndex = imageLeavesPage(rasterLayers[layer].matrix, normalizedPageBounds)
+          ? clipBuilder.add(pageRooted(sidecar.sourceClips?.[offset / 2] ?? null), signal) : clipIndex;
+        appendVectorDrawRun(runs, "raster", layer, 1, imageClipIndex, blendMode, optionalContent);
         itemRanges.add("raster", imageLayers[index], 1, item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GRADIENT) {
         appendVectorDrawRun(runs, "gradient-fill", index, 1, clipIndex, blendMode, optionalContent);
