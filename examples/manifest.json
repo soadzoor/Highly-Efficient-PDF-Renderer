@@ -1,9 +1,13 @@
 {
-  "generatedAt": "2026-09-30T11:19:41.033Z",
+  "generatedAt": "2026-10-01T13:50:37.410Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
       "name": "20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
+        "sizeBytes": 2048508
+      },
       "pdf": {
         "path": "examples/pdfs/20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
         "sizeBytes": 3357354
@@ -16,6 +20,10 @@
     {
       "id": "baldwin_park_ed_remodel_floor_1",
       "name": "Baldwin Park ED Remodel_Floor 1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.hep",
+        "sizeBytes": 2063728
+      },
       "pdf": {
         "path": "examples/pdfs/Baldwin%20Park%20ED%20Remodel_Floor%201.pdf",
         "sizeBytes": 5231679
@@ -28,6 +36,10 @@
     {
       "id": "chino_mob_floor_1",
       "name": "Chino MOB_FLOOR 1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Chino_MOB_FLOOR_1-parsed-data.hep",
+        "sizeBytes": 556340
+      },
       "pdf": {
         "path": "examples/pdfs/Chino%20MOB_FLOOR%201.pdf",
         "sizeBytes": 666826
@@ -40,6 +52,10 @@
     {
       "id": "dublin_1st_floor_2018_06_01",
       "name": "Dublin 1st Floor 2018 06 01.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Dublin_1st_Floor_2018_06_01-parsed-data.hep",
+        "sizeBytes": 2732272
+      },
       "pdf": {
         "path": "examples/pdfs/Dublin%201st%20Floor%202018%2006%2001.pdf",
         "sizeBytes": 2918857
@@ -52,6 +68,10 @@
     {
       "id": "layers",
       "name": "layers.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/layers-parsed-data.hep",
+        "sizeBytes": 7348
+      },
       "pdf": {
         "path": "examples/pdfs/layers.pdf",
         "sizeBytes": 348422
@@ -64,6 +84,10 @@
     {
       "id": "level_1",
       "name": "Level 1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Level_1-parsed-data.hep",
+        "sizeBytes": 7786764
+      },
       "pdf": {
         "path": "examples/pdfs/Level%201.pdf",
         "sizeBytes": 31445683
@@ -76,6 +100,10 @@
     {
       "id": "livermore_l1",
       "name": "Livermore_L1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Livermore_L1-parsed-data.hep",
+        "sizeBytes": 3846188
+      },
       "pdf": {
         "path": "examples/pdfs/Livermore_L1.pdf",
         "sizeBytes": 9263862
@@ -88,6 +116,10 @@
     {
       "id": "lk_office_level_1",
       "name": "LK Office Level 1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/LK_Office_Level_1-parsed-data.hep",
+        "sizeBytes": 11148
+      },
       "pdf": {
         "path": "examples/pdfs/LK%20Office%20Level%201.pdf",
         "sizeBytes": 30175
@@ -100,6 +132,10 @@
     {
       "id": "lower_level",
       "name": "Lower Level.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Lower_Level-parsed-data.hep",
+        "sizeBytes": 3888460
+      },
       "pdf": {
         "path": "examples/pdfs/Lower%20Level.pdf",
         "sizeBytes": 51313557
@@ -112,6 +148,10 @@
     {
       "id": "murietta_level1",
       "name": "Murietta_Level1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Murietta_Level1-parsed-data.hep",
+        "sizeBytes": 3602624
+      },
       "pdf": {
         "path": "examples/pdfs/Murietta_Level1.pdf",
         "sizeBytes": 4001014
@@ -124,6 +164,10 @@
     {
       "id": "optimizing_cpp",
       "name": "optimizing_cpp.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/optimizing_cpp-parsed-data.hep",
+        "sizeBytes": 1952236
+      },
       "pdf": {
         "path": "examples/pdfs/optimizing_cpp.pdf",
         "sizeBytes": 1848238
@@ -136,6 +180,10 @@
     {
       "id": "plan_de_deneigement_ars",
       "name": "Plan_de_deneigement_ARS.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Plan_de_deneigement_ARS-parsed-data.hep",
+        "sizeBytes": 631680
+      },
       "pdf": {
         "path": "examples/pdfs/Plan_de_deneigement_ARS.pdf",
         "sizeBytes": 796311
@@ -148,6 +196,10 @@
     {
       "id": "preliminary_cs_map_users_guide",
       "name": "Preliminary_CS-MAP_Users_Guide.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/Preliminary_CS-MAP_Users_Guide-parsed-data.hep",
+        "sizeBytes": 3014408
+      },
       "pdf": {
         "path": "examples/pdfs/Preliminary_CS-MAP_Users_Guide.pdf",
         "sizeBytes": 1452165
@@ -160,6 +212,10 @@
     {
       "id": "simivalleybehavioralhealth_sr_20180403",
       "name": "SimiValleyBehavioralHealth_SR_20180403.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
+        "sizeBytes": 557280
+      },
       "pdf": {
         "path": "examples/pdfs/SimiValleyBehavioralHealth_SR_20180403.pdf",
         "sizeBytes": 916550
@@ -172,6 +228,10 @@
     {
       "id": "stn_arch_kp_ontario_177920237_detached",
       "name": "stn_arch_kp-ontario_177920237_detached.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/stn_arch_kp-ontario_177920237_detached-parsed-data.hep",
+        "sizeBytes": 5924664
+      },
       "pdf": {
         "path": "examples/pdfs/stn_arch_kp-ontario_177920237_detached.pdf",
         "sizeBytes": 18277813
@@ -184,6 +244,10 @@
     {
       "id": "thesis",
       "name": "thesis.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/thesis-parsed-data.hep",
+        "sizeBytes": 1650456
+      },
       "pdf": {
         "path": "examples/pdfs/thesis.pdf",
         "sizeBytes": 2833537
@@ -196,6 +260,10 @@
     {
       "id": "warandpeace",
       "name": "WarAndPeace.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/WarAndPeace-parsed-data.hep",
+        "sizeBytes": 6593864
+      },
       "pdf": {
         "path": "examples/pdfs/WarAndPeace.pdf",
         "sizeBytes": 6964852
