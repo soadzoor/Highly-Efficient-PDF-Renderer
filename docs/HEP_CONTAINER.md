@@ -498,3 +498,113 @@ out-of-page content to a neighboring page. Files without it remain readable;
 page extraction uses existing text/raster/gradient page metadata and infers
 stroke/fill membership from the original page layout, with a diagnostic. Runtime
 Three.js page matrices are presentation state and are not stored here.
+
+## Optional LOD caches (scene v9)
+
+The optional top-level `manifest.lod` object has independent `vector` and `text`
+entries: vector currently uses `{ "version": 3, "file": "lod-vector/index.json" }`,
+and text uses `{ "version": 2, "file": "lod-text/index.json" }`. These additive caches do not require a container or
+scene-schema bump: the canonical scene is unchanged and older readers ignore
+unknown sections. Bump the corresponding cache version when its build algorithm
+or representation changes. Readers accept vector v1/v2/v3 and text v1/v2, warning when an older encoding
+can be repacked for smaller files. Other
+versions or malformed caches fall back independently to normal LOD generation
+with a console warning. Generic container repacking preserves caches as-is;
+`scripts/repack-hep-lods.mjs` upgrades their encoding.
+
+Each index is JSON (decoded limit 64 MiB). Numeric arrays are replaced by
+`{ "array": "f32" | "f64" | "u32", "file": "lod-vector/N.bin", "length": N }`
+descriptors, with the appropriate prefix for text. Each binary section contains
+little-endian numeric values transposed into byte planes: byte `b` of element
+`i` is at `b * length + i`. Lengths must match exactly. This preserves Float32/
+Float64 values without additional quantization and improves DEFLATE compression.
+Indexes contain at most 128 arrays, nesting depth at most 16.
+
+In v1, vector indexes contain `tileGrid` (including Float64 x/y edges), `literals`
+(stroke count and four Float32 vec4 streams: endpoints, primitiveMeta,
+primitiveBounds, styles), optional Uint32 `origins`, and `levels`. Storage IDs
+below the canonical stroke count reference canonical geometry; higher IDs
+reference the shared literal suffix. Each level contains tolerance, optional
+overview flag, segment count, scene bounds, maximum half width, optional Uint32
+record IDs (absent for the exact level), and Uint32 tile offsets, counts and
+segment IDs. Tile IDs address positions within the level, not storage IDs.
+Selection marks, visible IDs, build timings and GPU data are not persisted.
+Culling bounds are cheaply reconstructed from the shared geometry.
+
+In v1, text indexes contain exact/coarse/combined instance counts, the solid glyph
+index, runs, clusters, page nodes, and three Float32 coarse-instance streams
+(`coarseInstanceA/B/C`), matching `TextLodBuildData`. The exact glyph prefix and
+original glyph definitions remain in the canonical scene. Each viewer creates
+fresh selection state from the immutable cached build.
+
+### LOD encoding v2
+
+Vector metadata and indexes retain the v1 structure. `literals`' four arrays
+instead contain Uint32 residuals in component-major order (`channel * count +
+record`). Lossless residuals XOR original Float32 words with these predictors:
+
+- `primitiveMeta` and `styles`: the corresponding canonical record at `origins[id]`,
+  or zero when origins are absent.
+- `endpoints`: canonical start x/y; control x/y predict the decoded end x/y from
+  `primitiveMeta`.
+- `primitiveBounds`: Float32 min(start, end) x/y, then max(start, end) x/y.
+
+Decode meta before endpoints, then bounds. Residuals preserve arbitrary curves,
+clip bounds, styling, and signed zeros bit-for-bit. Bounds need not equal the
+prediction; exceptions remain in the residual stream.
+
+Compact mode adds `positionQuantum: 0.001953125` to the vector index and
+`precision: "compact"` to its manifest descriptor (otherwise `"lossless"`).
+All four endpoint components and the first two meta components use Uint32 modular
+integer differences instead of XOR: round(position / quantum) minus the rounded
+predictor. Decode with signed 32-bit modular addition, then multiply by the
+quantum into Float32. Other fields keep lossless word residuals. Canonical arrays
+are never quantized. Export rounds only literals and recomputes non-clipped
+bounds as conservative control hulls, preserving clip windows. Derived level
+bounds expand by half a quantum; exact-level bounds and all tile indexes stay
+unchanged. The existing 0.35-unit bucket margin exceeds rounding displacement.
+Compact export falls back to lossless for out-of-range coordinates.
+
+Text `runs`, `clusters`, and `pages` become `{ count, columns }` tables with
+Float64 numeric columns; the field order is specified by `TABLE_FIELDS` in
+`src/hepLodEncoding.ts`. Bounds, transforms and directions are flattened into
+component columns. Booleans are 0/1. Absent optional direction pairs use NaN;
+exact-only nodes may use positive Infinity for `maxInkHeight`. All other numbers
+must be finite. The v1 reader converts null heights back to Infinity only for
+ineligible nodes, recovering JSON's conversion of this exact-only sentinel.
+Coarse text instance arrays remain Float32. Text compaction introduces no rounding.
+
+### Vector LOD encoding v3
+
+The residual codec from v2 is retained. Bit-identical literal records (all sixteen
+Float32 words plus the optional paint origin) share a storage ID across levels.
+Level record lists retain their order and multiplicity; canonical records stay
+unchanged. Hash collisions are resolved by exact comparison, including signed zero.
+
+The index declares `tileIndexes: "rebuild"`. Levels omit `tileOffsets`, `tileCounts`,
+and `tileSegmentIds`. The loader validates geometry and membership before rebuilding
+bounds and spatial indexes cooperatively, with cancellation. Reconstruction never
+simplifies geometry; each viewer still owns its mutable selection state. Cached
+index reconstruction permits at most 64 × 1024 × 1024 tile references across all levels;
+exceeding this limit invalidates the optional cache with a diagnostic.
+
+Compact precision is the default for new vector caches; explicit `lossless`
+precision disables additional rounding. Compact v3 replaces the scalar grid with a Float32 `positionQuanta` array, one
+power-of-two step per literal. Each grid is no larger than the finest referencing
+level's original tolerance divided by 32. Identical records are shared before
+rounding, so fine/coarse sharing always chooses the finer precision, and exact
+post-rounding duplicates are shared again. The existing modular coordinate codec
+uses the record's grid for both the position and its predictor. Negative zero
+positions round to positive zero; lossless streams retain all bits.
+
+Per-coordinate displacement is at most half a grid step. Derived scene bounds
+expand by the largest half-step in their level. The selection tolerance also
+increases by sqrt(2) times this half-step to account for rounding within the
+existing screen-space error budget. Clip rectangles, styles, widths, alpha,
+primitive flags, and canonical geometry are unchanged. Rebuilt indexes use the
+rounded positions, so no assumption about the old tile margin is needed.
+Re-export retains an existing `positionQuanta` array, preventing accumulated
+rounding or bound growth. A v2 scalar `positionQuantum` can be retained when
+repacking without additional rounding; explicitly choosing compact upgrades it
+to adaptive grids. Out-of-range coordinates retain their existing precision with
+a warning. Text caches continue using v2 without additional loss.

@@ -145,7 +145,13 @@ const hepBlob = await buildHep("/document.pdf");
 // Save or upload the Blob with a .hep filename.
 ```
 
-HEP skips PDF extraction; loading still prepares LOD and GPU resources. See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md#hep-files) for browser export and Node conversion.
+HEP skips PDF extraction. Pass `withVectorLod: true` and/or `withTextLod: true`
+to store optional LOD caches and skip expensive simplification on load. Shared
+vector records reduce file size; spatial indexes and GPU resources are prepared
+when opening the file. Stored vector LODs default to compact precision, with bounded
+rounding of derived positions; the exact scene stays unchanged. Set
+`vectorLodPrecision: "lossless"` to disable additional rounding.
+See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md#hep-files) for browser export and Node conversion.
 
 HEP uses scene schema **v9 only**. Regenerate older archives from the original
 PDFs. Exports retain hidden content and original layer defaults; temporary layer

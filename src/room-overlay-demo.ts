@@ -489,7 +489,10 @@ async function loadExampleManifest(): Promise<void> {
             label: "HEP",
             sizeLabel: formatFileSize(entry.hepSizeBytes),
             title: `Load precomputed HEP data for ${entry.name}`
-          }
+          },
+          ...(entry.hepLodPath ? [{ key: `${entry.id}:hep-lod`, label: "HEP+LOD",
+            sizeLabel: formatFileSize(entry.hepLodSizeBytes ?? 0),
+            title: `Load ${entry.name} with stored vector and text LODs` }] : [])
         ]
       };
     });
@@ -504,8 +507,8 @@ async function loadExampleManifest(): Promise<void> {
 async function loadExampleSelection(selectionKey: string): Promise<void> {
   const separatorIndex = selectionKey.lastIndexOf(":");
   const entry = exampleEntryMap.get(selectionKey.slice(0, separatorIndex));
-  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "hep";
-  if (!entry || isBusy) {
+  const kind = selectionKey.slice(separatorIndex + 1) as "pdf" | "hep" | "hep-lod";
+  if (!entry || isBusy || (kind === "hep-lod" && !entry.hepLodPath)) {
     return;
   }
 
@@ -516,8 +519,8 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
   setBusy(true);
   exampleDropdown.setDisabled(true);
   try {
-    setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : "HEP"})...`);
-    const response = await fetch(kind === "pdf" ? entry.pdfPath : entry.hepPath, {
+    setStatus(`Downloading example ${entry.name} (${kind === "pdf" ? "PDF" : kind === "hep-lod" ? "HEP+LOD" : "HEP"})...`);
+    const response = await fetch(kind === "pdf" ? entry.pdfPath : kind === "hep-lod" ? entry.hepLodPath! : entry.hepPath, {
       cache: "no-store", signal: controller.signal
     });
     if (!response.ok) {

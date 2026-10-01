@@ -1,3 +1,4 @@
+import type { HepLodOptions } from "./hepLod";
 import {
   loadPdfSceneFromSource,
   type PdfObjectSource
@@ -21,7 +22,7 @@ import type { AnnotationAppearanceMode } from "./annotationData";
 export type HepCompression = "deflate" | "store";
 
 /** Options shared by PDF-source and already-parsed scene HEP builds. */
-export interface HepEncodingOptions {
+export interface HepEncodingOptions extends HepLodOptions {
   /** Override the source name written to the HEP manifest. */
   sourceLabel?: string;
 
@@ -169,6 +170,9 @@ async function buildSceneHep(
     "interleaved",
     rasterLayers,
     {
+      withVectorLod: options.withVectorLod,
+      vectorLodPrecision: options.vectorLodPrecision,
+      withTextLod: options.withTextLod,
       encodeRasterImages: options.encodeRasterImages ?? true,
       compression: options.compression === "store" ? "STORE" : "DEFLATE",
       signal: options.signal,
@@ -288,6 +292,12 @@ function normalizeSourceLabel(value: string | undefined, fallback: string): stri
 }
 
 function validateEncodingOptions(options: HepEncodingOptions): void {
+  if (options.vectorLodPrecision !== undefined && !["lossless", "compact"].includes(options.vectorLodPrecision)) {
+    throw new RangeError("vectorLodPrecision must be lossless or compact.");
+  }
+  for (const key of ["withVectorLod", "withTextLod"] as const) {
+    if (options[key] !== undefined && typeof options[key] !== "boolean") throw new RangeError(`${key} must be a boolean.`);
+  }
   if ("sourcePdf" in options || "sourcePdfPages" in options) {
     throw new RangeError("sourcePdf and sourcePdfPages are no longer supported; HEP v7 requires a complete scene. Reparse the original PDF before export.");
   }

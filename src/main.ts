@@ -1,3 +1,4 @@
+import { promptForHepLod } from "./hepLodPrompt";
 import { createViewerLinkNavigation } from "./viewerLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import "./style.css";
@@ -818,6 +819,11 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
       pdfPath: entry.pdfPath
     });
 
+    const lodKey = `${entry.id}:hep-lod`;
+    if (entry.hepLodPath) exampleSelectionMap.set(lodKey, {
+      id: entry.id, sourceName: entry.name, kind: "hep", path: entry.hepLodPath, pdfPath: entry.pdfPath
+    });
+
     items.push({
       name: entry.name,
       actions: [
@@ -832,7 +838,10 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
           label: "HEP",
           sizeLabel: formatFileSize(entry.hepSizeBytes),
           title: `Load precomputed HEP data for ${entry.name}`
-        }
+        },
+        ...(entry.hepLodPath ? [{ key: lodKey, label: "HEP+LOD",
+          sizeLabel: formatFileSize(entry.hepLodSizeBytes ?? 0),
+          title: `Load ${entry.name} with stored vector and text LODs` }] : [])
       ]
     });
   }
@@ -1657,8 +1666,17 @@ async function downloadHep(): Promise<boolean> {
   setParsingLoader(true, "0.00% Preparing HEP export...");
 
   try {
+    const lodOptions = await promptForHepLod(scene, exportController.signal);
+    if (!lodOptions) {
+      if (activeHepExportController === exportController) {
+        statusTextElement.textContent = previousStatusText;
+        statusTextElement.hidden = !previousStatusText?.trim();
+      }
+      return false;
+    }
     await yieldToBrowserPaint();
     const hepBlob = await buildHep(scene, {
+      ...lodOptions,
       sourceLabel: label,
       signal: exportController.signal,
       onProgress: (progress) => {
@@ -1672,7 +1690,7 @@ async function downloadHep(): Promise<boolean> {
       return false;
     }
 
-    const hepFileName = `${sanitizeDownloadName(label)}-parsed-data.hep`;
+    const hepFileName = `${sanitizeDownloadName(label)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
     triggerBrowserDownload(hepBlob, hepFileName);
     console.log(
       `[Parsed data export] ${label}: wrote ${hepFileName} (${formatFileSize(hepBlob.size)})`

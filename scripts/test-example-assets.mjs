@@ -115,7 +115,7 @@ async function run() {
 
   for (const sourceName of ["src/main.ts", "src/three-example.ts"]) {
     const source = await readFile(path.join(repoRootDir, sourceName), "utf8");
-    assert.match(source, /-parsed-data\.hep/, `${sourceName} must export .hep filenames`);
+    assert.match(source, /-parsed-data[^\n]*\.hep/, `${sourceName} must export .hep filenames`);
     assert.doesNotMatch(source, /-parsed-data\.zip/, `${sourceName} must not export .zip filenames`);
   }
   const brochure = manifest.examples.find((entry) => entry.name.includes("Broschuere_Leo_B2C"));

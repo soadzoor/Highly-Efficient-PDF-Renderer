@@ -1,3 +1,4 @@
+// Build/representation changes must bump HEP_VECTOR_LOD_VERSION in hepLod.ts.
 import {
   CompactStrokeIntervalGroups, NumberTupleTable,
   type StrokeIntervalPrimitive as StrokePrimitive, type StrokeIntervalGroup as IntervalGroup
@@ -539,6 +540,8 @@ export class VectorStrokeLodRuntime {
   private stats: VectorStrokeLodStats;
 
   constructor(scene: VectorScene, buildData?: VectorStrokeLodRuntimeBuildData) {
+    const restored = !buildData ? storedBuilds.get(scene) : undefined;
+    if (restored) buildData = restoreVectorStrokeLodBuild(scene, restored);
     const lodBuildStart = nowMs();
     this.tileGrid = buildData?.tileGrid ?? createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
     this.tileSelectedLevelIndices = new Int16Array(this.tileGrid.columns * this.tileGrid.rows);
@@ -564,8 +567,11 @@ export class VectorStrokeLodRuntime {
     }
     this.stats = this.createEmptyStats();
     const elapsedMs = buildData?.elapsedMs ?? (nowMs() - lodBuildStart);
-    logVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels);
-    recordVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels.length);
+    if (buildData?.elapsedMs !== 0) {
+      logVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels);
+      recordVectorLodBuildTiming(elapsedMs, scene.segmentCount, this.levels.length);
+    }
+    latestRuntimeByScene.set(scene, new WeakRef(this));
   }
 
   setScreenSpaceTransform(): void {
@@ -1276,7 +1282,7 @@ interface StrokeLodBuildStep {
 /** One build implementation serves synchronous and cooperative callers. */
 type StrokeLodBuild<T> = Generator<StrokeLodBuildStep, T, void>;
 
-interface StrokeLodHierarchyLevel {
+export interface StrokeLodHierarchyLevel {
   tolerance: number;
   overview?: boolean;
   segmentCount: number;
@@ -1297,7 +1303,7 @@ interface StrokeLodStorageBounds {
   maxY: Float32Array;
 }
 
-interface StrokeLodTileBuckets {
+export interface StrokeLodTileBuckets {
   tileOffsets: Uint32Array;
   tileCounts: Uint32Array;
   tileSegmentIds: Uint32Array;
@@ -1472,8 +1478,10 @@ function* buildStrokeLodTileBuckets(
   bounds: StrokeLodStorageBounds,
   grid: RuntimeTileGrid,
   startValue: number,
-  endValue: number
+  endValue: number,
+  maxReferences = Infinity
 ): StrokeLodBuild<StrokeLodTileBuckets> {
+  let referenceCount = 0;
   const tileCount = grid.columns * grid.rows;
   const tileCounts = new Uint32Array(tileCount);
   const range: RuntimeTileRange = { c0: 0, c1: 0, r0: 0, r1: 0 };
@@ -1481,6 +1489,8 @@ function* buildStrokeLodTileBuckets(
   for (let i = 0; i < segmentCount; i += 1) {
     const id = records ? records[i] : i;
     if (writeTileRangeForBounds(bounds.minX[id], bounds.minY[id], bounds.maxX[id], bounds.maxY[id], grid, range)) {
+      referenceCount += (range.r1 - range.r0 + 1) * (range.c1 - range.c0 + 1);
+      if (referenceCount > maxReferences) throw new Error("Vector LOD tile index resource limit exceeded");
       for (let row = range.r0; row <= range.r1; row += 1) {
         let tileIndex = row * grid.columns + range.c0;
         for (let column = range.c0; column <= range.c1; column += 1) {
@@ -1593,6 +1603,12 @@ async function prepareVectorStrokeLodRuntime(
     } finally {
       if (cacheResult || !completed) storePrebuiltVectorStrokeLodRuntimeInternal(scene, cached);
     }
+  }
+  if (storedBuilds.has(scene)) {
+    const runtime = new VectorStrokeLodRuntime(scene);
+    if (cacheResult) storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
+    scheduler.report(1, "Stored Vector LOD ready");
+    return runtime;
   }
   const tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
   await scheduler.maybeYield(true, 0.04, "Partitioning stroke density");
@@ -2666,4 +2682,75 @@ function clampInt(value: number, min: number, max: number): number {
     return max;
   }
   return value;
+}
+
+/** Reusable geometry and spatial index; selection scratch is deliberately excluded. @internal */
+export interface StoredVectorStrokeLod {
+  /** Persisted coordinate grid for optional compact geometry; canonical strokes are untouched. */
+  positionQuantum?: number;
+  /** v3 per-record grids, bounded by the finest referencing level. */
+  positionQuanta?: Float32Array;
+  tileGrid: RuntimeTileGrid;
+  literals: Pick<VectorScene, "segmentCount" | "endpoints" | "primitiveMeta" | "primitiveBounds" | "styles">;
+  origins?: Uint32Array;
+  levels: (StrokeLodHierarchyLevel & StrokeLodTileBuckets)[];
+}
+
+const storedBuilds = new WeakMap<VectorScene, StoredVectorStrokeLod>();
+// Export may inspect an active hierarchy without borrowing its mutable runtime
+// or keeping a disposed renderer alive.
+const latestRuntimeByScene = new WeakMap<VectorScene, WeakRef<VectorStrokeLodRuntime>>();
+
+export function getStoredVectorStrokeLod(scene: VectorScene): StoredVectorStrokeLod | null {
+  const persisted = storedBuilds.get(scene);
+  if (persisted) return persisted;
+  const runtime = latestRuntimeByScene.get(scene)?.deref();
+  const literals = runtime?.levels[0]?.store?.literals;
+  if (!runtime || !literals) return null;
+  return {
+    tileGrid: runtime.tileGrid,
+    literals: { segmentCount: literals.segmentCount, endpoints: literals.endpoints,
+      primitiveMeta: literals.primitiveMeta, primitiveBounds: literals.primitiveBounds, styles: literals.styles },
+    origins: explicitStrokePaintOrigins(literals),
+    levels: runtime.levels.map(level => ({ tolerance: level.tolerance, overview: level.overview,
+      segmentCount: level.segmentCount, records: level.records, sceneBounds: level.sceneBounds!,
+      maxHalfWidth: level.maxHalfWidth!, tileOffsets: level.tileOffsets, tileCounts: level.tileCounts,
+      tileSegmentIds: level.tileSegmentIds }))
+  };
+}
+
+/** Install validated data. Each viewer gets its own selection state. @internal */
+export function storeVectorStrokeLod(scene: VectorScene, data: StoredVectorStrokeLod): void {
+  storedBuilds.set(scene, data);
+}
+
+function restoreVectorStrokeLodBuild(scene: VectorScene, data: StoredVectorStrokeLod): VectorStrokeLodRuntimeBuildData {
+  const literals = { ...scene, ...data.literals };
+  setStrokePaintOrigins(literals, data.origins);
+  const store = { canonical: scene, literals };
+  const bounds = runStrokeLodBuild(buildStrokeLodStorageBounds(store, 0, 1));
+  return { tileGrid: data.tileGrid, elapsedMs: 0,
+    levels: data.levels.map(level => new StoredVectorStrokeLodLevel(store, level, level, bounds)) };
+}
+
+/** Rebuild only spatial lookup tables, never simplification. Input geometry must be validated first. */
+export async function rebuildStoredVectorStrokeLodIndexes(scene: VectorScene, data: StoredVectorStrokeLod,
+  signal?: AbortSignal): Promise<StoredVectorStrokeLod> {
+  signal?.throwIfAborted();
+  const scheduler = new VectorStrokeLodYieldScheduler({ yieldIntervalMs: 50, shouldCancel: () => signal?.aborted ?? false });
+  await scheduler.maybeYield(true, 0, "Restoring Vector LOD indexes");
+  const literals = { ...scene, ...data.literals };
+  setStrokePaintOrigins(literals, data.origins);
+  const bounds = await runStrokeLodBuildAsync(buildStrokeLodStorageBounds({ canonical: scene, literals }, 0, 0.2), scheduler);
+  const levels: StoredVectorStrokeLod["levels"] = [];
+  let remainingReferences = 64 * 1024 * 1024;
+  for (let i = 0; i < data.levels.length; i++) {
+    const level = data.levels[i];
+    const buckets = await runStrokeLodBuildAsync(buildStrokeLodTileBuckets(level.records, level.segmentCount,
+      bounds, data.tileGrid, 0.2 + 0.8 * i / data.levels.length, 0.2 + 0.8 * (i + 1) / data.levels.length, remainingReferences), scheduler);
+    remainingReferences -= buckets.tileSegmentIds.length;
+    levels.push({ ...level, ...buckets });
+  }
+  signal?.throwIfAborted();
+  return { ...data, levels };
 }

@@ -732,14 +732,65 @@ Set `encodeRasterImages: false` to store raw raster pixels. Set
 compression stream APIs. Such files can also be loaded without native
 decompression streams. Both options can increase file size.
 
-The builder accepts `signal` and `onProgress`, including raster encoding and
+LODs are omitted by default to keep files compact. Set `withVectorLod: true`
+and/or `withTextLod: true` to store them. Vector caches share unchanged canonical
+strokes and identical derived records across levels. Spatial indexes are rebuilt
+cooperatively on load, with cancellation support; expensive simplification is skipped.
+Text caches include runs, clusters and
+coarse instances. Export reuses an available build or creates the requested
+LOD. Text caches are omitted when the scene does not qualify for text LOD.
+
+Stored vector LODs default to compact precision; text LODs remain lossless. Vector cache v3 omits tile indexes and
+shares identical derived records; text cache v2 remains unchanged. Encoding predicts repeated
+coordinates/bounds from existing strokes and packs text metadata into numeric
+columns. Enable the desired caches; compact vector precision is automatic:
+
+```ts
+const hep = await buildHep(pdf.sceneData, {
+  withVectorLod: true, withTextLod: true
+});
+```
+
+Set `vectorLodPrecision: "lossless"` (CLI: `--vector-lod-precision=lossless`)
+to disable additional rounding.
+
+Compact mode rounds derived vector coordinates to power-of-two grids no larger
+than 1/32 of the finest referencing level's simplification tolerance. Per-axis
+rounding error is at most half a grid step. For example, tolerance 0.5 uses a
+1/64-unit grid; a record used only at tolerance 32 can use a 1-unit grid. Shared
+records keep the finer precision. Rounding displacement is added to the level's
+selection tolerance, preserving the renderer's screen-space error budget.
+Exact canonical geometry, stroke widths/colors/opacity and clipping windows stay
+unchanged. Bounds cover the rounded geometry, and tile indexes are rebuilt from it.
+Text LOD storage remains lossless. Very large coordinates outside the compact
+integer range retain lossless storage with a warning. Re-exporting a compact
+cache preserves its existing rounding; selecting lossless does not recover
+precision already discarded. Rebuild from the original PDF or compact HEP
+without LODs to recover the original LOD geometry.
+
+On load, matching caches skip simplification and clustering. Missing caches are
+built when the viewer needs them. Invalid or incompatible caches produce a
+console warning recommending regeneration and fall back to normal generation.
+Vector and text cache versions are independent of each other and of the HEP
+scene/container versions. Older viewers can ignore the optional sections.
+Version 1 caches remain usable with a warning recommending re-export/repacking
+for smaller files; no simplification or clustering is repeated. The reader also
+recovers the v1 JSON null sentinel for exact-only text nodes. GPU upload and
+mutable selection state are still prepared at load time.
+
+Both example viewers' **Download HEP** button offers independent vector/text
+checkboxes when applicable, unchecked by default. Cancel or Escape stops the
+export. Vector LOD offers Lossless and Compact precision choices. Downloads with
+either LOD option use a `-parsed-data-lod.hep` suffix.
+
+The builder accepts `signal` and `onProgress`, including LOD building, raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
 The loader supports HEP containers v1 and v2 with scene schema v9. New exports
 use v2 only when an exact stroke-style palette makes the file smaller; these
 files require an updated viewer. Existing v1 files remain supported. The palette
-changes no rendering values and stores no vector LOD data. Earlier scene schemas
+changes no rendering values; optional LOD caches are separate sections. Earlier scene schemas
 must be regenerated from the original PDF; repacking a container cannot restore
 layer definitions or content omitted by an earlier conversion. The
 [container specification](HEP_CONTAINER.md) describes the binary format and
@@ -766,6 +817,8 @@ The CLI is not included in the published npm package.
 npm install
 node PDFtoHEP.js ./Level1.pdf
 node PDFtoHEP.js --output-dir=./heps ./pdfs
+node PDFtoHEP.js --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
+node PDFtoHEP.js --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
 node PDFtoHEP.js --force ./pdfs
 node PDFtoHEP.js --annotation-appearances=none ./pdfs
 HEPR_PDF_PASSWORD='secret' node PDFtoHEP.js ./protected.pdf
@@ -782,6 +835,37 @@ is kept in every mode. PDFs that require a password take it from
 the `HEPR_PDF_PASSWORD` environment variable; the same password is tried for
 every PDF, and the HEP output is not password protected. Use `--help` for the
 complete command syntax.
+
+The flags `--with-vector-lod` and `--with-text-lod` are independent and opt-in.
+They do not change the CLI output filename; use a separate output directory to
+keep compact and cached variants side by side.
+
+For the bundled examples, run `npm run regenerate:heps:lod` manually. It writes
+to `public/examples/heps-lod` and updates the manifest with **HEP+LOD** actions
+and file sizes. The existing `npm run regenerate:heps` keeps writing compact
+files to `public/examples/heps`. HEP+LOD actions appear only for files present
+when the manifest is generated.
+
+To shrink already-generated example caches without parsing PDFs or repeating
+LOD simplification, run:
+
+```bash
+npm run repack:heps:lod  # shared geometry, rebuilt indexes, compact vector precision
+```
+
+This updates the manifest after successful repacking. The tool rebuilds spatial
+indexes to verify the result; it never generates missing LOD geometry. The underlying tool defaults
+to measurement only, supports individual files, and has a hard 60-second deadline
+per file in isolated workers:
+
+```bash
+node scripts/repack-hep-lods.mjs public/examples/heps-lod/Level_1-parsed-data.hep
+```
+
+`--write` enables atomic replacement, only when smaller. Repacking verifies
+canonical section bytes and all decoded LOD data against the expected lossless
+or compact result before writing. Invalid/missing caches are rejected
+without starting a LOD build. Existing files are unchanged during measurement.
 
 The worker heap ceiling defaults to 12,288 MiB for dense documents. Override it
 with `HEPR_PDF_TO_HEP_HEAP_MB` or Node's `--max-old-space-size=<MiB>` argument.

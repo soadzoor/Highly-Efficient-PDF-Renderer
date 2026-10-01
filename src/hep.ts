@@ -1,3 +1,4 @@
+import { readHepLod, writeHepLod, type HepLodOptions } from "./hepLod";
 import { validatePagePrimitiveRanges } from "./scenePageViews";
 import { writeHepAnnotations, readHepAnnotations } from "./hepAnnotations";
 import { readHepStructure, writeHepStructure } from "./hepStructure";
@@ -132,7 +133,7 @@ type TextureComponentType =
   | "uint8-normalized"
   | "uint16-range-delta-columns";
 
-export interface BuildHepBlobOptions {
+export interface BuildHepBlobOptions extends HepLodOptions {
   encodeRasterImages?: boolean;
   compression?: "STORE" | "DEFLATE";
   signal?: AbortSignal;
@@ -140,7 +141,7 @@ export interface BuildHepBlobOptions {
 }
 
 export interface HepBuildProgress {
-  stage: "raster-encode" | "hep-build";
+  stage: "raster-encode" | "hep-build" | "vector-lod" | "text-lod";
   unit?: "texels";
   processed?: number;
   total?: number;
@@ -210,6 +211,7 @@ interface ParsedDataSceneEntry {
 }
 
 interface ParsedDataManifest {
+  lod?: unknown;
   formatVersion?: unknown;
   sourceFile?: unknown;
   scene?: ParsedDataSceneEntry;
@@ -247,6 +249,8 @@ export async function buildHepBlobForLayout(
   sceneRasterLayers: RasterLayer[],
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
+  throwIfBuildAborted(options.signal);
+  if (options.withVectorLod || options.withTextLod) scene = prepareSceneForHepRendering(scene);
   validatePagePrimitiveRanges(scene);
   validateVectorDrawRuns(scene);
   validateSceneOptionalContentReferences(scene);
@@ -259,7 +263,14 @@ export async function buildHepBlobForLayout(
     ? countRasterTexelsToEncode(sceneRasterLayers)
     : 0;
   const hepBuildStart = totalRasterTexels > 0 ? 0.4 : 0;
-  options.onBuildProgress?.(
+  const lodBuildEnd = options.withVectorLod || options.withTextLod ? 0.6 : 0;
+  const reportBuildProgress = (value: number, progress: HepBuildProgress): void => {
+    options.onBuildProgress?.(lodBuildEnd + value * (1 - lodBuildEnd), progress);
+  };
+  const archive = new HepArchive();
+  const lod = await writeHepLod(archive, scene, { ...options,
+    onProgress: (value, stage) => options.onBuildProgress?.(value * lodBuildEnd, { stage }) });
+  reportBuildProgress(
     0,
     totalRasterTexels > 0
       ? {
@@ -270,7 +281,6 @@ export async function buildHepBlobForLayout(
         }
       : { stage: "hep-build" }
   );
-  const archive = new HepArchive();
   const annotations = writeHepAnnotations(archive, scene);
   const structure = writeHepStructure(archive, scene);
   const gradientMesh = writeHepGradientMesh(archive, scene);
@@ -371,13 +381,13 @@ export async function buildHepBlobForLayout(
   const rasterLayersManifest = await writeHepRasterLayers(archive, rasterLayers, {
     encodeRasterImages,
     signal: options.signal,
-    onTexelsEncoded: (processed) => options.onBuildProgress?.(
+    onTexelsEncoded: (processed) => reportBuildProgress(
       0.4 * (processed / totalRasterTexels),
       { stage: "raster-encode", unit: "texels", processed, total: totalRasterTexels }
     )
   });
   throwIfBuildAborted(options.signal);
-  options.onBuildProgress?.(hepBuildStart, { stage: "hep-build" });
+  reportBuildProgress(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
     formatVersion: PARSED_DATA_FORMAT_VERSION,
@@ -467,9 +477,9 @@ export async function buildHepBlobForLayout(
   };
 
   throwIfBuildAborted(options.signal);
-  archive.file("manifest.json", JSON.stringify(manifest));
+  archive.file("manifest.json", JSON.stringify({ ...manifest, ...(lod ? { lod } : {}) }));
   const onHepProgress = (metadata: { percent: number }): void => {
-    options.onBuildProgress?.(
+    reportBuildProgress(
       hepBuildStart + (1 - hepBuildStart) * (metadata.percent / 100),
       { stage: "hep-build" }
     );
@@ -480,7 +490,7 @@ export async function buildHepBlobForLayout(
     signal: options.signal
   }, onHepProgress);
   throwIfBuildAborted(options.signal);
-  options.onBuildProgress?.(1, { stage: "hep-build" });
+  reportBuildProgress(1, { stage: "hep-build" });
   throwIfBuildAborted(options.signal);
 
   return {
@@ -2154,6 +2164,7 @@ async function loadSceneFromHepInternal(
   scene.annotations = await readHepAnnotations(archive, sceneMeta.annotations, scene, signal);
   await readHepStructure(archive, sceneMeta.structure, scene, signal);
   preparedHepScenes.add(scene);
+  await readHepLod(archive, scene, manifest.lod, signal);
   progress.complete({ sourceType: "hep" });
   return scene;
 }

@@ -5,6 +5,7 @@ export interface ExampleAssetManifestEntry {
     path?: unknown;
     sizeBytes?: unknown;
   };
+  hepLod?: { path?: unknown; sizeBytes?: unknown };
   hep?: {
     path?: unknown;
     sizeBytes?: unknown;
@@ -21,6 +22,8 @@ export interface NormalizedExampleEntry {
   name: string;
   pdfPath: string;
   pdfSizeBytes: number;
+  hepLodPath?: string;
+  hepLodSizeBytes?: number;
   hepPath: string;
   hepSizeBytes: number;
 }
@@ -65,6 +68,10 @@ export function normalizeExampleManifestEntries(manifest: ExampleAssetManifest):
       name,
       pdfPath,
       pdfSizeBytes: readNonNegativeInt(raw?.pdf?.sizeBytes, 0),
+      ...(readNonEmptyString(raw?.hepLod?.path) ? {
+        hepLodPath: resolveAppAssetUrl(raw.hepLod!.path as string),
+        hepLodSizeBytes: readNonNegativeInt(raw.hepLod?.sizeBytes, 0)
+      } : {}),
       hepPath,
       hepSizeBytes: readNonNegativeInt(raw?.hep?.sizeBytes, 0)
     });

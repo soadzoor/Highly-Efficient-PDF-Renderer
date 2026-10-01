@@ -282,7 +282,7 @@ button:hover {
   position: fixed;
   z-index: 40;
   width: max-content;
-  max-width: min(460px, calc(100vw - 32px));
+  max-width: min(620px, calc(100vw - 32px));
   padding: 6px;
   overflow-y: auto;
   background: rgba(255, 255, 255, 0.97);
@@ -555,4 +555,10 @@ button:disabled {
 
 .drop-indicator.dragging {
   background: rgba(10, 22, 40, 0.18);
+}
+
+@media (max-width: 520px) {
+  .example-menu-row { flex-wrap: wrap; gap: 6px; }
+  .example-menu-name { flex-basis: 100%; }
+  .example-menu-actions { flex-wrap: wrap; }
 }

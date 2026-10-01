@@ -99,6 +99,7 @@ function validateName(name: string): Uint8Array {
 function entryLimit(name: string, limits?: Record<string, number>): number {
   let limit = MAX_CHUNK_BYTES;
   if (name === "manifest.json") limit = 16 * 1024 * 1024;
+  if (name === "lod-vector/index.json" || name === "lod-text/index.json") limit = 64 * 1024 * 1024;
   if (name === "annotations/annotations.json") limit = 64 * 1024 * 1024;
   if (name === "source/source.pdf" || name === "source.pdf") limit = 512 * 1024 * 1024;
   if (name.startsWith("raster/")) limit = 768 * 1024 * 1024;

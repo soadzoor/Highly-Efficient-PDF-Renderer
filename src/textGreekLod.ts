@@ -1,3 +1,4 @@
+// Build/representation changes must bump HEP_TEXT_LOD_VERSION in hepLod.ts.
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 
 /** Documents below this size retain the exact text path only. */

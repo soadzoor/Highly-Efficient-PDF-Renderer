@@ -41,6 +41,10 @@ Options:
       new conversion would only change its generatedAt timestamp.
   -h, --help   Show this help text.
   --output-dir=<directory>  Write all HEP files into this directory.
+  --with-vector-lod  Store vector LOD geometry; rebuild spatial indexes on load.
+  --with-text-lod  Store text LOD clusters when applicable.
+  --vector-lod-precision=lossless|compact  Stored vector LOD precision (default: compact).
+      compact rounds derived positions according to LOD tolerance; exact geometry stays unchanged.
   --icc-engine=qcms|lcms|alternate|none  ICC conversion (default: qcms).
       qcms/lcms: load the preferred engine only when needed; if unavailable or
                  unsupported, try the other engine, then alternate colors.
@@ -87,6 +91,9 @@ export function parsePdfToHepArguments(args) {
   let iccEngine;
   let annotationAppearances;
   let password;
+  let withVectorLod = false;
+  let withTextLod = false;
+  let vectorLodPrecision;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -103,6 +110,16 @@ export function parsePdfToHepArguments(args) {
     }
     if (!positionalOnly && argument === "--keep-unchanged") {
       keepUnchanged = true;
+      continue;
+    }
+    if (!positionalOnly && argument === "--with-vector-lod") { withVectorLod = true; continue; }
+    if (!positionalOnly && argument === "--with-text-lod") { withTextLod = true; continue; }
+    if (!positionalOnly && argument.startsWith("--vector-lod-precision=")) {
+      const value = argument.slice("--vector-lod-precision=".length);
+      if (vectorLodPrecision !== undefined || !["lossless", "compact"].includes(value)) {
+        throw new Error("Pass exactly one --vector-lod-precision=lossless or --vector-lod-precision=compact.");
+      }
+      vectorLodPrecision = value;
       continue;
     }
     if (!positionalOnly && argument.startsWith("--output-dir=")) {
@@ -156,6 +173,9 @@ export function parsePdfToHepArguments(args) {
 
   return {
     force, help, inputPath,
+    ...(withVectorLod ? { withVectorLod } : {}),
+    ...(withTextLod ? { withTextLod } : {}),
+    ...(vectorLodPrecision === undefined ? {} : { vectorLodPrecision }),
     ...(keepUnchanged ? { keepUnchanged } : {}),
     ...(outputDirectory === undefined ? {} : { outputDirectory }),
     ...(iccEngine === undefined ? {} : { iccEngine }),
@@ -298,13 +318,16 @@ function parseWorkerHeapMb(value, label) {
 }
 
 export function pdfToHepWorkerArguments(
-  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged
+  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged, withVectorLod, withTextLod, vectorLodPrecision
 ) {
   return [
     `--max-old-space-size=${heapMb}`,
     scriptPath,
     ...(force ? ["--force"] : []),
     ...(keepUnchanged ? ["--keep-unchanged"] : []),
+    ...(withVectorLod ? ["--with-vector-lod"] : []),
+    ...(withTextLod ? ["--with-text-lod"] : []),
+    ...(vectorLodPrecision === undefined ? [] : [`--vector-lod-precision=${vectorLodPrecision}`]),
     ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
     ...(iccEngine === undefined ? [] : [`--icc-engine=${iccEngine}`]),
     ...(annotationAppearances === undefined ? [] : [`--annotation-appearances=${annotationAppearances}`]),
@@ -633,7 +656,8 @@ export function startPdfToHepWorker(
   const child = spawnImplementation(
     process.execPath,
     pdfToHepWorkerArguments(
-      item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances, item.keepUnchanged
+      item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances, item.keepUnchanged,
+      item.withVectorLod, item.withTextLod, item.vectorLodPrecision
     ),
     {
       stdio: "inherit",
@@ -906,6 +930,9 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         iccEngine: options.iccEngine,
         annotationAppearances: options.annotationAppearances,
         keepUnchanged: options.keepUnchanged,
+        withVectorLod: options.withVectorLod,
+        withTextLod: options.withTextLod,
+        vectorLodPrecision: options.vectorLodPrecision,
         ...(password === undefined ? {} : { password }),
         fileNumber: index + 1,
         fileCount: pdfPaths.length
@@ -971,6 +998,9 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         abortController.signal.throwIfAborted();
         const hepBlob = await builder.buildHep(pdfBytes, {
           sourceLabel,
+          withVectorLod: options.withVectorLod,
+          withTextLod: options.withTextLod,
+          vectorLodPrecision: options.vectorLodPrecision,
           signal: abortController.signal,
           password,
           iccEngine: options.iccEngine,

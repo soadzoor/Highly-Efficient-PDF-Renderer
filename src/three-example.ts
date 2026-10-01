@@ -1,3 +1,4 @@
+import { promptForHepLod } from "./hepLodPrompt";
 import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import * as THREE from "three";
@@ -1799,8 +1800,11 @@ async function downloadHep(): Promise<boolean> {
   textLodSelectElement.disabled = true;
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
+    const lodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
+    if (!lodOptions) return false;
     await yieldToBrowserPaint();
     const hepBlob = await buildHep(pdfObject.sceneData, {
+      ...lodOptions,
       sourceLabel: pdfObject.sourceLabel,
       signal: exportController.signal,
       onProgress: (progress) => {
@@ -1817,7 +1821,7 @@ async function downloadHep(): Promise<boolean> {
       return false;
     }
 
-    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data.hep`;
+    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
     triggerBrowserDownload(hepBlob, hepFileName);
     return true;
   } catch (error) {
@@ -2135,6 +2139,11 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
       pdfPath: entry.pdfPath
     });
 
+    const lodKey = `${entry.id}:hep-lod`;
+    if (entry.hepLodPath) exampleSelectionMap.set(lodKey, {
+      id: entry.id, sourceName: entry.name, kind: "hep", path: entry.hepLodPath, pdfPath: entry.pdfPath
+    });
+
     items.push({
       name: entry.name,
       actions: [
@@ -2149,7 +2158,10 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
           label: "HEP",
           sizeLabel: formatFileSize(entry.hepSizeBytes),
           title: `Load precomputed HEP data for ${entry.name}`
-        }
+        },
+        ...(entry.hepLodPath ? [{ key: lodKey, label: "HEP+LOD",
+          sizeLabel: formatFileSize(entry.hepLodSizeBytes ?? 0),
+          title: `Load ${entry.name} with stored vector and text LODs` }] : [])
       ]
     });
   }

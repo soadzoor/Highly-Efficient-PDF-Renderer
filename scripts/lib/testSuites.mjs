@@ -14,6 +14,8 @@ export const fastTests = [
   "hep-container",
   "hep-float32-palette",
   "hep-api",
+  "hep-lod",
+  "hep-lod-examples",
   "hep-annotations",
   "pdf-annotation-metadata",
   "annotation-appearances",
