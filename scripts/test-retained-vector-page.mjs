@@ -6,9 +6,26 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !specifier.endsWith(".ts") ? `${specifier}.ts` : specifier, context);
 } });
 try {
-  const [{ openPdf }, { lowerRetainedPageToVectorScene }, { getScenePrimitive }, { validateVectorDrawRuns }] = await Promise.all([
-    import("../src/pdfSession.ts"), import("../src/retainedVectorPage.ts"), import("../src/scenePrimitives.ts"), import("../src/vectorDrawOrder.ts")
+  const [{ openPdf }, { lowerRetainedPageToVectorScene, buildRetainedPatternCellPage }, { getScenePrimitive }, { validateVectorDrawRuns },
+    { resolveHeprPatternPaint }, { HEPR_PAINT_KIND }, { validateHeprPageData }] = await Promise.all([
+    import("../src/pdfSession.ts"), import("../src/retainedVectorPage.ts"), import("../src/scenePrimitives.ts"), import("../src/vectorDrawOrder.ts"),
+    import("../src/heprDisplayExecutor.ts"), import("../src/heprDocumentData.ts"), import("../src/heprDocumentDataValidation.ts")
   ]);
+  // Lowering executes pattern cell pages unvalidated, trusting that they are
+  // valid whenever their page is. Check that against the full validator.
+  const validatePatternCellPages = page => {
+    const kinds = new Set();
+    for (let paint = 0; paint < page.stores.paints.kinds.length; paint++) {
+      const resolved = page.stores.paints.kinds[paint] === HEPR_PAINT_KIND.Pattern ? resolveHeprPatternPaint(page, paint) : null;
+      if (!resolved || resolved.kind === "shading") continue;
+      const cellPage = buildRetainedPatternCellPage(page, resolved);
+      validateHeprPageData(cellPage.page);
+      cellPage.transforms.set([0, 2, -2, 0, 7, 9], cellPage.cellOffset);
+      validateHeprPageData(cellPage.page);
+      kinds.add(resolved.kind);
+    }
+    return kinds;
+  };
   const fixture = (content, resources, extra = []) => writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
@@ -19,6 +36,7 @@ try {
     const session = await openPdf({ kind: "bytes", bytes });
     try {
       const page = await session.compilePage(0, { retainOptionalContent: true });
+      const patternCellKinds = validatePatternCellPages(page);
       const original = structuredClone(page);
       const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
       assert.deepEqual(page, original, "retained lowering leaves all source stores unchanged");
@@ -28,7 +46,7 @@ try {
       const integrated = await session.compileVectorPage(0, { vectorFallback: "error" });
       assert.equal(integrated.rasterLayers.length, 0, "the viewer compiler uses vector lowering before raster fallback");
       validateVectorDrawRuns(integrated);
-      return { page, scene };
+      return { page, scene, patternCellKinds };
     } finally { await session.close(); }
   };
   {
@@ -39,17 +57,19 @@ try {
     assert.equal(scene.rasterLayers.length, 0);
   }
   {
-    const { scene } = await compile(fixture("/Pattern cs /P scn 0 0 20 20 re f", "/Pattern << /P 5 0 R >>", [
+    const { scene, patternCellKinds } = await compile(fixture("/Pattern cs /P scn 0 0 20 20 re f", "/Pattern << /P 5 0 R >>", [
       { number: 5, body: tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 5 5] /XStep 10 /YStep 10 /Resources << >>", "0 0 1 rg 0 0 5 5 re f") }
     ]));
+    assert.deepEqual([...patternCellKinds], ["colored-tiling"], "the colored cell page passes full validation");
     assert.ok(scene.fillPathCount >= 4); assert.equal(scene.rasterLayers.length, 0);
     assert.ok(scene.clipPaths.length > 0, "cell paint is clipped to the original path");
     assert.deepEqual(getScenePrimitive(scene, { kind: "fill", index: 0 }).color, [0, 0, 1]);
   }
   {
-    const { scene } = await compile(fixture("/PCS cs 1 0 0 /P scn 0 0 20 20 re f", "/ColorSpace << /PCS [/Pattern /DeviceRGB] >> /Pattern << /P 5 0 R >>", [
+    const { scene, patternCellKinds } = await compile(fixture("/PCS cs 1 0 0 /P scn 0 0 20 20 re f", "/ColorSpace << /PCS [/Pattern /DeviceRGB] >> /Pattern << /P 5 0 R >>", [
       { number: 5, body: tinyPdfStream("/Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 5 5] /XStep 10 /YStep 10 /Resources << >>", "0 0 5 5 re f") }
     ]));
+    assert.deepEqual([...patternCellKinds], ["uncolored-tiling"], "the uncolored cell page and its paint adapter pass full validation");
     assert.ok(scene.fillPathCount >= 4); assert.deepEqual(getScenePrimitive(scene, { kind: "fill", index: 0 }).color, [1, 0, 0]);
   }
   {

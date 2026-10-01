@@ -4,7 +4,8 @@ import { createEmptyVectorScene } from "./emptyVectorScene";
 import { HEPR_ANNOTATION_MARKED_CONTENT_TAG, HEPR_COLOR_SPACE_KIND, HEPR_PAINT_KIND, HEPR_STROKE_FLAG, expandHeprImageToRgba8,
   type HeprPageData, type PdfMatrix } from "./heprDocumentData";
 import { executeHeprDisplayProgram, multiplyHeprMatrices, resolveHeprPatternPaint, type HeprDisplayBackend,
-  type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionIndexScope, type HeprExecutionState } from "./heprDisplayExecutor";
+  type HeprDrawRunExecution, type HeprExecutionClipScope, type HeprExecutionIndexScope, type HeprExecutionState,
+  type HeprResolvedPatternPaint } from "./heprDisplayExecutor";
 import { AnnotationLayerBuilder } from "./annotationLayers";
 import { ContentItemRangeBuilder } from "./structureData";
 import { visitHeprPath } from "./heprPathGeometry";
@@ -127,6 +128,36 @@ function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
     }
   }
   return base;
+}
+
+/**
+ * The page one tiling-pattern cell executes: `page` plus a root group invoking the
+ * cell program at the transform stored at `cellOffset` (identity until a cell is
+ * placed). Lowering executes it without validation, so it must be valid whenever
+ * `page` is; the retained vector suite validates it for every pattern fixture.
+ */
+export function buildRetainedPatternCellPage(page: HeprPageData, resolved: HeprResolvedPatternPaint):
+  { readonly page: HeprPageData; readonly transforms: Float32Array; readonly cellOffset: number } {
+  const baseTransform = page.stores.transforms.values.length / 6, transforms = new Float32Array(page.stores.transforms.values.length + (resolved.basePaintIndex >= 0 ? 12 : 6));
+  transforms.set(page.stores.transforms.values);
+  transforms.set(IDENTITY, baseTransform * 6);
+  const wrapperTransform = baseTransform + 1;
+  if (resolved.basePaintIndex >= 0) transforms.set(IDENTITY, wrapperTransform * 6);
+  // The executor models inherited paint on Type3 invocations. An uncolored
+  // pattern uses the same adapter as the retained Canvas backend.
+  const programs = resolved.basePaintIndex < 0 ? page.displayProgram.programs : [...page.displayProgram.programs, {
+    kind: "type3" as const, matrixIndex: wrapperTransform, bounds: null, clipToBounds: false,
+    resourceName: "Vector uncolored-pattern paint adapter",
+    commands: [{ kind: "invoke-program" as const, transformIndex: wrapperTransform, clipIndex: -1,
+      optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1,
+      programIndex: resolved.programIndex, type3PaintIndex: -1, viewTransformFlags: 0 }]
+  }];
+  const programIndex = resolved.basePaintIndex < 0 ? resolved.programIndex : page.displayProgram.programs.length;
+  const root = { ...page.displayProgram.groups[page.displayProgram.rootGroupIndex], alpha: 1, alphaIsShape: false, isolated: true, knockout: false, blendMode: "Normal" as const, softMaskGroupIndex: -1, softMaskSubtype: null, softMaskTransferFunctionIndex: -1, backdropPaintIndex: -1, blendingColorSpaceIndex: -1, clipIndex: -1,
+    commands: [{ kind: "invoke-program" as const, transformIndex: baseTransform, clipIndex: -1, optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1, programIndex, type3PaintIndex: resolved.basePaintIndex, viewTransformFlags: 0 }] };
+  return { page: { ...page, stores: { ...page.stores, transforms: { values: transforms } },
+    displayProgram: { ...page.displayProgram, programs, rootGroupIndex: page.displayProgram.groups.length, groups: [...page.displayProgram.groups, root] } },
+  transforms, cellOffset: baseTransform * 6 };
 }
 
 /** Lower self-contained reusable PDF programs into canonical geometry and a retained paint graph. */
@@ -627,38 +658,20 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (!Number.isSafeInteger(amount) || amount < 0 || amount > maxCells - cells) throw new PdfError("resource-limit", "Vector tiling pattern exceeds its cell budget.", { details: { reason: "vector-expansion-limit" } });
     cells += amount; patternActive.add(p);
     const paintedClip = clipFromGeometry(g, clip, rule);
-    const baseTransform = page.stores.transforms.values.length / 6, transforms = new Float32Array(page.stores.transforms.values.length + (resolved.basePaintIndex >= 0 ? 12 : 6));
-    transforms.set(page.stores.transforms.values);
-    const wrapperTransform = baseTransform + 1;
-    if (resolved.basePaintIndex >= 0) transforms.set(IDENTITY, wrapperTransform * 6);
-    // The executor models inherited paint on Type3 invocations. An uncolored
-    // pattern uses the same adapter as the retained Canvas backend.
-    const programs = resolved.basePaintIndex < 0 ? page.displayProgram.programs : [...page.displayProgram.programs, {
-      kind: "type3" as const, matrixIndex: wrapperTransform, bounds: null, clipToBounds: false,
-      resourceName: "Vector uncolored-pattern paint adapter",
-      commands: [{ kind: "invoke-program" as const, transformIndex: wrapperTransform, clipIndex: -1,
-        optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1,
-        programIndex: resolved.programIndex, type3PaintIndex: -1, viewTransformFlags: 0 }]
-    }];
-    const programIndex = resolved.basePaintIndex < 0 ? resolved.programIndex : page.displayProgram.programs.length;
-    const root = { ...page.displayProgram.groups[page.displayProgram.rootGroupIndex], alpha: 1, alphaIsShape: false, isolated: true, knockout: false, blendMode: "Normal" as const, softMaskGroupIndex: -1, softMaskSubtype: null, softMaskTransferFunctionIndex: -1, backdropPaintIndex: -1, blendingColorSpaceIndex: -1, clipIndex: -1,
-      commands: [{ kind: "invoke-program" as const, transformIndex: baseTransform, clipIndex: -1, optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1, programIndex, type3PaintIndex: resolved.basePaintIndex, viewTransformFlags: 0 }] };
-    const stores = { ...page.stores, transforms: { values: transforms } };
-    const displayProgram = { ...page.displayProgram, programs, rootGroupIndex: page.displayProgram.groups.length, groups: [...page.displayProgram.groups, root] };
+    const cellPage = buildRetainedPatternCellPage(page, resolved), { transforms, cellOffset } = cellPage;
     const group: ScenePaintGroup = { kind: "group", children: [], alpha: page.stores.paints.alphas[paint],
       isolated: true, knockout: false, blendMode: "Normal", optionalContent: condition };
     stack.at(-1)!.push(group); stack.push(group.children);
     try {
-      // The top-level execution validated `page`, and the root, adapter and wrapper
-      // transform above only reference its valid indices. The cell matrix is the one
-      // new value, so each tile checks it after Float32 storage instead of
-      // revalidating the whole page.
+      // The top-level execution validated `page`, and the cell page stays valid
+      // with it. The cell matrix is the one new value, so each tile checks it after
+      // Float32 storage instead of revalidating the whole page.
       for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
         signal.throwIfAborted();
-        transforms.set(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]), baseTransform * 6);
-        if (!transforms.subarray(baseTransform * 6, baseTransform * 6 + 6).every(Number.isFinite)) { skippedPatternCells++; continue; }
+        transforms.set(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]), cellOffset);
+        if (!transforms.subarray(cellOffset, cellOffset + 6).every(Number.isFinite)) { skippedPatternCells++; continue; }
         // A page object per tile keeps each cell's soft-mask executions apart.
-        await executeHeprDisplayProgram({ ...page, stores, displayProgram }, backend(paintedClip, condition, currentItem), { signal, trustedPage: true });
+        await executeHeprDisplayProgram({ ...cellPage.page }, backend(paintedClip, condition, currentItem), { signal, trustedPage: true });
       }
     } finally { stack.pop(); patternActive.delete(p); }
   };
