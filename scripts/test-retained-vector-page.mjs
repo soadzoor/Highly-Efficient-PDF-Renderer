@@ -349,6 +349,22 @@ try {
     } finally { await session.close(); }
   }
   {
+    // Cells 0..3 place within Float32 range; later cells overflow once stored.
+    const big = exponent => `1${"0".repeat(exponent)}.0`;
+    const session = await openPdf({ kind: "bytes", bytes: fixture("/Pattern cs /P scn 0 0 100 100 re f", "/Pattern << /P 5 0 R >>", [
+      { number: 5, body: tinyPdfStream(`/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [-${big(10)} -${big(10)} 1 1] /Matrix [${big(29)} 0 0 ${big(29)} 0 0] /XStep ${big(9)} /YStep ${big(9)} /Resources << >>`, "0 0 1 rg 0 0 1 1 re f") }
+    ]) });
+    try {
+      const diagnostics = [];
+      const scene = await lowerRetainedPageToVectorScene(await session.compilePage(0), { signal: new AbortController().signal, onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+      assert.equal(scene.fillPathCount, 16, "cells whose stored matrix stays finite still paint");
+      for (const key of ["fillPathMetaA", "fillPathMetaB", "fillPathMetaC", "fillSegmentsA", "fillSegmentsB"]) {
+        assert.ok(scene[key].every(Number.isFinite), `${key}: overflowing cells emit no non-finite geometry`);
+      }
+      assert.deepEqual(diagnostics.map(({ code, details }) => [code, details.cellCount]), [["pattern.cell-transform-overflow", 84]]);
+    } finally { await session.close(); }
+  }
+  {
     const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
     const session = await openPdf({ kind: "bytes", bytes: fixture(
       "1 w 0 0 1 RG BT /F 80 Tf 1 Tr 10 10 Td (AA) Tj ET " +

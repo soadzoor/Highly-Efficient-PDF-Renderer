@@ -171,7 +171,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const glyphAtlas = new Map<string, number>();
   const hairlineAtlas = new Map<string, ReturnType<typeof buildNativeGlyphHairline>>();
   let gradientSegments = 0, meshVertices = 0, meshIndices = 0;
-  let count = 0, coordinates = 0, cells = 0, lastYield = performance.now();
+  let count = 0, coordinates = 0, cells = 0, skippedPatternCells = 0, lastYield = performance.now();
   const fail = (message: string, reason = "vector-retained-program"): never => {
     throw new PdfError("unsupported-content", `VectorScene retained program: ${message}`, { details: { reason } });
   };
@@ -641,22 +641,24 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         programIndex: resolved.programIndex, type3PaintIndex: -1, viewTransformFlags: 0 }]
     }];
     const programIndex = resolved.basePaintIndex < 0 ? resolved.programIndex : page.displayProgram.programs.length;
+    const root = { ...page.displayProgram.groups[page.displayProgram.rootGroupIndex], alpha: 1, alphaIsShape: false, isolated: true, knockout: false, blendMode: "Normal" as const, softMaskGroupIndex: -1, softMaskSubtype: null, softMaskTransferFunctionIndex: -1, backdropPaintIndex: -1, blendingColorSpaceIndex: -1, clipIndex: -1,
+      commands: [{ kind: "invoke-program" as const, transformIndex: baseTransform, clipIndex: -1, optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1, programIndex, type3PaintIndex: resolved.basePaintIndex, viewTransformFlags: 0 }] };
+    const stores = { ...page.stores, transforms: { values: transforms } };
+    const displayProgram = { ...page.displayProgram, programs, rootGroupIndex: page.displayProgram.groups.length, groups: [...page.displayProgram.groups, root] };
     const group: ScenePaintGroup = { kind: "group", children: [], alpha: page.stores.paints.alphas[paint],
       isolated: true, knockout: false, blendMode: "Normal", optionalContent: condition };
     stack.at(-1)!.push(group); stack.push(group.children);
     try {
-      // Every tile reuses the same synthetic page with only the cell transform changed,
-      // so validate it for the first tile only instead of once per tile.
-      let firstTile = true;
+      // The top-level execution validated `page`, and the root, adapter and wrapper
+      // transform above only reference its valid indices. The cell matrix is the one
+      // new value, so each tile checks it after Float32 storage instead of
+      // revalidating the whole page.
       for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
         signal.throwIfAborted();
-        const cellMatrix = multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]);
-        transforms.set(cellMatrix, baseTransform * 6);
-        const root = { ...page.displayProgram.groups[page.displayProgram.rootGroupIndex], alpha: 1, alphaIsShape: false, isolated: true, knockout: false, blendMode: "Normal" as const, softMaskGroupIndex: -1, softMaskSubtype: null, softMaskTransferFunctionIndex: -1, backdropPaintIndex: -1, blendingColorSpaceIndex: -1, clipIndex: -1,
-          commands: [{ kind: "invoke-program" as const, transformIndex: baseTransform, clipIndex: -1, optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1, programIndex, type3PaintIndex: resolved.basePaintIndex, viewTransformFlags: 0 }] };
-        const synthetic = { ...page, stores: { ...page.stores, transforms: { values: transforms } }, displayProgram: { ...page.displayProgram, programs, rootGroupIndex: page.displayProgram.groups.length, groups: [...page.displayProgram.groups, root] } };
-        await executeHeprDisplayProgram(synthetic, backend(paintedClip, condition, currentItem), { signal, trustedPage: !firstTile });
-        firstTile = false;
+        transforms.set(multiplyHeprMatrices(toScene, [1, 0, 0, 1, x * xs, y * ys]), baseTransform * 6);
+        if (!transforms.subarray(baseTransform * 6, baseTransform * 6 + 6).every(Number.isFinite)) { skippedPatternCells++; continue; }
+        // A page object per tile keeps each cell's soft-mask executions apart.
+        await executeHeprDisplayProgram({ ...page, stores, displayProgram }, backend(paintedClip, condition, currentItem), { signal, trustedPage: true });
       }
     } finally { stack.pop(); patternActive.delete(p); }
   };
@@ -871,6 +873,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   if (ignoredFormContentItems) options.onDiagnostic?.({ code: "structure.form-content-items", severity: "warning",
     pageIndex: page.pageInfo.sourcePageIndex,
     message: "Structure content items (MCIDs) inside Form XObjects are not attributed; their paint belongs to the enclosing page item, if any." });
+  if (skippedPatternCells) options.onDiagnostic?.({ code: "pattern.cell-transform-overflow", severity: "warning",
+    pageIndex: page.pageInfo.sourcePageIndex,
+    message: `${skippedPatternCells} tiling pattern cell(s) were skipped because their placement exceeds the 32-bit float range.`,
+    details: { cellCount: skippedPatternCells } });
   if (annotationLayers.unavailableCount) options.onDiagnostic?.({ code: "annotation.layer-limit", severity: "warning",
     pageIndex: page.pageInfo.sourcePageIndex,
     message: `${annotationLayers.unavailableCount} annotation appearance(s) exceed the layer limit and cannot be hidden individually.`,

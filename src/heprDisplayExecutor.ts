@@ -210,7 +210,11 @@ export interface HeprDisplayBackend {
 export interface ExecuteHeprDisplayProgramOptions {
   readonly signal?: AbortSignal;
   readonly limits?: Partial<HeprDisplayExecutionLimits>;
-  /** Skip page validation: the caller derived this page from one already validated. */
+  /**
+   * Skip page validation. Only for a page derived from one already validated whose
+   * added or changed data the caller has checked itself: indices, matrices and
+   * limits are then trusted as they are.
+   */
   readonly trustedPage?: boolean;
 }
 
