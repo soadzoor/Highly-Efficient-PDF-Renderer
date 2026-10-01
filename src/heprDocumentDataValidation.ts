@@ -88,8 +88,12 @@ function fail(code: HeprDataValidationCode, path: string, message: string): neve
   throw new HeprDataValidationError(code, path, message);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function requireRecord(value: unknown, path: string): asserts value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  if (!isRecord(value)) {
     fail(HEPR_DATA_VALIDATION_CODES.InvalidShape, path, "expected an object");
   }
 }
@@ -2146,7 +2150,13 @@ function validateDisplayProgram(
   validateProgramGraph(page, path);
 }
 
-/** Bit 0 = ordinary caller; bit 1 = caller supplies an inherited paint. */
+/**
+ * Bit 0 = ordinary caller; bit 1 = caller supplies an inherited paint.
+ *
+ * This runs before groups, programs and commands are validated, so it skips
+ * malformed entries and out-of-range references instead of reading through
+ * them. The validation that follows rejects those with a proper error.
+ */
 function computeGroupPaintModes(
   page: HeprPageData,
   uncoloredPatternPrograms: ReadonlySet<number>
@@ -2155,15 +2165,17 @@ function computeGroupPaintModes(
   const groupModes = new Uint8Array(groups.length);
   const programModes = new Uint8Array(programs.length);
   const pending: Array<{ kind: "group" | "program"; index: number; mode: 1 | 2 }> = [];
-  const enqueue = (kind: "group" | "program", index: number, mode: 1 | 2): void => {
+  const enqueue = (kind: "group" | "program", index: unknown, mode: 1 | 2): void => {
     const modes = kind === "group" ? groupModes : programModes;
-    if ((modes[index] & mode) !== 0) return;
-    modes[index] |= mode;
-    pending.push({ kind, index, mode });
+    if (!Number.isSafeInteger(index) || (index as number) < 0 || (index as number) >= modes.length) return;
+    if ((modes[index as number] & mode) !== 0) return;
+    modes[index as number] |= mode;
+    pending.push({ kind, index: index as number, mode });
   };
 
   enqueue("group", rootGroupIndex, 1);
   for (let index = 0; index < programs.length; index += 1) {
+    if (!isRecord(programs[index])) continue;
     if (programs[index].kind === "type3" || uncoloredPatternPrograms.has(index)) {
       enqueue("program", index, 2);
     } else if (programs[index].kind === "pattern") {
@@ -2173,18 +2185,20 @@ function computeGroupPaintModes(
 
   for (let cursor = 0; cursor < pending.length; cursor += 1) {
     const { kind, index, mode } = pending[cursor];
-    const container = kind === "group" ? groups[index] : programs[index];
-    if (kind === "group" && groups[index].softMaskGroupIndex >= 0) {
-      enqueue("group", groups[index].softMaskGroupIndex, mode);
+    const container: unknown = kind === "group" ? groups[index] : programs[index];
+    if (!isRecord(container) || !Array.isArray(container.commands)) continue;
+    if (kind === "group" && typeof container.softMaskGroupIndex === "number" && container.softMaskGroupIndex >= 0) {
+      enqueue("group", container.softMaskGroupIndex, mode);
     }
-    for (const command of container.commands) {
+    for (const command of container.commands as unknown[]) {
+      if (!isRecord(command)) continue;
       if (command.kind === "invoke-group") {
         enqueue("group", command.groupIndex, mode);
       } else if (command.kind === "invoke-program") {
         enqueue(
           "program",
           command.programIndex,
-          command.type3PaintIndex >= 0 ? 2 : mode
+          typeof command.type3PaintIndex === "number" && command.type3PaintIndex >= 0 ? 2 : mode
         );
       }
     }

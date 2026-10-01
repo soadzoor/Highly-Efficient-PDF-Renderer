@@ -213,6 +213,42 @@ assert.throws(
     error.code === HEPR_DATA_VALIDATION_CODES.ResourceCycle
 );
 
+// Group and program references are followed for inherited-paint modes before
+// they are validated; malformed ones must still fail as validation errors.
+function referencePage() {
+  const page = createEmptyHeprPageData(pageInfo());
+  page.displayProgram.programs.push({
+    kind: "type3", commands: [], matrixIndex: 0, bounds: null, clipToBounds: false, resourceName: "Fixture"
+  });
+  page.displayProgram.groups[0].commands = [{
+    kind: "invoke-program", programIndex: 0, transformIndex: 0, clipIndex: -1, optionalContentIndex: -1,
+    markedContentIndex: -1, sourceOffset: -1, sourceLength: -1, type3PaintIndex: -1, viewTransformFlags: 0
+  }];
+  return page;
+}
+validateHeprPageData(referencePage());
+for (const [name, corrupt] of [
+  ["program index past the end", (page) => { page.displayProgram.groups[0].commands[0].programIndex = 1; }],
+  ["negative program index", (page) => { page.displayProgram.groups[0].commands[0].programIndex = -1; }],
+  ["fractional program index", (page) => { page.displayProgram.groups[0].commands[0].programIndex = 0.5; }],
+  ["string program index", (page) => { page.displayProgram.groups[0].commands[0].programIndex = "0"; }],
+  ["group index past the end", (page) => {
+    page.displayProgram.groups[0].commands[0] = { kind: "invoke-group", groupIndex: 1, transformIndex: 0, clipIndex: -1,
+      optionalContentIndex: -1, markedContentIndex: -1, sourceOffset: -1, sourceLength: -1 };
+  }],
+  ["soft-mask group past the end", (page) => {
+    page.displayProgram.groups[0].softMaskGroupIndex = 1; page.displayProgram.groups[0].softMaskSubtype = "Alpha";
+  }],
+  ["null program", (page) => { page.displayProgram.programs[0] = null; }],
+  ["null command", (page) => { page.displayProgram.groups[0].commands[0] = null; }],
+  ["non-array group commands", (page) => { page.displayProgram.groups[0].commands = 5; }],
+  ["non-array program commands", (page) => { page.displayProgram.programs[0].commands = {}; }]
+]) {
+  const page = referencePage();
+  corrupt(page);
+  assert.throws(() => validateHeprPageData(page), (error) => error instanceof HeprDataValidationError, name);
+}
+
 const v6Document = structuredClone(documentFor(emptyPage));
 v6Document.version = 6;
 assert.throws(
