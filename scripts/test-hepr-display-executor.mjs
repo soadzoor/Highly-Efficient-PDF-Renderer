@@ -190,6 +190,20 @@ try {
       error.code === HEPR_DISPLAY_EXECUTION_CODES.UnsupportedBlendMode
   );
 
+  // A page the caller already validated (pattern tiles after the first) skips the
+  // full-page validation; without the flag the same page is still rejected.
+  const trusted = populatedPage(createEmptyHeprPageData(pageInfo()), {
+    colorKind: HEPR_COLOR_SPACE_KIND.DeviceRgb,
+    paintKind: HEPR_PAINT_KIND.SolidColor
+  });
+  trusted.unexpectedField = true;
+  await assert.rejects(
+    executeHeprDisplayProgram(trusted, noOpBackend()),
+    (error) => error instanceof HeprDisplayExecutionError &&
+      error.code === HEPR_DISPLAY_EXECUTION_CODES.InvalidPage
+  );
+  await executeHeprDisplayProgram(trusted, noOpBackend(), { trustedPage: true });
+
   const cancelled = populatedPage(createEmptyHeprPageData(pageInfo()), {
     colorKind: HEPR_COLOR_SPACE_KIND.DeviceRgb,
     paintKind: HEPR_PAINT_KIND.SolidColor

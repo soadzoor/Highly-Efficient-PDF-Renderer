@@ -210,6 +210,8 @@ export interface HeprDisplayBackend {
 export interface ExecuteHeprDisplayProgramOptions {
   readonly signal?: AbortSignal;
   readonly limits?: Partial<HeprDisplayExecutionLimits>;
+  /** Skip page validation: the caller derived this page from one already validated. */
+  readonly trustedPage?: boolean;
 }
 
 export interface HeprDisplayExecutionStats {
@@ -277,7 +279,7 @@ export async function executeHeprDisplayProgram(
 ): Promise<HeprDisplayExecutionStats> {
   options.signal?.throwIfAborted();
   validateBackend(backend);
-  validatePageForExecution(page);
+  if (!options.trustedPage) validatePageForExecution(page);
   options.signal?.throwIfAborted();
 
   const executor = new DisplayExecutor(
