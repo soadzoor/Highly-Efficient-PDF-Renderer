@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import * as THREE from "three";
-import { TSL } from "three/webgpu";
-import WGSLNodeBuilder from "../node_modules/three/src/renderers/webgpu/nodes/WGSLNodeBuilder.js";
+// The builder must come from the same three/webgpu module as the materials:
+// a second copy keeps its own TSL stack, and a clip's assignments vanish.
+import { TSL, WGSLNodeBuilder } from "three/webgpu";
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -89,6 +90,15 @@ try {
       assert.equal(wgslFunction(vertex, name), wgslFunction(baselineBuilder.vertexShader, name));
     }
     assert.equal(wgslFunction(fragment, "heprRasterFragment"), wgslFunction(baselineBuilder.fragmentShader, "heprRasterFragment"));
+    // A single image antialiases its clip the same way.
+    const baselineClipTexture = new THREE.DataTexture(new Float32Array(16), 4, 1, THREE.RGBAFormat, THREE.FloatType);
+    initializeThreeVectorClip(baseline.material, baselineClipTexture);
+    const baselineClipped = createThreeVectorClipMaterial(baseline.material, 0);
+    const baselineFragment = build(baselineClipped, geometry).fragmentShader;
+    assert.match(baselineFragment.slice(baselineFragment.lastIndexOf("@fragment")),
+      /heprClipAAWidth = heprClipPixelWidth[\s\S]*heprClipSource \* vec4<f32>\( heprVectorClipAA\(/);
+    baselineClipped.dispose();
+    baselineClipTexture.dispose();
     // NodeBuilder evaluates the sampling argument before the shared fragment
     // helper can discard a transparent pixel, so derivatives stay uniform.
     assert.match(fragment, /heprRasterFragment\(\s*heprRasterStripSample\(/);
@@ -100,8 +110,13 @@ try {
     initializeThreeVectorClip(material, clipTexture);
     const clipped = createThreeVectorClipMaterial(material, 0);
     const clippedBuilder = build(clipped, geometry);
-    assert.match(clippedBuilder.fragmentShader, /fn heprVectorClip\s*\(/);
-    assert.match(clippedBuilder.fragmentShader, /heprVectorClip\( .*\.xy,/, "clipping uses transformed page coordinates");
+    assert.match(clippedBuilder.fragmentShader, /fn heprVectorClipAA\s*\(/, "a clip is often an image's outline: antialiased");
+    assert.match(clippedBuilder.fragmentShader, /heprVectorClipAA\( .*\.xy,/, "clipping uses transformed page coordinates");
+    const clippedMain = clippedBuilder.fragmentShader.slice(clippedBuilder.fragmentShader.lastIndexOf("@fragment"));
+    assert.match(clippedMain, /heprClipSource \* vec4<f32>\( heprVectorClipAA\(/, "premultiplied color scales whole at the clip edge");
+    assert(clippedMain.indexOf("heprClipAAWidth = heprClipPixelWidth") >= 0 &&
+      clippedMain.indexOf("heprClipAAWidth = heprClipPixelWidth") < clippedMain.search(/heprClipSource = heprRasterFragment\w*\(/),
+      `clip derivatives execute before the paint helper can discard: ${clippedMain}`);
     setThreePdfShapeOnly(clipped, true)();
     clipped.dispose();
     clipTexture.dispose();

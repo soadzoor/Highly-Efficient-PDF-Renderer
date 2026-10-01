@@ -7,7 +7,7 @@ import { copyThreePdfShapeUniform } from "./threePdfShape";
 import { copyThreePaintFold } from "./threePaintFold";
 
 const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
-const antialiasedNodeClips = new WeakSet<THREE.Material>();
+const antialiasedNodeClips = new WeakMap<THREE.Material, "straight-alpha" | "premultiplied">();
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
 const clipFn: unknown = TSL.wgslFn(VECTOR_CLIP_WGSL);
 const clipAAFn: unknown = TSL.wgslFn(VECTOR_CLIP_AA_WGSL);
@@ -24,9 +24,15 @@ export const VECTOR_CLIP_INSTANCE_ATTRIBUTE = "aVectorClipIndex";
 /** `uVectorClipIndex` value that selects the instance stream in the core shaders. */
 const INSTANCE_VECTOR_CLIP_UNIFORM = -2;
 
-export function registerThreeNodeClipPosition(material: THREE.Material, world: unknown, antialias = false): void {
+/**
+ * Without `antialias` a clip is a per-pixel point test. An antialiased clip
+ * scales a straight-alpha color's alpha by its coverage, or all of a
+ * premultiplied color.
+ */
+export function registerThreeNodeClipPosition(material: THREE.Material, world: unknown,
+  antialias: false | "straight-alpha" | "premultiplied" = false): void {
   nodeWorldPositions.set(material, world);
-  if (antialias) antialiasedNodeClips.add(material);
+  if (antialias) antialiasedNodeClips.set(material, antialias);
 }
 
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
@@ -93,7 +99,8 @@ function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): 
       ? TSL.sub(flatVarying(TSL.attribute(VECTOR_CLIP_INSTANCE_ATTRIBUTE, "float")), 1)
       : TSL.uniform(clipIndex);
     const clipParams = { point: world, clipIndex: index, clipTexture: TSL.textureLoad(texture) };
-    if (antialiasedNodeClips.has(source)) {
+    const antialias = antialiasedNodeClips.get(source);
+    if (antialias) {
       material.fragmentNode = TSL.Fn(() => {
         // Force derivatives before the paint helper, which can discard. The
         // straight-alpha blend must keep RGB intact along partially covered clips.
@@ -102,7 +109,7 @@ function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): 
         const color = TSL.property("vec4", "heprClipSource");
         color.assign(source.fragmentNode as never);
         const coverage = (clipAAFn as (params: Record<string, unknown>) => never)({ ...clipParams, aaWidth });
-        return TSL.vec4(color.rgb, TSL.mul(color.a, coverage));
+        return antialias === "premultiplied" ? TSL.mul(color, coverage) : TSL.vec4(color.rgb, TSL.mul(color.a, coverage));
       })();
     } else {
       const coverage = (clipFn as (params: Record<string, unknown>) => never)(clipParams);

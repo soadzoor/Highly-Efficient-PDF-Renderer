@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
 import * as THREE from 'three';
 import { createCanvas } from '@napi-rs/canvas';
-import { TSL } from 'three/webgpu';
-import WGSLNodeBuilder from '../node_modules/three/src/renderers/webgpu/nodes/WGSLNodeBuilder.js';
+// The builder must be the same three/webgpu module as the materials: a second
+// copy keeps its own TSL stack, so clip and paint-fold assignments vanish.
+import { TSL, WGSLNodeBuilder } from 'three/webgpu';
 const hooks=registerHooks({resolve(s,c,n){return n(c.parentURL?.includes('/src/') && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s)?s+'.ts':s,c);}});
 const previousDocument=globalThis.document;
 globalThis.document={createElement:()=>Object.assign(createCanvas(1,1),{style:{}})};

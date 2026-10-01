@@ -88,7 +88,7 @@ export function createThreeWebGpuRasterStripMaterial(
     opacity: widthOpacity.y,
     shapeOnly: shapeOnlyUniform
   });
-  registerThreeNodeClipPosition(material, packed.xy);
+  registerThreeNodeClipPosition(material, packed.xy, "premultiplied");
 
   return {
     material,

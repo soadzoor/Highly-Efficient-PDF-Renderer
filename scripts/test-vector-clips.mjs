@@ -120,6 +120,18 @@ try {
     } finally { await session.close(); }
   }
 
+  // A clip is often an image's visible outline, so image paint antialiases it:
+  // the pixel footprint is taken before any discard, and the premultiplied
+  // color scales whole with the clip coverage.
+  const { CORE_RASTER_FRAGMENT_SHADER_SOURCE } = await import("../src/coreShaders.ts");
+  const { RASTER_STRIP_FRAGMENT_GLSL } = await import("../src/rasterStripWebGlShaders.ts");
+  for (const source of [CORE_RASTER_FRAGMENT_SHADER_SOURCE, RASTER_STRIP_FRAGMENT_GLSL]) {
+    const main = source.slice(source.indexOf("void main()")).replace(/\/\/.*$/gm, "");
+    assert(main.indexOf("float clipAAWidth") >= 0 && main.indexOf("float clipAAWidth") < main.indexOf("discard;"));
+    assert.match(main, /(outColor \*=|color \*) heprVectorClipAA\(vWorld, clipAAWidth\)/);
+    assert(!/heprVectorClip\(/.test(main), "image clips are not a per-pixel point test");
+  }
+
   const grid = composeVectorScenesInGrid([sample, sample], 2);
   validateVectorDrawRuns(grid);
   const base = sample.clipPaths.length;

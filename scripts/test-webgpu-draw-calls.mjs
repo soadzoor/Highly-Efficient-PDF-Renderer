@@ -142,6 +142,13 @@ try {
     assert.match(shader, /uPageRects\[instanceIndex\]/);
     assert.doesNotMatch(shader, /uRaster\./, "background shader cannot read a per-image uniform buffer");
     assert.equal(renderer.pageBackgroundPipeline.descriptor.fragment.targets[0].blend.color.srcFactor, "one");
+    // A clip is often an image's visible outline: images antialias it, with the
+    // footprint taken before any discard, scaling their premultiplied color.
+    const raster = renderer.rasterPipeline.descriptor.fragment.module.code;
+    const rasterMain = raster.slice(raster.lastIndexOf("@fragment")).replace(/\/\/.*$/gm, "");
+    assert(rasterMain.indexOf("let clipAAWidth") >= 0 && rasterMain.indexOf("let clipAAWidth") < rasterMain.indexOf("discard;"));
+    assert.match(rasterMain, /return color \* heprVectorClipAA\(inData\.world, uVectorClip\.x, uVectorClipTex, clipAAWidth\)/);
+    assert.equal(renderer.rasterPipeline.descriptor.fragment.targets[0].blend.color.srcFactor, "one");
     assert.equal(batch.bindGroup.entries[1].resource.buffer, batch.instanceBuffer);
     const profiler = renderer.getPerformanceProfiler();
     profiler.start({ gpu: false });

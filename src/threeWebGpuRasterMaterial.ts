@@ -151,7 +151,8 @@ export function createThreeWebGpuRasterMaterial(
     shapeOnly: shapeOnlyUniform
   });
 
-  registerThreeNodeClipPosition(material, (rasterPack as { xy: unknown }).xy);
+  // Clips are often an image's visible outline; their edges are antialiased.
+  registerThreeNodeClipPosition(material, (rasterPack as { xy: unknown }).xy, "premultiplied");
 
   return {
     material,

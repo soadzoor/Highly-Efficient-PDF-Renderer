@@ -66,6 +66,10 @@ try {
     // browser/device, and a manual GPU run still verifies driver acceptance.
     const shader = pipeline.descriptor.fragment.module.code;
     assert(shader.indexOf("dpdx(sourceUv)") < shader.indexOf("if (color.a"));
+    // A clip is often an image's visible outline: its edge is antialiased over
+    // one pixel, measured before any discard, scaling the premultiplied color.
+    assert(shader.indexOf("let clipAAWidth") >= 0 && shader.indexOf("let clipAAWidth") < shader.indexOf("if (color.a"));
+    assert.match(shader, /return color \* heprVectorClipAA\(inData\.world, uVectorClip\.x, uVectorClipTex, clipAAWidth\)/);
     assert.match(shader, /firstLeadingBit\(width\)/);
     assert.match(shader, /levelWidth = max\(levelWidth \/ 2u, 1u\)/);
     assert.match(shader, /textureSampleLevel\(uRasterTex, uRasterSampler, atlasUv, 0\.0\)/);

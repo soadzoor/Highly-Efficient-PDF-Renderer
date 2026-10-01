@@ -973,12 +973,16 @@ out vec4 outColor;
 ${VECTOR_CLIP_GLSL}
 
 void main() {
+  // A clip is often an image's visible outline, so its edge is antialiased
+  // over one pixel, measured before any discard. Color is premultiplied.
+  float clipAAWidth = max(max(length(vec2(dFdx(vWorld.x), dFdy(vWorld.x))),
+    length(vec2(dFdx(vWorld.y), dFdy(vWorld.y)))), 1e-4);
   vec4 color = texture(uRasterTex, vUv) * uRasterOpacity;
   if (color.a <= 0.001) {
     discard;
   }
   outColor = color;
-  outColor *= heprVectorClip(vWorld);
+  outColor *= heprVectorClipAA(vWorld, clipAAWidth);
 }
 `;
 

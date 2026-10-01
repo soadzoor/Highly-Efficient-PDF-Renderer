@@ -65,6 +65,9 @@ vec4 sampleStripLevel(float level) {
 }
 
 void main() {
+  // An antialiased clip edge, measured before any discard; color is premultiplied.
+  float clipAAWidth = max(max(length(vec2(dFdx(vWorld.x), dFdy(vWorld.x))),
+    length(vec2(dFdx(vWorld.y), dFdy(vWorld.y)))), 1e-4);
   vec2 sourcePixels = vUv * vec2(vWidth, 1.0);
   float footprint = max(length(dFdx(sourcePixels)), length(dFdy(sourcePixels)));
   int remaining = int(vWidth);
@@ -78,6 +81,6 @@ void main() {
   float lower = floor(lod);
   vec4 color = mix(sampleStripLevel(lower), sampleStripLevel(ceil(lod)), fract(lod)) * vOpacity;
   if (color.a <= 0.001) discard;
-  outColor = color * heprVectorClip(vWorld);
+  outColor = color * heprVectorClipAA(vWorld, clipAAWidth);
 }
 `;
