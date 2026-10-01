@@ -10,6 +10,7 @@ import {
   type PdfValue
 } from "./nativeCos";
 import { AesKey, concatBytes, md5, rc4, sha256, sha384, sha512 } from "./nativeCrypto";
+import { encodePdfDocEncoding } from "./nativePdfDocEncoding";
 import { PdfError, type PdfDiagnostic } from "./nativeTypes";
 
 /** ISO 32000-2 Algorithm 2 password padding string. */
@@ -41,12 +42,16 @@ export interface PdfEncryptionInput {
    * one used for key derivation authenticates.
    */
   readonly fileIds: readonly Uint8Array[];
+  /** A user or owner password supplied by the caller. */
+  readonly password?: string;
 }
 
 /**
- * ISO 32000-2 Standard security handler. Opens documents whose user password
- * is empty (the common "owner password only" restriction encryption); a
- * document that needs a typed password is rejected as `encrypted`.
+ * ISO 32000-2 Standard security handler. The empty password is tried first,
+ * which opens documents that only restrict permissions; a supplied password is
+ * then tried as both the user and the owner password. A document that still
+ * cannot be authenticated is rejected as `encrypted` with a
+ * `password-required` or `password-incorrect` reason.
  */
 export class PdfSecurityHandler {
   readonly diagnostic: PdfDiagnostic;
@@ -138,16 +143,30 @@ export class PdfSecurityHandler {
     }
     if (version === 4 && methods.has("aes-128")) keyLength = 16;
 
-    const authentication = revision >= 5
-      ? authenticateAes256(revision, owner, user, dictionary)
-      : authenticateLegacyWithIds(revision, keyLength, owner, user, permissions, input.fileIds, encryptMetadata);
+    const supplied = input.password !== undefined && input.password !== "";
+    const candidates = revision >= 5
+      ? aes256PasswordCandidates(supplied ? input.password! : "")
+      : legacyPasswordCandidates(supplied ? input.password! : "");
+    let authentication: Authentication | null = null;
+    // The empty password comes first so a supplied password never prevents
+    // opening a document that needs none.
+    for (const password of supplied ? [EMPTY, ...candidates] : [EMPTY]) {
+      authentication = revision >= 5
+        ? authenticateAes256(revision, owner, user, dictionary, password)
+        : authenticateLegacyWithIds(revision, keyLength, owner, user, permissions, input.fileIds,
+          encryptMetadata, password);
+      if (authentication) break;
+    }
     if (!authentication) {
       throw new PdfError(
         "encrypted",
-        "The PDF is protected by a user password, which is not supported. Only PDFs that open without a password can be loaded.",
-        { details: { reason: "password-required", version, revision } }
+        supplied
+          ? "The supplied password is incorrect for this PDF."
+          : "This PDF is password protected. Supply its password to open it.",
+        { details: { reason: supplied ? "password-incorrect" : "password-required", version, revision } }
       );
     }
+    const passwordSource = authentication.empty ? "its empty" : "the supplied";
     const algorithm = describeAlgorithm(streamFilter.method !== "identity" ? streamFilter : stringFilter, keyLength);
     return new PdfSecurityHandler(
       authentication.fileKey,
@@ -159,8 +178,15 @@ export class PdfSecurityHandler {
       {
         code: "document.decrypted",
         severity: "info",
-        message: `Decrypted the PDF (${algorithm}) with its empty ${authentication.password} password.`,
-        details: { version, revision, algorithm, password: authentication.password, permissions }
+        message: `Decrypted the PDF (${algorithm}) with ${passwordSource} ${authentication.password} password.`,
+        details: {
+          version,
+          revision,
+          algorithm,
+          password: authentication.password,
+          suppliedPassword: !authentication.empty,
+          permissions
+        }
       }
     );
   }
@@ -268,6 +294,41 @@ export class PdfSecurityHandler {
 interface Authentication {
   readonly fileKey: Uint8Array;
   readonly password: "user" | "owner";
+  readonly empty: boolean;
+}
+
+/**
+ * Revisions 2-4 hash the password in PDFDocEncoding. Some producers used
+ * UTF-8 or Latin-1 instead, so those encodings are tried as well.
+ */
+function legacyPasswordCandidates(password: string): Uint8Array[] {
+  const latin1 = /^[\u0000-\u00ff]*$/.test(password)
+    ? Uint8Array.from(password, (character) => character.charCodeAt(0))
+    : null;
+  return uniquePasswords([
+    encodePdfDocEncoding(password),
+    new TextEncoder().encode(password),
+    latin1
+  ].map((bytes) => bytes?.subarray(0, 32) ?? null));
+}
+
+/**
+ * Revisions 5-6 hash the SASLprep-processed password as UTF-8, truncated to
+ * 127 bytes. NFKC normalization is SASLprep's mapping step for practically
+ * every password; the unnormalized text is tried as well.
+ */
+function aes256PasswordCandidates(password: string): Uint8Array[] {
+  const encoder = new TextEncoder();
+  return uniquePasswords([password.normalize("NFKC"), password]
+    .map((text) => encoder.encode(text).subarray(0, 127)));
+}
+
+function uniquePasswords(candidates: readonly (Uint8Array | null)[]): Uint8Array[] {
+  const unique: Uint8Array[] = [];
+  for (const candidate of candidates) {
+    if (candidate && !unique.some((existing) => sameBytes(existing, candidate))) unique.push(candidate);
+  }
+  return unique;
 }
 
 function authenticateLegacyWithIds(
@@ -277,16 +338,19 @@ function authenticateLegacyWithIds(
   user: Uint8Array,
   permissions: number,
   fileIds: readonly Uint8Array[],
-  encryptMetadata: boolean
+  encryptMetadata: boolean,
+  password: Uint8Array
 ): Authentication | null {
   for (const fileId of fileIds.length > 0 ? fileIds : [EMPTY]) {
-    const authentication = authenticateLegacy(revision, keyLength, owner, user, permissions, fileId, encryptMetadata);
+    const authentication = authenticateLegacy(
+      revision, keyLength, owner, user, permissions, fileId, encryptMetadata, password
+    );
     if (authentication) return authentication;
   }
   return null;
 }
 
-/** Algorithms 2, 4, 5 and 7 for revisions 2-4, using empty passwords. */
+/** Algorithms 2, 4, 5 and 7 for revisions 2-4: `password` as user, then owner. */
 function authenticateLegacy(
   revision: number,
   keyLength: number,
@@ -294,7 +358,8 @@ function authenticateLegacy(
   user: Uint8Array,
   permissions: number,
   fileId: Uint8Array,
-  encryptMetadata: boolean
+  encryptMetadata: boolean,
+  password: Uint8Array
 ): Authentication | null {
   if (revision < 2 || revision > 4) {
     throw unsupportedEncryption(
@@ -304,12 +369,12 @@ function authenticateLegacy(
   }
   const length = revision === 2 ? 5 : keyLength;
   const ownerEntry = owner.subarray(0, 32);
-  const fileKeyFor = (paddedPassword: Uint8Array): Uint8Array => {
+  const fileKeyFor = (paddedUserPassword: Uint8Array): Uint8Array => {
     const permissionBytes = new Uint8Array([
       permissions & 0xff, (permissions >>> 8) & 0xff, (permissions >>> 16) & 0xff, (permissions >>> 24) & 0xff
     ]);
     let digest = md5(
-      paddedPassword,
+      paddedUserPassword,
       ownerEntry,
       permissionBytes,
       fileId,
@@ -327,11 +392,13 @@ function authenticateLegacy(
     return sameBytes(value, user.subarray(0, 16));
   };
 
-  const emptyUserKey = fileKeyFor(PASSWORD_PADDING);
-  if (userMatches(emptyUserKey)) return { fileKey: emptyUserKey, password: "user" };
+  const paddedPassword = padPassword(password);
+  const empty = password.length === 0;
+  const userKey = fileKeyFor(paddedPassword);
+  if (userMatches(userKey)) return { fileKey: userKey, password: "user", empty };
 
-  // Algorithm 7: an empty owner password recovers the padded user password.
-  let ownerKey = md5(PASSWORD_PADDING);
+  // Algorithm 7: the owner password recovers the padded user password.
+  let ownerKey = md5(paddedPassword);
   if (revision >= 3) {
     for (let index = 0; index < 50; index += 1) ownerKey = md5(ownerKey);
   }
@@ -343,15 +410,24 @@ function authenticateLegacy(
     for (let round = 19; round >= 0; round -= 1) userPassword = rc4(xorKey(ownerKey, round), userPassword);
   }
   const ownerFileKey = fileKeyFor(userPassword);
-  return userMatches(ownerFileKey) ? { fileKey: ownerFileKey, password: "owner" } : null;
+  return userMatches(ownerFileKey) ? { fileKey: ownerFileKey, password: "owner", empty } : null;
 }
 
-/** Algorithms 2.A and 11/12 for revisions 5 and 6, using empty passwords. */
+/** Algorithm 2 step (a): pad or truncate a password to exactly 32 bytes. */
+function padPassword(password: Uint8Array): Uint8Array {
+  const padded = new Uint8Array(32);
+  padded.set(password.subarray(0, 32));
+  padded.set(PASSWORD_PADDING.subarray(0, 32 - Math.min(32, password.length)), Math.min(32, password.length));
+  return padded;
+}
+
+/** Algorithms 2.A and 11/12 for revisions 5 and 6: `password` as user, then owner. */
 function authenticateAes256(
   revision: number,
   owner: Uint8Array,
   user: Uint8Array,
-  dictionary: PdfDictionary
+  dictionary: PdfDictionary,
+  password: Uint8Array
 ): Authentication | null {
   if (revision !== 5 && revision !== 6) {
     throw unsupportedEncryption(
@@ -371,35 +447,40 @@ function authenticateAes256(
       { reason: "malformed-encryption-dictionary" }
     );
   }
-  const hash = (input: Uint8Array, userData: Uint8Array): Uint8Array =>
-    revision === 5 ? sha256(input) : hardenedHash(input, userData);
+  const hash = (salt: Uint8Array, userData: Uint8Array): Uint8Array =>
+    revision === 5
+      ? sha256(concatBytes([password, salt, userData]))
+      : hardenedHash(password, salt, userData);
   const userData = user.subarray(0, 48);
   const decryptKey = (intermediate: Uint8Array, encrypted: Uint8Array): Uint8Array =>
     new AesKey(intermediate).decryptCbc(encrypted.subarray(0, 32), ZERO_IV);
+  const empty = password.length === 0;
 
   if (sameBytes(hash(user.subarray(32, 40), EMPTY), user.subarray(0, 32))) {
     return {
       fileKey: decryptKey(hash(user.subarray(40, 48), EMPTY), userEncryptedKey),
-      password: "user"
+      password: "user",
+      empty
     };
   }
-  if (sameBytes(hash(concatBytes([owner.subarray(32, 40), userData]), userData), owner.subarray(0, 32))) {
+  if (sameBytes(hash(owner.subarray(32, 40), userData), owner.subarray(0, 32))) {
     return {
-      fileKey: decryptKey(hash(concatBytes([owner.subarray(40, 48), userData]), userData), ownerEncryptedKey),
-      password: "owner"
+      fileKey: decryptKey(hash(owner.subarray(40, 48), userData), ownerEncryptedKey),
+      password: "owner",
+      empty
     };
   }
   return null;
 }
 
 /**
- * Algorithm 2.B for an empty password. `input` already contains the salt and
- * user data; the user data is mixed into every round as the standard requires.
+ * Algorithm 2.B. The password and user data are mixed into every round as
+ * the standard requires; the user data is empty for user-password hashes.
  */
-function hardenedHash(input: Uint8Array, userData: Uint8Array): Uint8Array {
-  let key = sha256(input);
+function hardenedHash(password: Uint8Array, salt: Uint8Array, userData: Uint8Array): Uint8Array {
+  let key = sha256(concatBytes([password, salt, userData]));
   for (let round = 0; ; round += 1) {
-    const block = concatBytes([key, userData]);
+    const block = concatBytes([password, key, userData]);
     const repeated = new Uint8Array(block.length * 64);
     for (let index = 0; index < 64; index += 1) repeated.set(block, index * block.length);
     const encrypted = new AesKey(key.subarray(0, 16)).encryptCbc(repeated, key.subarray(16, 32));

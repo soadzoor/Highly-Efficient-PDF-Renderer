@@ -58,6 +58,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `signal` | — | `AbortSignal` for source reading, parsing, LOD preparation, and object creation. |
 | `sourceKind` | `"auto"` | Infer the format from the source, or force `"pdf"` / `"hep"`. |
 | `pages` | All pages | One-based PDF pages: `"2"`, `"1-3, 5"`, `"5-"`, or `"-3"`. |
+| `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
@@ -77,6 +78,37 @@ See [loading option types](../src/pdfObjectGenerator.ts) and
 [progress fields and stages](../src/loadProgress.ts). All selected pages are
 prepared before the promise resolves. Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
+
+### Password-protected PDFs
+
+Encrypted PDFs that open without a password, such as documents that only
+restrict permissions, load like any other PDF. When a PDF needs a password, the
+load rejects with an error that `isPdfPasswordError()` recognizes. Its
+`details.reason` is `"password-required"` when no password was given and
+`"password-incorrect"` when the given one is wrong. Ask for the password and
+load again; the user and the owner password both work:
+
+```ts
+import { isPdfPasswordError, pdfObjectGenerator } from "@soadzoor/hepr/bundler";
+
+async function loadPdf(bytes: Uint8Array, askPassword: (retry: boolean) => Promise<string | null>) {
+  let password: string | undefined;
+  for (;;) {
+    try {
+      return await pdfObjectGenerator(bytes, { password });
+    } catch (error) {
+      if (!isPdfPasswordError(error)) throw error;
+      const answer = await askPassword(error.details.reason === "password-incorrect");
+      if (answer === null) throw error;
+      password = answer;
+    }
+  }
+}
+```
+
+Pass bytes, a `File`, or a `Blob` so a retry does not download the PDF again.
+HEPR supports the standard password security handler (RC4, AES-128, and
+AES-256) and does not enforce its permission flags.
 
 ### Rendering options
 
@@ -864,7 +896,7 @@ or `@soadzoor/hepr` in Node.
 
 | Input | Options |
 | --- | --- |
-| PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
+| PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `password`, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
 Shared encoding options are `sourceLabel`, `encodeRasterImages` (default `true`),
@@ -872,7 +904,8 @@ Shared encoding options are `sourceLabel`, `encodeRasterImages` (default `true`)
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
 
-Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves
+A HEP built from a password-protected PDF stores the decrypted content and has
+no password of its own. Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves
 the PDF's original layer defaults, including initially hidden geometry, regardless
 of the viewer's current layer settings. HEP retains fallback commands and assets;
 it does not embed the original PDF for later image recovery.
@@ -1045,7 +1078,8 @@ options?)` for a PDF parser session, and `createNodeBundledStandardFontResolver(
 for lazy bundled font loading. Close worker sessions with `await session.close()`;
 close a file source yourself if it is never handed to a session. Session options
 and methods are defined in [workerClient.ts](../src/pdf/workerClient.ts) and
-[nativeTypes.ts](../src/pdf/nativeTypes.ts).
+[nativeTypes.ts](../src/pdf/nativeTypes.ts). Pass `password` in the session
+options for a PDF that requires one; see [password-protected PDFs](#password-protected-pdfs).
 
 Both direct `PdfSession` and worker sessions expose
 `await session.getPageAnnotations(sourcePageIndex, { signal })`. This reads

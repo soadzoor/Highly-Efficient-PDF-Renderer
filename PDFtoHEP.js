@@ -26,6 +26,8 @@ const PDF_TO_HEP_BATCH_INDEX_ENV = "HEPR_PDF_TO_HEP_BATCH_INDEX";
 const PDF_TO_HEP_BATCH_TOTAL_ENV = "HEPR_PDF_TO_HEP_BATCH_TOTAL";
 const PDF_TO_HEP_HEAP_ENV = "HEPR_PDF_TO_HEP_HEAP_MB";
 const PDF_TO_HEP_WORKER_TOKEN_ENV = "HEPR_PDF_TO_HEP_WORKER_TOKEN";
+// Passwords reach worker processes through their environment, never argv.
+export const PDF_PASSWORD_ENV = "HEPR_PDF_PASSWORD";
 const DEFAULT_PDF_TO_HEP_WORKER_HEAP_MB = 12_288;
 const PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE = 3;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -48,6 +50,11 @@ Options:
   --annotation-appearances=render|forms|none  Annotation appearances compiled
       into page content (default: render). forms keeps only form-field widgets;
       none draws no annotation. Annotation metadata is kept in every mode.
+  --password=<password>  User or owner password for PDFs that require one.
+      The same password is tried for every PDF. A command-line password can
+      show up in process lists and shell history; set the HEPR_PDF_PASSWORD
+      environment variable instead to keep it out of both. HEP files store
+      the decrypted content and have no password.
 
 Examples:
   node PDFtoHEP.js ./Level1.pdf
@@ -79,6 +86,7 @@ export function parsePdfToHepArguments(args) {
   let outputDirectory;
   let iccEngine;
   let annotationAppearances;
+  let password;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -121,6 +129,14 @@ export function parsePdfToHepArguments(args) {
       annotationAppearances = value;
       continue;
     }
+    if (!positionalOnly && argument.startsWith("--password=")) {
+      const value = argument.slice("--password=".length);
+      if (!value || password !== undefined) {
+        throw new Error("Pass exactly one non-empty --password=<password>.");
+      }
+      password = value;
+      continue;
+    }
     if (!positionalOnly && argument.startsWith("-")) {
       throw new Error(`Unknown option: ${argument}`);
     }
@@ -143,7 +159,8 @@ export function parsePdfToHepArguments(args) {
     ...(keepUnchanged ? { keepUnchanged } : {}),
     ...(outputDirectory === undefined ? {} : { outputDirectory }),
     ...(iccEngine === undefined ? {} : { iccEngine }),
-    ...(annotationAppearances === undefined ? {} : { annotationAppearances })
+    ...(annotationAppearances === undefined ? {} : { annotationAppearances }),
+    ...(password === undefined ? {} : { password })
   };
 }
 
@@ -385,6 +402,11 @@ export async function loadSourceHepBuilder(dependencies = {}) {
   }
 }
 
+function isPasswordError(error) {
+  return error?.code === "encrypted" &&
+    (error.details?.reason === "password-required" || error.details?.reason === "password-incorrect");
+}
+
 async function regularOutputExists(filePath) {
   try {
     const outputStats = await lstat(filePath);
@@ -618,6 +640,7 @@ export function startPdfToHepWorker(
       shell: false,
       env: {
         ...process.env,
+        ...(item.password ? { [PDF_PASSWORD_ENV]: item.password } : {}),
         [PDF_TO_HEP_WORKER_ENV]: "1",
         [PDF_TO_HEP_BATCH_INDEX_ENV]: String(item.fileNumber),
         [PDF_TO_HEP_BATCH_TOTAL_ENV]: String(item.fileCount),
@@ -862,6 +885,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
 
   assertSupportedNodeVersion();
   const workerProcess = isPdfToHepWorkerProcess();
+  const password = options.password ?? (process.env[PDF_PASSWORD_ENV] || undefined);
   const pdfPaths = await discoverPdfFiles(options.inputPath);
   assertUniqueHepOutputs(pdfPaths, options.outputDirectory);
 
@@ -882,6 +906,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         iccEngine: options.iccEngine,
         annotationAppearances: options.annotationAppearances,
         keepUnchanged: options.keepUnchanged,
+        ...(password === undefined ? {} : { password }),
         fileNumber: index + 1,
         fileCount: pdfPaths.length
       });
@@ -947,6 +972,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         const hepBlob = await builder.buildHep(pdfBytes, {
           sourceLabel,
           signal: abortController.signal,
+          password,
           iccEngine: options.iccEngine,
           annotationAppearances: options.annotationAppearances,
           onDiagnostic: (diagnostic) => {
@@ -995,6 +1021,9 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
         }
         failures.push({ pdfPath, error });
         console.error(`[${itemNumber}/${itemCount}] Failed ${pdfPath}: ${formatError(error)}`);
+        if (isPasswordError(error)) {
+          console.error(`Pass --password=<password> or set ${PDF_PASSWORD_ENV} to convert password-protected PDFs.`);
+        }
       }
     }
   } catch (error) {

@@ -7,6 +7,7 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 
 import {
   buildHep,
+  isPdfPasswordError,
   createPdfAnnotationControls,
   createThreePrimitiveInteractionController,
   createThreePdfLayerControls,
@@ -32,6 +33,7 @@ import {
 } from "./exampleManifest";
 import { createExampleDropdown, type ExampleDropdownItem } from "./exampleDropdown";
 import { createDrawingSelectionControls } from "./drawingSelectionControls";
+import { promptForPdfPassword } from "./pdfPasswordPrompt";
 import {
   applyExamplePageLayout,
   computeExamplePageLayout,
@@ -1362,17 +1364,38 @@ async function loadSource(
       return;
     }
     resetVectorStrokeLodBuildTiming();
-    const nextObject = await pdfObjectGenerator(
-      source,
-      {
-        ...objectOptions,
-        signal: controller.signal,
-        onProgress: (progress) => {
-          updateLoadingProgress(activeLoadToken, progress);
-        }
-      },
-      backend as HeprRendererType
-    );
+    let password: string | undefined;
+    let nextObject: HeprThreePdfObject;
+    for (;;) {
+      try {
+        nextObject = await pdfObjectGenerator(
+          source,
+          {
+            ...objectOptions,
+            password,
+            signal: controller.signal,
+            onProgress: (progress) => {
+              updateLoadingProgress(activeLoadToken, progress);
+            }
+          },
+          backend as HeprRendererType
+        );
+        break;
+      } catch (error) {
+        if (!isPdfPasswordError(error) || activeLoadToken !== loadToken) throw error;
+        setLoadingProgress(false);
+        setStatus(`${sourceLabel} is password protected.`);
+        const answer = await promptForPdfPassword({
+          label: sourceLabel,
+          retry: error.details.reason === "password-incorrect",
+          signal: controller.signal
+        });
+        if (answer === null || activeLoadToken !== loadToken) throw error;
+        password = answer;
+        setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
+        setLoadingProgress(true, "0.00% Parsing / loading");
+      }
+    }
     pendingObject = nextObject;
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();

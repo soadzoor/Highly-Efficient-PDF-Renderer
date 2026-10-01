@@ -72,6 +72,7 @@ export type PdfWorkerSource =
 export interface PdfWorkerOpenOptions {
   readonly iccEngine?: PdfIccOptions["iccEngine"];
   readonly repair?: "off" | "safe";
+  readonly password?: string;
   readonly limits?: Partial<PdfResourceLimits>;
   /** The worker should proxy missing-font requests to its owning host. */
   readonly hasMissingFontResolver?: boolean;

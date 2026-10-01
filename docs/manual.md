@@ -73,11 +73,13 @@ Some unsupported color and gradient behavior is approximated with warnings.
 Use `onDiagnostic` to display these warnings; see [rendering compatibility](api.md#rendering-compatibility-and-diagnostics).
 
 PDFs encrypted with the standard password handler (RC4, AES-128 or AES-256)
-open when they need no password to view, as with documents that only restrict
-permissions. HEPR does not enforce those permission flags. Documents that require
-a password to open, unrecoverable malformed resources, resource-limit violations,
-and features unsupported by both paths can still reject the load. Display load
-errors in your application so users can tell when a document could not be opened.
+open directly when they need no password to view, as with documents that only
+restrict permissions. Pass the `password` option for documents that require one;
+see [password-protected PDFs](api.md#password-protected-pdfs). HEPR does not
+enforce permission flags. A missing or wrong password, unrecoverable malformed
+resources, resource-limit violations, and features unsupported by both paths can
+still reject the load. Display load errors in your application so users can tell
+when a document could not be opened.
 
 ### Selecting and arranging pages
 
@@ -766,6 +768,7 @@ node PDFtoHEP.js ./Level1.pdf
 node PDFtoHEP.js --output-dir=./heps ./pdfs
 node PDFtoHEP.js --force ./pdfs
 node PDFtoHEP.js --annotation-appearances=none ./pdfs
+HEPR_PDF_PASSWORD='secret' node PDFtoHEP.js ./protected.pdf
 ```
 
 Directory input is scanned recursively and converted one PDF at a time in
@@ -774,7 +777,11 @@ the input unless `--output-dir=<directory>` is supplied. Output-name collisions
 are rejected. Existing files are skipped; `--force` replaces them only after a
 successful conversion. `--annotation-appearances=render|forms|none` chooses which
 annotation appearances become page content (default `render`); annotation metadata
-is kept in every mode. Use `--help` for the complete command syntax.
+is kept in every mode. PDFs that require a password take it from
+`--password=<password>` or, kept out of process lists and shell history, from
+the `HEPR_PDF_PASSWORD` environment variable; the same password is tried for
+every PDF, and the HEP output is not password protected. Use `--help` for the
+complete command syntax.
 
 The worker heap ceiling defaults to 12,288 MiB for dense documents. Override it
 with `HEPR_PDF_TO_HEP_HEAP_MB` or Node's `--max-old-space-size=<MiB>` argument.

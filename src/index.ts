@@ -227,6 +227,8 @@ export type {
 };
 
 export { buildHep } from "./hepBuilder";
+export { isPdfPasswordError } from "./pdfObjectGenerator";
+export type { PdfPasswordError, PdfPasswordErrorReason } from "./pdfObjectGenerator";
 export { createAnnotationOverlay, pickSceneAnnotation } from "./annotationOverlay";
 export type { AnnotationOverlay, AnnotationOverlayOptions, AnnotationOverlayAdapter, AnnotationPoint } from "./annotationOverlay";
 export type { PdfAnnotation, SceneAnnotation, ScenePdfPage, AnnotationGeometry, AnnotationAction,

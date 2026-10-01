@@ -43,6 +43,12 @@ export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOption
   /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 
+  /**
+   * User or owner password for a PDF that requires one to open. The HEP file
+   * stores the decrypted content and is not password protected.
+   */
+  password?: string;
+
   /** Merge compatible adjacent vector stroke segments during parsing. @default true */
   segmentMerge?: boolean;
 
@@ -102,6 +108,7 @@ async function buildHepFromPdf(
   const progress = createLoadProgressReporter(options.onProgress);
   const parseProgress = progress.child(0, 0.82, { sourceType: "pdf" });
   const loaded = await loadPdfSceneFromSource(source, {
+    password: options.password,
     iccTransformResolver: options.iccTransformResolver,
     iccEngine: options.iccEngine,
     onDiagnostic: options.onDiagnostic,

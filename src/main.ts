@@ -3,6 +3,9 @@ import { createAnnotationOverlay } from "./annotationOverlay";
 import "./style.css";
 import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
+import "./pdfPasswordPrompt.css";
+import { promptForPdfPassword } from "./pdfPasswordPrompt";
+import { isPdfPasswordError } from "./pdfObjectGenerator";
 import { createLayerVisibilityController } from "./layerVisibility";
 import { createPdfLayerControls } from "./pdfLayerControls";
 import { createPdfAnnotationControls } from "./pdfAnnotationControls";
@@ -529,6 +532,8 @@ interface LoadPdfOptions {
   downloadablePdf: PdfDownloadSource | null;
   signal: AbortSignal;
   preserveView?: boolean;
+  /** Password for a PDF that requires one; used only while parsing. */
+  password?: string;
 }
 
 const LOAD_PROGRESS_PARSE_END = 0.34;
@@ -914,12 +919,32 @@ async function loadPdfFile(file: File): Promise<void> {
       return;
     }
     const bytes = cloneSourceBytes(buffer);
-    await loadPdfBuffer(createParseBuffer(bytes), file.name, {
-      source: { kind: "pdf", bytes, label: file.name },
-      downloadablePdf: { label: file.name, bytes },
-      signal,
-      preserveView: false
-    });
+    let password: string | undefined;
+    for (;;) {
+      try {
+        await loadPdfBuffer(createParseBuffer(bytes), file.name, {
+          source: { kind: "pdf", bytes, label: file.name },
+          downloadablePdf: { label: file.name, bytes },
+          signal,
+          preserveView: false,
+          password
+        });
+        break;
+      } catch (error) {
+        if (!isPdfPasswordError(error) || signal.aborted || !isCurrentSourceLoad(sourceLoadToken)) throw error;
+        setStatus(`${file.name} is password protected.`);
+        const answer = await promptForPdfPassword({
+          label: file.name,
+          retry: error.details.reason === "password-incorrect",
+          signal
+        });
+        if (answer === null) {
+          if (isCurrentSourceLoad(sourceLoadToken)) setStatus(`${file.name} was not opened: it needs a password.`);
+          return;
+        }
+        password = answer;
+      }
+    }
   } catch (error) {
     if (!signal.aborted && isCurrentSourceLoad(sourceLoadToken)) {
       setStatus(`Failed to read PDF: ${error instanceof Error ? error.message : String(error)}`);
@@ -1000,6 +1025,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       );
       const pageScenes = await extractPdfPageScenes(buffer, {
         ...extractionOptions,
+        password: options.password,
         onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
       }, options.signal);
       parseMs = performance.now() - parseStart;
@@ -1086,6 +1112,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     setParsingLoader(false);
+    // The caller owns the password prompt and loads again.
+    if (isPdfPasswordError(error)) throw error;
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to render PDF: ${message}`);
   } finally {

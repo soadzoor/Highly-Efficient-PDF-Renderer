@@ -213,6 +213,8 @@ export interface VectorScene {
 
 export interface VectorExtractOptions extends PdfIccOptions {
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
+  /** User or owner password for a PDF that requires one to open. */
+  password?: string;
   enableSegmentMerge?: boolean;
   enableInvisibleCull?: boolean;
   /** One-based PDF page selection such as `"1-5, 8, 11-13"`. */
@@ -406,6 +408,7 @@ async function extractPdfPageScenesWithNative(
     const missingFontResolver = await nativeVectorMissingFontResolver();
     const openOptions = {
       repair: "safe",
+      password: options.password,
       signal,
       missingFontResolver,
       iccTransformResolver: options.iccTransformResolver,

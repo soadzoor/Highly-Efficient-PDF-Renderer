@@ -19,6 +19,7 @@ import {
   readFilterNames
 } from "./nativeFilters";
 import { PdfSecurityHandler } from "./nativeEncryption";
+import { decodePdfDocEncoding } from "./nativePdfDocEncoding";
 import { readIndirectObjectAt } from "./nativeObjects";
 import {
   createPdfRandomAccessReader,
@@ -37,6 +38,11 @@ import { readNativeXref, repairNativeXref, type NativeXrefResult } from "./nativ
 export interface NativePdfOpenOptions {
   /** Strict parsing is always attempted first. @default "safe" */
   readonly repair?: "off" | "safe";
+  /**
+   * User or owner password of an encrypted PDF. The empty password is always
+   * tried first, so it is only needed for documents that require one.
+   */
+  readonly password?: string;
   readonly limits?: Partial<PdfResourceLimits>;
   readonly signal?: AbortSignal;
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
@@ -214,7 +220,7 @@ export class NativePdfDocument {
         if (xref.encrypted) {
           // The encryption dictionary itself is never encrypted, so it is
           // read through a plain resolver whose cache is then discarded.
-          security = await createBootstrap(null).readSecurityHandler(options.signal);
+          security = await createBootstrap(null).readSecurityHandler(options.password, options.signal);
           attemptDiagnostics.push(security.diagnostic);
         }
         const bootstrap = createBootstrap(security);
@@ -749,7 +755,10 @@ export class NativePdfDocument {
     this.objectStreamCacheBytes -= decodedBytes;
   }
 
-  private async readSecurityHandler(signal?: AbortSignal): Promise<PdfSecurityHandler> {
+  private async readSecurityHandler(
+    password: string | undefined,
+    signal?: AbortSignal
+  ): Promise<PdfSecurityHandler> {
     const value = newestTrailerValue(this.xref.trailers, "Encrypt");
     const ref = isPdfRef(value) ? value : null;
     if (ref && this.xref.entries.get(ref.objectNumber)?.kind === "compressed") {
@@ -787,7 +796,7 @@ export class NativePdfDocument {
         if (!fileIds.has(key)) fileIds.set(key, first.bytes);
       }
     }
-    return PdfSecurityHandler.create({ dictionary, ref, fileIds: [...fileIds.values()] });
+    return PdfSecurityHandler.create({ dictionary, ref, fileIds: [...fileIds.values()], password });
   }
 
   private async findCatalog(signal?: AbortSignal): Promise<PdfDictionary> {
@@ -1730,27 +1739,6 @@ function copyPdfDiagnostic(diagnostic: PdfDiagnostic): PdfDiagnostic {
       ? { details: Object.freeze({ ...diagnostic.details }) }
       : {})
   });
-}
-
-const PDF_DOC_ENCODING: Readonly<Record<number, string>> = Object.freeze({
-  0x18: "\u02d8", 0x19: "\u02c7", 0x1a: "\u02c6", 0x1b: "\u02d9",
-  0x1c: "\u02dd", 0x1d: "\u02db", 0x1e: "\u02da", 0x1f: "\u02dc",
-  0x80: "\u2022", 0x81: "\u2020", 0x82: "\u2021", 0x83: "\u2026",
-  0x84: "\u2014", 0x85: "\u2013", 0x86: "\u0192", 0x87: "\u2044",
-  0x88: "\u2039", 0x89: "\u203a", 0x8a: "\u2212", 0x8b: "\u2030",
-  0x8c: "\u201e", 0x8d: "\u201c", 0x8e: "\u201d", 0x8f: "\u2018",
-  0x90: "\u2019", 0x91: "\u201a", 0x92: "\u2122", 0x93: "\ufb01",
-  0x94: "\ufb02", 0x95: "\u0141", 0x96: "\u0152", 0x97: "\u0160",
-  0x98: "\u0178", 0x99: "\u017d", 0x9a: "\u0131", 0x9b: "\u0142",
-  0x9c: "\u0153", 0x9d: "\u0161", 0x9e: "\u017e", 0xa0: "\u20ac"
-});
-
-function decodePdfDocEncoding(bytes: Uint8Array): string {
-  let output = "";
-  for (const byte of bytes) {
-    output += PDF_DOC_ENCODING[byte] ?? String.fromCharCode(byte);
-  }
-  return output;
 }
 
 function binaryString(bytes: Uint8Array): string {

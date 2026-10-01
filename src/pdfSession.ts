@@ -176,6 +176,8 @@ export const computePageGeometry = computeNativePdfPageGeometry;
 export interface OpenPdfOptions extends PdfIccOptions {
   /** Strict parsing always runs first. `safe` allows one bounded xref repair scan. */
   readonly repair?: "off" | "safe";
+  /** User or owner password for a PDF that requires one to open. */
+  readonly password?: string;
   readonly limits?: Partial<PdfResourceLimits>;
   readonly signal?: AbortSignal;
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
@@ -307,6 +309,7 @@ export async function openPdf(
     throwIfSessionAborted(options.signal);
     const nativeOptions: NativePdfOpenOptions = {
       repair: options.repair,
+      password: options.password,
       limits: options.limits,
       signal: options.signal,
       onDiagnostic: options.onDiagnostic

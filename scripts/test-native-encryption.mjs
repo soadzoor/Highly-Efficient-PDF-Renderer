@@ -25,10 +25,12 @@ try {
   const { openNativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
   const { isPdfStream } = await import("../src/pdf/nativeCos.ts");
 
-  const open = (bytes) => openNativePdfDocument({ kind: "bytes", bytes });
+  const { isPdfPasswordError, loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
 
-  async function expectPlaintext(bytes, algorithm, password = "user") {
-    const document = await open(bytes);
+  const open = (bytes, password) => openNativePdfDocument({ kind: "bytes", bytes }, { password });
+
+  async function expectPlaintext(bytes, algorithm, password = "user", supplied, suppliedPassword = false) {
+    const document = await open(bytes, supplied);
     try {
       assert.equal(document.info.metadata.title, "Secret Title", `${algorithm} decrypts Info strings`);
       const contents = (await document.getDecodedPageContents(0)).map((part) => Buffer.from(part).toString("latin1"));
@@ -46,6 +48,7 @@ try {
       assert.equal(diagnostic?.severity, "info");
       assert.equal(diagnostic?.details?.algorithm, algorithm);
       assert.equal(diagnostic?.details?.password, password);
+      assert.equal(diagnostic?.details?.suppliedPassword, suppliedPassword);
       return contents;
     } finally {
       await document.close();
@@ -84,13 +87,51 @@ try {
     "RC4 128-bit"
   );
 
-  for (const bytes of [
-    legacyPdf({ version: 2, revision: 3, keyBytes: 16, userPassword: "secret" }),
-    aes256Pdf({ userPassword: "secret" })
+  // Password-protected documents open with either password; a missing or
+  // wrong one is reported distinctly so a viewer can prompt and retry.
+  const protectedRc4 = legacyPdf({ version: 2, revision: 3, keyBytes: 16, userPassword: "secret" });
+  const protectedAes128 = legacyPdf({
+    version: 4, revision: 4, keyBytes: 16, method: "aes128", userPassword: "secret", objectStream: true
+  });
+  const protectedAes256 = aes256Pdf({ userPassword: "secret" });
+  for (const [bytes, algorithm] of [
+    [protectedRc4, "RC4 128-bit"],
+    [protectedAes128, "AES 128-bit"],
+    [protectedAes256, "AES 256-bit"]
   ]) {
-    await assert.rejects(open(bytes), (error) =>
-      error?.code === "encrypted" && error.details?.reason === "password-required");
+    await expectPlaintext(bytes, algorithm, "user", "secret", true);
+    await expectPlaintext(bytes, algorithm, "owner", "owner", true);
+    for (const [password, reason] of [[undefined, "password-required"], ["", "password-required"], ["wrong", "password-incorrect"]]) {
+      await assert.rejects(open(bytes, password), (error) => {
+        assert.equal(error?.code, "encrypted");
+        assert.equal(error.details?.reason, reason);
+        assert.equal(isPdfPasswordError(error), true);
+        assert.equal(error.message.includes("secret"), false);
+        return true;
+      });
+    }
   }
+  // A supplied password never stops a document that needs none from opening.
+  await expectPlaintext(legacyPdf({ version: 2, revision: 3, keyBytes: 16 }), "RC4 128-bit", "user", "unused");
+
+  // RC4/AES-128 passwords are PDFDocEncoded; AES-256 passwords are UTF-8
+  // after SASLprep, whose NFKC normalization maps compatibility characters.
+  await expectPlaintext(
+    legacyPdf({ version: 2, revision: 3, keyBytes: 16, userPassword: "pässwörd" }), "RC4 128-bit", "user", "pässwörd", true
+  );
+  await expectPlaintext(aes256Pdf({ userPassword: "pässwörd€" }), "AES 256-bit", "user", "pässwörd€", true);
+  await expectPlaintext(aes256Pdf({ userPassword: "file" }), "AES 256-bit", "user", "\ufb01le", true);
+  // Revision 6 truncates passwords to 127 UTF-8 bytes.
+  await expectPlaintext(aes256Pdf({ userPassword: "x".repeat(127) }), "AES 256-bit", "user", "x".repeat(200), true);
+
+  // The public loader carries the password through the parser worker.
+  await assert.rejects(
+    loadPdfSceneFromSource(protectedAes256, { sourceKind: "pdf" }),
+    (error) => isPdfPasswordError(error) && error.details.reason === "password-required"
+  );
+  const loaded = await loadPdfSceneFromSource(protectedAes256, { sourceKind: "pdf", password: "secret" });
+  assert.equal(loaded.scene.segmentCount > 0, true, "the decrypted page content is parsed");
+  assert.equal(isPdfPasswordError(new Error("plain")), false);
   await assert.rejects(
     open(legacyPdf({ version: 2, revision: 3, keyBytes: 16, handler: "Adobe.PubSec" })),
     (error) => error?.code === "encrypted" && error.details?.reason === "security-handler"

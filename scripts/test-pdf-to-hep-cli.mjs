@@ -106,6 +106,11 @@ for (const mode of ["render", "forms", "none"]) {
   assert.equal(options.iccEngine, "lcms");
 }
 assert.equal(parsePdfToHepArguments(["plan.pdf"]).annotationAppearances, undefined);
+
+assert.equal(parsePdfToHepArguments(["--password=s3cr3t pass", "plan.pdf"]).password, "s3cr3t pass");
+assert.equal("password" in parsePdfToHepArguments(["plan.pdf"]), false);
+assert.throws(() => parsePdfToHepArguments(["--password=", "plan.pdf"]), /non-empty --password/);
+assert.throws(() => parsePdfToHepArguments(["--password=a", "--password=b", "plan.pdf"]), /exactly one/);
 assert.throws(() => parsePdfToHepArguments(["--annotation-appearances=hidden", "plan.pdf"]), /annotation-appearances/);
 assert.throws(
   () => parsePdfToHepArguments(["--annotation-appearances=none", "--annotation-appearances=forms", "plan.pdf"]),
@@ -264,8 +269,26 @@ assert.match(
   spawnInvocation.options.env.HEPR_PDF_TO_HEP_WORKER_TOKEN,
   /^[0-9a-f]{8}-[0-9a-f-]{27}$/i
 );
+assert.equal(spawnInvocation.options.env.HEPR_PDF_PASSWORD, process.env.HEPR_PDF_PASSWORD);
 fakeChild.emit("close", 0, null);
 assert.deepEqual(await fakeWorker.completion, { code: 0, signal: null });
+
+// A password reaches the worker through its environment, never its argv.
+let passwordInvocation;
+const passwordChild = new FakeChild();
+const passwordWorker = startPdfToHepWorker(
+  { pdfPath: unusualWorkerPdf, fileNumber: 1, fileCount: 1, password: "s3cr3t" },
+  false,
+  8_192,
+  (command, args, options) => {
+    passwordInvocation = { command, args, options };
+    return passwordChild;
+  }
+);
+assert.equal(passwordInvocation.options.env.HEPR_PDF_PASSWORD, "s3cr3t");
+assert.equal(passwordInvocation.args.some((argument) => argument.includes("s3cr3t")), false);
+passwordChild.emit("close", 0, null);
+await passwordWorker.completion;
 
 const failingChild = new FakeChild();
 const failingWorker = startPdfToHepWorker(

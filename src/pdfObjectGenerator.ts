@@ -35,6 +35,15 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   signal?: AbortSignal;
 
   /**
+   * User or owner password for a PDF that requires one to open. Encrypted
+   * PDFs that open without a password need none. A missing or wrong password
+   * rejects with an error that {@link isPdfPasswordError} recognizes.
+   *
+   * PDF sources only; HEP sources ignore this option.
+   */
+  password?: string;
+
+  /**
    * Merge compatible adjacent vector stroke segments during parse.
    *
    * @default true
@@ -108,6 +117,28 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   sourceKind?: PdfObjectSourceKind | "auto";
 }
 
+/** Why a password-protected PDF could not be opened. */
+export type PdfPasswordErrorReason = "password-required" | "password-incorrect";
+
+/** A load error caused by a missing or wrong PDF password. */
+export interface PdfPasswordError extends Error {
+  readonly code: "encrypted";
+  readonly details: Readonly<{ reason: PdfPasswordErrorReason }>;
+}
+
+/**
+ * True when a PDF could not be opened because it needs a password
+ * (`details.reason === "password-required"`) or the supplied one is wrong
+ * (`"password-incorrect"`). Ask for the password and load again with the
+ * `password` option.
+ */
+export function isPdfPasswordError(error: unknown): error is PdfPasswordError {
+  if (!(error instanceof Error)) return false;
+  const { code, details } = error as { code?: unknown; details?: { reason?: unknown } };
+  return code === "encrypted" &&
+    (details?.reason === "password-required" || details?.reason === "password-incorrect");
+}
+
 /**
  * Internal parsed HEPR scene plus source metadata.
  */
@@ -157,6 +188,7 @@ async function loadPdfSceneFromSourceInternal(
   if (sourceKind === "pdf") {
     validateAnnotationAppearanceMode(options.annotationAppearances);
     const extractOptions: VectorExtractOptions = {
+      password: options.password,
       iccTransformResolver: options.iccTransformResolver,
       iccEngine: options.iccEngine,
       annotationAppearances: options.annotationAppearances,
