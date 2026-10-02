@@ -4,6 +4,7 @@ import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
+import { fitRasterSourceToTexture } from "./rasterTextureFit";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
@@ -5109,16 +5110,17 @@ export class WebGlFloorplanRenderer {
   }
 
   private uploadRasterLayers(scene: VectorScene): void {
-    const rasterSources = this.getSceneRasterLayers(scene);
     const maxRasterTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
-    for (const [index, source] of rasterSources.entries()) {
-      if (source.width > maxRasterTextureSize || source.height > maxRasterTextureSize) {
-        throw new Error(
-          `Raster layer ${index} requires a ${source.width}x${source.height} texture, ` +
-          `but this WebGL2 context supports at most ${maxRasterTextureSize}x${maxRasterTextureSize}.`
+    const rasterSources = this.getSceneRasterLayers(scene).map((source, index) => {
+      const fitted = fitRasterSourceToTexture(source, maxRasterTextureSize);
+      if (fitted !== source) {
+        console.warn(
+          `Raster layer ${index} (${source.width}x${source.height}) exceeds the WebGL2 texture limit ` +
+          `of ${maxRasterTextureSize}; drawing it downscaled to ${fitted.width}x${fitted.height}.`
         );
       }
-    }
+      return fitted;
+    });
 
     this.destroyRasterLayerTextures();
     const gl = this.gl;
