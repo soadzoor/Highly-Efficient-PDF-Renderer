@@ -10,6 +10,7 @@ import { WebGpuFrameTimer } from "./webGpuFrameTimer";
 import { RenderPerformanceProfiler } from "./renderPerformance";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
+import { fitRasterSourceToTexture } from "./rasterTextureFit";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
 import { WebGpuPaintCompositor, beginPdfManagedRenderPass } from "./webGpuPaintCompositor";
 import { buildGradientMeshRenderData } from "./gradientMesh";
@@ -4429,16 +4430,17 @@ export class WebGpuFloorplanRenderer {
   }
 
   private configureRasterLayers(scene: VectorScene): void {
-    const rasterSources = this.getSceneRasterLayers(scene);
     const maxRasterTextureSize = this.maxTextureSize();
-    for (const [index, source] of rasterSources.entries()) {
-      if (source.width > maxRasterTextureSize || source.height > maxRasterTextureSize) {
-        throw new Error(
-          `Raster layer ${index} requires a ${source.width}x${source.height} texture, ` +
-          `but this WebGPU device supports at most ${maxRasterTextureSize}x${maxRasterTextureSize}.`
+    const rasterSources = this.getSceneRasterLayers(scene).map((source, index) => {
+      const fitted = fitRasterSourceToTexture(source, maxRasterTextureSize);
+      if (fitted !== source) {
+        console.warn(
+          `Raster layer ${index} (${source.width}x${source.height}) exceeds the WebGPU texture limit ` +
+          `of ${maxRasterTextureSize}; drawing it downscaled to ${fitted.width}x${fitted.height}.`
         );
       }
-    }
+      return fitted;
+    });
 
     this.destroyRasterLayerResources();
 

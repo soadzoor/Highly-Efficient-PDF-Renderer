@@ -120,7 +120,26 @@ try {
   assert.equal(failing.mock.events.filter(event => event[0] === "raster").length, 9);
   failing.renderer.destroyRasterLayerTextures();
   renderer.destroyRasterLayerTextures();
-  console.log("WebGL raster strip batches: upload, clipping, paint order, visibility, partial draws, panning, replacement, residency and failure cleanup passed.");
+  // A layer wider than MAX_TEXTURE_SIZE (a barcode strip, for instance) is downscaled
+  // to the limit instead of failing the whole document, with a diagnostic.
+  const wide = Object.assign(createEmptyVectorScene(), {
+    rasterLayers: [{ width: 5000, height: 1, data: new Uint8Array(5000 * 4).fill(255), matrix: Float32Array.of(50, 0, 0, 1, 0, 0), opacity: 1 }],
+    drawRuns: [{ kind: "raster", first: 0, count: 1 }]
+  });
+  const wideRenderer = makeRenderer(WebGlFloorplanRenderer, wide);
+  const wideWarnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => wideWarnings.push(args.join(" "));
+  try {
+    wideRenderer.renderer.uploadRasterLayers(wide);
+  } finally {
+    console.warn = originalWarn;
+  }
+  const wideUpload = wideRenderer.mock.calls.find(call => call[0] === "texImage2D");
+  assert.deepEqual(wideUpload.slice(4, 6), [4096, 1], "oversized layers are downscaled to the texture limit");
+  assert.equal(wideRenderer.renderer.rasterLayers.length, 1);
+  assert.deepEqual(wideWarnings, ["Raster layer 0 (5000x1) exceeds the WebGL2 texture limit of 4096; drawing it downscaled to 4096x1."]);
+  console.log("WebGL raster strip batches: upload, clipping, paint order, visibility, partial draws, panning, replacement, residency, oversized layers and failure cleanup passed.");
 } finally { hooks.deregister(); }
 
 function strip(index) {
