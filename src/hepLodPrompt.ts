@@ -4,7 +4,7 @@ import { getCachedTextLod } from "./textLodCore";
 import { shouldBuildTextLod } from "./textGreekLod";
 import "./hepLodPrompt.css";
 
-/** The unchecked default preserves the compact export; Escape cancels. */
+/** Include available LODs by default for faster loading; Escape cancels. */
 export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promise<HepLodOptions | null> {
   if (signal?.aborted) return Promise.resolve(null);
   const cachedText = getCachedTextLod(scene);
@@ -20,7 +20,7 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
   title.id = "hep-lod-title";
   title.textContent = "Download HEP";
   const description = document.createElement("p");
-  description.textContent = "Store levels of detail for faster loading. This increases file size. Leave unchecked for a smaller file.";
+  description.textContent = "Store levels of detail for faster loading. This increases file size. Uncheck for a smaller file.";
   form.append(title, description);
   const inputs: { key: "withVectorLod" | "withTextLod"; input: HTMLInputElement }[] = [];
   for (const [available, key, label] of [[vector, "withVectorLod", "Include vector LOD"],
@@ -29,6 +29,7 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
     const row = document.createElement("label");
     const input = document.createElement("input");
     input.type = "checkbox";
+    input.checked = true;
     row.append(input, document.createTextNode(label));
     form.append(row);
     inputs.push({ key, input });
@@ -42,8 +43,8 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
       const option = document.createElement("option");
       option.value = value; option.textContent = label; precision.append(option);
     }
-    precision.disabled = true;
     const vectorInput = inputs.find(({ key }) => key === "withVectorLod")!.input;
+    precision.disabled = !vectorInput.checked;
     vectorInput.addEventListener("change", () => { precision.disabled = !vectorInput.checked; });
     row.append(precision); form.append(row);
   }
