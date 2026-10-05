@@ -59,6 +59,9 @@ export class PrimitiveAppearanceState {
   private readonly colors = new Map<string, PrimitiveColorUpdate>();
   private selected: PrimitiveRef[] = [];
   private hover: PrimitiveRef | null = null;
+  private annotationSelected: PrimitiveRef[] = [];
+  private annotationHovered: PrimitiveRef[] = [];
+  private annotationFallback: PrimitiveHighlightSet | null = null;
   private highlights: PrimitiveHighlightSet | null = null;
   private disposed = false;
   private readonly scene: VectorScene;
@@ -91,7 +94,7 @@ export class PrimitiveAppearanceState {
     if (ref) validatePrimitiveRef(this.scene, ref);
     if (ref ? this.hover && primitiveRefKey(ref) === primitiveRefKey(this.hover) : !this.hover) return;
     const next = ref && { ...ref };
-    const highlights = buildPrimitiveHighlights(this.scene, this.selected, next);
+    const highlights = this.buildHighlights(this.selected, next);
     this.hover = next;
     this.highlights = highlights;
     this.callbacks.onHighlights?.(highlights);
@@ -101,10 +104,28 @@ export class PrimitiveAppearanceState {
     this.assertLive();
     const next = this.validateRefs(refs);
     if (next.length === this.selected.length && next.every((ref, index) => primitiveRefKey(ref) === primitiveRefKey(this.selected[index]))) return;
-    const highlights = buildPrimitiveHighlights(this.scene, next, this.hover);
+    const highlights = this.buildHighlights(next, this.hover);
     this.selected = next;
     this.highlights = highlights;
     this.callbacks.onHighlights?.(highlights);
+  }
+
+  /** Additional annotation interaction state; ordinary primitive selection stays independent. */
+  setAnnotationHighlights(selected: readonly PrimitiveRef[], hovered: readonly PrimitiveRef[], fallback: PrimitiveHighlightSet | null): void {
+    this.assertLive();
+    const nextSelected = this.validateRefs(selected), nextHovered = this.validateRefs(hovered);
+    const highlights = mergePrimitiveHighlights(buildPrimitiveHighlights(this.scene,
+      [...this.selected, ...nextSelected], [...(this.hover ? [this.hover] : []), ...nextHovered],
+      nextSelected.length || nextHovered.length ? 262_144 : Infinity,
+      !!(nextSelected.length || nextHovered.length || fallback)), fallback);
+    this.annotationSelected = nextSelected; this.annotationHovered = nextHovered; this.annotationFallback = fallback;
+    this.highlights = highlights; this.callbacks.onHighlights?.(highlights);
+  }
+
+  private buildHighlights(selected: readonly PrimitiveRef[], hover: PrimitiveRef | null): PrimitiveHighlightSet | null {
+    return mergePrimitiveHighlights(buildPrimitiveHighlights(this.scene, [...selected, ...this.annotationSelected],
+      [...(hover ? [hover] : []), ...this.annotationHovered], Infinity,
+      !!(this.annotationSelected.length || this.annotationHovered.length || this.annotationFallback)), this.annotationFallback);
   }
 
   setOverrides(refs: readonly PrimitiveRef[], override: PrimitiveOverride): void {
@@ -134,6 +155,7 @@ export class PrimitiveAppearanceState {
     const hadHighlights = this.highlights !== null;
     this.selected = [];
     this.hover = null;
+    this.annotationSelected = []; this.annotationHovered = []; this.annotationFallback = null;
     this.highlights = null;
     if (hadHighlights) this.callbacks.onHighlights?.(null);
   }
@@ -159,10 +181,20 @@ export class PrimitiveAppearanceState {
 }
 
 export function buildPrimitiveHighlights(
-  scene: VectorScene, selected: readonly PrimitiveRef[], hover: PrimitiveRef | null
+  scene: VectorScene, selected: readonly PrimitiveRef[], hover: PrimitiveRef | readonly PrimitiveRef[] | null,
+  maxSegments = Infinity, deduplicate = false
 ): PrimitiveHighlightSet | null {
-  if (!selected.length && !hover) return null;
-  const refs = hover ? [...selected, hover] : selected;
+  const hovered = !hover ? [] : Array.isArray(hover) ? hover : [hover as PrimitiveRef];
+  let refs = [...selected, ...hovered];
+  if (deduplicate) {
+    const unique = new Map<string, PrimitiveRef>();
+    for (const ref of selected) unique.set(primitiveRefKey(ref), ref);
+    selected = [...unique.values()]; refs = [...selected];
+    for (const ref of hovered) if (!unique.has(primitiveRefKey(ref))) {
+      unique.set(primitiveRefKey(ref), ref); refs.push(ref);
+    }
+  }
+  if (!refs.length) return null;
   const traces = new Map<string, { primitive: PrimitiveInfo; mesh?: ReturnType<typeof buildGradientMeshBoundary> }>();
   let count = 0;
   let selectionCount = 0;
@@ -176,6 +208,7 @@ export function buildPrimitiveHighlights(
       traces.set(key, trace = { primitive, ...(mesh ? { mesh } : {}) });
     }
     count += trace.mesh ? trace.mesh.edges.length / 4 : trace.primitive.segmentCount;
+    if (count > maxSegments) throw new RangeError("Annotation highlight trace exceeds its segment budget.");
     if (index === selected.length - 1) selectionCount = count;
   }
   if (!count) return null;
@@ -243,6 +276,25 @@ export function buildPrimitiveHighlights(
     }
   }
   return { segments, clipPaths, selectionCount, count };
+}
+
+/** Merge packets while keeping selected traces ahead of hovered traces and remapping clips. */
+export function mergePrimitiveHighlights(a: PrimitiveHighlightSet | null, b: PrimitiveHighlightSet | null): PrimitiveHighlightSet | null {
+  if (!a) return b;
+  if (!b) return a;
+  const segments = new Float32Array((a.count + b.count) * 8);
+  const clipPaths = [...a.clipPaths, ...b.clipPaths.map(clip => ({ ...clip, parent: clip.parent < 0 ? -1 : clip.parent + a.clipPaths.length }))];
+  let cursor = 0;
+  const copy = (packet: PrimitiveHighlightSet, first: number, end: number, clipOffset: number): void => {
+    for (let i = first; i < end; i++) {
+      segments.set(packet.segments.subarray(i * 8, i * 8 + 8), cursor);
+      if (segments[cursor + 7] >= 0) segments[cursor + 7] += clipOffset;
+      cursor += 8;
+    }
+  };
+  copy(a, 0, a.selectionCount, 0); copy(b, 0, b.selectionCount, a.clipPaths.length);
+  copy(a, a.selectionCount, a.count, 0); copy(b, b.selectionCount, b.count, a.clipPaths.length);
+  return { segments, clipPaths, selectionCount: a.selectionCount + b.selectionCount, count: a.count + b.count };
 }
 
 /** Clip approximation matches the existing vector clip tolerance; traced curves stay quadratic. */

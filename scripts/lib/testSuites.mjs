@@ -22,6 +22,7 @@ export const fastTests = [
   "annotation-overlay",
   "annotation-links",
   "annotation-layers",
+  "annotation-interaction",
   "structure-content",
   "hep-scene-sections",
   "optional-content",

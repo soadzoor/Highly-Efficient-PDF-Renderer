@@ -20,7 +20,14 @@ try {
     scene.markedContent = { items: [{ pageIndex: 0, sourcePageIndex: 0, mcid, tag: 'Figure' }], ranges: { stroke: Uint32Array.of(0,1,0) } };
     scene.optionalContent={groups:[{id:'drawing',name:'Drawing',defaultVisible:true,locked:false,usedInView:true}],
       conditions:[{kind:'group',groupId:'drawing'}],order:[],radioGroups:[]};
-    scene.drawRuns=[{kind:'stroke',first:0,count:scene.segmentCount,optionalContent:0}];
+    scene.optionalContent.groups.push({id:'annotation:shared',annotationId:'shared',name:'Shared',defaultVisible:true,locked:true,usedInView:false});
+    scene.optionalContent.conditions.push({kind:'group',groupId:'annotation:shared'},{kind:'and',operands:[0,1]});
+    scene.drawRuns=[{kind:'stroke',first:0,count:scene.segmentCount,optionalContent:2}];
+    const annotation=(id,annotationIndex,rect,extra={})=>({id,sourcePageIndex:mcid,pageIndex:0,annotationIndex,
+      subtype:'Square',flags:4,visibleInDefaultView:true,hasAppearance:false,pdfGeometry:{rect},
+      bounds:{minX:rect[0],minY:rect[1],maxX:rect[2],maxY:rect[3]},...extra});
+    scene.annotations=[annotation('shared',0,[0,0,20,20],{hasAppearance:true,optionalContent:0}),
+      annotation(`note-${mcid}`,1,[2,14,4,16])];
     scene.textIndex = { version: 2, pages: [{ text: 'page', charInstance: Int32Array.of(-2,-2,-2,-2), fallbackQuads: Float32Array.of(2,2,4,4) }] };
     return scene;
   };
@@ -40,6 +47,8 @@ try {
     const bad = new THREE.Matrix4(); bad.elements[3] = 1;
     await assert.rejects(pdf.setPageTransform(0,bad), RangeError);
     pdf.setSearchHighlights(pdf.searchText('page'), { currentIndex: 1 });
+    pdf.setAnnotationSelection(['shared']); pdf.setAnnotationHover('note-6');
+    assert.equal(pdf.getAnnotationPrimitives('shared').length,3,'one annotation id can own appearances on several pages');
     const progress = [];
     const stopProgress = pdf.subscribePagePreparationProgress(value => progress.push(value));
     const [pages, second] = await Promise.all([pdf.getPages(), pdf.getPage(1)]);
@@ -55,6 +64,8 @@ try {
     assert.equal(pdf.rasterMaterialLayer.group.visible, false);
     assert.equal(pdf.pageMesh.visible, false, 'the original document depth rectangle cannot occlude moved pages');
     assert(pages.every(page => page.searchHighlightGroup?.visible), 'pre-existing find highlights migrate to pages');
+    assert(pages.every(page=>page.primitiveAppearance.getHighlights()?.selectionCount===1),'annotation selection migrates to every page occurrence');
+    assert.equal(second.primitiveAppearance.getHighlights().count,5,'metadata annotation hover migrates only to its page');
     const parent = new THREE.Group(); parent.position.set(2,-5,7); parent.rotation.set(.1,.2,.3); parent.add(pdf);
     pdf.position.set(4,3,2); pdf.scale.set(1.2,.8,1);
     for (const [index,page] of pages.entries()) {
@@ -103,6 +114,13 @@ try {
       assert.deepEqual(localHit?.primitive,{kind:'stroke',index:0},'page picking uses its local primitive store');
       assert.deepEqual(localHit?.markedContent,{pageIndex:0,sourcePageIndex:0,mcid:6,tag:'Figure'},'page picks follow the local primitive order');
       assert.equal(second.getPrimitive({kind:'stroke',index:0}).markedContent.mcid,6);
+      const pickOptions={camera,element,clientX:client.x,clientY:client.y,tolerancePx:2};
+      assert.equal((await pdf.pickAnnotation(pickOptions))?.annotationId,'shared','annotation picking follows independently transformed pages');
+      await pdf.setAnnotationVisibility(['shared'],false);
+      assert.equal(await pdf.pickAnnotation(pickOptions),null);
+      assert.equal((await pdf.pickAnnotation({...pickOptions,includeHidden:true}))?.annotationId,'shared');
+      assert(pages.every(page=>page.primitiveAppearance.getHighlights()?.selectionCount===1),'hidden appearance selection persists on all pages');
+      await pdf.setAnnotationVisibility(['shared'],true);
     }
     const matrix = new THREE.Matrix4().set(1,.2,0,20, 0,1,.1,5, .3,0,1,12, 0,0,0,1);
     await pdf.setPageTransform(1,matrix);
@@ -128,6 +146,7 @@ try {
     pdf.setSearchHighlights(matches,{currentIndex:1});
     assert(pages.every(page=>page.searchHighlightGroup?.visible),'find highlights are parented to individual pages');
     pdf.setSelection([{kind:'stroke',index:1}]);
+    assert.equal(second.primitiveAppearance.getHighlights().selectionCount,1,'page primitive and annotation selection share one trace');
     assert.deepEqual(second.primitiveAppearance.getSelection(),[{kind:'stroke',index:0}]);
     assert.equal(pages[0].primitiveAppearance.getSelection().length,0);
     pdf.setPrimitiveOverrides([{kind:'stroke',index:1}],{color:'yellow'});
@@ -137,6 +156,7 @@ try {
     await second.setLayerVisibility('drawing',false);
     assert.equal(pdf.isPrimitiveVisible({kind:'stroke',index:1}),false);
     assert(pages.every(page=>!page.isPrimitiveVisible({kind:'stroke',index:0})),'page layer APIs update every page');
+    assert(pages.every(page=>page.primitiveAppearance.getHighlights()?.selectionCount!==1),'annotation selection respects PDF layers on every page');
     await pdf.resetLayerVisibility();
     assert(pages.every(page=>page.isPrimitiveVisible({kind:'stroke',index:0})));
     pdf.setPageBackgroundColor(.2,.3,.4,.5);

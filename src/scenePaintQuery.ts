@@ -49,7 +49,7 @@ export function isScenePaintRunVisible(scene: VectorScene, run: VectorDrawRun | 
 }
 
 /** Includes conditions that affect a primitive through ancestor groups or masks. */
-export function scenePaintRunConditions(scene: VectorScene, run: VectorDrawRun | undefined): number[] {
+export function scenePaintRunConditions(scene: VectorScene, run: VectorDrawRun | undefined, includeMasks = true): number[] {
   const conditions = new Set<number>();
   if (run?.optionalContent !== undefined) conditions.add(run.optionalContent);
   const addNodes = (nodes: readonly ScenePaintNode[]): void => {
@@ -65,7 +65,7 @@ export function scenePaintRunConditions(scene: VectorScene, run: VectorDrawRun |
   };
   for (let scope = run && scene.paintGraph ? lookup(scene).scopes.get(run) : undefined; scope; scope = scope.parent ?? undefined) {
     if (scope.condition !== undefined) conditions.add(scope.condition);
-    if (scope.group?.softMask) addNodes(scope.group.softMask.children);
+    if (includeMasks && scope.group?.softMask) addNodes(scope.group.softMask.children);
   }
   return [...conditions];
 }
