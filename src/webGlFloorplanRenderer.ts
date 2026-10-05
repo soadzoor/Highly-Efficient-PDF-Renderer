@@ -6,6 +6,11 @@ import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./r
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale } from "./rasterTiles";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
+import { buildRasterAtlasBatches } from "./rasterAtlasBatches";
+import { rasterClipInstanceBounds } from "./rasterClipBounds";
+import { RASTER_ATLAS_VERTEX_GLSL, RASTER_ATLAS_FRAGMENT_GLSL } from "./rasterAtlasWebGlShaders";
+import { RASTER_BATCH_TEXTURES, RASTER_BATCH_INSTANCES, RASTER_BATCH_INSTANCE_FLOATS, RASTER_TEXTURE_BATCH_VERTEX_GLSL,
+  RASTER_TEXTURE_BATCH_FRAGMENT_GLSL } from "./rasterTextureBatchWebGlShaders";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
 import { WebGlPaintCompositor, type WebGlPaintFolding } from "./webGlPaintCompositor";
@@ -15,7 +20,7 @@ import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } fr
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { scenePaintSpanSegments } from "./scenePaintGraph";
 import { buildCanonicalRunLookup, submitPaintSpan, type CanonicalRunLookup } from "./scenePaintSpanDraws";
-import { RenderPerformanceProfiler } from "./renderPerformance";
+import { RenderPerformanceProfiler, type GpuOperationSource } from "./renderPerformance";
 import { estimateHighlightLocalUnitsPerPixel } from "./primitiveHighlightProjection";
 import type { PrimitiveColorUpdate, PrimitiveHighlightSet } from "./primitiveAppearance";
 import { coalescePrimitiveColorTexels, NativePrimitiveColors } from "./nativePrimitiveColors";
@@ -25,8 +30,10 @@ import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { OrderedTextLodSelection } from "./orderedTextLod";
 import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
-import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
-import { MAX_VECTOR_CLIP_DEPTH, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
+import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
+import { VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
+import { MAX_VECTOR_CLIP_DEPTH, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds,
+  type VectorClipPackingStats } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -416,6 +423,11 @@ uniform int uFillBandBase;
 // Per-path cell headers follow in the same store, from one less than this
 // texel: zero, the value of a uniform the host never sets, means none.
 uniform int uFillCellHeaders;
+// Bounds have their own small store: optional clip indexes can fill the main
+// clip texture without disabling quad shrinking.
+uniform int uFillClipBoundsEnabled;
+uniform highp sampler2D uFillClipBoundsTex;
+uniform float uVectorClipIndex;
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
 uniform float uZoom;
@@ -443,6 +455,42 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 
 ${FILL_COVERAGE_VERTEX_GLSL}
 
+vec4 heprFillInstanceClipBounds(float instanceClipIndex) {
+  int clipIndex = int(uVectorClipIndex < -1.5 ? instanceClipIndex : uVectorClipIndex);
+  // Projected views retain their original per-corner expansion. In the native
+  // orthographic view the margin is constant, including within indirect batches.
+  if (uUseLocalToClip < 0.5 && uFillClipBoundsEnabled > 0 && clipIndex >= 0) {
+    return texelFetch(uFillClipBoundsTex,
+      coordFromIndex(clipIndex, textureSize(uFillClipBoundsTex, 0)), 0);
+  }
+  return vec4(-1e38, -1e38, 1e38, 1e38);
+}
+
+vec4 heprFillQuadBounds(vec2 minBounds, vec2 maxBounds, vec2 margin, vec4 clipBounds) {
+  // Empty clips can contain infinite bounds; reject them before arithmetic.
+  if (clipBounds.x > clipBounds.z || clipBounds.y > clipBounds.w) {
+    return vec4(1.0, 1.0, 0.0, 0.0);
+  }
+  return vec4(max(minBounds.x, clipBounds.x) - margin.x,
+    max(minBounds.y, clipBounds.y) - margin.y,
+    min(maxBounds.x, clipBounds.z) + margin.x,
+    min(maxBounds.y, clipBounds.w) + margin.y);
+}
+
+void heprCullFill() {
+  gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+  vSegmentStart = 0;
+  vSegmentCount = 0;
+  vFillBands = vec4(0.0);
+  vFillCells = vec4(0.0);
+  vFillOrigin = vec2(0.0);
+  vColor = vec3(0.0);
+  vAlpha = 0.0;
+  vFillRule = 0.0;
+  vFillHasCompanionStroke = 0.0;
+  vLocal = vec2(0.0);
+}
+
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
   int pathIndex = int(aFillPathIndex + 0.5);
@@ -453,17 +501,7 @@ void main() {
   int segmentCount = int(metaA.y + 0.5);
   float alpha = metaC.w;
   if (segmentCount <= 0 || alpha <= 0.001) {
-    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
-    vSegmentStart = 0;
-    vSegmentCount = 0;
-    vFillBands = vec4(0.0);
-    vFillCells = vec4(0.0);
-    vFillOrigin = vec2(0.0);
-    vColor = vec3(0.0);
-    vAlpha = 0.0;
-    vFillRule = 0.0;
-    vFillHasCompanionStroke = 0.0;
-    vLocal = vec2(0.0);
+    heprCullFill();
     return;
   }
 
@@ -476,7 +514,13 @@ void main() {
     uUseLocalToClip, uLocalToClip, uZoom, uViewport));
   margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
     uUseLocalToClip, uLocalToClip, uViewport);
-  vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);
+  vec4 quad = heprFillQuadBounds(minBounds, maxBounds, margin,
+    heprFillInstanceClipBounds(vVectorClipIndex));
+  if (quad.x > quad.z || quad.y > quad.w) {
+    heprCullFill();
+    return;
+  }
+  vec2 world = mix(quad.xy, quad.zw, corner01);
 
   if (uUseLocalToClip >= 0.5) {
     gl_Position = uLocalToClip * vec4(world, 0.0, 1.0);
@@ -984,11 +1028,11 @@ in vec2 vUv;
 in vec2 vWorld;
 out vec4 outColor;
 
-${VECTOR_CLIP_GLSL}
+${RASTER_CLIP_GLSL}
 
 void main() {
-  // A clip is often an image's visible outline, so its edge is antialiased
-  // over one pixel, measured before any discard. Color is premultiplied.
+  // Polygon clip edges are antialiased; rectangular tile/page clips stay
+  // solid. Measure the footprint before any discard. Color is premultiplied.
   float clipAAWidth = max(max(length(vec2(dFdx(vWorld.x), dFdy(vWorld.x))),
     length(vec2(dFdx(vWorld.y), dFdy(vWorld.y)))), 1e-4);
   vec4 color = texture(uRasterTex, vUv) * uRasterOpacity;
@@ -1080,8 +1124,10 @@ const CAMERA_DAMPING_MAX_DT_MS = 64;
 const PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC = 5;
 const PAN_MAX_SPEED_WORLD_PER_SEC = 20_000;
 const PAN_INERTIA_VELOCITY_STALE_MS = 120;
-/** The last texture unit source-ordered paint programs use; compositing starts above it. */
+/** Main paint slots; the spare bounds unit 26 does not overlap compositor slots 19-25. */
 const ORDERED_PAINT_LAST_UNIT = 18;
+// At most 4 MiB of extra RGBA32F bounds, independent of clip index storage.
+const MAX_FILL_CLIP_BOUNDS_TEXELS = 256 * 1024;
 const CLEAR_COLOR_R = 160 / 255;
 const CLEAR_COLOR_G = 169 / 255;
 const CLEAR_COLOR_B = 175 / 255;
@@ -1270,6 +1316,19 @@ interface RasterStripBatchGpu {
   buffer: WebGLBuffer;
   vao: WebGLVertexArrayObject;
 }
+
+interface RasterAtlasBatchGpu extends RasterStripBatchGpu {
+  first: number;
+}
+
+interface RasterTextureBatchGeometryGpu {
+  buffer: WebGLBuffer;
+  vao: WebGLVertexArrayObject;
+  instances: Float32Array;
+}
+
+const MAX_RASTER_TEXTURE_BATCH_CACHE_BYTES = 4 * 1024 * 1024;
+const MAX_RASTER_TEXTURE_BATCH_CACHE_ENTRIES = 512;
 
 interface StrokeTextureSet {
   textureA: WebGLTexture;
@@ -1464,6 +1523,8 @@ export class WebGlFloorplanRenderer {
   private readonly uFillAAScreenPx: WebGLUniformLocation;
   private readonly uFillBandBase: WebGLUniformLocation;
   private readonly uFillCellHeaders: WebGLUniformLocation;
+  private readonly uFillClipBoundsEnabled: WebGLUniformLocation;
+  private readonly uFillClipBoundsTex: WebGLUniformLocation;
   private readonly uFillBandEntries: WebGLUniformLocation;
   /** Texel offsets of the band index inside the fill segment store; -1 when absent. */
   private fillBandBase = -1;
@@ -1573,6 +1634,9 @@ export class WebGlFloorplanRenderer {
   private vectorClipHeaders: Float32Array | null = null;
   /** Per clip [minX, minY, maxX, maxY] intersected with its ancestors. */
   private vectorClipBounds: Float32Array = new Float32Array(0);
+  private vectorClipBoundsTexture: WebGLTexture | null = null;
+  private vectorClipStoreTexels = 0;
+  private vectorClipPackingStats: VectorClipPackingStats | null = null;
   private vectorClipIndex = -1;
   private orderedBatches: VectorOrderedBatches | null = null;
   /** Per kind, canonical run indices sorted by their first primitive. */
@@ -1581,6 +1645,7 @@ export class WebGlFloorplanRenderer {
   private readonly orderedUniformPrograms = new Set<WebGLProgram>();
   private readonly orderedTextureBindings: (WebGLTexture | null | undefined)[] = [];
   private readonly orderedDedicatedTextureUnits: boolean;
+  private readonly fillClipBoundsUnit: number;
   private readonly orderedPaintUniformStates = new Map<WebGLProgram, number>();
   /** Per program, the clip sampler unit and clip index its uniforms hold. */
   private orderedClipStates?: Map<WebGLProgram, number>;
@@ -1670,6 +1735,24 @@ export class WebGlFloorplanRenderer {
 
   private rasterStripProgram: { program: WebGLProgram; uniforms: Readonly<Record<string, WebGLUniformLocation>> } | null = null;
 
+  private readonly rasterAtlasBatches = new Map<number, RasterAtlasBatchGpu>();
+
+  private rasterAtlasProgram: { program: WebGLProgram; uniforms: Readonly<Record<string, WebGLUniformLocation>> } | null = null;
+
+  private rasterTextureBatch: { program: WebGLProgram; uniforms: Readonly<Record<string, WebGLUniformLocation>>;
+    buffer: WebGLBuffer; vao: WebGLVertexArrayObject } | null = null;
+
+  private rasterTextureBatchUnavailable = false;
+
+  private rasterTextureBatchInstances: Float32Array | null = null;
+  /** Paint-position slots retain geometry only; textures and paint state stay live. */
+  private rasterTextureBatchCache: (RasterTextureBatchGeometryGpu | undefined)[] = [];
+  private rasterTextureBatchCacheBytes = 0;
+  private rasterTextureBatchCacheCursor = 0;
+  private rasterTextureBatchCacheUnavailable = false;
+  /** Layer replacement drops its cached bounds; clip upload resets the cache. */
+  private rasterTextureClipBounds = new WeakMap<RasterLayerGpu, Map<number, Float32Array>>();
+
   private rasterTextureResidencyEnabled = true;
 
   private gradientData: GradientSceneData | null = null;
@@ -1755,6 +1838,10 @@ export class WebGlFloorplanRenderer {
 
   private frameListener: FrameListener | null = null;
   private frameDrawCalls = 0;
+
+  private lastFillDrawFirst = 0;
+
+  private lastGradientFillDrawIndex = 0;
   private performanceProfiler: RenderPerformanceProfiler | null = null;
   private interactionViewportProvider: (() => DOMRect | DOMRectReadOnly | null) | null = null;
   private externalFrameDriver = false;
@@ -1862,6 +1949,9 @@ export class WebGlFloorplanRenderer {
     // one another's textures. Other rendering paths retain their existing slots.
     const textureUnits = context.getParameter(context.MAX_COMBINED_TEXTURE_IMAGE_UNITS) as number;
     this.orderedDedicatedTextureUnits = textureUnits >= 19;
+    // Unit 26 sits above compositor units 19-25 and below the folded mask.
+    // Smaller contexts share unit 14 with text, through the binding cache.
+    this.fillClipBoundsUnit = textureUnits >= 27 ? 26 : 14;
     // Folded group chains need a mask unit that nothing else binds a surface to.
     this.paintFoldUnit = textureUnits > PAINT_FOLD_MASK_UNIT ? PAINT_FOLD_MASK_UNIT : -1;
     const foldable = (source: string, premultiplied: boolean): string =>
@@ -2020,6 +2110,8 @@ export class WebGlFloorplanRenderer {
     this.uFillAAScreenPx = this.mustGetUniformLocation(this.fillProgram, "uFillAAScreenPx");
     this.uFillBandBase = this.mustGetUniformLocation(this.fillProgram, "uFillBandBase");
     this.uFillCellHeaders = this.mustGetUniformLocation(this.fillProgram, "uFillCellHeaders");
+    this.uFillClipBoundsEnabled = this.mustGetUniformLocation(this.fillProgram, "uFillClipBoundsEnabled");
+    this.uFillClipBoundsTex = this.mustGetUniformLocation(this.fillProgram, "uFillClipBoundsTex");
     this.uFillBandEntries = this.mustGetUniformLocation(this.fillProgram, "uFillBandEntries");
     this.uFillUseLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uUseLocalToClip");
     this.uFillLocalToClip = this.mustGetUniformLocation(this.fillProgram, "uLocalToClip");
@@ -2088,7 +2180,26 @@ export class WebGlFloorplanRenderer {
   getPerformanceProfiler(): RenderPerformanceProfiler {
     if (this.isDisposed) throw new Error("Cannot profile a disposed renderer.");
     return this.performanceProfiler ??= new RenderPerformanceProfiler({ gl: this.gl,
-      describeProgram: program => this.describeProgram(program) });
+      describeProgram: program => this.describeProgram(program),
+      describeDraw: (program, instances) => this.describeDrawSource(program, instances) });
+  }
+
+  /** Canonical IDs are copied only for individually timed GPU draws. */
+  private describeDrawSource(program: WebGLProgram | null, instances: number): GpuOperationSource | undefined {
+    if (!program) return undefined;
+    if (program === this.gradientFillProgram || program === this.gradientMeshProgram) {
+      return { kind: "gradient-fill", first: this.lastGradientFillDrawIndex, indirect: false,
+        ids: [this.lastGradientFillDrawIndex], clips: [this.vectorClipIndex], truncated: false };
+    }
+    if (program !== this.fillProgram) return undefined;
+    const first = this.lastFillDrawFirst, indirect = this.vectorClipIndex === -2;
+    const ids: number[] = [], clips: number[] = [], selected = this.orderedBatches?.uintInstances;
+    if (indirect && !selected) return undefined;
+    for (let index = 0; index < Math.min(instances, 32); index++) {
+      ids.push(indirect ? selected![(first + index) * 2] : first + index);
+      clips.push(indirect ? selected![(first + index) * 2 + 1] - 1 : this.vectorClipIndex);
+    }
+    return { kind: "fill", first, indirect, ids, clips, truncated: instances > ids.length };
   }
 
   /** Names a program in GPU operation timings; composite passes by their kind. */
@@ -2100,6 +2211,8 @@ export class WebGlFloorplanRenderer {
       [this.segmentProgram, "stroke"], [this.fillProgram, "fill"], [this.gradientFillProgram, "gradientFill"],
       [this.gradientMeshProgram, "gradientMesh"], [this.gradientStrokeProgram, "gradientStroke"],
       [this.textProgram, "text"], [this.rasterProgram, "raster"], [this.rasterStripProgram?.program, "rasterStrip"],
+      [this.rasterAtlasProgram?.program, "rasterAtlas"],
+      [this.rasterTextureBatch?.program, "rasterTextureBatch"],
       [this.pageBackgroundProgram, "pageBackground"], [this.vectorCompositeProgram, "vectorComposite"], [this.highlightProgram, "highlight"]];
     return names.find(([candidate]) => candidate === program)?.[1] ?? null;
   }
@@ -2556,6 +2669,7 @@ export class WebGlFloorplanRenderer {
         }
         prepared.clear();
         this.destroyRasterStripBatches();
+        this.destroyRasterAtlasBatches();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
         finished = true;
         this.destroyVectorMinifyResources(); this.requestFrame();
@@ -2935,6 +3049,8 @@ export class WebGlFloorplanRenderer {
     this.runLookup = null;
     gl.deleteTexture(this.vectorClipTexture);
     this.vectorClipTexture = null;
+    gl.deleteTexture(this.vectorClipBoundsTexture);
+    this.vectorClipBoundsTexture = null;
     this.vectorClipHeaders = null;
     this.vectorClipUniforms.clear();
 
@@ -2985,6 +3101,15 @@ export class WebGlFloorplanRenderer {
     }
     if (this.rasterStripProgram) gl.deleteProgram(this.rasterStripProgram.program);
     this.rasterStripProgram = null;
+    if (this.rasterAtlasProgram) gl.deleteProgram(this.rasterAtlasProgram.program);
+    this.rasterAtlasProgram = null;
+    if (this.rasterTextureBatch) {
+      gl.deleteProgram(this.rasterTextureBatch.program);
+      gl.deleteBuffer(this.rasterTextureBatch.buffer);
+      gl.deleteVertexArray(this.rasterTextureBatch.vao);
+    }
+    this.rasterTextureBatch = null;
+    this.destroyRasterTextureBatchCache();
 
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
@@ -3599,6 +3724,7 @@ export class WebGlFloorplanRenderer {
     gl.uniform4f(uniforms.uPrimitiveOverride, primitiveColor?.[0] ?? 0, primitiveColor?.[1] ?? 0, primitiveColor?.[2] ?? 0, primitiveColor ? 1 : 0);
     const clipBounds = this.gradientClipBounds();
     gl.uniform4f(uniforms.uClipBounds, clipBounds[0], clipBounds[1], clipBounds[2], clipBounds[3]);
+    this.lastGradientFillDrawIndex = pathIndex;
     if (meshCount) {
       gl.uniform1i(uniforms.uMeshPathIndex, pathIndex);
       gl.drawArrays(gl.TRIANGLES, this.gradientMeshRanges[pathIndex * 2], meshCount);
@@ -3921,6 +4047,186 @@ export class WebGlFloorplanRenderer {
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
+  /** Draw only the visible contiguous part of an atlas, in source paint order. */
+  private drawRasterAtlasBatch(batch: RasterAtlasBatchGpu, first: number, count: number,
+    width: number, height: number, x: number, y: number, zoom: number): void {
+    const gl = this.gl, { program, uniforms } = this.rasterAtlasProgram!;
+    gl.useProgram(program);
+    this.bindVectorClip(program);
+    this.bindPaintFold(program);
+    gl.bindVertexArray(batch.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, batch.buffer);
+    for (let attribute = 0; attribute < 3; attribute++) {
+      gl.vertexAttribPointer(attribute, 4, gl.FLOAT, false, 48, (first - batch.first) * 48 + attribute * 16);
+    }
+    if (this.prepareOrderedProgram(program)) {
+      this.setGradientViewUniforms(uniforms, width, height, x, y, zoom);
+      gl.uniform1i(uniforms.uRasterAtlasTex, 12);
+    }
+    this.bindOrderedTexture(12, batch.texture);
+    gl.uniform2f(uniforms.uRasterAtlasSize, batch.width, batch.height);
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    this.frameDrawCalls++;
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  /** Reuse canonical image textures, including images too large for the atlas. */
+  private drawRasterTextureBatch(textures: readonly WebGLTexture[], count: number,
+    width: number, height: number, x: number, y: number, zoom: number): boolean {
+    const gl = this.gl;
+    if (this.rasterTextureBatchUnavailable) return false;
+    if (!this.rasterTextureBatch) {
+      let program: WebGLProgram | null = null, buffer: WebGLBuffer | null = null, vao: WebGLVertexArrayObject | null = null;
+      try {
+        const fragment = this.paintFoldUnit >= 0
+          ? paintFoldFragmentGlsl(RASTER_TEXTURE_BATCH_FRAGMENT_GLSL, true) : RASTER_TEXTURE_BATCH_FRAGMENT_GLSL;
+        program = this.createProgram(RASTER_TEXTURE_BATCH_VERTEX_GLSL, fragment);
+        const uniforms = this.mustGetUniformMap(program, ["uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip",
+          "uLocalToClip", ...Array.from({ length: RASTER_BATCH_TEXTURES }, (_, i) => `uRasterBatchTex${i}`)]);
+        buffer = this.mustCreateBuffer(); vao = this.createVertexArray();
+        this.initializeRasterTextureBatchVao(buffer, vao);
+        if (this.paintFoldUnit >= 0) {
+          gl.useProgram(program);
+          gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit);
+        }
+        this.rasterTextureBatch = { program, uniforms, buffer, vao };
+      } catch (error) {
+        gl.deleteProgram(program); gl.deleteBuffer(buffer); gl.deleteVertexArray(vao);
+        this.rasterTextureBatchUnavailable = true;
+        console.warn("Raster texture batching unavailable; drawing original image layers.", error);
+        return false;
+      }
+    }
+    const { program, uniforms } = this.rasterTextureBatch;
+    gl.useProgram(program); this.bindVectorClip(program); this.bindPaintFold(program);
+    this.bindRasterTextureBatchGeometry(count);
+    if (this.prepareOrderedProgram(program)) {
+      this.setGradientViewUniforms(uniforms, width, height, x, y, zoom);
+      for (let unit = 0; unit < RASTER_BATCH_TEXTURES; unit++) gl.uniform1i(uniforms[`uRasterBatchTex${unit}`], unit);
+    }
+    // Every declared sampler needs a complete texture, even an unused slot.
+    for (let unit = 0; unit < RASTER_BATCH_TEXTURES; unit++) this.bindOrderedTexture(unit, textures[unit] ?? textures[0]);
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    this.frameDrawCalls++;
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    if (profile) this.profileRasterTextureQuadAreas(profile, width, height, x, y, zoom, count);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    return true;
+  }
+
+  private initializeRasterTextureBatchVao(buffer: WebGLBuffer, vao: WebGLVertexArrayObject): void {
+    const gl = this.gl;
+    gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    for (let attribute = 0; attribute < 4; attribute++) {
+      gl.enableVertexAttribArray(attribute);
+      gl.vertexAttribPointer(attribute, attribute === 2 ? 3 : 4, gl.FLOAT, false,
+        RASTER_BATCH_INSTANCE_FLOATS * 4, attribute * 16);
+      gl.vertexAttribDivisor(attribute, 1);
+    }
+  }
+
+  private bindRasterTextureBatchGeometry(count: number): void {
+    const gl = this.gl, data = this.rasterTextureBatchInstances!;
+    const length = count * RASTER_BATCH_INSTANCE_FLOATS, bytes = length * 4;
+    const slot = this.rasterTextureBatchCacheCursor++;
+    const cache = this.rasterTextureBatchCache ??= [];
+    this.rasterTextureBatchCacheBytes ??= 0;
+    let cached = cache[slot];
+    let matches = cached?.instances.length === length;
+    if (matches) for (let i = 0; i < length; i++) {
+      if (cached!.instances[i] !== data[i]) { matches = false; break; }
+    }
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    if (matches) {
+      gl.bindVertexArray(cached!.vao);
+      profile?.add("rasterTextureBatchCacheHits");
+      return;
+    }
+    profile?.add("rasterTextureBatchCacheMisses");
+    if (!this.rasterTextureBatchCacheUnavailable && slot < MAX_RASTER_TEXTURE_BATCH_CACHE_ENTRIES &&
+        this.rasterTextureBatchCacheBytes - (cached?.instances.byteLength ?? 0) + bytes <= MAX_RASTER_TEXTURE_BATCH_CACHE_BYTES) {
+      let buffer: WebGLBuffer | null = null, vao: WebGLVertexArrayObject | null = null;
+      try {
+        if (!cached) {
+          buffer = this.mustCreateBuffer(); vao = this.createVertexArray();
+          this.initializeRasterTextureBatchVao(buffer, vao);
+          cached = { buffer, vao, instances: new Float32Array(0) };
+        }
+        gl.bindVertexArray(cached.vao); gl.bindBuffer(gl.ARRAY_BUFFER, cached.buffer);
+        const instances = data.slice(0, length);
+        gl.bufferData(gl.ARRAY_BUFFER, instances, gl.STATIC_DRAW);
+        this.rasterTextureBatchCacheBytes += bytes - cached.instances.byteLength;
+        cached.instances = instances; cache[slot] = cached;
+        profile?.add("rasterTextureInstanceUploadBytes", bytes);
+        return;
+      } catch (error) {
+        if (cache[slot] === cached && cached) {
+          this.rasterTextureBatchCacheBytes -= cached.instances.byteLength;
+          gl.deleteBuffer(cached.buffer); gl.deleteVertexArray(cached.vao);
+          cache[slot] = undefined;
+        }
+        gl.deleteBuffer(buffer); gl.deleteVertexArray(vao);
+        this.rasterTextureBatchCacheUnavailable = true;
+        console.warn("Raster batch geometry cache unavailable; streaming image instances.", error);
+      }
+    }
+    const streaming = this.rasterTextureBatch!;
+    gl.bindVertexArray(streaming.vao); gl.bindBuffer(gl.ARRAY_BUFFER, streaming.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, length), gl.DYNAMIC_DRAW);
+    profile?.add("rasterTextureInstanceUploadBytes", bytes);
+  }
+
+  private destroyRasterTextureBatchCache(): void {
+    for (const entry of this.rasterTextureBatchCache ?? []) {
+      if (!entry) continue;
+      this.gl.deleteBuffer(entry.buffer); this.gl.deleteVertexArray(entry.vao);
+    }
+    this.rasterTextureBatchCache = [];
+    this.rasterTextureBatchCacheBytes = 0;
+    this.rasterTextureBatchCacheCursor = 0;
+  }
+
+  /** Opt-in bounds estimates for original-texture image batches only. */
+  private profileRasterTextureQuadAreas(profile: RenderPerformanceProfiler, width: number, height: number,
+    cameraX: number, cameraY: number, zoom: number, count: number): void {
+    if (this.localToClipRenderingEnabled || !(zoom > 0) || !Number.isFinite(zoom)) return;
+    const data = this.rasterTextureBatchInstances!;
+    const margin = Math.max(1 / Math.max(zoom, 1e-6), 1e-4);
+    let originalPixels = 0, quadPixels = 0, tested = 0, bounded = 0, culled = 0;
+    for (let instance = 0; instance < count; instance++) {
+      const offset = instance * RASTER_BATCH_INSTANCE_FLOATS;
+      const a = data[offset], b = data[offset + 1], c = data[offset + 2], d = data[offset + 3];
+      const e = data[offset + 4], f = data[offset + 5];
+      const pixels = (u0: number, v0: number, u1: number, v1: number): number => {
+        const x0 = e + Math.min(a * u0, a * u1) + Math.min(c * v0, c * v1);
+        const y0 = f + Math.min(b * u0, b * u1) + Math.min(d * v0, d * v1);
+        const x1 = e + Math.max(a * u0, a * u1) + Math.max(c * v0, c * v1);
+        const y1 = f + Math.max(b * u0, b * u1) + Math.max(d * v0, d * v1);
+        return Math.max(0, Math.min(width, Math.ceil((x1 - cameraX) * zoom + width / 2)) -
+          Math.max(0, Math.floor((x0 - cameraX) * zoom + width / 2))) *
+          Math.max(0, Math.min(height, Math.ceil((y1 - cameraY) * zoom + height / 2)) -
+          Math.max(0, Math.floor((y0 - cameraY) * zoom + height / 2)));
+      };
+      originalPixels += pixels(0, 0, 1, 1);
+      const clip = data[offset + 7];
+      if (clip >= 0 && clip * 4 + 3 < (this.vectorClipBounds?.length ?? 0)) tested++;
+      let u0 = data[offset + 12], v0 = data[offset + 13], u1 = data[offset + 14], v1 = data[offset + 15];
+      if (u0 > u1 || v0 > v1) { bounded++; culled++; continue; }
+      u0 = Math.max(0, u0 - data[offset + 9] * margin); v0 = Math.max(0, v0 - data[offset + 10] * margin);
+      u1 = Math.min(1, u1 + data[offset + 9] * margin); v1 = Math.min(1, v1 + data[offset + 10] * margin);
+      if (u0 > u1 || v0 > v1) { bounded++; culled++; continue; }
+      if (u0 > 0 || v0 > 0 || u1 < 1 || v1 < 1) bounded++;
+      quadPixels += pixels(u0, v0, u1, v1);
+    }
+    profile.add("rasterTextureUnclippedQuadPixelsEstimate", originalPixels);
+    profile.add("rasterTextureQuadPixelsEstimate", quadPixels);
+    profile.add("rasterTextureClipBoundsTestedInstances", tested);
+    profile.add("rasterTextureClipBoundedInstances", bounded);
+    profile.add("rasterTextureClipCulledInstances", culled);
+  }
+
   private drawRasterLayer(
     viewportWidth: number,
     viewportHeight: number,
@@ -4028,15 +4334,21 @@ export class WebGlFloorplanRenderer {
 
   private uploadVectorClips(scene: VectorScene): void {
     const gl = this.gl;
+    this.rasterTextureClipBounds = new WeakMap();
     if (this.vectorClipTexture) gl.deleteTexture(this.vectorClipTexture);
+    if (this.vectorClipBoundsTexture) gl.deleteTexture(this.vectorClipBoundsTexture);
+    this.vectorClipBoundsTexture = null;
     // The clip GLSL reads cell storage, bounding each pixel's clip work at any
     // zoom. Highlight overlays pack their own few clips with bands.
-    const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
+    const data = packVectorClips(scene.clipPaths, undefined, { cells: true,
+      onStats: stats => { this.vectorClipPackingStats = stats; } });
+    this.vectorClipStoreTexels = data.length / 4;
     this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-    const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
-    const height = Math.ceil(data.length / 4 / width);
+    const texels = data.length / 4;
+    const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(texels))));
+    const height = Math.ceil(texels / width);
     if (height > maxSize) throw new RangeError("Vector clip data exceeds GPU texture capacity.");
     const padded = new Float32Array(width * height * 4); padded.set(data);
     this.vectorClipTexture = gl.createTexture();
@@ -4045,6 +4357,28 @@ export class WebGlFloorplanRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, padded);
+    if (this.vectorClipBounds.length) {
+      try {
+        const count = this.vectorClipBounds.length / 4;
+        const boundsWidth = Math.min(maxSize, Math.ceil(Math.sqrt(count)));
+        const boundsHeight = Math.ceil(count / boundsWidth);
+        if (boundsWidth * boundsHeight > MAX_FILL_CLIP_BOUNDS_TEXELS || boundsHeight > maxSize) {
+          throw new RangeError("Fill clip bounds exceed their GPU storage budget.");
+        }
+        const boundsData = new Float32Array(boundsWidth * boundsHeight * 4);
+        boundsData.set(this.vectorClipBounds);
+        this.vectorClipBoundsTexture = gl.createTexture();
+        if (!this.vectorClipBoundsTexture) throw new Error("Unable to allocate the fill clip bounds texture.");
+        gl.bindTexture(gl.TEXTURE_2D, this.vectorClipBoundsTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, boundsWidth, boundsHeight, 0, gl.RGBA, gl.FLOAT, boundsData);
+      } catch (error) {
+        gl.deleteTexture(this.vectorClipBoundsTexture);
+        this.vectorClipBoundsTexture = null;
+        console.warn("Fill clip bounds unavailable; drawing original fill quads.", error);
+      }
+    }
     this.vectorClipIndex = -1;
   }
 
@@ -4211,6 +4545,7 @@ export class WebGlFloorplanRenderer {
   private drawSourceOrderedContent(width: number, height: number, x: number, y: number, zoom: number,
     framebuffer: WebGLFramebuffer | null = null): number {
     // A new frame trusts no GL state left by uploads, overlays or other paths.
+    this.rasterTextureBatchCacheCursor = 0;
     this.resetOrderedState();
     this.orderedInstanceVaos?.clear();
     this.orderedStateActive = true;
@@ -4218,6 +4553,18 @@ export class WebGlFloorplanRenderer {
       return this.drawSourceOrderedFrame(width, height, x, y, zoom, framebuffer);
     } finally {
       this.orderedStateActive = false;
+      const cache = this.rasterTextureBatchCache;
+      if (cache && this.rasterTextureBatchCacheCursor < cache.length) {
+        for (let i = this.rasterTextureBatchCacheCursor; i < cache.length; i++) {
+          const entry = cache[i];
+          if (!entry) continue;
+          this.gl.deleteBuffer(entry.buffer); this.gl.deleteVertexArray(entry.vao);
+          this.rasterTextureBatchCacheBytes -= entry.instances.byteLength;
+        }
+        cache.length = this.rasterTextureBatchCacheCursor;
+      }
+      const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+      profile?.add("rasterTextureBatchCacheBytes", this.rasterTextureBatchCacheBytes ?? 0);
     }
   }
 
@@ -4237,6 +4584,19 @@ export class WebGlFloorplanRenderer {
     profile?.endSection("paintVisibility");
     profile?.add("visiblePaints", runs.length);
     profile?.add("sourcePaints", this.scene!.drawRuns!.length);
+    profile?.add("fillClipBoundsAvailable", this.vectorClipBoundsTexture ? 1 : 0);
+    profile?.add("fillClipBoundsTexels", this.vectorClipBoundsTexture ? this.vectorClipBounds.length / 4 : 0);
+    profile?.add("vectorClipStoreTexels", this.vectorClipStoreTexels ?? 0);
+    if (profile && this.vectorClipPackingStats) {
+      const stats = this.vectorClipPackingStats;
+      profile.add("vectorClipUniquePayloads", stats.uniquePayloads);
+      profile.add("vectorClipSharedPayloads", stats.sharedPayloads);
+      profile.add("vectorClipRectangleNodes", stats.rectangleNodes);
+      profile.add("vectorClipCellIndexedNodes", stats.cellIndexedNodes);
+      profile.add("vectorClipBandIndexedNodes", stats.bandIndexedNodes);
+      profile.add("vectorClipUnindexedPolygonNodes", stats.unindexedPolygonNodes);
+      profile.add("vectorClipCoarsenedCellNodes", stats.coarsenedCellNodes);
+    }
     this.orderedRunsCulled = runs.length < this.scene!.drawRuns!.length;
     // Paints reorder only within a compositor span, so the ordered instance
     // plan is valid with or without transparency groups.
@@ -4254,7 +4614,65 @@ export class WebGlFloorplanRenderer {
       this.gl.bufferData(this.gl.ARRAY_BUFFER, plan.floatInstances.subarray(0, plan.instanceCount * 2), this.gl.DYNAMIC_DRAW);
       profile?.endSection("instanceUpload");
     }
+    const rasterIndices: number[] = [], rasterTextures: WebGLTexture[] = [];
+    const drawSingleRaster = (index: number, allowAtlas = true): void => {
+      profile?.add("drawBatches"); profile?.add("rasterInstances");
+      const atlas = allowAtlas && this.multiplyPass == null ? this.rasterAtlasBatches?.get(index) : undefined;
+      if (atlas) {
+        this.drawRasterAtlasBatch(atlas, index, 1, width, height, x, y, zoom);
+        profile?.add("rasterAtlasBatches");
+      } else {
+        const before = this.frameDrawCalls;
+        this.drawRasterLayerAtIndex(index, width, height, x, y, zoom);
+        profile?.add("rasterStandaloneDraws", this.frameDrawCalls - before);
+      }
+    };
+    const flushRaster = (): void => {
+      if (!rasterIndices.length) return;
+      const clip = this.vectorClipIndex;
+      // The batch shader reads each instance's clip rather than this uniform.
+      this.vectorClipIndex = -1;
+      try {
+        if (rasterIndices.length > 1 && this.drawRasterTextureBatch(rasterTextures, rasterIndices.length, width, height, x, y, zoom)) {
+          profile?.add("drawBatches"); profile?.add("rasterTextureBatches");
+          profile?.add("rasterTextureBatchInstances", rasterIndices.length);
+          profile?.add("rasterInstances", rasterIndices.length);
+        } else for (let i = 0; i < rasterIndices.length; i++) {
+          this.vectorClipIndex = this.rasterTextureBatchInstances![i * RASTER_BATCH_INSTANCE_FLOATS + 7];
+          drawSingleRaster(rasterIndices[i]);
+        }
+      } finally {
+        this.vectorClipIndex = clip; rasterIndices.length = rasterTextures.length = 0;
+      }
+    };
+    const queueRaster = (index: number): boolean => {
+      const layer = this.rasterLayers?.[index];
+      if (!layer || layer.quad || layer.uv || layer.extraTiles?.length || this.rasterTextureBatchUnavailable) return false;
+      let slot = rasterTextures.indexOf(layer.texture);
+      if (rasterIndices.length === RASTER_BATCH_INSTANCES || slot < 0 && rasterTextures.length === RASTER_BATCH_TEXTURES) {
+        flushRaster(); slot = -1;
+      }
+      if (slot < 0) { slot = rasterTextures.length; rasterTextures.push(layer.texture); }
+      const offset = rasterIndices.length * RASTER_BATCH_INSTANCE_FLOATS;
+      const data = this.rasterTextureBatchInstances ??= new Float32Array(RASTER_BATCH_INSTANCES * RASTER_BATCH_INSTANCE_FLOATS);
+      data.set(layer.matrix, offset); data[offset + 6] = layer.opacity;
+      data[offset + 7] = this.vectorClipIndex; data[offset + 8] = slot;
+      const cache = this.rasterTextureClipBounds ??= new WeakMap();
+      let clips = cache.get(layer);
+      if (!clips) { clips = new Map(); cache.set(layer, clips); }
+      let bounds = clips.get(this.vectorClipIndex);
+      if (!bounds) {
+        const first = this.vectorClipIndex * 4;
+        bounds = rasterClipInstanceBounds(layer.matrix, this.vectorClipBounds && first >= 0 && first + 3 < this.vectorClipBounds.length
+          ? this.vectorClipBounds.subarray(first, first + 4) : undefined);
+        clips.set(this.vectorClipIndex, bounds);
+      }
+      data.set(bounds, offset + 9);
+      rasterIndices.push(index);
+      return true;
+    };
     const draw = (run: NonNullable<VectorScene["drawRuns"]>[number]): void => {
+      if (run.kind !== "raster" || run.blendMode || this.multiplyPass != null) flushRaster();
       // Every paint binds through the frame's cache, so canonical paints and
       // gradients between batches need no invalidation of their own.
       this.vectorClipIndex = run.clipIndex ?? -1;
@@ -4283,14 +4701,24 @@ export class WebGlFloorplanRenderer {
       } else {
         for (let index = run.first; index < run.first + run.count; index++) {
           if (run.kind === "raster" && this.rasterRenderingEnabled) {
-            profile?.add("drawBatches");
+            const atlas = this.multiplyPass == null && !run.blendMode ? this.rasterAtlasBatches?.get(index) : undefined;
             const batch = !paintVisibility.requiresCompositing && this.multiplyPass == null && !run.blendMode
               ? this.rasterStripBatches?.get(index) : undefined;
-            if (batch && index + batch.count <= run.first + run.count) {
+            const count = atlas ? Math.min(run.first + run.count - index, atlas.first + atlas.count - index) : 0;
+            if (atlas && count > 1) {
+              flushRaster(); profile?.add("drawBatches");
+              this.drawRasterAtlasBatch(atlas, index, count, width, height, x, y, zoom);
+              profile?.add("rasterAtlasBatches");
+              profile?.add("rasterInstances", count);
+              index += count - 1;
+            } else if (batch && index + batch.count <= run.first + run.count) {
+              flushRaster(); profile?.add("drawBatches");
               this.drawRasterStripBatch(batch, width, height, x, y, zoom);
+              profile?.add("rasterStripBatches");
+              profile?.add("rasterInstances", batch.count);
               index += batch.count - 1;
-            } else {
-              this.drawRasterLayerAtIndex(index, width, height, x, y, zoom);
+            } else if (this.multiplyPass != null || run.blendMode || !queueRaster(index)) {
+              flushRaster(); drawSingleRaster(index, !run.blendMode);
             }
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
             profile?.add("drawBatches");
@@ -4320,6 +4748,7 @@ export class WebGlFloorplanRenderer {
           profile?.add("foldedPaints");
           try {
             draw(run);
+            flushRaster();
           } finally {
             this.paintFold = null;
             // The mask surface may later be drawn into; it must not stay bound.
@@ -4334,6 +4763,7 @@ export class WebGlFloorplanRenderer {
           this.paintShapeOnly = shapeOnly;
           const previous = strokes;
           submitPaintSpan(spanRuns, plan, segments, this.runLookup, draw);
+          flushRaster();
           if (shapeOnly) strokes = previous;
         }, condition => condition === undefined || visibility?.conditions[condition] === 1,
         this.orderedRunCuller?.selected ?? null,
@@ -4362,6 +4792,7 @@ export class WebGlFloorplanRenderer {
     }
     for (const run of plan?.batches ?? runs) {
       if (!run.blendMode) { draw(run); continue; }
+      flushRaster();
       // Pair both passes for each instance so overlapping instances observe
       // the fully composed preceding paint, including destination alpha.
       for (let first = run.first; first < run.first + run.count; first++) {
@@ -4375,6 +4806,7 @@ export class WebGlFloorplanRenderer {
       this.multiplyPass = null;
       this.gl.blendFuncSeparate(this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA, this.gl.ONE, this.gl.ONE_MINUS_SRC_ALPHA);
     }
+    flushRaster();
     this.vectorClipIndex = -1;
     profile?.endSection("drawSubmission");
     return strokes;
@@ -4406,6 +4838,9 @@ export class WebGlFloorplanRenderer {
     this.bindOrderedTexture(textureUnit + 2, this.fillPathMetaTextureC);
     this.bindOrderedTexture(textureUnit + 3, this.fillSegmentTextureA);
     this.bindOrderedTexture(textureUnit + 4, this.fillSegmentTextureB);
+    // Disabled samplers still need a complete texture. The original clip store
+    // is a safe placeholder when no bounds texture was allocated.
+    this.bindOrderedTexture(this.fillClipBoundsUnit ?? 14, this.vectorClipBoundsTexture ?? this.vectorClipTexture);
 
     if (this.prepareOrderedProgram(this.fillProgram)) {
       gl.uniform1i(this.uFillPathMetaTexA, textureUnit);
@@ -4421,6 +4856,8 @@ export class WebGlFloorplanRenderer {
       gl.uniform1f(this.uFillAAScreenPx, 1);
       gl.uniform1i(this.uFillBandBase, this.fillBandBase);
       gl.uniform1i(this.uFillCellHeaders, this.fillCellBase + 1);
+      gl.uniform1i(this.uFillClipBoundsEnabled, this.vectorClipBoundsTexture ? 1 : 0);
+      gl.uniform1i(this.uFillClipBoundsTex, this.fillClipBoundsUnit ?? 14);
       gl.uniform1i(this.uFillBandEntries, this.fillBandEntries);
       gl.uniform1f(this.uFillUseLocalToClip, this.localToClipRenderingEnabled ? 1 : 0);
       if (this.localToClipRenderingEnabled) {
@@ -4437,9 +4874,65 @@ export class WebGlFloorplanRenderer {
 
     if (this.vectorClipIndex !== -2) gl.bindBuffer(gl.ARRAY_BUFFER, this.allFillPathIdBuffer);
     this.bindOrderedInstanceAttribute(3, first);
+    this.lastFillDrawFirst = first;
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
     this.frameDrawCalls++;
+    const profile = this.performanceProfiler?.enabled ? this.performanceProfiler : null;
+    if (profile) this.profileFillQuadAreas(profile, viewportWidth, viewportHeight,
+      cameraCenterX, cameraCenterY, zoomValue, first, count);
     return count;
+  }
+
+  /** Opt-in area estimates resolve exactly the IDs and clips used by this draw. */
+  private profileFillQuadAreas(profile: RenderPerformanceProfiler, width: number, height: number,
+    cameraX: number, cameraY: number, zoom: number, first: number, count: number): void {
+    if (this.localToClipRenderingEnabled || !(zoom > 0) || !Number.isFinite(zoom)) return;
+    const scene = this.scene;
+    if (!scene?.fillPathMetaA || !scene.fillPathMetaB || !scene.fillPathMetaC) return;
+    const indirect = this.vectorClipIndex === -2;
+    const instances = indirect ? this.orderedBatches?.uintInstances : null;
+    if (indirect && !instances) return;
+    const bounds = this.vectorClipBounds;
+    const margin = 1 / zoom;
+    const pixels = (minX: number, minY: number, maxX: number, maxY: number): number =>
+      Math.max(0, Math.min(width, Math.ceil((maxX - cameraX) * zoom + width / 2)) -
+        Math.max(0, Math.floor((minX - cameraX) * zoom + width / 2))) *
+      Math.max(0, Math.min(height, Math.ceil((maxY - cameraY) * zoom + height / 2)) -
+        Math.max(0, Math.floor((minY - cameraY) * zoom + height / 2)));
+    let originalPixels = 0, quadPixels = 0, tested = 0, bounded = 0, culled = 0;
+    for (let instance = first; instance < first + count; instance++) {
+      const id = indirect ? instances![instance * 2] : instance;
+      const offset = id * 4;
+      if (offset + 3 >= scene.fillPathMetaA.length || !(scene.fillPathMetaA[offset + 1] > 0) ||
+        (!this.paintShapeOnly && !(scene.fillPathMetaC[offset + 3] > 0.001))) continue;
+      const minX = scene.fillPathMetaA[offset + 2], minY = scene.fillPathMetaA[offset + 3];
+      const maxX = scene.fillPathMetaB[offset], maxY = scene.fillPathMetaB[offset + 1];
+      let lowX = minX - margin, lowY = minY - margin;
+      let highX = maxX + margin, highY = maxY + margin;
+      originalPixels += pixels(lowX, lowY, highX, highY);
+      const clip = indirect ? instances![instance * 2 + 1] - 1 : this.vectorClipIndex;
+      if (this.vectorClipBoundsTexture && clip >= 0 && bounds && clip * 4 + 3 < bounds.length) {
+        tested++;
+        const start = clip * 4;
+        if (bounds[start] > bounds[start + 2] || bounds[start + 1] > bounds[start + 3]) {
+          bounded++; culled++;
+          continue;
+        }
+        lowX = Math.max(minX, bounds[start]) - margin;
+        lowY = Math.max(minY, bounds[start + 1]) - margin;
+        highX = Math.min(maxX, bounds[start + 2]) + margin;
+        highY = Math.min(maxY, bounds[start + 3]) + margin;
+        if (lowX > minX - margin || lowY > minY - margin ||
+          highX < maxX + margin || highY < maxY + margin) bounded++;
+      }
+      if (lowX > highX || lowY > highY) culled++;
+      else quadPixels += pixels(lowX, lowY, highX, highY);
+    }
+    profile.add("fillUnclippedQuadPixelsEstimate", originalPixels);
+    profile.add("fillQuadPixelsEstimate", quadPixels);
+    profile.add("fillClipBoundsTestedInstances", tested);
+    profile.add("fillClipBoundedInstances", bounded);
+    profile.add("fillClipCulledInstances", culled);
   }
 
   private drawVisibleSegments(
@@ -5076,7 +5569,9 @@ export class WebGlFloorplanRenderer {
   }
 
   private destroyRasterLayerTextures(): void {
+    this.destroyRasterTextureBatchCache();
     this.destroyRasterStripBatches();
+    this.destroyRasterAtlasBatches();
     for (const layer of this.rasterLayers) this.deleteRasterLayerTextures(layer);
     this.rasterLayers = [];
   }
@@ -5088,6 +5583,74 @@ export class WebGlFloorplanRenderer {
       this.gl.deleteVertexArray(batch.vao);
     }
     this.rasterStripBatches?.clear();
+  }
+
+  private destroyRasterAtlasBatches(): void {
+    const unique = new Set(this.rasterAtlasBatches?.values());
+    for (const batch of unique) {
+      this.gl.deleteTexture(batch.texture);
+      this.gl.deleteBuffer(batch.buffer);
+      this.gl.deleteVertexArray(batch.vao);
+    }
+    this.rasterAtlasBatches?.clear();
+  }
+
+  private uploadRasterAtlasBatches(scene: VectorScene, maxTextureSize: number): void {
+    const gl = this.gl;
+    try {
+      const excluded = new Set<number>();
+      // Keep the established strip atlas path for flat single-row images.
+      // Partial/failed strips can still share the original texture batch path.
+      if (!scene.paintGraph) scene.rasterLayers.forEach((source, index) => { if (source.height === 1) excluded.add(index); });
+      for (const [first, batch] of this.rasterStripBatches ?? []) {
+        for (let i = first; i < first + batch.count; i++) excluded.add(i);
+      }
+      const batches = buildRasterAtlasBatches(scene, maxTextureSize, excluded);
+      if (!batches.length) return;
+      if (!this.rasterAtlasProgram) {
+        const fragment = this.paintFoldUnit >= 0 ? paintFoldFragmentGlsl(RASTER_ATLAS_FRAGMENT_GLSL, true) : RASTER_ATLAS_FRAGMENT_GLSL;
+        const program = this.createProgram(RASTER_ATLAS_VERTEX_GLSL, fragment);
+        try {
+          this.rasterAtlasProgram = { program, uniforms: this.mustGetUniformMap(program, [
+            "uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip", "uRasterAtlasTex", "uRasterAtlasSize"
+          ]) };
+          if (this.paintFoldUnit >= 0) {
+            gl.useProgram(program);
+            gl.uniform1i(gl.getUniformLocation(program, "uPaintMask"), this.paintFoldUnit);
+          }
+        } catch (error) { this.rasterAtlasProgram = null; gl.deleteProgram(program); throw error; }
+      }
+      for (const batch of batches) {
+        const texture = this.mustCreateTexture();
+        let buffer: WebGLBuffer | null = null, vao: WebGLVertexArrayObject | null = null;
+        try {
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, batch.width, batch.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, batch.data);
+          buffer = this.mustCreateBuffer(); vao = this.createVertexArray();
+          gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          gl.bufferData(gl.ARRAY_BUFFER, batch.instances, gl.STATIC_DRAW);
+          for (let attribute = 0; attribute < 3; attribute++) {
+            gl.enableVertexAttribArray(attribute);
+            gl.vertexAttribPointer(attribute, 4, gl.FLOAT, false, 48, attribute * 16);
+            gl.vertexAttribDivisor(attribute, 1);
+          }
+          const gpu = { first: batch.first, count: batch.count, width: batch.width, height: batch.height, texture, buffer, vao };
+          for (let i = batch.first; i < batch.first + batch.count; i++) this.rasterAtlasBatches.set(i, gpu);
+        } catch (error) {
+          gl.deleteTexture(texture); gl.deleteBuffer(buffer); gl.deleteVertexArray(vao);
+          throw error;
+        }
+      }
+    } catch (error) {
+      this.destroyRasterAtlasBatches();
+      console.warn("Raster atlas batching unavailable; drawing original image layers.", error);
+    } finally {
+      gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
   }
 
   private uploadRasterStripBatches(scene: VectorScene, maxTextureSize: number): void {
@@ -5157,7 +5720,10 @@ export class WebGlFloorplanRenderer {
       }
       // Retained replacements keep the ordinary resources authoritative until
       // the next document load; batches must never resurrect stale source pixels.
-      if (this.rasterLayerUpdates.size === 0) this.uploadRasterStripBatches(scene, maxRasterTextureSize);
+      if (this.rasterLayerUpdates.size === 0) {
+        this.uploadRasterStripBatches(scene, maxRasterTextureSize);
+        this.uploadRasterAtlasBatches(scene, maxRasterTextureSize);
+      }
     } catch (error) {
       this.destroyRasterLayerTextures();
       throw error;

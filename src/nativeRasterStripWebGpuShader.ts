@@ -1,4 +1,4 @@
-import { VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
+import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
 import { RASTER_STRIP_LEVEL_WGSL, RASTER_STRIP_SAMPLE_WGSL } from "./rasterStripWebGpuSampling";
 
 /** Independent one-row image mip chains share an atlas without cross-image filtering. */
@@ -28,7 +28,7 @@ struct RasterStripInstance {
 @group(0) @binding(3) var uRasterTex : texture_2d<f32>;
 @group(1) @binding(0) var uVectorClipTex : texture_2d<f32>;
 @group(1) @binding(1) var<uniform> uVectorClip : vec4f;
-${VECTOR_CLIP_AA_WGSL}
+${RASTER_CLIP_WGSL}
 
 struct VsOut {
   @builtin(position) position : vec4f,
@@ -66,7 +66,7 @@ ${RASTER_STRIP_SAMPLE_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  // An antialiased clip edge, measured before any discard; color is premultiplied.
+  // Polygon clip AA is measured before discard; rectangular tile clips stay solid.
   let clipAAWidth = max(max(length(vec2f(dpdx(inData.world.x), dpdy(inData.world.x))),
     length(vec2f(dpdx(inData.world.y), dpdy(inData.world.y)))), 1e-4);
   let color = heprRasterStripSample(

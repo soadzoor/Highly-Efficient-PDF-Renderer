@@ -171,8 +171,8 @@ export function createThreeWebGpuRasterMaterial(
     shapeOnly: shapeOnlyUniform
   });
 
-  // Clips are often an image's visible outline; their edges are antialiased.
-  registerThreeNodeClipPosition(material, (rasterPack as { xy: unknown }).xy, "premultiplied");
+  // Polygon outlines are antialiased; rectangular tile/page clips stay solid.
+  registerThreeNodeClipPosition(material, (rasterPack as { xy: unknown }).xy, "premultiplied", true);
 
   return {
     material,

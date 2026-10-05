@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { createPdfAnnotationControls } from "../src/pdfAnnotationControls.ts";
 
-const selectors = [".pdf-annotations-all", ".pdf-annotations-all input", ".pdf-annotations-all span", ".pdf-annotations-filter",
+const selectors = [".pdf-annotations", ".pdf-annotations-clear", ".pdf-annotations-all", ".pdf-annotations-all input", ".pdf-annotations-all span", ".pdf-annotations-filter",
   ".pdf-annotations-filter input", ".pdf-annotations-list", ".pdf-annotations-status"];
 class Element extends EventTarget {
   childNodes = []; value = ""; textContent = ""; title = ""; className = ""; type = "";
+  attributes = new Map();
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  scrollIntoView() { this.scrolled = true; }
   checked = false; indeterminate = false; disabled = false; hidden = false;
   constructor(tag = "div", created = false) {
     super(); this.tagName = tag; this.created = created;
@@ -133,6 +137,45 @@ assert.equal(container.childNodes.length, 0);
 const before = calls.length;
 toggle(all, true); filter.dispatchEvent(new Event("input"));
 assert.equal(calls.length, before, "disposal removes the panel listeners");
+
+// Selection buttons never toggle appearance checkboxes; canvas selection reveals filtered/limited rows.
+scene = { annotations: Array.from({ length: 502 }, (_, index) => annotation(`row:${index}`, "Square", { annotationIndex: index })) };
+applied = new Map();
+const selectionRoot = new Element(), selectedEvents = [], hoveredEvents = [];
+const selectable = createPdfAnnotationControls({ container: selectionRoot, controller,
+  onSelect: annotation => selectedEvents.push(annotation?.id ?? null),
+  onHover: annotation => hoveredEvents.push(annotation?.id ?? null) });
+const selectionList = selectionRoot.querySelector(".pdf-annotations-list");
+const selectionButtons = () => walk(selectionList).filter(node => node.className === "pdf-annotation-select");
+const selectionBoxes = () => walk(selectionList).filter(node => node.tagName === "input");
+const selectionFilter = selectionRoot.querySelector(".pdf-annotations-filter input");
+const clearSelection = selectionRoot.querySelector(".pdf-annotations-clear");
+const firstButton = selectionButtons()[0];
+firstButton.dispatchEvent(new Event("click"));
+assert.deepEqual(selectedEvents, ["row:0"]); assert.equal(selectable.getSelection(), "row:0");
+assert.equal(firstButton.getAttribute("aria-pressed"), "true"); assert.equal(clearSelection.disabled, false);
+assert.equal(selectionBoxes()[0].checked, true, "row selection preserves visibility");
+firstButton.dispatchEvent(new Event("pointerenter")); assert.equal(hoveredEvents.at(-1), "row:0");
+firstButton.dispatchEvent(new Event("pointerleave")); assert.equal(hoveredEvents.at(-1), null);
+toggle(selectionBoxes()[0], false);
+assert.equal(selectable.getSelection(), "row:0", "visibility changes preserve selection");
+selectionFilter.value = "row:0"; selectionFilter.dispatchEvent(new Event("input"));
+selectable.selectAnnotation("row:501", { reveal: true });
+assert.equal(selectionFilter.value, ""); assert.equal(selectionRoot.querySelector(".pdf-annotations").open, true);
+assert.equal(selectionButtons().length, 500, "revealing a far row keeps the bounded list");
+const revealed = selectionButtons().find(button => button.getAttribute("aria-pressed") === "true");
+assert(revealed.title.includes("row:501")); assert.equal(revealed.scrolled, true);
+assert.deepEqual(selectedEvents, ["row:0"], "canvas synchronization never calls onSelect recursively");
+selectable.sceneChanged(); assert.equal(selectable.getSelection(), "row:501", "same-scene replacement preserves the selected row");
+clearSelection.dispatchEvent(new Event("click")); assert.equal(selectable.getSelection(), null);
+assert.equal(selectedEvents.at(-1), null); assert.equal(clearSelection.disabled, true);
+scene = { annotations: [annotation("repeat", "Square"), annotation("repeat", "Square", { pageIndex: 1 })] };
+selectable.sceneChanged();
+toggle(selectionBoxes()[0], false); assert(selectionBoxes().every(box => !box.checked), "repeated IDs synchronize visibility");
+selectionButtons()[0].dispatchEvent(new Event("click"));
+assert(selectionButtons().every(button => button.getAttribute("aria-pressed") === "true"));
+scene = { annotations: [] }; selectable.sceneChanged(); assert.equal(selectable.getSelection(), null);
+selectable.dispose();
 
 // The native example passes its real layer-visibility controller.
 const hooks = registerHooks({ resolve(specifier, context, next) {

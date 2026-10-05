@@ -352,6 +352,9 @@ Exporting such a HEP again stores exact ownership. Transforms are runtime presen
 | `resetLayerVisibility()` | Restore the PDF's original visibility defaults. Annotation visibility is kept. |
 | `getAnnotationLayers()` | List annotations whose compiled appearance can be shown or hidden, as `{ annotationId, visible }`. |
 | `setAnnotationVisibility(annotationIds, visible)` | Show or hide compiled annotation appearances by `SceneAnnotation.id`; metadata and bubbles are unaffected. |
+| `getAnnotationPrimitives(id)` | Return detached canonical primitive references for compiled appearances, including hidden paint; metadata-only annotations return `[]`. |
+| `setAnnotationSelection(ids)` / `setAnnotationHover(id)` | Draw blue selection / amber hover traces for annotations; `null` clears the corresponding annotation state. |
+| `pickAnnotation(options)` | Pick a compiled annotation appearance or metadata geometry in client CSS pixels; returns `{ annotationId, distancePx }` or `null`. |
 | `getStructureElement(id)` | Read a detached tagged-PDF structure element, with its user properties, by `markedContent.elementId`. |
 | `subscribeLayerVisibility(listener)` | Observe applied visibility snapshots; returns an unsubscribe function. |
 | `subscribeLayerVisibilityProgress(listener)` | Observe preparation percentage or `null` when idle; immediately reports current progress and returns an unsubscribe function. |
@@ -372,6 +375,78 @@ pdf.dispose();
 `attachControls()`, `fitToBounds()`, and `setViewState()` manage the internal
 fallback viewport. In an ordinary Three.js integration, use your application's
 camera and controls. Full method contracts: [HeprThreePdfObject](../src/threePdfObject.ts).
+
+### Annotation selection and picking
+
+An annotation list can select an annotation directly and select its list entry
+from a canvas hit:
+
+```ts
+pdf.setAnnotationSelection([annotation.id]);
+pdf.setAnnotationHover(annotation.id);
+
+const hit = await pdf.pickAnnotation({
+  camera,
+  element: renderer.domElement,
+  clientX: event.clientX,
+  clientY: event.clientY,
+  tolerancePx: 4,
+  includeHidden: true,
+  signal: controller.signal,
+});
+if (hit) selectListEntry(hit.annotationId);
+
+pdf.setAnnotationSelection(null);
+pdf.setAnnotationHover(null);
+```
+
+The camera and element work exactly as in `pick()`: HEPR handles recentering,
+object transforms and independent page transforms. Tolerance and distance use
+CSS pixels, independent of the drawing buffer's device pixel ratio. The default
+tolerance is 4; it must be finite and nonnegative. `AnnotationPickOptions` and
+`AnnotationHit` are exported from the package root.
+
+Compiled appearances use the same canonical native traces as primitive
+selection, independent of render LOD. Annotation selection and hover remain
+visible after `setAnnotationVisibility(ids, false)`; ordinary primitive selection
+keeps its existing visibility behavior. The two selections are independent and
+shared primitive traces are deduplicated. Repeating unchanged annotation state
+does not rebuild its highlights. PDF layers, Invisible/Hidden/NoView flags and
+Popup annotations still restrict interaction.
+
+`includeHidden` defaults to `false`. Setting it to `true` permits picking
+appearances suppressed by `setAnnotationVisibility`, without changing rendering
+or revealing hidden PDF layers. Annotations without attributable compiled paint
+use metadata quadrilaterals, ink, polygon or line geometry, then bounds. This
+also supports metadata-only AutoCAD SHX annotations, older HEPs and pages whose
+appearances were rasterized together. A miss on usable compiled geometry does
+not fall back to its bounding box; empty space inside an ink or polygon remains
+empty. Metadata traces and stroke widths are approximations.
+
+Within a page, the smallest projected annotation bounds among actual hits wins,
+including metadata-only notes over compiled appearances. Equal areas prefer
+the smaller hit distance, then the later source annotation index, later page
+slot and lexicographic ID. Overlapping independently transformed pages follow
+the same page depth and opaque-background policy as `pick()`.
+
+`getAnnotationPrimitives(id)` uses cached paint-run ownership instead of scanning
+all primitives. Its result includes every occurrence of that ID across pages
+and is independent of visibility. Known annotations with no attributable paint
+return `[]`; unknown IDs throw `RangeError`, as do selection/hover calls with
+unknown IDs. Selection batches validate before applying. Appearance ownership
+cannot be recovered from older HEPs or a single raster containing several
+annotations; metadata remains usable, without changing the HEP format.
+
+Picking lazily builds a spatial index of annotation geometry, avoiding the
+whole-drawing picking index. Appearance indexing is limited to 65,536 spatial
+blocks; unusually fragmented appearances use cooperative geometry scans with a
+console diagnostic when that budget is reached. Preparation and geometric queries yield and support
+cancellation; a visibility change during a query rejects with `AbortError`.
+Hosts should cancel stale pointer requests when their camera changes. Very large
+annotation traces fall back to metadata bounds with a console diagnostic;
+metadata paths exceeding 65,536 points likewise use bounds. Resource limits may
+reject an exceptionally large selection. `clearPrimitiveInteraction()` clears
+both annotation and primitive interaction and releases their picking indexes.
 
 ### PDF annotations and HTML bubbles
 
@@ -588,7 +663,7 @@ NoZoom and NoRotate appearances, including most sticky-note icons, keep their
 page geometry and scale with the page instead of forcing the page into a
 raster; `annotation.view-transform-approximated` reports this.
 
-`createPdfAnnotationControls({ container, controller, onChange? })` mounts the
+`createPdfAnnotationControls({ container, controller, onChange?, onSelect?, onHover? })` mounts the
 reusable **Annotations** panel used by all three demos. It lists every annotation
 except popups and Invisible, Hidden or NoView annotations, each with a checkbox.
 Turning one off hides its appearance through `controller.setAnnotationVisibility`.
@@ -629,6 +704,26 @@ panel's choices to the new renderer. With a filter active, **All** affects only 
 matching annotations. A failed change shows an error in the panel and returns the
 checkbox to the applied state. The panel exposes CSS classes under
 `.pdf-annotations`; `pdfLayerControls.css` includes them.
+
+Pass `onSelect(annotation | null)` to give each row a selection button separate
+from its visibility checkbox and add **Clear selection**. `onHover(annotation | null)`
+reports row hover and keyboard focus. Use these callbacks with
+`pdf.setAnnotationSelection(annotation ? [annotation.id] : null)` and
+`pdf.setAnnotationHover(annotation?.id ?? null)`. After a canvas `pickAnnotation()`
+hit, call `annotations.selectAnnotation(hit?.annotationId ?? null, { reveal: true })`.
+This updates the selected row without calling `onSelect`, opens the panel, clears
+a filter that excludes the hit, and includes the selected row within the 500-row
+limit. `getSelection()` returns the selected ID or null.
+
+The native and Three examples wire both directions and hover traces. Canvas
+picking includes hidden appearances and annotations without compiled paint;
+PDF visibility flags and document layers still apply. Choosing a row exits
+Drawing Selection, and canvas picking pauses during drawing or text selection
+gestures. Renderer replacement preserves selection for the same document.
+The demos use `createAnnotationOverlay({ pointerInteraction: false, ... })` to
+let the host's geometric picker own gestures and call `show(annotation, clientPoint?)`
+and `hide()`; a client point anchors link previews. The default overlay continues
+to handle its own metadata picking when this option is omitted.
 
 ### Drawing primitives
 

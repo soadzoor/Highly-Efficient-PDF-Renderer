@@ -16,5 +16,10 @@
 .pdf-annotations-filter { display: grid; gap: 0.25rem; margin: 0.6rem 0; }
 .pdf-annotations-list { max-height: 18rem; overflow: auto; margin-bottom: 0.5rem; }
 .pdf-annotation-row label { display: flex; align-items: start; gap: 0.4rem; padding: 0.2rem 0; overflow-wrap: anywhere; }
+.pdf-annotation-row { display: flex; align-items: start; gap: 0.35rem; }
+.pdf-annotation-select { flex: 1; min-width: 0; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 0.25rem; padding: 0.25rem; color: inherit; font: inherit; overflow-wrap: anywhere; cursor: pointer; }
+.pdf-annotation-select:hover, .pdf-annotation-select:focus-visible { background: #e8eef8; }
+.pdf-annotation-select[aria-pressed="true"] { background: #dce8ff; border-color: #3973ce; }
+.pdf-annotations-clear { margin-bottom: 0.4rem; }
 .pdf-annotations-more, .pdf-annotations-status { font-size: 0.8rem; margin-top: 0.4rem; }
 .pdf-annotations [hidden] { display: none !important; }

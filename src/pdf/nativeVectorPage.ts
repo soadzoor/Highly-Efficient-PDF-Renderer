@@ -1,7 +1,7 @@
 import type { SceneOptionalContent } from "../optionalContentData";
 import { AnnotationLayerBuilder } from "../annotationLayers";
 import { ContentItemRangeBuilder } from "../structureData";
-import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips } from "./nativeVectorClips";
+import { clipChainInsidePage, imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips, vectorPaintReachesPageEdge } from "./nativeVectorClips";
 import { buildNativeVectorGradients } from "./nativeVectorGradients";
 import type { NativePdfShadingRegistry } from "./nativeShadings";
 import { applyNativeHairlineTextOpacity, buildNativeVectorTextStrokes } from "./nativeVectorTextStroke";
@@ -308,8 +308,8 @@ export function buildNativeVectorPage(
   if (sidecar.pathPaintRanges) {
     const runs: NonNullable<VectorScene["drawRuns"]> = [];
     const clipBuilder = new NativeVectorClipBuilder();
-    // Paths and glyphs are already cut at the crop box; an image is placed
-    // whole, so one that reaches past the page also takes the page clip.
+    // Paths are cut at the crop box, but their shader AA can reach past it.
+    // Boundary paths and images extending off-page also take the page clip.
     const pageRooted = pageRootedVectorClips(normalizedPageBounds);
     // Structure content items (MCIDs) are attributed per primitive range,
     // beside the runs, so tagged objects never split draw runs.
@@ -336,8 +336,23 @@ export function buildNativeVectorPage(
         if (index * 2 + 1 >= sidecar.pathPaintRanges.length) {
           throw invalid("Invalid ordered path range.", pageInfo.sourcePageIndex, "vector-draw-path-range");
         }
+        const first = sidecar.pathPaintRanges[index * 2], count = sidecar.pathPaintRanges[index * 2 + 1];
+        let pathClipIndex = clipIndex;
+        const clippedToPage = clipChainInsidePage(sidecar.sourceClips?.[offset / 2], normalizedPageBounds);
+        for (let path = first; !clippedToPage && path < first + count; path++) {
+          const i = path * 4;
+          const atEdge = kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL
+            ? vectorPaintReachesPageEdge(compiled.fillPathMetaA[i + 2], compiled.fillPathMetaA[i + 3],
+              compiled.fillPathMetaB[i], compiled.fillPathMetaB[i + 1], normalizedPageBounds)
+            : vectorPaintReachesPageEdge(compiled.primitiveBounds[i], compiled.primitiveBounds[i + 1],
+              compiled.primitiveBounds[i + 2], compiled.primitiveBounds[i + 3], normalizedPageBounds);
+          if (atEdge) {
+            pathClipIndex = clipBuilder.add(pageRooted(sidecar.sourceClips?.[offset / 2] ?? null), signal);
+            break;
+          }
+        }
         appendVectorDrawRun(runs, kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
-          sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], clipIndex, blendMode, optionalContent);
+          first, count, pathClipIndex, blendMode, optionalContent);
         itemRanges.add(kind === DENSE_PDF_VECTOR_SCENE_EVENT_FILL ? "fill" : "stroke",
           sidecar.pathPaintRanges[index * 2], sidecar.pathPaintRanges[index * 2 + 1], item);
       } else if (kind === DENSE_PDF_VECTOR_SCENE_EVENT_GLYPH) {

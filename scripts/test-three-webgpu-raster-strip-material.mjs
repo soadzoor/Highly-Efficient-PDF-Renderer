@@ -95,6 +95,7 @@ try {
     initializeThreeVectorClip(baseline.material, baselineClipTexture);
     const baselineClipped = createThreeVectorClipMaterial(baseline.material, 0);
     const baselineFragment = build(baselineClipped, geometry).fragmentShader;
+    assert.match(baselineFragment, /heprRasterClipRectSamples\(/, "ordinary images keep tile/page clips solid");
     assert.match(baselineFragment.slice(baselineFragment.lastIndexOf("@fragment")),
       /heprClipAAWidth = heprClipPixelWidth[\s\S]*heprClipSource \* vec4<f32>\( heprVectorClipAA\(/);
     baselineClipped.dispose();
@@ -110,6 +111,7 @@ try {
     initializeThreeVectorClip(material, clipTexture);
     const clipped = createThreeVectorClipMaterial(material, 0);
     const clippedBuilder = build(clipped, geometry);
+    assert.match(clippedBuilder.fragmentShader, /heprRasterClipRectSamples\(/, "strip images use the same solid rectangle clips");
     assert.match(clippedBuilder.fragmentShader, /fn heprVectorClipAA\s*\(/, "a clip is often an image's outline: antialiased");
     assert.match(clippedBuilder.fragmentShader, /heprVectorClipAA\( .*\.xy,/, "clipping uses transformed page coordinates");
     const clippedMain = clippedBuilder.fragmentShader.slice(clippedBuilder.fragmentShader.lastIndexOf("@fragment"));

@@ -3,14 +3,17 @@ import { NodeMaterial, TSL } from "three/webgpu";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { packVectorClips } from "./vectorClips";
 import { VECTOR_CLIP_WGSL, VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
+import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
 import { copyThreePaintFold } from "./threePaintFold";
 
 const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
 const antialiasedNodeClips = new WeakMap<THREE.Material, "straight-alpha" | "premultiplied">();
+const rasterNodeClips = new WeakSet<THREE.Material>();
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
 const clipFn: unknown = TSL.wgslFn(VECTOR_CLIP_WGSL);
 const clipAAFn: unknown = TSL.wgslFn(VECTOR_CLIP_AA_WGSL);
+const rasterClipAAFn: unknown = TSL.wgslFn(RASTER_CLIP_WGSL);
 const clipPixelWidthFn: unknown = TSL.wgslFn(`
 fn heprClipPixelWidth(point: vec2<f32>) -> f32 {
   let dx = length(vec2<f32>(dpdx(point.x), dpdy(point.x)));
@@ -27,12 +30,13 @@ const INSTANCE_VECTOR_CLIP_UNIFORM = -2;
 /**
  * Without `antialias` a clip is a per-pixel point test. An antialiased clip
  * scales a straight-alpha color's alpha by its coverage, or all of a
- * premultiplied color.
+ * premultiplied color. Raster clips keep rectangular tile/page edges solid.
  */
 export function registerThreeNodeClipPosition(material: THREE.Material, world: unknown,
-  antialias: false | "straight-alpha" | "premultiplied" = false): void {
+  antialias: false | "straight-alpha" | "premultiplied" = false, raster = false): void {
   nodeWorldPositions.set(material, world);
   if (antialias) antialiasedNodeClips.set(material, antialias);
+  if (raster) rasterNodeClips.add(material);
 }
 
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
@@ -108,7 +112,9 @@ function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): 
         aaWidth.assign((clipPixelWidthFn as (params: Record<string, unknown>) => never)({ point: world }));
         const color = TSL.property("vec4", "heprClipSource");
         color.assign(source.fragmentNode as never);
-        const coverage = (clipAAFn as (params: Record<string, unknown>) => never)({ ...clipParams, aaWidth });
+        // Premultiplied image paint keeps rectangular tile/page clips solid.
+        const coverageFn = rasterNodeClips.has(source) ? rasterClipAAFn : clipAAFn;
+        const coverage = (coverageFn as (params: Record<string, unknown>) => never)({ ...clipParams, aaWidth });
         return antialias === "premultiplied" ? TSL.mul(color, coverage) : TSL.vec4(color.rgb, TSL.mul(color.a, coverage));
       })();
     } else {

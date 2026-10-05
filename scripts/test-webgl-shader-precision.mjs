@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../src/", import.meta.url));
 const shaders = new Map();
 for (const file of ["webGlFloorplanRenderer.ts", "nativeGradientWebGlShaders.ts",
-  "rasterStripWebGlShaders.ts", "primitiveHighlightShaders.ts"]) {
+  "rasterStripWebGlShaders.ts", "rasterAtlasWebGlShaders.ts", "rasterTextureBatchWebGlShaders.ts", "primitiveHighlightShaders.ts"]) {
   const text = readFileSync(root + file, "utf8");
   for (const [, name, body] of text.matchAll(/(?:export )?const (\w+) = `(#version 300 es[\s\S]*?)`;/g)) {
     shaders.set(name, body);
@@ -62,6 +62,8 @@ const programs = [
   ["GRADIENT_FILL_VERTEX_SHADER_SOURCE", "GRADIENT_FILL_FRAGMENT_SHADER_SOURCE"],
   ["GRADIENT_STROKE_VERTEX_SHADER_SOURCE", "GRADIENT_STROKE_FRAGMENT_SHADER_SOURCE"],
   ["RASTER_STRIP_VERTEX_GLSL", "RASTER_STRIP_FRAGMENT_GLSL"],
+  ["RASTER_ATLAS_VERTEX_GLSL", "RASTER_ATLAS_FRAGMENT_GLSL"],
+  ["RASTER_TEXTURE_BATCH_VERTEX_GLSL", "RASTER_TEXTURE_BATCH_FRAGMENT_GLSL"],
   ["PRIMITIVE_HIGHLIGHT_VERTEX_GLSL", "PRIMITIVE_HIGHLIGHT_FRAGMENT_GLSL"]
 ];
 

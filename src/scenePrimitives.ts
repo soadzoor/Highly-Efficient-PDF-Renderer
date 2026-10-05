@@ -10,6 +10,7 @@ import { isScenePaintRunVisible, scenePaintOrderedRuns, scenePaintRunConditions,
 export type PrimitiveKind = "stroke" | "fill" | "text" | "raster" | "gradient-fill" | "gradient-stroke";
 /** An index in the canonical loaded scene, never an index in a rendering LOD. */
 export interface PrimitiveRef { kind: PrimitiveKind; index: number }
+export interface PrimitivePickRange { kind: PrimitiveKind; first: number; count: number; paintRun?: VectorDrawRun }
 export interface PrimitivePoint { x: number; y: number }
 export interface PrimitiveSegment { start: PrimitivePoint; end: PrimitivePoint; control?: PrimitivePoint }
 export interface PrimitiveOptionalContent {
@@ -112,6 +113,8 @@ export function validatePrimitiveRef(scene: VectorScene, ref: PrimitiveRef): voi
 
 interface RunLookup { runs: readonly VectorDrawRun[]; byKind: Map<PrimitiveKind, VectorDrawRun[]> }
 const runLookups = new WeakMap<VectorScene, RunLookup>();
+const annotationRunLookups = new WeakMap<VectorScene, Map<string, VectorDrawRun[]>>();
+const annotationConditionOwners = new WeakMap<VectorScene, Map<number, string | undefined>>();
 function getRuns(scene: VectorScene): RunLookup {
   let lookup = runLookups.get(scene);
   if (!lookup) {
@@ -144,6 +147,49 @@ export function getPrimitiveAnnotationId(scene: VectorScene, ref: PrimitiveRef):
   return getPrimitiveConditionFields(scene, ref).annotationId;
 }
 
+/** Cached compact appearance ranges. Mask-only runs are never annotation paint. */
+export function getSceneAnnotationRuns(scene: VectorScene): ReadonlyMap<string, readonly VectorDrawRun[]> {
+  let result = annotationRunLookups.get(scene);
+  if (!result) {
+    const annotations = new Map<string, VectorDrawRun[]>();
+    const layers = getAnnotationLayerIds(scene.optionalContent);
+    if (!layers.size) { annotationRunLookups.set(scene, annotations); return annotations; }
+    const runs = scene.paintGraph ? scenePaintOrderedRuns(scene) : scene.drawRuns ?? defaultVectorDrawRuns(scene);
+    for (const run of runs) {
+      if (!run.count || !isScenePaintRunVisible(scene, run, () => true)) continue;
+      const id = runAnnotationId(scene, run);
+      if (id === undefined) continue;
+      let ranges = annotations.get(id);
+      if (!ranges) annotations.set(id, ranges = []);
+      ranges.push(run);
+    }
+    annotationRunLookups.set(scene, result = annotations);
+  }
+  return result;
+}
+
+/** Mask conditions affect visibility, but do not establish ownership of the painted primitive. */
+function runAnnotationId(scene: VectorScene, run: VectorDrawRun | undefined): string | undefined {
+  const layers = getAnnotationLayerIds(scene.optionalContent);
+  if (!layers.size) return undefined;
+  let owners = annotationConditionOwners.get(scene);
+  if (!owners) annotationConditionOwners.set(scene, owners = new Map());
+  const owner = (index: number): string | undefined => {
+    if (owners!.has(index)) return owners!.get(index);
+    const condition = scene.optionalContent?.conditions[index];
+    const id = condition?.kind === "group" ? layers.get(condition.groupId) :
+      condition?.kind === "not" ? owner(condition.operand) :
+        condition?.kind === "and" || condition?.kind === "or" ? condition.operands.map(owner).find(id => id !== undefined) : undefined;
+    owners!.set(index, id); return id;
+  };
+  return scenePaintRunConditions(scene, run, false).map(owner).find(id => id !== undefined);
+}
+
+/** Bounds-only access for interaction indexes, without materializing detached primitive geometry. */
+export function getScenePrimitiveBounds(scene: VectorScene, ref: PrimitiveRef): Bounds {
+  return primitiveBounds(scene, ref);
+}
+
 /** The structure content item (MCID) that painted a primitive, if any. */
 export function getPrimitiveMarkedContent(scene: VectorScene, ref: PrimitiveRef): SceneContentItem | undefined {
   validatePrimitiveRef(scene, ref);
@@ -151,7 +197,7 @@ export function getPrimitiveMarkedContent(scene: VectorScene, ref: PrimitiveRef)
   return item && { ...item };
 }
 
-/** PDF layers and the owning annotation share one condition walk; annotation layers are not PDF layers. */
+/** PDF layer dependencies and annotation ownership are separate; mask dependencies do not own paint. */
 function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): {
   optionalContent: PrimitiveOptionalContent; annotationId?: string; markedContent?: SceneContentItem;
 } {
@@ -161,7 +207,7 @@ function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): {
   const groups = new Set<string>();
   const visited = new Set<number>();
   const pending = scenePaintRunConditions(scene, primitiveRun(scene, ref));
-  let annotationId: string | undefined;
+  const annotationId = runAnnotationId(scene, primitiveRun(scene, ref));
   while (pending.length) {
     const index = pending.pop()!;
     if (visited.has(index)) continue;
@@ -170,7 +216,6 @@ function getPrimitiveConditionFields(scene: VectorScene, ref: PrimitiveRef): {
     if (condition?.kind === "group") {
       const annotation = annotationLayers.get(condition.groupId);
       if (annotation === undefined) groups.add(condition.groupId);
-      else annotationId ??= annotation;
     } else if (condition?.kind === "not") pending.push(condition.operand);
     else if (condition?.kind === "and" || condition?.kind === "or") pending.push(...condition.operands);
   }
@@ -666,6 +711,35 @@ function paintRank(scene: VectorScene, ref: PrimitiveRef, runRanks?: Map<Primiti
   return -1;
 }
 
+/** Conservative scene bounds of a CSS tolerance square, including perspective horizons. */
+export function scenePrimitivePickBounds(options: Pick<ScenePrimitivePickOptions, "clientPoint" | "unproject">, tolerance: number): Bounds {
+  const query = emptyBounds();
+  // The tolerance disk is contained by this CSS square. A horizon-crossing
+  // projection disables bounds rejection instead of missing visible geometry.
+  let bounded = true;
+  for (const dx of [-tolerance - 1, 0, tolerance + 1]) for (const dy of [-tolerance - 1, 0, tolerance + 1]) {
+    const point = options.unproject({ x: options.clientPoint.x + dx, y: options.clientPoint.y + dy });
+    if (finitePoint(point)) include(query, point); else bounded = false;
+  }
+  if (bounded) {
+    const radius = tolerance + 1;
+    const corners = [[-radius, -radius], [radius, -radius], [radius, radius], [-radius, radius]]
+      .map(([x, y]) => options.unproject({ x: options.clientPoint.x + x, y: options.clientPoint.y + y }));
+    let sign = 0;
+    for (let j = 0; j < 4; j++) {
+      const a = corners[j], b = corners[(j + 1) % 4], c = corners[(j + 2) % 4];
+      if (!finitePoint(a) || !finitePoint(b) || !finitePoint(c)) { bounded = false; break; }
+      const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      // A homography crossing its horizon can have finite corner samples
+      // while mapping the square to a folded, unbounded region.
+      if (!Number.isFinite(cross) || cross === 0 || (sign && Math.sign(cross) !== sign)) { bounded = false; break; }
+      sign = Math.sign(cross);
+    }
+  }
+  if (!bounded) Object.assign(query, { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity });
+  return query;
+}
+
 /** CPU query of retained geometry. Source arrays stay unchanged and no index is serialized. */
 export class ScenePrimitivePicker {
   private index: PackedIndex | null = null;
@@ -682,7 +756,44 @@ export class ScenePrimitivePicker {
     this.onBuildProgress = onBuildProgress;
   }
 
-  dispose(): void { this.disposed = true; this.index = null; runLookups.delete(this.scene); releaseScenePaintQuery(this.scene); }
+  dispose(): void {
+    this.disposed = true; this.index = null; runLookups.delete(this.scene); annotationRunLookups.delete(this.scene); releaseScenePaintQuery(this.scene);
+    annotationConditionOwners.delete(this.scene);
+  }
+
+  /** Query a small appearance directly, without building the whole drawing's spatial index. */
+  async pickRanges(options: ScenePrimitivePickOptions, ranges: readonly PrimitivePickRange[]): Promise<PrimitiveHit | null> {
+    const check = (): void => {
+      options.signal?.throwIfAborted();
+      if (this.disposed) throw new DOMException("Primitive picker disposed.", "AbortError");
+    };
+    check();
+    const tolerance = options.tolerancePx ?? 4;
+    if (!Number.isFinite(tolerance) || tolerance < 0) throw new RangeError("Picking tolerance must be a finite nonnegative CSS pixel value.");
+    if (!finitePoint(options.point) || !finitePoint(options.clientPoint)) return null;
+    const visible = options.isConditionVisible ?? ((condition?: number) => condition === undefined || !this.defaultConditions || this.defaultConditions[condition] === 1);
+    const work = new Work(check), query = scenePrimitivePickBounds(options, tolerance);
+    let best: PrimitiveHit | null = null;
+    for (const range of ranges) {
+      const run = range.paintRun ?? range;
+      if (!isScenePaintRunVisible(this.scene, run, visible)) continue;
+      for (let index = range.first; index < range.first + range.count; index++) {
+        const ref = { kind: range.kind, index };
+        if (work.shouldYield()) await work.yield();
+        if (options.isVisible?.(ref) === false || !boundsIntersect(primitiveBounds(this.scene, ref), query)) continue;
+        const hit = await this.hit(ref, options, tolerance, work);
+        if (!hit || best && hit.distancePx >= best.distancePx) continue;
+        const alpha = await scenePaintRunAlpha(this.scene, run, hit.closestPoint, {
+          visible, sample: (maskRef, point) => this.samplePaint(maskRef, point, options, work),
+          yield: async () => { if (work.shouldYield()) await work.yield(); }
+        });
+        const sourceAlpha = alpha === 1 ? 1 : (await this.samplePaint(ref, hit.closestPoint, options, work)).color[3];
+        if (alpha * sourceAlpha > ALPHA_EPSILON) best = hit;
+        if (best?.distancePx === 0) { check(); return best; }
+      }
+    }
+    check(); return best;
+  }
 
   async pick(options: ScenePrimitivePickOptions): Promise<PrimitiveHit | null> {
     const check = (): void => {
@@ -728,30 +839,7 @@ export class ScenePrimitivePicker {
       }
     };
     if (this.index) {
-      const index = this.index, query = emptyBounds();
-      // The tolerance disk is contained by this CSS square. A horizon-crossing
-      // projection disables bounds rejection instead of missing visible geometry.
-      let bounded = true;
-      for (const dx of [-tolerance - 1, 0, tolerance + 1]) for (const dy of [-tolerance - 1, 0, tolerance + 1]) {
-        const point = options.unproject({ x: options.clientPoint.x + dx, y: options.clientPoint.y + dy });
-        if (finitePoint(point)) include(query, point); else bounded = false;
-      }
-      if (bounded) {
-        const radius = tolerance + 1;
-        const corners = [[-radius, -radius], [radius, -radius], [radius, radius], [-radius, radius]]
-          .map(([x, y]) => options.unproject({ x: options.clientPoint.x + x, y: options.clientPoint.y + y }));
-        let sign = 0;
-        for (let j = 0; j < 4; j++) {
-          const a = corners[j], b = corners[(j + 1) % 4], c = corners[(j + 2) % 4];
-          if (!finitePoint(a) || !finitePoint(b) || !finitePoint(c)) { bounded = false; break; }
-          const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
-          // A homography crossing its horizon can have finite corner samples
-          // while mapping the square to a folded, unbounded region.
-          if (!Number.isFinite(cross) || cross === 0 || (sign && Math.sign(cross) !== sign)) { bounded = false; break; }
-          sign = Math.sign(cross);
-        }
-      }
-      if (!bounded) Object.assign(query, { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity });
+      const index = this.index, query = scenePrimitivePickBounds(options, tolerance);
       const stack: number[] = [index.levels.length - 1, index.levels[index.levels.length - 1]];
       while (stack.length) {
         const node = stack.pop()!, level = stack.pop()!;

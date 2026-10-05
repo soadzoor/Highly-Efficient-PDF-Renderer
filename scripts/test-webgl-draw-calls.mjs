@@ -106,6 +106,7 @@ try {
   renderer.gradientData = { gradientFillPathCount: 2, gradientStrokeRunCount: 2,
     gradientStrokeRunMetaA: new Float32Array([0, 3, 0, 0, 3, 0, 0, 0]) };
   renderer.gradientMeshRanges = new Uint32Array([0, 0, 0, 6]);
+  renderer.gradientMeshProgram = {};
   renderer.drawGradientFillPath(-1, 100, 100, 0, 0, 1);
   renderer.drawGradientFillPath(0, 100, 100, 0, 0, 1);
   renderer.drawGradientFillPath(1, 100, 100, 0, 0, 1);
@@ -118,6 +119,27 @@ try {
   renderer.drawRasterStripBatch({ vao: {}, texture: {}, width: 4, height: 4, count: 20 }, 100, 100, 0, 0, 1);
   assert.equal(renderer.frameDrawCalls, 5);
   assert.equal(renderer.frameDrawCalls, draws.length);
+
+  // Operation diagnostics resolve the actual indirect fill IDs, rather than
+  // treating an ordered instance-buffer offset as a canonical path index.
+  renderer.orderedBatches = { uintInstances: Uint32Array.of(5, 1, 12, 0, 7, 3) };
+  renderer.vectorClipIndex = -2;
+  renderer.drawFilledPaths(100, 100, 0, 0, 1, 1, 2);
+  assert.deepEqual(renderer.describeDrawSource(renderer.fillProgram, 2), {
+    kind: "fill", first: 1, indirect: true, ids: [12, 7], clips: [-1, 2], truncated: false
+  });
+  renderer.vectorClipIndex = 2;
+  renderer.drawFilledPaths(100, 100, 0, 0, 1, 3, 40);
+  const source = renderer.describeDrawSource(renderer.fillProgram, 40);
+  assert.equal(source.ids.length, 32); assert.equal(source.truncated, true);
+  assert.deepEqual(source.ids.slice(0, 3), [3, 4, 5]);
+  renderer.drawGradientFillPath(1, 100, 100, 0, 0, 1);
+  assert.deepEqual(renderer.describeDrawSource(renderer.gradientMeshProgram, 1), {
+    kind: "gradient-fill", first: 1, indirect: false, ids: [1], clips: [2], truncated: false
+  });
+  assert.equal(renderer.describeDrawSource(renderer.rasterProgram, 1), undefined);
+  assert.equal(renderer.describeDrawSource(null, 1), undefined);
+  renderer.orderedBatches = null;
 
   renderer.scene = null;
   frame(0);

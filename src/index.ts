@@ -272,7 +272,8 @@ export type {
 
 export type { HeprTextSearchMatch } from "./threePdfObject";
 export type { HeprPageOverlapMode } from "./threePdfObject";
-export type { PrimitivePickOptions } from "./threePdfObject";
+export type { PrimitivePickOptions, AnnotationPickOptions } from "./threePdfObject";
+export type { AnnotationHit } from "./sceneAnnotationInteraction";
 export type {
   PrimitiveKind, PrimitiveRef, PrimitivePoint, PrimitiveSegment, PrimitiveSegmentStyle, PrimitiveInfo, PrimitiveHit, PrimitiveOptionalContent
 } from "./scenePrimitives";

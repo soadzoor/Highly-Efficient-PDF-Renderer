@@ -134,6 +134,8 @@ function makeRenderer(Renderer, scene) {
   const renderer = Object.assign(Object.create(Renderer.prototype), {
     gl: mock.gl, scene, isDisposed: false, rasterTextureResidencyEnabled: true, rasterLayers: [],
     rasterStripBatches: new Map(), rasterStripProgram: null, rasterLayerUpdates: new Map(),
+    // Isolate the strip fallback here; texture batching has compositor tests.
+    rasterTextureBatchUnavailable: true,
     rasterRenderingEnabled: true, fillRenderingEnabled: true, strokeRenderingEnabled: true, textRenderingEnabled: true,
     optionalContentVisibility: { revision: 0, conditions: Uint8Array.of(1, 1) },
     vectorClipIndex: -1, vectorClipTexture: {}, vectorClipUniforms: new Map(), multiplyPass: null,

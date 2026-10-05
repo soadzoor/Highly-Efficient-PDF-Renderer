@@ -232,6 +232,10 @@ try {
     const options = { vectorOverride: [0, 0, 0, 0], strokeCurveEnabled: true };
     const fill = new ThreeMaterialFillLayer(solid, options);
     const gradient = new ThreeMaterialGradientLayer(solid, options);
+    assert.equal(fill.mesh.material.uniforms.uFillClipBoundsEnabled.value, 0,
+      "Three's shared solid fill shader disables native clip-store bounds");
+    assert.match(gradient.group.children[0].material.vertexShader, /heprClippedPaintQuad\(minBounds, maxBounds, uClipBounds/,
+      "Three gradients retain their projected clip-bound quad expansion");
     for (const mesh of [fill.mesh, gradient.group.children[0]]) {
       const uniforms = mesh.material.uniforms;
       assert.equal(uniforms.uFillBandBase.value, expectedBase,

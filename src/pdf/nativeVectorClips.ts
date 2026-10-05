@@ -36,6 +36,30 @@ export function imageLeavesPage(matrix: ArrayLike<number>, pageBounds: Readonly<
     Math.max(...xs) > pageBounds.maxX + 1e-3 || Math.max(...ys) > pageBounds.maxY + 1e-3;
 }
 
+/** Geometry at the crop boundary still needs a clip for its outward shader AA. */
+export function vectorPaintReachesPageEdge(minX: number, minY: number, maxX: number, maxY: number,
+  pageBounds: Readonly<DensePdfBounds>): boolean {
+  return minX <= pageBounds.minX + 1e-3 || minY <= pageBounds.minY + 1e-3 ||
+    maxX >= pageBounds.maxX - 1e-3 || maxY >= pageBounds.maxY - 1e-3;
+}
+
+/** A source clip contained in the page already trims a path's outward AA. */
+export function clipChainInsidePage(clip: DensePdfTextClip | null | undefined,
+  pageBounds: Readonly<DensePdfBounds>): boolean {
+  for (let node = clip; node; node = node.parent) {
+    const { minX, minY, maxX, maxY } = node.path.bounds;
+    const [a, b, c, d, e, f] = node.path.transform;
+    let inside = true;
+    for (let corner = 0; corner < 4; corner++) {
+      const x = corner & 1 ? maxX : minX, y = corner & 2 ? maxY : minY;
+      const px = a * x + c * y + e, py = b * x + d * y + f;
+      inside &&= px >= pageBounds.minX && py >= pageBounds.minY && px <= pageBounds.maxX && py <= pageBounds.maxY;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
 /** Clip curves flatten within this many points, which stays subpixel at the viewer's deepest zoom. */
 const CLIP_CURVE_TOLERANCE = 0.0001;
 /**

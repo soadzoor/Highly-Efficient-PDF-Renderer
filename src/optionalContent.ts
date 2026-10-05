@@ -203,6 +203,13 @@ export function createDefaultOptionalContentSnapshot(scene: VectorScene): Option
   return snapshot(scene.optionalContent, new Map(scene.optionalContent?.groups.map(group => [group.id, group.defaultVisible])), 0);
 }
 
+/** Interaction-only snapshot: reveal annotation appearances without changing PDF layers or rendering. */
+export function createAnnotationInteractionSnapshot(scene: VectorScene, applied: OptionalContentSnapshot): OptionalContentSnapshot {
+  const values = new Map(applied.layers.map(layer => [layer.id, layer.visible]));
+  for (const group of scene.optionalContent?.groups ?? []) if (isAnnotationLayer(group)) values.set(group.id, true);
+  return snapshot(scene.optionalContent, values, applied.revision);
+}
+
 const annotationLayerIds = new WeakMap<SceneOptionalContent, ReadonlyMap<string, string>>();
 /** Annotation layer id to annotation id, for scenes compiled with annotation layers. */
 export function getAnnotationLayerIds(data: SceneOptionalContent | undefined): ReadonlyMap<string, string> {

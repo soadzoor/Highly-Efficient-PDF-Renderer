@@ -1,4 +1,4 @@
-import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
+import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
 
 export const RASTER_STRIP_VERTEX_GLSL = `#version 300 es
 precision highp float;
@@ -49,7 +49,7 @@ flat in float vOpacity;
 flat in float vRow;
 out vec4 outColor;
 
-${VECTOR_CLIP_GLSL}
+${RASTER_CLIP_GLSL}
 
 vec4 sampleStripLevel(float level) {
   float offset = 0.0;
@@ -65,7 +65,7 @@ vec4 sampleStripLevel(float level) {
 }
 
 void main() {
-  // An antialiased clip edge, measured before any discard; color is premultiplied.
+  // Polygon clip AA is measured before discard; rectangular tile clips stay solid.
   float clipAAWidth = max(max(length(vec2(dFdx(vWorld.x), dFdy(vWorld.x))),
     length(vec2(dFdx(vWorld.y), dFdy(vWorld.y)))), 1e-4);
   vec2 sourcePixels = vUv * vec2(vWidth, 1.0);

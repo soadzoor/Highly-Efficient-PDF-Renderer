@@ -7,7 +7,8 @@ import * as THREE from "three";
 import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
 import { ScenePaintVisibility, sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { ScenePrimitivePicker, getScenePrimitive, validatePrimitiveRef, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
-  type PrimitiveKind } from "./scenePrimitives";
+  type ScenePrimitivePickOptions, type PrimitiveKind } from "./scenePrimitives";
+import { SceneAnnotationIndex, annotationPrimitiveRefs, applySceneAnnotationHighlights, pickSceneAnnotationInteraction, type AnnotationHit } from "./sceneAnnotationInteraction";
 import { PrimitiveAppearanceState, type PrimitiveColorUpdate, type PrimitiveHighlightSet,
   type PrimitiveOverride } from "./primitiveAppearance";
 import { ThreePrimitiveHighlightLayer } from "./threePrimitiveHighlightLayer";
@@ -25,7 +26,7 @@ import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
 import { ThreeMaterialGradientLayer } from "./threeMaterialGradientLayer";
 import { OptionalContentController, type AnnotationLayerVisibility, type LayerVisibilityChange, type OptionalContentListener,
-  type OptionalContentSnapshot } from "./optionalContent";
+  createAnnotationInteractionSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { getPrimitiveMarkedContent, isScenePrimitiveVisible } from "./scenePrimitives";
 import { findStructureElement, type StructureElement } from "./structureData";
 import { RetainedPageReplay } from "./retainedPageReplay";
@@ -96,6 +97,11 @@ export interface PrimitivePickOptions {
   tolerancePx?: number;
   kinds?: readonly PrimitiveKind[];
   signal?: AbortSignal;
+}
+
+export interface AnnotationPickOptions extends Omit<PrimitivePickOptions, "kinds"> {
+  /** Include appearances hidden with setAnnotationVisibility; PDF layers and flags still apply. Default false. */
+  includeHidden?: boolean;
 }
 
 const DEFAULT_FIT_PADDING_PIXELS = 64;
@@ -500,6 +506,8 @@ export class HeprThreePdfObject extends THREE.Group {
       this.setTextSelectionHighlights(this.textSelectionHighlightRects);
       this.setSelection(this.primitiveAppearance.getSelection());
       this.setHover(this.primitiveAppearance.getHover());
+      this.setAnnotationSelection(this.annotationSelected);
+      this.setAnnotationHover(this.annotationHovered);
       this.applyPrimitiveColorUpdates(this.primitiveAppearance.getColorUpdates());
       // That replay mirrors colors the document's own layers already show.
       this.pageColorsDiverged = false;
@@ -779,6 +787,13 @@ export class HeprThreePdfObject extends THREE.Group {
   private readonly paintVisibility: ScenePaintVisibility;
   private readonly retainedReplay: RetainedPageReplay | null;
   private primitivePicker: ScenePrimitivePicker | null = null;
+  private annotationIndex: SceneAnnotationIndex | null = null;
+  private annotationSelected: string[] = [];
+  private annotationHovered: string | null = null;
+  private annotationVisibilitySnapshot: OptionalContentSnapshot | null = null;
+  private annotationAppliedSnapshot: OptionalContentSnapshot | null = null;
+  private annotationSuppressed = new Set<string>();
+  private annotationInteractionRevision = 0;
   private primitivePreparationProgress: number | null = null;
   private readonly primitivePreparationListeners = new Set<(percentage: number | null) => void>();
   private pagePreparationProgress: number | null = null;
@@ -1050,6 +1065,70 @@ export class HeprThreePdfObject extends THREE.Group {
     return this.layerVisibility.setAnnotationVisibility(annotationIds, visible);
   }
 
+  private getAnnotationIndex(): SceneAnnotationIndex {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    return this.annotationIndex ??= new SceneAnnotationIndex(this.sceneData);
+  }
+
+  /** Detached canonical references for attributable compiled appearances, including hidden paint.
+   * Returns [] for metadata-only annotations and older HEPs without appearance ownership.
+   */
+  getAnnotationPrimitives(id: string): PrimitiveRef[] {
+    return annotationPrimitiveRefs(this.getAnnotationIndex().get(id).runs);
+  }
+
+  /** Select annotations independently of primitive selection. null or [] clears the annotation selection.
+   * Traces remain visible when their appearance is suppressed; metadata geometry is used when necessary.
+   */
+  setAnnotationSelection(ids: readonly string[] | null): void {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    if (ids !== null && !Array.isArray(ids)) throw new TypeError("Annotation IDs must be an array or null.");
+    const next = [...new Set(ids ?? [])];
+    if (next.length === this.annotationSelected.length && next.every((id, i) => id === this.annotationSelected[i]) && !this.pageViews) return;
+    const index = this.getAnnotationIndex();
+    for (const id of next) index.get(id);
+    this.updateAnnotationHighlights(next, this.annotationHovered);
+    this.annotationSelected = next;
+    for (const { object } of this.pageViews ?? []) {
+      const local = new Set(object.sceneData.annotations?.map(annotation => annotation.id));
+      object.setAnnotationSelection(next.filter(id => local.has(id)));
+    }
+  }
+
+  /** Hover every primitive of an annotation, or its metadata geometry when no appearance is available. */
+  setAnnotationHover(id: string | null): void {
+    if (this.isDisposed) throw new Error("PDF object disposed.");
+    if (id === this.annotationHovered && !this.pageViews) return;
+    if (id !== null) this.getAnnotationIndex().get(id);
+    this.updateAnnotationHighlights(this.annotationSelected, id);
+    this.annotationHovered = id;
+    for (const { object } of this.pageViews ?? []) object.setAnnotationHover(
+      id !== null && object.sceneData.annotations?.some(annotation => annotation.id === id) ? id : null);
+  }
+
+  private getAnnotationInteractionVisibility(): OptionalContentSnapshot {
+    if (this.annotationVisibilitySnapshot?.revision !== this.layerVisibility.revision) {
+      this.annotationVisibilitySnapshot = createAnnotationInteractionSnapshot(this.sceneData, this.getAnnotationAppliedVisibility());
+    }
+    return this.annotationVisibilitySnapshot;
+  }
+
+  private getAnnotationAppliedVisibility(): OptionalContentSnapshot {
+    if (this.annotationAppliedSnapshot?.revision !== this.layerVisibility.revision) {
+      this.annotationAppliedSnapshot = this.layerVisibility.getSnapshot();
+      const applied = new Map(this.annotationAppliedSnapshot.layers.map(layer => [layer.id, layer.visible]));
+      this.annotationSuppressed = new Set(this.sceneData.optionalContent?.groups.filter(group =>
+        group.annotationId !== undefined && applied.get(group.id) === false).map(group => group.annotationId!));
+    }
+    return this.annotationAppliedSnapshot;
+  }
+
+  private updateAnnotationHighlights(selected: readonly string[], hovered: string | null): void {
+    if (this.pageViews) return;
+    const snapshot = this.getAnnotationInteractionVisibility(), index = this.getAnnotationIndex();
+    applySceneAnnotationHighlights(this.sceneData, index, this.primitiveAppearance, snapshot, selected, hovered);
+  }
+
   /**
    * A detached structure element by `id`, such as `markedContent.elementId` from
    * `pick()` or `getPrimitive()`, with its user properties. Follow `parentId`
@@ -1097,6 +1176,7 @@ export class HeprThreePdfObject extends THREE.Group {
     const hover = this.primitiveAppearance.getHover();
     if (hover && !this.isPrimitiveVisible(hover)) this.primitiveAppearance.setHover(null);
     this.primitiveAppearance.setSelection(this.primitiveAppearance.getSelection().filter(ref => this.isPrimitiveVisible(ref)));
+    if (this.annotationSelected.length || this.annotationHovered !== null) this.updateAnnotationHighlights(this.annotationSelected, this.annotationHovered);
     this.setSearchHighlights(null);
     this.setTextSelectionHighlights(null);
   }
@@ -1136,8 +1216,22 @@ export class HeprThreePdfObject extends THREE.Group {
       }
       return null;
     }
+    const context = this.createPrimitivePickContext(options);
+    if (!context) return null;
+    this.primitivePicker ??= new ScenePrimitivePicker(this.sceneData,
+      percentage => this.reportPrimitivePreparationProgress(percentage));
+    const revision = this.layerVisibility.revision;
+    const hit = await this.primitivePicker.pick({ ...context,
+      isConditionVisible: condition => this.layerVisibility.isVisible(condition),
+      isVisible: ref => this.isPrimitiveVisible(ref) });
+    if (revision !== this.layerVisibility.revision) throw new DOMException("Layer visibility changed during picking.", "AbortError");
+    return hit;
+  }
+
+  private createPrimitivePickContext(options: PrimitivePickOptions): ScenePrimitivePickOptions | null {
     const { camera, element, clientX, clientY } = options;
     const rect = element.getBoundingClientRect();
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY) || rect.width <= 0 || rect.height <= 0) return null;
     if (clientX < rect.left || clientY < rect.top || clientX >= rect.left + rect.width ||
       clientY >= rect.top + rect.height) return null;
     const point = this.clientToScenePoint(camera, clientX, clientY, element);
@@ -1163,21 +1257,47 @@ export class HeprThreePdfObject extends THREE.Group {
       const t = -near.z / dz;
       return { x: near.x + t * (far.x - near.x), y: near.y + t * (far.y - near.y) };
     };
-    this.primitivePicker ??= new ScenePrimitivePicker(this.sceneData,
-      percentage => this.reportPrimitivePreparationProgress(percentage));
-    const revision = this.layerVisibility.revision;
-    const hit = await this.primitivePicker.pick({ point, clientPoint: { x: clientX, y: clientY }, project, unproject,
+    return { point, clientPoint: { x: clientX, y: clientY }, project, unproject,
       tolerancePx: options.tolerancePx, kinds: options.kinds, signal: options.signal,
       rasterLayers: this.retainedReplay?.getLayers(),
-      isConditionVisible: condition => this.layerVisibility.isVisible(condition),
       resolveColor: (ref, original) => {
         const rgb = this.primitiveAppearance.getOverrideColor(ref) ?? original;
         const tint = this.rendererConfig.vectorOverride;
         return rgb.map((value, channel) => value * (1 - tint[3]) + tint[channel] * tint[3]) as [number, number, number];
-      },
-      isVisible: ref => this.isPrimitiveVisible(ref) });
-    if (revision !== this.layerVisibility.revision) throw new DOMException("Layer visibility changed during picking.", "AbortError");
-    return hit;
+      } };
+  }
+
+  /** Pick annotation appearances or metadata in client CSS pixels. Within a page the smallest
+   * matching annotation wins, then distance, then source annotation order. Geometry misses do not
+   * fall back to bounds. Independent overlapping pages use the same depth policy as pick().
+   */
+  async pickAnnotation(options: AnnotationPickOptions): Promise<AnnotationHit | null> {
+    if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
+    options.signal?.throwIfAborted();
+    const tolerance = options.tolerancePx ?? 4;
+    if (!Number.isFinite(tolerance) || tolerance < 0) throw new RangeError("Picking tolerance must be a finite nonnegative CSS pixel value.");
+    if (options.includeHidden !== undefined && typeof options.includeHidden !== "boolean") throw new TypeError("includeHidden must be a boolean.");
+    if (this.pageViews) {
+      for (const candidate of this.pageHits(options.camera, options.clientX, options.clientY, options.element)) {
+        const hit = await candidate.page.object.pickAnnotation(options);
+        if (hit) return hit;
+        if (candidate.page.object.rendererConfig.pageBackground[3] >= 1) return null;
+      }
+      return null;
+    }
+    const context = this.createPrimitivePickContext(options);
+    if (!context) return null;
+    const revision = this.layerVisibility.revision;
+    const interactionRevision = this.annotationInteractionRevision;
+    const snapshot = options.includeHidden ? this.getAnnotationInteractionVisibility() : this.getAnnotationAppliedVisibility();
+    const picker = this.primitivePicker ??= new ScenePrimitivePicker(this.sceneData,
+      percentage => this.reportPrimitivePreparationProgress(percentage));
+    return pickSceneAnnotationInteraction(this.sceneData, this.getAnnotationIndex(), picker, context, snapshot,
+      options.includeHidden ?? false, this.annotationSuppressed, () => {
+        if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
+        if (interactionRevision !== this.annotationInteractionRevision) throw new DOMException("Annotation interaction cleared during picking.", "AbortError");
+        if (revision !== this.layerVisibility.revision) throw new DOMException("Layer visibility changed during annotation picking.", "AbortError");
+      });
   }
 
   /** Observe shared picking preparation, including after an individual query is cancelled.
@@ -1226,6 +1346,11 @@ export class HeprThreePdfObject extends THREE.Group {
   clearPrimitiveInteraction(): void {
     for (const page of this.pageViews ?? []) page.object.clearPrimitiveInteraction();
     if (this.isDisposed) return;
+    this.annotationInteractionRevision++;
+    this.annotationSelected = []; this.annotationHovered = null;
+    this.annotationIndex?.dispose(); this.annotationIndex = null;
+    this.annotationVisibilitySnapshot = null;
+    this.annotationAppliedSnapshot = null; this.annotationSuppressed.clear();
     this.primitiveAppearance.clear();
     this.primitivePicker?.dispose();
     this.primitivePicker = null;
@@ -2075,6 +2200,10 @@ export class HeprThreePdfObject extends THREE.Group {
     this.pageViews = null; this.pagePartition = null; this.pagePreparation = null;
     this.searchHighlightMatches = []; this.textSelectionHighlightRects = [];
     this.primitivePicker?.dispose();
+    this.annotationIndex?.dispose(); this.annotationIndex = null;
+    this.annotationInteractionRevision++;
+    this.annotationSelected = []; this.annotationHovered = null; this.annotationVisibilitySnapshot = null;
+    this.annotationAppliedSnapshot = null; this.annotationSuppressed.clear();
     this.primitivePicker = null;
     this.reportPrimitivePreparationProgress(null);
     this.primitivePreparationListeners.clear();
