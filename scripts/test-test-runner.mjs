@@ -87,21 +87,38 @@ try {
   // Repeating a module must still use a fresh process each time.
   const isolated = await executeFixture([pass, pass]);
   assert.equal(isolated.code, 0, isolated.output);
+  assert.match(isolated.output, /2\/2 test files completed: 2 passed, 0 failed, 0 not run\./);
   const failed = await executeFixture([fail, later]);
   assert.equal(failed.code, 1, failed.output);
   assert.match(failed.output, /intentional runner regression failure/);
+  assert.match(failed.output, /2\/2 test files completed: 1 passed, 1 failed, 0 not run\./);
+  assert.match(failed.output, /Failed test files:\n[^\n]*fail\.mjs/);
   assert.equal(await readFile(marker, "utf8"), "ran", "continue after a failed test");
   await rm(marker);
+
+  const subtests = join(temp, "subtests.mjs");
+  await writeFile(subtests,
+    'import { test } from "node:test";\n' +
+    'test("parent", async t => {\n' +
+    '  await t.test("first", () => { throw new Error("first failure"); });\n' +
+    '  await t.test("second", () => { throw new Error("second failure"); });\n' +
+    '});\n');
+  const multipleFailures = await executeFixture([subtests, pass]);
+  assert.equal(multipleFailures.code, 1, multipleFailures.output);
+  assert.match(multipleFailures.output, /2\/2 test files completed: 1 passed, 1 failed, 0 not run\./,
+    "multiple failing subtests must count as one failing file");
 
   const timedOut = await executeFixture([hang, later], { timeout: 200 });
   assert.equal(timedOut.code, 1, timedOut.output);
   assert.match(timedOut.output, /timed out/);
+  assert.match(timedOut.output, /2\/2 test files completed: 1 passed, 1 failed, 0 not run\./);
   assert.equal(await readFile(marker, "utf8"), "ran", "continue after a per-file timeout");
   await rm(marker);
 
   const overBudget = await executeFixture([hang, later], { budget: 200 });
   assert.equal(overBudget.code, 1, overBudget.output);
   assert.match(overBudget.output, /total budget/);
+  assert.match(overBudget.output, /1\/2 test files completed: 0 passed, 1 failed, 1 not run\./);
   await assert.rejects(readFile(marker), { code: "ENOENT" }, "cancel queued tests when the total budget expires");
   console.log("Test runner selection, opt-in boundaries, arguments, isolation, failures, and deadlines passed.");
 } finally {

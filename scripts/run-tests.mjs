@@ -1,5 +1,5 @@
 import { access, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { run } from "node:test";
 import { spec } from "node:test/reporters";
 import { pathToFileURL } from "node:url";
@@ -48,6 +48,7 @@ export async function executeTests({ files, argv = [], timeout = testTimeoutMs, 
   const controller = new AbortController();
   let failed = false;
   let completed = 0;
+  const failedFiles = [];
   const timer = setTimeout(() => {
     failed = true;
     console.error(`Test suite exceeded its ${budget}ms total budget.`);
@@ -66,8 +67,10 @@ export async function executeTests({ files, argv = [], timeout = testTimeoutMs, 
       // Enforce the deadline in the parent too: a legacy test's synchronous
       // loop can prevent Node's in-test timeout from firing in the child.
       const fileController = new AbortController();
+      let fileFailed = false;
       const fileTimer = setTimeout(() => {
         failed = true;
+        fileFailed = true;
         fileController.abort(new Error(`Test file timed out after ${timeout}ms: ${file}`));
       }, timeout);
       fileTimer.unref();
@@ -82,9 +85,10 @@ export async function executeTests({ files, argv = [], timeout = testTimeoutMs, 
           timeout,
           signal: AbortSignal.any([controller.signal, fileController.signal])
         });
-        stream.on("test:fail", () => { failed = true; });
+        stream.on("test:fail", () => { failed = true; fileFailed = true; });
         for await (const chunk of stream.compose(spec)) process.stdout.write(chunk);
         completed += 1;
+        if (fileFailed) failedFiles.push(file);
       } finally {
         clearTimeout(fileTimer);
       }
@@ -94,7 +98,11 @@ export async function executeTests({ files, argv = [], timeout = testTimeoutMs, 
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);
   }
-  console.log(`${completed}/${files.length} test files completed${failed ? " with failures" : " successfully"}.`);
+  console.log(`${completed}/${files.length} test files completed: ${completed - failedFiles.length} passed, ${failedFiles.length} failed, ${files.length - completed} not run.`);
+  if (failedFiles.length) {
+    console.log("Failed test files:");
+    for (const file of failedFiles) console.log(`  ${relative(repoRoot, file)}`);
+  }
   return failed ? 1 : 0;
 }
 

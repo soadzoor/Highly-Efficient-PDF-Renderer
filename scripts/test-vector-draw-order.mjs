@@ -37,13 +37,15 @@ try {
     assert.equal(scene.segmentCount, 2, "a repeated stroke after intervening paint must survive culling");
     assert.equal(scene.discardedDuplicateCount, 1);
     assert.equal(scene.rasterLayers.length, 1, "only the source image needs pixels");
+    // Page-edge fills retain the page clip for their antialiased fringe.
+    // The Form's BBox is a separate clip after that page clip.
     assert.deepEqual(scene.drawRuns, [
-      { kind: "fill", first: 0, count: 1 },
+      { kind: "fill", first: 0, count: 1, clipIndex: 0 },
       { kind: "text", first: 0, count: 1 },
-      { kind: "stroke", first: 1, count: 1, clipIndex: 0 },
-      { kind: "raster", first: 0, count: 1, clipIndex: 0 },
-      { kind: "fill", first: 2, count: 1, clipIndex: 0 },
-      { kind: "fill", first: 1, count: 1 },
+      { kind: "stroke", first: 1, count: 1, clipIndex: 1 },
+      { kind: "raster", first: 0, count: 1, clipIndex: 1 },
+      { kind: "fill", first: 2, count: 1, clipIndex: 1 },
+      { kind: "fill", first: 1, count: 1, clipIndex: 0 },
       { kind: "stroke", first: 0, count: 1 }
     ]);
     assert(!session.getDiagnostics().some(d => d.code === "page-raster-fallback"));
@@ -155,7 +157,8 @@ try {
   Object.assign(gpuRenderer, { scene, rasterRenderingEnabled: true, fillRenderingEnabled: true,
     strokeRenderingEnabled: true, textRenderingEnabled: true, fillPipeline: "fill", strokePipeline: "stroke",
     textPipeline: "text", rasterPipeline: "raster", fillBindGroup: "fill", strokeBindGroupAll: "all-strokes",
-    textBindGroup: "text", vectorClipBindGroups: ["instanced", "unclipped", "clip-0"], rasterLayerResources: [{ bindGroup: "image" }] });
+    textBindGroup: "text", vectorClipBindGroups: ["instanced", "unclipped",
+      ...scene.clipPaths.map((_clip, index) => `clip-${index}`)], rasterLayerResources: [{ bindGroup: "image" }] });
   calls = [];
   gpuRenderer.drawPageBackgroundContentIntoPass = () => calls.push(["background"]);
   let pipeline;
