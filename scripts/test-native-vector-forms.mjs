@@ -604,8 +604,8 @@ async function assertOrderedInterleavedPaint(openPdf) {
     assert.equal(scene.fillPathCount, 2);
     assert.equal(scene.segmentCount, 2);
     assert.deepEqual(scene.drawRuns, [
-      { kind: "stroke", first: 0, count: 1 },
-      { kind: "fill", first: 1, count: 1, clipIndex: 0 },
+      { kind: "stroke", first: 0, count: 1, clipIndex: 0 },
+      { kind: "fill", first: 1, count: 1, clipIndex: 1 },
       { kind: "fill", first: 0, count: 1 },
       { kind: "stroke", first: 1, count: 1 }
     ]);

@@ -53,7 +53,9 @@ try {
       }
       if (fixtureIndex === 0) {
         sample = scene;
-        assert.equal(scene.drawRuns.at(-1).clipIndex, undefined, "Q restores the unclipped caller");
+        const restoredClip = scene.drawRuns.at(-1).clipIndex;
+        assert(contains(scene, restoredClip, 1, 1), "Q restores the caller outside the former source clip");
+        assert(!contains(scene, restoredClip, -0.1, 1), "the boundary fill retains its page guard after Q");
         assert.equal(contains(scene, scene.drawRuns[0].clipIndex, 25, 25), false, "even-odd hole");
       }
       if (fixtureIndex === 1) assert.equal(contains(scene, scene.drawRuns[0].clipIndex, 25, 25), true, "nonzero overlap");

@@ -18,7 +18,7 @@ import type { Bounds, SceneTextIndex, VectorScene } from "./pdfVectorExtractor";
 import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
 import { NativeTextClipTester } from "./pdf/nativeTextClip";
-import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips } from "./pdf/nativeVectorClips";
+import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips, vectorPaintReachesPageEdge } from "./pdf/nativeVectorClips";
 import { emitCubicAsQuadratics, VectorPageTextIndexBuilder } from "./pdf/nativeVectorPage";
 import { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey, type NativeGlyphStrokeStyle } from "./pdf/nativeGlyphStroke";
 import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
@@ -424,8 +424,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (result) clipCache.set(scope, result); return result;
   };
   // Content outside the crop box is cut at the page edge, as the direct
-  // compiler cuts its geometry. Only a run that reaches past the page, under
-  // no clip already inside it, pays for the page clip.
+  // compiler cuts its geometry. Fills and strokes at the boundary also need
+  // the page clip, since their shader antialiasing reaches beyond the geometry.
   const withPageClip = pageRootedVectorClips(scene.pageBounds);
   const leavesPage = (minX: number, minY: number, maxX: number, maxY: number): boolean =>
     minX < -1e-3 || minY < -1e-3 || maxX > width + 1e-3 || maxY > height + 1e-3;
@@ -433,7 +433,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     clip: DensePdfTextClip | null): boolean => {
     for (let node = clip; node; node = node.parent) {
       const bounds = clipBounds(node);
-      if (bounds && !leavesPage(bounds.minX, bounds.minY, bounds.maxX, bounds.maxY)) return false;
+      if (bounds && bounds.minX >= 0 && bounds.minY >= 0 && bounds.maxX <= width && bounds.maxY <= height) return false;
     }
     if (kind === "gradient-fill") {
       const { gradientFillPathMetaA: a, gradientFillPathMetaB: b } = gradients.at(-1)!;
@@ -441,8 +441,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     }
     for (let index = first; index < first + amount; index++) {
       const i = index * 4;
-      if (kind === "fill" && leavesPage(fillsA[i + 2], fillsA[i + 3], fillsB[i], fillsB[i + 1])) return true;
-      if (kind === "stroke" && leavesPage(primitiveBounds.at(i), primitiveBounds.at(i + 1), primitiveBounds.at(i + 2), primitiveBounds.at(i + 3))) return true;
+      if (kind === "fill" && vectorPaintReachesPageEdge(fillsA[i + 2], fillsA[i + 3], fillsB[i], fillsB[i + 1], scene.pageBounds)) return true;
+      if (kind === "stroke" && vectorPaintReachesPageEdge(primitiveBounds.at(i), primitiveBounds.at(i + 1), primitiveBounds.at(i + 2), primitiveBounds.at(i + 3), scene.pageBounds)) return true;
       if (kind === "text") {
         const x = textB[i], y = textB[i + 1], atlas = textB[i + 2] * 4;
         if (leavesPage(glyphMetaA[atlas + 2] + x, glyphMetaA[atlas + 3] + y, glyphMetaB[atlas] + x, glyphMetaB[atlas + 1] + y)) return true;

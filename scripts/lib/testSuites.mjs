@@ -114,6 +114,7 @@ export const fastTests = [
   "webgl-ordered-state",
   "vector-draw-order",
   "vector-clips",
+  "vector-page-edges",
   "vector-clip-bands",
   "vector-draw-run-culling",
   "vector-visibility-guard",
