@@ -410,6 +410,25 @@ and blit gets its own GPU timer query. `gpu.operations` then reports:
 - `byPosition`, every such position in frame order, with its label, instance
   count and median, so that the whole frame can be accounted for.
 
+Native WebGL fill and gradient-fill operations also include `source`: up to 32
+canonical path IDs (`ids`), their clip roots (`clips`, with -1 meaning no clip),
+and `truncated` when more instances were submitted. For indirect fill draws,
+`first` is an instance-buffer offset; use `ids` to locate the source paths.
+Position summaries describe the first sampled draw at that position; later
+frames can select different paths as visibility and scheduling change.
+
+Native WebGL batches compatible small images into bounded atlases, including
+inside transparency groups. Other consecutive images can share one draw using
+up to eight original textures, with a separate clip root on each instance.
+These texture batches preserve the original hardware mip filtering and do not
+copy image pixels. They flush before vector paints, compositor transitions,
+folded paints and Multiply passes; tiled images retain individual quads.
+`rasterAtlasBatches`, `rasterStripBatches`, `rasterTextureBatches` and
+`rasterStandaloneDraws` count submissions. `rasterInstances` counts all image
+instances, and `rasterTextureBatchInstances` counts those using texture batches.
+Atlas storage retains independent mip chains and reuses them during camera
+motion. Images fall back to individual draws if batch resources are unavailable.
+
 Each timed operation runs between its own queries, so the GPU cannot overlap it
 with its neighbours, and those frames run slower. Operation times can therefore
 add up to more than an untimed span. The context's own methods are restored

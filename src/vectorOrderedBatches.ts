@@ -12,6 +12,7 @@ import {
   type VectorStrokeLodStorageLayout
 } from "./vectorStrokeLodStorage";
 import { sceneStrokeRecords, type StrokeRecords } from "./strokeRecords";
+import { vectorDrawRunsShareSubmission } from "./vectorDrawOrder";
 
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
@@ -372,6 +373,14 @@ export class VectorOrderedBatches {
   }
 
   private pushBatch(batch: VectorDrawRun, segment: number): void {
+    const previous = this.batches[this.batches.length - 1];
+    // Atlas-backed images may share a draw only inside the same compositor
+    // span. Keep their source order and every clip/blend boundary intact.
+    if (batch.kind === "raster" && !batch.blendMode && vectorDrawRunsShareSubmission(previous, batch) &&
+        this.batchSegments[this.batchSegments.length - 1] === segment) {
+      previous!.count += batch.count;
+      return;
+    }
     if (segment < (this.batchSegments[this.batchSegments.length - 1] ?? 0)) this.spanOrdered = false;
     this.batches.push(batch);
     this.batchSegments.push(segment);

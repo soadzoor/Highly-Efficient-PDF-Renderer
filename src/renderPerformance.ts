@@ -171,7 +171,8 @@ const NOTES = [
   "Nested CPU sections overlap; do not add parent, child, and GL-call timings. Slow GL calls include driver waits, not just GPU execution.",
   "Frame context frameGapMs preserves gaps omitted from interval summaries. Events retain up to eight longest instrumented calls per frame.",
   "Frame records are a bounded subset of slow CPU/GPU, high-batch and timeline frames; their selection is not a representative performance distribution.",
-  "GPU operation timings put each draw, clear and blit between its own timer queries, so the GPU cannot overlap it with neighbours; their sum can exceed an untimed span. A sum far below the frame span means the GPU spent that time waiting for commands."
+  "GPU operation timings put each draw, clear and blit between its own timer queries, so the GPU cannot overlap it with neighbours; their sum can exceed an untimed span. A sum far below the frame span means the GPU spent that time waiting for commands.",
+  "Source identifiers at an operation position describe its first sampled draw; visibility and scheduling can change them on later frames."
 ] as const;
 
 export class RenderPerformanceProfiler {
@@ -211,6 +212,7 @@ export class RenderPerformanceProfiler {
   private readonly gpuTimes: number[] = [];
   private droppedGpuSamples = 0;
   private readonly describeProgram: ((program: WebGLProgram | null) => string | null) | undefined;
+  private readonly describeDraw: ((program: WebGLProgram | null, instances: number) => GpuOperationSource | undefined) | undefined;
   private operations: GpuOperationTimer | null = null;
   private readonly gpuTimer: ExternalGpuFrameTimer | undefined;
   private externalOperations: GpuOperationStats | null = null;
@@ -221,10 +223,13 @@ export class RenderPerformanceProfiler {
    * timed frames. `gpuTimer` measures GPU time for a host without WebGL.
    */
   constructor(options: { gl?: WebGL2RenderingContext; now?: () => number;
-    describeProgram?: (program: WebGLProgram | null) => string | null; gpuTimer?: ExternalGpuFrameTimer } = {}) {
+    describeProgram?: (program: WebGLProgram | null) => string | null;
+    describeDraw?: (program: WebGLProgram | null, instances: number) => GpuOperationSource | undefined;
+    gpuTimer?: ExternalGpuFrameTimer } = {}) {
     this.gl = options.gl;
     this.now = options.now ?? (() => performance.now());
     this.describeProgram = options.describeProgram;
+    this.describeDraw = options.describeDraw;
     this.gpuTimer = options.gpuTimer;
   }
 
@@ -269,7 +274,7 @@ export class RenderPerformanceProfiler {
       this.gpuStatus = this.extension ? "available" : "unavailable";
       this.gpuReason = this.extension ? null : "EXT_disjoint_timer_query_webgl2 is unavailable.";
       if (this.extension && options.gpuOperations) {
-        this.operations = new GpuOperationTimer(this.gl, this.extension, this.describeProgram);
+        this.operations = new GpuOperationTimer(this.gl, this.extension, this.describeProgram, this.describeDraw);
       }
     } catch {
       this.gpuStatus = "unavailable";
@@ -640,6 +645,18 @@ function median(samples: readonly number[]): number {
   return summarize(samples).p50 ?? 0;
 }
 
+/** Bounded canonical source IDs for locating expensive native fill/gradient draws. */
+export interface GpuOperationSource {
+  kind: "fill" | "gradient-fill";
+  /** Offset in the draw's instance buffer; indirect buffers contain canonical IDs. */
+  first: number;
+  indirect: boolean;
+  /** Up to 32 canonical path IDs and their geometric clip roots, in submitted order. */
+  ids: number[];
+  clips: number[];
+  truncated: boolean;
+}
+
 /** One timed operation, as reported among the slowest of a capture. */
 export interface GpuOperationDetail {
   label: string;
@@ -654,6 +671,7 @@ export interface GpuOperationDetail {
   target: "screen" | "offscreen";
   viewport: [number, number];
   scissor: [number, number, number, number] | null;
+  source?: GpuOperationSource;
 }
 
 /**
@@ -679,6 +697,7 @@ export interface GpuOperationPosition {
   label: string;
   instances: number | null;
   ms: number;
+  source?: GpuOperationSource;
 }
 
 interface GpuOperationTotals {
@@ -756,7 +775,8 @@ export class GpuOperationStats {
     const frames = Math.max(1, this.frameMs.length);
     const copy = <T extends GpuOperationDetail>(detail: T): T => ({ ...detail,
       viewport: [...detail.viewport] as [number, number],
-      scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null });
+      scissor: detail.scissor ? [...detail.scissor] as [number, number, number, number] : null,
+      ...(detail.source ? { source: { ...detail.source, ids: [...detail.source.ids], clips: [...detail.source.clips] } } : {}) });
     // Frames without a label count as zero; positions reached by under half the
     // frames are not typical of them.
     const byLabel = [...this.labels].map(([label, entry]) => {
@@ -771,7 +791,8 @@ export class GpuOperationStats {
       .sort((a, b) => b.ms - a.ms || a.order - b.order)
       .slice(0, SLOWEST);
     const byPosition = usual
-      .map(({ detail, ms }) => ({ order: detail.order, label: detail.label, instances: detail.instances, ms: median(ms) }))
+      .map(({ detail, ms }) => ({ order: detail.order, label: detail.label, instances: detail.instances, ms: median(ms),
+        ...(detail.source ? { source: copy(detail).source } : {}) }))
       .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
     return { frameMs: [...this.frameMs], frameOperations: [...this.frameOperations],
       byLabel, slowest: this.slowest.map(copy), typical, byPosition };
@@ -788,6 +809,7 @@ class GpuOperationTimer {
   private readonly gl: WebGL2RenderingContext;
   private readonly extension: TimerExtension;
   private readonly describe: (program: WebGLProgram | null) => string | null;
+  private readonly describeDraw: ((program: WebGLProgram | null, instances: number) => GpuOperationSource | undefined) | undefined;
   private readonly restores: (() => void)[] = [];
   private readonly ordinals = new Map<WebGLProgram, number>();
   private installed = true;
@@ -805,8 +827,10 @@ class GpuOperationTimer {
   private reason: string | null = null;
 
   constructor(gl: WebGL2RenderingContext, extension: TimerExtension,
-    describe: (program: WebGLProgram | null) => string | null = () => null) {
+    describe: (program: WebGLProgram | null) => string | null = () => null,
+    describeDraw?: (program: WebGLProgram | null, instances: number) => GpuOperationSource | undefined) {
     this.gl = gl; this.extension = extension; this.describe = describe;
+    this.describeDraw = describeDraw;
     // Starting state is read once, outside any frame; wrappers track it after.
     try {
       this.program = gl.getParameter(gl.CURRENT_PROGRAM) as WebGLProgram | null;
@@ -952,9 +976,11 @@ class GpuOperationTimer {
               const [vertices, instances] = counts(args) as [number | null, number | null];
               const pixels = name === "blitFramebuffer"
                 ? Math.abs((args[6] as number) - (args[4] as number)) * Math.abs((args[7] as number) - (args[5] as number)) : null;
+              const source = name.startsWith("draw") ? timer.describeDraw?.(timer.program, instances ?? 0) : undefined;
               timer.frame.push({ query, label: timer.label(name), order: timer.frame.length, call: name,
                 vertices, instances, pixels, target: timer.offscreen ? "offscreen" : "screen",
-                viewport: [...timer.viewportSize], scissor: timer.scissorEnabled ? [...timer.scissorBox] : null });
+                viewport: [...timer.viewportSize], scissor: timer.scissorEnabled ? [...timer.scissorBox] : null,
+                ...(source ? { source } : {}) });
             } catch { timer.disable("A WebGL timer query could not be completed."); }
           }
         }

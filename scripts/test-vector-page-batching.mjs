@@ -19,7 +19,7 @@ try {
   const original = paints(plan);
   assert.equal(plan.batches.length, 15);
   assert(plan.update(scene.drawRuns, 0.1));
-  assert.equal(plan.batches.length, 7, "three pages share stroke, fill, and text draws; image textures remain separate");
+  assert.equal(plan.batches.length, 5, "three pages share vector draws and contiguous compatible image ranges");
   assert.deepEqual(paints(plan).slice().sort(), original.slice().sort(), "batching keeps every primitive and its clip root");
   for (let page = 0; page < 3; page++) assertPageOrder(plan, original, [page]);
   assert.deepEqual([...plan.floatInstances.slice(0, plan.instanceCount * 2)], [...plan.uintInstances.slice(0, plan.instanceCount * 2)]);
@@ -28,7 +28,7 @@ try {
   assert(plan.update(scene.drawRuns, 20), "screen-space coverage can connect formerly independent pages");
   assert.deepEqual(paints(plan), original, "overlapping AA/hairline coverage retains global source order");
   assert(plan.update(scene.drawRuns, 0.1));
-  assert.equal(plan.batches.length, 7);
+  assert.equal(plan.batches.length, 5);
   assert(plan.update(scene.drawRuns, null));
   assert.deepEqual(paints(plan), original, "unknown projection scale restores global order");
 
@@ -190,7 +190,7 @@ try {
   coarse.primitiveMeta[3] = 9; // Alpha 1 and rectangular clip flag.
   const boundedLodPlan = new VectorOrderedBatches(lodScene, runtime);
   boundedLodPlan.update(lodScene.drawRuns, 0.1);
-  assert.equal(boundedLodPlan.batches.length, 6, "fragment clip rectangles bound simplified strokes too");
+  assert.equal(boundedLodPlan.batches.length, 5, "fragment clip rectangles bound simplified strokes and compatible image ranges coalesce");
 
   // Culling and changing the selected LOD subset must not retain old IDs.
   const visible = scene.drawRuns.slice(5, 10);
@@ -481,7 +481,7 @@ try {
       ? () => renderer.drawSourceOrderedContent(100, 100, 50, 50, 10)
       : () => renderer.drawSourceOrderedContentIntoPass({});
     draw();
-    assert.equal(renderer.orderedBatches.batches.length, 7);
+    assert.equal(renderer.orderedBatches.batches.length, 5);
     if (Renderer === WebGlFloorplanRenderer) {
       renderer.localToClipRenderingEnabled = true;
       draw();

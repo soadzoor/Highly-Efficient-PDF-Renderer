@@ -153,6 +153,36 @@ assert.equal(occupied.queries.length, 0, "profiling does not replace a host appl
 assert.equal(host.getReport().gpu.droppedSamples, 1);
 assert(occupied.current, "the host query remains active");
 
+// Source descriptions run only for individually timed draws and reports keep
+// their source IDs detached from both the caller and subsequent report readers.
+{
+  const operations = operationGl(), fill = {}, source = { kind: "fill", first: 3, indirect: true,
+    ids: [12, 7], clips: [0, -1], truncated: false };
+  let descriptions = 0;
+  const profiler = new RenderPerformanceProfiler({ gl: operations.gl, now,
+    describeDraw(program, instances) {
+      descriptions++; assert.equal(program, fill); assert.equal(instances, 2);
+      return { ...source, ids: [...source.ids], clips: [...source.clips] };
+    } });
+  profiler.start({ maxFrames: 4, gpuOperations: true });
+  for (let frame = 0; frame < 4; frame++) {
+    time = frame * 16; profiler.beginFrame(); operations.gl.useProgram(fill);
+    operations.gl.drawArraysInstanced(4, 0, 4, 2); operations.gl.clear(16384);
+    profiler.endFrame(); operations.complete();
+  }
+  assert.equal(descriptions, 1, "clears and frames without operation timing need no source description");
+  const report = profiler.getReport().gpu.operations;
+  assert.deepEqual(report.typical.find(operation => operation.call === "drawArraysInstanced").source, source);
+  assert.deepEqual(report.byPosition[0].source, source);
+  assert.equal(report.byPosition[1].source, undefined, "a clear cannot inherit a paint's source identifiers");
+  report.byPosition[0].source.ids[0] = 999;
+  report.typical[0].source.clips[0] = 999;
+  source.ids[0] = 888;
+  const fresh = profiler.getReport().gpu.operations;
+  assert.deepEqual(fresh.byPosition[0].source.ids, [12, 7]);
+  assert.deepEqual(fresh.typical[0].source.clips, [0, -1]);
+}
+
 // Operation timing: every draw, clear and blit of one frame in eight gets its
 // own query, never in a frame holding the frame-span query, and the context's
 // methods are restored when the capture ends.
