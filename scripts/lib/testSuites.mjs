@@ -36,6 +36,7 @@ export const fastTests = [
   "composite-span-batching",
   "selective-raster-reasons",
   "retained-image-soft-mask",
+  "retained-stencil-seams",
   "vector-fill-bands",
   "vector-cell-index",
   "webgl-shader-precision",

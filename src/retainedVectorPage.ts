@@ -12,6 +12,8 @@ import { visitHeprPath } from "./heprPathGeometry";
 import { HeprFunctionEvaluator } from "./heprFunctionEvaluator";
 import { HeprColorEvaluator } from "./heprColorEvaluator";
 import { buildHeprVectorGradient } from "./retainedVectorGradient";
+import { compositeBinaryStencilPlates, isBinaryStencil, MAX_STENCIL_COMPOSITE_PIXELS,
+  type BinaryStencilPlate } from "./retainedStencilRaster";
 import type { GradientSceneData } from "./orderedGradientPaint";
 import type { OptionalContentCondition, SceneOptionalContent } from "./optionalContentData";
 import type { Bounds, SceneTextIndex, VectorScene } from "./pdfVectorExtractor";
@@ -29,9 +31,9 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 /**
- * Every stencil mask on a page becomes an RGBA8 image of its fill color. A
- * scan stored as hundreds of overlapping 1-bit plates holds hundreds of
- * megapixels, so they share the pixel budget of a page raster fallback.
+ * Stencil masks share the pixel budget of a page raster fallback. Co-located
+ * opaque plates can share an RGBA8 tile, keeping their coverage intact when
+ * the scan contains hundreds of overlapping 1-bit images.
  */
 const MAX_RETAINED_STENCIL_PIXELS = 16_000_000;
 type Color = readonly [number, number, number, number];
@@ -243,6 +245,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     (indices, inputs) => indices.flatMap(index => [...functions.evaluate(index, inputs, { signal })]), signal);
   const gradients: GradientSceneData[] = [];
   const imagePixels = new Map<number | string, { readonly data: Uint8Array; readonly width: number; readonly height: number }>();
+  const binaryStencils = new Map<number, boolean>();
+  let pendingStencil: { plates: BinaryStencilPlate[]; width: number; height: number; index: number;
+    matrix: Float32Array; clip: DensePdfTextClip | null; clipIndex: number | undefined;
+    condition: number | undefined; item: number; siblings: ScenePaintNode[] } | undefined;
   let stencilPixels = 0, stencilCount = 0;
   for (let index = 0; index < page.stores.images.imageMask.length; index++) {
     if (!page.stores.images.imageMask[index]) continue;
@@ -452,6 +458,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     return false;
   };
   const appendRun = (kind: "fill" | "stroke" | "raster" | "text" | "gradient-fill", first: number, amount: number, clip: DensePdfTextClip | null, condition?: number, paintColor?: Color): void => {
+    flushStencil();
     itemRanges.add(kind, first, amount, currentItem);
     if (runLeavesPage(kind, first, amount, clip)) clip = withPageClip(clip);
     const clipIndex = clipBuilder.add(clip, signal);
@@ -476,6 +483,22 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     runColors.push(paintColor);
     scene.drawRuns!.push({ kind, first, count: amount, ...(clipIndex === undefined ? {} : { clipIndex }), ...(condition === undefined ? {} : { optionalContent: condition }) });
     stack.at(-1)!.push({ kind: "draw", runIndex });
+  };
+  const flushStencil = (): void => {
+    const pending = pendingStencil;
+    if (!pending) return;
+    pendingStencil = undefined;
+    let pixels: { readonly data: Uint8Array; readonly width: number; readonly height: number };
+    if (pending.plates.length === 1) {
+      const plate = pending.plates[0], key = `${pending.index}:${plate.color.join(",")}`;
+      pixels = imagePixels.get(key) ?? tintHeprStencilMask(plate.coverage, pending.width, pending.height, plate.color, stencilScale, signal);
+      imagePixels.set(key, pixels);
+    } else pixels = compositeBinaryStencilPlates(pending.plates, pending.width, pending.height, stencilScale, signal);
+    const first = scene.rasterLayers.length;
+    scene.rasterLayers.push({ ...pixels, matrix: pending.matrix, paintOrder: first, pageIndex: 0 });
+    const previousItem = currentItem;
+    currentItem = pending.item;
+    try { appendRun("raster", first, 1, pending.clip, pending.condition); } finally { currentItem = previousItem; }
   };
   const fill = (g: Geometry, rgba: Color, rule: number, clip: DensePdfTextClip | null, condition?: number): void => {
     if (!g.a.length) return; budget(g.a.length + g.b.length);
@@ -769,6 +792,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (performance.now() - lastYield > 8) { await new Promise<void>(resolve => setTimeout(resolve, 0)); lastYield = performance.now(); }
     signal.throwIfAborted();
     const command = execution.command, matrix = execution.state.transform, condition = combine(execution.state, inheritedCondition);
+    if (command.source !== "images") flushStencil();
     let clip = clipScope(execution.state.clips);
     if (inheritedClip) {
       // Pattern-cell clips are nested inside the painted path's clipping scope.
@@ -855,13 +879,37 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         // Each of these needs a different preparation, and which one it is
         // decides whether a page keeps its vectors, so name them apart.
         if (images.matteOffsets[index + 1] > images.matteOffsets[index]) return fail("a pre-multiplied image matte requires preparation.");
-        // A stencil mask paints its coverage in the current fill color, so each
-        // color it is painted in is a raster of its own.
+        // A stencil mask paints coverage in the current fill color. Matching
+        // opaque plates share a raster; other masks retain their own color.
         const stencil = images.imageMask[index] ? color(command.paintIndex, execution.state) : undefined;
+        const source = images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]);
+        const layerMatrix = Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1]));
+        // Flatten only co-located binary plates in one source-over scope. Other
+        // paints, clips, layers, marked-content items and groups end the tile.
+        let canComposite = stencil?.[3] === 1 && images.softMaskImageIndices[index] < 0 &&
+          images.formats[index] === HEPR_IMAGE_FORMAT.Gray8 && source.length === images.widths[index] * images.heights[index] &&
+          source.length <= MAX_STENCIL_COMPOSITE_PIXELS && !knockoutScopes.has(stack.at(-1)!);
+        if (canComposite) {
+          let binary = binaryStencils.get(index);
+          if (binary === undefined) { binary = isBinaryStencil(source, signal); binaryStencils.set(index, binary); }
+          canComposite = binary;
+        }
+        if (canComposite) {
+          const rasterClip = imageLeavesPage(layerMatrix, scene.pageBounds) ? withPageClip(clip) : clip;
+          const clipIndex = clipBuilder.add(rasterClip, signal), siblings = stack.at(-1)!;
+          if (pendingStencil && (pendingStencil.width !== images.widths[index] || pendingStencil.height !== images.heights[index] ||
+              pendingStencil.clipIndex !== clipIndex || pendingStencil.condition !== condition || pendingStencil.item !== currentItem ||
+              pendingStencil.siblings !== siblings || !pendingStencil.matrix.every((value, i) => value === layerMatrix[i]))) flushStencil();
+          pendingStencil ??= { plates: [], width: images.widths[index], height: images.heights[index], index,
+            matrix: layerMatrix, clip: rasterClip, clipIndex, condition, item: currentItem, siblings };
+          pendingStencil.plates.push({ coverage: source, color: stencil! });
+          budget(6);
+          continue;
+        }
+        flushStencil();
         const key = stencil ? `${index}:${stencil.join(",")}` : index;
         let pixels = imagePixels.get(key);
         if (!pixels) {
-          const source = images.data.subarray(images.dataOffsets[index], images.dataOffsets[index + 1]);
           let width = images.widths[index], height = images.heights[index], data: Uint8Array, owned = false;
           if (stencil) {
             // A stencil's one-bit samples are stored as one coverage byte each.
@@ -889,7 +937,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
           imagePixels.set(key, pixels = { data, width, height });
         }
         const first = scene.rasterLayers.length; budget(6);
-        scene.rasterLayers.push({ width: pixels.width, height: pixels.height, data: pixels.data, matrix: Float32Array.from(multiplyHeprMatrices(matrix, [1, 0, 0, -1, 0, 1])), paintOrder: first, pageIndex: 0 });
+        scene.rasterLayers.push({ width: pixels.width, height: pixels.height, data: pixels.data, matrix: layerMatrix, paintOrder: first, pageIndex: 0 });
         appendRun("raster", first, 1, clip, condition);
       }
     } else return fail(`${command.source} requires a specialized vector adapter.`);
@@ -910,6 +958,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       }
     },
     beginCompositeGroup(execution) {
+      flushStencil();
       let executionMasks = masks.get(execution.page);
       if (!executionMasks) masks.set(execution.page, executionMasks = new Map());
       const children: ScenePaintNode[] = [];
@@ -937,6 +986,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       stack.push(children);
     },
     endCompositeGroup(_execution, outcome) {
+      if (outcome.status === "complete") flushStencil();
+      else pendingStencil = undefined;
       const children = stack.pop()!, group = groupScopes.get(children);
       if (outcome.status !== "complete" || !group || group.alpha === 1 || group.alphaIsShape ||
           group.knockout || group.softMask || group.blendMode !== "Normal" || children.length !== 1 ||
