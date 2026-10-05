@@ -98,6 +98,7 @@ export const fastTests = [
   "stroke-coverage-order",
   "native-streamed-content",
   "pdf-to-hep-progress",
+  "pdf-to-hep-workers",
   "native-glyph-hairline",
   "native-vector-page",
   "native-composite-lifetime",

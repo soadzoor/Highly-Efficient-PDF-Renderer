@@ -904,12 +904,28 @@ node PDFtoHEP.js --output-dir=./heps ./pdfs
 node PDFtoHEP.js --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
 node PDFtoHEP.js --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
 node PDFtoHEP.js --force ./pdfs
+node PDFtoHEP.js --workers=4 --output-dir=./heps ./pdfs
 node PDFtoHEP.js --annotation-appearances=none ./pdfs
 HEPR_PDF_PASSWORD='secret' node PDFtoHEP.js ./protected.pdf
 ```
 
-Directory input is scanned recursively and converted one PDF at a time in
-isolated child processes. `Level1.pdf` produces `Level1-parsed-data.hep` beside
+Directory input is scanned recursively and converted in isolated child processes,
+with one simultaneous conversion per available CPU thread by default, capped
+by the number of pending PDFs. Whenever a child finishes, its slot takes the next
+PDF without waiting for other conversions. Each PDF gets a fresh child process
+to release its memory after conversion. A single PDF still uses one conversion
+process. `--workers=<count>` overrides concurrency; `--workers=1` runs serially.
+Progress lines identify their PDF, and the final summary includes per-file
+durations and batch wall time. Summed conversion durations overlap in parallel
+and can exceed wall time.
+
+Each child retains its own heap limit of 12288 MiB by default (not preallocated).
+`HEPR_PDF_TO_HEP_HEAP_MB` or the parent's `--max-old-space-size` overrides this
+per-child limit. Large PDFs can use substantial combined memory; reduce
+`--workers` if needed. Ctrl+C stops new dispatch and cancels all active children;
+a second signal force-stops them. Failed conversions do not stop other PDFs.
+
+`Level1.pdf` produces `Level1-parsed-data.hep` beside
 the input unless `--output-dir=<directory>` is supplied. Output-name collisions
 are rejected. Existing files are skipped; `--force` replaces them only after a
 successful conversion. `--annotation-appearances=render|forms|none` chooses which

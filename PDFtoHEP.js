@@ -14,6 +14,7 @@ import {
   unlink
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { availableParallelism } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
@@ -33,7 +34,7 @@ const PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE = 3;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const PDF_TO_HEP_USAGE = `Usage:
-  node PDFtoHEP.js [--force] [--output-dir=<directory>] <pdf-or-directory>
+  node PDFtoHEP.js [--force] [--workers=<count>] [--output-dir=<directory>] <pdf-or-directory>
 
 Options:
   -f, --force  Replace existing regular HEP files after conversion succeeds.
@@ -41,6 +42,8 @@ Options:
       new conversion would only change its generatedAt timestamp.
   -h, --help   Show this help text.
   --output-dir=<directory>  Write all HEP files into this directory.
+  --workers=<count>  Maximum simultaneous conversions (default: available CPU threads).
+      Use --workers=1 for serial conversion or a lower count to reduce memory use.
   --with-vector-lod  Store vector LOD geometry; rebuild spatial indexes on load.
   --with-text-lod  Store text LOD clusters when applicable.
   --vector-lod-precision=lossless|compact  Stored vector LOD precision (default: compact).
@@ -65,13 +68,18 @@ Examples:
   node PDFtoHEP.js ./pdfs
   node PDFtoHEP.js --force ./pdfs
   node PDFtoHEP.js --force --keep-unchanged ./pdfs
+  node PDFtoHEP.js --workers=4 ./pdfs
 
 When given a directory, the script scans it recursively and processes regular
-.pdf files in isolated child processes, one at a time. Outputs use the client
-export convention <name>-parsed-data.hep and are written beside their PDFs,
-unless --output-dir is supplied. Output name collisions are rejected.
+.pdf files in isolated child processes, one per available CPU thread up to the
+number of pending PDFs. Each freed slot immediately takes the next PDF.
+Outputs use the client export convention <name>-parsed-data.hep and are written
+beside their PDFs, unless --output-dir is supplied. Output name collisions are
+rejected.
 
-Existing HEP files are skipped unless --force is supplied.`;
+Existing HEP files are skipped unless --force is supplied. Each child has its
+own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
+overrides it. Concurrent large PDFs can require substantial combined memory.`;
 
 class ExistingOutputError extends Error {
   constructor(outputPath) {
@@ -94,6 +102,7 @@ export function parsePdfToHepArguments(args) {
   let withVectorLod = false;
   let withTextLod = false;
   let vectorLodPrecision;
+  let workers;
 
   for (const argument of args) {
     if (!positionalOnly && argument === "--") {
@@ -110,6 +119,17 @@ export function parsePdfToHepArguments(args) {
     }
     if (!positionalOnly && argument === "--keep-unchanged") {
       keepUnchanged = true;
+      continue;
+    }
+    if (!positionalOnly && argument.startsWith("--workers=")) {
+      const value = argument.slice("--workers=".length);
+      if (
+        workers !== undefined || !/^\d+$/.test(value) ||
+        !Number.isSafeInteger(Number(value)) || Number(value) < 1
+      ) {
+        throw new Error("Pass exactly one --workers=<positive integer>.");
+      }
+      workers = Number(value);
       continue;
     }
     if (!positionalOnly && argument === "--with-vector-lod") { withVectorLod = true; continue; }
@@ -173,6 +193,7 @@ export function parsePdfToHepArguments(args) {
 
   return {
     force, help, inputPath,
+    ...(workers === undefined ? {} : { workers }),
     ...(withVectorLod ? { withVectorLod } : {}),
     ...(withTextLod ? { withTextLod } : {}),
     ...(vectorLodPrecision === undefined ? {} : { vectorLodPrecision }),
@@ -734,7 +755,13 @@ export async function runPdfToHepWorkerBatch(
   const cleanupWorkerTemps = dependencies.cleanupWorkerTemps ?? cleanupPdfToHepWorkerTemps;
   const signalTarget = dependencies.signalTarget ?? process;
   const now = dependencies.now ?? (() => performance.now());
-  let activeChild = null;
+  const workerCount = Math.min(
+    pending.length,
+    options.workers ?? (dependencies.availableParallelism ?? availableParallelism)()
+  );
+  const batchStartedAt = now();
+  const activeChildren = new Set();
+  let nextIndex = 0;
   let interruptedExitCode = 0;
   let generatedCount = 0;
   const failures = [];
@@ -746,10 +773,15 @@ export async function runPdfToHepWorkerBatch(
       interruptedExitCode = signalName === "SIGINT" ? 130 : 143;
       console.error(`Received ${signalName}; stopping the PDF-to-HEP batch...`);
     }
-    if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
+    if (repeatedSignal) {
+      console.error(`Received ${signalName} again; force-stopping the active workers...`);
+    }
+    for (const activeChild of activeChildren) {
+      if (activeChild.exitCode !== null || activeChild.signalCode !== null) {
+        continue;
+      }
       try {
         if (repeatedSignal) {
-          console.error(`Received ${signalName} again; force-stopping the active worker...`);
           activeChild.kill("SIGKILL");
         } else {
           activeChild.kill(signalName);
@@ -764,12 +796,11 @@ export async function runPdfToHepWorkerBatch(
   signalTarget.on("SIGINT", onSigInt);
   signalTarget.on("SIGTERM", onSigTerm);
 
-  try {
-    for (const item of pending) {
-      if (interruptedExitCode) {
-        break;
-      }
-
+  // Each consumer claims the next PDF synchronously, before awaiting its child.
+  // Fast PDFs refill their own slots without waiting for slower conversions.
+  const runNext = async () => {
+    while (!interruptedExitCode && nextIndex < pending.length) {
+      const item = pending[nextIndex++];
       const startedAt = now();
       let worker;
       try {
@@ -792,13 +823,19 @@ export async function runPdfToHepWorkerBatch(
         continue;
       }
 
-      activeChild = worker.child;
+      activeChildren.add(worker.child);
       const workerPid = worker.child.pid;
       let outcome;
       let workerFinishedAt;
       try {
         outcome = await worker.completion;
         workerFinishedAt = now();
+        // A child may receive a terminal signal before the parent does. Stop
+        // dispatch immediately and cancel siblings before asynchronous cleanup.
+        if (!interruptedExitCode) {
+          if (outcome.code === 130 || outcome.signal === "SIGINT") interrupt("SIGINT");
+          else if (outcome.code === 143 || outcome.signal === "SIGTERM") interrupt("SIGTERM");
+        }
       } catch (error) {
         workerFinishedAt = now();
         const status = interruptedExitCode ? "interrupted" : "failed";
@@ -823,8 +860,10 @@ export async function runPdfToHepWorkerBatch(
         );
         continue;
       } finally {
-        activeChild = null;
-        await cleanupWorkerTemps(item.outputPath, workerPid, worker.workerToken);
+        activeChildren.delete(worker.child);
+        await cleanupWorkerTemps(item.outputPath, workerPid, worker.workerToken).catch((error) => {
+          console.warn(`Could not clean up worker temporary files for ${item.pdfPath}: ${formatError(error)}`);
+        });
       }
 
       const durationMs = workerFinishedAt - startedAt;
@@ -854,25 +893,6 @@ export async function runPdfToHepWorkerBatch(
         );
         continue;
       }
-      if (outcome.code === 130 || outcome.signal === "SIGINT") {
-        const timing = appendPdfToHepTiming(timings, item, "interrupted", durationMs);
-        interruptedExitCode = 130;
-        console.error(
-          `[${item.fileNumber}/${item.fileCount}] Interrupted ${item.pdfPath} after ` +
-          formatPdfToHepDuration(timing.durationMs)
-        );
-        break;
-      }
-      if (outcome.code === 143 || outcome.signal === "SIGTERM") {
-        const timing = appendPdfToHepTiming(timings, item, "interrupted", durationMs);
-        interruptedExitCode = 143;
-        console.error(
-          `[${item.fileNumber}/${item.fileCount}] Interrupted ${item.pdfPath} after ` +
-          formatPdfToHepDuration(timing.durationMs)
-        );
-        break;
-      }
-
       const timing = appendPdfToHepTiming(timings, item, "failed", durationMs);
       const detail = outcome.signal
         ? `signal ${outcome.signal}`
@@ -884,19 +904,31 @@ export async function runPdfToHepWorkerBatch(
         `(${detail}). Continuing with the next PDF.`
       );
     }
+  };
+
+  console.log(`Converting ${pending.length} PDF(s) with up to ${workerCount} worker(s).`);
+  try {
+    // Keep signal forwarding installed until all active children have finished.
+    const results = await Promise.allSettled(Array.from({ length: workerCount }, () => runNext()));
+    const rejection = results.find((result) => result.status === "rejected");
+    if (rejection) throw rejection.reason;
   } finally {
     signalTarget.off("SIGINT", onSigInt);
     signalTarget.off("SIGTERM", onSigTerm);
   }
 
+  timings.sort((left, right) => left.fileNumber - right.fileNumber);
+  const wallTime = `Batch wall time: ${formatPdfToHepDuration(now() - batchStartedAt)}`;
   if (interruptedExitCode) {
     console.log(formatPdfToHepTimingSummary(timings));
+    console.log(wallTime);
     return interruptedExitCode;
   }
   console.log(
     `Finished: ${generatedCount} generated, ${skippedCount} skipped, ${failures.length} failed.`
   );
   console.log(formatPdfToHepTimingSummary(timings));
+  console.log(wallTime);
   return failures.length === 0 ? 0 : 1;
 }
 

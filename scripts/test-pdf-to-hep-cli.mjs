@@ -322,7 +322,7 @@ try {
   console.error = (message) => batchError.push(String(message));
   const batchPromise = runPdfToHepWorkerBatch(
     batchItems,
-    { force: false },
+    { force: false, workers: 1 },
     2,
     {
       heapMb: 8_192,
@@ -369,6 +369,7 @@ assert.ok(batchError.some((message) =>
   message.includes("after 0h 00m 03s") && message.includes("Continuing with the next PDF")
 ));
 assert.deepEqual(batchLog, [
+  "Converting 3 PDF(s) with up to 1 worker(s).",
   `[1/3] Converted ${batchItems[0].pdfPath} in 0h 00m 01s`,
   `[3/3] Skipped ${batchItems[2].pdfPath} after 0h 00m 04s`,
   "Finished: 1 generated, 3 skipped, 1 failed.",
@@ -378,7 +379,8 @@ assert.deepEqual(batchLog, [
     `  [2/3] ${batchItems[1].pdfPath}: 0h 00m 03s (failed)`,
     `  [3/3] ${batchItems[2].pdfPath}: 0h 00m 04s (skipped)`,
     "  Total attempted conversion time: 0h 00m 07s"
-  ].join("\n")
+  ].join("\n"),
+  "Batch wall time: 0h 00m 07s"
 ]);
 assert.equal(batchSignalTarget.listenerCount("SIGINT"), 0);
 assert.equal(batchSignalTarget.listenerCount("SIGTERM"), 0);
@@ -396,7 +398,7 @@ try {
   console.log = (message) => interruptLog.push(String(message));
   const interruptPromise = runPdfToHepWorkerBatch(
     batchItems,
-    { force: true },
+    { force: true, workers: 1 },
     0,
     {
       heapMb: 8_192,
@@ -427,11 +429,11 @@ try {
   console.log = originalConsoleLogForInterrupt;
 }
 assert.equal(interruptResult, 130);
-assert.deepEqual(interruptLog, [[
+assert.deepEqual(interruptLog, ["Converting 3 PDF(s) with up to 1 worker(s).", [
   "Conversion time summary:",
   `  [1/3] ${batchItems[0].pdfPath}: 0h 00m 05s (interrupted)`,
   "  Total attempted conversion time: 0h 00m 05s"
-].join("\n")]);
+].join("\n"), "Batch wall time: 0h 00m 05s"]);
 assert.equal(interruptChildren.length, 1, "interruption must prevent later workers from starting");
 assert.equal(interruptSignalTarget.listenerCount("SIGINT"), 0);
 assert.equal(interruptSignalTarget.listenerCount("SIGTERM"), 0);
