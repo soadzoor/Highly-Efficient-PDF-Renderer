@@ -3068,8 +3068,10 @@ export class NativeSfntFont {
       throw unsupportedFont("The TrueType maxp maxZones value is invalid.");
     }
     const cmaps = readSfntCmaps(this.view, this.tables.get("cmap"), limits);
-    this.unicodeCmap = cmaps.base.find((cmap) => cmap.platform !== 3 || cmap.encoding !== 0) ?? null;
-    this.symbolCmap = cmaps.base.find((cmap) => cmap.platform === 3 && cmap.encoding === 0) ?? null;
+    // (1,0) Macintosh subtables map single-byte codes, never Unicode scalar values.
+    this.unicodeCmap = cmaps.base.find((cmap) => cmap.platform !== 1 && (cmap.platform !== 3 || cmap.encoding !== 0)) ?? null;
+    this.symbolCmap = cmaps.base.find((cmap) => cmap.platform === 3 && cmap.encoding === 0) ??
+      cmaps.base.find((cmap) => cmap.platform === 1 && cmap.encoding === 0) ?? null;
     this.variationCmaps = cmaps.variation;
     if (
       this.tables.has("glyf") !== this.tables.has("loca") &&
@@ -4384,6 +4386,15 @@ function cmapPriority(platform: number, encoding: number, format: number): numbe
     (format === 4 || format === 6 || format === 0)
   ) {
     return 100 + (format === 4 ? 3 : format === 6 ? 2 : 1);
+  }
+  // PDF 32000-1 §9.6.6.4: a symbolic TrueType font without a (3,0) subtable maps
+  // character codes through its (1,0) subtable. Lowest rank: it only serves as the
+  // symbol cmap fallback.
+  if (
+    platform === 1 && encoding === 0 &&
+    (format === 4 || format === 6 || format === 0)
+  ) {
+    return 50 + (format === 4 ? 3 : format === 6 ? 2 : 1);
   }
   return -1;
 }

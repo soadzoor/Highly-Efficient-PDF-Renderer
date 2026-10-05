@@ -731,6 +731,31 @@ function testCollectionsAndKernelRouting() {
   expectPdf(() => type1.getGlyphOutline(1), "unsupported-font", /no supported outline table/i);
 }
 
+function testMacintoshSymbolCmap() {
+  // PDF 32000-1 §9.6.6.4: a symbolic TrueType font without a (3,0) subtable maps
+  // character codes through its (1,0) subtable. LibreOffice embeds its subset fonts
+  // this way (Flags 4, no /Encoding, a single (1,0) cmap).
+  const fixture = buildFixture();
+  const macOnly = cloneTables(fixture.tables);
+  macOnly.set("cmap", buildCmap([{ platform: 1, encoding: 0, bytes: cmapFormat0([[0x03, 2]]) }]));
+  const macFont = NativeSfntFont.parse(buildSfnt(macOnly));
+  assert.equal(macFont.mapSymbolCode(0x03), 2, "(1,0) is the symbol cmap when (3,0) is absent");
+  assert.equal(macFont.mapCodePoint(0x03), 0, "(1,0) is never treated as a Unicode cmap");
+
+  const both = cloneTables(fixture.tables);
+  both.set("cmap", buildCmap([
+    { platform: 1, encoding: 0, bytes: cmapFormat0([[0x20, 2]]) },
+    { platform: 3, encoding: 0, bytes: cmapFormat0([[0x20, 1]]) }
+  ]));
+  assert.equal(NativeSfntFont.parse(buildSfnt(both)).mapSymbolCode(0x20), 1, "(3,0) keeps precedence over (1,0)");
+
+  const withUnicode = cloneTables(fixture.tables);
+  withUnicode.set("cmap", buildCmap([
+    { platform: 1, encoding: 0, bytes: cmapFormat0([[0x41, 2]]) },
+    { platform: 3, encoding: 1, bytes: cmapFormat4([[0x41, 1]]) }
+  ]));
+  assert.equal(NativeSfntFont.parse(buildSfnt(withUnicode)).mapCodePoint(0x41), 1, "(3,1) stays the Unicode cmap");
+}
 function buildFixture() {
   const { glyf, offsets } = buildGlyphTable();
   const numGlyphs = offsets.length - 1;
@@ -1175,6 +1200,7 @@ try {
   testLazyGlyphValidationAndLimits();
   testCmapValidationAndLimits();
   testCollectionsAndKernelRouting();
+  testMacintoshSymbolCmap();
 } finally {
   hooks.deregister();
 }
