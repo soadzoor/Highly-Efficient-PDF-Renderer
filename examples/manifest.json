@@ -1,12 +1,12 @@
 {
-  "generatedAt": "2026-10-01T13:50:37.410Z",
+  "generatedAt": "2026-10-05T19:31:35.646Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
       "name": "20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
       "hepLod": {
         "path": "examples/heps-lod/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 2048508
+        "sizeBytes": 2048620
       },
       "pdf": {
         "path": "examples/pdfs/20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
@@ -14,7 +14,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 2046984
+        "sizeBytes": 2047600
       }
     },
     {
@@ -22,7 +22,7 @@
       "name": "Baldwin Park ED Remodel_Floor 1.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.hep",
-        "sizeBytes": 2063728
+        "sizeBytes": 2063388
       },
       "pdf": {
         "path": "examples/pdfs/Baldwin%20Park%20ED%20Remodel_Floor%201.pdf",
@@ -30,7 +30,7 @@
       },
       "hep": {
         "path": "examples/heps/Baldwin_Park_ED_Remodel_Floor_1-parsed-data.hep",
-        "sizeBytes": 850452
+        "sizeBytes": 851324
       }
     },
     {
@@ -38,7 +38,7 @@
       "name": "Chino MOB_FLOOR 1.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Chino_MOB_FLOOR_1-parsed-data.hep",
-        "sizeBytes": 556340
+        "sizeBytes": 555156
       },
       "pdf": {
         "path": "examples/pdfs/Chino%20MOB_FLOOR%201.pdf",
@@ -54,7 +54,7 @@
       "name": "Dublin 1st Floor 2018 06 01.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Dublin_1st_Floor_2018_06_01-parsed-data.hep",
-        "sizeBytes": 2732272
+        "sizeBytes": 2730296
       },
       "pdf": {
         "path": "examples/pdfs/Dublin%201st%20Floor%202018%2006%2001.pdf",
@@ -86,7 +86,7 @@
       "name": "Level 1.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Level_1-parsed-data.hep",
-        "sizeBytes": 7786764
+        "sizeBytes": 7736464
       },
       "pdf": {
         "path": "examples/pdfs/Level%201.pdf",
@@ -102,7 +102,7 @@
       "name": "Livermore_L1.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Livermore_L1-parsed-data.hep",
-        "sizeBytes": 3846188
+        "sizeBytes": 3837024
       },
       "pdf": {
         "path": "examples/pdfs/Livermore_L1.pdf",
@@ -134,7 +134,7 @@
       "name": "Lower Level.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Lower_Level-parsed-data.hep",
-        "sizeBytes": 3888460
+        "sizeBytes": 3861484
       },
       "pdf": {
         "path": "examples/pdfs/Lower%20Level.pdf",
@@ -150,7 +150,7 @@
       "name": "Murietta_Level1.pdf",
       "hepLod": {
         "path": "examples/heps-lod/Murietta_Level1-parsed-data.hep",
-        "sizeBytes": 3602624
+        "sizeBytes": 3598220
       },
       "pdf": {
         "path": "examples/pdfs/Murietta_Level1.pdf",
@@ -214,7 +214,7 @@
       "name": "SimiValleyBehavioralHealth_SR_20180403.pdf",
       "hepLod": {
         "path": "examples/heps-lod/SimiValleyBehavioralHealth_SR_20180403-parsed-data.hep",
-        "sizeBytes": 557280
+        "sizeBytes": 556824
       },
       "pdf": {
         "path": "examples/pdfs/SimiValleyBehavioralHealth_SR_20180403.pdf",
@@ -230,7 +230,7 @@
       "name": "stn_arch_kp-ontario_177920237_detached.pdf",
       "hepLod": {
         "path": "examples/heps-lod/stn_arch_kp-ontario_177920237_detached-parsed-data.hep",
-        "sizeBytes": 5924664
+        "sizeBytes": 5888664
       },
       "pdf": {
         "path": "examples/pdfs/stn_arch_kp-ontario_177920237_detached.pdf",
@@ -262,7 +262,7 @@
       "name": "WarAndPeace.pdf",
       "hepLod": {
         "path": "examples/heps-lod/WarAndPeace-parsed-data.hep",
-        "sizeBytes": 6593864
+        "sizeBytes": 6593868
       },
       "pdf": {
         "path": "examples/pdfs/WarAndPeace.pdf",
