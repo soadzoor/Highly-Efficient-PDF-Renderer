@@ -23,6 +23,7 @@ export const fastTests = [
   "annotation-links",
   "annotation-layers",
   "annotation-interaction",
+  "annotation-ui-interaction",
   "structure-content",
   "hep-scene-sections",
   "optional-content",

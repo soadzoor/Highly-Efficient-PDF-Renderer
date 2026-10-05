@@ -7,10 +7,8 @@ import * as THREE from "three";
 import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
 import { ScenePaintVisibility, sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { ScenePrimitivePicker, getScenePrimitive, validatePrimitiveRef, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
-  scenePrimitivePickBounds, type ScenePrimitivePickOptions, type PrimitiveKind } from "./scenePrimitives";
-import { SceneAnnotationIndex, annotationPrimitiveRefs, buildAnnotationMetadataHighlights, isAnnotationInteractionVisible,
-  pickAnnotationMetadata, projectedAnnotationArea, type AnnotationHit } from "./sceneAnnotationInteraction";
-import type { SceneAnnotation } from "./annotationData";
+  type ScenePrimitivePickOptions, type PrimitiveKind } from "./scenePrimitives";
+import { SceneAnnotationIndex, annotationPrimitiveRefs, applySceneAnnotationHighlights, pickSceneAnnotationInteraction, type AnnotationHit } from "./sceneAnnotationInteraction";
 import { PrimitiveAppearanceState, type PrimitiveColorUpdate, type PrimitiveHighlightSet,
   type PrimitiveOverride } from "./primitiveAppearance";
 import { ThreePrimitiveHighlightLayer } from "./threePrimitiveHighlightLayer";
@@ -1128,34 +1126,7 @@ export class HeprThreePdfObject extends THREE.Group {
   private updateAnnotationHighlights(selected: readonly string[], hovered: string | null): void {
     if (this.pageViews) return;
     const snapshot = this.getAnnotationInteractionVisibility(), index = this.getAnnotationIndex();
-    const selectedRefs: PrimitiveRef[] = [], hoveredRefs: PrimitiveRef[] = [];
-    const selectedMetadata: SceneAnnotation[] = [], hoveredMetadata: SceneAnnotation[] = [];
-    const collect = (id: string, refs: PrimitiveRef[], metadata: SceneAnnotation[]): void => {
-      const entry = index.get(id), annotations = entry.annotations.filter(annotation => isAnnotationInteractionVisible(annotation, snapshot));
-      if (!annotations.length) return;
-      if (!entry.runs.length) { for (const annotation of annotations) metadata.push(annotation); return; }
-      for (const run of entry.runs) {
-        if (!isScenePrimitiveVisible(this.sceneData, { kind: run.kind, index: run.first },
-          condition => condition === undefined || snapshot.conditions[condition] === 1)) continue;
-        for (let index = run.first; index < run.first + run.count; index++) {
-          if (selectedRefs.length + hoveredRefs.length >= 262_144) throw new RangeError("Annotation highlight exceeds its primitive budget.");
-          refs.push({ kind: run.kind, index });
-        }
-      }
-    };
-    try {
-      for (const id of selected) collect(id, selectedRefs, selectedMetadata);
-      if (hovered !== null && !selected.includes(hovered)) collect(hovered, hoveredRefs, hoveredMetadata);
-      this.primitiveAppearance.setAnnotationHighlights(selectedRefs, hoveredRefs,
-        buildAnnotationMetadataHighlights(selectedMetadata, hoveredMetadata));
-    } catch (error) {
-      if (!(error instanceof RangeError)) throw error;
-      console.warn("[HEPR] Annotation highlight fidelity reduced; using metadata bounds.", error.message);
-      const fallbackSelected = selected.flatMap(id => index.get(id).annotations.filter(annotation => isAnnotationInteractionVisible(annotation, snapshot)));
-      const fallbackHovered = hovered !== null && !selected.includes(hovered) ?
-        index.get(hovered).annotations.filter(annotation => isAnnotationInteractionVisible(annotation, snapshot)) : [];
-      this.primitiveAppearance.setAnnotationHighlights([], [], buildAnnotationMetadataHighlights(fallbackSelected, fallbackHovered, true));
-    }
+    applySceneAnnotationHighlights(this.sceneData, index, this.primitiveAppearance, snapshot, selected, hovered);
   }
 
   /**
@@ -1319,47 +1290,14 @@ export class HeprThreePdfObject extends THREE.Group {
     const revision = this.layerVisibility.revision;
     const interactionRevision = this.annotationInteractionRevision;
     const snapshot = options.includeHidden ? this.getAnnotationInteractionVisibility() : this.getAnnotationAppliedVisibility();
-    const index = this.getAnnotationIndex(), query = scenePrimitivePickBounds(context, tolerance);
-    const candidates = await index.query(query, options.signal);
-    if (interactionRevision !== this.annotationInteractionRevision) throw new DOMException("Annotation interaction cleared during picking.", "AbortError");
     const picker = this.primitivePicker ??= new ScenePrimitivePicker(this.sceneData,
       percentage => this.reportPrimitivePreparationProgress(percentage));
-    const matches: { entry: typeof candidates[number]; annotation: SceneAnnotation; area: number }[] = [];
-    const suppressed = options.includeHidden ? null : this.annotationSuppressed;
-    for (const entry of candidates) for (const annotation of entry.annotations) {
-      if (!isAnnotationInteractionVisible(annotation, snapshot)) continue;
-      const page = annotation.pageIndex * 4, r = this.sceneData.pageRects, point = context.point;
-      if (point.x < r[page] || point.x > r[page + 2] || point.y < r[page + 1] || point.y > r[page + 3]) continue;
-      matches.push({ entry, annotation, area: projectedAnnotationArea(annotation, context.project) });
-    }
-    matches.sort((a, b) => a.area - b.area || b.annotation.annotationIndex - a.annotation.annotationIndex ||
-      b.annotation.pageIndex - a.annotation.pageIndex || a.annotation.id.localeCompare(b.annotation.id));
-    let best: AnnotationHit | null = null, bestArea = Infinity;
-    let lastYield = performance.now();
-    for (const { entry, annotation, area } of matches) {
-      options.signal?.throwIfAborted();
-      if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
-      if (best && area > bestArea) break;
-      let distance: number | null;
-      if (entry.runs.length) {
-        const hit = await picker.pickRanges({ ...context,
-          isConditionVisible: condition => condition === undefined || snapshot.conditions[condition] === 1 }, index.appearanceRanges(entry, query));
-        distance = hit?.distancePx ?? null;
-      } else {
-        distance = suppressed?.has(annotation.id) ? null : pickAnnotationMetadata(annotation, context.clientPoint, context.project, tolerance);
-      }
-      if (distance !== null && (!best || area < bestArea || distance < best.distancePx)) {
-        best = { annotationId: annotation.id, distancePx: distance }; bestArea = area;
-      }
-      if (performance.now() - lastYield >= 8) {
-        await new Promise<void>(resolve => setTimeout(resolve, 0)); lastYield = performance.now();
-      }
-    }
-    options.signal?.throwIfAborted();
-    if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
-    if (interactionRevision !== this.annotationInteractionRevision) throw new DOMException("Annotation interaction cleared during picking.", "AbortError");
-    if (revision !== this.layerVisibility.revision) throw new DOMException("Layer visibility changed during annotation picking.", "AbortError");
-    return best;
+    return pickSceneAnnotationInteraction(this.sceneData, this.getAnnotationIndex(), picker, context, snapshot,
+      options.includeHidden ?? false, this.annotationSuppressed, () => {
+        if (this.isDisposed) throw new DOMException("PDF object disposed.", "AbortError");
+        if (interactionRevision !== this.annotationInteractionRevision) throw new DOMException("Annotation interaction cleared during picking.", "AbortError");
+        if (revision !== this.layerVisibility.revision) throw new DOMException("Layer visibility changed during annotation picking.", "AbortError");
+      });
   }
 
   /** Observe shared picking preparation, including after an individual query is cancelled.

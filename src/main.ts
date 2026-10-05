@@ -1,6 +1,8 @@
 import { promptForHepLod } from "./hepLodPrompt";
 import { createViewerLinkNavigation } from "./viewerLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
+import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
+import { createNativeAnnotationInteractionAdapter } from "./nativeAnnotationInteraction";
 import "./style.css";
 import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
@@ -276,6 +278,8 @@ function applyTextSearchScene(scene: VectorScene): void {
   annotationControls.sceneChanged();
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
+  annotationInteraction?.sceneChanged();
+  annotationInteraction?.refresh();
   textSearchController.setScene(scene);
   const hasText = scene.textIndex?.pages.some((page) => page.text.length > 0) ?? false;
   textSearchWidget.setAvailability(hasText ? "ready" : "no-text-index");
@@ -307,6 +311,7 @@ textSelectionCheckbox.addEventListener("change", () => {
 });
 
 textSelectionCheckbox.disabled = false;
+let annotationInteraction: AnnotationInteractionController | undefined;
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
   getLayerName: id => lastParsedScene?.optionalContent?.groups.find(group => group.id === id)?.name,
@@ -318,6 +323,7 @@ const drawingSelection = createDrawingSelectionControls({
     onError: error => { setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`); }
   }),
   onEnabledChange: enabled => {
+    annotationInteraction?.setInteractionEnabled(!enabled);
     textSelectionCheckbox.disabled = enabled;
     if (enabled) {
       textSelection.disable();
@@ -345,6 +351,7 @@ const linkNavigation = createViewerLinkNavigation({
   }
 });
 const annotationOverlay = createAnnotationOverlay({
+  pointerInteraction: false,
   getCanvas: () => canvasElement,
   adapter: {
     getScene: () => lastParsedScene,
@@ -359,7 +366,10 @@ const annotationOverlay = createAnnotationOverlay({
   enabled: annotationBubblesCheckbox.checked
 });
 annotationBubblesCheckbox.addEventListener("change", () => {
-  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+  if (annotationBubblesCheckbox.checked) {
+    annotationOverlay.enable();
+    annotationInteraction?.select(annotationInteraction.getSelection());
+  } else annotationOverlay.disable();
 });
 
 const layerVisibility = createLayerVisibilityController({
@@ -370,6 +380,7 @@ const layerVisibility = createLayerVisibilityController({
     textSearchController.refreshVisibility();
     textSelection.clearSelection();
     drawingSelection.onFrame();
+    annotationInteraction?.onFrame();
     annotationOverlay.onFrame();
   }
 });
@@ -383,7 +394,38 @@ const annotationControls = createPdfAnnotationControls({
     getAnnotationLayers: () => layerVisibility.getAnnotationLayers(),
     setAnnotationVisibility: (ids, visible) => layerVisibility.setAnnotationVisibility(ids, visible)
   },
-  onChange: () => annotationOverlay.onFrame()
+  onSelect: annotation => {
+    drawingSelection.disable();
+    textSelection.clearSelection();
+    annotationInteraction?.select(annotation?.id ?? null);
+  },
+  onHover: annotation => {
+    if (!drawingSelection.isEnabled()) annotationInteraction?.hover(annotation?.id ?? null);
+  },
+  onChange: () => {
+    annotationInteraction?.refresh();
+    annotationOverlay.onFrame();
+  }
+});
+annotationInteraction = createAnnotationInteractionController({
+  adapter: createNativeAnnotationInteractionAdapter({
+    getCanvas: () => canvasElement, getScene: () => lastParsedScene, getRenderer: () => renderer
+  }),
+  isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+  onSelectionChange: (annotation, source, point) => {
+    annotationControls.selectAnnotation(annotation?.id ?? null, { reveal: source === "canvas" });
+    if (source === "canvas" && annotation && annotationControls.isAnnotationEnabled(annotation) && linkNavigation.activate(annotation)) {
+      annotationOverlay.hide();
+    } else if (annotation && annotationBubblesCheckbox.checked && annotationControls.isAnnotationEnabled(annotation)) {
+      annotationOverlay.show(annotation, point);
+    } else annotationOverlay.hide();
+  },
+  onHoverChange: (annotation, point) => {
+    if (annotationInteraction?.getSelection()) return;
+    if (annotation && annotationBubblesCheckbox.checked && annotationControls.isAnnotationEnabled(annotation)) annotationOverlay.show(annotation, point);
+    else annotationOverlay.hide();
+  },
+  onError: error => setStatus(`Annotation selection failed: ${error instanceof Error ? error.message : String(error)}`)
 });
 
 let lastRuntimeTextUpdate = -Infinity;
@@ -393,6 +435,7 @@ function onRendererFrame(stats: DrawStats): void {
   drawCallMeter.update(stats.drawCalls);
   textSelection.updateOverlay();
   drawingSelection.onFrame();
+  annotationInteraction?.onFrame();
   annotationOverlay.onFrame();
 
   // Camera/interaction work stays per frame; formatting and replacing the HUD
@@ -572,6 +615,8 @@ backendSwitcher = createBackendSwitcher({
     renderer.setSearchHighlights?.(lastSearchHighlights);
     textSelection.refreshHighlights();
     drawingSelection.rendererChanged();
+    annotationControls.sceneChanged();
+    annotationInteraction?.refresh();
   },
   getCanvasElement: () => canvasElement,
   setCanvasElement: (nextCanvas) => {
@@ -640,6 +685,7 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 
 window.addEventListener("beforeunload", () => {
   drawCallMeter.dispose();
+  annotationInteraction?.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
   linkNavigation.dispose();
@@ -1251,7 +1297,10 @@ function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preser
     try {
       if (previousScene) target.setScene(previousScene);
       target.setViewState(previousView);
-      if (target === renderer) drawingSelection.rendererChanged();
+      if (target === renderer) {
+        drawingSelection.rendererChanged();
+        annotationInteraction?.refresh();
+      }
     } catch (restoreError) {
       console.warn("[HEPR] Failed to restore the previous scene after an upload error.", restoreError);
     }

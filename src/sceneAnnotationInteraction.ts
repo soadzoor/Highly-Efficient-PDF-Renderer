@@ -1,8 +1,8 @@
 import type { SceneAnnotation } from "./annotationData";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import type { OptionalContentSnapshot } from "./optionalContent";
-import { getSceneAnnotationRuns, getScenePrimitiveBounds, type PrimitivePickRange, type PrimitivePoint, type PrimitiveRef } from "./scenePrimitives";
-import type { PrimitiveHighlightSet } from "./primitiveAppearance";
+import { getSceneAnnotationRuns, getScenePrimitiveBounds, isScenePrimitiveVisible, scenePrimitivePickBounds, ScenePrimitivePicker, type ScenePrimitivePickOptions, type PrimitivePickRange, type PrimitivePoint, type PrimitiveRef } from "./scenePrimitives";
+import type { PrimitiveAppearanceState, PrimitiveHighlightSet } from "./primitiveAppearance";
 import { waitForLoad } from "./loadCancellation";
 
 export interface AnnotationHit { annotationId: string; distancePx: number }
@@ -251,4 +251,79 @@ export function buildAnnotationMetadataHighlights(selected: readonly SceneAnnota
     if (index === 0) selectionCount = values.length / 8;
   }
   return values.length ? { segments: Float32Array.from(values), clipPaths: [], selectionCount, count: values.length / 8 } : null;
+}
+
+/** Shared annotation traces for native and Three hosts. */
+export function applySceneAnnotationHighlights(scene: VectorScene, index: SceneAnnotationIndex,
+  appearance: PrimitiveAppearanceState, snapshot: OptionalContentSnapshot, selected: readonly string[], hovered: string | null): void {
+  const selectedRefs: PrimitiveRef[] = [], hoveredRefs: PrimitiveRef[] = [];
+  const selectedMetadata: SceneAnnotation[] = [], hoveredMetadata: SceneAnnotation[] = [];
+  const collect = (id: string, refs: PrimitiveRef[], metadata: SceneAnnotation[]): void => {
+    const entry = index.get(id), annotations = entry.annotations.filter(annotation => isAnnotationInteractionVisible(annotation, snapshot));
+    if (!annotations.length) return;
+    if (!entry.runs.length) { for (const annotation of annotations) metadata.push(annotation); return; }
+    for (const run of entry.runs) {
+      if (!isScenePrimitiveVisible(scene, { kind: run.kind, index: run.first },
+        condition => condition === undefined || snapshot.conditions[condition] === 1)) continue;
+      for (let index = run.first; index < run.first + run.count; index++) {
+        if (selectedRefs.length + hoveredRefs.length >= 262_144) throw new RangeError("Annotation highlight exceeds its primitive budget.");
+        refs.push({ kind: run.kind, index });
+      }
+    }
+  };
+  try {
+    for (const id of selected) collect(id, selectedRefs, selectedMetadata);
+    if (hovered !== null && !selected.includes(hovered)) collect(hovered, hoveredRefs, hoveredMetadata);
+    appearance.setAnnotationHighlights(selectedRefs, hoveredRefs,
+      buildAnnotationMetadataHighlights(selectedMetadata, hoveredMetadata));
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    console.warn("[HEPR] Annotation highlight fidelity reduced; using metadata bounds.", error.message);
+    const fallbackSelected = selected.flatMap(id => index.get(id).annotations.filter(annotation => isAnnotationInteractionVisible(annotation, snapshot)));
+    const fallbackHovered = hovered !== null && !selected.includes(hovered) ?
+      index.get(hovered).annotations.filter(annotation => isAnnotationInteractionVisible(annotation, snapshot)) : [];
+    appearance.setAnnotationHighlights([], [], buildAnnotationMetadataHighlights(fallbackSelected, fallbackHovered, true));
+  }
+}
+
+/** Shared geometric/metadata picking and overlap ordering for native and Three hosts. */
+export async function pickSceneAnnotationInteraction(scene: VectorScene, index: SceneAnnotationIndex,
+  picker: ScenePrimitivePicker, context: ScenePrimitivePickOptions, snapshot: OptionalContentSnapshot,
+  includeHidden: boolean, suppressedIds: ReadonlySet<string>, check: () => void): Promise<AnnotationHit | null> {
+  const tolerance = context.tolerancePx ?? 4, query = scenePrimitivePickBounds(context, tolerance);
+  const candidates = await index.query(query, context.signal);
+  check();
+  const matches: { entry: typeof candidates[number]; annotation: SceneAnnotation; area: number }[] = [];
+  const suppressed = includeHidden ? null : suppressedIds;
+  for (const entry of candidates) for (const annotation of entry.annotations) {
+    if (!isAnnotationInteractionVisible(annotation, snapshot)) continue;
+    const page = annotation.pageIndex * 4, r = scene.pageRects, point = context.point;
+    if (point.x < r[page] || point.x > r[page + 2] || point.y < r[page + 1] || point.y > r[page + 3]) continue;
+    matches.push({ entry, annotation, area: projectedAnnotationArea(annotation, context.project) });
+  }
+  matches.sort((a, b) => a.area - b.area || b.annotation.annotationIndex - a.annotation.annotationIndex ||
+    b.annotation.pageIndex - a.annotation.pageIndex || a.annotation.id.localeCompare(b.annotation.id));
+  let best: AnnotationHit | null = null, bestArea = Infinity;
+  let lastYield = performance.now();
+  for (const { entry, annotation, area } of matches) {
+    context.signal?.throwIfAborted();
+    check();
+    if (best && area > bestArea) break;
+    let distance: number | null;
+    if (entry.runs.length) {
+      const hit = await picker.pickRanges({ ...context,
+        isConditionVisible: condition => condition === undefined || snapshot.conditions[condition] === 1 }, index.appearanceRanges(entry, query));
+      distance = hit?.distancePx ?? null;
+    } else {
+      distance = suppressed?.has(annotation.id) ? null : pickAnnotationMetadata(annotation, context.clientPoint, context.project, tolerance);
+    }
+    if (distance !== null && (!best || area < bestArea || distance < best.distancePx)) {
+      best = { annotationId: annotation.id, distancePx: distance }; bestArea = area;
+    }
+    if (performance.now() - lastYield >= 8) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0)); lastYield = performance.now();
+    }
+  }
+
+  context.signal?.throwIfAborted(); check(); return best;
 }

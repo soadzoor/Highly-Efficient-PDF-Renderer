@@ -292,5 +292,25 @@ try {
   turnedOff.clear(); event("pointermove"); window.frame();
   assert.equal(hasPointerCursor(), true); assert.equal(hostedPanel.hidden, false, "turning it back on restores hover");
   hosted.dispose();
+  const manualActivations = [];
+  const manual = createAnnotationOverlay({ getCanvas: () => canvas, adapter: hostAdapter, pointerInteraction: false,
+    onActivate: a => { manualActivations.push(a); return true; } });
+  const manualPanel = document.body.children[0];
+  event("pointermove"); event("pointerdown"); event("pointerup"); manual.onFrame(); window.frame();
+  assert.equal(manualPanel.hidden, true, "host-owned gestures do not run a second metadata picker");
+  assert.deepEqual(manualActivations, [], "host-owned clicks never activate links twice");
+  canvas.setAttribute("data-hepr-annotation-hover", "");
+  manual.show(annotations[1], { x: 20, y: 20 });
+  assert.equal(manualPanel.hidden, false); assert.equal(manualPanel.attributes.get("role"), "tooltip");
+  manual.show(annotations[1], { x: 25, y: 20 }); assert.equal(manualPanel.style.left, "37px");
+  event("pointermove", 200, 100); manual.onFrame(); window.frame();
+  assert.equal(manualPanel.hidden, false, "host determines the hovered annotation");
+  manual.hide(); assert.equal(manualPanel.hidden, true);
+  assert.equal(hasPointerCursor(), true, "manual overlay leaves the host cursor alone");
+  manual.show(annotations[0]); assert.equal(manualPanel.hidden, false, "row-selected comments do not require a client point");
+  manual.show(annotations[1]); assert.equal(manualPanel.hidden, true, "selecting an unanchored link clears the previous comment bubble");
+  manual.show(annotations[0]);
+  turnedOff.add(annotations[0].id); manual.onFrame(); assert.equal(manualPanel.hidden, true);
+  manual.dispose(); canvas.removeAttribute("data-hepr-annotation-hover");
   console.log("Annotation overlay: precise picking, safe HTML text, pinning, pointer-following links, cursor ownership, gestures, visibility, host-disabled annotations, projection and lifecycle passed.");
 } finally { hooks.deregister(); }

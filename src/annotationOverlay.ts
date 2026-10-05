@@ -20,6 +20,8 @@ export interface AnnotationOverlayOptions {
   getCanvas(): HTMLCanvasElement | null;
   adapter: AnnotationOverlayAdapter;
   enabled?: boolean;
+  /** False when a host owns geometric picking and calls show()/hide() itself. Default true. */
+  pointerInteraction?: boolean;
   /** Host-controlled activation. Return true to consume the click; only comments can pin when unhandled. */
   onActivate?(annotation: SceneAnnotation): boolean;
   /** Optional accessible action button for comments. Link previews have no interactive controls. */
@@ -32,7 +34,7 @@ export interface AnnotationOverlay {
   disable(): void;
   isEnabled(): boolean;
   /** Open a comment programmatically. Links can only preview while hovered, never pin. */
-  show(annotation: SceneAnnotation): void;
+  show(annotation: SceneAnnotation, clientPoint?: AnnotationPoint): void;
   hide(): void;
   /** Call after camera, layer or backend updates; there is no internal animation loop. */
   onFrame(): void;
@@ -191,6 +193,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   let frame = 0;
 
   function setPointerCursor(overAnnotation: boolean): void {
+    if (options.pointerInteraction === false) return;
     const canvas = overAnnotation ? options.getCanvas() : null;
     if (cursorCanvas === canvas) return;
     cursorCanvas?.removeAttribute(cursorAttribute);
@@ -266,7 +269,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     sceneChanged();
     if (active) position();
     if (suppressed() || !pointer || gesture || !scene) setPointerCursor(false);
-    else scheduleHover();
+    else if (options.pointerInteraction !== false) scheduleHover();
   }
   function insidePanel(event: Event): boolean { return !!event.target && panel.contains(event.target as Node); }
 
@@ -275,6 +278,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     clearPointer();
     if (insidePanel(event)) { if (active && !isLink(active)) pinned = true; else hide(); return; }
     if (event.target !== options.getCanvas()) { hide(); return; }
+    if (options.pointerInteraction === false) return;
     pointers.add(event.pointerId);
     if (gesture) { gesture.multiple = true; return; }
     if (event.button !== 0 || suppressed()) return;
@@ -283,6 +287,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     if (!pinned) hide();
   }, eventOptions);
   window.addEventListener("pointermove", event => {
+    if (options.pointerInteraction === false) return;
     if (gesture) {
       if (event.pointerId === gesture.id && Math.hypot(event.clientX - gesture.start.x, event.clientY - gesture.start.y) > 5) gesture.moved = true;
       return;
@@ -294,11 +299,13 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     pointer = { x: event.clientX, y: event.clientY }; scheduleHover();
   }, eventOptions);
   window.addEventListener("pointerout", event => {
+    if (options.pointerInteraction === false) return;
     if (event.target !== options.getCanvas()) return;
     clearPointer();
     if (!pinned && !panel.contains(event.relatedTarget as Node | null)) hide();
   }, eventOptions);
   window.addEventListener("pointerup", event => {
+    if (options.pointerInteraction === false) return;
     pointers.delete(event.pointerId);
     if (!gesture || gesture.id !== event.pointerId) return;
     const ended = gesture; gesture = null;
@@ -338,10 +345,13 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     enable() { if (!disposed) enabled = true; },
     disable() { enabled = false; setPointerCursor(false); hide(); },
     isEnabled: () => enabled && !disposed,
-    show(annotation) {
+    show(annotation, clientPoint) {
       sceneChanged();
+      if (options.pointerInteraction === false) pointer = clientPoint ?? null;
       if (!suppressed() && scene?.annotations?.includes(annotation) && adapter.isAnnotationEnabled?.(annotation) !== false &&
-        (!isLink(annotation) || pointer && pickSceneAnnotation(scene, pointer.x, pointer.y, adapter) === annotation)) display(annotation, true);
+        (!isLink(annotation) || pointer && (options.pointerInteraction === false ||
+          pickSceneAnnotation(scene, pointer.x, pointer.y, adapter) === annotation))) display(annotation, true);
+      else if (options.pointerInteraction === false) hide();
     },
     hide() { clearPointer(); hide(); }, onFrame, sceneChanged,
     dispose() { if (disposed) return; disposed = true; clearPointer(); lifetime.abort(); if (frame) window.cancelAnimationFrame(frame); panel.remove(); active = null; }

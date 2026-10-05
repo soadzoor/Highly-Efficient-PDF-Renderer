@@ -1,6 +1,8 @@
 import { promptForHepLod } from "./hepLodPrompt";
 import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
+import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
+import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
 import * as THREE from "three";
 import { waitForLoad } from "./loadCancellation";
 import { WebGPURenderer } from "three/webgpu";
@@ -339,6 +341,7 @@ const exampleDropdown = createExampleDropdown({
   },
   signal: lifetimeSignal
 });
+let annotationInteraction: AnnotationInteractionController | undefined;
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
   getLayerName: id => currentPdfObject?.sceneData.optionalContent?.groups.find(group => group.id === id)?.name,
@@ -351,6 +354,7 @@ const drawingSelection = createDrawingSelectionControls({
     onError: error => setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`)
   }),
   onEnabledChange: enabled => {
+    annotationInteraction?.setInteractionEnabled(!enabled);
     textSelectionCheckboxElement.disabled = enabled;
     if (enabled || !textSelectionCheckboxElement.checked) textSelection.disable();
     else textSelection.enable();
@@ -366,6 +370,7 @@ const linkNavigation = createThreeLinkNavigation({
   onCameraChange: () => { updateCameraClipping(true); requestRender(); }
 });
 const annotationOverlay = createAnnotationOverlay({
+  pointerInteraction: false,
   getCanvas: () => canvasElement,
   adapter: {
     getScene: () => currentPdfObject?.sceneData ?? null,
@@ -380,7 +385,10 @@ const annotationOverlay = createAnnotationOverlay({
   enabled: annotationBubblesCheckbox.checked
 });
 annotationBubblesCheckbox.addEventListener("change", () => {
-  if (annotationBubblesCheckbox.checked) annotationOverlay.enable(); else annotationOverlay.disable();
+  if (annotationBubblesCheckbox.checked) {
+    annotationOverlay.enable();
+    annotationInteraction?.select(annotationInteraction.getSelection());
+  } else annotationOverlay.disable();
 });
 
 const layerControls = createThreePdfLayerControls({
@@ -392,6 +400,7 @@ const layerControls = createThreePdfLayerControls({
     refreshSearchAvailability();
     runSearch(textSearchInputElement.value, false);
     drawingSelection.onFrame();
+    annotationInteraction?.onFrame();
     annotationOverlay.onFrame();
   }
 });
@@ -403,7 +412,38 @@ const annotationControls = createPdfAnnotationControls({
     setAnnotationVisibility: (ids, visible) =>
       currentPdfObject?.setAnnotationVisibility(ids, visible) ?? Promise.reject(new Error("No PDF is loaded."))
   },
-  onChange: () => annotationOverlay.onFrame()
+  onSelect: annotation => {
+    drawingSelection.disable();
+    textSelection.clearSelection();
+    annotationInteraction?.select(annotation?.id ?? null);
+  },
+  onHover: annotation => {
+    if (!drawingSelection.isEnabled()) annotationInteraction?.hover(annotation?.id ?? null);
+  },
+  onChange: () => {
+    annotationInteraction?.refresh();
+    annotationOverlay.onFrame();
+  }
+});
+annotationInteraction = createAnnotationInteractionController({
+  adapter: createThreeAnnotationInteractionAdapter({
+    getCanvas: () => canvasElement, getCamera: () => camera, getPdfObject: () => currentPdfObject, requestRender
+  }),
+  isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+  onSelectionChange: (annotation, source, point) => {
+    annotationControls.selectAnnotation(annotation?.id ?? null, { reveal: source === "canvas" });
+    if (source === "canvas" && annotation && annotationControls.isAnnotationEnabled(annotation) && linkNavigation.activate(annotation)) {
+      annotationOverlay.hide();
+    } else if (annotation && annotationBubblesCheckbox.checked && annotationControls.isAnnotationEnabled(annotation)) {
+      annotationOverlay.show(annotation, point);
+    } else annotationOverlay.hide();
+  },
+  onHoverChange: (annotation, point) => {
+    if (annotationInteraction?.getSelection()) return;
+    if (annotation && annotationBubblesCheckbox.checked && annotationControls.isAnnotationEnabled(annotation)) annotationOverlay.show(annotation, point);
+    else annotationOverlay.hide();
+  },
+  onError: error => setStatus(`Annotation selection failed: ${error instanceof Error ? error.message : String(error)}`)
 });
 
 initializeBackendSelect();
@@ -564,6 +604,7 @@ async function ensureThreeRendererBackend(
   updatePerspectiveCameraProjection();
   updateCameraClipping();
   drawingSelection.rendererChanged();
+  annotationInteraction?.refresh();
   requestRender();
 }
 
@@ -594,6 +635,7 @@ function renderFrame(now: number = performance.now()): void {
   if (profile) recordCaptureCounters(profile, drawCalls, controlsChanged);
   profile?.beginSection("overlays");
   drawingSelection.onFrame();
+  annotationInteraction?.onFrame();
   annotationOverlay.onFrame();
   textSelection.updateOverlay();
   profile?.endSection("overlays");
@@ -1311,6 +1353,7 @@ function disposeExample(): void {
   captureProfiler = null;
   layerControls.dispose();
   annotationControls.dispose();
+  annotationInteraction?.dispose();
   drawingSelection.dispose();
   annotationOverlay.dispose();
   linkNavigation.dispose();
@@ -1631,6 +1674,7 @@ function replacePdfObject(
   } else drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
   annotationControls.sceneChanged();
+  annotationInteraction?.refresh();
   updateDrawStatsMeter();
   setDownloadDataButtonState(true);
   refreshSearchAvailability();
@@ -1660,6 +1704,7 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
   annotationControls.sceneChanged();
+  annotationInteraction?.sceneChanged();
   releasePdfObject(previousObject);
   lastNativeDrawStats = null;
   if (clearMetrics) {

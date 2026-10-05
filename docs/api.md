@@ -663,7 +663,7 @@ NoZoom and NoRotate appearances, including most sticky-note icons, keep their
 page geometry and scale with the page instead of forcing the page into a
 raster; `annotation.view-transform-approximated` reports this.
 
-`createPdfAnnotationControls({ container, controller, onChange? })` mounts the
+`createPdfAnnotationControls({ container, controller, onChange?, onSelect?, onHover? })` mounts the
 reusable **Annotations** panel used by all three demos. It lists every annotation
 except popups and Invisible, Hidden or NoView annotations, each with a checkbox.
 Turning one off hides its appearance through `controller.setAnnotationVisibility`.
@@ -704,6 +704,26 @@ panel's choices to the new renderer. With a filter active, **All** affects only 
 matching annotations. A failed change shows an error in the panel and returns the
 checkbox to the applied state. The panel exposes CSS classes under
 `.pdf-annotations`; `pdfLayerControls.css` includes them.
+
+Pass `onSelect(annotation | null)` to give each row a selection button separate
+from its visibility checkbox and add **Clear selection**. `onHover(annotation | null)`
+reports row hover and keyboard focus. Use these callbacks with
+`pdf.setAnnotationSelection(annotation ? [annotation.id] : null)` and
+`pdf.setAnnotationHover(annotation?.id ?? null)`. After a canvas `pickAnnotation()`
+hit, call `annotations.selectAnnotation(hit?.annotationId ?? null, { reveal: true })`.
+This updates the selected row without calling `onSelect`, opens the panel, clears
+a filter that excludes the hit, and includes the selected row within the 500-row
+limit. `getSelection()` returns the selected ID or null.
+
+The native and Three examples wire both directions and hover traces. Canvas
+picking includes hidden appearances and annotations without compiled paint;
+PDF visibility flags and document layers still apply. Choosing a row exits
+Drawing Selection, and canvas picking pauses during drawing or text selection
+gestures. Renderer replacement preserves selection for the same document.
+The demos use `createAnnotationOverlay({ pointerInteraction: false, ... })` to
+let the host's geometric picker own gestures and call `show(annotation, clientPoint?)`
+and `hide()`; a client point anchors link previews. The default overlay continues
+to handle its own metadata picking when this option is omitted.
 
 ### Drawing primitives
 

@@ -15,6 +15,9 @@ export interface PdfAnnotationControlsOptions {
   controller: PdfAnnotationControlsController;
   /** After annotations are turned on or off, for example to refresh the annotation overlay. */
   onChange?(): void;
+  /** Selecting a row is independent of its appearance checkbox. null clears selection. */
+  onSelect?(annotation: SceneAnnotation | null): void;
+  onHover?(annotation: SceneAnnotation | null): void;
 }
 
 interface Entry { annotation: SceneAnnotation; text: string; title: string; search: string }
@@ -44,11 +47,12 @@ function describe(annotation: SceneAnnotation): Entry {
  * appearance through the controller; pass `isAnnotationEnabled` to the
  * annotation overlay adapter so its bubble or link stops responding too.
  */
-export function createPdfAnnotationControls({ container, controller, onChange }: PdfAnnotationControlsOptions) {
+export function createPdfAnnotationControls({ container, controller, onChange, onSelect, onHover }: PdfAnnotationControlsOptions) {
   const document = container.ownerDocument;
   container.innerHTML = `<details class="pdf-annotations"><summary>Annotations</summary>
     <label class="pdf-annotations-all"><input type="checkbox" /><span>All</span></label>
     <label class="pdf-annotations-filter">Filter annotations<input type="search" placeholder="Type, page, text or author" aria-label="Filter annotations" /></label>
+    <button class="pdf-annotations-clear" type="button" disabled>Clear selection</button>
     <div class="pdf-annotations-list"></div>
     <div class="pdf-annotations-status" role="status" aria-live="polite"></div></details>`;
   const allLabel = container.querySelector<HTMLLabelElement>(".pdf-annotations-all")!;
@@ -58,7 +62,12 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
   const filter = container.querySelector<HTMLInputElement>(".pdf-annotations-filter input")!;
   const list = container.querySelector<HTMLDivElement>(".pdf-annotations-list")!;
   const status = container.querySelector<HTMLDivElement>(".pdf-annotations-status")!;
-  const checkboxes = new Map<string, HTMLInputElement>();
+  const details = container.querySelector<HTMLDetailsElement>(".pdf-annotations")!;
+  const clear = container.querySelector<HTMLButtonElement>(".pdf-annotations-clear")!;
+  clear.hidden = !onSelect;
+  const checkboxes = new Map<string, HTMLInputElement[]>();
+  const buttons = new Map<string, HTMLButtonElement[]>();
+  let selected: string | null = null;
   let scene: VectorScene | null = null;
   let entries: Entry[] = [];
   let matching: Entry[] = [];
@@ -72,7 +81,9 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
     const off = matching.filter(entry => hidden.has(entry.annotation.id)).length;
     all.checked = matching.length > 0 && off === 0;
     all.indeterminate = off > 0 && off < matching.length;
-    for (const [id, checkbox] of checkboxes) checkbox.checked = !hidden.has(id);
+    for (const [id, inputs] of checkboxes) for (const checkbox of inputs) checkbox.checked = !hidden.has(id);
+    for (const [id, rows] of buttons) for (const button of rows) button.setAttribute("aria-pressed", String(id === selected));
+    clear.disabled = selected === null;
   }
 
   async function request(ids: readonly string[], visible: boolean): Promise<void> {
@@ -127,9 +138,14 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
     allLabel.title = needle
       ? "Turn every annotation that matches the filter on or off, including ones beyond the list limit."
       : "Turn every annotation on or off, including ones beyond the list limit.";
+    if (buttons.size) onHover?.(null);
     checkboxes.clear();
+    buttons.clear();
     list.replaceChildren();
-    for (const entry of matching.slice(0, MAX_ROWS)) {
+    const shown = matching.slice(0, MAX_ROWS);
+    const chosen = matching.find(entry => entry.annotation.id === selected);
+    if (chosen && !shown.includes(chosen)) shown[shown.length - 1] = chosen;
+    for (const entry of shown) {
       const { annotation } = entry;
       const row = document.createElement("div");
       row.className = "pdf-annotation-row";
@@ -138,11 +154,26 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.addEventListener("change", () => apply([annotation.id], checkbox.checked));
-      checkboxes.set(annotation.id, checkbox);
+      const inputs = checkboxes.get(annotation.id) ?? [];
+      inputs.push(checkbox); checkboxes.set(annotation.id, inputs);
       const name = document.createElement("span");
       name.textContent = entry.text;
-      label.append(checkbox, name);
-      row.append(label);
+      if (onSelect) {
+        label.className = "pdf-annotation-visibility";
+        checkbox.setAttribute("aria-label", `Show ${entry.text}`);
+        label.append(checkbox);
+        const button = document.createElement("button");
+        button.type = "button"; button.className = "pdf-annotation-select"; button.title = entry.title;
+        button.append(name);
+        button.addEventListener("click", () => { selectAnnotation(annotation.id); onSelect(annotation); });
+        button.addEventListener("pointerenter", () => onHover?.(annotation));
+        button.addEventListener("pointerleave", () => onHover?.(null));
+        button.addEventListener("focus", () => onHover?.(annotation));
+        button.addEventListener("blur", () => onHover?.(null));
+        const rows = buttons.get(annotation.id) ?? [];
+        rows.push(button); buttons.set(annotation.id, rows);
+        row.append(label, button);
+      } else { label.append(checkbox, name); row.append(label); }
       list.append(row);
     }
     if (!entries.length) list.textContent = "This document has no annotations.";
@@ -170,6 +201,7 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
       return;
     }
     scene = next;
+    selected = null;
     generation++;
     operations = 0;
     filter.value = "";
@@ -181,6 +213,19 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
   }
 
   const toggleAll = (): void => apply(matching.map(entry => entry.annotation.id), all.checked);
+  function selectAnnotation(id: string | null, options: { reveal?: boolean } = {}): void {
+    if (disposed) return;
+    if (id !== null && !entries.some(entry => entry.annotation.id === id)) throw new RangeError(`Unknown listed annotation: ${id}`);
+    selected = id;
+    if (id !== null && options.reveal) {
+      details.open = true;
+      if (!matching.some(entry => entry.annotation.id === id)) filter.value = "";
+      render();
+      buttons.get(id)?.[0]?.scrollIntoView({ block: "nearest" });
+    } else sync();
+  }
+  const clearSelection = (): void => { selectAnnotation(null); onHover?.(null); onSelect?.(null); };
+  clear.addEventListener("click", clearSelection);
   all.addEventListener("change", toggleAll);
   filter.addEventListener("input", render);
   sceneChanged();
@@ -191,12 +236,17 @@ export function createPdfAnnotationControls({ container, controller, onChange }:
     },
     /** Call after replacing the document, its renderer or its PDF object. */
     sceneChanged,
+    /** Update the list from a canvas hit without triggering onSelect again. */
+    selectAnnotation,
+    getSelection: () => selected,
     dispose(): void {
       if (disposed) return;
       disposed = true; generation++;
       all.removeEventListener("change", toggleAll);
       filter.removeEventListener("input", render);
+      clear.removeEventListener("click", clearSelection);
       checkboxes.clear();
+      buttons.clear();
       container.replaceChildren();
     }
   };
