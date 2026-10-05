@@ -736,11 +736,21 @@ function testMacintoshSymbolCmap() {
   // character codes through its (1,0) subtable. LibreOffice embeds its subset fonts
   // this way (Flags 4, no /Encoding, a single (1,0) cmap).
   const fixture = buildFixture();
-  const macOnly = cloneTables(fixture.tables);
-  macOnly.set("cmap", buildCmap([{ platform: 1, encoding: 0, bytes: cmapFormat0([[0x03, 2]]) }]));
-  const macFont = NativeSfntFont.parse(buildSfnt(macOnly));
-  assert.equal(macFont.mapSymbolCode(0x03), 2, "(1,0) is the symbol cmap when (3,0) is absent");
-  assert.equal(macFont.mapCodePoint(0x03), 0, "(1,0) is never treated as a Unicode cmap");
+  for (const [format, bytes] of [
+    [0, cmapFormat0([[0x03, 2], [0xff, 1]])],
+    [4, cmapFormat4([[0x03, 2], [0xff, 1]])],
+    [6, cmapFormat6(0x03, Array.from({ length: 253 }, (_, index) => index === 0 ? 2 : index === 252 ? 1 : 0))]
+  ]) {
+    const macOnly = cloneTables(fixture.tables);
+    macOnly.set("cmap", buildCmap([{ platform: 1, encoding: 0, bytes }]));
+    const macFont = NativeSfntFont.parse(buildSfnt(macOnly));
+    assert.equal(macFont.mapSymbolCode(0x03), 2, `Macintosh format ${format} selects the symbol glyph`);
+    assert.equal(macFont.mapSymbolCode(0xff), 1, `Macintosh format ${format} accepts the highest byte`);
+    assert.equal(macFont.mapSymbolCode(0x04), 0, "unmapped symbol codes select .notdef");
+    assert.equal(macFont.mapSymbolCode(0x100), 0, "symbol codes are limited to single bytes");
+    assert.equal(macFont.mapCodePoint(0x03), 0, "(1,0) is never treated as a Unicode cmap");
+    assert.equal(macFont.mapCodePoint(0xff), 0, "high-byte Macintosh codes are not Unicode");
+  }
 
   const both = cloneTables(fixture.tables);
   both.set("cmap", buildCmap([
@@ -756,6 +766,7 @@ function testMacintoshSymbolCmap() {
   ]));
   assert.equal(NativeSfntFont.parse(buildSfnt(withUnicode)).mapCodePoint(0x41), 1, "(3,1) stays the Unicode cmap");
 }
+
 function buildFixture() {
   const { glyf, offsets } = buildGlyphTable();
   const numGlyphs = offsets.length - 1;

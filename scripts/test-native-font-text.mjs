@@ -191,11 +191,69 @@ assert.deepEqual(compoundOutline.bounds, [50, 0, 150, 100]);
 assert.equal(compoundOutline.commands[0].x, 50);
 
 await testMissingFontResolution();
+await testEmbeddedMacintoshSymbolFont();
 await testFixedPitchInferenceFromWidths();
 await testStandard14AdvanceMetrics();
 
 console.log("native font/text tests passed");
 hooks.deregister();
+
+async function testEmbeddedMacintoshSymbolFont() {
+  // Synthetic LibreOffice-style subset: symbolic TrueType, no PDF Encoding,
+  // and only a Macintosh (1,0) cmap mapping raw bytes to embedded glyphs.
+  const dictionary = new Map([
+    ["Subtype", name("TrueType")],
+    ["BaseFont", name("ABCDEF+FixtureSymbol")],
+    ["FirstChar", 3],
+    ["Widths", [620, 730]],
+    ["FontDescriptor", new Map([
+      ["Flags", 4],
+      ["MissingWidth", 510],
+      ["FontFile2", stream(buildTinySfnt(buildMacintoshSymbolCmap()))]
+    ])],
+    ["ToUnicode", stream(`
+      1 begincodespacerange <00> <ff> endcodespacerange
+      3 beginbfchar <03> <0041> <04> <03a9> <ff> <00660069> endbfchar
+    `)]
+  ]);
+  const font = await parseNativePdfFont(dictionary, resolver, {
+    missingFontResolver() {
+      assert.fail("an embedded Macintosh cmap must not require font substitution");
+    }
+  });
+  for (const [code, glyphId, unicode, width] of [
+    [0x03, 2, "A", 620],
+    [0x04, 1, "Ω", 730],
+    [0xff, 2, "fi", 510]
+  ]) {
+    const mapped = font.decode(Uint8Array.of(code));
+    assert.equal(mapped.codeByteLength, 1);
+    assert.equal(mapped.glyphId, glyphId, "raw PDF codes select embedded glyphs");
+    assert.equal(mapped.unicode, unicode, "ToUnicode supplies independent extraction text");
+    assert.equal(mapped.width, width, "PDF widths remain independent of sfnt glyph metrics");
+    assert.equal(font.getGlyphOutline(mapped.glyphId).commands[0].kind, "move");
+  }
+  assert.equal(font.decode(Uint8Array.of(0x05)).glyphId, 0, "unmapped codes select .notdef");
+
+  const withoutToUnicode = new Map(dictionary);
+  withoutToUnicode.delete("ToUnicode");
+  const rawFont = await parseNativePdfFont(withoutToUnicode, resolver);
+  assert.equal(rawFont.decode(Uint8Array.of(0x03)).glyphId, 2, "glyph selection does not require ToUnicode");
+  assert.equal(rawFont.decode(Uint8Array.of(0x03)).unicode, null);
+
+  const text = new NativeTextCompiler({
+    fonts: new Map([["F1", { font, fontIndex: 0 }]])
+  });
+  text.beginText();
+  text.setFont("F1", 10);
+  text.showText(Uint8Array.of(0x03, 0x04, 0xff));
+  text.endText();
+  const compiled = text.build();
+  assert.deepEqual([...compiled.glyphs.characterCodes], [0x03, 0x04, 0xff]);
+  assert.deepEqual([...compiled.glyphs.glyphIds], [2, 1, 2]);
+  assert.equal(compiled.textIndex.text, "AΩfi");
+  assert.deepEqual([...compiled.textIndex.charGlyphIndices], [0, 1, 2, 2]);
+}
 
 async function testStandard14AdvanceMetrics() {
   for (const [baseFont, expectedFace] of [
@@ -595,7 +653,20 @@ function makeCffSfnt(sfntBytes) {
   throw new Error("tiny sfnt has no glyf table");
 }
 
-function buildTinySfnt() {
+function buildMacintoshSymbolCmap() {
+  const bytes = new Uint8Array(12 + 262);
+  const view = new DataView(bytes.buffer);
+  view.setUint16(2, 1, false);
+  view.setUint16(4, 1, false);
+  view.setUint32(8, 12, false);
+  view.setUint16(14, 262, false);
+  bytes[18 + 0x03] = 2;
+  bytes[18 + 0x04] = 1;
+  bytes[18 + 0xff] = 2;
+  return bytes;
+}
+
+function buildTinySfnt(cmapOverride = null) {
   const head = new Uint8Array(54);
   const headView = new DataView(head.buffer);
   headView.setUint16(18, 1000, false);
@@ -683,7 +754,7 @@ function buildTinySfnt() {
   cmapTable.set(cmapSubtable, 12);
 
   const tables = new Map([
-    ["cmap", cmapTable],
+    ["cmap", cmapOverride ?? cmapTable],
     ["glyf", glyf],
     ["head", head],
     ["hhea", hhea],
