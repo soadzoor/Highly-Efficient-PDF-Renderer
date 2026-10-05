@@ -9,6 +9,7 @@ import { WebGpuPaintFolds } from "./webGpuPaintFold";
 import { WebGpuFrameTimer } from "./webGpuFrameTimer";
 import { RenderPerformanceProfiler } from "./renderPerformance";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
+import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, type RasterTile } from "./rasterTiles";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
 import { WebGpuPaintCompositor, beginPdfManagedRenderPass } from "./webGpuPaintCompositor";
@@ -85,10 +86,25 @@ import { sceneStrokeRecords, strokeTextureRows, type StrokeRecordField, type Str
 
 type FrameListener = (stats: DrawStats) => void;
 
-interface WebGpuRasterLayerResource {
+interface WebGpuRasterTileResource {
   texture: any;
   uniformBuffer: any;
   bindGroup: any;
+}
+
+interface RasterLayerSource {
+  opacity?: number;
+  width: number;
+  height: number;
+  data: Uint8Array<ArrayBufferLike>;
+  matrix: Float32Array;
+  paintOrder?: number;
+  pageIndex?: number;
+}
+
+interface WebGpuRasterLayerResource extends WebGpuRasterTileResource {
+  /** Further tiles of an image larger than one texture; the layer's own fields draw the first. */
+  extraTiles?: WebGpuRasterTileResource[];
   paintOrder: number;
   pageIndex: number;
 }
@@ -166,8 +182,8 @@ const CAMERA_UNIFORM_BUFFER_BYTES = 96;
 const VECTOR_COMPOSITE_UNIFORM_FLOATS = 4;
 const VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES = 16;
 
-const RASTER_UNIFORM_FLOATS = 8;
-const RASTER_UNIFORM_BUFFER_BYTES = 32;
+const RASTER_UNIFORM_FLOATS = 16;
+const RASTER_UNIFORM_BUFFER_BYTES = 64;
 
 const WGSL_OUTPUT_COLOR_HELPERS = /* wgsl */ `
 fn heprEncodeOutputColor(color : vec4f) -> vec4f {
@@ -875,6 +891,9 @@ struct CameraUniforms {
 struct RasterUniforms {
   matrixA : vec4f,
   matrixB : vec4f,
+  // A tile's part of the image's unit square, and the same corners in its texture.
+  quad : vec4f,
+  uv : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -923,9 +942,13 @@ ${pageBackgrounds ? `
   let e = uRaster.matrixB.x;
   let f = uRaster.matrixB.y;
 
+  // Corners select, never interpolate, so neighboring tiles share exact edges.
+  let farCorner = localTopDown > vec2f(0.5);
+  let tileCorner = select(uRaster.quad.xy, uRaster.quad.zw, farCorner);
+  let tileUv = select(uRaster.uv.xy, uRaster.uv.zw, farCorner);
   let world = vec2f(
-    a * localTopDown.x + c * localTopDown.y + e,
-    b * localTopDown.x + d * localTopDown.y + f
+    a * tileCorner.x + c * tileCorner.y + e,
+    b * tileCorner.x + d * tileCorner.y + f
   );
 `}
 
@@ -934,7 +957,7 @@ ${pageBackgrounds ? `
 
   var out : VsOut;
   out.position = vec4f(clip, 0.0, 1.0);
-  out.uv = localTopDown;
+  out.uv = ${pageBackgrounds ? "localTopDown" : "tileUv"};
   out.world = world;
   return out;
 }
@@ -1885,8 +1908,13 @@ export class WebGpuFloorplanRenderer {
     }
 
     // Timestamp queries cost nothing until a performance capture asks for them.
-    const device = await adapter.requestDevice(adapter.features?.has?.("timestamp-query")
-      ? { requiredFeatures: ["timestamp-query"] } : undefined);
+    // Devices default to 8192 texels per side; large images need fewer tiles
+    // when the device exposes what the adapter supports, as WebGL does.
+    const maxTextureDimension2D = Number(adapter.limits?.maxTextureDimension2D);
+    const device = await adapter.requestDevice({
+      ...(adapter.features?.has?.("timestamp-query") ? { requiredFeatures: ["timestamp-query"] } : {}),
+      ...(maxTextureDimension2D > 8192 ? { requiredLimits: { maxTextureDimension2D } } : {})
+    });
     let context: any = null;
     try {
       if (typeof device.addEventListener === "function") {
@@ -2253,20 +2281,18 @@ export class WebGpuFloorplanRenderer {
     updates = new Map(updates);
     const source = this.scene;
     if (!source || this.isDisposed) throw new Error("No active scene for raster replacement.");
-    validateRasterLayerUpdates(source, updates, this.maxTextureSize());
+    validateRasterLayerUpdates(source, updates);
     const prepared = new Map<number, WebGpuRasterLayerResource>();
     let finished = false;
     const release = (): void => {
-      for (const value of prepared.values()) { value.texture.destroy(); value.uniformBuffer.destroy(); }
+      for (const value of prepared.values()) destroyRasterLayerResource(value);
       prepared.clear();
     };
     let uploaded = false;
     const stage = (): void => {
       for (const [index, layer] of updates) {
         if ((this.rasterLayerUpdates.get(index) ?? source.rasterLayers[index]) !== layer) {
-          const texture = this.createRgba8Texture(layer.width, layer.height, premultiplyRgba(layer.data));
-          try { prepared.set(index, this.createRasterLayerResource(layer.matrix, texture, layer.paintOrder, layer.pageIndex, layer.opacity)); }
-          catch (error) { texture.destroy(); throw error; }
+          prepared.set(index, this.createRasterLayerResource(layer, index));
         }
       }
       uploaded = true;
@@ -2285,7 +2311,7 @@ export class WebGpuFloorplanRenderer {
         }
         for (const [index, next] of prepared) {
           const value = this.rasterLayerResources[index];
-          if (value) { value.texture.destroy(); value.uniformBuffer.destroy(); }
+          if (value) destroyRasterLayerResource(value);
           this.rasterLayerResources[index] = next;
         }
         prepared.clear();
@@ -3579,9 +3605,7 @@ export class WebGpuFloorplanRenderer {
         if (resource) {
           pass.setPipeline(this.rasterPipeline);
           this.bindVectorClip(pass);
-          pass.setBindGroup(0, resource.bindGroup);
-          pass.draw(4, 1, 0, 0);
-          this.frameDrawCalls += 1;
+          this.drawRasterLayerResource(pass, resource);
         }
       } else if (command.kind === "gradient-fill") {
         if (this.fillRenderingEnabled) {
@@ -3656,11 +3680,21 @@ export class WebGpuFloorplanRenderer {
         }
         const layer = this.rasterLayerResources[command.index];
         if (layer) {
-          pass.setBindGroup(0, layer.bindGroup);
-          pass.draw(4, 1, 0, 0);
-          this.frameDrawCalls += 1;
+          this.drawRasterLayerResource(pass, layer);
         }
       }
+    }
+  }
+
+  /** Tiles of one image never overlap, so each draws with the image's pipeline and clip. */
+  private drawRasterLayerResource(pass: any, resource: WebGpuRasterLayerResource): void {
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.draw(4, 1, 0, 0);
+    this.frameDrawCalls += 1;
+    for (const tile of resource.extraTiles ?? []) {
+      pass.setBindGroup(0, tile.bindGroup);
+      pass.draw(4, 1, 0, 0);
+      this.frameDrawCalls += 1;
     }
   }
 
@@ -3766,9 +3800,7 @@ export class WebGpuFloorplanRenderer {
             if (resource) {
               pass.setPipeline(multiplyPass === undefined ? this.rasterPipeline : this.multiplyPipeline(this.rasterPipeline, multiplyPass));
               this.bindVectorClip(pass);
-              pass.setBindGroup(0, resource.bindGroup);
-              pass.draw(4, 1, 0, 0);
-              this.frameDrawCalls += 1;
+              this.drawRasterLayerResource(pass, resource);
             }
           } else if (run.kind === "gradient-fill" && this.fillRenderingEnabled) {
             this.drawGradientFillIntoPass(pass, index);
@@ -4431,38 +4463,12 @@ export class WebGpuFloorplanRenderer {
   private configureRasterLayers(scene: VectorScene): void {
     const rasterSources = this.getSceneRasterLayers(scene);
     const maxRasterTextureSize = this.maxTextureSize();
-    for (const [index, source] of rasterSources.entries()) {
-      if (source.width > maxRasterTextureSize || source.height > maxRasterTextureSize) {
-        throw new Error(
-          `Raster layer ${index} requires a ${source.width}x${source.height} texture, ` +
-          `but this WebGPU device supports at most ${maxRasterTextureSize}x${maxRasterTextureSize}.`
-        );
-      }
-    }
 
     this.destroyRasterLayerResources();
 
     try {
-      for (const source of rasterSources) {
-        const matrix = new Float32Array(6);
-        if (source.matrix.length >= 6) {
-          matrix.set(source.matrix.subarray(0, 6));
-        } else {
-          matrix[0] = 1;
-          matrix[3] = 1;
-        }
-
-        const rgba = source.data.subarray(0, source.width * source.height * 4);
-        const premultiplied = premultiplyRgba(rgba);
-        const texture = this.createRgba8Texture(source.width, source.height, premultiplied);
-        try {
-          this.rasterLayerResources.push(
-            this.createRasterLayerResource(matrix, texture, source.paintOrder, source.pageIndex, source.opacity)
-          );
-        } catch (error) {
-          texture.destroy();
-          throw error;
-        }
+      for (const [index, source] of rasterSources.entries()) {
+        this.rasterLayerResources.push(this.createRasterLayerResource(source, index));
       }
       // Replayed replacements own their individual resources. They can no
       // longer use an atlas built from the immutable source scene.
@@ -4728,14 +4734,7 @@ export class WebGpuFloorplanRenderer {
 
   private destroyRasterLayerResources(): void {
     this.destroyRasterStripResources();
-    for (const layer of this.rasterLayerResources) {
-      if (layer.texture) {
-        layer.texture.destroy();
-      }
-      if (layer.uniformBuffer) {
-        layer.uniformBuffer.destroy();
-      }
-    }
+    for (const layer of this.rasterLayerResources) destroyRasterLayerResource(layer);
     this.rasterLayerResources = [];
   }
 
@@ -4819,13 +4818,45 @@ export class WebGpuFloorplanRenderer {
     this.writeRgba8Texture(this.pageBackgroundTexture, 1, 1, rgba, 0);
   }
 
-  private createRasterLayerResource(
-    matrix: Float32Array,
-    texture: any,
-    paintOrder = 0,
-    pageIndex = 0,
-    opacity = 1
-  ): WebGpuRasterLayerResource {
+  /** Upload one image, as tiles when it exceeds this device's texture limit. */
+  private createRasterLayerResource(source: RasterLayerSource, index: number): WebGpuRasterLayerResource {
+    const matrix = new Float32Array(6);
+    if (source.matrix.length >= 6) {
+      matrix.set(source.matrix.subarray(0, 6));
+    } else {
+      matrix[0] = 1;
+      matrix[3] = 1;
+    }
+    const maxTextureSize = this.maxTextureSize();
+    const plan = planRasterTiles(source.width, source.height, maxTextureSize);
+    reportRasterTileDownscale(index, source, plan, maxTextureSize);
+    const pixels = rasterTilePixels(source, plan);
+    const tiles: WebGpuRasterTileResource[] = [];
+    try {
+      for (const [tileIndex, tile] of plan.tiles.entries()) {
+        const texture = this.createRgba8Texture(tile.width, tile.height, pixels[tileIndex]);
+        try {
+          tiles.push(this.createRasterTileResource(matrix, texture, source.opacity ?? 1, tile));
+        } catch (error) {
+          texture.destroy();
+          throw error;
+        }
+      }
+    } catch (error) {
+      for (const tile of tiles) destroyRasterTileResource(tile);
+      throw error;
+    }
+    const paintOrder = source.paintOrder ?? 0, pageIndex = source.pageIndex ?? 0;
+    const [first, ...extraTiles] = tiles;
+    return {
+      ...first,
+      ...(extraTiles.length > 0 ? { extraTiles } : {}),
+      paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
+      pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
+    };
+  }
+
+  private createRasterTileResource(matrix: Float32Array, texture: any, opacity: number, tile: RasterTile): WebGpuRasterTileResource {
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
     rasterUniforms[0] = matrix[0];
@@ -4836,6 +4867,8 @@ export class WebGpuFloorplanRenderer {
     rasterUniforms[5] = matrix[5];
     rasterUniforms[6] = opacity;
     rasterUniforms[7] = 0;
+    rasterUniforms.set(tile.quad, 8);
+    rasterUniforms.set(tile.uv, 12);
     assertUniformBufferSizeMatches(rasterUniforms, RASTER_UNIFORM_BUFFER_BYTES, "raster");
 
     const uniformBuffer = this.gpuDevice.createBuffer({
@@ -4867,13 +4900,7 @@ export class WebGpuFloorplanRenderer {
         ]
       });
 
-      return {
-        texture,
-        uniformBuffer,
-        bindGroup,
-        paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
-        pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
-      };
+      return { texture, uniformBuffer, bindGroup };
     } catch (error) {
       try {
         uniformBuffer.destroy();
@@ -5396,6 +5423,16 @@ export class WebGpuFloorplanRenderer {
   }
 }
 
+function destroyRasterTileResource(tile: WebGpuRasterTileResource): void {
+  tile.texture?.destroy();
+  tile.uniformBuffer?.destroy();
+}
+
+function destroyRasterLayerResource(layer: WebGpuRasterLayerResource): void {
+  destroyRasterTileResource(layer);
+  for (const tile of layer.extraTiles ?? []) destroyRasterTileResource(tile);
+}
+
 function createPaddedByteTextureData(source: Uint8Array, width: number, height: number, bytesPerPixel = 4): Uint8Array {
   const expectedLength = width * height * bytesPerPixel;
   if (source.length > expectedLength) {
@@ -5405,35 +5442,6 @@ function createPaddedByteTextureData(source: Uint8Array, width: number, height: 
   const padded = new Uint8Array(expectedLength);
   padded.set(source);
   return padded;
-}
-
-function premultiplyRgba(source: Uint8Array): Uint8Array {
-  const out = new Uint8Array(source.length);
-  for (let i = 0; i + 3 < source.length; i += 4) {
-    const alpha = source[i + 3];
-    if (alpha <= 0) {
-      out[i] = 0;
-      out[i + 1] = 0;
-      out[i + 2] = 0;
-      out[i + 3] = 0;
-      continue;
-    }
-
-    if (alpha >= 255) {
-      out[i] = source[i];
-      out[i + 1] = source[i + 1];
-      out[i + 2] = source[i + 2];
-      out[i + 3] = 255;
-      continue;
-    }
-
-    const scale = alpha / 255;
-    out[i] = Math.round(source[i] * scale);
-    out[i + 1] = Math.round(source[i + 1] * scale);
-    out[i + 2] = Math.round(source[i + 2] * scale);
-    out[i + 3] = alpha;
-  }
-  return out;
 }
 
 function packNormalizedUint8TextureData(source: Float32Array, texelCount: number): Uint8Array {

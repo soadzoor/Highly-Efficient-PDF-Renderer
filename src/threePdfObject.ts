@@ -2781,6 +2781,8 @@ export class HeprThreePdfObject extends THREE.Group {
 
   private hostSupportsRasterTextures(renderer: ThreeHostRenderer): boolean {
     const maxTextureSize = readThreeRendererMaxTextureSize(renderer);
+    // Images larger than the host allows are tiled before their first upload.
+    this.rasterMaterialLayer.setMaxTextureSize(maxTextureSize);
     return this.rasterMaterialLayer.getMaxRasterTextureDimension() <= maxTextureSize;
   }
 

@@ -4,6 +4,7 @@ import { VECTOR_CELL_COVERAGE_GLSL } from "./vectorCellShaders";
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
+import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale } from "./rasterTiles";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
 import { buildGradientMeshRenderData } from "./gradientMesh";
 import { GRADIENT_MESH_VERTEX_GLSL, GRADIENT_MESH_FRAGMENT_GLSL } from "./gradientMeshShaders";
@@ -918,6 +919,10 @@ layout(location = 1) in vec4 aPageRect;
 #else
 uniform vec4 uRasterMatrixABCD;
 uniform vec2 uRasterMatrixEF;
+// A tile's part of the image's unit square, and the same corners in its
+// texture. Left unset (zero), they draw the whole image from one texture.
+uniform vec4 uRasterQuad;
+uniform vec4 uRasterUv;
 #endif
 uniform vec2 uViewport;
 uniform vec2 uCameraCenter;
@@ -931,6 +936,7 @@ out vec2 vWorld;
 void main() {
   vec2 corner01 = aCorner * 0.5 + 0.5;
   vec2 localTopDown = vec2(corner01.x, 1.0 - corner01.y);
+  vec2 uv = localTopDown;
 
 #ifdef INSTANCED_PAGE_BACKGROUNDS
   vec2 world = aPageRect.xy + aPageRect.zw * localTopDown;
@@ -942,9 +948,17 @@ void main() {
   float e = uRasterMatrixEF.x;
   float f = uRasterMatrixEF.y;
 
+  bool wholeImage = uRasterQuad == vec4(0.0);
+  vec4 quad = wholeImage ? vec4(0.0, 0.0, 1.0, 1.0) : uRasterQuad;
+  vec4 tileUv = wholeImage ? vec4(0.0, 0.0, 1.0, 1.0) : uRasterUv;
+  // Corners select, never interpolate, so neighboring tiles share exact edges.
+  bvec2 farCorner = greaterThan(localTopDown, vec2(0.5));
+  vec2 tileCorner = mix(quad.xy, quad.zw, farCorner);
+  uv = mix(tileUv.xy, tileUv.zw, farCorner);
+
   vec2 world = vec2(
-    a * localTopDown.x + c * localTopDown.y + e,
-    b * localTopDown.x + d * localTopDown.y + f
+    a * tileCorner.x + c * tileCorner.y + e,
+    b * tileCorner.x + d * tileCorner.y + f
   );
 #endif
 
@@ -956,7 +970,7 @@ void main() {
     gl_Position = vec4(clip, 0.0, 1.0);
   }
   vWorld = world;
-  vUv = localTopDown;
+  vUv = uv;
 }
 `;
 
@@ -1220,13 +1234,33 @@ export interface WebGlFloorplanRendererOptions {
 
 type FrameListener = (stats: DrawStats) => void;
 
-interface RasterLayerGpu {
-  opacity: number;
+interface RasterTileGpu {
   texture: WebGLTexture;
+  /** This tile's part of the image's unit square and its texture coordinates; absent for a whole image. */
+  quad?: Float32Array;
+  uv?: Float32Array;
+}
+
+interface RasterLayerGpu extends RasterTileGpu {
+  opacity: number;
   matrix: Float32Array;
   paintOrder: number;
   pageIndex: number;
+  /** Further tiles of an image larger than one texture; the layer's own fields draw the first. */
+  extraTiles?: RasterTileGpu[];
 }
+
+interface RasterLayerSource {
+  opacity?: number;
+  width: number;
+  height: number;
+  data: Uint8Array<ArrayBufferLike>;
+  matrix: Float32Array;
+  paintOrder?: number;
+  pageIndex?: number;
+}
+
+const WHOLE_RASTER_RECT = Float32Array.of(0, 0, 1, 1);
 
 interface RasterStripBatchGpu {
   count: number;
@@ -1498,6 +1532,8 @@ export class WebGlFloorplanRenderer {
   private readonly uRasterMatrixABCD: WebGLUniformLocation;
 
   private readonly uRasterMatrixEF: WebGLUniformLocation;
+  private readonly uRasterQuad: WebGLUniformLocation;
+  private readonly uRasterUv: WebGLUniformLocation;
 
   private readonly uRasterViewport: WebGLUniformLocation;
 
@@ -2020,6 +2056,8 @@ export class WebGlFloorplanRenderer {
     this.uRasterOpacity = this.mustGetUniformLocation(this.rasterProgram, "uRasterOpacity");
     this.uRasterMatrixABCD = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixABCD");
     this.uRasterMatrixEF = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixEF");
+    this.uRasterQuad = this.mustGetUniformLocation(this.rasterProgram, "uRasterQuad");
+    this.uRasterUv = this.mustGetUniformLocation(this.rasterProgram, "uRasterUv");
     this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
     this.uRasterCameraCenter = this.mustGetUniformLocation(this.rasterProgram, "uCameraCenter");
     this.uRasterZoom = this.mustGetUniformLocation(this.rasterProgram, "uZoom");
@@ -2483,25 +2521,18 @@ export class WebGlFloorplanRenderer {
     updates = new Map(updates);
     const source = this.scene;
     if (!source || this.isDisposed) throw new Error("No active scene for raster replacement.");
-    validateRasterLayerUpdates(source, updates, Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE)));
+    validateRasterLayerUpdates(source, updates);
     const prepared = new Map<number, RasterLayerGpu>();
     let finished = false;
     const release = (): void => {
-      for (const value of prepared.values()) { this.gl.deleteTexture(value.texture); }
+      for (const value of prepared.values()) this.deleteRasterLayerTextures(value);
       prepared.clear();
     };
     let uploaded = false;
     const stage = (): void => {
       for (const [index, layer] of updates) {
         if ((this.rasterLayerUpdates.get(index) ?? source.rasterLayers[index]) !== layer) {
-          const gl = this.gl, texture = this.mustCreateTexture();
-          try {
-            gl.bindTexture(gl.TEXTURE_2D, texture); configureRasterTexture(gl);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, layer.width, layer.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultiplyRgba(layer.data));
-            gl.generateMipmap(gl.TEXTURE_2D);
-            prepared.set(index, { texture, matrix: layer.matrix.slice(), opacity: layer.opacity ?? 1,
-              paintOrder: layer.paintOrder, pageIndex: layer.pageIndex });
-          } catch (error) { gl.deleteTexture(texture); throw error; }
+          prepared.set(index, this.createRasterLayerGpu(layer, index));
         }
       }
       uploaded = true;
@@ -2520,7 +2551,7 @@ export class WebGlFloorplanRenderer {
         }
         for (const [index, next] of prepared) {
           const value = this.rasterLayers[index];
-          if (value) { this.gl.deleteTexture(value.texture); }
+          if (value) this.deleteRasterLayerTextures(value);
           this.rasterLayers[index] = next;
         }
         prepared.clear();
@@ -3843,15 +3874,24 @@ export class WebGlFloorplanRenderer {
       if (this.multiplyPass != null) this.setMultiplyBlend();
       else gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
-    this.bindOrderedTexture(12, layer.texture);
     gl.uniform1f(this.uRasterOpacity, layer.opacity);
     gl.uniform4f(this.uRasterMatrixABCD, layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
     gl.uniform2f(this.uRasterMatrixEF, layer.matrix[4], layer.matrix[5]);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    this.frameDrawCalls++;
+    // Tiles of one image never overlap, so each draws with the image's state.
+    this.drawRasterTile(layer);
+    for (const tile of layer.extraTiles ?? []) this.drawRasterTile(tile);
     if (!statePrepared && this.multiplyPass == null) {
       gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
+  }
+
+  private drawRasterTile(tile: RasterTileGpu): void {
+    const gl = this.gl;
+    this.bindOrderedTexture(12, tile.texture);
+    gl.uniform4fv(this.uRasterQuad, tile.quad ?? WHOLE_RASTER_RECT);
+    gl.uniform4fv(this.uRasterUv, tile.uv ?? WHOLE_RASTER_RECT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.frameDrawCalls++;
   }
 
   private drawRasterStripBatch(
@@ -5037,10 +5077,7 @@ export class WebGlFloorplanRenderer {
 
   private destroyRasterLayerTextures(): void {
     this.destroyRasterStripBatches();
-    const gl = this.gl;
-    for (const layer of this.rasterLayers) {
-      gl.deleteTexture(layer.texture);
-    }
+    for (const layer of this.rasterLayers) this.deleteRasterLayerTextures(layer);
     this.rasterLayers = [];
   }
 
@@ -5111,58 +5148,12 @@ export class WebGlFloorplanRenderer {
   private uploadRasterLayers(scene: VectorScene): void {
     const rasterSources = this.getSceneRasterLayers(scene);
     const maxRasterTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
-    for (const [index, source] of rasterSources.entries()) {
-      if (source.width > maxRasterTextureSize || source.height > maxRasterTextureSize) {
-        throw new Error(
-          `Raster layer ${index} requires a ${source.width}x${source.height} texture, ` +
-          `but this WebGL2 context supports at most ${maxRasterTextureSize}x${maxRasterTextureSize}.`
-        );
-      }
-    }
 
     this.destroyRasterLayerTextures();
-    const gl = this.gl;
 
     try {
-      for (const source of rasterSources) {
-        const texture = this.mustCreateTexture();
-        try {
-          gl.bindTexture(gl.TEXTURE_2D, texture);
-          configureRasterTexture(gl);
-          const pixels = source.data.subarray(0, source.width * source.height * 4);
-          const premultiplied = premultiplyRgba(pixels);
-          gl.texImage2D(
-            gl.TEXTURE_2D,
-            0,
-            gl.RGBA,
-            source.width,
-            source.height,
-            0,
-            gl.RGBA,
-            gl.UNSIGNED_BYTE,
-            premultiplied
-          );
-          gl.generateMipmap(gl.TEXTURE_2D);
-        } catch (error) {
-          gl.deleteTexture(texture);
-          throw error;
-        }
-
-        const matrix = new Float32Array(6);
-        if (source.matrix.length >= 6) {
-          matrix.set(source.matrix.subarray(0, 6));
-        } else {
-          matrix[0] = 1;
-          matrix[3] = 1;
-        }
-
-        this.rasterLayers.push({
-          opacity: source.opacity ?? 1,
-          texture,
-          matrix,
-          paintOrder: source.paintOrder,
-          pageIndex: source.pageIndex
-        });
+      for (const [index, source] of rasterSources.entries()) {
+        this.rasterLayers.push(this.createRasterLayerGpu(source, index));
       }
       // Retained replacements keep the ordinary resources authoritative until
       // the next document load; batches must never resurrect stale source pixels.
@@ -5171,6 +5162,53 @@ export class WebGlFloorplanRenderer {
       this.destroyRasterLayerTextures();
       throw error;
     }
+  }
+
+  /** Upload one image, as tiles when it exceeds this context's texture limit. */
+  private createRasterLayerGpu(source: RasterLayerSource, index: number): RasterLayerGpu {
+    const gl = this.gl;
+    const maxTextureSize = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const plan = planRasterTiles(source.width, source.height, maxTextureSize);
+    reportRasterTileDownscale(index, source, plan, maxTextureSize);
+    const pixels = rasterTilePixels(source, plan);
+    const tiles: RasterTileGpu[] = [];
+    try {
+      for (const [tileIndex, tile] of plan.tiles.entries()) {
+        const texture = this.mustCreateTexture();
+        tiles.push(plan.tiles.length > 1
+          ? { texture, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) }
+          : { texture });
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        configureRasterTexture(gl);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tile.width, tile.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels[tileIndex]);
+        gl.generateMipmap(gl.TEXTURE_2D);
+      }
+    } catch (error) {
+      for (const tile of tiles) gl.deleteTexture(tile.texture);
+      throw error;
+    }
+
+    const matrix = new Float32Array(6);
+    if (source.matrix.length >= 6) {
+      matrix.set(source.matrix.subarray(0, 6));
+    } else {
+      matrix[0] = 1;
+      matrix[3] = 1;
+    }
+    const [first, ...extraTiles] = tiles;
+    return {
+      ...first,
+      ...(extraTiles.length > 0 ? { extraTiles } : {}),
+      opacity: source.opacity ?? 1,
+      matrix,
+      paintOrder: source.paintOrder ?? 0,
+      pageIndex: source.pageIndex ?? 0
+    };
+  }
+
+  private deleteRasterLayerTextures(layer: RasterLayerGpu): void {
+    this.gl.deleteTexture(layer.texture);
+    for (const tile of layer.extraTiles ?? []) this.gl.deleteTexture(tile.texture);
   }
 
   private getSceneRasterLayers(
@@ -6382,35 +6420,6 @@ function configureGlyphRasterTexture(gl: WebGL2RenderingContext): void {
   if (Number.isFinite(supported) && supported > 1) {
     gl.texParameterf(gl.TEXTURE_2D, anisotropy.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(16, supported));
   }
-}
-
-function premultiplyRgba(source: Uint8Array): Uint8Array {
-  const out = new Uint8Array(source.length);
-  for (let i = 0; i + 3 < source.length; i += 4) {
-    const alpha = source[i + 3];
-    if (alpha <= 0) {
-      out[i] = 0;
-      out[i + 1] = 0;
-      out[i + 2] = 0;
-      out[i + 3] = 0;
-      continue;
-    }
-
-    if (alpha >= 255) {
-      out[i] = source[i];
-      out[i + 1] = source[i + 1];
-      out[i + 2] = source[i + 2];
-      out[i + 3] = 255;
-      continue;
-    }
-
-    const scale = alpha / 255;
-    out[i] = Math.round(source[i] * scale);
-    out[i + 1] = Math.round(source[i + 1] * scale);
-    out[i + 2] = Math.round(source[i + 2] * scale);
-    out[i + 3] = alpha;
-  }
-  return out;
 }
 
 function packNormalizedUint8TextureData(source: Float32Array, texelCount: number): Uint8Array {

@@ -46,6 +46,7 @@ export const fastTests = [
   "pdf-annotation-controls",
   "raster-layer-updates",
   "raster-strip-batches",
+  "raster-tiles",
   "webgl-raster-strip-batches",
   "webgpu-raster-strip-batches",
   "three-raster-strip-batches",

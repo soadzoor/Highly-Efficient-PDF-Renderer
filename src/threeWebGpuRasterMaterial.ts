@@ -17,7 +17,13 @@ export interface ThreeWebGpuRasterMaterialState {
   material: THREE.Material;
   zoomUniform: MutableUniform<number>;
   useLocalToClipUniform: MutableUniform<number>;
-  updateSource(texture: THREE.Texture, matrix: Float32Array, opacity: number): void;
+  updateSource(texture: THREE.Texture, matrix: Float32Array, opacity: number, tile?: ThreeRasterTileRect): void;
+}
+
+/** A tile's part of the image's unit square, and the same corners in its texture. */
+export interface ThreeRasterTileRect {
+  readonly quad: readonly number[];
+  readonly uv: readonly number[];
 }
 
 interface ThreeWebGpuRasterMaterialOptions {
@@ -27,11 +33,15 @@ interface ThreeWebGpuRasterMaterialOptions {
   texture: THREE.Texture;
   matrixABCD: THREE.Vector4;
   matrixEF: THREE.Vector2;
+  /** Defaults to the whole image in one texture. */
+  tile?: ThreeRasterTileRect;
   viewport: THREE.Vector2;
   cameraCenter: THREE.Vector2;
   localToClip: THREE.Matrix4;
   pageBinding?: ThreePageBinding;
 }
+
+const WHOLE_RASTER_RECT = [0, 0, 1, 1];
 
 // Deliberately typed as `unknown`: naming the TSL function type (e.g. via
 // `ReturnType<typeof TSL.wgslFn>`) instantiates @types/three's recursive
@@ -44,19 +54,25 @@ function varyingNode(node: unknown): never {
   return (TSL.varying as unknown as (node: unknown) => unknown)(node) as never;
 }
 
+/** Placement of an image, or of one tile's part of it; whole images pass unit rects. */
 export const rasterPackFn: unknown = TSL.wgslFn(`
 fn heprRasterPack(
   corner: vec2<f32>,
   matrixABCD: vec4<f32>,
-  matrixEF: vec2<f32>
+  matrixEF: vec2<f32>,
+  tileQuad: vec4<f32>,
+  tileUv: vec4<f32>
 ) -> vec4<f32> {
   let corner01 = corner * 0.5 + vec2<f32>(0.5);
   let localTopDown = vec2<f32>(corner01.x, 1.0 - corner01.y);
+  // Corners select, never interpolate, so neighboring tiles share exact edges.
+  let farCorner = localTopDown > vec2<f32>(0.5);
+  let tileCorner = select(tileQuad.xy, tileQuad.zw, farCorner);
   let world = vec2<f32>(
-    matrixABCD.x * localTopDown.x + matrixABCD.z * localTopDown.y + matrixEF.x,
-    matrixABCD.y * localTopDown.x + matrixABCD.w * localTopDown.y + matrixEF.y
+    matrixABCD.x * tileCorner.x + matrixABCD.z * tileCorner.y + matrixEF.x,
+    matrixABCD.y * tileCorner.x + matrixABCD.w * tileCorner.y + matrixEF.y
   );
-  return vec4<f32>(world, localTopDown);
+  return vec4<f32>(world, select(tileUv.xy, tileUv.zw, farCorner));
 }
 `);
 
@@ -125,12 +141,16 @@ export function createThreeWebGpuRasterMaterial(
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const corner = TSL.attribute("aCorner", "vec2");
+  const tileQuad = new THREE.Vector4().fromArray(options.tile?.quad ?? WHOLE_RASTER_RECT);
+  const tileUv = new THREE.Vector4().fromArray(options.tile?.uv ?? WHOLE_RASTER_RECT);
   const rasterPack = varyingNode(options.instancedPageBackground
     ? callNode(pageBackgroundPackFn, { corner, pageRect: TSL.attribute("aPageRect", "vec4") })
     : callNode(rasterPackFn, {
       corner,
       matrixABCD: TSL.uniform(options.matrixABCD),
-      matrixEF: TSL.uniform(options.matrixEF)
+      matrixEF: TSL.uniform(options.matrixEF),
+      tileQuad: TSL.uniform(tileQuad),
+      tileUv: TSL.uniform(tileUv)
     }));
   const rasterPackValue = rasterPack as { zw: unknown };
   const textureNode = TSL.texture(options.texture, rasterPackValue.zw as never);
@@ -158,10 +178,12 @@ export function createThreeWebGpuRasterMaterial(
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,
     useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
-    updateSource(texture, matrix, opacity) {
+    updateSource(texture, matrix, opacity, tile) {
       textureNode.value = texture;
       options.matrixABCD.set(matrix[0], matrix[1], matrix[2], matrix[3]);
       options.matrixEF.set(matrix[4], matrix[5]);
+      tileQuad.fromArray(tile?.quad ?? WHOLE_RASTER_RECT);
+      tileUv.fromArray(tile?.uv ?? WHOLE_RASTER_RECT);
       opacityUniform.value = opacity;
     }
   };

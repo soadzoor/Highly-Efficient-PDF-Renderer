@@ -94,7 +94,7 @@ export class SharedPageRenderer {
       },
       getRasterLayerUpdates: () => new Map(replacements),
       prepareRasterLayerUpdates: (updates: ReadonlyMap<number, RasterLayer>) => {
-        validateRasterLayerUpdates(source, updates, Number.MAX_SAFE_INTEGER);
+        validateRasterLayerUpdates(source, updates);
         const staged = new Map(updates); let released = false;
         return { commit: () => { if (disposed || released) throw new DOMException("PDF page update cancelled.", "AbortError");
           for (const [index, layer] of staged) replacements.set(index, layer); dirty = true; }, dispose: () => { released = true; } };

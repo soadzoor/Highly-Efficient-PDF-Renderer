@@ -55,6 +55,8 @@ export function applyThreePdfOverlayPaintOrder(
           for (const child of mesh.children) {
             if (child.userData.heprMultiplyCompletion) child.renderOrder = vectorDrawRunRenderOrder(
               position + (item - run.first + 0.5) / run.count, scene.drawRuns!.length);
+            // Further tiles of a large image paint with it, Multiply passes included.
+            else if (child.userData.heprRasterTile) assign(child);
           }
         };
         if (run.kind === "raster") {
@@ -126,7 +128,10 @@ export function applyThreePdfOverlayPaintOrder(
   const span = HEPR_THREE_LAYER_ORDER_FILL - HEPR_THREE_LAYER_ORDER_RASTER;
   for (let i = 0; i < ordered.length; i += 1) {
     const renderOrder = HEPR_THREE_LAYER_ORDER_RASTER + span * ((i + 1) / (ordered.length + 1));
-    for (const mesh of ordered[i].meshes) mesh.renderOrder = renderOrder;
+    for (const mesh of ordered[i].meshes) {
+      mesh.renderOrder = renderOrder;
+      for (const child of mesh.children) if (child.userData.heprRasterTile) child.renderOrder = renderOrder;
+    }
   }
 }
 

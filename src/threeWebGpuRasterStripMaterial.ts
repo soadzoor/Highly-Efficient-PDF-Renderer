@@ -60,10 +60,13 @@ export function createThreeWebGpuRasterStripMaterial(
   const zoomUniform = TSL.uniform(1);
   const useLocalToClipUniform = TSL.uniform(0);
   const matrixB = TSL.attribute("aRasterMatrixEFWidthOpacity", "vec4") as unknown as { xy: unknown; zw: unknown };
+  const wholeImage = TSL.vec4(0, 0, 1, 1);
   const rasterPack = varyingNode(callNode(rasterPackFn, {
     corner: TSL.attribute("aCorner", "vec2"),
     matrixABCD: TSL.attribute("aRasterMatrixABCD", "vec4"),
-    matrixEF: matrixB.xy
+    matrixEF: matrixB.xy,
+    tileQuad: wholeImage,
+    tileUv: wholeImage
   }));
   const packed = rasterPack as { xy: unknown; zw: unknown };
   material.vertexNode = callNode(rasterClipFn, {

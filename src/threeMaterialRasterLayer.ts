@@ -17,12 +17,25 @@ import {
   HEPR_THREE_LAYER_ORDER_PAGE_BACKGROUND,
   HEPR_THREE_LAYER_ORDER_RASTER
 } from "./threeLayerOrder";
-import { createThreeWebGpuRasterMaterial, type ThreeWebGpuRasterMaterialState } from "./threeWebGpuRasterMaterial";
+import {
+  createThreeWebGpuRasterMaterial,
+  type ThreeRasterTileRect,
+  type ThreeWebGpuRasterMaterialState
+} from "./threeWebGpuRasterMaterial";
+import {
+  planRasterTiles,
+  rasterTilePixels,
+  reportRasterTileDownscale,
+  sameRasterTilePlan,
+  type RasterTilePlan
+} from "./rasterTiles";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface RasterLayerOptions {
   pageTransforms?: ThreePageTransforms;
+  /** Initial texture limit for tiling large images; see setMaxTextureSize. */
+  maxTextureSize?: number;
   materialBackend?: "webgl" | "webgpu";
   colorCompositing?: ThreeColorCompositing;
   pageBackground: [number, number, number, number];
@@ -45,6 +58,22 @@ interface ResidentRasterLayerEntry extends RasterLayerEntry {
   run?: VectorDrawRun;
   texture: THREE.Texture;
   resident: boolean;
+  /** Canonical images only; strip batches have neither. */
+  image?: RasterImageState;
+}
+
+interface RasterImageState {
+  rasterIndex: number;
+  source: RasterLayerSource;
+  plan: RasterTilePlan;
+  multiply: boolean;
+  /** Further tiles of an image larger than one texture, drawn as children of the image's mesh. */
+  tiles: RasterTileEntry[];
+}
+
+interface RasterTileEntry extends RasterLayerEntry {
+  texture: THREE.Texture;
+  completionMaterial?: THREE.Material;
 }
 
 interface RasterLayerSource {
@@ -75,7 +104,8 @@ export class ThreeMaterialRasterLayer {
   private activeEntries: RasterLayerEntry[] = [];
   private readonly multiplyMaterials: THREE.Material[] = [];
   private readonly ownedTextures = new Set<THREE.Texture>();
-  private maxRasterTextureDimension: number;
+  private maxRasterTextureDimension = 0;
+  private maxTextureSize: number;
   private rasterTextureResidencyEnabled = false;
   private disposed = false;
 
@@ -132,48 +162,42 @@ export class ThreeMaterialRasterLayer {
     }
 
     const rasterSources = getSceneRasterLayers(scene);
-    this.maxRasterTextureDimension = rasterSources.reduce(
-      (maximum, source) => Math.max(maximum, source.width, source.height),
-      0
-    );
+    // Until a host reports its limit, images stay whole, as one texture each.
+    this.maxTextureSize = options.maxTextureSize ?? Number.POSITIVE_INFINITY;
     for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
       const source = rasterSources[rasterIndex];
-      const texture = createRasterTexture(source);
-      this.ownedTextures.add(texture);
+      const plan = planRasterTiles(source.width, source.height, this.maxTextureSize);
+      const textures = createRasterTileTextures(source, plan, rasterIndex, this.maxTextureSize);
+      for (const texture of textures) this.ownedTextures.add(texture);
       const rasterOrderOffset = (rasterIndex + 1) / (rasterSources.length + 1);
       const entry = this.createEntry(
-        texture,
+        textures[0],
         source.matrix,
         HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset,
         this.geometry,
-        this.vectorClipIndices[this.rasterEntries.length] ?? -1,
-        source.opacity ?? 1
+        this.vectorClipIndices[rasterIndex] ?? -1,
+        source.opacity ?? 1,
+        rasterIndex,
+        plan.tiles[0]
       );
       entry.mesh.userData.heprDrawRun = { kind: "raster", first: rasterIndex, count: 1 };
       const run = rasterRuns[rasterIndex];
       const multiply = !scene.paintGraph && run?.blendMode === "Multiply";
-      if (multiply) {
-        const original = entry.material;
-        entry.mesh.material = entry.material = createThreeMultiplyMaterial(original, 0, true);
-        const second = createThreeMultiplyMaterial(original, 1, true);
-        original.dispose();
-        this.multiplyMaterials.push(second);
-        const completion = new THREE.Mesh(this.geometry, second);
-        completion.frustumCulled = false;
-        completion.userData.heprMultiplyCompletion = true;
-        entry.mesh.add(completion);
-      }
+      if (multiply) this.applyMultiply(entry);
       entry.mesh.visible = false;
-      const residentEntry = {
+      const residentEntry: ResidentRasterLayerEntry = {
         ...entry,
         run,
-        texture,
-        resident: false
+        texture: textures[0],
+        resident: false,
+        image: { rasterIndex, source, plan, multiply, tiles: [] }
       };
       this.entries.push(residentEntry);
       this.rasterEntries.push(residentEntry);
       this.group.add(entry.mesh);
+      this.addRasterTiles(residentEntry, textures);
     }
+    this.updateMaxRasterTextureDimension();
     try {
       // 2048 is within WebGL2's minimum texture limit. The shared planner
       // applies the same per-batch and total allocation bounds as native paths.
@@ -213,6 +237,24 @@ export class ThreeMaterialRasterLayer {
     }, this.maxRasterTextureDimension);
   }
 
+  /**
+   * Tile images that exceed the host renderer's texture limit. Textures upload
+   * lazily, so a host calling this before its first render uploads only tiles.
+   */
+  setMaxTextureSize(maxTextureSize: number): void {
+    if (this.disposed || maxTextureSize === this.maxTextureSize) return;
+    this.maxTextureSize = maxTextureSize;
+    for (const entry of this.rasterEntries) {
+      const image = entry.image;
+      if (!image) continue;
+      const plan = planRasterTiles(image.source.width, image.source.height, maxTextureSize);
+      if (sameRasterTilePlan(plan, image.plan)) continue;
+      this.setRasterImage(entry, image.source, plan,
+        createRasterTileTextures(image.source, plan, image.rasterIndex, maxTextureSize));
+    }
+    this.updateMaxRasterTextureDimension();
+  }
+
   /** Stage replacement pixels without uploading resources on a dormant material path. */
   prepareRasterLayerUpdates(updates: ReadonlyMap<number, RasterLayer>): { commit(): void; dispose(): void } {
     if (this.disposed) throw new Error("Raster material layer has been disposed.");
@@ -226,13 +268,18 @@ export class ThreeMaterialRasterLayer {
         throw new Error("Invalid staged raster layer update.");
       }
     }
-    const staged: { index: number; layer: RasterLayer; texture: THREE.DataTexture }[] = [];
+    const staged: { index: number; layer: RasterLayer; plan: RasterTilePlan; textures: THREE.DataTexture[] }[] = [];
+    const disposeStaged = (): void => {
+      for (const item of staged) for (const texture of item.textures) texture.dispose();
+    };
     try {
       for (const [index, layer] of updates) {
-        if (this.appliedRasterLayers[index] !== layer) staged.push({ index, layer, texture: createRasterTexture(layer) });
+        if (this.appliedRasterLayers[index] === layer) continue;
+        const plan = planRasterTiles(layer.width, layer.height, this.maxTextureSize);
+        staged.push({ index, layer, plan, textures: createRasterTileTextures(layer, plan, index, this.maxTextureSize) });
       }
     } catch (error) {
-      for (const item of staged) item.texture.dispose();
+      disposeStaged();
       throw error;
     }
     let finished = false;
@@ -240,38 +287,26 @@ export class ThreeMaterialRasterLayer {
       commit: () => {
         if (finished) return;
         if (this.disposed) {
-          for (const item of staged) item.texture.dispose();
+          disposeStaged();
           finished = true;
           throw new Error("Raster material layer has been disposed.");
         }
         finished = true;
         if (staged.length > 0) this.destroyStripBatches();
-        for (const { index, layer, texture } of staged) {
+        for (const { index, layer, plan, textures } of staged) {
           this.appliedRasterLayers[index] = layer;
           const entry = this.rasterEntries[index];
-          const previous = entry.texture;
-          entry.texture = texture;
-          this.ownedTextures.add(texture);
-          this.ownedTextures.delete(previous);
-          previous.dispose();
-          if (entry.webGpuState?.updateSource) entry.webGpuState.updateSource(texture, layer.matrix, layer.opacity ?? 1);
-          else {
-            const uniforms = (entry.material as THREE.RawShaderMaterial).uniforms;
-            uniforms.uRasterTex.value = texture;
-            uniforms.uRasterMatrixABCD.value.set(layer.matrix[0], layer.matrix[1], layer.matrix[2], layer.matrix[3]);
-            uniforms.uRasterMatrixEF.value.set(layer.matrix[4], layer.matrix[5]);
-            uniforms.uRasterOpacity.value = layer.opacity ?? 1;
-          }
-          this.maxRasterTextureDimension = Math.max(this.maxRasterTextureDimension, layer.width, layer.height);
+          this.setRasterImage(entry, layer, plan, textures);
           entry.resident = this.rasterTextureResidencyEnabled;
           entry.mesh.visible = entry.resident &&
             this.isEntryVisible(entry);
         }
+        if (staged.length > 0) this.updateMaxRasterTextureDimension();
       },
       dispose: () => {
         if (finished) return;
         finished = true;
-        for (const item of staged) item.texture.dispose();
+        disposeStaged();
       }
     };
   }
@@ -291,6 +326,7 @@ export class ThreeMaterialRasterLayer {
           continue;
         }
         entry.texture.needsUpdate = true;
+        for (const tile of entry.image?.tiles ?? []) tile.texture.needsUpdate = true;
         entry.resident = true;
         entry.mesh.visible = this.isEntryVisible(entry);
       }
@@ -392,7 +428,104 @@ export class ThreeMaterialRasterLayer {
       return;
     }
     entry.texture.dispose();
+    for (const tile of entry.image?.tiles ?? []) tile.texture.dispose();
     entry.resident = false;
+  }
+
+  /** Point an image's meshes at new pixels, rebuilding its further tiles for the new plan. */
+  private setRasterImage(
+    entry: ResidentRasterLayerEntry,
+    source: RasterLayerSource,
+    plan: RasterTilePlan,
+    textures: THREE.Texture[]
+  ): void {
+    const image = entry.image!;
+    this.removeRasterTiles(entry);
+    const previous = entry.texture;
+    entry.texture = textures[0];
+    for (const texture of textures) this.ownedTextures.add(texture);
+    this.ownedTextures.delete(previous);
+    previous.dispose();
+    image.source = source;
+    image.plan = plan;
+    const tile = plan.tiles[0];
+    if (entry.webGpuState?.updateSource) entry.webGpuState.updateSource(textures[0], source.matrix, source.opacity ?? 1, tile);
+    else {
+      const uniforms = (entry.material as THREE.RawShaderMaterial).uniforms;
+      uniforms.uRasterTex.value = textures[0];
+      uniforms.uRasterMatrixABCD.value.set(source.matrix[0], source.matrix[1], source.matrix[2], source.matrix[3]);
+      uniforms.uRasterMatrixEF.value.set(source.matrix[4], source.matrix[5]);
+      uniforms.uRasterQuad.value.fromArray(tile.quad);
+      uniforms.uRasterUv.value.fromArray(tile.uv);
+      uniforms.uRasterOpacity.value = source.opacity ?? 1;
+    }
+    this.addRasterTiles(entry, textures);
+  }
+
+  /**
+   * Tiles of one image never overlap. As children of its mesh they share its
+   * visibility, and paint ordering gives them its render order.
+   */
+  private addRasterTiles(entry: ResidentRasterLayerEntry, textures: THREE.Texture[]): void {
+    const image = entry.image!;
+    if (image.plan.tiles.length < 2) return;
+    const completionOrder = entry.mesh.children.find(child => child.userData.heprMultiplyCompletion)?.renderOrder;
+    for (let index = 1; index < image.plan.tiles.length; index++) {
+      const tile = this.createEntry(textures[index], image.source.matrix, entry.mesh.renderOrder, this.geometry,
+        this.vectorClipIndices[image.rasterIndex] ?? -1, image.source.opacity ?? 1, image.rasterIndex, image.plan.tiles[index]);
+      const tileEntry: RasterTileEntry = {
+        ...tile,
+        texture: textures[index],
+        completionMaterial: image.multiply ? this.applyMultiply(tile, completionOrder) : undefined
+      };
+      tile.mesh.userData.heprDrawRun = { ...entry.mesh.userData.heprDrawRun };
+      tile.mesh.userData.heprRasterTile = true;
+      image.tiles.push(tileEntry);
+      this.entries.push(tileEntry);
+      entry.mesh.add(tile.mesh);
+    }
+    this.activeEntries = this.entries.filter(item => !item.batched);
+  }
+
+  private removeRasterTiles(entry: ResidentRasterLayerEntry): void {
+    const image = entry.image!;
+    if (image.tiles.length === 0) return;
+    for (const tile of image.tiles) {
+      tile.mesh.removeFromParent();
+      tile.material.dispose();
+      if (tile.completionMaterial) {
+        tile.completionMaterial.dispose();
+        this.multiplyMaterials.splice(this.multiplyMaterials.indexOf(tile.completionMaterial), 1);
+      }
+      tile.texture.dispose();
+      this.ownedTextures.delete(tile.texture);
+      this.entries.splice(this.entries.indexOf(tile), 1);
+    }
+    image.tiles.length = 0;
+    this.activeEntries = this.entries.filter(item => !item.batched);
+  }
+
+  /** Paint Multiply as two ordered passes; the completion pass is a child mesh. */
+  private applyMultiply(entry: RasterLayerEntry, completionOrder?: number): THREE.Material {
+    const original = entry.material;
+    entry.mesh.material = entry.material = createThreeMultiplyMaterial(original, 0, true);
+    const second = createThreeMultiplyMaterial(original, 1, true);
+    original.dispose();
+    this.multiplyMaterials.push(second);
+    const completion = new THREE.Mesh(this.geometry, second);
+    completion.frustumCulled = false;
+    completion.userData.heprMultiplyCompletion = true;
+    if (completionOrder !== undefined) completion.renderOrder = completionOrder;
+    entry.mesh.add(completion);
+    return second;
+  }
+
+  private updateMaxRasterTextureDimension(): void {
+    let maximum = 0;
+    for (const entry of this.rasterEntries) {
+      for (const tile of entry.image?.plan.tiles ?? []) maximum = Math.max(maximum, tile.width, tile.height);
+    }
+    this.maxRasterTextureDimension = maximum;
   }
 
   private addStripBatch(batch: RasterStripBatch): void {
@@ -486,12 +619,14 @@ export class ThreeMaterialRasterLayer {
     renderOrder: number,
     geometry: THREE.BufferGeometry = this.geometry,
     clipIndex = -1,
-    opacity = 1
+    opacity = 1,
+    rasterIndex = this.rasterEntries.length,
+    tile: ThreeRasterTileRect = WHOLE_RASTER_TILE
   ): RasterLayerEntry {
     const matrix = normalizeRasterMatrix(matrixSource);
     const instancedPageBackground = geometry.hasAttribute("aPageRect");
     const pageBinding = this.pageTransforms ? instancedPageBackground ? { table: this.pageTransforms }
-      : this.pageTransforms.page("raster", this.rasterEntries.length) : undefined;
+      : this.pageTransforms.page("raster", rasterIndex) : undefined;
 
     if (this.materialBackend === "webgpu") {
       const state = createThreeWebGpuRasterMaterial({
@@ -502,6 +637,7 @@ export class ThreeMaterialRasterLayer {
         texture,
         matrixABCD: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]),
         matrixEF: new THREE.Vector2(matrix[4], matrix[5]),
+        tile,
         viewport: this.viewportUniform,
         cameraCenter: this.cameraCenterUniform,
         localToClip: this.localToClipUniform
@@ -539,6 +675,8 @@ export class ThreeMaterialRasterLayer {
         uRasterOpacity: { value: opacity },
         uRasterMatrixABCD: { value: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]) },
         uRasterMatrixEF: { value: new THREE.Vector2(matrix[4], matrix[5]) },
+        uRasterQuad: { value: new THREE.Vector4().fromArray(tile.quad) },
+        uRasterUv: { value: new THREE.Vector4().fromArray(tile.uv) },
         uViewport: { value: this.viewportUniform },
         uCameraCenter: { value: this.cameraCenterUniform },
         uZoom: this.zoomUniform,
@@ -561,6 +699,7 @@ export class ThreeMaterialRasterLayer {
 
 // Background placement comes from aPageRect; ordinary rasters use their matrix.
 const PAGE_BACKGROUND_PLACEMENT_MATRIX = new Float32Array([1, 0, 0, 1, 0, 0]);
+const WHOLE_RASTER_TILE: ThreeRasterTileRect = { quad: [0, 0, 1, 1], uv: [0, 0, 1, 1] };
 
 /**
  * One shared quad and a packed (x, y, width, height) instance per page.
@@ -640,14 +779,23 @@ function createPageBackgroundTexture(color: [number, number, number, number]): T
   return texture;
 }
 
-function createRasterTexture(source: RasterLayerSource): THREE.DataTexture {
-  const pixelCount = source.width * source.height * 4;
-  const pixels = source.data.subarray(0, pixelCount);
-  const premultiplied = premultiplyRgba(pixels);
+/** One premultiplied texture per tile of `plan`. */
+function createRasterTileTextures(
+  source: RasterLayerSource,
+  plan: RasterTilePlan,
+  rasterIndex: number,
+  maxTextureSize: number
+): THREE.DataTexture[] {
+  reportRasterTileDownscale(rasterIndex, source, plan, maxTextureSize);
+  const pixels = rasterTilePixels(source, plan);
+  return plan.tiles.map((tile, index) => createRasterTexture(pixels[index], tile.width, tile.height));
+}
+
+function createRasterTexture(premultiplied: Uint8Array, width: number, height: number): THREE.DataTexture {
   const texture = new THREE.DataTexture(
     premultiplied,
-    Math.max(1, source.width),
-    Math.max(1, source.height),
+    Math.max(1, width),
+    Math.max(1, height),
     THREE.RGBAFormat,
     THREE.UnsignedByteType
   );
@@ -730,18 +878,6 @@ function readFinite(value: number | undefined, fallback: number): number {
     return fallback;
   }
   return value;
-}
-
-function premultiplyRgba(source: Uint8Array): Uint8Array {
-  const out = new Uint8Array(source.length);
-  for (let i = 0; i + 3 < source.length; i += 4) {
-    const premultiplied = premultiplyRgbaPixel(source[i], source[i + 1], source[i + 2], source[i + 3]);
-    out[i] = premultiplied[0];
-    out[i + 1] = premultiplied[1];
-    out[i + 2] = premultiplied[2];
-    out[i + 3] = premultiplied[3];
-  }
-  return out;
 }
 
 function premultiplyRgbaPixel(red: number, green: number, blue: number, alpha: number): [number, number, number, number] {

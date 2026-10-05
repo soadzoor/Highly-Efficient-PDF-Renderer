@@ -17,8 +17,8 @@ try {
     const instance = Object.assign(Object.create(Renderer.prototype), {
       scene: source, isDisposed: false, [resident]: true, [slots]: [], rasterLayerUpdates: new Map(),
       gl: { getParameter: () => 128, bindTexture() {}, texParameteri() {}, texImage2D() {}, generateMipmap() {}, deleteTexture(t) { t.destroy(); } },
-      mustCreateTexture: texture, maxTextureSize: () => 128, createRgba8Texture: texture,
-      createRasterLayerResource: (_matrix, tex) => ({ texture: tex, uniformBuffer: { destroy() {} } }),
+      mustCreateTexture: texture, maxTextureSize: () => 128,
+      createRasterLayerResource: () => ({ texture: texture(), uniformBuffer: { destroy() {} } }),
       destroyVectorMinifyResources() {}, requestFrame() { frames++; }
     });
     const replacement = layer(20), input = new Map([[0, replacement]]);

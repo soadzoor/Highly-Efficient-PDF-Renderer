@@ -938,6 +938,14 @@ needed for features such as room detection. Their extracted text index is retain
 separately for search and selection; no text is painted twice. HEP stores the image,
 text, and retained replay resources, with no source PDF needed when reopening it.
 
+Images wider or taller than the GPU's texture limit are drawn as several tiles
+at full resolution. Native WebGPU requests the adapter's full limit, often 16,384
+texels instead of WebGPU's default 8,192. In three.js the host renderer's limit
+applies; `WebGPURenderer` uses 8,192 unless it is created with
+`requiredLimits: { maxTextureDimension2D }`. An image with more pixels than the
+device's largest texture is resampled to fit that many, and a console warning
+gives its original and drawn sizes.
+
 `onDiagnostic` receives these warnings (also retained by `PdfSession.getDiagnostics()`):
 
 | Code | Meaning |
