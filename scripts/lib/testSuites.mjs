@@ -39,6 +39,7 @@ export const fastTests = [
   "vector-fill-bands",
   "vector-cell-index",
   "webgl-shader-precision",
+  "webgl-fill-clip-bounds",
   "subpixel-stroke-coverage",
   "fill-area-coverage",
   "projected-coverage-margin",

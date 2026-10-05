@@ -419,7 +419,9 @@ frames can select different paths as visibility and scheduling change.
 
 Native WebGL batches compatible small images into bounded atlases, including
 inside transparency groups. Other consecutive images can share one draw using
-up to eight original textures, with a separate clip root on each instance.
+up to fourteen original textures, with a separate clip root on each instance.
+Texture selection uses at most four comparisons per fragment; two additional
+fragment samplers remain available for clipping and a folded soft mask.
 These texture batches preserve the original hardware mip filtering and do not
 copy image pixels. They flush before vector paints, compositor transitions,
 folded paints and Multiply passes; tiled images retain individual quads.
@@ -428,6 +430,69 @@ folded paints and Multiply passes; tiled images retain individual quads.
 instances, and `rasterTextureBatchInstances` counts those using texture batches.
 Atlas storage retains independent mip chains and reuses them during camera
 motion. Images fall back to individual draws if batch resources are unavailable.
+
+Native WebGL also bounds ordinary fill quads by each instance's clip-chain
+bounds in the orthographic view. The original path coverage, cell-index origin,
+clip tests, masks and paint order remain intact. During a capture,
+`fillUnclippedQuadPixelsEstimate` counts their original expanded quad areas and
+`fillQuadPixelsEstimate` counts the bounded areas, both intersected with the
+viewport and rounded outward. Overlapping instances count again; these are
+area estimates, not actual shaded pixels or GPU instructions. Compare them to
+see whether bounding removes work in the current view. `fillClipBoundedInstances`
+counts smaller quads and `fillClipCulledInstances` counts empty quads.
+`fillClipBoundsAvailable` reports whether bounds were uploaded,
+`fillClipBoundsTexels` counts their records, and `vectorClipStoreTexels` counts
+the original clip/index store's records. Bounds occupy their own texture,
+bounded to 4 MiB, so a full clip index store cannot disable quad shrinking.
+Clip geometry with identical Float32 coordinates shares GPU storage across
+parents and fill rules, while each clip retains its own header. When the clip
+store cannot fit a polygon's finest cell grids or its band index, it retains
+the coarser complete grids that fit before falling back to a full edge scan.
+This changes the candidate lookup, not the geometry or fill rule. `vectorClipUniquePayloads`
+and `vectorClipSharedPayloads` count distinct payloads and nodes reusing them.
+`vectorClipRectangleNodes`, `vectorClipCellIndexedNodes`,
+`vectorClipBandIndexedNodes`, and `vectorClipUnindexedPolygonNodes` count nodes
+using each layout; `vectorClipCoarsenedCellNodes` counts cell-indexed nodes with
+finer levels removed to fit the budget. These are whole-document upload
+statistics, independent of the current view, and shared nodes count separately.
+`fillClipBoundsTestedInstances` counts fills with an available clip bound,
+including those whose path bounds already fit inside it. These diagnostics
+distinguish disabled bounds from clips that remove no area. Allocation failure
+warns and retains the original quads and exact clip tests. Projected views
+retain their original expansion and omit the area estimates. The area
+calculation runs only while a capture is active.
+
+Native WebGL original-texture image batches also bound their quads by each
+image's clip chain in the orthographic view. Inverse transforms are cached per
+image and clip; the vertex shader expands them for the live antialiasing
+footprint. Mirrored, rotated and sheared images retain their UV interpolation,
+mip filtering, masks and paint order. Projected views and unstable inverses
+retain the original image quad. During a capture,
+`rasterTextureUnclippedQuadPixelsEstimate` and `rasterTextureQuadPixelsEstimate`
+estimate the original and bounded image areas. They count outward-rounded
+world bounding boxes intersected with the viewport, including overlaps, so
+rotated image estimates can exceed actual quad area. They cover texture
+batches; standalone images and atlases are excluded.
+`rasterTextureClipBoundsTestedInstances`, `rasterTextureClipBoundedInstances`,
+and `rasterTextureClipCulledInstances` report tested, smaller and empty image
+quads. These diagnostics omit projected views and add no area scans outside
+captures. Compare GPU spans without operation timing as well as a separate
+capture with operation timing, since individual timer queries add overhead.
+
+Original-texture image batches cache their instance buffers and VAOs by paint
+position. Comparing all instance values before each draw
+keeps cached geometry current when visibility, clips, transforms or opacity
+change. Textures, camera uniforms, masks and compositing state are bound live.
+The cache holds at most 512 batches and 4 MiB of GPU instance data, plus an equal
+CPU copy for comparison. Unused trailing slots and document replacement release
+their resources. Batches beyond either limit use the streaming path; allocation
+failure warns once and retains streaming draws. During captures,
+`rasterTextureBatchCacheHits` and `rasterTextureBatchCacheMisses` count reused and
+uncached batches, `rasterTextureInstanceUploadBytes` counts actual image-instance
+uploads, and `rasterTextureBatchCacheBytes` reports resident instance bytes.
+Panning or zooming a stable batch sequence should produce cache hits and no
+image-instance uploads after the cache is warm. This reduces submission work
+without changing the draw count.
 
 Each timed operation runs between its own queries, so the GPU cannot overlap it
 with its neighbours, and those frames run slower. Operation times can therefore

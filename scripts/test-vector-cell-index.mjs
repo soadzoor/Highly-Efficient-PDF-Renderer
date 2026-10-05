@@ -326,15 +326,48 @@ try {
       ...Array.from({ length: 64 }, (_, i) => [f32(100 - i * 200 / 64), 50]),
       ...Array.from({ length: 64 }, (_, i) => [-100, f32(50 - i * 100 / 64)])]])]
   ];
-  let clipPoints = 0, probes = 0, sampledPixels = 0, partialMasks = 0;
+  let clipPoints = 0, probes = 0, sampledPixels = 0, partialMasks = 0, coarsenedFixtures = 0;
   for (const [name, edges] of clipFixtures) {
     const clips = [{ parent: -1, fillRule: 0, edges }, { parent: -1, fillRule: 1, edges }];
     const packed = packVectorClips(clips, undefined, { cells: true });
     const plain = packVectorClips(clips);
     assert.equal(packed[3] & 4, 4, `${name}: nonzero polygon is cell-indexed`);
     assert.equal(packed[7], 5, `${name}: even-odd keeps its fill rule bit`);
+    assert.equal(packed[1], packed[5], `${name}: both fill rules share the cell index`);
     assert.equal(plain[3] & 4, 0, `${name}: the default layout keeps bands for other consumers`);
+    if (packed.length > plain.length) {
+      let stats;
+      const bandFallback = packVectorClips(clips, plain.length / 4,
+        { cells: true, onStats: value => { stats = value; } });
+      assert.deepEqual(bandFallback, plain, `${name}: keep the band fallback when it fits but the full cell index does not`);
+      assert.equal(stats.coarsenedCellNodes, 0);
+    }
     const header = [...packed.subarray(0, 4)];
+    const layouts = [["cells", packed], ["bands", plain]];
+    const texel = index => [...packed.subarray(index * 4, index * 4 + 4)];
+    const cells = texel(header[1]);
+    if (cells[1] > 1) {
+      // Leave exactly enough room for the coarsest complete grid and both
+      // node headers. The old all-or-nothing cell allocation lost its index.
+      const grid = texel(cells[0] + cells[1] - 1), cellCount = grid[1] * grid[2];
+      let capacity = 2 + 3 + cellCount;
+      for (let cell = 0; cell < cellCount; cell++) {
+        const record = texel(grid[0] + cell);
+        capacity += record[1] + record[3];
+      }
+      let stats;
+      const coarsened = packVectorClips(clips, capacity, { cells: true, onStats: value => { stats = value; } });
+      assert.equal(coarsened.length / 4, capacity, `${name}: coarsened index obeys the exact budget`);
+      assert.equal(coarsened[3], 4); assert.equal(coarsened[7], 5);
+      assert.equal(coarsened[1], coarsened[5]);
+      const info = [...coarsened.subarray(coarsened[1] * 4, coarsened[1] * 4 + 4)];
+      assert.equal(info[1], 1, `${name}: retain the coarsest level`);
+      assert.equal(info[2], cells[2] * 2 ** ((cells[1] - 1) * cells[3]), `${name}: update cell size when removing levels`);
+      assert.equal(stats.coarsenedCellNodes, 2); assert.equal(stats.cellIndexedNodes, 2);
+      assert.equal(stats.uniquePayloads, 1); assert.equal(stats.sharedPayloads, 1);
+      layouts.push(["coarsened cells", coarsened]);
+      coarsenedFixtures++;
+    }
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (let i = 0; i < edges.length; i += 4) {
       minX = Math.min(minX, edges[i], edges[i + 2]); minY = Math.min(minY, edges[i + 1], edges[i + 3]);
@@ -360,6 +393,12 @@ try {
       assert.equal(probe.winding, truth, `${name}: probe-level winding at ${point}`);
       assert.equal(probe.near < radius, nearest < radius, `${name}: the probe finds every edge within reach`);
       if (nearest < radius) assert(Math.abs(probe.near - nearest) < 1e-3 * Math.max(1, radius), `${name}: nearest edge distance`);
+      for (const [layout, data] of layouts.filter(([layout]) => layout === "coarsened cells")) {
+        const limitedHeader = [...data.subarray(0, 4)], limitedProbe = clipWinding(data, limitedHeader, point, radius);
+        assert.equal(clipWinding(data, limitedHeader, point, 0).winding, truth, `${name}: ${layout} point winding`);
+        assert.equal(limitedProbe.winding, truth, `${name}: ${layout} probe-level winding`);
+        assert.equal(limitedProbe.near < radius, nearest < radius, `${name}: ${layout} boundary probe`);
+      }
       clipPoints++; probes++;
     }
     // Boundary pixels: every sample's inside bit, for both layouts and rules.
@@ -384,7 +423,7 @@ try {
         if (w !== 0) nonzero |= bit;
         if (Math.abs(w) % 2 === 1) evenOdd |= bit;
       }));
-      for (const [layout, data] of [["cells", packed], ["bands", plain]]) {
+      for (const [layout, data] of layouts) {
         for (const [rule, truth] of [[0, nonzero], [1, evenOdd]]) {
           const mask = sampleMask(data, [...data.subarray(rule * 4, rule * 4 + 4)], point, aaWidth);
           assert.equal(mask & known, truth, `${name}: ${layout} rule ${rule} samples at ${point}, width ${aaWidth}`);
@@ -395,6 +434,7 @@ try {
     }
   }
   assert(partialMasks > 1000, `boundary pixels mix inside and outside samples (${partialMasks})`);
+  assert(coarsenedFixtures >= 3, "several polygon types exercise coarser indexes under budget pressure");
   assert(clipPoints > 5000 && probes > 5000, "clip fixtures exercise thousands of points");
   console.log(`Vector cell index: exact dyadic coverage, bounded work, float32 and curve tolerances, store budgets, ${clipPoints} clip winding/probe points and ${sampledPixels} sampled boundary pixels passed`);
 } finally { hooks.deregister(); }

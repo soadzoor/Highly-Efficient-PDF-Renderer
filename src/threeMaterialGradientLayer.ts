@@ -718,11 +718,16 @@ const GRADIENT_FILL_VERTEX_SHADER_SOURCE = replaceShaderSource(replaceShaderSour
     uUseLocalToClip, uLocalToClip, uZoom, uViewport));
   margin = heprBoundCoverageMargin(mix(minBounds, maxBounds, corner01), margin, mat2(1.0),
     uUseLocalToClip, uLocalToClip, uViewport);
-  vec2 world = mix(minBounds - margin, maxBounds + margin, corner01);`,
+  vec4 quad = heprFillQuadBounds(minBounds, maxBounds, margin,
+    heprFillInstanceClipBounds(vVectorClipIndex));
+  if (quad.x > quad.z || quad.y > quad.w) {
+    heprCullFill();
+    return;
+  }
+  vec2 world = mix(quad.xy, quad.zw, corner01);`,
   `  vec4 quad = heprClippedPaintQuad(minBounds, maxBounds, uClipBounds, uUseLocalToClip, uLocalToClip, uZoom, uViewport);
   if (any(greaterThan(quad.xy, quad.zw))) {
-    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
-    vSegmentCount = 0;
+    heprCullFill();
     return;
   }
   vec2 world = mix(quad.xy, quad.zw, corner01);`);

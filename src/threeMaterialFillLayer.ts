@@ -192,6 +192,8 @@ export class ThreeMaterialFillLayer {
           uFillBandEntries: { value: store.bandEntries },
           // Stored plus one: zero means the store has no cell index.
           uFillCellHeaders: { value: store.cellBase + 1 },
+          // Three projects fills and does not upload the native bounds store.
+          uFillClipBoundsEnabled: { value: 0 },
           uFillSegmentTexA: { value: this.fillSegmentTextureA },
           uFillSegmentTexB: { value: this.fillSegmentTextureB },
           uFillPathMetaTexSize: {

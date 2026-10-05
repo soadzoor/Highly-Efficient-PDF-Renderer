@@ -148,12 +148,58 @@ function clipCellTexels(cells: VectorPathCells): number {
   return 2 + cells.levels.length + cells.cellCount + cells.pieceCount + cells.closurePairCount;
 }
 
+/** Drop only the finest levels; every retained level still covers the whole polygon. */
+function fitClipCells(cells: VectorPathCells, capacity: number): VectorPathCells | null {
+  if (clipCellTexels(cells) <= capacity) return cells;
+  let pieces = cells.pieceCount, count = cells.cellCount, pairs = cells.closurePairCount;
+  for (let first = 1; first < cells.levels.length; first++) {
+    const removed = cells.levels[first - 1];
+    pieces -= removed.pieces.length / 8;
+    count -= removed.columns * removed.rows;
+    pairs -= removed.closures.length / 4;
+    if (2 + cells.levels.length - first + count + pieces + pairs <= capacity) {
+      return { ...cells, levels: cells.levels.slice(first), cellSize: cells.cellSize * 2 ** (first * cells.levelStep),
+        pieceCount: pieces, cellCount: count, closurePairCount: pairs };
+    }
+  }
+  return null;
+}
+
+export interface VectorClipPackingStats {
+  readonly uniquePayloads: number;
+  readonly sharedPayloads: number;
+  readonly rectangleNodes: number;
+  readonly cellIndexedNodes: number;
+  readonly bandIndexedNodes: number;
+  readonly unindexedPolygonNodes: number;
+  readonly coarsenedCellNodes: number;
+}
+
 export interface PackVectorClipOptions {
   /**
    * Index polygons with cells instead of bands. Only shaders that read flag
    * bit 2 may be given this layout: the clip GLSL and WGSL both do.
    */
   readonly cells?: boolean;
+  /** Upload-time diagnostics; node counts include nodes sharing a payload. */
+  readonly onStats?: (stats: VectorClipPackingStats) => void;
+}
+
+interface ClipPayload {
+  readonly edges: Float32Array;
+  readonly words: Uint32Array;
+  readonly rectangle: boolean;
+  bands: ClipBands | null;
+  cells: VectorPathCells | null;
+  coarsened: boolean;
+  offset: number;
+}
+
+/** Hash exact Float32 words, then verify collisions before sharing any geometry. */
+function clipPayloadKey(words: Uint32Array, rectangle: boolean): string {
+  let hash = 0x811c9dc5;
+  for (const word of words) hash = Math.imul(hash ^ word, 0x01000193);
+  return `${rectangle ? 1 : 0}:${words.length}:${hash >>> 0}`;
 }
 
 /**
@@ -169,8 +215,10 @@ export interface PackVectorClipOptions {
  * by one [firstEdgeTexel, count, 0, 0] per band and contiguous unchanged edge vec4s.
  * Edges shared by bands are duplicated to keep a single texture fetch per edge.
  * Consecutive rectangle ancestors are intersected once, preserving node IDs.
+ * Identical geometry shares a payload, independently of parent and fill rule.
  * The optional capacity bounds derived GPU storage; indexing falls back to the
- * original scan when it cannot fit. Canonical scene/HEP geometry is untouched.
+ * coarser cell levels, bands or original scan when it cannot fit. Canonical
+ * scene/HEP geometry is untouched.
  */
 export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels = MAX_VECTOR_CLIP_TEXELS,
   options: PackVectorClipOptions = {}): Float32Array {
@@ -181,6 +229,8 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
   if (rawCount > MAX_VECTOR_CLIP_TEXELS) throw new RangeError("Vector clip storage exceeds its limit.");
   const rectangles: (ClipRectangle | undefined)[] = [];
   const parents = new Int32Array(clips.length);
+  const payloads: ClipPayload[] = [], nodePayloads: ClipPayload[] = [];
+  const buckets = new Map<string, ClipPayload[]>();
   let count = clips.length;
   for (let index = 0; index < clips.length; index++) {
     const clip = clips[index];
@@ -195,39 +245,57 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
       parents[index] = parents[clip.parent];
     }
     rectangles.push(rectangle);
-    count += rectangle ? 1 : clip.edges.length / 4;
+    // Rectangle fusion depends on the parent, so compare the final bounds,
+    // not the original edges. Polygon storage is independent of both parent
+    // and fill rule; those stay in each original node's header.
+    const edges = rectangle ? Float32Array.from(rectangle) : clip.edges;
+    const words = new Uint32Array(edges.buffer, edges.byteOffset, edges.length);
+    const key = clipPayloadKey(words, !!rectangle), bucket = buckets.get(key);
+    let payload = bucket?.find(candidate => candidate.words.every((word, i) => word === words[i]));
+    if (!payload) {
+      payload = { edges, words, rectangle: !!rectangle, bands: null, cells: null, coarsened: false, offset: 0 };
+      if (bucket) bucket.push(payload); else buckets.set(key, [payload]);
+      payloads.push(payload);
+      count += edges.length / 4;
+    }
+    nodePayloads.push(payload);
   }
   if (count > maxTexels) throw new RangeError("Vector clip storage exceeds texture capacity.");
-  // Reserve every clip's unindexed payload first. An earlier index must never
+  // Reserve every unique unindexed payload first. An earlier index must never
   // consume the room needed by a later clip that the original layout could fit.
-  const indexes: (ClipBands | null)[] = [];
-  const cellIndexes: (VectorPathCells | null)[] = [];
-  for (let index = 0; index < clips.length; index++) {
-    const original = clips[index].edges.length / 4;
-    const cells = options.cells && !rectangles[index] ? buildClipCells(clips[index].edges) : null;
-    if (cells && count + clipCellTexels(cells) - original <= maxTexels) {
-      cellIndexes.push(cells); indexes.push(null); count += clipCellTexels(cells) - original;
+  for (const payload of payloads) {
+    const original = payload.edges.length / 4;
+    const fullCells = options.cells && !payload.rectangle ? buildClipCells(payload.edges) : null;
+    const capacity = maxTexels - count + original;
+    if (fullCells && clipCellTexels(fullCells) <= capacity) {
+      payload.cells = fullCells;
+      count += clipCellTexels(fullCells) - original;
       continue;
     }
-    cellIndexes.push(null);
-    const bands = rectangles[index] ? null : buildClipBands(clips[index].edges);
+    const bands = payload.rectangle ? null : buildClipBands(payload.edges);
     const extra = bands ? 1 + bands.counts.length + bands.entries - original : 0;
-    if (bands && count + extra <= maxTexels) { indexes.push(bands); count += extra; }
-    else indexes.push(null);
+    // Keep the existing band fallback when it fits: a very coarse cell grid
+    // may have longer candidate lists than bands. Coarsen only to avoid a
+    // complete edge scan when neither the full cell index nor bands fit.
+    if (bands && count + extra <= maxTexels) { payload.bands = bands; count += extra; continue; }
+    const cells = fullCells ? fitClipCells(fullCells, capacity) : null;
+    if (cells) {
+      payload.cells = cells; payload.coarsened = true;
+      count += clipCellTexels(cells) - original;
+    }
   }
   const data = new Float32Array(Math.max(1, count) * 4);
   let edgeOffset = clips.length;
-  for (let index = 0; index < clips.length; index++) {
-    const clip = clips[index], rectangle = rectangles[index], bands = indexes[index], cells = cellIndexes[index];
-    data.set([parents[index], edgeOffset, rectangle ? -1 : clip.edges.length / 4,
-      clip.fillRule + (bands ? 2 : 0) + (cells ? 4 : 0)], index * 4);
+  for (const payload of payloads) {
+    const { edges, bands, cells } = payload;
+    payload.offset = edgeOffset;
     if (cells) {
       edgeOffset = packClipCells(data, edgeOffset, cells);
       continue;
     }
     if (!bands) {
-      data.set(rectangle ?? clip.edges, edgeOffset * 4);
-      edgeOffset += rectangle ? 1 : clip.edges.length / 4;
+      data.set(edges, edgeOffset * 4);
+      edgeOffset += edges.length / 4;
       continue;
     }
     const bandCount = bands.counts.length, table = edgeOffset + 1;
@@ -239,15 +307,28 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
       bands.counts[band] = edgeOffset; // Reuse the counts as write cursors.
       edgeOffset += entries;
     }
-    for (let offset = 0; offset < clip.edges.length; offset += 4) {
-      const y0 = clip.edges[offset + 1], y1 = clip.edges[offset + 3];
+    for (let offset = 0; offset < edges.length; offset += 4) {
+      const y0 = edges[offset + 1], y1 = edges[offset + 3];
       const first = Math.max(0, clipBandRow(Math.min(y0, y1), bands.minY, bands.height, bandCount) - 1);
       const last = Math.min(bandCount - 1, clipBandRow(Math.max(y0, y1), bands.minY, bands.height, bandCount) + 1);
       for (let band = first; band <= last; band++) {
         const target = bands.counts[band]++ * 4;
-        for (let channel = 0; channel < 4; channel++) data[target + channel] = clip.edges[offset + channel];
+        for (let channel = 0; channel < 4; channel++) data[target + channel] = edges[offset + channel];
       }
     }
+  }
+  for (let index = 0; index < clips.length; index++) {
+    const payload = nodePayloads[index];
+    data.set([parents[index], payload.offset, payload.rectangle ? -1 : clips[index].edges.length / 4,
+      clips[index].fillRule + (payload.bands ? 2 : 0) + (payload.cells ? 4 : 0)], index * 4);
+  }
+  if (options.onStats) {
+    options.onStats({ uniquePayloads: payloads.length, sharedPayloads: clips.length - payloads.length,
+      rectangleNodes: nodePayloads.filter(payload => payload.rectangle).length,
+      cellIndexedNodes: nodePayloads.filter(payload => payload.cells).length,
+      bandIndexedNodes: nodePayloads.filter(payload => payload.bands).length,
+      unindexedPolygonNodes: nodePayloads.filter(payload => !payload.rectangle && !payload.cells && !payload.bands).length,
+      coarsenedCellNodes: nodePayloads.filter(payload => payload.coarsened).length });
   }
   return data;
 }

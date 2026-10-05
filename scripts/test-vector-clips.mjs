@@ -218,7 +218,8 @@ function testClipPacking(pack) {
     orientations.push(polygon([...points.slice(start), ...points.slice(0, start)], -1, fillRule));
   }
   const compact = pack(orientations);
-  assert.equal(compact.length, orientations.length * 8, "each rectangle needs only a header and bounds texel");
+  assert.equal(compact.length, (orientations.length + 1) * 4,
+    "rectangle orientations and fill rules keep separate headers sharing one bounds texel");
   for (let i = 0; i < orientations.length; i++) {
     assert.equal(compact[i * 4 + 2], -1);
     const offset = compact[i * 4 + 1] * 4;

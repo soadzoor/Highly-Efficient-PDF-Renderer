@@ -161,14 +161,65 @@ try {
   assert.throws(() => packVectorClips([clip], rawTexels - 1), /storage|limit|capacity/i,
     "a budget unable to store even the original geometry is rejected");
   const ample = packVectorClips([clip]);
-  const mixedBudget = ample.length / 4 + rawTexels;
+  const mixedBudget = ample.length / 4 + 1;
   const mixed = packVectorClips([clip, { ...clip, fillRule: 1 }], mixedBudget);
   assert(mixed.length / 4 <= mixedBudget, "several clips obey the shared upload budget");
   assert(mixed[3] >= 2, "the first useful index fits");
-  assert.equal(mixed[7], 1, "a later clip falls back when only its raw edge storage remains");
+  assert.equal(mixed[7], 3, "both fill rules reuse the same index within a single-payload budget");
+  assert.equal(mixed[1], mixed[5], "fill rules remain in separate headers sharing the geometry");
+  assert.equal(mixed.length / 4, mixedBudget);
   for (const y of [-70, -25, 0, 20, 70]) for (const x of [-125, -30, 0, 50, 125]) {
     for (const root of [0, 1]) assert.equal(packedContains(mixed, root, x, y), windingContains(oval, root, x, y));
   }
+  // Equal bounding boxes do not identify equal polygons. Different parents
+  // may share exact payloads, but each original node keeps its own ancestry.
+  const sharingClips = [
+    { parent: -1, fillRule: 0, edges: rectangle(-150, -80, 150, 80) },
+    { parent: -1, fillRule: 0, edges: rectangle(-150, -80, 0, 80) },
+    { parent: 0, fillRule: 0, edges: oval },
+    { parent: 1, fillRule: 1, edges: new Float32Array(oval) },
+    { parent: 1, fillRule: 0, edges: rectangle(-150, -80, 150, 80) },
+    { parent: -1, fillRule: 0, edges: polygon([[-125, 0], [0, -70], [125, 0], [0, 70]]) },
+    { parent: -1, fillRule: 0, edges: new Float32Array(0) },
+    { parent: 0, fillRule: 1, edges: new Float32Array(0) }
+  ];
+  let sharingStats;
+  const shared = packVectorClips(sharingClips, undefined, { onStats: stats => { sharingStats = stats; } });
+  assert.equal(shared[2 * 4 + 1], shared[3 * 4 + 1], "different parents share identical polygon payloads");
+  assert.notEqual(shared[2 * 4], shared[3 * 4], "each shared polygon keeps its own parent");
+  assert.equal(shared[4 * 4 + 1], shared[1 * 4 + 1], "rectangle sharing compares the final parent intersection");
+  assert.notEqual(shared[5 * 4 + 1], shared[2 * 4 + 1], "same-bounds different geometry is not merged");
+  assert.deepEqual(sharingStats, { uniquePayloads: 5, sharedPayloads: 3, rectangleNodes: 3,
+    cellIndexedNodes: 0, bandIndexedNodes: 2, unindexedPolygonNodes: 3, coarsenedCellNodes: 0 });
+  for (let root = 0; root < sharingClips.length; root++) {
+    for (const y of [-80, -60, 0, 30, 70]) for (const x of [-150, -90, -20, 0, 90, 150]) {
+      assert.equal(packedContains(shared, root, x, y), originalContains(sharingClips, root, x, y));
+    }
+  }
+  const sharedRaw = packVectorClips([clip, { ...clip, parent: 0, fillRule: 1 }], rawTexels + 1);
+  assert.equal(sharedRaw.length / 4, rawTexels + 1, "sharing also fits exact unindexed payload budgets");
+  assert.equal(sharedRaw[1], sharedRaw[5]); assert.equal(sharedRaw[7], 1);
+  assert.equal(sharedRaw[4], 0, "sharing never removes polygon ancestry");
+
+  // Construct a real FNV-1a collision. Hash equality alone must never merge
+  // geometry, even when all lengths and node types also match.
+  const firstEdges = Float32Array.of(0, 0, 1, 0, 1, 0, 0, 0);
+  const secondEdges = new Float32Array(firstEdges), words = new Uint32Array(secondEdges.buffer);
+  const hash = data => new Uint32Array(data.buffer).reduce((value, word) => Math.imul(value ^ word, 0x01000193), 0x811c9dc5) >>> 0;
+  const target = hash(firstEdges);
+  for (let candidate = 1; candidate < 100; candidate++) {
+    words[0] = candidate;
+    let prefix = 0x811c9dc5;
+    for (let i = 0; i < words.length - 1; i++) prefix = Math.imul(prefix ^ words[i], 0x01000193);
+    words[words.length - 1] = Math.imul(target, 0x359c449b) ^ prefix;
+    if (secondEdges.every(Number.isFinite)) break;
+  }
+  assert(secondEdges.every(Number.isFinite)); assert.equal(hash(secondEdges), target);
+  const collision = packVectorClips([{ parent: -1, fillRule: 0, edges: firstEdges },
+    { parent: -1, fillRule: 0, edges: secondEdges }]);
+  assert.notEqual(collision[1], collision[5], "colliding hashes retain distinct exact geometry");
+  assert.deepEqual(collision.subarray(collision[1] * 4, collision[1] * 4 + firstEdges.length), firstEdges);
+  assert.deepEqual(collision.subarray(collision[5] * 4, collision[5] * 4 + secondEdges.length), secondEdges);
   assert(clampMarginUsed, "antialiased coverage reaches past the chain bounds, so the clamp needs its margin");
   console.log(`Vector clip bands preserve crossings at ${checkedRows} boundary rows and Float32 winding at ${checkedPoints} points; ` +
     `${checkedDistances} pixel footprints preserve boundary distance and ${checkedCoverage} preserve coverage; ` +

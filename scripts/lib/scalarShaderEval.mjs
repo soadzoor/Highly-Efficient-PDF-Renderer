@@ -25,7 +25,7 @@ function compile(source, extra = {}) {
 
 export function evaluateGlsl(source, extra) {
   return compile(source
-    .replace(/\b(?:float|vec2|int|bool)\s+(hepr\w+)\s*\(([^)]*)\)\s*\{/g, (_, name, params) =>
+    .replace(/\b(?:float|vec2|vec4|int|bool)\s+(hepr\w+)\s*\(([^)]*)\)\s*\{/g, (_, name, params) =>
       `function ${name}(${params.split(",").map(param => param.trim().split(/\s+/).pop()).join(", ")}) {`)
     .replace(/\b(?:float|vec2|vec4|int|bool)\s+(\w+)\s*=/g, "let $1 =")
     .replace(/\bfloat\(/g, "toFloat(")

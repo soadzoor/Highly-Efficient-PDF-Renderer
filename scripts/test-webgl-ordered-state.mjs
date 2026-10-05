@@ -9,12 +9,13 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { WebGlPaintCompositor } = await import("../src/webGlPaintCompositor.ts");
 
-  for (const capacity of [16, 19, 32]) {
+  for (const capacity of [16, 19, 26, 27, 32]) {
     const mock = mockGl(capacity);
     const r = new WebGlFloorplanRenderer({ getContext: () => mock.gl });
     assert.equal(mock.calls.filter(([name, key]) => name === "getParameter" && key === 1).length, 1,
       "sampler capacity is queried once at construction");
     assert.equal(r.orderedDedicatedTextureUnits, capacity >= 19);
+    assert.equal(r.fillClipBoundsUnit, capacity >= 27 ? 26 : 14);
     const scene = createEmptyVectorScene();
     scene.segmentCount = scene.fillPathCount = scene.textInstanceCount = 2;
     const kinds = ["stroke", "fill", "text", "stroke", "fill", "text"];
@@ -42,6 +43,10 @@ try {
           assert.equal(paint.textures.get(paint.uniforms.get(name)), texture, `${name} is bound to its own texture`);
         }
         assert.equal(paint.textures.get(paint.uniforms.get("uVectorClipTex")), r.vectorClipTexture);
+        if (paint.program === r.fillProgram) {
+          assert.equal(paint.textures.get(paint.uniforms.get("uFillClipBoundsTex")), r.vectorClipBoundsTexture ?? r.vectorClipTexture);
+          assert.equal(paint.uniforms.get("uFillClipBoundsEnabled"), 0);
+        }
         assert.equal(paint.uniforms.get("uVectorClipIndex"), ordered ? -2 : 0);
         const location = paint.program === r.segmentProgram ? 1 : paint.program === r.fillProgram ? 3 : 2;
         assert.equal(paint.attributes.get(location).enabled, true);
@@ -62,7 +67,7 @@ try {
     assert.equal(mock.calls.filter(([name, location]) => name === "uniform1f" && location.name === "uPdfShapeOnly").length, 3);
     assert.equal(mock.calls.filter(([name, location]) => name === "uniform1i" && location.name === "uHeprMultiply").length, 3);
     const textureBinds = mock.calls.filter(([name]) => name === "bindTexture").length;
-    if (capacity >= 19) assert.equal(textureBinds, 19, "all nineteen textures are bound only once per ordered frame");
+    if (capacity >= 27) assert.equal(textureBinds, 20, "a spare bounds unit keeps paint textures bound once per frame");
     else assert(textureBinds > 19, "the lower-capacity layout safely rebinds overlapping slots");
     mock.clear();
     r.drawSourceOrderedContent(100, 100, 51, 50, 1);
