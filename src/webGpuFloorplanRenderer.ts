@@ -27,7 +27,8 @@ import { multiplyBlendState, multiplyFragmentWgsl } from "./vectorMultiply";
 import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { OrderedTextLodSelection } from "./orderedTextLod";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
-import { VECTOR_CLIP_AA_WGSL, VECTOR_CLIP_WGSL } from "./vectorClipShaders";
+import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
+import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 import { packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
@@ -964,12 +965,12 @@ ${pageBackgrounds ? `
 
 @group(1) @binding(0) var uVectorClipTex: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> uVectorClip: vec4f;
-${VECTOR_CLIP_AA_WGSL}
+${RASTER_CLIP_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
-  // A clip is often an image's visible outline, so its edge is antialiased
-  // over one pixel, measured before any discard. Color is premultiplied.
+  // Polygon clip edges are antialiased; rectangular tile/page clips stay
+  // solid. Measure the footprint before any discard. Color is premultiplied.
   let clipAAWidth = max(max(length(vec2f(dpdx(inData.world.x), dpdy(inData.world.x))),
     length(vec2f(dpdx(inData.world.y), dpdy(inData.world.y)))), 1e-4);
   let color = textureSample(uRasterTex, uRasterSampler, inData.uv) * ${pageBackgrounds ? "1.0" : "uRaster.matrixB.z"};

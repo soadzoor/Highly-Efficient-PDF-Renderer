@@ -1,4 +1,4 @@
-import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
+import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
 
 export const RASTER_ATLAS_VERTEX_GLSL = `#version 300 es
 precision highp float;
@@ -44,7 +44,7 @@ flat in vec4 vAtlasRect;
 flat in float vOpacity;
 out vec4 outColor;
 
-${VECTOR_CLIP_GLSL}
+${RASTER_CLIP_GLSL}
 
 vec4 sampleImageLevel(float level) {
   vec2 size = vAtlasRect.zw;

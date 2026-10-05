@@ -46,6 +46,7 @@ export const fastTests = [
   "pdf-layer-controls",
   "pdf-annotation-controls",
   "raster-layer-updates",
+  "raster-clip-seams",
   "raster-strip-batches",
   "raster-atlas-batches",
   "raster-tiles",

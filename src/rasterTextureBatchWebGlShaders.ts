@@ -1,4 +1,4 @@
-import { VECTOR_CLIP_GLSL } from "./vectorClipShaders";
+import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
 import { RASTER_CLIP_UV_BOUNDS_GLSL } from "./rasterClipBounds";
 
 // Leave two fragment samplers for geometric clips and a folded soft mask.
@@ -7,7 +7,7 @@ export const RASTER_BATCH_INSTANCES = 512;
 export const RASTER_BATCH_INSTANCE_FLOATS = 16;
 
 // Clip roots travel with the image, so different clips do not split a draw.
-const INSTANCE_CLIP_GLSL = VECTOR_CLIP_GLSL.replace("uniform float uVectorClipIndex;", "")
+const INSTANCE_CLIP_GLSL = RASTER_CLIP_GLSL.replace("uniform float uVectorClipIndex;", "")
   .replace(/uVectorClipIndex/g, "vRasterClip");
 
 export const RASTER_TEXTURE_BATCH_VERTEX_GLSL = `#version 300 es

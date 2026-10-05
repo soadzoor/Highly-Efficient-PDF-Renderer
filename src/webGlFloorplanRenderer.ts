@@ -30,7 +30,8 @@ import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { OrderedTextLodSelection } from "./orderedTextLod";
 import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
-import { VECTOR_CLIP_GLSL, VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
+import { RASTER_CLIP_GLSL } from "./rasterClipShaders";
+import { VECTOR_INSTANCE_CLIP_GLSL } from "./vectorClipShaders";
 import { MAX_VECTOR_CLIP_DEPTH, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds,
   type VectorClipPackingStats } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
@@ -1027,11 +1028,11 @@ in vec2 vUv;
 in vec2 vWorld;
 out vec4 outColor;
 
-${VECTOR_CLIP_GLSL}
+${RASTER_CLIP_GLSL}
 
 void main() {
-  // A clip is often an image's visible outline, so its edge is antialiased
-  // over one pixel, measured before any discard. Color is premultiplied.
+  // Polygon clip edges are antialiased; rectangular tile/page clips stay
+  // solid. Measure the footprint before any discard. Color is premultiplied.
   float clipAAWidth = max(max(length(vec2(dFdx(vWorld.x), dFdy(vWorld.x))),
     length(vec2(dFdx(vWorld.y), dFdy(vWorld.y)))), 1e-4);
   vec4 color = texture(uRasterTex, vUv) * uRasterOpacity;
