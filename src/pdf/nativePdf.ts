@@ -106,6 +106,7 @@ export {
   NativePdfExtGStateRegistry,
   type NativePdfBlendModeName,
   type NativePdfExtGStateDescription,
+  type NativePdfExtGStateFont,
   type NativePdfExtGStateGroupSidecars,
   type NativePdfExtGStateOptions,
   type NativePdfLineDash,

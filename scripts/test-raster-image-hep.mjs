@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import { createCanvas, ImageData as NodeImageData } from "@napi-rs/canvas";
-import { HepArchive, crc32 } from "../src/hepContainer.ts";
+import { HepArchive, crc32 } from "./lib/hepContainer.mjs";
 import { registerHooks } from "node:module";
 
 Promise.try ??= (callback, ...args) => Promise.resolve().then(() => callback(...args));

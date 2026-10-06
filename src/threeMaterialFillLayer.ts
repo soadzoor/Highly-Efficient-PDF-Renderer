@@ -1,3 +1,4 @@
+import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import { vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
@@ -6,7 +7,7 @@ import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
-import { enableThreeNodePaintFold, enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
+import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
 
@@ -18,7 +19,7 @@ import {
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import { HEPR_THREE_LAYER_ORDER_FILL } from "./threeLayerOrder";
 import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
-import { createThreeWebGpuFillMaterial, type ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
+import type { ThreeWebGpuFillMaterialState } from "./threeWebGpuFillMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -26,6 +27,7 @@ interface FillLayerOptions {
   pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
+  webGpu?: ThreeWebGpuBackend;
   colorCompositing?: ThreeColorCompositing;
   vectorOverride: [number, number, number, number];
 }
@@ -151,7 +153,7 @@ export class ThreeMaterialFillLayer {
     const pageBinding = options.pageTransforms?.instances("fill", scene);
     let material: THREE.Material;
     if ((options.materialBackend ?? "webgl") === "webgpu") {
-      const state = createThreeWebGpuFillMaterial({
+      const state = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuFillMaterial({
         colorCompositing: options.colorCompositing ?? "linear",
         fillPathMetaTextureA: this.fillPathMetaTextureA,
         fillPathMetaTextureB: this.fillPathMetaTextureB,
@@ -173,7 +175,7 @@ export class ThreeMaterialFillLayer {
       state.useLocalToClipUniform.value = this.useLocalToClipUniform.value;
       this.webGpuState = state;
       material = state.material;
-      enableThreeNodePaintFold(state.material);
+      requireThreeWebGpuBackend(options.webGpu).enableThreeNodePaintFold(state.material);
     } else {
       material = new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,

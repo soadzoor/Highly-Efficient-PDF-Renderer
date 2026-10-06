@@ -8,6 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 try {
+  const webGpu = await import("../src/threeWebGpuBackend.ts");
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
@@ -60,7 +61,8 @@ try {
       { width: 800, height: 600 }, null, { vectorLodMode: "off", textLodMode: "off", strokeCurveEnabled: true,
         textVectorOnly: true, threeColorCompositing: "linear", pageBackground: [1,1,1,1], vectorOverride: [0,0,0,0] },
       0, stub(), stub(), stub(), stub(), null, null, null, stub(), null,
-      new THREE.Mesh(new THREE.PlaneGeometry(100,100), new THREE.MeshBasicMaterial()), uv, new THREE.BufferAttribute(uv, 2));
+      new THREE.Mesh(new THREE.PlaneGeometry(100,100), new THREE.MeshBasicMaterial()), uv, new THREE.BufferAttribute(uv, 2),
+      undefined, undefined, backend === "webgpu" ? webGpu : undefined);
   };
   for (const backend of ["webgl", "webgpu"]) {
     const object = makeObject(scene, backend);

@@ -1,4 +1,4 @@
-import { Color } from "three";
+import { CSS_NAMED_COLORS } from "./cssNamedColors";
 import type { Bounds, VectorClipPath, VectorScene } from "./pdfVectorExtractor";
 import { buildGradientMeshBoundary } from "./gradientMeshBoundary";
 import { MAX_VECTOR_CLIP_EDGES } from "./vectorClips";
@@ -42,7 +42,7 @@ export function normalizePrimitiveColor(input: PrimitiveColorInput): [number, nu
     const value = input.trim().toLowerCase();
     if (/^#[\da-f]{3}$/.test(value)) packed = parseInt(value.slice(1).split("").map(c => c + c).join(""), 16);
     else if (/^#?[\da-f]{6}$/.test(value)) packed = parseInt(value.replace(/^#/, ""), 16);
-    else if (Object.hasOwn(Color.NAMES, value)) packed = Color.NAMES[value as keyof typeof Color.NAMES];
+    else if (Object.hasOwn(CSS_NAMED_COLORS, value)) packed = CSS_NAMED_COLORS[value];
     else throw new TypeError(`Unsupported primitive color: ${input}`);
   } else throw new TypeError("Invalid primitive color.");
   if (!Number.isInteger(packed) || packed < 0 || packed > 0xffffff) throw new TypeError("Invalid primitive color number.");

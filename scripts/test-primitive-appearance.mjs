@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { Color } from "three";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) return next(`${specifier}.ts`, context);
@@ -33,9 +34,16 @@ try {
   assert.deepEqual(normalizePrimitiveColor("red"), [1, 0, 0]);
   assert.deepEqual(normalizePrimitiveColor("ff0000"), [1, 0, 0]);
   assert.deepEqual(normalizePrimitiveColor("rebeccapurple"), [102 / 255, 51 / 255, 153 / 255]);
+  for (const [name, packed] of Object.entries(Color.NAMES)) {
+    assert.deepEqual(normalizePrimitiveColor(` ${name.toUpperCase()} `),
+      [(packed >>> 16) / 255, ((packed >>> 8) & 255) / 255, (packed & 255) / 255],
+      `Preserve the existing named color ${name}`);
+  }
   assert.deepEqual(normalizePrimitiveColor("#abc"), [170 / 255, 187 / 255, 204 / 255]);
   assert.deepEqual(normalizePrimitiveColor(0x123456), [18 / 255, 52 / 255, 86 / 255]);
   assert.throws(() => normalizePrimitiveColor("nonsense"), /color/);
+  assert.throws(() => normalizePrimitiveColor("constructor"), /color/);
+  assert.throws(() => normalizePrimitiveColor("transparent"), /color/);
   assert.throws(() => normalizePrimitiveColor([1, NaN, 0]), /color/);
   state.setOverrides([a, a], { color: "red" });
   assert.equal(colorCalls.length, 1);

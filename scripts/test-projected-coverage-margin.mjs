@@ -123,11 +123,11 @@ for (const source of [CLIPPED_PAINT_QUAD_GLSL, CLIPPED_PAINT_QUAD_WGSL]) {
   assert.equal((source.match(/heprBoundCoverageMargin\(/g) ?? []).length, 4,
     "a shared clipped-paint margin is safe at all four corners");
 }
-for (const file of ["webGlFloorplanRenderer.ts", "nativeGradientWebGlShaders.ts", "threeWebGpuTextMaterial.ts", "threeWebGpuFillMaterial.ts"]) {
+for (const file of ["nativeWebGlCoreShaders.ts", "nativeGradientWebGlShaders.ts", "threeWebGpuTextMaterial.ts", "threeWebGpuFillMaterial.ts"]) {
   const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
   assert.equal((source.match(/heprBoundCoverageMargin\(/g) ?? []).length, file === "threeWebGpuTextMaterial.ts" ? 0 : 1,
     `${file}: projected fills still apply the general limiter`);
-  if (file === "webGlFloorplanRenderer.ts" || file === "threeWebGpuTextMaterial.ts") {
+  if (file === "nativeWebGlCoreShaders.ts" || file === "threeWebGpuTextMaterial.ts") {
     assert.equal((source.match(/heprBoundCoverageMarginFromPixel\(/g) ?? []).length, 1,
       `${file}: glyphs reuse the pixel Jacobian instead of reprojecting padding`);
     assert.match(source, /heprCoverageMargin\(glyphToPixel\)/);

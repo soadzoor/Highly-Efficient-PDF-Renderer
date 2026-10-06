@@ -75,7 +75,11 @@ for (const [name, shader] of [["GLSL", evaluateGlsl(FILL_COVERAGE_GLSL)], ["WGSL
 }
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const read = relativePath => readFile(path.resolve(scriptDir, relativePath), "utf8");
+const read = async relativePath => {
+  const source = await readFile(path.resolve(scriptDir, relativePath), "utf8");
+  return relativePath === "../src/webGlFloorplanRenderer.ts"
+    ? source + await readFile(path.resolve(scriptDir, "../src/nativeWebGlCoreShaders.ts"), "utf8") : source;
+};
 for (const relativePath of ["../src/webGlFloorplanRenderer.ts", "../src/webGpuFloorplanRenderer.ts", "../src/threeWebGpuTextMaterial.ts"]) {
   const source = await read(relativePath);
   const language = relativePath.includes("webGl") ? "GLSL" : "WGSL";

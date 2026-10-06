@@ -11,6 +11,7 @@ export const fastTests = [
   "test-runner",
   "document-loading",
   "public-load-cancellation",
+  "pdf-source-ownership",
   "hep-container",
   "hep-float32-palette",
   "hep-api",
@@ -28,6 +29,7 @@ export const fastTests = [
   "hep-scene-sections",
   "optional-content",
   "retained-page-replay",
+  "retained-page-compositor",
   "retained-vector-page",
   "retained-packed-strokes",
   "retained-single-paint-opacity",
@@ -42,6 +44,7 @@ export const fastTests = [
   "vector-fill-bands",
   "vector-cell-index",
   "webgl-shader-precision",
+  "shader-comment-compaction",
   "webgl-fill-clip-bounds",
   "subpixel-stroke-coverage",
   "fill-area-coverage",
@@ -60,6 +63,7 @@ export const fastTests = [
   "three-raster-paint-order",
   "three-page-background-batching",
   "three-page-transforms",
+  "three-backend-loading",
   "three-page-transform-batching",
   "scene-page-views",
   "shared-page-renderer",
@@ -83,6 +87,9 @@ export const fastTests = [
   "native-document-semantics",
   "native-source-range-edge-cases",
   "native-font-text",
+  "pdf-session-ext-gstate-font",
+  "native-image-codecs",
+  "jbig2-codec-safety",
   "native-parser-fuzz",
   "pdf-range-transport",
   "pdf-session",
@@ -144,6 +151,7 @@ export const fastTests = [
   "native-paint-compositor",
   "native-direct-rendering",
   "text-lod-core",
+  "lod-worker",
   "text-lod-foreshortening",
   "native-ordered-text-lod",
   "three-ordered-text-lod",
@@ -170,7 +178,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package"],
+  package: ["browser-package", "bundler-package", "lod-worker-package", "built-material-shaders"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",

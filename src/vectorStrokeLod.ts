@@ -1,3 +1,4 @@
+import type { ThreeWebGpuBackend } from "./threeMaterialBackend";
 import type { ThreePageTransforms } from "./threePageTransforms";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import { getThreeVectorDrawPlan, type ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
@@ -39,6 +40,7 @@ interface VectorStrokeLodLayerOptions {
   pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
+  webGpu?: ThreeWebGpuBackend;
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];

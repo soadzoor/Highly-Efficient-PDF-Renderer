@@ -9,6 +9,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
@@ -112,7 +114,7 @@ try {
   assert.equal(nodeBlend.fragmentNode, node.fragmentNode);
   nodeBlend.dispose(); node.dispose();
   for (const materialBackend of ["webgl", "webgpu"]) {
-    const layer = new ThreeMaterialRasterLayer(scene, { materialBackend, pageBackground: [1, 1, 1, 0] });
+    const layer = new ThreeMaterialRasterLayer(scene, { materialBackend, webGpu, pageBackground: [1, 1, 1, 0] });
     applyThreePdfOverlayPaintOrder(scene, layer.group, []);
     const image = layer.group.children.at(-1), completion = image.children[0];
     assert(completion.userData.heprMultiplyCompletion);

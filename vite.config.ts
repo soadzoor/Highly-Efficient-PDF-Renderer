@@ -1,11 +1,14 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
+import { shaderCommentCompactionPlugin } from "./scripts/lib/compactShaderComments.mjs";
 
 export default defineConfig(({ mode }) => {
+  const sourceDir = `${resolve(import.meta.dirname, "src")}/`;
   if (mode === "lib") {
     return {
-      worker: { format: "es" },
+      plugins: [shaderCommentCompactionPlugin(sourceDir)],
+      worker: { format: "es", plugins: () => [shaderCommentCompactionPlugin(sourceDir)] },
       // Keep worker chunks relative to the package entry so consumers do not
       // accidentally request them from the host application's root.
       base: "./",
@@ -30,14 +33,14 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
-    plugins: [{
+    plugins: [shaderCommentCompactionPlugin(sourceDir), {
       name: "package-version-label",
       transformIndexHtml(html) {
         const { version } = JSON.parse(readFileSync(resolve(import.meta.dirname, "package.json"), "utf8"));
         return html.replaceAll("%HEPR_PACKAGE_VERSION%", version);
       }
     }],
-    worker: { format: "es" },
+    worker: { format: "es", plugins: () => [shaderCommentCompactionPlugin(sourceDir)] },
     // Use relative asset URLs so builds work when hosted from a repo subpath on GitHub Pages.
     base: "./",
     build: {

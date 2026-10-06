@@ -9,6 +9,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
@@ -46,7 +48,7 @@ try {
     .map(([key, value]) => [key, value.slice()]));
 
   for (const backend of ["webgl", "webgpu"]) {
-    const options = { materialBackend: backend, strokeCurveEnabled: true, textVectorOnly: true,
+    const options = { materialBackend: backend, webGpu, strokeCurveEnabled: true, textVectorOnly: true,
       vectorOverride: [0.8, 0.7, 0.6, 0.25] };
     const stroke = new ThreeMaterialStrokeLayer(scene, options);
     const fill = new ThreeMaterialFillLayer(scene, options);
@@ -75,7 +77,7 @@ try {
     assert.deepEqual([...fill.fillPathMetaTextureC.image.data], [...scene.fillPathMetaC]);
     assert.deepEqual([...text.textInstanceTextureC.image.data], [...scene.textInstanceC].map(value => Math.round(value * 255)));
     assert.equal(gradient.entries[0].primitiveColor.w, 0);
-    const overlay = new ThreePrimitiveHighlightLayer(backend, "linear");
+    const overlay = new ThreePrimitiveHighlightLayer(backend, "linear", webGpu);
     assert.equal(overlay.mesh.material.transparent, true, "traces follow the opaque fallback page");
     const packet = buildPrimitiveHighlights(scene, [{ kind: "stroke", index: 0 }], { kind: "text", index: 0 });
     overlay.setHighlights(packet);
@@ -101,7 +103,7 @@ try {
     drawRuns: [{ kind: "stroke", first: 0, count: 2 }] };
   for (const backend of ["webgl", "webgpu"]) {
     const layer = new ThreeMaterialStrokeLayer(duplicateScene, {
-      materialBackend: backend, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0]
+      materialBackend: backend, webGpu, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0]
     });
     assert.equal(layer.getRenderedSegmentCount(), 1);
     for (const kind of ["stroke", "fill", "text"]) {
@@ -173,6 +175,28 @@ try {
   const geometry = object.primitiveHighlightLayer.mesh.geometry;
   object.setSelection([{ kind: "stroke", index: 0 }, { kind: "stroke", index: 0 }]);
   assert.equal(object.primitiveHighlightLayer.mesh.geometry, geometry, "duplicate selection reuses traces");
+  // Native texture fallback keeps its independent overlay on a different host.
+  const gpuHost = { isWebGPURenderer: true, domElement: element,
+    getDrawingBufferSize: target => target.set(200, 200), getPixelRatio: () => 1 };
+  const redraws = [];
+  object.addEventListener("change", event => {
+    assert.equal(event.target, object);
+    assert.equal(object.primitiveHighlightLayer.mesh.material.isNodeMaterial, true);
+    assert.equal(object.primitiveHighlightLayer.mesh.visible, true);
+    redraws.push(event.reason);
+  });
+  assert.equal(object.webGpu, undefined, "WebGL object construction leaves the optional backend unloaded");
+  object.syncPrimitiveHighlightFrame(gpuHost, cameras[0]);
+  assert.equal(object.primitiveHighlightLayer.mesh.visible, false, "incompatible overlay waits for the host backend");
+  const pendingOverlay = object.pendingHighlightBackend;
+  assert(pendingOverlay instanceof Promise);
+  object.setSelection([{ kind: "stroke", index: 0 }, { kind: "fill", index: 0 }]);
+  await pendingOverlay;
+  assert.deepEqual(redraws, ["primitive-highlights-ready"], "demand-rendered hosts receive a redraw request");
+  assert.equal(object.primitiveHighlightLayer.mesh.material.isNodeMaterial, true);
+  assert.equal(object.primitiveHighlightLayer.mesh.visible, true);
+  assert.equal(object.primitiveHighlightLayer.mesh.geometry.instanceCount,
+    object.primitiveAppearance.getHighlights().count, "first-use loading installs the latest selection");
   object.setPrimitiveOverrides([{ kind: "stroke", index: 0 }], { color: "red" });
   assert.equal(nativeUpdates.length, 0, "dormant native scene must stay unallocated");
   uploaded = true;
@@ -184,7 +208,22 @@ try {
   unsubscribe(); unsubscribeThrowing();
   assert.equal(object.primitiveHighlightLayer, null);
   assert.equal(object.primitivePicker, null);
+  object.setSelection([{ kind: "stroke", index: 0 }]);
+  object.webGpu = undefined;
+  object.syncPrimitiveHighlightFrame(gpuHost, cameras[0]);
+  const pendingClearedOverlay = object.pendingHighlightBackend;
+  object.clearPrimitiveInteraction();
+  await pendingClearedOverlay;
+  assert.equal(object.primitiveHighlightLayer, null, "cleared selections cannot install a pending overlay");
+  assert.deepEqual(redraws, ["primitive-highlights-ready"], "missing overlays do not request another frame");
+  object.setSelection([{ kind: "stroke", index: 0 }]);
+  object.webGpu = undefined;
+  object.syncPrimitiveHighlightFrame(gpuHost, cameras[0]);
+  const pendingDisposedOverlay = object.pendingHighlightBackend;
   object.dispose();
+  await pendingDisposedOverlay;
+  assert.equal(object.primitiveHighlightLayer, null, "disposed objects cannot install a pending overlay");
+  assert.deepEqual(redraws, ["primitive-highlights-ready"], "disposed objects cannot request another frame");
   await assert.rejects(object.pick({ camera: cameras[0], element, clientX: 100, clientY: 100 }), /disposed/);
   for (const [key, value] of Object.entries(original)) assert.deepEqual(scene[key], value, `${key} remains immutable`);
   console.log("Three primitive interaction, color restoration, projection, overlay, and deferred replay tests passed");

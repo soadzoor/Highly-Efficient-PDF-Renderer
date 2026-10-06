@@ -184,7 +184,7 @@ try {
   );
   await assert.rejects(
     registry.resolvePageExtGState(0, "BadFont"),
-    hasPdfError("unsupported-font", "extgstate-font-unsupported")
+    hasPdfError("invalid-object", "extgstate-font-invalid")
   );
   await registry.resolvePageExtGState(0, "BadHalftone");
   for (const name of ["BadBlackGeneration", "BadUndercolor", "BadTransfer"]) {

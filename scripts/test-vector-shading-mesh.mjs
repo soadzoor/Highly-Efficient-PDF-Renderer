@@ -7,6 +7,8 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
       !/\.[a-z0-9]+(?:[?#]|$)/i.test(specifier)) return nextResolve(`${specifier}.ts`, context);
   return nextResolve(specifier, context);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { buildHeprVectorGradient } = await import("../src/retainedVectorGradient.ts");
@@ -62,7 +64,7 @@ try {
       assert.equal(mesh.vertices.length, scene.gradientMeshIndices.length * 6);
       assert.equal(mesh.ranges[1], scene.gradientMeshIndices.length);
       for (const backend of ["webgl", "webgpu"]) {
-        const layer = new ThreeMaterialGradientLayer(scene, { materialBackend: backend, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
+        const layer = new ThreeMaterialGradientLayer(scene, { materialBackend: backend, webGpu, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
         assert.equal(layer.entries[0].geometry.getAttribute("aMeshPosition").count, scene.gradientMeshIndices.length);
         if (backend === "webgl") {
           assert.match(layer.entries[0].material.vertexShader, /vec2 world = aMeshPosition;/);

@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 import { createServer } from "vite";
 
 Promise.try ??= (callback, ...args) => Promise.resolve().then(() => callback(...args));

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { build, parseAst } from "vite";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
+import { imagePdf, tinyJbig2, tinyJbig2Globals } from "./lib/imageCodecFixtures.mjs";
+import { checkBundlerSizes } from "./lib/bundleSizeChecks.mjs";
 
+const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
 const fixture = await mkdtemp(resolve(tmpdir(), "hepr-bundler-consumer-"));
 const keepFixture = process.argv.includes("--keep-fixture");
@@ -14,15 +18,17 @@ try {
   await cp(new URL("./fixtures/bundler-consumer/", import.meta.url), fixture, { recursive: true });
   // npm's publish file list is part of the contract. Never resolve HEPR from
   // the source checkout or a linked package, which Vite treats differently.
-  const packed = JSON.parse(execFileSync("npm", [
-    "pack", "--ignore-scripts", "--json", "--pack-destination", fixture
+  await execFileAsync("npm", [
+    "pack", "--ignore-scripts", "--pack-destination", fixture
   ], {
     cwd: root, encoding: "utf8", timeout: 20_000,
     env: { ...process.env, npm_config_cache: resolve(fixture, ".npm-cache"), npm_config_update_notifier: "false" }
-  }))[0];
+  });
+  const archives = (await readdir(fixture)).filter(name => name.endsWith(".tgz"));
+  assert.equal(archives.length, 1, "npm pack must create exactly one package archive");
   const installed = resolve(fixture, "node_modules/@soadzoor/hepr");
   await mkdir(installed, { recursive: true });
-  execFileSync("tar", ["-xzf", resolve(fixture, packed.filename), "--strip-components=1", "-C", installed]);
+  await execFileAsync("tar", ["-xzf", resolve(fixture, archives[0]), "--strip-components=1", "-C", installed]);
   for (const dependency of ["three", "vite"]) {
     await symlink(resolve(root, "node_modules", dependency), resolve(fixture, "node_modules", dependency), "junction");
   }
@@ -43,13 +49,13 @@ try {
   for (const base of ["/hepr-smoke/", "./"]) {
     const result = await build({ ...consumerConfig, base });
     files = new Map(result.output.map(file => [file.fileName, file]));
-    for (const prefix of ["libjpeg-turbo-", "lcms-", "qcms-"]) {
+    for (const prefix of ["libjpeg-turbo-", "openjpeg-", "jbig2-", "lcms-", "qcms-"]) {
       assert([...files.keys()].some(name => name.startsWith(`assets/${prefix}`) && name.endsWith(".wasm")),
         `${prefix} WASM must be emitted by the consumer`);
     }
     assert([...files.keys()].some(name => /LiberationSans-Regular-.*\.ttf$/.test(name)),
       "standard fonts must be emitted by the consumer");
-    for (const worker of ["pdfWorkerEntry", "roomDetectorWorker"]) {
+    for (const worker of ["pdfWorkerEntry", "roomDetectorWorker", "lodWorkerEntry"]) {
       assert([...files.keys()].some(name => new RegExp(`/${worker}-.*\\.js$`).test(name)),
         `${worker} must be built by the consumer`);
     }
@@ -117,6 +123,20 @@ try {
       assert(!session.getDiagnostics().some(diagnostic => diagnostic.code === "icc-alternate-used"));
     } finally { await session.close(); }
   }
+  const jpx = new Uint8Array(await readFile(new URL("./fixtures/codecs/rgb-8x8.jp2", import.meta.url)));
+  for (const [bytes, expected] of [
+    [imagePdf(jpx), [16, 85, 204, 255]],
+    [imagePdf(tinyJbig2(), { filter: "JBIG2Decode", width: 8, height: 2,
+      colorSpace: "/DeviceGray", bitsPerComponent: 1, globals: tinyJbig2Globals() }), [255, 255, 255, 255]]
+  ]) {
+    const session = await openPdfInNodeWorker({ kind: "bytes", bytes }, { workerUrl });
+    try {
+      const page = await session.compilePage(0, { optimization: "none" });
+      assert.deepEqual([...page.stores.images.data.subarray(0, 4)], expected,
+        "lazy image codecs must work from the consumer's emitted parser worker");
+    } finally { await session.close(); }
+  }
+  await checkBundlerSizes(fixture, consumerConfig);
   console.log(`Packed bundler entry passed: ${files.size} consumer files, assets resolved, worker sessions and both ICC engines exercised.`);
 } finally {
   if (keepFixture) console.log(`Manual browser fixture retained at ${fixture}`);

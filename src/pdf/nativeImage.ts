@@ -71,6 +71,8 @@ export interface NativeImageCodecRequest {
   /** Expected sample precision, or zero when JPX owns the precision. */
   readonly bitsPerComponent: number;
   readonly imageMask: boolean;
+  /** JPX samples are PDF palette indices; skip codestream palette expansion. */
+  readonly indexedColorSpace?: boolean;
   readonly encoded: Uint8Array;
   readonly globals: Uint8Array;
   readonly decodeParameters: Readonly<Record<string, CodecMetadataValue>>;
@@ -89,8 +91,9 @@ export interface NativeImageCodecRequest {
  * big-endian. The byte length must be exactly
  * `ceil(width * components * bitsPerComponent / 8) * height`.
  *
- * A JPX resolver must apply codestream palette/channel mapping and return
- * components in the explicit PDF `/ColorSpace` order. If `SMaskInData=1`, the
+ * A JPX resolver must apply codestream palette/channel mapping (unless
+ * `indexedColorSpace` requests raw PDF indices) and return components in the
+ * explicit PDF `/ColorSpace` order. If `SMaskInData=1`, the
  * final component is straight opacity. Signed or heterogeneous-precision JPX
  * components must be normalized to the single unsigned precision reported by
  * the result. `SMaskInData=2` is intentionally rejected until the bridge can
@@ -630,6 +633,9 @@ export class NativePdfImageRegistry {
             : componentCount + embeddedOpacityComponents,
           bitsPerComponent,
           imageMask,
+          ...(terminalCodec === "jpeg2000" ? {
+            indexedColorSpace: colorSpaceIndex >= 0 && this.colors.describe(colorSpaceIndex).kind === "Indexed"
+          } : {}),
           encoded: requestEncoded,
           globals: requestGlobals,
           decodeParameters: metadata,
@@ -748,7 +754,9 @@ export class NativePdfImageRegistry {
               : { colors: decodedSamples, opacity: null };
             validateColorKeyMaskPrecision(colorKeyMask, resolved.bitsPerComponent);
             const effectiveDecode = terminalCodec === "jpeg2000" && decode.length === 0
-              ? this.colors.defaultDecode(colorSpaceIndex)
+              ? this.colors.describe(colorSpaceIndex).kind === "Indexed"
+                ? [0, (2 ** resolved.bitsPerComponent) - 1]
+                : this.colors.defaultDecode(colorSpaceIndex)
               : decode;
             const converted = convertSamplesToSrgb(
               separated.colors,

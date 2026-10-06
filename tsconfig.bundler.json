@@ -10,6 +10,7 @@
     "src/index.ts",
     "src/pdf/pdfWorkerEntry.ts",
     "src/roomDetectorWorker.ts",
+    "src/lodWorkerEntry.ts",
     "src/vite-env.d.ts"
   ]
 }

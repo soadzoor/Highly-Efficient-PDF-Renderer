@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { decodeFloat32Palette, encodeFloat32Palette } from "../src/hepContainer.ts";
+import { decodeFloat32Palette, encodeFloat32Palette } from "./lib/hepContainer.mjs";
 import { decodeXorDeltaByteShuffledFloat32, encodeXorDeltaByteShuffledFloat32 } from "../src/parsedDataEncoding.ts";
 
 const bits = value => new Uint32Array(value.buffer, value.byteOffset, value.length);

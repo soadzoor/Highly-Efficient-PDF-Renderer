@@ -4,13 +4,15 @@ import {
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
-import { loadSceneFromHep, prepareSceneForHepRendering } from "./hep";
+import { loadSceneFromHep } from "./hepReader";
+import { prepareSceneForHepRendering } from "./hepShared";
 import { hasHepSignature, hasLegacyZipSignature } from "./hepContainer";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";
 import { waitForLoad } from "./loadCancellation";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
 
 /**
@@ -28,6 +30,8 @@ export type PdfObjectSourceKind = "pdf" | "hep";
  * Options used while loading and parsing a source into HEPR scene data.
  */
 export interface PdfObjectGeneratorOptions extends PdfIccOptions {
+  /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
+  imageCodecResolver?: NativeImageCodecResolver;
   /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 
@@ -189,6 +193,7 @@ async function loadPdfSceneFromSourceInternal(
     validateAnnotationAppearanceMode(options.annotationAppearances);
     const extractOptions: VectorExtractOptions = {
       password: options.password,
+      imageCodecResolver: options.imageCodecResolver,
       iccTransformResolver: options.iccTransformResolver,
       iccEngine: options.iccEngine,
       annotationAppearances: options.annotationAppearances,
@@ -202,7 +207,8 @@ async function loadPdfSceneFromSourceInternal(
     const pageScenes = await extractPdfPageScenes(
       createParseBuffer(sourceBytes),
       extractOptions,
-      signal
+      signal,
+      "transfer"
     );
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
@@ -263,7 +269,7 @@ export async function readPdfObjectSourceBytes(
   if (isBlobLike(source)) {
     const buffer = await waitForPromiseWithAbort(source.arrayBuffer(), signal);
     signal?.throwIfAborted();
-    const bytes = new Uint8Array(buffer).slice();
+    const bytes = new Uint8Array(buffer);
     progress?.complete({ stage: "source", unit: "bytes", processed: bytes.length, total: bytes.length });
     signal?.throwIfAborted();
     return bytes;

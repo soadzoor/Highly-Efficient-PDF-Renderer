@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import vm from "node:vm";
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 import { waitForLoad, yieldForLoad } from "../src/loadCancellation.ts";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
@@ -89,9 +89,13 @@ try {
 async function testPublicPipeline(reason) {
   const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
   const stages = ["before", "source", "vector-lod", "text-lod", "upload", "create", "complete", "success"];
-  const cases = ["pdf", "scene"].flatMap(sourceKind => stages.map(stage => ({ sourceKind, stage })));
-  for (const { sourceKind, stage } of cases) {
+  const sources = [{ sourceKind: "pdf" }, { sourceKind: "scene" },
+    { sourceKind: "hep", storedLod: false }, { sourceKind: "hep", storedLod: true }];
+  const cases = sources.flatMap(source => stages.map(stage => ({ ...source, stage })));
+  for (const { sourceKind, storedLod, stage } of cases) {
     if (sourceKind === "scene" && stage === "source") continue;
+    const vectorLodStage = storedLod ? "vector-lod-restore" : "vector-lod";
+    const events = [];
     const controller = new AbortController();
     let created = 0;
     let disposed = 0;
@@ -107,11 +111,12 @@ async function testPublicPipeline(reason) {
     const context = vm.createContext({
       createLoadProgressReporter, yieldForLoad,
       loadPdfSceneFromSource: async (_source, options) => {
-        assert.equal(sourceKind, "pdf", "compiled scenes must bypass source loading");
+        assert.notEqual(sourceKind, "scene", "compiled scenes must bypass source loading");
         assert.equal(options.signal, controller.signal);
         options.onProgress({ stage: "source", value: 1 });
-        return { scene: {}, sourceKind: "pdf" };
+        return { scene: {}, sourceKind };
       },
+      hasStoredVectorStrokeLod: () => storedLod === true,
       reserveVectorStrokeLodRuntime: async (_scene, _mode, _backend, options) => {
         if (options.shouldCancel()) throw new Error("vector scheduler cancelled");
         reserved++;
@@ -143,18 +148,22 @@ async function testPublicPipeline(reason) {
     vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
     vm.runInContext(sourceFunction(source, "pdfObjectGenerator"), context);
     if (stage === "before") controller.abort(reason);
-    const factory = sourceKind === "pdf" ? context.pdfObjectGenerator : context.createThreePdfObject;
-    const pending = factory(sourceKind === "pdf" ? bytesForTest() : {}, {
+    const factory = sourceKind === "scene" ? context.createThreePdfObject : context.pdfObjectGenerator;
+    const pending = factory(sourceKind === "scene" ? {} : bytesForTest(), {
       sourceLabel: "Host strokes",
       signal: controller.signal,
       onProgress: (event) => {
+        events.push(event);
         if (event.stage !== "source") assert.equal(event.sourceType, sourceKind);
-        if (event.stage === stage) controller.abort(reason);
+        if (event.stage === (stage === "vector-lod" ? vectorLodStage : stage)) controller.abort(reason);
       }
     });
     if (stage === "success") {
       assert.equal(await pending, object);
       assert.equal(disposed, 0);
+      assert(events.some(event => event.stage === vectorLodStage));
+      assert(!events.some(event => event.stage === (storedLod ? "vector-lod" : "vector-lod-restore")),
+        "stored LOD reports restoration; a missing hierarchy reports building");
     } else {
       await assert.rejects(pending, (error) => error === reason, stage);
       assert.equal(disposed, created, `${stage}: every provisional object must be disposed`);

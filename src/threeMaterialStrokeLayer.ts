@@ -1,3 +1,4 @@
+import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
@@ -22,7 +23,6 @@ import {
   normalizeThreeRawShaderSource,
   normalizeThreeStrokeRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
-import { createThreeWebGpuStrokeMaterial } from "./threeWebGpuStrokeMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -36,6 +36,7 @@ interface StrokeLayerOptions {
   /** Prepared texture data of `strokeRecords`, shared by every layer of one hierarchy. */
   strokeTextures?: SplitStrokeTextures;
   materialBackend?: "webgl" | "webgpu";
+  webGpu?: ThreeWebGpuBackend;
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
@@ -147,7 +148,7 @@ export class ThreeMaterialStrokeLayer {
     const materialBackend = options.materialBackend ?? "webgl";
     let material: THREE.Material;
     if (materialBackend === "webgpu") {
-      const webGpuMaterial = createThreeWebGpuStrokeMaterial({
+      const webGpuMaterial = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuStrokeMaterial({
         colorCompositing: options.colorCompositing ?? "linear",
         segmentTextureA: this.segmentTextureA,
         segmentTextureB: this.segmentTextureB,

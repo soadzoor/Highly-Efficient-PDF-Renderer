@@ -6,6 +6,8 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
   const { withThreeRenderPerformance } = await import("../src/threeRenderPerformance.ts");
@@ -37,7 +39,7 @@ try {
       const source = ordered ? { ...data, drawRuns: [{ kind: "stroke", first: 0, count }] } : data;
       assert(shouldUseVectorStrokeLod("auto", backend, source.segmentCount));
       const drawPlan = ordered ? new ThreeVectorDrawPlan(source) : undefined;
-      const options = { materialBackend: backend, colorCompositing: "display", drawPlan,
+      const options = { materialBackend: backend, webGpu, colorCompositing: "display", drawPlan,
         strokeCurveEnabled: true, textVectorOnly: true, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1] };
       const lod = new ThreeVectorLodStrokeLayer(source, options);
       let viewState = { zoom: 1, cameraCenterX: 1500, cameraCenterY: 0 };
@@ -53,7 +55,7 @@ try {
           threeColorCompositing: "display", pageBackground: [1, 1, 1, 1], vectorOverride: [0, 0, 0, 0] },
         0, new ThreeMaterialRasterLayer(source, options), new ThreeMaterialGradientLayer(source, options),
         new ThreeMaterialFillLayer(source, options), null, null, lod, null, new ThreeMaterialTextLayer(source, options),
-        null, page, uv, new THREE.BufferAttribute(uv, 2), drawPlan);
+        null, page, uv, new THREE.BufferAttribute(uv, 2), drawPlan, undefined, webGpu);
       const host = { isWebGLRenderer: backend === "webgl", isWebGPURenderer: backend === "webgpu",
         outputColorSpace: THREE.LinearSRGBColorSpace, capabilities: { maxTextureSize: 16384 },
         getDrawingBufferSize: target => target.set(viewport.width, viewport.height), getPixelRatio: () => 1 };

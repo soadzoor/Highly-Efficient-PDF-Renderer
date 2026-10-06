@@ -2,6 +2,7 @@ import { access, copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/p
 import { dirname, extname, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseAst } from "vite";
+import { compactShaderComments } from "./lib/compactShaderComments.mjs";
 
 const sourceDir = fileURLToPath(new URL("../src/", import.meta.url));
 const outputDir = fileURLToPath(new URL("../dist/bundler/", import.meta.url));
@@ -53,7 +54,7 @@ for (const name of files) {
   for (const edit of edits.sort((a, b) => b.start - a.start)) {
     output = output.slice(0, edit.start) + JSON.stringify(edit.value) + output.slice(edit.end);
   }
-  await writeFile(file, output);
+  await writeFile(file, compactShaderComments(output));
 }
 for (const name of assets) {
   const destination = resolve(outputDir, name);

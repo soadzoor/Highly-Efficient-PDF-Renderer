@@ -28,6 +28,25 @@ The main and `/three` entries retain the prebuilt `dist/lib` layout: serve that
 directory intact when using it in a browser; do not rebundle it or mix its modules
 with the `/bundler` entry. Node usage is unchanged.
 
+Rendering backends and WebGPU materials load on demand. The existing asynchronous
+object factories prepare the selected backend before returning, and HEP export
+loads its encoder when `buildHep` is called. The first use can require additional
+chunk requests; subsequent calls reuse the loaded modules. Deploy every emitted
+chunk and asset together. Optional features remain in the package, while named
+imports from `/bundler` allow unused modules to be removed by the application build.
+Worker startup files are explicitly preserved during tree shaking.
+
+When a WebGL HEPR object is hosted by a WebGPU renderer, its independent highlight
+overlay can load the host's materials on first use. Apps that render on demand
+can subscribe with `pdfObject.addEventListener("change", requestRender)`, where
+`requestRender` schedules their usual frame. The event's reason is
+`"primitive-highlights-ready"`. Remove the listener with
+`pdfObject.removeEventListener("change", requestRender)` during cleanup.
+
+Shader comments are removed only from build output; TypeScript sources keep their
+comments and indentation. Shader code whitespace remains intact for exact source
+patches. Vite builds requesting source maps retain the original strings and mappings.
+
 ## `pdfObjectGenerator(source, options?, rendererType?)`
 
 Returns `Promise<HeprThreePdfObject>`. The result is a `THREE.Group` that follows
@@ -65,6 +84,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
 | `annotationAppearances` | `"render"` | Which annotation appearances become page content: `"render"` all, `"forms"` only form fields (Widgets), `"none"` none. Annotation metadata is extracted in every mode. See [hiding annotation appearances](#hiding-annotation-appearances). |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
+| `imageCodecResolver` | Bundled codecs | Supply a raw-sample image decoder; works through PDF workers and PDF-to-HEP conversion. See [image compatibility](#rendering-compatibility-and-diagnostics). |
 | `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |
 | `iccEngine` | `"qcms"` | `"qcms"` or `"lcms"`: try the preferred engine, then the other engine, then alternate colors. `"alternate"`: approximate directly. `"none"`: disable built-in conversion and approximation. |
 | `onDiagnostic` | — | Receive PDF diagnostics, including raster fallback, visual approximation, and ICC warnings with zero-based `pageIndex`. |
@@ -78,6 +98,12 @@ See [loading option types](../src/pdfObjectGenerator.ts) and
 [progress fields and stages](../src/loadProgress.ts). All selected pages are
 prepared before the promise resolves. Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
+Large stroke and text LOD preparations use a module worker when available,
+leaving the browser's main thread available for interaction. Small preparations
+and environments without workers use the cooperative local path. Worker failure
+also falls back to that path; cancellation remains supported in both cases.
+Stored HEP vector LOD is adopted directly and reports the `vector-lod-restore`
+stage ("Loading Vector LOD"); `vector-lod` indicates preparation of a new hierarchy.
 
 ### Password-protected PDFs
 
@@ -1019,6 +1045,26 @@ supported tiling patterns and Type3 programs retain canonical geometry. Groups,
 standard blend modes, and alpha/luminosity masks use a shared ordered paint graph
 and renderer-owned transient surfaces. Group opacity is applied to the group
 result, preserving overlap between its children.
+
+Image decoders load on demand: JPEG, JPEG 2000 (`JPXDecode`), JBIG2
+(`JBIG2Decode`, including globals), and fax images are supported. The bundled
+JPEG 2000 and JBIG2 kernels come from PDF.js 6.4.299. Codec JavaScript and WASM
+assets ship with HEPR and load relative to the deployed package, including in
+parser workers; no third-party server or CDN is contacted to load a decoder.
+The published package and bundler entry include those assets automatically.
+
+The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
+embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX
+samples, codec-defined color spaces, and premultiplied alpha (`SMaskInData=2`)
+still require further integration, as do JP2 palette mappings that change the
+codestream's component count. PDF Indexed images retain their palette indices.
+`imageCodecResolver` can replace the bundled
+decoders using the exported `NativeImageCodecRequest` / `NativeImageCodecResult`
+contract; parser limits and output validation still apply.
+
+Extended graphics states can select a font and size through `/Font`, including
+fonts referenced directly from that state. Selection follows `q`/`Q` saves and
+restores, `Tf` overrides, and inherited Form graphics state.
 
 Malformed or unsupported effects and exhausted expansion budgets can still use
 diagnosed selective or whole-page image fallbacks. HEP retains the replayable

@@ -1,3 +1,4 @@
+import type { ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { ThreePageTransforms } from "./threePageTransforms";
 import { updateThreePageBatchFrame } from "./threePageBatchFrame";
 import { PAGE_PRIMITIVE_KINDS, ScenePageViews, type ScenePageView } from "./scenePageViews";
@@ -60,8 +61,7 @@ import {
   type VectorStrokeLodStats,
   type VectorLodMode
 } from "./vectorStrokeLod";
-import { WebGlFloorplanRenderer, type DrawStats, type ViewState } from "./webGlFloorplanRenderer";
-import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
+import type { DrawStats, ViewState } from "./webGlFloorplanRenderer";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 
 export type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
@@ -302,6 +302,11 @@ interface RendererConfig {
   vectorOverride: [number, number, number, number];
 }
 
+export interface HeprThreePdfObjectEventMap extends THREE.Object3DEventMap {
+  /** Request another frame after the optional host highlight backend is ready. */
+  change: { reason: "primitive-highlights-ready" };
+}
+
 /**
  * A three.js `Group` that represents a loaded PDF or HEP scene.
  *
@@ -321,7 +326,7 @@ interface RendererConfig {
  * }
  * ```
  */
-export class HeprThreePdfObject extends THREE.Group {
+export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> {
   private pageViews: { object: HeprThreePdfObject; view: ScenePageView }[] | null = null;
   private pagePartition: ScenePageViews | null = null;
   private pageBatch: HeprThreePdfObject | null = null;
@@ -799,6 +804,9 @@ export class HeprThreePdfObject extends THREE.Group {
   private pagePreparationProgress: number | null = null;
   private readonly pagePreparationListeners = new Set<(percentage: number | null) => void>();
   private primitiveHighlightLayer: ThreePrimitiveHighlightLayer | null = null;
+  private webGpu: ThreeWebGpuBackend | undefined;
+  private pendingHighlightBackend: Promise<void> | null = null;
+  private pendingHighlightFrame: { renderer: ThreeHostRenderer; camera: THREE.Camera } | null = null;
   private primitiveHighlightBackend: HeprRendererType | null = null;
   private primitiveHighlightColorCompositing: ThreeColorCompositing | null = null;
   private nativePrimitiveColorsReplayed = false;
@@ -906,10 +914,12 @@ export class HeprThreePdfObject extends THREE.Group {
     uvArray: Float32Array,
     uvAttribute: THREE.BufferAttribute,
     drawPlan?: ThreeVectorDrawPlan,
-    pageTransforms?: ThreePageTransforms
+    pageTransforms?: ThreePageTransforms,
+    webGpu?: ThreeWebGpuBackend
   ) {
     super();
     this.pageTransforms = pageTransforms;
+    this.webGpu = webGpu;
     this.sourceLabel = loadedScene.sourceLabel;
     this.sourceKind = loadedScene.sourceKind;
     this.sceneData = loadedScene.scene;
@@ -1401,7 +1411,7 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     if (!this.primitiveHighlightLayer) {
       this.primitiveHighlightLayer = new ThreePrimitiveHighlightLayer(this.rendererType,
-        this.rendererConfig.threeColorCompositing);
+        this.rendererConfig.threeColorCompositing, this.webGpu);
       this.primitiveHighlightBackend = this.rendererType;
       this.primitiveHighlightColorCompositing = this.rendererConfig.threeColorCompositing;
       this.add(this.primitiveHighlightLayer.mesh);
@@ -2213,6 +2223,7 @@ export class HeprThreePdfObject extends THREE.Group {
     this.layerVisibilityProgressListeners.clear();
     this.retainedReplay?.dispose();
     this.isDisposed = true;
+    this.pendingHighlightFrame = null;
     this.primitiveAppearance.dispose();
     this.primitiveHighlightLayer?.dispose();
     if (this.primitiveHighlightLayer) this.remove(this.primitiveHighlightLayer.mesh);
@@ -2300,6 +2311,7 @@ export class HeprThreePdfObject extends THREE.Group {
         pageTransforms: this.pageTransforms,
         drawPlan: this.drawPlan ?? undefined,
         materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl",
+        webGpu: this.webGpu,
         colorCompositing: this.rendererConfig.threeColorCompositing,
         strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
         vectorOverride: this.rendererConfig.vectorOverride
@@ -2314,6 +2326,7 @@ export class HeprThreePdfObject extends THREE.Group {
         pageTransforms: this.pageTransforms,
         drawPlan: this.drawPlan ?? undefined,
         materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl",
+        webGpu: this.webGpu,
         colorCompositing: this.rendererConfig.threeColorCompositing,
         strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
         vectorOverride: this.rendererConfig.vectorOverride
@@ -2419,15 +2432,41 @@ export class HeprThreePdfObject extends THREE.Group {
   }
 
   private syncPrimitiveHighlightFrame(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    if (this.pendingHighlightBackend) this.pendingHighlightFrame = { renderer, camera };
     if (this.primitiveHighlightLayer) {
       const backend = renderer.isWebGPURenderer === true ? "webgpu" : "webgl";
       const compositing = this.directDisplayOutputActive ? "display" : "linear";
+      if (backend === "webgpu" && !this.webGpu) {
+        // A WebGL object can use its native texture in a WebGPU host. Only the
+        // independent highlight overlay needs the host's optional material graph.
+        this.primitiveHighlightLayer.mesh.visible = false;
+        if (!this.pendingHighlightBackend) {
+          this.pendingHighlightFrame = { renderer, camera };
+          this.pendingHighlightBackend = import("./threeWebGpuBackend").then(webGpu => {
+            if (this.isDisposed) return;
+            this.webGpu = webGpu;
+            const frame = this.pendingHighlightFrame;
+            if (frame) {
+              this.syncPrimitiveHighlightFrame(frame.renderer, frame.camera);
+              if (!this.isDisposed && this.primitiveHighlightLayer?.mesh.visible) {
+                this.dispatchEvent({ type: "change", reason: "primitive-highlights-ready" });
+              }
+            }
+          }).catch(error => {
+            if (!this.isDisposed) console.warn("[HEPR] Unable to prepare the host WebGPU highlight overlay.", error);
+          }).finally(() => {
+            this.pendingHighlightBackend = null;
+            this.pendingHighlightFrame = null;
+          });
+        }
+        return;
+      }
       // Native-texture fallback may be hosted by a different Three backend.
       // Its independent overlay must use that host's material type and output.
       if (this.primitiveHighlightBackend !== backend || this.primitiveHighlightColorCompositing !== compositing) {
         this.remove(this.primitiveHighlightLayer.mesh);
         this.primitiveHighlightLayer.dispose();
-        this.primitiveHighlightLayer = new ThreePrimitiveHighlightLayer(backend, compositing);
+        this.primitiveHighlightLayer = new ThreePrimitiveHighlightLayer(backend, compositing, this.webGpu);
         this.primitiveHighlightBackend = backend;
         this.primitiveHighlightColorCompositing = compositing;
         this.primitiveHighlightLayer.setHighlights(this.primitiveAppearance.getHighlights()!);
@@ -2442,6 +2481,7 @@ export class HeprThreePdfObject extends THREE.Group {
       const pixelRatio = rect && rect.width > 0 && rect.height > 0
         ? Math.max(viewport.width / rect.width, viewport.height / rect.height)
         : renderer.getPixelRatio?.() ?? 1;
+      this.primitiveHighlightLayer.mesh.visible = true;
       this.primitiveHighlightLayer.updateFrame(matrix, estimateHighlightLocalUnitsPerPixel(matrix.elements, viewport, this.sceneBounds),
         pixelRatio);
     }
@@ -2745,7 +2785,7 @@ export class HeprThreePdfObject extends THREE.Group {
     }
     if (usePaintCompositor) {
       if (!this.paintCompositor) {
-        this.paintCompositor = new ThreePaintCompositor(this.rendererType);
+        this.paintCompositor = new ThreePaintCompositor(this.rendererType, this.webGpu);
         this.add(this.paintCompositor.mesh);
       }
       if (this.pageOwner) this.paintCompositor.setPageDepth(this.clipFromDataMatrix);
@@ -2879,6 +2919,7 @@ export class HeprThreePdfObject extends THREE.Group {
       pageTransforms: this.pageTransforms,
       drawPlan: this.drawPlan ?? undefined,
       materialBackend: this.rendererType === "webgpu" ? "webgpu" : "webgl",
+      webGpu: this.webGpu,
       colorCompositing: this.rendererConfig.threeColorCompositing,
       strokeCurveEnabled: this.rendererConfig.strokeCurveEnabled,
       textVectorOnly: this.rendererConfig.textVectorOnly,
@@ -3847,6 +3888,9 @@ export async function createThreePdfObject(
 ): Promise<HeprThreePdfObject> {
   signal?.throwIfAborted();
   const rendererType = options.rendererType ?? "webgl";
+  const webGpu = rendererType === "webgpu"
+    ? await waitForLoad(import("./threeWebGpuBackend"), signal) : undefined;
+  signal?.throwIfAborted();
   const sceneBounds = normalizeBounds(resolveSceneFitBounds(loadedScene.scene));
   const sceneCenterX = (sceneBounds.minX + sceneBounds.maxX) * 0.5;
   const sceneCenterY = (sceneBounds.minY + sceneBounds.maxY) * 0.5;
@@ -3890,6 +3934,7 @@ export async function createThreePdfObject(
     const rasterMaterialLayer = new ThreeMaterialRasterLayer(loadedScene.scene, {
       pageTransforms,
       materialBackend,
+      webGpu,
       colorCompositing: rendererConfig.threeColorCompositing,
       pageBackground: rendererConfig.pageBackground
     });
@@ -3898,6 +3943,7 @@ export async function createThreePdfObject(
     const gradientMaterialLayer = new ThreeMaterialGradientLayer(loadedScene.scene, {
       pageTransforms,
       materialBackend,
+      webGpu,
       colorCompositing: rendererConfig.threeColorCompositing,
       strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
       vectorOverride: rendererConfig.vectorOverride
@@ -3914,6 +3960,7 @@ export async function createThreePdfObject(
       pageTransforms,
       drawPlan,
       materialBackend,
+      webGpu,
       colorCompositing: rendererConfig.threeColorCompositing,
       vectorOverride: rendererConfig.vectorOverride
     });
@@ -3926,6 +3973,7 @@ export async function createThreePdfObject(
           pageTransforms,
           drawPlan,
           materialBackend,
+          webGpu,
           colorCompositing: rendererConfig.threeColorCompositing,
           strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
           vectorOverride: rendererConfig.vectorOverride
@@ -3942,6 +3990,7 @@ export async function createThreePdfObject(
           pageTransforms,
           drawPlan,
           materialBackend,
+          webGpu,
           colorCompositing: rendererConfig.threeColorCompositing,
           strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
           vectorOverride: rendererConfig.vectorOverride
@@ -3961,6 +4010,7 @@ export async function createThreePdfObject(
         pageTransforms,
         drawPlan,
         materialBackend,
+        webGpu,
         colorCompositing: rendererConfig.threeColorCompositing,
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
         textVectorOnly: rendererConfig.textVectorOnly,
@@ -3976,6 +4026,7 @@ export async function createThreePdfObject(
         pageTransforms,
         drawPlan,
         materialBackend,
+        webGpu,
         colorCompositing: rendererConfig.threeColorCompositing,
         strokeCurveEnabled: rendererConfig.strokeCurveEnabled,
         textVectorOnly: rendererConfig.textVectorOnly,
@@ -4030,7 +4081,8 @@ export async function createThreePdfObject(
       uvArray,
       uvAttribute,
       drawPlan,
-      pageTransforms
+      pageTransforms,
+      webGpu
     );
     pageMesh.onBeforeRender = (renderer, _scene, camera) => {
       object.handleBeforeRender(renderer as ThreeHostRenderer, camera as THREE.Camera);
@@ -4055,8 +4107,10 @@ async function createNativeRenderer(
   renderCanvas: HTMLCanvasElement
 ): Promise<RendererApi> {
   if (rendererType === "webgpu") {
+    const { WebGpuFloorplanRenderer } = await import("./webGpuFloorplanRenderer");
     return WebGpuFloorplanRenderer.create(renderCanvas);
   }
+  const { WebGlFloorplanRenderer } = await import("./webGlFloorplanRenderer");
   return new WebGlFloorplanRenderer(renderCanvas);
 }
 

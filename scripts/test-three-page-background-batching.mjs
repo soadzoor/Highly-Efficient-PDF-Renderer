@@ -7,6 +7,8 @@ import WGSLNodeBuilder from "../node_modules/three/src/renderers/webgpu/nodes/WG
 const hooks = registerHooks({ resolve(s, c, next) {
   return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
@@ -18,7 +20,7 @@ try {
       [Math.floor(i / 4) * 20 - 100, -10, Math.floor(i / 4) * 20 - 90, .25][i % 4]) };
   const canonical = structuredClone(scene);
   for (const [backend, colorCompositing] of [["webgl", "display"], ["webgpu", "display"], ["webgpu", "linear"]]) {
-    const layer = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, colorCompositing, pageBackground: [1,1,1,1] });
+    const layer = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, webGpu, colorCompositing, pageBackground: [1,1,1,1] });
     layer.setVisible(true);
     const meshes = [];
     layer.group.traverseVisible(object => { if (object.isMesh) meshes.push(object); });
@@ -105,7 +107,7 @@ try {
       pageRects: Float32Array.of(20, 30, -10, -5, 8, 2, 8, 12, 0, 0, 0, 0),
       rasterLayers: [{ width: 1, height: 1, data: Uint8Array.of(255,0,0,255),
         matrix: Float32Array.of(2,1,-1,3,25,-7), opacity: .5 }] };
-    const layer = new ThreeMaterialRasterLayer(edgeScene, { materialBackend: backend,
+    const layer = new ThreeMaterialRasterLayer(edgeScene, { materialBackend: backend, webGpu,
       colorCompositing: "display", pageBackground: [1,1,1,1] });
     const background = layer.entries[0], raster = layer.rasterEntries[0];
     assert.deepEqual(Array.from(background.mesh.geometry.getAttribute("aPageRect").array),

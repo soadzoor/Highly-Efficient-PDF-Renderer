@@ -10,6 +10,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 try {
+  const { registerThreeNodeClipPosition } = await import("../src/threeWebGpuVectorClips.ts");
   const { openPdf } = await import("../src/pdfSession.ts");
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
@@ -17,8 +18,7 @@ try {
   const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
   const { packVectorClips, MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES } = await import("../src/vectorClips.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
-  const { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial,
-    registerThreeNodeClipPosition } = await import("../src/threeVectorClips.ts");
+  const { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } = await import("../src/threeVectorClips.ts");
   const fixtures = [
     // Same winding, different fill rule: the second rectangle is a hole only with W*.
     fixture("q 5 5 50 50 re 20 20 20 20 re W* n /Fm Do Q 0 0 2 2 re f"),

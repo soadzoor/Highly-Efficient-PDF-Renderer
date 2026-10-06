@@ -8,10 +8,19 @@ import {
   NATIVE_VECTOR_MINIFY_ENABLED
 } from "../src/nativeRenderPolicy.ts";
 import { buildSingleChannelUint8MipChain } from "../src/singleChannelMipChain.ts";
-import { TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE } from "../src/textRasterAtlas.ts";
+import { registerHooks } from "node:module";
+const hooks = registerHooks({ resolve(specifier, context, next) {
+  if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
+    return next(`${specifier}.ts`, context);
+  }
+  return next(specifier, context);
+} });
+const { TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE } = await import("../src/textRasterAtlas.ts");
+hooks.deregister();
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const webGl = await readFile(path.resolve(scriptDir, "../src/webGlFloorplanRenderer.ts"), "utf8");
+const webGl = await readFile(path.resolve(scriptDir, "../src/webGlFloorplanRenderer.ts"), "utf8")
+  + await readFile(path.resolve(scriptDir, "../src/nativeWebGlCoreShaders.ts"), "utf8");
 const webGpu = await readFile(path.resolve(scriptDir, "../src/webGpuFloorplanRenderer.ts"), "utf8");
 
 assert.equal(

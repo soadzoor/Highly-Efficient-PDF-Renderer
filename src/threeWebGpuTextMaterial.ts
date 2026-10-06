@@ -1,8 +1,9 @@
-import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
+import { pageProjectionNode } from "./threeWebGpuPageTransforms";
+import type { ThreePageBinding } from "./threePageTransforms";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
-import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlas";
-import { registerThreeNodeClipPosition } from "./threeVectorClips";
+import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
+import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 

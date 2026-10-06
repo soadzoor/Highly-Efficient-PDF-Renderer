@@ -1,5 +1,4 @@
 import * as THREE from "three";
-import { NodeMaterial } from "three/webgpu";
 import { multiplyFragmentGlsl } from "./vectorMultiply";
 
 /** Clone one paint pass while sharing all camera/geometry uniform references. */
@@ -9,7 +8,7 @@ export function createThreeMultiplyMaterial(source: THREE.Material, pass: 0 | 1,
   if (source instanceof THREE.RawShaderMaterial && material instanceof THREE.RawShaderMaterial) {
     material.uniforms = source.uniforms;
     if (!premultiplied) material.fragmentShader = multiplyFragmentGlsl(source.fragmentShader);
-  } else if (material instanceof NodeMaterial) {
+  } else if ((material as THREE.Material & { isNodeMaterial?: boolean }).isNodeMaterial === true) {
     if (!premultiplied) material.premultipliedAlpha = true;
   } else {
     throw new Error("Unsupported Multiply paint material.");

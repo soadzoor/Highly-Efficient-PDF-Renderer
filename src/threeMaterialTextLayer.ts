@@ -1,3 +1,4 @@
+import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { OptionalContentSnapshot } from "./optionalContent";
@@ -26,7 +27,7 @@ import {
   normalizeThreeRawShaderSource,
   normalizeThreeTextRawFragmentShaderSource
 } from "./threeRawShaderColorSpace";
-import { createThreeWebGpuTextMaterial, type ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
+import type { ThreeWebGpuTextMaterialState } from "./threeWebGpuTextMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
@@ -34,6 +35,7 @@ interface TextLayerOptions {
   pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
+  webGpu?: ThreeWebGpuBackend;
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   textVectorOnly: boolean;
@@ -226,7 +228,7 @@ export class ThreeMaterialTextLayer {
 
     let material: THREE.Material;
     if (materialBackend === "webgpu") {
-      const state = createThreeWebGpuTextMaterial({
+      const state = requireThreeWebGpuBackend(options.webGpu).createThreeWebGpuTextMaterial({
         colorCompositing: options.colorCompositing ?? "linear",
         textInstanceTextureA: this.textInstanceTextureA,
         textInstanceTextureB: this.textInstanceTextureB,

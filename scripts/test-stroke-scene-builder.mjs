@@ -7,6 +7,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     !/\.[a-z0-9]+$/i.test(specifier) ? `${specifier}.ts` : specifier, context);
 } });
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { buildStrokeScene, createThreePdfObject } = await import("../src/index.ts");
   const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
@@ -80,7 +82,7 @@ try {
   // Actual Three materials can consume the scene without any GPU or DOM.
   for (const materialBackend of ["webgl", "webgpu"]) {
     const layer = new ThreeMaterialStrokeLayer(scene, {
-      materialBackend, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0]
+      materialBackend, webGpu, strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0]
     });
     try {
       layer.setVisible(true);

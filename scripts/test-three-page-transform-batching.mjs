@@ -8,6 +8,8 @@ import { TSL, WGSLNodeBuilder } from 'three/webgpu';
 const hooks=registerHooks({resolve(s,c,n){return n(c.parentURL?.includes('/src/') && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s)?s+'.ts':s,c);}});
 const previousDocument=globalThis.document;
 globalThis.document={createElement:()=>Object.assign(createCanvas(1,1),{style:{}})};
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const {buildStrokeScene}=await import('../src/strokeSceneBuilder.ts');
   const {composeVectorScenesInGrid}=await import('../src/pdfVectorExtractor.ts');
@@ -200,7 +202,7 @@ try {
     const data=composeVectorScenesInGrid([auxiliary,auxiliary],2),partition=new ScenePageViews(data);
     for(const backend of ['webgl','webgpu']) {
       const table=new ThreePageTransforms(partition);
-      const options={pageTransforms:table,materialBackend:backend,colorCompositing:'display',pageBackground:[1,1,1,1],
+      const options={pageTransforms:table,materialBackend:backend, webGpu,colorCompositing:'display',pageBackground:[1,1,1,1],
         vectorOverride:[0,0,0,0],strokeCurveEnabled:true};
       const raster=new ThreeMaterialRasterLayer(data,options),gradient=new ThreeMaterialGradientLayer(data,options);
       assert.equal(raster.stripEntries.length,2);
@@ -280,7 +282,7 @@ try {
   const dense=composeVectorScenesInGrid([densePage,densePage],2),partition=new ScenePageViews(dense);
   for(const backend of ['webgl','webgpu']) {
     const table=new ThreePageTransforms(partition),plan=new ThreeVectorDrawPlan(dense,table.runPages);
-    const layer=new ThreeVectorLodStrokeLayer(dense,{pageTransforms:table,drawPlan:plan,materialBackend:backend,
+    const layer=new ThreeVectorLodStrokeLayer(dense,{pageTransforms:table,drawPlan:plan,materialBackend:backend, webGpu,
       colorCompositing:'display',vectorOverride:[0,0,0,0],strokeCurveEnabled:true});
     const frame=units=>{
       layer.setLocalToClipTransform(new THREE.Matrix4().makeRotationY(.4),units);

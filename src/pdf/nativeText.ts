@@ -75,6 +75,7 @@ export interface NativeTextCompilerOptions {
 
 interface TextState {
   fontResourceName: string | null;
+  directFontResource: NativeTextFontResource | null;
   fontSize: number;
   characterSpacing: number;
   wordSpacing: number;
@@ -242,7 +243,24 @@ export class NativeTextCompiler {
       throw new PdfError("unsupported-font", `Page font resource /${resourceName} is missing.`);
     }
     this.state.fontResourceName = resourceName;
+    this.state.directFontResource = null;
     this.state.fontSize = finite(size, "font size");
+  }
+
+  /** ExtGState fonts and inherited Form fonts need no resource-name alias. */
+  setFontResource(resource: NativeTextFontResource, size: number): void {
+    this.checkCancellation();
+    if (!resource || !Number.isSafeInteger(resource.fontIndex) || resource.fontIndex < 0) {
+      throw new PdfError("unsupported-font", "An extended graphics state references an unprepared font.");
+    }
+    this.state.fontResourceName = null;
+    this.state.directFontResource = resource;
+    this.state.fontSize = finite(size, "font size");
+  }
+
+  getFontSelection(): Readonly<{ fontIndex: number; size: number }> | undefined {
+    if (this.state.fontResourceName === null && this.state.directFontResource === null) return undefined;
+    return { fontIndex: this.currentFont().fontIndex, size: this.state.fontSize };
   }
 
   setCharacterSpacing(value: number): void {
@@ -781,6 +799,7 @@ export class NativeTextCompiler {
   }
 
   private currentFont(): NativeTextFontResource {
+    if (this.state.directFontResource) return this.state.directFontResource;
     const name = this.state.fontResourceName;
     if (name === null) throw new PdfError("unsupported-font", "Text is shown before a font is selected.");
     const resource = this.fonts.get(name);
@@ -833,6 +852,7 @@ export class NativeTextCompiler {
 function createDefaultTextState(): TextState {
   return {
     fontResourceName: null,
+    directFontResource: null,
     fontSize: 0,
     characterSpacing: 0,
     wordSpacing: 0,

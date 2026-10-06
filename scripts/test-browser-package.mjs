@@ -105,6 +105,17 @@ for (const engine of ["Lcms", "Qcms"]) {
       "selecting one engine must not include the other engine's adapter");
   }
 }
+for (const codec of ["Jpx", "Jbig2"]) {
+  const codecChunks = chunks.filter(chunk => Object.keys(chunk.modules).some(id =>
+    new RegExp(`/native${codec}Codec(?:-[^/]+)?\\.js$`).test(id)));
+  assert(codecChunks.length > 0, `${codec} must ship as a separate lazy decoder`);
+  for (const chunk of codecChunks) {
+    assert(!staticChunks.has(chunk.fileName), `${codec} must stay out of the initial module graph`);
+    assert(!workerStaticChunks.has(chunk.fileName), `${codec} must stay out of the initial parser worker graph`);
+    assert(workerReachableChunks.has(chunk.fileName), `${codec} must remain reachable on demand`);
+    assert(!chunk.code.includes("data:application/wasm"), "codec WASM must remain a separate asset");
+  }
+}
 for (const chunk of detectorChunks) {
   assert.ok(!staticChunks.has(chunk.fileName),
     "importing the root package must not eagerly load the room detector");
@@ -119,7 +130,7 @@ console.log(`All-exports entry: ${size(entry.code)}`);
 console.log(`All ${chunks.length} JavaScript chunks: ${(chunks.reduce((sum, file) => sum + Buffer.byteLength(file.code), 0) / 1000).toFixed(1)} kB / ${(chunks.reduce((sum, file) => sum + gzipSync(file.code).length, 0) / 1000).toFixed(1)} kB gzip (sum per chunk).`);
 console.log("Worker files and fonts are separate assets, excluded from these JavaScript totals.");
 const assets = (await readdir(`${libDir}assets`)).sort();
-for (const engine of ["lcms", "qcms"]) {
+for (const engine of ["libjpeg-turbo", "lcms", "qcms", "openjpeg", "jbig2"]) {
   assert(assets.some(name => new RegExp(`^${engine}-.*\\.wasm$`).test(name)),
     `${engine} must ship as a package-relative WASM asset`);
 }

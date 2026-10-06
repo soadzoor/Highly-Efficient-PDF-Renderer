@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import { HepArchive, crc32, hasHepSignature, hasLegacyZipSignature,
-  encodeFloat32Palette, decodeFloat32Palette } from "../src/hepContainer.ts";
+  encodeFloat32Palette, decodeFloat32Palette } from "./lib/hepContainer.mjs";
 
 // Independent bit-at-a-time CRC and fixture layout do not use the production writer.
 function referenceCrc(bytes) {
@@ -78,6 +78,24 @@ async function rejects(bytes, pattern, name) {
 assert.equal(crc32(Buffer.from("123456789")), 0xcbf43926);
 assert.equal(crc32(new Uint8Array(0)), 0);
 assert.equal(hasHepSignature(Buffer.from([72, 69, 80, 0])), true);
+const importController = new AbortController();
+const importReason = new Error("cancel while loading HEP container writer");
+const importProgress = [];
+const coldWrite = new HepArchive().file("cold", "data").generateAsync({
+  type: "uint8array", compression: "STORE", signal: importController.signal
+}, event => importProgress.push(event.percent));
+importController.abort(importReason);
+await assert.rejects(coldWrite, error => error === importReason);
+await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(importProgress, [0], "cancelled imports must not start container writing");
+
+const snapshot = new HepArchive().file("early", "first");
+const pendingSnapshot = snapshot.generateAsync({ type: "uint8array", compression: "STORE" }, event => {
+  if (event.percent === 0) snapshot.file("callback", "second");
+});
+snapshot.remove("early").file("later", "third");
+assert.deepEqual(Object.keys((await HepArchive.loadAsync(await pendingSnapshot)).files), ["early", "callback"],
+  "lazy writer preserves entries captured immediately after the initial progress callback");
 assert.equal(hasHepSignature(Buffer.from([72, 69, 80])), false);
 for (const suffix of [[3, 4], [5, 6], [7, 8]]) {
   assert.equal(hasLegacyZipSignature(Buffer.from([80, 75, ...suffix])), true);

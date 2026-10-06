@@ -7,6 +7,13 @@
   "main": "./dist/lib/index.js",
   "module": "./dist/lib/index.js",
   "types": "./dist/types/index.d.ts",
+  "sideEffects": [
+    "**/pdf-worker.js",
+    "**/pdfWorkerEntry*.js",
+    "**/lodWorkerEntry*.js",
+    "**/roomDetectorWorker*.js",
+    "**/*.css"
+  ],
   "publishConfig": {
     "access": "public"
   },

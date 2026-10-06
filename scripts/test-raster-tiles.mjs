@@ -14,6 +14,8 @@ const warn = console.warn, warnings = [];
 let createEmptyVectorScene;
 console.warn = (...args) => warnings.push(args.join(" "));
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, isRasterTilePlanDownscaled } =
     await import("../src/rasterTiles.ts");
@@ -202,7 +204,7 @@ try {
   for (const backend of ["webgl", "webgpu"]) {
     const scene = Object.assign(sceneWith(image(150, 2, 7)), { pageRects: Float32Array.of(0, 0, 200, 200),
       drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "raster", first: 0, count: 1, blendMode: "Multiply" }] });
-    const layer = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, colorCompositing: "display",
+    const layer = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, webGpu, colorCompositing: "display",
       pageBackground: [1, 1, 1, 1] });
     const entry = layer.rasterEntries[0];
     assert.equal(entry.image.tiles.length, 0, "before a host reports its limit, images stay whole");

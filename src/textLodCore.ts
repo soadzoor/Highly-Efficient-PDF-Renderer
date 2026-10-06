@@ -10,6 +10,7 @@ import {
 import {
   buildTextLod,
   buildTextLodAsync,
+  shouldBuildTextLod,
   type TextLodAsyncBuildOptions,
   type TextLodBuildData,
   type TextLodBuildResult
@@ -123,7 +124,7 @@ export function prebuildTextLod(
   if (cached) return Promise.resolve(cached);
   const pending = pendingBuilds.get(scene);
   if (pending) return pending;
-  const promise = buildTextLodAsync(scene, options).then((result) => {
+  const promise = prepareTextLod(scene, options).then((result) => {
     cachedBuilds.set(scene, result);
     pendingBuilds.delete(scene);
     return result;
@@ -133,6 +134,24 @@ export function prebuildTextLod(
   });
   pendingBuilds.set(scene, promise);
   return promise;
+}
+
+async function prepareTextLod(scene: VectorScene, options: TextLodAsyncBuildOptions): Promise<TextLodBuildResult> {
+  if (typeof Worker !== "undefined" && shouldBuildTextLod(scene)) {
+    let client: typeof import("./lodWorkerClient") | undefined;
+    try { client = await import("./lodWorkerClient"); }
+    catch (error) { console.warn("[HEPR] LOD worker module unavailable; preparing cooperatively.", error); }
+    if (!client) return buildTextLodAsync(scene, options);
+    let lastProgress = 0;
+    const workerOptions = { ...options, onProgress: (progress: { value: number; message: string }): void => {
+      lastProgress = Math.max(lastProgress, progress.value);
+      options.onProgress?.({ ...progress, value: lastProgress });
+    } };
+    const result = await client.buildTextLodInWorker(scene, workerOptions);
+    if (result) return result;
+    return buildTextLodAsync(scene, workerOptions);
+  }
+  return buildTextLodAsync(scene, options);
 }
 
 /** Allow a loader or renderer to publish an already completed immutable build. */

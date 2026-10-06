@@ -13,7 +13,7 @@ try {
   const { packVectorClips, vectorClipChainBounds, UNBOUNDED_VECTOR_CLIP_BOUNDS } = await import("../src/vectorClips.ts");
   const { VECTOR_INSTANCE_CLIP_GLSL } = await import("../src/vectorClipShaders.ts");
   const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
-  const source = await readFile(new URL("../src/webGlFloorplanRenderer.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/nativeWebGlCoreShaders.ts", import.meta.url), "utf8");
   const vertex = source.match(/const FILL_VERTEX_SHADER_SOURCE = `([\s\S]*?)`;/)[1];
   const boundsSource = vertex.match(/vec4 heprFillQuadBounds\([\s\S]*?\n}/)[0];
   const lookupSource = vertex.match(/vec4 heprFillInstanceClipBounds\([\s\S]*?\n}/)[0];

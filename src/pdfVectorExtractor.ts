@@ -14,6 +14,7 @@ import type { PdfProgress } from "./heprDocumentData";
 import { validateIccEngine, type PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeMissingFontResolver } from "./pdf/nativeFont";
+import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import type { NativeVectorPdfSession, PdfSession } from "./pdfSession";
 import type { SceneOptionalContent } from "./optionalContentData";
 import type { SceneRetainedPage } from "./retainedPageData";
@@ -212,6 +213,8 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
+  /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
+  imageCodecResolver?: NativeImageCodecResolver;
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** User or owner password for a PDF that requires one to open. */
   password?: string;
@@ -308,13 +311,15 @@ export async function extractPdfPageScenes(
   pdfData: ArrayBuffer,
   options: VectorExtractOptions = {},
   /** @internal Used by HEP export to cancel active PDF parser work. */
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /** @internal Transfer only disposable buffers owned by the high-level loader. */
+  ownership: "copy" | "transfer" = "copy"
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
   validateIccEngine(options.iccEngine);
   assertPdfSourceBytes(pdfData);
   const progress = createLoadProgressReporter(options.onProgress);
-  return extractPdfPageScenesWithNativeTier(pdfData, options, progress, 0, signal);
+  return extractPdfPageScenesWithNativeTier(pdfData, options, progress, 0, signal, ownership);
 }
 
 function withRemappedProgress(
@@ -341,7 +346,8 @@ async function extractPdfPageScenesWithNativeTier(
   options: VectorExtractOptions,
   progress: LoadProgressReporter,
   start: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  ownership: "copy" | "transfer" = "copy"
 ): Promise<VectorScene[]> {
   const pageScenes = await extractPdfPageScenesWithNative(
     pdfData,
@@ -352,7 +358,8 @@ async function extractPdfPageScenesWithNativeTier(
       NATIVE_PDF_SUCCESS_PROGRESS_END,
       "worker"
     ),
-    signal
+    signal,
+    ownership
   );
   progress.report(NATIVE_PDF_SUCCESS_PROGRESS_END, {
     stage: "compile",
@@ -369,7 +376,8 @@ async function extractPdfPageScenesWithNativeTier(
 async function extractPdfPageScenesWithNative(
   pdfData: ArrayBuffer,
   options: VectorExtractOptions,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  ownership: "copy" | "transfer" = "copy"
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
   const {
@@ -403,12 +411,13 @@ async function extractPdfPageScenesWithNative(
     const source = {
       kind: "bytes",
       bytes: new Uint8Array(pdfData),
-      ownership: "copy"
+      ownership
     } as const;
     const missingFontResolver = await nativeVectorMissingFontResolver();
     const openOptions = {
       repair: "safe",
       password: options.password,
+      imageCodecResolver: options.imageCodecResolver,
       signal,
       missingFontResolver,
       iccTransformResolver: options.iccTransformResolver,
