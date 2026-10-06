@@ -11,6 +11,7 @@ export const fastTests = [
   "test-runner",
   "document-loading",
   "public-load-cancellation",
+  "pdf-source-ownership",
   "hep-container",
   "hep-float32-palette",
   "hep-api",
@@ -83,6 +84,9 @@ export const fastTests = [
   "native-document-semantics",
   "native-source-range-edge-cases",
   "native-font-text",
+  "pdf-session-ext-gstate-font",
+  "native-image-codecs",
+  "jbig2-codec-safety",
   "native-parser-fuzz",
   "pdf-range-transport",
   "pdf-session",
@@ -144,6 +148,7 @@ export const fastTests = [
   "native-paint-compositor",
   "native-direct-rendering",
   "text-lod-core",
+  "lod-worker",
   "text-lod-foreshortening",
   "native-ordered-text-lod",
   "three-ordered-text-lod",
@@ -170,7 +175,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package"],
+  package: ["browser-package", "bundler-package", "lod-worker-package"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",

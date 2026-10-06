@@ -100,7 +100,8 @@ try {
   );
   await assert.rejects(
     resolveBundledImageCodec({ ...request(rgb, 3), codec: "jpeg2000" }),
-    (error) => unsupportedImage(error) && error.details?.reason === "codec-not-bundled"
+    (error) => error?.code === "unsupported-image" && error.details?.codec === "jpeg2000" &&
+      error.details?.reason === "invalid-jpx-header"
   );
 
   for (const malformed of [

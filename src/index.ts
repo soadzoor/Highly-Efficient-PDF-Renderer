@@ -18,7 +18,7 @@ import {
   type CanvasInteractionController
 } from "./canvasInteractions";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
-import { reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
+import { hasStoredVectorStrokeLod, reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
 import { prebuildTextLod } from "./textLodCore";
 import { yieldForLoad } from "./loadCancellation";
 import type { VectorScene } from "./pdfVectorExtractor";
@@ -144,15 +144,17 @@ async function prepareThreePdfObject(
   let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
   try {
     signal?.throwIfAborted();
-    progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
+    const vectorLodStage = hasStoredVectorStrokeLod(loadedScene.scene) ? "vector-lod-restore" : "vector-lod";
+    progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: vectorLodStage, sourceType });
     vectorLodReservation = await reserveVectorStrokeLodRuntime(loadedScene.scene, options.vectorLod ?? "auto", rendererType, {
-      yieldIntervalMs: 500,
+      yieldIntervalMs: 50,
+      signal,
       shouldCancel: () => signal?.aborted === true,
       onProgress: (lodProgress) => {
         const value =
           LOAD_PROGRESS_VECTOR_LOD_START +
           lodProgress.value * (LOAD_PROGRESS_VECTOR_LOD_END - LOAD_PROGRESS_VECTOR_LOD_START);
-        progress.report(value, { stage: "vector-lod", sourceType });
+        progress.report(value, { stage: vectorLodStage, sourceType });
       }
     });
     signal?.throwIfAborted();
@@ -243,6 +245,14 @@ export type {
   NativeIccTransformResult,
   NativeIccProfileMetadata
 } from "./pdf/nativeIcc";
+export type {
+  NativeImageCodec,
+  NativeImageCodecResolver,
+  NativeImageCodecRequest,
+  NativeImageCodecResult,
+  CodecMetadataRecord,
+  CodecMetadataValue
+} from "./pdf/nativeImage";
 export type { PdfDiagnostic } from "./pdf/nativeTypes";
 
 export type {

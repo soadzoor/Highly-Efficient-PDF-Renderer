@@ -47,7 +47,7 @@ import {
   type ExamplePageLayoutTarget
 } from "./examplePageLayouts";
 import { createThreePdfObject } from "./threePdfObject";
-import { reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
+import { hasStoredVectorStrokeLod, reserveVectorStrokeLodRuntime, type VectorStrokeLodRuntimeReservation } from "./vectorStrokeLodCore";
 import { formatLoadProgressStage } from "./loadProgress";
 import { formatVectorStrokeLodStats } from "./vectorStrokeLodStatsFormat";
 import { formatTextLodStats } from "./textLodStatsFormat";
@@ -1528,10 +1528,12 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   try {
     const loadStart = performance.now();
     resetVectorStrokeLodBuildTiming();
+    const vectorLodStage = hasStoredVectorStrokeLod(previousObject.sceneData) ? "vector-lod-restore" : "vector-lod";
     vectorLodReservation = await reserveVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
       yieldIntervalMs: 50,
+      signal: controller.signal,
       shouldCancel: () => controller.signal.aborted,
-      onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: "vector-lod" })
+      onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: vectorLodStage })
     });
     controller.signal.throwIfAborted();
     if (objectOptions.textLod !== "off") {

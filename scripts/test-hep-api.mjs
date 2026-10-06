@@ -105,19 +105,21 @@ async function testPdfColorOptionForwarding() {
   const stopBeforeConversion = new Error("stop after checking PDF loader options");
   for (const iccEngine of [undefined, "qcms", "lcms", "alternate", "none"]) {
     const iccTransformResolver = () => {};
+    const imageCodecResolver = () => {};
     const onDiagnostic = () => {};
     const context = vm.createContext({
       createLoadProgressReporter,
       loadPdfSceneFromSource: async (_source, options) => {
         assert.equal(options.iccEngine, iccEngine);
         assert.equal(options.iccTransformResolver, iccTransformResolver);
+        assert.equal(options.imageCodecResolver, imageCodecResolver);
         assert.equal(options.onDiagnostic, onDiagnostic);
         throw stopBeforeConversion;
       }
     });
     vm.runInContext(sourceFunction(source, "buildHepFromPdf"), context);
     await assert.rejects(context.buildHepFromPdf(new Uint8Array(), {
-      iccEngine, iccTransformResolver, onDiagnostic
+      iccEngine, iccTransformResolver, imageCodecResolver, onDiagnostic
     }), error => error === stopBeforeConversion);
   }
 }

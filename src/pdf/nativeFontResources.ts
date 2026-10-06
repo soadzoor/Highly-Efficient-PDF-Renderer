@@ -106,6 +106,17 @@ export class NativePageFontRegistry {
     return Object.freeze(this.resources.flatMap(({ font }) => font.diagnostics));
   }
 
+  /** Register the dictionary referenced directly by an ExtGState /Font entry. */
+  async loadDirect(
+    value: PdfValue,
+    resources: PdfDictionary,
+    signal: AbortSignal,
+    options: NativeFontScopeOptions
+  ): Promise<NativeTextFontResource> {
+    signal.throwIfAborted();
+    return await this.loadFont(value, resources, "ExtGState", signal, options);
+  }
+
   private async loadFont(
     value: PdfValue,
     resources: PdfDictionary,

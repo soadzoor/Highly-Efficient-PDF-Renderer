@@ -1426,7 +1426,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       imageResources.extGStates,
       resources,
       references.extGStates,
-      signal
+      signal,
+      fontRegistry
     );
     const hasReferencedForms = xObjectReferences.some(({ kind }) => kind === "Form");
     const formGraph = output === "vector-scene" && !hasReferencedForms && page.annotations == null
@@ -1612,7 +1613,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       }),
       extGState: (resourceName) => timed("resourceLoadMs", async () => {
         const [definition] = await loadResourceExtGStates(
-          imageResources.extGStates, resources, [resourceName], signal
+          imageResources.extGStates, resources, [resourceName], signal, fontRegistry
         );
         streamed.extGStates.set(resourceName, definition);
         return definition;
@@ -1691,6 +1692,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       onRun: (run) => { emittedTextRuns.push(run); }
     });
     const textOperatorSink = {
+      getFontSelection: () => textCompiler.getFontSelection(),
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -1698,6 +1700,9 @@ class NativePdfSession implements NativeVectorPdfSession {
       ) {
         emittedTextRuns.length = 0;
         textCompiler.setOutputEnabled(context.outputEnabled);
+        if (context.font) {
+          textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
+        }
         textCompiler.applyOperator(operator, operands);
         return emittedTextRuns;
       }
@@ -2306,13 +2311,26 @@ async function loadResourceExtGStates(
   registry: NativePdfExtGStateRegistry,
   resources: PdfDictionary,
   resourceNames: readonly string[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  fontRegistry: NativePageFontRegistry,
+  allowType3 = true
 ): Promise<readonly DensePdfExtGStateDefinition[]> {
   const definitions: DensePdfExtGStateDefinition[] = [];
   for (const resourceName of resourceNames) {
     signal.throwIfAborted();
     const index = await registry.resolveExtGState(resources, resourceName, signal);
-    definitions.push(denseExtGStateDefinition(resourceName, registry.describe(index)));
+    const state = registry.describe(index);
+    let font: DensePdfExtGStateDefinition["font"];
+    if (state.font) {
+      const resource = await fontRegistry.loadDirect(
+        state.font.value, resources, signal, { label: `ExtGState /${resourceName}`, allowType3 }
+      );
+      font = Object.freeze({ fontIndex: resource.fontIndex, size: state.font.size });
+    }
+    definitions.push(Object.freeze({
+      ...denseExtGStateDefinition(resourceName, state),
+      ...(font ? { font } : {})
+    }));
   }
   return definitions;
 }
@@ -2729,7 +2747,9 @@ async function flattenNativeVectorFormOccurrences(
         imageResources.extGStates,
         definition.resources,
         definition.resourceReferences.extGStates,
-        signal
+        signal,
+        fontRegistry,
+        false
       );
       extGStateScopes.set(definition.definitionIndex, pending);
     }
@@ -2915,6 +2935,7 @@ async function flattenNativeVectorFormOccurrences(
       }
     });
     const textOperatorSink = {
+      getFontSelection: () => textCompiler.getFontSelection(),
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -2922,10 +2943,17 @@ async function flattenNativeVectorFormOccurrences(
       ) {
         emittedTextRuns.length = 0;
         textCompiler.setOutputEnabled(context.outputEnabled);
+        if (context.font) {
+          textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
+        }
         textCompiler.applyOperator(operator, operands);
         return emittedTextRuns;
       }
     };
+    if (paint.initialGraphicsState.font) {
+      const { fontIndex, size } = paint.initialGraphicsState.font;
+      textCompiler.setFontResource(fontRegistry.resources[fontIndex], size);
+    }
     const compiled = await compileVectorFormContent(await scopedContent(definition), {
       pageMatrix: transform,
       pageBounds: clipBounds,
@@ -4950,7 +4978,9 @@ async function compileNativeFormPrograms(
         imageResources.extGStates,
         definition.resources,
         definition.resourceReferences.extGStates,
-        signal
+        signal,
+        fontRegistry,
+        allowType3Text
       );
       extGStateScopes.set(definition.definitionIndex, pending);
     }
@@ -5102,6 +5132,7 @@ async function compileNativeFormPrograms(
       }
     });
     const textOperatorSink = {
+      getFontSelection: () => textCompiler.getFontSelection(),
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -5109,6 +5140,9 @@ async function compileNativeFormPrograms(
       ) {
         emittedTextRuns.length = 0;
         textCompiler.setOutputEnabled(context.outputEnabled);
+        if (context.font) {
+          textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
+        }
         textCompiler.applyOperator(operator, operands);
         return emittedTextRuns;
       }
@@ -5122,6 +5156,10 @@ async function compileNativeFormPrograms(
     const formInitialGraphicsState = definition.form.group
       ? resetTransparencyGroupCompositing(initialGraphicsState)
       : initialGraphicsState;
+    if (formInitialGraphicsState.font) {
+      const { fontIndex, size } = formInitialGraphicsState.font;
+      textCompiler.setFontResource(fontRegistry.resources[fontIndex], size);
+    }
     const markedContentProperties = await loadMarkedContentProperties(
       document,
       optionalContent,
@@ -5435,6 +5473,7 @@ async function compileNativeType3Programs(
       }
     });
     const textOperatorSink = {
+      getFontSelection: () => textCompiler.getFontSelection(),
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -5442,6 +5481,9 @@ async function compileNativeType3Programs(
       ) {
         emittedTextRuns.length = 0;
         textCompiler.setOutputEnabled(context.outputEnabled);
+        if (context.font) {
+          textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
+        }
         textCompiler.applyOperator(operator, operands);
         return emittedTextRuns;
       }
@@ -5492,7 +5534,8 @@ async function compileNativeType3Programs(
       resources.extGStates,
       glyph.charProc.resources,
       references.extGStates,
-      signal
+      signal,
+      fontRegistry
     );
     const markedContentProperties = await loadMarkedContentProperties(
       document,
@@ -6625,6 +6668,7 @@ async function compileNativePatternPrograms(
       }
     });
     const textOperatorSink = {
+      getFontSelection: () => textCompiler.getFontSelection(),
       applyOperator(
         operator: string,
         operands: readonly unknown[],
@@ -6632,6 +6676,9 @@ async function compileNativePatternPrograms(
       ) {
         emittedTextRuns.length = 0;
         textCompiler.setOutputEnabled(context.outputEnabled);
+        if (context.font) {
+          textCompiler.setFontResource(fontRegistry.resources[context.font.fontIndex], context.font.size);
+        }
         textCompiler.applyOperator(operator, operands);
         return emittedTextRuns;
       }
@@ -6702,7 +6749,8 @@ async function compileNativePatternPrograms(
       resources.extGStates,
       pattern.resources,
       references.extGStates,
-      signal
+      signal,
+      fontRegistry
     );
     const markedContentProperties = await loadMarkedContentProperties(
       document,
@@ -6897,7 +6945,9 @@ function formSpecializationKey(
     state.renderingIntent ?? null,
     state.flatnessTolerance ?? null,
     state.smoothnessTolerance ?? null,
-    state.strokeAdjustment ?? false
+    state.strokeAdjustment ?? false,
+    state.font?.fontIndex ?? -1,
+    state.font?.size ?? 0
   ]);
 }
 
@@ -7860,6 +7910,8 @@ function normalizePageIndexes(
 }
 
 function isNativeVectorRepresentationFailure(error: unknown): error is PdfError {
+  if (error instanceof PdfError && error.code === "unsupported-font" &&
+      error.details?.reason === "program-type3-text-not-integrated") return true;
   if (!(error instanceof PdfError) ||
       (error.code !== "unsupported-content" && error.code !== "unsupported-image")) return false;
   const reason = String(error.details?.reason ?? "");

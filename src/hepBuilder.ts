@@ -16,6 +16,7 @@ import {
 } from "./loadProgress";
 import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import type { AnnotationAppearanceMode } from "./annotationData";
 
 /** Compression algorithm used inside a generated HEP file. */
@@ -41,6 +42,8 @@ export interface HepEncodingOptions extends HepLodOptions {
 
 /** Options when building parsed data directly from an accepted PDF source. */
 export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOptions {
+  /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
+  imageCodecResolver?: NativeImageCodecResolver;
   /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 
@@ -110,6 +113,7 @@ async function buildHepFromPdf(
   const parseProgress = progress.child(0, 0.82, { sourceType: "pdf" });
   const loaded = await loadPdfSceneFromSource(source, {
     password: options.password,
+    imageCodecResolver: options.imageCodecResolver,
     iccTransformResolver: options.iccTransformResolver,
     iccEngine: options.iccEngine,
     onDiagnostic: options.onDiagnostic,

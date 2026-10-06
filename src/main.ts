@@ -15,7 +15,6 @@ import { createPdfAnnotationControls } from "./pdfAnnotationControls";
 import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
-import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import {
   composeVectorScenesInGrid,
   extractPdfPageScenes,
@@ -25,7 +24,7 @@ import {
 } from "./pdfVectorExtractor";
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
-import { buildHep } from "./index";
+import { buildHep } from "./hepBuilder";
 import {
   listSceneRasterLayers,
   loadSceneFromHep,
@@ -53,6 +52,7 @@ import {
 } from "./loadProgress";
 import {
   consumeVectorStrokeLodBuildTiming,
+  hasStoredVectorStrokeLod,
   prebuildVectorStrokeLodRuntime,
   resetVectorStrokeLodBuildTiming,
   type VectorLodMode,
@@ -222,6 +222,7 @@ const vectorColorInputElement = vectorColorInput;
 const vectorOpacitySliderElement = vectorOpacitySlider;
 const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
+let webGpuRendererClass: typeof import("./webGpuFloorplanRenderer").WebGpuFloorplanRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
@@ -492,6 +493,8 @@ function createWebGlRenderer(targetCanvas: HTMLCanvasElement): RendererApi {
 }
 
 async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<RendererApi> {
+  const { WebGpuFloorplanRenderer } = await import("./webGpuFloorplanRenderer");
+  webGpuRendererClass = WebGpuFloorplanRenderer;
   const next = await WebGpuFloorplanRenderer.create(targetCanvas);
   initializeRendererCommon(next);
   return next;
@@ -514,7 +517,7 @@ let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
 const performanceCapture = {
   start(options: RenderPerformanceOptions = {}): string {
-    if (!(renderer instanceof WebGlFloorplanRenderer) && !(renderer instanceof WebGpuFloorplanRenderer)) {
+    if (!(renderer instanceof WebGlFloorplanRenderer) && !(webGpuRendererClass && renderer instanceof webGpuRendererClass)) {
       throw new Error("This performance capture supports the native WebGL and WebGPU renderers.");
     }
     captureProfiler?.stop();
@@ -1204,7 +1207,9 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const parseEnd = performance.now();
 
     if (activeLoadToken === loadToken) {
-      progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType: "hep" });
+      progress.report(LOAD_PROGRESS_VECTOR_LOD_START, {
+        stage: hasStoredVectorStrokeLod(scene) ? "vector-lod-restore" : "vector-lod", sourceType: "hep"
+      });
     }
 
     if (activeLoadToken !== loadToken) {
@@ -1220,7 +1225,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     setStatus(
-      `Building LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
+      `Preparing LOD / GPU data for ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""}...`
     );
     const prebuildLodTiming = await prebuildVectorLodForScene(scene, progress, "hep", activeLoadToken, options.signal);
     await prebuildTextLodForScene(scene, progress, "hep", activeLoadToken, options.signal);
@@ -1485,13 +1490,15 @@ async function prebuildVectorLodForScene(
   signal?: AbortSignal
 ): Promise<VectorStrokeLodBuildTiming> {
   resetVectorStrokeLodBuildTiming();
-  progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: "vector-lod", sourceType });
+  const vectorLodStage = hasStoredVectorStrokeLod(scene) ? "vector-lod-restore" : "vector-lod";
+  progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: vectorLodStage, sourceType });
   await prebuildVectorStrokeLodRuntime(
     scene,
     uiControlManager.readVectorLodModeInput(),
     backendSwitcher?.getActiveBackend() ?? "webgl",
     {
-      yieldIntervalMs: 500,
+      yieldIntervalMs: 50,
+      signal,
       shouldCancel: () => activeLoadToken !== loadToken || signal?.aborted === true,
       onProgress: (lodProgress) => {
         if (activeLoadToken !== loadToken) {
@@ -1500,7 +1507,7 @@ async function prebuildVectorLodForScene(
         const value =
           LOAD_PROGRESS_VECTOR_LOD_START +
           lodProgress.value * (LOAD_PROGRESS_VECTOR_LOD_END - LOAD_PROGRESS_VECTOR_LOD_START);
-        progress.report(value, { stage: "vector-lod", sourceType });
+        progress.report(value, { stage: vectorLodStage, sourceType });
       }
     }
   );

@@ -1,0 +1,21 @@
+{
+  "sourcePackage": "mozilla/pdf.js@6.4.299",
+  "source": "https://github.com/mozilla/pdf.js/tree/v6.4.299/external/jbig2",
+  "pdfiumRevision": "bb1f9f71e7b15afdd5937adf8cfe5807522b882f",
+  "upstream-jbig2.wasm": {
+    "byteLength": 103671,
+    "sha256": "466f45c2a61a698152fb5400c27e56ff2ceb73dcb71fde3fc366a502308eaab0"
+  },
+  "upstream-jbig2.js": {
+    "byteLength": 7848,
+    "sha256": "5ea1b9f03f236ed16bdec65d02010e40d800382d83e8c01d9fd6d8822410b954"
+  },
+  "jbig2-6.4.299.wasm": {
+    "byteLength": 110780,
+    "sha256": "7136979e1439e9676588e2273751aa39245b7679d6e87a20703a2f3f446fbdb2",
+    "modifications": "scripts/lib/instrumentJbig2Wasm.mjs: batched function/loop work and cancellation callbacks every 1024 entries; defined memory maximum 8192 pages (512 MiB).",
+    "reproduce": "node scripts/lib/instrumentJbig2Wasm.mjs src/assets/codecs/jbig2/upstream-jbig2.wasm src/assets/codecs/jbig2/jbig2-6.4.299.wasm"
+  },
+  "licenses": ["PDFium BSD-3-Clause notice", "Apache-2.0"],
+  "licenseFile": "LICENSE_JBIG2"
+}

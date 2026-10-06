@@ -15,6 +15,7 @@ export type PDFLoadStage =
   | "raster-encode"
   | "hep-build"
   | "vector-lod"
+  | "vector-lod-restore"
   | "text-lod"
   | "upload"
   | "first-render"
@@ -288,6 +289,8 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
       return "Building HEP";
     case "vector-lod":
       return "Building Vector LOD";
+    case "vector-lod-restore":
+      return "Loading Vector LOD";
     case "text-lod":
       return "Building Text LOD";
     case "upload":

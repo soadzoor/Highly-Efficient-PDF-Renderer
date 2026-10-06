@@ -20,6 +20,74 @@ try {
   const text = await import("../src/textLodCore.ts");
   const { strokePaintOrigins } = await import("../src/vectorStrokePaintOrder.ts");
   const { createOrthographicLocalToClip } = await import("../src/planarProjection.ts");
+  const geometryFields = ["endpoints", "primitiveMeta", "primitiveBounds", "styles"];
+  const withForbiddenWorker = async (action, label) => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    let starts = 0;
+    Object.defineProperty(globalThis, "Worker", { configurable: true, writable: true,
+      value: class { constructor() { starts++; throw new Error("Stored HEP LOD must not start a worker"); } } });
+    try {
+      const result = await action();
+      assert.equal(starts, 0, `${label}: stored HEP LOD adoption must bypass worker startup and copying`);
+      return result;
+    } finally {
+      if (previous) Object.defineProperty(globalThis, "Worker", previous);
+      else delete globalThis.Worker;
+    }
+  };
+  const reserveWithoutGeometryReads = async (loaded, label) => {
+    const stored = vector.getStoredVectorStrokeLod(loaded);
+    assert(stored);
+    const originals = [], targets = new WeakMap();
+    const runtimes = [];
+    let reads = 0;
+    // Spreading the scene legitimately reads array references. Trap element
+    // access instead, while preserving TypedArray length/buffer/method access.
+    for (const owner of [loaded, stored.literals]) for (const field of geometryFields) {
+      const array = owner[field];
+      const probe = new Proxy(array, { get(target, key) {
+        if (typeof key === "string" && /^(0|[1-9]\d*)$/.test(key)) {
+          reads++;
+          throw new Error(`${label}: reread ${field}[${key}] after preparing stored bounds`);
+        }
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+      targets.set(probe, array);
+      originals.push([owner, field, array]);
+      owner[field] = probe;
+    }
+    try {
+      const reservations = await Promise.all([
+        vector.reserveVectorStrokeLodRuntime(loaded, "force", "webgl"),
+        vector.reserveVectorStrokeLodRuntime(loaded, "force", "webgpu")
+      ]);
+      for (const reservation of reservations) runtimes.push(reservation.take(loaded));
+      runtimes.push(new vector.VectorStrokeLodRuntime(loaded));
+      assert.equal(reads, 0, `${label}: canonical and derived ink bounds are reused`);
+      for (const runtime of runtimes) {
+        assert.equal(runtime.levels[0].scene, loaded);
+        assert(runtime.levels.every(level => level.store.canonical === loaded));
+      }
+      for (const runtime of runtimes.slice(1)) {
+        assert.notEqual(runtime.levels[0].segmentMarks, runtimes[0].levels[0].segmentMarks,
+          `${label}: every viewer owns independent selection state`);
+        assert.equal(runtime.levels[0].segmentMinX, runtimes[0].levels[0].segmentMinX,
+          `${label}: viewers share prepared bounds`);
+      }
+      return runtimes;
+    } finally {
+      for (const [owner, field, array] of originals) owner[field] = array;
+      // Restored literal scenes copy field references; remove probes there too
+      // before the existing geometry/selection parity assertions inspect them.
+      for (const runtime of runtimes) for (const level of runtime.levels) {
+        for (const field of geometryFields) {
+          const value = level.store.literals[field];
+          if (targets.has(value)) level.store.literals[field] = targets.get(value);
+        }
+      }
+    }
+  };
   const count = 512, glyphs = 50_000;
   const scene = { ...createEmptyVectorScene(), segmentCount: count, maxHalfWidth: .1,
     pageCount: 1, pagesPerRow: 1, pageRects: Float32Array.of(0, 0, 1000, 1000),
@@ -67,7 +135,12 @@ try {
     const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
     assert.equal(Boolean(manifest.lod?.vector), withVectorLod);
     assert.equal(Boolean(manifest.lod?.text), withTextLod);
-    const loaded = await loadSceneFromHep(bytes);
+    let restoredViewers;
+    const loaded = await withForbiddenWorker(async () => {
+      const loaded = await loadSceneFromHep(bytes);
+      if (withVectorLod) restoredViewers = await reserveWithoutGeometryReads(loaded, "v3 lossless round trip");
+      return loaded;
+    }, "v3 round trip");
     assert.equal(Boolean(vector.getStoredVectorStrokeLod(loaded)), withVectorLod);
     assert.equal(Boolean(text.getCachedTextLod(loaded)), withTextLod);
     if (withVectorLod) {
@@ -75,8 +148,7 @@ try {
       const disk = JSON.parse(await archive.file("lod-vector/index.json").async("string"));
       assert.equal(disk.tileIndexes, "rebuild");
       for (const level of disk.levels) for (const key of ["tileOffsets", "tileCounts", "tileSegmentIds"]) assert(!(key in level));
-      const first = await vector.reserveVectorStrokeLodRuntime(loaded, "force", "webgl");
-      const a = first.take(loaded), b = new vector.VectorStrokeLodRuntime(loaded);
+      const [a, b] = restoredViewers;
       assert.equal(vector.consumeVectorStrokeLodBuildTiming().buildCount, 0, "all viewers skip simplification");
       assert.notEqual(a.levels[0].segmentMarks, b.levels[0].segmentMarks);
       for (let i = 0; i < a.levels.length; i++) {
@@ -94,6 +166,11 @@ try {
         a.levels.forEach((level, i) => assert.deepEqual(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount),
           originalVector.levels[i].visibleSegmentIds.subarray(0, originalVector.levels[i].visibleSegmentCount)));
       }
+      const selected = a.levels.map(level => level.visibleSegmentIds.slice(0, level.visibleSegmentCount));
+      b.updateForLocalUnitsPerPixel(8);
+      b.update({ cameraCenterX: 1e6, cameraCenterY: 1e6, zoom: 1 / 8 }, { width: 640, height: 480 });
+      a.levels.forEach((level, i) => assert.deepEqual(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount),
+        selected[i], "another viewer's selection cannot mutate the first viewer"));
     }
     if (withTextLod) {
       const result = await text.prebuildTextLod(loaded);
@@ -107,6 +184,33 @@ try {
     }
     if (withVectorLod && withTextLod) storedBytes = bytes;
   }
+  // Cross the worker threshold with a bounded scene so the no-worker assertion
+  // is meaningful even when the small forced round trips would stay local.
+  const denseCount = 150_000;
+  const dense = { ...createEmptyVectorScene(), segmentCount: denseCount, maxHalfWidth: .1,
+    pageCount: 1, pagesPerRow: 1, pageRects: Float32Array.of(0, 0, 1000, 1000),
+    bounds: { minX: 0, minY: 0, maxX: 1000, maxY: 1000 },
+    pageBounds: { minX: 0, minY: 0, maxX: 1000, maxY: 1000 },
+    drawRuns: [{ kind: "stroke", first: 0, count: denseCount }] };
+  for (const field of geometryFields) {
+    dense[field] = new Float32Array(denseCount * 4);
+    for (let i = 0; i < denseCount; i++) dense[field].set(scene[field].subarray((i % count) * 4, (i % count) * 4 + 4), i * 4);
+  }
+  const denseCanonical = prepareSceneForHepRendering(dense);
+  const denseOriginal = new vector.VectorStrokeLodRuntime(denseCanonical);
+  const denseBytes = await (await buildHep(denseCanonical, { withVectorLod: true, vectorLodPrecision: "lossless" })).arrayBuffer();
+  await withForbiddenWorker(async () => {
+    const loaded = await loadSceneFromHep(denseBytes);
+    const [restored] = await reserveWithoutGeometryReads(loaded, "worker-sized v3 round trip");
+    assert.deepEqual(restored.levels[0].segmentMinX, denseOriginal.levels[0].segmentMinX);
+    for (const runtime of [restored, denseOriginal]) {
+      runtime.updateForLocalUnitsPerPixel(2);
+      runtime.update({ cameraCenterX: 100, cameraCenterY: 1, zoom: .5 }, { width: 640, height: 480 });
+    }
+    assert.deepEqual(restored.getStats(), denseOriginal.getStats());
+    restored.levels.forEach((level, i) => assert.deepEqual(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount),
+      denseOriginal.levels[i].visibleSegmentIds.subarray(0, denseOriginal.levels[i].visibleSegmentCount)));
+  }, "worker-sized v3 round trip");
   // Compact positions are bounded; exact geometry, styles and clip windows stay intact.
   const { compactVectorLod, deduplicateVectorLod, packVectorLod, unpackVectorLod } =
     await import("../src/hepLodEncoding.ts");
@@ -171,7 +275,11 @@ try {
   finally { console.warn = savedWarn; }
 
   const compactBlob = await buildHep(canonical, { withVectorLod: true }); // Compact is the API/CLI default.
-  const compactScene = await loadSceneFromHep(await compactBlob.arrayBuffer());
+  const compactScene = await withForbiddenWorker(async () => {
+    const loaded = await loadSceneFromHep(await compactBlob.arrayBuffer());
+    await reserveWithoutGeometryReads(loaded, "v3 compact round trip");
+    return loaded;
+  }, "v3 compact round trip");
   assert(vector.getStoredVectorStrokeLod(compactScene).positionQuanta);
   for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) assert.deepEqual(compactScene[key], canonical[key]);
   assert.equal(parsePdfToHepArguments(["--with-vector-lod", "--vector-lod-precision=compact", "input.pdf"]).vectorLodPrecision, "compact");
@@ -199,6 +307,12 @@ try {
   }
   legacy.file("manifest.json", JSON.stringify(legacyManifest));
   const legacyBytes = await legacy.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+  await withForbiddenWorker(async () => {
+    const loaded = await loadSceneFromHep(legacyBytes);
+    const first = new vector.VectorStrokeLodRuntime(loaded); // Legacy indexes may prepare bounds once.
+    const [second] = await reserveWithoutGeometryReads(loaded, "legacy v1 adoption");
+    assert.deepEqual(second.levels[0].segmentMinX, first.levels[0].segmentMinX);
+  }, "legacy v1 adoption");
   vector.resetVectorStrokeLodBuildTiming();
   for (const precision of ["lossless", "compact"]) {
     const repacked = await repackHepLodBytes(legacyBytes, { vectorLodPrecision: precision });
@@ -225,7 +339,13 @@ try {
   v2Manifest.lod.vector.version = 2;
   v2.file("manifest.json", JSON.stringify(v2Manifest));
   const v2Bytes = await v2.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  const v2Scene = await loadSceneFromHep(v2Bytes);
+  const v2Scene = await withForbiddenWorker(async () => {
+    const loaded = await loadSceneFromHep(v2Bytes);
+    const first = new vector.VectorStrokeLodRuntime(loaded);
+    const [second] = await reserveWithoutGeometryReads(loaded, "legacy v2 adoption");
+    assert.deepEqual(second.levels[0].segmentMinX, first.levels[0].segmentMinX);
+    return loaded;
+  }, "legacy v2 adoption");
   const v2Expected = structuredClone(vector.getStoredVectorStrokeLod(canonical));
   for (const level of v2Expected.levels) for (const key of ["overview", "records"]) if (level[key] === undefined) delete level[key];
   assert.deepEqual(vector.getStoredVectorStrokeLod(v2Scene), v2Expected);

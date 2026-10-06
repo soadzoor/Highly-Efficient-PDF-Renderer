@@ -143,6 +143,16 @@ async function resolveBundledImageCodecWithLimit(
   signal?: AbortSignal
 ): Promise<NativeImageCodecResult> {
   throwIfAborted(signal);
+  if (request.codec === "jpeg2000") {
+    const { decodeBundledJpx } = await import("./nativeJpxCodec");
+    throwIfAborted(signal);
+    return decodeBundledJpx(request, maxAggregateBytes, signal);
+  }
+  if (request.codec === "jbig2") {
+    const { decodeBundledJbig2 } = await import("./nativeJbig2Codec");
+    throwIfAborted(signal);
+    return decodeBundledJbig2(request, maxAggregateBytes, signal);
+  }
   if (request.codec !== "jpeg") {
     throw jpegError(
       `${request.codec} image data requires its pinned codec kernel.`,

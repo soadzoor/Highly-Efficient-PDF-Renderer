@@ -132,6 +132,8 @@ export interface VectorStrokeLodAsyncBuildOptions {
 
   /** Return true to cancel an in-progress async build. */
   shouldCancel?: () => boolean;
+  /** Cancels preparation, terminating a browser worker immediately. */
+  signal?: AbortSignal;
 }
 
 export interface ViewportPixels {
@@ -267,6 +269,7 @@ interface VectorStrokeLodRuntimeBuildData {
   tileGrid: RuntimeTileGrid;
   levels: RuntimeVectorStrokeLodLevel[];
   elapsedMs?: number;
+  allLevelBounds?: Bounds;
 }
 
 let accumulatedBuildTiming: VectorStrokeLodBuildTiming = {
@@ -552,7 +555,10 @@ export class VectorStrokeLodRuntime {
     this.projectedTilePartial = new Uint8Array(this.tileGrid.columns * this.tileGrid.rows);
     this.maxHalfWidth = Math.max(0, scene.maxHalfWidth);
     this.levels = buildData?.levels ?? runStrokeLodBuild(buildStoredStrokeLodLevels(scene, this.tileGrid));
-    for (const level of this.levels) {
+    // Worker preparation includes the union so rebinding canonical buffers
+    // cannot repeat a scan of every source and derived record on the host.
+    if (buildData?.allLevelBounds) Object.assign(this.allLevelBounds, buildData.allLevelBounds);
+    else for (const level of this.levels) {
       const records = level.records;
       for (let index = 0; index < level.segmentCount; index++) {
         const id = records ? records[index] : index;
@@ -1251,9 +1257,9 @@ export function shouldUseVectorStrokeLod(mode: VectorLodMode, rendererType: "web
   return segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS;
 }
 
-function strokeLodBuildSteps(scene: VectorScene): Array<{ tolerance: number; overview: boolean }> {
+function strokeLodBuildSteps(scene: VectorScene, overviewAllowed?: boolean): Array<{ tolerance: number; overview: boolean }> {
   const overview = scene.segmentCount > VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS &&
-    !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode);
+    (overviewAllowed ?? (!sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)));
   // Preserve a fine, coverage-weighted level before generating lossy overview
   // levels. Small/effect scenes keep the existing conservative hierarchy.
   return [
@@ -1296,7 +1302,7 @@ interface StrokeLodHierarchy {
   levels: StrokeLodHierarchyLevel[];
 }
 
-interface StrokeLodStorageBounds {
+export interface StrokeLodStorageBounds {
   minX: Float32Array;
   minY: Float32Array;
   maxX: Float32Array;
@@ -1335,14 +1341,14 @@ async function runStrokeLodBuildAsync<T>(build: StrokeLodBuild<T>, scheduler: Ve
  * geometry bits, paint origins and the level acceptance rule are those of a
  * standalone per-level build; only unchanged canonical strokes are shared.
  */
-function* buildStrokeLodHierarchy(scene: VectorScene): StrokeLodBuild<StrokeLodHierarchy> {
+function* buildStrokeLodHierarchy(scene: VectorScene, overviewAllowed?: boolean): StrokeLodBuild<StrokeLodHierarchy> {
   const baseCount = Math.max(0, scene.segmentCount | 0);
   const sink = new StrokeLodRecordSink(scene);
   const levels: StrokeLodHierarchyLevel[] = [
     { tolerance: 0, segmentCount: baseCount, sceneBounds: scene.bounds, maxHalfWidth: scene.maxHalfWidth }
   ];
   let previousCount = baseCount;
-  const steps = strokeLodBuildSteps(scene);
+  const steps = strokeLodBuildSteps(scene, overviewAllowed);
   const toleranceCount = steps.length;
 
   try {
@@ -1375,8 +1381,8 @@ function* buildStrokeLodHierarchy(scene: VectorScene): StrokeLodBuild<StrokeLodH
 }
 
 /** Build the hierarchy with shared culling bounds and per-level tile buckets. */
-function* buildStoredStrokeLodLevels(scene: VectorScene, tileGrid: RuntimeTileGrid): StrokeLodBuild<RuntimeVectorStrokeLodLevel[]> {
-  const hierarchy = yield* buildStrokeLodHierarchy(scene);
+function* buildStoredStrokeLodLevels(scene: VectorScene, tileGrid: RuntimeTileGrid, overviewAllowed?: boolean): StrokeLodBuild<RuntimeVectorStrokeLodLevel[]> {
+  const hierarchy = yield* buildStrokeLodHierarchy(scene, overviewAllowed);
   const bounds = yield* buildStrokeLodStorageBounds(hierarchy.store, 0.68, 0.72);
   const levels: RuntimeVectorStrokeLodLevel[] = [];
   const levelCount = Math.max(1, hierarchy.levels.length);
@@ -1604,24 +1610,49 @@ async function prepareVectorStrokeLodRuntime(
       if (cacheResult || !completed) storePrebuiltVectorStrokeLodRuntimeInternal(scene, cached);
     }
   }
-  if (storedBuilds.has(scene)) {
+  const stored = storedBuilds.get(scene);
+  if (stored) {
+    // A validated HEP hierarchy is already simplified and indexed. Adopting it
+    // must not start a worker or clone its canonical/derived geometry again.
+    if (options.signal?.aborted || options.shouldCancel?.()) throw new VectorStrokeLodBuildCancelledError();
     const runtime = new VectorStrokeLodRuntime(scene);
     if (cacheResult) storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
-    scheduler.report(1, "Stored Vector LOD ready");
+    try {
+      scheduler.report(1, "Stored Vector LOD ready");
+      if (options.signal?.aborted || options.shouldCancel?.()) throw new VectorStrokeLodBuildCancelledError();
+    } catch (error) {
+      if (!cacheResult) storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
+      throw error;
+    }
     return runtime;
   }
-  const tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
-  await scheduler.maybeYield(true, 0.04, "Partitioning stroke density");
-
-  const levels = await runStrokeLodBuildAsync(buildStoredStrokeLodLevels(scene, tileGrid), scheduler);
+  let workerBuild: PreparedVectorStrokeLod | null = null;
+  if (typeof Worker !== "undefined" && scene.segmentCount >= VECTOR_STROKE_LOD_MIN_SEGMENTS) {
+    let client: typeof import("./lodWorkerClient") | undefined;
+    try { client = await import("./lodWorkerClient"); }
+    catch (error) { console.warn("[HEPR] LOD worker module unavailable; preparing cooperatively.", error); }
+    if (client) workerBuild = await client.buildVectorLodInWorker(scene, undefined, {
+        ...options,
+        onProgress: progress => scheduler.report(progress.value, progress.message)
+      });
+  }
+  let buildData: VectorStrokeLodRuntimeBuildData;
+  if (workerBuild) {
+    const data = workerBuild.data!;
+    preparedStoredBounds.set(data, workerBuild);
+    buildData = restoreVectorStrokeLodBuild(scene, data);
+    buildData.elapsedMs = nowMs() - startedAt;
+  } else {
+    const tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
+    await scheduler.maybeYield(true, 0.04, "Partitioning stroke density");
+    const levels = await runStrokeLodBuildAsync(buildStoredStrokeLodLevels(scene, tileGrid), scheduler);
+    buildData = { tileGrid, levels, elapsedMs: nowMs() - startedAt };
+  }
 
   scheduler.report(0.99, "Finalizing Vector LOD");
   await scheduler.maybeYield(true, 0.99, "Finalizing Vector LOD");
-  const runtime = new VectorStrokeLodRuntime(scene, {
-    tileGrid,
-    levels,
-    elapsedMs: nowMs() - startedAt
-  });
+  buildData.elapsedMs = nowMs() - startedAt;
+  const runtime = new VectorStrokeLodRuntime(scene, buildData);
   if (cacheResult) storePrebuiltVectorStrokeLodRuntimeInternal(scene, runtime);
   try {
     scheduler.report(1, "Vector LOD ready");
@@ -1823,13 +1854,15 @@ class VectorStrokeLodYieldScheduler {
   private readonly yieldIntervalMs: number;
   private readonly onProgress?: (progress: VectorStrokeLodBuildProgress) => void;
   private readonly shouldCancel?: () => boolean;
+  private readonly signal?: AbortSignal;
   private lastYieldAt = nowMs();
   private lastProgressValue = -1;
 
   constructor(options: VectorStrokeLodAsyncBuildOptions) {
-    this.yieldIntervalMs = Math.max(50, Math.trunc(options.yieldIntervalMs ?? 500));
+    this.yieldIntervalMs = Math.max(50, Math.trunc(options.yieldIntervalMs ?? 50));
     this.onProgress = options.onProgress;
     this.shouldCancel = options.shouldCancel;
+    this.signal = options.signal;
   }
 
   report(value: number, message: string): void {
@@ -1842,7 +1875,7 @@ class VectorStrokeLodYieldScheduler {
   }
 
   async maybeYield(force: boolean, value: number, message: string): Promise<void> {
-    if (this.shouldCancel?.()) {
+    if (this.signal?.aborted || this.shouldCancel?.()) {
       throw new VectorStrokeLodBuildCancelledError();
     }
     this.report(value, message);
@@ -1852,7 +1885,7 @@ class VectorStrokeLodYieldScheduler {
     }
     await yieldToBrowser();
     this.lastYieldAt = nowMs();
-    if (this.shouldCancel?.()) {
+    if (this.signal?.aborted || this.shouldCancel?.()) {
       throw new VectorStrokeLodBuildCancelledError();
     }
   }
@@ -2696,10 +2729,28 @@ export interface StoredVectorStrokeLod {
   levels: (StrokeLodHierarchyLevel & StrokeLodTileBuckets)[];
 }
 
+/** Worker output excludes canonical buffers and per-view selection scratch. @internal */
+export interface PreparedVectorStrokeLod {
+  /** Omitted when preparing bounds for an existing stored hierarchy. */
+  data?: StoredVectorStrokeLod;
+  bounds: StrokeLodStorageBounds;
+  allLevelBounds: Bounds;
+}
+
+export type VectorStrokeLodBoundsSource = Pick<StoredVectorStrokeLod, "literals" | "origins"> & {
+  levels: Pick<StrokeLodHierarchyLevel, "segmentCount" | "records">[];
+};
+
 const storedBuilds = new WeakMap<VectorScene, StoredVectorStrokeLod>();
+const preparedStoredBounds = new WeakMap<StoredVectorStrokeLod, PreparedVectorStrokeLod>();
 // Export may inspect an active hierarchy without borrowing its mutable runtime
 // or keeping a disposed renderer alive.
 const latestRuntimeByScene = new WeakMap<VectorScene, WeakRef<VectorStrokeLodRuntime>>();
+
+/** Whether validated stored geometry is installed for direct adoption. @internal */
+export function hasStoredVectorStrokeLod(scene: VectorScene): boolean {
+  return storedBuilds.has(scene);
+}
 
 export function getStoredVectorStrokeLod(scene: VectorScene): StoredVectorStrokeLod | null {
   const persisted = storedBuilds.get(scene);
@@ -2707,12 +2758,17 @@ export function getStoredVectorStrokeLod(scene: VectorScene): StoredVectorStroke
   const runtime = latestRuntimeByScene.get(scene)?.deref();
   const literals = runtime?.levels[0]?.store?.literals;
   if (!runtime || !literals) return null;
+  return describeStoredVectorStrokeLod(runtime.tileGrid, literals, runtime.levels);
+}
+
+function describeStoredVectorStrokeLod(tileGrid: RuntimeTileGrid, literals: VectorScene,
+  levels: readonly RuntimeVectorStrokeLodLevel[]): StoredVectorStrokeLod {
   return {
-    tileGrid: runtime.tileGrid,
+    tileGrid,
     literals: { segmentCount: literals.segmentCount, endpoints: literals.endpoints,
       primitiveMeta: literals.primitiveMeta, primitiveBounds: literals.primitiveBounds, styles: literals.styles },
     origins: explicitStrokePaintOrigins(literals),
-    levels: runtime.levels.map(level => ({ tolerance: level.tolerance, overview: level.overview,
+    levels: levels.map(level => ({ tolerance: level.tolerance, overview: level.overview,
       segmentCount: level.segmentCount, records: level.records, sceneBounds: level.sceneBounds!,
       maxHalfWidth: level.maxHalfWidth!, tileOffsets: level.tileOffsets, tileCounts: level.tileCounts,
       tileSegmentIds: level.tileSegmentIds }))
@@ -2725,12 +2781,64 @@ export function storeVectorStrokeLod(scene: VectorScene, data: StoredVectorStrok
 }
 
 function restoreVectorStrokeLodBuild(scene: VectorScene, data: StoredVectorStrokeLod): VectorStrokeLodRuntimeBuildData {
+  // Keep canonical buffer identity; transfer packets contain derived records
+  // and bounds only, while selection stamps remain exclusive to each viewer.
   const literals = { ...scene, ...data.literals };
   setStrokePaintOrigins(literals, data.origins);
   const store = { canonical: scene, literals };
-  const bounds = runStrokeLodBuild(buildStrokeLodStorageBounds(store, 0, 1));
-  return { tileGrid: data.tileGrid, elapsedMs: 0,
+  let prepared = preparedStoredBounds.get(data);
+  if (!prepared) {
+    // Older stored formats include indexes but not these derived bounds. Keep
+    // their one-time restoration reusable across independent viewer runtimes.
+    const bounds = runStrokeLodBuild(buildStrokeLodStorageBounds(store, 0, 1));
+    prepared = { bounds, allLevelBounds: runStrokeLodBuild(buildStrokeLodAllLevelBounds(bounds, data.levels)) };
+    preparedStoredBounds.set(data, prepared);
+  }
+  const bounds = prepared.bounds;
+  return { tileGrid: data.tileGrid, elapsedMs: 0, allLevelBounds: prepared.allLevelBounds,
     levels: data.levels.map(level => new StoredVectorStrokeLodLevel(store, level, level, bounds)) };
+}
+
+/** Prepare transferable data using the same builder, without worker selection. @internal */
+export async function prepareVectorStrokeLodData(scene: VectorScene, stored: VectorStrokeLodBoundsSource | undefined,
+  overviewAllowed: boolean, options: VectorStrokeLodAsyncBuildOptions = {}): Promise<PreparedVectorStrokeLod> {
+  const scheduler = new VectorStrokeLodYieldScheduler(options);
+  let data: StoredVectorStrokeLod | undefined;
+  let levels: VectorStrokeLodBoundsSource["levels"];
+  let bounds: StrokeLodStorageBounds;
+  if (stored) {
+    const literals = { ...scene, ...stored.literals };
+    setStrokePaintOrigins(literals, stored.origins);
+    bounds = await runStrokeLodBuildAsync(buildStrokeLodStorageBounds({ canonical: scene, literals }, 0, 0.9), scheduler);
+    levels = stored.levels;
+  } else {
+    await scheduler.maybeYield(true, 0, "Preparing Vector LOD");
+    const tileGrid = createRuntimeTileGrid(scene.bounds, scene.segmentCount, scene);
+    const built = await runStrokeLodBuildAsync(buildStoredStrokeLodLevels(scene, tileGrid, overviewAllowed), scheduler);
+    data = describeStoredVectorStrokeLod(tileGrid, built[0].store!.literals, built);
+    levels = data.levels;
+    bounds = { minX: built[0].segmentMinX, minY: built[0].segmentMinY,
+      maxX: built[0].segmentMaxX, maxY: built[0].segmentMaxY };
+  }
+  const allLevelBounds = await runStrokeLodBuildAsync(buildStrokeLodAllLevelBounds(bounds, levels), scheduler);
+  scheduler.report(1, "Vector LOD ready");
+  return { data: stored ? undefined : data, bounds, allLevelBounds };
+}
+
+function* buildStrokeLodAllLevelBounds(bounds: StrokeLodStorageBounds,
+  levels: readonly Pick<StrokeLodHierarchyLevel, "segmentCount" | "records">[], value = 0.99): StrokeLodBuild<Bounds> {
+  const allLevelBounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (const level of levels) {
+    for (let index = 0; index < level.segmentCount; index++) {
+      const id = level.records ? level.records[index] : index;
+      allLevelBounds.minX = Math.min(allLevelBounds.minX, bounds.minX[id]);
+      allLevelBounds.minY = Math.min(allLevelBounds.minY, bounds.minY[id]);
+      allLevelBounds.maxX = Math.max(allLevelBounds.maxX, bounds.maxX[id]);
+      allLevelBounds.maxY = Math.max(allLevelBounds.maxY, bounds.maxY[id]);
+      if ((index & 8191) === 0) yield { value, message: "Finalizing Vector LOD bounds", yieldable: true };
+    }
+  }
+  return allLevelBounds;
 }
 
 /** Rebuild only spatial lookup tables, never simplification. Input geometry must be validated first. */
@@ -2751,6 +2859,10 @@ export async function rebuildStoredVectorStrokeLodIndexes(scene: VectorScene, da
     remainingReferences -= buckets.tileSegmentIds.length;
     levels.push({ ...level, ...buckets });
   }
+  const allLevelBounds = await runStrokeLodBuildAsync(buildStrokeLodAllLevelBounds(bounds, levels, 1), scheduler);
   signal?.throwIfAborted();
-  return { ...data, levels };
+  const restored = { ...data, levels };
+  // Cache on the exact object readHepLod installs, rather than its unpacked input.
+  preparedStoredBounds.set(restored, { bounds, allLevelBounds });
+  return restored;
 }

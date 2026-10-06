@@ -38,6 +38,12 @@ export interface NativePdfLineDash {
   readonly phase: number;
 }
 
+export interface NativePdfExtGStateFont {
+  /** The font dictionary itself, rather than a name in the /Font resources. */
+  readonly value: PdfRef | PdfDictionary;
+  readonly size: number;
+}
+
 export interface NativePdfSoftMaskGroupDescription {
   readonly isolated: boolean;
   readonly knockout: boolean;
@@ -96,6 +102,7 @@ export interface NativePdfExtGStateDescription {
   readonly effectiveBlendMode: PdfBlendMode | null;
   readonly alphaIsShape: boolean | null;
   readonly textKnockout: boolean | null;
+  readonly font: Readonly<NativePdfExtGStateFont> | null;
   readonly strokingOverprint: boolean | null;
   /** `/op` when present, otherwise `/OP` when present, otherwise null. */
   readonly nonstrokingOverprint: boolean | null;
@@ -202,14 +209,10 @@ const RENDERING_INTENTS: ReadonlySet<string> = new Set([
 const SUPPORTED_KEYS: ReadonlySet<string> = new Set([
   "Type", "LW", "LC", "LJ", "ML", "D", "RI", "OP", "op", "OPM", "TR", "TR2",
   "FL", "SM", "SA", "BM", "SMask", "CA", "ca", "AIS", "TK",
-  "BG", "BG2", "UCR", "UCR2", "HT"
+  "BG", "BG2", "UCR", "UCR2", "HT", "Font"
 ]);
 const SOFT_MASK_KEYS: ReadonlySet<string> = new Set(["Type", "S", "G", "BC", "TR"]);
 const TRANSPARENCY_GROUP_KEYS: ReadonlySet<string> = new Set(["Type", "S", "CS", "I", "K"]);
-
-const UNSUPPORTED_KEYS: ReadonlyMap<string, string> = new Map([
-  ["Font", "extgstate-font-unsupported"]
-]);
 
 /**
  * Lazy, resource-scoped registry for PDF extended graphics states and soft
@@ -592,6 +595,7 @@ export class NativePdfExtGStateRegistry {
     const effectiveBlendMode = blendModeSelection?.effective ?? null;
     const alphaIsShape = await optionalBoolean(this.document, dictionary, "AIS", label, signal);
     const textKnockout = await optionalBoolean(this.document, dictionary, "TK", label, signal);
+    const font = await this.readFont(dictionary, label, signal);
     const strokingOverprint = await optionalBoolean(this.document, dictionary, "OP", label, signal);
     const explicitNonstrokingOverprint = await optionalBoolean(this.document, dictionary, "op", label, signal);
     const nonstrokingOverprint = explicitNonstrokingOverprint ?? strokingOverprint;
@@ -641,6 +645,7 @@ export class NativePdfExtGStateRegistry {
       effectiveBlendMode,
       alphaIsShape,
       textKnockout,
+      font,
       strokingOverprint,
       nonstrokingOverprint,
       overprintMode: overprintModeValue as 0 | 1 | null,
@@ -667,13 +672,6 @@ export class NativePdfExtGStateRegistry {
   ): Promise<void> {
     throwIfAborted(signal);
     for (const key of dictionary.keys()) {
-      const reason = UNSUPPORTED_KEYS.get(key);
-      if (reason) {
-        const code = key === "Font" ? "unsupported-font" : "unsupported-content";
-        throw new PdfError(code, `${label} /${key} is unsupported by native compositing.`, {
-          details: { feature: "ext-gstate", reason, entry: key }
-        });
-      }
       if (!SUPPORTED_KEYS.has(key)) {
         throw extGStateError(`${label} contains unsupported entry /${key}.`, {
           reason: "extgstate-entry-unsupported",
@@ -681,6 +679,26 @@ export class NativePdfExtGStateRegistry {
         });
       }
     }
+  }
+
+  private async readFont(
+    dictionary: PdfDictionary,
+    label: string,
+    signal?: AbortSignal
+  ): Promise<Readonly<NativePdfExtGStateFont> | null> {
+    if (!dictionary.has("Font")) return null;
+    const array = await this.document.resolveValue(dictionary.get("Font"), signal);
+    if (!Array.isArray(array) || array.length !== 2) {
+      throw invalidEntry(label, "Font", "must contain a font dictionary and size", "extgstate-font-invalid");
+    }
+    const font = await this.document.resolveValue(array[0], signal);
+    const size = await this.document.resolveValue(array[1], signal);
+    if (!isPdfDictionary(font) || typeof size !== "number" || !Number.isFinite(size)) {
+      throw invalidEntry(label, "Font", "must contain a font dictionary and finite size", "extgstate-font-invalid");
+    }
+    // Keep the reference for font deduplication; accept a direct dictionary as
+    // a bounded compatibility extension to the indirect form in ISO 32000.
+    return Object.freeze({ value: isPdfRef(array[0]) ? array[0] : font, size });
   }
 
   private async readBlendModes(

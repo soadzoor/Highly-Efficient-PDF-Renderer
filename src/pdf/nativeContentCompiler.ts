@@ -59,9 +59,15 @@ export type DensePdfBlendMode =
   | "ColorDodge" | "ColorBurn" | "HardLight" | "SoftLight" | "Difference"
   | "Exclusion" | "Hue" | "Saturation" | "Color" | "Luminosity";
 
+export interface DensePdfFontSelection {
+  readonly fontIndex: number;
+  readonly size: number;
+}
+
 /** Rendering behavior for one native-registry `/ExtGState` resource. */
 export interface DensePdfExtGStateDefinition {
   resourceName: string;
+  font?: Readonly<DensePdfFontSelection>;
   strokeAlpha?: number;
   fillAlpha?: number;
   blendMode?: DensePdfBlendMode;
@@ -97,6 +103,8 @@ export interface DensePdfCompositeState {
 
 /** Optional native text interpreter fed by the compiler's sole content lexer. */
 export interface DensePdfTextOperatorSink {
+  /** Selected page-local font, captured for reusable-program inheritance. */
+  getFontSelection?(): Readonly<DensePdfFontSelection> | undefined;
   applyOperator(
     operator: string,
     operands: readonly unknown[],
@@ -106,6 +114,8 @@ export interface DensePdfTextOperatorSink {
 
 /** Static marked/optional-content state at one source operator. */
 export interface DensePdfTextOperatorContext {
+  /** Present only when gs selects a font dictionary and text-space size. */
+  readonly font?: Readonly<DensePdfFontSelection>;
   readonly outputEnabled: boolean;
   readonly optionalContentIndex: number;
   readonly markedContentIndex: number;
@@ -153,6 +163,7 @@ export type DensePdfColorSpaceResolver = (
 
 /** Supported graphics state inherited by a specialized Form invocation. */
 export interface DensePdfInitialGraphicsState {
+  readonly font?: Readonly<DensePdfFontSelection>;
   readonly lineWidth: number;
   readonly lineCap: number;
   readonly lineDash: readonly number[];
@@ -1327,6 +1338,7 @@ function validateExtGStateDefinition(
     !definition ||
     typeof definition.resourceName !== "string" ||
     definition.resourceName.length === 0 ||
+    !isOptionalFontSelection(definition.font) ||
     !isOptionalUnitInterval(definition.strokeAlpha) ||
     !isOptionalUnitInterval(definition.fillAlpha) ||
     (definition.alphaIsShape !== undefined && typeof definition.alphaIsShape !== "boolean") ||
@@ -1392,6 +1404,11 @@ function validateOptionalContentDefinitions(
 
 function isOptionalUnitInterval(value: number | undefined): boolean {
   return value === undefined || (Number.isFinite(value) && value >= 0 && value <= 1);
+}
+
+function isOptionalFontSelection(font: Readonly<DensePdfFontSelection> | undefined): boolean {
+  return font === undefined || (!!font && Number.isSafeInteger(font.fontIndex) &&
+    font.fontIndex >= 0 && Number.isFinite(font.size));
 }
 
 function isDensePdfBlendMode(value: string): value is DensePdfBlendMode {
@@ -2537,6 +2554,14 @@ class DenseContentCompiler {
             `Graphics state /${resourceName} was not resolved for this content.`,
             operator
           );
+        }
+        if (definition.font && this.textSink) {
+          this.textSink.applyOperator(operator, [resourceName], {
+            outputEnabled: this.contentVisible,
+            optionalContentIndex: this.activeOptionalContentIndex,
+            markedContentIndex: this.activeMarkedContentIndex,
+            font: definition.font
+          });
         }
         if (definition.strokeAlpha !== undefined) {
           this.state.strokeAlpha = definition.strokeAlpha;
@@ -4515,7 +4540,7 @@ class DenseContentCompiler {
         clipBounds: { ...this.state.clipBounds },
         clipIsDefault: this.state.clipIsDefault,
         clipIsExactRectangle: this.state.clipIsExactRectangle,
-        initialGraphicsState: snapshotInitialGraphicsState(this.state)
+        initialGraphicsState: snapshotInitialGraphicsState(this.state, this.textSink?.getFontSelection?.())
       });
       this.vectorFormPaintOrders.push(paintOrder);
       this.vectorFormClipIndices.push(this.state.clipIndex);
@@ -4548,7 +4573,7 @@ class DenseContentCompiler {
       clipBounds: { ...this.state.clipBounds },
       clipIsDefault: this.state.clipIsDefault,
       clipIsExactRectangle: this.state.clipIsExactRectangle,
-      initialGraphicsState: snapshotInitialGraphicsState(this.state)
+      initialGraphicsState: snapshotInitialGraphicsState(this.state, this.textSink?.getFontSelection?.())
     });
   }
 
@@ -7479,8 +7504,12 @@ function freezeSolidPaint(paint: Readonly<DensePdfSolidPaint>): DensePdfSolidPai
   });
 }
 
-function snapshotInitialGraphicsState(state: GraphicsState): DensePdfInitialGraphicsState {
+function snapshotInitialGraphicsState(
+  state: GraphicsState,
+  font?: Readonly<DensePdfFontSelection>
+): DensePdfInitialGraphicsState {
   return {
+    ...(font ? { font } : {}),
     lineWidth: state.lineWidth,
     lineCap: state.lineCap,
     lineDash: [...state.lineDash],
@@ -7514,6 +7543,7 @@ function freezeInitialGraphicsState(
 ): DensePdfInitialGraphicsState {
   return Object.freeze({
     ...state,
+    ...(state.font ? { font: Object.freeze({ ...state.font }) } : {}),
     lineDash: Object.freeze([...state.lineDash]),
     strokeColor: Object.freeze([...state.strokeColor]) as DensePdfInitialGraphicsState["strokeColor"],
     fillColor: Object.freeze([...state.fillColor]) as DensePdfInitialGraphicsState["fillColor"]
@@ -7521,6 +7551,7 @@ function freezeInitialGraphicsState(
 }
 
 function validateInitialGraphicsState(state: DensePdfInitialGraphicsState): void {
+  if (!isOptionalFontSelection(state.font)) throw new TypeError("Initial Form font state is invalid.");
   if (!Number.isFinite(state.lineWidth) || state.lineWidth < 0) {
     throw new TypeError("Initial Form line width must be finite and non-negative.");
   }

@@ -44,6 +44,7 @@ const context = vm.createContext({
   composeVectorScenesInGrid: (pages) => pages[0],
   prepareSceneForHepRendering: (value) => value,
   listSceneRasterLayers: () => [], resolveSceneFitBounds: () => ({}),
+  hasStoredVectorStrokeLod: () => false,
   prebuildVectorLodForScene: async () => timing, prebuildTextLodForScene: async () => {},
   consumeVectorStrokeLodBuildTiming: () => timing, combineVectorLodTimings: () => timing,
   yieldToBrowserPaint: async () => {}, yieldAfterPaint: async (signal) => signal?.throwIfAborted(),
@@ -148,6 +149,7 @@ assert.equal(context.sourceLoadController, null);
 await testThreeDocumentReplacement();
 await testThreeBackendReplacement();
 await testRoomDocumentReplacement();
+await testNativeBackendLoading();
 console.log("Document replacement, export ownership, upload rollback, and superseded-load cancellation passed.");
 
 function file(name, id) {
@@ -169,6 +171,43 @@ async function assertExport(id, label) {
   assert.equal(exports.at(-1).scene.id, id);
   assert.equal(exports.at(-1).source, undefined, "v7 exports the complete scene without embedding its source PDF");
   assert.equal(exports.at(-1).label, label);
+}
+
+async function testNativeBackendLoading() {
+  let imports = 0;
+  let failImport = true;
+  const initialized = [];
+  class WebGpuFloorplanRenderer {
+    static async create(canvas) {
+      if (canvas.fail) throw new Error("GPU initialization failed");
+      return new this(canvas);
+    }
+    constructor(canvas) { this.canvas = canvas; }
+  }
+  const host = vm.createContext({
+    webGpuRendererClass: null,
+    initializeRendererCommon: renderer => initialized.push(renderer),
+    loadWebGpuModule: async () => {
+      imports++;
+      if (failImport) throw new Error("Backend chunk unavailable");
+      return { WebGpuFloorplanRenderer };
+    }
+  });
+  // Replace only the module-loading boundary; exercise the real factory body.
+  const factory = sourceFunction(source, "createWebGpuRenderer")
+    .replace('import("./webGpuFloorplanRenderer")', "loadWebGpuModule()");
+  vm.runInContext(factory, host);
+  assert.equal(imports, 0, "Defining the factory must not load the optional backend");
+  await assert.rejects(host.createWebGpuRenderer({}), /chunk unavailable/);
+  assert.equal(host.webGpuRendererClass, null);
+  failImport = false;
+  await assert.rejects(host.createWebGpuRenderer({ fail: true }), /initialization failed/);
+  assert.equal(initialized.length, 0, "Failed initialization does not bind viewer state");
+  const canvas = {};
+  const renderer = await host.createWebGpuRenderer(canvas);
+  assert.equal(renderer.canvas, canvas);
+  assert.deepEqual(initialized, [renderer]);
+  assert(renderer instanceof host.webGpuRendererClass, "Capture retains the loaded constructor for profiler checks");
 }
 
 async function testThreeDocumentReplacement() {
@@ -322,6 +361,7 @@ async function testThreeBackendReplacement() {
       readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto" }),
       captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
       resetVectorStrokeLodBuildTiming: noop, consumeVectorStrokeLodBuildTiming: () => timing,
+      hasStoredVectorStrokeLod: () => false,
       reserveVectorStrokeLodRuntime: async (sceneData) => {
         assert.equal(sceneData, canonicalScene);
         return reservation;
