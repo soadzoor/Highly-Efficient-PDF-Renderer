@@ -7,6 +7,8 @@ import { MapControls } from "three/addons/controls/MapControls.js";
 const hooks = registerHooks({ resolve(s, c, next) {
   return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
@@ -48,7 +50,7 @@ try {
   const canonical = structuredClone(scene);
   function create(backend, mode, data = scene) {
     const plan = new ThreeVectorDrawPlan(data);
-    const options = { drawPlan: plan,materialBackend: backend,colorCompositing: "display",strokeCurveEnabled: true,
+    const options = { drawPlan: plan,materialBackend: backend, webGpu,colorCompositing: "display",strokeCurveEnabled: true,
       textVectorOnly: true,vectorOverride: [0,0,0,0],pageBackground: [1,1,1,1],rasterAtlasGlyphCount: data.textGlyphCount };
     const lod = ThreeTextLodLayer.create(data, sceneRequiresPaintCompositing(data) ? "off" : mode);
     const text = new ThreeMaterialTextLayer(lod.getRenderScene(), options);
@@ -65,7 +67,7 @@ try {
         threeColorCompositing: "display",pageBackground: [1,1,1,1],vectorOverride: [0,0,0,0] },
       0,new ThreeMaterialRasterLayer(data,options),new ThreeMaterialGradientLayer(data,options),
       new ThreeMaterialFillLayer(data,options),new ThreeMaterialStrokeLayer(data,options),null,null,null,text,lod,
-      new THREE.Mesh(new THREE.PlaneGeometry(502,242),new THREE.MeshBasicMaterial()),uv,new THREE.BufferAttribute(uv,2),plan);
+      new THREE.Mesh(new THREE.PlaneGeometry(502,242),new THREE.MeshBasicMaterial()),uv,new THREE.BufferAttribute(uv,2),plan,undefined,webGpu);
     const host = { isWebGLRenderer: backend === "webgl",isWebGPURenderer: backend === "webgpu",
       backend: { device: { limits: { maxTextureDimension2D: 16384 } } },
       outputColorSpace: THREE.LinearSRGBColorSpace,capabilities: { maxTextureSize: 16384 },

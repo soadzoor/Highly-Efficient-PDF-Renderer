@@ -4,7 +4,8 @@ import {
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
-import { loadSceneFromHep, prepareSceneForHepRendering } from "./hep";
+import { loadSceneFromHep } from "./hepReader";
+import { prepareSceneForHepRendering } from "./hepShared";
 import { hasHepSignature, hasLegacyZipSignature } from "./hepContainer";
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import { hasPdfHeader } from "./pdfSignature";

@@ -1,6 +1,7 @@
-import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
+import { pageProjectionNode } from "./threeWebGpuPageTransforms";
+import type { ThreePageBinding } from "./threePageTransforms";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
-import { registerThreeNodeClipPosition } from "./threeVectorClips";
+import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 

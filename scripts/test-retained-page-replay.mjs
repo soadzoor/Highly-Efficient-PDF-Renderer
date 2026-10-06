@@ -7,6 +7,9 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 try {
   const { openPdf, renderNativeRetainedCommandSpan } = await import("../src/pdfSession.ts");
+  const compositor = await import("../src/retainedPageCompositor.ts");
+  assert.equal(renderNativeRetainedCommandSpan, compositor.renderNativeRetainedCommandSpan,
+    "the historical session export preserves the isolated compositor API");
   const { RetainedPageReplay, applyRetainedPageVisibility } = await import("../src/retainedPageReplay.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const session = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [

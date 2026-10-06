@@ -3,6 +3,8 @@ import { registerHooks } from "node:module";
 const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { ThreeVectorLodStrokeLayer } = await import("../src/vectorStrokeLod.ts");
@@ -32,7 +34,7 @@ try {
   const original = structuredClone(scene);
   for (const materialBackend of ["webgl", "webgpu"]) {
     const plan = new ThreeVectorDrawPlan(scene);
-    const layer = new ThreeVectorLodStrokeLayer(scene, { materialBackend, drawPlan: plan,
+    const layer = new ThreeVectorLodStrokeLayer(scene, { materialBackend, webGpu, drawPlan: plan,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
     const controller = new OptionalContentController(scene);
     const viewport = { width: 640, height: 480 };

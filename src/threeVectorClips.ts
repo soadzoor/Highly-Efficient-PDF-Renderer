@@ -1,43 +1,22 @@
 import * as THREE from "three";
-import { NodeMaterial, TSL } from "three/webgpu";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { packVectorClips } from "./vectorClips";
-import { VECTOR_CLIP_WGSL, VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
-import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
 import { copyThreePaintFold } from "./threePaintFold";
 
-const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
-const antialiasedNodeClips = new WeakMap<THREE.Material, "straight-alpha" | "premultiplied">();
-const rasterNodeClips = new WeakSet<THREE.Material>();
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
-const clipFn: unknown = TSL.wgslFn(VECTOR_CLIP_WGSL);
-const clipAAFn: unknown = TSL.wgslFn(VECTOR_CLIP_AA_WGSL);
-const rasterClipAAFn: unknown = TSL.wgslFn(RASTER_CLIP_WGSL);
-const clipPixelWidthFn: unknown = TSL.wgslFn(`
-fn heprClipPixelWidth(point: vec2<f32>) -> f32 {
-  let dx = length(vec2<f32>(dpdx(point.x), dpdy(point.x)));
-  let dy = length(vec2<f32>(dpdx(point.y), dpdy(point.y)));
-  return max(max(dx, dy), 0.0001);
+type NodeClipCloner = (source: THREE.Material, target: THREE.Material, clipIndex: number | null, texture: THREE.DataTexture) => void;
+const nodeClipCloners = new WeakMap<THREE.Material, NodeClipCloner>();
+
+/** The selected backend supplies clipping when it creates a node material. */
+export function registerThreeVectorClipCloner(material: THREE.Material, applyClip: NodeClipCloner): void {
+  nodeClipCloners.set(material, applyClip);
 }
-`);
 
 /** Per-instance clip root, stored as `clipIndex + 1` so zero means unclipped. */
 export const VECTOR_CLIP_INSTANCE_ATTRIBUTE = "aVectorClipIndex";
 /** `uVectorClipIndex` value that selects the instance stream in the core shaders. */
 const INSTANCE_VECTOR_CLIP_UNIFORM = -2;
-
-/**
- * Without `antialias` a clip is a per-pixel point test. An antialiased clip
- * scales a straight-alpha color's alpha by its coverage, or all of a
- * premultiplied color. Raster clips keep rectangular tile/page edges solid.
- */
-export function registerThreeNodeClipPosition(material: THREE.Material, world: unknown,
-  antialias: false | "straight-alpha" | "premultiplied" = false, raster = false): void {
-  nodeWorldPositions.set(material, world);
-  if (antialias) antialiasedNodeClips.set(material, antialias);
-  if (raster) rasterNodeClips.add(material);
-}
 
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
   // Both the GLSL and WGSL clips read cell storage, bounding each pixel's clip
@@ -79,11 +58,6 @@ export function createThreeInstanceVectorClipMaterial(source: THREE.Material): T
   return cloneWithVectorClip(source, null);
 }
 
-function flatVarying(node: unknown): never {
-  return ((TSL.varying as unknown as (value: unknown) => { setInterpolation(type: string): unknown })(node)
-    .setInterpolation("flat")) as never;
-}
-
 function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): THREE.Material {
   const texture = materialTextures.get(source);
   if (!texture) throw new Error("Clipped material has no vector clip texture.");
@@ -94,35 +68,10 @@ function cloneWithVectorClip(source: THREE.Material, clipIndex: number | null): 
     // The shared core shaders already fall back to the instance stream when the
     // uniform selects it, so only the uniform changes.
     material.uniforms = { ...source.uniforms, uVectorClipIndex: { value: clipIndex ?? INSTANCE_VECTOR_CLIP_UNIFORM } };
-  } else if (source instanceof NodeMaterial && material instanceof NodeMaterial) {
-    const world = nodeWorldPositions.get(source);
-    if (!world || !source.fragmentNode) throw new Error("Clipped node material has no page-space position.");
-    // The clip root is per instance, so it travels flat, like every other
-    // per-primitive value in these materials.
-    const index = clipIndex === null
-      ? TSL.sub(flatVarying(TSL.attribute(VECTOR_CLIP_INSTANCE_ATTRIBUTE, "float")), 1)
-      : TSL.uniform(clipIndex);
-    const clipParams = { point: world, clipIndex: index, clipTexture: TSL.textureLoad(texture) };
-    const antialias = antialiasedNodeClips.get(source);
-    if (antialias) {
-      material.fragmentNode = TSL.Fn(() => {
-        // Force derivatives before the paint helper, which can discard. The
-        // straight-alpha blend must keep RGB intact along partially covered clips.
-        const aaWidth = TSL.property("float", "heprClipAAWidth");
-        aaWidth.assign((clipPixelWidthFn as (params: Record<string, unknown>) => never)({ point: world }));
-        const color = TSL.property("vec4", "heprClipSource");
-        color.assign(source.fragmentNode as never);
-        // Premultiplied image paint keeps rectangular tile/page clips solid.
-        const coverageFn = rasterNodeClips.has(source) ? rasterClipAAFn : clipAAFn;
-        const coverage = (coverageFn as (params: Record<string, unknown>) => never)({ ...clipParams, aaWidth });
-        return antialias === "premultiplied" ? TSL.mul(color, coverage) : TSL.vec4(color.rgb, TSL.mul(color.a, coverage));
-      })();
-    } else {
-      const coverage = (clipFn as (params: Record<string, unknown>) => never)(clipParams);
-      material.fragmentNode = TSL.mul(source.fragmentNode as never, coverage);
-    }
   } else {
-    throw new Error("Unsupported vector clip material.");
+    const applyClip = nodeClipCloners.get(source);
+    if (!applyClip) throw new Error("Unsupported vector clip material.");
+    applyClip(source, material, clipIndex, texture);
   }
   return material;
 }

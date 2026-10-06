@@ -42,7 +42,7 @@ export class RetainedPageReplay {
   constructor(scene: VectorScene, renderSpan?: RenderSpan) {
     this.scene = scene;
     this.renderSpan = renderSpan ?? (async (page, first, count, signal) => {
-      const { renderNativeRetainedCommandSpan } = await import("./pdfSession");
+      const { renderNativeRetainedCommandSpan } = await import("./retainedPageCompositor");
       return renderNativeRetainedCommandSpan(page, first, count, signal);
     });
     const dependencies = scene.retainedPages?.map(resource => new RetainedSpanDependencies(resource.page)) ?? [];

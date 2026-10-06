@@ -1,8 +1,9 @@
-import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
+import { pageProjectionNode } from "./threeWebGpuPageTransforms";
+import type { ThreePageBinding } from "./threePageTransforms";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
-import { registerThreeNodeClipPosition } from "./threeVectorClips";
+import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import { RASTER_STRIP_LEVEL_WGSL, RASTER_STRIP_SAMPLE_WGSL } from "./rasterStripWebGpuSampling";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import { rasterPackFn, rasterClipFn, rasterFragmentFns } from "./threeWebGpuRasterMaterial";

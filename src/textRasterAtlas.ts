@@ -1,3 +1,4 @@
+import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
 import type { VectorScene } from "./pdfVectorExtractor";
 
 export interface TextRasterAtlas {
@@ -34,7 +35,7 @@ const GLYPH_MAX_DIM_PX = 256;
  * Transparent texels around each glyph's UV rect. Glyph quads reach a pixel
  * past the glyph box, and samples there read this padding as empty.
  */
-export const TEXT_RASTER_ATLAS_PADDING_PX = 8;
+export { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
 const GLYPH_PADDING_PX = TEXT_RASTER_ATLAS_PADDING_PX;
 const CONNECTION_EPSILON = 1e-3;
 

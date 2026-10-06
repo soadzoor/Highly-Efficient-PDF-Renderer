@@ -8,7 +8,7 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 import { createServer } from "vite";
 
 import { encodeExampleAssetPathSegment } from "./example-asset-path.ts";

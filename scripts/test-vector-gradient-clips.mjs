@@ -9,6 +9,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
@@ -199,7 +201,7 @@ try {
 
   // Construct Three materials without creating a browser or GPU session.
   for (const materialBackend of ["webgl", "webgpu"]) {
-    const layer = new ThreeMaterialGradientLayer(scene, { materialBackend,
+    const layer = new ThreeMaterialGradientLayer(scene, { materialBackend, webGpu,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
     const entries = layer.getOrderedPaintMeshes();
     const materials = entries.map(entry => entry.mesh.material);

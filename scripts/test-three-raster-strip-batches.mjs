@@ -7,6 +7,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     ? `${specifier}.ts` : specifier, context);
 } });
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
@@ -20,7 +22,7 @@ try {
     return scene;
   };
   const createLayer = (scene, materialBackend, colorCompositing = "display") =>
-    new ThreeMaterialRasterLayer(scene, { materialBackend, colorCompositing, pageBackground: [1, 1, 1, 1] });
+    new ThreeMaterialRasterLayer(scene, { materialBackend, webGpu, colorCompositing, pageBackground: [1, 1, 1, 1] });
 
   for (const [backend, colorCompositing] of [["webgl", "display"], ["webgpu", "display"], ["webgpu", "linear"]]) {
     const scene = makeScene(13);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {

@@ -1,4 +1,5 @@
-import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
+import { pageProjectionNode } from "./threeWebGpuPageTransforms";
+import type { ThreePageBinding } from "./threePageTransforms";
 import { STROKE_COVERAGE_WGSL } from "./strokeCoverageShaders";
 import { CLIPPED_PAINT_QUAD_WGSL, FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { UNBOUNDED_VECTOR_CLIP_BOUNDS } from "./vectorClips";
@@ -8,7 +9,7 @@ import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { GRADIENT_PARAMETER_WGSL, GRADIENT_BACKGROUND_WGSL } from "./gradientSampling";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
-import { registerThreeNodeClipPosition } from "./threeVectorClips";
+import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 
 import {
   CORE_WGSL_DISTANCE_TO_LINE_SEGMENT_SOURCE,

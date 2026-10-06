@@ -29,6 +29,7 @@ export const fastTests = [
   "hep-scene-sections",
   "optional-content",
   "retained-page-replay",
+  "retained-page-compositor",
   "retained-vector-page",
   "retained-packed-strokes",
   "retained-single-paint-opacity",
@@ -43,6 +44,7 @@ export const fastTests = [
   "vector-fill-bands",
   "vector-cell-index",
   "webgl-shader-precision",
+  "shader-comment-compaction",
   "webgl-fill-clip-bounds",
   "subpixel-stroke-coverage",
   "fill-area-coverage",
@@ -61,6 +63,7 @@ export const fastTests = [
   "three-raster-paint-order",
   "three-page-background-batching",
   "three-page-transforms",
+  "three-backend-loading",
   "three-page-transform-batching",
   "scene-page-views",
   "shared-page-renderer",
@@ -175,7 +178,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package", "lod-worker-package"],
+  package: ["browser-package", "bundler-package", "lod-worker-package", "built-material-shaders"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",

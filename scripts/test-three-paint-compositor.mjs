@@ -11,11 +11,13 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { ThreePaintCompositor, projectThreePdfCompositeBounds } = await import("../src/threePaintCompositor.ts");
   for (const backend of ["webgl", "webgpu"]) {
-    const compositor = new ThreePaintCompositor(backend);
+    const compositor = new ThreePaintCompositor(backend, webGpu);
     for (const camera of [new THREE.PerspectiveCamera(50, 1.5, .1, 1000), new THREE.OrthographicCamera(-50,50,50,-50,.1,1000)]) {
       camera.coordinateSystem = backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem;
       camera.position.set(20,30,100); camera.lookAt(0,0,0); camera.updateProjectionMatrix(); camera.updateMatrixWorld();
@@ -46,9 +48,9 @@ try {
   });
   const original = scene.rasterLayers[0].data.slice();
   for (const backend of ["webgl", "webgpu"]) {
-    const stroke = new ThreeMaterialStrokeLayer(scene, { materialBackend: backend,
+    const stroke = new ThreeMaterialStrokeLayer(scene, { materialBackend: backend, webGpu,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
-    const raster = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, pageBackground: [1, 1, 1, 1] });
+    const raster = new ThreeMaterialRasterLayer(scene, { materialBackend: backend, webGpu, pageBackground: [1, 1, 1, 1] });
     const entry = raster.rasterEntries[0];
     const oldTexture = entry.texture;
     let oldDisposed = 0; oldTexture.addEventListener("dispose", () => oldDisposed++);
@@ -78,7 +80,7 @@ try {
     const restoreShape = setThreePdfShapeOnly(entry.material, true);
     restoreShape();
 
-    const compositor = new ThreePaintCompositor(backend);
+    const compositor = new ThreePaintCompositor(backend, webGpu);
     const host = makeRenderer(backend);
     const state = snapshot(host);
     const roots = [stroke.mesh, raster.group];
@@ -177,9 +179,9 @@ try {
       paintGraph: { roots: [{ kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
         children: [{ kind: "draw", runIndex: 0 }, { kind: "draw", runIndex: 1 }] }] }
     });
-    const spanStroke = new ThreeMaterialStrokeLayer(spanScene, { materialBackend: backend,
+    const spanStroke = new ThreeMaterialStrokeLayer(spanScene, { materialBackend: backend, webGpu,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
-    const spanCompositor = new ThreePaintCompositor(backend);
+    const spanCompositor = new ThreePaintCompositor(backend, webGpu);
     const spanHost = makeRenderer(backend);
     spanCompositor.render(spanHost, spanScene, [spanStroke.mesh], 32, 24, () => true);
     const spanDraws = spanHost.draws.filter(draw => draw.ids);
@@ -330,9 +332,9 @@ try {
       paintGraph: { roots: [{ kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
         children: [{ kind: "draw", runIndex: 1 }, { kind: "draw", runIndex: 0 }] }] }
     });
-    const splitStroke = new ThreeMaterialStrokeLayer(splitScene, { materialBackend: backend,
+    const splitStroke = new ThreeMaterialStrokeLayer(splitScene, { materialBackend: backend, webGpu,
       strokeCurveEnabled: true, vectorOverride: [0, 0, 0, 0] });
-    const splitCompositor = new ThreePaintCompositor(backend);
+    const splitCompositor = new ThreePaintCompositor(backend, webGpu);
     const splitHost = makeRenderer(backend);
     splitCompositor.render(splitHost, splitScene, [splitStroke.mesh], 32, 24, () => true);
     assert.deepEqual(splitHost.draws.filter(draw => draw.ids).map(draw => draw.ids), [[1], [0]],
@@ -369,7 +371,7 @@ try {
       mesh.userData.heprDrawRun = run;
       return mesh;
     });
-    const slotCompositor = new ThreePaintCompositor(backend), slotHost = makeRenderer(backend);
+    const slotCompositor = new ThreePaintCompositor(backend, webGpu), slotHost = makeRenderer(backend);
     const slotDraws = () => slotHost.draws.filter(draw => draw.tag !== undefined).map(draw => draw.tag);
     const drawSlots = project => {
       slotHost.draws.length = 0;
@@ -426,7 +428,7 @@ async function testCompositorOnlyLayers(source, backend) {
   const { ThreeMaterialTextLayer } = await import("../src/threeMaterialTextLayer.ts");
   const { ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
   const viewport = { width: 320, height: 240 }, drawPlan = new ThreeVectorDrawPlan(source);
-  const options = { materialBackend: backend, colorCompositing: "display", drawPlan,
+  const options = { materialBackend: backend, webGpu, colorCompositing: "display", drawPlan,
     strokeCurveEnabled: true, textVectorOnly: true, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1] };
   const stroke = new ThreeMaterialStrokeLayer(source, options);
   let viewState = { cameraCenterX: 5, cameraCenterY: 5, zoom: 20 };
@@ -442,7 +444,7 @@ async function testCompositorOnlyLayers(source, backend) {
     0, new ThreeMaterialRasterLayer(source, options), new ThreeMaterialGradientLayer(source, options),
     new ThreeMaterialFillLayer(source, options), stroke, null, null, null, new ThreeMaterialTextLayer(source, options),
     null, new THREE.Mesh(new THREE.PlaneGeometry(10, 10), new THREE.MeshBasicMaterial()),
-    uv, new THREE.BufferAttribute(uv, 2), drawPlan);
+    uv, new THREE.BufferAttribute(uv, 2), drawPlan, undefined, webGpu);
   const outer = new THREE.Scene(); outer.add(object);
   const host = Object.assign(makeRenderer(backend), {
     isWebGLRenderer: backend === "webgl", isWebGPURenderer: backend === "webgpu",
@@ -585,8 +587,8 @@ async function testFolding(ThreePaintCompositor, backend) {
     drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "fill", first: 1, count: 1 }],
     paintGraph: { roots: [group] }
   });
-  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, vectorOverride: [0, 0, 0, 0] });
-  const compositor = new ThreePaintCompositor(backend);
+  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, webGpu, vectorOverride: [0, 0, 0, 0] });
+  const compositor = new ThreePaintCompositor(backend, webGpu);
   const host = makeRenderer(backend);
   const folds = [], clearingRenders = [];
   const render = host.render.bind(host);
@@ -673,12 +675,12 @@ async function testGradientMaskFolding(ThreePaintCompositor, backend) {
     paintGraph: { roots: [{ kind: "group", isolated: false, knockout: false, alpha: 0.5, blendMode: "Normal",
       softMask: { subtype: "Luminosity", children: [{ kind: "draw", runIndex: 1 }] }, children: [{ kind: "draw", runIndex: 0 }] }] }
   });
-  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, vectorOverride: [0, 0, 0, 0] });
-  const gradient = new ThreeMaterialGradientLayer(scene, { materialBackend: backend, strokeCurveEnabled: true,
+  const fill = new ThreeMaterialFillLayer(scene, { materialBackend: backend, webGpu, vectorOverride: [0, 0, 0, 0] });
+  const gradient = new ThreeMaterialGradientLayer(scene, { materialBackend: backend, webGpu, strokeCurveEnabled: true,
     vectorOverride: [0, 0, 0, 0] });
   const gradientMaterials = new Set(gradient.getOrderedPaintMeshes().map(entry => entry.material));
   const clipFromData = new THREE.Matrix4().makeScale(0.2, 0.2, 1).premultiply(new THREE.Matrix4().makeTranslation(-1, -1, 0));
-  const compositor = new ThreePaintCompositor(backend);
+  const compositor = new ThreePaintCompositor(backend, webGpu);
   const host = makeRenderer(backend);
   const folds = [];
   let gradientDraws = 0;
@@ -728,7 +730,7 @@ function snapshot(renderer) {
 // A zoom replan replaces the scheduled meshes but retains canonical paint IDs.
 // HEP scenes can have thousands of ranges behind only a few dozen meshes.
 function testProxyReplacement(ThreePaintCompositor, backend) {
-  const compositor = new ThreePaintCompositor(backend);
+  const compositor = new ThreePaintCompositor(backend, webGpu);
   const batchCount = 16, rangesPerBatch = 256, rangeCount = batchCount * rangesPerBatch;
   const material = new THREE.MeshBasicMaterial();
   const geometries = [];

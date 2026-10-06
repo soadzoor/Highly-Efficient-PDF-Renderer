@@ -1,3 +1,4 @@
+import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { createThreeMultiplyMaterial } from "./threeVectorMultiply";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
@@ -6,7 +7,6 @@ import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } fr
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
-import { createThreeWebGpuRasterStripMaterial } from "./threeWebGpuRasterStripMaterial";
 
 import {
   CORE_RASTER_FRAGMENT_SHADER_SOURCE,
@@ -17,10 +17,9 @@ import {
   HEPR_THREE_LAYER_ORDER_PAGE_BACKGROUND,
   HEPR_THREE_LAYER_ORDER_RASTER
 } from "./threeLayerOrder";
-import {
-  createThreeWebGpuRasterMaterial,
-  type ThreeRasterTileRect,
-  type ThreeWebGpuRasterMaterialState
+import type {
+  ThreeRasterTileRect,
+  ThreeWebGpuRasterMaterialState
 } from "./threeWebGpuRasterMaterial";
 import {
   planRasterTiles,
@@ -37,6 +36,7 @@ interface RasterLayerOptions {
   /** Initial texture limit for tiling large images; see setMaxTextureSize. */
   maxTextureSize?: number;
   materialBackend?: "webgl" | "webgpu";
+  webGpu?: ThreeWebGpuBackend;
   colorCompositing?: ThreeColorCompositing;
   pageBackground: [number, number, number, number];
 }
@@ -86,6 +86,7 @@ interface RasterLayerSource {
 
 export class ThreeMaterialRasterLayer {
   private readonly pageTransforms: ThreePageTransforms | undefined;
+  private readonly webGpu: ThreeWebGpuBackend | undefined;
   private readonly visibility: ScenePaintVisibility;
   private snapshot: OptionalContentSnapshot;
   private readonly vectorClipTexture: THREE.DataTexture;
@@ -117,6 +118,7 @@ export class ThreeMaterialRasterLayer {
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
     this.pageTransforms = options.pageTransforms;
+    this.webGpu = options.webGpu;
     this.appliedRasterLayers = [...scene.rasterLayers];
     this.visibility = new ScenePaintVisibility(scene);
     this.snapshot = createDefaultOptionalContentSnapshot(scene);
@@ -544,7 +546,7 @@ export class ThreeMaterialRasterLayer {
         Float32Array.from({ length: batch.count }, (_, i) => this.pageTransforms!.page("raster", batch.first + i).page!), 1));
       let webGpuState: RasterLayerEntry["webGpuState"];
       if (this.materialBackend === "webgpu") {
-        const state = createThreeWebGpuRasterStripMaterial({ pageBinding, texture, colorCompositing: this.colorCompositing,
+        const state = requireThreeWebGpuBackend(this.webGpu).createThreeWebGpuRasterStripMaterial({ pageBinding, texture, colorCompositing: this.colorCompositing,
           viewport: this.viewportUniform, cameraCenter: this.cameraCenterUniform, localToClip: this.localToClipUniform });
         material = state.material;
         webGpuState = state;
@@ -629,7 +631,7 @@ export class ThreeMaterialRasterLayer {
       : this.pageTransforms.page("raster", rasterIndex) : undefined;
 
     if (this.materialBackend === "webgpu") {
-      const state = createThreeWebGpuRasterMaterial({
+      const state = requireThreeWebGpuBackend(this.webGpu).createThreeWebGpuRasterMaterial({
         instancedPageBackground,
         pageBinding,
         colorCompositing: this.colorCompositing,

@@ -23,7 +23,7 @@ import {
   startPdfToHepWorker,
   writeHepBlobAtomically
 } from "../PDFtoHEP.js";
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 
 for (const version of ["20.19.0", "22.13.0", "22.14.0", "23.0.0", "23.4.0"]) {
   assert.throws(() => assertSupportedNodeVersion(version), /Node.js 22\.15\+/);

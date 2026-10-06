@@ -28,6 +28,25 @@ The main and `/three` entries retain the prebuilt `dist/lib` layout: serve that
 directory intact when using it in a browser; do not rebundle it or mix its modules
 with the `/bundler` entry. Node usage is unchanged.
 
+Rendering backends and WebGPU materials load on demand. The existing asynchronous
+object factories prepare the selected backend before returning, and HEP export
+loads its encoder when `buildHep` is called. The first use can require additional
+chunk requests; subsequent calls reuse the loaded modules. Deploy every emitted
+chunk and asset together. Optional features remain in the package, while named
+imports from `/bundler` allow unused modules to be removed by the application build.
+Worker startup files are explicitly preserved during tree shaking.
+
+When a WebGL HEPR object is hosted by a WebGPU renderer, its independent highlight
+overlay can load the host's materials on first use. Apps that render on demand
+can subscribe with `pdfObject.addEventListener("change", requestRender)`, where
+`requestRender` schedules their usual frame. The event's reason is
+`"primitive-highlights-ready"`. Remove the listener with
+`pdfObject.removeEventListener("change", requestRender)` during cleanup.
+
+Shader comments are removed only from build output; TypeScript sources keep their
+comments and indentation. Shader code whitespace remains intact for exact source
+patches. Vite builds requesting source maps retain the original strings and mappings.
+
 ## `pdfObjectGenerator(source, options?, rendererType?)`
 
 Returns `Promise<HeprThreePdfObject>`. The result is a `THREE.Group` that follows

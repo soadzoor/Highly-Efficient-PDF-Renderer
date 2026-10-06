@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
  */
 const root = fileURLToPath(new URL("../src/", import.meta.url));
 const shaders = new Map();
-for (const file of ["webGlFloorplanRenderer.ts", "nativeGradientWebGlShaders.ts",
+for (const file of ["nativeWebGlCoreShaders.ts", "nativeGradientWebGlShaders.ts",
   "rasterStripWebGlShaders.ts", "rasterAtlasWebGlShaders.ts", "rasterTextureBatchWebGlShaders.ts", "primitiveHighlightShaders.ts"]) {
   const text = readFileSync(root + file, "utf8");
   for (const [, name, body] of text.matchAll(/(?:export )?const (\w+) = `(#version 300 es[\s\S]*?)`;/g)) {

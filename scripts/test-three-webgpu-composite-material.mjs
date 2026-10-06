@@ -16,9 +16,11 @@ const hooks = registerHooks({
   }
 });
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { ThreePaintCompositor } = await import("../src/threePaintCompositor.ts");
-  const compositor = new ThreePaintCompositor("webgpu");
+  const compositor = new ThreePaintCompositor("webgpu", webGpu);
   const fragment = build(compositor.passMaterial, compositor.mesh.geometry).fragmentShader;
 
   // Three keys a texture uniform by the bound texture's UUID, so every input

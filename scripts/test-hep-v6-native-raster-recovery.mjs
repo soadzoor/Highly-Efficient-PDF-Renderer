@@ -1,7 +1,7 @@
 // Old source-PDF recovery archives must fail before attempting any PDF parsing.
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) return next(`${specifier}.ts`, context);
   return next(specifier, context);

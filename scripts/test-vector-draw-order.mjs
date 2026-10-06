@@ -11,6 +11,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 
+const webGpu = await import("../src/threeWebGpuBackend.ts");
+
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
@@ -237,7 +239,7 @@ try {
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const materialScene = { ...scene, drawRuns: scene.drawRuns.map(run => ({ ...run, clipIndex: 0 })) };
   for (const materialBackend of ["webgl", "webgpu"]) {
-    const options = { materialBackend, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1],
+    const options = { materialBackend, webGpu, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1],
       strokeCurveEnabled: true, textVectorOnly: true };
     const layers = [new ThreeMaterialFillLayer(materialScene, options), new ThreeMaterialStrokeLayer(materialScene, options),
       new ThreeMaterialTextLayer(materialScene, options), new ThreeMaterialRasterLayer(materialScene, options)];

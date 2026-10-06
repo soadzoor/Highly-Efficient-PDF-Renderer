@@ -11,6 +11,7 @@ import {
   type ThreeColorCompositing,
   type HeprThreeObjectOptions,
   type HeprColorInput,
+  type HeprThreePdfObjectEventMap,
   type HeprThreePdfObject
 } from "./threePdfObject";
 import {
@@ -224,6 +225,7 @@ export type {
   ThreeColorCompositing,
   HeprThreeObjectOptions,
   HeprColorInput,
+  HeprThreePdfObjectEventMap,
   HeprThreePdfObject,
   CanvasInteractionController
 };

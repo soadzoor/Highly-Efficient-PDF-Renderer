@@ -5,7 +5,7 @@ import vm from "node:vm";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { registerHooks } from "node:module";
-import { HepArchive, hasHepSignature } from "../src/hepContainer.ts";
+import { HepArchive, hasHepSignature } from "./lib/hepContainer.mjs";
 
 const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) &&
@@ -20,6 +20,17 @@ try {
   const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
   const { loadSceneFromHep, prepareSceneForHepRendering } = await import("../src/hep.ts");
   const { VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
+  const importController = new AbortController();
+  const importReason = new Error("cancel while loading HEP builder");
+  const importEvents = [];
+  const coldBuild = builder.buildHep(composeVectorScenesInGrid([], 1), {
+    compression: "store", signal: importController.signal,
+    onProgress: event => importEvents.push(event)
+  });
+  importController.abort(importReason);
+  await assert.rejects(coldBuild, error => error === importReason);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(importEvents, [], "cancelled imports must not start HEP generation");
   await testOrderedLodRoundTrip(builder, loadSceneFromHep, prepareSceneForHepRendering, VectorStrokeLodRuntime);
   assert.equal(builder.buildParsedDataZip, undefined, "the old builder has no compatibility alias");
   const scene = composeVectorScenesInGrid([], 1);
@@ -101,7 +112,7 @@ try {
 }
 
 async function testPdfColorOptionForwarding() {
-  const source = await readFile(new URL("../src/hepBuilder.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/hepBuilderRuntime.ts", import.meta.url), "utf8");
   const stopBeforeConversion = new Error("stop after checking PDF loader options");
   for (const iccEngine of [undefined, "qcms", "lcms", "alternate", "none"]) {
     const iccTransformResolver = () => {};

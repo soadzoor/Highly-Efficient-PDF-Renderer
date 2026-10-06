@@ -1,9 +1,10 @@
-import { pageProjectionNode, type ThreePageBinding } from "./threePageTransforms";
+import { pageProjectionNode } from "./threeWebGpuPageTransforms";
+import type { ThreePageBinding } from "./threePageTransforms";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_CELL_COVERAGE_WGSL, VECTOR_FILL_CELL_INFO_WGSL } from "./vectorCellShaders";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
-import { registerThreeNodeClipPosition } from "./threeVectorClips";
+import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 

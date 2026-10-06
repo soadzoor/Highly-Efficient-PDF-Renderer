@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { build, parseAst } from "vite";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
 import { imagePdf, tinyJbig2, tinyJbig2Globals } from "./lib/imageCodecFixtures.mjs";
+import { checkBundlerSizes } from "./lib/bundleSizeChecks.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -135,6 +136,7 @@ try {
         "lazy image codecs must work from the consumer's emitted parser worker");
     } finally { await session.close(); }
   }
+  await checkBundlerSizes(fixture, consumerConfig);
   console.log(`Packed bundler entry passed: ${files.size} consumer files, assets resolved, worker sessions and both ICC engines exercised.`);
 } finally {
   if (keepFixture) console.log(`Manual browser fixture retained at ${fixture}`);

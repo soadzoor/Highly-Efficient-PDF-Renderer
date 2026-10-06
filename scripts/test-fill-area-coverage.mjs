@@ -230,7 +230,7 @@ for (let i = 0; i < 4000; i += 1) {
 }
 
 for (const [file, language] of [
-  ["webGlFloorplanRenderer.ts", "GLSL"],
+  ["nativeWebGlCoreShaders.ts", "GLSL"],
   ["nativeGradientWebGlShaders.ts", "GLSL"],
   ["webGpuFloorplanRenderer.ts", "WGSL"],
   ["nativeGradientWebGpuShaders.ts", "WGSL"],

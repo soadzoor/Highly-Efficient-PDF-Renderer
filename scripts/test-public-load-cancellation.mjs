@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import vm from "node:vm";
-import { HepArchive } from "../src/hepContainer.ts";
+import { HepArchive } from "./lib/hepContainer.mjs";
 import { waitForLoad, yieldForLoad } from "../src/loadCancellation.ts";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { sourceFunction } from "./lib/sourceFunction.mjs";

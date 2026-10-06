@@ -62,7 +62,7 @@ for (const coverage of [glsl, wgsl]) {
 }
 
 for (const [file, language] of [
-  ["webGlFloorplanRenderer.ts", "GLSL"],
+  ["nativeWebGlCoreShaders.ts", "GLSL"],
   ["nativeGradientWebGlShaders.ts", "GLSL"],
   ["threeTriangleStrokeLayer.ts", "GLSL"],
   ["threeCompactedStrokeLayer.ts", "GLSL"],

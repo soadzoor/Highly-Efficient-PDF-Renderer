@@ -25,11 +25,8 @@ import {
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
 import { buildHep } from "./hepBuilder";
-import {
-  listSceneRasterLayers,
-  loadSceneFromHep,
-  prepareSceneForHepRendering
-} from "./hep";
+import { loadSceneFromHep } from "./hepReader";
+import { listSceneRasterLayers, prepareSceneForHepRendering } from "./hepShared";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
 import {

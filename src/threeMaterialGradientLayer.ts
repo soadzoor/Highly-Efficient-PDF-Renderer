@@ -1,3 +1,4 @@
+import { requireThreeWebGpuBackend, type ThreeWebGpuBackend } from "./threeMaterialBackend";
 import { bindRawPageTransform, type ThreePageTransforms } from "./threePageTransforms";
 import { buildVectorFillBandIndex } from "./vectorFillBands";
 import { vectorIndexedPathStore, type VectorIndexedPathStore } from "./vectorCellIndex";
@@ -11,7 +12,7 @@ import * as THREE from "three";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
 import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
-import { enableThreeNodePaintFold, enableThreeRawPaintFold, registerThreeGradientMaskSource,
+import { enableThreeRawPaintFold, registerThreeGradientMaskSource,
   threePaintFoldFragmentGlsl } from "./threePaintFold";
 
 import {
@@ -24,11 +25,9 @@ import type { VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
 import { configureStraightAlphaBlending } from "./threeMaterialBlending";
 import type { ThreePdfOrderedPaintMesh } from "./threePdfPaintOrder";
 import { normalizeThreeRawShaderSource } from "./threeRawShaderColorSpace";
-import {
-  createThreeWebGpuGradientFillMaterial,
-  createThreeWebGpuGradientStrokeMaterial,
-  type ThreeWebGpuGradientFillMaterialState,
-  type ThreeWebGpuGradientStrokeMaterialState
+import type {
+  ThreeWebGpuGradientFillMaterialState,
+  ThreeWebGpuGradientStrokeMaterialState
 } from "./threeWebGpuGradientMaterial";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
@@ -36,6 +35,7 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 interface GradientLayerOptions {
   pageTransforms?: ThreePageTransforms;
   materialBackend?: "webgl" | "webgpu";
+  webGpu?: ThreeWebGpuBackend;
   colorCompositing?: ThreeColorCompositing;
   strokeCurveEnabled: boolean;
   vectorOverride: [number, number, number, number];
@@ -96,6 +96,7 @@ const GRADIENT_LUT_WIDTH = 1024;
 
 export class ThreeMaterialGradientLayer {
   private readonly pageTransforms: ThreePageTransforms | undefined;
+  private readonly webGpu: ThreeWebGpuBackend | undefined;
   private readonly scene: VectorScene;
   private readonly visibility: ScenePaintVisibility;
   private readonly fillRuns: (VectorDrawRun | undefined)[];
@@ -120,6 +121,7 @@ export class ThreeMaterialGradientLayer {
   constructor(scene: VectorScene, options: GradientLayerOptions) {
     this.scene = scene;
     this.pageTransforms = options.pageTransforms;
+    this.webGpu = options.webGpu;
     this.visibility = new ScenePaintVisibility(scene);
     this.fillRuns = Array(scene.gradientFillPathCount);
     this.strokeRuns = Array(scene.gradientStrokeRunCount);
@@ -317,7 +319,7 @@ export class ThreeMaterialGradientLayer {
       let material: THREE.Material;
       let fillState: ThreeWebGpuGradientFillMaterialState | undefined;
       if (materialBackend === "webgpu") {
-        fillState = createThreeWebGpuGradientFillMaterial({
+        fillState = requireThreeWebGpuBackend(this.webGpu).createThreeWebGpuGradientFillMaterial({
           pageBinding: this.pageTransforms?.page("gradient-fill", pathIndex),
           mesh: meshCount > 0,
           fillPathMetaTextureA: pathMetaA,
@@ -337,7 +339,7 @@ export class ThreeMaterialGradientLayer {
         material = fillState.material;
         // A group chain holding one analytic gradient draws it straight onto
         // the surface. Patch meshes can overlap themselves and keep their group.
-        if (!meshCount) enableThreeNodePaintFold(material);
+        if (!meshCount) requireThreeWebGpuBackend(this.webGpu).enableThreeNodePaintFold(material);
       } else {
         material = this.createWebGlFillMaterial(
           pathMetaA,
@@ -448,7 +450,7 @@ export class ThreeMaterialGradientLayer {
       let material: THREE.Material;
       let strokeState: ThreeWebGpuGradientStrokeMaterialState | undefined;
       if (materialBackend === "webgpu") {
-        strokeState = createThreeWebGpuGradientStrokeMaterial({
+        strokeState = requireThreeWebGpuBackend(this.webGpu).createThreeWebGpuGradientStrokeMaterial({
           pageBinding: this.pageTransforms?.page("gradient-stroke", runIndex),
           segmentTextureA: segmentA,
           segmentTextureB: segmentB,

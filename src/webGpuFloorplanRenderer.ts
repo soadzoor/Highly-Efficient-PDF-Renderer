@@ -74,7 +74,8 @@ import {
   type TextLodStats
 } from "./textLodCore";
 import { buildSingleChannelUint8MipChain } from "./singleChannelMipChain";
-import { buildTextRasterAtlas, TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlas";
+import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { TEXT_RASTER_ATLAS_PADDING_PX } from "./textRasterAtlasConstants";
 import {
   shouldUseVectorStrokeLod,
   takePrebuiltVectorStrokeLodRuntime,
