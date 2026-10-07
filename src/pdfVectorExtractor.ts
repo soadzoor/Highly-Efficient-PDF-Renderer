@@ -109,6 +109,8 @@ export interface VectorDrawRun {
 }
 
 export interface VectorScene {
+  /** Internal one-page viewing policy; omitted from composed/exported document data. */
+  pdfOverviewKind?: "vector" | "ocr" | "raster";
   /** Annotation geometry in composed scene coordinates; absent in older HEP files. */
   annotations?: readonly SceneAnnotation[];
   /** Compile-time appearance filter; absent means every appearance was compiled (`"render"`). */

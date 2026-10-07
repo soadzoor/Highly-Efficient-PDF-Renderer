@@ -106,13 +106,18 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
-The standalone canvas viewer and Three.js package/viewers open PDFs with more than 16 selected pages from page
-metadata, then loads pages near the current viewport in one worker. Overview
-previews use a longest edge of at most 96 pixels. Detailed page content is
-compiled when a page occupies more than 256 screen pixels, with at most 12
-detailed pages cached and a further limit based on estimated CPU payload bytes.
-Zooming back out restores the overview previews while keeping detailed content
-in the bounded cache for subsequent zooming.
+The standalone canvas viewer and Three.js package/viewers open PDFs with more
+than 16 selected pages from metadata, then load pages near the current viewport
+in one worker. Vector pages keep their original geometry at every zoom.
+Image-dominated scanned pages with usable invisible OCR show that text as visible
+vectors at a distance, without decoding scan images. Only scans without usable
+OCR get small bitmap previews, with a longest edge of at most 96 pixels.
+Unsupported drawing features can still use a diagnosed bounded raster fallback.
+Scan pixels load when a page occupies more than 256 screen pixels; zooming back
+out below 224 pixels restores the OCR vectors or scan preview. The gap prevents
+flicker near the transition. At most 12 detailed pages remain cached, with a
+further limit based on estimated CPU payload bytes. Short PDFs use the same
+scan policy while vector-only documents return complete vector scenes.
 Evicted pages regenerate as you navigate. Unloaded pages retain their outlines
 and positions. Search progressively loads preview text for the rest of the
 document; explicit HEP export compiles the complete original PDF.
@@ -146,10 +151,10 @@ text positions and widths, while skipping scan decoding and scan GPU textures.
 Glyphless or missing outlines use bundled substitute fonts.
 It is an approximate text-only view: pictures, diagrams, colors, clipping and
 annotation appearances are omitted; pages without drawable stored text are
-blank and emit a diagnostic. Search and selection remain available. Uncheck it
-to restore scans while retaining the camera and page layout. HEP sources do not
-support this option. HEP export uses the original PDF content. Zoom does not
-automatically switch this mode.
+blank and emit a diagnostic. Search and selection remain available. The checkbox
+forces text at every zoom; unchecking it restores automatic OCR overviews and
+scan detail while retaining the camera and page layout. HEP sources do not
+support this option. HEP export uses the original PDF content.
 
 ## Rendering and level of detail
 

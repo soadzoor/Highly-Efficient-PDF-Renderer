@@ -221,7 +221,7 @@ export interface NativeVectorPdfSession extends PdfSession {
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
   /** Viewing approximation: draw stored text with substitute fonts and skip image decoding. */
   readonly ocrTextOnly?: boolean;
-  /** Worker-owned bounded overview; full page scenes are compiled separately when visible in detail. */
+  /** Content-aware overview: preserve vectors, use OCR for scans, bound scans without OCR. */
   readonly previewMaxDimension?: number;
   /** Internal capability probes can require direct vector output. Normal loading falls back to pixels. */
   readonly vectorFallback?: "raster" | "error";
@@ -535,18 +535,62 @@ class NativePdfSession implements NativeVectorPdfSession {
       release = await this.acquireOperation(signal);
       if (options.ocrTextOnly) {
         const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
-        return await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
+        const scene = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
           this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+        scene.pdfOverviewKind = "vector";
+        return scene;
+      }
+      let overviewKind: VectorScene["pdfOverviewKind"];
+      if (options.previewMaxDimension !== undefined) {
+        const { inspectNativePageOverview } = await import("./pdf/nativePageOverview");
+        try {
+          overviewKind = await inspectNativePageOverview(this.document, sourcePageIndex, options, signal, this.optionalContent);
+        } catch (error) {
+          signal.throwIfAborted();
+          if (!(error instanceof PdfError || error instanceof DensePdfSyntaxError) ||
+              (error instanceof PdfError && (error.code === "resource-limit" || error.code === "aborted"))) throw error;
+          overviewKind = "vector";
+          this.appendDiagnostics([{ code: "page-overview-inspection-unavailable", severity: "warning", pageIndex: sourcePageIndex,
+            message: "Page content could not be classified for an overview; using the normal compatibility renderer.", details: { reason: error.message } }]);
+        }
+        if (overviewKind === "ocr") {
+          try {
+            const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
+            const overview = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
+              this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+            if (overview.textInstanceCount > 0 && overview.textIndex?.pages.some(page => /[^\s\ufffd]/u.test(page.text))) {
+              overview.pdfOverviewKind = "ocr";
+              return overview;
+            }
+            this.appendDiagnostics([{ code: "page-ocr-overview-unavailable", severity: "warning", pageIndex: sourcePageIndex,
+              message: "Stored OCR text has no drawable readable characters; using a bounded scan instead." }]);
+          } catch (error) {
+            signal.throwIfAborted();
+            if (!(error instanceof PdfError || error instanceof DensePdfSyntaxError) ||
+                (error instanceof PdfError && (error.code === "resource-limit" || error.code === "aborted"))) throw error;
+            this.appendDiagnostics([{ code: "page-ocr-overview-unavailable", severity: "warning", pageIndex: sourcePageIndex,
+              message: "Stored OCR text could not supply the overview; using a bounded scan instead.", details: { reason: error.message } }]);
+          }
+          overviewKind = "raster";
+        }
       }
       const scene = await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
       if (options.previewMaxDimension === undefined) return scene;
-      if (scene.segmentCount === 0 && scene.fillPathCount === 0 && scene.textInstanceCount === 0 &&
-          (scene.gradientFillPathCount ?? 0) === 0 && (scene.gradientStrokeRunCount ?? 0) === 0 && !scene.retainedPages?.length) {
+      scene.pdfOverviewKind = overviewKind;
+      if (overviewKind === "raster") {
         const { buildRasterScenePreview } = await import("./pageRasterPreview");
         return buildRasterScenePreview(scene, options.previewMaxDimension);
       }
-      return await this.compileRasterPageUnlocked(sourcePageIndex, { ...options, retainOptionalContent: false }, signal,
-        new Error("Bounded page overview"), options.previewMaxDimension);
+      // Unsupported vector paint can still use the existing bounded compatibility fallback.
+      // Such a page needs detail later; supported vector pages are complete at every zoom.
+      if (scene.rasterLayers.length && !scene.segmentCount && !scene.textInstanceCount && !scene.fillPathCount &&
+          !(scene.gradientFillPathCount ?? 0) && !(scene.gradientStrokeRunCount ?? 0) &&
+          scene.rasterLayers.some(layer => layer.width <= options.previewMaxDimension! && layer.height <= options.previewMaxDimension! &&
+            Math.abs(layer.matrix[0] * layer.matrix[3] - layer.matrix[1] * layer.matrix[2]) >=
+              (scene.pageBounds.maxX - scene.pageBounds.minX) * (scene.pageBounds.maxY - scene.pageBounds.minY) * .75)) {
+        scene.pdfOverviewKind = "raster";
+      }
+      return scene;
     } catch (error) {
       throw normalizeAbortError(error, signal);
     } finally {

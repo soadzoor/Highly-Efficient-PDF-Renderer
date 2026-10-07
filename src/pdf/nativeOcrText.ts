@@ -158,8 +158,10 @@ export async function compileNativeOcrTextPage(document: NativePdfDocument, sour
     maxPaths: options.limits?.maxPathsPerPage ?? document.limits.maxPathsPerPage,
     maxPathCoordinates: options.limits?.maxPathCoordinatesPerPage ?? document.limits.maxPathCoordinatesPerPage, signal });
   for (const diagnostic of [...registry.getDiagnostics(), ...textCompilation.diagnostics]) onDiagnostic(diagnostic);
-  onDiagnostic({ code: "view.ocr-text-only", severity: "warning", pageIndex: sourcePageIndex,
-    message: scene.textInstanceCount ? "Text-only view reconstructs stored text; font substitution may change its appearance. Images, diagrams, colors and clipping are omitted."
+  const automatic = options.ocrTextOnly !== true && options.previewMaxDimension !== undefined;
+  onDiagnostic({ code: automatic ? "page-ocr-overview" : "view.ocr-text-only", severity: automatic ? "info" : "warning", pageIndex: sourcePageIndex,
+    message: automatic && scene.textInstanceCount ? "This scan's overview uses stored vector OCR text; scan pixels load on demand when zoomed in."
+      : scene.textInstanceCount ? "Text-only view reconstructs stored text; font substitution may change its appearance. Images, diagrams, colors and clipping are omitted."
       : "This page has no drawable stored text. Disable text-only view to see its scanned content." });
   return scene;
 }

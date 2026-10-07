@@ -41,7 +41,7 @@ const context = vm.createContext({
   logTextureSizeStats: noop, applyTextSearchScene: noop, refreshDropIndicator: noop,
   updateMetricsPanel: noop,
   scheduleDemandPdfUpdate: noop, textSearchWidget: { setAvailability: noop },
-  openPdfPageDemand: async () => ({ pageCount: 1, close: async () => {} }),
+  openPdfPageDemand: openShortDocument,
   extractPdfPageScenes: (buffer, options, signal) => nextParse(buffer, options, signal),
   loadSceneFromHep: async (buffer, options) => (await nextParse(buffer, {}, options.signal))[0],
   computeAutoPagesPerRow: () => 1,
@@ -168,7 +168,7 @@ assert.equal(context.activePdfPageLoader, null);
 assert.equal(demandClosed, true, "document replacement closes the paging worker");
 
 // Switching text mode uses the original source, keeps the view, and cannot export the approximation.
-context.openPdfPageDemand = async () => ({ pageCount: 1, close: async () => {} });
+context.openPdfPageDemand = openShortDocument;
 nextParse = async (buffer, options) => [{ ...scene(new Uint8Array(buffer)[0]), mode: options.ocrTextOnly === true }];
 await context.loadPdfFile(file("ocr.pdf", 75));
 const beforeOcrView = { ...view };
@@ -228,6 +228,11 @@ function testNativePageDemandFrames() {
 
 function file(name, id) {
   return { name, arrayBuffer: async () => Uint8Array.of(id).buffer };
+}
+async function openShortDocument(buffer, options) {
+  return { pageCount: 1, requiresPageDemand: false, pageScenes: [],
+    async loadInitialOverviews(signal) { this.pageScenes = await nextParse(buffer, options, signal); },
+    async close() {} };
 }
 function scene(id) {
   return { id, segmentCount: 1, textInstanceCount: 0, fillPathCount: 0 };

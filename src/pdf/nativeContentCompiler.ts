@@ -1242,6 +1242,8 @@ export interface DensePdfResourceReferences {
 
 export interface DensePdfResourceScanOptions {
   readonly signal?: AbortSignal;
+  /** Internal overview inspection; image payloads remain unregistered and undecoded. */
+  readonly onInlineImage?: () => void;
   /** Internal text-only interpreter; operands use the native text sink representation. */
   readonly onOperator?: (operator: string, operands: readonly unknown[], markedContentProperty?: import("./nativeCos").PdfValue) => void;
 }
@@ -1284,6 +1286,7 @@ export function scanDensePdfPreparedResourceReferences(
     if (segment.kind === "image") {
       lexer.finish();
       scanner.consumeInlineImage();
+      options.onInlineImage?.();
     } else {
       lexer.feed(segment.bytes, false, segment.sourceOffset);
     }

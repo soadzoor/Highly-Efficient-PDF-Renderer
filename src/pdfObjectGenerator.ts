@@ -85,7 +85,7 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
    */
   maxPagesPerRow?: number;
 
-  /** Large PDFs load visible pages automatically. Use eager only when complete scene data is required before rendering. */
+  /** Load scan pixels on camera demand; large PDFs also defer page operators. Eager extracts complete original content. */
   pageLoading?: "auto" | "eager";
 
   /** PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding. */
@@ -230,15 +230,21 @@ async function loadPdfSceneFromSourceInternal(
       const loader = await openPdfPageDemand(createParseBuffer(sourceBytes), extractOptions, () => {}, signal);
       try {
         signal?.throwIfAborted();
-        if (loader.pageCount > 16) {
+        if (loader.pageCount <= 16) await loader.loadInitialOverviews(signal);
+        if (loader.pageCount > 16 || loader.requiresPageDemand) {
           const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
           const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
           progress.complete({ sourceType: "pdf" });
           signal?.throwIfAborted();
           return { scene, sourceLabel, sourceKind, sourceBytes, pageDemand: loader, sourceOptions: options };
         }
+        const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
+        const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
+        await loader.close();
+        progress.complete({ sourceType: "pdf" });
+        signal?.throwIfAborted();
+        return { scene, sourceLabel, sourceKind, sourceBytes, sourceOptions: options };
       } catch (error) { await loader.close(); throw error; }
-      await loader.close();
     }
     const pageScenes = await extractPdfPageScenes(
       createParseBuffer(sourceBytes),

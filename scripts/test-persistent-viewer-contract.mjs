@@ -22,7 +22,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /pageScenes\s*=\s*await\s+extractPdfPageScenes\s*\([\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
+  /pageScenes\s*=\s*candidate\.pageScenes[\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
   "any PDF parser must feed the established VectorScene composition pipeline"
 );
 assert.match(

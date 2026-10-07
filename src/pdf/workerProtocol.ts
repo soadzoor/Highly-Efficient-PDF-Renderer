@@ -37,7 +37,8 @@ import type {
 // Older workers must not silently ignore the requested color behavior.
 // Version 11 adds bounded page previews; old workers must not transfer full-resolution pages instead.
 // Version 12 requires workers to honor text-only viewing instead of decoding scans.
-export const PDF_WORKER_PROTOCOL_VERSION = 12 as const;
+// Version 13 preserves vector overviews and substitutes OCR before scan decoding.
+export const PDF_WORKER_PROTOCOL_VERSION = 13 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {

@@ -16,11 +16,13 @@ export class PdfPageDemandLoader {
   readonly password: string | undefined;
   private readonly previews = new Map<number, CachedPage>();
   private readonly detailed = new Map<number, CachedPage>();
+  private readonly overviewKinds = new Map<number, NonNullable<VectorScene["pdfOverviewKind"]>>();
   private readonly attempted = new Set<number>();
   private readonly failed = new Set<number>();
   private readonly evictedPreviews = new Set<number>();
   private wanted: number[] = [];
   private wantedDetail: number[] = [];
+  private detailCandidates: number[] = [];
   private detailKey = "";
   private visibleKey = "";
   private reportedPreviewEviction = false;
@@ -56,6 +58,10 @@ export class PdfPageDemandLoader {
   setOnChange(onChange: () => void | Promise<void>): void { this.onChange = onChange; }
   get previewCount(): number { return this.previews.size; }
   get detailedCount(): number { return this.detailed.size; }
+  /** Small vector-only documents can keep their complete scene without a paging worker. */
+  get requiresPageDemand(): boolean {
+    return this.previews.size !== this.pageCount || [...this.overviewKinds.values()].some(kind => kind !== "vector");
+  }
   get residentBytes(): number {
     return [...this.previews.values(), ...this.detailed.values()].reduce((bytes, page) => bytes + page.bytes, 0);
   }
@@ -91,13 +97,14 @@ export class PdfPageDemandLoader {
             Math.max(...ys) < -1.15 || Math.min(...ys) > 1.15)) continue;
         visible.push({ index, distance: Math.hypot((Math.min(...xs)+Math.max(...xs))/2,
           (Math.min(...ys)+Math.max(...ys))/2), detail: points.length !== 4 ||
-          Math.max((Math.max(...xs)-Math.min(...xs))*view.width/2, (Math.max(...ys)-Math.min(...ys))*view.height/2) > 256 });
+          Math.max((Math.max(...xs)-Math.min(...xs))*view.width/2, (Math.max(...ys)-Math.min(...ys))*view.height/2) >
+            (this.wantedDetail.includes(index) ? 224 : 256) });
         continue;
       }
       if (x1 < view.cameraCenterX - halfWidth - margin || x0 > view.cameraCenterX + halfWidth + margin ||
           y1 < view.cameraCenterY - halfHeight - margin || y0 > view.cameraCenterY + halfHeight + margin) continue;
       visible.push({ index, distance: Math.hypot((x0 + x1) / 2 - view.cameraCenterX, (y0 + y1) / 2 - view.cameraCenterY),
-        detail: Math.max(x1 - x0, y1 - y0) * view.zoom > 256 });
+        detail: Math.max(x1 - x0, y1 - y0) * view.zoom > (this.wantedDetail.includes(index) ? 224 : 256) });
     }
     visible.sort((a, b) => a.distance - b.distance || a.index - b.index);
     this.wanted = visible.map(page => page.index);
@@ -108,9 +115,16 @@ export class PdfPageDemandLoader {
       // previews that cannot all fit the same stationary viewport.
       for (const index of this.wanted) this.evictedPreviews.delete(index);
     }
+    this.detailCandidates = visible.filter(page => page.detail).map(page => page.index);
+    this.refreshDetailDemand();
+    this.start();
+  }
+
+  private refreshDetailDemand(): void {
     const previousDetail = this.wantedDetail;
-    // Text-only overviews already contain the full vector glyphs at every zoom.
-    this.wantedDetail = this.options.ocrTextOnly ? [] : visible.filter(page => page.detail).slice(0, MAX_DETAILED_PAGES).map(page => page.index);
+    // Vector pages already contain full geometry. Only scans need a second CPU tier.
+    this.wantedDetail = this.options.ocrTextOnly ? [] : this.detailCandidates
+      .filter(index => this.overviewKinds.get(index) !== "vector").slice(0, MAX_DETAILED_PAGES);
     const key = this.wantedDetail.join(",");
     if (key !== this.detailKey) {
       this.detailKey = key; this.attempted.clear();
@@ -122,11 +136,21 @@ export class PdfPageDemandLoader {
         void this.notifyChange();
       }
     }
-    this.start();
   }
 
   /** Search can fill the document's preview text index while visible detail retains priority. */
   requestAllPreviews(): void { this.allPreviews = true; this.start(); }
+  /** Preserve synchronous scene availability for short vector PDFs, without decoding OCR scans. */
+  async loadInitialOverviews(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const abort = () => this.pause();
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      this.requestAllPreviews();
+      await this.whenIdle();
+      signal?.throwIfAborted();
+    } finally { signal?.removeEventListener("abort", abort); }
+  }
   pause(): void { this.paused = true; this.operation?.abort(); }
   resume(): void { if (!this.closed) { this.paused = false; this.start(); } }
 
@@ -135,7 +159,7 @@ export class PdfPageDemandLoader {
     this.closed = true;
     this.operation?.abort();
     try { await this.session.close(); }
-    finally { await this.running; this.previews.clear(); this.detailed.clear(); }
+    finally { await this.running; this.previews.clear(); this.detailed.clear(); this.overviewKinds.clear(); }
   }
 
   /** Test/host synchronization without polling or forcing additional pages. */
@@ -189,6 +213,10 @@ export class PdfPageDemandLoader {
         // Navigation supersedes full-page work; a compact preview is still useful after a pan.
         if (!detail || this.wantedDetail.includes(index)) {
           cache.set(index, { scene, bytes: sceneCpuBytes(scene) });
+          if (!detail) {
+            this.overviewKinds.set(index, scene.pdfOverviewKind ?? (scene.rasterLayers.length || scene.retainedPages?.length ? "raster" : "vector"));
+            this.refreshDetailDemand();
+          }
           this.trim(cache, detail);
           await this.notifyChange();
         }

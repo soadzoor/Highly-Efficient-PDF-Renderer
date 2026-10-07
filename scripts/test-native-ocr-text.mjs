@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
-import { buildTinySfnt } from "./lib/tinySfnt.mjs";
+import { createOcrPdfFixture as fixture } from "./lib/ocrPdfFixture.mjs";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)
@@ -124,23 +123,3 @@ try {
   }
   console.log("native OCR text viewing tests passed");
 } finally { hooks.deregister(); }
-
-function fixture({ poisonImage = false, form = false, glyphless = true, content = "BT /F1 10 Tf 3 Tr 20 30 Td <00010002> Tj ET" }) {
-  const text = content;
-  const fontName = glyphless ? "GlyphLessFont" : "UsefulFont";
-  return writeTinyPdf({ objects: [
-    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [13 0 R] /D << /OFF [13 0 R] >> >> >>" },
-    { number: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>" },
-    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> /XObject << /Scan 6 0 R /Text 12 0 R >> /Properties << /Hidden 13 0 R >> >> /Contents 4 0 R >>" },
-    { number: 4, body: tinyPdfStream("", `q 200 0 0 100 0 0 cm /Scan Do Q\n${form ? "/Text Do" : text}`) },
-    { number: 5, body: `<< /Type /Font /Subtype /Type0 /BaseFont /${fontName} /Encoding /Identity-H /DescendantFonts [7 0 R] /ToUnicode 8 0 R >>` },
-    { number: 6, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray${poisonImage ? " /Filter /DefinitelyUnsupported" : ""}`, Uint8Array.of(0)) },
-    { number: 7, body: `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${fontName} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 9 0 R /DW 600 /CIDToGIDMap 11 0 R >>` },
-    { number: 8, body: tinyPdfStream("", "begincmap 1 begincodespacerange <0000> <FFFF> endcodespacerange 2 beginbfchar <0001> <0041> <0002> <0042> endbfchar endcmap") },
-    { number: 9, body: `<< /Type /FontDescriptor /FontName /${fontName} /Flags 4 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 10 0 R >>` },
-    { number: 10, body: tinyPdfStream("", buildTinySfnt()) },
-    { number: 11, body: tinyPdfStream("", glyphless ? new Uint8Array(6) : Uint8Array.of(0, 0, 0, 1, 0, 2)) },
-    { number: 12, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >>", text) },
-    { number: 13, body: "<< /Type /OCG /Name (Hidden) >>" }
-  ] });
-}

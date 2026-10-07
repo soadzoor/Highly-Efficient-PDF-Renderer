@@ -138,11 +138,12 @@ try {
     assert.equal((await simple.compileVectorPage(0)).rasterLayers.length, 0, "supported pages remain vectors");
     assert.equal(simple.getDiagnostics().length, 0);
     const preview = await simple.compileVectorPage(0, { previewMaxDimension: 16 });
-    assert.equal(preview.rasterLayerWidth, 16);
-    assert.equal(preview.rasterLayerHeight, 8);
-    assert.equal(preview.fillPathCount, 0, "overview vectors become a bounded preview");
+    assert.equal(preview.pdfOverviewKind, "vector");
+    assert.equal(preview.rasterLayerWidth, 0);
+    assert.equal(preview.rasterLayerHeight, 0);
+    assert.equal(preview.fillPathCount, 1, "supported overview geometry remains vector");
     assert(!preview.retainedPages?.length, "previews do not retain full decoded replay resources");
-    assert(simple.getDiagnostics().some(d => d.code === "page-preview"));
+    assert(!simple.getDiagnostics().some(d => d.code === "page-preview"));
     assert.equal((await simple.compileVectorPage(0)).fillPathCount, 1, "detail compiles accurate vectors again");
     for (const previewMaxDimension of [15, 4097, NaN, 16.5]) await assert.rejects(
       simple.compileVectorPage(0, { previewMaxDimension }), RangeError);
@@ -227,6 +228,7 @@ try {
     assert.ok(diagnostics.some(d => d.code === "page-raster-fallback"));
     assert.ok(worker.getDiagnostics().some(d => d.code === "page-raster-fallback"));
     const preview = await worker.compileVectorPage(0, { previewMaxDimension: 16 });
+    assert.equal(preview.pdfOverviewKind, "raster", "unsupported paint retains the refinable compatibility fallback");
     assert(preview.rasterLayerWidth <= 16 && preview.rasterLayerHeight <= 16,
       "worker fallback honors overview dimensions before generating or transferring pixels");
     assert(!preview.retainedPages?.length);

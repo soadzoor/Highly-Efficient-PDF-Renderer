@@ -17,7 +17,6 @@ import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import {
   composeVectorScenesInGrid,
-  extractPdfPageScenes,
   type Bounds,
   type VectorExtractOptions,
   type VectorScene
@@ -1140,12 +1139,12 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
         demandLoader = candidate;
         pageScenes = candidate.pageScenes;
       } else {
-        await candidate.close();
-        pageScenes = await extractPdfPageScenes(buffer, {
-          ...extractionOptions,
-          password: options.password,
-          onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
-        }, options.signal);
+        try {
+          await candidate.loadInitialOverviews(options.signal);
+          pageScenes = candidate.pageScenes;
+          if (candidate.requiresPageDemand) demandLoader = candidate;
+          else await candidate.close();
+        } catch (error) { await candidate.close(); throw error; }
       }
       parseMs = performance.now() - parseStart;
 

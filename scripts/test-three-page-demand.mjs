@@ -144,8 +144,9 @@ try {
       Float32Array.from(Array.from({ length:20 },(_,i)=>[i*2000,0,i*2000+600,800]).flat()));
     await loaded.pageDemand.whenIdle();
     assert.equal(loaded.pageDemand.previewCount,1);
-    assert.equal(loaded.pageDemand.detailedCount,1,"the real worker only compiles demanded detail");
+    assert.equal(loaded.pageDemand.detailedCount,0,"vector pages keep complete geometry without a raster overview/detail pair");
     assert.equal(loaded.pageDemand.pageScenes[0].segmentCount,1);
+    assert.equal(loaded.pageDemand.pageScenes[0].rasterLayers.length,0);
   } finally { await loaded.pageDemand.close(); }
   const eager = await loadPdfSceneFromSource(bytes,{ pages:"5-24",pageLoading:"eager" },undefined,true);
   assert.equal(eager.pageDemand,undefined);
