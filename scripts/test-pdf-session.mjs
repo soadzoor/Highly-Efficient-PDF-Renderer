@@ -3,6 +3,7 @@ import { registerHooks } from "node:module";
 import { deflateSync } from "node:zlib";
 
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
+import { buildTinySfnt } from "./lib/tinySfnt.mjs";
 
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -214,9 +215,54 @@ try {
   "source cleanup must not mask the atomic page-compilation failure");
 
   await testFlateEolStreams(openPdf, validateHeprPageData);
+  await testMalformedOcrFont(openPdf, validateHeprPageData);
   console.log("PDF session and atomic parse tests passed.");
 } finally {
   hooks.deregister();
+}
+
+async function testMalformedOcrFont(openPdf, validateHeprPageData) {
+  // Reproduce Acrobat Paper Capture's hidden OCR metadata in TIKA-2848-1:
+  // unused surrogate identity mappings and junk after the font's ASCIIHex EOD.
+  const bytes = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", "1 0 0 rg 1 2 3 4 re f BT /F1 12 Tf 3 Tr 10 20 Td <041a043e> Tj ET") },
+    { number: 5, body: "<< /Type /Font /Subtype /Type0 /BaseFont /HiddenHorzOCR /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>" },
+    { number: 6, body: "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /HiddenHorzOCR /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R >>" },
+    { number: 7, body: tinyPdfStream("", `
+      1 begincodespacerange <0000> <ffff> endcodespacerange
+      3 beginbfrange
+        <0400> <04ff> <0400>
+        <d800> <dbff> <d800>
+        <dc00> <dfff> <dc00>
+      endbfrange
+    `) },
+    { number: 8, body: "<< /Type /FontDescriptor /FontName /HiddenHorzOCR /Flags 4 /FontBBox [0 0 1000 1000] /Ascent 800 /Descent -200 /FontFile2 9 0 R >>" },
+    { number: 9, body: tinyPdfStream("/Filter /ASCIIHexDecode", Buffer.from(buildTinySfnt()).toString("hex") + ">\r\nendstr") }
+  ] });
+  const reported = [];
+  const session = await openPdf({ kind: "bytes", bytes }, {
+    onDiagnostic: diagnostic => reported.push(diagnostic)
+  });
+  try {
+    const page = await session.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    assert.equal(page.textIndex.text, "Ко", "valid Cyrillic OCR text survives malformed unused entries");
+    const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
+    assert.equal(scene.textIndex.pages[0].text, "Ко");
+    assert.equal(scene.fillPathCount, 1, "visible page geometry is preserved");
+    assert.equal(scene.textInstanceCount, 0, "hidden OCR remains invisible");
+    assert.equal(scene.rasterLayers.length, 0);
+    const unicodeDiagnostics = session.getDiagnostics().filter(d => d.code === "font.invalid-to-unicode");
+    assert.equal(unicodeDiagnostics.length, 1);
+    assert.equal(unicodeDiagnostics[0].details.invalidMappingCount, 2048);
+    assert.equal(reported.filter(d => d.code === "font.invalid-to-unicode").length, 1);
+    assert.equal(session.getDiagnostics().filter(d => d.code === "filter.asciihex-trailing-data").length, 1);
+  } finally {
+    await session.close();
+  }
 }
 
 async function testFlateEolStreams(openPdf, validateHeprPageData) {

@@ -1,5 +1,5 @@
 import { isPdfDictionary, isPdfName, type PdfDictionary, type PdfValue } from "./nativeCos";
-import { PdfError, type PdfResourceLimits, mergePdfLimits, throwIfAborted } from "./nativeTypes";
+import { PdfError, type PdfDiagnostic, type PdfResourceLimits, mergePdfLimits, throwIfAborted } from "./nativeTypes";
 
 const MAX_FILTER_CHAIN_LENGTH = 64;
 const DEFAULT_DECODED_CHUNK_SIZE = 256 * 1024;
@@ -7,6 +7,7 @@ const DEFAULT_DECODED_CHUNK_SIZE = 256 * 1024;
 export interface PdfFilterDecodeOptions {
   readonly limits?: Partial<PdfResourceLimits>;
   readonly signal?: AbortSignal;
+  readonly onDiagnostic?: (diagnostic: Readonly<PdfDiagnostic>) => void;
 }
 
 export interface PdfFilterChunkDecodeOptions extends PdfFilterDecodeOptions {
@@ -54,7 +55,7 @@ export async function decodePdfFilterChain(
         bytes = decodeAscii85(bytes, limits.maxDecodedStreamBytes, options.signal);
         break;
       case "ASCIIHexDecode":
-        bytes = decodeAsciiHex(bytes, limits.maxDecodedStreamBytes, options.signal);
+        bytes = decodeAsciiHex(bytes, limits.maxDecodedStreamBytes, options.signal, options.onDiagnostic);
         break;
       case "RunLengthDecode":
         bytes = decodeRunLength(bytes, limits.maxDecodedStreamBytes, options.signal);
@@ -118,7 +119,8 @@ export async function* decodePdfFilterChainChunks(
 
   const decoded = await decodePdfFilterChain(input, filters, decodeParameters, {
     limits,
-    signal: options.signal
+    signal: options.signal,
+    onDiagnostic: options.onDiagnostic
   });
   for (let offset = 0; offset < decoded.length; offset += chunkSize) {
     throwIfAborted(options.signal);
@@ -596,21 +598,27 @@ function appendAscii85Group(
   }
 }
 
-function decodeAsciiHex(input: Uint8Array, limit: number, signal?: AbortSignal): Uint8Array {
+function decodeAsciiHex(
+  input: Uint8Array,
+  limit: number,
+  signal?: AbortSignal,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
+): Uint8Array {
   const output = new BoundedByteWriter(limit);
   let high = -1;
   let ended = false;
+  let trailingByteCount = 0;
+  let nonWhitespaceByteCount = 0;
   for (let index = 0; index < input.length; index += 1) {
     if ((index & 0x3fff) === 0) throwIfAborted(signal);
     const byte = input[index];
     if (isWhitespace(byte)) continue;
     if (byte === 0x3e) {
       ended = true;
+      trailingByteCount = input.length - index - 1;
       for (index += 1; index < input.length; index += 1) {
         if ((index & 0x3fff) === 0) throwIfAborted(signal);
-        if (!isWhitespace(input[index])) {
-          throw new PdfError("invalid-object", "ASCIIHex data follows its terminator.");
-        }
+        if (!isWhitespace(input[index])) nonWhitespaceByteCount += 1;
       }
       break;
     }
@@ -625,6 +633,17 @@ function decodeAsciiHex(input: Uint8Array, limit: number, signal?: AbortSignal):
   if (!ended) throw new PdfError("invalid-object", "ASCIIHex stream has no > terminator.");
   if (high >= 0) output.appendByte(high << 4);
   throwIfAborted(signal);
+  if (nonWhitespaceByteCount > 0) {
+    // The explicit end marker bounds the payload. Some producers include
+    // extra framing bytes in /Length; preserve the decoded data and report
+    // that the trailing bytes were ignored without retaining their contents.
+    onDiagnostic?.(Object.freeze({
+      code: "filter.asciihex-trailing-data",
+      severity: "warning" as const,
+      message: `Ignored ${nonWhitespaceByteCount} non-whitespace bytes after an ASCIIHex end marker.`,
+      details: Object.freeze({ trailingByteCount, nonWhitespaceByteCount })
+    }));
+  }
   return output.finish();
 }
 

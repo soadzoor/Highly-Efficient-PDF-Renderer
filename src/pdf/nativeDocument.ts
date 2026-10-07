@@ -141,6 +141,7 @@ export class NativePdfDocument {
   private readonly objectStreamCacheByteLengths = new Map<number, number>();
   private readonly repairedDuplicateDictionaryKeys = new Set<string>();
   private readonly repairedMissingStreamEndEols = new Set<string>();
+  private readonly streamDecodeDiagnosticCodes = new WeakMap<PdfStream, Set<string>>();
   private readonly lifetime = new AbortController();
   private readonly reader: PdfRandomAccessReader;
   private readonly repairMalformedStreamFraming: boolean;
@@ -384,7 +385,8 @@ export class NativePdfDocument {
     const parameters = readDecodeParameters(paramsValue, filters.length);
     return await decodePdfFilterChain(stream.bytes, filters, parameters, {
       limits: this.limits,
-      signal: operationSignal
+      signal: operationSignal,
+      onDiagnostic: diagnostic => this.recordStreamDecodeDiagnostic(stream, diagnostic)
     });
   }
 
@@ -416,7 +418,8 @@ export class NativePdfDocument {
       {
         limits: this.limits,
         chunkSize: options.chunkSize,
-        signal: operationSignal
+        signal: operationSignal,
+        onDiagnostic: diagnostic => this.recordStreamDecodeDiagnostic(stream, diagnostic)
       }
     )) {
       yield chunk;
@@ -475,6 +478,17 @@ export class NativePdfDocument {
     this.objectStreamCacheByteLengths.clear();
     this.objectStreamCacheBytes = 0;
     await this.reader.close();
+  }
+
+  private recordStreamDecodeDiagnostic(stream: PdfStream, diagnostic: Readonly<PdfDiagnostic>): void {
+    let codes = this.streamDecodeDiagnosticCodes.get(stream);
+    if (codes?.has(diagnostic.code)) return;
+    if (!codes) {
+      codes = new Set();
+      this.streamDecodeDiagnosticCodes.set(stream, codes);
+    }
+    codes.add(diagnostic.code);
+    this.diagnostics.push(copyPdfDiagnostic(diagnostic));
   }
 
   private async resolveObjectInternal(

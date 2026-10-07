@@ -131,6 +131,7 @@ try {
   await testLimits(document, localDictionary);
   await testDefinitionCountLimit(document);
   await testStructuralValidation(document, localDictionary);
+  await testToUnicodeSurrogateRecovery(document, localDictionary);
 
   assert.throws(
     () => parseLeadingType3Metrics(encoder.encode("500 0 q 500 0 d0"), "LateMetrics"),
@@ -234,6 +235,42 @@ async function testStructuralValidation(document, validDictionary) {
     registry.prepareFont(badEncoding),
     hasPdfError("invalid-object", "type3-encoding-differences-code")
   );
+}
+
+async function testToUnicodeSurrogateRecovery(document, validDictionary) {
+  const dictionary = new Map(validDictionary);
+  dictionary.set("ToUnicode", {
+    kind: "stream",
+    dictionary: new Map(),
+    bytes: encoder.encode([
+      "1 begincodespacerange <00> <ff> endcodespacerange",
+      "3 beginbfchar",
+      "<41> <d800>",
+      "<42> <0055>",
+      "<43> <0041d8000042dc00d83dde00>",
+      "endbfchar"
+    ].join("\n"))
+  });
+  const registry = new NativePdfType3Registry(document);
+  const font = await registry.prepareFont(dictionary);
+  assert.equal(registry.size, 0, "repairing ToUnicode must keep CharProc streams lazy");
+  assert.equal(font.toUnicode[65], "\ufffd");
+  assert.equal(font.toUnicode[66], "U", "valid ToUnicode mappings survive neighboring repairs");
+  assert.equal(font.toUnicode[67], "A\ufffdB\ufffd😀", "valid UTF-16 units and pairs survive repairs");
+  assert.equal(font.charProcNameForCode(65), "Colored");
+  assert.equal(font.charProcNameForCode(66), "Uncolored");
+  assert.equal(font.charProcNameForCode(67), "Alias");
+
+  const colored = await font.resolveGlyph(65);
+  const alias = await font.resolveGlyph(67);
+  assert.equal(colored.toUnicode, "\ufffd");
+  assert.equal(colored.charProcName, "Colored", "repaired text cannot redirect CharProc selection");
+  assert.equal(colored.width, 500);
+  assert.equal(colored.charProc.ref.objectNumber, 20);
+  assert.deepEqual(colored.charProc.decodedBytes, coloredContent);
+  assert.strictEqual(alias.charProc, colored.charProc);
+  assert.equal(registry.size, 1, "unrelated and malformed unused CharProcs remain lazy");
+  assert.ok(font.charProcs.has("UnusedBad"));
 }
 
 function fixture() {
