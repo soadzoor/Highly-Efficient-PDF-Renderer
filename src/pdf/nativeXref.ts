@@ -54,7 +54,10 @@ export async function readNativeXref(
   limits: Readonly<PdfResourceLimits>,
   repair: "off" | "safe",
   diagnostics: PdfDiagnostic[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // Earlier-revision recovery may normalize indexed structure, but must not
+  // combine object definitions by scanning a different source prefix again.
+  allowStructuralRepair = true
 ): Promise<NativeXrefResult> {
   let startXref: number | null = null;
   try {
@@ -100,6 +103,7 @@ export async function readNativeXref(
         repairCause = targetedCause;
       }
     }
+    if (!allowStructuralRepair) throw repairCause;
     return await repairNativeXref(reader, limits, diagnostics, repairCause, signal, startXref);
   }
 }

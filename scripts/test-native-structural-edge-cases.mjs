@@ -55,6 +55,7 @@ try {
   await testDuplicateDictionaryBootstrapRepair();
   await testDuplicateDictionaryTargetedRetryFallsBackToFullRepair();
   await testBootstrapFailureUsesSingleRepair();
+  await testPreviousRevisionRecovery();
   await testRepairSkipsStreamPayloads();
 } finally {
   hooks.deregister();
@@ -995,6 +996,121 @@ function linearizedForwardFixture({ staleLength = false, cycle = false, hintBefo
     .replace("EEEEEEEEEE", fixed(firstPageEnd))
     .replace("TTTTTTTTTT", fixed(hintBeforeMainXref ? mainXref - 1 : mainXref + "xref\n0 5\n".length))
     .replace("PPPPPPPPPP", fixed(mainXref)));
+}
+
+async function testPreviousRevisionRecovery() {
+  const content = "1 0 0 rg 1 2 3 4 re f";
+  const base = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", content) },
+    { number: 6, body: "<< /Marker /Original >>" }
+  ] });
+  const broken = appendRenumberedRewrite(base);
+  await assert.rejects(openStrict(broken), hasPdfError("invalid-page-tree", /node is not a dictionary/));
+  const reported = [];
+  let closeCount = 0;
+  const document = await openNativePdfDocument({
+    kind: "range", label: "broken-rewrite.pdf", byteLength: broken.length,
+    async read(offset, length, signal) {
+      signal.throwIfAborted();
+      assert.equal(closeCount, 0, "failed recovery attempts must not close the shared source");
+      return broken.subarray(offset, offset + length);
+    },
+    close() { closeCount += 1; }
+  }, { onDiagnostic: diagnostic => reported.push(diagnostic) });
+  try {
+    assert.equal(document.info.pageCount, 1);
+    assert.equal(document.info.repaired, true);
+    assert.equal(document.info.byteLength, broken.length);
+    assert.equal(document.info.label, "broken-rewrite.pdf");
+    assert.equal(document.getPage(0).ref.objectNumber, 3);
+    assert.equal((await document.resolveObject(ref(6))).get("Marker").value, "Original",
+      "earlier resources must not resolve to newer objects with the same number");
+    assert.equal(await document.resolveObject(ref(5)), null, "newer definitions remain outside the recovered xref");
+    const [decoded] = await document.getDecodedPageContents(0);
+    assert.deepEqual(decoded, bytes(content));
+    assert.deepEqual(reported, document.getDiagnostics());
+    const recovery = reported.filter(diagnostic => diagnostic.code === "document.previous-revision");
+    assert.equal(recovery.length, 1);
+    assert.equal(recovery[0].severity, "warning");
+    assert.equal(recovery[0].details.revisionEnd, base.length);
+    assert.equal(recovery[0].details.ignoredBytes, broken.length - base.length);
+  } finally {
+    await document.close();
+  }
+  assert.equal(closeCount, 1, "the recovered document owns the original source exactly once");
+
+  const padded = await openNativePdfDocument({ kind: "bytes", bytes: concatenate([broken, "\r\n \t\0"]) }, {
+    limits: { maxIncrementalRevisions: 1 }
+  });
+  try {
+    assert.equal(padded.getPage(0).ref.objectNumber, 3,
+      "trailing whitespace must not make the current EOF consume a recovery attempt");
+  } finally {
+    await padded.close();
+  }
+
+  const malformedSentinel = base.slice();
+  replaceLastAscii(malformedSentinel, "0000000000 65535 f ", "0000000000 00000 f ");
+  const normalized = await openNativePdfDocument({ kind: "bytes", bytes: appendRenumberedRewrite(malformedSentinel) });
+  try {
+    assert.equal(normalized.getPage(0).ref.objectNumber, 3);
+    assert.ok(normalized.getDiagnostics().some(diagnostic => diagnostic.details?.repairKind === "object-zero-generation"),
+      "earlier revisions retain bounded xref sentinel normalization, as in the original TIKA PDF");
+  } finally {
+    await normalized.close();
+  }
+
+  const valid = await openNativePdfDocument({ kind: "bytes", bytes: appendRenumberedRewrite(base, true) });
+  try {
+    assert.equal(valid.info.repaired, false, "a valid current revision always takes precedence");
+    assert.equal(valid.getPage(0).ref.objectNumber, 7);
+    assert.equal((await valid.resolveObject(ref(6))).get("Marker").value, "Newer");
+    assert.ok(!valid.getDiagnostics().some(diagnostic => diagnostic.code === "document.previous-revision"));
+  } finally {
+    await valid.close();
+  }
+
+  const twiceBroken = appendRenumberedRewrite(broken);
+  const earlier = await openNativePdfDocument({ kind: "bytes", bytes: twiceBroken });
+  try {
+    assert.equal(earlier.getPage(0).ref.objectNumber, 3, "skip prior candidates whose page trees also fail validation");
+    assert.equal(earlier.getDiagnostics().find(diagnostic => diagnostic.code === "document.previous-revision").details.revisionEnd, base.length);
+  } finally {
+    await earlier.close();
+  }
+  await assert.rejects(
+    openNativePdfDocument({ kind: "bytes", bytes: twiceBroken }, { limits: { maxIncrementalRevisions: 1 } }),
+    hasPdfError("invalid-page-tree"), "previous-revision attempts respect the revision ceiling"
+  );
+  await assert.rejects(
+    openNativePdfDocument({ kind: "bytes", bytes: broken }, { limits: { maxRepairScanBytes: broken.length - 1 } }),
+    hasPdfError("resource-limit"), "recovery must not bypass structural scan limits"
+  );
+  await assert.rejects(
+    openNativePdfDocument({ kind: "bytes", bytes: broken }, { signal: AbortSignal.abort() }),
+    hasPdfError("aborted")
+  );
+}
+
+function appendRenumberedRewrite(base, valid = false) {
+  // Like TIKA-3224-1, the rewrite reuses object numbers while its page leaf
+  // references still identify streams (or nonexistent objects) from the base.
+  const builder = new Builder();
+  builder.append(base);
+  const offsets = new Map();
+  addObject(builder, offsets, 3, "<< /Type /Catalog /Pages 5 0 R >>");
+  addObject(builder, offsets, 5, `<< /Type /Pages /Count 1 /Kids [${valid ? 7 : 4} 0 R] >>`);
+  addObject(builder, offsets, 6, "<< /Marker /Newer >>");
+  if (valid) addObject(builder, offsets, 7, "<< /Type /Page /Parent 5 0 R /MediaBox [0 0 20 10] >>");
+  const xrefOffset = builder.length;
+  builder.append("xref\n0 1\n" + xrefFree() + "3 1\n" + xrefInUse(offsets.get(3)));
+  builder.append(`5 ${valid ? 3 : 2}\n` + xrefInUse(offsets.get(5)) + xrefInUse(offsets.get(6)));
+  if (valid) builder.append(xrefInUse(offsets.get(7)));
+  builder.append(`trailer\n<< /Size ${valid ? 8 : 7} /Root 3 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+  return builder.build();
 }
 
 function addObject(builder, offsets, number, body) {
