@@ -55,7 +55,12 @@ export class PdfPageDemandLoader {
     return [...this.previews.values(), ...this.detailed.values()].reduce((bytes, page) => bytes + page.bytes, 0);
   }
   get pageScenes(): VectorScene[] {
-    return this.placeholders.map((placeholder, index) => this.detailed.get(index)?.scene ?? this.previews.get(index)?.scene ?? placeholder);
+    return this.placeholders.map((_, index) => this.pageScene(index));
+  }
+
+  private pageScene(index: number, wantedDetail = this.wantedDetail): VectorScene {
+    return (wantedDetail.includes(index) ? this.detailed.get(index)?.scene : undefined) ??
+      this.previews.get(index)?.scene ?? this.detailed.get(index)?.scene ?? this.placeholders[index];
   }
 
   update(view: RasterResolutionView, pageRects: Float32Array): void {
@@ -80,11 +85,18 @@ export class PdfPageDemandLoader {
       // previews that cannot all fit the same stationary viewport.
       for (const index of this.wanted) this.evictedPreviews.delete(index);
     }
+    const previousDetail = this.wantedDetail;
     this.wantedDetail = visible.filter(page => page.detail).slice(0, MAX_DETAILED_PAGES).map(page => page.index);
     const key = this.wantedDetail.join(",");
     if (key !== this.detailKey) {
       this.detailKey = key; this.attempted.clear();
       for (const index of this.wantedDetail) this.evictedPreviews.delete(index);
+      // Display selection follows the current view, independently of cached detail.
+      // Reload an evicted preview while retaining its drawable detail as a fallback.
+      for (const index of previousDetail) if (!this.wantedDetail.includes(index)) this.evictedPreviews.delete(index);
+      if ([...previousDetail, ...this.wantedDetail].some(index => this.pageScene(index, previousDetail) !== this.pageScene(index))) {
+        void this.notifyChange();
+      }
     }
     this.start();
   }
@@ -104,6 +116,11 @@ export class PdfPageDemandLoader {
 
   /** Test/host synchronization without polling or forcing additional pages. */
   async whenIdle(): Promise<void> { await this.running; }
+
+  private async notifyChange(): Promise<void> {
+    try { await this.onChange(); }
+    catch (error) { console.warn("[HEPR] Demand-driven PDF page update failed.", error); }
+  }
 
   private start(): void {
     if (this.running || this.closed || this.paused) return;
@@ -147,14 +164,14 @@ export class PdfPageDemandLoader {
         if (!detail || this.wantedDetail.includes(index)) {
           cache.set(index, { scene, bytes: sceneCpuBytes(scene) });
           this.trim(cache, detail);
-          await this.onChange();
+          await this.notifyChange();
         }
       } catch (error) {
         if (operation.signal.aborted || this.closed) this.attempted.delete(index);
         else {
           this.failed.add(index);
           console.warn(`[HEPR] Page ${index + 1} could not be loaded; other pages remain available.`, error);
-          await this.onChange();
+          await this.notifyChange();
         }
       } finally { if (this.operation === operation) this.operation = null; }
       // Worker work and scene updates stay sequential, with a paint opportunity between pages.

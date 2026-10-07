@@ -70,6 +70,42 @@ try {
   }
 
   {
+    const f = fixture(3);
+    const overview = { ...baseView, width: 200, height: 100, cameraCenterX: 800, zoom: .1 };
+    f.loader.update(overview, f.rectangles); await f.loader.whenIdle();
+    assert.equal(f.loader.previewCount, 2);
+    const previews = f.loader.pageScenes;
+    f.loader.update(baseView, f.rectangles); await f.loader.whenIdle();
+    const firstDetail = f.loader.pageScenes[0];
+    assert.notEqual(firstDetail, previews[0]);
+    f.loader.update({ ...baseView, cameraCenterX: 1300 }, f.rectangles); await f.loader.whenIdle();
+    const secondDetail = f.loader.pageScenes[1];
+    assert.notEqual(secondDetail, previews[1]);
+    assert.equal(f.loader.pageScenes[0], previews[0], "offscreen cached detail is replaced with its overview preview");
+    const calls = f.calls.length, residentBytes = f.loader.residentBytes, changes = f.changes;
+    f.loader.update(overview, f.rectangles); await f.loader.whenIdle();
+    assert.equal(f.loader.pageScenes[0], previews[0]);
+    assert.equal(f.loader.pageScenes[1], previews[1], "visited pages return to the same previews used before zooming in");
+    assert.equal(f.changes, changes + 1, "zoom-out notifies the viewer even when no worker compilation is needed");
+    assert.equal(f.calls.length, calls);
+    assert.equal(f.loader.detailedCount, 2, "display demotion preserves the bounded detailed cache");
+    assert.equal(f.loader.residentBytes, residentBytes);
+    f.loader.update({ ...overview, zoom: .11 }, f.rectangles); await f.loader.whenIdle();
+    assert.equal(f.changes, changes + 1, "unchanged display tiers do not repeatedly upload the scene");
+    for (let cycle = 0; cycle < 3; cycle++) {
+      f.loader.update(baseView, f.rectangles); await f.loader.whenIdle();
+      assert.equal(f.loader.pageScenes[0], firstDetail, "zoom-in reuses the original cached detail immediately");
+      assert.equal(f.loader.pageScenes[1], previews[1]);
+      f.loader.update(overview, f.rectangles); await f.loader.whenIdle();
+      assert.equal(f.loader.pageScenes[0], previews[0]);
+      assert.equal(f.loader.pageScenes[1], previews[1]);
+    }
+    assert.equal(f.calls.length, calls, "repeated zoom cycles do not decode cached pages again");
+    assert.equal(f.changes, changes + 7, "both directions of cached zoom transitions notify exactly once");
+    await f.loader.close();
+  }
+
+  {
     const f = fixture(30, 5 * 1024 * 1024);
     for (let index = 0; index < 20; index++) {
       f.loader.update({ ...baseView, cameraCenterX: index * 1000 + 300 }, f.rectangles);
@@ -139,7 +175,7 @@ try {
     await f.loader.close();
   }
   assert.equal(warnings.length, 0);
-  console.log("Demand-driven PDF pages: metadata-only opening, preview/detail priority, stable layout, sequential work, bounded CPU/page caches, navigation, search, pause and stale-work cancellation passed.");
+  console.log("Demand-driven PDF pages: metadata-only opening, preview/detail priority, zoom demotion and cached promotion, stable layout, sequential work, bounded CPU/page caches, navigation, search, pause and stale-work cancellation passed.");
 } finally {
   console.warn = previousWarn;
   if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator); else delete globalThis.navigator;

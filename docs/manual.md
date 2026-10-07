@@ -111,6 +111,8 @@ metadata, then loads pages near the current viewport in one worker. Overview
 previews use a longest edge of at most 96 pixels. Detailed page content is
 compiled when a page occupies more than 256 screen pixels, with at most 12
 detailed pages cached and a further limit based on estimated CPU payload bytes.
+Zooming back out restores the overview previews while keeping detailed content
+in the bounded cache for subsequent zooming.
 Evicted pages regenerate as you navigate. Unloaded pages retain their outlines
 and positions. Search progressively loads preview text for the rest of the
 document; explicit HEP export compiles the complete original PDF.

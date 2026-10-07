@@ -226,7 +226,6 @@ let activePdfPageLoader: PdfPageDemandLoader | null = null;
 let demandPdfUpdateTimer: number | null = null;
 let demandPdfUpdateRunning = false;
 let demandPdfUpdatePending = false;
-let lastPdfDemandViewUpdate = -Infinity;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
@@ -439,8 +438,9 @@ let lastRuntimeTextUpdate = -Infinity;
 function onRendererFrame(stats: DrawStats): void {
   const now = performance.now();
   if (activePdfPageLoader && lastParsedScene && activeSceneLoadToken === null &&
-      pendingSourceLoadCount === 0 && activeHepExportController === null && now - lastPdfDemandViewUpdate >= 100) {
-    lastPdfDemandViewUpdate = now;
+      pendingSourceLoadCount === 0 && activeHepExportController === null) {
+    // Demand follows every presented frame, including the final frame of a short zoom.
+    // Scene uploads remain coalesced separately by scheduleDemandPdfUpdate.
     activePdfPageLoader.update({ ...renderer.getPresentedViewState(), width: canvasElement.width, height: canvasElement.height }, lastParsedScene.pageRects);
   }
   updateFpsMetric(now);
@@ -1216,7 +1216,6 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const previousPageLoader = activePdfPageLoader;
     activePdfPageLoader = demandLoader;
     demandLoader = null;
-    lastPdfDemandViewUpdate = -Infinity;
     void previousPageLoader?.close();
     if (activePdfPageLoader) parsedPdfPageCache = null;
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);

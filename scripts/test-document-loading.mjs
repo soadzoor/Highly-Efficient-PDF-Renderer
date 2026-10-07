@@ -22,7 +22,7 @@ const context = vm.createContext({
   waitForLoad, createLoadProgressReporter,
   loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
   sourceLoadController: null, activeHepExportController: null,
-  activePdfPageLoader: null, lastPdfDemandViewUpdate: -Infinity, demandPdfUpdatePending: false,
+  activePdfPageLoader: null, demandPdfUpdatePending: false,
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
   lastParsedSceneLabel: null, parsedPdfPageCache: null,
   exampleManifestEntries: [], exampleSelectionMap: new Map(),
@@ -168,7 +168,35 @@ await testThreeDocumentReplacement();
 await testThreeBackendReplacement();
 await testRoomDocumentReplacement();
 await testNativeBackendLoading();
+testNativePageDemandFrames();
 console.log("Document replacement, export ownership, upload rollback, and superseded-load cancellation passed.");
+
+function testNativePageDemandFrames() {
+  let now = 1000;
+  let zoom = .4;
+  const views = [];
+  const host = vm.createContext({
+    performance: { now: () => now }, activePdfPageLoader: { update: view => views.push(view) },
+    lastParsedScene: { pageRects: Float32Array.of(0, 0, 600, 800) },
+    activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
+    lastRuntimeTextUpdate: now,
+    renderer: { getPresentedViewState: () => ({ cameraCenterX: 300, cameraCenterY: 400, zoom }) },
+    canvasElement: { width: 400, height: 500 }, updateFpsMetric: noop, drawCallMeter: { update: noop },
+    textSelection: { updateOverlay: noop }, drawingSelection: { onFrame: noop },
+    annotationInteraction: null, annotationOverlay: { onFrame: noop }
+  });
+  vm.runInContext(sourceFunction(source, "onRendererFrame"), host);
+  host.onRendererFrame({ drawCalls: 0 });
+  now += 16; zoom = .1;
+  host.onRendererFrame({ drawCalls: 0 });
+  assert.deepEqual(views.map(view => view.zoom), [.4, .1],
+    "a final zoom-out frame within 100 ms still updates the page display demand");
+  assert.equal(views[1].width, 400);
+  assert.equal(views[1].height, 500);
+  host.activeHepExportController = {};
+  host.onRendererFrame({ drawCalls: 0 });
+  assert.equal(views.length, 2, "exports continue to suspend page-demand updates");
+}
 
 function file(name, id) {
   return { name, arrayBuffer: async () => Uint8Array.of(id).buffer };
