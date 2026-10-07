@@ -12,7 +12,8 @@ import type {
   RasterLayer,
   VectorScene
 } from "../pdfVectorExtractor";
-import { HEPR_IMAGE_FORMAT, expandHeprImageToRgba8, heprRawImageBytesPerPixel } from "../heprDocumentData";
+import { HEPR_IMAGE_FORMAT, expandHeprImageToRgba8, heprRawImageBytesPerPixel, heprRawImageByteLength } from "../heprDocumentData";
+import { createMonochromeRasterLayer } from "../monochromeRaster";
 import {
   DENSE_PDF_VECTOR_SCENE_EVENT_FILL,
   DENSE_PDF_VECTOR_SCENE_EVENT_STROKE,
@@ -242,6 +243,7 @@ export function buildNativeVectorPage(
   if (visualBounds.empty) includeBounds(visualBounds, pageBounds);
 
   const firstRaster = rasterLayers[0];
+  const emptyRasterData = new Uint8Array(0);
   const normalizedPageBounds: Bounds = {
     minX: pageBounds.minX,
     minY: pageBounds.minY,
@@ -289,7 +291,7 @@ export function buildNativeVectorPage(
     rasterLayers,
     rasterLayerWidth: firstRaster?.width ?? 0,
     rasterLayerHeight: firstRaster?.height ?? 0,
-    rasterLayerData: firstRaster?.data ?? new Uint8Array(0),
+    get rasterLayerData() { return firstRaster?.data ?? emptyRasterData; },
     rasterLayerMatrix: firstRaster?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     endpoints: appendHairlines(compiled.endpoints, hairlines?.endpoints),
     primitiveMeta: appendHairlines(compiled.primitiveMeta, hairlines?.primitiveMeta),
@@ -1797,10 +1799,16 @@ function buildRasterLayers(
         "legacy-vector-image-index");
     }
     const image = registry.describe(imageIndex);
+    let monochrome = image.format === HEPR_IMAGE_FORMAT.Gray1 && image.softMaskImageIndex < 0
+      ? { data: image.data, colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) }
+      : undefined;
     let imageData: Uint8Array;
     compositedImages ??= new Map<number, Uint8Array>();
     const prepared = compositedImages.get(imageIndex);
-    if (prepared) {
+    if (monochrome) {
+      validateVectorImage(image, imageIndex, pageIndex, false);
+      imageData = new Uint8Array(0);
+    } else if (prepared) {
       imageData = prepared;
     } else {
       if (image.softMaskImageIndex >= 0) {
@@ -1842,7 +1850,7 @@ function buildRasterLayers(
           transformedBounds({ minX: 0, minY: 0, maxX: 1, maxY: 1 }, transform)
         )) {
       const clipped = clipVectorNearestImage(
-        imageData,
+        monochrome ? expandHeprImageToRgba8(image.data, image.format, image.width, image.height, signal)! : imageData,
         image.width,
         image.height,
         transform,
@@ -1857,17 +1865,18 @@ function buildRasterLayers(
       layerHeight = clipped.height;
       layerData = clipped.data;
       layerMatrix = clipped.matrix;
+      monochrome = undefined;
     }
-    layers.push({
+    const base = {
       width: layerWidth,
       height: layerHeight,
-      data: layerData,
       matrix: layerMatrix,
       ...(sidecar.imageOpacities?.[invocation] === undefined || sidecar.imageOpacities[invocation] === 1
         ? {} : { opacity: sidecar.imageOpacities[invocation] }),
       paintOrder: sidecar.imagePaintOrders[invocation],
       pageIndex: 0
-    });
+    };
+    layers.push(monochrome ? createMonochromeRasterLayer(base, monochrome) : { ...base, data: layerData });
   }
   return layers;
 }
@@ -2088,15 +2097,14 @@ function validateVectorImage(
 ): void {
   // The registry has already unpacked source samples into a raw layout: RGBA8,
   // or one of the grayscale layouts a DeviceGray source keeps at rest.
-  const rawBytesPerPixel = image.format === HEPR_IMAGE_FORMAT.Rgba8 ||
+  const expectedBytes = image.format === HEPR_IMAGE_FORMAT.Rgba8 || image.format === HEPR_IMAGE_FORMAT.Gray1 ||
       image.format === HEPR_IMAGE_FORMAT.Gray8 || image.format === HEPR_IMAGE_FORMAT.GrayAlpha8
-    ? heprRawImageBytesPerPixel(image.format)
+    ? heprRawImageByteLength(image.format, image.width, image.height)
     : 0;
-  const expectedBytes = image.width * image.height * rawBytesPerPixel;
   if (
     !Number.isSafeInteger(image.width) || image.width <= 0 ||
     !Number.isSafeInteger(image.height) || image.height <= 0 ||
-    rawBytesPerPixel === 0 || !Number.isSafeInteger(expectedBytes) ||
+    expectedBytes === 0 || !Number.isSafeInteger(expectedBytes) ||
     !(image.data instanceof Uint8Array) || image.data.length !== expectedBytes ||
     image.imageMask || image.codecRequest !== null ||
     (allowSoftMask
@@ -2250,6 +2258,9 @@ function vectorImageMaskPixel(
   x: number,
   y: number
 ): number {
+  if (image.format === HEPR_IMAGE_FORMAT.Gray1) {
+    return (image.data[y * Math.ceil(image.width / 8) + (x >> 3)] >> (7 - (x & 7))) & 1;
+  }
   const offset = (y * image.width + x) * stride;
   // Alpha is the payload's last channel; a Gray8 mask carries none and is opaque.
   const alpha = stride === 1 ? 255 : image.data[offset + stride - 1];

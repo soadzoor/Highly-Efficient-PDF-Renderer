@@ -22,6 +22,7 @@ import { composePagePaintGraph } from "./scenePaintGraphComposition";
 import { validateScenePaintGraph, type ScenePaintGraph } from "./scenePaintGraph";
 import { composeOptionalContent } from "./optionalContentComposition";
 import { assertPdfBytes, PDF_HEADER_SCAN_BYTES } from "./pdfSignature";
+import { copyRasterLayer, type MonochromeRaster } from "./monochromeRaster";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -38,6 +39,8 @@ export interface RasterLayer {
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
+  /** Optional packed pixels; native GPU renderers avoid materializing the RGBA fallback. */
+  monochrome?: MonochromeRaster;
   matrix: Float32Array;
   /** Dense PDF paint ordinal within `pageIndex`. */
   paintOrder: number;
@@ -780,10 +783,7 @@ export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: Vecto
  */
 function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
   const pageBounds = normalizeSceneBounds(scene.pageBounds, scene.bounds);
-  const rasterLayers = listSceneRasterLayers(scene).map((layer) => ({
-    ...layer,
-    pageIndex: 0
-  }));
+  const rasterLayers = listSceneRasterLayers(scene).map(layer => copyRasterLayer(layer, { pageIndex: 0 }));
   let rasterBounds: Bounds | null = null;
   for (const layer of rasterLayers) {
     const matrix: Mat2D = [
@@ -802,6 +802,7 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
 
   const base = createEmptyVectorScene();
   const primaryRasterLayer = rasterLayers[0] ?? null;
+  const emptyRasterData = new Uint8Array(0);
   return {
     ...base,
     pdfPages: scene.pdfPages,
@@ -818,7 +819,7 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    get rasterLayerData() { return primaryRasterLayer?.data ?? emptyRasterData; },
     rasterLayerMatrix:
       primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     bounds: combineBounds(pageBounds, rasterBounds) ?? pageBounds,
@@ -839,12 +840,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   }
 
   if (pageScenes.length === 1) {
-    return {
-      ...pageScenes[0],
+    return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(pageScenes[0])) as VectorScene, {
       pageCount: Math.max(1, pageScenes[0].pageRects.length / 4),
       pagesPerRow: 1,
       pageTextRanges: normalizePageTextRangesForScene(pageScenes[0])
-    };
+    });
   }
 
   const pagesPerRow = normalizePositiveInt(requestedPagesPerRow, 10, 1, 100);
@@ -999,7 +999,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     if (pagePrimitiveRanges) {
       validatePagePrimitiveRanges(scene);
       const offsets = [segmentOffset, fillPathOffset, textInstanceOffset, rasterLayers.length, gradientFillPathOffset, gradientStrokeRunOffset];
-      const counts = scenePrimitiveCounts({ ...scene, rasterLayers: listSceneRasterLayers(scene) });
+      const counts = scenePrimitiveCounts(Object.assign(
+        Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene,
+        { rasterLayers: listSceneRasterLayers(scene) }
+      ));
       const localPages = Math.max(1, scene.pageRects.length / 4);
       for (let local = 0; local < localPages; local++) PAGE_PRIMITIVE_KINDS.forEach((kind, k) => {
         const src = local * PAGE_PRIMITIVE_RANGE_STRIDE + k * 2;
@@ -1035,7 +1038,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         raster: rasterLayers.length, "gradient-fill": gradientFillPathOffset,
         "gradient-stroke": gradientStrokeRunOffset
       };
-      for (const run of scene.drawRuns ?? defaultVectorDrawRuns({ ...scene, rasterLayers: listSceneRasterLayers(scene) })) {
+      for (const run of scene.drawRuns ?? defaultVectorDrawRuns(Object.assign(
+        Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene,
+        { rasterLayers: listSceneRasterLayers(scene) }
+      ))) {
         const clipIndex = run.clipIndex === undefined ? undefined : run.clipIndex + clipBase;
         const optionalContent = run.optionalContent === undefined ? undefined : run.optionalContent + layers.offsets[pageIndex];
         if (paintGraph) drawRuns.push({ ...run, first: run.first + offsets[run.kind],
@@ -1307,15 +1313,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       matrix[3] = layer.matrix[3];
       matrix[4] = layer.matrix[4] + tx;
       matrix[5] = layer.matrix[5] + ty;
-      rasterLayers.push({
-        width: layer.width,
-        height: layer.height,
-        data: layer.data,
+      rasterLayers.push(copyRasterLayer(layer, {
         matrix,
-        ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
         paintOrder: layer.paintOrder,
         pageIndex: pageRectBase + layer.pageIndex
-      });
+      }));
     }
 
     fillPathOffset += scene.fillPathCount;
@@ -1332,6 +1334,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   }
 
   const primaryRasterLayer = rasterLayers[0] ?? null;
+  const emptyRasterData = new Uint8Array(0);
 
   const { droppedPages: structureDroppedPages, ...structure } = composeSceneStructure(structurePages);
   if (structureDroppedPages) onDiagnostic?.({ code: "structure.limit", severity: "warning",
@@ -1407,7 +1410,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    get rasterLayerData() { return primaryRasterLayer?.data ?? emptyRasterData; },
     rasterLayerMatrix: primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     endpoints,
     primitiveMeta,
@@ -1570,8 +1573,7 @@ export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
     }
   }
 
-  return {
-    ...scene,
+  return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene, {
     textInstanceB,
     textGlyphCount: uniqueOldGlyphIndices.length,
     textGlyphSegmentCount: dedupGlyphSegmentsA.quadCount,
@@ -1579,7 +1581,7 @@ export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
     textGlyphMetaB: dedupGlyphMetaB.toTypedArray(),
     textGlyphSegmentsA: dedupGlyphSegmentsA.toTypedArray(),
     textGlyphSegmentsB: dedupGlyphSegmentsB.toTypedArray()
-  };
+  });
 }
 
 export function inferPageTextRanges(
@@ -1846,7 +1848,9 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
     for (const layer of scene.rasterLayers) {
       const width = Math.max(0, Math.trunc(layer?.width ?? 0));
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
-      if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
+      if (width <= 0 || height <= 0 || (layer.monochrome
+        ? !(layer.monochrome.data instanceof Uint8Array) || layer.monochrome.data.length !== Math.ceil(width / 8) * height || layer.monochrome.colors.length !== 8
+        : !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4)) {
         continue;
       }
 
@@ -1863,15 +1867,14 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
         matrix[3] = 1;
       }
 
-      out.push({
+      out.push(copyRasterLayer(layer, {
         width,
         height,
-        data: layer.data,
         matrix,
         ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
         paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
         pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
-      });
+      }));
     }
   }
 

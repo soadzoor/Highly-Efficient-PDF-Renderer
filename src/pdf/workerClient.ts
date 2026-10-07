@@ -6,6 +6,7 @@ import type {
   PdfDocumentInfo
 } from "../heprDocumentData";
 import type { VectorScene } from "../pdfVectorExtractor";
+import { restoreMonochromeSceneTransfer } from "../monochromeRaster";
 import type {
   NativeVectorCompileOptions,
   NativeVectorPdfSession,
@@ -594,7 +595,7 @@ class PdfWorkerConnection {
       }
     }, [], signal, options.onProgress) as Promise<CompileVectorSuccess>).then((response) => {
       this.replaceDiagnostics(response.diagnostics);
-      return response.scene;
+      return restoreMonochromeSceneTransfer(response.scene);
     });
   }
 

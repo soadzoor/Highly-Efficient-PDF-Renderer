@@ -354,10 +354,15 @@ to scene conditions (`-1` means unconditional). A resource is shared by all
 fallback islands that replay that page. Its file is `retained/page-N.bin` and
 contains self-contained retained drawing commands and typed stores, never a PDF
 that must be reparsed. Its image store keeps each decoded payload in the
-narrowest layout that represents it exactly: a DeviceGray source stays `Gray8`,
-or `GrayAlpha8` when a color-key Mask can make a pixel transparent, and only a
-consumer that uploads a texture widens it to straight RGBA8. A grayscale soft
-mask is therefore stored once rather than as three redundant channels.
+narrowest layout that represents it exactly: binary DeviceGray images of at
+least 256 pixels use `Gray1` (format 8), with black zero bits and white one bits,
+MSB first and each row padded to `ceil(width / 8)` bytes. Eight-bit DeviceGray
+sources stay `Gray8`, or `GrayAlpha8` when a color-key Mask needs alpha. Native
+WebGL and WebGPU renderers upload binary images as packed R8 bytes and separate
+R8 coverage mipmaps; consumers requiring RGBA widen the pixels on demand.
+The existing scene raster storage encodings remain unchanged, and decoded
+images with at most two exact RGBA colors can recover packed GPU storage.
+Grayscale soft masks are stored once rather than as three redundant channels.
 Replay is driven only by an optional-content change, so
 an exporter writes `scene.retainedPages` and its retained paint-graph leaves
 only for a document that has toggleable layers; without them the baked raster

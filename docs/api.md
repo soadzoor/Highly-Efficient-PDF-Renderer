@@ -1053,6 +1053,14 @@ assets ship with HEPR and load relative to the deployed package, including in
 parser workers; no third-party server or CDN is contacted to load a decoder.
 The published package and bundler entry include those assets automatically.
 
+Binary DeviceGray images of at least 256 pixels, including JBIG2 and fax images,
+keep packed one-bit pixels through native compilation and worker transfer.
+Native WebGL and WebGPU use eight pixels per R8 base texel with separate R8
+coverage mipmaps for filtered minification. Typical square images use about
+0.46 bytes per source pixel including mipmaps, versus 5.33 for RGBA8. Exact
+two-color images loaded from existing HEPs can use the same GPU path. Three,
+Canvas 2D, exports, and images requiring resampling retain RGBA compatibility.
+
 The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
 embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX
 samples, codec-defined color spaces, and premultiplied alpha (`SMaskInData=2`)

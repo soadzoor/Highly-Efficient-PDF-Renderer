@@ -3,6 +3,7 @@ import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateSceneOptionalContentReferences } from "./optionalContent";
 import { validateSceneRetainedPages } from "./retainedPageData";
 import { validateScenePaintGraph } from "./scenePaintGraph";
+import { copyRasterLayer } from "./monochromeRaster";
 import {
   optimizeVectorSceneTextGlyphs,
   type RasterLayer,
@@ -415,20 +416,21 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
     for (const layer of scene.rasterLayers) {
       const width = Math.max(0, Math.trunc(layer?.width ?? 0));
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
-      if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
+      if (width <= 0 || height <= 0 || (layer.monochrome
+        ? layer.monochrome.data.length !== Math.ceil(width / 8) * height || layer.monochrome.colors.length !== 8
+        : !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4)) {
         continue;
       }
 
       const matrix = layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix);
-      out.push({
+      out.push(copyRasterLayer(layer, {
         width,
         height,
-        data: layer.data,
         matrix,
         paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
         pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
         ...(layer.opacity === undefined ? {} : { opacity: layer.opacity })
-      });
+      }));
     }
   }
 

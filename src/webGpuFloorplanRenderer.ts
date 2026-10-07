@@ -9,7 +9,9 @@ import { WebGpuPaintFolds } from "./webGpuPaintFold";
 import { WebGpuFrameTimer } from "./webGpuFrameTimer";
 import { RenderPerformanceProfiler } from "./renderPerformance";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
-import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, type RasterTile } from "./rasterTiles";
+import { isRasterTilePlanDownscaled, planRasterTiles, rasterTilePixels, reportRasterTileDownscale, type RasterTile } from "./rasterTiles";
+import { buildMonochromeMipChain, detectMonochromeRaster, expandMonochromeRaster, monochromeRasterTile, type MonochromeRaster } from "./monochromeRaster";
+import { MONOCHROME_RASTER_WGSL } from "./monochromeRasterWebGpuShaders";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
 import { WebGpuPaintCompositor, beginPdfManagedRenderPass } from "./webGpuPaintCompositor";
@@ -90,6 +92,7 @@ type FrameListener = (stats: DrawStats) => void;
 
 interface WebGpuRasterTileResource {
   texture: any;
+  coverageTexture?: any;
   uniformBuffer: any;
   bindGroup: any;
 }
@@ -99,6 +102,7 @@ interface RasterLayerSource {
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
+  monochrome?: MonochromeRaster;
   matrix: Float32Array;
   paintOrder?: number;
   pageIndex?: number;
@@ -184,8 +188,8 @@ const CAMERA_UNIFORM_BUFFER_BYTES = 96;
 const VECTOR_COMPOSITE_UNIFORM_FLOATS = 4;
 const VECTOR_COMPOSITE_UNIFORM_BUFFER_BYTES = 16;
 
-const RASTER_UNIFORM_FLOATS = 16;
-const RASTER_UNIFORM_BUFFER_BYTES = 64;
+const RASTER_UNIFORM_FLOATS = 24;
+const RASTER_UNIFORM_BUFFER_BYTES = 96;
 
 const WGSL_OUTPUT_COLOR_HELPERS = /* wgsl */ `
 fn heprEncodeOutputColor(color : vec4f) -> vec4f {
@@ -896,6 +900,8 @@ struct RasterUniforms {
   // A tile's part of the image's unit square, and the same corners in its texture.
   quad : vec4f,
   uv : vec4f,
+  zeroColor : vec4f,
+  oneColor : vec4f,
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
@@ -904,6 +910,7 @@ struct RasterUniforms {
   : "var<uniform> uRaster : RasterUniforms;"}
 @group(0) @binding(2) var uRasterSampler : sampler;
 @group(0) @binding(3) var uRasterTex : texture_2d<f32>;
+${pageBackgrounds ? "" : "@group(0) @binding(4) var uRasterCoverageTex : texture_2d<f32>;"}
 
 struct VsOut {
   @builtin(position) position : vec4f,
@@ -967,6 +974,7 @@ ${pageBackgrounds ? `
 @group(1) @binding(0) var uVectorClipTex: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> uVectorClip: vec4f;
 ${RASTER_CLIP_WGSL}
+${pageBackgrounds ? "" : MONOCHROME_RASTER_WGSL}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
@@ -974,7 +982,19 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   // solid. Measure the footprint before any discard. Color is premultiplied.
   let clipAAWidth = max(max(length(vec2f(dpdx(inData.world.x), dpdy(inData.world.x))),
     length(vec2f(dpdx(inData.world.y), dpdy(inData.world.y)))), 1e-4);
-  let color = textureSample(uRasterTex, uRasterSampler, inData.uv) * ${pageBackgrounds ? "1.0" : "uRaster.matrixB.z"};
+${pageBackgrounds ? `
+  let color = textureSample(uRasterTex, uRasterSampler, inData.uv);
+` : `
+  let uvDx = dpdx(inData.uv);
+  let uvDy = dpdy(inData.uv);
+  var imageColor : vec4f;
+  if (uRaster.matrixB.w > 0.0) {
+    imageColor = heprMonochromeColor(inData.uv, uvDx, uvDy);
+  } else {
+    imageColor = textureSampleGrad(uRasterTex, uRasterSampler, inData.uv, uvDx, uvDy);
+  }
+  let color = imageColor * uRaster.matrixB.z;
+`}
   if (color.a <= 0.001) {
     discard;
   }
@@ -1755,6 +1775,11 @@ export class WebGpuFloorplanRenderer {
         },
         {
           binding: 3,
+          visibility: gpuShaderStage.FRAGMENT,
+          texture: { sampleType: "float" }
+        },
+        {
+          binding: 4,
           visibility: gpuShaderStage.FRAGMENT,
           texture: { sampleType: "float" }
         }
@@ -4675,36 +4700,30 @@ export class WebGpuFloorplanRenderer {
 
   private getSceneRasterLayers(
     scene: VectorScene
-  ): Array<{
-    opacity?: number;
-    width: number;
-    height: number;
-    data: Uint8Array<ArrayBufferLike>;
-    matrix: Float32Array;
-    paintOrder: number;
-    pageIndex: number;
-  }> {
-    const out: Array<{
-      opacity?: number;
-      width: number;
-      height: number;
-      data: Uint8Array<ArrayBufferLike>;
-      matrix: Float32Array;
-      paintOrder: number;
-      pageIndex: number;
-    }> = [];
+  ): Array<RasterLayerSource & { paintOrder: number; pageIndex: number }> {
+    const out: Array<RasterLayerSource & { paintOrder: number; pageIndex: number }> = [];
     if (Array.isArray(scene.rasterLayers)) {
       for (let index = 0; index < scene.rasterLayers.length; index++) {
         const layer = this.rasterLayerUpdates.get(index) ?? scene.rasterLayers[index];
         const width = Math.max(0, Math.trunc(layer?.width ?? 0));
         const height = Math.max(0, Math.trunc(layer?.height ?? 0));
-        if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
-          continue;
+        if (width <= 0 || height <= 0) continue;
+        const monochrome = layer.monochrome;
+        let data: Uint8Array<ArrayBufferLike>;
+        if (monochrome) {
+          if (!(monochrome.data instanceof Uint8Array) || monochrome.data.length < Math.ceil(width / 8) * height ||
+              !(monochrome.colors instanceof Uint8Array) || monochrome.colors.length !== 8) continue;
+          // The public RGBA field can be lazy. Native uploads only need packed bits.
+          data = new Uint8Array(0);
+        } else {
+          data = layer.data;
+          if (!(data instanceof Uint8Array) || data.length < width * height * 4) continue;
         }
         out.push({
           width,
           height,
-          data: layer.data,
+          data,
+          ...(monochrome ? { monochrome } : {}),
           opacity: layer.opacity,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
@@ -4831,16 +4850,31 @@ export class WebGpuFloorplanRenderer {
     }
     const maxTextureSize = this.maxTextureSize();
     const plan = planRasterTiles(source.width, source.height, maxTextureSize);
-    reportRasterTileDownscale(index, source, plan, maxTextureSize);
-    const pixels = rasterTilePixels(source, plan);
+    // Legacy HEPs retain RGBA bytes; exact two-color images can use the same
+    // packed path without changing the container or the source scene.
+    const monochrome = source.monochrome ?? (source.width * source.height >= 256
+      ? detectMonochromeRaster(source.data, source.width, source.height) : undefined);
+    reportRasterTileDownscale(index, {
+      width: source.width, height: source.height, data: monochrome?.data ?? source.data
+    }, plan, maxTextureSize);
+    const packed = monochrome && !isRasterTilePlanDownscaled(source, plan) ? monochrome : undefined;
+    const pixels = packed ? undefined : rasterTilePixels(monochrome ? {
+      width: source.width, height: source.height,
+      data: expandMonochromeRaster(monochrome, source.width, source.height)
+    } : source, plan);
     const tiles: WebGpuRasterTileResource[] = [];
     try {
       for (const [tileIndex, tile] of plan.tiles.entries()) {
-        const texture = this.createRgba8Texture(tile.width, tile.height, pixels[tileIndex]);
+        const tileMonochrome = packed ? monochromeRasterTile(packed, source.width, source.height, tile) : undefined;
+        const textures = tileMonochrome
+          ? this.createMonochromeTextures(tile.width, tile.height, tileMonochrome)
+          : { texture: this.createRgba8Texture(tile.width, tile.height, pixels![tileIndex]) };
         try {
-          tiles.push(this.createRasterTileResource(matrix, texture, source.opacity ?? 1, tile));
+          tiles.push(this.createRasterTileResource(matrix, textures.texture, source.opacity ?? 1, tile,
+            "coverageTexture" in textures ? textures.coverageTexture : undefined, tileMonochrome));
         } catch (error) {
-          texture.destroy();
+          textures.texture.destroy();
+          if ("coverageTexture" in textures) textures.coverageTexture.destroy();
           throw error;
         }
       }
@@ -4858,7 +4892,10 @@ export class WebGpuFloorplanRenderer {
     };
   }
 
-  private createRasterTileResource(matrix: Float32Array, texture: any, opacity: number, tile: RasterTile): WebGpuRasterTileResource {
+  private createRasterTileResource(
+    matrix: Float32Array, texture: any, opacity: number, tile: RasterTile,
+    coverageTexture?: any, monochrome?: MonochromeRaster
+  ): WebGpuRasterTileResource {
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
     rasterUniforms[0] = matrix[0];
@@ -4868,9 +4905,19 @@ export class WebGpuFloorplanRenderer {
     rasterUniforms[4] = matrix[4];
     rasterUniforms[5] = matrix[5];
     rasterUniforms[6] = opacity;
-    rasterUniforms[7] = 0;
+    rasterUniforms[7] = monochrome ? tile.width : 0;
     rasterUniforms.set(tile.quad, 8);
     rasterUniforms.set(tile.uv, 12);
+    if (monochrome) {
+      for (let endpoint = 0; endpoint < 2; endpoint++) {
+        const offset = endpoint * 4, alpha = monochrome.colors[offset + 3];
+        // Match the RGBA upload's byte-rounded premultiplication.
+        for (let channel = 0; channel < 3; channel++) {
+          rasterUniforms[16 + offset + channel] = Math.round(monochrome.colors[offset + channel] * alpha / 255) / 255;
+        }
+        rasterUniforms[19 + offset] = alpha / 255;
+      }
+    }
     assertUniformBufferSizeMatches(rasterUniforms, RASTER_UNIFORM_BUFFER_BYTES, "raster");
 
     const uniformBuffer = this.gpuDevice.createBuffer({
@@ -4898,11 +4945,15 @@ export class WebGpuFloorplanRenderer {
           {
             binding: 3,
             resource: texture.createView()
+          },
+          {
+            binding: 4,
+            resource: (coverageTexture ?? texture).createView()
           }
         ]
       });
 
-      return { texture, uniformBuffer, bindGroup };
+      return { texture, ...(coverageTexture ? { coverageTexture } : {}), uniformBuffer, bindGroup };
     } catch (error) {
       try {
         uniformBuffer.destroy();
@@ -5002,6 +5053,40 @@ export class WebGpuFloorplanRenderer {
       this.writeR8Texture(texture, level.width, level.height, padded, mipLevel);
     }
     return texture;
+  }
+
+  /** The base stores eight pixels per texel; separate R8 mips hold averaged bits. */
+  private createMonochromeTextures(width: number, height: number, source: MonochromeRaster): {
+    texture: any; coverageTexture: any;
+  } {
+    const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
+    const packedWidth = Math.ceil(width / 8);
+    const mipChain = buildMonochromeMipChain(source, width, height);
+    if (mipChain.length === 0) mipChain.push({ width: 1, height: 1,
+      data: Uint8Array.of((source.data[0] & 128) ? 255 : 0) });
+    const texture = this.gpuDevice.createTexture({
+      size: { width: packedWidth, height, depthOrArrayLayers: 1 },
+      format: "r8unorm",
+      usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
+    });
+    let coverageTexture: any = null;
+    try {
+      this.writeR8Texture(texture, packedWidth, height, source.data);
+      coverageTexture = this.gpuDevice.createTexture({
+        size: { width: mipChain[0].width, height: mipChain[0].height, depthOrArrayLayers: 1 },
+        format: "r8unorm",
+        mipLevelCount: mipChain.length,
+        usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
+      });
+      for (const [mipLevel, level] of mipChain.entries()) {
+        this.writeR8Texture(coverageTexture, level.width, level.height, level.data, mipLevel);
+      }
+      return { texture, coverageTexture };
+    } catch (error) {
+      texture.destroy();
+      coverageTexture?.destroy();
+      throw error;
+    }
   }
 
   private createRgba8DataTexture(width: number, height: number, source: Uint8Array): any {
@@ -5427,6 +5512,7 @@ export class WebGpuFloorplanRenderer {
 
 function destroyRasterTileResource(tile: WebGpuRasterTileResource): void {
   tile.texture?.destroy();
+  tile.coverageTexture?.destroy();
   tile.uniformBuffer?.destroy();
 }
 

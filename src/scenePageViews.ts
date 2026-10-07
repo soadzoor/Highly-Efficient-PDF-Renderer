@@ -5,6 +5,7 @@ import type { ScenePaintNode } from "./scenePaintGraph";
 import { defaultVectorDrawRuns, validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateScenePaintGraph } from "./scenePaintGraph";
 import { selectSceneMarkedContent } from "./structureData";
+import { copyRasterLayer } from "./monochromeRaster";
 
 export const PAGE_PRIMITIVE_KINDS = ["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"] as const;
 export const PAGE_PRIMITIVE_RANGE_STRIDE = PAGE_PRIMITIVE_KINDS.length * 2;
@@ -132,9 +133,9 @@ export class ScenePageViews {
     const primitives = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind, Uint32Array.from(this.indices[kind][pageIndex])])) as Record<PrimitiveKind, Uint32Array>;
     const maps = Object.fromEntries(PAGE_PRIMITIVE_KINDS.map(kind => [kind,
       new Map(Array.from(primitives[kind], (index, local) => [index, local]))])) as Record<PrimitiveKind, Map<number, number>>;
-    const scene: VectorScene = { ...source, pageCount: 1, pagesPerRow: 1,
+    const scene: VectorScene = Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(source)) as VectorScene, { pageCount: 1, pagesPerRow: 1,
       pageRects: source.pageRects.slice(pageIndex * 4, pageIndex * 4 + 4), pagePrimitiveRanges: undefined,
-      textIndex: null, retainedPages: undefined, paintGraph: undefined, clipPaths: undefined };
+      textIndex: null, retainedPages: undefined, paintGraph: undefined, clipPaths: undefined });
     const r = scene.pageRects;
     scene.pageBounds = { minX: Math.min(r[0], r[2]), minY: Math.min(r[1], r[3]), maxX: Math.max(r[0], r[2]), maxY: Math.max(r[1], r[3]) };
     scene.bounds = { ...scene.pageBounds };
@@ -221,10 +222,12 @@ export class ScenePageViews {
     const markedContent = selectSceneMarkedContent(source, primitives);
     if (markedContent) scene.markedContent = markedContent;
     else delete scene.markedContent;
-    scene.rasterLayers = Array.from(primitives.raster, index => ({ ...source.rasterLayers[index], pageIndex: 0 }));
+    scene.rasterLayers = Array.from(primitives.raster, index => copyRasterLayer(source.rasterLayers[index], { pageIndex: 0 }));
     const raster = scene.rasterLayers[0];
+    const emptyRasterData = new Uint8Array(0);
     scene.rasterLayerWidth = raster?.width ?? 0; scene.rasterLayerHeight = raster?.height ?? 0;
-    scene.rasterLayerData = raster?.data ?? new Uint8Array(0); scene.rasterLayerMatrix = raster?.matrix ?? Float32Array.of(1,0,0,1,0,0);
+    Object.defineProperty(scene, "rasterLayerData", { enumerable: true, configurable: true, get: () => raster?.data ?? emptyRasterData });
+    scene.rasterLayerMatrix = raster?.matrix ?? Float32Array.of(1,0,0,1,0,0);
     scene.imagePaintOpCount = scene.rasterLayers.length;
 
     const runs = source.drawRuns ?? defaultVectorDrawRuns(source), runMap = new Map<number, number[]>();

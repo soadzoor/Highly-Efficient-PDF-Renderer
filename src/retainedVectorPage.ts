@@ -28,6 +28,7 @@ import type { NativeGlyphPathCommand } from "./pdf/nativeFont";
 import type { DensePdfTextClip } from "./pdf/nativeContentCompiler";
 import { PdfError } from "./pdf/nativeTypes";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
+import { createMonochromeRasterLayer, type MonochromeRaster } from "./monochromeRaster";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
 /**
@@ -244,7 +245,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const colors = new HeprColorEvaluator(page.stores.colors,
     (indices, inputs) => indices.flatMap(index => [...functions.evaluate(index, inputs, { signal })]), signal);
   const gradients: GradientSceneData[] = [];
-  const imagePixels = new Map<number | string, { readonly data: Uint8Array; readonly width: number; readonly height: number }>();
+  const imagePixels = new Map<number | string, { readonly data: Uint8Array; readonly width: number; readonly height: number;
+    readonly monochrome?: MonochromeRaster }>();
   const binaryStencils = new Map<number, boolean>();
   let pendingStencil: { plates: BinaryStencilPlate[]; width: number; height: number; index: number;
     matrix: Float32Array; clip: DensePdfTextClip | null; clipIndex: number | undefined;
@@ -909,6 +911,12 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         flushStencil();
         const key = stencil ? `${index}:${stencil.join(",")}` : index;
         let pixels = imagePixels.get(key);
+        if (!pixels && !stencil && images.formats[index] === HEPR_IMAGE_FORMAT.Gray1 && images.softMaskImageIndices[index] < 0) {
+          pixels = createMonochromeRasterLayer({ width: images.widths[index], height: images.heights[index],
+            matrix: layerMatrix, paintOrder: 0, pageIndex: 0 },
+          { data: source, colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) });
+          imagePixels.set(key, pixels);
+        }
         if (!pixels) {
           let width = images.widths[index], height = images.heights[index], data: Uint8Array, owned = false;
           if (stencil) {
@@ -937,7 +945,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
           imagePixels.set(key, pixels = { data, width, height });
         }
         const first = scene.rasterLayers.length; budget(6);
-        scene.rasterLayers.push({ width: pixels.width, height: pixels.height, data: pixels.data, matrix: layerMatrix, paintOrder: first, pageIndex: 0 });
+        const base = { width: pixels.width, height: pixels.height, matrix: layerMatrix, paintOrder: first, pageIndex: 0 };
+        scene.rasterLayers.push(pixels.monochrome
+          ? createMonochromeRasterLayer(base, pixels.monochrome)
+          : { ...base, data: pixels.data });
         appendRun("raster", first, 1, clip, condition);
       }
     } else return fail(`${command.source} requires a specialized vector adapter.`);
@@ -1061,7 +1072,10 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   scene.pathCount = scene.fillPathCount + scene.segmentCount;
   scene.imagePaintOpCount = scene.rasterLayers.length;
   const image = scene.rasterLayers[0];
-  if (image) { scene.rasterLayerWidth = image.width; scene.rasterLayerHeight = image.height; scene.rasterLayerData = image.data; scene.rasterLayerMatrix = image.matrix; }
+  if (image) {
+    scene.rasterLayerWidth = image.width; scene.rasterLayerHeight = image.height; scene.rasterLayerMatrix = image.matrix;
+    Object.defineProperty(scene, "rasterLayerData", { enumerable: true, configurable: true, get: () => image.data });
+  }
   scene.pdfPages = [{ pageIndex: 0, sourcePageIndex: source.pageInfo.sourcePageIndex,
     pdfToScene: computeNativePdfPageGeometry(source.pageInfo).pageMatrix }];
   scene.annotations = source.annotations?.map(annotation => {

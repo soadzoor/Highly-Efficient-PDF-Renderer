@@ -126,7 +126,7 @@ try {
       assert.deepEqual(unpad(upload), pixels[index]);
       const uniforms = device.writes.find(write => write.buffer === tile.uniformBuffer).values;
       assert.deepEqual([...uniforms.subarray(0, 8)], [...scene.rasterLayers[0].matrix, 0.5, 0].map(Math.fround));
-      assert.deepEqual([...uniforms.subarray(8)], [...plan.tiles[index].quad, ...plan.tiles[index].uv].map(Math.fround));
+      assert.deepEqual([...uniforms.subarray(8, 16)], [...plan.tiles[index].quad, ...plan.tiles[index].uv].map(Math.fround));
     }
     const shader = renderer.rasterPipeline.descriptor.vertex.module.code;
     assert.match(shader, /select\(uRaster\.quad\.xy, uRaster\.quad\.zw, farCorner\)/, "corners select exact shared edges");

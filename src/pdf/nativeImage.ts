@@ -549,7 +549,10 @@ export class NativePdfImageRegistry {
               }
             });
           }
-          const samples = unpackImageSamples(
+          const packedGray = imageMask ? null : convertPackedGray1(
+            normalizedBytes, width, height, 1, 1, decode, colorKeyMask, colorSpaceIndex, this.colors, signal
+          );
+          const samples = packedGray ? new Uint8Array(0) : unpackImageSamples(
             normalizedBytes,
             width,
             height,
@@ -557,7 +560,10 @@ export class NativePdfImageRegistry {
             1,
             signal
           );
-          if (imageMask) {
+          if (packedGray) {
+            data = packedGray;
+            format = HEPR_IMAGE_FORMAT.Gray1;
+          } else if (imageMask) {
             data = convertStencilMask(samples, decode, 1, signal);
             format = HEPR_IMAGE_FORMAT.Gray8;
           } else {
@@ -726,7 +732,11 @@ export class NativePdfImageRegistry {
               }
             });
           }
-          const decodedSamples = unpackImageSamples(
+          const packedGray = imageMask || embeddedSoftMask.value !== 0 ? null : convertPackedGray1(
+            resolved.samples, decodedWidth, decodedHeight, resolved.components, resolved.bitsPerComponent,
+            decode, colorKeyMask, colorSpaceIndex, this.colors, signal
+          );
+          const decodedSamples = packedGray ? new Uint8Array(0) : unpackImageSamples(
             resolved.samples,
             decodedWidth,
             decodedHeight,
@@ -734,7 +744,10 @@ export class NativePdfImageRegistry {
             resolved.bitsPerComponent,
             signal
           );
-          if (imageMask) {
+          if (packedGray) {
+            data = packedGray;
+            format = HEPR_IMAGE_FORMAT.Gray1;
+          } else if (imageMask) {
             data = convertStencilMask(
               decodedSamples,
               decode,
@@ -797,7 +810,11 @@ export class NativePdfImageRegistry {
         bitsPerComponent
       );
       const decoded = await this.document.decodeStream(value, signal);
-      const samples = unpackImageSamples(
+      const packedGray = imageMask ? null : convertPackedGray1(
+        decoded, width, height, componentCount, bitsPerComponent,
+        decode, colorKeyMask, colorSpaceIndex, this.colors, signal
+      );
+      const samples = packedGray ? new Uint8Array(0) : unpackImageSamples(
         decoded,
         width,
         height,
@@ -805,7 +822,10 @@ export class NativePdfImageRegistry {
         bitsPerComponent,
         signal
       );
-      if (imageMask) {
+      if (packedGray) {
+        data = packedGray;
+        format = HEPR_IMAGE_FORMAT.Gray1;
+      } else if (imageMask) {
         data = convertStencilMask(samples, decode, bitsPerComponent, signal);
         format = HEPR_IMAGE_FORMAT.Gray8;
       } else {
@@ -1311,6 +1331,31 @@ function convertStencilMask(
   for (let index = 0; index < samples.length; index += 1) {
     if ((index & 0xffff) === 0) throwIfAborted(signal);
     output[index] = coverage[samples[index]];
+  }
+  return output;
+}
+
+/** Keep exact binary DeviceGray images packed instead of allocating samples and RGBA. */
+function convertPackedGray1(
+  source: Uint8Array, width: number, height: number, components: number, bitsPerComponent: number,
+  decode: readonly number[], colorKeyMask: readonly number[], colorSpaceIndex: number,
+  colors: NativePdfColorRegistry, signal?: AbortSignal
+): Uint8Array | null {
+  if (components !== 1 || bitsPerComponent !== 1 || width * height < 256 || colorKeyMask.length ||
+      colorSpaceIndex < 0 || colors.describe(colorSpaceIndex).kind !== "DeviceGray" || decode.length !== 2) return null;
+  const zero = clamp01(decode[0]), one = clamp01(decode[1]);
+  if (!((zero === 0 && one === 1) || (zero === 1 && one === 0))) return null;
+  const rowBytes = Math.ceil(width / 8);
+  if (source.length !== rowBytes * height) return null;
+  const output = allocateBytes(source.length, "packed grayscale image output");
+  for (let y = 0; y < height; y++) {
+    throwIfAborted(signal);
+    for (let x = 0; x < rowBytes; x++) {
+      const offset = y * rowBytes + x;
+      output[offset] = zero === 0 ? source[offset] : source[offset] ^ 255;
+    }
+    // Padding is outside the image and never participates in filtering.
+    if (width & 7) output[(y + 1) * rowBytes - 1] &= 255 << (8 - (width & 7));
   }
   return output;
 }

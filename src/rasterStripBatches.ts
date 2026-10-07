@@ -1,4 +1,5 @@
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
+import { detectMonochromeRaster } from "./monochromeRaster";
 
 export interface RasterStripBatch {
   first: number;
@@ -71,8 +72,9 @@ export function buildRasterStripBatches(
 }
 
 function isStrip(source: RasterLayer | undefined, maxWidth: number): source is RasterLayer {
-  return !!source && source.height === 1 && Number.isInteger(source.width) && source.width > 0 &&
+  return !!source && !source.monochrome && source.height === 1 && Number.isInteger(source.width) && source.width > 0 &&
     source.width <= maxWidth && source.data instanceof Uint8Array && source.data.length >= source.width * 4 &&
+    !detectMonochromeRaster(source.data, source.width, source.height) &&
     source.matrix instanceof Float32Array && source.matrix.length >= 6 &&
     source.matrix.subarray(0, 6).every(Number.isFinite) &&
     Number.isFinite(source.opacity ?? 1) && (source.opacity ?? 1) >= 0 && (source.opacity ?? 1) <= 1;
