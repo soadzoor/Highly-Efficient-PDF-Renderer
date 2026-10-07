@@ -22,7 +22,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /const\s+pageScenes\s*=\s*await\s+[A-Za-z_$][\w$]*\s*\([\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
+  /pageScenes\s*=\s*await\s+extractPdfPageScenes\s*\([\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
   "any PDF parser must feed the established VectorScene composition pipeline"
 );
 assert.match(
@@ -32,14 +32,17 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildHep\s*\(\s*scene\s*,\s*\{/,
+  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildHep\s*\(\s*scene\s*,\s*buildOptions\s*\)/,
   "HEP export must serialize the already-loaded VectorScene"
 );
 assert.doesNotMatch(
   readFunctionBody(mainSource, "downloadHep"),
   /\bopenPdf\b|\bparsePdf\b|\bcompilePdfForBatchExport\b/,
-  "HEP export must not parse the source PDF a second time or switch data models"
+  "HEP export must use the shared builder instead of an independent parser"
 );
+assert.match(mainSource, /pageScenes\s*=\s*candidate\.pageScenes/, "large PDFs compose metadata-backed page windows");
+assert.match(readFunctionBody(mainSource, "downloadHep"), /activePdfPageLoader[\s\S]*?buildHep\(lastLoadedSource\.bytes/,
+  "export from a partial page window must compile the complete original PDF");
 assert.doesNotMatch(
   mainSource,
   /\brenderHeprPageToCanvas2d\b/,

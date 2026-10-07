@@ -19,6 +19,10 @@ fn heprMonochromeBilinear(uv : vec2f, size : vec2i) -> f32 {
 }
 
 fn heprMonochromeColor(uv : vec2f, uvDx : vec2f, uvDy : vec2f) -> vec4f {
+  if (uRaster.matrixB.w < 0.0) {
+    let coverage = textureSampleGrad(uRasterTex, uRasterSampler, uv, uvDx, uvDy).r;
+    return mix(uRaster.zeroColor, uRaster.oneColor, coverage);
+  }
   let size = vec2i(i32(uRaster.matrixB.w), i32(textureDimensions(uRasterTex).y));
   let footprint = max(length(uvDx * vec2f(size)), length(uvDy * vec2f(size)));
   let lod = max(log2(max(footprint, 1.0)), 0.0);

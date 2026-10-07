@@ -258,8 +258,7 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
     const decoded = decodeTextGlyphSegments(encoded.bytes, encoded.meta);
     return { textGlyphSegmentsA: decoded.segmentsA, textGlyphSegmentsB: decoded.segmentsB };
   };
-  const prepared = optimizeVectorSceneTextGlyphs({
-    ...scene,
+  const prepared = optimizeVectorSceneTextGlyphs(Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)), {
     ...strokes,
     ...(scene.textGlyphSegmentCount > 0 ? quantizeGlyphSegments() : {}),
     // HEP v8 rounds clip endpoints too; use the same grid after page layout.
@@ -277,7 +276,7 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
         fallbackQuads: quantizePositions(page.fallbackQuads, page.fallbackQuads.length / 4, 4)
       }))
     } : null
-  });
+  }) as VectorScene);
   if (encodedStrokes) {
     preparedStrokeGeometry.set(prepared, encodedStrokes);
   }

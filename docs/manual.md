@@ -106,6 +106,21 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
+The standalone canvas viewer opens PDFs with more than 16 pages from page
+metadata, then loads pages near the current viewport in one worker. Overview
+previews use a longest edge of at most 96 pixels. Detailed page content is
+compiled when a page occupies more than 256 screen pixels, with at most 12
+detailed pages cached and a further limit based on estimated CPU payload bytes.
+Evicted pages regenerate as you navigate. Unloaded pages retain their outlines
+and positions. Search progressively loads preview text for the rest of the
+document; explicit HEP export compiles the complete original PDF.
+
+This page cache belongs to the standalone viewer. `pdfObjectGenerator`, extraction
+APIs and HEP conversion still produce complete scenes for their selected pages.
+All GPU integrations allocate small raster display tiers first and increase
+their resolution automatically with zoom. CPU canonical image data stays available
+for refinement; reducing GPU textures alone does not reduce eager parsing memory.
+
 ## Rendering and level of detail
 
 The three.js object follows your camera and synchronizes itself during normal

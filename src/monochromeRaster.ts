@@ -1,5 +1,5 @@
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
-import type { RasterTile } from "./rasterTiles";
+import type { RasterTile, RasterTilePlan } from "./rasterTiles";
 import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
 import { throwIfAborted } from "./pdf/nativeTypes";
 
@@ -105,6 +105,60 @@ export function restoreMonochromeSceneTransfer(scene: VectorScene): VectorScene 
 
 function dataDescriptor(value: unknown): PropertyDescriptor {
   return { value, enumerable: true, configurable: true, writable: true };
+}
+
+const BIT_COUNTS = Uint8Array.from({ length: 256 }, (_, value) => {
+  let count = 0;
+  for (; value; value &= value - 1) count++;
+  return count;
+});
+
+/** Generate only the requested coverage resolution, without RGBA or larger mip intermediates. */
+export function resampleMonochromeCoverage(source: MonochromeRaster, width: number, height: number,
+  outWidth: number, outHeight: number): Uint8Array {
+  const stride = validateMonochromeRaster(source, width, height);
+  if (!validDimensions(outWidth, outHeight) || outWidth > width || outHeight > height) {
+    throw new RangeError("Monochrome coverage dimensions must fit the source.");
+  }
+  const out = new Uint8Array(outWidth * outHeight);
+  const prefix = new Uint32Array(stride + 1), sums = new Float64Array(outWidth);
+  const scaleX = width / outWidth, scaleY = height / outHeight, area = scaleX * scaleY;
+  for (let targetY = 0; targetY < outHeight; targetY++) {
+    sums.fill(0);
+    const top = targetY * scaleY, bottom = (targetY + 1) * scaleY;
+    for (let y = Math.floor(top); y < Math.min(height, Math.ceil(bottom)); y++) {
+      const row = y * stride;
+      for (let byte = 0; byte < stride; byte++) prefix[byte + 1] = prefix[byte] + BIT_COUNTS[source.data[row + byte]];
+      const weightY = Math.min(bottom, y + 1) - Math.max(top, y);
+      // Prefix counts integrate entire bytes; only the two fractional cell edges read individual bits.
+      const before = (position: number): number => {
+        const whole = Math.floor(Math.min(width, position)), byte = whole >> 3, bits = whole & 7;
+        const value = source.data[row + byte] ?? 0;
+        return prefix[byte] + (bits ? BIT_COUNTS[value >>> (8 - bits)] : 0) +
+          (position - whole) * ((value >>> (7 - bits)) & 1);
+      };
+      for (let x = 0; x < outWidth; x++) {
+        sums[x] += (before((x + 1) * scaleX) - before(x * scaleX)) * weightY;
+      }
+    }
+    for (let x = 0; x < outWidth; x++) out[targetY * outWidth + x] = Math.round(sums[x] * 255 / area);
+  }
+  return out;
+}
+
+/** R8 display tiles retain the canonical image's placement and palette. */
+export function monochromeCoverageTilePixels(source: MonochromeRaster, width: number, height: number,
+  plan: RasterTilePlan): Uint8Array[] {
+  const coverage = resampleMonochromeCoverage(source, width, height, plan.width, plan.height);
+  return plan.tiles.map(tile => {
+    if (tile.width === plan.width && tile.height === plan.height) return coverage;
+    const data = new Uint8Array(tile.width * tile.height);
+    for (let y = 0; y < tile.height; y++) {
+      const start = (tile.y + y) * plan.width + tile.x;
+      data.set(coverage.subarray(start, start + tile.width), y * tile.width);
+    }
+    return data;
+  });
 }
 
 /** Recover packed storage from legacy RGBA images with at most two exact colors. */

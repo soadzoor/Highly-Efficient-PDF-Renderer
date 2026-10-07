@@ -22,6 +22,7 @@ const context = vm.createContext({
   waitForLoad, createLoadProgressReporter,
   loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
   sourceLoadController: null, activeHepExportController: null,
+  activePdfPageLoader: null, lastPdfDemandViewUpdate: -Infinity, demandPdfUpdatePending: false,
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
   lastParsedSceneLabel: null, parsedPdfPageCache: null,
   exampleManifestEntries: [], exampleSelectionMap: new Map(),
@@ -38,6 +39,8 @@ const context = vm.createContext({
   logSegmentMergeStats: noop, logInvisibleCullStats: noop, logTextVectorStats: noop,
   logTextureSizeStats: noop, applyTextSearchScene: noop, refreshDropIndicator: noop,
   updateMetricsPanel: noop,
+  scheduleDemandPdfUpdate: noop, textSearchWidget: { setAvailability: noop },
+  openPdfPageDemand: async () => ({ pageCount: 1, close: async () => {} }),
   extractPdfPageScenes: (buffer, options, signal) => nextParse(buffer, options, signal),
   loadSceneFromHep: async (buffer, options) => (await nextParse(buffer, {}, options.signal))[0],
   computeAutoPagesPerRow: () => 1,
@@ -146,6 +149,21 @@ assert.equal(exports.at(-1).source, undefined);
 assert.equal(context.pendingSourceLoadCount, 0);
 assert.equal(context.activeSceneLoadToken, null);
 assert.equal(context.sourceLoadController, null);
+// A page window exports the original document, never just its currently cached pages.
+let demandClosed = false, demandPaused = false;
+const demand = { pageCount: 17, pageScenes: [{ ...scene(73), segmentCount: 0 }], password: "secret",
+  pause() { demandPaused = true; }, resume() { demandPaused = false; }, async close() { demandClosed = true; } };
+context.openPdfPageDemand = async () => demand;
+await context.loadPdfFile(file("paged.pdf", 73));
+assertDocument(73, "paged.pdf");
+assert.equal(context.activePdfPageLoader, demand);
+assert.equal(context.parsedPdfPageCache, null, "partial windows are not mistaken for complete parsed documents");
+assert.equal(await context.downloadHep(), true);
+assert.equal(exports.at(-1).scene[0], 73, "paged export supplies complete source bytes to the shared builder");
+assert.equal(demandPaused, false, "export resumes demand-driven loading");
+await context.loadHepFile(file("replacement.hep", 74));
+assert.equal(context.activePdfPageLoader, null);
+assert.equal(demandClosed, true, "document replacement closes the paging worker");
 await testThreeDocumentReplacement();
 await testThreeBackendReplacement();
 await testRoomDocumentReplacement();

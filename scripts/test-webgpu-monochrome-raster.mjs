@@ -59,8 +59,9 @@ try {
     assert.equal(regular.bindGroup.entries.find(entry => entry.binding === 4).resource.texture, regular.texture);
     assert.equal(regular.coverageTexture, undefined, "ordinary images reuse their texture binding");
     const shader = renderer.rasterPipeline.descriptor.fragment.module.code;
-    assert(shader.indexOf("let uvDx = dpdx(inData.uv)") < shader.indexOf("if (uRaster.matrixB.w"),
-      "derivatives are evaluated before the packed-image branch");
+    const fragment = shader.slice(shader.indexOf("@fragment"));
+    assert(fragment.indexOf("let uvDx = dpdx(inData.uv)") < fragment.indexOf("if (uRaster.matrixB.w"),
+      "derivatives are evaluated before the image-mode branch in the fragment entry point");
     assert.match(shader, /textureLoad\(uRasterTex, vec2i\(p\.x \/ 8, p\.y\), 0\)/);
     assert.match(shader, /textureSampleLevel\(uRasterCoverageTex, uRasterSampler, uv, lod - 1\.0\)/);
     assert.match(shader, /imageColor \* uRaster\.matrixB\.z/);

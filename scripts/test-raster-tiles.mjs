@@ -223,7 +223,10 @@ try {
       pageBackground: [1, 1, 1, 1] });
     const entry = layer.rasterEntries[0];
     assert.equal(entry.image.tiles.length, 0, "before a host reports its limit, images stay whole");
-    assert.equal(layer.getMaxRasterTextureDimension(), 150);
+    assert.equal(layer.getMaxRasterTextureDimension(), 75, "initial textures use the preview tier");
+    layer.setTextureResidency(true);
+    layer.updateFrame({ cameraCenterX: 10, cameraCenterY: 8, zoom: 16 }, { width: 400, height: 400 });
+    assert.equal(layer.getMaxRasterTextureDimension(), 150, "zoom requests original resolution before device tiling");
     const whole = entry.texture;
     let disposed = 0;
     whole.addEventListener("dispose", () => disposed++);
@@ -288,7 +291,12 @@ try {
     const canonical = scene.rasterLayers[0].data;
     const createLayer = memory => {
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: { deviceMemory: memory } });
-      return new ThreeMaterialRasterLayer(scene, { pageBackground: [1, 1, 1, 1] });
+      const layer = new ThreeMaterialRasterLayer(scene, { pageBackground: [1, 1, 1, 1] });
+      assert(layer.rasterEntries.every(entry => entry.texture.image.width === 128), "all devices begin with previews");
+      layer.setTextureResidency(true);
+      for (let index = 0; index < scene.rasterLayers.length; index++) layer.updateFrame(
+        { cameraCenterX: 50, cameraCenterY: -500, zoom: 16 }, { width: 2048, height: 2048 });
+      return layer;
     };
     let low, high;
     try {

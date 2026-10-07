@@ -19,6 +19,11 @@ export interface AutomaticRasterMemoryBudget {
 export interface RasterMemorySource {
   readonly width: number;
   readonly height: number;
+  /** Screen-dependent upper bound; canonical source dimensions remain unchanged. */
+  readonly displayWidth?: number;
+  readonly displayHeight?: number;
+  /** Native packed sources use averaged R8 coverage when their display tier is smaller. */
+  readonly reducedMonochrome?: boolean;
   /** Presence identifies packed binary data; planning never reads the raster's pixels. */
   readonly monochrome?: unknown;
   /** Content assessment opts an ordinary opaque image into optional GPU compression. */
@@ -63,35 +68,45 @@ export function automaticRasterMemoryBudget(): AutomaticRasterMemoryBudget {
 
 /** Logical texture bytes, including every uploaded mip; driver allocation overhead is unknown. */
 export function estimateRasterTextureBytes(
-  width: number, height: number, packedMonochrome: boolean, compressionFormat?: RasterCompressionFormat | null
+  width: number, height: number, packedMonochrome: boolean, compressionFormat?: RasterCompressionFormat | null,
+  singleChannel = false
 ): number {
   validateDimensions(width, height);
   if (!packedMonochrome && compressionFormat) return estimateCompressedRasterBytes(width, height, compressionFormat);
   let levelWidth = width;
   let levelHeight = height;
-  let bytes = packedMonochrome ? Math.ceil(levelWidth / 8) * levelHeight : levelWidth * levelHeight * 4;
+  const channels = packedMonochrome || singleChannel ? 1 : 4;
+  let bytes = packedMonochrome ? Math.ceil(levelWidth / 8) * levelHeight : levelWidth * levelHeight * channels;
   // The packed shader still binds a complete coverage sampler for an image with no reduced mip level.
   if (packedMonochrome && width === 1 && height === 1) return bytes + 1;
   while (levelWidth > 1 || levelHeight > 1) {
     levelWidth = Math.max(1, Math.floor(levelWidth / 2));
     levelHeight = Math.max(1, Math.floor(levelHeight / 2));
-    bytes += levelWidth * levelHeight * (packedMonochrome ? 1 : 4);
+    bytes += levelWidth * levelHeight * channels;
   }
   return bytes;
 }
 
 /** Tile rectangles already include neighboring-image gutters, so overlaps are charged repeatedly. */
 export function estimateRasterTilePlanBytes(
-  plan: RasterTilePlan, packedMonochrome: boolean, compressionFormat?: RasterCompressionFormat | null
+  plan: RasterTilePlan, packedMonochrome: boolean, compressionFormat?: RasterCompressionFormat | null,
+  singleChannel = false
 ): number {
   return plan.tiles.reduce((bytes, tile) =>
-    bytes + estimateRasterTextureBytes(tile.width, tile.height, packedMonochrome, compressionFormat), 0);
+    bytes + estimateRasterTextureBytes(tile.width, tile.height, packedMonochrome, compressionFormat, singleChannel), 0);
+}
+
+/** Charge the representation actually uploaded at this display resolution. */
+export function estimateRasterSourcePlanBytes(source: RasterMemorySource, plan: RasterTilePlan,
+  format?: RasterCompressionFormat | null): number {
+  const packed = !!source.monochrome && !isRasterTilePlanDownscaled(source, plan);
+  return estimateRasterTilePlanBytes(plan, packed, format, !!source.monochrome && !!source.reducedMonochrome && !packed);
 }
 
 /**
- * Fit aggregate scene demand before GPU allocation. Packed images that fit the
- * device keep their exact dimensions; ordinary RGBA images share a resolution
- * scale. Eligible images try block compression before resolution reduction.
+ * Fit aggregate display demand before GPU allocation. Screen-sized requests share
+ * a resolution scale, including binary images. Legacy requests without display
+ * bounds preserve fitting packed images. Eligible images try compression first.
  * `availableBytes` is an internal reservation, never a required user setting.
  */
 export function planSceneRasterMemory(
@@ -106,12 +121,16 @@ export function planSceneRasterMemory(
     : Math.max(0, Math.min(budget.bytes, Math.floor(availableBytes)));
   const originalPlans = sources.map(source => {
     validateDimensions(source.width, source.height);
-    return planRasterTiles(source.width, source.height, maxTextureSize);
+    const width = source.displayWidth === undefined ? source.width : Math.max(1, Math.min(source.width, Math.floor(source.displayWidth)));
+    const height = source.displayHeight === undefined ? source.height : Math.max(1, Math.min(source.height, Math.floor(source.displayHeight)));
+    validateDimensions(width, height);
+    return planRasterTiles(width, height, maxTextureSize);
   });
-  const packed = sources.map((source, index) => !!source.monochrome && !isRasterTilePlanDownscaled(source, originalPlans[index]));
+  const packed = sources.map((source, index) => !!source.monochrome && source.displayWidth === undefined &&
+    !isRasterTilePlanDownscaled(source, originalPlans[index]));
   const copies = sources.map(source => Number.isFinite(source.allocationCopies) && source.allocationCopies! >= 1
     ? Math.ceil(source.allocationCopies!) : 1);
-  const costs = originalPlans.map((plan, index) => estimateRasterTilePlanBytes(plan, packed[index]) * copies[index]);
+  const costs = originalPlans.map((plan, index) => estimateRasterSourcePlanBytes(sources[index], plan) * copies[index]);
   const unscaledBytes = costs.reduce((sum, cost) => sum + cost, 0);
   const protectedBytes = costs.reduce((sum, cost, index) => sum + (packed[index] ? cost : 0), 0);
   const result = (
@@ -132,7 +151,7 @@ export function planSceneRasterMemory(
         ? compressionFormat : null;
     });
     const bytes = plans.reduce((sum, plan, index) => sum + (packed[index] ? costs[index] :
-      estimateRasterTilePlanBytes(plan, false, compressionFormats[index]) * copies[index]), 0);
+      estimateRasterSourcePlanBytes(sources[index], plan, compressionFormats[index]) * copies[index]), 0);
     return { plans, bytes, compressionFormats };
   };
   const compressed = price(originalPlans);
@@ -184,6 +203,6 @@ export function reportRasterMemoryBudget(plan: SceneRasterMemoryPlan, owner?: ob
   console.warn(`[HEPR] Raster GPU demand is estimated at ${Math.ceil(plan.unscaledBytes / MIB)} MiB; ` +
     `the automatic resident raster target is ${Math.ceil(plan.availableBytes / MIB)} MiB, estimated from ${origin}, not measured VRAM. ` +
     (compressedCount ? `Using ${plan.compressionFormats.find(Boolean)} GPU compression for ${compressedCount} eligible raster(s). ` : "") +
-    (plan.resolutionScale < 1 ? `Drawing RGBA rasters at reduced resolution (${Math.ceil(plan.estimatedBytes / MIB)} MiB estimated). ` : "") +
+    (plan.resolutionScale < 1 ? `Drawing rasters at reduced resolution (${Math.ceil(plan.estimatedBytes / MIB)} MiB estimated). ` : "") +
     (plan.overBudget ? "Keeping lossless packed rasters and minimum textures even though they exceed this heuristic target." : ""));
 }

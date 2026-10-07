@@ -137,6 +137,15 @@ try {
   try {
     assert.equal((await simple.compileVectorPage(0)).rasterLayers.length, 0, "supported pages remain vectors");
     assert.equal(simple.getDiagnostics().length, 0);
+    const preview = await simple.compileVectorPage(0, { previewMaxDimension: 16 });
+    assert.equal(preview.rasterLayerWidth, 16);
+    assert.equal(preview.rasterLayerHeight, 8);
+    assert.equal(preview.fillPathCount, 0, "overview vectors become a bounded preview");
+    assert(!preview.retainedPages?.length, "previews do not retain full decoded replay resources");
+    assert(simple.getDiagnostics().some(d => d.code === "page-preview"));
+    assert.equal((await simple.compileVectorPage(0)).fillPathCount, 1, "detail compiles accurate vectors again");
+    for (const previewMaxDimension of [15, 4097, NaN, 16.5]) await assert.rejects(
+      simple.compileVectorPage(0, { previewMaxDimension }), RangeError);
   } finally { await simple.close(); }
 
   const bounded = await openPdf({ kind: "bytes", bytes: fallbackAnnotation });
@@ -217,6 +226,12 @@ try {
     for (let i = 0; i < 2; i += 1) cases[0][2](await worker.compileVectorPage(0));
     assert.ok(diagnostics.some(d => d.code === "page-raster-fallback"));
     assert.ok(worker.getDiagnostics().some(d => d.code === "page-raster-fallback"));
+    const preview = await worker.compileVectorPage(0, { previewMaxDimension: 16 });
+    assert(preview.rasterLayerWidth <= 16 && preview.rasterLayerHeight <= 16,
+      "worker fallback honors overview dimensions before generating or transferring pixels");
+    assert(!preview.retainedPages?.length);
+    assertPixel(preview, 15, 10, [255, 0, 0, 255]);
+    cases[0][2](await worker.compileVectorPage(0));
   } finally { await worker.close(); }
 } finally { hooks.deregister(); }
 

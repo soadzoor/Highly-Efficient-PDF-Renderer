@@ -26,6 +26,7 @@ import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
 import { buildHep } from "./hepBuilder";
 import { loadSceneFromHep } from "./hepReader";
+import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
 import { listSceneRasterLayers, prepareSceneForHepRendering } from "./hepShared";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
@@ -221,6 +222,11 @@ const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
 let webGpuRendererClass: typeof import("./webGpuFloorplanRenderer").WebGpuFloorplanRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
+let activePdfPageLoader: PdfPageDemandLoader | null = null;
+let demandPdfUpdateTimer: number | null = null;
+let demandPdfUpdateRunning = false;
+let demandPdfUpdatePending = false;
+let lastPdfDemandViewUpdate = -Infinity;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
@@ -256,7 +262,10 @@ const textSearchWidget = createTextSearchWidget(
     countLabel: textSearchCount
   },
   {
-    onQueryInput: (query) => textSearchController.setQuery(query),
+    onQueryInput: (query) => {
+      if (query.trim()) activePdfPageLoader?.requestAllPreviews();
+      textSearchController.setQuery(query);
+    },
     onNext: () => textSearchController.next(),
     onPrev: () => textSearchController.prev(),
     onCaseToggle: (enabled) => textSearchController.setCaseSensitive(enabled),
@@ -429,6 +438,11 @@ annotationInteraction = createAnnotationInteractionController({
 let lastRuntimeTextUpdate = -Infinity;
 function onRendererFrame(stats: DrawStats): void {
   const now = performance.now();
+  if (activePdfPageLoader && lastParsedScene && activeSceneLoadToken === null &&
+      pendingSourceLoadCount === 0 && activeHepExportController === null && now - lastPdfDemandViewUpdate >= 100) {
+    lastPdfDemandViewUpdate = now;
+    activePdfPageLoader.update({ ...renderer.getPresentedViewState(), width: canvasElement.width, height: canvasElement.height }, lastParsedScene.pageRects);
+  }
   updateFpsMetric(now);
   drawCallMeter.update(stats.drawCalls);
   textSelection.updateOverlay();
@@ -456,6 +470,41 @@ function onRendererFrame(stats: DrawStats): void {
   const paintOrderSuffix = stats.paintOrderApproximated ? " | paint order: held" : "";
   runtimeTextElement.textContent =
     `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}${redundancySuffix}${paintOrderSuffix}`;
+}
+
+/** Coalesce worker completions, preserving navigation while replacing the bounded page window. */
+function scheduleDemandPdfUpdate(): void {
+  demandPdfUpdatePending = true;
+  if (demandPdfUpdateTimer !== null || demandPdfUpdateRunning) return;
+  demandPdfUpdateTimer = window.setTimeout(() => {
+    demandPdfUpdateTimer = null;
+    const loader = activePdfPageLoader;
+    if (!loader || activePdfPageLoader !== loader || activeSceneLoadToken !== null ||
+        pendingSourceLoadCount > 0 || activeHepExportController !== null) return;
+    demandPdfUpdatePending = false;
+    demandPdfUpdateRunning = true;
+    void backendSwitcher!.runWhenIdle(async () => {
+      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || activeHepExportController !== null) {
+        demandPdfUpdatePending = true; return;
+      }
+      const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, computeAutoPagesPerRow(loader.pageCount)));
+      const started = performance.now();
+      const stats = uploadSceneWithRollback(renderer, scene, true);
+      lastParsedScene = scene;
+      await layerVisibility.sceneChanged(true);
+      if (activePdfPageLoader !== loader || lastParsedScene !== scene) return;
+      applyTextSearchScene(scene);
+      textSearchWidget.setAvailability("ready");
+      updateMetricsPanel(lastParsedSceneLabel ?? "PDF", scene, stats, 0, performance.now() - started, null, null);
+      setStatus(`${loader.previewCount.toLocaleString()}/${loader.pageCount.toLocaleString()} page previews; ${loader.detailedCount} detailed pages cached. Pages load as you navigate.`);
+    }).catch(error => {
+      if (activePdfPageLoader === loader) setStatus(`Page display update failed: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      demandPdfUpdateRunning = false;
+      if (demandPdfUpdatePending && activePdfPageLoader && activeSceneLoadToken === null &&
+          pendingSourceLoadCount === 0 && activeHepExportController === null) scheduleDemandPdfUpdate();
+    });
+  }, 100);
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
@@ -1054,6 +1103,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       updateParsingLoaderProgress(payload);
     }
   });
+  let demandLoader: PdfPageDemandLoader | null = null;
 
   try {
     let scene: VectorScene;
@@ -1078,11 +1128,20 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       setStatus(
         `Parsing ${label}... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
-      const pageScenes = await extractPdfPageScenes(buffer, {
-        ...extractionOptions,
-        password: options.password,
-        onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
-      }, options.signal);
+      const candidate = await openPdfPageDemand(buffer, { ...extractionOptions, password: options.password },
+        scheduleDemandPdfUpdate, options.signal);
+      let pageScenes: VectorScene[];
+      if (candidate.pageCount > 16) {
+        demandLoader = candidate;
+        pageScenes = candidate.pageScenes;
+      } else {
+        await candidate.close();
+        pageScenes = await extractPdfPageScenes(buffer, {
+          ...extractionOptions,
+          password: options.password,
+          onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
+        }, options.signal);
+      }
       parseMs = performance.now() - parseStart;
 
       if (activeLoadToken === loadToken) {
@@ -1095,7 +1154,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
       const pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
       scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
-      parsedPages = pageScenes;
+      parsedPages = demandLoader ? null : pageScenes;
       console.log(
         `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
       );
@@ -1108,7 +1167,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     scene = prepareSceneForHepRendering(scene);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
+    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer && !demandLoader) {
       setParsingLoader(false);
       setStatus(`No visible geometry was extracted from ${label}.`);
       return;
@@ -1154,8 +1213,15 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedScene = scene;
     lastParsedSceneLabel = label;
     commitLoadedSource(options);
+    const previousPageLoader = activePdfPageLoader;
+    activePdfPageLoader = demandLoader;
+    demandLoader = null;
+    lastPdfDemandViewUpdate = -Infinity;
+    void previousPageLoader?.close();
+    if (activePdfPageLoader) parsedPdfPageCache = null;
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
     applyTextSearchScene(scene);
+    if (activePdfPageLoader) textSearchWidget.setAvailability("ready");
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
@@ -1172,6 +1238,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to render PDF: ${message}`);
   } finally {
+    await demandLoader?.close();
     finishSceneLoad(activeLoadToken);
   }
 }
@@ -1261,6 +1328,9 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedScene = scene;
     lastParsedSceneLabel = label;
     commitLoadedSource(options);
+    const previousPageLoader = activePdfPageLoader;
+    activePdfPageLoader = null;
+    void previousPageLoader?.close();
     parsedPdfPageCache = null;
     applyTextSearchScene(scene);
     refreshDropIndicator();
@@ -1471,6 +1541,13 @@ function updateBackendSelectDisabledState(): void {
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
     activeHepExportController !== null;
+  if (activePdfPageLoader) {
+    if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null) activePdfPageLoader.pause();
+    else {
+      activePdfPageLoader.resume();
+      if (demandPdfUpdatePending) scheduleDemandPdfUpdate();
+    }
+  }
 }
 
 function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
@@ -1728,16 +1805,21 @@ async function downloadHep(): Promise<boolean> {
       return false;
     }
     await yieldToBrowserPaint();
-    const hepBlob = await buildHep(scene, {
+    const buildOptions = {
       ...lodOptions,
       sourceLabel: label,
       signal: exportController.signal,
-      onProgress: (progress) => {
+      onProgress: (progress: import("./loadProgress").PDFLoadProgress) => {
         if (activeHepExportController === exportController) {
           updateParsingLoaderProgress(progress);
         }
       }
-    });
+    };
+    // A page window is incomplete; explicit export always compiles the complete original PDF.
+    const hepBlob = activePdfPageLoader && lastLoadedSource?.kind === "pdf"
+      ? await buildHep(lastLoadedSource.bytes, { ...buildOptions, password: activePdfPageLoader.password,
+        maxPagesPerRow: scene.pagesPerRow })
+      : await buildHep(scene, buildOptions);
 
     if (activeHepExportController !== exportController) {
       return false;

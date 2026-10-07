@@ -219,6 +219,8 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Worker-owned bounded overview; full page scenes are compiled separately when visible in detail. */
+  readonly previewMaxDimension?: number;
   /** Internal capability probes can require direct vector output. Normal loading falls back to pixels. */
   readonly vectorFallback?: "raster" | "error";
   /** Internal compatibility retry for features still using the grouped bridge. */
@@ -520,12 +522,24 @@ class NativePdfSession implements NativeVectorPdfSession {
     options: NativeVectorCompileOptions = {}
   ): Promise<VectorScene> {
     validateAnnotationAppearanceMode(options.annotationAppearances);
+    if (options.previewMaxDimension !== undefined && (!Number.isSafeInteger(options.previewMaxDimension) ||
+        options.previewMaxDimension < 16 || options.previewMaxDimension > 4096)) {
+      throw new RangeError("Page preview dimensions must be integers from 16 through 4096.");
+    }
     const operation = new AbortController();
     const signal = combineSignals(this.lifetime.signal, operation.signal, options.signal);
     let release: (() => void) | null = null;
     try {
       release = await this.acquireOperation(signal);
-      return await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
+      const scene = await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
+      if (options.previewMaxDimension === undefined) return scene;
+      if (scene.segmentCount === 0 && scene.fillPathCount === 0 && scene.textInstanceCount === 0 &&
+          (scene.gradientFillPathCount ?? 0) === 0 && (scene.gradientStrokeRunCount ?? 0) === 0 && !scene.retainedPages?.length) {
+        const { buildRasterScenePreview } = await import("./pageRasterPreview");
+        return buildRasterScenePreview(scene, options.previewMaxDimension);
+      }
+      return await this.compileRasterPageUnlocked(sourcePageIndex, { ...options, retainOptionalContent: false }, signal,
+        new Error("Bounded page overview"), options.previewMaxDimension);
     } catch (error) {
       throw normalizeAbortError(error, signal);
     } finally {
@@ -1270,7 +1284,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: NativeVectorCompileOptions,
     signal: AbortSignal,
-    reason: Error
+    reason: Error,
+    previewMaxDimension = options.previewMaxDimension
   ): Promise<VectorScene> {
     const page = await this.compilePageUnlocked(sourcePageIndex, options, signal);
     const limits = { ...this.document.limits, ...options.limits };
@@ -1280,7 +1295,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     const maxDimension = Math.min(16_384, limits.maxImageDimension);
     const { width, height } = page.pageInfo;
     let scale = Math.min(2, maxDimension / width, maxDimension / height,
-      Math.sqrt(maxPixels / (width * height)));
+      Math.sqrt(maxPixels / (width * height)),
+      previewMaxDimension === undefined ? Infinity : previewMaxDimension / Math.max(width, height));
     // Account for rounding each dimension up to an integer pixel.
     while (scale > 0 && Math.ceil(width * scale) * Math.ceil(height * scale) > maxPixels) scale *= 0.99;
     if (!(scale > 0)) throw new PdfError("resource-limit", "No pixel budget for page fallback.");
@@ -1312,7 +1328,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       if (count) {
         scene.optionalContent = options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined;
         if (scene.optionalContent && scene.textIndex) scene.optionalContent = await attachRetainedTextOptionalContent(page, scene.textIndex, scene.optionalContent, signal);
-        if (retainedReplayIsReachable(scene.optionalContent, page)) {
+        if (previewMaxDimension === undefined && retainedReplayIsReachable(scene.optionalContent, page)) {
           scene.retainedPages = [{ page,
             optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
             matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
@@ -1320,8 +1336,11 @@ class NativePdfSession implements NativeVectorPdfSession {
           scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count, rasterIndex: 0 }] };
         }
       }
-      onDiagnostic({ code: "page-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
-        message: "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable.",
+      onDiagnostic({ code: previewMaxDimension === undefined ? "page-raster-fallback" : "page-preview",
+        severity: previewMaxDimension === undefined ? "warning" : "info", pageIndex: sourcePageIndex,
+        message: previewMaxDimension === undefined
+          ? "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable."
+          : "This overview uses a bounded raster preview; detailed page content is compiled on demand.",
         details: { reason: reason.message, width: pixels.width, height: pixels.height, scale } });
       signal.throwIfAborted();
       return scene;

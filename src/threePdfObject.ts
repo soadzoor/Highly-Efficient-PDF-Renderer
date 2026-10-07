@@ -2674,6 +2674,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     if (
       viewportChanged ||
       presentedFrameSerial !== this.lastSyncedFrameSerial ||
+      this.rasterMaterialLayer.needsResolutionUpdate ||
       cameraDrivenMaterialPipelineEnabled
     ) {
       const viewState =

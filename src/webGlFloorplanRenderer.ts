@@ -17,9 +17,10 @@ import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./r
 import { buildRasterStripBatches } from "./rasterStripBatches";
 import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, type RasterTilePlan } from "./rasterTiles";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
-  reportRasterMemoryBudget } from "./rasterMemoryBudget";
+  estimateRasterSourcePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
+import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
 import { buildMonochromeMipChain, detectMonochromeRaster,
-  monochromeRasterTile, type MonochromeRaster } from "./monochromeRaster";
+  monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
 import { assessRasterCompression, selectRasterCompressionFormat, type RasterCompressionFormat } from "./rasterCompression";
 import { WebGlRasterCompression, MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES } from "./webGlRasterCompression";
@@ -282,13 +283,14 @@ type FrameListener = (stats: DrawStats) => void;
 interface RasterTileGpu {
   texture: WebGLTexture;
   compressionFormat?: RasterCompressionFormat;
-  monochrome?: { mipTexture: WebGLTexture; width: number; height: number; colors: Float32Array };
+  monochrome?: { mipTexture: WebGLTexture; width: number; height: number; colors: Float32Array; coverage?: boolean };
   /** This tile's part of the image's unit square and its texture coordinates; absent for a whole image. */
   quad?: Float32Array;
   uv?: Float32Array;
 }
 
 interface RasterLayerGpu extends RasterTileGpu {
+  rasterPlan: RasterTilePlan;
   /** Estimated logical texture bytes, including every tile and mip level. */
   estimatedBytes: number;
   opacity: number;
@@ -741,6 +743,9 @@ export class WebGlFloorplanRenderer {
   private textInstanceCount = 0;
 
   private rasterLayers: RasterLayerGpu[] = [];
+  private rasterResolutionPlanner: RasterResolutionPlanner | null = null;
+  private rasterResolutionView: RasterResolutionView | null = null;
+  private rasterResolutionSources: RasterLayerSource[] | null = null;
   private rasterStagedBytes = 0;
   private rasterCompression: WebGlRasterCompression | null = null;
 
@@ -1719,6 +1724,8 @@ export class WebGlFloorplanRenderer {
         this.destroyRasterStripBatches();
         this.destroyRasterAtlasBatches();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
+        this.rasterResolutionSources = null;
+        this.rasterResolutionPlanner?.invalidate();
         finished = true;
         this.destroyVectorMinifyResources(); this.requestFrame();
       },
@@ -1743,6 +1750,9 @@ export class WebGlFloorplanRenderer {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
     }
     if (this.scene !== scene) {
+      this.rasterResolutionPlanner = new RasterResolutionPlanner();
+      this.rasterResolutionView = null;
+      this.rasterResolutionSources = null;
       this.performanceProfiler?.stop();
       this.rasterLayerUpdates.clear();
       this.paintCompositor?.dispose(); this.paintCompositor = null;
@@ -2272,6 +2282,7 @@ export class WebGlFloorplanRenderer {
     this.updatePanReleaseVelocitySample(timestamp);
     const gl = this.gl;
     this.ensureRenderState();
+    this.updateRasterResolution();
     profile?.endSection("cameraAndState");
     profile?.setFrameContext({
       cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom,
@@ -3066,7 +3077,7 @@ export class WebGlFloorplanRenderer {
     this.bindOrderedTexture(12, tile.texture);
     // Unit 13 is shared with text through the ordinary ordered binding cache.
     this.bindOrderedTexture(13, tile.monochrome?.mipTexture ?? tile.texture);
-    gl.uniform1f(this.uRasterMonochrome, tile.monochrome ? 1 : 0);
+    gl.uniform1f(this.uRasterMonochrome, tile.monochrome ? tile.monochrome.coverage ? 2 : 1 : 0);
     gl.uniform1f(this.uRasterOpaque, tile.compressionFormat ? 1 : 0);
     if (tile.monochrome) {
       gl.uniform2f(this.uRasterMonoSize, tile.monochrome.width, tile.monochrome.height);
@@ -4781,6 +4792,7 @@ export class WebGlFloorplanRenderer {
   private uploadRasterLayers(scene: VectorScene): void {
     const canCompress = selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
     const rasterSources = this.getSceneRasterLayers(scene).map(source => this.classifyRasterLayerSource(source, canCompress));
+    this.rasterResolutionSources = rasterSources;
     const maxRasterTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
     this.destroyRasterLayerTextures();
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -4793,7 +4805,8 @@ export class WebGlFloorplanRenderer {
         // Atlases contain original RGBA pixels and cannot bypass a compressed
         // or reduced plan. Canonical textures remain authoritative for updates.
         if (this.rasterLayerUpdates.size === 0 && memoryPlan.resolutionScale === 1 &&
-            memoryPlan.compressionFormats.every(format => !format)) {
+            memoryPlan.compressionFormats.every(format => !format) &&
+            memoryPlan.plans.every((plan, index) => plan.width === rasterSources[index].width && plan.height === rasterSources[index].height)) {
             this.uploadRasterStripBatches(scene, maxRasterTextureSize,
               Math.max(0, memoryPlan.budget.bytes - this.estimatedRasterResidentBytes()));
             this.uploadRasterAtlasBatches(scene, maxRasterTextureSize,
@@ -4818,14 +4831,45 @@ export class WebGlFloorplanRenderer {
     const encoder = this.rasterCompression ??= new WebGlRasterCompression(this.gl);
     const format = selectRasterCompressionFormat(encoder.capabilities);
     const maxTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
-    let plan = planSceneRasterMemory(sources, maxTextureSize, availableBytes, format);
+    const select = (bytes?: number) => this.rasterResolutionPlanner
+      ? this.rasterResolutionPlanner.plan(sources, maxTextureSize, this.rasterResolutionView, bytes, format)
+      : planSceneRasterMemory(sources, maxTextureSize, bytes, format);
+    let plan = select(availableBytes);
     if (plan.compressionFormats.some(Boolean)) {
       const reserve = Math.min(MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES, plan.budget.bytes / 4);
-      plan = planSceneRasterMemory(sources, maxTextureSize, Math.max(0, plan.availableBytes - reserve), format);
+      plan = select(Math.max(0, plan.availableBytes - reserve));
     } else if (encoder.workspaceBytes > 0) {
-      plan = planSceneRasterMemory(sources, maxTextureSize, Math.max(0, plan.availableBytes - encoder.workspaceBytes), format);
+      plan = select(Math.max(0, plan.availableBytes - encoder.workspaceBytes));
     }
     return plan;
+  }
+
+  /** Refine one image per frame; old textures remain drawable until replacement succeeds. */
+  private updateRasterResolution(): void {
+    const planner = this.rasterResolutionPlanner;
+    if (!planner || !this.scene || !this.rasterTextureResidencyEnabled || !this.rasterRenderingEnabled || this.rasterStagedBytes > 0) return;
+    this.rasterResolutionView = { width: this.canvas.width, height: this.canvas.height,
+      cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom,
+      ...(this.localToClipRenderingEnabled ? { localToClip: this.localToClipMatrix } : {}) };
+    const canCompress = selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
+    const sources = this.rasterResolutionSources ??= this.getSceneRasterLayers(this.scene)
+      .map(source => this.classifyRasterLayerSource(source, canCompress));
+    const plan = this.planRasterLayerMemory(sources);
+    const index = planner.nextChange(sources, this.rasterLayers, plan);
+    if (index < 0) return;
+    reportRasterMemoryBudget(plan, this);
+    try {
+      const replacement = this.createRasterLayerGpu(sources[index], index, plan.plans[index], plan.compressionFormats[index]);
+      this.destroyRasterTextureBatchCache();
+      this.destroyRasterStripBatches(); this.destroyRasterAtlasBatches();
+      this.deleteRasterLayerTextures(this.rasterLayers[index]);
+      this.rasterLayers[index] = replacement;
+      this.destroyVectorMinifyResources();
+    } catch (error) {
+      planner.failed(index, plan);
+      console.warn("[HEPR] Raster refinement unavailable; retaining the previous display resolution.", error);
+    } finally { this.resetOrderedState(); }
+    if (planner.nextChange(sources, this.rasterLayers, plan) >= 0) this.requestFrame();
   }
 
   private retryRasterCompression(formats: readonly (RasterCompressionFormat | null)[], error: unknown): boolean {
@@ -4848,13 +4892,21 @@ export class WebGlFloorplanRenderer {
     const gl = this.gl;
     const maxTextureSize = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE));
     const plan = planned ?? planRasterTiles(source.width, source.height, maxTextureSize);
-    reportRasterTileDownscale(index, source, plan, maxTextureSize);
+    if (!this.rasterResolutionPlanner) reportRasterTileDownscale(index, source, plan, maxTextureSize);
     const monochrome = source.monochrome ?? detectMonochromeRaster(source.data, source.width, source.height);
     const packed = monochrome && plan.width === source.width && plan.height === source.height;
-    const pixels = packed ? [] : rasterTilePixels(monochrome ? this.classifyRasterLayerSource(source) : source, plan);
+    const coverage = !!monochrome && !packed && !!this.rasterResolutionPlanner;
+    const pixels = packed ? [] : coverage ? monochromeCoverageTilePixels(monochrome!, source.width, source.height, plan)
+      : rasterTilePixels(monochrome ? this.classifyRasterLayerSource(source) : source, plan);
     const tiles: RasterTileGpu[] = [];
     try {
       for (const [tileIndex, tile] of plan.tiles.entries()) {
+        if (coverage) {
+          const resource = this.createMonochromeCoverageTile(monochrome!, pixels[tileIndex], tile.width, tile.height);
+          tiles.push(plan.tiles.length > 1
+            ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) } : resource);
+          continue;
+        }
         if (packed) {
           const resource = this.createMonochromeRasterTile(
             monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height);
@@ -4897,7 +4949,9 @@ export class WebGlFloorplanRenderer {
     const [first, ...extraTiles] = tiles;
     return {
       ...first,
-      estimatedBytes: estimateRasterTilePlanBytes(plan, Boolean(packed), compressionFormat),
+      rasterPlan: plan,
+      estimatedBytes: estimateRasterSourcePlanBytes({ width: source.width, height: source.height,
+        monochrome, reducedMonochrome: coverage }, plan, compressionFormat),
       ...(extraTiles.length > 0 ? { extraTiles } : {}),
       opacity: source.opacity ?? 1,
       matrix,
@@ -4913,7 +4967,31 @@ export class WebGlFloorplanRenderer {
 
   private deleteRasterTileTextures(tile: RasterTileGpu): void {
     this.gl.deleteTexture(tile.texture);
-    if (tile.monochrome) this.gl.deleteTexture(tile.monochrome.mipTexture);
+    if (tile.monochrome && tile.monochrome.mipTexture !== tile.texture) this.gl.deleteTexture(tile.monochrome.mipTexture);
+  }
+
+  private createMonochromeCoverageTile(source: MonochromeRaster, pixels: Uint8Array, width: number, height: number): RasterTileGpu {
+    const gl = this.gl, texture = this.mustCreateTexture();
+    try {
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const levels = buildSingleChannelUint8MipChain(pixels, width, height);
+      for (const [level, data] of levels.entries()) gl.texImage2D(gl.TEXTURE_2D, level, gl.R8,
+        data.width, data.height, 0, gl.RED, gl.UNSIGNED_BYTE, data.data);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, levels.length - 1);
+      const colors = new Float32Array(8);
+      for (let offset = 0; offset < 8; offset += 4) {
+        const alpha = source.colors[offset + 3] / 255;
+        for (let channel = 0; channel < 3; channel++) colors[offset + channel] = Math.round(source.colors[offset + channel] * alpha) / 255;
+        colors[offset + 3] = alpha;
+      }
+      return { texture, monochrome: { mipTexture: texture, width, height, colors, coverage: true } };
+    } catch (error) { gl.deleteTexture(texture); throw error; }
+    finally { gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4); }
   }
 
   private createMonochromeRasterTile(source: MonochromeRaster, width: number, height: number): RasterTileGpu {

@@ -1055,11 +1055,13 @@ The published package and bundler entry include those assets automatically.
 
 Binary DeviceGray images of at least 256 pixels, including JBIG2 and fax images,
 keep packed one-bit pixels through native compilation and worker transfer.
-Native WebGL and WebGPU use eight pixels per R8 base texel with separate R8
-coverage mipmaps for filtered minification. Typical square images use about
-0.46 bytes per source pixel including mipmaps, versus 5.33 for RGBA8. Exact
-two-color images loaded from existing HEPs can use the same GPU path. Three,
-Canvas 2D, exports, and images requiring resampling retain RGBA compatibility.
+At original resolution, native WebGL and WebGPU use eight pixels per R8 base
+texel with separate R8 coverage mipmaps for filtered minification. Typical square
+images use about 0.46 bytes per source pixel including mipmaps, versus 5.33 for
+RGBA8. Reduced display tiers generate R8 coverage directly from packed pixels,
+without RGBA expansion or higher-resolution mip intermediates. Exact two-color
+images loaded from existing HEPs can use the same GPU path. Three, Canvas 2D and
+exports retain RGBA compatibility.
 
 The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
 embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX
@@ -1087,8 +1089,12 @@ needed for features such as room detection. Their extracted text index is retain
 separately for search and selection; no text is painted twice. HEP stores the image,
 text, and retained replay resources, with no source PDF needed when reopening it.
 
-Raster texture resolution is selected automatically from aggregate scene demand
-and `navigator.deviceMemory`, when available. This browser hint estimates rounded
+Raster texture resolution follows projected screen size, aggregate scene demand
+and `navigator.deviceMemory`, when available. Images initially allocate preview
+textures with a longest edge of at most 128 pixels. Visible images refine one per
+frame as zoom requires more detail, with hysteresis between resolution tiers;
+offscreen images return to preview size. Three also uses page projections and
+visibility to select its tiers. This browser hint estimates rounded
 system RAM, not total or available VRAM. The resident raster target is 1/32 of
 reported RAM, bounded to 16–256 MiB; unavailable or invalid hints use a conservative
 64 MiB target. No memory information needs to be provided by the user. Estimates
@@ -1097,7 +1103,8 @@ one extra resident target for old and new textures. Native raster batches are
 also charged to this target. These are heuristics rather than hardware allocation
 guarantees; vectors, text, compositor surfaces and other applications use memory too.
 
-Scenes that fit retain their current raster resolution and RGBA representation.
+Screen-sized images that fit retain their RGBA representation or exact packed
+binary representation when original dimensions are needed.
 Under memory pressure, native WebGL2 and WebGPU first try BC7 or ASTC 4x4 GPU
 compression for eligible opaque images, then area-filter ordinary rasters to
 smaller textures if aggregate demand still exceeds the target. Both formats
@@ -1109,9 +1116,10 @@ Eligibility is conservative: packed binary images, transparency, small or thin
 images, and sampled sharp edges or text-like detail avoid block compression.
 Pixel assessment uses the image contents rather than assuming a PDF codec is
 photographic. This heuristic is not a guarantee that every detail is detected.
-Native packed binary images that fit device limits remain lossless and can
-exceed the heuristic target, with a warning. Original scene pixels and export
-data are retained regardless of display compression or resolution.
+Packed binary display tiers also participate in the automatic resolution budget.
+Original scene pixels and export data are retained regardless of display
+compression or resolution. Refinement allocation failures retain the previous
+drawable tier and emit a diagnostic.
 
 The bundled MIT encoder kernels run on the renderer's existing GPU context or
 device, with no added runtime dependency. A bounded reusable encoding workspace
@@ -1122,10 +1130,10 @@ failures are diagnosed and replan budgeted RGBA textures so the document can
 still open. Console warnings distinguish compression and automatic resolution
 reduction from device texture-limit reductions.
 
-Three.js continues to use the automatic RGBA resolution budget. Zoom-dependent
-resolution tiers, parse-time reduced codec decoding, and larger ASTC footprints
-(including 12x12) remain separate stages; this implementation selects only the
-audited BC7 and ASTC 4x4 encoders.
+Three.js uses RGBA display textures at the selected resolution tiers. Parse-time
+reduced codec decoding and larger ASTC footprints (including 12x12) remain
+separate stages; this implementation selects only the audited BC7 and ASTC 4x4
+encoders.
 
 Images wider or taller than the GPU's texture limit are drawn as several tiles
 when the automatic scene budget permits. Native WebGPU requests the adapter's full limit, often 16,384

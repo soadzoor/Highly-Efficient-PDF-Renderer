@@ -60,6 +60,8 @@ export const fastTests = [
   "raster-atlas-batches",
   "raster-tiles",
   "raster-memory-budget",
+  "raster-resolution",
+  "pdf-page-demand",
   "webgl-raster-memory-budget",
   "webgpu-raster-memory-budget",
   "raster-compression",

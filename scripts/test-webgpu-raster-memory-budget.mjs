@@ -18,6 +18,7 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { automaticRasterMemoryBudget } = await import("../src/rasterMemoryBudget.ts");
   const { buildRasterStripBatches } = await import("../src/rasterStripBatches.ts");
+  const { RasterResolutionPlanner } = await import("../src/rasterResolution.ts");
   const sceneWith = (...layers) => Object.assign(createEmptyVectorScene(), { rasterLayers: layers });
   const create = scene => {
     const device = makeDevice();
@@ -139,7 +140,45 @@ try {
     renderer.dispose();
   }
 
-  console.log("WebGPU automatic raster budget: aggregate demand, packed preservation, fallback telemetry, placement, residency, concurrent updates, cleanup and duplicate batches passed.");
+  {
+    const scene = sceneWith(packedLayer(1024, 1024)), { renderer, device } = create(scene);
+    renderer.rasterResolutionPlanner = new RasterResolutionPlanner();
+    Object.assign(renderer.canvas, { width: 512, height: 512 });
+    Object.assign(renderer, { cameraCenterX: 512, cameraCenterY: 512, zoom: .1 });
+    renderer.configureRasterLayers(scene);
+    let displayed = renderer.rasterLayerResources[0];
+    const previewTexture = displayed.texture;
+    assert.equal(displayed.rasterPlan.width, 128);
+    assert.equal(displayed.texture.descriptor.format, "r8unorm");
+    assert.equal(displayed.coverageTexture, undefined, "a reduced scan needs one R8 coverage chain only");
+    assert(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] < 0, "shader receives the coverage-only mode");
+    assert.equal(displayed.estimatedBytes, layerBytes(displayed));
+    renderer.zoom = 1; renderer.updateRasterResolution();
+    displayed = renderer.rasterLayerResources[0];
+    assert.equal(displayed.rasterPlan.width, 1024);
+    assert(previewTexture.destroyed);
+    assert(displayed.coverageTexture, "full detail restores packed pixels with filtered coverage mips");
+    assert(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] > 0);
+    assert.equal(displayed.estimatedBytes, layerBytes(displayed));
+    const uploads = device.textures.length;
+    renderer.updateRasterResolution();
+    assert.equal(device.textures.length, uploads);
+    renderer.cameraCenterX = 10000; renderer.updateRasterResolution();
+    displayed = renderer.rasterLayerResources[0];
+    assert.equal(displayed.rasterPlan.width, 128);
+    renderer.cameraCenterX = 512;
+    device.failAtTexture = device.textures.length + 1;
+    renderer.updateRasterResolution();
+    assert.equal(renderer.rasterLayerResources[0], displayed, "failed promotion retains the working preview");
+    device.failAtTexture = null;
+    renderer.updateRasterResolution();
+    assert.equal(renderer.rasterLayerResources[0], displayed, "failed tier does not retry on every frame");
+    renderer.zoom = .3; renderer.updateRasterResolution();
+    assert.equal(renderer.rasterLayerResources[0].rasterPlan.width, 512, "a different requested tier can still refine");
+    renderer.dispose();
+    assert(device.textures.every(texture => texture.destroyed));
+  }
+  console.log("WebGPU automatic raster budget: aggregate demand, packed preservation, fallback telemetry, placement, residency, concurrent updates, cleanup, duplicate batches and demand-driven R8/packed allocations passed.");
 } finally {
   console.warn = warn;
   for (const [key, descriptor] of Object.entries(globals)) {

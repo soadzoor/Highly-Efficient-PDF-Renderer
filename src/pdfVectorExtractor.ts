@@ -515,7 +515,7 @@ let nativeVectorMissingFontResolverPromise: Promise<NativeMissingFontResolver> |
  * the host so browser and Node workers share one lazy face cache through the
  * existing request protocol.
  */
-function nativeVectorMissingFontResolver(): Promise<NativeMissingFontResolver> {
+export function nativeVectorMissingFontResolver(): Promise<NativeMissingFontResolver> {
   nativeVectorMissingFontResolverPromise ??= isNodeRuntime()
     ? import("./nodePdfSource").then(({ createNodeBundledStandardFontResolver }) =>
         createNodeBundledStandardFontResolver())

@@ -16,6 +16,7 @@ try {
   const { automaticRasterMemoryBudget, estimateRasterTextureBytes } = await import("../src/rasterMemoryBudget.ts");
   const { buildRasterStripBatches } = await import("../src/rasterStripBatches.ts");
   const { buildRasterAtlasBatches } = await import("../src/rasterAtlasBatches.ts");
+  const { RasterResolutionPlanner } = await import("../src/rasterResolution.ts");
   const budget = automaticRasterMemoryBudget();
   assert.equal(budget.bytes, 16 * 1024 * 1024);
   const data = rgbaData(1024, 1024);
@@ -109,7 +110,36 @@ try {
     current.renderer.destroyRasterLayerTextures();
     assert.equal(current.mock.textureBytes(), 0);
   }
-  console.log("WebGL automatic raster memory: aggregate plans, lazy packed pixels, exact mips, replacement peaks, residency and batch limits passed.");
+  {
+    const scan = scene.rasterLayers[4];
+    const current = fixture(WebGlFloorplanRenderer, Object.assign(createEmptyVectorScene(), { rasterLayers: [scan] }), estimateRasterTextureBytes);
+    Object.assign(current.renderer, { rasterResolutionPlanner: new RasterResolutionPlanner(), rasterResolutionView: null,
+      rasterRenderingEnabled: true, canvas: { width: 512, height: 512 }, cameraCenterX: 512, cameraCenterY: 512, zoom: .1 });
+    current.renderer.uploadRasterLayers(current.renderer.scene);
+    let displayed = current.renderer.rasterLayers[0];
+    const previewTexture = displayed.texture;
+    assert.equal(displayed.rasterPlan.width, 128, "initial allocation generates only a preview tier");
+    assert.equal(displayed.monochrome.coverage, true);
+    assert.equal(displayed.estimatedBytes, current.mock.textureBytes(), "R8-only previews have an exact ledger");
+    current.renderer.zoom = 1;
+    current.renderer.updateRasterResolution();
+    displayed = current.renderer.rasterLayers[0];
+    assert.equal(displayed.rasterPlan.width, 1024, "zoom promotes the original packed scan");
+    assert(!displayed.monochrome.coverage);
+    assert(!current.mock.alive.has(previewTexture));
+    assert.equal(current.mock.deletions.get(previewTexture), 1, "coverage texture aliases are destroyed once");
+    assert.equal(displayed.estimatedBytes, current.mock.textureBytes());
+    const uploadCount = current.mock.uploads.length;
+    current.renderer.updateRasterResolution();
+    assert.equal(current.mock.uploads.length, uploadCount, "stationary frames do not regenerate mips");
+    current.renderer.cameraCenterX = 10000;
+    current.renderer.updateRasterResolution();
+    assert.equal(current.renderer.rasterLayers[0].rasterPlan.width, 128, "offscreen detail is released");
+    assert.equal(expanded, 0);
+    current.renderer.destroyRasterLayerTextures();
+    assert.equal(current.mock.textureBytes(), 0);
+  }
+  console.log("WebGL automatic raster memory: aggregate plans, lazy packed pixels, exact mips, replacement peaks, residency, batch limits and zoom-dependent R8/packed allocations passed.");
 } finally {
   console.warn = previousWarn;
   if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator);
@@ -130,14 +160,14 @@ function image(width, height, data, index) {
 function fixture(Renderer, scene, estimateBytes) {
   const alive = new Set(), uploads = [];
   let texture = null, nextId = 0;
-  const mock = { alive, uploads, peakBytes: 0,
+  const mock = { alive, uploads, deletions: new Map(), peakBytes: 0,
     textureBytes: () => [...alive].reduce((sum, value) => sum + (value.bytes ?? 0), 0) };
   const gl = new Proxy({}, { get(_target, name) {
     if (name.toUpperCase() === name) return name;
     return (...args) => {
       if (name === "getParameter") return 4096;
       if (name.startsWith("create")) { const value = { id: ++nextId, bytes: 0, levels: new Map() }; alive.add(value); return value; }
-      if (name.startsWith("delete")) { alive.delete(args[0]); return; }
+      if (name.startsWith("delete")) { mock.deletions.set(args[0], (mock.deletions.get(args[0]) ?? 0) + 1); alive.delete(args[0]); return; }
       if (name === "getUniformLocation") return args[1];
       if (name === "bindTexture") texture = args[1];
       if (name === "texImage2D") {

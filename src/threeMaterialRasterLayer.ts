@@ -23,7 +23,6 @@ import type {
 } from "./threeWebGpuRasterMaterial";
 import {
   rasterTilePixels,
-  reportRasterTileDownscale,
   sameRasterTilePlan,
   type RasterTilePlan
 } from "./rasterTiles";
@@ -33,9 +32,9 @@ import type { MonochromeRaster } from "./monochromeRaster";
 import {
   automaticRasterMemoryBudget,
   estimateRasterTilePlanBytes,
-  planSceneRasterMemory,
   reportRasterMemoryBudget
 } from "./rasterMemoryBudget";
+import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
 
 interface RasterLayerOptions {
   pageTransforms?: ThreePageTransforms;
@@ -107,6 +106,10 @@ export class ThreeMaterialRasterLayer {
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private pendingRasterBytes = 0;
+  private readonly rasterResolutionPlanner = new RasterResolutionPlanner(false);
+  private rasterResolutionView: RasterResolutionView | null = null;
+  private rasterResolutionSources: RasterLayerSource[] | null = null;
+  needsResolutionUpdate = false;
   private readonly rasterEntries: ResidentRasterLayerEntry[] = [];
   private readonly appliedRasterLayers: (RasterLayer | undefined)[];
   private readonly stripEntries: ResidentRasterLayerEntry[] = [];
@@ -172,10 +175,11 @@ export class ThreeMaterialRasterLayer {
     }
 
     const rasterSources = getSceneRasterLayers(scene);
+    this.rasterResolutionSources = rasterSources;
     // The automatic scene budget applies even before a host reports its texture limit.
     this.maxTextureSize = options.maxTextureSize ?? Number.POSITIVE_INFINITY;
     // These materials upload RGBA even when their source is packed binary.
-    const memoryPlan = planSceneRasterMemory(rasterSources.map(({ width, height }) => ({ width, height })), this.maxTextureSize);
+    const memoryPlan = this.rasterResolutionPlanner.plan(rasterSources, this.maxTextureSize, null);
     reportRasterMemoryBudget(memoryPlan, this);
     for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
       const source = rasterSources[rasterIndex];
@@ -216,6 +220,7 @@ export class ThreeMaterialRasterLayer {
       // applies the same per-batch and total allocation bounds as native paths.
       // Both Three backends generate ordinary image mips by linear sampling.
       const batches = memoryPlan.resolutionScale === 1 && !memoryPlan.overBudget &&
+        memoryPlan.plans.every((plan, index) => plan.width === rasterSources[index].width && plan.height === rasterSources[index].height) &&
         rasterSources.length === scene.rasterLayers.length
         ? buildRasterStripBatches(scene, 2048, "linear") : [];
       let remainingBytes = memoryPlan.availableBytes - memoryPlan.estimatedBytes;
@@ -264,9 +269,8 @@ export class ThreeMaterialRasterLayer {
   setMaxTextureSize(maxTextureSize: number): void {
     if (this.disposed || maxTextureSize === this.maxTextureSize) return;
     this.maxTextureSize = maxTextureSize;
-    const memoryPlan = planSceneRasterMemory(this.rasterEntries.map(entry => ({
-      width: entry.image!.source.width, height: entry.image!.source.height
-    })), maxTextureSize);
+    const memoryPlan = this.rasterResolutionPlanner.plan(this.rasterEntries.map(entry => entry.image!.source),
+      maxTextureSize, this.rasterResolutionView);
     reportRasterMemoryBudget(memoryPlan, this);
     if (memoryPlan.resolutionScale < 1 || memoryPlan.overBudget) this.destroyStripBatches();
     for (const [index, entry] of this.rasterEntries.entries()) {
@@ -314,8 +318,10 @@ export class ThreeMaterialRasterLayer {
         const image = entry.texture.image as { width: number; height: number };
         return bytes + (entry.resident ? image.width * image.height * 4 : 0);
       }, 0);
-    const memoryPlan = planSceneRasterMemory(replacements.map(([, layer]) => ({ width: layer.width, height: layer.height })),
-      this.maxTextureSize, Math.min(budget.bytes - unchangedBytes - this.pendingRasterBytes,
+    const replacementView = this.rasterResolutionView?.projection ? { ...this.rasterResolutionView,
+      projection: (index: number) => this.rasterResolutionView!.projection!(replacements[index][0]) } : this.rasterResolutionView;
+    const memoryPlan = this.rasterResolutionPlanner.plan(replacements.map(([, layer]) => layer),
+      this.maxTextureSize, replacementView, Math.min(budget.bytes - unchangedBytes - this.pendingRasterBytes,
         budget.peakBytes - oldResidentBytes - this.pendingRasterBytes));
     reportRasterMemoryBudget(memoryPlan, this);
     try {
@@ -420,11 +426,41 @@ export class ThreeMaterialRasterLayer {
     this.viewportUniform.set(Math.max(1, viewport.width), Math.max(1, viewport.height));
     this.cameraCenterUniform.set(viewState.cameraCenterX, viewState.cameraCenterY);
     this.zoomUniform.value = Math.max(1e-6, viewState.zoom);
+    this.rasterResolutionView = { ...viewState, width: viewport.width, height: viewport.height,
+      ...(this.useLocalToClipUniform.value ? { localToClip: this.localToClipUniform.elements } : {}),
+      ...(this.pageTransforms ? { projection: (index: number) => {
+        const page = this.pageTransforms!.page("raster", index).page!;
+        return this.pageTransforms!.visibility[page] ? this.pageTransforms!.projectionElements[page] : null;
+      } } : {}) };
+    this.updateRasterResolution();
     for (const entry of this.activeEntries) {
       if (entry.webGpuState) {
         entry.webGpuState.zoomUniform.value = this.zoomUniform.value;
       }
     }
+  }
+
+  private updateRasterResolution(): void {
+    if (!this.rasterTextureResidencyEnabled || this.pendingRasterBytes > 0) return;
+    const sources = this.rasterResolutionSources ??= this.rasterEntries.map(entry => entry.image!.source);
+    const plan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize, this.rasterResolutionView);
+    const resources = () => this.rasterEntries.map(entry => ({ rasterPlan: entry.image!.plan,
+      estimatedBytes: estimateRasterTilePlanBytes(entry.image!.plan, false) }));
+    const index = this.rasterResolutionPlanner.nextChange(sources, resources(), plan);
+    this.needsResolutionUpdate = false;
+    if (index < 0) return;
+    reportRasterMemoryBudget(plan, this);
+    try {
+      const entry = this.rasterEntries[index], source = sources[index];
+      const textures = createRasterTileTextures(source, plan.plans[index], index, this.maxTextureSize);
+      this.destroyStripBatches();
+      this.setRasterImage(entry, source, plan.plans[index], textures);
+      this.updateMaxRasterTextureDimension();
+    } catch (error) {
+      this.rasterResolutionPlanner.failed(index, plan);
+      console.warn("[HEPR] Raster refinement unavailable; retaining the previous display resolution.", error);
+    }
+    this.needsResolutionUpdate = this.rasterResolutionPlanner.nextChange(sources, resources(), plan) >= 0;
   }
 
   setScreenSpaceTransform(): void {
@@ -494,6 +530,10 @@ export class ThreeMaterialRasterLayer {
     for (const texture of textures) this.ownedTextures.add(texture);
     this.ownedTextures.delete(previous);
     previous.dispose();
+    if (image.source !== source) {
+      this.rasterResolutionSources = null;
+      this.rasterResolutionPlanner.invalidate();
+    }
     image.source = source;
     image.plan = plan;
     const tile = plan.tiles[0];
@@ -834,7 +874,7 @@ function createRasterTileTextures(
   rasterIndex: number,
   maxTextureSize: number
 ): THREE.DataTexture[] {
-  reportRasterTileDownscale(rasterIndex, source, plan, maxTextureSize);
+  // Expected display tiers are chosen from zoom; memory reductions have an aggregate diagnostic.
   const pixels = rasterTilePixels(source, plan);
   return plan.tiles.map((tile, index) => createRasterTexture(pixels[index], tile.width, tile.height));
 }

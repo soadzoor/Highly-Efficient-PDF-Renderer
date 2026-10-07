@@ -29,6 +29,9 @@ vec4 heprRasterColor(vec2 uv, vec2 uvDx, vec2 uvDy) {
     if (uRasterOpaque > 0.5) color.a = 1.0;
     return color;
   }
+  if (uRasterMonochrome > 1.5) {
+    return mix(uRasterMonoColor0, uRasterMonoColor1, textureGrad(uRasterTex, uv, uvDx, uvDy).r);
+  }
   float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
   float lod = max(0.0, log2(max(footprint, 1.0)));
   float coverage;
