@@ -109,7 +109,8 @@ export class PdfPageDemandLoader {
       for (const index of this.wanted) this.evictedPreviews.delete(index);
     }
     const previousDetail = this.wantedDetail;
-    this.wantedDetail = visible.filter(page => page.detail).slice(0, MAX_DETAILED_PAGES).map(page => page.index);
+    // Text-only overviews already contain the full vector glyphs at every zoom.
+    this.wantedDetail = this.options.ocrTextOnly ? [] : visible.filter(page => page.detail).slice(0, MAX_DETAILED_PAGES).map(page => page.index);
     const key = this.wantedDetail.join(",");
     if (key !== this.detailKey) {
       this.detailKey = key; this.attempted.clear();
@@ -174,6 +175,7 @@ export class PdfPageDemandLoader {
       const operation = this.operation = new AbortController();
       try {
         const scene = await this.session.compileVectorPage(this.sourcePages[index], {
+          ocrTextOnly: this.options.ocrTextOnly,
           signal: operation.signal, optimization: "safe",
           enableSegmentMerge: this.options.enableSegmentMerge !== false,
           enableInvisibleCull: this.options.enableInvisibleCull !== false,

@@ -23,6 +23,11 @@ export interface ViewStateUpdateOptions {
   scheduleFrame?: boolean;
 }
 
+export interface SceneUpdateOptions {
+  /** Keep the current zoom tiers when replacing a progressive document window. */
+  preserveRasterResolution?: boolean;
+}
+
 /**
  * Advanced native renderer interface used internally by `HeprThreePdfObject`.
  *
@@ -108,7 +113,7 @@ export interface RendererApi {
   resize(): void;
 
   /** Upload a parsed scene and return GPU/resource stats. */
-  setScene(scene: VectorScene): SceneStats;
+  setScene(scene: VectorScene, options?: SceneUpdateOptions): SceneStats;
 
   /** Return stats for the uploaded scene, if available. */
   getSceneStats(): SceneStats | null;

@@ -100,6 +100,26 @@ try {
   assert.equal(calls.length, 2, "cached detail returns without another parse");
   assert(changes.filter(reason => reason === "pages-loaded").length >= 3);
 
+  for (let completion = 0; completion < 2; completion++) {
+    for (const target of [object, page, object.pageBatch]) {
+      const layer = target.rasterMaterialLayer, matrix = layer.rasterEntries[0].image.source.matrix;
+      if (target.pageTransforms) {
+        const projection = new THREE.Matrix4().makeScale(2 / matrix[0], 2 / matrix[3], 1);
+        projection.setPosition(-1 - 2 * matrix[4] / matrix[0], -1 - 2 * matrix[5] / matrix[3], 0);
+        target.pageTransforms.setPage(0, new THREE.Matrix4(), projection, true, 1);
+      }
+      layer.setTextureResidency(true);
+      layer.updateFrame({ cameraCenterX: matrix[4] + matrix[0] / 2,
+        cameraCenterY: matrix[5] + matrix[3] / 2, zoom: 2 }, { width: 1024, height: 1024 });
+      assert.equal(layer.rasterEntries[0].image.plan.width, 1024);
+    }
+    await loader.notifyChange(); await flush();
+    for (const target of [object, page, object.pageBatch]) {
+      assert.equal(target.rasterMaterialLayer.rasterEntries[0].image.plan.width, 1024,
+        "page notifications preserve sharp document, independent-page and batched-page tiers before another frame");
+    }
+  }
+
   page.position.x += 100000; object.updateMatrixWorld(true); object.updatePageDemand(host, camera); await flush();
   assert.equal(object.sceneData.rasterLayers[0].width, 96, "moved offscreen pages return to previews");
   assert.equal((await object.getPages())[0], page);

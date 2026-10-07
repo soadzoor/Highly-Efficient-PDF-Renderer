@@ -80,6 +80,7 @@ const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-s
 const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-select");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
+const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 const pdfLayersContainer = document.querySelector<HTMLDivElement>("#pdf-layers");
 const pdfAnnotationsContainer = document.querySelector<HTMLDivElement>("#pdf-annotations");
@@ -133,6 +134,7 @@ if (
   !textLodSelect ||
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
+  !ocrTextCheckbox ||
   !drawingSelectionContainer ||
   !pdfLayersContainer ||
   !pdfAnnotationsContainer ||
@@ -183,6 +185,7 @@ const vectorLodSelectElement = vectorLodSelect;
 const textLodSelectElement = textLodSelect;
 const touchRotateCheckboxElement = touchRotateCheckbox;
 const textSelectionCheckboxElement = textSelectionCheckbox;
+const ocrTextCheckboxElement = ocrTextCheckbox;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -810,6 +813,10 @@ textSelectionCheckboxElement.addEventListener("change", () => {
   setStatus(`Text selection ${textSelectionCheckboxElement.checked ? "enabled" : "disabled"}.`);
 }, { signal: lifetimeSignal });
 
+ocrTextCheckboxElement.addEventListener("change", () => {
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}, { signal: lifetimeSignal });
+
 for (const button of pageLayoutButtons) {
   button.addEventListener("click", () => {
     void setPageLayout(readPageLayout(button.dataset.pageLayout));
@@ -1363,10 +1370,11 @@ function disposeExample(): void {
   renderer.dispose();
 }
 
-function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> {
+function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> & { ocrTextOnly: boolean } {
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
+    ocrTextOnly: ocrTextCheckboxElement.checked,
     threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
     textLod: readTextLodMode(),
@@ -1472,7 +1480,8 @@ async function loadSource(
     const firstSubmitMs = performance.now() - firstSubmitStart;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
-    clearLoadedStatus();
+    if (nextObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
+    else clearLoadedStatus();
     updateSceneMetrics(nextObject);
   } catch (error) {
     if (activeLoadToken !== loadToken) {
@@ -1498,10 +1507,10 @@ async function loadSource(
   }
 }
 
-async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void> {
+async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource = false): Promise<void> {
   const previousObject = currentPdfObject;
   const source = lastLoadedSource;
-  if (!previousObject || !source || backend === activeThreeRendererBackend) {
+  if (!previousObject || !source || (!reparseSource && backend === activeThreeRendererBackend)) {
     return;
   }
 
@@ -1516,7 +1525,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   let targetInstalled = false;
   let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
 
-  setStatus(`Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
+  setStatus(reparseSource ? `Changing text view for ${previousObject.sourceLabel}...`
+    : `Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
   setLoadingProgress(true, "Preparing renderer...");
   setLoadControlsEnabled(false);
   setDownloadDataButtonState(true, true);
@@ -1528,25 +1538,27 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   try {
     const loadStart = performance.now();
     resetVectorStrokeLodBuildTiming();
-    const vectorLodStage = hasStoredVectorStrokeLod(previousObject.sceneData) ? "vector-lod-restore" : "vector-lod";
-    vectorLodReservation = await reserveVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
-      yieldIntervalMs: 50,
-      signal: controller.signal,
-      shouldCancel: () => controller.signal.aborted,
-      onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: vectorLodStage })
-    });
-    controller.signal.throwIfAborted();
-    if (objectOptions.textLod !== "off") {
-      await prebuildTextLod(previousObject.sceneData, {
+    if (!reparseSource) {
+      const vectorLodStage = hasStoredVectorStrokeLod(previousObject.sceneData) ? "vector-lod-restore" : "vector-lod";
+      vectorLodReservation = await reserveVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
         yieldIntervalMs: 50,
         signal: controller.signal,
-        onProgress: progress => updateLoadingProgress(activeLoadToken, { value: 0.7 + progress.value * 0.26, stage: "text-lod" })
+        shouldCancel: () => controller.signal.aborted,
+        onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: vectorLodStage })
       });
+      controller.signal.throwIfAborted();
+      if (objectOptions.textLod !== "off") {
+        await prebuildTextLod(previousObject.sceneData, {
+          yieldIntervalMs: 50,
+          signal: controller.signal,
+          onProgress: progress => updateLoadingProgress(activeLoadToken, { value: 0.7 + progress.value * 0.26, stage: "text-lod" })
+        });
+      }
     }
     updateLoadingProgress(activeLoadToken, { value: 0.98, stage: "upload" });
     // Keep canonical references attached to the exact same scene when
     // replacing the renderer; do not parse the source again.
-    nextObject = previousObject.isPageDemandLoaded && previousObject.sourceBytes
+    nextObject = (previousObject.isPageDemandLoaded || reparseSource) && previousObject.sourceBytes
       ? await pdfObjectGenerator(previousObject.sourceBytes, { ...previousObject.sourceOptions, ...objectOptions,
         sourceLabel: previousObject.sourceLabel,
         signal: controller.signal, onProgress: progress => updateLoadingProgress(activeLoadToken, progress) }, backend)
@@ -1554,7 +1566,9 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       {
         scene: previousObject.sceneData,
         sourceLabel: previousObject.sourceLabel,
-        sourceKind: previousObject.sourceKind
+        sourceKind: previousObject.sourceKind,
+        sourceBytes: previousObject.sourceBytes,
+        sourceOptions: previousObject.sourceOptions
       },
       { ...objectOptions, rendererType: backend },
       controller.signal,
@@ -1605,7 +1619,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
     updateSceneMetrics(installedObject);
     setDownloadDataButtonState(true);
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
-    clearLoadedStatus();
+    if (installedObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
+    else clearLoadedStatus();
   } catch (error) {
     if (nextObject && currentPdfObject === nextObject) {
       targetInstalled = true;
@@ -1759,6 +1774,8 @@ function setPanelCollapsed(collapsed: boolean): void {
 }
 
 function setLoadControlsEnabled(enabled: boolean): void {
+  ocrTextCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) ocrTextCheckboxElement.checked = currentPdfObject.sourceOptions?.ocrTextOnly === true;
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
@@ -1867,7 +1884,8 @@ async function downloadHep(): Promise<boolean> {
     if (!lodOptions) return false;
     await yieldToBrowserPaint();
     const hepOptions = {
-      ...(pdfObject.isPageDemandLoaded ? pdfObject.sourceOptions : {}),
+      ...((pdfObject.isPageDemandLoaded || pdfObject.sourceOptions?.ocrTextOnly) ? pdfObject.sourceOptions : {}),
+      ocrTextOnly: false,
       ...lodOptions,
       sourceLabel: pdfObject.sourceLabel,
       signal: exportController.signal,
@@ -1880,7 +1898,7 @@ async function downloadHep(): Promise<boolean> {
         setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
       }
     };
-    const hepBlob = pdfObject.isPageDemandLoaded
+    const hepBlob = pdfObject.isPageDemandLoaded || pdfObject.sourceOptions?.ocrTextOnly
       ? await buildHep(pdfObject.sourceBytes!, hepOptions) : await buildHep(pdfObject.sceneData, hepOptions);
 
     if (activeHepExportController !== exportController) {

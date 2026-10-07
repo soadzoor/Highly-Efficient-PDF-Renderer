@@ -24,6 +24,7 @@ const context = vm.createContext({
   sourceLoadController: null, activeHepExportController: null,
   activePdfPageLoader: null, demandPdfUpdatePending: false,
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
+  lastLoadedPdfPassword: undefined, loadedOcrTextOnly: false, ocrTextCheckbox: { checked: false, disabled: false },
   lastParsedSceneLabel: null, parsedPdfPageCache: null,
   exampleManifestEntries: [], exampleSelectionMap: new Map(),
   exampleDropdown: { setDisabled: noop },
@@ -75,7 +76,8 @@ for (const name of [
   "loadExampleSelection", "loadPdfFile", "loadHepFile", "loadPdfBuffer", "loadHepBuffer",
   "getExtractionOptions", "buildPdfPageCacheKey", "getCachedPdfPageScenes", "storeCachedPdfPageScenes",
   "commitLoadedSource", "uploadSceneWithRollback", "beginSourceLoad", "finishSourceLoad",
-  "isCurrentSourceLoad", "beginSceneLoad", "finishSceneLoad", "updateBackendSelectDisabledState", "downloadHep"
+  "isCurrentSourceLoad", "beginSceneLoad", "finishSceneLoad", "updateBackendSelectDisabledState", "downloadHep",
+  "reloadOcrTextView"
 ]) vm.runInContext(sourceFunction(source, name), context);
 
 await context.loadPdfFile(file("A.pdf", 65));
@@ -164,6 +166,32 @@ assert.equal(demandPaused, false, "export resumes demand-driven loading");
 await context.loadHepFile(file("replacement.hep", 74));
 assert.equal(context.activePdfPageLoader, null);
 assert.equal(demandClosed, true, "document replacement closes the paging worker");
+
+// Switching text mode uses the original source, keeps the view, and cannot export the approximation.
+context.openPdfPageDemand = async () => ({ pageCount: 1, close: async () => {} });
+nextParse = async (buffer, options) => [{ ...scene(new Uint8Array(buffer)[0]), mode: options.ocrTextOnly === true }];
+await context.loadPdfFile(file("ocr.pdf", 75));
+const beforeOcrView = { ...view };
+context.ocrTextCheckbox.checked = true;
+await context.reloadOcrTextView();
+assert.equal(context.lastParsedScene.mode, true);
+assert.equal(context.loadedOcrTextOnly, true);
+assert.equal(context.parsedPdfPageCache.optionsKey, "merge:1|cull:1|ocr:1");
+assert.deepEqual(view, beforeOcrView);
+await context.downloadHep();
+assert.equal(exports.at(-1).scene[0], 75, "text-only export supplies original PDF bytes");
+nextParse = async () => { throw new Error("failed to restore scans"); };
+context.ocrTextCheckbox.checked = false;
+await context.reloadOcrTextView();
+assert.equal(context.lastParsedScene.mode, true);
+assert.equal(context.ocrTextCheckbox.checked, true, "failed mode switch restores its checkbox");
+nextParse = async (buffer, options) => [{ ...scene(new Uint8Array(buffer)[0]), mode: options.ocrTextOnly === true }];
+context.ocrTextCheckbox.checked = false;
+await context.reloadOcrTextView();
+assert.equal(context.lastParsedScene.mode, false);
+assert.equal(context.loadedOcrTextOnly, false);
+assert.deepEqual(view, beforeOcrView);
+
 await testThreeDocumentReplacement();
 await testThreeBackendReplacement();
 await testRoomDocumentReplacement();
@@ -351,12 +379,16 @@ async function testRoomDocumentReplacement() {
 
 async function testThreeBackendReplacement() {
   const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
-  for (const failure of ["none", "renderer", "layers"]) {
+  for (const failure of ["none", "renderer", "layers", "text-view"]) {
+    const reparseSource = failure === "text-view";
+    const targetBackend = reparseSource ? "webgl" : "webgpu";
     const failRenderer = failure === "renderer";
-    const failed = failure !== "none";
+    const failed = failure === "renderer" || failure === "layers";
     const host = demoHost();
     const canonicalScene = scene("same artifact");
     const previous = host.currentPdfObject;
+    previous.sourceBytes = Uint8Array.of(75);
+    previous.sourceOptions = { password: "fixture-password", ocrTextOnly: false };
     previous.sceneData = canonicalScene;
     previous.setFrameListener = noop;
     previous.getLayers = () => [
@@ -404,23 +436,34 @@ async function testThreeBackendReplacement() {
     Object.assign(host, {
       lastLoadedSource: "original.pdf", lastDownloadablePdf: { label: "original.pdf" },
       lastNativeDrawStats: null, activeThreeRendererBackend: "webgl", lastLoadTimingText: "",
-      readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto" }),
+      readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto", ocrTextOnly: reparseSource }),
       captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
       resetVectorStrokeLodBuildTiming: noop, consumeVectorStrokeLodBuildTiming: () => timing,
       hasStoredVectorStrokeLod: () => false,
       reserveVectorStrokeLodRuntime: async (sceneData) => {
+        assert.equal(reparseSource, false, "A changed viewing mode prepares only the new scene's LOD");
         assert.equal(sceneData, canonicalScene);
         return reservation;
       },
       prebuildTextLod: async (sceneData) => assert.equal(sceneData, canonicalScene),
-      pdfObjectGenerator: () => assert.fail("Backend switches must reuse the parsed scene"),
+      pdfObjectGenerator: async (bytes, options, backend) => {
+        assert.equal(reparseSource, true, "Backend-only switches reuse the parsed scene");
+        assert.equal(bytes, previous.sourceBytes);
+        assert.equal(options.ocrTextOnly, true);
+        assert.equal(options.password, "fixture-password");
+        assert.equal(backend, targetBackend);
+        replacement.sourceOptions = { ocrTextOnly: true };
+        return replacement;
+      },
       createThreePdfObject: async (loadedScene, options, signal, prepared) => {
         assert.equal(prepared, reservation);
         prepared.take();
         assert.equal(loadedScene.scene, canonicalScene);
         assert.equal(loadedScene.sourceLabel, previous.sourceLabel);
         assert.equal(loadedScene.sourceKind, previous.sourceKind);
-        assert.equal(options.rendererType, "webgpu");
+        assert.equal(loadedScene.sourceBytes, previous.sourceBytes);
+        assert.equal(loadedScene.sourceOptions, previous.sourceOptions);
+        assert.equal(options.rendererType, targetBackend);
         signal.throwIfAborted();
         return replacement;
       },
@@ -482,9 +525,9 @@ async function testThreeBackendReplacement() {
     ]) {
       vm.runInContext(sourceFunction(source, name), host);
     }
-    await host.reloadSourceWithBackend("webgpu");
-    assert.equal(reservationTaken, 1, "Backend construction receives its prepared runtime");
-    assert.equal(reservationReleased, 1, "The reservation is always finalized");
+    await host.reloadSourceWithBackend(targetBackend, reparseSource);
+    assert.equal(reservationTaken, reparseSource ? 0 : 1, "Backend construction receives its prepared runtime");
+    assert.equal(reservationReleased, reparseSource ? 0 : 1, "The reservation is always finalized");
     assert.equal(layerResets, failRenderer ? 0 : 1);
     assert.equal(layerReplays, failRenderer ? 0 : 1, "Replay current PDF layer choices only after the target renderer is ready");
     assert.equal(layerBindings, failed ? 0 : 1, "Only a successfully prepared replacement becomes the panel's current object");
@@ -493,8 +536,8 @@ async function testThreeBackendReplacement() {
     assert.equal(host.currentPdfObject, failed ? previous : replacement);
     assert.equal(previous.disposals, failed ? 0 : 1);
     assert.equal(replacement.disposals, failed ? 1 : 0);
-    assert.deepEqual(backendChanges, failure === "layers" ? ["webgpu", "webgl"] : ["webgpu"]);
-    assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : "webgpu", "A layer replay failure rolls the renderer back with the old document intact");
+    assert.deepEqual(backendChanges, failure === "layers" ? ["webgpu", "webgl"] : [targetBackend]);
+    assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : targetBackend, "A layer replay failure rolls the renderer back with the old document intact");
     assert.equal(host.activePageLayout, "sphere", "Backend switches keep the page layout");
     assert.equal(host.pageLayoutView.object, failed ? previous : replacement);
     assert.equal(host.pageLayoutView.layout, "sphere");

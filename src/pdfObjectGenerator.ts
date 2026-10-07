@@ -88,6 +88,9 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   /** Large PDFs load visible pages automatically. Use eager only when complete scene data is required before rendering. */
   pageLoading?: "auto" | "eager";
 
+  /** PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding. */
+  ocrTextOnly?: boolean;
+
   /**
    * Progress callback for source loading, PDF parsing, HEP loading, vector/text
    * LOD building, and upload preparation.
@@ -210,6 +213,7 @@ async function loadPdfSceneFromSourceInternal(
   if (sourceKind === "pdf") {
     validateAnnotationAppearanceMode(options.annotationAppearances);
     const extractOptions: VectorExtractOptions = {
+      ocrTextOnly: options.ocrTextOnly,
       password: options.password,
       imageCodecResolver: options.imageCodecResolver,
       iccTransformResolver: options.iccTransformResolver,
@@ -254,7 +258,8 @@ async function loadPdfSceneFromSourceInternal(
       scene,
       sourceLabel,
       sourceKind,
-      sourceBytes
+      sourceBytes,
+      sourceOptions: options
     };
   }
 

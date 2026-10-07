@@ -36,7 +36,8 @@ import type {
 // Retained page color stores remain at version 8.
 // Older workers must not silently ignore the requested color behavior.
 // Version 11 adds bounded page previews; old workers must not transfer full-resolution pages instead.
-export const PDF_WORKER_PROTOCOL_VERSION = 11 as const;
+// Version 12 requires workers to honor text-only viewing instead of decoding scans.
+export const PDF_WORKER_PROTOCOL_VERSION = 12 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -90,6 +91,7 @@ export interface PdfWorkerCompileOptions {
 }
 
 export interface PdfWorkerVectorCompileOptions extends PdfWorkerCompileOptions {
+  readonly ocrTextOnly?: boolean;
   readonly previewMaxDimension?: number;
   readonly vectorFallback?: NativeVectorCompileOptions["vectorFallback"];
   readonly enableSegmentMerge?: NativeVectorCompileOptions["enableSegmentMerge"];

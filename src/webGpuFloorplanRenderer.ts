@@ -12,6 +12,7 @@ import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./r
 import { isRasterTilePlanDownscaled, rasterTilePixels, reportRasterTileDownscale, type RasterTile, type RasterTilePlan } from "./rasterTiles";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, estimateRasterSourcePlanBytes, planSceneRasterMemory, reportRasterMemoryBudget } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
+import type { SceneUpdateOptions } from "./rendererTypes";
 import { assessRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
 import { WebGpuRasterCompression } from "./webGpuRasterCompression";
 import { buildMonochromeMipChain, detectMonochromeRaster, monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
@@ -2444,14 +2445,21 @@ export class WebGpuFloorplanRenderer {
     this.requestFrame();
   }
 
-  setScene(scene: VectorScene): SceneStats {
+  setScene(scene: VectorScene, options: SceneUpdateOptions = {}): SceneStats {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGPU renderer has been disposed.");
     }
     if (this.scene !== scene) {
-      this.rasterResolutionPlanner = new RasterResolutionPlanner();
-      this.rasterResolutionView = null;
-      this.rasterResolutionSources = null;
+      if (options.preserveRasterResolution) {
+        this.rasterResolutionPlanner?.invalidate();
+        if (this.rasterResolutionView) this.rasterResolutionView = { ...this.rasterResolutionView,
+          width: this.canvas.width, height: this.canvas.height,
+          cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom };
+      } else {
+        this.rasterResolutionPlanner = new RasterResolutionPlanner();
+        this.rasterResolutionView = null;
+        this.rasterResolutionSources = null;
+      }
       this.rasterLayerUpdates.clear();
       this.paintCompositor?.dispose(); this.paintCompositor = null;
       this.optionalContentVisibility = createDefaultOptionalContentSnapshot(scene);
@@ -4581,6 +4589,9 @@ export class WebGpuFloorplanRenderer {
 
   private configureRasterLayers(scene: VectorScene): void {
     const rasterSources = this.getSceneRasterLayers(scene);
+    if (this.rasterResolutionPlanner && this.rasterResolutionSources) {
+      this.rasterResolutionPlanner.inheritTiers(this.rasterResolutionPlanner, this.rasterResolutionSources, rasterSources);
+    }
     this.rasterResolutionSources = rasterSources;
     const maxRasterTextureSize = this.maxTextureSize();
 

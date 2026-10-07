@@ -218,6 +218,8 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
+  /** Draw stored text with bundled substitute fonts, omitting images and other graphics. PDF only. */
+  ocrTextOnly?: boolean;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
@@ -457,6 +459,7 @@ async function extractPdfPageScenesWithNative(
         sourcePageCount
       });
       const scene = await vectorSession.compileVectorPage(sourcePageIndex, {
+        ocrTextOnly: options.ocrTextOnly,
         signal,
         optimization:
           options.enableSegmentMerge === false && options.enableInvisibleCull === false

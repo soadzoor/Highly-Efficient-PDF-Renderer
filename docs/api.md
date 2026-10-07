@@ -84,6 +84,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
+| `ocrTextOnly` | `false` | PDF viewing approximation: draw existing visible and invisible text at its stored positions and widths, substituting bundled fonts for glyphless or missing outlines. Skip image decoding and other graphics. Pages without drawable stored text remain blank and emit a diagnostic. |
 | `annotationAppearances` | `"render"` | Which annotation appearances become page content: `"render"` all, `"forms"` only form fields (Widgets), `"none"` none. Annotation metadata is extracted in every mode. See [hiding annotation appearances](#hiding-annotation-appearances). |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
 | `imageCodecResolver` | Bundled codecs | Supply a raw-sample image decoder; works through PDF workers and PDF-to-HEP conversion. See [image compatibility](#rendering-compatibility-and-diagnostics). |
@@ -95,6 +96,12 @@ Page selections are deduplicated and composed in document order. Invalid selecti
 reject with `RangeError`. HEP files preserve their saved page selection, layout and
 annotation appearance mode; PDF parsing options do not reprocess a HEP scene. Search uses the text index and
 does not require `extractText: true`.
+
+Use `pdfObjectGenerator(source, { ocrTextOnly: true })` for a text-only PDF view.
+This uses the PDF's existing text; it does not perform OCR. Vector overviews stay
+sharp at every zoom and do not allocate scan textures. Reopen the retained
+`sourceBytes` with `ocrTextOnly: false` to restore the normal view.
+`loadCompleteScene()` and the demo's HEP export compile the original PDF content.
 
 See [loading option types](../src/pdfObjectGenerator.ts) and
 [progress fields and stages](../src/loadProgress.ts). Large PDFs initially prepare

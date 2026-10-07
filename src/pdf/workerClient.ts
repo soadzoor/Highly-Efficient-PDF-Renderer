@@ -586,6 +586,7 @@ class PdfWorkerConnection {
       operation: "compile-vector-page",
       sourcePageIndex,
       options: {
+        ...(options.ocrTextOnly === undefined ? {} : { ocrTextOnly: options.ocrTextOnly }),
         ...(options.previewMaxDimension === undefined ? {} : { previewMaxDimension: options.previewMaxDimension }),
         limits: options.limits,
         optimization: options.optimization,

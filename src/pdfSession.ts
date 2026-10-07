@@ -219,6 +219,8 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Viewing approximation: draw stored text with substitute fonts and skip image decoding. */
+  readonly ocrTextOnly?: boolean;
   /** Worker-owned bounded overview; full page scenes are compiled separately when visible in detail. */
   readonly previewMaxDimension?: number;
   /** Internal capability probes can require direct vector output. Normal loading falls back to pixels. */
@@ -531,6 +533,11 @@ class NativePdfSession implements NativeVectorPdfSession {
     let release: (() => void) | null = null;
     try {
       release = await this.acquireOperation(signal);
+      if (options.ocrTextOnly) {
+        const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
+        return await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
+          this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+      }
       const scene = await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
       if (options.previewMaxDimension === undefined) return scene;
       if (scene.segmentCount === 0 && scene.fillPathCount === 0 && scene.textInstanceCount === 0 &&

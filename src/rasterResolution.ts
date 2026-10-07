@@ -5,6 +5,7 @@ import type { RasterCompressionFormat } from "./rasterCompression";
 
 export interface RasterResolutionSource extends RasterMemorySource {
   readonly matrix: ArrayLike<number>;
+  readonly pageIndex?: number;
 }
 
 export interface RasterResolutionView {
@@ -30,12 +31,31 @@ const PREVIEW_SIZE = 128;
 /** Select display tiers from screen demand without reading or changing canonical pixels. */
 export class RasterResolutionPlanner {
   private readonly tiers = new WeakMap<object, number>();
+  private retainedTiers = new Map<string, number>();
   private readonly failures = new Map<number, string>();
   private sources: readonly RasterResolutionSource[] | undefined;
   private readonly cache = new Map<string, SceneRasterMemoryPlan>();
   private readonly singleChannelMonochrome: boolean;
 
   constructor(singleChannelMonochrome = true) { this.singleChannelMonochrome = singleChannelMonochrome; }
+
+  /** Scene composition creates new wrappers and can shift raster indices. Keep their zoom hysteresis. */
+  inheritTiers(previous: RasterResolutionPlanner, previousSources: readonly RasterResolutionSource[],
+    sources: readonly RasterResolutionSource[]): void {
+    const key = (source: RasterResolutionSource) =>
+      `${source.pageIndex ?? 0}:${source.width}:${source.height}:${Array.from(source.matrix).join(",")}`;
+    // A deferred native upload can release the old scene with an empty window first.
+    const tiers = previousSources.length ? new Map<string, number>() : previous.retainedTiers;
+    for (const source of previousSources) {
+      const tier = previous.tiers.get(source);
+      if (tier !== undefined) tiers.set(key(source), tier);
+    }
+    for (const source of sources) {
+      const tier = tiers.get(key(source));
+      if (tier !== undefined) this.tiers.set(source, tier);
+    }
+    this.retainedTiers = tiers;
+  }
 
   plan(sources: readonly RasterResolutionSource[], maxTextureSize: number,
     view: RasterResolutionView | null, availableBytes?: number,

@@ -140,6 +140,17 @@ R8 coverage at smaller tiers. Eligible color images can use BC7/ASTC 4x4 through
 the host's `ExternalTexture` support, with one shared encoder workspace.
 Independent page views share the document's automatic raster memory target.
 
+The native and Three demos offer **Use OCR text instead of scans** for PDF
+sources. It reconstructs existing text with vector fonts, preserving
+text positions and widths, while skipping scan decoding and scan GPU textures.
+Glyphless or missing outlines use bundled substitute fonts.
+It is an approximate text-only view: pictures, diagrams, colors, clipping and
+annotation appearances are omitted; pages without drawable stored text are
+blank and emit a diagnostic. Search and selection remain available. Uncheck it
+to restore scans while retaining the camera and page layout. HEP sources do not
+support this option. HEP export uses the original PDF content. Zoom does not
+automatically switch this mode.
+
 ## Rendering and level of detail
 
 The three.js object follows your camera and synchronizes itself during normal

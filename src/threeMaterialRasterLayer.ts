@@ -42,6 +42,8 @@ import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterReso
 
 interface RasterLayerOptions {
   pageTransforms?: ThreePageTransforms;
+  /** Current content of the same progressive document, before its replacement is installed. */
+  previousLayer?: ThreeMaterialRasterLayer;
   /** Initial texture limit for tiling large images; see setMaxTextureSize. */
   maxTextureSize?: number;
   materialBackend?: "webgl" | "webgpu";
@@ -117,6 +119,7 @@ export class ThreeMaterialRasterLayer {
     this.rasterResolutionPlanner.invalidate(); this.needsResolutionUpdate = true; this.onChange?.();
   });
   private onChange: (() => void) | null = null;
+  private hostRenderer: Parameters<ThreeRasterCompression["setHost"]>[0] | undefined;
   private memoryAllowance: number | undefined;
   private rasterResolutionView: RasterResolutionView | null = null;
   private rasterResolutionSources: RasterLayerSource[] | null = null;
@@ -189,48 +192,62 @@ export class ThreeMaterialRasterLayer {
     const rasterSources = getSceneRasterLayers(scene);
     this.rasterResolutionSources = rasterSources;
     // The automatic scene budget applies even before a host reports its texture limit.
-    this.maxTextureSize = options.maxTextureSize ?? Number.POSITIVE_INFINITY;
-    const memoryPlan = this.rasterResolutionPlanner.plan(rasterSources, this.maxTextureSize, null);
-    reportRasterMemoryBudget(memoryPlan, this);
-    for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
-      const source = rasterSources[rasterIndex];
-      const plan = memoryPlan.plans[rasterIndex];
-      const textures = createRasterTileTextures(source, plan, rasterIndex, this.maxTextureSize);
-      for (const texture of textures) this.ownedTextures.add(texture);
-      const rasterOrderOffset = (rasterIndex + 1) / (rasterSources.length + 1);
-      const entry = this.createEntry(
-        textures[0],
-        source.matrix,
-        HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset,
-        this.geometry,
-        this.vectorClipIndices[rasterIndex] ?? -1,
-        source.opacity ?? 1,
-        rasterIndex,
-        plan.tiles[0]
-      );
-      entry.mesh.userData.heprDrawRun = { kind: "raster", first: rasterIndex, count: 1 };
-      const run = rasterRuns[rasterIndex];
-      const multiply = !scene.paintGraph && run?.blendMode === "Multiply";
-      if (multiply) this.applyMultiply(entry);
-      entry.mesh.visible = false;
-      const residentEntry: ResidentRasterLayerEntry = {
-        ...entry,
-        run,
-        texture: textures[0],
-        resident: false,
-        image: { rasterIndex, source, plan, multiply, tiles: [] }
-      };
-      this.entries.push(residentEntry);
-      this.rasterEntries.push(residentEntry);
-      this.group.add(entry.mesh);
-      this.addRasterTiles(residentEntry, textures);
+    const previous = options.previousLayer;
+    this.maxTextureSize = options.maxTextureSize ?? previous?.maxTextureSize ?? Number.POSITIVE_INFINITY;
+    this.memoryAllowance = previous?.memoryAllowance;
+    if (previous?.rasterTextureResidencyEnabled) {
+      this.rasterResolutionView = previous.snapshotResolutionView(rasterSources);
+      this.rasterResolutionPlanner.inheritTiers(previous.rasterResolutionPlanner,
+        previous.rasterResolutionSources ?? [], rasterSources);
+      if (previous.hostRenderer) this.setHostRenderer(previous.hostRenderer);
     }
+    let initial: ReturnType<ThreeMaterialRasterLayer["createInitialRasterTextures"]>;
+    try { initial = this.createInitialRasterTextures(rasterSources); }
+    catch (error) { this.dispose(); throw error; }
+    const { memoryPlan, textures: initialTextures } = initial;
+    for (const tiles of initialTextures) for (const texture of tiles) this.ownedTextures.add(texture);
+    reportRasterMemoryBudget(memoryPlan, this);
+    try {
+      for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
+        const source = rasterSources[rasterIndex];
+        const plan = memoryPlan.plans[rasterIndex];
+        const textures = initialTextures[rasterIndex];
+        const rasterOrderOffset = (rasterIndex + 1) / (rasterSources.length + 1);
+        const entry = this.createEntry(
+          textures[0],
+          source.matrix,
+          HEPR_THREE_LAYER_ORDER_RASTER + rasterOrderOffset,
+          this.geometry,
+          this.vectorClipIndices[rasterIndex] ?? -1,
+          source.opacity ?? 1,
+          rasterIndex,
+          plan.tiles[0]
+        );
+        entry.mesh.userData.heprDrawRun = { kind: "raster", first: rasterIndex, count: 1 };
+        const run = rasterRuns[rasterIndex];
+        const multiply = !scene.paintGraph && run?.blendMode === "Multiply";
+        if (multiply) this.applyMultiply(entry);
+        entry.mesh.visible = false;
+        const residentEntry: ResidentRasterLayerEntry = {
+          ...entry,
+          run,
+          texture: textures[0],
+          resident: false,
+          image: { rasterIndex, source, plan, multiply, tiles: [] }
+        };
+        this.entries.push(residentEntry);
+        this.rasterEntries.push(residentEntry);
+        this.group.add(entry.mesh);
+        this.addRasterTiles(residentEntry, textures);
+      }
+    } catch (error) { this.dispose(); throw error; }
     this.updateMaxRasterTextureDimension();
     try {
       // 2048 is within WebGL2's minimum texture limit. The shared planner
       // applies the same per-batch and total allocation bounds as native paths.
       // Both Three backends generate ordinary image mips by linear sampling.
       const batches = memoryPlan.resolutionScale === 1 && !memoryPlan.overBudget &&
+        memoryPlan.compressionFormats.every(format => !format) &&
         memoryPlan.plans.every((plan, index) => plan.width === rasterSources[index].width && plan.height === rasterSources[index].height) &&
         rasterSources.length === scene.rasterLayers.length
         ? buildRasterStripBatches(scene, 2048, "linear") : [];
@@ -256,9 +273,48 @@ export class ThreeMaterialRasterLayer {
   }
 
   private availableRasterBytes(): number {
-    const workspace = this.rasterEntries.some(entry => entry.image!.source.compressionEligible)
+    const eligible = this.rasterResolutionSources?.some(source => source.compressionEligible) ??
+      this.rasterEntries.some(entry => entry.image!.source.compressionEligible);
+    const workspace = eligible
       ? this.compression.workspaceBytes : 0;
     return this.memoryAllowance ?? automaticRasterMemoryBudget().bytes - workspace;
+  }
+
+  /** Snapshot projections by page, since incoming raster indices and transform tables can differ. */
+  private snapshotResolutionView(sources: RasterLayerSource[]): RasterResolutionView | null {
+    const view = this.rasterResolutionView;
+    if (!view) return null;
+    if (!view.projection) return { ...view, ...(view.localToClip ? { localToClip: Array.from(view.localToClip) } : {}) };
+    const projections = new Map<number, number[] | null>();
+    if (this.pageTransforms) {
+      this.pageTransforms.projectionElements.forEach((projection, page) =>
+        projections.set(page, this.pageTransforms!.visibility[page] ? [...projection] : null));
+    } else {
+      this.rasterResolutionSources?.forEach((source, index) => {
+        const projection = view.projection!(index);
+        projections.set(source.pageIndex ?? 0, projection ? Array.from(projection) : null);
+      });
+    }
+    return { ...view, projection: index => projections.get(sources[index].pageIndex ?? 0) ?? null };
+  }
+
+  private createInitialRasterTextures(sources: RasterLayerSource[]) {
+    for (let attempt = 0; ; attempt++) {
+      const format = this.compression.format;
+      const memoryPlan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize,
+        this.rasterResolutionView, this.availableRasterBytes(), format);
+      const textures: THREE.Texture[][] = [];
+      try {
+        for (const [index, source] of sources.entries()) textures.push(createRasterTileTextures(source,
+          memoryPlan.plans[index], index, this.maxTextureSize, this.compression, memoryPlan.compressionFormats[index]));
+        return { memoryPlan, textures };
+      } catch (error) {
+        for (const tiles of textures) for (const texture of tiles) texture.dispose();
+        if (attempt >= 2 || this.compression.format === format) throw error;
+        this.rasterResolutionPlanner.invalidate();
+        console.warn("[HEPR] Raster compression unavailable during page update; using bounded fallback textures.", error);
+      }
+    }
   }
 
   /** Allocate one document budget across independent page projections, including offscreen overview tiers. */
@@ -278,6 +334,7 @@ export class ThreeMaterialRasterLayer {
   }
 
   setHostRenderer(renderer: Parameters<ThreeRasterCompression["setHost"]>[0]): void {
+    this.hostRenderer = renderer;
     this.compression.setHost(renderer);
   }
 
@@ -424,10 +481,12 @@ export class ThreeMaterialRasterLayer {
     this.rasterTextureResidencyEnabled = resident;
     if (resident) {
       const sources = this.rasterResolutionSources ??= this.rasterEntries.map(entry => entry.image!.source);
-      // External handles were released with residency. Recreate drawable tiers
-      // within an uncompressed budget before the host can upload them again.
+      // Newly staged compressed handles are already drawable. Released handles
+      // need an uncompressed budget before the host can upload them again.
+      const liveCompressed = this.rasterEntries.some(entry => threeRasterTextureInfo(entry.texture).compressionFormat &&
+        (entry.texture as THREE.Texture & { sourceTexture?: unknown }).sourceTexture);
       const plan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize,
-        this.rasterResolutionView, this.availableRasterBytes());
+        this.rasterResolutionView, this.availableRasterBytes(), liveCompressed ? this.compression.format : null);
       if (plan.resolutionScale < 1 || plan.overBudget) this.destroyStripBatches();
       for (const [index, entry] of this.rasterEntries.entries()) {
         if (entry.batched) {
@@ -437,11 +496,13 @@ export class ThreeMaterialRasterLayer {
           continue;
         }
         const desiredBytes = estimateRasterSourcePlanBytes({ width: sources[index].width, height: sources[index].height,
-          monochrome: sources[index].monochrome, reducedMonochrome: true }, plan.plans[index]);
-        if (threeRasterTextureInfo(entry.texture).compressionFormat || this.rasterImageBytes(entry) > desiredBytes) {
+          monochrome: sources[index].monochrome, reducedMonochrome: true }, plan.plans[index], plan.compressionFormats[index]);
+        const released = threeRasterTextureInfo(entry.texture).compressionFormat &&
+          !(entry.texture as THREE.Texture & { sourceTexture?: unknown }).sourceTexture;
+        if (released || this.rasterImageBytes(entry) > desiredBytes) {
           const image = entry.image!;
           this.setRasterImage(entry, image.source, plan.plans[index], createRasterTileTextures(image.source, plan.plans[index],
-            image.rasterIndex, this.maxTextureSize));
+            image.rasterIndex, this.maxTextureSize, this.compression, plan.compressionFormats[index]));
         }
         markThreeRasterTextureForUpload(entry.texture);
         for (const tile of entry.image?.tiles ?? []) markThreeRasterTextureForUpload(tile.texture);

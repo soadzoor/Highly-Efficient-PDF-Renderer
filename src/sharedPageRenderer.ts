@@ -1,4 +1,4 @@
-import type { RendererApi } from "./rendererTypes";
+import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import type { DrawStats, ViewState } from "./webGlFloorplanRenderer";
@@ -20,6 +20,7 @@ export class SharedPageRenderer {
     const identity = {}, config = new Map<string, unknown[]>();
     const colors = new Map<string, PrimitiveColorUpdate>();
     let source = initialScene, disposed = false, dirty = true;
+    let sceneOptions: SceneUpdateOptions | undefined;
     let view: ViewState = { cameraCenterX: 0, cameraCenterY: 0, zoom: 1 };
     let presented = { ...view }, serial = 0;
     let listener: ((stats: DrawStats) => void) | null = null;
@@ -35,7 +36,15 @@ export class SharedPageRenderer {
       const changed = this.active !== identity;
       if (changed) {
         this.active = identity;
-        try { native.setScene(source); } catch (error) { this.active = null; throw error; }
+        try {
+          if (sceneOptions?.preserveRasterResolution) {
+            if (this.canvas.width !== canvas.width || this.canvas.height !== canvas.height) {
+              this.canvas.width = canvas.width; this.canvas.height = canvas.height; native.resize();
+            }
+            native.setViewState(view, { scheduleFrame: false });
+          }
+          native.setScene(source, sceneOptions);
+        } catch (error) { this.active = null; throw error; }
         dirty = true;
       }
       if (this.canvas.width !== canvas.width || this.canvas.height !== canvas.height) {
@@ -66,7 +75,8 @@ export class SharedPageRenderer {
     const methods: Record<string, (...args: any[]) => unknown> = {
       dispose: () => { disposed = true; listener = null; provider = null; config.clear(); colors.clear(); replacements.clear();
         if (this.active === identity) { this.active = null; native.setFrameListener(null); native.setInteractionViewportProvider(null); } },
-      setScene: (scene: VectorScene) => { source = scene; if (this.active === identity) this.active = null; return acquire().getSceneStats(); },
+      setScene: (scene: VectorScene, options?: SceneUpdateOptions) => { source = scene; sceneOptions = options;
+        if (this.active === identity) this.active = null; return acquire().getSceneStats(); },
       getSceneStats: () => acquire().getSceneStats(),
       getViewState: () => ({ ...view }),
       setViewState: (next: ViewState) => { view = { ...next }; },

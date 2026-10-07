@@ -84,6 +84,19 @@ try {
   assert.equal(threeRasterTextureInfo(entry.texture).mode,1,"full detail retains one bit per source pixel");
   assert.match(entry.material.fragmentShader,/heprRasterBinaryLinear/);
   assert.equal(entry.material.uniforms.uRasterMonoMips.value,threeRasterTextureInfo(entry.texture).coverage);
+  layer.updateFrame({ ...view,zoom:.34 },viewport);
+  assert.equal(entry.image.plan.width,2048,"zoom hysteresis retains the previous sharp tier");
+  const incoming = createEmptyVectorScene();
+  const offscreen = source(2048,1024,1); offscreen.matrix[4] = 100000;
+  incoming.rasterLayers = [offscreen,Object.defineProperties({},Object.getOwnPropertyDescriptors(image))];
+  const replacement = new ThreeMaterialRasterLayer(incoming,{ pageBackground:[1,1,1,1],previousLayer:layer });
+  assert.equal(replacement.rasterEntries[1].image.plan.width,2048,"page completion preserves current detail despite shifted image indices");
+  assert.equal(replacement.rasterEntries[0].image.plan.width,128,"new offscreen images keep bounded previews");
+  replacement.setTextureResidency(true); replacement.updateFrame({ ...view,zoom:.34 },viewport);
+  assert.equal(replacement.rasterEntries[1].image.plan.width,2048,"the next frame does not demote the inherited tier");
+  for (let i=0;i<3;i++) replacement.updateFrame({ ...view,zoom:.01 },viewport);
+  assert(replacement.rasterEntries[1].image.plan.width <= 128,"preservation still allows zoom-out demotion");
+  replacement.dispose();
   layer.updateFrame({ ...view,zoom:.01 },viewport);
   assert.equal(threeRasterTextureInfo(entry.texture).mode,2,"zoom-out demotes the native Three material");
   layer.setMemoryAllowance(65536); layer.updateFrame(view,viewport);
@@ -139,6 +152,14 @@ try {
       "the Three material planner compresses eligible photos before reducing their resolution");
     assert(photos.rasterEntries.every(entry=>entry.image.plan.width === 1024));
     assert(photos.rasterEntries.reduce((bytes,entry)=>bytes+photos.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes);
+    const rebuilt = new ThreeMaterialRasterLayer(photoScene,{ pageBackground:[1,1,1,1],materialBackend:"webgpu",webGpu,previousLayer:photos });
+    assert(rebuilt.rasterEntries.every(entry=>entry.image.plan.width === 1024 && threeRasterTextureInfo(entry.texture).compressionFormat === "bc7"),
+      "progressive replacement starts with sharp compressed tiers, rather than RGBA previews");
+    const stagedTextures = rebuilt.rasterEntries.map(entry=>entry.texture);
+    rebuilt.setTextureResidency(true); rebuilt.updateFrame(view,viewport);
+    assert.deepEqual(rebuilt.rasterEntries.map(entry=>entry.texture),stagedTextures,"activation retains newly staged external handles");
+    assert(rebuilt.rasterEntries.reduce((bytes,entry)=>bytes+rebuilt.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes);
+    rebuilt.dispose();
     photos.setTextureResidency(false); photos.setTextureResidency(true);
     assert(photos.rasterEntries.every(entry=>!threeRasterTextureInfo(entry.texture).compressionFormat),
       "returning from native fallback recreates released external handles as drawable textures");

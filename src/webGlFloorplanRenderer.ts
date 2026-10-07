@@ -19,6 +19,7 @@ import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, type Rast
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
   estimateRasterSourcePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
+import type { SceneUpdateOptions } from "./rendererTypes";
 import { buildMonochromeMipChain, detectMonochromeRaster,
   monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
@@ -1747,14 +1748,21 @@ export class WebGlFloorplanRenderer {
     this.requestFrame();
   }
 
-  setScene(scene: VectorScene): SceneStats {
+  setScene(scene: VectorScene, options: SceneUpdateOptions = {}): SceneStats {
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
     }
     if (this.scene !== scene) {
-      this.rasterResolutionPlanner = new RasterResolutionPlanner();
-      this.rasterResolutionView = null;
-      this.rasterResolutionSources = null;
+      if (options.preserveRasterResolution) {
+        this.rasterResolutionPlanner?.invalidate();
+        if (this.rasterResolutionView) this.rasterResolutionView = { ...this.rasterResolutionView,
+          width: this.canvas.width, height: this.canvas.height,
+          cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom };
+      } else {
+        this.rasterResolutionPlanner = new RasterResolutionPlanner();
+        this.rasterResolutionView = null;
+        this.rasterResolutionSources = null;
+      }
       this.performanceProfiler?.stop();
       this.rasterLayerUpdates.clear();
       this.paintCompositor?.dispose(); this.paintCompositor = null;
@@ -4797,6 +4805,9 @@ export class WebGlFloorplanRenderer {
   private uploadRasterLayers(scene: VectorScene): void {
     const canCompress = selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
     const rasterSources = this.getSceneRasterLayers(scene).map(source => this.classifyRasterLayerSource(source, canCompress));
+    if (this.rasterResolutionPlanner && this.rasterResolutionSources) {
+      this.rasterResolutionPlanner.inheritTiers(this.rasterResolutionPlanner, this.rasterResolutionSources, rasterSources);
+    }
     this.rasterResolutionSources = rasterSources;
     const maxRasterTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
     this.destroyRasterLayerTextures();

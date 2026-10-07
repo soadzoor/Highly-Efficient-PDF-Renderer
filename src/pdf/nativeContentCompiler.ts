@@ -1242,6 +1242,8 @@ export interface DensePdfResourceReferences {
 
 export interface DensePdfResourceScanOptions {
   readonly signal?: AbortSignal;
+  /** Internal text-only interpreter; operands use the native text sink representation. */
+  readonly onOperator?: (operator: string, operands: readonly unknown[], markedContentProperty?: import("./nativeCos").PdfValue) => void;
 }
 
 /**
@@ -1270,7 +1272,7 @@ export function scanDensePdfPreparedResourceReferences(
   options: DensePdfResourceScanOptions = {}
 ): DensePdfResourceReferences {
   options.signal?.throwIfAborted();
-  const scanner = new DensePdfResourceReferenceScanner();
+  const scanner = new DensePdfResourceReferenceScanner(options.onOperator);
   let tokenCount = 0;
   const lexer = new IncrementalPdfLexer((token) => {
     if ((tokenCount++ & 0xfff) === 0) options.signal?.throwIfAborted();
@@ -4829,6 +4831,11 @@ class DenseContentCompiler {
 }
 
 class DensePdfResourceReferenceScanner {
+  private readonly onOperator?: DensePdfResourceScanOptions["onOperator"];
+
+  constructor(onOperator?: DensePdfResourceScanOptions["onOperator"]) {
+    this.onOperator = onOperator;
+  }
   readonly xObjects = new Set<string>();
 
   readonly properties = new Set<string>();
@@ -4947,6 +4954,8 @@ class DensePdfResourceReferenceScanner {
         break;
       }
     }
+    this.onOperator?.(token.value, this.operands.map(toTextSinkOperand),
+      token.value === "BDC" ? contentOperandToCos(this.operands[1]) : undefined);
     this.operands.length = 0;
   }
 
@@ -5007,6 +5016,13 @@ class DensePdfResourceReferenceScanner {
         : { kind: "dictionary", value: container.entries }
     );
   }
+}
+
+function contentOperandToCos(value: PdfValue): import("./nativeCos").PdfValue {
+  if (isPdfArray(value)) return value.value.map(contentOperandToCos);
+  if (isPdfDictionary(value)) return new Map(value.value.map(([key, entry]) => [key, contentOperandToCos(entry)]));
+  if (isPdfString(value)) return { kind: "string", bytes: value.value, hex: false };
+  return value;
 }
 
 class IncrementalPdfLexer {

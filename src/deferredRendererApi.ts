@@ -1,5 +1,5 @@
 import type { VectorScene } from "./pdfVectorExtractor";
-import type { RendererApi } from "./rendererTypes";
+import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
 import type { SceneStats } from "./webGlFloorplanRenderer";
 import { createEmptyVectorScene } from "./emptyVectorScene";
 
@@ -20,7 +20,7 @@ export interface DeferredSceneRendererApi extends RendererApi {
   /** Upload the pending scene now, returning its native resource statistics. */
   ensureSceneUploaded(): SceneStats;
   /** Release any old native scene and defer a new viewing window. */
-  replaceDeferredScene(scene: VectorScene): void;
+  replaceDeferredScene(scene: VectorScene, options?: SceneUpdateOptions): void;
 }
 
 const SCENE_RESOURCE_METHODS = new Set<PropertyKey>([
@@ -42,6 +42,7 @@ export function deferRendererSceneUpload(
   initialScene: VectorScene
 ): DeferredSceneRendererApi {
   let pendingScene = initialScene;
+  let pendingOptions: SceneUpdateOptions | undefined;
   let sceneUploaded = false;
   let disposed = false;
   let uploadedStats: SceneStats | null = null;
@@ -52,7 +53,7 @@ export function deferRendererSceneUpload(
       throw new Error("Cannot upload a scene after the native renderer has been disposed.");
     }
     if (!sceneUploaded) {
-      uploadedStats = renderer.setScene(pendingScene);
+      uploadedStats = renderer.setScene(pendingScene, pendingOptions);
       sceneUploaded = true;
     }
     if (!uploadedStats) {
@@ -62,9 +63,10 @@ export function deferRendererSceneUpload(
   };
 
   const hasUploadedScene = (): boolean => sceneUploaded;
-  const setScene = (scene: VectorScene): SceneStats => {
+  const setScene = (scene: VectorScene, options?: SceneUpdateOptions): SceneStats => {
     pendingScene = scene;
-    const stats = renderer.setScene(scene);
+    pendingOptions = options;
+    const stats = renderer.setScene(scene, options);
     uploadedStats = stats;
     sceneUploaded = true;
     return stats;
@@ -86,10 +88,10 @@ export function deferRendererSceneUpload(
         return setScene;
       }
       if (property === "replaceDeferredScene") {
-        return (scene: VectorScene): void => {
+        return (scene: VectorScene, options?: SceneUpdateOptions): void => {
           if (disposed) throw new Error("Cannot replace a disposed renderer scene.");
-          if (sceneUploaded) renderer.setScene(createEmptyVectorScene());
-          pendingScene = scene; sceneUploaded = false; uploadedStats = null;
+          if (sceneUploaded) renderer.setScene(createEmptyVectorScene(), options);
+          pendingScene = scene; pendingOptions = options; sceneUploaded = false; uploadedStats = null;
         };
       }
       if (property === "dispose") {

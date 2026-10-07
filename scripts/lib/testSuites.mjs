@@ -62,6 +62,7 @@ export const fastTests = [
   "raster-memory-budget",
   "raster-resolution",
   "pdf-page-demand",
+  "native-ocr-text",
   "three-page-demand",
   "page-loading-placeholders",
   "three-raster-storage",

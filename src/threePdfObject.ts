@@ -944,7 +944,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.rendererType = rendererType;
     this.rendererConfig = rendererConfig;
     this.pageDemand = loadedScene.pageDemand;
-    this.sourceBytes = this.pageDemand ? loadedScene.sourceBytes : undefined;
+    // Both eager and demand-loaded PDFs can be reopened with another viewing mode.
+    this.sourceBytes = loadedScene.sourceKind === "pdf" ? loadedScene.sourceBytes : undefined;
     this.sourceOptions = loadedScene.sourceOptions ? { ...loadedScene.sourceOptions, signal: undefined, onProgress: undefined } : undefined;
     this.pendingInitialFit = true;
     this.installSceneContent([loadedScene, rendererType, renderer, renderCanvas, renderTexture, rendererConfig, initialFitPaddingPixels, rasterMaterialLayer, gradientMaterialLayer, fillMaterialLayer, strokeMaterialLayer, triangleStrokeLayer, vectorLodStrokeLayer, compactedStrokeLayer, textMaterialLayer, textLodLayer, pageMesh, uvArray, uvAttribute, drawPlan, pageTransforms, webGpu]);
@@ -1091,9 +1092,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   async loadCompleteScene(options: { signal?: AbortSignal; pages?: string } = {}): Promise<LoadedPdfScene["scene"]> {
     const signal = options.signal;
     signal?.throwIfAborted();
-    if (!this.pageDemand || !this.sourceBytes) return this.sceneData;
+    if ((!this.pageDemand && !this.sourceOptions?.ocrTextOnly) || !this.sourceBytes) return this.sceneData;
     const { loadPdfSceneFromSource } = await import("./pdfObjectGenerator");
-    return (await loadPdfSceneFromSource(this.sourceBytes, { ...this.sourceOptions, ...options })).scene;
+    return (await loadPdfSceneFromSource(this.sourceBytes, { ...this.sourceOptions, ...options, ocrTextOnly: false })).scene;
   }
 
   private scheduleDemandUpdate(): void {
@@ -1143,7 +1144,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     let committed = false;
     try {
       staged.push({ object: this, content: await createThreePdfContent({ scene, sourceKind: this.sourceKind,
-        sourceLabel: this.sourceLabel }, this.contentOptions(), signal, undefined, undefined, undefined, yieldControl, this.renderer, this.renderCanvas) });
+        sourceLabel: this.sourceLabel }, this.contentOptions(), signal, undefined, undefined, undefined, yieldControl,
+        this.renderer, this.renderCanvas, this.rasterMaterialLayer) });
       if (this.pageViews) {
         partition = new ScenePageViews(scene);
         for (const [index, page] of this.pageViews.entries()) {
@@ -1151,13 +1153,13 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
           const view = partition.extract(index);
           staged.push({ object: page.object, content: await createThreePdfContent({ scene: view.scene,
             sourceKind: this.sourceKind, sourceLabel: page.object.sourceLabel }, page.object.contentOptions(),
-          signal, undefined, undefined, undefined, yieldControl, page.object.renderer, page.object.renderCanvas) });
+          signal, undefined, undefined, undefined, yieldControl, page.object.renderer, page.object.renderCanvas, page.object.rasterMaterialLayer) });
         }
         if (this.pageBatch && !sceneRequiresPaintCompositing(scene) && !scene.retainedPages?.length) {
           table = new ThreePageTransforms(partition);
           staged.push({ object: this.pageBatch, content: await createThreePdfContent({ scene,
             sourceKind: this.sourceKind, sourceLabel: this.pageBatch.sourceLabel }, this.contentOptions(),
-          signal, undefined, undefined, table, yieldControl, this.pageBatch.renderer, this.pageBatch.renderCanvas) });
+          signal, undefined, undefined, table, yieldControl, this.pageBatch.renderer, this.pageBatch.renderCanvas, this.pageBatch.rasterMaterialLayer) });
         }
       }
       await this.waitForPendingLayers(signal);
@@ -1170,7 +1172,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         object.disposeSceneContent();
         object.pageTransforms?.dispose();
         object.installSceneContent(content);
-        (object.renderer as DeferredSceneRendererApi).replaceDeferredScene(content[0].scene);
+        (object.renderer as DeferredSceneRendererApi).replaceDeferredScene(content[0].scene, { preserveRasterResolution: true });
       }
       committed = true;
       if (partition && this.pageViews) {
@@ -1188,7 +1190,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       }
       // Clearing a previously uploaded page uses the shared native renderer.
       // Restore the document's pending scene and callbacks after all page updates.
-      (this.renderer as DeferredSceneRendererApi).replaceDeferredScene(scene);
+      (this.renderer as DeferredSceneRendererApi).replaceDeferredScene(scene, { preserveRasterResolution: true });
       this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
       this.attachNativeFrameListener(this.renderer);
       await this.trackLayerUpdate(this.layerVisibility.replaceScene(scene));
@@ -4128,7 +4130,8 @@ async function createThreePdfContent(
   /** Lets long background preparation return to the event loop between layers. */
   yieldControl?: () => Promise<void>,
   reuseRenderer?: RendererApi,
-  reuseCanvas?: HTMLCanvasElement
+  reuseCanvas?: HTMLCanvasElement,
+  previousRasterLayer?: ThreeMaterialRasterLayer
 ): Promise<ThreePdfContent> {
   signal?.throwIfAborted();
   const rendererType = options.rendererType ?? "webgl";
@@ -4181,6 +4184,7 @@ async function createThreePdfContent(
 
     const rasterMaterialLayer = new ThreeMaterialRasterLayer(loadedScene.scene, {
       pageTransforms,
+      previousLayer: previousRasterLayer,
       materialBackend,
       webGpu,
       colorCompositing: rendererConfig.threeColorCompositing,
