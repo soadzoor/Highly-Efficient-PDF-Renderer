@@ -546,7 +546,8 @@ function readNativeVectorSession(session: PdfSession): NativeVectorPdfSession {
   return session as NativeVectorPdfSession;
 }
 
-function reportNativePdfProgress(
+/** @internal Shared progress mapping for full-document and viewing compilation. */
+export function reportNativePdfProgress(
   reporter: LoadProgressReporter,
   event: Readonly<PdfProgress>,
   context: {

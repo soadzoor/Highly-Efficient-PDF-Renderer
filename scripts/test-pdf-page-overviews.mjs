@@ -121,6 +121,14 @@ try {
     assert.equal(shortScan.scene.rasterLayers.length, 0);
     assert.equal(shortScan.pageDemand.detailedCount, 0);
   } finally { await shortScan.pageDemand.close(); }
+  const fullBook = await loadPdfSceneFromSource(fixture({ pageCount: 20, poisonImage: true }), {}, undefined, true);
+  try {
+    assert.equal(fullBook.pageDemand.previewCount, 20, "large OCR books prepare every overview by default");
+    assert.equal(fullBook.scene.textInstanceCount, 40);
+    assert.equal(fullBook.scene.rasterLayers.length, 0, "full parsing still avoids all scan codecs until zoom");
+    assert(!fullBook.scene.pendingPagePreviews?.some(Boolean));
+    assert.equal(fullBook.pageDemand.detailedCount, 0);
+  } finally { await fullBook.pageDemand.close(); }
 
   // Both Three material backends must replace text and raster content together,
   // including independent and batched page handles, without a browser or GPU.

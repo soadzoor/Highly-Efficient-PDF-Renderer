@@ -81,6 +81,7 @@ const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-selec
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
+const pageStreamingCheckbox = document.querySelector<HTMLInputElement>("#page-streaming-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 const pdfLayersContainer = document.querySelector<HTMLDivElement>("#pdf-layers");
 const pdfAnnotationsContainer = document.querySelector<HTMLDivElement>("#pdf-annotations");
@@ -135,6 +136,7 @@ if (
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
   !ocrTextCheckbox ||
+  !pageStreamingCheckbox ||
   !drawingSelectionContainer ||
   !pdfLayersContainer ||
   !pdfAnnotationsContainer ||
@@ -186,6 +188,7 @@ const textLodSelectElement = textLodSelect;
 const touchRotateCheckboxElement = touchRotateCheckbox;
 const textSelectionCheckboxElement = textSelectionCheckbox;
 const ocrTextCheckboxElement = ocrTextCheckbox;
+const pageStreamingCheckboxElement = pageStreamingCheckbox;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -817,6 +820,10 @@ ocrTextCheckboxElement.addEventListener("change", () => {
   if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
 }, { signal: lifetimeSignal });
 
+pageStreamingCheckboxElement.addEventListener("change", () => {
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}, { signal: lifetimeSignal });
+
 for (const button of pageLayoutButtons) {
   button.addEventListener("click", () => {
     void setPageLayout(readPageLayout(button.dataset.pageLayout));
@@ -1370,11 +1377,12 @@ function disposeExample(): void {
   renderer.dispose();
 }
 
-function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> & { ocrTextOnly: boolean } {
+function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> & { ocrTextOnly: boolean; pageLoading: "all" | "auto" } {
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
     ocrTextOnly: ocrTextCheckboxElement.checked,
+    pageLoading: pageStreamingCheckboxElement.checked ? "auto" : "all",
     threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
     textLod: readTextLodMode(),
@@ -1525,7 +1533,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
   let targetInstalled = false;
   let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
 
-  setStatus(reparseSource ? `Changing text view for ${previousObject.sourceLabel}...`
+  setStatus(reparseSource ? `Changing PDF view for ${previousObject.sourceLabel}...`
     : `Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
   setLoadingProgress(true, "Preparing renderer...");
   setLoadControlsEnabled(false);
@@ -1776,6 +1784,8 @@ function setPanelCollapsed(collapsed: boolean): void {
 function setLoadControlsEnabled(enabled: boolean): void {
   ocrTextCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
   if (enabled && currentPdfObject) ocrTextCheckboxElement.checked = currentPdfObject.sourceOptions?.ocrTextOnly === true;
+  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto";
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);

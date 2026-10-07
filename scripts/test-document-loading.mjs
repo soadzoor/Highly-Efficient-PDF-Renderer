@@ -25,6 +25,7 @@ const context = vm.createContext({
   activePdfPageLoader: null, demandPdfUpdatePending: false,
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
   lastLoadedPdfPassword: undefined, loadedOcrTextOnly: false, ocrTextCheckbox: { checked: false, disabled: false },
+  loadedPageStreaming: false, pageStreamingCheckbox: { checked: false, disabled: false },
   lastParsedSceneLabel: null, parsedPdfPageCache: null,
   exampleManifestEntries: [], exampleSelectionMap: new Map(),
   exampleDropdown: { setDisabled: noop },
@@ -77,7 +78,7 @@ for (const name of [
   "getExtractionOptions", "buildPdfPageCacheKey", "getCachedPdfPageScenes", "storeCachedPdfPageScenes",
   "commitLoadedSource", "uploadSceneWithRollback", "beginSourceLoad", "finishSourceLoad",
   "isCurrentSourceLoad", "beginSceneLoad", "finishSceneLoad", "updateBackendSelectDisabledState", "downloadHep",
-  "reloadOcrTextView"
+  "reloadPdfViewingOptions"
 ]) vm.runInContext(sourceFunction(source, name), context);
 
 await context.loadPdfFile(file("A.pdf", 65));
@@ -156,6 +157,7 @@ let demandClosed = false, demandPaused = false;
 const demand = { pageCount: 17, pageScenes: [{ ...scene(73), segmentCount: 0 }], password: "secret",
   pause() { demandPaused = true; }, resume() { demandPaused = false; }, async close() { demandClosed = true; } };
 context.openPdfPageDemand = async () => demand;
+context.pageStreamingCheckbox.checked = true;
 await context.loadPdfFile(file("paged.pdf", 73));
 assertDocument(73, "paged.pdf");
 assert.equal(context.activePdfPageLoader, demand);
@@ -167,27 +169,48 @@ await context.loadHepFile(file("replacement.hep", 74));
 assert.equal(context.activePdfPageLoader, null);
 assert.equal(demandClosed, true, "document replacement closes the paging worker");
 
+// With streaming off, even a large vector document is prepared and uploaded as one scene.
+let initialLoads = 0, batchClosed = false;
+const batch = { pageCount: 17, requiresPageDemand: false, pageScenes: Array.from({ length: 17 }, () => scene(76)),
+  async loadInitialOverviews(signal, retainAll) { signal.throwIfAborted(); assert.equal(retainAll, true); initialLoads++; },
+  async close() { batchClosed = true; } };
+context.openPdfPageDemand = async () => batch;
+await context.loadPdfFile(file("full-book.pdf", 76));
+assertDocument(76, "full-book.pdf");
+assert.equal(initialLoads, 1);
+assert.equal(batchClosed, true, "completed vector documents release the paging worker");
+assert.equal(context.activePdfPageLoader, null);
+assert.equal(context.parsedPdfPageCache.pageScenes.length, 17);
+assert.equal(context.loadedPageStreaming, false);
+const batchView = { ...view };
+context.pageStreamingCheckbox.checked = true;
+context.openPdfPageDemand = async () => { throw new Error("streaming reload failed"); };
+await context.reloadPdfViewingOptions();
+assert.equal(context.pageStreamingCheckbox.checked, false, "failed reload restores the selected loading mode");
+assertDocument(76, "full-book.pdf");
+assert.deepEqual(view, batchView);
+
 // Switching text mode uses the original source, keeps the view, and cannot export the approximation.
 context.openPdfPageDemand = openShortDocument;
 nextParse = async (buffer, options) => [{ ...scene(new Uint8Array(buffer)[0]), mode: options.ocrTextOnly === true }];
 await context.loadPdfFile(file("ocr.pdf", 75));
 const beforeOcrView = { ...view };
 context.ocrTextCheckbox.checked = true;
-await context.reloadOcrTextView();
+await context.reloadPdfViewingOptions();
 assert.equal(context.lastParsedScene.mode, true);
 assert.equal(context.loadedOcrTextOnly, true);
-assert.equal(context.parsedPdfPageCache.optionsKey, "merge:1|cull:1|ocr:1");
+assert.equal(context.parsedPdfPageCache.optionsKey, "merge:1|cull:1|ocr:1|stream:0");
 assert.deepEqual(view, beforeOcrView);
 await context.downloadHep();
 assert.equal(exports.at(-1).scene[0], 75, "text-only export supplies original PDF bytes");
 nextParse = async () => { throw new Error("failed to restore scans"); };
 context.ocrTextCheckbox.checked = false;
-await context.reloadOcrTextView();
+await context.reloadPdfViewingOptions();
 assert.equal(context.lastParsedScene.mode, true);
 assert.equal(context.ocrTextCheckbox.checked, true, "failed mode switch restores its checkbox");
 nextParse = async (buffer, options) => [{ ...scene(new Uint8Array(buffer)[0]), mode: options.ocrTextOnly === true }];
 context.ocrTextCheckbox.checked = false;
-await context.reloadOcrTextView();
+await context.reloadPdfViewingOptions();
 assert.equal(context.lastParsedScene.mode, false);
 assert.equal(context.loadedOcrTextOnly, false);
 assert.deepEqual(view, beforeOcrView);

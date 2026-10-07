@@ -85,8 +85,8 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
    */
   maxPagesPerRow?: number;
 
-  /** Load scan pixels on camera demand; large PDFs also defer page operators. Eager extracts complete original content. */
-  pageLoading?: "auto" | "eager";
+  /** Default all prepares every viewing page before display. Auto streams large PDFs; eager also decodes original scan pixels. */
+  pageLoading?: "all" | "auto" | "eager";
 
   /** PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding. */
   ocrTextOnly?: boolean;
@@ -230,8 +230,9 @@ async function loadPdfSceneFromSourceInternal(
       const loader = await openPdfPageDemand(createParseBuffer(sourceBytes), extractOptions, () => {}, signal);
       try {
         signal?.throwIfAborted();
-        if (loader.pageCount <= 16) await loader.loadInitialOverviews(signal);
-        if (loader.pageCount > 16 || loader.requiresPageDemand) {
+        const streaming = options.pageLoading === "auto";
+        if (!streaming || loader.pageCount <= 16) await loader.loadInitialOverviews(signal, !streaming);
+        if ((streaming && loader.pageCount > 16) || loader.requiresPageDemand) {
           const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
           const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
           progress.complete({ sourceType: "pdf" });

@@ -1,5 +1,6 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, deriveSceneTextContentFromIndex, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, deriveSceneTextContentFromIndex, reportNativePdfProgress, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import { createLoadProgressReporter, type LoadProgressReporter } from "./loadProgress";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { automaticRasterMemoryBudget } from "./rasterMemoryBudget";
 import { sceneCpuBytes } from "./pageRasterPreview";
@@ -27,6 +28,8 @@ export class PdfPageDemandLoader {
   private visibleKey = "";
   private reportedPreviewEviction = false;
   private allPreviews = false;
+  private initialProgress: LoadProgressReporter | null = null;
+  private retainAllOverviews = false;
   private closed = false;
   private paused = false;
   private running: Promise<void> | null = null;
@@ -58,7 +61,7 @@ export class PdfPageDemandLoader {
   setOnChange(onChange: () => void | Promise<void>): void { this.onChange = onChange; }
   get previewCount(): number { return this.previews.size; }
   get detailedCount(): number { return this.detailed.size; }
-  /** Small vector-only documents can keep their complete scene without a paging worker. */
+  /** Fully compiled vector documents can keep their complete scene without a paging worker. */
   get requiresPageDemand(): boolean {
     return this.previews.size !== this.pageCount || [...this.overviewKinds.values()].some(kind => kind !== "vector");
   }
@@ -140,16 +143,18 @@ export class PdfPageDemandLoader {
 
   /** Search can fill the document's preview text index while visible detail retains priority. */
   requestAllPreviews(): void { this.allPreviews = true; this.start(); }
-  /** Preserve synchronous scene availability for short vector PDFs, without decoding OCR scans. */
-  async loadInitialOverviews(signal?: AbortSignal): Promise<void> {
+  /** Collect the initial scene without per-page uploads or frame waits; scans still decode on zoom. */
+  async loadInitialOverviews(signal?: AbortSignal, retainAll = false): Promise<void> {
     signal?.throwIfAborted();
     const abort = () => this.pause();
     signal?.addEventListener("abort", abort, { once: true });
+    this.initialProgress = createLoadProgressReporter(this.options.onProgress);
+    this.retainAllOverviews ||= retainAll;
     try {
       this.requestAllPreviews();
       await this.whenIdle();
       signal?.throwIfAborted();
-    } finally { signal?.removeEventListener("abort", abort); }
+    } finally { this.initialProgress = null; signal?.removeEventListener("abort", abort); }
   }
   pause(): void { this.paused = true; this.operation?.abort(); }
   resume(): void { if (!this.closed) { this.paused = false; this.start(); } }
@@ -197,6 +202,11 @@ export class PdfPageDemandLoader {
       const { index, detail } = request;
       if (detail) this.attempted.add(index);
       const operation = this.operation = new AbortController();
+      const progress = this.initialProgress;
+      const pageProgress = { stage: "pdf-page" as const, sourceType: "pdf" as const, executionPath: "worker" as const,
+        unit: "pages" as const, total: this.pageCount, pageIndex: index, pageCount: this.pageCount,
+        sourcePageIndex: this.sourcePages[index], sourcePageCount: this.session.info.pages.length };
+      progress?.report(.12 + index / this.pageCount * .82, { ...pageProgress, processed: index });
       try {
         const scene = await this.session.compileVectorPage(this.sourcePages[index], {
           ocrTextOnly: this.options.ocrTextOnly,
@@ -205,7 +215,11 @@ export class PdfPageDemandLoader {
           enableInvisibleCull: this.options.enableInvisibleCull !== false,
           ...(detail ? {} : { previewMaxDimension: PREVIEW_DIMENSION }),
           ...(this.options.annotationAppearances ? { annotationAppearances: this.options.annotationAppearances } : {}),
-          onProgress: () => {}
+          onProgress: event => {
+            if (progress) reportNativePdfProgress(progress, event, {
+              selectionIndex: index, selectedPageCount: this.pageCount, sourcePageCount: this.session.info.pages.length
+            });
+          }
         });
         if (this.options.extractTextContent === true) scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
         if (this.closed || operation.signal.aborted) { this.attempted.delete(index); continue; }
@@ -217,8 +231,8 @@ export class PdfPageDemandLoader {
             this.overviewKinds.set(index, scene.pdfOverviewKind ?? (scene.rasterLayers.length || scene.retainedPages?.length ? "raster" : "vector"));
             this.refreshDetailDemand();
           }
-          this.trim(cache, detail);
-          await this.notifyChange();
+          if (detail || !this.retainAllOverviews) this.trim(cache, detail);
+          if (!progress) await this.notifyChange();
         }
       } catch (error) {
         if (operation.signal.aborted || this.closed) this.attempted.delete(index);
@@ -227,11 +241,12 @@ export class PdfPageDemandLoader {
           // A failed page is no longer getting an overview; do not animate indefinitely.
           this.placeholders[index].pendingPagePreviews?.fill(0);
           console.warn(`[HEPR] Page ${index + 1} could not be loaded; other pages remain available.`, error);
-          await this.notifyChange();
+          if (!progress) await this.notifyChange();
         }
       } finally { if (this.operation === operation) this.operation = null; }
-      // Worker work and scene updates stay sequential, with a paint opportunity between pages.
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      progress?.report(.12 + (index + 1) / this.pageCount * .82, { ...pageProgress, processed: index + 1 });
+      // Streaming offers a paint opportunity; initial full-document work goes straight to the next page.
+      if (!progress) await new Promise<void>(resolve => setTimeout(resolve, 0));
     }
   }
 

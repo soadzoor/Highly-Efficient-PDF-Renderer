@@ -80,7 +80,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `pages` | All pages | One-based PDF pages: `"2"`, `"1-3, 5"`, `"5-"`, or `"-3"`. |
 | `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
-| `pageLoading` | `"auto"` | Preserve vector pages; use stored OCR as scan overviews and load scan pixels on zoom. Only scans without usable OCR get small bitmap previews. PDFs with more than 16 selected pages also defer page operators until needed. `"eager"` extracts the complete original scene before returning. |
+| `pageLoading` | `"all"` | Prepare all viewing pages before display, with one initial scene upload. `"auto"` opts into viewport-driven streaming for PDFs with more than 16 selected pages. Both preserve vector pages, use stored OCR as scan overviews and load scan pixels on zoom; only scans without usable OCR get small bitmap previews. `"eager"` also decodes complete original scan content before returning. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
@@ -104,11 +104,13 @@ sharp at every zoom and do not allocate scan textures. Reopen the retained
 `loadCompleteScene()` and the demo's HEP export compile the original PDF content.
 
 See [loading option types](../src/pdfObjectGenerator.ts) and
-[progress fields and stages](../src/loadProgress.ts). Large PDFs initially prepare
-page metadata; visible content loads as needed. Short PDFs prepare their vector,
-OCR or scan overviews before resolving; scanned pages still load original pixels
-on camera demand. Other sources and `pageLoading: "eager"` prepare all selected
-pages before resolving. Cancellation is cooperative; after a
+[progress fields and stages](../src/loadProgress.ts). By default, PDFs prepare all
+selected vector, OCR or scan overviews before resolving and upload their initial
+scene once. Scan pixels still load on camera demand. `pageLoading: "auto"` opens
+large PDFs from metadata and compiles visible pages as needed; its bounded page
+cache uses less CPU memory but rebuilds the viewing scene as pages arrive.
+`pageLoading: "eager"` prepares the complete original PDF content before resolving.
+Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
 Large stroke and text LOD preparations use a module worker when available,
 leaving the browser's main thread available for interaction. Small preparations
@@ -1153,14 +1155,19 @@ Parse-time reduced codec decoding and larger ASTC footprints (including 12x12) r
 separate stages; this implementation selects only the audited BC7 and ASTC 4x4
 encoders.
 
-Large PDFs use metadata-only page placeholders. Vector pages retain their original
+Default PDF loading prepares and retains every overview before display, without
+per-page scene rebuilds or waits for a frame between pages. Opt-in
+`pageLoading: "auto"` uses metadata-only placeholders for large PDFs and a bounded
+overview cache. The native and Three demos expose this choice through **Stream
+pages**, unchecked by default; changing it reloads the retained PDF and keeps the
+camera and layout. Vector pages retain their original
 geometry at every zoom. Image-dominated pages with usable invisible OCR use
 visible vector OCR for the overview, without decoding scan pixels. Only scans
 without usable OCR get bitmap previews bounded to 96 pixels. Unsupported drawing
 features can still use the diagnosed bounded raster compatibility fallback.
 Scans load original content when a page exceeds 256 screen pixels and return to
 the overview below 224 pixels; a bounded cache holds at most 12 detailed pages.
-Short PDFs use the same scan policy. Camera projections include independent
+Both loading modes use the same scan policy. Camera projections include independent
 page transforms and hidden pages. Zooming out selects the cached overview again;
 cached detail remains available for later zooms without affecting the displayed tier.
 `change` events with `reason: "pages-loaded"` tell hosts to refresh search,

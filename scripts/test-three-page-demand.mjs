@@ -134,11 +134,11 @@ try {
     { number:3,body:tinyPdfStream("","0 0 m 600 800 l S") },
     ...Array.from({ length:24 },(_,i)=>({ number:i+4,body:"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 3 0 R >>" }))
   ] });
-  const loaded = await loadPdfSceneFromSource(bytes,{ pages:"5-24",sourceLabel:"retained PDF" },undefined,true);
+  const loaded = await loadPdfSceneFromSource(bytes,{ pages:"5-24",sourceLabel:"retained PDF",pageLoading:"auto" },undefined,true);
   try {
     assert.equal(loaded.sourceLabel,"retained PDF");
     assert.equal(loaded.scene.pageCount,20);
-    assert.equal(loaded.scene.segmentCount,0,"automatic Three loading does not compile page operators before returning");
+    assert.equal(loaded.scene.segmentCount,0,"opt-in streaming does not compile page operators before returning");
     assert.equal(loaded.pageDemand.previewCount,0);
     loaded.pageDemand.update({ width:400,height:500,cameraCenterX:300,cameraCenterY:400,zoom:1 },
       Float32Array.from(Array.from({ length:20 },(_,i)=>[i*2000,0,i*2000+600,800]).flat()));
@@ -148,6 +148,15 @@ try {
     assert.equal(loaded.pageDemand.pageScenes[0].segmentCount,1);
     assert.equal(loaded.pageDemand.pageScenes[0].rasterLayers.length,0);
   } finally { await loaded.pageDemand.close(); }
+  const batchProgress = [];
+  const batch = await loadPdfSceneFromSource(bytes,{ pages:"5-24", onProgress:event=>batchProgress.push(event) },undefined,true);
+  assert.equal(batch.pageDemand,undefined,"complete vector books do not keep a streaming worker by default");
+  assert.equal(batch.scene.segmentCount,20,"all selected pages are prepared before the initial upload");
+  assert(!batch.scene.pendingPagePreviews?.some(Boolean));
+  const pageProgress = batchProgress.filter(event=>event.unit==="pages");
+  assert(pageProgress.some(event=>event.processed===20 && event.total===20),"batch parsing reports completed pages");
+  assert(pageProgress.some(event=>event.sourcePageIndex===4 && event.pageIndex===0),"batch progress retains source page selection");
+  assert(batchProgress.every((event,index)=>!index || event.value>=batchProgress[index-1].value),"batch progress stays monotonic");
   const eager = await loadPdfSceneFromSource(bytes,{ pages:"5-24",pageLoading:"eager" },undefined,true);
   assert.equal(eager.pageDemand,undefined);
   assert.equal(eager.scene.segmentCount,20,"complete extraction remains available explicitly");

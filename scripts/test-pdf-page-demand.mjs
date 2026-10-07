@@ -15,7 +15,7 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const baseView = { width: 400, height: 500, cameraCenterX: 300, cameraCenterY: 400, zoom: 1 };
-  const fixture = (pageCount, fullBytes = 1024) => {
+  const fixture = (pageCount, fullBytes = 1024, previewBytes = 4) => {
     const calls = [], completed = [], session = {
       info: { pages: Array.from({ length: pageCount }, (_, index) => ({ index, width: 600, height: 800 })) },
       closed: false, active: 0, maximumActive: 0,
@@ -29,7 +29,7 @@ try {
           scene.pageCount = 1;
           scene.bounds = scene.pageBounds = { minX: 0, minY: 0, maxX: 600, maxY: 800 };
           scene.pageRects = Float32Array.of(0, 0, 600, 800);
-          scene.rasterLayers = [{ width: 1, height: 1, data: new Uint8Array(options.previewMaxDimension ? 4 : fullBytes),
+          scene.rasterLayers = [{ width: 1, height: 1, data: new Uint8Array(options.previewMaxDimension ? previewBytes : fullBytes),
             matrix: Float32Array.of(600, 0, 0, 800, 0, 0), pageIndex: 0 }];
           completed.push(index);
           return scene;
@@ -43,6 +43,23 @@ try {
     for (let index = 0; index < pageCount; index++) rectangles.set([index * 1000, 0, index * 1000 + 600, 800], index * 4);
     return { loader, session, calls, completed, rectangles, get changes() { return changes; } };
   };
+
+  {
+    const f = fixture(4, 1024, 6 * 1024 * 1024);
+    let frameWaited = false;
+    const timer = setTimeout(() => { frameWaited = true; }, 0);
+    try {
+      await f.loader.loadInitialOverviews(undefined, true);
+      assert.equal(frameWaited, false, "batch loading does not wait for a host frame between pages");
+      assert.equal(f.changes, 0, "batch parsing does not request a GPU rebuild for each page");
+      assert.equal(f.loader.previewCount, 4, "complete overviews are retained beyond the streaming cache target");
+      assert.equal(f.loader.detailedCount, 0, "preparing all pages does not decode full scans");
+      assert(f.loader.pageScenes.every(scene => !scene.pendingPagePreviews?.some(Boolean)));
+      f.loader.update(baseView, f.rectangles); await f.loader.whenIdle();
+      assert.equal(f.loader.previewCount, 4, "scan refinement retains the complete initial document");
+      assert.equal(f.loader.detailedCount, 1);
+    } finally { clearTimeout(timer); await f.loader.close(); }
+  }
 
   {
     const f = fixture(614);

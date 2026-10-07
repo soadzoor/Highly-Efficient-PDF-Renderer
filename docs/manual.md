@@ -106,9 +106,17 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
-The standalone canvas viewer and Three.js package/viewers open PDFs with more
-than 16 selected pages from metadata, then load pages near the current viewport
-in one worker. Vector pages keep their original geometry at every zoom.
+The standalone canvas viewer and Three.js package/viewers prepare all selected
+page overviews before display by default, then upload the initial scene once.
+They do not rebuild the growing scene or wait for a frame after each parsed page.
+The **Stream pages** checkbox opts into viewport-driven loading for PDFs with
+more than 16 selected pages, starting from metadata and loading pages near the
+camera in one worker. It is unchecked by default; switching it reloads the
+retained PDF while preserving the camera and page layout. In the package, use
+`pageLoading: "auto"` to stream or `pageLoading: "all"` (the default) to prepare all
+overviews. Streaming uses a bounded overview cache; full loading retains every
+overview and uses more CPU memory for vector-heavy documents.
+Vector pages keep their original geometry at every zoom in both modes.
 Image-dominated scanned pages with usable invisible OCR show that text as visible
 vectors at a distance, without decoding scan images. Only scans without usable
 OCR get small bitmap previews, with a longest edge of at most 96 pixels.
@@ -116,9 +124,9 @@ Unsupported drawing features can still use a diagnosed bounded raster fallback.
 Scan pixels load when a page occupies more than 256 screen pixels; zooming back
 out below 224 pixels restores the OCR vectors or scan preview. The gap prevents
 flicker near the transition. At most 12 detailed pages remain cached, with a
-further limit based on estimated CPU payload bytes. Short PDFs use the same
-scan policy while vector-only documents return complete vector scenes.
-Evicted pages regenerate as you navigate. Unloaded pages retain their outlines
+further limit based on estimated CPU payload bytes. Vector-only documents return
+complete vector scenes after full loading. During streaming, evicted pages
+regenerate as you navigate. Unloaded pages retain their outlines
 and positions. Search progressively loads preview text for the rest of the
 document; explicit HEP export compiles the complete original PDF.
 
@@ -133,7 +141,8 @@ Three.js page demand follows camera projections, including moved or hidden pages
 `pdfObjectGenerator` exposes the current viewing window through `sceneData` and
 emits `change` events with `reason: "pages-loaded"` when it changes. Use
 `loadCompleteScene({ signal })` for complete geometry analysis, or
-`pageLoading: "eager"` when complete scene data is required before rendering.
+`pageLoading: "eager"` when complete original scene data, including decoded scans,
+is required before rendering.
 Extraction APIs and HEP conversion still produce complete scenes for their selected pages;
 the Three example exports retained original PDF bytes rather than its partial scene.
 All GPU integrations allocate small raster display tiers first and increase
