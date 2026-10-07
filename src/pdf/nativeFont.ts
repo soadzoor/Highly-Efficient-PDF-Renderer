@@ -235,6 +235,7 @@ interface CMapEntry {
 interface ParsedCMap {
   readonly codeSpaces: readonly NativeCodeSpaceRange[];
   readonly unicode: ReadonlyMap<string, string>;
+  readonly invalidUnicodeMappingCount: number;
   readonly cids: ReadonlyMap<string, number>;
   /** Aggregate retained program bytes across the /UseCMap chain. */
   readonly sourceByteCount: number;
@@ -353,6 +354,7 @@ export function parseToUnicodeCMap(
 ): {
   readonly codeSpaces: readonly NativeCodeSpaceRange[];
   readonly mappings: ReadonlyMap<string, string>;
+  readonly diagnostics: readonly PdfDiagnostic[];
   decode(bytes: Uint8Array, offset?: number): { code: number; byteLength: number; unicode: string | null };
 } {
   const defaults = DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS;
@@ -388,6 +390,7 @@ export function parseToUnicodeCMap(
   return Object.freeze({
     codeSpaces: parsed.codeSpaces,
     mappings: parsed.unicode,
+    diagnostics: toUnicodeDiagnostics(parsed.invalidUnicodeMappingCount),
     decode(source: Uint8Array, offset = 0) {
       const entry = decodeCMapCode(source, offset, parsed.codeSpaces, parsed.unicode);
       return {
@@ -520,6 +523,7 @@ async function parseSimpleFont(
     parserLimits,
     signal
   );
+  reportFontDiagnostics(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
   const firstChar = integerOr(dictionary.get("FirstChar"), 0);
   const widthValues = await resolveArray(dictionary.get("Widths"), resolver, signal);
   const widths = new Map<number, number>();
@@ -584,7 +588,8 @@ async function parseSimpleFont(
     replacement?.substitution ?? null,
     Object.freeze([
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
-      ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS)
+      ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS)
     ]),
     (bytes, offset) => {
       const code = bytes[offset];
@@ -676,6 +681,7 @@ async function parseCompositeFont(
     parserLimits,
     signal
   );
+  reportFontDiagnostics(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
   const cidUnicode = toUnicode === null
     ? await resolveCidUnicodeFallback(descendantSystemInfo, options, parserLimits.maxCMapMappings)
     : Object.freeze({ shard: null, diagnostics: EMPTY_DIAGNOSTICS });
@@ -746,6 +752,7 @@ async function parseCompositeFont(
     Object.freeze([
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...cidUnicode.diagnostics
     ]),
     (bytes, offset) => {
@@ -1278,6 +1285,7 @@ async function readToUnicode(
   return Object.freeze({
     codeSpaces: parsed.codeSpaces,
     mappings: parsed.unicode,
+    diagnostics: toUnicodeDiagnostics(parsed.invalidUnicodeMappingCount),
     decode(source: Uint8Array, offset = 0) {
       const entry = decodeCMapCode(source, offset, parsed.codeSpaces, parsed.unicode);
       return {
@@ -1287,6 +1295,17 @@ async function readToUnicode(
       };
     }
   });
+}
+
+function toUnicodeDiagnostics(invalidMappingCount: number): readonly PdfDiagnostic[] {
+  if (invalidMappingCount === 0) return EMPTY_DIAGNOSTICS;
+  return Object.freeze([Object.freeze({
+    code: "font.invalid-to-unicode",
+    severity: "warning" as const,
+    message: `Repaired ${invalidMappingCount} ToUnicode targets containing unpaired UTF-16 ` +
+      `surrogates with U+FFFD; affected text extraction may be approximate.`,
+    details: Object.freeze({ invalidMappingCount })
+  })]);
 }
 
 async function resolveCMap(
@@ -1453,6 +1472,7 @@ async function predefinedCMap(
   return Object.freeze({
     codeSpaces: Object.freeze(codeSpaces),
     unicode: new Map(),
+    invalidUnicodeMappingCount: inherited?.invalidUnicodeMappingCount ?? 0,
     cids: new Map(),
     sourceByteCount: inherited?.sourceByteCount ?? 0,
     tokenCount: inherited?.tokenCount ?? 0,
@@ -1473,6 +1493,7 @@ function identityCMap(name: "Identity-H" | "Identity-V"): ParsedCMap {
   return Object.freeze({
     codeSpaces: Object.freeze([{ byteLength: 2, start: 0, end: 0xffff }]),
     unicode: new Map(),
+    invalidUnicodeMappingCount: 0,
     cids: new Map(),
     sourceByteCount: 0,
     tokenCount: 0,
@@ -1573,6 +1594,12 @@ function parseCMap(
   const localSystemInfo = parseCMapSystemInfo(tokens);
   const codeSpaces: NativeCodeSpaceRange[] = inherited ? [...inherited.codeSpaces] : [];
   const localUnicode = new Map<string, string>();
+  let invalidUnicodeMappingCount = inherited?.invalidUnicodeMappingCount ?? 0;
+  const decodeUnicodeTarget = (target: Uint8Array): string => {
+    const decoded = decodeUtf16Be(target);
+    if (decoded.repaired) invalidUnicodeMappingCount += 1;
+    return decoded.unicode;
+  };
   const localCids = new Map<string, number>();
   const cidRangeLayers = inherited ? [...inherited.cidRangeLayers] : [];
   const cidRangeMappingCount = inherited?.cidRangeMappingCount ?? 0;
@@ -1675,7 +1702,7 @@ function parseCMap(
           localUnicode,
           localUnicodeKeys,
           cmapKey(bytesToCode(source), source.length),
-          decodeUtf16Be(target),
+          decodeUnicodeTarget(target),
           "Unicode"
         );
       }
@@ -1704,7 +1731,7 @@ function parseCMap(
               localUnicode,
               localUnicodeKeys,
               cmapKey(code, startBytes.length),
-              decodeUtf16Be(incrementBigEndian(initialTarget, code - start)),
+              decodeUnicodeTarget(incrementBigEndian(initialTarget, code - start)),
               "Unicode"
             );
           }
@@ -1716,7 +1743,7 @@ function parseCMap(
               localUnicode,
               localUnicodeKeys,
               cmapKey(code, startBytes.length),
-              decodeUtf16Be(mapped),
+              decodeUnicodeTarget(mapped),
               "Unicode"
             );
             code += 1;
@@ -1803,6 +1830,7 @@ function parseCMap(
   return {
     codeSpaces: Object.freeze(codeSpaces),
     unicode: overlayCMapMappings(inherited?.unicode, localUnicode),
+    invalidUnicodeMappingCount,
     cids: overlayCMapMappings(inherited?.cids, localCids),
     sourceByteCount,
     tokenCount,
@@ -4723,7 +4751,7 @@ function incrementBigEndian(bytes: Uint8Array, amount: number): Uint8Array {
   return result;
 }
 
-function decodeUtf16Be(bytes: Uint8Array): string {
+function decodeUtf16Be(bytes: Uint8Array): { unicode: string; repaired: boolean } {
   if (bytes.length % 2 !== 0) throw unsupportedFont("A ToUnicode target has odd UTF-16BE length.");
   // A ToUnicode destination is already declared to be UTF-16BE. Consequently
   // FEFF is the Unicode value U+FEFF, not an encoding signature to discard.
@@ -4731,25 +4759,34 @@ function decodeUtf16Be(bytes: Uint8Array): string {
   // it as "" lets the painted glyph keep its geometry without inventing a
   // replacement character in the mandatory text index.
   let result = "";
+  let repaired = false;
   for (let offset = 0; offset < bytes.length; offset += 2) {
     const unit = (bytes[offset] << 8) | bytes[offset + 1];
     if (unit >= 0xd800 && unit <= 0xdbff) {
       if (offset + 3 >= bytes.length) {
-        throw unsupportedFont("A ToUnicode target ends with an unpaired high surrogate.");
+        result += "\ufffd";
+        repaired = true;
+        continue;
       }
       const low = (bytes[offset + 2] << 8) | bytes[offset + 3];
       if (low < 0xdc00 || low > 0xdfff) {
-        throw unsupportedFont("A ToUnicode target contains an unpaired high surrogate.");
+        // Keep the following unit available for normal decoding. ToUnicode
+        // is extraction metadata, so bad surrogate units must not prevent
+        // otherwise usable glyphs or neighboring Unicode values from loading.
+        result += "\ufffd";
+        repaired = true;
+        continue;
       }
       result += String.fromCharCode(unit, low);
       offset += 2;
     } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw unsupportedFont("A ToUnicode target contains an unpaired low surrogate.");
+      result += "\ufffd";
+      repaired = true;
     } else {
       result += String.fromCharCode(unit);
     }
   }
-  return result;
+  return { unicode: result, repaired };
 }
 
 function requireCMapTarget(token: CMapToken | undefined, label: string): Uint8Array {

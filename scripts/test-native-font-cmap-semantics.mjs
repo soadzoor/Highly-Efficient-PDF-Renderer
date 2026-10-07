@@ -47,6 +47,7 @@ try {
   await testUseCMapCyclesAndDepth();
   await testSimpleEncodingAndUnicodeSeparation();
   await testCidToGidBounds();
+  await testToUnicodeSurrogateRecovery();
   testDirectCMapValidation();
   await testUnsupportedAssetsAndLimits();
 
@@ -533,6 +534,94 @@ async function testCidToGidBounds() {
   assert.equal(identity.decode(Uint8Array.of(0xab, 0xcd)).glyphId, 0xabcd);
 }
 
+async function testToUnicodeSurrogateRecovery() {
+  const repaired = parseToUnicodeCMap(encoder.encode(`
+    1 begincodespacerange <00> <ff> endcodespacerange
+    7 beginbfchar
+      <41> <d800>
+      <42> <dc00>
+      <43> <0041d8000042dc000043d83dde00>
+      <44> <d800d83dde00>
+      <45> <d83dde000044>
+      <46> <feff>
+      <47> <>
+    endbfchar
+    2 beginbfrange
+      <48> <4b> <d7fe>
+      <4c> <4e> [<0066> <d800> <0069006a>]
+    endbfrange
+  `));
+  for (const [code, unicode] of [
+    [0x41, "\ufffd"], [0x42, "\ufffd"], [0x43, "A\ufffdB\ufffdC😀"],
+    [0x44, "\ufffd😀"], [0x45, "😀D"], [0x46, "\ufeff"], [0x47, ""],
+    [0x48, "\ud7fe"], [0x49, "\ud7ff"], [0x4a, "\ufffd"], [0x4b, "\ufffd"],
+    [0x4c, "f"], [0x4d, "\ufffd"], [0x4e, "ij"]
+  ]) {
+    assert.equal(repaired.decode(Uint8Array.of(code)).unicode, unicode);
+    assert.equal(unicode.isWellFormed(), true, "text extraction never retains lone surrogates");
+  }
+  assert.equal(repaired.diagnostics.length, 1, "repairs emit one summary, not a warning per entry");
+  assert.equal(repaired.diagnostics[0].code, "font.invalid-to-unicode");
+  assert.equal(repaired.diagnostics[0].severity, "warning");
+  assert.equal(repaired.diagnostics[0].details.invalidMappingCount, 7);
+
+  const base = stream(`
+    1 begincodespacerange <00> <ff> endcodespacerange
+    2 beginbfchar <41> <d800> <42> <03a9> endbfchar
+  `);
+  const derived = stream(`
+    1 beginbfchar <43> <dc00> endbfchar
+  `, new Map([["UseCMap", base]]));
+  const dictionary = simpleFont(name("WinAnsiEncoding"));
+  dictionary.set("ToUnicode", derived);
+  const reported = [];
+  const font = await parseNativePdfFont(dictionary, identityResolver, {
+    onDiagnostic: diagnostic => reported.push(diagnostic)
+  });
+  assert.deepEqual(reported, font.diagnostics);
+  assert.equal(reported.length, 1);
+  assert.equal(reported[0].details.invalidMappingCount, 2, "repairs include inherited mappings");
+  assert.equal(font.decode(Uint8Array.of(65)).glyphName, "A");
+  assert.equal(font.decode(Uint8Array.of(65)).glyphId, 65);
+  assert.equal(font.decode(Uint8Array.of(65)).unicode, "\ufffd");
+  assert.equal(font.decode(Uint8Array.of(66)).unicode, "Ω", "valid neighboring mappings survive");
+  assert.equal(font.decode(Uint8Array.of(67)).unicode, "\ufffd");
+
+  // Acrobat Paper Capture's HiddenHorzOCR font in TIKA-2848-1.pdf maps the
+  // entire 16-bit space to itself, including unused surrogate code units.
+  const hex = value => value.toString(16).padStart(4, "0");
+  const identityRanges = Array.from({ length: 256 }, (_, index) => {
+    const start = index * 256;
+    return `<${hex(start)}> <${hex(start + 255)}> <${hex(start)}>`;
+  }).join("\n");
+  const ocrDictionary = compositeFont(name("Identity-H"), cidFont("Fixture", 0));
+  ocrDictionary.set("ToUnicode", stream(`
+    1 begincodespacerange <0000> <ffff> endcodespacerange
+    256 beginbfrange ${identityRanges} endbfrange
+  `));
+  const ocrReported = [];
+  const ocrFont = await parseNativePdfFont(ocrDictionary, identityResolver, {
+    onDiagnostic: diagnostic => ocrReported.push(diagnostic)
+  });
+  assert.deepEqual(ocrReported, ocrFont.diagnostics);
+  assert.equal(ocrReported.length, 1);
+  assert.equal(ocrReported[0].details.invalidMappingCount, 2048);
+  const cyrillic = ocrFont.decode(Uint8Array.of(0x04, 0x1a));
+  assert.equal(cyrillic.unicode, "К");
+  assert.equal(cyrillic.cid, 0x041a);
+  assert.equal(cyrillic.glyphId, 0x041a);
+  assert.equal(cyrillic.width, 1000);
+  assert.equal(ocrFont.decode(Uint8Array.of(0xd8, 0)).unicode, "\ufffd");
+  await assert.rejects(
+    parseNativePdfFont(ocrDictionary, identityResolver, { parserLimits: { maxCMapMappings: 65535 } }),
+    hasPdfError("resource-limit", /mapping limit/i)
+  );
+  await assert.rejects(
+    parseNativePdfFont(ocrDictionary, identityResolver, { signal: AbortSignal.abort() }),
+    hasPdfError("aborted")
+  );
+}
+
 function testDirectCMapValidation() {
   const valid = parseToUnicodeCMap(encoder.encode(`
     2 begincodespacerange <00> <7f> <8100> <81ff> endcodespacerange
@@ -542,6 +631,7 @@ function testDirectCMapValidation() {
   assert.equal(valid.decode(Uint8Array.of(0x40)).unicode, "", "empty destinations suppress text");
   assert.equal(valid.decode(Uint8Array.of(0x41)).unicode, "😀");
   assert.equal(valid.decode(Uint8Array.of(0x42)).unicode, "\ufeff", "FEFF is a Unicode value, not a BOM");
+  assert.equal(valid.diagnostics.length, 0);
   assert.equal(valid.decode(Uint8Array.of(0x43)).unicode, "", "singleton empty ranges suppress text");
   assert.equal(valid.decode(Uint8Array.of(0x81, 0)).unicode, "a");
   assert.equal(valid.decode(Uint8Array.of(0x81, 1)).unicode, "bc");
@@ -593,16 +683,16 @@ function testDirectCMapValidation() {
   assert.throws(
     () => parseToUnicodeCMap(encoder.encode(`
       1 begincodespacerange <00> <ff> endcodespacerange
-      1 beginbfchar <41> <d800> endbfchar
+      1 beginbfchar <41> <004100> endbfchar
     `)),
-    hasPdfError("unsupported-font", /unpaired high surrogate/i)
+    hasPdfError("unsupported-font", /odd UTF-16BE length/i)
   );
   assert.throws(
     () => parseToUnicodeCMap(encoder.encode(`
       1 begincodespacerange <00> <ff> endcodespacerange
-      1 beginbfchar <41> <dc00> endbfchar
+      1 beginbfrange <41> <42> <ffff> endbfrange
     `)),
-    hasPdfError("unsupported-font", /unpaired low surrogate/i)
+    hasPdfError("unsupported-font", /overflows/i)
   );
   assert.throws(
     () => parseToUnicodeCMap(encoder.encode(`

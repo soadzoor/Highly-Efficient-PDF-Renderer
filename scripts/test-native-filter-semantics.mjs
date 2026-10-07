@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { deflateRawSync, deflateSync, inflateSync } from "node:zlib";
 
+import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
+
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !specifier.endsWith(".ts")) {
@@ -18,6 +20,7 @@ const {
   readFilterNames
 } = await import("../src/pdf/nativeFilters.ts");
 const { PdfError } = await import("../src/pdf/nativeTypes.ts");
+const { openNativePdfDocument } = await import("../src/pdf/nativeDocument.ts");
 
 try {
   testFilterAndParameterParsing();
@@ -28,6 +31,8 @@ try {
   await testLzw();
   await testAscii85();
   await testAsciiHex();
+  await testAsciiHexTrailingData();
+  await testDocumentFilterDiagnostics();
   await testRunLength();
   await testTiffPredictor();
   await testPngPredictor();
@@ -489,7 +494,6 @@ async function testAsciiHex() {
   assert.deepEqual(await decodeOne(ascii(">"), "ASCIIHexDecode"), Uint8Array.of());
   await assert.rejects(decodeOne(ascii("61"), "ASCIIHexDecode"), hasPdfError("invalid-object", /no >/));
   await assert.rejects(decodeOne(ascii("6g>"), "ASCIIHexDecode"), hasPdfError("invalid-object", /character/));
-  await assert.rejects(decodeOne(ascii("61>x"), "ASCIIHexDecode"), hasPdfError("invalid-object", /follows/));
   await assert.rejects(
     decodePdfFilterChain(ascii("61>"), ["ASCIIHexDecode"], [null], {
       limits: { maxDecodedStreamBytes: 0 }
@@ -509,6 +513,93 @@ async function testAsciiHex() {
     }),
     hasPdfError("resource-limit", /configured byte limit/)
   );
+}
+
+async function testAsciiHexTrailingData() {
+  const decodeModes = [
+    (input, options) => decodePdfFilterChain(input, ["AHx"], [null], options),
+    async (input, options) => (await collectFilterChunks(input, ["ASCIIHexDecode"], [null], {
+      ...options, chunkSize: 1
+    })).bytes
+  ];
+  for (const decode of decodeModes) {
+    const diagnostics = [];
+    const onDiagnostic = diagnostic => diagnostics.push(diagnostic);
+    assert.deepEqual(await decode(ascii("61 62 6>\r\nendstr"), { onDiagnostic }), ascii("ab`"));
+    assert.equal(diagnostics.length, 1, "trailing data produces one warning per decode");
+    assert.equal(diagnostics[0].code, "filter.asciihex-trailing-data");
+    assert.equal(diagnostics[0].severity, "warning");
+    assert.deepEqual(diagnostics[0].details, { trailingByteCount: 8, nonWhitespaceByteCount: 6 });
+
+    diagnostics.length = 0;
+    assert.deepEqual(await decode(ascii("61>\u0000\t\r\n "), { onDiagnostic }), ascii("a"));
+    assert.equal(diagnostics.length, 0, "trailing whitespace stays quiet");
+    for (const payload of ["6162>\r\nendstr", "616>\r\nendstr"]) {
+      await assert.rejects(
+        decode(ascii(payload), { limits: { maxDecodedStreamBytes: 1 }, onDiagnostic }),
+        hasPdfError("resource-limit", /configured byte limit/)
+      );
+    }
+    await assert.rejects(
+      decode(ascii("6g>\r\nendstr"), { onDiagnostic }),
+      hasPdfError("invalid-object", /character/)
+    );
+    await assert.rejects(
+      decode(ascii("6162"), { onDiagnostic }),
+      hasPdfError("invalid-object", /no >/)
+    );
+    const controller = new AbortController();
+    controller.abort(new Error("ASCIIHex trailing-data cancellation"));
+    await assert.rejects(
+      decode(ascii("61>\r\nendstr"), { signal: controller.signal, onDiagnostic }),
+      hasPdfError("aborted", /aborted/)
+    );
+    assert.equal(diagnostics.length, 0, "failed or cancelled decodes do not report recovery");
+  }
+
+  const diagnostics = [];
+  const payload = ascii("preserved filter chain");
+  const chained = await collectFilterChunks(
+    concat(asciiHexEncode(bytesOf(deflateSync(payload))), ascii("\r\nendstr")),
+    ["ASCIIHexDecode", "FlateDecode"],
+    [null, null],
+    { chunkSize: 3, onDiagnostic: diagnostic => diagnostics.push(diagnostic) }
+  );
+  assert.deepEqual(chained.bytes, payload);
+  assert.equal(diagnostics.length, 1, "chunk fallback forwards filter diagnostics");
+
+  const controller = new AbortController();
+  const iterator = decodePdfFilterChainChunks(ascii("616263>\r\nendstr"), ["AHx"], [null], {
+    chunkSize: 1, signal: controller.signal
+  })[Symbol.asyncIterator]();
+  assert.deepEqual((await iterator.next()).value, ascii("a"));
+  controller.abort(new Error("ASCIIHex chunk cancellation"));
+  await assert.rejects(iterator.next(), hasPdfError("aborted", /aborted/));
+  await iterator.return?.();
+}
+
+async function testDocumentFilterDiagnostics() {
+  const document = await openNativePdfDocument({ kind: "bytes", bytes: writeTinyPdf({
+    objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("/Filter /ASCIIHexDecode", "712051>\r\nendstr") }
+    ]
+  }) });
+  try {
+    const [stream] = await document.getPageContentStreams(0);
+    assert.deepEqual(await document.decodeStream(stream), ascii("q Q"));
+    assert.deepEqual(await document.decodeStream(stream), ascii("q Q"));
+    const chunks = [];
+    for await (const chunk of document.decodeStreamChunks(stream, { chunkSize: 1 })) chunks.push(chunk);
+    assert.deepEqual(concat(...chunks), ascii("q Q"));
+    const diagnostics = document.getDiagnostics().filter(diagnostic => diagnostic.code === "filter.asciihex-trailing-data");
+    assert.equal(diagnostics.length, 1, "document warnings deduplicate repeated whole/chunk stream decoding");
+    assert.deepEqual(diagnostics[0].details, { trailingByteCount: 8, nonWhitespaceByteCount: 6 });
+  } finally {
+    await document.close();
+  }
 }
 
 async function testRunLength() {
