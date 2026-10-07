@@ -52,6 +52,22 @@ try {
   await controller.setLayerVisibility("b", true);
   assert.equal(observed, 1, "observer exceptions cannot block other listeners or reject applied updates");
 
+  let pagePrepares = 0, pageChanges = 0;
+  const paged = new OptionalContentController(scene, { prepare: () => { pagePrepares++; } });
+  paged.subscribe(() => pageChanges++);
+  await paged.setLayerVisibility("b", true);
+  const pageRevision = paged.revision;
+  await paged.replaceScene(createEmptyVectorScene());
+  assert.equal(paged.getLayers().length, 0, "evicted pages remove their layer definitions");
+  await paged.replaceScene(scene);
+  assert.deepEqual(paged.getLayers().map(layer => layer.visible), [false, true, true],
+    "returning pages restore saved choices rather than source defaults");
+  assert.equal(paged.revision, pageRevision + 2);
+  assert.equal(pageChanges, 3, "page replacement preserves existing subscriptions");
+  await paged.replaceScene(scene);
+  assert.equal(pagePrepares, 4, "a new generation prepares replay resources even when visibility matches");
+  paged.dispose();
+
   const prepares = [];
   const asyncController = new OptionalContentController(scene, { prepare: (value, { signal }) => new Promise((resolve, reject) => {
     prepares.push({ value, resolve }); signal.addEventListener("abort", () => reject(signal.reason), { once: true });

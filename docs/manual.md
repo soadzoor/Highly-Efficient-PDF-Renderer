@@ -106,7 +106,7 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
-The standalone canvas viewer opens PDFs with more than 16 pages from page
+The standalone canvas viewer and Three.js package/viewers open PDFs with more than 16 selected pages from page
 metadata, then loads pages near the current viewport in one worker. Overview
 previews use a longest edge of at most 96 pixels. Detailed page content is
 compiled when a page occupies more than 256 screen pixels, with at most 12
@@ -117,11 +117,21 @@ Evicted pages regenerate as you navigate. Unloaded pages retain their outlines
 and positions. Search progressively loads preview text for the rest of the
 document; explicit HEP export compiles the complete original PDF.
 
-This page cache belongs to the standalone viewer. `pdfObjectGenerator`, extraction
-APIs and HEP conversion still produce complete scenes for their selected pages.
+Three.js page demand follows camera projections, including moved or hidden pages.
+`pdfObjectGenerator` exposes the current viewing window through `sceneData` and
+emits `change` events with `reason: "pages-loaded"` when it changes. Use
+`loadCompleteScene({ signal })` for complete geometry analysis, or
+`pageLoading: "eager"` when complete scene data is required before rendering.
+Extraction APIs and HEP conversion still produce complete scenes for their selected pages;
+the Three example exports retained original PDF bytes rather than its partial scene.
 All GPU integrations allocate small raster display tiers first and increase
 their resolution automatically with zoom. CPU canonical image data stays available
 for refinement; reducing GPU textures alone does not reduce eager parsing memory.
+
+Both Three material backends retain packed one-bit images at full resolution and
+R8 coverage at smaller tiers. Eligible color images can use BC7/ASTC 4x4 through
+the host's `ExternalTexture` support, with one shared encoder workspace.
+Independent page views share the document's automatic raster memory target.
 
 ## Rendering and level of detail
 

@@ -4,6 +4,7 @@ import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
+import { threeRasterTextureInfo } from "./threeRasterTextures";
 
 import {
   createThreeWebGpuOutputFragmentFns,
@@ -119,6 +120,39 @@ fn heprRasterFragment(inputColor: vec4<f32>, opacity: f32, shapeOnly: f32) -> ve
 }
 `);
 
+const rasterBitFn: unknown = TSL.wgslFn(`
+fn heprThreeRasterBit(image: texture_2d<f32>, size: vec2f, pixel: vec2i) -> f32 {
+  let p = clamp(pixel, vec2i(0), vec2i(size) - vec2i(1));
+  let bits = u32(round(textureLoad(image, vec2i(p.x / 8, p.y), 0).r * 255.0));
+  return f32((bits >> (7u - (u32(p.x) & 7u))) & 1u);
+}`);
+const rasterSampleFn: unknown = TSL.wgslFn(`
+fn heprThreeRasterSample(image: texture_2d<f32>, imageSampler: sampler,
+  coverageImage: texture_2d<f32>, coverageSampler: sampler,
+  uv: vec2f, mode: f32, size: vec2f, color0: vec4f, color1: vec4f, opaque: f32) -> vec4f {
+  let dx = dpdx(uv); let dy = dpdy(uv);
+  if (mode < 0.5) {
+    var color = textureSampleGrad(image, imageSampler, uv, dx, dy);
+    if (opaque > 0.5) { color.a = 1.0; }
+    return color;
+  }
+  if (mode > 1.5) {
+    return mix(color0, color1, textureSampleGrad(image, imageSampler, uv, dx, dy).r);
+  }
+  let lod = max(0.0, log2(max(1.0, max(length(dx * size), length(dy * size)))));
+  var coverage: f32;
+  if (lod < 1.0) {
+    let position = uv * size - vec2f(0.5);
+    let pixel = vec2i(floor(position)); let weight = fract(position);
+    let base = mix(mix(heprThreeRasterBit(image, size, pixel), heprThreeRasterBit(image, size, pixel + vec2i(1,0)), weight.x),
+      mix(heprThreeRasterBit(image, size, pixel + vec2i(0,1)), heprThreeRasterBit(image, size, pixel + vec2i(1,1)), weight.x), weight.y);
+    coverage = mix(base, textureSampleLevel(coverageImage, coverageSampler, uv, 0.0).r, lod);
+  } else {
+    coverage = textureSampleLevel(coverageImage, coverageSampler, uv, lod - 1.0).r;
+  }
+  return mix(color0, color1, coverage);
+}`, [rasterBitFn] as never);
+
 export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions
 ): ThreeWebGpuRasterMaterialState {
@@ -154,7 +188,21 @@ export function createThreeWebGpuRasterMaterial(
       tileUv: TSL.uniform(tileUv)
     }));
   const rasterPackValue = rasterPack as { zw: unknown };
-  const textureNode = TSL.texture(options.texture, rasterPackValue.zw as never);
+  const info = threeRasterTextureInfo(options.texture);
+  const textureNode = TSL.texture(options.texture);
+  const coverageNode = TSL.texture(info.coverage);
+  // R8/RGBA tiers share a texture, while packed tiers need two. Preserve both
+  // binding identities across replacements instead of deduplicating by texture UUID.
+  textureNode.getUniformHash = () => textureNode.uuid;
+  coverageNode.getUniformHash = () => coverageNode.uuid;
+  const modeUniform = TSL.uniform(info.mode);
+  const opaqueUniform = TSL.uniform(info.compressionFormat ? 1 : 0);
+  const size = info.size.clone(), color0 = info.color0.clone(), color1 = info.color1.clone();
+  // Packed bytes use textureLoad. Its nearest-only texture has no TSL sampler;
+  // the coverage sampler also serves the filtered RGBA/R8 branches after a tier switch.
+  const inputColor = callNode(rasterSampleFn, { image: textureNode, imageSampler: TSL.sampler(coverageNode),
+    coverageImage: coverageNode, coverageSampler: TSL.sampler(coverageNode), uv: rasterPackValue.zw,
+    mode: modeUniform, size: TSL.uniform(size), color0: TSL.uniform(color0), color1: TSL.uniform(color1), opaque: opaqueUniform });
   const opacityUniform = TSL.uniform(options.opacity ?? 1);
 
   material.vertexNode = callNode(rasterClipFn, {
@@ -167,7 +215,7 @@ export function createThreeWebGpuRasterMaterial(
   });
   pageProjection.finish(material);
   material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
-    inputColor: textureNode,
+    inputColor,
     opacity: opacityUniform,
     shapeOnly: shapeOnlyUniform
   });
@@ -181,6 +229,11 @@ export function createThreeWebGpuRasterMaterial(
     useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
     updateSource(texture, matrix, opacity, tile) {
       textureNode.value = texture;
+      const info = threeRasterTextureInfo(texture);
+      coverageNode.value = info.coverage;
+      modeUniform.value = info.mode;
+      opaqueUniform.value = info.compressionFormat ? 1 : 0;
+      size.copy(info.size); color0.copy(info.color0); color1.copy(info.color1);
       options.matrixABCD.set(matrix[0], matrix[1], matrix[2], matrix[3]);
       options.matrixEF.set(matrix[4], matrix[5]);
       tileQuad.fromArray(tile?.quad ?? WHOLE_RASTER_RECT);

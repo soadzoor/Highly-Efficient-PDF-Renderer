@@ -190,6 +190,7 @@ async function testLateRendererCleanup(reason) {
     DEFAULT_FIT_PADDING_PIXELS: 10,
     createNativeRenderer: () => new Promise((resolve) => { finishRenderer = resolve; })
   });
+  vm.runInContext(sourceFunction(source, "createThreePdfContent"), context);
   vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
   const pending = context.createThreePdfObject({ scene: {} }, {}, controller.signal);
   controller.abort(reason);
@@ -231,6 +232,7 @@ async function testConsumedReservationCleanup() {
     sceneRequiresPaintCompositing: () => false,
     ThreeTextLodLayer: { create() { throw failure; } }
   });
+  vm.runInContext(sourceFunction(source, "createThreePdfContent"), context);
   vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
   await assert.rejects(context.createThreePdfObject({ scene }, {}, undefined, reservation),
     error => error === failure);

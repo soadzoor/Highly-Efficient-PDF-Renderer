@@ -1,6 +1,7 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { RendererApi } from "./rendererTypes";
 import type { SceneStats } from "./webGlFloorplanRenderer";
+import { createEmptyVectorScene } from "./emptyVectorScene";
 
 /**
  * Renderer facade used by the three.js adapter to postpone the expensive
@@ -18,6 +19,8 @@ export interface DeferredSceneRendererApi extends RendererApi {
 
   /** Upload the pending scene now, returning its native resource statistics. */
   ensureSceneUploaded(): SceneStats;
+  /** Release any old native scene and defer a new viewing window. */
+  replaceDeferredScene(scene: VectorScene): void;
 }
 
 const SCENE_RESOURCE_METHODS = new Set<PropertyKey>([
@@ -81,6 +84,13 @@ export function deferRendererSceneUpload(
       }
       if (property === "setScene") {
         return setScene;
+      }
+      if (property === "replaceDeferredScene") {
+        return (scene: VectorScene): void => {
+          if (disposed) throw new Error("Cannot replace a disposed renderer scene.");
+          if (sceneUploaded) renderer.setScene(createEmptyVectorScene());
+          pendingScene = scene; sceneUploaded = false; uploadedStats = null;
+        };
       }
       if (property === "dispose") {
         return dispose;

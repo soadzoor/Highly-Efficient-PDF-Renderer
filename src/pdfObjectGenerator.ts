@@ -14,6 +14,7 @@ import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
+import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -30,6 +31,8 @@ export type PdfObjectSourceKind = "pdf" | "hep";
  * Options used while loading and parsing a source into HEPR scene data.
  */
 export interface PdfObjectGeneratorOptions extends PdfIccOptions {
+  /** Override the human-readable source label (for example, when reopening retained bytes). */
+  sourceLabel?: string;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
   /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
@@ -81,6 +84,9 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
    * Omit to let HEPR choose a compact grid.
    */
   maxPagesPerRow?: number;
+
+  /** Large PDFs load visible pages automatically. Use eager only when complete scene data is required before rendering. */
+  pageLoading?: "auto" | "eager";
 
   /**
    * Progress callback for source loading, PDF parsing, HEP loading, vector/text
@@ -158,6 +164,9 @@ export interface LoadedPdfScene {
 
   /** Original source bytes. */
   sourceBytes: Uint8Array;
+  /** Viewing-only worker/cache; complete extraction and HEP export remain eager. */
+  pageDemand?: PdfPageDemandLoader;
+  sourceOptions?: PdfObjectGeneratorOptions;
 }
 
 /**
@@ -167,16 +176,25 @@ export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions = {},
   /** @internal Used by HEP export to cancel source loading and parsing. */
-  signal: AbortSignal | undefined = options.signal
+  signal: AbortSignal | undefined = options.signal,
+  /** @internal Only the Three viewer factory requests a partial viewing scene. */
+  demandLoading = false
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
-  return waitForLoad(loadPdfSceneFromSourceInternal(source, options, signal), signal);
+  const pending = loadPdfSceneFromSourceInternal(source, options, signal, demandLoading);
+  try { return await waitForLoad(pending, signal); }
+  catch (error) {
+    // A metadata session can finish just after its caller cancels. Drain and close that unclaimed worker.
+    void pending.then(loaded => loaded.pageDemand?.close()).catch(() => {});
+    throw error;
+  }
 }
 
 async function loadPdfSceneFromSourceInternal(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  demandLoading = false
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
   const progress = createLoadProgressReporter(options.onProgress);
@@ -187,7 +205,7 @@ async function loadPdfSceneFromSourceInternal(
   );
   signal?.throwIfAborted();
   const sourceKind = resolveSourceKind(source, sourceBytes, options.sourceKind);
-  const sourceLabel = resolveSourceLabel(source, sourceKind);
+  const sourceLabel = options.sourceLabel ?? resolveSourceLabel(source, sourceKind);
 
   if (sourceKind === "pdf") {
     validateAnnotationAppearanceMode(options.annotationAppearances);
@@ -204,6 +222,20 @@ async function loadPdfSceneFromSourceInternal(
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
+    if (demandLoading && options.pageLoading !== "eager") {
+      const loader = await openPdfPageDemand(createParseBuffer(sourceBytes), extractOptions, () => {}, signal);
+      try {
+        signal?.throwIfAborted();
+        if (loader.pageCount > 16) {
+          const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
+          const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
+          progress.complete({ sourceType: "pdf" });
+          signal?.throwIfAborted();
+          return { scene, sourceLabel, sourceKind, sourceBytes, pageDemand: loader, sourceOptions: options };
+        }
+      } catch (error) { await loader.close(); throw error; }
+      await loader.close();
+    }
     const pageScenes = await extractPdfPageScenes(
       createParseBuffer(sourceBytes),
       extractOptions,

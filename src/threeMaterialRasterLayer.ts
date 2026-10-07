@@ -22,16 +22,19 @@ import type {
   ThreeWebGpuRasterMaterialState
 } from "./threeWebGpuRasterMaterial";
 import {
-  rasterTilePixels,
   sameRasterTilePlan,
   type RasterTilePlan
 } from "./rasterTiles";
 import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
-import type { MonochromeRaster } from "./monochromeRaster";
+import { detectMonochromeRaster, type MonochromeRaster } from "./monochromeRaster";
+import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
+import { assessRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
+import { ThreeRasterCompression } from "./threeRasterCompression";
+import { createThreeRasterTileTextures, markThreeRasterTextureForUpload, threeRasterTextureInfo } from "./threeRasterTextures";
 import {
   automaticRasterMemoryBudget,
-  estimateRasterTilePlanBytes,
+  estimateRasterSourcePlanBytes,
   reportRasterMemoryBudget
 } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
@@ -87,6 +90,8 @@ interface RasterLayerSource {
   height: number;
   data: Uint8Array<ArrayBufferLike>;
   monochrome?: MonochromeRaster;
+  compressionEligible?: boolean;
+  pageIndex?: number;
   matrix: Float32Array;
 }
 
@@ -106,7 +111,12 @@ export class ThreeMaterialRasterLayer {
   private readonly pageBackgroundTexture: THREE.DataTexture;
   private readonly entries: RasterLayerEntry[] = [];
   private pendingRasterBytes = 0;
-  private readonly rasterResolutionPlanner = new RasterResolutionPlanner(false);
+  private readonly rasterResolutionPlanner = new RasterResolutionPlanner();
+  private readonly compression = new ThreeRasterCompression(() => {
+    this.rasterResolutionPlanner.invalidate(); this.needsResolutionUpdate = true; this.onChange?.();
+  });
+  private onChange: (() => void) | null = null;
+  private memoryAllowance: number | undefined;
   private rasterResolutionView: RasterResolutionView | null = null;
   private rasterResolutionSources: RasterLayerSource[] | null = null;
   needsResolutionUpdate = false;
@@ -178,7 +188,6 @@ export class ThreeMaterialRasterLayer {
     this.rasterResolutionSources = rasterSources;
     // The automatic scene budget applies even before a host reports its texture limit.
     this.maxTextureSize = options.maxTextureSize ?? Number.POSITIVE_INFINITY;
-    // These materials upload RGBA even when their source is packed binary.
     const memoryPlan = this.rasterResolutionPlanner.plan(rasterSources, this.maxTextureSize, null);
     reportRasterMemoryBudget(memoryPlan, this);
     for (let rasterIndex = 0; rasterIndex < rasterSources.length; rasterIndex += 1) {
@@ -237,6 +246,44 @@ export class ThreeMaterialRasterLayer {
     this.activeEntries = this.entries.filter(entry => !entry.batched);
   }
 
+  setChangeListener(listener: () => void): void { this.onChange = listener; }
+
+  setMemoryAllowance(bytes: number): void {
+    if (this.memoryAllowance === bytes) return;
+    this.memoryAllowance = bytes; this.rasterResolutionPlanner.invalidate(); this.needsResolutionUpdate = true;
+  }
+
+  private availableRasterBytes(): number {
+    const workspace = this.rasterEntries.some(entry => entry.image!.source.compressionEligible)
+      ? this.compression.workspaceBytes : 0;
+    return this.memoryAllowance ?? automaticRasterMemoryBudget().bytes - workspace;
+  }
+
+  /** Allocate one document budget across independent page projections, including offscreen overview tiers. */
+  planPageMemory(projections: (ArrayLike<number> | null)[], viewport: ViewportPixels): number[] {
+    const sources = this.rasterResolutionSources ??= this.rasterEntries.map(entry => entry.image!.source);
+    const view: RasterResolutionView = { width: viewport.width, height: viewport.height, zoom: 1,
+      cameraCenterX: 0, cameraCenterY: 0, projection: index => projections[sources[index].pageIndex ?? 0] };
+    const plan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize, view,
+      this.availableRasterBytes(), this.compression.format);
+    reportRasterMemoryBudget(plan, this);
+    const allowances = projections.map(() => 0);
+    sources.forEach((source,index) => {
+      allowances[source.pageIndex ?? 0] += estimateRasterSourcePlanBytes({ width: source.width, height: source.height,
+        monochrome: source.monochrome, reducedMonochrome: true }, plan.plans[index], plan.compressionFormats[index]);
+    });
+    return allowances;
+  }
+
+  setHostRenderer(renderer: Parameters<ThreeRasterCompression["setHost"]>[0]): void {
+    this.compression.setHost(renderer);
+  }
+
+  private rasterImageBytes(entry: ResidentRasterLayerEntry): number {
+    return threeRasterTextureInfo(entry.texture).estimatedBytes +
+      (entry.image?.tiles.reduce((bytes, tile) => bytes + threeRasterTextureInfo(tile.texture).estimatedBytes, 0) ?? 0);
+  }
+
   setVisible(visible: boolean): void {
     this.group.visible = visible;
   }
@@ -270,7 +317,7 @@ export class ThreeMaterialRasterLayer {
     if (this.disposed || maxTextureSize === this.maxTextureSize) return;
     this.maxTextureSize = maxTextureSize;
     const memoryPlan = this.rasterResolutionPlanner.plan(this.rasterEntries.map(entry => entry.image!.source),
-      maxTextureSize, this.rasterResolutionView);
+      maxTextureSize, this.rasterResolutionView, this.availableRasterBytes());
     reportRasterMemoryBudget(memoryPlan, this);
     if (memoryPlan.resolutionScale < 1 || memoryPlan.overBudget) this.destroyStripBatches();
     for (const [index, entry] of this.rasterEntries.entries()) {
@@ -282,6 +329,7 @@ export class ThreeMaterialRasterLayer {
         createRasterTileTextures(image.source, plan, image.rasterIndex, maxTextureSize));
     }
     this.updateMaxRasterTextureDimension();
+    this.needsResolutionUpdate = true;
   }
 
   /** Stage replacement pixels without uploading resources on a dormant material path. */
@@ -297,7 +345,7 @@ export class ThreeMaterialRasterLayer {
         throw new Error("Invalid staged raster layer update.");
       }
     }
-    const staged: { index: number; layer: RasterLayer; plan: RasterTilePlan; textures: THREE.DataTexture[] }[] = [];
+    const staged: { index: number; layer: RasterLayer; plan: RasterTilePlan; textures: THREE.Texture[] }[] = [];
     let reservedBytes = 0;
     const releaseReservation = (): void => {
       this.pendingRasterBytes = Math.max(0, this.pendingRasterBytes - reservedBytes);
@@ -311,9 +359,9 @@ export class ThreeMaterialRasterLayer {
     const changed = new Set(replacements.map(([index]) => index));
     const budget = automaticRasterMemoryBudget();
     const unchangedBytes = this.rasterEntries.reduce((bytes, entry, index) => bytes +
-      (changed.has(index) ? 0 : estimateRasterTilePlanBytes(entry.image!.plan, false)), 0);
+      (changed.has(index) ? 0 : this.rasterImageBytes(entry)), 0);
     const oldResidentBytes = this.rasterEntries.reduce((bytes, entry) => bytes +
-      (entry.resident ? estimateRasterTilePlanBytes(entry.image!.plan, false) : 0), 0) +
+      (entry.resident ? this.rasterImageBytes(entry) : 0), 0) +
       this.stripEntries.reduce((bytes, entry) => {
         const image = entry.texture.image as { width: number; height: number };
         return bytes + (entry.resident ? image.width * image.height * 4 : 0);
@@ -321,7 +369,7 @@ export class ThreeMaterialRasterLayer {
     const replacementView = this.rasterResolutionView?.projection ? { ...this.rasterResolutionView,
       projection: (index: number) => this.rasterResolutionView!.projection!(replacements[index][0]) } : this.rasterResolutionView;
     const memoryPlan = this.rasterResolutionPlanner.plan(replacements.map(([, layer]) => layer),
-      this.maxTextureSize, replacementView, Math.min(budget.bytes - unchangedBytes - this.pendingRasterBytes,
+      this.maxTextureSize, replacementView, Math.min(this.availableRasterBytes() - unchangedBytes - this.pendingRasterBytes,
         budget.peakBytes - oldResidentBytes - this.pendingRasterBytes));
     reportRasterMemoryBudget(memoryPlan, this);
     try {
@@ -329,7 +377,8 @@ export class ThreeMaterialRasterLayer {
         const plan = memoryPlan.plans[replacementIndex];
         staged.push({ index, layer, plan, textures: createRasterTileTextures(layer, plan, index, this.maxTextureSize) });
       }
-      reservedBytes = staged.reduce((bytes, item) => bytes + estimateRasterTilePlanBytes(item.plan, false), 0);
+      reservedBytes = staged.reduce((bytes, item) => bytes + item.textures.reduce((sum,texture) =>
+        sum + threeRasterTextureInfo(texture).estimatedBytes, 0), 0);
       this.pendingRasterBytes += reservedBytes;
     } catch (error) {
       disposeStaged();
@@ -372,15 +421,28 @@ export class ThreeMaterialRasterLayer {
     }
     this.rasterTextureResidencyEnabled = resident;
     if (resident) {
-      for (const entry of this.rasterEntries) {
+      const sources = this.rasterResolutionSources ??= this.rasterEntries.map(entry => entry.image!.source);
+      // External handles were released with residency. Recreate drawable tiers
+      // within an uncompressed budget before the host can upload them again.
+      const plan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize,
+        this.rasterResolutionView, this.availableRasterBytes());
+      if (plan.resolutionScale < 1 || plan.overBudget) this.destroyStripBatches();
+      for (const [index, entry] of this.rasterEntries.entries()) {
         if (entry.batched) {
           // Keep canonical meshes for replacement fallback, without traversing
           // thousands of hidden children on every Three.js frame.
           entry.mesh.removeFromParent();
           continue;
         }
-        entry.texture.needsUpdate = true;
-        for (const tile of entry.image?.tiles ?? []) tile.texture.needsUpdate = true;
+        const desiredBytes = estimateRasterSourcePlanBytes({ width: sources[index].width, height: sources[index].height,
+          monochrome: sources[index].monochrome, reducedMonochrome: true }, plan.plans[index]);
+        if (threeRasterTextureInfo(entry.texture).compressionFormat || this.rasterImageBytes(entry) > desiredBytes) {
+          const image = entry.image!;
+          this.setRasterImage(entry, image.source, plan.plans[index], createRasterTileTextures(image.source, plan.plans[index],
+            image.rasterIndex, this.maxTextureSize));
+        }
+        markThreeRasterTextureForUpload(entry.texture);
+        for (const tile of entry.image?.tiles ?? []) markThreeRasterTextureForUpload(tile.texture);
         entry.resident = true;
         entry.mesh.visible = this.isEntryVisible(entry);
       }
@@ -389,12 +451,15 @@ export class ThreeMaterialRasterLayer {
         entry.resident = true;
         entry.mesh.visible = this.isEntryVisible(entry);
       }
+      this.needsResolutionUpdate = true;
+      this.updateMaxRasterTextureDimension();
       return;
     }
     for (const entry of this.rasterEntries) {
       this.evictRasterEntry(entry);
     }
     for (const entry of this.stripEntries) this.evictRasterEntry(entry);
+    this.compression.releaseWorkspace();
   }
 
   setPageBackgroundColor(red: number, green: number, blue: number, alpha: number): void {
@@ -443,24 +508,29 @@ export class ThreeMaterialRasterLayer {
   private updateRasterResolution(): void {
     if (!this.rasterTextureResidencyEnabled || this.pendingRasterBytes > 0) return;
     const sources = this.rasterResolutionSources ??= this.rasterEntries.map(entry => entry.image!.source);
-    const plan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize, this.rasterResolutionView);
+    const format = this.compression.format;
+    const plan = this.rasterResolutionPlanner.plan(sources, this.maxTextureSize, this.rasterResolutionView,
+      this.availableRasterBytes(), format);
     const resources = () => this.rasterEntries.map(entry => ({ rasterPlan: entry.image!.plan,
-      estimatedBytes: estimateRasterTilePlanBytes(entry.image!.plan, false) }));
+      estimatedBytes: this.rasterImageBytes(entry), compressionFormat: threeRasterTextureInfo(entry.texture).compressionFormat }));
     const index = this.rasterResolutionPlanner.nextChange(sources, resources(), plan);
     this.needsResolutionUpdate = false;
     if (index < 0) return;
     reportRasterMemoryBudget(plan, this);
     try {
       const entry = this.rasterEntries[index], source = sources[index];
-      const textures = createRasterTileTextures(source, plan.plans[index], index, this.maxTextureSize);
+      const textures = createRasterTileTextures(source, plan.plans[index], index, this.maxTextureSize, this.compression, plan.compressionFormats[index]);
       this.destroyStripBatches();
       this.setRasterImage(entry, source, plan.plans[index], textures);
       this.updateMaxRasterTextureDimension();
     } catch (error) {
-      this.rasterResolutionPlanner.failed(index, plan);
+      // An encoder failure changes capabilities; replan on the next frame before reducing resolution.
+      if (this.compression.format !== format) this.rasterResolutionPlanner.invalidate();
+      else this.rasterResolutionPlanner.failed(index, plan);
       console.warn("[HEPR] Raster refinement unavailable; retaining the previous display resolution.", error);
     }
     this.needsResolutionUpdate = this.rasterResolutionPlanner.nextChange(sources, resources(), plan) >= 0;
+    if (this.needsResolutionUpdate) this.onChange?.();
   }
 
   setScreenSpaceTransform(): void {
@@ -484,6 +554,7 @@ export class ThreeMaterialRasterLayer {
 
   dispose(): void {
     this.disposed = true;
+    this.compression.dispose();
     this.vectorClipTexture.dispose();
     for (const entry of this.entries) {
       this.group.remove(entry.mesh);
@@ -523,6 +594,7 @@ export class ThreeMaterialRasterLayer {
     plan: RasterTilePlan,
     textures: THREE.Texture[]
   ): void {
+    source = classifyRasterSource(source);
     const image = entry.image!;
     this.removeRasterTiles(entry);
     const previous = entry.texture;
@@ -536,11 +608,18 @@ export class ThreeMaterialRasterLayer {
     }
     image.source = source;
     image.plan = plan;
-    const tile = plan.tiles[0];
+    const info = threeRasterTextureInfo(textures[0]);
+    const tile = { quad: plan.tiles[0].quad, uv: plan.tiles[0].uv.map((value, index) => value * info.uvScale[index % 2]) };
     if (entry.webGpuState?.updateSource) entry.webGpuState.updateSource(textures[0], source.matrix, source.opacity ?? 1, tile);
     else {
       const uniforms = (entry.material as THREE.RawShaderMaterial).uniforms;
       uniforms.uRasterTex.value = textures[0];
+      uniforms.uRasterMonoMips.value = info.coverage;
+      uniforms.uRasterMonochrome.value = info.mode;
+      uniforms.uRasterOpaque.value = info.compressionFormat ? 1 : 0;
+      uniforms.uRasterMonoSize.value.copy(info.size);
+      uniforms.uRasterMonoColor0.value.copy(info.color0);
+      uniforms.uRasterMonoColor1.value.copy(info.color1);
       uniforms.uRasterMatrixABCD.value.set(source.matrix[0], source.matrix[1], source.matrix[2], source.matrix[3]);
       uniforms.uRasterMatrixEF.value.set(source.matrix[4], source.matrix[5]);
       uniforms.uRasterQuad.value.fromArray(tile.quad);
@@ -711,6 +790,8 @@ export class ThreeMaterialRasterLayer {
     rasterIndex = this.rasterEntries.length,
     tile: ThreeRasterTileRect = WHOLE_RASTER_TILE
   ): RasterLayerEntry {
+    const info = threeRasterTextureInfo(texture);
+    tile = { quad: tile.quad, uv: tile.uv.map((value, index) => value * info.uvScale[index % 2]) };
     const matrix = normalizeRasterMatrix(matrixSource);
     const instancedPageBackground = geometry.hasAttribute("aPageRect");
     const pageBinding = this.pageTransforms ? instancedPageBackground ? { table: this.pageTransforms }
@@ -747,7 +828,7 @@ export class ThreeMaterialRasterLayer {
       glslVersion: THREE.GLSL3,
       defines: instancedPageBackground ? { INSTANCED_PAGE_BACKGROUNDS: 1 } : {},
       vertexShader: normalizeCoreShaderSource(CORE_RASTER_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(CORE_RASTER_FRAGMENT_SHADER_SOURCE),
+      fragmentShader: normalizeCoreShaderSource(monochromeRasterFragmentGlsl(CORE_RASTER_FRAGMENT_SHADER_SOURCE)),
       transparent: false,
       depthTest: false,
       depthWrite: false,
@@ -760,6 +841,12 @@ export class ThreeMaterialRasterLayer {
       blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
       uniforms: {
         uRasterTex: { value: texture },
+        uRasterMonoMips: { value: info.coverage },
+        uRasterMonochrome: { value: info.mode },
+        uRasterOpaque: { value: info.compressionFormat ? 1 : 0 },
+        uRasterMonoSize: { value: info.size.clone() },
+        uRasterMonoColor0: { value: info.color0.clone() },
+        uRasterMonoColor1: { value: info.color1.clone() },
         uRasterOpacity: { value: opacity },
         uRasterMatrixABCD: { value: new THREE.Vector4(matrix[0], matrix[1], matrix[2], matrix[3]) },
         uRasterMatrixEF: { value: new THREE.Vector2(matrix[4], matrix[5]) },
@@ -869,14 +956,19 @@ function createPageBackgroundTexture(color: [number, number, number, number]): T
 
 /** One premultiplied texture per tile of `plan`. */
 function createRasterTileTextures(
-  source: RasterLayerSource,
-  plan: RasterTilePlan,
-  rasterIndex: number,
-  maxTextureSize: number
-): THREE.DataTexture[] {
-  // Expected display tiers are chosen from zoom; memory reductions have an aggregate diagnostic.
-  const pixels = rasterTilePixels(source, plan);
-  return plan.tiles.map((tile, index) => createRasterTexture(pixels[index], tile.width, tile.height));
+  source: RasterLayerSource, plan: RasterTilePlan, rasterIndex: number, maxTextureSize: number,
+  compressor?: ThreeRasterCompression, format?: RasterCompressionFormat | null
+): THREE.Texture[] {
+  return createThreeRasterTileTextures(classifyRasterSource(source), plan, compressor, format);
+}
+
+function classifyRasterSource(source: RasterLayerSource): RasterLayerSource {
+  if (source.compressionEligible !== undefined) return source;
+  const mono = source.monochrome ?? detectMonochromeRaster(source.data, source.width, source.height);
+  const classified = Object.defineProperties({}, Object.getOwnPropertyDescriptors(source)) as RasterLayerSource;
+  if (mono) classified.monochrome = mono;
+  classified.compressionEligible = !mono && assessRasterCompression(source).eligible;
+  return classified;
 }
 
 function createRasterTexture(premultiplied: Uint8Array, width: number, height: number): THREE.DataTexture {
@@ -905,16 +997,13 @@ function getSceneRasterLayers(scene: VectorScene): RasterLayerSource[] {
       const width = Math.max(0, Math.trunc(layer?.width ?? 0));
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
       if (width <= 0 || height <= 0) continue;
-      const monochrome = layer.monochrome;
       if (!hasRasterSourcePixels(layer)) continue;
-      out.push({
-        width,
-        height,
-        get data() { return layer.data; },
-        ...(monochrome ? { monochrome } : {}),
-        opacity: layer.opacity,
-        matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix)
-      });
+      const source = Object.defineProperties({}, { ...Object.getOwnPropertyDescriptors(layer),
+        width: { value: width, writable: true, enumerable: true, configurable: true },
+        height: { value: height, writable: true, enumerable: true, configurable: true },
+        matrix: { value: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
+          writable: true, enumerable: true, configurable: true } }) as RasterLayerSource;
+      out.push(classifyRasterSource(source));
     }
   }
 
@@ -935,7 +1024,7 @@ function getSceneRasterLayers(scene: VectorScene): RasterLayerSource[] {
     matrix: scene.rasterLayerMatrix
   });
 
-  return out;
+  return out.map(classifyRasterSource);
 }
 
 function hasRasterSourcePixels(source: RasterLayerSource, exactRgba = false): boolean {

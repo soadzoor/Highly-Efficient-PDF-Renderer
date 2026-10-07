@@ -1546,7 +1546,11 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
     updateLoadingProgress(activeLoadToken, { value: 0.98, stage: "upload" });
     // Keep canonical references attached to the exact same scene when
     // replacing the renderer; do not parse the source again.
-    nextObject = await createThreePdfObject(
+    nextObject = previousObject.isPageDemandLoaded && previousObject.sourceBytes
+      ? await pdfObjectGenerator(previousObject.sourceBytes, { ...previousObject.sourceOptions, ...objectOptions,
+        sourceLabel: previousObject.sourceLabel,
+        signal: controller.signal, onProgress: progress => updateLoadingProgress(activeLoadToken, progress) }, backend)
+      : await createThreePdfObject(
       {
         scene: previousObject.sceneData,
         sourceLabel: previousObject.sourceLabel,
@@ -1658,6 +1662,17 @@ function replacePdfObject(
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
+  nextObject.addEventListener("change", event => {
+    if (currentPdfObject !== nextObject) return;
+    if (event.reason === "pages-loaded") {
+      updateSceneMetrics(nextObject);
+      drawingSelection.sceneChanged();
+      annotationOverlay.sceneChanged(); annotationControls.sceneChanged(); annotationInteraction?.refresh();
+      refreshSearchAvailability();
+      if (textSearchInputElement.value.trim()) runSearch(textSearchInputElement.value, false);
+    }
+    requestRender();
+  });
   resetPageLayout(options.pageLayoutView);
   layerControls.objectChanged();
   scene.add(nextObject);
@@ -1838,6 +1853,7 @@ async function downloadHep(): Promise<boolean> {
 
 
   const exportController = new AbortController();
+  pdfObject.pausePageLoading();
   activeHepExportController = exportController;
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
@@ -1850,11 +1866,12 @@ async function downloadHep(): Promise<boolean> {
     const lodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
     if (!lodOptions) return false;
     await yieldToBrowserPaint();
-    const hepBlob = await buildHep(pdfObject.sceneData, {
+    const hepOptions = {
+      ...(pdfObject.isPageDemandLoaded ? pdfObject.sourceOptions : {}),
       ...lodOptions,
       sourceLabel: pdfObject.sourceLabel,
       signal: exportController.signal,
-      onProgress: (progress) => {
+      onProgress: (progress: PDFLoadProgress) => {
         if (activeHepExportController !== exportController) {
           return;
         }
@@ -1862,7 +1879,9 @@ async function downloadHep(): Promise<boolean> {
         const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
         setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
       }
-    });
+    };
+    const hepBlob = pdfObject.isPageDemandLoaded
+      ? await buildHep(pdfObject.sourceBytes!, hepOptions) : await buildHep(pdfObject.sceneData, hepOptions);
 
     if (activeHepExportController !== exportController) {
       return false;
@@ -1878,6 +1897,7 @@ async function downloadHep(): Promise<boolean> {
     }
     return false;
   } finally {
+    pdfObject.resumePageLoading();
     if (activeHepExportController === exportController) {
       activeHepExportController = null;
       setLoadingProgress(false);

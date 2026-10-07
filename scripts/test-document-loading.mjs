@@ -516,6 +516,7 @@ function demoHost() {
 }
 function demoObject(id) {
   return {
+    addEventListener: noop, pausePageLoading: noop, resumePageLoading: noop,
     id, sourceLabel: id, sourceKind: "pdf", disposals: 0,
     renderer: { setInteractionViewportProvider: noop },
     setFrameListener: noop,

@@ -1,5 +1,5 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { nativeVectorMissingFontResolver, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, deriveSceneTextContentFromIndex, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { automaticRasterMemoryBudget } from "./rasterMemoryBudget";
 import { sceneCpuBytes } from "./pageRasterPreview";
@@ -30,14 +30,17 @@ export class PdfPageDemandLoader {
   private running: Promise<void> | null = null;
   private operation: AbortController | null = null;
   private readonly session: NativeVectorPdfSession;
-  private readonly onChange: () => void | Promise<void>;
+  private onChange: () => void | Promise<void>;
   private readonly options: VectorExtractOptions;
+  private readonly sourcePages: number[];
 
   constructor(session: NativeVectorPdfSession,
     onChange: () => void | Promise<void>, options: VectorExtractOptions = {}) {
     this.session = session; this.onChange = onChange; this.options = options;
     this.password = options.password;
-    this.placeholders = session.info.pages.map(page => {
+    this.sourcePages = resolvePdfPageNumbers(session.info.pages.length, options.pages).map(page => page - 1);
+    this.placeholders = this.sourcePages.map(index => {
+      const page = session.info.pages[index];
       const scene = createEmptyVectorScene();
       const bounds = { minX: 0, minY: 0, maxX: page.width, maxY: page.height };
       scene.pageCount = 1;
@@ -49,6 +52,7 @@ export class PdfPageDemandLoader {
   }
 
   get pageCount(): number { return this.placeholders.length; }
+  setOnChange(onChange: () => void | Promise<void>): void { this.onChange = onChange; }
   get previewCount(): number { return this.previews.size; }
   get detailedCount(): number { return this.detailed.size; }
   get residentBytes(): number {
@@ -71,6 +75,24 @@ export class PdfPageDemandLoader {
     for (let index = 0; index < this.pageCount; index++) {
       const offset = index * 4;
       const x0 = pageRects[offset], y0 = pageRects[offset + 1], x1 = pageRects[offset + 2], y1 = pageRects[offset + 3];
+      if (view.projection || view.localToClip) {
+        const m = view.projection ? view.projection(index) : view.localToClip;
+        if (!m) continue;
+        const corners = [[x0,y0], [x1,y0], [x0,y1], [x1,y1]].map(([x,y]) => {
+          const w = m[3]*x + m[7]*y + m[15];
+          return w > 1e-8 ? [(m[0]*x + m[4]*y + m[12])/w, (m[1]*x + m[5]*y + m[13])/w] : null;
+        });
+        const points = corners.filter(point => point !== null);
+        if (!points.length) continue;
+        const xs = points.map(point => point[0]), ys = points.map(point => point[1]);
+        // A near-plane intersection has unbounded demand; the detail/cache caps still apply.
+        if (points.length === 4 && (Math.max(...xs) < -1.15 || Math.min(...xs) > 1.15 ||
+            Math.max(...ys) < -1.15 || Math.min(...ys) > 1.15)) continue;
+        visible.push({ index, distance: Math.hypot((Math.min(...xs)+Math.max(...xs))/2,
+          (Math.min(...ys)+Math.max(...ys))/2), detail: points.length !== 4 ||
+          Math.max((Math.max(...xs)-Math.min(...xs))*view.width/2, (Math.max(...ys)-Math.min(...ys))*view.height/2) > 256 });
+        continue;
+      }
       if (x1 < view.cameraCenterX - halfWidth - margin || x0 > view.cameraCenterX + halfWidth + margin ||
           y1 < view.cameraCenterY - halfHeight - margin || y0 > view.cameraCenterY + halfHeight + margin) continue;
       visible.push({ index, distance: Math.hypot((x0 + x1) / 2 - view.cameraCenterX, (y0 + y1) / 2 - view.cameraCenterY),
@@ -150,7 +172,7 @@ export class PdfPageDemandLoader {
       if (detail) this.attempted.add(index);
       const operation = this.operation = new AbortController();
       try {
-        const scene = await this.session.compileVectorPage(index, {
+        const scene = await this.session.compileVectorPage(this.sourcePages[index], {
           signal: operation.signal, optimization: "safe",
           enableSegmentMerge: this.options.enableSegmentMerge !== false,
           enableInvisibleCull: this.options.enableInvisibleCull !== false,
@@ -158,6 +180,7 @@ export class PdfPageDemandLoader {
           ...(this.options.annotationAppearances ? { annotationAppearances: this.options.annotationAppearances } : {}),
           onProgress: () => {}
         });
+        if (this.options.extractTextContent === true) scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
         if (this.closed || operation.signal.aborted) { this.attempted.delete(index); continue; }
         const cache = detail ? this.detailed : this.previews;
         // Navigation supersedes full-page work; a compact preview is still useful after a pan.
@@ -212,5 +235,6 @@ export async function openPdfPageDemand(pdfData: ArrayBuffer, options: VectorExt
     imageCodecResolver: options.imageCodecResolver, iccEngine: options.iccEngine,
     iccTransformResolver: options.iccTransformResolver, onDiagnostic: options.onDiagnostic
   });
-  return new PdfPageDemandLoader(session as NativeVectorPdfSession, onChange, options);
+  try { return new PdfPageDemandLoader(session as NativeVectorPdfSession, onChange, options); }
+  catch (error) { await session.close(); throw error; }
 }

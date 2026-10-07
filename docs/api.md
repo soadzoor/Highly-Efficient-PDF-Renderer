@@ -76,9 +76,11 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | --- | --- | --- |
 | `signal` | — | `AbortSignal` for source reading, parsing, LOD preparation, and object creation. |
 | `sourceKind` | `"auto"` | Infer the format from the source, or force `"pdf"` / `"hep"`. |
+| `sourceLabel` | Inferred name | Override the name shown for retained bytes or other sources. |
 | `pages` | All pages | One-based PDF pages: `"2"`, `"1-3, 5"`, `"5-"`, or `"-3"`. |
 | `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
+| `pageLoading` | `"auto"` | PDFs with more than 16 selected pages open from metadata and load previews/detail as the camera needs them. `"eager"` extracts the complete scene before returning. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
@@ -95,8 +97,9 @@ annotation appearance mode; PDF parsing options do not reprocess a HEP scene. Se
 does not require `extractText: true`.
 
 See [loading option types](../src/pdfObjectGenerator.ts) and
-[progress fields and stages](../src/loadProgress.ts). All selected pages are
-prepared before the promise resolves. Cancellation is cooperative; after a
+[progress fields and stages](../src/loadProgress.ts). Large PDFs initially prepare
+page metadata; visible content loads as needed. Other sources and `pageLoading: "eager"`
+prepare all selected pages before resolving. Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
 Large stroke and text LOD preparations use a module worker when available,
 leaving the browser's main thread available for interaction. Small preparations
@@ -238,8 +241,10 @@ incremental buffer updates are outside this API; build a new scene if needed.
 
 ## `HeprThreePdfObject`
 
-The object supports normal Three.js transforms. `sceneData` contains its parsed
-`VectorScene`; treat it as read-only. `sourceLabel`, `sourceKind`, and
+The object supports normal Three.js transforms. `sceneData` contains its current
+`VectorScene`; treat it as read-only and read it again after `pages-loaded` events.
+For demand-loaded PDFs this is the viewing window; `loadCompleteScene()` performs
+explicit complete extraction for geometry analysis. `sourceLabel`, `sourceKind`, and
 `rendererType` describe the loaded source and backend.
 
 Transforms apply to the **whole loaded object**, including all pages, backgrounds
@@ -1060,8 +1065,8 @@ texel with separate R8 coverage mipmaps for filtered minification. Typical squar
 images use about 0.46 bytes per source pixel including mipmaps, versus 5.33 for
 RGBA8. Reduced display tiers generate R8 coverage directly from packed pixels,
 without RGBA expansion or higher-resolution mip intermediates. Exact two-color
-images loaded from existing HEPs can use the same GPU path. Three, Canvas 2D and
-exports retain RGBA compatibility.
+images loaded from existing HEPs can use the same GPU path. Both Three material
+backends use the same packed/R8 representations. Canvas 2D and exports retain RGBA compatibility.
 
 The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
 embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX
@@ -1105,7 +1110,7 @@ guarantees; vectors, text, compositor surfaces and other applications use memory
 
 Screen-sized images that fit retain their RGBA representation or exact packed
 binary representation when original dimensions are needed.
-Under memory pressure, native WebGL2 and WebGPU first try BC7 or ASTC 4x4 GPU
+Under memory pressure, native and Three WebGL2/WebGPU first try BC7 or ASTC 4x4 GPU
 compression for eligible opaque images, then area-filter ordinary rasters to
 smaller textures if aggregate demand still exceeds the target. Both formats
 store 16 bytes per 4x4 block, about one quarter of RGBA8 storage for large images.
@@ -1130,10 +1135,27 @@ failures are diagnosed and replan budgeted RGBA textures so the document can
 still open. Console warnings distinguish compression and automatic resolution
 reduction from device texture-limit reductions.
 
-Three.js uses RGBA display textures at the selected resolution tiers. Parse-time
-reduced codec decoding and larger ASTC footprints (including 12x12) remain
+Three uses its host renderer's public `ExternalTexture` bridge for compression,
+with one encoder/workspace shared by independent page materials on that host.
+Older Three versions without that bridge keep packed/R8 textures and automatic
+resolution sizing. Independent page views share one document raster budget.
+Parse-time reduced codec decoding and larger ASTC footprints (including 12x12) remain
 separate stages; this implementation selects only the audited BC7 and ASTC 4x4
 encoders.
+
+Large PDFs use metadata-only page placeholders, 96-pixel page previews and a
+bounded cache of at most 12 detailed pages. Camera projections include independent
+page transforms and hidden pages. Zooming out selects the cached overview again;
+cached detail remains available for later zooms without affecting the displayed tier.
+`change` events with `reason: "pages-loaded"` tell hosts to refresh search,
+annotation and selection UI and request a frame. `"raster-ready"` requests another
+frame for texture refinement or an asynchronously prepared encoder.
+`sceneData` represents the current viewing window when `isPageDemandLoaded` is
+true. Search requests remaining previews in the background. For complete geometry,
+use `await object.loadCompleteScene({ signal })`, or `pageLoading: "eager"` at load.
+For complete HEP export, pass `object.sourceBytes` and its `sourceOptions` to
+`buildHep`; the Three demo does this automatically. Disposing the object closes
+its worker and releases page caches.
 
 Images wider or taller than the GPU's texture limit are drawn as several tiles
 when the automatic scene budget permits. Native WebGPU requests the adapter's full limit, often 16,384

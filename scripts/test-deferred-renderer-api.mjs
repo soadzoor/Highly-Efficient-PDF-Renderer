@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 
-import { deferRendererSceneUpload } from "../src/deferredRendererApi.ts";
+const hooks = registerHooks({ resolve(s,c,next) {
+  return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s,c);
+} });
+const { deferRendererSceneUpload } = await import("../src/deferredRendererApi.ts");
 
 const threePdfObjectSource = await readFile(
   new URL("../src/threePdfObject.ts", import.meta.url),
@@ -80,8 +84,19 @@ const replacement = { marker: "replacement" };
 assert.equal(deferred.setScene(replacement), stats);
 assert.deepEqual(calls.findLast(([name]) => name === "setScene"), ["setScene", replacement]);
 
+const window = { marker: "viewing window" };
+deferred.replaceDeferredScene(window);
+assert.equal(deferred.hasUploadedScene(), false);
+assert.equal(calls.at(-1)[1].rasterLayers.length, 0, "old native image resources are released before deferring another window");
+const beforeWindow = calls.length;
+deferred.replaceDeferredScene(window);
+assert.equal(calls.length, beforeWindow, "an already dormant renderer does not upload another empty scene");
+deferred.renderExternalFrame(456);
+assert.deepEqual(calls.slice(-2), [["setScene", window], ["renderExternalFrame",456]]);
+
 deferred.dispose();
 assert.equal(calls.at(-1)[0], "dispose");
+assert.throws(() => deferred.replaceDeferredScene(window), /disposed/);
 
 const diagnosticCalls = [];
 const diagnosticRenderer = new Proxy({

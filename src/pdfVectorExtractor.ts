@@ -1921,7 +1921,7 @@ function normalizePositiveInt(value: unknown, fallback: number, min: number, max
   return valid;
 }
 
-function resolvePdfPageNumbers(pdfPageCount: number, pages: string | undefined): number[] {
+export function resolvePdfPageNumbers(pdfPageCount: number, pages: string | undefined): number[] {
   if (pages !== undefined && typeof pages !== "string") {
     throw new TypeError("pages must be a string.");
   }
