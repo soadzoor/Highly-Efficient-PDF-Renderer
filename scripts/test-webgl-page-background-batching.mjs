@@ -16,6 +16,7 @@ try {
     return [page * 20, 0, page * 20 + 10, 10][i % 4];
   });
   renderer.setAllPagesAndTextVisible();
+  renderer.scene = { pendingPagePreviews: Uint8Array.from({ length: 396 }, (_, i) => i === 0 ? 1 : 0) };
   const draw = (x = 50, zoom = 1) => {
     mock.calls.length = mock.draws.length = 0;
     renderer.frameDrawCalls = 0;
@@ -29,16 +30,20 @@ try {
   const attributes = mock.vaos.get(vao);
   assert.equal(attributes.get(0).divisor, 0);
   assert.deepEqual(attributes.get(1), {
-    enabled: true, buffer: renderer.pageBackgroundBuffer, size: 4, stride: 16, offset: 0, divisor: 1
+    enabled: true, buffer: renderer.pageBackgroundBuffer, size: 4, stride: 20, offset: 0, divisor: 1
   }, "each instance supplies one page rectangle");
+  assert.deepEqual(attributes.get(4), {
+    enabled: true, buffer: renderer.pageBackgroundBuffer, size: 1, stride: 20, offset: 16, divisor: 1
+  }, "the same instance carries its overview loading flag");
   assert.equal(uniforms.get("uRasterTex"), 12);
   assert.equal(uniforms.get("uRasterOpacity"), 1);
+  assert(uniforms.get("uPagePlaceholderTime") >= 0);
   assert.equal(counters.get("pageBackgroundBatches"), 1);
   assert.equal(counters.get("pageBackgroundInstances"), 396);
   const firstUpload = mock.uploads.get(renderer.pageBackgroundBuffer);
-  assert.equal(firstUpload.length, 396 * 4);
-  assert.deepEqual(firstUpload.slice(0, 8), [0, 0, 10, 10, 20, 0, 10, 10]);
-  assert.deepEqual(firstUpload.slice(-4), [7900, 0, 10, 10]);
+  assert.equal(firstUpload.length, 396 * 5);
+  assert.deepEqual(firstUpload.slice(0, 10), [0, 0, 10, 10, 1, 20, 0, 10, 10, 0]);
+  assert.deepEqual(firstUpload.slice(-5), [7900, 0, 10, 10, 0]);
 
   draw(60, 2);
   assert.equal(mock.calls.filter(c => c[0] === "bufferData").length, 0, "panning/zooming with the same pages reuses the buffer");
@@ -47,10 +52,10 @@ try {
   renderer.updateVisiblePagesAndTextRanges(40, 0, 50, 10);
   draw();
   assert.equal(mock.draws[0].args[3], 1, "only visible pages are instanced");
-  assert.deepEqual(mock.uploads.get(renderer.pageBackgroundBuffer), [40, 0, 10, 10]);
+  assert.deepEqual(mock.uploads.get(renderer.pageBackgroundBuffer), [40, 0, 10, 10, 0]);
   renderer.updateVisiblePagesAndTextRanges(60, 0, 70, 10);
   draw();
-  assert.deepEqual(mock.uploads.get(renderer.pageBackgroundBuffer), [60, 0, 10, 10],
+  assert.deepEqual(mock.uploads.get(renderer.pageBackgroundBuffer), [60, 0, 10, 10, 0],
     "a different page with the same visible count refreshes the buffer");
 
   renderer.localToClipRenderingEnabled = true;
@@ -66,9 +71,10 @@ try {
   assert.equal(mock.calls.filter(c => c[0] === "bufferData").length, 0, "color changes retain instance data");
 
   renderer.pageRects = Float32Array.of(-5, -6, -5, -8);
+  renderer.scene.pendingPagePreviews = undefined;
   renderer.setAllPagesAndTextVisible();
   draw();
-  assert.deepEqual(mock.uploads.get(renderer.pageBackgroundBuffer), [-5, -6, Math.fround(1e-6), Math.fround(1e-6)],
+  assert.deepEqual(mock.uploads.get(renderer.pageBackgroundBuffer), [-5, -6, Math.fround(1e-6), Math.fround(1e-6), 0],
     "scene replacement refreshes geometry and preserves degenerate rectangle handling");
   renderer.updateVisiblePagesAndTextRanges(100, 100, 110, 110);
   draw();

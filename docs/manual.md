@@ -117,6 +117,13 @@ Evicted pages regenerate as you navigate. Unloaded pages retain their outlines
 and positions. Search progressively loads preview text for the rest of the
 document; explicit HEP export compiles the complete original PDF.
 
+Pages waiting for their first overview show an animated book-page skeleton:
+a heading and groups of horizontal lines. Native and Three WebGL/WebGPU draw
+these shapes analytically in the page background, keeping them sharp at any
+zoom without allocating image textures. The skeleton disappears when the
+overview arrives. Offscreen or hidden pages do not keep animation running;
+the system's reduced-motion preference leaves a static skeleton.
+
 Three.js page demand follows camera projections, including moved or hidden pages.
 `pdfObjectGenerator` exposes the current viewing window through `sceneData` and
 emits `change` events with `reason: "pages-loaded"` when it changes. Use

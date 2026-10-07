@@ -22,6 +22,8 @@ import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterReso
 import { buildMonochromeMipChain, detectMonochromeRaster,
   monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
+import { pagePlaceholderVertexGlsl, pagePlaceholderFragmentGlsl, pagePlaceholderTime,
+  pagePlaceholderAnimationEnabled, hasVisiblePagePlaceholders } from "./pageLoadingPlaceholder";
 import { assessRasterCompression, selectRasterCompressionFormat, type RasterCompressionFormat } from "./rasterCompression";
 import { WebGlRasterCompression, MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES } from "./webGlRasterCompression";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
@@ -991,10 +993,10 @@ export class WebGlFloorplanRenderer {
     this.rasterProgram = this.createProgram(RASTER_VERTEX_SHADER_SOURCE,
       foldable(monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE), true));
     this.pageBackgroundProgram = this.createProgram(
-      RASTER_VERTEX_SHADER_SOURCE.replace("#version 300 es", "#version 300 es\n#define INSTANCED_PAGE_BACKGROUNDS"),
-      foldable(RASTER_FRAGMENT_SHADER_SOURCE, true));
+      pagePlaceholderVertexGlsl(RASTER_VERTEX_SHADER_SOURCE).replace("#version 300 es", "#version 300 es\n#define INSTANCED_PAGE_BACKGROUNDS"),
+      foldable(pagePlaceholderFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE), true));
     this.pageBackgroundUniforms = this.mustGetUniformMap(this.pageBackgroundProgram, [
-      "uRasterTex", "uRasterOpacity", "uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip"
+      "uRasterTex", "uRasterOpacity", "uViewport", "uCameraCenter", "uZoom", "uUseLocalToClip", "uLocalToClip", "uPagePlaceholderTime"
     ]);
     this.highlightProgram = this.createProgram(HIGHLIGHT_VERTEX_SHADER_SOURCE, HIGHLIGHT_FRAGMENT_SHADER_SOURCE);
 
@@ -2327,7 +2329,8 @@ export class WebGlFloorplanRenderer {
     this.capturePresentedFrameState();
     this.emitFrameStats(stats);
 
-    if (isCameraAnimating) {
+    if (isCameraAnimating || (this.scene?.pendingPagePreviews && this.rasterRenderingEnabled && this.pageBackgroundColor[3] > 0 && pagePlaceholderAnimationEnabled() &&
+      hasVisiblePagePlaceholders(this.scene, { ...this.getViewState(), width: this.canvas.width, height: this.canvas.height }))) {
       this.requestFrame();
     }
   }
@@ -3003,6 +3006,7 @@ export class WebGlFloorplanRenderer {
     this.setGradientViewUniforms(uniforms, viewportWidth, viewportHeight, cameraCenterX, cameraCenterY, zoomValue);
     gl.uniform1i(uniforms.uRasterTex, 12);
     gl.uniform1f(uniforms.uRasterOpacity, 1);
+    gl.uniform1f(uniforms.uPagePlaceholderTime, pagePlaceholderTime());
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.visiblePageRectCount);
     this.frameDrawCalls++;
     if (this.performanceProfiler?.enabled) {
@@ -3019,19 +3023,20 @@ export class WebGlFloorplanRenderer {
     if (!changed) return;
     if (this.pageBackgroundPageIndices.length < count) {
       this.pageBackgroundPageIndices = new Uint32Array(count);
-      this.pageBackgroundInstanceRects = new Float32Array(count * 4);
+      this.pageBackgroundInstanceRects = new Float32Array(count * 5);
     }
     const rects = this.pageBackgroundInstanceRects;
     for (let i = 0; i < count; i++) {
-      const source = indices[i] * 4, target = i * 4;
+      const source = indices[i] * 4, target = i * 5;
       this.pageBackgroundPageIndices[i] = indices[i];
       rects[target] = this.pageRects[source];
       rects[target + 1] = this.pageRects[source + 1];
       rects[target + 2] = Math.max(this.pageRects[source + 2] - this.pageRects[source], 1e-6);
       rects[target + 3] = Math.max(this.pageRects[source + 3] - this.pageRects[source + 1], 1e-6);
+      rects[target + 4] = this.scene?.pendingPagePreviews?.[indices[i]] ? 1 : 0;
     }
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.pageBackgroundBuffer);
-    this.gl.bufferData(this.gl.ARRAY_BUFFER, rects.subarray(0, count * 4), this.gl.DYNAMIC_DRAW);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, rects.subarray(0, count * 5), this.gl.DYNAMIC_DRAW);
     this.pageBackgroundSourceRects = this.pageRects;
     this.pageBackgroundInstanceCount = count;
   }
@@ -5862,9 +5867,15 @@ export class WebGlFloorplanRenderer {
 
       gl.bindBuffer(gl.ARRAY_BUFFER, rectBuffer);
       gl.enableVertexAttribArray(1);
-      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, vao === this.pageBackgroundVao ? 20 : 16, 0);
       gl.vertexAttribDivisor(1, 1);
     }
+
+    gl.bindVertexArray(this.pageBackgroundVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.pageBackgroundBuffer);
+    gl.enableVertexAttribArray(4);
+    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 20, 16);
+    gl.vertexAttribDivisor(4, 1);
 
     gl.bindVertexArray(null);
   }

@@ -127,19 +127,25 @@ try {
     const { renderer, device, frame } = create();
     renderer.scene.pageRects = Float32Array.from({ length: 396 * 4 }, (_, i) =>
       [Math.floor(i / 4) * 20, 0, Math.floor(i / 4) * 20 + 10, 10][i % 4]);
+    renderer.scene.pendingPagePreviews = Uint8Array.from({ length: 396 }, (_, i) => i === 0 ? 1 : 0);
     renderer.configurePageBackgroundResources(renderer.scene);
     assert.equal(frame(), 5, "396 backgrounds batch into one draw alongside four content draws");
     const [batch] = renderer.pageBackgroundResources;
     assert.equal(renderer.pageBackgroundResources.length, 1);
     assert.equal(batch.count, 396);
     const upload = device.writes.find(write => write.buffer === batch.instanceBuffer);
-    assert.equal(upload.values.length, 396 * 4);
-    assert.deepEqual(upload.values.slice(0,8), [0,0,10,10, 20,0,10,10]);
-    assert.deepEqual(upload.values.slice(-4), [7900,0,10,10]);
+    assert.equal(upload.values.length, 396 * 8);
+    assert.deepEqual(upload.values.slice(0,16), [0,0,10,10,1,0,0,0, 20,0,10,10,0,0,0,0]);
+    assert.deepEqual(upload.values.slice(-8), [7900,0,10,10,0,0,0,0]);
     assert.equal(batch.instanceBuffer.descriptor.usage, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const shader = renderer.pageBackgroundPipeline.descriptor.vertex.module.code;
     assert.match(shader, /var<storage, read> uPageRects/);
     assert.match(shader, /uPageRects\[instanceIndex\]/);
+    assert.match(shader, /heprPagePlaceholder\(textureSample/);
+    assert.match(shader, /@interpolate\(flat\) pending/);
+    assert.equal(batch.bindGroup.entries[4].resource.buffer, renderer.pagePlaceholderUniformBuffer);
+    assert.equal(device.writes.filter(write => write.buffer === renderer.pagePlaceholderUniformBuffer).length, 1,
+      "one small uniform update animates every pending background");
     assert.doesNotMatch(shader, /uRaster\./, "background shader cannot read a per-image uniform buffer");
     assert.equal(renderer.pageBackgroundPipeline.descriptor.fragment.targets[0].blend.color.srcFactor, "one");
     // A clip is often an image's visible outline: images antialias it, with the
@@ -166,25 +172,27 @@ try {
     renderer.rasterRenderingEnabled = true;
 
     // Device buffer limits split only oversized page sets into bounded batches.
-    device.limits.maxStorageBufferBindingSize = 32;
+    device.limits.maxStorageBufferBindingSize = 64;
     device.limits.maxBufferSize = 64;
     renderer.scene.pageRects = Float32Array.of(0,0,1,1, 2,0,3,1, 4,0,5,1, 6,0,7,1, 8,0,9,1);
     renderer.configurePageBackgroundResources(renderer.scene);
     assert(batch.instanceBuffer.destroyed, "replacing the document releases previous geometry");
     assert.deepEqual(renderer.pageBackgroundResources.map(resource => resource.count), [2,2,1]);
-    assert(renderer.pageBackgroundResources.every(resource => resource.instanceBuffer.descriptor.size <= 32));
+    assert(renderer.pageBackgroundResources.every(resource => resource.instanceBuffer.descriptor.size <= 64));
     assert.equal(frame(), 7, "frame metrics count the bounded batches");
     const chunks = [...renderer.pageBackgroundResources];
     renderer.scene.pageRects = Float32Array.of(NaN,0,1,1, -5,-6,-5,-8);
     renderer.configurePageBackgroundResources(renderer.scene);
     assert(chunks.every(resource => resource.instanceBuffer.destroyed));
     assert.equal(renderer.pageBackgroundResources[0].count, 1, "invalid rectangles are skipped");
-    assert.deepEqual(device.writes.at(-1).values, [-5,-6,Math.fround(1e-6),Math.fround(1e-6)],
+    assert.deepEqual(device.writes.at(-1).values, [-5,-6,Math.fround(1e-6),Math.fround(1e-6),0,0,0,0],
       "degenerate rectangle handling is preserved");
     const finalBuffer = renderer.pageBackgroundResources[0].instanceBuffer;
     const texture = renderer.pageBackgroundTexture;
+    const animationUniform = renderer.pagePlaceholderUniformBuffer;
     renderer.dispose(); renderer.dispose();
     assert(finalBuffer.destroyed); assert(texture.destroyed);
+    assert(animationUniform.destroyed, "disposing a viewer releases its animation uniform");
   }
 
   for (const blendMode of ["Normal", "Multiply"]) {

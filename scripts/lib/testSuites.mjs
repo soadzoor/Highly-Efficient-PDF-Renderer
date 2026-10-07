@@ -63,6 +63,7 @@ export const fastTests = [
   "raster-resolution",
   "pdf-page-demand",
   "three-page-demand",
+  "page-loading-placeholders",
   "three-raster-storage",
   "webgl-raster-memory-budget",
   "webgpu-raster-memory-budget",

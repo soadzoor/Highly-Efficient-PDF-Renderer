@@ -16,6 +16,8 @@ import { assessRasterCompression, type RasterCompressionFormat } from "./rasterC
 import { WebGpuRasterCompression } from "./webGpuRasterCompression";
 import { buildMonochromeMipChain, detectMonochromeRaster, monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
 import { MONOCHROME_RASTER_WGSL } from "./monochromeRasterWebGpuShaders";
+import { PAGE_PLACEHOLDER_WGSL, pagePlaceholderTime, pagePlaceholderAnimationEnabled,
+  hasVisiblePagePlaceholders } from "./pageLoadingPlaceholder";
 import { buildRasterStripBatches, type RasterStripBatch } from "./rasterStripBatches";
 import { RASTER_STRIP_WGSL } from "./nativeRasterStripWebGpuShader";
 import { WebGpuPaintCompositor, beginPdfManagedRenderPass } from "./webGpuPaintCompositor";
@@ -913,17 +915,20 @@ struct RasterUniforms {
 };
 
 @group(0) @binding(0) var<uniform> uCamera : CameraUniforms;
+${pageBackgrounds ? "struct PageBackground { rect: vec4f, placeholder: vec4f };" : ""}
 @group(0) @binding(1) ${pageBackgrounds
-  ? "var<storage, read> uPageRects : array<vec4f>;"
+  ? "var<storage, read> uPageRects : array<PageBackground>;"
   : "var<uniform> uRaster : RasterUniforms;"}
 @group(0) @binding(2) var uRasterSampler : sampler;
 @group(0) @binding(3) var uRasterTex : texture_2d<f32>;
-${pageBackgrounds ? "" : "@group(0) @binding(4) var uRasterCoverageTex : texture_2d<f32>;"}
+${pageBackgrounds ? "@group(0) @binding(4) var<uniform> uPagePlaceholderTime: vec4f;"
+  : "@group(0) @binding(4) var uRasterCoverageTex : texture_2d<f32>;"}
 
 struct VsOut {
   @builtin(position) position : vec4f,
   @location(0) uv : vec2f,
   @location(1) world : vec2f,
+  ${pageBackgrounds ? "@location(2) @interpolate(flat) pending: f32," : ""}
 };
 
 fn cornerFromVertexIndex(vertexIndex : u32) -> vec2f {
@@ -949,7 +954,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let localTopDown = vec2f(corner01.x, 1.0 - corner01.y);
 
 ${pageBackgrounds ? `
-  let rect = uPageRects[instanceIndex];
+  let rect = uPageRects[instanceIndex].rect;
   let world = rect.xy + rect.zw * localTopDown;
 ` : `
   let a = uRaster.matrixA.x;
@@ -976,6 +981,7 @@ ${pageBackgrounds ? `
   out.position = vec4f(clip, 0.0, 1.0);
   out.uv = ${pageBackgrounds ? "localTopDown" : "tileUv"};
   out.world = world;
+  ${pageBackgrounds ? "out.pending = uPageRects[instanceIndex].placeholder.x;" : ""}
   return out;
 }
 
@@ -983,6 +989,7 @@ ${pageBackgrounds ? `
 @group(1) @binding(1) var<uniform> uVectorClip: vec4f;
 ${RASTER_CLIP_WGSL}
 ${pageBackgrounds ? "" : MONOCHROME_RASTER_WGSL}
+${pageBackgrounds ? PAGE_PLACEHOLDER_WGSL : ""}
 
 @fragment
 fn fsMain(inData : VsOut) -> @location(0) vec4f {
@@ -991,7 +998,8 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
   let clipAAWidth = max(max(length(vec2f(dpdx(inData.world.x), dpdy(inData.world.x))),
     length(vec2f(dpdx(inData.world.y), dpdy(inData.world.y)))), 1e-4);
 ${pageBackgrounds ? `
-  let color = textureSample(uRasterTex, uRasterSampler, inData.uv);
+  let color = heprPagePlaceholder(textureSample(uRasterTex, uRasterSampler, inData.uv),
+    inData.uv, inData.pending, uPagePlaceholderTime.x);
 ` : `
   let uvDx = dpdx(inData.uv);
   let uvDy = dpdy(inData.uv);
@@ -1298,6 +1306,7 @@ export class WebGpuFloorplanRenderer {
 
   private textRasterAtlasTexture: any = null;
   private pageBackgroundTexture: any = null;
+  private pagePlaceholderUniformBuffer: any = null;
 
   private gradientMetaTextures: any[] = [];
 
@@ -3151,6 +3160,8 @@ export class WebGpuFloorplanRenderer {
       this.pageBackgroundTexture.destroy();
       this.pageBackgroundTexture = null;
     }
+    this.pagePlaceholderUniformBuffer?.destroy();
+    this.pagePlaceholderUniformBuffer = null;
     releaseOwnedWebGpuDevice(this.gpuDevice, this.gpuContext);
   }
 
@@ -3414,7 +3425,8 @@ export class WebGpuFloorplanRenderer {
     } finally { profile?.endSection("drawSubmission"); }
     this.capturePresentedFrameState();
 
-    if (isCameraAnimating) {
+    if (isCameraAnimating || (this.scene?.pendingPagePreviews && this.rasterRenderingEnabled && this.pageBackgroundColor[3] > 0 && pagePlaceholderAnimationEnabled() &&
+      hasVisiblePagePlaceholders(this.scene, { ...this.getViewState(), width: this.canvas.width, height: this.canvas.height }))) {
       this.requestFrame();
     }
   }
@@ -3686,6 +3698,9 @@ export class WebGpuFloorplanRenderer {
       return;
     }
     pass.setPipeline(this.pageBackgroundPipeline);
+    if (this.scene?.pendingPagePreviews?.some(Boolean)) {
+      this.gpuDevice.queue.writeBuffer(this.pagePlaceholderUniformBuffer, 0, Float32Array.of(pagePlaceholderTime(), 0, 0, 0));
+    }
     this.bindVectorClip(pass);
     for (const batch of this.pageBackgroundResources) {
       pass.setBindGroup(0, batch.bindGroup);
@@ -4725,24 +4740,25 @@ export class WebGpuFloorplanRenderer {
     // Usually one buffer for the whole document; keep extreme page counts
     // within both the storage binding and allocation limits of this device.
     const maxPages = Math.floor(Math.min(this.gpuDevice.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024,
-      this.gpuDevice.limits.maxBufferSize ?? 256 * 1024 * 1024) / 16);
+      this.gpuDevice.limits.maxBufferSize ?? 256 * 1024 * 1024) / 32);
     if (maxPages < 1) throw new Error("WebGPU buffer limits cannot hold a page background rectangle.");
-    const instances = new Float32Array(Math.min(rects.length / 4, maxPages) * 4);
+    const instances = new Float32Array(Math.min(rects.length / 4, maxPages) * 8);
     let count = 0;
     try {
       for (let i = 0; i + 3 < rects.length; i += 4) {
         const minX = rects[i], minY = rects[i + 1], maxX = rects[i + 2], maxY = rects[i + 3];
         if (![minX, minY, maxX, maxY].every(Number.isFinite)) continue;
-        instances[count * 4] = minX;
-        instances[count * 4 + 1] = minY;
-        instances[count * 4 + 2] = Math.max(maxX - minX, 1e-6);
-        instances[count * 4 + 3] = Math.max(maxY - minY, 1e-6);
+        instances[count * 8] = minX;
+        instances[count * 8 + 1] = minY;
+        instances[count * 8 + 2] = Math.max(maxX - minX, 1e-6);
+        instances[count * 8 + 3] = Math.max(maxY - minY, 1e-6);
+        instances[count * 8 + 4] = scene.pendingPagePreviews?.[i / 4] ? 1 : 0;
         if (++count === maxPages) {
           this.pageBackgroundResources.push(this.createPageBackgroundResource(instances));
           count = 0;
         }
       }
-      if (count) this.pageBackgroundResources.push(this.createPageBackgroundResource(instances.subarray(0, count * 4)));
+      if (count) this.pageBackgroundResources.push(this.createPageBackgroundResource(instances.subarray(0, count * 8)));
     } catch (error) {
       this.destroyPageBackgroundResources();
       throw error;
@@ -4751,13 +4767,16 @@ export class WebGpuFloorplanRenderer {
 
   private ensurePageBackgroundPipeline(): void {
     if (this.pageBackgroundPipeline) return;
+    const usage = (globalThis as any).GPUBufferUsage;
+    this.pagePlaceholderUniformBuffer ??= this.gpuDevice.createBuffer({ size: 16, usage: usage.UNIFORM | usage.COPY_DST });
     const stage = (globalThis as any).GPUShaderStage;
     const bindGroupLayout = this.gpuDevice.createBindGroupLayout({ entries: [
       { binding: 0, visibility: stage.VERTEX,
         buffer: { type: "uniform", minBindingSize: CAMERA_UNIFORM_BUFFER_BYTES } },
       { binding: 1, visibility: stage.VERTEX, buffer: { type: "read-only-storage" } },
       { binding: 2, visibility: stage.FRAGMENT, sampler: { type: "filtering" } },
-      { binding: 3, visibility: stage.FRAGMENT, texture: { sampleType: "float" } }
+      { binding: 3, visibility: stage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 4, visibility: stage.FRAGMENT, buffer: { type: "uniform", minBindingSize: 16 } }
     ] });
     const layout = this.gpuDevice.createPipelineLayout({
       bindGroupLayouts: [bindGroupLayout, this.vectorClipBindGroupLayout]
@@ -4776,10 +4795,11 @@ export class WebGpuFloorplanRenderer {
           { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: CAMERA_UNIFORM_BUFFER_BYTES } },
           { binding: 1, resource: { buffer: instanceBuffer } },
           { binding: 2, resource: this.rasterLayerSampler },
-          { binding: 3, resource: this.pageBackgroundTexture.createView() }
+          { binding: 3, resource: this.pageBackgroundTexture.createView() },
+          { binding: 4, resource: { buffer: this.pagePlaceholderUniformBuffer } }
         ]
       });
-      return { count: instances.length / 4, instanceBuffer, bindGroup };
+      return { count: instances.length / 8, instanceBuffer, bindGroup };
     } catch (error) {
       instanceBuffer.destroy();
       throw error;

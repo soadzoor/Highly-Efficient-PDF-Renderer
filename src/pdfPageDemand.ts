@@ -45,6 +45,7 @@ export class PdfPageDemandLoader {
       const bounds = { minX: 0, minY: 0, maxX: page.width, maxY: page.height };
       scene.pageCount = 1;
       scene.pageRects = Float32Array.of(0, 0, page.width, page.height);
+      scene.pendingPagePreviews = Uint8Array.of(1);
       scene.pageTextRanges = Uint32Array.of(0, 0);
       scene.bounds = scene.pageBounds = bounds;
       return scene;
@@ -193,6 +194,8 @@ export class PdfPageDemandLoader {
         if (operation.signal.aborted || this.closed) this.attempted.delete(index);
         else {
           this.failed.add(index);
+          // A failed page is no longer getting an overview; do not animate indefinitely.
+          this.placeholders[index].pendingPagePreviews?.fill(0);
           console.warn(`[HEPR] Page ${index + 1} could not be loaded; other pages remain available.`, error);
           await this.notifyChange();
         }

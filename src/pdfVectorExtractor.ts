@@ -131,6 +131,8 @@ export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
   pageRects: Float32Array;
+  /** Viewing-only page skeleton flags; absent once the overview is available. Never exported as PDF content. */
+  pendingPagePreviews?: Uint8Array;
   pageTextRanges: Uint32Array;
   /** Per-page [first,count] pairs: stroke, fill, text, raster, gradient-fill, gradient-stroke. */
   pagePrimitiveRanges?: Uint32Array;
@@ -949,6 +951,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
   const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
   const pageRects = new Float32Array(totalPageRectCount * 4);
+  const pendingPagePreviews = pageScenes.some(scene => scene.pendingPagePreviews?.some(Boolean))
+    ? new Uint8Array(totalPageRectCount) : undefined;
   const pageTextRanges = new Uint32Array(totalPageRectCount * 2);
 
   let fillPathOffset = 0;
@@ -1277,6 +1281,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         pageRects[dst + 1] = scenePageRects[src + 1] + ty;
         pageRects[dst + 2] = scenePageRects[src + 2] + tx;
         pageRects[dst + 3] = scenePageRects[src + 3] + ty;
+        if (pendingPagePreviews) pendingPagePreviews[pageRectOffset + i] = scene.pendingPagePreviews?.[i] ?? 0;
 
         const rangeDst = (pageRectOffset + i) * 2;
         const rangeSrc = i * 2;
@@ -1291,6 +1296,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       pageRects[dst + 1] = scene.pageBounds.minY + ty;
       pageRects[dst + 2] = scene.pageBounds.maxX + tx;
       pageRects[dst + 3] = scene.pageBounds.maxY + ty;
+      if (pendingPagePreviews) pendingPagePreviews[pageRectOffset] = scene.pendingPagePreviews?.[0] ?? 0;
       const rangeDst = pageRectOffset * 2;
       pageTextRanges[rangeDst] = textInstanceOffset;
       pageTextRanges[rangeDst + 1] = scene.textInstanceCount;
@@ -1353,6 +1359,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     pageCount: totalPageRectCount,
     pagesPerRow,
     pageRects,
+    ...(pendingPagePreviews ? { pendingPagePreviews } : {}),
     pageTextRanges,
     ...(pagePrimitiveRanges ? { pagePrimitiveRanges } : {}),
     textIndex: hasAnyTextIndex ? { version: 2, pages: mergedTextIndexPages } : null,

@@ -29,6 +29,7 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 import { detectMonochromeRaster, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
+import { pagePlaceholderTime, pagePlaceholderVertexGlsl, pagePlaceholderFragmentGlsl } from "./pageLoadingPlaceholder";
 import { assessRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
 import { ThreeRasterCompression } from "./threeRasterCompression";
 import { createThreeRasterTileTextures, markThreeRasterTextureForUpload, threeRasterTextureInfo } from "./threeRasterTextures";
@@ -58,7 +59,7 @@ interface RasterLayerEntry {
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material>;
   material: THREE.Material;
   webGpuState?: Pick<ThreeWebGpuRasterMaterialState, "zoomUniform" | "useLocalToClipUniform"> &
-    Partial<Pick<ThreeWebGpuRasterMaterialState, "updateSource">>;
+    Partial<Pick<ThreeWebGpuRasterMaterialState, "updateSource" | "pagePlaceholderTimeUniform">>;
   batched?: boolean;
 }
 
@@ -136,6 +137,7 @@ export class ThreeMaterialRasterLayer {
   private readonly zoomUniform: { value: number };
   private readonly useLocalToClipUniform: { value: number };
   private readonly localToClipUniform: THREE.Matrix4;
+  private readonly pagePlaceholderTimeUniform = { value: 0 };
 
   constructor(scene: VectorScene, options: RasterLayerOptions) {
     this.pageTransforms = options.pageTransforms;
@@ -169,7 +171,7 @@ export class ThreeMaterialRasterLayer {
     this.ownedTextures.add(this.pageBackgroundTexture);
 
     const pageRects = normalizePageRects(scene);
-    this.pageBackgroundGeometry = createPageBackgroundGeometry(pageRects);
+    this.pageBackgroundGeometry = createPageBackgroundGeometry(pageRects, scene.pendingPagePreviews);
     if (this.pageTransforms && this.pageBackgroundGeometry) this.pageBackgroundGeometry.setAttribute("aPageIndex",
       new THREE.InstancedBufferAttribute(Float32Array.from({ length: pageRects.length / 4 }, (_, i) => i), 1));
     if (this.pageBackgroundGeometry) {
@@ -498,9 +500,13 @@ export class ThreeMaterialRasterLayer {
         return this.pageTransforms!.visibility[page] ? this.pageTransforms!.projectionElements[page] : null;
       } } : {}) };
     this.updateRasterResolution();
+    this.pagePlaceholderTimeUniform.value = pagePlaceholderTime();
     for (const entry of this.activeEntries) {
       if (entry.webGpuState) {
         entry.webGpuState.zoomUniform.value = this.zoomUniform.value;
+        if (entry.webGpuState.pagePlaceholderTimeUniform) {
+          entry.webGpuState.pagePlaceholderTimeUniform.value = this.pagePlaceholderTimeUniform.value;
+        }
       }
     }
   }
@@ -827,8 +833,11 @@ export class ThreeMaterialRasterLayer {
     const material = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
       defines: instancedPageBackground ? { INSTANCED_PAGE_BACKGROUNDS: 1 } : {},
-      vertexShader: normalizeCoreShaderSource(CORE_RASTER_VERTEX_SHADER_SOURCE),
-      fragmentShader: normalizeCoreShaderSource(monochromeRasterFragmentGlsl(CORE_RASTER_FRAGMENT_SHADER_SOURCE)),
+      vertexShader: normalizeCoreShaderSource(instancedPageBackground
+        ? pagePlaceholderVertexGlsl(CORE_RASTER_VERTEX_SHADER_SOURCE) : CORE_RASTER_VERTEX_SHADER_SOURCE),
+      fragmentShader: normalizeCoreShaderSource(instancedPageBackground
+        ? pagePlaceholderFragmentGlsl(monochromeRasterFragmentGlsl(CORE_RASTER_FRAGMENT_SHADER_SOURCE))
+        : monochromeRasterFragmentGlsl(CORE_RASTER_FRAGMENT_SHADER_SOURCE)),
       transparent: false,
       depthTest: false,
       depthWrite: false,
@@ -840,6 +849,7 @@ export class ThreeMaterialRasterLayer {
       blendSrcAlpha: THREE.OneFactor,
       blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
       uniforms: {
+        uPagePlaceholderTime: this.pagePlaceholderTimeUniform,
         uRasterTex: { value: texture },
         uRasterMonoMips: { value: info.coverage },
         uRasterMonochrome: { value: info.mode },
@@ -882,7 +892,7 @@ const WHOLE_RASTER_TILE: ThreeRasterTileRect = { quad: [0, 0, 1, 1], uv: [0, 0, 
  * These are document-space rectangles, not independent page transforms: any
  * future page matrix must also be applied to content, culling and interaction.
  */
-function createPageBackgroundGeometry(pageRects: Float32Array): THREE.InstancedBufferGeometry | null {
+function createPageBackgroundGeometry(pageRects: Float32Array, pending?: Uint8Array): THREE.InstancedBufferGeometry | null {
   const pageCount = Math.floor(pageRects.length / 4);
   if (pageCount <= 0) {
     return null;
@@ -905,6 +915,8 @@ function createPageBackgroundGeometry(pageRects: Float32Array): THREE.InstancedB
   geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, 1, 1, 1, 1, -1, -1, -1], 2));
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 0, 2, 3]), 1));
   geometry.setAttribute("aPageRect", new THREE.InstancedBufferAttribute(rects, 4));
+  geometry.setAttribute("aPageLoading", new THREE.InstancedBufferAttribute(
+    Float32Array.from({ length: pageCount }, (_, page) => pending?.[page] ? 1 : 0), 1));
   geometry.instanceCount = pageCount;
   return geometry;
 }

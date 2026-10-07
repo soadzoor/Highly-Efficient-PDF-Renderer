@@ -67,7 +67,11 @@ try {
     await object.updateDemandPages();
   };
   object.updatePageDemand(host, camera);
+  assert.equal(object.needsLoadingAnimation, true, "visible metadata-only pages animate while their overview is pending");
+  assert(changes.includes("page-loading-animation"), "on-demand Three hosts receive another-frame notifications");
   await flush();
+  object.updatePageDemand(host, camera);
+  assert.equal(object.needsLoadingAnimation, false, "loaded or hidden pages stop the placeholder animation");
   assert.deepEqual(calls.map(call => [call.index, call.preview]), [[0,96],[0,undefined]], "only the projected page loads");
   assert.equal(object.sceneData.rasterLayers[0].width, 1024);
   assert.equal((await object.getPages())[0], page, "page handles survive content updates");

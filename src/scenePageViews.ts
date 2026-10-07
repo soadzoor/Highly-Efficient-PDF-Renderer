@@ -135,6 +135,7 @@ export class ScenePageViews {
       new Map(Array.from(primitives[kind], (index, local) => [index, local]))])) as Record<PrimitiveKind, Map<number, number>>;
     const scene: VectorScene = Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(source)) as VectorScene, { pageCount: 1, pagesPerRow: 1,
       pageRects: source.pageRects.slice(pageIndex * 4, pageIndex * 4 + 4), pagePrimitiveRanges: undefined,
+      ...(source.pendingPagePreviews ? { pendingPagePreviews: source.pendingPagePreviews.slice(pageIndex, pageIndex + 1) } : {}),
       textIndex: null, retainedPages: undefined, paintGraph: undefined, clipPaths: undefined });
     const r = scene.pageRects;
     scene.pageBounds = { minX: Math.min(r[0], r[2]), minY: Math.min(r[1], r[3]), maxX: Math.max(r[0], r[2]), maxY: Math.max(r[1], r[3]) };

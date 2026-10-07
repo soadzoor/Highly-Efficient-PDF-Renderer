@@ -5,6 +5,7 @@ import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import { threeRasterTextureInfo } from "./threeRasterTextures";
+import { PAGE_PLACEHOLDER_BAR_WGSL, PAGE_PLACEHOLDER_COLOR_WGSL } from "./pageLoadingPlaceholder";
 
 import {
   createThreeWebGpuOutputFragmentFns,
@@ -19,6 +20,7 @@ export interface ThreeWebGpuRasterMaterialState {
   material: THREE.Material;
   zoomUniform: MutableUniform<number>;
   useLocalToClipUniform: MutableUniform<number>;
+  pagePlaceholderTimeUniform: MutableUniform<number>;
   updateSource(texture: THREE.Texture, matrix: Float32Array, opacity: number, tile?: ThreeRasterTileRect): void;
 }
 
@@ -44,6 +46,8 @@ interface ThreeWebGpuRasterMaterialOptions {
 }
 
 const WHOLE_RASTER_RECT = [0, 0, 1, 1];
+const placeholderBarFn: unknown = TSL.wgslFn(PAGE_PLACEHOLDER_BAR_WGSL);
+const placeholderColorFn: unknown = TSL.wgslFn(PAGE_PLACEHOLDER_COLOR_WGSL, [placeholderBarFn] as never);
 
 // Deliberately typed as `unknown`: naming the TSL function type (e.g. via
 // `ReturnType<typeof TSL.wgslFn>`) instantiates @types/three's recursive
@@ -204,6 +208,9 @@ export function createThreeWebGpuRasterMaterial(
     coverageImage: coverageNode, coverageSampler: TSL.sampler(coverageNode), uv: rasterPackValue.zw,
     mode: modeUniform, size: TSL.uniform(size), color0: TSL.uniform(color0), color1: TSL.uniform(color1), opaque: opaqueUniform });
   const opacityUniform = TSL.uniform(options.opacity ?? 1);
+  const pagePlaceholderTimeUniform = TSL.uniform(0);
+  const pageColor = options.instancedPageBackground ? callNode(placeholderColorFn, { paper: inputColor,
+    uv: rasterPackValue.zw, pending: varyingNode(TSL.attribute("aPageLoading", "float")), time: pagePlaceholderTimeUniform }) : inputColor;
 
   material.vertexNode = callNode(rasterClipFn, {
     rasterPack,
@@ -215,7 +222,7 @@ export function createThreeWebGpuRasterMaterial(
   });
   pageProjection.finish(material);
   material.fragmentNode = callNode(rasterFragmentFns[options.colorCompositing], {
-    inputColor,
+    inputColor: pageColor,
     opacity: opacityUniform,
     shapeOnly: shapeOnlyUniform
   });
@@ -227,6 +234,7 @@ export function createThreeWebGpuRasterMaterial(
     material,
     zoomUniform: zoomUniform as MutableUniform<number>,
     useLocalToClipUniform: useLocalToClipUniform as MutableUniform<number>,
+    pagePlaceholderTimeUniform: pagePlaceholderTimeUniform as MutableUniform<number>,
     updateSource(texture, matrix, opacity, tile) {
       textureNode.value = texture;
       const info = threeRasterTextureInfo(texture);

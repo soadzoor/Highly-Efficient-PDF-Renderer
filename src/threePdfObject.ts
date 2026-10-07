@@ -22,6 +22,7 @@ import {
   type DeferredSceneRendererApi
 } from "./deferredRendererApi";
 import { composeVectorScenesInGrid } from "./pdfVectorExtractor";
+import { hasVisiblePagePlaceholders, pagePlaceholderAnimationEnabled } from "./pageLoadingPlaceholder";
 import { prepareSceneForHepRendering } from "./hepShared";
 import type { PdfPageDemandLoader } from "./pdfPageDemand";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
@@ -309,8 +310,8 @@ interface RendererConfig {
 }
 
 export interface HeprThreePdfObjectEventMap extends THREE.Object3DEventMap {
-  /** Request another frame after the optional host highlight backend is ready. */
-  change: { reason: "primitive-highlights-ready" | "pages-loaded" | "raster-ready" };
+  /** Request another frame for asynchronous content, overlays or visible loading animation. */
+  change: { reason: "primitive-highlights-ready" | "pages-loaded" | "raster-ready" | "page-loading-animation" };
 }
 
 /**
@@ -767,6 +768,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   readonly sourceBytes: Uint8Array | undefined;
   readonly sourceOptions: LoadedPdfScene["sourceOptions"];
   private readonly pageDemand: PdfPageDemandLoader | undefined;
+  private loadingAnimationActive = false;
   private demandUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private demandUpdatePending = false;
   private demandUpdateRunning: Promise<void> | null = null;
@@ -1078,6 +1080,10 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
 
   /** Large PDF scenes contain the current viewing window; source bytes are retained for complete export. */
   get isPageDemandLoaded(): boolean { return !!this.pageDemand; }
+  /** Whether a visible pending overview needs another host frame. */
+  get needsLoadingAnimation(): boolean {
+    return !this.isDisposed && this.loadingAnimationActive && pagePlaceholderAnimationEnabled();
+  }
   pausePageLoading(): void { this.pageDemand?.pause(); }
   resumePageLoading(): void { this.pageDemand?.resume(); }
 
@@ -1197,16 +1203,23 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private updatePageDemand(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
-    if (!this.pageDemand || this.isDisposed) return;
+    if (this.isDisposed || (!this.pageDemand && !this.sceneData.pendingPagePreviews)) {
+      this.loadingAnimationActive = false;
+      return;
+    }
     const viewport = readThreeRendererViewportPixels(renderer);
     const worldToClip = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const projection = (object: HeprThreePdfObject) => worldToClip.clone().multiply(object.matrixWorld)
       .multiply(object.dataToLocalMatrix).elements;
-    this.pageDemand.update({ width: viewport.width, height: viewport.height, zoom: 1, cameraCenterX: 0, cameraCenterY: 0,
+    const view = { width: viewport.width, height: viewport.height, zoom: 1, cameraCenterX: 0, cameraCenterY: 0,
+      clipDepth: camera.coordinateSystem === THREE.WebGPUCoordinateSystem ? 0 : -1,
       ...(this.pageViews ? { projection: (index: number) => {
         const page = this.pageViews![index].object;
         return page.visible && !page.isDisposed ? projection(page) : null;
-      } } : { localToClip: projection(this) }) }, this.sceneData.pageRects);
+      } } : { localToClip: projection(this) }) };
+    this.loadingAnimationActive = this.rendererConfig.pageBackground[3] > 0 && hasVisiblePagePlaceholders(this.sceneData, view);
+    if (!this.pageOwner && this.needsLoadingAnimation) this.dispatchEvent({ type: "change", reason: "page-loading-animation" });
+    this.pageDemand?.update(view, this.sceneData.pageRects);
   }
 
   /** Release one generation of content without changing the Group, page handles or controls. */
@@ -2825,6 +2838,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       !cameraDrivenMaterialPipelineEnabled &&
       (
         !perspectiveThreeCameraMode ||
+        this.needsLoadingAnimation ||
         nativeViewChanged ||
         viewportChanged
       );

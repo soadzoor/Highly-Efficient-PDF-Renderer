@@ -1150,6 +1150,13 @@ cached detail remains available for later zooms without affecting the displayed 
 `change` events with `reason: "pages-loaded"` tell hosts to refresh search,
 annotation and selection UI and request a frame. `"raster-ready"` requests another
 frame for texture refinement or an asynchronously prepared encoder.
+Pending overviews show sharp animated page skeletons in both native and Three
+backends. These are page-background shapes, so picking, search and exports do
+not include their lines. `"page-loading-animation"` change events request another
+host frame while a pending page is visible. Hosts can also read
+`object.needsLoadingAnimation`; offscreen/hidden pages and reduced-motion
+preferences stop these frame requests. The skeleton disappears as soon as the
+page overview is installed, including when the actual page is blank.
 `sceneData` represents the current viewing window when `isPageDemandLoaded` is
 true. Search requests remaining previews in the background. For complete geometry,
 use `await object.loadCompleteScene({ signal })`, or `pageLoading: "eager"` at load.
