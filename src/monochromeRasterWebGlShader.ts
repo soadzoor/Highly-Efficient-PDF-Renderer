@@ -4,6 +4,7 @@ export function monochromeRasterFragmentGlsl(source: string): string {
     .replace("uniform sampler2D uRasterTex;", `uniform sampler2D uRasterTex;
 uniform sampler2D uRasterMonoMips;
 uniform float uRasterMonochrome;
+uniform float uRasterOpaque;
 uniform vec2 uRasterMonoSize;
 uniform vec4 uRasterMonoColor0;
 uniform vec4 uRasterMonoColor1;
@@ -23,7 +24,11 @@ float heprRasterBinaryLinear(vec2 uv) {
 }
 
 vec4 heprRasterColor(vec2 uv, vec2 uvDx, vec2 uvDy) {
-  if (uRasterMonochrome < 0.5) return textureGrad(uRasterTex, uv, uvDx, uvDy);
+  if (uRasterMonochrome < 0.5) {
+    vec4 color = textureGrad(uRasterTex, uv, uvDx, uvDy);
+    if (uRasterOpaque > 0.5) color.a = 1.0;
+    return color;
+  }
   float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
   float lod = max(0.0, log2(max(footprint, 1.0)));
   float coverage;

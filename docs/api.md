@@ -1097,13 +1097,35 @@ one extra resident target for old and new textures. Native raster batches are
 also charged to this target. These are heuristics rather than hardware allocation
 guarantees; vectors, text, compositor surfaces and other applications use memory too.
 
-Scenes that fit retain their current raster resolution. Under memory pressure,
-ordinary RGBA images are area-filtered into smaller GPU textures; original scene
-pixels and export data are retained. Native packed binary images that fit device
-limits remain lossless and can exceed the heuristic target, with a warning.
-Console warnings identify automatic budget reductions separately from device
-texture-limit reductions. Zoom-dependent residency and block compression are
-separate optimizations; this budget does not yet select ASTC or BC encoders.
+Scenes that fit retain their current raster resolution and RGBA representation.
+Under memory pressure, native WebGL2 and WebGPU first try BC7 or ASTC 4x4 GPU
+compression for eligible opaque images, then area-filter ordinary rasters to
+smaller textures if aggregate demand still exceeds the target. Both formats
+store 16 bytes per 4x4 block, about one quarter of RGBA8 storage for large images.
+The device's extensions or negotiated features determine which format is usable;
+no GPU name or memory information needs to be provided by the user.
+
+Eligibility is conservative: packed binary images, transparency, small or thin
+images, and sampled sharp edges or text-like detail avoid block compression.
+Pixel assessment uses the image contents rather than assuming a PDF codec is
+photographic. This heuristic is not a guarantee that every detail is detected.
+Native packed binary images that fit device limits remain lossless and can
+exceed the heuristic target, with a warning. Original scene pixels and export
+data are retained regardless of display compression or resolution.
+
+The bundled MIT encoder kernels run on the renderer's existing GPU context or
+device, with no added runtime dependency. A bounded reusable encoding workspace
+is charged to the raster target; compressed blocks are uploaded without a
+JavaScript readback. All mip levels and block padding are included in the
+estimates, and texture coordinates retain the original image placement. Encoder
+failures are diagnosed and replan budgeted RGBA textures so the document can
+still open. Console warnings distinguish compression and automatic resolution
+reduction from device texture-limit reductions.
+
+Three.js continues to use the automatic RGBA resolution budget. Zoom-dependent
+resolution tiers, parse-time reduced codec decoding, and larger ASTC footprints
+(including 12x12) remain separate stages; this implementation selects only the
+audited BC7 and ASTC 4x4 encoders.
 
 Images wider or taller than the GPU's texture limit are drawn as several tiles
 when the automatic scene budget permits. Native WebGPU requests the adapter's full limit, often 16,384

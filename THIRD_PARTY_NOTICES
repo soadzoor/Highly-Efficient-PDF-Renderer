@@ -4,6 +4,39 @@ HEPR third-party notices
 This file covers third-party material shipped in the published package.
 Development-only dependencies are not part of the package.
 
+GPUtex BC7 and ASTC 4x4 encoders
+--------------------------------
+
+HEPR includes GPUtex's f32 WGSL and WebGL GLSL BC7 and ASTC 4x4 encoder
+kernels, adapted for bounded row-band workspaces and direct compressed
+texture uploads. The GPUtex runtime package is not included or required.
+Source: https://github.com/verekia/gputex
+Revision: 9ec9330dcf377c00e43f9fcc8ec9e6536911033c
+Shader paths: library/src/{bc7,astc4x4}.wgsl and
+library/src/webgl/glsl/{bc7,astc4x4}.frag.glsl and fullscreen.vert.glsl
+
+MIT License
+
+Copyright (c) 2026 GPUtex contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 PDF.js DeviceCMYK fallback
 --------------------------
 

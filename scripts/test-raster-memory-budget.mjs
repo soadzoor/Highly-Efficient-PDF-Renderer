@@ -128,6 +128,49 @@ try {
   assert(sameRasterTilePlan(planSceneRasterMemory([largeSource], 8192).plans[0], lowRam.plans[0]),
     "restoring residency reproduces the same plan when observed RAM and demand are unchanged");
 
+  // Hardware-supported compression preserves resolution before the same aggregate target forces reduction.
+  const eligiblePhoto = { ...largeSource, compressionEligible: true };
+  const compressed = planSceneRasterMemory([eligiblePhoto], 8192, undefined, "bc7");
+  assert.equal(compressed.resolutionScale, 1);
+  assert.deepEqual(compressed.compressionFormats, ["bc7"]);
+  assert(compressed.estimatedBytes <= compressed.availableBytes);
+  assert.equal(compressed.unscaledBytes, lowRam.unscaledBytes, "demand is compared with the ordinary RGBA cost first");
+  assert.equal(compressed.estimatedBytes, estimateRasterTextureBytes(4096, 4096, false, "bc7"));
+  const unsupported = planSceneRasterMemory([eligiblePhoto], 8192);
+  assert.deepEqual(unsupported.compressionFormats, [null]);
+  assert.equal(unsupported.plans[0].width, lowRam.plans[0].width, "missing capabilities retain the budgeted RGBA fallback");
+  const eligiblePackedSource = Object.defineProperties({}, Object.getOwnPropertyDescriptors(protectedSource));
+  eligiblePackedSource.compressionEligible = true;
+  const protectedCompression = planSceneRasterMemory([eligiblePackedSource,
+    eligiblePhoto, largeSource], 8192, undefined, "astc-4x4");
+  assert.deepEqual(protectedCompression.compressionFormats, [null, "astc-4x4", null]);
+  assert.equal(protectedCompression.plans[0].width, 4096);
+  assert(protectedCompression.estimatedBytes <= protectedCompression.availableBytes);
+  const compressedMany = planSceneRasterMemory(Array.from({ length: 4 }, () => eligiblePhoto), 8192, undefined, "bc7");
+  assert(compressedMany.resolutionScale < 1);
+  assert(compressedMany.plans[0].width > many.plans[0].width);
+  assert(compressedMany.estimatedBytes <= compressedMany.availableBytes);
+  assert.equal(compressedMany.estimatedBytes, compressedMany.plans.reduce((bytes, plan) =>
+    bytes + estimateRasterTilePlanBytes(plan, false, "bc7"), 0));
+  const compressedCopies = planSceneRasterMemory([{ ...eligiblePhoto, allocationCopies: 2 }], 8192, undefined, "bc7");
+  assert(compressedCopies.resolutionScale < 1, "retained compressed copies are still real allocations");
+  assert.equal(compressedCopies.estimatedBytes,
+    estimateRasterTilePlanBytes(compressedCopies.plans[0], false, "bc7") * 2);
+  const odd = planSceneRasterMemory([{ width: 13, height: 7, compressionEligible: true }], 8192, 208, "astc-4x4");
+  assert.equal(odd.resolutionScale, 1);
+  assert.equal(odd.estimatedBytes, 208, "pad base to16x8 then count every physical compressed mip");
+  const compressedMinimum = planSceneRasterMemory([eligiblePhoto], 8192, 0, "bc7");
+  assert.equal(compressedMinimum.overBudget, true);
+  assert.deepEqual(compressedMinimum.compressionFormats, [null], "block overhead loses to RGBA for a 1x1 fallback");
+  assert.equal(compressedMinimum.estimatedBytes, 4);
+  setNavigator({ deviceMemory: 8 });
+  const ample = planSceneRasterMemory([eligiblePhoto], 8192, undefined, "astc-4x4");
+  assert.equal(ample.resolutionScale, 1);
+  assert.deepEqual(ample.compressionFormats, [null], "ample RAM avoids an unnecessary lossy representation");
+  const forcedPackedReduction = planSceneRasterMemory([{ width: 100, height: 100, monochrome: {},
+    compressionEligible: true }], 64, 1, "bc7");
+  assert.deepEqual(forcedPackedReduction.compressionFormats, [null], "packed-source fidelity protection survives device downscaling");
+
   const warnings = [];
   console.warn = (...args) => warnings.push(args.join(" "));
   const owner = {};
@@ -141,6 +184,10 @@ try {
   reportRasterMemoryBudget(packedOverflow, owner);
   assert.equal(warnings.length, 2);
   assert.match(warnings[1], /Keeping lossless packed rasters/);
+  reportRasterMemoryBudget(compressed, owner);
+  assert.equal(warnings.length, 3);
+  assert.match(warnings[2], /bc7 GPU compression for 1 eligible raster/);
+  assert.doesNotMatch(warnings[2], /reduced resolution/, "compression at full dimensions reports the actual quality tradeoff");
   console.log("Automatic raster memory: safe RAM hints, bounded targets, exact mip/gutter costs, aggregate demand, lossless priority, allocation copies, staging reservations and diagnostics passed.");
 } finally {
   console.warn = originalWarn;
