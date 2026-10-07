@@ -26,6 +26,7 @@ try {
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
   const { vectorDrawRunRenderOrder } = await import("../src/threeVectorDrawRuns.ts");
   const { HeprThreePdfObject } = await import("../src/threePdfObject.ts");
+  const { expandMonochromeRaster } = await import("../src/monochromeRaster.ts");
 
   // Images within the limit, or on a host without one, stay one texture.
   for (const limit of [64, Infinity, NaN]) {
@@ -37,6 +38,20 @@ try {
     const source = image(5, 3, 1);
     assert.deepEqual(rasterTilePixels(source, planRasterTiles(5, 3, 64))[0], premultiply(source.data),
       "a whole image keeps the renderers' premultiplied rounding");
+  }
+  // Reduced binary tiles preserve area coverage and alpha without expanding the full source.
+  {
+    const width = 33, height = 17, stride = Math.ceil(width / 8);
+    const monochrome = { data: Uint8Array.from({ length: stride * height }, (_, index) => index * 37 & 255),
+      colors: Uint8Array.of(23, 145, 220, 37, 255, 41, 12, 192) };
+    const source = { width, height, monochrome, get data() { throw new Error("Full binary RGBA expansion"); } };
+    const plan = planRasterTiles(width, height, 16);
+    const expected = rasterTilePixels({ width, height, data: expandMonochromeRaster(monochrome, width, height) }, plan);
+    assert.deepEqual(rasterTilePixels(source, plan), expected);
+    warnings.length = 0;
+    reportRasterTileDownscale(0, source, planRasterTiles(8, 4, 64), 64);
+    assert.match(warnings[0], /automatic raster memory budget/);
+    assert.doesNotMatch(warnings[0], /texture limit/);
   }
 
   // The reported sticker barcode: a 9000x1 image on WebGPU's default limit.
@@ -265,7 +280,55 @@ try {
     layer.dispose();
     assert(released.has(replacement));
   }
-  console.log("Raster tiles: plans, exact seams through mip levels, budget resampling, WebGPU/WebGL/Three upload, draw, paint order, updates and cleanup passed.");
+  // The Three material path selects resolution automatically from RAM and aggregate scene demand.
+  {
+    const navigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const scene = sceneWith(image(1024, 1024, 10));
+    scene.rasterLayers = Array.from({ length: 4 }, () => scene.rasterLayers[0]);
+    const canonical = scene.rasterLayers[0].data;
+    const createLayer = memory => {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: { deviceMemory: memory } });
+      return new ThreeMaterialRasterLayer(scene, { pageBackground: [1, 1, 1, 1] });
+    };
+    let low, high;
+    try {
+      low = createLayer(0.5);
+      assert(low.rasterEntries.every(entry => entry.texture.image.width < 1024));
+      high = createLayer(8);
+      assert(high.rasterEntries.every(entry => entry.texture.image.width === 1024));
+      assert.equal(scene.rasterLayers[0].data, canonical, "memory quality never replaces canonical pixels");
+      const updateA = low.prepareRasterLayerUpdates(new Map([[0, { ...scene.rasterLayers[0], data: canonical.slice() }]]));
+      const firstReservation = low.pendingRasterBytes;
+      const updateB = low.prepareRasterLayerUpdates(new Map([[1, { ...scene.rasterLayers[0], data: canonical.slice() }]]));
+      assert(low.pendingRasterBytes > firstReservation, "pending replacements reserve their projected allocations");
+      updateA.dispose();
+      assert(low.pendingRasterBytes > 0 && low.pendingRasterBytes < firstReservation * 2);
+      updateB.commit(); updateB.dispose();
+      assert.equal(low.pendingRasterBytes, 0, "commit and cancellation release their reservations");
+      low.setMaxTextureSize(2048);
+      assert(low.rasterEntries.every(entry => entry.texture.image.width === 1024),
+        "a host capability replan uses the current automatic device budget");
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: { deviceMemory: 0.5 } });
+      const binary = { ...scene.rasterLayers[0], width: 2048, height: 2048,
+        monochrome: { data: new Uint8Array(256 * 2048), colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) },
+        get data() { throw new Error("Three expanded full-resolution binary source"); } };
+      const reduced = new ThreeMaterialRasterLayer(sceneWith(binary), { pageBackground: [1, 1, 1, 1] });
+      try {
+        assert(reduced.rasterEntries[0].texture.image.width < 2048,
+          "Three charges RGBA allocation while preparing reduced pixels directly from packed bits");
+        const replacement = Object.defineProperties({}, Object.getOwnPropertyDescriptors(binary));
+        const staged = reduced.prepareRasterLayerUpdates(new Map([[0, replacement]]));
+        staged.commit(); staged.dispose();
+        assert(reduced.rasterEntries[0].texture.image.width < 2048,
+          "binary replacements also prepare bounded pixels without invoking the full source getter");
+      } finally { reduced.dispose(); }
+    } finally {
+      low?.dispose(); high?.dispose();
+      if (navigator) Object.defineProperty(globalThis, "navigator", navigator);
+      else delete globalThis.navigator;
+    }
+  }
+  console.log("Raster tiles: plans, exact seams through mip levels, automatic memory budgeting, packed resampling, WebGPU/WebGL/Three upload, draw, paint order, updates and cleanup passed.");
 } finally {
   console.warn = warn;
   for (const [key, value] of Object.entries(globals)) {

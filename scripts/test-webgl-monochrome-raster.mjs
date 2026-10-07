@@ -56,12 +56,15 @@ try {
 
   const oversized = createMonochromeRasterLayer({ width: 48, height: 48, matrix: layer.matrix, paintOrder: 0, pageIndex: 0 },
     { data: Uint8Array.from({ length: 6 * 48 }, () => 0x55), colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) });
+  let downscaleExpanded = 0;
+  Object.defineProperty(oversized, "data", { get() { downscaleExpanded++; throw new Error("Full-size RGBA expansion is unnecessary"); } });
   const previousWarn = console.warn, warnings = [];
   let downscaled;
   console.warn = (...args) => warnings.push(args);
   try { downscaled = tiled.renderer.createRasterLayerGpu(oversized, 0); }
   finally { console.warn = previousWarn; }
   assert.equal(downscaled.monochrome, undefined, "resource-limit downscaling retains the area-averaged RGBA fallback");
+  assert.equal(downscaleExpanded, 0, "device-limit downscaling samples packed pixels directly");
   assert.equal(warnings.length, 1, "reduced image resolution remains diagnostic");
   assert.deepEqual(tiled.mock.calls.filter(call => call[0] === "texImage2D").at(-1).slice(3, 6), ["RGBA", 32, 32]);
   tiled.renderer.deleteRasterLayerTextures(downscaled);

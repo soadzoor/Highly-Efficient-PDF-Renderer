@@ -1087,8 +1087,26 @@ needed for features such as room detection. Their extracted text index is retain
 separately for search and selection; no text is painted twice. HEP stores the image,
 text, and retained replay resources, with no source PDF needed when reopening it.
 
+Raster texture resolution is selected automatically from aggregate scene demand
+and `navigator.deviceMemory`, when available. This browser hint estimates rounded
+system RAM, not total or available VRAM. The resident raster target is 1/32 of
+reported RAM, bounded to 16–256 MiB; unavailable or invalid hints use a conservative
+64 MiB target. No memory information needs to be provided by the user. Estimates
+include mipmaps and overlapping tile gutters, and replacement preparation allows
+one extra resident target for old and new textures. Native raster batches are
+also charged to this target. These are heuristics rather than hardware allocation
+guarantees; vectors, text, compositor surfaces and other applications use memory too.
+
+Scenes that fit retain their current raster resolution. Under memory pressure,
+ordinary RGBA images are area-filtered into smaller GPU textures; original scene
+pixels and export data are retained. Native packed binary images that fit device
+limits remain lossless and can exceed the heuristic target, with a warning.
+Console warnings identify automatic budget reductions separately from device
+texture-limit reductions. Zoom-dependent residency and block compression are
+separate optimizations; this budget does not yet select ASTC or BC encoders.
+
 Images wider or taller than the GPU's texture limit are drawn as several tiles
-at full resolution. Native WebGPU requests the adapter's full limit, often 16,384
+when the automatic scene budget permits. Native WebGPU requests the adapter's full limit, often 16,384
 texels instead of WebGPU's default 8,192. In three.js the host renderer's limit
 applies; `WebGPURenderer` uses 8,192 unless it is created with
 `requiredLimits: { maxTextureDimension2D }`. An image with more pixels than the
