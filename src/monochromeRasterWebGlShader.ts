@@ -1,4 +1,6 @@
-/** Packed binary base texels, with ordinary coverage mips for readable minification. */
+import { PACKED_COVERAGE_GLSL } from "./packedMonochromeCoverageShaders";
+
+/** Packed binary base texels, with four-bit coverage mips for readable minification. */
 export function monochromeRasterFragmentGlsl(source: string): string {
   return source.replace("precision highp float;", "precision highp float;\nprecision highp int;")
     .replace("uniform sampler2D uRasterTex;", `uniform sampler2D uRasterTex;
@@ -8,6 +10,7 @@ uniform float uRasterOpaque;
 uniform vec2 uRasterMonoSize;
 uniform vec4 uRasterMonoColor0;
 uniform vec4 uRasterMonoColor1;
+${PACKED_COVERAGE_GLSL}
 
 float heprRasterBit(ivec2 pixel) {
   pixel = clamp(pixel, ivec2(0), ivec2(uRasterMonoSize) - 1);
@@ -29,17 +32,14 @@ vec4 heprRasterColor(vec2 uv, vec2 uvDx, vec2 uvDy) {
     if (uRasterOpaque > 0.5) color.a = 1.0;
     return color;
   }
-  if (uRasterMonochrome > 1.5) {
-    return mix(uRasterMonoColor0, uRasterMonoColor1, textureGrad(uRasterTex, uv, uvDx, uvDy).r);
-  }
   float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
   float lod = max(0.0, log2(max(footprint, 1.0)));
   float coverage;
   if (lod < 1.0) {
-    float base = heprRasterBinaryLinear(uv);
-    coverage = mix(base, textureLod(uRasterMonoMips, uv, 0.0).r, lod);
+    float base = uRasterMonochrome > 1.5 ? textureLod(uRasterTex, uv, 0.0).r : heprRasterBinaryLinear(uv);
+    coverage = mix(base, heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, 0.0), lod);
   } else {
-    coverage = textureLod(uRasterMonoMips, uv, lod - 1.0).r;
+    coverage = heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, lod - 1.0);
   }
   return mix(uRasterMonoColor0, uRasterMonoColor1, coverage);
 }`)

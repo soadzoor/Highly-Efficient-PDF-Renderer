@@ -1078,12 +1078,19 @@ The published package and bundler entry include those assets automatically.
 Binary DeviceGray images of at least 256 pixels, including JBIG2 and fax images,
 keep packed one-bit pixels through native compilation and worker transfer.
 At original resolution, native WebGL and WebGPU use eight pixels per R8 base
-texel with separate R8 coverage mipmaps for filtered minification. Typical square
-images use about 0.46 bytes per source pixel including mipmaps, versus 5.33 for
-RGBA8. Reduced display tiers generate R8 coverage directly from packed pixels,
-without RGBA expansion or higher-resolution mip intermediates. Exact two-color
+texel with separate four-bit grayscale coverage mipmaps for filtered minification.
+Two coverage values share each R8 atlas texel; shared shaders unpack them and
+apply bilinear/trilinear filtering without blending packed bytes. Typical square
+images use about 0.29 bytes per source pixel including mipmaps, versus 5.33 for
+RGBA8. Full-resolution binary pixels remain exact. Mip coverage uses 16 shades,
+with at most 8/255 error relative to the previous R8 mip values; later levels
+average unquantized values so this error does not accumulate through the chain.
+Reduced display tiers generate an R8 base directly from packed pixels and use
+four-bit mips below it, without RGBA expansion or higher-resolution mip intermediates. Exact two-color
 images loaded from existing HEPs can use the same GPU path. Both Three material
-backends use the same packed/R8 representations. Canvas 2D and exports retain RGBA compatibility.
+backends use the same representations. Preparation workers transfer the packed
+atlases, and automatic memory planning includes their row/atlas padding.
+Canvas 2D and exports retain RGBA compatibility.
 
 The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
 embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX

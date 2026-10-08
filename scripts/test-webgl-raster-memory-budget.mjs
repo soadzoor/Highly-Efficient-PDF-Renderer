@@ -120,7 +120,7 @@ try {
     const previewTexture = displayed.texture;
     assert.equal(displayed.rasterPlan.width, 128, "initial allocation generates only a preview tier");
     assert.equal(displayed.monochrome.coverage, true);
-    assert.equal(displayed.estimatedBytes, current.mock.textureBytes(), "R8-only previews have an exact ledger");
+    assert.equal(displayed.estimatedBytes, current.mock.textureBytes(), "R8 bases and packed preview mips have an exact ledger");
     const beforeStale = current.mock.uploads.length;
     current.renderer.zoom = 1; current.renderer.updateRasterResolution();
     current.renderer.zoom = .1; current.renderer.updateRasterResolution();

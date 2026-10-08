@@ -1,5 +1,6 @@
 import { isRasterTilePlanDownscaled, planRasterTiles, type RasterTilePlan } from "./rasterTiles";
 import { estimateCompressedRasterBytes, type RasterCompressionFormat } from "./rasterCompression";
+import { packedMonochromeCoverageLayout } from "./packedMonochromeCoverage";
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -73,12 +74,14 @@ export function estimateRasterTextureBytes(
 ): number {
   validateDimensions(width, height);
   if (!packedMonochrome && compressionFormat) return estimateCompressedRasterBytes(width, height, compressionFormat);
+  if (packedMonochrome || singleChannel) {
+    const atlas = packedMonochromeCoverageLayout(width, height);
+    return (packedMonochrome ? Math.ceil(width / 8) * height : width * height) + atlas.width * atlas.height;
+  }
   let levelWidth = width;
   let levelHeight = height;
-  const channels = packedMonochrome || singleChannel ? 1 : 4;
-  let bytes = packedMonochrome ? Math.ceil(levelWidth / 8) * levelHeight : levelWidth * levelHeight * channels;
-  // The packed shader still binds a complete coverage sampler for an image with no reduced mip level.
-  if (packedMonochrome && width === 1 && height === 1) return bytes + 1;
+  const channels = 4;
+  let bytes = levelWidth * levelHeight * channels;
   while (levelWidth > 1 || levelHeight > 1) {
     levelWidth = Math.max(1, Math.floor(levelWidth / 2));
     levelHeight = Math.max(1, Math.floor(levelHeight / 2));

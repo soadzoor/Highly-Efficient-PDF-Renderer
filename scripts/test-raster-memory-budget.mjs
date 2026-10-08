@@ -42,7 +42,7 @@ try {
   assert.equal(estimateRasterTextureBytes(3, 5, false), 72);
   assert.equal(estimateRasterTextureBytes(3, 5, true), 8);
   assert.equal(estimateRasterTextureBytes(257, 1, false), 2048);
-  assert.equal(estimateRasterTextureBytes(257, 1, true), 288);
+  assert.equal(estimateRasterTextureBytes(257, 1, true), 161, "packed coverage atlas padding is included for wide strips");
   assert.equal(estimateRasterTextureBytes(1, 257, true), 512);
   for (const [width, height] of [[Infinity, 1], [1, NaN], [-1, 2], [0, 1], [2.5, 1], [Number.MAX_SAFE_INTEGER, 2]]) {
     assert.throws(() => estimateRasterTextureBytes(width, height, false), RangeError);

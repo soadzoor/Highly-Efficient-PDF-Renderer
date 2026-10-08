@@ -14,7 +14,7 @@ globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
 try {
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { buildMonochromeMipChain, expandMonochromeRaster, monochromeRasterTile } = await import("../src/monochromeRaster.ts");
+  const { buildPackedMonochromeMipAtlas, expandMonochromeRaster, monochromeRasterTile } = await import("../src/monochromeRaster.ts");
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
   const create = (limit = 2048) => {
     const device = makeDevice(limit);
@@ -38,16 +38,14 @@ try {
     const packedUploads = device.uploads.filter(upload => upload.destination.texture === resource.texture);
     assert.equal(packedUploads.length, 1);
     assert.deepEqual(unpad(packedUploads[0], 1), layer.monochrome.data);
-    const expectedMips = buildMonochromeMipChain(layer.monochrome, layer.width, layer.height);
+    const expectedMips = buildPackedMonochromeMipAtlas(layer.monochrome, layer.width, layer.height);
     assert.equal(resource.coverageTexture.descriptor.format, "r8unorm");
-    assert.deepEqual(resource.coverageTexture.descriptor.size, { width: 8, height: 8, depthOrArrayLayers: 1 });
-    assert.equal(resource.coverageTexture.descriptor.mipLevelCount, expectedMips.length);
+    assert.deepEqual(resource.coverageTexture.descriptor.size, { width: expectedMips.width, height: expectedMips.height, depthOrArrayLayers: 1 });
+    assert.equal(resource.coverageTexture.descriptor.mipLevelCount, 1, "the atlas has no hardware mip chain");
     const mipUploads = device.uploads.filter(upload => upload.destination.texture === resource.coverageTexture);
-    assert.equal(mipUploads.length, expectedMips.length);
-    mipUploads.forEach((upload, index) => {
-      assert.equal(upload.destination.mipLevel, index);
-      assert.deepEqual(unpad(upload, 1), expectedMips[index].data);
-    });
+    assert.equal(mipUploads.length, 1);
+    assert.equal(mipUploads[0].destination.mipLevel, 0);
+    assert.deepEqual(unpad(mipUploads[0], 1), expectedMips.data);
     const uniforms = device.writes.find(write => write.buffer === resource.uniformBuffer).values;
     assert.equal(uniforms.byteLength, 96);
     assert.equal(uniforms[7], layer.width);
@@ -63,7 +61,7 @@ try {
     assert(fragment.indexOf("let uvDx = dpdx(inData.uv)") < fragment.indexOf("if (uRaster.matrixB.w"),
       "derivatives are evaluated before the image-mode branch in the fragment entry point");
     assert.match(shader, /textureLoad\(uRasterTex, vec2i\(p\.x \/ 8, p\.y\), 0\)/);
-    assert.match(shader, /textureSampleLevel\(uRasterCoverageTex, uRasterSampler, uv, lod - 1\.0\)/);
+    assert.match(shader, /heprPackedCoverage\(uRasterCoverageTex, size, uv, lod - 1\.0\)/);
     assert.match(shader, /imageColor \* uRaster\.matrixB\.z/);
     assert.match(shader, /color \* heprVectorClipAA/);
     renderer.setRasterTextureResidency(false);
@@ -113,7 +111,7 @@ try {
     renderer.configureRasterLayers(sceneWith(packedLayer(1, 1)));
     const resource = renderer.rasterLayerResources[0];
     const upload = device.uploads.find(value => value.destination.texture === resource.coverageTexture);
-    assert.deepEqual([...unpad(upload, 1)], [255], "a one-pixel image has a valid constant coverage texture");
+    assert.deepEqual([...unpad(upload, 1)], [240], "a one-pixel image has a valid constant packed coverage texture");
     renderer.dispose();
   }
 

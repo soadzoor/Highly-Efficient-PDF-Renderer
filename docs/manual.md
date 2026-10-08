@@ -158,8 +158,17 @@ All GPU integrations allocate small raster display tiers first and increase
 their resolution automatically with zoom. CPU canonical image data stays available
 for refinement; reducing GPU textures alone does not reduce eager parsing memory.
 
-Both Three material backends retain packed one-bit images at full resolution and
-R8 coverage at smaller tiers. Eligible color images can use BC7/ASTC 4x4 through
+Native WebGL/WebGPU and both Three material backends retain packed one-bit images
+at full resolution and an R8 coverage base at smaller tiers. Their monochrome
+mipmaps store four-bit grayscale coverage in a compact atlas, with explicit
+bilinear/trilinear shader filtering. This halves the mip payload for large pages
+and lowers full-resolution texture memory from about 0.46 to 0.29 bytes per pixel
+(roughly 2.70 GB to 1.72 GB for 5.9 gigapixels, before allocation overhead).
+Inspect scanned text while zooming through intermediate sizes on each backend;
+four-bit mips can slightly change stroke darkness, while close-up binary pixels,
+canonical PDF data and exports remain exact. Check repeated OCR/scan swaps for
+stall regressions and consistent zoom-out demotion. No compression extension or
+additional runtime dependency is needed. Eligible color images can use BC7/ASTC 4x4 through
 the host's `ExternalTexture` support, with one shared encoder workspace.
 Independent page views share the document's automatic raster memory target.
 

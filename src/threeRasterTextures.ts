@@ -1,11 +1,12 @@
 import * as THREE from "three";
-import { buildMonochromeMipChain, monochromeCoverageTilePixels, monochromeRasterTile,
+import { buildPackedMonochromeMipAtlas, monochromeCoverageTilePixels, monochromeRasterTile,
   type MonochromeRaster } from "./monochromeRaster";
 import { rasterTilePixels, type RasterTilePlan } from "./rasterTiles";
 import { estimateRasterTextureBytes } from "./rasterMemoryBudget";
 import type { RasterCompressionFormat } from "./rasterCompression";
 import type { PreparedRasterPixels } from "./rasterPreparation";
 import { sameRasterTilePlan } from "./rasterTiles";
+import { buildPackedCoverageMipAtlas } from "./packedMonochromeCoverage";
 
 export interface ThreeRasterTextureInfo {
   mode: number;
@@ -60,17 +61,22 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
         texture = dataTexture(bits.data, Math.ceil(tile.width / 8), tile.height, true);
         texture.minFilter = texture.magFilter = THREE.NearestFilter;
         texture.generateMipmaps = false;
-        const chain = prepared?.mipChains?.[index] ?? buildMonochromeMipChain(bits, tile.width, tile.height);
-        const first = chain[0] ?? { width: 1, height: 1, data: Uint8Array.of((bits.data[0] >> 7) * 255) };
-        const coverage = dataTexture(first.data, first.width, first.height, true);
+        const atlas = prepared?.coverageAtlases?.[index] ?? buildPackedMonochromeMipAtlas(bits, tile.width, tile.height);
+        const coverage = dataTexture(atlas.data, atlas.width, atlas.height, true);
         coverage.generateMipmaps = false;
-        // Three's DataTexture mip array includes its base level on both backends.
-        coverage.mipmaps = chain.length ? chain : [first];
+        coverage.minFilter = THREE.LinearFilter;
         texture.addEventListener("dispose", () => coverage.dispose());
         information.set(texture, monoInfo(bits, coverage, tile.width, tile.height, 1));
       } else if (mono) {
         texture = dataTexture(pixels[index], tile.width, tile.height, true);
-        information.set(texture, monoInfo(mono, texture, tile.width, tile.height, 2));
+        texture.generateMipmaps = false;
+        texture.minFilter = THREE.LinearFilter;
+        const atlas = prepared?.coverageAtlases?.[index] ?? buildPackedCoverageMipAtlas(pixels[index], tile.width, tile.height);
+        const coverage = dataTexture(atlas.data, atlas.width, atlas.height, true);
+        coverage.generateMipmaps = false;
+        coverage.minFilter = THREE.LinearFilter;
+        texture.addEventListener("dispose", () => coverage.dispose());
+        information.set(texture, monoInfo(mono, coverage, tile.width, tile.height, 2));
       } else if (format && compressor) {
         texture = compressor.upload(pixels[index], tile.width, tile.height, format);
       } else {

@@ -1,5 +1,8 @@
-/** Packed MSB-first image sampling with filtered coverage for minification. */
+import { PACKED_COVERAGE_WGSL } from "./packedMonochromeCoverageShaders";
+
+/** Packed MSB-first image sampling with filtered four-bit coverage for minification. */
 export const MONOCHROME_RASTER_WGSL = /* wgsl */ `
+${PACKED_COVERAGE_WGSL}
 fn heprMonochromeBit(pixel : vec2i, size : vec2i) -> f32 {
   let p = clamp(pixel, vec2i(0), size - vec2i(1));
   // r8unorm preserves every byte; filtering is only used on the coverage texture.
@@ -19,20 +22,19 @@ fn heprMonochromeBilinear(uv : vec2f, size : vec2i) -> f32 {
 }
 
 fn heprMonochromeColor(uv : vec2f, uvDx : vec2f, uvDy : vec2f) -> vec4f {
-  if (uRaster.matrixB.w < 0.0) {
-    let coverage = textureSampleGrad(uRasterTex, uRasterSampler, uv, uvDx, uvDy).r;
-    return mix(uRaster.zeroColor, uRaster.oneColor, coverage);
-  }
-  let size = vec2i(i32(uRaster.matrixB.w), i32(textureDimensions(uRasterTex).y));
+  let size = vec2i(i32(abs(uRaster.matrixB.w)), i32(textureDimensions(uRasterTex).y));
   let footprint = max(length(uvDx * vec2f(size)), length(uvDy * vec2f(size)));
   let lod = max(log2(max(footprint, 1.0)), 0.0);
   var coverage : f32;
   if (lod < 1.0) {
-    let base = heprMonochromeBilinear(uv, size);
-    let reduced = textureSampleLevel(uRasterCoverageTex, uRasterSampler, uv, 0.0).r;
+    var base : f32;
+    if (uRaster.matrixB.w < 0.0) {
+      base = textureSampleLevel(uRasterTex, uRasterSampler, uv, 0.0).r;
+    } else { base = heprMonochromeBilinear(uv, size); }
+    let reduced = heprPackedCoverage(uRasterCoverageTex, size, uv, 0.0);
     coverage = mix(base, reduced, lod);
   } else {
-    coverage = textureSampleLevel(uRasterCoverageTex, uRasterSampler, uv, lod - 1.0).r;
+    coverage = heprPackedCoverage(uRasterCoverageTex, size, uv, lod - 1.0);
   }
   return mix(uRaster.zeroColor, uRaster.oneColor, coverage);
 }

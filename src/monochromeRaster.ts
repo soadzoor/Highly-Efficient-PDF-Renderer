@@ -3,6 +3,7 @@ import type { RasterTile, RasterTilePlan } from "./rasterTiles";
 import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
 import { throwIfAborted } from "./pdf/nativeTypes";
 import { finishRasterSteps, finishRasterStepsAsync } from "./rasterPreparationYield";
+import { packMonochromeCoverageSteps, type PackedMonochromeCoverageAtlas } from "./packedMonochromeCoverage";
 
 /** Packed, MSB-first rows and straight-alpha RGBA colors for the zero and one bits. */
 export interface MonochromeRaster {
@@ -259,9 +260,47 @@ export function buildMonochromeMipChainAsync(monochrome: MonochromeRaster, width
 
 function* monochromeMipSteps(monochrome: MonochromeRaster, width: number, height: number,
   signal?: AbortSignal): Generator<void, SingleChannelUint8MipLevel[]> {
+  const chain: SingleChannelUint8MipLevel[] = [];
+  for (const level of monochromeMipLevelSteps(monochrome, width, height, signal)) {
+    if (level) chain.push(level);
+    else yield;
+  }
+  return chain;
+}
+
+/** Quantize only the stored derivative; later levels average the unquantized coverage. */
+export function buildPackedMonochromeMipAtlas(monochrome: MonochromeRaster, width: number,
+  height: number, signal?: AbortSignal): PackedMonochromeCoverageAtlas {
+  return finishRasterSteps(packedMonochromeMipSteps(monochrome, width, height, signal));
+}
+
+export function buildPackedMonochromeMipAtlasAsync(monochrome: MonochromeRaster, width: number,
+  height: number, signal?: AbortSignal): Promise<PackedMonochromeCoverageAtlas> {
+  return finishRasterStepsAsync(packedMonochromeMipSteps(monochrome, width, height, signal));
+}
+
+function* packedMonochromeMipSteps(monochrome: MonochromeRaster, width: number, height: number,
+  signal?: AbortSignal): Generator<void, PackedMonochromeCoverageAtlas> {
+  throwIfAborted(signal);
+  validateMonochromeRaster(monochrome, width, height);
+  const levels = width === 1 && height === 1
+    ? [{ width: 1, height: 1, data: Uint8Array.of((monochrome.data[0] & 128) ? 255 : 0) }]
+    : monochromeMipLevelSteps(monochrome, width, height, signal);
+  const steps = packMonochromeCoverageSteps(levels, width, height);
+  let step = steps.next();
+  while (!step.done) {
+    throwIfAborted(signal);
+    yield;
+    step = steps.next();
+  }
+  throwIfAborted(signal);
+  return step.value;
+}
+
+function* monochromeMipLevelSteps(monochrome: MonochromeRaster, width: number, height: number,
+  signal?: AbortSignal): Generator<void | SingleChannelUint8MipLevel> {
   throwIfAborted(signal);
   const stride = validateMonochromeRaster(monochrome, width, height);
-  const chain: SingleChannelUint8MipLevel[] = [];
   let levelWidth = width, levelHeight = height;
   let sample = (x: number, y: number): number =>
     ((monochrome.data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1) * 255;
@@ -292,13 +331,12 @@ function* monochromeMipSteps(monochrome: MonochromeRaster, width: number, height
       }
       yield;
     }
-    chain.push({ width: nextWidth, height: nextHeight, data });
+    yield { width: nextWidth, height: nextHeight, data };
     sample = (x, y) => data[y * nextWidth + x];
     levelWidth = nextWidth;
     levelHeight = nextHeight;
   }
   throwIfAborted(signal);
-  return chain;
 }
 
 function packedRgba(data: Uint8Array, offset: number): number {

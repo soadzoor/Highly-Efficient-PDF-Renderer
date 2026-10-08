@@ -152,7 +152,8 @@ try {
     const previewTexture = displayed.texture;
     assert.equal(displayed.rasterPlan.width, 128);
     assert.equal(displayed.texture.descriptor.format, "r8unorm");
-    assert.equal(displayed.coverageTexture, undefined, "a reduced scan needs one R8 coverage chain only");
+    assert.equal(displayed.coverageTexture.descriptor.format, "r8unorm", "a reduced scan binds four-bit mips beside its R8 base");
+    assert.equal(displayed.coverageTexture.descriptor.mipLevelCount, 1, "the coverage atlas has no hardware mips");
     assert(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] < 0, "shader receives the coverage-only mode");
     assert.equal(displayed.estimatedBytes, layerBytes(displayed));
     const beforeStale = device.textures.length;

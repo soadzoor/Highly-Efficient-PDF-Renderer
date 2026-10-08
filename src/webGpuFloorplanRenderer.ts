@@ -18,7 +18,8 @@ import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterReso
 import type { SceneUpdateOptions } from "./rendererTypes";
 import { assessRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
 import { WebGpuRasterCompression } from "./webGpuRasterCompression";
-import { buildMonochromeMipChain, detectMonochromeRaster, monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
+import { buildPackedMonochromeMipAtlas, detectMonochromeRaster, monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
+import { buildPackedCoverageMipAtlas, type PackedMonochromeCoverageAtlas } from "./packedMonochromeCoverage";
 import { MONOCHROME_RASTER_WGSL } from "./monochromeRasterWebGpuShaders";
 import { PAGE_PLACEHOLDER_WGSL, pagePlaceholderTime, pagePlaceholderAnimationEnabled,
   hasVisiblePagePlaceholders } from "./pageLoadingPlaceholder";
@@ -5134,10 +5135,10 @@ export class WebGpuFloorplanRenderer {
           reportRasterMemoryBudget(fallback, this);
           return this.createRasterLayerResource(source, index, fallback.plans[0], null);
         }
-        const textures = packed
-          ? this.createMonochromeTextures(tile.width, tile.height, tileMonochrome!, prepared?.mipChains?.[tileIndex])
-          : { texture: coverage ? this.createR8Texture(tile.width, tile.height, pixels![tileIndex], prepared?.mipChains?.[tileIndex])
-            : compressed?.texture ?? this.createRgba8Texture(tile.width, tile.height, pixels![tileIndex]) };
+        const textures = packed || coverage
+          ? this.createMonochromeTextures(tile.width, tile.height, tileMonochrome!, prepared?.coverageAtlases?.[tileIndex],
+            coverage ? pixels![tileIndex] : undefined)
+          : { texture: compressed?.texture ?? this.createRgba8Texture(tile.width, tile.height, pixels![tileIndex]) };
         const uploadedTile: RasterTile = compressed ? { ...tile, uv: [
           tile.uv[0] * compressed.uvScale[0], tile.uv[1] * compressed.uvScale[1],
           tile.uv[2] * compressed.uvScale[0], tile.uv[3] * compressed.uvScale[1]
@@ -5337,15 +5338,15 @@ export class WebGpuFloorplanRenderer {
     return texture;
   }
 
-  /** The base stores eight pixels per texel; separate R8 mips hold averaged bits. */
-  private createMonochromeTextures(width: number, height: number, source: MonochromeRaster, preparedMips?: SingleChannelUint8MipLevel[]): {
+  /** Exact packed bits or an R8 display base, with separate four-bit coverage mips. */
+  private createMonochromeTextures(width: number, height: number, source: MonochromeRaster,
+    preparedAtlas?: PackedMonochromeCoverageAtlas, coveragePixels?: Uint8Array): {
     texture: any; coverageTexture: any;
   } {
     const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
-    const packedWidth = Math.ceil(width / 8);
-    const mipChain = preparedMips ?? buildMonochromeMipChain(source, width, height);
-    if (mipChain.length === 0) mipChain.push({ width: 1, height: 1,
-      data: Uint8Array.of((source.data[0] & 128) ? 255 : 0) });
+    const packedWidth = coveragePixels ? width : Math.ceil(width / 8);
+    const atlas = preparedAtlas ?? (coveragePixels ? buildPackedCoverageMipAtlas(coveragePixels, width, height)
+      : buildPackedMonochromeMipAtlas(source, width, height));
     const texture = this.gpuDevice.createTexture({
       size: { width: packedWidth, height, depthOrArrayLayers: 1 },
       format: "r8unorm",
@@ -5353,16 +5354,14 @@ export class WebGpuFloorplanRenderer {
     });
     let coverageTexture: any = null;
     try {
-      this.writeR8Texture(texture, packedWidth, height, source.data);
+      this.writeR8Texture(texture, packedWidth, height, coveragePixels ?? source.data);
       coverageTexture = this.gpuDevice.createTexture({
-        size: { width: mipChain[0].width, height: mipChain[0].height, depthOrArrayLayers: 1 },
+        size: { width: atlas.width, height: atlas.height, depthOrArrayLayers: 1 },
         format: "r8unorm",
-        mipLevelCount: mipChain.length,
+        mipLevelCount: 1,
         usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
       });
-      for (const [mipLevel, level] of mipChain.entries()) {
-        this.writeR8Texture(coverageTexture, level.width, level.height, level.data, mipLevel);
-      }
+      this.writeR8Texture(coverageTexture, atlas.width, atlas.height, atlas.data);
       return { texture, coverageTexture };
     } catch (error) {
       texture.destroy();

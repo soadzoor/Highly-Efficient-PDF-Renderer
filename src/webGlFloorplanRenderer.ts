@@ -18,12 +18,12 @@ import { buildRasterStripBatches } from "./rasterStripBatches";
 import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, type RasterTilePlan } from "./rasterTiles";
 import { prepareRasterPixels, finishRasterUpdateSteps, finishRasterUpdateStepsAsync, type RasterPreparationJob, type PreparedRasterPixels } from "./rasterPreparation";
 import { RasterResourceCache } from "./rasterResourceCache";
-import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
+import { buildPackedCoverageMipAtlas, type PackedMonochromeCoverageAtlas } from "./packedMonochromeCoverage";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
   estimateRasterSourcePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
 import type { SceneUpdateOptions } from "./rendererTypes";
-import { buildMonochromeMipChain, detectMonochromeRaster,
+import { buildPackedMonochromeMipAtlas, detectMonochromeRaster,
   monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
 import { pagePlaceholderVertexGlsl, pagePlaceholderFragmentGlsl, pagePlaceholderTime,
@@ -4996,14 +4996,14 @@ export class WebGlFloorplanRenderer {
     try {
       for (const [tileIndex, tile] of plan.tiles.entries()) {
         if (coverage) {
-          const resource = this.createMonochromeCoverageTile(monochrome!, pixels[tileIndex], tile.width, tile.height, prepared?.mipChains?.[tileIndex]);
+          const resource = this.createMonochromeRasterTile(monochrome!, tile.width, tile.height, prepared?.coverageAtlases?.[tileIndex], pixels[tileIndex]);
           tiles.push(plan.tiles.length > 1
             ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) } : resource);
           continue;
         }
         if (packed) {
           const resource = this.createMonochromeRasterTile(
-            prepared?.monochromeTiles?.[tileIndex] ?? monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height, prepared?.mipChains?.[tileIndex]);
+            prepared?.monochromeTiles?.[tileIndex] ?? monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height, prepared?.coverageAtlases?.[tileIndex]);
           tiles.push(plan.tiles.length > 1
             ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) }
             : resource);
@@ -5066,61 +5066,35 @@ export class WebGlFloorplanRenderer {
     if (tile.monochrome && tile.monochrome.mipTexture !== tile.texture) this.gl.deleteTexture(tile.monochrome.mipTexture);
   }
 
-  private createMonochromeCoverageTile(source: MonochromeRaster, pixels: Uint8Array, width: number, height: number, preparedMips?: SingleChannelUint8MipLevel[]): RasterTileGpu {
-    const gl = this.gl, texture = this.mustCreateTexture();
-    try {
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      const levels = preparedMips ?? buildSingleChannelUint8MipChain(pixels, width, height);
-      for (const [level, data] of levels.entries()) gl.texImage2D(gl.TEXTURE_2D, level, gl.R8,
-        data.width, data.height, 0, gl.RED, gl.UNSIGNED_BYTE, data.data);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, levels.length - 1);
-      const colors = new Float32Array(8);
-      for (let offset = 0; offset < 8; offset += 4) {
-        const alpha = source.colors[offset + 3] / 255;
-        for (let channel = 0; channel < 3; channel++) colors[offset + channel] = Math.round(source.colors[offset + channel] * alpha) / 255;
-        colors[offset + 3] = alpha;
-      }
-      return { texture, monochrome: { mipTexture: texture, width, height, colors, coverage: true } };
-    } catch (error) { gl.deleteTexture(texture); throw error; }
-    finally { gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4); }
-  }
-
-  private createMonochromeRasterTile(source: MonochromeRaster, width: number, height: number, preparedMips?: SingleChannelUint8MipLevel[]): RasterTileGpu {
+  private createMonochromeRasterTile(source: MonochromeRaster, width: number, height: number,
+    preparedAtlas?: PackedMonochromeCoverageAtlas, coveragePixels?: Uint8Array): RasterTileGpu {
     const gl = this.gl, texture = this.mustCreateTexture();
     let mipTexture: WebGLTexture | null = null;
     try {
       mipTexture = this.mustCreateTexture();
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, coveragePixels ? gl.LINEAR : gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, coveragePixels ? gl.LINEAR : gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, coveragePixels ? width : Math.ceil(width / 8), height,
+        0, gl.RED, gl.UNSIGNED_BYTE, coveragePixels ?? source.data);
+      const atlas = preparedAtlas ?? (coveragePixels ? buildPackedCoverageMipAtlas(coveragePixels, width, height)
+        : buildPackedMonochromeMipAtlas(source, width, height));
+      gl.bindTexture(gl.TEXTURE_2D, mipTexture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, Math.ceil(width / 8), height, 0, gl.RED, gl.UNSIGNED_BYTE, source.data);
-      const levels = preparedMips ?? buildMonochromeMipChain(source, width, height);
-      // A complete sampler is still required for the single-pixel special case.
-      if (!levels.length) levels.push({ width: 1, height: 1, data: Uint8Array.of((source.data[0] >> 7) * 255) });
-      gl.bindTexture(gl.TEXTURE_2D, mipTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      for (const [level, pixels] of levels.entries()) {
-        gl.texImage2D(gl.TEXTURE_2D, level, gl.R8, pixels.width, pixels.height, 0, gl.RED, gl.UNSIGNED_BYTE, pixels.data);
-      }
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, levels.length - 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, atlas.width, atlas.height, 0, gl.RED, gl.UNSIGNED_BYTE, atlas.data);
       const colors = new Float32Array(8);
       for (let offset = 0; offset < 8; offset += 4) {
         const alpha = source.colors[offset + 3] / 255;
         for (let channel = 0; channel < 3; channel++) colors[offset + channel] = Math.round(source.colors[offset + channel] * alpha) / 255;
         colors[offset + 3] = alpha;
       }
-      return { texture, monochrome: { mipTexture, width, height, colors } };
+      return { texture, monochrome: { mipTexture, width, height, colors, coverage: !!coveragePixels } };
     } catch (error) {
       gl.deleteTexture(texture);
       gl.deleteTexture(mipTexture);

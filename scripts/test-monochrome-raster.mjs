@@ -11,11 +11,14 @@ try {
   const {
     expandMonochromeRaster, createMonochromeRasterLayer, copyRasterLayer,
     detectMonochromeRaster, monochromeRasterTile, buildMonochromeMipChain,
+    buildPackedMonochromeMipAtlas, buildPackedMonochromeMipAtlasAsync,
     prepareMonochromeSceneTransfer, restoreMonochromeSceneTransfer
   } = await import("../src/monochromeRaster.ts");
   const { buildSingleChannelUint8MipChain } = await import("../src/singleChannelMipChain.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { collectPdfTransferables } = await import("../src/pdf/workerProtocol.ts");
+  const { packedMonochromeCoverageLayout } = await import("../src/packedMonochromeCoverage.ts");
+  const { estimateRasterTextureBytes } = await import("../src/rasterMemoryBudget.ts");
 
   // Odd rows have their own padding, and palette entries preserve straight alpha.
   const colors = Uint8Array.of(13, 23, 31, 0, 97, 131, 173, 128);
@@ -148,6 +151,27 @@ try {
     }
     const actual = buildMonochromeMipChain({ data: bitData, colors }, mipWidth, mipHeight);
     assert.deepEqual(actual, referenceAreaMipChain(coverage, mipWidth, mipHeight), `${mipWidth}x${mipHeight} area coverage mip chain`);
+    const atlas = buildPackedMonochromeMipAtlas({ data: bitData, colors }, mipWidth, mipHeight);
+    assert.deepEqual(await buildPackedMonochromeMipAtlasAsync({ data: bitData, colors }, mipWidth, mipHeight), atlas);
+    const layout = packedMonochromeCoverageLayout(mipWidth, mipHeight);
+    const reference = actual.length ? actual : [{ width: 1, height: 1, data: coverage }];
+    for (const [index, level] of reference.entries()) {
+      const stored = layout.levels[index];
+      assert.equal(stored.width, level.width); assert.equal(stored.height, level.height);
+      for (let y = 0; y < level.height; y++) for (let x = 0; x < level.width; x++) {
+        const packedByte = atlas.data[stored.byteOffset + y * stored.rowBytes + (x >> 1)];
+        const decoded = ((packedByte >> (x % 2 ? 0 : 4)) & 15) * 17;
+        const expected = level.data[y * level.width + x];
+        assert(Math.abs(decoded - expected) <= 8, "each mip retains gray coverage within half a four-bit step");
+      }
+      if (level.width % 2) for (let y = 0; y < level.height; y++) {
+        assert.equal(atlas.data[stored.byteOffset + (y + 1) * stored.rowBytes - 1] & 15, 0,
+          "odd rows do not sample unused neighboring coverage values");
+      }
+    }
+    assert.equal(estimateRasterTextureBytes(mipWidth, mipHeight, true), bitData.byteLength + atlas.data.byteLength,
+      "memory planning charges the exact atlas allocation, including row and terminal padding");
+    assert(Math.max(atlas.width, atlas.height) <= Math.max(mipWidth, mipHeight), "atlas fits the original tile's device limit");
     if ((mipWidth === 1 || mipWidth % 2 === 0) && (mipHeight === 1 || mipHeight % 2 === 0)) {
       assert.deepEqual(actual[0], buildSingleChannelUint8MipChain(coverage, mipWidth, mipHeight)[1],
         `${mipWidth}x${mipHeight} even first level keeps established bytes before any odd later level`);
@@ -168,6 +192,11 @@ try {
   }
   const large = { data: new Uint8Array(1024 * 1024 / 8), colors };
   const chain = buildMonochromeMipChain(large, 1024, 1024);
+  const packedAtlas = buildPackedMonochromeMipAtlas(large, 1024, 1024);
+  assert(packedAtlas.data.byteLength < chain.reduce((sum, level) => sum + level.data.byteLength, 0) * .501,
+    "four-bit coverage mips use approximately half the previous GPU mip bytes");
+  assert(large.data.byteLength + packedAtlas.data.byteLength < 1024 * 1024 * .293,
+    "packed base and four-bit mips approach seven twenty-fourths of a byte per source pixel");
   assert.equal(chain[0].data.length, 512 * 512, "the largest unpacked coverage allocation is a quarter of full resolution");
   assert(large.data.byteLength + chain.reduce((sum, level) => sum + level.data.byteLength, 0) < 1024 * 1024 / 2,
     "packed base plus coverage mipmaps stays below half a byte per source pixel");
@@ -177,7 +206,8 @@ try {
   for (const operation of [
     () => expandMonochromeRaster(simple, 9, 2, controller.signal),
     () => monochromeRasterTile(simple, 9, 2, tile(0, 0, 1, 1), controller.signal),
-    () => buildMonochromeMipChain(simple, 9, 2, controller.signal)
+    () => buildMonochromeMipChain(simple, 9, 2, controller.signal),
+    () => buildPackedMonochromeMipAtlas(simple, 9, 2, controller.signal)
   ]) assert.throws(operation, error => error.code === "aborted");
   assert.throws(() => expandMonochromeRaster(simple, 0, 2), RangeError);
   assert.throws(() => expandMonochromeRaster({ data: new Uint8Array(1), colors }, 9, 2), RangeError);

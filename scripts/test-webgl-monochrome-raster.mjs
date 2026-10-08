@@ -25,8 +25,8 @@ try {
   assert.equal(gpu.monochrome.width, 9);
   assert.equal(gpu.monochrome.height, 2);
   const uploads = mock.calls.filter(call => call[0] === "texImage2D");
-  assert.deepEqual(uploads.map(call => [call[3], call[4], call[5]]), [["R8", 2, 2], ["R8", 4, 1], ["R8", 2, 1], ["R8", 1, 1]],
-    "base rows contain eight bits per byte and minification uses coverage mips");
+  assert.deepEqual(uploads.map(call => [call[3], call[4], call[5]]), [["R8", 2, 2], ["R8", 2, 2]],
+    "base rows contain eight bits per byte and coverage mips occupy one four-bit atlas");
   assert.deepEqual(uploads[0].at(-1), mono.data);
   assert.equal(mock.calls.filter(call => call[0] === "generateMipmap").length, 0);
   assert.deepEqual(Array.from(gpu.monochrome.colors), Array.from(Float32Array.of(0, 0, 0, 0, 50 / 255, 25 / 255, 13 / 255, 128 / 255)),
@@ -40,7 +40,7 @@ try {
 
   const single = renderer.createRasterLayerGpu(createMonochromeRasterLayer({ width: 1, height: 1,
     matrix: layer.matrix, paintOrder: 0, pageIndex: 0 }, { data: Uint8Array.of(128), colors: mono.colors }), 0);
-  assert.equal(mock.calls.filter(call => call[0] === "texImage2D").at(-1).at(-1)[0], 255,
+  assert.equal(mock.calls.filter(call => call[0] === "texImage2D").at(-1).at(-1)[0], 240,
     "a single source pixel supplies a complete coverage sampler");
   renderer.deleteRasterLayerTextures(single);
 
@@ -95,7 +95,8 @@ try {
   const shader = monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE);
   assert(shader.includes("heprRasterColor(vUv, dFdx(vUv), dFdy(vUv))"));
   assert(shader.includes("heprVectorClipAA(vWorld, clipAAWidth)"));
-  assert(shader.includes("textureLod(uRasterMonoMips"));
+  assert(shader.includes("heprPackedCoverage(uRasterMonoMips"));
+  assert(shader.includes("texelFetch(image"), "packed coverage bytes use exact fetches before interpolation");
   assert(!RASTER_FRAGMENT_SHADER_SOURCE.includes("uRasterMonochrome"), "page background keeps the existing shader");
 } finally {
   hooks.deregister();

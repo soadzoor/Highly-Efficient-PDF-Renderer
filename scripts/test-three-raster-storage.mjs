@@ -12,7 +12,8 @@ Object.defineProperty(globalThis, "navigator", { configurable: true, value: { de
 try {
   const { createThreeRasterTileTextures, threeRasterTextureInfo } = await import("../src/threeRasterTextures.ts");
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
-  const { buildMonochromeMipChain, monochromeCoverageTilePixels } = await import("../src/monochromeRaster.ts");
+  const { buildPackedMonochromeMipAtlas, monochromeCoverageTilePixels } = await import("../src/monochromeRaster.ts");
+  const { buildPackedCoverageMipAtlas } = await import("../src/packedMonochromeCoverage.ts");
   const { estimateRasterSourcePlanBytes, automaticRasterMemoryBudget } = await import("../src/rasterMemoryBudget.ts");
   const { createThreeWebGpuRasterMaterial } = await import("../src/threeWebGpuRasterMaterial.ts");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
@@ -30,14 +31,18 @@ try {
   assert.equal(packedInfo.mode,1); assert.equal(packed.generateMipmaps,false);
   assert.equal(packed.minFilter,THREE.NearestFilter);
   assert.equal(packedInfo.coverage.format,THREE.RedFormat);
-  assert.deepEqual(packedInfo.coverage.mipmaps,buildMonochromeMipChain(small.monochrome,33,17));
+  assert.deepEqual(packedInfo.coverage.image,buildPackedMonochromeMipAtlas(small.monochrome,33,17));
+  assert.equal(packedInfo.coverage.mipmaps.length,0,"packed coverage uses explicit shader LODs");
+  assert.equal(packedInfo.coverage.generateMipmaps,false);
   assert.equal(packedInfo.estimatedBytes,estimateRasterSourcePlanBytes({ width: small.width, height: small.height, monochrome: small.monochrome, reducedMonochrome: true },fullPlan));
   assert.equal(packedInfo.color1.w,128/255);
   assert(Math.abs(packedInfo.color1.x-10/255*128/255)<1e-12,"palette colors are premultiplied");
   const [coverage] = createThreeRasterTileTextures(small,reducedPlan), coverageInfo = threeRasterTextureInfo(coverage);
-  assert.equal(coverageInfo.mode,2); assert.equal(coverageInfo.coverage,coverage);
+  assert.equal(coverageInfo.mode,2); assert.notEqual(coverageInfo.coverage,coverage);
   assert.equal(coverage.image.data.length,16*8);
   assert.deepEqual(coverage.image.data,monochromeCoverageTilePixels(small.monochrome,33,17,reducedPlan)[0]);
+  assert.deepEqual(coverageInfo.coverage.image,buildPackedCoverageMipAtlas(coverage.image.data,16,8));
+  assert.equal(coverage.generateMipmaps,false,"reduced bases keep exact R8 coverage without uncompressed mips");
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position",new THREE.BufferAttribute(new Float32Array(12),3));
@@ -50,12 +55,14 @@ try {
     const builder = build(state.material,geometry), shader = builder.fragmentShader;
     const bindings = builder.getBindings().flatMap(group => group.bindings);
     const textureBindings = bindings.filter(binding => binding.isSampledTexture);
-    assert.equal(textureBindings.length,2,"preview tiers keep distinct binding slots without duplicating texture allocations");
+    assert.equal(textureBindings.length,2,"preview tiers bind an R8 base and a packed coverage atlas");
     assert.match(shader,/fn heprThreeRasterBit\s*\(/);
     for (const match of shader.matchAll(/\b(nodeUniform\d+_sampler)\b/g))
       assert(shader.includes(`var ${match[1]} : sampler;`), "every function sampler argument has a real binding");
     assert.match(shader,/textureLoad\(image, vec2i\(p.x \/ 8, p.y\), 0\)/);
-    assert.match(shader,/textureSampleLevel\(coverageImage, coverageSampler, uv, lod - 1.0\)/);
+    assert.match(shader,/heprPackedCoverage\(coverageImage, vec2i\(size\), uv, lod - 1.0\)/);
+    assert.match(shader,/fn heprCoverageTexel/);
+    assert.match(shader,/fn heprCoverageBilinear/);
     assert(shader.indexOf("let dx = dpdx(uv)") < shader.indexOf("if (mode < 0.5)"));
     assert.match(shader,/heprThreeOutputColor\(straightSrgb\) \* color.a/);
     state.updateSource(packed,Float32Array.of(1,0,0,1,0,0),1);

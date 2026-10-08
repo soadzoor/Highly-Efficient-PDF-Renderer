@@ -11,7 +11,7 @@ host.onmessage = event => {
     const buffers = new Set<ArrayBuffer>();
     for (const pixels of result.pixels) buffers.add(pixels.buffer as ArrayBuffer);
     for (const bits of result.monochromeTiles ?? []) { buffers.add(bits.data.buffer as ArrayBuffer); buffers.add(bits.colors.buffer as ArrayBuffer); }
-    for (const chain of result.mipChains ?? []) for (const level of chain) buffers.add(level.data.buffer as ArrayBuffer);
+    for (const atlas of result.coverageAtlases ?? []) buffers.add(atlas.data.buffer as ArrayBuffer);
     host.postMessage({ result }, [...buffers]);
   } catch (error) { host.postMessage({ error: error instanceof Error ? error.message : String(error) }, []); }
 };

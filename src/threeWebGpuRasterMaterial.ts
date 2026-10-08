@@ -6,6 +6,8 @@ import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import { threeRasterTextureInfo } from "./threeRasterTextures";
 import { PAGE_PLACEHOLDER_BAR_WGSL, PAGE_PLACEHOLDER_COLOR_WGSL } from "./pageLoadingPlaceholder";
+import { PACKED_COVERAGE_TEXEL_WGSL, PACKED_COVERAGE_BILINEAR_WGSL,
+  PACKED_COVERAGE_TRILINEAR_WGSL } from "./packedMonochromeCoverageShaders";
 
 import {
   createThreeWebGpuOutputFragmentFns,
@@ -130,6 +132,9 @@ fn heprThreeRasterBit(image: texture_2d<f32>, size: vec2f, pixel: vec2i) -> f32 
   let bits = u32(round(textureLoad(image, vec2i(p.x / 8, p.y), 0).r * 255.0));
   return f32((bits >> (7u - (u32(p.x) & 7u))) & 1u);
 }`);
+const coverageTexelFn = TSL.wgslFn(PACKED_COVERAGE_TEXEL_WGSL);
+const coverageBilinearFn = TSL.wgslFn(PACKED_COVERAGE_BILINEAR_WGSL, [coverageTexelFn] as never);
+const coverageTrilinearFn = TSL.wgslFn(PACKED_COVERAGE_TRILINEAR_WGSL, [coverageBilinearFn] as never);
 const rasterSampleFn: unknown = TSL.wgslFn(`
 fn heprThreeRasterSample(image: texture_2d<f32>, imageSampler: sampler,
   coverageImage: texture_2d<f32>, coverageSampler: sampler,
@@ -140,22 +145,24 @@ fn heprThreeRasterSample(image: texture_2d<f32>, imageSampler: sampler,
     if (opaque > 0.5) { color.a = 1.0; }
     return color;
   }
-  if (mode > 1.5) {
-    return mix(color0, color1, textureSampleGrad(image, imageSampler, uv, dx, dy).r);
-  }
   let lod = max(0.0, log2(max(1.0, max(length(dx * size), length(dy * size)))));
   var coverage: f32;
   if (lod < 1.0) {
     let position = uv * size - vec2f(0.5);
     let pixel = vec2i(floor(position)); let weight = fract(position);
-    let base = mix(mix(heprThreeRasterBit(image, size, pixel), heprThreeRasterBit(image, size, pixel + vec2i(1,0)), weight.x),
-      mix(heprThreeRasterBit(image, size, pixel + vec2i(0,1)), heprThreeRasterBit(image, size, pixel + vec2i(1,1)), weight.x), weight.y);
-    coverage = mix(base, textureSampleLevel(coverageImage, coverageSampler, uv, 0.0).r, lod);
+    var base: f32;
+    if (mode > 1.5) {
+      base = textureSampleLevel(image, imageSampler, uv, 0.0).r;
+    } else {
+      base = mix(mix(heprThreeRasterBit(image, size, pixel), heprThreeRasterBit(image, size, pixel + vec2i(1,0)), weight.x),
+        mix(heprThreeRasterBit(image, size, pixel + vec2i(0,1)), heprThreeRasterBit(image, size, pixel + vec2i(1,1)), weight.x), weight.y);
+    }
+    coverage = mix(base, heprPackedCoverage(coverageImage, vec2i(size), uv, 0.0), lod);
   } else {
-    coverage = textureSampleLevel(coverageImage, coverageSampler, uv, lod - 1.0).r;
+    coverage = heprPackedCoverage(coverageImage, vec2i(size), uv, lod - 1.0);
   }
   return mix(color0, color1, coverage);
-}`, [rasterBitFn] as never);
+}`, [rasterBitFn, coverageTrilinearFn] as never);
 
 export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions
