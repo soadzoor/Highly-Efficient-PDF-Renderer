@@ -1896,6 +1896,7 @@ async function downloadHep(): Promise<boolean> {
     const buildOptions = {
       ...lodOptions,
       sourceLabel: label,
+      sourcePdfByteLength: lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes.byteLength : undefined,
       signal: exportController.signal,
       onProgress: (progress: import("./loadProgress").PDFLoadProgress) => {
         if (activeHepExportController === exportController) {

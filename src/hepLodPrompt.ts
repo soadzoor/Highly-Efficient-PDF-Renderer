@@ -20,7 +20,7 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
   title.id = "hep-lod-title";
   title.textContent = "Download HEP";
   const description = document.createElement("p");
-  description.textContent = "Store levels of detail for faster loading. This increases file size. Uncheck for a smaller file.";
+  description.textContent = "Store levels of detail for faster loading. Uncheck for a smaller file. If these caches make the HEP as large as the original PDF, they are omitted and rebuilt when needed.";
   form.append(title, description);
   const inputs: { key: "withVectorLod" | "withTextLod"; input: HTMLInputElement }[] = [];
   for (const [available, key, label] of [[vector, "withVectorLod", "Include vector LOD"],

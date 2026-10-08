@@ -482,7 +482,8 @@ async function readHepManifest(archive) {
  * The candidate must come from the default DEFLATE writer, as this CLI's
  * buildHep() calls do, or the re-encoding would not match its encoding.
  */
-export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal) {
+export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal, sourcePdfByteLength) {
+  if (sourcePdfByteLength !== undefined && existingBytes.byteLength >= sourcePdfByteLength) return false;
   const existing = await HepArchive.loadAsync(existingBytes, { signal });
   const candidate = await HepArchive.loadAsync(candidateBytes, { signal });
   const existingSections = Object.values(existing.files);
@@ -508,11 +509,11 @@ export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes,
   return Buffer.compare(restamped, existingBytes) === 0;
 }
 
-async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal) {
+async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal, sourcePdfByteLength) {
   try {
     const existingBytes = await readFile(outputPath, { signal });
     const candidateBytes = new Uint8Array(await hepBlob.arrayBuffer());
-    return await hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal);
+    return await hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal, sourcePdfByteLength);
   } catch (error) {
     if (signal?.aborted) {
       throw error;
@@ -1045,11 +1046,16 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
           onProgress: createProgressLogger(sourceLabel, itemNumber, itemCount)
         });
         abortController.signal.throwIfAborted();
+        if (hepBlob.size >= pdfBytes.byteLength) {
+          throw new RangeError(`HEP size policy: ${sourceLabel} produced ${hepBlob.size} bytes; ` +
+            `the HEP must be strictly smaller than its ${pdfBytes.byteLength}-byte PDF.`);
+        }
         if (options.keepUnchanged && await existingHepDiffersOnlyInGeneratedAt(
           outputPath,
           hepBlob,
           builder.HepArchive,
-          abortController.signal
+          abortController.signal,
+          pdfBytes.byteLength
         )) {
           console.log(
             `[${itemNumber}/${itemCount}] Kept ${outputPath}; only its generatedAt timestamp would change`
@@ -1066,12 +1072,6 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
           );
         }
         generatedCount += 1;
-        if (hepBlob.size > pdfBytes.byteLength) {
-          console.warn(
-            `[${itemNumber}/${itemCount}] Warning: ${sourceLabel} produced a HEP larger than its PDF ` +
-            `(${formatBytes(hepBlob.size)} > ${formatBytes(pdfBytes.byteLength)}).`
-          );
-        }
       } catch (error) {
         if (abortController.signal.aborted) {
           throw error;

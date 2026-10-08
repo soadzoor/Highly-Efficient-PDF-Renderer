@@ -235,6 +235,7 @@ async function loadPdfSceneFromSourceInternal(
         if ((streaming && loader.pageCount > 16) || loader.requiresPageDemand) {
           const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
           const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.displayPageScenes, pagesPerRow, options.onDiagnostic));
+          scene.sourcePdfByteLength = sourceBytes.byteLength;
           loader.bindDisplayScene(scene);
           progress.complete({ sourceType: "pdf" });
           signal?.throwIfAborted();
@@ -242,6 +243,7 @@ async function loadPdfSceneFromSourceInternal(
         }
         const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
         const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
+        scene.sourcePdfByteLength = sourceBytes.byteLength;
         await loader.close();
         progress.complete({ sourceType: "pdf" });
         signal?.throwIfAborted();
@@ -257,6 +259,7 @@ async function loadPdfSceneFromSourceInternal(
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
     const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pageScenes, pagesPerRow, options.onDiagnostic));
+    scene.sourcePdfByteLength = sourceBytes.byteLength;
     signal?.throwIfAborted();
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
     signal?.throwIfAborted();

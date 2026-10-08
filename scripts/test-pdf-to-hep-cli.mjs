@@ -203,6 +203,12 @@ async function encodeTestHep(generatedAt, {
   return archive.generateAsync({ type: "uint8array", compression });
 }
 const existingTestHep = await encodeTestHep("2026-09-29T15:45:20.289Z");
+for (const sourcePdfByteLength of [existingTestHep.byteLength - 1, existingTestHep.byteLength]) {
+  assert.equal(await hepDiffersOnlyInGeneratedAt(existingTestHep, existingTestHep, HepArchive,
+    undefined, sourcePdfByteLength), false, "--keep-unchanged must never retain an over-budget HEP");
+}
+assert.equal(await hepDiffersOnlyInGeneratedAt(existingTestHep, existingTestHep, HepArchive,
+  undefined, existingTestHep.byteLength + 1), true, "an under-budget unchanged HEP can be retained");
 assert.equal(
   await hepDiffersOnlyInGeneratedAt(existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z"), HepArchive),
   true,

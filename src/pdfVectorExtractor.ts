@@ -113,6 +113,8 @@ export interface VectorDrawRun {
 }
 
 export interface VectorScene {
+  /** Original PDF size used to keep exported HEP files strictly smaller. */
+  sourcePdfByteLength?: number;
   /** Internal one-page viewing policy; omitted from composed/exported document data. */
   pdfOverviewKind?: "vector" | "ocr" | "raster";
   /** Annotation geometry in composed scene coordinates; absent in older HEP files. */

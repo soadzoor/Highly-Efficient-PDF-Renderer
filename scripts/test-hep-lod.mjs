@@ -212,8 +212,68 @@ try {
       denseOriginal.levels[i].visibleSegmentIds.subarray(0, denseOriginal.levels[i].visibleSegmentCount)));
   }, "worker-sized v3 round trip");
   // Compact positions are bounded; exact geometry, styles and clip windows stay intact.
-  const { compactVectorLod, deduplicateVectorLod, packVectorLod, unpackVectorLod } =
+  const { compactVectorLod, deduplicateVectorLod, packVectorLod, unpackVectorLod, packTextLod, unpackTextLod } =
     await import("../src/hepLodEncoding.ts");
+  // Corrections preserve text caches even when canonical quantization or a
+  // previous builder made their derived geometry differ from today's predictor.
+  const correctedText = structuredClone(originalText.data);
+  const correctedRun = correctedText.runs.find(run => run.eligible);
+  correctedRun.transform[0] += .123456789;
+  correctedRun.transform[1] = -0;
+  correctedRun.transform[4] += .345678901;
+  correctedRun.bounds.minX += .012345678;
+  correctedRun.maxInkHeight += .03456789;
+  correctedText.coarseInstanceA[correctedRun.coarseIndex * 4 + 1] = -0;
+  correctedText.coarseInstanceB[correctedRun.coarseIndex * 4] += .125;
+  correctedText.coarseInstanceC[correctedRun.coarseIndex * 4 + 3] += .25;
+  const roundedSource = { ...canonical, textInstanceB: canonical.textInstanceB.slice() };
+  roundedSource.textInstanceB[correctedRun.exactStart * 4] += .0625;
+  const packedText = packTextLod(correctedText, roundedSource);
+  assert.deepEqual(unpackTextLod(packedText, roundedSource), correctedText,
+    "nonzero transform, bounds, color, and signed-zero corrections survive exactly");
+  const setTextResidual = (table, column, row, value, prediction = 0) => {
+    const word = new DataView(new ArrayBuffer(8));
+    word.setFloat64(0, prediction, true);
+    const low = word.getUint32(0, true), high = word.getUint32(4, true);
+    word.setFloat64(0, value, true);
+    table.columns[column * 2 * table.count + row] = word.getUint32(0, true) ^ low;
+    table.columns[(column * 2 + 1) * table.count + row] = word.getUint32(4, true) ^ high;
+  };
+  for (const invalidCount of [-1, .5, canonical.textInstanceCount + 1]) {
+    const corrupt = structuredClone(packedText);
+    setTextResidual(corrupt.runs, 1, 0, invalidCount);
+    assert.throws(() => unpackTextLod(corrupt, roundedSource), /invalid compact LOD/);
+  }
+  const overlappingText = structuredClone(packedText);
+  setTextResidual(overlappingText.runs, 0, 1, 0, correctedText.runs[0].exactCount);
+  assert.throws(() => unpackTextLod(overlappingText, roundedSource), /invalid compact LOD/);
+  const abortText = new AbortController(); abortText.abort();
+  assert.throws(() => packTextLod(correctedText, roundedSource, abortText.signal), { name: "AbortError" });
+  assert.throws(() => unpackTextLod(packedText, roundedSource, abortText.signal), { name: "AbortError" });
+
+  // An independent v2 fixture keeps the original Float64 column layout.
+  const textBounds = ["bounds.minX", "bounds.minY", "bounds.maxX", "bounds.maxY"];
+  const textDirections = ["inkHeightDirection.0", "inkHeightDirection.1", "baselineDirection.0", "baselineDirection.1"];
+  const legacyTextFields = {
+    runs: ["exactStart", "exactCount", "coarseIndex", "pageIndex", ...textBounds,
+      ...Array.from({ length: 6 }, (_, i) => `transform.${i}`), "maxInkHeight", "eligible"],
+    clusters: ["pageIndex", "runStart", "runCount", "exactStart", "exactCount", "coarseStart", "coarseCount",
+      ...textBounds, "maxInkHeight", ...textDirections, "eligible"],
+    pages: ["pageIndex", "clusterStart", "clusterCount", "exactStart", "exactCount", "coarseCount",
+      ...textBounds, "maxInkHeight", ...textDirections, "eligible"]
+  };
+  const legacyTextPacked = { ...originalText.data };
+  for (const [kind, fields] of Object.entries(legacyTextFields)) {
+    const nodes = originalText.data[kind], columns = new Float64Array(nodes.length * fields.length);
+    fields.forEach((path, column) => nodes.forEach((node, row) => {
+      const [key, child] = path.split(".");
+      const value = child === undefined ? node[key] : node[key]?.[child];
+      columns[column * nodes.length + row] = value === undefined ? NaN : Number(value);
+    }));
+    legacyTextPacked[kind] = { count: nodes.length, columns };
+  }
+  assert.deepEqual(unpackTextLod(legacyTextPacked), originalText.data, "v2 Float64 columns remain readable");
+
   const snapshot = structuredClone(vector.getStoredVectorStrokeLod(canonical));
   snapshot.literals.endpoints[0] += .00071;
   snapshot.literals.primitiveMeta[0] += .00031;
@@ -336,6 +396,16 @@ try {
     v2.file(file, bytes);
     return { array: value instanceof Float64Array ? "f64" : value instanceof Float32Array ? "f32" : "u32", file, length: value.length };
   }));
+  let v2TextIndex = 0;
+  v2.file("lod-text/index.json", JSON.stringify(legacyTextPacked, (_key, value) => {
+    if (!ArrayBuffer.isView(value)) return value;
+    const file = `lod-text/${v2TextIndex++}.bin`, raw = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < value.length; i++) for (let c = 0; c < value.BYTES_PER_ELEMENT; c++) bytes[c * value.length + i] = raw[i * value.BYTES_PER_ELEMENT + c];
+    v2.file(file, bytes);
+    return { array: value instanceof Float64Array ? "f64" : "f32", file, length: value.length };
+  }));
+  v2Manifest.lod.text.version = 2;
   v2Manifest.lod.vector.version = 2;
   v2.file("manifest.json", JSON.stringify(v2Manifest));
   const v2Bytes = await v2.generateAsync({ type: "uint8array", compression: "DEFLATE" });
@@ -346,6 +416,7 @@ try {
     assert.deepEqual(second.levels[0].segmentMinX, first.levels[0].segmentMinX);
     return loaded;
   }, "legacy v2 adoption");
+  assert.deepEqual(text.getCachedTextLod(v2Scene)?.data, originalText.data, "legacy v2 text cache is adopted");
   const v2Expected = structuredClone(vector.getStoredVectorStrokeLod(canonical));
   for (const level of v2Expected.levels) for (const key of ["overview", "records"]) if (level[key] === undefined) delete level[key];
   assert.deepEqual(vector.getStoredVectorStrokeLod(v2Scene), v2Expected);
@@ -402,16 +473,22 @@ try {
   const warnings = [], warn = console.warn;
   console.warn = message => warnings.push(message);
   try {
-    for (const corruption of ["version", "records", "indexes", "precision", "text"]) {
+    for (const corruption of ["version", "records", "indexes", "precision", "text", "text-range"]) {
       const archive = await HepArchive.loadAsync(storedBytes);
       if (corruption === "version") {
         const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
         manifest.lod.vector.version = 0;
         archive.file("manifest.json", JSON.stringify(manifest));
       } else {
-        const path = corruption === "text" ? "lod-text/index.json" : "lod-vector/index.json";
+        const path = corruption.startsWith("text") ? "lod-text/index.json" : "lod-vector/index.json";
         const index = JSON.parse(await archive.file(path).async("string"));
         if (corruption === "text") index.clusters.count = -1;
+        else if (corruption === "text-range") {
+          const descriptor = index.runs.columns, bytes = await archive.file(descriptor.file).async("uint8array");
+          const high = (1 * 2 + 1) * index.runs.count; // exactCount[0] = +Infinity.
+          for (let byte = 0; byte < 4; byte++) bytes[byte * descriptor.length + high] = (0x7ff00000 >>> (byte * 8)) & 255;
+          archive.file(descriptor.file, bytes);
+        }
         else if (corruption === "indexes") delete index.tileIndexes;
         else if (corruption === "precision") index.positionQuanta = index.origins; // Wrong array type.
         else index.levels[1].records.length = 0xffffffff;
@@ -419,16 +496,16 @@ try {
       }
       const loaded = await loadSceneFromHep(await (await archive.generateAsync({ type: "blob", compression: "STORE" })).arrayBuffer());
       assert.equal(loaded.segmentCount, count);
-      assert.equal(Boolean(vector.getStoredVectorStrokeLod(loaded)), corruption === "text");
-      assert.equal(Boolean(text.getCachedTextLod(loaded)), corruption !== "text");
-      if (corruption !== "text") {
+      assert.equal(Boolean(vector.getStoredVectorStrokeLod(loaded)), corruption.startsWith("text"));
+      assert.equal(Boolean(text.getCachedTextLod(loaded)), !corruption.startsWith("text"));
+      if (!corruption.startsWith("text")) {
         vector.resetVectorStrokeLodBuildTiming();
         await vector.prebuildVectorStrokeLodRuntime(loaded, "force", "webgl");
         assert.equal(vector.consumeVectorStrokeLodBuildTiming().buildCount, 1);
       } else assert((await text.prebuildTextLod(loaded)).data);
     }
   } finally { console.warn = warn; }
-  assert.equal(warnings.length, 5);
+  assert.equal(warnings.length, 6);
   assert(warnings.every(message => /Regenerate/.test(message)));
   const empty = await buildHep(createEmptyVectorScene(), { withVectorLod: true, withTextLod: true });
   const emptyArchive = await HepArchive.loadAsync(await empty.arrayBuffer());
@@ -436,5 +513,5 @@ try {
   const controller = new AbortController(); controller.abort();
   await assert.rejects(buildHep(canonical, { withVectorLod: true, signal: controller.signal }), { name: "AbortError" });
   await assert.rejects(buildHep(canonical, { withVectorLod: "yes" }), /boolean/);
-  console.log("HEP LOD: v3 shared geometry, adaptive precision, reconstructed indexes, legacy compatibility, selection parity, corruption, and cancellation passed.");
+  console.log("HEP LOD: v3 shared geometry, predictive text, adaptive precision, reconstructed indexes, legacy compatibility, selection parity, corruption, and cancellation passed.");
 } finally { hooks.deregister(); }

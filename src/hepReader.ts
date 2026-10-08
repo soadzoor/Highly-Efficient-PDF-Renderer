@@ -478,6 +478,11 @@ async function loadSceneFromHepInternal(
     );
   }
 
+  if (manifest.sourcePdfByteLength !== undefined &&
+      (!Number.isSafeInteger(manifest.sourcePdfByteLength) || Number(manifest.sourcePdfByteLength) <= 0)) {
+    throw new Error("Invalid HEP sourcePdfByteLength; expected a positive safe integer.");
+  }
+
   const sceneMeta = typeof manifest.scene === "object" && manifest.scene ? manifest.scene : {};
   const manifestTextures = Array.isArray(manifest.textures) ? manifest.textures : [];
 
@@ -927,6 +932,7 @@ async function loadSceneFromHepInternal(
   scene.annotations = await readHepAnnotations(archive, sceneMeta.annotations, scene, signal);
   await readHepStructure(archive, sceneMeta.structure, scene, signal);
   preparedHepScenes.add(scene);
+  if (manifest.sourcePdfByteLength !== undefined) scene.sourcePdfByteLength = Number(manifest.sourcePdfByteLength);
   await readHepLod(archive, scene, manifest.lod, signal);
   progress.complete({ sourceType: "hep" });
   return scene;

@@ -18,6 +18,7 @@ import {
 } from "./hepSceneSections";
 import { writeHepGradientMesh } from "./hepGradientMesh";
 import { HepArchive } from "./hepContainer";
+import { assertHepSizeBelowPdf, omitHepLodForSizeBudget, validateSourcePdfByteLength } from "./hepSizePolicy";
 import {
   GRADIENT_LUT_WIDTH,
   type RasterLayer,
@@ -84,6 +85,11 @@ export async function buildHepBlobForLayout(
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
   throwIfBuildAborted(options.signal);
+  validateSourcePdfByteLength(options.sourcePdfByteLength);
+  validateSourcePdfByteLength(scene.sourcePdfByteLength);
+  const sourcePdfByteLength = options.sourcePdfByteLength === undefined ? scene.sourcePdfByteLength
+    : scene.sourcePdfByteLength === undefined ? options.sourcePdfByteLength
+    : Math.min(options.sourcePdfByteLength, scene.sourcePdfByteLength);
   if (options.withVectorLod || options.withTextLod) scene = prepareSceneForHepRendering(scene);
   validatePagePrimitiveRanges(scene);
   validateVectorDrawRuns(scene);
@@ -226,6 +232,7 @@ export async function buildHepBlobForLayout(
   const manifest = {
     formatVersion: PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,
+    sourcePdfByteLength,
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,
     textInstances: textInstancesExport?.manifest,
@@ -311,19 +318,33 @@ export async function buildHepBlobForLayout(
   };
 
   throwIfBuildAborted(options.signal);
-  archive.file("manifest.json", JSON.stringify({ ...manifest, ...(lod ? { lod } : {}) }));
+  const outputManifest = { ...manifest, ...(lod ? { lod } : {}) };
+  archive.file("manifest.json", JSON.stringify(outputManifest));
+  // Reserve progress for a possible second serialization after removing caches.
+  const finalBuildEnd = sourcePdfByteLength === undefined ? 1 : 0.99;
+  const firstBuildEnd = sourcePdfByteLength !== undefined && lod
+    ? hepBuildStart + (1 - hepBuildStart) * 0.8
+    : finalBuildEnd;
   const onHepProgress = (metadata: { percent: number }): void => {
     reportBuildProgress(
-      hepBuildStart + (1 - hepBuildStart) * (metadata.percent / 100),
+      hepBuildStart + (firstBuildEnd - hepBuildStart) * (metadata.percent / 100),
       { stage: "hep-build" }
     );
   };
-  const hepBlob = await archive.generateAsync({
+  let hepBlob = await archive.generateAsync({
     type: "blob",
     compression,
     signal: options.signal
   }, onHepProgress);
   throwIfBuildAborted(options.signal);
+  if (sourcePdfByteLength !== undefined && omitHepLodForSizeBudget(archive, outputManifest, hepBlob.size, sourcePdfByteLength)) {
+    throwIfBuildAborted(options.signal);
+    hepBlob = await archive.generateAsync({ type: "blob", compression, signal: options.signal }, metadata => {
+      reportBuildProgress(firstBuildEnd + (finalBuildEnd - firstBuildEnd) * (metadata.percent / 100), { stage: "hep-build" });
+    });
+    throwIfBuildAborted(options.signal);
+  }
+  assertHepSizeBelowPdf(hepBlob.size, sourcePdfByteLength, label);
   reportBuildProgress(1, { stage: "hep-build" });
   throwIfBuildAborted(options.signal);
 

@@ -940,6 +940,12 @@ cache preserves its existing rounding; selecting lossless does not recover
 precision already discarded. Rebuild from the original PDF or compact HEP
 without LODs to recover the original LOD geometry.
 
+Text LOD v3 predicts run transforms and bounds from the canonical glyphs, then
+stores exact XOR corrections. Coarse glyph transforms and colors reuse those
+predictions. This avoids storing the same geometry several times while preserving
+every decoded cache value. Existing text LOD v1/v2 remains readable and can be
+repacked without parsing the PDF or clustering the text again.
+
 On load, matching caches skip simplification and clustering. Missing caches are
 built when the viewer needs them. Invalid or incompatible caches produce a
 console warning recommending regeneration and fall back to normal generation.
@@ -951,9 +957,17 @@ recovers the v1 JSON null sentinel for exact-only text nodes. GPU upload and
 mutable selection state are still prepared at load time.
 
 Both example viewers' **Download HEP** button offers independent vector/text
-checkboxes when applicable, unchecked by default. Cancel or Escape stops the
+checkboxes when applicable, checked by default. Cancel or Escape stops the
 export. Vector LOD offers Lossless and Compact precision choices. Downloads with
 either LOD option use a `-parsed-data-lod.hep` suffix.
+
+Exports compare the complete HEP against the original PDF's byte length and
+require it to be strictly smaller. Optional LOD caches are omitted with a
+console warning if they would exceed that budget; the viewer rebuilds them when
+needed. If the HEP still cannot fit without caches, export reports a size-policy
+error and keeps the document open. No document content is discarded to meet the
+budget. A custom scene or an older HEP without a recorded source size needs the
+`sourcePdfByteLength` build option for this check.
 
 The builder accepts `signal` and `onProgress`, including LOD building, raster encoding and
 container build progress. Browser and Node exports use the same format but may
@@ -1049,6 +1063,10 @@ per file in isolated workers:
 ```bash
 node scripts/repack-hep-lods.mjs public/examples/heps-lod/Level_1-parsed-data.hep
 ```
+
+For an older HEP without recorded PDF size, add
+`--source-pdf="/path/to/original.pdf"` for a single HEP file. This reads only the
+PDF's file size and enforces the same strict budget; it does not parse the PDF.
 
 `--write` enables atomic replacement, only when smaller. Repacking verifies
 canonical section bytes and all decoded LOD data against the expected lossless

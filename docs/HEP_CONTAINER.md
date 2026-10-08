@@ -506,12 +506,20 @@ Three.js page matrices are presentation state and are not stored here.
 
 ## Optional LOD caches (scene v9)
 
+An optional top-level `manifest.sourcePdfByteLength` records the original PDF's
+positive safe-integer byte length. New PDF exports record it, and readers retain
+it for later scene exports. Writers check the complete archive, including index
+and padding, against this strict upper bound. They omit optional LOD caches with
+a diagnostic when needed; if canonical content still cannot fit, export fails
+before saving. This additive metadata changes no container or scene version.
+For older files or custom scenes, callers can supply the original PDF length.
+
 The optional top-level `manifest.lod` object has independent `vector` and `text`
 entries: vector currently uses `{ "version": 3, "file": "lod-vector/index.json" }`,
-and text uses `{ "version": 2, "file": "lod-text/index.json" }`. These additive caches do not require a container or
+and text uses `{ "version": 3, "file": "lod-text/index.json" }`. These additive caches do not require a container or
 scene-schema bump: the canonical scene is unchanged and older readers ignore
 unknown sections. Bump the corresponding cache version when its build algorithm
-or representation changes. Readers accept vector v1/v2/v3 and text v1/v2, warning when an older encoding
+or representation changes. Readers accept vector v1/v2/v3 and text v1/v2/v3, warning when an older encoding
 can be repacked for smaller files. Other
 versions or malformed caches fall back independently to normal LOD generation
 with a console warning. Generic container repacking preserves caches as-is;
@@ -578,6 +586,31 @@ exact-only nodes may use positive Infinity for `maxInkHeight`. All other numbers
 must be finite. The v1 reader converts null heights back to Infinity only for
 ineligible nodes, recovering JSON's conversion of this exact-only sentinel.
 Coarse text instance arrays remain Float32. Text compaction introduces no rounding.
+
+### Text LOD encoding v3
+
+The index carries `textEncoding: "predictive"`. Tables retain the v2 field order
+and store each Float64 column as two Uint32 XOR residual columns (low word, high
+word), each containing `count` records. A run's source glyph range predicts its
+transform and ink height from the canonical glyph matrices, positions and glyph
+bounds. Bounds predict the decoded run transform. Cluster and page bounds,
+counts and heights predict their decoded children; page bounds include the
+canonical page rectangle. Source range starts predict the previous range's end,
+and other scalar fields use zero unless the predictor defines a derived value.
+The predictor formulas and evaluation order are specified by
+`predictTextNode` in `src/hepLodEncoding.ts`.
+
+Decode run ranges first, validate them, then decode transforms before bounds.
+Decode runs before clusters, then pages. Ranges are contiguous, non-overlapping
+and bounded by their source arrays, so prediction scans visit each glyph or
+child at most once per table. The three coarse Float32 streams store Uint32
+residuals in component-major order. Their predictors are the decoded run
+transforms rounded to Float32 and the canonical first glyph's color.
+
+All corrections remain in the residuals, including values changed by canonical
+coordinate quantization, signed zero and the positive Infinity sentinel. The
+decoded cache is lossless; this changes no canonical scene data, clustering or
+LOD selection. Older viewers ignore text v3 and rebuild it when needed.
 
 ### Vector LOD encoding v3
 

@@ -1042,10 +1042,20 @@ or `@soadzoor/hepr` in Node.
 | PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `password`, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
-Shared encoding options are `sourceLabel`, `encodeRasterImages` (default `true`),
+Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
 `compression` (`"deflate"` by default, or `"store"`), `onProgress`, and `signal`.
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
+
+PDF-source builds measure the original PDF automatically. Scenes loaded through
+HEPR carry that size, and HEP exports record it for later re-export. For a custom
+scene or an older HEP, supply `sourcePdfByteLength` (a positive safe integer) to
+enforce the same budget. The complete archive must be strictly smaller than the
+PDF, including its index, manifest and stored LODs. If requested LOD caches exceed
+the budget, the writer omits them with a console warning; they rebuild when needed.
+If the canonical archive still cannot fit, the build rejects with `RangeError`
+before saving anything. It preserves document content and does not change viewing.
+Scenes without a known PDF size cannot enforce a PDF size comparison.
 
 A HEP built from a password-protected PDF stores the decrypted content and has
 no password of its own. Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves

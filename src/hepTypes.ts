@@ -51,6 +51,7 @@ export type TextureComponentType =
   | "uint16-range-delta-columns";
 
 export interface BuildHepBlobOptions extends HepLodOptions {
+  sourcePdfByteLength?: number;
   encodeRasterImages?: boolean;
   compression?: "STORE" | "DEFLATE";
   signal?: AbortSignal;
@@ -128,6 +129,7 @@ export interface ParsedDataSceneEntry {
 }
 
 export interface ParsedDataManifest {
+  sourcePdfByteLength?: unknown;
   lod?: unknown;
   formatVersion?: unknown;
   sourceFile?: unknown;

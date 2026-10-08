@@ -7,6 +7,7 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import type { AnnotationAppearanceMode } from "./annotationData";
 import { waitForLoad } from "./loadCancellation";
+import { validateSourcePdfByteLength } from "./hepSizePolicy";
 
 /** Compression algorithm used inside a generated HEP file. */
 export type HepCompression = "deflate" | "store";
@@ -15,6 +16,9 @@ export type HepCompression = "deflate" | "store";
 export interface HepEncodingOptions extends HepLodOptions {
   /** Override the source name written to the HEP manifest. */
   sourceLabel?: string;
+
+  /** Original PDF byte length; omit optional LODs or reject exports that cannot be strictly smaller. */
+  sourcePdfByteLength?: number;
 
   /** Encode raster layers as WebP/PNG when supported; otherwise store raw RGBA. @default true */
   encodeRasterImages?: boolean;
@@ -94,6 +98,7 @@ export async function buildHep(
 }
 
 function validateEncodingOptions(options: HepEncodingOptions): void {
+  validateSourcePdfByteLength(options.sourcePdfByteLength);
   if (options.vectorLodPrecision !== undefined && !["lossless", "compact"].includes(options.vectorLodPrecision)) {
     throw new RangeError("vectorLodPrecision must be lossless or compact.");
   }

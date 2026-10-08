@@ -1898,6 +1898,7 @@ async function downloadHep(): Promise<boolean> {
       ocrTextOnly: false,
       ...lodOptions,
       sourceLabel: pdfObject.sourceLabel,
+      sourcePdfByteLength: pdfObject.sourceKind === "pdf" ? pdfObject.sourceBytes?.byteLength : undefined,
       signal: exportController.signal,
       onProgress: (progress: PDFLoadProgress) => {
         if (activeHepExportController !== exportController) {
