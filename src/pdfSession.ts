@@ -99,6 +99,7 @@ import {
   isPdfDictionary,
   isPdfName,
   isPdfStream,
+  isPdfString,
   createNativeOptionalContentRegistry,
   openNativePdfDocument,
   type NativePdfOpenOptions,
@@ -1767,6 +1768,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       fonts: fontsByName,
       initialTransform: pageMatrix,
       maxGlyphs,
+      maxGraphicsStateDepth: this.document.limits.maxRecursionDepth,
+      signal,
       onRun: (run) => { emittedTextRuns.push(run); }
     });
     const textOperatorSink = {
@@ -1984,6 +1987,7 @@ class NativePageTextAccumulator {
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly glyphPrefixes: string[] = [];
   private readonly glyphTexts: string[] = [];
+  private readonly actualTextEndPositions = new Map<number, readonly [number, number]>();
   private readonly runSourcesWithDiagnostics = new WeakSet<object>();
   /** Every run slice of a Form shares its transform store; remap it once. */
   private readonly transformRemaps = new WeakMap<object, Uint32Array>();
@@ -2034,6 +2038,8 @@ class NativePageTextAccumulator {
       }
       this.glyphPrefixes.push("");
       this.glyphTexts.push("");
+      const endPosition = compilation.actualTextEndPositions?.get(index);
+      if (endPosition) this.actualTextEndPositions.set(glyphOffset + index, endPosition);
     }
     for (const run of compilation.runs) {
       this.runs.push(Object.freeze({ ...run, first: glyphOffset + run.first }));
@@ -2147,6 +2153,8 @@ class NativePageTextAccumulator {
     const gapBefore = compilation.glyphGapBefore?.length === total ? compilation.glyphGapBefore : null;
     const transformRemap = this.remapTransforms(compilation.transforms);
     for (let index = first; index < first + count; index += 1) {
+      const endPosition = compilation.actualTextEndPositions?.get(index);
+      if (endPosition) this.actualTextEndPositions.set(glyphOffset + index - first, endPosition);
       this.fontIndices.push(glyphs.fontIndices[index]);
       this.characterCodes.push(glyphs.characterCodes[index]);
       this.glyphIds.push(glyphs.glyphIds[index]);
@@ -2276,6 +2284,7 @@ class NativePageTextAccumulator {
         ...(this.hasCompleteGlyphGapBefore ? {
           glyphGapBefore: Uint8Array.from(this.glyphGapBefore)
         } : {}),
+        ...(this.actualTextEndPositions.size > 0 ? { actualTextEndPositions: new Map(this.actualTextEndPositions) } : {}),
         runs: Object.freeze([...this.runs]),
         diagnostics: Object.freeze([...this.diagnostics])
       }),
@@ -5853,9 +5862,12 @@ function buildInvocationOrderedTextIndex(
     const units = fontResources[compilation.glyphs.fontIndices[glyphIndex]]?.font.unitsPerEm ?? 1000;
     const vertical = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Vertical) !== 0;
     const advance = (widthEms?.[glyphIndex] ?? 0) * units;
+    const end = compilation.actualTextEndPositions?.get(glyphIndex);
     pens.push(matrix[4], matrix[5],
-      matrix[4] + (vertical ? matrix[2] : matrix[0]) * advance,
-      matrix[5] + (vertical ? matrix[3] : matrix[1]) * advance,
+      end ? outerTransform[0] * end[0] + outerTransform[2] * end[1] + outerTransform[4]
+        : matrix[4] + (vertical ? matrix[2] : matrix[0]) * advance,
+      end ? outerTransform[1] * end[0] + outerTransform[3] * end[1] + outerTransform[5]
+        : matrix[5] + (vertical ? matrix[3] : matrix[1]) * advance,
       Math.hypot(matrix[2] * units, matrix[3] * units));
     gapBefore.push(gaps?.[glyphIndex] ?? 0);
     return occurrence;
@@ -7337,6 +7349,12 @@ async function loadMarkedContentProperties(
       ? undefined
       : await document.resolveValue(property.propertyList.get("MCID"), signal);
     let mcid = -1;
+    const actualTextValue = property.propertyList === null
+      ? undefined
+      : await document.resolveValue(property.propertyList.get("ActualText"), signal);
+    if (actualTextValue !== undefined && actualTextValue !== null && !isPdfString(actualTextValue)) {
+      throw new PdfError("invalid-object", `Marked-content property /${property.name} has an invalid /ActualText.`);
+    }
     if (mcidValue !== undefined && mcidValue !== null) {
       if (!Number.isSafeInteger(mcidValue) || (mcidValue as number) < 0) {
         throw new PdfError(
@@ -7351,6 +7369,7 @@ async function loadMarkedContentProperties(
       optionalContentIndex: property.membershipIndex ?? -1,
       defaultVisible: property.defaultVisible,
       mcid,
+      ...(isPdfString(actualTextValue) ? { actualText: actualTextValue.bytes } : {}),
       unresolvedOptionalContent: property.propertyList === null && optionalNames.has(property.name)
     }));
   }

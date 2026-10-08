@@ -178,6 +178,8 @@ assert.equal(compiledSuppressedText.glyphs.glyphIds.length, 1, "the painted glyp
 assert.equal(compiledSuppressedText.textIndex.text, "", "no replacement character is invented");
 assert.deepEqual([...compiledSuppressedText.textIndex.charGlyphIndices], []);
 
+testActualText();
+
 const sfnt = NativeSfntFont.parse(buildTinySfnt());
 assert.equal(sfnt.unitsPerEm, 1000);
 assert.equal(sfnt.mapCodePoint(65), 1);
@@ -198,6 +200,67 @@ await testStandard14AdvanceMetrics();
 
 console.log("native font/text tests passed");
 hooks.deregister();
+
+function testActualText() {
+  const fonts = new Map([["F1", { font: simpleFont, fontIndex: 3 }]]);
+  assert.equal(simpleFont.decode(Uint8Array.of(31)).unicode, null);
+  const compile = (replacement) => {
+    const compiler = new NativeTextCompiler({ fonts });
+    compiler.beginText();
+    compiler.setFont("F1", 10);
+    if (replacement !== null) compiler.beginMarkedText(replacement);
+    compiler.showAdjustedText([Uint8Array.of(65, 31), -100, Uint8Array.of(66)]);
+    if (replacement !== null) compiler.endMarkedText();
+    compiler.endText();
+    return compiler.build();
+  };
+  const original = compile(null);
+  const replaced = compile(Uint8Array.of(0xfe, 0xff, 0x09, 0x32, 0x09, 0x3f, 0x09, 0x02));
+  assert.equal(replaced.textIndex.text, "लिं");
+  assert.deepEqual([...replaced.textIndex.charGlyphIndices], [0, 0, 0]);
+  assert.deepEqual(replaced.glyphs, original.glyphs, "replacement text does not change painted glyphs or advances");
+  assert.deepEqual(replaced.transforms, original.transforms);
+  assert.deepEqual(replaced.runs, original.runs);
+  assert(original.diagnostics.some(({ code }) => code === "font.missing-unicode-mapping"));
+  assert.equal(replaced.diagnostics.length, 0, "authoritative text needs no per-glyph Unicode fallback");
+  assert.equal(compile(new Uint8Array()).textIndex.text, "", "empty ActualText suppresses extraction, retaining paint");
+  assert.equal(compile(Uint8Array.of(0x80, 0x93)).textIndex.text, "•ﬁ", "PDFDocEncoding is used without a BOM");
+  assert.equal(compile(Uint8Array.of(0xff, 0xfe, 0x3d, 0xd8, 0, 0xde)).textIndex.text, "😀");
+  assert.equal(compile(Uint8Array.of(0xef, 0xbb, 0xbf, ...encoder.encode("😀"))).textIndex.text, "😀");
+  assert.equal(compile(Uint8Array.of(0xfe, 0xff, 0xfe, 0xff, 0, 65)).textIndex.text, "\ufeffA", "only the encoding BOM is removed");
+  const malformed = compile(Uint8Array.of(0xfe, 0xff, 0xd8, 0));
+  assert.equal(malformed.textIndex.text, "\ufffd");
+  assert.deepEqual(malformed.diagnostics.map(({ code }) => code), ["text.invalid-actual-text"]);
+
+  const nested = new NativeTextCompiler({ fonts });
+  nested.beginText(); nested.setFont("F1", 10);
+  nested.showText(Uint8Array.of(65));
+  nested.moveText(0, -20);
+  nested.beginMarkedText(encoder.encode("outer"));
+  nested.beginMarkedText();
+  nested.showText(Uint8Array.of(31));
+  nested.beginMarkedText(encoder.encode("inner"));
+  nested.showText(Uint8Array.of(31));
+  nested.endMarkedText(); nested.endMarkedText(); nested.endMarkedText();
+  nested.showText(Uint8Array.of(31));
+  nested.endText();
+  const compiled = nested.build();
+  assert.equal(compiled.textIndex.text, "Ω\nouter\ufffd", "outer replacement is emitted once and preserves its leading separator");
+  assert.equal(compiled.diagnostics.length, 1, "unmapped glyphs outside ActualText still warn");
+
+  const bounded = new NativeTextCompiler({ fonts, maxTextCodeUnits: 2, maxGraphicsStateDepth: 1 });
+  assert.throws(() => bounded.beginMarkedText(encoder.encode("long")), error => error.code === "resource-limit");
+  bounded.beginMarkedText();
+  assert.throws(() => bounded.beginMarkedText(), error => error.code === "resource-limit");
+  assert.throws(() => bounded.build(), error => error.code === "unsupported-content");
+  bounded.endMarkedText();
+  assert.throws(() => bounded.endMarkedText(), error => error.code === "unsupported-content");
+  const abort = new AbortController();
+  const cancelled = new NativeTextCompiler({ fonts, signal: abort.signal });
+  cancelled.beginMarkedText(encoder.encode("text"));
+  abort.abort();
+  assert.throws(() => cancelled.endMarkedText(), error => error.code === "aborted");
+}
 
 async function testEmbeddedObsoleteCompoundFlag() {
   const dictionary = new Map([

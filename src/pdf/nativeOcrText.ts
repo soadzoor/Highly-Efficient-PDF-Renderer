@@ -5,7 +5,7 @@ import { prepareNativeInlineImages } from "./nativeInlineImage";
 import { NativeTextCompiler, type NativeTextFontResource } from "./nativeText";
 import { buildNativeVectorPage } from "./nativeVectorPage";
 import { computeNativePdfPageGeometry } from "./nativePageGeometry";
-import { isPdfName, isPdfStream, type PdfDictionary, type PdfValue } from "./nativeCos";
+import { isPdfDictionary, isPdfName, isPdfStream, isPdfString, type PdfDictionary, type PdfValue } from "./nativeCos";
 import { PdfError, type PdfDiagnostic } from "./nativeTypes";
 import type { NativePdfDocument } from "./nativeDocument";
 import type { NativeOptionalContentRegistry } from "./nativeOptionalContent";
@@ -82,18 +82,27 @@ export async function compileNativeOcrTextPage(document: NativePdfDocument, sour
       signal.throwIfAborted();
       if (operator === "BMC" || operator === "BDC") {
         let ownVisible = true;
-        if (operator === "BDC" && operands[0] === "OC") {
+        let actualText: Uint8Array | undefined;
+        if (operator === "BDC") {
           const properties = resources.get("Properties");
           const value = typeof operands[1] === "string" && properties
             ? (await document.resolveDictionary(properties, signal)).get(operands[1])
             : property;
-          ownVisible = value ? (await optionalContent.resolvePropertyValue(value, signal))?.defaultVisible ?? true : true;
+          if (operands[0] === "OC") {
+            ownVisible = value ? (await optionalContent.resolvePropertyValue(value, signal))?.defaultVisible ?? true : true;
+          }
+          const definition = await document.resolveValue(value, signal);
+          const replacement = isPdfDictionary(definition)
+            ? await document.resolveValue(definition.get("ActualText"), signal) : undefined;
+          if (isPdfString(replacement)) actualText = replacement.bytes;
         }
         if (visible.length > document.limits.maxRecursionDepth) throw new PdfError("resource-limit", "OCR marked-content nesting exceeds the page limit.");
         visible.push(visible.at(-1)! && ownVisible);
+        if (actualText) emit("BDC", ["Span", new Map([["ActualText", actualText]])]);
+        else emit("BMC", ["Span"]);
         continue;
       }
-      if (operator === "EMC") { if (visible.length === 1) throw new PdfError("invalid-object", "Unbalanced OCR marked content."); visible.pop(); continue; }
+      if (operator === "EMC") { if (visible.length === 1) throw new PdfError("invalid-object", "Unbalanced OCR marked content."); visible.pop(); emit("EMC"); continue; }
       if (operator === "Tf") {
         const [resource] = await registry.loadScope(resources, [String(operands[0])], signal, { label: "OCR text", allowType3: true });
         emit("Tf", [alias(resource[1]), operands[1]]);
@@ -139,9 +148,11 @@ export async function compileNativeOcrTextPage(document: NativePdfDocument, sour
     page.resources ? await document.resolveDictionary(page.resources, signal) : new Map(), 0);
   const maxGlyphs = options.limits?.maxGlyphsPerPage ?? document.limits.maxGlyphsPerPage;
   const runs: import("./nativeText").NativeTextDrawRun[] = [];
-  const compiler = new NativeTextCompiler({ fonts, initialTransform: pageMatrix, maxGlyphs, signal, onRun: run => runs.push(run) });
+  const compiler = new NativeTextCompiler({ fonts, initialTransform: pageMatrix, maxGlyphs,
+    maxGraphicsStateDepth: document.limits.maxRecursionDepth, signal, onRun: run => runs.push(run) });
   const compiled = await compileGroupedVectorPageContent(new TextEncoder().encode(text.join("")), {
     pageMatrix, pageBounds, signal, enableSegmentMerge: false, enableInvisibleCull: false,
+    maxMarkedContentDepth: document.limits.maxRecursionDepth,
     markedContentProperties: new Map([["OCRHidden", { resourceName: "OCRHidden", optionalContentIndex: 0, defaultVisible: false, mcid: -1 }]]),
     textOperatorSink: { applyOperator(operator, operands, context) {
       runs.length = 0;
@@ -171,6 +182,7 @@ function serializeOperand(value: unknown): string {
   if (typeof value === "string") return `/${value}`; // Generated font aliases only.
   if (value instanceof Uint8Array) return `<${Array.from(value, byte => byte.toString(16).padStart(2, "0")).join("")}>`;
   if (Array.isArray(value)) return `[${value.map(serializeOperand).join(" ")}]`;
+  if (value instanceof Map) return `<< ${[...value].map(([key, entry]) => `/${key} ${serializeOperand(entry)}`).join(" ")} >>`;
   throw new PdfError("invalid-object", "Invalid OCR text operand.");
 }
 

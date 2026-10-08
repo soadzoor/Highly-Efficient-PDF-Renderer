@@ -758,6 +758,18 @@ function validateTextInputs(
         "legacy-vector-text-gap");
     }
   }
+  if (compilation.actualTextEndPositions !== undefined) {
+    if (!(compilation.actualTextEndPositions instanceof Map)) {
+      throw invalid("Native text has invalid ActualText pen positions.", pageIndex, "legacy-vector-actual-text");
+    }
+    for (const [glyph, position] of compilation.actualTextEndPositions) {
+      throwIfAborted(signal);
+      if (!Number.isSafeInteger(glyph) || glyph < 0 || glyph >= glyphCount ||
+          !Array.isArray(position) || position.length !== 2 || !position.every(Number.isFinite)) {
+        throw invalid("Native text has an invalid ActualText pen position.", pageIndex, "legacy-vector-actual-text");
+      }
+    }
+  }
 
   const fonts = new Array<NativePdfFont | undefined>(resources.length);
   for (const resource of resources) {
@@ -1433,8 +1445,9 @@ function convertTextIndex(
     const penStartX = matrix[4];
     const penStartY = matrix[5];
     const advanceUnits = advanceEm * units;
-    const penEndX = penStartX + (vertical ? matrix[2] : matrix[0]) * advanceUnits;
-    const penEndY = penStartY + (vertical ? matrix[3] : matrix[1]) * advanceUnits;
+    const endPosition = compilation.actualTextEndPositions?.get(reference);
+    const penEndX = endPosition?.[0] ?? penStartX + (vertical ? matrix[2] : matrix[0]) * advanceUnits;
+    const penEndY = endPosition?.[1] ?? penStartY + (vertical ? matrix[3] : matrix[1]) * advanceUnits;
     const emHeight = Math.hypot(matrix[2] * units, matrix[3] * units);
     const instance = glyphToInstance[reference];
     const quad = instance < 0
