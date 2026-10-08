@@ -97,9 +97,10 @@ export async function readHepStructure(archive: HepArchive, descriptor: unknown,
   }
   cursor.expectEnd(HEP_CONTENT_RANGES_PATH);
   if (total !== meta.rangeCount) mismatch();
-  const candidate: VectorScene = { ...scene,
+  // Structure validation must preserve packed scans' lazy RGBA compatibility getters.
+  const candidate = Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)), {
     markedContent: data.items.length || total ? { items: data.items, ranges } : undefined,
-    structureElements: data.elements.length ? data.elements : undefined };
+    structureElements: data.elements.length ? data.elements : undefined }) as VectorScene;
   validateSceneStructure(candidate);
   if (candidate.markedContent) scene.markedContent = candidate.markedContent;
   if (candidate.structureElements) scene.structureElements = candidate.structureElements;

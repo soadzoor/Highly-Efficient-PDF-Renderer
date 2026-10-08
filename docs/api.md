@@ -1054,6 +1054,11 @@ Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterI
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
 
+Monochrome layers always save lossless packed one-bit rows and their two-color
+RGBA palette, including when `encodeRasterImages` is false. They bypass PNG/WebP
+encoding and reload without expanding RGBA. These exports use scene schema v10;
+other scenes still use v9, and the current loader accepts both.
+
 PDF-source builds measure the original PDF automatically. Scenes loaded through
 HEPR carry that size, and HEP exports record it for later re-export. For a custom
 scene or an older HEP, supply `sourcePdfByteLength` (a positive safe integer) to

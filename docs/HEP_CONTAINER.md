@@ -1,12 +1,14 @@
 # HEP container versions 1 and 2
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1** and **2** wrap **scene schema version 9**, recorded in
+versions **1** and **2** wrap **scene schema version 9 or 10**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support both container versions and require scene v9; files using older
-scene schemas must be regenerated from their original PDF. Container repacking preserves section bytes and does not upgrade a
-scene or restore omitted layers.
+Readers support both container versions and scene v9/v10; files using older
+scene schemas must be regenerated from their original PDF. Writers use scene
+v10 when packed monochrome raster layers are present, otherwise v9. A v9-only
+reader needs an update to open v10. Container repacking preserves section bytes
+and does not upgrade a scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
 There are no directory records, timestamps, encryption, ZIP structures, or
@@ -201,7 +203,7 @@ decimal text.
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
 | `drawRuns` | `{file, count}` | `geometry/draw-runs.varint` |
 | `paintGraph` | `{file, rootCount}` | `geometry/paint-graph.varint` |
-| `rasterLayers` (v9) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
+| `rasterLayers` (v9/v10) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
 the signed mapping. `geometry/clip-paths.d512` holds `pathCount`, then per path
@@ -240,7 +242,8 @@ cell back into that layer's own straight-alpha RGBA; atlases never reach the GPU
 `geometry/raster-layers.varint` holds `atlasCount`, then per atlas an encoding
 byte (0 raw RGBA8, 1 PNG), `width` and `height`. Then `layerCount` and per layer
 a flags byte (bits 0-1 storage: 0 raw RGBA8, 1 PNG, 2 WebP, 3 atlas cell; bit 2
-opacity present; bits 3-7 zero), `width`, `height`, and zigzag deltas of
+opacity present; in v10 bit 3 selects packed monochrome with bits 0-1 zero;
+bits 4-7 zero), `width`, `height`, and zigzag deltas of
 `paintOrder` and `pageIndex` against the previous layer. An atlas cell follows
 with its atlas index and zigzag `x` and `y`, relative to the previous cell's right
 edge and row when that cell is in the same atlas and to zero otherwise; the cell
@@ -259,7 +262,29 @@ cost, needs at most half the bytes of its lossless form, as photographs do.
 Atlases are shelf-packed in layer order, at most 2,048 texels square, and stored
 losslessly, since lossy blocks would bleed between unrelated cells; a single
 candidate stays standalone. Readers accept up to 262,144 layers and 4,096 image
-sections, and count decoded atlases and cropped cells toward the texel budget.
+sections, and count decoded atlases and cropped cells as RGBA toward the memory
+budget.
+
+Scene v10 adds `raster/layer-N.mono`: eight palette bytes (straight-alpha RGBA8
+for zero bits, then one bits), followed by exactly `ceil(width / 8) * height`
+MSB-first packed bytes. Each row is independently byte-padded; padding bits are
+preserved. Dimensions come from the layer record. The ordinary container
+DEFLATE compresses this section; PNG/WebP encoders, RGBA expansion, and atlas
+packing are bypassed. Both palette alpha values, opacity, transforms, paint
+order, pages, and full-resolution pixels remain lossless. The section stores
+canonical pixels; GPU display derivatives are rebuilt when needed. Optional
+decoded JBIG2 symbol caches are omitted. Reloading retains packed rows with lazy
+RGBA access for consumers that require it.
+
+Packed layers count their palette and packed bytes toward the same 1 GiB
+aggregate raster memory limit. Traditional layers retain RGBA accounting;
+per-image texel and dimension limits still apply to both representations.
+Indexed section lengths are checked against dimensions before decompression.
+For a 2,480 by 3,506 scan this reduces the uncompressed pixel section from
+34,779,520 RGBA bytes to 1,086,868 bytes including the palette. Compressed size
+depends on the scan; packed DEFLATE does not promise the same ratio as the
+original JBIG2 stream. The existing requirement that an exported HEP be smaller
+than its source PDF still applies.
 
 ### Text glyph outlines and origins
 
@@ -360,8 +385,8 @@ MSB first and each row padded to `ceil(width / 8)` bytes. Eight-bit DeviceGray
 sources stay `Gray8`, or `GrayAlpha8` when a color-key Mask needs alpha. Native
 WebGL and WebGPU renderers upload binary images as packed R8 bytes and separate
 R8 coverage mipmaps; consumers requiring RGBA widen the pixels on demand.
-The existing scene raster storage encodings remain unchanged, and decoded
-images with at most two exact RGBA colors can recover packed GPU storage.
+Scene v10 raster layers retain packed bits directly; decoded v9 images with at
+most two exact RGBA colors can recover packed GPU storage.
 Grayscale soft masks are stored once rather than as three redundant channels.
 Replay is driven only by an optional-content change, so
 an exporter writes `scene.retainedPages` and its retained paint-graph leaves

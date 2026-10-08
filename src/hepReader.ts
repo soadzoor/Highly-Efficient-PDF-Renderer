@@ -44,6 +44,8 @@ import {
   inspectRasterImage,
   rasterImageEncodingFromPath
 } from "./rasterImageCodec";
+import { decodeHepMonochromeRaster, hepMonochromeRasterByteLength } from "./hepMonochromeRaster";
+import { createMonochromeRasterLayer } from "./monochromeRaster";
 import {
   SCENE_RASTER_LAYERS_PATH,
   copyRasterRect,
@@ -65,6 +67,7 @@ import {
 } from "./parsedDataVarint";
 import {
   PARSED_DATA_FORMAT_VERSION,
+  PARSED_DATA_MONOCHROME_FORMAT_VERSION,
   readTexturePayloadAsFloat32,
   readNonNegativeInt,
   preparedStrokeGeometry,
@@ -97,7 +100,7 @@ const MAX_PARSED_RASTER_DIMENSION = 16_384;
 const MAX_PARSED_RASTER_TEXELS_PER_LAYER = 134_217_728;
 const MAX_PARSED_RASTER_PAYLOAD_BYTES = 768 * 1024 * 1024;
 const MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES = 1024 * 1024 * 1024;
-const MAX_PARSED_RASTER_TOTAL_TEXELS = 2 * MAX_PARSED_RASTER_TEXELS_PER_LAYER;
+const MAX_PARSED_RASTER_TOTAL_DECODED_BYTES = 8 * MAX_PARSED_RASTER_TEXELS_PER_LAYER;
 const MAX_PARSED_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 async function readSceneTextIndexFromParsedData(archive: HepArchive, manifest: ParsedDataManifest): Promise<SceneTextIndex | null> {
@@ -472,9 +475,10 @@ async function loadSceneFromHepInternal(
     throw new Error(`Invalid manifest.json: ${message}`);
   }
 
-  if (manifest.formatVersion !== PARSED_DATA_FORMAT_VERSION) {
+  if (manifest.formatVersion !== PARSED_DATA_FORMAT_VERSION &&
+      manifest.formatVersion !== PARSED_DATA_MONOCHROME_FORMAT_VERSION) {
     throw new Error(
-      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}. Re-export the HEP file with the current version.`
+      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION} or v${PARSED_DATA_MONOCHROME_FORMAT_VERSION}. Re-export the HEP file with the current version.`
     );
   }
 
@@ -745,7 +749,7 @@ async function loadSceneFromHepInternal(
   validateNativeGradientResources(nativeGradientResources, pageCount);
   progress.report(0.82, { stage: "hep-section", sourceType: "hep", unit: "sections" });
   signal?.throwIfAborted();
-  const rasterLayers = await readRasterLayersFromParsedData(archive, sceneMeta, signal);
+  const rasterLayers = await readRasterLayersFromParsedData(archive, sceneMeta, manifest.formatVersion, signal);
   signal?.throwIfAborted();
   for (const layer of rasterLayers) {
     if (layer.pageIndex >= pageCount) {
@@ -838,7 +842,7 @@ async function loadSceneFromHepInternal(
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    rasterLayerData: primaryRasterLayer?.monochrome ? new Uint8Array(0) : primaryRasterLayer?.data ?? new Uint8Array(0),
     rasterLayerMatrix: primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     endpoints,
     primitiveMeta,
@@ -862,6 +866,13 @@ async function loadSceneFromHepInternal(
     discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
     discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
   });
+  if (primaryRasterLayer?.monochrome) {
+    Object.defineProperty(scene, "rasterLayerData", {
+      enumerable: true,
+      configurable: true,
+      get: () => primaryRasterLayer.data
+    });
+  }
   if (sceneMeta.pagePrimitiveRanges !== undefined) {
     const ranges = sceneMeta.pagePrimitiveRanges;
     if (!Array.isArray(ranges) || ranges.length !== scene.pageRects.length / 4 * 12 ||
@@ -1268,6 +1279,7 @@ const MAX_RASTER_RECORD_BYTES = 80;
 async function readRasterLayersFromParsedData(
   archive: HepArchive,
   sceneMeta: ParsedDataSceneEntry,
+  formatVersion: number,
   signal?: AbortSignal
 ): Promise<RasterLayer[]> {
   if (sceneMeta.rasterLayers === undefined) {
@@ -1292,6 +1304,9 @@ async function readRasterLayersFromParsedData(
   if (table.layers.length !== count || table.atlases.length !== atlasCount) {
     throw new Error("Scene raster layers do not match their manifest entry.");
   }
+  if (formatVersion !== PARSED_DATA_MONOCHROME_FORMAT_VERSION && table.layers.some(layer => layer.storage === "mono")) {
+    throw new Error("Packed monochrome raster layers require HEP scene format v10.");
+  }
   validateRasterLayerBudgets(archive, table);
 
   // Decode an atlas when its first cell is needed and release it after its last.
@@ -1304,6 +1319,20 @@ async function readRasterLayersFromParsedData(
   for (let i = 0; i < table.layers.length; i += 1) {
     signal?.throwIfAborted();
     const record = table.layers[i];
+    const base = {
+      width: record.width,
+      height: record.height,
+      matrix: record.matrix,
+      paintOrder: record.paintOrder,
+      pageIndex: record.pageIndex,
+      ...(record.opacity === undefined ? {} : { opacity: record.opacity })
+    };
+    if (record.storage === "mono") {
+      const bytes = await archive.file(rasterLayerFile(i, "mono"))!.async("uint8array");
+      signal?.throwIfAborted();
+      layers.push(createMonochromeRasterLayer(base, decodeHepMonochromeRaster(bytes, record.width, record.height)));
+      continue;
+    }
     let data: Uint8Array;
     if (record.storage === "atlas") {
       const cell = record.cell!;
@@ -1321,15 +1350,7 @@ async function readRasterLayersFromParsedData(
       data = await readRasterImageSection(archive, rasterLayerFile(i, record.storage), record.width, record.height);
       signal?.throwIfAborted();
     }
-    layers.push({
-      width: record.width,
-      height: record.height,
-      matrix: record.matrix,
-      data,
-      paintOrder: record.paintOrder,
-      pageIndex: record.pageIndex,
-      ...(record.opacity === undefined ? {} : { opacity: record.opacity })
-    });
+    layers.push({ ...base, data });
   }
 
   return layers;
@@ -1379,19 +1400,20 @@ async function readRasterImageSection(
 /**
  * Bound raster allocation using index sizes before inflating or decoding any
  * section. HEP files may come from untrusted drag-and-drop input. Decoded
- * atlases and the layers cropped from them both count toward the texel budget.
+ * atlases and cropped layers count as RGBA; monochrome layers count their exact
+ * packed bytes and palette, while retaining the per-image dimension/texel limits.
  */
 function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable): void {
   let sectionCount = 0;
   let totalPayloadBytes = 0;
-  let totalTexels = 0;
-  const addTexels = (texels: number, label: string): void => {
+  let totalDecodedBytes = 0;
+  const addTexels = (texels: number, label: string, decodedBytes = texels * 4): void => {
     if (texels > MAX_PARSED_RASTER_TEXELS_PER_LAYER) {
       throw new Error(`${label} exceeds the per-image texel budget.`);
     }
-    totalTexels += texels;
+    totalDecodedBytes += decodedBytes;
   };
-  const addSection = (path: string, texels: number, label: string): void => {
+  const addSection = (path: string, rawBytes: number, label: string): void => {
     const archiveEntry = archive.file(path);
     if (!archiveEntry) {
       throw new Error(`HEP file is missing ${label.toLowerCase()}: ${path}.`);
@@ -1400,7 +1422,7 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
     if (byteLength === null || byteLength > MAX_PARSED_RASTER_PAYLOAD_BYTES) {
       throw new Error(`${label} HEP section size is invalid or exceeds the memory budget.`);
     }
-    if (rasterImageEncodingFromPath(path) === null && byteLength !== texels * 4) {
+    if (rasterImageEncodingFromPath(path) === null && byteLength !== rawBytes) {
       throw new Error(`${label} raw byte length does not match its metadata.`);
     }
     sectionCount += 1;
@@ -1409,13 +1431,14 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
   table.atlases.forEach((atlas, index) => {
     const texels = atlas.width * atlas.height;
     addTexels(texels, `Raster atlas ${index}`);
-    addSection(rasterAtlasFile(index, atlas.encoding), texels, `Raster atlas ${index}`);
+    addSection(rasterAtlasFile(index, atlas.encoding), texels * 4, `Raster atlas ${index}`);
   });
   table.layers.forEach((layer, index) => {
     const texels = layer.width * layer.height;
-    addTexels(texels, `Raster layer ${index}`);
+    const decodedBytes = layer.storage === "mono" ? hepMonochromeRasterByteLength(layer.width, layer.height) : texels * 4;
+    addTexels(texels, `Raster layer ${index}`, decodedBytes);
     if (layer.storage !== "atlas") {
-      addSection(rasterLayerFile(index, layer.storage), texels, `Raster layer ${index}`);
+      addSection(rasterLayerFile(index, layer.storage), decodedBytes, `Raster layer ${index}`);
     }
   });
   if (sectionCount > MAX_PARSED_RASTER_SECTION_COUNT) {
@@ -1423,7 +1446,7 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
       `Parsed data contains ${sectionCount} raster sections; the limit is ${MAX_PARSED_RASTER_SECTION_COUNT}.`
     );
   }
-  if (totalPayloadBytes > MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES || totalTexels > MAX_PARSED_RASTER_TOTAL_TEXELS) {
+  if (totalPayloadBytes > MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES || totalDecodedBytes > MAX_PARSED_RASTER_TOTAL_DECODED_BYTES) {
     throw new Error("Parsed data raster payloads exceed the aggregate memory budget.");
   }
 }

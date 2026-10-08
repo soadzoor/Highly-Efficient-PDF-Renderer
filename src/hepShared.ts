@@ -45,6 +45,8 @@ import type {
  * origins from their advances; see docs/HEP_CONTAINER.md.
  */
 export const PARSED_DATA_FORMAT_VERSION = 9;
+/** Packed monochrome raster sections extend the otherwise unchanged v9 scene. */
+export const PARSED_DATA_MONOCHROME_FORMAT_VERSION = 10;
 export const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 export const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 export const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";

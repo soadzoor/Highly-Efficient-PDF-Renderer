@@ -20,7 +20,7 @@ export interface HepEncodingOptions extends HepLodOptions {
   /** Original PDF byte length; omit optional LODs or reject exports that cannot be strictly smaller. */
   sourcePdfByteLength?: number;
 
-  /** Encode raster layers as WebP/PNG when supported; otherwise store raw RGBA. @default true */
+  /** Encode color rasters as WebP/PNG when supported. Monochrome layers always retain packed bits. @default true */
   encodeRasterImages?: boolean;
 
   /** HEP compression algorithm. @default "deflate" */

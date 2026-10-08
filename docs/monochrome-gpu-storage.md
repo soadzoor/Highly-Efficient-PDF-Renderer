@@ -86,6 +86,12 @@ endpoints across rows. The resulting texture bytes and raster target are
 unchanged. Reduced-tier worker inputs omit unused JBIG2 dictionaries; full-tier
 outputs release those dictionaries after compact encoding.
 
+HEP downloads retain the canonical packed pixels and two-color RGBA palette in
+scene v10 monochrome sections, compressed by the container. Export skips RGBA
+expansion and PNG/WebP encoding for these layers. Reloading keeps packed storage
+and generates GPU derivatives as needed; palettes, alpha, row padding, and zoom
+detail remain exact. See [HEP container format](HEP_CONTAINER.md).
+
 The all-pages trial targets `C:\Users\soadz\Desktop\TIKA\TIKA-2848-1.pdf`.
 Lightweight inspection of direct PDF dictionaries found 614 pages and 614
 1-bit DeviceGray/JBIG2 scans, approximately 641 MiB of packed base pixels.

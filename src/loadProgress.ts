@@ -284,7 +284,7 @@ export function formatLoadProgressStage(stage: PDFLoadStage | undefined): string
     case "hep-section":
       return "Decoding HEP";
     case "raster-encode":
-      return "Compressing raster images";
+      return "Preparing raster data";
     case "hep-build":
       return "Building HEP";
     case "vector-lod":

@@ -28,6 +28,7 @@ export const fastTests = [
   "annotation-ui-interaction",
   "structure-content",
   "hep-scene-sections",
+  "hep-monochrome-raster",
   "optional-content",
   "retained-page-replay",
   "retained-page-compositor",
