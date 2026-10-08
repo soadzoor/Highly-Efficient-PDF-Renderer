@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-08T11:14:24.192Z",
+  "generatedAt": "2026-10-08T19:48:28.558Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
@@ -255,6 +255,54 @@
       "hep": {
         "path": "examples/heps/thesis-parsed-data.hep",
         "sizeBytes": 1537524
+      }
+    },
+    {
+      "id": "tika_2848_1",
+      "name": "TIKA-2848-1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/TIKA-2848-1-parsed-data.hep",
+        "sizeBytes": 74572040
+      },
+      "pdf": {
+        "path": "examples/pdfs/TIKA-2848-1.pdf",
+        "sizeBytes": 50479587
+      },
+      "hep": {
+        "path": "examples/heps/TIKA-2848-1-parsed-data.hep",
+        "sizeBytes": 74570964
+      }
+    },
+    {
+      "id": "tika_2848_2",
+      "name": "TIKA-2848-2.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/TIKA-2848-2-parsed-data.hep",
+        "sizeBytes": 7882292
+      },
+      "pdf": {
+        "path": "examples/pdfs/TIKA-2848-2.pdf",
+        "sizeBytes": 10181637
+      },
+      "hep": {
+        "path": "examples/heps/TIKA-2848-2-parsed-data.hep",
+        "sizeBytes": 7346272
+      }
+    },
+    {
+      "id": "tika_3212_1",
+      "name": "TIKA-3212-1.pdf",
+      "hepLod": {
+        "path": "examples/heps-lod/TIKA-3212-1-parsed-data.hep",
+        "sizeBytes": 2750408
+      },
+      "pdf": {
+        "path": "examples/pdfs/TIKA-3212-1.pdf",
+        "sizeBytes": 9442451
+      },
+      "hep": {
+        "path": "examples/heps/TIKA-3212-1-parsed-data.hep",
+        "sizeBytes": 2563600
       }
     },
     {
