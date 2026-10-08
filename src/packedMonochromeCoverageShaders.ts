@@ -63,11 +63,11 @@ fn heprCoverageBilinear(image: texture_2d<f32>, size: vec2i, offset: i32, uv: ve
 export const PACKED_COVERAGE_TRILINEAR_WGSL = /* wgsl */ `
 fn heprPackedCoverage(image: texture_2d<f32>, baseSize: vec2i, uv: vec2f, lod: f32) -> f32 {
   let level = clamp(lod, 0.0, max(0.0, floor(log2(f32(max(baseSize.x, baseSize.y)))) - 1.0));
-  let target = i32(floor(level));
+  let targetLevel = i32(floor(level));
   var size = max(vec2i(1), baseSize / vec2i(2));
   var offset = 0;
   for (var i = 0; i < 32; i++) {
-    if (i == target) {
+    if (i == targetLevel) {
       let first = heprCoverageBilinear(image, size, offset, uv);
       let fraction = fract(level);
       if (fraction == 0.0) { return first; }
