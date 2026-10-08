@@ -512,7 +512,7 @@ function makeRenderer(backend = "webgpu") {
     coordinateSystem: backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem,
     target: new THREE.RenderTarget(7, 9), viewport: new THREE.Vector4(3, 4, 17, 19),
     scissor: new THREE.Vector4(5, 6, 11, 13), scissorTest: true, clearColor: new THREE.Color(0.2, 0.3, 0.4),
-    clearAlpha: 0.7, autoClear: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], clears: [], targets: [], fail: false,
+    clearAlpha: 0.7, autoClear: true, sortObjects: true, xr: { enabled: true }, cube: 2, mip: 1, draws: [], clears: [], targets: [], fail: false,
     // WebGPURenderer's lighting manager; WebGLRenderer has none.
     ...(backend === "webgpu" ? { lighting: { enabled: true } } : {}), litRenders: 0,
     getRenderTarget() { return this.target; },
@@ -525,6 +525,7 @@ function makeRenderer(backend = "webgpu") {
     setClearColor(color, alpha) { this.clearColor.copy(color); this.clearAlpha = alpha; },
     clear() { this.clears.push({ scissorTest: this.target.scissorTest, scissor: this.target.scissor.toArray() }); },
     render(scene, camera) {
+      assert.equal(this.sortObjects, false, "private compositor draws skip redundant host sorting");
       this.call = (this.call ?? 0) + 1;
       // Mirrors Renderer._updateCamera: the first render whose coordinate
       // system differs from the camera's rebuilds the projection. The abstract
@@ -540,7 +541,7 @@ function makeRenderer(backend = "webgpu") {
       assert.equal(this.scissorTest, this.target.scissorTest, "WebGPU also needs the renderer scissor-test flag");
       // Like Three: meshes draw in render order, each between its own hooks,
       // which is where the compositor applies a batched mesh's state.
-      for (const mesh of [...scene.children].sort((a, b) => a.renderOrder - b.renderOrder)) {
+      for (const mesh of scene.children) {
         mesh.onBeforeRender(this, scene, camera, mesh.geometry, mesh.material, null);
         this.onMesh?.(mesh);
         const ids = mesh.geometry.getAttribute("aSegmentIndex");
@@ -723,7 +724,7 @@ async function testGradientMaskFolding(ThreePaintCompositor, backend) {
 function snapshot(renderer) {
   return { target: renderer.target.uuid, viewport: renderer.viewport.toArray(), scissor: renderer.scissor.toArray(),
     scissorTest: renderer.scissorTest, color: renderer.clearColor.toArray(), alpha: renderer.clearAlpha,
-    autoClear: renderer.autoClear, xr: renderer.xr.enabled, lighting: renderer.lighting?.enabled,
+    autoClear: renderer.autoClear, sortObjects: renderer.sortObjects, xr: renderer.xr.enabled, lighting: renderer.lighting?.enabled,
     cube: renderer.cube, mip: renderer.mip };
 }
 

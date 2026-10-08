@@ -17,6 +17,7 @@ try {
       const compositor = new ThreePaintCompositor(backend, webGpu);
       const host = makeHost(compositor);
       compositor.render(host, scene, [mesh], 64, 64, () => true);
+      assert.equal(host.sortObjects, true, "private draws restore the host's sorting setting");
       assert.deepEqual(host.contents.get(compositor.output.texture), expected,
         `${backend}: deferred groups preserve the destination's paint order, transparent=${transparent}`);
       if (!transparent) assert.equal(host.renders, 5,
@@ -33,10 +34,15 @@ try {
       assert.throws(() => compositor.render(host, scene, [mesh], 64, 64, () => true), /synthetic draw failure/);
       assert.equal(compositor.batches.size, 0, "a failed frame abandons every surface batch");
       assert.equal(host.target, null, "a failed frame restores the host target");
+      assert.equal(host.sortObjects, true, "a failed private draw restores host sorting");
       host.fail = false;
       compositor.render(host, scene, [mesh], 64, 64, () => true);
       assert.deepEqual(host.contents.get(compositor.output.texture), expected, "the next frame recovers after a failed render");
       assert.equal(new Set(compositor.pool).size, compositor.pool.length, "failure does not recycle the same surface twice");
+      host.sortObjects = false;
+      compositor.render(host, scene, [mesh], 64, 64, () => true);
+      assert.equal(host.sortObjects, false, "a host that disabled sorting keeps that setting");
+      assert.deepEqual(host.contents.get(compositor.output.texture), expected);
       compositor.dispose(); mesh.geometry.dispose(); mesh.material.dispose();
     }
 
@@ -96,7 +102,7 @@ function fixture(createEmptyVectorScene, groups, transparent) {
 // its input, and an isolated source-over pass appends its group's paints.
 function makeHost(compositor) {
   return {
-    target: null, autoClear: true, xr: { enabled: true }, lighting: { enabled: true },
+    target: null, autoClear: true, sortObjects: true, xr: { enabled: true }, lighting: { enabled: true },
     viewport: new THREE.Vector4(), scissor: new THREE.Vector4(), scissorTest: false,
     color: new THREE.Color(), alpha: 0, contents: new Map(), renders: 0, meshes: [],
     getRenderTarget() { return this.target; }, setRenderTarget(target) { this.target = target; },
@@ -107,11 +113,13 @@ function makeHost(compositor) {
     setClearColor(value, alpha) { this.color.copy(value); this.alpha = alpha; },
     clear() { this.contents.set(this.target.texture, []); },
     render(scene, camera) {
+      assert.equal(this.sortObjects, false, "private rendering follows queued order without sorting");
       if (this.fail) throw new Error("synthetic draw failure");
       this.renders++;
       if (this.autoClear) this.clear();
-      const meshes = [...scene.children].sort((a, b) =>
-        Number(a.material.transparent) - Number(b.material.transparent) || a.renderOrder - b.renderOrder);
+      // Three retains separate opaque/transparent lists even with sorting off.
+      const meshes = [...scene.children.filter(mesh => !mesh.material.transparent),
+        ...scene.children.filter(mesh => mesh.material.transparent)];
       for (const mesh of meshes) {
         this.meshes.push(mesh);
         mesh.onBeforeRender(this, scene, camera, mesh.geometry, mesh.material, null);

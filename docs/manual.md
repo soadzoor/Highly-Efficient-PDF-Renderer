@@ -691,6 +691,10 @@ counts these draws; paints that compute a gradient mask keep the full shader.
 Both variants share live paint, clipping and fold inputs and prepare their
 programs before the first draw, including hidden paints that can appear later.
 
+Private Three compositor scenes draw meshes in queued order with host sorting
+temporarily disabled. Surface dependencies and opaque/transparent transitions
+still split batches; the host's sorting setting is restored after each render.
+
 During a Three WebGL capture, existing GL calls are timed by default. The
 `gl.*` sections distinguish shader-source setup, compilation, linking, program
 use, shader/state queries, buffer/texture uploads, drawing, clears, readbacks

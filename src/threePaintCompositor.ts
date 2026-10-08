@@ -18,6 +18,7 @@ import { ThreeScenePaintPlan } from "./threeScenePaintPlan";
 /** Public renderer operations only, so Three retains ownership of its GPU state cache. */
 export interface ThreePaintHostRenderer {
   autoClear: boolean;
+  sortObjects?: boolean;
   readonly outputColorSpace?: string;
   xr?: { enabled: boolean };
   /** WebGPURenderer's lighting manager; WebGLRenderer has none. */
@@ -885,8 +886,12 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.previousGlMaterial = null;
     this.automaticGlUniformUploads = this.backend === "webgl" && !this.failedGlHostRender && THREE.REVISION === "186" &&
       (this.renderer as { isWebGLRenderer?: boolean }).isWebGLRenderer === true;
+    const sortObjects = this.renderer!.sortObjects;
     let completed = false;
     try {
+      // Private meshes already follow insertion order. prepare() splits a
+      // transparent-to-opaque transition, preserving Three's separate lists.
+      if (sortObjects !== undefined) this.renderer!.sortObjects = false;
       const enabled = this.debugValidation ||
         (globalThis as { HEPR_DEBUG_COMPOSITOR_VALIDATION?: boolean }).HEPR_DEBUG_COMPOSITOR_VALIDATION === true;
       const device = enabled
@@ -904,6 +909,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       completed = true;
     }
     finally {
+      if (sortObjects !== undefined) this.renderer!.sortObjects = sortObjects;
       if (this.backend === "webgl") this.failedGlHostRender = !completed;
       this.previousGlMaterial = null;
       this.automaticGlUniformUploads = false;
