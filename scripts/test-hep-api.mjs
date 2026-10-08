@@ -34,7 +34,7 @@ try {
   assert.deepEqual(importEvents, [], "cancelled imports must not start HEP generation");
   const orderedScene = await testOrderedLodRoundTrip(builder, loadSceneFromHep, prepareSceneForHepRendering, VectorStrokeLodRuntime);
   await testSizeBudget(builder, orderedScene, loadSceneFromHep);
-  await testOptionalCacheRemoval();
+  await testSizeWarning();
   assert.equal(builder.buildParsedDataZip, undefined, "the old builder has no compatibility alias");
   const scene = composeVectorScenesInGrid([], 1);
   for (const compression of ["store", "deflate"]) {
@@ -197,42 +197,52 @@ async function testSizeBudget(builder, scene, loadScene) {
     await assert.rejects(loadScene(malformed), /source PDF byte length|sourcePdfByteLength|source PDF.*size/i,
       "malformed persisted source lengths are rejected");
   }
-  await assert.rejects(builder.buildHep(scene, { ...options, sourcePdfByteLength: fitting.size }),
-    error => error instanceof RangeError && /is not smaller/.test(error.message), "equal-size exports fail");
-  await assert.rejects(builder.buildHep(scene, { ...options, sourcePdfByteLength: fitting.size - 1 }),
-    /is not smaller/, "oversized canonical exports fail without dropping content");
-  await assert.rejects(builder.buildHep({ ...scene, sourcePdfByteLength: fitting.size }, options),
-    /is not smaller/, "an explicit option cannot increase the recorded original PDF budget");
-
   const withLod = await builder.buildHep(scene, { ...options, withVectorLod: true });
-  assert(withLod.size > base.size + 512, "the fixture has optional LOD data to omit");
+  assert(withLod.size > base.size + 512, "the fixture has meaningful selected LOD data");
   const budget = Math.floor((withLod.size + base.size) / 2);
-  const events = [], warnings = [];
+  const events = [], warnings = [], callbackWarnings = [];
   const originalWarn = console.warn;
   try {
     console.warn = message => warnings.push(message);
+    for (const [exportScene, exportOptions] of [
+      [scene, { ...options, sourcePdfByteLength: 1 }],
+      [{ ...scene, sourcePdfByteLength: 1 }, options]
+    ]) {
+      const larger = await builder.buildHep(exportScene, { ...exportOptions, onWarning: message => callbackWarnings.push(message) });
+      assert(larger.size > 1, "larger canonical exports remain downloadable");
+      const largerArchive = await HepArchive.loadAsync(await larger.arrayBuffer());
+      assert.equal(JSON.parse(await largerArchive.file("manifest.json").async("string")).sourcePdfByteLength, 1);
+      const loaded = await loadScene(await larger.arrayBuffer());
+      for (const field of ["endpoints", "primitiveMeta", "primitiveBounds", "styles", "drawRuns", "clipPaths"]) {
+        assert.deepEqual(loaded[field], scene[field], `size warnings preserve canonical ${field}`);
+      }
+    }
+    assert.equal(warnings.length, 2);
+    assert.deepEqual(callbackWarnings, warnings.map(message => message.replace(/^\[HEP\] /, "")), "API and console report the same size warning");
+    warnings.length = callbackWarnings.length = 0;
     const limited = await builder.buildHep(scene, { ...options, sourcePdfByteLength: budget,
-      withVectorLod: true, onProgress: event => events.push(event) });
-    assert(limited.size < budget);
+      withVectorLod: true, onProgress: event => events.push(event), onWarning: message => callbackWarnings.push(message) });
+    assert(limited.size >= budget, "selected LODs remain downloadable even when the HEP exceeds the PDF size");
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /Omitted stored LOD caches/);
+    assert.deepEqual(callbackWarnings, warnings.map(message => message.replace(/^\[HEP\] /, "")));
+    assert(warnings[0].includes(String(limited.size)) && warnings[0].includes(String(budget)), "the warning reports both byte sizes");
     const bytes = new Uint8Array(await limited.arrayBuffer());
     const archive = await HepArchive.loadAsync(bytes);
     const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
-    assert.equal(manifest.lod, undefined);
+    assert(manifest.lod?.vector, "selected vector LODs are retained");
     assert.equal(manifest.sourcePdfByteLength, budget);
-    assert(!Object.keys(archive.files).some(name => name.startsWith("lod-")));
+    assert(Object.keys(archive.files).some(name => name.startsWith("lod-vector/")));
     const loaded = await loadScene(bytes);
     for (const field of ["endpoints", "primitiveMeta", "primitiveBounds", "styles", "drawRuns", "clipPaths"]) {
-      assert.deepEqual(loaded[field], scene[field], `omitting caches preserves canonical ${field}`);
+      assert.deepEqual(loaded[field], scene[field], `keeping selected caches preserves canonical ${field}`);
     }
     assert.equal(events.at(-1).value, 1);
     assert(events.every((event, index) => index === 0 || event.value >= events[index - 1].value));
-    assert.equal(events.filter(event => event.stage === "hep-build" && event.value === 1).length, 1,
-      "progress completes only after the final archive passes its budget");
+    assert(events.some(event => event.stage === "hep-build" && event.value === 1),
+      "archive building reaches complete progress");
 
     const controller = new AbortController();
-    const reason = new Error("cancel between budget attempts");
+    const reason = new Error("cancel while reporting the export size warning");
     console.warn = () => controller.abort(reason);
     await assert.rejects(builder.buildHep(scene, { ...options, sourcePdfByteLength: budget,
       withVectorLod: true, signal: controller.signal }), error => error === reason);
@@ -241,29 +251,25 @@ async function testSizeBudget(builder, scene, loadScene) {
   }
 }
 
-async function testOptionalCacheRemoval() {
-  const { omitHepLodForSizeBudget } = await import("../src/hepSizePolicy.ts");
-  const archive = new HepArchive();
-  archive.file("geometry/canonical.bin", Uint8Array.of(1, 2, 3));
-  archive.file("lod-vector/index.json", "{}");
-  archive.file("lod-text/index.json", "{}");
-  const manifest = { sourceFile: "cache-budget.pdf", sourcePdfByteLength: 1000,
-    lod: { vector: { file: "lod-vector/index.json" }, text: { file: "lod-text/index.json" } } };
-  archive.file("manifest.json", JSON.stringify(manifest));
-  assert.equal(omitHepLodForSizeBudget(archive, manifest, 999, 1000), false);
-  const originalWarn = console.warn;
+async function testSizeWarning() {
+  const { warnIfHepSizeExceedsPdf } = await import("../src/hepSizePolicy.ts");
+  const warnings = [], callbacks = [], originalWarn = console.warn;
   try {
-    console.warn = () => {};
-    assert.equal(omitHepLodForSizeBudget(archive, manifest, 1000, 1000), true);
+    console.warn = message => warnings.push(message);
+    warnIfHepSizeExceedsPdf(999, 1000, "size-warning.pdf", message => callbacks.push(message));
+    warnIfHepSizeExceedsPdf(1001, undefined, "size-warning.pdf", message => callbacks.push(message));
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(callbacks, []);
+    for (const size of [1000, 1001]) {
+      warnIfHepSizeExceedsPdf(size, 1000, "size-warning.pdf", message => callbacks.push(message));
+      assert(warnings.at(-1).includes(String(size)) && warnings.at(-1).includes("1000"));
+      assert(warnings.at(-1).includes("size-warning.pdf"));
+    }
+    assert.equal(warnings.length, 2, "equal and larger HEPs emit warnings without throwing");
+    assert.deepEqual(callbacks, warnings.map(message => message.replace(/^\[HEP\] /, "")));
   } finally {
     console.warn = originalWarn;
   }
-  assert.equal(archive.file("lod-vector/index.json"), null);
-  assert.equal(archive.file("lod-text/index.json"), null);
-  assert.equal(manifest.lod, undefined);
-  assert.equal(JSON.parse(await archive.file("manifest.json").async("string")).lod, undefined);
-  assert.deepEqual(await archive.file("geometry/canonical.bin").async("uint8array"), Uint8Array.of(1, 2, 3));
-  assert.equal(omitHepLodForSizeBudget(archive, manifest, 1000, 1000), false);
 }
 
 async function testOrderedLodRoundTrip(builder, loadScene, prepareScene, Runtime) {

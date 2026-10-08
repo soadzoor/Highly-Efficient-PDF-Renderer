@@ -18,7 +18,7 @@ export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "c
     const { getCachedTextLod } = await import("../src/textLodCore.ts");
     const { prepareVectorLodForStorage } = await import("../src/hepLodEncoding.ts");
     const { writeHepLod, HEP_VECTOR_LOD_VERSION, HEP_TEXT_LOD_VERSION } = await import("../src/hepLod.ts");
-    const { validateSourcePdfByteLength, omitHepLodForSizeBudget, assertHepSizeBelowPdf } = await import("../src/hepSizePolicy.ts");
+    const { validateSourcePdfByteLength, warnIfHepSizeExceedsPdf } = await import("../src/hepSizePolicy.ts");
     const archive = await HepArchive.loadAsync(bytes, { signal });
     const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
     validateSourcePdfByteLength(manifest.sourcePdfByteLength);
@@ -46,11 +46,8 @@ export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "c
     manifest.lod = scene && await writeHepLod(archive, scene, { withVectorLod, withTextLod, vectorLodPrecision, signal });
     manifest.sourcePdfByteLength = sourcePdfByteLength;
     archive.file("manifest.json", JSON.stringify(manifest));
-    let output = await archive.generateAsync({ type: "uint8array", compression: "DEFLATE", signal });
-    if (sourcePdfByteLength !== undefined && omitHepLodForSizeBudget(archive, manifest, output.length, sourcePdfByteLength)) {
-      output = await archive.generateAsync({ type: "uint8array", compression: "DEFLATE", signal });
-    }
-    assertHepSizeBelowPdf(output.length, sourcePdfByteLength, manifest.sourceFile ?? "HEP");
+    const output = await archive.generateAsync({ type: "uint8array", compression: "DEFLATE", signal });
+    warnIfHepSizeExceedsPdf(output.length, sourcePdfByteLength, manifest.sourceFile ?? "HEP");
     const verified = await HepArchive.loadAsync(output, { signal });
     for (const [name, original] of before) {
       signal?.throwIfAborted();
@@ -69,7 +66,7 @@ export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "c
 
 const usage = "Usage: node scripts/repack-hep-lods.mjs [--write] [--source-pdf=<PDF-file>] [--vector-lod-precision=lossless|compact] [--timeout-ms=60000] <HEP-file-or-directory>\n" +
   "Default: compact vector precision, measure only. --write atomically replaces each file only if smaller, after geometry verification.\n" +
-  "--source-pdf records a single HEP's original PDF size and omits optional LOD caches if needed to keep it strictly smaller.\n" +
+  "--source-pdf records a single HEP's original PDF size; larger outputs warn while retaining the existing LOD caches.\n" +
   "Each file runs in an isolated worker with a hard timeout. No PDFs are parsed; no LOD simplification is performed. Spatial indexes are rebuilt.";
 
 async function main(args) {

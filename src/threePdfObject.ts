@@ -27,6 +27,7 @@ import { hasVisiblePagePlaceholders, pagePlaceholderAnimationEnabled } from "./p
 import { prepareSceneForHepRendering } from "./hepShared";
 import type { PdfPageDemandLoader } from "./pdfPageDemand";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
+import type { LoadProgressCallback } from "./loadProgress";
 import type { RendererApi } from "./rendererTypes";
 import type { ThreeCompactedStrokeLayer } from "./threeCompactedStrokeLayer";
 import { ThreeMaterialFillLayer } from "./threeMaterialFillLayer";
@@ -1093,13 +1094,24 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   pausePageLoading(): void { this.pageDemand?.pause(); }
   resumePageLoading(): void { this.pageDemand?.resume(); }
 
-  /** Explicit full extraction for geometry analysis. Viewing and exporting need not retain this scene. */
-  async loadCompleteScene(options: { signal?: AbortSignal; pages?: string } = {}): Promise<LoadedPdfScene["scene"]> {
-    const signal = options.signal;
-    signal?.throwIfAborted();
+  /** Complete geometry for analysis/export, reusing loaded canonical pages and the active PDF session. */
+  async loadCompleteScene(options: { signal?: AbortSignal; pages?: string; onProgress?: LoadProgressCallback } = {}): Promise<LoadedPdfScene["scene"]> {
+    const signal = options.signal ? AbortSignal.any([options.signal, this.pagePreparationAbort.signal])
+      : this.pagePreparationAbort.signal;
+    signal.throwIfAborted();
+    if (this.pageDemand && (options.pages === undefined || options.pages === this.sourceOptions?.pages)) {
+      const pages = await this.pageDemand.loadCompletePageScenes({ signal, onProgress: options.onProgress });
+      signal.throwIfAborted();
+      const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pages,
+        this.sceneData.pagesPerRow, this.sourceOptions?.onDiagnostic));
+      scene.sourcePdfByteLength = this.sceneData.sourcePdfByteLength ?? this.sourceBytes?.byteLength;
+      signal.throwIfAborted();
+      return scene;
+    }
     if ((!this.pageDemand && !this.sourceOptions?.ocrTextOnly) || !this.sourceBytes) return this.sceneData;
     const { loadPdfSceneFromSource } = await import("./pdfObjectGenerator");
-    return (await loadPdfSceneFromSource(this.sourceBytes, { ...this.sourceOptions, ...options, ocrTextOnly: false })).scene;
+    return (await loadPdfSceneFromSource(this.sourceBytes, { ...this.sourceOptions, ...options, signal,
+      ocrTextOnly: false, compressScans: false })).scene;
   }
 
   private scheduleDemandUpdate(): void {

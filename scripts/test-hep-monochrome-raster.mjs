@@ -368,7 +368,7 @@ try {
 
   const standaloneTable = sections.encodeRasterLayerTable({ atlases: [], layers: [storedTable.layers[0]] });
   assert.equal(standaloneTable[2], 8 | 4, "mono uses a new storage flag and preserves the old opacity flag");
-  for (const flag of [8 | 1, 8 | 2, 8 | 3, 16, 128]) {
+  for (const flag of [8 | 1, 8 | 2, 8 | 3, 8 | 16, 8 | 32, 64, 128]) {
     const invalid = standaloneTable.slice();
     invalid[2] = flag;
     assert.throws(() => sections.decodeRasterLayerTable(invalid, limits), /flag|storage|monochrome/i);

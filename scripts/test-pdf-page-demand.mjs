@@ -15,12 +15,13 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const baseView = { width: 400, height: 500, cameraCenterX: 300, cameraCenterY: 400, zoom: 1 };
-  const fixture = (pageCount, fullBytes = 1024, previewBytes = 4) => {
+  const fixture = (pageCount, fullBytes = 1024, previewBytes = 4, options = {}) => {
     const calls = [], completed = [], session = {
       info: { pages: Array.from({ length: pageCount }, (_, index) => ({ index, width: 600, height: 800 })) },
       closed: false, active: 0, maximumActive: 0,
       async compileVectorPage(index, options) {
-        calls.push({ index, preview: options.previewMaxDimension, signal: options.signal });
+        calls.push({ index, preview: options.previewMaxDimension, signal: options.signal,
+          ocrTextOnly: options.ocrTextOnly });
         this.maximumActive = Math.max(this.maximumActive, ++this.active);
         try {
           await this.block?.(index, options);
@@ -31,6 +32,7 @@ try {
           scene.pageRects = Float32Array.of(0, 0, 600, 800);
           scene.rasterLayers = [{ width: 1, height: 1, data: new Uint8Array(options.previewMaxDimension ? previewBytes : fullBytes),
             matrix: Float32Array.of(600, 0, 0, 800, 0, 0), pageIndex: 0 }];
+          if (options.previewMaxDimension && this.overviewKind) scene.pdfOverviewKind = this.overviewKind;
           completed.push(index);
           return scene;
         } finally { this.active--; }
@@ -38,7 +40,7 @@ try {
       async close() { this.closed = true; }
     };
     let changes = 0;
-    const loader = new PdfPageDemandLoader(session, () => { changes++; });
+    const loader = new PdfPageDemandLoader(session, () => { changes++; }, options);
     const rectangles = new Float32Array(pageCount * 4);
     for (let index = 0; index < pageCount; index++) rectangles.set([index * 1000, 0, index * 1000 + 600, 800], index * 4);
     return { loader, session, calls, completed, rectangles, get changes() { return changes; } };
@@ -191,8 +193,108 @@ try {
     assert.equal(f.loader.pageScenes[2].rasterLayers[0].data.length, 1024);
     await f.loader.close();
   }
+  {
+    const f = fixture(3);
+    f.session.overviewKind = "vector";
+    await f.loader.loadInitialOverviews(undefined, true);
+    const previews = f.loader.pageScenes, calls = f.calls.length, changes = f.changes;
+    const progress = [];
+    const pages = await f.loader.loadCompletePageScenes({ onProgress: event => progress.push(event) });
+    assert(pages.every((page, index) => page === previews[index]),
+      "complete vector overviews are reused without scanning their operators again");
+    assert.equal(f.calls.length, calls);
+    assert.equal(f.changes, changes, "exporting does not request viewer uploads");
+    assert(progress.some(event => event.processed === 3 && event.total === 3));
+    assert(progress.every((event, index) => !index || event.value >= progress[index - 1].value));
+    const cancelled = new AbortController(), reason = new Error("cancel cached export");
+    await assert.rejects(f.loader.loadCompletePageScenes({ signal: cancelled.signal,
+      onProgress: () => cancelled.abort(reason) }), error => error === reason);
+    assert.equal(f.calls.length, calls, "cancelling a cached export does not compile new pages");
+    await f.loader.close();
+  }
+  {
+    const f = fixture(4);
+    await f.loader.loadInitialOverviews(undefined, true);
+    f.loader.update(baseView, f.rectangles); await f.loader.whenIdle();
+    const detail = f.loader.pageScenes[0], calls = f.calls.length, changes = f.changes;
+    const residentBytes = f.loader.residentBytes;
+    const pages = await f.loader.loadCompletePageScenes();
+    assert.equal(pages.length, 4, "export includes the complete selected document");
+    assert.equal(pages[0], detail, "original-resolution cached detail is reused");
+    assert.deepEqual(f.calls.slice(calls).map(call => [call.index, call.preview]),
+      [[1, undefined], [2, undefined], [3, undefined]], "scan previews are upgraded at original resolution");
+    assert(pages.every(page => page.rasterLayers[0].data.length === 1024), "no preview pixels are exported");
+    assert.equal(f.session.maximumActive, 1);
+    assert.equal(f.changes, changes, "export compilation leaves the displayed scene alone");
+    assert.equal(f.loader.previewCount, 4);
+    assert.equal(f.loader.detailedCount, 1);
+    assert.equal(f.loader.residentBytes, residentBytes, "one-off export data does not inflate the viewing cache");
+    await f.loader.close();
+  }
+  {
+    const f = fixture(5, 1024, 4, { pages: "2,4", ocrTextOnly: true });
+    f.session.overviewKind = "vector";
+    await f.loader.loadInitialOverviews(undefined, true);
+    const calls = f.calls.length, progress = [];
+    const pages = await f.loader.loadCompletePageScenes({ onProgress: event => progress.push(event) });
+    assert.equal(pages.length, 2);
+    assert.deepEqual(f.calls.slice(calls).map(call => [call.index, call.preview, call.ocrTextOnly]),
+      [[1, undefined, false], [3, undefined, false]],
+      "text-only vector overviews cannot replace full selected source pages");
+    assert(progress.some(event => event.pageIndex === 0 && event.sourcePageIndex === 1));
+    assert(progress.some(event => event.pageIndex === 1 && event.sourcePageIndex === 3));
+    await f.loader.close();
+  }
+  {
+    const f = fixture(3);
+    let enter;
+    const entered = new Promise(resolve => { enter = resolve; });
+    f.session.block = async (_index, options) => {
+      if (!options.previewMaxDimension) return;
+      enter();
+      await new Promise((resolve, reject) => options.signal.addEventListener("abort",
+        () => reject(options.signal.reason), { once: true }));
+    };
+    f.loader.update(baseView, f.rectangles); await entered;
+    f.loader.pause();
+    const pages = await f.loader.loadCompletePageScenes();
+    assert.equal(pages.length, 3);
+    assert(f.calls[0].signal.aborted, "pending viewing work drains before full extraction");
+    assert.deepEqual(f.calls.map(call => [call.index, call.preview]),
+      [[0, 96], [0, undefined], [1, undefined], [2, undefined]]);
+    assert.equal(f.session.maximumActive, 1, "full extraction never overlaps the viewing worker operation");
+    assert.equal(f.loader.previewCount, 0, "already paused page loading stays paused after extraction");
+    await f.loader.close();
+  }
+  {
+    const f = fixture(3), controller = new AbortController(), reason = new Error("cancel export");
+    let enter;
+    const entered = new Promise(resolve => { enter = resolve; });
+    f.session.block = async (_index, options) => {
+      enter();
+      await new Promise((resolve, reject) => options.signal.addEventListener("abort",
+        () => reject(options.signal.reason), { once: true }));
+    };
+    const exporting = f.loader.loadCompletePageScenes({ signal: controller.signal });
+    await entered;
+    await assert.rejects(f.loader.loadCompletePageScenes(), /already running/i,
+      "overlapping exports cannot start a second worker operation");
+    f.loader.resume();
+    assert.equal(f.calls.length, 1);
+    controller.abort(reason);
+    await assert.rejects(exporting, error => error === reason);
+    assert.equal(f.calls.length, 1, "cancellation stops before the next page");
+    assert.equal(f.loader.residentBytes, 0);
+    assert.equal(f.changes, 0);
+    delete f.session.block;
+    f.loader.update(baseView, f.rectangles); await f.loader.whenIdle();
+    assert.equal(f.loader.detailedCount, 1, "cancelled export does not poison page loading");
+    await f.loader.close();
+    await assert.rejects(f.loader.loadCompletePageScenes(), /closed|disposed/i);
+    assert.equal(f.loader.residentBytes, 0);
+  }
   assert.equal(warnings.length, 0);
-  console.log("Demand-driven PDF pages: metadata-only opening, preview/detail priority, zoom demotion and cached promotion, stable layout, sequential work, bounded CPU/page caches, navigation, search, pause and stale-work cancellation passed.");
+  console.log("Demand-driven PDF pages: metadata-only opening, preview/detail priority, stable layout, bounded caches, navigation, search, cancellation and full export reuse passed.");
 } finally {
   console.warn = previousWarn;
   if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator); else delete globalThis.navigator;

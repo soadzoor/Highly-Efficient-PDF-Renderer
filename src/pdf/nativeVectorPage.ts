@@ -1801,7 +1801,8 @@ function buildRasterLayers(
     const image = registry.describe(imageIndex);
     let monochrome = image.format === HEPR_IMAGE_FORMAT.Gray1 && image.softMaskImageIndex < 0
       ? { data: image.data, colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255),
-          ...(image.jbig2Symbols ? { symbols: image.jbig2Symbols } : {}) }
+          ...(image.jbig2Symbols ? { symbols: image.jbig2Symbols } : {}),
+          ...(image.jbig2Source ? { jbig2Source: image.jbig2Source } : {}) }
       : undefined;
     let imageData: Uint8Array;
     compositedImages ??= new Map<number, Uint8Array>();

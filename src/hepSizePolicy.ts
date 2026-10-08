@@ -1,48 +1,21 @@
-import type { HepArchive } from "./hepContainer";
-
-interface HepSizeManifest {
-  sourceFile?: string;
-  lod?: unknown;
-}
-
 export function validateSourcePdfByteLength(value: number | undefined): void {
   if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
     throw new RangeError("sourcePdfByteLength must be a positive safe integer.");
   }
 }
 
-/** Remove only regenerable caches; the complete canonical document stays intact. */
-export function omitHepLodForSizeBudget(
-  archive: HepArchive,
-  manifest: HepSizeManifest,
-  candidateByteLength: number,
-  sourcePdfByteLength: number
-): boolean {
-  if (candidateByteLength < sourcePdfByteLength) return false;
-  const files = Object.keys(archive.files).filter(name =>
-    name.startsWith("lod-vector/") || name.startsWith("lod-text/"));
-  if (!manifest.lod && files.length === 0) return false;
-  for (const name of files) archive.remove(name);
-  delete manifest.lod;
-  archive.file("manifest.json", JSON.stringify(manifest));
-  console.warn(
-    `[HEP] Omitted stored LOD caches for ${manifest.sourceFile ?? "document.pdf"}: the complete HEP ` +
-    `(${candidateByteLength} bytes) must be smaller than the original PDF (${sourcePdfByteLength} bytes). ` +
-    "LOD caches will be built when needed."
-  );
-  return true;
-}
-
-export function assertHepSizeBelowPdf(
+/** File size is advisory; keep the complete document and requested caches. */
+export function warnIfHepSizeExceedsPdf(
   candidateByteLength: number,
   sourcePdfByteLength: number | undefined,
-  label: string
+  label: string,
+  onWarning?: (message: string) => void
 ): void {
   if (sourcePdfByteLength !== undefined && candidateByteLength >= sourcePdfByteLength) {
-    throw new RangeError(
-      `Cannot export ${label}: the HEP without stored LOD caches (${candidateByteLength} bytes) ` +
-      `is not smaller than the original PDF (${sourcePdfByteLength} bytes). ` +
-      "Keep the original PDF; no document content was discarded."
-    );
+    const message = `HEP export for ${label} is ${(candidateByteLength / 1_000_000).toFixed(1)} MB ` +
+      `(${candidateByteLength} bytes), compared with the original PDF at ${(sourcePdfByteLength / 1_000_000).toFixed(1)} MB ` +
+      `(${sourcePdfByteLength} bytes). The download includes all document content and selected LOD caches.`;
+    console.warn(`[HEP] ${message}`);
+    onWarning?.(message);
   }
 }

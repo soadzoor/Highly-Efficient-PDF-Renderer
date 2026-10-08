@@ -91,6 +91,8 @@ async function buildSceneHep(
       withTextLod: options.withTextLod,
       encodeRasterImages: options.encodeRasterImages ?? true,
       sourcePdfByteLength: options.sourcePdfByteLength,
+      monochromeEncoding: options.monochromeEncoding,
+      onWarning: options.onWarning,
       compression: options.compression === "store" ? "STORE" : "DEFLATE",
       signal: options.signal,
       onBuildProgress: (value, buildProgress) => {

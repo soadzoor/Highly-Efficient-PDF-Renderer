@@ -17,8 +17,14 @@ export interface HepEncodingOptions extends HepLodOptions {
   /** Override the source name written to the HEP manifest. */
   sourceLabel?: string;
 
-  /** Original PDF byte length; omit optional LODs or reject exports that cannot be strictly smaller. */
+  /** Original PDF byte length; warn when the generated HEP is at least as large. */
   sourcePdfByteLength?: number;
+
+  /** Lossless scan storage: fast binary packing or smaller original JBIG2 streams when available. @default "jbig2" */
+  monochromeEncoding?: "packed" | "jbig2";
+
+  /** Receives export warnings, including a HEP larger than the original PDF. */
+  onWarning?: (message: string) => void;
 
   /** Encode color rasters as WebP/PNG when supported. Monochrome layers always retain packed bits. @default true */
   encodeRasterImages?: boolean;
@@ -99,6 +105,9 @@ export async function buildHep(
 
 function validateEncodingOptions(options: HepEncodingOptions): void {
   validateSourcePdfByteLength(options.sourcePdfByteLength);
+  if (options.monochromeEncoding !== undefined && !["packed", "jbig2"].includes(options.monochromeEncoding)) {
+    throw new RangeError("monochromeEncoding must be packed or jbig2.");
+  }
   if (options.vectorLodPrecision !== undefined && !["lossless", "compact"].includes(options.vectorLodPrecision)) {
     throw new RangeError("vectorLodPrecision must be lossless or compact.");
   }

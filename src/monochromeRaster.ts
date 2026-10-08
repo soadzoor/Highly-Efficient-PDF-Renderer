@@ -11,6 +11,31 @@ export interface MonochromeRaster {
   data: Uint8Array;
   colors: Uint8Array;
   symbols?: MonochromeSymbolScene;
+  /** Original bundled-decoder input, valid only while the canonical pixels match. */
+  jbig2Source?: MonochromeJbig2Source;
+}
+
+/** Owned image streams, rather than views retaining the complete source PDF. */
+export interface MonochromeJbig2Source {
+  readonly width: number;
+  readonly height: number;
+  readonly encoded: Uint8Array;
+  readonly globals: Uint8Array;
+  readonly invert: boolean;
+  readonly packedHash: readonly [number, number];
+}
+
+/** Detect pixel edits before reusing original compressed monochrome streams. */
+export function hashMonochromePixels(data: Uint8Array, width: number, height: number): readonly [number, number] {
+  let first = 0x811c9dc5, second = 0x9e3779b9;
+  for (let offset = 0; offset < data.length; offset++) {
+    first = Math.imul(first ^ data[offset], 0x01000193);
+    second = Math.imul(second + data[offset], 0x85ebca6b);
+  }
+  return [
+    (first ^ width ^ Math.imul(height, 0x9e3779b1)) >>> 0,
+    (second ^ height ^ Math.imul(width, 0xc2b2ae35)) >>> 0
+  ];
 }
 
 /** Materialize RGBA only for consumers that cannot use the packed representation. */
@@ -75,7 +100,13 @@ export function prepareMonochromeSceneTransfer(scene: VectorScene): VectorScene 
       data: new Uint8Array(layer.monochrome.data),
       colors: new Uint8Array(layer.monochrome.colors),
       ...(layer.monochrome.symbols ? { symbols: { symbols: layer.monochrome.symbols.symbols.map(symbol => ({
-        ...symbol, data: new Uint8Array(symbol.data) })), placements: new Int32Array(layer.monochrome.symbols.placements) } } : {})
+        ...symbol, data: new Uint8Array(symbol.data) })), placements: new Int32Array(layer.monochrome.symbols.placements) } } : {}),
+      ...(layer.monochrome.jbig2Source ? { jbig2Source: {
+        ...layer.monochrome.jbig2Source,
+        encoded: new Uint8Array(layer.monochrome.jbig2Source.encoded),
+        globals: new Uint8Array(layer.monochrome.jbig2Source.globals),
+        packedHash: [layer.monochrome.jbig2Source.packedHash[0], layer.monochrome.jbig2Source.packedHash[1]]
+      } } : {})
     });
     descriptors.data = dataDescriptor(new Uint8Array(0));
     return Object.defineProperties({}, descriptors) as RasterLayer;

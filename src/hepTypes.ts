@@ -52,6 +52,8 @@ export type TextureComponentType =
 
 export interface BuildHepBlobOptions extends HepLodOptions {
   sourcePdfByteLength?: number;
+  monochromeEncoding?: "packed" | "jbig2";
+  onWarning?: (message: string) => void;
   encodeRasterImages?: boolean;
   compression?: "STORE" | "DEFLATE";
   signal?: AbortSignal;

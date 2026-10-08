@@ -102,7 +102,8 @@ Use `pdfObjectGenerator(source, { ocrTextOnly: true })` for a text-only PDF view
 This uses the PDF's existing text; it does not perform OCR. Vector overviews stay
 sharp at every zoom and do not allocate scan textures. Reopen the retained
 `sourceBytes` with `ocrTextOnly: false` to restore the normal view.
-`loadCompleteScene()` and the demo's HEP export compile the original PDF content.
+`loadCompleteScene()` and the demo's HEP export complete the original PDF content,
+reusing the active session and cached full pages when available.
 
 See [loading option types](../src/pdfObjectGenerator.ts) and
 [progress fields and stages](../src/loadProgress.ts). By default, PDFs prepare all
@@ -266,8 +267,9 @@ incremental buffer updates are outside this API; build a new scene if needed.
 
 The object supports normal Three.js transforms. `sceneData` contains its current
 `VectorScene`; treat it as read-only and read it again after `pages-loaded` events.
-For demand-loaded PDFs this is the viewing window; `loadCompleteScene()` performs
-explicit complete extraction for geometry analysis. `sourceLabel`, `sourceKind`, and
+For demand-loaded PDFs this is the viewing window; `loadCompleteScene({ signal, onProgress })`
+reuses the active PDF session and cached full pages, then extracts the remaining
+complete content for analysis or export. `sourceLabel`, `sourceKind`, and
 `rendererType` describe the loaded source and backend.
 
 Transforms apply to the **whole loaded object**, including all pages, backgrounds
@@ -1050,24 +1052,36 @@ or `@soadzoor/hepr` in Node.
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
 Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
-`compression` (`"deflate"` by default, or `"store"`), `onProgress`, and `signal`.
+`monochromeEncoding` (`"jbig2"` by default, or `"packed"`),
+`compression` (`"deflate"` by default, or `"store"`), `onProgress`, `onWarning`, and `signal`.
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
 
-Monochrome layers always save lossless packed one-bit rows and their two-color
-RGBA palette, including when `encodeRasterImages` is false. They bypass PNG/WebP
-encoding and reload without expanding RGBA. These exports use scene schema v10;
-other scenes still use v9, and the current loader accepts both.
+Monochrome layers save full-resolution pixels and their two-color RGBA palette
+losslessly, including when `encodeRasterImages` is false. They bypass PNG/WebP
+encoding and reload as packed one-bit rows without expanding RGBA.
+`monochromeEncoding: "jbig2"` retains original JBIG2 segments when available and
+unchanged, giving smaller files with more CPU work on reload; other layers use
+plain packed DEFLATE. `"packed"` uses an 8-by-8 bit transpose and run encoding
+before DEFLATE for fast reload, falling back to plain packed bytes if runs grow.
+The native and Three demo Download HEP dialogs offer either variant or both,
+using `-fast` and `-small` filenames. Both reuse one complete scene. Demand-loaded
+viewers reuse their active PDF session, full vector overviews and cached scan
+detail; only missing full pages compile. Raster/OCR previews are replaced by
+complete content. Text-only views without an active session extract the original
+PDF once. Full extraction is shared by both encodings, leaves the viewing window
+unchanged, and does not add a permanent second document to the viewing cache.
+These exports use scene v10 (plain packed), v11 (JBIG2), or v12 (binary runs);
+other scenes still use v9, and the current loader accepts v9–v12.
 
 PDF-source builds measure the original PDF automatically. Scenes loaded through
 HEPR carry that size, and HEP exports record it for later re-export. For a custom
 scene or an older HEP, supply `sourcePdfByteLength` (a positive safe integer) to
-enforce the same budget. The complete archive must be strictly smaller than the
-PDF, including its index, manifest and stored LODs. If requested LOD caches exceed
-the budget, the writer omits them with a console warning; they rebuild when needed.
-If the canonical archive still cannot fit, the build rejects with `RangeError`
-before saving anything. It preserves document content and does not change viewing.
-Scenes without a known PDF size cannot enforce a PDF size comparison.
+enable the same size comparison. If the complete archive is at least as large
+as the PDF, the writer warns through `console.warn` and `onWarning(message)`;
+the download still succeeds and keeps all document content and requested LODs.
+The demo viewers display the warning after download. Scenes without a known PDF
+size skip the comparison.
 
 A HEP built from a password-protected PDF stores the decrypted content and has
 no password of its own. Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves
@@ -1235,9 +1249,10 @@ preferences stop these frame requests. The skeleton disappears as soon as the
 page overview is installed, including when the actual page is blank.
 `sceneData` represents the current viewing window when `isPageDemandLoaded` is
 true. Search requests remaining previews in the background. For complete geometry,
-use `await object.loadCompleteScene({ signal })`, or `pageLoading: "eager"` at load.
-For complete HEP export, pass `object.sourceBytes` and its `sourceOptions` to
-`buildHep`; the Three demo does this automatically. Disposing the object closes
+use `await object.loadCompleteScene({ signal, onProgress })`, or `pageLoading: "eager"` at load.
+For complete HEP export, pass that returned scene to `buildHep`; the Three demo
+does this once and reuses the scene for both scan encodings. Cached complete
+pages skip parsing; missing full pages still need compilation. Disposing the object closes
 its worker and releases page caches.
 
 Images wider or taller than the GPU's texture limit are drawn as several tiles

@@ -76,6 +76,8 @@ number of pending PDFs. Each freed slot immediately takes the next PDF.
 Outputs use the client export convention <name>-parsed-data.hep and are written
 beside their PDFs, unless --output-dir is supplied. Output name collisions are
 rejected.
+HEP files larger than their source PDFs are written with a warning; selected
+LOD caches are retained.
 
 Existing HEP files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
@@ -482,8 +484,7 @@ async function readHepManifest(archive) {
  * The candidate must come from the default DEFLATE writer, as this CLI's
  * buildHep() calls do, or the re-encoding would not match its encoding.
  */
-export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal, sourcePdfByteLength) {
-  if (sourcePdfByteLength !== undefined && existingBytes.byteLength >= sourcePdfByteLength) return false;
+export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal) {
   const existing = await HepArchive.loadAsync(existingBytes, { signal });
   const candidate = await HepArchive.loadAsync(candidateBytes, { signal });
   const existingSections = Object.values(existing.files);
@@ -509,11 +510,11 @@ export async function hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes,
   return Buffer.compare(restamped, existingBytes) === 0;
 }
 
-async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal, sourcePdfByteLength) {
+async function existingHepDiffersOnlyInGeneratedAt(outputPath, hepBlob, HepArchive, signal) {
   try {
     const existingBytes = await readFile(outputPath, { signal });
     const candidateBytes = new Uint8Array(await hepBlob.arrayBuffer());
-    return await hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal, sourcePdfByteLength);
+    return await hepDiffersOnlyInGeneratedAt(existingBytes, candidateBytes, HepArchive, signal);
   } catch (error) {
     if (signal?.aborted) {
       throw error;
@@ -1046,16 +1047,11 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
           onProgress: createProgressLogger(sourceLabel, itemNumber, itemCount)
         });
         abortController.signal.throwIfAborted();
-        if (hepBlob.size >= pdfBytes.byteLength) {
-          throw new RangeError(`HEP size policy: ${sourceLabel} produced ${hepBlob.size} bytes; ` +
-            `the HEP must be strictly smaller than its ${pdfBytes.byteLength}-byte PDF.`);
-        }
         if (options.keepUnchanged && await existingHepDiffersOnlyInGeneratedAt(
           outputPath,
           hepBlob,
           builder.HepArchive,
-          abortController.signal,
-          pdfBytes.byteLength
+          abortController.signal
         )) {
           console.log(
             `[${itemNumber}/${itemCount}] Kept ${outputPath}; only its generatedAt timestamp would change`

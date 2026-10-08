@@ -30,19 +30,24 @@ assert.match(
   /\bprebuildVectorStrokeLodRuntime\b[\s\S]*\bprebuildTextLod\b[\s\S]*\.setScene\s*\(/,
   "LOD generation and persistent scene upload must remain intact"
 );
-assert.match(
-  mainSource,
-  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildHep\s*\(\s*scene\s*,\s*buildOptions\s*\)/,
-  "HEP export must serialize the already-loaded VectorScene"
-);
+const downloadHep = readFunctionBody(mainSource, "downloadHep");
+assert.match(downloadHep, /\blet\s+exportScene\s*=\s*scene\s*;/,
+  "complete loaded scenes must be reused directly for HEP export");
+assert.match(downloadHep, /\bbuildHep\s*\(\s*exportScene\s*,\s*\{\s*\.\.\.buildOptions\s*,\s*\.\.\.scanOption\s*,?\s*\}\s*\)/,
+  "HEP export must serialize the canonical VectorScene");
 assert.doesNotMatch(
-  readFunctionBody(mainSource, "downloadHep"),
+  downloadHep,
   /\bopenPdf\b|\bparsePdf\b|\bcompilePdfForBatchExport\b/,
   "HEP export must use the shared builder instead of an independent parser"
 );
 assert.match(mainSource, /pageScenes\s*=\s*candidate\.displayPageScenes/, "large PDFs compose metadata-backed page windows");
-assert.match(readFunctionBody(mainSource, "downloadHep"), /activePdfPageLoader[\s\S]*?buildHep\(lastLoadedSource\.bytes/,
-  "export from a partial page window must compile the complete original PDF");
+assert.match(downloadHep,
+  /pageLoader\.loadCompletePageScenes\s*\([\s\S]*?exportScene\s*=\s*prepareSceneForHepRendering\s*\(\s*composeVectorScenesInGrid\s*\([\s\S]*?for\s*\(\s*const\s+scanOption\s+of\s+scanOptions\s*\)/,
+  "partial page windows must complete and compose the original document before encoding either export");
+assert.equal((downloadHep.match(/\bloadCompletePageScenes\s*\(/g) ?? []).length, 1,
+  "both scan encodings share one complete extraction from the live PDF session");
+assert.doesNotMatch(downloadHep, /\bbuildHep\s*\(\s*(?:lastLoadedSource|source)\.bytes/,
+  "the encoding loop must not reparse the original PDF for each HEP variant");
 assert.doesNotMatch(
   mainSource,
   /\brenderHeprPageToCanvas2d\b/,

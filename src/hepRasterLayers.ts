@@ -1,5 +1,5 @@
 /**
- * Scene v9/v10 raster layers: one binary record per canonical image layer, with
+ * Scene v9–v12 raster layers: one binary record per canonical image layer, with
  * the pixels of small lossless layers packed into shared atlas images.
  *
  * PDFs can paint thousands of tiny images; a map sliced into one-pixel
@@ -24,11 +24,13 @@ export const RASTER_ATLAS_MAX_SIZE = 2048;
 export const RASTER_ATLAS_MAX_CELL_TEXELS = 16_384;
 
 /** Index order is the wire format; never reorder, only append. */
-const LAYER_STORAGE = ["rgba", "png", "webp", "atlas", "mono"] as const;
+const LAYER_STORAGE = ["rgba", "png", "webp", "atlas", "mono", "jbig2", "binary"] as const;
 const ATLAS_ENCODINGS = ["rgba", "png"] as const;
 const FLAG_STORAGE_MASK = 3;
 const FLAG_OPACITY = 4;
 const FLAG_MONOCHROME = 8;
+const FLAG_JBIG2 = 16;
+const FLAG_BINARY = 32;
 const MAX_INT32 = 0x7fffffff;
 
 export type RasterLayerStorage = typeof LAYER_STORAGE[number];
@@ -193,7 +195,9 @@ export function copyRasterRect(
  * `varint width`, `varint height`. Then `varint layerCount` and per layer a
  * flags byte (bits 0-1 storage: 0 RGBA8, 1 PNG, 2 WebP section, 3 atlas cell;
  * bit 2 opacity present; bit 3 monochrome packed section with bits 0-1 zero,
- * added in scene v10), `varint width`, `varint height`, zigzag deltas of
+ * added in scene v10; bit 4 original JBIG2 section with bits 0-1 and bit 3
+ * zero, added in scene v11; bit 5 transposed binary runs with all other storage
+ * bits zero, added in scene v12), `varint width`, `varint height`, zigzag deltas of
  * paint order and page index against the previous layer, then for a cell
  * `varint atlas` and zigzag `x`, `y` against the previous cell's right edge
  * and row when it is in the same atlas (else against zero), and a float64
@@ -225,7 +229,9 @@ export function encodeRasterLayerTable({ atlases, layers }: RasterLayerTable): U
     if (hasOpacity && !(Number.isFinite(layer.opacity) && layer.opacity! >= 0 && layer.opacity! <= 1)) {
       fail(`layer ${index} has an invalid opacity`);
     }
-    writer.writeByte((layer.storage === "mono" ? FLAG_MONOCHROME : storage) | (hasOpacity ? FLAG_OPACITY : 0));
+    const storageFlag = layer.storage === "mono" ? FLAG_MONOCHROME :
+      layer.storage === "jbig2" ? FLAG_JBIG2 : layer.storage === "binary" ? FLAG_BINARY : storage;
+    writer.writeByte(storageFlag | (hasOpacity ? FLAG_OPACITY : 0));
     writer.writeVarUint32(requireInteger(layer.width, 1, MAX_INT32, "layer width"));
     writer.writeVarUint32(requireInteger(layer.height, 1, MAX_INT32, "layer height"));
     writer.writeZigzagVarint(requireInteger(layer.paintOrder, 0, MAX_INT32, "paint order") - previousPaintOrder);
@@ -274,9 +280,13 @@ export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTab
   let previousCell = { atlas: -1, right: 0, y: 0 };
   for (let index = 0; index < layerCount; index += 1) {
     const flags = cursor.readByte("raster layer flags");
-    if (flags & ~(FLAG_STORAGE_MASK | FLAG_OPACITY | FLAG_MONOCHROME)) fail(`layer ${index} has reserved flag bits`);
-    if ((flags & FLAG_MONOCHROME) && (flags & FLAG_STORAGE_MASK)) fail(`layer ${index} has conflicting storage flags`);
-    const storage = flags & FLAG_MONOCHROME ? "mono" : LAYER_STORAGE[flags & FLAG_STORAGE_MASK];
+    if (flags & ~(FLAG_STORAGE_MASK | FLAG_OPACITY | FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY)) fail(`layer ${index} has reserved flag bits`);
+    const extendedStorage = flags & (FLAG_MONOCHROME | FLAG_JBIG2 | FLAG_BINARY);
+    if (extendedStorage && ((flags & FLAG_STORAGE_MASK) || (extendedStorage & (extendedStorage - 1)))) {
+      fail(`layer ${index} has conflicting storage flags`);
+    }
+    const storage = flags & FLAG_BINARY ? "binary" : flags & FLAG_JBIG2 ? "jbig2" :
+      flags & FLAG_MONOCHROME ? "mono" : LAYER_STORAGE[flags & FLAG_STORAGE_MASK];
     const width = requireInteger(cursor.readVarUint32(), 1, limits.maxDimension, "layer width");
     const height = requireInteger(cursor.readVarUint32(), 1, limits.maxDimension, "layer height");
     paintOrder = requireInteger(paintOrder + cursor.readZigzagVarint(), 0, MAX_INT32, "paint order");

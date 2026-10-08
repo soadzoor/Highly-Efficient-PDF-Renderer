@@ -47,6 +47,10 @@ import type {
 export const PARSED_DATA_FORMAT_VERSION = 9;
 /** Packed monochrome raster sections extend the otherwise unchanged v9 scene. */
 export const PARSED_DATA_MONOCHROME_FORMAT_VERSION = 10;
+/** Original compressed JBIG2 streams can be decoded without the source PDF. */
+export const PARSED_DATA_JBIG2_FORMAT_VERSION = 11;
+/** Transposed binary run sections extend the otherwise unchanged v11 scene. */
+export const PARSED_DATA_BINARY_FORMAT_VERSION = 12;
 export const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 export const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 export const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";

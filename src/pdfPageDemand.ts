@@ -1,7 +1,7 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, deriveSceneTextContentFromIndex, reportNativePdfProgress, type RasterLayer, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
 import { createOcrDemandScene, createOcrDetailDemandScene, needsOcrDetailGeometry, placeDemandRaster } from "./pdfDemandScene";
-import { createLoadProgressReporter, type LoadProgressReporter } from "./loadProgress";
+import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { automaticRasterMemoryBudget } from "./rasterMemoryBudget";
 import { sceneCpuBytes } from "./pageRasterPreview";
@@ -39,6 +39,7 @@ export class PdfPageDemandLoader {
   private paused = false;
   private running: Promise<void> | null = null;
   private operation: AbortController | null = null;
+  private completeOperation: AbortController | null = null;
   private readonly session: NativeVectorPdfSession;
   private onChange: () => void | Promise<void>;
   private onTiming: ((name: string, durationMs: number) => void) | null = null;
@@ -227,13 +228,74 @@ export class PdfPageDemandLoader {
       signal?.throwIfAborted();
     } finally { this.initialProgress = null; signal?.removeEventListener("abort", abort); }
   }
+
+  /** Reuse canonical pages for export; remaining pages compile once without growing the viewing caches. */
+  async loadCompletePageScenes(options: {
+    signal?: AbortSignal; onProgress?: LoadProgressCallback
+  } = {}): Promise<VectorScene[]> {
+    options.signal?.throwIfAborted();
+    if (this.closed) throw new Error("The PDF page loader is closed.");
+    if (this.completeOperation) throw new Error("Complete PDF page extraction is already running.");
+    const operation = this.completeOperation = new AbortController();
+    const abort = (): void => operation.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", abort, { once: true });
+    const wasPaused = this.paused;
+    this.pause();
+    const progress = createLoadProgressReporter(options.onProgress);
+    const checkActive = (): void => {
+      operation.signal.throwIfAborted();
+      if (this.closed) throw new Error("The PDF page loader is closed.");
+    };
+    try {
+      await this.whenIdle();
+      checkActive();
+      const pages: VectorScene[] = [];
+      for (let index = 0; index < this.pageCount; index++) {
+        checkActive();
+        const sourcePageIndex = this.sourcePages[index];
+        const pageProgress = { stage: "pdf-page" as const, sourceType: "pdf" as const, executionPath: "worker" as const,
+          unit: "pages" as const, total: this.pageCount, pageIndex: index, pageCount: this.pageCount,
+          sourcePageIndex, sourcePageCount: this.session.info.pages.length };
+        progress.report(.12 + index / this.pageCount * .82, { ...pageProgress, processed: index });
+        const cached = this.options.ocrTextOnly ? undefined : this.detailed.get(index)?.scene ??
+          (this.overviewKinds.get(index) === "vector" ? this.previews.get(index)?.scene : undefined);
+        const scene = cached ?? await this.session.compileVectorPage(sourcePageIndex, {
+          ocrTextOnly: false,
+          signal: operation.signal,
+          optimization: this.options.enableSegmentMerge === false && this.options.enableInvisibleCull === false ? "none" : "safe",
+          enableSegmentMerge: this.options.enableSegmentMerge !== false,
+          enableInvisibleCull: this.options.enableInvisibleCull !== false,
+          ...(this.options.annotationAppearances ? { annotationAppearances: this.options.annotationAppearances } : {}),
+          onProgress: event => reportNativePdfProgress(progress, event, {
+            selectionIndex: index, selectedPageCount: this.pageCount, sourcePageCount: this.session.info.pages.length
+          })
+        });
+        checkActive();
+        if (!cached && this.options.extractTextContent === true) scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
+        pages.push(scene);
+        progress.report(.12 + (index + 1) / this.pageCount * .82, { ...pageProgress, processed: index + 1 });
+      }
+      checkActive();
+      progress.complete({ stage: "compile", sourceType: "pdf", executionPath: "worker", unit: "pages",
+        processed: pages.length, total: pages.length, pageCount: pages.length, sourcePageCount: this.session.info.pages.length });
+      checkActive();
+      return pages;
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
+      if (this.completeOperation === operation) this.completeOperation = null;
+      this.paused = wasPaused;
+      if (!wasPaused && !this.closed) this.start();
+    }
+  }
+
   pause(): void { this.paused = true; this.operation?.abort(); }
-  resume(): void { if (!this.closed) { this.paused = false; this.start(); } }
+  resume(): void { if (!this.closed && !this.completeOperation) { this.paused = false; this.start(); } }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.operation?.abort();
+    this.completeOperation?.abort(new DOMException("PDF page loader closed.", "AbortError"));
     try { await this.session.close(); }
     finally { await this.running; this.previews.clear(); this.detailed.clear(); this.overviewKinds.clear();
       this.displayPages.clear(); this.boundDisplayPages = null; this.boundDisplayScene = null; this.onTiming = null; }
@@ -248,7 +310,7 @@ export class PdfPageDemandLoader {
   }
 
   private start(): void {
-    if (this.running || this.closed || this.paused) return;
+    if (this.running || this.closed || this.paused || this.completeOperation) return;
     this.running = this.pump().finally(() => { this.running = null; });
     // A host callback failure is reported, never an unhandled promise rejection.
     void this.running.catch(error => console.warn("[HEPR] Demand-driven PDF page update failed.", error));

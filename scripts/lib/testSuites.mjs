@@ -29,6 +29,8 @@ export const fastTests = [
   "structure-content",
   "hep-scene-sections",
   "hep-monochrome-raster",
+  "hep-jbig2-raster",
+  "hep-binary-raster",
   "optional-content",
   "retained-page-replay",
   "retained-page-compositor",

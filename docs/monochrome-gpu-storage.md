@@ -36,8 +36,9 @@ including its mip levels. GPU dictionaries are not shared between pages.
 
 The canonical packed CPU image remains available for compatibility and exports.
 Symbol metadata is retained in native vector scenes and copied safely through
-workers. The existing HEP container stores canonical pixels; symbol metadata is
-not serialized, so a reopened HEP uses the block path.
+workers. HEP stores canonical packed pixels or original JBIG2 streams.
+Symbol metadata is not serialized; original JBIG2 reload can recover it through
+the bundled symbol decoder, while packed reload uses the block path.
 
 ## Texture layout and accounting
 
@@ -84,13 +85,17 @@ Zoom refinement extracts complete compact blocks directly from packed bytes,
 uses exact 2×2 averaging for even mip reductions, and reuses horizontal coverage
 endpoints across rows. The resulting texture bytes and raster target are
 unchanged. Reduced-tier worker inputs omit unused JBIG2 dictionaries; full-tier
-outputs release those dictionaries after compact encoding.
+outputs release those dictionaries after compact encoding. Raster preparation
+workers do not copy original encoded streams, which only serve HEP export.
 
-HEP downloads retain the canonical packed pixels and two-color RGBA palette in
-scene v10 monochrome sections, compressed by the container. Export skips RGBA
-expansion and PNG/WebP encoding for these layers. Reloading keeps packed storage
-and generates GPU derivatives as needed; palettes, alpha, row padding, and zoom
-detail remain exact. See [HEP container format](HEP_CONTAINER.md).
+HEP downloads offer two lossless scan encodings: original JBIG2 streams for a
+smaller file, or transposed packed-bit runs with DEFLATE for faster reload.
+Both retain the two-color RGBA palette and fall back to plain packed DEFLATE
+where needed. Export skips RGBA expansion and PNG/WebP encoding for these layers.
+Reloading keeps packed storage and generates GPU derivatives as needed;
+palettes, alpha, canonical pixels, and zoom detail remain exact. Larger exports
+download with a warning and retain selected LOD caches. See
+[HEP container format](HEP_CONTAINER.md).
 
 The all-pages trial targets `C:\Users\soadz\Desktop\TIKA\TIKA-2848-1.pdf`.
 Lightweight inspection of direct PDF dictionaries found 614 pages and 614

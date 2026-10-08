@@ -56,34 +56,34 @@ try {
   let compact;
   try {
     compact = await repackHepLodBytes(original, { sourcePdfByteLength: budget });
-    assert(compact.length < budget, "successful repack is strictly smaller than the PDF");
+    assert(compact.length >= budget, "a larger repack keeps the selected LOD caches");
     const compactArchive = await HepArchive.loadAsync(compact);
     const compactManifest = JSON.parse(await compactArchive.file("manifest.json").async("string"));
     assert.equal(compactManifest.sourcePdfByteLength, budget);
-    assert.equal(compactManifest.lod, undefined);
-    assert(!Object.keys(compactArchive.files).some(name => name.startsWith("lod-")));
-    assert.equal(getStoredVectorStrokeLod(await loadSceneFromHep(compact)), null);
+    assert(compactManifest.lod?.vector);
+    assert(Object.keys(compactArchive.files).some(name => name.startsWith("lod-vector/")));
+    assert(getStoredVectorStrokeLod(await loadSceneFromHep(compact)));
     for (const name of Object.keys(originalArchive.files)) {
       if (name === "manifest.json" || name.startsWith("lod-")) continue;
       assert.deepEqual(await compactArchive.file(name).async("uint8array"),
         await originalArchive.file(name).async("uint8array"), `canonical section ${name} stays byte identical`);
     }
-    assert(warnings.some(message => /Omitted stored LOD caches/.test(message)), "cache omission emits a diagnostic");
+    assert(warnings.some(message => message.includes(String(compact.length)) && message.includes(String(budget))),
+      "the size warning reports both lengths");
 
-    // Existing manifests enforce the policy even when no new PDF is provided.
+    // Existing manifests retain source sizes without discarding selected caches.
     const recordedArchive = await HepArchive.loadAsync(original);
     recordedArchive.file("manifest.json", JSON.stringify({ ...originalManifest, sourcePdfByteLength: budget }));
     const recorded = await recordedArchive.generateAsync({ type: "uint8array", compression: "DEFLATE" });
     const restoredBudget = await repackHepLodBytes(recorded);
-    assert(restoredBudget.length < budget);
-    assert.equal(JSON.parse(await (await HepArchive.loadAsync(restoredBudget)).file("manifest.json").async("string")).lod, undefined);
+    assert(restoredBudget.length >= budget);
+    assert(JSON.parse(await (await HepArchive.loadAsync(restoredBudget)).file("manifest.json").async("string")).lod?.vector);
     const keptBudget = await repackHepLodBytes(recorded, { sourcePdfByteLength: 1_000_000 });
-    assert(keptBudget.length < budget, "a supplied budget cannot loosen the recorded original PDF size");
+    assert(keptBudget.length >= budget, "a supplied budget does not remove caches or replace the recorded PDF size");
     assert.equal(JSON.parse(await (await HepArchive.loadAsync(keptBudget)).file("manifest.json").async("string")).sourcePdfByteLength, budget);
 
-    // Equality fails too, including a current archive without LOD caches.
-    await assert.rejects(repackHepLodBytes(compact, { sourcePdfByteLength: compact.length }),
-      /is not smaller than the original PDF/);
+    const equallySized = await repackHepLodBytes(compact, { sourcePdfByteLength: compact.length });
+    assert(getStoredVectorStrokeLod(await loadSceneFromHep(equallySized)), "size comparisons never block or remove LODs");
   } finally { console.warn = warn; }
   for (const sourcePdfByteLength of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1, "1000"]) {
     await assert.rejects(repackHepLodBytes(original, { sourcePdfByteLength }), /positive safe integer/);
@@ -115,13 +115,13 @@ try {
     const measured = await run(args);
     assert.equal(measured.code, 0, measured.stderr);
     assert.match(measured.stdout, /measurement only/);
-    assert.match(measured.stderr, /Omitted stored LOD caches/);
+    assert.match(measured.stderr, /original PDF/);
     assert.deepEqual(await readFile(input), Buffer.from(source), "measurement leaves the HEP unchanged");
     const written = await run([...args.slice(0, -1), "--write", input]);
     assert.equal(written.code, 0, written.stderr);
     assert.match(written.stdout, /replaced/);
     const replaced = await readFile(input);
-    assert(replaced.length < budget);
+    assert(replaced.length >= budget);
     assert.equal(JSON.parse(await (await HepArchive.loadAsync(replaced)).file("manifest.json").async("string")).sourcePdfByteLength, budget);
     assert.deepEqual(await readFile(pdf), pdfBytes, "only the PDF's size is inspected");
     assert.deepEqual((await readdir(directory)).sort(), ["input.hep", "source.pdf", "stderr.log", "stdout.log"], "staging directory is cleaned up");
@@ -129,10 +129,12 @@ try {
     assert.equal(directoryBudget.code, 1);
     assert.match(directoryBudget.stderr, /requires a single HEP file/);
     await writeFile(pdf, "%PDF-tiny");
-    const impossibleBudget = await run([...args.slice(0, -1), "--write", input]);
-    assert.equal(impossibleBudget.code, 1);
-    assert.match(impossibleBudget.stderr, /is not smaller than the original PDF/);
-    assert.deepEqual(await readFile(input), replaced, "failed policy verification leaves the HEP unchanged");
+    const tinySource = await run([...args.slice(0, -1), "--write", input]);
+    assert.equal(tinySource.code, 0, tinySource.stderr);
+    assert.match(tinySource.stderr, /original PDF/);
+    const warned = await readFile(input);
+    assert(warned.length <= replaced.length, "the CLI still replaces existing HEPs only when the repack is smaller");
+    assert(getStoredVectorStrokeLod(await loadSceneFromHep(warned)), "a tiny original PDF size does not drop LOD caches");
   } finally { await rm(directory, { recursive: true, force: true }); }
-  console.log("HEP LOD repack budgets: preserved canonical bytes, optional cache omission, strict source size, recorded budgets, cancellation, and atomic writes passed.");
+  console.log("HEP LOD repack sizes: preserved canonical bytes and selected caches, size warnings, recorded PDF sizes, cancellation, and atomic writes passed.");
 } finally { hooks.deregister(); }

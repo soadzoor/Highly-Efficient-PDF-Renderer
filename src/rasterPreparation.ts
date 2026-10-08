@@ -18,8 +18,11 @@ export function prepareRasterPixels(source: RasterTileSource, plan: RasterTilePl
         // Never structured-clone a monochrome layer's lazy RGBA getter or detach canonical pixels.
         const monochrome = source.monochrome;
         // Reduced coverage does not use JBIG2 dictionaries, which can outweigh the packed image.
-        const workerMonochrome = monochrome && (plan.width !== source.width || plan.height !== source.height)
-          ? { data: monochrome.data, colors: monochrome.colors } : monochrome;
+        const workerMonochrome = monochrome ? {
+          data: monochrome.data, colors: monochrome.colors,
+          ...(plan.width === source.width && plan.height === source.height && monochrome.symbols
+            ? { symbols: monochrome.symbols } : {})
+        } : undefined;
         const input = { width: source.width, height: source.height,
           data: monochrome ? new Uint8Array(0) : source.data, monochrome: workerMonochrome };
         return await new Promise<PreparedRasterPixels>((resolve, reject) => {

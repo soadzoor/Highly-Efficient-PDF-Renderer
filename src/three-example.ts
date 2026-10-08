@@ -1901,34 +1901,64 @@ async function downloadHep(): Promise<boolean> {
   textLodSelectElement.disabled = true;
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
-    const lodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
-    if (!lodOptions) return false;
+    const downloadOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
+    if (!downloadOptions) return false;
+    const { downloadBothScanEncodings, ...lodOptions } = downloadOptions;
+    const scanOptions = downloadBothScanEncodings ? [
+      { monochromeEncoding: "packed" as const },
+      { monochromeEncoding: "jbig2" as const }
+    ] : [{ monochromeEncoding: lodOptions.monochromeEncoding }];
+    let completedScanExports = 0;
+    const exportWarnings: string[] = [];
+    const needsCompleteScene = pdfObject.isPageDemandLoaded || Boolean(pdfObject.sourceOptions?.ocrTextOnly);
+    const scenePhaseEnd = needsCompleteScene ? 0.8 : 0;
+    const updateExportProgress = (progress: PDFLoadProgress, start: number, end: number): void => {
+      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return;
+      const stageLabel = formatLoadProgressStage(progress.stage);
+      const value = start + Math.max(0, Math.min(1, Number(progress.value) || 0)) * (end - start);
+      setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
+    };
     await yieldToBrowserPaint();
+    exportController.signal.throwIfAborted();
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    const exportScene = needsCompleteScene
+      ? await pdfObject.loadCompleteScene({
+        signal: exportController.signal,
+        onProgress: (progress) => updateExportProgress(progress, 0, scenePhaseEnd)
+      })
+      : pdfObject.sceneData;
+    exportController.signal.throwIfAborted();
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
     const hepOptions = {
-      ...((pdfObject.isPageDemandLoaded || pdfObject.sourceOptions?.ocrTextOnly) ? pdfObject.sourceOptions : {}),
-      ocrTextOnly: false,
       ...lodOptions,
       sourceLabel: pdfObject.sourceLabel,
       sourcePdfByteLength: pdfObject.sourceKind === "pdf" ? pdfObject.sourceBytes?.byteLength : undefined,
       signal: exportController.signal,
+      onWarning: (message: string) => {
+        if (activeHepExportController === exportController) exportWarnings.push(message);
+      },
       onProgress: (progress: PDFLoadProgress) => {
-        if (activeHepExportController !== exportController) {
-          return;
-        }
-        const stageLabel = formatLoadProgressStage(progress.stage);
-        const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
-        setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
+        const start = scenePhaseEnd + completedScanExports * (1 - scenePhaseEnd) / scanOptions.length;
+        const end = scenePhaseEnd + (completedScanExports + 1) * (1 - scenePhaseEnd) / scanOptions.length;
+        updateExportProgress(progress, start, end);
       }
     };
-    const hepBlob = pdfObject.isPageDemandLoaded || pdfObject.sourceOptions?.ocrTextOnly
-      ? await buildHep(pdfObject.sourceBytes!, hepOptions) : await buildHep(pdfObject.sceneData, hepOptions);
+    for (const scanOption of scanOptions) {
+      exportController.signal.throwIfAborted();
+      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+      const hepBlob = await buildHep(exportScene, { ...hepOptions, ...scanOption });
 
-    if (activeHepExportController !== exportController) {
-      return false;
+      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+      exportController.signal.throwIfAborted();
+      const scanSuffix = scanOption.monochromeEncoding === "packed" ? "-fast" :
+        scanOption.monochromeEncoding === "jbig2" ? "-small" : "";
+      const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${scanSuffix}${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
+      triggerBrowserDownload(hepBlob, hepFileName);
+      completedScanExports += 1;
+      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+      exportController.signal.throwIfAborted();
     }
-
-    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
-    triggerBrowserDownload(hepBlob, hepFileName);
+    if (exportWarnings.length > 0) setStatus(`HEP downloaded. Warning: ${exportWarnings.join(" ")}`);
     return true;
   } catch (error) {
     if (activeHepExportController === exportController) {
@@ -1937,7 +1967,10 @@ async function downloadHep(): Promise<boolean> {
     }
     return false;
   } finally {
-    pdfObject.resumePageLoading();
+    if (currentPdfObject === pdfObject &&
+      (activeHepExportController === exportController || activeHepExportController === null)) {
+      pdfObject.resumePageLoading();
+    }
     if (activeHepExportController === exportController) {
       activeHepExportController = null;
       setLoadingProgress(false);

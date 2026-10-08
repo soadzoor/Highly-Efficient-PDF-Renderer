@@ -124,9 +124,46 @@ try {
   page.position.x += 100000; object.updateMatrixWorld(true); object.updatePageDemand(host, camera); await flush();
   assert.equal(object.sceneData.rasterLayers[0].width, 96, "moved offscreen pages return to previews");
   assert.equal((await object.getPages())[0], page);
+  const displayedScene = object.sceneData, exportCallStart = calls.length, changesBeforeExport = changes.length;
+  const exportProgress = [];
+  const completeScene = await object.loadCompleteScene({ onProgress: event => exportProgress.push(event) });
+  assert.equal(completeScene.pageCount, 24);
+  assert.equal(completeScene.pagesPerRow, displayedScene.pagesPerRow, "export preserves the document grid");
+  assert.equal(completeScene.rasterLayers.length, 24);
+  assert(completeScene.rasterLayers.every(layer => layer.width === 1024 && layer.monochrome),
+    "full export contains original scan pixels instead of displayed previews");
+  assert.deepEqual(calls.slice(exportCallStart).map(call => [call.index, call.preview]),
+    Array.from({ length: 23 }, (_, index) => [index + 1, undefined]),
+    "the live PDF session reuses cached detail and compiles only missing full pages");
+  assert.equal(object.sceneData, displayedScene, "full extraction does not replace the viewing window");
+  assert.equal(changes.length, changesBeforeExport, "full extraction does not request new rendered frames");
+  assert.equal(loader.detailedCount, 1, "export does not retain a second full scan document in the viewing cache");
+  assert.equal(disposed, 0);
+  assert(exportProgress.some(event => event.processed === 24 && event.total === 24));
   object.dispose(); await loader.whenIdle();
   assert.equal(session.closed, true);
   assert.equal(disposed, 1);
+  await assert.rejects(object.loadCompleteScene(), /disposed|closed/i);
+
+  let enterExport;
+  const exportEntered = new Promise(resolve => { enterExport = resolve; });
+  const blockedSession = {
+    info: { pages: [{ index: 0, width: 600, height: 800 }] }, closed: false,
+    async compileVectorPage(_index, options) {
+      enterExport();
+      await new Promise((resolve, reject) => options.signal.addEventListener("abort",
+        () => reject(options.signal.reason), { once: true }));
+    },
+    async close() { this.closed = true; }
+  };
+  const blockedLoader = new PdfPageDemandLoader(blockedSession, () => {});
+  const blockedObject = await createThreePdfObject({ scene: composeVectorScenesInGrid(blockedLoader.pageScenes, 1),
+    sourceKind: "pdf", sourceLabel: "cancelled export", sourceBytes: Uint8Array.of(1), pageDemand: blockedLoader },
+  { vectorLod: "off", textLod: "off" }, undefined, undefined, () => native);
+  const blockedExport = blockedObject.loadCompleteScene();
+  await exportEntered; blockedObject.dispose();
+  await assert.rejects(blockedExport, /disposed|closed/i);
+  assert.equal(blockedSession.closed, true, "disposing during export closes and cancels the reused worker");
 
   const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
   const bytes = writeTinyPdf({ objects: [
@@ -165,5 +202,5 @@ try {
   await assert.rejects(loadPdfSceneFromSource(bytes,{ onProgress:event=>{
     if (event.stage === "complete") cancelled.abort(reason);
   } },cancelled.signal,true),error=>error===reason);
-  console.log("Three page demand: metadata-only construction, camera projections, stable page handles, zoom-out previews, cached promotion and worker/context cleanup passed.");
+  console.log("Three page demand: metadata-only construction, camera projections, stable page handles, cached promotion, full export reuse and worker/context cleanup passed.");
 } finally { clearTimeout(deadline); globalThis.document = oldDocument; hooks.deregister(); }

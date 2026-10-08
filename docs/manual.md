@@ -153,7 +153,10 @@ emits `change` events with `reason: "pages-loaded"` when it changes. Use
 `pageLoading: "eager"` when complete original scene data, including decoded scans,
 is required before rendering.
 Extraction APIs and HEP conversion still produce complete scenes for their selected pages;
-the Three example exports retained original PDF bytes rather than its partial scene.
+the Three example reuses its live PDF session and cached full pages to complete
+the export scene once. It shares that scene between both scan encodings instead
+of reopening the PDF for each download. Missing full pages still need compilation;
+raster and OCR previews cannot stand in for the original page content.
 All GPU integrations allocate small raster display tiers first and increase
 their resolution automatically with zoom. CPU canonical image data stays available
 for refinement; reducing GPU textures alone does not reduce eager parsing memory.
@@ -961,19 +964,30 @@ checkboxes when applicable, checked by default. Cancel or Escape stops the
 export. Vector LOD offers Lossless and Compact precision choices. Downloads with
 either LOD option use a `-parsed-data-lod.hep` suffix.
 
+For monochrome scans, the dialog also offers Faster opening, Smaller file, or
+Both (two files), selected by default. The fast variant uses packed binary runs
+with DEFLATE; the smaller variant reuses original JBIG2 streams where available.
+Both preserve full-resolution image quality. Filenames include `-fast` or
+`-small` before the optional `-lod` suffix. The smaller variant requires more
+image decoding work when reopened.
+
+Download HEP reuses a complete loaded scene immediately. For paged viewing, it
+reuses the existing PDF worker and cached full pages, loading only the remaining
+complete content. This preparation runs once even when Both is selected. Export
+leaves the viewing window unchanged and releases the temporary full scene afterward.
+
 Exports compare the complete HEP against the original PDF's byte length and
-require it to be strictly smaller. Optional LOD caches are omitted with a
-console warning if they would exceed that budget; the viewer rebuilds them when
-needed. If the HEP still cannot fit without caches, export reports a size-policy
-error and keeps the document open. No document content is discarded to meet the
-budget. A custom scene or an older HEP without a recorded source size needs the
+show a warning when the HEP is at least as large. Downloads still succeed and
+retain all selected LOD caches. The viewer displays both file sizes after the
+download; library callers can use `onWarning(message)`. A custom scene or an
+older HEP without a recorded source size needs the
 `sourcePdfByteLength` build option for this check.
 
 The builder accepts `signal` and `onProgress`, including LOD building, raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP containers v1 and v2 with scene schema v9. New exports
+The loader supports HEP containers v1 and v2 with scene schemas v9–v12. New exports
 use v2 only when an exact stroke-style palette makes the file smaller; these
 files require an updated viewer. Existing v1 files remain supported. The palette
 changes no rendering values; optional LOD caches are separate sections. Earlier scene schemas

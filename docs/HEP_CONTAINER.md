@@ -1,13 +1,14 @@
 # HEP container versions 1 and 2
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1** and **2** wrap **scene schema version 9 or 10**, recorded in
+versions **1** and **2** wrap **scene schema versions 9–12**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support both container versions and scene v9/v10; files using older
+Readers support both container versions and scene v9–v12; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
-v10 when packed monochrome raster layers are present, otherwise v9. A v9-only
-reader needs an update to open v10. Container repacking preserves section bytes
+v12 for transposed binary runs, v11 for original JBIG2 streams, v10 for plain
+packed monochrome rasters, otherwise v9. Readers need support for the scene
+version used by the file. Container repacking preserves section bytes
 and does not upgrade a scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
@@ -203,7 +204,7 @@ decimal text.
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
 | `drawRuns` | `{file, count}` | `geometry/draw-runs.varint` |
 | `paintGraph` | `{file, rootCount}` | `geometry/paint-graph.varint` |
-| `rasterLayers` (v9/v10) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
+| `rasterLayers` (v9–v12) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
 the signed mapping. `geometry/clip-paths.d512` holds `pathCount`, then per path
@@ -242,8 +243,10 @@ cell back into that layer's own straight-alpha RGBA; atlases never reach the GPU
 `geometry/raster-layers.varint` holds `atlasCount`, then per atlas an encoding
 byte (0 raw RGBA8, 1 PNG), `width` and `height`. Then `layerCount` and per layer
 a flags byte (bits 0-1 storage: 0 raw RGBA8, 1 PNG, 2 WebP, 3 atlas cell; bit 2
-opacity present; in v10 bit 3 selects packed monochrome with bits 0-1 zero;
-bits 4-7 zero), `width`, `height`, and zigzag deltas of
+opacity present; bit 3 selects packed monochrome in v10+, bit 4 selects original
+JBIG2 in v11+, bit 5 selects transposed binary runs in v12+; an extended storage
+flag requires bits 0-1 and all other storage flags zero; bits 6-7 zero),
+`width`, `height`, and zigzag deltas of
 `paintOrder` and `pageIndex` against the previous layer. An atlas cell follows
 with its atlas index and zigzag `x` and `y`, relative to the previous cell's right
 edge and row when that cell is in the same atlas and to zero otherwise; the cell
@@ -283,8 +286,55 @@ Indexed section lengths are checked against dimensions before decompression.
 For a 2,480 by 3,506 scan this reduces the uncompressed pixel section from
 34,779,520 RGBA bytes to 1,086,868 bytes including the palette. Compressed size
 depends on the scan; packed DEFLATE does not promise the same ratio as the
-original JBIG2 stream. The existing requirement that an exported HEP be smaller
-than its source PDF still applies.
+original JBIG2 stream. Larger HEP exports remain valid and produce a size warning.
+
+Scene v11 adds `raster/layer-N.jbig2`, reusing the PDF's original encoded JBIG2
+segments when the canonical packed pixels and dimensions still match their
+source fingerprint. This avoids re-encoding monochrome scans. Each section has
+a 40-byte `HJB1` header followed by the encoded segments:
+
+| Offset | Type | Value |
+| --- | --- | --- |
+| 0 | 4 bytes | `HJB1` |
+| 4 | uint8 | Bit 0: invert decoded bits; other bits zero |
+| 5 | 3 bytes | Reserved: zero |
+| 8 | 8 bytes | Two straight-alpha RGBA8 palette colors |
+| 16 | uint32 | Encoded segment byte length |
+| 20 | uint32 | Shared globals byte length |
+| 24 | uint32 | Globals section index, or `0xffffffff` when empty |
+| 28 | 2 uint32 | Canonical packed pixel fingerprint |
+| 36 | uint32 | Reserved: zero |
+
+Globals use `raster/jbig2-globals-N.bin`; identical globals share one section.
+Both segments and globals use container STORE because they are already
+compressed. The loader uses the bundled native JBIG2 decoder, applies polarity,
+clears row padding as the original PDF parser did, and verifies the fingerprint
+before publishing a layer. The fingerprint is the pair returned by
+`hashMonochromePixels` in `src/monochromeRaster.ts`, including dimensions.
+Palette, opacity, page placement, and pixels remain exact. Unsupported source
+provenance or changed pixels fall back to v10 packed storage. Original segments
+and shared globals count toward resident raster memory alongside decoded packed
+pixels. One JBIG2 decode is bounded to 128 MiB of encoded inputs and packed output;
+shared globals are size-checked before decompression. Reloading JBIG2 usually
+uses more CPU than inflating packed bytes.
+
+Scene v12 adds `raster/layer-N.binary`, selected by the fast-opening scan option.
+Its 16-byte header contains `HBR1` at bytes 0–3, the two RGBA8 palette colors at
+4–11, and four reserved zero bytes at 12–15. The remaining bytes store an initial
+bit (0 or 1), then positive canonical unsigned base-128 varint run lengths;
+successive runs alternate the bit value. The bit stream is the packed raster
+transposed in 8-by-8 blocks: for each group of eight rows, visit byte columns
+left to right, transpose the eight row bytes, and concatenate the eight output
+bytes. Missing rows in the final block are zero. Bits within each output byte
+are MSB first. Transposing again recovers the canonical rows, including their
+padding bits. Runs must fill exactly `ceil(width / 8) * ceil(height / 8) * 64`
+bits; zero runs, overlong varints, overruns, trailing bytes and nonzero hidden
+rows are invalid. Container DEFLATE compresses the run stream.
+
+The writer bounds preprocessing memory and falls back to v10 packed storage if
+the run section is not smaller than the plain palette-plus-packed section.
+Reload allocates only the canonical packed output and a small block scratch
+buffer. Both scan options are lossless and avoid full RGBA expansion.
 
 ### Text glyph outlines and origins
 
@@ -533,10 +583,11 @@ Three.js page matrices are presentation state and are not stored here.
 
 An optional top-level `manifest.sourcePdfByteLength` records the original PDF's
 positive safe-integer byte length. New PDF exports record it, and readers retain
-it for later scene exports. Writers check the complete archive, including index
-and padding, against this strict upper bound. They omit optional LOD caches with
-a diagnostic when needed; if canonical content still cannot fit, export fails
-before saving. This additive metadata changes no container or scene version.
+it for later scene exports. Writers compare the complete archive, including index
+and padding, with this size and emit a console warning and optional `onWarning`
+callback when the HEP is at least as large. Export still succeeds and preserves
+all requested LOD caches. The demo viewers show the warning after download.
+This additive metadata changes no container or scene version.
 For older files or custom scenes, callers can supply the original PDF length.
 
 The optional top-level `manifest.lod` object has independent `vector` and `text`
