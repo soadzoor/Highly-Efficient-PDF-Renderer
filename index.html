@@ -52,9 +52,9 @@
           <label for="page-streaming-checkbox">Stream pages</label>
           <input id="page-streaming-checkbox" type="checkbox" />
         </div>
-        <div class="number-row" title="Experimental PDF mode. Load every selected page and compress scans during parsing. Fine text may soften. Overrides page streaming; packed monochrome scans remain lossless.">
-          <label for="compress-scans-checkbox">GPU compress scans (experimental)</label>
-          <input id="compress-scans-checkbox" type="checkbox" />
+        <div class="number-row" title="PDF only. Load every selected page and prepare scan textures during parsing for faster zoom refinement. Uses more loading time and CPU memory. Overrides page streaming; packed monochrome scans remain lossless, while color and grayscale compression may soften fine text.">
+          <label for="compress-scans-checkbox">GPU compress scans</label>
+          <input id="compress-scans-checkbox" type="checkbox" checked />
         </div>
         <div class="number-row">
           <label for="annotation-bubbles-checkbox">Annotation bubbles</label>

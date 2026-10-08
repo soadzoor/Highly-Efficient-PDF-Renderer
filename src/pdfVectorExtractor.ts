@@ -234,7 +234,7 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
-  /** Experimental: prepare bounded GPU-compressed scan derivatives between page compiles. */
+  /** Prepare bounded compact monochrome or eligible GPU-compressed color/grayscale scan derivatives between page compiles. */
   compressScans?: boolean;
   /** Draw stored text with bundled substitute fonts, omitting images and other graphics. PDF only. */
   ocrTextOnly?: boolean;

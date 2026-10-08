@@ -106,8 +106,22 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
-The standalone canvas viewer and Three.js package/viewers prepare all selected
-page overviews before display by default, then upload the initial scene once.
+The native and Three demos enable **GPU compress scans** by default. They decode
+every selected PDF page before display and prepare bounded scan textures during
+parsing, trading longer loading and more CPU memory for faster zoom refinement.
+Packed monochrome scans use compact storage; eligible opaque color/grayscale
+scans can use lossy BC7/ASTC blocks. Preparation targets image-only pages with a
+raster covering at least half the page. Pages with visible vectors or text skip
+scan preparation, but still load upfront while the option is enabled. It overrides page streaming,
+is bypassed by **Use OCR text instead of scans**, and does not affect HEP loading.
+Selecting **GPU compress scans** unchecks both **Use OCR text instead of scans**
+and **Stream pages**. Selecting either of those unchecks **GPU compress scans**;
+OCR-only viewing and streaming can be used together. HEP loads preserve the
+PDF scan-compression choice.
+
+The Three.js package defaults and demos with **GPU compress scans** unchecked
+prepare all selected page overviews before display, then upload the initial
+scene once.
 They do not rebuild the growing scene or wait for a frame after each parsed page.
 The **Stream pages** checkbox opts into viewport-driven loading for PDFs with
 more than 16 selected pages, starting from metadata and loading pages near the

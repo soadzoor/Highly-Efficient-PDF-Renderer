@@ -323,9 +323,9 @@ textSelectionCheckbox.addEventListener("change", () => {
 });
 
 textSelectionCheckbox.disabled = false;
-ocrTextCheckbox.addEventListener("change", () => { void reloadPdfViewingOptions(); });
-pageStreamingCheckbox.addEventListener("change", () => { void reloadPdfViewingOptions(); });
-compressScansCheckbox.addEventListener("change", () => { void reloadPdfViewingOptions(); });
+ocrTextCheckbox.addEventListener("change", handleOcrTextChange);
+pageStreamingCheckbox.addEventListener("change", handlePageStreamingChange);
+compressScansCheckbox.addEventListener("change", handleCompressScansChange);
 let annotationInteraction: AnnotationInteractionController | undefined;
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
@@ -611,6 +611,7 @@ let lastLoadedPdfPassword: string | undefined;
 let loadedOcrTextOnly = false;
 let loadedPageStreaming = false;
 let loadedCompressScans = false;
+let loadedCompressScansPreference = compressScansCheckbox.checked;
 let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
@@ -1419,12 +1420,15 @@ function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, stream
   loadedOcrTextOnly = options.source.kind === "pdf" && ocrTextOnly;
   ocrTextCheckbox!.checked = loadedOcrTextOnly;
   ocrTextCheckbox!.disabled = options.source.kind !== "pdf";
-  loadedPageStreaming = options.source.kind === "pdf" && streaming;
+  loadedCompressScans = options.source.kind === "pdf" && compressScans && !loadedOcrTextOnly;
+  loadedPageStreaming = options.source.kind === "pdf" && streaming && !loadedCompressScans;
   pageStreamingCheckbox!.checked = loadedPageStreaming;
-  loadedCompressScans = options.source.kind === "pdf" && compressScans;
-  compressScansCheckbox!.checked = loadedCompressScans;
+  if (options.source.kind === "pdf") {
+    loadedCompressScansPreference = !loadedOcrTextOnly && !loadedPageStreaming && compressScansCheckbox!.checked;
+  }
+  compressScansCheckbox!.checked = loadedCompressScansPreference;
   compressScansCheckbox!.disabled = options.source.kind !== "pdf";
-  pageStreamingCheckbox!.disabled = options.source.kind !== "pdf" || loadedCompressScans;
+  pageStreamingCheckbox!.disabled = options.source.kind !== "pdf";
   lastDownloadablePdf = options.downloadablePdf;
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
 }
@@ -1467,6 +1471,24 @@ function buildPdfPageCacheKey(): string {
   return `merge:1|cull:1|ocr:${options.ocrTextOnly ? 1 : 0}|stream:${pageStreamingCheckbox!.checked && !options.compressScans ? 1 : 0}|compress:${options.compressScans ? 1 : 0}`;
 }
 
+function handleOcrTextChange(): void {
+  if (ocrTextCheckbox!.checked) compressScansCheckbox!.checked = false;
+  void reloadPdfViewingOptions();
+}
+
+function handlePageStreamingChange(): void {
+  if (pageStreamingCheckbox!.checked) compressScansCheckbox!.checked = false;
+  void reloadPdfViewingOptions();
+}
+
+function handleCompressScansChange(): void {
+  if (compressScansCheckbox!.checked) {
+    ocrTextCheckbox!.checked = false;
+    pageStreamingCheckbox!.checked = false;
+  }
+  void reloadPdfViewingOptions();
+}
+
 async function reloadPdfViewingOptions(): Promise<void> {
   const source = lastLoadedSource;
   if (source?.kind !== "pdf") return;
@@ -1490,8 +1512,8 @@ async function reloadPdfViewingOptions(): Promise<void> {
       ocrTextCheckbox!.checked = loadedOcrTextOnly;
       ocrTextCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
       pageStreamingCheckbox!.checked = loadedPageStreaming;
-      pageStreamingCheckbox!.disabled = lastLoadedSource?.kind !== "pdf" || loadedCompressScans;
-      compressScansCheckbox!.checked = loadedCompressScans;
+      pageStreamingCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
+      compressScansCheckbox!.checked = loadedCompressScansPreference && !loadedOcrTextOnly && !loadedPageStreaming;
       compressScansCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
     }
   }
@@ -1646,7 +1668,7 @@ function updateBackendSelectDisabledState(): void {
   ocrTextCheckbox!.disabled = pendingSourceLoadCount > 0 || activeSceneLoadToken !== null ||
     activeHepExportController !== null || lastLoadedSource?.kind === "hep";
   compressScansCheckbox!.disabled = ocrTextCheckbox!.disabled;
-  pageStreamingCheckbox!.disabled = ocrTextCheckbox!.disabled || loadedCompressScans;
+  pageStreamingCheckbox!.disabled = ocrTextCheckbox!.disabled;
   backendSelectElement.disabled =
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||

@@ -73,13 +73,21 @@ performed for this change.
 
 ## Verification
 
-The native and Three examples expose **GPU compress scans (experimental)**.
-Enable it with **Use OCR text instead of scans** off, then open the PDF. It
-overrides streaming and decodes all selected pages before display. Packed scans
+The native and Three examples enable **GPU compress scans** by default.
+Selecting it unchecks both **Use OCR text instead of scans** and **Stream pages**.
+Selecting either of those unchecks **GPU compress scans**; OCR-only viewing and
+streaming can be used together.
+With **Use OCR text instead of scans** off, it overrides streaming and decodes
+all selected pages before display, trading longer loading and more CPU memory
+for less scan preparation during zoom. Packed scans
 prepare their compact atlas candidates during parsing, with a per-page share of
 the automatic raster target. The display tier can be smaller than the original;
 zoom detail and exports retain the canonical packed pixels. Color/grayscale
 scans can instead use optional lossy BC7/ASTC blocks, with a fidelity diagnostic.
+Preparation targets image-only pages with a raster covering at least half the
+page. Pages with visible vectors or text skip scan preparation, but still load
+upfront while the option is enabled. HEP loading is unaffected, and the library option remains
+opt-in.
 
 Zoom refinement extracts complete compact blocks directly from packed bytes,
 uses exact 2×2 averaging for even mip reductions, and reuses horizontal coverage
@@ -100,7 +108,7 @@ The all-pages trial targets `C:\Users\soadz\Desktop\TIKA\TIKA-2848-1.pdf`.
 Lightweight inspection of direct PDF dictionaries found 614 pages and 614
 1-bit DeviceGray/JBIG2 scans, approximately 641 MiB of packed base pixels.
 No pages were decoded for that inspection. Original CPU pixels remain resident
-in this experimental mode, in addition to bounded display preparation data.
+in this mode, in addition to bounded display preparation data.
 Actual browser/GPU stability and VRAM use require a manual run.
 
 Synthetic checks cover all base/mip texels, exact atlas byte snapshots,

@@ -88,7 +88,7 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   /** Default all prepares every viewing page before display. Auto streams large PDFs; eager also decodes original scan pixels. */
   pageLoading?: "all" | "auto" | "eager";
 
-  /** Experimental PDF viewing mode: load all selected scan pages and prepare lossy GPU blocks during parsing. */
+  /** Decode all selected PDF pages and prepare bounded scan textures during parsing: compact monochrome or eligible lossy color/grayscale. */
   compressScans?: boolean;
 
   /** PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding. */

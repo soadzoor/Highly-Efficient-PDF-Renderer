@@ -142,7 +142,7 @@ try {
     for (const count of ["segmentCount", "fillPathCount", "textInstanceCount", "gradientFillPathCount", "gradientStrokeRunCount"]) {
       const layer = colorScan(64, 64);
       await compressor.preparePage(Object.assign(page(layer), { [count]: 1 }), 4, 0);
-      assert.equal(layer.gpuCompression, undefined, "ordinary vector/text pages are outside the scan experiment");
+      assert.equal(layer.gpuCompression, undefined, "ordinary vector/text pages skip scan preparation");
       assert.equal(layer.compressionHint, undefined);
     }
     assert.equal(encoder.calls.length, 0);

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 
 const mainSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+const threeHtml = await readFile(new URL("../three-example.html", import.meta.url), "utf8");
 const zipSource = await readFile(new URL("../src/hepShared.ts", import.meta.url), "utf8");
 
 assert.match(
@@ -74,6 +75,18 @@ assert.match(vectorLodSelect.content, /<option\s+value="auto"\s+selected>Auto<\/
 const textLodSelect = readSelect(html, "text-lod-mode");
 assert.doesNotMatch(textLodSelect.openingTag, /\bdisabled\b/i);
 assert.match(textLodSelect.content, /<option\s+value="auto"\s+selected>Auto<\/option>/i);
+
+for (const [name, document] of [["native", html], ["Three", threeHtml]]) {
+  const scanCompression = /<input\b[^>]*\bid=["']compress-scans-checkbox["'][^>]*>/i.exec(document);
+  assert.ok(scanCompression, `${name} viewer exposes GPU scan compression`);
+  assert.match(scanCompression[0], /\bchecked\b/i, `${name} viewer enables GPU scan compression by default`);
+  const pageStreaming = /<input\b[^>]*\bid=["']page-streaming-checkbox["'][^>]*>/i.exec(document);
+  assert.ok(pageStreaming, `${name} viewer exposes page streaming`);
+  assert.doesNotMatch(pageStreaming[0], /\bchecked\b/i, `${name} viewer defaults to mutually exclusive page loading modes`);
+  assert.match(document, /GPU compress scans/);
+  assert.doesNotMatch(document, /GPU compress scans\s*\(experimental\)/i,
+    `${name} viewer no longer labels GPU scan compression experimental`);
+}
 
 console.log("persistent viewer contract passed");
 

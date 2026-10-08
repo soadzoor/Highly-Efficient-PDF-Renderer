@@ -81,7 +81,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
 | `pageLoading` | `"all"` | Prepare all viewing pages before display, with one initial scene upload. `"auto"` opts into viewport-driven streaming for PDFs with more than 16 selected pages. Both preserve vector pages, use stored OCR as scan overviews and load scan pixels on zoom; only scans without usable OCR get small bitmap previews. `"eager"` also decodes complete original scan content before returning. |
-| `compressScans` | `false` | Experimental PDF viewing mode: eagerly decode all selected pages and prepare bounded scan texture data between page compiles. Packed monochrome uses compact atlases; opaque color/grayscale scans can use lossy BC7/ASTC. Overrides page streaming; `ocrTextOnly` skips scan preparation. |
+| `compressScans` | `false` | Eagerly decode all selected PDF pages and prepare bounded scan texture data between page compiles. Packed monochrome uses compact atlases; opaque color/grayscale scans can use lossy BC7/ASTC. Overrides page streaming; `ocrTextOnly` skips scan preparation. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
@@ -123,6 +123,14 @@ Compatible renderers reuse that data at upload; zoom can still prepare a higher
 resolution from original pixels. This mode retains every original page on the CPU,
 so it uses more CPU memory than streaming. Its temporary GPU encoder and retained
 display derivatives are bounded independently of the original document pixels.
+The native and Three demo viewers enable **GPU compress scans** by default;
+selecting it unchecks both **Use OCR text instead of scans** and **Stream pages**.
+Selecting either of those unchecks **GPU compress scans**; OCR-only viewing and
+streaming can be used together.
+The library option remains opt-in. Scan preparation targets image-only pages
+with a raster covering at least half the page. Pages containing visible vector
+artwork or text skip this preparation, but the option still loads every selected page
+upfront and overrides streaming for those PDFs. HEP loading is unaffected.
 Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
 Large stroke and text LOD preparations use a module worker when available,
@@ -1191,7 +1199,7 @@ no GPU name or memory information needs to be provided by the user.
 
 Eligibility is conservative: packed binary images, transparency, small or thin
 images, and sampled sharp edges or text-like detail avoid block compression.
-The explicit `compressScans` experiment permits sharp opaque scanned content to
+`compressScans` permits sharp opaque scanned content to
 use lossy blocks and emits a fidelity diagnostic. Packed monochrome stays on its
 compact/packed path. Parse-time derivatives set a bounded minimum display tier
 when their texture format is supported, so all scan pages can remain resident

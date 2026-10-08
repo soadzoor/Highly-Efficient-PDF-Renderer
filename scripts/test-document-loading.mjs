@@ -32,7 +32,8 @@ const context = vm.createContext({
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
   lastLoadedPdfPassword: undefined, loadedOcrTextOnly: false, ocrTextCheckbox: { checked: false, disabled: false },
   loadedPageStreaming: false, pageStreamingCheckbox: { checked: false, disabled: false },
-  loadedCompressScans: false, compressScansCheckbox: { checked: false, disabled: false },
+  loadedCompressScans: false, loadedCompressScansPreference: false,
+  compressScansCheckbox: { checked: false, disabled: false },
   lastParsedSceneLabel: null, parsedPdfPageCache: null,
   exampleManifestEntries: [], exampleSelectionMap: new Map(),
   exampleDropdown: { setDisabled: noop },
@@ -281,6 +282,7 @@ assert.equal(context.loadedOcrTextOnly, false);
 assert.deepEqual(view, beforeOcrView);
 
 await testThreeDocumentReplacement();
+await testScanCompressionPreferences();
 await testThreeHepExports();
 await testHepLodPrompt();
 await testThreeBackendReplacement();
@@ -288,6 +290,229 @@ await testRoomDocumentReplacement();
 await testNativeBackendLoading();
 testNativePageDemandFrames();
 console.log("Document replacement, export ownership, upload rollback, and superseded-load cancellation passed.");
+
+async function testScanCompressionPreferences() {
+  const pdf = { kind: "pdf", bytes: Uint8Array.of(1), label: "scans.pdf" };
+  const hep = { kind: "hep", bytes: Uint8Array.of(2), label: "scans.hep" };
+  const host = vm.createContext({
+    AbortController, loadedOcrTextOnly: false, loadedPageStreaming: false,
+    loadedCompressScans: false, loadedCompressScansPreference: true,
+    ocrTextCheckbox: { checked: false }, pageStreamingCheckbox: { checked: false },
+    compressScansCheckbox: { checked: true }, backendSelectElement: {},
+    lastLoadedSource: null, lastLoadedPdfPassword: undefined, lastDownloadablePdf: null,
+    pendingSourceLoadCount: 0, activeSceneLoadToken: null, activeHepExportController: null,
+    activePdfPageLoader: null, sourceLoadController: null,
+    setDownloadPdfButtonState: noop, cancelActiveHepExport: noop,
+    beginSourceLoad: () => { host.sourceLoadController = new AbortController(); return 1; },
+    finishSourceLoad: noop, isCurrentSourceLoad: () => true, createParseBuffer: bytes => bytes.buffer,
+    setStatus: noop
+  });
+  for (const name of ["getExtractionOptions", "commitLoadedSource", "updateBackendSelectDisabledState", "reloadPdfViewingOptions",
+    "handleOcrTextChange", "handleCompressScansChange", "handlePageStreamingChange"])
+    vm.runInContext(sourceFunction(source, name), host);
+  const reloadPdfViewingOptions = host.reloadPdfViewingOptions;
+  const nativeChanges = [];
+  host.reloadPdfViewingOptions = () => nativeChanges.push({
+    ...host.getExtractionOptions(), streaming: host.pageStreamingCheckbox.checked
+  });
+  assert.equal(host.getExtractionOptions().compressScans, true, "checked default prepares scan textures for PDF loading");
+  host.commitLoadedSource({ source: pdf }, false, false, true);
+  host.updateBackendSelectDisabledState();
+  assert.equal(host.pageStreamingCheckbox.checked, false, "GPU preparation leaves page streaming unchecked");
+  assert.equal(host.pageStreamingCheckbox.disabled, false, "page streaming remains available to switch away from GPU preparation");
+  host.commitLoadedSource({ source: hep });
+  assert.equal(host.loadedCompressScans, false, "HEP loading does not run the PDF scan compressor");
+  assert.equal(host.compressScansCheckbox.checked, true, "HEP loading preserves the PDF compression preference");
+  assert.equal(host.compressScansCheckbox.disabled, true);
+  assert.equal(host.getExtractionOptions().compressScans, true, "the next PDF keeps the checked preference");
+  host.commitLoadedSource({ source: pdf }, false, false, true);
+  host.pageStreamingCheckbox.checked = true;
+  host.handlePageStreamingChange();
+  assert.equal(host.compressScansCheckbox.checked, false, "selecting page streaming unchecks GPU compression before reloading");
+  assert.equal(nativeChanges.at(-1).compressScans, false);
+  assert.equal(nativeChanges.at(-1).streaming, true);
+  host.commitLoadedSource({ source: pdf }, false, true, false);
+  host.ocrTextCheckbox.checked = true;
+  host.handleOcrTextChange();
+  assert.equal(host.compressScansCheckbox.checked, false, "selecting OCR unchecks GPU scan compression before reloading");
+  assert.equal(nativeChanges.at(-1).ocrTextOnly, true);
+  assert.equal(nativeChanges.at(-1).compressScans, false);
+  assert.equal(nativeChanges.at(-1).streaming, true, "OCR and page streaming can be selected together");
+  host.commitLoadedSource({ source: pdf }, true, true, false);
+  host.updateBackendSelectDisabledState();
+  assert.equal(host.compressScansCheckbox.checked, false, "text-only PDFs keep GPU scan compression unchecked");
+  assert.equal(host.pageStreamingCheckbox.disabled, false, "text-only loading can stream");
+  host.pageStreamingCheckbox.checked = false;
+  host.handlePageStreamingChange();
+  assert.equal(host.ocrTextCheckbox.checked, true, "unchecking streaming preserves OCR");
+  assert.equal(host.compressScansCheckbox.checked, false, "unchecking streaming does not select GPU compression");
+  host.commitLoadedSource({ source: pdf }, true, false, false);
+  host.ocrTextCheckbox.checked = false;
+  host.handleOcrTextChange();
+  assert.equal(host.compressScansCheckbox.checked, false, "unchecking OCR does not select GPU compression");
+  host.commitLoadedSource({ source: pdf }, true, true, false);
+  host.compressScansCheckbox.checked = true;
+  host.handleCompressScansChange();
+  assert.equal(host.ocrTextCheckbox.checked, false, "selecting GPU scan compression unchecks OCR before reloading");
+  assert.equal(host.pageStreamingCheckbox.checked, false, "selecting GPU scan compression unchecks streaming before reloading");
+  assert.equal(nativeChanges.at(-1).ocrTextOnly, false);
+  assert.equal(nativeChanges.at(-1).compressScans, true);
+  assert.equal(nativeChanges.at(-1).streaming, false);
+  host.commitLoadedSource({ source: pdf }, false, false, true);
+  host.compressScansCheckbox.checked = false;
+  host.handleCompressScansChange();
+  assert.equal(host.ocrTextCheckbox.checked, false, "unchecking GPU compression does not select OCR");
+  assert.equal(host.pageStreamingCheckbox.checked, false, "unchecking GPU compression does not select streaming");
+  host.commitLoadedSource({ source: pdf }, false, false, false);
+  host.commitLoadedSource({ source: hep });
+  assert.equal(host.compressScansCheckbox.checked, false, "an explicit opt-out survives HEP loading");
+  for (const [textOnly, compressed, streaming, select] of [
+    [false, true, false, "ocr"], [false, true, false, "stream"],
+    [true, false, true, "gpu"], [false, false, true, "gpu"], [true, false, false, "stream"]
+  ]) {
+    for (const cancelled of [false, true]) {
+      host.ocrTextCheckbox.checked = textOnly;
+      host.compressScansCheckbox.checked = compressed;
+      host.pageStreamingCheckbox.checked = streaming;
+      host.commitLoadedSource({ source: pdf }, textOnly, streaming, compressed);
+      host.loadPdfBuffer = async () => {
+        assert.equal(host.ocrTextCheckbox.checked && host.compressScansCheckbox.checked, false,
+          "reload starts with mutually exclusive scan modes");
+        assert.equal(host.pageStreamingCheckbox.checked && host.compressScansCheckbox.checked, false,
+          "reload starts with mutually exclusive page loading modes");
+        if (cancelled) host.sourceLoadController.abort();
+        throw new Error("reload failed");
+      };
+      let pendingReload;
+      host.reloadPdfViewingOptions = () => { pendingReload = reloadPdfViewingOptions(); };
+      if (select === "ocr") {
+        host.ocrTextCheckbox.checked = true;
+        host.handleOcrTextChange();
+      } else if (select === "stream") {
+        host.pageStreamingCheckbox.checked = true;
+        host.handlePageStreamingChange();
+      } else {
+        host.compressScansCheckbox.checked = true;
+        host.handleCompressScansChange();
+      }
+      await pendingReload;
+      assert.equal(host.ocrTextCheckbox.checked, textOnly, "failed or cancelled reloads restore the committed OCR choice");
+      assert.equal(host.compressScansCheckbox.checked, compressed, "failed or cancelled reloads restore the committed compression choice");
+      assert.equal(host.pageStreamingCheckbox.checked, streaming, "failed or cancelled reloads restore the committed streaming choice");
+      assert.equal(host.pageStreamingCheckbox.disabled, false);
+    }
+  }
+
+  const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
+  const three = vm.createContext({
+    currentPdfObject: null, loadedCompressScansPreference: true, lastNativeDrawStats: null,
+    ocrTextCheckboxElement: { checked: false }, pageStreamingCheckboxElement: { checked: false },
+    compressScansCheckboxElement: { checked: true }, openButtonElement: {}, fileInputElement: {},
+    exampleDropdown: { setDisabled: noop }, pageLayoutButtons: [],
+    readPageBackgroundColor: () => [1, 1, 1, 1], readVectorOverrideColor: () => [0, 0, 0, 0],
+    readVectorLodMode: () => "auto", readTextLodMode: () => "auto",
+    disposeCurrentObject: noop, resetPageLayout: noop, layerControls: { objectChanged: noop },
+    scene: { add: noop }, resetFpsMeter: noop, drawCallMeter: { reset: noop },
+    refreshDropIndicator: noop, updateCameraClipping: noop, drawingSelection: { sceneChanged: noop },
+    annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop },
+    annotationInteraction: null, updateDrawStatsMeter: noop, setDownloadDataButtonState: noop, requestRender: noop,
+    refreshSearchAvailability: noop, textSearchInputElement: { value: "" },
+    readBackendMode: () => "webgl"
+  });
+  for (const name of ["readThreeObjectOptions", "setLoadControlsEnabled", "replacePdfObject",
+    "handleOcrTextChange", "handleCompressScansChange", "handlePageStreamingChange"])
+    vm.runInContext(sourceFunction(threeSource, name), three);
+  const threeChanges = [];
+  three.reloadSourceWithBackend = (backend, reparseSource) => {
+    assert.equal(backend, "webgl");
+    assert.equal(reparseSource, true, "scan mode changes reparse the PDF");
+    threeChanges.push(three.readThreeObjectOptions());
+  };
+  const install = (sourceKind, sourceOptions) => {
+    three.replacePdfObject({ sourceKind, sourceOptions, sceneData: {},
+      renderer: { setInteractionViewportProvider: noop }, setFrameListener: noop, addEventListener: noop },
+    { fitCamera: false });
+    three.setLoadControlsEnabled(true);
+  };
+  assert.equal(three.readThreeObjectOptions().compressScans, true);
+  assert.equal(three.readThreeObjectOptions().pageLoading, "eager");
+  install("hep");
+  assert.equal(three.compressScansCheckboxElement.checked, true, "Three HEP loading preserves the checked preference");
+  assert.equal(three.compressScansCheckboxElement.disabled, true);
+  install("pdf", { compressScans: true, pageLoading: "eager" });
+  assert.equal(three.pageStreamingCheckboxElement.checked, false, "Three GPU preparation leaves streaming unchecked");
+  assert.equal(three.pageStreamingCheckboxElement.disabled, false, "Three streaming remains available to switch modes");
+  three.pageStreamingCheckboxElement.checked = true;
+  three.handlePageStreamingChange();
+  assert.equal(three.compressScansCheckboxElement.checked, false, "Three selecting streaming unchecks GPU compression before reloading");
+  assert.equal(threeChanges.at(-1).compressScans, false);
+  assert.equal(threeChanges.at(-1).pageLoading, "auto");
+  install("pdf", { compressScans: false, pageLoading: "auto" });
+  three.ocrTextCheckboxElement.checked = true;
+  three.handleOcrTextChange();
+  assert.equal(three.compressScansCheckboxElement.checked, false, "Three selecting OCR unchecks GPU compression before reloading");
+  assert.equal(threeChanges.at(-1).ocrTextOnly, true);
+  assert.equal(threeChanges.at(-1).compressScans, false);
+  assert.equal(threeChanges.at(-1).pageLoading, "auto", "Three OCR and streaming can be selected together");
+  install("pdf", { ocrTextOnly: true, compressScans: false, pageLoading: "auto" });
+  assert.equal(three.compressScansCheckboxElement.checked, false, "Three text-only PDFs keep GPU compression unchecked");
+  assert.equal(three.readThreeObjectOptions().compressScans, false);
+  assert.equal(three.readThreeObjectOptions().pageLoading, "auto");
+  assert.equal(three.pageStreamingCheckboxElement.disabled, false);
+  three.pageStreamingCheckboxElement.checked = false;
+  three.handlePageStreamingChange();
+  assert.equal(three.ocrTextCheckboxElement.checked, true, "Three unchecking streaming preserves OCR");
+  assert.equal(three.compressScansCheckboxElement.checked, false, "Three unchecking streaming does not select GPU compression");
+  assert.equal(threeChanges.at(-1).pageLoading, "all");
+  install("pdf", { ocrTextOnly: true, compressScans: false, pageLoading: "all" });
+  three.ocrTextCheckboxElement.checked = false;
+  three.handleOcrTextChange();
+  assert.equal(three.compressScansCheckboxElement.checked, false, "Three unchecking OCR does not select GPU compression");
+  install("pdf", { ocrTextOnly: true, compressScans: false, pageLoading: "auto" });
+  three.compressScansCheckboxElement.checked = true;
+  three.handleCompressScansChange();
+  assert.equal(three.ocrTextCheckboxElement.checked, false, "Three selecting GPU compression unchecks OCR before reloading");
+  assert.equal(three.pageStreamingCheckboxElement.checked, false, "Three selecting GPU compression unchecks streaming before reloading");
+  assert.equal(threeChanges.at(-1).ocrTextOnly, false);
+  assert.equal(threeChanges.at(-1).compressScans, true);
+  assert.equal(threeChanges.at(-1).pageLoading, "eager");
+  install("pdf", { compressScans: true, pageLoading: "eager" });
+  three.compressScansCheckboxElement.checked = false;
+  three.handleCompressScansChange();
+  assert.equal(three.ocrTextCheckboxElement.checked, false, "Three unchecking GPU compression does not select OCR");
+  assert.equal(three.pageStreamingCheckboxElement.checked, false, "Three unchecking GPU compression does not select streaming");
+  assert.equal(threeChanges.at(-1).pageLoading, "all");
+  install("pdf", { compressScans: false, pageLoading: "all" });
+  assert.equal(three.readThreeObjectOptions().compressScans, false, "Three respects explicitly unchecked compression");
+  assert.equal(three.pageStreamingCheckboxElement.disabled, false);
+  for (const [textOnly, compressed, streaming, select] of [
+    [false, true, false, "ocr"], [false, true, false, "stream"],
+    [true, false, true, "gpu"], [false, false, true, "gpu"], [true, false, false, "stream"]
+  ]) {
+    three.ocrTextCheckboxElement.checked = textOnly;
+    three.compressScansCheckboxElement.checked = compressed;
+    three.pageStreamingCheckboxElement.checked = streaming;
+    install("pdf", { ocrTextOnly: textOnly, compressScans: compressed, pageLoading: compressed ? "eager" : streaming ? "auto" : "all" });
+    if (select === "ocr") {
+      three.ocrTextCheckboxElement.checked = true;
+      three.handleOcrTextChange();
+    } else if (select === "stream") {
+      three.pageStreamingCheckboxElement.checked = true;
+      three.handlePageStreamingChange();
+    } else {
+      three.compressScansCheckboxElement.checked = true;
+      three.handleCompressScansChange();
+    }
+    three.setLoadControlsEnabled(false);
+    three.setLoadControlsEnabled(true);
+    assert.equal(three.ocrTextCheckboxElement.checked, textOnly, "Three rollback restores the committed OCR choice");
+    assert.equal(three.compressScansCheckboxElement.checked, compressed, "Three rollback restores the committed compression choice");
+    assert.equal(three.pageStreamingCheckboxElement.checked, streaming, "Three rollback restores the committed streaming choice");
+    assert.equal(three.pageStreamingCheckboxElement.disabled, false);
+  }
+  install("hep");
+  assert.equal(three.compressScansCheckboxElement.checked, false, "Three preserves an explicit opt-out across HEP loading");
+}
 
 function testNativePageDemandFrames() {
   let now = 1000;
@@ -876,6 +1101,7 @@ async function testThreeBackendReplacement() {
 function demoHost() {
   return {
     performance, AbortController, waitForLoad,
+    loadedCompressScansPreference: false, compressScansCheckboxElement: { checked: false },
     annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop },
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,

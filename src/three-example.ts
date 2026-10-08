@@ -192,6 +192,7 @@ const textSelectionCheckboxElement = textSelectionCheckbox;
 const ocrTextCheckboxElement = ocrTextCheckbox;
 const pageStreamingCheckboxElement = pageStreamingCheckbox;
 const compressScansCheckboxElement = compressScansCheckbox;
+let loadedCompressScansPreference = compressScansCheckboxElement.checked;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -819,17 +820,29 @@ textSelectionCheckboxElement.addEventListener("change", () => {
   setStatus(`Text selection ${textSelectionCheckboxElement.checked ? "enabled" : "disabled"}.`);
 }, { signal: lifetimeSignal });
 
-ocrTextCheckboxElement.addEventListener("change", () => {
+function handleOcrTextChange(): void {
+  if (ocrTextCheckboxElement.checked) compressScansCheckboxElement.checked = false;
   if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
-}, { signal: lifetimeSignal });
+}
 
-pageStreamingCheckboxElement.addEventListener("change", () => {
-  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
-}, { signal: lifetimeSignal });
+ocrTextCheckboxElement.addEventListener("change", handleOcrTextChange, { signal: lifetimeSignal });
 
-compressScansCheckboxElement.addEventListener("change", () => {
+function handlePageStreamingChange(): void {
+  if (pageStreamingCheckboxElement.checked) compressScansCheckboxElement.checked = false;
   if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
-}, { signal: lifetimeSignal });
+}
+
+pageStreamingCheckboxElement.addEventListener("change", handlePageStreamingChange, { signal: lifetimeSignal });
+
+function handleCompressScansChange(): void {
+  if (compressScansCheckboxElement.checked) {
+    ocrTextCheckboxElement.checked = false;
+    pageStreamingCheckboxElement.checked = false;
+  }
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}
+
+compressScansCheckboxElement.addEventListener("change", handleCompressScansChange, { signal: lifetimeSignal });
 
 for (const button of pageLayoutButtons) {
   button.addEventListener("click", () => {
@@ -1694,6 +1707,9 @@ function replacePdfObject(
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
+  if (nextObject.sourceKind === "pdf") {
+    loadedCompressScansPreference = compressScansCheckboxElement.checked && !nextObject.sourceOptions?.ocrTextOnly;
+  }
   nextObject.addEventListener("change", event => {
     if (currentPdfObject !== nextObject) return;
     if (event.reason === "pages-loaded") {
@@ -1794,9 +1810,13 @@ function setLoadControlsEnabled(enabled: boolean): void {
   ocrTextCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
   if (enabled && currentPdfObject) ocrTextCheckboxElement.checked = currentPdfObject.sourceOptions?.ocrTextOnly === true;
   compressScansCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
-  if (enabled && currentPdfObject) compressScansCheckboxElement.checked = currentPdfObject.sourceOptions?.compressScans === true;
-  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep" || compressScansCheckboxElement.checked;
-  if (enabled && currentPdfObject) pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto";
+  if (enabled && currentPdfObject) {
+    compressScansCheckboxElement.checked = loadedCompressScansPreference && !ocrTextCheckboxElement.checked;
+  }
+  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) {
+    pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto" && !compressScansCheckboxElement.checked;
+  }
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
