@@ -252,8 +252,8 @@ try {
     renderer.setScene(scenes([scan]));
     assert.equal(resources()[0].rasterPlan.width, 128);
     Object.assign(renderer, { zoom: 1, cameraCenterX: 512, cameraCenterY: 512 });
-    renderer.updateRasterResolution();
-    renderer.zoom = .34; renderer.updateRasterResolution();
+    await refine(renderer);
+    renderer.zoom = .34; await refine(renderer);
     assert.equal(resources()[0].rasterPlan.width, 1024, "small zoom-out stays within the previous tier's hysteresis");
     const before = Object.defineProperties({}, Object.getOwnPropertyDescriptors(scan));
     before.pageIndex = 1; before.matrix = Float32Array.of(1024,0,0,1024,20000,0);
@@ -263,11 +263,11 @@ try {
       renderer.setScene(scenes([before, wrapper]), { preserveRasterResolution: true });
       assert.equal(resources()[1].rasterPlan.width, 1024, `${backend}: a completed page keeps existing detail before another frame`);
       assert.equal(resources()[0].rasterPlan.width, 128, "offscreen sources remain previews");
-      renderer.updateRasterResolution();
+      await refine(renderer);
       assert.equal(resources()[1].rasterPlan.width, 1024, "refinement does not reverse a preserved tier");
     }
     renderer.zoom = .01;
-    for (let i = 0; i < 3; i++) renderer.updateRasterResolution();
+    for (let i = 0; i < 3; i++) await refine(renderer);
     assert(resources()[1].rasterPlan.width <= 128, "real zoom-out still releases high detail");
     renderer.setScene(scenes([scan]));
     assert.equal(resources()[0].rasterPlan.width, 128, "a new document starts with previews");
@@ -371,4 +371,9 @@ function gpuMock() {
     createRenderPipeline: descriptor => ({ getBindGroupLayout: index => descriptor.layout.bindGroupLayouts[index] })
   };
   return device;
+}
+
+async function refine(renderer) {
+  renderer.updateRasterResolution();
+  while (renderer.rasterPreparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
 }

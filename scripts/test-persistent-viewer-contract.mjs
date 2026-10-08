@@ -22,7 +22,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /pageScenes\s*=\s*candidate\.pageScenes[\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
+  /pageScenes\s*=\s*candidate\.displayPageScenes[\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
   "any PDF parser must feed the established VectorScene composition pipeline"
 );
 assert.match(
@@ -40,7 +40,7 @@ assert.doesNotMatch(
   /\bopenPdf\b|\bparsePdf\b|\bcompilePdfForBatchExport\b/,
   "HEP export must use the shared builder instead of an independent parser"
 );
-assert.match(mainSource, /pageScenes\s*=\s*candidate\.pageScenes/, "large PDFs compose metadata-backed page windows");
+assert.match(mainSource, /pageScenes\s*=\s*candidate\.displayPageScenes/, "large PDFs compose metadata-backed page windows");
 assert.match(readFunctionBody(mainSource, "downloadHep"), /activePdfPageLoader[\s\S]*?buildHep\(lastLoadedSource\.bytes/,
   "export from a partial page window must compile the complete original PDF");
 assert.doesNotMatch(

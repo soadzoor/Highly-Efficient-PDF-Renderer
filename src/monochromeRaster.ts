@@ -2,6 +2,7 @@ import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import type { RasterTile, RasterTilePlan } from "./rasterTiles";
 import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
 import { throwIfAborted } from "./pdf/nativeTypes";
+import { finishRasterSteps, finishRasterStepsAsync } from "./rasterPreparationYield";
 
 /** Packed, MSB-first rows and straight-alpha RGBA colors for the zero and one bits. */
 export interface MonochromeRaster {
@@ -116,6 +117,16 @@ const BIT_COUNTS = Uint8Array.from({ length: 256 }, (_, value) => {
 /** Generate only the requested coverage resolution, without RGBA or larger mip intermediates. */
 export function resampleMonochromeCoverage(source: MonochromeRaster, width: number, height: number,
   outWidth: number, outHeight: number): Uint8Array {
+  return finishRasterSteps(monochromeCoverageSteps(source, width, height, outWidth, outHeight));
+}
+
+export function resampleMonochromeCoverageAsync(source: MonochromeRaster, width: number, height: number,
+  outWidth: number, outHeight: number): Promise<Uint8Array> {
+  return finishRasterStepsAsync(monochromeCoverageSteps(source, width, height, outWidth, outHeight));
+}
+
+function* monochromeCoverageSteps(source: MonochromeRaster, width: number, height: number,
+  outWidth: number, outHeight: number): Generator<void, Uint8Array> {
   const stride = validateMonochromeRaster(source, width, height);
   if (!validDimensions(outWidth, outHeight) || outWidth > width || outHeight > height) {
     throw new RangeError("Monochrome coverage dimensions must fit the source.");
@@ -140,6 +151,7 @@ export function resampleMonochromeCoverage(source: MonochromeRaster, width: numb
       for (let x = 0; x < outWidth; x++) {
         sums[x] += (before((x + 1) * scaleX) - before(x * scaleX)) * weightY;
       }
+      yield;
     }
     for (let x = 0; x < outWidth; x++) out[targetY * outWidth + x] = Math.round(sums[x] * 255 / area);
   }
@@ -237,6 +249,16 @@ export function buildMonochromeMipChain(
   height: number,
   signal?: AbortSignal
 ): SingleChannelUint8MipLevel[] {
+  return finishRasterSteps(monochromeMipSteps(monochrome, width, height, signal));
+}
+
+export function buildMonochromeMipChainAsync(monochrome: MonochromeRaster, width: number,
+  height: number, signal?: AbortSignal): Promise<SingleChannelUint8MipLevel[]> {
+  return finishRasterStepsAsync(monochromeMipSteps(monochrome, width, height, signal));
+}
+
+function* monochromeMipSteps(monochrome: MonochromeRaster, width: number, height: number,
+  signal?: AbortSignal): Generator<void, SingleChannelUint8MipLevel[]> {
   throwIfAborted(signal);
   const stride = validateMonochromeRaster(monochrome, width, height);
   const chain: SingleChannelUint8MipLevel[] = [];
@@ -268,6 +290,7 @@ export function buildMonochromeMipChain(
         }
         data[y * nextWidth + x] = Math.round(sum / area);
       }
+      yield;
     }
     chain.push({ width: nextWidth, height: nextHeight, data });
     sample = (x, y) => data[y * nextWidth + x];

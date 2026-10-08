@@ -108,7 +108,12 @@ See [loading option types](../src/pdfObjectGenerator.ts) and
 selected vector, OCR or scan overviews before resolving and upload their initial
 scene once. Scan pixels still load on camera demand. `pageLoading: "auto"` opens
 large PDFs from metadata and compiles visible pages as needed; its bounded page
-cache uses less CPU memory but rebuilds the viewing scene as pages arrive.
+cache uses less CPU memory and installs new page geometry as pages arrive.
+OCR/scan swaps retain existing geometry and update scan textures plus paint
+visibility. Raster preparation uses a shared worker or cooperative fallback;
+recent GPU tiers are cached within the automatic memory allowance. Additional
+vector/clip detail installs once, while compositing pages may require full scene
+updates to preserve their effects.
 `pageLoading: "eager"` prepares the complete original PDF content before resolving.
 Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.

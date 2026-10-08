@@ -4,6 +4,8 @@ import { buildMonochromeMipChain, monochromeCoverageTilePixels, monochromeRaster
 import { rasterTilePixels, type RasterTilePlan } from "./rasterTiles";
 import { estimateRasterTextureBytes } from "./rasterMemoryBudget";
 import type { RasterCompressionFormat } from "./rasterCompression";
+import type { PreparedRasterPixels } from "./rasterPreparation";
+import { sameRasterTilePlan } from "./rasterTiles";
 
 export interface ThreeRasterTextureInfo {
   mode: number;
@@ -43,21 +45,22 @@ export function markThreeRasterTextureForUpload(texture: THREE.Texture): void {
 /** Display derivatives preserve packed canonical pixels and never invoke their RGBA getter. */
 export function createThreeRasterTileTextures(source: { width: number; height: number; data: Uint8Array;
   monochrome?: MonochromeRaster }, plan: RasterTilePlan, compressor?: ThreeRasterCompressor,
-  format?: RasterCompressionFormat | null): THREE.Texture[] {
+  format?: RasterCompressionFormat | null, prepared?: PreparedRasterPixels): THREE.Texture[] {
+  if (prepared && !sameRasterTilePlan(prepared.plan, plan)) prepared = undefined;
   const mono = source.monochrome;
   const packed = !!mono && plan.width === source.width && plan.height === source.height;
-  const pixels = packed ? [] : mono ? monochromeCoverageTilePixels(mono, source.width, source.height, plan)
-    : rasterTilePixels(source, plan);
+  const pixels = prepared?.pixels ?? (packed ? [] : mono ? monochromeCoverageTilePixels(mono, source.width, source.height, plan)
+    : rasterTilePixels(source, plan));
   const textures: THREE.Texture[] = [];
   try {
     for (const [index, tile] of plan.tiles.entries()) {
       let texture: THREE.Texture;
       if (packed) {
-        const bits = monochromeRasterTile(mono!, source.width, source.height, tile);
+        const bits = prepared?.monochromeTiles?.[index] ?? monochromeRasterTile(mono!, source.width, source.height, tile);
         texture = dataTexture(bits.data, Math.ceil(tile.width / 8), tile.height, true);
         texture.minFilter = texture.magFilter = THREE.NearestFilter;
         texture.generateMipmaps = false;
-        const chain = buildMonochromeMipChain(bits, tile.width, tile.height);
+        const chain = prepared?.mipChains?.[index] ?? buildMonochromeMipChain(bits, tile.width, tile.height);
         const first = chain[0] ?? { width: 1, height: 1, data: Uint8Array.of((bits.data[0] >> 7) * 255) };
         const coverage = dataTexture(first.data, first.width, first.height, true);
         coverage.generateMipmaps = false;

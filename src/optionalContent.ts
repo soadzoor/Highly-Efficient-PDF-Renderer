@@ -15,6 +15,8 @@ export interface OptionalContentLayer extends OptionalContentGroup { readonly vi
 export interface AnnotationLayerVisibility { readonly annotationId: string; readonly visible: boolean }
 /** A detached visibility snapshot. Treat its condition bytes as read-only. */
 export interface OptionalContentSnapshot {
+  /** Internal viewing alternatives, independent of the document's PDF layer conditions. */
+  readonly rasterPages?: ReadonlySet<number>;
   readonly revision: number;
   readonly layers: readonly LayerVisibilityChange[];
   readonly conditions: Uint8Array;

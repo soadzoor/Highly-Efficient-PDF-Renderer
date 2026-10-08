@@ -35,6 +35,11 @@ export interface SceneUpdateOptions {
  * `HeprThreePdfObject` methods instead of calling this interface directly.
  */
 export interface RendererApi {
+  /** Select already prepared page alternatives without replacing document geometry. */
+  setPageRasterVisibility?(pages: ReadonlySet<number>): void;
+  /** Lifecycle timing outside the frame loop, retained in performance captures. */
+  recordPerformanceTransition?(name: string, durationMs: number): void;
+  prepareRasterLayerUpdatesAsync?(updates: ReadonlyMap<number, RasterLayer>): Promise<PreparedRasterLayerUpdates>;
   prepareRasterLayerUpdates?(updates: ReadonlyMap<number, RasterLayer>): PreparedRasterLayerUpdates;
   getRasterLayerUpdates?(): ReadonlyMap<number, RasterLayer>;
   /** Apply a prepared, immutable visibility revision without uploading geometry again. */

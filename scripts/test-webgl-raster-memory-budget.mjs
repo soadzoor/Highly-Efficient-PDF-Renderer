@@ -121,23 +121,52 @@ try {
     assert.equal(displayed.rasterPlan.width, 128, "initial allocation generates only a preview tier");
     assert.equal(displayed.monochrome.coverage, true);
     assert.equal(displayed.estimatedBytes, current.mock.textureBytes(), "R8-only previews have an exact ledger");
+    const beforeStale = current.mock.uploads.length;
+    current.renderer.zoom = 1; current.renderer.updateRasterResolution();
+    current.renderer.zoom = .1; current.renderer.updateRasterResolution();
+    while (current.renderer.rasterPreparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(current.mock.uploads.length, beforeStale, "obsolete refinement is discarded after zoom-out");
     current.renderer.zoom = 1;
-    current.renderer.updateRasterResolution();
+    await refine(current.renderer);
     displayed = current.renderer.rasterLayers[0];
     assert.equal(displayed.rasterPlan.width, 1024, "zoom promotes the original packed scan");
     assert(!displayed.monochrome.coverage);
-    assert(!current.mock.alive.has(previewTexture));
-    assert.equal(current.mock.deletions.get(previewTexture), 1, "coverage texture aliases are destroyed once");
-    assert.equal(displayed.estimatedBytes, current.mock.textureBytes());
+    assert(current.mock.alive.has(previewTexture), "the previous tier remains warm in the bounded cache");
+    assert.equal(current.mock.deletions.get(previewTexture) ?? 0, 0, "cached coverage aliases remain live");
+    assert.equal(displayed.estimatedBytes + current.renderer.rasterResourceCache.bytes, current.mock.textureBytes());
     const uploadCount = current.mock.uploads.length;
-    current.renderer.updateRasterResolution();
+    await refine(current.renderer);
     assert.equal(current.mock.uploads.length, uploadCount, "stationary frames do not regenerate mips");
     current.renderer.cameraCenterX = 10000;
-    current.renderer.updateRasterResolution();
+    await refine(current.renderer);
     assert.equal(current.renderer.rasterLayers[0].rasterPlan.width, 128, "offscreen detail is released");
     assert.equal(expanded, 0);
     current.renderer.destroyRasterLayerTextures();
     assert.equal(current.mock.textureBytes(), 0);
+  }
+  {
+    const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: [image(24, 24, rgbaData(24, 24), 0), image(24, 24, rgbaData(24, 24), 1)] });
+    const { renderer, mock } = fixture(WebGlFloorplanRenderer, scene, estimateRasterTextureBytes);
+    renderer.uploadRasterLayers(scene);
+    const old = renderer.rasterLayers.slice(), createResource = renderer.createRasterLayerGpu.bind(renderer);
+    let preparedUploads = 0, ticks = 0;
+    renderer.createRasterLayerGpu = (source, index, plan, format, prepared) => {
+      assert(prepared); assert.deepEqual(prepared.plan, plan); preparedUploads++;
+      return createResource(source, index, plan, format, prepared);
+    };
+    const timer = setInterval(() => ticks++, 0);
+    const pixels = rgbaData(1600, 1600);
+    const pending = renderer.prepareRasterLayerUpdatesAsync(new Map([[0, image(1600, 1600, pixels, 0)], [1, image(1600, 1600, pixels, 1)]]));
+    assert(renderer.rasterStagedBytes > 0);
+    assert.deepEqual(renderer.rasterLayers, old);
+    const transaction = await pending; clearInterval(timer);
+    assert(ticks > 0); assert.equal(preparedUploads, 2);
+    assert.deepEqual(renderer.rasterLayers, old);
+    assert(mock.peakBytes <= budget.peakBytes);
+    transaction.commit(); transaction.dispose(); assert.equal(renderer.rasterStagedBytes, 0);
+    assert.equal(renderer.estimatedRasterResidentBytes(), mock.textureBytes());
+    assert(renderer.estimatedRasterResidentBytes() <= budget.bytes);
+    renderer.destroyRasterLayerTextures(); assert.equal(mock.textureBytes(), 0);
   }
   console.log("WebGL automatic raster memory: aggregate plans, lazy packed pixels, exact mips, replacement peaks, residency, batch limits and zoom-dependent R8/packed allocations passed.");
 } finally {
@@ -186,4 +215,9 @@ function fixture(Renderer, scene, estimateBytes) {
     rasterStripBatches: new Map(), rasterAtlasBatches: new Map(), paintFoldUnit: -1,
     createProgram: () => ({ program: true }), destroyVectorMinifyResources() {}, requestFrame() {} });
   return { renderer, mock };
+}
+
+async function refine(renderer) {
+  renderer.updateRasterResolution();
+  while (renderer.rasterPreparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
 }

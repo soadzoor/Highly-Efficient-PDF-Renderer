@@ -73,7 +73,7 @@ try {
   object.updatePageDemand(host, camera);
   assert.equal(object.needsLoadingAnimation, false, "loaded or hidden pages stop the placeholder animation");
   assert.deepEqual(calls.map(call => [call.index, call.preview]), [[0,96],[0,undefined]], "only the projected page loads");
-  assert.equal(object.sceneData.rasterLayers[0].width, 1024);
+  assert.equal(object.rasterMaterialLayer.appliedRasterLayers[1].width, 1024);
   assert.equal((await object.getPages())[0], page, "page handles survive content updates");
   assert.deepEqual(page.position.toArray(), position.toArray());
   assert.equal(page.rotation.z, .15);
@@ -96,13 +96,13 @@ try {
   object.renderer.ensureSceneUploaded();
   assert.equal(nativeScene, object.sceneData, "the document fallback retains its complete current window after page cleanup");
   camera.zoom = 1; camera.updateProjectionMatrix(); object.updatePageDemand(host, camera); await flush();
-  assert.equal(object.sceneData.rasterLayers[0].width, 1024);
+  assert.equal(object.rasterMaterialLayer.appliedRasterLayers[1].width, 1024);
   assert.equal(calls.length, 2, "cached detail returns without another parse");
   assert(changes.filter(reason => reason === "pages-loaded").length >= 3);
 
   for (let completion = 0; completion < 2; completion++) {
     for (const target of [object, page, object.pageBatch]) {
-      const layer = target.rasterMaterialLayer, matrix = layer.rasterEntries[0].image.source.matrix;
+      const layer = target.rasterMaterialLayer, matrix = layer.rasterEntries[1].image.source.matrix;
       if (target.pageTransforms) {
         const projection = new THREE.Matrix4().makeScale(2 / matrix[0], 2 / matrix[3], 1);
         projection.setPosition(-1 - 2 * matrix[4] / matrix[0], -1 - 2 * matrix[5] / matrix[3], 0);
@@ -111,11 +111,12 @@ try {
       layer.setTextureResidency(true);
       layer.updateFrame({ cameraCenterX: matrix[4] + matrix[0] / 2,
         cameraCenterY: matrix[5] + matrix[3] / 2, zoom: 2 }, { width: 1024, height: 1024 });
-      assert.equal(layer.rasterEntries[0].image.plan.width, 1024);
+      while (layer.preparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(layer.rasterEntries[1].image.plan.width, 1024);
     }
     await loader.notifyChange(); await flush();
     for (const target of [object, page, object.pageBatch]) {
-      assert.equal(target.rasterMaterialLayer.rasterEntries[0].image.plan.width, 1024,
+      assert.equal(target.rasterMaterialLayer.rasterEntries[1].image.plan.width, 1024,
         "page notifications preserve sharp document, independent-page and batched-page tiers before another frame");
     }
   }

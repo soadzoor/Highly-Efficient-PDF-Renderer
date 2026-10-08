@@ -34,6 +34,8 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
+  /** Viewing-only scan slot; its pixels can change without replacing document geometry. */
+  pageDemandSlot?: boolean;
   /** Constant paint alpha, independent of the retained image RGBA; absent means one. */
   opacity?: number;
   width: number;
@@ -99,6 +101,8 @@ export interface VectorClipPath {
 
 /** Consecutive instances painted together, in PDF source order. */
 export interface VectorDrawRun {
+  /** Viewing-only alternative paints. Both representations retain stable primitive IDs. */
+  pdfRepresentation?: { pageIndex: number; detail: boolean };
   /** Index of the visibility condition in the document's optional-content model. */
   optionalContent?: number;
   blendMode?: "Multiply";
@@ -745,6 +749,11 @@ export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPa
   return composeScenesInGrid(pageScenes, requestedPagesPerRow, onDiagnostic);
 }
 
+/** Internal page alternatives share one origin instead of being laid out in separate grid cells. */
+export function composeOverlappingVectorScenes(pageScenes: VectorScene[]): VectorScene {
+  return composeScenesInGrid(pageScenes, 1, undefined, true);
+}
+
 export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
   const pageScenes = await extractPdfPageScenes(pdfData, options);
@@ -842,7 +851,7 @@ interface PagePlacement {
 }
 
 function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number,
-  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): VectorScene {
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, overlap = false): VectorScene {
   if (pageScenes.length === 0) {
     return createEmptyVectorScene();
   }
@@ -857,6 +866,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
 
   const pagesPerRow = normalizePositiveInt(requestedPagesPerRow, 10, 1, 100);
   const placements = computeGridPlacements(pageScenes, pagesPerRow);
+  if (overlap) for (const placement of placements) { placement.translateX = 0; placement.translateY = 0; }
 
   let totalFillPathCount = 0;
   let totalFillSegmentCount = 0;
@@ -1054,7 +1064,9 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       ))) {
         const clipIndex = run.clipIndex === undefined ? undefined : run.clipIndex + clipBase;
         const optionalContent = run.optionalContent === undefined ? undefined : run.optionalContent + layers.offsets[pageIndex];
-        if (paintGraph) drawRuns.push({ ...run, first: run.first + offsets[run.kind],
+        if (paintGraph || run.pdfRepresentation) drawRuns.push({ ...run, first: run.first + offsets[run.kind],
+          ...(run.pdfRepresentation ? { pdfRepresentation: { ...run.pdfRepresentation,
+            pageIndex: pageRectBase + run.pdfRepresentation.pageIndex } } : {}),
           ...(clipIndex === undefined ? {} : { clipIndex }), ...(optionalContent === undefined ? {} : { optionalContent }) });
         else appendVectorDrawRun(drawRuns, run.kind, run.first + offsets[run.kind], run.count, clipIndex, run.blendMode, optionalContent);
       }

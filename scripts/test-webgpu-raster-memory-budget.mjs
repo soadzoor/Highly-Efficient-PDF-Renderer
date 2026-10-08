@@ -98,7 +98,9 @@ try {
     assert.equal(renderer.rasterStagedBytes, 0);
     assert(residentBytes(renderer) <= budget.bytes);
     assert.equal(renderer.rasterLayerResources[2], packed, "unchanged sources preserve their resources and quality");
-    assert(old.slice(0, 2).every(resource => resource.texture.destroyed));
+    assert(old.slice(0, 2).every(resource => resource.texture.destroyed ||
+      [...renderer.rasterResourceCache.entries.values()].some(entry => entry.resource === resource)),
+      "every retired resource is either cached or released under memory pressure");
     assert.equal(scene.rasterLayers[0].width, 24, "updates preserve the canonical document");
 
     const cancelOffset = device.textures.length;
@@ -153,30 +155,58 @@ try {
     assert.equal(displayed.coverageTexture, undefined, "a reduced scan needs one R8 coverage chain only");
     assert(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] < 0, "shader receives the coverage-only mode");
     assert.equal(displayed.estimatedBytes, layerBytes(displayed));
+    const beforeStale = device.textures.length;
     renderer.zoom = 1; renderer.updateRasterResolution();
+    renderer.zoom = .1; renderer.updateRasterResolution();
+    while (renderer.rasterPreparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(device.textures.length, beforeStale, "obsolete refinement is discarded after zoom-out");
+    renderer.zoom = 1; await refine(renderer);
     displayed = renderer.rasterLayerResources[0];
     assert.equal(displayed.rasterPlan.width, 1024);
-    assert(previewTexture.destroyed);
+    assert(!previewTexture.destroyed, "the previous tier remains warm");
     assert(displayed.coverageTexture, "full detail restores packed pixels with filtered coverage mips");
     assert(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] > 0);
     assert.equal(displayed.estimatedBytes, layerBytes(displayed));
     const uploads = device.textures.length;
-    renderer.updateRasterResolution();
+    await refine(renderer);
     assert.equal(device.textures.length, uploads);
-    renderer.cameraCenterX = 10000; renderer.updateRasterResolution();
+    renderer.cameraCenterX = 10000; await refine(renderer);
     displayed = renderer.rasterLayerResources[0];
     assert.equal(displayed.rasterPlan.width, 128);
     renderer.cameraCenterX = 512;
+    renderer.rasterResourceCache.clear();
     device.failAtTexture = device.textures.length + 1;
-    renderer.updateRasterResolution();
+    await refine(renderer);
     assert.equal(renderer.rasterLayerResources[0], displayed, "failed promotion retains the working preview");
     device.failAtTexture = null;
-    renderer.updateRasterResolution();
+    await refine(renderer);
     assert.equal(renderer.rasterLayerResources[0], displayed, "failed tier does not retry on every frame");
-    renderer.zoom = .3; renderer.updateRasterResolution();
+    renderer.zoom = .3; await refine(renderer);
     assert.equal(renderer.rasterLayerResources[0].rasterPlan.width, 512, "a different requested tier can still refine");
     renderer.dispose();
     assert(device.textures.every(texture => texture.destroyed));
+  }
+  // Async staging reserves the whole batch before yielding and consumes matching prepared plans.
+  {
+    const scene = sceneWith(colorLayer(24, 24), colorLayer(24, 24)), { renderer, device } = create(scene);
+    renderer.configureRasterLayers(scene);
+    const old = renderer.rasterLayerResources.slice(), createResource = renderer.createRasterLayerResource.bind(renderer);
+    let preparedUploads = 0, ticks = 0;
+    renderer.createRasterLayerResource = (source, index, plan, format, prepared) => {
+      assert(prepared); assert.deepEqual(prepared.plan, plan); preparedUploads++;
+      return createResource(source, index, plan, format, prepared);
+    };
+    const timer = setInterval(() => ticks++, 0);
+    const pending = renderer.prepareRasterLayerUpdatesAsync(new Map([[0, colorLayer(1600, 1600)], [1, colorLayer(1600, 1600)]]));
+    assert(renderer.rasterStagedBytes > 0, "the complete asynchronous batch reserves its budget immediately");
+    assert.deepEqual(renderer.rasterLayerResources, old);
+    const transaction = await pending; clearInterval(timer);
+    assert(ticks > 0); assert.equal(preparedUploads, 2);
+    assert.deepEqual(renderer.rasterLayerResources, old, "completed uploads remain hidden until commit");
+    assert(residentBytes(renderer) + renderer.rasterStagedBytes <= budget.peakBytes);
+    transaction.commit(); transaction.dispose(); assert.equal(renderer.rasterStagedBytes, 0);
+    assert(residentBytes(renderer) <= budget.bytes);
+    renderer.dispose(); assert(device.textures.every(texture => texture.destroyed));
   }
   console.log("WebGPU automatic raster budget: aggregate demand, packed preservation, fallback telemetry, placement, residency, concurrent updates, cleanup, duplicate batches and demand-driven R8/packed allocations passed.");
 } finally {
@@ -226,7 +256,7 @@ function layerBytes(layer) {
 }
 
 function residentBytes(renderer) {
-  return renderer.rasterLayerResources.reduce((sum, layer) => sum + layerBytes(layer), 0) +
+  return renderer.rasterLayerResources.reduce((sum, layer) => sum + layerBytes(layer), 0) + (renderer.rasterResourceCache?.bytes ?? 0) +
     [...renderer.rasterStripResources.values()].reduce((sum, strip) => sum + textureBytes(strip.texture) +
       strip.instanceBuffer.descriptor.size, 0);
 }
@@ -257,4 +287,9 @@ function makeDevice() {
     },
     destroy() {}
   };
+}
+
+async function refine(renderer) {
+  renderer.updateRasterResolution();
+  while (renderer.rasterPreparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
 }

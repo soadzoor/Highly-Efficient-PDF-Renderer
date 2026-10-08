@@ -151,7 +151,7 @@ try {
 
     const staged = renderer.prepareRasterLayerUpdates(new Map([[0, image(100, 1, 4)]]));
     staged.commit(); staged.dispose();
-    assert(tiles.every(tile => tile.texture.destroyed && tile.uniformBuffer.destroyed), "replaced tiles are released");
+    assert(tiles.every(tile => !tile.texture.destroyed && !tile.uniformBuffer.destroyed), "replaced tiles remain in the bounded cache");
     draws = submit(renderer);
     assert.equal(draws.length, planRasterTiles(100, 1, 64).tiles.length, "an oversized replacement is tiled, not rejected");
     renderer.dispose();
@@ -226,6 +226,7 @@ try {
     assert.equal(layer.getMaxRasterTextureDimension(), 75, "initial textures use the preview tier");
     layer.setTextureResidency(true);
     layer.updateFrame({ cameraCenterX: 10, cameraCenterY: 8, zoom: 16 }, { width: 400, height: 400 });
+    while (layer.preparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal(layer.getMaxRasterTextureDimension(), 150, "zoom requests original resolution before device tiling");
     const whole = entry.texture;
     let disposed = 0;
@@ -234,7 +235,7 @@ try {
       backend === "webgl" ? { isWebGLRenderer: true, capabilities: { maxTextureSize: 64 } }
         : { isWebGPURenderer: true, backend: { device: { limits: { maxTextureDimension2D: 64 } } } });
     assert.equal(layer.getMaxRasterTextureDimension(), 64, "the host check tiles before the first upload");
-    assert.equal(disposed, 1, "the whole-image texture is released");
+    assert.equal(disposed, 0, "the whole-image tier stays warm within the budget");
     const plan = planRasterTiles(150, 2, 64), pixels = rasterTilePixels(scene.rasterLayers[0], plan);
     const textures = [entry.texture, ...entry.image.tiles.map(tile => tile.texture)];
     assert.equal(textures.length, plan.tiles.length);
@@ -270,7 +271,7 @@ try {
     for (const texture of textures) texture.addEventListener("dispose", () => released.add(texture));
     const staged = layer.prepareRasterLayerUpdates(new Map([[0, image(40, 40, 8)]]));
     staged.commit();
-    assert(textures.every(texture => released.has(texture)), "replaced tiles are released");
+    assert(textures.every(texture => !released.has(texture)), "replaced textures remain warm while their meshes are removed");
     assert.equal(entry.image.tiles.length, 0);
     assert.equal(entry.mesh.children.filter(child => child.userData.heprRasterTile).length, 0);
     assert.equal(layer.entries.length, 2, "the background and the one image remain");
@@ -282,6 +283,8 @@ try {
     replacement.addEventListener("dispose", () => released.add(replacement));
     layer.dispose();
     assert(released.has(replacement));
+    assert.equal(disposed, 1, "teardown releases the cached whole-image tier");
+    assert(textures.every(texture => released.has(texture)), "teardown releases all warm textures");
   }
   // The Three material path selects resolution automatically from RAM and aggregate scene demand.
   {
@@ -289,20 +292,22 @@ try {
     const scene = sceneWith(image(1024, 1024, 10));
     scene.rasterLayers = Array.from({ length: 4 }, () => scene.rasterLayers[0]);
     const canonical = scene.rasterLayers[0].data;
-    const createLayer = memory => {
+    const createLayer = async memory => {
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: { deviceMemory: memory } });
       const layer = new ThreeMaterialRasterLayer(scene, { pageBackground: [1, 1, 1, 1] });
       assert(layer.rasterEntries.every(entry => entry.texture.image.width === 128), "all devices begin with previews");
       layer.setTextureResidency(true);
-      for (let index = 0; index < scene.rasterLayers.length; index++) layer.updateFrame(
-        { cameraCenterX: 50, cameraCenterY: -500, zoom: 16 }, { width: 2048, height: 2048 });
+      for (let index = 0; index < scene.rasterLayers.length; index++) {
+        layer.updateFrame({ cameraCenterX: 50, cameraCenterY: -500, zoom: 16 }, { width: 2048, height: 2048 });
+        while (layer.preparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
+      }
       return layer;
     };
     let low, high;
     try {
-      low = createLayer(0.5);
+      low = await createLayer(0.5);
       assert(low.rasterEntries.every(entry => entry.texture.image.width < 1024));
-      high = createLayer(8);
+      high = await createLayer(8);
       assert(high.rasterEntries.every(entry => entry.texture.image.width === 1024));
       assert.equal(scene.rasterLayers[0].data, canonical, "memory quality never replaces canonical pixels");
       const updateA = low.prepareRasterLayerUpdates(new Map([[0, { ...scene.rasterLayers[0], data: canonical.slice() }]]));

@@ -155,6 +155,7 @@ assert.equal(context.sourceLoadController, null);
 // A page window exports the original document, never just its currently cached pages.
 let demandClosed = false, demandPaused = false;
 const demand = { pageCount: 17, pageScenes: [{ ...scene(73), segmentCount: 0 }], password: "secret",
+  get displayPageScenes() { return this.pageScenes; }, bindDisplayScene: noop, setPerformanceListener: noop,
   pause() { demandPaused = true; }, resume() { demandPaused = false; }, async close() { demandClosed = true; } };
 context.openPdfPageDemand = async () => demand;
 context.pageStreamingCheckbox.checked = true;
@@ -172,6 +173,7 @@ assert.equal(demandClosed, true, "document replacement closes the paging worker"
 // With streaming off, even a large vector document is prepared and uploaded as one scene.
 let initialLoads = 0, batchClosed = false;
 const batch = { pageCount: 17, requiresPageDemand: false, pageScenes: Array.from({ length: 17 }, () => scene(76)),
+  get displayPageScenes() { return this.pageScenes; },
   async loadInitialOverviews(signal, retainAll) { signal.throwIfAborted(); assert.equal(retainAll, true); initialLoads++; },
   async close() { batchClosed = true; } };
 context.openPdfPageDemand = async () => batch;
@@ -254,6 +256,7 @@ function file(name, id) {
 }
 async function openShortDocument(buffer, options) {
   return { pageCount: 1, requiresPageDemand: false, pageScenes: [],
+    get displayPageScenes() { return this.pageScenes; },
     async loadInitialOverviews(signal) { this.pageScenes = await nextParse(buffer, options, signal); },
     async close() {} };
 }

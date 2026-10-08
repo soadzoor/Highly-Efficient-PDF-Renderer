@@ -84,6 +84,31 @@ assert.equal(profiler.getReport().discardedMetricNames, 72, "dynamic metric name
 profiler.dispose();
 assert.throws(() => profiler.start(), /disposed/);
 
+// Scene swaps run between frames and must survive in the capture report.
+{
+  const transitions = new RenderPerformanceProfiler({ now });
+  transitions.recordTransition("pageSwap.decode", 10);
+  assert.equal(transitions.getReport().transitions.length, 0);
+  transitions.start({ gpu: false });
+  time += 20; transitions.recordTransition("pageSwap.decode", 20);
+  time += 2; transitions.recordTransition("rasterUpload.submit", 2);
+  assert.equal(transitions.getReport().frames, 0);
+  assert.equal(transitions.getReport().transitionSections["pageSwap.decode"].total, 20);
+  const detached = transitions.getReport(); detached.transitions[0].durationMs = -1;
+  assert.equal(transitions.getReport().transitions[0].durationMs, 20);
+  for (let i = 0; i < 300; i++) transitions.recordTransition("rasterUpload.cacheHit", 0);
+  assert.equal(transitions.getReport().transitions.length, 120);
+  assert.equal(transitions.getReport().transitionSections["rasterUpload.cacheHit"].samples, 256);
+  transitions.recordTransition("invalid", NaN); transitions.recordTransition("invalid", -1);
+  assert.equal(transitions.getReport().transitionSections.invalid, undefined);
+  transitions.stop(); transitions.recordTransition("stopped", 1);
+  assert.equal(transitions.getReport().transitionSections.stopped, undefined);
+  transitions.start({ gpu: false });
+  assert.deepEqual(transitions.getReport().transitions, []);
+  assert.deepEqual(transitions.getReport().transitionSections, {});
+  transitions.dispose();
+}
+
 const timing = fakeGl();
 const gpu = new RenderPerformanceProfiler({ gl: timing.gl, now });
 gpu.start({ maxFrames: 12 });

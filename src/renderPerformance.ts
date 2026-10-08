@@ -108,6 +108,9 @@ export interface RenderPerformanceSummary {
 }
 
 export interface RenderPerformanceReport {
+  /** Bounded lifecycle timings, including work performed between rendered frames. */
+  transitions: (RenderPerformanceEvent & { startMs: number })[];
+  transitionSections: Record<string, RenderPerformanceSummary>;
   active: boolean;
   frames: number;
   maxFrames: number;
@@ -163,6 +166,7 @@ const FRAME_CONTEXT_KEYS = ["cameraCenterX", "cameraCenterY", "zoom", "viewportW
   "cameraDistanceToTarget", "cameraTiltDegrees", "cameraFovYDegrees", "cameraAspect", "cameraNear", "cameraFar",
   "cameraZoom", "controlsChanged"] as const;
 const NOTES = [
+  "Transition timings include work between frames. Asynchronous preparation spans include worker/queue wait; nested spans overlap. Events retain the latest 120 transitions and summaries up to 256 samples per name.",
   "CPU times cover JavaScript and command submission, excluding asynchronous GPU execution.",
   "Frame intervals describe rendered frames, not a continuous FPS benchmark; gaps over 250 ms are omitted.",
   "GPU times sample every fourth rendered frame without waiting; unresolved or invalid samples are discarded.",
@@ -176,6 +180,8 @@ const NOTES = [
 ] as const;
 
 export class RenderPerformanceProfiler {
+  private readonly transitions: (RenderPerformanceEvent & { startMs: number })[] = [];
+  private readonly transitionSamples = new Map<string, number[]>();
   private readonly gl: WebGL2RenderingContext | undefined;
   private readonly now: () => number;
   private active = false;
@@ -399,6 +405,18 @@ export class RenderPerformanceProfiler {
     return this.getReport();
   }
 
+  recordTransition(name: string, durationMs: number): void {
+    if (!this.active || !Number.isFinite(durationMs) || durationMs < 0 || !name || name.length > 128) return;
+    let samples = this.transitionSamples.get(name);
+    if (!samples) {
+      if (this.transitionSamples.size >= MAX_METRIC_NAMES) return;
+      this.transitionSamples.set(name, samples = []);
+    }
+    if (samples.length < 256) samples.push(durationMs);
+    this.transitions.push({ name, durationMs, startMs: Math.max(0, this.now() - this.startedAt - durationMs) });
+    if (this.transitions.length > 120) this.transitions.shift();
+  }
+
   reset(): void {
     this.finish();
     this.startedAt = this.endedAt = 0;
@@ -411,6 +429,7 @@ export class RenderPerformanceProfiler {
     this.events = [];
     this.frameGpuTimes.length = this.frameGpuStates.length = 0;
     this.cpuSections.clear(); this.counters.clear();
+    this.transitions.length = 0; this.transitionSamples.clear();
     this.operations = null;
     this.externalOperations = null;
     this.externalTiming = false;
@@ -422,6 +441,8 @@ export class RenderPerformanceProfiler {
   getReport(): RenderPerformanceReport {
     return {
       active: this.active, frames: this.frameCpu.length, maxFrames: this.maxFrames,
+      transitions: this.transitions.map(event => ({ ...event })),
+      transitionSections: Object.fromEntries([...this.transitionSamples].map(([name, samples]) => [name, summarize(samples)])),
       elapsedMs: Math.max(0, (this.active ? this.now() : this.endedAt) - this.startedAt),
       frameIntervalMs: summarize(this.frameIntervals), frameCpuMs: summarize(this.frameCpu),
       cpuSections: Object.fromEntries([...this.cpuSections].map(([name, samples]) => [name, summarize(samples)])),

@@ -7,6 +7,8 @@ import { registerThreeCompressedTexture, type ThreeRasterCompressor } from "./th
 interface HostRenderer {
   readonly isWebGLRenderer?: boolean;
   readonly isWebGPURenderer?: boolean;
+  readonly initialized?: boolean;
+  initTexture?: (texture: THREE.Texture) => void;
   getContext?: () => unknown;
   readonly backend?: { readonly device?: unknown };
 }

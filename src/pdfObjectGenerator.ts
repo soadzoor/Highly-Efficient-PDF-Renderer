@@ -234,7 +234,8 @@ async function loadPdfSceneFromSourceInternal(
         if (!streaming || loader.pageCount <= 16) await loader.loadInitialOverviews(signal, !streaming);
         if ((streaming && loader.pageCount > 16) || loader.requiresPageDemand) {
           const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
-          const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
+          const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.displayPageScenes, pagesPerRow, options.onDiagnostic));
+          loader.bindDisplayScene(scene);
           progress.complete({ sourceType: "pdf" });
           signal?.throwIfAborted();
           return { scene, sourceLabel, sourceKind, sourceBytes, pageDemand: loader, sourceOptions: options };

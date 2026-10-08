@@ -126,7 +126,16 @@ out below 224 pixels restores the OCR vectors or scan preview. The gap prevents
 flicker near the transition. At most 12 detailed pages remain cached, with a
 further limit based on estimated CPU payload bytes. Vector-only documents return
 complete vector scenes after full loading. During streaming, evicted pages
-regenerate as you navigate. Unloaded pages retain their outlines
+regenerate as you navigate. OCR/scan transitions retain the page geometry, glyph
+resources and search index. Scan pixels and coverage mips prepare in a shared
+worker, with a cooperative fallback, while the previous representation stays
+visible. Submissions are spread across images; Three initializes prepared textures
+through its active host before switching page visibility. Recent GPU resolution
+tiers stay warm inside
+the same automatic raster budget, so repeated zoom cycles can reuse them. Pages
+with additional vector paints or clips install their detail geometry once;
+compositing effects can still require a diagnosed scene rebuild.
+Unloaded pages retain their outlines
 and positions. Search progressively loads preview text for the rest of the
 document; explicit HEP export compiles the complete original PDF.
 
@@ -437,10 +446,21 @@ copy(heprPerf.json());    // Chrome DevTools helper: copy the report for compari
 Capture panning and zooming separately, with the same viewport, DPR, LOD settings,
 and visible layers when comparing versions. Capture is off by default, stops after
 the requested number of rendered frames (600 by default), and also stops when the
-document or renderer is replaced. `heprPerf.report()` reads the current report;
+document or renderer is replaced; demand-driven page updates keep it running.
+`heprPerf.report()` reads the current report;
 starting again clears the previous capture. The report includes the starting view,
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
+
+`transitionSections` measures work between frames, including `pageSwap.decode`,
+`pageSwap.rasterPreparation`, `pageSwap.total`, `rasterRefinement.prepare` and
+`rasterUpload.submit`. `rasterUpload.cacheHit` identifies texture reuse, and
+`rasterUpload.threeHost` measures Three host texture initialization before the
+page switch. Cold scene generations also record composition, preparation,
+`pageSwap.textLod`, `pageSwap.textUpload`, and native scene/atlas construction. `transitions` keeps the latest 120 events. These spans
+can overlap, and worker preparation includes queue/wait time; upload submission
+measures CPU wall time rather than asynchronous GPU execution. Compare the first
+zoom-in with repeated OCR/scan cycles when investigating a stall.
 
 To see which GPU work fills that span, add `gpuOperations: true`:
 

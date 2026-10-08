@@ -1,3 +1,5 @@
+import { finishRasterSteps, finishRasterStepsAsync } from "./rasterPreparationYield";
+
 export interface SingleChannelUint8MipLevel {
   width: number;
   height: number;
@@ -15,6 +17,14 @@ export function buildSingleChannelUint8MipChain(
   width: number,
   height: number
 ): SingleChannelUint8MipLevel[] {
+  return finishRasterSteps(singleChannelMipSteps(source, width, height));
+}
+
+export function buildSingleChannelUint8MipChainAsync(source: Uint8Array, width: number, height: number): Promise<SingleChannelUint8MipLevel[]> {
+  return finishRasterStepsAsync(singleChannelMipSteps(source, width, height));
+}
+
+function* singleChannelMipSteps(source: Uint8Array, width: number, height: number): Generator<void, SingleChannelUint8MipLevel[]> {
   const chain: SingleChannelUint8MipLevel[] = [];
   let levelWidth = Math.max(1, Math.trunc(width));
   let levelHeight = Math.max(1, Math.trunc(height));
@@ -43,6 +53,7 @@ export function buildSingleChannelUint8MipChain(
         nextData[y * nextWidth + x] =
           ((levelData[i00] + levelData[i01] + levelData[i10] + levelData[i11]) + 2) >> 2;
       }
+      yield;
     }
 
     chain.push({ width: nextWidth, height: nextHeight, data: nextData });

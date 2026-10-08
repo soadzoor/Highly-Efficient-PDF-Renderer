@@ -492,13 +492,49 @@ function scheduleDemandPdfUpdate(): void {
       if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || activeHepExportController !== null) {
         demandPdfUpdatePending = true; return;
       }
-      const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, computeAutoPagesPerRow(loader.pageCount)));
+      const transitionStarted = performance.now();
+      const update = lastParsedScene ? loader.getDisplayUpdate(lastParsedScene) : null;
+      if (update && renderer.prepareRasterLayerUpdates) {
+        const staged = renderer.prepareRasterLayerUpdatesAsync
+          ? await renderer.prepareRasterLayerUpdatesAsync(update.layers) : renderer.prepareRasterLayerUpdates(update.layers);
+        try {
+          if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+          if (!lastParsedScene || !loader.isDisplayUpdateCurrent(lastParsedScene, update)) {
+            demandPdfUpdatePending = true; return;
+          }
+          staged.commit();
+          renderer.setPageRasterVisibility?.(update.rasterPages);
+          renderer.recordPerformanceTransition?.("pageSwap.total", performance.now() - transitionStarted);
+        } finally { staged.dispose(); }
+        return;
+      }
+      const composeStarted = performance.now();
+      const pageScenes = loader.displayPageScenes;
+      const composed = composeVectorScenesInGrid(pageScenes, computeAutoPagesPerRow(loader.pageCount));
+      renderer.recordPerformanceTransition?.("pageSwap.compose", performance.now() - composeStarted);
+      const prepareStarted = performance.now();
+      const scene = prepareSceneForHepRendering(composed);
+      renderer.recordPerformanceTransition?.("pageSwap.prepareScene", performance.now() - prepareStarted);
+      await prebuildTextLod(scene);
+      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
       const started = performance.now();
       const stats = uploadSceneWithRollback(renderer, scene, true, true);
       lastParsedScene = scene;
+      loader.bindDisplayScene(scene, pageScenes);
       await layerVisibility.sceneChanged(true);
       if (activePdfPageLoader !== loader || lastParsedScene !== scene) return;
       applyTextSearchScene(scene);
+      const initialUpdate = loader.getDisplayUpdate(scene);
+      if (initialUpdate && renderer.prepareRasterLayerUpdates) {
+        const staged = renderer.prepareRasterLayerUpdatesAsync
+          ? await renderer.prepareRasterLayerUpdatesAsync(initialUpdate.layers) : renderer.prepareRasterLayerUpdates(initialUpdate.layers);
+        try {
+          if (activePdfPageLoader !== loader || lastParsedScene !== scene || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+          if (!loader.isDisplayUpdateCurrent(scene, initialUpdate)) { demandPdfUpdatePending = true; return; }
+          staged.commit(); renderer.setPageRasterVisibility?.(initialUpdate.rasterPages);
+        } finally { staged.dispose(); }
+      }
+      renderer.recordPerformanceTransition?.("pageSwap.total", performance.now() - transitionStarted);
       textSearchWidget.setAvailability("ready");
       updateMetricsPanel(lastParsedSceneLabel ?? "PDF", scene, stats, 0, performance.now() - started, null, null);
       setStatus(`${loader.previewCount.toLocaleString()}/${loader.pageCount.toLocaleString()} page previews; ${loader.detailedCount} detailed pages cached. Pages load as you navigate.`);
@@ -599,6 +635,7 @@ const performanceCapture = {
     console.table({ frameCpu: report.frameCpuMs, frameInterval: report.frameIntervalMs,
       ...report.cpuSections, gpuCommandSpan: report.gpu.frameMs });
     console.table(report.counters);
+    console.table(report.transitionSections);
     return report;
   },
   json(): string { return JSON.stringify(performanceCapture.report(), null, 2); }
@@ -1143,11 +1180,11 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       let pageScenes: VectorScene[];
       if (streaming && candidate.pageCount > 16) {
         demandLoader = candidate;
-        pageScenes = candidate.pageScenes;
+        pageScenes = candidate.displayPageScenes;
       } else {
         try {
           await candidate.loadInitialOverviews(options.signal, !streaming);
-          pageScenes = candidate.pageScenes;
+          pageScenes = candidate.displayPageScenes;
           if (candidate.requiresPageDemand) demandLoader = candidate;
           else await candidate.close();
         } catch (error) { await candidate.close(); throw error; }
@@ -1175,6 +1212,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     scene = prepareSceneForHepRendering(scene);
+    demandLoader?.bindDisplayScene(scene);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
     if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer && !demandLoader && !extractionOptions.ocrTextOnly) {
@@ -1225,6 +1263,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     commitLoadedSource(options, extractionOptions.ocrTextOnly === true, streaming);
     const previousPageLoader = activePdfPageLoader;
     activePdfPageLoader = demandLoader;
+    activePdfPageLoader?.setPerformanceListener((name, ms) => renderer.recordPerformanceTransition?.(name, ms));
     demandLoader = null;
     void previousPageLoader?.close();
     if (activePdfPageLoader) parsedPdfPageCache = null;

@@ -291,6 +291,9 @@ export class ScenePageViews {
     }
     scene.pathCount = scene.fillPathCount + scene.gradientFillPathCount;
     scene.pagePrimitiveRanges = Uint32Array.from(PAGE_PRIMITIVE_KINDS.flatMap(kind => [0, primitives[kind].length]));
+    for (const run of scene.drawRuns ?? []) if (run.pdfRepresentation) {
+      run.pdfRepresentation = { ...run.pdfRepresentation, pageIndex: 0 };
+    }
     validateVectorDrawRuns(scene); validateScenePaintGraph(scene);
     return { scene, paintBounds, primitives, pageIndex };
   }

@@ -1,5 +1,6 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
-import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, deriveSceneTextContentFromIndex, reportNativePdfProgress, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import { nativeVectorMissingFontResolver, resolvePdfPageNumbers, deriveSceneTextContentFromIndex, reportNativePdfProgress, type RasterLayer, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import { createOcrDemandScene, createOcrDetailDemandScene, needsOcrDetailGeometry, placeDemandRaster } from "./pdfDemandScene";
 import { createLoadProgressReporter, type LoadProgressReporter } from "./loadProgress";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { automaticRasterMemoryBudget } from "./rasterMemoryBudget";
@@ -21,6 +22,10 @@ export class PdfPageDemandLoader {
   private readonly attempted = new Set<number>();
   private readonly failed = new Set<number>();
   private readonly evictedPreviews = new Set<number>();
+  private readonly displayPages = new Map<number, { overview: VectorScene; scene: VectorScene; detailed: boolean }>();
+  private boundDisplayPages: VectorScene[] | null = null;
+  private boundDisplayScene: VectorScene | null = null;
+  private readonly placedRasters = new WeakMap<RasterLayer, Map<number, RasterLayer>>();
   private wanted: number[] = [];
   private wantedDetail: number[] = [];
   private detailCandidates: number[] = [];
@@ -36,6 +41,8 @@ export class PdfPageDemandLoader {
   private operation: AbortController | null = null;
   private readonly session: NativeVectorPdfSession;
   private onChange: () => void | Promise<void>;
+  private onTiming: ((name: string, durationMs: number) => void) | null = null;
+  private readonly reportedCompatibilityPages = new Set<number>();
   private readonly options: VectorExtractOptions;
   private readonly sourcePages: number[];
 
@@ -59,6 +66,7 @@ export class PdfPageDemandLoader {
 
   get pageCount(): number { return this.placeholders.length; }
   setOnChange(onChange: () => void | Promise<void>): void { this.onChange = onChange; }
+  setPerformanceListener(listener: ((name: string, durationMs: number) => void) | null): void { this.onTiming = listener; }
   get previewCount(): number { return this.previews.size; }
   get detailedCount(): number { return this.detailed.size; }
   /** Fully compiled vector documents can keep their complete scene without a paging worker. */
@@ -70,6 +78,69 @@ export class PdfPageDemandLoader {
   }
   get pageScenes(): VectorScene[] {
     return this.placeholders.map((_, index) => this.pageScene(index));
+  }
+
+  /** Stable OCR geometry: changing its selected representation does not replace a page scene. */
+  get displayPageScenes(): VectorScene[] {
+    return this.placeholders.map((_, index) => {
+      const overview = this.previews.get(index)?.scene;
+      if (!overview || this.overviewKinds.get(index) === "vector" || this.options.ocrTextOnly) return this.pageScene(index);
+      let display = this.displayPages.get(index);
+      if (!display || display.overview !== overview) {
+        display = { overview, scene: createOcrDemandScene(overview), detailed: false };
+        this.displayPages.set(index, display);
+      }
+      const detail = this.detailed.get(index)?.scene;
+      if (detail && needsOcrDetailGeometry(detail) && !display.detailed) {
+        const combined = createOcrDetailDemandScene(overview, detail);
+        if (!combined) {
+          if (!this.reportedCompatibilityPages.has(index)) {
+            this.reportedCompatibilityPages.add(index);
+            console.warn(`[HEPR] Page ${index + 1} retains its complete scene update path to preserve compositing effects.`);
+          }
+          return this.pageScene(index);
+        }
+        display.scene = combined; display.detailed = true;
+      }
+      return display.scene;
+    });
+  }
+
+  bindDisplayScene(scene: VectorScene, pages = this.displayPageScenes): void {
+    this.boundDisplayPages = pages;
+    this.boundDisplayScene = scene;
+  }
+
+  /** Null means newly loaded geometry requires a scene generation; otherwise only scan pixels/visibility change. */
+  getDisplayUpdate(scene: VectorScene): { layers: Map<number, RasterLayer>; rasterPages: Set<number> } | null {
+    const pages = this.displayPageScenes;
+    if (scene !== this.boundDisplayScene || !this.boundDisplayPages ||
+        pages.some((page, index) => page !== this.boundDisplayPages![index])) return null;
+    const layers = new Map<number, RasterLayer>(), rasterPages = new Set<number>();
+    const offsets = new Map<number, number>();
+    scene.rasterLayers.forEach((slot, index) => {
+      if (!slot.pageDemandSlot) return;
+      const page = slot.pageIndex, offset = offsets.get(page) ?? 0;
+      offsets.set(page, offset + 1);
+      const source = this.wantedDetail.includes(page) ? this.detailed.get(page)?.scene.rasterLayers[offset] : undefined;
+      if (!source) { layers.set(index, slot); return; }
+      let placed = this.placedRasters.get(source);
+      if (!placed) this.placedRasters.set(source, placed = new Map());
+      let layer = placed.get(page);
+      if (!layer || layer.matrix[4] !== Math.fround(source.matrix[4] + scene.pageRects[page * 4] - pages[page].pageRects[0]) ||
+          layer.matrix[5] !== Math.fround(source.matrix[5] + scene.pageRects[page * 4 + 1] - pages[page].pageRects[1])) {
+        layer = placeDemandRaster(source, scene, pages[page], page); placed.set(page, layer);
+      }
+      layers.set(index, layer); rasterPages.add(page);
+    });
+    return { layers, rasterPages };
+  }
+
+  isDisplayUpdateCurrent(scene: VectorScene, update: { layers: ReadonlyMap<number, RasterLayer>; rasterPages: ReadonlySet<number> }): boolean {
+    const latest = this.getDisplayUpdate(scene);
+    return !!latest && latest.layers.size === update.layers.size && latest.rasterPages.size === update.rasterPages.size &&
+      [...latest.rasterPages].every(page => update.rasterPages.has(page)) &&
+      [...latest.layers].every(([index, layer]) => update.layers.get(index) === layer);
   }
 
   private pageScene(index: number, wantedDetail = this.wantedDetail): VectorScene {
@@ -164,7 +235,8 @@ export class PdfPageDemandLoader {
     this.closed = true;
     this.operation?.abort();
     try { await this.session.close(); }
-    finally { await this.running; this.previews.clear(); this.detailed.clear(); this.overviewKinds.clear(); }
+    finally { await this.running; this.previews.clear(); this.detailed.clear(); this.overviewKinds.clear();
+      this.displayPages.clear(); this.boundDisplayPages = null; this.boundDisplayScene = null; this.onTiming = null; }
   }
 
   /** Test/host synchronization without polling or forcing additional pages. */
@@ -208,6 +280,7 @@ export class PdfPageDemandLoader {
         sourcePageIndex: this.sourcePages[index], sourcePageCount: this.session.info.pages.length };
       progress?.report(.12 + index / this.pageCount * .82, { ...pageProgress, processed: index });
       try {
+        const started = performance.now();
         const scene = await this.session.compileVectorPage(this.sourcePages[index], {
           ocrTextOnly: this.options.ocrTextOnly,
           signal: operation.signal, optimization: "safe",
@@ -221,6 +294,8 @@ export class PdfPageDemandLoader {
             });
           }
         });
+        try { this.onTiming?.(detail ? "pageSwap.decode" : "pageSwap.overview", performance.now() - started); }
+        catch (error) { console.warn("[HEPR] Page timing listener failed.", error); }
         if (this.options.extractTextContent === true) scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
         if (this.closed || operation.signal.aborted) { this.attempted.delete(index); continue; }
         const cache = detail ? this.detailed : this.previews;
@@ -261,6 +336,7 @@ export class PdfPageDemandLoader {
       const index = [...cache.keys()].sort((a, b) => rank(b) - rank(a))[0];
       bytes -= cache.get(index)!.bytes;
       cache.delete(index);
+      if (!detail) this.displayPages.delete(index);
       if (!detail) {
         this.evictedPreviews.add(index);
         if (!this.reportedPreviewEviction) {

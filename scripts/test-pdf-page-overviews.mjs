@@ -118,14 +118,16 @@ try {
   try {
     assert(shortScan.pageDemand, "short scanned PDFs also use zoom-dependent loading");
     assert.equal(shortScan.scene.textInstanceCount, 2);
-    assert.equal(shortScan.scene.rasterLayers.length, 0);
+    assert.equal(shortScan.scene.rasterLayers.length, 1);
+    assert(shortScan.scene.rasterLayers.every(layer => layer.pageDemandSlot && layer.width === 1 && layer.opacity === 0), "OCR reserves metadata slots without decoding page images");
     assert.equal(shortScan.pageDemand.detailedCount, 0);
   } finally { await shortScan.pageDemand.close(); }
   const fullBook = await loadPdfSceneFromSource(fixture({ pageCount: 20, poisonImage: true }), {}, undefined, true);
   try {
     assert.equal(fullBook.pageDemand.previewCount, 20, "large OCR books prepare every overview by default");
     assert.equal(fullBook.scene.textInstanceCount, 40);
-    assert.equal(fullBook.scene.rasterLayers.length, 0, "full parsing still avoids all scan codecs until zoom");
+    assert.equal(fullBook.scene.rasterLayers.length, 20);
+    assert(fullBook.scene.rasterLayers.every(layer => layer.pageDemandSlot && layer.data.length === 4 && layer.opacity === 0), "full parsing reserves empty slots and never calls poisoned scan codecs");
     assert(!fullBook.scene.pendingPagePreviews?.some(Boolean));
     assert.equal(fullBook.pageDemand.detailedCount, 0);
   } finally { await fullBook.pageDemand.close(); }
@@ -147,6 +149,7 @@ try {
         object = await createThreePdfObject(loaded, { rendererType, vectorLod: "off", textLod: "off", vectorOnly: true },
           undefined, undefined, () => native);
         const [page] = await object.getPages();
+        let resident = null;
         for (const zoom of [.25, 2, .25, 2]) {
           loaded.pageDemand.update({ ...view, zoom }, object.sceneData.pageRects);
           await loaded.pageDemand.whenIdle();
@@ -155,11 +158,19 @@ try {
           if (object.demandUpdateRunning) await object.demandUpdateRunning;
           await object.updateDemandPages();
           for (const target of [object, page, object.pageBatch].filter(Boolean)) {
-            assert.equal(target.sceneData.textInstanceCount, zoom < 1 ? 2 : 0, `${rendererType}: OCR appears only in the overview`);
-            assert.equal(target.sceneData.rasterLayers.length, zoom < 1 ? 0 : 1, `${rendererType}: scans appear only in detail`);
-            assert.equal(target.textMaterialLayer.mesh.geometry.instanceCount, zoom < 1 ? 2 : 0);
-            assert.equal(target.rasterMaterialLayer.rasterEntries.length, zoom < 1 ? 0 : 1);
+            assert.equal(target.sceneData.textInstanceCount, 2, `${rendererType}: OCR geometry remains resident`);
+            assert.equal(target.sceneData.rasterLayers.length, 1, "the scan keeps one stable slot");
+            const visible = target.paintVisibility.select(target.sceneData.drawRuns);
+            assert.equal(visible.some(run => run.kind === "text"), zoom < 1, "visibility selects OCR only at a distance");
+            assert.equal(visible.some(run => run.kind === "raster"), zoom >= 1, "visibility selects the scan when close");
+            assert.equal(target.rasterMaterialLayer.appliedRasterLayers[0].width, zoom < 1 ? 1 : 256);
           }
+          const targets = [object, page, object.pageBatch].filter(Boolean);
+          const resources = targets.map(target => [target.sceneData, target.textMaterialLayer,
+            target.textMaterialLayer.textInstanceTextureA, target.sceneData.textIndex]);
+          if (resident) resources.forEach((list,index) => list.forEach((value,key) =>
+            assert.equal(value,resident[index][key], "warm swaps retain scene, text material, GPU text texture and search index")));
+          if (zoom >= 1 || resident) resident = resources;
           assert.equal((await object.getPages())[0], page, "OCR/scan transitions retain independent page handles");
         }
       } finally { object?.dispose(); await loaded.pageDemand.close(); }

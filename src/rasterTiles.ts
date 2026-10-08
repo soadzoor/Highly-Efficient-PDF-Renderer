@@ -1,4 +1,5 @@
 import type { MonochromeRaster } from "./monochromeRaster";
+import { finishRasterSteps, finishRasterStepsAsync } from "./rasterPreparationYield";
 
 /**
  * GPU texture limits belong to the device, not the document. An image larger
@@ -128,21 +129,32 @@ export function isRasterTilePlanDownscaled(source: { width: number; height: numb
 
 /** Premultiplied RGBA for each tile of `plan`, resampled first when the plan is smaller than the source. */
 export function rasterTilePixels(source: RasterTileSource, plan: RasterTilePlan): Uint8Array[] {
+  return finishRasterSteps(rasterTilePixelSteps(source, plan));
+}
+
+export function rasterTilePixelsAsync(source: RasterTileSource, plan: RasterTilePlan): Promise<Uint8Array[]> {
+  return finishRasterStepsAsync(rasterTilePixelSteps(source, plan));
+}
+
+function* rasterTilePixelSteps(source: RasterTileSource, plan: RasterTilePlan): Generator<void, Uint8Array[]> {
   const downscaled = isRasterTilePlanDownscaled(source, plan);
   const image = downscaled
-    ? resamplePremultiplied(source.monochrome ?? source.data, source.width, source.height, plan.width, plan.height)
+    ? yield* resamplePremultiplied(source.monochrome ?? source.data, source.width, source.height, plan.width, plan.height)
     : source.data;
-  return plan.tiles.map(tile => {
-    if (downscaled && tile.width === plan.width && tile.height === plan.height) return image;
+  const pixels: Uint8Array[] = [];
+  for (const tile of plan.tiles) {
+    if (downscaled && tile.width === plan.width && tile.height === plan.height) { pixels.push(image); continue; }
     const out = new Uint8Array(tile.width * tile.height * 4);
     for (let row = 0; row < tile.height; row++) {
       const from = ((tile.y + row) * plan.width + tile.x) * 4;
       const pixels = image.subarray(from, from + tile.width * 4);
       if (downscaled) out.set(pixels, row * tile.width * 4);
       else premultiplyInto(out, row * tile.width * 4, pixels);
+      yield;
     }
-    return out;
-  });
+    pixels.push(out);
+  }
+  return pixels;
 }
 
 /** Rounds exactly as the renderers' whole-image premultiplication always has. */
@@ -166,13 +178,13 @@ function premultiplyInto(target: Uint8Array, offset: number, source: Uint8Array)
 }
 
 /** Area-averages straight-alpha RGBA into a smaller premultiplied image, one output row at a time. */
-function resamplePremultiplied(
+function* resamplePremultiplied(
   source: Uint8Array | MonochromeRaster,
   width: number,
   height: number,
   outWidth: number,
   outHeight: number
-): Uint8Array {
+): Generator<void, Uint8Array> {
   const out = new Uint8Array(outWidth * outHeight * 4);
   const row = new Float64Array(width * 4);
   const scaleX = width / outWidth, scaleY = height / outHeight;
@@ -197,6 +209,7 @@ function resamplePremultiplied(
         row[x * 4 + 2] += pixels[sample + 2] * color;
         row[x * 4 + 3] += alpha;
       }
+      yield;
     }
     for (let outX = 0; outX < outWidth; outX++) {
       const left = outX * scaleX, right = left + scaleX;

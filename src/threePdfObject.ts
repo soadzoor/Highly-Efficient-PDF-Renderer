@@ -21,7 +21,8 @@ import {
   deferRendererSceneUpload,
   type DeferredSceneRendererApi
 } from "./deferredRendererApi";
-import { composeVectorScenesInGrid } from "./pdfVectorExtractor";
+import { composeVectorScenesInGrid, type RasterLayer } from "./pdfVectorExtractor";
+import { copyRasterLayer } from "./monochromeRaster";
 import { hasVisiblePagePlaceholders, pagePlaceholderAnimationEnabled } from "./pageLoadingPlaceholder";
 import { prepareSceneForHepRendering } from "./hepShared";
 import type { PdfPageDemandLoader } from "./pdfPageDemand";
@@ -772,6 +773,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   private demandUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private demandUpdatePending = false;
   private demandUpdateRunning: Promise<void> | null = null;
+  private rasterPages: ReadonlySet<number> = new Set();
+  private readonly localDemandRasters = new WeakMap<RasterLayer, RasterLayer>();
+  private transitionProfile: ReturnType<typeof getThreeRenderPerformance> = null;
 
   /** Internal native renderer. Advanced escape hatch; prefer object methods. */
   renderer!: RendererApi;
@@ -953,6 +957,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     this.addEventListener("added", this.handleAddedToParent);
     this.addEventListener("removed", this.handleRemovedFromParent);
     this.pageDemand?.setOnChange(() => this.scheduleDemandUpdate());
+    this.pageDemand?.setPerformanceListener((name, ms) => this.transitionProfile?.recordTransition(name, ms));
   }
 
   private installSceneContent(content: ThreePdfContent): void {
@@ -1134,8 +1139,21 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     await this.waitForPendingLayers(signal);
     if (!this.demandUpdatePending) return;
     this.demandUpdatePending = false;
-    const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(this.pageDemand.pageScenes,
-      this.sceneData.pagesPerRow, this.sourceOptions?.onDiagnostic));
+    const started = performance.now();
+    const update = this.pageDemand.getDisplayUpdate(this.sceneData);
+    if (update) {
+      await this.applyDemandRasterUpdate(update);
+      this.transitionProfile?.recordTransition("pageSwap.total", performance.now() - started);
+      this.dispatchEvent({ type: "change", reason: "pages-loaded" });
+      return;
+    }
+    const pageScenes = this.pageDemand.displayPageScenes;
+    const composed = composeVectorScenesInGrid(pageScenes,
+      this.sceneData.pagesPerRow, this.sourceOptions?.onDiagnostic);
+    this.transitionProfile?.recordTransition("pageSwap.compose", performance.now() - started);
+    const prepareStarted = performance.now();
+    const scene = prepareSceneForHepRendering(composed);
+    this.transitionProfile?.recordTransition("pageSwap.prepareScene", performance.now() - prepareStarted);
     const yieldControl = createLoadYielder(signal);
     const staged: { object: HeprThreePdfObject; content: ThreePdfContent }[] = [];
     const pageViews = this.pageViews;
@@ -1195,6 +1213,10 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       this.attachNativeFrameListener(this.renderer);
       await this.trackLayerUpdate(this.layerVisibility.replaceScene(scene));
       if (this.isDisposed) return;
+      this.pageDemand.bindDisplayScene(scene, pageScenes);
+      const initialUpdate = this.pageDemand.getDisplayUpdate(scene);
+      if (initialUpdate) await this.applyDemandRasterUpdate(initialUpdate);
+      this.transitionProfile?.recordTransition("pageSwap.total", performance.now() - started);
       this.dispatchEvent({ type: "change", reason: "pages-loaded" });
     } finally {
       if (!committed) {
@@ -1202,6 +1224,63 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         table?.dispose();
       }
     }
+  }
+
+  private async applyDemandRasterUpdate(update: { layers: Map<number, RasterLayer>; rasterPages: Set<number> }): Promise<void> {
+    const targets: { object: HeprThreePdfObject; layers: Map<number, RasterLayer>; pages: ReadonlySet<number> }[] = [
+      { object: this, layers: update.layers, pages: update.rasterPages }
+    ];
+    if (this.pageBatch) targets.push({ object: this.pageBatch, layers: update.layers, pages: update.rasterPages });
+    for (const page of this.pageViews ?? []) {
+      const layers = new Map<number, RasterLayer>();
+      page.view.primitives.raster.forEach((global, local) => {
+        const layer = update.layers.get(global);
+        if (!layer) return;
+        let mapped = this.localDemandRasters.get(layer);
+        if (!mapped) { mapped = copyRasterLayer(layer, { pageIndex: 0 }); this.localDemandRasters.set(layer, mapped); }
+        layers.set(local, mapped);
+      });
+      targets.push({ object: page.object, layers, pages: new Set(update.rasterPages.has(page.view.pageIndex) ? [0] : []) });
+    }
+    const staged: { commit(): void; dispose(): void }[] = [];
+    try {
+      for (const { object, layers } of targets) {
+        if (object.isDisposed) continue;
+        staged.push(await object.rasterMaterialLayer.prepareRasterLayerUpdatesAsync(layers));
+        const prepare = object.renderer.prepareRasterLayerUpdatesAsync?.bind(object.renderer);
+        if (prepare) {
+          const native = await prepare(layers);
+          if (native) staged.push(native);
+        }
+        else {
+          const deferred = object.renderer as Partial<DeferredSceneRendererApi>;
+          if (!deferred.hasUploadedScene || deferred.hasUploadedScene()) {
+            const native = object.renderer.prepareRasterLayerUpdates?.(layers);
+            if (native) staged.push(native);
+          }
+        }
+      }
+      this.pagePreparationAbort.signal.throwIfAborted();
+      if (this.isDisposed) return;
+      if (this.pageDemand && !this.pageDemand.isDisplayUpdateCurrent(this.sceneData, update)) {
+        this.demandUpdatePending = true; return;
+      }
+      for (const transaction of staged) transaction.commit();
+      for (const { object, pages } of targets) if (!object.isDisposed) object.setPageRasterVisibility(pages);
+    } finally { for (const transaction of staged) transaction.dispose(); }
+  }
+
+  private setPageRasterVisibility(pages: ReadonlySet<number>): void {
+    this.rasterPages = new Set(pages);
+    const snapshot = { ...this.layerVisibility.getSnapshot(), rasterPages: this.rasterPages };
+    this.paintVisibility.setVisibility(snapshot);
+    this.strokeMaterialLayer?.setOptionalContentVisibility(snapshot);
+    this.vectorLodStrokeLayer?.setOptionalContentVisibility(snapshot);
+    this.fillMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.textMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.gradientMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.rasterMaterialLayer.setOptionalContentVisibility(snapshot);
+    this.renderer.setPageRasterVisibility?.(this.rasterPages);
   }
 
   private updatePageDemand(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
@@ -1383,6 +1462,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private applyLayerVisibility(snapshot: OptionalContentSnapshot): void {
+    snapshot = { ...snapshot, rasterPages: this.rasterPages };
     for (const page of this.pageViews ?? []) page.object.applyLayerVisibility(snapshot);
     this.pageBatch?.applyLayerVisibility(snapshot);
     this.paintVisibility.setVisibility(snapshot);
@@ -2581,6 +2661,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   handleBeforeRender(renderer: ThreeHostRenderer, camera: THREE.Camera): void {
+    this.transitionProfile = getThreeRenderPerformance() ?? this.transitionProfile;
     this.refreshSceneRenderHook();
     if (this.skipNextBeforeRenderCallback) {
       this.skipNextBeforeRenderCallback = false;
@@ -2724,6 +2805,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
 
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.camera");
+    this.transitionProfile = profile ?? this.transitionProfile;
     this.syncAuxiliaryOutputColorSpace(renderer);
     // With page views, primitive highlights are drawn by the pages.
     if (!this.pageViews) this.syncPrimitiveHighlightFrame(renderer,camera);

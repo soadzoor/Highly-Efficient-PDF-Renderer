@@ -153,7 +153,7 @@ try {
     assert.equal(layer.stripEntries.length, 0, "committed replacements cannot leave stale atlas pixels");
     assert.equal(layer.group.children.length, 14);
     assert.equal(visibleRasters(layer).length, 13);
-    assert.equal(replacedTextureReleases(), 1);
+    assert.equal(replacedTextureReleases(), 0, "replaced textures stay warm");
     const currentTexture = originals[0].texture;
     layer.prepareRasterLayerUpdates(new Map([[0, replacement]])).commit();
     assert.equal(originals[0].texture, currentTexture, "cached replay identities retain an already replaced texture");
@@ -174,6 +174,7 @@ try {
       assert.equal(count.material(), 1);
     }
     layer.dispose();
+    assert.equal(replacedTextureReleases(), 1, "teardown releases the warm texture exactly once");
     assert.equal(layer.group.children.length, 0);
     for (const count of releases) assert.equal(count.texture(), 2, "retired atlases are not disposed again with the layer");
     assert.deepEqual(scene.drawRuns, sourceRuns);

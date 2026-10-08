@@ -80,11 +80,11 @@ try {
   assert.equal(threeRasterTextureInfo(entry.texture).mode,2,"initial previews use R8");
   layer.setTextureResidency(true);
   const view = { cameraCenterX: 1024,cameraCenterY: 512,zoom: 1 }, viewport = { width: 2048,height: 1024 };
-  layer.updateFrame(view,viewport);
+  await frame(layer,view,viewport);
   assert.equal(threeRasterTextureInfo(entry.texture).mode,1,"full detail retains one bit per source pixel");
   assert.match(entry.material.fragmentShader,/heprRasterBinaryLinear/);
   assert.equal(entry.material.uniforms.uRasterMonoMips.value,threeRasterTextureInfo(entry.texture).coverage);
-  layer.updateFrame({ ...view,zoom:.34 },viewport);
+  await frame(layer,{ ...view,zoom:.34 },viewport);
   assert.equal(entry.image.plan.width,2048,"zoom hysteresis retains the previous sharp tier");
   const incoming = createEmptyVectorScene();
   const offscreen = source(2048,1024,1); offscreen.matrix[4] = 100000;
@@ -92,14 +92,14 @@ try {
   const replacement = new ThreeMaterialRasterLayer(incoming,{ pageBackground:[1,1,1,1],previousLayer:layer });
   assert.equal(replacement.rasterEntries[1].image.plan.width,2048,"page completion preserves current detail despite shifted image indices");
   assert.equal(replacement.rasterEntries[0].image.plan.width,128,"new offscreen images keep bounded previews");
-  replacement.setTextureResidency(true); replacement.updateFrame({ ...view,zoom:.34 },viewport);
+  replacement.setTextureResidency(true); await frame(replacement,{ ...view,zoom:.34 },viewport);
   assert.equal(replacement.rasterEntries[1].image.plan.width,2048,"the next frame does not demote the inherited tier");
-  for (let i=0;i<3;i++) replacement.updateFrame({ ...view,zoom:.01 },viewport);
+  for (let i=0;i<3;i++) await frame(replacement,{ ...view,zoom:.01 },viewport);
   assert(replacement.rasterEntries[1].image.plan.width <= 128,"preservation still allows zoom-out demotion");
   replacement.dispose();
-  layer.updateFrame({ ...view,zoom:.01 },viewport);
+  await frame(layer,{ ...view,zoom:.01 },viewport);
   assert.equal(threeRasterTextureInfo(entry.texture).mode,2,"zoom-out demotes the native Three material");
-  layer.setMemoryAllowance(65536); layer.updateFrame(view,viewport);
+  layer.setMemoryAllowance(65536); await frame(layer,view,viewport);
   assert(layer.rasterImageBytes(entry) <= 65536,"replacement bytes honor the page's document allowance");
   layer.dispose();
 
@@ -147,7 +147,7 @@ try {
     const photos = new ThreeMaterialRasterLayer(photoScene,{ pageBackground:[1,1,1,1],materialBackend:"webgpu",webGpu });
     photos.setHostRenderer(host); await Promise.resolve(); photos.setTextureResidency(true);
     const view = { cameraCenterX:512,cameraCenterY:512,zoom:1 }, viewport = { width:1024,height:1024 };
-    for (let i=0;i<7;i++) photos.updateFrame(view,viewport);
+    for (let i=0;i<7;i++) await frame(photos,view,viewport);
     assert(photos.rasterEntries.every(entry=>threeRasterTextureInfo(entry.texture).compressionFormat === "bc7"),
       "the Three material planner compresses eligible photos before reducing their resolution");
     assert(photos.rasterEntries.every(entry=>entry.image.plan.width === 1024));
@@ -156,7 +156,7 @@ try {
     assert(rebuilt.rasterEntries.every(entry=>entry.image.plan.width === 1024 && threeRasterTextureInfo(entry.texture).compressionFormat === "bc7"),
       "progressive replacement starts with sharp compressed tiers, rather than RGBA previews");
     const stagedTextures = rebuilt.rasterEntries.map(entry=>entry.texture);
-    rebuilt.setTextureResidency(true); rebuilt.updateFrame(view,viewport);
+    rebuilt.setTextureResidency(true); await frame(rebuilt,view,viewport);
     assert.deepEqual(rebuilt.rasterEntries.map(entry=>entry.texture),stagedTextures,"activation retains newly staged external handles");
     assert(rebuilt.rasterEntries.reduce((bytes,entry)=>bytes+rebuilt.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes);
     rebuilt.dispose();
@@ -169,15 +169,43 @@ try {
     failures = 1;
     const originalWarn = console.warn, warnings = [];
     console.warn = (...args)=>warnings.push(args.join(" "));
-    try { photos.updateFrame(view,viewport); } finally { console.warn = originalWarn; }
+    try { await frame(photos,view,viewport); } finally { console.warn = originalWarn; }
     assert.equal(photos.rasterEntries[0].texture,beforeFailure,"failed encoding retains a drawable previous tier");
     assert(warnings.some(warning=>warning.includes("retaining the previous display resolution")));
-    for (let i=0;i<7;i++) photos.updateFrame(view,viewport);
+    for (let i=0;i<7;i++) await frame(photos,view,viewport);
     assert(photos.rasterEntries.every(entry=>!threeRasterTextureInfo(entry.texture).compressionFormat));
     assert(photos.rasterEntries.reduce((bytes,entry)=>bytes+photos.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes,
       "encoder failure replans uncompressed textures within the same budget");
     photos.dispose();
   } finally { WebGpuRasterCompression.create = originalCreate; }
+  for (const backend of ["webgl", "webgpu"]) {
+    const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: [source(17, 17)] });
+    const layer = new ThreeMaterialRasterLayer(scene, { pageBackground: [1, 1, 1, 1] });
+    const initialized = new Set(), device = {};
+    let uploads = 0;
+    layer.setHostRenderer({ isWebGLRenderer: backend === "webgl", isWebGPURenderer: backend === "webgpu",
+      initialized: true, backend: { device }, initTexture(texture) {
+        if (!initialized.has(texture)) { initialized.add(texture); uploads++; }
+      } });
+    layer.setTextureResidency(true);
+    const original = layer.rasterEntries[0].texture, a = source(33, 17), b = source(35, 19);
+    const staged = await layer.prepareRasterLayerUpdatesAsync(new Map([[0, a]]));
+    assert.equal(uploads, 2, "packed pixels and coverage mips upload through the host before commit");
+    assert.equal(layer.rasterEntries[0].texture, original, "prewarming does not replace the displayed texture");
+    staged.commit(); staged.dispose();
+    const detailTexture = layer.rasterEntries[0].texture;
+    const second = await layer.prepareRasterLayerUpdatesAsync(new Map([[0, b]])); second.commit(); second.dispose();
+    const beforeWarm = uploads;
+    const warm = await layer.prepareRasterLayerUpdatesAsync(new Map([[0, a]])); warm.commit(); warm.dispose();
+    assert.equal(layer.rasterEntries[0].texture, detailTexture);
+    assert.equal(uploads, beforeWarm, "warm texture versions need no further host upload");
+    const failureSource = source(37, 21);
+    layer.setHostRenderer({ isWebGLRenderer: true, initTexture() { throw Error("synthetic host upload failure"); } });
+    await assert.rejects(layer.prepareRasterLayerUpdatesAsync(new Map([[0, failureSource]])), /synthetic host upload/);
+    assert.equal(layer.rasterEntries[0].texture, detailTexture);
+    assert.equal(layer.pendingRasterBytes, 0, "host upload failure releases the staged reservation");
+    layer.dispose();
+  }
   console.log("Three raster storage: packed/R8 tiers, palette/mips, real WGSL bindings, zoom demotion, document allowances and shared external compression ownership passed.");
 } finally {
   clearTimeout(deadline);
@@ -192,4 +220,9 @@ function build(material,geometry) {
     coordinateSystem:THREE.WebGPUCoordinateSystem,debug:{ diagnostics:{ keywords:false } } };
   const builder = new WGSLNodeBuilder(new THREE.Mesh(geometry,material),renderer);
   builder.scene = new THREE.Scene(); builder.camera = new THREE.PerspectiveCamera(); return builder.build();
+}
+
+async function frame(layer, view, viewport) {
+  layer.updateFrame(view, viewport);
+  while (layer.preparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
 }

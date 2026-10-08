@@ -11,6 +11,7 @@
     "**/pdf-worker.js",
     "**/pdfWorkerEntry*.js",
     "**/lodWorkerEntry*.js",
+    "**/rasterPreparationWorker*.js",
     "**/roomDetectorWorker*.js",
     "**/*.css"
   ],

@@ -15,7 +15,10 @@ import {
 import { vectorIndexedPathStore } from "./vectorCellIndex";
 import { validateRasterLayerUpdates, type PreparedRasterLayerUpdates } from "./rasterLayerUpdates";
 import { buildRasterStripBatches } from "./rasterStripBatches";
-import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, type RasterTilePlan } from "./rasterTiles";
+import { planRasterTiles, rasterTilePixels, reportRasterTileDownscale, sameRasterTilePlan, type RasterTilePlan } from "./rasterTiles";
+import { prepareRasterPixels, finishRasterUpdateSteps, finishRasterUpdateStepsAsync, type RasterPreparationJob, type PreparedRasterPixels } from "./rasterPreparation";
+import { RasterResourceCache } from "./rasterResourceCache";
+import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, planSceneRasterMemory,
   estimateRasterSourcePlanBytes, reportRasterMemoryBudget } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
@@ -1658,22 +1661,32 @@ export class WebGlFloorplanRenderer {
 
   getRasterLayerUpdates(): ReadonlyMap<number, RasterLayer> { return this.rasterLayerUpdates; }
 
+  async prepareRasterLayerUpdatesAsync(updates: ReadonlyMap<number, RasterLayer>): Promise<PreparedRasterLayerUpdates> {
+    return finishRasterUpdateStepsAsync(this.prepareRasterLayerUpdateSteps(updates),
+      (name, duration) => this.recordPerformanceTransition(name, duration));
+  }
+
   prepareRasterLayerUpdates(updates: ReadonlyMap<number, RasterLayer>): PreparedRasterLayerUpdates {
+    return finishRasterUpdateSteps(this.prepareRasterLayerUpdateSteps(updates));
+  }
+
+  private *prepareRasterLayerUpdateSteps(updates: ReadonlyMap<number, RasterLayer>):
+    Generator<RasterPreparationJob, PreparedRasterLayerUpdates, PreparedRasterPixels | undefined> {
     updates = new Map(updates);
     const source = this.scene;
     if (!source || this.isDisposed) throw new Error("No active scene for raster replacement.");
     validateRasterLayerUpdates(source, updates);
     const prepared = new Map<number, RasterLayerGpu>();
     let finished = false;
+    let reservedBytes = 0;
     const release = (): void => {
-      for (const value of prepared.values()) {
-        this.rasterStagedBytes = Math.max(0, (this.rasterStagedBytes ?? 0) - value.estimatedBytes);
-        this.deleteRasterLayerTextures(value);
-      }
+      for (const value of prepared.values()) this.deleteRasterLayerTextures(value);
       prepared.clear();
+      this.rasterStagedBytes = Math.max(0, (this.rasterStagedBytes ?? 0) - reservedBytes);
+      reservedBytes = 0;
     };
     let uploaded = false;
-    const stage = (): void => {
+    const stage = function* (this: WebGlFloorplanRenderer): Generator<RasterPreparationJob, void, PreparedRasterPixels | undefined> {
       const changed = [...updates].filter(([index, layer]) =>
         (this.rasterLayerUpdates.get(index) ?? source.rasterLayers[index]) !== layer);
       const changedIndices = new Set(changed.map(([index]) => index));
@@ -1692,11 +1705,19 @@ export class WebGlFloorplanRenderer {
         const memoryPlan = this.planRasterLayerMemory(sources, availableBytes);
         reportRasterMemoryBudget(memoryPlan, this);
         try {
+          reservedBytes = memoryPlan.estimatedBytes;
+          this.rasterStagedBytes = (this.rasterStagedBytes ?? 0) + reservedBytes;
           for (const [offset, [index]] of changed.entries()) {
-            const resource = this.createRasterLayerGpu(sources[offset], index, memoryPlan.plans[offset], memoryPlan.compressionFormats[offset]);
+            const plan = memoryPlan.plans[offset], format = memoryPlan.compressionFormats[offset];
+            const pixels = yield { source: sources[offset], plan, cached: this.rasterResourceCache?.has(sources[offset], plan, format) ?? false };
+            if (this.scene !== source || this.isDisposed || !this.rasterTextureResidencyEnabled)
+              throw new DOMException("Raster update superseded.", "AbortError");
+            const resource = this.createRasterLayerGpu(sources[offset], index, plan, format, pixels);
             prepared.set(index, resource);
-            this.rasterStagedBytes = (this.rasterStagedBytes ?? 0) + resource.estimatedBytes;
           }
+          const actualBytes = [...prepared.values()].reduce((sum, resource) => sum + resource.estimatedBytes, 0);
+          this.rasterStagedBytes += actualBytes - reservedBytes;
+          reservedBytes = actualBytes;
           break;
         } catch (error) {
           release();
@@ -1705,7 +1726,7 @@ export class WebGlFloorplanRenderer {
       }
       uploaded = true;
     };
-    try { if (this.rasterTextureResidencyEnabled) stage(); }
+    try { if (this.rasterTextureResidencyEnabled) yield* stage.call(this); }
     catch (error) { release(); throw error; }
     return {
       commit: () => {
@@ -1715,20 +1736,22 @@ export class WebGlFloorplanRenderer {
         }
         if (!this.rasterTextureResidencyEnabled) release();
         else if (!uploaded) {
-          try { stage(); } catch (error) { release(); finished = true; throw error; }
+          try { finishRasterUpdateSteps(stage.call(this)); } catch (error) { release(); finished = true; throw error; }
         }
         for (const [index, next] of prepared) {
           const value = this.rasterLayers[index];
-          if (value) this.deleteRasterLayerTextures(value);
+          if (value) this.getRasterResourceCache().park(value, value.estimatedBytes ?? 0);
           this.rasterLayers[index] = next;
-          this.rasterStagedBytes = Math.max(0, (this.rasterStagedBytes ?? 0) - next.estimatedBytes);
         }
         prepared.clear();
+        this.rasterStagedBytes = Math.max(0, (this.rasterStagedBytes ?? 0) - reservedBytes);
+        reservedBytes = 0;
         this.destroyRasterStripBatches();
         this.destroyRasterAtlasBatches();
         for (const [index, layer] of updates) this.rasterLayerUpdates.set(index, layer);
         this.rasterResolutionSources = null;
         this.rasterResolutionPlanner?.invalidate();
+        this.trimRasterResourceCache();
         finished = true;
         this.destroyVectorMinifyResources(); this.requestFrame();
       },
@@ -1738,7 +1761,21 @@ export class WebGlFloorplanRenderer {
 
   getOptionalContentVisibility(): OptionalContentSnapshot | null { return this.optionalContentVisibility; }
 
+  private pageRasterVisibility: ReadonlySet<number> | undefined;
+
+  recordPerformanceTransition(name: string, durationMs: number): void {
+    this.performanceProfiler?.recordTransition(name, durationMs);
+  }
+
+  setPageRasterVisibility(pages: ReadonlySet<number>): void {
+    if (this.pageRasterVisibility?.size === pages.size && [...pages].every(page => this.pageRasterVisibility!.has(page))) return;
+    this.pageRasterVisibility = new Set(pages);
+    this.setOptionalContentVisibility({ ...(this.optionalContentVisibility ?? createDefaultOptionalContentSnapshot(this.scene!)),
+      rasterPages: this.pageRasterVisibility });
+  }
+
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
+    if (this.pageRasterVisibility && snapshot.rasterPages !== this.pageRasterVisibility) snapshot = { ...snapshot, rasterPages: this.pageRasterVisibility };
     if (this.isDisposed || this.optionalContentVisibility === snapshot) return;
     this.optionalContentVisibility = snapshot;
     this.scenePaintVisibility?.setVisibility(snapshot);
@@ -1749,6 +1786,7 @@ export class WebGlFloorplanRenderer {
   }
 
   setScene(scene: VectorScene, options: SceneUpdateOptions = {}): SceneStats {
+    const transitionStarted = performance.now();
     if (this.isDisposed) {
       throw new Error("Cannot upload a scene after the WebGL renderer has been disposed.");
     }
@@ -1763,7 +1801,8 @@ export class WebGlFloorplanRenderer {
         this.rasterResolutionView = null;
         this.rasterResolutionSources = null;
       }
-      this.performanceProfiler?.stop();
+      if (!options.preserveRasterResolution) this.performanceProfiler?.stop();
+      this.pageRasterVisibility = undefined;
       this.rasterLayerUpdates.clear();
       this.paintCompositor?.dispose(); this.paintCompositor = null;
       this.optionalContentVisibility = createDefaultOptionalContentSnapshot(scene);
@@ -1784,9 +1823,11 @@ export class WebGlFloorplanRenderer {
     this.pageBackgroundSourceRects = null;
     this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
     this.textLodRuntime?.dispose();
+    const lodStarted = performance.now();
     const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
       : getCachedTextLod(scene);
+    this.recordPerformanceTransition("pageSwap.textLod", performance.now() - lodStarted);
     this.textLodRuntime = textLodBuildResult
       ? new TextLodRuntime(textLodBuildResult, this.textLodMode)
       : null;
@@ -1801,7 +1842,7 @@ export class WebGlFloorplanRenderer {
     this.isPanInteracting = false;
     this.destroyVectorMinifyResources();
     this.destroyVectorLodResources();
-    this.destroyRasterLayerTextures();
+    this.destroyRasterLayerTextures(!!options.preserveRasterResolution);
     if (this.rasterTextureResidencyEnabled) {
       this.uploadRasterLayers(scene);
     }
@@ -1828,6 +1869,7 @@ export class WebGlFloorplanRenderer {
       }
     }
     let textTextureStats;
+    const textUploadStarted = performance.now();
     try {
       textTextureStats = this.uploadTextData(scene, textLodUploadData);
     } catch (error) {
@@ -1839,6 +1881,7 @@ export class WebGlFloorplanRenderer {
       textLodUploadData = null;
       textTextureStats = this.uploadTextData(scene, null);
     }
+    this.recordPerformanceTransition("pageSwap.textUpload", performance.now() - textUploadStarted);
     this.orderedTextLod = scene.drawRuns && textLodUploadData ? new OrderedTextLodSelection(scene, textLodUploadData) : null;
     if (this.orderedTextLod && textLodUploadData) this.orderedRunCuller?.includeTextLod(textLodUploadData);
     this.sceneStats = {
@@ -1921,6 +1964,7 @@ export class WebGlFloorplanRenderer {
 
     if (this.primitiveColors) this.setPrimitiveColorUpdates(this.primitiveColors.updates());
 
+    this.recordPerformanceTransition("pageSwap.setScene", performance.now() - transitionStarted);
     return this.sceneStats;
   }
 
@@ -4651,12 +4695,29 @@ export class WebGlFloorplanRenderer {
     ranges.push({ start: clampedStart, count: clampedCount });
   }
 
-  private destroyRasterLayerTextures(): void {
+  private rasterResourceCache: RasterResourceCache<RasterLayerGpu> | null = null;
+  private rasterPreparationRunning = false;
+
+  private getRasterResourceCache(): RasterResourceCache<RasterLayerGpu> {
+    return this.rasterResourceCache ??= new RasterResourceCache(resource => this.deleteRasterLayerTextures(resource));
+  }
+
+  private trimRasterResourceCache(): void {
+    const resident = this.estimatedRasterResidentBytes() - (this.rasterResourceCache?.bytes ?? 0);
+    this.rasterResourceCache?.trim(Math.max(0, automaticRasterMemoryBudget().bytes - resident - (this.rasterStagedBytes ?? 0)));
+  }
+
+  private destroyRasterLayerTextures(preserveCache = false): void {
     this.destroyRasterTextureBatchCache();
     this.destroyRasterStripBatches();
     this.destroyRasterAtlasBatches();
-    for (const layer of this.rasterLayers) this.deleteRasterLayerTextures(layer);
+    for (const layer of this.rasterLayers) {
+      if (preserveCache) this.getRasterResourceCache().park(layer, layer.estimatedBytes ?? 0);
+      else this.deleteRasterLayerTextures(layer);
+    }
     this.rasterLayers = [];
+    if (!preserveCache) this.rasterResourceCache?.clear();
+    else this.trimRasterResourceCache();
     this.rasterCompression?.releaseWorkspace();
   }
 
@@ -4810,7 +4871,7 @@ export class WebGlFloorplanRenderer {
     }
     this.rasterResolutionSources = rasterSources;
     const maxRasterTextureSize = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
-    this.destroyRasterLayerTextures();
+    this.destroyRasterLayerTextures(true);
     for (let attempt = 0; attempt < 3; attempt++) {
       const memoryPlan = this.planRasterLayerMemory(rasterSources);
       reportRasterMemoryBudget(memoryPlan, this);
@@ -4863,10 +4924,11 @@ export class WebGlFloorplanRenderer {
   /** Refine one image per frame; old textures remain drawable until replacement succeeds. */
   private updateRasterResolution(): void {
     const planner = this.rasterResolutionPlanner;
-    if (!planner || !this.scene || !this.rasterTextureResidencyEnabled || !this.rasterRenderingEnabled || this.rasterStagedBytes > 0) return;
+    if (!planner || !this.scene || !this.rasterTextureResidencyEnabled || !this.rasterRenderingEnabled) return;
     this.rasterResolutionView = { width: this.canvas.width, height: this.canvas.height,
       cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom,
       ...(this.localToClipRenderingEnabled ? { localToClip: this.localToClipMatrix } : {}) };
+    if (this.rasterStagedBytes > 0 || this.rasterPreparationRunning) return;
     const canCompress = selectRasterCompressionFormat((this.rasterCompression ??= new WebGlRasterCompression(this.gl)).capabilities) !== null;
     const sources = this.rasterResolutionSources ??= this.getSceneRasterLayers(this.scene)
       .map(source => this.classifyRasterLayerSource(source, canCompress));
@@ -4874,18 +4936,30 @@ export class WebGlFloorplanRenderer {
     const index = planner.nextChange(sources, this.rasterLayers, plan);
     if (index < 0) return;
     reportRasterMemoryBudget(plan, this);
-    try {
-      const replacement = this.createRasterLayerGpu(sources[index], index, plan.plans[index], plan.compressionFormats[index]);
+    const scene = this.scene, source = sources[index], target = plan.plans[index];
+    this.rasterPreparationRunning = true;
+    const started = performance.now();
+    const pixels = this.rasterResourceCache?.has(source, target, plan.compressionFormats[index])
+      ? Promise.resolve(undefined) : prepareRasterPixels(source, target);
+    void pixels.then(pixels => {
+      if (this.isDisposed || this.scene !== scene || this.rasterResolutionSources !== sources || !this.rasterTextureResidencyEnabled || this.rasterStagedBytes > 0) return;
+      this.rasterResolutionView = { width: this.canvas.width, height: this.canvas.height,
+        cameraCenterX: this.cameraCenterX, cameraCenterY: this.cameraCenterY, zoom: this.zoom,
+        ...(this.localToClipRenderingEnabled ? { localToClip: this.localToClipMatrix } : {}) };
+      const latest = this.planRasterLayerMemory(sources);
+      if (!sameRasterTilePlan(latest.plans[index], target) || latest.compressionFormats[index] !== plan.compressionFormats[index]) return;
+      this.recordPerformanceTransition("rasterRefinement.prepare", performance.now() - started);
+      const replacement = this.createRasterLayerGpu(source, index, target, plan.compressionFormats[index], pixels);
       this.destroyRasterTextureBatchCache();
       this.destroyRasterStripBatches(); this.destroyRasterAtlasBatches();
-      this.deleteRasterLayerTextures(this.rasterLayers[index]);
+      this.getRasterResourceCache().park(this.rasterLayers[index], this.rasterLayers[index].estimatedBytes ?? 0);
       this.rasterLayers[index] = replacement;
+      this.trimRasterResourceCache();
       this.destroyVectorMinifyResources();
-    } catch (error) {
+    }).catch(error => {
       planner.failed(index, plan);
       console.warn("[HEPR] Raster refinement unavailable; retaining the previous display resolution.", error);
-    } finally { this.resetOrderedState(); }
-    if (planner.nextChange(sources, this.rasterLayers, plan) >= 0) this.requestFrame();
+    }).finally(() => { this.rasterPreparationRunning = false; this.resetOrderedState(); if (!this.isDisposed) this.requestFrame(); });
   }
 
   private retryRasterCompression(formats: readonly (RasterCompressionFormat | null)[], error: unknown): boolean {
@@ -4899,33 +4973,37 @@ export class WebGlFloorplanRenderer {
     let bytes = (this.rasterLayers ?? []).reduce((sum, layer) => sum + (layer.estimatedBytes ?? 0), 0);
     for (const batch of this.rasterStripBatches?.values() ?? []) bytes += batch.width * batch.height * 4 + batch.count * 32;
     for (const batch of new Set(this.rasterAtlasBatches?.values())) bytes += batch.width * batch.height * 4 + batch.count * 48;
-    return bytes + (this.rasterCompression?.workspaceBytes ?? 0);
+    return bytes + (this.rasterCompression?.workspaceBytes ?? 0) + (this.rasterResourceCache?.bytes ?? 0);
   }
 
   /** Upload one image, as tiles when it exceeds this context's texture limit. */
   private createRasterLayerGpu(source: RasterLayerSource, index: number, planned?: RasterTilePlan,
-    compressionFormat?: RasterCompressionFormat | null): RasterLayerGpu {
+    compressionFormat?: RasterCompressionFormat | null, prepared?: PreparedRasterPixels): RasterLayerGpu {
     const gl = this.gl;
     const maxTextureSize = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE));
     const plan = planned ?? planRasterTiles(source.width, source.height, maxTextureSize);
+    const cached = this.getRasterResourceCache().take(source, plan, compressionFormat);
+    if (cached) { this.recordPerformanceTransition("rasterUpload.cacheHit", 0); return cached; }
+    const uploadStarted = performance.now();
+    if (prepared && !sameRasterTilePlan(prepared.plan, plan)) prepared = undefined;
     if (!this.rasterResolutionPlanner) reportRasterTileDownscale(index, source, plan, maxTextureSize);
     const monochrome = source.monochrome ?? detectMonochromeRaster(source.data, source.width, source.height);
     const packed = monochrome && plan.width === source.width && plan.height === source.height;
     const coverage = !!monochrome && !packed && !!this.rasterResolutionPlanner;
-    const pixels = packed ? [] : coverage ? monochromeCoverageTilePixels(monochrome!, source.width, source.height, plan)
-      : rasterTilePixels(monochrome ? this.classifyRasterLayerSource(source) : source, plan);
+    const pixels = prepared?.pixels ?? (packed ? [] : coverage ? monochromeCoverageTilePixels(monochrome!, source.width, source.height, plan)
+      : rasterTilePixels(monochrome ? this.classifyRasterLayerSource(source) : source, plan));
     const tiles: RasterTileGpu[] = [];
     try {
       for (const [tileIndex, tile] of plan.tiles.entries()) {
         if (coverage) {
-          const resource = this.createMonochromeCoverageTile(monochrome!, pixels[tileIndex], tile.width, tile.height);
+          const resource = this.createMonochromeCoverageTile(monochrome!, pixels[tileIndex], tile.width, tile.height, prepared?.mipChains?.[tileIndex]);
           tiles.push(plan.tiles.length > 1
             ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) } : resource);
           continue;
         }
         if (packed) {
           const resource = this.createMonochromeRasterTile(
-            monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height);
+            prepared?.monochromeTiles?.[tileIndex] ?? monochromeRasterTile(monochrome, source.width, source.height, tile), tile.width, tile.height, prepared?.mipChains?.[tileIndex]);
           tiles.push(plan.tiles.length > 1
             ? { ...resource, quad: Float32Array.from(tile.quad), uv: Float32Array.from(tile.uv) }
             : resource);
@@ -4963,7 +5041,7 @@ export class WebGlFloorplanRenderer {
       matrix[3] = 1;
     }
     const [first, ...extraTiles] = tiles;
-    return {
+    const resource: RasterLayerGpu = {
       ...first,
       rasterPlan: plan,
       estimatedBytes: estimateRasterSourcePlanBytes({ width: source.width, height: source.height,
@@ -4974,6 +5052,8 @@ export class WebGlFloorplanRenderer {
       paintOrder: source.paintOrder ?? 0,
       pageIndex: source.pageIndex ?? 0
     };
+    this.recordPerformanceTransition("rasterUpload.submit", performance.now() - uploadStarted);
+    return this.getRasterResourceCache().remember(resource, source, plan, compressionFormat);
   }
 
   private deleteRasterLayerTextures(layer: RasterLayerGpu): void {
@@ -4986,7 +5066,7 @@ export class WebGlFloorplanRenderer {
     if (tile.monochrome && tile.monochrome.mipTexture !== tile.texture) this.gl.deleteTexture(tile.monochrome.mipTexture);
   }
 
-  private createMonochromeCoverageTile(source: MonochromeRaster, pixels: Uint8Array, width: number, height: number): RasterTileGpu {
+  private createMonochromeCoverageTile(source: MonochromeRaster, pixels: Uint8Array, width: number, height: number, preparedMips?: SingleChannelUint8MipLevel[]): RasterTileGpu {
     const gl = this.gl, texture = this.mustCreateTexture();
     try {
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -4995,7 +5075,7 @@ export class WebGlFloorplanRenderer {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      const levels = buildSingleChannelUint8MipChain(pixels, width, height);
+      const levels = preparedMips ?? buildSingleChannelUint8MipChain(pixels, width, height);
       for (const [level, data] of levels.entries()) gl.texImage2D(gl.TEXTURE_2D, level, gl.R8,
         data.width, data.height, 0, gl.RED, gl.UNSIGNED_BYTE, data.data);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, levels.length - 1);
@@ -5010,7 +5090,7 @@ export class WebGlFloorplanRenderer {
     finally { gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4); }
   }
 
-  private createMonochromeRasterTile(source: MonochromeRaster, width: number, height: number): RasterTileGpu {
+  private createMonochromeRasterTile(source: MonochromeRaster, width: number, height: number, preparedMips?: SingleChannelUint8MipLevel[]): RasterTileGpu {
     const gl = this.gl, texture = this.mustCreateTexture();
     let mipTexture: WebGLTexture | null = null;
     try {
@@ -5022,7 +5102,7 @@ export class WebGlFloorplanRenderer {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, Math.ceil(width / 8), height, 0, gl.RED, gl.UNSIGNED_BYTE, source.data);
-      const levels = buildMonochromeMipChain(source, width, height);
+      const levels = preparedMips ?? buildMonochromeMipChain(source, width, height);
       // A complete sampler is still required for the single-pixel special case.
       if (!levels.length) levels.push({ width: 1, height: 1, data: Uint8Array.of((source.data[0] >> 7) * 255) });
       gl.bindTexture(gl.TEXTURE_2D, mipTexture);
@@ -5594,7 +5674,9 @@ export class WebGlFloorplanRenderer {
     const glyphMetaBData = new Float32Array(glyphMetaTexelCount * 4);
 
     const glyphRasterMetaData = new Float32Array(glyphMetaTexelCount * 4);
+    const atlasStarted = performance.now();
     const textRasterAtlas = buildTextRasterAtlas(scene, maxTextureSize);
+    this.recordPerformanceTransition("pageSwap.glyphAtlas", performance.now() - atlasStarted);
     if (textRasterAtlas) {
       glyphRasterMetaData.set(textRasterAtlas.glyphUvRects);
       this.textRasterAtlasWidth = textRasterAtlas.width;

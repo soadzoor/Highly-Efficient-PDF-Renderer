@@ -52,6 +52,8 @@ export const fastTests = [
   "pdf-layer-controls",
   "pdf-annotation-controls",
   "raster-layer-updates",
+  "raster-preparation",
+  "pdf-demand-swaps",
   "monochrome-raster",
   "webgl-monochrome-raster",
   "webgpu-monochrome-raster",
@@ -195,7 +197,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package", "lod-worker-package", "built-material-shaders"],
+  package: ["browser-package", "bundler-package", "lod-worker-package", "raster-worker-package", "built-material-shaders"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",
