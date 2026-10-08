@@ -1,12 +1,12 @@
 {
-  "generatedAt": "2026-10-08T19:48:28.558Z",
+  "generatedAt": "2026-10-08T20:36:45.887Z",
   "examples": [
     {
       "id": "20260415_broschuere_leo_b2c_rz_online_reduz",
       "name": "20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
       "hepLod": {
         "path": "examples/heps-lod/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 2048628
+        "sizeBytes": 2048948
       },
       "pdf": {
         "path": "examples/pdfs/20260415+Broschuere_Leo_B2C_RZ+(online+reduz).pdf",
@@ -14,7 +14,7 @@
       },
       "hep": {
         "path": "examples/heps/20260415_Broschuere_Leo_B2C_RZ_online_reduz_-parsed-data.hep",
-        "sizeBytes": 2047608
+        "sizeBytes": 2047928
       }
     },
     {
@@ -294,7 +294,7 @@
       "name": "TIKA-3212-1.pdf",
       "hepLod": {
         "path": "examples/heps-lod/TIKA-3212-1-parsed-data.hep",
-        "sizeBytes": 2750408
+        "sizeBytes": 2750396
       },
       "pdf": {
         "path": "examples/pdfs/TIKA-3212-1.pdf",
@@ -302,7 +302,7 @@
       },
       "hep": {
         "path": "examples/heps/TIKA-3212-1-parsed-data.hep",
-        "sizeBytes": 2563600
+        "sizeBytes": 2563592
       }
     },
     {
