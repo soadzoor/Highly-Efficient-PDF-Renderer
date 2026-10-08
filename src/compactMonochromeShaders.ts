@@ -73,21 +73,25 @@ float heprCompactTexel(sampler2D image, ivec2 size, uint level, ivec2 pixel) {
   uint bits = level == 0u ? heprCompactWord(image, 4u) : 4u;
   uint map = heprCompactWord(image, 5u + level);
   uint entry = heprCompactWord(image, map + (p.y / 32u) * ((uint(size.x) + 31u) / 32u) + p.x / 32u);
-  if ((entry & 0xc0000000u) != 0x40000000u) return heprCompactBlock(image, entry, p, bits) / float((1u << bits) - 1u);
-  uint list = entry & 0x3fffffffu;
-  float value = heprCompactBlock(image, heprCompactWord(image, list), p, 1u);
-  uint count = heprCompactWord(image, list + 1u);
-  for (uint i = 0u; i < 8u; i++) {
-    if (i >= count) break;
-    uint record = list + 2u + 3u * i;
-    uint glyph = heprCompactWord(image, record);
-    ivec2 local = ivec2(p) - ivec2(int(heprCompactWord(image, record + 1u)), int(heprCompactWord(image, record + 2u)));
-    ivec2 glyphSize = ivec2(heprCompactWord(image, glyph), heprCompactWord(image, glyph + 1u));
-    if (all(greaterThanEqual(local, ivec2(0))) && all(lessThan(local, glyphSize))) {
-      uint byteOffset = uint(local.y) * ((uint(glyphSize.x) + 7u) / 8u) + uint(local.x) / 8u;
-      uint word = heprCompactWord(image, glyph + 2u + byteOffset / 4u);
-      uint ink = (word >> ((byteOffset & 3u) * 8u + 7u - (uint(local.x) & 7u))) & 1u;
-      value = min(value, 1.0 - float(ink));
+  float value = 0.0;
+  if ((entry & 0xc0000000u) != 0x40000000u) {
+    value = heprCompactBlock(image, entry, p, bits) / float((1u << bits) - 1u);
+  } else {
+    uint list = entry & 0x3fffffffu;
+    value = heprCompactBlock(image, heprCompactWord(image, list), p, 1u);
+    uint count = heprCompactWord(image, list + 1u);
+    for (uint i = 0u; i < 8u; i++) {
+      if (i >= count) break;
+      uint record = list + 2u + 3u * i;
+      uint glyph = heprCompactWord(image, record);
+      ivec2 local = ivec2(p) - ivec2(int(heprCompactWord(image, record + 1u)), int(heprCompactWord(image, record + 2u)));
+      ivec2 glyphSize = ivec2(heprCompactWord(image, glyph), heprCompactWord(image, glyph + 1u));
+      if (all(greaterThanEqual(local, ivec2(0))) && all(lessThan(local, glyphSize))) {
+        uint byteOffset = uint(local.y) * ((uint(glyphSize.x) + 7u) / 8u) + uint(local.x) / 8u;
+        uint word = heprCompactWord(image, glyph + 2u + byteOffset / 4u);
+        uint ink = (word >> ((byteOffset & 3u) * 8u + 7u - (uint(local.x) & 7u))) & 1u;
+        value = min(value, 1.0 - float(ink));
+      }
     }
   }
   return value;

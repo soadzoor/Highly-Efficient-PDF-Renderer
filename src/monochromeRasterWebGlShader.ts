@@ -29,23 +29,25 @@ float heprRasterBinaryLinear(vec2 uv) {
 }
 
 vec4 heprRasterColor(vec2 uv, vec2 uvDx, vec2 uvDy) {
+  vec4 color = vec4(0.0);
   if (uRasterMonochrome < 0.5) {
-    vec4 color = textureGrad(uRasterTex, uv, uvDx, uvDy);
+    color = textureGrad(uRasterTex, uv, uvDx, uvDy);
     if (uRasterOpaque > 0.5) color.a = 1.0;
-    return color;
-  }
-  float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
-  float lod = max(0.0, log2(max(footprint, 1.0)));
-  float coverage;
-  if (uRasterMonochrome > 2.5) {
-    coverage = heprCompactSample(uRasterTex, ivec2(uRasterMonoSize), uv, lod);
-  } else if (lod < 1.0) {
-    float base = uRasterMonochrome > 1.5 ? textureLod(uRasterTex, uv, 0.0).r : heprRasterBinaryLinear(uv);
-    coverage = mix(base, heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, 0.0), lod);
   } else {
-    coverage = heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, lod - 1.0);
+    float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
+    float lod = max(0.0, log2(max(footprint, 1.0)));
+    float coverage = 0.0;
+    if (uRasterMonochrome > 2.5) {
+      coverage = heprCompactSample(uRasterTex, ivec2(uRasterMonoSize), uv, lod);
+    } else if (lod < 1.0) {
+      float base = uRasterMonochrome > 1.5 ? textureLod(uRasterTex, uv, 0.0).r : heprRasterBinaryLinear(uv);
+      coverage = mix(base, heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, 0.0), lod);
+    } else {
+      coverage = heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, lod - 1.0);
+    }
+    color = mix(uRasterMonoColor0, uRasterMonoColor1, coverage);
   }
-  return mix(uRasterMonoColor0, uRasterMonoColor1, coverage);
+  return color;
 }`)
     // Derivatives are measured before either sampling branch or a clip discard.
     .replace("texture(uRasterTex, vUv)", "heprRasterColor(vUv, dFdx(vUv), dFdy(vUv))");

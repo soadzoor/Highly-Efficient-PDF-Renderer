@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { evaluateGlsl } from "./lib/scalarShaderEval.mjs";
 
 const hooks = registerHooks({ resolve(s, c, next) {
   return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s, c);
@@ -140,11 +141,68 @@ try {
   assert(shader.includes("heprPackedCoverage(uRasterMonoMips"));
   assert(shader.includes("texelFetch(image"), "packed coverage bytes use exact fetches before interpolation");
   assert(!RASTER_FRAGMENT_SHADER_SOURCE.includes("uRasterMonochrome"), "page background keeps the existing shader");
+  testRasterColor(shader);
 } finally {
   hooks.deregister();
 }
 
 console.log("WebGL packed monochrome raster tests passed");
+
+function testRasterColor(shader) {
+  // Expand componentwise vector multiplication for the scalar evaluator;
+  // execute the shipped helper's sampling branches and palette interpolation.
+  const source = shader.match(/vec4 heprRasterColor\([\s\S]*?\n}/)[0]
+    .replace(/uvD([xy]) \* uRasterMonoSize/g, "vec2(uvD$1.x * uRasterMonoSize.x, uvD$1.y * uRasterMonoSize.y)");
+  const palette0 = { r: 0.1, g: 0.2, b: 0.3, a: 0.4 }, palette1 = { r: 0.5, g: 0.6, b: 0.7, a: 0.8 };
+  const sampledColor = { r: 0.2, g: 0.3, b: 0.4, a: 0.5 };
+  for (const [mode, lod, opaque, coverage, expectedReads] of [
+    [0, 2, 0, null, ["rgba"]], [0, 2, 1, null, ["rgba"]],
+    [3, 2, 1, 0.6, ["compact"]],
+    [1, 0, 0, 0.25, ["binary", "packed"]],
+    [1, 0.5, 0, 0.5, ["binary", "packed"]],
+    [2, 0.5, 0, 0.625, ["reduced", "packed"]],
+    [1, 1, 0, 0.75, ["packed"]],
+    [1, 2, 0, 0.75, ["packed"]], [2, 2, 0, 0.75, ["packed"]]
+  ]) {
+    const reads = [], uv = { x: 0.25, y: 0.75 }, size = { x: 8, y: 4 };
+    const dx = { x: 2 ** lod / size.x, y: 0 }, dy = { x: 0, y: 0 };
+    const { heprRasterColor } = evaluateGlsl(source, {
+      uRasterTex: "raster", uRasterMonoMips: "mips", uRasterMonochrome: mode,
+      uRasterOpaque: opaque, uRasterMonoSize: size, uRasterMonoColor0: palette0, uRasterMonoColor1: palette1,
+      vec4: (r, g = r, b = r, a = r) => ({ r, g, b, a }), ivec2: value => ({ ...value }),
+      length: value => Math.hypot(value.x, value.y),
+      mix: (a, b, weight) => typeof a === "number" ? a + (b - a) * weight :
+        Object.fromEntries(Object.keys(a).map(key => [key, a[key] + (b[key] - a[key]) * weight])),
+      textureGrad(texture, sampledUv, sampledDx, sampledDy) {
+        assert.equal(texture, "raster"); assert.equal(sampledUv, uv);
+        assert.equal(sampledDx, dx); assert.equal(sampledDy, dy);
+        reads.push("rgba"); return { ...sampledColor };
+      },
+      textureLod(texture, sampledUv, sampledLod) {
+        assert.equal(texture, "raster"); assert.equal(sampledUv, uv); assert.equal(sampledLod, 0);
+        reads.push("reduced"); return { r: 0.5 };
+      },
+      heprRasterBinaryLinear(sampledUv) {
+        assert.equal(sampledUv, uv); reads.push("binary"); return 0.25;
+      },
+      heprPackedCoverage(texture, sampledSize, sampledUv, sampledLod) {
+        assert.equal(texture, "mips"); assert.deepEqual(sampledSize, size); assert.equal(sampledUv, uv);
+        assert(Math.abs(sampledLod - Math.max(lod - 1, 0)) < 1e-12);
+        reads.push("packed"); return 0.75;
+      },
+      heprCompactSample(texture, sampledSize, sampledUv, sampledLod) {
+        assert.equal(texture, "raster"); assert.deepEqual(sampledSize, size); assert.equal(sampledUv, uv);
+        assert.equal(sampledLod, lod); reads.push("compact"); return 0.6;
+      }
+    });
+    const color = heprRasterColor(uv, dx, dy);
+    const expected = coverage === null ? { ...sampledColor, a: opaque ? 1 : sampledColor.a } :
+      Object.fromEntries(Object.keys(palette0).map(key => [key, palette0[key] + (palette1[key] - palette0[key]) * coverage]));
+    for (const key of Object.keys(expected)) assert(Math.abs(color[key] - expected[key]) < 1e-12,
+      `raster mode ${mode}, LOD ${lod} preserves ${key}, including palette alpha`);
+    assert.deepEqual(reads, expectedReads, `raster mode ${mode}, LOD ${lod} samples only its selected representation`);
+  }
+}
 
 function makeRenderer(Renderer, limit) {
   const calls = [], alive = new Set(), bindings = new Map();

@@ -23,7 +23,11 @@ uint heprRasterClipPolygonSamples(vec4 node, vec2 point, vec4 sampleX, vec4 samp
       tileRect = tileRect && min(abs(line.x - line.z), abs(line.y - line.w)) <= 0.002;
     }
   }
-  if (tileRect) return heprClipPolygonSamples(node, vec4(point.x), vec4(point.y), 0.0);
+  if (tileRect) {
+    sampleX = vec4(point.x);
+    sampleY = vec4(point.y);
+    span = 0.0;
+  }
   return heprClipPolygonSamples(node, sampleX, sampleY, span);
 }
 `;

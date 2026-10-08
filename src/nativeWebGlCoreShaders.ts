@@ -378,14 +378,16 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 ${FILL_COVERAGE_VERTEX_GLSL}
 
 vec4 heprFillInstanceClipBounds(float instanceClipIndex) {
+  // A single initialized return avoids warnings in ANGLE's HLSL translation.
+  vec4 bounds = vec4(-1e38, -1e38, 1e38, 1e38);
   int clipIndex = int(uVectorClipIndex < -1.5 ? instanceClipIndex : uVectorClipIndex);
   // Projected views retain their original per-corner expansion. In the native
   // orthographic view the margin is constant, including within indirect batches.
   if (uUseLocalToClip < 0.5 && uFillClipBoundsEnabled > 0 && clipIndex >= 0) {
-    return texelFetch(uFillClipBoundsTex,
+    bounds = texelFetch(uFillClipBoundsTex,
       coordFromIndex(clipIndex, textureSize(uFillClipBoundsTex, 0)), 0);
   }
-  return vec4(-1e38, -1e38, 1e38, 1e38);
+  return bounds;
 }
 
 vec4 heprFillQuadBounds(vec2 minBounds, vec2 maxBounds, vec2 margin, vec4 clipBounds) {

@@ -13,6 +13,8 @@ try {
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
   const { planSceneRasterMemory } = await import("../src/rasterMemoryBudget.ts");
   const { buildPreparedRasterPixels, buildPreparedRasterPixelsAsync } = await import("../src/rasterPreparationCore.ts");
+  const { COMPACT_MONOCHROME_GLSL } = await import("../src/compactMonochromeShaders.ts");
+  const shaderSampler = compactShaderSampler(COMPACT_MONOCHROME_GLSL);
   const colors = Uint8Array.of(0,0,0,255,255,255,255,255);
   function check(source, width, height, reduced) {
     const mips = reduced ? buildPackedCoverageMipAtlas(reduced, width, height) : buildPackedMonochromeMipAtlas(source, width, height);
@@ -20,12 +22,18 @@ try {
     assert(atlas, "compressible content must select compact storage");
     assert(atlas.data.length < (reduced?.length ?? source.data.length) + mips.data.length);
     const layout = packedMonochromeCoverageLayout(width, height);
+    const shader = shaderSampler(atlas);
     for (const [level, size] of [{ width, height }, ...layout.levels].entries()) {
       for (let y = 0; y < size.height; y++) for (let x = 0; x < size.width; x++) {
         const expected = level === 0 ? reduced ? reduced[y * width + x] / 255
           : ((source.data[y * Math.ceil(width / 8) + (x >> 3)] >> (7 - (x & 7))) & 1)
           : ((mips.data[size.byteOffset + y * size.rowBytes + (x >> 1)] >> ((x & 1) ? 0 : 4)) & 15) / 15;
         assert.equal(sample(atlas, level, x, y), expected, `level ${level}, (${x},${y})`);
+      }
+      // Include ink/background in the symbol fixtures, block boundaries, and out-of-bounds mip edges.
+      for (const [x,y] of [[0,0],[1,1],[29,28],[30,28],[31,31],[32,32],
+        [size.width-1,size.height-1],[-1,-1],[size.width,-1],[-1,size.height],[size.width,size.height]]) {
+        assert.equal(shader(size, level, x, y), sample(atlas, level, x, y), `GLSL level ${level}, (${x},${y})`);
       }
     }
     return { atlas, mips };
@@ -84,7 +92,7 @@ try {
   const unknown={...memorySource,monochrome:{...source,data:source.data.slice()}};
   assert(planSceneRasterMemory([unknown],1024,info.estimatedBytes+16).plans[0].width<512,"unknown contents retain a safe upper bound");
   let disposals=0;texture.addEventListener("dispose",()=>disposals++);texture.dispose();assert.equal(disposals,1);
-  console.log(`Compact monochrome: exhaustive base/mip parity, byte-identical atlas snapshots, blank/repeated blocks, symbol/tile composition, fallback, async preparation and Three accounting passed. Blank fixture: ${white.data.length} bytes.`);
+  console.log(`Compact monochrome: exhaustive base/mip parity, GLSL sampling/clamping parity, byte-identical atlas snapshots, blank/repeated blocks, symbol/tile composition, fallback, async preparation and Three accounting passed. Blank fixture: ${white.data.length} bytes.`);
 } finally { hooks.deregister(); }
 
 /** Byte-for-byte atlas snapshots captured from the original per-pixel builder. */
@@ -113,4 +121,38 @@ function sample(atlas,level,x,y) {
     value=Math.min(value,1-ink);
   }
   return value;
+}
+
+/** Execute the production GLSL texel body with its integer/vector operations and atlas reads. */
+function compactShaderSampler(glsl) {
+  let body = glsl.match(/float heprCompactTexel\([^\n]+\) \{([\s\S]*?)\n\}/)[1];
+  // These are the shader's integer divisions; JS division would retain fractional indices.
+  for (const [from,to] of [
+    ["p.y / 32u", "(p.y >>> 5)"], ["((uint(size.x) + 31u) / 32u)", "((uint(size.x) + 31u) >>> 5)"],
+    ["p.x / 32u", "(p.x >>> 5)"], ["((uint(glyphSize.x) + 7u) / 8u)", "((uint(glyphSize.x) + 7u) >>> 3)"],
+    ["uint(local.x) / 8u", "(uint(local.x) >>> 3)"], ["byteOffset / 4u", "(byteOffset >>> 2)"],
+  ]) body = body.replaceAll(from,to);
+  body = body.replaceAll("size - 1", "subtract(size, 1)")
+    .replace(/ivec2\(p\) - (ivec2\([^\n]+\));/, "subtract(ivec2(p), $1);")
+    .replace(/\b(?:uint|float|ivec2|uvec2) (\w+) =/g, "let $1 =")
+    .replace(/\b(0x[\da-f]+|\d+)u\b/gi, "$1").replaceAll(" >> ", " >>> ").replace(/\bmin\(/g, "Math.min(");
+  const vector = (x,y=x) => typeof x === "object" ? x : {x,y};
+  const helpers = {
+    heprCompactWord: (image,offset) => image.getUint32(offset*4,true),
+    heprCompactBlock: (image,entry,p,bits) => {
+      if (entry & 0x80000000) return entry & 255;
+      const bit = ((p.y & 31)*32+(p.x & 31))*bits;
+      return (image.getUint32((entry+(bit>>>5))*4,true) >>> (bit & 31)) & ((1<<bits)-1);
+    },
+    uint: x => x>>>0, int: x => x|0, float: Number, ivec2: vector, uvec2: vector,
+    subtract: (a,b) => ({x:a.x-(typeof b === "number" ? b : b.x), y:a.y-(typeof b === "number" ? b : b.y)}),
+    clamp: (p,low,high) => ({x:Math.max(low.x,Math.min(high.x,p.x)), y:Math.max(low.y,Math.min(high.y,p.y))}),
+    greaterThanEqual: (a,b) => ({x:a.x>=b.x,y:a.y>=b.y}), lessThan: (a,b) => ({x:a.x<b.x,y:a.y<b.y}),
+    all: v => v.x && v.y,
+  };
+  const run = new Function(...Object.keys(helpers), `return function(image,size,level,pixel) {${body}}`)(...Object.values(helpers));
+  return atlas => {
+    const image = new DataView(atlas.data.buffer,atlas.data.byteOffset,atlas.data.byteLength);
+    return (size,level,x,y) => run(image,{x:size.width,y:size.height},level,{x,y});
+  };
 }
