@@ -660,9 +660,11 @@ batches, before visibility/redundancy filtering; repeated passes count again.
 Ordered stroke LOD batches visit selected IDs only, so this work follows the
 visible selection rather than the combined size of all stored LOD levels.
 `three.compositor` includes setup, batch lookup/geometry preparation, target
-binding, `three.hostDraw` (host renders that draw paints) and `three.hostPass`
-(host renders of composite passes alone). Consecutive compositor operations
-into one surface share a host render; `three.hostRenders` counts them. Inside `three.compositorSetup`,
+binding, `three.hostDraw` (batches that draw paints) and `three.hostPass`
+(batches of composite passes alone). Consecutive compositor operations
+into one surface share a batch. `three.hostRenders` counts full calls to the
+host's `render(scene, camera)`; `three.directPasses` counts batches drawn through
+the specialized compositor path. Inside `three.compositorSetup`,
 `three.compositorCollect` measures proxy/range-index maintenance and
 `three.compositorSelection` measures visible-paint selection. Compare collection
 with `three.scheduleChanges` to diagnose zoom replans. These sections overlap:
@@ -694,6 +696,21 @@ programs before the first draw, including hidden paints that can appear later.
 Private Three compositor scenes draw meshes in queued order with host sorting
 temporarily disabled. Surface dependencies and opaque/transparent transitions
 still split batches; the host's sorting setting is restored after each render.
+
+On Three revision 186, WebGL records the frame's target switches, bounded clears
+and batches, then initializes their geometry in one private driver render.
+Its driver hook replays the batches through Three's `renderBufferDirect`, with
+the usual object/material hooks and matrix updates. `three.directFrame` measures
+the driver render including replay, so it overlaps `three.hostDraw` and
+`three.hostPass`. WebGPU draws each batch through Three's render-object managers
+without repeated scene traversal, render-list construction or sorting. Shader,
+geometry, binding, pipeline and texture ownership stays with Three, and each
+WebGPU pass gets a fresh render ID for its live mask and opacity inputs.
+For the Broschuere workload this replaces 72 full compositor renders with one
+on WebGL and zero on WebGPU; its drawing and surface-pass dependencies remain.
+These counts exclude the application's outer render and presentation draw.
+Unknown renderer versions and unsupported host states use the regular path,
+visible as full calls in `three.hostRenders`.
 
 During a Three WebGL capture, existing GL calls are timed by default. The
 `gl.*` sections distinguish shader-source setup, compilation, linking, program

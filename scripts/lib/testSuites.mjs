@@ -106,6 +106,8 @@ export const fastTests = [
   "three-webgpu-composite-material",
   "three-webgpu-submission-batch",
   "three-webgpu-renderer-submissions",
+  "three-webgpu-direct-pass",
+  "three-webgl-direct-frame",
   "three-webgpu-uniform-updates",
   "three-webgl-uniform-updates",
   "three-paint-fold-state",

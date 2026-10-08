@@ -9,3 +9,4 @@ export { createThreeWebGpuGradientFillMaterial, createThreeWebGpuGradientStrokeM
 export { enableThreeNodePaintFold, createThreeNodeSurfacePaintFoldMaterial } from "./threeWebGpuPaintFold";
 export { createThreeWebGpuPrimitiveHighlightMaterial } from "./threeWebGpuPrimitiveHighlightMaterial";
 export { createThreeWebGpuPaintCompositorMaterials } from "./threeWebGpuPaintCompositorMaterials";
+export { createThreeWebGpuDirectPass } from "./threeWebGpuDirectPass";

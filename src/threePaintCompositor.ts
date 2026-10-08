@@ -14,8 +14,10 @@ import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { compileThreeMaterialRoots, type ThreeShaderCompileHost } from "./threeShaderPreparation";
 import { getThreeWebGpuSubmissionBatch } from "./threeWebGpuSubmissionBatch";
 import { ThreeScenePaintPlan } from "./threeScenePaintPlan";
+import { createThreeWebGlDirectFrame, type ThreeWebGlDirectFrame } from "./threeWebGlDirectFrame";
+import type { ThreeWebGpuDirectPass } from "./threeWebGpuDirectPass";
 
-/** Public renderer operations only, so Three retains ownership of its GPU state cache. */
+/** Host operations; guarded direct adapters still use Three's resource and draw managers. */
 export interface ThreePaintHostRenderer {
   autoClear: boolean;
   sortObjects?: boolean;
@@ -303,6 +305,13 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   /** The pending clear of the target just bound, for its next render. */
   private clearOnRender: readonly [number, number, number, number] | null = null;
   private renderer: ThreePaintHostRenderer | null = null;
+  private glDirectRenderer: ThreePaintHostRenderer | null = null;
+  private glDirectFrame: ThreeWebGlDirectFrame | null = null;
+  private activeGlDirectFrame: ThreeWebGlDirectFrame | null = null;
+  private gpuDirectPass: ThreeWebGpuDirectPass | null = null;
+  /** WebGL initializes all queued geometry in one driver render before replaying these commands. */
+  private glCommands: (() => void)[] | null = null;
+  private readonly glMeshes: CompositorMesh[] = [];
   private output: THREE.RenderTarget | null = null;
   private width = 0;
   private height = 0;
@@ -524,6 +533,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.compositorSetup");
     profile?.add("three.compositorFrames");
+    profile?.add("three.hostRenders", 0);
+    profile?.add("three.directPasses", 0);
     this.rendering = true;
     this.renderer = renderer;
     this.project = project; this.viewportWidth = width; this.viewportHeight = height;
@@ -561,6 +572,14 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       // compositor makes over a hundred of those a frame.
       if (renderer.lighting) renderer.lighting.enabled = false;
       renderer.setScissorTest(false);
+      if (this.backend === "webgl") {
+        if (this.glDirectRenderer !== renderer) {
+          this.glDirectFrame?.dispose();
+          this.glDirectRenderer = renderer;
+          this.glDirectFrame = createThreeWebGlDirectFrame(renderer, this.camera);
+        }
+        if (this.glDirectFrame) this.glCommands = [];
+      } else this.gpuDirectPass = this.webGpu!.createThreeWebGpuDirectPass(renderer);
       profile?.beginSection("three.compositorCollect");
       this.collect(roots);
       profile?.endSection("three.compositorCollect");
@@ -585,6 +604,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       profile?.add("three.paintPlanOperations", this.paintPlan.operations);
       for (const target of this.batches.keys()) this.flush(target);
       this.flushClear(this.output);
+      this.replayGlFrame();
       this.presentationBinding.value = this.output.texture;
       // Raw GL paints use display values internally. A postprocessing target
       // expects working-linear color and applies its output transfer afterward.
@@ -598,6 +618,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.batches.clear();
       this.pendingClears.clear(); this.clearOnRender = null;
       this.internalScene.clear();
+      this.glCommands = null; this.glMeshes.length = 0;
+      this.activeGlDirectFrame = null; this.gpuDirectPass = null;
       renderer.setViewport(saved.viewport); renderer.setScissor(saved.scissor); renderer.setScissorTest(saved.scissorTest);
       // Binding a target restores its own physical viewport/scissor. Global
       // viewport APIs retain the default-framebuffer values in Three.
@@ -650,9 +672,13 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     // WebGPU attachment clears cover the whole surface regardless of scissor;
     // keep that fast clear there, deferred. WebGL can restrict the clear call.
     if (this.backend === "webgpu") { this.pendingClears.set(target, color); return; }
-    this.target(target, rect);
-    this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
-    this.renderer!.clear(true, false, false);
+    const clear = () => {
+      this.target(target, rect);
+      this.renderer!.setClearColor(new THREE.Color().setRGB(color[0], color[1], color[2]), color[3]);
+      this.renderer!.clear(true, false, false);
+    };
+    if (this.glCommands) this.glCommands.push(clear);
+    else clear();
   }
   /** Encodes a target's pending clear before something reads it. */
   private flushClear(target: THREE.RenderTarget | undefined): void {
@@ -815,6 +841,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   }
 
   dispose(): void {
+    this.glDirectFrame?.dispose(); this.glDirectFrame = null; this.glDirectRenderer = null;
     this.releaseSurfaces();
     this.paintPlan.clear(); this.proxyLookups = new WeakMap(); this.singleProxyLookups = new WeakMap();
     for (const proxy of this.proxies.values()) this.disposePartial(proxy);
@@ -858,7 +885,6 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
   private hostRender(passesOnly: boolean, label: () => string): void {
     const profile = getThreeRenderPerformance();
     if (!profile) { this.hostRenderInternal(label); return; }
-    profile.add("three.hostRenders");
     const section = passesOnly ? "three.hostPass" : "three.hostDraw";
     const start = performance.now();
     try { this.hostRenderInternal(label); }
@@ -897,9 +923,9 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       const device = enabled
         ? (this.renderer as { backend?: { device?: GPUDeviceLike } }).backend?.device
         : undefined;
-      if (!device) { this.renderer!.render(this.internalScene, this.camera); completed = true; return; }
+      if (!device) { this.drawInternalScene(); completed = true; return; }
       device.pushErrorScope("validation");
-      try { this.renderer!.render(this.internalScene, this.camera); }
+      try { this.drawInternalScene(); }
       finally {
         const described = label();
         void device.popErrorScope().then(error => {
@@ -914,6 +940,40 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.previousGlMaterial = null;
       this.automaticGlUniformUploads = false;
     }
+  }
+  private drawInternalScene(): void {
+    const profile = getThreeRenderPerformance();
+    if (this.activeGlDirectFrame) {
+      profile?.add("three.directPasses");
+      // Match Three's separate lists even if one paint span contains both
+      // opaque and transparent source materials.
+      for (let transparent = 0; transparent < 2; transparent++) {
+        for (const mesh of this.internalScene.children as CompositorMesh[]) {
+          if (Number(mesh.material.transparent) === transparent) this.activeGlDirectFrame.draw(mesh, this.internalScene);
+        }
+      }
+    } else if (this.gpuDirectPass) {
+      const direct = this.gpuDirectPass.render(this.internalScene, this.camera);
+      profile?.add(direct ? "three.directPasses" : "three.hostRenders");
+    } else {
+      profile?.add("three.hostRenders");
+      this.renderer!.render(this.internalScene, this.camera);
+    }
+  }
+  private replayGlFrame(): void {
+    const commands = this.glCommands;
+    if (!commands) return;
+    this.glCommands = null;
+    const replay = () => { for (const command of commands) command(); };
+    const profile = getThreeRenderPerformance();
+    if (this.glDirectFrame!.supports(this.glMeshes)) {
+      this.activeGlDirectFrame = this.glDirectFrame;
+      profile?.add("three.hostRenders");
+      profile?.beginSection("three.directFrame");
+      try { this.glDirectFrame!.run(this.glMeshes, replay); }
+      finally { this.activeGlDirectFrame = null; profile?.endSection("three.directFrame"); }
+    } else replay();
+    this.glMeshes.length = 0;
   }
   /**
    * Readies the batch for an operation that draws `materials` into
@@ -956,12 +1016,18 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       if (batch.target === target || batch.reads.has(target)) this.flush(batch.target);
     }
   }
-  /** Renders the pending batch as one host render. */
+  /** Finishes a batch in dependency order, or records it for the WebGL driver. */
   private flush(target = this.batch?.target): void {
     const batch = target && this.batches.get(target);
     if (!batch) return;
     this.batches.delete(batch.target);
     if (this.batch === batch) this.batch = null;
+    if (this.glCommands) {
+      this.glMeshes.push(...batch.meshes);
+      this.glCommands.push(() => this.renderBatch(batch));
+    } else this.renderBatch(batch);
+  }
+  private renderBatch(batch: RenderBatch): void {
     this.target(batch.target);
     if (batch.meshes.length) this.internalScene.add(...batch.meshes);
     try {
