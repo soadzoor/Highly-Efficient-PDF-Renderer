@@ -15,6 +15,7 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
 import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
+import { resolvePdfViewingOptions } from "./pdfViewingOptions";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -35,7 +36,7 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   sourceLabel?: string;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
-  /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
+  /** Receives PDF diagnostics, including viewing-option conflicts and ICC fallback warnings. Option conflicts also warn on the console. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 
   /** Cancel source reading, parsing, LOD preparation, and object creation. */
@@ -85,13 +86,32 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
    */
   maxPagesPerRow?: number;
 
-  /** Default all prepares every viewing page before display. Auto streams large PDFs; eager also decodes original scan pixels. */
+  /**
+   * All prepares every viewing page before display; auto streams large PDFs;
+   * eager also decodes original scan pixels. Compatible with ocrTextOnly.
+   * Effective compressScans overrides auto with eager and emits
+   * options.compress-scans-streaming-conflict through onDiagnostic and console.warn.
+   * @default "all"
+   */
   pageLoading?: "all" | "auto" | "eager";
 
-  /** Decode all selected PDF pages and prepare bounded scan textures during parsing: compact monochrome or eligible lossy color/grayscale. */
+  /**
+   * Decode all selected PDF pages and prepare bounded scan textures during
+   * parsing: compact monochrome or eligible lossy color/grayscale.
+   * ocrTextOnly takes precedence and disables this option with an
+   * options.compress-scans-ocr-conflict warning. Otherwise this overrides
+   * pageLoading auto with eager and an options.compress-scans-streaming-conflict warning.
+   * Warnings use onDiagnostic and console.warn; HEP sources ignore these PDF options.
+   * @default false
+   */
   compressScans?: boolean;
 
-  /** PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding. */
+  /**
+   * PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding.
+   * Disables compressScans with an options.compress-scans-ocr-conflict warning
+   * through onDiagnostic and console.warn; the requested pageLoading mode remains available.
+   * @default false
+   */
   ocrTextOnly?: boolean;
 
   /**
@@ -172,6 +192,7 @@ export interface LoadedPdfScene {
   sourceBytes: Uint8Array;
   /** Viewing-only worker/cache; complete extraction and HEP export remain eager. */
   pageDemand?: PdfPageDemandLoader;
+  /** Resolved PDF options; conflicting viewing flags are normalized without changing the caller's options. */
   sourceOptions?: PdfObjectGeneratorOptions;
 }
 
@@ -215,6 +236,7 @@ async function loadPdfSceneFromSourceInternal(
 
   if (sourceKind === "pdf") {
     validateAnnotationAppearanceMode(options.annotationAppearances);
+    options = { ...options, ...resolvePdfViewingOptions(options) };
     const extractOptions: VectorExtractOptions = {
       compressScans: options.compressScans,
       ocrTextOnly: options.ocrTextOnly,

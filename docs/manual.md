@@ -119,6 +119,14 @@ and **Stream pages**. Selecting either of those unchecks **GPU compress scans**;
 OCR-only viewing and streaming can be used together. HEP loads preserve the
 PDF scan-compression choice.
 
+The public API also resolves conflicting PDF options and warns through
+`onDiagnostic` and `console.warn`: `ocrTextOnly: true` disables `compressScans`;
+otherwise `compressScans: true` replaces `pageLoading: "auto"` with `"eager"`.
+When all three are requested, OCR wins and automatic streaming remains available.
+The returned `sourceOptions` stores the resolved choices without changing the
+caller's options. HEP loads ignore these PDF-only options. See the
+[loading options and warning codes](api.md#loading-options).
+
 The Three.js package defaults and demos with **GPU compress scans** unchecked
 prepare all selected page overviews before display, then upload the initial
 scene once.
@@ -1022,6 +1030,14 @@ npm install @napi-rs/canvas
 Vector/text-only extraction does not need this dependency. Without an encoder,
 HEP raster export falls back to raw RGBA and can produce much larger files.
 Repository development installs already include the canvas backend.
+
+Offline conversion compiles every selected page's complete original content,
+but does not prepare or store GPU display caches. The **GPU compress scans**
+viewing option does not apply to `PDFtoHEP.js` or `buildHep`; enabling preparation
+alone would add conversion work without changing the saved HEP. Monochrome scans
+still use the fast, lossless binary storage, and viewers build display data on load
+or zoom. Normal Node provides Canvas2D rather than the WebGL context needed to
+prepare BC7/ASTC color blocks.
 
 The repository provides `PDFtoHEP.js` for batch conversion. It requires a normal
 checkout with development dependencies and Node.js 22.15+, 23.5+, or 24+.

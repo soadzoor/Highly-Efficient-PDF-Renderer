@@ -45,6 +45,16 @@ try {
     assert.equal(blob.type, "application/x-hep");
     const bytes = new Uint8Array(await blob.arrayBuffer());
     assert(hasHepSignature(bytes));
+    if (compression === "store") {
+      const diagnostics = [];
+      const loaded = await loadPdfSceneFromSource(bytes, {
+        compressScans: true, ocrTextOnly: true, pageLoading: "auto",
+        onDiagnostic: diagnostic => diagnostics.push(diagnostic)
+      });
+      assert.equal(loaded.sourceKind, "hep");
+      assert.equal(diagnostics.filter(diagnostic => diagnostic.code.startsWith("options.compress-scans-")).length, 0,
+        "HEP loads ignore PDF viewing options without reporting irrelevant conflicts");
+    }
     assert(events.some(event => event.stage === "hep-build"));
     assert.equal(events.at(-1).value, 1);
     for (let i = 1; i < events.length; i++) assert(events[i].value >= events[i - 1].value);

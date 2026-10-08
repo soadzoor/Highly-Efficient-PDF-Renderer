@@ -7,7 +7,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     ? `${specifier}.ts` : specifier, context);
 } });
 const warn = console.warn;
-console.warn = () => {};
+const warnings = [];
+console.warn = (...args) => warnings.push(args.map(String).join(" "));
 const MIB = 1024 * 1024, budget = 5 * MIB;
 const storageBudget = Math.floor((budget - 4 * MIB) * .98);
 
@@ -220,16 +221,11 @@ try {
   {
     const { loadPdfSceneFromSource } = await import("../src/pdfObjectGenerator.ts");
     const width = 64, height = 64, packed = packedScan(width, height).monochrome.data;
-    const bytes = writeTinyPdf({ objects: [
-      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
-      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
-      { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>` },
-      { number: 4, body: tinyPdfStream("", `q ${width} 0 0 ${height} 0 0 cm /Im Do Q`) },
-      { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceGray /BitsPerComponent 1`, packed) }
-    ] });
+    const bytes = scanPdf(width, height, packed);
     const original = bytes.slice(), diagnostics = [];
-    const loaded = await loadPdfSceneFromSource(bytes, { compressScans: true, pageLoading: "auto",
-      onDiagnostic: diagnostic => diagnostics.push(diagnostic) }, undefined, true);
+    const options = Object.freeze({ compressScans: true, pageLoading: "auto",
+      onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+    const loaded = await loadPdfSceneFromSource(bytes, options, undefined, true);
     assert.equal(loaded.pageDemand, undefined, "scan preparation selects complete parsing even when the viewer requests automatic demand loading");
     assert.equal(loaded.scene.pageCount, 1);
     assert.equal(loaded.scene.rasterLayers.length, 1);
@@ -242,8 +238,72 @@ try {
     assert.equal(typeof Object.getOwnPropertyDescriptor(layer, "data").get, "function", "real loading preserves the lazy RGBA compatibility field");
     assert.equal(layer.gpuCompression, undefined);
     assert(diagnostics.some(diagnostic => diagnostic.code === "raster.scan-monochrome-preparation"));
+    const conflicts = diagnostics.filter(diagnostic => diagnostic.code.startsWith("options.compress-scans-"));
+    assert.equal(conflicts.length, 1, "the public loader reports the streaming conflict once, without duplicate extractor warnings");
+    assert.equal(conflicts[0].code, "options.compress-scans-streaming-conflict");
+    assert.equal(conflicts[0].severity, "warning");
+    assert.equal(warnings.filter(message => message.includes(conflicts[0].message)).length, 1);
+    assert.notEqual(loaded.sourceOptions, options, "resolved PDF viewing options use a separate object");
+    assert.equal(loaded.sourceOptions.compressScans, true);
+    assert.equal(loaded.sourceOptions.pageLoading, "eager");
+    assert.equal(options.pageLoading, "auto", "conflict resolution preserves the caller's options");
     assert.deepEqual(loaded.sourceBytes, original);
     assert.deepEqual(bytes, original, "the caller's PDF bytes remain attached and unchanged");
+
+    for (const pageLoading of ["all", "eager"]) {
+      const compatible = [];
+      const loaded = await loadPdfSceneFromSource(bytes, { compressScans: true, pageLoading,
+        onDiagnostic: diagnostic => compatible.push(diagnostic) }, undefined, true);
+      assert.equal(loaded.pageDemand, undefined);
+      assert(loaded.scene.rasterLayers[0].gpuPreparation);
+      assert.equal(compatible.filter(diagnostic => diagnostic.code.startsWith("options.compress-scans-")).length, 0,
+        `${pageLoading} is compatible with scan preparation`);
+    }
+
+    const manyPages = scanPdf(width, height, packed, 17);
+    for (const compressScans of [false, true]) {
+      const diagnostics = [];
+      const options = Object.freeze({ compressScans, ocrTextOnly: true, pageLoading: "auto",
+        onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+      const loaded = await loadPdfSceneFromSource(manyPages, options, undefined, true);
+      try {
+        assert(loaded.pageDemand, "OCR mode keeps automatic page streaming when scan preparation is disabled or conflicting");
+        assert.equal(loaded.pageDemand.pageCount, 17);
+        assert.equal(loaded.pageDemand.previewCount, 0, "streaming starts with metadata instead of decoding every page");
+        assert.equal(loaded.sourceOptions.compressScans, false);
+        assert.equal(loaded.sourceOptions.pageLoading, "auto");
+        const conflicts = diagnostics.filter(diagnostic => diagnostic.code.startsWith("options.compress-scans-"));
+        assert.equal(conflicts.length, compressScans ? 1 : 0,
+          "OCR wins first, so all three options emit only the relevant OCR conflict warning");
+        if (compressScans) {
+          assert.equal(conflicts[0].code, "options.compress-scans-ocr-conflict");
+          assert.equal(conflicts[0].severity, "warning");
+          assert.equal(warnings.filter(message => message.includes(conflicts[0].message)).length, 1);
+        }
+        assert.equal(options.compressScans, compressScans, "OCR resolution leaves the requested options unchanged");
+      } finally { await loaded.pageDemand?.close(); }
+    }
+
+    const { extractPdfPageScenes, extractPdfRasterPageScenes } = await import("../src/pdfVectorExtractor.ts");
+    for (const extract of [extractPdfPageScenes, extractPdfRasterPageScenes]) {
+      const diagnostics = [], start = warnings.length;
+      const options = Object.freeze({ compressScans: true, ocrTextOnly: true,
+        onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+      const pages = await extract(bytes.slice().buffer, options);
+      assert.equal(pages.length, 1);
+      assert.equal(pages[0].rasterLayers.length, 0, "direct extractors honor OCR rather than decoding or preparing scans");
+      const conflicts = diagnostics.filter(diagnostic => diagnostic.code.startsWith("options.compress-scans-"));
+      assert.equal(conflicts.length, 1, "direct extraction reports the OCR conflict once");
+      assert.equal(conflicts[0].code, "options.compress-scans-ocr-conflict");
+      assert.equal(conflicts[0].severity, "warning");
+      assert.equal(warnings.slice(start).filter(message => message.includes(conflicts[0].message)).length, 1);
+      assert.equal(options.compressScans, true);
+    }
+
+    const beforeFallback = warnings.length;
+    await extractPdfPageScenes(bytes.slice().buffer, { compressScans: true, ocrTextOnly: true });
+    assert.equal(warnings.slice(beforeFallback).filter(message => /compressScans/.test(message) && /ocrTextOnly/.test(message)).length, 1,
+      "public API conflicts warn through console.warn even without an onDiagnostic callback");
   }
 
   console.log("Parse-time scan preparation: BC7/ASTC blocks, lazy-safe compact monochrome atlases, shared page budgets, fallback, cancellation and composition passed.");
@@ -269,6 +329,19 @@ function packedScan(width, height) {
   return { width, height, monochrome: { data, colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) },
     get data() { throw new Error("packed scan RGBA must remain lazy"); },
     matrix: Float32Array.of(100, 0, 0, -100, 0, 100), pageIndex: 0, paintOrder: 0 };
+}
+
+function scanPdf(width, height, packed, pageCount = 1) {
+  const pages = Array.from({ length: pageCount }, (_, index) => index + 3);
+  const contents = pageCount + 3, image = pageCount + 4;
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: `<< /Type /Pages /Count ${pageCount} /Kids [${pages.map(page => `${page} 0 R`).join(" ")}] >>` },
+    ...pages.map(number => ({ number,
+      body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /XObject << /Im ${image} 0 R >> >> /Contents ${contents} 0 R >>` })),
+    { number: contents, body: tinyPdfStream("", `q ${width} 0 0 ${height} 0 0 cm /Im Do Q`) },
+    { number: image, body: tinyPdfStream(`/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceGray /BitsPerComponent 1`, packed) }
+  ] });
 }
 
 function retainedBytes(layer) {

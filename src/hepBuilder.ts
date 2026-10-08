@@ -36,7 +36,11 @@ export interface HepEncodingOptions extends HepLodOptions {
   signal?: AbortSignal;
 }
 
-/** Options when building parsed data directly from an accepted PDF source. */
+/**
+ * Options when building complete parsed data directly from a PDF source.
+ * Viewing options (compressScans, ocrTextOnly, pageLoading) do not apply here.
+ * HEP stores canonical image pixels; GPU display preparations are not serialized.
+ */
 export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOptions {
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;

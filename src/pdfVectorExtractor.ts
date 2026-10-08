@@ -25,6 +25,7 @@ import { assertPdfBytes, PDF_HEADER_SCAN_BYTES } from "./pdfSignature";
 import { copyRasterLayer, type MonochromeRaster } from "./monochromeRaster";
 import type { PreparedRasterCompression } from "./rasterCompression";
 import type { PreparedRasterPixels } from "./rasterPreparationCore";
+import { resolvePdfViewingOptions } from "./pdfViewingOptions";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -234,12 +235,23 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
-  /** Prepare bounded compact monochrome or eligible GPU-compressed color/grayscale scan derivatives between page compiles. */
+  /**
+   * Prepare bounded compact monochrome or eligible GPU-compressed color/grayscale
+   * scan derivatives between page compiles. ocrTextOnly disables this option with
+   * an options.compress-scans-ocr-conflict warning through onDiagnostic and console.warn.
+   * @default false
+   */
   compressScans?: boolean;
-  /** Draw stored text with bundled substitute fonts, omitting images and other graphics. PDF only. */
+  /**
+   * Draw stored text with bundled substitute fonts, omitting images and other graphics.
+   * Takes precedence over compressScans with an options.compress-scans-ocr-conflict warning.
+   * PDF only; compatible with streaming in the high-level loader.
+   * @default false
+   */
   ocrTextOnly?: boolean;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
+  /** Receives PDF diagnostics, including viewing-option conflicts, which also warn on the console. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** User or owner password for a PDF that requires one to open. */
   password?: string;
@@ -405,6 +417,7 @@ async function extractPdfPageScenesWithNative(
   ownership: "copy" | "transfer" = "copy"
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
+  options = { ...options, compressScans: resolvePdfViewingOptions(options).compressScans };
   const {
     openPdfInBrowserWorker,
     openPdfInNodeWorker

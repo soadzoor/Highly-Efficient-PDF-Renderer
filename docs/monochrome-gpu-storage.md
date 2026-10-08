@@ -89,6 +89,12 @@ page. Pages with visible vectors or text skip scan preparation, but still load
 upfront while the option is enabled. HEP loading is unaffected, and the library option remains
 opt-in.
 
+API callers receive conflict warnings through `onDiagnostic` and `console.warn`.
+`ocrTextOnly: true` disables `compressScans` and preserves the requested loading
+mode; otherwise `compressScans: true` changes `pageLoading: "auto"` to `"eager"`.
+`"all"` and `"eager"` are compatible with scan preparation. See
+[loading options and warning codes](api.md#loading-options).
+
 Zoom refinement extracts complete compact blocks directly from packed bytes,
 uses exact 2×2 averaging for even mip reductions, and reuses horizontal coverage
 endpoints across rows. The resulting texture bytes and raster target are

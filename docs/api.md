@@ -81,7 +81,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
 | `pageLoading` | `"all"` | Prepare all viewing pages before display, with one initial scene upload. `"auto"` opts into viewport-driven streaming for PDFs with more than 16 selected pages. Both preserve vector pages, use stored OCR as scan overviews and load scan pixels on zoom; only scans without usable OCR get small bitmap previews. `"eager"` also decodes complete original scan content before returning. |
-| `compressScans` | `false` | Eagerly decode all selected PDF pages and prepare bounded scan texture data between page compiles. Packed monochrome uses compact atlases; opaque color/grayscale scans can use lossy BC7/ASTC. Overrides page streaming; `ocrTextOnly` skips scan preparation. |
+| `compressScans` | `false` | Eagerly decode all selected PDF pages and prepare bounded scan texture data between page compiles. Packed monochrome uses compact atlases; opaque color/grayscale scans can use lossy BC7/ASTC. `ocrTextOnly: true` disables this option with a warning. Otherwise it overrides `pageLoading: "auto"` with `"eager"` and a warning. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
@@ -91,7 +91,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `imageCodecResolver` | Bundled codecs | Supply a raw-sample image decoder; works through PDF workers and PDF-to-HEP conversion. See [image compatibility](#rendering-compatibility-and-diagnostics). |
 | `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |
 | `iccEngine` | `"qcms"` | `"qcms"` or `"lcms"`: try the preferred engine, then the other engine, then alternate colors. `"alternate"`: approximate directly. `"none"`: disable built-in conversion and approximation. |
-| `onDiagnostic` | — | Receive PDF diagnostics, including raster fallback, visual approximation, and ICC warnings with zero-based `pageIndex`. |
+| `onDiagnostic` | — | Receive PDF diagnostics, including conflicting loading options, raster fallback, visual approximation, and ICC warnings. `pageIndex`, when present, is zero-based. |
 
 Page selections are deduplicated and composed in document order. Invalid selections
 reject with `RangeError`. HEP files preserve their saved page selection, layout and
@@ -131,6 +131,22 @@ The library option remains opt-in. Scan preparation targets image-only pages
 with a raster covering at least half the page. Pages containing visible vector
 artwork or text skip this preparation, but the option still loads every selected page
 upfront and overrides streaming for those PDFs. HEP loading is unaffected.
+
+For PDF sources, conflicting viewing options emit a warning through both
+`onDiagnostic` and `console.warn`, once per conflict per load:
+
+| Code | Resolution |
+| --- | --- |
+| `options.compress-scans-ocr-conflict` | `ocrTextOnly: true` disables `compressScans`. The requested `pageLoading` mode is preserved. |
+| `options.compress-scans-streaming-conflict` | Effective `compressScans: true` replaces `pageLoading: "auto"` with `"eager"`, loading every selected page upfront. |
+
+If all three are requested, OCR-only viewing wins, `"auto"` remains available,
+and only the OCR conflict warning is emitted. `"all"` and `"eager"` are compatible
+with scan preparation. Returned `sourceOptions` records the resolved choices;
+the caller's options object is unchanged. HEP sources ignore these PDF-only
+options without conflict warnings. These loader warnings are separate from
+parser diagnostics and are not retained by `PdfSession.getDiagnostics()`.
+
 Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
 Large stroke and text LOD preparations use a module worker when available,
@@ -1058,6 +1074,11 @@ or `@soadzoor/hepr` in Node.
 | --- | --- |
 | PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `password`, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
+
+PDF-to-HEP conversion compiles the complete original content. Viewing options
+`compressScans`, `ocrTextOnly`, and `pageLoading` are not `buildHep` options.
+Prepared GPU display data is not saved in HEP, including when exporting an
+already-prepared scene; viewers rebuild it as needed from canonical pixels.
 
 Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
 `compression` (`"deflate"` by default, or `"store"`), `onProgress`, `onWarning`, and `signal`.

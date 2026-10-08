@@ -120,8 +120,8 @@ export const PDF_DIAGNOSTIC_SEVERITIES: readonly PdfDiagnosticSeverity[] = [
 ];
 
 /**
- * Stable diagnostic codes emitted by the v1 engine. New codes may be added in
- * minor releases, so consumers should always tolerate unknown strings.
+ * Stable diagnostic codes emitted by PDF loaders and the v1 engine. New codes
+ * may be added in minor releases, so consumers should tolerate unknown strings.
  */
 export const PDF_DIAGNOSTIC_CODES = {
   CatalogRepaired: "catalog.repaired",
@@ -147,6 +147,8 @@ export const PDF_DIAGNOSTIC_CODES = {
   ColorProfileFallback: "color.profile-fallback",
   SourceRangeFallback: "source.range-full-download",
   SourceValidatorUnavailable: "source.validator-unavailable",
+  CompressScansOcrConflict: "options.compress-scans-ocr-conflict",
+  CompressScansStreamingConflict: "options.compress-scans-streaming-conflict",
   OptimizationSkipped: "optimize.skipped"
 } as const;
 
