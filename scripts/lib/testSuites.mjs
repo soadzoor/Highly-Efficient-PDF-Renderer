@@ -10,6 +10,8 @@ export const suiteBudgetMs = 10 * 60_000;
 export const fastTests = [
   "test-runner",
   "document-loading",
+  "viewer-render-warmup",
+  "viewer-render-warmup-integration",
   "public-load-cancellation",
   "pdf-source-ownership",
   "hep-container",
@@ -102,6 +104,9 @@ export const fastTests = [
   "three-vector-instance-clip",
   "three-vector-clip-resources",
   "three-webgpu-composite-material",
+  "three-webgpu-submission-batch",
+  "three-webgpu-renderer-submissions",
+  "three-paint-fold-state",
   "three-webgpu-raster-strip-material",
   "three-webgpu-text-material",
   "three-webgpu-varying-interpolation",

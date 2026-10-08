@@ -5,6 +5,7 @@ import { createAnnotationInteractionController, type AnnotationInteractionContro
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
 import * as THREE from "three";
 import { waitForLoad } from "./loadCancellation";
+import { warmViewerRendering } from "./viewerRenderWarmup";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
@@ -744,6 +745,23 @@ function waitForNextRenderedFrame(token: number): Promise<void> {
   return new Promise((resolve) => {
     pendingRenderedFrameResolvers.push(resolve);
     requestRender();
+  });
+}
+
+async function warmThreeRenderer(token: number, signal: AbortSignal): Promise<void> {
+  const target = renderer;
+  const queue = (target as ThreeExampleRenderer & {
+    backend?: { device?: { queue?: { onSubmittedWorkDone?(): Promise<void> } } }
+  }).backend?.device?.queue;
+  await warmViewerRendering({ signal,
+    renderFrame: warmupSignal => {
+      if (token !== loadToken || target !== renderer) return;
+      return waitForLoad(waitForNextRenderedFrame(token), warmupSignal);
+    },
+    waitForGpu: queue?.onSubmittedWorkDone ? () => {
+      if (token !== loadToken || target !== renderer) return;
+      return queue.onSubmittedWorkDone!();
+    } : undefined
   });
 }
 
@@ -1570,6 +1588,8 @@ async function loadSource(
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
+    await warmThreeRenderer(activeLoadToken, controller.signal);
+    if (activeLoadToken !== loadToken) return;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
     if (nextObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
@@ -1727,6 +1747,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
+    await warmThreeRenderer(activeLoadToken, controller.signal);
+    if (activeLoadToken !== loadToken) return;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(
       totalLoadMs,

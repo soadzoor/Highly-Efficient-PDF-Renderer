@@ -5,13 +5,14 @@ import type { ScenePaintMask } from "./scenePaintGraph";
 import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeProjector, type PdfCompositeOperation, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
 import { PDF_COMPOSITE_FRAGMENT_GLSL } from "./pdfCompositeShaders";
 import { setThreePdfShapeOnly } from "./threePdfShape";
-import { canFoldThreePaint, setThreePaintFold, threeGradientMaskSource, threeGradientMaskVectors,
-  type ThreeGradientMaskFold } from "./threePaintFold";
+import { canFoldThreePaint, createThreePaintFoldRestorer, threeGradientMaskSource, threeGradientMaskVectors,
+  type ThreeGradientMaskFold, type ThreePaintFoldRestorer } from "./threePaintFold";
 import { HEPR_THREE_LAYER_ORDER_TEXT } from "./threeLayerOrder";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 import { scenePaintNodeBounds } from "./scenePaintGraph";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { compileThreeMaterialRoots, type ThreeShaderCompileHost } from "./threeShaderPreparation";
+import { getThreeWebGpuSubmissionBatch } from "./threeWebGpuSubmissionBatch";
 
 /** Public renderer operations only, so Three retains ownership of its GPU state cache. */
 export interface ThreePaintHostRenderer {
@@ -92,7 +93,7 @@ interface PartialGeometrySelection {
 interface PaintFold { opacity: number; mask: THREE.Texture | null; content?: ScenePaintMask; gradient?: ThreeGradientMaskFold }
 
 /** What a paint's stand-in applies to its material while it draws. */
-interface DrawState { shapeOnly: boolean; fold: PaintFold | null }
+interface DrawState { shapeOnly: boolean; fold: PaintFold | null; foldRestorer?: ThreePaintFoldRestorer }
 
 /** A composite pass's inputs, applied to the shared pass uniforms while its mesh draws. */
 interface PassState {
@@ -367,6 +368,31 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     if (this.rendering) return;
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.compositor");
+    const submissions = this.backend === "webgpu" ? getThreeWebGpuSubmissionBatch(renderer) : null;
+    try {
+      if (submissions) submissions.run(() => this.renderFrame(renderer, scene, roots, width, height, visible, project, clipFromData));
+      else this.renderFrame(renderer, scene, roots, width, height, visible, project, clipFromData);
+    } finally {
+      if (submissions) {
+        const stats = submissions.stats;
+        profile?.add("three.gpuSubmissionRequests", stats.requestedSubmissions);
+        profile?.add("three.gpuSubmissions", stats.submissions);
+        profile?.add("three.gpuCommandBuffers", stats.commandBuffers);
+        profile?.add("three.gpuBufferWriteBarriers", stats.bufferWriteBarriers);
+        profile?.add("three.gpuResourceWriteBarriers", stats.resourceWriteBarriers);
+        profile?.add("three.gpuUnknownBarriers", stats.unknownBarriers);
+        profile?.add("three.gpuRequestedBufferWrites", stats.requestedBufferWrites);
+        profile?.add("three.gpuBufferWrites", stats.bufferWrites);
+        profile?.add("three.gpuStagedUploadBytes", stats.stagedUploadBytes);
+      }
+      profile?.endSection("three.compositor");
+    }
+  }
+
+  private renderFrame(renderer: ThreePaintHostRenderer, scene: VectorScene, roots: readonly THREE.Object3D[], width: number, height: number,
+    visible: (condition?: number) => boolean, project: PdfCompositeProjector | null,
+    clipFromData: THREE.Matrix4 | null): void {
+    const profile = getThreeRenderPerformance();
     profile?.beginSection("three.compositorSetup");
     profile?.add("three.compositorFrames");
     this.rendering = true;
@@ -450,7 +476,6 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.renderer = null; this.rendering = false; this.project = null;
       this.clipFromData = null; this.scene = null; this.gradientMask = null;
       profile?.add("three.surfaceBytes", this.surfaces.size * this.width * this.height * 4);
-      profile?.endSection("three.compositor");
     }
   }
 
@@ -825,7 +850,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
     this.meshRestores.push(setThreePdfShapeOnly(mesh.material, state.shapeOnly));
     const fold = state.fold;
     if (fold) {
-      this.meshRestores.push(setThreePaintFold(mesh.material, fold.opacity, fold.mask, fold.content, fold.gradient));
+      const restorer = state.foldRestorer ??= createThreePaintFoldRestorer();
+      this.meshRestores.push(restorer.apply(mesh.material, fold.opacity, fold.mask, fold.content, fold.gradient));
     }
     if (mesh.material instanceof THREE.RawShaderMaterial) mesh.material.uniformsNeedUpdate = true;
   }

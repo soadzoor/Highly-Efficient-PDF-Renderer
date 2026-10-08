@@ -12,7 +12,8 @@ import { isPdfPasswordError, loadPdfSceneFromSource } from "./pdfObjectGenerator
 import { createLayerVisibilityController } from "./layerVisibility";
 import { createPdfLayerControls } from "./pdfLayerControls";
 import { createPdfAnnotationControls } from "./pdfAnnotationControls";
-import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
+import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
+import { warmViewerRendering } from "./viewerRenderWarmup";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import {
@@ -1258,6 +1259,9 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
+    progress.report(1, { stage: "first-render", sourceType: "pdf" });
+    await warmNativeRenderer(targetRenderer, options.signal);
+    if (activeLoadToken !== loadToken) return;
     progress.complete({ sourceType: "pdf" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -1374,6 +1378,9 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
+    progress.report(1, { stage: "first-render", sourceType: "hep" });
+    await warmNativeRenderer(targetRenderer, options.signal);
+    if (activeLoadToken !== loadToken) return;
     progress.complete({ sourceType: "hep" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -1431,6 +1438,20 @@ function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, stream
   pageStreamingCheckbox!.disabled = options.source.kind !== "pdf";
   lastDownloadablePdf = options.downloadablePdf;
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+}
+
+/** Keep native frame pacing while warming the view that will become interactive. */
+async function warmNativeRenderer(target: RendererApi, signal: AbortSignal): Promise<void> {
+  if (!(target instanceof WebGlFloorplanRenderer) && !(webGpuRendererClass && target instanceof webGpuRendererClass)) return;
+  await warmViewerRendering({ signal, renderFrame: async warmupSignal => {
+    warmupSignal.throwIfAborted();
+    if (target !== renderer) return;
+    const serial = target.getPresentedFrameSerial();
+    target.requestFrame();
+    while (target === renderer && target.getPresentedFrameSerial() === serial) {
+      await yieldForLoad(warmupSignal);
+    }
+  } });
 }
 
 function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preserveView?: boolean,

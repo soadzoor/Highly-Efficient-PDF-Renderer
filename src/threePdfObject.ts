@@ -6,6 +6,7 @@ import { SharedPageRenderer } from "./sharedPageRenderer";
 import { createLoadYielder, yieldAfterPaint } from "./loadCancellation";
 import * as THREE from "three";
 import { projectThreePdfCompositeBounds, ThreePaintCompositor, type ThreePaintHostRenderer } from "./threePaintCompositor";
+import { installThreeWebGpuSubmissionBatch } from "./threeWebGpuSubmissionBatch";
 import { ScenePaintVisibility, sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { ScenePrimitivePicker, getScenePrimitive, validatePrimitiveRef, type PrimitiveRef, type PrimitiveInfo, type PrimitiveHit,
   type ScenePrimitivePickOptions, type PrimitiveKind } from "./scenePrimitives";
@@ -2390,6 +2391,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     // The compositor must capture its target before compileAsync returns its
     // promise; an uninitialized WebGPU host otherwise captures it after init.
     if (renderer.isWebGPURenderer) await renderer.init?.();
+    if (renderer.isWebGPURenderer) installThreeWebGpuSubmissionBatch(renderer);
     signal?.throwIfAborted();
     await yieldAfterPaint(signal);
     if (this.isDisposed) return;
@@ -2870,6 +2872,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
 
   private syncFrame(renderer: ThreeHostRenderer, camera: THREE.Camera, shaderPreparationOnly = false): void {
+    if (renderer.isWebGPURenderer) installThreeWebGpuSubmissionBatch(renderer);
     this.lastHostRenderer = renderer;
     this.rasterMaterialLayer.setHostRenderer(renderer);
     if (!shaderPreparationOnly) this.updatePageDemand(renderer, camera);

@@ -73,6 +73,63 @@ export interface ThreeGradientMaskFold {
   linear: boolean;
 }
 
+export interface ThreePaintFoldRestorer {
+  apply(material: THREE.Material, opacity: number, mask: THREE.Texture | null,
+    content?: ScenePaintMask, gradient?: ThreeGradientMaskFold): () => void;
+  restore(): void;
+}
+
+function applyPaintFoldInputs(inputs: PaintFoldInputs, opacity: number, mask: THREE.Texture | null,
+  content?: ScenePaintMask, gradient?: ThreeGradientMaskFold): void {
+  const [red, green, blue, alpha, bias] = paintFoldMaskWeights(content);
+  const mode = gradient ? (gradient.linear ? PaintFoldMode.LinearGradient : PaintFoldMode.Gradient)
+    : mask ? PaintFoldMode.Surface : PaintFoldMode.None;
+  inputs.fold.value.set(opacity, mode, bias, 0);
+  inputs.weights.value.set(red, green, blue, alpha);
+  inputs.mask.value = gradient?.lut ?? mask ?? inputs.neutral;
+  if (gradient) for (let index = 0; index < inputs.gradient.length; index++) {
+    inputs.gradient[index].fromArray(gradient.vectors, index * 4);
+  }
+}
+
+/**
+ * A compositor draw slot's reusable fold snapshot. Clip clones may share
+ * inputs, so each concurrently active draw needs its own restorer, restored
+ * in reverse order. Keep the snapshot vectors and callback between draws:
+ * gradient folds otherwise allocate dozens of vectors for every frame.
+ */
+export function createThreePaintFoldRestorer(): ThreePaintFoldRestorer {
+  const fold = new THREE.Vector4(), weights = new THREE.Vector4();
+  const vectors: THREE.Vector4[] = [];
+  let active: PaintFoldInputs | null = null;
+  let texture: THREE.Texture | null = null;
+  let gradientCount = 0;
+  const restore = (): void => {
+    const inputs = active;
+    if (!inputs) return;
+    inputs.fold.value.copy(fold); inputs.weights.value.copy(weights); inputs.mask.value = texture;
+    for (let index = 0; index < gradientCount; index++) inputs.gradient[index].copy(vectors[index]);
+    active = null; texture = null; gradientCount = 0;
+  };
+  return {
+    apply(material, opacity, mask, content, gradient) {
+      if (active) throw new Error("A PDF paint fold snapshot is already active.");
+      const inputs = foldInputs.get(material);
+      if (!inputs) throw new Error("PDF material cannot draw a folded paint.");
+      fold.copy(inputs.fold.value); weights.copy(inputs.weights.value); texture = inputs.mask.value;
+      gradientCount = gradient ? inputs.gradient.length : 0;
+      for (let index = 0; index < gradientCount; index++) {
+        (vectors[index] ??= new THREE.Vector4()).copy(inputs.gradient[index]);
+      }
+      active = inputs;
+      try { applyPaintFoldInputs(inputs, opacity, mask, content, gradient); }
+      catch (error) { restore(); throw error; }
+      return restore;
+    },
+    restore
+  };
+}
+
 /**
  * Applies a fold to a paint material until the returned callback restores it.
  * `content` is the soft mask that `mask` holds unconverted, or that
@@ -85,13 +142,7 @@ export function setThreePaintFold(material: THREE.Material, opacity: number, mas
   if (!inputs) throw new Error("PDF material cannot draw a folded paint.");
   const fold = inputs.fold.value.clone(), weights = inputs.weights.value.clone(), texture = inputs.mask.value;
   const vectors = gradient ? inputs.gradient.map(vector => vector.clone()) : null;
-  const [red, green, blue, alpha, bias] = paintFoldMaskWeights(content);
-  const mode = gradient ? (gradient.linear ? PaintFoldMode.LinearGradient : PaintFoldMode.Gradient)
-    : mask ? PaintFoldMode.Surface : PaintFoldMode.None;
-  inputs.fold.value.set(opacity, mode, bias, 0);
-  inputs.weights.value.set(red, green, blue, alpha);
-  inputs.mask.value = gradient?.lut ?? mask ?? inputs.neutral;
-  if (gradient) inputs.gradient.forEach((vector, index) => vector.fromArray(gradient.vectors, index * 4));
+  applyPaintFoldInputs(inputs, opacity, mask, content, gradient);
   return () => {
     inputs.fold.value.copy(fold); inputs.weights.value.copy(weights); inputs.mask.value = texture;
     if (vectors) inputs.gradient.forEach((vector, index) => vector.copy(vectors[index]));

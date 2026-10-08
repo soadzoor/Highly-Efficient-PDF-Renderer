@@ -21,6 +21,8 @@ let nextParse = async (buffer) => [scene(new Uint8Array(buffer)[0])];
 let failUpload = null;
 let uploadedScene = null;
 let view = { cameraCenterX: 0, cameraCenterY: 0, zoom: 1 };
+let duringNativeWarmup = null;
+const nativeLoadEvents = [];
 // The export dialog's default: Download with no LOD checked. null is Cancel.
 let hepLodChoice = {};
 const context = vm.createContext({
@@ -45,10 +47,19 @@ const context = vm.createContext({
   setStatus: (message) => { statuses.push(message); context.statusTextElement.textContent = message; }, clearLoadedStatus: noop,
   setDownloadPdfButtonState: noop, setDownloadDataButtonState: noop,
   setDownloadAllDataButtonState: noop, setPrimaryLoadControlsEnabled: noop,
-  setParsingLoader: noop, setMetricPlaceholder: noop, updateParsingLoaderProgress: event => exportProgress.push(event.value),
+  setParsingLoader: visible => nativeLoadEvents.push({ event: visible ? "loading" : "ready", id: uploadedScene?.id }),
+  setMetricPlaceholder: noop, updateParsingLoaderProgress: event => exportProgress.push(event.value),
   logSegmentMergeStats: noop, logInvisibleCullStats: noop, logTextVectorStats: noop,
   logTextureSizeStats: noop, applyTextSearchScene: noop, refreshDropIndicator: noop,
-  updateMetricsPanel: noop,
+  updateMetricsPanel: (_label, value) => nativeLoadEvents.push({ event: "metrics", id: value.id }),
+  warmNativeRenderer: async (target, signal) => {
+    assert.equal(target, context.renderer);
+    signal.throwIfAborted();
+    const value = uploadedScene;
+    nativeLoadEvents.push({ event: "warm", id: value.id });
+    await waitForLoad(Promise.resolve(duringNativeWarmup?.(value, signal)), signal);
+    nativeLoadEvents.push({ event: "warm-complete", id: value.id });
+  },
   scheduleDemandPdfUpdate: noop, textSearchWidget: { setAvailability: noop },
   openPdfPageDemand: openShortDocument,
   extractPdfPageScenes: (buffer, options, signal) => nextParse(buffer, options, signal),
@@ -83,6 +94,7 @@ const context = vm.createContext({
     getViewState: () => ({ ...view }), setViewState: (next) => { view = next; },
     setScene: (value) => {
       uploadedScene = value; // Simulate an upload which can fail after replacing buffers.
+      nativeLoadEvents.push({ event: "upload", id: value.id });
       if (value.id === failUpload) throw new Error("GPU upload failed");
       return stats;
     },
@@ -282,6 +294,7 @@ assert.equal(context.loadedOcrTextOnly, false);
 assert.deepEqual(view, beforeOcrView);
 
 await testThreeDocumentReplacement();
+await testNativeWarmupLoads();
 await testScanCompressionPreferences();
 await testThreeHepExports();
 await testHepLodPrompt();
@@ -839,6 +852,8 @@ async function testThreeDocumentReplacement() {
   const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
   const host = demoHost();
   const objects = new Map();
+  const loadEvents = [];
+  let duringWarmup = null;
   let metadataStarted;
   const metadataReady = new Promise((resolve) => { metadataStarted = resolve; });
   let compileStarted, finishCompile;
@@ -875,9 +890,23 @@ async function testThreeDocumentReplacement() {
       host.currentPdfObject.dispose();
       host.currentPdfObject = object;
     },
-    updateLoadingProgress: noop, setLoadingProgress: noop, setLoadControlsEnabled: noop,
+    updateLoadingProgress: noop, setLoadingProgress: visible => {
+      if (!visible) loadEvents.push({ event: "ready", id: host.currentPdfObject.id });
+    }, setLoadControlsEnabled: noop,
     setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
-    waitForNextRenderedFrame: async () => {}, formatLoadTiming: () => "timing", updateSceneMetrics: noop
+    waitForNextRenderedFrame: async () => loadEvents.push({ event: "first-frame", id: host.currentPdfObject.id }),
+    warmThreeRenderer: async (token, signal) => {
+      signal.throwIfAborted();
+      assert.equal(token, host.loadToken);
+      const object = host.currentPdfObject;
+      assert.deepEqual(loadEvents.at(-1), { event: "first-frame", id: object.id },
+        "Three warming follows the installed object's first rendered frame");
+      loadEvents.push({ event: "warm", id: object.id });
+      await waitForLoad(Promise.resolve(duringWarmup?.(object, signal)), signal);
+      loadEvents.push({ event: "warm-complete", id: object.id });
+    },
+    formatLoadTiming: () => "timing",
+    updateSceneMetrics: object => loadEvents.push({ event: "metrics", id: object.id })
   });
   vm.createContext(host);
   vm.runInContext(sourceFunction(source, "loadSource"), host);
@@ -893,6 +922,9 @@ async function testThreeDocumentReplacement() {
   assert.equal(objects.get("B").disposals, 1);
   assert.equal(objects.get("C").disposals, 0);
   assert.equal(previous.disposals, 1);
+  assert.deepEqual(loadEvents.filter(event => event.id === "C").map(event => event.event),
+    ["first-frame", "warm", "warm-complete", "metrics", "ready"],
+    "Three marks loading complete after its warm-up completes");
 
   const c = host.currentPdfObject;
   const d = host.loadSource("D");
@@ -910,6 +942,87 @@ async function testThreeDocumentReplacement() {
   assert.equal(objects.get("E").disposals, 0);
   assert.equal(objects.get("F").disposals, 1);
   assert.equal(host.lastLoadedSource, "E");
+
+  let enterWarmup, finishWarmup, oldWarmSignal;
+  const warmupStarted = new Promise(resolve => { enterWarmup = resolve; });
+  const warmupDone = new Promise(resolve => { finishWarmup = resolve; });
+  duringWarmup = (object, signal) => {
+    if (object.id !== "G") return;
+    oldWarmSignal = signal;
+    enterWarmup();
+    return warmupDone;
+  };
+  const g = host.loadSource("G");
+  await warmupStarted;
+  assert.equal(host.currentPdfObject.id, "G", "warm-up exercises the installed replacement");
+  assert(!loadEvents.some(event => event.id === "G" && event.event === "ready"));
+  await host.loadSource("H");
+  await g;
+  assert.equal(oldWarmSignal.aborted, true, "a newer document cancels the old rendering warm-up");
+  finishWarmup();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(host.currentPdfObject.id, "H");
+  assert.equal(host.lastLoadedSource, "H");
+  assert.equal(host.lastDownloadablePdf.label, "H");
+  assert(!loadEvents.some(event => event.id === "G" && ["metrics", "ready"].includes(event.event)),
+    "cancelled warm-up cannot publish stale metrics or hide the newer loader");
+}
+
+async function testNativeWarmupLoads() {
+  const previousParse = nextParse;
+  nextParse = async buffer => [scene(new Uint8Array(buffer)[0])];
+  try {
+    for (const kind of ["pdf", "hep"]) {
+      const id = kind === "pdf" ? 90 : 91;
+      let enterWarmup, finishWarmup;
+      const started = new Promise(resolve => { enterWarmup = resolve; });
+      const completed = new Promise(resolve => { finishWarmup = resolve; });
+      duringNativeWarmup = value => {
+        if (value.id !== id) return;
+        enterWarmup();
+        return completed;
+      };
+      nativeLoadEvents.length = 0;
+      const load = kind === "pdf" ? context.loadPdfFile(file("warm.pdf", id)) : context.loadHepFile(file("warm.hep", id));
+      await started;
+      assert.equal(uploadedScene.id, id, "native warm-up uses the newly uploaded scene");
+      assert.notEqual(context.lastParsedScene.id, id, "the document is committed after warm-up");
+      assert(!nativeLoadEvents.some(event => event.id === id && event.event === "ready"));
+      finishWarmup();
+      await load;
+      assert.equal(context.lastParsedScene.id, id);
+      assert.equal(context.lastLoadedSource.kind, kind);
+      const events = nativeLoadEvents.filter(event => event.id === id).map(event => event.event);
+      assert(events.indexOf("upload") < events.indexOf("warm"));
+      assert(events.indexOf("warm") < events.indexOf("warm-complete"));
+      assert(events.indexOf("warm-complete") < events.indexOf("ready"));
+      assert(events.indexOf("warm-complete") < events.indexOf("metrics"));
+    }
+
+    let enterWarmup, finishWarmup, oldWarmSignal;
+    const started = new Promise(resolve => { enterWarmup = resolve; });
+    const completed = new Promise(resolve => { finishWarmup = resolve; });
+    duringNativeWarmup = (value, signal) => {
+      if (value.id !== 92) return;
+      oldWarmSignal = signal;
+      enterWarmup();
+      return completed;
+    };
+    nativeLoadEvents.length = 0;
+    const older = context.loadPdfFile(file("older-warm.pdf", 92));
+    await started;
+    await context.loadPdfFile(file("newer-warm.pdf", 93));
+    await older;
+    assert.equal(oldWarmSignal.aborted, true);
+    finishWarmup();
+    await new Promise(resolve => setImmediate(resolve));
+    assertDocument(93, "newer-warm.pdf");
+    assert(!nativeLoadEvents.some(event => event.id === 92 && ["metrics", "ready"].includes(event.event)),
+      "late cancelled native warming cannot commit the old scene or hide a newer loader");
+  } finally {
+    duringNativeWarmup = null;
+    nextParse = previousParse;
+  }
 }
 
 async function testRoomDocumentReplacement() {
@@ -981,6 +1094,7 @@ async function testThreeBackendReplacement() {
     let layerBindings = 0;
     const backendChanges = [];
     const submissions = [];
+    const finalStatuses = [];
     const resourceReleases = [];
     let compilationFinished = false;
     const cameraPart = { copy: noop };
@@ -1045,6 +1159,7 @@ async function testThreeBackendReplacement() {
       release: () => { reservationReleased++; }
     };
     Object.assign(host, {
+      setStatus: message => finalStatuses.push(message),
       lastLoadedSource: "original.pdf", lastDownloadablePdf: { label: "original.pdf" },
       lastNativeDrawStats: null, activeThreeRendererBackend: "webgl", lastLoadTimingText: "",
       readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto", ocrTextOnly: reparseSource }),
@@ -1129,7 +1244,19 @@ async function testThreeBackendReplacement() {
       updateDrawStatsMeter: noop, updateLodStatsMeter: noop, refreshSearchAvailability: noop,
       updateLoadingProgress: noop, setLoadingProgress: noop, setLoadControlsEnabled: noop,
       setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop,
-      waitForNextRenderedFrame: async () => {}, formatLoadTiming: () => "timing",
+      waitForNextRenderedFrame: async () => {
+        assert.equal(host.currentPdfObject, replacement);
+        submissions.push("installed");
+      },
+      warmThreeRenderer: async (token, signal) => {
+        signal.throwIfAborted();
+        assert.equal(token, host.loadToken);
+        assert.equal(host.currentPdfObject, replacement);
+        assert.equal(submissions.at(-1), "installed", "Backend warm-up follows the replacement's first installed frame");
+        assert.equal(host.lastLoadTimingText, "", "Backend loading is not finalized before warm-up");
+        submissions.push("warm");
+      },
+      formatLoadTiming: () => "timing",
       updateSceneMetrics: noop, formatBackendLabel: value => value,
       activePageLayout: "sphere", pageLayoutView: previousPageLayout, pageLayoutRequest: 0,
       pageLayoutAnimator: { cancel: noop }, pageLayoutRowElement: { hidden: true }, pageLayoutButtons: [],
@@ -1149,6 +1276,7 @@ async function testThreeBackendReplacement() {
       vm.runInContext(sourceFunction(source, name), host);
     }
     await host.reloadSourceWithBackend(targetBackend, reparseSource);
+    if (!failed) assert(!finalStatuses.some(message => /failed/i.test(message)), finalStatuses.at(-1));
     assert.equal(reservationTaken, reparseSource ? 0 : 1, "Backend construction receives its prepared runtime");
     assert.equal(reservationReleased, reparseSource ? 0 : 1, "The reservation is always finalized");
     assert.equal(layerResets, 1);
@@ -1160,6 +1288,8 @@ async function testThreeBackendReplacement() {
     assert.equal(previous.disposals, failed ? 0 : 1);
     assert.equal(replacement.disposals, failed ? 1 : 0);
     assert.deepEqual(backendChanges, failed || reparseSource ? [] : [targetBackend]);
+    assert.deepEqual(submissions, failed ? [] : reparseSource ? ["installed", "warm"] : ["detached", "installed", "warm"],
+      "Only an installed backend is warmed, after its first visible frame");
     assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : targetBackend, "Preparation failure leaves the old renderer and document intact");
     assert.deepEqual(resourceReleases, ["compile", "cancel"].includes(failure) ? ["object", "renderer"] : failed ? ["object"] : [],
       "Release a cancelled replacement's PDF resources before its staged GPU context");
@@ -1176,7 +1306,7 @@ function demoHost() {
   return {
     performance, AbortController, waitForLoad,
     loadedCompressScansPreference: false, compressScansCheckboxElement: { checked: false },
-    annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop },
+    annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop }, annotationInteraction: null,
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,
     drawCallMeter: { reset: noop }, drawCallCounter: { recordNativeFrame: noop },
