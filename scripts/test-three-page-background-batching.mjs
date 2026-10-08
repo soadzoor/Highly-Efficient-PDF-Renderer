@@ -79,6 +79,15 @@ try {
       assert.equal(material.isNodeMaterial, true);
       assert.equal(entry.webGpuState.useLocalToClipUniform.value, 1);
       const shaders = build(material, geometry);
+      const samplerNames = new Set(shaders.fragmentShader.match(/\b\w+_sampler\b/g) ?? []);
+      assert(samplerNames.size > 0, "page background sampling uses a texture sampler");
+      const samplerBindings = shaders.getBindings().flatMap(group => group.bindings)
+        .filter(binding => binding.isSampler).map(binding => binding.name);
+      for (const name of samplerNames) {
+        assert.match(shaders.fragmentShader, new RegExp(`\\bvar\\s+${name}\\s*:\\s*sampler\\s*;`),
+          `page background sampler ${name} is declared in WGSL`);
+        assert(samplerBindings.includes(name), `page background sampler ${name} has a GPU binding`);
+      }
       assert.match(shaders.vertexShader, /heprPageBackgroundPack/);
       assert.match(shaders.vertexShader, /aPageRect/);
       assert.doesNotMatch(shaders.vertexShader, /fn heprRasterPack\s*\(/);

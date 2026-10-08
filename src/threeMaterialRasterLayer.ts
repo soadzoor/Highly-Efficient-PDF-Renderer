@@ -1117,8 +1117,10 @@ function createPageBackgroundTexture(color: [number, number, number, number]): T
   );
   const data = new Uint8Array(rgba);
   const texture = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
-  texture.magFilter = THREE.NearestFilter;
-  texture.minFilter = THREE.NearestFilter;
+  // Three WebGPU omits samplers for nearest-only textures, but the raster WGSL
+  // needs one. Linear filtering samples the same solid color from this 1x1 texture.
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
   texture.flipY = false;
