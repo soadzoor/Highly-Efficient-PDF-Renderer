@@ -80,6 +80,12 @@ the automatic raster target. The display tier can be smaller than the original;
 zoom detail and exports retain the canonical packed pixels. Color/grayscale
 scans can instead use optional lossy BC7/ASTC blocks, with a fidelity diagnostic.
 
+Zoom refinement extracts complete compact blocks directly from packed bytes,
+uses exact 2×2 averaging for even mip reductions, and reuses horizontal coverage
+endpoints across rows. The resulting texture bytes and raster target are
+unchanged. Reduced-tier worker inputs omit unused JBIG2 dictionaries; full-tier
+outputs release those dictionaries after compact encoding.
+
 The all-pages trial targets `C:\Users\soadz\Desktop\TIKA\TIKA-2848-1.pdf`.
 Lightweight inspection of direct PDF dictionaries found 614 pages and 614
 1-bit DeviceGray/JBIG2 scans, approximately 641 MiB of packed base pixels.
@@ -87,7 +93,8 @@ No pages were decoded for that inspection. Original CPU pixels remain resident
 in this experimental mode, in addition to bounded display preparation data.
 Actual browser/GPU stability and VRAM use require a manual run.
 
-Synthetic checks cover all base/mip texels, odd dimensions, repeated blocks,
+Synthetic checks cover all base/mip texels, exact atlas byte snapshots,
+fractional coverage endpoints, odd dimensions, repeated blocks,
 clipped symbols, mismatched traces, fallback selection, cooperative preparation,
 native uploads, Three WGSL bindings, memory accounting and resource cleanup.
 JBIG2 fixtures compare symbol reconstruction with the existing WASM decoder,
@@ -96,10 +103,11 @@ allocations are checked for work/heap accounting. The packaged preparation
 worker is exercised using Node worker threads, without a browser or server.
 
 Manual verification: start the viewer as usual, open TIKA-2848-1.pdf, and zoom
-between OCR overview and scan detail in native WebGL/WebGPU and the Three
+between overview and full scan detail in native WebGL/WebGPU and the Three
 viewers. Check scan appearance, cropped image edges, minification, demotion,
-transition timings and resident raster bytes. Compare recorded GPU/upload
-timings against the previous branch; shader execution time needs a real GPU.
+the delay until scans become sharp, and resident raster bytes. Compare recorded
+GPU/upload timings against the previous branch; shader execution time needs a
+real GPU.
 
 ## Files
 

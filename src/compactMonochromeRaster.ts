@@ -19,6 +19,12 @@ export interface CompactMonochromeAtlas {
 
 const BLOCK = 32, UNIFORM = 0x80000000, SYMBOLS = 0x40000000;
 const MAX_SYMBOLS_PER_BLOCK = 8;
+const REVERSE_BITS = Uint8Array.from({ length: 256 }, (_, value) => {
+  let reversed = 0;
+  for (let bit = 0; bit < 8; bit++) reversed |= ((value >> bit) & 1) << (7 - bit);
+  return reversed;
+});
+const SWAP_NIBBLES = Uint8Array.from({ length: 256 }, (_, value) => ((value & 15) << 4) | (value >> 4));
 
 /** One RGBA texel is a little-endian word. Uniform markers and shared payloads
  * cover every logical level; hardware mipmaps are deliberately disabled.
@@ -46,16 +52,18 @@ export function* compactMonochromeSteps(source: MonochromeRaster, width: number,
     const offset = end; words.set(values, end); end += values.length; return offset;
   };
   const dictionaries = new Map<string, number[]>();
+  // Appending copies the scratch words, so every block can reuse these payloads.
+  const basePayload = new Uint32Array(BLOCK * baseBits), coveragePayload = new Uint32Array(BLOCK * 4);
   let uniformBlocks = 0, reusedBlocks = 0, symbolBlocks = 0;
-  const storeBlock = (values: Uint8Array, bits: number): number => {
-    if (values.every(value => value === values[0])) { uniformBlocks++; return (UNIFORM | values[0]) >>> 0; }
-    const payload = new Uint32Array(BLOCK * BLOCK * bits / 32);
-    let hash = 2166136261;
-    for (let i = 0; i < values.length; i++) {
-      const shift = (i * bits) & 31;
-      payload[(i * bits) >>> 5] |= values[i] << shift;
+  const storePayload = (payload: Uint32Array, bits: number): number => {
+    const first = payload[0] & ((1 << bits) - 1);
+    const uniformWord = (first * (bits === 1 ? 0xffffffff : bits === 4 ? 0x11111111 : 0x01010101)) >>> 0;
+    let hash = 2166136261, uniform = true;
+    for (const value of payload) {
+      if (value !== uniformWord) uniform = false;
+      hash = Math.imul(hash ^ value, 16777619);
     }
-    for (const value of payload) hash = Math.imul(hash ^ value, 16777619);
+    if (uniform) { uniformBlocks++; return (UNIFORM | first) >>> 0; }
     const key = `${bits}:${hash >>> 0}`, candidates = dictionaries.get(key) ?? [];
     for (const offset of candidates) {
       if (payload.every((value, index) => words[offset + index] === value)) { reusedBlocks++; return offset; }
@@ -109,17 +117,46 @@ export function* compactMonochromeSteps(source: MonochromeRaster, width: number,
           const blockIndex = by * columns + bx;
           const instances = levelIndex === 0 ? bins?.[blockIndex] : undefined;
           const useSymbols = !!instances?.length && instances.length <= MAX_SYMBOLS_PER_BLOCK;
-          const values = new Uint8Array(BLOCK * BLOCK);
-          for (let y = 0; y < BLOCK; y++) for (let x = 0; x < BLOCK; x++) {
-            const px = Math.min(level.width - 1, bx * BLOCK + x), py = Math.min(level.height - 1, by * BLOCK + y);
-            if (!levelIndex) values[y * BLOCK + x] = reduced ? reduced[py * width + px]
-              : ((useSymbols ? residual : source.data)[py * Math.ceil(width / 8) + (px >> 3)] >> (7 - (px & 7))) & 1;
-            else {
-              const byte = coverage.data[level.byteOffset + py * level.rowBytes + (px >> 1)];
-              values[y * BLOCK + x] = (byte >> ((px & 1) ? 0 : 4)) & 15;
+          const payload = levelIndex ? coveragePayload : basePayload;
+          if ((bx + 1) * BLOCK <= level.width && (by + 1) * BLOCK <= level.height) {
+            // Full blocks are byte-aligned: turn packed source bytes directly into
+            // shader words instead of expanding and repacking 1,024 pixel values.
+            if (bits === 1) {
+              const data = useSymbols ? residual : source.data, stride = Math.ceil(width / 8);
+              let row = by * BLOCK * stride + bx * 4;
+              for (let y = 0; y < BLOCK; y++, row += stride) {
+                payload[y] = REVERSE_BITS[data[row]] | (REVERSE_BITS[data[row + 1]] << 8) |
+                  (REVERSE_BITS[data[row + 2]] << 16) | (REVERSE_BITS[data[row + 3]] << 24);
+              }
+            } else {
+              const data = levelIndex ? coverage.data : reduced!, stride = levelIndex ? level.rowBytes : width;
+              const rowBytes = BLOCK * bits / 8;
+              let row = (levelIndex ? level.byteOffset : 0) + by * BLOCK * stride + bx * rowBytes, index = 0;
+              for (let y = 0; y < BLOCK; y++, row += stride) for (let x = 0; x < rowBytes; x += 4) {
+                const offset = row + x;
+                payload[index++] = bits === 4
+                  ? SWAP_NIBBLES[data[offset]] | (SWAP_NIBBLES[data[offset + 1]] << 8) |
+                    (SWAP_NIBBLES[data[offset + 2]] << 16) | (SWAP_NIBBLES[data[offset + 3]] << 24)
+                  : data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24);
+              }
+            }
+          } else {
+            // Partial blocks retain the same clamped padding at image edges.
+            payload.fill(0);
+            for (let y = 0; y < BLOCK; y++) for (let x = 0; x < BLOCK; x++) {
+              const px = Math.min(level.width - 1, bx * BLOCK + x), py = Math.min(level.height - 1, by * BLOCK + y);
+              let value: number;
+              if (!levelIndex) value = reduced ? reduced[py * width + px]
+                : ((useSymbols ? residual : source.data)[py * Math.ceil(width / 8) + (px >> 3)] >> (7 - (px & 7))) & 1;
+              else {
+                const byte = coverage.data[level.byteOffset + py * level.rowBytes + (px >> 1)];
+                value = (byte >> ((px & 1) ? 0 : 4)) & 15;
+              }
+              const bit = (y * BLOCK + x) * bits;
+              payload[bit >>> 5] |= value << (bit & 31);
             }
           }
-          let entry = storeBlock(values, bits);
+          let entry = storePayload(payload, bits);
           if (useSymbols && scene) {
             const records = [entry, instances!.length];
             for (const placement of instances!) {

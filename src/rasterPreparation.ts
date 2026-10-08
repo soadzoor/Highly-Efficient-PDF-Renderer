@@ -16,8 +16,12 @@ export function prepareRasterPixels(source: RasterTileSource, plan: RasterTilePl
         worker ??= new Worker(new URL("./rasterPreparationWorker.ts", import.meta.url), { type: "module" });
         const active = worker;
         // Never structured-clone a monochrome layer's lazy RGBA getter or detach canonical pixels.
+        const monochrome = source.monochrome;
+        // Reduced coverage does not use JBIG2 dictionaries, which can outweigh the packed image.
+        const workerMonochrome = monochrome && (plan.width !== source.width || plan.height !== source.height)
+          ? { data: monochrome.data, colors: monochrome.colors } : monochrome;
         const input = { width: source.width, height: source.height,
-          data: source.monochrome ? new Uint8Array(0) : source.data, monochrome: source.monochrome };
+          data: monochrome ? new Uint8Array(0) : source.data, monochrome: workerMonochrome };
         return await new Promise<PreparedRasterPixels>((resolve, reject) => {
           const deadline = setTimeout(() => reject(new Error("Raster preparation worker timed out.")), 30_000);
           active.onmessage = event => { clearTimeout(deadline); event.data.error ? reject(new Error(event.data.error)) : resolve(event.data.result); };

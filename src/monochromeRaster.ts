@@ -139,6 +139,15 @@ function* monochromeCoverageSteps(source: MonochromeRaster, width: number, heigh
   const out = new Uint8Array(outWidth * outHeight);
   const prefix = new Uint32Array(stride + 1), sums = new Float64Array(outWidth);
   const scaleX = width / outWidth, scaleY = height / outHeight, area = scaleX * scaleY;
+  // Cell edges are identical in every row; evaluate each packed endpoint only once per row.
+  const edgeBytes = new Uint32Array(outWidth + 1), edgeShifts = new Uint8Array(outWidth + 1);
+  const edgeFractions = new Float64Array(outWidth + 1);
+  for (let x = 0; x <= outWidth; x++) {
+    const position = x * scaleX, whole = Math.floor(Math.min(width, position));
+    edgeBytes[x] = whole >> 3;
+    edgeShifts[x] = 8 - (whole & 7);
+    edgeFractions[x] = position - whole;
+  }
   for (let targetY = 0; targetY < outHeight; targetY++) {
     sums.fill(0);
     const top = targetY * scaleY, bottom = (targetY + 1) * scaleY;
@@ -147,14 +156,14 @@ function* monochromeCoverageSteps(source: MonochromeRaster, width: number, heigh
       for (let byte = 0; byte < stride; byte++) prefix[byte + 1] = prefix[byte] + BIT_COUNTS[source.data[row + byte]];
       const weightY = Math.min(bottom, y + 1) - Math.max(top, y);
       // Prefix counts integrate entire bytes; only the two fractional cell edges read individual bits.
-      const before = (position: number): number => {
-        const whole = Math.floor(Math.min(width, position)), byte = whole >> 3, bits = whole & 7;
-        const value = source.data[row + byte] ?? 0;
-        return prefix[byte] + (bits ? BIT_COUNTS[value >>> (8 - bits)] : 0) +
-          (position - whole) * ((value >>> (7 - bits)) & 1);
-      };
+      let before = 0;
       for (let x = 0; x < outWidth; x++) {
-        sums[x] += (before((x + 1) * scaleX) - before(x * scaleX)) * weightY;
+        const edge = x + 1, byte = edgeBytes[edge], shift = edgeShifts[edge];
+        const value = source.data[row + byte] ?? 0;
+        const after = prefix[byte] + BIT_COUNTS[value >>> shift] +
+          edgeFractions[edge] * ((value >>> (shift - 1)) & 1);
+        sums[x] += (after - before) * weightY;
+        before = after;
       }
       yield;
     }
@@ -311,6 +320,7 @@ function* monochromeMipLevelSteps(monochrome: MonochromeRaster, width: number, h
   throwIfAborted(signal);
   const stride = validateMonochromeRaster(monochrome, width, height);
   let levelWidth = width, levelHeight = height;
+  let levelData: Uint8Array | undefined;
   let sample = (x: number, y: number): number =>
     ((monochrome.data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1) * 255;
   while (levelWidth > 1 || levelHeight > 1) {
@@ -318,29 +328,54 @@ function* monochromeMipLevelSteps(monochrome: MonochromeRaster, width: number, h
     const nextWidth = Math.max(1, levelWidth >> 1);
     const nextHeight = Math.max(1, levelHeight >> 1);
     const data = new Uint8Array(nextWidth * nextHeight);
-    // Scale source-cell edges by the target size so overlap weights stay integral.
-    // Each output cell has the same area, levelWidth * levelHeight, in this grid.
-    const area = levelWidth * levelHeight;
-    for (let y = 0; y < nextHeight; y++) {
-      if ((y & 63) === 0) throwIfAborted(signal);
-      const top = y * levelHeight, bottom = (y + 1) * levelHeight;
-      const sourceTop = Math.floor(top / nextHeight), sourceBottom = Math.ceil(bottom / nextHeight);
-      for (let x = 0; x < nextWidth; x++) {
-        const left = x * levelWidth, right = (x + 1) * levelWidth;
-        const sourceLeft = Math.floor(left / nextWidth), sourceRight = Math.ceil(right / nextWidth);
-        let sum = 0;
-        for (let sourceY = sourceTop; sourceY < sourceBottom; sourceY++) {
-          const weightY = Math.min(bottom, (sourceY + 1) * nextHeight) - Math.max(top, sourceY * nextHeight);
-          for (let sourceX = sourceLeft; sourceX < sourceRight; sourceX++) {
-            const weightX = Math.min(right, (sourceX + 1) * nextWidth) - Math.max(left, sourceX * nextWidth);
-            sum += sample(sourceX, sourceY) * weightX * weightY;
+    // Even reductions are exact 2x2 boxes; avoid overlap weights and unpacking the packed base.
+    if ((levelWidth & 1) === 0 && (levelHeight & 1) === 0) {
+      const rowBytes = levelData ? levelWidth : stride;
+      for (let y = 0; y < nextHeight; y++) {
+        if ((y & 63) === 0) throwIfAborted(signal);
+        const top = y * 2 * rowBytes, bottom = top + rowBytes, target = y * nextWidth;
+        if (levelData) {
+          for (let x = 0; x < nextWidth; x++) {
+            const sourceX = x * 2;
+            data[target + x] = Math.round((levelData[top + sourceX] + levelData[top + sourceX + 1] +
+              levelData[bottom + sourceX] + levelData[bottom + sourceX + 1]) / 4);
+          }
+        } else {
+          for (let x = 0; x < nextWidth; x++) {
+            const sourceX = x * 2, byte = sourceX >> 3, shift = 6 - (sourceX & 7);
+            const count = BIT_COUNTS[(monochrome.data[top + byte] >> shift) & 3] +
+              BIT_COUNTS[(monochrome.data[bottom + byte] >> shift) & 3];
+            data[target + x] = Math.round(count * 255 / 4);
           }
         }
-        data[y * nextWidth + x] = Math.round(sum / area);
+        yield;
       }
-      yield;
+    } else {
+      // Scale source-cell edges by the target size so overlap weights stay integral.
+      // Each output cell has the same area, levelWidth * levelHeight, in this grid.
+      const area = levelWidth * levelHeight;
+      for (let y = 0; y < nextHeight; y++) {
+        if ((y & 63) === 0) throwIfAborted(signal);
+        const top = y * levelHeight, bottom = (y + 1) * levelHeight;
+        const sourceTop = Math.floor(top / nextHeight), sourceBottom = Math.ceil(bottom / nextHeight);
+        for (let x = 0; x < nextWidth; x++) {
+          const left = x * levelWidth, right = (x + 1) * levelWidth;
+          const sourceLeft = Math.floor(left / nextWidth), sourceRight = Math.ceil(right / nextWidth);
+          let sum = 0;
+          for (let sourceY = sourceTop; sourceY < sourceBottom; sourceY++) {
+            const weightY = Math.min(bottom, (sourceY + 1) * nextHeight) - Math.max(top, sourceY * nextHeight);
+            for (let sourceX = sourceLeft; sourceX < sourceRight; sourceX++) {
+              const weightX = Math.min(right, (sourceX + 1) * nextWidth) - Math.max(left, sourceX * nextWidth);
+              sum += sample(sourceX, sourceY) * weightX * weightY;
+            }
+          }
+          data[y * nextWidth + x] = Math.round(sum / area);
+        }
+        yield;
+      }
     }
     yield { width: nextWidth, height: nextHeight, data };
+    levelData = data;
     sample = (x, y) => data[y * nextWidth + x];
     levelWidth = nextWidth;
     levelHeight = nextHeight;

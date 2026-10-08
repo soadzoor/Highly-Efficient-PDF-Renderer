@@ -5,10 +5,16 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     ? `${specifier}.ts` : specifier, context);
 } });
 const originalWorker = globalThis.Worker, warn = console.warn;
+const originalOnmessage = Object.getOwnPropertyDescriptor(globalThis, "onmessage");
+const originalPostMessage = Object.getOwnPropertyDescriptor(globalThis, "postMessage");
 try {
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
   const { buildPreparedRasterPixels, buildPreparedRasterPixelsAsync } = await import("../src/rasterPreparationCore.ts");
   const { RasterResourceCache } = await import("../src/rasterResourceCache.ts");
+  // Exercise the actual worker module through browser globals, without a browser or server.
+  await import("../src/rasterPreparationWorker.ts");
+  const workerMessage = globalThis.onmessage;
+  if (originalOnmessage) Object.defineProperty(globalThis, "onmessage", originalOnmessage); else delete globalThis.onmessage;
   const color = (width, height) => ({ width, height,
     data: Uint8Array.from({ length: width * height * 4 }, (_, index) => index * 43 % 256) });
   const binary = (width, height) => ({ width, height,
@@ -61,20 +67,61 @@ try {
       setTimeout(() => {
         pending--;
         if (failNext) { failNext = false; this.onerror({ message: "synthetic failure" }); }
-        else this.onmessage({ data: { result: buildPreparedRasterPixels(cloned.source, cloned.plan) } });
+        else {
+          globalThis.postMessage = (response, transfers) => {
+            for (const bits of response.result?.monochromeTiles ?? []) assert.equal(bits.symbols, undefined,
+              "the worker returns ready texture data without retaining JBIG2 dictionaries");
+            const symbols = cloned.source.monochrome?.symbols;
+            if (symbols) {
+              assert(!transfers.includes(symbols.placements.buffer), "placements are not sent back after encoding");
+              for (const symbol of symbols.symbols) assert(!transfers.includes(symbol.data.buffer),
+                "symbol bitmaps are not sent back after encoding");
+            }
+            this.onmessage({ data: structuredClone(response, { transfer: transfers }) });
+          };
+          try { workerMessage({ data: cloned }); }
+          finally {
+            if (originalPostMessage) Object.defineProperty(globalThis, "postMessage", originalPostMessage); else delete globalThis.postMessage;
+          }
+        }
       }, 0);
     }
     terminate() { this.terminated = true; }
   }
   globalThis.Worker = FakeWorker;
   const { prepareRasterPixels, finishRasterUpdateStepsAsync } = await import("../src/rasterPreparation.ts");
-  const workerSource = binary(257, 257), workerPlan = planRasterTiles(257, 257, 64, .25);
+  const workerSource = binary(512, 256), workerPlan = planRasterTiles(512, 256, 64);
+  const glyph = { width: 9, height: 7, data: Uint8Array.from({ length: 14 }, (_, i) => i & 1 ? 128 : 0xaa) };
+  const symbols = { symbols: [glyph], placements: Int32Array.of(29, 28, 0, 137, 74, 0, 253, 134, 0, 400, 219, 0) };
+  workerSource.monochrome.symbols = symbols;
+  workerSource.monochrome.data.fill(255);
+  for (let i = 0; i < symbols.placements.length; i += 3) {
+    const x = symbols.placements[i], y = symbols.placements[i + 1];
+    for (let sy = 0; sy < glyph.height; sy++) for (let sx = 0; sx < glyph.width; sx++) {
+      if (glyph.data[sy * 2 + (sx >> 3)] & (128 >> (sx & 7)))
+        workerSource.monochrome.data[(y + sy) * 64 + ((x + sx) >> 3)] &= ~(128 >> ((x + sx) & 7));
+    }
+  }
   const before = workerSource.monochrome.data.slice();
+  const symbolsBefore = structuredClone(symbols), colorsBefore = workerSource.monochrome.colors.slice();
   const results = await Promise.all([prepareRasterPixels(workerSource, workerPlan), prepareRasterPixels(workerSource, workerPlan)]);
   assert.equal(workers.length, 1); assert.equal(maxPending, 1);
   for (const result of results) assert.deepEqual(result, buildPreparedRasterPixels(workerSource, workerPlan));
   assert.deepEqual(workerSource.monochrome.data, before);
   assert.equal(sends[0].source.data.byteLength, 0);
+  assert.equal(sends[0].source.monochrome.symbols, undefined, "reduced coverage never clones unused symbol dictionaries");
+  assert.equal(sends[0].source.monochrome.data, workerSource.monochrome.data, "packed input remains canonical until structured cloning");
+  assert.equal(sends[0].source.monochrome.colors, workerSource.monochrome.colors);
+  const fullPlan = planRasterTiles(workerSource.width, workerSource.height, 8192);
+  const fullExpected = buildPreparedRasterPixels(workerSource, fullPlan);
+  assert(fullExpected.compactAtlases[0].symbolBlocks > 0, "the full-detail fixture uses its symbol dictionary during encoding");
+  fullExpected.monochromeTiles = fullExpected.monochromeTiles.map(bits => ({ data: bits.data, colors: bits.colors }));
+  assert.deepEqual(await prepareRasterPixels(workerSource, fullPlan), fullExpected,
+    "full detail retains exact packed pixels, palettes and compact output after dropping transport-only dictionaries");
+  assert.equal(sends.at(-1).source.monochrome.symbols, symbols, "full detail still gives the encoder its symbol dictionary");
+  assert.deepEqual(workerSource.monochrome.data, before, "transferred result buffers do not detach packed source pixels");
+  assert.deepEqual(workerSource.monochrome.colors, colorsBefore);
+  assert.deepEqual(symbols, symbolsBefore, "symbol placements and dictionaries remain owned by the canonical document");
   failNext = true; const warnings = [];
   console.warn = (...args) => warnings.push(args);
   assert.deepEqual(await prepareRasterPixels(workerSource, workerPlan), results[0], "worker errors fall back cooperatively");
@@ -91,4 +138,9 @@ try {
   await assert.rejects(finishRasterUpdateStepsAsync(aborted(), () => {}), error => error.name === "AbortError");
   assert(cleanup); assert.equal(sends.length, sendCount, "cache hits avoid pixel preparation");
   console.log("Raster preparation: exact bytes, cooperative yielding, packed transport, serialized worker fallback, cache bounds and cancellation passed.");
-} finally { globalThis.Worker = originalWorker; console.warn = warn; hooks.deregister(); }
+} finally {
+  globalThis.Worker = originalWorker; console.warn = warn;
+  if (originalOnmessage) Object.defineProperty(globalThis, "onmessage", originalOnmessage); else delete globalThis.onmessage;
+  if (originalPostMessage) Object.defineProperty(globalThis, "postMessage", originalPostMessage); else delete globalThis.postMessage;
+  hooks.deregister();
+}

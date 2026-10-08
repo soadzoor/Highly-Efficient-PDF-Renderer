@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { registerHooks } from "node:module";
 import * as THREE from "three";
 const hooks = registerHooks({ resolve(s, c, next) {
@@ -31,6 +32,7 @@ try {
   }
   const blank = { data: new Uint8Array(Math.ceil(257 / 8) * 65).fill(255), colors };
   const { atlas: white, mips: whiteMips } = check(blank,257,65);
+  snapshot(white,"c7b004de55a448f310802659a574ed9dec721c817e1b10079bb4be8c2c81fc2a");
   assert(white.uniformBlocks > 0); assert.equal(white.symbolBlocks,0);
   assert.deepEqual(await buildCompactMonochromeAtlasAsync(blank,257,65,whiteMips),white);
   let seed = 43;
@@ -39,12 +41,20 @@ try {
   const rows = Array.from({ length:32 }, () => Uint8Array.from({ length:4 }, random));
   for (let y=0;y<256;y++) for (let x=0;x<64;x++) repeated.data[y*64+x] = rows[y&31][x&3];
   const { atlas: shared } = check(repeated,512,256);
+  snapshot(shared,"bd99af15a5221771072c57a495aad819be16e323628c762f7b15d24ae32ace79");
   assert(shared.reusedBlocks > 0);
+  const allBytes = { data:Uint8Array.from({ length:512*256/8 }, (_,i) => ((Math.floor(i/64)&63)*4+(i&3))&255), colors };
+  snapshot(check(allBytes,512,256).atlas,"9b18d477809b68debb11ab135070a05bee6862246fa2f64371ff39da1ba33c53");
+  // Full base/mip blocks also support odd byte strides: 17 and 33 bytes per row.
+  const oddStride = { data:Uint8Array.from({ length:17*130 }, (_,i) => ((Math.floor(i/17)&31)*53+((i%17)&3)*97)&255), colors };
+  snapshot(check(oddStride,130,130).atlas,"e36d035984efb7682a7542f3adace90999a77336accd8557a2f1466295169dab");
   const noise = { data: Uint8Array.from({ length:512*256/8 }, random), colors };
   assert.equal(buildCompactMonochromeAtlas(noise,512,256,buildPackedMonochromeMipAtlas(noise,512,256)),undefined,
     "incompressible content keeps the packed bitmap rather than increasing storage");
   const reduced = Uint8Array.from({ length:65*67 }, (_, i) => (i % 65) < 32 ? 45 : 187);
-  check(blank,65,67,reduced);
+  snapshot(check(blank,65,67,reduced).atlas,"c32baf315804e67b4225ff80168d702862a427296e4a80316219462515ec3b50");
+  const texturedReduced = Uint8Array.from({ length:97*99 }, (_,i) => (((i%97)&31)*53+((Math.floor(i/97)&31)*97))&255);
+  snapshot(check(blank,97,99,texturedReduced).atlas,"01f3b08cb412d48a1e99620bc0cef2e973bc9b71d2765b95e1e03ad85ebd6cc5");
   const glyph = { width:9, height:7, data:Uint8Array.from({ length:14 }, (_,i) => i&1 ? 128 : 0xaa) };
   const source = { data:new Uint8Array(512*256/8).fill(255), colors,
     symbols:{ symbols:[glyph], placements:Int32Array.of(29,28,0,137,74,0,253,134,0,400,219,0) } };
@@ -54,10 +64,14 @@ try {
       if(glyph.data[sy*2+(sx>>3)]&(128>>(sx&7)))source.data[(y+sy)*64+((x+sx)>>3)] &= ~(128>>((x+sx)&7));
   }
   const {atlas:symbolAtlas}=check(source,512,256);assert(symbolAtlas.symbolBlocks>0);
+  snapshot(symbolAtlas,"b20ef9e94e6f50adcde9f76de613adb0a63ce4a8def8e6f4f006fa6e356dd828");
   const tile = monochromeRasterTile(source,512,256,{x:30,y:29,width:129,height:99});
   const {atlas:tileAtlas}=check(tile,129,99);assert(tileAtlas.symbolBlocks>0,"cropped symbols retain their pixels across tile edges");
+  snapshot(tileAtlas,"44c5ac55006268a99e0b5742bf3e4e47595c266615f823fbe9be9ef78c43d027");
   const mismatched = {...source,symbols:{...source.symbols,placements:Int32Array.of(0,0,0)}};
-  assert.equal(check(mismatched,512,256).atlas.symbolBlocks,0,"inconsistent traces cannot alter canonical pixels");
+  const {atlas:canonical}=check(mismatched,512,256);
+  assert.equal(canonical.symbolBlocks,0,"inconsistent traces cannot alter canonical pixels");
+  snapshot(canonical,"e60bb65832c7e3d525b0c64c174b4cd4898cb9dc8b460fd279dd59b8c389d600");
   const plan=planRasterTiles(512,256,1024),input={width:512,height:256,monochrome:source,get data(){assert.fail("RGBA expansion");}};
   const prepared=buildPreparedRasterPixels(input,plan);
   assert.deepEqual(await buildPreparedRasterPixelsAsync(input,plan),prepared);
@@ -70,8 +84,15 @@ try {
   const unknown={...memorySource,monochrome:{...source,data:source.data.slice()}};
   assert(planSceneRasterMemory([unknown],1024,info.estimatedBytes+16).plans[0].width<512,"unknown contents retain a safe upper bound");
   let disposals=0;texture.addEventListener("dispose",()=>disposals++);texture.dispose();assert.equal(disposals,1);
-  console.log(`Compact monochrome: exhaustive base/mip parity, blank/repeated blocks, symbol/tile composition, fallback, async preparation and Three accounting passed. Blank fixture: ${white.data.length} bytes.`);
+  console.log(`Compact monochrome: exhaustive base/mip parity, byte-identical atlas snapshots, blank/repeated blocks, symbol/tile composition, fallback, async preparation and Three accounting passed. Blank fixture: ${white.data.length} bytes.`);
 } finally { hooks.deregister(); }
+
+/** Byte-for-byte atlas snapshots captured from the original per-pixel builder. */
+function snapshot(atlas,expected) {
+  const digest=createHash("sha256").update(`${atlas.width}:${atlas.height}:${atlas.uniformBlocks}:${atlas.reusedBlocks}:${atlas.symbolBlocks}:`)
+    .update(atlas.data).digest("hex");
+  assert.equal(digest,expected,"packed block extraction preserves the original atlas bytes and accounting");
+}
 
 /** Independent CPU interpretation of the GPU word format, including symbol overlays. */
 function sample(atlas,level,x,y) {

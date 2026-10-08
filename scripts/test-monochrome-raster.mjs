@@ -12,6 +12,7 @@ try {
     expandMonochromeRaster, createMonochromeRasterLayer, copyRasterLayer,
     detectMonochromeRaster, monochromeRasterTile, buildMonochromeMipChain,
     buildPackedMonochromeMipAtlas, buildPackedMonochromeMipAtlasAsync,
+    resampleMonochromeCoverage, resampleMonochromeCoverageAsync,
     prepareMonochromeSceneTransfer, restoreMonochromeSceneTransfer
   } = await import("../src/monochromeRaster.ts");
   const { buildSingleChannelUint8MipChain } = await import("../src/singleChannelMipChain.ts");
@@ -136,9 +137,10 @@ try {
     }
   }
 
-  // Every mip covers the entire source extent, including odd-edge pixels at later levels.
+  // Exact 2x2 reductions, non-byte-aligned packed rows and odd-edge reductions can alternate.
   for (const [mipWidth, mipHeight] of [[1, 1], [1, 32], [32, 1], [1, 35], [35, 1], [2, 2], [3, 3],
-    [9, 13], [32, 16], [64, 16], [65, 17], [34, 70]]) {
+    [6, 10], [10, 12], [12, 20], [20, 28], [26, 28], [9, 13], [32, 16], [64, 16], [65, 17],
+    [34, 70], [66, 140], [130, 74]]) {
     const stride = Math.ceil(mipWidth / 8), bitData = new Uint8Array(stride * mipHeight);
     const coverage = new Uint8Array(mipWidth * mipHeight);
     for (let y = 0; y < mipHeight; y++) {
@@ -148,6 +150,8 @@ try {
           bitData[y * stride + (x >> 3)] |= 128 >> (x & 7);
         }
       }
+      // Padding bits must not enter either reduction path.
+      if (mipWidth % 8) bitData[(y + 1) * stride - 1] |= (1 << (8 - mipWidth % 8)) - 1;
     }
     const actual = buildMonochromeMipChain({ data: bitData, colors }, mipWidth, mipHeight);
     assert.deepEqual(actual, referenceAreaMipChain(coverage, mipWidth, mipHeight), `${mipWidth}x${mipHeight} area coverage mip chain`);
@@ -182,6 +186,19 @@ try {
         `${mipWidth}x${mipHeight} even levels preserve established box-filter bytes`);
     }
   }
+  // Retain established coverage bytes across fractional endpoints, byte boundaries and row padding.
+  for (const [width, height, outWidth, outHeight, expected] of [
+    [17, 9, 5, 4, [192, 178, 112, 167, 168, 158, 88, 115, 83, 122, 125, 165, 112, 163, 118, 158, 68, 128, 120, 92]],
+    [16, 8, 5, 3, [129, 149, 189, 177, 102, 94, 102, 207, 56, 80, 165, 155, 153, 102, 82]],
+    [9, 5, 4, 3, [130, 108, 153, 176, 130, 119, 187, 244, 62, 164, 51, 244]]
+  ]) {
+    const data = Uint8Array.from({ length: Math.ceil(width / 8) * height }, (_, index) => (index * 113 + 171) & 255);
+    const source = { data, colors }, original = data.slice();
+    const actual = resampleMonochromeCoverage(source, width, height, outWidth, outHeight);
+    assert.deepEqual(actual, Uint8Array.from(expected));
+    assert.deepEqual(await resampleMonochromeCoverageAsync(source, width, height, outWidth, outHeight), actual);
+    assert.deepEqual(data, original, "coverage preparation leaves packed canonical pixels intact");
+  }
   for (const [edgeWidth, edgeHeight] of [[257, 1], [1, 257]]) {
     const stride = Math.ceil(edgeWidth / 8), edgeBits = new Uint8Array(stride * edgeHeight);
     const edgeX = edgeWidth - 1, edgeY = edgeHeight - 1;
@@ -207,7 +224,9 @@ try {
     () => expandMonochromeRaster(simple, 9, 2, controller.signal),
     () => monochromeRasterTile(simple, 9, 2, tile(0, 0, 1, 1), controller.signal),
     () => buildMonochromeMipChain(simple, 9, 2, controller.signal),
-    () => buildPackedMonochromeMipAtlas(simple, 9, 2, controller.signal)
+    () => buildPackedMonochromeMipAtlas(simple, 9, 2, controller.signal),
+    () => buildMonochromeMipChain(large, 1024, 1024, controller.signal),
+    () => buildPackedMonochromeMipAtlas(large, 1024, 1024, controller.signal)
   ]) assert.throws(operation, error => error.code === "aborted");
   assert.throws(() => expandMonochromeRaster(simple, 0, 2), RangeError);
   assert.throws(() => expandMonochromeRaster({ data: new Uint8Array(1), colors }, 9, 2), RangeError);
