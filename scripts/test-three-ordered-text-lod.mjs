@@ -19,6 +19,9 @@ try {
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
   const { ThreeVectorDrawPlan } = await import("../src/threeVectorDrawPlan.ts");
+  const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
+  const { OrderedTextLodSelection } = await import("../src/orderedTextLod.ts");
+  const { getOrBuildTextLod, TextLodRuntime } = await import("../src/textLodCore.ts");
   const { sceneStrokeRecords } = await import("../src/strokeRecords.ts");
   const { RenderPerformanceProfiler } = await import("../src/renderPerformance.ts");
   const { withThreeRenderPerformance } = await import("../src/threeRenderPerformance.ts");
@@ -182,6 +185,82 @@ try {
       console.log(`Three ${backend}/${mode}: ${count}→${selected} text instances; pan reuse, tilt, clips, layers, exact zoom and fallback passed.`);
     } finally { profile.dispose(); object.dispose(); }
   }
+  // Ordinary document objects have no shared page transforms. Their Auto LOD
+  // must still include coarse coverage in the native scheduler's overlap proof,
+  // so a guide's thousands of alternating paints can share a few meshes.
+  const glyphsPerPaint = 50, paintCount = count / glyphsPerPaint;
+  const batchScene = { ...scene, clipPaths: [],optionalContent: undefined,
+    bounds: { minX: -1,minY: -1,maxX: 701,maxY: 241 },pageRects: Float32Array.of(-1,-1,701,241),
+    fillPathCount: paintCount,fillSegmentCount: paintCount * 4,
+    fillPathMetaA: new Float32Array(paintCount * 4),fillPathMetaB: new Float32Array(paintCount * 4),
+    fillPathMetaC: new Float32Array(paintCount * 4),fillSegmentsA: new Float32Array(paintCount * 16),
+    fillSegmentsB: new Float32Array(paintCount * 16),drawRuns: [] };
+  batchScene.pageBounds = batchScene.bounds;
+  for (let paint = 0; paint < paintCount; paint++) {
+    const y = Math.floor(paint * glyphsPerPaint / 500) * 2;
+    batchScene.drawRuns.push({ kind: "text",first: paint * glyphsPerPaint,count: glyphsPerPaint },
+      { kind: "fill",first: paint,count: 1 });
+    batchScene.fillPathMetaA.set([paint * 4,4,600,y],paint * 4);
+    batchScene.fillPathMetaB.set([601,y + 1,0,0],paint * 4);
+    batchScene.fillPathMetaC.set([0,0,0,1],paint * 4);
+    const edges = rectangle(600,y,601,y + 1).edges;
+    for (let edge = 0; edge < 4; edge++) {
+      const offset = paint * 16 + edge * 4;
+      batchScene.fillSegmentsA.set([edges[edge * 4],edges[edge * 4 + 1],edges[edge * 4],edges[edge * 4 + 1]],offset);
+      batchScene.fillSegmentsB.set([edges[edge * 4 + 2],edges[edge * 4 + 3],0,0],offset);
+    }
+  }
+  const batchCanonical = structuredClone(batchScene);
+  for (const backend of ["webgl", "webgpu"]) for (const mode of ["auto", "off"]) {
+    const { object,plan,lod,camera,controls,distance,frame } = create(backend,mode,batchScene);
+    const profile = new RenderPerformanceProfiler();
+    try {
+      frame();
+      if (mode === "off") { object.setTextLodMode("auto"); frame(); }
+      const build = getOrBuildTextLod(batchScene), runtime = new TextLodRuntime(build);
+      const selection = new OrderedTextLodSelection(batchScene,build.data);
+      const native = new VectorOrderedBatches(batchScene,null);
+      const paintMeshes = () => [...textMeshes(object),...object.fillMaterialLayer.mesh.children.filter(m => m.visible && m.geometry.instanceCount > 0)]
+        .sort((a,b) => a.renderOrder - b.renderOrder);
+      for (const zoom of [.02, 1, .02]) {
+        camera.position.z = distance * .02 / zoom; frame();
+        const localToClip = camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse).multiply(object.matrixWorld)
+          .multiply(new THREE.Matrix4().makeTranslation(-350,-120,0)).elements;
+        const selected = runtime.update({ localToClip,viewportWidth: viewport.width,viewportHeight: viewport.height,pixelRatio: 1 });
+        selection.update(selected); native.setTextSelection(selection); native.update(batchScene.drawRuns,1 / zoom);
+        assert.equal(native.batches.length,2,"the dense guide permits two native content draws including coarse coverage");
+        assert.equal(paintMeshes().length,native.batches.length,`${backend}/${mode}: Auto batches ordinary documents like native`);
+        assert.deepEqual(paintMeshes().map(m => m.userData.heprDrawRun.kind),native.batches.map(b => b.kind));
+        assert.notDeepEqual(plan.order,Array.from({ length: batchScene.drawRuns.length }, (_,i) => i),
+          "Auto LOD does not disable the ordinary document scheduler");
+        const textBatch = native.batches.find(b => b.kind === "text");
+        assert.deepEqual(drawn(object),Array.from({ length: textBatch.count }, (_,i) =>
+          Array.from(native.uintInstances.subarray((textBatch.first + i) * 2,(textBatch.first + i + 1) * 2))),
+        "Three preserves the native selected exact/coarse IDs and clips");
+        const fillBatch = native.batches.find(b => b.kind === "fill");
+        const fillMesh = paintMeshes().find(m => m.userData.heprDrawRun.kind === "fill");
+        assert.deepEqual(Array.from({ length: fillMesh.geometry.instanceCount }, (_,i) => fillMesh.geometry.getAttribute("aFillPathIndex").getX(i)),
+          Array.from({ length: fillBatch.count }, (_,i) => native.uintInstances[(fillBatch.first + i) * 2]),
+          "batching keeps every native fill instance");
+        assert.equal(zoom === 1 ? lod.getStats().coarseClusters : lod.getStats().renderedGlyphs,0);
+        const attributes = paintMeshes().map(m => m.geometry.getAttribute(m.userData.heprDrawRun.kind === "text" ? "aTextInstanceIndex" : "aFillPathIndex"));
+        const versions = attributes.map(attribute => attribute.version), uploads = lod.getStats().selectionUploads;
+        profile.start({ gpu: false,maxFrames: 11 });
+        profileFrame(profile,frame);
+        for (let i = 0; i < 10; i++) {
+          camera.position.x += .01; controls.target.x += .01; profileFrame(profile,frame);
+        }
+        const capture = profile.stop();
+        assert.equal(capture.counters["three.instanceUploadBytes"]?.total ?? 0,0,"stationary frames and pans reuse batched instance buffers");
+        assert.equal(capture.counters["three.batchCandidateInstances"]?.total ?? 0,0,"stationary frames and pans do not scan dense paints");
+        assert.deepEqual(attributes.map(attribute => attribute.version),versions);
+        assert.equal(lod.getStats().selectionUploads,uploads);
+      }
+      runtime.dispose();
+      console.log(`Three ${backend}/${mode}: ${batchScene.drawRuns.length} guide paints share ${paintMeshes().length} native-equivalent meshes.`);
+    } finally { profile.dispose(); object.dispose(); }
+  }
+  assert.deepEqual(batchScene,batchCanonical,"dense batching preserves canonical PDF geometry and paints");
   for (const backend of ["webgl", "webgpu"]) {
     const { object,lod,host,camera,frame } = create(backend,"auto");
     try {

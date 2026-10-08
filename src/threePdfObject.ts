@@ -3590,7 +3590,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     // Only the material layers submit from this plan. While the native renderer
     // draws into a texture instead, replanning would rebuild batches nothing draws.
     if (!vectorPipelineActive) return;
-    if (this.pageTransforms && this.textLodLayer?.hasCombinedPayload()) {
+    // Ordinary documents need the same coarse-coverage bounds as shared page
+    // batches; without them Auto text LOD keeps every paint in source order.
+    if (this.textLodLayer?.hasCombinedPayload()) {
       const data = getOrBuildTextLod(this.sceneData).data;
       if (data) this.drawPlan?.setTextLodSource(data);
     }
