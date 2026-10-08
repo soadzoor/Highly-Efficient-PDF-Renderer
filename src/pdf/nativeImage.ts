@@ -1,3 +1,4 @@
+import type { MonochromeSymbolScene } from "../compactMonochromeRaster";
 import {
   isPdfDictionary,
   isPdfName,
@@ -100,6 +101,7 @@ export interface NativeImageCodecRequest {
  * represent its premultiplication semantics.
  */
 export interface NativeImageCodecResult {
+  readonly jbig2Symbols?: MonochromeSymbolScene;
   readonly samples: Uint8Array;
   readonly width: number;
   readonly height: number;
@@ -130,6 +132,7 @@ export interface NativePdfImageOptions {
 }
 
 export interface NativePdfImageDescription {
+  readonly jbig2Symbols?: MonochromeSymbolScene;
   readonly width: number;
   readonly height: number;
   readonly sourceBitsPerComponent: number;
@@ -466,6 +469,7 @@ export class NativePdfImageRegistry {
           signal
         )
       : [];
+    let jbig2Symbols: MonochromeSymbolScene | undefined;
     let data: Uint8Array | null = null;
     let format: number | null = null;
     let codecRequest: NativeImageCodecRequest | null = null;
@@ -745,6 +749,7 @@ export class NativePdfImageRegistry {
             signal
           );
           if (packedGray) {
+            if (decode[0] === 0 && decode[1] === 1) jbig2Symbols = resolved.jbig2Symbols;
             data = packedGray;
             format = HEPR_IMAGE_FORMAT.Gray1;
           } else if (imageMask) {
@@ -862,6 +867,7 @@ export class NativePdfImageRegistry {
       decode,
       matte: mask.matte,
       data,
+      ...(jbig2Symbols ? { jbig2Symbols } : {}),
       codecRequest
     });
     const index = this.records.length;
@@ -1215,7 +1221,8 @@ async function resolveCodecThroughCaller(
     width: raw.width,
     height: raw.height,
     components: raw.components,
-    bitsPerComponent: raw.bitsPerComponent
+    bitsPerComponent: raw.bitsPerComponent,
+    ...(trustedResolver && request.codec === "jbig2" && raw.jbig2Symbols ? { jbig2Symbols: raw.jbig2Symbols } : {})
   });
 }
 

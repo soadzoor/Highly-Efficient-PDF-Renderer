@@ -182,7 +182,7 @@ try {
   assert.deepEqual(packed.mock.paints.filter(p => ["rasterTextureBatch", "raster"].includes(p.label)).map(p => [p.label, p.count]),
     [["rasterTextureBatch", 3], ["raster", 1], ["rasterTextureBatch", 3]],
     "a packed monochrome image keeps its own sampler and flushes surrounding RGBA batches");
-  assert.equal(packed.mock.paints.find(p => p.label === "raster").uniforms.get("uRasterMonochrome"), 1);
+  assert.equal(packed.mock.paints.find(p => p.label === "raster").uniforms.get("uRasterMonochrome"), 3);
 
   const paired = makeScene(7); paired.rasterLayers = paired.rasterLayers.map((_, i) => largeImage(i));
   paired.drawRuns[3].blendMode = "Multiply"; delete paired.paintGraph;

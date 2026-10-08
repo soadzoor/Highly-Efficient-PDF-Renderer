@@ -48,8 +48,11 @@ try {
   assert.equal(mock.textureBytes(), 0);
   mock.uploads.length = 0;
   renderer.setRasterTextureResidency(true);
-  assert.deepEqual(mock.uploads.map(upload => [upload.width, upload.height]), uploadSizes,
-    "residency restoration reapplies the scene-wide budget");
+  assert(mock.uploads.every((upload, index) => upload.width >= uploadSizes[index][0] && upload.height >= uploadSizes[index][1]),
+    "learned monochrome savings allow restoration to retain at least the previous quality");
+  assert(renderer.estimatedRasterResidentBytes() <= budget.bytes,
+    "restoration uses measured compact costs within the scene-wide budget");
+  assert.equal(renderer.estimatedRasterResidentBytes(), mock.textureBytes());
   const untouched = renderer.rasterLayers.slice(1);
   const old = renderer.rasterLayers[0].texture;
   const replacement = image(2048, 2048, rgbaData(2048, 2048), 8);

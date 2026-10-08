@@ -1,8 +1,9 @@
+import { buildCompactMonochromeAtlas } from "./compactMonochromeRaster";
 import * as THREE from "three";
 import { buildPackedMonochromeMipAtlas, monochromeCoverageTilePixels, monochromeRasterTile,
   type MonochromeRaster } from "./monochromeRaster";
 import { rasterTilePixels, type RasterTilePlan } from "./rasterTiles";
-import { estimateRasterTextureBytes } from "./rasterMemoryBudget";
+import { rememberMonochromePlanBytes, estimateRasterTextureBytes } from "./rasterMemoryBudget";
 import type { RasterCompressionFormat } from "./rasterCompression";
 import type { PreparedRasterPixels } from "./rasterPreparation";
 import { sameRasterTilePlan } from "./rasterTiles";
@@ -56,27 +57,27 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
   try {
     for (const [index, tile] of plan.tiles.entries()) {
       let texture: THREE.Texture;
-      if (packed) {
-        const bits = prepared?.monochromeTiles?.[index] ?? monochromeRasterTile(mono!, source.width, source.height, tile);
-        texture = dataTexture(bits.data, Math.ceil(tile.width / 8), tile.height, true);
-        texture.minFilter = texture.magFilter = THREE.NearestFilter;
-        texture.generateMipmaps = false;
-        const atlas = prepared?.coverageAtlases?.[index] ?? buildPackedMonochromeMipAtlas(bits, tile.width, tile.height);
-        const coverage = dataTexture(atlas.data, atlas.width, atlas.height, true);
-        coverage.generateMipmaps = false;
-        coverage.minFilter = THREE.LinearFilter;
-        texture.addEventListener("dispose", () => coverage.dispose());
-        information.set(texture, monoInfo(bits, coverage, tile.width, tile.height, 1));
-      } else if (mono) {
-        texture = dataTexture(pixels[index], tile.width, tile.height, true);
-        texture.generateMipmaps = false;
-        texture.minFilter = THREE.LinearFilter;
-        const atlas = prepared?.coverageAtlases?.[index] ?? buildPackedCoverageMipAtlas(pixels[index], tile.width, tile.height);
-        const coverage = dataTexture(atlas.data, atlas.width, atlas.height, true);
-        coverage.generateMipmaps = false;
-        coverage.minFilter = THREE.LinearFilter;
-        texture.addEventListener("dispose", () => coverage.dispose());
-        information.set(texture, monoInfo(mono, coverage, tile.width, tile.height, 2));
+      if (mono) {
+        const bits = packed ? prepared?.monochromeTiles?.[index] ?? monochromeRasterTile(mono, source.width, source.height, tile) : mono;
+        const atlas = prepared?.coverageAtlases?.[index] ?? (packed ? buildPackedMonochromeMipAtlas(bits, tile.width, tile.height)
+          : buildPackedCoverageMipAtlas(pixels[index], tile.width, tile.height));
+        const compact = prepared?.compactAtlases ? prepared.compactAtlases[index]
+          : buildCompactMonochromeAtlas(bits, tile.width, tile.height, atlas, packed ? undefined : pixels[index]);
+        if (compact) {
+          texture = dataTexture(compact.data, compact.width, compact.height);
+          texture.generateMipmaps = false;
+          texture.minFilter = THREE.LinearFilter;
+          information.set(texture, { ...monoInfo(bits, texture, tile.width, tile.height, 3), estimatedBytes: compact.data.length });
+        } else {
+          texture = dataTexture(packed ? bits.data : pixels[index], packed ? Math.ceil(tile.width / 8) : tile.width, tile.height, true);
+          texture.minFilter = texture.magFilter = packed ? THREE.NearestFilter : THREE.LinearFilter;
+          texture.generateMipmaps = false;
+          const coverage = dataTexture(atlas.data, atlas.width, atlas.height, true);
+          coverage.generateMipmaps = false;
+          coverage.minFilter = THREE.LinearFilter;
+          texture.addEventListener("dispose", () => coverage.dispose());
+          information.set(texture, monoInfo(bits, coverage, tile.width, tile.height, packed ? 1 : 2));
+        }
       } else if (format && compressor) {
         texture = compressor.upload(pixels[index], tile.width, tile.height, format);
       } else {
@@ -86,6 +87,7 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
       }
       textures.push(texture);
     }
+    if (mono) rememberMonochromePlanBytes(source, plan, textures.reduce((sum, texture) => sum + threeRasterTextureInfo(texture).estimatedBytes, 0));
     return textures;
   } catch (error) {
     for (const texture of textures) texture.dispose();

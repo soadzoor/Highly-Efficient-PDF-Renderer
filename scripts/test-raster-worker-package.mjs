@@ -38,7 +38,8 @@ parentPort.on("message", data => globalThis.onmessage({ data }));
   const { planRasterTiles } = await import(pathToFileURL(resolve(bundlerDir, "rasterTiles.js")));
   const { buildPreparedRasterPixels } = await import(pathToFileURL(resolve(bundlerDir, "rasterPreparationCore.js")));
   const source = { width, height, data: new Uint8Array(), monochrome: { data: bits,
-    colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255) } };
+    colors: Uint8Array.of(0, 0, 0, 255, 255, 255, 255, 255),
+    symbols: { symbols: [{ width: 1, height: 1, data: Uint8Array.of(128) }], placements: Int32Array.of(1,1,0,33,34,0) } } };
   for (const scale of [1, .25]) {
     const plan = planRasterTiles(width, height, 64, scale);
     const response = await new Promise((accept, reject) => {

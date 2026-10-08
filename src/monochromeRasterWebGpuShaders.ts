@@ -1,8 +1,10 @@
+import { COMPACT_MONOCHROME_WGSL } from "./compactMonochromeShaders";
 import { PACKED_COVERAGE_WGSL } from "./packedMonochromeCoverageShaders";
 
 /** Packed MSB-first image sampling with filtered four-bit coverage for minification. */
 export const MONOCHROME_RASTER_WGSL = /* wgsl */ `
 ${PACKED_COVERAGE_WGSL}
+${COMPACT_MONOCHROME_WGSL}
 fn heprMonochromeBit(pixel : vec2i, size : vec2i) -> f32 {
   let p = clamp(pixel, vec2i(0), size - vec2i(1));
   // r8unorm preserves every byte; filtering is only used on the coverage texture.
@@ -22,11 +24,16 @@ fn heprMonochromeBilinear(uv : vec2f, size : vec2i) -> f32 {
 }
 
 fn heprMonochromeColor(uv : vec2f, uvDx : vec2f, uvDy : vec2f) -> vec4f {
-  let size = vec2i(i32(abs(uRaster.matrixB.w)), i32(textureDimensions(uRasterTex).y));
+  // A half-integer width marks the compact atlas without enlarging the shared UBO.
+  let compact = fract(abs(uRaster.matrixB.w)) > 0.25;
+  var size = vec2i(i32(abs(uRaster.matrixB.w)), i32(textureDimensions(uRasterTex).y));
+  if (compact) { size = vec2i(i32(heprCompactWord(uRasterTex, 0u)), i32(heprCompactWord(uRasterTex, 1u))); }
   let footprint = max(length(uvDx * vec2f(size)), length(uvDy * vec2f(size)));
   let lod = max(log2(max(footprint, 1.0)), 0.0);
   var coverage : f32;
-  if (lod < 1.0) {
+  if (compact) {
+    coverage = heprCompactSample(uRasterTex, size, uv, lod);
+  } else if (lod < 1.0) {
     var base : f32;
     if (uRaster.matrixB.w < 0.0) {
       base = textureSampleLevel(uRasterTex, uRasterSampler, uv, 0.0).r;

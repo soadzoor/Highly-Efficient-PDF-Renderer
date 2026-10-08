@@ -4,6 +4,19 @@ HEPR third-party notices
 This file covers third-party material shipped in the published package.
 Development-only dependencies are not part of the package.
 
+PDF.js symbol-preserving JBIG2 decoder
+-------------------------------------
+
+src/pdf/codecs/jbig2SymbolKernel.ts and jbig2ArithmeticDecoder.ts are adapted
+from Mozilla PDF.js src/core/jbig2.js and src/core/arithmetic_decoder.js.
+Revision: ef6ecee34c24069a3935cde968e23360d54fd872
+Source: https://github.com/mozilla/pdf.js/tree/ef6ecee34c24069a3935cde968e23360d54fd872/src/core
+Copyright 2012 Mozilla Foundation. Apache License, Version 2.0.
+HEPR adds operation-local work/allocation accounting, packed page composition,
+symbol placement retention and native bounded CCITT decoding. Unsupported
+composition retains the separately licensed PDFium WASM fallback documented
+below. The Apache License, Version 2.0 is reproduced in this file.
+
 GPUtex BC7 and ASTC 4x4 encoders
 --------------------------------
 

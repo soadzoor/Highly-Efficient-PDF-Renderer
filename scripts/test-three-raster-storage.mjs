@@ -38,10 +38,9 @@ try {
   assert.equal(packedInfo.color1.w,128/255);
   assert(Math.abs(packedInfo.color1.x-10/255*128/255)<1e-12,"palette colors are premultiplied");
   const [coverage] = createThreeRasterTileTextures(small,reducedPlan), coverageInfo = threeRasterTextureInfo(coverage);
-  assert.equal(coverageInfo.mode,2); assert.notEqual(coverageInfo.coverage,coverage);
-  assert.equal(coverage.image.data.length,16*8);
-  assert.deepEqual(coverage.image.data,monochromeCoverageTilePixels(small.monochrome,33,17,reducedPlan)[0]);
-  assert.deepEqual(coverageInfo.coverage.image,buildPackedCoverageMipAtlas(coverage.image.data,16,8));
+  assert.equal(coverageInfo.mode,3); assert.equal(coverageInfo.coverage,coverage);
+  assert.equal(coverageInfo.estimatedBytes,coverage.image.data.length);
+  assert(coverage.image.data.length < 16*8, "uniform reduced coverage benefits from compact blocks");
   assert.equal(coverage.generateMipmaps,false,"reduced bases keep exact R8 coverage without uncompressed mips");
 
   const geometry = new THREE.BufferGeometry();
@@ -84,11 +83,11 @@ try {
   scene.rasterLayers = [image]; scene.pageRects = Float32Array.of(0,0,2048,1024);
   const layer = new ThreeMaterialRasterLayer(scene,{ pageBackground: [1,1,1,1] });
   const entry = layer.rasterEntries[0];
-  assert.equal(threeRasterTextureInfo(entry.texture).mode,2,"initial previews use R8");
+  assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"initial previews compact averaged coverage");
   layer.setTextureResidency(true);
   const view = { cameraCenterX: 1024,cameraCenterY: 512,zoom: 1 }, viewport = { width: 2048,height: 1024 };
   await frame(layer,view,viewport);
-  assert.equal(threeRasterTextureInfo(entry.texture).mode,1,"full detail retains one bit per source pixel");
+  assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"full detail compacts exact binary pixels");
   assert.match(entry.material.fragmentShader,/heprRasterBinaryLinear/);
   assert.equal(entry.material.uniforms.uRasterMonoMips.value,threeRasterTextureInfo(entry.texture).coverage);
   await frame(layer,{ ...view,zoom:.34 },viewport);
@@ -105,7 +104,7 @@ try {
   assert(replacement.rasterEntries[1].image.plan.width <= 128,"preservation still allows zoom-out demotion");
   replacement.dispose();
   await frame(layer,{ ...view,zoom:.01 },viewport);
-  assert.equal(threeRasterTextureInfo(entry.texture).mode,2,"zoom-out demotes the native Three material");
+  assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"zoom-out demotes the native Three material");
   layer.setMemoryAllowance(65536); await frame(layer,view,viewport);
   assert(layer.rasterImageBytes(entry) <= 65536,"replacement bytes honor the page's document allowance");
   layer.dispose();

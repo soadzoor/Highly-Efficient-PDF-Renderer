@@ -142,6 +142,23 @@ try {
     renderer.dispose();
     assert(device.textures.every(texture => texture.destroyed));
   }
+  {
+    const { renderer, device } = create();
+    renderer.configureRasterLayers(sceneWith(packedLayer(256,256)));
+    const resource = renderer.rasterLayerResources[0];
+    assert.equal(resource.texture.descriptor.format, "rgba8unorm");
+    assert.equal(resource.coverageTexture, resource.texture);
+    assert.equal(device.writes.find(write => write.buffer === resource.uniformBuffer).values[7], 256.5);
+    const size = resource.texture.descriptor.size;
+    assert.equal(resource.estimatedBytes, size.width * size.height * 4 + 96);
+    renderer.dispose();assert.equal(resource.texture.destroyCalls, 1, "shared compact bindings destroy the atlas once");
+  }
+  for (const failure of ["compact upload", "raster uniform", "raster bind group"]) {
+    const { renderer, device } = create();const offset = device.textures.length;device.failure = failure;
+    assert.throws(() => renderer.configureRasterLayers(sceneWith(packedLayer(256,256))), /synthetic/);
+    assert(device.textures.slice(offset).every(texture => texture.destroyed && texture.destroyCalls === 1));
+    renderer.dispose();
+  }
   console.log("WebGPU packed monochrome: byte uploads, coverage mips, premultiplied colors, lazy sources, tiles, legacy detection, limits and cleanup passed.");
 } finally {
   for (const [key, value] of Object.entries(globals)) {
@@ -168,6 +185,7 @@ function makeDevice(limit) {
     textures, buffers, uploads, writes, failure: null, limits: { maxTextureDimension2D: limit },
     queue: {
       writeTexture(destination, pixels, layout, dimensions) {
+        if (device.failure === "compact upload" && destination.texture.descriptor.format === "rgba8unorm") throw new Error("synthetic compact upload failure");
         if (device.failure === "coverage upload" && destination.texture.descriptor.format === "r8unorm" &&
             destination.texture.descriptor.mipLevelCount) throw new Error("synthetic coverage upload failure");
         uploads.push({ destination, pixels: pixels.slice(), layout, dimensions });
@@ -190,8 +208,8 @@ function makeDevice(limit) {
       buffers.push(buffer); return buffer;
     },
     createTexture(descriptor) {
-      const texture = { descriptor, destroyed: false, createView() { return { texture: this }; },
-        destroy() { this.destroyed = true; } };
+      const texture = { descriptor, destroyed: false, destroyCalls: 0, createView() { return { texture: this }; },
+        destroy() { this.destroyed = true; this.destroyCalls++; } };
       textures.push(texture); return texture;
     },
     destroy() {}

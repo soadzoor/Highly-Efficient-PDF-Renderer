@@ -1,3 +1,4 @@
+import { buildCompactMonochromeAtlas, type CompactMonochromeAtlas } from "./compactMonochromeRaster";
 import { STROKE_COVERAGE_WGSL, STROKE_DENSITY_WGSL } from "./strokeCoverageShaders";
 import { FILL_COVERAGE_VERTEX_WGSL, FILL_COVERAGE_WGSL } from "./fillCoverageShaders";
 import { VECTOR_FILL_BAND_INFO_WGSL, vectorFillBandLoopWgsl } from "./vectorFillBandShaders";
@@ -13,7 +14,7 @@ import { isRasterTilePlanDownscaled, rasterTilePixels, reportRasterTileDownscale
 import { prepareRasterPixels, finishRasterUpdateSteps, finishRasterUpdateStepsAsync, type RasterPreparationJob, type PreparedRasterPixels } from "./rasterPreparation";
 import { RasterResourceCache } from "./rasterResourceCache";
 import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
-import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, estimateRasterSourcePlanBytes, planSceneRasterMemory, reportRasterMemoryBudget } from "./rasterMemoryBudget";
+import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, estimateRasterSourcePlanBytes, estimateRasterTextureBytes, rememberMonochromePlanBytes, planSceneRasterMemory, reportRasterMemoryBudget } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
 import type { SceneUpdateOptions } from "./rendererTypes";
 import { assessRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
@@ -5121,6 +5122,7 @@ export class WebGpuFloorplanRenderer {
       data: new Uint8Array(0), monochrome
     } : source, plan));
     const tiles: WebGpuRasterTileResource[] = [];
+    let compactSavings = 0;
     try {
       for (const [tileIndex, tile] of plan.tiles.entries()) {
         const tileMonochrome = packed ? prepared?.monochromeTiles?.[tileIndex] ?? monochromeRasterTile(packed, source.width, source.height, tile) : coverage ? monochrome : undefined;
@@ -5137,18 +5139,20 @@ export class WebGpuFloorplanRenderer {
         }
         const textures = packed || coverage
           ? this.createMonochromeTextures(tile.width, tile.height, tileMonochrome!, prepared?.coverageAtlases?.[tileIndex],
-            coverage ? pixels![tileIndex] : undefined)
+            coverage ? pixels![tileIndex] : undefined, prepared?.compactAtlases?.[tileIndex], !!prepared?.compactAtlases)
           : { texture: compressed?.texture ?? this.createRgba8Texture(tile.width, tile.height, pixels![tileIndex]) };
+        if ("compactBytes" in textures && textures.compactBytes !== undefined) compactSavings +=
+          estimateRasterTextureBytes(tile.width, tile.height, !!packed, null, coverage) - textures.compactBytes;
         const uploadedTile: RasterTile = compressed ? { ...tile, uv: [
           tile.uv[0] * compressed.uvScale[0], tile.uv[1] * compressed.uvScale[1],
           tile.uv[2] * compressed.uvScale[0], tile.uv[3] * compressed.uvScale[1]
         ] } : tile;
         try {
           tiles.push(this.createRasterTileResource(matrix, textures.texture, source.opacity ?? 1, uploadedTile,
-            "coverageTexture" in textures ? textures.coverageTexture : undefined, tileMonochrome, !!compressed, coverage));
+            "coverageTexture" in textures ? textures.coverageTexture : undefined, tileMonochrome, !!compressed, coverage, "compact" in textures && !!textures.compact));
         } catch (error) {
           textures.texture.destroy();
-          if ("coverageTexture" in textures) textures.coverageTexture.destroy();
+          if ("coverageTexture" in textures && textures.coverageTexture !== textures.texture) textures.coverageTexture.destroy();
           throw error;
         }
       }
@@ -5162,19 +5166,21 @@ export class WebGpuFloorplanRenderer {
       ...first,
       rasterPlan: plan,
       estimatedBytes: estimateRasterSourcePlanBytes({ width: source.width, height: source.height,
-        monochrome, reducedMonochrome: coverage }, plan, compressionFormat) + plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES,
+        monochrome, reducedMonochrome: coverage }, plan, compressionFormat) - compactSavings + plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES,
       ...(compressionFormat ? { compressionFormat } : {}),
       ...(extraTiles.length > 0 ? { extraTiles } : {}),
       paintOrder: Number.isFinite(paintOrder) ? paintOrder : 0,
       pageIndex: Number.isFinite(pageIndex) ? Math.max(0, Math.trunc(pageIndex)) : 0
     };
+    if (monochrome) rememberMonochromePlanBytes({ width: source.width, height: source.height, monochrome }, plan,
+      resource.estimatedBytes! - plan.tiles.length * RASTER_UNIFORM_BUFFER_BYTES);
     this.recordPerformanceTransition("rasterUpload.submit", performance.now() - uploadStarted);
     return this.getRasterResourceCache().remember(resource, source, plan, compressionFormat);
   }
 
   private createRasterTileResource(
     matrix: Float32Array, texture: any, opacity: number, tile: RasterTile,
-    coverageTexture?: any, monochrome?: MonochromeRaster, compressedOpaque = false, coverageOnly = false
+    coverageTexture?: any, monochrome?: MonochromeRaster, compressedOpaque = false, coverageOnly = false, compact = false
   ): WebGpuRasterTileResource {
     const gpuBufferUsage = (globalThis as any).GPUBufferUsage;
     const rasterUniforms = new Float32Array(RASTER_UNIFORM_FLOATS);
@@ -5185,7 +5191,7 @@ export class WebGpuFloorplanRenderer {
     rasterUniforms[4] = matrix[4];
     rasterUniforms[5] = matrix[5];
     rasterUniforms[6] = opacity;
-    rasterUniforms[7] = monochrome ? tile.width * (coverageOnly ? -1 : 1) : 0;
+    rasterUniforms[7] = monochrome ? compact ? tile.width + 0.5 : tile.width * (coverageOnly ? -1 : 1) : 0;
     rasterUniforms.set(tile.quad, 8);
     rasterUniforms.set(tile.uv, 12);
     if (compressedOpaque) rasterUniforms[16] = 1;
@@ -5340,13 +5346,19 @@ export class WebGpuFloorplanRenderer {
 
   /** Exact packed bits or an R8 display base, with separate four-bit coverage mips. */
   private createMonochromeTextures(width: number, height: number, source: MonochromeRaster,
-    preparedAtlas?: PackedMonochromeCoverageAtlas, coveragePixels?: Uint8Array): {
-    texture: any; coverageTexture: any;
+    preparedAtlas?: PackedMonochromeCoverageAtlas, coveragePixels?: Uint8Array, preparedCompact?: CompactMonochromeAtlas,
+    compactPrepared = false): {
+    texture: any; coverageTexture: any; compact?: boolean; compactBytes?: number;
   } {
     const gpuTextureUsage = (globalThis as any).GPUTextureUsage;
     const packedWidth = coveragePixels ? width : Math.ceil(width / 8);
     const atlas = preparedAtlas ?? (coveragePixels ? buildPackedCoverageMipAtlas(coveragePixels, width, height)
       : buildPackedMonochromeMipAtlas(source, width, height));
+    const compact = compactPrepared ? preparedCompact : buildCompactMonochromeAtlas(source, width, height, atlas, coveragePixels);
+    if (compact) {
+      const texture = this.createRgba8DataTexture(compact.width, compact.height, compact.data);
+      return { texture, coverageTexture: texture, compact: true, compactBytes: compact.data.length };
+    }
     const texture = this.gpuDevice.createTexture({
       size: { width: packedWidth, height, depthOrArrayLayers: 1 },
       format: "r8unorm",
@@ -5383,9 +5395,11 @@ export class WebGpuFloorplanRenderer {
       usage: gpuTextureUsage.TEXTURE_BINDING | gpuTextureUsage.COPY_DST
     });
 
-    const padded = createPaddedByteTextureData(source, width, height, 4);
-    this.writeRgba8Texture(texture, width, height, padded);
-    return texture;
+    try {
+      const padded = createPaddedByteTextureData(source, width, height, 4);
+      this.writeRgba8Texture(texture, width, height, padded);
+      return texture;
+    } catch (error) { texture.destroy(); throw error; }
   }
 
   private writeFloatTexture(texture: any, width: number, height: number, data: Float32Array): void {
@@ -5793,7 +5807,7 @@ export class WebGpuFloorplanRenderer {
 
 function destroyRasterTileResource(tile: WebGpuRasterTileResource): void {
   tile.texture?.destroy();
-  tile.coverageTexture?.destroy();
+  if (tile.coverageTexture !== tile.texture) tile.coverageTexture?.destroy();
   tile.uniformBuffer?.destroy();
 }
 

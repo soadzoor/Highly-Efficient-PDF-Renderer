@@ -1092,6 +1092,20 @@ backends use the same representations. Preparation workers transfer the packed
 atlases, and automatic memory planning includes their row/atlas padding.
 Canvas 2D and exports retain RGBA compatibility.
 
+When smaller, a shared compact atlas replaces the base and coverage textures:
+32x32 blocks use uniform-value markers or share byte-identical payloads across
+levels. Supported JBIG2 text regions also retain actual decoded symbol bitmaps
+and placements, including arithmetic refinements. The renderer compares block
+sharing with symbol sharing and chooses the smaller result, requiring at least
+5% savings over ordinary packed storage. Both native and Three backends use the
+same layout and filtering. Original pixels and the existing four-bit mip values
+are unchanged. GPU residency charges the actual atlas size; subsequent budget
+decisions reuse those measured costs without scanning pixels during rendering.
+Unmeasured images retain conservative estimates. Unsupported JBIG2 composition
+uses the metered PDFium bitmap decoder, and existing HEPs can still use block
+sharing without symbol metadata. See [monochrome GPU storage](monochrome-gpu-storage.md)
+for the format, limits and manual verification steps.
+
 The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
 embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX
 samples, codec-defined color spaces, and premultiplied alpha (`SMaskInData=2`)

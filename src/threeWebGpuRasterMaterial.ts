@@ -2,6 +2,7 @@ import { pageProjectionNode } from "./threeWebGpuPageTransforms";
 import type { ThreePageBinding } from "./threePageTransforms";
 import { registerThreePdfShapeUniform } from "./threePdfShape";
 import { registerThreeNodeClipPosition } from "./threeWebGpuVectorClips";
+import { COMPACT_WORD_WGSL, COMPACT_BLOCK_WGSL, COMPACT_TEXEL_WGSL, COMPACT_BILINEAR_WGSL, COMPACT_SAMPLE_WGSL } from "./compactMonochromeShaders";
 import * as THREE from "three";
 import { NodeMaterial, TSL } from "three/webgpu";
 import { threeRasterTextureInfo } from "./threeRasterTextures";
@@ -126,6 +127,11 @@ fn heprRasterFragment(inputColor: vec4<f32>, opacity: f32, shapeOnly: f32) -> ve
 }
 `);
 
+const compactWordFn = TSL.wgslFn(COMPACT_WORD_WGSL);
+const compactBlockFn = TSL.wgslFn(COMPACT_BLOCK_WGSL, [compactWordFn] as never);
+const compactTexelFn = TSL.wgslFn(COMPACT_TEXEL_WGSL, [compactWordFn, compactBlockFn] as never);
+const compactBilinearFn = TSL.wgslFn(COMPACT_BILINEAR_WGSL, [compactTexelFn] as never);
+const compactSampleFn = TSL.wgslFn(COMPACT_SAMPLE_WGSL, [compactWordFn, compactBilinearFn] as never);
 const rasterBitFn: unknown = TSL.wgslFn(`
 fn heprThreeRasterBit(image: texture_2d<f32>, size: vec2f, pixel: vec2i) -> f32 {
   let p = clamp(pixel, vec2i(0), vec2i(size) - vec2i(1));
@@ -147,7 +153,9 @@ fn heprThreeRasterSample(image: texture_2d<f32>, imageSampler: sampler,
   }
   let lod = max(0.0, log2(max(1.0, max(length(dx * size), length(dy * size)))));
   var coverage: f32;
-  if (lod < 1.0) {
+  if (mode > 2.5) {
+    coverage = heprCompactSample(image, vec2i(size), uv, lod);
+  } else if (lod < 1.0) {
     let position = uv * size - vec2f(0.5);
     let pixel = vec2i(floor(position)); let weight = fract(position);
     var base: f32;
@@ -162,7 +170,7 @@ fn heprThreeRasterSample(image: texture_2d<f32>, imageSampler: sampler,
     coverage = heprPackedCoverage(coverageImage, vec2i(size), uv, lod - 1.0);
   }
   return mix(color0, color1, coverage);
-}`, [rasterBitFn, coverageTrilinearFn] as never);
+}`, [rasterBitFn, coverageTrilinearFn, compactSampleFn] as never);
 
 export function createThreeWebGpuRasterMaterial(
   options: ThreeWebGpuRasterMaterialOptions

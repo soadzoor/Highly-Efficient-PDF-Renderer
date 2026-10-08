@@ -92,6 +92,25 @@ try {
   assert.equal(uploadFailed.mock.alive.size, 0, "failed mip upload releases both textures");
   assert.deepEqual(uploadFailed.mock.calls.filter(call => call[0] === "pixelStorei").at(-1), ["pixelStorei", "UNPACK_ALIGNMENT", 4]);
 
+  {
+    const { renderer: compactRenderer, mock: compactMock } = makeRenderer(WebGlFloorplanRenderer, 512);
+    const bits = { data: new Uint8Array(512 * 512 / 8).fill(255), colors: mono.colors };
+    const source = { width: 512, height: 512, monochrome: bits, matrix: Float32Array.of(512,0,0,512,0,0),
+      get data() { assert.fail("compact upload must not expand RGBA"); } };
+    const resource = compactRenderer.createRasterLayerGpu(source, 0);
+    assert.equal(resource.monochrome.compact, true);
+    assert.equal(resource.monochrome.mipTexture, resource.texture);
+    const uploads = compactMock.calls.filter(call => call[0] === "texImage2D");
+    assert.equal(uploads.length, 1); assert.equal(uploads[0][3], "RGBA8");
+    assert.equal(resource.estimatedBytes, uploads[0].at(-1).byteLength);
+    compactRenderer.drawRasterTile(resource);
+    assert(compactMock.calls.some(call => call[0] === "uniform1f" && call[1] === "uRasterMonochrome" && call[2] === 3));
+    compactRenderer.deleteRasterLayerTextures(resource);assert.equal(compactMock.alive.size, 0);
+    const failed = makeRenderer(WebGlFloorplanRenderer, 512);failed.mock.failUpload = 1;
+    assert.throws(() => failed.renderer.createRasterLayerGpu(source, 0), /upload failed/);
+    assert.equal(failed.mock.alive.size, 0, "failed compact uploads release the atlas");
+  }
+
   const shader = monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE);
   assert(shader.includes("heprRasterColor(vUv, dFdx(vUv), dFdy(vUv))"));
   assert(shader.includes("heprVectorClipAA(vWorld, clipAAWidth)"));

@@ -1,3 +1,4 @@
+import type { MonochromeSymbolScene } from "./compactMonochromeRaster";
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import type { RasterTile, RasterTilePlan } from "./rasterTiles";
 import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
@@ -9,6 +10,7 @@ import { packMonochromeCoverageSteps, type PackedMonochromeCoverageAtlas } from 
 export interface MonochromeRaster {
   data: Uint8Array;
   colors: Uint8Array;
+  symbols?: MonochromeSymbolScene;
 }
 
 /** Materialize RGBA only for consumers that cannot use the packed representation. */
@@ -71,7 +73,9 @@ export function prepareMonochromeSceneTransfer(scene: VectorScene): VectorScene 
     // Transfer only worker-owned copies of the compact payload, never cached bytes.
     descriptors.monochrome = dataDescriptor({
       data: new Uint8Array(layer.monochrome.data),
-      colors: new Uint8Array(layer.monochrome.colors)
+      colors: new Uint8Array(layer.monochrome.colors),
+      ...(layer.monochrome.symbols ? { symbols: { symbols: layer.monochrome.symbols.symbols.map(symbol => ({
+        ...symbol, data: new Uint8Array(symbol.data) })), placements: new Int32Array(layer.monochrome.symbols.placements) } } : {})
     });
     descriptors.data = dataDescriptor(new Uint8Array(0));
     return Object.defineProperties({}, descriptors) as RasterLayer;
@@ -240,7 +244,12 @@ export function monochromeRasterTile(
     }
     data[y * stride + stride - 1] &= lastByteMask;
   }
-  return { data, colors: monochrome.colors };
+  const symbols = monochrome.symbols ? { symbols: monochrome.symbols.symbols,
+    placements: new Int32Array(monochrome.symbols.placements) } : undefined;
+  if (symbols) for (let i = 0; i < symbols.placements.length; i += 3) {
+    symbols.placements[i] -= tile.x; symbols.placements[i + 1] -= tile.y;
+  }
+  return { data, colors: monochrome.colors, ...(symbols ? { symbols } : {}) };
 }
 
 /** Area-averaged coverage below the packed base, retaining odd-edge texels without unpacking the base. */

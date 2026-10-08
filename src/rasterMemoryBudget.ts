@@ -7,6 +7,30 @@ const GIB = 1024 * MIB;
 const MIN_RASTER_BUDGET = 16 * MIB;
 const MAX_RASTER_BUDGET = 256 * MIB;
 const FALLBACK_RASTER_BUDGET = 64 * MIB;
+const learnedMonochromeBytes = new WeakMap<object, Map<string, number>>();
+
+/** Preparation/upload reveals content savings without reading pixels during frame planning. */
+export function rememberMonochromePlanBytes(source: RasterMemorySource, plan: RasterTilePlan, bytes: number): void {
+  const key = (source.monochrome as { data?: unknown } | undefined)?.data;
+  if (!key || typeof key !== "object" || !Number.isSafeInteger(bytes) || bytes <= 0) return;
+  const costs = learnedMonochromeBytes.get(key) ?? new Map<string, number>();
+  const signature = monochromePlanSignature(source, plan);
+  if (!costs.has(signature) && costs.size >= 8) costs.delete(costs.keys().next().value!);
+  costs.set(signature, bytes); learnedMonochromeBytes.set(key, costs);
+}
+
+function monochromePlanSignature(source: RasterMemorySource, plan: RasterTilePlan): string {
+  return `${source.width}:${source.height}:${plan.width}:${plan.height}:` +
+    plan.tiles.map(tile => `${tile.x},${tile.y},${tile.width},${tile.height}`).join(";");
+}
+
+function plannedSourceBytes(source: RasterMemorySource, plan: RasterTilePlan, format?: RasterCompressionFormat | null): number {
+  const upperBound = estimateRasterSourcePlanBytes(source, plan, format);
+  const key = (source.monochrome as { data?: unknown } | undefined)?.data;
+  if (!key || typeof key !== "object" || (!source.reducedMonochrome && isRasterTilePlanDownscaled(source, plan))) return upperBound;
+  const learned = learnedMonochromeBytes.get(key)?.get(monochromePlanSignature(source, plan));
+  return learned === undefined ? upperBound : Math.min(upperBound, learned);
+}
 
 export interface AutomaticRasterMemoryBudget {
   /** Heuristic resident raster target, derived from system RAM rather than measured VRAM. */
@@ -133,7 +157,7 @@ export function planSceneRasterMemory(
     !isRasterTilePlanDownscaled(source, originalPlans[index]));
   const copies = sources.map(source => Number.isFinite(source.allocationCopies) && source.allocationCopies! >= 1
     ? Math.ceil(source.allocationCopies!) : 1);
-  const costs = originalPlans.map((plan, index) => estimateRasterSourcePlanBytes(sources[index], plan) * copies[index]);
+  const costs = originalPlans.map((plan, index) => plannedSourceBytes(sources[index], plan) * copies[index]);
   const unscaledBytes = costs.reduce((sum, cost) => sum + cost, 0);
   const protectedBytes = costs.reduce((sum, cost, index) => sum + (packed[index] ? cost : 0), 0);
   const result = (
@@ -154,7 +178,7 @@ export function planSceneRasterMemory(
         ? compressionFormat : null;
     });
     const bytes = plans.reduce((sum, plan, index) => sum + (packed[index] ? costs[index] :
-      estimateRasterSourcePlanBytes(sources[index], plan, compressionFormats[index]) * copies[index]), 0);
+      plannedSourceBytes(sources[index], plan, compressionFormats[index]) * copies[index]), 0);
     return { plans, bytes, compressionFormats };
   };
   const compressed = price(originalPlans);

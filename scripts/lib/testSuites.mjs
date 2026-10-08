@@ -55,6 +55,8 @@ export const fastTests = [
   "raster-preparation",
   "pdf-demand-swaps",
   "monochrome-raster",
+  "compact-monochrome-raster",
+  "jbig2-symbol-storage",
   "webgl-monochrome-raster",
   "webgpu-monochrome-raster",
   "raster-clip-seams",

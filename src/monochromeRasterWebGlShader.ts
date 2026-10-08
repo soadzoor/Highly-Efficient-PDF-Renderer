@@ -1,3 +1,4 @@
+import { COMPACT_MONOCHROME_GLSL } from "./compactMonochromeShaders";
 import { PACKED_COVERAGE_GLSL } from "./packedMonochromeCoverageShaders";
 
 /** Packed binary base texels, with four-bit coverage mips for readable minification. */
@@ -11,6 +12,7 @@ uniform vec2 uRasterMonoSize;
 uniform vec4 uRasterMonoColor0;
 uniform vec4 uRasterMonoColor1;
 ${PACKED_COVERAGE_GLSL}
+${COMPACT_MONOCHROME_GLSL}
 
 float heprRasterBit(ivec2 pixel) {
   pixel = clamp(pixel, ivec2(0), ivec2(uRasterMonoSize) - 1);
@@ -35,7 +37,9 @@ vec4 heprRasterColor(vec2 uv, vec2 uvDx, vec2 uvDy) {
   float footprint = max(length(uvDx * uRasterMonoSize), length(uvDy * uRasterMonoSize));
   float lod = max(0.0, log2(max(footprint, 1.0)));
   float coverage;
-  if (lod < 1.0) {
+  if (uRasterMonochrome > 2.5) {
+    coverage = heprCompactSample(uRasterTex, ivec2(uRasterMonoSize), uv, lod);
+  } else if (lod < 1.0) {
     float base = uRasterMonochrome > 1.5 ? textureLod(uRasterTex, uv, 0.0).r : heprRasterBinaryLinear(uv);
     coverage = mix(base, heprPackedCoverage(uRasterMonoMips, ivec2(uRasterMonoSize), uv, 0.0), lod);
   } else {

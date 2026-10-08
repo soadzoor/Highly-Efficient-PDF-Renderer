@@ -151,10 +151,10 @@ try {
     let displayed = renderer.rasterLayerResources[0];
     const previewTexture = displayed.texture;
     assert.equal(displayed.rasterPlan.width, 128);
-    assert.equal(displayed.texture.descriptor.format, "r8unorm");
-    assert.equal(displayed.coverageTexture.descriptor.format, "r8unorm", "a reduced scan binds four-bit mips beside its R8 base");
-    assert.equal(displayed.coverageTexture.descriptor.mipLevelCount, 1, "the coverage atlas has no hardware mips");
-    assert(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] < 0, "shader receives the coverage-only mode");
+    assert.equal(displayed.texture.descriptor.format, "rgba8unorm");
+    assert.equal(displayed.coverageTexture, displayed.texture, "compact base and mips share one physical atlas");
+    assert.equal(displayed.coverageTexture.descriptor.mipLevelCount ?? 1, 1, "the compact atlas has no hardware mips");
+    assert.equal(device.writes.find(write => write.buffer === displayed.uniformBuffer).values[7] % 1, .5, "shader receives compact mode");
     assert.equal(displayed.estimatedBytes, layerBytes(displayed));
     const beforeStale = device.textures.length;
     renderer.zoom = 1; renderer.updateRasterResolution();
@@ -253,7 +253,7 @@ function textureBytes(texture) {
 
 function layerBytes(layer) {
   return [layer, ...layer.extraTiles ?? []].reduce((sum, tile) => sum + textureBytes(tile.texture) +
-    (tile.coverageTexture ? textureBytes(tile.coverageTexture) : 0) + tile.uniformBuffer.descriptor.size, 0);
+    (tile.coverageTexture && tile.coverageTexture !== tile.texture ? textureBytes(tile.coverageTexture) : 0) + tile.uniformBuffer.descriptor.size, 0);
 }
 
 function residentBytes(renderer) {
