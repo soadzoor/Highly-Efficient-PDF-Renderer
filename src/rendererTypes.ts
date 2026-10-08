@@ -23,6 +23,11 @@ export interface ViewStateUpdateOptions {
   scheduleFrame?: boolean;
 }
 
+export interface SceneUpdateOptions {
+  /** Keep the current zoom tiers when replacing a progressive document window. */
+  preserveRasterResolution?: boolean;
+}
+
 /**
  * Advanced native renderer interface used internally by `HeprThreePdfObject`.
  *
@@ -30,6 +35,11 @@ export interface ViewStateUpdateOptions {
  * `HeprThreePdfObject` methods instead of calling this interface directly.
  */
 export interface RendererApi {
+  /** Select already prepared page alternatives without replacing document geometry. */
+  setPageRasterVisibility?(pages: ReadonlySet<number>): void;
+  /** Lifecycle timing outside the frame loop, retained in performance captures. */
+  recordPerformanceTransition?(name: string, durationMs: number): void;
+  prepareRasterLayerUpdatesAsync?(updates: ReadonlyMap<number, RasterLayer>): Promise<PreparedRasterLayerUpdates>;
   prepareRasterLayerUpdates?(updates: ReadonlyMap<number, RasterLayer>): PreparedRasterLayerUpdates;
   getRasterLayerUpdates?(): ReadonlyMap<number, RasterLayer>;
   /** Apply a prepared, immutable visibility revision without uploading geometry again. */
@@ -108,7 +118,7 @@ export interface RendererApi {
   resize(): void;
 
   /** Upload a parsed scene and return GPU/resource stats. */
-  setScene(scene: VectorScene): SceneStats;
+  setScene(scene: VectorScene, options?: SceneUpdateOptions): SceneStats;
 
   /** Return stats for the uploaded scene, if available. */
   getSceneStats(): SceneStats | null;

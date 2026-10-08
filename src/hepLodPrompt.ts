@@ -4,8 +4,10 @@ import { getCachedTextLod } from "./textLodCore";
 import { shouldBuildTextLod } from "./textGreekLod";
 import "./hepLodPrompt.css";
 
-/** Include available LODs by default for faster loading; Escape cancels. */
-export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promise<HepLodOptions | null> {
+export type HepDownloadOptions = HepLodOptions;
+
+/** Include available LODs; Escape cancels. */
+export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promise<HepDownloadOptions | null> {
   if (signal?.aborted) return Promise.resolve(null);
   const cachedText = getCachedTextLod(scene);
   const vector = scene.segmentCount > 0;
@@ -19,9 +21,10 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
   const title = document.createElement("h2");
   title.id = "hep-lod-title";
   title.textContent = "Download HEP";
+  form.append(title);
   const description = document.createElement("p");
-  description.textContent = "Store levels of detail for faster loading. This increases file size. Uncheck for a smaller file.";
-  form.append(title, description);
+  description.textContent = "Store levels of detail for faster loading. Uncheck for a smaller file. Your selected levels are kept. HEP files larger than the original PDF still download with a warning.";
+  form.append(description);
   const inputs: { key: "withVectorLod" | "withTextLod"; input: HTMLInputElement }[] = [];
   for (const [available, key, label] of [[vector, "withVectorLod", "Include vector LOD"],
     [text, "withTextLod", "Include text LOD"]] as const) {
@@ -66,7 +69,7 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
     signal?.addEventListener("abort", abort, { once: true });
     dialog.addEventListener("close", () => {
       signal?.removeEventListener("abort", abort);
-      const options: HepLodOptions = {};
+      const options: HepDownloadOptions = {};
       for (const { key, input } of inputs) options[key] = input.checked;
       if (options.withVectorLod) options.vectorLodPrecision = precision.value === "compact" ? "compact" : "lossless";
       dialog.remove();

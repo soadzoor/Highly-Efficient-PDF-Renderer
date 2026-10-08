@@ -15,9 +15,11 @@ export function createLayerVisibilityController(options: LayerVisibilityOptions)
   let controller: OptionalContentController | null = null;
   let replay: RetainedPageReplay | null = null;
   let snapshot: OptionalContentSnapshot | null = null;
+  const rememberedVisibility = new Map<string, boolean>();
   const listeners = new Set<OptionalContentListener>();
-  const notify = (value: OptionalContentSnapshot): void => {
+  const notify = (value: OptionalContentSnapshot, remember = true): void => {
     snapshot = value;
+    if (remember) for (const layer of value.layers) rememberedVisibility.set(layer.id, layer.visible);
     options.getRenderer().setOptionalContentVisibility?.(value);
     try { options.onChange?.(value); } catch { /* Observers cannot roll back an applied revision. */ }
     for (const listener of listeners) { try { listener(value); } catch { /* Isolate host observers. */ } }
@@ -47,9 +49,10 @@ export function createLayerVisibilityController(options: LayerVisibilityOptions)
       listeners.add(listener);
       return () => { listeners.delete(listener); };
     },
-    sceneChanged(): void {
+    sceneChanged(preserveVisibility = false): Promise<void> {
       const next = options.getScene();
-      if (next === scene) return;
+      if (next === scene) return Promise.resolve();
+      if (!preserveVisibility) rememberedVisibility.clear();
       controller?.dispose();
       replay?.dispose(); replay = null;
       controller = null;
@@ -82,8 +85,22 @@ export function createLayerVisibilityController(options: LayerVisibilityOptions)
               } finally { context.signal.removeEventListener("abort", abort); resources?.dispose(); }
             };
           } });
-        notify(controller.getSnapshot());
+        const target = controller;
+        const changes = preserveVisibility ? target.getLayers().filter(layer => !layer.locked && layer.usedInView &&
+          rememberedVisibility.has(layer.id) && rememberedVisibility.get(layer.id) !== layer.visible)
+          .map(layer => ({ id: layer.id, visible: rememberedVisibility.get(layer.id)! })) : [];
+        const annotations = preserveVisibility ? scene.optionalContent?.groups.filter(group => group.annotationId &&
+          rememberedVisibility.has(group.id)).map(group => ({ id: group.annotationId!, visible: rememberedVisibility.get(group.id)! })) ?? [] : [];
+        notify(target.getSnapshot(), !preserveVisibility);
+        if (changes.length || annotations.length) return (async () => {
+          if (changes.length) await target.setLayerVisibilities(changes);
+          for (const visible of [false, true]) {
+            const ids = annotations.filter(annotation => annotation.visible === visible).map(annotation => annotation.id);
+            if (ids.length) await target.setAnnotationVisibility(ids, visible);
+          }
+        })();
       }
+      return Promise.resolve();
     },
     rendererChanged(): void {
       if (replay) {
@@ -92,7 +109,7 @@ export function createLayerVisibilityController(options: LayerVisibilityOptions)
       }
       if (snapshot) options.getRenderer().setOptionalContentVisibility?.(snapshot);
     },
-    dispose(): void { controller?.dispose(); replay?.dispose(); replay = null; controller = null; scene = null; snapshot = null; listeners.clear(); }
+    dispose(): void { controller?.dispose(); replay?.dispose(); replay = null; controller = null; scene = null; snapshot = null; listeners.clear(); rememberedVisibility.clear(); }
   };
 }
 

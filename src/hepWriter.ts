@@ -18,6 +18,7 @@ import {
 } from "./hepSceneSections";
 import { writeHepGradientMesh } from "./hepGradientMesh";
 import { HepArchive } from "./hepContainer";
+import { warnIfHepSizeExceedsPdf, validateSourcePdfByteLength } from "./hepSizePolicy";
 import {
   GRADIENT_LUT_WIDTH,
   type RasterLayer,
@@ -28,6 +29,8 @@ import {
   encodeRasterRgbaCandidates,
   pickBestRasterImage
 } from "./rasterImageCodec";
+import { encodeHepMonochromeRaster } from "./hepMonochromeRaster";
+import { encodeHepBinaryRaster } from "./hepBinaryRaster";
 import {
   IdenticalRasterFinder,
   SCENE_RASTER_LAYERS_PATH,
@@ -55,6 +58,8 @@ import {
 import {
   prepareSceneForHepRendering,
   PARSED_DATA_FORMAT_VERSION,
+  PARSED_DATA_MONOCHROME_FORMAT_VERSION,
+  PARSED_DATA_BINARY_FORMAT_VERSION,
   TEXT_INDEX_JSON_PATH,
   TEXT_CHAR_MAP_PATH,
   TEXT_FALLBACK_PATH,
@@ -84,6 +89,11 @@ export async function buildHepBlobForLayout(
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
   throwIfBuildAborted(options.signal);
+  validateSourcePdfByteLength(options.sourcePdfByteLength);
+  validateSourcePdfByteLength(scene.sourcePdfByteLength);
+  const sourcePdfByteLength = options.sourcePdfByteLength === undefined ? scene.sourcePdfByteLength
+    : scene.sourcePdfByteLength === undefined ? options.sourcePdfByteLength
+    : Math.min(options.sourcePdfByteLength, scene.sourcePdfByteLength);
   if (options.withVectorLod || options.withTextLod) scene = prepareSceneForHepRendering(scene);
   validatePagePrimitiveRanges(scene);
   validateVectorDrawRuns(scene);
@@ -216,7 +226,7 @@ export async function buildHepBlobForLayout(
     encodeRasterImages,
     signal: options.signal,
     onTexelsEncoded: (processed) => reportBuildProgress(
-      0.4 * (processed / totalRasterTexels),
+      totalRasterTexels > 0 ? 0.4 * (processed / totalRasterTexels) : 0,
       { stage: "raster-encode", unit: "texels", processed, total: totalRasterTexels }
     )
   });
@@ -224,8 +234,11 @@ export async function buildHepBlobForLayout(
   reportBuildProgress(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
-    formatVersion: PARSED_DATA_FORMAT_VERSION,
+    formatVersion: rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
+      rasterLayers.some(layer => layer.monochrome)
+      ? PARSED_DATA_MONOCHROME_FORMAT_VERSION : PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,
+    sourcePdfByteLength,
     generatedAt: new Date().toISOString(),
     strokeGeometry: strokeGeometryExport?.manifest,
     textInstances: textInstancesExport?.manifest,
@@ -288,7 +301,9 @@ export async function buildHepBlobForLayout(
       textInstanceCount: scene.textInstanceCount,
       textGlyphCount: scene.textGlyphCount,
       textGlyphPrimitiveCount: scene.textGlyphSegmentCount,
-      rasterLayers: rasterLayersManifest
+      rasterLayers: rasterLayersManifest && {
+        file: rasterLayersManifest.file, count: rasterLayersManifest.count, atlasCount: rasterLayersManifest.atlasCount
+      }
     },
     textures: textureEntries.map((entry) => ({
       name: entry.name,
@@ -311,7 +326,8 @@ export async function buildHepBlobForLayout(
   };
 
   throwIfBuildAborted(options.signal);
-  archive.file("manifest.json", JSON.stringify({ ...manifest, ...(lod ? { lod } : {}) }));
+  const outputManifest = { ...manifest, ...(lod ? { lod } : {}) };
+  archive.file("manifest.json", JSON.stringify(outputManifest));
   const onHepProgress = (metadata: { percent: number }): void => {
     reportBuildProgress(
       hepBuildStart + (1 - hepBuildStart) * (metadata.percent / 100),
@@ -324,6 +340,7 @@ export async function buildHepBlobForLayout(
     signal: options.signal
   }, onHepProgress);
   throwIfBuildAborted(options.signal);
+  warnIfHepSizeExceedsPdf(hepBlob.size, sourcePdfByteLength, label, options.onWarning);
   reportBuildProgress(1, { stage: "hep-build" });
   throwIfBuildAborted(options.signal);
 
@@ -373,10 +390,13 @@ const RASTER_ATLAS_LOSSY_ADVANTAGE = 2;
 const RASTER_SECTION_OVERHEAD_BYTES = 64;
 
 /**
- * Write the v9 raster layer table: every layer keeps its own record, and the
+ * Write the raster layer table: every layer keeps its own record, and the
  * pixels of small lossless layers share PNG atlases instead of paying for a
  * section, a PNG header and a JSON record each. A repeated image is encoded
- * once, and small repeats share one atlas cell. See `hepRasterLayers`.
+ * once, and small repeats share one atlas cell. Monochrome layers keep their
+ * canonical packed rows and palette, using transposed binary runs when smaller,
+ * without materializing RGBA or image codecs.
+ * See `hepRasterLayers`.
  */
 async function writeHepRasterLayers(
   archive: HepArchive,
@@ -386,7 +406,7 @@ async function writeHepRasterLayers(
     signal?: AbortSignal;
     onTexelsEncoded: (processed: number) => void;
   }
-): Promise<{ file: string; count: number; atlasCount: number } | undefined> {
+): Promise<{ file: string; count: number; atlasCount: number; binary: boolean } | undefined> {
   if (layers.length === 0) {
     return undefined;
   }
@@ -394,29 +414,71 @@ async function writeHepRasterLayers(
   const pixels: Uint8Array[] = [];
   const encoded: Array<{ storage: "png" | "webp"; bytes: Uint8Array } | null> = [];
   const identical = new IdenticalRasterFinder();
+  let binary = false;
   /** The first earlier layer with identical pixels, or -1. */
   const originals: number[] = [];
   const joinsAtlas: boolean[] = [];
   const atlasMembers: number[] = [];
   let encodedTexels = 0;
+  let lastYield = performance.now();
   for (let i = 0; i < layers.length; i += 1) {
     throwIfBuildAborted(options.signal);
     const layer = layers[i];
     const expectedBytes = layer.width * layer.height * 4;
     if (
+      !Number.isSafeInteger(layer.width) ||
+      !Number.isSafeInteger(layer.height) ||
       !Number.isSafeInteger(expectedBytes) ||
       layer.width <= 0 ||
-      layer.height <= 0 ||
-      !(layer.data instanceof Uint8Array) ||
-      layer.data.byteLength < expectedBytes
+      layer.height <= 0
     ) {
-      throw new Error(`Raster layer ${i} has invalid dimensions or insufficient RGBA data.`);
+      throw new Error(`Raster layer ${i} has invalid dimensions.`);
     }
     if (layer.opacity !== undefined && (!Number.isFinite(layer.opacity) || layer.opacity < 0 || layer.opacity > 1)) {
       throw new Error(`Raster layer ${i} has invalid opacity.`);
     }
     if (layer.matrix.length !== 6 || !layer.matrix.every(Number.isFinite)) {
       throw new Error(`Raster layer ${i} has an invalid transform matrix.`);
+    }
+    const record: RasterLayerRecord = {
+      width: layer.width,
+      height: layer.height,
+      matrix: layer.matrix,
+      paintOrder: Number.isFinite(layer.paintOrder) ? Math.max(0, Math.trunc(layer.paintOrder)) : 0,
+      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
+      ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
+      storage: "rgba"
+    };
+    if (layer.monochrome) {
+      const monochrome = layer.monochrome;
+      const packedRuns = encodeHepBinaryRaster(monochrome, layer.width, layer.height, options.signal);
+      if (packedRuns) {
+        archive.file(rasterLayerFile(i, "binary"), packedRuns);
+        record.storage = "binary";
+        binary = true;
+      } else {
+        archive.file(rasterLayerFile(i, "mono"), encodeHepMonochromeRaster(monochrome, layer.width, layer.height, options.signal));
+        record.storage = "mono";
+      }
+      records.push(record);
+      pixels.push(new Uint8Array(0));
+      encoded.push(null);
+      originals.push(-1);
+      joinsAtlas.push(false);
+      if (options.encodeRasterImages) {
+        encodedTexels += layer.width * layer.height;
+        options.onTexelsEncoded(encodedTexels);
+      }
+      // Packed copies have no image-encoder await to let progress repaint or cancellation run.
+      if (performance.now() - lastYield >= 8) {
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        throwIfBuildAborted(options.signal);
+        lastYield = performance.now();
+      }
+      continue;
+    }
+    if (!(layer.data instanceof Uint8Array) || layer.data.byteLength < expectedBytes) {
+      throw new Error(`Raster layer ${i} has insufficient RGBA data.`);
     }
     const rgba = layer.data.subarray(0, expectedBytes);
     const original = identical.findOrAdd(i, layer.width, layer.height, rgba);
@@ -442,15 +504,8 @@ async function writeHepRasterLayers(
     encoded.push(best);
     originals.push(original);
     joinsAtlas.push(original >= 0 ? joinsAtlas[original] : isRasterAtlasCandidate(layer.width, layer.height) && !lossyWins);
-    records.push({
-      width: layer.width,
-      height: layer.height,
-      matrix: layer.matrix,
-      paintOrder: Number.isFinite(layer.paintOrder) ? Math.max(0, Math.trunc(layer.paintOrder)) : 0,
-      pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
-      ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
-      storage: best?.storage ?? "rgba"
-    });
+    record.storage = best?.storage ?? "rgba";
+    records.push(record);
     if (joinsAtlas[i]) {
       atlasMembers.push(i);
     }
@@ -497,7 +552,7 @@ async function writeHepRasterLayers(
   }
 
   records.forEach((record, index) => {
-    if (record.storage === "atlas") return;
+    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "binary") return;
     const image = encoded[index];
     if (image) {
       // WebP and PNG already carry entropy compression; deflating them again
@@ -508,7 +563,7 @@ async function writeHepRasterLayers(
     }
   });
   archive.file(SCENE_RASTER_LAYERS_PATH, encodeRasterLayerTable({ atlases, layers: records }));
-  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length };
+  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, binary };
 }
 
 function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null {

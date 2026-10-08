@@ -11,7 +11,7 @@ import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import * as THREE from "three";
 import { createDefaultOptionalContentSnapshot, type OptionalContentSnapshot } from "./optionalContent";
 import { ScenePaintVisibility } from "./scenePaintVisibility";
-import { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
+import { acquireThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } from "./threeVectorClips";
 import { enableThreeRawPaintFold, registerThreeGradientMaskSource,
   threePaintFoldFragmentGlsl } from "./threePaintFold";
 
@@ -103,6 +103,7 @@ export class ThreeMaterialGradientLayer {
   private readonly strokeRuns: (VectorDrawRun | undefined)[];
   readonly group: THREE.Group;
   private readonly vectorClipTexture: THREE.DataTexture | null;
+  private readonly releaseVectorClipTexture: (() => void) | null;
   private readonly fillClipIndices: number[];
   private readonly strokeClipIndices: number[];
 
@@ -131,6 +132,7 @@ export class ThreeMaterialGradientLayer {
     this.curveUniform = { value: options.strokeCurveEnabled ? 1 : 0 };
     this.vectorOverrideUniform = new THREE.Vector4(...options.vectorOverride);
     this.vectorClipTexture = null;
+    this.releaseVectorClipTexture = null;
     this.fillClipIndices = Array(scene.gradientFillPathCount).fill(-1);
     this.strokeClipIndices = Array(scene.gradientStrokeRunCount).fill(-1);
     for (const run of scene.drawRuns ?? []) {
@@ -150,12 +152,19 @@ export class ThreeMaterialGradientLayer {
       return;
     }
 
-    this.vectorClipTexture = this.own(createThreeVectorClipTexture(scene));
-    const gradientTextures = this.createGradientTextures(source, gradientCount);
-    const materialBackend = options.materialBackend ?? "webgl";
-    this.createFillEntries(source, gradientTextures, materialBackend);
-    this.createStrokeEntries(source, gradientTextures, materialBackend, options.strokeCurveEnabled);
-    this.setOptionalContentVisibility(createDefaultOptionalContentSnapshot(scene));
+    const clips = acquireThreeVectorClipTexture(scene);
+    this.vectorClipTexture = clips.texture;
+    this.releaseVectorClipTexture = clips.release;
+    try {
+      const gradientTextures = this.createGradientTextures(source, gradientCount);
+      const materialBackend = options.materialBackend ?? "webgl";
+      this.createFillEntries(source, gradientTextures, materialBackend);
+      this.createStrokeEntries(source, gradientTextures, materialBackend, options.strokeCurveEnabled);
+      this.setOptionalContentVisibility(createDefaultOptionalContentSnapshot(scene));
+    } catch (error) {
+      this.dispose();
+      throw error;
+    }
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -240,6 +249,7 @@ export class ThreeMaterialGradientLayer {
   }
 
   dispose(): void {
+    this.releaseVectorClipTexture?.();
     for (const entry of this.entries) {
       this.group.remove(entry.mesh);
       entry.geometry.dispose();

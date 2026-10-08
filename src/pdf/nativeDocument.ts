@@ -193,12 +193,15 @@ export class NativePdfDocument {
         diagnostics,
         options.signal
       );
-      const finishOpen = async (): Promise<NativePdfDocument> => {
+      const finishOpen = async (
+        revisionReader: PdfRandomAccessReader = reader,
+        recoveredRevision = false
+      ): Promise<NativePdfDocument> => {
         // Failed strict bootstraps must not leak partial or duplicate diagnostics
         // into the one repaired attempt.
         const attemptDiagnostics: PdfDiagnostic[] = [];
         const createBootstrap = (security: PdfSecurityHandler | null): NativePdfDocument => new NativePdfDocument(
-          reader,
+          revisionReader,
           xref,
           new Map(),
           [],
@@ -254,7 +257,7 @@ export class NativePdfDocument {
           version,
           byteLength: reader.byteLength,
           pageCount: pages.length,
-          repaired: xref.repaired,
+          repaired: xref.repaired || recoveredRevision,
           linearized,
           label: reader.label,
           language,
@@ -264,7 +267,7 @@ export class NativePdfDocument {
         };
         diagnostics.push(...attemptDiagnostics);
         const document = new NativePdfDocument(
-          reader,
+          revisionReader,
           xref,
           catalog,
           pages,
@@ -289,54 +292,100 @@ export class NativePdfDocument {
         document.objectStreamCacheBytes = bootstrap.objectStreamCacheBytes;
         return document;
       };
-      let document: NativePdfDocument;
-      try {
-        document = await finishOpen();
-      } catch (strictError) {
-        if (
-          (options.repair ?? "safe") !== "safe" ||
-          xref.repaired ||
-          !isRepairableBootstrapError(strictError)
-        ) throw strictError;
+      const openCurrentRevision = async (): Promise<NativePdfDocument> => {
+        try {
+          return await finishOpen();
+        } catch (strictError) {
+          if (
+            (options.repair ?? "safe") !== "safe" ||
+            xref.repaired ||
+            !isRepairableBootstrapError(strictError)
+          ) throw strictError;
 
-        // Duplicate dictionary keys do not invalidate an otherwise strict
-        // xref. Retry only the lazy bootstrap objects under the deterministic
-        // keep-last policy before paying for a source-wide structural scan.
-        // `repaired` is the existing switch used by object/object-stream
-        // parsers to enable that policy and emit per-object diagnostics.
-        let targetedDocument: NativePdfDocument | null = null;
-        let repairCause: unknown = strictError;
-        const strictXref = xref;
-        if (isDuplicateDictionaryKeyError(strictError)) {
-          const diagnosticInsertionIndex = diagnostics.length;
-          xref = { ...strictXref, repaired: true };
-          try {
-            targetedDocument = await finishOpen();
-            diagnostics.splice(
-              diagnosticInsertionIndex,
-              0,
-              ...targetedDuplicateDictionaryRepairDiagnostics(strictError, xref)
+          // Duplicate dictionary keys do not invalidate an otherwise strict
+          // xref. Retry only the lazy bootstrap objects under the deterministic
+          // keep-last policy before paying for a source-wide structural scan.
+          // `repaired` is the existing switch used by object/object-stream
+          // parsers to enable that policy and emit per-object diagnostics.
+          let targetedDocument: NativePdfDocument | null = null;
+          let repairCause: unknown = strictError;
+          const strictXref = xref;
+          if (isDuplicateDictionaryKeyError(strictError)) {
+            const diagnosticInsertionIndex = diagnostics.length;
+            xref = { ...strictXref, repaired: true };
+            try {
+              targetedDocument = await finishOpen();
+              diagnostics.splice(
+                diagnosticInsertionIndex,
+                0,
+                ...targetedDuplicateDictionaryRepairDiagnostics(strictError, xref)
+              );
+            } catch (targetedError) {
+              xref = strictXref;
+              if (!isRepairableBootstrapError(targetedError)) throw targetedError;
+              repairCause = targetedError;
+            }
+          }
+
+          if (targetedDocument) {
+            return targetedDocument;
+          } else {
+            xref = await repairNativeXref(
+              reader,
+              limits,
+              diagnostics,
+              repairCause,
+              options.signal,
+              strictXref.startXref
             );
-          } catch (targetedError) {
-            xref = strictXref;
-            if (!isRepairableBootstrapError(targetedError)) throw targetedError;
-            repairCause = targetedError;
+            return await finishOpen();
           }
         }
-
-        if (targetedDocument) {
-          document = targetedDocument;
-        } else {
-          xref = await repairNativeXref(
-            reader,
-            limits,
-            diagnostics,
-            repairCause,
-            options.signal,
-            strictXref.startXref
-          );
-          document = await finishOpen();
+      };
+      let document: NativePdfDocument | null = null;
+      try {
+        document = await openCurrentRevision();
+      } catch (repairError) {
+        if ((options.repair ?? "safe") !== "safe" || !isRepairableBootstrapError(repairError)) {
+          throw repairError;
         }
+        // A broken rewrite can renumber objects without preserving their data.
+        // Recover a complete earlier revision with its own xref and source
+        // boundary instead of mixing it with the unusable newer definitions.
+        for (const revisionEnd of await previousPdfRevisionEnds(reader, limits, options.signal)) {
+          const revisionReader: PdfRandomAccessReader = {
+            byteLength: revisionEnd,
+            label: reader.label,
+            read(offset, length, signal) {
+              if (offset < 0 || length < 0 || offset > revisionEnd - length) {
+                throw new PdfError("source-read", "A read exceeds the recovered PDF revision.");
+              }
+              return reader.read(offset, length, signal);
+            },
+            close: () => reader.close()
+          };
+          const revisionDiagnostics: PdfDiagnostic[] = [];
+          try {
+            xref = await readNativeXref(revisionReader, limits, "safe", revisionDiagnostics, options.signal, false);
+            document = await finishOpen(revisionReader, true);
+          } catch (previousError) {
+            if (!isRepairableBootstrapError(previousError)) throw previousError;
+            continue;
+          }
+          diagnostics.push(...revisionDiagnostics, {
+            code: "document.previous-revision",
+            severity: "warning",
+            message: "The current PDF structure could not be recovered; opened an earlier complete revision. Newer updates may be absent.",
+            details: {
+              revisionEnd,
+              ignoredBytes: reader.byteLength - revisionEnd,
+              pageCount: document.info.pageCount,
+              currentError: repairError.message
+            }
+          });
+          break;
+        }
+        if (document === null) throw repairError;
       }
       for (const diagnostic of diagnostics) options.onDiagnostic?.(copyPdfDiagnostic(diagnostic));
       opened = true;
@@ -1327,13 +1376,39 @@ async function readPdfHeader(reader: PdfRandomAccessReader, signal?: AbortSignal
   return version;
 }
 
-function isRepairableBootstrapError(error: unknown): boolean {
+function isRepairableBootstrapError(error: unknown): error is PdfError {
   return error instanceof PdfError && (
     error.code === "invalid-xref" ||
     error.code === "invalid-object" ||
     error.code === "invalid-page-tree" ||
     error.code === "unexpected-eof"
   );
+}
+
+async function previousPdfRevisionEnds(
+  reader: PdfRandomAccessReader,
+  limits: Readonly<PdfResourceLimits>,
+  signal?: AbortSignal
+): Promise<readonly number[]> {
+  // Match the bounded startxref tail search, and cap validated candidates by
+  // the existing revision limit. Every candidate must pass xref/page parsing.
+  const length = Math.min(reader.byteLength, limits.maxRepairScanBytes, 1024 * 1024);
+  const offset = reader.byteLength - length;
+  throwIfAborted(signal);
+  const text = binaryString(await reader.read(offset, length, signal));
+  throwIfAborted(signal);
+  const finalSyntaxEnd = offset + text.replace(/[\x00\x09\x0a\x0c\x0d\x20]+$/, "").length;
+  const markers = /(?:^|[\r\n])[\x00\x09\x0c\x20]*startxref[\x00\x09\x0a\x0c\x0d\x20]+(\d+)[\x00\x09\x0a\x0c\x0d\x20]*%%EOF(?:\r\n|\r|\n)?/g;
+  const ends: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = markers.exec(text))) {
+    const end = offset + markers.lastIndex;
+    const startXref = Number(match[1]);
+    if (end >= finalSyntaxEnd || !Number.isSafeInteger(startXref) || startXref >= end) continue;
+    if (match.index === 0 && offset > 0 && text[0] !== "\r" && text[0] !== "\n") continue;
+    ends.push(end);
+  }
+  return ends.reverse().slice(0, limits.maxIncrementalRevisions);
 }
 
 function isDuplicateDictionaryKeyError(error: unknown): error is PdfError {

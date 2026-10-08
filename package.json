@@ -7,10 +7,14 @@
   "main": "./dist/lib/index.js",
   "module": "./dist/lib/index.js",
   "types": "./dist/types/index.d.ts",
+  "bin": {
+    "pdf-to-hep": "./bin/pdf-to-hep.js"
+  },
   "sideEffects": [
     "**/pdf-worker.js",
     "**/pdfWorkerEntry*.js",
     "**/lodWorkerEntry*.js",
+    "**/rasterPreparationWorker*.js",
     "**/roomDetectorWorker*.js",
     "**/*.css"
   ],
@@ -62,6 +66,8 @@
     }
   },
   "files": [
+    "bin",
+    "PDFtoHEP.js",
     "dist/lib",
     "dist/bundler",
     "dist/types",
@@ -94,7 +100,7 @@
     "generate-manifest": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-manifest.ts",
     "regenerate:heps": "node PDFtoHEP.js --force --keep-unchanged --output-dir=public/examples/heps public/examples/pdfs && npm run generate-manifest",
     "regenerate:heps:lod": "node PDFtoHEP.js --force --keep-unchanged --with-vector-lod --with-text-lod --output-dir=public/examples/heps-lod public/examples/pdfs && npm run generate-manifest",
-    "repack:heps:lod": "node scripts/repack-hep-lods.mjs --write public/examples/heps-lod && npm run generate-manifest",
+    "regenerate:heps:all": "node PDFtoHEP.js --force --keep-unchanged --output-dir=public/examples/heps public/examples/pdfs && node PDFtoHEP.js --force --keep-unchanged --with-vector-lod --with-text-lod --output-dir=public/examples/heps-lod public/examples/pdfs && npm run generate-manifest",
     "benchmark:native-vector-page": "node --max-old-space-size=12288 --expose-gc --experimental-strip-types scripts/benchmark-native-vector-page.mjs",
     "benchmark:production-parser": "node --max-old-space-size=12288 --expose-gc scripts/benchmark-production-parser.mjs",
     "score:rooms": "node scripts/score-rooms.mjs",
@@ -104,20 +110,16 @@
     "clean:lib": "node scripts/clean-lib-output.mjs"
   },
   "dependencies": {},
+  "optionalDependencies": {
+    "@napi-rs/canvas": "1.0.9"
+  },
   "devDependencies": {
-    "@napi-rs/canvas": "1.0.9",
     "@types/three": "0.186.0",
     "three": "0.186.1",
     "typescript": "7.0.2",
     "vite": "8.3.1"
   },
   "peerDependencies": {
-    "@napi-rs/canvas": ">=1.0.8",
     "three": ">=0.170.0"
-  },
-  "peerDependenciesMeta": {
-    "@napi-rs/canvas": {
-      "optional": true
-    }
   }
 }

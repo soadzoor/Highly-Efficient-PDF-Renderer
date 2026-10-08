@@ -545,6 +545,30 @@ function testLazyGlyphValidationAndLimits() {
   );
   const reservedCompoundFont = NativeSfntFont.parse(buildSfnt(reservedCompoundFlag));
   expectPdf(() => reservedCompoundFont.getGlyphOutline(3), "unsupported-font", /reserved component/i);
+  const recoveredCompoundFont = NativeSfntFont.parse(buildSfnt(reservedCompoundFlag), 0, undefined, "pdf-embedded");
+  assert.deepEqual(recoveredCompoundFont.diagnostics, [], "unused glyph normalization remains lazy");
+  assert.deepEqual(recoveredCompoundFont.getGlyphOutline(3), font.getGlyphOutline(3),
+    "ignoring obsolete overlap flags preserves exact geometry and component metrics");
+  assert.deepEqual(recoveredCompoundFont.diagnostics[0]?.details, {
+    reason: "compound-obsolete-overlap-flag", glyphId: 3, ignoredFlags: 0x0010, exact: true
+  });
+  assert(Object.isFrozen(recoveredCompoundFont.diagnostics));
+  assert(Object.isFrozen(recoveredCompoundFont.diagnostics[0]));
+  recoveredCompoundFont.getGlyphOutline(3);
+  recoveredCompoundFont.getGlyphOutline(7);
+  assert.equal(recoveredCompoundFont.diagnostics.length, 1, "cached and nested uses emit one warning per font");
+  for (const highFlag of [0x2000, 0x4000, 0x8000]) {
+    const highReserved = cloneTables(reservedCompoundFlag);
+    const view = new DataView(highReserved.get("glyf").buffer);
+    view.setUint16(fixture.glyphOffsets[3] + 10, view.getUint16(fixture.glyphOffsets[3] + 10, false) | highFlag, false);
+    const highReservedFont = NativeSfntFont.parse(buildSfnt(highReserved), 0, undefined, "pdf-embedded");
+    expectPdf(() => highReservedFont.getGlyphOutline(3), "unsupported-font", /reserved component/i);
+  }
+  const invalidRecoveredComponent = cloneTables(reservedCompoundFlag);
+  new DataView(invalidRecoveredComponent.get("glyf").buffer).setUint16(fixture.glyphOffsets[3] + 12, 99, false);
+  const invalidRecoveredFont = NativeSfntFont.parse(buildSfnt(invalidRecoveredComponent), 0, undefined, "pdf-embedded");
+  expectPdf(() => invalidRecoveredFont.getGlyphOutline(3), "unsupported-font", /Glyph ID 99/i);
+  assert.equal(invalidRecoveredFont.diagnostics.length, 0, "failed outlines never report successful normalization");
 
   const badPointMatch = cloneTables(fixture.tables);
   new DataView(badPointMatch.get("glyf").buffer).setUint16(fixture.glyphOffsets[4] + 22, 99, false);

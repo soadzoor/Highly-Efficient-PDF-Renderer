@@ -76,27 +76,78 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | --- | --- | --- |
 | `signal` | — | `AbortSignal` for source reading, parsing, LOD preparation, and object creation. |
 | `sourceKind` | `"auto"` | Infer the format from the source, or force `"pdf"` / `"hep"`. |
+| `sourceLabel` | Inferred name | Override the name shown for retained bytes or other sources. |
 | `pages` | All pages | One-based PDF pages: `"2"`, `"1-3, 5"`, `"5-"`, or `"-3"`. |
 | `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
+| `pageLoading` | `"all"` | Prepare all viewing pages before display, with one initial scene upload. `"auto"` opts into viewport-driven streaming for PDFs with more than 16 selected pages. Both preserve vector pages, use stored OCR as scan overviews and load scan pixels on zoom; only scans without usable OCR get small bitmap previews. `"eager"` also decodes complete original scan content before returning. |
+| `compressScans` | `false` | Eagerly decode all selected PDF pages and prepare bounded scan texture data between page compiles. Packed monochrome uses compact atlases; opaque color/grayscale scans can use lossy BC7/ASTC. `ocrTextOnly: true` disables this option with a warning. Otherwise it overrides `pageLoading: "auto"` with `"eager"` and a warning. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
+| `ocrTextOnly` | `false` | PDF viewing approximation: draw existing visible and invisible text at its stored positions and widths, substituting bundled fonts for glyphless or missing outlines. Skip image decoding and other graphics. Pages without drawable stored text remain blank and emit a diagnostic. |
 | `annotationAppearances` | `"render"` | Which annotation appearances become page content: `"render"` all, `"forms"` only form fields (Widgets), `"none"` none. Annotation metadata is extracted in every mode. See [hiding annotation appearances](#hiding-annotation-appearances). |
 | `onProgress` | — | Receive overall progress (`value` from 0 to 1) and the current `stage`. |
 | `imageCodecResolver` | Bundled codecs | Supply a raw-sample image decoder; works through PDF workers and PDF-to-HEP conversion. See [image compatibility](#rendering-compatibility-and-diagnostics). |
 | `iccTransformResolver` | — | Supply a batched ICC-to-sRGB conversion engine; works through PDF workers. |
 | `iccEngine` | `"qcms"` | `"qcms"` or `"lcms"`: try the preferred engine, then the other engine, then alternate colors. `"alternate"`: approximate directly. `"none"`: disable built-in conversion and approximation. |
-| `onDiagnostic` | — | Receive PDF diagnostics, including raster fallback, visual approximation, and ICC warnings with zero-based `pageIndex`. |
+| `onDiagnostic` | — | Receive PDF diagnostics, including conflicting loading options, raster fallback, visual approximation, and ICC warnings. `pageIndex`, when present, is zero-based. |
 
 Page selections are deduplicated and composed in document order. Invalid selections
 reject with `RangeError`. HEP files preserve their saved page selection, layout and
 annotation appearance mode; PDF parsing options do not reprocess a HEP scene. Search uses the text index and
 does not require `extractText: true`.
 
+Use `pdfObjectGenerator(source, { ocrTextOnly: true })` for a text-only PDF view.
+This uses the PDF's existing text; it does not perform OCR. Vector overviews stay
+sharp at every zoom and do not allocate scan textures. Reopen the retained
+`sourceBytes` with `ocrTextOnly: false` to restore the normal view.
+`loadCompleteScene()` and the demo's HEP export complete the original PDF content,
+reusing the active session and cached full pages when available.
+
 See [loading option types](../src/pdfObjectGenerator.ts) and
-[progress fields and stages](../src/loadProgress.ts). All selected pages are
-prepared before the promise resolves. Cancellation is cooperative; after a
+[progress fields and stages](../src/loadProgress.ts). By default, PDFs prepare all
+selected vector, OCR or scan overviews before resolving and upload their initial
+scene once. Scan pixels still load on camera demand. `pageLoading: "auto"` opens
+large PDFs from metadata and compiles visible pages as needed; its bounded page
+cache uses less CPU memory and installs new page geometry as pages arrive.
+OCR/scan swaps retain existing geometry and update scan textures plus paint
+visibility. Raster preparation uses a shared worker or cooperative fallback;
+recent GPU tiers are cached within the automatic memory allowance. Additional
+vector/clip detail installs once, while compositing pages may require full scene
+updates to preserve their effects.
+`pageLoading: "eager"` prepares the complete original PDF content before resolving.
+`compressScans: true` also prepares scan display data page by page during parsing,
+retaining a bounded share of the automatic raster target for every selected page.
+Compatible renderers reuse that data at upload; zoom can still prepare a higher
+resolution from original pixels. This mode retains every original page on the CPU,
+so it uses more CPU memory than streaming. Its temporary GPU encoder and retained
+display derivatives are bounded independently of the original document pixels.
+The native and Three demo viewers enable **GPU compress scans** by default;
+selecting it unchecks both **Use OCR text instead of scans** and **Stream pages**.
+Selecting either of those unchecks **GPU compress scans**; OCR-only viewing and
+streaming can be used together.
+The library option remains opt-in. Scan preparation targets image-only pages
+with a raster covering at least half the page. Pages containing visible vector
+artwork or text skip this preparation, but the option still loads every selected page
+upfront and overrides streaming for those PDFs. HEP loading is unaffected.
+
+For PDF sources, conflicting viewing options emit a warning through both
+`onDiagnostic` and `console.warn`, once per conflict per load:
+
+| Code | Resolution |
+| --- | --- |
+| `options.compress-scans-ocr-conflict` | `ocrTextOnly: true` disables `compressScans`. The requested `pageLoading` mode is preserved. |
+| `options.compress-scans-streaming-conflict` | Effective `compressScans: true` replaces `pageLoading: "auto"` with `"eager"`, loading every selected page upfront. |
+
+If all three are requested, OCR-only viewing wins, `"auto"` remains available,
+and only the OCR conflict warning is emitted. `"all"` and `"eager"` are compatible
+with scan preparation. Returned `sourceOptions` records the resolved choices;
+the caller's options object is unchanged. HEP sources ignore these PDF-only
+options without conflict warnings. These loader warnings are separate from
+parser diagnostics and are not retained by `PdfSession.getDiagnostics()`.
+
+Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
 Large stroke and text LOD preparations use a module worker when available,
 leaving the browser's main thread available for interaction. Small preparations
@@ -238,8 +289,11 @@ incremental buffer updates are outside this API; build a new scene if needed.
 
 ## `HeprThreePdfObject`
 
-The object supports normal Three.js transforms. `sceneData` contains its parsed
-`VectorScene`; treat it as read-only. `sourceLabel`, `sourceKind`, and
+The object supports normal Three.js transforms. `sceneData` contains its current
+`VectorScene`; treat it as read-only and read it again after `pages-loaded` events.
+For demand-loaded PDFs this is the viewing window; `loadCompleteScene({ signal, onProgress })`
+reuses the active PDF session and cached full pages, then extracts the remaining
+complete content for analysis or export. `sourceLabel`, `sourceKind`, and
 `rendererType` describe the loaded source and backend.
 
 Transforms apply to the **whole loaded object**, including all pages, backgrounds
@@ -771,7 +825,8 @@ not antialiased framebuffer pixels or simplified LOD geometry.
 identify individual segments; gradient-stroke indices identify complete runs.
 Text indices identify glyph instances: a ligature is not necessarily one
 Unicode character. Raster references identify whole layers, not shapes inside
-their pixels. Invisible OCR text has no pickable render instance.
+their pixels. Invisible OCR text in the original scan view has no pickable render
+instance; visible OCR overviews expose ordinary vector text primitives.
 
 `getPrimitive(ref)` returns `kind`, `index`, `ref`, `bounds`, `pageIndex` (or
 `null` when ambiguous), original `color`/`opacity`, `segmentCount`, and
@@ -1020,10 +1075,40 @@ or `@soadzoor/hepr` in Node.
 | PDF source (`PdfObjectSource`) | `BuildHepFromPdfOptions`: shared encoding options, `password`, `pages`, `maxPagesPerRow`, `segmentMerge`, `invisibleCull`, `iccTransformResolver`, `iccEngine`, and `onDiagnostic`. |
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
-Shared encoding options are `sourceLabel`, `encodeRasterImages` (default `true`),
-`compression` (`"deflate"` by default, or `"store"`), `onProgress`, and `signal`.
+PDF-to-HEP conversion compiles the complete original content. Viewing options
+`compressScans`, `ocrTextOnly`, and `pageLoading` are not `buildHep` options.
+Prepared GPU display data is not saved in HEP, including when exporting an
+already-prepared scene; viewers rebuild it as needed from canonical pixels.
+
+Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
+`compression` (`"deflate"` by default, or `"store"`), `onProgress`, `onWarning`, and `signal`.
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
+
+Monochrome layers save full-resolution pixels and their two-color RGBA palette
+losslessly, including when `encodeRasterImages` is false. They bypass PNG/WebP
+encoding and reload as packed one-bit rows without expanding RGBA.
+They use an 8-by-8 bit transpose and run encoding before DEFLATE for fast reload,
+falling back to plain packed bytes if runs grow. Original JBIG2 streams are not
+retained for export. The native and Three demo Download HEP dialogs offer only
+applicable vector/text LOD options and download one file. Demand-loaded
+viewers reuse their active PDF session, full vector overviews and cached scan
+detail; only missing full pages compile. Raster/OCR previews are replaced by
+complete content. Text-only views without an active session extract the original
+PDF once. Full extraction leaves the viewing window
+unchanged, and does not add a permanent second document to the viewing cache.
+These exports use scene v10 (plain packed) or v12 (binary runs); other scenes
+still use v9. The current loader accepts v9–v12, including older JBIG2 HEPs,
+which use the fast packed encoding when re-exported.
+
+PDF-source builds measure the original PDF automatically. Scenes loaded through
+HEPR carry that size, and HEP exports record it for later re-export. For a custom
+scene or an older HEP, supply `sourcePdfByteLength` (a positive safe integer) to
+enable the same size comparison. If the complete archive is at least as large
+as the PDF, the writer warns through `console.warn` and `onWarning(message)`;
+the download still succeeds and keeps all document content and requested LODs.
+The demo viewers display the warning after download. Scenes without a known PDF
+size skip the comparison.
 
 A HEP built from a password-protected PDF stores the decrypted content and has
 no password of its own. Pass an already-loaded `pdf.sceneData` to avoid parsing again. Export preserves
@@ -1053,6 +1138,37 @@ assets ship with HEPR and load relative to the deployed package, including in
 parser workers; no third-party server or CDN is contacted to load a decoder.
 The published package and bundler entry include those assets automatically.
 
+Binary DeviceGray images of at least 256 pixels, including JBIG2 and fax images,
+keep packed one-bit pixels through native compilation and worker transfer.
+At original resolution, native WebGL and WebGPU use eight pixels per R8 base
+texel with separate four-bit grayscale coverage mipmaps for filtered minification.
+Two coverage values share each R8 atlas texel; shared shaders unpack them and
+apply bilinear/trilinear filtering without blending packed bytes. Typical square
+images use about 0.29 bytes per source pixel including mipmaps, versus 5.33 for
+RGBA8. Full-resolution binary pixels remain exact. Mip coverage uses 16 shades,
+with at most 8/255 error relative to the previous R8 mip values; later levels
+average unquantized values so this error does not accumulate through the chain.
+Reduced display tiers generate an R8 base directly from packed pixels and use
+four-bit mips below it, without RGBA expansion or higher-resolution mip intermediates. Exact two-color
+images loaded from existing HEPs can use the same GPU path. Both Three material
+backends use the same representations. Preparation workers transfer the packed
+atlases, and automatic memory planning includes their row/atlas padding.
+Canvas 2D and exports retain RGBA compatibility.
+
+When smaller, a shared compact atlas replaces the base and coverage textures:
+32x32 blocks use uniform-value markers or share byte-identical payloads across
+levels. Supported JBIG2 text regions also retain actual decoded symbol bitmaps
+and placements, including arithmetic refinements. The renderer compares block
+sharing with symbol sharing and chooses the smaller result, requiring at least
+5% savings over ordinary packed storage. Both native and Three backends use the
+same layout and filtering. Original pixels and the existing four-bit mip values
+are unchanged. GPU residency charges the actual atlas size; subsequent budget
+decisions reuse those measured costs without scanning pixels during rendering.
+Unmeasured images retain conservative estimates. Unsupported JBIG2 composition
+uses the metered PDFium bitmap decoder, and existing HEPs can still use block
+sharing without symbol metadata. See [monochrome GPU storage](monochrome-gpu-storage.md)
+for the format, limits and manual verification steps.
+
 The bundled JPEG 2000 decoder emits 8-bit samples and requires an explicit PDF color space;
 embedded straight alpha (`SMaskInData=1`) is supported. Explicit 16-bit JPX
 samples, codec-defined color spaces, and premultiplied alpha (`SMaskInData=2`)
@@ -1079,8 +1195,95 @@ needed for features such as room detection. Their extracted text index is retain
 separately for search and selection; no text is painted twice. HEP stores the image,
 text, and retained replay resources, with no source PDF needed when reopening it.
 
+Raster texture resolution follows projected screen size, aggregate scene demand
+and `navigator.deviceMemory`, when available. Images initially allocate preview
+textures with a longest edge of at most 128 pixels. Visible images refine one per
+frame as zoom requires more detail, with hysteresis between resolution tiers;
+offscreen images return to preview size. Three also uses page projections and
+visibility to select its tiers. This browser hint estimates rounded
+system RAM, not total or available VRAM. The resident raster target is 1/32 of
+reported RAM, bounded to 16–256 MiB; unavailable or invalid hints use a conservative
+64 MiB target. No memory information needs to be provided by the user. Estimates
+include mipmaps and overlapping tile gutters, and replacement preparation allows
+one extra resident target for old and new textures. Native raster batches are
+also charged to this target. These are heuristics rather than hardware allocation
+guarantees; vectors, text, compositor surfaces and other applications use memory too.
+
+Screen-sized images that fit retain their RGBA representation or exact packed
+binary representation when original dimensions are needed.
+Under memory pressure, native and Three WebGL2/WebGPU first try BC7 or ASTC 4x4 GPU
+compression for eligible opaque images, then area-filter ordinary rasters to
+smaller textures if aggregate demand still exceeds the target. Both formats
+store 16 bytes per 4x4 block, about one quarter of RGBA8 storage for large images.
+The device's extensions or negotiated features determine which format is usable;
+no GPU name or memory information needs to be provided by the user.
+
+Eligibility is conservative: packed binary images, transparency, small or thin
+images, and sampled sharp edges or text-like detail avoid block compression.
+`compressScans` permits sharp opaque scanned content to
+use lossy blocks and emits a fidelity diagnostic. Packed monochrome stays on its
+compact/packed path. Parse-time derivatives set a bounded minimum display tier
+when their texture format is supported, so all scan pages can remain resident
+together without regenerating their display data at the initial upload.
+Pixel assessment uses the image contents rather than assuming a PDF codec is
+photographic. This heuristic is not a guarantee that every detail is detected.
+Packed binary display tiers also participate in the automatic resolution budget.
+Original scene pixels and export data are retained regardless of display
+compression or resolution. Refinement allocation failures retain the previous
+drawable tier and emit a diagnostic.
+
+The bundled MIT encoder kernels run on the renderer's existing GPU context or
+device, with no added runtime dependency. A bounded reusable encoding workspace
+is charged to the raster target; compressed blocks are uploaded without a
+JavaScript readback. All mip levels and block padding are included in the
+estimates, and texture coordinates retain the original image placement. Encoder
+failures are diagnosed and replan budgeted RGBA textures so the document can
+still open. Console warnings distinguish compression and automatic resolution
+reduction from device texture-limit reductions.
+
+Three uses its host renderer's public `ExternalTexture` bridge for compression,
+with one encoder/workspace shared by independent page materials on that host.
+Older Three versions without that bridge keep packed/R8 textures and automatic
+resolution sizing. Independent page views share one document raster budget.
+Parse-time reduced codec decoding and larger ASTC footprints (including 12x12) remain
+separate stages; this implementation selects only the audited BC7 and ASTC 4x4
+encoders.
+
+Default PDF loading prepares and retains every overview before display, without
+per-page scene rebuilds or waits for a frame between pages. Opt-in
+`pageLoading: "auto"` uses metadata-only placeholders for large PDFs and a bounded
+overview cache. The native and Three demos expose this choice through **Stream
+pages**, unchecked by default; changing it reloads the retained PDF and keeps the
+camera and layout. Vector pages retain their original
+geometry at every zoom. Image-dominated pages with usable invisible OCR use
+visible vector OCR for the overview, without decoding scan pixels. Only scans
+without usable OCR get bitmap previews bounded to 96 pixels. Unsupported drawing
+features can still use the diagnosed bounded raster compatibility fallback.
+Scans load original content when a page exceeds 256 screen pixels and return to
+the overview below 224 pixels; a bounded cache holds at most 12 detailed pages.
+Both loading modes use the same scan policy. Camera projections include independent
+page transforms and hidden pages. Zooming out selects the cached overview again;
+cached detail remains available for later zooms without affecting the displayed tier.
+`change` events with `reason: "pages-loaded"` tell hosts to refresh search,
+annotation and selection UI and request a frame. `"raster-ready"` requests another
+frame for texture refinement or an asynchronously prepared encoder.
+Pending overviews show sharp animated page skeletons in both native and Three
+backends. These are page-background shapes, so picking, search and exports do
+not include their lines. `"page-loading-animation"` change events request another
+host frame while a pending page is visible. Hosts can also read
+`object.needsLoadingAnimation`; offscreen/hidden pages and reduced-motion
+preferences stop these frame requests. The skeleton disappears as soon as the
+page overview is installed, including when the actual page is blank.
+`sceneData` represents the current viewing window when `isPageDemandLoaded` is
+true. Search requests remaining previews in the background. For complete geometry,
+use `await object.loadCompleteScene({ signal, onProgress })`, or `pageLoading: "eager"` at load.
+For complete HEP export, pass that returned scene to `buildHep`; the Three demo
+does this once and reuses the complete scene. Cached complete
+pages skip parsing; missing full pages still need compilation. Disposing the object closes
+its worker and releases page caches.
+
 Images wider or taller than the GPU's texture limit are drawn as several tiles
-at full resolution. Native WebGPU requests the adapter's full limit, often 16,384
+when the automatic scene budget permits. Native WebGPU requests the adapter's full limit, often 16,384
 texels instead of WebGPU's default 8,192. In three.js the host renderer's limit
 applies; `WebGPURenderer` uses 8,192 unless it is created with
 `requiredLimits: { maxTextureDimension2D }`. An image with more pixels than the

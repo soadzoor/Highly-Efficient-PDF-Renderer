@@ -18,6 +18,7 @@ import type {
   NativeIccTransformResult
 } from "./nativeIcc";
 import { PdfError, type PdfSource } from "./nativeTypes";
+import { prepareMonochromeSceneTransfer } from "../monochromeRaster";
 import {
   createRemoteRangePdfSource,
   type PdfMessageEndpoint
@@ -229,10 +230,10 @@ export function attachPdfWorkerRuntime(
         })
       };
       if (request.operation === "compile-vector-page") {
-        const scene = await activeSession.compileVectorPage(
+        const scene = prepareMonochromeSceneTransfer(await activeSession.compileVectorPage(
           request.sourcePageIndex,
           compileOptions
-        );
+        ));
         const response = {
           type: "hepr-pdf-result" as const,
           protocolVersion: PDF_WORKER_PROTOCOL_VERSION,

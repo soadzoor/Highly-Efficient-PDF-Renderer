@@ -1,4 +1,5 @@
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
+import { detectMonochromeRaster } from "./monochromeRaster";
 
 export interface RasterAtlasBatch {
   first: number;
@@ -69,10 +70,11 @@ export function buildRasterAtlasBatches(
 }
 
 function eligible(source: RasterLayer | undefined, size: number): source is RasterLayer {
-  return !!source && Number.isInteger(source.width) && Number.isInteger(source.height) &&
+  return !!source && !source.monochrome && Number.isInteger(source.width) && Number.isInteger(source.height) &&
     source.width > 0 && source.height > 0 && source.width <= MAX_IMAGE_SIZE && source.height <= MAX_IMAGE_SIZE &&
     source.height <= size && mipChainWidth(source.width, source.height) <= size &&
     source.data instanceof Uint8Array && source.data.length >= source.width * source.height * 4 &&
+    !detectMonochromeRaster(source.data, source.width, source.height) &&
     source.matrix instanceof Float32Array && source.matrix.length >= 6 && source.matrix.subarray(0, 6).every(Number.isFinite) &&
     Number.isFinite(source.opacity ?? 1) && (source.opacity ?? 1) >= 0 && (source.opacity ?? 1) <= 1;
 }

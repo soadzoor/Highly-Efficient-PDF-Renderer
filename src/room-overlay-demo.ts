@@ -606,6 +606,14 @@ async function loadSceneSource(file: File, sourceUrl?: string): Promise<boolean>
     clearCurrentPdfObject();
     currentPdfCoordinateTransform = coordinateTransform;
     currentPdfObject = pdfObject;
+    pdfObject.addEventListener("change", event => {
+      if (currentPdfObject !== pdfObject) return;
+      if (event.reason === "pages-loaded") {
+        drawingSelection.sceneChanged(); annotationOverlay.sceneChanged();
+        annotationControls.sceneChanged();
+      }
+      requestRender();
+    });
     currentPdfSourceUrl = sourceUrl;
     pendingObject = null;
     currentGeneratedTsv = null;
@@ -694,7 +702,9 @@ async function detectRoomsForCurrentPdf(): Promise<void> {
 
     // Deterministic detection on the extracted stroke segments; seeds come from
     // scene.textContent (extracted at load time via extractText: true).
-    const result = await detectRooms(pdfObject.sceneData, {
+    const detectionScene = pdfObject.isPageDemandLoaded
+      ? await pdfObject.loadCompleteScene({ pages: "1", signal: controller.signal }) : pdfObject.sceneData;
+    const result = await detectRooms(detectionScene, {
       pageIndexes: [0],
       signal: controller.signal
     });

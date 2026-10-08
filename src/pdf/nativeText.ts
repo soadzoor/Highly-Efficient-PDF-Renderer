@@ -8,6 +8,7 @@ import {
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import type { NativeMappedCharacter, NativePdfFont } from "./nativeFont";
 import type { NativePdfPreparedType3Font } from "./nativeType3";
+import { decodePdfDocEncoding } from "./nativePdfDocEncoding";
 
 export interface NativeTextFontResource {
   readonly font: NativePdfFont;
@@ -46,6 +47,8 @@ export interface NativeTextCompilation {
   readonly glyphWidthEms?: Float32Array;
   /** Glyph-local marker for a PDF.js-compatible forward TJ word gap. */
   readonly glyphGapBefore?: Uint8Array;
+  /** Page-space pen ends for extracted ActualText spanning several source glyphs. */
+  readonly actualTextEndPositions?: ReadonlyMap<number, readonly [number, number]>;
   readonly runs: readonly NativeTextDrawRun[];
   readonly diagnostics: readonly PdfDiagnostic[];
 }
@@ -65,7 +68,7 @@ export interface NativeTextCompilerOptions {
   readonly maxTransforms?: number;
   /** Maximum cumulative string/number entries consumed from TJ arrays. */
   readonly maxTextArrayItems?: number;
-  /** Maximum q/Q nesting handled by this standalone interpreter. */
+  /** Maximum q/Q or marked-text nesting handled by this standalone interpreter. */
   readonly maxGraphicsStateDepth?: number;
   readonly signal?: AbortSignal;
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
@@ -88,6 +91,13 @@ interface TextState {
 interface GraphicsSnapshot {
   readonly ctm: Matrix;
   readonly textState: TextState;
+}
+
+interface ActualTextScope {
+  readonly text: string;
+  readonly firstGlyph: number;
+  separator: " " | "\n" | null;
+  endPosition: readonly [number, number] | null;
 }
 
 type Matrix = [number, number, number, number, number, number];
@@ -157,6 +167,9 @@ export class NativeTextCompiler {
   private outputEnabled = true;
   private processedGlyphCount = 0;
   private processedTextArrayItemCount = 0;
+  private readonly markedTextScopes: Array<ActualTextScope | null> = [];
+  private actualTextScope: ActualTextScope | null = null;
+  private readonly actualTextEndPositions = new Map<number, readonly [number, number]>();
 
   constructor(options: NativeTextCompilerOptions) {
     this.fonts = options.fonts;
@@ -311,6 +324,56 @@ export class NativeTextCompiler {
     this.outputEnabled = enabled;
   }
 
+  /** ActualText replaces extraction semantics; glyph selection and painting stay intact. */
+  beginMarkedText(actualText: Uint8Array | null = null): void {
+    this.checkCancellation();
+    if (this.markedTextScopes.length >= this.maxGraphicsStateDepth) {
+      throw new PdfError("resource-limit", "PDF marked-text nesting exceeds its configured limit.", {
+        details: { maxMarkedContentDepth: this.maxGraphicsStateDepth }
+      });
+    }
+    // The outer replacement covers the whole sequence, including nested spans.
+    let scope: ActualTextScope | null = null;
+    if (actualText !== null && this.actualTextScope === null) {
+      if (!(actualText instanceof Uint8Array)) throw invalidText("ActualText must be a PDF byte string.");
+      const decoded = decodeActualText(actualText);
+      const text = decoded.text;
+      if (decoded.repaired) {
+        const diagnostic: PdfDiagnostic = {
+          code: "text.invalid-actual-text", severity: "warning",
+          message: "Malformed ActualText was decoded with replacement characters; text extraction may be approximate."
+        };
+        this.diagnostics.push(diagnostic);
+        this.onDiagnostic?.(diagnostic);
+      }
+      this.ensureTextCapacity(text.length);
+      scope = { text, firstGlyph: this.glyphIds.length, separator: this.pendingSeparator, endPosition: null };
+      this.actualTextScope = scope;
+    }
+    this.markedTextScopes.push(scope);
+  }
+
+  endMarkedText(): void {
+    this.checkCancellation();
+    const scope = this.markedTextScopes.pop();
+    if (scope === undefined) throw invalidText("EMC has no matching marked-text scope.");
+    if (scope === null) return;
+    this.actualTextScope = null;
+    this.pendingSeparator = scope.separator;
+    if (scope.text.length === 0 || scope.firstGlyph === this.glyphIds.length) return;
+    this.flushPendingSeparator(scope.text);
+    this.ensureTextCapacity(scope.text.length);
+    this.textParts.push(scope.text);
+    this.textCodeUnits += scope.text.length;
+    if (scope.endPosition) this.actualTextEndPositions.set(scope.firstGlyph, scope.endPosition);
+    // As with a ligature, replacement characters share their source glyph's
+    // selection geometry. Do not invent glyphs from semantic text.
+    for (let index = 0; index < scope.text.length; index++) {
+      if ((index & 0x3fff) === 0) this.checkCancellation();
+      this.charGlyphIndices.push(scope.firstGlyph);
+    }
+  }
+
   moveText(tx: number, ty: number, setLeading = false): void {
     this.requireTextObject(setLeading ? "TD" : "Td");
     this.checkCancellation();
@@ -409,6 +472,7 @@ export class NativeTextCompiler {
       throw invalidText("Text-index separators must be a space or line break.");
     }
     if (this.textCodeUnits === 0) return;
+    if (this.actualTextScope && this.glyphIds.length > this.actualTextScope.firstGlyph) return;
     // Keep separators pending so leading/trailing separators are never
     // materialized. A line break dominates repeated spacing hints.
     if (separator === "\n" || this.pendingSeparator === null) this.pendingSeparator = separator;
@@ -418,6 +482,9 @@ export class NativeTextCompiler {
   applyOperator(operator: string, operands: readonly unknown[]): void {
     this.checkCancellation();
     switch (operator) {
+      case "BMC": this.requireOperandCount(operator, operands, 1); this.beginMarkedText(); return;
+      case "BDC": this.requireOperandCount(operator, operands, 2); this.beginMarkedText(operands[1] as Uint8Array | null); return;
+      case "EMC": this.requireOperandCount(operator, operands, 0); this.endMarkedText(); return;
       case "q": this.requireOperandCount(operator, operands, 0); this.saveGraphicsState(); return;
       case "Q": this.requireOperandCount(operator, operands, 0); this.restoreGraphicsState(); return;
       case "cm": this.requireOperandCount(operator, operands, 6); this.concatTransform(numberMatrix(operands)); return;
@@ -474,6 +541,7 @@ export class NativeTextCompiler {
   }
 
   build(): NativeTextCompilation {
+    if (this.markedTextScopes.length > 0) throw invalidText("PDF text ends inside a marked-text scope.");
     this.checkCancellation();
     if (this.inTextObject) throw invalidText("The PDF content ends inside a BT/ET text object.");
     // Like the content compiler, let unterminated saves expire at the end of
@@ -498,6 +566,7 @@ export class NativeTextCompiler {
       glyphAdvanceEms: Float32Array.from(this.glyphAdvanceEms),
       glyphWidthEms: Float32Array.from(this.glyphWidthEms),
       glyphGapBefore: Uint8Array.from(this.glyphGapBefore),
+      ...(this.actualTextEndPositions.size > 0 ? { actualTextEndPositions: new Map(this.actualTextEndPositions) } : {}),
       runs: Object.freeze(this.runs.map((run) => Object.freeze({ ...run }))),
       diagnostics: Object.freeze(this.diagnostics.map((diagnostic) => Object.freeze({ ...diagnostic })))
     });
@@ -691,16 +760,20 @@ export class NativeTextCompiler {
       if (font.subtype === "Type3") flags |= HEPR_GLYPH_FLAG.Type3;
       this.flags.push(flags);
 
-      const unicode = mapped.unicode ?? "\ufffd";
-      this.flushPendingSeparator(unicode);
-      this.ensureTextCapacity(unicode.length);
-      this.textParts.push(unicode);
-      this.textCodeUnits += unicode.length;
-      for (let index = 0; index < unicode.length; index += 1) {
-        if ((index & 0x3fff) === 0) this.checkCancellation();
-        this.charGlyphIndices.push(glyphIndex);
+      if (this.actualTextScope === null) {
+        const unicode = mapped.unicode ?? "\ufffd";
+        this.flushPendingSeparator(unicode);
+        this.ensureTextCapacity(unicode.length);
+        this.textParts.push(unicode);
+        this.textCodeUnits += unicode.length;
+        for (let index = 0; index < unicode.length; index += 1) {
+          if ((index & 0x3fff) === 0) this.checkCancellation();
+          this.charGlyphIndices.push(glyphIndex);
+        }
+        if (mapped.unicode === null) this.reportMissingUnicode(resource, mapped);
+      } else if (glyphIndex === this.actualTextScope.firstGlyph) {
+        this.actualTextScope.separator = this.pendingSeparator;
       }
-      if (mapped.unicode === null) this.reportMissingUnicode(resource, mapped);
       const advanceUnits = widthEm * font.unitsPerEm;
       this.previousPenEndX = glyphTransform[4] +
         (font.writingMode === 1 ? glyphTransform[2] : glyphTransform[0]) * advanceUnits;
@@ -708,6 +781,9 @@ export class NativeTextCompiler {
         (font.writingMode === 1 ? glyphTransform[3] : glyphTransform[1]) * advanceUnits;
       this.hasPreviousPenEnd = Number.isFinite(this.previousPenEndX) &&
         Number.isFinite(this.previousPenEndY);
+      if (this.actualTextScope && this.hasPreviousPenEnd) {
+        this.actualTextScope.endPosition = [this.previousPenEndX, this.previousPenEndY];
+      }
     }
     this.textMatrix = multiply(this.textMatrix, [1, 0, 0, 1, advanceX, advanceY]);
   }
@@ -846,6 +922,23 @@ export class NativeTextCompiler {
   ): void {
     this.requireOperandCount(operator, operands, 1);
     callback(requireNumber(operands[0], operator));
+  }
+}
+
+function decodeActualText(bytes: Uint8Array): { text: string; repaired: boolean } {
+  let encoding: string | null = null, offset = 0;
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    encoding = "utf-16be"; offset = 2;
+  } else if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+    encoding = "utf-16le"; offset = 2;
+  } else if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    encoding = "utf-8"; offset = 3;
+  }
+  if (encoding === null) return { text: decodePdfDocEncoding(bytes), repaired: false };
+  try {
+    return { text: new TextDecoder(encoding, { fatal: true, ignoreBOM: true }).decode(bytes.subarray(offset)), repaired: false };
+  } catch {
+    return { text: new TextDecoder(encoding, { ignoreBOM: true }).decode(bytes.subarray(offset)), repaired: true };
   }
 }
 

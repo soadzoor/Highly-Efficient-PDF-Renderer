@@ -236,6 +236,44 @@ try {
     canonical.forEach(texture => assert.equal(texture.destroyed, 1, "shared textures have a single owner"));
   }
 
+  // Progressive page completion must not send visible scans back through preview tiers.
+  for (const [backend, Renderer] of [["WebGL", WebGlFloorplanRenderer], ["WebGPU", WebGpuFloorplanRenderer]]) {
+    const canvas = { width: 1024, height: 1024, getContext: () => glMock() };
+    const renderer = backend === "WebGL" ? new Renderer(canvas)
+      : new Renderer(canvas, gpuMock(), { configure() {} }, "rgba8unorm");
+    renderer.requestFrame = () => {};
+    renderer.vectorLodMode = renderer.textLodMode = "off";
+    const scan = { width: 1024, height: 1024, pageIndex: 0,
+      matrix: Float32Array.of(1024, 0, 0, 1024, 0, 0),
+      monochrome: { data: new Uint8Array(128 * 1024).fill(0xaa), colors: Uint8Array.of(255,255,255,255,0,0,0,255) },
+      get data() { assert.fail("progressive updates must not expand packed scans"); } };
+    const scenes = layers => Object.assign(createEmptyVectorScene(), { rasterLayers: layers });
+    const resources = () => backend === "WebGL" ? renderer.rasterLayers : renderer.rasterLayerResources;
+    renderer.setScene(scenes([scan]));
+    assert.equal(resources()[0].rasterPlan.width, 128);
+    Object.assign(renderer, { zoom: 1, cameraCenterX: 512, cameraCenterY: 512 });
+    await refine(renderer);
+    renderer.zoom = .34; await refine(renderer);
+    assert.equal(resources()[0].rasterPlan.width, 1024, "small zoom-out stays within the previous tier's hysteresis");
+    const before = Object.defineProperties({}, Object.getOwnPropertyDescriptors(scan));
+    before.pageIndex = 1; before.matrix = Float32Array.of(1024,0,0,1024,20000,0);
+    for (let i = 0; i < 3; i++) {
+      if (i === 1) renderer.setScene(createEmptyVectorScene(), { preserveRasterResolution: true });
+      const wrapper = Object.defineProperties({}, Object.getOwnPropertyDescriptors(scan));
+      renderer.setScene(scenes([before, wrapper]), { preserveRasterResolution: true });
+      assert.equal(resources()[1].rasterPlan.width, 1024, `${backend}: a completed page keeps existing detail before another frame`);
+      assert.equal(resources()[0].rasterPlan.width, 128, "offscreen sources remain previews");
+      await refine(renderer);
+      assert.equal(resources()[1].rasterPlan.width, 1024, "refinement does not reverse a preserved tier");
+    }
+    renderer.zoom = .01;
+    for (let i = 0; i < 3; i++) await refine(renderer);
+    assert(resources()[1].rasterPlan.width <= 128, "real zoom-out still releases high detail");
+    renderer.setScene(scenes([scan]));
+    assert.equal(resources()[0].rasterPlan.width, 128, "a new document starts with previews");
+    renderer.dispose();
+  }
+
   // A growing visible selection replaces only its ID buffer and bind groups,
   // and must do so before encoding even the background's shared clip binding.
   const growthDevice = gpuMock();
@@ -333,4 +371,9 @@ function gpuMock() {
     createRenderPipeline: descriptor => ({ getBindGroupLayout: index => descriptor.layout.bindGroupLayouts[index] })
   };
   return device;
+}
+
+async function refine(renderer) {
+  renderer.updateRasterResolution();
+  while (renderer.rasterPreparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
 }

@@ -175,6 +175,15 @@ try {
   assert.deepEqual(interleaved.mock.paints.filter(p => ["rasterTextureBatch", "fill"].includes(p.label)).map(p => [p.label, p.count]),
     [["rasterTextureBatch", 3], ["fill", 1], ["rasterTextureBatch", 3]], "a vector paint flushes preceding images before drawing");
 
+  const packedScene = makeScene(7); packedScene.rasterLayers = packedScene.rasterLayers.map((_, i) => largeImage(i));
+  packedScene.rasterLayers[3].data.fill(128);
+  const packed = fixture(Renderer, packedScene, VectorOrderedBatches);
+  packed.renderer.drawSourceOrderedContent(100, 80, 0, 0, 1);
+  assert.deepEqual(packed.mock.paints.filter(p => ["rasterTextureBatch", "raster"].includes(p.label)).map(p => [p.label, p.count]),
+    [["rasterTextureBatch", 3], ["raster", 1], ["rasterTextureBatch", 3]],
+    "a packed monochrome image keeps its own sampler and flushes surrounding RGBA batches");
+  assert.equal(packed.mock.paints.find(p => p.label === "raster").uniforms.get("uRasterMonochrome"), 3);
+
   const paired = makeScene(7); paired.rasterLayers = paired.rasterLayers.map((_, i) => largeImage(i));
   paired.drawRuns[3].blendMode = "Multiply"; delete paired.paintGraph;
   const multiplyBoundary = fixture(Renderer, paired, VectorOrderedBatches);
@@ -431,7 +440,10 @@ function image(index, height = 2) {
     matrix: Float32Array.of(20, 0, 0, -height, index, 20), pageIndex: 0, paintOrder: index };
 }
 function largeImage(index) {
-  return { ...image(index, 1), width: 1025, data: new Uint8Array(1025 * 4).fill(128),
+  // Keep three colors so this fixture exercises ordinary RGBA texture batching.
+  const data = new Uint8Array(1025 * 4).fill(128);
+  data[0] = 127; data[4] = 126;
+  return { ...image(index, 1), width: 1025, data,
     matrix: Float32Array.of(1025, 0, 0, -1, index, 20) };
 }
 function group(children, alpha = 0.5) { return { kind: "group", isolated: true, knockout: false, alpha, blendMode: "Normal", children }; }

@@ -1,0 +1,307 @@
+import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
+import * as THREE from "three";
+import { TSL, WGSLNodeBuilder } from "three/webgpu";
+
+const hooks = registerHooks({ resolve(s,c,next) {
+  return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s,c);
+} });
+const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+const deadline = setTimeout(() => assert.fail("Three raster storage did not complete within 10 seconds."),10000);
+Object.defineProperty(globalThis, "navigator", { configurable: true, value: { deviceMemory: .5 } });
+try {
+  const { createThreeRasterTileTextures, threeRasterTextureInfo, registerThreeCompressedTexture } = await import("../src/threeRasterTextures.ts");
+  const { planRasterTiles } = await import("../src/rasterTiles.ts");
+  const { buildPackedMonochromeMipAtlas, monochromeCoverageTilePixels } = await import("../src/monochromeRaster.ts");
+  const { buildPackedCoverageMipAtlas } = await import("../src/packedMonochromeCoverage.ts");
+  const { estimateRasterSourcePlanBytes, automaticRasterMemoryBudget } = await import("../src/rasterMemoryBudget.ts");
+  const { createThreeWebGpuRasterMaterial } = await import("../src/threeWebGpuRasterMaterial.ts");
+  const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { ThreeRasterCompression } = await import("../src/threeRasterCompression.ts");
+  const { WebGpuRasterCompression } = await import("../src/webGpuRasterCompression.ts");
+  const { estimateCompressedRasterBytes } = await import("../src/rasterCompression.ts");
+  const { prepareRasterPixels } = await import("../src/rasterPreparation.ts");
+  const source = (width,height,pageIndex=0) => ({ width,height,pageIndex,
+    matrix: Float32Array.of(width,0,0,height,0,0), monochrome: {
+      data: new Uint8Array(Math.ceil(width/8)*height).fill(0xaa), colors: Uint8Array.of(255,240,220,255,10,20,30,128)
+    }, get data() { assert.fail("Three must not materialize packed source RGBA"); } });
+  const small = source(33,17), fullPlan = planRasterTiles(33,17,512), reducedPlan = planRasterTiles(16,8,512);
+  const [packed] = createThreeRasterTileTextures(small,fullPlan), packedInfo = threeRasterTextureInfo(packed);
+  assert.equal(packed.format,THREE.RedFormat); assert.equal(packed.image.width,5);
+  assert.equal(packedInfo.mode,1); assert.equal(packed.generateMipmaps,false);
+  assert.equal(packed.minFilter,THREE.NearestFilter);
+  assert.equal(packedInfo.coverage.format,THREE.RedFormat);
+  assert.deepEqual(packedInfo.coverage.image,buildPackedMonochromeMipAtlas(small.monochrome,33,17));
+  assert.equal(packedInfo.coverage.mipmaps.length,0,"packed coverage uses explicit shader LODs");
+  assert.equal(packedInfo.coverage.generateMipmaps,false);
+  assert.equal(packedInfo.estimatedBytes,estimateRasterSourcePlanBytes({ width: small.width, height: small.height, monochrome: small.monochrome, reducedMonochrome: true },fullPlan));
+  assert.equal(packedInfo.color1.w,128/255);
+  assert(Math.abs(packedInfo.color1.x-10/255*128/255)<1e-12,"palette colors are premultiplied");
+  const [coverage] = createThreeRasterTileTextures(small,reducedPlan), coverageInfo = threeRasterTextureInfo(coverage);
+  assert.equal(coverageInfo.mode,3); assert.equal(coverageInfo.coverage,coverage);
+  assert.equal(coverageInfo.estimatedBytes,coverage.image.data.length);
+  assert(coverage.image.data.length < 16*8, "uniform reduced coverage benefits from compact blocks");
+  assert.equal(coverage.generateMipmaps,false,"reduced bases keep exact R8 coverage without uncompressed mips");
+  for (const plan of [fullPlan,reducedPlan]) {
+    const preparation = await prepareRasterPixels(small,plan);
+    const preparedSource = Object.defineProperties({},Object.getOwnPropertyDescriptors(small));
+    preparedSource.gpuPreparation = preparation;
+    const [texture] = createThreeRasterTileTextures(preparedSource,plan), info = threeRasterTextureInfo(texture);
+    if (preparation.compactAtlases[0]) {
+      assert.equal(texture.image.data,preparation.compactAtlases[0].data,
+        "stored compact monochrome atlases upload directly without repeating preparation");
+    } else {
+      assert.equal(texture.image.data,preparation.monochromeTiles?.[0]?.data ?? preparation.pixels[0]);
+      assert.equal(info.coverage.image.data,preparation.coverageAtlases[0].data,
+        "stored monochrome coverage mip atlases retain their prepared buffers");
+    }
+    texture.dispose();
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position",new THREE.BufferAttribute(new Float32Array(12),3));
+  geometry.setAttribute("aCorner",new THREE.BufferAttribute(Float32Array.of(-1,-1,1,-1,-1,1,1,1),2));
+  geometry.setIndex([0,1,2,2,1,3]);
+  for (const colorCompositing of ["display","linear"]) {
+    const state = createThreeWebGpuRasterMaterial({ texture: coverage, viewport: new THREE.Vector2(800,600),
+      cameraCenter: new THREE.Vector2(), localToClip: new THREE.Matrix4(), colorCompositing,
+      matrixABCD: new THREE.Vector4(1,0,0,1),matrixEF: new THREE.Vector2() });
+    const builder = build(state.material,geometry), shader = builder.fragmentShader;
+    const bindings = builder.getBindings().flatMap(group => group.bindings);
+    const textureBindings = bindings.filter(binding => binding.isSampledTexture);
+    assert.equal(textureBindings.length,2,"preview tiers bind an R8 base and a packed coverage atlas");
+    assert.match(shader,/fn heprThreeRasterBit\s*\(/);
+    for (const match of shader.matchAll(/\b(nodeUniform\d+_sampler)\b/g))
+      assert(shader.includes(`var ${match[1]} : sampler;`), "every function sampler argument has a real binding");
+    assert.match(shader,/textureLoad\(image, vec2i\(p.x \/ 8, p.y\), 0\)/);
+    assert.match(shader,/heprPackedCoverage\(coverageImage, vec2i\(size\), uv, lod - 1.0\)/);
+    assert.match(shader,/fn heprCoverageTexel/);
+    assert.match(shader,/fn heprCoverageBilinear/);
+    assert(shader.indexOf("let dx = dpdx(uv)") < shader.indexOf("if (mode < 0.5)"));
+    assert.match(shader,/heprThreeOutputColor\(straightSrgb\) \* color.a/);
+    state.updateSource(packed,Float32Array.of(1,0,0,1,0,0),1);
+    textureBindings.forEach(binding=>binding.update());
+    assert.deepEqual(new Set(textureBindings.map(binding=>binding.texture)),new Set([packed,packedInfo.coverage]),
+      "promotion updates both existing bindings without recompiling or losing coverage mips");
+    state.updateSource(coverage,Float32Array.of(2,0,0,3,4,5),.5);
+    const next = build(state.material,geometry);
+    assert(next.getBindings().flatMap(group => group.bindings).some(binding => binding.textureNode?.value === coverage),
+      "a tier replacement updates real texture/sampler bindings");
+    state.material.dispose();
+  }
+  geometry.dispose();
+  let coverageDisposed = 0;
+  packedInfo.coverage.addEventListener("dispose",() => coverageDisposed++);
+  packed.dispose(); assert.equal(coverageDisposed,1); coverage.dispose();
+
+  const derivativePlan = planRasterTiles(65,17,32);
+  assert(derivativePlan.tiles.length > 1);
+  const encodedTiles = derivativePlan.tiles.map(tile => new Uint8Array(estimateCompressedRasterBytes(tile.width,tile.height,"bc7")));
+  const derivativeSource = { width:65,height:17,gpuCompression:{ format:"bc7",plan:derivativePlan,tiles:encodedTiles },
+    get data() { assert.fail("Matching compressed tiles must upload without rebuilding canonical RGBA tiles"); } };
+  let encodedUploads=0, encodedDisposals=0;
+  const encodedCompressor = { format:"bc7",upload(_data,width,height,format,encoded) {
+    assert.equal(format,"bc7"); assert.equal(encoded,encodedTiles[encodedUploads++]);
+    const texture = new THREE.Texture(); texture.addEventListener("dispose",()=>encodedDisposals++);
+    registerThreeCompressedTexture(texture,width,height,format,encoded.byteLength,[1,1]); return texture;
+  } };
+  const compressedTiles = createThreeRasterTileTextures(derivativeSource,derivativePlan,encodedCompressor,"bc7");
+  assert.equal(encodedUploads,derivativePlan.tiles.length);
+  assert.equal(compressedTiles.reduce((sum,texture)=>sum+threeRasterTextureInfo(texture).estimatedBytes,0),
+    encodedTiles.reduce((sum,tile)=>sum+tile.byteLength,0));
+  compressedTiles.forEach(texture=>texture.dispose()); assert.equal(encodedDisposals,encodedUploads);
+  let partialDisposed=0, partialUploads=0;
+  assert.throws(()=>createThreeRasterTileTextures(derivativeSource,derivativePlan,{ format:"bc7",upload() {
+    if (partialUploads++) throw Error("synthetic encoded tile upload failure");
+    const texture = new THREE.Texture(); texture.addEventListener("dispose",()=>partialDisposed++); return texture;
+  } },"bc7"),/synthetic encoded tile/);
+  assert.equal(partialDisposed,1,"a failed encoded tile upload releases every earlier tile handle");
+  const canonicalDerivative = Object.defineProperties({},Object.getOwnPropertyDescriptors(derivativeSource));
+  Object.defineProperty(canonicalDerivative,"data",{ value:new Uint8Array(65*17*4).fill(255),configurable:true });
+  for (const [plan,format] of [[derivativePlan,"astc-4x4"],[planRasterTiles(16,8,32),"bc7"]]) {
+    let ordinaryUploads=0;
+    const textures = createThreeRasterTileTextures(canonicalDerivative,plan,{ format,upload(data,width,height,_format,encoded) {
+      ordinaryUploads++; assert.equal(encoded,undefined,"different formats and plans cannot reuse stored blocks");
+      assert.equal(data.byteLength,width*height*4,"the encoder receives the requested RGBA display tiles"); return new THREE.Texture();
+    } },format);
+    assert.equal(ordinaryUploads,plan.tiles.length); textures.forEach(texture=>texture.dispose());
+  }
+
+  const image = source(2048,1024), scene = createEmptyVectorScene();
+  scene.rasterLayers = [image]; scene.pageRects = Float32Array.of(0,0,2048,1024);
+  const storedPreparation = await prepareRasterPixels(image,planRasterTiles(256,128,4096));
+  const preparedImage = Object.defineProperties({},Object.getOwnPropertyDescriptors(image));
+  preparedImage.gpuPreparation = storedPreparation;
+  const preparedScene = Object.assign(createEmptyVectorScene(),{ rasterLayers:[preparedImage] });
+  const preparedLayer = new ThreeMaterialRasterLayer(preparedScene,{ pageBackground:[1,1,1,1] });
+  assert.equal(preparedLayer.rasterEntries[0].image.plan.width,256,"material creation preserves the prepared monochrome display tier");
+  assert.equal(preparedLayer.rasterEntries[0].texture.image.data,storedPreparation.compactAtlases[0].data,
+    "material source classification preserves and consumes prepared compact pixels");
+  preparedLayer.dispose();
+  const stagedLayer = new ThreeMaterialRasterLayer(scene,{ pageBackground:[1,1,1,1] });
+  stagedLayer.setTextureResidency(true);
+  const preparedUpdate = await stagedLayer.prepareRasterLayerUpdatesAsync(new Map([[0,preparedImage]]));
+  preparedUpdate.commit(); preparedUpdate.dispose();
+  assert.equal(stagedLayer.rasterEntries[0].texture.image.data,storedPreparation.compactAtlases[0].data,
+    "asynchronous page updates skip repeating monochrome pixel and mip preparation");
+  stagedLayer.dispose();
+  const layer = new ThreeMaterialRasterLayer(scene,{ pageBackground: [1,1,1,1] });
+  const entry = layer.rasterEntries[0];
+  assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"initial previews compact averaged coverage");
+  layer.setTextureResidency(true);
+  const view = { cameraCenterX: 1024,cameraCenterY: 512,zoom: 1 }, viewport = { width: 2048,height: 1024 };
+  await frame(layer,view,viewport);
+  assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"full detail compacts exact binary pixels");
+  assert.match(entry.material.fragmentShader,/heprRasterBinaryLinear/);
+  assert.equal(entry.material.uniforms.uRasterMonoMips.value,threeRasterTextureInfo(entry.texture).coverage);
+  await frame(layer,{ ...view,zoom:.34 },viewport);
+  assert.equal(entry.image.plan.width,2048,"zoom hysteresis retains the previous sharp tier");
+  const incoming = createEmptyVectorScene();
+  const offscreen = source(2048,1024,1); offscreen.matrix[4] = 100000;
+  incoming.rasterLayers = [offscreen,Object.defineProperties({},Object.getOwnPropertyDescriptors(image))];
+  const replacement = new ThreeMaterialRasterLayer(incoming,{ pageBackground:[1,1,1,1],previousLayer:layer });
+  assert.equal(replacement.rasterEntries[1].image.plan.width,2048,"page completion preserves current detail despite shifted image indices");
+  assert.equal(replacement.rasterEntries[0].image.plan.width,128,"new offscreen images keep bounded previews");
+  replacement.setTextureResidency(true); await frame(replacement,{ ...view,zoom:.34 },viewport);
+  assert.equal(replacement.rasterEntries[1].image.plan.width,2048,"the next frame does not demote the inherited tier");
+  for (let i=0;i<3;i++) await frame(replacement,{ ...view,zoom:.01 },viewport);
+  assert(replacement.rasterEntries[1].image.plan.width <= 128,"preservation still allows zoom-out demotion");
+  replacement.dispose();
+  await frame(layer,{ ...view,zoom:.01 },viewport);
+  assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"zoom-out demotes the native Three material");
+  layer.setMemoryAllowance(65536); await frame(layer,view,viewport);
+  assert(layer.rasterImageBytes(entry) <= 65536,"replacement bytes honor the page's document allowance");
+  layer.dispose();
+
+  const pagesScene = createEmptyVectorScene();
+  pagesScene.rasterLayers = Array.from({ length:4 },(_,i) => source(4096,4096,i));
+  const pagesLayer = new ThreeMaterialRasterLayer(pagesScene,{ pageBackground:[1,1,1,1] });
+  const projection = new THREE.Matrix4().makeScale(2/4096,2/4096,1); projection.setPosition(-1,-1,0);
+  const allowances = pagesLayer.planPageMemory(Array(4).fill(projection.elements),{ width:4096,height:4096 });
+  assert(allowances.reduce((a,b)=>a+b,0) <= automaticRasterMemoryBudget().bytes,
+    "independent pages share one automatic document budget");
+  assert(allowances.every(bytes=>bytes>0)); pagesLayer.dispose();
+
+  const originalCreate = WebGpuRasterCompression.create;
+  let creates=0, disposed=0, destroyed=0, adapterEncodedUploads=0;
+  WebGpuRasterCompression.create = async () => { creates++; return { format:"bc7", available:true,workspaceBytes:4096,
+    setFailureListener() {}, releaseWorkspace() {}, dispose() { disposed++; },
+    createTexture(width,height) { return { texture: { destroy() { destroyed++; } },estimatedBytes:400,uvScale:[width/20,height/12] }; },
+    createTextureFromEncoded(width,height,bytes) {
+      adapterEncodedUploads++; assert.equal(bytes,encodedTiles[0]);
+      return { texture:{ destroy() { destroyed++; } },estimatedBytes:bytes.byteLength,uvScale:[1,1] };
+    } }; };
+  try {
+    const host = { isWebGPURenderer:true,backend:{ device:{} } }, a = new ThreeRasterCompression(()=>{}), b = new ThreeRasterCompression(()=>{});
+    a.setHost(host); b.setHost(host); await Promise.resolve();
+    assert.equal(creates,1,"page materials reuse one encoder/workspace on their host device");
+    const texture = a.upload(new Uint8Array(17*11*4),17,11,"bc7");
+    assert.equal(texture.isExternalTexture,true);
+    assert.deepEqual(threeRasterTextureInfo(texture).uvScale,[17/20,11/12]);
+    const encodedTexture = a.upload(new Uint8Array(0),derivativePlan.tiles[0].width,derivativePlan.tiles[0].height,"bc7",encodedTiles[0]);
+    assert.equal(adapterEncodedUploads,1,"the Three adapter uploads parser-prepared blocks on its host device");
+    assert.equal(threeRasterTextureInfo(encodedTexture).estimatedBytes,encodedTiles[0].byteLength);
+    encodedTexture.dispose(); assert.equal(destroyed,1);
+    a.dispose(); assert.equal(disposed,0,"a remaining page keeps the shared encoder alive");
+    texture.dispose(); texture.dispose(); assert.equal(destroyed,2,"the adapter owns each GPU handle exactly once");
+    b.dispose(); assert.equal(disposed,1);
+
+    let unavailable = false, failures = 0;
+    WebGpuRasterCompression.create = async () => ({ format:"bc7", get available() { return !unavailable; }, workspaceBytes:4096,
+      setFailureListener() {},releaseWorkspace() {},dispose() {},
+      createTexture(width,height) {
+        if (failures) { failures--; unavailable = true; return null; }
+        return { texture:{ destroy() {} },estimatedBytes:estimateCompressedRasterBytes(width,height,"bc7"),uvScale:[1,1] };
+      } });
+    const data = new Uint8Array(1024*1024*4);
+    for (let y=0;y<1024;y++) for (let x=0;x<1024;x++) {
+      const offset=(y*1024+x)*4;
+      data.set([x>>2,y>>2,(x+y)>>3,255],offset);
+    }
+    const photoScene = createEmptyVectorScene();
+    photoScene.rasterLayers = Array.from({ length:6 },(_,i)=>({ width:1024,height:1024,data,pageIndex:i,
+      matrix:Float32Array.of(1024,0,0,1024,0,0) }));
+    const webGpu = await import("../src/threeWebGpuBackend.ts");
+    const photos = new ThreeMaterialRasterLayer(photoScene,{ pageBackground:[1,1,1,1],materialBackend:"webgpu",webGpu });
+    photos.setHostRenderer(host); await Promise.resolve(); photos.setTextureResidency(true);
+    const view = { cameraCenterX:512,cameraCenterY:512,zoom:1 }, viewport = { width:1024,height:1024 };
+    for (let i=0;i<7;i++) await frame(photos,view,viewport);
+    assert(photos.rasterEntries.every(entry=>threeRasterTextureInfo(entry.texture).compressionFormat === "bc7"),
+      "the Three material planner compresses eligible photos before reducing their resolution");
+    assert(photos.rasterEntries.every(entry=>entry.image.plan.width === 1024));
+    assert(photos.rasterEntries.reduce((bytes,entry)=>bytes+photos.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes);
+    const rebuilt = new ThreeMaterialRasterLayer(photoScene,{ pageBackground:[1,1,1,1],materialBackend:"webgpu",webGpu,previousLayer:photos });
+    assert(rebuilt.rasterEntries.every(entry=>entry.image.plan.width === 1024 && threeRasterTextureInfo(entry.texture).compressionFormat === "bc7"),
+      "progressive replacement starts with sharp compressed tiers, rather than RGBA previews");
+    const stagedTextures = rebuilt.rasterEntries.map(entry=>entry.texture);
+    rebuilt.setTextureResidency(true); await frame(rebuilt,view,viewport);
+    assert.deepEqual(rebuilt.rasterEntries.map(entry=>entry.texture),stagedTextures,"activation retains newly staged external handles");
+    assert(rebuilt.rasterEntries.reduce((bytes,entry)=>bytes+rebuilt.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes);
+    rebuilt.dispose();
+    photos.setTextureResidency(false); photos.setTextureResidency(true);
+    assert(photos.rasterEntries.every(entry=>!threeRasterTextureInfo(entry.texture).compressionFormat),
+      "returning from native fallback recreates released external handles as drawable textures");
+    assert(photos.rasterEntries.reduce((bytes,entry)=>bytes+photos.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes,
+      "fallback reactivation fits uncompressed tiers before the host can upload them");
+    const beforeFailure = photos.rasterEntries[0].texture;
+    failures = 1;
+    const originalWarn = console.warn, warnings = [];
+    console.warn = (...args)=>warnings.push(args.join(" "));
+    try { await frame(photos,view,viewport); } finally { console.warn = originalWarn; }
+    assert.equal(photos.rasterEntries[0].texture,beforeFailure,"failed encoding retains a drawable previous tier");
+    assert(warnings.some(warning=>warning.includes("retaining the previous display resolution")));
+    for (let i=0;i<7;i++) await frame(photos,view,viewport);
+    assert(photos.rasterEntries.every(entry=>!threeRasterTextureInfo(entry.texture).compressionFormat));
+    assert(photos.rasterEntries.reduce((bytes,entry)=>bytes+photos.rasterImageBytes(entry),0) <= automaticRasterMemoryBudget().bytes,
+      "encoder failure replans uncompressed textures within the same budget");
+    photos.dispose();
+  } finally { WebGpuRasterCompression.create = originalCreate; }
+  for (const backend of ["webgl", "webgpu"]) {
+    const scene = Object.assign(createEmptyVectorScene(), { rasterLayers: [source(17, 17)] });
+    const layer = new ThreeMaterialRasterLayer(scene, { pageBackground: [1, 1, 1, 1] });
+    const initialized = new Set(), device = {};
+    let uploads = 0;
+    layer.setHostRenderer({ isWebGLRenderer: backend === "webgl", isWebGPURenderer: backend === "webgpu",
+      initialized: true, backend: { device }, initTexture(texture) {
+        if (!initialized.has(texture)) { initialized.add(texture); uploads++; }
+      } });
+    layer.setTextureResidency(true);
+    const original = layer.rasterEntries[0].texture, a = source(33, 17), b = source(35, 19);
+    const staged = await layer.prepareRasterLayerUpdatesAsync(new Map([[0, a]]));
+    assert.equal(uploads, 2, "packed pixels and coverage mips upload through the host before commit");
+    assert.equal(layer.rasterEntries[0].texture, original, "prewarming does not replace the displayed texture");
+    staged.commit(); staged.dispose();
+    const detailTexture = layer.rasterEntries[0].texture;
+    const second = await layer.prepareRasterLayerUpdatesAsync(new Map([[0, b]])); second.commit(); second.dispose();
+    const beforeWarm = uploads;
+    const warm = await layer.prepareRasterLayerUpdatesAsync(new Map([[0, a]])); warm.commit(); warm.dispose();
+    assert.equal(layer.rasterEntries[0].texture, detailTexture);
+    assert.equal(uploads, beforeWarm, "warm texture versions need no further host upload");
+    const failureSource = source(37, 21);
+    layer.setHostRenderer({ isWebGLRenderer: true, initTexture() { throw Error("synthetic host upload failure"); } });
+    await assert.rejects(layer.prepareRasterLayerUpdatesAsync(new Map([[0, failureSource]])), /synthetic host upload/);
+    assert.equal(layer.rasterEntries[0].texture, detailTexture);
+    assert.equal(layer.pendingRasterBytes, 0, "host upload failure releases the staged reservation");
+    layer.dispose();
+  }
+  console.log("Three raster storage: packed/R8 tiers, prepared compressed tile reuse, palette/mips, real WGSL bindings, zoom demotion, document allowances and shared external compression ownership passed.");
+} finally {
+  clearTimeout(deadline);
+  if (oldNavigator) Object.defineProperty(globalThis,"navigator",oldNavigator); else delete globalThis.navigator;
+  hooks.deregister();
+}
+
+function build(material,geometry) {
+  const renderer = { contextNode:TSL.context({}),library:{ fromMaterial:value=>value },getRenderTarget:()=>null,getMRT:()=>null,
+    backend:{ compatibilityMode:false,utils:{ getTextureSampleData:()=>({ primarySamples:1 }) },
+      capabilities:{ getUniformBufferLimit:()=>65536 } },hasFeature:()=>false,hasCompatibility:()=>false,
+    coordinateSystem:THREE.WebGPUCoordinateSystem,debug:{ diagnostics:{ keywords:false } } };
+  const builder = new WGSLNodeBuilder(new THREE.Mesh(geometry,material),renderer);
+  builder.scene = new THREE.Scene(); builder.camera = new THREE.PerspectiveCamera(); return builder.build();
+}
+
+async function frame(layer, view, viewport) {
+  layer.updateFrame(view, viewport);
+  while (layer.preparationRunning) await new Promise(resolve => setTimeout(resolve, 0));
+}

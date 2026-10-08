@@ -118,7 +118,7 @@ try {
     staged.commit(); staged.dispose();
     assert.equal(renderer.rasterStripResources.size, 0);
     assert(batches.every(batch => batch.texture.destroyed && batch.instanceBuffer.destroyed));
-    assert(previous.texture.destroyed && previous.uniformBuffer.destroyed);
+    assert(!previous.texture.destroyed && !previous.uniformBuffer.destroyed, "canonical replacements remain warm within the cache budget");
     assert.notEqual(renderer.rasterLayerResources[0], previous);
     draws = submit(renderer);
     assert.equal(draws.filter(draw => draw.pipeline === renderer.rasterPipeline).length, 10,

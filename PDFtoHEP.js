@@ -19,6 +19,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { format } from "node:util";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const scriptPath = fileURLToPath(import.meta.url);
@@ -76,6 +77,11 @@ number of pending PDFs. Each freed slot immediately takes the next PDF.
 Outputs use the client export convention <name>-parsed-data.hep and are written
 beside their PDFs, unless --output-dir is supplied. Output name collisions are
 rejected.
+HEP files larger than their source PDFs are written with a warning; selected
+LOD caches are retained.
+Each run ends with attempted, successful, failed and skipped counts, original
+and generated file sizes for successful conversions, and a recap of warnings
+and failures. Per-file sizes are included in the conversion time summary.
 
 Existing HEP files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
@@ -339,11 +345,12 @@ function parseWorkerHeapMb(value, label) {
 }
 
 export function pdfToHepWorkerArguments(
-  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged, withVectorLod, withTextLod, vectorLodPrecision
+  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged, withVectorLod, withTextLod, vectorLodPrecision,
+  workerScriptPath = scriptPath
 ) {
   return [
     `--max-old-space-size=${heapMb}`,
-    scriptPath,
+    workerScriptPath,
     ...(force ? ["--force"] : []),
     ...(keepUnchanged ? ["--keep-unchanged"] : []),
     ...(withVectorLod ? ["--with-vector-lod"] : []),
@@ -380,7 +387,8 @@ async function assertNodeCanvasAvailable() {
     canvasModule = await import("@napi-rs/canvas");
   } catch (error) {
     throw new Error(
-      "@napi-rs/canvas could not be loaded. Run npm install before converting PDFs; " +
+      "@napi-rs/canvas could not be loaded. Run npm install @soadzoor/hepr @napi-rs/canvas, " +
+      "then retry with npx pdf-to-hep (repository users can run npm install); " +
       "the canvas implementation is required to preserve raster PDF content server-side.",
       { cause: error }
     );
@@ -648,20 +656,88 @@ export function formatPdfToHepTimingSummary(timings) {
     totalDurationMs += timing.durationMs;
     lines.push(
       `  [${timing.fileNumber}/${timing.fileCount}] ${timing.pdfPath}: ` +
-      `${formatDurationSeconds(elapsedSeconds)} (${timing.status})`
+      `${formatDurationSeconds(elapsedSeconds)} (${timing.status})` +
+      (timing.sourceBytes === undefined ? "" : `; PDF ${formatBytes(timing.sourceBytes)}`) +
+      (timing.outputBytes === undefined ? "" : ` -> HEP ${formatBytes(timing.outputBytes)}`)
     );
   }
   lines.push(`  Total attempted conversion time: ${formatPdfToHepDuration(totalDurationMs)}`);
   return lines.join("\n");
 }
 
-function appendPdfToHepTiming(timings, item, status, durationMs) {
+export function formatPdfToHepSummary(timings, skippedCount, notAttemptedCount = 0) {
+  const successful = timings.filter((timing) => timing.status === "generated");
+  const failed = timings.filter((timing) => timing.status === "failed");
+  const interrupted = timings.filter((timing) => timing.status === "interrupted");
+  // Compare the same documents; failed and skipped PDFs have no new HEP.
+  const sized = successful.filter((timing) =>
+    timing.sourceBytes !== undefined && timing.outputBytes !== undefined
+  );
+  const sourceBytes = sized.reduce((total, timing) => total + timing.sourceBytes, 0);
+  const outputBytes = sized.reduce((total, timing) => total + timing.outputBytes, 0);
+  const withWarnings = timings.filter((timing) => timing.warnings?.length > 0);
+  const warningCount = withWarnings.reduce((total, timing) =>
+    total + timing.warnings.reduce((count, warning) => count + warning.count, 0), 0
+  );
+  const lines = [
+    "Conversion summary:",
+    `  PDFs attempted: ${timings.length}`,
+    `  Successful: ${successful.length}`,
+    `  Failed: ${failed.length}`,
+    `  Skipped: ${skippedCount}`
+  ];
+  if (interrupted.length > 0) lines.push(`  Interrupted: ${interrupted.length}`);
+  if (notAttemptedCount > 0) lines.push(`  Not attempted: ${notAttemptedCount}`);
+  if (sized.length < successful.length) {
+    lines.push(`  File sizes available for ${sized.length}/${successful.length} successful conversions.`);
+  }
+  const sizesUnavailable = successful.length > 0 && sized.length === 0;
+  lines.push(
+    `  Original PDFs (successful): ${sizesUnavailable ? "unavailable" : formatBytes(sourceBytes)}`,
+    `  Generated HEPs (successful): ${sizesUnavailable ? "unavailable" : formatBytes(outputBytes)}`
+  );
+  if (sourceBytes > 0) {
+    const change = outputBytes - sourceBytes;
+    const sign = change > 0 ? "+" : change < 0 ? "-" : "";
+    lines.push(
+      `  Size change: ${sign}${formatBytes(Math.abs(change))} ` +
+      `(${sign}${(Math.abs(change) / sourceBytes * 100).toFixed(2)}%)`
+    );
+  }
+  lines.push(
+    `  HEPs larger than original PDFs: ${sized.filter((timing) => timing.outputBytes > timing.sourceBytes).length}`,
+    `  Warnings: ${warningCount} across ${withWarnings.length} PDF(s)`
+  );
+  const details = [];
+  if (failed.length > 0) {
+    details.push("Failed PDFs:");
+    for (const timing of failed) {
+      details.push(`  ${timing.pdfPath}: ${timing.errorMessage ?? "conversion failed"}`);
+    }
+  }
+  if (withWarnings.length > 0) {
+    details.push("Warnings by PDF:");
+    for (const timing of withWarnings) {
+      details.push(`  ${timing.pdfPath}:`);
+      for (const warning of timing.warnings) {
+        details.push(`    ${warning.message}${warning.count > 1 ? ` (${warning.count} times)` : ""}`);
+      }
+    }
+  }
+  // Keep the compact totals last even when thousands of PDFs have warnings.
+  return [...details, ...lines].join("\n");
+}
+
+function appendPdfToHepTiming(timings, item, status, durationMs, report) {
   const timing = {
     pdfPath: item.pdfPath,
     fileNumber: item.fileNumber,
     fileCount: item.fileCount,
     status,
-    durationMs: Math.max(0, Number(durationMs) || 0)
+    durationMs: Math.max(0, Number(durationMs) || 0),
+    ...report,
+    // A candidate that was never written must not count as generated output.
+    ...(status === "generated" ? {} : { outputBytes: undefined })
   };
   timings.push(timing);
   return timing;
@@ -671,17 +747,20 @@ export function startPdfToHepWorker(
   item,
   force,
   heapMb,
-  spawnImplementation = spawn
+  spawnImplementation = spawn,
+  workerScriptPath = scriptPath
 ) {
   const workerToken = randomUUID();
+  const report = { warnings: [] };
+  const warningsByMessage = new Map();
   const child = spawnImplementation(
     process.execPath,
     pdfToHepWorkerArguments(
       item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances, item.keepUnchanged,
-      item.withVectorLod, item.withTextLod, item.vectorLodPrecision
+      item.withVectorLod, item.withTextLod, item.vectorLodPrecision, workerScriptPath
     ),
     {
-      stdio: "inherit",
+      stdio: ["inherit", "inherit", "inherit", "ipc"],
       shell: false,
       env: {
         ...process.env,
@@ -693,6 +772,24 @@ export function startPdfToHepWorker(
       }
     }
   );
+
+  child.on("message", (message) => {
+    if (message?.type === "pdf-to-hep-warning" && typeof message.message === "string") {
+      const previous = warningsByMessage.get(message.message);
+      if (previous) previous.count += 1;
+      else {
+        const warning = { message: message.message, count: 1 };
+        warningsByMessage.set(message.message, warning);
+        report.warnings.push(warning);
+      }
+    } else if (message?.type === "pdf-to-hep-error" && typeof message.message === "string") {
+      report.errorMessage = message.message;
+    } else if (message?.type === "pdf-to-hep-sizes") {
+      for (const key of ["sourceBytes", "outputBytes"]) {
+        if (Number.isSafeInteger(message[key]) && message[key] >= 0) report[key] = message[key];
+      }
+    }
+  });
 
   const completion = new Promise((resolve, reject) => {
     let settled = false;
@@ -709,10 +806,10 @@ export function startPdfToHepWorker(
     });
   });
 
-  return { child, completion, workerToken };
+  return { child, completion, workerToken, report };
 }
 
-async function cleanupPdfToHepWorkerTemps(outputPath, workerPid, workerToken) {
+async function cleanupPdfToHepWorkerTemps(outputPath, workerPid, workerToken, onWarning = console.warn) {
   if (
     !Number.isSafeInteger(workerPid) ||
     workerPid <= 0 ||
@@ -727,7 +824,7 @@ async function cleanupPdfToHepWorkerTemps(outputPath, workerPid, workerToken) {
   try {
     entries = await readdir(directoryPath, { withFileTypes: true });
   } catch (error) {
-    console.warn(`Could not inspect worker temporary files in ${directoryPath}: ${formatError(error)}`);
+    onWarning(`Could not inspect worker temporary files in ${directoryPath}: ${formatError(error)}`);
     return;
   }
 
@@ -738,7 +835,7 @@ async function cleanupPdfToHepWorkerTemps(outputPath, workerPid, workerToken) {
     const temporaryPath = path.join(directoryPath, entry.name);
     await unlink(temporaryPath).catch((error) => {
       if (error?.code !== "ENOENT") {
-        console.warn(`Could not remove worker temporary file ${temporaryPath}: ${formatError(error)}`);
+        onWarning(`Could not remove worker temporary file ${temporaryPath}: ${formatError(error)}`);
       }
     });
   }
@@ -751,7 +848,9 @@ export async function runPdfToHepWorkerBatch(
   dependencies = {}
 ) {
   const heapMb = dependencies.heapMb ?? resolvePdfToHepWorkerHeapMb();
-  const startWorker = dependencies.startWorker ?? startPdfToHepWorker;
+  const startWorker = dependencies.startWorker ?? ((item, force, heapMb) =>
+    startPdfToHepWorker(item, force, heapMb, spawn, dependencies.workerScriptPath)
+  );
   const cleanupWorkerTemps = dependencies.cleanupWorkerTemps ?? cleanupPdfToHepWorkerTemps;
   const signalTarget = dependencies.signalTarget ?? process;
   const now = dependencies.now ?? (() => performance.now());
@@ -807,7 +906,9 @@ export async function runPdfToHepWorkerBatch(
         worker = startWorker(item, options.force, heapMb);
       } catch (error) {
         const status = interruptedExitCode ? "interrupted" : "failed";
-        const timing = appendPdfToHepTiming(timings, item, status, now() - startedAt);
+        const timing = appendPdfToHepTiming(timings, item, status, now() - startedAt, {
+          errorMessage: formatError(error)
+        });
         if (interruptedExitCode) {
           console.error(
             `[${item.fileNumber}/${item.fileCount}] Interrupted ${item.pdfPath} after ` +
@@ -824,6 +925,11 @@ export async function runPdfToHepWorkerBatch(
       }
 
       activeChildren.add(worker.child);
+      const report = worker.report ?? { warnings: [] };
+      const warn = (message) => {
+        console.warn(message);
+        report.warnings.push({ message, count: 1 });
+      };
       const workerPid = worker.child.pid;
       let outcome;
       let workerFinishedAt;
@@ -843,7 +949,8 @@ export async function runPdfToHepWorkerBatch(
           timings,
           item,
           status,
-          workerFinishedAt - startedAt
+          workerFinishedAt - startedAt,
+          { ...report, errorMessage: report.errorMessage ?? formatError(error) }
         );
         if (interruptedExitCode) {
           console.error(
@@ -861,14 +968,14 @@ export async function runPdfToHepWorkerBatch(
         continue;
       } finally {
         activeChildren.delete(worker.child);
-        await cleanupWorkerTemps(item.outputPath, workerPid, worker.workerToken).catch((error) => {
-          console.warn(`Could not clean up worker temporary files for ${item.pdfPath}: ${formatError(error)}`);
+        await cleanupWorkerTemps(item.outputPath, workerPid, worker.workerToken, warn).catch((error) => {
+          warn(`Could not clean up worker temporary files for ${item.pdfPath}: ${formatError(error)}`);
         });
       }
 
       const durationMs = workerFinishedAt - startedAt;
       if (interruptedExitCode) {
-        const timing = appendPdfToHepTiming(timings, item, "interrupted", durationMs);
+        const timing = appendPdfToHepTiming(timings, item, "interrupted", durationMs, report);
         console.error(
           `[${item.fileNumber}/${item.fileCount}] Interrupted ${item.pdfPath} after ` +
           formatPdfToHepDuration(timing.durationMs)
@@ -876,7 +983,7 @@ export async function runPdfToHepWorkerBatch(
         break;
       }
       if (outcome.code === 0) {
-        const timing = appendPdfToHepTiming(timings, item, "generated", durationMs);
+        const timing = appendPdfToHepTiming(timings, item, "generated", durationMs, report);
         generatedCount += 1;
         console.log(
           `[${item.fileNumber}/${item.fileCount}] Converted ${item.pdfPath} in ` +
@@ -885,7 +992,7 @@ export async function runPdfToHepWorkerBatch(
         continue;
       }
       if (outcome.code === PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE) {
-        const timing = appendPdfToHepTiming(timings, item, "skipped", durationMs);
+        const timing = appendPdfToHepTiming(timings, item, "skipped", durationMs, report);
         skippedCount += 1;
         console.log(
           `[${item.fileNumber}/${item.fileCount}] Skipped ${item.pdfPath} after ` +
@@ -893,10 +1000,13 @@ export async function runPdfToHepWorkerBatch(
         );
         continue;
       }
-      const timing = appendPdfToHepTiming(timings, item, "failed", durationMs);
       const detail = outcome.signal
         ? `signal ${outcome.signal}`
         : `exit code ${outcome.code ?? "unknown"}`;
+      const timing = appendPdfToHepTiming(timings, item, "failed", durationMs, {
+        ...report,
+        errorMessage: report.errorMessage ?? detail
+      });
       failures.push({ pdfPath: item.pdfPath, message: detail });
       console.error(
         `[${item.fileNumber}/${item.fileCount}] Conversion worker failed for ` +
@@ -922,6 +1032,7 @@ export async function runPdfToHepWorkerBatch(
   if (interruptedExitCode) {
     console.log(formatPdfToHepTimingSummary(timings));
     console.log(wallTime);
+    console.log(formatPdfToHepSummary(timings, skippedCount, pending.length - timings.length));
     return interruptedExitCode;
   }
   console.log(
@@ -929,13 +1040,15 @@ export async function runPdfToHepWorkerBatch(
   );
   console.log(formatPdfToHepTimingSummary(timings));
   console.log(wallTime);
+  console.log(formatPdfToHepSummary(timings, skippedCount));
   return failures.length === 0 ? 0 : 1;
 }
 
-export async function runPdfToHep(args = process.argv.slice(2)) {
+export async function runPdfToHep(args = process.argv.slice(2), dependencies = {}) {
   const options = parsePdfToHepArguments(args);
   if (options.help) {
-    console.log(PDF_TO_HEP_USAGE);
+    const usageCommand = dependencies.usageCommand ?? "node PDFtoHEP.js";
+    console.log(PDF_TO_HEP_USAGE.replaceAll("node PDFtoHEP.js", usageCommand));
     return 0;
   }
 
@@ -978,6 +1091,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
     }
     console.log(`No files generated; ${skippedCount} existing HEP file(s) skipped.`);
     console.log(formatPdfToHepTimingSummary([]));
+    console.log(formatPdfToHepSummary([], skippedCount));
     return 0;
   }
 
@@ -985,13 +1099,43 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
     await mkdir(options.outputDirectory, { recursive: true });
   }
   if (!workerProcess) {
-    return runPdfToHepWorkerBatch(pending, options, skippedCount);
+    return runPdfToHepWorkerBatch(pending, options, skippedCount, dependencies);
   }
   if (pending.length !== 1) {
     throw new Error("An internal PDF-to-HEP worker must receive exactly one PDF.");
   }
 
-  await assertNodeCanvasAvailable();
+  const report = dependencies.reportWorkerEvent ?? reportPdfToHepWorkerEvent;
+  const originalWarn = console.warn;
+  // Workers handle a single PDF, so all warnings (including direct builder
+  // console.warn calls) can be attributed to it without parsing console output.
+  console.warn = (...args) => {
+    originalWarn(...args);
+    report({ type: "pdf-to-hep-warning", message: format(...args) });
+  };
+  try {
+    return await convertPdfToHep(pending, options, password, skippedCount, dependencies, report);
+  } catch (error) {
+    report({ type: "pdf-to-hep-error", message: formatError(error) });
+    throw error;
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+function reportPdfToHepWorkerEvent(event) {
+  if (!process.connected || typeof process.send !== "function") return;
+  // Reporting must not turn a usable conversion into a failure if the parent
+  // disconnects during cancellation. The callback also handles async errors.
+  try {
+    process.send(event, () => {});
+  } catch {
+    // The parent may have disconnected between checking and sending.
+  }
+}
+
+async function convertPdfToHep(pending, options, password, skippedCount, dependencies, report) {
+  await (dependencies.assertCanvasAvailable ?? assertNodeCanvasAvailable)();
 
   const abortController = new AbortController();
   let interruptedExitCode = 0;
@@ -1015,7 +1159,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
   let generatedCount = 0;
   let builder;
   try {
-    builder = await loadSourceHepBuilder();
+    builder = await (dependencies.loadBuilder ?? loadSourceHepBuilder)();
     for (let index = 0; index < pending.length; index += 1) {
       abortController.signal.throwIfAborted();
       const { pdfPath, outputPath } = pending[index];
@@ -1027,6 +1171,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
 
       try {
         const pdfBytes = await readFile(pdfPath, { signal: abortController.signal });
+        report({ type: "pdf-to-hep-sizes", sourceBytes: pdfBytes.byteLength });
         abortController.signal.throwIfAborted();
         const hepBlob = await builder.buildHep(pdfBytes, {
           sourceLabel,
@@ -1065,13 +1210,8 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
             `[${itemNumber}/${itemCount}] Wrote ${outputPath} (${formatBytes(hepBlob.size)})`
           );
         }
+        report({ type: "pdf-to-hep-sizes", outputBytes: hepBlob.size });
         generatedCount += 1;
-        if (hepBlob.size > pdfBytes.byteLength) {
-          console.warn(
-            `[${itemNumber}/${itemCount}] Warning: ${sourceLabel} produced a HEP larger than its PDF ` +
-            `(${formatBytes(hepBlob.size)} > ${formatBytes(pdfBytes.byteLength)}).`
-          );
-        }
       } catch (error) {
         if (abortController.signal.aborted) {
           throw error;
@@ -1082,6 +1222,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
           continue;
         }
         failures.push({ pdfPath, error });
+        report({ type: "pdf-to-hep-error", message: formatError(error) });
         console.error(`[${itemNumber}/${itemCount}] Failed ${pdfPath}: ${formatError(error)}`);
         if (isPasswordError(error)) {
           console.error(`Pass --password=<password> or set ${PDF_PASSWORD_ENV} to convert password-protected PDFs.`);

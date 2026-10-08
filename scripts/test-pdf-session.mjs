@@ -216,6 +216,7 @@ try {
 
   await testFlateEolStreams(openPdf, validateHeprPageData);
   await testMalformedOcrFont(openPdf, validateHeprPageData);
+  await testEmbeddedCompoundFont(openPdf, validateHeprPageData);
   console.log("PDF session and atomic parse tests passed.");
 } finally {
   hooks.deregister();
@@ -260,6 +261,48 @@ async function testMalformedOcrFont(openPdf, validateHeprPageData) {
     assert.equal(unicodeDiagnostics[0].details.invalidMappingCount, 2048);
     assert.equal(reported.filter(d => d.code === "font.invalid-to-unicode").length, 1);
     assert.equal(session.getDiagnostics().filter(d => d.code === "filter.asciihex-trailing-data").length, 1);
+  } finally {
+    await session.close();
+  }
+}
+
+async function testEmbeddedCompoundFont(openPdf, validateHeprPageData) {
+  // TIKA-2848-2 uses the obsolete overlap bit on a visible compound glyph.
+  const bytes = writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", "1 0 0 rg 1 2 3 4 re f 0 0 0 rg BT /F1 20 Tf 10 20 Td (B) Tj ET") },
+    { number: 5, body: "<< /Type /Font /Subtype /TrueType /BaseFont /FixtureCompound /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 66 /Widths [600 700] /FontDescriptor 6 0 R >>" },
+    { number: 6, body: "<< /Type /FontDescriptor /FontName /FixtureCompound /Flags 32 /FontBBox [0 -200 1000 800] /Ascent 800 /Descent -200 /FontFile2 7 0 R >>" },
+    { number: 7, body: tinyPdfStream("", buildTinySfnt(0x0013)) }
+  ] });
+  const reported = [];
+  const session = await openPdf({ kind: "bytes", bytes }, {
+    onDiagnostic: diagnostic => reported.push(diagnostic)
+  });
+  try {
+    // Compile vector first: its font diagnostics must include warnings that
+    // only arise later, while deriving visible outlines for the scene.
+    const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
+    assert.equal(scene.textIndex.pages[0].text, "B");
+    assert.equal(scene.textInstanceCount, 1, "the compound glyph remains visible");
+    assert.equal(scene.fillPathCount, 1, "surrounding page geometry is preserved");
+    assert.equal(scene.rasterLayers.length, 0, "obsolete flags preserve vector output");
+    const fontDiagnostics = session.getDiagnostics().filter(d => d.code === "font.sfnt-compound-flags-normalized");
+    assert.equal(fontDiagnostics.length, 1, "lazy glyph warnings reach the vector session");
+    assert.equal(fontDiagnostics[0].details.ignoredFlags, 0x0010);
+    assert.equal(fontDiagnostics[0].details.exact, true);
+    assert.equal(reported.filter(d => d.code === "font.sfnt-compound-flags-normalized").length, 1);
+
+    const page = await session.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    assert.equal(page.textIndex.text, "B");
+    assert.deepEqual([...page.stores.glyphs.glyphIds], [2]);
+    assert.deepEqual([...page.stores.fonts.outlinePathCounts], [1]);
+    assert.equal(session.getDiagnostics().filter(d => d.code === "font.sfnt-compound-flags-normalized").length, 1);
+    assert.equal(reported.filter(d => d.code === "font.sfnt-compound-flags-normalized").length, 1,
+      "recompiling the same font does not notify the caller twice");
   } finally {
     await session.close();
   }

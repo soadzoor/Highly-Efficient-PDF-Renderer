@@ -10,10 +10,10 @@ const manifest = JSON.parse(await readFile(new URL("../package.json", import.met
 assert.deepEqual(Object.keys(manifest.dependencies ?? {}), [],
   "HEPR must have no regular runtime dependencies");
 assert.equal(manifest.dependencies?.["@napi-rs/canvas"], undefined);
-assert.equal(manifest.optionalDependencies?.["@napi-rs/canvas"], undefined,
-  "browser consumers must not install native canvas automatically");
-assert.ok(manifest.peerDependencies?.["@napi-rs/canvas"]);
-assert.equal(manifest.peerDependenciesMeta?.["@napi-rs/canvas"]?.optional, true);
+assert.ok(manifest.optionalDependencies?.["@napi-rs/canvas"],
+  "the CLI canvas backend must be optional so browser consumers can omit its installation");
+assert.equal(manifest.peerDependencies?.["@napi-rs/canvas"], undefined,
+  "omitting optional dependencies must not install canvas as a required peer");
 
 // Rebundle the emitted package, where minification has already folded constants.
 // Remove Vite's hints to check that native isolation survives other bundlers.

@@ -8,11 +8,12 @@ import "./drawingSelectionControls.css";
 import "./pdfLayerControls.css";
 import "./pdfPasswordPrompt.css";
 import { promptForPdfPassword } from "./pdfPasswordPrompt";
-import { isPdfPasswordError } from "./pdfObjectGenerator";
+import { isPdfPasswordError, loadPdfSceneFromSource } from "./pdfObjectGenerator";
 import { createLayerVisibilityController } from "./layerVisibility";
 import { createPdfLayerControls } from "./pdfLayerControls";
 import { createPdfAnnotationControls } from "./pdfAnnotationControls";
-import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
+import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
+import { warmViewerRendering } from "./viewerRenderWarmup";
 
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import {
@@ -26,6 +27,7 @@ import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
 import { buildHep } from "./hepBuilder";
 import { loadSceneFromHep } from "./hepReader";
+import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
 import { listSceneRasterLayers, prepareSceneForHepRendering } from "./hepShared";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
@@ -121,6 +123,9 @@ const textSearchPrevButton = document.querySelector<HTMLButtonElement>("#text-se
 const textSearchNextButton = document.querySelector<HTMLButtonElement>("#text-search-next");
 const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-search-case");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
+const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
+const pageStreamingCheckbox = document.querySelector<HTMLInputElement>("#page-streaming-checkbox");
+const compressScansCheckbox = document.querySelector<HTMLInputElement>("#compress-scans-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 
 if (
@@ -169,6 +174,9 @@ if (
   !textSearchNextButton ||
   !textSearchCaseButton ||
   !textSelectionCheckbox ||
+  !ocrTextCheckbox ||
+  !pageStreamingCheckbox ||
+  !compressScansCheckbox ||
   !drawingSelectionContainer
 ) {
   throw new Error("Required UI elements are missing from index.html.");
@@ -221,6 +229,10 @@ const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
 let webGpuRendererClass: typeof import("./webGpuFloorplanRenderer").WebGpuFloorplanRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
+let activePdfPageLoader: PdfPageDemandLoader | null = null;
+let demandPdfUpdateTimer: number | null = null;
+let demandPdfUpdateRunning = false;
+let demandPdfUpdatePending = false;
 let backendSwitcher: ReturnType<typeof createBackendSwitcher> | null = null;
 
 const uiControlManager = createUiControlManager(
@@ -256,7 +268,10 @@ const textSearchWidget = createTextSearchWidget(
     countLabel: textSearchCount
   },
   {
-    onQueryInput: (query) => textSearchController.setQuery(query),
+    onQueryInput: (query) => {
+      if (query.trim()) activePdfPageLoader?.requestAllPreviews();
+      textSearchController.setQuery(query);
+    },
     onNext: () => textSearchController.next(),
     onPrev: () => textSearchController.prev(),
     onCaseToggle: (enabled) => textSearchController.setCaseSensitive(enabled),
@@ -309,6 +324,9 @@ textSelectionCheckbox.addEventListener("change", () => {
 });
 
 textSelectionCheckbox.disabled = false;
+ocrTextCheckbox.addEventListener("change", handleOcrTextChange);
+pageStreamingCheckbox.addEventListener("change", handlePageStreamingChange);
+compressScansCheckbox.addEventListener("change", handleCompressScansChange);
 let annotationInteraction: AnnotationInteractionController | undefined;
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
@@ -429,6 +447,12 @@ annotationInteraction = createAnnotationInteractionController({
 let lastRuntimeTextUpdate = -Infinity;
 function onRendererFrame(stats: DrawStats): void {
   const now = performance.now();
+  if (activePdfPageLoader && lastParsedScene && activeSceneLoadToken === null &&
+      pendingSourceLoadCount === 0 && activeHepExportController === null) {
+    // Demand follows every presented frame, including the final frame of a short zoom.
+    // Scene uploads remain coalesced separately by scheduleDemandPdfUpdate.
+    activePdfPageLoader.update({ ...renderer.getPresentedViewState(), width: canvasElement.width, height: canvasElement.height }, lastParsedScene.pageRects);
+  }
   updateFpsMetric(now);
   drawCallMeter.update(stats.drawCalls);
   textSelection.updateOverlay();
@@ -456,6 +480,81 @@ function onRendererFrame(stats: DrawStats): void {
   const paintOrderSuffix = stats.paintOrderApproximated ? " | paint order: held" : "";
   runtimeTextElement.textContent =
     `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}${vectorLodSuffix}${textLodSuffix}${redundancySuffix}${paintOrderSuffix}`;
+}
+
+/** Coalesce worker completions, preserving navigation while replacing the bounded page window. */
+function scheduleDemandPdfUpdate(): void {
+  demandPdfUpdatePending = true;
+  if (demandPdfUpdateTimer !== null || demandPdfUpdateRunning) return;
+  demandPdfUpdateTimer = window.setTimeout(() => {
+    demandPdfUpdateTimer = null;
+    const loader = activePdfPageLoader;
+    if (!loader || activePdfPageLoader !== loader || activeSceneLoadToken !== null ||
+        pendingSourceLoadCount > 0 || activeHepExportController !== null) return;
+    demandPdfUpdatePending = false;
+    demandPdfUpdateRunning = true;
+    void backendSwitcher!.runWhenIdle(async () => {
+      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || activeHepExportController !== null) {
+        demandPdfUpdatePending = true; return;
+      }
+      const transitionStarted = performance.now();
+      const update = lastParsedScene ? loader.getDisplayUpdate(lastParsedScene) : null;
+      if (update && renderer.prepareRasterLayerUpdates) {
+        const staged = renderer.prepareRasterLayerUpdatesAsync
+          ? await renderer.prepareRasterLayerUpdatesAsync(update.layers) : renderer.prepareRasterLayerUpdates(update.layers);
+        try {
+          if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+          if (!lastParsedScene || !loader.isDisplayUpdateCurrent(lastParsedScene, update)) {
+            demandPdfUpdatePending = true; return;
+          }
+          staged.commit();
+          renderer.setPageRasterVisibility?.(update.rasterPages);
+          renderer.recordPerformanceTransition?.("pageSwap.total", performance.now() - transitionStarted);
+        } finally { staged.dispose(); }
+        return;
+      }
+      const composeStarted = performance.now();
+      const pageScenes = loader.displayPageScenes;
+      const composed = composeVectorScenesInGrid(pageScenes, computeAutoPagesPerRow(loader.pageCount));
+      renderer.recordPerformanceTransition?.("pageSwap.compose", performance.now() - composeStarted);
+      const prepareStarted = performance.now();
+      const scene = prepareSceneForHepRendering(composed);
+      renderer.recordPerformanceTransition?.("pageSwap.prepareScene", performance.now() - prepareStarted);
+      await prebuildTextLod(scene);
+      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+      const started = performance.now();
+      const stats = uploadSceneWithRollback(renderer, scene, true, true);
+      lastParsedScene = scene;
+      loader.bindDisplayScene(scene, pageScenes);
+      await layerVisibility.sceneChanged(true);
+      if (activePdfPageLoader !== loader || lastParsedScene !== scene) return;
+      applyTextSearchScene(scene);
+      const initialUpdate = loader.getDisplayUpdate(scene);
+      if (initialUpdate && renderer.prepareRasterLayerUpdates) {
+        const staged = renderer.prepareRasterLayerUpdatesAsync
+          ? await renderer.prepareRasterLayerUpdatesAsync(initialUpdate.layers) : renderer.prepareRasterLayerUpdates(initialUpdate.layers);
+        try {
+          if (activePdfPageLoader !== loader || lastParsedScene !== scene || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+          if (!loader.isDisplayUpdateCurrent(scene, initialUpdate)) { demandPdfUpdatePending = true; return; }
+          staged.commit(); renderer.setPageRasterVisibility?.(initialUpdate.rasterPages);
+        } finally { staged.dispose(); }
+      }
+      renderer.recordPerformanceTransition?.("pageSwap.total", performance.now() - transitionStarted);
+      textSearchWidget.setAvailability("ready");
+      updateMetricsPanel(lastParsedSceneLabel ?? "PDF", scene, stats, 0, performance.now() - started, null, null);
+      const hasExportWarning = baseStatus.startsWith("HEP downloaded. Warning: ") ||
+        (baseStatus.startsWith("Batch export complete: ") && baseStatus.includes(" Warning: "));
+      if (!hasExportWarning) {
+        setStatus(`${loader.previewCount.toLocaleString()}/${loader.pageCount.toLocaleString()} page previews; ${loader.detailedCount} detailed pages cached. Pages load as you navigate.`);
+      }
+    }).catch(error => {
+      if (activePdfPageLoader === loader) setStatus(`Page display update failed: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      demandPdfUpdateRunning = false;
+      if (demandPdfUpdatePending && activePdfPageLoader && activeSceneLoadToken === null &&
+          pendingSourceLoadCount === 0 && activeHepExportController === null) scheduleDemandPdfUpdate();
+    });
+  }, 100);
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
@@ -509,6 +608,11 @@ interface LoadedSource {
 }
 
 let lastLoadedSource: LoadedSource | null = null;
+let lastLoadedPdfPassword: string | undefined;
+let loadedOcrTextOnly = false;
+let loadedPageStreaming = false;
+let loadedCompressScans = false;
+let loadedCompressScansPreference = compressScansCheckbox.checked;
 let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
@@ -542,6 +646,7 @@ const performanceCapture = {
     console.table({ frameCpu: report.frameCpuMs, frameInterval: report.frameIntervalMs,
       ...report.cpuSections, gpuCommandSpan: report.gpu.frameMs });
     console.table(report.counters);
+    console.table(report.transitionSections);
     return report;
   },
   json(): string { return JSON.stringify(performanceCapture.report(), null, 2); }
@@ -1047,6 +1152,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
   }
   const loadStart = performance.now();
   const extractionOptions = getExtractionOptions();
+  const streaming = pageStreamingCheckbox!.checked && !extractionOptions.compressScans;
   const pageSceneOptionsKey = buildPdfPageCacheKey();
   const cachedPageScenes = getCachedPdfPageScenes(options.source, pageSceneOptionsKey);
   const progress = createLoadProgressReporter((payload) => {
@@ -1054,6 +1160,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       updateParsingLoaderProgress(payload);
     }
   });
+  let demandLoader: PdfPageDemandLoader | null = null;
 
   try {
     let scene: VectorScene;
@@ -1078,11 +1185,25 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       setStatus(
         `Parsing ${label}... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
-      const pageScenes = await extractPdfPageScenes(buffer, {
-        ...extractionOptions,
-        password: options.password,
-        onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback()
-      }, options.signal);
+      let pageScenes: VectorScene[];
+      const parseOptions = { ...extractionOptions, password: options.password,
+        onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback() };
+      if (extractionOptions.compressScans) {
+        pageScenes = await extractPdfPageScenes(buffer, parseOptions, options.signal, "transfer");
+      } else {
+        const candidate = await openPdfPageDemand(buffer, parseOptions, scheduleDemandPdfUpdate, options.signal);
+        if (streaming && candidate.pageCount > 16) {
+          demandLoader = candidate;
+          pageScenes = candidate.displayPageScenes;
+        } else {
+          try {
+            await candidate.loadInitialOverviews(options.signal, !streaming);
+            pageScenes = candidate.displayPageScenes;
+            if (candidate.requiresPageDemand) demandLoader = candidate;
+            else await candidate.close();
+          } catch (error) { await candidate.close(); throw error; }
+        }
+      }
       parseMs = performance.now() - parseStart;
 
       if (activeLoadToken === loadToken) {
@@ -1095,7 +1216,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
       const pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
       scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
-      parsedPages = pageScenes;
+      parsedPages = demandLoader ? null : pageScenes;
       console.log(
         `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
       );
@@ -1106,9 +1227,10 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
 
     scene = prepareSceneForHepRendering(scene);
+    demandLoader?.bindDisplayScene(scene);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
+    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer && !demandLoader && !extractionOptions.ocrTextOnly) {
       setParsingLoader(false);
       setStatus(`No visible geometry was extracted from ${label}.`);
       return;
@@ -1137,6 +1259,9 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
+    progress.report(1, { stage: "first-render", sourceType: "pdf" });
+    await warmNativeRenderer(targetRenderer, options.signal);
+    if (activeLoadToken !== loadToken) return;
     progress.complete({ sourceType: "pdf" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -1153,14 +1278,22 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
     lastParsedScene = scene;
     lastParsedSceneLabel = label;
-    commitLoadedSource(options);
+    commitLoadedSource(options, extractionOptions.ocrTextOnly === true, streaming, extractionOptions.compressScans === true);
+    const previousPageLoader = activePdfPageLoader;
+    activePdfPageLoader = demandLoader;
+    activePdfPageLoader?.setPerformanceListener((name, ms) => renderer.recordPerformanceTransition?.(name, ms));
+    demandLoader = null;
+    void previousPageLoader?.close();
+    if (activePdfPageLoader) parsedPdfPageCache = null;
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
     applyTextSearchScene(scene);
+    if (activePdfPageLoader) textSearchWidget.setAvailability("ready");
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
     updateMetricsPanel(label, scene, sceneStats, parseMs, uploadMs, lodTiming, performance.now() - loadStart);
-    clearLoadedStatus();
+    if (extractionOptions.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
+    else clearLoadedStatus();
   } catch (error) {
     if (activeLoadToken !== loadToken || options.signal.aborted) {
       return;
@@ -1172,6 +1305,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to render PDF: ${message}`);
   } finally {
+    await demandLoader?.close();
     finishSceneLoad(activeLoadToken);
   }
 }
@@ -1244,6 +1378,9 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
     const uploadMs = Math.max(0, uploadEnd - uploadStart - fallbackLodTiming.elapsedMs);
+    progress.report(1, { stage: "first-render", sourceType: "hep" });
+    await warmNativeRenderer(targetRenderer, options.signal);
+    if (activeLoadToken !== loadToken) return;
     progress.complete({ sourceType: "hep" });
     if (activeLoadToken === loadToken) {
       setParsingLoader(false);
@@ -1261,6 +1398,9 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedScene = scene;
     lastParsedSceneLabel = label;
     commitLoadedSource(options);
+    const previousPageLoader = activePdfPageLoader;
+    activePdfPageLoader = null;
+    void previousPageLoader?.close();
     parsedPdfPageCache = null;
     applyTextSearchScene(scene);
     refreshDropIndicator();
@@ -1281,23 +1421,51 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
   }
 }
 
-function commitLoadedSource(options: LoadPdfOptions): void {
+function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, streaming = false, compressScans = false): void {
   lastLoadedSource = options.source;
+  lastLoadedPdfPassword = options.source.kind === "pdf" ? options.password : undefined;
+  loadedOcrTextOnly = options.source.kind === "pdf" && ocrTextOnly;
+  ocrTextCheckbox!.checked = loadedOcrTextOnly;
+  ocrTextCheckbox!.disabled = options.source.kind !== "pdf";
+  loadedCompressScans = options.source.kind === "pdf" && compressScans && !loadedOcrTextOnly;
+  loadedPageStreaming = options.source.kind === "pdf" && streaming && !loadedCompressScans;
+  pageStreamingCheckbox!.checked = loadedPageStreaming;
+  if (options.source.kind === "pdf") {
+    loadedCompressScansPreference = !loadedOcrTextOnly && !loadedPageStreaming && compressScansCheckbox!.checked;
+  }
+  compressScansCheckbox!.checked = loadedCompressScansPreference;
+  compressScansCheckbox!.disabled = options.source.kind !== "pdf";
+  pageStreamingCheckbox!.disabled = options.source.kind !== "pdf";
   lastDownloadablePdf = options.downloadablePdf;
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
 }
 
-function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preserveView?: boolean): SceneStats {
+/** Keep native frame pacing while warming the view that will become interactive. */
+async function warmNativeRenderer(target: RendererApi, signal: AbortSignal): Promise<void> {
+  if (!(target instanceof WebGlFloorplanRenderer) && !(webGpuRendererClass && target instanceof webGpuRendererClass)) return;
+  await warmViewerRendering({ signal, renderFrame: async warmupSignal => {
+    warmupSignal.throwIfAborted();
+    if (target !== renderer) return;
+    const serial = target.getPresentedFrameSerial();
+    target.requestFrame();
+    while (target === renderer && target.getPresentedFrameSerial() === serial) {
+      await yieldForLoad(warmupSignal);
+    }
+  } });
+}
+
+function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preserveView?: boolean,
+  preserveRasterResolution = false): SceneStats {
   lastRuntimeTextUpdate = -Infinity;
   const previousScene = lastParsedScene;
   const previousView = target.getViewState();
   try {
-    const stats = target.setScene(scene);
+    const stats = target.setScene(scene, { preserveRasterResolution });
     if (!preserveView) target.fitToBounds(resolveSceneFitBounds(scene), 64);
     return stats;
   } catch (error) {
     try {
-      if (previousScene) target.setScene(previousScene);
+      if (previousScene) target.setScene(previousScene, { preserveRasterResolution: true });
       target.setViewState(previousView);
       if (target === renderer) {
         drawingSelection.rendererChanged();
@@ -1312,13 +1480,64 @@ function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preser
 
 function getExtractionOptions(): VectorExtractOptions {
   return {
+    ocrTextOnly: ocrTextCheckbox!.checked,
+    compressScans: compressScansCheckbox!.checked && !ocrTextCheckbox!.checked,
     enableSegmentMerge: true,
     enableInvisibleCull: true
   };
 }
 
 function buildPdfPageCacheKey(): string {
-  return "merge:1|cull:1";
+  const options = getExtractionOptions();
+  return `merge:1|cull:1|ocr:${options.ocrTextOnly ? 1 : 0}|stream:${pageStreamingCheckbox!.checked && !options.compressScans ? 1 : 0}|compress:${options.compressScans ? 1 : 0}`;
+}
+
+function handleOcrTextChange(): void {
+  if (ocrTextCheckbox!.checked) compressScansCheckbox!.checked = false;
+  void reloadPdfViewingOptions();
+}
+
+function handlePageStreamingChange(): void {
+  if (pageStreamingCheckbox!.checked) compressScansCheckbox!.checked = false;
+  void reloadPdfViewingOptions();
+}
+
+function handleCompressScansChange(): void {
+  if (compressScansCheckbox!.checked) {
+    ocrTextCheckbox!.checked = false;
+    pageStreamingCheckbox!.checked = false;
+  }
+  void reloadPdfViewingOptions();
+}
+
+async function reloadPdfViewingOptions(): Promise<void> {
+  const source = lastLoadedSource;
+  if (source?.kind !== "pdf") return;
+  cancelActiveHepExport();
+  const sourceLoadToken = beginSourceLoad();
+  ocrTextCheckbox!.disabled = true;
+  pageStreamingCheckbox!.disabled = true;
+  compressScansCheckbox!.disabled = true;
+  try {
+    await loadPdfBuffer(createParseBuffer(source.bytes), source.label, {
+      source, downloadablePdf: lastDownloadablePdf, signal: sourceLoadController!.signal,
+      preserveView: true, password: lastLoadedPdfPassword
+    });
+  } catch (error) {
+    if (isCurrentSourceLoad(sourceLoadToken) && !sourceLoadController?.signal.aborted) {
+      setStatus(`Failed to change PDF view: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } finally {
+    finishSourceLoad(sourceLoadToken);
+    if (isCurrentSourceLoad(sourceLoadToken)) {
+      ocrTextCheckbox!.checked = loadedOcrTextOnly;
+      ocrTextCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
+      pageStreamingCheckbox!.checked = loadedPageStreaming;
+      pageStreamingCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
+      compressScansCheckbox!.checked = loadedCompressScansPreference && !loadedOcrTextOnly && !loadedPageStreaming;
+      compressScansCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
+    }
+  }
 }
 
 function getCachedPdfPageScenes(source: LoadedSource, optionsKey: string): VectorScene[] | null {
@@ -1467,10 +1686,21 @@ function finishSceneLoad(token: number): void {
 }
 
 function updateBackendSelectDisabledState(): void {
+  ocrTextCheckbox!.disabled = pendingSourceLoadCount > 0 || activeSceneLoadToken !== null ||
+    activeHepExportController !== null || lastLoadedSource?.kind === "hep";
+  compressScansCheckbox!.disabled = ocrTextCheckbox!.disabled;
+  pageStreamingCheckbox!.disabled = ocrTextCheckbox!.disabled;
   backendSelectElement.disabled =
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
     activeHepExportController !== null;
+  if (activePdfPageLoader) {
+    if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null) activePdfPageLoader.pause();
+    else {
+      activePdfPageLoader.resume();
+      if (demandPdfUpdatePending) scheduleDemandPdfUpdate();
+    }
+  }
 }
 
 function updateParsingLoaderProgress(progress: PDFLoadProgress): void {
@@ -1616,6 +1846,7 @@ async function downloadAllExampleHeps(): Promise<void> {
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
   setDownloadAllDataButtonState(true, true, `Exporting 0/${pdfEntries.length}...`);
   setParsingLoader(true, "0.00% Preparing HEP export...");
+  const exportWarnings: string[] = [];
 
   try {
     await yieldToBrowserPaint();
@@ -1638,6 +1869,9 @@ async function downloadAllExampleHeps(): Promise<void> {
       const hepBlob = await buildHep(bytes, {
         sourceLabel: entry.name,
         signal: exportController.signal,
+        onWarning: (message: string) => {
+          if (activeHepExportController === exportController) exportWarnings.push(message);
+        },
         onProgress: (progress) => {
           if (activeHepExportController !== exportController) {
             return;
@@ -1657,7 +1891,7 @@ async function downloadAllExampleHeps(): Promise<void> {
     }
 
     if (activeHepExportController === exportController) {
-      setStatus(`Batch export complete: ${pdfEntries.length.toLocaleString()} HEP files downloaded.`);
+      setStatus(`Batch export complete: ${pdfEntries.length.toLocaleString()} HEP files downloaded.${exportWarnings.length > 0 ? ` Warning: ${exportWarnings.join(" ")}` : ""}`);
     }
   } catch (error) {
     if (activeHepExportController === exportController) {
@@ -1704,6 +1938,10 @@ async function downloadHep(): Promise<boolean> {
 
   const scene = lastParsedScene;
   const label = lastParsedSceneLabel;
+  const pageLoader = activePdfPageLoader;
+  const source = lastLoadedSource;
+  const password = lastLoadedPdfPassword;
+  const needsCompleteScene = Boolean(pageLoader || (loadedOcrTextOnly && source?.kind === "pdf"));
 
   const previousStatusText = statusTextElement.textContent;
 
@@ -1727,30 +1965,63 @@ async function downloadHep(): Promise<boolean> {
       }
       return false;
     }
+    const exportWarnings: string[] = [];
     await yieldToBrowserPaint();
-    const hepBlob = await buildHep(scene, {
+    exportController.signal.throwIfAborted();
+    if (activeHepExportController !== exportController) return false;
+    const buildStart = needsCompleteScene ? 0.8 : 0;
+    const onSceneProgress = (progress: PDFLoadProgress): void => {
+      if (activeHepExportController === exportController) {
+        updateParsingLoaderProgress({ ...progress, value: progress.value * buildStart });
+      }
+    };
+    let exportScene = scene;
+    if (pageLoader) {
+      const pages = await pageLoader.loadCompletePageScenes({ signal: exportController.signal, onProgress: onSceneProgress });
+      exportController.signal.throwIfAborted();
+      if (activeHepExportController !== exportController) return false;
+      exportScene = prepareSceneForHepRendering(composeVectorScenesInGrid(pages, scene.pagesPerRow));
+    } else if (needsCompleteScene && source?.kind === "pdf") {
+      // Text-only eager views omitted images; complete extraction is needed for export.
+      exportScene = (await loadPdfSceneFromSource(source.bytes, { sourceLabel: label, password,
+        ocrTextOnly: false, maxPagesPerRow: scene.pagesPerRow, signal: exportController.signal,
+        onProgress: onSceneProgress })).scene;
+    }
+    exportController.signal.throwIfAborted();
+    if (activeHepExportController !== exportController) return false;
+    const buildOptions = {
       ...lodOptions,
       sourceLabel: label,
+      sourcePdfByteLength: source?.kind === "pdf" ? source.bytes.byteLength : undefined,
       signal: exportController.signal,
-      onProgress: (progress) => {
+      onWarning: (message: string) => {
+        if (activeHepExportController === exportController) exportWarnings.push(message);
+      },
+      onProgress: (progress: PDFLoadProgress) => {
         if (activeHepExportController === exportController) {
-          updateParsingLoaderProgress(progress);
+          updateParsingLoaderProgress({ ...progress,
+            value: buildStart + (1 - buildStart) * progress.value });
         }
       }
-    });
+    };
+    const hepBlob = await buildHep(exportScene, buildOptions);
 
-    if (activeHepExportController !== exportController) {
-      return false;
-    }
-
+    if (activeHepExportController !== exportController) return false;
+    exportController.signal.throwIfAborted();
     const hepFileName = `${sanitizeDownloadName(label)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
     triggerBrowserDownload(hepBlob, hepFileName);
     console.log(
       `[Parsed data export] ${label}: wrote ${hepFileName} (${formatFileSize(hepBlob.size)})`
     );
-    const restoredStatus = previousStatusText || baseStatus;
-    statusTextElement.textContent = restoredStatus;
-    statusTextElement.hidden = restoredStatus.trim().length === 0;
+    if (activeHepExportController !== exportController) return false;
+    exportController.signal.throwIfAborted();
+    if (exportWarnings.length > 0) {
+      setStatus(`HEP downloaded. Warning: ${exportWarnings.join(" ")}`);
+    } else {
+      const restoredStatus = previousStatusText || baseStatus;
+      statusTextElement.textContent = restoredStatus;
+      statusTextElement.hidden = restoredStatus.trim().length === 0;
+    }
     return true;
   } catch (error) {
     if (activeHepExportController === exportController) {

@@ -43,7 +43,7 @@ async function buildHepFromPdf(
     loaded.scene,
     normalizeSourceLabel(options.sourceLabel, loaded.sourceLabel),
     rasterLayers,
-    options,
+    loaded.sourceKind === "pdf" ? { ...options, sourcePdfByteLength: loaded.sourceBytes.byteLength } : options,
     progress.child(0.82, 1, { sourceType: "pdf" })
   );
   progress.complete({ sourceType: "pdf" });
@@ -90,6 +90,8 @@ async function buildSceneHep(
       vectorLodPrecision: options.vectorLodPrecision,
       withTextLod: options.withTextLod,
       encodeRasterImages: options.encodeRasterImages ?? true,
+      sourcePdfByteLength: options.sourcePdfByteLength,
+      onWarning: options.onWarning,
       compression: options.compression === "store" ? "STORE" : "DEFLATE",
       signal: options.signal,
       onBuildProgress: (value, buildProgress) => {

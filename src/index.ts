@@ -66,6 +66,11 @@ const LOAD_PROGRESS_UPLOAD = 0.98;
  * from three.js `onBeforeRender`, so typical render loops do not need a
  * separate per-frame HEPR call.
  *
+ * Conflicting PDF viewing options warn through onDiagnostic and console.warn.
+ * ocrTextOnly disables compressScans; otherwise compressScans overrides
+ * pageLoading: "auto" with eager loading. The returned sourceOptions reflect
+ * these resolutions without changing the supplied options.
+ *
  * Example:
  *
  * ```ts
@@ -99,15 +104,17 @@ export async function pdfObjectGenerator(
 ): Promise<HeprThreePdfObject> {
   const signal = options.signal;
   signal?.throwIfAborted();
+  let loadedScene: Awaited<ReturnType<typeof loadPdfSceneFromSource>> | undefined;
   try {
     const progress = createLoadProgressReporter(options.onProgress);
-    const loadedScene = await loadPdfSceneFromSource(source, {
+    loadedScene = await loadPdfSceneFromSource(source, {
       ...options,
       onProgress: progress.child(0, LOAD_PROGRESS_SCENE_END).toCallback()
-    });
+    }, signal, true);
     signal?.throwIfAborted();
     return await prepareThreePdfObject(loadedScene, { ...options, rendererType }, progress);
   } catch (error) {
+    await loadedScene?.pageDemand?.close();
     signal?.throwIfAborted();
     throw error;
   }

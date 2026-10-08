@@ -6,6 +6,7 @@ import {
   HEPR_GLYPH_FLAG,
   HEPR_GRADIENT_KIND,
   HEPR_IMAGE_FORMAT,
+  heprRawImageByteLength,
   HEPR_MESH_KIND,
   HEPR_PAINT_KIND,
   HEPR_PATTERN_KIND,
@@ -817,7 +818,7 @@ function validateStores(
     if (images.widths[index] === 0 || images.heights[index] === 0) {
       fail(HEPR_DATA_VALIDATION_CODES.InvalidNumber, `${path}.images[${index}]`, "dimensions must be positive");
     }
-    if (images.formats[index] > HEPR_IMAGE_FORMAT.Ccitt) {
+    if (images.formats[index] > HEPR_IMAGE_FORMAT.Gray1) {
       fail(HEPR_DATA_VALIDATION_CODES.InvalidNumber, `${path}.images.formats[${index}]`, "unknown format");
     }
     const bitsPerComponent = images.bitsPerComponent[index];
@@ -849,8 +850,8 @@ function validateStores(
           : images.formats[index] === HEPR_IMAGE_FORMAT.Rgba16
             ? 8
             : 0;
-    if (bytesPerPixel !== 0) {
-      const expectedBytes = images.widths[index] * images.heights[index] * bytesPerPixel;
+    if (bytesPerPixel !== 0 || images.formats[index] === HEPR_IMAGE_FORMAT.Gray1) {
+      const expectedBytes = heprRawImageByteLength(images.formats[index], images.widths[index], images.heights[index]);
       if (!Number.isSafeInteger(expectedBytes) || storedBytes !== expectedBytes) {
         fail(
           HEPR_DATA_VALIDATION_CODES.InvalidCardinality,
@@ -1438,6 +1439,7 @@ function validateStores(
     } else if (
       images.colorSpaceIndices[index] < 0 &&
       images.formats[index] !== HEPR_IMAGE_FORMAT.Jpeg2000 &&
+      images.formats[index] !== HEPR_IMAGE_FORMAT.Gray1 &&
       images.formats[index] !== HEPR_IMAGE_FORMAT.Gray8 &&
       images.formats[index] !== HEPR_IMAGE_FORMAT.GrayAlpha8 &&
       images.formats[index] !== HEPR_IMAGE_FORMAT.Rgba8 &&

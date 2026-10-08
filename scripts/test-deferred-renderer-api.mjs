@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 
-import { deferRendererSceneUpload } from "../src/deferredRendererApi.ts";
+const hooks = registerHooks({ resolve(s,c,next) {
+  return next(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? `${s}.ts` : s,c);
+} });
+const { deferRendererSceneUpload } = await import("../src/deferredRendererApi.ts");
 
 const threePdfObjectSource = await readFile(
   new URL("../src/threePdfObject.ts", import.meta.url),
@@ -21,8 +25,8 @@ const view = { cameraCenterX: 1, cameraCenterY: 2, zoom: 3 };
 
 const renderer = new Proxy({
   sceneStats: null,
-  setScene(nextScene) {
-    calls.push(["setScene", nextScene]);
+  setScene(nextScene, options) {
+    calls.push(options ? ["setScene", nextScene, options] : ["setScene", nextScene]);
     this.sceneStats = stats;
     return stats;
   },
@@ -79,9 +83,27 @@ assert.equal(calls.filter(([name]) => name === "setScene").length, 1, "resource 
 const replacement = { marker: "replacement" };
 assert.equal(deferred.setScene(replacement), stats);
 assert.deepEqual(calls.findLast(([name]) => name === "setScene"), ["setScene", replacement]);
+const sceneOptions = { preserveRasterResolution: true };
+deferred.setScene(replacement, sceneOptions);
+assert.deepEqual(calls.at(-1), ["setScene", replacement, sceneOptions], "explicit scene options reach the native backend");
+
+const window = { marker: "viewing window" };
+deferred.replaceDeferredScene(window);
+assert.equal(deferred.hasUploadedScene(), false);
+assert.equal(calls.at(-1)[1].rasterLayers.length, 0, "old native image resources are released before deferring another window");
+const beforeWindow = calls.length;
+deferred.replaceDeferredScene(window);
+assert.equal(calls.length, beforeWindow, "an already dormant renderer does not upload another empty scene");
+deferred.renderExternalFrame(456);
+assert.deepEqual(calls.slice(-2), [["setScene", window], ["renderExternalFrame",456]]);
+deferred.replaceDeferredScene(window, sceneOptions);
+assert.equal(calls.at(-1)[2], sceneOptions, "releasing old native resources preserves the progressive planning state");
+deferred.ensureSceneUploaded();
+assert.deepEqual(calls.at(-1), ["setScene", window, sceneOptions], "a deferred replacement retains its zoom options until upload");
 
 deferred.dispose();
 assert.equal(calls.at(-1)[0], "dispose");
+assert.throws(() => deferred.replaceDeferredScene(window), /disposed/);
 
 const diagnosticCalls = [];
 const diagnosticRenderer = new Proxy({

@@ -6,6 +6,7 @@ import type {
   PdfDocumentInfo
 } from "../heprDocumentData";
 import type { VectorScene } from "../pdfVectorExtractor";
+import { restoreMonochromeSceneTransfer } from "../monochromeRaster";
 import type {
   NativeVectorCompileOptions,
   NativeVectorPdfSession,
@@ -585,6 +586,8 @@ class PdfWorkerConnection {
       operation: "compile-vector-page",
       sourcePageIndex,
       options: {
+        ...(options.ocrTextOnly === undefined ? {} : { ocrTextOnly: options.ocrTextOnly }),
+        ...(options.previewMaxDimension === undefined ? {} : { previewMaxDimension: options.previewMaxDimension }),
         limits: options.limits,
         optimization: options.optimization,
         enableSegmentMerge: options.enableSegmentMerge,
@@ -594,7 +597,7 @@ class PdfWorkerConnection {
       }
     }, [], signal, options.onProgress) as Promise<CompileVectorSuccess>).then((response) => {
       this.replaceDiagnostics(response.diagnostics);
-      return response.scene;
+      return restoreMonochromeSceneTransfer(response.scene);
     });
   }
 

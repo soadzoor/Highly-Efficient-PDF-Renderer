@@ -3,6 +3,7 @@ import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import { validateSceneOptionalContentReferences } from "./optionalContent";
 import { validateSceneRetainedPages } from "./retainedPageData";
 import { validateScenePaintGraph } from "./scenePaintGraph";
+import { copyRasterLayer } from "./monochromeRaster";
 import {
   optimizeVectorSceneTextGlyphs,
   type RasterLayer,
@@ -44,6 +45,12 @@ import type {
  * origins from their advances; see docs/HEP_CONTAINER.md.
  */
 export const PARSED_DATA_FORMAT_VERSION = 9;
+/** Packed monochrome raster sections extend the otherwise unchanged v9 scene. */
+export const PARSED_DATA_MONOCHROME_FORMAT_VERSION = 10;
+/** Original compressed JBIG2 streams can be decoded without the source PDF. */
+export const PARSED_DATA_JBIG2_FORMAT_VERSION = 11;
+/** Transposed binary run sections extend the otherwise unchanged v11 scene. */
+export const PARSED_DATA_BINARY_FORMAT_VERSION = 12;
 export const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 export const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 export const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";
@@ -257,8 +264,7 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
     const decoded = decodeTextGlyphSegments(encoded.bytes, encoded.meta);
     return { textGlyphSegmentsA: decoded.segmentsA, textGlyphSegmentsB: decoded.segmentsB };
   };
-  const prepared = optimizeVectorSceneTextGlyphs({
-    ...scene,
+  const prepared = optimizeVectorSceneTextGlyphs(Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)), {
     ...strokes,
     ...(scene.textGlyphSegmentCount > 0 ? quantizeGlyphSegments() : {}),
     // HEP v8 rounds clip endpoints too; use the same grid after page layout.
@@ -276,7 +282,7 @@ export function prepareSceneForHepRendering(scene: VectorScene): VectorScene {
         fallbackQuads: quantizePositions(page.fallbackQuads, page.fallbackQuads.length / 4, 4)
       }))
     } : null
-  });
+  }) as VectorScene);
   if (encodedStrokes) {
     preparedStrokeGeometry.set(prepared, encodedStrokes);
   }
@@ -415,20 +421,21 @@ export function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
     for (const layer of scene.rasterLayers) {
       const width = Math.max(0, Math.trunc(layer?.width ?? 0));
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
-      if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
+      if (width <= 0 || height <= 0 || (layer.monochrome
+        ? layer.monochrome.data.length !== Math.ceil(width / 8) * height || layer.monochrome.colors.length !== 8
+        : !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4)) {
         continue;
       }
 
       const matrix = layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix);
-      out.push({
+      out.push(copyRasterLayer(layer, {
         width,
         height,
-        data: layer.data,
         matrix,
         paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
         pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0,
         ...(layer.opacity === undefined ? {} : { opacity: layer.opacity })
-      });
+      }));
     }
   }
 

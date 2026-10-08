@@ -2,7 +2,7 @@
  * Builds a deterministic three-glyph TrueType font for native PDF fixtures.
  * Codes U+0041 and U+0042 map to the two non-empty glyphs.
  */
-export function buildTinySfnt() {
+export function buildTinySfnt(compoundFlags = 0x0003) {
   const head = new Uint8Array(54);
   const headView = new DataView(head.buffer);
   headView.setUint16(18, 1000, false);
@@ -49,7 +49,7 @@ export function buildTinySfnt() {
   compoundView.setInt16(4, 0, false);
   compoundView.setInt16(6, 150, false);
   compoundView.setInt16(8, 100, false);
-  compoundView.setUint16(10, 0x0003, false);
+  compoundView.setUint16(10, compoundFlags, false);
   compoundView.setUint16(12, 1, false);
   compoundView.setInt16(14, 50, false);
   compoundView.setInt16(16, 0, false);

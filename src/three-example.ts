@@ -5,6 +5,7 @@ import { createAnnotationInteractionController, type AnnotationInteractionContro
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
 import * as THREE from "three";
 import { waitForLoad } from "./loadCancellation";
+import { warmViewerRendering } from "./viewerRenderWarmup";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
@@ -80,6 +81,9 @@ const vectorLodSelect = document.querySelector<HTMLSelectElement>("#vector-lod-s
 const textLodSelect = document.querySelector<HTMLSelectElement>("#text-lod-select");
 const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rotate-checkbox");
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
+const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
+const pageStreamingCheckbox = document.querySelector<HTMLInputElement>("#page-streaming-checkbox");
+const compressScansCheckbox = document.querySelector<HTMLInputElement>("#compress-scans-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 const pdfLayersContainer = document.querySelector<HTMLDivElement>("#pdf-layers");
 const pdfAnnotationsContainer = document.querySelector<HTMLDivElement>("#pdf-annotations");
@@ -133,6 +137,9 @@ if (
   !textLodSelect ||
   !touchRotateCheckbox ||
   !textSelectionCheckbox ||
+  !ocrTextCheckbox ||
+  !pageStreamingCheckbox ||
+  !compressScansCheckbox ||
   !drawingSelectionContainer ||
   !pdfLayersContainer ||
   !pdfAnnotationsContainer ||
@@ -183,6 +190,10 @@ const vectorLodSelectElement = vectorLodSelect;
 const textLodSelectElement = textLodSelect;
 const touchRotateCheckboxElement = touchRotateCheckbox;
 const textSelectionCheckboxElement = textSelectionCheckbox;
+const ocrTextCheckboxElement = ocrTextCheckbox;
+const pageStreamingCheckboxElement = pageStreamingCheckbox;
+const compressScansCheckboxElement = compressScansCheckbox;
+let loadedCompressScansPreference = compressScansCheckboxElement.checked;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -251,6 +262,11 @@ interface CameraSnapshot {
 }
 
 type ThreeExampleRenderer = THREE.WebGLRenderer | WebGPURenderer;
+interface PreparedThreeRendererBackend {
+  backend: HeprRendererType;
+  canvas: HTMLCanvasElement;
+  renderer: ThreeExampleRenderer;
+}
 type WebGpuRendererParametersWithCanvas = ConstructorParameters<typeof WebGPURenderer>[0] & {
   canvas: HTMLCanvasElement;
 };
@@ -485,9 +501,23 @@ async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promi
   // values directly. Disable Three's linear intermediate/output transform for
   // this dedicated comparison renderer so Three/WebGPU does the same.
   configureThreeRenderer(nextRenderer, THREE.LinearSRGBColorSpace);
-  await nextRenderer.init();
-  stopThreeInternalAnimationLoop(nextRenderer);
-  return nextRenderer;
+  try {
+    await nextRenderer.init();
+    stopThreeInternalAnimationLoop(nextRenderer);
+    return nextRenderer;
+  } catch (error) {
+    const failedRenderer = nextRenderer as WebGPURenderer & {
+      _initialized?: boolean;
+      backend: WebGPURenderer["backend"] & { device?: { destroy?: () => void } };
+    };
+    if (failedRenderer._initialized === false) {
+      // In r186 dispose() calls setAnimationLoop(), which retries the rejected
+      // init promise and leaves an unhandled rejection. No renderer managers
+      // exist yet; releasing its owned device also frees partial GPU resources.
+      failedRenderer.backend.device?.destroy?.();
+    } else nextRenderer.dispose();
+    throw error;
+  }
 }
 
 /**
@@ -559,21 +589,36 @@ function createReplacementViewportCanvas(): HTMLCanvasElement {
   return nextCanvas;
 }
 
-async function ensureThreeRendererBackend(
+/** Create the next context without clearing the document still on screen. */
+async function prepareThreeRendererBackend(
   backend: HeprRendererType,
-  options: { disposeCurrentPdfObject?: boolean } = {}
-): Promise<void> {
+  signal?: AbortSignal
+): Promise<PreparedThreeRendererBackend | null> {
+  signal?.throwIfAborted();
   if (backend === activeThreeRendererBackend) {
-    return;
+    return null;
   }
-
-  const disposeCurrentPdfObject = options.disposeCurrentPdfObject !== false;
-  const previousControlsTarget = controls.target.clone();
-  const previousCanvas = canvasElement;
   const nextCanvas = createReplacementViewportCanvas();
   const nextRenderer = backend === "webgpu"
     ? await createWebGpuThreeRenderer(nextCanvas)
     : createWebGlThreeRenderer(nextCanvas);
+  try {
+    signal?.throwIfAborted();
+    return { backend, canvas: nextCanvas, renderer: nextRenderer };
+  } catch (error) {
+    nextRenderer.dispose();
+    throw error;
+  }
+}
+
+/** Install a prepared context synchronously with its replacement PDF object. */
+function installThreeRendererBackend(
+  prepared: PreparedThreeRendererBackend,
+  options: { disposeCurrentPdfObject?: boolean } = {}
+): void {
+  const disposeCurrentPdfObject = options.disposeCurrentPdfObject !== false;
+  const previousControlsTarget = controls.target.clone();
+  const previousCanvas = canvasElement;
 
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);
@@ -587,12 +632,12 @@ async function ensureThreeRendererBackend(
   }
   renderer.dispose();
 
-  previousCanvas.replaceWith(nextCanvas);
-  canvasElement = nextCanvas;
+  previousCanvas.replaceWith(prepared.canvas);
+  canvasElement = prepared.canvas;
   canvasResizeObserver.disconnect();
-  canvasResizeObserver.observe(nextCanvas);
-  renderer = nextRenderer;
-  activeThreeRendererBackend = backend;
+  canvasResizeObserver.observe(prepared.canvas);
+  renderer = prepared.renderer;
+  activeThreeRendererBackend = prepared.backend;
   resetFpsMeter();
   // The capture's GPU timer queries belong to the context being replaced.
   captureGlCalls?.dispose(); captureGlCalls = null;
@@ -601,10 +646,20 @@ async function ensureThreeRendererBackend(
   drawCallMeter.reset();
   controls = createMapControls();
   controls.target.copy(previousControlsTarget);
+  camera.coordinateSystem = prepared.renderer.coordinateSystem;
   updatePerspectiveCameraProjection();
   updateCameraClipping();
   drawingSelection.rendererChanged();
   annotationInteraction?.refresh();
+}
+
+async function ensureThreeRendererBackend(
+  backend: HeprRendererType,
+  options: { disposeCurrentPdfObject?: boolean } = {}
+): Promise<void> {
+  const prepared = await prepareThreeRendererBackend(backend, lifetimeSignal);
+  if (!prepared) return;
+  installThreeRendererBackend(prepared, options);
   requestRender();
 }
 
@@ -690,6 +745,23 @@ function waitForNextRenderedFrame(token: number): Promise<void> {
   return new Promise((resolve) => {
     pendingRenderedFrameResolvers.push(resolve);
     requestRender();
+  });
+}
+
+async function warmThreeRenderer(token: number, signal: AbortSignal): Promise<void> {
+  const target = renderer;
+  const queue = (target as ThreeExampleRenderer & {
+    backend?: { device?: { queue?: { onSubmittedWorkDone?(): Promise<void> } } }
+  }).backend?.device?.queue;
+  await warmViewerRendering({ signal,
+    renderFrame: warmupSignal => {
+      if (token !== loadToken || target !== renderer) return;
+      return waitForLoad(waitForNextRenderedFrame(token), warmupSignal);
+    },
+    waitForGpu: queue?.onSubmittedWorkDone ? () => {
+      if (token !== loadToken || target !== renderer) return;
+      return queue.onSubmittedWorkDone!();
+    } : undefined
   });
 }
 
@@ -809,6 +881,30 @@ textSelectionCheckboxElement.addEventListener("change", () => {
   }
   setStatus(`Text selection ${textSelectionCheckboxElement.checked ? "enabled" : "disabled"}.`);
 }, { signal: lifetimeSignal });
+
+function handleOcrTextChange(): void {
+  if (ocrTextCheckboxElement.checked) compressScansCheckboxElement.checked = false;
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}
+
+ocrTextCheckboxElement.addEventListener("change", handleOcrTextChange, { signal: lifetimeSignal });
+
+function handlePageStreamingChange(): void {
+  if (pageStreamingCheckboxElement.checked) compressScansCheckboxElement.checked = false;
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}
+
+pageStreamingCheckboxElement.addEventListener("change", handlePageStreamingChange, { signal: lifetimeSignal });
+
+function handleCompressScansChange(): void {
+  if (compressScansCheckboxElement.checked) {
+    ocrTextCheckboxElement.checked = false;
+    pageStreamingCheckboxElement.checked = false;
+  }
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}
+
+compressScansCheckboxElement.addEventListener("change", handleCompressScansChange, { signal: lifetimeSignal });
 
 for (const button of pageLayoutButtons) {
   button.addEventListener("click", () => {
@@ -1363,10 +1459,14 @@ function disposeExample(): void {
   renderer.dispose();
 }
 
-function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> {
+function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> & { ocrTextOnly: boolean; compressScans: boolean; pageLoading: "all" | "auto" | "eager" } {
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
+    ocrTextOnly: ocrTextCheckboxElement.checked,
+    compressScans: compressScansCheckboxElement.checked && !ocrTextCheckboxElement.checked,
+    pageLoading: compressScansCheckboxElement.checked && !ocrTextCheckboxElement.checked ? "eager"
+      : pageStreamingCheckboxElement.checked ? "auto" : "all",
     threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
     textLod: readTextLodMode(),
@@ -1392,6 +1492,7 @@ async function loadSource(
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
   let pendingObject: HeprThreePdfObject | null = null;
+  let preparedBackend: PreparedThreeRendererBackend | null = null;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "0.00% Parsing / loading");
   setLoadControlsEnabled(false);
@@ -1403,10 +1504,6 @@ async function loadSource(
 
   try {
     const loadStart = performance.now();
-    await ensureThreeRendererBackend(backend);
-    if (activeLoadToken !== loadToken) {
-      return;
-    }
     resetVectorStrokeLodBuildTiming();
     let password: string | undefined;
     let nextObject: HeprThreePdfObject;
@@ -1454,25 +1551,49 @@ async function loadSource(
     );
     controller.signal.throwIfAborted();
     if (activeLoadToken !== loadToken) return;
-    replacePdfObject(nextObject);
-    pendingObject = null;
-    lastLoadedSource = source;
-    lastDownloadablePdf = downloadablePdf;
-    setDownloadDataButtonState(true);
-    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     updateLoadingProgress(activeLoadToken, {
       value: 1,
       stage: "first-render",
       sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "hep"
     });
     const firstSubmitStart = performance.now();
+    preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
+    const submitRenderer = preparedBackend?.renderer ?? renderer;
+    const submitCamera = camera.clone();
+    submitCamera.coordinateSystem = backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem;
+    submitCamera.updateProjectionMatrix();
+    // Compile the clip/LOD variants selected by the view that will be shown,
+    // while leaving the old document's camera and controls alone.
+    fitCameraToObject(nextObject, true, submitCamera);
+    await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
+    controller.signal.throwIfAborted();
+    if (activeLoadToken !== loadToken) return;
+    if (preparedBackend) {
+      const previewScene = new THREE.Scene();
+      previewScene.add(nextObject);
+      try {
+        prepareThreeRendererFrame(submitRenderer);
+        submitRenderer.render(previewScene, submitCamera);
+      } finally { previewScene.remove(nextObject); }
+      installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
+      preparedBackend = null;
+    }
+    replacePdfObject(nextObject);
+    pendingObject = null;
+    lastLoadedSource = source;
+    lastDownloadablePdf = downloadablePdf;
+    setDownloadDataButtonState(true);
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     requestRender();
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
+    await warmThreeRenderer(activeLoadToken, controller.signal);
+    if (activeLoadToken !== loadToken) return;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
-    clearLoadedStatus();
+    if (nextObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
+    else clearLoadedStatus();
     updateSceneMetrics(nextObject);
   } catch (error) {
     if (activeLoadToken !== loadToken) {
@@ -1487,6 +1608,7 @@ async function loadSource(
     setStatus(`Failed to load source: ${message}`);
   } finally {
     if (pendingObject && pendingObject !== currentPdfObject) pendingObject.dispose();
+    preparedBackend?.renderer.dispose();
     if (activeLoadToken === loadToken) {
       sourceLoadController = null;
       setLoadingProgress(false);
@@ -1498,10 +1620,10 @@ async function loadSource(
   }
 }
 
-async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void> {
+async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource = false): Promise<void> {
   const previousObject = currentPdfObject;
   const source = lastLoadedSource;
-  if (!previousObject || !source || backend === activeThreeRendererBackend) {
+  if (!previousObject || !source || (!reparseSource && backend === activeThreeRendererBackend)) {
     return;
   }
 
@@ -1513,10 +1635,12 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   const cameraSnapshot = captureCameraSnapshot();
   const objectOptions = readThreeObjectOptions();
   let nextObject: HeprThreePdfObject | null = null;
+  let preparedBackend: PreparedThreeRendererBackend | null = null;
   let targetInstalled = false;
   let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
 
-  setStatus(`Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
+  setStatus(reparseSource ? `Changing PDF view for ${previousObject.sourceLabel}...`
+    : `Switching ${previousObject.sourceLabel} to ${formatBackendLabel(backend)}...`);
   setLoadingProgress(true, "Preparing renderer...");
   setLoadControlsEnabled(false);
   setDownloadDataButtonState(true, true);
@@ -1528,29 +1652,37 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
   try {
     const loadStart = performance.now();
     resetVectorStrokeLodBuildTiming();
-    const vectorLodStage = hasStoredVectorStrokeLod(previousObject.sceneData) ? "vector-lod-restore" : "vector-lod";
-    vectorLodReservation = await reserveVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
-      yieldIntervalMs: 50,
-      signal: controller.signal,
-      shouldCancel: () => controller.signal.aborted,
-      onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: vectorLodStage })
-    });
-    controller.signal.throwIfAborted();
-    if (objectOptions.textLod !== "off") {
-      await prebuildTextLod(previousObject.sceneData, {
+    if (!reparseSource) {
+      const vectorLodStage = hasStoredVectorStrokeLod(previousObject.sceneData) ? "vector-lod-restore" : "vector-lod";
+      vectorLodReservation = await reserveVectorStrokeLodRuntime(previousObject.sceneData, objectOptions.vectorLod ?? "auto", backend, {
         yieldIntervalMs: 50,
         signal: controller.signal,
-        onProgress: progress => updateLoadingProgress(activeLoadToken, { value: 0.7 + progress.value * 0.26, stage: "text-lod" })
+        shouldCancel: () => controller.signal.aborted,
+        onProgress: progress => updateLoadingProgress(activeLoadToken, { value: progress.value * 0.7, stage: vectorLodStage })
       });
+      controller.signal.throwIfAborted();
+      if (objectOptions.textLod !== "off") {
+        await prebuildTextLod(previousObject.sceneData, {
+          yieldIntervalMs: 50,
+          signal: controller.signal,
+          onProgress: progress => updateLoadingProgress(activeLoadToken, { value: 0.7 + progress.value * 0.26, stage: "text-lod" })
+        });
+      }
     }
     updateLoadingProgress(activeLoadToken, { value: 0.98, stage: "upload" });
     // Keep canonical references attached to the exact same scene when
     // replacing the renderer; do not parse the source again.
-    nextObject = await createThreePdfObject(
+    nextObject = (previousObject.isPageDemandLoaded || reparseSource) && previousObject.sourceBytes
+      ? await pdfObjectGenerator(previousObject.sourceBytes, { ...previousObject.sourceOptions, ...objectOptions,
+        sourceLabel: previousObject.sourceLabel,
+        signal: controller.signal, onProgress: progress => updateLoadingProgress(activeLoadToken, progress) }, backend)
+      : await createThreePdfObject(
       {
         scene: previousObject.sceneData,
         sourceLabel: previousObject.sourceLabel,
-        sourceKind: previousObject.sourceKind
+        sourceKind: previousObject.sourceKind,
+        sourceBytes: previousObject.sourceBytes,
+        sourceOptions: previousObject.sourceOptions
       },
       { ...objectOptions, rendererType: backend },
       controller.signal,
@@ -1564,32 +1696,59 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
       return;
     }
 
-    await ensureThreeRendererBackend(backend, { disposeCurrentPdfObject: false });
-    if (activeLoadToken !== loadToken) {
-      nextObject.dispose();
-      nextObject = null;
-      return;
-    }
-
     await layerControls.prepareReplacement(nextObject, controller.signal);
     controller.signal.throwIfAborted();
     const pageLayoutReplacement = await preparePageLayoutReplacement(nextObject, controller.signal);
     controller.signal.throwIfAborted();
+    updateLoadingProgress(activeLoadToken, {
+      value: 1,
+      stage: "first-render",
+      sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "hep"
+    });
+    // Include shader preparation and the detached first submit in the upload
+    // timing. Keep the old canvas displayed until its successor has a frame.
+    const firstSubmitStart = performance.now();
+    preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
+    controller.signal.throwIfAborted();
+    const submitRenderer = preparedBackend?.renderer ?? renderer;
+    // WebGPU updates camera clip conventions. A detached camera lets the old
+    // renderer continue drawing while asynchronous compilation is pending.
+    const submitCamera = camera.clone();
+    submitCamera.position.copy(cameraSnapshot.position);
+    submitCamera.quaternion.copy(cameraSnapshot.quaternion);
+    submitCamera.up.copy(cameraSnapshot.up);
+    submitCamera.coordinateSystem = submitRenderer.coordinateSystem;
+    submitCamera.updateProjectionMatrix();
+    submitCamera.updateMatrixWorld(true);
+    const previewScene = new THREE.Scene();
+    previewScene.add(nextObject);
+    try {
+      await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
+      controller.signal.throwIfAborted();
+      if (preparedBackend) {
+        prepareThreeRendererFrame(submitRenderer);
+        submitRenderer.render(previewScene, submitCamera);
+      }
+    } finally {
+      previewScene.remove(nextObject);
+    }
+    controller.signal.throwIfAborted();
+    if (activeLoadToken !== loadToken) return;
+    if (preparedBackend) {
+      installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
+      preparedBackend = null;
+    }
     replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement });
     targetInstalled = true;
     const installedObject = nextObject;
     nextObject = null;
     restoreCameraSnapshot(cameraSnapshot);
-    updateLoadingProgress(activeLoadToken, {
-      value: 1,
-      stage: "first-render",
-      sourceType: installedObject.sourceKind === "pdf" ? "pdf" : "hep"
-    });
-    const firstSubmitStart = performance.now();
     requestRender();
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
+    await warmThreeRenderer(activeLoadToken, controller.signal);
+    if (activeLoadToken !== loadToken) return;
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(
       totalLoadMs,
@@ -1601,13 +1760,17 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
     updateSceneMetrics(installedObject);
     setDownloadDataButtonState(true);
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
-    clearLoadedStatus();
+    if (installedObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
+    else clearLoadedStatus();
   } catch (error) {
     if (nextObject && currentPdfObject === nextObject) {
       targetInstalled = true;
       nextObject = null;
     }
     nextObject?.dispose();
+    nextObject = null;
+    preparedBackend?.renderer.dispose();
+    preparedBackend = null;
     const message = error instanceof Error ? error.message : String(error);
     if (activeLoadToken !== loadToken) {
       return;
@@ -1627,6 +1790,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType): Promise<void>
         : `Failed to switch renderer: ${message}`
     );
   } finally {
+    nextObject?.dispose();
+    preparedBackend?.renderer.dispose();
     vectorLodReservation?.release();
     if (activeLoadToken === loadToken) {
       sourceLoadController = null;
@@ -1658,6 +1823,20 @@ function replacePdfObject(
   });
   if (!sameScene) disposeCurrentObject({ clearMetrics: options.fitCamera !== false });
   currentPdfObject = nextObject;
+  if (nextObject.sourceKind === "pdf") {
+    loadedCompressScansPreference = compressScansCheckboxElement.checked && !nextObject.sourceOptions?.ocrTextOnly;
+  }
+  nextObject.addEventListener("change", event => {
+    if (currentPdfObject !== nextObject) return;
+    if (event.reason === "pages-loaded") {
+      updateSceneMetrics(nextObject);
+      drawingSelection.sceneChanged();
+      annotationOverlay.sceneChanged(); annotationControls.sceneChanged(); annotationInteraction?.refresh();
+      refreshSearchAvailability();
+      if (textSearchInputElement.value.trim()) runSearch(textSearchInputElement.value, false);
+    }
+    requestRender();
+  });
   resetPageLayout(options.pageLayoutView);
   layerControls.objectChanged();
   scene.add(nextObject);
@@ -1744,6 +1923,16 @@ function setPanelCollapsed(collapsed: boolean): void {
 }
 
 function setLoadControlsEnabled(enabled: boolean): void {
+  ocrTextCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) ocrTextCheckboxElement.checked = currentPdfObject.sourceOptions?.ocrTextOnly === true;
+  compressScansCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) {
+    compressScansCheckboxElement.checked = loadedCompressScansPreference && !ocrTextCheckboxElement.checked;
+  }
+  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) {
+    pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto" && !compressScansCheckboxElement.checked;
+  }
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;
   exampleDropdown.setDisabled(!enabled);
@@ -1838,6 +2027,7 @@ async function downloadHep(): Promise<boolean> {
 
 
   const exportController = new AbortController();
+  pdfObject.pausePageLoading();
   activeHepExportController = exportController;
   setDownloadDataButtonState(true, true);
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf), false);
@@ -1847,29 +2037,49 @@ async function downloadHep(): Promise<boolean> {
   textLodSelectElement.disabled = true;
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
+    const needsCompleteScene = pdfObject.isPageDemandLoaded || Boolean(pdfObject.sourceOptions?.ocrTextOnly);
     const lodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
     if (!lodOptions) return false;
+    const exportWarnings: string[] = [];
+    const scenePhaseEnd = needsCompleteScene ? 0.8 : 0;
+    const updateExportProgress = (progress: PDFLoadProgress, start: number, end: number): void => {
+      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return;
+      const stageLabel = formatLoadProgressStage(progress.stage);
+      const value = start + Math.max(0, Math.min(1, Number(progress.value) || 0)) * (end - start);
+      setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
+    };
     await yieldToBrowserPaint();
-    const hepBlob = await buildHep(pdfObject.sceneData, {
+    exportController.signal.throwIfAborted();
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    const exportScene = needsCompleteScene
+      ? await pdfObject.loadCompleteScene({
+        signal: exportController.signal,
+        onProgress: (progress) => updateExportProgress(progress, 0, scenePhaseEnd)
+      })
+      : pdfObject.sceneData;
+    exportController.signal.throwIfAborted();
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    const hepOptions = {
       ...lodOptions,
       sourceLabel: pdfObject.sourceLabel,
+      sourcePdfByteLength: pdfObject.sourceKind === "pdf" ? pdfObject.sourceBytes?.byteLength : undefined,
       signal: exportController.signal,
-      onProgress: (progress) => {
-        if (activeHepExportController !== exportController) {
-          return;
-        }
-        const stageLabel = formatLoadProgressStage(progress.stage);
-        const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
-        setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);
+      onWarning: (message: string) => {
+        if (activeHepExportController === exportController) exportWarnings.push(message);
+      },
+      onProgress: (progress: PDFLoadProgress) => {
+        updateExportProgress(progress, scenePhaseEnd, 1);
       }
-    });
+    };
+    const hepBlob = await buildHep(exportScene, hepOptions);
 
-    if (activeHepExportController !== exportController) {
-      return false;
-    }
-
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    exportController.signal.throwIfAborted();
     const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
     triggerBrowserDownload(hepBlob, hepFileName);
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    exportController.signal.throwIfAborted();
+    if (exportWarnings.length > 0) setStatus(`HEP downloaded. Warning: ${exportWarnings.join(" ")}`);
     return true;
   } catch (error) {
     if (activeHepExportController === exportController) {
@@ -1878,6 +2088,10 @@ async function downloadHep(): Promise<boolean> {
     }
     return false;
   } finally {
+    if (currentPdfObject === pdfObject &&
+      (activeHepExportController === exportController || activeHepExportController === null)) {
+      pdfObject.resumePageLoading();
+    }
     if (activeHepExportController === exportController) {
       activeHepExportController = null;
       setLoadingProgress(false);
@@ -2368,8 +2582,11 @@ function restoreCameraSnapshot(snapshot: CameraSnapshot): void {
   controls.update();
 }
 
-function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean): void {
-  scene.updateMatrixWorld(true);
+function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean, previewCamera?: THREE.PerspectiveCamera): void {
+  if (previewCamera) targetObject.updateWorldMatrix(true, true);
+  else scene.updateMatrixWorld(true);
+  const fitCamera = previewCamera ?? camera;
+  const fitTarget = previewCamera ? controls.target.clone() : controls.target;
   if (tempObjectBounds.setFromObject(targetObject).isEmpty()) {
     return;
   }
@@ -2385,21 +2602,25 @@ function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: bo
   const paddedWidth = objectWidth * widthPaddingFactor;
   const paddedHeight = objectHeight * heightPaddingFactor;
 
-  const verticalFovRadians = THREE.MathUtils.degToRad(camera.fov);
-  const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, camera.aspect));
+  const verticalFovRadians = THREE.MathUtils.degToRad(fitCamera.fov);
+  const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, fitCamera.aspect));
   const distanceForHeight = (paddedHeight * 0.5) / Math.tan(verticalFovRadians * 0.5);
   const distanceForWidth = (paddedWidth * 0.5) / Math.tan(horizontalFovRadians * 0.5);
   const distance = Math.max(1e-3, distanceForHeight, distanceForWidth);
 
-  tempViewDirection.subVectors(camera.position, controls.target);
+  tempViewDirection.subVectors(fitCamera.position, fitTarget);
   if (tempViewDirection.lengthSq() <= 1e-12) {
     tempViewDirection.set(0, 0, 1);
   } else {
     tempViewDirection.normalize();
   }
 
-  camera.position.copy(tempObjectCenter).addScaledVector(tempViewDirection, distance);
-  controls.target.set(tempObjectCenter.x, tempObjectCenter.y, tempObjectCenter.z);
+  fitCamera.position.copy(tempObjectCenter).addScaledVector(tempViewDirection, distance);
+  fitTarget.set(tempObjectCenter.x, tempObjectCenter.y, tempObjectCenter.z);
+  if (previewCamera) {
+    updateCameraClipping(true, fitCamera, fitTarget, tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
+    return;
+  }
   if (updateClipForTarget || !currentPdfObject) {
     updateClipAnchor(tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
   }
@@ -2413,16 +2634,17 @@ function updateClipAnchor(center: THREE.Vector3, radius: number): void {
   currentContentRadius = Math.max(MIN_OBJECT_EXTENT, radius);
 }
 
-function updateCameraClipping(force = false): void {
-  const distanceToTarget = camera.position.distanceTo(controls.target);
-  const targetOffset = tempClipDelta.subVectors(currentContentCenter, controls.target).length();
-  const span = Math.max(MIN_OBJECT_EXTENT, currentContentRadius + targetOffset);
+function updateCameraClipping(force = false, targetCamera = camera, target = controls.target,
+  contentCenter = currentContentCenter, contentRadius = currentContentRadius): void {
+  const distanceToTarget = targetCamera.position.distanceTo(target);
+  const targetOffset = tempClipDelta.subVectors(contentCenter, target).length();
+  const span = Math.max(MIN_OBJECT_EXTENT, contentRadius + targetOffset);
   const margin = span * CAMERA_CLIP_MARGIN_MULTIPLIER;
   // No content is nearer than the clip sphere's closest view depth. Keeping the
   // near plane just in front of it preserves depth precision for 3D page layouts.
   const contentDepth = distanceToTarget > 0
-    ? tempClipDelta.subVectors(currentContentCenter, camera.position)
-      .dot(tempClipForward.subVectors(controls.target, camera.position)) / distanceToTarget - currentContentRadius
+    ? tempClipDelta.subVectors(contentCenter, targetCamera.position)
+      .dot(tempClipForward.subVectors(target, targetCamera.position)) / distanceToTarget - contentRadius
     : 0;
 
   const nextNear = Math.max(
@@ -2433,13 +2655,13 @@ function updateCameraClipping(force = false): void {
 
   if (
     !force &&
-    Math.abs(camera.near - nextNear) <= CAMERA_CLIP_UPDATE_EPSILON &&
-    Math.abs(camera.far - nextFar) <= CAMERA_CLIP_UPDATE_EPSILON
+    Math.abs(targetCamera.near - nextNear) <= CAMERA_CLIP_UPDATE_EPSILON &&
+    Math.abs(targetCamera.far - nextFar) <= CAMERA_CLIP_UPDATE_EPSILON
   ) {
     return;
   }
 
-  camera.near = nextNear;
-  camera.far = nextFar;
-  camera.updateProjectionMatrix();
+  targetCamera.near = nextNear;
+  targetCamera.far = nextFar;
+  targetCamera.updateProjectionMatrix();
 }

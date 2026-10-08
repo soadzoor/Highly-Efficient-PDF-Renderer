@@ -35,7 +35,10 @@ import type {
 // Version 9 replaces iccFallback with four ICC engine modes and automatic fallback.
 // Retained page color stores remain at version 8.
 // Older workers must not silently ignore the requested color behavior.
-export const PDF_WORKER_PROTOCOL_VERSION = 10 as const;
+// Version 11 adds bounded page previews; old workers must not transfer full-resolution pages instead.
+// Version 12 requires workers to honor text-only viewing instead of decoding scans.
+// Version 13 preserves vector overviews and substitutes OCR before scan decoding.
+export const PDF_WORKER_PROTOCOL_VERSION = 13 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -89,6 +92,8 @@ export interface PdfWorkerCompileOptions {
 }
 
 export interface PdfWorkerVectorCompileOptions extends PdfWorkerCompileOptions {
+  readonly ocrTextOnly?: boolean;
+  readonly previewMaxDimension?: number;
   readonly vectorFallback?: NativeVectorCompileOptions["vectorFallback"];
   readonly enableSegmentMerge?: NativeVectorCompileOptions["enableSegmentMerge"];
   readonly enableInvisibleCull?: NativeVectorCompileOptions["enableInvisibleCull"];

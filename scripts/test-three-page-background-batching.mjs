@@ -16,6 +16,7 @@ try {
   const { HEPR_THREE_LAYER_ORDER_PAGE_BACKGROUND } = await import("../src/threeLayerOrder.ts");
   const { applyThreePdfOverlayPaintOrder } = await import("../src/threePdfPaintOrder.ts");
   const scene = { ...createEmptyVectorScene(), pageCount: 396,
+    pendingPagePreviews: Uint8Array.from({ length: 396 }, (_, i) => i === 2 ? 1 : 0),
     pageRects: Float32Array.from({ length: 396 * 4 }, (_, i) =>
       [Math.floor(i / 4) * 20 - 100, -10, Math.floor(i / 4) * 20 - 90, .25][i % 4]) };
   const canonical = structuredClone(scene);
@@ -39,6 +40,9 @@ try {
     assert.equal(material.blendDst, THREE.OneMinusSrcAlphaFactor);
     const corners = geometry.getAttribute("aCorner"), index = geometry.index;
     const rects = geometry.getAttribute("aPageRect");
+    const pending = geometry.getAttribute("aPageLoading");
+    assert.equal(pending.isInstancedBufferAttribute, true);
+    assert.deepEqual(Array.from(pending.array), Array.from(scene.pendingPagePreviews));
     assert.equal(corners.count, 4, "all pages reuse the unit quad");
     assert.equal(rects.isInstancedBufferAttribute, true);
     assert.equal(rects.meshPerAttribute, 1);
@@ -65,6 +69,8 @@ try {
       assert.equal(material.isRawShaderMaterial, true);
       assert.equal(material.defines.INSTANCED_PAGE_BACKGROUNDS, 1);
       assert.match(material.vertexShader, /aPageRect.xy \+ aPageRect.zw \* localTopDown/);
+      assert.match(material.fragmentShader, /heprPagePlaceholder\(color,vUv,vPageLoading,uPagePlaceholderTime\)/);
+      assert(material.uniforms.uPagePlaceholderTime.value >= 0);
       assert.equal(material.uniforms.uUseLocalToClip.value, 1);
       assert.deepEqual(material.uniforms.uLocalToClip.value.elements, projection.elements);
       assert.deepEqual(material.uniforms.uRasterMatrixABCD.value.toArray(), [1,0,0,1]);
@@ -73,6 +79,15 @@ try {
       assert.equal(material.isNodeMaterial, true);
       assert.equal(entry.webGpuState.useLocalToClipUniform.value, 1);
       const shaders = build(material, geometry);
+      const samplerNames = new Set(shaders.fragmentShader.match(/\b\w+_sampler\b/g) ?? []);
+      assert(samplerNames.size > 0, "page background sampling uses a texture sampler");
+      const samplerBindings = shaders.getBindings().flatMap(group => group.bindings)
+        .filter(binding => binding.isSampler).map(binding => binding.name);
+      for (const name of samplerNames) {
+        assert.match(shaders.fragmentShader, new RegExp(`\\bvar\\s+${name}\\s*:\\s*sampler\\s*;`),
+          `page background sampler ${name} is declared in WGSL`);
+        assert(samplerBindings.includes(name), `page background sampler ${name} has a GPU binding`);
+      }
       assert.match(shaders.vertexShader, /heprPageBackgroundPack/);
       assert.match(shaders.vertexShader, /aPageRect/);
       assert.doesNotMatch(shaders.vertexShader, /fn heprRasterPack\s*\(/);
@@ -80,6 +95,10 @@ try {
       assert.equal(attribute.type, "vec4");
       assert.match(shaders.vertexShader, /heprRasterClipPosition/);
       assert.match(shaders.fragmentShader, /heprRasterFragment/);
+      assert.match(shaders.fragmentShader, /fn heprPagePlaceholder\s*\(/);
+      assert.match(shaders.fragmentShader, /fn heprPlaceholderBar\s*\(/);
+      assert.match(shaders.vertexShader, /aPageLoading/);
+      assert(entry.webGpuState.pagePlaceholderTimeUniform.value >= 0);
     }
     layer.setScreenSpaceTransform();
     assert.equal(backend === "webgl" ? material.uniforms.uUseLocalToClip.value : entry.webGpuState.useLocalToClipUniform.value, 0);

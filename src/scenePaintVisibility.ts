@@ -81,6 +81,8 @@ export class ScenePaintVisibility {
     const visible = (condition?: number): boolean => condition === undefined || snapshot.conditions[condition] === 1;
     const runs: VectorDrawRun[] = [];
     for (const run of this.orderedRuns) {
+      const alternative = run.pdfRepresentation;
+      if (alternative && alternative.detail !== (snapshot.rasterPages?.has(alternative.pageIndex) ?? false)) continue;
       if (!isScenePaintRunVisible(this.scene, run, visible)) continue;
       this.eligible.add(run);
       runs.push(run);

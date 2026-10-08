@@ -163,6 +163,12 @@ try {
   renderer = { setOptionalContentVisibility(value) { applied = value; } };
   native.rendererChanged(); assert.equal(applied.revision, revision); assert.equal(applied.conditions[0], 1);
   currentScene = structuredClone(scene); native.sceneChanged(); assert.equal(applied.conditions[0], 0);
+  await native.setLayerVisibility("upper", true);
+  currentScene = createEmptyVectorScene(); await native.sceneChanged(true);
+  currentScene = structuredClone(scene); await native.sceneChanged(true);
+  assert.equal(applied.conditions[0], 1, "page-cache scene changes retain visibility even when a layer temporarily disappears");
+  currentScene = structuredClone(scene); await native.sceneChanged();
+  assert.equal(applied.conditions[0], 0, "opening another document still resets visibility");
   assert.deepEqual(scene, original, "queries, renderer filters, and visibility state leave source buffers unchanged");
   native.dispose(); layers.dispose(); picker.dispose();
   console.log("Layer interaction passed: paint eligibility, inspection, hidden OCR, Three visibility and backend replay.");

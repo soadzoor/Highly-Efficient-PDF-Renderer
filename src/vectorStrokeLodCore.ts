@@ -433,7 +433,10 @@ class StrokeLodRecordSink {
   }
 
   finish(): VectorScene {
-    const literals: VectorScene = { ...this.canonical, segmentCount: this.literalCount };
+    const literals = Object.assign(
+      Object.defineProperties({}, Object.getOwnPropertyDescriptors(this.canonical)) as VectorScene,
+      { segmentCount: this.literalCount }
+    );
     STROKE_LOD_FIELDS.forEach((key, index) => {
       literals[key] = new Float32Array(this.fields[index].toTypedArray().buffer);
     });
@@ -2783,7 +2786,9 @@ export function storeVectorStrokeLod(scene: VectorScene, data: StoredVectorStrok
 function restoreVectorStrokeLodBuild(scene: VectorScene, data: StoredVectorStrokeLod): VectorStrokeLodRuntimeBuildData {
   // Keep canonical buffer identity; transfer packets contain derived records
   // and bounds only, while selection stamps remain exclusive to each viewer.
-  const literals = { ...scene, ...data.literals };
+  const literals = Object.assign(
+    Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene, data.literals
+  );
   setStrokePaintOrigins(literals, data.origins);
   const store = { canonical: scene, literals };
   let prepared = preparedStoredBounds.get(data);
@@ -2807,7 +2812,9 @@ export async function prepareVectorStrokeLodData(scene: VectorScene, stored: Vec
   let levels: VectorStrokeLodBoundsSource["levels"];
   let bounds: StrokeLodStorageBounds;
   if (stored) {
-    const literals = { ...scene, ...stored.literals };
+    const literals = Object.assign(
+      Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene, stored.literals
+    );
     setStrokePaintOrigins(literals, stored.origins);
     bounds = await runStrokeLodBuildAsync(buildStrokeLodStorageBounds({ canonical: scene, literals }, 0, 0.9), scheduler);
     levels = stored.levels;
@@ -2847,7 +2854,9 @@ export async function rebuildStoredVectorStrokeLodIndexes(scene: VectorScene, da
   signal?.throwIfAborted();
   const scheduler = new VectorStrokeLodYieldScheduler({ yieldIntervalMs: 50, shouldCancel: () => signal?.aborted ?? false });
   await scheduler.maybeYield(true, 0, "Restoring Vector LOD indexes");
-  const literals = { ...scene, ...data.literals };
+  const literals = Object.assign(
+    Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene, data.literals
+  );
   setStrokePaintOrigins(literals, data.origins);
   const bounds = await runStrokeLodBuildAsync(buildStrokeLodStorageBounds({ canonical: scene, literals }, 0, 0.2), scheduler);
   const levels: StoredVectorStrokeLod["levels"] = [];

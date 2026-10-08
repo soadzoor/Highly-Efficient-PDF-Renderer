@@ -34,10 +34,13 @@ export class ThreeVectorDrawPlan {
   private readonly all: readonly number[];
   private ordered: number[];
   private readonly positionOfRun: Int32Array;
+  /** Material layers can wait for the first camera schedule before allocating batches. */
+  readonly deferInitialBatches: boolean;
 
-  constructor(scene: VectorScene, independentPageRuns: Uint16Array | null = null) {
+  constructor(scene: VectorScene, independentPageRuns: Uint16Array | null = null, deferInitialBatches = false) {
     this.scene = scene;
     this.independentPageRuns = independentPageRuns;
+    this.deferInitialBatches = deferInitialBatches;
     const runs = scene.drawRuns ?? [];
     this.all = Array.from({ length: runs.length }, (_, index) => index);
     this.ordered = [...this.all];

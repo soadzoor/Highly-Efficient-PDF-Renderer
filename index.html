@@ -44,6 +44,18 @@
           <label for="text-selection-checkbox">Text Selection</label>
           <input id="text-selection-checkbox" type="checkbox" checked />
         </div>
+        <div class="number-row" title="PDF only. Reconstruct stored text with substitute fonts; omit pictures and diagrams. Pages without stored text are blank.">
+          <label for="ocr-text-checkbox">Use OCR text instead of scans</label>
+          <input id="ocr-text-checkbox" type="checkbox" />
+        </div>
+        <div class="number-row" title="PDF only. Show large documents progressively as you navigate. Off loads all page overviews before display; scan detail still loads on zoom.">
+          <label for="page-streaming-checkbox">Stream pages</label>
+          <input id="page-streaming-checkbox" type="checkbox" />
+        </div>
+        <div class="number-row" title="PDF only. Load every selected page and prepare scan textures during parsing for faster zoom refinement. Uses more loading time and CPU memory. Overrides page streaming; packed monochrome scans remain lossless, while color and grayscale compression may soften fine text.">
+          <label for="compress-scans-checkbox">GPU compress scans</label>
+          <input id="compress-scans-checkbox" type="checkbox" checked />
+        </div>
         <div class="number-row">
           <label for="annotation-bubbles-checkbox">Annotation bubbles</label>
           <input id="annotation-bubbles-checkbox" type="checkbox" checked />

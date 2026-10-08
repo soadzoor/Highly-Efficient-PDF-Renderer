@@ -7,6 +7,7 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import type { AnnotationAppearanceMode } from "./annotationData";
 import { waitForLoad } from "./loadCancellation";
+import { validateSourcePdfByteLength } from "./hepSizePolicy";
 
 /** Compression algorithm used inside a generated HEP file. */
 export type HepCompression = "deflate" | "store";
@@ -16,7 +17,13 @@ export interface HepEncodingOptions extends HepLodOptions {
   /** Override the source name written to the HEP manifest. */
   sourceLabel?: string;
 
-  /** Encode raster layers as WebP/PNG when supported; otherwise store raw RGBA. @default true */
+  /** Original PDF byte length; warn when the generated HEP is at least as large. */
+  sourcePdfByteLength?: number;
+
+  /** Receives export warnings, including a HEP larger than the original PDF. */
+  onWarning?: (message: string) => void;
+
+  /** Encode color rasters as WebP/PNG when supported. Monochrome layers always retain packed bits. @default true */
   encodeRasterImages?: boolean;
 
   /** HEP compression algorithm. @default "deflate" */
@@ -29,7 +36,11 @@ export interface HepEncodingOptions extends HepLodOptions {
   signal?: AbortSignal;
 }
 
-/** Options when building parsed data directly from an accepted PDF source. */
+/**
+ * Options when building complete parsed data directly from a PDF source.
+ * Viewing options (compressScans, ocrTextOnly, pageLoading) do not apply here.
+ * HEP stores canonical image pixels; GPU display preparations are not serialized.
+ */
 export interface BuildHepFromPdfOptions extends HepEncodingOptions, PdfIccOptions {
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
@@ -94,6 +105,7 @@ export async function buildHep(
 }
 
 function validateEncodingOptions(options: HepEncodingOptions): void {
+  validateSourcePdfByteLength(options.sourcePdfByteLength);
   if (options.vectorLodPrecision !== undefined && !["lossless", "compact"].includes(options.vectorLodPrecision)) {
     throw new RangeError("vectorLodPrecision must be lossless or compact.");
   }

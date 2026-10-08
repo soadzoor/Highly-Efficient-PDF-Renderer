@@ -266,6 +266,8 @@ export interface DensePdfMarkedContentPropertyDefinition {
   readonly optionalContentIndex: number;
   readonly defaultVisible: boolean;
   readonly mcid: number;
+  /** PDF text-string bytes replacing this sequence's extracted glyph text. */
+  readonly actualText?: Uint8Array;
   /** The resource resolver diagnosed a missing /OC property and retained its paint. */
   readonly unresolvedOptionalContent?: boolean;
 }
@@ -1242,6 +1244,10 @@ export interface DensePdfResourceReferences {
 
 export interface DensePdfResourceScanOptions {
   readonly signal?: AbortSignal;
+  /** Internal overview inspection; image payloads remain unregistered and undecoded. */
+  readonly onInlineImage?: () => void;
+  /** Internal text-only interpreter; operands use the native text sink representation. */
+  readonly onOperator?: (operator: string, operands: readonly unknown[], markedContentProperty?: import("./nativeCos").PdfValue) => void;
 }
 
 /**
@@ -1270,7 +1276,7 @@ export function scanDensePdfPreparedResourceReferences(
   options: DensePdfResourceScanOptions = {}
 ): DensePdfResourceReferences {
   options.signal?.throwIfAborted();
-  const scanner = new DensePdfResourceReferenceScanner();
+  const scanner = new DensePdfResourceReferenceScanner(options.onOperator);
   let tokenCount = 0;
   const lexer = new IncrementalPdfLexer((token) => {
     if ((tokenCount++ & 0xfff) === 0) options.signal?.throwIfAborted();
@@ -1282,6 +1288,7 @@ export function scanDensePdfPreparedResourceReferences(
     if (segment.kind === "image") {
       lexer.finish();
       scanner.consumeInlineImage();
+      options.onInlineImage?.();
     } else {
       lexer.feed(segment.bytes, false, segment.sourceOffset);
     }
@@ -1379,7 +1386,8 @@ function validateMarkedContentDefinitions(
         (typeof definition.unresolvedOptionalContent !== "boolean" ||
           (definition.unresolvedOptionalContent &&
             (definition.optionalContentIndex !== -1 || !definition.defaultVisible)))) ||
-      !Number.isSafeInteger(definition.mcid) || definition.mcid < -1
+      !Number.isSafeInteger(definition.mcid) || definition.mcid < -1 ||
+      (definition.actualText !== undefined && !(definition.actualText instanceof Uint8Array))
     ) {
       throw new TypeError(`markedContentProperties contains an invalid /${resourceName} definition.`);
     }
@@ -2987,6 +2995,11 @@ class DenseContentCompiler {
           );
         }
         this.beginMarkedContent(tag, null, -1, -1, true, operator);
+        this.textSink?.applyOperator(operator, [tag], {
+          outputEnabled: this.contentVisible,
+          optionalContentIndex: this.activeOptionalContentIndex,
+          markedContentIndex: this.activeMarkedContentIndex
+        });
         return;
       }
       case "BDC": {
@@ -2998,6 +3011,7 @@ class DenseContentCompiler {
         let optionalContentIndex = -1;
         let defaultVisible = true;
         let mcid = -1;
+        let actualText: Uint8Array | null = null;
         if (isPdfName(property)) {
           propertyName = property.value;
           implicitVisibleOptionalScope = tag === "OC" &&
@@ -3012,6 +3026,7 @@ class DenseContentCompiler {
               implicitVisibleOptionalScope = definition.unresolvedOptionalContent === true;
             }
             mcid = definition.mcid;
+            actualText = definition.actualText ?? null;
           }
         } else if (!isPdfDictionary(property)) {
           throw new DensePdfSyntaxError("BDC property operand must be a name or dictionary.");
@@ -3023,6 +3038,11 @@ class DenseContentCompiler {
             );
           }
           mcid = readInlineMcid(property, operator);
+          const value = property.value.find(([key]) => key === "ActualText")?.[1];
+          if (value !== undefined && value !== null) {
+            if (!isPdfString(value)) throw new DensePdfSyntaxError("BDC /ActualText must be a byte string.");
+            actualText = value.value;
+          }
         }
         if (
           tag === "OC" && optionalContentIndex < 0 && !implicitVisibleOptionalScope &&
@@ -3041,6 +3061,11 @@ class DenseContentCompiler {
           defaultVisible,
           operator
         );
+        this.textSink?.applyOperator(operator, [tag, actualText], {
+          outputEnabled: this.contentVisible,
+          optionalContentIndex: this.activeOptionalContentIndex,
+          markedContentIndex: this.activeMarkedContentIndex
+        });
         return;
       }
       case "EMC":
@@ -3049,6 +3074,11 @@ class DenseContentCompiler {
           throw new DensePdfSyntaxError("EMC has no matching BMC or BDC scope.");
         }
         this.syncActiveMarkedContent();
+        this.textSink?.applyOperator(operator, [], {
+          outputEnabled: this.contentVisible,
+          optionalContentIndex: this.activeOptionalContentIndex,
+          markedContentIndex: this.activeMarkedContentIndex
+        });
         return;
       case "MP":
         this.requireArgs(operator, args, 1);
@@ -4829,6 +4859,11 @@ class DenseContentCompiler {
 }
 
 class DensePdfResourceReferenceScanner {
+  private readonly onOperator?: DensePdfResourceScanOptions["onOperator"];
+
+  constructor(onOperator?: DensePdfResourceScanOptions["onOperator"]) {
+    this.onOperator = onOperator;
+  }
   readonly xObjects = new Set<string>();
 
   readonly properties = new Set<string>();
@@ -4947,6 +4982,8 @@ class DensePdfResourceReferenceScanner {
         break;
       }
     }
+    this.onOperator?.(token.value, this.operands.map(toTextSinkOperand),
+      token.value === "BDC" ? contentOperandToCos(this.operands[1]) : undefined);
     this.operands.length = 0;
   }
 
@@ -5007,6 +5044,13 @@ class DensePdfResourceReferenceScanner {
         : { kind: "dictionary", value: container.entries }
     );
   }
+}
+
+function contentOperandToCos(value: PdfValue): import("./nativeCos").PdfValue {
+  if (isPdfArray(value)) return value.value.map(contentOperandToCos);
+  if (isPdfDictionary(value)) return new Map(value.value.map(([key, entry]) => [key, contentOperandToCos(entry)]));
+  if (isPdfString(value)) return { kind: "string", bytes: value.value, hex: false };
+  return value;
 }
 
 class IncrementalPdfLexer {

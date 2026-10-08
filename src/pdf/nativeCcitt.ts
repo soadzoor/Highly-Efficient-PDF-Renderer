@@ -46,6 +46,8 @@ export interface NativeCcittDecodeResult {
   readonly damagedRows: number;
   readonly bitsConsumed: number;
   readonly bytesConsumed: number;
+  /** Reader operations and transitions, including speculative reads. */
+  readonly work: number;
   readonly terminatedBy: "end-of-block" | "rows" | "end-of-data";
 }
 
@@ -270,6 +272,7 @@ export function decodeNativeCcittFax(
     damagedRows,
     bitsConsumed: reader.position,
     bytesConsumed: Math.ceil(reader.position / 8),
+    work: reader.work + budget.work,
     terminatedBy
   };
 }
@@ -714,6 +717,7 @@ function enforceNextDecodedRow(
 }
 
 class MsbBitReader {
+  get work(): number { return this.scanCount; }
   private readonly bytes: Uint8Array;
   private readonly maxScanBits: number;
   private readonly signal?: AbortSignal;
@@ -856,6 +860,7 @@ class MsbBitReader {
 }
 
 class TransitionBudget {
+  get work(): number { return this.count; }
   private count = 0;
   private readonly limit: number;
   private readonly signal?: AbortSignal;

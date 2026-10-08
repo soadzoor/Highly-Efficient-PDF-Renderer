@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { evaluateGlsl } from "./lib/scalarShaderEval.mjs";
 
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
@@ -68,6 +69,41 @@ try {
     assert.equal(coverage({ x: 2, y: 2 }, bounds(3, 3, 1, 1)), 0, "empty rectangles stay empty");
   }
   assert(oldSeams > 0, "the zoom sweep must reproduce the previous tile seam");
+
+  // Execute the shipped wrapper: changing its return control flow must keep
+  // tile seams solid without changing the exact polygon winding or its AA.
+  const polygonSource = RASTER_CLIP_GLSL.match(/uint heprRasterClipPolygonSamples\([\s\S]*?\n}/)[0];
+  const rectEdges = [bounds(0, 0, 10, 0), bounds(10, 0, 10, 10),
+    bounds(10, 10, 0, 10), bounds(0, 10, 0, 0)];
+  const roundedEdges = [bounds(0, 0, 10, 0.001), bounds(10, 0.001, 10.001, 10),
+    bounds(10.001, 10, 0.001, 10.001), bounds(0.001, 10.001, 0, 0)];
+  const rotatedEdges = [bounds(0, 5, 5, 0), bounds(5, 0, 10, 5),
+    bounds(10, 5, 5, 10), bounds(5, 10, 0, 5)];
+  const point = { x: 2.5, y: 4.5 }, sampleX = bounds(2.125, 2.375, 2.625, 2.875);
+  const sampleY = bounds(4.125, 4.375, 4.625, 4.875), span = 0.75;
+  for (const [label, edges, count, flags, centered] of [
+    ["axis-aligned tile", rectEdges, 4, 0, true],
+    ["rounded tile", roundedEdges, 4, 1, true],
+    ["rotated quad", rotatedEdges, 4, 0, false],
+    ["banded polygon", rectEdges, 4, 2, false],
+    ["cell-indexed polygon", rectEdges, 4, 4, false],
+    ["non-quad polygon", rectEdges, 3, 0, false]
+  ]) {
+    const node = bounds(-1, 37, count, flags), reads = [], samples = [];
+    const { heprRasterClipPolygonSamples } = evaluateGlsl(polygonSource.replace(/^uint /, "float "), {
+      vec4: value => bounds(value, value, value, value),
+      heprClipTexel: index => { reads.push(index); return edges[index - node.y]; },
+      heprClipPolygonSamples: (...args) => { samples.push(args); return 0x5A69; }
+    });
+    assert.equal(heprRasterClipPolygonSamples(node, point, sampleX, sampleY, span), 0x5A69,
+      `${label} preserves the exact winding sample mask`);
+    assert.deepEqual(samples, [[node,
+      centered ? bounds(point.x, point.x, point.x, point.x) : sampleX,
+      centered ? bounds(point.y, point.y, point.y, point.y) : sampleY,
+      centered ? 0 : span]], `${label} evaluates polygon coverage once with the correct footprint`);
+    assert.deepEqual(reads, count === 4 && (flags & 6) === 0 ? [37, 38, 39, 40] : [],
+      `${label} reads edges only for a candidate tile quad`);
+  }
 
   for (const source of [RASTER_CLIP_GLSL, RASTER_CLIP_WGSL]) {
     assert.match(source, /samples &= (?:node.z < 0.0 \? )?heprRasterClipRectSamples/);

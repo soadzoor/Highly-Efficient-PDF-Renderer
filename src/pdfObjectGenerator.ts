@@ -14,6 +14,8 @@ import type { PdfIccOptions } from "./pdf/nativeIcc";
 import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import type { NativeImageCodecResolver } from "./pdf/nativeImage";
 import { validateAnnotationAppearanceMode, type AnnotationAppearanceMode } from "./annotationData";
+import { openPdfPageDemand, type PdfPageDemandLoader } from "./pdfPageDemand";
+import { resolvePdfViewingOptions } from "./pdfViewingOptions";
 
 /**
  * Source input accepted by HEPR loaders.
@@ -30,9 +32,11 @@ export type PdfObjectSourceKind = "pdf" | "hep";
  * Options used while loading and parsing a source into HEPR scene data.
  */
 export interface PdfObjectGeneratorOptions extends PdfIccOptions {
+  /** Override the human-readable source label (for example, when reopening retained bytes). */
+  sourceLabel?: string;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
-  /** Receives PDF diagnostics, including warnings when ICC fallback is used. */
+  /** Receives PDF diagnostics, including viewing-option conflicts and ICC fallback warnings. Option conflicts also warn on the console. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 
   /** Cancel source reading, parsing, LOD preparation, and object creation. */
@@ -81,6 +85,34 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
    * Omit to let HEPR choose a compact grid.
    */
   maxPagesPerRow?: number;
+
+  /**
+   * All prepares every viewing page before display; auto streams large PDFs;
+   * eager also decodes original scan pixels. Compatible with ocrTextOnly.
+   * Effective compressScans overrides auto with eager and emits
+   * options.compress-scans-streaming-conflict through onDiagnostic and console.warn.
+   * @default "all"
+   */
+  pageLoading?: "all" | "auto" | "eager";
+
+  /**
+   * Decode all selected PDF pages and prepare bounded scan textures during
+   * parsing: compact monochrome or eligible lossy color/grayscale.
+   * ocrTextOnly takes precedence and disables this option with an
+   * options.compress-scans-ocr-conflict warning. Otherwise this overrides
+   * pageLoading auto with eager and an options.compress-scans-streaming-conflict warning.
+   * Warnings use onDiagnostic and console.warn; HEP sources ignore these PDF options.
+   * @default false
+   */
+  compressScans?: boolean;
+
+  /**
+   * PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding.
+   * Disables compressScans with an options.compress-scans-ocr-conflict warning
+   * through onDiagnostic and console.warn; the requested pageLoading mode remains available.
+   * @default false
+   */
+  ocrTextOnly?: boolean;
 
   /**
    * Progress callback for source loading, PDF parsing, HEP loading, vector/text
@@ -158,6 +190,10 @@ export interface LoadedPdfScene {
 
   /** Original source bytes. */
   sourceBytes: Uint8Array;
+  /** Viewing-only worker/cache; complete extraction and HEP export remain eager. */
+  pageDemand?: PdfPageDemandLoader;
+  /** Resolved PDF options; conflicting viewing flags are normalized without changing the caller's options. */
+  sourceOptions?: PdfObjectGeneratorOptions;
 }
 
 /**
@@ -167,16 +203,25 @@ export async function loadPdfSceneFromSource(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions = {},
   /** @internal Used by HEP export to cancel source loading and parsing. */
-  signal: AbortSignal | undefined = options.signal
+  signal: AbortSignal | undefined = options.signal,
+  /** @internal Only the Three viewer factory requests a partial viewing scene. */
+  demandLoading = false
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
-  return waitForLoad(loadPdfSceneFromSourceInternal(source, options, signal), signal);
+  const pending = loadPdfSceneFromSourceInternal(source, options, signal, demandLoading);
+  try { return await waitForLoad(pending, signal); }
+  catch (error) {
+    // A metadata session can finish just after its caller cancels. Drain and close that unclaimed worker.
+    void pending.then(loaded => loaded.pageDemand?.close()).catch(() => {});
+    throw error;
+  }
 }
 
 async function loadPdfSceneFromSourceInternal(
   source: PdfObjectSource,
   options: PdfObjectGeneratorOptions,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  demandLoading = false
 ): Promise<LoadedPdfScene> {
   signal?.throwIfAborted();
   const progress = createLoadProgressReporter(options.onProgress);
@@ -187,11 +232,14 @@ async function loadPdfSceneFromSourceInternal(
   );
   signal?.throwIfAborted();
   const sourceKind = resolveSourceKind(source, sourceBytes, options.sourceKind);
-  const sourceLabel = resolveSourceLabel(source, sourceKind);
+  const sourceLabel = options.sourceLabel ?? resolveSourceLabel(source, sourceKind);
 
   if (sourceKind === "pdf") {
     validateAnnotationAppearanceMode(options.annotationAppearances);
+    options = { ...options, ...resolvePdfViewingOptions(options) };
     const extractOptions: VectorExtractOptions = {
+      compressScans: options.compressScans,
+      ocrTextOnly: options.ocrTextOnly,
       password: options.password,
       imageCodecResolver: options.imageCodecResolver,
       iccTransformResolver: options.iccTransformResolver,
@@ -204,6 +252,30 @@ async function loadPdfSceneFromSourceInternal(
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
+    if (demandLoading && options.pageLoading !== "eager" && !options.compressScans) {
+      const loader = await openPdfPageDemand(createParseBuffer(sourceBytes), extractOptions, () => {}, signal);
+      try {
+        signal?.throwIfAborted();
+        const streaming = options.pageLoading === "auto";
+        if (!streaming || loader.pageCount <= 16) await loader.loadInitialOverviews(signal, !streaming);
+        if ((streaming && loader.pageCount > 16) || loader.requiresPageDemand) {
+          const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
+          const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.displayPageScenes, pagesPerRow, options.onDiagnostic));
+          scene.sourcePdfByteLength = sourceBytes.byteLength;
+          loader.bindDisplayScene(scene);
+          progress.complete({ sourceType: "pdf" });
+          signal?.throwIfAborted();
+          return { scene, sourceLabel, sourceKind, sourceBytes, pageDemand: loader, sourceOptions: options };
+        }
+        const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, loader.pageCount);
+        const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(loader.pageScenes, pagesPerRow, options.onDiagnostic));
+        scene.sourcePdfByteLength = sourceBytes.byteLength;
+        await loader.close();
+        progress.complete({ sourceType: "pdf" });
+        signal?.throwIfAborted();
+        return { scene, sourceLabel, sourceKind, sourceBytes, sourceOptions: options };
+      } catch (error) { await loader.close(); throw error; }
+    }
     const pageScenes = await extractPdfPageScenes(
       createParseBuffer(sourceBytes),
       extractOptions,
@@ -213,6 +285,7 @@ async function loadPdfSceneFromSourceInternal(
     signal?.throwIfAborted();
     const pagesPerRow = normalizePagesPerRow(options.maxPagesPerRow, pageScenes.length);
     const scene = prepareSceneForHepRendering(composeVectorScenesInGrid(pageScenes, pagesPerRow, options.onDiagnostic));
+    scene.sourcePdfByteLength = sourceBytes.byteLength;
     signal?.throwIfAborted();
     progress.report(0.93, { stage: "compile", sourceType: "pdf" });
     signal?.throwIfAborted();
@@ -222,7 +295,8 @@ async function loadPdfSceneFromSourceInternal(
       scene,
       sourceLabel,
       sourceKind,
-      sourceBytes
+      sourceBytes,
+      sourceOptions: options
     };
   }
 

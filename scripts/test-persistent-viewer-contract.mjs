@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 
 const mainSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+const threeHtml = await readFile(new URL("../three-example.html", import.meta.url), "utf8");
 const zipSource = await readFile(new URL("../src/hepShared.ts", import.meta.url), "utf8");
 
 assert.match(
@@ -22,7 +23,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /const\s+pageScenes\s*=\s*await\s+[A-Za-z_$][\w$]*\s*\([\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
+  /pageScenes\s*=\s*candidate\.displayPageScenes[\s\S]*?scene\s*=\s*composeVectorScenesInGrid\s*\(/,
   "any PDF parser must feed the established VectorScene composition pipeline"
 );
 assert.match(
@@ -30,16 +31,26 @@ assert.match(
   /\bprebuildVectorStrokeLodRuntime\b[\s\S]*\bprebuildTextLod\b[\s\S]*\.setScene\s*\(/,
   "LOD generation and persistent scene upload must remain intact"
 );
-assert.match(
-  mainSource,
-  /async\s+function\s+downloadHep\b[\s\S]*?\bbuildHep\s*\(\s*scene\s*,\s*\{/,
-  "HEP export must serialize the already-loaded VectorScene"
-);
+const downloadHep = readFunctionBody(mainSource, "downloadHep");
+assert.match(downloadHep, /\blet\s+exportScene\s*=\s*scene\s*;/,
+  "complete loaded scenes must be reused directly for HEP export");
+assert.match(downloadHep, /\bbuildHep\s*\(\s*exportScene\s*,\s*buildOptions\s*\)/,
+  "HEP export must serialize the canonical VectorScene");
 assert.doesNotMatch(
-  readFunctionBody(mainSource, "downloadHep"),
+  downloadHep,
   /\bopenPdf\b|\bparsePdf\b|\bcompilePdfForBatchExport\b/,
-  "HEP export must not parse the source PDF a second time or switch data models"
+  "HEP export must use the shared builder instead of an independent parser"
 );
+assert.match(mainSource, /pageScenes\s*=\s*candidate\.displayPageScenes/, "large PDFs compose metadata-backed page windows");
+assert.match(downloadHep,
+  /pageLoader\.loadCompletePageScenes\s*\([\s\S]*?exportScene\s*=\s*prepareSceneForHepRendering\s*\(\s*composeVectorScenesInGrid\s*\([\s\S]*?buildHep\s*\(\s*exportScene/,
+  "partial page windows must complete and compose the original document before export");
+assert.equal((downloadHep.match(/\bloadCompletePageScenes\s*\(/g) ?? []).length, 1,
+  "HEP export completes the live PDF session once");
+assert.equal((downloadHep.match(/\bbuildHep\s*\(/g) ?? []).length, 1,
+  "HEP export serializes one fast file");
+assert.doesNotMatch(downloadHep, /\bbuildHep\s*\(\s*(?:lastLoadedSource|source)\.bytes/,
+  "HEP encoding must use the completed scene without reparsing the original PDF");
 assert.doesNotMatch(
   mainSource,
   /\brenderHeprPageToCanvas2d\b/,
@@ -64,6 +75,18 @@ assert.match(vectorLodSelect.content, /<option\s+value="auto"\s+selected>Auto<\/
 const textLodSelect = readSelect(html, "text-lod-mode");
 assert.doesNotMatch(textLodSelect.openingTag, /\bdisabled\b/i);
 assert.match(textLodSelect.content, /<option\s+value="auto"\s+selected>Auto<\/option>/i);
+
+for (const [name, document] of [["native", html], ["Three", threeHtml]]) {
+  const scanCompression = /<input\b[^>]*\bid=["']compress-scans-checkbox["'][^>]*>/i.exec(document);
+  assert.ok(scanCompression, `${name} viewer exposes GPU scan compression`);
+  assert.match(scanCompression[0], /\bchecked\b/i, `${name} viewer enables GPU scan compression by default`);
+  const pageStreaming = /<input\b[^>]*\bid=["']page-streaming-checkbox["'][^>]*>/i.exec(document);
+  assert.ok(pageStreaming, `${name} viewer exposes page streaming`);
+  assert.doesNotMatch(pageStreaming[0], /\bchecked\b/i, `${name} viewer defaults to mutually exclusive page loading modes`);
+  assert.match(document, /GPU compress scans/);
+  assert.doesNotMatch(document, /GPU compress scans\s*\(experimental\)/i,
+    `${name} viewer no longer labels GPU scan compression experimental`);
+}
 
 console.log("persistent viewer contract passed");
 

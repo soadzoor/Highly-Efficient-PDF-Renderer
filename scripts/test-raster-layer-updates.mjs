@@ -47,6 +47,14 @@ try {
     instance.scene = createEmptyVectorScene();
     assert.throws(() => stale.commit(), error => error.name === "AbortError"); stale.dispose();
     assert.equal(instance.getRasterLayerUpdates().get(0).data[0], 60, "old document cannot commit replacement");
+    instance.scene = source;
+    const beforeAsync = allocations;
+    const pending = instance.prepareRasterLayerUpdatesAsync(new Map([[0, layer(80)]]));
+    assert(instance.rasterStagedBytes > 0, "async work reserves its budget before yielding");
+    instance.scene = createEmptyVectorScene();
+    await assert.rejects(pending, error => error.name === "AbortError");
+    assert.equal(allocations, beforeAsync, "superseded async preparation never uploads into the new scene");
+    assert.equal(instance.rasterStagedBytes, 0, "superseded async work releases its reservation");
   }
   console.log("Native raster updates passed: atomic batches, source preservation, cancellation, residency transitions, stale documents.");
 } finally { hooks.deregister(); }

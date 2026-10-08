@@ -120,8 +120,8 @@ export const PDF_DIAGNOSTIC_SEVERITIES: readonly PdfDiagnosticSeverity[] = [
 ];
 
 /**
- * Stable diagnostic codes emitted by the v1 engine. New codes may be added in
- * minor releases, so consumers should always tolerate unknown strings.
+ * Stable diagnostic codes emitted by PDF loaders and the v1 engine. New codes
+ * may be added in minor releases, so consumers should tolerate unknown strings.
  */
 export const PDF_DIAGNOSTIC_CODES = {
   CatalogRepaired: "catalog.repaired",
@@ -147,6 +147,8 @@ export const PDF_DIAGNOSTIC_CODES = {
   ColorProfileFallback: "color.profile-fallback",
   SourceRangeFallback: "source.range-full-download",
   SourceValidatorUnavailable: "source.validator-unavailable",
+  CompressScansOcrConflict: "options.compress-scans-ocr-conflict",
+  CompressScansStreamingConflict: "options.compress-scans-streaming-conflict",
   OptimizationSkipped: "optimize.skipped"
 } as const;
 
@@ -207,10 +209,12 @@ export const HEPR_IMAGE_FORMAT = {
   Jpeg: 4,
   Jpeg2000: 5,
   Jbig2: 6,
-  Ccitt: 7
+  Ccitt: 7,
+  /** Canonical black/white pixels, MSB first with each row padded to a byte. */
+  Gray1: 8
 } as const;
 
-/** Bytes per pixel of a self-contained raw payload; zero for an encoded codec. */
+/** Bytes per pixel of a byte-aligned raw payload; zero for packed or encoded data. */
 export function heprRawImageBytesPerPixel(format: number): number {
   return format === HEPR_IMAGE_FORMAT.Gray8
     ? 1
@@ -223,12 +227,18 @@ export function heprRawImageBytesPerPixel(format: number): number {
           : 0;
 }
 
+/** Exact raw payload length, including row padding for packed binary images. */
+export function heprRawImageByteLength(format: number, width: number, height: number): number {
+  return format === HEPR_IMAGE_FORMAT.Gray1
+    ? Math.ceil(width / 8) * height
+    : width * height * heprRawImageBytesPerPixel(format);
+}
+
 /**
- * Widen a raw grayscale payload to the straight RGBA8 layout renderers upload
- * as a texture. A one-component source keeps its own byte per pixel at rest,
- * because a retained page serializes this store verbatim and an RGBA8 copy of
- * a grayscale soft mask is three redundant channels; only a consumer that needs
- * a texture pays the widening. An `Rgba8` payload is returned as-is, so a caller
+ * Widen raw grayscale to straight RGBA8 for consumers without a packed or
+ * single-channel path. Retained pages serialize their narrow image layouts;
+ * native GPU renderers can upload Gray1 without widening it. An `Rgba8`
+ * payload is returned as-is, so a caller
  * that mutates the result must copy it first. Any other format returns null for
  * the caller's own fallback.
  */
@@ -239,6 +249,21 @@ export function expandHeprImageToRgba8(
   height: number,
   signal?: AbortSignal
 ): Uint8Array | null {
+  if (format === HEPR_IMAGE_FORMAT.Gray1) {
+    const rowBytes = Math.ceil(width / 8);
+    if (!Number.isSafeInteger(width * height) || data.length !== rowBytes * height) return null;
+    const output = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      signal?.throwIfAborted();
+      for (let x = 0; x < width; x++) {
+        const value = ((data[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1) * 255;
+        const offset = (y * width + x) * 4;
+        output[offset] = output[offset + 1] = output[offset + 2] = value;
+        output[offset + 3] = 255;
+      }
+    }
+    return output;
+  }
   if (format === HEPR_IMAGE_FORMAT.Gray8 || format === HEPR_IMAGE_FORMAT.GrayAlpha8) {
     const stride = format === HEPR_IMAGE_FORMAT.GrayAlpha8 ? 2 : 1;
     const pixelCount = width * height;

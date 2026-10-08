@@ -99,6 +99,7 @@ import {
   isPdfDictionary,
   isPdfName,
   isPdfStream,
+  isPdfString,
   createNativeOptionalContentRegistry,
   openNativePdfDocument,
   type NativePdfOpenOptions,
@@ -219,6 +220,10 @@ export interface NativeVectorPdfSession extends PdfSession {
 
 /** @internal Established-renderer controls which are intentionally absent from the page-native API. */
 export interface NativeVectorCompileOptions extends PdfCompileOptions {
+  /** Viewing approximation: draw stored text with substitute fonts and skip image decoding. */
+  readonly ocrTextOnly?: boolean;
+  /** Content-aware overview: preserve vectors, use OCR for scans, bound scans without OCR. */
+  readonly previewMaxDimension?: number;
   /** Internal capability probes can require direct vector output. Normal loading falls back to pixels. */
   readonly vectorFallback?: "raster" | "error";
   /** Internal compatibility retry for features still using the grouped bridge. */
@@ -520,12 +525,73 @@ class NativePdfSession implements NativeVectorPdfSession {
     options: NativeVectorCompileOptions = {}
   ): Promise<VectorScene> {
     validateAnnotationAppearanceMode(options.annotationAppearances);
+    if (options.previewMaxDimension !== undefined && (!Number.isSafeInteger(options.previewMaxDimension) ||
+        options.previewMaxDimension < 16 || options.previewMaxDimension > 4096)) {
+      throw new RangeError("Page preview dimensions must be integers from 16 through 4096.");
+    }
     const operation = new AbortController();
     const signal = combineSignals(this.lifetime.signal, operation.signal, options.signal);
     let release: (() => void) | null = null;
     try {
       release = await this.acquireOperation(signal);
-      return await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
+      if (options.ocrTextOnly) {
+        const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
+        const scene = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
+          this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+        scene.pdfOverviewKind = "vector";
+        return scene;
+      }
+      let overviewKind: VectorScene["pdfOverviewKind"];
+      if (options.previewMaxDimension !== undefined) {
+        const { inspectNativePageOverview } = await import("./pdf/nativePageOverview");
+        try {
+          overviewKind = await inspectNativePageOverview(this.document, sourcePageIndex, options, signal, this.optionalContent);
+        } catch (error) {
+          signal.throwIfAborted();
+          if (!(error instanceof PdfError || error instanceof DensePdfSyntaxError) ||
+              (error instanceof PdfError && (error.code === "resource-limit" || error.code === "aborted"))) throw error;
+          overviewKind = "vector";
+          this.appendDiagnostics([{ code: "page-overview-inspection-unavailable", severity: "warning", pageIndex: sourcePageIndex,
+            message: "Page content could not be classified for an overview; using the normal compatibility renderer.", details: { reason: error.message } }]);
+        }
+        if (overviewKind === "ocr") {
+          try {
+            const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");
+            const overview = await compileNativeOcrTextPage(this.document, sourcePageIndex, options, signal,
+              this.missingFontResolver, this.optionalContent, diagnostic => this.appendDiagnostics([diagnostic]));
+            if (overview.textInstanceCount > 0 && overview.textIndex?.pages.some(page => /[^\s\ufffd]/u.test(page.text))) {
+              overview.pdfOverviewKind = "ocr";
+              return overview;
+            }
+            this.appendDiagnostics([{ code: "page-ocr-overview-unavailable", severity: "warning", pageIndex: sourcePageIndex,
+              message: "Stored OCR text has no drawable readable characters; using a bounded scan instead." }]);
+          } catch (error) {
+            signal.throwIfAborted();
+            if (!(error instanceof PdfError || error instanceof DensePdfSyntaxError) ||
+                (error instanceof PdfError && (error.code === "resource-limit" || error.code === "aborted"))) throw error;
+            this.appendDiagnostics([{ code: "page-ocr-overview-unavailable", severity: "warning", pageIndex: sourcePageIndex,
+              message: "Stored OCR text could not supply the overview; using a bounded scan instead.", details: { reason: error.message } }]);
+          }
+          overviewKind = "raster";
+        }
+      }
+      const scene = await this.compileVectorPageWithLayerFallback(sourcePageIndex, options, signal);
+      if (options.previewMaxDimension === undefined) return scene;
+      scene.pdfOverviewKind = overviewKind;
+      if (overviewKind === "raster") {
+        const { buildRasterScenePreview } = await import("./pageRasterPreview");
+        return buildRasterScenePreview(scene, options.previewMaxDimension);
+      }
+      // Unsupported vector paint can still use the existing bounded compatibility fallback.
+      // Such a page needs detail later; supported vector pages are complete at every zoom.
+      if (scene.rasterLayers.length && !scene.segmentCount && !scene.textInstanceCount && !scene.fillPathCount &&
+          !(scene.gradientFillPathCount ?? 0) && !(scene.gradientStrokeRunCount ?? 0) &&
+          scene.rasterLayers.some(layer => layer.width <= options.previewMaxDimension! && layer.height <= options.previewMaxDimension! &&
+            Math.abs(layer.matrix[0] * layer.matrix[3] - layer.matrix[1] * layer.matrix[2]) >=
+              (scene.pageBounds.maxX - scene.pageBounds.minX) * (scene.pageBounds.maxY - scene.pageBounds.minY) * .75)) {
+        scene.pdfOverviewKind = "raster";
+      }
+      return scene;
     } catch (error) {
       throw normalizeAbortError(error, signal);
     } finally {
@@ -1096,7 +1162,6 @@ class NativePdfSession implements NativeVectorPdfSession {
       }
       const adaptationStartedAt = timings ? nativeVectorTimingNow() : 0;
       this.appendDiagnostics(textCompilation.diagnostics);
-      this.appendDiagnostics(fontRegistry.getDiagnostics());
       this.appendDiagnostics(this.optionalContent.getDiagnostics(), false);
       if (textCompilation.glyphs.glyphIds.length !== 0) {
         onProgress?.(progress(
@@ -1177,6 +1242,8 @@ class NativePdfSession implements NativeVectorPdfSession {
         if (timings) timings.selectiveRasterMs = nativeVectorTimingNow() - rasterStartedAt;
       }
       const scene = buildScene(compositeRasterLayers);
+      // Glyph outlines can discover font warnings lazily while building the scene.
+      this.appendDiagnostics(fontRegistry.getDiagnostics());
       if (compositeTextIndex) scene.textIndex = compositeTextIndex;
       if (compositeRasterLayers.length > 0) {
         if (retainedCompositePage && retainedReplayIsReachable(scene.optionalContent, retainedCompositePage)) {
@@ -1270,7 +1337,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     sourcePageIndex: number,
     options: NativeVectorCompileOptions,
     signal: AbortSignal,
-    reason: Error
+    reason: Error,
+    previewMaxDimension = options.previewMaxDimension
   ): Promise<VectorScene> {
     const page = await this.compilePageUnlocked(sourcePageIndex, options, signal);
     const limits = { ...this.document.limits, ...options.limits };
@@ -1280,7 +1348,8 @@ class NativePdfSession implements NativeVectorPdfSession {
     const maxDimension = Math.min(16_384, limits.maxImageDimension);
     const { width, height } = page.pageInfo;
     let scale = Math.min(2, maxDimension / width, maxDimension / height,
-      Math.sqrt(maxPixels / (width * height)));
+      Math.sqrt(maxPixels / (width * height)),
+      previewMaxDimension === undefined ? Infinity : previewMaxDimension / Math.max(width, height));
     // Account for rounding each dimension up to an integer pixel.
     while (scale > 0 && Math.ceil(width * scale) * Math.ceil(height * scale) > maxPixels) scale *= 0.99;
     if (!(scale > 0)) throw new PdfError("resource-limit", "No pixel budget for page fallback.");
@@ -1312,7 +1381,7 @@ class NativePdfSession implements NativeVectorPdfSession {
       if (count) {
         scene.optionalContent = options.retainOptionalContent ? await this.optionalContent.sceneData(signal) : undefined;
         if (scene.optionalContent && scene.textIndex) scene.optionalContent = await attachRetainedTextOptionalContent(page, scene.textIndex, scene.optionalContent, signal);
-        if (retainedReplayIsReachable(scene.optionalContent, page)) {
+        if (previewMaxDimension === undefined && retainedReplayIsReachable(scene.optionalContent, page)) {
           scene.retainedPages = [{ page,
             optionalContentConditions: Int32Array.from(page.stores.optionalContent.defaultVisible, (_, index) => scene.optionalContent ? index : -1),
             matrix: Float32Array.of(1, 0, 0, 1, 0, 0) }];
@@ -1320,8 +1389,11 @@ class NativePdfSession implements NativeVectorPdfSession {
           scene.paintGraph = { roots: [{ kind: "retained", retainedPage: 0, firstCommand: 0, count, rasterIndex: 0 }] };
         }
       }
-      onDiagnostic({ code: "page-raster-fallback", severity: "warning", pageIndex: sourcePageIndex,
-        message: "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable.",
+      onDiagnostic({ code: previewMaxDimension === undefined ? "page-raster-fallback" : "page-preview",
+        severity: previewMaxDimension === undefined ? "warning" : "info", pageIndex: sourcePageIndex,
+        message: previewMaxDimension === undefined
+          ? "This page was rasterized to keep the PDF usable; vector sharpness and drawing geometry are unavailable."
+          : "This overview uses a bounded raster preview; detailed page content is compiled on demand.",
         details: { reason: reason.message, width: pixels.width, height: pixels.height, scale } });
       signal.throwIfAborted();
       return scene;
@@ -1696,6 +1768,8 @@ class NativePdfSession implements NativeVectorPdfSession {
       fonts: fontsByName,
       initialTransform: pageMatrix,
       maxGlyphs,
+      maxGraphicsStateDepth: this.document.limits.maxRecursionDepth,
+      signal,
       onRun: (run) => { emittedTextRuns.push(run); }
     });
     const textOperatorSink = {
@@ -1913,6 +1987,7 @@ class NativePageTextAccumulator {
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly glyphPrefixes: string[] = [];
   private readonly glyphTexts: string[] = [];
+  private readonly actualTextEndPositions = new Map<number, readonly [number, number]>();
   private readonly runSourcesWithDiagnostics = new WeakSet<object>();
   /** Every run slice of a Form shares its transform store; remap it once. */
   private readonly transformRemaps = new WeakMap<object, Uint32Array>();
@@ -1963,6 +2038,8 @@ class NativePageTextAccumulator {
       }
       this.glyphPrefixes.push("");
       this.glyphTexts.push("");
+      const endPosition = compilation.actualTextEndPositions?.get(index);
+      if (endPosition) this.actualTextEndPositions.set(glyphOffset + index, endPosition);
     }
     for (const run of compilation.runs) {
       this.runs.push(Object.freeze({ ...run, first: glyphOffset + run.first }));
@@ -2076,6 +2153,8 @@ class NativePageTextAccumulator {
     const gapBefore = compilation.glyphGapBefore?.length === total ? compilation.glyphGapBefore : null;
     const transformRemap = this.remapTransforms(compilation.transforms);
     for (let index = first; index < first + count; index += 1) {
+      const endPosition = compilation.actualTextEndPositions?.get(index);
+      if (endPosition) this.actualTextEndPositions.set(glyphOffset + index - first, endPosition);
       this.fontIndices.push(glyphs.fontIndices[index]);
       this.characterCodes.push(glyphs.characterCodes[index]);
       this.glyphIds.push(glyphs.glyphIds[index]);
@@ -2205,6 +2284,7 @@ class NativePageTextAccumulator {
         ...(this.hasCompleteGlyphGapBefore ? {
           glyphGapBefore: Uint8Array.from(this.glyphGapBefore)
         } : {}),
+        ...(this.actualTextEndPositions.size > 0 ? { actualTextEndPositions: new Map(this.actualTextEndPositions) } : {}),
         runs: Object.freeze([...this.runs]),
         diagnostics: Object.freeze([...this.diagnostics])
       }),
@@ -5782,9 +5862,12 @@ function buildInvocationOrderedTextIndex(
     const units = fontResources[compilation.glyphs.fontIndices[glyphIndex]]?.font.unitsPerEm ?? 1000;
     const vertical = (compilation.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Vertical) !== 0;
     const advance = (widthEms?.[glyphIndex] ?? 0) * units;
+    const end = compilation.actualTextEndPositions?.get(glyphIndex);
     pens.push(matrix[4], matrix[5],
-      matrix[4] + (vertical ? matrix[2] : matrix[0]) * advance,
-      matrix[5] + (vertical ? matrix[3] : matrix[1]) * advance,
+      end ? outerTransform[0] * end[0] + outerTransform[2] * end[1] + outerTransform[4]
+        : matrix[4] + (vertical ? matrix[2] : matrix[0]) * advance,
+      end ? outerTransform[1] * end[0] + outerTransform[3] * end[1] + outerTransform[5]
+        : matrix[5] + (vertical ? matrix[3] : matrix[1]) * advance,
       Math.hypot(matrix[2] * units, matrix[3] * units));
     gapBefore.push(gaps?.[glyphIndex] ?? 0);
     return occurrence;
@@ -7266,6 +7349,12 @@ async function loadMarkedContentProperties(
       ? undefined
       : await document.resolveValue(property.propertyList.get("MCID"), signal);
     let mcid = -1;
+    const actualTextValue = property.propertyList === null
+      ? undefined
+      : await document.resolveValue(property.propertyList.get("ActualText"), signal);
+    if (actualTextValue !== undefined && actualTextValue !== null && !isPdfString(actualTextValue)) {
+      throw new PdfError("invalid-object", `Marked-content property /${property.name} has an invalid /ActualText.`);
+    }
     if (mcidValue !== undefined && mcidValue !== null) {
       if (!Number.isSafeInteger(mcidValue) || (mcidValue as number) < 0) {
         throw new PdfError(
@@ -7280,6 +7369,7 @@ async function loadMarkedContentProperties(
       optionalContentIndex: property.membershipIndex ?? -1,
       defaultVisible: property.defaultVisible,
       mcid,
+      ...(isPdfString(actualTextValue) ? { actualText: actualTextValue.bytes } : {}),
       unresolvedOptionalContent: property.propertyList === null && optionalNames.has(property.name)
     }));
   }

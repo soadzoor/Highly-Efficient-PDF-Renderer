@@ -6,6 +6,7 @@ export { createThreeWebGpuTextMaterial } from "./threeWebGpuTextMaterial";
 export { createThreeWebGpuRasterMaterial } from "./threeWebGpuRasterMaterial";
 export { createThreeWebGpuRasterStripMaterial } from "./threeWebGpuRasterStripMaterial";
 export { createThreeWebGpuGradientFillMaterial, createThreeWebGpuGradientStrokeMaterial } from "./threeWebGpuGradientMaterial";
-export { enableThreeNodePaintFold } from "./threeWebGpuPaintFold";
+export { enableThreeNodePaintFold, createThreeNodeSurfacePaintFoldMaterial } from "./threeWebGpuPaintFold";
 export { createThreeWebGpuPrimitiveHighlightMaterial } from "./threeWebGpuPrimitiveHighlightMaterial";
 export { createThreeWebGpuPaintCompositorMaterials } from "./threeWebGpuPaintCompositorMaterials";
+export { createThreeWebGpuDirectPass } from "./threeWebGpuDirectPass";

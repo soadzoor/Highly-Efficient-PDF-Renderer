@@ -2828,6 +2828,20 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     const pixelCount = width * height;
     const output = new Uint8ClampedArray(pixelCount * 4);
     switch (images.formats[imageIndex]) {
+      case HEPR_IMAGE_FORMAT.Gray1: {
+        requireByteLength(data, Math.ceil(width / 8) * height, imageIndex);
+        const stride = Math.ceil(width / 8);
+        for (let y = 0; y < height; y++) {
+          this.options.signal?.throwIfAborted();
+          for (let x = 0; x < width; x++) {
+            const value = ((data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1) * 255;
+            const offset = (y * width + x) * 4;
+            output[offset] = output[offset + 1] = output[offset + 2] = value;
+            output[offset + 3] = 255;
+          }
+        }
+        return output;
+      }
       case HEPR_IMAGE_FORMAT.Rgba8:
         requireByteLength(data, pixelCount * 4, imageIndex);
         output.set(data);

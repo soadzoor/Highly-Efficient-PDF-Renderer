@@ -101,9 +101,60 @@ optional JSON report, never an archive.
 
 The reference candidate leaves about 37.74 MiB and 4.17 MiB below the respective
 PDF sizes, so it is worth investigating. It still grows today's HEPs by roughly
-6.7× and 9.1×. A future writer must compare its complete final file against the
-original PDF size and omit stored LODs when that budget is exceeded. These two
+6.7× and 9.1×. The writer now compares its complete final file against the
+original PDF size and omits stored LODs when that strict budget is reached. If
+canonical content still cannot fit, export fails before saving. These two
 examples do not establish a size guarantee for other documents.
+
+## TIKA-2848-2 text LOD compression and size policy
+
+The 1,576-page TIKA-2848-2 PDF exposed an unenforced size budget. Its HEP had
+4,135,835 exact glyph instances and stored text LOD geometry several times:
+run transforms, their bounds, and the coarse glyph transforms. Text LOD v3 now
+predicts those values from canonical glyph ranges and previously decoded records,
+retaining exact IEEE-754 XOR corrections. Canonical scene sections are unchanged,
+and the decoded cache retains every value; text is not clustered again.
+
+Measured by repacking the existing HEP, with no PDF parsing:
+
+| File | Bytes | MiB |
+| --- | ---: | ---: |
+| Original PDF | 10,181,637 | 9.71 |
+| Previous HEP with vector/text LOD | 13,824,412 | 13.18 |
+| HEP with text LOD v3 and both caches retained | 7,882,296 | 7.52 |
+
+The result is 43.0% smaller than the previous HEP and 22.6% smaller than the PDF.
+The repacker verified every canonical section byte and all decoded LOD data
+before atomically replacing a temporary copy. The original download was preserved.
+Text LOD v1/v2 remains readable; older viewers can ignore v3 and rebuild the cache.
+
+The builder, demo downloads and converter now check the complete file against
+the original PDF length. Optional caches are omitted with a diagnostic if they
+exceed the strict budget; oversized canonical output fails before saving, without
+discarding document content. New files record the original PDF size for re-export.
+Custom scenes and older HEPs need the explicit `sourcePdfByteLength` option or
+the repacker's `--source-pdf` argument when their original size is unknown.
+
+TypeScript checking and 13 server-free regression files passed. Coverage includes
+lossless residual corrections, signed zero, legacy caches, malformed ranges and
+budgets, cancellation, cache omission, source-size provenance, canonical byte
+preservation and atomic writes. Browser appearance/zoom verification remains
+manual; no development server or PDF conversion was run.
+
+Changed files for this size/compression fix:
+
+- Encoding and policy: `src/hepLodEncoding.ts`, `src/hepLod.ts`,
+  `src/hepSizePolicy.ts`, `src/hepBuilder.ts`, `src/hepBuilderRuntime.ts`,
+  `src/hepWriter.ts`, `src/hepReader.ts`, `src/hepTypes.ts`.
+- Source size and downloads: `src/pdfVectorExtractor.ts`,
+  `src/pdfObjectGenerator.ts`, `src/main.ts`, `src/three-example.ts`,
+  `src/hepLodPrompt.ts`.
+- Tools and tests: `PDFtoHEP.js`, `scripts/repack-hep-lods.mjs`,
+  `scripts/test-hep-api.mjs`, `scripts/test-hep-lod.mjs`,
+  `scripts/test-hep-lod-repack-budget.mjs`, `scripts/test-pdf-to-hep-cli.mjs`,
+  `scripts/lib/testSuites.mjs`.
+- Documentation: `docs/HEP_CONTAINER.md`, `docs/api.md`, `docs/manual.md`,
+  `docs/parser-memory.md`.
 
 ## Validation and manual checks
 

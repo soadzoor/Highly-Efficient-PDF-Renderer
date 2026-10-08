@@ -1,3 +1,6 @@
+import type { MonochromeRaster } from "./monochromeRaster";
+import { finishRasterSteps, finishRasterStepsAsync } from "./rasterPreparationYield";
+
 /**
  * GPU texture limits belong to the device, not the document. An image larger
  * than one texture is split into tiles that keep its original resolution.
@@ -40,6 +43,8 @@ export interface RasterTileSource {
   readonly height: number;
   /** Straight-alpha RGBA rows. */
   readonly data: Uint8Array;
+  /** Allows reduced display pixels to be prepared without expanding the entire source. */
+  readonly monochrome?: MonochromeRaster;
 }
 
 interface AxisSpan {
@@ -124,21 +129,34 @@ export function isRasterTilePlanDownscaled(source: { width: number; height: numb
 
 /** Premultiplied RGBA for each tile of `plan`, resampled first when the plan is smaller than the source. */
 export function rasterTilePixels(source: RasterTileSource, plan: RasterTilePlan): Uint8Array[] {
+  return finishRasterSteps(rasterTilePixelSteps(source, plan));
+}
+
+export function rasterTilePixelsAsync(source: RasterTileSource, plan: RasterTilePlan, signal?: AbortSignal): Promise<Uint8Array[]> {
+  return finishRasterStepsAsync(rasterTilePixelSteps(source, plan, signal));
+}
+
+function* rasterTilePixelSteps(source: RasterTileSource, plan: RasterTilePlan, signal?: AbortSignal): Generator<void, Uint8Array[]> {
+  signal?.throwIfAborted();
   const downscaled = isRasterTilePlanDownscaled(source, plan);
   const image = downscaled
-    ? resamplePremultiplied(source.data, source.width, source.height, plan.width, plan.height)
+    ? yield* resamplePremultiplied(source.monochrome ?? source.data, source.width, source.height, plan.width, plan.height, signal)
     : source.data;
-  return plan.tiles.map(tile => {
-    if (downscaled && tile.width === plan.width && tile.height === plan.height) return image;
+  const pixels: Uint8Array[] = [];
+  for (const tile of plan.tiles) {
+    if (downscaled && tile.width === plan.width && tile.height === plan.height) { pixels.push(image); continue; }
     const out = new Uint8Array(tile.width * tile.height * 4);
     for (let row = 0; row < tile.height; row++) {
+      signal?.throwIfAborted();
       const from = ((tile.y + row) * plan.width + tile.x) * 4;
       const pixels = image.subarray(from, from + tile.width * 4);
       if (downscaled) out.set(pixels, row * tile.width * 4);
       else premultiplyInto(out, row * tile.width * 4, pixels);
+      yield;
     }
-    return out;
-  });
+    pixels.push(out);
+  }
+  return pixels;
 }
 
 /** Rounds exactly as the renderers' whole-image premultiplication always has. */
@@ -162,31 +180,40 @@ function premultiplyInto(target: Uint8Array, offset: number, source: Uint8Array)
 }
 
 /** Area-averages straight-alpha RGBA into a smaller premultiplied image, one output row at a time. */
-function resamplePremultiplied(
-  data: Uint8Array,
+function* resamplePremultiplied(
+  source: Uint8Array | MonochromeRaster,
   width: number,
   height: number,
   outWidth: number,
-  outHeight: number
-): Uint8Array {
+  outHeight: number,
+  signal?: AbortSignal
+): Generator<void, Uint8Array> {
   const out = new Uint8Array(outWidth * outHeight * 4);
   const row = new Float64Array(width * 4);
   const scaleX = width / outWidth, scaleY = height / outHeight;
   const area = scaleX * scaleY;
+  const packed = source instanceof Uint8Array ? null : source;
+  const data = packed ? packed.data : (source as Uint8Array);
+  const palette = packed?.colors;
+  const stride = Math.ceil(width / 8);
   for (let outY = 0; outY < outHeight; outY++) {
     row.fill(0);
     const top = outY * scaleY, bottom = top + scaleY;
     for (let y = Math.floor(top); y < Math.min(height, Math.ceil(bottom)); y++) {
+      signal?.throwIfAborted();
       const weight = Math.min(bottom, y + 1) - Math.max(top, y);
       if (weight <= 0) continue;
       for (let x = 0, i = y * width * 4; x < width; x++, i += 4) {
-        const alpha = data[i + 3] * weight;
+        const pixels = palette ?? data;
+        const sample = palette ? ((data[y * stride + (x >> 3)] >>> (7 - (x & 7))) & 1) * 4 : i;
+        const alpha = pixels[sample + 3] * weight;
         const color = alpha / 255;
-        row[x * 4] += data[i] * color;
-        row[x * 4 + 1] += data[i + 1] * color;
-        row[x * 4 + 2] += data[i + 2] * color;
+        row[x * 4] += pixels[sample] * color;
+        row[x * 4 + 1] += pixels[sample + 1] * color;
+        row[x * 4 + 2] += pixels[sample + 2] * color;
         row[x * 4 + 3] += alpha;
       }
+      yield;
     }
     for (let outX = 0; outX < outWidth; outX++) {
       const left = outX * scaleX, right = left + scaleX;
@@ -218,8 +245,18 @@ export function reportRasterTileDownscale(
   plan: RasterTilePlan,
   maxTextureSize: number
 ): void {
-  if (!isRasterTilePlanDownscaled(source, plan) || reportedDownscales.has(source.data)) return;
-  reportedDownscales.add(source.data);
+  if (!isRasterTilePlanDownscaled(source, plan)) return;
+  const pixels = source.monochrome?.data ?? source.data;
+  if (reportedDownscales.has(pixels)) return;
+  reportedDownscales.add(pixels);
+  const devicePlan = planRasterTiles(source.width, source.height, maxTextureSize);
+  if (plan.width < devicePlan.width || plan.height < devicePlan.height) {
+    console.warn(
+      `[HEPR] Raster image ${index} (${source.width}x${source.height}) exceeds this scene's automatic ` +
+      `raster memory budget; drawing it at ${plan.width}x${plan.height}. Original pixels are retained.`
+    );
+    return;
+  }
   console.warn(
     `[HEPR] Raster image ${index} (${source.width}x${source.height}) needs more GPU memory than this ` +
     `device's ${maxTextureSize}x${maxTextureSize} texture limit allows for one image; drawing it at ` +

@@ -11,6 +11,7 @@
     "src/pdf/pdfWorkerEntry.ts",
     "src/roomDetectorWorker.ts",
     "src/lodWorkerEntry.ts",
+    "src/rasterPreparationWorker.ts",
     "src/vite-env.d.ts"
   ]
 }

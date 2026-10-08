@@ -15,6 +15,8 @@ export interface OptionalContentLayer extends OptionalContentGroup { readonly vi
 export interface AnnotationLayerVisibility { readonly annotationId: string; readonly visible: boolean }
 /** A detached visibility snapshot. Treat its condition bytes as read-only. */
 export interface OptionalContentSnapshot {
+  /** Internal viewing alternatives, independent of the document's PDF layer conditions. */
+  readonly rasterPages?: ReadonlySet<number>;
   readonly revision: number;
   readonly layers: readonly LayerVisibilityChange[];
   readonly conditions: Uint8Array;
@@ -247,12 +249,13 @@ export function getOptionalContentGroupIds(data: SceneOptionalContent | undefine
  * PDF layers and HEPR annotation layers share one condition table but separate APIs.
  */
 export class OptionalContentController {
-  private readonly data: SceneOptionalContent | undefined;
+  private data: SceneOptionalContent | undefined;
   /** PDF layers only. */
-  private readonly groups: Map<string, OptionalContentGroup>;
+  private groups: Map<string, OptionalContentGroup>;
   /** Annotation id to its annotation layer id. */
-  private readonly annotationLayers: Map<string, string>;
-  private readonly annotationIds: ReadonlySet<string>;
+  private annotationLayers: Map<string, string>;
+  private annotationIds: ReadonlySet<string>;
+  private readonly savedVisibility = new Map<string, boolean>();
   private readonly listeners = new Set<OptionalContentListener>();
   private readonly options: OptionalContentControllerOptions;
   private current: OptionalContentSnapshot;
@@ -272,6 +275,21 @@ export class OptionalContentController {
     if (options.onChange) this.listeners.add(options.onChange);
   }
   get revision(): number { return this.current.revision; }
+  /** Refresh a demand-loaded scene without losing choices or subscriptions when pages are evicted. */
+  async replaceScene(scene: VectorScene): Promise<void> {
+    this.assertLive();
+    for (const layer of this.current.layers) this.savedVisibility.set(layer.id, layer.visible);
+    this.active?.abort(); this.active = null; this.generation++;
+    const revision = this.current.revision;
+    this.data = scene.optionalContent;
+    this.groups = new Map(this.data?.groups.filter(group => !isAnnotationLayer(group)).map(group => [group.id, group]));
+    this.annotationLayers = new Map([...getAnnotationLayerIds(this.data)].map(([id, annotationId]) => [annotationId, id]));
+    this.annotationIds = new Set(scene.annotations?.map(annotation => annotation.id));
+    this.current = { ...createDefaultOptionalContentSnapshot(scene), revision };
+    this.requested = new Map(this.current.layers.map(layer => [layer.id, this.savedVisibility.get(layer.id) ?? layer.visible]));
+    // New replay resources must be prepared even if the saved choices match their defaults.
+    await this.update(this.requested, {}, true);
+  }
   getLayers(): OptionalContentLayer[] {
     const values = new Map(this.current.layers.map(layer => [layer.id, layer.visible]));
     return [...this.groups.values()].map(group => ({ ...group, visible: values.get(group.id)! }));
@@ -402,9 +420,9 @@ export class OptionalContentController {
     }
     return next;
   }
-  private async update(next: Map<string, boolean>, options: OptionalContentUpdateOptions): Promise<void> {
+  private async update(next: Map<string, boolean>, options: OptionalContentUpdateOptions, force = false): Promise<void> {
     this.assertLive(); options.signal?.throwIfAborted();
-    if (!this.active && this.current.layers.every(layer => next.get(layer.id) === layer.visible)) return;
+    if (!force && !this.active && this.current.layers.every(layer => next.get(layer.id) === layer.visible)) return;
     this.active?.abort(new DOMException("Layer update superseded.", "AbortError"));
     const controller = new AbortController(), generation = ++this.generation;
     this.active = controller; this.requested = next;

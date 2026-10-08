@@ -178,6 +178,8 @@ assert.equal(compiledSuppressedText.glyphs.glyphIds.length, 1, "the painted glyp
 assert.equal(compiledSuppressedText.textIndex.text, "", "no replacement character is invented");
 assert.deepEqual([...compiledSuppressedText.textIndex.charGlyphIndices], []);
 
+testActualText();
+
 const sfnt = NativeSfntFont.parse(buildTinySfnt());
 assert.equal(sfnt.unitsPerEm, 1000);
 assert.equal(sfnt.mapCodePoint(65), 1);
@@ -190,6 +192,7 @@ const compoundOutline = sfnt.getGlyphOutline(2);
 assert.deepEqual(compoundOutline.bounds, [50, 0, 150, 100]);
 assert.equal(compoundOutline.commands[0].x, 50);
 
+await testEmbeddedObsoleteCompoundFlag();
 await testMissingFontResolution();
 await testEmbeddedMacintoshSymbolFont();
 await testFixedPitchInferenceFromWidths();
@@ -197,6 +200,92 @@ await testStandard14AdvanceMetrics();
 
 console.log("native font/text tests passed");
 hooks.deregister();
+
+function testActualText() {
+  const fonts = new Map([["F1", { font: simpleFont, fontIndex: 3 }]]);
+  assert.equal(simpleFont.decode(Uint8Array.of(31)).unicode, null);
+  const compile = (replacement) => {
+    const compiler = new NativeTextCompiler({ fonts });
+    compiler.beginText();
+    compiler.setFont("F1", 10);
+    if (replacement !== null) compiler.beginMarkedText(replacement);
+    compiler.showAdjustedText([Uint8Array.of(65, 31), -100, Uint8Array.of(66)]);
+    if (replacement !== null) compiler.endMarkedText();
+    compiler.endText();
+    return compiler.build();
+  };
+  const original = compile(null);
+  const replaced = compile(Uint8Array.of(0xfe, 0xff, 0x09, 0x32, 0x09, 0x3f, 0x09, 0x02));
+  assert.equal(replaced.textIndex.text, "लिं");
+  assert.deepEqual([...replaced.textIndex.charGlyphIndices], [0, 0, 0]);
+  assert.deepEqual(replaced.glyphs, original.glyphs, "replacement text does not change painted glyphs or advances");
+  assert.deepEqual(replaced.transforms, original.transforms);
+  assert.deepEqual(replaced.runs, original.runs);
+  assert(original.diagnostics.some(({ code }) => code === "font.missing-unicode-mapping"));
+  assert.equal(replaced.diagnostics.length, 0, "authoritative text needs no per-glyph Unicode fallback");
+  assert.equal(compile(new Uint8Array()).textIndex.text, "", "empty ActualText suppresses extraction, retaining paint");
+  assert.equal(compile(Uint8Array.of(0x80, 0x93)).textIndex.text, "•ﬁ", "PDFDocEncoding is used without a BOM");
+  assert.equal(compile(Uint8Array.of(0xff, 0xfe, 0x3d, 0xd8, 0, 0xde)).textIndex.text, "😀");
+  assert.equal(compile(Uint8Array.of(0xef, 0xbb, 0xbf, ...encoder.encode("😀"))).textIndex.text, "😀");
+  assert.equal(compile(Uint8Array.of(0xfe, 0xff, 0xfe, 0xff, 0, 65)).textIndex.text, "\ufeffA", "only the encoding BOM is removed");
+  const malformed = compile(Uint8Array.of(0xfe, 0xff, 0xd8, 0));
+  assert.equal(malformed.textIndex.text, "\ufffd");
+  assert.deepEqual(malformed.diagnostics.map(({ code }) => code), ["text.invalid-actual-text"]);
+
+  const nested = new NativeTextCompiler({ fonts });
+  nested.beginText(); nested.setFont("F1", 10);
+  nested.showText(Uint8Array.of(65));
+  nested.moveText(0, -20);
+  nested.beginMarkedText(encoder.encode("outer"));
+  nested.beginMarkedText();
+  nested.showText(Uint8Array.of(31));
+  nested.beginMarkedText(encoder.encode("inner"));
+  nested.showText(Uint8Array.of(31));
+  nested.endMarkedText(); nested.endMarkedText(); nested.endMarkedText();
+  nested.showText(Uint8Array.of(31));
+  nested.endText();
+  const compiled = nested.build();
+  assert.equal(compiled.textIndex.text, "Ω\nouter\ufffd", "outer replacement is emitted once and preserves its leading separator");
+  assert.equal(compiled.diagnostics.length, 1, "unmapped glyphs outside ActualText still warn");
+
+  const bounded = new NativeTextCompiler({ fonts, maxTextCodeUnits: 2, maxGraphicsStateDepth: 1 });
+  assert.throws(() => bounded.beginMarkedText(encoder.encode("long")), error => error.code === "resource-limit");
+  bounded.beginMarkedText();
+  assert.throws(() => bounded.beginMarkedText(), error => error.code === "resource-limit");
+  assert.throws(() => bounded.build(), error => error.code === "unsupported-content");
+  bounded.endMarkedText();
+  assert.throws(() => bounded.endMarkedText(), error => error.code === "unsupported-content");
+  const abort = new AbortController();
+  const cancelled = new NativeTextCompiler({ fonts, signal: abort.signal });
+  cancelled.beginMarkedText(encoder.encode("text"));
+  abort.abort();
+  assert.throws(() => cancelled.endMarkedText(), error => error.code === "aborted");
+}
+
+async function testEmbeddedObsoleteCompoundFlag() {
+  const dictionary = new Map([
+    ["Subtype", name("TrueType")],
+    ["BaseFont", name("FixtureCompound")],
+    ["Encoding", name("WinAnsiEncoding")],
+    ["FontDescriptor", new Map([["FontFile2", stream(buildTinySfnt(null, 0x0013))]])]
+  ]);
+  const reported = [];
+  const font = await parseNativePdfFont(dictionary, resolver, {
+    onDiagnostic: diagnostic => reported.push(diagnostic)
+  });
+  assert.equal(font.diagnostics.length, 0, "parsing unused glyphs emits no normalization warning");
+  assert.equal(reported.length, 0);
+  assert.equal(font.decode(Uint8Array.of(66)).glyphId, 2);
+  assert.deepEqual(font.getGlyphOutline(2), compoundOutline, "embedded legacy flags keep accurate vector outlines");
+  assert.equal(font.diagnostics.length, 1, "PDF fonts expose warnings discovered after parsing");
+  assert.equal(font.diagnostics[0].code, "font.sfnt-compound-flags-normalized");
+  assert.strictEqual(font.diagnostics[0], font.sfnt.diagnostics[0]);
+  assert.strictEqual(reported[0], font.diagnostics[0], "diagnostic callbacks receive lazy glyph warnings");
+  assert(Object.isFrozen(font.diagnostics));
+  font.getGlyphOutline(2);
+  assert.equal(font.diagnostics.length, 1);
+  assert.equal(reported.length, 1, "cached glyph requests do not repeat warnings");
+}
 
 async function testEmbeddedMacintoshSymbolFont() {
   // Synthetic LibreOffice-style subset: symbolic TrueType, no PDF Encoding,
@@ -666,7 +755,7 @@ function buildMacintoshSymbolCmap() {
   return bytes;
 }
 
-function buildTinySfnt(cmapOverride = null) {
+function buildTinySfnt(cmapOverride = null, compoundFlags = 0x0003) {
   const head = new Uint8Array(54);
   const headView = new DataView(head.buffer);
   headView.setUint16(18, 1000, false);
@@ -713,7 +802,7 @@ function buildTinySfnt(cmapOverride = null) {
   compoundView.setInt16(4, 0, false);
   compoundView.setInt16(6, 150, false);
   compoundView.setInt16(8, 100, false);
-  compoundView.setUint16(10, 0x0003, false);
+  compoundView.setUint16(10, compoundFlags, false);
   compoundView.setUint16(12, 1, false);
   compoundView.setInt16(14, 50, false);
   compoundView.setInt16(16, 0, false);

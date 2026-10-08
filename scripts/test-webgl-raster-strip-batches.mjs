@@ -141,7 +141,7 @@ function makeRenderer(Renderer, scene) {
     vectorClipIndex: -1, vectorClipTexture: {}, vectorClipUniforms: new Map(), multiplyPass: null,
     multiplyUniforms: new Map(), paintShapeUniforms: new Map(), orderedTextureBindings: [],
     orderedUniformPrograms: new Set(), orderedPaintUniformStates: new Map(), orderedInstanceVaos: new Set(),
-    performanceProfiler: { enabled: true, counters: {}, beginSection() {}, endSection() {},
+    performanceProfiler: { enabled: true, counters: {}, beginSection() {}, endSection() {}, recordTransition() {},
       add(name, value = 1) { this.counters[name] = (this.counters[name] ?? 0) + value; } },
     drawPageBackgrounds() {}, destroyVectorMinifyResources() {}, requestFrame() {},
     drawFilledPaths(_w, _h, _x, _y, _zoom, first, count) { mock.events.push(["fill", first, count]); },

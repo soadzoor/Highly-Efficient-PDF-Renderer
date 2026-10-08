@@ -10,7 +10,7 @@ import type { TextLodBuildData } from "./textGreekLod";
 
 // Bump independently when a build algorithm or its persisted representation changes.
 export const HEP_VECTOR_LOD_VERSION = 3;
-export const HEP_TEXT_LOD_VERSION = 2;
+export const HEP_TEXT_LOD_VERSION = 3;
 export interface HepLodOptions {
   /** Embed vector LOD geometry, building it if absent; rebuild spatial indexes on load. @default false */
   withVectorLod?: boolean;
@@ -50,7 +50,7 @@ export async function writeHepLod(archive: HepArchive, scene: VectorScene,
     const resultText = await prebuildTextLod(scene, { signal: options.signal,
       onProgress: event => options.onProgress?.((Number(vector) + event.value) / steps, "text-lod") });
     options.signal?.throwIfAborted();
-    if (resultText.data) result.text = writeData(archive, "lod-text", HEP_TEXT_LOD_VERSION, packTextLod(resultText.data));
+    if (resultText.data) result.text = writeData(archive, "lod-text", HEP_TEXT_LOD_VERSION, packTextLod(resultText.data, scene, options.signal));
     options.onProgress?.(1, "text-lod");
   }
   return result.vector || result.text ? result : undefined;
@@ -70,14 +70,15 @@ export async function readHepLod(archive: HepArchive, scene: VectorScene, metada
     try {
       signal?.throwIfAborted();
       const version = kind === "vector" ? HEP_VECTOR_LOD_VERSION : HEP_TEXT_LOD_VERSION;
-      if (descriptor?.version !== version && descriptor?.version !== 1 && !(kind === "vector" && descriptor?.version === 2)) throw new Error(`stored version ${descriptor?.version}, current version ${version}`);
+      if (descriptor?.version !== version && descriptor?.version !== 1 && descriptor?.version !== 2) throw new Error(`stored version ${descriptor?.version}, current version ${version}`);
       const prefix = `lod-${kind}`;
       if (descriptor.file !== `${prefix}/index.json`) throw new Error("invalid cache descriptor");
       let data = await readData(archive, prefix, signal);
+      if (kind === "text" && descriptor.version === 3) requireValid((data as { textEncoding?: string }).textEncoding === "predictive");
       if (kind === "vector" && descriptor.version === 3) requireValid((data as { tileIndexes?: string }).tileIndexes === "rebuild");
       if (descriptor.version >= 2) data = kind === "vector"
         ? unpackVectorLod(scene, data as Parameters<typeof unpackVectorLod>[1])
-        : unpackTextLod(data as Parameters<typeof unpackTextLod>[0]);
+        : unpackTextLod(data as Parameters<typeof unpackTextLod>[0], scene, signal);
       if (kind === "vector") {
         validateVector(scene, data as StoredVectorStrokeLod, descriptor.version !== 3);
         if (descriptor.version === 3) data = await rebuildStoredVectorStrokeLodIndexes(scene, data as StoredVectorStrokeLod, signal);

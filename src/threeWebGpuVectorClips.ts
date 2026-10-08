@@ -3,6 +3,7 @@ import { NodeMaterial, TSL } from "three/webgpu";
 import { VECTOR_CLIP_WGSL, VECTOR_CLIP_AA_WGSL } from "./vectorClipShaders";
 import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
 import { registerThreeVectorClipCloner, VECTOR_CLIP_INSTANCE_ATTRIBUTE } from "./threeVectorClips";
+import { mapThreeNodeSurfacePaintFold } from "./threeWebGpuPaintFold";
 
 const nodeWorldPositions = new WeakMap<THREE.Material, unknown>();
 const antialiasedNodeClips = new WeakMap<THREE.Material, "straight-alpha" | "premultiplied">();
@@ -49,21 +50,22 @@ function applyNodeVectorClip(source: THREE.Material, material: THREE.Material, c
     : TSL.uniform(clipIndex);
   const clipParams = { point: world, clipIndex: index, clipTexture: TSL.textureLoad(texture) };
   const antialias = antialiasedNodeClips.get(source);
-  if (antialias) {
-    material.fragmentNode = TSL.Fn(() => {
+  const applyClip = (fragment: unknown): never => {
+    if (antialias) return TSL.Fn(() => {
       // Force derivatives before the paint helper, which can discard. The
       // straight-alpha blend must keep RGB intact along partially covered clips.
       const aaWidth = TSL.property("float", "heprClipAAWidth");
       aaWidth.assign((clipPixelWidthFn as (params: Record<string, unknown>) => never)({ point: world }));
       const color = TSL.property("vec4", "heprClipSource");
-      color.assign(source.fragmentNode as never);
+      color.assign(fragment as never);
       // Premultiplied image paint keeps rectangular tile/page clips solid.
       const coverageFn = rasterNodeClips.has(source) ? rasterClipAAFn : clipAAFn;
       const coverage = (coverageFn as (params: Record<string, unknown>) => never)({ ...clipParams, aaWidth });
       return antialias === "premultiplied" ? TSL.mul(color, coverage) : TSL.vec4(color.rgb, TSL.mul(color.a, coverage));
-    })();
-  } else {
+    })() as never;
     const coverage = (clipFn as (params: Record<string, unknown>) => never)(clipParams);
-    material.fragmentNode = TSL.mul(source.fragmentNode as never, coverage);
-  }
+    return TSL.mul(fragment as never, coverage) as never;
+  };
+  material.fragmentNode = applyClip(source.fragmentNode);
+  mapThreeNodeSurfacePaintFold(source, material, applyClip);
 }

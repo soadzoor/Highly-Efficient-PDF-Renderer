@@ -19,6 +19,28 @@ export function tinyJbig2Globals() {
   return Uint8Array.from(segment(0, 0, 0, [0, 1, ...uint32(0), ...uint32(0)]));
 }
 
+/** One real Huffman-coded black symbol, placed repeatedly in separate text regions. */
+export function tinySymbolJbig2({ width = 256, height = 256, placements = [[29, 28], [137, 74]],
+  useGlobals = false, textFlags = 17, pageFlags = 0 } = {}) {
+  const dictionary = [0, 1, ...uint32(1), ...uint32(1), 0x5f, 0x80, 0x80, 0, 0x40];
+  const page = [...uint32(width), ...uint32(height), ...uint32(0), ...uint32(0), pageFlags, 0, 0];
+  // RUNCODE 1 has a one-bit code; all other run codes are absent. The single
+  // symbol ID has length one. DT=1, DT=1, FS=0, ID=0, DS=OOB.
+  let codes = Array.from({ length: 35 }, (_, i) => i === 1 ? "0001" : "0000").join("") + "0";
+  codes = codes.padEnd(Math.ceil(codes.length / 8) * 8, "0") + "00000000000001";
+  const data = Array.from({ length: Math.ceil(codes.length / 8) }, (_, i) =>
+    parseInt(codes.slice(i * 8, i * 8 + 8).padEnd(8, "0"), 2));
+  const textSegments = placements.flatMap(([x, y], index) => {
+    const region = [...uint32(1), ...uint32(1), ...uint32(x), ...uint32(y), 0,
+      textFlags >>> 8, textFlags & 255, 0, 0, ...uint32(1), ...data];
+    return [...uint32(index + 3), 7, 32, 2, 1, ...uint32(region.length), ...region];
+  });
+  return {
+    encoded: Uint8Array.from([...segment(1, 48, 1, page), ...(useGlobals ? [] : segment(2, 0, 1, dictionary)), ...textSegments]),
+    globals: useGlobals ? Uint8Array.from(segment(2, 0, 0, dictionary)) : new Uint8Array()
+  };
+}
+
 export function imagePdf(encoded, {
   filter = "JPXDecode", width = 8, height = 8, colorSpace = "/DeviceRGB",
   bitsPerComponent = 8, extra = "", globals

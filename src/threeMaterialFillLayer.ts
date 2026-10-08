@@ -6,7 +6,7 @@ import { vectorIndexedPathStore } from "./vectorCellIndex";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
-import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { enableThreeRawPaintFold, threePaintFoldFragmentGlsl } from "./threePaintFold";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import * as THREE from "three";
@@ -46,6 +46,7 @@ interface CullingBounds {
 
 export class ThreeMaterialFillLayer {
   private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly releaseVectorClipTexture: () => void;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
@@ -78,7 +79,6 @@ export class ThreeMaterialFillLayer {
   private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: FillLayerOptions) {
-    this.vectorClipTexture = createThreeVectorClipTexture(scene);
     const fillPathCount = Math.max(0, scene.fillPathCount | 0);
     const fillSegmentCount = Math.max(0, scene.fillSegmentCount | 0);
     this.fillPathCount = fillPathCount;
@@ -219,11 +219,19 @@ export class ThreeMaterialFillLayer {
     configureStraightAlphaBlending(material);
 
     bindRawPageTransform(material, pageBinding);
-    initializeThreeVectorClip(material, this.vectorClipTexture);
-    this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
-    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex", options.drawPlan);
+    const clips = acquireThreeVectorClipTexture(scene);
+    this.vectorClipTexture = clips.texture;
+    this.releaseVectorClipTexture = clips.release;
+    try {
+      initializeThreeVectorClip(material, this.vectorClipTexture);
+      this.mesh = new THREE.Mesh(geometry, material);
+      this.mesh.frustumCulled = false;
+      this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_FILL;
+      this.orderedRuns = ThreeVectorDrawRuns.create(scene, "fill", this.mesh, "aFillPathIndex", options.drawPlan);
+    } catch (error) {
+      clips.release();
+      throw error;
+    }
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -278,7 +286,7 @@ export class ThreeMaterialFillLayer {
 
   dispose(): void {
     this.orderedRuns?.dispose();
-    this.vectorClipTexture.dispose();
+    this.releaseVectorClipTexture();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.fillPathMetaTextureA.dispose();

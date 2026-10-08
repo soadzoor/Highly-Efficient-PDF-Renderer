@@ -106,6 +106,108 @@ Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.
 
+The native and Three demos enable **GPU compress scans** by default. They decode
+every selected PDF page before display and prepare bounded scan textures during
+parsing, trading longer loading and more CPU memory for faster zoom refinement.
+Packed monochrome scans use compact storage; eligible opaque color/grayscale
+scans can use lossy BC7/ASTC blocks. Preparation targets image-only pages with a
+raster covering at least half the page. Pages with visible vectors or text skip
+scan preparation, but still load upfront while the option is enabled. It overrides page streaming,
+is bypassed by **Use OCR text instead of scans**, and does not affect HEP loading.
+Selecting **GPU compress scans** unchecks both **Use OCR text instead of scans**
+and **Stream pages**. Selecting either of those unchecks **GPU compress scans**;
+OCR-only viewing and streaming can be used together. HEP loads preserve the
+PDF scan-compression choice.
+
+The public API also resolves conflicting PDF options and warns through
+`onDiagnostic` and `console.warn`: `ocrTextOnly: true` disables `compressScans`;
+otherwise `compressScans: true` replaces `pageLoading: "auto"` with `"eager"`.
+When all three are requested, OCR wins and automatic streaming remains available.
+The returned `sourceOptions` stores the resolved choices without changing the
+caller's options. HEP loads ignore these PDF-only options. See the
+[loading options and warning codes](api.md#loading-options).
+
+The Three.js package defaults and demos with **GPU compress scans** unchecked
+prepare all selected page overviews before display, then upload the initial
+scene once.
+They do not rebuild the growing scene or wait for a frame after each parsed page.
+The **Stream pages** checkbox opts into viewport-driven loading for PDFs with
+more than 16 selected pages, starting from metadata and loading pages near the
+camera in one worker. It is unchecked by default; switching it reloads the
+retained PDF while preserving the camera and page layout. In the package, use
+`pageLoading: "auto"` to stream or `pageLoading: "all"` (the default) to prepare all
+overviews. Streaming uses a bounded overview cache; full loading retains every
+overview and uses more CPU memory for vector-heavy documents.
+Vector pages keep their original geometry at every zoom in both modes.
+Image-dominated scanned pages with usable invisible OCR show that text as visible
+vectors at a distance, without decoding scan images. Only scans without usable
+OCR get small bitmap previews, with a longest edge of at most 96 pixels.
+Unsupported drawing features can still use a diagnosed bounded raster fallback.
+Scan pixels load when a page occupies more than 256 screen pixels; zooming back
+out below 224 pixels restores the OCR vectors or scan preview. The gap prevents
+flicker near the transition. At most 12 detailed pages remain cached, with a
+further limit based on estimated CPU payload bytes. Vector-only documents return
+complete vector scenes after full loading. During streaming, evicted pages
+regenerate as you navigate. OCR/scan transitions retain the page geometry, glyph
+resources and search index. Scan pixels and coverage mips prepare in a shared
+worker, with a cooperative fallback, while the previous representation stays
+visible. Submissions are spread across images; Three initializes prepared textures
+through its active host before switching page visibility. Recent GPU resolution
+tiers stay warm inside
+the same automatic raster budget, so repeated zoom cycles can reuse them. Pages
+with additional vector paints or clips install their detail geometry once;
+compositing effects can still require a diagnosed scene rebuild.
+Unloaded pages retain their outlines
+and positions. Search progressively loads preview text for the rest of the
+document; explicit HEP export compiles the complete original PDF.
+
+Pages waiting for their first overview show an animated book-page skeleton:
+a heading and groups of horizontal lines. Native and Three WebGL/WebGPU draw
+these shapes analytically in the page background, keeping them sharp at any
+zoom without allocating image textures. The skeleton disappears when the
+overview arrives. Offscreen or hidden pages do not keep animation running;
+the system's reduced-motion preference leaves a static skeleton.
+
+Three.js page demand follows camera projections, including moved or hidden pages.
+`pdfObjectGenerator` exposes the current viewing window through `sceneData` and
+emits `change` events with `reason: "pages-loaded"` when it changes. Use
+`loadCompleteScene({ signal })` for complete geometry analysis, or
+`pageLoading: "eager"` when complete original scene data, including decoded scans,
+is required before rendering.
+Extraction APIs and HEP conversion still produce complete scenes for their selected pages;
+the Three example reuses its live PDF session and cached full pages to complete
+the export scene once. It serializes that scene without reopening the PDF.
+Missing full pages still need compilation;
+raster and OCR previews cannot stand in for the original page content.
+All GPU integrations allocate small raster display tiers first and increase
+their resolution automatically with zoom. CPU canonical image data stays available
+for refinement; reducing GPU textures alone does not reduce eager parsing memory.
+
+Native WebGL/WebGPU and both Three material backends retain packed one-bit images
+at full resolution and an R8 coverage base at smaller tiers. Their monochrome
+mipmaps store four-bit grayscale coverage in a compact atlas, with explicit
+bilinear/trilinear shader filtering. This halves the mip payload for large pages
+and lowers full-resolution texture memory from about 0.46 to 0.29 bytes per pixel
+(roughly 2.70 GB to 1.72 GB for 5.9 gigapixels, before allocation overhead).
+Inspect scanned text while zooming through intermediate sizes on each backend;
+four-bit mips can slightly change stroke darkness, while close-up binary pixels,
+canonical PDF data and exports remain exact. Check repeated OCR/scan swaps for
+stall regressions and consistent zoom-out demotion. No compression extension or
+additional runtime dependency is needed. Eligible color images can use BC7/ASTC 4x4 through
+the host's `ExternalTexture` support, with one shared encoder workspace.
+Independent page views share the document's automatic raster memory target.
+
+The native and Three demos offer **Use OCR text instead of scans** for PDF
+sources. It reconstructs existing text with vector fonts, preserving
+text positions and widths, while skipping scan decoding and scan GPU textures.
+Glyphless or missing outlines use bundled substitute fonts.
+It is an approximate text-only view: pictures, diagrams, colors, clipping and
+annotation appearances are omitted; pages without drawable stored text are
+blank and emit a diagnostic. Search and selection remain available. The checkbox
+forces text at every zoom; unchecking it restores automatic OCR overviews and
+scan detail while retaining the camera and page layout. HEP sources do not
+support this option. HEP export uses the original PDF content.
+
 ## Rendering and level of detail
 
 The three.js object follows your camera and synchronizes itself during normal
@@ -378,10 +480,21 @@ copy(heprPerf.json());    // Chrome DevTools helper: copy the report for compari
 Capture panning and zooming separately, with the same viewport, DPR, LOD settings,
 and visible layers when comparing versions. Capture is off by default, stops after
 the requested number of rendered frames (600 by default), and also stops when the
-document or renderer is replaced. `heprPerf.report()` reads the current report;
+document or renderer is replaced; demand-driven page updates keep it running.
+`heprPerf.report()` reads the current report;
 starting again clears the previous capture. The report includes the starting view,
 drawing label, settings, per-frame averages/percentiles for CPU phases, batch and
 upload counters, and sampled GPU command-span timing when supported.
+
+`transitionSections` measures work between frames, including `pageSwap.decode`,
+`pageSwap.rasterPreparation`, `pageSwap.total`, `rasterRefinement.prepare` and
+`rasterUpload.submit`. `rasterUpload.cacheHit` identifies texture reuse, and
+`rasterUpload.threeHost` measures Three host texture initialization before the
+page switch. Cold scene generations also record composition, preparation,
+`pageSwap.textLod`, `pageSwap.textUpload`, and native scene/atlas construction. `transitions` keeps the latest 120 events. These spans
+can overlap, and worker preparation includes queue/wait time; upload submission
+measures CPU wall time rather than asynchronous GPU execution. Compare the first
+zoom-in with repeated OCR/scan cycles when investigating a stall.
 
 To see which GPU work fills that span, add `gpuOperations: true`:
 
@@ -547,13 +660,57 @@ batches, before visibility/redundancy filtering; repeated passes count again.
 Ordered stroke LOD batches visit selected IDs only, so this work follows the
 visible selection rather than the combined size of all stored LOD levels.
 `three.compositor` includes setup, batch lookup/geometry preparation, target
-binding, `three.hostDraw` (host renders that draw paints) and `three.hostPass`
-(host renders of composite passes alone). Consecutive compositor operations
-into one surface share a host render; `three.hostRenders` counts them. Inside `three.compositorSetup`,
+binding, `three.hostDraw` (batches that draw paints) and `three.hostPass`
+(batches of composite passes alone). Consecutive compositor operations
+into one surface share a batch. `three.hostRenders` counts full calls to the
+host's `render(scene, camera)`; `three.directPasses` counts batches drawn through
+the specialized compositor path. Inside `three.compositorSetup`,
 `three.compositorCollect` measures proxy/range-index maintenance and
 `three.compositorSelection` measures visible-paint selection. Compare collection
 with `three.scheduleChanges` to diagnose zoom replans. These sections overlap:
 do not sum parent and child durations.
+
+`three.cachedPaintPlans` counts frames that replay a stable compositor plan;
+`three.paintPlanBuilds` counts frames that rebuild it. Visibility revisions,
+paint selection, proxy replacement, surface size and fold eligibility invalidate
+the plan. Projected rectangles and computed mask vectors still update every
+frame. `three.cachedProxyLookups` and `three.cachedGeometrySelections` count
+reused draw lookups and complete geometry selections.
+
+On Three revision 186, `three.glAutoUniformUploads` counts compositor draws
+whose changed material lets Three upload uniforms automatically;
+`three.glForcedUniformUploads` counts draws that require an explicit refresh,
+including consecutive uses of one material. Other hosts or unverified revisions
+keep explicit refreshes. During Three WebGPU compositing, eligible uniform groups
+upload their complete CPU buffer once rather than each small changed range.
+`three.gpuRequestedBufferWrites` counts these requests before the existing packed
+upload, while `three.gpuBufferWrites` counts actual queue uploads. The complete
+updates reduce request/copy count but increase `three.gpuStagedUploadBytes`.
+
+Ordinary Three WebGPU fill draws use an opacity/surface-mask shader variant
+without the fifteen computed-gradient mask uniforms. `three.surfaceFoldDraws`
+counts these draws; paints that compute a gradient mask keep the full shader.
+Both variants share live paint, clipping and fold inputs and prepare their
+programs before the first draw, including hidden paints that can appear later.
+
+Private Three compositor scenes draw meshes in queued order with host sorting
+temporarily disabled. Surface dependencies and opaque/transparent transitions
+still split batches; the host's sorting setting is restored after each render.
+
+On Three revision 186, WebGL records the frame's target switches, bounded clears
+and batches, then initializes their geometry in one private driver render.
+Its driver hook replays the batches through Three's `renderBufferDirect`, with
+the usual object/material hooks and matrix updates. `three.directFrame` measures
+the driver render including replay, so it overlaps `three.hostDraw` and
+`three.hostPass`. WebGPU draws each batch through Three's render-object managers
+without repeated scene traversal, render-list construction or sorting. Shader,
+geometry, binding, pipeline and texture ownership stays with Three, and each
+WebGPU pass gets a fresh render ID for its live mask and opacity inputs.
+For the Broschuere workload this replaces 72 full compositor renders with one
+on WebGL and zero on WebGPU; its drawing and surface-pass dependencies remain.
+These counts exclude the application's outer render and presentation draw.
+Unknown renderer versions and unsupported host states use the regular path,
+visible as full calls in `three.hostRenders`.
 
 During a Three WebGL capture, existing GL calls are timed by default. The
 `gl.*` sections distinguish shader-source setup, compilation, linking, program
@@ -852,6 +1009,12 @@ cache preserves its existing rounding; selecting lossless does not recover
 precision already discarded. Rebuild from the original PDF or compact HEP
 without LODs to recover the original LOD geometry.
 
+Text LOD v3 predicts run transforms and bounds from the canonical glyphs, then
+stores exact XOR corrections. Coarse glyph transforms and colors reuse those
+predictions. This avoids storing the same geometry several times while preserving
+every decoded cache value. Existing text LOD v1/v2 remains readable and can be
+repacked without parsing the PDF or clustering the text again.
+
 On load, matching caches skip simplification and clustering. Missing caches are
 built when the viewer needs them. Invalid or incompatible caches produce a
 console warning recommending regeneration and fall back to normal generation.
@@ -863,15 +1026,34 @@ recovers the v1 JSON null sentinel for exact-only text nodes. GPU upload and
 mutable selection state are still prepared at load time.
 
 Both example viewers' **Download HEP** button offers independent vector/text
-checkboxes when applicable, unchecked by default. Cancel or Escape stops the
+checkboxes when applicable, checked by default. Cancel or Escape stops the
 export. Vector LOD offers Lossless and Compact precision choices. Downloads with
 either LOD option use a `-parsed-data-lod.hep` suffix.
+
+Monochrome scans always use the fast, lossless binary encoding with DEFLATE,
+falling back to plain packed pixels when binary runs would grow. Each click
+downloads one `-parsed-data.hep` file, or `-parsed-data-lod.hep` when LOD is
+included. When neither vector nor text LOD is available, export starts without
+a dialog. Full-resolution image quality is preserved. Older HEPs containing
+original JBIG2 streams remain readable and use the fast encoding on re-export.
+
+Download HEP reuses a complete loaded scene immediately. For paged viewing, it
+reuses the existing PDF worker and cached full pages, loading only the remaining
+complete content. Export
+leaves the viewing window unchanged and releases the temporary full scene afterward.
+
+Exports compare the complete HEP against the original PDF's byte length and
+show a warning when the HEP is at least as large. Downloads still succeed and
+retain all selected LOD caches. The viewer displays both file sizes after the
+download; library callers can use `onWarning(message)`. A custom scene or an
+older HEP without a recorded source size needs the
+`sourcePdfByteLength` build option for this check.
 
 The builder accepts `signal` and `onProgress`, including LOD building, raster encoding and
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP containers v1 and v2 with scene schema v9. New exports
+The loader supports HEP containers v1 and v2 with scene schemas v9–v12. New exports
 use v2 only when an exact stroke-style palette makes the file smaller; these
 files require an updated viewer. Existing v1 files remain supported. The palette
 changes no rendering values; optional LOD caches are separate sections. Earlier scene schemas
@@ -883,30 +1065,62 @@ resource limits.
 ## Node conversion
 
 Node applications need the optional canvas backend for PDF operations that use
-Canvas2D and for decoding encoded HEP images:
+Canvas2D and for decoding encoded HEP images. npm installs `@napi-rs/canvas` as an
+optional dependency by default. Browser-only consumers can use
+`npm install @soadzoor/hepr three --omit=optional`. If the native backend's
+installation fails or optional dependencies were omitted, install it explicitly:
 
 ```bash
 npm install @napi-rs/canvas
 ```
 
-Vector/text-only extraction does not need this dependency. Without an encoder,
+Library vector/text-only extraction does not need this dependency. Without an encoder,
 HEP raster export falls back to raw RGBA and can produce much larger files.
-Repository development installs already include the canvas backend.
+The CLI checks for the canvas backend before converting so PDFs that need raster
+fallback can be processed; if it is missing, the CLI prints installation
+instructions. Normal repository installs also include the canvas backend.
 
-The repository provides `PDFtoHEP.js` for batch conversion. It requires a normal
-checkout with development dependencies and Node.js 22.15+, 23.5+, or 24+.
-The CLI is not included in the published npm package.
+Offline conversion compiles every selected page's complete original content,
+but does not prepare or store GPU display caches. The **GPU compress scans**
+viewing option does not apply to `PDFtoHEP.js` or `buildHep`; enabling preparation
+alone would add conversion work without changing the saved HEP. Monochrome scans
+still use the fast, lossless binary storage, and viewers build display data on load
+or zoom. Normal Node provides Canvas2D rather than the WebGL context needed to
+prepare BC7/ASTC color blocks.
+
+The npm package includes the `pdf-to-hep` CLI for single-file and batch conversion.
+It requires Node.js 22.15+, 23.5+, or 24+ and runs the compiled library without a
+repository checkout or development dependencies:
 
 ```bash
-npm install
-node PDFtoHEP.js ./Level1.pdf
+npx @soadzoor/hepr ./Level1.pdf
+npx @soadzoor/hepr --output-dir=./heps ./pdfs
+npx @soadzoor/hepr --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --force ./pdfs
+npx @soadzoor/hepr --workers=4 --output-dir=./heps ./pdfs
+npx @soadzoor/hepr --annotation-appearances=none ./pdfs
+HEPR_PDF_PASSWORD='secret' npx @soadzoor/hepr ./protected.pdf
+```
+
+For repeated use, install the package in your project and invoke its executable:
+
+```bash
+npm install @soadzoor/hepr
+npx pdf-to-hep ./Level1.pdf --output-dir=./heps
+npx -- pdf-to-hep --help
+```
+
+If a one-off `npx` run cannot load canvas, install both packages in the same project
+with `npm install @soadzoor/hepr @napi-rs/canvas`, then use `npx pdf-to-hep`.
+Installing canvas only in the caller's directory does not add it to an existing
+`npx` cache installation.
+
+The repository's existing command remains available after `npm install` and uses
+the same flags:
+
+```bash
 node PDFtoHEP.js --output-dir=./heps ./pdfs
-node PDFtoHEP.js --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
-node PDFtoHEP.js --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
-node PDFtoHEP.js --force ./pdfs
-node PDFtoHEP.js --workers=4 --output-dir=./heps ./pdfs
-node PDFtoHEP.js --annotation-appearances=none ./pdfs
-HEPR_PDF_PASSWORD='secret' node PDFtoHEP.js ./protected.pdf
 ```
 
 Directory input is scanned recursively and converted in isolated child processes,
@@ -927,7 +1141,8 @@ a second signal force-stops them. Failed conversions do not stop other PDFs.
 
 `Level1.pdf` produces `Level1-parsed-data.hep` beside
 the input unless `--output-dir=<directory>` is supplied. Output-name collisions
-are rejected. Existing files are skipped; `--force` replaces them only after a
+are rejected. Relative input and output paths use the current working directory.
+Existing files are skipped; `--force` replaces them only after a
 successful conversion. `--annotation-appearances=render|forms|none` chooses which
 annotation appearances become page content (default `render`); annotation metadata
 is kept in every mode. PDFs that require a password take it from
@@ -961,6 +1176,10 @@ per file in isolated workers:
 ```bash
 node scripts/repack-hep-lods.mjs public/examples/heps-lod/Level_1-parsed-data.hep
 ```
+
+For an older HEP without recorded PDF size, add
+`--source-pdf="/path/to/original.pdf"` for a single HEP file. This reads only the
+PDF's file size and enforces the same strict budget; it does not parse the PDF.
 
 `--write` enables atomic replacement, only when smaller. Repacking verifies
 canonical section bytes and all decoded LOD data against the expected lossless

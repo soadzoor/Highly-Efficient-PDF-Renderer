@@ -82,7 +82,7 @@ export class RetainedPageReplay {
         const bits = pageVisibility[node.retainedPage], previous = this.pageVisibility[node.retainedPage];
         const changed = this.dependencies[index].some(condition => bits[condition] !== previous[condition]);
         if (!visible.has(node.rasterIndex)) {
-          if (this.visible.has(node.rasterIndex)) updates.set(node.rasterIndex, { ...original, width: 1, height: 1, data: new Uint8Array(4) });
+          if (this.visible.has(node.rasterIndex)) updates.set(node.rasterIndex, { ...original, monochrome: undefined, width: 1, height: 1, data: new Uint8Array(4) });
         } else if (changed || !this.visible.has(node.rasterIndex)) {
           await waitForLoad(new Promise<void>(resolve => setTimeout(resolve, 0)), options.signal);
           const rendered = await waitForLoad(this.renderSpan(pages[node.retainedPage], node.firstCommand, node.count, options.signal), options.signal);
@@ -93,7 +93,7 @@ export class RetainedPageReplay {
               a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
               a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]]);
             updates.set(node.rasterIndex, { ...rendered, matrix, paintOrder: original.paintOrder, pageIndex: original.pageIndex });
-          } else updates.set(node.rasterIndex, { ...original, width: 1, height: 1, data: new Uint8Array(4) });
+          } else updates.set(node.rasterIndex, { ...original, monochrome: undefined, width: 1, height: 1, data: new Uint8Array(4) });
         }
         report(Math.floor((index + 1) / this.nodes.length * 100));
       }

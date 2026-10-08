@@ -22,6 +22,10 @@ import { composePagePaintGraph } from "./scenePaintGraphComposition";
 import { validateScenePaintGraph, type ScenePaintGraph } from "./scenePaintGraph";
 import { composeOptionalContent } from "./optionalContentComposition";
 import { assertPdfBytes, PDF_HEADER_SCAN_BYTES } from "./pdfSignature";
+import { copyRasterLayer, type MonochromeRaster } from "./monochromeRaster";
+import type { PreparedRasterCompression } from "./rasterCompression";
+import type { PreparedRasterPixels } from "./rasterPreparationCore";
+import { resolvePdfViewingOptions } from "./pdfViewingOptions";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -33,11 +37,21 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
+  /** Viewing-only GPU blocks; canonical pixels remain available for export and recovery. */
+  gpuCompression?: PreparedRasterCompression;
+  /** Viewing-only packed/compact monochrome atlases prepared before scene upload. */
+  gpuPreparation?: PreparedRasterPixels;
+  /** Explicit viewing approximation for opaque scanned pages with sharp text edges. */
+  compressionHint?: "scan";
+  /** Viewing-only scan slot; its pixels can change without replacing document geometry. */
+  pageDemandSlot?: boolean;
   /** Constant paint alpha, independent of the retained image RGBA; absent means one. */
   opacity?: number;
   width: number;
   height: number;
   data: Uint8Array<ArrayBufferLike>;
+  /** Optional packed pixels; native GPU renderers avoid materializing the RGBA fallback. */
+  monochrome?: MonochromeRaster;
   matrix: Float32Array;
   /** Dense PDF paint ordinal within `pageIndex`. */
   paintOrder: number;
@@ -96,6 +110,8 @@ export interface VectorClipPath {
 
 /** Consecutive instances painted together, in PDF source order. */
 export interface VectorDrawRun {
+  /** Viewing-only alternative paints. Both representations retain stable primitive IDs. */
+  pdfRepresentation?: { pageIndex: number; detail: boolean };
   /** Index of the visibility condition in the document's optional-content model. */
   optionalContent?: number;
   blendMode?: "Multiply";
@@ -106,6 +122,10 @@ export interface VectorDrawRun {
 }
 
 export interface VectorScene {
+  /** Original PDF size used to warn when an exported HEP is larger. */
+  sourcePdfByteLength?: number;
+  /** Internal one-page viewing policy; omitted from composed/exported document data. */
+  pdfOverviewKind?: "vector" | "ocr" | "raster";
   /** Annotation geometry in composed scene coordinates; absent in older HEP files. */
   annotations?: readonly SceneAnnotation[];
   /** Compile-time appearance filter; absent means every appearance was compiled (`"render"`). */
@@ -128,6 +148,8 @@ export interface VectorScene {
   pageCount: number;
   pagesPerRow: number;
   pageRects: Float32Array;
+  /** Viewing-only page skeleton flags; absent once the overview is available. Never exported as PDF content. */
+  pendingPagePreviews?: Uint8Array;
   pageTextRanges: Uint32Array;
   /** Per-page [first,count] pairs: stroke, fill, text, raster, gradient-fill, gradient-stroke. */
   pagePrimitiveRanges?: Uint32Array;
@@ -213,8 +235,23 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
+  /**
+   * Prepare bounded compact monochrome or eligible GPU-compressed color/grayscale
+   * scan derivatives between page compiles. ocrTextOnly disables this option with
+   * an options.compress-scans-ocr-conflict warning through onDiagnostic and console.warn.
+   * @default false
+   */
+  compressScans?: boolean;
+  /**
+   * Draw stored text with bundled substitute fonts, omitting images and other graphics.
+   * Takes precedence over compressScans with an options.compress-scans-ocr-conflict warning.
+   * PDF only; compatible with streaming in the high-level loader.
+   * @default false
+   */
+  ocrTextOnly?: boolean;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
   imageCodecResolver?: NativeImageCodecResolver;
+  /** Receives PDF diagnostics, including viewing-option conflicts, which also warn on the console. */
   onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   /** User or owner password for a PDF that requires one to open. */
   password?: string;
@@ -380,6 +417,7 @@ async function extractPdfPageScenesWithNative(
   ownership: "copy" | "transfer" = "copy"
 ): Promise<VectorScene[]> {
   signal?.throwIfAborted();
+  options = { ...options, compressScans: resolvePdfViewingOptions(options).compressScans };
   const {
     openPdfInBrowserWorker,
     openPdfInNodeWorker
@@ -406,6 +444,7 @@ async function extractPdfPageScenesWithNative(
     });
   };
   let session: PdfSession | null = null;
+  let scanCompressor: import("./pdfRasterCompression").PdfRasterCompressor | undefined;
   let failed = false;
   try {
     const source = {
@@ -432,6 +471,10 @@ async function extractPdfPageScenesWithNative(
     sourcePageCount = vectorSession.info.pageCount;
     const pageNumbers = resolvePdfPageNumbers(sourcePageCount, options.pages);
     selectedPageCount = pageNumbers.length;
+    if (options.compressScans && !options.ocrTextOnly) {
+      const { createPdfRasterCompressor } = await import("./pdfRasterCompression");
+      scanCompressor = createPdfRasterCompressor(options.onDiagnostic);
+    }
     const pageScenes: VectorScene[] = [];
 
     for (selectionIndex = 0; selectionIndex < selectedPageCount; selectionIndex += 1) {
@@ -452,6 +495,7 @@ async function extractPdfPageScenesWithNative(
         sourcePageCount
       });
       const scene = await vectorSession.compileVectorPage(sourcePageIndex, {
+        ocrTextOnly: options.ocrTextOnly,
         signal,
         optimization:
           options.enableSegmentMerge === false && options.enableInvisibleCull === false
@@ -466,6 +510,8 @@ async function extractPdfPageScenesWithNative(
       if (options.extractTextContent === true) {
         scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
       }
+      await scanCompressor?.preparePage(scene, selectedPageCount, sourcePageIndex, signal);
+      signal?.throwIfAborted();
       pageScenes.push(scene);
       progress.report(pageEnd, {
         stage: "pdf-page",
@@ -497,6 +543,7 @@ async function extractPdfPageScenesWithNative(
     failed = true;
     throw error;
   } finally {
+    scanCompressor?.dispose();
     try {
       await session?.close();
     } catch (closeError) {
@@ -512,7 +559,7 @@ let nativeVectorMissingFontResolverPromise: Promise<NativeMissingFontResolver> |
  * the host so browser and Node workers share one lazy face cache through the
  * existing request protocol.
  */
-function nativeVectorMissingFontResolver(): Promise<NativeMissingFontResolver> {
+export function nativeVectorMissingFontResolver(): Promise<NativeMissingFontResolver> {
   nativeVectorMissingFontResolverPromise ??= isNodeRuntime()
     ? import("./nodePdfSource").then(({ createNodeBundledStandardFontResolver }) =>
         createNodeBundledStandardFontResolver())
@@ -536,7 +583,8 @@ function readNativeVectorSession(session: PdfSession): NativeVectorPdfSession {
   return session as NativeVectorPdfSession;
 }
 
-function reportNativePdfProgress(
+/** @internal Shared progress mapping for full-document and viewing compilation. */
+export function reportNativePdfProgress(
   reporter: LoadProgressReporter,
   event: Readonly<PdfProgress>,
   context: {
@@ -734,6 +782,11 @@ export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPa
   return composeScenesInGrid(pageScenes, requestedPagesPerRow, onDiagnostic);
 }
 
+/** Internal page alternatives share one origin instead of being laid out in separate grid cells. */
+export function composeOverlappingVectorScenes(pageScenes: VectorScene[]): VectorScene {
+  return composeScenesInGrid(pageScenes, 1, undefined, true);
+}
+
 export async function extractPdfVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const maxPagesPerRow = normalizePositiveInt(options.maxPagesPerRow, 10, 1, 100);
   const pageScenes = await extractPdfPageScenes(pdfData, options);
@@ -780,10 +833,7 @@ export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: Vecto
  */
 function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
   const pageBounds = normalizeSceneBounds(scene.pageBounds, scene.bounds);
-  const rasterLayers = listSceneRasterLayers(scene).map((layer) => ({
-    ...layer,
-    pageIndex: 0
-  }));
+  const rasterLayers = listSceneRasterLayers(scene).map(layer => copyRasterLayer(layer, { pageIndex: 0 }));
   let rasterBounds: Bounds | null = null;
   for (const layer of rasterLayers) {
     const matrix: Mat2D = [
@@ -802,6 +852,7 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
 
   const base = createEmptyVectorScene();
   const primaryRasterLayer = rasterLayers[0] ?? null;
+  const emptyRasterData = new Uint8Array(0);
   return {
     ...base,
     pdfPages: scene.pdfPages,
@@ -818,7 +869,7 @@ function createNativeRasterOnlyPageScene(scene: VectorScene): VectorScene {
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    get rasterLayerData() { return primaryRasterLayer?.data ?? emptyRasterData; },
     rasterLayerMatrix:
       primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     bounds: combineBounds(pageBounds, rasterBounds) ?? pageBounds,
@@ -833,22 +884,22 @@ interface PagePlacement {
 }
 
 function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number,
-  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): VectorScene {
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, overlap = false): VectorScene {
   if (pageScenes.length === 0) {
     return createEmptyVectorScene();
   }
 
   if (pageScenes.length === 1) {
-    return {
-      ...pageScenes[0],
+    return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(pageScenes[0])) as VectorScene, {
       pageCount: Math.max(1, pageScenes[0].pageRects.length / 4),
       pagesPerRow: 1,
       pageTextRanges: normalizePageTextRangesForScene(pageScenes[0])
-    };
+    });
   }
 
   const pagesPerRow = normalizePositiveInt(requestedPagesPerRow, 10, 1, 100);
   const placements = computeGridPlacements(pageScenes, pagesPerRow);
+  if (overlap) for (const placement of placements) { placement.translateX = 0; placement.translateY = 0; }
 
   let totalFillPathCount = 0;
   let totalFillSegmentCount = 0;
@@ -949,6 +1000,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
   const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
   const pageRects = new Float32Array(totalPageRectCount * 4);
+  const pendingPagePreviews = pageScenes.some(scene => scene.pendingPagePreviews?.some(Boolean))
+    ? new Uint8Array(totalPageRectCount) : undefined;
   const pageTextRanges = new Uint32Array(totalPageRectCount * 2);
 
   let fillPathOffset = 0;
@@ -999,7 +1052,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     if (pagePrimitiveRanges) {
       validatePagePrimitiveRanges(scene);
       const offsets = [segmentOffset, fillPathOffset, textInstanceOffset, rasterLayers.length, gradientFillPathOffset, gradientStrokeRunOffset];
-      const counts = scenePrimitiveCounts({ ...scene, rasterLayers: listSceneRasterLayers(scene) });
+      const counts = scenePrimitiveCounts(Object.assign(
+        Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene,
+        { rasterLayers: listSceneRasterLayers(scene) }
+      ));
       const localPages = Math.max(1, scene.pageRects.length / 4);
       for (let local = 0; local < localPages; local++) PAGE_PRIMITIVE_KINDS.forEach((kind, k) => {
         const src = local * PAGE_PRIMITIVE_RANGE_STRIDE + k * 2;
@@ -1035,10 +1091,15 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         raster: rasterLayers.length, "gradient-fill": gradientFillPathOffset,
         "gradient-stroke": gradientStrokeRunOffset
       };
-      for (const run of scene.drawRuns ?? defaultVectorDrawRuns({ ...scene, rasterLayers: listSceneRasterLayers(scene) })) {
+      for (const run of scene.drawRuns ?? defaultVectorDrawRuns(Object.assign(
+        Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene,
+        { rasterLayers: listSceneRasterLayers(scene) }
+      ))) {
         const clipIndex = run.clipIndex === undefined ? undefined : run.clipIndex + clipBase;
         const optionalContent = run.optionalContent === undefined ? undefined : run.optionalContent + layers.offsets[pageIndex];
-        if (paintGraph) drawRuns.push({ ...run, first: run.first + offsets[run.kind],
+        if (paintGraph || run.pdfRepresentation) drawRuns.push({ ...run, first: run.first + offsets[run.kind],
+          ...(run.pdfRepresentation ? { pdfRepresentation: { ...run.pdfRepresentation,
+            pageIndex: pageRectBase + run.pdfRepresentation.pageIndex } } : {}),
           ...(clipIndex === undefined ? {} : { clipIndex }), ...(optionalContent === undefined ? {} : { optionalContent }) });
         else appendVectorDrawRun(drawRuns, run.kind, run.first + offsets[run.kind], run.count, clipIndex, run.blendMode, optionalContent);
       }
@@ -1271,6 +1332,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
         pageRects[dst + 1] = scenePageRects[src + 1] + ty;
         pageRects[dst + 2] = scenePageRects[src + 2] + tx;
         pageRects[dst + 3] = scenePageRects[src + 3] + ty;
+        if (pendingPagePreviews) pendingPagePreviews[pageRectOffset + i] = scene.pendingPagePreviews?.[i] ?? 0;
 
         const rangeDst = (pageRectOffset + i) * 2;
         const rangeSrc = i * 2;
@@ -1285,6 +1347,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       pageRects[dst + 1] = scene.pageBounds.minY + ty;
       pageRects[dst + 2] = scene.pageBounds.maxX + tx;
       pageRects[dst + 3] = scene.pageBounds.maxY + ty;
+      if (pendingPagePreviews) pendingPagePreviews[pageRectOffset] = scene.pendingPagePreviews?.[0] ?? 0;
       const rangeDst = pageRectOffset * 2;
       pageTextRanges[rangeDst] = textInstanceOffset;
       pageTextRanges[rangeDst + 1] = scene.textInstanceCount;
@@ -1307,15 +1370,11 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       matrix[3] = layer.matrix[3];
       matrix[4] = layer.matrix[4] + tx;
       matrix[5] = layer.matrix[5] + ty;
-      rasterLayers.push({
-        width: layer.width,
-        height: layer.height,
-        data: layer.data,
+      rasterLayers.push(copyRasterLayer(layer, {
         matrix,
-        ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
         paintOrder: layer.paintOrder,
         pageIndex: pageRectBase + layer.pageIndex
-      });
+      }));
     }
 
     fillPathOffset += scene.fillPathCount;
@@ -1332,6 +1391,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   }
 
   const primaryRasterLayer = rasterLayers[0] ?? null;
+  const emptyRasterData = new Uint8Array(0);
 
   const { droppedPages: structureDroppedPages, ...structure } = composeSceneStructure(structurePages);
   if (structureDroppedPages) onDiagnostic?.({ code: "structure.limit", severity: "warning",
@@ -1350,6 +1410,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     pageCount: totalPageRectCount,
     pagesPerRow,
     pageRects,
+    ...(pendingPagePreviews ? { pendingPagePreviews } : {}),
     pageTextRanges,
     ...(pagePrimitiveRanges ? { pagePrimitiveRanges } : {}),
     textIndex: hasAnyTextIndex ? { version: 2, pages: mergedTextIndexPages } : null,
@@ -1407,7 +1468,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     rasterLayers,
     rasterLayerWidth: primaryRasterLayer?.width ?? 0,
     rasterLayerHeight: primaryRasterLayer?.height ?? 0,
-    rasterLayerData: primaryRasterLayer?.data ?? new Uint8Array(0),
+    get rasterLayerData() { return primaryRasterLayer?.data ?? emptyRasterData; },
     rasterLayerMatrix: primaryRasterLayer?.matrix ?? new Float32Array([1, 0, 0, 1, 0, 0]),
     endpoints,
     primitiveMeta,
@@ -1570,8 +1631,7 @@ export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
     }
   }
 
-  return {
-    ...scene,
+  return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(scene)) as VectorScene, {
     textInstanceB,
     textGlyphCount: uniqueOldGlyphIndices.length,
     textGlyphSegmentCount: dedupGlyphSegmentsA.quadCount,
@@ -1579,7 +1639,7 @@ export function optimizeVectorSceneTextGlyphs(scene: VectorScene): VectorScene {
     textGlyphMetaB: dedupGlyphMetaB.toTypedArray(),
     textGlyphSegmentsA: dedupGlyphSegmentsA.toTypedArray(),
     textGlyphSegmentsB: dedupGlyphSegmentsB.toTypedArray()
-  };
+  });
 }
 
 export function inferPageTextRanges(
@@ -1846,7 +1906,9 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
     for (const layer of scene.rasterLayers) {
       const width = Math.max(0, Math.trunc(layer?.width ?? 0));
       const height = Math.max(0, Math.trunc(layer?.height ?? 0));
-      if (width <= 0 || height <= 0 || !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4) {
+      if (width <= 0 || height <= 0 || (layer.monochrome
+        ? !(layer.monochrome.data instanceof Uint8Array) || layer.monochrome.data.length !== Math.ceil(width / 8) * height || layer.monochrome.colors.length !== 8
+        : !(layer.data instanceof Uint8Array) || layer.data.length < width * height * 4)) {
         continue;
       }
 
@@ -1863,15 +1925,14 @@ function listSceneRasterLayers(scene: VectorScene): RasterLayer[] {
         matrix[3] = 1;
       }
 
-      out.push({
+      out.push(copyRasterLayer(layer, {
         width,
         height,
-        data: layer.data,
         matrix,
         ...(layer.opacity === undefined ? {} : { opacity: layer.opacity }),
         paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,
         pageIndex: Number.isFinite(layer.pageIndex) ? Math.max(0, Math.trunc(layer.pageIndex)) : 0
-      });
+      }));
     }
   }
 
@@ -1918,7 +1979,7 @@ function normalizePositiveInt(value: unknown, fallback: number, min: number, max
   return valid;
 }
 
-function resolvePdfPageNumbers(pdfPageCount: number, pages: string | undefined): number[] {
+export function resolvePdfPageNumbers(pdfPageCount: number, pages: string | undefined): number[] {
   if (pages !== undefined && typeof pages !== "string") {
     throw new TypeError("pages must be a string.");
   }

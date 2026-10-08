@@ -115,8 +115,16 @@ export class ThreeVectorDrawRuns {
         for (const id of ids) this.lodIdToRank[id] = rank++;
       }
     }
-    this.rebuildEntries();
-    this.finishUpdate();
+    if (this.plan.deferInitialBatches) {
+      // The factory will supply the camera scale before the first layer update.
+      // Allocating canonical batches now can create thousands of meshes that
+      // the first scheduled update immediately discards. Keep the source count
+      // for beginUpdate(), but submit neither the parent nor any child yet.
+      this.parent.geometry.instanceCount = 0;
+    } else {
+      this.rebuildEntries();
+      this.finishUpdate();
+    }
     this.setEnabled(true);
   }
 
@@ -431,7 +439,10 @@ export class ThreeVectorDrawRuns {
   }
 
   private disposeEntries(): void {
-    for (const entry of this.entries) {
+    // Remove newest children first, avoiding shifts through every remaining
+    // batch on each splice while preserving unrelated children and events.
+    for (let index = this.entries.length - 1; index >= 0; index--) {
+      const entry = this.entries[index];
       this.parent.remove(entry.mesh);
       // Batch geometries borrow the layer's corner and index buffers. Three
       // frees the GPU buffer of every attribute a disposed geometry still

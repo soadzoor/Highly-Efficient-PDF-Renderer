@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -10,6 +11,7 @@ import {
   assertUniqueHepOutputs,
   discoverPdfFiles,
   formatPdfToHepDuration,
+  formatPdfToHepSummary,
   formatPdfToHepTimingSummary,
   hepDiffersOnlyInGeneratedAt,
   hepOutputPathForPdf,
@@ -203,6 +205,8 @@ async function encodeTestHep(generatedAt, {
   return archive.generateAsync({ type: "uint8array", compression });
 }
 const existingTestHep = await encodeTestHep("2026-09-29T15:45:20.289Z");
+assert.equal(await hepDiffersOnlyInGeneratedAt(existingTestHep, existingTestHep, HepArchive), true,
+  "--keep-unchanged retains identical HEP data without applying a source-PDF size limit");
 assert.equal(
   await hepDiffersOnlyInGeneratedAt(existingTestHep, await encodeTestHep("2026-09-30T11:19:41.033Z"), HepArchive),
   true,
@@ -261,7 +265,7 @@ const fakeWorker = startPdfToHepWorker(
 assert.equal(spawnInvocation.command, process.execPath);
 assert.deepEqual(spawnInvocation.args, redirectedWorkerArguments);
 assert.equal(spawnInvocation.options.shell, false);
-assert.equal(spawnInvocation.options.stdio, "inherit");
+assert.deepEqual(spawnInvocation.options.stdio, ["inherit", "inherit", "inherit", "ipc"]);
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER, "1");
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_BATCH_INDEX, "2");
 assert.equal(spawnInvocation.options.env.HEPR_PDF_TO_HEP_BATCH_TOTAL, "5");
@@ -380,7 +384,12 @@ assert.deepEqual(batchLog, [
     `  [3/3] ${batchItems[2].pdfPath}: 0h 00m 04s (skipped)`,
     "  Total attempted conversion time: 0h 00m 07s"
   ].join("\n"),
-  "Batch wall time: 0h 00m 07s"
+  "Batch wall time: 0h 00m 07s",
+  formatPdfToHepSummary([
+    { ...batchItems[0], status: "generated" },
+    { ...batchItems[1], status: "failed", errorMessage: "exit code 1" },
+    { ...batchItems[2], status: "skipped" }
+  ], 3)
 ]);
 assert.equal(batchSignalTarget.listenerCount("SIGINT"), 0);
 assert.equal(batchSignalTarget.listenerCount("SIGTERM"), 0);
@@ -433,7 +442,9 @@ assert.deepEqual(interruptLog, ["Converting 3 PDF(s) with up to 1 worker(s).", [
   "Conversion time summary:",
   `  [1/3] ${batchItems[0].pdfPath}: 0h 00m 05s (interrupted)`,
   "  Total attempted conversion time: 0h 00m 05s"
-].join("\n"), "Batch wall time: 0h 00m 05s"]);
+].join("\n"), "Batch wall time: 0h 00m 05s", formatPdfToHepSummary([
+  { ...batchItems[0], status: "interrupted" }
+], 0, 2)]);
 assert.equal(interruptChildren.length, 1, "interruption must prevent later workers from starting");
 assert.equal(interruptSignalTarget.listenerCount("SIGINT"), 0);
 assert.equal(interruptSignalTarget.listenerCount("SIGTERM"), 0);
@@ -490,7 +501,8 @@ try {
   assert.deepEqual(existingSkipLog, [
     `Skipping existing ${existingHepPath}`,
     "No files generated; 1 existing HEP file(s) skipped.",
-    "Conversion time summary: no PDF conversions were attempted."
+    "Conversion time summary: no PDF conversions were attempted.",
+    formatPdfToHepSummary([], 1)
   ]);
   assert.equal(await readFile(existingHepPath, "utf8"), "existing HEP sentinel");
 
@@ -529,6 +541,123 @@ try {
       process.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER = previousWorkerFlag;
     }
   }
+
+  // Exercise the worker's reporting without a parser, canvas, or source loader.
+  // The builder returns a synthetic archive; no PDF conversion is performed.
+  const reportPdf = path.join(temporaryRoot, "report.pdf");
+  const reportOutput = hepOutputPathForPdf(reportPdf);
+  await writeFile(reportPdf, "%PDF-test-only");
+  const reports = [];
+  const originalConsoleForReports = { log: console.log, error: console.error, warn: console.warn };
+  const liveWarnings = [];
+  let canvasChecks = 0;
+  let reportingGeneratedAt = "2026-10-01T11:19:41.033Z";
+  const reportingDependencies = {
+    assertCanvasAvailable: async () => { canvasChecks += 1; },
+    reportWorkerEvent: (event) => reports.push(event),
+    async loadBuilder() {
+      console.warn("%s warning", "loader");
+      return {
+        HepArchive,
+        async buildHep(bytes, options) {
+          assert.equal(bytes.byteLength, 14);
+          console.warn("[HEP] synthetic size warning");
+          options.onDiagnostic({ severity: "info", code: "info-only", message: "ignore" });
+          options.onDiagnostic({ severity: "warning", code: "icc-fallback", pageIndex: 1, message: "approximate colors" });
+          return new Blob([await encodeTestHep(reportingGeneratedAt)]);
+        },
+        async close() { console.warn("cleanup warning"); }
+      };
+    }
+  };
+  try {
+    process.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER = "1";
+    console.log = () => {};
+    console.error = () => {};
+    console.warn = (...args) => liveWarnings.push(args);
+    const reportConsoleWarn = console.warn;
+    assert.equal(await runPdfToHep([reportPdf], reportingDependencies), 0);
+    const generatedReportBytes = await readFile(reportOutput);
+    assert.deepEqual(reports.filter((event) => event.type === "pdf-to-hep-sizes"), [
+      { type: "pdf-to-hep-sizes", sourceBytes: 14 },
+      { type: "pdf-to-hep-sizes", outputBytes: generatedReportBytes.byteLength }
+    ]);
+    assert.deepEqual(reports.filter((event) => event.type === "pdf-to-hep-warning").map((event) => event.message), [
+      "loader warning",
+      "[HEP] synthetic size warning",
+      "report.pdf page 2: [icc-fallback] approximate colors",
+      "cleanup warning"
+    ]);
+    assert.equal(liveWarnings.length, 4, "warnings remain visible during conversion");
+    assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after success");
+
+    reports.length = 0;
+    reportingGeneratedAt = "2026-10-02T11:19:41.033Z";
+    assert.equal(await runPdfToHep(["--force", "--keep-unchanged", reportPdf], reportingDependencies), 0);
+    assert.deepEqual(await readFile(reportOutput), generatedReportBytes);
+    assert.equal(reports.find((event) => event.outputBytes !== undefined).outputBytes, generatedReportBytes.byteLength,
+      "kept HEPs report their successful size");
+
+    reports.length = 0;
+    assert.equal(await runPdfToHep(["--force", reportPdf], {
+      ...reportingDependencies,
+      async loadBuilder() {
+        return {
+          buildHep() { console.warn("failure warning"); throw new Error("synthetic build failure"); },
+          async close() {}
+        };
+      }
+    }), 1);
+    assert(reports.some((event) => event.type === "pdf-to-hep-error" && event.message === "synthetic build failure"));
+    assert(!reports.some((event) => event.outputBytes !== undefined), "failed builds do not report generated sizes");
+    assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after a failed build");
+
+    reports.length = 0;
+    await assert.rejects(runPdfToHep(["--force", reportPdf], {
+      ...reportingDependencies,
+      async loadBuilder() { throw new Error("synthetic loader failure"); }
+    }), /synthetic loader failure/);
+    assert.deepEqual(reports, [{ type: "pdf-to-hep-error", message: "synthetic loader failure" }]);
+    assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after a rejected worker");
+    assert.equal(canvasChecks, 4);
+  } finally {
+    Object.assign(console, originalConsoleForReports);
+    if (previousWorkerFlag === undefined) delete process.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER;
+    else process.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER = previousWorkerFlag;
+  }
+
+  // Verify the real IPC path with a short-lived Node child and a stub builder.
+  const ipcWorkerScript = path.join(temporaryRoot, "ipc-worker.mjs");
+  await writeFile(ipcWorkerScript, `
+import { runPdfToHep } from ${JSON.stringify(new URL("../PDFtoHEP.js", import.meta.url).href)};
+process.exitCode = await runPdfToHep(process.argv.slice(2), {
+  assertCanvasAvailable: async () => {},
+  async loadBuilder() {
+    return {
+      async buildHep() {
+        console.warn("synthetic IPC warning");
+        console.warn("synthetic IPC warning");
+        return new Blob(["synthetic HEP"]);
+      },
+      async close() {}
+    };
+  }
+});
+`);
+  const ipcWorker = startPdfToHepWorker({
+    pdfPath: reportPdf,
+    outputPath: reportOutput,
+    fileNumber: 1,
+    fileCount: 1
+  }, true, 512, (command, args, options) => spawn(command, args, {
+    ...options, stdio: ["ignore", "ignore", "ignore", "ipc"]
+  }), ipcWorkerScript);
+  assert.deepEqual(await ipcWorker.completion, { code: 0, signal: null });
+  assert.deepEqual(ipcWorker.report, {
+    warnings: [{ message: "synthetic IPC warning", count: 2 }],
+    sourceBytes: 14,
+    outputBytes: 13
+  });
 
   const collisionA = path.join(temporaryRoot, "A B.pdf");
   const collisionB = path.join(temporaryRoot, "A_B.PDF");
@@ -592,5 +721,5 @@ try {
 }
 
 console.log(
-  "PDF-to-HEP CLI argument, timing, source-loader, unchanged-HEP, filesystem, and atomic-write tests passed."
+  "PDF-to-HEP CLI argument, timing, worker reporting/IPC, source-loader, unchanged-HEP, filesystem, and atomic-write tests passed."
 );

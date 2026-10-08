@@ -7,9 +7,11 @@ try {
   const scenes=[createEmptyVectorScene(),createEmptyVectorScene()];
   const image=value=>({width:1,height:1,data:Uint8Array.of(value,0,0,255),matrix:Float32Array.of(1,0,0,1,0,0),pageIndex:0,paintOrder:0});
   scenes.forEach((scene,i)=>scene.rasterLayers=[image(i)]);
-  let active, view, colors, background, visibility, listener, pixels, uploads=0,disposals=0,serial=0,releases=0;
+  let active, view, colors, background, visibility, listener, pixels, lastSceneOptions, uploadView,
+    uploads=0,disposals=0,serial=0,releases=0;
   const native={
-    setScene(scene){active=scene;uploads++;pixels=scene.rasterLayers[0].data[0];colors=[];return{textureWidth:1};},
+    setScene(scene,options){active=scene;lastSceneOptions=options;uploadView={...view};uploads++;
+      pixels=scene.rasterLayers[0].data[0];colors=[];return{textureWidth:1};},
     getSceneStats:()=>({textureWidth:1}),resize(){},dispose(){disposals++;},
     setExternalFrameDriver(){},setViewState(next){view={...next};},getViewState:()=>({...view}),getPresentedViewState:()=>({...view}),
     setFrameListener(next){listener=next;},setInteractionViewportProvider(){},
@@ -47,6 +49,10 @@ try {
   assert.deepEqual(b.getViewState(),{cameraCenterX:-5,cameraCenterY:-8,zoom:3});
   assert.throws(()=>a.setExternalFrameDriver(false),/Three.js host/);
   const cancelled=b.prepareRasterLayerUpdates(new Map([[0,image(99)]]));cancelled.dispose();assert.throws(()=>cancelled.commit(),e=>e.name==='AbortError');
+  const sceneOptions={preserveRasterResolution:true};
+  b.setScene(scenes[1],sceneOptions);
+  assert.equal(lastSceneOptions,sceneOptions,'a progressive page forwards zoom-preservation options');
+  assert.deepEqual(uploadView,b.getViewState(),'progressive planning uses this page camera before uploading on the shared context');
   a.dispose();b.dispose();assert.equal(disposals,0,'views do not destroy the shared context');
   assert.throws(()=>a.renderExternalFrame(),e=>e.name==='AbortError');
   assert(releases>=2,'staged native replacements are released');

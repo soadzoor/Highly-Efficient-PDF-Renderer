@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import vm from "node:vm";
 import { HepArchive } from "./lib/hepContainer.mjs";
-import { waitForLoad, yieldForLoad } from "../src/loadCancellation.ts";
+import { createLoadYielder, waitForLoad, yieldForLoad } from "../src/loadCancellation.ts";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { sourceFunction } from "./lib/sourceFunction.mjs";
 import { tinyPdfStream, writeTinyPdf } from "./lib/tinyPdfWriter.mjs";
@@ -180,18 +180,22 @@ async function testLateRendererCleanup(reason) {
   const source = await readFile(new URL("../src/threePdfObject.ts", import.meta.url), "utf8");
   const controller = new AbortController();
   let finishRenderer;
+  let enteredRenderer;
+  const rendererStarted = new Promise(resolve => { enteredRenderer = resolve; });
   let disposed = 0;
   const context = vm.createContext({
-    waitForLoad, document: { createElement: () => ({}) },
+    createLoadYielder, waitForLoad, document: { createElement: () => ({}) },
     normalizeBounds: (bounds) => bounds,
     resolveSceneFitBounds: () => ({ minX: 0, minY: 0, maxX: 10, maxY: 10 }),
     computeInitialCanvasSize: () => ({ width: 10, height: 10 }),
     normalizeRendererConfig: () => ({}), shouldUseVectorStrokeLod: () => false,
     DEFAULT_FIT_PADDING_PIXELS: 10,
-    createNativeRenderer: () => new Promise((resolve) => { finishRenderer = resolve; })
+    createNativeRenderer: () => new Promise((resolve) => { finishRenderer = resolve; enteredRenderer(); })
   });
+  vm.runInContext(sourceFunction(source, "createThreePdfContent"), context);
   vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
   const pending = context.createThreePdfObject({ scene: {} }, {}, controller.signal);
+  await rendererStarted;
   controller.abort(reason);
   await assert.rejects(pending, (error) => error === reason);
   finishRenderer({ dispose: () => { disposed += 1; } });
@@ -211,7 +215,7 @@ async function testConsumedReservationCleanup() {
     release() { assert.equal(owned, false, "the layer already consumed this reservation"); }
   };
   const context = vm.createContext({
-    waitForLoad, document: { createElement: () => ({}) },
+    createLoadYielder, waitForLoad, document: { createElement: () => ({}) },
     normalizeBounds: bounds => bounds,
     resolveSceneFitBounds: () => ({ minX: 0, minY: 0, maxX: 10, maxY: 10 }),
     computeInitialCanvasSize: () => ({ width: 10, height: 10 }),
@@ -231,6 +235,7 @@ async function testConsumedReservationCleanup() {
     sceneRequiresPaintCompositing: () => false,
     ThreeTextLodLayer: { create() { throw failure; } }
   });
+  vm.runInContext(sourceFunction(source, "createThreePdfContent"), context);
   vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
   await assert.rejects(context.createThreePdfObject({ scene }, {}, undefined, reservation),
     error => error === failure);

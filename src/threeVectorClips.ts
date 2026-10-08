@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import type { VectorScene } from "./pdfVectorExtractor";
+import type { VectorClipPath, VectorScene } from "./pdfVectorExtractor";
 import { packVectorClips } from "./vectorClips";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
 import { copyThreePaintFold } from "./threePaintFold";
@@ -7,6 +7,37 @@ import { copyThreePaintFold } from "./threePaintFold";
 const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
 type NodeClipCloner = (source: THREE.Material, target: THREE.Material, clipIndex: number | null, texture: THREE.DataTexture) => void;
 const nodeClipCloners = new WeakMap<THREE.Material, NodeClipCloner>();
+
+interface SharedClipTexture { texture: THREE.DataTexture; users: number }
+const sharedClipTextures = new WeakMap<readonly VectorClipPath[], SharedClipTexture>();
+const emptyClipPaths: readonly VectorClipPath[] = [];
+
+/** Material layers and derived LOD/page scenes borrow one immutable clip store. */
+export function acquireThreeVectorClipTexture(scene: VectorScene): {
+  texture: THREE.DataTexture;
+  release(): void;
+} {
+  const key = scene.clipPaths ?? emptyClipPaths;
+  let entry = sharedClipTextures.get(key);
+  if (!entry) {
+    entry = { texture: createThreeVectorClipTexture(scene), users: 0 };
+    sharedClipTextures.set(key, entry);
+  }
+  entry.users++;
+  const resource = entry;
+  let released = false;
+  return {
+    texture: resource.texture,
+    release(): void {
+      if (released) return;
+      released = true;
+      if (--resource.users === 0) {
+        sharedClipTextures.delete(key);
+        resource.texture.dispose();
+      }
+    }
+  };
+}
 
 /** The selected backend supplies clipping when it creates a node material. */
 export function registerThreeVectorClipCloner(material: THREE.Material, applyClip: NodeClipCloner): void {

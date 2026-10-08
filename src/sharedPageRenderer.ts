@@ -1,8 +1,9 @@
-import type { RendererApi } from "./rendererTypes";
+import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
 import type { RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import type { DrawStats, ViewState } from "./webGlFloorplanRenderer";
 import { validateRasterLayerUpdates } from "./rasterLayerUpdates";
+import type { DeferredSceneRendererApi } from "./deferredRendererApi";
 
 /**
  * Independent Three page views share one native fallback context. Until a view
@@ -14,12 +15,18 @@ export class SharedPageRenderer {
   private active: object | null = null;
   private readonly renderer: RendererApi;
   private readonly canvas: HTMLCanvasElement;
-  constructor(renderer: RendererApi, canvas: HTMLCanvasElement) { this.renderer = renderer; this.canvas = canvas; }
+  private readonly documentRenderer: Partial<DeferredSceneRendererApi>;
+  private documentRevision = -1;
+  constructor(renderer: RendererApi, canvas: HTMLCanvasElement) {
+    this.documentRenderer = renderer;
+    this.renderer = this.documentRenderer.getNativeRenderer?.() ?? renderer; this.canvas = canvas;
+  }
 
   createView(initialScene: VectorScene, canvas: HTMLCanvasElement): RendererApi {
     const identity = {}, config = new Map<string, unknown[]>();
     const colors = new Map<string, PrimitiveColorUpdate>();
     let source = initialScene, disposed = false, dirty = true;
+    let sceneOptions: SceneUpdateOptions | undefined;
     let view: ViewState = { cameraCenterX: 0, cameraCenterY: 0, zoom: 1 };
     let presented = { ...view }, serial = 0;
     let listener: ((stats: DrawStats) => void) | null = null;
@@ -32,10 +39,21 @@ export class SharedPageRenderer {
     };
     const acquire = (): RendererApi => {
       if (disposed) throw new DOMException("PDF page disposed.", "AbortError");
-      const changed = this.active !== identity;
+      const revision = this.documentRenderer.getSceneUploadRevision?.() ?? 0;
+      const changed = this.active !== identity || this.documentRevision !== revision;
       if (changed) {
+        this.documentRenderer.invalidateUploadedScene?.();
+        this.documentRevision = revision;
         this.active = identity;
-        try { native.setScene(source); } catch (error) { this.active = null; throw error; }
+        try {
+          if (sceneOptions?.preserveRasterResolution) {
+            if (this.canvas.width !== canvas.width || this.canvas.height !== canvas.height) {
+              this.canvas.width = canvas.width; this.canvas.height = canvas.height; native.resize();
+            }
+            native.setViewState(view, { scheduleFrame: false });
+          }
+          native.setScene(source, sceneOptions);
+        } catch (error) { this.active = null; throw error; }
         dirty = true;
       }
       if (this.canvas.width !== canvas.width || this.canvas.height !== canvas.height) {
@@ -66,7 +84,8 @@ export class SharedPageRenderer {
     const methods: Record<string, (...args: any[]) => unknown> = {
       dispose: () => { disposed = true; listener = null; provider = null; config.clear(); colors.clear(); replacements.clear();
         if (this.active === identity) { this.active = null; native.setFrameListener(null); native.setInteractionViewportProvider(null); } },
-      setScene: (scene: VectorScene) => { source = scene; if (this.active === identity) this.active = null; return acquire().getSceneStats(); },
+      setScene: (scene: VectorScene, options?: SceneUpdateOptions) => { source = scene; sceneOptions = options;
+        if (this.active === identity) this.active = null; return acquire().getSceneStats(); },
       getSceneStats: () => acquire().getSceneStats(),
       getViewState: () => ({ ...view }),
       setViewState: (next: ViewState) => { view = { ...next }; },
@@ -95,10 +114,13 @@ export class SharedPageRenderer {
       getRasterLayerUpdates: () => new Map(replacements),
       prepareRasterLayerUpdates: (updates: ReadonlyMap<number, RasterLayer>) => {
         validateRasterLayerUpdates(source, updates);
+        const capturedScene = source;
         const staged = new Map(updates); let released = false;
-        return { commit: () => { if (disposed || released) throw new DOMException("PDF page update cancelled.", "AbortError");
+        return { commit: () => { if (disposed || released || source !== capturedScene) throw new DOMException("PDF page update cancelled.", "AbortError");
           for (const [index, layer] of staged) replacements.set(index, layer); dirty = true; }, dispose: () => { released = true; } };
-      }
+      },
+      // Preparation updates CPU state; acquiring the shared context here would upload every page.
+      prepareRasterLayerUpdatesAsync: async (updates: ReadonlyMap<number, RasterLayer>) => methods.prepareRasterLayerUpdates(updates)
     };
     const forwarded = new Map<PropertyKey, Function>();
     return new Proxy(methods, {
