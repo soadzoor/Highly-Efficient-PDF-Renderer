@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import * as THREE from "three";
 import { Backend, NodeMaterial, Renderer, StandardNodeLibrary, TSL, WGSLNodeBuilder } from "three/webgpu";
-import { installThreeWebGpuSubmissionBatch } from "../src/threeWebGpuSubmissionBatch.ts";
+import WebGPUBindingUtils from "../node_modules/three/src/renderers/webgpu/utils/WebGPUBindingUtils.js";
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (context.parentURL?.endsWith("/src/threeWebGpuSubmissionBatch.ts") &&
+    specifier === "./threeWebGpuUniformUpdates") specifier += ".ts";
+  return nextResolve(specifier, context);
+} });
+const { installThreeWebGpuSubmissionBatch } = await import("../src/threeWebGpuSubmissionBatch.ts");
 
 // Exercise Three's real render objects, node updates and uniform bindings. The
 // fake device executes queued commands in order and compares each GPU uniform
@@ -15,10 +22,13 @@ function bytesOf(data, offset = 0, size) {
 
 function testDevice() {
   const device = {
-    draws: 0, checkedBuffers: 0, expected: [],
+    draws: 0, checkedBuffers: 0, expected: [], writeCalls: 0,
     queue: {
       submit(commands) { for (const command of commands) for (const operation of command.operations) operation(); },
-      writeBuffer(buffer, offset, data, dataOffset, size) { buffer.bytes.set(bytesOf(data, dataOffset, size), offset); }
+      writeBuffer(buffer, offset, data, dataOffset, size) {
+        device.writeCalls++;
+        buffer.bytes.set(bytesOf(data, dataOffset, size), offset);
+      }
     },
     createBuffer({ size, usage }) { return { size, usage, mapState: "unmapped", bytes: new Uint8Array(size), destroy() {} }; },
     createBindGroup({ entries }) { return { entries }; },
@@ -62,6 +72,7 @@ class TestBackend extends Backend {
     this.capabilities = { getUniformBufferLimit: () => 65536 };
     this.utils = { getTextureSampleData: () => ({ primarySamples: 1 }) };
     this.writes = 0;
+    this.bindingUtils = new WebGPUBindingUtils(this);
   }
   get coordinateSystem() { return THREE.WebGPUCoordinateSystem; }
   hasFeature() { return false; }
@@ -76,15 +87,8 @@ class TestBackend extends Backend {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
   updateBinding(binding) {
-    const buffer = this.get(binding).buffer;
-    if (binding.updateRanges.length) for (const range of binding.updateRanges) {
-      this.device.queue.writeBuffer(buffer, range.start * binding.buffer.BYTES_PER_ELEMENT,
-        binding.buffer, range.start, range.count);
-      this.writes++;
-    } else {
-      this.device.queue.writeBuffer(buffer, 0, binding.buffer, 0);
-      this.writes++;
-    }
+    this.bindingUtils.updateBinding(binding);
+    this.writes++;
   }
   createBindings(group) {
     this.get(group).gpu = this.device.createBindGroup({ entries: group.bindings.map((binding, index) =>
@@ -117,6 +121,7 @@ globalThis.GPUBufferUsage ??= { COPY_SRC: 4, COPY_DST: 8, UNIFORM: 64 };
 let renderer, batch;
 try {
   const backend = new TestBackend();
+  const originalUpdate = backend.updateBinding;
   renderer = new Renderer(backend, { outputBufferType: THREE.UnsignedByteType });
   renderer.library = new StandardNodeLibrary();
   renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
@@ -124,9 +129,11 @@ try {
   batch = installThreeWebGpuSubmissionBatch(renderer);
   assert.ok(batch);
   const color = TSL.uniform(new THREE.Vector4());
+  const unchanged = TSL.uniform(new THREE.Vector4(0.5, 0.6, 0.7, 0.8));
+  const tail = TSL.uniform(new THREE.Vector4());
   const material = new NodeMaterial();
   material.vertexNode = TSL.vec4(TSL.positionLocal, 1);
-  material.fragmentNode = color;
+  material.fragmentNode = color.add(unchanged.mul(0.01)).add(tail.mul(0.1));
   material.depthTest = material.depthWrite = false;
   const geometry = new THREE.PlaneGeometry(1, 1);
   const first = new THREE.Mesh(geometry, material), second = new THREE.Mesh(geometry, material);
@@ -139,9 +146,13 @@ try {
   const targetB = new THREE.RenderTarget(8, 8, { depthBuffer: false });
   const draw = (scene, target, value) => {
     color.value.set(value, value + 0.25, value + 0.5, 1);
+    tail.value.set(value * 3, value * 4, value * 5, 1);
     renderer.setRenderTarget(target); renderer.render(scene, camera);
   };
   draw(a, targetA, 0); draw(b, targetB, 0);
+  backend.device.writeCalls = 0;
+  draw(a, targetA, 0.5);
+  assert.equal(backend.device.writeCalls, 2, "Three's real binding utility writes two noncontiguous changed uniform ranges");
   backend.device.draws = backend.device.checkedBuffers = backend.writes = 0;
 
   // Two different objects/targets have independent Three uniform buffers and
@@ -151,6 +162,7 @@ try {
   assert.equal(batch.stats.requestedSubmissions, 2);
   assert.equal(batch.stats.submissions, 1, JSON.stringify(batch.stats));
   assert.equal(batch.stats.requestedBufferWrites, 2);
+  assert.equal(batch.stats.stagedUploadBytes, 96, "each changed UBO uploads all fields including unchanged uniforms");
   assert.equal(batch.stats.bufferWrites, 1, "independent Three uniform writes share one upload");
 
   // Reusing a render object also reuses its UBO. Rewriting that buffer must
@@ -164,11 +176,29 @@ try {
   }
   assert.equal(backend.device.draws, 14);
   assert.ok(backend.device.checkedBuffers >= 14, "all actual Three UBO values survive delayed submission");
-  assert.ok(backend.writes > 2, "the test exercises changed uniforms after the first draw");
+  assert.equal(backend.writes, 0, "known Three uniform groups bypass the original fragmented update method only during batching");
   assert.equal(backend.device, backend.originalDevice, "renderer retains native device identity");
   batch.dispose(); batch = null;
+  assert.equal(backend.updateBinding, originalUpdate, "adapter disposal restores the backend's original binding method");
   draw(a, targetA, 20);
   assert.equal(backend.device.draws, 15, "normal Three drawing works after adapter disposal");
+
+  // A native device can be shared by several renderer backends. Each backend
+  // receives the same scoped optimization, and one adapter restores them all.
+  const sharedBackend = new TestBackend();
+  sharedBackend.device = backend.device;
+  const originalSharedUpdate = sharedBackend.updateBinding;
+  batch = installThreeWebGpuSubmissionBatch(renderer);
+  const firstWrappedUpdate = backend.updateBinding;
+  assert.equal(installThreeWebGpuSubmissionBatch({ backend: sharedBackend }), batch);
+  const sharedWrappedUpdate = sharedBackend.updateBinding;
+  assert.notEqual(sharedWrappedUpdate, originalSharedUpdate);
+  assert.equal(installThreeWebGpuSubmissionBatch({ backend: sharedBackend }), batch);
+  assert.equal(sharedBackend.updateBinding, sharedWrappedUpdate, "shared backend installation remains idempotent");
+  assert.equal(backend.updateBinding, firstWrappedUpdate);
+  batch.dispose(); batch = null;
+  assert.equal(backend.updateBinding, originalUpdate);
+  assert.equal(sharedBackend.updateBinding, originalSharedUpdate, "dispose restores every backend sharing the device");
   targetA.dispose(); targetB.dispose(); geometry.dispose(); material.dispose();
   console.log("Three WebGPU real renderer submissions: shared node materials, changed UBOs and draw values passed");
 } finally {

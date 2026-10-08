@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { installThreeWebGpuSubmissionBatch, getThreeWebGpuSubmissionBatch } from "../src/threeWebGpuSubmissionBatch.ts";
+import { registerHooks } from "node:module";
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (context.parentURL?.endsWith("/src/threeWebGpuSubmissionBatch.ts") &&
+    specifier === "./threeWebGpuUniformUpdates") specifier += ".ts";
+  return nextResolve(specifier, context);
+} });
+const { installThreeWebGpuSubmissionBatch, getThreeWebGpuSubmissionBatch } =
+  await import("../src/threeWebGpuSubmissionBatch.ts");
 
 for (const renderer of [null, {}, { backend: {} }, { backend: { isWebGPUBackend: false } },
   { backend: { isWebGPUBackend: true, device: { queue: {} } } }]) {

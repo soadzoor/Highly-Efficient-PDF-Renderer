@@ -685,7 +685,7 @@ async function testGradientMaskFolding(ThreePaintCompositor, backend) {
   const folds = [];
   let gradientDraws = 0;
   host.onMesh = mesh => {
-    if (gradientMaterials.has(mesh.material)) gradientDraws++;
+    if ([...compositor.proxies.values()].some(proxy => gradientMaterials.has(proxy.source.material) && proxy.meshes.includes(mesh))) gradientDraws++;
     const state = threePaintFoldState(mesh.material);
     if (state?.masked) folds.push(state);
   };

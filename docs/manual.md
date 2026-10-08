@@ -668,6 +668,29 @@ into one surface share a host render; `three.hostRenders` counts them. Inside `t
 with `three.scheduleChanges` to diagnose zoom replans. These sections overlap:
 do not sum parent and child durations.
 
+`three.cachedPaintPlans` counts frames that replay a stable compositor plan;
+`three.paintPlanBuilds` counts frames that rebuild it. Visibility revisions,
+paint selection, proxy replacement, surface size and fold eligibility invalidate
+the plan. Projected rectangles and computed mask vectors still update every
+frame. `three.cachedProxyLookups` and `three.cachedGeometrySelections` count
+reused draw lookups and complete geometry selections.
+
+On Three revision 186, `three.glAutoUniformUploads` counts compositor draws
+whose changed material lets Three upload uniforms automatically;
+`three.glForcedUniformUploads` counts draws that require an explicit refresh,
+including consecutive uses of one material. Other hosts or unverified revisions
+keep explicit refreshes. During Three WebGPU compositing, eligible uniform groups
+upload their complete CPU buffer once rather than each small changed range.
+`three.gpuRequestedBufferWrites` counts these requests before the existing packed
+upload, while `three.gpuBufferWrites` counts actual queue uploads. The complete
+updates reduce request/copy count but increase `three.gpuStagedUploadBytes`.
+
+Ordinary Three WebGPU fill draws use an opacity/surface-mask shader variant
+without the fifteen computed-gradient mask uniforms. `three.surfaceFoldDraws`
+counts these draws; paints that compute a gradient mask keep the full shader.
+Both variants share live paint, clipping and fold inputs and prepare their
+programs before the first draw, including hidden paints that can appear later.
+
 During a Three WebGL capture, existing GL calls are timed by default. The
 `gl.*` sections distinguish shader-source setup, compilation, linking, program
 use, shader/state queries, buffer/texture uploads, drawing, clears, readbacks

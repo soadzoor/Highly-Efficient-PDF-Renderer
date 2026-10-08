@@ -126,6 +126,32 @@ try {
     assert.deepEqual(frame().map(draw => draw.clips), [[11], [10]]);
     assert.equal(disposals, 1, "replacing source geometry retires the subset's owned GPU buffers");
     assert.notEqual(proxy.partialGeometries[0], previousPartial);
+
+    const fullRun = [{ kind: "stroke", first: 3, count: 7 }];
+    assert.equal(compositor.geometryForRuns(proxy, fullRun, 0), replacement);
+    const fullSnapshot = proxy.partialSelections[0];
+    assert.equal(compositor.geometryForRuns(proxy, fullRun, 0), replacement);
+    assert.equal(proxy.partialSelections[0], fullSnapshot,
+      "unchanged full-source selections skip range sorting and membership work");
+    replacement.getAttribute("aVectorClipIndex").needsUpdate = true;
+    assert.equal(compositor.geometryForRuns(proxy, fullRun, 0), replacement);
+    assert.notEqual(proxy.partialSelections[0], fullSnapshot,
+      "changed full-source attribute versions invalidate the cached geometry selection");
+    fullRun[0].first = 9; fullRun[0].count = 1;
+    assert.deepEqual(values(compositor.geometryForRuns(proxy, fullRun, 0), "aSegmentIndex"), [12],
+      "a full selection that becomes a subset never reuses the full source");
+
+    const lookupRun = [{ kind: "stroke", first: 3, count: 1 }];
+    const lookup = compositor.proxiesForRuns(lookupRun);
+    assert.equal(compositor.proxiesForRuns(lookupRun), lookup);
+    lookupRun[0].first = 7;
+    assert.notEqual(compositor.proxiesForRuns(lookupRun), lookup,
+      "mutable requested runs invalidate proxy membership");
+    const rescheduled = new THREE.Mesh(replacement, material);
+    Object.assign(rescheduled.userData, source.userData);
+    compositor.collect([rescheduled]);
+    assert.equal(compositor.proxiesForRuns(lookupRun).ordered[0].source, rescheduled,
+      "mesh replacement invalidates every retained proxy lookup");
     compositor.dispose();
     assert.equal(proxy.partialSelections, undefined);
     assert.equal(disposals, 1);

@@ -109,6 +109,8 @@ export const fastTests = [
   "three-webgpu-uniform-updates",
   "three-webgl-uniform-updates",
   "three-paint-fold-state",
+  "three-webgpu-paint-fold-variants",
+  "three-paint-fold-variants-compositor",
   "three-webgpu-raster-strip-material",
   "three-webgpu-text-material",
   "three-webgpu-varying-interpolation",

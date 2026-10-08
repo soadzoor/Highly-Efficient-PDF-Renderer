@@ -64,6 +64,12 @@ export function canFoldThreePaint(material: THREE.Material): boolean {
   return foldInputs.has(material);
 }
 
+/** An enclosing caller's computed fold also needs the full gradient shader. */
+export function hasThreeComputedGradientPaintFold(material: THREE.Material): boolean {
+  const inputs = foldInputs.get(material);
+  return !!inputs && inputs.fold.value.y >= 1.5;
+}
+
 /** A soft mask made of one gradient paint, as a folded paint computes it; see `THREE_GRADIENT_MASK_VECTORS`. */
 export interface ThreeGradientMaskFold {
   /** The scene's gradient colour table, which holds a row per gradient. */

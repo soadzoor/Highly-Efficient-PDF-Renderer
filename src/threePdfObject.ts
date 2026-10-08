@@ -2428,7 +2428,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
         this.add(this.paintCompositor.mesh);
       }
       if (this.pageOwner) this.paintCompositor.setPageDepth(this.clipFromDataMatrix);
-      await this.paintCompositor.compileForRenderer(renderer as unknown as ThreePaintHostRenderer & ThreeShaderCompileHost, roots, signal);
+      await this.paintCompositor.compileForRenderer(renderer as unknown as ThreePaintHostRenderer & ThreeShaderCompileHost,
+        roots, signal, this.sceneData);
       outer.push(this.paintCompositor.mesh);
     } else {
       outer.push(...roots);
@@ -3189,7 +3190,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
           materialLayerViewport.width, materialLayerViewport.height,
           condition => this.layerVisibility.isVisible(condition),
           bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType),
-          this.clipFromDataMatrix);
+          this.clipFromDataMatrix, this.layerVisibility.revision);
       }
     } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }

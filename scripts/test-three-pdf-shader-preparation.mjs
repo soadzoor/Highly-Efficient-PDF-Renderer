@@ -68,7 +68,8 @@ try {
         assert.equal(host.xr.enabled, false); assert.equal(host.lighting.enabled, false);
         assert(originalMaterials.size > 0);
         for (const material of originalMaterials) {
-          assert(scene.children.some(mesh => mesh.material === material), "original paint programs are prepared");
+          const ordinary = object.paintCompositor.surfacePaintMaterial(material);
+          assert(scene.children.some(mesh => mesh.material === ordinary), "ordinary paint programs are prepared");
         }
         assert(scene.children.some(mesh => mesh.material === object.paintCompositor.passMaterial));
         assert(scene.children.some(mesh => mesh.material === object.paintCompositor.blendMaterial));

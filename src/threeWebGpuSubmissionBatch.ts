@@ -1,3 +1,5 @@
+import { installThreeWebGpuUniformUpdates } from "./threeWebGpuUniformUpdates";
+
 type GpuObject = object & Record<PropertyKey, unknown>;
 type GpuMethod = (...args: unknown[]) => unknown;
 
@@ -27,11 +29,18 @@ export interface ThreeWebGpuSubmissionBatch {
 
 const installed = new WeakMap<object, ThreeWebGpuSubmissionBatch>();
 const devices = new WeakMap<object, ThreeWebGpuSubmissionBatch>();
+const uniformInstallers = new WeakMap<ThreeWebGpuSubmissionBatch, (backend: GpuObject) => void>();
 const MAX_COMMAND_BUFFERS = 256;
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 const COPY_SRC = 0x0004, COPY_DST = 0x0008;
 const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
 const ARRAY_KIND = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, Symbol.toStringTag)!.get!;
+const TYPED_BYTES = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteLength")!.get!;
+const TYPED_OFFSET = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteOffset")!.get!;
+const TYPED_BUFFER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "buffer")!.get!;
+const VIEW_BYTES = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength")!.get!;
+const VIEW_OFFSET = Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset")!.get!;
+const VIEW_BUFFER = Object.getOwnPropertyDescriptor(DataView.prototype, "buffer")!.get!;
 const ELEMENT_BYTES: Record<string, number> = { Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1,
   Int16Array: 2, Uint16Array: 2, Float16Array: 2, Int32Array: 4, Uint32Array: 4, Float32Array: 4,
   Float64Array: 8, BigInt64Array: 8, BigUint64Array: 8 };
@@ -63,10 +72,9 @@ function sourceBytes(args: unknown[]): Uint8Array | null {
       const kind = ARRAY_KIND.call(data) as string | undefined;
       factor = kind ? ELEMENT_BYTES[kind] : 1;
       if (!factor) return null;
-      const prototype = kind ? TYPED_ARRAY_PROTOTYPE : DataView.prototype;
-      bytes = Object.getOwnPropertyDescriptor(prototype, "byteLength")!.get!.call(data);
-      start = Object.getOwnPropertyDescriptor(prototype, "byteOffset")!.get!.call(data);
-      storage = Object.getOwnPropertyDescriptor(prototype, "buffer")!.get!.call(data);
+      bytes = (kind ? TYPED_BYTES : VIEW_BYTES).call(data);
+      start = (kind ? TYPED_OFFSET : VIEW_OFFSET).call(data);
+      storage = (kind ? TYPED_BUFFER : VIEW_BUFFER).call(data);
     } catch { return null; }
     if (size !== undefined && (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0)) return null;
     const count = size === undefined ? bytes - dataOffset * factor : (size as number) * factor;
@@ -99,7 +107,10 @@ export function installThreeWebGpuSubmissionBatch(renderer: unknown): ThreeWebGp
   if (!object(candidate) || candidate.isWebGPUBackend !== true || !object(candidate.device)) return null;
   const device = candidate.device;
   const previous = devices.get(device);
-  if (previous) { installed.set(renderer, previous); return previous; }
+  if (previous) {
+    uniformInstallers.get(previous)?.(candidate);
+    installed.set(renderer, previous); return previous;
+  }
   if (!object(device.queue) || typeof device.createBindGroup !== "function" ||
     typeof device.createCommandEncoder !== "function" || typeof device.queue.submit !== "function" ||
     typeof device.queue.writeBuffer !== "function") return null;
@@ -121,6 +132,12 @@ export function installThreeWebGpuSubmissionBatch(renderer: unknown): ThreeWebGp
     upload = null; uploadData = new Uint8Array(0);
   };
   let depth = 0, disposed = false, stageAllowed = true, stats = emptyStats();
+  const uniformBackends = new WeakSet<object>(), uniformRestores: (() => void)[] = [];
+  const installUniformUpdates = (backend: GpuObject) => {
+    if (uniformBackends.has(backend)) return;
+    const restore = installThreeWebGpuUniformUpdates(backend, () => depth > 0 && !disposed);
+    if (restore) { uniformBackends.add(backend); uniformRestores.push(restore); }
+  };
 
   const flush = () => {
     if (!pending.length && !writeCount) return;
@@ -417,6 +434,9 @@ export function installThreeWebGpuSubmissionBatch(renderer: unknown): ThreeWebGp
         if (resource) resourceRestores.get(resource)?.();
       }
       trackedResources.clear();
+      for (const restore of uniformRestores) restore();
+      uniformRestores.length = 0;
+      uniformInstallers.delete(batch);
       restore();
       devices.delete(device);
       const renderer = owner.deref();
@@ -425,6 +445,8 @@ export function installThreeWebGpuSubmissionBatch(renderer: unknown): ThreeWebGp
   };
   installed.set(renderer, batch);
   devices.set(device, batch);
+  uniformInstallers.set(batch, installUniformUpdates);
+  installUniformUpdates(candidate);
   return batch;
 }
 
