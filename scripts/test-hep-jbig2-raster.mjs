@@ -13,11 +13,11 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 function guardRgba(scene) {
   for (const layer of scene.rasterLayers) if (layer.monochrome) Object.defineProperty(layer, "data", {
     enumerable: true, configurable: true,
-    get() { throw new Error("JBIG2 HEP export must not expand scans into RGBA"); }
+    get() { throw new Error("HEP export must not expand scans into RGBA"); }
   });
   if (scene.rasterLayers[0]?.monochrome) Object.defineProperty(scene, "rasterLayerData", {
     enumerable: true, configurable: true,
-    get() { throw new Error("JBIG2 HEP export must not read the primary RGBA alias"); }
+    get() { throw new Error("HEP export must not read the primary RGBA alias"); }
   });
   return scene;
 }
@@ -43,27 +43,29 @@ async function editArchive(bytes, edit) {
   return archive.generateAsync({ type: "uint8array", compression: "STORE" });
 }
 
-function sectionCodecs(bytes) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const result = new Map();
-  let offset = 32 + view.getUint32(12, true) * 20;
-  for (let index = 0; index < view.getUint32(8, true); index += 1) {
-    const nameLength = view.getUint16(offset, true);
-    const name = new TextDecoder().decode(bytes.subarray(offset + 16, offset + 16 + nameLength));
-    const chunk = view.getUint32(offset + 4, true);
-    result.set(name, chunk === 0xffffffff ? null : view.getUint8(32 + chunk * 20 + 16));
-    offset = Math.ceil((offset + 16 + nameLength) / 4) * 4;
-  }
-  return result;
+// Legacy v11 fixtures are assembled independently of the current writer.
+function legacySection(encoded, globalsLength, colors, invert, packedHash, globalsIndex = 0) {
+  const bytes = new Uint8Array(40 + encoded.length);
+  bytes.set([0x48, 0x4a, 0x42, 0x31]);
+  bytes[4] = invert ? 1 : 0;
+  bytes.set(colors, 8);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(16, encoded.length, true);
+  view.setUint32(20, globalsLength, true);
+  view.setUint32(24, globalsLength ? globalsIndex : 0xffffffff, true);
+  view.setUint32(28, packedHash[0], true);
+  view.setUint32(32, packedHash[1], true);
+  bytes.set(encoded, 40);
+  return bytes;
 }
 
 try {
   const [{ buildHep }, { loadSceneFromHep }, { openPdf }, { createEmptyVectorScene },
-    sections, codec, mono, { collectPdfTransferables }, { decodeBundledJbig2 }] = await Promise.all([
+    sections, codec, mono, { collectPdfTransferables }] = await Promise.all([
     import("../src/hepBuilder.ts"), import("../src/hep.ts"), import("../src/pdfSession.ts"),
     import("../src/emptyVectorScene.ts"), import("../src/hepRasterLayers.ts"),
     import("../src/hepJbig2Raster.ts"), import("../src/monochromeRaster.ts"),
-    import("../src/pdf/workerProtocol.ts"), import("../src/pdf/nativeJbig2Codec.ts")
+    import("../src/pdf/workerProtocol.ts")
   ]);
   const limits = { maxLayers: 100, maxAtlases: 4, maxDimension: 16_384 };
   const readTable = async archive => sections.decodeRasterLayerTable(
@@ -83,14 +85,8 @@ try {
       const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
       const layer = scene.rasterLayers[0];
       assert(layer.monochrome, "native JBIG2 scans retain canonical packed pixels");
-      assert(layer.monochrome.jbig2Source, "trusted native JBIG2 decoding retains encoded provenance");
-      const source = layer.monochrome.jbig2Source;
-      assert.equal(source.width, width);
-      assert.equal(source.height, height);
-      assert.equal(source.invert, index === 1);
-      assert.deepEqual(source.encoded, fixture.encoded);
-      assert.deepEqual(source.globals, fixture.globals);
-      assert.deepEqual(source.packedHash, mono.hashMonochromePixels(layer.monochrome.data, width, height));
+      assert.equal(layer.monochrome.jbig2Source, undefined,
+        "PDF parsing keeps packed pixels and GPU symbols without retaining encoded source streams");
       if (!index) assert(layer.monochrome.symbols, "ordinary symbol pages retain their GPU dictionary");
       layers.push(mono.copyRasterLayer(layer, {
         matrix: Float32Array.of(257.5, -1.25, 2.5, -257.75, 42.25, -1.75),
@@ -101,27 +97,11 @@ try {
   assert.deepEqual(fixture.encoded, encodedBefore);
   assert.deepEqual(fixture.globals, globalsBefore);
 
-  // Altered PDF colors and caller-supplied decoders cannot claim that the
-  // original encoded stream reproduces the prepared canonical image.
-  for (const [extra, options] of [
-    ["/Decode [.25 .75]", {}], ["/Mask [0 0]", {}],
-    ["", { imageCodecResolver: request => decodeBundledJbig2(request, 32 * 1024 * 1024) }]
-  ]) {
-    const session = await openPdf({ kind: "bytes", bytes: imagePdf(fixture.encoded, {
-      filter: "JBIG2Decode", width, height, colorSpace: "/DeviceGray",
-      bitsPerComponent: 1, extra, globals: fixture.globals
-    }) }, options);
-    try {
-      const scene = await session.compileVectorPage(0, { optimization: "none", vectorFallback: "error" });
-      assert.equal(scene.rasterLayers[0].monochrome?.jbig2Source, undefined,
-        "modified pixels and custom codec results cannot retain trusted stream provenance");
-    } finally { await session.close(); }
-  }
-
   const decodeBudget = 32 * 1024 * 1024;
   const palette = Uint8Array.of(7, 11, 13, 0, 241, 223, 197, 127);
-  const source = layers[0].monochrome.jbig2Source;
-  const section = codec.encodeHepJbig2Raster(source, palette, 0, width, height);
+  for (const layer of layers) layer.monochrome.colors = palette;
+  const hashes = layers.map(layer => mono.hashMonochromePixels(layer.monochrome.data, width, height));
+  const section = legacySection(fixture.encoded, fixture.globals.length, palette, false, hashes[0]);
   assert.equal(section.length, codec.HEP_JBIG2_RASTER_HEADER_BYTES + fixture.encoded.length);
   assert.deepEqual(section.subarray(codec.HEP_JBIG2_RASTER_HEADER_BYTES), fixture.encoded);
   const inspected = codec.inspectHepJbig2Raster(section, width, height, decodeBudget);
@@ -130,7 +110,7 @@ try {
   assert.equal(inspected.globalsIndex, 0);
   assert.equal(inspected.globalsLength, fixture.globals.length);
   assert.equal(inspected.invert, false);
-  assert.deepEqual(inspected.packedHash, source.packedHash);
+  assert.deepEqual(inspected.packedHash, hashes[0]);
   assert.equal(inspected.encoded.buffer, section.buffer, "inspection borrows encoded bytes rather than expanding pixels");
   const borrowed = new Uint8Array(section.length + 11);
   borrowed.set(section, 7);
@@ -138,18 +118,18 @@ try {
     fixture.globals, width, height, decodeBudget);
   assert.deepEqual(decoded.data, layers[0].monochrome.data);
   assert.deepEqual(decoded.colors, palette);
+  assert.notEqual(decoded.colors.buffer, borrowed.buffer,
+    "the decoded palette must not retain the original compressed section");
   assert.deepEqual(decoded.symbols, layers[0].monochrome.symbols);
   assert.deepEqual(fixture.encoded, encodedBefore);
   assert.deepEqual(fixture.globals, globalsBefore);
-  const invertedSection = codec.encodeHepJbig2Raster(layers[1].monochrome.jbig2Source, palette, 0, width, height);
+  const invertedSection = legacySection(fixture.encoded, fixture.globals.length, palette, true, hashes[1]);
   const inverted = await codec.decodeHepJbig2Raster(invertedSection, fixture.globals, width, height, decodeBudget);
   assert.deepEqual(inverted.data, layers[1].monochrome.data);
   assert.equal(inverted.symbols, undefined, "inverted pixels cannot use the original black-symbol atlas");
   assert.deepEqual(inverted.colors, palette);
   const standalone = tinySymbolJbig2({ width, height, placements: [[0, 0], [8, 1], [12, 2], [256, 256]] });
-  const withoutGlobals = codec.encodeHepJbig2Raster({ ...source,
-    encoded: standalone.encoded, globals: new Uint8Array()
-  }, palette, codec.HEP_JBIG2_NO_GLOBALS, width, height);
+  const withoutGlobals = legacySection(standalone.encoded, 0, palette, false, hashes[0]);
   assert.equal(codec.inspectHepJbig2Raster(withoutGlobals, width, height, decodeBudget).globalsLength, 0);
   assert.deepEqual((await codec.decodeHepJbig2Raster(withoutGlobals, new Uint8Array(), width, height, decodeBudget)).data,
     layers[0].monochrome.data);
@@ -168,8 +148,6 @@ try {
   assert.throws(() => codec.inspectHepJbig2Raster(section.subarray(0, 39), width, height, decodeBudget), /header/i);
   assert.throws(() => codec.inspectHepJbig2Raster(section, width, height,
     layers[0].monochrome.data.length + fixture.encoded.length + fixture.globals.length - 1), /budget/i);
-  assert.throws(() => codec.encodeHepJbig2Raster(source, palette.subarray(0, 7), 0, width, height), /palette/i);
-  assert.throws(() => codec.encodeHepJbig2Raster(source, palette, 0, width + 1, height), /dimension/i);
   await assert.rejects(codec.decodeHepJbig2Raster(section, fixture.globals.subarray(0, fixture.globals.length - 1),
     width, height, decodeBudget), /globals|length/i);
   const wrongHash = section.slice();
@@ -177,48 +155,35 @@ try {
   await assert.rejects(codec.decodeHepJbig2Raster(wrongHash, fixture.globals, width, height, decodeBudget), /hash/i);
   const scene = rasterScene(createEmptyVectorScene, layers);
 
-  // Worker messages copy provenance rather than detaching native cached bytes.
+  // Worker messages preserve packed pixels and GPU symbols without detaching cached data.
   const transport = mono.prepareMonochromeSceneTransfer(scene);
   const transferred = structuredClone(transport, {
     transfer: collectPdfTransferables(transport.rasterLayers.map(layer => layer.monochrome))
   });
   const restored = mono.restoreMonochromeSceneTransfer(transferred);
   for (const [index, layer] of layers.entries()) {
-    assert.deepEqual(restored.rasterLayers[index].monochrome.jbig2Source, layer.monochrome.jbig2Source);
-    assert(layer.monochrome.jbig2Source.encoded.byteLength > 0);
-    assert(layer.monochrome.jbig2Source.globals.byteLength > 0);
+    assert.deepEqual(restored.rasterLayers[index].monochrome.data, layer.monochrome.data);
+    assert.deepEqual(restored.rasterLayers[index].monochrome.symbols, layer.monochrome.symbols);
+    assert.equal(restored.rasterLayers[index].monochrome.jbig2Source, undefined);
     assert(layer.monochrome.data.byteLength > 0);
   }
 
-  let storedBytes, storedTable;
+  let fastBytes, fastTable;
   for (const compression of ["store", "deflate"]) {
     for (const encodeRasterImages of [true, false]) {
       const progress = [];
       const bytes = new Uint8Array(await (await buildHep(scene, {
-        compression, encodeRasterImages, monochromeEncoding: "jbig2", onProgress: event => progress.push(event)
+        compression, encodeRasterImages, onProgress: event => progress.push(event)
       })).arrayBuffer());
       const archive = await HepArchive.loadAsync(bytes);
       const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
       const table = await readTable(archive);
-      assert.equal(manifest.formatVersion, 11);
+      assert.equal(manifest.formatVersion, 12);
       assert.deepEqual(table.atlases, []);
-      assert.deepEqual(table.layers.map(layer => layer.storage), ["jbig2", "jbig2"]);
+      assert.deepEqual(table.layers.map(layer => layer.storage), ["binary", "binary"]);
       assert.deepEqual(Object.keys(archive.files).filter(name => name.startsWith("raster/")).sort(),
-        ["raster/layer-0.jbig2", "raster/layer-1.jbig2", codec.hepJbig2GlobalsFile(0)].sort(),
-        "identical global dictionaries from independent PDF sessions share one section");
-      const codecs = sectionCodecs(bytes);
-      for (const name of Object.keys(archive.files).filter(name => name.startsWith("raster/"))) {
-        assert.equal(codecs.get(name), 0, "original JBIG2 data bypasses redundant container recompression");
-      }
-      assert.deepEqual(await archive.file(codec.hepJbig2GlobalsFile(0)).async("uint8array"), fixture.globals);
-      for (const [index, layer] of layers.entries()) {
-        const payload = await archive.file(`raster/layer-${index}.jbig2`).async("uint8array");
-        const stored = codec.inspectHepJbig2Raster(payload, width, height, decodeBudget);
-        assert.deepEqual(stored.encoded, fixture.encoded, "HEP keeps the original compressed page bytes exactly");
-        assert.deepEqual(stored.colors, layer.monochrome.colors);
-        assert.equal(stored.globalsIndex, 0);
-        assert.equal(stored.invert, !!index);
-      }
+        ["raster/layer-0.binary", "raster/layer-1.binary"],
+        "all exports use fast binary scan sections without original streams or global dictionaries");
       assert(progress.every((event, index) => Number.isFinite(event.value) && event.value >= 0 && event.value <= 1 &&
         (!index || event.value >= progress[index - 1].value)));
       assert.equal(progress.at(-1).value, 1);
@@ -233,83 +198,105 @@ try {
         assert.deepEqual(actual.matrix, expected.matrix);
         assert.deepEqual(actual.monochrome.data, expected.monochrome.data);
         assert.deepEqual(actual.monochrome.colors, expected.monochrome.colors);
-        assert.deepEqual(actual.monochrome.jbig2Source.encoded, fixture.encoded);
-        assert.deepEqual(actual.monochrome.jbig2Source.globals, fixture.globals);
-        assert.equal(actual.monochrome.jbig2Source.invert, !!index);
-        if (!index) assert.deepEqual(actual.monochrome.symbols, expected.monochrome.symbols);
+        assert.equal(actual.monochrome.jbig2Source, undefined);
         assert.equal(typeof Object.getOwnPropertyDescriptor(actual, "data")?.get, "function");
-        for (let y = 0; y < height; y += 1) assert.equal(actual.monochrome.data[y * Math.ceil(width / 8) + 32] & 127, 0,
-          "packed decode normalizes sub-byte row padding without touching the next row");
       }
       const reexport = await HepArchive.loadAsync(await (await buildHep(guardRgba(loaded), {
-        compression: "store", encodeRasterImages, monochromeEncoding: "jbig2"
+        compression: "store", encodeRasterImages
       })).arrayBuffer());
-      assert.deepEqual((await readTable(reexport)).layers.map(layer => layer.storage), ["jbig2", "jbig2"]);
-      if (compression === "store" && encodeRasterImages) { storedBytes = bytes; storedTable = table; }
+      assert.deepEqual((await readTable(reexport)).layers.map(layer => layer.storage), ["binary", "binary"]);
+      if (compression === "store" && encodeRasterImages) { fastBytes = bytes; fastTable = table; }
     }
   }
 
-  // Modified canonical pixels and dimensions must never revive stale encoded content.
-  for (const change of [
-    layer => { layer.monochrome.data[0] ^= 0x80; },
-    layer => { layer.width += 1; },
-    layer => {
-      // The canonical pixel hash still matches. An encoded text region can
-      // nevertheless declare an enormous decoder allocation; fall back to
-      // the already decoded pixels without entering a codec or allocating it.
-      const encoded = layer.monochrome.jbig2Source.encoded.slice();
-      const view = new DataView(encoded.buffer);
-      assert.equal(view.getUint32(42), 1);
-      assert.equal(view.getUint32(46), 1);
-      view.setUint32(42, 1_000_000);
-      view.setUint32(46, 1_000_000);
-      layer.monochrome.jbig2Source = { ...layer.monochrome.jbig2Source, encoded };
-    }
-  ]) {
-    const changed = mono.copyRasterLayer(layers[0]);
-    changed.monochrome = { ...layers[0].monochrome, data: layers[0].monochrome.data.slice() };
-    change(changed);
-    const bytes = await (await buildHep(rasterScene(createEmptyVectorScene, [changed]), {
-      compression: "store", encodeRasterImages: false, monochromeEncoding: "jbig2"
-    })).arrayBuffer();
-    const archive = await HepArchive.loadAsync(bytes);
-    assert.equal(JSON.parse(await archive.file("manifest.json").async("string")).formatVersion, 10);
-    assert.equal((await readTable(archive)).layers[0].storage, "mono");
-    assert.deepEqual((await loadSceneFromHep(bytes)).rasterLayers[0].monochrome.data, changed.monochrome.data);
+  // Keep v11 compatibility using explicit historical envelopes rather than a
+  // selectable legacy encoder in the current production export path.
+  const storedTable = { ...fastTable, layers: fastTable.layers.map(layer => ({ ...layer, storage: "jbig2" })) };
+  const storedBytes = await editArchive(fastBytes, async archive => {
+    for (const name of Object.keys(archive.files)) if (name.startsWith("raster/")) archive.remove(name);
+    archive.file(codec.hepJbig2GlobalsFile(0), fixture.globals);
+    for (const [index, layer] of layers.entries()) archive.file(`raster/layer-${index}.jbig2`,
+      legacySection(fixture.encoded, fixture.globals.length, layer.monochrome.colors, !!index, hashes[index]));
+    archive.file(sections.SCENE_RASTER_LAYERS_PATH, sections.encodeRasterLayerTable(storedTable));
+    const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+    archive.file("manifest.json", JSON.stringify({ ...manifest, formatVersion: 11 }));
+  });
+  const legacy = await loadSceneFromHep(storedBytes);
+  for (const [index, expected] of layers.entries()) {
+    const actual = legacy.rasterLayers[index];
+    assert.deepEqual(actual.monochrome.data, expected.monochrome.data);
+    assert.deepEqual(actual.monochrome.colors, expected.monochrome.colors);
+    assert.deepEqual(actual.matrix, expected.matrix);
+    assert.equal(actual.opacity, expected.opacity);
+    assert.equal(actual.pageIndex, expected.pageIndex);
+    assert.equal(actual.paintOrder, expected.paintOrder);
+    assert.equal(actual.monochrome.jbig2Source, undefined, "legacy loading releases original encoded streams");
+    if (!index) assert.deepEqual(actual.monochrome.symbols, expected.monochrome.symbols);
+    for (let y = 0; y < height; y += 1) assert.equal(actual.monochrome.data[y * Math.ceil(width / 8) + 32] & 127, 0,
+      "legacy decode normalizes sub-byte row padding without touching the next row");
   }
+  for (const encodeRasterImages of [true, false]) {
+    const reexport = await HepArchive.loadAsync(await (await buildHep(guardRgba(legacy), {
+      compression: "store", encodeRasterImages
+    })).arrayBuffer());
+    assert.equal(JSON.parse(await reexport.file("manifest.json").async("string")).formatVersion, 12);
+    assert.deepEqual((await readTable(reexport)).layers.map(layer => layer.storage), ["binary", "binary"],
+      "re-exporting an old small HEP migrates its decoded scans to the fast format");
+    assert(Object.keys(reexport.files).every(name => !/jbig2/.test(name)));
+  }
+
+  // Edits export the current canonical pixels instead of reviving old streams.
+  const changed = mono.copyRasterLayer(legacy.rasterLayers[0]);
+  changed.monochrome = { ...changed.monochrome, data: changed.monochrome.data.slice() };
+  changed.monochrome.data[0] ^= 0x80;
+  const changedBytes = await (await buildHep(rasterScene(createEmptyVectorScene, [changed]), {
+    compression: "store", encodeRasterImages: false
+  })).arrayBuffer();
+  assert.deepEqual((await loadSceneFromHep(changedBytes)).rasterLayers[0].monochrome.data, changed.monochrome.data);
 
   // A larger fast-opening file stays downloadable and reports the tradeoff.
   const fastWarnings = [], consoleWarnings = [], originalWarn = console.warn;
   let fastBlob;
   try {
     console.warn = message => consoleWarnings.push(message);
-    fastBlob = await buildHep(scene, { monochromeEncoding: "packed", sourcePdfByteLength: 1,
+    fastBlob = await buildHep(scene, { sourcePdfByteLength: 1,
       compression: "store", onWarning: message => fastWarnings.push(message) });
   } finally { console.warn = originalWarn; }
   assert.equal(fastWarnings.length, 1);
   assert.deepEqual(fastWarnings, consoleWarnings.map(message => message.replace(/^\[HEP\] /, "")));
   assert(fastWarnings[0].includes(String(fastBlob.size)) && fastWarnings[0].includes("1 bytes"));
-  const fastBytes = await fastBlob.arrayBuffer();
-  const fastArchive = await HepArchive.loadAsync(fastBytes);
+  const warnedBytes = await fastBlob.arrayBuffer();
+  const fastArchive = await HepArchive.loadAsync(warnedBytes);
   assert.equal(JSON.parse(await fastArchive.file("manifest.json").async("string")).formatVersion, 12);
   assert.deepEqual((await readTable(fastArchive)).layers.map(layer => layer.storage), ["binary", "binary"]);
-  const fast = await loadSceneFromHep(fastBytes);
+  const fast = await loadSceneFromHep(warnedBytes);
   for (const [index, layer] of layers.entries()) assert.deepEqual(fast.rasterLayers[index].monochrome.data, layer.monochrome.data);
   for (const version of [9, 10, 11]) await assert.rejects(loadSceneFromHep(await editArchive(fastBytes, async archive => {
     const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
     archive.file("manifest.json", JSON.stringify({ ...manifest, formatVersion: version }));
   })), /v12|version 12|binary|format/i);
 
-  const plain = mono.copyRasterLayer(layers[0]);
-  plain.monochrome = { data: layers[0].monochrome.data, colors: layers[0].monochrome.colors };
+  const plain = mono.createMonochromeRasterLayer({ width: 3, height: 1, matrix: layers[0].matrix,
+    paintOrder: layers[0].paintOrder, pageIndex: layers[0].pageIndex, opacity: layers[0].opacity },
+    { data: Uint8Array.of(0xa5), colors: palette });
   const color = { width: 20, height: 1, matrix: Float32Array.of(20, 0, 0, 1, 0, 0),
     data: Uint8Array.from({ length: 80 }, (_, index) => index * 17 & 255), paintOrder: 8, pageIndex: 1 };
-  const mixedBytes = await (await buildHep(rasterScene(createEmptyVectorScene, [layers[0], plain, color,
+  const mixedSeed = await (await buildHep(rasterScene(createEmptyVectorScene, [layers[0], plain, color,
     { ...color, data: color.data.slice(), paintOrder: 9 }]), {
-    compression: "store", encodeRasterImages: false, monochromeEncoding: "jbig2"
+    compression: "store", encodeRasterImages: false
   })).arrayBuffer();
+  const mixedBytes = await editArchive(mixedSeed, async archive => {
+    archive.remove("raster/layer-0.binary");
+    archive.file("raster/layer-0.jbig2", legacySection(fixture.encoded, fixture.globals.length,
+      layers[0].monochrome.colors, false, hashes[0]));
+    archive.file(codec.hepJbig2GlobalsFile(0), fixture.globals);
+    const table = await readTable(archive);
+    table.layers[0].storage = "jbig2";
+    archive.file(sections.SCENE_RASTER_LAYERS_PATH, sections.encodeRasterLayerTable(table));
+    const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+    archive.file("manifest.json", JSON.stringify({ ...manifest, formatVersion: 11 }));
+  });
   const mixedArchive = await HepArchive.loadAsync(mixedBytes);
-  assert.equal(JSON.parse(await mixedArchive.file("manifest.json").async("string")).formatVersion, 11);
   assert.deepEqual((await readTable(mixedArchive)).layers.map(layer => layer.storage), ["jbig2", "mono", "atlas", "atlas"]);
   const mixed = await loadSceneFromHep(mixedBytes);
   assert.deepEqual(mixed.rasterLayers[0].monochrome.data, layers[0].monochrome.data);
@@ -352,13 +339,11 @@ try {
 
   const controller = new AbortController(), reason = new Error("cancel JBIG2 HEP export");
   controller.abort(reason);
-  assert.throws(() => codec.encodeHepJbig2Raster(source, palette, 0, width, height, controller.signal),
-    error => error === reason);
   await assert.rejects(codec.decodeHepJbig2Raster(section, fixture.globals, width, height, decodeBudget, controller.signal),
     error => error === reason);
   await assert.rejects(buildHep(scene, { signal: controller.signal }), error => error === reason);
   await assert.rejects(loadSceneFromHep(storedBytes, { signal: controller.signal }), error => error === reason);
-  console.log("HEP original JBIG2 passed: exact stream passthrough, bounded packed decode, inverse polarity, globals, metadata, symbols, worker ownership, stale-source fallback and version gates.");
+  console.log("HEP scans passed: fast default export, v11 JBIG2 compatibility and migration, exact pixels, bounded decode, inverse polarity, globals, metadata, symbols, worker ownership and version gates.");
 } finally {
   hooks.deregister();
 }

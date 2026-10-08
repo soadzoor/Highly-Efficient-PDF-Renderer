@@ -154,8 +154,8 @@ emits `change` events with `reason: "pages-loaded"` when it changes. Use
 is required before rendering.
 Extraction APIs and HEP conversion still produce complete scenes for their selected pages;
 the Three example reuses its live PDF session and cached full pages to complete
-the export scene once. It shares that scene between both scan encodings instead
-of reopening the PDF for each download. Missing full pages still need compilation;
+the export scene once. It serializes that scene without reopening the PDF.
+Missing full pages still need compilation;
 raster and OCR previews cannot stand in for the original page content.
 All GPU integrations allocate small raster display tiers first and increase
 their resolution automatically with zoom. CPU canonical image data stays available
@@ -964,16 +964,16 @@ checkboxes when applicable, checked by default. Cancel or Escape stops the
 export. Vector LOD offers Lossless and Compact precision choices. Downloads with
 either LOD option use a `-parsed-data-lod.hep` suffix.
 
-For monochrome scans, the dialog also offers Faster opening, Smaller file, or
-Both (two files), selected by default. The fast variant uses packed binary runs
-with DEFLATE; the smaller variant reuses original JBIG2 streams where available.
-Both preserve full-resolution image quality. Filenames include `-fast` or
-`-small` before the optional `-lod` suffix. The smaller variant requires more
-image decoding work when reopened.
+Monochrome scans always use the fast, lossless binary encoding with DEFLATE,
+falling back to plain packed pixels when binary runs would grow. Each click
+downloads one `-parsed-data.hep` file, or `-parsed-data-lod.hep` when LOD is
+included. When neither vector nor text LOD is available, export starts without
+a dialog. Full-resolution image quality is preserved. Older HEPs containing
+original JBIG2 streams remain readable and use the fast encoding on re-export.
 
 Download HEP reuses a complete loaded scene immediately. For paged viewing, it
 reuses the existing PDF worker and cached full pages, loading only the remaining
-complete content. This preparation runs once even when Both is selected. Export
+complete content. Export
 leaves the viewing window unchanged and releases the temporary full scene afterward.
 
 Exports compare the complete HEP against the original PDF's byte length and

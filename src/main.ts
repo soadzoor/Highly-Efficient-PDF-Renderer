@@ -1914,21 +1914,14 @@ async function downloadHep(): Promise<boolean> {
   setParsingLoader(true, "0.00% Preparing HEP export...");
 
   try {
-    const downloadOptions = await promptForHepLod(scene, exportController.signal,
-      { offerScanEncodings: source?.kind === "pdf" && needsCompleteScene });
-    if (!downloadOptions) {
+    const lodOptions = await promptForHepLod(scene, exportController.signal);
+    if (!lodOptions) {
       if (activeHepExportController === exportController) {
         statusTextElement.textContent = previousStatusText;
         statusTextElement.hidden = !previousStatusText?.trim();
       }
       return false;
     }
-    const { downloadBothScanEncodings, ...lodOptions } = downloadOptions;
-    const scanOptions = downloadBothScanEncodings ? [
-      { monochromeEncoding: "packed" as const },
-      { monochromeEncoding: "jbig2" as const }
-    ] : [{ monochromeEncoding: lodOptions.monochromeEncoding }];
-    let completedScanExports = 0;
     const exportWarnings: string[] = [];
     await yieldToBrowserPaint();
     exportController.signal.throwIfAborted();
@@ -1946,7 +1939,7 @@ async function downloadHep(): Promise<boolean> {
       if (activeHepExportController !== exportController) return false;
       exportScene = prepareSceneForHepRendering(composeVectorScenesInGrid(pages, scene.pagesPerRow));
     } else if (needsCompleteScene && source?.kind === "pdf") {
-      // Text-only eager views omitted images; complete extraction is needed once for all encodings.
+      // Text-only eager views omitted images; complete extraction is needed for export.
       exportScene = (await loadPdfSceneFromSource(source.bytes, { sourceLabel: label, password,
         ocrTextOnly: false, maxPagesPerRow: scene.pagesPerRow, signal: exportController.signal,
         onProgress: onSceneProgress })).scene;
@@ -1964,28 +1957,21 @@ async function downloadHep(): Promise<boolean> {
       onProgress: (progress: PDFLoadProgress) => {
         if (activeHepExportController === exportController) {
           updateParsingLoaderProgress({ ...progress,
-            value: buildStart + (1 - buildStart) * (completedScanExports + progress.value) / scanOptions.length });
+            value: buildStart + (1 - buildStart) * progress.value });
         }
       }
     };
-    for (const scanOption of scanOptions) {
-      exportController.signal.throwIfAborted();
-      if (activeHepExportController !== exportController) return false;
-      const hepBlob = await buildHep(exportScene, { ...buildOptions, ...scanOption });
+    const hepBlob = await buildHep(exportScene, buildOptions);
 
-      if (activeHepExportController !== exportController) return false;
-      exportController.signal.throwIfAborted();
-      const scanSuffix = scanOption.monochromeEncoding === "packed" ? "-fast" :
-        scanOption.monochromeEncoding === "jbig2" ? "-small" : "";
-      const hepFileName = `${sanitizeDownloadName(label)}-parsed-data${scanSuffix}${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
-      triggerBrowserDownload(hepBlob, hepFileName);
-      console.log(
-        `[Parsed data export] ${label}: wrote ${hepFileName} (${formatFileSize(hepBlob.size)})`
-      );
-      completedScanExports += 1;
-      if (activeHepExportController !== exportController) return false;
-      exportController.signal.throwIfAborted();
-    }
+    if (activeHepExportController !== exportController) return false;
+    exportController.signal.throwIfAborted();
+    const hepFileName = `${sanitizeDownloadName(label)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
+    triggerBrowserDownload(hepBlob, hepFileName);
+    console.log(
+      `[Parsed data export] ${label}: wrote ${hepFileName} (${formatFileSize(hepBlob.size)})`
+    );
+    if (activeHepExportController !== exportController) return false;
+    exportController.signal.throwIfAborted();
     if (exportWarnings.length > 0) {
       setStatus(`HEP downloaded. Warning: ${exportWarnings.join(" ")}`);
     } else {

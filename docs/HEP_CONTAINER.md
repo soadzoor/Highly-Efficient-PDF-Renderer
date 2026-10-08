@@ -6,9 +6,9 @@ versions **1** and **2** wrap **scene schema versions 9–12**, recorded in
 document model is a different thing; it is not this container's scene schema.
 Readers support both container versions and scene v9–v12; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
-v12 for transposed binary runs, v11 for original JBIG2 streams, v10 for plain
-packed monochrome rasters, otherwise v9. Readers need support for the scene
-version used by the file. Container repacking preserves section bytes
+v12 for transposed binary runs, v10 for plain packed monochrome rasters,
+otherwise v9. Legacy v11 JBIG2 streams remain readable. Readers need support for
+the scene version used by the file. Container repacking preserves section bytes
 and does not upgrade a scene or restore omitted layers.
 
 All integers are unsigned and little-endian. Offsets and lengths are bytes.
@@ -288,10 +288,10 @@ For a 2,480 by 3,506 scan this reduces the uncompressed pixel section from
 depends on the scan; packed DEFLATE does not promise the same ratio as the
 original JBIG2 stream. Larger HEP exports remain valid and produce a size warning.
 
-Scene v11 adds `raster/layer-N.jbig2`, reusing the PDF's original encoded JBIG2
-segments when the canonical packed pixels and dimensions still match their
-source fingerprint. This avoids re-encoding monochrome scans. Each section has
-a 40-byte `HJB1` header followed by the encoded segments:
+Legacy scene v11 uses `raster/layer-N.jbig2` to store original encoded JBIG2
+segments and a fingerprint of their canonical packed pixels. New exports use
+the fast binary encoding, including when re-exporting a v11 file. The reader
+still accepts each 40-byte `HJB1` header followed by the encoded segments:
 
 | Offset | Type | Value |
 | --- | --- | --- |
@@ -311,14 +311,15 @@ compressed. The loader uses the bundled native JBIG2 decoder, applies polarity,
 clears row padding as the original PDF parser did, and verifies the fingerprint
 before publishing a layer. The fingerprint is the pair returned by
 `hashMonochromePixels` in `src/monochromeRaster.ts`, including dimensions.
-Palette, opacity, page placement, and pixels remain exact. Unsupported source
-provenance or changed pixels fall back to v10 packed storage. Original segments
-and shared globals count toward resident raster memory alongside decoded packed
-pixels. One JBIG2 decode is bounded to 128 MiB of encoded inputs and packed output;
+Palette, opacity, page placement, and pixels remain exact. Original segments
+and shared globals are released after loading; they are not retained in the
+scene for export. Legacy compressed inputs count alongside packed pixels during
+the loading memory preflight. One JBIG2 decode is bounded to 128 MiB of encoded
+inputs and packed output;
 shared globals are size-checked before decompression. Reloading JBIG2 usually
 uses more CPU than inflating packed bytes.
 
-Scene v12 adds `raster/layer-N.binary`, selected by the fast-opening scan option.
+Scene v12 adds `raster/layer-N.binary`, used automatically for monochrome exports.
 Its 16-byte header contains `HBR1` at bytes 0–3, the two RGBA8 palette colors at
 4–11, and four reserved zero bytes at 12–15. The remaining bytes store an initial
 bit (0 or 1), then positive canonical unsigned base-128 varint run lengths;
@@ -334,7 +335,7 @@ rows are invalid. Container DEFLATE compresses the run stream.
 The writer bounds preprocessing memory and falls back to v10 packed storage if
 the run section is not smaller than the plain palette-plus-packed section.
 Reload allocates only the canonical packed output and a small block scratch
-buffer. Both scan options are lossless and avoid full RGBA expansion.
+buffer. Monochrome exports are lossless and avoid full RGBA expansion.
 
 ### Text glyph outlines and origins
 

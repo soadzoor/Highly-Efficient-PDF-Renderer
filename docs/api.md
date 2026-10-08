@@ -1052,7 +1052,6 @@ or `@soadzoor/hepr` in Node.
 | Parsed `VectorScene` | `BuildHepFromSceneOptions`: shared encoding options. |
 
 Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
-`monochromeEncoding` (`"jbig2"` by default, or `"packed"`),
 `compression` (`"deflate"` by default, or `"store"`), `onProgress`, `onWarning`, and `signal`.
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
@@ -1060,19 +1059,18 @@ compressed files requires `DecompressionStream("deflate")`.
 Monochrome layers save full-resolution pixels and their two-color RGBA palette
 losslessly, including when `encodeRasterImages` is false. They bypass PNG/WebP
 encoding and reload as packed one-bit rows without expanding RGBA.
-`monochromeEncoding: "jbig2"` retains original JBIG2 segments when available and
-unchanged, giving smaller files with more CPU work on reload; other layers use
-plain packed DEFLATE. `"packed"` uses an 8-by-8 bit transpose and run encoding
-before DEFLATE for fast reload, falling back to plain packed bytes if runs grow.
-The native and Three demo Download HEP dialogs offer either variant or both,
-using `-fast` and `-small` filenames. Both reuse one complete scene. Demand-loaded
+They use an 8-by-8 bit transpose and run encoding before DEFLATE for fast reload,
+falling back to plain packed bytes if runs grow. Original JBIG2 streams are not
+retained for export. The native and Three demo Download HEP dialogs offer only
+applicable vector/text LOD options and download one file. Demand-loaded
 viewers reuse their active PDF session, full vector overviews and cached scan
 detail; only missing full pages compile. Raster/OCR previews are replaced by
 complete content. Text-only views without an active session extract the original
-PDF once. Full extraction is shared by both encodings, leaves the viewing window
+PDF once. Full extraction leaves the viewing window
 unchanged, and does not add a permanent second document to the viewing cache.
-These exports use scene v10 (plain packed), v11 (JBIG2), or v12 (binary runs);
-other scenes still use v9, and the current loader accepts v9–v12.
+These exports use scene v10 (plain packed) or v12 (binary runs); other scenes
+still use v9. The current loader accepts v9–v12, including older JBIG2 HEPs,
+which use the fast packed encoding when re-exported.
 
 PDF-source builds measure the original PDF automatically. Scenes loaded through
 HEPR carry that size, and HEP exports record it for later re-export. For a custom
@@ -1251,7 +1249,7 @@ page overview is installed, including when the actual page is blank.
 true. Search requests remaining previews in the background. For complete geometry,
 use `await object.loadCompleteScene({ signal, onProgress })`, or `pageLoading: "eager"` at load.
 For complete HEP export, pass that returned scene to `buildHep`; the Three demo
-does this once and reuses the scene for both scan encodings. Cached complete
+does this once and reuses the complete scene. Cached complete
 pages skip parsing; missing full pages still need compilation. Disposing the object closes
 its worker and releases page caches.
 

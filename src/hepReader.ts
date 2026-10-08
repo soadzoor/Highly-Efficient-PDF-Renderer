@@ -1330,7 +1330,7 @@ async function readRasterLayersFromParsedData(
     if (layer.cell) lastCellIndex.set(layer.cell.atlas, index);
   });
   const atlasPixels = new Map<number, Uint8Array>();
-  // Globals stay shared by all layers, including retained provenance for later export.
+  // Decode shared legacy JBIG2 globals once across layers.
   const jbig2Globals = new Map<number, Uint8Array>();
   const layers: RasterLayer[] = [];
   for (let i = 0; i < table.layers.length; i += 1) {
@@ -1500,7 +1500,7 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
             decodedBytes - 8 + byteLength - HEP_JBIG2_RASTER_HEADER_BYTES > HEP_JBIG2_MAX_DECODE_BYTES) {
           throw new Error(`Raster layer ${index} JBIG2 section exceeds the decode byte budget.`);
         }
-        // The scene retains original segments as well as decoded packed pixels.
+        // Account legacy compressed inputs alongside packed pixels while loading.
         totalDecodedBytes += byteLength;
       }
     }

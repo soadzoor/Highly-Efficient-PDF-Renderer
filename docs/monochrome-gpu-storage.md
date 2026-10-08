@@ -36,9 +36,9 @@ including its mip levels. GPU dictionaries are not shared between pages.
 
 The canonical packed CPU image remains available for compatibility and exports.
 Symbol metadata is retained in native vector scenes and copied safely through
-workers. HEP stores canonical packed pixels or original JBIG2 streams.
-Symbol metadata is not serialized; original JBIG2 reload can recover it through
-the bundled symbol decoder, while packed reload uses the block path.
+workers. New HEP exports store canonical packed pixels and reload through the
+block path. Symbol metadata is not serialized. Older JBIG2 HEPs remain readable
+and can recover symbols through the bundled decoder.
 
 ## Texture layout and accounting
 
@@ -85,12 +85,11 @@ Zoom refinement extracts complete compact blocks directly from packed bytes,
 uses exact 2×2 averaging for even mip reductions, and reuses horizontal coverage
 endpoints across rows. The resulting texture bytes and raster target are
 unchanged. Reduced-tier worker inputs omit unused JBIG2 dictionaries; full-tier
-outputs release those dictionaries after compact encoding. Raster preparation
-workers do not copy original encoded streams, which only serve HEP export.
+outputs release those dictionaries after compact encoding. Original encoded
+streams are not retained in the scene or copied through workers for HEP export.
 
-HEP downloads offer two lossless scan encodings: original JBIG2 streams for a
-smaller file, or transposed packed-bit runs with DEFLATE for faster reload.
-Both retain the two-color RGBA palette and fall back to plain packed DEFLATE
+HEP downloads use transposed packed-bit runs with DEFLATE for fast reload.
+They retain the two-color RGBA palette and fall back to plain packed DEFLATE
 where needed. Export skips RGBA expansion and PNG/WebP encoding for these layers.
 Reloading keeps packed storage and generates GPU derivatives as needed;
 palettes, alpha, canonical pixels, and zoom detail remain exact. Larger exports

@@ -31,9 +31,6 @@ import {
 } from "./rasterImageCodec";
 import { encodeHepMonochromeRaster } from "./hepMonochromeRaster";
 import { encodeHepBinaryRaster } from "./hepBinaryRaster";
-import { encodeHepJbig2Raster, HEP_JBIG2_NO_GLOBALS, HEP_JBIG2_MAX_DECODE_BYTES, hepJbig2GlobalsFile } from "./hepJbig2Raster";
-import { hashMonochromePixels, type MonochromeJbig2Source } from "./monochromeRaster";
-import { preflightJbig2, stripJbig2FileHeader } from "./pdf/codecs/jbig2Preflight";
 import {
   IdenticalRasterFinder,
   SCENE_RASTER_LAYERS_PATH,
@@ -62,7 +59,6 @@ import {
   prepareSceneForHepRendering,
   PARSED_DATA_FORMAT_VERSION,
   PARSED_DATA_MONOCHROME_FORMAT_VERSION,
-  PARSED_DATA_JBIG2_FORMAT_VERSION,
   PARSED_DATA_BINARY_FORMAT_VERSION,
   TEXT_INDEX_JSON_PATH,
   TEXT_CHAR_MAP_PATH,
@@ -228,7 +224,6 @@ export async function buildHepBlobForLayout(
 
   const rasterLayersManifest = await writeHepRasterLayers(archive, rasterLayers, {
     encodeRasterImages,
-    monochromeEncoding: options.monochromeEncoding ?? "jbig2",
     signal: options.signal,
     onTexelsEncoded: (processed) => reportBuildProgress(
       totalRasterTexels > 0 ? 0.4 * (processed / totalRasterTexels) : 0,
@@ -240,7 +235,7 @@ export async function buildHepBlobForLayout(
 
   const manifest = {
     formatVersion: rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
-      rasterLayersManifest?.jbig2 ? PARSED_DATA_JBIG2_FORMAT_VERSION : rasterLayers.some(layer => layer.monochrome)
+      rasterLayers.some(layer => layer.monochrome)
       ? PARSED_DATA_MONOCHROME_FORMAT_VERSION : PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,
     sourcePdfByteLength,
@@ -399,7 +394,8 @@ const RASTER_SECTION_OVERHEAD_BYTES = 64;
  * pixels of small lossless layers share PNG atlases instead of paying for a
  * section, a PNG header and a JSON record each. A repeated image is encoded
  * once, and small repeats share one atlas cell. Monochrome layers keep their
- * canonical packed rows and palette, without materializing RGBA or image codecs.
+ * canonical packed rows and palette, using transposed binary runs when smaller,
+ * without materializing RGBA or image codecs.
  * See `hepRasterLayers`.
  */
 async function writeHepRasterLayers(
@@ -407,11 +403,10 @@ async function writeHepRasterLayers(
   layers: readonly RasterLayer[],
   options: {
     encodeRasterImages: boolean;
-    monochromeEncoding: "packed" | "jbig2";
     signal?: AbortSignal;
     onTexelsEncoded: (processed: number) => void;
   }
-): Promise<{ file: string; count: number; atlasCount: number; jbig2: boolean; binary: boolean } | undefined> {
+): Promise<{ file: string; count: number; atlasCount: number; binary: boolean } | undefined> {
   if (layers.length === 0) {
     return undefined;
   }
@@ -419,9 +414,7 @@ async function writeHepRasterLayers(
   const pixels: Uint8Array[] = [];
   const encoded: Array<{ storage: "png" | "webp"; bytes: Uint8Array } | null> = [];
   const identical = new IdenticalRasterFinder();
-  const identicalGlobals = new IdenticalRasterFinder();
-  const globalsByData = new Map<Uint8Array, number>();
-  let globalsCount = 0, jbig2 = false, binary = false;
+  let binary = false;
   /** The first earlier layer with identical pixels, or -1. */
   const originals: number[] = [];
   const joinsAtlas: boolean[] = [];
@@ -457,38 +450,15 @@ async function writeHepRasterLayers(
       storage: "rgba"
     };
     if (layer.monochrome) {
-      const monochrome = layer.monochrome, source = monochrome.jbig2Source;
-      const hash = options.monochromeEncoding === "jbig2" && source && source.width === layer.width && source.height === layer.height &&
-        monochrome.data.length + source.encoded.length + source.globals.length <= HEP_JBIG2_MAX_DECODE_BYTES
-        ? hashMonochromePixels(monochrome.data, layer.width, layer.height) : undefined;
-      if (source && hash && hash[0] === source.packedHash[0] && hash[1] === source.packedHash[1] &&
-          canReloadJbig2Source(source, options.signal)) {
-        let globalsIndex = HEP_JBIG2_NO_GLOBALS;
-        if (source.globals.length) {
-          const cached = globalsByData.get(source.globals);
-          if (cached !== undefined) globalsIndex = cached;
-          else {
-            const previous = identicalGlobals.findOrAdd(globalsCount, source.globals.length, 1, source.globals);
-            globalsIndex = previous < 0 ? globalsCount++ : previous;
-            if (previous < 0) archive.file(hepJbig2GlobalsFile(globalsIndex), source.globals, { compression: "STORE" });
-            globalsByData.set(source.globals, globalsIndex);
-          }
-        }
-        archive.file(rasterLayerFile(i, "jbig2"), encodeHepJbig2Raster(source, monochrome.colors,
-          globalsIndex, layer.width, layer.height, options.signal), { compression: "STORE" });
-        record.storage = "jbig2";
-        jbig2 = true;
+      const monochrome = layer.monochrome;
+      const packedRuns = encodeHepBinaryRaster(monochrome, layer.width, layer.height, options.signal);
+      if (packedRuns) {
+        archive.file(rasterLayerFile(i, "binary"), packedRuns);
+        record.storage = "binary";
+        binary = true;
       } else {
-        const packedRuns = options.monochromeEncoding === "packed"
-          ? encodeHepBinaryRaster(monochrome, layer.width, layer.height, options.signal) : undefined;
-        if (packedRuns) {
-          archive.file(rasterLayerFile(i, "binary"), packedRuns);
-          record.storage = "binary";
-          binary = true;
-        } else {
-          archive.file(rasterLayerFile(i, "mono"), encodeHepMonochromeRaster(monochrome, layer.width, layer.height, options.signal));
-          record.storage = "mono";
-        }
+        archive.file(rasterLayerFile(i, "mono"), encodeHepMonochromeRaster(monochrome, layer.width, layer.height, options.signal));
+        record.storage = "mono";
       }
       records.push(record);
       pixels.push(new Uint8Array(0));
@@ -582,7 +552,7 @@ async function writeHepRasterLayers(
   }
 
   records.forEach((record, index) => {
-    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "jbig2" || record.storage === "binary") return;
+    if (record.storage === "atlas" || record.storage === "mono" || record.storage === "binary") return;
     const image = encoded[index];
     if (image) {
       // WebP and PNG already carry entropy compression; deflating them again
@@ -593,20 +563,7 @@ async function writeHepRasterLayers(
     }
   });
   archive.file(SCENE_RASTER_LAYERS_PATH, encodeRasterLayerTable({ atlases, layers: records }));
-  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, jbig2, binary };
-}
-
-/** Reused streams must fit the loader's declared working-set budget too. */
-function canReloadJbig2Source(source: MonochromeJbig2Source, signal?: AbortSignal): boolean {
-  try {
-    preflightJbig2(stripJbig2FileHeader(source.encoded), stripJbig2FileHeader(source.globals),
-      source.width, source.height, HEP_JBIG2_MAX_DECODE_BYTES, signal);
-    return true;
-  } catch {
-    signal?.throwIfAborted();
-    // Canonical packed pixels still provide an exact, independently reloadable fallback.
-    return false;
-  }
+  return { file: SCENE_RASTER_LAYERS_PATH, count: records.length, atlasCount: atlases.length, binary };
 }
 
 function buildTextIndexExport(scene: VectorScene): TextIndexExportResult | null {

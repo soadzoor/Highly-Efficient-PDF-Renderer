@@ -1902,15 +1902,8 @@ async function downloadHep(): Promise<boolean> {
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
     const needsCompleteScene = pdfObject.isPageDemandLoaded || Boolean(pdfObject.sourceOptions?.ocrTextOnly);
-    const downloadOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal,
-      { offerScanEncodings: pdfObject.sourceKind === "pdf" && needsCompleteScene });
-    if (!downloadOptions) return false;
-    const { downloadBothScanEncodings, ...lodOptions } = downloadOptions;
-    const scanOptions = downloadBothScanEncodings ? [
-      { monochromeEncoding: "packed" as const },
-      { monochromeEncoding: "jbig2" as const }
-    ] : [{ monochromeEncoding: lodOptions.monochromeEncoding }];
-    let completedScanExports = 0;
+    const lodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
+    if (!lodOptions) return false;
     const exportWarnings: string[] = [];
     const scenePhaseEnd = needsCompleteScene ? 0.8 : 0;
     const updateExportProgress = (progress: PDFLoadProgress, start: number, end: number): void => {
@@ -1939,26 +1932,17 @@ async function downloadHep(): Promise<boolean> {
         if (activeHepExportController === exportController) exportWarnings.push(message);
       },
       onProgress: (progress: PDFLoadProgress) => {
-        const start = scenePhaseEnd + completedScanExports * (1 - scenePhaseEnd) / scanOptions.length;
-        const end = scenePhaseEnd + (completedScanExports + 1) * (1 - scenePhaseEnd) / scanOptions.length;
-        updateExportProgress(progress, start, end);
+        updateExportProgress(progress, scenePhaseEnd, 1);
       }
     };
-    for (const scanOption of scanOptions) {
-      exportController.signal.throwIfAborted();
-      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
-      const hepBlob = await buildHep(exportScene, { ...hepOptions, ...scanOption });
+    const hepBlob = await buildHep(exportScene, hepOptions);
 
-      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
-      exportController.signal.throwIfAborted();
-      const scanSuffix = scanOption.monochromeEncoding === "packed" ? "-fast" :
-        scanOption.monochromeEncoding === "jbig2" ? "-small" : "";
-      const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${scanSuffix}${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
-      triggerBrowserDownload(hepBlob, hepFileName);
-      completedScanExports += 1;
-      if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
-      exportController.signal.throwIfAborted();
-    }
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    exportController.signal.throwIfAborted();
+    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
+    triggerBrowserDownload(hepBlob, hepFileName);
+    if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
+    exportController.signal.throwIfAborted();
     if (exportWarnings.length > 0) setStatus(`HEP downloaded. Warning: ${exportWarnings.join(" ")}`);
     return true;
   } catch (error) {

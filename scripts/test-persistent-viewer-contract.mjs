@@ -33,7 +33,7 @@ assert.match(
 const downloadHep = readFunctionBody(mainSource, "downloadHep");
 assert.match(downloadHep, /\blet\s+exportScene\s*=\s*scene\s*;/,
   "complete loaded scenes must be reused directly for HEP export");
-assert.match(downloadHep, /\bbuildHep\s*\(\s*exportScene\s*,\s*\{\s*\.\.\.buildOptions\s*,\s*\.\.\.scanOption\s*,?\s*\}\s*\)/,
+assert.match(downloadHep, /\bbuildHep\s*\(\s*exportScene\s*,\s*buildOptions\s*\)/,
   "HEP export must serialize the canonical VectorScene");
 assert.doesNotMatch(
   downloadHep,
@@ -42,12 +42,14 @@ assert.doesNotMatch(
 );
 assert.match(mainSource, /pageScenes\s*=\s*candidate\.displayPageScenes/, "large PDFs compose metadata-backed page windows");
 assert.match(downloadHep,
-  /pageLoader\.loadCompletePageScenes\s*\([\s\S]*?exportScene\s*=\s*prepareSceneForHepRendering\s*\(\s*composeVectorScenesInGrid\s*\([\s\S]*?for\s*\(\s*const\s+scanOption\s+of\s+scanOptions\s*\)/,
-  "partial page windows must complete and compose the original document before encoding either export");
+  /pageLoader\.loadCompletePageScenes\s*\([\s\S]*?exportScene\s*=\s*prepareSceneForHepRendering\s*\(\s*composeVectorScenesInGrid\s*\([\s\S]*?buildHep\s*\(\s*exportScene/,
+  "partial page windows must complete and compose the original document before export");
 assert.equal((downloadHep.match(/\bloadCompletePageScenes\s*\(/g) ?? []).length, 1,
-  "both scan encodings share one complete extraction from the live PDF session");
+  "HEP export completes the live PDF session once");
+assert.equal((downloadHep.match(/\bbuildHep\s*\(/g) ?? []).length, 1,
+  "HEP export serializes one fast file");
 assert.doesNotMatch(downloadHep, /\bbuildHep\s*\(\s*(?:lastLoadedSource|source)\.bytes/,
-  "the encoding loop must not reparse the original PDF for each HEP variant");
+  "HEP encoding must use the completed scene without reparsing the original PDF");
 assert.doesNotMatch(
   mainSource,
   /\brenderHeprPageToCanvas2d\b/,

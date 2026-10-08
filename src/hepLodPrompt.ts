@@ -1,26 +1,18 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { HepLodOptions } from "./hepLod";
-import type { HepEncodingOptions } from "./hepBuilder";
 import { getCachedTextLod } from "./textLodCore";
 import { shouldBuildTextLod } from "./textGreekLod";
 import "./hepLodPrompt.css";
 
-export interface HepDownloadOptions extends HepLodOptions,
-  Pick<HepEncodingOptions, "monochromeEncoding"> {
-  downloadBothScanEncodings?: boolean;
-}
+export type HepDownloadOptions = HepLodOptions;
 
-/** Include available LODs and offer both lossless scan encodings; Escape cancels. */
-export function promptForHepLod(scene: VectorScene, signal?: AbortSignal,
-  options: { offerScanEncodings?: boolean } = {}): Promise<HepDownloadOptions | null> {
+/** Include available LODs; Escape cancels. */
+export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promise<HepDownloadOptions | null> {
   if (signal?.aborted) return Promise.resolve(null);
   const cachedText = getCachedTextLod(scene);
   const vector = scene.segmentCount > 0;
   const text = cachedText ? cachedText.data !== null : shouldBuildTextLod(scene);
-  // Paged views may contain OCR text, RGBA previews or empty scan slots rather than canonical packed pixels.
-  const scans = options.offerScanEncodings === true || scene.rasterLayers.some(layer =>
-    Boolean(layer.monochrome || layer.pageDemandSlot || layer.compressionHint === "scan"));
-  if (!vector && !text && !scans) return Promise.resolve({});
+  if (!vector && !text) return Promise.resolve({});
   const dialog = document.createElement("dialog");
   dialog.className = "hep-lod-dialog";
   dialog.setAttribute("aria-labelledby", "hep-lod-title");
@@ -30,28 +22,9 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal,
   title.id = "hep-lod-title";
   title.textContent = "Download HEP";
   form.append(title);
-  if (vector || text) {
-    const description = document.createElement("p");
-    description.textContent = "Store levels of detail for faster loading. Uncheck for a smaller file. Your selected levels are kept." +
-      (scans ? "" : " HEP files larger than the original PDF still download with a warning.");
-    form.append(description);
-  }
-  const scanEncoding = document.createElement("select");
-  if (scans) {
-    const description = document.createElement("p");
-    description.textContent = "Choose how monochrome scans are stored. Both formats preserve full image quality; other images use the same format in either file. Faster opening stores decoded pixels; smaller files reuse original compressed scans when available. Files larger than the original PDF still download with a warning.";
-    const row = document.createElement("label");
-    row.append(document.createTextNode("Scan export options"));
-    scanEncoding.setAttribute("aria-label", "Scan export options");
-    for (const [value, label] of [["packed", "Faster opening (larger file)"],
-      ["jbig2", "Smaller file (slower opening)"], ["both", "Both (two files)"]]) {
-      const option = document.createElement("option");
-      option.value = value; option.textContent = label; scanEncoding.append(option);
-    }
-    scanEncoding.value = "both";
-    row.append(scanEncoding);
-    form.append(description, row);
-  }
+  const description = document.createElement("p");
+  description.textContent = "Store levels of detail for faster loading. Uncheck for a smaller file. Your selected levels are kept. HEP files larger than the original PDF still download with a warning.";
+  form.append(description);
   const inputs: { key: "withVectorLod" | "withTextLod"; input: HTMLInputElement }[] = [];
   for (const [available, key, label] of [[vector, "withVectorLod", "Include vector LOD"],
     [text, "withTextLod", "Include text LOD"]] as const) {
@@ -99,10 +72,6 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal,
       const options: HepDownloadOptions = {};
       for (const { key, input } of inputs) options[key] = input.checked;
       if (options.withVectorLod) options.vectorLodPrecision = precision.value === "compact" ? "compact" : "lossless";
-      if (scans) {
-        options.monochromeEncoding = scanEncoding.value === "packed" ? "packed" : "jbig2";
-        options.downloadBothScanEncodings = scanEncoding.value === "both";
-      }
       dialog.remove();
       resolve(dialog.returnValue === "download" ? options : null);
     }, { once: true });

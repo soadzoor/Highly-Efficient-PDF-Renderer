@@ -1,7 +1,7 @@
-import { hashMonochromePixels, type MonochromeJbig2Source, type MonochromeRaster } from "./monochromeRaster";
+import { hashMonochromePixels, type MonochromeRaster } from "./monochromeRaster";
 import { hepMonochromeRasterByteLength } from "./hepMonochromeRaster";
 
-/** HJB1 stores the PDF's original JBIG2 segments; shared globals live in their own section. */
+/** Legacy HJB1 contains original JBIG2 segments; new exports use packed binary pixels. */
 export const HEP_JBIG2_RASTER_HEADER_BYTES = 40;
 export const HEP_JBIG2_NO_GLOBALS = 0xffffffff;
 export const HEP_JBIG2_MAX_DECODE_BYTES = 128 * 1024 * 1024;
@@ -34,44 +34,6 @@ export function hepJbig2GlobalsFile(index: number): string {
   requireUint32(index, "globals index");
   if (index === HEP_JBIG2_NO_GLOBALS) fail("globals index is reserved");
   return `raster/jbig2-globals-${index}.bin`;
-}
-
-/** Copy encoded segments, not RGBA pixels or a newly compressed image. */
-export function encodeHepJbig2Raster(
-  source: MonochromeJbig2Source,
-  colors: Uint8Array,
-  globalsIndex: number,
-  width: number,
-  height: number,
-  signal?: AbortSignal
-): Uint8Array {
-  signal?.throwIfAborted();
-  packedBytes(width, height);
-  if (source.width !== width || source.height !== height) fail("source dimensions do not match the layer");
-  if (!(colors instanceof Uint8Array) || colors.length !== 8) fail("palette must contain exactly two RGBA colors");
-  if (!(source.encoded instanceof Uint8Array) || source.encoded.length === 0) fail("encoded data is empty");
-  if (!(source.globals instanceof Uint8Array)) fail("globals are not bytes");
-  if (typeof source.invert !== "boolean") fail("polarity is invalid");
-  if (!source.packedHash || source.packedHash.length !== 2) fail("packed pixel hash is invalid");
-  const encodedLength = requireUint32(source.encoded.length, "encoded length");
-  const globalsLength = requireUint32(source.globals.length, "globals length");
-  requireUint32(globalsIndex, "globals index");
-  if ((globalsLength === 0) !== (globalsIndex === HEP_JBIG2_NO_GLOBALS)) fail("globals reference does not match its length");
-  const hash0 = requireUint32(source.packedHash[0], "packed pixel hash");
-  const hash1 = requireUint32(source.packedHash[1], "packed pixel hash");
-  const output = new Uint8Array(HEP_JBIG2_RASTER_HEADER_BYTES + encodedLength);
-  output.set(MAGIC);
-  output[4] = source.invert ? 1 : 0;
-  output.set(colors, 8);
-  const view = new DataView(output.buffer);
-  view.setUint32(16, encodedLength, true);
-  view.setUint32(20, globalsLength, true);
-  view.setUint32(24, globalsIndex, true);
-  view.setUint32(28, hash0, true);
-  view.setUint32(32, hash1, true);
-  output.set(source.encoded, HEP_JBIG2_RASTER_HEADER_BYTES);
-  signal?.throwIfAborted();
-  return output;
 }
 
 /** Validate the complete envelope and decode budget before entering a codec. */
@@ -146,11 +108,8 @@ export async function decodeHepJbig2Raster(
     fail("decoded packed pixels do not match their stored hash");
   }
   return {
-    data, colors: stored.colors,
-    ...(!stored.invert && decoded.jbig2Symbols ? { symbols: decoded.jbig2Symbols } : {}),
-    jbig2Source: {
-      width, height, encoded: stored.encoded, globals, invert: stored.invert,
-      packedHash: stored.packedHash
-    }
+    // Copy the tiny palette so it does not retain the original encoded section.
+    data, colors: new Uint8Array(stored.colors),
+    ...(!stored.invert && decoded.jbig2Symbols ? { symbols: decoded.jbig2Symbols } : {})
   };
 }

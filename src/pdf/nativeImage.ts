@@ -1,5 +1,4 @@
 import type { MonochromeSymbolScene } from "../compactMonochromeRaster";
-import { hashMonochromePixels, type MonochromeJbig2Source } from "../monochromeRaster";
 import {
   isPdfDictionary,
   isPdfName,
@@ -134,7 +133,6 @@ export interface NativePdfImageOptions {
 
 export interface NativePdfImageDescription {
   readonly jbig2Symbols?: MonochromeSymbolScene;
-  readonly jbig2Source?: MonochromeJbig2Source;
   readonly width: number;
   readonly height: number;
   readonly sourceBitsPerComponent: number;
@@ -472,7 +470,6 @@ export class NativePdfImageRegistry {
         )
       : [];
     let jbig2Symbols: MonochromeSymbolScene | undefined;
-    let jbig2Source: MonochromeJbig2Source | undefined;
     let data: Uint8Array | null = null;
     let format: number | null = null;
     let codecRequest: NativeImageCodecRequest | null = null;
@@ -753,14 +750,6 @@ export class NativePdfImageRegistry {
           );
           if (packedGray) {
             if (decode[0] === 0 && decode[1] === 1) jbig2Symbols = resolved.jbig2Symbols;
-            if (terminalCodec === "jbig2" && this.trustedCodecResolver && mask.kind === "none" &&
-                decodedWidth === width && decodedHeight === height) {
-              jbig2Source = {
-                width, height, encoded: requestEncoded, globals: requestGlobals,
-                invert: clamp01(decode[0]) === 1,
-                packedHash: hashMonochromePixels(packedGray, width, height)
-              };
-            }
             data = packedGray;
             format = HEPR_IMAGE_FORMAT.Gray1;
           } else if (imageMask) {
@@ -879,7 +868,6 @@ export class NativePdfImageRegistry {
       matte: mask.matte,
       data,
       ...(jbig2Symbols ? { jbig2Symbols } : {}),
-      ...(jbig2Source ? { jbig2Source } : {}),
       codecRequest
     });
     const index = this.records.length;

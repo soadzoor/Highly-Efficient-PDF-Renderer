@@ -16,7 +16,7 @@ const exportProgress = [];
 const completeParses = [];
 const hepPrompts = [];
 let exportWarning = null;
-let cancelAfterDownload = false;
+let duringBuild = null;
 let nextParse = async (buffer) => [scene(new Uint8Array(buffer)[0])];
 let failUpload = null;
 let uploadedScene = null;
@@ -65,22 +65,17 @@ const context = vm.createContext({
   consumeVectorStrokeLodBuildTiming: () => timing, combineVectorLodTimings: () => timing,
   yieldToBrowserPaint: async () => {}, yieldAfterPaint: async (signal) => signal?.throwIfAborted(),
   sanitizeDownloadName: (label) => label,
-  promptForHepLod: async (value, signal, options) => {
-    hepPrompts.push({ scene: value, signal, options, completeParseCount: completeParses.length });
+  promptForHepLod: async (value, signal) => {
+    hepPrompts.push({ scene: value, signal, completeParseCount: completeParses.length });
     return hepLodChoice;
   },
-  triggerBrowserDownload: (_blob, name) => {
-    downloads.push(name);
-    if (cancelAfterDownload) {
-      context.activeHepExportController?.abort();
-      context.activeHepExportController = null;
-    }
-  }, formatFileSize: String,
+  triggerBrowserDownload: (_blob, name) => downloads.push(name), formatFileSize: String,
   buildHep: async (value, options) => {
     exports.push({ scene: value, label: options.sourceLabel, options });
     options.onProgress?.({ value: 0, stage: "hep-build" });
     options.onProgress?.({ value: 1, stage: "hep-build" });
     if (exportWarning) options.onWarning?.(exportWarning);
+    await duringBuild?.(options);
     return { size: 1 };
   },
   renderer: {
@@ -108,7 +103,7 @@ await context.loadPdfFile(file("A.pdf", 65));
 assertDocument(65, "A.pdf");
 const originalCache = context.parsedPdfPageCache;
 await assertExport(65, "A.pdf");
-await testNativeScanExports();
+await testNativeHepExports();
 hepLodChoice = null;
 const exportCount = exports.length;
 assert.equal(await context.downloadHep(), false, "cancelling the export dialog downloads nothing");
@@ -195,20 +190,19 @@ await context.loadPdfFile(file("paged.pdf", 73));
 assertDocument(73, "paged.pdf");
 assert.equal(context.activePdfPageLoader, demand);
 assert.equal(context.parsedPdfPageCache, null, "partial windows are not mistaken for complete parsed documents");
-hepLodChoice = { downloadBothScanEncodings: true };
+hepLodChoice = {};
 const pagedExportStart = exports.length;
 const initialPrompt = context.promptForHepLod;
-context.promptForHepLod = async (value, signal, options) => {
-  assert.equal(completePageLoads, 0, "page previews offer export choices before loading full pages");
-  assert.equal(options.offerScanEncodings, true, "metadata-only PDFs may contain scans not yet loaded");
-  return initialPrompt(value, signal, options);
+context.promptForHepLod = async (value, signal) => {
+  assert.equal(completePageLoads, 0, "LOD choices precede full page extraction");
+  return initialPrompt(value, signal);
 };
 assert.equal(await context.downloadHep(), true);
 context.promptForHepLod = initialPrompt;
-assert.equal(completePageLoads, 1, "Both completes the loaded PDF only once");
-assert.equal(exports.length, pagedExportStart + 2);
+assert.equal(completePageLoads, 1, "export completes the loaded PDF only once");
+assert.equal(exports.length, pagedExportStart + 1);
 assert(exports.slice(pagedExportStart).every(item => item.scene === completePages[0]),
-  "both exports share the complete canonical scene, without reparsing source bytes");
+  "export uses the complete canonical scene, without reparsing source bytes");
 assert.notEqual(exports.at(-1).scene, context.lastParsedScene, "viewing previews are never exported");
 assert.equal(demandPaused, false, "export resumes demand-driven loading");
 hepLodChoice = {};
@@ -262,19 +256,16 @@ assert.equal(context.lastParsedScene.mode, true);
 assert.equal(context.loadedOcrTextOnly, true);
 assert.equal(context.parsedPdfPageCache.optionsKey, "merge:1|cull:1|ocr:1|stream:0|compress:0");
 assert.deepEqual(view, beforeOcrView);
-hepLodChoice = { downloadBothScanEncodings: true };
+hepLodChoice = {};
 const ocrExportStart = exports.length, ocrParseStart = completeParses.length;
 await context.downloadHep();
-assert.equal(hepPrompts.at(-1).options.offerScanEncodings, true,
-  "text-only PDFs offer scan choices before restoring their omitted images");
 assert.equal(hepPrompts.at(-1).completeParseCount, ocrParseStart,
   "text-only export does not parse the full PDF before opening the dialog");
-assert.equal(completeParses.length, ocrParseStart + 1, "Both completes text-only PDFs only once");
+assert.equal(completeParses.length, ocrParseStart + 1, "export completes text-only PDFs only once");
 assert.equal(completeParses.at(-1).options.ocrTextOnly, false);
-assert.equal(exports.length, ocrExportStart + 2);
+assert.equal(exports.length, ocrExportStart + 1);
 assert.equal(exports.at(-1).scene.id, 75);
 assert.equal(exports.at(-1).scene.mode, false, "text-only approximation is replaced with canonical content for export");
-assert.equal(exports.at(-1).scene, exports.at(-2).scene);
 assert.notEqual(exports.at(-1).scene, context.lastParsedScene);
 hepLodChoice = {};
 nextParse = async () => { throw new Error("failed to restore scans"); };
@@ -290,8 +281,8 @@ assert.equal(context.loadedOcrTextOnly, false);
 assert.deepEqual(view, beforeOcrView);
 
 await testThreeDocumentReplacement();
-await testThreeScanExports();
-await testScanExportPrompt();
+await testThreeHepExports();
+await testHepLodPrompt();
 await testThreeBackendReplacement();
 await testRoomDocumentReplacement();
 await testNativeBackendLoading();
@@ -346,49 +337,69 @@ function assertDocument(id, label) {
   assert.equal(context.lastDownloadablePdf.bytes[0], id);
 }
 async function assertExport(id, label) {
+  const parseCount = completeParses.length;
+  const exportCount = exports.length, downloadCount = downloads.length;
   assert.equal(await context.downloadHep(), true);
-  assert.equal(hepPrompts.at(-1).options.offerScanEncodings, false,
-    "complete eager PDF scenes do not offer scan choices merely because their source is a PDF");
+  assert.equal(completeParses.length, parseCount, "complete eager scenes need no additional PDF extraction");
+  assert.equal(exports.length, exportCount + 1, "Download HEP builds one file");
   assert.equal(exports.at(-1).scene.id, id);
   assert.equal(exports.at(-1).source, undefined, "v7 exports the complete scene without embedding its source PDF");
   assert.equal(exports.at(-1).label, label);
+  assert.deepEqual(downloads.slice(downloadCount), [`${label}-parsed-data.hep`]);
 }
 
-async function testNativeScanExports() {
-  hepLodChoice = { downloadBothScanEncodings: true, withVectorLod: true };
+async function testNativeHepExports() {
+  hepLodChoice = { withVectorLod: true, vectorLodPrecision: "lossless" };
   const exportStart = exports.length, downloadStart = downloads.length;
   exportProgress.length = 0;
   exportWarning = "HEP (200 bytes) exceeds the original PDF (100 bytes). Selected LOD caches were retained.";
   assert.equal(await context.downloadHep(), true);
   const built = exports.slice(exportStart);
-  assert.equal(built.length, 2);
+  assert.equal(built.length, 1);
   assert.equal(built[0].scene, context.lastParsedScene);
-  assert.equal(built[1].scene, context.lastParsedScene, "both variants reuse the same complete parsed scene");
-  assert.deepEqual(built.map(item => item.options.monochromeEncoding), ["packed", "jbig2"]);
-  assert(built.every(item => item.options.withVectorLod === true && item.options.downloadBothScanEncodings === undefined));
-  assert.deepEqual(downloads.slice(downloadStart), ["A.pdf-parsed-data-fast-lod.hep", "A.pdf-parsed-data-small-lod.hep"]);
-  assert.deepEqual(exportProgress, [0, .5, .5, 1]);
+  assert.equal(built[0].options.withVectorLod, true);
+  assert.equal(built[0].options.vectorLodPrecision, "lossless");
+  assert.equal(built[0].options.monochromeEncoding, undefined, "fast binary compression is automatic");
+  assert.deepEqual(downloads.slice(downloadStart), ["A.pdf-parsed-data-lod.hep"]);
+  assert.deepEqual(exportProgress, [0, 1]);
   assert.match(context.statusTextElement.textContent, /HEP downloaded.*Warning.*200 bytes.*100 bytes/);
   assert.equal(context.activeHepExportController, null);
   exportWarning = null;
-  cancelAfterDownload = true;
-  const cancelledStart = exports.length, cancelledDownloads = downloads.length;
-  assert.equal(await context.downloadHep(), false);
-  assert.equal(exports.length, cancelledStart + 1, "replacing/cancelling ownership after the first download prevents the second build");
-  assert.equal(downloads.length, cancelledDownloads + 1);
-  cancelAfterDownload = false;
+  for (const stage of ["before build", "during build"]) {
+    const cancelledStart = exports.length, cancelledDownloads = downloads.length;
+    const originalYield = context.yieldToBrowserPaint;
+    const cancel = () => {
+      context.activeHepExportController.abort();
+      context.activeHepExportController = null;
+    };
+    if (stage === "before build") context.yieldToBrowserPaint = async () => cancel();
+    else duringBuild = async options => {
+      cancel();
+      options.onWarning("stale export warning");
+    };
+    assert.equal(await context.downloadHep(), false);
+    assert.equal(exports.length, cancelledStart + (stage === "during build" ? 1 : 0),
+      "cancelled exports do not start additional work");
+    assert.equal(downloads.length, cancelledDownloads, "cancelled exports do not download a completed blob");
+    assert(!context.statusTextElement.textContent.includes("stale export warning"));
+    context.yieldToBrowserPaint = originalYield;
+    duringBuild = null;
+  }
   hepLodChoice = {};
 }
 
-async function testThreeScanExports() {
+async function testThreeHepExports() {
   const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
-  for (const cancel of [false, true]) for (const mode of ["eager", "paged", "text-only"]) {
+  for (const cancel of ["none", "dialog", "before build", "during build", "replacement"])
+    for (const mode of ["eager", "paged", "text-only"]) {
     const built = [], downloaded = [], statuses = [], progress = [];
     const completeScene = scene("scans"), object = demoObject("scans");
-    let completeLoads = 0;
+    let completeLoads = 0, resumes = 0;
+    object.resumePageLoading = () => { resumes++; };
     object.sceneData = mode === "eager" ? completeScene : scene("viewing approximation");
     object.isPageDemandLoaded = mode === "paged";
     object.sourceOptions = mode === "text-only" ? { ocrTextOnly: true } : undefined;
+    object.sourceBytes = new Uint8Array(100);
     object.loadCompleteScene = async options => {
       completeLoads++;
       options.signal.throwIfAborted();
@@ -402,12 +413,10 @@ async function testThreeScanExports() {
       AbortController, console: { log: noop }, currentPdfObject: object,
       loadToken: 0, sourceLoadController: null, activeHepExportController: null,
       lastLoadedSource: {}, lastDownloadablePdf: { bytes: Uint8Array.of(1), label: "scans.pdf" },
-      promptForHepLod: async (value, signal, options) => {
+      promptForHepLod: async value => {
         assert.equal(value, object.sceneData);
-        assert.equal(completeLoads, 0, "Three export choices precede full page extraction");
-        assert.equal(options.offerScanEncodings, mode !== "eager",
-          "Three paged and text-only PDFs may contain monochrome content absent from their display scene");
-        return { downloadBothScanEncodings: true, withVectorLod: true };
+        assert.equal(completeLoads, 0, "Three LOD choices precede full page extraction");
+        return cancel === "dialog" ? null : { withVectorLod: true, vectorLodPrecision: "compact" };
       },
       setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop,
       backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
@@ -415,7 +424,12 @@ async function testThreeScanExports() {
         if (visible && label?.endsWith("Building HEP")) progress.push(Number.parseFloat(label) / 100);
       },
       formatLoadProgressStage: stage => stage === "pdf-page" ? "Completing PDF pages" : "Building HEP",
-      yieldToBrowserPaint: async () => {}, formatFileSize: String,
+      yieldToBrowserPaint: async () => {
+        if (cancel === "before build") {
+          host.activeHepExportController.abort();
+          host.activeHepExportController = null;
+        }
+      }, formatFileSize: String,
       sanitizeDownloadName: label => label,
       setStatus: message => statuses.push(message),
       buildHep: async (input, options) => {
@@ -423,26 +437,31 @@ async function testThreeScanExports() {
         options.onProgress({ value: 0, stage: "hep-build" });
         options.onProgress({ value: 1, stage: "hep-build" });
         options.onWarning("HEP (200 bytes) exceeds the original PDF (100 bytes).");
+        if (cancel === "during build" || cancel === "replacement") {
+          if (cancel === "replacement") host.currentPdfObject = demoObject("replacement");
+          host.activeHepExportController.abort();
+          host.activeHepExportController = null;
+          options.onWarning("stale export warning");
+        }
         return { size: 200 };
       },
-      triggerBrowserDownload: (_blob, name) => {
-        downloaded.push(name);
-        if (cancel) { host.activeHepExportController.abort(); host.activeHepExportController = null; }
-      }
+      triggerBrowserDownload: (_blob, name) => downloaded.push(name)
     });
     vm.runInContext(sourceFunction(source, "downloadHep"), host);
-    await host.downloadHep();
-    assert.equal(completeLoads, mode === "eager" ? 0 : 1,
-      "Both reuses one complete extraction from the loaded document");
-    assert.equal(built.length, cancel ? 1 : 2);
+    assert.equal(await host.downloadHep(), cancel === "none");
+    const startsBuild = cancel !== "dialog" && cancel !== "before build";
+    assert.equal(completeLoads, mode === "eager" || !startsBuild ? 0 : 1,
+      "export uses one complete extraction from the loaded document");
+    assert.equal(built.length, startsBuild ? 1 : 0);
     assert(built.every(item => item.input === completeScene));
-    assert.deepEqual(built.map(item => item.options.monochromeEncoding), cancel ? ["packed"] : ["packed", "jbig2"]);
-    assert(built.every(item => item.options.withVectorLod === true && item.options.downloadBothScanEncodings === undefined));
-    assert.deepEqual(downloaded, cancel ? ["scans.pdf-parsed-data-fast-lod.hep"] :
-      ["scans.pdf-parsed-data-fast-lod.hep", "scans.pdf-parsed-data-small-lod.hep"]);
-    assert.deepEqual(progress, mode === "eager" ? (cancel ? [0, .5] : [0, .5, .5, 1]) :
-      (cancel ? [.8, .9] : [.8, .9, .9, 1]));
-    if (!cancel) assert.match(statuses.at(-1), /HEP downloaded.*Warning.*200 bytes.*100 bytes/);
+    assert(built.every(item => item.options.withVectorLod === true && item.options.vectorLodPrecision === "compact"));
+    assert(built.every(item => item.options.monochromeEncoding === undefined));
+    assert(built.every(item => item.options.sourcePdfByteLength === 100));
+    assert.deepEqual(downloaded, cancel === "none" ? ["scans.pdf-parsed-data-lod.hep"] : []);
+    assert.deepEqual(progress, !startsBuild ? [] : mode === "eager" ? [0, 1] : [.8, 1]);
+    if (cancel === "none") assert.match(statuses.at(-1), /HEP downloaded.*Warning.*200 bytes.*100 bytes/);
+    else assert.equal(statuses.length, 0, "cancelled and superseded exports do not publish warnings");
+    assert.equal(resumes, cancel === "replacement" ? 0 : 1, "only the current document resumes loading");
     assert.equal(host.activeHepExportController, null);
   }
   const built = [], downloaded = [];
@@ -454,7 +473,7 @@ async function testThreeScanExports() {
   const host = vm.createContext({
     AbortController, console: { log: noop }, currentPdfObject: object,
     activeHepExportController: null, lastDownloadablePdf: null,
-    promptForHepLod: async () => ({ downloadBothScanEncodings: true }),
+    promptForHepLod: async () => ({}),
     setDownloadDataButtonState: noop, setDownloadPdfButtonState: noop, setLoadControlsEnabled: noop,
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {},
     setLoadingProgress: noop, formatLoadProgressStage: String, yieldToBrowserPaint: async () => {},
@@ -475,7 +494,7 @@ async function testThreeScanExports() {
   assert.equal(resumes, 0, "stale cleanup does not resume the disposed Three object");
 }
 
-async function testScanExportPrompt() {
+async function testHepLodPrompt() {
   const source = await readFile(new URL("../src/hepLodPrompt.ts", import.meta.url), "utf8");
   const elements = [];
   class Element {
@@ -492,52 +511,65 @@ async function testScanExportPrompt() {
     focus() {}
   }
   const host = vm.createContext({
+    AbortController,
     getCachedTextLod: () => null, shouldBuildTextLod: value => value.textInstanceCount > 0,
     document: { body: new Element("body"), createTextNode: text => ({ textContent: text }),
       createElement: tag => { const element = new Element(tag); elements.push(element); return element; } }
   });
   vm.runInContext(sourceFunction(source, "promptForHepLod"), host);
-  assert.equal(Object.keys(await host.promptForHepLod({ segmentCount: 0, rasterLayers: [] })).length, 0);
-  assert.equal(elements.length, 0, "empty scenes need no export dialog");
-  const cases = [
-    { label: "canonical monochrome pixels", scene: { segmentCount: 0, rasterLayers: [{ monochrome: {} }] } },
-    { label: "RGBA page previews", scene: { segmentCount: 0, rasterLayers: [{ pageDemandSlot: true }] } },
-    { label: "scan placeholders", scene: { segmentCount: 0, rasterLayers: [{ compressionHint: "scan" }] } },
-    { label: "metadata-only PDFs", scene: { segmentCount: 0, rasterLayers: [] }, options: { offerScanEncodings: true } },
-    { label: "OCR-only PDFs", scene: { segmentCount: 1, textInstanceCount: 1, rasterLayers: [] },
-      options: { offerScanEncodings: true } }
-  ];
-  for (const item of cases) for (const selection of ["both", "packed", "jbig2", "cancel"]) {
+  for (const rasterLayers of [[], [{ monochrome: {} }], [{ pageDemandSlot: true }],
+    [{ compressionHint: "scan" }], [{ data: Uint8Array.of(255, 0, 0, 255) }]]) {
     elements.length = 0;
-    const pending = host.promptForHepLod(item.scene, undefined, item.options);
-    const select = elements.find(element => element.attributes["aria-label"] === "Scan export options");
-    assert(select, `${item.label} offer scan encodings before canonical pixels are available`);
-    assert.equal(select.value, "both", "both lossless variants are selected initially");
-    assert.deepEqual(select.children.map(option => option.value), ["packed", "jbig2", "both"]);
+    assert.equal(Object.keys(await host.promptForHepLod({ segmentCount: 0, textInstanceCount: 0, rasterLayers })).length, 0);
+    assert.equal(elements.length, 0, "raster and metadata scenes without LODs export without a dialog");
+  }
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.equal(await host.promptForHepLod(scene("cancelled"), aborted.signal), null);
+  assert.equal(elements.length, 0, "an already cancelled export does not open a dialog");
+  const cases = [
+    { segmentCount: 1, textInstanceCount: 0, rasterLayers: [] },
+    { segmentCount: 0, textInstanceCount: 1, rasterLayers: [] },
+    { segmentCount: 1, textInstanceCount: 1, rasterLayers: [{ monochrome: {} }] }
+  ];
+  for (const item of cases) for (const selection of ["default", "uncheck", "lossless", "cancel", "abort"]) {
+    elements.length = 0;
+    const controller = new AbortController();
+    const pending = host.promptForHepLod(item, controller.signal);
+    assert(!elements.some(element => element.attributes["aria-label"] === "Scan export options"),
+      "export dialogs contain no scan encoding controls");
+    const inputs = elements.filter(element => element.tag === "input");
+    assert.equal(inputs.length, Number(item.segmentCount > 0) + Number(item.textInstanceCount > 0));
+    assert(inputs.every(input => input.type === "checkbox" && input.checked));
+    const precision = elements.find(element => element.attributes["aria-label"] === "Vector LOD precision");
+    assert.equal(Boolean(precision), item.segmentCount > 0);
+    if (precision) {
+      assert.equal(precision.value, "compact");
+      assert.deepEqual(precision.children.map(option => option.value), ["compact", "lossless"]);
+    }
+    if (selection === "uncheck") {
+      for (const input of inputs) { input.checked = false; input.listeners.change?.(); }
+      if (precision) assert.equal(precision.disabled, true, "precision follows vector LOD selection");
+    }
+    if (selection === "lossless" && precision) precision.value = "lossless";
     const dialog = elements.find(element => element.tag === "dialog");
     assert(dialog.shown);
-    select.value = selection;
-    dialog.close(selection === "cancel" ? "cancel" : "download");
+    if (selection === "abort") controller.abort();
+    else dialog.close(selection === "cancel" ? "cancel" : "download");
     const result = await pending;
-    if (selection === "cancel") assert.equal(result, null);
+    if (selection === "cancel" || selection === "abort") assert.equal(result, null);
     else {
-      assert.equal(result.monochromeEncoding, selection === "packed" ? "packed" : "jbig2");
-      assert.equal(result.downloadBothScanEncodings, selection === "both");
-      assert.equal(result.withVectorLod, item.scene.segmentCount > 0 ? true : undefined);
-      assert.equal(result.withTextLod, item.scene.textInstanceCount > 0 ? true : undefined);
+      assert.equal(result.withVectorLod, item.segmentCount > 0 ? selection !== "uncheck" : undefined);
+      assert.equal(result.withTextLod, item.textInstanceCount > 0 ? selection !== "uncheck" : undefined);
+      assert.equal(result.vectorLodPrecision, item.segmentCount > 0 && selection !== "uncheck"
+        ? selection === "lossless" ? "lossless" : "compact" : undefined);
+      assert.deepEqual(Object.keys(result).sort(), [
+        ...(item.segmentCount > 0 ? ["withVectorLod"] : []),
+        ...(item.textInstanceCount > 0 ? ["withTextLod"] : []),
+        ...(item.segmentCount > 0 && selection !== "uncheck" ? ["vectorLodPrecision"] : [])
+      ].sort(), "the dialog returns only LOD options");
     }
     assert(dialog.removed);
-  }
-  for (const rasterLayers of [[], [{ data: Uint8Array.of(255, 0, 0, 255) }]]) {
-    elements.length = 0;
-    const pending = host.promptForHepLod({ segmentCount: 1, rasterLayers });
-    assert(!elements.some(element => element.attributes["aria-label"] === "Scan export options"),
-      "complete vector and ordinary color-image scenes keep the LOD-only dialog");
-    elements.find(element => element.tag === "dialog").close("download");
-    const result = await pending;
-    assert.equal(result.withVectorLod, true);
-    assert.equal(result.monochromeEncoding, undefined);
-    assert.equal(result.downloadBothScanEncodings, undefined);
   }
 }
 
