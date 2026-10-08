@@ -261,6 +261,11 @@ interface CameraSnapshot {
 }
 
 type ThreeExampleRenderer = THREE.WebGLRenderer | WebGPURenderer;
+interface PreparedThreeRendererBackend {
+  backend: HeprRendererType;
+  canvas: HTMLCanvasElement;
+  renderer: ThreeExampleRenderer;
+}
 type WebGpuRendererParametersWithCanvas = ConstructorParameters<typeof WebGPURenderer>[0] & {
   canvas: HTMLCanvasElement;
 };
@@ -495,9 +500,23 @@ async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promi
   // values directly. Disable Three's linear intermediate/output transform for
   // this dedicated comparison renderer so Three/WebGPU does the same.
   configureThreeRenderer(nextRenderer, THREE.LinearSRGBColorSpace);
-  await nextRenderer.init();
-  stopThreeInternalAnimationLoop(nextRenderer);
-  return nextRenderer;
+  try {
+    await nextRenderer.init();
+    stopThreeInternalAnimationLoop(nextRenderer);
+    return nextRenderer;
+  } catch (error) {
+    const failedRenderer = nextRenderer as WebGPURenderer & {
+      _initialized?: boolean;
+      backend: WebGPURenderer["backend"] & { device?: { destroy?: () => void } };
+    };
+    if (failedRenderer._initialized === false) {
+      // In r186 dispose() calls setAnimationLoop(), which retries the rejected
+      // init promise and leaves an unhandled rejection. No renderer managers
+      // exist yet; releasing its owned device also frees partial GPU resources.
+      failedRenderer.backend.device?.destroy?.();
+    } else nextRenderer.dispose();
+    throw error;
+  }
 }
 
 /**
@@ -569,21 +588,36 @@ function createReplacementViewportCanvas(): HTMLCanvasElement {
   return nextCanvas;
 }
 
-async function ensureThreeRendererBackend(
+/** Create the next context without clearing the document still on screen. */
+async function prepareThreeRendererBackend(
   backend: HeprRendererType,
-  options: { disposeCurrentPdfObject?: boolean } = {}
-): Promise<void> {
+  signal?: AbortSignal
+): Promise<PreparedThreeRendererBackend | null> {
+  signal?.throwIfAborted();
   if (backend === activeThreeRendererBackend) {
-    return;
+    return null;
   }
-
-  const disposeCurrentPdfObject = options.disposeCurrentPdfObject !== false;
-  const previousControlsTarget = controls.target.clone();
-  const previousCanvas = canvasElement;
   const nextCanvas = createReplacementViewportCanvas();
   const nextRenderer = backend === "webgpu"
     ? await createWebGpuThreeRenderer(nextCanvas)
     : createWebGlThreeRenderer(nextCanvas);
+  try {
+    signal?.throwIfAborted();
+    return { backend, canvas: nextCanvas, renderer: nextRenderer };
+  } catch (error) {
+    nextRenderer.dispose();
+    throw error;
+  }
+}
+
+/** Install a prepared context synchronously with its replacement PDF object. */
+function installThreeRendererBackend(
+  prepared: PreparedThreeRendererBackend,
+  options: { disposeCurrentPdfObject?: boolean } = {}
+): void {
+  const disposeCurrentPdfObject = options.disposeCurrentPdfObject !== false;
+  const previousControlsTarget = controls.target.clone();
+  const previousCanvas = canvasElement;
 
   if (animationFrameId !== 0) {
     cancelAnimationFrame(animationFrameId);
@@ -597,12 +631,12 @@ async function ensureThreeRendererBackend(
   }
   renderer.dispose();
 
-  previousCanvas.replaceWith(nextCanvas);
-  canvasElement = nextCanvas;
+  previousCanvas.replaceWith(prepared.canvas);
+  canvasElement = prepared.canvas;
   canvasResizeObserver.disconnect();
-  canvasResizeObserver.observe(nextCanvas);
-  renderer = nextRenderer;
-  activeThreeRendererBackend = backend;
+  canvasResizeObserver.observe(prepared.canvas);
+  renderer = prepared.renderer;
+  activeThreeRendererBackend = prepared.backend;
   resetFpsMeter();
   // The capture's GPU timer queries belong to the context being replaced.
   captureGlCalls?.dispose(); captureGlCalls = null;
@@ -611,10 +645,20 @@ async function ensureThreeRendererBackend(
   drawCallMeter.reset();
   controls = createMapControls();
   controls.target.copy(previousControlsTarget);
+  camera.coordinateSystem = prepared.renderer.coordinateSystem;
   updatePerspectiveCameraProjection();
   updateCameraClipping();
   drawingSelection.rendererChanged();
   annotationInteraction?.refresh();
+}
+
+async function ensureThreeRendererBackend(
+  backend: HeprRendererType,
+  options: { disposeCurrentPdfObject?: boolean } = {}
+): Promise<void> {
+  const prepared = await prepareThreeRendererBackend(backend, lifetimeSignal);
+  if (!prepared) return;
+  installThreeRendererBackend(prepared, options);
   requestRender();
 }
 
@@ -1430,6 +1474,7 @@ async function loadSource(
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
   let pendingObject: HeprThreePdfObject | null = null;
+  let preparedBackend: PreparedThreeRendererBackend | null = null;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   setLoadingProgress(true, "0.00% Parsing / loading");
   setLoadControlsEnabled(false);
@@ -1441,10 +1486,6 @@ async function loadSource(
 
   try {
     const loadStart = performance.now();
-    await ensureThreeRendererBackend(backend);
-    if (activeLoadToken !== loadToken) {
-      return;
-    }
     resetVectorStrokeLodBuildTiming();
     let password: string | undefined;
     let nextObject: HeprThreePdfObject;
@@ -1492,18 +1533,39 @@ async function loadSource(
     );
     controller.signal.throwIfAborted();
     if (activeLoadToken !== loadToken) return;
-    replacePdfObject(nextObject);
-    pendingObject = null;
-    lastLoadedSource = source;
-    lastDownloadablePdf = downloadablePdf;
-    setDownloadDataButtonState(true);
-    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     updateLoadingProgress(activeLoadToken, {
       value: 1,
       stage: "first-render",
       sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "hep"
     });
     const firstSubmitStart = performance.now();
+    preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
+    const submitRenderer = preparedBackend?.renderer ?? renderer;
+    const submitCamera = camera.clone();
+    submitCamera.coordinateSystem = backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem;
+    submitCamera.updateProjectionMatrix();
+    // Compile the clip/LOD variants selected by the view that will be shown,
+    // while leaving the old document's camera and controls alone.
+    fitCameraToObject(nextObject, true, submitCamera);
+    await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
+    controller.signal.throwIfAborted();
+    if (activeLoadToken !== loadToken) return;
+    if (preparedBackend) {
+      const previewScene = new THREE.Scene();
+      previewScene.add(nextObject);
+      try {
+        prepareThreeRendererFrame(submitRenderer);
+        submitRenderer.render(previewScene, submitCamera);
+      } finally { previewScene.remove(nextObject); }
+      installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
+      preparedBackend = null;
+    }
+    replacePdfObject(nextObject);
+    pendingObject = null;
+    lastLoadedSource = source;
+    lastDownloadablePdf = downloadablePdf;
+    setDownloadDataButtonState(true);
+    setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     requestRender();
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
@@ -1526,6 +1588,7 @@ async function loadSource(
     setStatus(`Failed to load source: ${message}`);
   } finally {
     if (pendingObject && pendingObject !== currentPdfObject) pendingObject.dispose();
+    preparedBackend?.renderer.dispose();
     if (activeLoadToken === loadToken) {
       sourceLoadController = null;
       setLoadingProgress(false);
@@ -1552,6 +1615,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
   const cameraSnapshot = captureCameraSnapshot();
   const objectOptions = readThreeObjectOptions();
   let nextObject: HeprThreePdfObject | null = null;
+  let preparedBackend: PreparedThreeRendererBackend | null = null;
   let targetInstalled = false;
   let vectorLodReservation: VectorStrokeLodRuntimeReservation | null = null;
 
@@ -1612,28 +1676,53 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
       return;
     }
 
-    await ensureThreeRendererBackend(backend, { disposeCurrentPdfObject: false });
-    if (activeLoadToken !== loadToken) {
-      nextObject.dispose();
-      nextObject = null;
-      return;
-    }
-
     await layerControls.prepareReplacement(nextObject, controller.signal);
     controller.signal.throwIfAborted();
     const pageLayoutReplacement = await preparePageLayoutReplacement(nextObject, controller.signal);
     controller.signal.throwIfAborted();
+    updateLoadingProgress(activeLoadToken, {
+      value: 1,
+      stage: "first-render",
+      sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "hep"
+    });
+    // Include shader preparation and the detached first submit in the upload
+    // timing. Keep the old canvas displayed until its successor has a frame.
+    const firstSubmitStart = performance.now();
+    preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
+    controller.signal.throwIfAborted();
+    const submitRenderer = preparedBackend?.renderer ?? renderer;
+    // WebGPU updates camera clip conventions. A detached camera lets the old
+    // renderer continue drawing while asynchronous compilation is pending.
+    const submitCamera = camera.clone();
+    submitCamera.position.copy(cameraSnapshot.position);
+    submitCamera.quaternion.copy(cameraSnapshot.quaternion);
+    submitCamera.up.copy(cameraSnapshot.up);
+    submitCamera.coordinateSystem = submitRenderer.coordinateSystem;
+    submitCamera.updateProjectionMatrix();
+    submitCamera.updateMatrixWorld(true);
+    const previewScene = new THREE.Scene();
+    previewScene.add(nextObject);
+    try {
+      await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
+      controller.signal.throwIfAborted();
+      if (preparedBackend) {
+        prepareThreeRendererFrame(submitRenderer);
+        submitRenderer.render(previewScene, submitCamera);
+      }
+    } finally {
+      previewScene.remove(nextObject);
+    }
+    controller.signal.throwIfAborted();
+    if (activeLoadToken !== loadToken) return;
+    if (preparedBackend) {
+      installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
+      preparedBackend = null;
+    }
     replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement });
     targetInstalled = true;
     const installedObject = nextObject;
     nextObject = null;
     restoreCameraSnapshot(cameraSnapshot);
-    updateLoadingProgress(activeLoadToken, {
-      value: 1,
-      stage: "first-render",
-      sourceType: installedObject.sourceKind === "pdf" ? "pdf" : "hep"
-    });
-    const firstSubmitStart = performance.now();
     requestRender();
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
@@ -1657,6 +1746,9 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
       nextObject = null;
     }
     nextObject?.dispose();
+    nextObject = null;
+    preparedBackend?.renderer.dispose();
+    preparedBackend = null;
     const message = error instanceof Error ? error.message : String(error);
     if (activeLoadToken !== loadToken) {
       return;
@@ -1676,6 +1768,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
         : `Failed to switch renderer: ${message}`
     );
   } finally {
+    nextObject?.dispose();
+    preparedBackend?.renderer.dispose();
     vectorLodReservation?.release();
     if (activeLoadToken === loadToken) {
       sourceLoadController = null;
@@ -2466,8 +2560,11 @@ function restoreCameraSnapshot(snapshot: CameraSnapshot): void {
   controls.update();
 }
 
-function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean): void {
-  scene.updateMatrixWorld(true);
+function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean, previewCamera?: THREE.PerspectiveCamera): void {
+  if (previewCamera) targetObject.updateWorldMatrix(true, true);
+  else scene.updateMatrixWorld(true);
+  const fitCamera = previewCamera ?? camera;
+  const fitTarget = previewCamera ? controls.target.clone() : controls.target;
   if (tempObjectBounds.setFromObject(targetObject).isEmpty()) {
     return;
   }
@@ -2483,21 +2580,25 @@ function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: bo
   const paddedWidth = objectWidth * widthPaddingFactor;
   const paddedHeight = objectHeight * heightPaddingFactor;
 
-  const verticalFovRadians = THREE.MathUtils.degToRad(camera.fov);
-  const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, camera.aspect));
+  const verticalFovRadians = THREE.MathUtils.degToRad(fitCamera.fov);
+  const horizontalFovRadians = 2 * Math.atan(Math.tan(verticalFovRadians * 0.5) * Math.max(1e-6, fitCamera.aspect));
   const distanceForHeight = (paddedHeight * 0.5) / Math.tan(verticalFovRadians * 0.5);
   const distanceForWidth = (paddedWidth * 0.5) / Math.tan(horizontalFovRadians * 0.5);
   const distance = Math.max(1e-3, distanceForHeight, distanceForWidth);
 
-  tempViewDirection.subVectors(camera.position, controls.target);
+  tempViewDirection.subVectors(fitCamera.position, fitTarget);
   if (tempViewDirection.lengthSq() <= 1e-12) {
     tempViewDirection.set(0, 0, 1);
   } else {
     tempViewDirection.normalize();
   }
 
-  camera.position.copy(tempObjectCenter).addScaledVector(tempViewDirection, distance);
-  controls.target.set(tempObjectCenter.x, tempObjectCenter.y, tempObjectCenter.z);
+  fitCamera.position.copy(tempObjectCenter).addScaledVector(tempViewDirection, distance);
+  fitTarget.set(tempObjectCenter.x, tempObjectCenter.y, tempObjectCenter.z);
+  if (previewCamera) {
+    updateCameraClipping(true, fitCamera, fitTarget, tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
+    return;
+  }
   if (updateClipForTarget || !currentPdfObject) {
     updateClipAnchor(tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() * 0.5));
   }
@@ -2511,16 +2612,17 @@ function updateClipAnchor(center: THREE.Vector3, radius: number): void {
   currentContentRadius = Math.max(MIN_OBJECT_EXTENT, radius);
 }
 
-function updateCameraClipping(force = false): void {
-  const distanceToTarget = camera.position.distanceTo(controls.target);
-  const targetOffset = tempClipDelta.subVectors(currentContentCenter, controls.target).length();
-  const span = Math.max(MIN_OBJECT_EXTENT, currentContentRadius + targetOffset);
+function updateCameraClipping(force = false, targetCamera = camera, target = controls.target,
+  contentCenter = currentContentCenter, contentRadius = currentContentRadius): void {
+  const distanceToTarget = targetCamera.position.distanceTo(target);
+  const targetOffset = tempClipDelta.subVectors(contentCenter, target).length();
+  const span = Math.max(MIN_OBJECT_EXTENT, contentRadius + targetOffset);
   const margin = span * CAMERA_CLIP_MARGIN_MULTIPLIER;
   // No content is nearer than the clip sphere's closest view depth. Keeping the
   // near plane just in front of it preserves depth precision for 3D page layouts.
   const contentDepth = distanceToTarget > 0
-    ? tempClipDelta.subVectors(currentContentCenter, camera.position)
-      .dot(tempClipForward.subVectors(controls.target, camera.position)) / distanceToTarget - currentContentRadius
+    ? tempClipDelta.subVectors(contentCenter, targetCamera.position)
+      .dot(tempClipForward.subVectors(target, targetCamera.position)) / distanceToTarget - contentRadius
     : 0;
 
   const nextNear = Math.max(
@@ -2531,13 +2633,13 @@ function updateCameraClipping(force = false): void {
 
   if (
     !force &&
-    Math.abs(camera.near - nextNear) <= CAMERA_CLIP_UPDATE_EPSILON &&
-    Math.abs(camera.far - nextFar) <= CAMERA_CLIP_UPDATE_EPSILON
+    Math.abs(targetCamera.near - nextNear) <= CAMERA_CLIP_UPDATE_EPSILON &&
+    Math.abs(targetCamera.far - nextFar) <= CAMERA_CLIP_UPDATE_EPSILON
   ) {
     return;
   }
 
-  camera.near = nextNear;
-  camera.far = nextFar;
-  camera.updateProjectionMatrix();
+  targetCamera.near = nextNear;
+  targetCamera.far = nextFar;
+  targetCamera.updateProjectionMatrix();
 }

@@ -841,14 +841,26 @@ async function testThreeDocumentReplacement() {
   const objects = new Map();
   let metadataStarted;
   const metadataReady = new Promise((resolve) => { metadataStarted = resolve; });
+  let compileStarted, finishCompile;
+  const compiling = new Promise(resolve => { compileStarted = resolve; });
+  const compilation = new Promise(resolve => { finishCompile = resolve; });
   Object.assign(host, {
     lastLoadedSource: "A", lastDownloadablePdf: { label: "A" }, lastLoadTimingText: "",
     readBackendMode: () => "webgl", readThreeObjectOptions: () => ({}),
-    cancelActiveHepExport: noop, ensureThreeRendererBackend: async () => {},
+    cancelActiveHepExport: noop, prepareThreeRendererBackend: async () => null,
+    renderer: {}, THREE: { WebGLCoordinateSystem: 2000, WebGPUCoordinateSystem: 2001 },
+    camera: { clone: () => ({ updateProjectionMatrix: noop }) },
+    fitCameraToObject: noop,
     resetVectorStrokeLodBuildTiming: noop, consumeVectorStrokeLodBuildTiming: () => timing,
     pdfObjectGenerator: async (name, options) => {
       options.signal.throwIfAborted();
       const object = demoObject(name);
+      object.compileForThreeRenderer = async (renderer, _camera, signal) => {
+        assert.equal(renderer, host.renderer);
+        if (name === "D") { compileStarted(); await compilation; }
+        signal.throwIfAborted();
+        if (name === "F") throw new Error("shader compilation failed");
+      };
       objects.set(name, object);
       return object;
     },
@@ -881,6 +893,23 @@ async function testThreeDocumentReplacement() {
   assert.equal(objects.get("B").disposals, 1);
   assert.equal(objects.get("C").disposals, 0);
   assert.equal(previous.disposals, 1);
+
+  const c = host.currentPdfObject;
+  const d = host.loadSource("D");
+  await compiling;
+  assert.equal(host.currentPdfObject, c, "shader preparation must preserve the displayed document");
+  await host.loadSource("E");
+  assert.equal(objects.get("D").disposals, 0, "non-cancellable shader work retains its resources until it settles");
+  finishCompile();
+  await d;
+  assert.equal(host.currentPdfObject.id, "E");
+  assert.equal(objects.get("D").disposals, 1);
+  assert.equal(c.disposals, 1);
+  await host.loadSource("F");
+  assert.equal(host.currentPdfObject.id, "E", "a compilation failure keeps the old document");
+  assert.equal(objects.get("E").disposals, 0);
+  assert.equal(objects.get("F").disposals, 1);
+  assert.equal(host.lastLoadedSource, "E");
 }
 
 async function testRoomDocumentReplacement() {
@@ -930,11 +959,11 @@ async function testRoomDocumentReplacement() {
 
 async function testThreeBackendReplacement() {
   const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
-  for (const failure of ["none", "renderer", "layers", "text-view"]) {
+  for (const failure of ["none", "renderer", "layers", "text-view", "compile", "cancel"]) {
     const reparseSource = failure === "text-view";
     const targetBackend = reparseSource ? "webgl" : "webgpu";
     const failRenderer = failure === "renderer";
-    const failed = failure === "renderer" || failure === "layers";
+    const failed = ["renderer", "layers", "compile", "cancel"].includes(failure);
     const host = demoHost();
     const canonicalScene = scene("same artifact");
     const previous = host.currentPdfObject;
@@ -951,6 +980,37 @@ async function testThreeBackendReplacement() {
     let layerResets = 0;
     let layerBindings = 0;
     const backendChanges = [];
+    const submissions = [];
+    const resourceReleases = [];
+    let compilationFinished = false;
+    const cameraPart = { copy: noop };
+    const stagedRenderer = {
+      coordinateSystem: 2001,
+      domElement: { getBoundingClientRect: () => ({}) },
+      render: (preview, previewCamera) => {
+        assert.equal(compilationFinished, true, "Compile before the detached first submit");
+        assert.equal(host.currentPdfObject, previous, "Keep the current document installed during the detached submit");
+        assert.notEqual(previewCamera, host.camera, "The replacement renderer must not change the live camera's clip convention");
+        assert.equal(preview.object, replacement);
+        submissions.push("detached");
+      },
+      dispose: () => resourceReleases.push("renderer")
+    };
+    const disposeReplacement = replacement.dispose;
+    replacement.dispose = () => { resourceReleases.push("object"); disposeReplacement.call(replacement); };
+    replacement.compileForThreeRenderer = async (targetRenderer, previewCamera, signal) => {
+      assert.equal(targetRenderer, reparseSource ? host.renderer : stagedRenderer);
+      assert.notEqual(previewCamera, host.camera);
+      assert.equal(previewCamera.coordinateSystem, targetRenderer.coordinateSystem);
+      assert.equal(host.activeThreeRendererBackend, "webgl", "The old context stays installed while shaders compile");
+      assert.equal(previous.disposals, 0);
+      assert.equal(host.currentPdfObject, previous);
+      await Promise.resolve();
+      if (failure === "compile") throw new Error("Shader preparation failed");
+      if (failure === "cancel") host.sourceLoadController.abort(new Error("Switch cancelled"));
+      signal.throwIfAborted();
+      compilationFinished = true;
+    };
     const previousPageLayout = { object: previous, layout: "sphere" };
     const replacementPages = [{ id: "page 1" }, { id: "page 2" }];
     const arrangedPages = [];
@@ -988,7 +1048,9 @@ async function testThreeBackendReplacement() {
       lastLoadedSource: "original.pdf", lastDownloadablePdf: { label: "original.pdf" },
       lastNativeDrawStats: null, activeThreeRendererBackend: "webgl", lastLoadTimingText: "",
       readThreeObjectOptions: () => ({ vectorLod: "auto", textLod: "auto", ocrTextOnly: reparseSource }),
-      captureCameraSnapshot: () => ({}), restoreCameraSnapshot: noop,
+      captureCameraSnapshot: () => ({ position: {}, quaternion: {}, up: {} }), restoreCameraSnapshot: noop,
+      camera: { clone: () => ({ position: cameraPart, quaternion: cameraPart, up: cameraPart, updateMatrixWorld: noop, updateProjectionMatrix: noop }) },
+      THREE: { Scene: class { add(object) { this.object = object; } remove(object) { assert.equal(this.object, object); this.object = null; } } },
       resetVectorStrokeLodBuildTiming: noop, consumeVectorStrokeLodBuildTiming: () => timing,
       hasStoredVectorStrokeLod: () => false,
       reserveVectorStrokeLodRuntime: async (sceneData) => {
@@ -1018,12 +1080,22 @@ async function testThreeBackendReplacement() {
         signal.throwIfAborted();
         return replacement;
       },
-      ensureThreeRendererBackend: async (backend, options) => {
-        assert.equal(options.disposeCurrentPdfObject, false);
-        backendChanges.push(backend);
+      prepareThreeRendererBackend: async (backend, signal) => {
+        signal.throwIfAborted();
+        assert.equal(host.activeThreeRendererBackend, "webgl");
+        assert.equal(previous.disposals, 0);
         if (failRenderer) throw new Error("Backend unavailable");
-        host.activeThreeRendererBackend = backend;
+        return reparseSource ? null : { backend, renderer: stagedRenderer };
       },
+      installThreeRendererBackend: (prepared, options) => {
+        assert.equal(options.disposeCurrentPdfObject, false);
+        assert.deepEqual(submissions, ["detached"], "Present the first frame before replacing the old canvas");
+        backendChanges.push(prepared.backend);
+        host.activeThreeRendererBackend = prepared.backend;
+        host.renderer = prepared.renderer;
+      },
+      ensureThreeRendererBackend: async () => assert.fail("Preparation failure must preserve the old renderer without recreating it"),
+      prepareThreeRendererFrame: noop,
       layerControls: {
         prepareReplacement: async (target, signal) => {
           assert.equal(target, replacement);
@@ -1051,7 +1123,7 @@ async function testThreeBackendReplacement() {
           stateReplays += 1;
         }
       },
-      renderer: { domElement: { getBoundingClientRect: () => ({}) } },
+      renderer: { coordinateSystem: 2000, domElement: { getBoundingClientRect: () => ({}) } },
       scene: { add: noop, remove: noop }, textSearchInputElement: { value: "" },
       resetFpsMeter: noop, refreshDropIndicator: noop, updateCameraClipping: noop,
       updateDrawStatsMeter: noop, updateLodStatsMeter: noop, refreshSearchAvailability: noop,
@@ -1079,22 +1151,24 @@ async function testThreeBackendReplacement() {
     await host.reloadSourceWithBackend(targetBackend, reparseSource);
     assert.equal(reservationTaken, reparseSource ? 0 : 1, "Backend construction receives its prepared runtime");
     assert.equal(reservationReleased, reparseSource ? 0 : 1, "The reservation is always finalized");
-    assert.equal(layerResets, failRenderer ? 0 : 1);
-    assert.equal(layerReplays, failRenderer ? 0 : 1, "Replay current PDF layer choices only after the target renderer is ready");
+    assert.equal(layerResets, 1);
+    assert.equal(layerReplays, 1, "Prepare current PDF layer choices while the old renderer remains installed");
     assert.equal(layerBindings, failed ? 0 : 1, "Only a successfully prepared replacement becomes the panel's current object");
     assert.equal(sceneResets, 0, "Same-scene renderer replacements must retain selection and colors");
     assert.equal(stateReplays, failed ? 0 : 1);
     assert.equal(host.currentPdfObject, failed ? previous : replacement);
     assert.equal(previous.disposals, failed ? 0 : 1);
     assert.equal(replacement.disposals, failed ? 1 : 0);
-    assert.deepEqual(backendChanges, failure === "layers" ? ["webgpu", "webgl"] : [targetBackend]);
-    assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : targetBackend, "A layer replay failure rolls the renderer back with the old document intact");
+    assert.deepEqual(backendChanges, failed || reparseSource ? [] : [targetBackend]);
+    assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : targetBackend, "Preparation failure leaves the old renderer and document intact");
+    assert.deepEqual(resourceReleases, ["compile", "cancel"].includes(failure) ? ["object", "renderer"] : failed ? ["object"] : [],
+      "Release a cancelled replacement's PDF resources before its staged GPU context");
     assert.equal(host.activePageLayout, "sphere", "Backend switches keep the page layout");
     assert.equal(host.pageLayoutView.object, failed ? previous : replacement);
     assert.equal(host.pageLayoutView.layout, "sphere");
-    assert.deepEqual(arrangedPages, failed ? [] : [{ pages: replacementPages, targets: ["sphere targets"] }]);
+    assert.deepEqual(arrangedPages, failure === "layers" ? [] : [{ pages: replacementPages, targets: ["sphere targets"] }]);
     assert.equal(host.pageLayoutRowElement.hidden, failed, "Multi-page replacements show the page layout controls");
-    assert.deepEqual(pageProgress, failed ? [] : ['subscribed', 'unsubscribed'], "Replacement page preparation reports progress until it settles");
+    assert.deepEqual(pageProgress, failure === "layers" ? [] : ['subscribed', 'unsubscribed'], "Replacement page preparation reports progress until it settles");
   }
 }
 
