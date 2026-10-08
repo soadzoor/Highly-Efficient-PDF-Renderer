@@ -190,6 +190,7 @@ const compoundOutline = sfnt.getGlyphOutline(2);
 assert.deepEqual(compoundOutline.bounds, [50, 0, 150, 100]);
 assert.equal(compoundOutline.commands[0].x, 50);
 
+await testEmbeddedObsoleteCompoundFlag();
 await testMissingFontResolution();
 await testEmbeddedMacintoshSymbolFont();
 await testFixedPitchInferenceFromWidths();
@@ -197,6 +198,31 @@ await testStandard14AdvanceMetrics();
 
 console.log("native font/text tests passed");
 hooks.deregister();
+
+async function testEmbeddedObsoleteCompoundFlag() {
+  const dictionary = new Map([
+    ["Subtype", name("TrueType")],
+    ["BaseFont", name("FixtureCompound")],
+    ["Encoding", name("WinAnsiEncoding")],
+    ["FontDescriptor", new Map([["FontFile2", stream(buildTinySfnt(null, 0x0013))]])]
+  ]);
+  const reported = [];
+  const font = await parseNativePdfFont(dictionary, resolver, {
+    onDiagnostic: diagnostic => reported.push(diagnostic)
+  });
+  assert.equal(font.diagnostics.length, 0, "parsing unused glyphs emits no normalization warning");
+  assert.equal(reported.length, 0);
+  assert.equal(font.decode(Uint8Array.of(66)).glyphId, 2);
+  assert.deepEqual(font.getGlyphOutline(2), compoundOutline, "embedded legacy flags keep accurate vector outlines");
+  assert.equal(font.diagnostics.length, 1, "PDF fonts expose warnings discovered after parsing");
+  assert.equal(font.diagnostics[0].code, "font.sfnt-compound-flags-normalized");
+  assert.strictEqual(font.diagnostics[0], font.sfnt.diagnostics[0]);
+  assert.strictEqual(reported[0], font.diagnostics[0], "diagnostic callbacks receive lazy glyph warnings");
+  assert(Object.isFrozen(font.diagnostics));
+  font.getGlyphOutline(2);
+  assert.equal(font.diagnostics.length, 1);
+  assert.equal(reported.length, 1, "cached glyph requests do not repeat warnings");
+}
 
 async function testEmbeddedMacintoshSymbolFont() {
   // Synthetic LibreOffice-style subset: symbolic TrueType, no PDF Encoding,
@@ -666,7 +692,7 @@ function buildMacintoshSymbolCmap() {
   return bytes;
 }
 
-function buildTinySfnt(cmapOverride = null) {
+function buildTinySfnt(cmapOverride = null, compoundFlags = 0x0003) {
   const head = new Uint8Array(54);
   const headView = new DataView(head.buffer);
   headView.setUint16(18, 1000, false);
@@ -713,7 +739,7 @@ function buildTinySfnt(cmapOverride = null) {
   compoundView.setInt16(4, 0, false);
   compoundView.setInt16(6, 150, false);
   compoundView.setInt16(8, 100, false);
-  compoundView.setUint16(10, 0x0003, false);
+  compoundView.setUint16(10, compoundFlags, false);
   compoundView.setUint16(12, 1, false);
   compoundView.setInt16(14, 50, false);
   compoundView.setInt16(16, 0, false);

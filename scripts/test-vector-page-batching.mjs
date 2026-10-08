@@ -32,6 +32,46 @@ try {
   assert(plan.update(scene.drawRuns, null));
   assert.deepEqual(paints(plan), original, "unknown projection scale restores global order");
 
+  // Books exceeding the old 512-page cutoff still have cheap page scheduling.
+  // White fills under black text cannot commute within a page, but independent
+  // pages should share the same two content draws even at overview scale.
+  for (const count of [513, 1576]) {
+    const book = makePages(Array.from({ length: count }, (_, page) => page * 100));
+    book.drawRuns = book.drawRuns.filter(run => run.kind === "fill" || run.kind === "text");
+    book.segmentCount = 0;
+    for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) book[key] = new Float32Array(0);
+    book.fillPathMetaC = new Float32Array(count * 4);
+    book.textInstanceC = new Float32Array(count * 4);
+    for (let page = 0; page < count; page++) {
+      book.fillPathMetaB[page * 4 + 2] = book.fillPathMetaB[page * 4 + 3] = book.fillPathMetaC[page * 4 + 2] = 1;
+      book.fillPathMetaC[page * 4 + 3] = book.textInstanceC[page * 4 + 3] = 0.5;
+    }
+    const bookPlan = new VectorOrderedBatches(book, null);
+    bookPlan.update(book.drawRuns);
+    const bookOriginal = paints(bookPlan);
+    assert.equal(bookPlan.batches.length, count * 2);
+    bookPlan.update(book.drawRuns, 52.67214004946034);
+    assert.equal(bookPlan.batches.length, 2, "large books batch independent page fills and text");
+    assert.deepEqual(paints(bookPlan).slice().sort(), bookOriginal.slice().sort(), "large-page scheduling retains every paint and clip");
+    const positions = new Map(paints(bookPlan).map((paint, index) => [paint, index]));
+    for (let page = 0; page < count; page++) {
+      assert(positions.get(`fill:${page}:0`) < positions.get(`text:${page}:0`), "overlapping page backgrounds remain below text");
+    }
+    assert.equal(bookPlan.update(book.drawRuns, 52.67214004946034), false, "unchanged book views reuse uploaded instances");
+    bookPlan.update(book.drawRuns, null);
+    assert.deepEqual(paints(bookPlan), bookOriginal, "large books restore source order for unknown projections");
+  }
+  const overBudget = createEmptyVectorScene();
+  overBudget.pageRects = new Float32Array(513 * 4);
+  overBudget.drawRuns = Array.from({ length: 32768 }, () => ({ kind: "fill", first: 0, count: 0 }));
+  assert.equal(new VectorOrderedBatches(overBudget, null).scheduler, null, "large-page setup retains a bounded-work fallback");
+  overBudget.pageRects = new Float32Array(512 * 4);
+  assert(new VectorOrderedBatches(overBudget, null).scheduler, "existing dense scenes within 512 pages retain scheduling");
+  const excessivePages = createEmptyVectorScene();
+  excessivePages.pageRects = new Float32Array(65537 * 4);
+  excessivePages.drawRuns = [];
+  assert.equal(new VectorOrderedBatches(excessivePages, null).scheduler, null, "page IDs never overflow uint16 storage");
+
   const single = makePages([0]);
   single.fillPathMetaA[2] = 100; single.fillPathMetaB[0] = 110;
   const singlePlan = new VectorOrderedBatches(single, null);

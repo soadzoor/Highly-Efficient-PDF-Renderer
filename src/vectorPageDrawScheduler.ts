@@ -25,6 +25,9 @@ const MIN_RESOLVED_PAGE_PIXELS = 256;
 // calls, which only pays on a page carrying far more paints than a minified
 // view can resolve. Smaller scenes are already cheap to draw in source order.
 const MIN_CLAMPED_PAINTS = 1024;
+// Larger books can have thousands of pages but only a few paints per page.
+// Bound their nearest-page, overlap and interleave scans by work, not page count.
+const LARGE_PAGE_CHECK_BUDGET = 16 * 1024 * 1024;
 
 /** Interleave independent paint streams; overlapping streams retain source order. */
 export class VectorPageDrawScheduler {
@@ -71,8 +74,11 @@ export class VectorPageDrawScheduler {
     // Bound setup work for arbitrary public scenes, including invalid layouts
     // and scenes that carry draw runs but no page rectangles.
     const pages = (scene.pageRects?.length ?? 0) / 4;
-    if (!scene.drawRuns || pages < 1 || pages > 512 || !Number.isInteger(pages) ||
+    if (!scene.drawRuns || pages < 1 || pages > 0x10000 || !Number.isInteger(pages) ||
         !scene.pageRects.every(Number.isFinite)) return null;
+    // Keep the existing allowance for dense scenes with up to 512 pages. Above
+    // it, limit O(pages * runs + pages²) scans and keep page IDs within uint16.
+    if (pages > 512 && pages * (scene.drawRuns.length + pages) > LARGE_PAGE_CHECK_BUDGET) return null;
     if (segments && segments.length !== scene.drawRuns.length) return null;
     if (independentPageRuns && (independentPageRuns.length !== scene.drawRuns.length || independentPageRuns.some(page => page >= pages))) return null;
     return new VectorPageDrawScheduler(scene, strokes, sourceRuns, segments, independentPageRuns);

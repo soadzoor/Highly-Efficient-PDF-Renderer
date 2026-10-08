@@ -435,9 +435,11 @@ class ParsedNativeFont implements NativePdfFont {
   readonly sfnt: NativeSfntFont | null;
   readonly cff: NativeCffFont | null;
   readonly substitution: NativeFontSubstitution | null;
-  readonly diagnostics: readonly PdfDiagnostic[];
+  private diagnosticData: readonly PdfDiagnostic[];
+  private sfntDiagnosticCount: number;
   private readonly decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter;
   private readonly unsupportedOutlineReason: string | null;
+  private readonly onDiagnostic: ParseNativePdfFontOptions["onDiagnostic"];
 
   constructor(
     subtype: NativePdfFontSubtype,
@@ -451,7 +453,8 @@ class ParsedNativeFont implements NativePdfFont {
     substitution: NativeFontSubstitution | null,
     diagnostics: readonly PdfDiagnostic[],
     decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter,
-    unsupportedOutlineReason: string | null
+    unsupportedOutlineReason: string | null,
+    onDiagnostic?: ParseNativePdfFontOptions["onDiagnostic"]
   ) {
     this.subtype = subtype;
     this.baseFont = baseFont;
@@ -462,9 +465,24 @@ class ParsedNativeFont implements NativePdfFont {
     this.sfnt = sfnt;
     this.cff = cff;
     this.substitution = substitution;
-    this.diagnostics = diagnostics;
+    this.diagnosticData = diagnostics;
+    this.sfntDiagnosticCount = sfnt?.diagnostics.length ?? 0;
     this.decodeCharacter = decodeCharacter;
     this.unsupportedOutlineReason = unsupportedOutlineReason;
+    this.onDiagnostic = onDiagnostic;
+  }
+
+  /** Outlines are lazy, so normalization warnings can arrive after font parsing. */
+  get diagnostics(): readonly PdfDiagnostic[] {
+    const sfntDiagnostics = this.sfnt?.diagnostics ?? EMPTY_DIAGNOSTICS;
+    if (sfntDiagnostics.length > this.sfntDiagnosticCount) {
+      this.diagnosticData = Object.freeze([
+        ...this.diagnosticData,
+        ...sfntDiagnostics.slice(this.sfntDiagnosticCount)
+      ]);
+      this.sfntDiagnosticCount = sfntDiagnostics.length;
+    }
+    return this.diagnosticData;
   }
 
   decode(bytes: Uint8Array, offset = 0): NativeMappedCharacter {
@@ -475,7 +493,13 @@ class ParsedNativeFont implements NativePdfFont {
   }
 
   getGlyphOutline(glyphId: number): NativeGlyphOutline {
-    if (this.sfnt) return this.sfnt.getGlyphOutline(glyphId);
+    if (this.sfnt) {
+      const previousCount = this.sfnt.diagnostics.length;
+      const outline = this.sfnt.getGlyphOutline(glyphId);
+      const diagnostics = this.sfnt.diagnostics;
+      for (let index = previousCount; index < diagnostics.length; index++) this.onDiagnostic?.(diagnostics[index]);
+      return outline;
+    }
     if (this.cff) return this.cff.getGlyphOutline(glyphId);
     throw unsupportedFont(
       this.unsupportedOutlineReason ??
@@ -642,7 +666,8 @@ async function parseSimpleFont(
         verticalMetric: null
       };
     },
-    outlineReason
+    outlineReason,
+    options.onDiagnostic
   );
 }
 
@@ -789,7 +814,8 @@ async function parseCompositeFont(
         verticalMetric: metric
       };
     },
-    outlineReason
+    outlineReason,
+    options.onDiagnostic
   );
 }
 
@@ -2931,7 +2957,10 @@ export class NativeSfntFont {
   readonly lineGap: number;
   readonly fontBounds: readonly [number, number, number, number];
   readonly outlineFormat: "glyf" | "cff" | "cff2" | "unknown";
-  readonly diagnostics: readonly PdfDiagnostic[];
+  private diagnosticData: readonly PdfDiagnostic[];
+  private obsoleteCompoundFlagReported = false;
+
+  get diagnostics(): readonly PdfDiagnostic[] { return this.diagnosticData; }
 
   private readonly view: DataView;
   private readonly tables: ReadonlyMap<string, SfntTable>;
@@ -3051,7 +3080,7 @@ export class NativeSfntFont {
     this.firstRecoveredHorizontalBearingGlyph = canRecoverMissingBearings
       ? this.numberOfHMetrics + availableBearingBytes / 2
       : this.numGlyphs;
-    this.diagnostics = embeddedHmtxDelta === 0
+    this.diagnosticData = embeddedHmtxDelta === 0
       ? EMPTY_DIAGNOSTICS
       : Object.freeze([embeddedHmtxDiagnostic(
           embeddedHmtxDelta,
@@ -3478,10 +3507,18 @@ export class NativeSfntFont {
     let componentCount = 0;
     let metricsGlyphId = glyphId;
     let hasInstructions = false;
+    let hasObsoleteOverlapFlag = false;
     do {
       flags = this.u16(offset, table);
-      if ((flags & 0xe010) !== 0) {
-        throw unsupportedFont("A compound TrueType glyph uses reserved component flags.");
+      const reservedFlags = flags & 0xe010;
+      if (reservedFlags !== 0) {
+        if (this.validation !== "pdf-embedded" || reservedFlags !== 0x0010) {
+          throw unsupportedFont("A compound TrueType glyph uses reserved component flags.");
+        }
+        // Legacy bit 4 described overlapping contours and is ignored by
+        // TrueType scalers. It adds no payload; retain every structural check.
+        flags &= ~0x0010;
+        hasObsoleteOverlapFlag = true;
       }
       if ((flags & 0x0100) !== 0) {
         hasInstructions = true;
@@ -3610,6 +3647,15 @@ export class NativeSfntFont {
       throw unsupportedFont("A compound TrueType glyph exceeds its maxp profile.");
     }
     const resolvedBounds = resolveGlyphBounds(points, bounds, glyphId, this.validation);
+    if (hasObsoleteOverlapFlag && !this.obsoleteCompoundFlagReported) {
+      this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+        code: "font.sfnt-compound-flags-normalized",
+        severity: "warning" as const,
+        message: "An embedded TrueType glyph set the obsolete overlap flag; the flag was ignored and its vector outline preserved.",
+        details: Object.freeze({ reason: "compound-obsolete-overlap-flag", glyphId, ignoredFlags: 0x0010, exact: true })
+      })]);
+      this.obsoleteCompoundFlagReported = true;
+    }
     return {
       points: Object.freeze(points),
       contourEnds: Object.freeze(contourEnds),

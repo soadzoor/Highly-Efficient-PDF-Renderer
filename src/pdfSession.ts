@@ -1161,7 +1161,6 @@ class NativePdfSession implements NativeVectorPdfSession {
       }
       const adaptationStartedAt = timings ? nativeVectorTimingNow() : 0;
       this.appendDiagnostics(textCompilation.diagnostics);
-      this.appendDiagnostics(fontRegistry.getDiagnostics());
       this.appendDiagnostics(this.optionalContent.getDiagnostics(), false);
       if (textCompilation.glyphs.glyphIds.length !== 0) {
         onProgress?.(progress(
@@ -1242,6 +1241,8 @@ class NativePdfSession implements NativeVectorPdfSession {
         if (timings) timings.selectiveRasterMs = nativeVectorTimingNow() - rasterStartedAt;
       }
       const scene = buildScene(compositeRasterLayers);
+      // Glyph outlines can discover font warnings lazily while building the scene.
+      this.appendDiagnostics(fontRegistry.getDiagnostics());
       if (compositeTextIndex) scene.textIndex = compositeTextIndex;
       if (compositeRasterLayers.length > 0) {
         if (retainedCompositePage && retainedReplayIsReachable(scene.optionalContent, retainedCompositePage)) {
