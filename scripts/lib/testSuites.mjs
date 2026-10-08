@@ -204,7 +204,7 @@ export const fastTests = [
 // Suites with prerequisites are opt-in. HEP package conversion deliberately
 // stays outside the packaging gate invoked by build:lib.
 export const explicitSuites = {
-  package: ["browser-package", "bundler-package", "lod-worker-package", "raster-worker-package", "built-material-shaders"],
+  package: ["browser-package", "bundler-package", "lod-worker-package", "raster-worker-package", "built-material-shaders", "pdf-to-hep-package"],
   browser: [
     "example-assets",
     "pdf-source-cancellation",

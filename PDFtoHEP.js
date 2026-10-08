@@ -341,11 +341,12 @@ function parseWorkerHeapMb(value, label) {
 }
 
 export function pdfToHepWorkerArguments(
-  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged, withVectorLod, withTextLod, vectorLodPrecision
+  pdfPath, force, heapMb, outputDirectory, iccEngine, annotationAppearances, keepUnchanged, withVectorLod, withTextLod, vectorLodPrecision,
+  workerScriptPath = scriptPath
 ) {
   return [
     `--max-old-space-size=${heapMb}`,
-    scriptPath,
+    workerScriptPath,
     ...(force ? ["--force"] : []),
     ...(keepUnchanged ? ["--keep-unchanged"] : []),
     ...(withVectorLod ? ["--with-vector-lod"] : []),
@@ -382,7 +383,8 @@ async function assertNodeCanvasAvailable() {
     canvasModule = await import("@napi-rs/canvas");
   } catch (error) {
     throw new Error(
-      "@napi-rs/canvas could not be loaded. Run npm install before converting PDFs; " +
+      "@napi-rs/canvas could not be loaded. Run npm install @soadzoor/hepr @napi-rs/canvas, " +
+      "then retry with npx pdf-to-hep (repository users can run npm install); " +
       "the canvas implementation is required to preserve raster PDF content server-side.",
       { cause: error }
     );
@@ -673,14 +675,15 @@ export function startPdfToHepWorker(
   item,
   force,
   heapMb,
-  spawnImplementation = spawn
+  spawnImplementation = spawn,
+  workerScriptPath = scriptPath
 ) {
   const workerToken = randomUUID();
   const child = spawnImplementation(
     process.execPath,
     pdfToHepWorkerArguments(
       item.pdfPath, force, heapMb, item.outputDirectory, item.iccEngine, item.annotationAppearances, item.keepUnchanged,
-      item.withVectorLod, item.withTextLod, item.vectorLodPrecision
+      item.withVectorLod, item.withTextLod, item.vectorLodPrecision, workerScriptPath
     ),
     {
       stdio: "inherit",
@@ -753,7 +756,9 @@ export async function runPdfToHepWorkerBatch(
   dependencies = {}
 ) {
   const heapMb = dependencies.heapMb ?? resolvePdfToHepWorkerHeapMb();
-  const startWorker = dependencies.startWorker ?? startPdfToHepWorker;
+  const startWorker = dependencies.startWorker ?? ((item, force, heapMb) =>
+    startPdfToHepWorker(item, force, heapMb, spawn, dependencies.workerScriptPath)
+  );
   const cleanupWorkerTemps = dependencies.cleanupWorkerTemps ?? cleanupPdfToHepWorkerTemps;
   const signalTarget = dependencies.signalTarget ?? process;
   const now = dependencies.now ?? (() => performance.now());
@@ -934,10 +939,11 @@ export async function runPdfToHepWorkerBatch(
   return failures.length === 0 ? 0 : 1;
 }
 
-export async function runPdfToHep(args = process.argv.slice(2)) {
+export async function runPdfToHep(args = process.argv.slice(2), dependencies = {}) {
   const options = parsePdfToHepArguments(args);
   if (options.help) {
-    console.log(PDF_TO_HEP_USAGE);
+    const usageCommand = dependencies.usageCommand ?? "node PDFtoHEP.js";
+    console.log(PDF_TO_HEP_USAGE.replaceAll("node PDFtoHEP.js", usageCommand));
     return 0;
   }
 
@@ -987,7 +993,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
     await mkdir(options.outputDirectory, { recursive: true });
   }
   if (!workerProcess) {
-    return runPdfToHepWorkerBatch(pending, options, skippedCount);
+    return runPdfToHepWorkerBatch(pending, options, skippedCount, dependencies);
   }
   if (pending.length !== 1) {
     throw new Error("An internal PDF-to-HEP worker must receive exactly one PDF.");
@@ -1017,7 +1023,7 @@ export async function runPdfToHep(args = process.argv.slice(2)) {
   let generatedCount = 0;
   let builder;
   try {
-    builder = await loadSourceHepBuilder();
+    builder = await (dependencies.loadBuilder ?? loadSourceHepBuilder)();
     for (let index = 0; index < pending.length; index += 1) {
       abortController.signal.throwIfAborted();
       const { pdfPath, outputPath } = pending[index];

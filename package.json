@@ -7,6 +7,9 @@
   "main": "./dist/lib/index.js",
   "module": "./dist/lib/index.js",
   "types": "./dist/types/index.d.ts",
+  "bin": {
+    "pdf-to-hep": "./bin/pdf-to-hep.js"
+  },
   "sideEffects": [
     "**/pdf-worker.js",
     "**/pdfWorkerEntry*.js",
@@ -63,6 +66,8 @@
     }
   },
   "files": [
+    "bin",
+    "PDFtoHEP.js",
     "dist/lib",
     "dist/bundler",
     "dist/types",
@@ -105,20 +110,16 @@
     "clean:lib": "node scripts/clean-lib-output.mjs"
   },
   "dependencies": {},
+  "optionalDependencies": {
+    "@napi-rs/canvas": "1.0.9"
+  },
   "devDependencies": {
-    "@napi-rs/canvas": "1.0.9",
     "@types/three": "0.186.0",
     "three": "0.186.1",
     "typescript": "7.0.2",
     "vite": "8.3.1"
   },
   "peerDependencies": {
-    "@napi-rs/canvas": ">=1.0.8",
     "three": ">=0.170.0"
-  },
-  "peerDependenciesMeta": {
-    "@napi-rs/canvas": {
-      "optional": true
-    }
   }
 }

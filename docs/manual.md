@@ -1021,15 +1021,20 @@ resource limits.
 ## Node conversion
 
 Node applications need the optional canvas backend for PDF operations that use
-Canvas2D and for decoding encoded HEP images:
+Canvas2D and for decoding encoded HEP images. npm installs `@napi-rs/canvas` as an
+optional dependency by default. Browser-only consumers can use
+`npm install @soadzoor/hepr three --omit=optional`. If the native backend's
+installation fails or optional dependencies were omitted, install it explicitly:
 
 ```bash
 npm install @napi-rs/canvas
 ```
 
-Vector/text-only extraction does not need this dependency. Without an encoder,
+Library vector/text-only extraction does not need this dependency. Without an encoder,
 HEP raster export falls back to raw RGBA and can produce much larger files.
-Repository development installs already include the canvas backend.
+The CLI checks for the canvas backend before converting so PDFs that need raster
+fallback can be processed; if it is missing, the CLI prints installation
+instructions. Normal repository installs also include the canvas backend.
 
 Offline conversion compiles every selected page's complete original content,
 but does not prepare or store GPU display caches. The **GPU compress scans**
@@ -1039,20 +1044,39 @@ still use the fast, lossless binary storage, and viewers build display data on l
 or zoom. Normal Node provides Canvas2D rather than the WebGL context needed to
 prepare BC7/ASTC color blocks.
 
-The repository provides `PDFtoHEP.js` for batch conversion. It requires a normal
-checkout with development dependencies and Node.js 22.15+, 23.5+, or 24+.
-The CLI is not included in the published npm package.
+The npm package includes the `pdf-to-hep` CLI for single-file and batch conversion.
+It requires Node.js 22.15+, 23.5+, or 24+ and runs the compiled library without a
+repository checkout or development dependencies:
 
 ```bash
-npm install
-node PDFtoHEP.js ./Level1.pdf
+npx @soadzoor/hepr ./Level1.pdf
+npx @soadzoor/hepr --output-dir=./heps ./pdfs
+npx @soadzoor/hepr --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --force ./pdfs
+npx @soadzoor/hepr --workers=4 --output-dir=./heps ./pdfs
+npx @soadzoor/hepr --annotation-appearances=none ./pdfs
+HEPR_PDF_PASSWORD='secret' npx @soadzoor/hepr ./protected.pdf
+```
+
+For repeated use, install the package in your project and invoke its executable:
+
+```bash
+npm install @soadzoor/hepr
+npx pdf-to-hep ./Level1.pdf --output-dir=./heps
+npx -- pdf-to-hep --help
+```
+
+If a one-off `npx` run cannot load canvas, install both packages in the same project
+with `npm install @soadzoor/hepr @napi-rs/canvas`, then use `npx pdf-to-hep`.
+Installing canvas only in the caller's directory does not add it to an existing
+`npx` cache installation.
+
+The repository's existing command remains available after `npm install` and uses
+the same flags:
+
+```bash
 node PDFtoHEP.js --output-dir=./heps ./pdfs
-node PDFtoHEP.js --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
-node PDFtoHEP.js --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
-node PDFtoHEP.js --force ./pdfs
-node PDFtoHEP.js --workers=4 --output-dir=./heps ./pdfs
-node PDFtoHEP.js --annotation-appearances=none ./pdfs
-HEPR_PDF_PASSWORD='secret' node PDFtoHEP.js ./protected.pdf
 ```
 
 Directory input is scanned recursively and converted in isolated child processes,
@@ -1073,7 +1097,8 @@ a second signal force-stops them. Failed conversions do not stop other PDFs.
 
 `Level1.pdf` produces `Level1-parsed-data.hep` beside
 the input unless `--output-dir=<directory>` is supplied. Output-name collisions
-are rejected. Existing files are skipped; `--force` replaces them only after a
+are rejected. Relative input and output paths use the current working directory.
+Existing files are skipped; `--force` replaces them only after a
 successful conversion. `--annotation-appearances=render|forms|none` chooses which
 annotation appearances become page content (default `render`); annotation metadata
 is kept in every mode. PDFs that require a password take it from

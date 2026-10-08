@@ -18,6 +18,7 @@ export default defineConfig(({ mode }) => {
           entry: {
             index: resolve(import.meta.dirname, "src/index.ts"),
             node: resolve(import.meta.dirname, "src/nodePdfSource.ts"),
+            "pdf-to-hep-runtime": resolve(import.meta.dirname, "src/pdfToHepRuntime.ts"),
             "pdf-worker": resolve(import.meta.dirname, "src/pdf/pdfWorkerEntry.ts")
           },
           formats: ["es"],
