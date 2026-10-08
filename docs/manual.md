@@ -973,9 +973,10 @@ Set `encodeRasterImages: false` to store raw raster pixels. Set
 compression stream APIs. Such files can also be loaded without native
 decompression streams. Both options can increase file size.
 
-LODs are omitted by default to keep files compact. Set `withVectorLod: true`
-and/or `withTextLod: true` to store them. Vector caches share unchanged canonical
-strokes and identical derived records across levels. Spatial indexes are rebuilt
+`buildHep` includes applicable vector and text LOD caches by default. Set
+`withVectorLod: false` and/or `withTextLod: false` to omit them for smaller files.
+Vector caches share unchanged canonical strokes and identical derived records
+across levels. Spatial indexes are rebuilt
 cooperatively on load, with cancellation support; expensive simplification is skipped.
 Text caches include runs, clusters and
 coarse instances. Export reuses an available build or creates the requested
@@ -984,12 +985,10 @@ LOD. Text caches are omitted when the scene does not qualify for text LOD.
 Stored vector LODs default to compact precision; text LODs remain lossless. Vector cache v3 omits tile indexes and
 shares identical derived records; text cache v2 remains unchanged. Encoding predicts repeated
 coordinates/bounds from existing strokes and packs text metadata into numeric
-columns. Enable the desired caches; compact vector precision is automatic:
+columns. Both caches and compact vector precision are automatic when applicable:
 
 ```ts
-const hep = await buildHep(pdf.sceneData, {
-  withVectorLod: true, withTextLod: true
-});
+const hep = await buildHep(pdf.sceneData);
 ```
 
 Set `vectorLodPrecision: "lossless"` (CLI: `--vector-lod-precision=lossless`)
@@ -1027,8 +1026,9 @@ mutable selection state are still prepared at load time.
 
 Both example viewers' **Download HEP** button offers independent vector/text
 checkboxes when applicable, checked by default. Cancel or Escape stops the
-export. Vector LOD offers Lossless and Compact precision choices. Downloads with
-either LOD option use a `-parsed-data-lod.hep` suffix.
+export. Vector LOD offers Lossless and Compact precision choices, with Compact
+selected by default. Downloads with either LOD option use a
+`-parsed-data-lod.hep` suffix.
 
 Monochrome scans always use the fast, lossless binary encoding with DEFLATE,
 falling back to plain packed pixels when binary runs would grow. Each click
@@ -1089,14 +1089,15 @@ or zoom. Normal Node provides Canvas2D rather than the WebGL context needed to
 prepare BC7/ASTC color blocks.
 
 The npm package includes the `pdf-to-hep` CLI for single-file and batch conversion.
-It requires Node.js 22.15+, 23.5+, or 24+ and runs the compiled library without a
-repository checkout or development dependencies:
+It includes applicable vector and text LOD caches by default, using compact vector
+precision. It requires Node.js 22.15+, 23.5+, or 24+ and runs the compiled library
+without a repository checkout or development dependencies:
 
 ```bash
 npx @soadzoor/hepr ./Level1.pdf
-npx @soadzoor/hepr --output-dir=./heps ./pdfs
-npx @soadzoor/hepr --with-vector-lod --with-text-lod --output-dir=./heps-lod ./pdfs
-npx @soadzoor/hepr --with-vector-lod --vector-lod-precision=compact --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --without-vector-lod --without-text-lod --output-dir=./heps ./pdfs
+npx @soadzoor/hepr --without-text-lod --vector-lod-precision=lossless --output-dir=./heps-vector-lod ./pdfs
 npx @soadzoor/hepr --force ./pdfs
 npx @soadzoor/hepr --workers=4 --output-dir=./heps ./pdfs
 npx @soadzoor/hepr --annotation-appearances=none ./pdfs
@@ -1151,15 +1152,19 @@ the `HEPR_PDF_PASSWORD` environment variable; the same password is tried for
 every PDF, and the HEP output is not password protected. Use `--help` for the
 complete command syntax.
 
-The flags `--with-vector-lod` and `--with-text-lod` are independent and opt-in.
-They do not change the CLI output filename; use a separate output directory to
-keep compact and cached variants side by side.
+The flags `--without-vector-lod` and `--without-text-lod` independently disable
+the corresponding stored caches. Use both for a file without stored LODs. These
+flags do not change the CLI output filename; use a separate output directory to
+keep files with and without caches side by side. Existing outputs are skipped
+even when the LOD options change; use `--force` to replace them. The JavaScript
+`buildHep` API also includes both applicable caches by default; pass
+`withVectorLod: false` or `withTextLod: false` to omit either one.
 
 For the bundled examples, run `npm run regenerate:heps:lod` manually. It writes
 to `public/examples/heps-lod` and updates the manifest with **HEP+LOD** actions
-and file sizes. The existing `npm run regenerate:heps` keeps writing compact
-files to `public/examples/heps`. HEP+LOD actions appear only for files present
-when the manifest is generated.
+and file sizes. The existing `npm run regenerate:heps` explicitly disables both
+LOD caches and keeps writing files to `public/examples/heps`. HEP+LOD actions
+appear only for files present when the manifest is generated.
 
 To shrink already-generated example caches without parsing PDFs or repeating
 LOD simplification, run:

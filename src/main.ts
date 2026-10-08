@@ -1,4 +1,5 @@
-import { promptForHepLod } from "./hepLodPrompt";
+import { hasSelectedHepLod, promptForHepLod } from "./hepLodPrompt";
+import { resolveHepLodOptions } from "./hepLodOptions";
 import { createViewerLinkNavigation } from "./viewerLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
@@ -1957,14 +1958,15 @@ async function downloadHep(): Promise<boolean> {
   setParsingLoader(true, "0.00% Preparing HEP export...");
 
   try {
-    const lodOptions = await promptForHepLod(scene, exportController.signal);
-    if (!lodOptions) {
+    const selectedLodOptions = await promptForHepLod(scene, exportController.signal);
+    if (!selectedLodOptions) {
       if (activeHepExportController === exportController) {
         statusTextElement.textContent = previousStatusText;
         statusTextElement.hidden = !previousStatusText?.trim();
       }
       return false;
     }
+    const lodOptions = resolveHepLodOptions(selectedLodOptions);
     const exportWarnings: string[] = [];
     await yieldToBrowserPaint();
     exportController.signal.throwIfAborted();
@@ -2008,7 +2010,7 @@ async function downloadHep(): Promise<boolean> {
 
     if (activeHepExportController !== exportController) return false;
     exportController.signal.throwIfAborted();
-    const hepFileName = `${sanitizeDownloadName(label)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
+    const hepFileName = `${sanitizeDownloadName(label)}-parsed-data${hasSelectedHepLod(exportScene, lodOptions) ? "-lod" : ""}.hep`;
     triggerBrowserDownload(hepBlob, hepFileName);
     console.log(
       `[Parsed data export] ${label}: wrote ${hepFileName} (${formatFileSize(hepBlob.size)})`

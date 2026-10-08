@@ -7,24 +7,26 @@ import {
 } from "./vectorStrokeLodCore";
 import { prebuildTextLod, storePrebuiltTextLod } from "./textLodCore";
 import type { TextLodBuildData } from "./textGreekLod";
+import { resolveHepLodOptions } from "./hepLodOptions";
 
 // Bump independently when a build algorithm or its persisted representation changes.
 export const HEP_VECTOR_LOD_VERSION = 3;
 export const HEP_TEXT_LOD_VERSION = 3;
 export interface HepLodOptions {
-  /** Embed vector LOD geometry, building it if absent; rebuild spatial indexes on load. @default false */
+  /** Embed vector LOD geometry, building it if absent; rebuild spatial indexes on load. @default true */
   withVectorLod?: boolean;
   /** Round derived positions on grids bounded by each level's tolerance. @default "compact" */
   vectorLodPrecision?: "lossless" | "compact";
-  /** Embed text LOD clusters when the scene is eligible. @default false */
+  /** Embed text LOD clusters when the scene is eligible. @default true */
   withTextLod?: boolean;
 }
 interface LodDescriptor { version: number; file: string; precision?: "lossless" | "compact" }
 export interface HepLodManifest { vector?: LodDescriptor; text?: LodDescriptor }
 
 export async function writeHepLod(archive: HepArchive, scene: VectorScene,
-  options: HepLodOptions & { signal?: AbortSignal; onProgress?: (value: number, kind: "vector-lod" | "text-lod") => void }
+  options: HepLodOptions & { signal?: AbortSignal; onProgress?: (value: number, kind: "vector-lod" | "text-lod") => void } = {}
 ): Promise<HepLodManifest | undefined> {
+  options = resolveHepLodOptions(options);
   const result: HepLodManifest = {};
   const vector = Boolean(options.withVectorLod && scene.segmentCount > 0);
   const text = Boolean(options.withTextLod && scene.textInstanceCount > 0);

@@ -1082,6 +1082,16 @@ already-prepared scene; viewers rebuild it as needed from canonical pixels.
 
 Shared encoding options are `sourceLabel`, `sourcePdfByteLength`, `encodeRasterImages` (default `true`),
 `compression` (`"deflate"` by default, or `"store"`), `onProgress`, `onWarning`, and `signal`.
+
+`withVectorLod` and `withTextLod` both default to `true`; set either to `false`
+to omit the corresponding LOD cache. Caches are stored when applicable to the
+scene. `vectorLodPrecision` defaults to `"compact"`; use `"lossless"` to disable
+additional rounding of derived vector
+coordinates. Text LOD storage remains lossless. The CLI includes both applicable
+caches by default and offers `--without-vector-lod` and `--without-text-lod` to
+omit them. The demo Download HEP dialogs also select available caches by default.
+See [Node conversion](manual.md#node-conversion) for CLI usage.
+
 Compressed writing requires native `CompressionStream("deflate")`; loading
 compressed files requires `DecompressionStream("deflate")`.
 

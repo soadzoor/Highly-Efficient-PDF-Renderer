@@ -37,21 +37,29 @@ for (const version of ["22.15.0", "22.20.0", "23.5.0", "24.0.0", "26.0.0"]) {
 assert.deepEqual(parsePdfToHepArguments(["./Level1.pdf"]), {
   force: false,
   help: false,
+  withVectorLod: true,
+  withTextLod: true,
   inputPath: "./Level1.pdf"
 });
 assert.deepEqual(parsePdfToHepArguments(["--force", "./pdfs"]), {
   force: true,
   help: false,
+  withVectorLod: true,
+  withTextLod: true,
   inputPath: "./pdfs"
 });
 assert.deepEqual(parsePdfToHepArguments(["--", "-pdfs"]), {
   force: false,
   help: false,
+  withVectorLod: true,
+  withTextLod: true,
   inputPath: "-pdfs"
 });
 assert.deepEqual(parsePdfToHepArguments(["--help"]), {
   force: false,
   help: true,
+  withVectorLod: true,
+  withTextLod: true,
   inputPath: undefined
 });
 assert.throws(() => parsePdfToHepArguments([]), /Pass a PDF file or directory/);
@@ -60,6 +68,8 @@ assert.throws(() => parsePdfToHepArguments(["one", "two"]), /exactly one/);
 assert.deepEqual(parsePdfToHepArguments(["--output-dir=./heps", "./pdfs"]), {
   force: false,
   help: false,
+  withVectorLod: true,
+  withTextLod: true,
   inputPath: "./pdfs",
   outputDirectory: path.resolve("./heps")
 });
@@ -73,6 +83,8 @@ assert.deepEqual(parsePdfToHepArguments(["--force", "--keep-unchanged", "./pdfs"
   force: true,
   keepUnchanged: true,
   help: false,
+  withVectorLod: true,
+  withTextLod: true,
   inputPath: "./pdfs"
 });
 assert.throws(
@@ -86,6 +98,32 @@ assert.equal(
   true,
   "batch workers receive the parent's --keep-unchanged"
 );
+
+for (const [withVectorLod, withTextLod] of [[true, true], [false, true], [true, false], [false, false]]) {
+  const flags = [
+    ...(withVectorLod ? [] : ["--without-vector-lod"]),
+    ...(withTextLod ? [] : ["--without-text-lod"])
+  ];
+  assert.deepEqual(parsePdfToHepArguments([...flags, "plan.pdf"]), {
+    force: false, help: false, inputPath: "plan.pdf", withVectorLod, withTextLod
+  }, "every CLI combination keeps both LOD booleans explicit");
+}
+for (const flag of ["--with-vector-lod", "--with-text-lod"]) {
+  assert.throws(() => parsePdfToHepArguments([flag, "plan.pdf"]), /Unknown option/,
+    "former opt-in flags are no longer accepted");
+}
+for (const withVectorLod of [undefined, true, false]) {
+  for (const withTextLod of [undefined, true, false]) {
+    const args = pdfToHepWorkerArguments("plan.pdf", false, 8192,
+      undefined, undefined, undefined, undefined, withVectorLod, withTextLod);
+    assert.equal(args.includes("--without-vector-lod"), withVectorLod === false);
+    assert.equal(args.includes("--without-text-lod"), withTextLod === false);
+    assert.deepEqual(parsePdfToHepArguments(args.slice(2)), {
+      force: false, help: false, inputPath: "plan.pdf",
+      withVectorLod: withVectorLod !== false, withTextLod: withTextLod !== false
+    }, "workers preserve explicit opt-outs and default omitted LOD settings to enabled");
+  }
+}
 
 for (const policy of ["error", "alternate"]) {
   assert.throws(() => parsePdfToHepArguments([`--icc-fallback=${policy}`, "plan.pdf"]), /Unknown option/);

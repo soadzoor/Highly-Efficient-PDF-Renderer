@@ -1,10 +1,20 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { HepLodOptions } from "./hepLod";
+import { resolveHepLodOptions } from "./hepLodOptions";
 import { getCachedTextLod } from "./textLodCore";
 import { shouldBuildTextLod } from "./textGreekLod";
 import "./hepLodPrompt.css";
 
 export type HepDownloadOptions = HepLodOptions;
+
+/** Decide the download suffix from the complete scene and selected caches. */
+export function hasSelectedHepLod(scene: VectorScene, options: HepDownloadOptions): boolean {
+  const { withVectorLod, withTextLod } = resolveHepLodOptions(options);
+  if (withVectorLod && scene.segmentCount > 0) return true;
+  if (!withTextLod) return false;
+  const cachedText = getCachedTextLod(scene);
+  return cachedText ? cachedText.data !== null : shouldBuildTextLod(scene);
+}
 
 /** Include available LODs; Escape cancels. */
 export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promise<HepDownloadOptions | null> {

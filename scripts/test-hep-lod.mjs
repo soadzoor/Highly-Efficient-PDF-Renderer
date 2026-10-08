@@ -13,7 +13,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
 } });
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { prepareSceneForHepRendering, loadSceneFromHep } = await import("../src/hep.ts");
+  const { prepareSceneForHepRendering, loadSceneFromHep, buildHepBlobForLayout } = await import("../src/hep.ts");
   const { HepArchive } = await import("../src/hepContainer.ts");
   const { buildHep } = await import("../src/hepBuilder.ts");
   const vector = await import("../src/vectorStrokeLodCore.ts");
@@ -118,10 +118,50 @@ try {
   const originalText = await text.prebuildTextLod(canonical);
   assert(originalVector.levels.length > 1);
   assert(originalText.data);
-  const options = parsePdfToHepArguments(["--with-vector-lod", "--with-text-lod", "input.pdf"]);
+  const options = parsePdfToHepArguments(["input.pdf"]);
   assert.equal(options.withVectorLod, true); assert.equal(options.withTextLod, true);
   const args = pdfToHepWorkerArguments("input.pdf", false, 2048, undefined, undefined, undefined, false, true, true);
-  assert(args.includes("--with-vector-lod") && args.includes("--with-text-lod"));
+  assert(!args.includes("--without-vector-lod") && !args.includes("--without-text-lod"));
+  for (const [label, exportOptions, expectedVector, expectedText] of [
+    ["omitted options", undefined, true, true],
+    ["empty options", {}, true, true],
+    ["undefined LOD options", { withVectorLod: undefined, withTextLod: undefined }, true, true],
+    ["vector opt-out", { withVectorLod: false }, false, true],
+    ["text opt-out", { withTextLod: false }, true, false]
+  ]) {
+    const blob = exportOptions === undefined ? await buildHep(canonical) : await buildHep(canonical, exportOptions);
+    const archive = await HepArchive.loadAsync(await blob.arrayBuffer());
+    const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+    assert.equal(Boolean(manifest.lod?.vector), expectedVector, `${label}: vector LOD default is enabled`);
+    assert.equal(Boolean(manifest.lod?.text), expectedText, `${label}: text LOD default is enabled`);
+    assert.equal(Boolean(archive.file("lod-vector/index.json")), expectedVector, `${label}: vector cache is stored`);
+    assert.equal(Boolean(archive.file("lod-text/index.json")), expectedText, `${label}: text cache is stored`);
+  }
+  const sceneStats = {};
+  for (const [prefix, itemCount] of [
+    ["fillPathTexture", canonical.fillPathCount], ["fillSegmentTexture", canonical.fillSegmentCount],
+    ["texture", canonical.segmentCount], ["textInstanceTexture", canonical.textInstanceCount],
+    ["textGlyphTexture", canonical.textGlyphCount], ["textSegmentTexture", canonical.textGlyphSegmentCount],
+    ["gradientTexture", canonical.gradientCount], ["gradientFillPathTexture", canonical.gradientFillPathCount],
+    ["gradientFillSegmentTexture", canonical.gradientFillSegmentCount],
+    ["gradientStrokeRunTexture", canonical.gradientStrokeRunCount],
+    ["gradientStrokeSegmentTexture", canonical.gradientStrokeSegmentCount]
+  ]) {
+    sceneStats[`${prefix}Width`] = Math.max(1, itemCount);
+    sceneStats[`${prefix}Height`] = 1;
+  }
+  const writerProgress = [];
+  const direct = await buildHepBlobForLayout(canonical, sceneStats, "direct.pdf", "interleaved", [], {
+    onBuildProgress: (value, progress) => writerProgress.push({ value, stage: progress.stage })
+  });
+  const directArchive = await HepArchive.loadAsync(await direct.blob.arrayBuffer());
+  const directManifest = JSON.parse(await directArchive.file("manifest.json").async("string"));
+  assert(directManifest.lod?.vector && directManifest.lod?.text, "the shared writer enables both LOD caches by default");
+  assert(directArchive.file("lod-vector/index.json") && directArchive.file("lod-text/index.json"));
+  assert(writerProgress.some(event => event.stage === "vector-lod"));
+  assert(writerProgress.some(event => event.stage === "text-lod"));
+  assert(writerProgress.every((event, index) => index === 0 || event.value >= writerProgress[index - 1].value));
+  assert.equal(writerProgress.at(-1).value, 1, "the shared writer completes progress with default LOD caching");
   let storedBytes;
   for (const [withVectorLod, withTextLod] of [[false, false], [true, false], [false, true], [true, true]]) {
     vector.resetVectorStrokeLodBuildTiming();
@@ -342,15 +382,18 @@ try {
   }, "v3 compact round trip");
   assert(vector.getStoredVectorStrokeLod(compactScene).positionQuanta);
   for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) assert.deepEqual(compactScene[key], canonical[key]);
-  assert.equal(parsePdfToHepArguments(["--with-vector-lod", "--vector-lod-precision=compact", "input.pdf"]).vectorLodPrecision, "compact");
+  assert.equal(parsePdfToHepArguments(["--vector-lod-precision=compact", "input.pdf"]).vectorLodPrecision, "compact");
   assert.throws(() => parsePdfToHepArguments(["--vector-lod-precision=bad", "input.pdf"]), /precision/);
   assert(pdfToHepWorkerArguments("input.pdf", false, 2048, undefined, undefined, undefined, false, true, false, "compact")
     .includes("--vector-lod-precision=compact"));
   await assert.rejects(buildHep(canonical, { vectorLodPrecision: "bad" }), /vectorLodPrecision/);
 
   // Independent v1 fixture, including JSON's null encoding of exact-only Infinity.
-  const legacy = await HepArchive.loadAsync(await (await buildHep(canonical)).arrayBuffer());
+  const legacy = await HepArchive.loadAsync(await (await buildHep(canonical, {
+    withVectorLod: false, withTextLod: false
+  })).arrayBuffer());
   const legacyManifest = JSON.parse(await legacy.file("manifest.json").async("string"));
+  assert.equal(legacyManifest.lod, undefined, "explicit opt-outs leave the independent legacy fixture cache-free");
   legacyManifest.lod = {};
   for (const [kind, data] of [["vector", vector.getStoredVectorStrokeLod(canonical)], ["text", originalText.data]]) {
     let index = 0;

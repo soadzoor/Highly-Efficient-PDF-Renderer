@@ -1,4 +1,5 @@
 import type { HepLodOptions } from "./hepLod";
+import { resolveHepLodOptions } from "./hepLodOptions";
 import type { PdfObjectSource } from "./pdfObjectGenerator";
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { LoadProgressCallback } from "./loadProgress";
@@ -101,7 +102,7 @@ export async function buildHep(
   options.signal?.throwIfAborted();
   const { buildHepRuntime } = await waitForLoad(import("./hepBuilderRuntime"), options.signal);
   options.signal?.throwIfAborted();
-  return buildHepRuntime(input, options);
+  return buildHepRuntime(input, resolveHepLodOptions(options));
 }
 
 function validateEncodingOptions(options: HepEncodingOptions): void {

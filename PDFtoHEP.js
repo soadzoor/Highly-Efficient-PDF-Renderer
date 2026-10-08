@@ -45,8 +45,8 @@ Options:
   --output-dir=<directory>  Write all HEP files into this directory.
   --workers=<count>  Maximum simultaneous conversions (default: available CPU threads).
       Use --workers=1 for serial conversion or a lower count to reduce memory use.
-  --with-vector-lod  Store vector LOD geometry; rebuild spatial indexes on load.
-  --with-text-lod  Store text LOD clusters when applicable.
+  --without-vector-lod  Omit vector LOD geometry (included by default).
+  --without-text-lod  Omit text LOD clusters (included by default when applicable).
   --vector-lod-precision=lossless|compact  Stored vector LOD precision (default: compact).
       compact rounds derived positions according to LOD tolerance; exact geometry stays unchanged.
   --icc-engine=qcms|lcms|alternate|none  ICC conversion (default: qcms).
@@ -105,8 +105,8 @@ export function parsePdfToHepArguments(args) {
   let iccEngine;
   let annotationAppearances;
   let password;
-  let withVectorLod = false;
-  let withTextLod = false;
+  let withVectorLod = true;
+  let withTextLod = true;
   let vectorLodPrecision;
   let workers;
 
@@ -138,8 +138,8 @@ export function parsePdfToHepArguments(args) {
       workers = Number(value);
       continue;
     }
-    if (!positionalOnly && argument === "--with-vector-lod") { withVectorLod = true; continue; }
-    if (!positionalOnly && argument === "--with-text-lod") { withTextLod = true; continue; }
+    if (!positionalOnly && argument === "--without-vector-lod") { withVectorLod = false; continue; }
+    if (!positionalOnly && argument === "--without-text-lod") { withTextLod = false; continue; }
     if (!positionalOnly && argument.startsWith("--vector-lod-precision=")) {
       const value = argument.slice("--vector-lod-precision=".length);
       if (vectorLodPrecision !== undefined || !["lossless", "compact"].includes(value)) {
@@ -198,10 +198,8 @@ export function parsePdfToHepArguments(args) {
   }
 
   return {
-    force, help, inputPath,
+    force, help, inputPath, withVectorLod, withTextLod,
     ...(workers === undefined ? {} : { workers }),
-    ...(withVectorLod ? { withVectorLod } : {}),
-    ...(withTextLod ? { withTextLod } : {}),
     ...(vectorLodPrecision === undefined ? {} : { vectorLodPrecision }),
     ...(keepUnchanged ? { keepUnchanged } : {}),
     ...(outputDirectory === undefined ? {} : { outputDirectory }),
@@ -353,8 +351,8 @@ export function pdfToHepWorkerArguments(
     workerScriptPath,
     ...(force ? ["--force"] : []),
     ...(keepUnchanged ? ["--keep-unchanged"] : []),
-    ...(withVectorLod ? ["--with-vector-lod"] : []),
-    ...(withTextLod ? ["--with-text-lod"] : []),
+    ...(withVectorLod === false ? ["--without-vector-lod"] : []),
+    ...(withTextLod === false ? ["--without-text-lod"] : []),
     ...(vectorLodPrecision === undefined ? [] : [`--vector-lod-precision=${vectorLodPrecision}`]),
     ...(outputDirectory === undefined ? [] : [`--output-dir=${outputDirectory}`]),
     ...(iccEngine === undefined ? [] : [`--icc-engine=${iccEngine}`]),

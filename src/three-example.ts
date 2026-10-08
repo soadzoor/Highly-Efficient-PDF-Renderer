@@ -1,4 +1,5 @@
-import { promptForHepLod } from "./hepLodPrompt";
+import { hasSelectedHepLod, promptForHepLod } from "./hepLodPrompt";
+import { resolveHepLodOptions } from "./hepLodOptions";
 import { createThreeLinkNavigation } from "./threeLinkNavigation";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
@@ -2038,8 +2039,9 @@ async function downloadHep(): Promise<boolean> {
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
     const needsCompleteScene = pdfObject.isPageDemandLoaded || Boolean(pdfObject.sourceOptions?.ocrTextOnly);
-    const lodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
-    if (!lodOptions) return false;
+    const selectedLodOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
+    if (!selectedLodOptions) return false;
+    const lodOptions = resolveHepLodOptions(selectedLodOptions);
     const exportWarnings: string[] = [];
     const scenePhaseEnd = needsCompleteScene ? 0.8 : 0;
     const updateExportProgress = (progress: PDFLoadProgress, start: number, end: number): void => {
@@ -2075,7 +2077,7 @@ async function downloadHep(): Promise<boolean> {
 
     if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
     exportController.signal.throwIfAborted();
-    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${lodOptions.withVectorLod || lodOptions.withTextLod ? "-lod" : ""}.hep`;
+    const hepFileName = `${sanitizeDownloadName(pdfObject.sourceLabel)}-parsed-data${hasSelectedHepLod(exportScene, lodOptions) ? "-lod" : ""}.hep`;
     triggerBrowserDownload(hepBlob, hepFileName);
     if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return false;
     exportController.signal.throwIfAborted();

@@ -49,7 +49,12 @@ try {
     else globalThis.window = previousWindow;
   }
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  assert.match(pkg.scripts["regenerate:heps:lod"], /--with-vector-lod --with-text-lod --output-dir=public\/examples\/heps-lod/);
-  assert.doesNotMatch(pkg.scripts["regenerate:heps"], /--with-/);
+  assert.match(pkg.scripts["regenerate:heps"], /--without-vector-lod --without-text-lod --output-dir=public\/examples\/heps /);
+  assert.match(pkg.scripts["regenerate:heps:lod"], /--output-dir=public\/examples\/heps-lod/);
+  assert.doesNotMatch(pkg.scripts["regenerate:heps:lod"], /--(?:with|without)-(?:vector|text)-lod/,
+    "the LOD example script uses the CLI's enabled defaults");
+  assert.match(pkg.scripts["regenerate:heps:all"], /--without-vector-lod --without-text-lod --output-dir=public\/examples\/heps /);
+  assert.match(pkg.scripts["regenerate:heps:all"], /&& node PDFtoHEP\.js --force --keep-unchanged --output-dir=public\/examples\/heps-lod /);
+  assert.doesNotMatch(pkg.scripts["regenerate:heps:all"], /--with-(?:vector|text)-lod/);
   console.log("HEP+LOD manifest matching, optional actions, sizes, base URLs and separate outputs passed.");
 } finally { await rm(root, { recursive: true, force: true }); }

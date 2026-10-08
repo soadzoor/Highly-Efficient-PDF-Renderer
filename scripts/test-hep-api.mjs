@@ -187,7 +187,8 @@ async function testSizeBudget(builder, scene, loadScene) {
     await assert.rejects(builder.buildHep(scene, { sourcePdfByteLength: value }),
       error => error instanceof RangeError && /positive safe integer/.test(error.message));
   }
-  const options = { compression: "store", sourceLabel: "size-budget.pdf", sourcePdfByteLength: 1_000_000 };
+  const options = { compression: "store", sourceLabel: "size-budget.pdf", sourcePdfByteLength: 1_000_000,
+    withVectorLod: false, withTextLod: false };
   const base = await builder.buildHep(scene, options);
   const fitting = await builder.buildHep(scene, { ...options, sourcePdfByteLength: base.size + 256 });
   const fittingArchive = await HepArchive.loadAsync(new Uint8Array(await fitting.arrayBuffer()));
@@ -301,7 +302,7 @@ async function testOrderedLodRoundTrip(builder, loadScene, prepareScene, Runtime
     scene.styles.set([.1, 0, 0, 0], i * 4);
   }
   const pdf = prepareScene(scene);
-  const hep = await loadScene(await (await builder.buildHep(pdf, { compression: "store" })).arrayBuffer());
+  const hep = await loadScene(await (await builder.buildHep(pdf, { compression: "store", vectorLodPrecision: "lossless" })).arrayBuffer());
   const fields = ["endpoints", "primitiveMeta", "primitiveBounds", "styles", "drawRuns", "clipPaths"];
   for (const key of fields) assert.deepEqual(hep[key], pdf[key], `HEP preserves ordered ${key}`);
   const a = new Runtime(pdf), b = new Runtime(hep);

@@ -81,12 +81,18 @@ try {
   assert.match(help, /pdf-to-hep .*<pdf-or-directory>/);
   assert.match(help, /--workers=<count>/);
   assert.match(help, /--output-dir=<directory>/);
+  assert.match(help, /--without-vector-lod/);
+  assert.match(help, /--without-text-lod/);
+  assert.doesNotMatch(help, /--with-(?:vector|text)-lod/);
   assert.match(await command("npm", ["exec", "--offline", "--no", "--", "pdf-to-hep", "--help"]),
     /pdf-to-hep .*<pdf-or-directory>/, "npm exec must resolve the installed bin without network access");
   assert.match(await command("npx", ["--offline", "--no", "--", "@soadzoor/hepr", "--help"]),
     /pdf-to-hep .*<pdf-or-directory>/, "npx must infer the package's executable without network access");
   assert.match(await command(process.execPath, [binLink], 1), /Pass a PDF file or directory/);
   assert.match(await command(process.execPath, [binLink, "--unknown", "input.pdf"], 1), /Unknown option/);
+  for (const flag of ["--with-vector-lod", "--with-text-lod"]) {
+    assert.match(await command(process.execPath, [binLink, flag, "input.pdf"], 1), /Unknown option/);
+  }
   assert.match(await command(process.execPath, [binLink, "missing.pdf"], 1), /Input does not exist/);
   await mkdir(resolve(consumer, "empty"));
   assert.match(await command(process.execPath, [binLink, "empty"], 1), /No PDF files found/);
@@ -148,30 +154,36 @@ try {
   await assert.rejects(access(resolve(consumer, "invalid-parsed-data.hep")), error => error.code === "ENOENT");
 
   const { parsePdfToHepArguments, startPdfToHepWorker } = await import(pathToFileURL(resolve(installed, "PDFtoHEP.js")));
-  const child = new EventEmitter();
-  let invocation;
-  const worker = startPdfToHepWorker({
-    pdfPath: resolve(consumer, "pdfs/Level 1.pdf"), outputDirectory: resolve(consumer, "heps"),
-    fileNumber: 2, fileCount: 3, password: "fixture password", iccEngine: "lcms",
-    annotationAppearances: "forms", keepUnchanged: true,
-    withVectorLod: true, withTextLod: true, vectorLodPrecision: "lossless"
-  }, true, 512, (executable, args, options) => {
-    invocation = { executable, args, options };
-    return child;
-  }, launcher);
-  assert.equal(invocation.executable, process.execPath);
-  assert.equal(invocation.args[0], "--max-old-space-size=512");
-  assert.equal(invocation.args[1], launcher, "workers must launch the packaged entry rather than the source CLI");
-  assert.deepEqual(parsePdfToHepArguments(invocation.args.slice(2)), {
-    force: true, help: false, inputPath: resolve(consumer, "pdfs/Level 1.pdf"),
-    outputDirectory: resolve(consumer, "heps"), iccEngine: "lcms", annotationAppearances: "forms",
-    keepUnchanged: true, withVectorLod: true, withTextLod: true, vectorLodPrecision: "lossless"
-  });
-  assert.equal(invocation.options.shell, false);
-  assert.equal(invocation.options.env.HEPR_PDF_PASSWORD, "fixture password");
-  assert.ok(invocation.args.every(argument => !argument.includes("fixture password")));
-  child.emit("close", 0, null);
-  assert.deepEqual(await worker.completion, { code: 0, signal: null });
+  assert.equal(parsePdfToHepArguments(["input.pdf"]).withVectorLod, true);
+  assert.equal(parsePdfToHepArguments(["input.pdf"]).withTextLod, true);
+  for (const [withVectorLod, withTextLod] of [[true, true], [false, true], [true, false], [false, false]]) {
+    const child = new EventEmitter();
+    let invocation;
+    const worker = startPdfToHepWorker({
+      pdfPath: resolve(consumer, "pdfs/Level 1.pdf"), outputDirectory: resolve(consumer, "heps"),
+      fileNumber: 2, fileCount: 3, password: "fixture password", iccEngine: "lcms",
+      annotationAppearances: "forms", keepUnchanged: true,
+      withVectorLod, withTextLod, vectorLodPrecision: "lossless"
+    }, true, 512, (executable, args, options) => {
+      invocation = { executable, args, options };
+      return child;
+    }, launcher);
+    assert.equal(invocation.executable, process.execPath);
+    assert.equal(invocation.args[0], "--max-old-space-size=512");
+    assert.equal(invocation.args[1], launcher, "workers must launch the packaged entry rather than the source CLI");
+    assert.equal(invocation.args.includes("--without-vector-lod"), !withVectorLod);
+    assert.equal(invocation.args.includes("--without-text-lod"), !withTextLod);
+    assert.deepEqual(parsePdfToHepArguments(invocation.args.slice(2)), {
+      force: true, help: false, inputPath: resolve(consumer, "pdfs/Level 1.pdf"),
+      outputDirectory: resolve(consumer, "heps"), iccEngine: "lcms", annotationAppearances: "forms",
+      keepUnchanged: true, withVectorLod, withTextLod, vectorLodPrecision: "lossless"
+    });
+    assert.equal(invocation.options.shell, false);
+    assert.equal(invocation.options.env.HEPR_PDF_PASSWORD, "fixture password");
+    assert.ok(invocation.args.every(argument => !argument.includes("fixture password")));
+    child.emit("close", 0, null);
+    assert.deepEqual(await worker.completion, { code: 0, signal: null });
+  }
   console.log("Packed PDF-to-HEP CLI: npm executable, help/errors, relative skips, worker launch and compiled builder passed; no PDFs converted.");
 } finally {
   await rm(fixture, { recursive: true, force: true });

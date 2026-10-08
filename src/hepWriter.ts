@@ -1,4 +1,5 @@
 import { writeHepLod } from "./hepLod";
+import { resolveHepLodOptions } from "./hepLodOptions";
 import { validatePagePrimitiveRanges } from "./scenePageViews";
 import { writeHepAnnotations } from "./hepAnnotations";
 import { writeHepStructure } from "./hepStructure";
@@ -88,6 +89,7 @@ export async function buildHepBlobForLayout(
   sceneRasterLayers: RasterLayer[],
   options: BuildHepBlobOptions = {}
 ): Promise<HepBlobResult> {
+  options = resolveHepLodOptions(options);
   throwIfBuildAborted(options.signal);
   validateSourcePdfByteLength(options.sourcePdfByteLength);
   validateSourcePdfByteLength(scene.sourcePdfByteLength);

@@ -145,10 +145,11 @@ const hepBlob = await buildHep("/document.pdf");
 // Save or upload the Blob with a .hep filename.
 ```
 
-HEP skips PDF extraction. Pass `withVectorLod: true` and/or `withTextLod: true`
-to store optional LOD caches and skip expensive simplification on load. Shared
-vector records reduce file size; spatial indexes and GPU resources are prepared
-when opening the file. Stored vector LODs default to compact precision, with bounded
+HEP skips PDF extraction. `buildHep` includes applicable vector and text LOD caches
+by default to skip expensive simplification on load. Set `withVectorLod: false`
+and/or `withTextLod: false` to omit them. Shared vector records reduce file size;
+spatial indexes and GPU resources are prepared when opening the file. Stored
+vector LODs default to compact precision, with bounded
 rounding of derived positions; the exact scene stays unchanged. Set
 `vectorLodPrecision: "lossless"` to disable additional rounding.
 See the [manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md#hep-files) for browser export and Node conversion.
@@ -159,6 +160,12 @@ Convert a local PDF or a directory of PDFs from the command line:
 npx @soadzoor/hepr ./input.pdf --output-dir=./heps
 npx @soadzoor/hepr ./pdfs --workers=4 --output-dir=./heps
 ```
+
+The CLI includes applicable vector and text LOD caches by default, matching
+`buildHep` and both example viewers. Use
+`--without-vector-lod` or `--without-text-lod` to omit either cache, or both flags
+for smaller files without stored LODs. Stored vector LODs use compact precision
+unless `--vector-lod-precision=lossless` is supplied.
 
 The CLI requires Node.js 22.15+, 23.5+, or 24+. It writes
 `<name>-parsed-data.hep` and supports the same conversion flags as the repository's
