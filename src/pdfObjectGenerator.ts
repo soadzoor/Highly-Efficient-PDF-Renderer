@@ -88,6 +88,9 @@ export interface PdfObjectGeneratorOptions extends PdfIccOptions {
   /** Default all prepares every viewing page before display. Auto streams large PDFs; eager also decodes original scan pixels. */
   pageLoading?: "all" | "auto" | "eager";
 
+  /** Experimental PDF viewing mode: load all selected scan pages and prepare lossy GPU blocks during parsing. */
+  compressScans?: boolean;
+
   /** PDF viewing approximation: draw stored text with bundled fonts and skip scan decoding. */
   ocrTextOnly?: boolean;
 
@@ -213,6 +216,7 @@ async function loadPdfSceneFromSourceInternal(
   if (sourceKind === "pdf") {
     validateAnnotationAppearanceMode(options.annotationAppearances);
     const extractOptions: VectorExtractOptions = {
+      compressScans: options.compressScans,
       ocrTextOnly: options.ocrTextOnly,
       password: options.password,
       imageCodecResolver: options.imageCodecResolver,
@@ -226,7 +230,7 @@ async function loadPdfSceneFromSourceInternal(
       extractTextContent: options.extractText === true,
       onProgress: progress.child(0.16, 0.9, { sourceType: "pdf" }).toCallback()
     };
-    if (demandLoading && options.pageLoading !== "eager") {
+    if (demandLoading && options.pageLoading !== "eager" && !options.compressScans) {
       const loader = await openPdfPageDemand(createParseBuffer(sourceBytes), extractOptions, () => {}, signal);
       try {
         signal?.throwIfAborted();

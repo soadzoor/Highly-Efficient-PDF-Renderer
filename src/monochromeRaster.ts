@@ -126,8 +126,8 @@ export function resampleMonochromeCoverage(source: MonochromeRaster, width: numb
 }
 
 export function resampleMonochromeCoverageAsync(source: MonochromeRaster, width: number, height: number,
-  outWidth: number, outHeight: number): Promise<Uint8Array> {
-  return finishRasterStepsAsync(monochromeCoverageSteps(source, width, height, outWidth, outHeight));
+  outWidth: number, outHeight: number, signal?: AbortSignal): Promise<Uint8Array> {
+  return finishRasterStepsAsync(monochromeCoverageSteps(source, width, height, outWidth, outHeight), signal);
 }
 
 function* monochromeCoverageSteps(source: MonochromeRaster, width: number, height: number,
@@ -264,7 +264,7 @@ export function buildMonochromeMipChain(
 
 export function buildMonochromeMipChainAsync(monochrome: MonochromeRaster, width: number,
   height: number, signal?: AbortSignal): Promise<SingleChannelUint8MipLevel[]> {
-  return finishRasterStepsAsync(monochromeMipSteps(monochrome, width, height, signal));
+  return finishRasterStepsAsync(monochromeMipSteps(monochrome, width, height, signal), signal);
 }
 
 function* monochromeMipSteps(monochrome: MonochromeRaster, width: number, height: number,
@@ -285,7 +285,7 @@ export function buildPackedMonochromeMipAtlas(monochrome: MonochromeRaster, widt
 
 export function buildPackedMonochromeMipAtlasAsync(monochrome: MonochromeRaster, width: number,
   height: number, signal?: AbortSignal): Promise<PackedMonochromeCoverageAtlas> {
-  return finishRasterStepsAsync(packedMonochromeMipSteps(monochrome, width, height, signal));
+  return finishRasterStepsAsync(packedMonochromeMipSteps(monochrome, width, height, signal), signal);
 }
 
 function* packedMonochromeMipSteps(monochrome: MonochromeRaster, width: number, height: number,

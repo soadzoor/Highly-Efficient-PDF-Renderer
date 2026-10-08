@@ -77,15 +77,23 @@ try {
   // Metadata is read before lazy RGBA; binary and stencil masks remain lossless.
   for (const [metadata, reason] of [[{ monochrome: {} }, "monochrome"], [{ imageMask: true }, "mask"],
     [{ stencilMask: true }, "mask"], [{ exactPixels: true }, "exact-pixels"], [{ containsText: true }, "text"]]) {
-    assert.equal(assessRasterCompression({ width: 4096, height: 4096, ...metadata,
-      get data() { throw new Error("Must not expand protected pixels"); } }).reason, reason);
+    for (const compressionHint of [undefined, "scan"]) {
+      const protectedResult = assessRasterCompression({ width: 4096, height: 4096, ...metadata, compressionHint,
+        get data() { throw new Error("Must not expand protected pixels"); } });
+      assert.equal(protectedResult.reason, reason);
+      assert.equal(protectedResult.eligible, false, "a scan hint cannot override explicit lossless metadata");
+    }
   }
   assert.equal(assessRasterCompression({ width: 1, height: 1, get data() { throw new Error("Small image"); } }).reason, "small-image");
+  assert.equal(assessRasterCompression({ width: 1, height: 1, compressionHint: "scan",
+    get data() { throw new Error("Small scan"); } }).reason, "small-image");
   assert.equal(assessRasterCompression({ width: 8, height: 1024, data: new Uint8Array(0) }).reason, "thin-image");
+  assert.equal(assessRasterCompression({ width: 8, height: 1024, compressionHint: "scan", data: new Uint8Array(0) }).reason, "thin-image");
   assert.equal(assessRasterCompression({ width: NaN, height: 64, data: new Uint8Array(0) }).reason, "invalid-pixels");
   assert.equal(assessRasterCompression({ width: 64, height: 64, data: new Uint8Array(0) }).reason, "invalid-pixels");
   const binary = image(64, 64, (x, y) => (x + y) % 2 ? [0, 0, 0, 255] : [255, 255, 255, 255]);
   assert.equal(assessRasterCompression({ width: 64, height: 64, data: binary }).reason, "binary");
+  assert.equal(assessRasterCompression({ width: 64, height: 64, compressionHint: "scan", data: binary }).reason, "binary");
   const detail = image(64, 64, (x, y) => [[0, 0, 0, 255], [127, 127, 127, 255], [255, 255, 255, 255]][(x + y) % 3]);
   const detailed = assessRasterCompression({ width: 64, height: 64, data: detail, codec: "jpeg", filename: "photo.jpg" });
   assert.equal(detailed.reason, "detailed-content", "a codec or filename cannot override actual text-like edges");
@@ -94,6 +102,20 @@ try {
   const scannedText = smooth.data.slice();
   for (let y = 12; y < 18; y++) for (let x = 9; x < 55; x += 7) scannedText.set([0, 0, 0, 255], (y * 64 + x) * 4);
   assert.equal(assessRasterCompression({ width: 64, height: 64, data: scannedText }).reason, "detailed-content");
+  for (const pixels of [detail, scannedText]) {
+    const scan = assessRasterCompression({ width: 64, height: 64, data: pixels, compressionHint: "scan" });
+    assert.equal(scan.reason, "scan", "loading a scanned page can explicitly opt its text-like detail into compression");
+    assert.equal(scan.eligible, true);
+    assert.equal(scan.opaque, true);
+    const withoutHint = assessRasterCompression({ width: 64, height: 64, data: pixels });
+    assert.equal(scan.edgeFraction, withoutHint.edgeFraction, "the diagnostic retains the actual scan edge assessment");
+    assert.equal(scan.maxGradient, withoutHint.maxGradient);
+  }
+  const translucentScan = scannedText.slice();
+  translucentScan[translucentScan.length - 1] = 254;
+  const translucent = assessRasterCompression({ width: 64, height: 64, data: translucentScan, compressionHint: "scan" });
+  assert.equal(translucent.reason, "alpha");
+  assert.equal(translucent.eligible, false, "scan compression still requires every source alpha byte to be opaque");
 
   const larger = { width: 512, height: 768, data: image(512, 768, (x, y) =>
     [40 + Math.floor(x / 8), 50 + Math.floor(y / 8), 20 + Math.floor((x + y) / 12), 255]) };

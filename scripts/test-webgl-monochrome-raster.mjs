@@ -10,6 +10,9 @@ try {
   const { createMonochromeRasterLayer, expandMonochromeRaster } = await import("../src/monochromeRaster.ts");
   const { monochromeRasterFragmentGlsl } = await import("../src/monochromeRasterWebGlShader.ts");
   const { RASTER_FRAGMENT_SHADER_SOURCE } = await import("../src/nativeWebGlCoreShaders.ts");
+  const { buildPreparedRasterPixels } = await import("../src/rasterPreparationCore.ts");
+  const { planRasterTiles } = await import("../src/rasterTiles.ts");
+  const { RasterResolutionPlanner } = await import("../src/rasterResolution.ts");
   const mono = { data: Uint8Array.of(0x80, 0x80, 0x55, 0), colors: Uint8Array.of(0, 0, 0, 0, 100, 50, 25, 128) };
   let expanded = 0;
   const layer = {
@@ -109,6 +112,26 @@ try {
     const failed = makeRenderer(WebGlFloorplanRenderer, 512);failed.mock.failUpload = 1;
     assert.throws(() => failed.renderer.createRasterLayerGpu(source, 0), /upload failed/);
     assert.equal(failed.mock.alive.size, 0, "failed compact uploads release the atlas");
+  }
+  {
+    const { renderer: preparedRenderer, mock: preparedMock } = makeRenderer(WebGlFloorplanRenderer, 512);
+    const source = { width:512,height:512,matrix:Float32Array.of(512,0,0,512,0,0),paintOrder:0,pageIndex:0,
+      monochrome:{ data:new Uint8Array(512*512/8).fill(255),colors:mono.colors },
+      get data() { assert.fail("stored monochrome display preparation must keep canonical RGBA lazy"); } };
+    const plan = planRasterTiles(256,256,512);
+    source.gpuPreparation = buildPreparedRasterPixels(source,plan);
+    assert(source.gpuPreparation.compactAtlases[0]);
+    const collected = preparedRenderer.getSceneRasterLayers({ rasterLayers:[source] });
+    assert.equal(collected[0].gpuPreparation,source.gpuPreparation,"native WebGL source collection retains stored preparation");
+    const classified = preparedRenderer.classifyRasterLayerSource(collected[0]);
+    assert.equal(classified.gpuPreparation,source.gpuPreparation);
+    preparedRenderer.rasterResolutionPlanner = new RasterResolutionPlanner();
+    const resource = preparedRenderer.createRasterLayerGpu(classified,0,plan);
+    const uploads = preparedMock.calls.filter(call=>call[0]==="texImage2D");
+    assert.equal(uploads.length,1); assert.equal(resource.monochrome.compact,true);
+    assert.equal(uploads[0].at(-1),source.gpuPreparation.compactAtlases[0].data,
+      "native WebGL uploads the stored compact atlas buffer without repeating coverage or compact preparation");
+    preparedRenderer.deleteRasterLayerTextures(resource); assert.equal(preparedMock.alive.size,0);
   }
 
   const shader = monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE);

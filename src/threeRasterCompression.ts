@@ -66,9 +66,11 @@ export class ThreeRasterCompression implements ThreeRasterCompressor {
     return this.format ? this.shared?.webGpu?.workspaceBytes ?? MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES : 0;
   }
 
-  upload(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat): THREE.Texture {
+  upload(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat, encoded?: Uint8Array): THREE.Texture {
     const state = this.shared;
-    const resource = state?.webGl ? state.webGl.upload(data, width, height, format) : state?.webGpu?.createTexture(width, height, data);
+    const resource = state?.webGl
+      ? encoded ? state.webGl.uploadEncoded(encoded, width, height, format) : state.webGl.upload(data, width, height, format)
+      : encoded ? state?.webGpu?.createTextureFromEncoded(width, height, encoded) : state?.webGpu?.createTexture(width, height, data);
     if (!resource || !externalTextureConstructor) throw new Error("The Three host cannot compress this raster.");
     const texture = new externalTextureConstructor(resource.texture);
     texture.image = { width: Math.ceil(width / 4) * 4, height: Math.ceil(height / 4) * 4 };

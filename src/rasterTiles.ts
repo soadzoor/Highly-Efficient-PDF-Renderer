@@ -132,20 +132,22 @@ export function rasterTilePixels(source: RasterTileSource, plan: RasterTilePlan)
   return finishRasterSteps(rasterTilePixelSteps(source, plan));
 }
 
-export function rasterTilePixelsAsync(source: RasterTileSource, plan: RasterTilePlan): Promise<Uint8Array[]> {
-  return finishRasterStepsAsync(rasterTilePixelSteps(source, plan));
+export function rasterTilePixelsAsync(source: RasterTileSource, plan: RasterTilePlan, signal?: AbortSignal): Promise<Uint8Array[]> {
+  return finishRasterStepsAsync(rasterTilePixelSteps(source, plan, signal));
 }
 
-function* rasterTilePixelSteps(source: RasterTileSource, plan: RasterTilePlan): Generator<void, Uint8Array[]> {
+function* rasterTilePixelSteps(source: RasterTileSource, plan: RasterTilePlan, signal?: AbortSignal): Generator<void, Uint8Array[]> {
+  signal?.throwIfAborted();
   const downscaled = isRasterTilePlanDownscaled(source, plan);
   const image = downscaled
-    ? yield* resamplePremultiplied(source.monochrome ?? source.data, source.width, source.height, plan.width, plan.height)
+    ? yield* resamplePremultiplied(source.monochrome ?? source.data, source.width, source.height, plan.width, plan.height, signal)
     : source.data;
   const pixels: Uint8Array[] = [];
   for (const tile of plan.tiles) {
     if (downscaled && tile.width === plan.width && tile.height === plan.height) { pixels.push(image); continue; }
     const out = new Uint8Array(tile.width * tile.height * 4);
     for (let row = 0; row < tile.height; row++) {
+      signal?.throwIfAborted();
       const from = ((tile.y + row) * plan.width + tile.x) * 4;
       const pixels = image.subarray(from, from + tile.width * 4);
       if (downscaled) out.set(pixels, row * tile.width * 4);
@@ -183,7 +185,8 @@ function* resamplePremultiplied(
   width: number,
   height: number,
   outWidth: number,
-  outHeight: number
+  outHeight: number,
+  signal?: AbortSignal
 ): Generator<void, Uint8Array> {
   const out = new Uint8Array(outWidth * outHeight * 4);
   const row = new Float64Array(width * 4);
@@ -197,6 +200,7 @@ function* resamplePremultiplied(
     row.fill(0);
     const top = outY * scaleY, bottom = top + scaleY;
     for (let y = Math.floor(top); y < Math.min(height, Math.ceil(bottom)); y++) {
+      signal?.throwIfAborted();
       const weight = Math.min(bottom, y + 1) - Math.max(top, y);
       if (weight <= 0) continue;
       for (let x = 0, i = y * width * 4; x < width; x++, i += 4) {

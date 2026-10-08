@@ -75,6 +75,7 @@ export const fastTests = [
   "webgl-raster-memory-budget",
   "webgpu-raster-memory-budget",
   "raster-compression",
+  "pdf-raster-compression",
   "webgl-raster-compression",
   "webgpu-raster-compression",
   "webgl-raster-strip-batches",

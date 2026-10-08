@@ -167,6 +167,23 @@ try {
   const ample = planSceneRasterMemory([eligiblePhoto], 8192, undefined, "astc-4x4");
   assert.equal(ample.resolutionScale, 1);
   assert.deepEqual(ample.compressionFormats, [null], "ample RAM avoids an unnecessary lossy representation");
+  const preferred = planSceneRasterMemory([{ ...eligiblePhoto, preferCompression: true }, eligiblePhoto,
+    { ...largeSource, preferCompression: true }], 8192, undefined, "astc-4x4");
+  assert.equal(preferred.resolutionScale, 1);
+  assert(preferred.unscaledBytes < preferred.availableBytes, "this preference is exercised without memory pressure");
+  assert.deepEqual(preferred.compressionFormats, ["astc-4x4", null, null],
+    "only eligible sources with an explicit preference compress before memory pressure");
+  assert.equal(preferred.estimatedBytes, estimateRasterTextureBytes(4096, 4096, false, "astc-4x4") +
+    estimateRasterTextureBytes(4096, 4096, false) * 2);
+  assert.deepEqual(planSceneRasterMemory([{ ...eligiblePhoto, preferCompression: true }], 8192).compressionFormats, [null],
+    "prebuilt-compression preference retains the fallback when hardware support is absent");
+  assert.deepEqual(planSceneRasterMemory([{ width: 1, height: 1, compressionEligible: true,
+    preferCompression: true }], 8192, undefined, "bc7").compressionFormats, [null],
+    "the preference cannot make block overhead exceed the ordinary texture cost");
+  const preferredPacked = Object.defineProperties({}, Object.getOwnPropertyDescriptors(eligiblePackedSource));
+  preferredPacked.preferCompression = true;
+  assert.deepEqual(planSceneRasterMemory([preferredPacked],
+    8192, undefined, "bc7").compressionFormats, [null], "preferred packed rasters retain their lossless representation");
   const forcedPackedReduction = planSceneRasterMemory([{ width: 100, height: 100, monochrome: {},
     compressionEligible: true }], 64, 1, "bc7");
   assert.deepEqual(forcedPackedReduction.compressionFormats, [null], "packed-source fidelity protection survives device downscaling");

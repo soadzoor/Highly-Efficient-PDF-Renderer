@@ -1,11 +1,13 @@
 import { automaticRasterMemoryBudget, estimateRasterSourcePlanBytes, planSceneRasterMemory, type RasterMemorySource,
   type SceneRasterMemoryPlan } from "./rasterMemoryBudget";
 import { sameRasterTilePlan, type RasterTilePlan } from "./rasterTiles";
-import type { RasterCompressionFormat } from "./rasterCompression";
+import type { PreparedRasterCompression, RasterCompressionFormat } from "./rasterCompression";
 
 export interface RasterResolutionSource extends RasterMemorySource {
   readonly matrix: ArrayLike<number>;
   readonly pageIndex?: number;
+  readonly gpuCompression?: PreparedRasterCompression;
+  readonly gpuPreparation?: { readonly plan: RasterTilePlan };
 }
 
 export interface RasterResolutionView {
@@ -75,11 +77,15 @@ export class RasterResolutionPlanner {
         }
       }
       this.tiers.set(source, tier);
+      // Keep the bounded parse-time derivative until the view needs more detail.
+      const derivative = source.gpuPreparation ?? (!source.monochrome && source.compressionEligible && source.gpuCompression?.format === format
+        ? source.gpuCompression : undefined);
       return { width: source.width, height: source.height,
-        displayWidth: Math.max(1, Math.floor(source.width / 2 ** tier)),
-        displayHeight: Math.max(1, Math.floor(source.height / 2 ** tier)),
+        displayWidth: Math.min(source.width, Math.max(1, Math.floor(source.width / 2 ** tier), derivative?.plan.width ?? 0)),
+        displayHeight: Math.min(source.height, Math.max(1, Math.floor(source.height / 2 ** tier), derivative?.plan.height ?? 0)),
         ...(this.singleChannelMonochrome && source.monochrome ? { monochrome: source.monochrome, reducedMonochrome: true } : {}),
-        compressionEligible: source.compressionEligible, allocationCopies: source.allocationCopies };
+        compressionEligible: source.compressionEligible, preferCompression: source.preferCompression,
+        allocationCopies: source.allocationCopies };
     });
     if (this.sources !== sources) { this.sources = sources; this.cache.clear(); }
     const key = `${maxTextureSize}:${availableBytes}:${automaticRasterMemoryBudget().bytes}:${format}:` +

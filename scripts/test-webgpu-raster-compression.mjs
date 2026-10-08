@@ -17,7 +17,7 @@ try {
   const { WebGpuRasterCompression } = await import("../src/webGpuRasterCompression.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { assessRasterCompression, estimateCompressedRasterBytes } = await import("../src/rasterCompression.ts");
+  const { assessRasterCompression, estimateCompressedRasterBytes, rasterCompressionMipLayout } = await import("../src/rasterCompression.ts");
   const { automaticRasterMemoryBudget } = await import("../src/rasterMemoryBudget.ts");
   const sceneWith = (...layers) => Object.assign(createEmptyVectorScene(), { rasterLayers: layers });
   const createRenderer = async (scene, options = {}) => {
@@ -90,6 +90,72 @@ try {
     assert(device.textures.every(texture => texture.destroyed));
     assert(device.buffers.every(buffer => buffer.destroyed));
     assert.equal(compressor.createTexture(5, 33, data), null);
+  }
+
+  for (const [feature, format, gpuFormat] of [
+    ["texture-compression-bc", "bc7", "bc7-rgba-unorm"],
+    ["texture-compression-astc", "astc-4x4", "astc-4x4-unorm"]
+  ]) {
+    const device = makeDevice({ features: [feature], limit: 64 });
+    const compressor = await WebGpuRasterCompression.create(device, 3200);
+    const layout = rasterCompressionMipLayout(5, 33, format);
+    const encoded = new Uint8Array(estimateCompressedRasterBytes(5, 33, format));
+    layout.forEach((level, index) => encoded.fill(index + 1, level.byteOffset, level.byteOffset + level.byteLength));
+    const preserved = encoded.slice();
+    const result = compressor.createTextureFromEncoded(5, 33, encoded);
+    assert.equal(result.texture.descriptor.format, gpuFormat);
+    assert.deepEqual(result.texture.descriptor.size, { width: 8, height: 36, depthOrArrayLayers: 1 });
+    assert.equal(result.texture.descriptor.mipLevelCount, layout.length);
+    assert.deepEqual(result.uvScale, [5 / 8, 33 / 36]);
+    assert.equal(result.estimatedBytes, encoded.byteLength);
+    assert.equal(device.textures.length, 1, "prepared blocks allocate only their sampled destination");
+    assert.equal(device.buffers.length, 0, "prepared blocks need no encoder output or parameter buffers");
+    assert.equal(device.submissions.length, 0, "prepared uploads perform no compute dispatch or buffer copy");
+    assert.equal(compressor.residentBytes, 0, "the import path consumes no shared encoder workspace");
+    assert.equal(device.uploads.length, layout.length);
+    for (const [mip, level] of layout.entries()) {
+      const upload = device.uploads[mip];
+      assert.equal(upload.destination.texture, result.texture);
+      assert.equal(upload.destination.mipLevel, mip);
+      assert.deepEqual(upload.layout, { bytesPerRow: level.blocksX * 16, rowsPerImage: level.blocksY });
+      assert.deepEqual(upload.size, { width: level.blocksX * 4, height: level.blocksY * 4, depthOrArrayLayers: 1 },
+        "terminal mip uploads include the complete physical compressed blocks");
+      assert.deepEqual(upload.blockBytes, encoded.subarray(level.byteOffset, level.byteOffset + level.byteLength));
+    }
+    assert.deepEqual(encoded, preserved, "imports never change the cached mip bytes");
+    const textureCount = device.textures.length;
+    for (const invalid of [encoded.subarray(1), new Uint8Array(encoded.byteLength + 1)]) {
+      assert.throws(() => compressor.createTextureFromEncoded(5, 33, invalid), RangeError);
+    }
+    for (const [width, height] of [[0, 33], [NaN, 33], [5, 1.5]]) {
+      assert.throws(() => compressor.createTextureFromEncoded(width, height, encoded), RangeError);
+    }
+    assert.equal(compressor.createTextureFromEncoded(65, 33,
+      new Uint8Array(estimateCompressedRasterBytes(65, 33, format))), null);
+    assert.equal(device.textures.length, textureCount, "invalid bytes and unsupported dimensions fail before allocation");
+    assert.equal(device.buffers.length, 0);
+    assert.equal(compressor.available, true, "malformed cached blocks cannot disable valid GPU compression");
+    await flush();
+    assert.equal(device.scopePushes, device.scopePops);
+    result.texture.destroy(); compressor.dispose();
+    assert(device.textures.every(texture => texture.destroyed));
+    assert.equal(compressor.createTextureFromEncoded(5, 33, encoded), null);
+  }
+
+  {
+    const device = makeDevice(), compressor = await WebGpuRasterCompression.create(device);
+    const failures = [], failure = new Error("synthetic saved-block validation failure");
+    compressor.setFailureListener(error => failures.push(error));
+    device.nextValidationError = failure;
+    const result = compressor.createTextureFromEncoded(5, 7,
+      new Uint8Array(estimateCompressedRasterBytes(5, 7, "bc7")));
+    await flush();
+    assert.deepEqual(failures, [failure], "late saved-block validation enters the existing renderer recovery path");
+    assert.equal(compressor.available, false);
+    assert.equal(compressor.residentBytes, 0);
+    assert.equal(device.buffers.length, 0);
+    assert.equal(device.scopePushes, device.scopePops);
+    result.texture.destroy(); compressor.dispose();
   }
 
   {
@@ -205,7 +271,7 @@ try {
   }
 
   assert(warnings.some(message => message.includes("raster compression failed")));
-  console.log("WebGPU raster compression: negotiated BC7/ASTC kernels, bounded shared bands, direct block copies, padded mip chains, opaque sampling, residency and bounded sync/async recovery passed.");
+  console.log("WebGPU raster compression: negotiated BC7/ASTC kernels, bounded shared bands, prepared mip uploads, block validation, opaque sampling, residency and bounded sync/async recovery passed.");
 } finally {
   console.warn = warn;
   for (const [key, descriptor] of Object.entries(globals)) {
@@ -268,7 +334,9 @@ function makeDevice(options = {}) {
     scopePushes: 0, scopePops: 0, nextValidationError: options.validationError ?? null,
     queue: {
       writeTexture(destination, pixels, layout, size) {
-        uploads.push({ destination, layout, size, firstPixels: [...pixels.subarray(0, 8)] });
+        uploads.push({ destination, layout, size, firstPixels: [...pixels.subarray(0, 8)],
+          blockBytes: destination.texture.descriptor.format === "bc7-rgba-unorm" ||
+            destination.texture.descriptor.format === "astc-4x4-unorm" ? pixels.slice() : undefined });
       },
       writeBuffer(buffer, offset, values) { buffer.values = values.slice(); },
       submit(commands) {

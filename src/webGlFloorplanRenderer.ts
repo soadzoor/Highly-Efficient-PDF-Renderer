@@ -29,7 +29,7 @@ import { buildPackedMonochromeMipAtlas, detectMonochromeRaster,
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
 import { pagePlaceholderVertexGlsl, pagePlaceholderFragmentGlsl, pagePlaceholderTime,
   pagePlaceholderAnimationEnabled, hasVisiblePagePlaceholders } from "./pageLoadingPlaceholder";
-import { assessRasterCompression, selectRasterCompressionFormat, type RasterCompressionFormat } from "./rasterCompression";
+import { assessRasterCompression, selectRasterCompressionFormat, type PreparedRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
 import { WebGlRasterCompression, MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES } from "./webGlRasterCompression";
 import { RASTER_STRIP_VERTEX_GLSL, RASTER_STRIP_FRAGMENT_GLSL } from "./rasterStripWebGlShaders";
 import { buildRasterAtlasBatches } from "./rasterAtlasBatches";
@@ -315,9 +315,23 @@ interface RasterLayerSource {
   data: Uint8Array<ArrayBufferLike>;
   monochrome?: MonochromeRaster;
   compressionEligible?: boolean;
+  preferCompression?: boolean;
+  compressionHint?: "scan";
+  gpuCompression?: PreparedRasterCompression;
+  gpuPreparation?: PreparedRasterPixels;
   matrix: Float32Array;
   paintOrder?: number;
   pageIndex?: number;
+}
+
+function hasPreparedRasterCompression(source: RasterLayerSource, plan: RasterTilePlan,
+  format?: RasterCompressionFormat | null): boolean {
+  return !source.monochrome && !!source.gpuCompression && source.gpuCompression.format === format &&
+    sameRasterTilePlan(source.gpuCompression.plan, plan) && source.gpuCompression.tiles.length === plan.tiles.length;
+}
+
+function hasPreparedRasterPixels(source: RasterLayerSource, plan: RasterTilePlan): boolean {
+  return !!source.gpuPreparation && sameRasterTilePlan(source.gpuPreparation.plan, plan);
 }
 
 const WHOLE_RASTER_RECT = Float32Array.of(0, 0, 1, 1);
@@ -1710,7 +1724,9 @@ export class WebGlFloorplanRenderer {
           this.rasterStagedBytes = (this.rasterStagedBytes ?? 0) + reservedBytes;
           for (const [offset, [index]] of changed.entries()) {
             const plan = memoryPlan.plans[offset], format = memoryPlan.compressionFormats[offset];
-            const pixels = yield { source: sources[offset], plan, cached: this.rasterResourceCache?.has(sources[offset], plan, format) ?? false };
+            const pixels = yield { source: sources[offset], plan,
+              cached: hasPreparedRasterPixels(sources[offset], plan) || hasPreparedRasterCompression(sources[offset], plan, format) ||
+                (this.rasterResourceCache?.has(sources[offset], plan, format) ?? false) };
             if (this.scene !== source || this.isDisposed || !this.rasterTextureResidencyEnabled)
               throw new DOMException("Raster update superseded.", "AbortError");
             const resource = this.createRasterLayerGpu(sources[offset], index, plan, format, pixels);
@@ -4900,9 +4916,11 @@ export class WebGlFloorplanRenderer {
 
   private classifyRasterLayerSource(source: RasterLayerSource, canCompress = false): RasterLayerSource {
     if (source.monochrome) return source;
-    const monochrome = detectMonochromeRaster(source.data, source.width, source.height);
+    const monochrome = source.gpuCompression ? undefined : detectMonochromeRaster(source.data, source.width, source.height);
     return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(source)) as RasterLayerSource,
-      monochrome ? { monochrome, compressionEligible: false } : { compressionEligible: canCompress && assessRasterCompression(source).eligible });
+      monochrome ? { monochrome, compressionEligible: false, preferCompression: false }
+        : { compressionEligible: canCompress && (!!source.gpuCompression || assessRasterCompression(source).eligible),
+          preferCompression: source.compressionHint === "scan" || !!source.gpuCompression });
   }
 
   private planRasterLayerMemory(sources: readonly RasterLayerSource[], availableBytes?: number) {
@@ -4940,7 +4958,8 @@ export class WebGlFloorplanRenderer {
     const scene = this.scene, source = sources[index], target = plan.plans[index];
     this.rasterPreparationRunning = true;
     const started = performance.now();
-    const pixels = this.rasterResourceCache?.has(source, target, plan.compressionFormats[index])
+    const pixels = hasPreparedRasterPixels(source, target) || hasPreparedRasterCompression(source, target, plan.compressionFormats[index]) ||
+      this.rasterResourceCache?.has(source, target, plan.compressionFormats[index])
       ? Promise.resolve(undefined) : prepareRasterPixels(source, target);
     void pixels.then(pixels => {
       if (this.isDisposed || this.scene !== scene || this.rasterResolutionSources !== sources || !this.rasterTextureResidencyEnabled || this.rasterStagedBytes > 0) return;
@@ -4986,12 +5005,15 @@ export class WebGlFloorplanRenderer {
     const cached = this.getRasterResourceCache().take(source, plan, compressionFormat);
     if (cached) { this.recordPerformanceTransition("rasterUpload.cacheHit", 0); return cached; }
     const uploadStarted = performance.now();
+    prepared ??= source.gpuPreparation;
     if (prepared && !sameRasterTilePlan(prepared.plan, plan)) prepared = undefined;
     if (!this.rasterResolutionPlanner) reportRasterTileDownscale(index, source, plan, maxTextureSize);
-    const monochrome = source.monochrome ?? detectMonochromeRaster(source.data, source.width, source.height);
+    const monochrome = source.monochrome ?? (source.gpuCompression ? undefined : detectMonochromeRaster(source.data, source.width, source.height));
     const packed = monochrome && plan.width === source.width && plan.height === source.height;
     const coverage = !!monochrome && !packed && !!this.rasterResolutionPlanner;
-    const pixels = prepared?.pixels ?? (packed ? [] : coverage ? monochromeCoverageTilePixels(monochrome!, source.width, source.height, plan)
+    const encoded = !monochrome && hasPreparedRasterCompression(source, plan, compressionFormat)
+      ? source.gpuCompression!.tiles : undefined;
+    const pixels = encoded ? [] : prepared?.pixels ?? (packed ? [] : coverage ? monochromeCoverageTilePixels(monochrome!, source.width, source.height, plan)
       : rasterTilePixels(monochrome ? this.classifyRasterLayerSource(source) : source, plan));
     const tiles: RasterTileGpu[] = [];
     try {
@@ -5011,9 +5033,10 @@ export class WebGlFloorplanRenderer {
           continue;
         }
         if (compressionFormat) {
-          const resource = (this.rasterCompression ??= new WebGlRasterCompression(gl)).upload(
-            pixels[tileIndex], tile.width, tile.height, compressionFormat,
-            Math.min(MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES, automaticRasterMemoryBudget().bytes / 4));
+          const encoder = this.rasterCompression ??= new WebGlRasterCompression(gl);
+          const resource = encoded ? encoder.uploadEncoded(encoded[tileIndex], tile.width, tile.height, compressionFormat)
+            : encoder.upload(pixels[tileIndex], tile.width, tile.height, compressionFormat,
+              Math.min(MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES, automaticRasterMemoryBudget().bytes / 4));
           const uv = tile.uv.map((value, offset) => value * resource.uvScale[offset % 2]);
           tiles.push({ texture: resource.texture, compressionFormat,
             ...(plan.tiles.length > 1 ? { quad: Float32Array.from(tile.quad) } : {}),
@@ -5116,26 +5139,8 @@ export class WebGlFloorplanRenderer {
 
   private getSceneRasterLayers(
     scene: VectorScene
-  ): Array<{
-    opacity?: number;
-    width: number;
-    height: number;
-    data: Uint8Array<ArrayBufferLike>;
-    monochrome?: MonochromeRaster;
-    matrix: Float32Array;
-    paintOrder: number;
-    pageIndex: number;
-  }> {
-    const out: Array<{
-      opacity?: number;
-      width: number;
-      height: number;
-      data: Uint8Array<ArrayBufferLike>;
-      monochrome?: MonochromeRaster;
-      matrix: Float32Array;
-      paintOrder: number;
-      pageIndex: number;
-    }> = [];
+  ): Array<RasterLayerSource & { paintOrder: number; pageIndex: number }> {
+    const out: Array<RasterLayerSource & { paintOrder: number; pageIndex: number }> = [];
     if (Array.isArray(scene.rasterLayers)) {
       for (let index = 0; index < scene.rasterLayers.length; index++) {
         const layer = this.rasterLayerUpdates.get(index) ?? scene.rasterLayers[index];
@@ -5151,6 +5156,9 @@ export class WebGlFloorplanRenderer {
           height,
           get data() { return layer.data; },
           ...(layer.monochrome ? { monochrome: layer.monochrome } : {}),
+          compressionHint: layer.compressionHint,
+          gpuCompression: layer.gpuCompression,
+          gpuPreparation: layer.gpuPreparation,
           opacity: layer.opacity,
           matrix: layer.matrix instanceof Float32Array ? layer.matrix : new Float32Array(layer.matrix),
           paintOrder: Number.isFinite(layer.paintOrder) ? layer.paintOrder : 0,

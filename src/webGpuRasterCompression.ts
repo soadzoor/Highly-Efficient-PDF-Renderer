@@ -2,6 +2,7 @@ import {
   buildRasterCompressionMipChain,
   estimateCompressedRasterBytes,
   rasterCompressionFormatInfo,
+  rasterCompressionMipLayout,
   type RasterCompressionFormat
 } from "./rasterCompression";
 import { RASTER_BC7_ENCODER_WGSL } from "./shaders/rasterBc7Encoder";
@@ -75,6 +76,46 @@ export class WebGpuRasterCompression {
   get residentBytes(): number { return this.inputTexture ? this.workspaceBytes : 0; }
   setFailureListener(listener: ((error: unknown) => void) | null): void { this.failureListener = listener; }
   releaseWorkspace(): void { this.destroyWorkspace(); }
+
+  /** Upload transferable parser blocks directly, without RGBA uploads or compute workspace. */
+  createTextureFromEncoded(width: number, height: number, data: Uint8Array): WebGpuCompressedRasterTexture | null {
+    if (!this.available) return null;
+    const layout = rasterCompressionMipLayout(width, height, this.format);
+    const estimatedBytes = layout.reduce((sum, mip) => sum + mip.byteLength, 0);
+    if (!(data instanceof Uint8Array) || data.length !== estimatedBytes) {
+      throw new RangeError("Incorrect encoded raster mip byte length.");
+    }
+    const base = layout[0];
+    if (base.width > this.workspaceWidth || base.height > this.workspaceWidth) return null;
+    const usage = (globalThis as any).GPUTextureUsage;
+    let texture: any = null;
+    const scoped = pushCompressionErrorScopes(this.device);
+    try {
+      texture = this.device.createTexture({
+        label: `hepr-raster-${this.format}`,
+        size: { width: base.width, height: base.height, depthOrArrayLayers: 1 },
+        format: rasterCompressionFormatInfo(this.format).webGpuFormat,
+        mipLevelCount: layout.length,
+        usage: usage.TEXTURE_BINDING | usage.COPY_DST
+      });
+      for (const [mipLevel, mip] of layout.entries()) {
+        this.device.queue.writeTexture({ texture, mipLevel }, data.subarray(mip.byteOffset, mip.byteOffset + mip.byteLength),
+          { bytesPerRow: mip.blocksX * 16, rowsPerImage: mip.blocksY },
+          { width: mip.blocksX * 4, height: mip.blocksY * 4, depthOrArrayLayers: 1 });
+      }
+      return { texture, estimatedBytes, uvScale: [width / base.width, height / base.height] };
+    } catch (error) {
+      texture?.destroy();
+      this.disable(error);
+      return null;
+    } finally {
+      if (scoped) {
+        void popCompressionErrorScopes(this.device).then((error: unknown) => {
+          if (error) this.disable(error);
+        }, (error: unknown) => this.disable(error));
+      }
+    }
+  }
 
   createTexture(width: number, height: number, premultiplied: Uint8Array): WebGpuCompressedRasterTexture | null {
     if (!this.available) return null;

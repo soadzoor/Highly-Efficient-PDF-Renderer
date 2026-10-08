@@ -72,6 +72,21 @@ performed for this change.
 
 ## Verification
 
+The native and Three examples expose **GPU compress scans (experimental)**.
+Enable it with **Use OCR text instead of scans** off, then open the PDF. It
+overrides streaming and decodes all selected pages before display. Packed scans
+prepare their compact atlas candidates during parsing, with a per-page share of
+the automatic raster target. The display tier can be smaller than the original;
+zoom detail and exports retain the canonical packed pixels. Color/grayscale
+scans can instead use optional lossy BC7/ASTC blocks, with a fidelity diagnostic.
+
+The all-pages trial targets `C:\Users\soadz\Desktop\TIKA\TIKA-2848-1.pdf`.
+Lightweight inspection of direct PDF dictionaries found 614 pages and 614
+1-bit DeviceGray/JBIG2 scans, approximately 641 MiB of packed base pixels.
+No pages were decoded for that inspection. Original CPU pixels remain resident
+in this experimental mode, in addition to bounded display preparation data.
+Actual browser/GPU stability and VRAM use require a manual run.
+
 Synthetic checks cover all base/mip texels, odd dimensions, repeated blocks,
 clipped symbols, mismatched traces, fallback selection, cooperative preparation,
 native uploads, Three WGSL bindings, memory accounting and resource cleanup.

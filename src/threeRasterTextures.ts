@@ -4,7 +4,7 @@ import { buildPackedMonochromeMipAtlas, monochromeCoverageTilePixels, monochrome
   type MonochromeRaster } from "./monochromeRaster";
 import { rasterTilePixels, type RasterTilePlan } from "./rasterTiles";
 import { rememberMonochromePlanBytes, estimateRasterTextureBytes } from "./rasterMemoryBudget";
-import type { RasterCompressionFormat } from "./rasterCompression";
+import type { PreparedRasterCompression, RasterCompressionFormat } from "./rasterCompression";
 import type { PreparedRasterPixels } from "./rasterPreparation";
 import { sameRasterTilePlan } from "./rasterTiles";
 import { buildPackedCoverageMipAtlas } from "./packedMonochromeCoverage";
@@ -22,7 +22,7 @@ export interface ThreeRasterTextureInfo {
 
 export interface ThreeRasterCompressor {
   readonly format: RasterCompressionFormat | null;
-  upload(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat): THREE.Texture;
+  upload(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat, encoded?: Uint8Array): THREE.Texture;
 }
 
 const information = new WeakMap<THREE.Texture, ThreeRasterTextureInfo>();
@@ -46,12 +46,17 @@ export function markThreeRasterTextureForUpload(texture: THREE.Texture): void {
 
 /** Display derivatives preserve packed canonical pixels and never invoke their RGBA getter. */
 export function createThreeRasterTileTextures(source: { width: number; height: number; data: Uint8Array;
-  monochrome?: MonochromeRaster }, plan: RasterTilePlan, compressor?: ThreeRasterCompressor,
+  monochrome?: MonochromeRaster; gpuCompression?: PreparedRasterCompression; gpuPreparation?: PreparedRasterPixels },
+  plan: RasterTilePlan, compressor?: ThreeRasterCompressor,
   format?: RasterCompressionFormat | null, prepared?: PreparedRasterPixels): THREE.Texture[] {
+  prepared ??= source.gpuPreparation;
   if (prepared && !sameRasterTilePlan(prepared.plan, plan)) prepared = undefined;
   const mono = source.monochrome;
   const packed = !!mono && plan.width === source.width && plan.height === source.height;
-  const pixels = prepared?.pixels ?? (packed ? [] : mono ? monochromeCoverageTilePixels(mono, source.width, source.height, plan)
+  const encoded = !mono && compressor && source.gpuCompression && source.gpuCompression.format === format &&
+    sameRasterTilePlan(source.gpuCompression.plan, plan) && source.gpuCompression.tiles.length === plan.tiles.length
+    ? source.gpuCompression.tiles : undefined;
+  const pixels = encoded ? [] : prepared?.pixels ?? (packed ? [] : mono ? monochromeCoverageTilePixels(mono, source.width, source.height, plan)
     : rasterTilePixels(source, plan));
   const textures: THREE.Texture[] = [];
   try {
@@ -79,7 +84,7 @@ export function createThreeRasterTileTextures(source: { width: number; height: n
           information.set(texture, monoInfo(bits, coverage, tile.width, tile.height, packed ? 1 : 2));
         }
       } else if (format && compressor) {
-        texture = compressor.upload(pixels[index], tile.width, tile.height, format);
+        texture = compressor.upload(pixels[index], tile.width, tile.height, format, encoded?.[index]);
       } else {
         texture = dataTexture(pixels[index], tile.width, tile.height);
         information.set(texture, { ...threeRasterTextureInfo(texture), size: new THREE.Vector2(tile.width, tile.height),

@@ -10,6 +10,7 @@ const setMemory = deviceMemory => Object.defineProperty(globalThis, "navigator",
 
 try {
   const { RasterResolutionPlanner } = await import("../src/rasterResolution.ts");
+  const { planRasterTiles } = await import("../src/rasterTiles.ts");
   const { estimateRasterSourcePlanBytes, estimateRasterTextureBytes } = await import("../src/rasterMemoryBudget.ts");
   const { resampleMonochromeCoverage, createMonochromeRasterLayer } = await import("../src/monochromeRaster.ts");
   const { buildRasterScenePreview, sceneCpuBytes } = await import("../src/pageRasterPreview.ts");
@@ -35,6 +36,47 @@ try {
   assert.equal(distant.plans[0].width, 128, "offscreen images release high resolution");
   assert.equal(source.width, 2048);
   assert.equal(source.height, 1024);
+
+  const derivativePlan = planRasterTiles(600, 300, 8192);
+  const compressedScan = { width: 2048, height: 1024, matrix: source.matrix,
+    compressionEligible: true, preferCompression: true,
+    gpuCompression: { format: "bc7", plan: derivativePlan, tiles: [new Uint8Array(0)] },
+    get data() { assert.fail("Derivative planning must not read canonical pixels"); } };
+  const scanSources = [compressedScan], scanPlanner = new RasterResolutionPlanner();
+  const scanPreview = scanPlanner.plan(scanSources, 8192, null, undefined, "bc7");
+  assert.deepEqual(scanPreview.plans[0], derivativePlan, "an offscreen scan keeps its parse-time compressed tier without re-encoding");
+  assert.deepEqual(scanPreview.compressionFormats, ["bc7"], "scan compression remains selected when RGBA would fit the budget");
+  assert.equal(scanPlanner.nextChange(scanSources, [{ rasterPlan: derivativePlan,
+    estimatedBytes: scanPreview.estimatedBytes, compressionFormat: "bc7" }], scanPreview), -1);
+  const scanDetail = scanPlanner.plan(scanSources, 8192, { ...view, zoom: 1 }, undefined, "bc7");
+  assert.equal(scanDetail.plans[0].width, 2048, "screen demand can promote a parse-time derivative to sharper detail");
+  assert.deepEqual(scanPlanner.plan(scanSources, 8192, { ...view, zoom: .01 }, undefined, "bc7").plans[0], derivativePlan,
+    "zoom-out returns to the stored derivative tier");
+  const constrainedScan = scanPlanner.plan(scanSources, 8192, null, 1024, "bc7");
+  assert(constrainedScan.plans[0].width < derivativePlan.width && constrainedScan.estimatedBytes <= 1024,
+    "stored derivatives remain subject to the aggregate GPU memory allowance");
+  for (const format of [null, "astc-4x4"]) {
+    const fallback = scanPlanner.plan(scanSources, 8192, null, undefined, format);
+    assert.equal(fallback.plans[0].width, 128, "an unavailable or different compression format keeps ordinary screen tiers");
+  }
+  const packedScan = Object.defineProperties({}, Object.getOwnPropertyDescriptors(compressedScan));
+  packedScan.monochrome = {};
+  const packedDerivative = new RasterResolutionPlanner().plan([packedScan], 8192, null, undefined, "bc7");
+  assert.equal(packedDerivative.plans[0].width, 128, "packed pixels retain their own lossless tier selection");
+  assert.deepEqual(packedDerivative.compressionFormats, [null]);
+  const preparedScan = Object.defineProperties({}, Object.getOwnPropertyDescriptors(source));
+  preparedScan.gpuPreparation = { plan: derivativePlan };
+  const preparedSources = [preparedScan], preparedPlanner = new RasterResolutionPlanner();
+  for (const format of [null, "bc7"]) {
+    const preparedPreview = preparedPlanner.plan(preparedSources, 8192, null, undefined, format);
+    assert.deepEqual(preparedPreview.plans[0], derivativePlan,
+      "prepared monochrome coverage retains its parse-time tier independently of lossy GPU compression support");
+    assert.deepEqual(preparedPreview.compressionFormats, [null]);
+    assert.equal(preparedPreview.estimatedBytes, estimateRasterTextureBytes(600, 300, false, null, true));
+  }
+  const reducedPreparation = preparedPlanner.plan(preparedSources, 8192, null, 4096);
+  assert(reducedPreparation.plans[0].width < derivativePlan.width && reducedPreparation.estimatedBytes <= 4096,
+    "the resident budget can reduce a prepared monochrome display tier");
 
   const identity = Float32Array.of(1 / 2048, 0, 0, 0, 0, 1 / 1024, 0, 0, 0, 0, 1, 0, -.5, -.5, 0, 1);
   const projected = new RasterResolutionPlanner().plan(sources, 8192, { ...view, localToClip: identity });
@@ -102,7 +144,7 @@ try {
   const shared = new ArrayBuffer(100);
   const accounting = Object.assign(createEmptyVectorScene(), { payloadA: new Uint8Array(shared), payloadB: new Uint8Array(shared, 20), label: "test" });
   assert.equal(sceneCpuBytes(accounting), sceneCpuBytes(createEmptyVectorScene()) + 108);
-  console.log("Raster resolution: previews, visibility, zoom hysteresis, projections, RAM/content budgets, packed area filtering, canonical ownership and lazy-safe scene preparation passed.");
+  console.log("Raster resolution: previews, compressed derivative reuse, visibility, zoom hysteresis, projections, RAM/content budgets, packed area filtering, canonical ownership and lazy-safe scene preparation passed.");
 } finally {
   if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator); else delete globalThis.navigator;
   hooks.deregister();

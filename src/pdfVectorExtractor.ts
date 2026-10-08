@@ -23,6 +23,8 @@ import { validateScenePaintGraph, type ScenePaintGraph } from "./scenePaintGraph
 import { composeOptionalContent } from "./optionalContentComposition";
 import { assertPdfBytes, PDF_HEADER_SCAN_BYTES } from "./pdfSignature";
 import { copyRasterLayer, type MonochromeRaster } from "./monochromeRaster";
+import type { PreparedRasterCompression } from "./rasterCompression";
+import type { PreparedRasterPixels } from "./rasterPreparationCore";
 
 type Mat2D = [number, number, number, number, number, number];
 
@@ -34,6 +36,12 @@ export interface Bounds {
 }
 
 export interface RasterLayer {
+  /** Viewing-only GPU blocks; canonical pixels remain available for export and recovery. */
+  gpuCompression?: PreparedRasterCompression;
+  /** Viewing-only packed/compact monochrome atlases prepared before scene upload. */
+  gpuPreparation?: PreparedRasterPixels;
+  /** Explicit viewing approximation for opaque scanned pages with sharp text edges. */
+  compressionHint?: "scan";
   /** Viewing-only scan slot; its pixels can change without replacing document geometry. */
   pageDemandSlot?: boolean;
   /** Constant paint alpha, independent of the retained image RGBA; absent means one. */
@@ -226,6 +234,8 @@ export interface VectorScene {
 }
 
 export interface VectorExtractOptions extends PdfIccOptions {
+  /** Experimental: prepare bounded GPU-compressed scan derivatives between page compiles. */
+  compressScans?: boolean;
   /** Draw stored text with bundled substitute fonts, omitting images and other graphics. PDF only. */
   ocrTextOnly?: boolean;
   /** Optional raw-sample image decoder; omitted uses the bundled codecs. */
@@ -421,6 +431,7 @@ async function extractPdfPageScenesWithNative(
     });
   };
   let session: PdfSession | null = null;
+  let scanCompressor: import("./pdfRasterCompression").PdfRasterCompressor | undefined;
   let failed = false;
   try {
     const source = {
@@ -447,6 +458,10 @@ async function extractPdfPageScenesWithNative(
     sourcePageCount = vectorSession.info.pageCount;
     const pageNumbers = resolvePdfPageNumbers(sourcePageCount, options.pages);
     selectedPageCount = pageNumbers.length;
+    if (options.compressScans && !options.ocrTextOnly) {
+      const { createPdfRasterCompressor } = await import("./pdfRasterCompression");
+      scanCompressor = createPdfRasterCompressor(options.onDiagnostic);
+    }
     const pageScenes: VectorScene[] = [];
 
     for (selectionIndex = 0; selectionIndex < selectedPageCount; selectionIndex += 1) {
@@ -482,6 +497,8 @@ async function extractPdfPageScenesWithNative(
       if (options.extractTextContent === true) {
         scene.textContent = deriveSceneTextContentFromIndex(scene, 0);
       }
+      await scanCompressor?.preparePage(scene, selectedPageCount, sourcePageIndex, signal);
+      signal?.throwIfAborted();
       pageScenes.push(scene);
       progress.report(pageEnd, {
         stage: "pdf-page",
@@ -513,6 +530,7 @@ async function extractPdfPageScenesWithNative(
     failed = true;
     throw error;
   } finally {
+    scanCompressor?.dispose();
     try {
       await session?.close();
     } catch (closeError) {

@@ -3,6 +3,7 @@ import { buildRasterCompressionMipChain, estimateCompressedRasterBytes, rasterCo
 import { GPUTEX_BC7_FRAGMENT } from "./shaders/gputexBc7Fragment";
 import { GPUTEX_ASTC4X4_FRAGMENT } from "./shaders/gputexAstc4x4Fragment";
 import { GPUTEX_FULLSCREEN_VERTEX } from "./shaders/gputexFullscreenVertex";
+import { throwIfAborted } from "./pdf/nativeTypes";
 
 export const MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES = 4 * 1024 * 1024;
 
@@ -52,8 +53,8 @@ export function detectWebGlRasterCompression(gl: WebGL2RenderingContext): Raster
 
 /**
  * One fragment encodes one block. Integer FBO pixels travel through a PBO to
- * compressed texture storage on this same context, without JavaScript readback.
- * Fixed-size bands keep encoder GPU resources independent of image height.
+ * same-context texture storage or transferable parser output. Direct texture
+ * uploads avoid JavaScript readback; fixed bands bound every encoder workspace.
  */
 export class WebGlRasterCompression {
   private readonly gl: WebGL2RenderingContext;
@@ -81,6 +82,105 @@ export class WebGlRasterCompression {
   }
 
   get workspaceBytes(): number { return this.workspace?.bytes ?? 0; }
+
+  /** Encode transferable blocks during parsing, synchronizing one bounded band at a time. */
+  encode(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat,
+    workspaceLimitBytes = MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES, signal?: AbortSignal): Uint8Array {
+    throwIfAborted(signal);
+    const caps = this.capabilities;
+    if (!(format === "bc7" ? caps.bc7 : caps.astc4x4) || typeof this.gl.getBufferSubData !== "function") {
+      throw new Error(`WebGL ${format} block readback is unavailable.`);
+    }
+    const gl = this.gl, state = captureState(gl);
+    try {
+      const layout = rasterCompressionMipLayout(width, height, format);
+      if (layout[0].width > Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) ||
+          layout[0].height > Number(gl.getParameter(gl.MAX_TEXTURE_SIZE))) {
+        throw new Error("Block-aligned raster exceeds this context's texture dimension limit.");
+      }
+      const output = new Uint8Array(layout.reduce((sum, mip) => sum + mip.byteLength, 0));
+      const program = this.getProgram(format);
+      prepareState(gl);
+      const workspace = this.getWorkspace(workspaceLimitBytes);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, workspace.framebuffer);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.useProgram(program.program);
+      gl.bindVertexArray(workspace.vao);
+      gl.uniform1i(program.source, 0);
+      gl.uniform1i(program.flip, 0);
+      let level = 0;
+      for (const pixels of buildRasterCompressionMipChain(data, width, height, signal)) {
+        const blocksX = Math.ceil(pixels.width / 4);
+        for (let y = 0; y < pixels.height; y += workspace.blockRows * 4) {
+          throwIfAborted(signal);
+          const rows = Math.min(workspace.blockRows * 4, pixels.height - y);
+          const blockRows = Math.ceil(rows / 4), bytes = blocksX * blockRows * 16;
+          gl.bindTexture(gl.TEXTURE_2D, workspace.source);
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, pixels.width, rows, gl.RGBA, gl.UNSIGNED_BYTE,
+            pixels.data.subarray(y * pixels.width * 4, (y + rows) * pixels.width * 4));
+          gl.uniform2i(program.size, pixels.width, rows);
+          gl.viewport(0, 0, blocksX, blockRows);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, workspace.buffer);
+          gl.readPixels(0, 0, blocksX, blockRows, gl.RGBA_INTEGER, gl.UNSIGNED_INT, 0);
+          const offset = layout[level].byteOffset + (y / 4) * blocksX * 16;
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, output.subarray(offset, offset + bytes));
+          checkError(gl, `${format} mip ${level} band readback`);
+        }
+        level++;
+      }
+      throwIfAborted(signal);
+      return output;
+    } catch (error) {
+      if (!signal?.aborted) this.failed.add(format);
+      this.releaseWorkspace();
+      throw error;
+    } finally {
+      restoreState(gl, state);
+    }
+  }
+
+  /** Upload parser-prepared blocks without creating encoder workspace or RGBA derivatives. */
+  uploadEncoded(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat): WebGlCompressedRaster {
+    const layout = rasterCompressionMipLayout(width, height, format);
+    const estimatedBytes = layout.reduce((sum, mip) => sum + mip.byteLength, 0);
+    if (!(data instanceof Uint8Array) || data.length !== estimatedBytes) {
+      throw new RangeError("Incorrect encoded raster mip byte length.");
+    }
+    const caps = this.capabilities;
+    if (!(format === "bc7" ? caps.bc7 : caps.astc4x4)) throw new Error(`WebGL ${format} compression is unavailable.`);
+    const gl = this.gl, state = captureState(gl), base = layout[0];
+    let texture: WebGLTexture | null = null;
+    try {
+      if (base.width > Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || base.height > Number(gl.getParameter(gl.MAX_TEXTURE_SIZE))) {
+        throw new Error("Block-aligned raster exceeds this context's texture dimension limit.");
+      }
+      prepareState(gl);
+      texture = requireResource(gl.createTexture(), "compressed texture");
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      const internalFormat = format === "bc7" ? 0x8e8c : 0x93b0;
+      gl.texStorage2D(gl.TEXTURE_2D, layout.length, internalFormat, base.width, base.height);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, layout.length - 1);
+      checkError(gl, "compressed texture allocation");
+      for (const [level, mip] of layout.entries()) {
+        gl.compressedTexSubImage2D(gl.TEXTURE_2D, level, 0, 0, mip.width, mip.height, internalFormat,
+          data.subarray(mip.byteOffset, mip.byteOffset + mip.byteLength));
+        checkError(gl, `${format} encoded mip ${level} upload`);
+      }
+      return { texture, estimatedBytes, uvScale: [width / base.width, height / base.height] };
+    } catch (error) {
+      if (texture) gl.deleteTexture(texture);
+      this.failed.add(format);
+      this.releaseWorkspace();
+      throw error;
+    } finally {
+      restoreState(gl, state);
+    }
+  }
 
   upload(data: Uint8Array, width: number, height: number, format: RasterCompressionFormat,
     workspaceLimitBytes = MAX_WEBGL_RASTER_COMPRESSION_WORKSPACE_BYTES): WebGlCompressedRaster {

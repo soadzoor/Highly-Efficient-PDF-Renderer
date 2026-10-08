@@ -60,8 +60,8 @@ export function packMonochromeCoverageMipChain(levels: SingleChannelUint8MipLeve
 }
 
 export function packMonochromeCoverageMipChainAsync(levels: SingleChannelUint8MipLevel[], width: number,
-  height: number): Promise<PackedMonochromeCoverageAtlas> {
-  return finishRasterStepsAsync(packMonochromeCoverageSteps(levels, width, height));
+  height: number, signal?: AbortSignal): Promise<PackedMonochromeCoverageAtlas> {
+  return finishRasterStepsAsync(packMonochromeCoverageSteps(levels, width, height), signal);
 }
 
 export function buildPackedCoverageMipAtlas(data: Uint8Array, width: number, height: number): PackedMonochromeCoverageAtlas {
@@ -70,7 +70,7 @@ export function buildPackedCoverageMipAtlas(data: Uint8Array, width: number, hei
 }
 
 export async function buildPackedCoverageMipAtlasAsync(data: Uint8Array, width: number,
-  height: number): Promise<PackedMonochromeCoverageAtlas> {
-  const levels = await buildSingleChannelUint8MipChainAsync(data, width, height);
-  return packMonochromeCoverageMipChainAsync(levels.length > 1 ? levels.slice(1) : levels, width, height);
+  height: number, signal?: AbortSignal): Promise<PackedMonochromeCoverageAtlas> {
+  const levels = await buildSingleChannelUint8MipChainAsync(data, width, height, signal);
+  return packMonochromeCoverageMipChainAsync(levels.length > 1 ? levels.slice(1) : levels, width, height, signal);
 }

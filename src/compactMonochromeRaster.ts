@@ -160,9 +160,9 @@ export function buildCompactMonochromeAtlas(source: MonochromeRaster, width: num
   return symbols && (!blocks || symbols.data.length < blocks.data.length) ? symbols : blocks;
 }
 export async function buildCompactMonochromeAtlasAsync(source: MonochromeRaster, width: number, height: number,
-  coverage: PackedMonochromeCoverageAtlas, reduced?: Uint8Array): Promise<CompactMonochromeAtlas | undefined> {
-  const blocks = await finishRasterStepsAsync(compactMonochromeSteps({ ...source, symbols: undefined }, width, height, coverage, reduced));
+  coverage: PackedMonochromeCoverageAtlas, reduced?: Uint8Array, signal?: AbortSignal): Promise<CompactMonochromeAtlas | undefined> {
+  const blocks = await finishRasterStepsAsync(compactMonochromeSteps({ ...source, symbols: undefined }, width, height, coverage, reduced), signal);
   if (!source.symbols || reduced) return blocks;
-  const symbols = await finishRasterStepsAsync(compactMonochromeSteps(source, width, height, coverage));
+  const symbols = await finishRasterStepsAsync(compactMonochromeSteps(source, width, height, coverage), signal);
   return symbols && (!blocks || symbols.data.length < blocks.data.length) ? symbols : blocks;
 }

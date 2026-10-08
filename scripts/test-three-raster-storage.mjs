@@ -10,7 +10,7 @@ const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
 const deadline = setTimeout(() => assert.fail("Three raster storage did not complete within 10 seconds."),10000);
 Object.defineProperty(globalThis, "navigator", { configurable: true, value: { deviceMemory: .5 } });
 try {
-  const { createThreeRasterTileTextures, threeRasterTextureInfo } = await import("../src/threeRasterTextures.ts");
+  const { createThreeRasterTileTextures, threeRasterTextureInfo, registerThreeCompressedTexture } = await import("../src/threeRasterTextures.ts");
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
   const { buildPackedMonochromeMipAtlas, monochromeCoverageTilePixels } = await import("../src/monochromeRaster.ts");
   const { buildPackedCoverageMipAtlas } = await import("../src/packedMonochromeCoverage.ts");
@@ -21,6 +21,7 @@ try {
   const { ThreeRasterCompression } = await import("../src/threeRasterCompression.ts");
   const { WebGpuRasterCompression } = await import("../src/webGpuRasterCompression.ts");
   const { estimateCompressedRasterBytes } = await import("../src/rasterCompression.ts");
+  const { prepareRasterPixels } = await import("../src/rasterPreparation.ts");
   const source = (width,height,pageIndex=0) => ({ width,height,pageIndex,
     matrix: Float32Array.of(width,0,0,height,0,0), monochrome: {
       data: new Uint8Array(Math.ceil(width/8)*height).fill(0xaa), colors: Uint8Array.of(255,240,220,255,10,20,30,128)
@@ -42,6 +43,21 @@ try {
   assert.equal(coverageInfo.estimatedBytes,coverage.image.data.length);
   assert(coverage.image.data.length < 16*8, "uniform reduced coverage benefits from compact blocks");
   assert.equal(coverage.generateMipmaps,false,"reduced bases keep exact R8 coverage without uncompressed mips");
+  for (const plan of [fullPlan,reducedPlan]) {
+    const preparation = await prepareRasterPixels(small,plan);
+    const preparedSource = Object.defineProperties({},Object.getOwnPropertyDescriptors(small));
+    preparedSource.gpuPreparation = preparation;
+    const [texture] = createThreeRasterTileTextures(preparedSource,plan), info = threeRasterTextureInfo(texture);
+    if (preparation.compactAtlases[0]) {
+      assert.equal(texture.image.data,preparation.compactAtlases[0].data,
+        "stored compact monochrome atlases upload directly without repeating preparation");
+    } else {
+      assert.equal(texture.image.data,preparation.monochromeTiles?.[0]?.data ?? preparation.pixels[0]);
+      assert.equal(info.coverage.image.data,preparation.coverageAtlases[0].data,
+        "stored monochrome coverage mip atlases retain their prepared buffers");
+    }
+    texture.dispose();
+  }
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position",new THREE.BufferAttribute(new Float32Array(12),3));
@@ -79,8 +95,57 @@ try {
   packedInfo.coverage.addEventListener("dispose",() => coverageDisposed++);
   packed.dispose(); assert.equal(coverageDisposed,1); coverage.dispose();
 
+  const derivativePlan = planRasterTiles(65,17,32);
+  assert(derivativePlan.tiles.length > 1);
+  const encodedTiles = derivativePlan.tiles.map(tile => new Uint8Array(estimateCompressedRasterBytes(tile.width,tile.height,"bc7")));
+  const derivativeSource = { width:65,height:17,gpuCompression:{ format:"bc7",plan:derivativePlan,tiles:encodedTiles },
+    get data() { assert.fail("Matching compressed tiles must upload without rebuilding canonical RGBA tiles"); } };
+  let encodedUploads=0, encodedDisposals=0;
+  const encodedCompressor = { format:"bc7",upload(_data,width,height,format,encoded) {
+    assert.equal(format,"bc7"); assert.equal(encoded,encodedTiles[encodedUploads++]);
+    const texture = new THREE.Texture(); texture.addEventListener("dispose",()=>encodedDisposals++);
+    registerThreeCompressedTexture(texture,width,height,format,encoded.byteLength,[1,1]); return texture;
+  } };
+  const compressedTiles = createThreeRasterTileTextures(derivativeSource,derivativePlan,encodedCompressor,"bc7");
+  assert.equal(encodedUploads,derivativePlan.tiles.length);
+  assert.equal(compressedTiles.reduce((sum,texture)=>sum+threeRasterTextureInfo(texture).estimatedBytes,0),
+    encodedTiles.reduce((sum,tile)=>sum+tile.byteLength,0));
+  compressedTiles.forEach(texture=>texture.dispose()); assert.equal(encodedDisposals,encodedUploads);
+  let partialDisposed=0, partialUploads=0;
+  assert.throws(()=>createThreeRasterTileTextures(derivativeSource,derivativePlan,{ format:"bc7",upload() {
+    if (partialUploads++) throw Error("synthetic encoded tile upload failure");
+    const texture = new THREE.Texture(); texture.addEventListener("dispose",()=>partialDisposed++); return texture;
+  } },"bc7"),/synthetic encoded tile/);
+  assert.equal(partialDisposed,1,"a failed encoded tile upload releases every earlier tile handle");
+  const canonicalDerivative = Object.defineProperties({},Object.getOwnPropertyDescriptors(derivativeSource));
+  Object.defineProperty(canonicalDerivative,"data",{ value:new Uint8Array(65*17*4).fill(255),configurable:true });
+  for (const [plan,format] of [[derivativePlan,"astc-4x4"],[planRasterTiles(16,8,32),"bc7"]]) {
+    let ordinaryUploads=0;
+    const textures = createThreeRasterTileTextures(canonicalDerivative,plan,{ format,upload(data,width,height,_format,encoded) {
+      ordinaryUploads++; assert.equal(encoded,undefined,"different formats and plans cannot reuse stored blocks");
+      assert.equal(data.byteLength,width*height*4,"the encoder receives the requested RGBA display tiles"); return new THREE.Texture();
+    } },format);
+    assert.equal(ordinaryUploads,plan.tiles.length); textures.forEach(texture=>texture.dispose());
+  }
+
   const image = source(2048,1024), scene = createEmptyVectorScene();
   scene.rasterLayers = [image]; scene.pageRects = Float32Array.of(0,0,2048,1024);
+  const storedPreparation = await prepareRasterPixels(image,planRasterTiles(256,128,4096));
+  const preparedImage = Object.defineProperties({},Object.getOwnPropertyDescriptors(image));
+  preparedImage.gpuPreparation = storedPreparation;
+  const preparedScene = Object.assign(createEmptyVectorScene(),{ rasterLayers:[preparedImage] });
+  const preparedLayer = new ThreeMaterialRasterLayer(preparedScene,{ pageBackground:[1,1,1,1] });
+  assert.equal(preparedLayer.rasterEntries[0].image.plan.width,256,"material creation preserves the prepared monochrome display tier");
+  assert.equal(preparedLayer.rasterEntries[0].texture.image.data,storedPreparation.compactAtlases[0].data,
+    "material source classification preserves and consumes prepared compact pixels");
+  preparedLayer.dispose();
+  const stagedLayer = new ThreeMaterialRasterLayer(scene,{ pageBackground:[1,1,1,1] });
+  stagedLayer.setTextureResidency(true);
+  const preparedUpdate = await stagedLayer.prepareRasterLayerUpdatesAsync(new Map([[0,preparedImage]]));
+  preparedUpdate.commit(); preparedUpdate.dispose();
+  assert.equal(stagedLayer.rasterEntries[0].texture.image.data,storedPreparation.compactAtlases[0].data,
+    "asynchronous page updates skip repeating monochrome pixel and mip preparation");
+  stagedLayer.dispose();
   const layer = new ThreeMaterialRasterLayer(scene,{ pageBackground: [1,1,1,1] });
   const entry = layer.rasterEntries[0];
   assert.equal(threeRasterTextureInfo(entry.texture).mode,3,"initial previews compact averaged coverage");
@@ -119,10 +184,14 @@ try {
   assert(allowances.every(bytes=>bytes>0)); pagesLayer.dispose();
 
   const originalCreate = WebGpuRasterCompression.create;
-  let creates=0, disposed=0, destroyed=0;
+  let creates=0, disposed=0, destroyed=0, adapterEncodedUploads=0;
   WebGpuRasterCompression.create = async () => { creates++; return { format:"bc7", available:true,workspaceBytes:4096,
     setFailureListener() {}, releaseWorkspace() {}, dispose() { disposed++; },
-    createTexture(width,height) { return { texture: { destroy() { destroyed++; } },estimatedBytes:400,uvScale:[width/20,height/12] }; } }; };
+    createTexture(width,height) { return { texture: { destroy() { destroyed++; } },estimatedBytes:400,uvScale:[width/20,height/12] }; },
+    createTextureFromEncoded(width,height,bytes) {
+      adapterEncodedUploads++; assert.equal(bytes,encodedTiles[0]);
+      return { texture:{ destroy() { destroyed++; } },estimatedBytes:bytes.byteLength,uvScale:[1,1] };
+    } }; };
   try {
     const host = { isWebGPURenderer:true,backend:{ device:{} } }, a = new ThreeRasterCompression(()=>{}), b = new ThreeRasterCompression(()=>{});
     a.setHost(host); b.setHost(host); await Promise.resolve();
@@ -130,8 +199,12 @@ try {
     const texture = a.upload(new Uint8Array(17*11*4),17,11,"bc7");
     assert.equal(texture.isExternalTexture,true);
     assert.deepEqual(threeRasterTextureInfo(texture).uvScale,[17/20,11/12]);
+    const encodedTexture = a.upload(new Uint8Array(0),derivativePlan.tiles[0].width,derivativePlan.tiles[0].height,"bc7",encodedTiles[0]);
+    assert.equal(adapterEncodedUploads,1,"the Three adapter uploads parser-prepared blocks on its host device");
+    assert.equal(threeRasterTextureInfo(encodedTexture).estimatedBytes,encodedTiles[0].byteLength);
+    encodedTexture.dispose(); assert.equal(destroyed,1);
     a.dispose(); assert.equal(disposed,0,"a remaining page keeps the shared encoder alive");
-    texture.dispose(); texture.dispose(); assert.equal(destroyed,1,"the adapter owns each GPU handle exactly once");
+    texture.dispose(); texture.dispose(); assert.equal(destroyed,2,"the adapter owns each GPU handle exactly once");
     b.dispose(); assert.equal(disposed,1);
 
     let unavailable = false, failures = 0;
@@ -212,7 +285,7 @@ try {
     assert.equal(layer.pendingRasterBytes, 0, "host upload failure releases the staged reservation");
     layer.dispose();
   }
-  console.log("Three raster storage: packed/R8 tiers, palette/mips, real WGSL bindings, zoom demotion, document allowances and shared external compression ownership passed.");
+  console.log("Three raster storage: packed/R8 tiers, prepared compressed tile reuse, palette/mips, real WGSL bindings, zoom demotion, document allowances and shared external compression ownership passed.");
 } finally {
   clearTimeout(deadline);
   if (oldNavigator) Object.defineProperty(globalThis,"navigator",oldNavigator); else delete globalThis.navigator;

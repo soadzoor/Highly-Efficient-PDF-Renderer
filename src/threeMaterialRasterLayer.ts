@@ -30,7 +30,7 @@ import type { ViewState } from "./webGlFloorplanRenderer";
 import { detectMonochromeRaster, type MonochromeRaster } from "./monochromeRaster";
 import { monochromeRasterFragmentGlsl } from "./monochromeRasterWebGlShader";
 import { pagePlaceholderTime, pagePlaceholderVertexGlsl, pagePlaceholderFragmentGlsl } from "./pageLoadingPlaceholder";
-import { assessRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
+import { assessRasterCompression, type PreparedRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
 import { ThreeRasterCompression } from "./threeRasterCompression";
 import { createThreeRasterTileTextures, markThreeRasterTextureForUpload, threeRasterTextureInfo } from "./threeRasterTextures";
 import {
@@ -98,8 +98,22 @@ interface RasterLayerSource {
   data: Uint8Array<ArrayBufferLike>;
   monochrome?: MonochromeRaster;
   compressionEligible?: boolean;
+  preferCompression?: boolean;
+  compressionHint?: "scan";
+  gpuCompression?: PreparedRasterCompression;
+  gpuPreparation?: PreparedRasterPixels;
   pageIndex?: number;
   matrix: Float32Array;
+}
+
+function hasPreparedRasterCompression(source: RasterLayerSource, plan: RasterTilePlan,
+  format?: RasterCompressionFormat | null): boolean {
+  return !source.monochrome && !!source.gpuCompression && source.gpuCompression.format === format &&
+    sameRasterTilePlan(source.gpuCompression.plan, plan) && source.gpuCompression.tiles.length === plan.tiles.length;
+}
+
+function hasPreparedRasterPixels(source: RasterLayerSource, plan: RasterTilePlan): boolean {
+  return !!source.gpuPreparation && sameRasterTilePlan(source.gpuPreparation.plan, plan);
 }
 
 export class ThreeMaterialRasterLayer {
@@ -420,7 +434,7 @@ export class ThreeMaterialRasterLayer {
       projection: (index: number) => this.rasterResolutionView!.projection!(replacements[index][0]) } : this.rasterResolutionView;
     return this.rasterResolutionPlanner.plan(sources, this.maxTextureSize, view,
       Math.max(0, Math.min(this.availableRasterBytes() - unchangedBytes - this.pendingRasterBytes,
-        budget.peakBytes - residentBytes - this.pendingRasterBytes)));
+        budget.peakBytes - residentBytes - this.pendingRasterBytes)), this.compression.format);
   }
 
   prepareRasterLayerUpdates(updates: ReadonlyMap<number, RasterLayer>): { commit(): void; dispose(): void } {
@@ -460,7 +474,9 @@ export class ThreeMaterialRasterLayer {
       this.pendingRasterBytes += reservedBytes;
       for (const [replacementIndex, [index, layer]] of replacements.entries()) {
         const plan = memoryPlan.plans[replacementIndex], format = memoryPlan.compressionFormats[replacementIndex];
-        const pixels = yield { source: sources[replacementIndex], plan, cached: this.resourceCache.has(sources[replacementIndex], plan, format) };
+        const pixels = yield { source: sources[replacementIndex], plan,
+          cached: hasPreparedRasterPixels(sources[replacementIndex], plan) || hasPreparedRasterCompression(sources[replacementIndex], plan, format) ||
+            this.resourceCache.has(sources[replacementIndex], plan, format) };
         if (this.disposed) throw new DOMException("Raster material layer disposed.", "AbortError");
         staged.push({ index, layer, plan, textures: this.createImageTextures(layer, plan, index, format, pixels) });
       }
@@ -617,7 +633,8 @@ export class ThreeMaterialRasterLayer {
     const entry = this.rasterEntries[index], source = sources[index], target = plan.plans[index];
     this.preparationRunning = true; this.needsResolutionUpdate = true;
     const started = performance.now();
-    const pixels = this.resourceCache.has(source, target, plan.compressionFormats[index])
+    const pixels = hasPreparedRasterPixels(source, target) || hasPreparedRasterCompression(source, target, plan.compressionFormats[index]) ||
+      this.resourceCache.has(source, target, plan.compressionFormats[index])
       ? Promise.resolve(undefined) : prepareRasterPixels(source, target);
     void pixels.then(pixels => {
       if (this.disposed || !this.rasterTextureResidencyEnabled || this.rasterResolutionSources !== sources || this.pendingRasterBytes > 0) return;
@@ -1123,10 +1140,11 @@ function classifyRasterSource(source: RasterLayerSource): RasterLayerSource {
   if (source.compressionEligible !== undefined) return source;
   const cached = classifiedRasterSources.get(source);
   if (cached) return cached;
-  const mono = source.monochrome ?? detectMonochromeRaster(source.data, source.width, source.height);
+  const mono = source.monochrome ?? (source.gpuCompression ? undefined : detectMonochromeRaster(source.data, source.width, source.height));
   const classified = Object.defineProperties({}, Object.getOwnPropertyDescriptors(source)) as RasterLayerSource;
   if (mono) classified.monochrome = mono;
-  classified.compressionEligible = !mono && assessRasterCompression(source).eligible;
+  classified.compressionEligible = !mono && (!!source.gpuCompression || assessRasterCompression(source).eligible);
+  classified.preferCompression = !mono && (source.compressionHint === "scan" || !!source.gpuCompression);
   classifiedRasterSources.set(source, classified);
   return classified;
 }

@@ -81,6 +81,7 @@ Use `"webgpu"` with a WebGPU-capable Three.js renderer and browser/GPU support.
 | `password` | — | User or owner password of a PDF that requires one to open. See [password-protected PDFs](#password-protected-pdfs). |
 | `maxPagesPerRow` | Automatic grid | Maximum pages per row when composing a PDF scene. |
 | `pageLoading` | `"all"` | Prepare all viewing pages before display, with one initial scene upload. `"auto"` opts into viewport-driven streaming for PDFs with more than 16 selected pages. Both preserve vector pages, use stored OCR as scan overviews and load scan pixels on zoom; only scans without usable OCR get small bitmap previews. `"eager"` also decodes complete original scan content before returning. |
+| `compressScans` | `false` | Experimental PDF viewing mode: eagerly decode all selected pages and prepare bounded scan texture data between page compiles. Packed monochrome uses compact atlases; opaque color/grayscale scans can use lossy BC7/ASTC. Overrides page streaming; `ocrTextOnly` skips scan preparation. |
 | `segmentMerge` | `true` | Merge compatible adjacent vector stroke segments during PDF parsing. |
 | `invisibleCull` | `true` | Drop known invisible content during PDF parsing. |
 | `extractText` | `false` | Also populate scene-space text items for tasks such as room-label seeding. |
@@ -115,6 +116,12 @@ recent GPU tiers are cached within the automatic memory allowance. Additional
 vector/clip detail installs once, while compositing pages may require full scene
 updates to preserve their effects.
 `pageLoading: "eager"` prepares the complete original PDF content before resolving.
+`compressScans: true` also prepares scan display data page by page during parsing,
+retaining a bounded share of the automatic raster target for every selected page.
+Compatible renderers reuse that data at upload; zoom can still prepare a higher
+resolution from original pixels. This mode retains every original page on the CPU,
+so it uses more CPU memory than streaming. Its temporary GPU encoder and retained
+display derivatives are bounded independently of the original document pixels.
 Cancellation is cooperative; after a
 successful load, the returned object belongs to the caller and needs disposal.
 Large stroke and text LOD preparations use a module worker when available,
@@ -1167,6 +1174,11 @@ no GPU name or memory information needs to be provided by the user.
 
 Eligibility is conservative: packed binary images, transparency, small or thin
 images, and sampled sharp edges or text-like detail avoid block compression.
+The explicit `compressScans` experiment permits sharp opaque scanned content to
+use lossy blocks and emits a fidelity diagnostic. Packed monochrome stays on its
+compact/packed path. Parse-time derivatives set a bounded minimum display tier
+when their texture format is supported, so all scan pages can remain resident
+together without regenerating their display data at the initial upload.
 Pixel assessment uses the image contents rather than assuming a PDF codec is
 photographic. This heuristic is not a guarantee that every detail is detected.
 Packed binary display tiers also participate in the automatic resolution budget.

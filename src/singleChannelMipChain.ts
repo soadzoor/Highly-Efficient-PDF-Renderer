@@ -20,8 +20,9 @@ export function buildSingleChannelUint8MipChain(
   return finishRasterSteps(singleChannelMipSteps(source, width, height));
 }
 
-export function buildSingleChannelUint8MipChainAsync(source: Uint8Array, width: number, height: number): Promise<SingleChannelUint8MipLevel[]> {
-  return finishRasterStepsAsync(singleChannelMipSteps(source, width, height));
+export function buildSingleChannelUint8MipChainAsync(source: Uint8Array, width: number, height: number,
+  signal?: AbortSignal): Promise<SingleChannelUint8MipLevel[]> {
+  return finishRasterStepsAsync(singleChannelMipSteps(source, width, height), signal);
 }
 
 function* singleChannelMipSteps(source: Uint8Array, width: number, height: number): Generator<void, SingleChannelUint8MipLevel[]> {

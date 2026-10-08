@@ -16,6 +16,8 @@ try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { buildPackedMonochromeMipAtlas, expandMonochromeRaster, monochromeRasterTile } = await import("../src/monochromeRaster.ts");
   const { planRasterTiles } = await import("../src/rasterTiles.ts");
+  const { buildPreparedRasterPixels } = await import("../src/rasterPreparationCore.ts");
+  const { RasterResolutionPlanner } = await import("../src/rasterResolution.ts");
   const create = (limit = 2048) => {
     const device = makeDevice(limit);
     const renderer = new WebGpuFloorplanRenderer({}, device, { configure() {}, unconfigure() {} }, "rgba8unorm");
@@ -158,6 +160,32 @@ try {
     assert.throws(() => renderer.configureRasterLayers(sceneWith(packedLayer(256,256))), /synthetic/);
     assert(device.textures.slice(offset).every(texture => texture.destroyed && texture.destroyCalls === 1));
     renderer.dispose();
+  }
+  {
+    const layer = packedLayer(512,512);
+    layer.monochrome.data.fill(255);
+    layer.gpuPreparation = buildPreparedRasterPixels(layer,planRasterTiles(256,256,2048));
+    const compact = layer.gpuPreparation.compactAtlases[0]; assert(compact);
+    const { renderer,device } = create(), scene = sceneWith(layer);
+    const collected = renderer.getSceneRasterLayers(scene);
+    assert.equal(collected[0].gpuPreparation,layer.gpuPreparation,"native WebGPU source collection retains stored preparation");
+    assert.equal(renderer.prepareRasterSource(collected[0]).gpuPreparation,layer.gpuPreparation);
+    renderer.rasterResolutionPlanner = new RasterResolutionPlanner();
+    const createDataTexture = renderer.createRgba8DataTexture;
+    let compactUploads = 0;
+    renderer.createRgba8DataTexture = function(width,height,data) {
+      compactUploads++; assert.equal(data,compact.data,
+        "native WebGPU submits the stored compact atlas buffer without repeating pixel or mip preparation");
+      return createDataTexture.call(this,width,height,data);
+    };
+    renderer.scene = scene; renderer.configureRasterLayers(scene);
+    const resource = renderer.rasterLayerResources[0];
+    assert.equal(compactUploads,1); assert.equal(resource.rasterPlan.width,256);
+    assert.equal(resource.coverageTexture,resource.texture);
+    const uploaded = unpad(device.uploads.find(value=>value.destination.texture===resource.texture),4);
+    assert.deepEqual(uploaded.subarray(0,compact.data.length),compact.data);
+    assert(uploaded.subarray(compact.data.length).every(value=>value===0),"texture padding preserves the stored atlas bytes");
+    renderer.dispose(); assert.equal(resource.texture.destroyCalls,1);
   }
   console.log("WebGPU packed monochrome: byte uploads, coverage mips, premultiplied colors, lazy sources, tiles, legacy detection, limits and cleanup passed.");
 } finally {

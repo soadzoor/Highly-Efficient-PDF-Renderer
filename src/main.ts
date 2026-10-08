@@ -17,6 +17,7 @@ import { waitForLoad, yieldAfterPaint } from "./loadCancellation";
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import {
   composeVectorScenesInGrid,
+  extractPdfPageScenes,
   type Bounds,
   type VectorExtractOptions,
   type VectorScene
@@ -123,6 +124,7 @@ const textSearchCaseButton = document.querySelector<HTMLButtonElement>("#text-se
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
 const pageStreamingCheckbox = document.querySelector<HTMLInputElement>("#page-streaming-checkbox");
+const compressScansCheckbox = document.querySelector<HTMLInputElement>("#compress-scans-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 
 if (
@@ -173,6 +175,7 @@ if (
   !textSelectionCheckbox ||
   !ocrTextCheckbox ||
   !pageStreamingCheckbox ||
+  !compressScansCheckbox ||
   !drawingSelectionContainer
 ) {
   throw new Error("Required UI elements are missing from index.html.");
@@ -322,6 +325,7 @@ textSelectionCheckbox.addEventListener("change", () => {
 textSelectionCheckbox.disabled = false;
 ocrTextCheckbox.addEventListener("change", () => { void reloadPdfViewingOptions(); });
 pageStreamingCheckbox.addEventListener("change", () => { void reloadPdfViewingOptions(); });
+compressScansCheckbox.addEventListener("change", () => { void reloadPdfViewingOptions(); });
 let annotationInteraction: AnnotationInteractionController | undefined;
 const drawingSelection = createDrawingSelectionControls({
   container: drawingSelectionContainer,
@@ -602,6 +606,7 @@ let lastLoadedSource: LoadedSource | null = null;
 let lastLoadedPdfPassword: string | undefined;
 let loadedOcrTextOnly = false;
 let loadedPageStreaming = false;
+let loadedCompressScans = false;
 let lastParsedSceneLabel: string | null = null;
 let captureProfiler: RenderPerformanceProfiler | null = null;
 let captureContext: Record<string, unknown> | null = null;
@@ -1141,7 +1146,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
   }
   const loadStart = performance.now();
   const extractionOptions = getExtractionOptions();
-  const streaming = pageStreamingCheckbox!.checked;
+  const streaming = pageStreamingCheckbox!.checked && !extractionOptions.compressScans;
   const pageSceneOptionsKey = buildPdfPageCacheKey();
   const cachedPageScenes = getCachedPdfPageScenes(options.source, pageSceneOptionsKey);
   const progress = createLoadProgressReporter((payload) => {
@@ -1174,20 +1179,24 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       setStatus(
         `Parsing ${label}... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
-      const candidate = await openPdfPageDemand(buffer, { ...extractionOptions, password: options.password,
-        onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback() },
-        scheduleDemandPdfUpdate, options.signal);
       let pageScenes: VectorScene[];
-      if (streaming && candidate.pageCount > 16) {
-        demandLoader = candidate;
-        pageScenes = candidate.displayPageScenes;
+      const parseOptions = { ...extractionOptions, password: options.password,
+        onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback() };
+      if (extractionOptions.compressScans) {
+        pageScenes = await extractPdfPageScenes(buffer, parseOptions, options.signal, "transfer");
       } else {
-        try {
-          await candidate.loadInitialOverviews(options.signal, !streaming);
+        const candidate = await openPdfPageDemand(buffer, parseOptions, scheduleDemandPdfUpdate, options.signal);
+        if (streaming && candidate.pageCount > 16) {
+          demandLoader = candidate;
           pageScenes = candidate.displayPageScenes;
-          if (candidate.requiresPageDemand) demandLoader = candidate;
-          else await candidate.close();
-        } catch (error) { await candidate.close(); throw error; }
+        } else {
+          try {
+            await candidate.loadInitialOverviews(options.signal, !streaming);
+            pageScenes = candidate.displayPageScenes;
+            if (candidate.requiresPageDemand) demandLoader = candidate;
+            else await candidate.close();
+          } catch (error) { await candidate.close(); throw error; }
+        }
       }
       parseMs = performance.now() - parseStart;
 
@@ -1260,7 +1269,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
     lastParsedScene = scene;
     lastParsedSceneLabel = label;
-    commitLoadedSource(options, extractionOptions.ocrTextOnly === true, streaming);
+    commitLoadedSource(options, extractionOptions.ocrTextOnly === true, streaming, extractionOptions.compressScans === true);
     const previousPageLoader = activePdfPageLoader;
     activePdfPageLoader = demandLoader;
     activePdfPageLoader?.setPerformanceListener((name, ms) => renderer.recordPerformanceTransition?.(name, ms));
@@ -1400,7 +1409,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
   }
 }
 
-function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, streaming = false): void {
+function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, streaming = false, compressScans = false): void {
   lastLoadedSource = options.source;
   lastLoadedPdfPassword = options.source.kind === "pdf" ? options.password : undefined;
   loadedOcrTextOnly = options.source.kind === "pdf" && ocrTextOnly;
@@ -1408,7 +1417,10 @@ function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, stream
   ocrTextCheckbox!.disabled = options.source.kind !== "pdf";
   loadedPageStreaming = options.source.kind === "pdf" && streaming;
   pageStreamingCheckbox!.checked = loadedPageStreaming;
-  pageStreamingCheckbox!.disabled = options.source.kind !== "pdf";
+  loadedCompressScans = options.source.kind === "pdf" && compressScans;
+  compressScansCheckbox!.checked = loadedCompressScans;
+  compressScansCheckbox!.disabled = options.source.kind !== "pdf";
+  pageStreamingCheckbox!.disabled = options.source.kind !== "pdf" || loadedCompressScans;
   lastDownloadablePdf = options.downloadablePdf;
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
 }
@@ -1440,13 +1452,15 @@ function uploadSceneWithRollback(target: RendererApi, scene: VectorScene, preser
 function getExtractionOptions(): VectorExtractOptions {
   return {
     ocrTextOnly: ocrTextCheckbox!.checked,
+    compressScans: compressScansCheckbox!.checked && !ocrTextCheckbox!.checked,
     enableSegmentMerge: true,
     enableInvisibleCull: true
   };
 }
 
 function buildPdfPageCacheKey(): string {
-  return `merge:1|cull:1|ocr:${ocrTextCheckbox!.checked ? 1 : 0}|stream:${pageStreamingCheckbox!.checked ? 1 : 0}`;
+  const options = getExtractionOptions();
+  return `merge:1|cull:1|ocr:${options.ocrTextOnly ? 1 : 0}|stream:${pageStreamingCheckbox!.checked && !options.compressScans ? 1 : 0}|compress:${options.compressScans ? 1 : 0}`;
 }
 
 async function reloadPdfViewingOptions(): Promise<void> {
@@ -1456,6 +1470,7 @@ async function reloadPdfViewingOptions(): Promise<void> {
   const sourceLoadToken = beginSourceLoad();
   ocrTextCheckbox!.disabled = true;
   pageStreamingCheckbox!.disabled = true;
+  compressScansCheckbox!.disabled = true;
   try {
     await loadPdfBuffer(createParseBuffer(source.bytes), source.label, {
       source, downloadablePdf: lastDownloadablePdf, signal: sourceLoadController!.signal,
@@ -1471,7 +1486,9 @@ async function reloadPdfViewingOptions(): Promise<void> {
       ocrTextCheckbox!.checked = loadedOcrTextOnly;
       ocrTextCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
       pageStreamingCheckbox!.checked = loadedPageStreaming;
-      pageStreamingCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
+      pageStreamingCheckbox!.disabled = lastLoadedSource?.kind !== "pdf" || loadedCompressScans;
+      compressScansCheckbox!.checked = loadedCompressScans;
+      compressScansCheckbox!.disabled = lastLoadedSource?.kind !== "pdf";
     }
   }
 }
@@ -1624,7 +1641,8 @@ function finishSceneLoad(token: number): void {
 function updateBackendSelectDisabledState(): void {
   ocrTextCheckbox!.disabled = pendingSourceLoadCount > 0 || activeSceneLoadToken !== null ||
     activeHepExportController !== null || lastLoadedSource?.kind === "hep";
-  pageStreamingCheckbox!.disabled = ocrTextCheckbox!.disabled;
+  compressScansCheckbox!.disabled = ocrTextCheckbox!.disabled;
+  pageStreamingCheckbox!.disabled = ocrTextCheckbox!.disabled || loadedCompressScans;
   backendSelectElement.disabled =
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||

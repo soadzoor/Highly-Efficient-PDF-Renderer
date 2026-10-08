@@ -82,6 +82,7 @@ const touchRotateCheckbox = document.querySelector<HTMLInputElement>("#touch-rot
 const textSelectionCheckbox = document.querySelector<HTMLInputElement>("#text-selection-checkbox");
 const ocrTextCheckbox = document.querySelector<HTMLInputElement>("#ocr-text-checkbox");
 const pageStreamingCheckbox = document.querySelector<HTMLInputElement>("#page-streaming-checkbox");
+const compressScansCheckbox = document.querySelector<HTMLInputElement>("#compress-scans-checkbox");
 const drawingSelectionContainer = document.querySelector<HTMLDivElement>("#drawing-selection");
 const pdfLayersContainer = document.querySelector<HTMLDivElement>("#pdf-layers");
 const pdfAnnotationsContainer = document.querySelector<HTMLDivElement>("#pdf-annotations");
@@ -137,6 +138,7 @@ if (
   !textSelectionCheckbox ||
   !ocrTextCheckbox ||
   !pageStreamingCheckbox ||
+  !compressScansCheckbox ||
   !drawingSelectionContainer ||
   !pdfLayersContainer ||
   !pdfAnnotationsContainer ||
@@ -189,6 +191,7 @@ const touchRotateCheckboxElement = touchRotateCheckbox;
 const textSelectionCheckboxElement = textSelectionCheckbox;
 const ocrTextCheckboxElement = ocrTextCheckbox;
 const pageStreamingCheckboxElement = pageStreamingCheckbox;
+const compressScansCheckboxElement = compressScansCheckbox;
 const touchRotateRowElement = touchRotateRow;
 const pageBackgroundColorInputElement = pageBackgroundColorInput;
 const pageBackgroundOpacitySliderElement = pageBackgroundOpacitySlider;
@@ -824,6 +827,10 @@ pageStreamingCheckboxElement.addEventListener("change", () => {
   if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
 }, { signal: lifetimeSignal });
 
+compressScansCheckboxElement.addEventListener("change", () => {
+  if (currentPdfObject?.sourceKind === "pdf") void reloadSourceWithBackend(readBackendMode(), true);
+}, { signal: lifetimeSignal });
+
 for (const button of pageLayoutButtons) {
   button.addEventListener("click", () => {
     void setPageLayout(readPageLayout(button.dataset.pageLayout));
@@ -1377,12 +1384,14 @@ function disposeExample(): void {
   renderer.dispose();
 }
 
-function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> & { ocrTextOnly: boolean; pageLoading: "all" | "auto" } {
+function readThreeObjectOptions(): Omit<HeprThreeObjectOptions, "rendererType"> & { ocrTextOnly: boolean; compressScans: boolean; pageLoading: "all" | "auto" | "eager" } {
   const pageBackground = readPageBackgroundColor();
   const vectorOverride = readVectorOverrideColor();
   return {
     ocrTextOnly: ocrTextCheckboxElement.checked,
-    pageLoading: pageStreamingCheckboxElement.checked ? "auto" : "all",
+    compressScans: compressScansCheckboxElement.checked && !ocrTextCheckboxElement.checked,
+    pageLoading: compressScansCheckboxElement.checked && !ocrTextCheckboxElement.checked ? "eager"
+      : pageStreamingCheckboxElement.checked ? "auto" : "all",
     threeColorCompositing: "display",
     vectorLod: readVectorLodMode(),
     textLod: readTextLodMode(),
@@ -1784,7 +1793,9 @@ function setPanelCollapsed(collapsed: boolean): void {
 function setLoadControlsEnabled(enabled: boolean): void {
   ocrTextCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
   if (enabled && currentPdfObject) ocrTextCheckboxElement.checked = currentPdfObject.sourceOptions?.ocrTextOnly === true;
-  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  compressScansCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep";
+  if (enabled && currentPdfObject) compressScansCheckboxElement.checked = currentPdfObject.sourceOptions?.compressScans === true;
+  pageStreamingCheckboxElement.disabled = !enabled || currentPdfObject?.sourceKind === "hep" || compressScansCheckboxElement.checked;
   if (enabled && currentPdfObject) pageStreamingCheckboxElement.checked = currentPdfObject.sourceOptions?.pageLoading === "auto";
   openButtonElement.disabled = !enabled;
   fileInputElement.disabled = !enabled;

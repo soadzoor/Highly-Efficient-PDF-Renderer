@@ -53,6 +53,68 @@ try {
     assert.equal(mock.listeners.size, 0);
   }
 
+  for (const format of ["bc7", "astc-4x4"]) {
+    const mock = mockGl(32), encoder = new WebGlRasterCompression(mock.gl);
+    mock.allowReadback = true;
+    const initial = mock.snapshot(), pixels = new Uint8Array(7 * 11 * 4).fill(255);
+    const encoded = encoder.encode(pixels, 7, 11, format, 768);
+    const layout = rasterCompressionMipLayout(7, 11, format);
+    const expected = new Uint8Array(estimateCompressedRasterBytes(7, 11, format));
+    let marker = 0;
+    for (const level of layout) {
+      for (let row = 0; row < level.blocksY; row++) {
+        const start = level.byteOffset + row * level.blocksX * 16;
+        expected.fill(++marker, start, start + level.blocksX * 16);
+      }
+    }
+    assert.deepEqual(encoded, expected, "parsing retains compact bytes in contiguous physical mip and block-row order");
+    assert.equal(mock.compressed.length, 0, "preparation needs no sampled compressed destination texture");
+    assert.equal(encoder.workspaceBytes, 768);
+    assert.equal(mock.readbacks.length, marker);
+    assert(mock.readbacks.every(read => read.byteLength <= read.bufferBytes && read.bufferBytes <= 768),
+      "each compressed readback is bounded by the shared band buffer");
+    assert.deepEqual(mock.snapshot(), initial, "byte encoding restores all renderer GL state");
+
+    const draws = mock.draws, reads = mock.reads.length, readbacks = mock.readbacks.length;
+    const compressed = encoder.uploadEncoded(encoded, 7, 11, format);
+    assert.equal(mock.draws, draws, "prepared bytes upload without executing the encoder again");
+    assert.equal(mock.reads.length, reads);
+    assert.equal(mock.readbacks.length, readbacks);
+    assert.deepEqual(compressed.uvScale, [7 / 8, 11 / 12]);
+    assert.equal(compressed.estimatedBytes, encoded.byteLength);
+    assert.deepEqual(mock.compressed.map(call => call.slice(1, 7)), layout.map((level, mip) =>
+      [mip, 0, 0, level.width, level.height, format === "bc7" ? 0x8e8c : 0x93b0]));
+    assert.deepEqual(mock.compressed.map(call => Array.from(call[7])), layout.map(level =>
+      Array.from(encoded.subarray(level.byteOffset, level.byteOffset + level.byteLength))),
+    "every uploaded mip contains precisely the saved bytes for that level");
+    assert.deepEqual(mock.snapshot(), initial, "saved-byte upload preserves renderer GL state");
+
+    const allocations = mock.allocations;
+    for (const invalid of [encoded.subarray(1), new Uint8Array(encoded.byteLength + 1)]) {
+      assert.throws(() => encoder.uploadEncoded(invalid, 7, 11, format), RangeError);
+    }
+    assert.throws(() => encoder.uploadEncoded(encoded, 0, 11, format));
+    assert.throws(() => encoder.uploadEncoded(encoded, 33, 11, format));
+    assert.equal(mock.allocations, allocations, "invalid saved bytes or dimensions fail before GPU allocation");
+    assert(encoder.capabilities[format === "bc7" ? "bc7" : "astc4x4"], "invalid cache input cannot disable supported compression");
+    mock.gl.deleteTexture(compressed.texture); encoder.dispose();
+    assert.equal(mock.alive.size, 0);
+  }
+
+  for (const abortDuringRead of [false, true]) {
+    const mock = mockGl(32), encoder = new WebGlRasterCompression(mock.gl), abort = new AbortController();
+    mock.allowReadback = true;
+    const initial = mock.snapshot();
+    if (abortDuringRead) mock.onRead = () => abort.abort(); else abort.abort();
+    assert.throws(() => encoder.encode(new Uint8Array(8 * 12 * 4).fill(255), 8, 12, "bc7", 768, abort.signal),
+      error => error.code === "aborted");
+    assert.deepEqual(mock.snapshot(), initial, "cancelled preparation restores caller GL state");
+    assert.equal(encoder.workspaceBytes, 0);
+    assert.equal(encoder.capabilities.bc7, true, "user cancellation cannot mark an otherwise usable format as failed");
+    if (!abortDuringRead) assert.equal(mock.allocations, 0, "already-cancelled parsing allocates no encoder resources");
+    encoder.dispose(); assert.equal(mock.alive.size, 0);
+  }
+
   for (const fail of ["shader", "framebuffer", "buffer", "compressed"]) {
     const mock = mockGl(32); mock.fail = fail;
     const encoder = new WebGlRasterCompression(mock.gl), initial = mock.snapshot();
@@ -120,7 +182,7 @@ try {
   assert(monochromeRasterFragmentGlsl(RASTER_FRAGMENT_SHADER_SOURCE).includes("if (uRasterOpaque > 0.5) color.a = 1.0"),
     "opaque compressed pixels correct BC7 endpoint alpha before scene opacity is applied");
   assert(!RASTER_FRAGMENT_SHADER_SOURCE.includes("uRasterOpaque"), "shared Three/page-background shaders keep their defaults");
-  console.log("WebGL GPU block compression: fixed bands, integer FBO/PBO uploads, padded mips, UVs, state, failures, context restoration, residency and budget fallback passed.");
+  console.log("WebGL GPU block compression: fixed bands, bounded parser readback, prepared mip uploads, cancellation, UVs, state, failures, context restoration, residency and budget fallback passed.");
 
   function mockGl(limit, support = true) {
     const alive = new Set(), listeners = new Set(), stores = new Map(), bindings = new Map(), enabled = new Set(["BLEND", "SCISSOR_TEST", "DITHER"]);
@@ -132,8 +194,8 @@ try {
       program: {}, vao: {}, draw: {}, read: {}, sampler: {}, error: 0 };
     bindings.set(1000, {}); stores.set("PIXEL_PACK_BUFFER", {}); stores.set("PIXEL_UNPACK_BUFFER", {});
     let id = 0, boundBuffer = null;
-    const mock = { alive, listeners, compressed: [], reads: [], storage: [], uniforms: [], bandPixels: [], rgbaUploads: [], allocations: 0,
-      astc: support, contextLost: false, fail: "",
+    const mock = { alive, listeners, compressed: [], reads: [], readbacks: [], storage: [], uniforms: [], bandPixels: [], rgbaUploads: [], allocations: 0,
+      astc: support, contextLost: false, fail: "", allowReadback: false, onRead: null, draws: 0,
       snapshot: () => ({ ...state, viewport: [...state.viewport], mask: [...state.mask], bindings: [...bindings], stores: [...stores], pixels: [...pixels], enabled: [...enabled].sort() }) };
     const gl = new Proxy({ TEXTURE0: 1000, NO_ERROR: 0, canvas: {
       addEventListener(_name, fn) { listeners.add(fn); }, removeEventListener(_name, fn) { listeners.delete(fn); }
@@ -185,9 +247,16 @@ try {
         if (name === "bindBuffer") { stores.set(args[0], args[1]); boundBuffer = args[1]; }
         if (name === "bufferData") boundBuffer.bytes = typeof args[1] === "number" ? args[1] : args[1].byteLength;
         if (name === "texSubImage2D") { assert.equal(stores.get("PIXEL_UNPACK_BUFFER"), null); mock.bandPixels.push(args.at(-1).slice()); }
-        if (name === "readPixels") { assert.equal(typeof args.at(-1), "number"); assert(stores.get("PIXEL_PACK_BUFFER")); mock.reads.push(args); }
+        if (name === "drawArrays") mock.draws++;
+        if (name === "readPixels") {
+          assert.equal(typeof args.at(-1), "number"); assert(stores.get("PIXEL_PACK_BUFFER"));
+          mock.reads.push(args); stores.get("PIXEL_PACK_BUFFER").marker = mock.reads.length;
+          mock.onRead?.();
+        }
         if (name === "compressedTexSubImage2D") {
-          assert.equal(stores.get("PIXEL_UNPACK_BUFFER"), stores.get("PIXEL_PACK_BUFFER"));
+          const fromBytes = args[7] instanceof Uint8Array;
+          if (fromBytes) assert.equal(stores.get("PIXEL_UNPACK_BUFFER"), null);
+          else assert.equal(stores.get("PIXEL_UNPACK_BUFFER"), stores.get("PIXEL_PACK_BUFFER"));
           const texture = bindings.get(state.active), storage = texture.storage;
           const [, level, x, y, width, height, format] = args;
           const mipWidth = Math.max(1, storage.width >> level), mipHeight = Math.max(1, storage.height >> level);
@@ -202,11 +271,19 @@ try {
           }
           assert.equal(y, texture.uploadedRows.get(level) ?? 0, "bands upload in contiguous row order");
           texture.uploadedRows.set(level, y + height);
-          assert.equal(args[7], Math.ceil(args[4] / 4) * Math.ceil(args[5] / 4) * 16);
+          assert.equal(fromBytes ? args[7].byteLength : args[7], Math.ceil(args[4] / 4) * Math.ceil(args[5] / 4) * 16);
           mock.compressed.push(args); if (mock.fail === "compressed") state.error = "INVALID_OPERATION";
         }
         if (name === "texImage2D") mock.rgbaUploads.push({ width: args[3], height: args[4] });
-        if (name === "getBufferSubData") throw new Error("JS compressed-byte readback is prohibited");
+        if (name === "getBufferSubData") {
+          if (!mock.allowReadback) throw new Error("JS compressed-byte readback is prohibited during renderer upload");
+          const buffer = stores.get(args[0]);
+          assert.equal(args[1], 0);
+          assert(args[2] instanceof Uint8Array);
+          assert(args[2].byteLength <= buffer.bytes);
+          args[2].fill(buffer.marker);
+          mock.readbacks.push({ byteLength: args[2].byteLength, bufferBytes: buffer.bytes });
+        }
       };
     } });
     mock.gl = gl; return mock;

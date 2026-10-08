@@ -53,6 +53,8 @@ export interface RasterMemorySource {
   readonly monochrome?: unknown;
   /** Content assessment opts an ordinary opaque image into optional GPU compression. */
   readonly compressionEligible?: boolean;
+  /** Viewing derivatives can prefer compression even when their RGBA tier fits. */
+  readonly preferCompression?: boolean;
   /** Additional resident copies, such as canonical textures retained beside a batch atlas. */
   readonly allocationCopies?: number;
 }
@@ -60,7 +62,7 @@ export interface RasterMemorySource {
 export interface SceneRasterMemoryPlan {
   /** Index-aligned with the source list, retaining each image's unit-square placement. */
   readonly plans: RasterTilePlan[];
-  /** Selected only when ordinary RGBA demand exceeds the effective resident target. */
+  /** Selected for preferred derivatives or when ordinary RGBA demand exceeds the resident target. */
   readonly compressionFormats: (RasterCompressionFormat | null)[];
   readonly budget: AutomaticRasterMemoryBudget;
   /** Effective target after internal staging/other resident allocations are reserved. */
@@ -166,13 +168,14 @@ export function planSceneRasterMemory(
   ): SceneRasterMemoryPlan =>
     ({ plans, compressionFormats, budget, availableBytes: available, unscaledBytes, estimatedBytes, protectedBytes,
       resolutionScale, overBudget: estimatedBytes > available });
-  if (unscaledBytes <= available || packed.every(Boolean)) {
+  if ((unscaledBytes <= available && !sources.some(source => source.preferCompression)) || packed.every(Boolean)) {
     return result(originalPlans, unscaledBytes, 1, sources.map(() => null));
   }
 
   const price = (plans: RasterTilePlan[]) => {
     const compressionFormats = plans.map((plan, index): RasterCompressionFormat | null => {
-      if (!compressionFormat || packed[index] || sources[index].monochrome || !sources[index].compressionEligible) return null;
+      if (!compressionFormat || packed[index] || sources[index].monochrome || !sources[index].compressionEligible ||
+          (unscaledBytes <= available && !sources[index].preferCompression)) return null;
       // Block padding and terminal mips can outweigh savings for a tiny reduced image.
       return estimateRasterTilePlanBytes(plan, false, compressionFormat) < estimateRasterTilePlanBytes(plan, false)
         ? compressionFormat : null;

@@ -1,6 +1,15 @@
 import { throwIfAborted } from "./pdf/nativeTypes";
+import type { RasterTilePlan } from "./rasterTiles";
 
 export type RasterCompressionFormat = "bc7" | "astc-4x4";
+
+/** Transferable viewing derivatives; canonical image pixels remain available for fallback and export. */
+export interface PreparedRasterCompression {
+  readonly format: RasterCompressionFormat;
+  readonly plan: RasterTilePlan;
+  /** Concatenated physical mip blocks for each tile, in rasterCompressionMipLayout order. */
+  readonly tiles: Uint8Array[];
+}
 
 export interface RasterCompressionCapabilities {
   readonly bc7: boolean;
@@ -45,10 +54,12 @@ export interface RasterCompressionSource {
   readonly stencilMask?: boolean;
   readonly exactPixels?: boolean;
   readonly containsText?: boolean;
+  /** Explicitly permits lossy display compression of an opaque scanned page. */
+  readonly compressionHint?: "scan";
 }
 
 export type RasterCompressionEligibilityReason = "smooth-color" | "monochrome" | "mask" | "exact-pixels" |
-  "text" | "small-image" | "thin-image" | "invalid-pixels" | "alpha" | "binary" | "detailed-content";
+  "text" | "small-image" | "thin-image" | "invalid-pixels" | "alpha" | "binary" | "detailed-content" | "scan";
 
 export interface RasterCompressionEligibility {
   readonly eligible: boolean;
@@ -161,7 +172,7 @@ export function* buildRasterCompressionMipChain(
 export function assessRasterCompression(source: RasterCompressionSource): RasterCompressionEligibility {
   const result = (reason: RasterCompressionEligibilityReason, opaque = false, sampledPixels = 0,
     edgeFraction = 0, maxGradient = 0): RasterCompressionEligibility =>
-    ({ eligible: reason === "smooth-color", reason, opaque, sampledPixels, edgeFraction, maxGradient });
+    ({ eligible: reason === "smooth-color" || reason === "scan", reason, opaque, sampledPixels, edgeFraction, maxGradient });
   // Inspect metadata first: an enumerable packed-image RGBA getter must stay untouched.
   if (source.monochrome) return result("monochrome");
   if (source.imageMask || source.stencilMask) return result("mask");
@@ -214,7 +225,8 @@ export function assessRasterCompression(source: RasterCompressionSource): Raster
     }
   }
   const edgeFraction = gradients ? sharpEdges / gradients : 0;
-  return result(maxGradient >= 64 || edgeFraction > 0.025 ? "detailed-content" : "smooth-color",
+  return result(maxGradient >= 64 || edgeFraction > 0.025
+    ? source.compressionHint === "scan" ? "scan" : "detailed-content" : "smooth-color",
     true, sampledPixels, edgeFraction, maxGradient);
 }
 

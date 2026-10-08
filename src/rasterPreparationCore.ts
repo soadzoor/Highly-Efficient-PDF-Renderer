@@ -31,35 +31,46 @@ export function buildPreparedRasterPixels(source: RasterTileSource, plan: Raster
   return { plan, pixels, ...(mono ? { coverageAtlases, compactAtlases } : {}) };
 }
 
-export async function buildPreparedRasterPixelsAsync(source: RasterTileSource, plan: RasterTilePlan): Promise<PreparedRasterPixels> {
+export async function buildPreparedRasterPixelsAsync(source: RasterTileSource, plan: RasterTilePlan,
+  signal?: AbortSignal): Promise<PreparedRasterPixels> {
+  signal?.throwIfAborted();
   const mono = source.monochrome;
-  if (!mono) return { plan, pixels: await rasterTilePixelsAsync(source, plan) };
+  if (!mono) {
+    const pixels = await rasterTilePixelsAsync(source, plan, signal);
+    signal?.throwIfAborted();
+    return { plan, pixels };
+  }
   const pixels: Uint8Array[] = [], monochromeTiles: MonochromeRaster[] = [], coverageAtlases: PackedMonochromeCoverageAtlas[] = [];
   const compactAtlases: (CompactMonochromeAtlas | undefined)[] = [];
   if (plan.width === source.width && plan.height === source.height) {
     for (const tile of plan.tiles) {
+      signal?.throwIfAborted();
       const bits = monochromeRasterTile(mono, source.width, source.height, tile);
       monochromeTiles.push(bits);
-      const atlas = await buildPackedMonochromeMipAtlasAsync(bits, tile.width, tile.height);
+      const atlas = await buildPackedMonochromeMipAtlasAsync(bits, tile.width, tile.height, signal);
       coverageAtlases.push(atlas);
-      compactAtlases.push(await buildCompactMonochromeAtlasAsync(bits, tile.width, tile.height, atlas));
+      compactAtlases.push(await buildCompactMonochromeAtlasAsync(bits, tile.width, tile.height, atlas, undefined, signal));
     }
+    signal?.throwIfAborted();
     return { plan, pixels, monochromeTiles, coverageAtlases, compactAtlases };
   }
-  const coverage = await resampleMonochromeCoverageAsync(mono, source.width, source.height, plan.width, plan.height);
+  const coverage = await resampleMonochromeCoverageAsync(mono, source.width, source.height, plan.width, plan.height, signal);
   for (const tile of plan.tiles) {
+    signal?.throwIfAborted();
     let data = coverage;
     if (tile.width !== plan.width || tile.height !== plan.height) {
       data = new Uint8Array(tile.width * tile.height);
       for (let y = 0; y < tile.height; y++) {
+        signal?.throwIfAborted();
         const start = (tile.y + y) * plan.width + tile.x;
         data.set(coverage.subarray(start, start + tile.width), y * tile.width);
       }
     }
     pixels.push(data);
-    const atlas = await buildPackedCoverageMipAtlasAsync(data, tile.width, tile.height);
+    const atlas = await buildPackedCoverageMipAtlasAsync(data, tile.width, tile.height, signal);
     coverageAtlases.push(atlas);
-    compactAtlases.push(await buildCompactMonochromeAtlasAsync(mono, tile.width, tile.height, atlas, data));
+    compactAtlases.push(await buildCompactMonochromeAtlasAsync(mono, tile.width, tile.height, atlas, data, signal));
   }
+  signal?.throwIfAborted();
   return { plan, pixels, coverageAtlases, compactAtlases };
 }
