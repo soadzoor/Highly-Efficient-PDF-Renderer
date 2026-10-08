@@ -1901,7 +1901,9 @@ async function downloadHep(): Promise<boolean> {
   textLodSelectElement.disabled = true;
   setLoadingProgress(true, "0.00% Preparing HEP export...");
   try {
-    const downloadOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal);
+    const needsCompleteScene = pdfObject.isPageDemandLoaded || Boolean(pdfObject.sourceOptions?.ocrTextOnly);
+    const downloadOptions = await promptForHepLod(pdfObject.sceneData, exportController.signal,
+      { offerScanEncodings: pdfObject.sourceKind === "pdf" && needsCompleteScene });
     if (!downloadOptions) return false;
     const { downloadBothScanEncodings, ...lodOptions } = downloadOptions;
     const scanOptions = downloadBothScanEncodings ? [
@@ -1910,7 +1912,6 @@ async function downloadHep(): Promise<boolean> {
     ] : [{ monochromeEncoding: lodOptions.monochromeEncoding }];
     let completedScanExports = 0;
     const exportWarnings: string[] = [];
-    const needsCompleteScene = pdfObject.isPageDemandLoaded || Boolean(pdfObject.sourceOptions?.ocrTextOnly);
     const scenePhaseEnd = needsCompleteScene ? 0.8 : 0;
     const updateExportProgress = (progress: PDFLoadProgress, start: number, end: number): void => {
       if (activeHepExportController !== exportController || currentPdfObject !== pdfObject) return;

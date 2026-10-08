@@ -1914,7 +1914,8 @@ async function downloadHep(): Promise<boolean> {
   setParsingLoader(true, "0.00% Preparing HEP export...");
 
   try {
-    const downloadOptions = await promptForHepLod(scene, exportController.signal);
+    const downloadOptions = await promptForHepLod(scene, exportController.signal,
+      { offerScanEncodings: source?.kind === "pdf" && needsCompleteScene });
     if (!downloadOptions) {
       if (activeHepExportController === exportController) {
         statusTextElement.textContent = previousStatusText;

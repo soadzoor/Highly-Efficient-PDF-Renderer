@@ -11,12 +11,15 @@ export interface HepDownloadOptions extends HepLodOptions,
 }
 
 /** Include available LODs and offer both lossless scan encodings; Escape cancels. */
-export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promise<HepDownloadOptions | null> {
+export function promptForHepLod(scene: VectorScene, signal?: AbortSignal,
+  options: { offerScanEncodings?: boolean } = {}): Promise<HepDownloadOptions | null> {
   if (signal?.aborted) return Promise.resolve(null);
   const cachedText = getCachedTextLod(scene);
   const vector = scene.segmentCount > 0;
   const text = cachedText ? cachedText.data !== null : shouldBuildTextLod(scene);
-  const scans = scene.rasterLayers.some(layer => Boolean(layer.monochrome));
+  // Paged views may contain OCR text, RGBA previews or empty scan slots rather than canonical packed pixels.
+  const scans = options.offerScanEncodings === true || scene.rasterLayers.some(layer =>
+    Boolean(layer.monochrome || layer.pageDemandSlot || layer.compressionHint === "scan"));
   if (!vector && !text && !scans) return Promise.resolve({});
   const dialog = document.createElement("dialog");
   dialog.className = "hep-lod-dialog";
@@ -36,7 +39,7 @@ export function promptForHepLod(scene: VectorScene, signal?: AbortSignal): Promi
   const scanEncoding = document.createElement("select");
   if (scans) {
     const description = document.createElement("p");
-    description.textContent = "Both scan formats preserve the same image quality. Faster opening stores decoded pixels; smaller files decode the original compressed scans when opened. Files larger than the original PDF still download with a warning.";
+    description.textContent = "Choose how monochrome scans are stored. Both formats preserve full image quality; other images use the same format in either file. Faster opening stores decoded pixels; smaller files reuse original compressed scans when available. Files larger than the original PDF still download with a warning.";
     const row = document.createElement("label");
     row.append(document.createTextNode("Scan export options"));
     scanEncoding.setAttribute("aria-label", "Scan export options");
