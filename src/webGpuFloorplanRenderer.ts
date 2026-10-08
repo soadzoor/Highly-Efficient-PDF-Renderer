@@ -16,7 +16,8 @@ import { RasterResourceCache } from "./rasterResourceCache";
 import type { SingleChannelUint8MipLevel } from "./singleChannelMipChain";
 import { automaticRasterMemoryBudget, estimateRasterTilePlanBytes, estimateRasterSourcePlanBytes, estimateRasterTextureBytes, rememberMonochromePlanBytes, planSceneRasterMemory, reportRasterMemoryBudget } from "./rasterMemoryBudget";
 import { RasterResolutionPlanner, type RasterResolutionView } from "./rasterResolution";
-import type { SceneUpdateOptions } from "./rendererTypes";
+import type { RendererApi, SceneUpdateOptions } from "./rendererTypes";
+import { deferRendererInitialization } from "./deferredRendererInitialization";
 import { assessRasterCompression, type PreparedRasterCompression, type RasterCompressionFormat } from "./rasterCompression";
 import { WebGpuRasterCompression } from "./webGpuRasterCompression";
 import { buildPackedMonochromeMipAtlas, detectMonochromeRaster, monochromeRasterTile, monochromeCoverageTilePixels, type MonochromeRaster } from "./monochromeRaster";
@@ -1962,6 +1963,38 @@ export class WebGpuFloorplanRenderer {
   }
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuFloorplanRenderer> {
+    const { device, presentationFormat } = await this.prepareDevice();
+    let context: any = null;
+    try {
+      context = canvas.getContext("webgpu");
+      if (!context) throw new Error("Failed to acquire a WebGPU canvas context.");
+      const renderer = new WebGpuFloorplanRenderer(canvas, device, context, presentationFormat);
+      await renderer.initializeRasterCompression();
+      return renderer;
+    } catch (error) {
+      try { releaseOwnedWebGpuDevice(device, context); } catch { /* Preserve initialization failure. */ }
+      throw error;
+    }
+  }
+
+  /** Internal Three fallback: prepare the device, compiling native pipelines only on first use. */
+  static async createDeferred(canvas: HTMLCanvasElement): Promise<RendererApi> {
+    const { device, presentationFormat } = await this.prepareDevice();
+    let context: any = null;
+    return deferRendererInitialization(canvas, this.prototype, () => {
+      context = canvas.getContext("webgpu");
+      if (!context) throw new Error("Failed to acquire a WebGPU canvas context.");
+      const renderer = new WebGpuFloorplanRenderer(canvas, device, context, presentationFormat);
+      // The first fallback frame uses bounded RGBA resources while the optional
+      // encoder compiles; the ordinary native factory still awaits the encoder.
+      void renderer.initializeRasterCompression(true).catch(error => {
+        console.warn("[HEPR] Optional native fallback raster compression unavailable.", error);
+      });
+      return renderer;
+    }, () => releaseOwnedWebGpuDevice(device, context));
+  }
+
+  private static async prepareDevice(): Promise<{ device: any; presentationFormat: string }> {
     const nav = navigator as Navigator & {
       gpu?: {
         requestAdapter: (options?: { powerPreference?: "low-power" | "high-performance" }) => Promise<any>;
@@ -2001,7 +2034,6 @@ export class WebGpuFloorplanRenderer {
         ...(requiredLimits ? { requiredLimits } : {})
       });
     }
-    let context: any = null;
     try {
       if (typeof device.addEventListener === "function") {
         device.addEventListener("uncapturederror", (event: any) => {
@@ -2009,31 +2041,32 @@ export class WebGpuFloorplanRenderer {
           console.warn("[WebGPU uncaptured error]", message);
         });
       }
-      context = canvas.getContext("webgpu");
-      if (!context) {
-        throw new Error("Failed to acquire a WebGPU canvas context.");
-      }
-
       const presentationFormat = nav.gpu.getPreferredCanvasFormat?.() ?? "bgra8unorm";
-      const renderer = new WebGpuFloorplanRenderer(canvas, device, context, presentationFormat);
-      renderer.rasterCompression = await WebGpuRasterCompression.create(device, automaticRasterMemoryBudget().bytes / 4);
-      renderer.rasterCompression?.setFailureListener(() => {
-        if (renderer.isDisposed || !renderer.scene || !renderer.rasterTextureResidency) return;
-        try {
-          renderer.configureRasterLayers(renderer.scene);
-          renderer.destroyVectorMinifyResources();
-          renderer.requestFrame();
-        } catch (error) { console.warn("[HEPR] Bounded RGBA raster recovery failed.", error); }
-      });
-      return renderer;
+      return { device, presentationFormat };
     } catch (error) {
       try {
-        releaseOwnedWebGpuDevice(device, context);
+        releaseOwnedWebGpuDevice(device, null);
       } catch {
         // Preserve the original initialization error.
       }
       throw error;
     }
+  }
+
+  private async initializeRasterCompression(refreshScene = false): Promise<void> {
+    const compression = await WebGpuRasterCompression.create(this.gpuDevice, automaticRasterMemoryBudget().bytes / 4);
+    if (this.isDisposed) { compression?.dispose(); return; }
+    this.rasterCompression = compression;
+    const refresh = (): void => {
+      if (this.isDisposed || !this.scene || !this.rasterTextureResidency) return;
+      try {
+        this.configureRasterLayers(this.scene);
+        this.destroyVectorMinifyResources();
+        this.requestFrame();
+      } catch (error) { console.warn("[HEPR] Bounded RGBA raster recovery failed.", error); }
+    };
+    compression?.setFailureListener(refresh);
+    if (refreshScene && compression) refresh();
   }
 
   setFrameListener(listener: FrameListener | null): void {

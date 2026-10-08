@@ -6,7 +6,7 @@ import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
 import {
   sceneStrokeRecords, splitStrokeTextures, type SplitStrokeTextures, type StrokeRecords, type StrokeTextureData
 } from "./strokeRecords";
-import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import * as THREE from "three";
@@ -56,6 +56,7 @@ interface CullingBounds {
 
 export class ThreeMaterialStrokeLayer {
   private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly releaseVectorClipTexture: () => void;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
   private readonly pageTransforms: ThreePageTransforms | undefined;
   private readonly solidColorOverrides = new Set<string>();
@@ -99,7 +100,6 @@ export class ThreeMaterialStrokeLayer {
   private useLocalToClip = false;
 
   constructor(scene: VectorScene, options: StrokeLayerOptions) {
-    this.vectorClipTexture = createThreeVectorClipTexture(scene);
     const records = options.strokeRecords ?? sceneStrokeRecords(scene);
     const segmentCount = Math.max(0, records.count | 0);
     this.segmentCount = segmentCount;
@@ -217,13 +217,21 @@ export class ThreeMaterialStrokeLayer {
     configureStraightAlphaBlending(material);
 
     bindRawPageTransform(material, pageBinding);
-    initializeThreeVectorClip(material, this.vectorClipTexture);
-    this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
-    this.orderedRuns = ThreeVectorDrawRuns.create(options.canonicalScene ?? scene, "stroke", this.mesh, "aSegmentIndex", options.drawPlan, options.strokeOrigins);
-    // Coverage in the original layout cannot prove redundancy after pages move.
-    if (this.pageTransforms) this.orderedRuns?.setStrokeRedundancyEnabled(false);
+    const clips = acquireThreeVectorClipTexture(scene);
+    this.vectorClipTexture = clips.texture;
+    this.releaseVectorClipTexture = clips.release;
+    try {
+      initializeThreeVectorClip(material, this.vectorClipTexture);
+      this.mesh = new THREE.Mesh(geometry, material);
+      this.mesh.frustumCulled = false;
+      this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_STROKE;
+      this.orderedRuns = ThreeVectorDrawRuns.create(options.canonicalScene ?? scene, "stroke", this.mesh, "aSegmentIndex", options.drawPlan, options.strokeOrigins);
+      // Coverage in the original layout cannot prove redundancy after pages move.
+      if (this.pageTransforms) this.orderedRuns?.setStrokeRedundancyEnabled(false);
+    } catch (error) {
+      clips.release();
+      throw error;
+    }
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -339,7 +347,7 @@ export class ThreeMaterialStrokeLayer {
 
   dispose(): void {
     this.orderedRuns?.dispose();
-    this.vectorClipTexture.dispose();
+    this.releaseVectorClipTexture();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.segmentTextureA.dispose();

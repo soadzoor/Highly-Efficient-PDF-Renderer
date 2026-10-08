@@ -4,7 +4,7 @@ import type { OrderedTextLodSelection } from "./orderedTextLod";
 import type { OptionalContentSnapshot } from "./optionalContent";
 import type { PrimitiveColorUpdate } from "./primitiveAppearance";
 import { patchPrimitiveColorTexture } from "./threePrimitiveColors";
-import { createThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
+import { acquireThreeVectorClipTexture, initializeThreeVectorClip } from "./threeVectorClips";
 import { ThreeVectorDrawRuns } from "./threeVectorDrawRuns";
 import type { ThreeVectorDrawPlan } from "./threeVectorDrawPlan";
 import * as THREE from "three";
@@ -62,6 +62,7 @@ interface CullingBounds {
 
 export class ThreeMaterialTextLayer {
   private readonly vectorClipTexture: THREE.DataTexture;
+  private readonly releaseVectorClipTexture: () => void;
   private readonly orderedRuns: ThreeVectorDrawRuns | null;
   readonly mesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.Material>;
 
@@ -109,7 +110,6 @@ export class ThreeMaterialTextLayer {
   private renderedTextInstanceCount: number;
 
   constructor(scene: VectorScene, options: TextLayerOptions) {
-    this.vectorClipTexture = createThreeVectorClipTexture(scene);
     const pageBinding = options.pageTransforms?.instances("text", scene);
     const materialBackend = options.materialBackend ?? "webgl";
     const textInstanceCount = Math.max(0, scene.textInstanceCount | 0);
@@ -300,11 +300,19 @@ export class ThreeMaterialTextLayer {
     configureStraightAlphaBlending(material);
 
     bindRawPageTransform(material, pageBinding);
-    initializeThreeVectorClip(material, this.vectorClipTexture);
-    this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
-    this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex", options.drawPlan);
+    const clips = acquireThreeVectorClipTexture(scene);
+    this.vectorClipTexture = clips.texture;
+    this.releaseVectorClipTexture = clips.release;
+    try {
+      initializeThreeVectorClip(material, this.vectorClipTexture);
+      this.mesh = new THREE.Mesh(geometry, material);
+      this.mesh.frustumCulled = false;
+      this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
+      this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex", options.drawPlan);
+    } catch (error) {
+      clips.release();
+      throw error;
+    }
   }
 
   setOptionalContentVisibility(snapshot: OptionalContentSnapshot): void {
@@ -602,7 +610,7 @@ export class ThreeMaterialTextLayer {
 
   dispose(): void {
     this.orderedRuns?.dispose();
-    this.vectorClipTexture.dispose();
+    this.releaseVectorClipTexture();
     this.mesh.geometry.dispose();
     this.mesh.material.dispose();
     this.textInstanceTextureA.dispose();

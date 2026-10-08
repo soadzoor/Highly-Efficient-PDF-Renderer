@@ -4230,6 +4230,7 @@ async function createThreePdfContent(
   previousRasterLayer?: ThreeMaterialRasterLayer
 ): Promise<ThreePdfContent> {
   signal?.throwIfAborted();
+  yieldControl ??= createLoadYielder(signal);
   const rendererType = options.rendererType ?? "webgl";
   const webGpu = rendererType === "webgpu"
     ? await waitForLoad(import("./threeWebGpuBackend"), signal) : undefined;
@@ -4246,12 +4247,15 @@ async function createThreePdfContent(
 
   const rendererConfig = normalizeRendererConfig(options);
   const initialFitPaddingPixels = DEFAULT_FIT_PADDING_PIXELS;
-  const drawPlan = loadedScene.scene.drawRuns ? new ThreeVectorDrawPlan(loadedScene.scene, pageTransforms?.runPages) : undefined;
+  // The first frame supplies the actual camera scale before updating layers.
+  // Avoid creating canonical meshes that that schedule would immediately replace.
+  const drawPlan = loadedScene.scene.drawRuns ? new ThreeVectorDrawPlan(loadedScene.scene, pageTransforms?.runPages, true) : undefined;
   const useVectorLodStrokeLayer = shouldUseVectorStrokeLod(
       rendererConfig.vectorLodMode,
       rendererType,
       loadedScene.scene.segmentCount
     );
+  await yieldControl();
   const nativeRenderer: RendererApi = reuseRenderer ?? (pageRenderer ? pageRenderer(renderCanvas) : await waitForLoad(
     createNativeRenderer(rendererType, renderCanvas).then<RendererApi>((renderer) => {
       if (signal?.aborted) {
@@ -4451,10 +4455,12 @@ async function createNativeRenderer(
 ): Promise<RendererApi> {
   if (rendererType === "webgpu") {
     const { WebGpuFloorplanRenderer } = await import("./webGpuFloorplanRenderer");
-    return WebGpuFloorplanRenderer.create(renderCanvas);
+    return WebGpuFloorplanRenderer.createDeferred(renderCanvas);
   }
   const { WebGlFloorplanRenderer } = await import("./webGlFloorplanRenderer");
-  return new WebGlFloorplanRenderer(renderCanvas);
+  const { deferRendererInitialization } = await import("./deferredRendererInitialization");
+  return deferRendererInitialization(renderCanvas, WebGlFloorplanRenderer.prototype,
+    () => new WebGlFloorplanRenderer(renderCanvas));
 }
 
 /**
