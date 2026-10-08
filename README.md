@@ -164,6 +164,11 @@ The CLI requires Node.js 22.15+, 23.5+, or 24+. It writes
 `<name>-parsed-data.hep` and supports the same conversion flags as the repository's
 `node PDFtoHEP.js` command. After installing the package in a project, use
 `npx -- pdf-to-hep --help` to see all options.
+Each run ends with attempted, successful, failed and skipped counts, total original
+PDF and generated HEP sizes for successful conversions, and warnings and failures
+grouped by PDF. The timing report includes per-file sizes. Existing-file skips
+are excluded from the size comparison; `--force --keep-unchanged` conversions
+count as successful even when the existing HEP is kept.
 Conversion requires `@napi-rs/canvas`, which npm installs as an optional dependency
 by default. If its installation fails or optional dependencies were omitted,
 install both packages with `npm install @soadzoor/hepr @napi-rs/canvas` and run
