@@ -14,7 +14,7 @@ import {
   unlink
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { availableParallelism } from "node:os";
+import { availableParallelism, freemem } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
@@ -31,6 +31,8 @@ const PDF_TO_HEP_WORKER_TOKEN_ENV = "HEPR_PDF_TO_HEP_WORKER_TOKEN";
 // Passwords reach worker processes through their environment, never argv.
 export const PDF_PASSWORD_ENV = "HEPR_PDF_PASSWORD";
 const DEFAULT_PDF_TO_HEP_WORKER_HEAP_MB = 12_288;
+const PDF_TO_HEP_WORKER_NATIVE_RESERVE_MB = 1_024;
+const PDF_TO_HEP_MEMORY_BUDGET_FRACTION = 0.75;
 const PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE = 3;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RASTER_FALLBACK_DIAGNOSTIC_CODES = new Set([
@@ -48,7 +50,8 @@ Options:
       new conversion would only change its generatedAt timestamp.
   -h, --help   Show this help text.
   --output-dir=<directory>  Write all HEP files into this directory.
-  --workers=<count>  Maximum simultaneous conversions (default: available CPU threads).
+  --workers=<count>  Maximum simultaneous conversions (default: limited by available
+      memory and CPU threads). Overrides the automatic memory-based limit.
       Use --workers=1 for serial conversion or a lower count to reduce memory use.
   --without-vector-lod  Omit vector LOD geometry (included by default).
   --without-text-lod  Omit text LOD clusters (included by default when applicable).
@@ -77,8 +80,9 @@ Examples:
   node PDFtoHEP.js --workers=4 ./pdfs
 
 When given a directory, the script scans it recursively and processes regular
-.pdf files in isolated child processes, one per available CPU thread up to the
-number of pending PDFs. Each freed slot immediately takes the next PDF.
+.pdf files in isolated child processes. Automatic concurrency is limited by
+available memory, CPU threads, and the number of pending PDFs. Each freed slot
+immediately takes the next PDF; finished processes release their memory.
 Outputs use the client export convention <name>-parsed-data.hep and are written
 beside their PDFs, unless --output-dir is supplied. Output name collisions are
 rejected.
@@ -92,7 +96,10 @@ reasons; ordinary embedded PDF images are not counted as fallback.
 
 Existing HEP files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
-overrides it. Concurrent large PDFs can require substantial combined memory.`;
+overrides it. Automatic concurrency budgets 75% of initially available memory,
+allowing each worker its heap ceiling plus 1024 MiB for native allocations,
+with at least one worker. This estimate is not a hard process memory limit:
+typed arrays and canvas allocations can exceed it. --workers overrides it.`;
 
 class ExistingOutputError extends Error {
   constructor(outputPath) {
@@ -347,6 +354,28 @@ function parseWorkerHeapMb(value, label) {
     throw new Error(`${label} must be an integer between 512 and 131072 MiB.`);
   }
   return heapMb;
+}
+
+export function resolvePdfToHepWorkerCount(pendingCount, options, heapMb, dependencies = {}) {
+  if (options.workers !== undefined) return Math.min(pendingCount, options.workers);
+  const cpuCount = (dependencies.availableParallelism ?? availableParallelism)();
+  // Node's availableMemory also accounts for process/container constraints;
+  // freemem limits the estimate to the RAM currently free in the OS (including WSL).
+  let memoryBytes;
+  try {
+    memoryBytes = (dependencies.availableMemory ?? (() =>
+      Math.min(freemem(), process.availableMemory?.() ?? Infinity)
+    ))();
+  } catch {
+    // Unknown memory availability should select one worker, not prevent conversion.
+  }
+  // Heap limits exclude typed arrays, canvas surfaces, and other native memory.
+  // Leave headroom for these and for the parent/OS, without preallocating anything.
+  const workerBudgetBytes = (heapMb + PDF_TO_HEP_WORKER_NATIVE_RESERVE_MB) * 1024 * 1024;
+  const memoryCount = Number.isFinite(memoryBytes) && memoryBytes > 0
+    ? Math.max(1, Math.floor(memoryBytes * PDF_TO_HEP_MEMORY_BUDGET_FRACTION / workerBudgetBytes))
+    : 1;
+  return Math.min(pendingCount, cpuCount, memoryCount);
 }
 
 export function pdfToHepWorkerArguments(
@@ -912,10 +941,7 @@ export async function runPdfToHepWorkerBatch(
   const cleanupWorkerTemps = dependencies.cleanupWorkerTemps ?? cleanupPdfToHepWorkerTemps;
   const signalTarget = dependencies.signalTarget ?? process;
   const now = dependencies.now ?? (() => performance.now());
-  const workerCount = Math.min(
-    pending.length,
-    options.workers ?? (dependencies.availableParallelism ?? availableParallelism)()
-  );
+  const workerCount = resolvePdfToHepWorkerCount(pending.length, options, heapMb, dependencies);
   const batchStartedAt = now();
   const activeChildren = new Set();
   let nextIndex = 0;

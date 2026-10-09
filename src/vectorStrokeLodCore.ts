@@ -1552,6 +1552,40 @@ export async function prebuildVectorStrokeLodRuntime(
   return prepareVectorStrokeLodRuntime(scene, mode, rendererType, options, true);
 }
 
+/**
+ * Build geometry for HEP export without the viewer's culling indexes or scratch.
+ * HEP v3 rebuilds these indexes on load. The empty indexes returned here must
+ * not be installed as a stored viewer hierarchy. @internal
+ */
+export async function buildVectorStrokeLodForStorage(
+  scene: VectorScene,
+  options: VectorStrokeLodAsyncBuildOptions = {}
+): Promise<StoredVectorStrokeLod> {
+  const scheduler = new VectorStrokeLodYieldScheduler(options);
+  const startedAt = nowMs();
+  await scheduler.maybeYield(true, 0, "Preparing Vector LOD");
+  const tileGrid = createRuntimeTileGrid(scene.bounds, Math.max(0, scene.segmentCount | 0), scene);
+  await scheduler.maybeYield(true, 0.04, "Partitioning stroke density");
+  const hierarchy = await runStrokeLodBuildAsync(buildStrokeLodHierarchy(scene), scheduler);
+  await scheduler.maybeYield(true, 0.99, "Finalizing Vector LOD");
+  const literals = hierarchy.store.literals;
+  const empty = new Uint32Array(0);
+  const result: StoredVectorStrokeLod = {
+    tileGrid,
+    literals: { segmentCount: literals.segmentCount, endpoints: literals.endpoints,
+      primitiveMeta: literals.primitiveMeta, primitiveBounds: literals.primitiveBounds, styles: literals.styles },
+    origins: explicitStrokePaintOrigins(literals),
+    levels: hierarchy.levels.map(level => ({ tolerance: level.tolerance, overview: level.overview,
+      segmentCount: level.segmentCount, records: level.records, sceneBounds: level.sceneBounds,
+      maxHalfWidth: level.maxHalfWidth, tileOffsets: empty, tileCounts: empty, tileSegmentIds: empty }))
+  };
+  scheduler.report(1, "Vector LOD ready");
+  const elapsedMs = nowMs() - startedAt;
+  logVectorLodBuildTiming(elapsedMs, scene.segmentCount, hierarchy.levels);
+  recordVectorLodBuildTiming(elapsedMs, scene.segmentCount, hierarchy.levels.length);
+  return result;
+}
+
 /** Exclusive preparation for a delayed renderer constructor. @internal */
 export interface VectorStrokeLodRuntimeReservation {
   take(scene: VectorScene): VectorStrokeLodRuntime;

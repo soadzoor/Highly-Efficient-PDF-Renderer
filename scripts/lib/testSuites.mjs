@@ -18,6 +18,7 @@ export const fastTests = [
   "hep-float32-palette",
   "hep-api",
   "hep-lod",
+  "hep-lod-export-memory",
   "hep-lod-repack-budget",
   "hep-lod-examples",
   "hep-annotations",

@@ -2,7 +2,7 @@ import { prepareVectorLodForStorage, packVectorLod, unpackVectorLod, packTextLod
 import { HepArchive } from "./hepContainer";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
-  getStoredVectorStrokeLod, prebuildVectorStrokeLodRuntime, storeVectorStrokeLod, rebuildStoredVectorStrokeLodIndexes,
+  getStoredVectorStrokeLod, buildVectorStrokeLodForStorage, storeVectorStrokeLod, rebuildStoredVectorStrokeLodIndexes,
   type StoredVectorStrokeLod
 } from "./vectorStrokeLodCore";
 import { prebuildTextLod, storePrebuiltTextLod } from "./textLodCore";
@@ -35,11 +35,10 @@ export async function writeHepLod(archive: HepArchive, scene: VectorScene,
     options.onProgress?.(0, "vector-lod");
     let data = getStoredVectorStrokeLod(scene);
     if (!data) {
-      await prebuildVectorStrokeLodRuntime(scene, "force", "webgl", {
-        shouldCancel: () => options.signal?.aborted ?? false,
+      data = await buildVectorStrokeLodForStorage(scene, {
+        signal: options.signal,
         onProgress: event => options.onProgress?.(event.value / steps, "vector-lod")
       });
-      data = getStoredVectorStrokeLod(scene);
     }
     options.signal?.throwIfAborted();
     if (data) data = prepareVectorLodForStorage(data, (options.vectorLodPrecision ?? "compact") === "compact");

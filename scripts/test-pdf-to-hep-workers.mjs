@@ -6,6 +6,7 @@ import {
   formatPdfToHepRasterFallbackSummary,
   formatPdfToHepSummary,
   parsePdfToHepArguments,
+  resolvePdfToHepWorkerCount,
   runPdfToHepWorkerBatch,
   startPdfToHepWorker
 } from "../PDFtoHEP.js";
@@ -20,7 +21,38 @@ for (const value of ["", "0", "-1", "1.5", "NaN", "Infinity", "2e3", " 2", "9007
 }
 assert.throws(() => parsePdfToHepArguments(["--workers=2", "--workers=3", "pdfs"]), /exactly one/);
 
-async function withBatch({ count = 5, options = {}, available = 2, throwOnStart, failCleanup = false, reports = {} } = {}, check) {
+const GiB = 1024 ** 3;
+const workerCount = (memory, { pending = 100, cpu = 32, heapMb = 12_288, workers } = {}) =>
+  resolvePdfToHepWorkerCount(pending, { workers }, heapMb, {
+    availableParallelism: () => cpu,
+    availableMemory: () => memory
+  });
+assert.equal(workerCount(16 * GiB), 1, "a 16 GiB WSL VM must not launch one 12 GiB worker per CPU thread");
+assert.equal(workerCount(32 * GiB), 1, "reserve native memory and leave 25% of available RAM as headroom");
+assert.equal(workerCount(64 * GiB), 3);
+const twoWorkerBoundary = 2 * 13 * GiB / 0.75;
+assert.equal(workerCount(twoWorkerBoundary - 1), 1, "round worker capacity down");
+assert.equal(workerCount(twoWorkerBoundary), 2, "admit the next worker at the budget boundary");
+assert.equal(workerCount(64 * GiB, { cpu: 2 }), 2, "CPU count still bounds automatic concurrency");
+assert.equal(workerCount(64 * GiB, { pending: 1 }), 1, "never launch more workers than pending PDFs");
+assert.equal(workerCount(64 * GiB, { pending: 0 }), 0);
+assert.equal(workerCount(64 * GiB, { heapMb: 131_072 }), 1, "one PDF remains usable even when its ceiling exceeds free RAM");
+assert.equal(workerCount(16 * GiB, { heapMb: 8192 }), 1, "configured heap ceilings affect scheduling");
+assert.equal(workerCount(32 * GiB, { heapMb: 8192 }), 2);
+for (const memory of [0, -1, undefined, NaN, Infinity]) {
+  assert.equal(workerCount(memory), 1, "unknown or exhausted available memory uses serial conversion");
+}
+assert.equal(resolvePdfToHepWorkerCount(4, {}, 12_288, {
+  availableParallelism: () => 32,
+  availableMemory: () => { throw new Error("memory probe unavailable"); }
+}), 1, "an unavailable memory probe must not prevent conversion");
+assert.equal(resolvePdfToHepWorkerCount(4, { workers: 3 }, 12_288, {
+  availableParallelism: () => { throw new Error("explicit workers bypass CPU probing"); },
+  availableMemory: () => { throw new Error("explicit workers bypass memory probing"); }
+}), 3, "an explicit worker override remains authoritative");
+
+async function withBatch({ count = 5, options = {}, available = 2, memory = 64 * GiB,
+  throwOnStart, failCleanup = false, reports = {} } = {}, check) {
   const items = Array.from({ length: count }, (_, index) => ({
     pdfPath: path.resolve(`worker-${index + 1}.pdf`),
     outputPath: path.resolve(`worker-${index + 1}-parsed-data.hep`),
@@ -38,6 +70,7 @@ async function withBatch({ count = 5, options = {}, available = 2, throwOnStart,
   let time = 0;
   let active = 0;
   let maximumActive = 0;
+  let memoryProbeCount = 0;
   let settled = false;
   const originalConsole = { log: console.log, error: console.error, warn: console.warn };
   try {
@@ -48,6 +81,7 @@ async function withBatch({ count = 5, options = {}, available = 2, throwOnStart,
       heapMb: 8192,
       signalTarget,
       availableParallelism: () => available,
+      availableMemory: () => { memoryProbeCount++; return memory; },
       now: () => time,
       startWorker(item, force, heapMb) {
         assert.equal(force, options.force ?? false);
@@ -98,13 +132,15 @@ async function withBatch({ count = 5, options = {}, available = 2, throwOnStart,
     });
     assert.equal(signalTarget.listenerCount("SIGINT"), 0);
     assert.equal(signalTarget.listenerCount("SIGTERM"), 0);
+    assert.equal(memoryProbeCount, options.workers === undefined ? 1 : 0,
+      "automatic memory is sampled once per batch; explicit worker counts skip the probe");
   } finally {
     Object.assign(console, originalConsole);
   }
 }
 
 await withBatch({}, async (batch) => {
-  assert.deepEqual(batch.started, [1, 2], "default uses the available CPU parallelism");
+  assert.deepEqual(batch.started, [1, 2], "default uses CPU parallelism when enough memory is available");
   await batch.finish(2, 0, null, 1000);
   assert.deepEqual(batch.started, [1, 2, 3], "a fast PDF refills its slot while PDF 1 remains active");
   await batch.finish(3, 1, null, 2000);
@@ -260,8 +296,18 @@ assert.equal(formatPdfToHepRasterFallbackSummary(interruptedFallback),
   "interrupted attempts are excluded from the successful output recap");
 assert.equal(formatPdfToHepRasterFallbackSummary([]), "Raster fallback by PDF:\n  None in successful conversions.");
 
+await withBatch({ count: 3, available: 32, memory: 16 * GiB }, async (batch) => {
+  assert.deepEqual(batch.started, [1], "the real batch applies its automatic memory limit");
+  await batch.finish(1);
+  assert.deepEqual(batch.started, [1, 2], "a finished process releases the slot for the next PDF");
+  await batch.finish(2);
+  await batch.finish(3);
+  assert.equal(await batch.completion, 0);
+  assert.equal(batch.maximumActive, 1, "large CPU counts cannot overrun a small memory budget");
+});
+
 for (const [count, workers, expected] of [[3, 1, 1], [3, 3, 3], [1, 100, 1]]) {
-  await withBatch({ count, options: { workers } }, async (batch) => {
+  await withBatch({ count, memory: GiB, options: { workers } }, async (batch) => {
     assert.equal(batch.started.length, expected, "explicit worker count overrides CPU detection and is capped by pending work");
     for (let number = 1; number <= count; number++) await batch.finish(number);
     assert.equal(await batch.completion, 0);
@@ -307,4 +353,4 @@ for (const [signal, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]]) {
   });
 }
 
-console.log("PDF-to-HEP worker pool: CPU defaults, limits, scheduling, failure isolation, timing, size/warning summaries, cleanup, and cancellation passed.");
+console.log("PDF-to-HEP worker pool: memory/CPU defaults, overrides, scheduling, failure isolation, timing, size/warning summaries, cleanup, and cancellation passed.");
