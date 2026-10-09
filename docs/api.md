@@ -1313,7 +1313,7 @@ applies; `WebGPURenderer` uses 8,192 unless it is created with
 device's largest texture is resampled to fit that many, and a console warning
 gives its original and drawn sizes.
 
-`onDiagnostic` receives these warnings (also retained by `PdfSession.getDiagnostics()`):
+`onDiagnostic` receives these diagnostics (also retained by `PdfSession.getDiagnostics()`):
 
 | Code | Meaning |
 | --- | --- |
@@ -1324,7 +1324,7 @@ gives its original and drawn sizes.
 | `image.resolution-reduced` | An image too large to decode within the stream limit was decoded at 1/2, 1/4, or 1/8 resolution. |
 | `image.ccitt-size-adjusted` | Fax image data had more or fewer columns or rows than the image declares; it was cropped or padded with white. |
 | `image.stencil-resolution-reduced` | A caller-supplied stencil pixel allowance required box-filtering the masks by the same factor, given in details. Full-resolution masks are attempted by default. |
-| `clip-curve-approximation` | Curved clip boundaries use vector edges at a 0.0001-point subdivision tolerance before Float32 storage. The tolerance does not increase with the edge count. |
+| `clip-curve-approximation` | Informational: curved clip boundaries use vector edges at a 0.0001-point subdivision tolerance before Float32 storage. The tolerance does not increase with the edge count. |
 | `clip-curve-precision-limited` | Floating-point subdivision could not refine a curved clip further; it retains the closest representable vector edges. |
 
 Stitching-function boundaries are sampled as hard color transitions. Gradient

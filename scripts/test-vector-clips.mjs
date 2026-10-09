@@ -44,7 +44,12 @@ try {
       assert.equal(scene.rasterLayers.length, 0, `fixture ${fixtureIndex} retains vector Forms`);
       assert(scene.fillPathCount > 0 && scene.clipPaths.length > 0);
       assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
-      if (fixtureIndex === 5) assert(session.getDiagnostics().some(d => d.code === "clip-curve-approximation"));
+      if (fixtureIndex === 5) {
+        assert(session.getDiagnostics().some(d => d.code === "clip-curve-approximation" && d.severity === "info"),
+          "ordinary curved-clip subdivision is retained as an informational diagnostic");
+        assert(!session.getDiagnostics().some(d => d.code === "clip-curve-precision-limited"),
+          "ordinary curved clips reach the subdivision tolerance");
+      }
       if (fixtureIndex === 5) assert(!session.getDiagnostics().some(d => d.code === "clip-curve-coarsened"));
       if (fixtureIndex === 6) {
         assert(scene.clipPaths.some(clip => clip.edges.length / 4 > TARGET_VECTOR_CLIP_EDGES));

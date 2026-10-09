@@ -401,7 +401,7 @@ export function buildNativeVectorPage(
     };
     scene.drawRuns = runs;
     if (clipBuilder.paths.length) scene.clipPaths = clipBuilder.paths;
-    if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "warning",
+    if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "info",
       pageIndex: pageInfo.sourcePageIndex, message: "Curved clip boundaries use vector edges with a 0.0001-point subdivision tolerance." });
     if (clipBuilder.precisionLimitedCurves) input.onDiagnostic?.({ code: "clip-curve-precision-limited", severity: "warning",
       pageIndex: pageInfo.sourcePageIndex,
