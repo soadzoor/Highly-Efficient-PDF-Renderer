@@ -2889,7 +2889,7 @@ function embeddedHmtxDiagnostic(
       });
   return Object.freeze({
     code: "font.sfnt-horizontal-metrics-normalized",
-    severity: "warning",
+    severity: missing && recoveredExactly ? "info" : "warning",
     message: missing
       ? recoveredExactly
         ? "An embedded sfnt omitted trailing horizontal bearings; exact values were recovered from glyph xMin bounds."
@@ -3691,8 +3691,8 @@ export class NativeSfntFont {
     if (start > end || end > glyf.length || end - start < 10) {
       throw unsupportedFont("The TrueType glyf/loca tables contain an invalid glyph span.");
     }
-    // The PDF-embedded recovery path is enabled only when head.flags bit 1
-    // promises that each horizontal left side bearing equals glyph xMin.
+    // With head.flags bit 1, each horizontal left side bearing equals glyph
+    // xMin exactly; otherwise xMin is the best available approximation.
     return this.i16(glyf.offset + start + 2, { offset: glyf.offset + start, length: end - start });
   }
 

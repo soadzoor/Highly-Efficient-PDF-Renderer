@@ -439,7 +439,7 @@ function testBinaryHmtxNormalizationFixtures() {
   assert.equal(underCount.diagnostics.length, 1);
   assert.deepEqual(underCount.diagnostics[0], {
     code: "font.sfnt-horizontal-metrics-normalized",
-    severity: "warning",
+    severity: "info",
     message: "An embedded sfnt omitted trailing horizontal bearings; exact values were recovered from glyph xMin bounds.",
     details: {
       reason: "hmtx-missing-bearings",
@@ -469,6 +469,7 @@ function testBinaryHmtxNormalizationFixtures() {
     "an unreachable bounded hmtx tail cannot alter count-derived metrics"
   );
   assert.equal(overCount.diagnostics[0]?.details?.reason, "hmtx-trailing-bytes");
+  assert.equal(overCount.diagnostics[0]?.severity, "warning");
   assert.equal(overCount.diagnostics[0]?.details?.ignoredByteCount, 2);
 
   const missingInvariant = hmtxUnderCountFixture.slice();
@@ -485,6 +486,7 @@ function testBinaryHmtxNormalizationFixtures() {
   assert.deepEqual(approximated.getHorizontalMetric(2), { advanceWidth: 600, leftSideBearing: 50 });
   assert.deepEqual(approximated.getGlyphOutline(2).bounds, [50, 0, 150, 100]);
   assert.equal(approximated.diagnostics[0]?.details?.exact, false);
+  assert.equal(approximated.diagnostics[0]?.severity, "warning");
   assert.match(approximated.diagnostics[0]?.message ?? "", /approximated by glyph xMin/);
 
   const missingLongMetricTables = cloneTables(buildFixture().tables);

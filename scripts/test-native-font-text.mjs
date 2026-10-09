@@ -664,6 +664,7 @@ async function testMissingFontResolution() {
     normalizedMetricFont.diagnostics[0]?.code,
     "font.sfnt-horizontal-metrics-normalized"
   );
+  assert.equal(normalizedMetricFont.diagnostics[0]?.severity, "info");
   assert.deepEqual(normalizedMetricDiagnostics, normalizedMetricFont.diagnostics);
 
   let cffResolverCalls = 0;
