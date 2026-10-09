@@ -8,7 +8,7 @@
 - You may inspect git status, diffs, and logs when useful.
 - You may suggest git commands or commit messages, but leave all git operations for the user to perform manually.
 - If not instructed otherwise, don't run commands that can take hours to run (like machine learning training, evaluations, etc.), just say the word, and user will run them manually if they agree to run them
-- This also includes generating parsed ZIPs from PDFs. Don't do that by yourself, because it can take a lot of time. Ask me to do it if needed.
+- This also includes generating parsed ZIPs from PDFs. Don't do that by yourself, because it can take a lot of time. Except if it's about a conversion bug / problem that you're investigating. In those cases, feel free to run the command yourself for your own debug purposes.
 
 ## Development Server
 
@@ -40,7 +40,7 @@
 
 ## User-Controlled Operations
 
-The user will handle manually:
+The user will handle manually (if not asked specifically otherwise):
 
 - running long commands (because the user often can't cancel them, if needed), like machine learning training, etc
 - starting or stopping development servers

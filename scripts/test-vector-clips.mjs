@@ -225,6 +225,24 @@ try {
     } finally { await session.close(); }
   }
 
+  // A technical drawing's many disconnected contours can exceed the old
+  // 65,536-edge path cap while still fitting the bounded exact band index.
+  const technicalRectangles = Array.from({ length: 17_000 }, (_, index) =>
+    `${(2 + index % 125 * .45).toFixed(2)} ${(2 + Math.floor(index / 125) * .45).toFixed(2)} .2 .2 re`).join(" ");
+  for (const rule of ["W", "W*"]) {
+    const session = await openPdf({ kind: "bytes", bytes: fixture(`q ${technicalRectangles} ${rule} n /Fm Do Q`) });
+    try {
+      const scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
+      validateVectorDrawRuns(scene);
+      assert(scene.clipPaths.some(clip => clip.edges.length / 4 === 68_000),
+        "all contours survive exact lowering beyond the former canonical edge cap");
+      assert.equal(scene.rasterLayers.length, 0, "a large indexable clip keeps the drawing in vectors");
+      assert(contains(scene, scene.drawRuns[0].clipIndex, 2.1, 2.1));
+      assert(!contains(scene, scene.drawRuns[0].clipIndex, 2.3, 2.1), "gaps between contours stay empty");
+      assert(!session.getDiagnostics().some(d => d.code.endsWith("fallback") || d.code === "clip-curve-coarsened"));
+    } finally { await session.close(); }
+  }
+
   // Curves give up precision before a clip is refused; straight edges have none to give.
   const k = 300 * 0.5523;
   const circle = [0, 300, 0, 2, 300, k, k, 300, 0, 300, 2, -k, 300, -300, k, -300, 0,

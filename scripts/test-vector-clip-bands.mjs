@@ -260,6 +260,31 @@ try {
   assert.throws(() => validateVectorClips({ clipPaths: tooManyIndexed }), /storage exceeds its limit/i,
     "validation charges every mandatory index to the aggregate GPU budget");
 
+  // Larger canonical clips retain exact edges without enlarging the per-pixel
+  // shader scan or aggregate texture budgets.
+  const technicalEdges = new Float32Array(17_000 * 16);
+  for (let index = 0; index < 17_000; index++) {
+    const x = index % 125, y = Math.floor(index / 125);
+    technicalEdges.set(rectangle(x, y, x + .5, y + .5), index * 16);
+  }
+  assert.equal(technicalEdges.length / 4, 68_000);
+  const technicalClips = [0, 1].map(fillRule => ({ parent: -1, fillRule, edges: technicalEdges }));
+  validateVectorClips({ clipPaths: technicalClips });
+  const technicalTexels = requiredVectorClipTexels(technicalEdges);
+  assert(technicalTexels !== null && technicalTexels + 2 <= MAX_VECTOR_CLIP_TEXELS);
+  for (const cells of [false, true]) {
+    const packed = packVectorClips(technicalClips, technicalTexels + 2, { cells });
+    assert.equal(packed[2], 68_000, "canonical edge count is retained in the header");
+    assert.equal(packed[3], 2); assert.equal(packed[7], 3);
+    const stats = bandStats(packed, 0);
+    assert(stats.maximum <= MAX_VECTOR_CLIP_EDGES, "large paths still obey the shader scan limit");
+    assert.equal(packed.length / 4, technicalTexels + 2, "mandatory index stays within its storage budget");
+    for (const [x, y] of [[.25, .25], [.75, .25], [124.25, 135.25], [125, 136]]) {
+      for (const root of [0, 1]) assert.equal(packedContains(packed, root, x, y), originalContains(technicalClips, root, x, y),
+        "large indices preserve islands and gaps for both fill rules");
+    }
+  }
+
   const fullHeight = polygon(Array.from({ length: MAX_VECTOR_CLIP_EDGES + 2 }, (_, index) => [index, index % 2]));
   assert.equal(canIndexVectorClip(fullHeight), false, "too many full-height candidates remain bounded failures");
   assert.equal(requiredVectorClipTexels(fullHeight), null);

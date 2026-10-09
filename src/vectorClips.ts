@@ -3,8 +3,11 @@ import { buildVectorPathCells, type VectorPathCells } from "./vectorCellIndex";
 
 /** Maximum candidate edges one shader invocation may scan for one clip. */
 export const MAX_VECTOR_CLIP_EDGES = 8192;
-/** Larger canonical paths must have an exact index within the shader budget. */
-export const MAX_VECTOR_CLIP_PATH_EDGES = 65536;
+/**
+ * Large technical drawings can exceed 65,536 clip edges. Retain their exact
+ * paths when the index fits the separate shader and aggregate storage budgets.
+ */
+export const MAX_VECTOR_CLIP_PATH_EDGES = 262144;
 export const MAX_VECTOR_CLIP_DEPTH = 64;
 // Keep texel offsets exactly representable as floats and bound upload memory to 64 MiB.
 export const MAX_VECTOR_CLIP_TEXELS = 4 * 1024 * 1024;
