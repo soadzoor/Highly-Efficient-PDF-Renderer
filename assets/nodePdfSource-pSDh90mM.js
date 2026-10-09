@@ -1,0 +1,3 @@
+import{createBundledStandardFontResolver as e}from"./standardFontResolver-CXxp0hSw.js";function t(t={}){return e({...t,loadAsset:t.loadAsset??(async(e,t)=>{t?.throwIfAborted();let n=await r();t?.throwIfAborted();let i=await n.readFile(e.url);return t?.throwIfAborted(),i})})}let n;function r(){return n||=import(
+/* @vite-ignore */
+`node:fs/promises`),n}export{t as createNodeBundledStandardFontResolver};
