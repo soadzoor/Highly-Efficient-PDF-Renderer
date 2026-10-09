@@ -59,7 +59,9 @@ export function buildNativeGlyphHairline(
       current = { start, end: start, segments: [], closed: false };
       contours.push(current);
     } else if (command.kind === "close") {
-      if (!current) throw unsupported("Hairline glyph closes a missing contour.");
+      // Closing an empty or already closed subpath has no effect. Generic
+      // retained PDF paths can include another close from their paint operator.
+      if (!current) continue;
       if (!same(current.end, current.start) || !current.segments.length) append([current.end, current.start]);
       current.closed = true;
       current = null;

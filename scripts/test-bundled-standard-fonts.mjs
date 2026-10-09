@@ -81,8 +81,14 @@ try {
 
   const cases = [
     [request("Helvetica"), "liberation-sans-regular"],
+    [request("ArialMT", { style: { serif: true } }), "liberation-sans-regular"],
+    [request("ABCDEF+Arial-BoldItalicMT", {
+      style: { serif: true, fixedPitch: true }
+    }), "liberation-sans-bold-italic"],
     [request("Helvetica-BoldOblique"), "liberation-sans-bold-italic"],
+    [request("Helvetica", { style: { fixedPitch: true, serif: true } }), "liberation-sans-regular"],
     [request("Times-Roman"), "liberation-serif-regular"],
+    [request("TimesNewRomanPSMT", { style: { fixedPitch: true } }), "liberation-serif-regular"],
     [request("Times New Roman"), "liberation-serif-regular"],
     [request("Times New Roman,Bold", { style: { weight: 700 } }), "liberation-serif-bold"],
     [request("Times New Roman,BoldItalic", {
@@ -90,6 +96,7 @@ try {
     }), "liberation-serif-bold-italic"],
     [request("Times-BoldItalic"), "liberation-serif-bold-italic"],
     [request("Courier-Oblique"), "liberation-mono-italic"],
+    [request("CourierNewPSMT", { style: { serif: true } }), "liberation-mono-regular"],
     [request("LucidaConsole"), "liberation-mono-regular"],
     [request("Consolas,Bold", { style: { weight: 700 } }), "liberation-mono-bold"],
     [request("Symbol"), "noto-sans-math"],
@@ -151,16 +158,20 @@ try {
   const fixture = writeTinyPdf({
     objects: [
       { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
-      { number: 2, body: "<< /Type /Pages /Count 3 /Kids [3 0 R 4 0 R 5 0 R] >>" },
+      { number: 2, body: "<< /Type /Pages /Count 4 /Kids [3 0 R 4 0 R 5 0 R 6 0 R] >>" },
       { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 10 0 R >> >> /Contents 20 0 R >>" },
       { number: 4, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 11 0 R >> >> /Contents 21 0 R >>" },
       { number: 5, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 12 0 R >> >> /Contents 22 0 R >>" },
+      { number: 6, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 13 0 R >> >> /Contents 23 0 R >>" },
       { number: 10, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>" },
       { number: 11, body: "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>" },
       { number: 12, body: "<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>" },
+      { number: 13, body: "<< /Type /Font /Subtype /TrueType /BaseFont /ArialMT /FontDescriptor 14 0 R /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 65 /Widths [667] >>" },
+      { number: 14, body: "<< /Type /FontDescriptor /FontName /ArialMT /FontFamily (Arial) /FontWeight 400 /Flags 42 /ItalicAngle 0 >>" },
       { number: 20, body: tinyPdfStream("", "BT /F1 20 Tf 10 40 Td (A) Tj ET\n") },
       { number: 21, body: tinyPdfStream("", "BT /F1 20 Tf 10 40 Td (\\042) Tj ET\n") },
-      { number: 22, body: tinyPdfStream("", "BT /F1 20 Tf 10 40 Td (#) Tj ET\n") }
+      { number: 22, body: tinyPdfStream("", "BT /F1 20 Tf 10 40 Td (#) Tj ET\n") },
+      { number: 23, body: tinyPdfStream("", "BT /F1 20 Tf 10 40 Td (A) Tj ET\n") }
     ]
   });
   const session = await openPdf(
@@ -168,8 +179,12 @@ try {
     { missingFontResolver: nodeResolver }
   );
   try {
-    const pages = await Promise.all([0, 1, 2].map((index) => session.compilePage(index)));
-    assert.deepEqual(pages.map((page) => page.textIndex.text), ["A", "∀", "✃"]);
+    const pages = await Promise.all([0, 1, 2, 3].map((index) => session.compilePage(index)));
+    assert.deepEqual(pages.map((page) => page.textIndex.text), ["A", "∀", "✃", "A"]);
+    const arialDiagnostic = session.getDiagnostics().find(
+      ({ code, details }) => code === "font.missing-substituted" && details?.baseFont === "ArialMT"
+    );
+    assert.match(arialDiagnostic?.details?.substituteIdentifier, /^hepr:liberation-sans-regular:/);
     for (const [pageIndex, page] of pages.entries()) {
       assert.equal(page.stores.glyphs.glyphIds[0] > 0, true, `page ${pageIndex} glyph id`);
       assert.equal(page.stores.fonts.outlinePathCounts[0] > 0, true, `page ${pageIndex} outline`);

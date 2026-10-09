@@ -121,7 +121,9 @@ export function buildNativeGlyphStroke(
       current = { points: [transform(local, command.x, command.y)], closed: false };
       contours.push(current);
     } else if (command.kind === "close") {
-      if (!current) throw unsupported("Glyph stroke closes a missing contour.");
+      // Closing an empty or already closed subpath has no effect. Generic
+      // retained PDF paths can include another close from their paint operator.
+      if (!current) continue;
       if (current.points.length > 1 && same(current.points[0], current.points.at(-1)!)) current.points.pop();
       current.closed = true;
       current.hasSegment = true;

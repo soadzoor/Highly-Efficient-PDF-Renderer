@@ -39,6 +39,8 @@ try {
     "closed contours have device-pixel hairlines and rounded joins");
   assert.equal(square.approximateStyle, true, "the approximation of default miter joins is explicit");
   assert.equal(square.approximated, false, "line join approximation is distinct from curve approximation");
+  assert.deepEqual(build([close, move(1, 2), line(5, 2), line(5, 6), line(1, 6), close, close]), square,
+    "empty and redundant closes preserve exactly the same hairline geometry");
 
   const cubic = build([move(0, 0),
     { kind: "cubic", control1X: 0, control1Y: 100, control2X: 100, control2Y: 100, x: 100, y: 0 }]);
@@ -84,6 +86,7 @@ try {
   assert.ok(dashedCurve.endpoints.every(Number.isFinite));
 
   assert.equal(build([]), null);
+  assert.equal(build([close, close]), null, "closing an empty path does not paint");
   assert.equal(build([move(0, 0)]), null, "a moveto alone does not paint");
   assert.ok(build([move(0, 0), line(0, 0)], { lineCap: 1 }), "a round zero-length stroke remains visible");
   assert.ok(build([move(0, 0), close], { lineCap: 1 }), "a round zero-length closed subpath remains visible");

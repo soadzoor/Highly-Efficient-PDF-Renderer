@@ -256,7 +256,23 @@ try {
       }
     } finally { await session.close(); }
   }
-  console.log(`Hairline text passed: ${cases.length * 2 + 8} vector compilations, independent path geometry, zoom, search, clips and layers.`);
+  for (const width of [0, 2]) {
+    const scenes = [];
+    for (const closes of ["h", "h h"]) {
+      const session = await openPdf({ kind: "bytes", bytes: fixture({
+        content: `0 0 1 RG ${width} w 1 j 1 J 10 10 m 10 30 30 30 30 10 c 40 10 l ${closes} S`
+      }) });
+      try {
+        const page = await session.compilePage(0);
+        const scene = await lowerRetainedPageToVectorScene(page, { signal: signal() });
+        assert.equal(scene.rasterLayers.length, 0, "redundant path closes preserve vector strokes");
+        scenes.push(strokeSegments(scene, getScenePrimitive));
+      } finally { await session.close(); }
+    }
+    assert(scenes[0].length > 0, "the closed CAD path has visible stroke geometry");
+    assert.deepEqual(scenes[1], scenes[0], `redundant closes preserve width ${width} strokes exactly`);
+  }
+  console.log(`Hairline text passed: ${cases.length * 2 + 12} vector compilations, independent path geometry, zoom, search, clips and layers.`);
 } finally { hooks.deregister(); }
 
 function strokeSegments(scene, getScenePrimitive) {

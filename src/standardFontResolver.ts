@@ -2,6 +2,7 @@ import type {
   NativeMissingFontRequest,
   NativeMissingFontResolver
 } from "./pdf/nativeFont";
+import { resolveNativeStandard14MetricFace } from "./pdf/nativeStandard14Metrics";
 
 export type BundledStandardFontAssetId =
   | "liberation-mono-regular"
@@ -215,15 +216,27 @@ export function resolveBundledStandardFontAsset(
   const bold = request.style.weight >= 600 || /(?:bold|black|heavy|demi|semi)/.test(name);
   const italic = request.style.italic || request.descriptor.italicAngle !== 0 ||
     /(?:italic|oblique)/.test(name);
+  // Recognized family names take precedence over contradictory descriptor
+  // flags: some producers mark ArialMT as serif despite its /FontFamily.
+  const standardFace = resolveNativeStandard14MetricFace(
+    request.normalizedBaseFont || request.baseFont
+  );
+  const standardFamily = standardFace === "courier"
+    ? "mono"
+    : standardFace?.startsWith("helvetica")
+      ? "sans"
+      : standardFace?.startsWith("times")
+        ? "serif"
+        : null;
   // Monospace families that commonly arrive nonembedded without /FixedPitch
   // (e.g. LucidaConsole, Consolas) need a fixed-pitch substitute; proportional
   // glyphs visibly drift inside the document's uniform /Widths advances.
-  const family = request.style.fixedPitch ||
+  const family = standardFamily ?? (request.style.fixedPitch ||
     /(?:courier|mono|typewriter|consol|menlo|monaco|fixedsys|lettergothic)/.test(name)
     ? "mono"
     : request.style.serif || /(?:times|serif|roman|georgia)/.test(name)
       ? "serif"
-      : "sans";
+      : "sans");
   const face = bold ? (italic ? "bold-italic" : "bold") : (italic ? "italic" : "regular");
   return ASSETS[`${family === "mono" ? "liberation-mono" : family === "serif" ? "liberation-serif" : "liberation-sans"}-${face}`];
 }

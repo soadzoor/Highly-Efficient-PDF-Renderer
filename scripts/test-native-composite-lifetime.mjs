@@ -14,6 +14,7 @@ const hooks = registerHooks({
 });
 const originalOffscreen = Object.getOwnPropertyDescriptor(globalThis, "OffscreenCanvas");
 const canvases = [];
+let peakCanvasPixels = 0;
 let failure = null;
 let cancelReadback = null;
 Object.defineProperty(globalThis, "OffscreenCanvas", {
@@ -22,6 +23,8 @@ Object.defineProperty(globalThis, "OffscreenCanvas", {
     constructor(width, height) {
       const canvas = createCanvas(width, height);
       canvases.push(canvas);
+      peakCanvasPixels = Math.max(peakCanvasPixels,
+        canvases.reduce((pixels, surface) => pixels + surface.width * surface.height, 0));
       const getContext = canvas.getContext.bind(canvas);
       canvas.getContext = (...args) => {
         if (failure === "context") return null;
@@ -91,6 +94,55 @@ try {
   assertReleased();
   assert.deepEqual(retried.rasterLayers[0].data, snapshot, "the session remains reusable after failed rendering");
   assert.deepEqual(pixels, snapshot, "released canvases must not own returned scene pixels");
+
+  // Non-isolated alpha paints each need an intermediate group. Their backing
+  // stores must be released before the next paint, rather than at page readback.
+  const groupSession = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /ExtGState << /GM 5 0 R >> >> /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", Array.from({ length: 6 }, () =>
+      "q /GM gs 1 0 0 rg 0 0 10 10 re f Q").join("\n")) },
+    { number: 5, body: "<< /Type /ExtGState /ca 0.5 >>" }
+  ] }) });
+  try {
+    const { createNativeCompositeSurfaceFactory } = await import("../src/retainedPageCompositor.ts");
+    const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
+    const page = await groupSession.compilePage(0);
+    assert.equal(page.displayProgram.groups.length, 7, "fixture must exercise six separate alpha groups");
+    canvases.length = 0;
+    peakCanvasPixels = 0;
+    const factory = await createNativeCompositeSurfaceFactory();
+    try {
+      const rendered = await renderHeprPageToCanvas2d(page, { surfaceFactory: factory });
+      assert.equal(canvases.length, 7, "the output and each paint use distinct surfaces");
+      assert(peakCanvasPixels <= 20 * 20 * 2 + 6,
+        "only the output and current group retain full page-sized backing stores");
+      assert(canvases.slice(1).every(canvas => canvas.width === 1 && canvas.height === 1),
+        "completed group buffers are released before readback or factory cleanup");
+      assert.deepEqual([...rendered.surface.context.getImageData(5, 15, 1, 1).data], [255, 0, 0, 252],
+        "releasing group buffers preserves ordered alpha compositing");
+      assert.equal(rendered.surface.context.getImageData(15, 5, 1, 1).data[3], 0,
+        "the live output keeps its transparent background");
+    } finally { factory.releaseAll(); }
+    assertReleased();
+
+    canvases.length = 0;
+    const failedFactory = await createNativeCompositeSurfaceFactory();
+    const throwDuringPaint = (width, height) => {
+      const surface = failedFactory(width, height);
+      if (canvases.length > 1) surface.context.fill = () => { throw new Error("fixture group paint failed"); };
+      return surface;
+    };
+    try {
+      await assert.rejects(renderHeprPageToCanvas2d(page, { surfaceFactory: throwDuringPaint }),
+        /fixture group paint failed/);
+      assert(canvases.length > 1, "painting fails after a group surface was allocated");
+      assert(canvases.slice(1).every(canvas => canvas.width === 1 && canvas.height === 1),
+        "failed group rendering releases intermediate backing stores while unwinding");
+    } finally { failedFactory.releaseAll(); }
+    assertReleased();
+  } finally { await groupSession.close(); }
   console.log("native composite surface lifetime tests passed");
 } finally {
   await session?.close();

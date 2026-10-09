@@ -607,7 +607,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     }
     if (frame.discard || outcome.status !== "complete") {
       this.releaseMask(execution.softMaskExecutionId);
-      this.releasePixels(frame.accountedPixels);
+      if (!frame.direct) this.releaseSurface(frame);
       return;
     }
     if (frame.direct) return;
@@ -636,7 +636,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       this.compositeLayer(parent.surface.context, frame.surface.canvas, execution);
     } finally {
       if (mask !== null) this.releaseMask(execution.softMaskExecutionId);
-      this.releasePixels(frame.accountedPixels);
+      this.releaseSurface(frame);
     }
   }
 
@@ -679,6 +679,8 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const frame of this.frames) if (!frame.direct) this.releaseSurface(frame);
+    for (const mask of this.masks.values()) this.releaseSurface(mask);
     this.frames.length = 0;
     this.masks.clear();
     this.imageCache.clear();
@@ -3076,12 +3078,26 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     this.liveWorkingPixels = Math.max(0, this.liveWorkingPixels - pixels);
   }
 
+  private releaseSurface(image: CachedImage): void {
+    // A factory may keep its canvases alive until pixel readback. Completed
+    // groups and masks have already been composited, so release their backing
+    // stores immediately instead of retaining one page-sized buffer per paint.
+    try {
+      const canvas = image.surface.canvas as { width: number; height: number };
+      canvas.width = 1;
+      canvas.height = 1;
+    } catch {
+      // Immutable host wrappers must rely on collection instead.
+    }
+    this.releasePixels(image.accountedPixels);
+  }
+
   private releaseMask(executionId: number | null): void {
     if (executionId === null) return;
     const mask = this.masks.get(executionId);
     if (mask === undefined) return;
     this.masks.delete(executionId);
-    this.releasePixels(mask.accountedPixels);
+    this.releaseSurface(mask);
   }
 
   private currentFrame(): GroupFrame {

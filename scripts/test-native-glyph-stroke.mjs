@@ -87,6 +87,10 @@ try {
   const rect = compare("closed outline keeps its hole", square);
   assert.deepEqual(rect.bounds, { minX: 18, minY: 18, maxX: 67, maxY: 67 });
   assert.equal(rect.approximated, false);
+  assert.deepEqual(compare("empty and redundant closes", [close, ...square, close]), rect,
+    "redundant closes keep the same silhouette and match the reference canvas");
+  assert.equal(buildNativeGlyphStroke([close, close], identity, defaults), null,
+    "closing an empty path does not paint");
   for (const lineJoin of [0, 1, 2]) {
     for (const lineCap of [0, 1, 2]) compare(`join ${lineJoin}, cap ${lineCap}`, corners, { lineJoin, lineCap });
   }
