@@ -22,36 +22,33 @@ for (const value of ["", "0", "-1", "1.5", "NaN", "Infinity", "2e3", " 2", "9007
 assert.throws(() => parsePdfToHepArguments(["--workers=2", "--workers=3", "pdfs"]), /exactly one/);
 
 const GiB = 1024 ** 3;
-const workerCount = (memory, { pending = 100, cpu = 32, heapMb = 12_288, workers } = {}) =>
-  resolvePdfToHepWorkerCount(pending, { workers }, heapMb, {
+const workerCount = ({ pending = 100, cpu = 32, memory, workers } = {}) => {
+  let memoryProbeCount = 0;
+  const count = resolvePdfToHepWorkerCount(pending, { workers }, {
     availableParallelism: () => cpu,
-    availableMemory: () => memory
+    availableMemory: () => { memoryProbeCount++; return memory; }
   });
-assert.equal(workerCount(16 * GiB), 1, "a 16 GiB WSL VM must not launch one 12 GiB worker per CPU thread");
-assert.equal(workerCount(32 * GiB), 1, "reserve native memory and leave 25% of available RAM as headroom");
-assert.equal(workerCount(64 * GiB), 3);
-const twoWorkerBoundary = 2 * 13 * GiB / 0.75;
-assert.equal(workerCount(twoWorkerBoundary - 1), 1, "round worker capacity down");
-assert.equal(workerCount(twoWorkerBoundary), 2, "admit the next worker at the budget boundary");
-assert.equal(workerCount(64 * GiB, { cpu: 2 }), 2, "CPU count still bounds automatic concurrency");
-assert.equal(workerCount(64 * GiB, { pending: 1 }), 1, "never launch more workers than pending PDFs");
-assert.equal(workerCount(64 * GiB, { pending: 0 }), 0);
-assert.equal(workerCount(64 * GiB, { heapMb: 131_072 }), 1, "one PDF remains usable even when its ceiling exceeds free RAM");
-assert.equal(workerCount(16 * GiB, { heapMb: 8192 }), 1, "configured heap ceilings affect scheduling");
-assert.equal(workerCount(32 * GiB, { heapMb: 8192 }), 2);
-for (const memory of [0, -1, undefined, NaN, Infinity]) {
-  assert.equal(workerCount(memory), 1, "unknown or exhausted available memory uses serial conversion");
+  assert.equal(memoryProbeCount, 0, "worker count does not probe available memory");
+  return count;
+};
+assert.equal(workerCount(), 32, "automatic concurrency uses all available CPU threads");
+assert.equal(workerCount({ cpu: 2 }), 2, "CPU count bounds automatic concurrency");
+assert.equal(workerCount({ pending: 20 }), 20, "never launch more workers than pending PDFs");
+assert.equal(workerCount({ pending: 1 }), 1);
+assert.equal(workerCount({ pending: 0 }), 0);
+for (const memory of [GiB, 16 * GiB, 32 * GiB, 64 * GiB, 0, -1, undefined, NaN, Infinity]) {
+  assert.equal(workerCount({ memory }), 32, "available memory does not affect automatic concurrency");
 }
-assert.equal(resolvePdfToHepWorkerCount(4, {}, 12_288, {
+assert.equal(resolvePdfToHepWorkerCount(4, {}, {
   availableParallelism: () => 32,
   availableMemory: () => { throw new Error("memory probe unavailable"); }
-}), 1, "an unavailable memory probe must not prevent conversion");
-assert.equal(resolvePdfToHepWorkerCount(4, { workers: 3 }, 12_288, {
+}), 4, "an unavailable memory probe must not affect concurrency");
+assert.equal(resolvePdfToHepWorkerCount(4, { workers: 3 }, {
   availableParallelism: () => { throw new Error("explicit workers bypass CPU probing"); },
   availableMemory: () => { throw new Error("explicit workers bypass memory probing"); }
 }), 3, "an explicit worker override remains authoritative");
 
-async function withBatch({ count = 5, options = {}, available = 2, memory = 64 * GiB,
+async function withBatch({ count = 5, options = {}, available = 2, memory = GiB, heapMb = 8192,
   throwOnStart, failCleanup = false, reports = {} } = {}, check) {
   const items = Array.from({ length: count }, (_, index) => ({
     pdfPath: path.resolve(`worker-${index + 1}.pdf`),
@@ -78,14 +75,14 @@ async function withBatch({ count = 5, options = {}, available = 2, memory = 64 *
     console.error = (message) => errors.push(String(message));
     console.warn = (message) => warnings.push(String(message));
     const completion = runPdfToHepWorkerBatch(items, { force: false, ...options }, 1, {
-      heapMb: 8192,
+      heapMb,
       signalTarget,
       availableParallelism: () => available,
       availableMemory: () => { memoryProbeCount++; return memory; },
       now: () => time,
-      startWorker(item, force, heapMb) {
+      startWorker(item, force, workerHeapMb) {
         assert.equal(force, options.force ?? false);
-        assert.equal(heapMb, 8192);
+        assert.equal(workerHeapMb, heapMb);
         assert(!started.includes(item.fileNumber), "each PDF is dispatched exactly once");
         started.push(item.fileNumber);
         if (item.fileNumber === throwOnStart) throw new Error("synthetic synchronous spawn failure");
@@ -96,7 +93,7 @@ async function withBatch({ count = 5, options = {}, available = 2, memory = 64 *
         child.kill = (signal) => { signals.push([item.fileNumber, signal]); return true; };
         children.set(item.fileNumber, child);
         maximumActive = Math.max(maximumActive, ++active);
-        return startPdfToHepWorker(item, force, heapMb, () => child);
+        return startPdfToHepWorker(item, force, workerHeapMb, () => child);
       },
       async cleanupWorkerTemps(outputPath, pid, token) {
         assert.equal(outputPath, items[pid - 40_001].outputPath);
@@ -132,15 +129,14 @@ async function withBatch({ count = 5, options = {}, available = 2, memory = 64 *
     });
     assert.equal(signalTarget.listenerCount("SIGINT"), 0);
     assert.equal(signalTarget.listenerCount("SIGTERM"), 0);
-    assert.equal(memoryProbeCount, options.workers === undefined ? 1 : 0,
-      "automatic memory is sampled once per batch; explicit worker counts skip the probe");
+    assert.equal(memoryProbeCount, 0, "batches do not probe available memory");
   } finally {
     Object.assign(console, originalConsole);
   }
 }
 
 await withBatch({}, async (batch) => {
-  assert.deepEqual(batch.started, [1, 2], "default uses CPU parallelism when enough memory is available");
+  assert.deepEqual(batch.started, [1, 2], "default uses CPU parallelism regardless of available memory");
   await batch.finish(2, 0, null, 1000);
   assert.deepEqual(batch.started, [1, 2, 3], "a fast PDF refills its slot while PDF 1 remains active");
   await batch.finish(3, 1, null, 2000);
@@ -296,15 +292,14 @@ assert.equal(formatPdfToHepRasterFallbackSummary(interruptedFallback),
   "interrupted attempts are excluded from the successful output recap");
 assert.equal(formatPdfToHepRasterFallbackSummary([]), "Raster fallback by PDF:\n  None in successful conversions.");
 
-await withBatch({ count: 3, available: 32, memory: 16 * GiB }, async (batch) => {
-  assert.deepEqual(batch.started, [1], "the real batch applies its automatic memory limit");
-  await batch.finish(1);
-  assert.deepEqual(batch.started, [1, 2], "a finished process releases the slot for the next PDF");
-  await batch.finish(2);
-  await batch.finish(3);
-  assert.equal(await batch.completion, 0);
-  assert.equal(batch.maximumActive, 1, "large CPU counts cannot overrun a small memory budget");
-});
+for (const heapMb of [512, 8192, 12_288, 131_072]) {
+  await withBatch({ count: 3, available: 32, memory: GiB, heapMb }, async (batch) => {
+    assert.deepEqual(batch.started, [1, 2, 3], "low available memory does not limit automatic concurrency");
+    for (let number = 1; number <= 3; number++) await batch.finish(number);
+    assert.equal(await batch.completion, 0);
+    assert.equal(batch.maximumActive, 3, "worker heap ceilings do not affect scheduling");
+  });
+}
 
 for (const [count, workers, expected] of [[3, 1, 1], [3, 3, 3], [1, 100, 1]]) {
   await withBatch({ count, memory: GiB, options: { workers } }, async (batch) => {
@@ -353,4 +348,4 @@ for (const [signal, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]]) {
   });
 }
 
-console.log("PDF-to-HEP worker pool: memory/CPU defaults, overrides, scheduling, failure isolation, timing, size/warning summaries, cleanup, and cancellation passed.");
+console.log("PDF-to-HEP worker pool: CPU defaults, memory-independent scheduling, overrides, failure isolation, timing, size/warning summaries, cleanup, and cancellation passed.");

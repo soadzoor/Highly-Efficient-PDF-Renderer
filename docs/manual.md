@@ -1164,11 +1164,12 @@ node PDFtoHEP.js --output-dir=./heps ./pdfs
 ```
 
 Directory input is scanned recursively and converted in isolated child processes,
-with automatic concurrency limited by available memory, CPU threads, and the
-number of pending PDFs. Whenever a child finishes, its slot takes the next
-PDF without waiting for other conversions. Each PDF gets a fresh child process
-to release its memory after conversion. A single PDF still uses one conversion
-process. `--workers=<count>` overrides the automatic limit; `--workers=1` runs serially.
+with one worker per available CPU thread, capped by the number of pending PDFs.
+Whenever a child finishes, its slot takes the next PDF without waiting for other
+conversions. Each PDF gets a fresh child process to release its memory after
+conversion. A single PDF still uses one conversion
+process. `--workers=<count>` accepts a positive integer to override the automatic
+count; use it to reduce concurrency, or `--workers=1` to run serially.
 Progress lines identify their PDF, and the final summary includes per-file
 durations and batch wall time. Summed conversion durations overlap in parallel
 and can exceed wall time.
@@ -1181,14 +1182,10 @@ counted as raster fallback in generated HEPs.
 
 Each child retains its own heap limit of 12288 MiB by default (not preallocated).
 `HEPR_PDF_TO_HEP_HEAP_MB` or the parent's `--max-old-space-size` overrides this
-per-child limit. Automatic concurrency budgets 75% of the memory available at
-batch startup, allowing each child its heap ceiling plus 1024 MiB for native
-allocations, and always permits at least one conversion. With the default heap,
-16 GiB of available RAM selects one worker. This is a conservative scheduling
-estimate, not a hard memory limit: typed arrays and canvas allocations are outside
-the JavaScript heap. Explicit `--workers` bypasses this estimate. Ctrl+C stops new
-dispatch and cancels all active children; a second signal force-stops them.
-Failed conversions do not stop other PDFs.
+per-child limit. This heap setting is independent of worker scheduling. Typed
+arrays and canvas allocations are outside the JavaScript heap. Ctrl+C stops new
+dispatch and cancels all active children; a second signal force-stops them. Failed
+conversions do not stop other PDFs.
 
 `Level1.pdf` produces `Level1-parsed-data.hep` beside
 the input unless `--output-dir=<directory>` is supplied. Output-name collisions
