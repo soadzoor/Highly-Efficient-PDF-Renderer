@@ -190,7 +190,7 @@ export interface OpenPdfOptions extends PdfIccOptions {
   readonly signal?: AbortSignal;
   readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   readonly onProgress?: PdfCompileOptions["onProgress"];
-  /** Deterministic caller-owned substitute lookup for nonembedded fonts. */
+  /** Deterministic substitutes for missing fonts and unsupported embedded Type1 outlines. */
   readonly missingFontResolver?: NativeMissingFontResolver;
   /** Focused decoder bridge returning validated packed image samples. */
   readonly imageCodecResolver?: NativeImageCodecResolver;

@@ -1141,6 +1141,15 @@ standard blend modes, and alpha/luminosity masks use a shared ordered paint grap
 and renderer-owned transient surfaces. Group opacity is applied to the group
 result, preserving overlap between its children.
 
+Embedded sfnt subsets may retain unused horizontal-metric bytes; HEPR ignores
+these bounded tails with a normalization warning. Embedded PFA/PFB Type1 fonts
+use the configured substitute-font resolver and emit `font.type1-substituted`.
+Explicit PDF character widths take precedence, but glyph shapes and mappings
+for opaque names may be approximate. Paths exceeding the cooperative vector
+paint budget use retained vector lowering or bounded selective raster fallback
+with diagnostics. Large straight clipping paths stay vector when indexing
+keeps each shader scan within its edge budget, preserving the clip geometry.
+
 Image decoders load on demand: JPEG, JPEG 2000 (`JPXDecode`), JBIG2
 (`JBIG2Decode`, including globals), and fax images are supported. The bundled
 JPEG 2000 and JBIG2 kernels come from PDF.js 6.4.299. Codec JavaScript and WASM

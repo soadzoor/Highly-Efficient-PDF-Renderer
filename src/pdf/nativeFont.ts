@@ -115,7 +115,7 @@ export interface NativeFontStyleMetadata {
   readonly forceBold: boolean;
 }
 
-/** Immutable information supplied to a caller-owned deterministic resolver. */
+/** Missing or unsupported font information supplied to a deterministic resolver. */
 export interface NativeMissingFontRequest {
   readonly baseFont: string;
   readonly normalizedBaseFont: string;
@@ -563,7 +563,8 @@ async function parseSimpleFont(
     simpleWidthsSuggestFixedPitch(widths, encoding.glyphNames)
   );
   const replacement = embeddedSfnt === null && embeddedCff === null &&
-    descriptor.embeddedKind === null && subtype !== "Type3"
+    (descriptor.embeddedKind === null || descriptor.embeddedKind === "type1") &&
+    subtype !== "Type3"
     ? await resolveMissingSfnt({
         baseFont,
         normalizedBaseFont: stripSubsetPrefix(baseFont),
@@ -575,6 +576,7 @@ async function parseSimpleFont(
       }, options)
     : null;
   const sfnt = embeddedSfnt ?? replacement?.sfnt ?? null;
+  const approximateType1 = replacement !== null && descriptor.embeddedKind === "type1";
   const type3Matrix = subtype === "Type3" ? readNumberArray(dictionary.get("FontMatrix"), 6) : null;
   const unitsPerEm = sfnt?.unitsPerEm ?? embeddedCff?.unitsPerEm ?? (
     type3Matrix && type3Matrix[0] !== 0 ? Math.max(1, Math.round(1 / Math.abs(type3Matrix[0]))) : 1000
@@ -629,9 +631,14 @@ async function parseSimpleFont(
         // unrelated ToUnicode value must never redirect painted geometry.
         glyphId = embeddedCff.glyphIdForName(glyphName);
       } else if (sfnt) {
-        // ToUnicode is semantic extraction metadata, never a glyph selector.
-        // Substitute and embedded sfnt selection follows the PDF Encoding.
-        const unicodeScalar = selectionUnicode ? firstUnicodeScalar(selectionUnicode) : -1;
+        // Embedded sfnt and ordinary substitutes follow PDF Encoding, never
+        // ToUnicode. Unsupported Type1 subsets can use opaque names (g56)
+        // with only ToUnicode identifying a usable approximate substitute.
+        // Keep recognized names and explicit .notdef selections authoritative.
+        const approximateUnicode = approximateType1 && selectionUnicode === null &&
+          glyphName !== ".notdef" ? mappedUnicode : null;
+        const glyphUnicode = selectionUnicode ?? approximateUnicode;
+        const unicodeScalar = glyphUnicode ? firstUnicodeScalar(glyphUnicode) : -1;
         glyphId = unicodeScalar >= 0 ? sfnt.mapCodePoint(unicodeScalar) : 0;
         if (glyphId === 0 && descriptor.flags & 4) {
           glyphId = sfnt.mapSymbolCode(code);
@@ -2725,17 +2732,25 @@ async function resolveMissingSfnt(
     byteLength: ownedBytes.length,
     outlineFormat: "glyf"
   });
+  const approximateType1 = request.descriptor.embeddedKind === "type1";
   const diagnostic: PdfDiagnostic = Object.freeze({
-    code: "font.missing-substituted",
+    code: approximateType1 ? "font.type1-substituted" : "font.missing-substituted",
     severity: "warning",
-    message: `Missing font ${request.baseFont || "(unnamed)"} was replaced by caller asset ${identifier}.`,
+    message: approximateType1
+      ? `Embedded PFA/PFB Type1 font ${request.baseFont || "(unnamed)"} was approximated by caller asset ${identifier}; PDF widths take precedence. Unrecognized glyph names use ToUnicode when available; unavailable built-in Encoding entries use the default simple-font encoding.`
+      : `Missing font ${request.baseFont || "(unnamed)"} was replaced by caller asset ${identifier}.`,
     details: Object.freeze({
       baseFont: request.baseFont,
       normalizedBaseFont: request.normalizedBaseFont,
       subtype: request.subtype,
       substituteIdentifier: identifier,
       faceIndex,
-      byteLength: ownedBytes.length
+      byteLength: ownedBytes.length,
+      ...(approximateType1 ? {
+        reason: "unsupported-type1-outlines",
+        embeddedKind: "type1",
+        approximate: true
+      } : {})
     })
   });
   options.onDiagnostic?.(diagnostic);
@@ -3055,10 +3070,10 @@ export class NativeSfntFont {
     // the whole array. With head.flags bit 1 each omitted value is exactly the
     // corresponding glyph xMin; without it xMin is the best available value.
     // Outlines keep their absolute glyf coordinates either way, so only the
-    // reported bearing can differ. Others include final alignment bytes or two
-    // stale trailing bearings. Keep strict fonts exact; for embedded subsets,
-    // recover only the first form from fully bounded glyf/loca data and ignore
-    // at most the already established four-byte unreachable tail.
+    // reported bearing can differ. Others retain stale trailing bearings from
+    // the original font. Keep strict fonts exact; for embedded subsets, recover
+    // the first form from fully bounded glyf/loca data and ignore any unreachable
+    // tail. The table is already bounds checked and its suffix is never read.
     const embeddedHmtxDelta = validation === "pdf-embedded"
       ? hmtx.length - expectedHmtxLength
       : 0;
@@ -3070,7 +3085,7 @@ export class NativeSfntFont {
     const recoveredBearingsExact = (this.u16(head.offset + 16, head) & 0x0002) !== 0;
     const canIgnoreTrailingBytes =
       validation === "pdf-embedded" &&
-      embeddedHmtxDelta > 0 && embeddedHmtxDelta <= 4;
+      embeddedHmtxDelta > 0;
     if (
       hmtx.length !== expectedHmtxLength &&
       !canRecoverMissingBearings && !canIgnoreTrailingBytes

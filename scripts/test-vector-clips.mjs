@@ -16,7 +16,7 @@ try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { NativeVectorClipBuilder } = await import("../src/pdf/nativeVectorClips.ts");
   const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
-  const { packVectorClips, MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES } = await import("../src/vectorClips.ts");
+  const { packVectorClips, MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES, MAX_VECTOR_CLIP_PATH_EDGES } = await import("../src/vectorClips.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } = await import("../src/threeVectorClips.ts");
   const fixtures = [
@@ -147,7 +147,8 @@ try {
   assert.throws(() => validateVectorDrawRuns({ ...sample, drawRuns: undefined }), /requires ordered/);
   assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ ...sample.clipPaths[0], parent: 0 }] }), /clip path/);
   assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array([0, NaN, 1, 1]) }] }), /clip path/);
-  assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array((MAX_VECTOR_CLIP_EDGES + 1) * 4) }] }), /clip path/);
+  assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array((MAX_VECTOR_CLIP_EDGES + 1) * 4) }] }), /clip candidates/);
+  assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array((MAX_VECTOR_CLIP_PATH_EDGES + 1) * 4) }] }), /clip path/);
   const deep = Array.from({ length: MAX_VECTOR_CLIP_DEPTH + 1 }, (_, i) => ({ ...sample.clipPaths[0], parent: i - 1 }));
   assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: deep }), /nesting/);
   const packed = packVectorClips(sample.clipPaths);
@@ -165,6 +166,64 @@ try {
   const emptyIndex = builder.add({ ...clip, path: { ...clip.path, data: new Float32Array([0, 1, 1]) } });
   assert.equal(contains({ clipPaths: builder.paths }, emptyIndex, 1, 1), false);
   assert.equal(builder.coarseningDiagnostic(0), undefined, "clips within budget keep the usual tolerance");
+
+  // Source vertices can outgrow the edge budget while still describing just
+  // four straight sides. The initial move lies inside the bottom edge, so its
+  // closing seam must also coalesce without changing either winding rule.
+  const straight = [0, 10_000, 0];
+  for (let x = 10_001; x <= 20_000; x++) straight.push(1, x, 0);
+  straight.push(1, 20_000, 20_000, 1, 0, 20_000, 1, 0, 0, 4);
+  const exactClip = (data, fillRule = 0) => ({ parent: null, fillRule,
+    path: { data: Float32Array.from(data), transform: [1, 0, 0, 1, 0, 0],
+      bounds: { minX: 0, minY: 0, maxX: 20_000, maxY: 20_000 } } });
+  for (const fillRule of [0, 1]) {
+    const exact = new NativeVectorClipBuilder();
+    const index = exact.add(exactClip(straight, fillRule));
+    assert.equal(exact.paths[index].edges.length / 4, 4, "collinear vertices and the closing seam reduce exactly");
+    assert(contains({ clipPaths: exact.paths }, index, 5_000, 5_000));
+    assert(!contains({ clipPaths: exact.paths }, index, -1, 5_000));
+    assert.equal(exact.coarseningDiagnostic(0), undefined, "exact simplification costs no curve fidelity");
+  }
+
+  const outer = [0, 0, 0, 1, 20, 0, 1, 22, 5, 1, 20, 0, 1, 20, 20, 1, 0, 20, 4];
+  const inner = [0, 5, 5, 1, 5, 15, 1, 15, 15, 1, 15, 5, 4];
+  const island = [0, 7, 7, 1, 13, 7, 1, 13, 13, 1, 7, 13, 4];
+  for (const fillRule of [0, 1]) {
+    const exact = new NativeVectorClipBuilder();
+    const index = exact.add(exactClip([...outer, ...inner, ...island], fillRule));
+    assert.equal(exact.paths[index].edges.length / 4, 12, "a reversed spike cancels without merging contours");
+    assert(contains({ clipPaths: exact.paths }, index, 2, 2));
+    assert(!contains({ clipPaths: exact.paths }, index, 6, 6), "oppositely wound nested contour retains its hole");
+    assert(contains({ clipPaths: exact.paths }, index, 10, 10), "a third contour restores the island");
+  }
+  const doubled = new NativeVectorClipBuilder();
+  const doubledIndex = doubled.add(exactClip([...outer, ...outer], 1));
+  assert.equal(doubled.paths[doubledIndex].edges.length / 4, 8, "duplicate contours retain winding multiplicity");
+  assert(!contains({ clipPaths: doubled.paths }, doubledIndex, 2, 2));
+  let cancellationChecks = 0;
+  assert.throws(() => new NativeVectorClipBuilder().add(exactClip(straight), {
+    get aborted() { return ++cancellationChecks >= 4; }
+  }), error => error.code === "aborted", "long collapsed source paths still check cancellation");
+
+  // Disconnected line contours may need more canonical edges than a shader
+  // can scan at once. Spatial bands keep each lookup bounded while retaining
+  // every source edge and its exact winding.
+  const rectangles = Array.from({ length: 2_100 }, (_, index) =>
+    `${2 + index % 60} ${2 + Math.floor(index / 60)} .5 .5 re`).join(" ");
+  for (const rule of ["W", "W*"]) {
+    const session = await openPdf({ kind: "bytes", bytes: fixture(`q ${rectangles} ${rule} n /Fm Do Q`) });
+    try {
+      const scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
+      validateVectorDrawRuns(scene);
+      assert(scene.clipPaths.some(clip => clip.edges.length / 4 > MAX_VECTOR_CLIP_EDGES),
+        "the complete large clip stays canonical vector geometry");
+      assert.equal(scene.rasterLayers.length, 0);
+      assert(contains(scene, scene.drawRuns[0].clipIndex, 2.25, 2.25));
+      assert(!contains(scene, scene.drawRuns[0].clipIndex, 2.75, 2.25));
+      assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
+      comparePackedClips(scene.clipPaths, packVectorClips(scene.clipPaths));
+    } finally { await session.close(); }
+  }
 
   // Curves give up precision before a clip is refused; straight edges have none to give.
   const k = 300 * 0.5523;

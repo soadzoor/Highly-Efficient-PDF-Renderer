@@ -1,7 +1,10 @@
 import type { VectorClipPath, VectorScene } from "./pdfVectorExtractor";
 import { buildVectorPathCells, type VectorPathCells } from "./vectorCellIndex";
 
+/** Maximum candidate edges one shader invocation may scan for one clip. */
 export const MAX_VECTOR_CLIP_EDGES = 8192;
+/** Larger canonical paths must have an exact index within the shader budget. */
+export const MAX_VECTOR_CLIP_PATH_EDGES = 65536;
 export const MAX_VECTOR_CLIP_DEPTH = 64;
 // Keep texel offsets exactly representable as floats and bound upload memory to 64 MiB.
 export const MAX_VECTOR_CLIP_TEXELS = 4 * 1024 * 1024;
@@ -16,11 +19,16 @@ export function validateVectorClips(scene: VectorScene): void {
     const clip = clips[index];
     if (!clip || !Number.isInteger(clip.parent) || clip.parent < -1 || clip.parent >= index ||
         (clip.fillRule !== 0 && clip.fillRule !== 1) || !(clip.edges instanceof Float32Array) ||
-        clip.edges.length % 4 !== 0 || clip.edges.length / 4 > MAX_VECTOR_CLIP_EDGES ||
+        clip.edges.length % 4 !== 0 || clip.edges.length / 4 > MAX_VECTOR_CLIP_PATH_EDGES ||
         !clip.edges.every(Number.isFinite)) throw new Error("Invalid vector clip path.");
+    const requiredTexels = clip.edges.length / 4 > MAX_VECTOR_CLIP_EDGES
+      ? requiredVectorClipTexels(clip.edges) : clip.edges.length / 4;
+    if (requiredTexels === null) {
+      throw new Error("Vector clip candidates exceed the shader edge limit.");
+    }
     const depth = clip.parent < 0 ? 1 : depths[clip.parent] + 1;
     if (depth > MAX_VECTOR_CLIP_DEPTH) throw new Error("Vector clip nesting exceeds its limit.");
-    texels += clip.edges.length / 4;
+    texels += requiredTexels;
     if (texels > MAX_VECTOR_CLIP_TEXELS) throw new Error("Vector clip storage exceeds its limit.");
     depths.push(depth);
   }
@@ -104,25 +112,56 @@ function buildClipBands(edges: Float32Array): ClipBands | null {
   }
   const span = Math.fround(maxY - minY);
   if (!(span > 0) || !Number.isFinite(span)) return null;
-  const count = Math.min(MAX_CLIP_BANDS, 2 ** Math.ceil(Math.log2(edgeCount / TARGET_CLIP_EDGES_PER_BAND)));
-  const height = Math.fround(span / count);
-  if (height < MIN_NORMAL_FLOAT32) return null;
-  const counts = new Uint32Array(count);
-  let entries = 0;
-  for (let offset = 0; offset < edges.length; offset += 4) {
-    const y0 = edges[offset + 1], y1 = edges[offset + 3];
-    // Horizontal edges cannot change winding, but still bound edge coverage.
-    // Match Float32 addressing, with one neighbouring band on each side for
-    // backend rounding at a boundary. No geometry or crossing math is changed.
-    const first = Math.max(0, clipBandRow(Math.min(y0, y1), minY, height, count) - 1);
-    const last = Math.min(count - 1, clipBandRow(Math.max(y0, y1), minY, height, count) + 1);
-    entries += last - first + 1;
-    if (entries > edgeCount * MAX_CLIP_ENTRIES_PER_EDGE) return null;
-    for (let band = first; band <= last; band++) counts[band]++;
+  const required = edgeCount > MAX_VECTOR_CLIP_EDGES;
+  const initialCount = Math.min(MAX_CLIP_BANDS, 2 ** Math.ceil(Math.log2(edgeCount / TARGET_CLIP_EDGES_PER_BAND)));
+  for (let count = initialCount; count >= 1; count /= 2) {
+    const height = Math.fround(span / count);
+    if (height < MIN_NORMAL_FLOAT32) {
+      if (required) continue;
+      return null;
+    }
+    const counts = new Uint32Array(count);
+    let entries = 0;
+    for (let offset = 0; offset < edges.length; offset += 4) {
+      const y0 = edges[offset + 1], y1 = edges[offset + 3];
+      // Horizontal edges cannot change winding, but still bound edge coverage.
+      // Match Float32 addressing, with one neighbouring band on each side for
+      // backend rounding at a boundary. No geometry or crossing math is changed.
+      const first = Math.max(0, clipBandRow(Math.min(y0, y1), minY, height, count) - 1);
+      const last = Math.min(count - 1, clipBandRow(Math.max(y0, y1), minY, height, count) + 1);
+      entries += last - first + 1;
+      if (entries > edgeCount * MAX_CLIP_ENTRIES_PER_EDGE) break;
+      for (let band = first; band <= last; band++) {
+        if (++counts[band] > MAX_VECTOR_CLIP_EDGES) return null;
+      }
+    }
+    if (entries > edgeCount * MAX_CLIP_ENTRIES_PER_EDGE) {
+      // Coarser bands duplicate fewer long edges. Ordinary clips keep their
+      // existing optional-index behavior; oversized clips need a fitting index.
+      if (required) continue;
+      return null;
+    }
+    // Full-height edges gain nothing from indexing. Ordinary clips retain
+    // their original scan; oversized ones must keep the bounded candidate list.
+    if (!required && entries / count >= edgeCount / 2) return null;
+    return { minY, height, counts, entries };
   }
-  // Full-height edges gain nothing from indexing. Keep their original scan.
-  if (entries / count >= edgeCount / 2) return null;
-  return { minY, height, counts, entries };
+  return null;
+}
+
+/** Whether an oversized clip has an exact index within shader and storage bounds. */
+export function canIndexVectorClip(edges: Float32Array): boolean {
+  const count = edges.length / 4;
+  return count > MAX_VECTOR_CLIP_EDGES && requiredVectorClipTexels(edges) !== null;
+}
+
+/** Required GPU payload texels, excluding the node header; null if no bounded layout exists. */
+export function requiredVectorClipTexels(edges: Float32Array): number | null {
+  const count = edges.length / 4;
+  if (!Number.isInteger(count) || count > MAX_VECTOR_CLIP_PATH_EDGES || !edges.every(Number.isFinite)) return null;
+  if (count <= MAX_VECTOR_CLIP_EDGES) return count;
+  const bands = buildClipBands(edges);
+  return bands ? 1 + bands.counts.length + bands.entries : null;
 }
 
 /** Clip polygons are indexed more finely than fills: one texel per line piece. */
@@ -217,8 +256,9 @@ function clipPayloadKey(words: Uint32Array, rectangle: boolean): string {
  * Consecutive rectangle ancestors are intersected once, preserving node IDs.
  * Identical geometry shares a payload, independently of parent and fill rule.
  * The optional capacity bounds derived GPU storage; indexing falls back to the
- * coarser cell levels, bands or original scan when it cannot fit. Canonical
- * scene/HEP geometry is untouched.
+ * coarser cell levels, bands or original scan when it cannot fit. Paths above
+ * the shader edge budget always reserve their bounded band index; a capacity
+ * unable to fit it is rejected. Canonical scene/HEP geometry is untouched.
  */
 export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels = MAX_VECTOR_CLIP_TEXELS,
   options: PackVectorClipOptions = {}): Float32Array {
@@ -234,6 +274,9 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
   let count = clips.length;
   for (let index = 0; index < clips.length; index++) {
     const clip = clips[index];
+    if (clip.edges.length / 4 > MAX_VECTOR_CLIP_PATH_EDGES) {
+      throw new RangeError("Vector clip path exceeds its edge limit.");
+    }
     const rectangle = clipRectangle(clip.edges);
     const parentRectangle = rectangles[clip.parent];
     parents[index] = clip.parent;
@@ -253,17 +296,23 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
     const key = clipPayloadKey(words, !!rectangle), bucket = buckets.get(key);
     let payload = bucket?.find(candidate => candidate.words.every((word, i) => word === words[i]));
     if (!payload) {
-      payload = { edges, words, rectangle: !!rectangle, bands: null, cells: null, coarsened: false, offset: 0 };
+      const bands = edges.length / 4 > MAX_VECTOR_CLIP_EDGES && edges.every(Number.isFinite)
+        ? buildClipBands(edges) : null;
+      if (edges.length / 4 > MAX_VECTOR_CLIP_EDGES && !bands) {
+        throw new RangeError("Vector clip candidates exceed the shader edge limit.");
+      }
+      payload = { edges, words, rectangle: !!rectangle, bands, cells: null, coarsened: false, offset: 0 };
       if (bucket) bucket.push(payload); else buckets.set(key, [payload]);
       payloads.push(payload);
-      count += edges.length / 4;
+      count += bands ? 1 + bands.counts.length + bands.entries : edges.length / 4;
     }
     nodePayloads.push(payload);
   }
   if (count > maxTexels) throw new RangeError("Vector clip storage exceeds texture capacity.");
-  // Reserve every unique unindexed payload first. An earlier index must never
-  // consume the room needed by a later clip that the original layout could fit.
+  // Reserve every mandatory band index and ordinary unindexed payload first.
+  // Optional indices must never consume storage another clip needs to render.
   for (const payload of payloads) {
+    if (payload.bands) continue;
     const original = payload.edges.length / 4;
     const fullCells = options.cells && !payload.rectangle ? buildClipCells(payload.edges) : null;
     const capacity = maxTexels - count + original;

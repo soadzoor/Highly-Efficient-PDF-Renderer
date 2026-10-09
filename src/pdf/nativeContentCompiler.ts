@@ -665,6 +665,7 @@ export type DensePdfSelectivePaintReason =
   | "shading-pattern-stroke"
   | "tiling-pattern-fill"
   | "tiling-pattern-stroke"
+  | "large-path"
   | "large-disconnected-fill"
   | "clipped-path"
   | "clipped-image"
@@ -2102,7 +2103,10 @@ class DenseContentCompiler {
     this.remapStrokeIndices(compactOrderedStrokes
       ? this.strokes.compactRemoved()
       : await this.strokes.cullContainedInOrder(checkpoint));
-    const strokeResult = await this.strokes.finalize(checkpoint, compactOrderedStrokes);
+    const strokeResult = await this.strokes.finalize(checkpoint, compactOrderedStrokes,
+      this.vectorImagePathSpanCheckpoints.length > 0 && !this.policy.orderedPaint
+        ? remap => this.remapStrokeIndices(remap)
+        : undefined);
     if (compactOrderedStrokes) {
       const clipIndex = this.vectorSourceClipIndices[0] ?? -1;
       this.vectorSourceClipIndices.length = 0;
@@ -3388,12 +3392,8 @@ class DenseContentCompiler {
     }
 
     const pathData = this.path.view();
-    if (!this.policy.displayProgram && pathData.length > MAX_PAINT_PATH_FLOATS) {
-      throw new DensePdfUnsupportedError(
-        "A single PDF path is too large for cooperative vector compilation.",
-        operator
-      );
-    }
+    const oversizedPath = !this.policy.displayProgram &&
+      pathData.length > MAX_PAINT_PATH_FLOATS;
     const pathBounds = pathData.length > 0
       ? computeTransformedPathBounds(pathData, this.state.matrix)
       : null;
@@ -3479,9 +3479,21 @@ class DenseContentCompiler {
       this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON;
     const visibleStroke = strokePathVisible && strokePaint && !strokeUsesPattern &&
       this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON;
+    // The cooperative geometry budget applies to emitted paint, not to clip
+    // resources or discarded paths. Pages can preserve the complete compound
+    // path (including winding, dashes, and the active clip) through the native
+    // display program's bounded selective raster capture.
+    const visibleOversizedPath = oversizedPath &&
+      (visibleFill || visibleStroke || visiblePatternFill || visiblePatternStroke);
+    if (visibleOversizedPath && !this.policy.selectiveRaster) {
+      throw new DensePdfUnsupportedError(
+        "A single PDF path is too large for cooperative vector compilation.",
+        operator
+      );
+    }
     const selectivelyCapturedPath = this.policy.vectorScene === true &&
       this.policy.selectiveRaster === true &&
-      (largeDisconnectedFill || visiblePatternFill || visiblePatternStroke ||
+      (visibleOversizedPath || largeDisconnectedFill || visiblePatternFill || visiblePatternStroke ||
         ((!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) &&
           (visibleFill || visibleStroke)));
     if (selectivelyCapturedPath) {
@@ -3492,7 +3504,7 @@ class DenseContentCompiler {
         this.operatorSourceOffset,
         this.operatorSourceLength
       );
-      this.recordVectorSelectivePaint(ordinal, selectivePathPaintReason(
+      this.recordVectorSelectivePaint(ordinal, visibleOversizedPath ? "large-path" : selectivePathPaintReason(
         largeDisconnectedFill, visiblePatternFill, visiblePatternStroke,
         this.state.fillPattern?.kind, this.state.strokePattern?.kind));
       finishClip();
@@ -5919,7 +5931,8 @@ class DenseStrokeBuilder {
 
   async finalize(
     checkpoint: (force?: boolean) => Promise<void>,
-    compactOrderedStrokes = false
+    compactOrderedStrokes = false,
+    onIndexRemap?: (remap: Uint32Array) => void
   ): Promise<StrokeFinalizeResult> {
     // No further primitives can be emitted once finalization starts. Release
     // the duplicate hash table before allocating the containment-cull working
@@ -5950,7 +5963,8 @@ class DenseStrokeBuilder {
       this.primitiveMeta.usedView(),
       this.primitiveBounds.usedView(),
       this.styles.usedView(),
-      checkpoint
+      checkpoint,
+      onIndexRemap
     );
   }
 
@@ -6631,7 +6645,8 @@ async function cullContainedSegments(
   primitiveMeta: Float32Array,
   primitiveBounds: Float32Array,
   styles: Float32Array,
-  checkpoint: (force?: boolean) => Promise<void>
+  checkpoint: (force?: boolean) => Promise<void>,
+  onIndexRemap?: (remap: Uint32Array) => void
 ): Promise<StrokeFinalizeResult> {
   const { keep, discardedContainedCount } = await markContainedSegments(
     endpoints, primitiveMeta, primitiveBounds, styles, checkpoint, null);
@@ -6643,7 +6658,8 @@ async function cullContainedSegments(
     keep,
     keep.length - discardedContainedCount,
     discardedContainedCount,
-    checkpoint
+    checkpoint,
+    onIndexRemap
   );
 }
 
@@ -7012,15 +7028,20 @@ async function compactStrokeBuffers(
   keep: Uint8Array,
   visibleCount: number,
   discardedContainedCount: number,
-  checkpoint: (force?: boolean) => Promise<void>
+  checkpoint: (force?: boolean) => Promise<void>,
+  onIndexRemap?: (remap: Uint32Array) => void
 ): Promise<StrokeFinalizeResult> {
   // Finalization owns the builder stores: compact them in place, then shrink
   // them instead of copying four output stores at peak memory.
   const bounds = emptyBounds();
+  // Grouped vector output also stores stroke boundaries for selective image
+  // captures. Those boundaries must follow the final containment compaction.
+  const remap = onIndexRemap && discardedContainedCount > 0 ? new Uint32Array(keep.length + 1) : null;
   let maxHalfWidth = 0;
   let out = 0;
   for (let index = 0; index < keep.length; index += 1) {
     if ((index & 0x1fff) === 0) await checkpoint();
+    if (remap) remap[index] = out;
     if (keep[index] === 0) {
       continue;
     }
@@ -7038,6 +7059,10 @@ async function compactStrokeBuffers(
       }
     }
     out += 1;
+  }
+  if (remap) {
+    remap[keep.length] = out;
+    onIndexRemap!(remap);
   }
   return {
     endpoints: takeFloat32Prefix(endpoints, visibleCount * 4),

@@ -338,21 +338,29 @@ function testPdfEmbeddedSubsetCompatibility() {
     "unreachable trailing bearings must not alter count-derived metrics"
   );
 
-  const oversizedHmtxTables = cloneTables(fixture.tables);
-  oversizedHmtxTables.set(
-    "hmtx",
-    concatenate([oversizedHmtxTables.get("hmtx"), Uint8Array.of(0, 0, 0, 0, 0, 0)])
-  );
-  expectPdf(
-    () => NativeSfntFont.parse(
-      buildSfnt(oversizedHmtxTables),
-      0,
-      undefined,
-      "pdf-embedded"
-    ),
-    "unsupported-font",
-    /hhea\/hmtx/i
-  );
+  for (const trailingByteCount of [6, 64, 4_096]) {
+    const oversizedHmtxTables = cloneTables(fixture.tables);
+    const tail = new Uint8Array(trailingByteCount).fill(0xff);
+    oversizedHmtxTables.set(
+      "hmtx",
+      concatenate([oversizedHmtxTables.get("hmtx"), tail])
+    );
+    const oversizedHmtx = buildSfnt(oversizedHmtxTables);
+    expectPdf(
+      () => NativeSfntFont.parse(oversizedHmtx),
+      "unsupported-font",
+      /hhea\/hmtx/i
+    );
+    const font = NativeSfntFont.parse(oversizedHmtx, 0, undefined, "pdf-embedded");
+    assert.deepEqual(
+      font.getHorizontalMetric(9),
+      { advanceWidth: 900, leftSideBearing: 90 },
+      "stale subset tails of any length cannot alter count-derived metrics"
+    );
+    assert.deepEqual(font.getGlyphOutline(1).bounds, [0, 0, 200, 100]);
+    assert.equal(font.diagnostics[0]?.details?.reason, "hmtx-trailing-bytes");
+    assert.equal(font.diagnostics[0]?.details?.ignoredByteCount, trailingByteCount);
+  }
 
   const staleGlyphBoundsTables = cloneTables(fixture.tables);
   new DataView(staleGlyphBoundsTables.get("glyf").buffer)

@@ -197,8 +197,9 @@ export const BUNDLED_STANDARD_FONT_ASSETS: Readonly<
 /**
  * Resolve a PDF font request to one deterministic bundled substitute.
  *
- * The exact Standard-14 names are honored first. Other nonembedded fonts use
- * descriptor/family/style metadata, making fallback stable across platforms.
+ * The exact Standard-14 names are honored first. Other missing fonts and
+ * unsupported Type1 programs use descriptor/family/style metadata, making
+ * fallback stable across platforms.
  */
 export function resolveBundledStandardFontAsset(
   request: Readonly<NativeMissingFontRequest>
@@ -229,7 +230,8 @@ export function resolveBundledStandardFontAsset(
 
 /**
  * Create a lazy, deterministic resolver for the PDF Standard-14 family and
- * other nonembedded fonts. Completed face loads are cached per resolver.
+ * other missing fonts or unsupported Type1 programs. Completed face loads are
+ * cached per resolver.
  */
 export function createBundledStandardFontResolver(
   options: CreateBundledStandardFontResolverOptions = {}

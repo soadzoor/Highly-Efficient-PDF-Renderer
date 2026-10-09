@@ -126,6 +126,8 @@ export const fastTests = [
   "native-document-semantics",
   "native-source-range-edge-cases",
   "native-font-text",
+  "native-sfnt-semantics",
+  "native-type1-substitution",
   "pdf-actual-text",
   "pdf-session-ext-gstate-font",
   "native-image-codecs",

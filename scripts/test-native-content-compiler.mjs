@@ -18,6 +18,7 @@ import {
   compileRetainedTextContent,
   DensePdfSyntaxError,
   DensePdfUnsupportedError,
+  DensePdfResourceLimitError,
   getDensePdfPaintSourceIdentity,
   scanDensePdfPreparedResourceReferences
 } from "../src/pdf/nativeContentCompiler.ts";
@@ -50,6 +51,7 @@ await testCancellationAndProgress();
 await testMergeCullAndFillBoundaries();
 await testLosslessExtremeCoordinateKeys();
 await testCooperativeEligibilityLimits();
+await testGroupedSelectiveImageCheckpoints();
 
 console.log("Dense PDF content compiler tests passed.");
 
@@ -1119,7 +1121,71 @@ async function testCooperativeEligibilityLimits() {
     commands.push(`${index} ${index % 2} l`);
   }
   commands.push("S");
-  await expectUnsupported(commands.join("\n"), "S");
+  const path = commands.slice(0, -1).join("\n");
+  await expectUnsupported(`${path}\nS`, "S");
+
+  const content = `0 0 2 2 re f\n${path}\nB*\n0 0 3 3 re f`;
+  const captured = await compile(content, { output: "vector-scene" });
+  assert.equal(captured.fillPathCount, 2, "surrounding fills stay vector");
+  assert.equal(captured.segmentCount, 0, "an oversized compound paint is captured as one whole path");
+  assert.deepEqual(captured.vectorSceneData.selectivePaintReasons, ["large-path"]);
+  assert.deepEqual([...captured.vectorSceneData.selectivePaintSourceSpans], [content.indexOf("B*"), 2]);
+  assert.deepEqual([...captured.vectorSceneData.selectivePaintOrdinalSpans], [1, 1],
+    "the complete fill/stroke paint occupies its source position");
+
+  const retained = await compile(`${path}\nB*`, { output: "display-program" });
+  assert.equal(retained.pagePaths[0].data.length, 66_003,
+    "the fallback display program retains every path command");
+  assert.equal(retained.genericPathPaints[0].fillRule, 1, "even-odd holes survive capture");
+  assert.ok(retained.genericPathPaints[0].fill && retained.genericPathPaints[0].stroke);
+
+  const clipped = await compile(`${path}\nW n\n0 0 2 2 re f`, { output: "vector-scene" });
+  assert.equal(clipped.pagePaths[0].data.length, 66_003,
+    "oversized clip-only paths remain exact vector clip resources");
+  assert.equal(clipped.clipPaths.length, 1);
+  assert.equal(clipped.fillPathCount, 1);
+  assert.equal(clipped.vectorSceneData.selectivePaintSourceSpans.length, 0,
+    "clip construction itself has no raster paint to capture");
+
+  const discarded = await compile(`${path}\nn`, { output: "vector-scene" });
+  assert.equal(discarded.pathCount, 0, "unpainted paths do not exceed the paint budget");
+  const invisible = await compile(`${path}\nf`, {
+    output: "vector-scene",
+    pageBounds: { minX: -10, minY: -10, maxX: -1, maxY: -1 }
+  });
+  assert.equal(invisible.pathCount, 0, "off-page fills do not require capture");
+
+  await assert.rejects(compile(content, { output: "vector-scene", maxPathVerbs: 22_000 }),
+    error => error instanceof DensePdfResourceLimitError && /verb limit/.test(error.message),
+    "selective capture does not bypass path resource limits");
+
+  const controller = new AbortController();
+  await assert.rejects(compile(content, {
+    output: "vector-scene",
+    signal: controller.signal,
+    onProgress(progress) {
+      if (progress.phase === "finalizing") controller.abort(new Error("large-path cancellation"));
+    }
+  }), /large-path cancellation/, "selective captures remain cancellable before finalization");
+}
+
+async function testGroupedSelectiveImageCheckpoints() {
+  const containedImageSpan = await compileGroupedPage(
+    "0 0 m 100 0 l S 10 0 m 20 0 l S /Im0 Do",
+    { imageXObjects: new Map([["Im0", 0]]) }
+  );
+  assert.equal(containedImageSpan.segmentCount, 1, "a contained stroke is culled");
+  assert.deepEqual([...containedImageSpan.vectorSceneData.imagePathSpanCheckpoints], [0, 0, 0, 1, 0, 2],
+    "grouped containment culling remaps selective-image geometry checkpoints");
+
+  const twoImages = await compileGroupedPage(
+    "0 100 m 100 100 l S /Im0 Do 0 0 m 100 0 l S 10 0 m 20 0 l S /Im0 Do",
+    { imageXObjects: new Map([["Im0", 0]]) }
+  );
+  assert.equal(twoImages.segmentCount, 2);
+  assert.deepEqual([...twoImages.vectorSceneData.imagePathSpanCheckpoints],
+    [0, 0, 1, 1, 1, 1, 0, 0, 1, 2, 2, 4],
+    "nonzero stroke starts and the final stroke boundary both follow compaction");
 }
 
 async function* delayedChunks(bytes, chunkSize) {

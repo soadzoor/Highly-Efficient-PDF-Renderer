@@ -13,7 +13,9 @@ const scratch = new DataView(new ArrayBuffer(4));
 let checkedRows = 0, checkedPoints = 0, checkedDistances = 0, checkedCoverage = 0, checkedClamps = 0;
 let clampMarginUsed = false;
 try {
-  const { packVectorClips, vectorClipChainBounds } = await import("../src/vectorClips.ts");
+  const { packVectorClips, vectorClipChainBounds, validateVectorClips, canIndexVectorClip,
+    requiredVectorClipTexels, MAX_VECTOR_CLIP_EDGES, MAX_VECTOR_CLIP_PATH_EDGES, MAX_VECTOR_CLIP_TEXELS } =
+    await import("../src/vectorClips.ts");
   const oval = ellipse(2945, 125, 70);
   const fixtures = [
     ["dense oval", oval],
@@ -200,6 +202,74 @@ try {
   assert.equal(sharedRaw.length / 4, rawTexels + 1, "sharing also fits exact unindexed payload budgets");
   assert.equal(sharedRaw[1], sharedRaw[5]); assert.equal(sharedRaw[7], 1);
   assert.equal(sharedRaw[4], 0, "sharing never removes polygon ancestry");
+
+  // Large canonical paths keep their exact edges while every shader list stays
+  // bounded. These short rectangles exceed 4x duplication at 512 bands and
+  // therefore need 256 bands; reducing band count never drops source geometry.
+  const adaptiveEdges = new Float32Array(3000 * 16);
+  for (let index = 0; index < 3000; index++) {
+    const x = index % 16, y = index / 3000;
+    adaptiveEdges.set(rectangle(x, y, x + 1, y + 3 / 512), index * 16);
+  }
+  assert(adaptiveEdges.length / 4 > MAX_VECTOR_CLIP_EDGES);
+  assert.equal(canIndexVectorClip(adaptiveEdges), true);
+  assert.equal(requiredVectorClipTexels(oval), oval.length / 4);
+  const largeClips = [0, 1].map(fillRule => ({ parent: -1, fillRule, edges: adaptiveEdges }));
+  validateVectorClips({ clipPaths: largeClips });
+  const largeSnapshot = structuredClone(largeClips);
+  const requiredTexels = requiredVectorClipTexels(adaptiveEdges);
+  for (const cells of [false, true]) {
+    const packed = packVectorClips(largeClips, requiredTexels + largeClips.length, { cells });
+    assert.equal(packed.length / 4, requiredTexels + largeClips.length, "shared large geometry reserves one mandatory index");
+    assert.equal(packed[3], 2, "large nonzero clips always use bounded bands");
+    assert.equal(packed[7], 3, "large even-odd clips always use bounded bands");
+    assert.equal(packed[1], packed[5], "both rules share their exact mandatory band payload");
+    const info = packed[1] * 4;
+    assert.equal(packed[info + 3], 256, "adaptive bands fit the duplication cap at a coarser index");
+    const rows = boundaryRows(adaptiveEdges, packed, 0).filter((_, index) => index % 128 === 0);
+    const stats = verifyBands("large adaptive clip", adaptiveEdges, packed, 0, rows);
+    assert(stats.maximum <= MAX_VECTOR_CLIP_EDGES, "every band fits the static shader scan budget");
+    assert(stats.entries <= adaptiveEdges.length, "mandatory band entries stay within 4x original edges");
+    assert.equal(requiredTexels, 1 + packed[info + 3] + stats.entries);
+    for (const y of [-0.01, 0, 0.125, 0.3333, 0.5, 0.875, 1, 1.01]) {
+      for (const x of [-0.01, 0, 0.5, 3.5, 7.5, 15.5, 16]) {
+        for (const root of [0, 1]) {
+          assert.equal(packedContains(packed, root, x, y), originalContains(largeClips, root, x, y),
+            "mandatory indices preserve nonzero and even-odd winding");
+          checkedPoints++;
+        }
+      }
+    }
+    for (const width of [0.0001, 0.01, 0.25]) for (const [x, y] of [[0, 0], [3.5, 0.5], [15.5, 1]]) {
+      for (const root of [0, 1]) verifyCoverage("large adaptive clip", largeClips, packed, root, x, y, width);
+    }
+    assert.throws(() => packVectorClips([largeClips[0]], adaptiveEdges.length / 4 + 1, { cells }), /capacity/i,
+      "large clips cannot fall back to a raw scan when their mandatory index does not fit");
+    assert.throws(() => packVectorClips([largeClips[0]], requiredTexels, { cells }), /capacity/i,
+      "the mandatory payload budget also includes its node header");
+  }
+  assert.deepEqual(largeClips, largeSnapshot, "index adaptation never changes canonical clip geometry");
+  const mandatoryBudget = 2 + oval.length / 4 + requiredTexels;
+  const reserved = packVectorClips([clip, largeClips[0]], mandatoryBudget, { cells: true });
+  assert(reserved.length / 4 <= mandatoryBudget);
+  assert.equal(reserved[7], 2, "earlier optional indices cannot consume a later clip's mandatory band storage");
+  const tooManyIndexed = Array.from({ length: Math.floor(MAX_VECTOR_CLIP_TEXELS / (requiredTexels + 1)) + 1 },
+    () => ({ ...largeClips[0] }));
+  assert(tooManyIndexed.length * (adaptiveEdges.length / 4 + 1) < MAX_VECTOR_CLIP_TEXELS,
+    "the raw canonical paths fit the aggregate budget before mandatory index overhead");
+  assert.throws(() => validateVectorClips({ clipPaths: tooManyIndexed }), /storage exceeds its limit/i,
+    "validation charges every mandatory index to the aggregate GPU budget");
+
+  const fullHeight = polygon(Array.from({ length: MAX_VECTOR_CLIP_EDGES + 2 }, (_, index) => [index, index % 2]));
+  assert.equal(canIndexVectorClip(fullHeight), false, "too many full-height candidates remain bounded failures");
+  assert.equal(requiredVectorClipTexels(fullHeight), null);
+  const unindexable = [{ parent: -1, fillRule: 0, edges: fullHeight }];
+  assert.throws(() => validateVectorClips({ clipPaths: unindexable }), /shader edge limit/i);
+  assert.throws(() => packVectorClips(unindexable, undefined, { cells: true }), /shader edge limit/i);
+  const excessive = [{ parent: -1, fillRule: 0, edges: new Float32Array((MAX_VECTOR_CLIP_PATH_EDGES + 1) * 4) }];
+  assert.equal(requiredVectorClipTexels(excessive[0].edges), null);
+  assert.throws(() => validateVectorClips({ clipPaths: excessive }), /Invalid vector clip path/i);
+  assert.throws(() => packVectorClips(excessive), /path exceeds its edge limit/i);
 
   // Construct a real FNV-1a collision. Hash equality alone must never merge
   // geometry, even when all lengths and node types also match.
@@ -392,7 +462,7 @@ function bandStats(packed, root) {
   }
   return { average: entries / bandCount, maximum, entries };
 }
-function verifyBands(name, edges, packed, root) {
+function verifyBands(name, edges, packed, root, rows = boundaryRows(edges, packed, root)) {
   const info = packed[root * 4 + 1] * 4, table = packed[info] * 4, bandCount = packed[info + 3];
   assert(Number.isInteger(bandCount) && bandCount > 0);
   assert(Number.isFinite(packed[info + 2]) && packed[info + 2] > 0);
@@ -413,7 +483,7 @@ function verifyBands(name, edges, packed, root) {
   }
   // Preserving the complete ordered set of edges crossing each row is stronger
   // than testing a few pixel centers: winding then agrees for every x on that row.
-  for (const y of boundaryRows(edges, packed, root)) {
+  for (const y of rows) {
     const [offset, count] = bandRange(packed, root, y), selected = originals.get(`${offset}:${count}`);
     assert(selected, `${name}: Float32 row lookup addresses a valid band`);
     let candidate = 0;

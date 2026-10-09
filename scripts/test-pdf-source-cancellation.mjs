@@ -60,9 +60,12 @@ try {
   const originalFetch = globalThis.fetch;
   const fetchController = new AbortController();
   let receivedFetchSignal = null;
+  let resolveFetchStarted;
+  const fetchStarted = new Promise(resolve => { resolveFetchStarted = resolve; });
   try {
     globalThis.fetch = (_input, init) => {
       receivedFetchSignal = init?.signal ?? null;
+      resolveFetchStarted();
       return new Promise((_resolve, reject) => {
         receivedFetchSignal?.addEventListener(
           "abort",
@@ -76,6 +79,12 @@ try {
       "https://example.test/slow.pdf",
       { signal: fetchController.signal }
     );
+    await Promise.race([
+      fetchStarted,
+      pendingExport.then(() => {
+        throw new Error("HEP export completed before starting the mocked PDF fetch.");
+      })
+    ]);
     assert.equal(receivedFetchSignal, fetchController.signal);
     fetchController.abort();
     await assert.rejects(pendingExport, (error) => error?.name === "AbortError");

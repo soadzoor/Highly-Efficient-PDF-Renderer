@@ -134,6 +134,7 @@ export const PDF_DIAGNOSTIC_CODES = {
   MetadataInvalidField: "metadata.invalid-field",
   MetadataInvalidId: "metadata.invalid-id",
   MissingFontSubstituted: "font.missing-substituted",
+  UnsupportedType1Substituted: "font.type1-substituted",
   InvalidToUnicode: "font.invalid-to-unicode",
   MissingUnicodeMapping: "font.missing-unicode-mapping",
   AppearanceSynthesized: "annotation.appearance-synthesized",

@@ -1,6 +1,7 @@
 import type { DensePdfBounds, DensePdfMatrix, DensePdfTextClip } from "./nativeContentCompiler";
 import type { VectorClipPath } from "../pdfVectorExtractor";
-import { MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES, MAX_VECTOR_CLIP_TEXELS } from "../vectorClips";
+import { MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES, MAX_VECTOR_CLIP_PATH_EDGES,
+  MAX_VECTOR_CLIP_TEXELS, requiredVectorClipTexels } from "../vectorClips";
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 
 export function rectangleVectorClip(bounds: Readonly<DensePdfBounds>, transform: DensePdfMatrix,
@@ -71,14 +72,15 @@ const MAX_CLIP_CURVE_TOLERANCE = CLIP_CURVE_TOLERANCE * 4 ** 5;
 
 interface FlattenedVectorClip {
   readonly edges: number[];
-  /** The edges stopped at MAX_VECTOR_CLIP_EDGES; the path is incomplete. */
+  /** The edges stopped at their bounded representation limit; the path is incomplete. */
   readonly overflow: boolean;
   /** A curve took more than its chord, so a coarser tolerance needs fewer edges. */
   readonly subdivided: boolean;
   readonly curves: boolean;
 }
 
-function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, signal?: AbortSignal): FlattenedVectorClip {
+function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, signal?: AbortSignal,
+  edgeLimit = MAX_VECTOR_CLIP_EDGES): FlattenedVectorClip {
   const edges: number[] = [];
   const data = path.data;
   const [a, b, c, d, e, f] = path.transform;
@@ -86,11 +88,38 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
     a * data[offset] + c * data[offset + 1] + e, b * data[offset] + d * data[offset + 1] + f
   ];
   let x = 0, y = 0, sx = 0, sy = 0, open = false, overflow = false, subdivided = false, curves = false;
+  let subpathEdgeStart = 0;
   const line = (nx: number, ny: number): void => {
     if (x === nx && y === ny) return;
-    if (edges.length >= MAX_VECTOR_CLIP_EDGES * 4) { overflow = true; return; }
+    // Consecutive collinear edges have the same directed winding as their
+    // endpoint chord, including partial or complete backtracking. Use exact
+    // equality so simplification never changes a corner or a narrow hole.
+    while (edges.length > subpathEdgeStart) {
+      const last = edges.length - 4;
+      const ax = edges[last], ay = edges[last + 1];
+      if ((x - ax) * (ny - y) !== (y - ay) * (nx - x)) break;
+      edges.length = last;
+      x = ax; y = ay;
+      if (x === nx && y === ny) return;
+    }
+    if (edges.length >= edgeLimit * 4) { overflow = true; return; }
     if ((edges.length & 1023) === 0) throwIfAborted(signal);
     edges.push(x, y, nx, ny); x = nx; y = ny;
+  };
+  const finishSubpath = (): void => {
+    // The move point can lie in the middle of a straight boundary. Merge the
+    // closing seam too, while keeping independent source contours separate.
+    while (edges.length >= subpathEdgeStart + 8) {
+      const first = subpathEdgeStart, last = edges.length - 4;
+      const ax = edges[last], ay = edges[last + 1];
+      const bx = edges[first], by = edges[first + 1];
+      const cx = edges[first + 2], cy = edges[first + 3];
+      if (edges[last + 2] !== bx || edges[last + 3] !== by ||
+          (bx - ax) * (cy - by) !== (by - ay) * (cx - bx)) break;
+      edges[first] = ax; edges[first + 1] = ay;
+      edges.length = last;
+      if (ax === cx && ay === cy) edges.splice(first, 4);
+    }
   };
   const cubic = (x0: number, y0: number, x1: number, y1: number, x2: number, y2: number,
     x3: number, y3: number, level = 0): void => {
@@ -111,10 +140,14 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
     cubic(x0, y0, ax, ay, dx, dy, mx, my, level + 1);
     cubic(mx, my, ex, ey, cx, cy, x3, y3, level + 1);
   };
+  let sourceWork = 0;
   for (let offset = 0; offset < data.length && !overflow;) {
+    // A long straight source path may now collapse to one stored edge.
+    if ((sourceWork++ & 1023) === 0) throwIfAborted(signal);
     const op = data[offset++];
     if (op === 0) {
-      if (open) line(sx, sy);
+      if (open) { line(sx, sy); finishSubpath(); }
+      subpathEdgeStart = edges.length;
       [x, y] = point(offset); sx = x; sy = y; offset += 2; open = true;
     } else if (op === 1) { line(...point(offset)); offset += 2; open = true; }
     else if (op === 2) {
@@ -125,10 +158,13 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
       const [cx, cy] = point(offset), [nx, ny] = point(offset + 2);
       cubic(x, y, x + (cx - x) * 2 / 3, y + (cy - y) * 2 / 3,
         nx + (cx - nx) * 2 / 3, ny + (cy - ny) * 2 / 3, nx, ny); offset += 4; open = true;
-    } else if (op === 4) { if (open) line(sx, sy); open = false; }
+    } else if (op === 4) {
+      if (open) { line(sx, sy); finishSubpath(); }
+      open = false; subpathEdgeStart = edges.length;
+    }
     else throw new PdfError("invalid-object", "Invalid vector clip path operator.");
   }
-  if (open) line(sx, sy);
+  if (open) { line(sx, sy); finishSubpath(); }
   return { edges, overflow, subdivided, curves };
 }
 
@@ -151,9 +187,9 @@ export class NativeVectorClipBuilder {
     if (existing !== undefined) return existing;
     const parent = this.add(clip.parent, signal, depth + 1) ?? -1;
     let tolerance = CLIP_CURVE_TOLERANCE;
-    let flattened = flattenVectorClip(clip.path, tolerance, signal);
+    let flattened = flattenVectorClip(clip.path, tolerance, signal, MAX_VECTOR_CLIP_PATH_EDGES);
     if (flattened.curves) this.approximatedCurves = true;
-    while (flattened.overflow) {
+    while (flattened.overflow || (flattened.curves && flattened.edges.length > MAX_VECTOR_CLIP_EDGES * 4)) {
       // Without subdivided curves the edges are already as few as the path allows.
       if (!flattened.subdivided || tolerance >= MAX_CLIP_CURVE_TOLERANCE) throw new PdfError("unsupported-content",
         "A vector clip exceeds the bounded edge representation.", { details: { reason: "vector-clip-edge-limit" } });
@@ -161,11 +197,16 @@ export class NativeVectorClipBuilder {
       flattened = flattenVectorClip(clip.path, tolerance, signal);
     }
     const packedEdges = Float32Array.from(flattened.edges);
+    const payloadTexels = requiredVectorClipTexels(packedEdges);
+    if (payloadTexels === null) {
+      throw new PdfError("unsupported-content", "A vector clip exceeds the bounded edge representation.",
+        { details: { reason: "vector-clip-edge-limit" } });
+    }
     const shapeKey = `${parent}:${clip.fillRule}:${packedEdges.join(",")}`;
     const sameShape = this.shapes.get(shapeKey);
     if (sameShape !== undefined) { this.ids.set(clip, sameShape); return sameShape; }
     const index = this.paths.length;
-    this.texelCount += 1 + packedEdges.length / 4;
+    this.texelCount += 1 + payloadTexels;
     if (this.texelCount > MAX_VECTOR_CLIP_TEXELS) {
       throw new PdfError("resource-limit", "Vector clip storage exceeds its limit.");
     }
