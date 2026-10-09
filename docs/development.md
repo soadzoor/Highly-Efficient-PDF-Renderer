@@ -31,7 +31,7 @@ Open the URL printed by Vite. The demo entry points are:
 
 | Command | Purpose |
 | --- | --- |
-| `npm test` | Type check and bounded fast regression suite. |
+| `npm test` | Type check and fast regression suite. |
 | `npm run typecheck` | TypeScript checks only. |
 | `npm run test:file -- scripts/test-text-search.mjs` | Run one regression file. |
 | `npm run build` | Build the demo app. |

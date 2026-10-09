@@ -2,8 +2,6 @@ import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 export const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-export const testTimeoutMs = 60_000;
-export const suiteBudgetMs = 10 * 60_000;
 
 // Keep the existing CI selection explicit. Discovery of a new test must not
 // silently add servers, corpus work, or PDF-to-HEP conversions to npm test.

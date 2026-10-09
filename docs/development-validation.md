@@ -6,7 +6,7 @@ No additional test framework is required.
 
 | Command | Scope |
 | --- | --- |
-| `npm test` | Typecheck plus the bounded fast regression suite. |
+| `npm test` | Typecheck plus the fast regression suite. |
 | `npm run test:fast` | Explicit CI selection covering loading, cancellation, parsing, workers, compositing, text/search, LOD, and the runner itself. |
 | `npm run test:unit` | Discovered algorithm and source-contract tests. |
 | `npm run test:integration` | Discovered Node session, worker, codec, and component-interaction tests. |
@@ -17,10 +17,10 @@ No additional test framework is required.
 | `npm run test:file -- <path>` | Run one file, forwarding any following arguments to it. |
 
 The shared runner executes each file in a fresh Node process, sequentially,
-with TypeScript stripping enabled. It enforces a 60-second per-file timeout
-and a ten-minute suite budget, reports failures, and exits nonzero. The total
-budget cancels running and queued tests. These defaults also apply to individual
-files; increase them explicitly for a longer manual check.
+with TypeScript stripping enabled. It has no per-file timeout or total suite
+budget by default, reports failures, and exits nonzero. Set `--timeout=ms` or
+`--budget=ms` explicitly to enforce a deadline. An explicit total budget cancels
+running and queued tests. Ctrl+C also cancels the run.
 
 Preview a selection without importing or executing any test:
 

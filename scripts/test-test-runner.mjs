@@ -36,7 +36,7 @@ async function executeFixture(files, options = {}) {
   const launcher = join(temp, "launch.mjs");
   await writeFile(launcher,
     `import { executeTests } from ${JSON.stringify(new URL("./run-tests.mjs", import.meta.url).href)};\n` +
-    `process.exitCode = await executeTests(${JSON.stringify({ files, timeout: 2_000, budget: 5_000, ...options })});\n`
+    `process.exitCode = await executeTests(${JSON.stringify({ files, ...options })});\n`
   );
   return await invoke([launcher]);
 }
@@ -58,6 +58,14 @@ try {
   assert.throws(() => parseArgs(["file"]), /Provide a test file/);
   assert.throws(() => parseArgs(["unit", "--timeout=0"]), /positive integer/);
   assert.throws(() => parseArgs(["unit", "--budget=NaN"]), /positive integer/);
+  for (const args of [["fast"], ["file", "scripts/test-test-runner.mjs"]]) {
+    const defaults = parseArgs(args);
+    assert.equal(defaults.timeout, undefined, "test files have no default timeout");
+    assert.equal(defaults.budget, undefined, "test suites have no default budget");
+  }
+  const limits = parseArgs(["unit", "--timeout=200", "--budget=500"]);
+  assert.equal(limits.timeout, 200);
+  assert.equal(limits.budget, 500);
 
   const pass = join(temp, "pass.mjs");
   const fail = join(temp, "fail.mjs");
@@ -68,6 +76,21 @@ try {
   await writeFile(fail, 'throw new Error("intentional runner regression failure");\n');
   await writeFile(hang, 'while (true) {}\n');
   await writeFile(later, `import { writeFile } from "node:fs/promises"; await writeFile(${JSON.stringify(marker)}, "ran");\n`);
+
+  const unlimitedLauncher = join(temp, "unlimited.mjs");
+  await writeFile(unlimitedLauncher,
+    'import assert from "node:assert/strict";\n' +
+    `import { executeTests } from ${JSON.stringify(new URL("./run-tests.mjs", import.meta.url).href)};\n` +
+    'const scheduled = [];\n' +
+    'const originalSetTimeout = globalThis.setTimeout;\n' +
+    'globalThis.setTimeout = (...args) => { scheduled.push(args[1]); return originalSetTimeout(...args); };\n' +
+    'try {\n' +
+    `  assert.equal(await executeTests({ files: [${JSON.stringify(pass)}] }), 0);\n` +
+    '  assert.deepEqual(scheduled, [], "running without limit flags must not schedule deadline timers");\n' +
+    '} finally { globalThis.setTimeout = originalSetTimeout; }\n'
+  );
+  const unlimited = await invoke([unlimitedLauncher]);
+  assert.equal(unlimited.code, 0, unlimited.output);
 
   const listed = await invoke([runner, "file", "--list", fail]);
   assert.equal(listed.code, 0);
@@ -120,7 +143,18 @@ try {
   assert.match(overBudget.output, /total budget/);
   assert.match(overBudget.output, /1\/2 test files completed: 0 passed, 1 failed, 1 not run\./);
   await assert.rejects(readFile(marker), { code: "ENOENT" }, "cancel queued tests when the total budget expires");
-  console.log("Test runner selection, opt-in boundaries, arguments, isolation, failures, and deadlines passed.");
+
+  const interruptedLauncher = join(temp, "interrupted.mjs");
+  await writeFile(interruptedLauncher,
+    `import { executeTests } from ${JSON.stringify(new URL("./run-tests.mjs", import.meta.url).href)};\n` +
+    'setTimeout(() => process.kill(process.pid, "SIGINT"), 200);\n' +
+    `process.exitCode = await executeTests(${JSON.stringify({ files: [hang, later] })});\n`
+  );
+  const interrupted = await invoke([interruptedLauncher]);
+  assert.equal(interrupted.code, 1, interrupted.output);
+  assert.match(interrupted.output, /1\/2 test files completed: 0 passed, 1 failed, 1 not run\./);
+  await assert.rejects(readFile(marker), { code: "ENOENT" }, "interrupts cancel queued tests without deadline flags");
+  console.log("Test runner selection, opt-in boundaries, arguments, isolation, failures, unlimited defaults, explicit deadlines, and interruption passed.");
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

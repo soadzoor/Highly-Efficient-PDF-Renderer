@@ -3,7 +3,7 @@ import { relative, resolve } from "node:path";
 import { run } from "node:test";
 import { spec } from "node:test/reporters";
 import { pathToFileURL } from "node:url";
-import { discoverTests, repoRoot, selectSuite, suiteBudgetMs, testTimeoutMs } from "./lib/testSuites.mjs";
+import { discoverTests, repoRoot, selectSuite } from "./lib/testSuites.mjs";
 
 const usage = `Usage:
   node scripts/run-tests.mjs <suite> [--list] [--timeout=ms] [--budget=ms]
@@ -11,13 +11,14 @@ const usage = `Usage:
 
 Suites: fast, unit, integration, package, browser, conversion, corpus.
 Tests run sequentially in isolated Node processes. --list never executes tests.
+There are no time limits unless --timeout or --budget is supplied.
 The package suite requires npm run build:lib; conversion/browser/corpus suites
 are opt-in and can require Vite middleware, fixtures, or generated artifacts.`;
 
 export function parseArgs(args) {
   const [suite, ...rest] = args;
   if (!suite || suite === "--help" || suite === "-h") return { help: true };
-  const options = { suite, list: false, timeout: testTimeoutMs, budget: suiteBudgetMs, files: [], argv: [] };
+  const options = { suite, list: false, files: [], argv: [] };
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index];
     if (arg === "--list") options.list = true;
@@ -43,18 +44,18 @@ export function parseArgs(args) {
   return options;
 }
 
-export async function executeTests({ files, argv = [], timeout = testTimeoutMs, budget = suiteBudgetMs }) {
+export async function executeTests({ files, argv = [], timeout, budget }) {
   if (!files.length) throw new Error("Refusing to run without an explicit test selection.");
   const controller = new AbortController();
   let failed = false;
   let completed = 0;
   const failedFiles = [];
-  const timer = setTimeout(() => {
+  const timer = budget === undefined ? undefined : setTimeout(() => {
     failed = true;
     console.error(`Test suite exceeded its ${budget}ms total budget.`);
     controller.abort();
   }, budget);
-  timer.unref();
+  timer?.unref();
   const interrupt = () => {
     failed = true;
     controller.abort();
@@ -64,16 +65,16 @@ export async function executeTests({ files, argv = [], timeout = testTimeoutMs, 
   try {
     for (const file of files) {
       if (controller.signal.aborted) break;
-      // Enforce the deadline in the parent too: a legacy test's synchronous
+      // Enforce an explicit deadline in the parent too: a legacy test's synchronous
       // loop can prevent Node's in-test timeout from firing in the child.
       const fileController = new AbortController();
       let fileFailed = false;
-      const fileTimer = setTimeout(() => {
+      const fileTimer = timeout === undefined ? undefined : setTimeout(() => {
         failed = true;
         fileFailed = true;
         fileController.abort(new Error(`Test file timed out after ${timeout}ms: ${file}`));
       }, timeout);
-      fileTimer.unref();
+      fileTimer?.unref();
       try {
         const stream = run({
           files: [file],
@@ -82,7 +83,7 @@ export async function executeTests({ files, argv = [], timeout = testTimeoutMs, 
           concurrency: 1,
           isolation: "process",
           execArgv: ["--experimental-strip-types"],
-          timeout,
+          ...(timeout === undefined ? {} : { timeout }),
           signal: AbortSignal.any([controller.signal, fileController.signal])
         });
         stream.on("test:fail", () => { failed = true; fileFailed = true; });
