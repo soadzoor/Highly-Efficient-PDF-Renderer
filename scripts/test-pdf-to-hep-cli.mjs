@@ -590,6 +590,11 @@ try {
   const liveWarnings = [];
   let canvasChecks = 0;
   let reportingGeneratedAt = "2026-10-01T11:19:41.033Z";
+  const defaultReportingDiagnostics = [
+    { severity: "info", code: "info-only", message: "ignore" },
+    { severity: "warning", code: "icc-fallback", pageIndex: 1, message: "approximate colors" }
+  ];
+  let reportingDiagnostics = defaultReportingDiagnostics;
   const reportingDependencies = {
     assertCanvasAvailable: async () => { canvasChecks += 1; },
     reportWorkerEvent: (event) => reports.push(event),
@@ -600,8 +605,7 @@ try {
         async buildHep(bytes, options) {
           assert.equal(bytes.byteLength, 14);
           console.warn("[HEP] synthetic size warning");
-          options.onDiagnostic({ severity: "info", code: "info-only", message: "ignore" });
-          options.onDiagnostic({ severity: "warning", code: "icc-fallback", pageIndex: 1, message: "approximate colors" });
+          for (const diagnostic of reportingDiagnostics) options.onDiagnostic(diagnostic);
           return new Blob([await encodeTestHep(reportingGeneratedAt)]);
         },
         async close() { console.warn("cleanup warning"); }
@@ -627,6 +631,8 @@ try {
       "cleanup warning"
     ]);
     assert.equal(liveWarnings.length, 4, "warnings remain visible during conversion");
+    assert(!reports.some(event => event.type === "pdf-to-hep-raster-fallback"),
+      "ordinary loader, HEP size, and ICC warnings never classify raster fallback");
     assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after success");
 
     reports.length = 0;
@@ -637,16 +643,50 @@ try {
       "kept HEPs report their successful size");
 
     reports.length = 0;
+    const selective = { severity: "warning", code: "selective-raster-fallback", pageIndex: 0,
+      message: "Rasterized one span.", details: { reason: "unsupported blend mode" } };
+    reportingDiagnostics = [
+      selective,
+      { ...selective },
+      { severity: "warning", code: "page-raster-fallback", pageIndex: 2, message: "Rasterized a page.",
+        details: { reasons: "vector-clip-edge-limit; unsupported paint", reason: "less specific reason" } },
+      { severity: "warning", code: "retained-raster-fallback", message: "Rasterized one reusable program.",
+        details: { reason: "retained program" } },
+      ...["retained-vector-fallback", "font.type1-substituted", "native-raster-image", "page-preview"].map(code =>
+        ({ severity: "warning", code, message: "Compatibility diagnostic with no raster fallback." })),
+      { severity: "info", code: "page-raster-fallback", message: "Informational dry run." },
+      { severity: "error", code: "page-raster-fallback", message: "Unconfirmed failed raster attempt." }
+    ];
+    assert.equal(await runPdfToHep(["--force", reportPdf], reportingDependencies), 0);
+    assert.deepEqual(reports.filter(event => event.type === "pdf-to-hep-raster-fallback"), [
+      { type: "pdf-to-hep-raster-fallback", code: "selective-raster-fallback", pageIndex: 0,
+        message: "Rasterized one span.", reason: "unsupported blend mode" },
+      { type: "pdf-to-hep-raster-fallback", code: "selective-raster-fallback", pageIndex: 0,
+        message: "Rasterized one span.", reason: "unsupported blend mode" },
+      { type: "pdf-to-hep-raster-fallback", code: "page-raster-fallback", pageIndex: 2,
+        message: "Rasterized a page.", reason: "vector-clip-edge-limit; unsupported paint" },
+      { type: "pdf-to-hep-raster-fallback", code: "retained-raster-fallback",
+        message: "Rasterized one reusable program.", reason: "retained program" }
+    ], "only definitive warning diagnostics produce structured fallback reports with source page and reason");
+    reportingDiagnostics = defaultReportingDiagnostics;
+
+    reports.length = 0;
     assert.equal(await runPdfToHep(["--force", reportPdf], {
       ...reportingDependencies,
       async loadBuilder() {
         return {
-          buildHep() { console.warn("failure warning"); throw new Error("synthetic build failure"); },
+          buildHep(_bytes, options) {
+            options.onDiagnostic(selective);
+            console.warn("failure warning");
+            throw new Error("synthetic build failure");
+          },
           async close() {}
         };
       }
     }), 1);
     assert(reports.some((event) => event.type === "pdf-to-hep-error" && event.message === "synthetic build failure"));
+    assert(reports.some(event => event.type === "pdf-to-hep-raster-fallback"),
+      "a fallback observed before failure is reported, allowing the parent to classify it by final status");
     assert(!reports.some((event) => event.outputBytes !== undefined), "failed builds do not report generated sizes");
     assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after a failed build");
 
@@ -657,7 +697,7 @@ try {
     }), /synthetic loader failure/);
     assert.deepEqual(reports, [{ type: "pdf-to-hep-error", message: "synthetic loader failure" }]);
     assert.equal(console.warn, reportConsoleWarn, "warning capture is restored after a rejected worker");
-    assert.equal(canvasChecks, 4);
+    assert.equal(canvasChecks, 5);
   } finally {
     Object.assign(console, originalConsoleForReports);
     if (previousWorkerFlag === undefined) delete process.env.HEPR_PDF_TO_HEP_INTERNAL_WORKER;
@@ -672,9 +712,13 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   assertCanvasAvailable: async () => {},
   async loadBuilder() {
     return {
-      async buildHep() {
+      async buildHep(_bytes, options) {
         console.warn("synthetic IPC warning");
         console.warn("synthetic IPC warning");
+        for (let index = 0; index < 2; index++) options.onDiagnostic({
+          severity: "warning", code: "page-raster-fallback", pageIndex: 2,
+          message: "synthetic IPC raster fallback", details: { reason: "synthetic page reason" }
+        });
         return new Blob(["synthetic HEP"]);
       },
       async close() {}
@@ -692,9 +736,14 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   }), ipcWorkerScript);
   assert.deepEqual(await ipcWorker.completion, { code: 0, signal: null });
   assert.deepEqual(ipcWorker.report, {
-    warnings: [{ message: "synthetic IPC warning", count: 2 }],
+    warnings: [
+      { message: "synthetic IPC warning", count: 2 },
+      { message: "report.pdf page 3: [page-raster-fallback] synthetic IPC raster fallback", count: 2 }
+    ],
     sourceBytes: 14,
-    outputBytes: 13
+    outputBytes: 13,
+    rasterFallbacks: [{ code: "page-raster-fallback", message: "synthetic IPC raster fallback",
+      pageIndex: 2, reason: "synthetic page reason", count: 2 }]
   });
 
   const collisionA = path.join(temporaryRoot, "A B.pdf");

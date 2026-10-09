@@ -1134,6 +1134,12 @@ Progress lines identify their PDF, and the final summary includes per-file
 durations and batch wall time. Summed conversion durations overlap in parallel
 and can exceed wall time.
 
+The final **Raster fallback by PDF** section lists successful conversions that
+needed selective raster layers or whole-page raster rendering, with affected
+page numbers and diagnostic reasons. It reports when none occurred. Original
+PDF images, font/color approximations, and failed conversion attempts are not
+counted as raster fallback in generated HEPs.
+
 Each child retains its own heap limit of 12288 MiB by default (not preallocated).
 `HEPR_PDF_TO_HEP_HEAP_MB` or the parent's `--max-old-space-size` overrides this
 per-child limit. Large PDFs can use substantial combined memory; reduce

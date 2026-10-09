@@ -176,6 +176,8 @@ PDF and generated HEP sizes for successful conversions, and warnings and failure
 grouped by PDF. The timing report includes per-file sizes. Existing-file skips
 are excluded from the size comparison; `--force --keep-unchanged` conversions
 count as successful even when the existing HEP is kept.
+The final raster-fallback section lists successful PDFs, affected pages, and
+reasons when vector content required raster rendering.
 Conversion requires `@napi-rs/canvas`, which npm installs as an optional dependency
 by default. If its installation fails or optional dependencies were omitted,
 install both packages with `npm install @soadzoor/hepr @napi-rs/canvas` and run

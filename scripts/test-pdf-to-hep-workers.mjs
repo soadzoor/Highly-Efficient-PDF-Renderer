@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import path from "node:path";
 import { setImmediate as tick } from "node:timers/promises";
 import {
+  formatPdfToHepRasterFallbackSummary,
   formatPdfToHepSummary,
   parsePdfToHepArguments,
   runPdfToHepWorkerBatch,
@@ -125,6 +126,7 @@ await withBatch({}, async (batch) => {
   assert.match(batch.logs.at(-1), /PDFs attempted: 5\n  Successful: 3\n  Failed: 1\n  Skipped: 2/);
   assert.match(batch.logs.at(-1), /File sizes available for 0\/3 successful conversions/);
   assert.match(batch.logs.at(-1), /Original PDFs \(successful\): unavailable/);
+  assert(batch.logs.at(-1).endsWith("Raster fallback by PDF:\n  None in successful conversions."));
 });
 
 await withBatch({
@@ -156,7 +158,8 @@ await withBatch({
   assert.equal(await batch.completion, 1);
   const summary = batch.logs.at(-1);
   assert.match(summary, /Conversion summary:/);
-  assert(summary.indexOf("Conversion summary:") > summary.indexOf("Warnings by PDF:"), "compact totals remain last after the warning recap");
+  assert(summary.indexOf("Conversion summary:") > summary.indexOf("Warnings by PDF:"), "compact totals follow the warning recap");
+  assert(summary.indexOf("Raster fallback by PDF:") > summary.indexOf("Conversion summary:"), "the raster fallback recap follows the totals");
   assert.match(summary, /PDFs attempted: 4\n  Successful: 2\n  Failed: 1\n  Skipped: 2/);
   assert.match(summary, /Original PDFs \(successful\): 9.00 KiB/);
   assert.match(summary, /Generated HEPs \(successful\): 6.00 KiB/);
@@ -179,6 +182,83 @@ assert.match(formatPdfToHepSummary([
   { status: "generated", sourceBytes: 0, outputBytes: 0 }
 ], 0), /Generated HEPs \(successful\): 0 B/);
 assert(!formatPdfToHepSummary([{ status: "generated", sourceBytes: 0, outputBytes: 0 }], 0).includes("NaN"));
+
+const selectiveFallback = { type: "pdf-to-hep-raster-fallback", code: "selective-raster-fallback",
+  pageIndex: 0, message: "One display span used raster fallback.", reason: "unsupported blend mode" };
+const pageFallback = { type: "pdf-to-hep-raster-fallback", code: "page-raster-fallback",
+  pageIndex: 2, message: "A full page used raster fallback after vector-clip-edge-limit.", reason: "vector-clip-edge-limit" };
+const retainedFallback = { type: "pdf-to-hep-raster-fallback", code: "retained-raster-fallback",
+  message: "A retained program used raster fallback." };
+const diagnosticChild = new EventEmitter();
+const diagnosticWorker = startPdfToHepWorker({ pdfPath: path.resolve("dedup.pdf"), fileNumber: 1, fileCount: 1 },
+  false, 8192, () => diagnosticChild);
+const differentDiagnostics = [
+  selectiveFallback,
+  { ...selectiveFallback, pageIndex: 1 },
+  { ...selectiveFallback, code: "page-raster-fallback" },
+  { ...selectiveFallback, message: "A different span used raster fallback." },
+  { ...selectiveFallback, reason: "unsupported pattern" }
+];
+for (const event of [selectiveFallback, ...differentDiagnostics]) diagnosticChild.emit("message", event);
+assert.deepEqual(diagnosticWorker.report.rasterFallbacks, differentDiagnostics.map(({ type, ...diagnostic }, index) =>
+  ({ ...diagnostic, count: index === 0 ? 2 : 1 })),
+  "deduplication preserves differences in page, code, message, and reason");
+diagnosticChild.emit("close", 0, null);
+await diagnosticWorker.completion;
+await withBatch({
+  count: 5,
+  reports: {
+    1: [selectiveFallback, { ...selectiveFallback, count: 999 }, pageFallback, retainedFallback],
+    2: [
+      // Warning text alone and non-raster compatibility diagnostics must never
+      // classify a PDF as using raster fallback.
+      { type: "pdf-to-hep-warning", message: "[page-raster-fallback] unstructured warning text" },
+      ...["retained-vector-fallback", "font.type1-substituted", "icc-fallback", "native-raster-image", "page-preview"].map(code =>
+        ({ ...selectiveFallback, code })),
+      { ...selectiveFallback, message: 1 },
+      { ...selectiveFallback, message: "" },
+      { ...selectiveFallback, pageIndex: -1 },
+      { ...selectiveFallback, pageIndex: 0.5 },
+      { ...selectiveFallback, pageIndex: Number.MAX_SAFE_INTEGER + 1 },
+      { ...selectiveFallback, reason: "" },
+      { ...selectiveFallback, reason: 42 }
+    ],
+    3: [{ ...selectiveFallback, message: "Raster attempt before conversion failed." }],
+    4: [{ ...retainedFallback, pageIndex: 4 }],
+    5: [{ ...selectiveFallback, message: "Raster attempt before output was skipped." }]
+  }
+}, async batch => {
+  await batch.finish(2);
+  await batch.finish(3, 1);
+  await batch.finish(4);
+  await batch.finish(5, 3);
+  await batch.finish(1);
+  assert.equal(await batch.completion, 1);
+  const summary = batch.logs.at(-1);
+  const fallbackSummary = summary.slice(summary.indexOf("Raster fallback by PDF:"));
+  assert.equal(fallbackSummary, [
+    "Raster fallback by PDF:",
+    "  Successful PDFs using raster fallback: 2",
+    `  ${path.resolve("worker-1.pdf")}:`,
+    "    Page 1 [selective-raster-fallback]: One display span used raster fallback. (2 times)",
+    "      Reason: unsupported blend mode",
+    "    Page 3 [page-raster-fallback]: A full page used raster fallback after vector-clip-edge-limit.",
+    "    [retained-raster-fallback]: A retained program used raster fallback.",
+    `  ${path.resolve("worker-4.pdf")}:`,
+    "    Page 5 [retained-raster-fallback]: A retained program used raster fallback."
+  ].join("\n"));
+  assert.equal((fallbackSummary.match(/vector-clip-edge-limit/g) ?? []).length, 1,
+    "a reason already present in the message is not repeated");
+  for (const name of ["worker-2.pdf", "worker-3.pdf", "worker-5.pdf"]) assert(!fallbackSummary.includes(name));
+});
+
+const interruptedFallback = [{ pdfPath: "interrupted.pdf", status: "interrupted", rasterFallbacks: [
+  { code: "page-raster-fallback", message: "Temporary raster attempt.", count: 1 }
+] }];
+assert.equal(formatPdfToHepRasterFallbackSummary(interruptedFallback),
+  "Raster fallback by PDF:\n  None in successful conversions.",
+  "interrupted attempts are excluded from the successful output recap");
+assert.equal(formatPdfToHepRasterFallbackSummary([]), "Raster fallback by PDF:\n  None in successful conversions.");
 
 for (const [count, workers, expected] of [[3, 1, 1], [3, 3, 3], [1, 100, 1]]) {
   await withBatch({ count, options: { workers } }, async (batch) => {

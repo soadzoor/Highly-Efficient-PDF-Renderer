@@ -33,6 +33,11 @@ export const PDF_PASSWORD_ENV = "HEPR_PDF_PASSWORD";
 const DEFAULT_PDF_TO_HEP_WORKER_HEAP_MB = 12_288;
 const PDF_TO_HEP_WORKER_SKIPPED_EXIT_CODE = 3;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RASTER_FALLBACK_DIAGNOSTIC_CODES = new Set([
+  "selective-raster-fallback",
+  "retained-raster-fallback",
+  "page-raster-fallback"
+]);
 
 export const PDF_TO_HEP_USAGE = `Usage:
   node PDFtoHEP.js [--force] [--workers=<count>] [--output-dir=<directory>] <pdf-or-directory>
@@ -82,6 +87,8 @@ LOD caches are retained.
 Each run ends with attempted, successful, failed and skipped counts, original
 and generated file sizes for successful conversions, and a recap of warnings
 and failures. Per-file sizes are included in the conversion time summary.
+A final raster-fallback section lists successful PDFs with affected pages and
+reasons; ordinary embedded PDF images are not counted as fallback.
 
 Existing HEP files are skipped unless --force is supplied. Each child has its
 own heap limit (default: 12288 MiB, not preallocated); HEPR_PDF_TO_HEP_HEAP_MB
@@ -663,6 +670,30 @@ export function formatPdfToHepTimingSummary(timings) {
   return lines.join("\n");
 }
 
+export function formatPdfToHepRasterFallbackSummary(timings) {
+  const affected = timings.filter((timing) =>
+    timing.status === "generated" && timing.rasterFallbacks?.length > 0
+  );
+  const lines = ["Raster fallback by PDF:"];
+  if (affected.length === 0) {
+    lines.push("  None in successful conversions.");
+    return lines.join("\n");
+  }
+  lines.push(`  Successful PDFs using raster fallback: ${affected.length}`);
+  for (const timing of affected) {
+    lines.push(`  ${timing.pdfPath}:`);
+    for (const fallback of timing.rasterFallbacks) {
+      const page = fallback.pageIndex === undefined ? "" : `Page ${fallback.pageIndex + 1} `;
+      const repeated = fallback.count > 1 ? ` (${fallback.count} times)` : "";
+      lines.push(`    ${page}[${fallback.code}]: ${fallback.message}${repeated}`);
+      if (fallback.reason && !fallback.message.includes(fallback.reason)) {
+        lines.push(`      Reason: ${fallback.reason}`);
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
 export function formatPdfToHepSummary(timings, skippedCount, notAttemptedCount = 0) {
   const successful = timings.filter((timing) => timing.status === "generated");
   const failed = timings.filter((timing) => timing.status === "failed");
@@ -722,8 +753,25 @@ export function formatPdfToHepSummary(timings, skippedCount, notAttemptedCount =
       }
     }
   }
-  // Keep the compact totals last even when thousands of PDFs have warnings.
-  return [...details, ...lines].join("\n");
+  // Keep totals after the warning recap, followed by the requested fallback list.
+  return [...details, ...lines, formatPdfToHepRasterFallbackSummary(timings)].join("\n");
+}
+
+function normalizeRasterFallbackDiagnostic(diagnostic) {
+  if (
+    !RASTER_FALLBACK_DIAGNOSTIC_CODES.has(diagnostic.code) ||
+    typeof diagnostic.message !== "string" || diagnostic.message.trim().length === 0 ||
+    (diagnostic.pageIndex !== undefined &&
+      (!Number.isSafeInteger(diagnostic.pageIndex) || diagnostic.pageIndex < 0)) ||
+    (diagnostic.reason !== undefined &&
+      (typeof diagnostic.reason !== "string" || diagnostic.reason.trim().length === 0))
+  ) return null;
+  return {
+    code: diagnostic.code,
+    message: diagnostic.message,
+    ...(diagnostic.pageIndex === undefined ? {} : { pageIndex: diagnostic.pageIndex }),
+    ...(diagnostic.reason === undefined ? {} : { reason: diagnostic.reason })
+  };
 }
 
 function appendPdfToHepTiming(timings, item, status, durationMs, report) {
@@ -751,6 +799,7 @@ export function startPdfToHepWorker(
   const workerToken = randomUUID();
   const report = { warnings: [] };
   const warningsByMessage = new Map();
+  const rasterFallbacksByDiagnostic = new Map();
   const child = spawnImplementation(
     process.execPath,
     pdfToHepWorkerArguments(
@@ -779,6 +828,17 @@ export function startPdfToHepWorker(
         const warning = { message: message.message, count: 1 };
         warningsByMessage.set(message.message, warning);
         report.warnings.push(warning);
+      }
+    } else if (message?.type === "pdf-to-hep-raster-fallback") {
+      const diagnostic = normalizeRasterFallbackDiagnostic(message);
+      if (!diagnostic) return;
+      const key = JSON.stringify(diagnostic);
+      const previous = rasterFallbacksByDiagnostic.get(key);
+      if (previous) previous.count += 1;
+      else {
+        const fallback = { ...diagnostic, count: 1 };
+        rasterFallbacksByDiagnostic.set(key, fallback);
+        (report.rasterFallbacks ??= []).push(fallback);
       }
     } else if (message?.type === "pdf-to-hep-error" && typeof message.message === "string") {
       report.errorMessage = message.message;
@@ -1182,6 +1242,14 @@ async function convertPdfToHep(pending, options, password, skippedCount, depende
           annotationAppearances: options.annotationAppearances,
           onDiagnostic: (diagnostic) => {
             if (diagnostic.severity !== "warning") return;
+            const reason = diagnostic.details?.reasons ?? diagnostic.details?.reason;
+            const fallback = normalizeRasterFallbackDiagnostic({
+              code: diagnostic.code,
+              message: diagnostic.message,
+              ...(diagnostic.pageIndex === undefined ? {} : { pageIndex: diagnostic.pageIndex }),
+              ...(typeof reason === "string" && reason.trim().length > 0 ? { reason } : {})
+            });
+            if (fallback) report({ type: "pdf-to-hep-raster-fallback", ...fallback });
             const page = diagnostic.pageIndex === undefined ? "" : ` page ${diagnostic.pageIndex + 1}`;
             console.warn(`${sourceLabel}${page}: [${diagnostic.code}] ${diagnostic.message}`);
           },
