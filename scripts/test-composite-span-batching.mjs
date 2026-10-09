@@ -8,6 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
+  const { OrderedTextLodSelection } = await import("../src/orderedTextLod.ts");
   const { normalizeScenePaintGraph, planScenePaintPasses, scenePaintSpanSegments, scenePaintNodeBounds } = await import("../src/scenePaintGraph.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
   const { ScenePaintVisibility } = await import("../src/scenePaintVisibility.ts");
@@ -96,6 +97,110 @@ try {
   assert.deepEqual({ visible: visibleRuns.length, batches: plan.batches.length, spans: spans.length,
     submitted: submitted.length }, { visible: 27, batches: 11, spans: 7, submitted: 13 },
     "27 interleaved paints across 7 spans reach the GPU as 13 draws, the mask's two included");
+
+  // Symbolic compositor plans retain these immutable arrays while the camera
+  // moves. Their canonical coverage must be resolved once, including fallback
+  // spans, and invalidated whenever the ordered batch selection changes.
+  const cachedPlan = new VectorOrderedBatches(scene, null);
+  cachedPlan.update(visibleRuns, 0.1);
+  const cachedSpan = spans[0], cachedLookup = buildCanonicalRunLookup(scene);
+  const getKind = cachedLookup.get.bind(cachedLookup);
+  let lookupReads = 0;
+  cachedLookup.get = kind => { lookupReads++; return getKind(kind); };
+  const collect = (span = cachedSpan, spanSegments = cachedPlan.segments) => {
+    const result = [];
+    submitPaintSpan(span, cachedPlan, spanSegments, cachedLookup, run => result.push(run));
+    return result;
+  };
+  const initialCached = collect();
+  assert(lookupReads > 0, "the first submission resolves canonical coverage");
+  lookupReads = 0;
+  assert.deepEqual(collect(), initialCached);
+  assert.equal(lookupReads, 0, "camera-only frames reuse the resolved batch interval");
+  const unchangedRevision = cachedPlan.revision;
+  assert.equal(cachedPlan.update(visibleRuns, 0.1), false);
+  assert.equal(cachedPlan.revision, unchangedRevision, "unchanged batches retain their cache revision");
+  collect();
+  assert.equal(lookupReads, 0);
+  collect(cachedSpan, cachedPlan.segments.slice());
+  assert(lookupReads > 0, "a replacement span map invalidates cached resolution");
+  cachedPlan.update(visibleRuns.filter(run => run !== visibleRuns[0]), 0.1);
+  assert(cachedPlan.revision > unchangedRevision);
+  lookupReads = 0;
+  assert.deepEqual(collect(), cachedSpan, "a changed scheduled selection cannot use a stale interval");
+  assert(lookupReads > 0, "changed coverage is resolved again");
+  lookupReads = 0;
+  assert.deepEqual(collect(), cachedSpan);
+  assert.equal(lookupReads, 0, "unchanged fallback spans are cached too");
+  cachedPlan.update(visibleRuns, 0.1);
+  assert.deepEqual(collect(), initialCached, "restoring the selection restores planned draws");
+
+  const lodLevel = { scene, segmentCount: scene.segmentCount, tolerance: 0,
+    visibleSegmentCount: 2, visibleSegmentIds: Uint32Array.of(0, 1) };
+  const lodPlan = new VectorOrderedBatches(scene, { levels: [lodLevel] });
+  lodPlan.update(visibleRuns, 0.1);
+  const collectLod = (span = cachedSpan) => {
+    const result = [];
+    submitPaintSpan(span, lodPlan, lodPlan.segments, cachedLookup, run => result.push(run));
+    return result;
+  };
+  assert.deepEqual(collectLod().map(run => run.kind).sort(), ["fill", "stroke"]);
+  const maskSpan = spans.find(span => span.some(run => maskRuns.some(index =>
+    runs[index].kind === run.kind && runs[index].first === run.first)));
+  assert.deepEqual(collectLod(maskSpan), maskSpan);
+  const lodRevision = lodPlan.revision, lodCoverageRevision = lodPlan.coverageRevision;
+  lodLevel.visibleSegmentIds[0] = 4;
+  lodLevel.visibleSegmentCount = 1;
+  lodPlan.invalidate();
+  assert(lodPlan.update(visibleRuns, 0.1));
+  assert(lodPlan.revision > lodRevision);
+  assert.equal(lodPlan.coverageRevision, lodCoverageRevision, "LOD-only rebuilds retain canonical coverage");
+  lookupReads = 0;
+  assert.deepEqual(collectLod().map(run => run.kind), ["fill"],
+    "moving LOD selection into another span cannot reuse a batch interval that includes its neighbours");
+  assert.deepEqual(collectLod(maskSpan), maskSpan, "LOD changes also retain fallback coverage decisions");
+  assert.equal(lookupReads, 0, "LOD-only rebuilds refresh batch intervals without revisiting canonical runs");
+
+  const glyphScene = Object.assign(createEmptyVectorScene(), {
+    textInstanceCount: 4, textGlyphCount: 1,
+    textInstanceA: Float32Array.from({ length: 16 }, (_value, index) => index % 4 === 0 || index % 4 === 3 ? 1 : 0),
+    textInstanceB: Float32Array.from({ length: 16 }, (_value, index) => index % 4 === 0 ? index * 5 : 0),
+    textInstanceC: Float32Array.from({ length: 16 }, (_value, index) => index % 4 === 3 ? 1 : 0),
+    textGlyphMetaA: Float32Array.of(0, 0, 0, 0), textGlyphMetaB: Float32Array.of(1, 1, 0, 0),
+    drawRuns: [{ kind: "text", first: 0, count: 2 }, { kind: "text", first: 2, count: 2 }],
+    paintGraph: { roots: [draw(0), group([draw(1)], { alpha: 0.5 })] }
+  });
+  const glyphData = { exactInstanceCount: 4, coarseInstanceCount: 2, runs: [
+    { exactStart: 0, exactCount: 2, coarseIndex: 0, bounds: { minX: 0, minY: 0, maxX: 21, maxY: 1 } },
+    { exactStart: 2, exactCount: 2, coarseIndex: 1, bounds: { minX: 40, minY: 0, maxX: 61, maxY: 1 } }
+  ] };
+  const glyphSelection = new OrderedTextLodSelection(glyphScene, glyphData);
+  glyphSelection.update({ instanceIds: Uint32Array.of(0, 1, 2, 3), changed: true });
+  const glyphPlan = new VectorOrderedBatches(glyphScene, null);
+  glyphPlan.setTextSelection(glyphSelection);
+  glyphPlan.update(glyphScene.drawRuns, 0.1);
+  const glyphSpans = glyphScene.drawRuns.map(run => [{ ...run }]);
+  const glyphLookup = buildCanonicalRunLookup(glyphScene), getGlyphKind = glyphLookup.get.bind(glyphLookup);
+  let glyphLookupReads = 0;
+  glyphLookup.get = kind => { glyphLookupReads++; return getGlyphKind(kind); };
+  const collectGlyphIds = span => {
+    const ids = [];
+    submitPaintSpan(span, glyphPlan, glyphPlan.segments, glyphLookup, run => {
+      for (let index = run.first; index < run.first + run.count; index++) ids.push(glyphPlan.uintInstances[index * 2]);
+    });
+    return ids;
+  };
+  assert.deepEqual(collectGlyphIds(glyphSpans[0]), [0, 1]);
+  assert.deepEqual(collectGlyphIds(glyphSpans[1]), [2, 3]);
+  const glyphCoverageRevision = glyphPlan.coverageRevision;
+  glyphSelection.update({ instanceIds: Uint32Array.of(5), changed: true });
+  glyphPlan.setTextSelection(glyphSelection);
+  assert(glyphPlan.update(glyphScene.drawRuns, 0.1));
+  assert.equal(glyphPlan.coverageRevision, glyphCoverageRevision);
+  glyphLookupReads = 0;
+  assert.deepEqual(collectGlyphIds(glyphSpans[0]), [], "an empty glyph LOD span never submits the neighbouring batch");
+  assert.deepEqual(collectGlyphIds(glyphSpans[1]), [5], "the following span finds its relocated coarse glyph batch");
+  assert.equal(glyphLookupReads, 0, "glyph LOD changes refresh ranges without rescanning source paints");
 
   // A genuine opacity group anywhere in a document selects the compositor
   // globally. Ordinary layer wrappers elsewhere must still share one span.
@@ -248,6 +353,76 @@ try {
   crossKindPlan.update(crossKindDarken.drawRuns, 0.1);
   assert.equal(crossKindPlan.batches.length, 2, "restoring source colors regroups cross-kind draws");
   assertCrossKindInstances();
+
+  // Black Darken is Normal source-over even at antialiased edges and over a
+  // translucent backdrop. Removing its wrappers retains source indices and
+  // joins ordinary paints into the enclosing submission span.
+  const blackScene = structuredClone(crossKindDarken);
+  for (let index = 0; index < blackScene.segmentCount; index++) blackScene.styles.fill(0, index * 4 + 1, index * 4 + 4);
+  for (let index = 0; index < blackScene.fillPathCount; index++) {
+    blackScene.fillPathMetaB.fill(0, index * 4 + 2, index * 4 + 4);
+    blackScene.fillPathMetaC[index * 4 + 2] = 0;
+  }
+  const blackSource = structuredClone(blackScene);
+  const blackNodes = normalizeScenePaintGraph(blackScene);
+  assert.deepEqual(blackNodes, blackScene.paintGraph.roots.map(node => node.children[0]),
+    "black Darken wrappers flatten to their own canonical paints");
+  assert.equal(new Set(scenePaintSpanSegments(blackScene)).size, 1, "black paint shares one enclosing span");
+  const tintedBlackNodes = normalizeScenePaintGraph(blackScene, true, false);
+  assert.equal(tintedBlackNodes.length, 1, "tinting black retains the existing equal-RGB batching");
+  assert.equal(tintedBlackNodes[0].kind, "group", "tinted source black still requires its Darken composite");
+  assert.equal(tintedBlackNodes[0].children.length, darkenCount);
+  assert.equal(normalizeScenePaintGraph(blackScene, true, false), tintedBlackNodes, "tint eligibility has its own graph cache");
+  assert.notEqual(scenePaintSpanSegments(blackScene), scenePaintSpanSegments(blackScene, true, false),
+    "tint eligibility has matching span caches");
+  assert(scenePaintNodeBounds(blackScene, true, false).nodes.has(tintedBlackNodes[0].children),
+    "tint eligibility has matching group bounds");
+  assert.equal(normalizeScenePaintGraph(blackScene, false).length, darkenCount,
+    "primitive recoloring disables the black shortcut alongside color batching");
+  assert.deepEqual(blackScene, blackSource, "black normalization leaves the canonical graph and colors untouched");
+  const blackPlan = new VectorOrderedBatches(blackScene, null);
+  blackPlan.update(blackScene.drawRuns, 0.1);
+  const flatBlackSegments = blackPlan.segments;
+  assert.equal(blackPlan.blackDarkenSourceOverEnabled, true);
+  blackPlan.setBlackDarkenSourceOverEnabled(false);
+  blackPlan.update(blackScene.drawRuns, 0.1);
+  assert.equal(blackPlan.colorBatchingEnabled, true, "global tint retains equal-color batching");
+  assert.equal(blackPlan.blackDarkenSourceOverEnabled, false, "global tint disables only the black shortcut");
+  assert.notEqual(blackPlan.segments, flatBlackSegments, "global tint rebuilds the plan's span schedule");
+  assert.equal(blackPlan.batches.length, 2, "tinted black still batches into one draw per vector program");
+  blackPlan.setColorCommutationEnabled(false);
+  blackPlan.update(blackScene.drawRuns, 0.1);
+  assert.equal(blackPlan.blackDarkenSourceOverEnabled, false, "primitive overrides retain every black group effect");
+  assert.equal(blackPlan.batches.length, darkenCount);
+  blackPlan.setColorCommutationEnabled(true);
+  blackPlan.update(blackScene.drawRuns, 0.1);
+  assert.equal(blackPlan.blackDarkenSourceOverEnabled, false, "restoring primitive colors remembers the global tint");
+  assert.equal(blackPlan.batches.length, 2);
+  blackPlan.setBlackDarkenSourceOverEnabled(true);
+  blackPlan.update(blackScene.drawRuns, 0.1);
+  assert.equal(blackPlan.segments, flatBlackSegments, "restoring source black reuses the original span graph");
+  assert.equal(blackPlan.instanceCount, darkenCount, "tint and recolor transitions retain every canonical primitive");
+  const conditionedBlack = structuredClone(blackScene);
+  conditionedBlack.paintGraph.roots = [group([draw(0)], { blendMode: "Darken", optionalContent: 0 })];
+  assert.equal(normalizeScenePaintGraph(conditionedBlack)[0].optionalContent, 0,
+    "a flattened black paint inherits its group visibility condition");
+  for (const change of [
+    target => { target.paintGraph.roots[0].alpha = 0.5; },
+    target => { target.paintGraph.roots[0].softMask = { children: [], subtype: "Alpha" }; },
+    target => { target.paintGraph.roots[0].knockout = true; },
+    target => { target.paintGraph.roots[0].optionalContent = 1; },
+    target => { target.drawRuns[0].blendMode = "Multiply"; },
+    target => { target.fillPathMetaB[2] = 0.1; },
+    target => { target.fillPathMetaC[2] = NaN; },
+    target => { target.paintGraph.roots[0].children = []; },
+    target => { target.paintGraph.roots = [group(target.paintGraph.roots, { knockout: true })]; }
+  ]) {
+    const protectedBlack = structuredClone(blackScene);
+    protectedBlack.paintGraph.roots = protectedBlack.paintGraph.roots.slice(0, 1);
+    change(protectedBlack);
+    assert.equal(normalizeScenePaintGraph(protectedBlack)[0].kind, "group",
+      "opacity, masks, knockout, condition intersections, blends, unknown colors and empty groups retain their wrapper");
+  }
 
   // Every surface a group composites through is transparent outside the group's
   // own paints, so all but the root's backdrop copy carry a rectangle, and none

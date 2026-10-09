@@ -60,7 +60,7 @@ try {
   globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2 };
   globalThis.GPUShaderStage = { VERTEX: 1, FRAGMENT: 2 };
   for (const [Renderer, backend] of [[WebGlFloorplanRenderer, "gl"], [WebGpuFloorplanRenderer, "gpu"]]) {
-    const forceExact = [], textModes = [], colorCommutation = [];
+    const forceExact = [], textModes = [], colorCommutation = [], blackSourceOver = [];
     let frames = 0, invalidations = 0;
     const instance = Object.assign(Object.create(Renderer.prototype), {
       scene, gl, gpuDevice: device, primitiveGradientLayout: {}, primitiveColors: null,
@@ -68,7 +68,9 @@ try {
       segmentTextureWidth: 2, fillPathMetaTextureWidth: 1, textInstanceTextureWidth: 1,
       vectorLodRuntime: { setForceExact(value) { forceExact.push(value); } },
       textLodRuntime: { setMode(value) { textModes.push(value); } }, textLodMode: "auto",
-      orderedBatches: { invalidate() { invalidations++; }, setColorCommutationEnabled(value) { colorCommutation.push(value); } },
+      orderedBatches: { invalidate() { invalidations++; }, setColorCommutationEnabled(value) { colorCommutation.push(value); },
+        setBlackDarkenSourceOverEnabled(value) { blackSourceOver.push(value); } },
+      vectorOverrideColor: [0, 0, 0], vectorOverrideOpacity: 0,
       vectorLodLevels: [{ ownsTextures: true, textureC: "combined", textureWidth: 3 }],
       vectorLodLevelResources: [{ ownsTextures: true, textureC: "combined", textureWidth: 3 }],
       destroyVectorMinifyResources() {}, requestFrame() { frames++; }
@@ -90,6 +92,13 @@ try {
     assert.deepEqual(textModes, ["off", "auto"]);
     assert.deepEqual(colorCommutation, [false, true], "clearing colors restores same-color batching");
     assert.equal(instance.primitiveColors.updates().length, 0);
+    instance.setVectorColorOverride(0.4, 0.5, 0.6, 0.25);
+    instance.setVectorColorOverride(0, 0, 0, 0.75);
+    instance.setVectorColorOverride(0.4, 0.5, 0.6, 0);
+    assert.deepEqual(blackSourceOver, [false, true, true],
+      `${backend}: tinting black restores Darken, while black tint and zero tint keep source-over`);
+    assert.deepEqual(colorCommutation, [false, true],
+      `${backend}: global tint preserves existing equal-color batching`);
     assert.deepEqual(writes.find(write => write.kind === "texel" && write.texture === "stroke").data, [...scene.styles.slice(0, 4)]);
     assert.deepEqual(writes.find(write => write.kind === "texel" && write.texture === "text").data, [51, 77, 102, 128]);
     const adjacent = [0, 1].map(index => ({ ref: { kind: "stroke", index }, color: [0, 1, 0] }));

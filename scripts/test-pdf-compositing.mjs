@@ -33,6 +33,7 @@ try {
   render.maskPaintFolds = 0;
   render.canonicalColors = false;
   render.colorBatchingEnabled = true;
+  render.blackDarkenSourceOverEnabled = true;
   function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null, reuseBackdrop = false) {
     const alive = new Set(); let draws=0;
     render.spans=[]; render.passes=0; render.surfaces=0; render.folds=0;
@@ -105,7 +106,8 @@ try {
     const initial = { pixel: [...backdrop] };
     if (reuseBackdrop) alive.add(initial);
     try {
-      const result=compositeScenePaintGraph(scene,adapter,initial,visible,selected,reuseBackdrop,render.colorBatchingEnabled);
+      const result=compositeScenePaintGraph(scene,adapter,initial,visible,selected,reuseBackdrop,render.colorBatchingEnabled,
+        render.blackDarkenSourceOverEnabled);
       if (reuseBackdrop) assert.equal(result, initial, "the root returns its borrowed scratch backdrop");
       else close(initial.pixel, backdrop, 0.000000001);
       const pixel=[...result.pixel]; adapter.release(result); assert.equal(alive.size,0); return pixel;
@@ -225,6 +227,21 @@ try {
         "disabling color batching restores each source group boundary");
       render.colorBatchingEnabled = true;
     }
+  }
+  const blackPaints = [0.17, 0.4, 0.81].map(alpha => ({ color: [0, 0, 0, alpha], shape: alpha }));
+  for (const isolated of [false, true]) for (const backdrop of [
+    [0, 0, 0, 0], [0.1, 0.2, 0.3, 0.5], [1, 1, 1, 1], [0.75, 0.2, 0.5, 1]
+  ]) {
+    const blackRoots = blackPaints.map((_paint, index) => g([d(index)], { isolated, blendMode: "Darken" }));
+    const expected = blackPaints.reduce((pixel, paint) => compositePdfPixel(pixel, paint.color, "Darken"), backdrop);
+    close(render(blackRoots, blackPaints, backdrop), expected);
+    assert.deepEqual({ spans: render.spans, passes: render.passes }, { spans: [1], passes: 0 },
+      "black Darken paints share the ordinary draw span without a composite");
+    render.blackDarkenSourceOverEnabled = false;
+    close(render(blackRoots, blackPaints, backdrop), expected);
+    assert.deepEqual({ spans: render.spans, passes: render.passes }, { spans: [1], passes: 1 },
+      "disabling the black shortcut preserves equal-color Darken batching");
+    render.blackDarkenSourceOverEnabled = true;
   }
   const darkenColors = [{ color: [0.5, 0, 0, 0.5], shape: 0.5 }, { color: [0, 0, 0.5, 0.5], shape: 0.5 }];
   close(render(darkenColors.map((_paint, index) => g([d(index)], { blendMode: "Darken" })), darkenColors), [0.5, 0.25, 0.5, 1]);

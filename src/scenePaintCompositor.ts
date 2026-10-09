@@ -182,10 +182,12 @@ interface PaintResult<Surface> {
  * alias it on success. Other callers retain the non-mutating copy behavior.
  * Callers changing individual source colors disable `colorBatchingEnabled`
  * in both this executor and their draw plan, keeping group boundaries aligned.
+ * A global tint that changes black disables only `blackDarkenSourceOverEnabled`,
+ * preserving equal-color batching while restoring the required Darken passes.
  */
 export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAdapter<Surface>,
   backdrop: Surface, visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
-  reuseBackdrop = false, colorBatchingEnabled = true): Surface {
+  reuseBackdrop = false, colorBatchingEnabled = true, blackDarkenSourceOverEnabled = true): Surface {
   const stats = (globalThis as { HEPR_DEBUG_COMPOSITE_STATS?: boolean }).HEPR_DEBUG_COMPOSITE_STATS === true
     ? { clears: 0, copies: 0, passes: 0, spans: 0, runs: 0, folds: 0, live: 0, peak: 0 } : null;
   if (stats) adapter = compositeStatsAdapter(adapter, stats);
@@ -196,7 +198,7 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
   const copy = (source: Surface, bounds?: Bounds): Surface => {
     const surface = take(); adapter.copy(source, surface, bounds); return surface;
   };
-  const extents = scenePaintNodeBounds(scene, colorBatchingEnabled);
+  const extents = scenePaintNodeBounds(scene, colorBatchingEnabled, blackDarkenSourceOverEnabled);
   const boundsOf = (nodes: readonly ScenePaintNode[]): Bounds | undefined => extents.nodes.get(nodes);
   const runBounds = (index: number): Bounds | undefined => {
     const offset = index * 4, values = extents.runs;
@@ -538,7 +540,8 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
     // backdrop saves a surface, a clear and two full-surface passes per span.
     // Backend-owned scratch backdrops can be painted in place. The caller
     // retains ownership on failure and must release an aliased result only once.
-    const result = accumulate(normalizeScenePaintGraph(scene, colorBatchingEnabled), reuseBackdrop ? backdrop : copy(backdrop), 0);
+    const result = accumulate(normalizeScenePaintGraph(scene, colorBatchingEnabled, blackDarkenSourceOverEnabled),
+      reuseBackdrop ? backdrop : copy(backdrop), 0);
     // Transfer only the result's ownership to the caller.
     owned.delete(result);
     return result;

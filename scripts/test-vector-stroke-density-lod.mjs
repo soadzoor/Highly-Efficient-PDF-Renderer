@@ -238,6 +238,14 @@ assert.deepEqual([...strokePaintGroups(fragmented, false)], Array.from({ length:
 const ungrouped = structuredClone(fragmented); delete ungrouped.paintGraph;
 assert.deepEqual([...strokePaintGroups(ungrouped)], Array.from({ length: 32 }, (_, index) => index),
   "custom scenes without a graph retain their existing paint-operation boundaries");
+const tintableBlack = structuredClone(fragmented);
+for (const node of tintableBlack.paintGraph.roots.slice(16)) node.blendMode = "Normal";
+assert.notEqual(strokePaintGroups(tintableBlack)[15], strokePaintGroups(tintableBlack)[16],
+  "stored LOD retains black Darken/Normal boundaries that a later global tint can restore");
+const tintableBlackLevel = buildVectorStrokeLodScenes(tintableBlack)[1].scene;
+assert.equal(tintableBlackLevel.segmentCount, 2, "black density aggregation stays inside each tintable blend span");
+assert.deepEqual([...strokePaintOrigins(tintableBlackLevel)], [0, 16],
+  "both Darken and Normal paints retain an independent LOD origin");
 const barriers = [
   scene => { for (const run of scene.drawRuns.slice(16)) run.clipIndex = 0; },
   scene => { for (const run of scene.drawRuns.slice(16)) run.optionalContent = 0; },

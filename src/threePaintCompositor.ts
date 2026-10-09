@@ -502,15 +502,17 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
    */
   render(renderer: ThreePaintHostRenderer, scene: VectorScene, roots: readonly THREE.Object3D[], width: number, height: number,
     visible: (condition?: number) => boolean, project: PdfCompositeProjector | null = null,
-    clipFromData: THREE.Matrix4 | null = null, visibilityRevision?: number, colorBatchingEnabled = true): void {
+    clipFromData: THREE.Matrix4 | null = null, visibilityRevision?: number, colorBatchingEnabled = true,
+    blackDarkenSourceOverEnabled = true): void {
     if (this.rendering) return;
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.compositor");
     const submissions = this.backend === "webgpu" ? getThreeWebGpuSubmissionBatch(renderer) : null;
     try {
       if (submissions) submissions.run(() => this.renderFrame(renderer, scene, roots, width, height, visible, project,
-        clipFromData, visibilityRevision, colorBatchingEnabled));
-      else this.renderFrame(renderer, scene, roots, width, height, visible, project, clipFromData, visibilityRevision, colorBatchingEnabled);
+        clipFromData, visibilityRevision, colorBatchingEnabled, blackDarkenSourceOverEnabled));
+      else this.renderFrame(renderer, scene, roots, width, height, visible, project, clipFromData, visibilityRevision,
+        colorBatchingEnabled, blackDarkenSourceOverEnabled);
     } finally {
       if (submissions) {
         const stats = submissions.stats;
@@ -530,7 +532,8 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
 
   private renderFrame(renderer: ThreePaintHostRenderer, scene: VectorScene, roots: readonly THREE.Object3D[], width: number, height: number,
     visible: (condition?: number) => boolean, project: PdfCompositeProjector | null,
-    clipFromData: THREE.Matrix4 | null, visibilityRevision?: number, colorBatchingEnabled = true): void {
+    clipFromData: THREE.Matrix4 | null, visibilityRevision?: number, colorBatchingEnabled = true,
+    blackDarkenSourceOverEnabled = true): void {
     const profile = getThreeRenderPerformance();
     profile?.beginSection("three.compositorSetup");
     profile?.add("three.compositorFrames");
@@ -585,7 +588,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       this.collect(roots);
       profile?.endSection("three.compositorCollect");
       profile?.beginSection("three.compositorSelection");
-      const selected = this.selectPaints(scene, colorBatchingEnabled);
+      const selected = this.selectPaints(scene, colorBatchingEnabled, blackDarkenSourceOverEnabled);
       profile?.endSection("three.compositorSelection");
       profile?.endSection("three.compositorSetup");
       if (profile) {
@@ -600,7 +603,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
         for (const proxy of backgrounds) this.queueProxy(proxy, proxy.source.geometry, false, null);
       }
       this.output = this.paintPlan.execute(scene, this, backdrop, visible, selected, visibilityRevision,
-        this.proxyRevision, this.width, this.height, colorBatchingEnabled);
+        this.proxyRevision, this.width, this.height, colorBatchingEnabled, blackDarkenSourceOverEnabled);
       profile?.add(this.paintPlan.reused ? "three.cachedPaintPlans" : "three.paintPlanBuilds");
       profile?.add("three.paintPlanOperations", this.paintPlan.operations);
       for (const target of this.batches.keys()) this.flush(target);
@@ -1181,7 +1184,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
    * bounds or unsafe perspective projections keep the paint. null means nothing
    * was culled.
    */
-  private selectPaints(scene: VectorScene, colorBatchingEnabled = true): Uint8Array | null {
+  private selectPaints(scene: VectorScene, colorBatchingEnabled = true, blackDarkenSourceOverEnabled = true): Uint8Array | null {
     const runs = scene.drawRuns;
     if (!runs) return null;
     const selected = this.paintSelection?.length === runs.length
@@ -1192,7 +1195,7 @@ export class ThreePaintCompositor implements ScenePaintCompositorAdapter<THREE.R
       if (!proxy.runIndices || (proxy.source.geometry as THREE.InstancedBufferGeometry).instanceCount > 0) continue;
       for (const index of proxy.runIndices) { selected[index] = 0; culled = true; }
     }
-    const bounds = this.project ? scenePaintNodeBounds(scene, colorBatchingEnabled).runs : null;
+    const bounds = this.project ? scenePaintNodeBounds(scene, colorBatchingEnabled, blackDarkenSourceOverEnabled).runs : null;
     if (bounds) for (let index = 0; index < runs.length; index++) {
       const kind = runs[index].kind;
       // Vector layers already account for their active LOD's coverage. Only

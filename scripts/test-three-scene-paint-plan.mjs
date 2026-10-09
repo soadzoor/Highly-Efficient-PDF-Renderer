@@ -130,6 +130,24 @@ try {
   assert.deepEqual(executePlan(colorPlan, monochrome, state, () => true, null, undefined, 0, 64, false), unbatched,
     "uncached plans also respect disabled color batching");
 
+  const black = structuredClone(monochrome);
+  for (let index = 0; index < black.fillPathCount; index++) {
+    black.fillPathMetaB[index * 4 + 2] = black.fillPathMetaB[index * 4 + 3] = black.fillPathMetaC[index * 4 + 2] = 0;
+  }
+  const blackPlan = new ThreeScenePaintPlan();
+  const sourceOver = executePlan(blackPlan, black, state, () => true, null);
+  assert.deepEqual(sourceOver, executeOriginal(black, state, () => true, null));
+  executePlan(blackPlan, black, state, () => true, null);
+  assert.equal(blackPlan.reused, true);
+  const darken = executePlan(blackPlan, black, state, () => true, null, 0, 0, 64, true, false);
+  assert.deepEqual(darken, executeOriginal(black, state, () => true, null, true, false));
+  assert.equal(blackPlan.reused, false, "a global tint invalidates the black source-over shortcut separately");
+  assert(darken.length > sourceOver.length, "tinted black paints keep their real Darken composite operations");
+  executePlan(blackPlan, black, state, () => true, null, 0, 0, 64, true, false);
+  assert.equal(blackPlan.reused, true);
+  assert.deepEqual(executePlan(blackPlan, black, state, () => true, null), sourceOver);
+  assert.equal(blackPlan.reused, false, "restoring black source colors restores the shorter operation plan");
+
   const plan = new ThreeScenePaintPlan();
   executePlan(plan, scene, state, () => true, null);
   const failing = makeAdapter(state);
@@ -140,17 +158,20 @@ try {
   assert.equal(plan.operations, 0);
   console.log("Three scene paint plans passed: exact operation/lifetime parity, dynamic mask projections, visibility/culling/scene/proxy/resize/capability invalidation and failure cleanup.");
 
-  function executePlan(plan, input, state, visible, selected, revision, structure = 0, width = 64, colorBatchingEnabled = true) {
+  function executePlan(plan, input, state, visible, selected, revision, structure = 0, width = 64,
+    colorBatchingEnabled = true, blackDarkenSourceOverEnabled = true) {
     if (arguments.length < 6) revision = 0;
     const host = makeAdapter(state);
-    const result = plan.execute(input, host.adapter, { id: 0 }, visible, selected, revision, structure, width, 32, colorBatchingEnabled);
+    const result = plan.execute(input, host.adapter, { id: 0 }, visible, selected, revision, structure, width, 32,
+      colorBatchingEnabled, blackDarkenSourceOverEnabled);
     host.live.delete(result.id);
     assert.equal(host.live.size, 0);
     return host.operations;
   }
-  function executeOriginal(input, state, visible, selected, colorBatchingEnabled = true) {
+  function executeOriginal(input, state, visible, selected, colorBatchingEnabled = true, blackDarkenSourceOverEnabled = true) {
     const host = makeAdapter(state);
-    const result = compositeScenePaintGraph(input, host.adapter, { id: 0 }, visible, selected, true, colorBatchingEnabled);
+    const result = compositeScenePaintGraph(input, host.adapter, { id: 0 }, visible, selected, true, colorBatchingEnabled,
+      blackDarkenSourceOverEnabled);
     host.live.delete(result.id);
     assert.equal(host.live.size, 0);
     return host.operations;

@@ -1,7 +1,8 @@
 import { nativeGradientMaskVectors } from "./gradientMaskFold";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
-import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOperation,
+import { pdfCompositeScissorRect, type PdfCompositeOperation,
   type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
+import { ScenePaintPlan } from "./scenePaintPlan";
 import { PDF_COMPOSITE_FRAGMENT_GLSL, PDF_COMPOSITE_VERTEX_GLSL } from "./pdfCompositeShaders";
 import { choosePdfCompositeResolution } from "./pdfCompositeBudget";
 import type { ScenePaintMask } from "./scenePaintGraph";
@@ -64,6 +65,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   private readonly one: WebGLTexture;
   private readonly transfers = new Map<Float32Array, WebGLTexture>();
   private readonly pool: Surface[] = [];
+  private readonly paintPlan = new ScenePaintPlan();
   private readonly all = new Set<Surface>();
   private width = 0;
   private height = 0;
@@ -79,6 +81,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
   readonly firstUnit: number;
   /** Units this compositor has bound during the current render, by offset. */
   private readonly bound: (WebGLTexture | null)[] = [];
+  get paintPlanReused(): boolean { return this.paintPlan.reused; }
+  get paintPlanOperations(): number { return this.paintPlan.operations; }
 
   constructor(gl: WebGL2RenderingContext, onDraw?: () => void) {
     this.gl = gl;
@@ -122,7 +126,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     draw: (runs: readonly VectorDrawRun[], shapeOnly: boolean) => void,
     visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
     project: PdfCompositeProjector | null = null, knownState?: WebGlPaintCompositorState,
-    folding: WebGlPaintFolding | null = null, colorBatchingEnabled = true): void {
+    folding: WebGlPaintFolding | null = null, colorBatchingEnabled = true, visibilityRevision?: number,
+    blackDarkenSourceOverEnabled = true): void {
     const gl = this.gl;
     const size = choosePdfCompositeResolution(scene, width, height);
     if (size.scale < 1 && !this.approximationReported) {
@@ -145,7 +150,8 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, backdrop.framebuffer);
       gl.blitFramebuffer(viewport[0], viewport[1], viewport[0] + width, viewport[1] + height,
         0, 0, this.width, this.height, gl.COLOR_BUFFER_BIT, gl.LINEAR);
-      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true, colorBatchingEnabled);
+      result = this.paintPlan.execute(scene, this, backdrop, visible, selected, visibilityRevision, 0,
+        width, height, colorBatchingEnabled, blackDarkenSourceOverEnabled);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, result.framebuffer);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.blitFramebuffer(0, 0, this.width, this.height, viewport[0], viewport[1], viewport[0] + width, viewport[1] + height,
@@ -280,6 +286,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     this.onDraw?.();
   }
   dispose(): void {
+    this.paintPlan.clear();
     this.releaseSurfaces();
     for (const texture of this.transfers.values()) this.gl.deleteTexture(texture);
     this.transfers.clear(); this.gl.deleteTexture(this.zero); this.gl.deleteTexture(this.one);

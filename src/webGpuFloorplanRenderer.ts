@@ -2338,6 +2338,8 @@ export class WebGpuFloorplanRenderer {
 
     this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
     this.vectorOverrideOpacity = nextOpacity;
+    this.orderedBatches?.setBlackDarkenSourceOverEnabled(nextOpacity === 0 ||
+      (nextRed === 0 && nextGreen === 0 && nextBlue === 0));
     this.requestFrame();
   }
 
@@ -4036,7 +4038,8 @@ export class WebGpuFloorplanRenderer {
       const parentPass = pass;
       try {
         const colorBatchingEnabled = plan?.colorBatchingEnabled ?? false;
-        const segments = scenePaintSpanSegments(this.scene!, colorBatchingEnabled);
+        const blackDarkenSourceOverEnabled = plan?.blackDarkenSourceOverEnabled ?? false;
+        const segments = scenePaintSpanSegments(this.scene!, colorBatchingEnabled, blackDarkenSourceOverEnabled);
         this.paintCompositor.render(this.scene!, parentPass, this.paintViewportWidth, this.paintViewportHeight,
           (spanRuns, target, shapeOnly) => {
             pass = shapeOnly ? new Proxy(target, { get: (object, key) => key === "setPipeline"
@@ -4065,7 +4068,9 @@ export class WebGpuFloorplanRenderer {
               pass = target;
               try { draw(run); } finally { this.paintFolds?.end(); }
             }
-          }, colorBatchingEnabled);
+          }, colorBatchingEnabled, paintVisibility.revision, blackDarkenSourceOverEnabled);
+        this.performanceProfiler?.add(this.paintCompositor.paintPlanReused ? "cachedPaintPlans" : "paintPlanBuilds");
+        this.performanceProfiler?.add("paintPlanOperations", this.paintCompositor.paintPlanOperations);
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
@@ -4518,6 +4523,8 @@ export class WebGpuFloorplanRenderer {
     if (this.orderedTextLod) this.orderedRunCuller?.includeTextLod(this.orderedTextLod.data);
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
       !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
+    this.orderedBatches?.setBlackDarkenSourceOverEnabled(this.vectorOverrideOpacity === 0 ||
+      this.vectorOverrideColor.every(channel => channel === 0));
     this.orderedInstanceBuffer?.destroy();
     const usage = (globalThis as any).GPUBufferUsage;
     this.orderedInstanceCapacityBytes = Math.max(8, this.orderedBatches?.uintInstances.byteLength ?? 0);

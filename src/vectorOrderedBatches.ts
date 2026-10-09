@@ -18,6 +18,10 @@ import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
   readonly batches: VectorDrawRun[] = [];
+  /** Changes whenever mutable batches are rebuilt. */
+  revision = 0;
+  /** LOD selection changes batch ranges without changing canonical membership. */
+  coverageRevision = 0;
   /**
    * The compositor span each batch belongs to, parallel to `batches`. Batches
    * rise through the spans in graph order, so a caller compositing one span
@@ -93,6 +97,7 @@ export class VectorOrderedBatches {
   private readonly redundancy: VectorStrokeRedundancy;
   private redundancyIds = new Uint32Array(0);
   private redundancyEnabled = true;
+  private blackPreserved = true;
   private previousSelectedRanks = new Uint32Array(0);
   private previousRankCount = 0;
   private previousRuns: VectorDrawRun[] = [];
@@ -104,6 +109,7 @@ export class VectorOrderedBatches {
   private textSelectionRevision = 0;
 
   get colorBatchingEnabled(): boolean { return this.redundancyEnabled && this.strokeColorsMatchSource; }
+  get blackDarkenSourceOverEnabled(): boolean { return this.colorBatchingEnabled && this.blackPreserved; }
 
   constructor(scene: VectorScene, runtime: VectorStrokeLodRuntime | null) {
     this.scene = scene;
@@ -196,16 +202,28 @@ export class VectorOrderedBatches {
     if (this.redundancyEnabled === enabled) return;
     this.redundancyEnabled = enabled;
     const segments = sceneRequiresPaintCompositing(this.scene)
-      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled, this.blackDarkenSourceOverEnabled) : null;
     if (segments !== this.segments) this.rebuildScheduler();
     else this.scheduler?.setColorCommutationEnabled(enabled);
     this.orderDirty = true;
     this.dirty = true;
   }
 
+  /** Global tint may change black while still preserving equal-color batching. */
+  setBlackDarkenSourceOverEnabled(enabled: boolean): void {
+    if (this.blackPreserved === enabled) return;
+    this.blackPreserved = enabled;
+    const segments = sceneRequiresPaintCompositing(this.scene)
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled, this.blackDarkenSourceOverEnabled) : null;
+    if (segments === this.segments) return;
+    this.rebuildScheduler();
+    this.orderDirty = true;
+    this.dirty = true;
+  }
+
   private rebuildScheduler(): void {
     this.segments = sceneRequiresPaintCompositing(this.scene)
-      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled, this.blackDarkenSourceOverEnabled) : null;
     let maxSpan = 0;
     for (const span of this.segments ?? []) maxSpan = Math.max(maxSpan, span);
     this.scheduledSpanPrefix = new Uint32Array(maxSpan + 2);
@@ -296,6 +314,8 @@ export class VectorOrderedBatches {
     }
     this.previousSelectedRanks.set(this.selectedRanks.subarray(0, selectedCount));
     this.previousRankCount = selectedCount;
+    this.revision++;
+    if (!sameRuns) this.coverageRevision++;
     this.batches.length = 0;
     this.batchSegments.length = 0;
     this.spanOrdered = true;

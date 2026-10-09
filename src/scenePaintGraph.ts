@@ -166,6 +166,7 @@ export function planScenePaintPasses(scene: VectorScene, visible: (condition?: n
 
 const normalizedGraphs = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
 const normalizedGraphsWithoutColorBatching = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
+const normalizedGraphsWithoutBlackSourceOver = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
 
 /** Exact uploaded RGB of a Normal vector paint, or null for mixed/unknown colors. */
 function uniformDrawColor(scene: VectorScene, runIndex: number): readonly number[] | null {
@@ -235,15 +236,22 @@ function paintsSourceOverOnly(scene: VectorScene, nodes: readonly ScenePaintNode
  *   upload format accumulate their paints into one isolated source, then Darken once.
  *   Coverage alpha still aggregates as source-over, including on translucent
  *   backdrops. Color overrides or differing LOD RGB disable this optimization.
+ * - A singleton Darken paint whose uploaded RGB is black is plain source-over:
+ *   min(backdrop RGB, 0) is zero for every backdrop, including partial alpha.
+ *   Its otherwise ordinary wrapper can be spliced into its parent's span.
+ *   A global tint that changes black disables this shortcut separately.
+ *   A global tint that changes black disables this shortcut independently.
  *
  * A spliced child inherits its group's optional-content condition if it has no
  * condition of its own. A different child condition keeps the group intact:
  * both must hold, and a node has room for only one condition. Run conditions
  * are checked independently, so they do not prevent this inheritance.
  */
-export function normalizeScenePaintGraph(scene: VectorScene, colorBatchingEnabled = true): readonly ScenePaintNode[] {
+export function normalizeScenePaintGraph(scene: VectorScene, colorBatchingEnabled = true,
+  blackDarkenSourceOverEnabled = true): readonly ScenePaintNode[] {
   if (!scene.paintGraph) return [];
-  const cache = colorBatchingEnabled ? normalizedGraphs : normalizedGraphsWithoutColorBatching;
+  const cache = !colorBatchingEnabled ? normalizedGraphsWithoutColorBatching
+    : blackDarkenSourceOverEnabled ? normalizedGraphs : normalizedGraphsWithoutBlackSourceOver;
   const cached = cache.get(scene);
   if (cached) return cached;
   const colors = new Map<number, readonly number[] | null>();
@@ -288,8 +296,11 @@ export function normalizeScenePaintGraph(scene: VectorScene, colorBatchingEnable
       if (node.kind !== "group") { append(node); continue; }
       const sourceOverOnly = !node.knockout && paintsSourceOverOnly(scene, node.children, 0);
       const children = rewrite(node.children, depth + 1, node.knockout, knockoutAncestor || node.knockout);
+      const blackSourceOver = colorBatchingEnabled && blackDarkenSourceOverEnabled && !knockoutAncestor &&
+        node.blendMode === "Darken" && children.length === 1 && children[0].kind === "draw" &&
+        colorOf(children[0].runIndex)?.every(value => value === 0);
       if (!knockoutParent && node.alpha === 1 && !node.softMask &&
-          !node.knockout && node.blendMode === "Normal" && (!node.isolated || sourceOverOnly) &&
+          !node.knockout && (node.blendMode === "Normal" || blackSourceOver) && (!node.isolated || sourceOverOnly) &&
           (node.optionalContent === undefined || children.every(child =>
             child.optionalContent === undefined || child.optionalContent === node.optionalContent))) {
         for (const child of children) append(node.optionalContent !== undefined && child.optionalContent === undefined
@@ -309,6 +320,7 @@ export function normalizeScenePaintGraph(scene: VectorScene, colorBatchingEnable
 
 const spanSegments = new WeakMap<VectorScene, Uint32Array>();
 const spanSegmentsWithoutColorBatching = new WeakMap<VectorScene, Uint32Array>();
+const spanSegmentsWithoutBlackSourceOver = new WeakMap<VectorScene, Uint32Array>();
 
 /**
  * The span each canonical draw run paints in, numbered in graph order.
@@ -326,9 +338,11 @@ const spanSegmentsWithoutColorBatching = new WeakMap<VectorScene, Uint32Array>()
  * boundaries only cost batching, never correctness, so list starts and group
  * edges each take one rather than being computed exactly.
  */
-export function scenePaintSpanSegments(scene: VectorScene, colorBatchingEnabled = true): Uint32Array | null {
+export function scenePaintSpanSegments(scene: VectorScene, colorBatchingEnabled = true,
+  blackDarkenSourceOverEnabled = true): Uint32Array | null {
   if (!scene.paintGraph || !scene.drawRuns) return null;
-  const cache = colorBatchingEnabled ? spanSegments : spanSegmentsWithoutColorBatching;
+  const cache = !colorBatchingEnabled ? spanSegmentsWithoutColorBatching
+    : blackDarkenSourceOverEnabled ? spanSegments : spanSegmentsWithoutBlackSourceOver;
   const cached = cache.get(scene);
   if (cached) return cached;
   const runs = scene.drawRuns;
@@ -358,7 +372,7 @@ export function scenePaintSpanSegments(scene: VectorScene, colorBatchingEnabled 
     }
     current++;
   };
-  visit(normalizeScenePaintGraph(scene, colorBatchingEnabled), 0);
+  visit(normalizeScenePaintGraph(scene, colorBatchingEnabled, blackDarkenSourceOverEnabled), 0);
   cache.set(scene, segments);
   return segments;
 }
@@ -371,6 +385,7 @@ export interface ScenePaintExtents {
 }
 const nodeBounds = new WeakMap<VectorScene, ScenePaintExtents>();
 const nodeBoundsWithoutColorBatching = new WeakMap<VectorScene, ScenePaintExtents>();
+const nodeBoundsWithoutBlackSourceOver = new WeakMap<VectorScene, ScenePaintExtents>();
 const UNBOUNDED: Bounds = { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity };
 
 /**
@@ -385,8 +400,10 @@ const UNBOUNDED: Bounds = { minX: -Infinity, minY: -Infinity, maxX: Infinity, ma
  * lookup. A paint whose extent is unknown reports an unbounded rectangle, so a
  * group containing one is never restricted.
  */
-export function scenePaintNodeBounds(scene: VectorScene, colorBatchingEnabled = true): ScenePaintExtents {
-  const cache = colorBatchingEnabled ? nodeBounds : nodeBoundsWithoutColorBatching;
+export function scenePaintNodeBounds(scene: VectorScene, colorBatchingEnabled = true,
+  blackDarkenSourceOverEnabled = true): ScenePaintExtents {
+  const cache = !colorBatchingEnabled ? nodeBoundsWithoutColorBatching
+    : blackDarkenSourceOverEnabled ? nodeBounds : nodeBoundsWithoutBlackSourceOver;
   const cached = cache.get(scene);
   if (cached) return cached;
   const result: ScenePaintExtents = { nodes: new Map<readonly ScenePaintNode[], Bounds>(), runs: null };
@@ -428,7 +445,7 @@ export function scenePaintNodeBounds(scene: VectorScene, colorBatchingEnabled = 
     return bounds;
   };
   perRun.fill(Infinity);
-  visit(normalizeScenePaintGraph(scene, colorBatchingEnabled), 0);
+  visit(normalizeScenePaintGraph(scene, colorBatchingEnabled, blackDarkenSourceOverEnabled), 0);
   result.runs = perRun;
   cache.set(scene, result);
   return result;

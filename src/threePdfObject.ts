@@ -997,6 +997,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     };
     this.dataToLocalMatrix.makeTranslation(-this.sceneCenterX, -this.sceneCenterY, 0);
     this.drawPlan = this.sceneData.drawRuns ? drawPlan ?? new ThreeVectorDrawPlan(this.sceneData) : null;
+    const tint = this.rendererConfig.vectorOverride;
+    this.drawPlan?.setBlackDarkenSourceOverEnabled(tint[3] <= 0 ||
+      (tint[0] === 0 && tint[1] === 0 && tint[2] === 0));
     this.renderer.setInteractionViewportProvider(() => this.resolveInteractionViewportRect());
     this.attachNativeFrameListener(this.renderer);
 
@@ -2555,6 +2558,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
       return;
     }
     this.rendererConfig.vectorOverride = [red, green, blue, opacity];
+    this.drawPlan?.setBlackDarkenSourceOverEnabled(opacity <= 0 ||
+      (red === 0 && green === 0 && blue === 0));
+    this.syncVectorDrawPlanOrder();
     this.markPageAppearanceChanged();
     this.renderer.setVectorColorOverride(red, green, blue, opacity);
     this.gradientMaterialLayer.setVectorOverride(red, green, blue, opacity);
@@ -3195,7 +3201,8 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
           materialLayerViewport.width, materialLayerViewport.height,
           condition => this.layerVisibility.isVisible(condition),
           bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType),
-          this.clipFromDataMatrix, this.layerVisibility.revision, this.drawPlan?.colorBatchingEnabled ?? true);
+          this.clipFromDataMatrix, this.layerVisibility.revision, this.drawPlan?.colorBatchingEnabled ?? true,
+          this.drawPlan?.blackDarkenSourceOverEnabled ?? false);
       }
     } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }

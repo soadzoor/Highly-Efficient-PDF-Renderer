@@ -678,6 +678,19 @@ the plan. Projected rectangles and computed mask vectors still update every
 frame. `three.cachedProxyLookups` and `three.cachedGeometrySelections` count
 reused draw lookups and complete geometry selections.
 
+Native WebGL and WebGPU also replay stable paint plans. Their `cachedPaintPlans`,
+`paintPlanBuilds` and `paintPlanOperations` counters describe this reuse. Canonical
+span coverage is resolved once per paint selection; LOD-only batch changes
+refresh the batch intervals without rescanning the full canonical paint list.
+
+Unmasked singleton Darken groups drawing exact black at full group opacity share
+ordinary source-over spans. Black Darken is equivalent to alpha blending even at AA edges
+and over a translucent background. A global tint that changes black restores
+the Darken boundaries while retaining equal-color batching. Different gray
+Darken paints retain their order and composite passes because merging them can
+change overlapping antialiased pixels. These runtime optimizations also apply
+to existing HEP files; re-export is unnecessary.
+
 On Three revision 186, `three.glAutoUniformUploads` counts compositor draws
 whose changed material lets Three upload uniforms automatically;
 `three.glForcedUniformUploads` counts draws that require an explicit refresh,

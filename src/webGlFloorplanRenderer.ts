@@ -1608,6 +1608,8 @@ export class WebGlFloorplanRenderer {
 
     this.vectorOverrideColor = [nextRed, nextGreen, nextBlue];
     this.vectorOverrideOpacity = nextOpacity;
+    this.orderedBatches?.setBlackDarkenSourceOverEnabled(nextOpacity === 0 ||
+      (nextRed === 0 && nextGreen === 0 && nextBlue === 0));
     this.requestFrame();
   }
 
@@ -3899,7 +3901,8 @@ export class WebGlFloorplanRenderer {
         }
       } : null;
       const colorBatchingEnabled = plan?.colorBatchingEnabled ?? false;
-      const segments = scenePaintSpanSegments(this.scene!, colorBatchingEnabled);
+      const blackDarkenSourceOverEnabled = plan?.blackDarkenSourceOverEnabled ?? false;
+      const segments = scenePaintSpanSegments(this.scene!, colorBatchingEnabled, blackDarkenSourceOverEnabled);
       try {
         this.paintCompositor.render(this.scene!, width, height, (spanRuns, shapeOnly) => {
           this.invalidateOrderedState();
@@ -3926,7 +3929,9 @@ export class WebGlFloorplanRenderer {
           scissor: false, blend: true, depth: false, program: null, vao: null,
           blendFunction: [this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA, this.gl.ONE, this.gl.ONE_MINUS_SRC_ALPHA],
           blendEquation: [this.gl.FUNC_ADD, this.gl.FUNC_ADD]
-        }, folding, colorBatchingEnabled);
+        }, folding, colorBatchingEnabled, paintVisibility.revision, blackDarkenSourceOverEnabled);
+        profile?.add(this.paintCompositor.paintPlanReused ? "cachedPaintPlans" : "paintPlanBuilds");
+        profile?.add("paintPlanOperations", this.paintCompositor.paintPlanOperations);
       } finally {
         this.paintShapeOnly = false; this.vectorClipIndex = -1;
         profile?.endSection("drawSubmission");
@@ -5543,6 +5548,8 @@ export class WebGlFloorplanRenderer {
     this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
       !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
+    this.orderedBatches?.setBlackDarkenSourceOverEnabled(this.vectorOverrideOpacity === 0 ||
+      this.vectorOverrideColor.every(channel => channel === 0));
     if (this.orderedBatches && !this.orderedInstanceBuffer) this.orderedInstanceBuffer = this.mustCreateBuffer();
 
     // The combined store starts with unchanged canonical IDs, so exact draws

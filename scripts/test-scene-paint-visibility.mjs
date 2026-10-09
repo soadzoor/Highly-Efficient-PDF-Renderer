@@ -34,6 +34,18 @@ try {
   assert.equal(plan.isRunVisible(scene.drawRuns[1]), false);
   await state.resetLayerVisibility(); plan.setVisibility(state.getSnapshot());
   assert.equal(plan.select(scene.drawRuns), scene.drawRuns);
+  const initialSnapshot = state.getSnapshot();
+  plan.setVisibility(initialSnapshot);
+  const initialRevision = plan.revision;
+  plan.setVisibility(initialSnapshot);
+  assert.equal(plan.revision, initialRevision, "unchanged snapshots retain the paint-plan cache");
+  plan.setVisibility({ ...initialSnapshot, conditions: Uint8Array.of(1, 0) });
+  assert(plan.revision > initialRevision, "replacement snapshots invalidate plans even with identical source revisions");
+  assert.deepEqual(plan.select(scene.drawRuns), [scene.drawRuns[0], scene.drawRuns[2]]);
+  const hiddenRevision = plan.revision;
+  plan.setVisibility(null);
+  assert(plan.revision > hiddenRevision, "returning to defaults invalidates the cached visibility plan");
+  assert.equal(plan.select(scene.drawRuns), scene.drawRuns);
   assert.deepEqual(scene, original, "runtime plans never merge, rewrite, or discard canonical runs");
 
   const group = (children, extra = {}) => ({ kind: "group", children, alpha: 1, isolated: false,

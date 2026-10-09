@@ -333,6 +333,8 @@ try {
     for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
       const renderer = Object.create(Renderer.prototype);
       renderer.vectorLodMode = "force";
+      renderer.vectorOverrideColor = [0.4, 0.5, 0.6];
+      renderer.vectorOverrideOpacity = 0.25;
       renderer.mustCreateBuffer = () => ({});
       renderer.gpuDevice = { createBuffer: () => ({ destroy() {} }) };
       renderer.uploadVectorClips = () => {};
@@ -345,8 +347,13 @@ try {
       renderer.destroyVectorLodResources = () => {};
       assert(renderer.rebuildVectorLod(scene));
       assert(renderer.orderedBatches.strokeRecords.count > scene.segmentCount);
+      assert.equal(renderer.orderedBatches.blackDarkenSourceOverEnabled, false,
+        "a tint configured before scene upload retains Darken blending");
       renderer.vectorLodMode = "off";
+      renderer.vectorOverrideOpacity = 0;
       assert.equal(renderer.rebuildVectorLod(scene), false);
+      assert.equal(renderer.orderedBatches.blackDarkenSourceOverEnabled, true,
+        "rebuilding without tint enables the black source-over shortcut");
       assert.deepEqual(renderer.orderedBatches.strokeRecords.segments.map(segment => segment.scene), [scene]);
       assert.equal(renderer.vectorLodRuntime, null);
     }

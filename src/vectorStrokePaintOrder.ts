@@ -99,8 +99,11 @@ export function strokePaintGroups(scene: VectorScene, mergeCompatibleRuns = true
   let result = cache.get(scene);
   if (result) return result;
   result = new Uint32Array(scene.segmentCount);
+  // Stored geometry must remain valid when a global tint turns black into a
+  // different RGB. Keep Darken/Normal boundaries even while the renderer can
+  // temporarily remove black Darken wrappers from its submission graph.
   const spans = mergeCompatibleRuns && scene.paintGraph && paintGraphRunsInSourceOrder(scene)
-    ? scenePaintSpanSegments(scene) : null;
+    ? scenePaintSpanSegments(scene, true, false) : null;
   let previousRun: VectorDrawRun | undefined;
   let previousRunIndex = -1;
   let previousConditions: number[] | undefined;

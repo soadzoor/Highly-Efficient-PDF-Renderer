@@ -58,6 +58,7 @@ export class ScenePaintVisibility {
   readonly requiresCompositing: boolean;
   readonly orderedRuns: readonly VectorDrawRun[];
   private snapshot: OptionalContentSnapshot | null = null;
+  private visibilityRevision = 0;
   private readonly eligible = new Set<VectorDrawRun>();
   private visibleRuns: readonly VectorDrawRun[] = [];
   private readonly selected: VectorDrawRun[] = [];
@@ -73,10 +74,14 @@ export class ScenePaintVisibility {
     this.setVisibility(this.defaults);
   }
 
+  /** Snapshot replacements invalidate paint plans even when source revision numbers match. */
+  get revision(): number { return this.visibilityRevision; }
+
   setVisibility(snapshot: OptionalContentSnapshot | null): void {
     snapshot ??= this.defaults;
     if (this.snapshot === snapshot) return;
     this.snapshot = snapshot;
+    this.visibilityRevision++;
     this.eligible.clear();
     const visible = (condition?: number): boolean => condition === undefined || snapshot.conditions[condition] === 1;
     const runs: VectorDrawRun[] = [];

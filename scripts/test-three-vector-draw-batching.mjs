@@ -239,6 +239,25 @@ try {
   assert.equal(darkLayer.mesh.children.length, darkened.segmentCount,
     "dormant LOD colors that differ from their origins invalidate the group color proof");
   darkLayer.runs.dispose(); darkLayer.clipTexture.dispose();
+  const blackened = structuredClone(darkened);
+  for (let index = 0; index < blackened.segmentCount; index++) blackened.styles.fill(0, index * 4 + 1, index * 4 + 4);
+  blackened.paintGraph.roots[1] = blackened.paintGraph.roots[1].children[0];
+  const blackPlan = new ThreeVectorDrawPlan(blackened);
+  const blackLayer = createLayer(blackened, "stroke", "aSegmentIndex", blackened.segmentCount, blackPlan);
+  assert.equal(blackLayer.mesh.children.length, 1, "black Darken and ordinary paints share one material batch");
+  const untintedVersion = blackPlan.version;
+  assert.equal(blackPlan.setBlackDarkenSourceOverEnabled(false), true);
+  refresh(blackLayer);
+  assert(blackPlan.version > untintedVersion, "a tint rebuilds effect spans even without changed run order");
+  assert.equal(blackPlan.colorBatchingEnabled, true, "a tint retains equal-color grouping");
+  assert.equal(blackLayer.mesh.children.length, 3, "tinted black retains its Darken boundaries");
+  blackPlan.setColorCommutationEnabled(false);
+  blackPlan.setColorCommutationEnabled(true);
+  assert.equal(blackPlan.blackDarkenSourceOverEnabled, false, "primitive color changes preserve the tint gate");
+  blackPlan.setBlackDarkenSourceOverEnabled(true);
+  refresh(blackLayer);
+  assert.equal(blackLayer.mesh.children.length, 1, "removing the tint restores the enclosing source-over batch");
+  blackLayer.runs.dispose(); blackLayer.clipTexture.dispose();
   const backwardsDarkened = { ...darkened, paintGraph: { roots: [...darkened.paintGraph.roots].reverse() } };
   const backwardsLayer = createLayer(backwardsDarkened, "stroke", "aSegmentIndex", darkened.segmentCount,
     new ThreeVectorDrawPlan(backwardsDarkened));

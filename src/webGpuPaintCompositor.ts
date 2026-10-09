@@ -1,7 +1,8 @@
 import { nativeGradientMaskVectors } from "./gradientMaskFold";
 import type { Bounds, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
-import { compositeScenePaintGraph, pdfCompositeScissorRect, type PdfCompositeOperation,
+import { pdfCompositeScissorRect, type PdfCompositeOperation,
   type PdfCompositeProjector, type ScenePaintCompositorAdapter } from "./scenePaintCompositor";
+import { ScenePaintPlan } from "./scenePaintPlan";
 import { PDF_COMPOSITE_WGSL } from "./pdfCompositeShaders";
 import { choosePdfCompositeResolution, PDF_COMPOSITE_MAX_BYTES } from "./pdfCompositeBudget";
 import type { ScenePaintMask } from "./scenePaintGraph";
@@ -60,6 +61,7 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   private uniformEncoder: any = null;
   private readonly transfers = new Map<Float32Array, Surface>();
   private readonly pool: Surface[] = [];
+  private readonly paintPlan = new ScenePaintPlan();
   private readonly all = new Set<Surface>();
   private width = 0;
   private height = 0;
@@ -80,6 +82,8 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
   private viewportWidth = 0;
   private viewportHeight = 0;
   private readonly onDraw: (() => void) | undefined;
+  get paintPlanReused(): boolean { return this.paintPlan.reused; }
+  get paintPlanOperations(): number { return this.paintPlan.operations; }
 
   constructor(device: any, format: string, onDraw?: () => void) {
     this.device = device; this.format = format;
@@ -109,7 +113,7 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     draw: (runs: readonly VectorDrawRun[], pass: any, shapeOnly: boolean) => void,
     visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
     project: PdfCompositeProjector | null = null, folding: WebGpuPaintFolding | null = null,
-    colorBatchingEnabled = true): void {
+    colorBatchingEnabled = true, visibilityRevision?: number, blackDarkenSourceOverEnabled = true): void {
     const info = managedPasses.get(parentPass);
     if (!info) throw new Error("PDF compositing requires a managed render pass.");
     if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0)
@@ -143,7 +147,8 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     try {
       backdrop = this.acquire();
       this.pass({ operation: 5, source: { view: info.descriptor.colorAttachments[0].view, texture: null } }, backdrop);
-      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true, colorBatchingEnabled);
+      result = this.paintPlan.execute(scene, this, backdrop, visible, selected, visibilityRevision, 0,
+        width, height, colorBatchingEnabled, blackDarkenSourceOverEnabled);
       this.flushClears([result]);
       this.endPass();
       const pass = info.resume();
@@ -233,6 +238,7 @@ export class WebGpuPaintCompositor implements ScenePaintCompositorAdapter<Surfac
     this.encode(operation, pass);
   }
   dispose(): void {
+    this.paintPlan.clear();
     this.releaseSurfaces(); this.zero.texture.destroy(); this.one.texture.destroy();
     for (const uniform of this.uniforms) uniform.destroy(); this.uniforms.length = 0;
     for (const transfer of this.transfers.values()) transfer.texture.destroy(); this.transfers.clear();

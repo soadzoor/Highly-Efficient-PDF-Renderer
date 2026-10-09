@@ -13,6 +13,7 @@ try {
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
+  const { ScenePaintPlan } = await import("../src/scenePaintPlan.ts");
   const { pdfShapeCoverageWgsl } = await import("../src/pdfShapeCoverage.ts");
   const { choosePdfCompositeResolution } = await import("../src/pdfCompositeBudget.ts");
   const scene = { drawRuns: [{ kind: "fill", first: 0, count: 1 }],
@@ -81,6 +82,71 @@ try {
   assert.deepEqual(draws.map(draw => draw.shapeOnly), [false, true], "knockout groups still render their shape");
   assert.deepEqual([...writes.at(-1).values.slice(8, 10)], [6, 6], "final copy explicitly addresses the destination dimensions");
   parent.end(); encoder.finish();
+
+  // Both native adapters replay a stable graph while applying this frame's
+  // draw callback. Explicit visibility revisions opt in; dynamic callbacks
+  // without one keep their original per-frame behavior.
+  {
+    const graph = { drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "fill", first: 1, count: 1 }],
+      paintGraph: { roots: [{ kind: "draw", runIndex: 0, optionalContent: 0 },
+        { kind: "draw", runIndex: 1, optionalContent: 1 }] } };
+    const knownState = { framebuffer: null, readFramebuffer: null, viewport: [0, 0, 4, 4],
+      clearColor: [1, 1, 1, 1], scissor: false, blend: true, depth: false, program: null, vao: null,
+      blendFunction: [0, 0, 0, 0], blendEquation: [0, 0] };
+    const nativeGl = Object.create(WebGlPaintCompositor.prototype);
+    Object.assign(nativeGl, { paintPlan: new ScenePaintPlan(), width: 4, height: 4, bound: [],
+      gl: { disable() {}, enable() {}, bindFramebuffer() {}, blitFramebuffer() {}, viewport() {},
+        clearColor() {}, blendFuncSeparate() {}, blendEquationSeparate() {}, useProgram() {}, bindVertexArray() {} },
+      acquire: () => ({}), release() {}, clear() {}, copy() {}, pass() {},
+      draw(runs, _destination, shapeOnly) { this.drawSpan(runs, shapeOnly); } });
+    const nativeGpu = new WebGpuPaintCompositor(device, "rgba8unorm");
+    for (const backend of ["webgl", "webgpu"]) {
+      const native = backend === "webgl" ? nativeGl : nativeGpu;
+      let visibleChecks = 0, showSecond = true;
+      const visible = condition => { visibleChecks++; return condition !== 1 || showSecond; };
+      const render = (revision, selected = null, blackDarkenSourceOverEnabled = true) => {
+        const actual = [];
+        if (backend === "webgl") {
+          native.render(graph, 4, 4, runs => actual.push(...runs), visible, selected, null, knownState,
+            null, true, revision, blackDarkenSourceOverEnabled);
+        } else {
+          const log = makeEncoder(), pass = beginPdfManagedRenderPass(log,
+            { colorAttachments: [{ view: target.createView(), loadOp: "load", storeOp: "store" }] });
+          native.render(graph, pass, 4, 4, (runs, targetPass) => { actual.push(...runs); targetPass.draw(3); },
+            visible, selected, null, null, true, revision, blackDarkenSourceOverEnabled);
+          pass.end(); log.finish();
+        }
+        return actual.map(run => [run.first, run.count]);
+      };
+      assert.deepEqual(render(0), [[0, 2]], backend);
+      assert.equal(native.paintPlanReused, false);
+      visibleChecks = 0;
+      assert.deepEqual(render(0), [[0, 2]], backend);
+      assert.equal(native.paintPlanReused, true);
+      assert(native.paintPlanOperations > 0, `${backend}: cached operation counts are available to profiling`);
+      assert.equal(visibleChecks, 0, `${backend}: stable frames skip canonical graph traversal`);
+      showSecond = false;
+      assert.deepEqual(render(1), [[0, 1]], `${backend}: a visibility revision drops hidden content`);
+      assert.equal(native.paintPlan.reused, false);
+      showSecond = true;
+      const selected = Uint8Array.of(1, 0);
+      assert.deepEqual(render(2, selected), [[0, 1]], backend);
+      assert.deepEqual(render(2, selected), [[0, 1]], backend);
+      assert.equal(native.paintPlan.reused, true);
+      selected[0] = 0; selected[1] = 1;
+      assert.deepEqual(render(2, selected), [[1, 1]], `${backend}: mutated culling flags invalidate the plan`);
+      assert.equal(native.paintPlan.reused, false);
+      assert.deepEqual(render(2, selected, false), [[1, 1]], backend);
+      assert.equal(native.paintPlan.reused, false, `${backend}: global tint eligibility invalidates the operation plan`);
+      assert.deepEqual(render(2, selected, false), [[1, 1]], backend);
+      assert.equal(native.paintPlan.reused, true);
+      assert.deepEqual(render(undefined), [[0, 2]], backend);
+      showSecond = false;
+      assert.deepEqual(render(undefined), [[0, 1]], `${backend}: unversioned callbacks remain dynamic`);
+      assert.equal(native.paintPlan.reused, false);
+    }
+    nativeGpu.dispose();
+  }
 
   const nextEncoder = makeEncoder(), nextPass = beginPdfManagedRenderPass(nextEncoder,
     { colorAttachments: [{ view: target.createView(), loadOp: "load", storeOp: "store" }] });
@@ -184,8 +250,11 @@ try {
       gradientFillSegmentsB: f([6, 0, 0, 0, 6, 6, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0]),
       paintGraph: { roots: [{ ...masked.paintGraph.roots[0],
         softMask: { subtype: "Alpha", children: [{ kind: "draw", runIndex: 1 }] } }] } };
-    const project = box => ({ x: box.minX, y: box.minY, width: box.maxX - box.minX, height: box.maxY - box.minY });
+    let projectShift = 0;
+    const project = box => ({ x: box.minX + projectShift, y: box.minY,
+      width: box.maxX - box.minX, height: box.maxY - box.minY });
     for (const mode of ["computed", "override", "transfer", "curved"]) {
+      projectShift = 0;
       const graph = mode === "transfer" ? { ...analytic, paintGraph: { roots: [{ ...analytic.paintGraph.roots[0],
         softMask: { ...analytic.paintGraph.roots[0].softMask, transfer } }] } }
         : mode === "curved" ? { ...analytic, gradientFillSegmentsB: analytic.gradientFillSegmentsB.slice() } : analytic;
@@ -193,14 +262,33 @@ try {
       const log = makeEncoder(), parentPass = beginPdfManagedRenderPass(log,
         { colorAttachments: [{ view: target.createView(), loadOp: "load", storeOp: "store" }] });
       draws.length = 0;
-      let actual;
-      compositor.render(graph, parentPass, 6, 6, draw, () => true, null, project, {
-        canFold: run => run.kind === "fill", canFoldMaskPaint: () => mode !== "override",
+      let actual, maskOverride = mode === "override";
+      const folding = {
+        canFold: run => run.kind === "fill", canFoldMaskPaint: () => !maskOverride,
         draw(run, pass, opacity, mask, content, gradient) { actual = { mask, gradient }; pass.draw(3); }
-      });
+      };
+      const render = () => compositor.render(graph, parentPass, 6, 6, draw, () => true, null, project, folding, true, 0);
+      render();
       assert.equal(!!actual.gradient, mode === "computed", mode);
       assert.equal(actual.mask === null, mode === "computed", mode);
       assert.equal(draws.length, mode === "computed" ? 0 : 1, `${mode}: mask paint submissions`);
+      if (mode === "computed") {
+        const previousGradient = actual.gradient.slice();
+        projectShift = 0.25;
+        render();
+        assert.equal(compositor.paintPlanReused, true, "camera movement reuses the computed-mask operation plan");
+        assert.notDeepEqual(actual.gradient, previousGradient, "replayed masks receive fresh projection vectors");
+        maskOverride = true;
+        draws.length = 0;
+        render();
+        assert.equal(compositor.paintPlanReused, false, "a mask color override invalidates computed-mask capability");
+        assert.equal(actual.gradient, undefined);
+        assert.equal(draws.length, 1, "the overridden mask restores its rendered-surface path");
+        maskOverride = false;
+        render();
+        assert.equal(compositor.paintPlanReused, false, "restoring the mask colors restores computed-mask capability");
+        assert(actual.gradient);
+      }
       assert.equal(new Set(compositor.pool).size, compositor.pool.length, "backdrop/result aliases return to the pool once");
       parentPass.end(); log.finish();
       // Both adapters use the same eligibility, with backend-specific Y direction.

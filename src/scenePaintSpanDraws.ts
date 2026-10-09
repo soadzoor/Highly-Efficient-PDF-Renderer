@@ -3,6 +3,15 @@ import type { VectorOrderedBatches } from "./vectorOrderedBatches";
 
 export type CanonicalRunLookup = Map<VectorDrawRun["kind"], { firsts: Int32Array; ends: Int32Array; indices: Int32Array }>;
 
+interface SpanBatchRange { low: number; high: number; revision: number; first: number; end: number }
+interface SpanBatchCache {
+  coverageRevision: number;
+  segments: Uint32Array;
+  lookup: CanonicalRunLookup | null;
+  ranges: WeakMap<readonly VectorDrawRun[], SpanBatchRange | null>;
+}
+const spanBatchCaches = new WeakMap<VectorOrderedBatches, SpanBatchCache>();
+
 /** Per kind, canonical run indices sorted by their first primitive. */
 export function buildCanonicalRunLookup(scene: VectorScene): CanonicalRunLookup | null {
   const runs = scene.drawRuns;
@@ -44,6 +53,25 @@ function canonicalRunPosition(lookup: CanonicalRunLookup | null, kind: VectorDra
  */
 export function submitPaintSpan(runs: readonly VectorDrawRun[], plan: VectorOrderedBatches | null,
   segments: Uint32Array | null, lookup: CanonicalRunLookup | null, draw: (run: VectorDrawRun) => void): void {
+  let cache: SpanBatchCache | undefined;
+  if (plan && segments && plan.spanOrdered) {
+    cache = spanBatchCaches.get(plan);
+    if (!cache || cache.coverageRevision !== plan.coverageRevision || cache.segments !== segments || cache.lookup !== lookup) {
+      cache = { coverageRevision: plan.coverageRevision, segments, lookup, ranges: new WeakMap() };
+      spanBatchCaches.set(plan, cache);
+    }
+    // Recorded compositor spans are immutable and survive camera-only frames.
+    // Resolving their canonical coverage again would visit every source paint,
+    // even when LOD selected only a few thousand instances for the same batches.
+    const range = cache.ranges.get(runs);
+    if (range !== undefined) {
+      if (range) {
+        if (range.revision !== plan.revision) refreshSpanBatchRange(range, plan);
+        for (let index = range.first; index < range.end; index++) draw(plan.batches[index]);
+      } else for (const run of runs) draw(run);
+      return;
+    }
+  }
   let low = Infinity, high = -Infinity;
   if (plan && segments && plan.spanOrdered) {
     const covered = new Set<number>();
@@ -72,17 +100,33 @@ export function submitPaintSpan(runs: readonly VectorDrawRun[], plan: VectorOrde
     }
   }
   if (!plan || low > high) {
+    cache?.ranges.set(runs, null);
     for (const run of runs) draw(run);
     return;
   }
-  // Span ids rise along the batches, and one span's batches are contiguous among
-  // them. Searching rather than advancing a cursor keeps the geometric shape
-  // pass, which submits the same span a second time, drawing the same batches.
+  const range = { low, high, revision: plan.revision, first: 0, end: 0 };
+  refreshSpanBatchRange(range, plan);
+  cache?.ranges.set(runs, range);
+  for (let index = range.first; index < range.end; index++) draw(plan.batches[index]);
+}
+
+/** LOD changes batch ranges while the canonical span coverage stays reusable. */
+function refreshSpanBatchRange(range: SpanBatchRange, plan: VectorOrderedBatches): void {
+  // Span ids rise along the batches. Binary searches find both ends, including
+  // an empty span, without walking the canonical runs during animated zooms.
+  // A shape pass can repeat this span without advancing a shared draw cursor.
   const ids = plan.batchSegments;
   let first = 0, last = ids.length - 1;
   while (first <= last) {
     const middle = (first + last) >> 1;
-    if (ids[middle] < low) first = middle + 1; else last = middle - 1;
+    if (ids[middle] < range.low) first = middle + 1; else last = middle - 1;
   }
-  for (let index = first; index < plan.batches.length && ids[index] <= high; index++) draw(plan.batches[index]);
+  range.first = first;
+  last = ids.length - 1;
+  while (first <= last) {
+    const middle = (first + last) >> 1;
+    if (ids[middle] <= range.high) first = middle + 1; else last = middle - 1;
+  }
+  range.end = first;
+  range.revision = plan.revision;
 }

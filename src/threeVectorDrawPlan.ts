@@ -31,6 +31,7 @@ export class ThreeVectorDrawPlan {
   private readonly independentPageRuns: Uint16Array | null;
   private unitsPerPixel: number | null = null;
   private colorCommutationEnabled = true;
+  private blackPreserved = true;
   private strokeColorsMatchSource = true;
   private strokes: StrokeRecords;
   private sourceRuns: Uint32Array;
@@ -65,6 +66,7 @@ export class ThreeVectorDrawPlan {
   get positions(): Int32Array { return this.positionOfRun; }
 
   get colorBatchingEnabled(): boolean { return this.colorCommutationEnabled && this.strokeColorsMatchSource; }
+  get blackDarkenSourceOverEnabled(): boolean { return this.colorBatchingEnabled && this.blackPreserved; }
 
   /** True while minification holds the scheduler's coverage margin. */
   get paintOrderApproximated(): boolean { return (!this.textLodEnabled || !!this.textLodData) && (this.scheduler?.paintOrderApproximated ?? false); }
@@ -90,11 +92,22 @@ export class ThreeVectorDrawPlan {
     if (this.colorCommutationEnabled === enabled) return false;
     this.colorCommutationEnabled = enabled;
     const segments = sceneRequiresPaintCompositing(this.scene)
-      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled, this.blackDarkenSourceOverEnabled) : null;
     if (segments === this.segments) {
       this.scheduler?.setColorCommutationEnabled(enabled);
       return this.reschedule();
     }
+    this.rebuildScheduler();
+    return true;
+  }
+
+  /** Keep equal-color batches when a global tint prevents black from staying black. */
+  setBlackDarkenSourceOverEnabled(enabled: boolean): boolean {
+    if (this.blackPreserved === enabled) return false;
+    this.blackPreserved = enabled;
+    const segments = sceneRequiresPaintCompositing(this.scene)
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled, this.blackDarkenSourceOverEnabled) : null;
+    if (segments === this.segments) return false;
     this.rebuildScheduler();
     return true;
   }
@@ -121,7 +134,7 @@ export class ThreeVectorDrawPlan {
 
   private rebuildScheduler(): void {
     this.segments = sceneRequiresPaintCompositing(this.scene)
-      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled, this.blackDarkenSourceOverEnabled) : null;
     this.scheduler = this.createScheduler();
     if (this.textLodData) this.scheduler?.includeTextLod(this.textLodData);
     this.scheduler?.setColorCommutationEnabled(this.colorCommutationEnabled);
