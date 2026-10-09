@@ -853,9 +853,60 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       }
     } else if (command.source === "stroke-segments") {
       const store = page.stores.strokes, rgba = color(command.paintIndex, execution.state), scaleX = Math.hypot(matrix[0], matrix[1]), scaleY = Math.hypot(matrix[2], matrix[3]);
-      if (Math.abs(scaleX - scaleY) > 1e-6 * Math.max(scaleX, scaleY) || Math.abs(matrix[0] * matrix[2] + matrix[1] * matrix[3]) > 1e-6) return fail("nonuniform packed stroke transform.");
-      const first = endpoints.length / 4;
+      const dot = matrix[0] * matrix[2] + matrix[1] * matrix[3];
+      const uniform = scaleX > 0 && scaleY > 0 && Math.abs(scaleX - scaleY) <= 1e-6 * Math.max(scaleX, scaleY) &&
+        Math.abs(dot) <= scaleX * scaleY * 1e-6;
+      const trace = scaleX * scaleX + scaleY * scaleY;
+      const difference = Math.hypot(scaleX * scaleX - scaleY * scaleY, 2 * dot);
+      const maximumScale = Math.sqrt((trace + difference) / 2);
+      const minimumScale = Math.sqrt(Math.max(0, (trace - difference) / 2));
+      let first = endpoints.length / 4, packedCount = 0;
+      let outline: Geometry | null = null, outlineAlpha = 0;
+      const flushOutline = (): void => {
+        if (!outline) return;
+        fill(outline, [rgba[0], rgba[1], rgba[2], rgba[3] * outlineAlpha], 0, clip, condition);
+        outline = null;
+      };
       for (let stroke = command.first; stroke < command.first + command.count; stroke++) { budget(16); const i = stroke * 4;
+        const flags = Math.floor(store.primitiveMeta[i + 3] / 2), alpha = store.primitiveMeta[i + 3] - flags * 2;
+        const hairline = (flags & 1) !== 0 || store.styles[i] === 0;
+        const half = store.styles[i] * (uniform ? scaleX : (maximumScale + minimumScale) / 2);
+        const penError = store.styles[i] * (maximumScale - minimumScale) / 2;
+        if (!hairline && !uniform && !(minimumScale > 0 && Number.isFinite(half) && penError <= 0.01)) {
+          if (packedCount) appendRun("stroke", first, packedCount, clip, condition);
+          packedCount = 0;
+          // Packed segments already own their cap coverage and dashed pieces.
+          // Expand the pen in local coordinates before applying the Form or
+          // annotation matrix, so anisotropy/shear retains a vector silhouette.
+          const commands: NativeGlyphPathCommand[] = [
+            { kind: "move", x: store.endpoints[i], y: store.endpoints[i + 1] },
+            store.primitiveMeta[i + 2] === 1
+              ? { kind: "quadratic", controlX: store.endpoints[i + 2], controlY: store.endpoints[i + 3],
+                  x: store.primitiveMeta[i], y: store.primitiveMeta[i + 1] }
+              : { kind: "line", x: store.primitiveMeta[i], y: store.primitiveMeta[i + 1] }
+          ];
+          const g = buildNativeGlyphStroke(commands, matrix, { transform: matrix, width: store.styles[i] * 2,
+            lineCap: (flags & 2) !== 0 ? 1 : 0, lineJoin: 1, miterLimit: 10, dashArray: [], dashPhase: 0 }, signal);
+          if (g) {
+            // One packed paint remains one knockout object. Union its cap and
+            // curve contours before applying alpha, avoiding darkened joins.
+            if (outline && outlineAlpha !== alpha) flushOutline();
+            if (!outline) {
+              outline = { a: g.segmentsA, b: g.segmentsB, bounds: g.bounds };
+              outlineAlpha = alpha;
+            } else {
+              append(outline.a, g.segmentsA); append(outline.b, g.segmentsB);
+              include(outline.bounds, g.bounds.minX, g.bounds.minY); include(outline.bounds, g.bounds.maxX, g.bounds.maxY);
+            }
+          }
+          continue;
+        }
+        flushOutline();
+        if (!hairline && !uniform && !reportedStrokePenApproximation) {
+          reportedStrokePenApproximation = true;
+          options.onDiagnostic?.({ code: "stroke-pen-approximation", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+            message: "Nearly circular stroke pens use vector centerlines with at most 0.01-point radial error." });
+        }
         // Keep transformed coordinates in double precision until every output
         // (especially the expanded bounds) is computed, then round each once.
         const x0 = matrix[0] * store.endpoints[i] + matrix[2] * store.endpoints[i + 1] + matrix[4];
@@ -864,11 +915,13 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         const cy = matrix[1] * store.endpoints[i + 2] + matrix[3] * store.endpoints[i + 3] + matrix[5];
         const x1 = matrix[0] * store.primitiveMeta[i] + matrix[2] * store.primitiveMeta[i + 1] + matrix[4];
         const y1 = matrix[1] * store.primitiveMeta[i] + matrix[3] * store.primitiveMeta[i + 1] + matrix[5];
-        const flags = Math.floor(store.primitiveMeta[i + 3] / 2), alpha = store.primitiveMeta[i + 3] - flags * 2, half = store.styles[i] * scaleX;
+        if (packedCount === 0) first = endpoints.length / 4;
         endpoints.push(x0, y0, cx, cy); primitiveMeta.push(x1, y1, store.primitiveMeta[i + 2], flags * 2 + rgba[3] * alpha); styles.push(half, rgba[0], rgba[1], rgba[2]);
         primitiveBounds.push(Math.min(x0, cx, x1) - half, Math.min(y0, cy, y1) - half, Math.max(x0, cx, x1) + half, Math.max(y0, cy, y1) + half); scene.maxHalfWidth = Math.max(scene.maxHalfWidth, half);
+        packedCount++;
       }
-      appendRun("stroke", first, command.count, clip, condition);
+      flushOutline();
+      if (packedCount) appendRun("stroke", first, packedCount, clip, condition);
     } else if (command.source === "paths") {
       for (let index = command.first; index < command.first + command.count; index++) {
         const g = geometry([index], matrix);

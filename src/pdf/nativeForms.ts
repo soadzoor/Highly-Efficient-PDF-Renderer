@@ -12,6 +12,7 @@ import {
   type PdfValue
 } from "./nativeCos";
 import { type NativePdfDocument } from "./nativeDocument";
+import { transformNativePdfRectangle } from "./nativeFormGeometry";
 import type { NativeOptionalContentRegistry } from "./nativeOptionalContent";
 import {
   PdfError,
@@ -180,6 +181,7 @@ export class NativePdfFormAppearanceRegistry {
   private readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
   private readonly optionalContent?: NativeOptionalContentRegistry;
   private readonly diagnostics: PdfDiagnostic[] = [];
+  private readonly emptyAppearanceDiagnostics = new Set<string>();
   private readonly objectIds = new WeakMap<object, number>();
   private readonly resourceIdentities = new WeakMap<PdfDictionary, string>();
   private readonly formCache = new Map<string, Promise<FormRecord>>();
@@ -501,6 +503,11 @@ export class NativePdfFormAppearanceRegistry {
       throw new TypeError("The annotation was not created by this registry.");
     }
     if (!annotation.visibleInDefaultView || annotation.subtype === "Popup") return null;
+    if (annotation.rectangle[0] === annotation.rectangle[2] ||
+        annotation.rectangle[1] === annotation.rectangle[3]) {
+      this.emitEmptyAppearanceDiagnostic(annotation, "Rect");
+      return null;
+    }
     let optionalContentIndex = -1;
     if (annotation.optionalContent !== undefined && annotation.optionalContent !== null) {
       if (!this.optionalContent) {
@@ -581,6 +588,16 @@ export class NativePdfFormAppearanceRegistry {
       `annotation ${annotation.annotationIndex}`,
       signal
     );
+    const { bbox } = record.publicForm;
+    // The appearance is clipped to its BBox. An empty box has no visible
+    // paint, even when the annotation Rect is nonempty; do not divide by zero
+    // while placing it or decode its unreachable content.
+    const transformedBox = transformNativePdfRectangle(bbox, record.publicForm.matrix);
+    if (bbox[0] === bbox[2] || bbox[1] === bbox[3] ||
+        transformedBox.minX === transformedBox.maxX || transformedBox.minY === transformedBox.maxY) {
+      this.emitEmptyAppearanceDiagnostic(annotation, "BBox");
+      return null;
+    }
     return Object.freeze({
       annotation,
       normalAppearance: this.createRootInvocation(record),
@@ -1328,6 +1345,18 @@ export class NativePdfFormAppearanceRegistry {
     const frozen = Object.freeze({ ...diagnostic });
     this.diagnostics.push(frozen);
     this.onDiagnostic?.(frozen);
+  }
+
+  private emitEmptyAppearanceDiagnostic(annotation: NativePdfAnnotationAppearance, bounds: "Rect" | "BBox"): void {
+    if (this.emptyAppearanceDiagnostics.has(annotation.id)) return;
+    this.emptyAppearanceDiagnostics.add(annotation.id);
+    this.emitDiagnostic({
+      code: "annotation.empty-appearance",
+      severity: bounds === "Rect" ? "info" : "warning",
+      pageIndex: annotation.pageIndex,
+      message: `Annotation ${annotation.annotationIndex} has an empty /${bounds}; its appearance has no visible area and its metadata is retained.`,
+      details: { annotationIndex: annotation.annotationIndex, annotationId: annotation.id, bounds }
+    });
   }
 }
 

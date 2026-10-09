@@ -14,6 +14,33 @@ try {
   const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
   const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
   const options = { missingFontResolver: () => ({ sfntBytes: buildTinySfnt(), identifier: "annotation-vectors" }) };
+  const empty = await openPdf({ kind: "bytes", bytes: writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R /Annots [5 0 R 6 0 R 7 0 R 8 0 R] >>" },
+    { number: 4, body: tinyPdfStream("", "10 10 20 20 re f") },
+    { number: 5, body: "<< /Type /Annot /Subtype /Link /Rect [40 10 60 30] /AP << /N 9 0 R >> >>" },
+    // An empty Rect leaves even a malformed/missing appearance unreachable.
+    { number: 6, body: "<< /Type /Annot /Subtype /Link /Rect [0 0 0 10] /AP 999 0 R >>" },
+    { number: 7, body: "<< /Type /Annot /Subtype /Link /Rect [40 40 60 60] /AP << /N 10 0 R >> >>" },
+    { number: 8, body: "<< /Type /Annot /Subtype /Link /Rect [70 70 80 80] /AP << /N 11 0 R >> >>" },
+    // The empty box clips out all paint, including broken resource references.
+    { number: 9, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 0 0]", "/Missing Do") },
+    { number: 10, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Matrix [0 0 0 1 0 0]", "/Missing Do") },
+    { number: 11, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", "0 0 10 10 re f") }
+  ] }) }, options);
+  try {
+    const scene = await empty.compileVectorPage(0, { vectorFallback: "error" });
+    assert.equal(scene.fillPathCount, 2, "page content and the visible annotation survive empty appearances");
+    assert.equal(scene.rasterLayers.length, 0);
+    assert.equal(scene.annotations.length, 4, "empty annotation metadata remains available");
+    const page = await empty.compilePage(0);
+    assert.equal(page.annotations.length, 4);
+    assert.equal(page.displayProgram.programs.length, 1, "clipped-out appearances are never decoded");
+    assert.equal(empty.getDiagnostics().filter(d => d.code === "annotation.empty-appearance").length, 3,
+      "empty appearances are diagnosed once across repeated vector and retained compilation");
+    assert(!empty.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
+  } finally { await empty.close(); }
   for (const [rotation, expectedBounds] of [
     [0, [10, 10, 30, 20]], [90, [10, 50, 20, 70]],
     [180, [50, 40, 70, 50]], [270, [40, 10, 50, 30]]

@@ -206,6 +206,56 @@ try {
     assert.deepEqual(segment.end, { x: 60, y: 95 });
     closeTo(style(scene, 0).strokeWidth, .36, "uniform rotation/scale transforms the pen width");
   }
+  for (const [name, matrix, width, expectedBounds] of [
+    ["anisotropic", "2 0 0 1 0 0", 2, [18, 9, 62, 11]],
+    ["sheared", "2 .5 0 1 0 0", 2, [18, 15 - Math.sqrt(1.25), 62, 25 + Math.sqrt(1.25)]],
+    ["hairline", "2 .5 0 1 0 0", 0, null],
+    ["nearly uniform", "2 0 0 2.00001 0 0", .12, null]
+  ]) {
+    // A reusable Form stores packed strokes in local space. Its invocation
+    // changes the pen only when the retained page is lowered to a vector scene.
+    const { scene, viewer } = await compile("/Shape Do", {
+      integrated: true,
+      resources: "/XObject << /Shape 5 0 R >>",
+      objects: [{ number: 5, body: tinyPdfStream(
+        `/Type /XObject /Subtype /Form /BBox [0 0 40 40] /Matrix [${matrix}] ` +
+        "/Resources << >> /Group << /S /Transparency /I true >>",
+        `1 J 1 j ${width} w 10 10 m 30 10 l S`
+      ) }]
+    });
+    for (const actual of [scene, viewer]) {
+      assert.equal(actual.retainedPages?.length ?? 0, 0, `${name}: no raster replay resource is needed`);
+      if (expectedBounds) {
+        assert.equal(actual.segmentCount, 0, `${name}: the complete transformed pen is a vector outline`);
+        assert.equal(actual.fillPathCount, 1);
+        const bounds = getScenePrimitive(actual, { kind: "fill", index: 0 }).bounds;
+        for (const [index, key] of ["minX", "minY", "maxX", "maxY"].entries())
+          assert(Math.abs(bounds[key] - expectedBounds[index]) < .025, `${name}: ${key} matches the transformed ellipse`);
+      } else {
+        assert.equal(actual.fillPathCount, 0);
+        assert.equal(actual.segmentCount, 1, `${name}: device hairlines and bounded circular pens stay packed`);
+        assert.equal(style(actual, 0).hairline, width === 0);
+        closeTo(style(actual, 0).strokeWidth, width === 0 ? 0 : .2400006, `${name}: transformed pen width`);
+      }
+    }
+  }
+  {
+    const { scene, viewer } = await compile("/Shape Do", {
+      integrated: true,
+      resources: "/XObject << /Shape 5 0 R >>",
+      objects: [{ number: 5, body: tinyPdfStream(
+        "/Type /XObject /Subtype /Form /BBox [0 0 40 40] /Matrix [2 0 0 1 0 0] " +
+        "/Resources << >> /Group << /S /Transparency /I true /K true >>",
+        "1 J 1 j 2 w 10 10 m 10 30 30 30 30 10 c S"
+      ) }]
+    });
+    for (const actual of [scene, viewer]) {
+      assert.equal(actual.segmentCount, 0);
+      assert.equal(actual.fillPathCount, 1, "one transformed curved stroke remains one knockout object");
+      assert.equal(actual.drawRuns.length, 1, "overlapping cap and curve contours share one paint");
+      assert(actual.fillSegmentCount > 8, "the curve retains its expanded vector contour");
+    }
+  }
   for (const [name, content] of [
     ["nonuniform pen", "q 2 0 0 1 0 0 cm 1 J 1 j .12 w 10 10 m 30 10 l S Q"],
     ["dashed pen", "1 J 1 j .12 w [2 1] 0 d 10 10 m 40 10 l S"],
