@@ -1320,7 +1320,8 @@ gives its original and drawn sizes.
 | `image.resolution-reduced` | An image too large to decode within the stream limit was decoded at 1/2, 1/4, or 1/8 resolution. |
 | `image.ccitt-size-adjusted` | Fax image data had more or fewer columns or rows than the image declares; it was cropped or padded with white. |
 | `image.stencil-resolution-reduced` | A page's stencil image masks, each kept as an image of its fill color, held more than the 16-million-pixel budget; every mask was box-filtered by the same factor, given in details, instead of rasterizing the page. |
-| `clip-curve-coarsened` | A curved clip, such as a line of clipping text, exceeded the vector clip edge budget at the usual 0.0001-point curve tolerance and was flattened more coarsely (at most about 0.1 point) instead of rasterizing the page; details include the clip count and coarsest tolerance. |
+| `clip-curve-approximation` | Curved clip boundaries use vector edges at a 0.0001-point subdivision tolerance before Float32 storage. The tolerance does not increase with the edge count. |
+| `clip-curve-precision-limited` | Floating-point subdivision could not refine a curved clip further; it retains the closest representable vector edges. |
 
 Stitching-function boundaries are sampled as hard color transitions. Gradient
 color-tolerance misses are nonfatal, but stop-count and other hard resource limits

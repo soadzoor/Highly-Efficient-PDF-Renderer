@@ -556,7 +556,8 @@ counts smaller quads and `fillClipCulledInstances` counts empty quads.
 `fillClipBoundsAvailable` reports whether bounds were uploaded,
 `fillClipBoundsTexels` counts their records, and `vectorClipStoreTexels` counts
 the original clip/index store's records. Bounds occupy their own texture,
-bounded to 4 MiB, so a full clip index store cannot disable quad shrinking.
+limited by the device's texture dimensions, so a full clip index store cannot
+disable quad shrinking.
 Clip geometry with identical Float32 coordinates shares GPU storage across
 parents and fill rules, while each clip retains its own header. When the clip
 store cannot fit a polygon's finest cell grids or its band index, it retains

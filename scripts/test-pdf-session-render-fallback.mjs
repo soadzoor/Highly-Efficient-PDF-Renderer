@@ -16,20 +16,19 @@ try {
   const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
   const { computeCharQuad } = await import("../src/sceneTextGeometry.ts");
   const { openPdfInNodeWorker } = await import("../src/pdf/workerClient.ts");
-  const { MAX_VECTOR_CLIP_EDGES } = await import("../src/vectorClips.ts");
   const font = buildTinySfnt();
   const fontOptions = { missingFontResolver: () => ({ sfntBytes: font, identifier: "fallback-fixture" }) };
-  // More straight edges than a vector clip holds, and no curve to flatten more
-  // coarsely: neither vector path can represent the page.
-  const sawtooth = Array.from({ length: MAX_VECTOR_CLIP_EDGES + 100 },
-    (_, index) => `${(index * 40 / (MAX_VECTOR_CLIP_EDGES + 100)).toFixed(4)} ${index % 2 ? 1 : .5} l`).join(" ");
+  // A finely dashed glyph stroke exceeds the vector outline representation;
+  // its raster fallback must still paint the annotation afterward.
   const fallbackAnnotation = fixture({
-    annotations: true, content: `q 0 0 m ${sawtooth} 40 0 l h W n /G gs 0 0 1 1 re f Q`, state: "/ca .5 /AIS true"
+    annotations: true, font: true,
+    content: "0 0 1 RG .4 w [.01 .01] 0 d BT /F 100 Tf 1 Tr 5 5 Td (A) Tj ET"
   });
   const cases = [
     ["annotation after unsupported page paint", fallbackAnnotation, (scene) => {
       assertPixel(scene, 15, 10, [255, 0, 0, 255]);
       assertPixel(scene, 2, 2, [0, 0, 0, 0]);
+      assert.equal(scene.textIndex.pages[0].text, "A", "rasterized annotated text stays searchable");
     }],
     ["arbitrary image clip", fixture({ content: "0 0 m 40 0 l 0 20 l h W n 40 0 0 20 0 0 cm /Im Do", image: true }), (scene) => {
       assertPixel(scene, 5, 5, [255, 0, 0, 255]);
@@ -51,7 +50,8 @@ try {
     const warnings = [];
     const session = await openPdf({ kind: "bytes", bytes }, { ...fontOptions, onDiagnostic: d => warnings.push(d) });
     try {
-      const scene = await session.compileVectorPage(0, { optimization: "none" });
+      const options = { optimization: "none", ...(bytes === fallbackAnnotation ? { preserveDrawingOrder: true } : {}) };
+      const scene = await session.compileVectorPage(0, options);
       assert.equal(scene.rasterLayers.length, name === "filled and outlined text" ? 0 : 1, name);
       assert.equal(scene.fillPathCount, 0, name);
       if (name === "arbitrary image clip" || name === "one-bit image") {
@@ -67,7 +67,7 @@ try {
         assert.equal(warnings.find(d => d.code === "page-raster-fallback").pageIndex, 0);
       }
       check(scene);
-      const second = await session.compileVectorPage(0, { optimization: "none" });
+      const second = await session.compileVectorPage(0, options);
       assert.deepEqual(second.rasterLayerData, scene.rasterLayerData, "repeat operations own usable resources");
     } finally { await session.close(); }
   }
@@ -149,17 +149,23 @@ try {
       simple.compileVectorPage(0, { previewMaxDimension }), RangeError);
   } finally { await simple.close(); }
 
-  const bounded = await openPdf({ kind: "bytes", bytes: fallbackAnnotation });
+  const bounded = await openPdf({ kind: "bytes", bytes: fallbackAnnotation }, fontOptions);
   try {
-    const scene = await bounded.compileVectorPage(0, { limits: { maxImagePixels: 100, maxImageDimension: 12 } });
+    const scene = await bounded.compileVectorPage(0, { preserveDrawingOrder: true,
+      limits: { maxImagePixels: 100, maxImageDimension: 12 } });
     assert.ok(scene.rasterLayerWidth * scene.rasterLayerHeight <= 100);
     assert.ok(scene.rasterLayerWidth <= 12 && scene.rasterLayerHeight <= 12);
+    const preview = await bounded.compileVectorPage(0, { preserveDrawingOrder: true, previewMaxDimension: 16 });
+    assert.equal(preview.pdfOverviewKind, "raster", "unsupported paint retains the refinable compatibility fallback");
+    assert(preview.rasterLayerWidth <= 16 && preview.rasterLayerHeight <= 16);
+    assert(!preview.retainedPages?.length);
+    assertPixel(preview, 15, 10, [255, 0, 0, 255]);
     await assert.rejects(bounded.compileVectorPage(0, { signal: AbortSignal.abort() }));
     await assert.rejects(bounded.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
       error => error.code === "resource-limit");
     // Strict vector mode names what the vector paths could not represent.
     await assert.rejects(bounded.compileVectorPage(0, { vectorFallback: "error" }),
-      error => error.details?.reason === "vector-clip-edge-limit");
+      error => error.details?.reason === "native-glyph-stroke-complexity");
   } finally { await bounded.close(); }
 
   for (const transfer of ["/TR 9 0 R", "/TR2 [9 0 R /Identity 9 0 R /Identity]", "/UCR2 9 0 R /BG2 9 0 R /HT << /HalftoneType 1 >>"]) {
@@ -217,23 +223,37 @@ try {
     assert.ok(!failed.getDiagnostics().some(d => d.code === "page-raster-fallback"));
   } finally { await failed.close(); }
 
-  // The real worker must forward the warning and transfer raster/text buffers.
+  // The worker keeps the annotation vector while transferring the glyph raster
+  // and searchable text. Its default drawing order permits selective fallback.
   const diagnostics = [];
   const worker = await openPdfInNodeWorker({ kind: "bytes", bytes: cases[0][1] }, {
+    ...fontOptions,
     workerUrl: sourceWorkerBootstrapUrl(new URL("../src/pdf/pdfWorkerEntry.ts", import.meta.url)),
     onDiagnostic: d => diagnostics.push(d)
   });
   try {
-    for (let i = 0; i < 2; i += 1) cases[0][2](await worker.compileVectorPage(0));
-    assert.ok(diagnostics.some(d => d.code === "page-raster-fallback"));
-    assert.ok(worker.getDiagnostics().some(d => d.code === "page-raster-fallback"));
+    const assertSelectiveFallback = scene => {
+      assert.equal(scene.rasterLayers.length, 1);
+      assert(scene.rasterLayers[0].data.some((value, index) => index % 4 === 3 && value > 0 && scene.rasterLayers[0].data[index - 1] > 0),
+        "the transferred glyph raster paints visible blue pixels");
+      assert.equal(scene.fillPathCount, 1, "the annotation keeps its vector geometry");
+      assert.deepEqual([...scene.fillPathMetaA.subarray(2, 4), ...scene.fillPathMetaB.subarray(0, 2)], [10, 5, 20, 15]);
+      assert.deepEqual([...scene.fillPathMetaB.subarray(2, 4), ...scene.fillPathMetaC.subarray(2, 4)], [1, 0, 0, 1]);
+      assert.equal(scene.annotations.length, 1, "annotation metadata is transferred");
+      assert.equal(scene.textIndex.pages[0].text, "A", "rasterized text stays searchable after transfer");
+    };
+    for (let i = 0; i < 2; i += 1) assertSelectiveFallback(await worker.compileVectorPage(0));
+    assert.ok(diagnostics.some(d => d.code === "selective-raster-fallback"));
+    assert.ok(worker.getDiagnostics().some(d => d.code === "selective-raster-fallback"));
     const preview = await worker.compileVectorPage(0, { previewMaxDimension: 16 });
-    assert.equal(preview.pdfOverviewKind, "raster", "unsupported paint retains the refinable compatibility fallback");
-    assert(preview.rasterLayerWidth <= 16 && preview.rasterLayerHeight <= 16,
-      "worker fallback honors overview dimensions before generating or transferring pixels");
+    assert.equal(preview.pdfOverviewKind, "vector", "the vector annotation remains available in the overview");
     assert(!preview.retainedPages?.length);
-    assertPixel(preview, 15, 10, [255, 0, 0, 255]);
-    cases[0][2](await worker.compileVectorPage(0));
+    assertSelectiveFallback(preview);
+    const limited = await worker.compileVectorPage(0, { limits: { maxImagePixels: 100, maxImageDimension: 12 } });
+    assertSelectiveFallback(limited);
+    assert(limited.rasterLayers[0].width * limited.rasterLayers[0].height <= 100);
+    assert(limited.rasterLayers[0].width <= 12 && limited.rasterLayers[0].height <= 12);
+    assertSelectiveFallback(await worker.compileVectorPage(0));
   } finally { await worker.close(); }
 } finally { hooks.deregister(); }
 

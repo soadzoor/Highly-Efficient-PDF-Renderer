@@ -1,10 +1,5 @@
 import { VECTOR_CLIP_GLSL, VECTOR_CLIP_WGSL } from "./vectorClipShaders";
 import { PRIMITIVE_SELECTION_COLOR, PRIMITIVE_HOVER_COLOR } from "./primitiveAppearance";
-import { MAX_VECTOR_CLIP_DEPTH } from "./vectorClips";
-
-function highlightClipShader(source: string): string {
-  return source.replace(/depth < \d+/, `depth < ${MAX_VECTOR_CLIP_DEPTH + 2}`);
-}
 
 /** Original-scene geometry, including quadratic controls; no tessellation or scene copies. */
 export const PRIMITIVE_HIGHLIGHT_VERTEX_GLSL = `#version 300 es
@@ -51,7 +46,7 @@ flat in vec4 vSegmentA;
 flat in vec4 vSegmentB;
 flat in vec3 vColor;
 out vec4 outColor;
-${highlightClipShader(VECTOR_CLIP_GLSL).replace("int(uVectorClipIndex)", "int(vSegmentB.w)")}
+${VECTOR_CLIP_GLSL.replace("int(uVectorClipIndex)", "int(vSegmentB.w)")}
 vec2 heprOffsetToLineSegment(vec2 p, vec2 a, vec2 b) {
   vec2 ab = b - a;
   float abLenSq = dot(ab, ab);
@@ -246,7 +241,7 @@ struct Output {
 ${PRIMITIVE_HIGHLIGHT_LINE_OFFSET_WGSL}
 ${PRIMITIVE_HIGHLIGHT_QUADRATIC_OFFSET_WGSL}
 ${PRIMITIVE_HIGHLIGHT_COVERAGE_WGSL}
-${highlightClipShader(VECTOR_CLIP_WGSL)}
+${VECTOR_CLIP_WGSL}
 @vertex fn vsMain(@builtin(vertex_index) vertex: u32,@builtin(instance_index) instance: u32) -> Output {
   let segment = uSegments[instance];
   let p0 = segment.a.xy;

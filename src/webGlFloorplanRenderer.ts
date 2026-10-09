@@ -56,7 +56,7 @@ import { VectorOrderedBatches } from "./vectorOrderedBatches";
 import { OrderedTextLodSelection } from "./orderedTextLod";
 import { buildVectorFillBandIndex, vectorFillBandIndex, vectorSceneFillStore } from "./vectorFillBands";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
-import { MAX_VECTOR_CLIP_DEPTH, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds,
+import { MAX_VECTOR_CLIP_TEXELS, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds,
   type VectorClipPackingStats } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorDrawRun, VectorScene } from "./pdfVectorExtractor";
@@ -132,8 +132,6 @@ const PAN_MAX_SPEED_WORLD_PER_SEC = 20_000;
 const PAN_INERTIA_VELOCITY_STALE_MS = 120;
 /** Main paint slots; the spare bounds unit 26 does not overlap compositor slots 19-25. */
 const ORDERED_PAINT_LAST_UNIT = 18;
-// At most 4 MiB of extra RGBA32F bounds, independent of clip index storage.
-const MAX_FILL_CLIP_BOUNDS_TEXELS = 256 * 1024;
 const CLEAR_COLOR_R = 160 / 255;
 const CLEAR_COLOR_G = 169 / 255;
 const CLEAR_COLOR_B = 175 / 255;
@@ -2985,7 +2983,7 @@ export class WebGlFloorplanRenderer {
     const headers = this.vectorClipHeaders;
     if (!headers) return 0;
     let index = this.vectorClipIndex, edges = 0, indexedNodes = 0;
-    for (let depth = 0; depth < MAX_VECTOR_CLIP_DEPTH && index >= 0 && index * 4 < headers.length; depth++) {
+    for (let depth = 0; depth < headers.length / 4 && index >= 0 && index * 4 < headers.length; depth++) {
       // Indexed nodes retain their original edge count; rectangles have no polygon loop.
       const count = Math.max(0, headers[index * 4 + 2]);
       edges += count;
@@ -3482,14 +3480,14 @@ export class WebGlFloorplanRenderer {
     if (this.vectorClipTexture) gl.deleteTexture(this.vectorClipTexture);
     if (this.vectorClipBoundsTexture) gl.deleteTexture(this.vectorClipBoundsTexture);
     this.vectorClipBoundsTexture = null;
-    // The clip GLSL reads cell storage, bounding each pixel's clip work at any
-    // zoom. Highlight overlays pack their own few clips with bands.
-    const data = packVectorClips(scene.clipPaths, undefined, { cells: true,
+    // Optional spatial indices accelerate exact clipping at any zoom.
+    // Highlight overlays pack their own few clips with bands.
+    const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    const data = packVectorClips(scene.clipPaths, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true,
       onStats: stats => { this.vectorClipPackingStats = stats; } });
     this.vectorClipStoreTexels = data.length / 4;
     this.vectorClipHeaders = data.slice(0, (scene.clipPaths?.length ?? 0) * 4);
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);
-    const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
     const texels = data.length / 4;
     const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(texels))));
     const height = Math.ceil(texels / width);
@@ -3506,8 +3504,8 @@ export class WebGlFloorplanRenderer {
         const count = this.vectorClipBounds.length / 4;
         const boundsWidth = Math.min(maxSize, Math.ceil(Math.sqrt(count)));
         const boundsHeight = Math.ceil(count / boundsWidth);
-        if (boundsWidth * boundsHeight > MAX_FILL_CLIP_BOUNDS_TEXELS || boundsHeight > maxSize) {
-          throw new RangeError("Fill clip bounds exceed their GPU storage budget.");
+        if (boundsHeight > maxSize) {
+          throw new RangeError("Fill clip bounds exceed GPU texture capacity.");
         }
         const boundsData = new Float32Array(boundsWidth * boundsHeight * 4);
         boundsData.set(this.vectorClipBounds);

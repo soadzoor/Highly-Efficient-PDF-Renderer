@@ -409,8 +409,9 @@ export function buildNativeVectorPage(
     if (clipBuilder.paths.length) scene.clipPaths = clipBuilder.paths;
     if (clipBuilder.approximatedCurves) input.onDiagnostic?.({ code: "clip-curve-approximation", severity: "warning",
       pageIndex: pageInfo.sourcePageIndex, message: "Curved clip boundaries use vector edges with a 0.0001-point subdivision tolerance." });
-    const coarsened = clipBuilder.coarseningDiagnostic(pageInfo.sourcePageIndex);
-    if (coarsened) input.onDiagnostic?.(coarsened);
+    if (clipBuilder.precisionLimitedCurves) input.onDiagnostic?.({ code: "clip-curve-precision-limited", severity: "warning",
+      pageIndex: pageInfo.sourcePageIndex,
+      message: "Some curved clip boundaries reached floating-point precision before the subdivision tolerance; they use the closest representable vector edges." });
     applyNativeHairlineTextOpacity(scene, hairlines);
     simplifyVectorDrawRuns(scene);
   }

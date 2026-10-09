@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { VectorClipPath, VectorScene } from "./pdfVectorExtractor";
-import { packVectorClips } from "./vectorClips";
+import { MAX_VECTOR_CLIP_TEXELS, packVectorClips } from "./vectorClips";
 import { copyThreePdfShapeUniform } from "./threePdfShape";
 import { copyThreePaintFold } from "./threePaintFold";
 
@@ -8,11 +8,16 @@ const materialTextures = new WeakMap<THREE.Material, THREE.DataTexture>();
 type NodeClipCloner = (source: THREE.Material, target: THREE.Material, clipIndex: number | null, texture: THREE.DataTexture) => void;
 const nodeClipCloners = new WeakMap<THREE.Material, NodeClipCloner>();
 
-interface SharedClipTexture { texture: THREE.DataTexture; users: number }
+interface SharedClipTexture {
+  texture: THREE.DataTexture;
+  users: number;
+  failedCapacity?: { maxSize: number; error: unknown };
+}
 const sharedClipTextures = new WeakMap<readonly VectorClipPath[], SharedClipTexture>();
 const emptyClipPaths: readonly VectorClipPath[] = [];
+const uploadedClipTextures = new WeakSet<THREE.DataTexture>();
 
-/** Material layers and derived LOD/page scenes borrow one immutable clip store. */
+/** Material layers and derived LOD/page scenes borrow one shared clip texture. */
 export function acquireThreeVectorClipTexture(scene: VectorScene): {
   texture: THREE.DataTexture;
   release(): void;
@@ -50,18 +55,53 @@ export const VECTOR_CLIP_INSTANCE_ATTRIBUTE = "aVectorClipIndex";
 const INSTANCE_VECTOR_CLIP_UNIFORM = -2;
 
 export function createThreeVectorClipTexture(scene: VectorScene): THREE.DataTexture {
-  // Both the GLSL and WGSL clips read cell storage, bounding each pixel's clip
-  // work at any zoom.
-  const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
-  const width = Math.min(4096, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
-  const height = Math.ceil(data.length / 4 / width);
-  if (height > 4096) throw new RangeError("Vector clip texture exceeds material capacity.");
-  const padded = new Float32Array(width * height * 4); padded.set(data);
-  const texture = new THREE.DataTexture(padded, width, height, THREE.RGBAFormat, THREE.FloatType);
+  // Prefer cell storage for both shader backends; complete edge scans remain
+  // available when an optional index cannot fit the texture capacity.
+  const image = packThreeVectorClipImage(scene.clipPaths, Math.sqrt(MAX_VECTOR_CLIP_TEXELS));
+  const texture = new THREE.DataTexture(image.data, image.width, image.height, THREE.RGBAFormat, THREE.FloatType);
   texture.minFilter = texture.magFilter = THREE.NearestFilter;
   texture.generateMipmaps = false;
+  texture.onUpdate = () => uploadedClipTextures.add(texture);
   texture.needsUpdate = true;
   return texture;
+}
+
+/** Adapt the shared store before a host uploads it, preserving every material reference. */
+export function prepareThreeVectorClipTexture(scene: VectorScene, maxTextureSize: number): void {
+  if (!Number.isFinite(maxTextureSize) || maxTextureSize < 1) return;
+  const maxSize = Math.floor(maxTextureSize);
+  const clips = scene.clipPaths ?? emptyClipPaths;
+  const entry = sharedClipTextures.get(clips);
+  if (!entry || (entry.texture.image.width <= maxSize && entry.texture.image.height <= maxSize)) return;
+  if (entry.failedCapacity?.maxSize === maxSize) throw entry.failedCapacity.error;
+  let image: ReturnType<typeof packThreeVectorClipImage>;
+  try {
+    image = packThreeVectorClipImage(clips, maxSize);
+  } catch (error) {
+    entry.failedCapacity = { maxSize, error };
+    throw error;
+  }
+  // Three allocates immutable GPU texture dimensions. A later, smaller host
+  // needs fresh GPU storage; this disposal does not release any shared lease.
+  if (uploadedClipTextures.has(entry.texture)) {
+    entry.texture.dispose();
+    uploadedClipTextures.delete(entry.texture);
+  }
+  entry.texture.image = image;
+  entry.texture.needsUpdate = true;
+  entry.failedCapacity = undefined;
+}
+
+function packThreeVectorClipImage(clips: readonly VectorClipPath[] | undefined, maxSize: number): {
+  data: Float32Array;
+  width: number;
+  height: number;
+} {
+  const data = packVectorClips(clips, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true });
+  const width = Math.min(maxSize, Math.max(1, Math.ceil(Math.sqrt(data.length / 4))));
+  const height = Math.ceil(data.length / 4 / width);
+  const padded = new Float32Array(width * height * 4); padded.set(data);
+  return { data: padded, width, height };
 }
 
 export function initializeThreeVectorClip(material: THREE.Material, texture: THREE.DataTexture): void {

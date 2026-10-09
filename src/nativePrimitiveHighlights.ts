@@ -1,5 +1,5 @@
 import type { PrimitiveHighlightSet } from "./primitiveAppearance";
-import { packVectorClips } from "./vectorClips";
+import { MAX_VECTOR_CLIP_TEXELS, packVectorClips } from "./vectorClips";
 import {
   PRIMITIVE_HIGHLIGHT_VERTEX_GLSL,
   PRIMITIVE_HIGHLIGHT_FRAGMENT_GLSL,
@@ -7,7 +7,7 @@ import {
 } from "./primitiveHighlightShaders";
 
 function clipPixels(highlights: PrimitiveHighlightSet, maxSize: number): { data: Float32Array; width: number; height: number } {
-  const packed = packVectorClips(highlights.clipPaths);
+  const packed = packVectorClips(highlights.clipPaths, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2));
   const width = Math.max(1, Math.min(maxSize, Math.ceil(Math.sqrt(packed.length / 4))));
   const height = Math.max(1, Math.ceil(packed.length / 4 / width));
   if (height > maxSize) throw new RangeError("Primitive highlight clips exceed GPU limits.");

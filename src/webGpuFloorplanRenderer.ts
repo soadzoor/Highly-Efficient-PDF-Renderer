@@ -44,7 +44,7 @@ import { OrderedTextLodSelection } from "./orderedTextLod";
 import { VectorDrawRunCuller, vectorViewBounds } from "./vectorDrawRunCulling";
 import { RASTER_CLIP_WGSL } from "./rasterClipShaders";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
-import { packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
+import { MAX_VECTOR_CLIP_TEXELS, packVectorClips, UNBOUNDED_VECTOR_CLIP_BOUNDS, vectorClipChainBounds } from "./vectorClips";
 import { validateVectorDrawRuns } from "./vectorDrawOrder";
 import type { Bounds, RasterLayer, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -3923,9 +3923,10 @@ export class WebGpuFloorplanRenderer {
     for (const buffer of this.vectorClipBuffers) buffer.destroy();
     this.vectorClipBuffers = [];
     this.vectorClipBindGroups = [];
-    // The clip WGSL reads cell storage, bounding each pixel's clip work at any zoom.
-    const data = packVectorClips(scene.clipPaths, undefined, { cells: true });
-    const dims = chooseTextureDimensions(data.length / 4, this.maxTextureSize());
+    // Optional spatial indices accelerate exact clipping at any zoom.
+    const maxSize = this.maxTextureSize();
+    const data = packVectorClips(scene.clipPaths, Math.min(MAX_VECTOR_CLIP_TEXELS, maxSize ** 2), { cells: true });
+    const dims = chooseTextureDimensions(data.length / 4, maxSize);
     this.vectorClipTexture = this.createFloatTexture(dims.width, dims.height, data);
     const usage = (globalThis as any).GPUBufferUsage;
     this.vectorClipBounds = vectorClipChainBounds(scene.clipPaths);

@@ -1,8 +1,6 @@
 import type { DensePdfBounds, DensePdfMatrix, DensePdfTextClip } from "./nativeContentCompiler";
 import type { VectorClipPath } from "../pdfVectorExtractor";
-import { MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES, MAX_VECTOR_CLIP_PATH_EDGES,
-  MAX_VECTOR_CLIP_TEXELS, requiredVectorClipTexels } from "../vectorClips";
-import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
+import { PdfError, throwIfAborted } from "./nativeTypes";
 
 export function rectangleVectorClip(bounds: Readonly<DensePdfBounds>, transform: DensePdfMatrix,
   parent: DensePdfTextClip | null): DensePdfTextClip {
@@ -21,9 +19,20 @@ export function pageRootedVectorClips(pageBounds: Readonly<DensePdfBounds>): (cl
   const page = rectangleVectorClip(pageBounds, [1, 0, 0, 1, 0, 0], null);
   const rooted = new WeakMap<DensePdfTextClip, DensePdfTextClip>();
   const under = (clip: DensePdfTextClip | null): DensePdfTextClip => {
-    if (!clip) return page;
-    let result = rooted.get(clip);
-    if (!result) rooted.set(clip, result = { ...clip, parent: under(clip.parent) });
+    const chain: DensePdfTextClip[] = [];
+    const visited = new Set<DensePdfTextClip>();
+    let result = page;
+    for (let node = clip; node; node = node.parent) {
+      const existing = rooted.get(node);
+      if (existing) { result = existing; break; }
+      if (visited.has(node)) throw new PdfError("invalid-object", "Cyclic vector clip chain.");
+      visited.add(node); chain.push(node);
+    }
+    for (let index = chain.length - 1; index >= 0; index--) {
+      const node = chain[index];
+      result = { ...node, parent: result };
+      rooted.set(node, result);
+    }
     return result;
   };
   return under;
@@ -63,34 +72,32 @@ export function clipChainInsidePage(clip: DensePdfTextClip | null | undefined,
 
 /** Clip curves flatten within this many points, which stays subpixel at the viewer's deepest zoom. */
 const CLIP_CURVE_TOLERANCE = 0.0001;
-/**
- * A clip whose curves outgrow MAX_VECTOR_CLIP_EDGES flattens again at a 4x
- * coarser tolerance, up to about 0.1 point. That still beats what refusing it
- * leads to: a whole-page raster at twice the page size has half-point pixels.
- */
-const MAX_CLIP_CURVE_TOLERANCE = CLIP_CURVE_TOLERANCE * 4 ** 5;
-
 interface FlattenedVectorClip {
   readonly edges: number[];
-  /** The edges stopped at their bounded representation limit; the path is incomplete. */
-  readonly overflow: boolean;
-  /** A curve took more than its chord, so a coarser tolerance needs fewer edges. */
-  readonly subdivided: boolean;
   readonly curves: boolean;
+  readonly precisionLimitedCurves: boolean;
 }
 
-function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, signal?: AbortSignal,
-  edgeLimit = MAX_VECTOR_CLIP_EDGES): FlattenedVectorClip {
+function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, signal?: AbortSignal): FlattenedVectorClip {
   const edges: number[] = [];
   const data = path.data;
   const [a, b, c, d, e, f] = path.transform;
-  const point = (offset: number): [number, number] => [
-    a * data[offset] + c * data[offset + 1] + e, b * data[offset] + d * data[offset + 1] + f
-  ];
-  let x = 0, y = 0, sx = 0, sy = 0, open = false, overflow = false, subdivided = false, curves = false;
+  const point = (offset: number): [number, number] => {
+    const x = a * data[offset] + c * data[offset + 1] + e;
+    const y = b * data[offset] + d * data[offset + 1] + f;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new PdfError("invalid-object", "Non-finite vector clip coordinates.");
+    }
+    return [x, y];
+  };
+  let x = 0, y = 0, sx = 0, sy = 0, open = false, curves = false;
+  let precisionLimitedCurves = false, curveWork = 0;
   let subpathEdgeStart = 0;
   const line = (nx: number, ny: number): void => {
     if (x === nx && y === ny) return;
+    if (![x, y, nx, ny].every(value => Number.isFinite(Math.fround(value)))) {
+      throw new PdfError("invalid-object", "Non-finite vector clip coordinates.");
+    }
     // Consecutive collinear edges have the same directed winding as their
     // endpoint chord, including partial or complete backtracking. Use exact
     // equality so simplification never changes a corner or a narrow hole.
@@ -102,7 +109,6 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
       x = ax; y = ay;
       if (x === nx && y === ny) return;
     }
-    if (edges.length >= edgeLimit * 4) { overflow = true; return; }
     if ((edges.length & 1023) === 0) throwIfAborted(signal);
     edges.push(x, y, nx, ny); x = nx; y = ny;
   };
@@ -122,26 +128,42 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
     }
   };
   const cubic = (x0: number, y0: number, x1: number, y1: number, x2: number, y2: number,
-    x3: number, y3: number, level = 0): void => {
-    if (overflow) return;
-    // Distance to the endpoint segment bounds the complete Bezier control hull.
-    const distance = (px: number, py: number): number => {
-      const dx = x3 - x0, dy = y3 - y0;
-      const t = Math.max(0, Math.min(1, ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy || 1)));
-      return Math.hypot(px - x0 - t * dx, py - y0 - t * dy);
-    };
-    if (Math.max(distance(x1, y1), distance(x2, y2)) <= tolerance) { line(x3, y3); return; }
-    if (level >= 20) throw new PdfError("unsupported-content", "A vector clip curve exceeds its subdivision limit.",
-      { details: { reason: "vector-clip-curve-limit" } });
-    subdivided = true;
-    const ax = (x0 + x1) / 2, ay = (y0 + y1) / 2, bx = (x1 + x2) / 2, by = (y1 + y2) / 2;
-    const cx = (x2 + x3) / 2, cy = (y2 + y3) / 2, dx = (ax + bx) / 2, dy = (ay + by) / 2;
-    const ex = (bx + cx) / 2, ey = (by + cy) / 2, mx = (dx + ex) / 2, my = (dy + ey) / 2;
-    cubic(x0, y0, ax, ay, dx, dy, mx, my, level + 1);
-    cubic(mx, my, ex, ey, cx, cy, x3, y3, level + 1);
+    x3: number, y3: number): void => {
+    const pending = [[x0, y0, x1, y1, x2, y2, x3, y3]];
+    while (pending.length) {
+      if ((curveWork++ & 1023) === 0) throwIfAborted(signal);
+      const current = pending.pop()!;
+      const [x0, y0, x1, y1, x2, y2, x3, y3] = current;
+      // These are points on the curve; its control hull may extend beyond
+      // Float32 even when every rendered curve point remains representable.
+      if (![x0, y0, x3, y3].every(value => Number.isFinite(Math.fround(value)))) {
+        throw new PdfError("invalid-object", "Non-finite vector clip coordinates.");
+      }
+      // Distance to the endpoint segment bounds the complete Bezier control hull.
+      const distance = (px: number, py: number): number => {
+        const dx = x3 - x0, dy = y3 - y0;
+        const t = Math.max(0, Math.min(1, ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy || 1)));
+        return Math.hypot(px - x0 - t * dx, py - y0 - t * dy);
+      };
+      if (Math.max(distance(x1, y1), distance(x2, y2)) <= tolerance) { line(x3, y3); continue; }
+      if (current[8] === 1) {
+        // Subdivision rounded back to this same control polygon. Its chord is
+        // the closest approximation further floating-point work can produce.
+        precisionLimitedCurves = true;
+        line(x3, y3);
+        continue;
+      }
+      const ax = x0 / 2 + x1 / 2, ay = y0 / 2 + y1 / 2, bx = x1 / 2 + x2 / 2, by = y1 / 2 + y2 / 2;
+      const cx = x2 / 2 + x3 / 2, cy = y2 / 2 + y3 / 2, dx = ax / 2 + bx / 2, dy = ay / 2 + by / 2;
+      const ex = bx / 2 + cx / 2, ey = by / 2 + cy / 2, mx = dx / 2 + ex / 2, my = dy / 2 + ey / 2;
+      const left = [x0, y0, ax, ay, dx, dy, mx, my], right = [mx, my, ex, ey, cx, cy, x3, y3];
+      left.push(left.every((value, index) => value === current[index]) ? 1 : 0);
+      right.push(right.every((value, index) => value === current[index]) ? 1 : 0);
+      pending.push(right, left);
+    }
   };
   let sourceWork = 0;
-  for (let offset = 0; offset < data.length && !overflow;) {
+  for (let offset = 0; offset < data.length;) {
     // A long straight source path may now collapse to one stored edge.
     if ((sourceWork++ & 1023) === 0) throwIfAborted(signal);
     const op = data[offset++];
@@ -165,68 +187,48 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
     else throw new PdfError("invalid-object", "Invalid vector clip path operator.");
   }
   if (open) { line(sx, sy); finishSubpath(); }
-  return { edges, overflow, subdivided, curves };
+  return { edges, curves, precisionLimitedCurves };
 }
 
-/** Clip curves use a bounded vector approximation; painted glyphs/paths stay untouched. */
+/** Clip curves use the usual subpixel tolerance regardless of their edge count. */
 export class NativeVectorClipBuilder {
   readonly paths: VectorClipPath[] = [];
   approximatedCurves = false;
-  /** Clips flattened coarser than usual to fit their edge budget, and the coarsest tolerance used. */
-  coarsenedClipCount = 0;
-  coarsestCurveTolerance = CLIP_CURVE_TOLERANCE;
+  precisionLimitedCurves = false;
   private readonly ids = new Map<DensePdfTextClip, number>();
   private readonly shapes = new Map<string, number>();
-  private texelCount = 0;
-
-  add(clip: DensePdfTextClip | null | undefined, signal?: AbortSignal, depth = 0): number | undefined {
+  add(clip: DensePdfTextClip | null | undefined, signal?: AbortSignal): number | undefined {
     if (!clip) return undefined;
     throwIfAborted(signal);
-    if (depth >= MAX_VECTOR_CLIP_DEPTH) throw new PdfError("resource-limit", "Vector clip nesting exceeds its limit.");
     const existing = this.ids.get(clip);
     if (existing !== undefined) return existing;
-    const parent = this.add(clip.parent, signal, depth + 1) ?? -1;
-    let tolerance = CLIP_CURVE_TOLERANCE;
-    let flattened = flattenVectorClip(clip.path, tolerance, signal, MAX_VECTOR_CLIP_PATH_EDGES);
+    const chain: DensePdfTextClip[] = [];
+    const visited = new Set<DensePdfTextClip>();
+    let parent = -1;
+    for (let node: DensePdfTextClip | null = clip; node; node = node.parent) {
+      throwIfAborted(signal);
+      const known = this.ids.get(node);
+      if (known !== undefined) { parent = known; break; }
+      if (visited.has(node)) throw new PdfError("invalid-object", "Cyclic vector clip chain.");
+      visited.add(node); chain.push(node);
+    }
+    for (let index = chain.length - 1; index >= 0; index--) parent = this.addNode(chain[index], parent, signal);
+    return parent;
+  }
+
+  private addNode(clip: DensePdfTextClip, parent: number, signal?: AbortSignal): number {
+    const flattened = flattenVectorClip(clip.path, CLIP_CURVE_TOLERANCE, signal);
     if (flattened.curves) this.approximatedCurves = true;
-    while (flattened.overflow || (flattened.curves && flattened.edges.length > MAX_VECTOR_CLIP_EDGES * 4)) {
-      // Without subdivided curves the edges are already as few as the path allows.
-      if (!flattened.subdivided || tolerance >= MAX_CLIP_CURVE_TOLERANCE) throw new PdfError("unsupported-content",
-        "A vector clip exceeds the bounded edge representation.", { details: { reason: "vector-clip-edge-limit" } });
-      tolerance *= 4;
-      flattened = flattenVectorClip(clip.path, tolerance, signal);
-    }
+    if (flattened.precisionLimitedCurves) this.precisionLimitedCurves = true;
     const packedEdges = Float32Array.from(flattened.edges);
-    const payloadTexels = requiredVectorClipTexels(packedEdges);
-    if (payloadTexels === null) {
-      throw new PdfError("unsupported-content", "A vector clip exceeds the bounded edge representation.",
-        { details: { reason: "vector-clip-edge-limit" } });
-    }
+    if (!packedEdges.every(Number.isFinite)) throw new PdfError("invalid-object", "Non-finite vector clip coordinates.");
     const shapeKey = `${parent}:${clip.fillRule}:${packedEdges.join(",")}`;
     const sameShape = this.shapes.get(shapeKey);
     if (sameShape !== undefined) { this.ids.set(clip, sameShape); return sameShape; }
     const index = this.paths.length;
-    this.texelCount += 1 + payloadTexels;
-    if (this.texelCount > MAX_VECTOR_CLIP_TEXELS) {
-      throw new PdfError("resource-limit", "Vector clip storage exceeds its limit.");
-    }
-    if (tolerance > CLIP_CURVE_TOLERANCE) {
-      this.coarsenedClipCount++;
-      this.coarsestCurveTolerance = Math.max(this.coarsestCurveTolerance, tolerance);
-    }
     this.paths.push({ parent, fillRule: clip.fillRule, edges: packedEdges });
     this.shapes.set(shapeKey, index);
     this.ids.set(clip, index);
     return index;
-  }
-
-  /** Names the clips whose curves needed a coarser tolerance than the usual one, if any. */
-  coarseningDiagnostic(pageIndex: number): PdfDiagnostic | undefined {
-    if (this.coarsenedClipCount === 0) return undefined;
-    return { code: "clip-curve-coarsened", severity: "warning", pageIndex,
-      message: `${this.coarsenedClipCount} curved clip boundar${this.coarsenedClipCount === 1 ? "y" : "ies"} ` +
-        `exceeded ${MAX_VECTOR_CLIP_EDGES} vector edges at a ${CLIP_CURVE_TOLERANCE}-point subdivision tolerance; ` +
-        `they use up to ${Number(this.coarsestCurveTolerance.toPrecision(3))} point, visible only at deep zoom.`,
-      details: { clipCount: this.coarsenedClipCount, tolerance: this.coarsestCurveTolerance } };
   }
 }

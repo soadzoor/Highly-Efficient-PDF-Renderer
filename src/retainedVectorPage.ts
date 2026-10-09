@@ -1045,8 +1045,9 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   scene.segmentCount = scene.endpoints.length / 4; scene.sourceSegmentCount = scene.segmentCount; scene.mergedSegmentCount = scene.segmentCount;
   scene.imageLayerSegmentCount = 0;
   scene.clipPaths = clipBuilder.paths;
-  const coarsenedClips = clipBuilder.coarseningDiagnostic(page.pageInfo.sourcePageIndex);
-  if (coarsenedClips) options.onDiagnostic?.(coarsenedClips);
+  if (clipBuilder.precisionLimitedCurves) options.onDiagnostic?.({ code: "clip-curve-precision-limited", severity: "warning",
+    pageIndex: page.pageInfo.sourcePageIndex,
+    message: "Some curved clip boundaries reached floating-point precision before the subdivision tolerance; they use the closest representable vector edges." });
   if (stencilScale < 1) options.onDiagnostic?.({ code: "image.stencil-resolution-reduced", severity: "warning",
     pageIndex: page.pageInfo.sourcePageIndex,
     message: `${stencilCount} stencil image masks hold ${stencilPixels} pixels, more than the page's ${maxStencilPixels}-pixel ` +

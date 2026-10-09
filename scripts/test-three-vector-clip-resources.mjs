@@ -8,7 +8,10 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { acquireThreeVectorClipTexture, createThreeVectorClipTexture } = await import("../src/threeVectorClips.ts");
+  const { acquireThreeVectorClipTexture, createThreeVectorClipTexture, prepareThreeVectorClipTexture,
+    initializeThreeVectorClip, createThreeVectorClipMaterial } = await import("../src/threeVectorClips.ts");
+  const { packVectorClips } = await import("../src/vectorClips.ts");
+  const THREE = await import("three");
   const { ThreeMaterialRasterLayer } = await import("../src/threeMaterialRasterLayer.ts");
   const { ThreeMaterialGradientLayer } = await import("../src/threeMaterialGradientLayer.ts");
   const { ThreeMaterialFillLayer } = await import("../src/threeMaterialFillLayer.ts");
@@ -61,6 +64,63 @@ try {
   assert.notEqual(detached.texture, recreated.texture, "a new clip array has independent ownership");
   detached.release(); recreated.release();
 
+  const deviceScene = { ...scene, clipPaths: [ellipse(250)] };
+  const canonical = structuredClone(deviceScene.clipPaths);
+  const smallFirst = acquireThreeVectorClipTexture(deviceScene);
+  const smallSecond = acquireThreeVectorClipTexture({ ...deviceScene });
+  const deviceTexture = smallFirst.texture;
+  const material = new THREE.RawShaderMaterial();
+  initializeThreeVectorClip(material, deviceTexture);
+  const clippedMaterial = createThreeVectorClipMaterial(material, 0);
+  let deviceDisposals = 0;
+  deviceTexture.addEventListener("dispose", () => deviceDisposals++);
+  const initialImage = deviceTexture.image;
+  for (const unknownSize of [Infinity, NaN, 0]) prepareThreeVectorClipTexture(deviceScene, unknownSize);
+  assert.equal(deviceTexture.image, initialImage, "unknown host capacity leaves the shared store unchanged");
+  assert(initialImage.width > 32 || initialImage.height > 32, "optional cells exceed a small host's texture size");
+  prepareThreeVectorClipTexture(deviceScene, 32);
+  assert(deviceTexture.image.width <= 32 && deviceTexture.image.height <= 32);
+  assert.equal(deviceDisposals, 0, "first-use repacking has no GPU allocation to dispose");
+  assert.equal(material.uniforms.uVectorClipTex.value, deviceTexture);
+  assert.equal(clippedMaterial.uniforms.uVectorClipTex.value, deviceTexture,
+    "repacking preserves every existing material's texture reference");
+  assert.equal(smallSecond.texture, deviceTexture, "repacking preserves shared lease identity");
+  const fittedImage = deviceTexture.image;
+  const fittedVersion = deviceTexture.version;
+  for (const maxSize of [32, 4096]) prepareThreeVectorClipTexture(deviceScene, maxSize);
+  assert.equal(deviceTexture.image, fittedImage, "subsequent frames do not repack or expand a fitted store");
+  assert.equal(deviceTexture.version, fittedVersion);
+
+  // Simulate Three's upload notification before a second, smaller host borrows
+  // the scene. Immutable GPU dimensions need disposal, while leases survive.
+  deviceTexture.onUpdate(deviceTexture);
+  prepareThreeVectorClipTexture(deviceScene, 16);
+  assert.equal(deviceDisposals, 1, "shrinking an uploaded texture releases its previous GPU allocation");
+  assert(deviceTexture.image.width <= 16 && deviceTexture.image.height <= 16);
+  const raw = packVectorClips(deviceScene.clipPaths, 16 ** 2, { cells: true });
+  assert.equal(raw[3], 0, "the small device retains complete raw edges when indices cannot fit");
+  assert.deepEqual(deviceTexture.image.data.subarray(0, raw.length), raw);
+  assert.deepEqual(deviceScene.clipPaths, canonical, "device fitting preserves the canonical clip geometry");
+  const surviving = acquireThreeVectorClipTexture(deviceScene);
+  assert.equal(surviving.texture, deviceTexture, "GPU disposal does not remove a live shared store");
+  deviceTexture.onUpdate(deviceTexture);
+  const finalImage = deviceTexture.image;
+  const finalVersion = deviceTexture.version;
+  let capacityError;
+  try { prepareThreeVectorClipTexture(deviceScene, 15); } catch (error) { capacityError = error; }
+  assert.match(capacityError?.message ?? "", /capacity/i, "irreducible canonical edges reject the actual device capacity");
+  assert.throws(() => prepareThreeVectorClipTexture(deviceScene, 15), error => error === capacityError,
+    "a failed capacity is remembered instead of repeating expensive packing every frame");
+  assert.equal(deviceTexture.image, finalImage, "failed repacking leaves live texture storage intact");
+  assert.equal(deviceTexture.version, finalVersion);
+  assert.equal(deviceDisposals, 1, "a failed fit does not dispose the usable uploaded store");
+  prepareThreeVectorClipTexture(deviceScene, 16);
+  smallFirst.release(); smallSecond.release();
+  assert.equal(deviceDisposals, 1, "GPU disposal cannot consume another owner's shared lease");
+  surviving.release();
+  assert.equal(deviceDisposals, 2, "the final owner still releases GPU resources exactly once");
+  material.dispose(); clippedMaterial.dispose();
+
   for (const backend of ["webgl", "webgpu"]) {
     const options = { materialBackend: backend, webGpu, strokeCurveEnabled: true,
       textVectorOnly: true, vectorOverride: [0, 0, 0, 0], pageBackground: [1, 1, 1, 1] };
@@ -100,3 +160,12 @@ try {
   assert.equal(failureReleases, 1, "failed constructors cannot keep the shared texture alive");
   console.log("Three vector clip resource sharing regression tests passed");
 } finally { hooks.deregister(); }
+
+function ellipse(count) {
+  const edges = new Float32Array(count * 4);
+  for (let index = 0; index < count; index++) {
+    const a = index * Math.PI * 2 / count, b = (index + 1) * Math.PI * 2 / count;
+    edges.set([Math.cos(a), Math.sin(a), Math.cos(b), Math.sin(b)], index * 4);
+  }
+  return { parent: -1, fillRule: 0, edges };
+}

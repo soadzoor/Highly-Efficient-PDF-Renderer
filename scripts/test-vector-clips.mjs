@@ -16,7 +16,7 @@ try {
   const { validateVectorDrawRuns } = await import("../src/vectorDrawOrder.ts");
   const { NativeVectorClipBuilder } = await import("../src/pdf/nativeVectorClips.ts");
   const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
-  const { packVectorClips, MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES, MAX_VECTOR_CLIP_PATH_EDGES } = await import("../src/vectorClips.ts");
+  const { packVectorClips, validateVectorClips, TARGET_VECTOR_CLIP_EDGES } = await import("../src/vectorClips.ts");
   const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { createThreeVectorClipTexture, initializeThreeVectorClip, createThreeVectorClipMaterial } = await import("../src/threeVectorClips.ts");
   const fixtures = [
@@ -31,7 +31,7 @@ try {
     // A clip is frozen in page space when W executes, before subsequent changes to the CTM.
     fixture("q 1 0 0 1 10 5 cm 0 0 m 30 0 l 0 30 l h W n 1 0 0 1 -10 -5 cm /Fm Do Q"),
     fixture("q 5 5 m 5 55 55 55 55 5 c h W n /Fm Do Q"),
-    // Five stacked circles outgrow the edge budget at the usual curve tolerance.
+    // Five stacked circles exceed the indexing target at the usual curve tolerance.
     fixture(`q ${"62 32 m 62 48.569 48.569 62 32 62 c 2 48.569 15.431 62 2 32 c 2 15.431 15.431 2 32 2 c 48.569 2 62 15.431 62 32 c h ".repeat(5)}W n /Fm Do Q`)
   ];
   let sample;
@@ -47,9 +47,9 @@ try {
       if (fixtureIndex === 5) assert(session.getDiagnostics().some(d => d.code === "clip-curve-approximation"));
       if (fixtureIndex === 5) assert(!session.getDiagnostics().some(d => d.code === "clip-curve-coarsened"));
       if (fixtureIndex === 6) {
-        assert(scene.clipPaths.every(clip => clip.edges.length / 4 <= MAX_VECTOR_CLIP_EDGES));
-        assert.equal(session.getDiagnostics().find(d => d.code === "clip-curve-coarsened")?.details.clipCount, 1,
-          "an oversized curved clip is flattened more coarsely, not refused");
+        assert(scene.clipPaths.some(clip => clip.edges.length / 4 > TARGET_VECTOR_CLIP_EDGES));
+        assert(!session.getDiagnostics().some(d => d.code === "clip-curve-coarsened"),
+          "large curved clips retain the usual subdivision tolerance");
       }
       if (fixtureIndex === 0) {
         sample = scene;
@@ -66,12 +66,27 @@ try {
         const retained = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal,
           onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
         assert.equal(retained.rasterLayers.length, 0);
-        assert(retained.clipPaths.length > 0 && retained.clipPaths.every(clip => clip.edges.length / 4 <= MAX_VECTOR_CLIP_EDGES));
-        assert(diagnostics.some(d => d.code === "clip-curve-coarsened"), "retained lowering coarsens the same clip");
+        assert(retained.clipPaths.some(clip => clip.edges.length / 4 > TARGET_VECTOR_CLIP_EDGES));
+        assert(!diagnostics.some(d => d.code === "clip-curve-coarsened"), "retained lowering preserves the same clip tolerance");
       }
+      // Skia's polygon clip tessellator is slow on thousands of coincident
+      // edges. This fixture's five identical nonzero contours have the same
+      // interior as one; compare that exact interior after checking equality.
+      // The packed winding comparison above still scans all five contours.
+      const visualScene = fixtureIndex === 6 ? { ...scene, clipPaths: scene.clipPaths.map(clip => {
+        if (clip.edges.length / 4 <= TARGET_VECTOR_CLIP_EDGES) return clip;
+        assert.equal(clip.fillRule, 0);
+        assert.equal(clip.edges.length % 5, 0);
+        const contour = clip.edges.subarray(0, clip.edges.length / 5);
+        for (let index = 1; index < 5; index++) {
+          assert.deepEqual(clip.edges.subarray(index * contour.length, (index + 1) * contour.length), contour,
+            "the visual comparison may collapse only identical nonzero contours");
+        }
+        return { ...clip, edges: contour };
+      }) } : scene;
       for (const scale of [2, 8, 24]) {
         const reference = await renderHeprPageToCanvas2d(page, { scale, surfaceFactory });
-        const retained = renderRetainedFills(scene, scale);
+        const retained = renderRetainedFills(visualScene, scale);
         compareInteriors(retained.getImageData(0, 0, 64 * scale, 64 * scale).data,
           reference.surface.context.getImageData(0, 0, 64 * scale, 64 * scale).data, `fixture ${fixtureIndex}, scale ${scale}`);
       }
@@ -147,10 +162,10 @@ try {
   assert.throws(() => validateVectorDrawRuns({ ...sample, drawRuns: undefined }), /requires ordered/);
   assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ ...sample.clipPaths[0], parent: 0 }] }), /clip path/);
   assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array([0, NaN, 1, 1]) }] }), /clip path/);
-  assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array((MAX_VECTOR_CLIP_EDGES + 1) * 4) }] }), /clip candidates/);
-  assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array((MAX_VECTOR_CLIP_PATH_EDGES + 1) * 4) }] }), /clip path/);
-  const deep = Array.from({ length: MAX_VECTOR_CLIP_DEPTH + 1 }, (_, i) => ({ ...sample.clipPaths[0], parent: i - 1 }));
-  assert.throws(() => validateVectorDrawRuns({ ...sample, clipPaths: deep }), /nesting/);
+  assert.throws(() => validateVectorClips({ clipPaths: [{ parent: -1, fillRule: 2, edges: new Float32Array(0) }] }), /clip path/);
+  assert.throws(() => validateVectorClips({ clipPaths: [{ parent: -1, fillRule: 0, edges: new Float32Array(3) }] }), /clip path/);
+  const deep = Array.from({ length: 129 }, (_, i) => ({ ...sample.clipPaths[0], parent: i - 1 }));
+  assert.doesNotThrow(() => validateVectorClips({ clipPaths: deep }), "valid ancestry is not capped at 64 clips");
   const packed = packVectorClips(sample.clipPaths);
   assert.equal(packed[1], sample.clipPaths.length, "the clip texture contains coordinates, not a sampled mask");
   testClipPacking(packVectorClips);
@@ -165,7 +180,19 @@ try {
   assert.throws(() => builder.add(clip, AbortSignal.abort()));
   const emptyIndex = builder.add({ ...clip, path: { ...clip.path, data: new Float32Array([0, 1, 1]) } });
   assert.equal(contains({ clipPaths: builder.paths }, emptyIndex, 1, 1), false);
-  assert.equal(builder.coarseningDiagnostic(0), undefined, "clips within budget keep the usual tolerance");
+
+  let deepSource = null;
+  for (let index = 0; index < 129; index++) deepSource = { ...clip, parent: deepSource };
+  const deepBuilder = new NativeVectorClipBuilder();
+  const deepIndex = deepBuilder.add(deepSource);
+  assert.equal(deepBuilder.paths.length, 129, "native lowering retains ancestry beyond the former depth cap");
+  validateVectorClips({ clipPaths: deepBuilder.paths });
+  assert(contains({ clipPaths: deepBuilder.paths }, deepIndex, 1, 1));
+  assert(!contains({ clipPaths: deepBuilder.paths }, deepIndex, 9, 9));
+  const cyclic = { ...clip };
+  cyclic.parent = cyclic;
+  assert.throws(() => new NativeVectorClipBuilder().add(cyclic),
+    error => error.code === "invalid-object" && /cycle|cyclic/i.test(error.message), "cyclic ancestry is still rejected");
 
   // Source vertices can outgrow the edge budget while still describing just
   // four straight sides. The initial move lies inside the bottom edge, so its
@@ -182,7 +209,6 @@ try {
     assert.equal(exact.paths[index].edges.length / 4, 4, "collinear vertices and the closing seam reduce exactly");
     assert(contains({ clipPaths: exact.paths }, index, 5_000, 5_000));
     assert(!contains({ clipPaths: exact.paths }, index, -1, 5_000));
-    assert.equal(exact.coarseningDiagnostic(0), undefined, "exact simplification costs no curve fidelity");
   }
 
   const outer = [0, 0, 0, 1, 20, 0, 1, 22, 5, 1, 20, 0, 1, 20, 20, 1, 0, 20, 4];
@@ -205,9 +231,8 @@ try {
     get aborted() { return ++cancellationChecks >= 4; }
   }), error => error.code === "aborted", "long collapsed source paths still check cancellation");
 
-  // Disconnected line contours may need more canonical edges than a shader
-  // can scan at once. Spatial bands keep each lookup bounded while retaining
-  // every source edge and its exact winding.
+  // Spatial bands accelerate disconnected contours while retaining every
+  // source edge and its exact winding.
   const rectangles = Array.from({ length: 2_100 }, (_, index) =>
     `${2 + index % 60} ${2 + Math.floor(index / 60)} .5 .5 re`).join(" ");
   for (const rule of ["W", "W*"]) {
@@ -215,7 +240,7 @@ try {
     try {
       const scene = await session.compileVectorPage(0, { vectorFallback: "error", preserveDrawingOrder: true });
       validateVectorDrawRuns(scene);
-      assert(scene.clipPaths.some(clip => clip.edges.length / 4 > MAX_VECTOR_CLIP_EDGES),
+      assert(scene.clipPaths.some(clip => clip.edges.length / 4 > TARGET_VECTOR_CLIP_EDGES),
         "the complete large clip stays canonical vector geometry");
       assert.equal(scene.rasterLayers.length, 0);
       assert(contains(scene, scene.drawRuns[0].clipIndex, 2.25, 2.25));
@@ -226,7 +251,7 @@ try {
   }
 
   // A technical drawing's many disconnected contours can exceed the old
-  // 65,536-edge path cap while still fitting the bounded exact band index.
+  // 65,536-edge path cap while still benefiting from an exact band index.
   const technicalRectangles = Array.from({ length: 17_000 }, (_, index) =>
     `${(2 + index % 125 * .45).toFixed(2)} ${(2 + Math.floor(index / 125) * .45).toFixed(2)} .2 .2 re`).join(" ");
   for (const rule of ["W", "W*"]) {
@@ -243,29 +268,92 @@ try {
     } finally { await session.close(); }
   }
 
-  // Curves give up precision before a clip is refused; straight edges have none to give.
+  // Repeated curves keep exactly the same tolerance as a single curve.
   const k = 300 * 0.5523;
   const circle = [0, 300, 0, 2, 300, k, k, 300, 0, 300, 2, -k, 300, -300, k, -300, 0,
     2, -300, -k, -k, -300, 0, -300, 2, k, -300, 300, -k, 300, 0, 4];
   const curved = (data) => ({ parent: null, fillRule: 0, path: { data: Float32Array.from(data),
     transform: [1, 0, 0, 1, 400, 400], bounds: { minX: -300, minY: -300, maxX: 300, maxY: 300 } } });
-  const coarse = new NativeVectorClipBuilder();
-  const coarseIndex = coarse.add(curved([...circle, ...circle, ...circle]));
-  const coarseEdges = coarse.paths[coarseIndex].edges.length / 4;
-  assert(coarseEdges <= MAX_VECTOR_CLIP_EDGES && coarseEdges > MAX_VECTOR_CLIP_EDGES / 4);
-  assert(contains({ clipPaths: coarse.paths }, coarseIndex, 400, 699.9) && !contains({ clipPaths: coarse.paths }, coarseIndex, 400, 700.1));
-  assert.equal(coarse.coarsenedClipCount, 1);
-  const coarsened = coarse.coarseningDiagnostic(3);
-  assert.equal(coarsened.code, "clip-curve-coarsened");
-  assert.equal(coarsened.pageIndex, 3);
-  assert.equal(coarsened.details.tolerance, coarse.coarsestCurveTolerance);
-  assert(coarse.coarsestCurveTolerance > 0.0001 && coarse.coarsestCurveTolerance < 0.01);
   const fine = new NativeVectorClipBuilder();
-  assert(fine.paths[fine.add(curved(circle))].edges.length / 4 > coarseEdges / 3, "one circle keeps the usual tolerance");
-  assert.equal(fine.coarsenedClipCount, 0);
-  const sawtooth = [0, 0, 0, ...Array.from({ length: MAX_VECTOR_CLIP_EDGES + 8 }, (_, i) => [1, i + 1, i % 2]).flat()];
-  assert.throws(() => new NativeVectorClipBuilder().add(curved(sawtooth)),
-    error => error.details?.reason === "vector-clip-edge-limit");
+  const fineEdges = fine.paths[fine.add(curved(circle))].edges;
+  const repeated = new NativeVectorClipBuilder();
+  const repeatedIndex = repeated.add(curved([...circle, ...circle, ...circle]));
+  const repeatedEdges = repeated.paths[repeatedIndex].edges;
+  assert(repeatedEdges.length / 4 > TARGET_VECTOR_CLIP_EDGES);
+  assert.equal(repeatedEdges.length, fineEdges.length * 3, "large clips retain every subdivision at the usual tolerance");
+  for (let index = 0; index < 3; index++) assert.deepEqual(repeatedEdges.subarray(index * fineEdges.length, (index + 1) * fineEdges.length), fineEdges);
+  assert(contains({ clipPaths: repeated.paths }, repeatedIndex, 400, 699.9) && !contains({ clipPaths: repeated.paths }, repeatedIndex, 400, 700.1));
+
+  // Narrow curves can need deep subdivision around turning points without
+  // needing many stored edges. Their shape must survive the former depth cap.
+  const narrowClip = { parent: null, fillRule: 0, path: {
+    data: Float32Array.of(0, 0, 0, 2, 1e12, 0, -1e12, 1, 0, 1, 4),
+    transform: [1, 0, 0, 1, 0, 0], bounds: { minX: -1e12, minY: 0, maxX: 1e12, maxY: 1 }
+  } };
+  const narrow = new NativeVectorClipBuilder();
+  const narrowEdges = narrow.paths[narrow.add(narrowClip)].edges;
+  assert(narrowEdges.every(Number.isFinite));
+  assert(narrowEdges.length / 4 > 4 && narrowEdges.length / 4 < 1_000);
+  assert.equal(narrow.precisionLimitedCurves, false, "deep subdivision still reaches the usual tolerance");
+  const narrowXs = narrowEdges.filter((_, index) => index % 2 === 0);
+  assert(Math.min(...narrowXs) < -2.8e11 && Math.max(...narrowXs) > 2.8e11, "both turning points survive");
+  for (let offset = 0; offset < narrowEdges.length; offset += 4) {
+    const next = (offset + 4) % narrowEdges.length;
+    assert.equal(narrowEdges[offset + 2], narrowEdges[next]);
+    assert.equal(narrowEdges[offset + 3], narrowEdges[next + 1]);
+  }
+  assert(windingContains(narrowEdges, 0, 1e11, .1) && windingContains(narrowEdges, 0, -1e11, .9));
+  assert(!windingContains(narrowEdges, 0, 3e11, .1) && !windingContains(narrowEdges, 0, 1e11, .9));
+
+  const precisionClip = { parent: null, fillRule: 0, path: {
+    data: Float32Array.of(0, 0, 0, 2, 0, 1, 1, 1, 1, 1, 4),
+    transform: [.125, 0, 0, .125, 1e15 + .125, 1e15 + .125],
+    bounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 }
+  } };
+  const precision = new NativeVectorClipBuilder();
+  const precisionEdges = precision.paths[precision.add(precisionClip)].edges;
+  assert(precisionEdges.every(Number.isFinite));
+  assert.equal(precision.precisionLimitedCurves, true, "floating-point subdivision stalls retain a diagnostic flag");
+  assert.throws(() => new NativeVectorClipBuilder().add({ ...clip,
+    path: { ...clip.path, transform: [1e100, 0, 0, 1e100, 0, 0] } }),
+    error => error.code === "invalid-object", "coordinates that overflow the scene format are rejected");
+
+  // Control points are not uploaded: the curve can stay within Float32 even
+  // when its transformed control hull extends beyond that format's range.
+  const wideControls = new NativeVectorClipBuilder();
+  const wideIndex = wideControls.add({ ...narrowClip, path: { ...narrowClip.path,
+    data: Float32Array.of(0, 0, 0, 2, 2e38, 0, 2e38, 0, 0, 0, 1, 0, 10, 1, -1, 10, 1, -1, 0, 4),
+    transform: [2, 0, 0, 1, 0, 0]
+  } });
+  assert.equal(wideControls.paths[wideIndex].edges.length / 4, 4);
+  assert(windingContains(wideControls.paths[wideIndex].edges, 0, -1, 5),
+    "representable curve points remain usable beyond the control-point range");
+
+  // Backtracking collinear cubics collapse to four boundary edges, so their
+  // substantial subdivision work needs cancellation checks of its own.
+  const collapsedCurves = [0, 0, 0, 1, 1, 0, 1, 1, 1];
+  for (let index = 0; index < 30; index++) collapsedCurves.push(2, 1e35, 1, -1e35, 1, 2, 1);
+  collapsedCurves.push(1, 0, 1, 4);
+  const collapsedClip = { ...narrowClip, path: { ...narrowClip.path, data: Float32Array.from(collapsedCurves),
+    bounds: { minX: -1e35, minY: 0, maxX: 1e35, maxY: 1 } } };
+  const collapsed = new NativeVectorClipBuilder();
+  let subdivisionChecks = 0;
+  collapsed.add(collapsedClip, { get aborted() { subdivisionChecks++; return false; } });
+  assert.equal(collapsed.paths[0].edges.length / 4, 4);
+  assert(subdivisionChecks > 10, "cancellation polling follows subdivision work even when stored geometry stays tiny");
+  subdivisionChecks = 0;
+  assert.throws(() => new NativeVectorClipBuilder().add(collapsedClip, {
+    get aborted() { return ++subdivisionChecks >= 6; }
+  }), error => error.code === "aborted");
+
+  const sawtooth = [0, 0, -1];
+  for (let index = 0; index < 270_000; index++) sawtooth.push(1, index + 1, index % 2);
+  sawtooth.push(1, 0, 2, 4);
+  const largeBuilder = new NativeVectorClipBuilder();
+  const largeIndex = largeBuilder.add(curved(sawtooth));
+  assert(largeBuilder.paths[largeIndex].edges.length / 4 > 262_144,
+    "straight clips beyond the former canonical cap retain all noncollinear edges");
+  validateVectorClips({ clipPaths: largeBuilder.paths });
 
   // Per-run material clones share live camera uniforms but keep independent clip roots.
   const texture = createThreeVectorClipTexture(sample);

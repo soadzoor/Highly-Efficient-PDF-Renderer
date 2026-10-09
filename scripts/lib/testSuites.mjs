@@ -171,6 +171,7 @@ export const fastTests = [
   "vector-clips",
   "vector-page-edges",
   "vector-clip-bands",
+  "vector-clip-device-capacity",
   "vector-draw-run-culling",
   "vector-visibility-guard",
   "vector-run-clip-elision",

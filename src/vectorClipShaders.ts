@@ -1,5 +1,3 @@
-import { MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES } from "./vectorClips";
-
 // Point test: whether a point lies inside the whole clip chain. Cell storage
 // (vectorCellIndex.ts) gives the winding from the cell holding the point, at
 // the finest level: its pieces, plus closures standing in for all geometry
@@ -7,8 +5,8 @@ import { MAX_VECTOR_CLIP_DEPTH, MAX_VECTOR_CLIP_EDGES } from "./vectorClips";
 const VECTOR_CLIP_POINT_GLSL = `
 float heprVectorClip(vec2 point) {
   highp int index = int(uVectorClipIndex);
-  for (highp int depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
-    if (index < 0) break;
+  // Validated parent indices point to earlier nodes and terminate at -1.
+  while (index >= 0) {
     vec4 node = heprClipTexel(index);
     if (node.z < 0.0) {
       vec4 bounds = heprClipTexel(int(node.y));
@@ -25,16 +23,14 @@ float heprVectorClip(vec2 point) {
       vec4 grid = heprClipTexel(int(cells.x));
       vec2 home = clamp(floor((point - origin.xy) / cells.z), vec2(0.0), grid.yz - 1.0);
       vec4 cell = heprClipTexel(int(grid.x + home.y * grid.y + home.x));
-      for (highp int piece = 0; piece < ${MAX_VECTOR_CLIP_EDGES}; piece++) {
-        if (piece >= int(cell.y)) break;
+      for (highp int piece = 0; piece < int(cell.y); piece++) {
         vec4 line = heprClipTexel(int(cell.x) + piece);
         if ((line.y > point.y) != (line.w > point.y)) {
           float x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
           if (x > point.x) winding += line.w > line.y ? 1 : -1;
         }
       }
-      for (highp int closure = 0; closure < ${MAX_VECTOR_CLIP_EDGES}; closure++) {
-        if (closure >= int(cell.w)) break;
+      for (highp int closure = 0; closure < int(cell.w); closure++) {
         vec4 pair = heprClipTexel(int(cell.z) + closure);
         if (pair.x <= point.y) winding -= int(pair.y);
         if (pair.z <= point.y) winding -= int(pair.w);
@@ -50,8 +46,7 @@ float heprVectorClip(vec2 point) {
         firstEdge = int(range.x);
         edgeCount = int(range.y);
       }
-      for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge++) {
-        if (edge >= edgeCount) break;
+      for (highp int edge = 0; edge < edgeCount; edge++) {
         vec4 line = heprClipTexel(firstEdge + edge);
         if ((line.y > point.y) != (line.w > point.y)) {
           float x = line.x + (point.y - line.y) / (line.w - line.y) * (line.z - line.x);
@@ -63,7 +58,6 @@ float heprVectorClip(vec2 point) {
     if (!inside) return 0.0;
     index = int(node.x);
   }
-  if (index >= 0) return 0.0;
   return 1.0;
 }
 `;
@@ -127,8 +121,7 @@ void heprClipSampleCrossings(vec4 line, vec4 sampleX, vec4 sampleY, vec4 rows, v
 // any is used. Reads past the end repeat the last edge and count for nothing.
 void heprClipSampleEdges(highp int first, highp int count, vec4 sampleX, vec4 sampleY, vec4 rows, vec4 columns,
     inout vec4 winding0, inout vec4 winding1, inout vec4 winding2, inout vec4 winding3) {
-  for (highp int edge = 0; edge < ${MAX_VECTOR_CLIP_EDGES}; edge += 4) {
-    if (edge >= count) break;
+  for (highp int edge = 0; edge < count; edge += 4) {
     highp int last = first + count - 1;
     vec4 line0 = heprClipTexel(first + edge);
     vec4 line1 = heprClipTexel(min(first + edge + 1, last));
@@ -179,8 +172,7 @@ uint heprClipPolygonSamples(vec4 node, vec4 sampleX, vec4 sampleY, float span) {
           winding0, winding1, winding2, winding3);
         highp int closures = int(cell.z);
         highp int closureCount = int(cell.w);
-        for (highp int closure = 0; closure < ${MAX_VECTOR_CLIP_EDGES}; closure += 2) {
-          if (closure >= closureCount) break;
+        for (highp int closure = 0; closure < closureCount; closure += 2) {
           vec4 pair0 = heprClipTexel(closures + closure);
           vec4 pair1 = heprClipTexel(closures + min(closure + 1, closureCount - 1));
           vec4 below = (heprClipClosuresBelow(pair0, sampleY) +
@@ -223,15 +215,13 @@ float heprVectorClipAA(vec2 point, float aaWidth) {
   float span = 0.75 * aaWidth;
   uint samples = 0xFFFFu;
   highp int index = int(uVectorClipIndex);
-  for (highp int depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
-    if (index < 0) break;
+  while (index >= 0) {
     vec4 node = heprClipTexel(index);
     samples &= node.z < 0.0 ? heprClipRectSamples(heprClipTexel(int(node.y)), sampleX, sampleY)
       : heprClipPolygonSamples(node, sampleX, sampleY, span);
     if (samples == 0u) return 0.0;
     index = int(node.x);
   }
-  if (index >= 0) return 0.0;
   return heprSampleCoverage(samples);
 }
 `;
@@ -258,8 +248,8 @@ float heprClipCellLevel(vec4 cells, float reach) {
 export const VECTOR_CLIP_WGSL = /* wgsl */ `
 fn heprVectorClip(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f32>) -> f32 {
   var index = i32(clipIndex);
-  for (var depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
-    if (index < 0) { break; }
+  // Validated parent indices point to earlier nodes and terminate at -1.
+  while (index >= 0) {
     let node = heprClipTexel(clipTexture, index);
     if (node.z < 0.0) {
       let bounds = heprClipTexel(clipTexture, i32(node.y));
@@ -311,7 +301,6 @@ fn heprVectorClip(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f32>
     if (!inside) { return 0.0; }
     index = i32(node.x);
   }
-  if (index >= 0) { return 0.0; }
   return 1.0;
 }
 
@@ -332,8 +321,7 @@ fn heprVectorClipAA(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f3
   let span = 0.75 * aaWidth;
   var samples = 0xFFFFu;
   var index = i32(clipIndex);
-  for (var depth = 0; depth < ${MAX_VECTOR_CLIP_DEPTH}; depth++) {
-    if (index < 0) { break; }
+  while (index >= 0) {
     let node = heprClipTexel(clipTexture, index);
     if (node.z < 0.0) {
       samples &= heprClipRectSamples(heprClipTexel(clipTexture, i32(node.y)), sampleX, sampleY);
@@ -343,7 +331,6 @@ fn heprVectorClipAA(point: vec2<f32>, clipIndex: f32, clipTexture: texture_2d<f3
     if (samples == 0u) { return 0.0; }
     index = i32(node.x);
   }
-  if (index >= 0) { return 0.0; }
   return f32(countOneBits(samples)) * 0.0625;
 }
 

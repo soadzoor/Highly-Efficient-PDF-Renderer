@@ -5,13 +5,12 @@ import { PRIMITIVE_HIGHLIGHT_COVERAGE_WGSL, PRIMITIVE_HIGHLIGHT_POSITION_WGSL,
   PRIMITIVE_HIGHLIGHT_LINE_OFFSET_WGSL, PRIMITIVE_HIGHLIGHT_QUADRATIC_OFFSET_WGSL } from "./primitiveHighlightShaders";
 import { createThreeWebGpuOutputFragmentFns, type ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import { VECTOR_CLIP_WGSL } from "./vectorClipShaders";
-import { MAX_VECTOR_CLIP_DEPTH } from "./vectorClips";
 
 const lineFn = TSL.wgslFn(PRIMITIVE_HIGHLIGHT_LINE_OFFSET_WGSL);
 const quadraticFn = TSL.wgslFn(PRIMITIVE_HIGHLIGHT_QUADRATIC_OFFSET_WGSL, [lineFn] as never);
 const coverageFn = TSL.wgslFn(PRIMITIVE_HIGHLIGHT_COVERAGE_WGSL, [lineFn, quadraticFn] as never);
 const positionFn = TSL.wgslFn(PRIMITIVE_HIGHLIGHT_POSITION_WGSL);
-const clipFn = TSL.wgslFn(VECTOR_CLIP_WGSL.replace(/depth < \d+/, `depth < ${MAX_VECTOR_CLIP_DEPTH + 2}`));
+const clipFn = TSL.wgslFn(VECTOR_CLIP_WGSL);
 const fragmentFns = createThreeWebGpuOutputFragmentFns(`
 fn heprThreePrimitiveHighlight(point:vec2<f32>,a:vec4<f32>,b:vec4<f32>,index:f32,
   pixelRatio:f32,selectionCount:f32,clipTexture:texture_2d<f32>) -> vec4<f32> {

@@ -41,6 +41,7 @@ import { RetainedPageReplay } from "./retainedPageReplay";
 import { ThreeMaterialRasterLayer } from "./threeMaterialRasterLayer";
 import { ThreeMaterialStrokeLayer } from "./threeMaterialStrokeLayer";
 import { ThreeMaterialTextLayer } from "./threeMaterialTextLayer";
+import { prepareThreeVectorClipTexture } from "./threeVectorClips";
 import { getThreeRenderPerformance } from "./threeRenderPerformance";
 import { compileThreeMaterialRoots, type ThreeShaderCompileHost } from "./threeShaderPreparation";
 import { ThreeTextLodLayer } from "./textLodLayer";
@@ -2408,6 +2409,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
 
     this.rasterMaterialLayer.setHostRenderer(renderer);
     this.ensureThreeTextLodResourceSupport(renderer);
+    prepareThreeVectorClipTexture(this.sceneData, readThreeRendererMaxTextureSize(renderer));
     if (!this.hasCompleteMaterialLayers() || !this.hostSupportsRasterTextures(renderer)) return;
     camera.updateMatrixWorld();
     this.updateWorldMatrix(true, true);
@@ -2907,6 +2909,9 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     const hostBackendMatches = this.hostBackendMatchesMaterialBackend(renderer);
     const hostColorCompositingMatches = this.hostColorCompositingMatches(renderer);
     const hostUsesMaterialBackend = this.hostUsesMaterialBackend(renderer);
+    if (hostUsesMaterialBackend) {
+      prepareThreeVectorClipTexture(this.sceneData, readThreeRendererMaxTextureSize(renderer));
+    }
     const hostSupportsRasterTextures =
       hostUsesMaterialBackend && this.hostSupportsRasterTextures(renderer);
     const cameraDrivenMaterialPipelineEnabled =

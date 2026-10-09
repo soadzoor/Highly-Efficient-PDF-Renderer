@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 } });
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
-  const { PrimitiveAppearanceState, normalizePrimitiveColor } = await import("../src/primitiveAppearance.ts");
+  const { PrimitiveAppearanceState, normalizePrimitiveColor, buildPrimitiveHighlights } = await import("../src/primitiveAppearance.ts");
   const { getScenePrimitive } = await import("../src/scenePrimitives.ts");
   const { buildHep } = await import("../src/hepBuilder.ts");
   const { loadSceneFromHep } = await import("../src/hep.ts");
@@ -75,6 +75,34 @@ try {
   assert.equal(colorCalls.at(-1)[0].color, null);
   assert.throws(() => state.setHover(a), /disposed/);
   assert.deepEqual(scene, original, "interaction never mutates canonical data");
+
+  // The quadratic turns back at t=2/3. Only the neighbourhood of that turn
+  // needs more than twenty subdivisions; straight portions stay inexpensive.
+  const meshScene = createEmptyVectorScene();
+  Object.assign(meshScene, {
+    pageCount: 1, pageRects: Float32Array.of(0, 0, 1e12, 1),
+    bounds: { minX: 0, minY: 0, maxX: 1e12, maxY: 1 },
+    pageBounds: { minX: 0, minY: 0, maxX: 1e12, maxY: 1 },
+    gradientCount: 1, gradientMetaA: Float32Array.of(2, 0, 0, 0),
+    gradientMetaB: Float32Array.of(1, 0, 0, 1), gradientMetaC: new Float32Array(4),
+    gradientMeshRanges: Uint32Array.of(0, 3), gradientMeshIndices: Uint32Array.of(0, 1, 2),
+    gradientMeshPositions: Float32Array.of(0, 0, 1, 0, 0, 1), gradientMeshColors: new Float32Array(12),
+    gradientFillPathCount: 1, gradientFillSegmentCount: 3,
+    gradientFillPathMetaA: Float32Array.of(0, 3, 0, 0), gradientFillPathMetaB: Float32Array.of(1e12, 1, 0, 0),
+    gradientFillPathMetaC: Float32Array.of(0, 0, 0, 1), gradientFillPaintMeta: Float32Array.of(0, -1, 0, 0),
+    gradientFillSegmentsA: Float32Array.of(0, 0, 1e12, 0, 5e11, 0, 5e11, 1, 5e11, 1, 0, 0),
+    gradientFillSegmentsB: Float32Array.of(5e11, 0, 1, 0, 5e11, 1, 0, 0, 0, 0, 0, 0),
+    drawRuns: [{ kind: "gradient-fill", first: 0, count: 1 }]
+  });
+  const meshHighlights = buildPrimitiveHighlights(meshScene, [{ kind: "gradient-fill", index: 0 }], null);
+  assert.equal(meshHighlights.count, 3, "the mesh boundary stays a triangle");
+  const contour = meshHighlights.clipPaths[0].edges;
+  assert(contour.length > 12 && contour.length < 1_000, "only the backtracking turn needs subdivision");
+  assert(contour.every(Number.isFinite));
+  assert(Math.max(...contour.filter((_, index) => index % 2 === 0)) > 6.6e11,
+    "the contour retains its excursion beyond the endpoint chord");
+  meshScene.gradientFillSegmentsA[2] = NaN;
+  assert.throws(() => buildPrimitiveHighlights(meshScene, [{ kind: "gradient-fill", index: 0 }], null), /Non-finite/);
 
   // Only a tiny synthetic scene is serialized. No source PDF conversion.
   const hep = await buildHep(scene, { compression: "store", encodeRasterImages: false });

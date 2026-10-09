@@ -1,7 +1,6 @@
 import { CSS_NAMED_COLORS } from "./cssNamedColors";
 import type { Bounds, VectorClipPath, VectorScene } from "./pdfVectorExtractor";
 import { buildGradientMeshBoundary } from "./gradientMeshBoundary";
-import { MAX_VECTOR_CLIP_EDGES } from "./vectorClips";
 import {
   getPrimitiveClipChain, getPrimitiveSegmentClipBounds, getScenePrimitive, validatePrimitiveRef,
   type PrimitiveInfo, type PrimitiveKind, type PrimitiveRef
@@ -301,21 +300,31 @@ export function mergePrimitiveHighlights(a: PrimitiveHighlightSet | null, b: Pri
 function primitiveContourClip(primitive: PrimitiveInfo): Float32Array {
   const edges: number[] = [];
   const line = (x0: number, y0: number, x1: number, y1: number): void => {
+    if (![x0, y0, x1, y1].every(Number.isFinite)) throw new RangeError("Non-finite mesh highlight clip coordinates.");
     if (x0 === x1 && y0 === y1) return;
-    if (edges.length / 4 >= MAX_VECTOR_CLIP_EDGES) throw new RangeError("Mesh highlight paint clipping exceeds its edge budget.");
     edges.push(x0, y0, x1, y1);
   };
-  const quadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number, depth = 0): void => {
-    const dx = x1 - x0, dy = y1 - y0;
-    const t = Math.max(0, Math.min(1, ((cx - x0) * dx + (cy - y0) * dy) / (dx * dx + dy * dy || 1)));
-    if (Math.hypot(cx - x0 - t * dx, cy - y0 - t * dy) <= 0.0001) { line(x0, y0, x1, y1); return; }
-    if (depth >= 20) throw new RangeError("Mesh highlight paint clipping exceeds its subdivision budget.");
-    const ax = (x0 + cx) / 2, ay = (y0 + cy) / 2, bx = (cx + x1) / 2, by = (cy + y1) / 2;
-    const mx = (ax + bx) / 2, my = (ay + by) / 2;
-    quadratic(x0, y0, ax, ay, mx, my, depth + 1);
-    quadratic(mx, my, bx, by, x1, y1, depth + 1);
+  const quadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number): void => {
+    const first = [x0, y0, cx, cy, x1, y1];
+    if (!first.every(Number.isFinite)) throw new RangeError("Non-finite mesh highlight clip coordinates.");
+    const pending = [first];
+    while (pending.length) {
+      const current = pending.pop()!;
+      const [x0, y0, cx, cy, x1, y1] = current;
+      const dx = x1 - x0, dy = y1 - y0;
+      const t = Math.max(0, Math.min(1, ((cx - x0) * dx + (cy - y0) * dy) / (dx * dx + dy * dy || 1)));
+      if (Math.hypot(cx - x0 - t * dx, cy - y0 - t * dy) <= 0.0001 || current[6] === 1) {
+        // A stalled control polygon cannot improve through more subdivision.
+        line(x0, y0, x1, y1); continue;
+      }
+      const ax = x0 / 2 + cx / 2, ay = y0 / 2 + cy / 2, bx = cx / 2 + x1 / 2, by = cy / 2 + y1 / 2;
+      const mx = ax / 2 + bx / 2, my = ay / 2 + by / 2;
+      const left = [x0, y0, ax, ay, mx, my], right = [mx, my, bx, by, x1, y1];
+      left.push(left.every((value, index) => value === current[index]) ? 1 : 0);
+      right.push(right.every((value, index) => value === current[index]) ? 1 : 0);
+      pending.push(right, left);
+    }
   };
-  if (primitive.segmentCount > MAX_VECTOR_CLIP_EDGES) throw new RangeError("Mesh highlight paint clipping exceeds its edge budget.");
   for (let i = 0; i < primitive.segmentCount; i++) {
     const { start, control, end } = primitive.getSegment(i);
     if (control) quadratic(start.x, start.y, control.x, control.y, end.x, end.y);

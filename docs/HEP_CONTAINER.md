@@ -517,11 +517,16 @@ page space. A parent index references an earlier clip to intersect with; `-1`
 means no parent. Fill rule `0` is nonzero winding, `1` is even-odd. Empty paths
 clip everything. Clip paths require ordered draw runs and a reader that applies
 their references. They do not modify the image pixels or painted vector geometry.
-Limits are 8,192 edges per path, 64 intersected clips and 4,194,304 total nodes
-plus edges (64 MiB of packed coordinate data). Curved clip boundaries
-are subdivided into vector edges at a 0.0001-point tolerance before Float32
-storage, with a diagnostic; glyph outlines and painted curves are unaffected.
-Renderers evaluate clipping at the current zoom without a raster mask.
+Clip validation does not impose per-path edge, ancestry-depth or aggregate GPU
+storage budgets. Curved clip boundaries are subdivided into vector edges at a
+0.0001-point tolerance before Float32 storage, with a diagnostic; glyph outlines
+and painted curves are unaffected. Renderers evaluate clipping at the current
+zoom without a raster mask. If floating-point precision prevents further curve
+subdivision, the nearest vector approximation is retained with a diagnostic.
+Uploads share identical geometry and adapt optional
+spatial indices to the device's texture dimensions. The GPU layout requires exact
+Float32 texel addresses, so its packed storage can contain at most 2^24 texels;
+this format constraint is independent of available memory.
 
 ## Limits and integrity
 
