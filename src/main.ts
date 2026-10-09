@@ -963,18 +963,15 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
       path: entry.pdfPath,
       pdfPath: entry.pdfPath
     });
-    exampleSelectionMap.set(hepKey, {
-      id: entry.id,
-      sourceName: entry.name,
-      kind: "hep",
-      path: entry.hepPath,
-      pdfPath: entry.pdfPath
-    });
-
-    const lodKey = `${entry.id}:hep-lod`;
-    if (entry.hepLodPath) exampleSelectionMap.set(lodKey, {
-      id: entry.id, sourceName: entry.name, kind: "hep", path: entry.hepLodPath, pdfPath: entry.pdfPath
-    });
+    if (entry.hepLodPath) {
+      exampleSelectionMap.set(hepKey, {
+        id: entry.id,
+        sourceName: entry.name,
+        kind: "hep",
+        path: entry.hepLodPath,
+        pdfPath: entry.pdfPath
+      });
+    }
 
     items.push({
       name: entry.name,
@@ -985,15 +982,12 @@ function populateExampleDropdown(entries: NormalizedExampleEntry[]): void {
           sizeLabel: formatFileSize(entry.pdfSizeBytes),
           title: `Parse ${entry.name} from the original PDF`
         },
-        {
+        ...(entry.hepLodPath ? [{
           key: hepKey,
           label: "HEP",
-          sizeLabel: formatFileSize(entry.hepSizeBytes),
-          title: `Load precomputed HEP data for ${entry.name}`
-        },
-        ...(entry.hepLodPath ? [{ key: lodKey, label: "HEP+LOD",
           sizeLabel: formatFileSize(entry.hepLodSizeBytes ?? 0),
-          title: `Load ${entry.name} with stored vector and text LODs` }] : [])
+          title: `Load precomputed HEP data for ${entry.name}`
+        }] : [])
       ]
     });
   }

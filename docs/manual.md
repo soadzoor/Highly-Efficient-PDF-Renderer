@@ -1217,10 +1217,11 @@ even when the LOD options change; use `--force` to replace them. The JavaScript
 `withVectorLod: false` or `withTextLod: false` to omit either one.
 
 For the bundled examples, run `npm run regenerate:heps:lod` manually. It writes
-to `public/examples/heps-lod` and updates the manifest with **HEP+LOD** actions
-and file sizes. The existing `npm run regenerate:heps` explicitly disables both
-LOD caches and keeps writing files to `public/examples/heps`. HEP+LOD actions
-appear only for files present when the manifest is generated.
+to `public/examples/heps-lod` and updates the manifest with file sizes. The
+example menus offer one **HEP** action per PDF, using the file with stored vector
+and text LODs. This action appears only when that file is present in the manifest.
+The existing `npm run regenerate:heps` explicitly disables both LOD caches and
+keeps writing files to `public/examples/heps`.
 
 To shrink existing HEPs while preserving every decoded section byte, including
 all LOD levels, precision and indexes, run the storage repacker:
