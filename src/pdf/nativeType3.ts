@@ -11,7 +11,7 @@ import {
 } from "./nativeCos";
 import type { NativePdfDocument } from "./nativeDocument";
 import { parseNativePdfFont, parseToUnicodeCMap } from "./nativeFont";
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 
 export type NativePdfType3Matrix = readonly [number, number, number, number, number, number];
 export type NativePdfType3Rectangle = readonly [number, number, number, number];
@@ -74,6 +74,7 @@ export interface NativePdfPreparedType3Font {
   readonly dictionary: PdfDictionary;
   readonly fontMatrix: NativePdfType3Matrix;
   readonly fontBBox: NativePdfType3Rectangle;
+  readonly diagnostics: readonly PdfDiagnostic[];
   readonly firstChar: number;
   readonly lastChar: number;
   readonly widths: readonly number[];
@@ -122,6 +123,7 @@ interface CharProcResolutionStack {
 interface ParsedType3FontData {
   readonly fontMatrix: NativePdfType3Matrix;
   readonly fontBBox: NativePdfType3Rectangle;
+  readonly diagnostics: readonly PdfDiagnostic[];
   readonly firstChar: number;
   readonly lastChar: number;
   readonly widths: readonly number[];
@@ -560,6 +562,7 @@ class PreparedType3Font implements NativePdfPreparedType3Font {
   readonly dictionary: PdfDictionary;
   readonly fontMatrix: NativePdfType3Matrix;
   readonly fontBBox: NativePdfType3Rectangle;
+  readonly diagnostics: readonly PdfDiagnostic[];
   readonly firstChar: number;
   readonly lastChar: number;
   readonly widths: readonly number[];
@@ -586,6 +589,7 @@ class PreparedType3Font implements NativePdfPreparedType3Font {
     this.dictionary = dictionary;
     this.fontMatrix = data.fontMatrix;
     this.fontBBox = data.fontBBox;
+    this.diagnostics = data.diagnostics;
     this.firstChar = data.firstChar;
     this.lastChar = data.lastChar;
     this.widths = data.widths;
@@ -709,16 +713,26 @@ async function parseType3FontData(
   if (!Number.isFinite(determinant) || determinant === 0) {
     throw invalidType3("A Type3 font /FontMatrix must be nonsingular.", "type3-font-matrix-singular");
   }
-  const fontBBox = asRectangle(await requiredNumberArray(
+  const sourceFontBBox = asRectangle(await requiredNumberArray(
     document,
     dictionary.get("FontBBox"),
     4,
     "/FontBBox",
     signal
   ));
-  if (fontBBox[0] > fontBBox[2] || fontBBox[1] > fontBBox[3]) {
-    throw invalidType3("A Type3 font /FontBBox is reversed.", "type3-font-bbox-reversed");
-  }
+  const reversed = sourceFontBBox[0] > sourceFontBBox[2] || sourceFontBBox[1] > sourceFontBBox[3];
+  const fontBBox = reversed ? asRectangle([
+    Math.min(sourceFontBBox[0], sourceFontBBox[2]),
+    Math.min(sourceFontBBox[1], sourceFontBBox[3]),
+    Math.max(sourceFontBBox[0], sourceFontBBox[2]),
+    Math.max(sourceFontBBox[1], sourceFontBBox[3])
+  ]) : sourceFontBBox;
+  const diagnostics: readonly PdfDiagnostic[] = Object.freeze(reversed ? [Object.freeze({
+    code: "font.type3-bbox-normalized",
+    severity: "warning" as const,
+    message: "Normalized reversed Type3 /FontBBox coordinates; glyph painting retains its original FontMatrix.",
+    details: Object.freeze({ sourceFontBBox: sourceFontBBox.join(" "), fontBBox: fontBBox.join(" ") })
+  })] : []);
   const firstChar = await requiredInteger(document, dictionary.get("FirstChar"), "/FirstChar", signal);
   const lastChar = await requiredInteger(document, dictionary.get("LastChar"), "/LastChar", signal);
   if (firstChar < 0 || firstChar > 255 || lastChar < firstChar || lastChar > 255) {
@@ -793,6 +807,7 @@ async function parseType3FontData(
   return {
     fontMatrix,
     fontBBox,
+    diagnostics,
     firstChar,
     lastChar,
     widths,

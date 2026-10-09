@@ -360,6 +360,34 @@ function testGroup4ModesAndEofb() {
     () => decode(bits("1"), { K: -1, Columns: 8, EndOfBlock: true }),
     hasPdfError("invalid-object", /without an EOFB/)
   );
+  const fillDiagnostics = [];
+  const filledMarker = decode(bits(`1 00000 ${eofb}`), { K: -1, Columns: 8 }, {
+    limits: { maxRows: 1 }, onDiagnostic: diagnostic => fillDiagnostics.push(diagnostic)
+  });
+  assertResult(filledMarker, [0xff], 8, 1, "end-of-block");
+  assert.equal(fillDiagnostics[0].code, "filter.ccitt-end-of-block-fill");
+  assert.equal(fillDiagnostics[0].details.fillBits, 5);
+
+  for (const padding of ["", "0".repeat(69)]) {
+    const diagnostics = [];
+    const recovered = decode(bits(`1 ${padding}`), { K: -1, Columns: 8 }, {
+      recoverMissingEndOfBlock: true,
+      limits: { maxRows: 1 },
+      onDiagnostic: diagnostic => diagnostics.push(diagnostic)
+    });
+    assertResult(recovered, [0xff], 8, 1, "end-of-data");
+    assert.equal(diagnostics[0].code, "filter.ccitt-end-of-block-recovered");
+    assert.equal(diagnostics[0].details.decodedRows, 1);
+  }
+  assert.throws(() => decode(bits("1 1"), { K: -1, Columns: 8 }, {
+    recoverMissingEndOfBlock: true, limits: { maxRows: 1 }
+  }), hasPdfError("resource-limit", /row count/));
+  assert.throws(() => decode(bits("1 001 000111 0000"), { K: -1, Columns: 8 }, {
+    recoverMissingEndOfBlock: true
+  }), hasPdfError("invalid-object", /Truncated CCITT/));
+  assert.throws(() => decode(bits(`1 ${"0".repeat(69)}`), { K: -1, Columns: 8 }, {
+    recoverMissingEndOfBlock: true, limits: { maxScanBits: 72 }
+  }), hasPdfError("resource-limit", /scanning/));
   assert.throws(
     () => decode(bits(`0000001 000 ${eofb}`), {
       K: -1,

@@ -48,6 +48,7 @@ try {
   await testSimpleEncodingAndUnicodeSeparation();
   await testCidToGidBounds();
   await testToUnicodeSurrogateRecovery();
+  await testCidMappingRecovery();
   testDirectCMapValidation();
   await testUnsupportedAssetsAndLimits();
 
@@ -628,6 +629,62 @@ async function testToUnicodeSurrogateRecovery() {
   );
 }
 
+async function testCidMappingRecovery() {
+  const reported = [];
+  const encoding = stream(`
+    1 begincodespacerange <00> <ff> endcodespacerange
+    1 begincidrange <40> <44> 10 endcidrange
+    1 begincidchar <41> 50 endcidchar
+    1 begincidrange <42> <43> 60 endcidrange
+    1 begincidchar <41> 70 endcidchar
+  `);
+  const font = await parseNativePdfFont(compositeFont(encoding), identityResolver, {
+    onDiagnostic: diagnostic => reported.push(diagnostic)
+  });
+  assert.deepEqual([0x40, 0x41, 0x42, 0x43, 0x44].map(code => font.decode(Uint8Array.of(code)).cid),
+    [10, 70, 60, 61, 14], "later cidchar and cidrange definitions override only their mapped codes");
+  const recovery = font.diagnostics.find(d => d.code === "font.cmap-cid-overrides");
+  assert.equal(recovery.details.overriddenMappingCount, 4);
+  assert(reported.includes(recovery));
+  const privateEncoding = stream(`
+    /CIDSystemInfo 3 dict dup begin /Registry (Adobe) def
+    /Ordering (ProducerSubset) def /Supplement 0 def end def
+    1 begincodespacerange <00> <ff> endcodespacerange
+    1 begincidchar <41> 70 endcidchar
+  `);
+  const privateFont = await parseNativePdfFont(
+    compositeFont(privateEncoding, cidFont("ProducerCollection", 0)), identityResolver
+  );
+  assert.equal(privateFont.decode(Uint8Array.of(0x41)).cid, 70);
+  assert.equal(privateFont.diagnostics[0].code, "font.cmap-private-collection-alias");
+  await assert.rejects(
+    parseNativePdfFont(compositeFont(encoding), identityResolver, { parserLimits: { maxCMapMappings: 8 } }),
+    hasPdfError("resource-limit", /mapping limit/i)
+  );
+
+  const malformed = compositeFont(name("Identity-H"), cidFont("Japan1", 7));
+  malformed.set("ToUnicode", stream(`
+    1 begincodespacerange <0000> <ffff> endcodespacerange
+    1 begincidrange <0000> <ffff> 0 endcidrange
+  `));
+  const fallback = await parseNativePdfFont(malformed, identityResolver);
+  assert.equal(fallback.decode(Uint8Array.of(2, 0x79)).cid, 633);
+  assert.equal(fallback.decode(Uint8Array.of(2, 0x79)).unicode, "\u3000",
+    "CID-only ToUnicode uses collection fallback, never treats a glyph ID as a Unicode scalar");
+  assert.equal(fallback.diagnostics[0].code, "font.to-unicode-non-unicode-mappings");
+
+  const mixed = parseToUnicodeCMap(encoder.encode(`
+    1 begincodespacerange <00> <ff> endcodespacerange
+    1 begincidchar <41> 7 endcidchar
+    1 beginnotdefrange <00> <ff> 0 endnotdefrange
+    1 beginbfchar <41> <03a9> endbfchar
+  `));
+  assert.equal(mixed.decode(Uint8Array.of(0x41)).unicode, "Ω");
+  assert.equal(mixed.decode(Uint8Array.of(0x42)).unicode, null);
+  assert.equal(mixed.diagnostics.length, 1);
+  assert.deepEqual(mixed.diagnostics[0].details, { cidMappingCount: 1, notdefMappingCount: 256 });
+}
+
 function testDirectCMapValidation() {
   const valid = parseToUnicodeCMap(encoder.encode(`
     2 begincodespacerange <00> <7f> <8100> <81ff> endcodespacerange
@@ -728,20 +785,18 @@ function testDirectCMapValidation() {
     `)),
     hasPdfError("unsupported-font", /cidrange target exceeds/i)
   );
-  assert.throws(
-    () => parseToUnicodeCMap(encoder.encode(`
+  const cidOnly = parseToUnicodeCMap(encoder.encode(`
       1 begincodespacerange <00> <ff> endcodespacerange
       1 begincidchar <41> 7 endcidchar
-    `)),
-    hasPdfError("unsupported-font", /ToUnicode CMap cannot contain CID mappings/i)
-  );
-  assert.throws(
-    () => parseToUnicodeCMap(encoder.encode(`
+  `));
+  assert.equal(cidOnly.decode(Uint8Array.of(0x41)).unicode, null);
+  assert.equal(cidOnly.diagnostics[0].code, "font.to-unicode-non-unicode-mappings");
+  const notdefOnly = parseToUnicodeCMap(encoder.encode(`
       1 begincodespacerange <00> <ff> endcodespacerange
       1 beginnotdefrange <00> <ff> 0 endnotdefrange
-    `)),
-    hasPdfError("unsupported-font", /notdef/i)
-  );
+  `));
+  assert.equal(notdefOnly.decode(Uint8Array.of(0x41)).unicode, null);
+  assert.equal(notdefOnly.diagnostics[0].code, "font.to-unicode-non-unicode-mappings");
   assert.throws(
     () => parseToUnicodeCMap(encoder.encode(`
       1 begincodespacerange <00> <ff> endcodespacerange
@@ -771,20 +826,18 @@ async function testUnsupportedAssetsAndLimits() {
     1 begincodespacerange <00> <ff> endcodespacerange
     1 begincidrange <41> <42> 7 endcidrange
   `));
-  await assert.rejects(
-    parseNativePdfFont(cidRangeToUnicode, identityResolver),
-    hasPdfError("unsupported-font", /ToUnicode CMap cannot contain CID mappings/i)
-  );
+  const cidRangeFont = await parseNativePdfFont(cidRangeToUnicode, identityResolver);
+  assert.equal(cidRangeFont.decode(Uint8Array.of(0x41)).unicode, "A");
+  assert.equal(cidRangeFont.diagnostics[0].code, "font.to-unicode-non-unicode-mappings");
 
   const notdefToUnicode = simpleFont(name("WinAnsiEncoding"));
   notdefToUnicode.set("ToUnicode", stream(`
     1 begincodespacerange <00> <ff> endcodespacerange
     1 beginnotdefrange <00> <ff> 0 endnotdefrange
   `));
-  await assert.rejects(
-    parseNativePdfFont(notdefToUnicode, identityResolver),
-    hasPdfError("unsupported-font", /ToUnicode CMap cannot contain notdef mappings/i)
-  );
+  const notdefFont = await parseNativePdfFont(notdefToUnicode, identityResolver);
+  assert.equal(notdefFont.decode(Uint8Array.of(0x41)).unicode, "A");
+  assert.equal(notdefFont.diagnostics[0].code, "font.to-unicode-non-unicode-mappings");
 
   await assert.rejects(
     parseNativePdfFont(compositeFont(stream(`

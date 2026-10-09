@@ -443,7 +443,22 @@ class NativeInlineImageParser {
         );
       }
     }
-    const boundary = this.findBoundary(dataStart, dictionary, filterNames);
+    let boundary: InlineBoundary;
+    try {
+      boundary = this.findBoundary(dataStart, dictionary, filterNames);
+    } catch (error) {
+      // ID followed by CR and a first sample byte of LF looks like a CRLF
+      // separator. Recover that byte only when the exact unfiltered sample
+      // layout proves the alternate EI boundary; binary data stays intact.
+      if (filterNames.length !== 0 || exactUnfilteredPayloadLength(dictionary) === null ||
+          this.bytes[idStart + 2] !== 0x0d || this.bytes[idStart + 3] !== 0x0a ||
+          !(error instanceof PdfError) || error.code !== "unsupported-image" ||
+          (error.details?.reason !== "inline-image-ei-whitespace" &&
+           error.details?.reason !== "inline-image-missing-ei" &&
+           error.details?.reason !== "inline-image-truncated-payload")) throw error;
+      dataStart -= 1;
+      boundary = this.findBoundary(dataStart, dictionary, filterNames);
+    }
     const dataLength = boundary.dataEnd - dataStart;
     if (dataLength < 0 || dataLength > this.limits.maxPayloadBytes) {
       throw limitError("inline-image-payload", "Inline image payload exceeds its configured limit.", {

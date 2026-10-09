@@ -164,7 +164,7 @@ function buildFixture() {
       { number: 66, body: image("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 65 0 R", Uint8Array.of(0)) },
       { number: 67, body: image("/Width 1 /Height 1 /Filter /JPXDecode /SMaskInData 0 /Mask [0 65535]", Uint8Array.of(0xff, 0x4f)) },
       { number: 72, body: image("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /RunLengthDecode", Uint8Array.of(0, 0, 128)) },
-      { number: 73, body: image("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 4 /Columns 1 >>", Uint8Array.of(0)) },
+      { number: 73, body: image("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 4 /Columns 1 >>", deflateSync(Uint8Array.of(0xab))) },
       { number: 74, body: image("/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /RunLengthDecode", Uint8Array.of(0, 127, 128)) },
       { number: 75, body: image("/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 76 0 R", Uint8Array.of(1, 2, 3)) },
       { number: 76, body: image("/Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte []", Uint8Array.of(0, 255)) }
@@ -185,6 +185,34 @@ const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture });
 
 try {
   const images = new NativePdfImageRegistry(document);
+
+  // e1180adf's Type3 masks use the default eight-bit PNG predictor to group
+  // packed one-bit scanlines into /Columns-byte blocks, with a short last block.
+  for (const [width, height] of [[21, 55], [42, 56], [49, 58]]) {
+    const rowStride = Math.ceil(width / 8);
+    const samples = Uint8Array.from({ length: rowStride * height }, (_, index) => (index * 37 + 91) & 255);
+    const predicted = [];
+    for (let offset = 0; offset < samples.length; offset += width) {
+      predicted.push(1);
+      for (let column = 0; column < Math.min(width, samples.length - offset); column += 1) {
+        predicted.push((samples[offset + column] - (column > 0 ? samples[offset + column - 1] : 0)) & 255);
+      }
+    }
+    const dictionary = new Map(Object.entries({
+      Type: name("XObject"), Subtype: name("Image"), Width: width, Height: height,
+      BitsPerComponent: 1, ImageMask: true, Decode: [1, 0], Filter: name("FlateDecode"),
+      DecodeParms: new Map([["Predictor", 15], ["Columns", width]])
+    }));
+    const result = images.describe(await images.add({
+      kind: "stream", dictionary, bytes: deflateSync(Uint8Array.from(predicted))
+    }));
+    const expected = Uint8Array.from({ length: width * height }, (_, index) => {
+      const row = Math.floor(index / width), column = index % width;
+      return (samples[row * rowStride + (column >>> 3)] >>> (7 - (column & 7))) & 1 ? 255 : 0;
+    });
+    assert.deepEqual(result.data, expected, `${width}x${height} packed mask retains every pixel across predictor blocks`);
+  }
+  assert.ok(document.getDiagnostics().some(diagnostic => diagnostic.code === "filter.png-predictor-partial-row"));
 
   // MM16169_U-0028 uses five palette entries in an eight-bit image. Scaling
   // samples to hival instead of preserving their indices made the tile black.
@@ -331,7 +359,8 @@ try {
     await rejectsCode(images.add(ref(objectNumber)), "unsupported-image");
   }
   await rejectsCode(images.add(ref(72)), "unsupported-image");
-  await rejectsCode(images.add(ref(73)), "unsupported-image");
+  assert.deepEqual([...images.describe(await images.add(ref(73))).data], [171, 171, 171, 255],
+    "filter predictor precision is independent of image sample precision");
   assert.deepEqual(
     [...images.describe(await images.add(ref(74))).data],
     [127, 127, 127, 255],

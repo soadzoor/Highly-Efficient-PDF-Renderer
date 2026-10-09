@@ -673,10 +673,17 @@ export class NativePdfExtGStateRegistry {
     throwIfAborted(signal);
     for (const key of dictionary.keys()) {
       if (!SUPPORTED_KEYS.has(key)) {
-        throw extGStateError(`${label} contains unsupported entry /${key}.`, {
-          reason: "extgstate-entry-unsupported",
-          entry: key
-        });
+        // Unknown dictionary keys (including the common lowercase /type typo)
+        // have no defined graphics-state semantics. Keep all recognized paint
+        // entries without resolving potentially broken extension metadata.
+        const diagnostic: PdfDiagnostic = {
+          code: "extgstate.unknown-entry-ignored",
+          severity: "warning",
+          message: `${label} contains unknown entry /${key}; the entry was ignored.`,
+          details: { feature: "ext-gstate", reason: "extgstate-entry-unknown", entry: key }
+        };
+        this.diagnostics.push(diagnostic);
+        this.onDiagnostic?.(diagnostic);
       }
     }
   }

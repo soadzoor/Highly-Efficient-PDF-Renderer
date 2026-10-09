@@ -230,6 +230,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
   const glyphReach = new Uint8Array(page.stores.glyphs.glyphIds.length);
   const glyphClipTester = new NativeTextClipTester();
   let reportedGlyphStrokeComplexity = false, reportedHairlineCurveApproximation = false, reportedHairlineStyleApproximation = false;
+  let reportedStrokePenApproximation = false;
   let reportedViewTransformApproximation = false;
   const stack: ScenePaintNode[][] = [scene.paintGraph.roots];
   const knockoutScopes = new WeakSet<ScenePaintNode[]>();
@@ -579,7 +580,8 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       const flags = Math.floor(g.primitiveMeta[offset + 3] / 2);
       primitiveMeta.push(g.primitiveMeta[offset] + x, g.primitiveMeta[offset + 1] + y, g.primitiveMeta[offset + 2],
         (halfWidth > 0 ? flags & ~1 : flags) * 2 + 1);
-      primitiveBounds.push(g.primitiveBounds[offset] + x, g.primitiveBounds[offset + 1] + y, g.primitiveBounds[offset + 2] + x, g.primitiveBounds[offset + 3] + y);
+      primitiveBounds.push(g.primitiveBounds[offset] + x - halfWidth, g.primitiveBounds[offset + 1] + y - halfWidth,
+        g.primitiveBounds[offset + 2] + x + halfWidth, g.primitiveBounds[offset + 3] + y + halfWidth);
       styles.push(halfWidth, rgba[0], rgba[1], rgba[2]);
     }
     scene.maxHalfWidth = Math.max(scene.maxHalfWidth, halfWidth);
@@ -635,15 +637,35 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     // under minification because its two edges can fall between pixel centers.
     const stroke = strokeStyle(style, matrix), strokes = page.stores.strokes;
     const scaleX = Math.hypot(matrix[0], matrix[1]), scaleY = Math.hypot(matrix[2], matrix[3]);
+    const dot = matrix[0] * matrix[2] + matrix[1] * matrix[3];
     const uniform = scaleX > 0 && scaleY > 0 && Math.abs(scaleX - scaleY) <= 1e-6 * Math.max(scaleX, scaleY) &&
-      Math.abs(matrix[0] * matrix[2] + matrix[1] * matrix[3]) <= scaleX * scaleY * 1e-6;
-    if (uniform && stroke.dashArray.length === 0 && (strokes.flags[style] & HEPR_STROKE_FLAG.StrokeAdjust) === 0) {
+      Math.abs(dot) <= scaleX * scaleY * 1e-6;
+    // CAD exporters often round nominally uniform CTMs differently on each
+    // axis. Bound the circular pen's deviation from the transformed ellipse
+    // by its singular radii, including shear, under the curve tolerance already
+    // used by native strokes. Large deviations retain the exact vector outline.
+    const trace = scaleX * scaleX + scaleY * scaleY;
+    const difference = Math.hypot(scaleX * scaleX - scaleY * scaleY, 2 * dot);
+    const maximumScale = Math.sqrt((trace + difference) / 2);
+    const minimumScale = Math.sqrt(Math.max(0, (trace - difference) / 2));
+    const halfWidth = uniform ? stroke.width * scaleX * 0.5 : stroke.width * (maximumScale + minimumScale) * 0.25;
+    const penError = stroke.width * (maximumScale - minimumScale) * 0.25;
+    const boundedPen = minimumScale > 0 && Number.isFinite(halfWidth) && penError <= 0.01;
+    if ((uniform || boundedPen) && stroke.dashArray.length === 0 && (strokes.flags[style] & HEPR_STROKE_FLAG.StrokeAdjust) === 0) {
       const commands = pathCommands(indices);
       const singleLine = commands.length === 2 && commands[0].kind === "move" && commands[1].kind === "line";
       if (stroke.lineCap === 1 && (stroke.lineJoin === 1 || singleLine)) {
         if (rgba[3] <= 1e-3) return;
         const g = buildNativeGlyphHairline(commands, matrix, { ...stroke, width: 0 }, signal);
-        if (g) packedStroke(g, IDENTITY, rgba, clip, condition, stroke.width * scaleX * 0.5);
+        if (g) {
+          packedStroke(g, IDENTITY, rgba, clip, condition, halfWidth);
+          if (!uniform && !reportedStrokePenApproximation) {
+            reportedStrokePenApproximation = true;
+            options.onDiagnostic?.({ code: "stroke-pen-approximation", severity: "warning", pageIndex: page.pageInfo.sourcePageIndex,
+              message: "Nearly circular stroke pens use vector centerlines with at most 0.01-point radial error.",
+              details: { maximumRadialError: 0.01 } });
+          }
+        }
         return;
       }
     }

@@ -697,9 +697,11 @@ function buildTextInstancesExport(scene: VectorScene): TextInstancesExport | nul
   }
   for (let index = 0; index < clipRectCount; index += 1) {
     const offset = index * 4;
-    if (clipRects![offset] >= clipRects![offset + 2] ||
-        clipRects![offset + 1] >= clipRects![offset + 3]) {
-      throw new Error("Text clip rectangle is empty or reversed.");
+    // A zero-area clip paints no text and is valid. Narrow native clips may
+    // also collapse to zero area when stored on the Float32 scene grid.
+    if (clipRects![offset] > clipRects![offset + 2] ||
+        clipRects![offset + 1] > clipRects![offset + 3]) {
+      throw new Error("Text clip rectangle is reversed.");
     }
   }
   for (let index = 0; index < count; index += 1) {

@@ -144,6 +144,16 @@ const resourceColor = prepareNativeInlineImages(
 );
 assert.deepEqual(resourceColor.images[0].stream.dictionary.get("ColorSpace"), name("Alias"));
 
+// A CR separator followed by a literal LF first sample must not consume that
+// sample as CRLF. The exact row length determines which interpretation is valid.
+for (const separator of ["\r", "\r\n"]) {
+  const samples = Uint8Array.of(10, 54, 202, 17, 61, 209);
+  const separated = prepareNativeInlineImages(concat(
+    "BI /W 2 /H 1 /BPC 8 /CS /RGB ID", separator, samples, "\nEI Q"
+  ));
+  assert.deepEqual([...separated.images[0].stream.bytes], [...samples]);
+}
+
 const compressed = deflateSync(Uint8Array.of(127));
 const compressedHex = `${Buffer.from(compressed).toString("hex")}>`;
 const predictor = prepareNativeInlineImages(

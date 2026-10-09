@@ -754,7 +754,8 @@ function testCollectionsAndKernelRouting() {
     tables.set("maxp", cffMaxp(10));
     const cff = NativeSfntFont.parse(buildSfnt(tables, "OTTO"));
     assert.equal(cff.outlineFormat, tag === "CFF " ? "cff" : "cff2");
-    expectPdf(() => cff.getGlyphOutline(1), "unsupported-font", /CFF\/CFF2.*kernel/i);
+    expectPdf(() => cff.getGlyphOutline(1), "unsupported-font",
+      tag === "CFF " ? /CFF header.*bounds/i : /CFF2.*engine/i);
   }
 
   const type1Tables = cloneTables(fixture.tables);

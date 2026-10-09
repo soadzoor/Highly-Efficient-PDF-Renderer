@@ -103,7 +103,10 @@ export class NativePageFontRegistry {
   }
 
   getDiagnostics(): readonly PdfDiagnostic[] {
-    return Object.freeze(this.resources.flatMap(({ font }) => font.diagnostics));
+    return Object.freeze(this.resources.flatMap(({ font, type3 }) => [
+      ...font.diagnostics,
+      ...(type3?.diagnostics ?? [])
+    ]));
   }
 
   /** Register the dictionary referenced directly by an ExtGState /Font entry. */

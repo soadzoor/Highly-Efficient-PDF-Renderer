@@ -27,6 +27,7 @@ try {
   await testChainedFilters();
   await testFlate();
   await testFlateEolRecovery();
+  await testFlateMissingChecksumEol();
   await testStreamingFlateChunks();
   await testLzw();
   await testAscii85();
@@ -289,6 +290,61 @@ async function testFlateEolRecovery() {
     for (const marker of [[0], [10], [13], [13, 10]]) {
       await assert.rejects(decode(concat(raw, Uint8Array.from(marker))), hasPdfError("invalid-object", /FlateDecode/));
     }
+  }
+}
+
+async function testFlateMissingChecksumEol() {
+  const decodeModes = [
+    (input, options) => decodePdfFilterChain(input, ["FlateDecode"], [null], options),
+    async (input, options) => (await collectFilterChunks(input, ["FlateDecode"], [null], {
+      ...options, chunkSize: 3
+    })).bytes
+  ];
+  for (const [payload, marker] of [
+    [Uint8Array.of(9), [10]],
+    [Uint8Array.of(12), [13]],
+    [Uint8Array.from([...Array(13).fill(255), 22]), [13, 10]]
+  ]) {
+    const encoded = bytesOf(deflateSync(payload));
+    assert.deepEqual([...encoded.subarray(-marker.length)], marker);
+    const truncated = encoded.subarray(0, -marker.length);
+    for (const decode of decodeModes) {
+      const diagnostics = [];
+      assert.deepEqual(await decode(truncated, { onDiagnostic: diagnostic => diagnostics.push(diagnostic) }), payload);
+      assert.equal(diagnostics.length, 1);
+      assert.equal(diagnostics[0].code, "filter.flate-eol-recovered");
+      assert.deepEqual(diagnostics[0].details, { trimmedByteCount: 0, appendedByteCount: marker.length });
+      if (payload.length > 1) {
+        await assert.rejects(decode(truncated, { limits: { maxDecodedStreamBytes: payload.length - 1 } }),
+          hasPdfError("resource-limit", /configured byte limit/));
+      }
+      const controller = new AbortController();
+      controller.abort();
+      await assert.rejects(decode(truncated, { signal: controller.signal }), hasPdfError("aborted", /aborted/));
+      const damaged = truncated.slice();
+      damaged[damaged.length - 1] ^= 1;
+      await assert.rejects(decode(damaged), hasPdfError("invalid-object", /FlateDecode/));
+    }
+  }
+  const ordinaryChecksum = bytesOf(deflateSync(Uint8Array.of(1)));
+  for (const decode of decodeModes) {
+    await assert.rejects(decode(ordinaryChecksum.subarray(0, -1)), hasPdfError("invalid-object", /FlateDecode/));
+  }
+
+  // Reproduce a declared /Length that puts its final checksum LF outside the
+  // payload. The following stream delimiter happens to be that missing byte.
+  const payload = Uint8Array.of(9);
+  const truncated = bytesOf(deflateSync(payload)).subarray(0, -1);
+  const fixture = writeTinyPdf({ objects: [{ number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Kids [] /Count 0 >>" },
+    { number: 3, body: tinyPdfStream("/Filter /FlateDecode", truncated) }] });
+  const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture });
+  try {
+    const stream = await document.resolveObject({ kind: "ref", objectNumber: 3, generation: 0 });
+    assert.deepEqual(await document.decodeStream(stream), payload);
+    assert.ok(document.getDiagnostics().some(diagnostic => diagnostic.code === "filter.flate-eol-recovered"));
+  } finally {
+    await document.close();
   }
 }
 
@@ -694,10 +750,27 @@ async function testPngPredictor() {
     decodePredictor(Uint8Array.of(5, 0), 15, 1, 8, 1),
     hasPdfError("invalid-object", /filter byte/)
   );
-  await assert.rejects(
-    decodePredictor(Uint8Array.of(0, 1), 15, 1, 8, 2),
-    hasPdfError("invalid-object", /Truncated PNG/)
-  );
+  for (const filter of [0, 1, 2, 3, 4]) {
+    const partialRows = [Uint8Array.of(10, 20, 30, 40), Uint8Array.of(5, 15)];
+    const encoded = bytesOf(deflateSync(encodePngRows(partialRows, [filter, filter], 1)));
+    const params = predictorParams(15, 1, 8, 4);
+    for (const chunked of [false, true]) {
+      const diagnostics = [];
+      const options = { onDiagnostic: diagnostic => diagnostics.push(diagnostic) };
+      const result = chunked
+        ? (await collectFilterChunks(encoded, ["FlateDecode"], [params], { ...options, chunkSize: 3 })).bytes
+        : await decodePdfFilterChain(encoded, ["FlateDecode"], [params], options);
+      assert.deepEqual(result, concat(...partialRows), `a partial final PNG block preserves filter ${filter} samples`);
+      assert.equal(diagnostics.length, 1);
+      assert.equal(diagnostics[0].code, "filter.png-predictor-partial-row");
+      assert.deepEqual(diagnostics[0].details, { rowBytes: 4, finalRowBytes: 2, decodedBytes: 6 });
+      await assert.rejects(decodePdfFilterChain(encoded, ["FlateDecode"], [params], {
+        limits: { maxDecodedStreamBytes: 7 }
+      }), hasPdfError("resource-limit", /configured byte limit/));
+    }
+  }
+  await assert.rejects(decodePredictor(Uint8Array.of(0), 15, 1, 8, 2),
+    hasPdfError("invalid-object", /without samples/));
   await assert.rejects(
     decodePredictor(Uint8Array.of(), 15, 1, 3, 1),
     hasPdfError("invalid-object", /predictor parameters/)

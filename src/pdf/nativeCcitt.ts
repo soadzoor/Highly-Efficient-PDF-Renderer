@@ -1,7 +1,6 @@
-import { PdfError, throwIfAborted } from "./nativeTypes";
+import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 
 const EOL = "000000000001";
-const EOFB = `${EOL}${EOL}`;
 const RUN_EXTENSION = -1;
 
 /** PDF CCITTFaxDecode parameters, using the defaults from ISO 32000-1 table 11. */
@@ -31,6 +30,9 @@ export interface NativeCcittLimits {
 export interface NativeCcittDecodeOptions {
   readonly limits?: Partial<NativeCcittLimits>;
   readonly signal?: AbortSignal;
+  /** Accept physical EOD after complete rows when an image omits RTC/EOFB. */
+  readonly recoverMissingEndOfBlock?: boolean;
+  readonly onDiagnostic?: (diagnostic: PdfDiagnostic) => void;
 }
 
 export interface NativeCcittDecodeResult {
@@ -204,7 +206,7 @@ export function decodeNativeCcittFax(
       let mode = pendingMode;
       pendingMode = null;
       if (mode === null) {
-        const start = readLineStart(reader, params, decodedRows);
+        const start = readLineStart(reader, params, decodedRows, options);
         if (start === "end-of-block") {
           terminatedBy = "end-of-block";
           break;
@@ -361,11 +363,26 @@ function readParameters(
 function readLineStart(
   reader: MsbBitReader,
   params: NormalizedParameters,
-  rowIndex: number
+  rowIndex: number,
+  options: NativeCcittDecodeOptions
 ): "1d" | "2d" | "end-of-block" | "end-of-data" {
   if (params.encodedByteAlign) reader.skipToByteBoundary(true);
+  if (params.endOfBlock && params.k < 0 && tryConsumeEofb(reader, options)) return "end-of-block";
+  if (params.endOfBlock && params.k >= 0 && tryConsumeRtc(reader, params.k > 0)) return "end-of-block";
+  // Only a complete row boundary can recover a missing terminator. A partial
+  // run/mode code still fails inside the row decoder. Some producers pad the
+  // physical end with whole zero bytes as well as ordinary bit alignment.
+  if (params.endOfBlock && options.recoverMissingEndOfBlock && rowIndex > 0 && reader.hasOnlyZeroPadding()) {
+    reader.skipFinalZeroPadding();
+    options.onDiagnostic?.({
+      code: "filter.ccitt-end-of-block-recovered",
+      severity: "warning",
+      message: "CCITTFaxDecode ended after complete rows without its end-of-block marker; the decoded rows were retained.",
+      details: { decodedRows: rowIndex, group: params.k < 0 ? 4 : 3 }
+    });
+    return "end-of-data";
+  }
   if (params.k < 0) {
-    if (params.endOfBlock && reader.tryConsumeExact(EOFB)) return "end-of-block";
     if (reader.atEnd || (params.endOfBlock && reader.hasOnlyFinalZeroPadding())) {
       if (!reader.atEnd) reader.skipFinalZeroPadding();
       if (!params.endOfBlock) return "end-of-data";
@@ -374,7 +391,6 @@ function readLineStart(
     return "2d";
   }
 
-  if (params.endOfBlock && tryConsumeRtc(reader, params.k > 0)) return "end-of-block";
   if (params.endOfBlock && reader.hasOnlyFinalZeroPadding()) {
     reader.skipFinalZeroPadding();
     throw malformed(reader, "Truncated Group 3 data without an RTC marker.", "ccitt-missing-rtc");
@@ -402,6 +418,24 @@ function readLineStart(
     return "end-of-data";
   }
   return mode;
+}
+
+function tryConsumeEofb(reader: MsbBitReader, options: NativeCcittDecodeOptions): boolean {
+  const checkpoint = reader.mark();
+  if (!reader.tryConsumeEol() || !reader.tryConsumeEol()) {
+    reader.restore(checkpoint);
+    return false;
+  }
+  const fillBits = reader.position - checkpoint - EOL.length * 2;
+  if (fillBits > 0) {
+    options.onDiagnostic?.({
+      code: "filter.ccitt-end-of-block-fill",
+      severity: "warning",
+      message: "CCITTFaxDecode end-of-block marker contained extra zero fill bits; its complete rows were retained.",
+      details: { fillBits }
+    });
+  }
+  return true;
 }
 
 function tryConsumeRtc(reader: MsbBitReader, mixed: boolean): boolean {
@@ -837,6 +871,18 @@ class MsbBitReader {
       const absolute = this.bitOffset + relative;
       if (((this.bytes[Math.floor(absolute / 8)] >>> (7 - (absolute & 7))) & 1) !== 0) return false;
     }
+    return true;
+  }
+
+  hasOnlyZeroPadding(): boolean {
+    const checkpoint = this.mark();
+    while (!this.atEnd) {
+      if (this.readOptional() !== 0) {
+        this.restore(checkpoint);
+        return false;
+      }
+    }
+    this.restore(checkpoint);
     return true;
   }
 

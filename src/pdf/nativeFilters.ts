@@ -41,7 +41,7 @@ export async function decodePdfFilterChain(
     const params = decodeParameters[index] ?? null;
     switch (filter) {
       case "FlateDecode":
-        bytes = await decodeFlate(bytes, limits.maxDecodedStreamBytes, options.signal);
+        bytes = await decodeFlate(bytes, limits.maxDecodedStreamBytes, options.signal, options.onDiagnostic);
         break;
       case "LZWDecode":
         bytes = decodeLzw(
@@ -69,7 +69,7 @@ export async function decodePdfFilterChain(
     // Predictor decoding is kept as an explicit post-filter transform. This
     // also accepts producer output that attaches the predictor dictionary to a
     // simple outer byte filter; the bytes are never inspected to infer one.
-    bytes = applyPredictor(bytes, params, limits.maxDecodedStreamBytes, options.signal);
+    bytes = applyPredictor(bytes, params, limits.maxDecodedStreamBytes, options.signal, options.onDiagnostic);
     throwIfAborted(options.signal);
   }
   return bytes;
@@ -110,7 +110,8 @@ export async function* decodePdfFilterChainChunks(
       input,
       limits.maxDecodedStreamBytes,
       chunkSize,
-      options.signal
+      options.signal,
+      options.onDiagnostic
     )) {
       yield chunk;
     }
@@ -183,11 +184,12 @@ export function readDecodeParameters(
 async function decodeFlate(
   input: Uint8Array,
   limit: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): Promise<Uint8Array> {
   const wrapper = classifyFlateWrapper(input);
   if (wrapper === "zlib") {
-    return (await inflateWithPlatformStream([input], "deflate", limit, signal, true, true)).bytes!;
+    return (await inflateWithPlatformStream([input], "deflate", limit, signal, true, true, onDiagnostic)).bytes!;
   }
   const decoded = (await inflateWithPlatformStream(
     [input],
@@ -219,7 +221,8 @@ async function* decodeFlateChunks(
   input: Uint8Array,
   limit: number,
   chunkSize: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): AsyncIterable<Uint8Array> {
   const wrapper = classifyFlateWrapper(input);
   const inflateState: PlatformInflateState = { length: 0 };
@@ -230,7 +233,8 @@ async function* decodeFlateChunks(
     limit,
     signal,
     inflateState,
-    wrapper === "zlib"
+    wrapper === "zlib",
+    onDiagnostic
   )) {
     if (checksum) updateAdler32(checksum, platformChunk, signal);
     for (let offset = 0; offset < platformChunk.length; offset += chunkSize) {
@@ -256,25 +260,43 @@ async function* decodeFlateChunks(
 }
 
 /**
- * Find a strictly valid zlib stream with exactly one trailing EOL removed.
+ * Find a strictly valid zlib stream with exactly one misplaced EOL repaired.
  * Probe without retaining decoded chunks: some platforms discard queued output
  * on error, so the initial attempt's delivered length cannot prove completeness.
  */
-async function validateZlibWithoutEolMarker(
+async function validateZlibFraming(
   input: Uint8Array,
   limit: number,
   signal?: AbortSignal
-): Promise<{ readonly input: Uint8Array; readonly length: number } | null> {
+): Promise<{
+  readonly inputs: readonly Uint8Array[];
+  readonly length: number;
+  readonly trimmedByteCount: number;
+  readonly appendedByteCount: number;
+} | null> {
   const last = input[input.length - 1];
-  if (last !== 0x0a && last !== 0x0d) return null;
-  const maxTrim = last === 0x0a && input[input.length - 2] === 0x0d ? 2 : 1;
+  const maxTrim = last === 0x0a && input[input.length - 2] === 0x0d ? 2
+    : last === 0x0a || last === 0x0d ? 1 : 0;
+  const candidates: {
+    inputs: readonly Uint8Array[];
+    trimmedByteCount: number;
+    appendedByteCount: number;
+  }[] = [];
   // Try LF alone before CRLF: the preceding CR can be a checksum byte.
   for (let trim = 1; trim <= maxTrim; trim += 1) {
-    const candidate = input.subarray(0, input.length - trim);
+    candidates.push({ inputs: [input.subarray(0, input.length - trim)], trimmedByteCount: trim, appendedByteCount: 0 });
+  }
+  // Some producers exclude a final checksum CR/LF from /Length as if it were
+  // the stream delimiter. Restore only those framing bytes, and accept them
+  // only when the platform validates the complete DEFLATE data and Adler-32.
+  for (const marker of [Uint8Array.of(0x0a), Uint8Array.of(0x0d), Uint8Array.of(0x0d, 0x0a)]) {
+    candidates.push({ inputs: [input, marker], trimmedByteCount: 0, appendedByteCount: marker.length });
+  }
+  for (const candidate of candidates) {
     try {
-      const decoded = await inflateWithPlatformStream([candidate], "deflate", limit, signal, false);
+      const decoded = await inflateWithPlatformStream(candidate.inputs, "deflate", limit, signal, false);
       throwIfAborted(signal);
-      return { input: candidate, length: decoded.length };
+      return { ...candidate, length: decoded.length };
     } catch (cause) {
       throwIfAborted(signal);
       if (!(cause instanceof PdfError) || cause.code !== "invalid-object") throw cause;
@@ -308,7 +330,8 @@ async function inflateWithPlatformStream(
   limit: number,
   signal: AbortSignal | undefined,
   collect: boolean,
-  recoverEolMarker = false
+  recoverEolMarker = false,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): Promise<{ readonly bytes?: Uint8Array; readonly length: number }> {
   const state: PlatformInflateState = { length: 0 };
   const writer = collect ? new BoundedByteWriter(limit) : null;
@@ -318,7 +341,8 @@ async function inflateWithPlatformStream(
     limit,
     signal,
     state,
-    recoverEolMarker
+    recoverEolMarker,
+    onDiagnostic
   )) {
     writer?.append(chunk);
   }
@@ -337,7 +361,8 @@ async function* inflatePlatformChunks(
   limit: number,
   signal: AbortSignal | undefined,
   state: PlatformInflateState,
-  recoverEolMarker = false
+  recoverEolMarker = false,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): AsyncIterable<Uint8Array> {
   if (typeof DecompressionStream !== "function") {
     throw new PdfError("unsupported-filter", "FlateDecode requires DecompressionStream support.");
@@ -387,7 +412,7 @@ async function* inflatePlatformChunks(
     // or its synthetic validation checksum. Strict retries keep checksum,
     // truncation, byte-limit and cancellation checks intact.
     if (recoverEolMarker && format === "deflate" && inputs.length === 1) {
-      const recovered = await validateZlibWithoutEolMarker(inputs[0], limit, signal);
+      const recovered = await validateZlibFraming(inputs[0], limit, signal);
       if (recovered && recovered.length >= state.length) {
         if (recovered.length > state.length) {
           // Replay only if the failed decoder withheld output. Skip the prefix
@@ -395,7 +420,7 @@ async function* inflatePlatformChunks(
           // Neither this replay nor the validation retains the full output.
           let skip = state.length;
           const replayState: PlatformInflateState = { length: 0 };
-          for await (const chunk of inflatePlatformChunks([recovered.input], format, limit, signal, replayState)) {
+          for await (const chunk of inflatePlatformChunks(recovered.inputs, format, limit, signal, replayState)) {
             const offset = Math.min(skip, chunk.length);
             skip -= offset;
             if (offset < chunk.length) {
@@ -409,6 +434,17 @@ async function* inflatePlatformChunks(
           }
         }
         throwIfAborted(signal);
+        onDiagnostic?.(Object.freeze({
+          code: "filter.flate-eol-recovered",
+          severity: "warning" as const,
+          message: recovered.appendedByteCount > 0
+            ? "Restored an EOL byte sequence excluded from the FlateDecode checksum by the stream length; the complete stream checksum was validated."
+            : "Removed an EOL byte sequence included after the FlateDecode stream; the complete stream checksum was validated.",
+          details: Object.freeze({
+            trimmedByteCount: recovered.trimmedByteCount,
+            appendedByteCount: recovered.appendedByteCount
+          })
+        }));
         completed = true;
         return;
       }
@@ -681,7 +717,8 @@ function applyPredictor(
   input: Uint8Array,
   params: PdfDictionary | null,
   limit: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): Uint8Array {
   throwIfAborted(signal);
   const predictor = integerEntry(params, "Predictor", 1);
@@ -710,7 +747,7 @@ function applyPredictor(
     );
   }
   if (predictor >= 10 && predictor <= 15) {
-    return decodePngPredictor(input, colors, bits, rowBytes, limit, signal);
+    return decodePngPredictor(input, colors, bits, rowBytes, limit, signal, onDiagnostic);
   }
   throw new PdfError("unsupported-filter", `Unsupported PDF predictor ${predictor}.`, {
     details: { predictor }
@@ -748,14 +785,19 @@ function decodePngPredictor(
   bits: number,
   rowBytes: number,
   limit: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDiagnostic?: PdfFilterDecodeOptions["onDiagnostic"]
 ): Uint8Array {
   // ISO 32000 PNG prediction stores a filter tag byte at the start of every
   // row for every predictor value 10..15 (not only optimum predictor 15).
   const encodedRowBytes = checkedAdd(rowBytes, 1, "PNG predictor encoded row size");
-  if (input.length % encodedRowBytes !== 0) throw new PdfError("invalid-object", "Truncated PNG predictor row.");
-  const rows = input.length / encodedRowBytes;
-  const outputLength = checkedMultiply(rows, rowBytes, "PNG predictor output length");
+  const finalRowBytes = input.length % encodedRowBytes;
+  if (finalRowBytes === 1) throw new PdfError("invalid-object", "Truncated PNG predictor row without samples.");
+  // Some producers filter packed image bytes in blocks that do not coincide
+  // with image scanlines. Their final block can be shorter than /Columns;
+  // reconstruct its existing samples without inventing padding pixels.
+  const rows = Math.ceil(input.length / encodedRowBytes);
+  const outputLength = input.length - rows;
   enforceLimit(outputLength, limit);
   const output = allocateBytes(outputLength, "PNG predictor output");
   const bytesPerPixel = Math.max(1, Math.ceil(colors * bits / 8));
@@ -765,7 +807,8 @@ function decodePngPredictor(
     const filter = input[inputOffset++];
     if (filter > 4) throw new PdfError("invalid-object", "Invalid PNG predictor filter byte.");
     const rowOffset = row * rowBytes;
-    for (let column = 0; column < rowBytes; column += 1) {
+    const availableColumns = Math.min(rowBytes, input.length - inputOffset);
+    for (let column = 0; column < availableColumns; column += 1) {
       if ((column & 0x3fff) === 0) throwIfAborted(signal);
       const encoded = input[inputOffset++];
       const left = column >= bytesPerPixel ? output[rowOffset + column - bytesPerPixel] : 0;
@@ -777,6 +820,14 @@ function decodePngPredictor(
         : filter === 3 ? Math.floor((left + up) / 2) : paeth(left, up, upLeft);
       output[rowOffset + column] = (encoded + prediction) & 0xff;
     }
+  }
+  if (finalRowBytes > 1) {
+    onDiagnostic?.(Object.freeze({
+      code: "filter.png-predictor-partial-row",
+      severity: "warning" as const,
+      message: "PNG prediction ended with a partial row; its available samples were retained without padding.",
+      details: Object.freeze({ rowBytes, finalRowBytes: finalRowBytes - 1, decodedBytes: outputLength })
+    }));
   }
   return output;
 }

@@ -131,6 +131,7 @@ try {
   await testLimits(document, localDictionary);
   await testDefinitionCountLimit(document);
   await testStructuralValidation(document, localDictionary);
+  await testReversedFontBBoxRecovery(document, localDictionary);
   await testToUnicodeSurrogateRecovery(document, localDictionary);
 
   assert.throws(
@@ -161,6 +162,21 @@ try {
 }
 
 console.log("native Type3 preparation tests passed");
+
+async function testReversedFontBBoxRecovery(document, validDictionary) {
+  const dictionary = new Map(validDictionary);
+  dictionary.set("FontBBox", [700, 800, -10, -20]);
+  const registry = new NativePdfType3Registry(document);
+  const font = await registry.prepareFont(dictionary);
+  assert.equal(registry.size, 0, "normalizing cache bounds leaves glyph definitions lazy");
+  assert.deepEqual(font.fontBBox, [-10, -20, 700, 800]);
+  assert.deepEqual(font.fontMatrix, [0.001, 0, 0, 0.001, 0, 0]);
+  assert.equal(font.diagnostics[0].code, "font.type3-bbox-normalized");
+  const glyph = await font.resolveGlyph(65);
+  assert.deepEqual(glyph.charProc.decodedBytes, coloredContent);
+  assert.equal(glyph.width, 500);
+  assert.equal(glyph.charProcName, "Colored");
+}
 
 async function testLimits(document, localDictionary) {
   const decodedLimited = new NativePdfType3Registry(document, {

@@ -11,7 +11,7 @@ const hooks = registerHooks({
 });
 
 const { NativeCffFont } = await import("../src/pdf/nativeCff.ts");
-const { parseNativePdfFont } = await import("../src/pdf/nativeFont.ts");
+const { NativeSfntFont, parseNativePdfFont } = await import("../src/pdf/nativeFont.ts");
 const { PdfError } = await import("../src/pdf/nativeTypes.ts");
 
 function testCffStructureAndType2Outlines() {
@@ -175,6 +175,103 @@ async function testPdfFontSelectionIsSeparateFromToUnicode() {
   assert.equal(mapped.unicode, "Ω", "ToUnicode controls text semantics only");
   assert.equal(mapped.width, 600);
   assert.deepEqual(font.getGlyphOutline(mapped.glyphId).bounds, [100, 0, 350, 200]);
+}
+
+async function testOpenTypeCffOutlines() {
+  const bytes = wrapOpenTypeCff(buildCffFixture());
+  const sfnt = NativeSfntFont.parse(bytes);
+  assert.equal(sfnt.outlineFormat, "cff");
+  assert.equal(sfnt.unitsPerEm, 2000);
+  assert.equal(sfnt.mapCodePoint(65), 1);
+  const outline = sfnt.getGlyphOutline(1);
+  assert.deepEqual(outline.bounds, [200, 0, 700, 400], "CFF outlines scale to the sfnt's unitsPerEm");
+  assert.deepEqual(outline.commands[0], { kind: "move", x: 200, y: 0 });
+  assert.deepEqual(outline.commands[3], {
+    kind: "cubic", control1X: 500, control1Y: 200, control2X: 600, control2Y: 400, x: 700, y: 400
+  });
+  assert.equal(outline.advanceWidth, 1500, "OpenType hmtx metrics override CFF charstring widths");
+  assert.equal(outline.leftSideBearing, 20);
+  assert.strictEqual(sfnt.getGlyphOutline(1), outline);
+
+  const name = value => ({ kind: "name", value });
+  const embedded = { kind: "stream", dictionary: new Map([["Subtype", name("OpenType")]]), bytes };
+  const dictionary = new Map([
+    ["Subtype", name("Type1")], ["BaseFont", name("FixtureOpenTypeCff")],
+    ["Encoding", name("WinAnsiEncoding")],
+    ["FontDescriptor", new Map([["Flags", 32], ["FontFile3", embedded]])],
+    ["ToUnicode", { kind: "stream", dictionary: new Map(), bytes: new TextEncoder().encode(`
+      1 begincodespacerange <00> <ff> endcodespacerange
+      1 beginbfchar <41> <03a9> endbfchar
+    `) }]
+  ]);
+  const resolver = {
+    async resolveValue(value) { return value; },
+    async decodeStream(value) { return value.bytes; }
+  };
+  const font = await parseNativePdfFont(dictionary, resolver);
+  const mapped = font.decode(Uint8Array.of(65));
+  assert.equal(mapped.unicode, "Ω");
+  assert.equal(mapped.glyphId, 1, "PDF Encoding selects the sfnt glyph independently from ToUnicode");
+  assert.equal(mapped.width, 750);
+  assert.deepEqual(font.getGlyphOutline(mapped.glyphId).commands, outline.commands);
+
+  const limited = NativeSfntFont.parse(bytes, 0, { maxCffBytes: 1 });
+  expectPdf(() => limited.getGlyphOutline(1), "resource-limit", /byte limit/i);
+  const pdfLimited = await parseNativePdfFont(dictionary, resolver, { parserLimits: { maxCffBytes: 1 } });
+  expectPdf(() => pdfLimited.getGlyphOutline(1), "resource-limit", /byte limit/i);
+  const mismatched = NativeSfntFont.parse(wrapOpenTypeCff(buildCffFixture(), 4));
+  expectPdf(() => mismatched.getGlyphOutline(1), "unsupported-font", /count disagrees/i);
+}
+
+function wrapOpenTypeCff(cffBytes, numGlyphs = 5) {
+  const head = new Uint8Array(54);
+  const headView = new DataView(head.buffer);
+  headView.setUint16(18, 2000);
+  headView.setInt16(36, 0);
+  headView.setInt16(38, -40);
+  headView.setInt16(40, 1420);
+  headView.setInt16(42, 1160);
+  const maxp = new Uint8Array(6);
+  const maxpView = new DataView(maxp.buffer);
+  maxpView.setUint32(0, 0x00005000);
+  maxpView.setUint16(4, numGlyphs);
+  const hhea = new Uint8Array(36);
+  new DataView(hhea.buffer).setUint16(34, numGlyphs);
+  const hmtx = new Uint8Array(numGlyphs * 4);
+  const hmtxView = new DataView(hmtx.buffer);
+  for (let glyph = 0; glyph < numGlyphs; glyph++) {
+    hmtxView.setUint16(glyph * 4, 1500);
+    hmtxView.setInt16(glyph * 4 + 2, 20);
+  }
+  const cmap = new Uint8Array(40);
+  const cmapView = new DataView(cmap.buffer);
+  cmapView.setUint16(2, 1);
+  cmapView.setUint16(4, 3);
+  cmapView.setUint16(6, 10);
+  cmapView.setUint32(8, 12);
+  cmapView.setUint16(12, 12);
+  cmapView.setUint32(16, 28);
+  cmapView.setUint32(24, 1);
+  cmapView.setUint32(28, 65);
+  cmapView.setUint32(32, 65);
+  cmapView.setUint32(36, 1);
+  const tables = [["head", head], ["maxp", maxp], ["hhea", hhea], ["hmtx", hmtx], ["cmap", cmap], ["CFF ", cffBytes]];
+  const directorySize = 12 + tables.length * 16;
+  const totalSize = directorySize + tables.reduce((sum, [, table]) => sum + Math.ceil(table.length / 4) * 4, 0);
+  const bytes = new Uint8Array(totalSize);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, 0x4f54544f);
+  view.setUint16(4, tables.length);
+  let offset = directorySize;
+  tables.forEach(([tag, table], index) => {
+    const record = 12 + index * 16;
+    bytes.set(new TextEncoder().encode(tag), record);
+    view.setUint32(record + 8, offset);
+    view.setUint32(record + 12, table.length);
+    bytes.set(table, offset);
+    offset += Math.ceil(table.length / 4) * 4;
+  });
+  return bytes;
 }
 
 function testMalformedProgramsAndLimits() {
@@ -611,6 +708,7 @@ testBaseFontBlendIsNotMultipleMaster();
 testSyntheticBaseRemainsUnsupported();
 testLatin1StringsAreAccepted();
 await testPdfFontSelectionIsSeparateFromToUnicode();
+await testOpenTypeCffOutlines();
 await testCidCffOutlinesAndPdfSelection();
 testMalformedProgramsAndLimits();
 testDeprecatedPdfDotsectionCompatibility();

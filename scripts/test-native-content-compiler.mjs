@@ -41,6 +41,7 @@ await testPrivatePaintSourceIdentityRange();
 await testCompilationContexts();
 await testVectorSceneOutput();
 await testPathsTransformsAndCurves();
+await testPathsAcrossGraphicsStatesAndEof();
 await testClippingAndDashes();
 await testDeviceColorsAndMetadataCounts();
 await testTextAndMarkedContentSemantics();
@@ -616,9 +617,6 @@ async function testPathsTransformsAndCurves() {
   assert.equal(transformed.maxHalfWidth, 2.5);
   assert.equal(transformed.operatorCount, 7);
 
-  await expectUnsupported("0 0 m q 1 0 0 1 1 1 cm Q 1 1 l S", "q");
-  await expectUnsupported("0 0 m 1 0 0 1 1 1 cm 1 1 l S", "cm");
-
   // The compact builder keeps the pre-close shorthand-control current point
   // after h in its normalized path representation.
   const shorthand = await compile(
@@ -650,6 +648,59 @@ async function testPathsTransformsAndCurves() {
   });
   assert.equal(zeroRound.sourceSegmentCount, 1);
   assert.equal(zeroRound.segmentCount, 1);
+}
+
+async function testPathsAcrossGraphicsStatesAndEof() {
+  const options = { enableSegmentMerge: false, enableInvisibleCull: false };
+  for (const [content, expected, matrix] of [
+    ["0 0 m q 1 0 0 1 1 1 cm 1 1 l Q 4 4 l S", "0 0 m 2 2 l 4 4 l S"],
+    ["q 2 0 0 3 5 7 cm 0 0 m 1 1 l Q 9 10 l S", "5 7 m 7 10 l 9 10 l S"],
+    ["0 0 m q 2 w 1 1 l Q 2 2 l S", "0 0 m 1 1 l 2 2 l S"],
+    ["0 0 m 1 0 0 1 1 1 cm 1 1 l S", "-1 -1 m 1 1 l S", [1, 0, 0, 1, 1, 1]],
+    ["q 2 0 0 2 4 6 cm 0 0 m 1 0 l h Q 5 8 8 8 v S",
+      "4 6 m 6 6 l h 5 8 8 8 v S"]
+  ]) {
+    const actual = await compile(content, options);
+    const explicit = await compile(expected, { ...options, ...(matrix ? { pageMatrix: matrix } : {}) });
+    assertSceneGeometryEqual(actual, { ...explicit, operatorCount: actual.operatorCount });
+  }
+  const display = await compile("q 2 0 0 3 5 7 cm 0 0 m 1 1 l Q 9 10 l S", {
+    ...options, output: "display-program"
+  });
+  assert.deepEqual([...display.pagePaths[0].data], [0, 5, 7, 1, 7, 10, 1, 9, 10]);
+  assert.deepEqual(display.pagePaths[0].transform, [1, 0, 0, 1, 0, 0]);
+  const curved = await compile("q 2 0 0 3 5 7 cm 0 0 m 1 0 2 1 3 1 c h Q f", {
+    ...options, output: "display-program"
+  });
+  assert.deepEqual([...curved.pagePaths[0].data], [0, 5, 7, 2, 7, 7, 9, 10, 11, 10, 4]);
+  assert.deepEqual(curved.pagePaths[0].transform, [1, 0, 0, 1, 0, 0]);
+  for (const [paint, resources] of [
+    ["/Resource Do", { imageXObjects: new Map([["Resource", 0]]) }],
+    ["/Resource Do", { formXObjects: new Map([["Resource", 0]]) }],
+    ["/Resource sh", { shadings: new Map([["Resource", 0]]) }]
+  ]) {
+    const invoked = await compile(`0 0 m ${paint} 10 0 l S`, {
+      ...options, ...resources, output: "display-program"
+    });
+    assert.deepEqual([...invoked.endpoints], [0, 0, 10, 0],
+      `${paint} leaves the caller's current path intact`);
+    assert.equal(invoked.paintRuns.length, 6, "the resource paints before the pending path");
+  }
+  const before = encoder.encode("0 0 m ");
+  const after = encoder.encode(" 10 0 l S");
+  const inline = await compile([
+    { kind: "content", bytes: before, sourceOffset: 0, sourceLength: before.length },
+    { kind: "image", imageIndex: 0, sourceOffset: before.length, sourceLength: 12 },
+    { kind: "content", bytes: after, sourceOffset: before.length + 12, sourceLength: after.length }
+  ], { ...options, output: "display-program" });
+  assert.deepEqual([...inline.endpoints], [0, 0, 10, 0]);
+  assert.equal(inline.paintRuns[0], DENSE_PDF_PAINT_RUN_IMAGE);
+  assert.equal(inline.paintRuns.length, 6);
+  for (const tail of ["0 0 m", "0 0 1 1 re", "0 0 1 1 re W", "0 0 1 1 re W* q"]) {
+    const painted = await compile(`5 5 m 6 6 l S ${tail}`, options);
+    const expected = await compile("5 5 m 6 6 l S", options);
+    assertSceneGeometryEqual(painted, { ...expected, operatorCount: painted.operatorCount });
+  }
 }
 
 async function testClippingAndDashes() {
@@ -1009,7 +1060,6 @@ async function testUnsupportedAndMalformedContent() {
   for (const content of [
     "Q",
     "0 m",
-    "0 0 m",
     "[1 2 d",
     "<< /MCID >> /Span BDC",
     "(unterminated",

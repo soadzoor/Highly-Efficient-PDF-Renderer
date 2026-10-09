@@ -2037,7 +2037,6 @@ class DenseContentCompiler {
     if (this.containers.length > 0 || this.operandCount > 0) {
       throw new DensePdfSyntaxError("Inline image interrupts a pending content object or operand list.");
     }
-    this.rejectTransformChangeInsidePath("BI");
     this.operatorCount += 1;
     this.operatorSourceOffset = segment.sourceOffset;
     this.operatorSourceLength = segment.sourceLength;
@@ -2070,9 +2069,9 @@ class DenseContentCompiler {
     if (this.operandCount > 0) {
       throw new DensePdfSyntaxError("Dangling operands at the end of PDF content.");
     }
-    if (this.path.length > 0 || this.pendingClipRule !== null) {
-      throw new DensePdfSyntaxError("Unpainted path at the end of PDF content.");
-    }
+    // Path construction and W/W* do not paint. An unfinished path expires
+    // with this content program, just like an unmatched graphics-state save.
+    this.clearPaintPathState();
     if (this.pendingTextClipRange !== null) {
       throw new DensePdfSyntaxError("PDF content ends inside an unterminated text object.");
     }
@@ -2472,25 +2471,27 @@ class DenseContentCompiler {
         return;
       case "q":
         this.requireArgs(operator, args, 0);
-        this.rejectTransformChangeInsidePath(operator);
+        // The current path is not part of the saved graphics state.
         this.stateStack.push(cloneState(this.state));
         return;
       case "Q": {
         this.requireArgs(operator, args, 0);
-        this.rejectTransformChangeInsidePath(operator);
         const restored = this.stateStack.pop();
         if (!restored) {
           throw new DensePdfSyntaxError("Unbalanced Q operator in PDF content.");
         }
+        this.rebaseCurrentPath(restored.matrix, operator);
         this.state = restored;
         return;
       }
-      case "cm":
+      case "cm": {
         this.requireArgs(operator, args, 6);
-        this.rejectTransformChangeInsidePath(operator);
-        this.state.matrix = multiplyMatrices(this.state.matrix, matrixFromArgs(args));
+        const matrix = multiplyMatrices(this.state.matrix, matrixFromArgs(args));
+        this.rebaseCurrentPath(matrix, operator);
+        this.state.matrix = matrix;
         this.state.matrixScale = matrixScale(this.state.matrix);
         return;
+      }
       case "w":
         this.requireArgs(operator, args, 1);
         {
@@ -2797,7 +2798,6 @@ class DenseContentCompiler {
       }
       case "Do": {
         this.requireArgs(operator, args, 1);
-        this.rejectTransformChangeInsidePath(operator);
         const resourceName = nameArg(args, 0);
         const imageIndex = this.options.imageXObjects?.get(resourceName);
         if (imageIndex !== undefined) {
@@ -2849,7 +2849,6 @@ class DenseContentCompiler {
       }
       case "sh": {
         this.requireArgs(operator, args, 1);
-        this.rejectTransformChangeInsidePath(operator);
         const resourceName = nameArg(args, 0);
         const gradientIndex = this.options.shadings?.get(resourceName);
         if (gradientIndex === undefined) {
@@ -4841,13 +4840,25 @@ class DenseContentCompiler {
     }
   }
 
-  private rejectTransformChangeInsidePath(operator: string): void {
-    if (this.path.length > 0) {
+  private rebaseCurrentPath(matrix: DensePdfMatrix, operator: string): void {
+    if (this.path.length === 0 || matrix.every((value, index) => value === this.state.matrix[index])) return;
+    // Coordinates enter the PDF current path under the CTM at construction
+    // time. Keep their device positions when later operators change the CTM;
+    // the eventual paint still uses its own graphics state for stroke widths.
+    const determinant = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+    if (determinant === 0 || !Number.isFinite(determinant)) {
       throw new DensePdfUnsupportedError(
-        `Operator ${operator} changes graphics transforms inside an active path.`,
+        `Operator ${operator} changes to a singular graphics transform inside an active path.`,
         operator
       );
     }
+    const inverse: DensePdfMatrix = [
+      matrix[3] / determinant, -matrix[1] / determinant,
+      -matrix[2] / determinant, matrix[0] / determinant,
+      (matrix[2] * matrix[5] - matrix[3] * matrix[4]) / determinant,
+      (matrix[1] * matrix[4] - matrix[0] * matrix[5]) / determinant
+    ];
+    this.path.transform(multiplyMatrices(inverse, this.state.matrix));
   }
 }
 
@@ -5334,6 +5345,20 @@ class ReusablePathBuilder {
 
   rawData(): Float32Array {
     return this.data;
+  }
+
+  transform(matrix: DensePdfMatrix): void {
+    for (let offset = 0; offset < this.used;) {
+      const verb = this.data[offset++];
+      const count = verb === DRAW_CURVE_TO ? 6 : verb === DRAW_CLOSE ? 0 : 2;
+      for (let end = offset + count; offset < end; offset += 2) {
+        const [x, y] = applyMatrix(matrix, this.data[offset], this.data[offset + 1]);
+        this.data[offset] = x;
+        this.data[offset + 1] = y;
+      }
+    }
+    [this.currentX, this.currentY] = applyMatrix(matrix, this.currentX, this.currentY);
+    [this.subpathStartX, this.subpathStartY] = applyMatrix(matrix, this.subpathStartX, this.subpathStartY);
   }
 
   isSingleLine(): boolean {

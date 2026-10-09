@@ -517,6 +517,8 @@ export class NativePdfImageRegistry {
             ccittParameters,
             {
               signal,
+              recoverMissingEndOfBlock: true,
+              onDiagnostic: this.onDiagnostic,
               limits: imageCcittLimits(this.document, encodedSize.columns, encodedSize.rows)
             }
           );
@@ -1780,14 +1782,9 @@ function validateImageSampleFilterConsistency(
   const parameters = decodeParameters[decodeParameters.length - 1];
   const predictor = parameters?.get("Predictor") ?? 1;
   if (Number.isSafeInteger(predictor) && (predictor as number) !== 1) {
-    const predictorBits = parameters?.get("BitsPerComponent") ?? 8;
-    if (Number.isSafeInteger(predictorBits) && predictorBits !== bitsPerComponent) {
-      throw new PdfError(
-        "unsupported-image",
-        "Image BitsPerComponent disagrees with its terminal filter predictor.",
-        { details: { bitsPerComponent, predictorBits: predictorBits as number } }
-      );
-    }
+    // Predictor precision describes the byte transform, independently of the
+    // image samples. For example, a 1-bit mask may predict packed bitmap bytes
+    // using the default 8-bit precision and blocks spanning several scanlines.
     return;
   }
   if ((terminalFilter === "RunLengthDecode" || terminalFilter === "RL") && bitsPerComponent !== 8) {

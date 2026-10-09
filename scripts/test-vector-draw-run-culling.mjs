@@ -133,6 +133,7 @@ try {
     for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
       const renderer = Object.create(Renderer.prototype);
       Object.assign(renderer, { scene: merged, vectorLodMode: "force", orderedInstanceBuffer: { destroy() {} },
+        vectorOverrideColor: [0, 0, 0], vectorOverrideOpacity: 0,
         gpuDevice: { createBuffer: () => ({ destroy() {} }) },
         uploadSegments() {}, uploadVectorLodLevels() {}, uploadVectorClips() {}, destroyVectorLodResources() {} });
       const rebuild = Renderer === WebGlFloorplanRenderer ? "rebuildVectorLod" : "prepareVectorLod";

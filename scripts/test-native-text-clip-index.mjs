@@ -57,6 +57,23 @@ try {
       // Only a tiny synthetic in-memory archive, never corpus HEP regeneration.
       const hep = await buildHep(scene, { encodeRasterImages: false, compression: "store" });
       checkIndex(await loadSceneFromHep(await hep.arrayBuffer()));
+      if (rule === "concave") {
+        // An empty clip is a valid no-paint region, including narrow rectangles
+        // whose endpoints collapse together when converted to Float32.
+        for (const rectangle of [[2, 3, 2, 9], [2, 3, 9, 3],
+          [2, 3, 2 + 1e-8, 9]]) {
+          const instanceB = scene.textInstanceB.slice();
+          for (let index = 3; index < scene.textInstanceCount * 4; index += 4) instanceB[index] = 1;
+          const clipped = { ...scene, textInstanceB: instanceB, textClipRects: Float32Array.from(rectangle) };
+          const archive = await buildHep(clipped, { encodeRasterImages: false, compression: "store" });
+          const restored = await loadSceneFromHep(await archive.arrayBuffer());
+          assert.deepEqual(restored.textClipRects, clipped.textClipRects);
+          assert.deepEqual(restored.textInstanceB, clipped.textInstanceB);
+        }
+        await assert.rejects(buildHep({ ...scene, textClipRects: Float32Array.of(9, 3, 2, 9) }, {
+          encodeRasterImages: false, compression: "store"
+        }), /Text clip rectangle is reversed/);
+      }
       assert.deepEqual((await session.compileVectorPage(0)).textIndex, scene.textIndex, "clip data is immutable across compiles");
     } finally {
       await session.close();

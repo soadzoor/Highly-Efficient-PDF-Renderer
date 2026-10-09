@@ -32,13 +32,13 @@ try {
     { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << ${resources} >> /Contents 4 0 R >>` },
     { number: 4, body: tinyPdfStream("", content) }, ...extra
   ] });
-  const compile = async bytes => {
+  const compile = async (bytes, options = {}) => {
     const session = await openPdf({ kind: "bytes", bytes });
     try {
       const page = await session.compilePage(0, { retainOptionalContent: true });
       const patternCellKinds = validatePatternCellPages(page);
       const original = structuredClone(page);
-      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal });
+      const scene = await lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal, ...options });
       assert.deepEqual(page, original, "retained lowering leaves all source stores unchanged");
       validateVectorDrawRuns(scene);
       const { validateScenePaintGraph } = await import("../src/scenePaintGraph.ts");
@@ -55,6 +55,35 @@ try {
     assert.deepEqual(getScenePrimitive(scene, { kind: "fill", index: 0 }).color, [0, 0, 1]);
     assert.deepEqual(getScenePrimitive(scene, { kind: "fill", index: 0 }).bounds, { minX: 3, minY: 4, maxX: 23, maxY: 24 });
     assert.equal(scene.rasterLayers.length, 0);
+  }
+  {
+    // Rounded CAD CTMs should retain compact round-pen centerlines when the
+    // transformed pen differs by less than the native curve error tolerance.
+    // Shear matters even when the two matrix columns have equal lengths.
+    for (const [matrix, packed, cap = 1] of [
+      ["1.00004 0 0 1", true], ["1 .005 .005 1", true],
+      ["1 .1 .1 1", false], ["1.00004 0 0 1", false, 2]
+    ]) {
+      const diagnostics = [];
+      const { page, scene } = await compile(fixture(
+        `q ${matrix} 10 10 cm 2 w ${cap} J 1 j 0 0 m 10 0 l 10 10 l S 20 0 m 30 0 l 30 10 l S Q`, ""
+      ), { onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+      assert.equal(scene.fillPathCount, packed ? 0 : 2);
+      assert.equal(scene.segmentCount > 0, packed);
+      assert.equal(diagnostics.filter(diagnostic => diagnostic.code === "stroke-pen-approximation").length,
+        packed ? 1 : 0);
+      if (packed) {
+        const half = scene.styles[0];
+        assert.ok(half >= 1 && half <= 1.0001, "the circular pen uses the midpoint of the singular radii");
+        for (let offset = 0; offset < scene.segmentCount * 4; offset += 4) {
+          assert.ok(scene.primitiveBounds[offset] <= Math.min(scene.endpoints[offset], scene.primitiveMeta[offset]) - half + 1e-5);
+          assert.ok(scene.primitiveBounds[offset + 2] >= Math.max(scene.endpoints[offset], scene.primitiveMeta[offset]) + half - 1e-5);
+        }
+        await assert.rejects(lowerRetainedPageToVectorScene(page, {
+          signal: new AbortController().signal, maxCoordinates: 1
+        }), error => error.code === "resource-limit", "packed strokes still honor caller geometry budgets");
+      }
+    }
   }
   {
     const { scene, patternCellKinds } = await compile(fixture("/Pattern cs /P scn 0 0 20 20 re f", "/Pattern << /P 5 0 R >>", [

@@ -20,6 +20,7 @@ const {
 
 function optionalContentFixture({
   defaultConfiguration = "/D << /BaseState /ON /OFF [12 0 R] >>",
+  catalogGroups = "/OCGs [11 0 R 12 0 R]",
   pageProperties = "",
   extraObjects = []
 } = {}) {
@@ -31,7 +32,7 @@ function optionalContentFixture({
       { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /OCProperties 10 0 R >>" },
       { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
       { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] ${resources} >>` },
-      { number: 10, body: `<< /OCGs [11 0 R 12 0 R] ${defaultConfiguration} >>` },
+      { number: 10, body: `<< ${catalogGroups} ${defaultConfiguration} >>` },
       { number: 11, body: "<< /Type /OCG /Name (Visible Layer) >>" },
       { number: 12, body: "<< /Type /OCG /Name <FEFF00480069006400640065006E0020004C0061007900650072> >>" },
       ...extraObjects
@@ -186,6 +187,29 @@ await withFixture(
     );
   }
 );
+
+for (const catalogGroups of ["", "/OCGs null"]) {
+  const diagnostics = [];
+  await withFixture(optionalContentFixture({
+    catalogGroups,
+    defaultConfiguration: "/D << /Order [] >>",
+    pageProperties: "/Recovered 11 0 R"
+  }), { onDiagnostic: diagnostic => diagnostics.push(diagnostic) }, async ({ document, registry }) => {
+    assert.equal(registry.groupCount, 0, "an empty layer catalog must open successfully");
+    const [property] = await registry.resolvePageProperties(document.getPage(0).resources, ["Recovered"]);
+    assert.equal(property.defaultVisible, true);
+    assert.equal(registry.groupCount, 1, "content groups are still recovered lazily");
+    assert.deepEqual(diagnostics.map(diagnostic => diagnostic.code), [
+      NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroups,
+      NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup
+    ]);
+    assert.deepEqual(registry.getDiagnostics(), diagnostics);
+  });
+}
+
+await assert.rejects(withFixture(optionalContentFixture({
+  catalogGroups: "/OCGs 42", defaultConfiguration: "/D << >>"
+}), {}, async () => undefined), hasPdfCode("invalid-object", /OCGs entry is not an array/));
 
 await withFixture(
   optionalContentFixture({ defaultConfiguration: "/D << /BaseState /OFF /ON [11 0 R] >>" }),

@@ -16,6 +16,7 @@ import type { OptionalContentCondition, OptionalContentOrderNode, SceneOptionalC
 export const NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES = Object.freeze({
   HiddenDefault: "optional-content.hidden",
   MissingCatalogGroup: "optional-content.missing-catalog-group",
+  MissingCatalogGroups: "optional-content.missing-catalog-groups",
   UnresolvedOptionalProperty: "optional-content.unresolved-property",
   UnresolvedMetadataProperty: "marked-content.unresolved-property"
 } as const);
@@ -199,7 +200,19 @@ export class NativeOptionalContentRegistry {
       signal,
       "The catalog /OCProperties entry"
     );
-    const rawGroups = await this.resolver.resolveValue(properties.get("OCGs"), signal);
+    let rawGroups = await this.resolver.resolveValue(properties.get("OCGs"), signal);
+    if (rawGroups === undefined || rawGroups === null) {
+      // Some producers leave an empty /OCProperties dictionary after removing
+      // its layers. Any groups still used by page content are recovered lazily.
+      rawGroups = [];
+      const diagnostic: PdfDiagnostic = Object.freeze({
+        code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroups,
+        severity: "warning",
+        message: "The catalog /OCProperties has no /OCGs array; groups used by content will be recovered as visible and layer visibility may differ."
+      });
+      this.diagnostics.push(diagnostic);
+      this.onDiagnostic?.(diagnostic);
+    }
     if (!Array.isArray(rawGroups)) {
       throw invalidOptionalContent("The catalog /OCProperties /OCGs entry is not an array.");
     }

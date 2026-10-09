@@ -212,10 +212,17 @@ try {
     registry.resolvePageExtGState(0, "BadColorSpace"),
     hasPdfError("unsupported-content", "soft-mask-group-color-space-unsupported")
   );
-  await assert.rejects(
-    registry.resolvePageExtGState(0, "BadUnknown"),
-    hasPdfError("unsupported-content", "extgstate-entry-unsupported")
-  );
+  const unknownIndex = await registry.resolvePageExtGState(0, "BadUnknown");
+  assert.equal(registry.describe(unknownIndex).nonstrokingAlpha, 0.4,
+    "unknown metadata must retain recognized paint entries without resolving its values");
+  const lowercaseIndex = await registry.resolvePageExtGState(0, "LowercaseType");
+  assert.equal(registry.describe(lowercaseIndex).effectiveBlendMode, "Darken");
+  assert.equal(registry.describe(lowercaseIndex).nonstrokingAlpha, 0.6);
+  await registry.resolvePageExtGState(0, "LowercaseType");
+  assert.deepEqual(registry.getDiagnostics()
+    .filter(diagnostic => diagnostic.code === "extgstate.unknown-entry-ignored")
+    .map(diagnostic => diagnostic.details.entry), ["Foo", "type"],
+    "repeated graphics-state resolution must not duplicate recovery diagnostics");
   await assert.rejects(
     registry.resolvePageExtGState(0, "EmptyBlend"),
     hasPdfError("invalid-object", "extgstate-blend-mode-invalid")
@@ -279,7 +286,7 @@ function fixture() {
     "/BadMaskSubtype 44 0 R /BadGroup 45 0 R /BadBackdrop 46 0 R",
     "/BadMaskTransfer 47 0 R /BadColorSpace 48 0 R /BadUnknown 49 0 R",
     "/EmptyBlend 50 0 R /BadIntent 51 0 R /BadDash 52 0 R /FallbackBlend 54 0 R",
-    "/BadHalftone 55 0 R /BadBlackGeneration 56 0 R /BadUndercolor 57 0 R"
+    "/BadHalftone 55 0 R /BadBlackGeneration 56 0 R /BadUndercolor 57 0 R /LowercaseType 58 0 R"
   ].join(" ");
   return writeTinyPdf({
     objects: [
@@ -349,7 +356,7 @@ function fixture() {
       { number: 46, body: "<< /SMask << /S /Luminosity /G 31 0 R /BC [0 0] >> >>" },
       { number: 47, body: "<< /SMask << /S /Alpha /G 31 0 R /TR 53 0 R >> >>" },
       { number: 48, body: "<< /SMask << /S /Luminosity /G 35 0 R >> >>" },
-      { number: 49, body: "<< /Foo 1 >>" },
+      { number: 49, body: "<< /Foo 99 0 R /ca .4 >>" },
       { number: 50, body: "<< /BM [] >>" },
       { number: 51, body: "<< /RI /Bogus >>" },
       { number: 52, body: "<< /D [[0 0] 0] >>" },
@@ -361,6 +368,7 @@ function fixture() {
       { number: 55, body: "<< /HT /Default >>" },
       { number: 56, body: "<< /BG 32 0 R >>" },
       { number: 57, body: "<< /UCR 32 0 R >>" },
+      { number: 58, body: "<< /type /ExtGState /BM /Darken /ca .6 >>" },
       { number: 80, body: "81 0 R" },
       { number: 81, body: "<< /ca .1 >>" },
       { number: 82, body: "83 0 R" },

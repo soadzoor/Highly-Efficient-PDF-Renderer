@@ -132,6 +132,15 @@ try {
       ]),
       [["image.ccitt-size-adjusted", 1728, 1], ["image.ccitt-size-adjusted", 8, 1]]
     );
+    sizeDiagnostics.length = 0;
+    for (const objectNumber of [41, 42, 43]) {
+      assert.deepEqual([...adjusted.describe(await adjusted.add(ref(objectNumber))).data], rgbaBits(Array(8).fill(1)));
+    }
+    assert.deepEqual(sizeDiagnostics.map(diagnostic => diagnostic.code), [
+      "filter.ccitt-end-of-block-fill",
+      "filter.ccitt-end-of-block-recovered",
+      "filter.ccitt-end-of-block-recovered"
+    ]);
 
     const extension = images.describe(await images.add(ref(22)));
     assert.equal(extension.format, HEPR_IMAGE_FORMAT.Ccitt);
@@ -379,7 +388,15 @@ function ccittImageFixture() {
         pattern
       )
     },
-    { number: 40, body: "<< /K 0 /Columns 8 /Rows 1 /EndOfBlock false >>" }
+    { number: 40, body: "<< /K 0 /Columns 8 /Rows 1 /EndOfBlock false >>" },
+    ...["1 00000 " + eofb, "1 " + "0".repeat(69), "1"].map((encoded, index) => ({
+      number: 41 + index,
+      body: image(
+        "/Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode " +
+        "/DecodeParms << /K -1 /Columns 8 >>",
+        packBits(encoded)
+      )
+    }))
   ] });
 }
 

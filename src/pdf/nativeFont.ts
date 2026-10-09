@@ -236,6 +236,7 @@ interface ParsedCMap {
   readonly codeSpaces: readonly NativeCodeSpaceRange[];
   readonly unicode: ReadonlyMap<string, string>;
   readonly invalidUnicodeMappingCount: number;
+  readonly overriddenCidMappingCount: number;
   readonly cids: ReadonlyMap<string, number>;
   /** Aggregate retained program bytes across the /UseCMap chain. */
   readonly sourceByteCount: number;
@@ -353,6 +354,7 @@ export function parseToUnicodeCMap(
   readonly codeSpaces: readonly NativeCodeSpaceRange[];
   readonly mappings: ReadonlyMap<string, string>;
   readonly diagnostics: readonly PdfDiagnostic[];
+  readonly discardedNonUnicodeMappings: boolean;
   decode(bytes: Uint8Array, offset?: number): { code: number; byteLength: number; unicode: string | null };
 } {
   const defaults = DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS;
@@ -379,25 +381,7 @@ export function parseToUnicodeCMap(
       "maxCodeSpaceRanges"
     )
   });
-  if (parsed.cids.size > 0 || parsed.cidRangeMappingCount > 0) {
-    throw unsupportedFont("A ToUnicode CMap cannot contain CID mappings.");
-  }
-  if (parsed.notdefRangeMappingCount > 0) {
-    throw unsupportedFont("A ToUnicode CMap cannot contain notdef mappings.");
-  }
-  return Object.freeze({
-    codeSpaces: parsed.codeSpaces,
-    mappings: parsed.unicode,
-    diagnostics: toUnicodeDiagnostics(parsed.invalidUnicodeMappingCount),
-    decode(source: Uint8Array, offset = 0) {
-      const entry = decodeCMapCode(source, offset, parsed.codeSpaces, parsed.unicode);
-      return {
-        code: entry.code,
-        byteLength: entry.byteLength,
-        unicode: parsed.unicode.get(cmapKey(entry.code, entry.byteLength)) ?? null
-      };
-    }
-  });
+  return prepareToUnicodeCMap(parsed);
 }
 
 /** Parse a simple or composite PDF font dictionary and its lazy embedded program. */
@@ -704,7 +688,11 @@ async function parseCompositeFont(
     parserLimits,
     signal
   );
-  validateEncodingSystemInfo(encoding, descendantSystemInfo);
+  const encodingDiagnostics = Object.freeze([
+    ...validateEncodingSystemInfo(encoding, descendantSystemInfo),
+    ...cidOverrideDiagnostics(encoding.overriddenCidMappingCount)
+  ]);
+  reportFontDiagnostics(encodingDiagnostics, options);
   const toUnicode = await readToUnicode(
     dictionary.get("ToUnicode"),
     resolver,
@@ -712,7 +700,9 @@ async function parseCompositeFont(
     signal
   );
   reportFontDiagnostics(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
-  const cidUnicode = toUnicode === null
+  const useCidUnicodeFallback = toUnicode === null ||
+    (toUnicode.discardedNonUnicodeMappings && toUnicode.mappings.size === 0);
+  const cidUnicode = useCidUnicodeFallback
     ? await resolveCidUnicodeFallback(descendantSystemInfo, options, parserLimits.maxCMapMappings)
     : Object.freeze({ shard: null, diagnostics: EMPTY_DIAGNOSTICS });
   const descriptor = await parseFontDescriptor(descendant.get("FontDescriptor"), resolver, signal);
@@ -783,6 +773,7 @@ async function parseCompositeFont(
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...encodingDiagnostics,
       ...cidUnicode.diagnostics
     ]),
     (bytes, offset) => {
@@ -797,9 +788,9 @@ async function parseCompositeFont(
         (encoding.identityBase ? entry.code : 0);
       const rawGlyphId = embeddedCff ? embeddedCff.glyphIdForCid(cid) : cidToGid ? cidToGid(cid) : cid;
       const glyphId = sfnt && rawGlyphId >= sfnt.numGlyphs ? 0 : rawGlyphId;
-      const unicode = toUnicode === null
+      const unicode = useCidUnicodeFallback
         ? cidUnicode.shard?.unicodeForCid(cid) ?? null
-        : toUnicode.mappings.get(key) ?? null;
+        : toUnicode!.mappings.get(key) ?? null;
       const width = widths.get(cid) ?? defaultWidth;
       const metric = encoding.writingMode === 1
         ? verticalMetrics.get(cid) ?? {
@@ -920,12 +911,29 @@ async function readCidSystemInfoString(
 function validateEncodingSystemInfo(
   encoding: ParsedCMap,
   descendant: Readonly<NativeCidSystemInfo>
-): void {
+): readonly PdfDiagnostic[] {
   // Identity CMaps are collection-neutral by definition and are routinely
   // paired with Adobe-Japan1 and the other registered collections.
   const required = encoding.systemInfo;
-  if (encoding.identityBase && (required === null || required.ordering === "Identity")) return;
-  if (required === null) return;
+  if (encoding.identityBase && (required === null || required.ordering === "Identity")) return EMPTY_DIAGNOSTICS;
+  if (required === null) return EMPTY_DIAGNOSTICS;
+  // Private producer collections have no canonical CID interpretation.
+  // Their explicit local CID definitions remain authoritative even when the
+  // producer uses different collection labels in the CMap and descendant.
+  if (
+    encoding.cidRangeMappingCount === 0 && encoding.cids.size > 0 &&
+    required.registry === descendant.registry &&
+    required.ordering !== descendant.ordering &&
+    nativeCidToUnicodeCollection(required) === null &&
+    nativeCidToUnicodeCollection(descendant) === null
+  ) {
+    return Object.freeze([Object.freeze({
+      code: "font.cmap-private-collection-alias",
+      severity: "warning" as const,
+      message: "Recovered differing private CID collection labels using the embedded CMap's explicit CID mappings.",
+      details: Object.freeze({ encodingOrdering: required.ordering, descendantOrdering: descendant.ordering })
+    })]);
+  }
   if (required.registry !== descendant.registry || required.ordering !== descendant.ordering) {
     throw new PdfError(
       "unsupported-font",
@@ -956,6 +964,7 @@ function validateEncodingSystemInfo(
       }
     );
   }
+  return EMPTY_DIAGNOSTICS;
 }
 
 async function resolveCidUnicodeFallback(
@@ -1307,16 +1316,30 @@ async function readToUnicode(
     false,
     signal
   );
-  if (parsed.cids.size > 0 || parsed.cidRangeMappingCount > 0) {
-    throw unsupportedFont("A font /ToUnicode CMap cannot contain CID mappings.");
-  }
-  if (parsed.notdefRangeMappingCount > 0) {
-    throw unsupportedFont("A font /ToUnicode CMap cannot contain notdef mappings.");
+  return prepareToUnicodeCMap(parsed);
+}
+
+function prepareToUnicodeCMap(parsed: ParsedCMap): ReturnType<typeof parseToUnicodeCMap> {
+  const discardedNonUnicodeMappings = parsed.cids.size > 0 ||
+    parsed.cidRangeMappingCount > 0 || parsed.notdefRangeMappingCount > 0;
+  const diagnostics = [...toUnicodeDiagnostics(parsed.invalidUnicodeMappingCount)];
+  if (discardedNonUnicodeMappings) {
+    diagnostics.push(Object.freeze({
+      code: "font.to-unicode-non-unicode-mappings",
+      severity: "warning" as const,
+      message: "Ignored CID and notdef entries in a ToUnicode CMap, retaining its Unicode entries; " +
+        "text extraction uses available font fallbacks and may be incomplete.",
+      details: Object.freeze({
+        cidMappingCount: parsed.cids.size + parsed.cidRangeMappingCount,
+        notdefMappingCount: parsed.notdefRangeMappingCount
+      })
+    }));
   }
   return Object.freeze({
     codeSpaces: parsed.codeSpaces,
     mappings: parsed.unicode,
-    diagnostics: toUnicodeDiagnostics(parsed.invalidUnicodeMappingCount),
+    diagnostics: Object.freeze(diagnostics),
+    discardedNonUnicodeMappings,
     decode(source: Uint8Array, offset = 0) {
       const entry = decodeCMapCode(source, offset, parsed.codeSpaces, parsed.unicode);
       return {
@@ -1326,6 +1349,16 @@ async function readToUnicode(
       };
     }
   });
+}
+
+function cidOverrideDiagnostics(count: number): readonly PdfDiagnostic[] {
+  if (count === 0) return EMPTY_DIAGNOSTICS;
+  return Object.freeze([Object.freeze({
+    code: "font.cmap-cid-overrides",
+    severity: "warning" as const,
+    message: `Recovered ${count} overlapping local CID mappings using their last definitions.`,
+    details: Object.freeze({ overriddenMappingCount: count })
+  })]);
 }
 
 function toUnicodeDiagnostics(invalidMappingCount: number): readonly PdfDiagnostic[] {
@@ -1504,6 +1537,7 @@ async function predefinedCMap(
     codeSpaces: Object.freeze(codeSpaces),
     unicode: new Map(),
     invalidUnicodeMappingCount: inherited?.invalidUnicodeMappingCount ?? 0,
+    overriddenCidMappingCount: inherited?.overriddenCidMappingCount ?? 0,
     cids: new Map(),
     sourceByteCount: inherited?.sourceByteCount ?? 0,
     tokenCount: inherited?.tokenCount ?? 0,
@@ -1525,6 +1559,7 @@ function identityCMap(name: "Identity-H" | "Identity-V"): ParsedCMap {
     codeSpaces: Object.freeze([{ byteLength: 2, start: 0, end: 0xffff }]),
     unicode: new Map(),
     invalidUnicodeMappingCount: 0,
+    overriddenCidMappingCount: 0,
     cids: new Map(),
     sourceByteCount: 0,
     tokenCount: 0,
@@ -1632,6 +1667,7 @@ function parseCMap(
     return decoded.unicode;
   };
   const localCids = new Map<string, number>();
+  let overriddenCidMappingCount = inherited?.overriddenCidMappingCount ?? 0;
   const cidRangeLayers = inherited ? [...inherited.cidRangeLayers] : [];
   const cidRangeMappingCount = inherited?.cidRangeMappingCount ?? 0;
   const notdefRangeLayers = inherited ? [...inherited.notdefRangeLayers] : [];
@@ -1794,13 +1830,13 @@ function parseCMap(
         const source = requireCMapSource(tokens[++index], "cidchar source");
         const target = requireCMapNumber(tokens[++index], "cidchar target");
         if (target > MAX_CID) throw unsupportedFont("CMap cidchar target exceeds 65535.");
-        setLocalCMapMapping(
+        if (setLocalCMapMapping(
           localCids,
           localCidKeys,
           cmapKey(bytesToCode(source), source.length),
           target,
           "CID"
-        );
+        )) overriddenCidMappingCount += 1;
       }
       requireCMapBlockEnd(tokens[++index], "endcidchar");
     } else if (token.value === "begincidrange") {
@@ -1824,13 +1860,13 @@ function parseCMap(
           limits.maxCMapMappings
         );
         for (let code = start; code <= end; code += 1) {
-          setLocalCMapMapping(
+          if (setLocalCMapMapping(
             localCids,
             localCidKeys,
             cmapKey(code, startBytes.length),
             firstCid + code - start,
             "CID"
-          );
+          )) overriddenCidMappingCount += 1;
         }
       }
       requireCMapBlockEnd(tokens[++index], "endcidrange");
@@ -1862,6 +1898,7 @@ function parseCMap(
     codeSpaces: Object.freeze(codeSpaces),
     unicode: overlayCMapMappings(inherited?.unicode, localUnicode),
     invalidUnicodeMappingCount,
+    overriddenCidMappingCount,
     cids: overlayCMapMappings(inherited?.cids, localCids),
     sourceByteCount,
     tokenCount,
@@ -2240,13 +2277,15 @@ function setLocalCMapMapping<T>(
   key: string,
   value: T,
   kind: "Unicode" | "CID"
-): void {
-  if (localKeys.has(key)) {
+): boolean {
+  const overridden = localKeys.has(key);
+  if (overridden && kind === "Unicode") {
     throw unsupportedFont(`CMap contains overlapping local ${kind} mappings.`);
   }
   localKeys.add(key);
   // A local definition intentionally overrides the inherited /UseCMap value.
   mappings.set(key, value);
+  return overridden;
 }
 
 function addCodeSpaceRange(
@@ -2961,7 +3000,7 @@ interface SfntCmaps {
   readonly variation: readonly VariationCmapLookup[];
 }
 
-/** Bounds-checked sfnt reader for TrueType/OpenType cmap, metrics, and glyf outlines. */
+/** Bounds-checked sfnt reader for TrueType/OpenType cmap, metrics, and glyf/CFF outlines. */
 export class NativeSfntFont {
   readonly unitsPerEm: number;
   readonly numGlyphs: number;
@@ -2987,6 +3026,8 @@ export class NativeSfntFont {
   private readonly indexToLocFormat: number;
   private readonly glyphLocations: Uint32Array | null;
   private readonly maxpProfile: MaxpTrueTypeProfile | null;
+  private readonly cffParserLimits: Readonly<Partial<NativeCffParserLimits>>;
+  private cffFont: NativeCffFont | null = null;
   private readonly outlineCache = new Map<number, NativeGlyphOutline>();
 
   private constructor(
@@ -2994,11 +3035,13 @@ export class NativeSfntFont {
     faceOffset: number,
     limits: Readonly<NativeSfntParserLimits>,
     protectedRanges: readonly SfntProtectedRange[] = Object.freeze([]),
-    validation: "strict" | "pdf-embedded" = "strict"
+    validation: "strict" | "pdf-embedded" = "strict",
+    cffParserLimits: Readonly<Partial<NativeCffParserLimits>> = {}
   ) {
     this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.limits = limits;
     this.validation = validation;
+    this.cffParserLimits = Object.freeze({ ...cffParserLimits });
     this.tables = readSfntTables(
       this.view,
       faceOffset,
@@ -3170,7 +3213,7 @@ export class NativeSfntFont {
   static parse(
     bytes: Uint8Array,
     faceIndex = 0,
-    limitOverrides?: Partial<NativeSfntParserLimits>,
+    limitOverrides?: Partial<NativeSfntParserLimits & NativeCffParserLimits>,
     validation: "strict" | "pdf-embedded" = "strict"
   ): NativeSfntFont {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 12) {
@@ -3277,7 +3320,7 @@ export class NativeSfntFont {
     } else if (faceIndex !== 0) {
       throw unsupportedFont("A non-collection sfnt has only face zero.");
     }
-    return new NativeSfntFont(bytes, faceOffset, limits, protectedRanges, validation);
+    return new NativeSfntFont(bytes, faceOffset, limits, protectedRanges, validation, limitOverrides);
   }
 
   mapCodePoint(codePoint: number, variationSelector?: number): number {
@@ -3339,10 +3382,35 @@ export class NativeSfntFont {
     this.requireGlyphId(glyphId);
     const cached = this.outlineCache.get(glyphId);
     if (cached) return cached;
+    if (this.outlineFormat === "cff") {
+      if (this.cffFont === null) {
+        const table = this.requireTable("CFF ");
+        const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + table.offset, table.length);
+        const cff = NativeCffFont.parse(bytes, this.cffParserLimits);
+        if (cff.numGlyphs !== this.numGlyphs) {
+          throw unsupportedFont("The OpenType CFF CharStrings count disagrees with maxp.numGlyphs.");
+        }
+        this.cffFont = cff;
+      }
+      const source = this.cffFont.getGlyphOutline(glyphId);
+      const scale = this.unitsPerEm / this.cffFont.unitsPerEm;
+      const metric = this.getHorizontalMetric(glyphId);
+      const outline: NativeGlyphOutline = Object.freeze({
+        glyphId,
+        commands: scale === 1 ? source.commands
+          : Object.freeze(source.commands.map(command => scaleCffGlyphCommand(command, scale))),
+        bounds: scale === 1 ? source.bounds
+          : freezeBounds(source.bounds.map(value => value * scale), "OpenType CFF glyph"),
+        advanceWidth: metric.advanceWidth,
+        leftSideBearing: metric.leftSideBearing
+      });
+      this.outlineCache.set(glyphId, outline);
+      return outline;
+    }
     if (this.outlineFormat !== "glyf") {
       throw unsupportedFont(
-        this.outlineFormat === "cff" || this.outlineFormat === "cff2"
-          ? "CFF/CFF2 outlines require the native CFF kernel, which is not available."
+        this.outlineFormat === "cff2"
+          ? "CFF2 outlines require the native CFF2 engine, which is not available."
           : "The embedded sfnt has no supported outline table."
       );
     }
@@ -3788,6 +3856,31 @@ export class NativeSfntFont {
   private f2dot14(offset: number, table: SfntTable): number {
     return this.i16(offset, table) / 16384;
   }
+}
+
+function scaleCffGlyphCommand(command: NativeGlyphPathCommand, scale: number): NativeGlyphPathCommand {
+  if (command.kind === "close") return command;
+  if (command.kind === "cubic") {
+    return Object.freeze({
+      kind: command.kind,
+      control1X: command.control1X * scale,
+      control1Y: command.control1Y * scale,
+      control2X: command.control2X * scale,
+      control2Y: command.control2Y * scale,
+      x: command.x * scale,
+      y: command.y * scale
+    });
+  }
+  if (command.kind === "quadratic") {
+    return Object.freeze({
+      kind: command.kind,
+      controlX: command.controlX * scale,
+      controlY: command.controlY * scale,
+      x: command.x * scale,
+      y: command.y * scale
+    });
+  }
+  return Object.freeze({ kind: command.kind, x: command.x * scale, y: command.y * scale });
 }
 
 function readSfntTables(
