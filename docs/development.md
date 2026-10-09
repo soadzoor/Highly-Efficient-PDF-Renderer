@@ -79,7 +79,7 @@ The demos read paired PDF and HEP entries from these locations:
 
 ```text
 public/examples/pdfs/          Source documents
-public/examples/heps/          Prepared HEP documents
+public/examples/heps/          Prepared HEP documents with stored LODs
 public/examples/manifest.json  Demo menu entries and file sizes
 ```
 
@@ -91,7 +91,8 @@ npm run generate-manifest
 
 This command indexes existing files; it does not convert PDFs. For conversion,
 follow the [manual](manual.md#node-conversion). A full example refresh with
-`npm run regenerate:heps` converts all bundled PDFs and updates the manifest;
+`npm run regenerate:heps` converts all bundled PDFs with stored vector and text
+LODs into `public/examples/heps` and updates the manifest;
 allow time and memory for large documents before starting it.
 
 ## Room detection tools

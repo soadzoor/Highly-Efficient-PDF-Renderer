@@ -74,6 +74,8 @@ To profile an existing HEP without conversion or a server:
 node scripts/benchmark-vector-lod-memory.mjs public/examples/heps/Level_1-parsed-data.hep --ordered --output=/tmp/lod-memory.json
 ```
 
+The current bundled HEPs include stored LODs; the historical measurements above
+used HEPs without those caches. Use the same input file for comparable runs.
 Use `--compare=previous-snapshot.json` to compare output. The tool's default
 deadline is 90 seconds. `--source=original-core.ts` and
 `--ordered-source=original-batches.ts` allow an original implementation to be

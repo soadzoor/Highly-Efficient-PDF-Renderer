@@ -1134,7 +1134,7 @@ without a repository checkout or development dependencies:
 
 ```bash
 npx @soadzoor/hepr ./Level1.pdf
-npx @soadzoor/hepr --output-dir=./heps-lod ./pdfs
+npx @soadzoor/hepr --output-dir=./heps ./pdfs
 npx @soadzoor/hepr --without-vector-lod --without-text-lod --output-dir=./heps ./pdfs
 npx @soadzoor/hepr --without-text-lod --vector-lod-precision=lossless --output-dir=./heps-vector-lod ./pdfs
 npx @soadzoor/hepr --force ./pdfs
@@ -1216,12 +1216,10 @@ even when the LOD options change; use `--force` to replace them. The JavaScript
 `buildHep` API also includes both applicable caches by default; pass
 `withVectorLod: false` or `withTextLod: false` to omit either one.
 
-For the bundled examples, run `npm run regenerate:heps:lod` manually. It writes
-to `public/examples/heps-lod` and updates the manifest with file sizes. The
+For the bundled examples, run `npm run regenerate:heps` manually. It writes
+to `public/examples/heps` and updates the manifest with file sizes. The
 example menus offer one **HEP** action per PDF, using the file with stored vector
 and text LODs. This action appears only when that file is present in the manifest.
-The existing `npm run regenerate:heps` explicitly disables both LOD caches and
-keeps writing files to `public/examples/heps`.
 
 To shrink existing HEPs while preserving every decoded section byte, including
 all LOD levels, precision and indexes, run the storage repacker:
@@ -1242,16 +1240,17 @@ their cached representation without parsing PDFs or repeating
 LOD simplification, run:
 
 ```bash
-npm run repack:heps:lod  # shared geometry, rebuilt indexes, compact vector precision
+node scripts/repack-hep-lods.mjs --write public/examples/heps
+npm run generate-manifest
 ```
 
-This updates the manifest after successful repacking. The tool rebuilds spatial
-indexes to verify the result; it never generates missing LOD geometry. The underlying tool defaults
-to measurement only, supports individual files, and has a hard 60-second deadline
-per file in isolated workers:
+The second command refreshes the manifest after successful repacking. The tool
+rebuilds spatial indexes to verify the result; it never generates missing LOD
+geometry. The underlying tool defaults to measurement only, supports individual
+files, and has a hard 60-second deadline per file in isolated workers:
 
 ```bash
-node scripts/repack-hep-lods.mjs public/examples/heps-lod/Level_1-parsed-data.hep
+node scripts/repack-hep-lods.mjs public/examples/heps/Level_1-parsed-data.hep
 ```
 
 For an older HEP without recorded PDF size, add

@@ -12,7 +12,6 @@ interface ExampleOptionManifestEntry {
     path: string;
     sizeBytes: number;
   };
-  hepLod?: { path: string; sizeBytes: number };
   hep: {
     path: string;
     sizeBytes: number;
@@ -38,7 +37,10 @@ const outputManifestPath = path.resolve(outputRootDir, "manifest.json");
 
 async function main(): Promise<void> {
   const pdfFiles = await readFilesWithExtensions(outputPdfDir, [".pdf"]);
-  const hepFiles = await readFilesWithExtensions(outputHepDir, [".hep"]);
+  const hepFiles = await readFilesWithExtensions(outputHepDir, [".hep"]).catch(error => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
 
   if (pdfFiles.length === 0) {
     throw new Error(`No PDFs found in ${outputPdfDir}`);
@@ -47,11 +49,6 @@ async function main(): Promise<void> {
     throw new Error(`No HEP files found in ${outputHepDir}`);
   }
 
-  const lodFiles = await readFilesWithExtensions(path.join(outputRootDir, "heps-lod"), [".hep"]).catch(error => {
-    if (error.code === "ENOENT") return [];
-    throw error;
-  });
-  const lodBuckets = buildHepBuckets(lodFiles);
   const hepBuckets = buildHepBuckets(hepFiles);
   const usedIds = new Set<string>();
   const manifestEntries: ExampleOptionManifestEntry[] = [];
@@ -68,14 +65,10 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const matchedLod = lodBuckets.get(comparableKey)?.shift();
     const id = makeUniqueId(pdfStem, usedIds, manifestEntries.length + 1);
     manifestEntries.push({
       id,
       name: pdf.name,
-      ...(matchedLod ? { hepLod: {
-        path: `examples/heps-lod/${encodeExampleAssetPathSegment(matchedLod.name)}`, sizeBytes: matchedLod.sizeBytes
-      } } : {}),
       pdf: {
         path: `examples/pdfs/${encodeExampleAssetPathSegment(pdf.name)}`,
         sizeBytes: pdf.sizeBytes

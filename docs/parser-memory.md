@@ -89,10 +89,11 @@ container/level descriptors, alignment, and any persisted spatial bucket arrays;
 the latter would be rebuilt. They do not subtract the new palette savings.
 No complete stored-LOD archive or browser loading path was implemented or timed.
 
-To repeat the estimate from existing inputs, without conversion:
+To repeat the original estimate without conversion, use an archived HEP without
+stored LODs; the current bundled examples already contain those caches:
 
 ```sh
-node scripts/estimate-vector-lod-storage.mjs public/examples/heps/Level_1-parsed-data.hep "public/examples/pdfs/Level 1.pdf" --output=/tmp/level1-lod-size.json
+node scripts/estimate-vector-lod-storage.mjs /path/to/archived/Level_1-parsed-data.hep "public/examples/pdfs/Level 1.pdf" --output=/tmp/level1-lod-size.json
 ```
 
 The tool uses zlib-wrapped DEFLATE, verifies exact field and reference/literal
