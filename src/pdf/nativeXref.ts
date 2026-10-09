@@ -79,7 +79,7 @@ export async function readNativeXref(
         const actualGeneration = cause.details?.actualGeneration;
         diagnostics.push({
           code: "xref.repaired",
-          severity: "warning",
+          severity: "info",
           message:
             "The strict PDF structure was invalid; HEPR normalized the malformed free-object sentinel without scanning object payloads.",
           details: {

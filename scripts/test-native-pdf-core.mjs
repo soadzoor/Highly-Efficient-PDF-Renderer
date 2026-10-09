@@ -50,7 +50,8 @@ function classicFixture({
   encrypted = false,
   brokenStartXref = false,
   incremental = false,
-  indirectLength = false
+  indirectLength = false,
+  objectZeroGeneration = 65_535
 } = {}) {
   const parts = ["%PDF-1.7\n%\x80\x81\x82\x83\n"];
   let length = bytes(parts[0]).length;
@@ -71,7 +72,7 @@ function classicFixture({
   const firstXref = length;
   const size = encrypted ? 10 : indirectLength ? 6 : 5;
   parts.push(`xref\n0 ${size}\n`);
-  parts.push("0000000000 65535 f \n");
+  parts.push(`0000000000 ${String(objectZeroGeneration).padStart(5, "0")} f \n`);
   for (let number = 1; number < size; number += 1) {
     const offset = offsets.get(number) ?? 0;
     parts.push(`${String(offset).padStart(10, "0")} ${offset ? "00000 n" : "65535 f"} \n`);
@@ -243,8 +244,28 @@ async function testIncrementalAndRepair() {
   const repaired = await openNativePdfDocument({ kind: "bytes", bytes: classicFixture({ brokenStartXref: true }) });
   assert.equal(repaired.info.repaired, true);
   assert.equal(repaired.info.pageCount, 1);
-  assert(repaired.getDiagnostics().some((item) => item.code === "xref.repaired"));
+  assert(repaired.getDiagnostics().some((item) =>
+    item.code === "xref.repaired" && item.severity === "warning"
+  ), "rebuilding object offsets with a structural scan still warns");
   await repaired.close();
+
+  const malformedSentinel = classicFixture({ objectZeroGeneration: 0 });
+  await assert.rejects(
+    openNativePdfDocument({ kind: "bytes", bytes: malformedSentinel }, { repair: "off" }),
+    (error) => error.code === "invalid-xref" && error.details?.reason === "object-zero-generation"
+  );
+  const normalized = await openNativePdfDocument({ kind: "bytes", bytes: malformedSentinel });
+  try {
+    assert.equal(normalized.info.repaired, true);
+    assert.equal(normalized.info.pageCount, 1);
+    const diagnostic = normalized.getDiagnostics().find(item => item.code === "xref.repaired");
+    assert.equal(diagnostic.severity, "info", "exact classic-xref sentinel normalization is informational");
+    assert.equal(diagnostic.details.repairKind, "object-zero-generation");
+    assert.equal(diagnostic.details.actualGeneration, 0);
+    assert.deepEqual([...await normalized.getDecodedPageContents(0)], [bytes("0 0 m 10 10 l S")]);
+  } finally {
+    await normalized.close();
+  }
 }
 
 async function testXrefAndObjectStreams() {
@@ -284,6 +305,8 @@ async function testXrefAndObjectStreams() {
     targetedRepair.getDiagnostics()[0].details?.repairKind,
     "object-zero-generation"
   );
+  assert.equal(targetedRepair.getDiagnostics()[0].severity, "info",
+    "exact xref-stream sentinel normalization is informational");
   assert.deepEqual(
     [...await targetedRepair.getDecodedPageContents(0)],
     [bytes("0 0 10 10 re f")]
