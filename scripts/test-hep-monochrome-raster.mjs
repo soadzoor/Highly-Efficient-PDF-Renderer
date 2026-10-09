@@ -126,14 +126,20 @@ async function assertRasterMetadataPreflight(seedBytes, loadScene, sections, cod
     // Real archive entries exercise reader preflight without inflating the
     // hundreds of MiB of packed scan data or allocating any raster pixels.
     await tryMetadata({}, error => error === firstPackedRead);
-    assert.equal(rasterReads, 1, "the complete packed-scene budget is admitted before reading its first pixels");
-    for (const invalid of [
+    assert.equal(rasterReads, 1, "complete packed-scene metadata is admitted before reading its first pixels");
+    for (const large of [
       { storage: "rgba", count: 40 },
       { count: 1100 },
       { count: 4097, width: 1, height: 1 },
-      { extraBytes: 1 },
       { count: 1, width: 16384, height: 8193 },
       { count: 1, width: 16385, height: 1 }
+    ]) {
+      await tryMetadata(large, error => error === firstPackedRead);
+      assert.equal(rasterReads, 1, "metadata beyond the old byte, section, texel, and dimension caps reaches pixel decoding");
+    }
+    for (const invalid of [
+      { extraBytes: 1 },
+      { storage: "rgba", count: 1, width: 0x7fffffff, height: 0x7fffffff }
     ]) {
       await tryMetadata(invalid, /budget|limit|length|size|out of range/i);
       assert.equal(rasterReads, 0, "invalid raster metadata is rejected before inflating pixels");

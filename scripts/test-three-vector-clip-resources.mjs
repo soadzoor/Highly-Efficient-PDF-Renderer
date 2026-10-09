@@ -77,9 +77,9 @@ try {
   const initialImage = deviceTexture.image;
   for (const unknownSize of [Infinity, NaN, 0]) prepareThreeVectorClipTexture(deviceScene, unknownSize);
   assert.equal(deviceTexture.image, initialImage, "unknown host capacity leaves the shared store unchanged");
-  assert(initialImage.width > 32 || initialImage.height > 32, "optional cells exceed a small host's texture size");
-  prepareThreeVectorClipTexture(deviceScene, 32);
-  assert(deviceTexture.image.width <= 32 && deviceTexture.image.height <= 32);
+  assert(initialImage.width > 24 || initialImage.height > 24, "optional cells exceed a small host's texture size");
+  prepareThreeVectorClipTexture(deviceScene, 24);
+  assert(deviceTexture.image.width <= 24 && deviceTexture.image.height <= 24);
   assert.equal(deviceDisposals, 0, "first-use repacking has no GPU allocation to dispose");
   assert.equal(material.uniforms.uVectorClipTex.value, deviceTexture);
   assert.equal(clippedMaterial.uniforms.uVectorClipTex.value, deviceTexture,
@@ -87,7 +87,7 @@ try {
   assert.equal(smallSecond.texture, deviceTexture, "repacking preserves shared lease identity");
   const fittedImage = deviceTexture.image;
   const fittedVersion = deviceTexture.version;
-  for (const maxSize of [32, 4096]) prepareThreeVectorClipTexture(deviceScene, maxSize);
+  for (const maxSize of [24, 4096]) prepareThreeVectorClipTexture(deviceScene, maxSize);
   assert.equal(deviceTexture.image, fittedImage, "subsequent frames do not repack or expand a fitted store");
   assert.equal(deviceTexture.version, fittedVersion);
 

@@ -76,8 +76,20 @@ try {
   ];
   assert.deepEqual([...supportedNativeVectorShadings({ size: descriptions.length, describe: i => descriptions[i] })], [0, 1, 2, 4],
     "axial/radial domains stay vector; a degenerate axis remains unsupported");
-  assert.throws(() => buildNativeVectorGradients(new Array(4097), undefined, 10000), error => error.code === "resource-limit",
-    "shading color tables have a bounded allocation independent of the ordinary path limit");
+  const repeatedShading = buildNativeVectorGradients(Array.from({ length: 4097 }, (_, paintOrder) => ({
+    gradientIndex: 0, transform: [1, 0, 0, 1, 0, 0],
+    clipBounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 }, alpha: 1, paintOrder
+  })), {
+    size: 1,
+    describe: () => ({ ...descriptions[0], domain: [0, 1], boundingBox: null,
+      functionIndex: 0, functionIndices: [], colorSpaceIndex: 0 }),
+    functions: { evaluate: () => [1, 0, 0] },
+    colors: { convertToSrgb: () => [1, 0, 0] }
+  }, 10000);
+  assert.equal(repeatedShading.gradientCount, 4097, "shading counts beyond the former allowance stay vector");
+  assert.ok(repeatedShading.gradientLut.length > 16 * 1024 * 1024, "color-table allocation follows actual device memory");
+  assert.throws(() => buildNativeVectorGradients(new Array(2), undefined, 1), error => error.code === "resource-limit",
+    "caller-selected shading path limits still apply");
   assert.throws(() => buildNativeVectorGradients(new Array(2), undefined, 100, undefined, 16), error => error.code === "resource-limit",
     "generated shading geometry respects the coordinate budget before allocation");
   const mixed = await openPdf({ kind: "bytes", bytes: fixture({

@@ -180,12 +180,12 @@ export class NativePageFontRegistry {
         signal
       });
     }
-    if (this.resources.length >= this.document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Page font resources exceed the object-cache limit.", {
+    if (this.resources.length >= 0x7fffffff) {
+      throw new PdfError("resource-limit", "Page font resources exceed the Int32 index range.", {
         pageIndex: this.pageIndex,
         details: {
           reason: "page-font-count",
-          maxFonts: this.document.limits.maxCachedObjects
+          maxFonts: 0x7fffffff
         }
       });
     }

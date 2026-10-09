@@ -385,18 +385,18 @@ interface InternalCanvasBackendOptions {
   readonly boundSoftMasks?: boolean;
 }
 
-const DEFAULT_MAX_CANVAS_PIXELS = 100_000_000;
-const DEFAULT_MAX_WORKING_PIXELS = 256_000_000;
-const DEFAULT_MAX_GRADIENT_STOPS = 8_192;
-const DEFAULT_MAX_GRADIENT_SUBDIVISION_DEPTH = 12;
+const DEFAULT_MAX_CANVAS_PIXELS = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_WORKING_PIXELS = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_GRADIENT_STOPS = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_GRADIENT_SUBDIVISION_DEPTH = Number.MAX_SAFE_INTEGER;
 const DEFAULT_GRADIENT_COLOR_TOLERANCE = 1 / 1024;
-const DEFAULT_MAX_MESH_TRIANGLES = 1_000_000;
-const DEFAULT_MAX_MESH_SUBDIVISION_DEPTH = 10;
+const DEFAULT_MAX_MESH_TRIANGLES = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_MESH_SUBDIVISION_DEPTH = Number.MAX_SAFE_INTEGER;
 const DEFAULT_MESH_COLOR_TOLERANCE = 8 / 255;
 const DEFAULT_PATCH_FLATNESS_PIXELS = 0.25;
-const DEFAULT_MAX_PATTERN_DEPTH = 16;
-const DEFAULT_MAX_PATTERN_CELLS = 65_536;
-const DEFAULT_MAX_PATTERN_PIXELS = 64_000_000;
+const DEFAULT_MAX_PATTERN_DEPTH = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_PATTERN_CELLS = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_PATTERN_PIXELS = Number.MAX_SAFE_INTEGER;
 const SHADING_FLAG_EXTEND_START = 1 << 0;
 const SHADING_FLAG_EXTEND_END = 1 << 1;
 const SHADING_FLAG_ANTI_ALIAS = 1 << 2;
@@ -495,6 +495,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private colorEvaluator: HeprColorEvaluator | null = null;
   private liveWorkingPixels = 0;
   private emittedMeshTriangles = 0;
+  private diagnosedMeshPrecision = false;
   private rootCompleted = false;
   private disposed = false;
 
@@ -1981,7 +1982,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       );
       const needsMinimumSampling = depth < 2;
       if ((needsMinimumSampling || error > this.options.gradientColorTolerance) &&
-          depth < this.options.maxGradientSubdivisionDepth) {
+          depth < this.options.maxGradientSubdivisionDepth && middleOffset > low.offset && middleOffset < high.offset) {
         subdivide(low, middle, depth + 1);
         subdivide(middle, high, depth + 1);
         return;
@@ -2255,14 +2256,14 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       tessellation = tessellateHeprPatchMesh(this.page, metadata.gradientIndex, {
         flatness: this.options.patchFlatnessPixels / deviceScale,
         componentFlatness: this.options.gradientColorTolerance,
-        maxDepth: Math.min(20, this.options.maxMeshSubdivisionDepth + 4),
+        maxDepth: Math.min(Number.MAX_SAFE_INTEGER, this.options.maxMeshSubdivisionDepth + 4),
         maxTriangles: this.options.maxMeshTriangles,
         maxOutputBytes: Math.min(
-          256 * 1024 * 1024,
+          Number.MAX_SAFE_INTEGER,
           Math.max(1_024, this.options.maxMeshTriangles * 80)
         ),
-        maxSubdivisionNodes: Math.max(1, this.options.maxMeshTriangles * 2),
-        maxFunctionEvaluations: Math.max(1, this.options.maxMeshTriangles * 2),
+        maxSubdivisionNodes: Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, this.options.maxMeshTriangles * 2)),
+        maxFunctionEvaluations: Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, this.options.maxMeshTriangles * 2)),
         signal: this.options.signal,
         evaluateFunction: metadata.functionIndices.length === 0
           ? undefined
@@ -2357,6 +2358,21 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
     const ab = midpoint(vertices[0], vertices[1]);
     const bc = midpoint(vertices[1], vertices[2]);
     const ca = midpoint(vertices[2], vertices[0]);
+    const sameVertex = (first: MeshVertex, second: MeshVertex): boolean =>
+      first.x === second.x && first.y === second.y && first.functionInput === second.functionInput &&
+      first.components.every((value, index) => value === second.components[index]);
+    if ([ab, bc, ca].every(middle => vertices.some(vertex => sameVertex(middle, vertex)))) {
+      if (!this.diagnosedMeshPrecision) {
+        this.diagnosedMeshPrecision = true;
+        this.options.onDiagnostic?.({
+          code: "mesh-approximation", severity: "warning", pageIndex: this.page.pageInfo.sourcePageIndex,
+          message: "Mesh subdivision reached numeric precision; colors may differ.",
+          details: { variation, tolerance: this.options.meshColorTolerance }
+        });
+      }
+      this.emitSolidTriangle(context, vertices, path);
+      return;
+    }
     this.drawGouraudTriangle(context, [vertices[0], ab, ca], colorSpaceIndex, functionIndices, depth + 1, path);
     this.drawGouraudTriangle(context, [ab, vertices[1], bc], colorSpaceIndex, functionIndices, depth + 1, path);
     this.drawGouraudTriangle(context, [ca, bc, vertices[2]], colorSpaceIndex, functionIndices, depth + 1, path);
@@ -2834,7 +2850,7 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         for (let y = 0; y < height; y++) {
           this.options.signal?.throwIfAborted();
           for (let x = 0; x < width; x++) {
-            const value = ((data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1) * 255;
+            const value = ((data[y * stride + Math.floor(x / 8)] >> (7 - (x & 7))) & 1) * 255;
             const offset = (y * width + x) * 4;
             output[offset] = output[offset + 1] = output[offset + 2] = value;
             output[offset + 3] = 255;
@@ -3120,7 +3136,7 @@ function resolveOptions(options: HeprCanvas2dBackendOptions): ResolvedBackendOpt
     ),
     maxGradientSubdivisionDepth: nonnegativeInteger(
       options.maxGradientSubdivisionDepth ?? DEFAULT_MAX_GRADIENT_SUBDIVISION_DEPTH,
-      20,
+      Number.MAX_SAFE_INTEGER,
       "maxGradientSubdivisionDepth"
     ),
     gradientColorTolerance: unitTolerance(
@@ -3133,7 +3149,7 @@ function resolveOptions(options: HeprCanvas2dBackendOptions): ResolvedBackendOpt
     ),
     maxMeshSubdivisionDepth: nonnegativeInteger(
       options.maxMeshSubdivisionDepth ?? DEFAULT_MAX_MESH_SUBDIVISION_DEPTH,
-      20,
+      Number.MAX_SAFE_INTEGER,
       "maxMeshSubdivisionDepth"
     ),
     meshColorTolerance: unitTolerance(
@@ -3146,7 +3162,7 @@ function resolveOptions(options: HeprCanvas2dBackendOptions): ResolvedBackendOpt
     ),
     maxPatternDepth: nonnegativeInteger(
       options.maxPatternDepth ?? DEFAULT_MAX_PATTERN_DEPTH,
-      64,
+      Number.MAX_SAFE_INTEGER,
       "maxPatternDepth"
     ),
     maxPatternCells: positiveSafeInteger(

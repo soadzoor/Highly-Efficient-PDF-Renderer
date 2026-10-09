@@ -483,6 +483,16 @@ function testMalformedInputs() {
 }
 
 function testLimitsAndCancellation() {
+  const wide = decode(bits("1"), { K: -1, Columns: 65_536, Rows: 1, EndOfBlock: false });
+  assert.equal(wide.bytes.length, 8192, "a wide compressed row beyond the former column allowance decodes");
+  assert.ok(wide.bytes.every(value => value === 255));
+  const tall = decode(bits("1".repeat(65_536)), { K: -1, Columns: 1, Rows: 65_536, EndOfBlock: false });
+  assert.equal(tall.rows, 65_536, "row counts follow allocation capacity rather than a guessed ceiling");
+  assert.ok(tall.bytes.every(value => value === 128));
+  assert.deepEqual([...decode(bits("000000000001 10011"), {
+    Columns: 8, Rows: 1, EndOfLine: true, EndOfBlock: false, DamagedRowsBeforeError: 2048
+  }).bytes], [255], "the PDF's damaged-row tolerance is not capped by a default allowance");
+
   assert.throws(
     () => decode(new Uint8Array(0), { Columns: 9 }, {
       limits: { maxColumns: 8 }

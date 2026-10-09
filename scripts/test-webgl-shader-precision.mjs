@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { evaluateWgsl } from "./lib/scalarShaderEval.mjs";
+import { VECTOR_FILL_BAND_INFO_WGSL } from "../src/vectorFillBandShaders.ts";
+import { VECTOR_FILL_CELL_INFO_WGSL } from "../src/vectorCellShaders.ts";
 
 /**
  * A uniform declared in both stages of a program must resolve to the same
@@ -89,6 +92,28 @@ for (const [name, stage] of [["FILL_VERTEX_SHADER_SOURCE", "vertex"], ["FILL_FRA
   ["GRADIENT_FILL_VERTEX_SHADER_SOURCE", "vertex"], ["GRADIENT_FILL_FRAGMENT_SHADER_SOURCE", "fragment"]]) {
   assert.equal(defaultPrecision(shaders.get(name), stage).int, "highp",
     `${name} must resolve int to highp: it indexes segment-store texels`);
+}
+
+// Exact Float32 integers need no rounding bias. Above 2^23, adding 0.5
+// rounds an odd address to the next integer before the shader converts it.
+const helpers = evaluateWgsl(VECTOR_FILL_BAND_INFO_WGSL + VECTOR_FILL_CELL_INFO_WGSL, {
+  toInt: value => Math.trunc(Math.fround(value)),
+  textureDimensions: texture => ({ x: texture.width }),
+  textureLoad: (texture, coordinate) => coordinate.y * texture.width + coordinate.x
+});
+const texture = { width: 4096 };
+for (const address of [2 ** 23 - 1, 2 ** 23 + 1, 2 ** 24 - 1]) {
+  assert.equal(helpers.heprFillBandInfo(1, address - 1, texture), address,
+    "band records preserve high odd texture addresses");
+  assert.equal(helpers.heprFillCellInfo(0, address + 1, texture), address,
+    "cell records preserve high odd texture addresses");
+}
+for (const file of ["nativeWebGlCoreShaders.ts", "nativeGradientWebGlShaders.ts", "nativeGradientWebGpuShaders.ts",
+  "webGpuFloorplanRenderer.ts", "threeWebGpuFillMaterial.ts", "threeWebGpuTextMaterial.ts",
+  "threeWebGpuGradientMaterial.ts", "threeWebGpuStrokeMaterial.ts", "threeTriangleStrokeLayer.ts",
+  "threeMaterialGradientLayer.ts"]) {
+  assert.doesNotMatch(readFileSync(root + file, "utf8"), /\b(?:int|i32)\([A-Za-z_]\w*(?:\.[xyzw])? \+ 0\.5\)/,
+    `${file}: exact stored integer indices must not be biased during decoding`);
 }
 
 console.log(`WebGL shader precision: ${programs.length} programs, ${shared} shared uniforms agree across stages`);

@@ -35,8 +35,6 @@ export interface OptionalContentControllerOptions {
 
 const MAX_GROUPS = MAX_OPTIONAL_CONTENT_GROUPS;
 const MAX_CONDITIONS = MAX_OPTIONAL_CONTENT_CONDITIONS;
-const MAX_DEPTH = 64;
-const MAX_OPERANDS = 1_000_000;
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -59,7 +57,6 @@ export function validateSceneOptionalContent(value: unknown): asserts value is S
   const conditions = value.conditions;
   const validIndex = (index: unknown): index is number => typeof index === "number" &&
     Number.isSafeInteger(index) && index >= 0 && index < conditions.length;
-  let operandCount = 0;
   for (const condition of conditions) {
     if (!record(condition)) invalid("invalid condition");
     if (condition.kind === "group") {
@@ -68,53 +65,50 @@ export function validateSceneOptionalContent(value: unknown): asserts value is S
       if (typeof condition.value !== "boolean") invalid("invalid constant condition");
     } else if (condition.kind === "not") {
       if (!validIndex(condition.operand)) invalid("invalid condition reference");
-      operandCount++;
     } else if (condition.kind === "and" || condition.kind === "or") {
       if (!Array.isArray(condition.operands) || !condition.operands.every(validIndex)) invalid("invalid condition operands");
-      operandCount += condition.operands.length;
     } else invalid("unknown condition kind");
-    if (operandCount > MAX_OPERANDS) invalid("condition operand limit exceeded");
   }
   const visited = new Uint8Array(conditions.length);
-  const heights = new Uint8Array(conditions.length);
-  const visit = (index: number, depth: number): number => {
-    if (depth > MAX_DEPTH) invalid("condition nesting limit exceeded");
-    if (visited[index] === 1) invalid("cyclic condition");
-    if (visited[index] === 2) return heights[index];
-    visited[index] = 1;
-    const condition = conditions[index];
-    let height = 0;
-    if (condition.kind === "not") height = visit(condition.operand, depth + 1) + 1;
-    else if (condition.kind === "and" || condition.kind === "or") {
-      for (const child of condition.operands) height = Math.max(height, visit(child, depth + 1) + 1);
+  const indices: number[] = [], children: number[] = [];
+  for (let root = 0; root < conditions.length; root++) {
+    if (visited[root]) continue;
+    indices.push(root); children.push(0); visited[root] = 1;
+    while (indices.length) {
+      const top = indices.length - 1, index = indices[top], condition = conditions[index];
+      const operands = condition.kind === "not" ? [condition.operand] :
+        condition.kind === "and" || condition.kind === "or" ? condition.operands : [];
+      if (children[top] >= operands.length) {
+        visited[index] = 2; indices.pop(); children.pop();
+        continue;
+      }
+      const child = operands[children[top]++];
+      if (visited[child] === 1) invalid("cyclic condition");
+      if (!visited[child]) { indices.push(child); children.push(0); visited[child] = 1; }
     }
-    if (height > MAX_DEPTH) invalid("condition nesting limit exceeded");
-    heights[index] = height;
-    visited[index] = 2;
-    return height;
-  };
-  for (let index = 0; index < conditions.length; index++) visit(index, 0);
-  let orderCount = 0;
-  const order = (nodes: unknown[], depth: number): void => {
-    if (depth > MAX_DEPTH) invalid("layer order nesting limit exceeded");
-    for (const node of nodes) {
-      if (++orderCount > MAX_CONDITIONS || !record(node)) invalid("invalid layer order");
+  }
+  const orderArrays: unknown[][] = [value.order], orderChildren = [0];
+  const activeOrder = new Set<unknown[]>(orderArrays);
+  while (orderArrays.length) {
+    const top = orderArrays.length - 1, nodes = orderArrays[top];
+    if (orderChildren[top] >= nodes.length) {
+      activeOrder.delete(nodes); orderArrays.pop(); orderChildren.pop();
+    } else {
+      const node = nodes[orderChildren[top]++];
+      if (!record(node)) invalid("invalid layer order");
       if (node.kind === "group") {
         if (typeof node.groupId !== "string" || !ids.has(node.groupId)) invalid("unknown ordered layer");
       } else if (node.kind !== "label" || typeof node.label !== "string" || !Array.isArray(node.children)) invalid("invalid layer order node");
       if (node.children !== undefined) {
         if (!Array.isArray(node.children)) invalid("invalid layer order children");
-        order(node.children, depth + 1);
+        if (activeOrder.has(node.children)) invalid("cyclic layer order");
+        orderArrays.push(node.children); orderChildren.push(0); activeOrder.add(node.children);
       }
     }
-  };
-  order(value.order, 0);
-  let radioCount = 0;
+  }
   for (const radio of value.radioGroups) {
     if (!Array.isArray(radio) || radio.some(id => typeof id !== "string" || !ids.has(id)) ||
         new Set(radio).size !== radio.length) invalid("invalid radio group");
-    radioCount += radio.length;
-    if (radioCount > MAX_OPERANDS) invalid("radio group limit exceeded");
   }
 }
 
@@ -138,17 +132,27 @@ function evaluate(data: SceneOptionalContent | undefined, values: ReadonlyMap<st
   if (!data) return new Uint8Array(0);
   const result = new Uint8Array(data.conditions.length);
   const visited = new Uint8Array(result.length);
-  const visit = (index: number): boolean => {
-    if (visited[index]) return result[index] !== 0;
-    const condition = data.conditions[index];
-    const visible = condition.kind === "group" ? values.get(condition.groupId) === true :
-      condition.kind === "constant" ? condition.value : condition.kind === "not" ? !visit(condition.operand) :
-        condition.kind === "and" ? condition.operands.every(visit) : condition.operands.some(visit);
-    result[index] = visible ? 1 : 0;
-    visited[index] = 1;
-    return visible;
-  };
-  for (let index = 0; index < result.length; index++) visit(index);
+  const indices: number[] = [], children: number[] = [];
+  for (let root = 0; root < result.length; root++) {
+    if (visited[root]) continue;
+    indices.push(root); children.push(0);
+    while (indices.length) {
+      const top = indices.length - 1, index = indices[top], condition = data.conditions[index];
+      const operands = condition.kind === "not" ? [condition.operand] :
+        condition.kind === "and" || condition.kind === "or" ? condition.operands : [];
+      if (children[top] < operands.length) {
+        const child = operands[children[top]++];
+        if (!visited[child]) { indices.push(child); children.push(0); }
+        continue;
+      }
+      const visible = condition.kind === "group" ? values.get(condition.groupId) === true :
+        condition.kind === "constant" ? condition.value : condition.kind === "not" ? result[condition.operand] === 0 :
+          condition.kind === "and" ? condition.operands.every(child => result[child] !== 0) :
+            condition.operands.some(child => result[child] !== 0);
+      result[index] = visible ? 1 : 0; visited[index] = 1;
+      indices.pop(); children.pop();
+    }
+  }
   return result;
 }
 
@@ -200,6 +204,24 @@ function cloneSnapshot(value: OptionalContentSnapshot): OptionalContentSnapshot 
   return { revision: value.revision, layers: value.layers.map(layer => ({ ...layer })), conditions: value.conditions.slice() };
 }
 
+function cloneOrder(nodes: readonly OptionalContentOrderNode[]): OptionalContentOrderNode[] {
+  const result: OptionalContentOrderNode[] = [];
+  const pending = [{ source: nodes, target: result }];
+  while (pending.length) {
+    const { source, target } = pending.pop()!;
+    for (const node of source) {
+      const copy = { ...node };
+      if (node.children) {
+        const children: OptionalContentOrderNode[] = [];
+        copy.children = children;
+        pending.push({ source: node.children, target: children });
+      }
+      target.push(copy);
+    }
+  }
+  return result;
+}
+
 export function createDefaultOptionalContentSnapshot(scene: VectorScene): OptionalContentSnapshot {
   validateSceneOptionalContentReferences(scene);
   return snapshot(scene.optionalContent, new Map(scene.optionalContent?.groups.map(group => [group.id, group.defaultVisible])), 0);
@@ -232,15 +254,18 @@ export function getOptionalContentGroupIds(data: SceneOptionalContent | undefine
   }
   const annotationLayers = getAnnotationLayerIds(data);
   const visited = new Set<number>(), groups = new Set<string>();
-  const visit = (index: number): void => {
-    if (visited.has(index)) return;
+  const pending = [condition];
+  while (pending.length) {
+    const index = pending.pop()!;
+    if (visited.has(index)) continue;
     visited.add(index);
     const item = data.conditions[index];
     if (item.kind === "group") { if (!annotationLayers.has(item.groupId)) groups.add(item.groupId); }
-    else if (item.kind === "not") visit(item.operand);
-    else if (item.kind === "and" || item.kind === "or") for (const child of item.operands) visit(child);
-  };
-  visit(condition);
+    else if (item.kind === "not") pending.push(item.operand);
+    else if (item.kind === "and" || item.kind === "or") {
+      for (let child = item.operands.length - 1; child >= 0; child--) pending.push(item.operands[child]);
+    }
+  }
   return [...groups];
 }
 
@@ -294,7 +319,7 @@ export class OptionalContentController {
     const values = new Map(this.current.layers.map(layer => [layer.id, layer.visible]));
     return [...this.groups.values()].map(group => ({ ...group, visible: values.get(group.id)! }));
   }
-  getOrder(): readonly OptionalContentOrderNode[] { return structuredClone(this.data?.order ?? []); }
+  getOrder(): readonly OptionalContentOrderNode[] { return cloneOrder(this.data?.order ?? []); }
   getSnapshot(): OptionalContentSnapshot { return cloneSnapshot(this.current); }
   isVisible(condition?: number): boolean { return condition === undefined || this.current.conditions[condition] === 1; }
   getGroupIds(condition?: number): string[] { return getOptionalContentGroupIds(this.data, condition); }

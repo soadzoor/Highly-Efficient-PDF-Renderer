@@ -52,13 +52,13 @@ export interface NativeCcittDecodeResult {
 }
 
 const DEFAULT_LIMITS: Readonly<NativeCcittLimits> = Object.freeze({
-  maxColumns: 65_535,
-  maxRows: 65_535,
-  maxPixels: 268_435_456,
-  maxOutputBytes: 512 * 1024 * 1024,
-  maxScanBits: 8_589_934_592,
-  maxTransitions: 268_435_456,
-  maxDamagedRows: 1024
+  maxColumns: Number.MAX_SAFE_INTEGER,
+  maxRows: Number.MAX_SAFE_INTEGER,
+  maxPixels: Number.MAX_SAFE_INTEGER,
+  maxOutputBytes: Number.MAX_SAFE_INTEGER,
+  maxScanBits: Number.MAX_SAFE_INTEGER,
+  maxTransitions: Number.MAX_SAFE_INTEGER,
+  maxDamagedRows: Number.MAX_SAFE_INTEGER
 });
 
 type RunCode = readonly [runLength: number, bits: string];
@@ -272,7 +272,7 @@ export function decodeNativeCcittFax(
     damagedRows,
     bitsConsumed: reader.position,
     bytesConsumed: Math.ceil(reader.position / 8),
-    work: reader.work + budget.work,
+    work: checkedAdd(reader.work, budget.work, "CCITT decoder work"),
     terminatedBy
   };
 }
@@ -616,7 +616,7 @@ function findReferenceTransition(
   let low = 0;
   let high = transitions.length;
   while (low < high) {
-    const middle = (low + high) >>> 1;
+    const middle = Math.floor((low + high) / 2);
     // T.4 4.2.1.3.2 places b1 strictly to the right of a0. A reference
     // element that coincides with a0 belongs to the run already coded, so
     // skipping it is what keeps a vertical mode from moving backwards.
@@ -659,16 +659,16 @@ function setBlackRange(
   budget.checkCancellation();
   let position = start;
   while (position < end && (position & 7) !== 0) {
-    bytes[position >>> 3] |= 1 << (7 - (position & 7));
+    bytes[Math.floor(position / 8)] |= 1 << (7 - (position & 7));
     position += 1;
   }
-  const fullByteEnd = end >>> 3;
-  if (position < (fullByteEnd << 3)) {
-    bytes.fill(0xff, position >>> 3, fullByteEnd);
-    position = fullByteEnd << 3;
+  const fullByteEnd = Math.floor(end / 8);
+  if (position < fullByteEnd * 8) {
+    bytes.fill(0xff, Math.floor(position / 8), fullByteEnd);
+    position = fullByteEnd * 8;
   }
   while (position < end) {
-    bytes[position >>> 3] |= 1 << (7 - (position & 7));
+    bytes[Math.floor(position / 8)] |= 1 << (7 - (position & 7));
     position += 1;
   }
   budget.checkCancellation();
@@ -757,7 +757,7 @@ class MsbBitReader {
     if (this.atEnd) return undefined;
     this.accountScan();
     const absolute = this.bitOffset++;
-    return ((this.bytes[absolute >>> 3] >>> (7 - (absolute & 7))) & 1) as 0 | 1;
+    return ((this.bytes[Math.floor(absolute / 8)] >>> (7 - (absolute & 7))) & 1) as 0 | 1;
   }
 
   readRequired(message: string): 0 | 1 {
@@ -835,7 +835,7 @@ class MsbBitReader {
     if (remaining > 7) return false;
     for (let relative = 0; relative < remaining; relative += 1) {
       const absolute = this.bitOffset + relative;
-      if (((this.bytes[absolute >>> 3] >>> (7 - (absolute & 7))) & 1) !== 0) return false;
+      if (((this.bytes[Math.floor(absolute / 8)] >>> (7 - (absolute & 7))) & 1) !== 0) return false;
     }
     return true;
   }

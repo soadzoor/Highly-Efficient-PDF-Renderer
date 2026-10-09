@@ -96,7 +96,7 @@ export function normalizeIccComponents(
 export const NATIVE_ICC_GRID_POINTS: Readonly<Record<NativeIccComponentCount, number>> =
   Object.freeze({ 1: 256, 3: 33, 4: 17 });
 
-export const DEFAULT_MAX_ICC_TRANSFORM_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_MAX_ICC_TRANSFORM_BYTES = Number.MAX_SAFE_INTEGER;
 
 interface NativeIccTransformShape {
   readonly sampleCount: number;

@@ -411,6 +411,12 @@ async function testCidSystemInfoStringRejections() {
 }
 
 async function testUseCMapCyclesAndDepth() {
+  let encoding = stream("1 begincodespacerange <00> <ff> endcodespacerange 1 begincidchar <41> 5 endcidchar");
+  for (let depth = 0; depth < 128; depth++) encoding = stream("", new Map([["UseCMap", encoding]]));
+  const deeplyInherited = await parseNativePdfFont(compositeFont(encoding, cidFont("Japan1", 7)), identityResolver);
+  assert.equal(deeplyInherited.decode(Uint8Array.of(0x41)).cid, 5, "valid CMap inheritance extends beyond the former depth cap");
+  await assert.rejects(parseNativePdfFont(compositeFont(encoding, cidFont("Japan1", 7)), identityResolver,
+    { parserLimits: { maxUseCMapDepth: 64 } }), hasPdfError("resource-limit", /depth/));
   const oneInheritedLevel = await loadFont(10, { parserLimits: { maxUseCMapDepth: 1 } });
   assert.equal(oneInheritedLevel.decode(Uint8Array.of(0x81, 1)).cid, 200);
   await assert.rejects(loadFont(30), hasPdfError("unsupported-font", /cycle/i));

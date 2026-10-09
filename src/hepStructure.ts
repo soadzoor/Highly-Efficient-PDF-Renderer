@@ -11,7 +11,8 @@ import {
 
 export const HEP_STRUCTURE_PATH = "structure/structure.json";
 export const HEP_CONTENT_RANGES_PATH = "structure/content-ranges.varint";
-export const MAX_HEP_STRUCTURE_BYTES = 64 * 1024 * 1024;
+/** HEP chunk lengths use an unsigned 32-bit wire field. */
+export const MAX_HEP_STRUCTURE_BYTES = 0xffffffff;
 
 export interface HepStructureDescriptor {
   file: string;
@@ -77,13 +78,15 @@ export async function readHepStructure(archive: HepArchive, descriptor: unknown,
     throw new Error("HEP structure does not match its manifest entry.");
   }
   const mismatch = (): never => { throw new Error("HEP structure ranges do not match the scene."); };
-  const cursor = new VarintCursor(await read(HEP_CONTENT_RANGES_PATH));
+  const rangeBytes = await read(HEP_CONTENT_RANGES_PATH);
+  const cursor = new VarintCursor(rangeBytes);
   const ranges: SceneContentItemRanges = {};
   let total = 0;
   for (const kind of PRIMITIVE_KINDS) {
     const rangeCount = cursor.readVarUint32();
     if ((total += rangeCount) > meta.rangeCount) mismatch();
     if (rangeCount === 0) continue;
+    if (rangeCount * 3 > rangeBytes.length - cursor.byteOffset) mismatch();
     const primitives = scenePrimitiveCount(scene, kind), values = new Uint32Array(rangeCount * 3);
     let end = 0;
     for (let range = 0; range < rangeCount; range++) {

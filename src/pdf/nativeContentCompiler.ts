@@ -319,9 +319,9 @@ export interface DensePdfContentCompileOptions {
   formOptionalContent?: ReadonlyMap<string, Readonly<DensePdfOptionalContentDefinition>>;
   /** Optional-content associations on image XObjects in this resource scope. */
   imageOptionalContent?: ReadonlyMap<string, Readonly<DensePdfOptionalContentDefinition>>;
-  /** Maximum nested BMC/BDC scopes. @default 64 */
+  /** Maximum nested BMC/BDC scopes; defaults to Int32 marked-content index capacity. */
   maxMarkedContentDepth?: number;
-  /** Maximum BMC/BDC nodes retained by this compilation. @default 1000000 */
+  /** Maximum BMC/BDC nodes retained by this compilation; defaults to Int32 index capacity. */
   maxMarkedContent?: number;
   /**
    * Page-local HEPR image indexes keyed by `/XObject` resource name. A value
@@ -665,7 +665,6 @@ export type DensePdfSelectivePaintReason =
   | "shading-pattern-stroke"
   | "tiling-pattern-fill"
   | "tiling-pattern-stroke"
-  | "large-path"
   | "large-disconnected-fill"
   | "clipped-path"
   | "clipped-image"
@@ -859,12 +858,13 @@ const COVER_DIRECTION_SCALE = 2_000;
 const COVER_OFFSET_SCALE = 200;
 const COVER_INTERVAL_EPSILON = 0.05;
 const COVER_HALF_WIDTH_EPSILON = 1e-4;
-const DEFAULT_MAX_PATH_RESOURCES = 5_000_000;
-const DEFAULT_MAX_PATH_VERBS = 20_000_000;
-const DEFAULT_MAX_PATH_COORDINATES = 60_000_000;
-const DEFAULT_MAX_CLIP_PATHS = 1_000_000;
-const DEFAULT_MAX_STROKE_STYLES = 5_000_000;
-const DEFAULT_MAX_DASH_VALUES = 20_000_000;
+// These are typed-array index capacities, not estimates of available memory.
+const DEFAULT_MAX_PATH_RESOURCES = 0xffff_ffff;
+const DEFAULT_MAX_PATH_VERBS = 0xffff_ffff;
+const DEFAULT_MAX_PATH_COORDINATES = 0xffff_ffff;
+const DEFAULT_MAX_CLIP_PATHS = 0x7fff_ffff;
+const DEFAULT_MAX_STROKE_STYLES = 0xffff_ffff;
+const DEFAULT_MAX_DASH_VALUES = 0xffff_ffff;
 
 export const DENSE_PDF_STROKE_STYLE_FLAG_HAIRLINE = 1 << 0;
 const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
@@ -874,11 +874,10 @@ const STROKE_STYLE_FLAG_OFFSET = 2;
 
 const MAX_INPUT_SLICE_BYTES = 256 * 1024;
 const DEFAULT_YIELD_INTERVAL_MS = 50;
-const MAX_OPERAND_COUNT = 1_000_000;
-const MAX_PAINT_PATH_FLOATS = 65_536;
+const MAX_OPERAND_COUNT = 0xffff_ffff; // JavaScript array length capacity.
 const MAX_COVERAGE_GROUP_SIZE = 8_192;
-const DEFAULT_MAX_MARKED_CONTENT_DEPTH = 64;
-const DEFAULT_MAX_MARKED_CONTENT = 1_000_000;
+const DEFAULT_MAX_MARKED_CONTENT_DEPTH = 0x7fff_ffff;
+const DEFAULT_MAX_MARKED_CONTENT = 0x7fff_ffff;
 const TEXT_SINK_OPERATORS = new Set([
   "q", "Q", "cm", "BT", "ET", "Tf", "Tc", "Tw", "Tz", "TL", "Tr", "Ts",
   "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\""
@@ -2330,7 +2329,7 @@ class DenseContentCompiler {
     const container = this.containers.at(-1);
     if (!container) {
       if (this.operandCount >= MAX_OPERAND_COUNT) {
-        throw new DensePdfSyntaxError("PDF content operand stack exceeded its safety limit.");
+        throw new DensePdfSyntaxError("PDF content operand stack exceeds JavaScript array capacity.");
       }
       this.operands[this.operandCount++] = value;
       return;
@@ -3392,8 +3391,6 @@ class DenseContentCompiler {
     }
 
     const pathData = this.path.view();
-    const oversizedPath = !this.policy.displayProgram &&
-      pathData.length > MAX_PAINT_PATH_FLOATS;
     const pathBounds = pathData.length > 0
       ? computeTransformedPathBounds(pathData, this.state.matrix)
       : null;
@@ -3479,21 +3476,9 @@ class DenseContentCompiler {
       this.state.fillAlpha > ALPHA_INVISIBLE_EPSILON;
     const visibleStroke = strokePathVisible && strokePaint && !strokeUsesPattern &&
       this.state.strokeAlpha > ALPHA_INVISIBLE_EPSILON;
-    // The cooperative geometry budget applies to emitted paint, not to clip
-    // resources or discarded paths. Pages can preserve the complete compound
-    // path (including winding, dashes, and the active clip) through the native
-    // display program's bounded selective raster capture.
-    const visibleOversizedPath = oversizedPath &&
-      (visibleFill || visibleStroke || visiblePatternFill || visiblePatternStroke);
-    if (visibleOversizedPath && !this.policy.selectiveRaster) {
-      throw new DensePdfUnsupportedError(
-        "A single PDF path is too large for cooperative vector compilation.",
-        operator
-      );
-    }
     const selectivelyCapturedPath = this.policy.vectorScene === true &&
       this.policy.selectiveRaster === true &&
-      (visibleOversizedPath || largeDisconnectedFill || visiblePatternFill || visiblePatternStroke ||
+      (largeDisconnectedFill || visiblePatternFill || visiblePatternStroke ||
         ((!this.policy.orderedPaint && !this.state.clipIsDefault && !this.state.clipIsExactRectangle) &&
           (visibleFill || visibleStroke)));
     if (selectivelyCapturedPath) {
@@ -3504,7 +3489,7 @@ class DenseContentCompiler {
         this.operatorSourceOffset,
         this.operatorSourceLength
       );
-      this.recordVectorSelectivePaint(ordinal, visibleOversizedPath ? "large-path" : selectivePathPaintReason(
+      this.recordVectorSelectivePaint(ordinal, selectivePathPaintReason(
         largeDisconnectedFill, visiblePatternFill, visiblePatternStroke,
         this.state.fillPattern?.kind, this.state.strokePattern?.kind));
       finishClip();
@@ -3638,7 +3623,6 @@ class DenseContentCompiler {
 
     if (visibleFill) {
       const fillStart = this.fillPathCount;
-      const fillSegmentStart = fillSegmentsA.quadCount;
       if (fillRule === null) {
         throw new DensePdfSyntaxError("Missing PDF fill rule for a painted fill path.");
       }
@@ -3660,9 +3644,6 @@ class DenseContentCompiler {
             this.state.clipMask
           );
       if (emittedBounds) {
-        if (!this.policy.displayProgram && fillSegmentsA.quadCount - fillSegmentStart > 65_536) {
-          throw new DensePdfUnsupportedError("VectorScene fill exceeds the 65536-segment analytic coverage budget.", operator);
-        }
         this.fillPathCount += 1;
         this.fillBounds = combineBounds(this.fillBounds, emittedBounds);
       }
@@ -5012,7 +4993,7 @@ class DensePdfResourceReferenceScanner {
     const container = this.containers.at(-1);
     if (!container) {
       if (this.operands.length >= MAX_OPERAND_COUNT) {
-        throw new DensePdfSyntaxError("PDF content operand stack exceeded its safety limit.");
+        throw new DensePdfSyntaxError("PDF content operand stack exceeds JavaScript array capacity.");
       }
       this.operands.push(value);
       return;
@@ -6724,10 +6705,9 @@ async function markContainedSegments(
   const opaqueCovers: number[] = [];
   const cullGroup = (candidates: number[]): void => {
     if (candidates.length > MAX_COVERAGE_GROUP_SIZE) {
-      if (order) return;
-      throw new DensePdfUnsupportedError(
-        "A collinear stroke group is too large for cooperative vector culling."
-      );
+      // Culling is optional. Keep the complete vector group when its quadratic
+      // comparison pass would monopolize a cooperative compilation interval.
+      return;
     }
     if (candidates.length > starts.length) {
       starts = new Float64Array(Math.max(candidates.length, starts.length * 2));

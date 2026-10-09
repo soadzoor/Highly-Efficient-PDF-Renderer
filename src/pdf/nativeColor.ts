@@ -103,11 +103,11 @@ interface ColorParseStack {
   readonly depth: number;
 }
 
-const DEFAULT_MAX_ICC_PROFILE_BYTES = 64 * 1024 * 1024;
-const DEFAULT_MAX_DEVICE_N_COMPONENTS = 32;
-const DEFAULT_MAX_COLOR_SPACES = 4_096;
-const DEFAULT_MAX_COLOR_STORE_VALUES = 16_777_216;
-const DEFAULT_MAX_COLOR_STORE_BYTES = 128 * 1024 * 1024;
+const DEFAULT_MAX_ICC_PROFILE_BYTES = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_DEVICE_N_COMPONENTS = 255; // HEPR component-count field.
+const DEFAULT_MAX_COLOR_SPACES = 0x7fff_ffff;
+const DEFAULT_MAX_COLOR_STORE_VALUES = 0xffff_ffff;
+const DEFAULT_MAX_COLOR_STORE_BYTES = 0xffff_ffff;
 const D65 = [0.95047, 1, 1.08883] as const;
 
 /** Owns PDF color resources and their canonical-sRGB conversion. */

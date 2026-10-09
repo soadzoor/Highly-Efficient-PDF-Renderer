@@ -259,7 +259,7 @@ export class NativePdfExtGStateRegistry {
     );
     this.maxExtGStates = boundedOption(
       options.maxExtGStates,
-      document.limits.maxCachedObjects,
+      MAX_INT32,
       "maxExtGStates"
     );
   }

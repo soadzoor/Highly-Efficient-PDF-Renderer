@@ -265,6 +265,7 @@ export function encodeRasterLayerTable({ atlases, layers }: RasterLayerTable): U
 export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTableLimits): RasterLayerTable {
   const cursor = new VarintCursor(bytes);
   const atlasCount = requireInteger(cursor.readVarUint32(), 0, limits.maxAtlases, "atlas count");
+  if (atlasCount * 3 + 1 > bytes.length - cursor.byteOffset) fail("atlas records are truncated");
   const atlases: RasterAtlasRecord[] = [];
   for (let index = 0; index < atlasCount; index += 1) {
     const encoding = ATLAS_ENCODINGS[cursor.readByte("atlas encoding")];
@@ -274,6 +275,7 @@ export function decodeRasterLayerTable(bytes: Uint8Array, limits: RasterLayerTab
     atlases.push({ encoding, width, height });
   }
   const layerCount = requireInteger(cursor.readVarUint32(), 0, limits.maxLayers, "layer count");
+  if (layerCount * 29 > bytes.length - cursor.byteOffset) fail("layer records or matrices are truncated");
   const layers: RasterLayerRecord[] = [];
   let paintOrder = 0;
   let pageIndex = 0;

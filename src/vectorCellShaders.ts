@@ -207,7 +207,7 @@ export const VECTOR_FILL_CELL_INFO_WGSL = /* wgsl */ `
 fn heprFillCellInfo(pathIndex: f32, headers: f32, segments: texture_2d<f32>) -> vec4<f32> {
   if (headers <= 0.0) { return vec4<f32>(0.0); }
   let width = i32(textureDimensions(segments).x);
-  let index = i32(headers - 1.0 + pathIndex + 0.5);
+  let index = i32(headers - 1.0 + pathIndex);
   return textureLoad(segments, vec2<i32>(index % width, index / width), 0);
 }
 `;

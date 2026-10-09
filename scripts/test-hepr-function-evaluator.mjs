@@ -181,6 +181,34 @@ const fixture = writeTinyPdf({
 const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture });
 
 try {
+  // Small payloads exceed the previous policy limits without large allocation.
+  const unrestricted = new NativePdfFunctionRegistry(document);
+  for (let index = 0; index < 4097; index++) await unrestricted.add(exponential());
+  const wideOutputs = await unrestricted.add(exponential({
+    range: Array.from({ length: 33 }, () => [0, 1]).flat(),
+    c0: new Array(33).fill(0), c1: new Array(33).fill(1)
+  }));
+  const manyInputs = await unrestricted.add(sampled({
+    domain: Array.from({ length: 40 }, () => [0, 1]).flat(), size: new Array(40).fill(1), values: [255]
+  }));
+  let deepFunction = exponential();
+  for (let depth = 0; depth < 70; depth++) deepFunction = stitching({ functions: [deepFunction] });
+  const deepIndex = await unrestricted.add(deepFunction);
+  const manyOperations = await unrestricted.add(calculator(`{ pop 0 ${"0 add ".repeat(9000)} }`));
+  const largeStack = await unrestricted.add(calculator(`{ pop ${"0 ".repeat(257)}${"add ".repeat(256)} }`));
+  let nestedProcedure = "1";
+  for (let depth = 0; depth < 70; depth++) nestedProcedure = `true { ${nestedProcedure} } if`;
+  const deepCalculator = await unrestricted.add(calculator(`{ pop ${nestedProcedure} }`));
+  const unrestrictedEvaluator = new HeprFunctionEvaluator(unrestricted.buildStore());
+  for (const [index, inputs, expected] of [
+    [4096, [0.5], [0.5]], [wideOutputs, [0.5], new Array(33).fill(0.5)],
+    [manyInputs, new Array(40).fill(0.5), [1]], [deepIndex, [0.5], [0.5]],
+    [manyOperations, [0], [0]], [largeStack, [0], [0]], [deepCalculator, [0], [1]]
+  ]) {
+    closeArrays(unrestricted.evaluate(index, inputs), expected);
+    closeArrays(unrestrictedEvaluator.evaluate(index, inputs), expected);
+  }
+
   const registry = new NativePdfFunctionRegistry(document);
   const linear = await registry.add(sampled({
     domain: [0, 1, 0, 1],

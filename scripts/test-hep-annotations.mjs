@@ -60,5 +60,11 @@ try {
   }
   const cyclic = { type: "Named" }; cyclic.next = [cyclic];
   assert.throws(() => validateAnnotations([{ ...scene.annotations[0], action: cyclic }], { pageCount: 1, conditionCount: 1 }), /annotation/);
+  let action = { type: "Named", name: "LastPage" };
+  for (let depth = 0; depth < 70; depth++) action = { type: "Named", next: [action] };
+  const deepScene = { ...scene, annotations: [{ ...scene.annotations[0], action }] };
+  const deepBlob = await buildHep(deepScene, { compression: "store" });
+  const deepLoaded = await loadSceneFromHep(new Uint8Array(await deepBlob.arrayBuffer()));
+  assert.deepEqual(deepLoaded.annotations, deepScene.annotations, "valid action chains beyond the former nesting limit round trip");
   console.log("HEP annotation sections: round trips, older files, placement, layers, corruption and cancellation passed.");
 } finally { hooks.deregister(); }

@@ -11,7 +11,7 @@ try {
   const { lowerRetainedPageToVectorScene } = await import("../src/retainedVectorPage.ts");
   const { validateScenePaintGraph } = await import("../src/scenePaintGraph.ts");
   const { buildRasterAtlasBatches } = await import("../src/rasterAtlasBatches.ts");
-  const { compositeBinaryStencilPlates, MAX_STENCIL_COMPOSITE_PIXELS } = await import("../src/retainedStencilRaster.ts");
+  const { compositeBinaryStencilPlates } = await import("../src/retainedStencilRaster.ts");
 
   const first = "q 20 0 0 10 10 10 cm .643137255 .682352941 .674509804 rg /A Do Q";
   const second = "q 20 0 0 10 10 10 cm .549019608 .588235294 .580392157 rg /B Do Q";
@@ -106,8 +106,10 @@ try {
   grayCoverage.stores.images.data[grayCoverage.stores.images.dataOffsets[0]] = 128;
   assert.equal((await lower(grayCoverage)).rasterLayers.length, 2, "fractional source coverage keeps its original compositing");
 
-  assert.throws(() => compositeBinaryStencilPlates([], MAX_STENCIL_COMPOSITE_PIXELS + 1, 1, 1,
-    new AbortController().signal), /tile budget/);
+  const largeComposite = compositeBinaryStencilPlates([], 4_000_001, 1, 1, new AbortController().signal);
+  assert.equal(largeComposite.data.length, 4_000_001 * 4, "stencil allocations beyond the former allowance are attempted");
+  assert.throws(() => compositeBinaryStencilPlates([], Number.MAX_SAFE_INTEGER, 2, 1,
+    new AbortController().signal), /dimensions/);
   const cancelled = new AbortController(); cancelled.abort();
   assert.throws(() => compositeBinaryStencilPlates([{ coverage: Uint8Array.of(255), color: [1, 0, 0, 1] }],
     1, 1, 1, cancelled.signal), { name: "AbortError" });

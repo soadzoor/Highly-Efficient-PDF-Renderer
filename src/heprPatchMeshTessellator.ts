@@ -145,11 +145,11 @@ const DEFAULT_OPTIONS: Readonly<Omit<ResolvedOptions, "signal" | "evaluateFuncti
   flatness: 0.25,
   componentFlatness: 1 / 1024,
   minFunctionDepth: 1,
-  maxDepth: 10,
-  maxTriangles: 1_000_000,
-  maxOutputBytes: 256 * 1024 * 1024,
-  maxSubdivisionNodes: 2_000_000,
-  maxFunctionEvaluations: 2_000_000
+  maxDepth: Number.MAX_SAFE_INTEGER,
+  maxTriangles: 0xffff_ffff,
+  maxOutputBytes: Number.MAX_SAFE_INTEGER,
+  maxSubdivisionNodes: Number.MAX_SAFE_INTEGER,
+  maxFunctionEvaluations: Number.MAX_SAFE_INTEGER
 });
 
 const PATCH_FUNCTION_ARRAY_FLAG = 1 << 5;
@@ -329,7 +329,7 @@ function resolveOptions(options: HeprPatchTessellationOptions): ResolvedOptions 
   };
   requirePositiveFinite(resolved.flatness, "flatness");
   requirePositiveFinite(resolved.componentFlatness, "componentFlatness");
-  requireIntegerRange(resolved.maxDepth, 0, 20, "maxDepth");
+  requireIntegerRange(resolved.maxDepth, 0, Number.MAX_SAFE_INTEGER, "maxDepth");
   requireIntegerRange(resolved.minFunctionDepth, 0, resolved.maxDepth, "minFunctionDepth");
   requirePositiveSafeInteger(resolved.maxTriangles, "maxTriangles");
   requirePositiveSafeInteger(resolved.maxOutputBytes, "maxOutputBytes");
@@ -587,6 +587,15 @@ function buildPatchLeaves(patch: PatchRecord, context: TessellationContext): voi
     }
     if (leaf.depth >= context.options.maxDepth) {
       throw limitError("Patch tessellation cannot satisfy flatness within maxDepth.", {
+        patchIndex: patch.sourceIndex,
+        depth: leaf.depth,
+        geometryError,
+        componentError
+      });
+    }
+    // The dyadic topology grid needs exact integer cells and half-cell centers.
+    if (!Number.isSafeInteger(2 ** (leaf.depth + 1))) {
+      throw limitError("Patch subdivision exceeds numeric parameter-grid precision.", {
         patchIndex: patch.sourceIndex,
         depth: leaf.depth,
         geometryError,

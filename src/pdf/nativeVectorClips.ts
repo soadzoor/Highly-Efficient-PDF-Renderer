@@ -96,7 +96,12 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
   const line = (nx: number, ny: number): void => {
     if (x === nx && y === ny) return;
     if (![x, y, nx, ny].every(value => Number.isFinite(Math.fround(value)))) {
-      throw new PdfError("invalid-object", "Non-finite vector clip coordinates.");
+      // Finite PDF coordinates can exceed the GPU store after transformation.
+      // Retained lowering can intersect large Form bounding clips with the page
+      // before storing them, so keep this a representation failure it can retry.
+      throw new PdfError("unsupported-content", "Vector clip coordinates exceed Float32 storage.", {
+        details: { reason: "vector-clip-coordinate-range" }
+      });
     }
     // Consecutive collinear edges have the same directed winding as their
     // endpoint chord, including partial or complete backtracking. Use exact
@@ -137,7 +142,9 @@ function flattenVectorClip(path: DensePdfTextClip["path"], tolerance: number, si
       // These are points on the curve; its control hull may extend beyond
       // Float32 even when every rendered curve point remains representable.
       if (![x0, y0, x3, y3].every(value => Number.isFinite(Math.fround(value)))) {
-        throw new PdfError("invalid-object", "Non-finite vector clip coordinates.");
+        throw new PdfError("unsupported-content", "Vector clip coordinates exceed Float32 storage.", {
+          details: { reason: "vector-clip-coordinate-range" }
+        });
       }
       // Distance to the endpoint segment bounds the complete Bezier control hull.
       const distance = (px: number, py: number): number => {

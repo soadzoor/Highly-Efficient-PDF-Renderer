@@ -105,8 +105,6 @@ type Matrix = [number, number, number, number, number, number];
 const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0];
 const MAX_INT32 = 0x7fff_ffff;
 const MAX_UINT32 = 0xffff_ffff;
-const DEFAULT_MAX_TEXT_CODE_UNITS = 100_000_000;
-const DEFAULT_MAX_GRAPHICS_STATE_DEPTH = 64;
 /** PDF.js tracking-space threshold used for signed TJ positioning gaps. */
 const TEXT_INDEX_GAP_EM_FACTOR = 0.102;
 
@@ -173,24 +171,20 @@ export class NativeTextCompiler {
 
   constructor(options: NativeTextCompilerOptions) {
     this.fonts = options.fonts;
-    this.maxGlyphs = options.maxGlyphs ?? 10_000_000;
+    this.maxGlyphs = options.maxGlyphs ?? MAX_INT32;
     requirePositiveLimit(this.maxGlyphs, "maxGlyphs", MAX_INT32);
-    this.maxTextCodeUnits = options.maxTextCodeUnits ?? Math.min(
-      DEFAULT_MAX_TEXT_CODE_UNITS,
-      Math.max(1_024, this.maxGlyphs * 8)
-    );
-    requirePositiveLimit(this.maxTextCodeUnits, "maxTextCodeUnits", MAX_INT32);
-    this.maxFallbackQuads = options.maxFallbackQuads ?? this.maxGlyphs;
+    this.maxTextCodeUnits = options.maxTextCodeUnits ?? MAX_UINT32;
+    requirePositiveLimit(this.maxTextCodeUnits, "maxTextCodeUnits", MAX_UINT32);
+    // Char-to-glyph indexes reserve -1 for separators and encode fallback
+    // records as -index-2, leaving one fewer Int32 fallback slot than glyph slots.
+    this.maxFallbackQuads = options.maxFallbackQuads ?? Math.min(this.maxGlyphs, MAX_INT32 - 1);
     requirePositiveLimit(this.maxFallbackQuads, "maxFallbackQuads", MAX_INT32 - 1);
     this.maxTransforms = options.maxTransforms ?? this.maxGlyphs + 1;
     requirePositiveLimit(this.maxTransforms, "maxTransforms", MAX_UINT32);
-    this.maxTextArrayItems = options.maxTextArrayItems ?? Math.min(
-      MAX_INT32,
-      Math.max(1_024, this.maxGlyphs * 2)
-    );
-    requirePositiveLimit(this.maxTextArrayItems, "maxTextArrayItems", MAX_INT32);
-    this.maxGraphicsStateDepth = options.maxGraphicsStateDepth ?? DEFAULT_MAX_GRAPHICS_STATE_DEPTH;
-    requirePositiveLimit(this.maxGraphicsStateDepth, "maxGraphicsStateDepth", MAX_INT32);
+    this.maxTextArrayItems = options.maxTextArrayItems ?? Number.MAX_SAFE_INTEGER;
+    requirePositiveLimit(this.maxTextArrayItems, "maxTextArrayItems", Number.MAX_SAFE_INTEGER);
+    this.maxGraphicsStateDepth = options.maxGraphicsStateDepth ?? MAX_UINT32;
+    requirePositiveLimit(this.maxGraphicsStateDepth, "maxGraphicsStateDepth", Number.MAX_SAFE_INTEGER);
     this.signal = options.signal;
     throwIfAborted(this.signal);
     this.ctm = validateMatrix(options.initialTransform ?? IDENTITY, "initial text transform");

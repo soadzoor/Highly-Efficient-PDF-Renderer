@@ -51,9 +51,9 @@ export function validateScenePaintGraph(scene: VectorScene): void {
   const retainedSlots = new Set<number>();
   let count = 0;
   const visit = (nodes: readonly ScenePaintNode[], depth: number): void => {
-    if (!Array.isArray(nodes) || depth > 64) throw new RangeError("Invalid PDF paint graph nesting.");
+    if (!Array.isArray(nodes)) throw new RangeError("Invalid PDF paint graph nesting.");
     for (const node of nodes) {
-      if (!node || typeof node !== "object" || seen.has(node) || ++count > 1_000_000) throw new TypeError("Invalid cyclic or oversized PDF paint graph.");
+      if (!node || typeof node !== "object" || seen.has(node) || ++count > 0xffffffff) throw new TypeError("Invalid cyclic PDF paint graph or Uint32 node index overflow.");
       seen.add(node);
       if (node.optionalContent !== undefined && (!Number.isSafeInteger(node.optionalContent) || node.optionalContent < 0 ||
         node.optionalContent >= (scene.optionalContent?.conditions.length ?? 0))) throw new RangeError("Invalid PDF paint graph visibility condition.");
@@ -84,7 +84,7 @@ export function validateScenePaintGraph(scene: VectorScene): void {
         if (node.softMask) {
           const mask = node.softMask;
           if (mask.subtype !== "Alpha" && mask.subtype !== "Luminosity") throw new TypeError("Invalid PDF mask subtype.");
-          if (mask.transfer && (!(mask.transfer instanceof Float32Array) || mask.transfer.length < 2 || mask.transfer.length > 65536 ||
+          if (mask.transfer && (!(mask.transfer instanceof Float32Array) || mask.transfer.length < 2 ||
             !mask.transfer.every((value: number) => Number.isFinite(value) && value >= 0 && value <= 1))) throw new TypeError("Invalid PDF mask transfer function.");
           if (mask.backdrop && (!Array.isArray(mask.backdrop) || mask.backdrop.length !== 3 ||
             !mask.backdrop.every((value: number) => Number.isFinite(value) && value >= 0 && value <= 1))) throw new TypeError("Invalid PDF mask backdrop.");
@@ -139,7 +139,6 @@ export function planScenePaintPasses(scene: VectorScene, visible: (condition?: n
   const result: ScenePaintPass[] = [];
   let nextId = 0;
   const visit = (nodes: readonly ScenePaintNode[], depth: number): void => {
-    if (depth > 64) throw new RangeError("PDF paint graph nesting exceeds 64 groups.");
     for (const node of nodes) {
       if (!visible(node.optionalContent)) continue;
       if (node.kind === "draw") {
@@ -177,7 +176,6 @@ const normalizedGraphs = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
  * it contains never affects the isolation of the group carrying it.
  */
 function paintsSourceOverOnly(scene: VectorScene, nodes: readonly ScenePaintNode[], depth: number): boolean {
-  if (depth > 64) return false;
   for (const node of nodes) {
     if (node.kind === "group") {
       if (node.knockout || node.blendMode !== "Normal" || !paintsSourceOverOnly(scene, node.children, depth + 1)) return false;
@@ -215,7 +213,7 @@ export function normalizeScenePaintGraph(scene: VectorScene): readonly ScenePain
   const rewrite = (nodes: readonly ScenePaintNode[], depth: number, knockoutParent: boolean): ScenePaintNode[] => {
     const result: ScenePaintNode[] = [];
     for (const node of nodes) {
-      if (node.kind !== "group" || depth >= 64) { result.push(node); continue; }
+      if (node.kind !== "group") { result.push(node); continue; }
       const sourceOverOnly = !node.knockout && paintsSourceOverOnly(scene, node.children, 0);
       const children = rewrite(node.children, depth + 1, node.knockout);
       if (!knockoutParent && node.alpha === 1 && !node.softMask &&
@@ -265,7 +263,6 @@ export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
   runs.forEach((run, index) => { if (run.kind === "raster" && run.count === 1) retainedRuns.set(run.first, index); });
   let current = 0;
   const visit = (nodes: readonly ScenePaintNode[], depth: number, knockout = false): void => {
-    if (depth > 64) return;
     current++;
     for (const node of nodes) {
       if (node.kind === "group") {
@@ -330,7 +327,6 @@ export function scenePaintNodeBounds(scene: VectorScene): ScenePaintExtents {
   const retainedRuns = new Map<number, number>();
   runs.forEach((run, index) => { if (run.kind === "raster" && run.count === 1) retainedRuns.set(run.first, index); });
   const visit = (nodes: readonly ScenePaintNode[], depth: number): Bounds => {
-    if (depth > 64) return UNBOUNDED;
     const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
     const include = (other: Bounds): void => {
       bounds.minX = Math.min(bounds.minX, other.minX); bounds.minY = Math.min(bounds.minY, other.minY);

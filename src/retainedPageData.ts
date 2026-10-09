@@ -13,7 +13,7 @@ export interface SceneRetainedPage {
 
 export function validateSceneRetainedPages(scene: VectorScene): void {
   if (scene.retainedPages === undefined) return;
-  if (!Array.isArray(scene.retainedPages) || scene.retainedPages.length > 4096) throw new TypeError("Invalid retained page resources.");
+  if (!Array.isArray(scene.retainedPages)) throw new TypeError("Invalid retained page resources.");
   const validated = new Set<HeprPageData>();
   for (const resource of scene.retainedPages) {
     if (!resource || !(resource.matrix instanceof Float32Array) || resource.matrix.length !== 6 ||

@@ -679,7 +679,7 @@ vec4 heprSamplePdfGradient(vec2 world, float gradientIndexInput) {
   if (gradientIndexInput < -0.5) {
     return vec4(1.0);
   }
-  int gradientIndex = int(gradientIndexInput + 0.5);
+  int gradientIndex = int(gradientIndexInput);
   ivec2 coord = ivec2(gradientIndex % uGradientMetaTexSize.x, gradientIndex / uGradientMetaTexSize.x);
   vec4 metaA = texelFetch(uGradientMetaTexA, coord, 0);
   vec4 metaB = texelFetch(uGradientMetaTexB, coord, 0);

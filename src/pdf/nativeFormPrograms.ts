@@ -294,12 +294,12 @@ export class NativePdfFormGraphBuilder {
     throwIfAborted(options.signal);
     const existing = this.byForm.get(invocation.form);
     if (existing) return existing.definitionIndex;
-    if (this.mutable.length >= document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Referenced Form definitions exceed the object-cache limit.", {
+    if (this.mutable.length >= 0xffffffff) {
+      throw new PdfError("resource-limit", "Referenced Form definitions exceed the Uint32 index range.", {
         pageIndex,
         details: {
           reason: "form-definition-count",
-          maxFormDefinitions: document.limits.maxCachedObjects
+          maxFormDefinitions: 0xffffffff
         }
       });
     }
@@ -401,12 +401,12 @@ export async function buildNativePdfScopedFormDefinitionGraph(
     throwIfAborted(options.signal);
     const existing = byForm.get(invocation.form);
     if (existing) return existing.definitionIndex;
-    if (mutable.length >= document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Referenced Form definitions exceed the object-cache limit.", {
+    if (mutable.length >= 0xffffffff) {
+      throw new PdfError("resource-limit", "Referenced Form definitions exceed the Uint32 index range.", {
         pageIndex: options.pageIndex,
         details: {
           reason: "form-definition-count",
-          maxFormDefinitions: document.limits.maxCachedObjects
+          maxFormDefinitions: 0xffffffff
         }
       });
     }
@@ -549,12 +549,12 @@ export async function buildNativePdfResourceFormDefinitionGraph(
     throwIfAborted(options.signal);
     const existing = byForm.get(invocation.form);
     if (existing) return existing.definitionIndex;
-    if (mutable.length >= document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Referenced Form definitions exceed the object-cache limit.", {
+    if (mutable.length >= 0xffffffff) {
+      throw new PdfError("resource-limit", "Referenced Form definitions exceed the Uint32 index range.", {
         pageIndex: options.pageIndex,
         details: {
           reason: "form-definition-count",
-          maxFormDefinitions: document.limits.maxCachedObjects
+          maxFormDefinitions: 0xffffffff
         }
       });
     }

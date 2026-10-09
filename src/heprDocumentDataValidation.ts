@@ -66,11 +66,11 @@ export interface HeprDataValidationLimits {
 
 export const DEFAULT_HEPR_DATA_VALIDATION_LIMITS: Readonly<HeprDataValidationLimits> =
   Object.freeze({
-    maxPages: 1_000_000,
-    maxCommandsPerPage: 10_000_000,
-    maxResourcesPerStore: 10_000_000,
-    maxTypedArrayBytesPerPage: 2 * 1024 * 1024 * 1024,
-    maxTextCodeUnitsPerPage: 100_000_000
+    maxPages: 0xffff_ffff,
+    maxCommandsPerPage: 0xffff_ffff,
+    maxResourcesPerStore: 0xffff_ffff,
+    maxTypedArrayBytesPerPage: Number.MAX_SAFE_INTEGER,
+    maxTextCodeUnitsPerPage: 0xffff_ffff
   });
 
 type TypedArray =

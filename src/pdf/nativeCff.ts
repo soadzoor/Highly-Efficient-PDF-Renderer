@@ -4,7 +4,7 @@ import type {
 } from "./nativeFont";
 import { PdfError } from "./nativeTypes";
 
-/** Independent ceilings for the object-heavy CFF and Type 2 interpreters. */
+/** Optional caller ceilings for the CFF and Type 2 interpreters. */
 export interface NativeCffParserLimits {
   readonly maxCffBytes: number;
   readonly maxCffIndexEntries: number;
@@ -17,14 +17,14 @@ export interface NativeCffParserLimits {
 }
 
 export const DEFAULT_NATIVE_CFF_PARSER_LIMITS: Readonly<NativeCffParserLimits> = Object.freeze({
-  maxCffBytes: 64 * 1024 * 1024,
-  maxCffIndexEntries: 1_000_000,
-  maxCffStringBytes: 16 * 1024 * 1024,
-  maxType2CharStringBytes: 16 * 1024 * 1024,
-  maxType2Operators: 1_000_000,
-  maxType2SubrDepth: 32,
-  maxType2SubrCalls: 4_096,
-  maxType2PathCommands: 1_000_000
+  maxCffBytes: Number.MAX_SAFE_INTEGER,
+  maxCffIndexEntries: Number.MAX_SAFE_INTEGER,
+  maxCffStringBytes: Number.MAX_SAFE_INTEGER,
+  maxType2CharStringBytes: Number.MAX_SAFE_INTEGER,
+  maxType2Operators: Number.MAX_SAFE_INTEGER,
+  maxType2SubrDepth: Number.MAX_SAFE_INTEGER,
+  maxType2SubrCalls: Number.MAX_SAFE_INTEGER,
+  maxType2PathCommands: Number.MAX_SAFE_INTEGER
 });
 
 interface CffIndex {

@@ -24,7 +24,6 @@ import {
 
 const MAX_INT32 = 0x7fff_ffff;
 const MAX_UINT32 = 0xffff_ffff;
-const MAX_TEXT_CODE_UNITS = 100_000_000;
 
 export interface NativePageTextResourceOptions {
   readonly maxPaths: number;
@@ -266,7 +265,7 @@ function resolveLimits(options: NativePageTextResourceOptions): ResolvedPageText
   return {
     maxPaths: readLimit(options.maxPaths, "maxPaths", MAX_UINT32),
     maxGlyphs,
-    maxFonts: readLimit(options.maxFonts ?? 1_000_000, "maxFonts", MAX_UINT32),
+    maxFonts: readLimit(options.maxFonts ?? MAX_UINT32, "maxFonts", MAX_UINT32),
     maxTransforms: readLimit(options.maxTransforms ?? maxGlyphs + 1, "maxTransforms", MAX_UINT32),
     maxPathVerbs: readLimit(
       options.maxPathVerbs ?? DEFAULT_PDF_RESOURCE_LIMITS.maxPathVerbsPerPage,
@@ -279,14 +278,14 @@ function resolveLimits(options: NativePageTextResourceOptions): ResolvedPageText
       MAX_UINT32
     ),
     maxFallbackQuads: readLimit(
-      options.maxFallbackQuads ?? maxGlyphs,
+      options.maxFallbackQuads ?? Math.min(maxGlyphs, MAX_INT32 - 1),
       "maxFallbackQuads",
       MAX_INT32 - 1
     ),
     maxTextCodeUnits: readLimit(
-      options.maxTextCodeUnits ?? MAX_TEXT_CODE_UNITS,
+      options.maxTextCodeUnits ?? MAX_UINT32,
       "maxTextCodeUnits",
-      MAX_INT32
+      MAX_UINT32
     )
   };
 }

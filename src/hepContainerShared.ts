@@ -2,10 +2,8 @@
 export const HEADER_BYTES = 32;
 export const CHUNK_RECORD_BYTES = 20;
 export const EMPTY_CHUNK = 0xffffffff;
-export const MAX_RECORDS = 8192;
-export const MAX_INDEX_BYTES = 16 * 1024 * 1024;
-export const MAX_CHUNK_BYTES = 1024 * 1024 * 1024;
-export const MAX_TOTAL_BYTES = 2 * MAX_CHUNK_BYTES;
+/** Offsets and lengths in the container index are unsigned 32-bit fields. */
+export const MAX_UINT32 = 0xffffffff;
 
 export const GROUP_BYTES = 64 * 1024;
 export const encoder = new TextEncoder();
@@ -41,7 +39,7 @@ export function hasLegacyZipSignature(input: ArrayBuffer | Uint8Array): boolean 
 
 export interface HepArchiveLoadOptions {
   signal?: AbortSignal;
-  /** Optional stricter limits, checked from the index before decompression. */
+  /** Optional caller limits, checked from the index before decompression. */
   entryByteLimits?: Record<string, number>;
 }
 
@@ -97,12 +95,7 @@ export function validateName(name: string): Uint8Array {
 }
 
 function entryLimit(name: string, limits?: Record<string, number>): number {
-  let limit = MAX_CHUNK_BYTES;
-  if (name === "manifest.json") limit = 16 * 1024 * 1024;
-  if (name === "lod-vector/index.json" || name === "lod-text/index.json") limit = 64 * 1024 * 1024;
-  if (name === "annotations/annotations.json") limit = 64 * 1024 * 1024;
-  if (name === "source/source.pdf" || name === "source.pdf") limit = 512 * 1024 * 1024;
-  if (name.startsWith("raster/")) limit = 768 * 1024 * 1024;
+  let limit = MAX_UINT32;
   if (limits && Object.hasOwn(limits, name)) {
     const requested = limits[name];
     if (!Number.isSafeInteger(requested) || requested < 0) fail(`invalid byte limit for ${name}.`);

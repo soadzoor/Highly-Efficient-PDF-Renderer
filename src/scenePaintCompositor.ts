@@ -461,7 +461,6 @@ export function compositeScenePaintGraph<Surface>(scene: VectorScene, adapter: S
 
   const group = (nodes: readonly ScenePaintNode[], initialBackdrop: Surface, settings: ScenePaintGroup, depth: number,
     shapeConsumed: boolean): PaintResult<Surface> => {
-    if (depth > 64) throw new RangeError("PDF compositor exceeds its group nesting budget.");
     if (settings.isolated && !settings.knockout && !shapeConsumed) return isolatedGroup(nodes, settings, depth);
     const needsShape = shapeConsumed || settings.knockout;
     // Knockout and non-isolated blending read their own backdrop rather than a

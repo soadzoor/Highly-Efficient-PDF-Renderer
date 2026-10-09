@@ -1145,10 +1145,14 @@ Embedded sfnt subsets may retain unused horizontal-metric bytes; HEPR ignores
 these bounded tails with a normalization warning. Embedded PFA/PFB Type1 fonts
 use the configured substitute-font resolver and emit `font.type1-substituted`.
 Explicit PDF character widths take precedence, but glyph shapes and mappings
-for opaque names may be approximate. Paths exceeding the cooperative vector
-paint budget use retained vector lowering or bounded selective raster fallback
-with diagnostics. Large straight clipping paths stay vector when indexing
-keeps each shader scan within its edge budget, preserving the clip geometry.
+for opaque names may be approximate. Path, clip, glyph and resource complexity
+has no default admission budget: conversion attempts vector processing on the
+host device. Caller-supplied resource limits remain available. Typed-array and
+wire-format ranges, allocation failures, cancellation and malformed-data checks
+still apply. Optional clip indices use available GPU texture capacity and can
+retain coarser indices or complete edge scans without replacing the geometry.
+Unsupported paint features can still use retained lowering or raster fallback
+with diagnostics.
 
 Image decoders load on demand: JPEG, JPEG 2000 (`JPXDecode`), JBIG2
 (`JBIG2Decode`, including globals), and fax images are supported. The bundled
@@ -1315,17 +1319,17 @@ gives its original and drawn sizes.
 | --- | --- |
 | `page-raster-fallback` | A whole page became an image; details include the original reason, pixel dimensions, and scale. |
 | `compositing-approximation` | Unsupported group/stroke behavior was approximated for screen output. |
-| `gradient-approximation` | Adaptive gradient sampling reached its depth limit before meeting the color tolerance. |
+| `gradient-approximation` | Adaptive gradient sampling reached coordinate precision or a caller-supplied limit before meeting the color tolerance. |
 | `extgstate-approximation` | A print color/halftone setting or nonidentity transfer function was omitted for screen output. |
 | `image.resolution-reduced` | An image too large to decode within the stream limit was decoded at 1/2, 1/4, or 1/8 resolution. |
 | `image.ccitt-size-adjusted` | Fax image data had more or fewer columns or rows than the image declares; it was cropped or padded with white. |
-| `image.stencil-resolution-reduced` | A page's stencil image masks, each kept as an image of its fill color, held more than the 16-million-pixel budget; every mask was box-filtered by the same factor, given in details, instead of rasterizing the page. |
+| `image.stencil-resolution-reduced` | A caller-supplied stencil pixel allowance required box-filtering the masks by the same factor, given in details. Full-resolution masks are attempted by default. |
 | `clip-curve-approximation` | Curved clip boundaries use vector edges at a 0.0001-point subdivision tolerance before Float32 storage. The tolerance does not increase with the edge count. |
 | `clip-curve-precision-limited` | Floating-point subdivision could not refine a curved clip further; it retains the closest representable vector edges. |
 
 Stitching-function boundaries are sampled as hard color transitions. Gradient
-color-tolerance misses are nonfatal, but stop-count and other hard resource limits
-remain enforced. `/BG2`, `/UCR2`, and `/TR2` take precedence over their older entries.
+color-tolerance misses are nonfatal. Explicit caller resource limits and actual
+representation constraints remain enforced. `/BG2`, `/UCR2`, and `/TR2` take precedence over their older entries.
 Default resets are accepted; unsupported custom functions use the screen defaults
 with a warning. In particular, BG/UCR can affect RGB-to-CMYK conversion inside a
 transparency group, so their omission is an approximation even for RGB output.

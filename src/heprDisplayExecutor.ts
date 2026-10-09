@@ -61,10 +61,10 @@ export interface HeprDisplayExecutionLimits {
 
 export const DEFAULT_HEPR_DISPLAY_EXECUTION_LIMITS: Readonly<HeprDisplayExecutionLimits> =
   Object.freeze({
-    maxInvocationDepth: 64,
-    maxExecutedCommands: 10_000_000,
-    maxCompositeGroupExecutions: 1_000_000,
-    maxProgramExecutions: 1_000_000
+    maxInvocationDepth: Number.MAX_SAFE_INTEGER,
+    maxExecutedCommands: Number.MAX_SAFE_INTEGER,
+    maxCompositeGroupExecutions: Number.MAX_SAFE_INTEGER,
+    maxProgramExecutions: Number.MAX_SAFE_INTEGER
   });
 
 export type HeprClipScopeOrigin = "command" | "group" | "program-bounds";

@@ -14,10 +14,6 @@ export interface NativeGlyphHairlineGeometry {
 
 type Point = readonly [number, number];
 interface Contour { segments: Point[][]; start: Point; end: Point; closed: boolean; }
-const MAX_COMMANDS = 65536;
-const MAX_PRIMITIVES = 4096;
-const MAX_WORK = 65536;
-const MAX_DEPTH = 20;
 const CURVE_ERROR = 0.01;
 const HAIRLINE = 1;
 const ROUND_CAP = 2;
@@ -35,11 +31,6 @@ export function buildNativeGlyphHairline(
   signal?: AbortSignal
 ): NativeGlyphHairlineGeometry | null {
   throwIfAborted(signal);
-  if (commands.length > MAX_COMMANDS) {
-    throw new PdfError("resource-limit", "Hairline glyph has too many outline commands.", {
-      details: { reason: "native-glyph-stroke-input-limit", limit: MAX_COMMANDS }
-    });
-  }
   if (stroke.width !== 0 || ![0, 1, 2].includes(stroke.lineCap) ||
       ![0, 1, 2].includes(stroke.lineJoin) || !Number.isFinite(stroke.miterLimit) ||
       stroke.miterLimit < 1 || !Number.isFinite(stroke.dashPhase)) {
@@ -53,15 +44,11 @@ export function buildNativeGlyphHairline(
   const page = inverse ? ctm : [1, 0, 0, 1, 0, 0];
   const contours: Contour[] = [];
   let current: Contour | null = null;
-  let segmentCount = 0;
-  let work = 0;
   const checkpoint = (): void => {
     throwIfAborted(signal);
-    if (++work > MAX_WORK) throw complexity();
   };
   const append = (points: Point[]): void => {
     if (!current) throw unsupported("Hairline glyph contains a segment outside a contour.");
-    if (++segmentCount > MAX_PRIMITIVES) throw complexity();
     current.segments.push(points);
     current.end = points[points.length - 1];
   };
@@ -104,7 +91,6 @@ export function buildNativeGlyphHairline(
     const end = points[points.length - 1];
     const control = points.length === 3 ? points[1] : end;
     if (same(start, end) && same(start, control) && !round) return;
-    if (endpoints.length / 4 >= MAX_PRIMITIVES) throw complexity();
     const minX = Math.min(start[0], control[0], end[0]);
     const minY = Math.min(start[1], control[1], end[1]);
     const maxX = Math.max(start[0], control[0], end[0]);
@@ -118,28 +104,34 @@ export function buildNativeGlyphHairline(
     bounds.maxX = Math.max(bounds.maxX, maxX);
     bounds.maxY = Math.max(bounds.maxY, maxY);
   };
-  const cubic = (points: readonly Point[], round: boolean, depth = 0): void => {
-    checkpoint();
-    const [a, b, c, d] = points;
-    const control: Point = [(3 * (b[0] + c[0]) - a[0] - d[0]) / 4,
-      (3 * (b[1] + c[1]) - a[1] - d[1]) / 4];
-    const error = Math.max(
-      Math.hypot((a[0] + 2 * control[0]) / 3 - b[0], (a[1] + 2 * control[1]) / 3 - b[1]),
-      Math.hypot((d[0] + 2 * control[0]) / 3 - c[0], (d[1] + 2 * control[1]) / 3 - c[1]));
-    if (error <= CURVE_ERROR) {
-      emit([a, control, d], round);
-      return;
+  const cubic = (points: readonly Point[], round: boolean): void => {
+    const pending = [{ points, chord: false }];
+    while (pending.length) {
+      checkpoint();
+      const current = pending.pop()!;
+      const [a, b, c, d] = current.points;
+      const control: Point = [(3 * (b[0] + c[0]) - a[0] - d[0]) / 4,
+        (3 * (b[1] + c[1]) - a[1] - d[1]) / 4];
+      const error = Math.max(
+        Math.hypot((a[0] + 2 * control[0]) / 3 - b[0], (a[1] + 2 * control[1]) / 3 - b[1]),
+        Math.hypot((d[0] + 2 * control[0]) / 3 - c[0], (d[1] + 2 * control[1]) / 3 - c[1]));
+      if (error <= CURVE_ERROR) {
+        emit([a, control, d], round);
+        continue;
+      }
+      // Further subdivision cannot improve a control polygon that rounds back
+      // to itself; its chord is the remaining representable approximation.
+      if (current.chord) { emit([a, d], round); continue; }
+      const [left, right] = split(current.points);
+      const unchanged = (part: readonly Point[]): boolean => part.every((point, index) => same(point, current.points[index]));
+      pending.push({ points: right, chord: unchanged(right) }, { points: left, chord: unchanged(left) });
     }
-    if (depth >= MAX_DEPTH) throw complexity();
-    const [left, right] = split(points);
-    cubic(left, round, depth + 1);
-    cubic(right, round, depth + 1);
   };
 
   const cycle = dash.reduce((sum, value) => sum + value, 0);
   const scale = Math.hypot(ctm[0], ctm[1], ctm[2], ctm[3]);
   const positiveDash = dash.filter(value => value > 0);
-  const smallestDash = positiveDash.length ? Math.min(...positiveDash) : 0;
+  const smallestDash = positiveDash.length ? positiveDash.reduce((smallest, value) => Math.min(smallest, value), Infinity) : 0;
   const dashTolerance = dash.length ? Math.min(CURVE_ERROR / scale, smallestDash / 32) : 0;
   for (const contour of contours) {
     checkpoint();
@@ -211,7 +203,7 @@ export function buildNativeGlyphHairline(
         checkpoint();
         const span = Math.min(remaining, length - position);
         const next = position + span;
-        if (next === position) throw complexity();
+        if (next === position) throw unsupported("Hairline glyph dash spacing is below coordinate precision.");
         if (dashIndex % 2 === 0) {
           const start = at(position);
           const end = at(next);
@@ -232,24 +224,28 @@ export function buildNativeGlyphHairline(
         }
       }
     };
-    const flatten = (points: readonly Point[], depth = 0): void => {
-      checkpoint();
-      const start = points[0];
-      const end = points[points.length - 1];
-      let polygonLength = 0;
-      for (let index = 1; index < points.length; index += 1) {
-        polygonLength += Math.hypot(points[index][0] - points[index - 1][0], points[index][1] - points[index - 1][1]);
+    const flatten = (points: readonly Point[]): void => {
+      const pending = [{ points, chord: false }];
+      while (pending.length) {
+        checkpoint();
+        const current = pending.pop()!;
+        const points = current.points;
+        const start = points[0];
+        const end = points[points.length - 1];
+        let polygonLength = 0;
+        for (let index = 1; index < points.length; index += 1) {
+          polygonLength += Math.hypot(points[index][0] - points[index - 1][0], points[index][1] - points[index - 1][1]);
+        }
+        const chord = Math.hypot(end[0] - start[0], end[1] - start[1]);
+        if (current.chord || polygonLength - chord <= dashTolerance &&
+            points.slice(1, -1).every(point => distanceToSegment(point, start, end) <= dashTolerance)) {
+          dashedLine(start, end);
+          continue;
+        }
+        const [left, right] = split(points);
+        const unchanged = (part: readonly Point[]): boolean => part.every((point, index) => same(point, points[index]));
+        pending.push({ points: right, chord: unchanged(right) }, { points: left, chord: unchanged(left) });
       }
-      const chord = Math.hypot(end[0] - start[0], end[1] - start[1]);
-      if (polygonLength - chord <= dashTolerance &&
-          points.slice(1, -1).every(point => distanceToSegment(point, start, end) <= dashTolerance)) {
-        dashedLine(start, end);
-        return;
-      }
-      if (depth >= MAX_DEPTH) throw complexity();
-      const [left, right] = split(points);
-      flatten(left, depth + 1);
-      flatten(right, depth + 1);
     };
     for (const points of contour.segments) {
       if (points.length === 2) dashedLine(points[0], points[1]);
@@ -269,7 +265,6 @@ export function buildNativeGlyphHairline(
 }
 
 function normalizeDash(input: readonly number[]): number[] {
-  if (input.length > MAX_PRIMITIVES) throw complexity();
   if (input.some(value => !Number.isFinite(value) || value < 0)) {
     throw unsupported("Hairline glyph stroke has an invalid dash pattern.");
   }
@@ -318,7 +313,7 @@ function split(points: readonly Point[]): [Point[], Point[]] {
   const right = [row[row.length - 1]];
   while (row.length > 1) {
     row = row.slice(1).map((point, index): Point =>
-      [(row[index][0] + point[0]) / 2, (row[index][1] + point[1]) / 2]);
+      [row[index][0] / 2 + point[0] / 2, row[index][1] / 2 + point[1] / 2]);
     left.push(row[0]);
     right.push(row[row.length - 1]);
   }
@@ -337,10 +332,4 @@ function distanceToSegment(point: Point, a: Point, b: Point): number {
 
 function unsupported(message: string): PdfError {
   return new PdfError("unsupported-content", message, { details: { reason: "native-glyph-stroke" } });
-}
-
-function complexity(): PdfError {
-  return new PdfError("unsupported-content", "Hairline glyph stroke exceeds its geometry budget.", {
-    details: { reason: "native-glyph-stroke-complexity", limit: MAX_PRIMITIVES }
-  });
 }

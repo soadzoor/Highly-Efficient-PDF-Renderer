@@ -544,10 +544,10 @@ async function testCancellationAndStores() {
   const bounded = new NativePdfFunctionRegistry(document, { maxStoreValues: 2 });
   await rejectsCode(() => bounded.add(sampled()), "resource-limit");
 
-  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxFunctions, 4_096);
-  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxFunctionDepth, 64);
-  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxStoreValues, 16_777_216);
-  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxCalculatorBytes, 1_048_576);
+  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxFunctions, 0x00ff_ffff);
+  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxFunctionDepth, Number.MAX_SAFE_INTEGER);
+  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxStoreValues, 0xffff_ffff);
+  assert.equal(DEFAULT_NATIVE_PDF_FUNCTION_LIMITS.maxCalculatorBytes, 0xffff_ffff);
 }
 
 try {

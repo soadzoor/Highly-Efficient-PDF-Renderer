@@ -16,7 +16,7 @@ const {
 } = await import("../src/pdf/nativeText.ts");
 const { buildNativePageTextResources } = await import("../src/pdf/nativePageText.ts");
 const { HEPR_GLYPH_FLAG, HEPR_PATH_VERB } = await import("../src/heprDocumentData.ts");
-const { PdfError } = await import("../src/pdf/nativeTypes.ts");
+const { PdfError, DEFAULT_PDF_RESOURCE_LIMITS } = await import("../src/pdf/nativeTypes.ts");
 
 const binaryText = (...values) => Uint8Array.of(...values);
 const fontA = makeFont();
@@ -473,6 +473,15 @@ function testOutlineStoresAndLimits() {
 }
 
 function testCancellationMalformedValuesAndResourceLimits() {
+  const defaultLimits = compilerFor([], {
+    maxGlyphs: DEFAULT_PDF_RESOURCE_LIMITS.maxGlyphsPerPage,
+    maxGraphicsStateDepth: DEFAULT_PDF_RESOURCE_LIMITS.maxRecursionDepth
+  });
+  for (let depth = 0; depth < 128; depth += 1) defaultLimits.saveGraphicsState();
+  defaultLimits.appendFallbackText("A", [0, 0, 1, 1]);
+  for (let depth = 0; depth < 128; depth += 1) defaultLimits.restoreGraphicsState();
+  assert.equal(defaultLimits.build().textIndex.text, "A", "default limits fit signed text indexes and allow deep valid scopes");
+
   const aborted = new AbortController();
   aborted.abort("fixture cancellation");
   expectPdfError(

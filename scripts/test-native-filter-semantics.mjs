@@ -74,14 +74,10 @@ function testFilterAndParameterParsing() {
     hasPdfError("invalid-object", /invalid value/)
   );
   assert.throws(() => readDecodeParameters(null, -1), RangeError);
-  assert.throws(
-    () => readDecodeParameters(null, 65),
-    hasPdfError("resource-limit", /depth limit/)
-  );
-  assert.throws(
-    () => readFilterNames(Array.from({ length: 65 }, () => name("Fl"))),
-    hasPdfError("resource-limit", /depth limit/)
-  );
+  assert.equal(readDecodeParameters(null, 65).length, 65, "filter parameters have no guessed chain allowance");
+  assert.equal(readFilterNames(Array.from({ length: 65 }, () => name("Fl"))).length, 65);
+  assert.throws(() => readDecodeParameters(null, 0x1_0000_0000),
+    hasPdfError("resource-limit", /array capacity/));
 }
 
 async function testChainedFilters() {
@@ -99,6 +95,15 @@ async function testChainedFilters() {
     await decodePdfFilterChain(encoded, ["AHx", "Fl"], [null, predictor]),
     decoded
   );
+  const chainLength = 65;
+  let deeplyFiltered = decoded;
+  for (let index = 0; index < chainLength; index += 1) deeplyFiltered = bytesOf(deflateSync(deeplyFiltered));
+  const deepFilters = Array(chainLength).fill("FlateDecode");
+  const deepParameters = readDecodeParameters(null, chainLength);
+  assert.deepEqual(await decodePdfFilterChain(deeplyFiltered, deepFilters, deepParameters), decoded,
+    "a small valid filter chain beyond the former depth allowance decodes completely");
+  const chunked = await collectFilterChunks(deeplyFiltered, deepFilters, deepParameters, { chunkSize: 2 });
+  assert.deepEqual(chunked.bytes, decoded, "chunked decoding accepts the same complete chain");
   await assert.rejects(
     decodePdfFilterChain(encoded, ["ASCIIHexDecode", "FlateDecode"], [null]),
     hasPdfError("invalid-object", /mismatched DecodeParms arity/)

@@ -37,15 +37,6 @@ export function buildNativeGlyphStrokeAtOrigin(commands: readonly NativeGlyphPat
 type Point = readonly [number, number];
 interface Contour { points: Point[]; closed: boolean; hasSegment?: boolean; }
 
-/**
- * Per-glyph bound on flattening work and on the stroke outline it produces.
- * Outlined display text in real documents reaches a little over two thousand
- * edges, so a tighter bound refuses ordinary headlines; the page-level
- * coordinate and path limits are what actually protect the frame's memory.
- */
-const MAX_EDGES = 4096;
-const MAX_INPUT_COMMANDS = 65536;
-const MAX_CURVE_DEPTH = 20;
 const EPSILON = 1e-12;
 
 /**
@@ -54,7 +45,8 @@ const EPSILON = 1e-12;
  * one fill, preserving holes and applying translucent paint only once.
  *
  * Curves are flattened to at most 0.01 page units of centerline error. The
- * result remains vector geometry at every zoom, within the glyph edge budget.
+ * result remains vector geometry at every zoom. Allocation capacity and
+ * representable coordinates govern expansion, without a glyph edge cutoff.
  */
 export function buildNativeGlyphStroke(
   commands: readonly NativeGlyphPathCommand[],
@@ -63,11 +55,6 @@ export function buildNativeGlyphStroke(
   signal?: AbortSignal
 ): NativeGlyphStrokeGeometry | null {
   throwIfAborted(signal);
-  if (commands.length > MAX_INPUT_COMMANDS) {
-    throw new PdfError("resource-limit", "Glyph stroke has too many outline commands.", {
-      details: { reason: "native-glyph-stroke-input-limit", limit: MAX_INPUT_COMMANDS }
-    });
-  }
   const ctm = matrix(stroke.transform);
   const glyph = matrix(glyphTransform);
   if (!Number.isFinite(stroke.width) || stroke.width <= 0) {
@@ -92,35 +79,39 @@ export function buildNativeGlyphStroke(
   const tolerance = Math.min(0.01 / scale, radius / 32);
   const contours: Contour[] = [];
   let current: Contour | null = null;
-  let flattenedEdges = 0;
   let approximated = false;
 
   const append = (point: Point): void => {
     if (!current) throw unsupported("Glyph stroke contains a segment outside a contour.");
     current.hasSegment = true;
     if (same(current.points[current.points.length - 1], point)) return;
-    if (++flattenedEdges > MAX_EDGES) throw complexity();
     current.points.push(point);
   };
-  const flatten = (points: readonly Point[], depth = 0): void => {
-    throwIfAborted(signal);
-    const start = points[0];
-    const end = points[points.length - 1];
-    if (points.slice(1, -1).every(point => distanceToSegment(point, start, end) <= tolerance)) {
-      append(end);
-      return;
+  const flatten = (points: readonly Point[]): void => {
+    const pending: { points: readonly Point[]; chord?: boolean }[] = [{ points }];
+    while (pending.length) {
+      throwIfAborted(signal);
+      const next = pending.pop()!;
+      const curve = next.points;
+      const start = curve[0], end = curve[curve.length - 1];
+      if (next.chord || curve.slice(1, -1).every(point => distanceToSegment(point, start, end) <= tolerance)) {
+        append(end);
+        continue;
+      }
+      const left: Point[] = [start], right: Point[] = [end];
+      let row = [...curve];
+      while (row.length > 1) {
+        row = row.slice(1).map((point, index) => midpoint(row[index], point));
+        left.push(row[0]);
+        right.push(row[row.length - 1]);
+      }
+      right.reverse();
+      // Further subdivision can round back to the same control polygon.
+      // Retain its closest representable chord instead of looping forever.
+      const unchanged = (part: readonly Point[]): boolean => part.every((point, index) =>
+        point[0] === curve[index][0] && point[1] === curve[index][1]);
+      pending.push({ points: right, chord: unchanged(right) }, { points: left, chord: unchanged(left) });
     }
-    if (depth === MAX_CURVE_DEPTH) throw complexity();
-    const left: Point[] = [start];
-    const right: Point[] = [end];
-    let row = [...points];
-    while (row.length > 1) {
-      row = row.slice(1).map((point, index) => midpoint(row[index], point));
-      left.push(row[0]);
-      right.push(row[row.length - 1]);
-    }
-    flatten(left, depth + 1);
-    flatten(right.reverse(), depth + 1);
   };
 
   for (let index = 0; index < commands.length; index += 1) {
@@ -169,10 +160,10 @@ export function buildNativeGlyphStroke(
     if (area === 0) return;
     if (area < 0) pagePoints.reverse();
     for (let index = 0; index < pagePoints.length; index += 1) {
+      if ((index & 1023) === 0) throwIfAborted(signal);
       const a = pagePoints[index];
       const b = pagePoints[(index + 1) % pagePoints.length];
       if (same(a, b)) continue;
-      if (segmentsA.length / 4 >= MAX_EDGES) throw complexity();
       segmentsA.push(a[0], a[1], b[0], b[1]);
       segmentsB.push(b[0], b[1], 0, 0);
       bounds.minX = Math.min(bounds.minX, a[0]);
@@ -185,9 +176,10 @@ export function buildNativeGlyphStroke(
     approximated = true;
     const step = Math.min(Math.PI / 4, 2 * Math.acos(Math.max(-1, 1 - tolerance / radius)));
     const count = Math.ceil(Math.abs(angle) / step);
-    if (!Number.isFinite(count) || count > MAX_EDGES) throw complexity();
+    if (!Number.isSafeInteger(count)) throw unsupported("Glyph stroke arc subdivisions exceed numeric precision.");
     const points: Point[] = [center];
     for (let index = 0; index <= count; index += 1) {
+      if ((index & 1023) === 0) throwIfAborted(signal);
       const a = start + angle * index / count;
       points.push([center[0] + Math.cos(a) * radius, center[1] + Math.sin(a) * radius]);
     }
@@ -315,7 +307,6 @@ export function buildNativeGlyphStroke(
 }
 
 function normalizeDash(input: readonly number[]): readonly number[] {
-  if (input.length > MAX_EDGES) throw complexity();
   if (!input.length) return input;
   if (input.some(value => !Number.isFinite(value) || value < 0)) {
     throw unsupported("Glyph stroke has an invalid dash pattern.");
@@ -337,7 +328,6 @@ function dashContour(contour: Contour, dash: readonly number[], phase: number, s
   let remaining = dash[index] - offset;
   const result: Contour[] = [];
   let active: Contour | null = null;
-  let events = 0;
   const count = contour.closed ? contour.points.length : contour.points.length - 1;
   for (let segment = 0; segment < count; segment += 1) {
     const a = contour.points[segment];
@@ -348,9 +338,11 @@ function dashContour(contour: Contour, dash: readonly number[], phase: number, s
       [a[0] + (b[0] - a[0]) * value / length, a[1] + (b[1] - a[1]) * value / length];
     while (position < length) {
       throwIfAborted(signal);
-      if (++events > MAX_EDGES) throw complexity();
       const painted = index % 2 === 0;
       const step = Math.min(remaining, length - position);
+      if (step > 0 && position + step === position) {
+        throw unsupported("Glyph stroke dash spacing is below coordinate precision.");
+      }
       if (painted) {
         if (!active) {
           active = { points: [pointAt(position)], closed: false };
@@ -402,7 +394,7 @@ function transform(m: readonly number[], x: number, y: number): Point {
 }
 
 function same(a: Point, b: Point): boolean { return Math.hypot(a[0] - b[0], a[1] - b[1]) <= EPSILON; }
-function midpoint(a: Point, b: Point): Point { return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]; }
+function midpoint(a: Point, b: Point): Point { return [a[0] / 2 + b[0] / 2, a[1] / 2 + b[1] / 2]; }
 function distanceToSegment(p: Point, a: Point, b: Point): number {
   const dx = b[0] - a[0];
   const dy = b[1] - a[1];
@@ -412,9 +404,4 @@ function distanceToSegment(p: Point, a: Point, b: Point): number {
 }
 function unsupported(message: string): PdfError {
   return new PdfError("unsupported-content", message, { details: { reason: "native-glyph-stroke" } });
-}
-function complexity(): PdfError {
-  return new PdfError("unsupported-content", `Glyph stroke exceeds the renderer's ${MAX_EDGES}-edge budget.`, {
-    details: { reason: "native-glyph-stroke-complexity", limit: MAX_EDGES }
-  });
 }

@@ -4,7 +4,8 @@ import type { HepArchive } from "./hepContainer";
 import type { VectorScene } from "./pdfVectorExtractor";
 
 export const HEP_ANNOTATIONS_PATH = "annotations/annotations.json";
-export const MAX_HEP_ANNOTATION_BYTES = 64 * 1024 * 1024;
+/** HEP chunk lengths use an unsigned 32-bit wire field. */
+export const MAX_HEP_ANNOTATION_BYTES = 0xffffffff;
 
 export function writeHepAnnotations(archive: HepArchive, scene: VectorScene): {
   file: string; version: 1; count: number; appearances?: AnnotationAppearanceMode;

@@ -4,9 +4,6 @@ import type { DensePdfVectorShadingPaint } from "./nativeContentCompiler";
 import type { NativePdfShadingDescription } from "./nativeShadings";
 import { DEFAULT_PDF_RESOURCE_LIMITS, PdfError, throwIfAborted } from "./nativeTypes";
 
-/** Bound LUT storage to 16 MiB, independently of the ordinary path ceiling. */
-const MAX_VECTOR_SHADING_PAINTS = 4096;
-
 export interface NativeVectorGradientSource {
   readonly size: number;
   describe(index: number): Readonly<NativePdfShadingDescription>;
@@ -40,7 +37,7 @@ export function buildNativeVectorGradients(
   signal?: AbortSignal,
   maxPathCoordinates = DEFAULT_PDF_RESOURCE_LIMITS.maxPathCoordinatesPerPage
 ): GradientSceneData {
-  if (paints.length > Math.min(maxPaths, MAX_VECTOR_SHADING_PAINTS) || paints.length * 16 > maxPathCoordinates) {
+  if (paints.length > maxPaths || paints.length * 16 > maxPathCoordinates) {
     throw new PdfError("resource-limit", "Vector shading paints exceed their geometry or color-table storage limit.");
   }
   if (paints.length && !registry) throw new PdfError("invalid-object", "Vector shading paints have no resource registry.");

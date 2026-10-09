@@ -487,7 +487,7 @@ function withinClips(scene: VectorScene, point: PrimitivePoint, clipIndex: numbe
   if (rect && !inBounds(point, rect)) return false;
   for (let depth = 0; clipIndex >= 0; depth++) {
     const clip = scene.clipPaths?.[clipIndex];
-    if (!clip || depth >= 64) return false;
+    if (!clip || depth >= (scene.clipPaths?.length ?? 0)) return false;
     let winding = 0;
     for (let i = 0; i < clip.edges.length; i += 4) winding += lineWinding(
       { x: clip.edges[i], y: clip.edges[i + 1] }, { x: clip.edges[i + 2], y: clip.edges[i + 3] }, point);

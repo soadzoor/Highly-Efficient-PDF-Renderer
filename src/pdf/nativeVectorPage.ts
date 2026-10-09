@@ -123,19 +123,13 @@ const GLYPH_FLAG_TYPE3 = 1 << 2;
 const GLYPH_FLAG_CLIP_ONLY = 1 << 3;
 const KNOWN_GLYPH_FLAGS = GLYPH_FLAG_VERTICAL | GLYPH_FLAG_INVISIBLE |
   GLYPH_FLAG_TYPE3 | GLYPH_FLAG_CLIP_ONLY;
-const MAX_VECTOR_GLYPH_PRIMITIVES = 256;
 const TEXT_VISIBLE_ALPHA_EPSILON = 1e-3;
 const TEXT_CUBIC_TO_QUAD_ERROR = 0.015;
 const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 12;
-/** Bound the exceptional disjointness proof independently of page complexity. */
-const MAX_LATE_IMAGE_GLYPH_BOUNDS_TESTS = 10_000_000;
 /** Match the established PageTextIndexBuilder's page-space gap heuristic. */
 const TEXT_INDEX_GAP_EM_FACTOR = 0.25;
-/** Match the established per-image raster capture grid and safety ceiling. */
+/** Padding for the exceptional legacy clipped-image capture. */
 const VECTOR_RASTER_CROP_PADDING_PX = 2;
-const VECTOR_RASTER_MAX_SCALE = 24;
-const VECTOR_RASTER_MAX_DIMENSION = 16_384;
-const VECTOR_RASTER_MAX_PIXELS = 134_217_728;
 
 /**
  * Build the existing one-page `VectorScene` directly from native parser data.
@@ -1279,13 +1273,6 @@ function deriveGlyphGeometry(
       throw unsupported(`Glyph ${glyphId} uses an unsupported outline command.`, pageIndex,
         "legacy-vector-glyph-command");
     }
-    if (segmentsA.length / 4 > MAX_VECTOR_GLYPH_PRIMITIVES) {
-      throw unsupported(
-        `Glyph ${glyphId} exceeds the VectorScene renderer's ${MAX_VECTOR_GLYPH_PRIMITIVES}-primitive limit.`,
-        pageIndex,
-        "legacy-vector-glyph-primitives"
-      );
-    }
   }
   if (contourOpen) {
     throw unsupported(`Glyph ${glyphId} ends with an unclosed contour.`, pageIndex,
@@ -1711,7 +1698,6 @@ function validateLateImageUnderlays(
       "legacy-vector-image-order-bounds");
   }
   let precedingGlyphEnd = 0;
-  let boundsTests = 0;
   for (let eventOffset = 0; eventOffset < sidecar.sourceEvents.length; eventOffset += 2) {
     if ((eventOffset & 0x3fff) === 0) throwIfAborted(signal);
     const kind = sidecar.sourceEvents[eventOffset];
@@ -1736,20 +1722,6 @@ function validateLateImageUnderlays(
       const glyphOffset = glyph * 4;
       const minX = sourceGlyphPaintBounds[glyphOffset];
       if (Number.isNaN(minX)) continue;
-      boundsTests += 1;
-      if (boundsTests > MAX_LATE_IMAGE_GLYPH_BOUNDS_TESTS) {
-        throw new PdfError(
-          "resource-limit",
-          "Late-image source-order proof exceeds its bounded glyph comparison limit.",
-          {
-            pageIndex,
-            details: {
-              reason: "legacy-vector-image-order-proof-limit",
-              limit: MAX_LATE_IMAGE_GLYPH_BOUNDS_TESTS
-            }
-          }
-        );
-      }
       const glyphBounds: Bounds = {
         minX,
         minY: sourceGlyphPaintBounds[glyphOffset + 1],
@@ -1946,11 +1918,7 @@ function clipVectorNearestImage(
     sourceWidth / Math.abs(sourceTransform[0]),
     sourceHeight / Math.abs(sourceTransform[3])
   );
-  const scale = chooseVectorRasterScale(
-    Math.max(1, Math.ceil(placement.maxX - placement.minX)),
-    Math.max(1, Math.ceil(placement.maxY - placement.minY)),
-    nativeScale
-  );
+  const scale = Math.max(1, Number.isFinite(nativeScale) ? nativeScale : 1);
   const pageDeviceWidth = (pageBounds.maxX - pageBounds.minX) * scale;
   const pageDeviceHeight = (pageBounds.maxY - pageBounds.minY) * scale;
   const placedMinX = (imageBounds.minX - pageBounds.minX) * scale;
@@ -1972,21 +1940,17 @@ function clipVectorNearestImage(
   const pixelCount = width * height;
   if (!Number.isSafeInteger(width) || width <= 0 ||
       !Number.isSafeInteger(height) || height <= 0 ||
-      !Number.isSafeInteger(pixelCount) ||
-      width > VECTOR_RASTER_MAX_DIMENSION || height > VECTOR_RASTER_MAX_DIMENSION ||
-      pixelCount > VECTOR_RASTER_MAX_PIXELS) {
+      !Number.isSafeInteger(pixelCount * 4)) {
     throw new PdfError(
       "resource-limit",
-      "A clipped image exceeds the bounded VectorScene raster dimensions.",
+      "A clipped image has invalid dimensions or exceeds safe raster addressing.",
       {
         pageIndex,
         details: {
           reason: "legacy-vector-image-clip-size",
           imageIndex,
           width,
-          height,
-          maxDimension: VECTOR_RASTER_MAX_DIMENSION,
-          maxPixels: VECTOR_RASTER_MAX_PIXELS
+          height
         }
       }
     );
@@ -2070,29 +2034,6 @@ function clipVectorNearestImage(
       pageBounds.maxY - cropMinY / scale
     ])
   };
-}
-
-function chooseVectorRasterScale(
-  baseWidth: number,
-  baseHeight: number,
-  targetScale: number
-): number {
-  let scale = Math.max(
-    1,
-    Math.min(VECTOR_RASTER_MAX_SCALE, Number.isFinite(targetScale) ? targetScale : 1)
-  );
-  while (scale > 1) {
-    const width = Math.max(1, Math.ceil(baseWidth * scale));
-    const height = Math.max(1, Math.ceil(baseHeight * scale));
-    if (width <= VECTOR_RASTER_MAX_DIMENSION &&
-        height <= VECTOR_RASTER_MAX_DIMENSION &&
-        width * height <= VECTOR_RASTER_MAX_PIXELS) {
-      return scale;
-    }
-    scale *= 0.85;
-    if (scale < 1.05) return 1;
-  }
-  return 1;
 }
 
 function intervalCoverage(
@@ -2274,7 +2215,7 @@ function vectorImageMaskPixel(
   y: number
 ): number {
   if (image.format === HEPR_IMAGE_FORMAT.Gray1) {
-    return (image.data[y * Math.ceil(image.width / 8) + (x >> 3)] >> (7 - (x & 7))) & 1;
+    return (image.data[y * Math.ceil(image.width / 8) + Math.floor(x / 8)] >> (7 - (x & 7))) & 1;
   }
   const offset = (y * image.width + x) * stride;
   // Alpha is the payload's last channel; a Gray8 mask carries none and is opaque.

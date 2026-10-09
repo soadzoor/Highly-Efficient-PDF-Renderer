@@ -46,6 +46,9 @@ try {
     assert.throws(() => decodeSceneClipPaths(bytes.subarray(0, bytes.length - 1)), /clip path/);
     assert.throws(() => decodeSceneClipPaths(Uint8Array.from([1, 2, 0, 0, 0, 0, 0, 0])),
       /parent must reference an earlier path/);
+    assert.throws(() => decodeSceneClipPaths(Uint8Array.of(255, 255, 255, 255, 15)), /path records are truncated/);
+    assert.throws(() => decodeSceneClipPaths(Uint8Array.of(1, 1, 0, 255, 255, 255, 255, 15, 0, 0, 0, 0)),
+      /coordinate columns are truncated/, "large declared edge counts require real column bytes before allocation");
   }
 
   // ----------------------------------------------------------- draw runs
@@ -63,11 +66,15 @@ try {
     assert.deepEqual(decodeSceneDrawRuns(encoded), drawRuns, "draw runs round-trip exactly");
     assert.throws(() => decodeSceneDrawRuns(encoded.subarray(0, encoded.length - 1)), /draw run|length mismatch/);
     assert.throws(() => encodeSceneDrawRuns([{ kind: "bogus", first: 0, count: 1 }]), /unknown kind/);
+    assert.throws(() => decodeSceneDrawRuns(Uint8Array.of(255, 255, 255, 255, 15)), /run records are truncated/);
 
     // Per-kind delta coding must stay compact for the common consecutive case.
     const consecutive = Array.from({ length: 1000 }, (_, index) => ({ kind: "text", first: index, count: 1 }));
     assert(encodeSceneDrawRuns(consecutive).length < 3100, "a consecutive run costs about two bytes");
     assert.deepEqual(decodeSceneDrawRuns(encodeSceneDrawRuns(consecutive)), consecutive);
+    const largeIndices = [0x7ffffffe, 0x80000000, 0xffffffff].map(first => ({ kind: "fill", first, count: 0 }));
+    assert.deepEqual(decodeSceneDrawRuns(encodeSceneDrawRuns(largeIndices)), largeIndices,
+      "delta tracking preserves indices crossing the signed 32-bit boundary");
   }
 
   // --------------------------------------------------------- paint graph
@@ -97,6 +104,7 @@ try {
       /paint graph|length mismatch|ended early/);
     assert.throws(() => encodeScenePaintGraph({ roots: [{ kind: "group", alpha: 1, isolated: false,
       knockout: false, blendMode: "Nope", children: [] }] }), /unknown blend mode/);
+    assert.throws(() => decodeScenePaintGraph(Uint8Array.of(255, 255, 255, 255, 15)), /node records are truncated/);
 
     // A draw-heavy graph is the common shape; it must stay near one byte a node.
     const wide = { roots: Array.from({ length: 5000 }, (_, index) => ({ kind: "draw", runIndex: index })) };
@@ -107,7 +115,17 @@ try {
     for (let depth = 0; depth < 70; depth += 1) {
       deep = { kind: "group", alpha: 1, isolated: false, knockout: false, blendMode: "Normal", children: [deep] };
     }
-    assert.throws(() => encodeScenePaintGraph({ roots: [deep] }), /nesting is too deep/);
+    const deepGraph = { roots: [deep] };
+    assert.deepEqual(decodeScenePaintGraph(encodeScenePaintGraph(deepGraph)), deepGraph,
+      "valid graph nesting beyond the old 64-level ceiling round-trips");
+    const cyclicRoots = [];
+    cyclicRoots.push({ kind: "group", alpha: 1, isolated: false, knockout: false, blendMode: "Normal", children: cyclicRoots });
+    assert.throws(() => encodeScenePaintGraph({ roots: cyclicRoots }), /cyclic/);
+    const transfer = new Float32Array(65_537).fill(0.5);
+    const transferGraph = { roots: [{ kind: "group", alpha: 1, isolated: false, knockout: false, blendMode: "Normal",
+      children: [], softMask: { subtype: "Alpha", transfer, children: [] } }] };
+    assert.deepEqual(decodeScenePaintGraph(encodeScenePaintGraph(transferGraph)), transferGraph,
+      "transfer curves beyond the old sample cap round-trip");
   }
 
   const {
@@ -148,6 +166,9 @@ try {
       /matrix data does not fill the section/);
     assert.throws(() => decodeRasterLayerTable(encoded, { ...limits, maxLayers: 4 }), /layer count is out of range/);
     assert.throws(() => decodeRasterLayerTable(encoded, { ...limits, maxDimension: 256 }), /out of range/);
+    assert.throws(() => decodeRasterLayerTable(Uint8Array.of(255, 255, 255, 255, 15), {
+      maxLayers: 0xffffffff, maxAtlases: 0xffffffff, maxDimension: 0x7fffffff
+    }), /atlas records are truncated/);
     assert.throws(() => encodeRasterLayerTable({ atlases: [], layers: [{ ...table.layers[4], paintOrder: -1 }] }),
       /paint order is out of range/);
     assert.throws(() => encodeRasterLayerTable({ atlases: [], layers: [{ ...table.layers[4], matrix: Float32Array.from([NaN, 0, 0, 1, 0, 0]) }] }),
@@ -208,6 +229,9 @@ try {
     assert.equal(decoded.segmentsA[4], decoded.segmentsB[0]);
     assert.throws(() => decodeTextGlyphSegments(bytes, { ...meta, segmentCount: 4 }), /segment count/);
     assert.throws(() => decodeTextGlyphSegments(bytes.subarray(0, bytes.length - 1), meta), /column lengths/);
+    assert.throws(() => decodeTextGlyphSegments(Uint8Array.of(255, 255, 255, 255, 15), {
+      ...meta, segmentCount: 0xffffffff
+    }), /bitsets are truncated/);
   }
 
   // ------------------------------------------------------- glyph origins

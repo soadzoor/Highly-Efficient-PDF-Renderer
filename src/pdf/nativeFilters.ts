@@ -1,7 +1,7 @@
 import { isPdfDictionary, isPdfName, type PdfDictionary, type PdfValue } from "./nativeCos";
 import { PdfError, type PdfDiagnostic, type PdfResourceLimits, mergePdfLimits, throwIfAborted } from "./nativeTypes";
 
-const MAX_FILTER_CHAIN_LENGTH = 64;
+const MAX_FILTER_CHAIN_LENGTH = 0xffff_ffff; // JavaScript array length capacity.
 const DEFAULT_DECODED_CHUNK_SIZE = 256 * 1024;
 
 export interface PdfFilterDecodeOptions {
@@ -806,7 +806,7 @@ function normalizeChunkSize(value: number | undefined): number {
 
 function enforceFilterCount(count: number): void {
   if (count > MAX_FILTER_CHAIN_LENGTH) {
-    throw new PdfError("resource-limit", "A PDF stream filter chain exceeds its depth limit.", {
+    throw new PdfError("resource-limit", "A PDF stream filter chain exceeds JavaScript array capacity.", {
       details: { filterCount: count, limit: MAX_FILTER_CHAIN_LENGTH }
     });
   }
@@ -955,7 +955,7 @@ class MsbBitReader {
     let value = 0;
     for (let bit = 0; bit < width; bit += 1) {
       const absolute = this.bitOffset++;
-      value = (value << 1) | ((this.bytes[absolute >>> 3] >>> (7 - (absolute & 7))) & 1);
+      value = (value << 1) | ((this.bytes[Math.floor(absolute / 8)] >>> (7 - (absolute & 7))) & 1);
     }
     return value;
   }
@@ -968,7 +968,7 @@ class MsbBitReader {
     }
     while (this.bitOffset < totalBits) {
       const absolute = this.bitOffset++;
-      if (((this.bytes[absolute >>> 3] >>> (7 - (absolute & 7))) & 1) !== 0) {
+      if (((this.bytes[Math.floor(absolute / 8)] >>> (7 - (absolute & 7))) & 1) !== 0) {
         throw new PdfError("invalid-object", "LZWDecode has nonzero padding after its EOD code.");
       }
     }
@@ -980,7 +980,7 @@ function readPackedSample(bytes: Uint8Array, rowOffset: number, sample: number, 
   const startBit = sample * bits;
   for (let bit = 0; bit < bits; bit += 1) {
     const position = startBit + bit;
-    value = (value << 1) | ((bytes[rowOffset + (position >>> 3)] >>> (7 - (position & 7))) & 1);
+    value = (value << 1) | ((bytes[rowOffset + Math.floor(position / 8)] >>> (7 - (position & 7))) & 1);
   }
   return value;
 }
@@ -995,7 +995,7 @@ function writePackedSample(
   const startBit = sample * bits;
   for (let bit = 0; bit < bits; bit += 1) {
     const position = startBit + bit;
-    const byteOffset = rowOffset + (position >>> 3);
+    const byteOffset = rowOffset + Math.floor(position / 8);
     const mask = 1 << (7 - (position & 7));
     const sourceMask = 1 << (bits - bit - 1);
     bytes[byteOffset] = value & sourceMask ? bytes[byteOffset] | mask : bytes[byteOffset] & ~mask;

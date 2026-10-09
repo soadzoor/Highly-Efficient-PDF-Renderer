@@ -46,6 +46,12 @@ const { openPdfInNodeWorker } = await import("../src/pdf/workerClient.ts");
 const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
 const { validateHeprPageData } = await import("../src/heprDocumentDataValidation.ts");
 const { HEPR_COLOR_SPACE_KIND, collectHeprTransferables } = await import("../src/heprDocumentData.ts");
+const { configureWasm32Memory } = await import("../src/pdf/nativeWasmMemory.ts");
+const smallWasm = Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0, 5, 5, 1, 1, 1, 128, 32);
+const widenedWasm = configureWasm32Memory(smallWasm);
+assert.deepEqual([...widenedWasm.slice(8)], [5, 6, 1, 1, 1, 128, 128, 4], "ICC heaps use WASM32 capacity without allocating it");
+new WebAssembly.Module(widenedWasm);
+assert.throws(() => configureWasm32Memory(smallWasm, 65537), /WASM32/);
 const profiles = Object.fromEntries(await Promise.all(
   ["srgb", "linear-rgb", "linear-gray", "synthetic-cmyk", "lab"].map(async name =>
     [name, new Uint8Array(await readFile(new URL(`./fixtures/icc/${name}.icc`, import.meta.url)))])

@@ -257,7 +257,7 @@ export function expandHeprImageToRgba8(
     for (let y = 0; y < height; y++) {
       signal?.throwIfAborted();
       for (let x = 0; x < width; x++) {
-        const value = ((data[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1) * 255;
+        const value = ((data[y * rowBytes + Math.floor(x / 8)] >> (7 - (x & 7))) & 1) * 255;
         const offset = (y * width + x) * 4;
         output[offset] = output[offset + 1] = output[offset + 2] = value;
         output[offset + 3] = 255;

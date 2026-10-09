@@ -49,17 +49,19 @@ export interface HeprFunctionEvaluationLimits {
 
 export const DEFAULT_HEPR_FUNCTION_EVALUATION_LIMITS:
 Readonly<HeprFunctionEvaluationLimits> = Object.freeze({
-  maxFunctions: 4_096,
-  maxStoreValues: 16_777_216,
-  maxFunctionDepth: 64,
-  maxInputs: 16,
-  maxOutputs: 32,
-  maxInterpolationSamples: 1_048_576,
-  maxCalculatorBytes: 1_048_576,
-  maxCalculatorTokens: 4_096,
-  maxCalculatorDepth: 16,
-  maxCalculatorStack: 256,
-  maxCalculatorOperations: 16_384
+  // Function references and arities are encoded in Float32 parameter stores;
+  // store offsets are Uint32. Other defaults defer to runtime resources.
+  maxFunctions: 0x00ff_ffff,
+  maxStoreValues: 0xffff_ffff,
+  maxFunctionDepth: Number.MAX_SAFE_INTEGER,
+  maxInputs: 0x0100_0000,
+  maxOutputs: 0x0100_0000,
+  maxInterpolationSamples: Number.MAX_SAFE_INTEGER,
+  maxCalculatorBytes: 0xffff_ffff,
+  maxCalculatorTokens: Number.MAX_SAFE_INTEGER,
+  maxCalculatorDepth: Number.MAX_SAFE_INTEGER,
+  maxCalculatorStack: Number.MAX_SAFE_INTEGER,
+  maxCalculatorOperations: Number.MAX_SAFE_INTEGER
 });
 
 export interface HeprFunctionEvaluatorOptions {
@@ -672,19 +674,27 @@ function evaluateLinearSamples(
   limits: Readonly<HeprFunctionEvaluationLimits>,
   signal?: AbortSignal
 ): number[] {
-  const cornerCount = 2 ** record.inputCount;
+  const axes: { offset: number; fraction: number }[] = [];
+  let basePointIndex = 0, stride = 1;
+  for (let dimension = 0; dimension < record.inputCount; dimension++) {
+    basePointIndex += lower[dimension] * stride;
+    if (upper[dimension] !== lower[dimension] && fractions[dimension] > 0) {
+      axes.push({ offset: (upper[dimension] - lower[dimension]) * stride, fraction: fractions[dimension] });
+    }
+    stride *= record.size[dimension];
+  }
+  const cornerCount = 2 ** axes.length;
   assertInterpolationWork(cornerCount, limits);
   const output = new Array<number>(record.outputCount).fill(0);
   for (let corner = 0; corner < cornerCount; corner += 1) {
     if ((corner & 0xff) === 0) checkAbort(signal);
-    let pointIndex = 0;
-    let stride = 1;
+    let pointIndex = basePointIndex;
     let weight = 1;
-    for (let dimension = 0; dimension < record.inputCount; dimension += 1) {
-      const high = (corner & (2 ** dimension)) !== 0;
-      pointIndex += (high ? upper[dimension] : lower[dimension]) * stride;
-      weight *= high ? fractions[dimension] : 1 - fractions[dimension];
-      stride *= record.size[dimension];
+    for (let dimension = 0; dimension < axes.length; dimension += 1) {
+      const high = Math.floor(corner / 2 ** dimension) % 2 !== 0;
+      const axis = axes[dimension];
+      if (high) pointIndex += axis.offset;
+      weight *= high ? axis.fraction : 1 - axis.fraction;
     }
     if (weight === 0) continue;
     const sampleOffset = pointIndex * record.outputCount;
@@ -1342,16 +1352,10 @@ function normalizeLimits(
       throw new RangeError(`HEPR function limit ${name} must be a positive safe integer.`);
     }
   }
-  if (limits.maxInputs > 16) {
-    throw new RangeError("HEPR function maxInputs cannot exceed 16.");
-  }
-  if (limits.maxFunctions > 0x00ff_ffff || limits.maxOutputs > 0x0100_0000) {
+  if (limits.maxFunctions > 0x00ff_ffff || limits.maxInputs > 0x0100_0000 || limits.maxOutputs > 0x0100_0000) {
     throw new RangeError(
       "HEPR function count and output limits cannot exceed exactly representable Float32 integers."
     );
-  }
-  if (limits.maxFunctionDepth > 64 || limits.maxCalculatorDepth > 64) {
-    throw new RangeError("HEPR function recursion limits cannot exceed 64.");
   }
   if (limits.maxStoreValues > 0xffff_ffff) {
     throw new RangeError("HEPR function store limit cannot exceed Uint32 capacity.");

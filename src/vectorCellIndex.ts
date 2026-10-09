@@ -26,17 +26,15 @@ import { vectorFillBandStore, type VectorFillBandIndex, type VectorPathSegmentSt
  *
  * Nothing is approximated: pieces are exact sub-curves and closures carry the
  * exact vertical extents, so coverage matches the unindexed sum up to
- * rounding. The price is storage, bounded per path and in total.
+ * rounding. Optional index storage uses the caller's available texture capacity.
  */
 
 /** A path needs this many segments before an index is shorter than its scan. */
 const MIN_INDEXED_SEGMENTS = 24;
 /** The finest level stops refining once its cells average this many pieces. */
 const TARGET_PIECES_PER_CELL = 8;
-const MAX_LEVELS = 14;
-const MAX_CELLS_PER_LEVEL = 4096;
-/** Texels a path's index may use per original segment, across all its levels. */
-const MAX_TEXELS_PER_SEGMENT = 40;
+/** Absolute addresses are stored as exact Float32 integers in the GPU format. */
+const MAX_ADDRESSABLE_TEXELS = 2 ** 24;
 /** Where vertices below a cell's rows fold into a single closure. */
 export const CELL_CLOSURE_BELOW = -1e30;
 
@@ -56,7 +54,9 @@ export interface VectorCellOptions {
   readonly targetPieces?: number;
   /** Cell size ratio between levels, as a power of two. */
   readonly levelStep?: number;
-  /** Texels a path may use per original segment, across all its levels. */
+  /** Available texture texels, across all levels; defaults to the address format's capacity. */
+  readonly maxTexels?: number;
+  /** Optional caller-selected texels per original segment, across all levels. */
   readonly texelsPerSegment?: number;
   /**
    * Keep horizontal lines. They add nothing to coverage or winding, but a
@@ -77,6 +77,8 @@ export interface VectorPathCells {
   readonly pieceCount: number;
   readonly cellCount: number;
   readonly closurePairCount: number;
+  /** A finer complete level could not fit the caller's remaining texture capacity. */
+  readonly capacityLimited: boolean;
 }
 
 /**
@@ -88,8 +90,13 @@ export function buildVectorPathCells(segmentsA: Float32Array, segmentsB: Float32
   count: number, bounds: readonly number[], curveThreshold = 0.5, options: VectorCellOptions = {}): VectorPathCells | null {
   if (count < MIN_INDEXED_SEGMENTS) return null;
   const target = options.targetPieces ?? TARGET_PIECES_PER_CELL, step = options.levelStep ?? 1;
+  if (!Number.isInteger(step) || step < 1 || !Number.isFinite(target) || target < 0) {
+    throw new RangeError("Invalid vector cell refinement options.");
+  }
   const keepHorizontal = options.keepHorizontal ?? false;
-  const maxTexels = count * (options.texelsPerSegment ?? MAX_TEXELS_PER_SEGMENT);
+  const maxTexels = Math.floor(Math.min(MAX_ADDRESSABLE_TEXELS, options.maxTexels ?? MAX_ADDRESSABLE_TEXELS,
+    options.texelsPerSegment === undefined ? Infinity : count * options.texelsPerSegment));
+  if (!(maxTexels > 0)) return null;
   const [minX, minY, maxX, maxY] = bounds;
   const extent = Math.max(maxX - minX, maxY - minY);
   if (!(extent > 0) || !Number.isFinite(extent) || !Number.isFinite(minX) || !Number.isFinite(minY)) return null;
@@ -97,32 +104,39 @@ export function buildVectorPathCells(segmentsA: Float32Array, segmentsB: Float32
   if (!Number.isFinite(top) || top <= 0) return null;
   const levels: VectorCellLevel[] = [];
   let pieces = 0, cells = 0, pairs = 0;
-  for (let depth = step; depth <= MAX_LEVELS; depth += step) {
+  let finest = top, previousWork = Infinity, previousPieces = 0, capacityLimited = false;
+  for (let depth = step; ; depth += step) {
     const size = top / 2 ** depth;
     // Float32 must represent the cell size, and every cell edge distinctly.
     if (Math.fround(size) !== size || size < Math.max(Math.abs(minX), Math.abs(minY), extent) * 2 ** -20) break;
     const columns = Math.max(1, Math.ceil((maxX - minX) / size));
     const rows = Math.max(1, Math.ceil((maxY - minY) / size));
-    if (columns * rows > MAX_CELLS_PER_LEVEL) break;
     const remaining = maxTexels - pieces - cells - pairs - levels.length - 1;
+    if (!Number.isSafeInteger(columns * rows) || columns * rows > remaining) { capacityLimited = true; break; }
     const level = buildLevel(segmentsA, segmentsB, start, count, minX, minY, size, columns, rows, curveThreshold,
       keepHorizontal, remaining);
     // A level that exceeds the construction budget is optional. Earlier,
     // complete levels still cover the whole path without dropping geometry.
-    if (!level) break;
+    if (!level) { capacityLimited = true; break; }
     const levelPieces = level.pieces.length / 8, levelPairs = level.closures.length / 4;
     // Pieces occupy a texel in each store texture; records and closures in one.
-    if (pieces + levelPieces + cells + columns * rows + pairs + levelPairs + levels.length + 1 > maxTexels) break;
+    let occupied = 0, work = 0;
+    for (let cell = 0; cell < columns * rows; cell++) {
+      const candidates = level.cells[cell * 4 + 1] + 2 * level.cells[cell * 4 + 3];
+      if (candidates > 0) { occupied++; work += candidates; }
+    }
+    const averageWork = occupied ? work / occupied : 0;
+    // Finer grids that only duplicate long edges add storage without reducing
+    // candidate work. Keep the complete earlier levels in that case.
+    if (levels.length && averageWork >= previousWork && levelPieces >= previousPieces * 2 ** step) break;
     levels.unshift(level);
     pieces += levelPieces; cells += columns * rows; pairs += levelPairs;
-    let occupied = 0;
-    for (let cell = 0; cell < columns * rows; cell++) if (level.cells[cell * 4 + 1] > 0) occupied++;
+    finest = size; previousWork = averageWork; previousPieces = levelPieces;
     if (!occupied || levelPieces / occupied <= target) break;
   }
   if (!levels.length) return null;
-  const finest = top / 2 ** (levels.length * step);
   return { originX: minX, originY: minY, cellSize: finest, levelStep: step, levels, pieceCount: pieces,
-    cellCount: cells, closurePairCount: pairs };
+    cellCount: cells, closurePairCount: pairs, capacityLimited };
 }
 
 /** Growable piece storage: seven floats (x0, y0, cx, cy, x2, y2, flag) and a column each. */
@@ -188,6 +202,7 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
             }
           }
         } else pushRoot(splits, (x - x0) / (x2 - x0), x);
+        if (buffer.count + splits.length / 2 > maxPieces) return null;
       }
     }
     if (!splits.length) {
@@ -385,11 +400,8 @@ export interface VectorPathCellStore {
   readonly indexedPaths: number;
 }
 
-/** Index texels a store may add per original segment, across all its paths. */
-export const CELL_STORE_TEXELS_PER_SEGMENT = 4;
-const CELL_STORE_MIN_BUDGET = 65536;
 /** Defaults: a 4x size ratio between levels halves storage for ~20% more work. */
-const STORE_DEFAULTS: Required<VectorCellOptions> = { targetPieces: 12, levelStep: 2, texelsPerSegment: 8,
+const STORE_DEFAULTS: VectorCellOptions = { targetPieces: 12, levelStep: 2,
   keepHorizontal: false };
 
 /**
@@ -402,11 +414,11 @@ const STORE_DEFAULTS: Required<VectorCellOptions> = { targetPieces: 12, levelSte
  * closure texel count), and the closure pairs. A cell with a curve among its
  * pieces stores its piece count negated, so a cell of lines, nearly every
  * cell, reads one texel per piece. Every index is absolute. Paths with the
- * most segments gain the most and are indexed first, within a budget
- * proportional to the store; a path left out
+ * most segments gain the most and are indexed first, within the available
+ * texture capacity; a path left out
  * has a zero level count and keeps its band index or linear scan.
  */
-export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSize = 2048,
+export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSize = Math.sqrt(MAX_ADDRESSABLE_TEXELS),
   options: VectorPathCellStoreOptions = {}): VectorPathCellStore {
   const segmentCount = store.segmentCount, pathCount = store.pathCount;
   const base = options.base ?? segmentCount;
@@ -414,9 +426,8 @@ export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSiz
     headerBase: -1, indexedPaths: 0 };
   if (!pathCount || !store.pathMetaA || !store.pathMetaB) return empty;
   // Offsets must stay exact Float32 integers and inside one texture.
-  const capacity = Math.min(maxTextureSize * maxTextureSize, 0x1000000);
-  const budget = Math.min(capacity - base - pathCount,
-    options.budget ?? Math.max(CELL_STORE_MIN_BUDGET, segmentCount * CELL_STORE_TEXELS_PER_SEGMENT));
+  const capacity = Math.min(maxTextureSize * maxTextureSize, MAX_ADDRESSABLE_TEXELS);
+  const budget = Math.min(capacity - base - pathCount, options.budget ?? Infinity);
   if (budget <= 0) return empty;
   const cellOptions = { ...STORE_DEFAULTS, ...options };
   const curveThreshold = options.curveThreshold ?? 0.5;
@@ -432,7 +443,8 @@ export function vectorPathCellStore(store: VectorPathSegmentStore, maxTextureSiz
     if (pieces + levels + cells + pairs + count > budget) continue;
     const index = buildVectorPathCells(store.segmentsA, store.segmentsB, store.pathMetaA[meta], count,
       [store.pathMetaA[meta + 2], store.pathMetaA[meta + 3], store.pathMetaB[meta], store.pathMetaB[meta + 1]],
-      curveThreshold, cellOptions);
+      curveThreshold, { ...cellOptions, maxTexels: Math.min(cellOptions.maxTexels ?? Infinity,
+        budget - pieces - levels - cells - pairs) });
     if (!index) continue;
     const size = index.pieceCount + index.levels.length + index.cellCount + index.closurePairCount;
     if (pieces + levels + cells + pairs + size > budget) continue;
@@ -497,7 +509,7 @@ export interface VectorIndexedPathStore {
  * leaves out still has its bands; one without either scans linearly.
  */
 export function vectorIndexedPathStore(store: VectorPathSegmentStore, bands: VectorFillBandIndex | null,
-  maxTextureSize = 2048, options: VectorPathCellStoreOptions = {}): VectorIndexedPathStore {
+  maxTextureSize = Math.sqrt(MAX_ADDRESSABLE_TEXELS), options: VectorPathCellStoreOptions = {}): VectorIndexedPathStore {
   const banded = vectorFillBandStore(store.segmentsA, store.segmentCount, bands, maxTextureSize);
   const cells = vectorPathCellStore(store, maxTextureSize, { ...options, base: banded.texels });
   const dataA = new Float32Array(cells.texels * 4);

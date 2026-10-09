@@ -324,7 +324,7 @@ class AnnotationReader {
   }
 
   private async findNamedDestination(raw: PdfValue | undefined, name: string, visited: Set<PdfDictionary>, depth: number): Promise<PdfValue | undefined> {
-    if (depth >= Math.min(this.document.limits.maxRecursionDepth, ANNOTATION_LIMITS.depth) || visited.size >= this.document.limits.maxCachedObjects) this.limit("Destination name tree exceeds limits.");
+    if (depth >= Math.min(this.document.limits.maxRecursionDepth, ANNOTATION_LIMITS.depth)) this.limit("Destination name tree exceeds limits.");
     const node = await this.resolve(raw);
     if (node == null) return undefined;
     if (!isPdfDictionary(node) || visited.has(node)) return this.invalid("Invalid or cyclic destination name tree.");

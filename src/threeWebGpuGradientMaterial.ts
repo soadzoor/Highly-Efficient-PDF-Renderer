@@ -111,7 +111,7 @@ const fillCellInfoFn = TSL.wgslFn(VECTOR_FILL_CELL_INFO_WGSL);
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprGradientCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
-  let itemIndex = i32(index + 0.5);
+  let itemIndex = i32(index);
   let safeWidth = max(i32(width), 1);
   return vec2<i32>(itemIndex % safeWidth, itemIndex / safeWidth);
 }
@@ -142,7 +142,7 @@ fn heprSamplePdfGradient(
     return vec4<f32>(1.0);
   }
 
-  let gradientIndex = i32(gradientIndexInput + 0.5);
+  let gradientIndex = i32(gradientIndexInput);
   let metaWidth = max(i32(metaWidthInput), 1);
   let coord = vec2<i32>(gradientIndex % metaWidth, gradientIndex / metaWidth);
   let a = textureLoad(metaA, coord, 0);
@@ -192,7 +192,7 @@ fn heprGradientFillVertexPack(
   useLocalToClip: f32,
   localToClip: mat4x4<f32>
 ) -> vec4<f32> {
-  let segmentCount = i32(metaA.y + 0.5);
+  let segmentCount = i32(metaA.y);
   let alpha = metaC.w;
   if (segmentCount <= 0 || (alpha <= 0.001 && shapeOnly < 0.5)) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
@@ -298,8 +298,8 @@ fn heprGradientFillFragment(
     length(vec2<f32>(dpdx(local.x), dpdy(local.x))),
     length(vec2<f32>(dpdx(local.y), dpdy(local.y)))
   ) * fillAAScreenPx, vec2<f32>(0.0001));
-  let segmentStart = i32(metaA.x + 0.5);
-  let segmentCount = i32(metaA.y + 0.5);
+  let segmentStart = i32(metaA.x);
+  let segmentCount = i32(metaA.y);
   if (segmentCount <= 0 || (metaC.w <= 0.001 && shapeOnly < 0.5)) { discard; }
   // Average the winding number over the footprint box. A path with a cell
   // index reads only the cells under the box; otherwise the bands spanning

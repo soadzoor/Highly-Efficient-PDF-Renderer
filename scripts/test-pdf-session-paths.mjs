@@ -126,6 +126,23 @@ try {
     await vectorClipSession.close();
   }
 
+  const largePathSession = await openPdf({
+    kind: "bytes", bytes: largeVectorPathFixture(), label: "large-vector-path.pdf"
+  });
+  try {
+    const scene = await largePathSession.compileVectorPage(0, { optimization: "none" });
+    assert.equal(scene.fillPathCount, 2, "both paints stay vector with a large path and clip");
+    assert.ok(scene.fillSegmentCount > 65_536, "analytic fill retains more than the former segment ceiling");
+    assert.equal(scene.rasterLayers.length, 0, "path complexity does not request raster fallback");
+    const clippedRun = scene.drawRuns.find(run => (run.clipIndex ?? -1) >= 0);
+    assert.ok(clippedRun, "the first fill retains its exact clip");
+    const clip = scene.clipPaths[clippedRun.clipIndex];
+    assert.equal(clip.fillRule, 1, "large even-odd clips preserve their winding rule");
+    assert.ok(clip.edges.length / 4 > 65_536, "large clipping geometry remains complete");
+  } finally {
+    await largePathSession.close();
+  }
+
   for (const [limits, reason] of [
     [{ maxPathsPerPage: 1 }, undefined],
     [{ maxClipsPerPage: 2 }, "clips"],
@@ -274,5 +291,18 @@ function vectorClipCompatibilityFixture() {
         "q 10 10 m 70 10 l 40 60 l h W* n 10 10 60 50 re f Q"
       )
     }
+  ] });
+}
+
+function largeVectorPathFixture() {
+  const segments = 70_000;
+  const commands = ["0 0 m"];
+  for (let index = 1; index <= segments; index += 1) commands.push(`${index} ${index % 2} l`);
+  const path = commands.join("\n");
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>" },
+    { number: 3, body: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${segments + 1} 4] /Contents 4 0 R >>` },
+    { number: 4, body: tinyPdfStream("", `q\n${path}\nW* n\n0 0 ${segments} 3 re f\nQ\n${path}\nf*`) }
   ] });
 }

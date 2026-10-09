@@ -12,7 +12,7 @@ import { visitHeprPath } from "./heprPathGeometry";
 import { HeprFunctionEvaluator } from "./heprFunctionEvaluator";
 import { HeprColorEvaluator } from "./heprColorEvaluator";
 import { buildHeprVectorGradient } from "./retainedVectorGradient";
-import { compositeBinaryStencilPlates, isBinaryStencil, MAX_STENCIL_COMPOSITE_PIXELS,
+import { compositeBinaryStencilPlates, isBinaryStencil,
   type BinaryStencilPlate } from "./retainedStencilRaster";
 import type { GradientSceneData } from "./orderedGradientPaint";
 import type { OptionalContentCondition, SceneOptionalContent } from "./optionalContentData";
@@ -31,12 +31,6 @@ import type { PdfDiagnostic } from "./pdf/nativeTypes";
 import { createMonochromeRasterLayer, type MonochromeRaster } from "./monochromeRaster";
 
 const IDENTITY: PdfMatrix = [1, 0, 0, 1, 0, 0];
-/**
- * Stencil masks share the pixel budget of a page raster fallback. Co-located
- * opaque plates can share an RGBA8 tile, keeping their coverage intact when
- * the scan contains hundreds of overlapping 1-bit images.
- */
-const MAX_RETAINED_STENCIL_PIXELS = 16_000_000;
 type Color = readonly [number, number, number, number];
 interface Geometry { a: number[]; b: number[]; bounds: Bounds }
 
@@ -210,8 +204,8 @@ export function buildRetainedPatternCellPage(page: HeprPageData, resolved: HeprR
 /** Lower self-contained reusable PDF programs into canonical geometry and a retained paint graph. */
 export async function lowerRetainedPageToVectorScene(source: HeprPageData, options: RetainedVectorPageOptions): Promise<VectorScene> {
   const { signal } = options;
-  const maximum = options.maxPrimitives ?? 1_000_000, maxCoordinates = options.maxCoordinates ?? 60_000_000;
-  const maxCells = options.maxPatternCells ?? 100_000;
+  const maximum = options.maxPrimitives ?? Number.MAX_SAFE_INTEGER, maxCoordinates = options.maxCoordinates ?? Number.MAX_SAFE_INTEGER;
+  const maxCells = options.maxPatternCells ?? Number.MAX_SAFE_INTEGER;
   for (const limit of [maximum, maxCoordinates, maxCells]) if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("Retained vector budgets must be nonnegative safe integers.");
   // Execute every retained command; visibility is applied by the scene controller later.
   const page: HeprPageData = { ...source, stores: { ...source.stores, optionalContent: {
@@ -256,7 +250,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     if (!page.stores.images.imageMask[index]) continue;
     stencilPixels += page.stores.images.widths[index] * page.stores.images.heights[index]; stencilCount++;
   }
-  const maxStencilPixels = options.maxStencilPixels ?? MAX_RETAINED_STENCIL_PIXELS;
+  const maxStencilPixels = options.maxStencilPixels ?? Number.MAX_SAFE_INTEGER;
   const stencilScale = stencilPixels > maxStencilPixels ? Math.sqrt(maxStencilPixels / stencilPixels) : 1;
   const glyphAtlas = new Map<string, number>();
   const hairlineAtlas = new Map<string, ReturnType<typeof buildNativeGlyphHairline>>();
@@ -906,7 +900,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
         // paints, clips, layers, marked-content items and groups end the tile.
         let canComposite = stencil?.[3] === 1 && images.softMaskImageIndices[index] < 0 &&
           images.formats[index] === HEPR_IMAGE_FORMAT.Gray8 && source.length === images.widths[index] * images.heights[index] &&
-          source.length <= MAX_STENCIL_COMPOSITE_PIXELS && !knockoutScopes.has(stack.at(-1)!);
+          !knockoutScopes.has(stack.at(-1)!);
         if (canComposite) {
           let binary = binaryStencils.get(index);
           if (binary === undefined) { binary = isBinaryStencil(source, signal); binaryStencils.set(index, binary); }

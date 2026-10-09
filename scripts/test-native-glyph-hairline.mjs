@@ -95,17 +95,16 @@ try {
     { transform: [0, 0, 0, 0, 0, 0], dashArray: [1, 1] }), /singular/);
   assert.throws(() => build([move(0, 0), line(Infinity, 0)]), /coordinates/);
   assert.throws(() => build([line(1, 0)]), /outside a contour/);
-  assert.throws(() => build([move(0, 0), line(100, 0)], { dashArray: [0.0001, 0.0001] }),
-    error => error.code === "unsupported-content" && error.details.reason === "native-glyph-stroke-complexity",
-    "extremely dense dashes use bounded compatibility fallback");
-  assert.throws(() => build(Array.from({ length: 65537 }, () => move(0, 0))),
-    error => error.code === "resource-limit", "oversized glyph input remains a hard resource limit");
+  const denseDashes = build([move(0, 0), line(10, 0)], { dashArray: [0.0005, 0.0005] });
+  assert.ok(denseDashes.endpoints.length / 4 > 4096, "dense hairline dashes remain vector beyond the former ceiling");
+  const largeOutline = build([move(0, 0), ...Array.from({ length: 70_000 }, (_, index) => line(index + 1, index % 2))], { lineCap: 1 });
+  assert.equal(largeOutline.endpoints.length / 4, 70_000, "large hairline outlines keep every segment");
   assert.throws(() => build([move(0, 0), line(10, 0)], { dashArray: [0, 0] }), /empty dash cycle/);
   const controller = new AbortController();
   controller.abort();
   assert.throws(() => buildNativeGlyphHairline([move(0, 0), line(1, 0)], identity, defaults, controller.signal),
     error => error.name === "AbortError" || error.code === "aborted");
-  console.log("Native glyph hairline geometry, transforms, dashes, curves, and resource bounds passed.");
+  console.log("Native glyph hairline geometry, transforms, dashes, curves, and cancellation passed.");
 } finally {
   hooks.deregister();
 }

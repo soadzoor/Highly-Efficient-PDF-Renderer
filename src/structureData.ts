@@ -60,7 +60,8 @@ export interface SceneMarkedContent {
 export const PRIMITIVE_KINDS: readonly PrimitiveKind[] = Object.freeze(["stroke", "fill", "text", "raster", "gradient-fill", "gradient-stroke"]);
 
 export const STRUCTURE_LIMITS = Object.freeze({
-  items: 1_000_000, ranges: 4_000_000, elements: 262_144, userProperties: 1_000_000, text: 16_000_000
+  items: 0xffffffff, ranges: Number.MAX_SAFE_INTEGER, elements: 0xffffffff,
+  userProperties: Number.MAX_SAFE_INTEGER, text: Number.MAX_SAFE_INTEGER
 });
 
 export function scenePrimitiveCount(scene: VectorScene, kind: PrimitiveKind): number {

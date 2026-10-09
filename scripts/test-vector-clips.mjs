@@ -316,7 +316,8 @@ try {
   assert.equal(precision.precisionLimitedCurves, true, "floating-point subdivision stalls retain a diagnostic flag");
   assert.throws(() => new NativeVectorClipBuilder().add({ ...clip,
     path: { ...clip.path, transform: [1e100, 0, 0, 1e100, 0, 0] } }),
-    error => error.code === "invalid-object", "coordinates that overflow the scene format are rejected");
+    error => error.code === "unsupported-content" && error.details?.reason === "vector-clip-coordinate-range",
+    "finite coordinates that overflow the GPU store permit a retained representation retry");
 
   // Control points are not uploaded: the curve can stay within Float32 even
   // when its transformed control hull extends beyond that format's range.

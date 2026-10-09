@@ -3,7 +3,7 @@ export const VECTOR_FILL_BAND_INFO_WGSL = /* wgsl */ `
 fn heprFillBandInfo(pathIndex: f32, base: f32, segments: texture_2d<f32>) -> vec4<f32> {
   if (base < 0.0) { return vec4<f32>(0.0); }
   let width = i32(textureDimensions(segments).x);
-  let index = i32(base + pathIndex + 0.5);
+  let index = i32(base + pathIndex);
   return textureLoad(segments, vec2<i32>(index % width, index / width), 0);
 }
 `;

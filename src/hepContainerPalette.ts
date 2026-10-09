@@ -1,4 +1,4 @@
-import { MAX_CHUNK_BYTES } from "./hepContainerShared";
+import { MAX_UINT32 } from "./hepContainerShared";
 
 /** Exact Float32 vec4 palette: u16 count, u16 reserved, little-endian words, byte indices. */
 const PALETTE_HEADER_BYTES = 4;
@@ -17,7 +17,7 @@ export function encodeFloat32Palette(source: Float32Array): Uint8Array | null {
 
 function encodeWordPalette(words: Uint32Array): Uint8Array | null {
   const itemCount = words.length / FLOATS_PER_ITEM;
-  if (itemCount === 0 || words.byteLength > MAX_CHUNK_BYTES) return null;
+  if (itemCount === 0 || words.byteLength > MAX_UINT32) return null;
   const palette = new Uint32Array(MAX_PALETTE_ITEMS * FLOATS_PER_ITEM);
   const indices = new Uint8Array(itemCount);
   const entries = new Map<string, number>();
@@ -62,8 +62,8 @@ export function decodeFloat32Palette(bytes: Uint8Array, itemCount: number): Floa
   if (!Number.isSafeInteger(itemCount) || itemCount <= 0 || bytes.byteLength < PALETTE_HEADER_BYTES) {
     throw new Error("Invalid Float32 palette item count or header.");
   }
-  if (itemCount > MAX_CHUNK_BYTES / BYTES_PER_ITEM) {
-    throw new Error("Float32 palette exceeds the decoded texture byte limit.");
+  if (itemCount > MAX_UINT32 / BYTES_PER_ITEM) {
+    throw new Error("Float32 palette exceeds the 32-bit decoded byte length field.");
   }
   const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const paletteCount = header.getUint16(0, true);

@@ -1,5 +1,4 @@
 import {
-  NATIVE_SELECTIVE_MAX_CANVAS_PIXELS,
   createNativeCompositeSurfaceFactory,
   createSelectiveCompositePage,
   renderNativeCompositeCommandSpan,
@@ -1342,10 +1341,10 @@ class NativePdfSession implements NativeVectorPdfSession {
   ): Promise<VectorScene> {
     const page = await this.compilePageUnlocked(sourcePageIndex, options, signal);
     const limits = { ...this.document.limits, ...options.limits };
-    const maxPixels = Math.min(NATIVE_SELECTIVE_MAX_CANVAS_PIXELS, limits.maxImagePixels,
+    const maxPixels = Math.min(limits.maxImagePixels,
       Math.floor(limits.maxDecodedStreamBytes / 4));
     if (maxPixels < 1) throw new PdfError("resource-limit", "No pixel budget for page fallback.");
-    const maxDimension = Math.min(16_384, limits.maxImageDimension);
+    const maxDimension = limits.maxImageDimension;
     const { width, height } = page.pageInfo;
     let scale = Math.min(2, maxDimension / width, maxDimension / height,
       Math.sqrt(maxPixels / (width * height)),
@@ -1357,7 +1356,7 @@ class NativePdfSession implements NativeVectorPdfSession {
     const { renderHeprPageToCanvas2d, HEPR_CANVAS_2D_ERROR_CODES } = await import("./heprCanvas2dRenderer");
     const onDiagnostic = (diagnostic: PdfDiagnostic) => this.appendDiagnostics([diagnostic]);
     const renderOptions = { scale, surfaceFactory, signal, onDiagnostic,
-      maxCanvasPixels: maxPixels, maxWorkingPixels: Math.min(64_000_000, Math.floor(limits.maxDecodedStreamBytes / 4)) };
+      maxCanvasPixels: maxPixels, maxWorkingPixels: Math.floor(limits.maxDecodedStreamBytes / 4) };
     try {
       let pixels;
       try {
@@ -4714,12 +4713,12 @@ async function compileNativeFormPrograms(
     const key = formSpecializationKey(definitionIndex, initialGraphicsState);
     const cached = specializationByKey.get(key);
     if (cached !== undefined) return cached;
-    if (programs.length >= document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Form program specializations exceed the object-cache limit.", {
+    if (programs.length >= 0xffffffff) {
+      throw new PdfError("resource-limit", "Form program specializations exceed the Uint32 index range.", {
         pageIndex,
         details: {
           reason: "form-program-specialization-count",
-          maxFormPrograms: document.limits.maxCachedObjects
+          maxFormPrograms: 0xffffffff
         }
       });
     }
@@ -5019,12 +5018,12 @@ async function compileNativeType3Programs(
     const definitionKey = `${prepared.id}|${glyph.charProc.id}|${type3SpecializationKey(initialGraphicsState)}`;
     const cached = programByDefinition.get(definitionKey);
     if (cached !== undefined) return cached;
-    if (programs.length >= document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Type3 CharProc programs exceed the object-cache limit.", {
+    if (programs.length >= 0xffffffff) {
+      throw new PdfError("resource-limit", "Type3 CharProc programs exceed the Uint32 index range.", {
         pageIndex,
         details: {
           reason: "type3-program-count",
-          maxType3Programs: document.limits.maxCachedObjects
+          maxType3Programs: 0xffffffff
         }
       });
     }
@@ -6224,12 +6223,12 @@ async function compileNativePatternPrograms(
     const pattern = invocation.pattern;
     if (pattern.patternType === 2) return;
     if (programByPatternIndex.has(pattern.index)) return;
-    if (programs.length >= document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Tiling-pattern programs exceed the object-cache limit.", {
+    if (programs.length >= 0xffffffff) {
+      throw new PdfError("resource-limit", "Tiling-pattern programs exceed the Uint32 index range.", {
         pageIndex,
         details: {
           reason: "pattern-program-count",
-          maxPatternPrograms: document.limits.maxCachedObjects
+          maxPatternPrograms: 0xffffffff
         }
       });
     }

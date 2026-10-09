@@ -50,7 +50,8 @@ await testUnsupportedAndMalformedContent();
 await testCancellationAndProgress();
 await testMergeCullAndFillBoundaries();
 await testLosslessExtremeCoordinateKeys();
-await testCooperativeEligibilityLimits();
+await testLargeVectorPaths();
+await testDeepMarkedContent();
 await testGroupedSelectiveImageCheckpoints();
 
 console.log("Dense PDF content compiler tests passed.");
@@ -1115,49 +1116,60 @@ async function testLosslessExtremeCoordinateKeys() {
   assert.equal(scene.segmentCount, 2);
 }
 
-async function testCooperativeEligibilityLimits() {
+async function testLargeVectorPaths() {
+  const segmentCount = 70_000;
+  const geometryOptions = {
+    pageBounds: { minX: -1, minY: -1, maxX: segmentCount + 1, maxY: 4 },
+    enableInvisibleCull: false,
+    enableSegmentMerge: false
+  };
   const commands = ["0 0 m"];
-  for (let index = 1; index <= 22_000; index += 1) {
+  for (let index = 1; index <= segmentCount; index += 1) {
     commands.push(`${index} ${index % 2} l`);
   }
   commands.push("S");
   const path = commands.slice(0, -1).join("\n");
-  await expectUnsupported(`${path}\nS`, "S");
+  const stroked = await compile(`${path}\nS`, geometryOptions);
+  assert.equal(stroked.segmentCount, segmentCount, "a long path keeps every vector stroke");
+
+  const form = await compile(`${path}\nB*`, geometryOptions, compileVectorFormContent);
+  assert.equal(form.segmentCount, segmentCount, "large Form paths remain vector");
+  assert(form.fillSegmentCount > 65_536, "large Form fills exceed the former analytic cutoff");
 
   const content = `0 0 2 2 re f\n${path}\nB*\n0 0 3 3 re f`;
-  const captured = await compile(content, { output: "vector-scene" });
-  assert.equal(captured.fillPathCount, 2, "surrounding fills stay vector");
-  assert.equal(captured.segmentCount, 0, "an oversized compound paint is captured as one whole path");
-  assert.deepEqual(captured.vectorSceneData.selectivePaintReasons, ["large-path"]);
-  assert.deepEqual([...captured.vectorSceneData.selectivePaintSourceSpans], [content.indexOf("B*"), 2]);
-  assert.deepEqual([...captured.vectorSceneData.selectivePaintOrdinalSpans], [1, 1],
-    "the complete fill/stroke paint occupies its source position");
+  const vectors = await compile(content, { ...geometryOptions, output: "vector-scene" });
+  assert.equal(vectors.fillPathCount, 3, "large and surrounding fills all stay vector");
+  assert.equal(vectors.segmentCount, segmentCount, "the companion stroke stays vector");
+  assert(vectors.fillSegmentCount > 65_536, "the complete analytic fill exceeds the former cutoff");
+  assert.deepEqual(vectors.vectorSceneData.selectivePaintReasons ?? [], []);
+  assert.equal(vectors.vectorSceneData.selectivePaintSourceSpans.length, 0);
+  assert.equal(vectors.vectorSceneData.selectivePaintOrdinalSpans.length, 0);
 
-  const retained = await compile(`${path}\nB*`, { output: "display-program" });
-  assert.equal(retained.pagePaths[0].data.length, 66_003,
-    "the fallback display program retains every path command");
-  assert.equal(retained.genericPathPaints[0].fillRule, 1, "even-odd holes survive capture");
+  const retained = await compile(`${path}\nB*`, { ...geometryOptions, output: "display-program" });
+  assert.equal(retained.pagePaths[0].data.length, segmentCount * 3 + 3,
+    "the display program retains every path command");
+  assert.equal(retained.genericPathPaints[0].fillRule, 1, "even-odd winding is retained");
   assert.ok(retained.genericPathPaints[0].fill && retained.genericPathPaints[0].stroke);
 
-  const clipped = await compile(`${path}\nW n\n0 0 2 2 re f`, { output: "vector-scene" });
-  assert.equal(clipped.pagePaths[0].data.length, 66_003,
-    "oversized clip-only paths remain exact vector clip resources");
+  const clipped = await compile(`${path}\nW n\n0 0 2 2 re f`, { ...geometryOptions, output: "vector-scene" });
+  assert.equal(clipped.pagePaths[0].data.length, segmentCount * 3 + 3,
+    "large clip-only paths remain exact vector clip resources");
   assert.equal(clipped.clipPaths.length, 1);
   assert.equal(clipped.fillPathCount, 1);
   assert.equal(clipped.vectorSceneData.selectivePaintSourceSpans.length, 0,
     "clip construction itself has no raster paint to capture");
 
   const discarded = await compile(`${path}\nn`, { output: "vector-scene" });
-  assert.equal(discarded.pathCount, 0, "unpainted paths do not exceed the paint budget");
+  assert.equal(discarded.pathCount, 0, "unpainted paths produce no geometry");
   const invisible = await compile(`${path}\nf`, {
     output: "vector-scene",
     pageBounds: { minX: -10, minY: -10, maxX: -1, maxY: -1 }
   });
   assert.equal(invisible.pathCount, 0, "off-page fills do not require capture");
 
-  await assert.rejects(compile(content, { output: "vector-scene", maxPathVerbs: 22_000 }),
+  await assert.rejects(compile(content, { output: "vector-scene", maxPathVerbs: segmentCount }),
     error => error instanceof DensePdfResourceLimitError && /verb limit/.test(error.message),
-    "selective capture does not bypass path resource limits");
+    "explicit path resource limits still apply");
 
   const controller = new AbortController();
   await assert.rejects(compile(content, {
@@ -1166,7 +1178,18 @@ async function testCooperativeEligibilityLimits() {
     onProgress(progress) {
       if (progress.phase === "finalizing") controller.abort(new Error("large-path cancellation"));
     }
-  }), /large-path cancellation/, "selective captures remain cancellable before finalization");
+  }), /large-path cancellation/, "large paths remain cancellable before finalization");
+}
+
+async function testDeepMarkedContent() {
+  const depth = 128;
+  const content = `${"/Span BMC\n".repeat(depth)}0 0 2 2 re f\n${"EMC\n".repeat(depth)}`;
+  const compiled = await compile(content);
+  assert.equal(compiled.markedContent.length, depth, "valid nesting beyond the former default stays vector");
+  assert.equal(compiled.fillPathCount, 1);
+  await assert.rejects(compile(content, { maxMarkedContentDepth: 64 }),
+    error => error instanceof DensePdfResourceLimitError && /nesting/.test(error.message),
+    "caller-selected nesting limits still apply");
 }
 
 async function testGroupedSelectiveImageCheckpoints() {

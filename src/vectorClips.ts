@@ -3,8 +3,6 @@ import { buildVectorPathCells, type VectorPathCells } from "./vectorCellIndex";
 
 /** Prefer indexing large clips; shaders can still scan their complete edges. */
 export const TARGET_VECTOR_CLIP_EDGES = 8192;
-/** Bound cell-index construction; larger polygons retain exact bands or edges. */
-export const MAX_CELL_INDEXED_CLIP_EDGES = 65_536;
 /** Absolute texel addresses in the GPU format must remain exact Float32 integers. */
 export const MAX_VECTOR_CLIP_TEXELS = 2 ** 24;
 
@@ -72,8 +70,6 @@ function clipRectangle(edges: Float32Array): ClipRectangle | undefined {
 
 const MIN_INDEXED_CLIP_EDGES = 64;
 const TARGET_CLIP_EDGES_PER_BAND = 16;
-const MAX_CLIP_BANDS = 512;
-const MAX_CLIP_ENTRIES_PER_EDGE = 4;
 // Subnormal band heights may flush to zero on the GPU.
 const MIN_NORMAL_FLOAT32 = 2 ** -126;
 
@@ -89,7 +85,7 @@ function clipBandRow(y: number, minY: number, height: number, count: number): nu
 }
 
 /** Keep the original directed edges; only shorten the per-pixel candidate list. */
-function buildClipBands(edges: Float32Array): ClipBands | null {
+function buildClipBands(edges: Float32Array, maxTexels = MAX_VECTOR_CLIP_TEXELS): ClipBands | null {
   const edgeCount = edges.length / 4;
   if (edgeCount < MIN_INDEXED_CLIP_EDGES) return null;
   let minY = Infinity, maxY = -Infinity;
@@ -99,15 +95,14 @@ function buildClipBands(edges: Float32Array): ClipBands | null {
   }
   const span = Math.fround(maxY - minY);
   if (!(span > 0) || !Number.isFinite(span)) return null;
-  const large = edgeCount > TARGET_VECTOR_CLIP_EDGES;
-  const initialCount = Math.min(MAX_CLIP_BANDS, 2 ** Math.ceil(Math.log2(edgeCount / TARGET_CLIP_EDGES_PER_BAND)));
+  if (maxTexels <= 2) return null;
+  const initialCount = Math.min(2 ** Math.floor(Math.log2(maxTexels - 1)),
+    2 ** Math.ceil(Math.log2(edgeCount / TARGET_CLIP_EDGES_PER_BAND)));
   for (let count = initialCount; count >= 1; count /= 2) {
     const height = Math.fround(span / count);
-    if (height < MIN_NORMAL_FLOAT32) {
-      if (large) continue;
-      return null;
-    }
+    if (height < MIN_NORMAL_FLOAT32) continue;
     const counts = new Uint32Array(count);
+    const maxEntries = maxTexels - 1 - count;
     let entries = 0;
     for (let offset = 0; offset < edges.length; offset += 4) {
       const y0 = edges[offset + 1], y1 = edges[offset + 3];
@@ -117,17 +112,13 @@ function buildClipBands(edges: Float32Array): ClipBands | null {
       const first = Math.max(0, clipBandRow(Math.min(y0, y1), minY, height, count) - 1);
       const last = Math.min(count - 1, clipBandRow(Math.max(y0, y1), minY, height, count) + 1);
       entries += last - first + 1;
-      if (entries > edgeCount * MAX_CLIP_ENTRIES_PER_EDGE) break;
+      if (entries > maxEntries) break;
       for (let band = first; band <= last; band++) {
         counts[band]++;
       }
     }
-    if (entries > edgeCount * MAX_CLIP_ENTRIES_PER_EDGE) {
-      // Coarser bands duplicate fewer long edges. Ordinary clips keep their
-      // existing optional-index behavior; large clips try a smaller index.
-      if (large) continue;
-      return null;
-    }
+    // Coarser bands duplicate fewer long edges and may fit the device.
+    if (entries > maxEntries) continue;
     // Full-height edges gain nothing from indexing. Ordinary clips retain
     // their original scan rather than duplicate edges without accelerating it.
     if (entries / count >= edgeCount / 2) return null;
@@ -153,10 +144,10 @@ export function requiredVectorClipTexels(edges: Float32Array): number | null {
 }
 
 /** Clip polygons are indexed more finely than fills: one texel per line piece. */
-const CLIP_CELL_OPTIONS = { targetPieces: 8, levelStep: 1, texelsPerSegment: 12, keepHorizontal: true };
+const CLIP_CELL_OPTIONS = { targetPieces: 8, levelStep: 1, keepHorizontal: true };
 
 /** A cell index over a clip polygon's edges (see vectorCellIndex.ts), or null. */
-function buildClipCells(edges: Float32Array): VectorPathCells | null {
+function buildClipCells(edges: Float32Array, capacity: number): VectorPathCells | null {
   const count = edges.length / 4;
   const segmentsA = new Float32Array(count * 4), segmentsB = new Float32Array(count * 4);
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -167,29 +158,13 @@ function buildClipCells(edges: Float32Array): VectorPathCells | null {
     minX = Math.min(minX, x0, x1); minY = Math.min(minY, y0, y1);
     maxX = Math.max(maxX, x0, x1); maxY = Math.max(maxY, y0, y1);
   }
-  return buildVectorPathCells(segmentsA, segmentsB, 0, count, [minX, minY, maxX, maxY], 0.5, CLIP_CELL_OPTIONS);
+  return buildVectorPathCells(segmentsA, segmentsB, 0, count, [minX, minY, maxX, maxY], 0.5,
+    { ...CLIP_CELL_OPTIONS, maxTexels: capacity - 2 });
 }
 
 /** Texels a clip's cell index occupies: header pair, levels, cells, pieces, closures. */
 function clipCellTexels(cells: VectorPathCells): number {
   return 2 + cells.levels.length + cells.cellCount + cells.pieceCount + cells.closurePairCount;
-}
-
-/** Drop only the finest levels; every retained level still covers the whole polygon. */
-function fitClipCells(cells: VectorPathCells, capacity: number): VectorPathCells | null {
-  if (clipCellTexels(cells) <= capacity) return cells;
-  let pieces = cells.pieceCount, count = cells.cellCount, pairs = cells.closurePairCount;
-  for (let first = 1; first < cells.levels.length; first++) {
-    const removed = cells.levels[first - 1];
-    pieces -= removed.pieces.length / 8;
-    count -= removed.columns * removed.rows;
-    pairs -= removed.closures.length / 4;
-    if (2 + cells.levels.length - first + count + pieces + pairs <= capacity) {
-      return { ...cells, levels: cells.levels.slice(first), cellSize: cells.cellSize * 2 ** (first * cells.levelStep),
-        pieceCount: pieces, cellCount: count, closurePairCount: pairs };
-    }
-  }
-  return null;
 }
 
 export interface VectorClipPackingStats {
@@ -294,23 +269,22 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
     const original = payload.edges.length / 4;
     // Dense technical drawings can cover the viewport with a rectangle clipped
     // by thousands of small contours. Bands still scan unrelated contours at
-    // close zoom; cells restrict the search in both axes. Keep construction
-    // bounded for enormous polygons and retain their exact band/scan fallback.
-    const fullCells = options.cells && !payload.rectangle && original <= MAX_CELL_INDEXED_CLIP_EDGES
-      ? buildClipCells(payload.edges) : null;
+    // close zoom; cells restrict the search in both axes. Construct only levels
+    // that fit the device, independently of the polygon's original edge count.
     const capacity = maxTexels - count + original;
-    if (fullCells && clipCellTexels(fullCells) <= capacity) {
+    const fullCells = options.cells && !payload.rectangle ? buildClipCells(payload.edges, capacity) : null;
+    if (fullCells && !fullCells.capacityLimited) {
       payload.cells = fullCells;
       count += clipCellTexels(fullCells) - original;
       continue;
     }
-    const bands = payload.rectangle ? null : buildClipBands(payload.edges);
+    const bands = payload.rectangle ? null : buildClipBands(payload.edges, capacity);
     const extra = bands ? 1 + bands.counts.length + bands.entries - original : 0;
     // Keep the existing band fallback when it fits: a very coarse cell grid
     // may have longer candidate lists than bands. Coarsen only to avoid a
     // complete edge scan when neither the full cell index nor bands fit.
     if (bands && count + extra <= maxTexels) { payload.bands = bands; count += extra; continue; }
-    const cells = fullCells ? fitClipCells(fullCells, capacity) : null;
+    const cells = fullCells;
     if (cells) {
       payload.cells = cells; payload.coarsened = true;
       count += clipCellTexels(cells) - original;

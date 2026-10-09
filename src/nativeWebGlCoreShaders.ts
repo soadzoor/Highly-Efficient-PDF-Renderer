@@ -70,7 +70,7 @@ ivec2 segmentCoord(int index) {
 
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
-  int index = int(aSegmentIndex + 0.5);
+  int index = int(aSegmentIndex);
 #ifdef HEPR_SPLIT_STROKE_STORE
   vec4 primitiveA;
   vec4 primitiveB;
@@ -417,12 +417,12 @@ void heprCullFill() {
 
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
-  int pathIndex = int(aFillPathIndex + 0.5);
+  int pathIndex = int(aFillPathIndex);
   vec4 metaA = texelFetch(uFillPathMetaTexA, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
   vec4 metaB = texelFetch(uFillPathMetaTexB, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
   vec4 metaC = texelFetch(uFillPathMetaTexC, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
 
-  int segmentCount = int(metaA.y + 0.5);
+  int segmentCount = int(metaA.y);
   float alpha = metaC.w;
   if (segmentCount <= 0 || alpha <= 0.001) {
     heprCullFill();
@@ -454,7 +454,7 @@ void main() {
     gl_Position = vec4(clip, 0.0, 1.0);
   }
 
-  vSegmentStart = int(metaA.x + 0.5);
+  vSegmentStart = int(metaA.x);
   vSegmentCount = segmentCount;
   vFillBands = uFillBandBase < 0 ? vec4(0.0)
     : texelFetch(uFillSegmentTexA, coordFromIndex(uFillBandBase + pathIndex, uFillSegmentTexSize), 0);
@@ -635,16 +635,16 @@ ${FILL_COVERAGE_VERTEX_GLSL}
 
 void main() {
   vVectorClipIndex = aVectorClipIndex - 1.0;
-  int instanceIndex = int(aTextInstanceIndex + 0.5);
+  int instanceIndex = int(aTextInstanceIndex);
   vec4 instanceA = texelFetch(uTextInstanceTexA, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
   vec4 instanceB = texelFetch(uTextInstanceTexB, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
   vec4 instanceC = texelFetch(uTextInstanceTexC, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
 
-  int glyphIndex = int(instanceB.z + 0.5);
+  int glyphIndex = int(instanceB.z);
   vec4 glyphMetaA = texelFetch(uTextGlyphMetaTexA, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
   vec4 glyphMetaB = texelFetch(uTextGlyphMetaTexB, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
 
-  int segmentCount = int(glyphMetaA.y + 0.5);
+  int segmentCount = int(glyphMetaA.y);
   if (segmentCount <= 0) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vSegmentStart = 0;
@@ -683,7 +683,7 @@ void main() {
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
     instanceA.y * local.x + instanceA.w * local.y + instanceB.y
   );
-  int clipRef = int(instanceB.w + 0.5);
+  int clipRef = int(instanceB.w);
   vClipRect = clipRef > 0
     ? texelFetch(uTextGlyphMetaTexA, coordFromIndex(clipRef - 1, uTextGlyphMetaTexSize), 0)
     : vec4(0.0);
@@ -695,7 +695,7 @@ void main() {
     vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
     gl_Position = vec4(clip, 0.0, 1.0);
   }
-  vSegmentStart = int(glyphMetaA.x + 0.5);
+  vSegmentStart = int(glyphMetaA.x);
   vSegmentCount = segmentCount;
   vColor = instanceC.rgb;
   vColorAlpha = instanceC.a;

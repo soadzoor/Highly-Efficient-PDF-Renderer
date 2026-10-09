@@ -2,10 +2,7 @@ import {
   HEADER_BYTES,
   CHUNK_RECORD_BYTES,
   EMPTY_CHUNK,
-  MAX_RECORDS,
-  MAX_INDEX_BYTES,
-  MAX_CHUNK_BYTES,
-  MAX_TOTAL_BYTES,
+  MAX_UINT32,
   GROUP_BYTES,
   SMALL_ENTRY_BYTES,
   groupKey,
@@ -34,17 +31,14 @@ export async function generateHepArchive(
   const openGroups = new Map<string, number>();
   let indexLength = 0;
   let aggregate = 0;
-  let rasterBytes = 0;
   for (const source of sources) {
     options.signal?.throwIfAborted();
     const nameBytes = validateName(source.name);
     validateEntryLength(source.name, source.uncompressedSize);
-    if (source.name.startsWith("raster/")) rasterBytes += source.uncompressedSize;
-    if (rasterBytes > MAX_CHUNK_BYTES) fail("aggregate raster byte limit exceeded.");
     const record: EntryRecord = { name: source.name, nameBytes, chunkId: EMPTY_CHUNK, offset: 0, length: source.uncompressedSize };
     entries.push(record);
     indexLength += align4(16 + nameBytes.length);
-    if (indexLength > MAX_INDEX_BYTES) fail("index byte limit exceeded.");
+    if (indexLength > MAX_UINT32) fail("index exceeds its 32-bit length field.");
     if (!record.length) continue;
     const store = compression === "STORE" || source.compression === "STORE" || isPrecompressed(source.name);
     const prefix = !isPrecompressed(source.name) && record.length <= SMALL_ENTRY_BYTES ? groupKey(source.name) : undefined;
@@ -64,11 +58,11 @@ export async function generateHepArchive(
     aggregate += record.offset + record.length - chunk.length;
     chunk.length = record.offset + record.length;
     chunk.entries.push({ record, source });
-    if (aggregate > MAX_TOTAL_BYTES) fail("aggregate decoded byte limit exceeded.");
+    if (!Number.isSafeInteger(aggregate)) fail("aggregate decoded byte length is not a safe integer.");
   }
   indexLength += writeChunks.length * CHUNK_RECORD_BYTES;
-  if (entries.length > MAX_RECORDS || writeChunks.length > MAX_RECORDS) fail("too many sections or chunks.");
-  if (indexLength > MAX_INDEX_BYTES) fail("index byte limit exceeded.");
+  if (entries.length > MAX_UINT32 || writeChunks.length > MAX_UINT32) fail("record count exceeds its 32-bit field.");
+  if (indexLength > MAX_UINT32) fail("index exceeds its 32-bit length field.");
   const payloads: Uint8Array[] = [];
   const chunks: ChunkRecord[] = [];
   let outputLength = HEADER_BYTES + indexLength;
@@ -92,7 +86,7 @@ export async function generateHepArchive(
     let stored = decoded;
     let codec = 0;
     if (!chunk.store) {
-      const compressed = await transformBytes(decoded, true, MAX_CHUNK_BYTES + 1024 * 1024, options.signal);
+      const compressed = await transformBytes(decoded, true, Number.MAX_SAFE_INTEGER, options.signal);
       if (compressed.length < decoded.length) { stored = compressed; codec = 1; }
       // This changes only the physical chunk codec: section names, decoded
       // bytes, checksum and scene manifest are identical. Keeping the chunk
@@ -100,10 +94,13 @@ export async function generateHepArchive(
       if (chunk.entries.length === 1 && isPaletteCandidate(chunk.entries[0].record.name)) {
         const palette = encodePaletteBytes(decoded);
         if (palette) {
-          const packed = await transformBytes(palette, true, MAX_CHUNK_BYTES + 1024 * 1024, options.signal);
+          const packed = await transformBytes(palette, true, Number.MAX_SAFE_INTEGER, options.signal);
           if (align4(packed.length) < align4(stored.length)) { stored = packed; codec = 2; }
         }
       }
+    }
+    if (outputLength > MAX_UINT32 || stored.length > MAX_UINT32 || decoded.length > MAX_UINT32) {
+      fail("chunk offset or length exceeds its 32-bit field.");
     }
     chunks.push({ offset: outputLength, storedLength: stored.length, decodedLength: decoded.length,
       checksum: crc32(decoded), codec, entries: chunk.entries.map(entry => entry.record) });
@@ -112,7 +109,7 @@ export async function generateHepArchive(
     processed += chunk.length;
     onProgress?.({ percent: aggregate ? Math.min(99, processed / aggregate * 99) : 99 });
   }
-  if (outputLength > 0xffffffff) fail("container exceeds the 32-bit offset limit.");
+  if (!Number.isSafeInteger(outputLength)) fail("container byte length is not a safe integer.");
   const headerIndex = new Uint8Array(HEADER_BYTES + indexLength);
   headerIndex.set([0x48, 0x45, 0x50, 0]);
   const view = new DataView(headerIndex.buffer);
@@ -162,4 +159,3 @@ export async function generateHepArchive(
 function isPaletteCandidate(name: string): boolean {
   return name === "textures/stroke-styles.f32" || name === "textures/stroke-styles.f32cm";
 }
-

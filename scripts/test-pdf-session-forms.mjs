@@ -27,10 +27,11 @@ try {
     ]);
 
   const source = { kind: "bytes", bytes: formFixture(), label: "native-forms.pdf" };
-  const session = await openPdf(source);
+  const session = await openPdf(source, { limits: { maxCachedObjects: 1 } });
   try {
     const page = await session.compilePage(0, { optimization: "none" });
     validateHeprPageData(page);
+    assert(page.displayProgram.programs.length > 1, "an object-cache eviction target does not cap retained Form programs");
 
     const root = page.displayProgram.groups[page.displayProgram.rootGroupIndex];
     assert.deepEqual(

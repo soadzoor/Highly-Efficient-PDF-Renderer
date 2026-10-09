@@ -296,17 +296,15 @@ const EMPTY_DESCRIPTOR: NativeFontDescriptor = Object.freeze({
 const EMPTY_DIAGNOSTICS: readonly PdfDiagnostic[] = Object.freeze([]);
 
 export const DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS: Readonly<NativePdfFontParserLimits> = Object.freeze({
-  // These are aggregate limits across a /UseCMap chain. Keeping them below
-  // the general decoded-stream ceiling bounds the object-heavy lexer/maps.
-  maxCMapBytes: 16 * 1024 * 1024,
-  maxCMapMappings: 262_144,
-  maxCMapTokens: 1_048_576,
-  maxCodeSpaceRanges: 4_096,
-  maxUseCMapDepth: 64,
-  // CID values and CID-keyed width/vertical metric tables are 16-bit spaces.
-  maxCidMetricEntries: 65_536,
-  // At most 256 codes can be assigned; a second 256 permits sparse resets.
-  maxSimpleEncodingDifferences: 512,
+  // Aggregate parsing work follows host allocation capacity unless the caller
+  // supplies smaller limits. Wire-format ranges are validated at their reads.
+  maxCMapBytes: Number.MAX_SAFE_INTEGER,
+  maxCMapMappings: Number.MAX_SAFE_INTEGER,
+  maxCMapTokens: Number.MAX_SAFE_INTEGER,
+  maxCodeSpaceRanges: Number.MAX_SAFE_INTEGER,
+  maxUseCMapDepth: Number.MAX_SAFE_INTEGER,
+  maxCidMetricEntries: Number.MAX_SAFE_INTEGER,
+  maxSimpleEncodingDifferences: Number.MAX_SAFE_INTEGER,
   maxCffBytes: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxCffBytes,
   maxCffIndexEntries: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxCffIndexEntries,
   maxCffStringBytes: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxCffStringBytes,
@@ -315,14 +313,14 @@ export const DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS: Readonly<NativePdfFontParser
   maxType2SubrDepth: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2SubrDepth,
   maxType2SubrCalls: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2SubrCalls,
   maxType2PathCommands: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2PathCommands,
-  maxSfntFaces: 4_096,
-  maxSfntTables: 4_096,
-  maxSfntCmapRecords: 4_096,
-  maxSfntCmapGroups: 1_000_000,
-  maxGlyphPoints: 1_000_000,
-  maxCompoundGlyphDepth: 32,
-  maxCompoundGlyphComponents: 4_096,
-  maxGlyphInstructionBytes: 16 * 1024 * 1024
+  maxSfntFaces: Number.MAX_SAFE_INTEGER,
+  maxSfntTables: Number.MAX_SAFE_INTEGER,
+  maxSfntCmapRecords: Number.MAX_SAFE_INTEGER,
+  maxSfntCmapGroups: Number.MAX_SAFE_INTEGER,
+  maxGlyphPoints: Number.MAX_SAFE_INTEGER,
+  maxCompoundGlyphDepth: Number.MAX_SAFE_INTEGER,
+  maxCompoundGlyphComponents: Number.MAX_SAFE_INTEGER,
+  maxGlyphInstructionBytes: Number.MAX_SAFE_INTEGER
 });
 
 export const DEFAULT_NATIVE_SFNT_PARSER_LIMITS: Readonly<NativeSfntParserLimits> =

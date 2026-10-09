@@ -4,11 +4,6 @@ import type { NativePdfDocument } from "./nativeDocument";
 import { decodePdfString } from "./nativeForms";
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 
-const MAX_TREE_DEPTH = 32;
-const MAX_TREE_NODES = 4096;
-const MAX_ANCESTORS = 64;
-const MAX_ROLE_CHAIN = 16;
-
 interface StructureRoot {
   readonly dictionary: PdfDictionary;
   readonly identity: string | null;
@@ -77,7 +72,7 @@ export class NativePdfStructureTree {
       const element = await this.readElement(id, signal);
       if (!element) continue;
       result.set(id, element);
-      if (element.parentId && depth < MAX_ANCESTORS) pending.push({ id: element.parentId, depth: depth + 1 });
+      if (element.parentId && depth < this.document.limits.maxRecursionDepth) pending.push({ id: element.parentId, depth: depth + 1 });
     }
     return [...result.values()];
   }
@@ -116,7 +111,7 @@ export class NativePdfStructureTree {
     const visit = async (value: PdfValue | undefined, depth: number): Promise<PdfValue | undefined> => {
       const node = await this.resolve(value, signal);
       if (node == null) return undefined;
-      if (!isPdfDictionary(node) || visited.has(node) || depth > MAX_TREE_DEPTH || visited.size >= MAX_TREE_NODES) {
+      if (!isPdfDictionary(node) || visited.has(node) || depth > this.document.limits.maxRecursionDepth) {
         this.invalid("The structure /ParentTree is malformed or too deep.");
         return undefined;
       }
@@ -180,7 +175,9 @@ export class NativePdfStructureTree {
     signal?: AbortSignal): Promise<StructureElement> {
     const element: StructureElement = { id, type };
     let standard = type;
-    for (let step = 0; root.roleMap && step < MAX_ROLE_CHAIN; step++) {
+    const roles = new Set<string>();
+    while (root.roleMap && !roles.has(standard)) {
+      roles.add(standard);
       const mapped = await this.resolve(root.roleMap.get(standard), signal);
       if (!isPdfName(mapped) || mapped.value === standard) break;
       standard = mapped.value;

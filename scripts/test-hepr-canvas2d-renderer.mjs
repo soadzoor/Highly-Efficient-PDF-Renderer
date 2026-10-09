@@ -332,6 +332,28 @@ try {
     renderHeprPageToCanvas2d(page, { surfaceFactory, maxCanvasPixels: 10 }),
     isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit)
   );
+  const largePage = dataApi.createEmptyHeprPageData({
+    ...page.pageInfo, mediaBox: [0, 0, 20_000, 20_000], cropBox: [0, 0, 20_000, 20_000],
+    width: 20_000, height: 20_000
+  });
+  const allocationAttempt = new Error("device allocation attempted");
+  let allocationAttempts = 0;
+  const unavailableSurfaceFactory = (width, height) => {
+    assert.equal(width, 20_000); assert.equal(height, 20_000);
+    allocationAttempts++;
+    throw allocationAttempt;
+  };
+  await assert.rejects(renderHeprPageToCanvas2d(largePage, { surfaceFactory: unavailableSurfaceFactory }),
+    error => error instanceof HeprCanvas2dError && error.code === HEPR_CANVAS_2D_ERROR_CODES.InvalidSurface &&
+      error.cause === allocationAttempt);
+  assert.equal(allocationAttempts, 1, "a canvas above the old pixel ceiling reaches the device without allocating a test surface");
+  await assert.rejects(renderHeprPageToCanvas2d(largePage, {
+    surfaceFactory: unavailableSurfaceFactory, maxCanvasPixels: 100_000_000
+  }), isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit));
+  assert.equal(allocationAttempts, 1, "an explicit caller pixel limit still rejects before device allocation");
+  await renderHeprPageToCanvas2d(page, {
+    surfaceFactory, maxGradientSubdivisionDepth: 70, maxMeshSubdivisionDepth: 70, maxPatternDepth: 70
+  });
   const controller = new AbortController();
   const reason = new Error("cancel Canvas2D reference render");
   controller.abort(reason);

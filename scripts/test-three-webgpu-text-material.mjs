@@ -45,7 +45,7 @@ try {
   // corner to clip space (-2, -2), drawing a long sliver across the page.
   assert.doesNotMatch(clipFn, /vertexPack\.[zw]/,
     "degenerate glyphs must not be detected from packed glyph-space coordinates");
-  assert.match(clipFn, /i32\(\s*glyphMetaA\.y \+ 0\.5\s*\) <= 0/,
+  assert.match(clipFn, /i32\(\s*glyphMetaA\.y\s*\) <= 0/,
     "degenerate glyphs are culled per instance on the glyph segment count, like the GLSL and native WGSL shaders");
 
   // The cull must read the same glyph metadata the vertex pack positions from.

@@ -123,7 +123,7 @@ async function resourceFixture() {
         number: 18,
         body: tinyPdfStream(
           "/Type /XObject /Subtype /Image /Width 70000 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
-          Uint8Array.of(0)
+          new Uint8Array(70000)
         )
       },
       {
@@ -472,10 +472,15 @@ async function testImages(colors, functions) {
   assert.equal(ccitt.codecRequest, null, "supported CCITT is decoded without an external codec request");
   assert.deepEqual([...ccitt.data], [255, 255, 255, 255]);
   assert.equal(requests.length, 3, "only external image codecs are surfaced");
-  await assert.rejects(
-    images.add(ref(18)),
-    (error) => error instanceof PdfError && error.code === "resource-limit"
-  );
+  const wide = images.describe(await images.add(ref(18)));
+  assert.equal(wide.width, 70000, "valid image dimensions are attempted beyond the former default ceiling");
+  assert.equal(wide.data.length, 70000, "large grayscale images retain their single-channel samples");
+  const limitedDocument = await openNativePdfDocument({ kind: "bytes", bytes: await resourceFixture() },
+    { limits: { maxImageDimension: 65535 } });
+  try {
+    const limitedImages = new NativePdfImageRegistry(limitedDocument);
+    await assert.rejects(limitedImages.add(ref(18)), (error) => error instanceof PdfError && error.code === "resource-limit");
+  } finally { await limitedDocument.close(); }
 
   const strictCodecs = new NativePdfImageRegistry(document, colors, { codecPolicy: "error" });
   assert.deepEqual(

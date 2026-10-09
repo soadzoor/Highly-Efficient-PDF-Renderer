@@ -1,7 +1,6 @@
 import { PdfError, throwIfAborted } from "../nativeTypes";
 
-export const JBIG2_MAX_WORK = 200_000_000;
-const MAX_SYMBOLS = 1_000_000;
+export const JBIG2_MAX_WORK = Number.MAX_SAFE_INTEGER;
 const REGION_TYPES = new Set([4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43]);
 const SEGMENT_TYPES = new Set([0, ...REGION_TYPES, 16, 48, 49, 50, 51, 52, 53, 62]);
 
@@ -14,13 +13,12 @@ export function stripJbig2FileHeader(bytes: Uint8Array): Uint8Array {
   return bytes.subarray(length);
 }
 
-/** Bound declared resources before entering the opaque PDFium decoder.
- * PDFium's packed bitmaps use less memory than the former JS row arrays. Keep
- * the previous conservative pixel/symbol accounting here; the WASM heap has a
- * separate hard cap for resources whose size is determined by encoded data.
+/** Validate segment structure and account declared resources before decoding.
+ * Smaller caller-selected memory/work allowances remain enforceable; defaults
+ * attempt allocation on the host within numeric and Wasm addressing capacity.
  */
 export function preflightJbig2(encoded: Uint8Array, globals: Uint8Array, width: number, height: number,
-  maxBytes: number, signal?: AbortSignal): number {
+  maxBytes: number, signal?: AbortSignal, maximumWork = JBIG2_MAX_WORK): number {
   let bytes = encoded.length + globals.length + Math.ceil(width / 8) * height;
   let work = 0, symbols = 0, pageSeen = false;
   const dictionaries = new Map<number, number>();
@@ -30,10 +28,10 @@ export function preflightJbig2(encoded: Uint8Array, globals: Uint8Array, width: 
   };
   const step = (count: number): void => {
     throwIfAborted(signal);
-    if (!Number.isSafeInteger(count) || count < 0 || (work += count) > JBIG2_MAX_WORK) resource("jbig2-work");
+    if (!Number.isSafeInteger(count) || count < 0 || (work += count) > maximumWork) resource("jbig2-work");
   };
   const countSymbols = (count: number): void => {
-    if (!Number.isSafeInteger(count) || count < 0 || (symbols += count) > MAX_SYMBOLS) resource("jbig2-symbols");
+    if (!Number.isSafeInteger(count) || count < 0 || !Number.isSafeInteger(symbols += count)) resource("jbig2-symbols");
     reserve(count * 16); step(count);
   };
   const bitmap = (w: number, h: number): void => { reserve(w * h + h * 16); step(w * h); };

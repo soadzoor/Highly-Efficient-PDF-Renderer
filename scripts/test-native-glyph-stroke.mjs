@@ -166,14 +166,14 @@ try {
     [{ getGlyphOutline: () => ({ commands: curve }) }], bounds, count - 1, coordinateBudget),
     error => error.details?.reason === "vector-glyph-stroke-limit", "path budgets still count glyph instances");
 
-  const denseContour = Array.from({ length: 1100 }, (_, i) => {
-    const angle = i * Math.PI * 2 / 1100;
+  const denseContour = Array.from({ length: 2200 }, (_, i) => {
+    const angle = i * Math.PI * 2 / 2200;
     return { kind: i ? "line" : "move", x: 40 + Math.cos(angle) * 20, y: 40 + Math.sin(angle) * 20 };
   });
   denseContour.push(close);
   const denseGeometry = buildNativeGlyphStrokeAtOrigin(denseContour, identity, defaults), denseStores = makeStores();
   const denseEdges = denseGeometry.segmentsA.length / 4;
-  assert.ok(denseEdges > 2048 && denseEdges <= 4096, "valid detailed strokes exceed the former shader ceiling");
+  assert.ok(denseEdges > 4096, "valid detailed strokes exceed the former glyph edge cutoff");
   buildNativeVectorTextStrokes(compiled, sidecar, text, denseStores,
     [{ getGlyphOutline: () => ({ commands: denseContour }) }], bounds, count,
     denseGeometry.segmentsA.length + denseGeometry.segmentsB.length);
@@ -189,10 +189,11 @@ try {
     error => error.code === "unsupported-content");
   assert.throws(() => buildNativeGlyphStroke(square, identity, { ...defaults, dashArray: [0, 0] }),
     error => error.code === "unsupported-content");
-  assert.throws(() => buildNativeGlyphStroke(square, identity, { ...defaults, dashArray: [0.0001, 0.0001] }),
-    error => error.code === "unsupported-content" && error.details.reason === "native-glyph-stroke-complexity");
-  assert.throws(() => buildNativeGlyphStroke(Array(65537).fill(move(0, 0)), identity, defaults),
-    error => error.code === "resource-limit");
+  const detailedDash = buildNativeGlyphStroke([move(0, 0), line(2, 0)], identity,
+    { ...defaults, dashArray: [0.0001, 0.0001] });
+  assert.ok(detailedDash.segmentsA.length / 4 > 4096, "fine representable dashes retain their complete vectors");
+  assert.equal(buildNativeGlyphStroke(Array(65537).fill(move(0, 0)), identity, defaults), null,
+    "source command counts do not reject a valid empty outline");
   const controller = new AbortController();
   controller.abort();
   assert.throws(() => buildNativeGlyphStroke(square, identity, defaults, controller.signal),

@@ -77,7 +77,7 @@ export function buildNativeFallbackTextIndex(page: HeprPageData, signal: AbortSi
     let low = fonts.glyphOffsets[font];
     let high = fonts.glyphOffsets[font + 1];
     while (low < high) {
-      const middle = (low + high) >>> 1;
+      const middle = Math.floor((low + high) / 2);
       if (fonts.glyphIds[middle] < glyphs.glyphIds[glyph]) low = middle + 1;
       else high = middle;
     }

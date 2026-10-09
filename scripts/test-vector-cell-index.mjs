@@ -12,7 +12,7 @@ try {
   const { VECTOR_CELL_COVERAGE_GLSL, VECTOR_CELL_COVERAGE_WGSL } = await import("../src/vectorCellShaders.ts");
   const { vectorPathCellStore, vectorIndexedPathStore, buildVectorPathCells } = await import("../src/vectorCellIndex.ts");
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
-  const { packVectorClips, MAX_CELL_INDEXED_CLIP_EDGES } = await import("../src/vectorClips.ts");
+  const { packVectorClips } = await import("../src/vectorClips.ts");
   const { CORE_FILL_VERTEX_SHADER_SOURCE } = await import("../src/webGlFloorplanRenderer.ts");
   const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
 
@@ -395,7 +395,7 @@ try {
     const packed = packVectorClips(clips, undefined, { cells: true, onStats: value => { stats = value; } });
     const bands = packVectorClips(clips);
     assert.equal(edges.length / 4, edgeCount);
-    assert(edgeCount > 8192 && edgeCount <= MAX_CELL_INDEXED_CLIP_EDGES);
+    assert(edgeCount > 8192);
     assert.equal(packed[7], 4, `${edgeCount} edges: large nonzero polygon uses cells`);
     assert.equal(packed[11], 5, `${edgeCount} edges: large even-odd polygon uses cells`);
     assert.equal(packed[5], packed[9], "copied geometry shares one cell payload across fill rules");
@@ -440,10 +440,11 @@ try {
     }
     assert(cellVisits * 4 < bandVisits, `${edgeCount} edges: close zoom reduces ${bandVisits} band candidates to ${cellVisits} cell pieces/closures`);
     assert(cellVisits / points.length < edgeCount / 100, "close zoom visits a bounded fraction of the original edges");
-    // A capacity equal to the band payload preserves that useful fallback;
-    // the exact shared-edge capacity retains every edge in the raw layout.
+    // A capacity equal to the band payload retains cells when they fit,
+    // otherwise bands; raw capacity retains every shared source edge.
     const constrained = packVectorClips(clips, bands.length / 4, { cells: true });
-    assert.deepEqual(constrained, bands, `${edgeCount} edges: capacity pressure preserves bands`);
+    assert.deepEqual(constrained, packed.length <= bands.length ? packed : bands,
+      `${edgeCount} edges: device capacity selects a complete beneficial index`);
     const rawCapacity = clips.length + edgeCount + 2;
     const raw = packVectorClips(clips, rawCapacity, { cells: true });
     assert.equal(raw.length / 4, rawCapacity); assert.equal(raw[7], 0); assert.equal(raw[11], 1);
@@ -451,29 +452,32 @@ try {
     assert.throws(() => packVectorClips(clips, rawCapacity - 1, { cells: true }), /capacity/i);
     assert.deepEqual(clips, snapshot, "large clip indexing preserves canonical geometry");
   }
-  assert.equal(MAX_CELL_INDEXED_CLIP_EDGES, 65_536, "cell construction has an explicit large-clip work limit");
   {
-    const edges = edgesOf(Array.from({ length: MAX_CELL_INDEXED_CLIP_EDGES / 4 + 1 }, (_, index) => {
+    const formerLimit = 65_536;
+    const edges = edgesOf(Array.from({ length: formerLimit / 4 + 1 }, (_, index) => {
       const x = index % 128 * 4, y = Math.floor(index / 128) * 4;
       return rectangle(x, y, x + 2, y + 2);
     }));
     const clips = [0, 1].map(fillRule => ({ parent: -1, fillRule, edges }));
-    const atLimitEdges = edges.subarray(0, MAX_CELL_INDEXED_CLIP_EDGES * 4);
+    const atLimitEdges = edges.subarray(0, formerLimit * 4);
     const atLimit = packVectorClips([0, 1].map(fillRule => ({ parent: -1, fillRule, edges: atLimitEdges })),
       undefined, { cells: true });
     assert.equal(atLimit[3], 4); assert.equal(atLimit[7], 5);
-    assert.equal(atLimit[1], atLimit[5], "the inclusive cell work limit retains a shared cell index");
-    const bands = packVectorClips(clips), guarded = packVectorClips(clips, undefined, { cells: true });
-    assert.equal(edges.length / 4, MAX_CELL_INDEXED_CLIP_EDGES + 4);
-    assert.deepEqual(guarded, bands, "clips above the cell work limit keep their exact beneficial band index");
-    assert.equal(guarded[3], 2); assert.equal(guarded[7], 3); assert.equal(guarded[1], guarded[5]);
+    assert.equal(atLimit[1], atLimit[5], "large clips retain a shared cell index");
+    const indexed = packVectorClips(clips, undefined, { cells: true });
+    assert.equal(edges.length / 4, formerLimit + 4);
+    assert.equal(indexed[3], 4, "clips above the former edge cutoff still receive a cell index");
+    assert.equal(indexed[7], 5); assert.equal(indexed[1], indexed[5]);
+    const headerOffset = indexed[1] * 4, levelOffset = indexed[headerOffset] * 4;
+    assert(indexed[levelOffset + 1] * indexed[levelOffset + 2] > 4096,
+      "device capacity permits grids beyond the former cell-count cutoff");
     const raw = packVectorClips(clips, 2 + edges.length / 4, { cells: true });
     assert.equal(raw[3], 0); assert.equal(raw[7], 1); assert.equal(raw[1], raw[5]);
-    assert.deepEqual(raw.subarray(8), edges, "above-limit raw fallback preserves every source edge");
+    assert.deepEqual(raw.subarray(8), edges, "capacity-constrained raw fallback preserves every source edge");
     for (const point of [[1, 1], [2, 1], [3, 1], [1, 513]]) for (const root of [0, 1]) {
       const truth = originalMask(clips, root, point, 0.25);
-      assert.equal(packedMask(guarded, root, point, 0.25), truth, "above-limit bands preserve AA samples");
-      assert.equal(packedMask(raw, root, point, 0.25), truth, "above-limit raw storage preserves AA samples");
+      assert.equal(packedMask(indexed, root, point, 0.25), truth, "large cell indices preserve AA samples");
+      assert.equal(packedMask(raw, root, point, 0.25), truth, "capacity-constrained raw storage preserves AA samples");
     }
   }
 

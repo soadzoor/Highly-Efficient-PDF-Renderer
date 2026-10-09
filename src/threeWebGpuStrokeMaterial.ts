@@ -78,7 +78,7 @@ function varyingNode(node: unknown, flat = false): never {
 
 const segmentCoordFn = TSL.wgslFn(`
 fn heprSegmentCoord(index: f32, width: f32) -> vec2<i32> {
-  let segmentIndex = i32(index + 0.5);
+  let segmentIndex = i32(index);
   let safeWidth = max(i32(width), 1);
   return vec2<i32>(segmentIndex % safeWidth, segmentIndex / safeWidth);
 }
@@ -93,8 +93,8 @@ fn heprSplitSegmentTexel(
   tailWidth: f32,
   splitIndex: f32
 ) -> vec4<f32> {
-  let segmentIndex = i32(index + 0.5);
-  let split = i32(splitIndex + 0.5);
+  let segmentIndex = i32(index);
+  let split = i32(splitIndex);
   if (segmentIndex >= split) {
     let tailIndex = segmentIndex - split;
     let width = max(i32(tailWidth), 1);

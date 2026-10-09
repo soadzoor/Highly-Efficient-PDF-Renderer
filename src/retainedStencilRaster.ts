@@ -1,6 +1,3 @@
-/** Keep the temporary, full-resolution tile below 16 MB. */
-export const MAX_STENCIL_COMPOSITE_PIXELS = 4_000_000;
-
 export interface BinaryStencilPlate {
   readonly coverage: Uint8Array;
   readonly color: readonly [number, number, number, number];
@@ -21,7 +18,11 @@ export function isBinaryStencil(coverage: Uint8Array, signal: AbortSignal): bool
  */
 export function compositeBinaryStencilPlates(plates: readonly BinaryStencilPlate[], width: number,
   height: number, scale: number, signal: AbortSignal): { data: Uint8Array; width: number; height: number } {
-  if (width * height > MAX_STENCIL_COMPOSITE_PIXELS) throw new RangeError("Stencil composite exceeds its tile budget.");
+  signal.throwIfAborted();
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0 ||
+      !Number.isSafeInteger(width * height * 4) || !Number.isFinite(scale) || scale <= 0) {
+    throw new RangeError("Stencil composite dimensions or scale are invalid.");
+  }
   const pixels = new Uint8Array(width * height * 4);
   const channel = (value: number): number => Math.round(Math.max(0, Math.min(1, value)) * 255);
   for (const plate of plates) {

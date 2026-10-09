@@ -31,6 +31,9 @@ their `upstreamSha256`, and apply `limitWasmMemory` from
 `scripts/lib/limitWasmMemory.mjs`. Write the result as `lcms.wasm` or `qcms.wasm`
 and check the shipped `sha256`. The only binary modification sets the memory
 section's maximum to 4096 pages (256 MiB); executable code is unchanged.
+At runtime the loader rewrites this stored maximum to the WASM32 address
+capacity. Memory grows on demand; the stored value is no longer a conversion
+admission limit. The shipped binaries and their hashes remain unchanged.
 Upstream build scripts do not pin every compiler dependency, so rebuilding from
 C/Rust source is not claimed to reproduce the upstream binaries byte-for-byte.
 

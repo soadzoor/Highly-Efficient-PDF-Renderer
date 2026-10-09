@@ -11,6 +11,7 @@ const hooks = registerHooks({ resolve(specifier, context, nextResolve) {
 try {
   const { openPdf } = await import("../src/pdfSession.ts");
   const { selectivePathPaintReason } = await import("../src/pdf/nativeContentCompiler.ts");
+  const { ScenePrimitivePicker } = await import("../src/scenePrimitives.ts");
 
   // A bounded raster layer costs a paint its resolution independence, so the
   // warning names the feature responsible rather than only reporting a count.
@@ -71,7 +72,7 @@ try {
     assert(produced > 0, `${label} produces vector ${expect}`);
   }
 
-  // The input path exceeds the cooperative geometry budget, with an even-odd
+  // The input path exceeds the former geometry cutoff, with an even-odd
   // hole and a dashed companion stroke inside an independently live clip.
   // Repeated points keep this regression small to rasterize while still
   // requiring the complete original path to reach the display program.
@@ -86,24 +87,18 @@ try {
     largePaint,
     { preserveDrawingOrder: false, retainOptionalContent: false }
   );
-  assert.equal(largeScene.fillPathCount, 2, "surrounding paint retains vector geometry");
-  assert.equal(largeScene.rasterLayers.length, 1, "the whole compound paint uses one bounded layer");
-  assert.equal(largeFallback?.details?.reasons, "large-path");
-  const layer = largeScene.rasterLayers[0];
-  assert(layer.width * layer.height <= 1_000_000, "the native raster allocation stays bounded");
-  const alphaAt = (x, y) => {
-    const [a, b, c, d, e, f] = layer.matrix;
-    const determinant = a * d - b * c;
-    const u = (d * (x - e) - c * (y - f)) / determinant;
-    const v = (a * (y - f) - b * (x - e)) / determinant;
-    if (u < 0 || u >= 1 || v < 0 || v >= 1) return 0;
-    return layer.data[(Math.floor(v * layer.height) * layer.width + Math.floor(u * layer.width)) * 4 + 3];
-  };
-  assert(alphaAt(25, 25) > 240, "the visible outer fill survives capture");
-  assert.equal(alphaAt(50, 50), 0, "even-odd winding preserves the inner hole");
-  assert.equal(alphaAt(15, 25), 0, "the source clip excludes paint outside its bounds");
-  assert(alphaAt(32, 31) > 240, "an on-dash stroke remains visible inside the hole");
-  assert.equal(alphaAt(36, 31), 0, "the off-dash stroke gap stays transparent");
+  assert.equal(largeScene.fillPathCount, 3, "all compound and surrounding fills remain vector");
+  assert.equal(largeScene.rasterLayers.length, 0, "legacy ordering also attempts the complete vector geometry");
+  assert.equal(largeFallback, undefined);
+  const picker = new ScenePrimitivePicker(largeScene);
+  const visibleAt = async (x, y) => Boolean(await picker.pick({
+    point: { x, y }, clientPoint: { x, y }, project: p => p, unproject: p => p, tolerancePx: 0
+  }));
+  assert(await visibleAt(25, 25), "the visible outer fill survives vector lowering");
+  assert.equal(await visibleAt(50, 50), false, "even-odd winding preserves the inner hole");
+  assert.equal(await visibleAt(15, 25), false, "the source clip excludes paint outside its bounds");
+  assert(await visibleAt(32, 31), "an on-dash stroke remains visible inside the hole");
+  assert.equal(await visibleAt(36, 31), false, "the off-dash stroke gap stays transparent");
 
-  console.log("Selective raster reasons: pattern paints stay vector; oversized compound paths preserve winding, clip, and dashes with bounded raster diagnostics");
+  console.log("Selective raster reasons: patterns and large compound paths preserve vector winding, clips, and dashes.");
 } finally { hooks.deregister(); }

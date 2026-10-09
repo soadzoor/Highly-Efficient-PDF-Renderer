@@ -18,17 +18,21 @@ try {
   const { openPdfInNodeWorker } = await import("../src/pdf/workerClient.ts");
   const font = buildTinySfnt();
   const fontOptions = { missingFontResolver: () => ({ sfntBytes: font, identifier: "fallback-fixture" }) };
-  // A finely dashed glyph stroke exceeds the vector outline representation;
-  // its raster fallback must still paint the annotation afterward.
+  // A finely dashed glyph stroke exceeds the former per-glyph edge cutoff.
+  // Keep its vector outline and paint the annotation afterward.
   const fallbackAnnotation = fixture({
     annotations: true, font: true,
     content: "0 0 1 RG .4 w [.01 .01] 0 d BT /F 100 Tf 1 Tr 5 5 Td (A) Tj ET"
   });
   const cases = [
-    ["annotation after unsupported page paint", fallbackAnnotation, (scene) => {
-      assertPixel(scene, 15, 10, [255, 0, 0, 255]);
-      assertPixel(scene, 2, 2, [0, 0, 0, 0]);
-      assert.equal(scene.textIndex.pages[0].text, "A", "rasterized annotated text stays searchable");
+    ["fine glyph stroke and annotation", fallbackAnnotation, async (scene, page) => {
+      const rendered = await renderHeprPageToCanvas2d(page, { surfaceFactory });
+      assertRenderedPixel(rendered, 15, 10, [255, 0, 0, 255]);
+      assertRenderedPixel(rendered, 2, 2, [0, 0, 0, 0]);
+      assert(rendered.surface.context.getImageData(0, 0, rendered.width, rendered.height).data.some(
+        (value, index, data) => index % 4 === 2 && value > 0 && data[index + 1] > 0),
+        "the fine glyph stroke still paints visible blue pixels before its annotation");
+      assert.equal(scene.textIndex.pages[0].text, "A", "annotated vector text stays searchable");
     }],
     ["arbitrary image clip", fixture({ content: "0 0 m 40 0 l 0 20 l h W n 40 0 0 20 0 0 cm /Im Do", image: true }), (scene) => {
       assertPixel(scene, 5, 5, [255, 0, 0, 255]);
@@ -52,40 +56,33 @@ try {
     try {
       const options = { optimization: "none", ...(bytes === fallbackAnnotation ? { preserveDrawingOrder: true } : {}) };
       const scene = await session.compileVectorPage(0, options);
-      assert.equal(scene.rasterLayers.length, name === "filled and outlined text" ? 0 : 1, name);
-      assert.equal(scene.fillPathCount, 0, name);
+      assert.equal(scene.rasterLayers.length, name === "arbitrary image clip" || name === "one-bit image" ? 1 : 0, name);
+      assert.equal(scene.fillPathCount, name === "fine glyph stroke and annotation" ? 1 : 0, name);
       if (name === "arbitrary image clip" || name === "one-bit image") {
         assert(!warnings.some(d => d.code.endsWith("raster-fallback")));
         if (name === "arbitrary image clip") assert.equal(scene.clipPaths.length, 1);
         assert.equal(scene.rasterLayers[0].width, name === "one-bit image" ? 2 : 1,
           "the original image is retained without resampling");
         assert.equal(scene.rasterLayers[0].height, 1);
-      } else if (name === "filled and outlined text") {
-        assert(!warnings.some(d => d.code.endsWith("raster-fallback")));
       } else {
-        assert.equal(warnings.filter(d => d.code === "page-raster-fallback").length, 1, name);
-        assert.equal(warnings.find(d => d.code === "page-raster-fallback").pageIndex, 0);
+        assert(!warnings.some(d => d.code.endsWith("raster-fallback")));
       }
-      check(scene);
+      await check(scene, await session.compilePage(0));
       const second = await session.compileVectorPage(0, options);
       assert.deepEqual(second.rasterLayerData, scene.rasterLayerData, "repeat operations own usable resources");
     } finally { await session.close(); }
   }
 
-  for (const [name, style, reason] of [
-    // Fine enough to outrun the per-glyph edge budget, which ordinary outlined
-    // display text sits just under. Stroke-only text has nothing else to show,
-    // so its page still falls back to a bounded raster.
-    ["glyph stroke edge budget", ".4 w [.01 .01] 0 d", "native-glyph-stroke-complexity"]
-  ]) {
+  {
+    const name = "finely dashed glyph stroke", style = ".4 w [.01 .01] 0 d";
     const warnings = [];
     const session = await openPdf({ kind: "bytes", bytes: fixture({
       font: true, content: `0 0 1 RG ${style} BT /F 100 Tf 1 Tr 5 5 Td (A) Tj ET`
     }) }, { ...fontOptions, onDiagnostic: d => warnings.push(d) });
     try {
-      await assert.rejects(session.compileVectorPage(0, { vectorFallback: "error" }),
-        error => error.code === "unsupported-content" && error.details?.reason === reason, name);
-      assert(!warnings.some(d => d.code.endsWith("raster-fallback")), "strict vector mode must not rasterize");
+      const exact = await session.compileVectorPage(0, { vectorFallback: "error" });
+      assert.equal(exact.rasterLayers.length, 0);
+      assert(exact.textGlyphSegmentCount > 4096, "fine glyphs retain their complete outline beyond the old edge cutoff");
       const limits = { maxImagePixels: 800, maxImageDimension: 40 };
       const assertRaster = layer => {
         assert(layer.width * layer.height <= 800 && layer.width <= 40 && layer.height <= 40,
@@ -95,27 +92,31 @@ try {
       };
       for (const preserveDrawingOrder of [undefined, true]) {
         const scene = await session.compileVectorPage(0, { preserveDrawingOrder, limits });
-        assert.equal(scene.rasterLayers.length, 1, name);
-        assertRaster(scene.rasterLayers[0]);
+        assert.equal(scene.rasterLayers.length, 0, name);
+        assert.equal(scene.textInstanceCount, 1, "image limits do not force a valid glyph outline into raster storage");
         const index = scene.textIndex.pages[0];
-        assert.equal(index.text, "A", `${name}: raster text remains searchable`);
+        assert.equal(index.text, "A", `${name}: vector text remains searchable`);
         const bounds = new Float32Array(4);
         assert(computeCharQuad(scene, index, 0, bounds, 0));
         assert(bounds.every(Number.isFinite) && bounds[2] > bounds[0] && bounds[3] > bounds[1]);
-        assert(warnings.some(d => d.code.endsWith("raster-fallback") && d.pageIndex === 0), name);
       }
       const decodedBound = await session.compileVectorPage(0, { limits: { maxDecodedStreamBytes: 3200 } });
-      assertRaster(decodedBound.rasterLayers[0]);
+      assert.equal(decodedBound.rasterLayers.length, 0);
       const page = await session.compilePage(0);
       const count = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands.length;
       assertRaster(await renderNativeRetainedCommandSpan(page, 0, count, new AbortController().signal,
         { ...DEFAULT_PDF_RESOURCE_LIMITS, ...limits }));
+      const byteBoundedRaster = await renderNativeRetainedCommandSpan(page, 0, count, new AbortController().signal,
+        { ...DEFAULT_PDF_RESOURCE_LIMITS, maxDecodedStreamBytes: 3200 });
+      assert(byteBoundedRaster.data.byteLength <= 3200, "an explicit decoded-byte budget limits manual raster rendering");
+      assertRaster(byteBoundedRaster);
       const warningCount = warnings.length;
       await assert.rejects(session.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
         error => error.code === "resource-limit", `${name}: hard resource limits must propagate`);
       await assert.rejects(session.compileVectorPage(0, { signal: AbortSignal.abort() }),
         error => error.code === "aborted", `${name}: cancellation must propagate`);
       assert.equal(warnings.length, warningCount, "failed safety checks must not start another fallback");
+      assert(!warnings.some(d => d.code.endsWith("raster-fallback")), "valid fine glyph geometry never requires fallback");
     } finally { await session.close(); }
   }
 
@@ -156,16 +157,17 @@ try {
     assert.ok(scene.rasterLayerWidth * scene.rasterLayerHeight <= 100);
     assert.ok(scene.rasterLayerWidth <= 12 && scene.rasterLayerHeight <= 12);
     const preview = await bounded.compileVectorPage(0, { preserveDrawingOrder: true, previewMaxDimension: 16 });
-    assert.equal(preview.pdfOverviewKind, "raster", "unsupported paint retains the refinable compatibility fallback");
-    assert(preview.rasterLayerWidth <= 16 && preview.rasterLayerHeight <= 16);
+    assert.equal(scene.rasterLayers.length, 0, "explicit image limits keep the fine glyph stroke vector");
+    assert.equal(preview.pdfOverviewKind, "vector", "fine glyph strokes remain vector in the overview");
+    assert.equal(preview.fillPathCount, 1, "the annotation remains visible geometry in the overview");
+    assert.equal(preview.textIndex.pages[0].text, "A");
     assert(!preview.retainedPages?.length);
-    assertPixel(preview, 15, 10, [255, 0, 0, 255]);
+    const rendered = await renderHeprPageToCanvas2d(await bounded.compilePage(0), { surfaceFactory, scale: 16 / 40 });
+    assertRenderedPixel(rendered, 15, 10, [255, 0, 0, 255]);
     await assert.rejects(bounded.compileVectorPage(0, { signal: AbortSignal.abort() }));
     await assert.rejects(bounded.compileVectorPage(0, { limits: { maxPathCoordinatesPerPage: 1 } }),
       error => error.code === "resource-limit");
-    // Strict vector mode names what the vector paths could not represent.
-    await assert.rejects(bounded.compileVectorPage(0, { vectorFallback: "error" }),
-      error => error.details?.reason === "native-glyph-stroke-complexity");
+    assert.equal((await bounded.compileVectorPage(0, { vectorFallback: "error" })).rasterLayers.length, 0);
   } finally { await bounded.close(); }
 
   for (const transfer of ["/TR 9 0 R", "/TR2 [9 0 R /Identity 9 0 R /Identity]", "/UCR2 9 0 R /BG2 9 0 R /HT << /HalftoneType 1 >>"]) {
@@ -223,8 +225,7 @@ try {
     assert.ok(!failed.getDiagnostics().some(d => d.code === "page-raster-fallback"));
   } finally { await failed.close(); }
 
-  // The worker keeps the annotation vector while transferring the glyph raster
-  // and searchable text. Its default drawing order permits selective fallback.
+  // The worker transfers the fine glyph outline, annotation and searchable text.
   const diagnostics = [];
   const worker = await openPdfInNodeWorker({ kind: "bytes", bytes: cases[0][1] }, {
     ...fontOptions,
@@ -232,34 +233,37 @@ try {
     onDiagnostic: d => diagnostics.push(d)
   });
   try {
-    const assertSelectiveFallback = scene => {
-      assert.equal(scene.rasterLayers.length, 1);
-      assert(scene.rasterLayers[0].data.some((value, index) => index % 4 === 3 && value > 0 && scene.rasterLayers[0].data[index - 1] > 0),
-        "the transferred glyph raster paints visible blue pixels");
+    const assertVectorGlyph = scene => {
+      assert.equal(scene.rasterLayers.length, 0);
+      assert.equal(scene.textInstanceCount, 1);
+      assert(scene.textGlyphSegmentCount > 4096, "the transferred glyph preserves its complete fine outline");
+      assert.deepEqual([...scene.textInstanceC.subarray(0, 4)], [0, 0, 1, 1], "the transferred stroke retains blue paint");
       assert.equal(scene.fillPathCount, 1, "the annotation keeps its vector geometry");
       assert.deepEqual([...scene.fillPathMetaA.subarray(2, 4), ...scene.fillPathMetaB.subarray(0, 2)], [10, 5, 20, 15]);
       assert.deepEqual([...scene.fillPathMetaB.subarray(2, 4), ...scene.fillPathMetaC.subarray(2, 4)], [1, 0, 0, 1]);
       assert.equal(scene.annotations.length, 1, "annotation metadata is transferred");
-      assert.equal(scene.textIndex.pages[0].text, "A", "rasterized text stays searchable after transfer");
+      assert.equal(scene.textIndex.pages[0].text, "A", "vector text stays searchable after transfer");
     };
-    for (let i = 0; i < 2; i += 1) assertSelectiveFallback(await worker.compileVectorPage(0));
-    assert.ok(diagnostics.some(d => d.code === "selective-raster-fallback"));
-    assert.ok(worker.getDiagnostics().some(d => d.code === "selective-raster-fallback"));
+    for (let i = 0; i < 2; i += 1) assertVectorGlyph(await worker.compileVectorPage(0));
+    assert(!diagnostics.some(d => d.code.endsWith("raster-fallback")));
+    assert(!worker.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
     const preview = await worker.compileVectorPage(0, { previewMaxDimension: 16 });
     assert.equal(preview.pdfOverviewKind, "vector", "the vector annotation remains available in the overview");
     assert(!preview.retainedPages?.length);
-    assertSelectiveFallback(preview);
+    assertVectorGlyph(preview);
     const limited = await worker.compileVectorPage(0, { limits: { maxImagePixels: 100, maxImageDimension: 12 } });
-    assertSelectiveFallback(limited);
-    assert(limited.rasterLayers[0].width * limited.rasterLayers[0].height <= 100);
-    assert(limited.rasterLayers[0].width <= 12 && limited.rasterLayers[0].height <= 12);
-    assertSelectiveFallback(await worker.compileVectorPage(0));
+    assertVectorGlyph(limited);
+    assertVectorGlyph(await worker.compileVectorPage(0));
   } finally { await worker.close(); }
 } finally { hooks.deregister(); }
 
 function surfaceFactory(width, height) {
   const canvas = createCanvas(width, height);
   return { canvas, context: canvas.getContext("2d") };
+}
+function assertRenderedPixel(rendered, x, y, expected) {
+  assert.deepEqual([...rendered.surface.context.getImageData(Math.floor(x * rendered.scale),
+    Math.floor((rendered.height / rendered.scale - y) * rendered.scale), 1, 1).data], expected);
 }
 function assertPixel(scene, x, y, expected) {
   const layer = scene.rasterLayers[0];

@@ -4,7 +4,8 @@ import { hepMonochromeRasterByteLength } from "./hepMonochromeRaster";
 /** Legacy HJB1 contains original JBIG2 segments; new exports use packed binary pixels. */
 export const HEP_JBIG2_RASTER_HEADER_BYTES = 40;
 export const HEP_JBIG2_NO_GLOBALS = 0xffffffff;
-export const HEP_JBIG2_MAX_DECODE_BYTES = 128 * 1024 * 1024;
+/** No application byte cap; the decoder still validates its native ABI. */
+export const HEP_JBIG2_MAX_DECODE_BYTES = Number.MAX_SAFE_INTEGER;
 const MAGIC = Uint8Array.of(0x48, 0x4a, 0x42, 0x31); // HJB1
 const MAX_UINT32 = 0xffffffff;
 

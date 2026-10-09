@@ -257,8 +257,8 @@ await rejects(small.bytes.subarray(0, 31), /header/);
 await rejects(edit(small.bytes, b => b.writeUInt16LE(3, 4)), /version/);
 await rejects(edit(small.bytes, b => b.writeUInt16LE(1, 6)), /reserved/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(1, 24)), /reserved/);
-await rejects(edit(small.bytes, b => b.writeUInt32LE(8193, 8)), /too many/);
-await rejects(edit(small.bytes, b => b.writeUInt32LE(8193, 12)), /too many/);
+await rejects(edit(small.bytes, b => b.writeUInt32LE(8193, 8)), /index length/);
+await rejects(edit(small.bytes, b => b.writeUInt32LE(8193, 12)), /index length/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(16 * 1024 * 1024 + 4, 16), false), /index length/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(39, 16), false), /index length/);
 await rejects(edit(small.bytes, b => { b[20] ^= 1; }, false), /index checksum/);
@@ -267,7 +267,7 @@ await rejects(edit(small.bytes, b => { b[49] = 1; }), /reserved/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(73, 32)), /offset/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(0, 36)), /stored length/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(2, 40)), /lengths differ/);
-await rejects(edit(small.bytes, b => b.writeUInt32LE(1024 * 1024 * 1024 + 1, 40)), /decoded chunk length/);
+await rejects(edit(small.bytes, b => b.writeUInt32LE(0, 40)), /decoded chunk length/);
 await rejects(edit(small.bytes, b => { b[54] = 1; }), /reserved/);
 await rejects(edit(small.bytes, b => { b[68] = 0xff; }), /UTF-8/);
 await rejects(edit(small.bytes, b => { b[68] = 0; }), /section name/);
@@ -294,16 +294,36 @@ await rejects(edit(groupedFixture.bytes, b => {
 }), /group alignment padding/, "g/a");
 await assert.rejects(HepArchive.loadAsync(small.bytes, { entryByteLimits: { x: 2 } }), /byte limit/);
 await assert.rejects(HepArchive.loadAsync(small.bytes, { entryByteLimits: { x: -1 } }), /byte limit/);
-await rejects(fixture([["manifest.json", "x"]], { compress: true, declaredLength: 16 * 1024 * 1024 + 1 }).bytes, /section.*byte limit/);
-for (const name of ["source/source.pdf", "source.pdf"]) {
-  await rejects(fixture([[name, "x"]], { compress: true, declaredLength: 512 * 1024 * 1024 + 1 }).bytes, /section.*byte limit/);
+// Large declared sizes are admitted lazily without allocating those sizes.
+// Actual reads still require the decompressed bytes to match the declaration.
+for (const [name, length] of [
+  ["manifest.json", 16 * 1024 * 1024 + 1],
+  ["source/source.pdf", 512 * 1024 * 1024 + 1],
+  ["source.pdf", 512 * 1024 * 1024 + 1],
+  ["geometry/large", 1024 * 1024 * 1024 + 1],
+  ["raster/large", 768 * 1024 * 1024 + 1]
+]) {
+  const bytes = fixture([[name, "x"]], { compress: true, declaredLength: length }).bytes;
+  const archive = await HepArchive.loadAsync(bytes);
+  assert.equal(archive.file(name).uncompressedSize, length);
+  await assert.rejects(archive.file(name).async("uint8array"), /decoded chunk length mismatch/);
+  await assert.rejects(HepArchive.loadAsync(bytes, { entryByteLimits: { [name]: length - 1 } }), /byte limit/);
 }
-await rejects(fixture([["a", "a"], ["b", "b"], ["c", "c"]], {
+assert.equal(Object.keys((await HepArchive.loadAsync(fixture([["a", "a"], ["b", "b"], ["c", "c"]], {
   compress: true, declaredLength: 1024 * 1024 * 1024
-}).bytes, /aggregate decoded byte limit/);
-await rejects(fixture([["raster/a", "a"], ["raster/b", "b"]], {
+}).bytes)).files).length, 3, "decoded aggregate sizes are governed by allocation, not a 2 GiB application cap");
+assert.equal(Object.keys((await HepArchive.loadAsync(fixture([["raster/a", "a"], ["raster/b", "b"]], {
   compress: true, declaredLength: 600 * 1024 * 1024
-}).bytes, /aggregate raster byte limit/);
+}).bytes)).files).length, 2, "raster sections have no separate aggregate application cap");
+const manySections = new HepArchive();
+for (let index = 0; index < 8193; index++) manySections.file(`section-${index}`, "x");
+const manyBytes = await manySections.generateAsync({ type: "uint8array", compression: "STORE" });
+const manyView = new DataView(manyBytes.buffer);
+assert.equal(manyView.getUint32(8, true), 8193, "writing more than the old section count cap succeeds");
+assert.equal(manyView.getUint32(12, true), 8193, "writing more than the old chunk count cap succeeds");
+const manyArchive = await HepArchive.loadAsync(manyBytes);
+assert.equal(Object.keys(manyArchive.files).length, 8193);
+assert.equal(await manyArchive.file("section-8192").async("string"), "x");
 const excessive = fixture([["x", Buffer.alloc(2 * 1024 * 1024)]], { compress: true, declaredLength: 16 });
 await rejects(excessive.bytes, /decompressed output exceeds/, "x");
 await rejects(fixture([["x", "abc"]], { compress: true, declaredLength: 4 }).bytes, /decoded chunk length mismatch/, "x");
@@ -354,4 +374,4 @@ const reading = huge.file("data").async("uint8array");
 setTimeout(() => activeRead.abort(reason), 0);
 await assert.rejects(reading, error => error === reason);
 
-console.log("HEP container tests passed (independent fixtures, native zlib interoperability, limits, corruption, and cancellation).");
+console.log("HEP container tests passed (independent fixtures, native zlib interoperability, caller limits, large index declarations, corruption, and cancellation).");

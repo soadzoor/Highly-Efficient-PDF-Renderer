@@ -33,12 +33,7 @@ export const SCENE_CLIP_PATHS_PATH = "geometry/clip-paths.d512";
 export const SCENE_DRAW_RUNS_PATH = "geometry/draw-runs.varint";
 export const SCENE_PAINT_GRAPH_PATH = "geometry/paint-graph.varint";
 
-/** Shared with the paint graph and the scene validators. */
-const MAX_NODES = 1_000_000;
-const MAX_CLIP_PATHS = 1_000_000;
-const MAX_CLIP_EDGES = 50_000_000;
-const MAX_DEPTH = 64;
-const MAX_TRANSFER_SAMPLES = 65_536;
+const MAX_UINT32 = 0xffffffff;
 
 /** Index order is the wire format; never reorder, only append. */
 const DRAW_RUN_KINDS: readonly VectorDrawRun["kind"][] = [
@@ -70,17 +65,18 @@ function requireIndex(value: unknown, limit: number, section: string, label: str
  * same column, so a rectangular clip costs a handful of bytes.
  */
 export function encodeSceneClipPaths(clipPaths: readonly VectorClipPath[]): Uint8Array {
-  if (clipPaths.length > MAX_CLIP_PATHS) fail("clip path", "too many clip paths");
+  requireIndex(clipPaths.length, MAX_UINT32, "clip path", "path count");
   const writer = new ByteWriter(clipPaths.length * 8 + 64);
   writer.writeVarUint32(clipPaths.length);
   let totalEdges = 0;
   for (const clip of clipPaths) {
     if (clip.edges.length % 4 !== 0) fail("clip path", "an edge list is not a whole number of edges");
-    totalEdges += clip.edges.length / 4;
-    if (totalEdges > MAX_CLIP_EDGES) fail("clip path", "too many clip edges");
+    const edgeCount = requireIndex(clip.edges.length / 4, MAX_UINT32, "clip path", "edge count");
+    // Every edge needs at least one byte in each u32-sized coordinate column.
+    totalEdges = requireIndex(totalEdges + edgeCount, MAX_UINT32, "clip path", "column length");
     writer.writeZigzagVarint(clip.parent);
     writer.writeByte(clip.fillRule);
-    writer.writeVarUint32(clip.edges.length / 4);
+    writer.writeVarUint32(edgeCount);
   }
   const edges = new Float32Array(totalEdges * 4);
   let offset = 0;
@@ -89,7 +85,9 @@ export function encodeSceneClipPaths(clipPaths: readonly VectorClipPath[]): Uint
     offset += clip.edges.length;
   }
   const columns = [0, 1, 2, 3].map(channel => encodeFixed512DeltaColumn(edges, totalEdges, 4, channel));
-  for (const column of columns) writer.writeVarUint32(column.length);
+  for (const column of columns) {
+    writer.writeVarUint32(requireIndex(column.length, MAX_UINT32, "clip path", "column length"));
+  }
   for (const column of columns) writer.writeBytes(column);
   return writer.toUint8Array();
 }
@@ -97,7 +95,9 @@ export function encodeSceneClipPaths(clipPaths: readonly VectorClipPath[]): Uint
 export function decodeSceneClipPaths(bytes: Uint8Array): VectorClipPath[] {
   const cursor = new VarintCursor(bytes);
   const pathCount = cursor.readVarUint32();
-  if (pathCount > MAX_CLIP_PATHS) fail("clip path", "too many clip paths");
+  // A record needs at least three bytes, followed by four column lengths.
+  // Check the payload before allocating arrays from untrusted counts.
+  if (pathCount * 3 + 4 > bytes.length - cursor.byteOffset) fail("clip path", "path records are truncated");
   const parents = new Int32Array(pathCount);
   const fillRules = new Uint8Array(pathCount);
   const edgeCounts = new Uint32Array(pathCount);
@@ -108,14 +108,14 @@ export function decodeSceneClipPaths(bytes: Uint8Array): VectorClipPath[] {
     if (fillRule > 1) fail("clip path", "fill rule must be zero or one");
     fillRules[index] = fillRule;
     edgeCounts[index] = cursor.readVarUint32();
-    totalEdges += edgeCounts[index];
-    if (totalEdges > MAX_CLIP_EDGES) fail("clip path", "too many clip edges");
+    totalEdges = requireIndex(totalEdges + edgeCounts[index], MAX_UINT32, "clip path", "column length");
     if (parents[index] < -1 || parents[index] >= index) fail("clip path", "parent must reference an earlier path");
   }
   const lengths = [0, 1, 2, 3].map(() => cursor.readVarUint32());
   const columnStart = cursor.byteOffset;
   const declared = lengths.reduce((sum, value) => sum + value, 0);
   if (columnStart + declared !== bytes.length) fail("clip path", "column lengths do not fill the section");
+  if (lengths.some(length => length < totalEdges)) fail("clip path", "coordinate columns are truncated");
   const edges = new Float32Array(totalEdges * 4);
   let offset = columnStart;
   for (let channel = 0; channel < 4; channel += 1) {
@@ -146,10 +146,10 @@ export function decodeSceneClipPaths(bytes: Uint8Array): VectorClipPath[] {
  * per-kind delta is usually the previous run's length.
  */
 export function encodeSceneDrawRuns(drawRuns: readonly VectorDrawRun[]): Uint8Array {
-  if (drawRuns.length > MAX_NODES) fail("draw run", "too many draw runs");
+  requireIndex(drawRuns.length, MAX_UINT32, "draw run", "run count");
   const writer = new ByteWriter(drawRuns.length * 4 + 16);
   writer.writeVarUint32(drawRuns.length);
-  const previousFirst = new Int32Array(DRAW_RUN_KINDS.length);
+  const previousFirst = new Float64Array(DRAW_RUN_KINDS.length);
   let previousClip = 0;
   for (const run of drawRuns) {
     const kind = DRAW_RUN_KINDS.indexOf(run.kind);
@@ -172,8 +172,8 @@ export function encodeSceneDrawRuns(drawRuns: readonly VectorDrawRun[]): Uint8Ar
 export function decodeSceneDrawRuns(bytes: Uint8Array): VectorDrawRun[] {
   const cursor = new VarintCursor(bytes);
   const runCount = cursor.readVarUint32();
-  if (runCount > MAX_NODES) fail("draw run", "too many draw runs");
-  const previousFirst = new Int32Array(DRAW_RUN_KINDS.length);
+  if (runCount * 3 > bytes.length - cursor.byteOffset) fail("draw run", "run records are truncated");
+  const previousFirst = new Float64Array(DRAW_RUN_KINDS.length);
   let previousClip = 0;
   const drawRuns: VectorDrawRun[] = [];
   for (let index = 0; index < runCount; index += 1) {
@@ -182,7 +182,7 @@ export function decodeSceneDrawRuns(bytes: Uint8Array): VectorDrawRun[] {
     const kind = DRAW_RUN_KINDS[flags & 7];
     if (!kind) fail("draw run", "unknown kind");
     const first = previousFirst[flags & 7] + cursor.readZigzagVarint();
-    if (first < 0) fail("draw run", "first is negative");
+    requireIndex(first, MAX_UINT32, "draw run", "first");
     previousFirst[flags & 7] = first;
     const run: VectorDrawRun = { kind, first, count: cursor.readVarUint32() };
     if (flags & 8) {
@@ -209,15 +209,15 @@ export function decodeSceneDrawRuns(bytes: Uint8Array): VectorDrawRun[] {
  */
 export function encodeScenePaintGraph(graph: ScenePaintGraph): Uint8Array {
   const writer = new ByteWriter(4096);
-  let nodes = 0;
+  const activeLists = new Set<readonly ScenePaintNode[]>();
   let previousRunIndex = 0;
   const writeBounds = (bounds: Bounds): void => {
     writer.writeFloat64(bounds.minX); writer.writeFloat64(bounds.minY);
     writer.writeFloat64(bounds.maxX); writer.writeFloat64(bounds.maxY);
   };
-  const writeMask = (mask: ScenePaintMask, depth: number): void => {
+  const writeMask = (mask: ScenePaintMask): void => {
     const transfer = mask.transfer;
-    if (transfer && transfer.length > MAX_TRANSFER_SAMPLES) fail("paint graph", "mask transfer is too large");
+    if (transfer) requireIndex(transfer.length, MAX_UINT32, "paint graph", "mask transfer length");
     writer.writeByte((mask.subtype === "Luminosity" ? 1 : 0) | (transfer ? 2 : 0) | (mask.backdrop ? 4 : 0));
     if (transfer) {
       // A transfer curve is already a Float32Array, so float32 is exact here
@@ -226,13 +226,13 @@ export function encodeScenePaintGraph(graph: ScenePaintGraph): Uint8Array {
       for (const sample of transfer) writer.writeFloat32(sample);
     }
     if (mask.backdrop) for (const channel of mask.backdrop) writer.writeFloat64(channel);
-    writeList(mask.children, depth + 1);
+    writeList(mask.children);
   };
-  const writeList = (list: readonly ScenePaintNode[], depth: number): void => {
-    if (depth > MAX_DEPTH) fail("paint graph", "nesting is too deep");
-    writer.writeVarUint32(list.length);
+  const writeList = (list: readonly ScenePaintNode[]): void => {
+    if (activeLists.has(list)) fail("paint graph", "cyclic node lists");
+    activeLists.add(list);
+    writer.writeVarUint32(requireIndex(list.length, MAX_UINT32, "paint graph", "node count"));
     for (const node of list) {
-      if (++nodes > MAX_NODES) fail("paint graph", "too many nodes");
       const hasCondition = node.optionalContent !== undefined;
       if (node.kind === "draw") {
         writer.writeByte(PAINT_NODE_DRAW | (hasCondition ? 4 : 0));
@@ -257,30 +257,30 @@ export function encodeScenePaintGraph(graph: ScenePaintGraph): Uint8Array {
         if (node.alphaIsShape !== undefined) writer.writeByte(node.alphaIsShape ? 1 : 0);
         if (hasCondition) writer.writeVarUint32(node.optionalContent!);
         if (node.bounds) writeBounds(node.bounds);
-        if (node.softMask) writeMask(node.softMask, depth);
-        writeList(node.children, depth + 1);
+        if (node.softMask) writeMask(node.softMask);
+        writeList(node.children);
       }
     }
+    activeLists.delete(list);
   };
-  writeList(graph.roots, 0);
+  writeList(graph.roots);
   return writer.toUint8Array();
 }
 
 export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
   const cursor = new VarintCursor(bytes);
-  let nodes = 0;
   let previousRunIndex = 0;
   const readBounds = (): Bounds => ({
     minX: cursor.readFloat64("paint bounds"), minY: cursor.readFloat64("paint bounds"),
     maxX: cursor.readFloat64("paint bounds"), maxY: cursor.readFloat64("paint bounds")
   });
-  const readMask = (depth: number): ScenePaintMask => {
+  const readMask = (): ScenePaintMask => {
     const flags = cursor.readByte("mask flags");
     if (flags & 0xf8) fail("paint graph", "unsupported mask flag bits");
     const mask: ScenePaintMask = { children: [], subtype: flags & 1 ? "Luminosity" : "Alpha" };
     if (flags & 2) {
       const length = cursor.readVarUint32();
-      if (length > MAX_TRANSFER_SAMPLES) fail("paint graph", "mask transfer is too large");
+      if (length * 4 > bytes.length - cursor.byteOffset) fail("paint graph", "mask transfer is truncated");
       const transfer = new Float32Array(length);
       for (let index = 0; index < length; index += 1) transfer[index] = cursor.readFloat32("mask transfer");
       mask.transfer = transfer;
@@ -289,16 +289,14 @@ export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
       mask.backdrop = [cursor.readFloat64("mask backdrop"), cursor.readFloat64("mask backdrop"),
         cursor.readFloat64("mask backdrop")];
     }
-    mask.children = readList(depth + 1);
+    mask.children = readList();
     return mask;
   };
-  const readList = (depth: number): ScenePaintNode[] => {
-    if (depth > MAX_DEPTH) fail("paint graph", "nesting is too deep");
+  const readList = (): ScenePaintNode[] => {
     const length = cursor.readVarUint32();
-    if (length > MAX_NODES) fail("paint graph", "too many nodes");
+    if (length * 2 > bytes.length - cursor.byteOffset) fail("paint graph", "node records are truncated");
     const list: ScenePaintNode[] = [];
     for (let index = 0; index < length; index += 1) {
-      if (++nodes > MAX_NODES) fail("paint graph", "too many nodes");
       const header = cursor.readByte("paint node header");
       const kind = header & 3;
       const condition = header & 4 ? cursor.readVarUint32.bind(cursor) : null;
@@ -313,7 +311,7 @@ export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
         if (header & 0xf8) fail("paint graph", "unsupported retained flag bits");
         const node: ScenePaintNode = {
           kind: "retained",
-          retainedPage: requireIndex(cursor.readVarUint32(), MAX_NODES, "paint graph", "retained page"),
+          retainedPage: cursor.readVarUint32(),
           firstCommand: cursor.readVarUint32(),
           count: cursor.readVarUint32(),
           rasterIndex: cursor.readVarUint32()
@@ -331,8 +329,8 @@ export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
         if (header & 128) node.alphaIsShape = cursor.readByte("alpha is shape") !== 0;
         if (condition) node.optionalContent = condition();
         if (header & 32) node.bounds = readBounds();
-        if (header & 64) node.softMask = readMask(depth);
-        node.children = readList(depth + 1);
+        if (header & 64) node.softMask = readMask();
+        node.children = readList();
         list.push(node);
       } else {
         fail("paint graph", "unknown node kind");
@@ -340,7 +338,7 @@ export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
     }
     return list;
   };
-  const roots = readList(0);
+  const roots = readList();
   cursor.expectEnd(SCENE_PAINT_GRAPH_PATH);
   return { roots };
 }

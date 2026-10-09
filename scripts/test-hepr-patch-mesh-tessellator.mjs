@@ -209,6 +209,8 @@ try {
     () => tessellateHeprPatchMesh(coonsPage, 0, { maxOutputBytes: 32 }),
     hasTessellationCode("resource-limit")
   );
+  assert.deepEqual(tessellateHeprPatchMesh(coonsPage, 0, { maxDepth: 70 }),
+    tessellateHeprPatchMesh(coonsPage, 0), "a caller depth above the old ceiling accepts an already-flat patch");
   const controller = new AbortController();
   controller.abort();
   assert.throws(

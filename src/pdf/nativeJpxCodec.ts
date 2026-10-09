@@ -50,7 +50,7 @@ export async function decodeBundledJpx(request: Readonly<NativeImageCodecRequest
     // JS samples are outside WASM memory. Reserve them (including the temporary
     // RGBA bridge for Gray+alpha) before capping the kernel's grow-only heap.
     const jsBytes = request.encoded.length + outputBytes * (request.components === 2 ? 3 : 1) + 1024 * 1024;
-    const compiled = await loadModule(Math.floor(Math.min(maxBytes - jsBytes, 512 * 1024 * 1024) / WASM_PAGE_BYTES));
+    const compiled = await loadModule(Math.min(65536, Math.floor((maxBytes - jsBytes) / WASM_PAGE_BYTES)));
     throwIfAborted(signal);
     // Fresh instances release grow-only memory after each decode. Instantiation
     // is synchronous here so a failure rejects OpenJPEG's initialization promise.
@@ -63,7 +63,7 @@ export async function decodeBundledJpx(request: Readonly<NativeImageCodecRequest
       warn: (_message: string) => {}
     }) as unknown as JpxKernel;
     throwIfAborted(signal);
-    const pointer = kernel._malloc(request.encoded.length);
+    const pointer = kernel._malloc(request.encoded.length) >>> 0;
     if (!pointer) throw new PdfError("resource-limit", "JPEG 2000 input allocation failed.");
     try {
       kernel.writeArrayToMemory(request.encoded, pointer);
@@ -161,7 +161,7 @@ function loadAsset(): Promise<Uint8Array<ArrayBuffer>> {
   return pending;
 }
 
-/** Tighten only the memory-section maximum in our pinned kernel. */
+/** Set the operation's memory ceiling within the kernel's unsigned 32-bit ABI. */
 function capWasmMemory(bytes: Uint8Array, maximumPages: number): Uint8Array<ArrayBuffer> {
   let cursor = 8;
   const read = (): number => {
@@ -182,8 +182,8 @@ function capWasmMemory(bytes: Uint8Array, maximumPages: number): Uint8Array<Arra
     const start = cursor, id = bytes[cursor++], length = read(), end = cursor + length;
     if (id === 5) {
       if (read() !== 1 || read() !== 1) throw new Error("Invalid pinned WASM memory section.");
-      const minimum = read(), maximum = read();
-      if (cursor !== end || maximumPages < minimum || maximumPages > maximum) {
+      const minimum = read(); read();
+      if (cursor !== end || maximumPages < minimum || maximumPages > 65536) {
         throw new PdfError("resource-limit", "OpenJPEG's initial memory exceeds the configured stream limit.");
       }
       const payload = [1, 1, ...encode(minimum), ...encode(maximumPages)];

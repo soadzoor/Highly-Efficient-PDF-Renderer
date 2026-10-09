@@ -35,12 +35,12 @@ export interface NativeOptionalContentLimits {
 
 export const DEFAULT_NATIVE_OPTIONAL_CONTENT_LIMITS: Readonly<NativeOptionalContentLimits> =
   Object.freeze({
-    maxGroups: 100_000,
-    maxMemberships: 100_000,
-    maxExpressionDepth: 64,
-    maxExpressionNodes: 1_000_000,
-    maxExpressionOperands: 100_000,
-    maxPageProperties: 100_000
+    maxGroups: Number.MAX_SAFE_INTEGER,
+    maxMemberships: Number.MAX_SAFE_INTEGER,
+    maxExpressionDepth: Number.MAX_SAFE_INTEGER,
+    maxExpressionNodes: Number.MAX_SAFE_INTEGER,
+    maxExpressionOperands: Number.MAX_SAFE_INTEGER,
+    maxPageProperties: Number.MAX_SAFE_INTEGER
   });
 
 export interface NativeOptionalContentOptions {

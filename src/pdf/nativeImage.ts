@@ -161,7 +161,7 @@ interface EmbeddedSoftMask {
 }
 
 const CODEC_ENVELOPE_MAGIC = Uint8Array.of(0x48, 0x49, 0x43, 0x31); // HIC1
-const MAX_CODEC_METADATA_BYTES = 1024 * 1024;
+const MAX_CODEC_METADATA_BYTES = 0xffff_ffff; // Uint32 codec-envelope length.
 const CODEC_IDS: Readonly<Record<NativeImageCodec, number>> = {
   jpeg: 1,
   jpeg2000: 2,
@@ -1727,18 +1727,10 @@ function imageCcittLimits(
     maxRows: height,
     maxPixels,
     maxOutputBytes: Math.min(maxDecodedBytes, maxPackedBytes),
-    maxScanBits: saturatingMultiply(maxDecodedBytes, 8),
-    // Alternating pixels need one run and changing element per pixel. Four
-    // operations per allowed pixel leaves room for 2-D mode bookkeeping while
-    // keeping hostile streams bounded by the document's image ceiling.
-    maxTransitions: saturatingMultiply(maxPixels, 4),
-    maxDamagedRows: height
+    maxScanBits: Number.MAX_SAFE_INTEGER,
+    maxTransitions: Number.MAX_SAFE_INTEGER,
+    maxDamagedRows: Number.MAX_SAFE_INTEGER
   };
-}
-
-function saturatingMultiply(left: number, right: number): number {
-  if (left <= Math.floor(Number.MAX_SAFE_INTEGER / right)) return left * right;
-  return Number.MAX_SAFE_INTEGER;
 }
 
 function isUnsupportedCcittCapability(cause: unknown): cause is PdfError {
@@ -2319,9 +2311,6 @@ function canonicalizeCodecMetadataValue(
   objects: Set<object>,
   depth: number
 ): CodecMetadataValue {
-  if (depth > 64) {
-    throw new PdfError("resource-limit", "Image codec metadata exceeds the envelope recursion limit.");
-  }
   if (value === null || typeof value === "boolean" || typeof value === "string") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {

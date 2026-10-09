@@ -20,7 +20,9 @@ The script verifies the upstream hash, adds a balanced work/cancellation check
 at every defined function entry and loop header, and caps defined memory at
 8192 WASM pages (512 MiB). A private counter batches callbacks every 1024
 entries, leaving at most 1023 uncharged entries when decoding completes. The
-adapter further caps each fresh instance using the operation's byte budget;
-the upstream 16 MiB initial heap still applies. Work units differ from the
+adapter rewrites that stored maximum for each fresh instance: by default it
+permits the WASM32 address capacity, with smaller caller byte allowances honored.
+The upstream 16 MiB initial heap still applies and memory grows on demand.
+Work units differ from the
 former JavaScript decoder's algorithm-specific steps. Metadata preflight keeps
 page, segment, reference, symbol, region and grid checks before decoding.

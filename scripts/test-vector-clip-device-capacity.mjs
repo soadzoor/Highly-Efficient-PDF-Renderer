@@ -17,7 +17,7 @@ try {
   const { packVectorClips } = await import("../src/vectorClips.ts");
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const scene = Object.assign(createEmptyVectorScene(), { clipPaths: [ellipse(256)] });
-  const maxSize = 32;
+  const maxSize = 24;
   const complete = packVectorClips(scene.clipPaths, undefined, { cells: true });
   const fitted = packVectorClips(scene.clipPaths, maxSize ** 2, { cells: true });
   assert(complete.length / 4 > maxSize ** 2, "optional indices exceed this small device's capacity");

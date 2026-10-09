@@ -100,16 +100,6 @@ import type {
   NativeGradientResources
 } from "./hepTypes";
 
-/** Layers are records now; each atlas or standalone image is one section. */
-const MAX_PARSED_RASTER_LAYER_COUNT = 262_144;
-const MAX_PARSED_RASTER_SECTION_COUNT = 4_096;
-const MAX_PARSED_RASTER_DIMENSION = 16_384;
-const MAX_PARSED_RASTER_TEXELS_PER_LAYER = 134_217_728;
-const MAX_PARSED_RASTER_PAYLOAD_BYTES = 768 * 1024 * 1024;
-const MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES = 1024 * 1024 * 1024;
-const MAX_PARSED_RASTER_TOTAL_DECODED_BYTES = 8 * MAX_PARSED_RASTER_TEXELS_PER_LAYER;
-const MAX_PARSED_MANIFEST_BYTES = 16 * 1024 * 1024;
-
 async function readSceneTextIndexFromParsedData(archive: HepArchive, manifest: ParsedDataManifest): Promise<SceneTextIndex | null> {
   try {
     const meta =
@@ -465,8 +455,8 @@ async function loadSceneFromHepInternal(
     );
   }
   const manifestByteLength = readHepEntryUncompressedSize(manifestFile);
-  if (manifestByteLength === null || manifestByteLength > MAX_PARSED_MANIFEST_BYTES) {
-    throw new Error("Parsed data manifest size is invalid or exceeds the memory budget.");
+  if (manifestByteLength === null) {
+    throw new Error("Parsed data manifest size is invalid.");
   }
 
   const manifestJson = await progress.child(0.16, 0.22, { sourceType: "hep" }).withIndeterminateProgress(
@@ -911,7 +901,7 @@ async function loadSceneFromHepInternal(
     scene.optionalContent = sceneMeta.optionalContent;
   }
   if (sceneMeta.retainedPages !== undefined) {
-    if (!Array.isArray(sceneMeta.retainedPages) || sceneMeta.retainedPages.length > 4096) throw new Error("Invalid retained page resources.");
+    if (!Array.isArray(sceneMeta.retainedPages)) throw new Error("Invalid retained page resources.");
     const retained = new Map<string, HeprPageData>();
     scene.retainedPages = [];
     for (const resource of sceneMeta.retainedPages) {
@@ -1297,18 +1287,15 @@ async function readRasterLayersFromParsedData(
   const meta = readSceneSectionDescriptor(sceneMeta.rasterLayers, SCENE_RASTER_LAYERS_PATH, "raster layers");
   const count = readSceneSectionCount(meta, "count", "raster layers");
   const atlasCount = readSceneSectionCount(meta, "atlasCount", "raster layers");
-  if (count > MAX_PARSED_RASTER_LAYER_COUNT) {
-    throw new Error(`Parsed data contains ${count} raster layers; the limit is ${MAX_PARSED_RASTER_LAYER_COUNT}.`);
-  }
   const tableEntry = archive.file(SCENE_RASTER_LAYERS_PATH);
   const tableByteLength = tableEntry ? readHepEntryUncompressedSize(tableEntry) : null;
   if (tableByteLength === null || tableByteLength > (count + atlasCount + 1) * MAX_RASTER_RECORD_BYTES) {
     throw new Error("Scene raster layer table is missing or larger than its records allow.");
   }
   const table = decodeRasterLayerTable(await readSceneSectionBytes(archive, SCENE_RASTER_LAYERS_PATH, signal), {
-    maxLayers: MAX_PARSED_RASTER_LAYER_COUNT,
-    maxAtlases: MAX_PARSED_RASTER_SECTION_COUNT,
-    maxDimension: MAX_PARSED_RASTER_DIMENSION
+    maxLayers: count,
+    maxAtlases: atlasCount,
+    maxDimension: 0x7fffffff
   });
   if (table.layers.length !== count || table.atlases.length !== atlasCount) {
     throw new Error("Scene raster layers do not match their manifest entry.");
@@ -1322,7 +1309,7 @@ async function readRasterLayersFromParsedData(
   if (formatVersion < PARSED_DATA_BINARY_FORMAT_VERSION && table.layers.some(layer => layer.storage === "binary")) {
     throw new Error("Transposed binary raster layers require HEP scene format v12.");
   }
-  validateRasterLayerBudgets(archive, table);
+  validateRasterLayerPayloads(archive, table);
 
   // Decode an atlas when its first cell is needed and release it after its last.
   const lastCellIndex = new Map<number, number>();
@@ -1446,20 +1433,14 @@ async function readRasterImageSection(
 }
 
 /**
- * Bound raster allocation using index sizes before inflating or decoding any
- * section. HEP files may come from untrusted drag-and-drop input. Decoded
- * atlases and cropped layers count as RGBA; monochrome layers count their exact
- * packed bytes and palette, while retaining the per-image dimension/texel limits.
+ * Validate declared raster dimensions and section sizes before decoding.
+ * Actual image allocations are governed by the device and its codec.
  */
-function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable): void {
-  let sectionCount = 0;
-  let totalPayloadBytes = 0;
-  let totalDecodedBytes = 0;
+function validateRasterLayerPayloads(archive: HepArchive, table: RasterLayerTable): void {
   const addTexels = (texels: number, label: string, decodedBytes = texels * 4): void => {
-    if (texels > MAX_PARSED_RASTER_TEXELS_PER_LAYER) {
-      throw new Error(`${label} exceeds the per-image texel budget.`);
+    if (!Number.isSafeInteger(texels) || !Number.isSafeInteger(decodedBytes)) {
+      throw new Error(`${label} decoded byte length is not a safe integer.`);
     }
-    totalDecodedBytes += decodedBytes;
   };
   const addSection = (path: string, rawBytes: number | null, label: string): number => {
     const archiveEntry = archive.file(path);
@@ -1467,14 +1448,12 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
       throw new Error(`HEP file is missing ${label.toLowerCase()}: ${path}.`);
     }
     const byteLength = readHepEntryUncompressedSize(archiveEntry);
-    if (byteLength === null || byteLength > MAX_PARSED_RASTER_PAYLOAD_BYTES) {
-      throw new Error(`${label} HEP section size is invalid or exceeds the memory budget.`);
+    if (byteLength === null) {
+      throw new Error(`${label} HEP section size is invalid.`);
     }
     if (rawBytes !== null && rasterImageEncodingFromPath(path) === null && byteLength !== rawBytes) {
       throw new Error(`${label} raw byte length does not match its metadata.`);
     }
-    sectionCount += 1;
-    totalPayloadBytes += byteLength;
     return byteLength;
   };
   table.atlases.forEach((atlas, index) => {
@@ -1500,8 +1479,6 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
             decodedBytes - 8 + byteLength - HEP_JBIG2_RASTER_HEADER_BYTES > HEP_JBIG2_MAX_DECODE_BYTES) {
           throw new Error(`Raster layer ${index} JBIG2 section exceeds the decode byte budget.`);
         }
-        // Account legacy compressed inputs alongside packed pixels while loading.
-        totalDecodedBytes += byteLength;
       }
     }
   });
@@ -1511,15 +1488,6 @@ function validateRasterLayerBudgets(archive: HepArchive, table: RasterLayerTable
     if (byteLength === 0 || byteLength > HEP_JBIG2_MAX_DECODE_BYTES) {
       throw new Error("JBIG2 globals section exceeds the decode byte budget.");
     }
-    totalDecodedBytes += byteLength;
-  }
-  if (sectionCount > MAX_PARSED_RASTER_SECTION_COUNT) {
-    throw new Error(
-      `Parsed data contains ${sectionCount} raster sections; the limit is ${MAX_PARSED_RASTER_SECTION_COUNT}.`
-    );
-  }
-  if (totalPayloadBytes > MAX_PARSED_RASTER_TOTAL_PAYLOAD_BYTES || totalDecodedBytes > MAX_PARSED_RASTER_TOTAL_DECODED_BYTES) {
-    throw new Error("Parsed data raster payloads exceed the aggregate memory budget.");
   }
 }
 

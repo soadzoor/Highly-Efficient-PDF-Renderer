@@ -14,6 +14,7 @@ const hooks = registerHooks({
 });
 const { decodeBundledJbig2, BUNDLED_JBIG2_CODEC_ASSET: asset } = await import("../src/pdf/nativeJbig2Codec.ts");
 const { capJbig2WasmMemory, decodePdfiumJbig2 } = await import("../src/pdf/codecs/jbig2Wasm.ts");
+const { preflightJbig2 } = await import("../src/pdf/codecs/jbig2Preflight.ts");
 const upstream = new Uint8Array(await readFile(new URL("../src/assets/codecs/jbig2/upstream-jbig2.wasm", import.meta.url)));
 const shipped = new Uint8Array(await readFile(asset.url));
 const instrumented = instrumentJbig2Wasm(upstream);
@@ -32,6 +33,9 @@ const cappedInstance = new WebAssembly.Instance(new WebAssembly.Module(capped), 
 assert.equal(cappedInstance.exports.i.buffer.byteLength, 16 * 1024 * 1024);
 assert.throws(() => cappedInstance.exports.i.grow(1), RangeError, "defined memory must enforce the cap");
 assert.throws(() => capJbig2WasmMemory(shipped, 255), error => error.code === "resource-limit");
+assert.equal(WebAssembly.validate(capJbig2WasmMemory(shipped, 65536)), true,
+  "the runtime memory allowance can exceed the vendored 512 MiB policy up to the memory32 ABI");
+assert.throws(() => capJbig2WasmMemory(shipped, 65537), error => error.code === "resource-limit");
 
 const uint32 = value => [value >>> 24, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
 function segment(number, type, payload, references = []) {
@@ -103,9 +107,14 @@ const eightReferences = [
   1, 2, 3, 4, 5, 6, 7, 8, 0, ...uint32(0)
 ];
 assert.deepEqual([...(await decode([segment(1, 48, pageInfo()), eightReferences])).samples], [255]);
-await resourceLimit(() => decode([
+await invalidData(() => decode([
   segment(1, 48, pageInfo()), [...uint32(100), 62, ...uint32(0xe0100000)]
-]), "jbig2-symbols");
+]), "truncated reference metadata remains invalid independently of symbol counts");
+const declaredSymbols = Uint8Array.from([
+  ...segment(1, 48, pageInfo()), ...segment(2, 0, [0, 1, ...uint32(1_000_001), ...uint32(1_000_001)])
+]);
+assert.doesNotThrow(() => preflightJbig2(declaredSymbols, new Uint8Array(), 1, 1, Number.MAX_SAFE_INTEGER),
+  "symbol declarations beyond the former count allowance can reach the allocator");
 
 // A tiny Huffman dictionary defining/exporting one black 1x1 symbol.
 // DH=1, DW=1, OOB, BMSIZE=0; byte-aligned bitmap; export runs zero then one.
@@ -140,15 +149,20 @@ await resourceLimit(() => decode([
 ], 32768), "jbig2-working-set");
 
 // A single reused pattern with a zero grid vector can overlap itself thousands of times.
-// Its output is tiny relative to the loop cost; reject it before painting 266M pixels.
+// Prove its declared 266M-pixel work is accepted without running that decode.
 const pattern = [1, 255, 255, ...uint32(0), ...new Array(32).fill(255)];
 const overlapGrid = [
   ...regionInfo(255, 255), 1, ...uint32(4096), ...uint32(1),
   ...uint32(0), ...uint32(0), 0, 0, 0, 0
 ];
-await resourceLimit(() => decode([
-  segment(1, 48, pageInfo()), segment(2, 16, pattern), segment(3, 22, overlapGrid, [2])
-]), "jbig2-work");
+const declaredWork = Uint8Array.from([
+  ...segment(1, 48, pageInfo()), ...segment(2, 16, pattern), ...segment(3, 22, overlapGrid, [2])
+]);
+assert.ok(preflightJbig2(declaredWork, new Uint8Array(), 1, 1, Number.MAX_SAFE_INTEGER) > 200_000_000,
+  "default work accounting has no guessed complexity allowance");
+assert.throws(() => preflightJbig2(declaredWork, new Uint8Array(), 1, 1, Number.MAX_SAFE_INTEGER, undefined, 200_000_000),
+  error => error.code === "resource-limit" && error.details?.reason === "jbig2-work",
+  "explicit work allowances still apply");
 
 // The instrumentation must stop real WASM execution, not just metadata parsing.
 const tall = Uint8Array.from([
@@ -203,7 +217,7 @@ assert.deepEqual(originalPdfium(encoded, globals, 8, 2), Uint8Array.of(255, 0));
 assert.deepEqual(originalPdfium(tall, new Uint8Array(), 1, 4096), recovered);
 
 hooks.deregister();
-console.log("PDFium JBIG2 passed: reproducible metered WASM, original parity, globals/headers, segment/symbol guards, hard heap/work caps, in-kernel abort, ownership and recovery.");
+console.log("PDFium JBIG2 passed: reproducible metered WASM, original parity, globals/headers, segment validation, caller heap/work limits, in-kernel abort, ownership and recovery.");
 
 function originalPdfium(bytes, globals, width, height) {
   let wasm, output;

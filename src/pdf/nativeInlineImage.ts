@@ -23,12 +23,12 @@ export interface NativeInlineImageLimits {
 }
 
 export const DEFAULT_NATIVE_INLINE_IMAGE_LIMITS: Readonly<NativeInlineImageLimits> = Object.freeze({
-  maxImages: 65_536,
-  maxDictionaryEntries: 256,
-  maxDictionaryBytes: 64 * 1024,
-  maxPayloadBytes: 512 * 1024 * 1024,
-  maxScanBytes: 512 * 1024 * 1024,
-  maxNestingDepth: 64
+  maxImages: Number.MAX_SAFE_INTEGER,
+  maxDictionaryEntries: Number.MAX_SAFE_INTEGER,
+  maxDictionaryBytes: Number.MAX_SAFE_INTEGER,
+  maxPayloadBytes: Number.MAX_SAFE_INTEGER,
+  maxScanBytes: Number.MAX_SAFE_INTEGER,
+  maxNestingDepth: Number.MAX_SAFE_INTEGER
 });
 
 export interface NativeInlineImageOptions {
@@ -926,15 +926,17 @@ function rejectIndirectValues(
   errorCode: "unsupported-content" | "unsupported-image",
   offset: number
 ): void {
-  if (isPdfRef(value) || isPdfStream(value)) {
-    throw syntaxError(errorCode, "Content values shall be direct non-stream objects.", offset);
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) rejectIndirectValues(item, errorCode, offset);
-    return;
-  }
-  if (isPdfDictionary(value)) {
-    for (const item of value.values()) rejectIndirectValues(item, errorCode, offset);
+  const pending = [value];
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (isPdfRef(current) || isPdfStream(current)) {
+      throw syntaxError(errorCode, "Content values shall be direct non-stream objects.", offset);
+    }
+    if (Array.isArray(current)) {
+      for (const item of current) pending.push(item);
+    } else if (isPdfDictionary(current)) {
+      for (const item of current.values()) pending.push(item);
+    }
   }
 }
 

@@ -18,7 +18,7 @@ const { PdfError } = await import("../src/pdf/nativeTypes.ts");
 const { createEmptyHeprPageData } = await import("../src/heprDocumentData.ts");
 const { validateHeprPageData } = await import("../src/heprDocumentDataValidation.ts");
 
-const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture() });
+const document = await openNativePdfDocument({ kind: "bytes", bytes: fixture() }, { limits: { maxCachedObjects: 1 } });
 const decoder = new TextDecoder();
 
 try {

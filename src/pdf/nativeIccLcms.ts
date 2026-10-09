@@ -47,6 +47,7 @@ function instantiate(module: WebAssembly.Module): LcmsExports {
     fd_write: () => 52,
     emscripten_date_now: () => Date.now(),
     emscripten_memcpy_js: (destination: number, source: number, count: number) => {
+      destination >>>= 0; source >>>= 0; count >>>= 0;
       new Uint8Array(wasm.memory.buffer).copyWithin(destination, source, source + count);
       return destination;
     },
@@ -94,7 +95,7 @@ export async function resolveLcmsTransform(
   let profilePointer = 0, inputProfile = 0, outputProfile = 0, transform = 0;
   let inputPointer = 0, outputPointer = 0;
   const allocate = (size: number) => {
-    const pointer = wasm.malloc(size);
+    const pointer = wasm.malloc(size) >>> 0;
     if (!pointer) throw iccMemoryError();
     return pointer;
   };

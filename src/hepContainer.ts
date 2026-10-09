@@ -2,10 +2,6 @@ import {
   HEADER_BYTES,
   CHUNK_RECORD_BYTES,
   EMPTY_CHUNK,
-  MAX_RECORDS,
-  MAX_INDEX_BYTES,
-  MAX_CHUNK_BYTES,
-  MAX_TOTAL_BYTES,
   GROUP_BYTES,
   SMALL_ENTRY_BYTES,
   groupKey,
@@ -71,7 +67,6 @@ export class HepArchive {
     if (options?.compression !== undefined && options.compression !== "STORE" && options.compression !== "DEFLATE") {
       throw new Error("HEP section compression must be STORE or DEFLATE.");
     }
-    if (!Object.hasOwn(this.files, name) && Object.keys(this.files).length >= MAX_RECORDS) fail("too many sections.");
     this.files[name] = new HepArchiveEntry(name, bytes.length, async () => bytes, options?.compression);
     return this;
   }
@@ -99,12 +94,10 @@ export class HepArchive {
     const chunkCount = view.getUint32(12, true);
     const indexLength = view.getUint32(16, true);
     const indexEnd = HEADER_BYTES + indexLength;
-    if (entryCount > MAX_RECORDS || chunkCount > MAX_RECORDS) fail("too many sections or chunks.");
-    if (indexLength > MAX_INDEX_BYTES || indexLength % 4 !== 0 || indexEnd > bytes.length ||
+    if (indexLength % 4 !== 0 || indexEnd > bytes.length ||
         indexLength < chunkCount * CHUNK_RECORD_BYTES + entryCount * 20) fail("invalid index length.");
     if (crc32(bytes.subarray(HEADER_BYTES, indexEnd)) !== view.getUint32(20, true)) fail("index checksum mismatch.");
     const chunks: ChunkRecord[] = [];
-    let totalDecoded = 0;
     let cursor = HEADER_BYTES;
     for (let index = 0; index < chunkCount; index += 1) {
       const chunk: ChunkRecord = {
@@ -124,16 +117,13 @@ export class HepArchive {
       }
       if (chunk.offset % 4 !== 0 || chunk.offset < indexEnd || chunk.storedLength === 0 ||
           chunk.offset + chunk.storedLength > bytes.length) fail("invalid chunk offset or stored length.");
-      if (chunk.decodedLength === 0 || chunk.decodedLength > MAX_CHUNK_BYTES) fail("invalid decoded chunk length.");
+      if (chunk.decodedLength === 0) fail("invalid decoded chunk length.");
       if (chunk.codec === 0 && chunk.storedLength !== chunk.decodedLength) fail("stored chunk lengths differ.");
-      totalDecoded += chunk.decodedLength;
-      if (totalDecoded > MAX_TOTAL_BYTES) fail("aggregate decoded byte limit exceeded.");
       chunks.push(chunk);
       cursor += CHUNK_RECORD_BYTES;
     }
     const entries: EntryRecord[] = [];
     const seenNames = new Set<string>();
-    let rasterBytes = 0;
     for (let index = 0; index < entryCount; index += 1) {
       if (cursor + 16 > indexEnd) fail("truncated section record.");
       const nameLength = view.getUint16(cursor, true);
@@ -150,8 +140,6 @@ export class HepArchive {
         offset: view.getUint32(cursor + 8, true), length: view.getUint32(cursor + 12, true)
       };
       validateEntryLength(name, entry.length, options.entryByteLimits);
-      if (name.startsWith("raster/")) rasterBytes += entry.length;
-      if (rasterBytes > MAX_CHUNK_BYTES) fail("aggregate raster byte limit exceeded.");
       if (entry.length === 0) {
         if (entry.chunkId !== EMPTY_CHUNK || entry.offset !== 0) fail("invalid empty section reference.");
       } else {

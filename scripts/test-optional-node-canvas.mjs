@@ -25,7 +25,8 @@ const hooks = registerHooks({
 
 try {
   const { loadNodeCanvas } = await import("../src/nodeCanvas.ts");
-  const { openPdf } = await import("../src/pdfSession.ts");
+  const { openPdf, renderNativeRetainedCommandSpan } = await import("../src/pdfSession.ts");
+  const { DEFAULT_PDF_RESOURCE_LIMITS } = await import("../src/pdf/nativeTypes.ts");
   const missingCodec = await import("../src/rasterImageCodec.ts?missing-canvas");
   assert.equal(canvasAttempts, 0, "importing HEPR modules must not load native canvas");
 
@@ -78,10 +79,18 @@ try {
     assert.equal(stencil.rasterLayers[0].width, 2);
   } finally { await stencilSession.close(); }
 
-  // Only the page raster fallback needs canvas, and its error names the peer.
+  // Complex clips stay vector without canvas. Explicit raster rendering still
+  // needs the optional peer, and its error names the missing dependency.
   const fallbackSession = await openPdf({ kind: "bytes", bytes: fixture("unrepresentable") });
   try {
-    await assert.rejects(fallbackSession.compileVectorPage(0),
+    const attempts = canvasAttempts;
+    const vector = await fallbackSession.compileVectorPage(0);
+    assert.equal(vector.rasterLayers.length, 0);
+    assert.ok(vector.clipPaths[0].edges.length / 4 > 8192);
+    assert.equal(canvasAttempts, attempts);
+    const page = await fallbackSession.compilePage(0);
+    const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
+    await assert.rejects(renderNativeRetainedCommandSpan(page, 0, commands.length, new AbortController().signal, DEFAULT_PDF_RESOURCE_LIMITS),
       error => error.code === "unsupported-content" && /npm install @napi-rs\/canvas/.test(error.message));
   } finally { await fallbackSession.close(); }
 
@@ -113,9 +122,16 @@ try {
 
   const installedSession = await openPdf({ kind: "bytes", bytes: fixture("unrepresentable") });
   try {
-    const scene = await installedSession.compileVectorPage(0, { preserveDrawingOrder: false });
-    assert.equal(scene.rasterLayers.length, 1);
-    assert.ok(scene.rasterLayers[0].data.some((value, index) => index % 4 === 3 && value === 255));
+    const scene = await installedSession.compileVectorPage(0);
+    assert.equal(scene.rasterLayers.length, 0);
+    assert.equal(scene.fillPathCount, 1);
+    const legacy = await installedSession.compileVectorPage(0, { preserveDrawingOrder: false });
+    assert.equal(legacy.rasterLayers.length, 1, "legacy rendering uses raster for unsupported arbitrary clip shapes");
+    assert.ok(legacy.rasterLayers[0].data.some((value, index) => index % 4 === 3 && value === 255));
+    const page = await installedSession.compilePage(0);
+    const commands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
+    const raster = await renderNativeRetainedCommandSpan(page, 0, commands.length, new AbortController().signal, DEFAULT_PDF_RESOURCE_LIMITS);
+    assert.ok(raster.data.some((value, index) => index % 4 === 3 && value === 255));
   } finally {
     await installedSession.close();
   }
@@ -131,7 +147,7 @@ function fixture(raster) {
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
     { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>" },
     { number: 4, body: tinyPdfStream("", raster === "unrepresentable"
-      // More straight clip edges than a vector clip holds: only a raster shows it.
+      // More straight clip edges than the former arbitrary vector cutoff.
       ? `q 0 0 m ${Array.from({ length: 8400 }, (_, i) => `${(i * 20 / 8400).toFixed(4)} ${i % 2 ? 2 : 1} l`).join(" ")} 20 0 l h W n 1 0 0 rg 0 0 20 20 re f Q`
       : raster
         ? "q 5 5 10 10 re W n 0 20 -20 0 20 0 cm /Im Do Q"

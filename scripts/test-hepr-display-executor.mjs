@@ -167,6 +167,12 @@ try {
     (error) => error instanceof HeprDisplayExecutionError &&
       error.code === HEPR_DISPLAY_EXECUTION_CODES.DepthLimit
   );
+  tooDeep.displayProgram.programs = Array.from({ length: 70 }, (_, index) => ({
+    kind: "form", commands: index === 69 ? [draw(0)] : [invokeProgram(index + 1)],
+    matrixIndex: 0, bounds: null, clipToBounds: false, resourceName: `deep-${index}`
+  }));
+  const deepStats = await executeHeprDisplayProgram(tooDeep, noOpBackend());
+  assert.equal(deepStats.programExecutions, 70, "valid invocations beyond the old depth ceiling execute");
 
   const unknownSource = populatedPage(createEmptyHeprPageData(pageInfo()), {
     colorKind: HEPR_COLOR_SPACE_KIND.DeviceRgb,

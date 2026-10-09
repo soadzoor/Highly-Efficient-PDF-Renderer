@@ -505,7 +505,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let metaB = textureLoad(uFillPathMetaTexB, coord, 0);
   let metaC = textureLoad(uFillPathMetaTexC, coord, 0);
 
-  let segmentCount = i32(metaA.y + 0.5);
+  let segmentCount = i32(metaA.y);
   let alpha = metaC.w;
 
   var out : VsOut;
@@ -539,7 +539,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
   out.position = vec4f(clip, 0.0, 1.0);
   out.local = world;
-  out.segmentStart = i32(metaA.x + 0.5);
+  out.segmentStart = i32(metaA.x);
   out.segmentCount = segmentCount;
   out.color = vec3f(metaB.z, metaB.w, metaC.z);
   out.alpha = alpha;
@@ -705,13 +705,13 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let instanceB = textureLoad(uTextInstanceTexB, instanceCoord, 0);
   let instanceC = textureLoad(uTextInstanceTexC, instanceCoord, 0);
 
-  let glyphIndex = i32(instanceB.z + 0.5);
+  let glyphIndex = i32(instanceB.z);
   let glyphCoord = coordFromIndex(glyphIndex, i32(glyphMetaDims.x));
   let glyphMetaA = textureLoad(uTextGlyphMetaTexA, glyphCoord, 0);
   let glyphMetaB = textureLoad(uTextGlyphMetaTexB, glyphCoord, 0);
   let glyphRasterMeta = textureLoad(uTextGlyphRasterMetaTex, glyphCoord, 0);
 
-  let segmentCount = i32(glyphMetaA.y + 0.5);
+  let segmentCount = i32(glyphMetaA.y);
 
   var out : VsOut;
   out.vectorClipIndex = uVectorClip.x;
@@ -743,7 +743,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
     instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
     instanceA.y * local.x + instanceA.w * local.y + instanceB.y
   );
-  let clipRef = i32(instanceB.w + 0.5);
+  let clipRef = i32(instanceB.w);
   out.clipRect = vec4f(0.0, 0.0, 0.0, 0.0);
   if (clipRef > 0) {
     out.clipRect = textureLoad(
@@ -758,7 +758,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
 
   out.position = vec4f(clip, 0.0, 1.0);
   out.local = local;
-  out.segmentStart = i32(glyphMetaA.x + 0.5);
+  out.segmentStart = i32(glyphMetaA.x);
   out.segmentCount = segmentCount;
   out.color = instanceC.xyz;
   out.colorAlpha = instanceC.w;

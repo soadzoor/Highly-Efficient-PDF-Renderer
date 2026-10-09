@@ -1,4 +1,5 @@
 import { PdfError, throwIfAborted } from "./nativeTypes";
+import { configureWasm32Memory } from "./nativeWasmMemory";
 
 /** Recoverable failures of the built-in engines, not caller-owned resolvers. */
 export class IccEngineError extends PdfError {
@@ -12,7 +13,8 @@ export class IccEngineError extends PdfError {
   }
 }
 
-export const ICC_WASM_MAX_BYTES = 256 * 1024 * 1024;
+/** The engines use unsigned 32-bit pointers. Memory grows on demand. */
+export const ICC_WASM_MAX_BYTES = 2 ** 32;
 
 export function iccMemoryError(cause?: unknown): PdfError {
   return new PdfError("resource-limit", "The ICC engine exceeded its working-memory limit.", {
@@ -20,7 +22,7 @@ export function iccMemoryError(cause?: unknown): PdfError {
   });
 }
 
-/** Cache code only. Each transform gets a fresh instance and bounded memory. */
+/** Cache code only. Each transform gets a fresh instance that grows on demand. */
 export function createIccModuleLoader(url: URL, byteLength: number): (signal?: AbortSignal) => Promise<WebAssembly.Module> {
   let pending: Promise<WebAssembly.Module> | undefined;
   return async signal => {
@@ -40,7 +42,7 @@ export function createIccModuleLoader(url: URL, byteLength: number): (signal?: A
           bytes = new Uint8Array(await response.arrayBuffer());
         }
         if (bytes.byteLength !== byteLength) throw new Error("ICC asset length mismatch.");
-        return await WebAssembly.compile(bytes);
+        return await WebAssembly.compile(configureWasm32Memory(bytes));
       })().catch(cause => {
         pending = undefined;
         if (cause instanceof PdfError) throw cause;

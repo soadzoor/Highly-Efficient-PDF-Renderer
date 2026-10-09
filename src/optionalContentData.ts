@@ -1,6 +1,6 @@
-/** Validation ceilings shared by page scenes, composition and HEP loading. */
-export const MAX_OPTIONAL_CONTENT_GROUPS = 100_000;
-export const MAX_OPTIONAL_CONTENT_CONDITIONS = 1_000_000;
+/** JavaScript array capacity and signed Int32 condition-reference capacity. */
+export const MAX_OPTIONAL_CONTENT_GROUPS = 0xffffffff;
+export const MAX_OPTIONAL_CONTENT_CONDITIONS = 2 ** 31;
 
 /** Document-local layer identity; store the document/artifact identity separately. */
 export interface OptionalContentGroup {

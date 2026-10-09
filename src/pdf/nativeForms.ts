@@ -181,6 +181,7 @@ export class NativePdfFormAppearanceRegistry {
   private readonly optionalContent?: NativeOptionalContentRegistry;
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly objectIds = new WeakMap<object, number>();
+  private readonly resourceIdentities = new WeakMap<PdfDictionary, string>();
   private readonly formCache = new Map<string, Promise<FormRecord>>();
   private readonly formRecords = new WeakMap<NativePdfForm, FormRecord>();
   private readonly decodedContentCache = new WeakMap<NativePdfForm, Promise<Uint8Array>>();
@@ -343,15 +344,6 @@ export class NativePdfFormAppearanceRegistry {
     if (!Array.isArray(fieldsValue)) {
       throw new PdfError("invalid-object", "AcroForm /Fields is not an array.");
     }
-    if (fieldsValue.length > this.document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "AcroForm root fields exceed the object-cache limit.", {
-        details: {
-          reason: "acroform-field-count",
-          fieldCount: fieldsValue.length,
-          maxFields: this.document.limits.maxCachedObjects
-        }
-      });
-    }
     const fields = Object.freeze([...fieldsValue]);
     const metadata: NativePdfAcroFormMetadata = Object.freeze({
       dictionary,
@@ -388,10 +380,7 @@ export class NativePdfFormAppearanceRegistry {
     if (!Array.isArray(resolved)) {
       throw new PdfError("invalid-object", "A page /Annots entry is not an array.", { pageIndex });
     }
-    const maxAnnotations = Math.min(
-      this.document.limits.maxCommandsPerPage,
-      this.document.limits.maxCachedObjects
-    );
+    const maxAnnotations = this.document.limits.maxCommandsPerPage;
     if (resolved.length > maxAnnotations) {
       throw new PdfError("resource-limit", "Page annotations exceed the page command limit.", {
         pageIndex,
@@ -615,6 +604,8 @@ export class NativePdfFormAppearanceRegistry {
     const resources = page.resources === undefined || page.resources === null
       ? EMPTY_RESOURCES
       : await this.document.resolveDictionary(page.resources, signal);
+    this.resourceIdentities.set(resources, resources === EMPTY_RESOURCES ? "empty" : isPdfRef(page.resources)
+      ? `ref:${pdfRefKey(page.resources)}` : `page:${pageIndex}:resources`);
     this.pageResourceCache.set(pageIndex, resources);
     return resources;
   }
@@ -680,19 +671,11 @@ export class NativePdfFormAppearanceRegistry {
         details: { reason: "unsupported-form-type" }
       });
     }
-    const resourceScope = await this.resolveFormResources(dictionary, inheritedResources, signal);
     const sourceIdentity = this.sourceIdentity(rawValue, resolved);
+    const resourceScope = await this.resolveFormResources(dictionary, sourceIdentity, inheritedResources, signal);
     const semanticIdentity = `${sourceIdentity}|resources:${resourceScope.identity}`;
     const cached = this.formCache.get(semanticIdentity);
     if (cached) return await cached;
-    if (this.formCache.size >= this.document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "Referenced Form definitions exceed the object-cache limit.", {
-        details: {
-          reason: "form-definition-count",
-          maxFormDefinitions: this.document.limits.maxCachedObjects
-        }
-      });
-    }
     const pending = this.parseFormRecord(
       resolved,
       rawValue,
@@ -743,23 +726,29 @@ export class NativePdfFormAppearanceRegistry {
 
   private async resolveFormResources(
     dictionary: PdfDictionary,
+    sourceIdentity: string,
     inheritedResources: PdfDictionary | undefined,
     signal?: AbortSignal
   ): Promise<EffectiveResourceScope> {
     const raw = dictionary.get("Resources");
     if (raw !== undefined && raw !== null) {
       const local = await this.document.resolveDictionary(raw, signal);
+      // An evicted Form can be parsed into a new dictionary object. Its inline
+      // resources still belong to the same source stream, so aliases must keep
+      // one semantic program identity even with a small resolver cache.
+      const identity = isPdfRef(raw) ? this.valueIdentity(raw, local) : `${sourceIdentity}:resources`;
+      this.resourceIdentities.set(local, identity);
       return {
         dictionary: local,
         origin: "local",
-        identity: this.valueIdentity(raw, local)
+        identity
       };
     }
     if (inheritedResources) {
       return {
         dictionary: inheritedResources,
         origin: inheritedResources === EMPTY_RESOURCES ? "empty" : "inherited",
-        identity: this.objectIdentity(inheritedResources)
+        identity: this.resourceIdentities.get(inheritedResources) ?? this.objectIdentity(inheritedResources)
       };
     }
     return { dictionary: EMPTY_RESOURCES, origin: "empty", identity: "empty" };
@@ -947,17 +936,6 @@ export class NativePdfFormAppearanceRegistry {
         "choice-options-type"
       );
     }
-    if (value.length > this.document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "A choice field has too many /Opt entries.", {
-        pageIndex,
-        details: {
-          annotationIndex,
-          reason: "choice-option-count",
-          optionCount: value.length,
-          maxOptions: this.document.limits.maxCachedObjects
-        }
-      });
-    }
     const options: NativePdfChoiceOption[] = [];
     for (let index = 0; index < value.length; index += 1) {
       if ((index & 0x3ff) === 0) throwIfAborted(signal);
@@ -1008,17 +986,6 @@ export class NativePdfFormAppearanceRegistry {
         annotationIndex,
         "choice-indices-type"
       );
-    }
-    if (value.length > this.document.limits.maxCachedObjects) {
-      throw new PdfError("resource-limit", "A choice field has too many /I entries.", {
-        pageIndex,
-        details: {
-          annotationIndex,
-          reason: "choice-index-count",
-          indexCount: value.length,
-          maxIndices: this.document.limits.maxCachedObjects
-        }
-      });
     }
     const indices: number[] = [];
     for (let index = 0; index < value.length; index += 1) {
@@ -1080,17 +1047,6 @@ export class NativePdfFormAppearanceRegistry {
       if (isPdfString(value)) return;
       if (!Array.isArray(value)) valid = false;
       else {
-        if (value.length > this.document.limits.maxCachedObjects) {
-          throw new PdfError("resource-limit", `Widget field /${key} has too many choice values.`, {
-            pageIndex,
-            details: {
-              annotationIndex,
-              reason: "field-value-count",
-              valueCount: value.length,
-              maxValues: this.document.limits.maxCachedObjects
-            }
-          });
-        }
         for (let index = 0; index < value.length; index += 1) {
           if ((index & 0x3ff) === 0) throwIfAborted(signal);
           if (!isPdfString(await this.document.resolveValue(value[index], signal))) {
@@ -1129,17 +1085,6 @@ export class NativePdfFormAppearanceRegistry {
           annotationIndex,
           "field-parent-kids"
         );
-      }
-      if (kids.length > this.document.limits.maxCachedObjects) {
-        throw new PdfError("resource-limit", "A field /Kids array exceeds the object-cache limit.", {
-          pageIndex,
-          details: {
-            annotationIndex,
-            reason: "field-kids-count",
-            kidCount: kids.length,
-            maxKids: this.document.limits.maxCachedObjects
-          }
-        });
       }
       const seenKids = new Set<string>();
       let childOccurrences = 0;

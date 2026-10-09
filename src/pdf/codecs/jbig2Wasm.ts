@@ -29,9 +29,11 @@ export async function decodePdfiumJbig2(encoded: Uint8Array, globals: Uint8Array
   maxBytes: number, signal?: AbortSignal, maximumWork = JBIG2_MAX_WORK): Promise<Uint8Array> {
   throwIfAborted(signal);
   const outputBytes = Math.ceil(width / 8) * height;
-  // Reserve caller data and the JS bridge output outside the capped WASM heap.
+  // Reserve caller data and bridge output outside the operation-local heap.
+  // A memory32 module can address at most 65,536 pages; growth below that
+  // capacity follows the caller's allowance and actual host allocation.
   const maximumPages = Math.floor(Math.min(maxBytes - encoded.length - globals.length - outputBytes - 65536,
-    512 * 1024 * 1024) / PAGE_BYTES);
+    65536 * PAGE_BYTES) / PAGE_BYTES);
   const module = await withAbort(loadModule(maximumPages), signal);
   throwIfAborted(signal);
   let wasm: Jbig2Exports, samples: Uint8Array | undefined, work = 0, heapLimitHit = false;
@@ -61,6 +63,7 @@ export async function decodePdfiumJbig2(encoded: Uint8Array, globals: Uint8Array
     g: () => { throw new Error("Unexpected CCITT allocation in JBIG2 decoder."); },
     h: (pointer: number, pitch: number, paddedPitch: number, rows: number): void => {
       throwIfAborted(signal);
+      pointer >>>= 0; // WebAssembly exports memory32 addresses as signed i32.
       if (pitch !== Math.ceil(width / 8) || paddedPitch !== Math.ceil(width / 32) * 4 || rows !== height || samples) {
         throw new Error("Invalid PDFium output dimensions.");
       }
@@ -79,8 +82,8 @@ export async function decodePdfiumJbig2(encoded: Uint8Array, globals: Uint8Array
   // No _free after an interrupted allocator/decoder: dropping this fresh
   // instance releases its heap and cannot mask the original limit/abort error.
   wasm.j();
-  const pointer = wasm.k(encoded.length);
-  const globalsPointer = globals.length ? wasm.k(globals.length) : 0;
+  const pointer = wasm.k(encoded.length) >>> 0;
+  const globalsPointer = globals.length ? wasm.k(globals.length) >>> 0 : 0;
   if (!pointer || (globals.length && !globalsPointer)) throw jbig2ResourceError("jbig2-working-set");
   heapSlice(pointer, encoded.length).set(encoded);
   if (globals.length) heapSlice(globalsPointer, globals.length).set(globals);
@@ -124,7 +127,7 @@ function loadAsset(): Promise<Uint8Array<ArrayBuffer>> {
   return pending;
 }
 
-/** Tighten the pinned module's defined memory for each operation. */
+/** Set the pinned module's memory allowance within the memory32 ABI. */
 export function capJbig2WasmMemory(bytes: Uint8Array, maximumPages: number): Uint8Array<ArrayBuffer> {
   let position = 8;
   const read = (): number => {
@@ -143,7 +146,8 @@ export function capJbig2WasmMemory(bytes: Uint8Array, maximumPages: number): Uin
     if (id === 5) {
       if (read() !== 1 || read() !== 1) throw new Error("Invalid pinned JBIG2 memory section.");
       const minimum = read(), maximum = read();
-      if (position !== end || !Number.isSafeInteger(maximumPages) || maximumPages < minimum || maximumPages > maximum) {
+      if (position !== end || maximum < minimum || maximum > 65536 ||
+          !Number.isSafeInteger(maximumPages) || maximumPages < minimum || maximumPages > 65536) {
         throw jbig2ResourceError("jbig2-working-set");
       }
       const payload = [1, 1, ...encode(minimum), ...encode(maximumPages)];

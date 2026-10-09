@@ -205,6 +205,21 @@ function testMalformedProgramsAndLimits() {
 
   const pathLimited = NativeCffFont.parse(buildCffFixture(), { maxType2PathCommands: 2 });
   expectPdf(() => pathLimited.getGlyphOutline(1), "resource-limit", /path command/i);
+
+  const repeated = buildCffFixture({
+    aCharString: type2([0, 0, "rmoveto", ...Array.from({ length: 4_097 }, () => [-107, "callsubr"]).flat(), "endchar"]),
+    localSubrs: [type2(["return"])]
+  });
+  NativeCffFont.parse(repeated).getGlyphOutline(1);
+  expectPdf(() => NativeCffFont.parse(repeated, { maxType2SubrCalls: 4_096 }).getGlyphOutline(1),
+    "resource-limit", /subroutine calls/i);
+  const nested = buildCffFixture({
+    aCharString: type2([0, 0, "rmoveto", -107, "callsubr", "endchar"]),
+    localSubrs: Array.from({ length: 48 }, (_, index) => type2(index === 47 ? ["return"] : [index + 1 - 107, "callsubr", "return"]))
+  });
+  NativeCffFont.parse(nested).getGlyphOutline(1);
+  expectPdf(() => NativeCffFont.parse(nested, { maxType2SubrDepth: 32 }).getGlyphOutline(1),
+    "resource-limit", /subroutine depth/i);
 }
 
 function testDeprecatedPdfDotsectionCompatibility() {

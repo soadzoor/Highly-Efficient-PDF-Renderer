@@ -75,7 +75,7 @@ const cellCoverageFn = TSL.wgslFn(VECTOR_CELL_COVERAGE_WGSL, [includeNode(fillCo
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
-  let itemIndex = i32(index + 0.5);
+  let itemIndex = i32(index);
   let safeWidth = max(i32(width), 1);
   return vec2<i32>(itemIndex % safeWidth, itemIndex / safeWidth);
 }
@@ -93,7 +93,7 @@ fn heprFillVertexPack(
   useLocalToClip: f32,
   localToClip: mat4x4<f32>
 ) -> vec4<f32> {
-  let segmentCount = i32(metaA.y + 0.5);
+  let segmentCount = i32(metaA.y);
   let alpha = mix(metaC.w, 1.0, shapeOnly);
   if (segmentCount <= 0 || alpha <= 0.001) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
@@ -159,8 +159,8 @@ fn heprFillFragment(
     length(vec2<f32>(dpdx(local.x), dpdy(local.x))),
     length(vec2<f32>(dpdx(local.y), dpdy(local.y)))
   ) * fillAAScreenPx, vec2<f32>(0.0001));
-  let segmentStart = i32(metaA.x + 0.5);
-  let segmentCount = i32(metaA.y + 0.5);
+  let segmentStart = i32(metaA.x);
+  let segmentCount = i32(metaA.y);
   let alphaStyle = mix(metaC.w, 1.0, shapeOnly);
   if (segmentCount <= 0 || alphaStyle <= 0.001) {
     discard;

@@ -31,7 +31,7 @@ try {
     kind: "bytes",
     bytes: type3Fixture(),
     label: "native-session-type3.pdf"
-  });
+  }, { limits: { maxCachedObjects: 1 } });
   try {
     const page = await session.compilePage(0, { optimization: "none" });
     validateHeprPageData(page);
@@ -330,11 +330,21 @@ try {
     `typed-array snapshots must stay bounded; observed ${uint32ArrayFromCalls} Uint32Array.from calls`
   );
 
-  const tooDeep = await openPdf({
+  const deepSource = {
     kind: "bytes",
     bytes: deepType3Fixture(65),
     label: "deep-type3.pdf"
-  });
+  };
+  const deep = await openPdf(deepSource, { limits: { maxCachedObjects: 1 } });
+  try {
+    const page = await deep.compilePage(0, { optimization: "none" });
+    validateHeprPageData(page);
+    assert.equal(page.displayProgram.programs.length, 65,
+      "a small resolver cache and nesting beyond the former depth allowance retain every CharProc program");
+  } finally {
+    await deep.close();
+  }
+  const tooDeep = await openPdf(deepSource, { limits: { maxRecursionDepth: 64 } });
   try {
     await assert.rejects(
       tooDeep.compilePage(0, { optimization: "none" }),

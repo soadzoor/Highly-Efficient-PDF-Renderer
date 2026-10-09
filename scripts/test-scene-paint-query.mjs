@@ -6,7 +6,8 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { ScenePrimitivePicker, getScenePrimitive, isScenePrimitiveVisible } = await import("../src/scenePrimitives.ts");
-  const { validateScenePaintGraph } = await import("../src/scenePaintGraph.ts");
+  const { validateScenePaintGraph, planScenePaintPasses, normalizeScenePaintGraph,
+    scenePaintSpanSegments, scenePaintNodeBounds } = await import("../src/scenePaintGraph.ts");
   const rect = (x0,y0,x1,y1) => [[x0,y0,x1,y0],[x1,y0,x1,y1],[x1,y1,x0,y1],[x0,y1,x0,y0]];
   const fill = (scene, edges, rgb = [1,1,1], alpha = 1, condition) => {
     const first = scene.fillSegmentCount, index = scene.fillPathCount++;
@@ -23,6 +24,23 @@ try {
   const group = (children, extra={}) => ({kind:"group", children, isolated:true, knockout:false, blendMode:"Normal",alpha:1,...extra});
   const scene = () => Object.assign(createEmptyVectorScene(),{drawRuns:[],pageCount:1,pageRects:Float32Array.of(0,0,10,10),optionalContent:{groups:[{id:"A",name:"A",defaultVisible:false,locked:false,usedInView:true}],conditions:[{kind:"group",groupId:"A"}],order:[],radioGroups:[]}});
   const query = (x,y,extra={}) => ({point:{x,y},clientPoint:{x,y},project:p=>p,unproject:p=>p,tolerancePx:0,...extra});
+  {
+    const s=scene();
+    let node=fill(s,rect(0,0,10,10));
+    for(let depth=0;depth<70;depth++) node=group([node],{alpha:0.99});
+    s.paintGraph={roots:[node]};
+    validateScenePaintGraph(s);
+    const passes=planScenePaintPasses(s,()=>true);
+    assert.equal(passes.filter(pass=>pass.kind==="begin-group").length,70);
+    assert.equal(passes.filter(pass=>pass.kind==="draw").length,1,"deep groups retain their leaf paint");
+    let normalized=normalizeScenePaintGraph(s)[0], depth=0;
+    while(normalized.kind==="group") { depth++; normalized=normalized.children[0]; }
+    assert.equal(depth,70);
+    assert.ok(scenePaintSpanSegments(s)[0]>0,"deep paints are assigned a compositor span");
+    assert.ok(scenePaintNodeBounds(s).nodes.size>70,"deep group bounds are measured");
+    node.children=[node];
+    assert.throws(()=>validateScenePaintGraph(s),/cyclic/,"removing nesting ceilings preserves cycle rejection");
+  }
   {
     const s=scene(), bottom=fill(s,rect(0,0,10,10)), content=fill(s,rect(0,0,10,10)), mask=fill(s,[...rect(0,0,10,10),...rect(3,3,7,7)]);
     s.paintGraph={roots:[bottom,group([content],{softMask:{children:[mask],subtype:"Alpha"}})]};

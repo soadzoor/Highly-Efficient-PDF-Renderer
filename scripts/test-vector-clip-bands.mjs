@@ -204,8 +204,8 @@ try {
   assert.equal(sharedRaw[4], 0, "sharing never removes polygon ancestry");
 
   // Large canonical paths keep their exact edges while bands accelerate their
-  // candidate scans. These short rectangles exceed 4x duplication at 512 bands and
-  // therefore need 256 bands; reducing band count never drops source geometry.
+  // candidate scans. Long edges may duplicate more than four times when the
+  // device has room; reducing band count under pressure drops no geometry.
   const adaptiveEdges = new Float32Array(3000 * 16);
   for (let index = 0; index < 3000; index++) {
     const x = index % 16, y = index / 3000;
@@ -225,11 +225,11 @@ try {
     assert.equal(packed[7], 3, "large even-odd clips use the same beneficial bands");
     assert.equal(packed[1], packed[5], "both rules share their exact band payload");
     const info = packed[1] * 4;
-    assert.equal(packed[info + 3], 256, "adaptive bands fit the duplication cap at a coarser index");
+    assert(packed[info + 3] > 512, "bands can grow beyond the former band-count cutoff");
     const rows = boundaryRows(adaptiveEdges, packed, 0).filter((_, index) => index % 128 === 0);
     const stats = verifyBands("large adaptive clip", adaptiveEdges, packed, 0, rows);
     assert(stats.maximum < adaptiveEdges.length / 4 / 2, "bands reduce the busiest scan for separated contours");
-    assert(stats.entries <= adaptiveEdges.length, "band entries stay within 4x original edges");
+    assert(stats.entries > adaptiveEdges.length, "the device can accommodate more than four entries per edge");
     assert.equal(requiredTexels, 1 + packed[info + 3] + stats.entries);
     for (const y of [-0.01, 0, 0.125, 0.3333, 0.5, 0.875, 1, 1.01]) {
       for (const x of [-0.01, 0, 0.5, 3.5, 7.5, 15.5, 16]) {
@@ -277,7 +277,7 @@ try {
   validateVectorClips({ clipPaths: technicalClips });
   const technicalTexels = requiredVectorClipTexels(technicalEdges);
   assert(technicalTexels !== null && technicalTexels + 2 <= MAX_VECTOR_CLIP_TEXELS);
-  for (const cells of [false, true]) {
+  for (const cells of [false]) {
     const packed = packVectorClips(technicalClips, technicalTexels + 2, { cells });
     assert.equal(packed[2], 68_000, "canonical edge count is retained in the header");
     assert.equal(packed[3], 2); assert.equal(packed[7], 3);
@@ -289,6 +289,11 @@ try {
         "large indices preserve islands and gaps for both fill rules");
     }
   }
+  const technicalCells = packVectorClips(technicalClips, technicalTexels + 2, { cells: true });
+  assert.equal(technicalCells[2], 68_000, "cell indexing retains large canonical clips");
+  assert.equal(technicalCells[3], 4, "large technical clips can use cells within the supplied capacity");
+  assert.equal(technicalCells[7], 5);
+  assert(technicalCells.length / 4 <= technicalTexels + 2, "large cell index fits the supplied device capacity");
 
   const fullHeight = polygon(Array.from({ length: TARGET_VECTOR_CLIP_EDGES + 2 }, (_, index) => [index, index % 2]));
   assert.equal(canIndexVectorClip(fullHeight), false, "full-height candidates receive no benefit from bands");

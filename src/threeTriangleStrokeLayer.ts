@@ -60,7 +60,7 @@ ivec2 segmentCoord(int index) {
 }
 
 void main() {
-  int index = int(aSegmentIndex + 0.5);
+  int index = int(aSegmentIndex);
   vec4 primitiveA = texelFetch(uSegmentTexA, segmentCoord(index), 0);
   vec4 primitiveB = texelFetch(uSegmentTexB, segmentCoord(index), 0);
   vec4 style = texelFetch(uSegmentStyleTex, segmentCoord(index), 0);

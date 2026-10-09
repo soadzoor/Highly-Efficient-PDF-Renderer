@@ -8,7 +8,7 @@ export interface GradientMeshArrays {
 }
 interface GradientMeshScene extends GradientMeshArrays { gradientCount: number; gradientMetaA: Float32Array }
 interface MeshManifest { rangesFile: string; positionsFile: string; colorsFile: string; indicesFile: string; vertexCount: number; indexCount: number }
-const MAX_VERTICES = 10_000_000, MAX_INDICES = 30_000_000;
+const MAX_UINT32 = 0xffffffff;
 const littleEndian = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 
 export function validateGradientMesh(scene: GradientMeshScene): void {
@@ -20,7 +20,7 @@ export function validateGradientMesh(scene: GradientMeshScene): void {
   }
   if (!(ranges instanceof Uint32Array) || !(positions instanceof Float32Array) || !(colors instanceof Float32Array) || !(indices instanceof Uint32Array) ||
       ranges.length !== scene.gradientCount * 2 || positions.length % 2 || colors.length !== positions.length * 2 || indices.length % 3 ||
-      positions.length > MAX_VERTICES * 2 || indices.length > MAX_INDICES || !positions.every(Number.isFinite) ||
+      positions.byteLength > MAX_UINT32 || colors.byteLength > MAX_UINT32 || indices.byteLength > MAX_UINT32 || !positions.every(Number.isFinite) ||
       !colors.every(value => Number.isFinite(value) && value >= 0 && value <= 1)) throw new Error("Invalid gradient mesh resources.");
   const vertices = positions.length / 2;
   if (indices.some(index => index >= vertices)) throw new Error("Gradient mesh references an unknown vertex.");
@@ -57,8 +57,8 @@ export async function readHepGradientMesh(archive: HepArchive, value: unknown, g
   if (value === undefined) return {};
   if (!value || typeof value !== "object") throw new Error("Invalid gradient mesh section.");
   const meta = value as MeshManifest;
-  if (!Number.isSafeInteger(meta.vertexCount) || meta.vertexCount < 0 || meta.vertexCount > MAX_VERTICES ||
-      !Number.isSafeInteger(meta.indexCount) || meta.indexCount < 0 || meta.indexCount > MAX_INDICES || meta.indexCount % 3 ||
+  if (!Number.isSafeInteger(meta.vertexCount) || meta.vertexCount < 0 || meta.vertexCount * 16 > MAX_UINT32 ||
+      !Number.isSafeInteger(meta.indexCount) || meta.indexCount < 0 || meta.indexCount * 4 > MAX_UINT32 || meta.indexCount % 3 ||
       ![meta.rangesFile, meta.positionsFile, meta.colorsFile, meta.indicesFile].every(file => typeof file === "string" && file)) throw new Error("Invalid gradient mesh section metadata.");
   const read = async <T extends Float32Array | Uint32Array>(file: string, length: number, constructor: {new(buffer: ArrayBuffer): T}): Promise<T> => {
     signal?.throwIfAborted();

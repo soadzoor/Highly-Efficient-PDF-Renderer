@@ -19,9 +19,11 @@ export function composeOptionalContent(pages: readonly (SceneOptionalContent | u
   const orderGroups = new Set<string>();
   const radioGroups = new Map<string, readonly string[]>();
   const collect = (nodes: readonly OptionalContentOrderNode[]): void => {
-    for (const node of nodes) {
+    const pending = [...nodes];
+    while (pending.length) {
+      const node = pending.pop()!;
       if (node.kind === "group") orderGroups.add(node.groupId);
-      if (node.children) collect(node.children);
+      if (node.children) for (const child of node.children) pending.push(child);
     }
   };
   for (const page of pages) {
@@ -45,7 +47,7 @@ export function composeOptionalContent(pages: readonly (SceneOptionalContent | u
         : condition.kind === "not" ? { kind: "not", operand: condition.operand + offset }
           : condition.kind === "group" && dropped.has(condition.groupId) ? { kind: "constant", value: true } : { ...condition });
     }
-    if (!order.length) { order.push(...page.order); collect(page.order); }
+    if (!order.length) { for (const node of page.order) order.push(node); collect(page.order); }
     for (const radio of page.radioGroups) radioGroups.set(JSON.stringify(radio), [...radio]);
   }
   // Annotation layers are not PDF layers and never join the display order.

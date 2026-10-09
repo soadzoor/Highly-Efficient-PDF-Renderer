@@ -118,7 +118,7 @@ void main() {
   vec4 metaC = texelFetch(uPathMetaTexC, coord, 0);
   vec4 paintMeta = texelFetch(uPaintMetaTex, coord, 0);
 
-  int segmentCount = int(metaA.y + 0.5);
+  int segmentCount = int(metaA.y);
   float alpha = metaC.w;
   vec2 corner01 = cornerFromIndex(cornerIndex) * 0.5 + 0.5;
   // Reach pixels whose footprint touches a path narrower than a pixel.
@@ -158,7 +158,7 @@ void main() {
     gl_Position = vec4((screen / (0.5 * uViewport)) - 1.0, 0.0, 1.0);
   }
 
-  vSegmentStart = int(metaA.x + 0.5);
+  vSegmentStart = int(metaA.x);
   vSegmentCount = segmentCount;
   vBands = uBandBase < 0 ? vec4(0.0)
     : texelFetch(uSegmentTexA, coordFromIndex(uBandBase + pathIndex, uSegmentTexSize), 0);
@@ -336,7 +336,7 @@ void main() {
   int runIndex = gl_VertexID / 4;
   int cornerIndex = gl_VertexID - runIndex * 4;
   vec4 runMeta = texelFetch(uRunMetaTexA, coordFromIndex(runIndex, uRunMetaTexSize), 0);
-  int segmentIndex = int(runMeta.x + 0.5) + gl_InstanceID;
+  int segmentIndex = int(runMeta.x) + gl_InstanceID;
   ivec2 segmentCoord = coordFromIndex(segmentIndex, uSegmentTexSize);
   vec4 primitiveA = texelFetch(uEndpointsTex, segmentCoord, 0);
   vec4 primitiveB = texelFetch(uPrimitiveMetaTex, segmentCoord, 0);

@@ -8,7 +8,6 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { OptionalContentController, validateSceneOptionalContent } = await import("../src/optionalContent.ts");
-  const { MAX_OPTIONAL_CONTENT_GROUPS } = await import("../src/optionalContentData.ts");
   const { AnnotationLayerBuilder, annotationLayerId } = await import("../src/annotationLayers.ts");
   const { composeOptionalContent } = await import("../src/optionalContentComposition.ts");
   const { getScenePrimitive, isScenePrimitiveVisible } = await import("../src/scenePrimitives.ts");
@@ -98,10 +97,12 @@ try {
   assert.deepEqual(builder.build().conditions, [{ kind: "constant", value: true }, { kind: "group", groupId: "annotation:ref:5:0" },
     { kind: "and", operands: [0, 1] }]);
   assert.equal(new AnnotationLayerBuilder(undefined, []).build(), undefined, "pages without layers stay without optional content");
-  const full = new AnnotationLayerBuilder({ groups: Array.from({ length: MAX_OPTIONAL_CONTENT_GROUPS },
+  const formerGroupLimit = 100_000;
+  const full = new AnnotationLayerBuilder({ groups: Array.from({ length: formerGroupLimit },
     (_, index) => ({ id: `g${index}`, name: "", defaultVisible: true, locked: false, usedInView: true })), conditions: [], order: [], radioGroups: [] }, []);
-  assert.equal(full.condition(undefined, "ref:5:0"), undefined, "an annotation beyond the ceiling paints without a layer");
-  assert.equal(full.unavailableCount, 1);
+  assert.equal(full.condition(undefined, "ref:5:0"), 0, "an annotation beyond the former ceiling retains its own layer");
+  assert.equal(full.unavailableCount, 0);
+  assert.equal(full.build().groups.length, formerGroupLimit + 1);
 
   // Composition keeps one layer per annotation id, outside the display order, within the layer ceiling.
   const page = (annotationIds, pdfGroups = [{ id: "ref:1:0", name: "Walls", defaultVisible: true, locked: false, usedInView: true }]) => ({
@@ -115,12 +116,13 @@ try {
   assert.deepEqual(composed.data.order, [{ kind: "group", groupId: "ref:1:0" }]);
   assert.deepEqual(composed.offsets, [0, 2, 2]);
   assert.equal(composed.droppedAnnotationLayers, 0);
-  const crowded = Array.from({ length: MAX_OPTIONAL_CONTENT_GROUPS - 1 },
+  const crowded = Array.from({ length: formerGroupLimit - 1 },
     (_, index) => ({ id: `layer${index}`, name: "", defaultVisible: true, locked: false, usedInView: true }));
   const limited = composeOptionalContent([page(["ref:5:0", "ref:6:0"], crowded)]);
-  assert.equal(limited.droppedAnnotationLayers, 1);
-  assert.equal(limited.data.groups.length, MAX_OPTIONAL_CONTENT_GROUPS);
-  assert.deepEqual(limited.data.conditions.at(-1), { kind: "constant", value: true }, "a dropped layer's appearance stays visible");
+  assert.equal(limited.droppedAnnotationLayers, 0);
+  assert.equal(limited.data.groups.length, formerGroupLimit + 1);
+  assert.deepEqual(limited.data.conditions.at(-1), { kind: "group", groupId: "annotation:ref:6:0" },
+    "composition retains annotation visibility beyond the former layer ceiling");
   validateSceneOptionalContent(limited.data);
   console.log("Annotation layers passed: separate runtime API, PDF-layer isolation, picking attribution, HEP round trips, limits and composition.");
 } finally { hooks.deregister(); }

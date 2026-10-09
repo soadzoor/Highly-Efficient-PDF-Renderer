@@ -64,7 +64,6 @@ export class PdfNeedMoreDataError extends Error {
 
 const WHITE_SPACE = new Set([0x00, 0x09, 0x0a, 0x0c, 0x0d, 0x20]);
 const DELIMITERS = new Set([0x28, 0x29, 0x3c, 0x3e, 0x5b, 0x5d, 0x7b, 0x7d, 0x2f, 0x25]);
-const DEFAULT_MAX_CONTAINER_ENTRIES = 2_000_000;
 
 interface ParsedNumberToken {
   readonly value: number;
@@ -128,8 +127,8 @@ export class PdfCosParser {
   ) {
     const baseOffset = options.baseOffset ?? 0;
     const position = options.position ?? 0;
-    const maxDepth = options.maxDepth ?? 64;
-    const maxContainerEntries = options.maxContainerEntries ?? DEFAULT_MAX_CONTAINER_ENTRIES;
+    const maxDepth = options.maxDepth ?? Number.MAX_SAFE_INTEGER;
+    const maxContainerEntries = options.maxContainerEntries ?? Number.MAX_SAFE_INTEGER;
     const duplicateDictionaryKeys = options.duplicateDictionaryKeys ?? "reject";
     if (
       !Number.isSafeInteger(baseOffset) || baseOffset < 0 ||

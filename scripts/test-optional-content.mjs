@@ -30,6 +30,32 @@ try {
   scene.textIndex = { version: 2, pages: [{ text: "x", charInstance: new Int32Array([-2]),
     fallbackQuads: new Float32Array([0, 0, 1, 1]), optionalContent: new Int32Array([1]) }] };
   const original = structuredClone(scene);
+
+  // Deep valid graphs and layer order use iterative walks; cycles still fail.
+  const deep = createEmptyVectorScene(), depth = 10_000;
+  const conditions = Array.from({ length: depth }, (_, index) => ({ kind: "not", operand: index + 1 }));
+  conditions.push({ kind: "group", groupId: "deep" });
+  let order = [{ kind: "group", groupId: "deep" }];
+  for (let index = 0; index < depth; index++) order = [{ kind: "label", label: "Nested", children: order }];
+  deep.optionalContent = { groups: [group("deep", true)], conditions, order, radioGroups: [] };
+  const deepController = new OptionalContentController(deep);
+  assert.equal(deepController.isVisible(0), true);
+  assert.deepEqual(deepController.getGroupIds(0), ["deep"]);
+  assert.notEqual(deepController.getOrder()[0], order[0], "deep layer orders remain detached");
+  await deepController.setLayerVisibility("deep", false);
+  assert.equal(deepController.isVisible(0), false);
+  deepController.dispose();
+  conditions[depth] = { kind: "not", operand: 0 };
+  assert.throws(() => validateSceneOptionalContentReferences(deep), /cyclic condition/);
+  conditions[depth] = { kind: "group", groupId: "deep" };
+  order[0].children = order;
+  assert.throws(() => validateSceneOptionalContentReferences(deep), /cyclic layer order/);
+  const manyOperands = createEmptyVectorScene();
+  manyOperands.optionalContent = { groups: [], order: [], radioGroups: [], conditions: [
+    { kind: "constant", value: true }, { kind: "and", operands: Array(1_000_001).fill(0) }
+  ] };
+  assert.equal(new OptionalContentController(manyOperands).isVisible(1), true,
+    "valid repeated operands beyond the former cap remain usable");
   const controller = new OptionalContentController(scene);
   assert.deepEqual([...controller.getSnapshot().conditions], [1, 0, 0, 1, 1]);
   assert.deepEqual(controller.getGroupIds(4), ["a", "b"]);

@@ -94,15 +94,8 @@ const TJCS_YCCK = 4;
 const TJFLAG_ACCURATEDCT = 4096;
 const TJFLAG_STOPONWARNING = 8192;
 const JPEG_DECODE_FLAGS = TJFLAG_ACCURATEDCT | TJFLAG_STOPONWARNING;
-const MAX_JPEG_INPUT_BYTES = 512 * 1024 * 1024;
-const MAX_JPEG_OUTPUT_BYTES = 512 * 1024 * 1024;
-// libjpeg-turbo 2.1's TJFLAG_LIMITSCANS uses 500. Normal encoders emit only
-// a small fraction of this, while the cap blocks progressive scan-amplification
-// attacks before entering this older synchronous codec kernel.
-const MAX_JPEG_SCANS = 500;
-// Real JPEGs generally contain tens of markers (or a few hundred ICC chunks).
-// Keep the structural walk itself bounded independently of the byte ceiling.
-const MAX_JPEG_MARKERS = 4096;
+const MAX_JPEG_INPUT_BYTES = 0xffff_ffff; // WASM32 size_t.
+const MAX_JPEG_OUTPUT_BYTES = 0xffff_ffff;
 const WASM_PAGE_BYTES = 64 * 1024;
 const WASM_INITIAL_MEMORY_BYTES = 2 * WASM_PAGE_BYTES;
 // Reserve space for libjpeg state, Huffman/quantization tables, row buffers,
@@ -122,7 +115,7 @@ let compiledModulePromise: Promise<WebAssembly.Module> | undefined;
  * from permanently raising the memory floor of a direct session or worker.
  */
 export function createBundledImageCodecResolver(
-  maxAggregateBytes = MAX_JPEG_OUTPUT_BYTES
+  maxAggregateBytes = Number.MAX_SAFE_INTEGER
 ): NativeImageCodecResolver {
   if (!Number.isSafeInteger(maxAggregateBytes) || maxAggregateBytes <= 0) {
     throw new RangeError("The bundled JPEG aggregate byte limit must be a positive safe integer.");
@@ -553,7 +546,6 @@ function inspectJpegMarkers(
   }
 
   let cursor = 2;
-  let markerCount = 1;
   let scanCount = 0;
   let frame: {
     width: number;
@@ -575,23 +567,11 @@ function inspectJpegMarkers(
     throwIfAborted(signal);
     nextAbortCheck = offset + 64 * 1024;
   };
-  const countMarker = (markerOffset: number): void => {
-    markerCount += 1;
-    if (markerCount > MAX_JPEG_MARKERS) {
-      throw jpegError(
-        "The JPEG contains too many structural markers.",
-        "jpeg-marker-limit",
-        { markers: markerCount, limit: MAX_JPEG_MARKERS, markerOffset }
-      );
-    }
-  };
-
   while (!sawEnd) {
     checkWork(cursor);
     const marker = pending ?? readBoundaryMarker(bytes, cursor);
     pending = null;
     cursor = marker.afterCode;
-    countMarker(marker.markerOffset);
 
     if (marker.code === 0xd9) {
       sawEnd = true;
@@ -649,20 +629,6 @@ function inspectJpegMarkers(
       validateStartOfScan(bytes, marker, segment.payloadStart, segment.end, frame.componentIds);
       sawFirstScan = true;
       scanCount += 1;
-      if (scanCount > MAX_JPEG_SCANS) {
-        throw jpegError(
-          frame.progressive
-            ? "The progressive JPEG exceeds the scan limit."
-            : "The JPEG exceeds the scan limit.",
-          frame.progressive ? "progressive-scan-limit" : "jpeg-scan-limit",
-          {
-            scans: scanCount,
-            limit: MAX_JPEG_SCANS,
-            progressive: frame.progressive,
-            markerOffset: marker.markerOffset
-          }
-        );
-      }
       pending = findMarkerAfterEntropyData(
         bytes,
         cursor,
@@ -1006,7 +972,7 @@ function checkedOutputByteLength(width: number, height: number, components: numb
 function allocateWasm(exports: TurboJpegExports, byteLength: number, label: string): number {
   let pointer: number;
   try {
-    pointer = exports.malloc(byteLength);
+    pointer = exports.malloc(byteLength) >>> 0;
   } catch (cause) {
     throw jpegError(`Unable to allocate ${label}.`, "wasm-allocation-failed", {
       bytes: byteLength

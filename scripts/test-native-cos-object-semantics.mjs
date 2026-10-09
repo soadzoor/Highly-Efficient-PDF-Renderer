@@ -184,6 +184,12 @@ function testContainersDepthCountsAndDuplicates() {
     () => new PdfCosParser(bytes("[]"), { maxDepth: 0 }).parseValue(),
     hasPdfError("resource-limit")
   );
+  let nested = new PdfCosParser(bytes(`${"[".repeat(128)}0${"]".repeat(128)}`)).parseValue();
+  for (let depth = 0; depth < 128; depth += 1) {
+    assert.ok(Array.isArray(nested), "default nesting follows the runtime instead of a fixed depth allowance");
+    nested = nested[0];
+  }
+  assert.equal(nested, 0);
 
   assert.throws(() => parseOne("[1 2"), isNeedMore);
   assert.throws(() => parseOne("<< /A 1"), isNeedMore);

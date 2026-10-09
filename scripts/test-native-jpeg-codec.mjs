@@ -119,13 +119,19 @@ try {
   await assert.rejects(
     resolveBundledImageCodec(request(manyScanJpeg(0xc2, 501), 1, 1, 1)),
     (error) => unsupportedImage(error) &&
-      error.details?.reason === "progressive-scan-limit" &&
-      error.details?.scans === 501 && error.details?.limit === 500
+      error.details?.reason !== "progressive-scan-limit",
+    "malformed scan data reaches format validation without an arbitrary scan ceiling"
   );
   await assert.rejects(
     resolveBundledImageCodec(request(manyScanJpeg(0xc0, 501), 1, 1, 1)),
-    (error) => unsupportedImage(error) && error.details?.reason === "jpeg-scan-limit"
+    (error) => unsupportedImage(error) && error.details?.reason !== "jpeg-scan-limit"
   );
+  const comments = Uint8Array.from({ length: 4200 * 4 }, (_, index) => [255, 254, 0, 2][index % 4]);
+  const manyMarkers = new Uint8Array(rgb.length + comments.length);
+  manyMarkers.set(rgb.subarray(0, 2)); manyMarkers.set(comments, 2); manyMarkers.set(rgb.subarray(2), 2 + comments.length);
+  const decodedMarkers = await resolveBundledImageCodec(request(manyMarkers, 3));
+  assert.deepEqual(decodedMarkers.samples, (await resolveBundledImageCodec(request(rgb, 3))).samples,
+    "valid JPEG comments beyond the former marker ceiling preserve pixels");
   await assert.rejects(
     resolveBundledImageCodec(request(manyScanJpeg(0xc3, 1), 1, 1, 1)),
     (error) => unsupportedImage(error) && error.details?.reason === "unsupported-jpeg-frame"

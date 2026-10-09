@@ -149,9 +149,9 @@ identities, decoded strings, field metadata, relationships, inert actions and
 optional-content condition indexes. It contains no appearance streams.
 
 The reader validates the descriptor, version, count, geometry, scalar types,
-page slots, condition indexes and bounded action nesting. Section size is
-limited to 64 MiB before decompression; record, coordinate, text and action
-budgets also apply. Invalid metadata fails validation rather than becoming
+page slots, condition indexes and action cycles. Section lengths must fit the
+container's uint32 fields; records, coordinates, text and action nesting have
+no additional default memory allowance. Invalid metadata fails validation rather than becoming
 interactive UI data. A missing descriptor produces an empty annotation array.
 
 This optional section changes none of the container, scene v9 or page v8
@@ -314,9 +314,10 @@ before publishing a layer. The fingerprint is the pair returned by
 Palette, opacity, page placement, and pixels remain exact. Original segments
 and shared globals are released after loading; they are not retained in the
 scene for export. Legacy compressed inputs count alongside packed pixels during
-the loading memory preflight. One JBIG2 decode is bounded to 128 MiB of encoded
-inputs and packed output;
-shared globals are size-checked before decompression. Reloading JBIG2 usually
+the loading size validation. JBIG2 decoding attempts allocation on the host;
+the kernel's unsigned 32-bit pointers bound its linear memory. Callers can
+provide smaller byte or work allowances. Shared globals are size-checked
+before decompression. Reloading JBIG2 usually
 uses more CPU than inflating packed bytes.
 
 Scene v12 adds `raster/layer-N.binary`, used automatically for monochrome exports.
@@ -410,10 +411,10 @@ number. Characters that share a glyph, such as the members of a ligature, each
 own a quad holding the same rectangle; a shared quad would leave the two counts
 disagreeing and a reader then discards the whole text index.
 
-Layer tables are limited to 100,000 groups, 1,000,000 condition nodes/operands,
-and nesting depth 64. IDs and references must be valid and unique where required;
+Layer tables have no default group, operand or nesting allowance. Condition
+references must fit their Int32 representation. IDs and references must be valid and unique where required;
 cyclic conditions, invalid draw-run references and malformed text associations
-are rejected. The existing 16 MiB manifest limit still applies.
+are rejected. The manifest length uses the container's uint32 field.
 
 ### Compositing and replay resources
 
@@ -422,7 +423,7 @@ groups, and retained fallback leaves. Draw leaves reference a draw-run index.
 Groups retain alpha, isolation, knockout, blend mode, bounds, optional visibility
 condition, and an optional alpha/luminosity mask subtree. Each canonical draw run
 is covered once, including singleton raster runs substituted by a retained leaf.
-Repeated/cyclic nodes and nesting beyond 64 are rejected.
+Repeated/cyclic nodes are rejected. Valid nesting is processed within runtime capacity.
 
 `scene.retainedPages` entries contain a resource `file`, a six-value page-to-scene
 `matrix`, and an `optionalContentConditions` array mapping retained memberships
@@ -461,8 +462,8 @@ and uint32 payload byte length. Metadata is padded with zeroes to a four-byte
 boundary. Typed arrays appear in metadata as
 `{$heprArray:"u8"|"u32"|"i32"|"f32",offset,length}`; offsets address the aligned
 payload, lengths count elements, and multibyte values are little-endian. Repeated
-references reuse one array. Metadata is limited to 16 MiB and the payload to
-768 MiB; array ranges and the complete retained-page schema are validated.
+references reuse one array. Metadata and payload lengths must fit their uint32
+fields; array ranges and the complete retained-page schema are validated.
 Ordinary scenes omit these resources. Old embedded-PDF raster recovery is not
 part of scene v8 or v9.
 
@@ -536,20 +537,16 @@ The index checksum is verified before interpreting records. Chunk checksums and
 internal gap bytes are verified when a section is read, after decoding if needed.
 CRC32 detects accidental corruption; it is not authentication.
 
-| Resource | Maximum |
-| --- | --- |
-| Entries / chunks | 8,192 each |
-| Index | 16 MiB |
-| Decoded chunk | 1 GiB |
-| Total decoded chunks, including alignment gaps | 2 GiB |
-| `manifest.json` | 16 MiB |
-| Each retained page program | 16 MiB metadata + 768 MiB typed stores |
-| Each `raster/` payload | 768 MiB |
-| Total `raster/` payloads | 1 GiB |
+Counts, offsets and lengths must fit the uint32 fields described above, and
+declared counts must fit the actual index or section bytes before allocation.
+There are no additional default section-count, decoded-byte or aggregate-raster
+budgets. Allocations depend on the host runtime and device. Raster dimensions
+must fit their signed 32-bit encoding; optional-content references and scene
+indices must fit their corresponding typed fields. Scene validation also checks
+geometry, references and cycles.
 
-The scene loader additionally applies its semantic raster, image-dimension,
-optional-content DAG and paint-graph limits. Callers can provide stricter per-entry byte limits to the
-internal reader. Metadata limits are checked before decompression, and streamed
+Callers can provide stricter per-entry byte limits to the internal reader.
+Declared lengths and caller limits are checked before decompression, and streamed
 decoded output cannot exceed its declared length. A grouped chunk is decoded once
 per reader, including concurrent entry reads. Standalone decoded chunks are not
 cached. Returned section buffers are independent copies.

@@ -254,6 +254,15 @@ const expressionFixture = optionalContentFixture({
   pageProperties: "/Expr 17 0 R",
   extraObjects: [{ number: 17, body: "<< /Type /OCMD /VE [/And 11 0 R [/Not 12 0 R]] >>" }]
 });
+let deepExpression = "11 0 R";
+for (let depth = 0; depth < 512; depth++) deepExpression = `[/Not ${deepExpression}]`;
+await withFixture(optionalContentFixture({
+  pageProperties: "/Deep 17 0 R",
+  extraObjects: [{ number: 17, body: `<< /Type /OCMD /VE ${deepExpression} >>` }]
+}), {}, async ({ document, registry }) => {
+  const [property] = await registry.resolvePageProperties(document.getPage(0).resources, ["Deep"]);
+  assert.equal(property.defaultVisible, true, "default expression depth follows host resources beyond the former cutoff");
+});
 await withFixture(
   expressionFixture,
   { limits: { maxExpressionDepth: 0 } },

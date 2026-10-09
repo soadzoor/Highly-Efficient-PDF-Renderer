@@ -200,6 +200,35 @@ try {
   assert.equal(scene.rasterLayers[0].paintOrder, 7);
   assert.equal(scene.rasterLayers[0].pageIndex, 0, "a one-page scene uses layout slot zero");
 
+  const complexGlyphScene = buildNativeVectorPage({
+    ...input,
+    fontResources: [{
+      fontIndex: 0,
+      font: {
+        ...font,
+        getGlyphOutline(glyphId) {
+          return {
+            ...font.getGlyphOutline(glyphId),
+            commands: [
+              { kind: "move", x: 0, y: 0 },
+              ...Array.from({ length: 300 }, (_, index) => ({
+                kind: "line", x: (index + 1) * 8 / 300, y: (index + 1) % 2
+              })),
+              { kind: "close" }
+            ],
+            bounds: [0, 0, 8, 1]
+          };
+        }
+      }
+    }]
+  });
+  assert.equal(complexGlyphScene.textGlyphCount, 1);
+  assert.equal(complexGlyphScene.textGlyphSegmentCount, 301,
+    "glyphs beyond the former 256-primitive cutoff must preserve every vector segment");
+  assert.equal(complexGlyphScene.textInstanceCount, 1);
+  assert.equal(complexGlyphScene.rasterLayers.length, 1,
+    "a complex glyph must not add a raster replacement");
+
   const softMaskedBase = {
     ...imageRegistry.describe(0),
     interpolate: false,
@@ -350,6 +379,20 @@ try {
     ]),
     "a rectangular clip keeps the established placement-grid padding transparent"
   );
+
+  const wideClippedScene = buildNativeVectorPage({
+    ...input,
+    pageInfo: { sourcePageIndex: 3, width: 20_000, height: 10 },
+    pageBounds: { minX: 0, minY: 0, maxX: 20_000, maxY: 10 },
+    imageRegistry: { ...imageRegistry, describe: index => ({ ...imageRegistry.describe(index), interpolate: false }) },
+    compiled: { ...compiled, vectorSceneData: { ...vectorSceneData,
+      imageTransforms: new Float32Array([20_000, 0, 0, 1, 0, 0]),
+      imageClipBounds: new Float32Array([1, 0, 19_999, 1]),
+      imageFlags: new Uint8Array([DENSE_PDF_VECTOR_SCENE_IMAGE_FLAG_CLIPPED])
+    } }
+  });
+  assert.equal(wideClippedScene.rasterLayers[0].width, 20_000,
+    "a narrow clipped image beyond the former dimension allowance keeps its sampling grid");
 
   const brochureWidth = 1_246;
   const brochureHeight = 1_175;

@@ -126,7 +126,7 @@ export function decodeStrokeGeometry(encoded: StrokeGeometryExport): {
     const startYFloat = decodeRangeUint16(sy, qMin[1], qMax[1]);
     const endXFloat = decodeRangeUint16(ex, qMin[2], qMax[2]);
     const endYFloat = decodeRangeUint16(ey, qMin[3], qMax[3]);
-    const isQuad = (metaBytes[i >> 3] >>> (i & 7)) & 1;
+    const isQuad = (metaBytes[Math.floor(i / 8)] >>> (i & 7)) & 1;
 
     const offset = i * 4;
     endpoints[offset] = startXFloat;
@@ -338,7 +338,7 @@ export function buildStrokeGeometryExport(scene: VectorScene): StrokeGeometryExp
     prevEndYInt = ey;
 
     if (bInts[offset + 2] >= 1) {
-      bitset[i >> 3] |= 1 << (i & 7);
+      bitset[Math.floor(i / 8)] |= 1 << (i & 7);
       curveCount += 1;
       // Predict the control point from DECODED floats so the reader's
       // prediction reproduces this value bit-exactly.

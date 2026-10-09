@@ -19,7 +19,8 @@
 ## Working Style
 
 - Prefer opening a PDF with an approximate appearance or visual glitches over refusing to open it because a rendering feature is unsupported.
-- Preserve accurate vector output where possible; use bounded raster fallback and visual approximations when needed to keep a document usable. Emit diagnostics when fidelity or capabilities are reduced instead of silently omitting visible content.
+- Preserve accurate vector output where possible; use bounded raster fallback and visual approximations only when needed to keep a document usable. Emit diagnostics when fidelity or capabilities are reduced instead of silently omitting visible content.
+- Don't introduce hardcoded _resource_ limits, like maximum number of segments, or maximum edge-clips. It if doesn't work on a weak device, it shouldn't mean it should fail on a powerful PC just because we added a hardcoded limit - let the user try, even if it might fail. If needed, they can add those limits manually with flags - although we've proven that in a lot of cases, the rasterization fallback is actually more resource-hungry than the vector processing, even with large numbers.
 - Treat this compatibility preference as the default development direction, including PDF parsing, viewing, and PDF-to-HEP conversion. It does not override cancellation, resource limits, or validation needed to process data safely.
 
 - Make focused, minimal changes that directly address the task.

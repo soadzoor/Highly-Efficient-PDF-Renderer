@@ -26,7 +26,7 @@ import {
 export const TEXT_GLYPH_SEGMENTS_PATH = "geometry/text-glyph-segments.cq16";
 export const TEXT_INSTANCE_POSITIONS_PATH = "geometry/text-instance-ef.pd512";
 
-const MAX_GLYPH_SEGMENTS = 50_000_000;
+const MAX_UINT32 = 0xffffffff;
 const MAX_UINT16 = 65_535;
 
 export interface TextGlyphSegmentsMeta {
@@ -66,7 +66,7 @@ function axisRange(a: Float32Array, b: Float32Array, count: number, axis: number
  * equals the previous end exactly.
  *
  * `varint segmentCount`, a quadratic bitset and a control bitset of
- * `ceil(segmentCount / 8)` bytes each (bit `i & 7` of byte `i >> 3`), then six
+ * `ceil(segmentCount / 8)` bytes each (bit `i & 7` of byte `floor(i / 8)`), then six
  * `varint` column byte lengths and the zigzag columns: start x/y against the
  * previous end, end x/y against the start, and, for segments whose control bit
  * is set, control x/y against the rounded-down chord midpoint. Quadratics
@@ -78,7 +78,9 @@ export function encodeTextGlyphSegments(
   segmentsB: Float32Array,
   count: number
 ): { bytes: Uint8Array; meta: TextGlyphSegmentsMeta } {
-  if (count > MAX_GLYPH_SEGMENTS) fail("text glyph segments", "too many segments");
+  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_UINT32) {
+    fail("text glyph segments", "segment count exceeds its uint32 range");
+  }
   if (segmentsA.length < count * 4 || segmentsB.length < count * 4) {
     throw new Error(`Text glyph segments have insufficient data for ${count} segments.`);
   }
@@ -103,9 +105,9 @@ export function encodeTextGlyphSegments(
     columns[1].writeZigzagVarint(sy - previousY);
     columns[2].writeZigzagVarint(ex - sx);
     columns[3].writeZigzagVarint(ey - sy);
-    if (isQuadratic) quadratic[i >> 3] |= 1 << (i & 7);
+    if (isQuadratic) quadratic[Math.floor(i / 8)] |= 1 << (i & 7);
     if (isQuadratic || cx !== ex || cy !== ey) {
-      control[i >> 3] |= 1 << (i & 7);
+      control[Math.floor(i / 8)] |= 1 << (i & 7);
       columns[4].writeZigzagVarint(cx - ((sx + ex) >> 1));
       columns[5].writeZigzagVarint(cy - ((sy + ey) >> 1));
     }
@@ -117,7 +119,10 @@ export function encodeTextGlyphSegments(
   writer.writeBytes(quadratic);
   writer.writeBytes(control);
   const columnBytes = columns.map(column => column.toUint8Array());
-  for (const column of columnBytes) writer.writeVarUint32(column.length);
+  for (const column of columnBytes) {
+    if (column.length > MAX_UINT32) fail("text glyph segments", "column length exceeds its uint32 range");
+    writer.writeVarUint32(column.length);
+  }
   for (const column of columnBytes) writer.writeBytes(column);
   return {
     bytes: writer.toUint8Array(),
@@ -137,7 +142,7 @@ export function decodeTextGlyphSegments(
   const section = "text glyph segments";
   const header = new VarintCursor(bytes);
   const count = header.readVarUint32();
-  if (count !== meta.segmentCount || count > MAX_GLYPH_SEGMENTS) {
+  if (count !== meta.segmentCount) {
     fail(section, "segment count does not match its manifest entry");
   }
   const bitsetBytes = Math.ceil(count / 8);
@@ -149,6 +154,7 @@ export function decodeTextGlyphSegments(
   if (columnStart + columnLengths.reduce((sum, length) => sum + length, 0) !== bytes.length) {
     fail(section, "column lengths do not fill the section");
   }
+  if (columnLengths.slice(0, 4).some(length => length < count)) fail(section, "point columns are truncated");
   const columns = columnLengths.map((length) => {
     const cursor = new VarintCursor(bytes, columnStart, columnStart + length);
     columnStart += length;
@@ -166,8 +172,9 @@ export function decodeTextGlyphSegments(
   let previousY = 0;
   for (let i = 0; i < count; i += 1) {
     const bit = 1 << (i & 7);
-    const isQuadratic = (bytes[bitsetStart + (i >> 3)] & bit) !== 0;
-    const hasControl = (bytes[bitsetStart + bitsetBytes + (i >> 3)] & bit) !== 0;
+    const bitsetOffset = Math.floor(i / 8);
+    const isQuadratic = (bytes[bitsetStart + bitsetOffset] & bit) !== 0;
+    const hasControl = (bytes[bitsetStart + bitsetBytes + bitsetOffset] & bit) !== 0;
     if (isQuadratic && !hasControl) fail(section, "a quadratic has no control point");
     const sx = requireGrid(previousX + columns[0].readZigzagVarint());
     const sy = requireGrid(previousY + columns[1].readZigzagVarint());

@@ -200,7 +200,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   let metaB = textureLoad(uPathMetaB, coord, 0);
   let metaC = textureLoad(uPathMetaC, coord, 0);
   let paintMeta = textureLoad(uPaintMeta, coord, 0);
-  let segmentCount = i32(metaA.y + 0.5);
+  let segmentCount = i32(metaA.y);
   let alpha = metaC.w;
   var out : FillOut;
   out.bands = heprFillBandInfo(f32(pathIndex), uCamera.fillBands.z, uSegmentsA);
@@ -230,7 +230,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> FillOut {
   let screen = (world - uCamera.cameraCenter) * uCamera.zoom + 0.5 * uCamera.viewport;
   out.position = vec4f((screen / (0.5 * uCamera.viewport)) - 1.0, 0.0, 1.0);
   out.local = world;
-  out.segmentStart = i32(metaA.x + 0.5);
+  out.segmentStart = i32(metaA.x);
   out.segmentCount = segmentCount;
   out.solidColor = vec3f(metaB.z, metaB.w, metaC.z);
   out.alpha = alpha;
@@ -321,7 +321,7 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) ins
   let runIndex = i32(vertexIndex / 4u);
   let runDimensions = textureDimensions(uRunMetaA);
   let runMeta = textureLoad(uRunMetaA, coordFromIndex(runIndex, i32(runDimensions.x)), 0);
-  let segmentIndex = i32(runMeta.x + 0.5) + i32(instanceIndex);
+  let segmentIndex = i32(runMeta.x) + i32(instanceIndex);
   let segmentDimensions = textureDimensions(uEndpoints);
   let coord = coordFromIndex(segmentIndex, i32(segmentDimensions.x));
   let primitiveA = textureLoad(uEndpoints, coord, 0);

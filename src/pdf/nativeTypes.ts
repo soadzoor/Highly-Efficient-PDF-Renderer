@@ -81,27 +81,32 @@ export interface PdfResourceLimits {
   readonly maxGlyphsPerPage: number;
 }
 
+/**
+ * Content sizes have no default memory allowance: allocations are attempted on
+ * the host device. Index ceilings describe the emitted typed-array ABI; callers
+ * can opt into smaller resource limits. Cache targets only govern reuse.
+ */
 export const DEFAULT_PDF_RESOURCE_LIMITS: Readonly<PdfResourceLimits> = Object.freeze({
-  maxIncrementalRevisions: 128,
-  maxRecursionDepth: 64,
-  maxDecodedStreamBytes: 512 * 1024 * 1024,
+  maxIncrementalRevisions: Number.MAX_SAFE_INTEGER,
+  maxRecursionDepth: Number.MAX_SAFE_INTEGER,
+  maxDecodedStreamBytes: Number.MAX_SAFE_INTEGER,
   maxObjectStreamCacheBytes: 512 * 1024 * 1024,
-  maxRepairScanBytes: 512 * 1024 * 1024,
-  maxRepairCandidates: 2_000_000,
+  maxRepairScanBytes: Number.MAX_SAFE_INTEGER,
+  maxRepairCandidates: Number.MAX_SAFE_INTEGER,
   maxCachedObjects: 16_384,
   maxSourceCacheBytes: 32 * 1024 * 1024,
-  maxImageDimension: 65_535,
-  maxImagePixels: 268_435_456,
-  maxIccProfileBytes: 64 * 1024 * 1024,
-  maxIccTransformBytes: 16 * 1024 * 1024,
-  maxCommandsPerPage: 10_000_000,
-  maxPathsPerPage: 5_000_000,
-  maxPathVerbsPerPage: 20_000_000,
-  maxPathCoordinatesPerPage: 60_000_000,
-  maxClipsPerPage: 1_000_000,
-  maxStrokeStylesPerPage: 5_000_000,
-  maxDashValuesPerPage: 20_000_000,
-  maxGlyphsPerPage: 10_000_000
+  maxImageDimension: 0xffff_ffff,
+  maxImagePixels: Number.MAX_SAFE_INTEGER,
+  maxIccProfileBytes: Number.MAX_SAFE_INTEGER,
+  maxIccTransformBytes: Number.MAX_SAFE_INTEGER,
+  maxCommandsPerPage: 0xffff_ffff,
+  maxPathsPerPage: 0xffff_ffff,
+  maxPathVerbsPerPage: 0xffff_ffff,
+  maxPathCoordinatesPerPage: 0xffff_ffff,
+  maxClipsPerPage: 0x7fff_ffff,
+  maxStrokeStylesPerPage: 0xffff_ffff,
+  maxDashValuesPerPage: 0xffff_ffff,
+  maxGlyphsPerPage: 0x7fff_ffff
 });
 
 export type PdfErrorCode =

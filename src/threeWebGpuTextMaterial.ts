@@ -74,7 +74,7 @@ function varyingNode(node: unknown, flat = false): never {
 
 const coordFromIndexFn = TSL.wgslFn(`
 fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
-  let itemIndex = i32(index + 0.5);
+  let itemIndex = i32(index);
   let safeWidth = max(i32(width), 1);
   return vec2<i32>(itemIndex % safeWidth, itemIndex / safeWidth);
 }
@@ -82,7 +82,7 @@ fn heprCoordFromIndex(index: f32, width: f32) -> vec2<i32> {
 
 const clipCoordFromReferenceFn = TSL.wgslFn(`
 fn heprClipCoordFromReference(reference: f32, width: f32) -> vec2<i32> {
-  let itemIndex = max(i32(reference + 0.5) - 1, 0);
+  let itemIndex = max(i32(reference) - 1, 0);
   let safeWidth = max(i32(width), 1);
   return vec2<i32>(itemIndex % safeWidth, itemIndex / safeWidth);
 }
@@ -103,7 +103,7 @@ fn heprTextVertexPack(
   useLocalToClip: f32,
   localToClip: mat4x4<f32>
 ) -> vec4<f32> {
-  let segmentCount = i32(glyphMetaA.y + 0.5);
+  let segmentCount = i32(glyphMetaA.y);
   if (segmentCount <= 0) {
     return vec4<f32>(-2.0, -2.0, 0.0, 0.0);
   }
@@ -142,7 +142,7 @@ fn heprTextClipPosition(
   // shaders. vertexPack.zw carries glyph-space coordinates, so any sentinel
   // packed there would also match real glyphs whose bounds reach far enough
   // below the origin, dragging one quad corner off-screen.
-  if (i32(glyphMetaA.y + 0.5) <= 0) {
+  if (i32(glyphMetaA.y) <= 0) {
     return vec4<f32>(-2.0, -2.0, 0.0, 1.0);
   }
 
@@ -226,8 +226,8 @@ fn heprTextFragment(
     abs(atlasPixelsDx.y) + abs(atlasPixelsDy.y)
   );
 
-  let segmentStart = i32(glyphMetaA.x + 0.5);
-  let segmentCount = i32(glyphMetaA.y + 0.5);
+  let segmentStart = i32(glyphMetaA.x);
+  let segmentCount = i32(glyphMetaA.y);
   if (segmentCount <= 0 || instanceColor.a <= 0.001) {
     discard;
   }

@@ -93,6 +93,11 @@ try {
   await assert.rejects(readHepStructure(archive, descriptor, { ...target(), fillPathCount: 1 }), /ranges/);
   await assert.rejects(readHepStructure(new HepArchive(), descriptor, target()), /Missing/);
   await readHepStructure(archive, undefined, target());
+  const truncated = new HepArchive();
+  truncated.file(descriptor.file, await archive.file(descriptor.file).async("uint8array"));
+  truncated.file(descriptor.rangesFile, Uint8Array.of(255,255,255,255,15));
+  await assert.rejects(readHepStructure(truncated, { ...descriptor, rangeCount: 0xffffffff }, target()), /ranges/,
+    "declared counts must fit actual range bytes before allocating");
 
   // Composition shifts primitives, items and page slots; element ids are shared.
   const composed = composeVectorScenesInGrid([scene, scene], 2);

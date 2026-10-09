@@ -814,19 +814,21 @@ well (`src/vectorCellIndex.ts`). A fill pixel reads the finest level whose
 cells are at least half its footprint, so it visits at most three cells each
 way at any zoom, and gets the same coverage as the unindexed sum up to
 rounding. The index is built when a scene is uploaded (about 0.3 s for the
-Broschuere HEP). A fill store's index may add up to four texels per segment;
-paths are indexed from the largest down, and a path left out keeps its bands.
-A clip polygon's index may use twelve texels per edge within the clip
-texture's limit, else it keeps bands too. Clips with up to 65,536 edges can
-use cells, including large collections of small contours whose bands still
-scan hundreds of unrelated edges at close zoom. Larger clips retain bands
-or the complete edge scan. Cell construction stops before exceeding its
-index budget, bounds intermediate storage relative to that budget, and keeps
-any complete coarser levels already built. Native WebGPU passes the cell
+Broschuere HEP). Paths are indexed from the largest down within the available
+texture capacity, and a path left out keeps its bands. Clips have no per-path
+edge cutoff or default index-to-edge allowance. Large collections of small
+contours can use cells even when bands scan hundreds of unrelated edges at
+close zoom. Cell construction stops when further refinement no longer reduces
+candidate work, coordinate precision prevents refinement, or the next complete
+level would exceed the texture capacity. It keeps complete coarser levels;
+bands and the complete edge scan preserve the original geometry when needed.
+The packed GPU format uses exact Float32 addresses, with a capacity of 2^24
+texels independently of available memory. Native WebGPU passes the cell
 headers in its camera uniforms, Three's WebGL materials set `uFillCellHeaders`
 and its node materials take `fillCellBase`. Three's layers do not know the
-device's texture limit, so their stores stay within 2048 × 2048 texels and a
-very large scene indexes fewer paths there. A host that reuses the GL fill
+device's texture limit until upload, so they initially use the packed format's
+capacity and adapt their stores to the host renderer during upload.
+A host that reuses the GL fill
 shaders and never sets the cell uniforms (`uFillCellHeaders`, `uCellHeaders`)
 leaves them at zero, which means no cells.
 

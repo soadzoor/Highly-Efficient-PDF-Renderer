@@ -346,6 +346,15 @@ expectPdfError(
 expectPdfError(() => prepareNativeInlineImages(encoder.encode("ID x")), "unsupported-content");
 expectPdfError(() => prepareNativeInlineImages(encoder.encode("EI")), "unsupported-content");
 
+// Defaults admit dictionaries beyond the old byte/entry/depth cutoffs.
+const ignoredEntries = Array.from({ length: 257 }, (_, index) => `/Ignored${index} 0`).join(" ");
+const largeDictionary = inline(`${" ".repeat(65_537)}${ignoredEntries} /Nested ${"[".repeat(512)}0${"]".repeat(512)} /W 1 /H 1 /BPC 8 /CS /G`, Uint8Array.of(0));
+assert.equal(prepareNativeInlineImages(largeDictionary).images.length, 1);
+expectPdfError(() => prepareNativeInlineImages(largeDictionary, { limits: { maxNestingDepth: 64 } }), "resource-limit");
+const manyImages = bytes("BI /W 1 /H 1 /BPC 8 /CS /G ID x EI\n".repeat(65_537));
+assert.equal(prepareNativeInlineImages(manyImages).images.length, 65_537,
+  "inline image count follows available host resources instead of the former count cutoff");
+
 expectPdfError(
   () => prepareNativeInlineImages(multipleContent, { limits: { maxImages: 1 } }),
   "resource-limit",
