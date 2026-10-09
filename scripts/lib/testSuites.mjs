@@ -14,6 +14,8 @@ export const fastTests = [
   "pdf-source-ownership",
   "hep-container",
   "hep-float32-palette",
+  "hep-storage-repack",
+  "hep-integer-chunks",
   "hep-api",
   "large-bit-addresses",
   "hep-lod",

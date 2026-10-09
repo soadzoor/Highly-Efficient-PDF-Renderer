@@ -1078,13 +1078,14 @@ The builder accepts `signal` and `onProgress`, including LOD building, raster en
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP containers v1 and v2 with scene schemas v9–v13. Scene v13
+The loader supports HEP containers v1–v3 with scene schemas v9–v13. Scene v13
 stores repeated transparency wrappers and matching draw-run metadata compactly,
 preserving the original group boundaries and paint order exactly. Exports use it
-when repeated wrappers can share storage. New exports
-use v2 only when an exact stroke-style palette makes the file smaller; these
-files require an updated viewer. Existing v1 files remain supported. The palette
-changes no rendering values; optional LOD caches are separate sections. Earlier scene schemas
+when repeated wrappers can share storage. New exports use v2 when an exact
+stroke-style palette saves space, or v3 when lossless integer encoding shrinks
+the existing vector LOD bytes. These files require an updated viewer. Existing
+v1 and v2 files remain supported. Both encodings preserve every decoded section
+byte; optional LOD caches are separate sections. Earlier scene schemas
 must be regenerated from the original PDF; repacking a container cannot restore
 layer definitions or content omitted by an earlier conversion. The
 [container specification](HEP_CONTAINER.md) describes the binary format and
@@ -1205,7 +1206,22 @@ and file sizes. The existing `npm run regenerate:heps` explicitly disables both
 LOD caches and keeps writing files to `public/examples/heps`. HEP+LOD actions
 appear only for files present when the manifest is generated.
 
-To shrink already-generated example caches without parsing PDFs or repeating
+To shrink existing HEPs while preserving every decoded section byte, including
+all LOD levels, precision and indexes, run the storage repacker:
+
+```bash
+node --experimental-strip-types scripts/repack-hep-storage.mjs /path/to/heps
+```
+
+It measures only by default. Add `--write` to atomically replace files that become
+smaller, after verifying the changed sections. It accepts individual HEP files
+or directories, never parses PDFs or recalculates LODs, and leaves unrelated
+sections in their original encoding. New integer chunks require a viewer that
+supports HEP container v3. Use Ctrl+C to cancel, or `--timeout-ms=N` for an optional
+per-file deadline.
+
+To shrink already-generated example caches by sharing geometry and changing
+their cached representation without parsing PDFs or repeating
 LOD simplification, run:
 
 ```bash

@@ -254,7 +254,7 @@ const groupedFixture = fixture([["g/a", "abc"], ["g/b", "def"]], { grouped: true
 const emptyFixture = fixture([["x", ""]]);
 await rejects(Buffer.alloc(0), /header/);
 await rejects(small.bytes.subarray(0, 31), /header/);
-await rejects(edit(small.bytes, b => b.writeUInt16LE(3, 4)), /version/);
+await rejects(edit(small.bytes, b => b.writeUInt16LE(4, 4)), /version/);
 await rejects(edit(small.bytes, b => b.writeUInt16LE(1, 6)), /reserved/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(1, 24)), /reserved/);
 await rejects(edit(small.bytes, b => b.writeUInt32LE(8193, 8)), /index length/);

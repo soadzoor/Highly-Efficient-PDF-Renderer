@@ -1,10 +1,10 @@
-# HEP container versions 1 and 2
+# HEP container versions 1–3
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1** and **2** wrap **scene schema versions 9–13**, recorded in
+versions **1–3** wrap **scene schema versions 9–13**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support both container versions and scene v9–v13; files using older
+Readers support all three container versions and scene v9–v13; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
 v13 when repeated paint-group metadata is compacted, v12 for transposed binary
 runs, v10 for plain packed monochrome rasters, otherwise v9. Legacy v11 JBIG2
@@ -25,7 +25,7 @@ The first 32 bytes are:
 | Offset | Type | Value |
 | --- | --- | --- |
 | 0 | 4 bytes | `48 45 50 00` (`HEP\0`) |
-| 4 | uint16 | Container version: `1` or `2` |
+| 4 | uint16 | Container version: `1`, `2` or `3` |
 | 6 | uint16 | Flags: `0` |
 | 8 | uint32 | Entry count |
 | 12 | uint32 | Chunk count |
@@ -43,7 +43,7 @@ records; its length is divisible by four. Each chunk record is 20 bytes:
 | 4 | uint32 | Stored payload length, excluding external padding |
 | 8 | uint32 | Decoded payload length, including internal alignment gaps |
 | 12 | uint32 | CRC32 of the complete decoded chunk |
-| 16 | uint8 | Codec: `0` = stored, `1` = zlib-wrapped DEFLATE, `2` = DEFLATE with exact vec4 palette (container v2 only) |
+| 16 | uint8 | Codec: `0` = stored, `1` = zlib-wrapped DEFLATE, `2` = DEFLATE with exact vec4 palette (container v2–v3), `3` = DEFLATE with exact integer varints (container v3) |
 | 17 | 3 bytes | Reserved: all zero |
 
 Each variable-length entry record has this layout:
@@ -122,6 +122,48 @@ original stored/DEFLATE candidate. Chunk counts, index size, and all other
 sections stay identical, so selecting the palette cannot enlarge the archive.
 Global or per-entry `STORE` retains the original bytes without a palette.
 This codec stores no vector LOD data.
+
+## Exact integer chunks (container v3)
+
+Container v3 adds codec `3` while keeping the existing header and index layout.
+The writer emits v3 only when it selects at least one integer chunk. The reader
+continues to accept codecs 0–2, and scene schemas and LOD versions are unchanged.
+Files containing codec 3 require an updated reader.
+
+Codec 3 compresses the existing byte-plane wire bytes without decoding a scene,
+building LOD levels, rounding coordinates or rebuilding spatial indexes. The
+decoded chunk length must be positive and divisible by four. It defines a word
+count `n = decodedLength / 4`; word `i` consists of bytes at offsets `i`, `n+i`,
+`2n+i`, `3n+i`, in little-endian order. Every 32-bit pattern is preserved.
+
+The zlib-wrapped DEFLATE payload inflates to one mode byte followed by exactly
+`n` canonical unsigned LEB128 varints, each representing a uint32. Modes are:
+
+| Mode | Values stored as varints |
+| --- | --- |
+| 0 | Zigzag of each word interpreted as signed int32 |
+| 1 | Zigzag of each word's difference from the preceding word, modulo 2^32 and interpreted as signed int32 |
+| 2 | Each word's difference from the preceding word, modulo 2^32, as unsigned uint32 |
+
+The preceding word is initially zero and advances across the entire chunk.
+Zigzag maps signed value `x` to `2*x` for nonnegative values or `-2*x-1` for
+negative values. Decoding modes 1 and 2 adds the decoded delta to the preceding
+word modulo 2^32. The result is written back into the same four byte planes.
+CRC32, entry offsets and decoded lengths refer to these original wire bytes.
+
+Packed decompression is bounded by `1 + 5*n` bytes. Readers reject unknown modes,
+truncation, varints longer than five bytes, fifth bytes greater than 15,
+noncanonical encodings with a zero final byte after continuation, and trailing
+bytes. The complete varint stream is validated before allocating its expanded
+wire payload. Caller-supplied section byte limits still apply to decoded lengths.
+
+The writer considers standalone `lod-vector/*.bin` chunks only. It measures all
+three compressed modes and uses codec 3 only when its payload padded to four
+bytes is strictly smaller than the existing stored/DEFLATE candidate. The
+unchanged chunk layout makes this a whole-file size guarantee. Global or
+per-entry `STORE` bypasses the transform. Existing LOD arrays and their index
+JSON remain byte identical after decoding; both the canonical scene and the
+precomputed hierarchy are preserved.
 
 ## Annotation metadata
 

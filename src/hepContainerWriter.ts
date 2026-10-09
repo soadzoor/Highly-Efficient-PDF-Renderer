@@ -15,6 +15,7 @@ import {
   transformBytes
 } from "./hepContainerShared";
 import { encodePaletteBytes } from "./hepContainerPalette";
+import { chooseHepIntegerEncoding } from "./hepContainerIntegers";
 import type { HepArchiveEntry, HepArchiveWriteOptions, HepArchiveProgress } from "./hepContainer";
 import type { EntryRecord, ChunkRecord } from "./hepContainerShared";
 
@@ -98,6 +99,10 @@ export async function generateHepArchive(
           if (align4(packed.length) < align4(stored.length)) { stored = packed; codec = 2; }
         }
       }
+      if (chunk.entries.length === 1 && /^lod-vector\/[^/]+\.bin$/.test(chunk.entries[0].record.name)) {
+        const packed = await chooseHepIntegerEncoding(decoded, stored.length, options.signal);
+        if (packed) { stored = packed; codec = 3; }
+      }
     }
     if (outputLength > MAX_UINT32 || stored.length > MAX_UINT32 || decoded.length > MAX_UINT32) {
       fail("chunk offset or length exceeds its 32-bit field.");
@@ -113,7 +118,7 @@ export async function generateHepArchive(
   const headerIndex = new Uint8Array(HEADER_BYTES + indexLength);
   headerIndex.set([0x48, 0x45, 0x50, 0]);
   const view = new DataView(headerIndex.buffer);
-  view.setUint16(4, chunks.some(chunk => chunk.codec === 2) ? 2 : 1, true);
+  view.setUint16(4, chunks.some(chunk => chunk.codec === 3) ? 3 : chunks.some(chunk => chunk.codec === 2) ? 2 : 1, true);
   view.setUint32(8, entries.length, true);
   view.setUint32(12, chunks.length, true);
   view.setUint32(16, indexLength, true);
