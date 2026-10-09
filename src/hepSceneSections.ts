@@ -169,7 +169,8 @@ export function encodeSceneDrawRuns(drawRuns: readonly VectorDrawRun[]): Uint8Ar
   return writer.toUint8Array();
 }
 
-export function decodeSceneDrawRuns(bytes: Uint8Array): VectorDrawRun[] {
+export function decodeSceneDrawRuns(bytes: Uint8Array, grouped = false): VectorDrawRun[] {
+  if (grouped) return decodeGroupedSceneDrawRuns(bytes);
   const cursor = new VarintCursor(bytes);
   const runCount = cursor.readVarUint32();
   if (runCount * 3 > bytes.length - cursor.byteOffset) fail("draw run", "run records are truncated");
@@ -198,19 +199,139 @@ export function decodeSceneDrawRuns(bytes: Uint8Array): VectorDrawRun[] {
   return drawRuns;
 }
 
+/** Repeated transparency wrappers often have consecutive paints with the same state. */
+export function encodeSceneDrawRunsForStorage(drawRuns: readonly VectorDrawRun[]): {
+  bytes: Uint8Array; groupedRuns: boolean
+} {
+  const legacy = encodeSceneDrawRuns(drawRuns);
+  const groups: Array<{ first: number; count: number }> = [];
+  for (let first = 0; first < drawRuns.length;) {
+    const run = drawRuns[first];
+    let end = first + 1;
+    while (end < drawRuns.length) {
+      const next = drawRuns[end], previous = drawRuns[end - 1];
+      if (next.kind !== run.kind || next.clipIndex !== run.clipIndex ||
+          next.optionalContent !== run.optionalContent || next.blendMode !== run.blendMode ||
+          next.first !== previous.first + previous.count) break;
+      end++;
+    }
+    groups.push({ first, count: end - first });
+    first = end;
+  }
+  const writer = new ByteWriter(drawRuns.length + groups.length * 4 + 16);
+  writer.writeVarUint32(drawRuns.length);
+  writer.writeVarUint32(groups.length);
+  const previousEnd = new Float64Array(DRAW_RUN_KINDS.length);
+  let previousClip = 0;
+  for (const group of groups) {
+    const run = drawRuns[group.first], kind = DRAW_RUN_KINDS.indexOf(run.kind);
+    const hasClip = run.clipIndex !== undefined, hasCondition = run.optionalContent !== undefined;
+    const implicit = run.first === previousEnd[kind];
+    writer.writeByte(kind | (hasClip ? 8 : 0) | (hasCondition ? 16 : 0) |
+      (run.blendMode === "Multiply" ? 32 : 0) | (implicit ? 64 : 0));
+    writer.writeVarUint32(group.count);
+    if (!implicit) writer.writeVarUint32(requireIndex(run.first, MAX_UINT32, "draw run", "first"));
+    if (hasClip) {
+      writer.writeZigzagVarint(run.clipIndex! - previousClip);
+      previousClip = run.clipIndex!;
+    }
+    if (hasCondition) writer.writeVarUint32(run.optionalContent!);
+    for (let index = group.first; index < group.first + group.count; index++) {
+      writer.writeVarUint32(requireIndex(drawRuns[index].count, MAX_UINT32, "draw run", "count"));
+    }
+    const last = drawRuns[group.first + group.count - 1];
+    previousEnd[kind] = last.first + last.count;
+  }
+  const bytes = writer.toUint8Array();
+  return bytes.length < legacy.length ? { bytes, groupedRuns: true } : { bytes: legacy, groupedRuns: false };
+}
+
+/** Shared state plus one count per canonical run; no paint is merged or reordered. */
+function decodeGroupedSceneDrawRuns(bytes: Uint8Array): VectorDrawRun[] {
+  const cursor = new VarintCursor(bytes);
+  const runCount = cursor.readVarUint32(), groupCount = cursor.readVarUint32();
+  if (groupCount > runCount || runCount + groupCount * 2 > bytes.length - cursor.byteOffset) {
+    fail("draw run", "grouped run records are truncated");
+  }
+  const previousEnd = new Float64Array(DRAW_RUN_KINDS.length);
+  let previousClip = 0;
+  const drawRuns: VectorDrawRun[] = [];
+  for (let group = 0; group < groupCount; group++) {
+    const flags = cursor.readByte("grouped draw run flags"), kind = DRAW_RUN_KINDS[flags & 7];
+    if (flags & 128) fail("draw run", "unsupported grouped flag bits");
+    if (!kind) fail("draw run", "unknown kind");
+    const count = cursor.readVarUint32();
+    if (count === 0 || count > runCount - drawRuns.length) fail("draw run", "invalid group length");
+    let first = flags & 64 ? previousEnd[flags & 7] : cursor.readVarUint32();
+    let clipIndex: number | undefined;
+    if (flags & 8) {
+      previousClip += cursor.readZigzagVarint();
+      clipIndex = requireIndex(previousClip, MAX_UINT32, "draw run", "clip index");
+    }
+    const optionalContent = flags & 16 ? cursor.readVarUint32() : undefined;
+    if (count > bytes.length - cursor.byteOffset) fail("draw run", "group counts are truncated");
+    for (let index = 0; index < count; index++) {
+      requireIndex(first, MAX_UINT32, "draw run", "first");
+      const run: VectorDrawRun = { kind, first, count: cursor.readVarUint32() };
+      if (clipIndex !== undefined) run.clipIndex = clipIndex;
+      if (optionalContent !== undefined) run.optionalContent = optionalContent;
+      if (flags & 32) run.blendMode = "Multiply";
+      drawRuns.push(run);
+      first += run.count;
+      if (first > MAX_UINT32 + 1) fail("draw run", "range end is out of range");
+    }
+    previousEnd[flags & 7] = first;
+  }
+  if (drawRuns.length !== runCount) fail("draw run", "group counts do not match run count");
+  cursor.expectEnd(SCENE_DRAW_RUNS_PATH);
+  return drawRuns;
+}
+
 /* ------------------------------------------------------------- paint graph */
 
 /**
  * A pre-order walk. Each node opens with a header byte: kind in bits 0-1, a
  * visibility-condition bit, then kind-specific flags. Draw leaves carry only a
  * delta-coded run index, which is the overwhelming majority of the graph;
- * groups spell out their compositing state in float32 because alpha, bounds
- * and transfer samples are not page coordinates.
+ * groups retain alpha and bounds as float64 and mask transfer samples as
+ * float32 because these values are not page coordinates.
  */
 export function encodeScenePaintGraph(graph: ScenePaintGraph): Uint8Array {
+  return encodePaintGraph(graph).bytes;
+}
+
+/**
+ * Losslessly compress consecutive singleton group wrappers. The group state
+ * is shared on disk only; readers restore each original group and draw node,
+ * keeping their boundaries available when appearances or visibility change.
+ */
+export function encodeScenePaintGraphForStorage(graph: ScenePaintGraph, drawRunCount: number): {
+  bytes: Uint8Array; repeatedGroups: boolean;
+} {
+  requireIndex(drawRunCount, MAX_UINT32, "paint graph", "source draw run count");
+  return encodePaintGraph(graph, drawRunCount);
+}
+
+type PaintGroup = Extract<ScenePaintNode, { kind: "group" }>;
+
+function samePaintGroupState(first: PaintGroup, second: PaintGroup): boolean {
+  if (!Object.is(first.alpha, second.alpha) || first.isolated !== second.isolated ||
+      first.knockout !== second.knockout || first.blendMode !== second.blendMode ||
+      first.optionalContent !== second.optionalContent || first.alphaIsShape !== second.alphaIsShape ||
+      !!first.bounds !== !!second.bounds) return false;
+  return !first.bounds || !!second.bounds &&
+    Object.is(first.bounds.minX, second.bounds.minX) && Object.is(first.bounds.minY, second.bounds.minY) &&
+    Object.is(first.bounds.maxX, second.bounds.maxX) && Object.is(first.bounds.maxY, second.bounds.maxY);
+}
+
+function encodePaintGraph(graph: ScenePaintGraph, drawRunCount?: number): {
+  bytes: Uint8Array; repeatedGroups: boolean;
+} {
   const writer = new ByteWriter(4096);
   const activeLists = new Set<readonly ScenePaintNode[]>();
   let previousRunIndex = 0;
+  let repeatedRunCount = 0;
+  let repeatedGroups = false;
   const writeBounds = (bounds: Bounds): void => {
     writer.writeFloat64(bounds.minX); writer.writeFloat64(bounds.minY);
     writer.writeFloat64(bounds.maxX); writer.writeFloat64(bounds.maxY);
@@ -228,11 +349,60 @@ export function encodeScenePaintGraph(graph: ScenePaintGraph): Uint8Array {
     if (mask.backdrop) for (const channel of mask.backdrop) writer.writeFloat64(channel);
     writeList(mask.children);
   };
+  const writeGroupState = (node: PaintGroup): void => {
+    const hasCondition = node.optionalContent !== undefined;
+    const blendMode = PDF_BLEND_MODES.indexOf(node.blendMode);
+    if (blendMode < 0) fail("paint graph", `unknown blend mode ${String(node.blendMode)}`);
+    writer.writeByte(PAINT_NODE_GROUP | (hasCondition ? 4 : 0) | (node.isolated ? 8 : 0) |
+      (node.knockout ? 16 : 0) | (node.bounds ? 32 : 0) | (node.softMask ? 64 : 0) |
+      (node.alphaIsShape !== undefined ? 128 : 0));
+    writer.writeByte(blendMode);
+    writer.writeFloat64(node.alpha);
+    if (node.alphaIsShape !== undefined) writer.writeByte(node.alphaIsShape ? 1 : 0);
+    if (hasCondition) writer.writeVarUint32(node.optionalContent!);
+    if (node.bounds) writeBounds(node.bounds);
+    if (node.softMask) writeMask(node.softMask);
+  };
+  const repeatLength = (list: readonly ScenePaintNode[], index: number): number => {
+    if (drawRunCount === undefined || drawRunCount - repeatedRunCount < 2) return 1;
+    const node = list[index];
+    if (node.kind !== "group" || node.softMask || node.children.length !== 1 ||
+        node.children[0].kind !== "draw") return 1;
+    const draw = node.children[0];
+    if (!Number.isSafeInteger(draw.runIndex) || draw.runIndex < 0 || draw.runIndex >= drawRunCount) return 1;
+    let count = 1;
+    const available = Math.min(drawRunCount - repeatedRunCount, drawRunCount - draw.runIndex);
+    while (count < available && index + count < list.length) {
+      const next = list[index + count];
+      if (next.kind !== "group" || next.softMask || next.children.length !== 1 ||
+          next.children[0].kind !== "draw" || !samePaintGroupState(node, next) ||
+          next.children[0].optionalContent !== draw.optionalContent ||
+          next.children[0].runIndex !== draw.runIndex + count) break;
+      count += 1;
+    }
+    return count;
+  };
   const writeList = (list: readonly ScenePaintNode[]): void => {
     if (activeLists.has(list)) fail("paint graph", "cyclic node lists");
     activeLists.add(list);
     writer.writeVarUint32(requireIndex(list.length, MAX_UINT32, "paint graph", "node count"));
-    for (const node of list) {
+    for (let index = 0; index < list.length; index += 1) {
+      const node = list[index];
+      const repeatCount = repeatLength(list, index);
+      if (repeatCount >= 2 && node.kind === "group" && node.children[0].kind === "draw") {
+        writer.writeByte(3);
+        writer.writeVarUint32(repeatCount);
+        writeGroupState(node);
+        const draw = node.children[0];
+        writer.writeByte(PAINT_NODE_DRAW | (draw.optionalContent !== undefined ? 4 : 0));
+        writer.writeZigzagVarint(draw.runIndex - previousRunIndex);
+        if (draw.optionalContent !== undefined) writer.writeVarUint32(draw.optionalContent);
+        previousRunIndex = draw.runIndex + repeatCount - 1;
+        repeatedRunCount += repeatCount;
+        repeatedGroups = true;
+        index += repeatCount - 1;
+        continue;
+      }
       const hasCondition = node.optionalContent !== undefined;
       if (node.kind === "draw") {
         writer.writeByte(PAINT_NODE_DRAW | (hasCondition ? 4 : 0));
@@ -247,29 +417,21 @@ export function encodeScenePaintGraph(graph: ScenePaintGraph): Uint8Array {
         writer.writeVarUint32(node.rasterIndex);
         if (hasCondition) writer.writeVarUint32(node.optionalContent!);
       } else {
-        const blendMode = PDF_BLEND_MODES.indexOf(node.blendMode);
-        if (blendMode < 0) fail("paint graph", `unknown blend mode ${String(node.blendMode)}`);
-        writer.writeByte(PAINT_NODE_GROUP | (hasCondition ? 4 : 0) | (node.isolated ? 8 : 0) |
-          (node.knockout ? 16 : 0) | (node.bounds ? 32 : 0) | (node.softMask ? 64 : 0) |
-          (node.alphaIsShape !== undefined ? 128 : 0));
-        writer.writeByte(blendMode);
-        writer.writeFloat64(node.alpha);
-        if (node.alphaIsShape !== undefined) writer.writeByte(node.alphaIsShape ? 1 : 0);
-        if (hasCondition) writer.writeVarUint32(node.optionalContent!);
-        if (node.bounds) writeBounds(node.bounds);
-        if (node.softMask) writeMask(node.softMask);
+        writeGroupState(node);
         writeList(node.children);
       }
     }
     activeLists.delete(list);
   };
   writeList(graph.roots);
-  return writer.toUint8Array();
+  return { bytes: writer.toUint8Array(), repeatedGroups };
 }
 
-export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
+export function decodeScenePaintGraph(bytes: Uint8Array, drawRunCount?: number): ScenePaintGraph {
+  if (drawRunCount !== undefined) requireIndex(drawRunCount, MAX_UINT32, "paint graph", "source draw run count");
   const cursor = new VarintCursor(bytes);
   let previousRunIndex = 0;
+  let repeatedRunCount = 0;
   const readBounds = (): Bounds => ({
     minX: cursor.readFloat64("paint bounds"), minY: cursor.readFloat64("paint bounds"),
     maxX: cursor.readFloat64("paint bounds"), maxY: cursor.readFloat64("paint bounds")
@@ -292,9 +454,25 @@ export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
     mask.children = readList();
     return mask;
   };
+  const readGroupState = (header: number): PaintGroup => {
+    const blendMode = PDF_BLEND_MODES[cursor.readByte("blend mode")];
+    if (!blendMode) fail("paint graph", "unknown blend mode");
+    const node: PaintGroup = {
+      kind: "group", children: [], alpha: cursor.readFloat64("group alpha"), isolated: (header & 8) !== 0,
+      knockout: (header & 16) !== 0, blendMode
+    };
+    if (header & 128) node.alphaIsShape = cursor.readByte("alpha is shape") !== 0;
+    if (header & 4) node.optionalContent = cursor.readVarUint32();
+    if (header & 32) node.bounds = readBounds();
+    if (header & 64) node.softMask = readMask();
+    return node;
+  };
   const readList = (): ScenePaintNode[] => {
     const length = cursor.readVarUint32();
-    if (length * 2 > bytes.length - cursor.byteOffset) fail("paint graph", "node records are truncated");
+    // Literal nodes need at least two bytes each. A v13 repeat may account for
+    // at most the remaining canonical draw runs without consuming those bytes.
+    const literalMinimum = drawRunCount === undefined ? length : Math.max(0, length - (drawRunCount - repeatedRunCount));
+    if (literalMinimum * 2 > bytes.length - cursor.byteOffset) fail("paint graph", "node records are truncated");
     const list: ScenePaintNode[] = [];
     for (let index = 0; index < length; index += 1) {
       const header = cursor.readByte("paint node header");
@@ -319,19 +497,40 @@ export function decodeScenePaintGraph(bytes: Uint8Array): ScenePaintGraph {
         if (condition) node.optionalContent = condition();
         list.push(node);
       } else if (kind === PAINT_NODE_GROUP) {
-        const blendMode = PDF_BLEND_MODES[cursor.readByte("blend mode")];
-        if (!blendMode) fail("paint graph", "unknown blend mode");
-        const alpha = cursor.readFloat64("group alpha");
-        const node: ScenePaintNode = {
-          kind: "group", children: [], alpha, isolated: (header & 8) !== 0,
-          knockout: (header & 16) !== 0, blendMode
-        };
-        if (header & 128) node.alphaIsShape = cursor.readByte("alpha is shape") !== 0;
-        if (condition) node.optionalContent = condition();
-        if (header & 32) node.bounds = readBounds();
-        if (header & 64) node.softMask = readMask();
+        const node = readGroupState(header);
         node.children = readList();
         list.push(node);
+      } else if (kind === 3 && drawRunCount !== undefined) {
+        if (header !== 3) fail("paint graph", "unsupported repeated group flag bits");
+        const repeatCount = cursor.readVarUint32();
+        if (repeatCount < 2 || repeatCount > length - index || repeatCount > drawRunCount - repeatedRunCount) {
+          fail("paint graph", "repeated group count exceeds its logical list or source draw runs");
+        }
+        const groupHeader = cursor.readByte("repeated group header");
+        if ((groupHeader & 3) !== PAINT_NODE_GROUP || groupHeader & 64) {
+          fail("paint graph", "repeated groups require an unmasked group state");
+        }
+        const group = readGroupState(groupHeader);
+        const drawHeader = cursor.readByte("repeated draw header");
+        if ((drawHeader & 3) !== PAINT_NODE_DRAW || drawHeader & 0xf8) {
+          fail("paint graph", "invalid repeated draw flags");
+        }
+        const first = previousRunIndex + cursor.readZigzagVarint();
+        if (first < 0 || first + repeatCount > drawRunCount) {
+          fail("paint graph", "repeated groups reference unknown source draw runs");
+        }
+        const drawCondition = drawHeader & 4 ? cursor.readVarUint32() : undefined;
+        if (cursor.byteOffset > bytes.length) fail("paint graph", "repeated draw data is truncated");
+        repeatedRunCount += repeatCount;
+        previousRunIndex = first + repeatCount - 1;
+        for (let offset = 0; offset < repeatCount; offset += 1) {
+          const draw: ScenePaintNode = { kind: "draw", runIndex: first + offset };
+          if (drawCondition !== undefined) draw.optionalContent = drawCondition;
+          const node: PaintGroup = { ...group, children: [draw] };
+          if (group.bounds) node.bounds = { ...group.bounds };
+          list.push(node);
+        }
+        index += repeatCount - 1;
       } else {
         fail("paint graph", "unknown node kind");
       }

@@ -75,6 +75,7 @@ import {
   PARSED_DATA_MONOCHROME_FORMAT_VERSION,
   PARSED_DATA_JBIG2_FORMAT_VERSION,
   PARSED_DATA_BINARY_FORMAT_VERSION,
+  PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
   readTexturePayloadAsFloat32,
   readNonNegativeInt,
   preparedStrokeGeometry,
@@ -475,9 +476,10 @@ async function loadSceneFromHepInternal(
   if (manifest.formatVersion !== PARSED_DATA_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_MONOCHROME_FORMAT_VERSION &&
       manifest.formatVersion !== PARSED_DATA_JBIG2_FORMAT_VERSION &&
-      manifest.formatVersion !== PARSED_DATA_BINARY_FORMAT_VERSION) {
+      manifest.formatVersion !== PARSED_DATA_BINARY_FORMAT_VERSION &&
+      manifest.formatVersion !== PARSED_DATA_GROUP_RUN_FORMAT_VERSION) {
     throw new Error(
-      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_BINARY_FORMAT_VERSION}. Re-export the HEP file with the current version.`
+      `HEP format v${String(manifest.formatVersion)} is not supported; expected v${PARSED_DATA_FORMAT_VERSION}–v${PARSED_DATA_GROUP_RUN_FORMAT_VERSION}. Re-export the HEP file with the current version.`
     );
   }
 
@@ -893,7 +895,8 @@ async function loadSceneFromHepInternal(
   if (sceneMeta.drawRuns !== undefined) {
     const meta = readSceneSectionDescriptor(sceneMeta.drawRuns, SCENE_DRAW_RUNS_PATH, "draw runs");
     const count = readSceneSectionCount(meta, "count", "draw runs");
-    scene.drawRuns = decodeSceneDrawRuns(await readSceneSectionBytes(archive, SCENE_DRAW_RUNS_PATH, signal));
+    const grouped = readSceneSectionEncoding(meta, "grouped-v1", manifest.formatVersion, "draw runs");
+    scene.drawRuns = decodeSceneDrawRuns(await readSceneSectionBytes(archive, SCENE_DRAW_RUNS_PATH, signal), grouped);
     if (scene.drawRuns.length !== count) throw new Error("Scene draw runs do not match their manifest entry.");
   }
   if (sceneMeta.optionalContent !== undefined) {
@@ -927,7 +930,9 @@ async function loadSceneFromHepInternal(
   if (sceneMeta.paintGraph !== undefined) {
     const meta = readSceneSectionDescriptor(sceneMeta.paintGraph, SCENE_PAINT_GRAPH_PATH, "paint graph");
     const rootCount = readSceneSectionCount(meta, "rootCount", "paint graph");
-    scene.paintGraph = decodeScenePaintGraph(await readSceneSectionBytes(archive, SCENE_PAINT_GRAPH_PATH, signal));
+    const repeated = readSceneSectionEncoding(meta, "group-runs-v1", manifest.formatVersion, "paint graph");
+    scene.paintGraph = decodeScenePaintGraph(await readSceneSectionBytes(archive, SCENE_PAINT_GRAPH_PATH, signal),
+      repeated ? scene.drawRuns?.length ?? 0 : undefined);
     if (scene.paintGraph.roots.length !== rootCount) {
       throw new Error("Scene paint graph does not match its manifest entry.");
     }
@@ -1533,6 +1538,16 @@ function readSceneSectionCount(
     throw new Error(`Invalid scene ${label} ${key}.`);
   }
   return count;
+}
+
+function readSceneSectionEncoding(descriptor: Record<string, unknown>, encoding: string,
+  formatVersion: number, label: string): boolean {
+  if (descriptor.encoding === undefined) return false;
+  if (descriptor.encoding !== encoding) throw new Error(`Unsupported scene ${label} encoding.`);
+  if (formatVersion < PARSED_DATA_GROUP_RUN_FORMAT_VERSION) {
+    throw new Error(`Scene ${label} encoding requires HEP v${PARSED_DATA_GROUP_RUN_FORMAT_VERSION}.`);
+  }
+  return true;
 }
 
 async function readSceneSectionBytes(

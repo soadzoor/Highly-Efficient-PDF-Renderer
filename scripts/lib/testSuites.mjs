@@ -31,6 +31,7 @@ export const fastTests = [
   "annotation-ui-interaction",
   "structure-content",
   "hep-scene-sections",
+  "hep-paint-group-compaction",
   "hep-monochrome-raster",
   "hep-jbig2-raster",
   "hep-binary-raster",

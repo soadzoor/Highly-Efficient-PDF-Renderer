@@ -15,7 +15,8 @@ import {
   SCENE_PAINT_GRAPH_PATH,
   encodeSceneClipPaths,
   encodeSceneDrawRuns,
-  encodeScenePaintGraph
+  encodeSceneDrawRunsForStorage,
+  encodeScenePaintGraphForStorage
 } from "./hepSceneSections";
 import { writeHepGradientMesh } from "./hepGradientMesh";
 import { HepArchive } from "./hepContainer";
@@ -61,6 +62,7 @@ import {
   PARSED_DATA_FORMAT_VERSION,
   PARSED_DATA_MONOCHROME_FORMAT_VERSION,
   PARSED_DATA_BINARY_FORMAT_VERSION,
+  PARSED_DATA_GROUP_RUN_FORMAT_VERSION,
   TEXT_INDEX_JSON_PATH,
   TEXT_CHAR_MAP_PATH,
   TEXT_FALLBACK_PATH,
@@ -191,17 +193,23 @@ export async function buildHepBlobForLayout(
     clipPathsManifest = { file: SCENE_CLIP_PATHS_PATH, count: scene.clipPaths.length,
       edgeCount: scene.clipPaths.reduce((total, clip) => total + clip.edges.length / 4, 0) };
   }
-  let drawRunsManifest: { file: string; count: number } | undefined;
+  const paintGraphExport = scene.paintGraph
+    ? encodeScenePaintGraphForStorage(scene.paintGraph, scene.drawRuns?.length ?? 0) : undefined;
+  let drawRunsManifest: { file: string; count: number; encoding?: "grouped-v1" } | undefined;
   if (scene.drawRuns) {
     throwIfBuildAborted(options.signal);
-    archive.file(SCENE_DRAW_RUNS_PATH, encodeSceneDrawRuns(scene.drawRuns));
-    drawRunsManifest = { file: SCENE_DRAW_RUNS_PATH, count: scene.drawRuns.length };
+    const encoded = paintGraphExport?.repeatedGroups ? encodeSceneDrawRunsForStorage(scene.drawRuns)
+      : { bytes: encodeSceneDrawRuns(scene.drawRuns), groupedRuns: false };
+    archive.file(SCENE_DRAW_RUNS_PATH, encoded.bytes);
+    drawRunsManifest = { file: SCENE_DRAW_RUNS_PATH, count: scene.drawRuns.length,
+      ...(encoded.groupedRuns ? { encoding: "grouped-v1" } : {}) };
   }
-  let paintGraphManifest: { file: string; rootCount: number } | undefined;
-  if (scene.paintGraph) {
+  let paintGraphManifest: { file: string; rootCount: number; encoding?: "group-runs-v1" } | undefined;
+  if (scene.paintGraph && paintGraphExport) {
     throwIfBuildAborted(options.signal);
-    archive.file(SCENE_PAINT_GRAPH_PATH, encodeScenePaintGraph(scene.paintGraph));
-    paintGraphManifest = { file: SCENE_PAINT_GRAPH_PATH, rootCount: scene.paintGraph.roots.length };
+    archive.file(SCENE_PAINT_GRAPH_PATH, paintGraphExport.bytes);
+    paintGraphManifest = { file: SCENE_PAINT_GRAPH_PATH, rootCount: scene.paintGraph.roots.length,
+      ...(paintGraphExport.repeatedGroups ? { encoding: "group-runs-v1" } : {}) };
   }
 
   const textInstancesExport = buildTextInstancesExport(scene);
@@ -236,7 +244,8 @@ export async function buildHepBlobForLayout(
   reportBuildProgress(hepBuildStart, { stage: "hep-build" });
 
   const manifest = {
-    formatVersion: rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
+    formatVersion: paintGraphExport?.repeatedGroups ? PARSED_DATA_GROUP_RUN_FORMAT_VERSION :
+      rasterLayersManifest?.binary ? PARSED_DATA_BINARY_FORMAT_VERSION :
       rasterLayers.some(layer => layer.monochrome)
       ? PARSED_DATA_MONOCHROME_FORMAT_VERSION : PARSED_DATA_FORMAT_VERSION,
     sourceFile: label,

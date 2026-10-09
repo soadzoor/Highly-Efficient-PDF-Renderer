@@ -51,6 +51,8 @@ export const PARSED_DATA_MONOCHROME_FORMAT_VERSION = 10;
 export const PARSED_DATA_JBIG2_FORMAT_VERSION = 11;
 /** Transposed binary run sections extend the otherwise unchanged v11 scene. */
 export const PARSED_DATA_BINARY_FORMAT_VERSION = 12;
+/** Lossless repeated transparency wrappers and their grouped paint metadata. */
+export const PARSED_DATA_GROUP_RUN_FORMAT_VERSION = 13;
 export const TEXT_INDEX_JSON_PATH = "text/text-index.json";
 export const TEXT_CHAR_MAP_PATH = "text/char-map.bin";
 export const TEXT_FALLBACK_PATH = "text/fallback-quads.d512";

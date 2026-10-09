@@ -1107,8 +1107,11 @@ detail; only missing full pages compile. Raster/OCR previews are replaced by
 complete content. Text-only views without an active session extract the original
 PDF once. Full extraction leaves the viewing window
 unchanged, and does not add a permanent second document to the viewing cache.
-These exports use scene v10 (plain packed) or v12 (binary runs); other scenes
-still use v9. The current loader accepts v9–v12, including older JBIG2 HEPs,
+These exports use scene v10 (plain packed) or v12 (binary runs). Scene v13
+optionally encodes repeated transparency wrappers and matching draw-run metadata
+losslessly, preserving their group boundaries and paint order. Exports use v13
+when repeated wrappers can share storage; other scenes retain v9–v12. The current
+loader accepts v9–v13, including older JBIG2 HEPs,
 which use the fast packed encoding when re-exported.
 
 PDF-source builds measure the original PDF automatically. Scenes loaded through

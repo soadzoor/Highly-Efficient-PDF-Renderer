@@ -1065,7 +1065,10 @@ The builder accepts `signal` and `onProgress`, including LOD building, raster en
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP containers v1 and v2 with scene schemas v9–v12. New exports
+The loader supports HEP containers v1 and v2 with scene schemas v9–v13. Scene v13
+stores repeated transparency wrappers and matching draw-run metadata compactly,
+preserving the original group boundaries and paint order exactly. Exports use it
+when repeated wrappers can share storage. New exports
 use v2 only when an exact stroke-style palette makes the file smaller; these
 files require an updated viewer. Existing v1 files remain supported. The palette
 changes no rendering values; optional LOD caches are separate sections. Earlier scene schemas

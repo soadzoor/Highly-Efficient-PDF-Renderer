@@ -1,13 +1,14 @@
 # HEP container versions 1 and 2
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1** and **2** wrap **scene schema versions 9–12**, recorded in
+versions **1** and **2** wrap **scene schema versions 9–13**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support both container versions and scene v9–v12; files using older
+Readers support both container versions and scene v9–v13; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
-v12 for transposed binary runs, v10 for plain packed monochrome rasters,
-otherwise v9. Legacy v11 JBIG2 streams remain readable. Readers need support for
+v13 when repeated paint-group metadata is compacted, v12 for transposed binary
+runs, v10 for plain packed monochrome rasters, otherwise v9. Legacy v11 JBIG2
+streams remain readable. Readers need support for
 the scene version used by the file. Container repacking preserves section bytes
 and does not upgrade a scene or restore omitted layers.
 
@@ -202,9 +203,9 @@ decimal text.
 | Field | Descriptor | Section |
 | --- | --- | --- |
 | `clipPaths` | `{file, count, edgeCount}` | `geometry/clip-paths.d512` |
-| `drawRuns` | `{file, count}` | `geometry/draw-runs.varint` |
-| `paintGraph` | `{file, rootCount}` | `geometry/paint-graph.varint` |
-| `rasterLayers` (v9–v12) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
+| `drawRuns` | `{file, count, encoding?}` | `geometry/draw-runs.varint` |
+| `paintGraph` | `{file, rootCount, encoding?}` | `geometry/paint-graph.varint` |
+| `rasterLayers` (v9–v13) | `{file, count, atlasCount}` | `geometry/raster-layers.varint` |
 
 Every integer is an unsigned LEB128 varint unless described as zigzag, which is
 the signed mapping. `geometry/clip-paths.d512` holds `pathCount`, then per path
@@ -229,6 +230,47 @@ raster slot. A group uses bits 3-7 for isolated, knockout, bounds, soft mask and
 before its children. Group alpha, bounds and mask backdrop are float64 because a
 scene holds them at full precision; mask transfer samples are float32 because
 they are already a `Float32Array`.
+
+Scene v13 optionally compacts repeated singleton paint groups without changing
+the canonical graph or its group boundaries. Its paint-graph descriptor carries
+`encoding: "group-runs-v1"`. In addition to the ordinary nodes above, node header
+`3` introduces a repeated group record: a varint repeat count of at least two,
+an ordinary group header and state without a children list, then one ordinary
+draw header, a zigzag first-run delta and an optional draw condition. It expands
+to separate singleton groups referencing consecutive draw runs. The preceding
+run index advances to the last expanded run, and the enclosing list length
+counts the expanded nodes. Group state includes alpha, blend mode, isolation,
+knockout, bounds, visibility and the presence/value of `alphaIsShape`; the draw
+condition must also match. Exact state equality includes signed zero. Masks,
+empty groups and nonconsecutive run references retain their ordinary records.
+Each expanded group, child list, draw and bounds object is independent.
+
+The decoder requires the canonical draw-run count to interpret a repeated group
+record. Each repeated range must fit that count and its enclosing logical list;
+the total expanded repeated groups must also fit the source run count. This
+validates expansion against document data before allocating reconstructed nodes.
+Repeated records cannot contain masks. Existing scene schemas use only the
+ordinary codec, and unknown encoding descriptors are rejected.
+
+For v13 exports with repeated groups, the writer also selects a smaller draw-run
+representation when useful. Its descriptor carries `encoding: "grouped-v1"`.
+The section starts with the expanded run count and group count. Each group stores
+a flags byte using the same kind, clip, visibility and Multiply bits as the
+ordinary codec, plus bit 6 when its first index is the preceding end index for
+that kind (initially zero); bit 7 is invalid. The flags are followed by a varint
+group length, an absolute first index if bit 6 is absent, an optional zigzag clip
+delta (initially zero), an optional visibility index, and one varint primitive
+count per expanded run. Adjacent runs share a group only when kind, clipping,
+visibility and blend state match and their primitive ranges are consecutive.
+The decoder preserves every original run and validates counts and index ranges.
+An ordinary draw-run section remains valid in v13 when grouping is not smaller.
+
+These encodings reduce decompressed metadata substantially for PDFs that repeat
+one transparency wrapper per stroke. Compressed file-size savings are more
+moderate because deflate already handles identical group state well; grouping
+draw-run metadata removes additional redundancy. The stored graph retains the
+original groups, so recoloring, layer visibility and color-dependent render
+batching continue to use the complete canonical paint order.
 
 ### Raster layers and atlases
 
