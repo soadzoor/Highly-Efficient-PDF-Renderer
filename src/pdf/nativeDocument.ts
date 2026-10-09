@@ -769,7 +769,7 @@ export class NativePdfDocument {
     this.repairedMissingStreamEndEols.add(identity);
     this.diagnostics.push({
       code: "object.stream-end-eol-repaired",
-      severity: "warning",
+      severity: "info",
       message: "Structural repair accepted an exact stream boundary without its required end-of-line marker.",
       offset,
       objectNumber,

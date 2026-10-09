@@ -404,8 +404,11 @@ async function testMissingStreamEndEolRepair() {
       diagnostics.map(({ code }) => code),
       ["object.stream-end-eol-repaired"]
     );
+    assert.equal(diagnostics[0].severity, "info", "exact stream framing normalization is informational");
     assert.equal(diagnostics[0].objectNumber, 4);
     assert.equal(diagnostics[0].details?.reason, "missing-stream-end-eol");
+    assert.deepEqual(await repaired.getDecodedPageContents(0), [content]);
+    assert.equal(repaired.getDiagnostics().length, 1, "repeated stream resolution does not repeat the diagnostic");
   } finally {
     await repaired.close();
   }
