@@ -23,19 +23,30 @@ try {
     get data() { throw Error("preparation must not materialize packed RGBA"); } });
   for (const source of [color(137, 71), binary(137, 71)]) {
     const canonical = (source.monochrome?.data ?? source.data).slice();
-    for (const scale of [1, .37]) {
-      const plan = planRasterTiles(source.width, source.height, 31, scale);
+    for (const maxTextureSize of [256, 31]) {
+      const plan = planRasterTiles(source.width, source.height, maxTextureSize);
       const sync = buildPreparedRasterPixels(source, plan), async = await buildPreparedRasterPixelsAsync(source, plan);
       assert.deepEqual(async, sync, "cooperative and worker algorithms retain exact tile and mip bytes");
     }
     assert.deepEqual(source.monochrome?.data ?? source.data, canonical);
   }
-  let ticks = 0;
-  const timer = setInterval(() => ticks++, 0);
-  const big = binary(1025, 1027);
-  await buildPreparedRasterPixelsAsync(big, planRasterTiles(big.width, big.height, 256, .03125));
-  clearInterval(timer);
-  assert(ticks > 0, "fallback preparation yields even for extreme downscaling");
+  {
+    const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, "performance");
+    let clockCalls = 0, ticked = false;
+    const timer = setTimeout(() => { ticked = true; }, 0);
+    try {
+      // Exhaust the first time slice regardless of machine speed, then hold the clock steady.
+      Object.defineProperty(globalThis, "performance", { configurable: true,
+        value: { now: () => clockCalls++ === 0 ? 0 : 5 } });
+      const big = binary(1025, 1027), plan = planRasterTiles(big.width, big.height, 32);
+      assert.deepEqual(await buildPreparedRasterPixelsAsync(big, plan), buildPreparedRasterPixels(big, plan));
+      assert(ticked, "fallback preparation yields even for extreme downscaling");
+    } finally {
+      clearTimeout(timer);
+      if (performanceDescriptor) Object.defineProperty(globalThis, "performance", performanceDescriptor);
+      else delete globalThis.performance;
+    }
+  }
 
   // The LRU distinguishes texture formats, placements and monochrome palettes.
   const released = [], cache = new RasterResourceCache(resource => released.push(resource));

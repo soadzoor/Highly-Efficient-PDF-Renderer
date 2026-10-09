@@ -20,7 +20,7 @@ import type { Bounds, SceneTextIndex, VectorScene } from "./pdfVectorExtractor";
 import type { ScenePaintGroup, ScenePaintNode } from "./scenePaintGraph";
 import { buildNativeFallbackTextIndex } from "./pdf/nativeRasterPage";
 import { NativeTextClipTester } from "./pdf/nativeTextClip";
-import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips, vectorPaintReachesPageEdge } from "./pdf/nativeVectorClips";
+import { imageLeavesPage, NativeVectorClipBuilder, pageRootedVectorClips, rectangleVectorClip, vectorPaintReachesPageEdge } from "./pdf/nativeVectorClips";
 import { emitCubicAsQuadratics, VectorPageTextIndexBuilder } from "./pdf/nativeVectorPage";
 import { buildNativeGlyphStroke, buildNativeGlyphStrokeAtOrigin, nativeGlyphStrokeCacheKey, type NativeGlyphStrokeStyle } from "./pdf/nativeGlyphStroke";
 import { buildNativeGlyphHairline } from "./pdf/nativeGlyphHairline";
@@ -428,6 +428,22 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
       const [x0, y0, x1, y1] = scope.bounds;
       result = { parent, fillRule: 0, path: { data: new Float32Array([0, x0, y0, 1, x1, y0, 1, x1, y1, 1, x0, y1, 4]), transform: [...scope.outerTransform],
         bounds: { minX: x0, minY: y0, maxX: x1, maxY: y1 } } };
+      const [a, b, c, d] = scope.outerTransform;
+      if ((b === 0 && c === 0) || (a === 0 && d === 0)) {
+        const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(([x, y]) => point(scope.outerTransform, x, y));
+        if (corners.every(corner => corner.every(Number.isFinite)) &&
+            corners.some(corner => corner.some(value => !Number.isFinite(Math.fround(value))))) {
+          // A finite cell/Form matrix can send its bounding rectangle beyond
+          // Float32 range. An axis-aligned rectangle intersects the page exactly,
+          // so bound that clip before storing its transformed edge coordinates.
+          const bounds = { minX: Math.max(scene.pageBounds.minX, Math.min(...corners.map(p => p[0]))),
+            minY: Math.max(scene.pageBounds.minY, Math.min(...corners.map(p => p[1]))),
+            maxX: Math.min(scene.pageBounds.maxX, Math.max(...corners.map(p => p[0]))),
+            maxY: Math.min(scene.pageBounds.maxY, Math.max(...corners.map(p => p[1]))) };
+          result = rectangleVectorClip(bounds.maxX >= bounds.minX && bounds.maxY >= bounds.minY
+            ? bounds : { minX: 0, minY: 0, maxX: 0, maxY: 0 }, [...IDENTITY], parent);
+        }
+      }
     }
     if (result) clipCache.set(scope, result); return result;
   };

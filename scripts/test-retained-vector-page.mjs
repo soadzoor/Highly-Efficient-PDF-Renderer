@@ -381,8 +381,38 @@ try {
       for (const key of ["fillPathMetaA", "fillPathMetaB", "fillPathMetaC", "fillSegmentsA", "fillSegmentsB"]) {
         assert.ok(scene[key].every(Number.isFinite), `${key}: overflowing cells emit no non-finite geometry`);
       }
+      assert.ok(scene.clipPaths.every(clip => clip.edges.every(Number.isFinite)),
+        "finite cell matrices also retain finite program bounding clips");
+      validateVectorDrawRuns(scene);
       assert.deepEqual(diagnostics.map(({ code, details }) => [code, details.cellCount]), [["pattern.cell-transform-overflow", 84]]);
     } finally { await session.close(); }
+  }
+  {
+    // Each matrix stays finite, while its transformed Form BBox exceeds the
+    // Float32 clip store. Its exact intersection with the page stays finite.
+    const huge = `1${"0".repeat(20)}.0`, tiny = `0.${"0".repeat(18)}1`;
+    for (const [name, bbox, matrix, paint, expected] of [
+      ["scaled", `-${huge} -${huge} ${huge} ${huge}`, `${huge} 0 0 ${huge} 0 0`, `0 0 ${tiny} ${tiny} re f`, [0, 0, 10, 10]],
+      ["rotated", `-${huge} -${huge} ${huge} ${huge}`, `0 ${huge} -${huge} 0 20 0`, `0 0 ${tiny} ${tiny} re f`, [10, 0, 20, 10]],
+      ["reflected partial clip", `-${huge} 0 0 ${huge}`, `-${huge} 0 0 ${huge} 50 0`, `-${tiny} 0 ${tiny} ${tiny} re f`, [50, 0, 60, 10]]
+    ]) {
+      const { scene, page } = await compile(fixture("/Fm Do", "/XObject << /Fm 5 0 R >>", [
+        { number: 5, body: tinyPdfStream(`/Type /XObject /Subtype /Form /BBox [${bbox}] /Matrix [${matrix}] /Resources << >>`, paint) }
+      ]));
+      assert.equal(scene.fillPathCount, 1, `${name}: paint stays vector`);
+      assert.ok(scene.clipPaths.every(clip => clip.edges.every(Number.isFinite)), `${name}: clip coordinates stay finite`);
+      const bounds = getScenePrimitive(scene, { kind: "fill", index: 0 }).bounds;
+      for (const [index, key] of ["minX", "minY", "maxX", "maxY"].entries()) {
+        assert.ok(Math.abs(bounds[key] - expected[index]) < 1e-4, `${name}: ${key} preserves the transformed paint`);
+      }
+      const clip = scene.clipPaths[scene.drawRuns[0].clipIndex];
+      assert.equal(Math.min(...clip.edges.filter((_, index) => index % 2 === 0)), name === "reflected partial clip" ? 50 : 0);
+      assert.equal(Math.max(...clip.edges), 100, `${name}: the exact clip is bounded by the page`);
+      await assert.rejects(lowerRetainedPageToVectorScene(page, { signal: AbortSignal.abort() }),
+        { name: "AbortError" }, `${name}: cancellation still propagates`);
+      await assert.rejects(lowerRetainedPageToVectorScene(page, { signal: new AbortController().signal, maxPrimitives: 0 }),
+        error => error.code === "resource-limit", `${name}: geometry limits still propagate`);
+    }
   }
   {
     const { buildTinySfnt } = await import("./lib/tinySfnt.mjs");
