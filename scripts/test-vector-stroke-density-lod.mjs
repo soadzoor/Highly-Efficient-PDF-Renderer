@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(s, c, n) {
   return n(c.parentURL?.includes("/src/") && /^\.\.?\//.test(s) && !/\.[a-z0-9]+$/i.test(s) ? s + ".ts" : s, c);
 } });
 const [{ createEmptyVectorScene }, { buildVectorStrokeLodScenes, buildRuntimeTileBuckets, VectorStrokeLodRuntime, prebuildVectorStrokeLodRuntime },
-  { strokePaintOrigins }, { pdfShapeCoverageWgsl }, { CORE_STROKE_FRAGMENT_SHADER_SOURCE }] = await Promise.all([
+  { strokePaintOrigins, strokePaintGroups, strokeLodOverviewAllowed }, { pdfShapeCoverageWgsl }, { CORE_STROKE_FRAGMENT_SHADER_SOURCE }] = await Promise.all([
   import("../src/emptyVectorScene.ts"), import("../src/vectorStrokeLodCore.ts"),
   import("../src/vectorStrokePaintOrder.ts"), import("../src/pdfShapeCoverage.ts"), import("../src/coreShaders.ts")
 ]);
@@ -220,6 +220,87 @@ function paintCenter(scene) {
       scene.styles[a + 1 + channel] * alpha + color[channel] * (1 - alpha);
   }
   return color;
+}
+
+// Technical drawings often wrap every opaque stroke in its own Darken group.
+// Once their sources share a surface, LOD can combine equivalent adjacent
+// paints while preserving all the canonical clip and visibility boundaries.
+const fragmented = makeScene(Array.from({ length: 32 }, () => mark()));
+fragmented.drawRuns = Array.from({ length: 32 }, (_, first) => ({ kind: "stroke", first, count: 1 }));
+fragmented.paintGraph = { roots: fragmented.drawRuns.map((_run, runIndex) => ({ kind: "group",
+  alpha: 1, isolated: false, knockout: false, blendMode: "Darken", children: [{ kind: "draw", runIndex }] })) };
+const fragmentedSnapshot = structuredClone(fragmented);
+assert(strokeLodOverviewAllowed(fragmented), "normalized isolated Darken sources allow budget approximations");
+assert.deepEqual([...strokePaintGroups(fragmented)], Array(32).fill(0),
+  "equivalent singleton paints share one normalized source span");
+assert.deepEqual([...strokePaintGroups(fragmented, false)], Array.from({ length: 32 }, (_, index) => index),
+  "fine interval groups retain independent paint-operation boundaries");
+const ungrouped = structuredClone(fragmented); delete ungrouped.paintGraph;
+assert.deepEqual([...strokePaintGroups(ungrouped)], Array.from({ length: 32 }, (_, index) => index),
+  "custom scenes without a graph retain their existing paint-operation boundaries");
+const barriers = [
+  scene => { for (const run of scene.drawRuns.slice(16)) run.clipIndex = 0; },
+  scene => { for (const run of scene.drawRuns.slice(16)) run.optionalContent = 0; },
+  scene => { for (const run of scene.drawRuns.slice(16)) run.pdfRepresentation = { pageIndex: 0, detail: true }; },
+  scene => { for (const node of scene.paintGraph.roots.slice(16)) node.optionalContent = 0; },
+  scene => { for (const node of scene.paintGraph.roots.slice(16)) node.children[0].optionalContent = 0; },
+  scene => { for (let id = 16; id < 32; id++) scene.primitiveMeta[id * 4 + 3] = 7; },
+  scene => { for (let id = 16; id < 32; id++) scene.primitiveMeta[id * 4 + 3] = 4.5; },
+  scene => { for (let id = 16; id < 32; id++) scene.styles[id * 4 + 1] = .00001; },
+  scene => {
+    scene.drawRuns.splice(16, 0, { kind: "fill", first: 0, count: 1 });
+    for (const node of scene.paintGraph.roots.slice(16)) node.children[0].runIndex++;
+    scene.paintGraph.roots.splice(16, 0, { kind: "draw", runIndex: 16 });
+  }
+];
+for (const insertBarrier of barriers) {
+  const scene = structuredClone(fragmented); insertBarrier(scene);
+  const groups = strokePaintGroups(scene);
+  assert.notEqual(groups[15], groups[16], "run clips, layers, representations, paint kinds, flags and exact RGB remain barriers");
+}
+const reordered = structuredClone(fragmented);
+reordered.paintGraph.roots.reverse();
+assert.equal(strokeLodOverviewAllowed(reordered), false, "reordered graph runs retain conservative LOD");
+assert.deepEqual([...strokePaintGroups(reordered)], Array.from({ length: 32 }, (_, index) => index),
+  "canonical neighbours cannot merge through a reordered paint graph");
+for (const change of [{ alpha: .5 }, { knockout: true }, { blendMode: "Multiply" },
+  { softMask: { subtype: "Alpha", children: [] } }]) {
+  const scene = structuredClone(fragmented);
+  Object.assign(scene.paintGraph.roots[0], change);
+  assert.equal(strokeLodOverviewAllowed(scene), false, "masks, opacity, knockout and other blends retain conservative LOD");
+}
+const runBlend = structuredClone(fragmented); runBlend.drawRuns[0].blendMode = "Multiply";
+assert.equal(strokeLodOverviewAllowed(runBlend), false, "object blending still excludes budget approximations");
+const fragmentedLevel = buildVectorStrokeLodScenes(fragmented)[1].scene;
+assert.equal(fragmentedLevel.segmentCount, 1, "equivalent Darken sources retain density aggregation");
+assert.equal(weights(fragmentedLevel)[0], fragmented.segmentCount, "Darken density aggregation keeps source-over multiplicity");
+assert.deepEqual(fragmented, fragmentedSnapshot, "LOD metadata leaves canonical paint origins and geometry unchanged");
+
+// Interval union does not retain the AA multiplicity of long strokes. Fine
+// levels keep independent coincident and partially overlapping paints intact,
+// while neighboring repeated dots still use coverage-weighted aggregation.
+for (const partialOverlap of [false, true]) {
+  const marks = [
+    ...Array.from({ length: 32 }, (_, id) => mark(partialOverlap && id % 2 ? 5 : 0, 0,
+      { x1: partialOverlap && id % 2 ? 15 : 10 })),
+    ...Array.from({ length: 32 }, () => mark())
+  ];
+  const scene = makeScene(marks);
+  scene.bounds = { minX: -2, minY: -2, maxX: 17, maxY: 2 };
+  scene.drawRuns = marks.map((_mark, first) => ({ kind: "stroke", first, count: 1 }));
+  scene.paintGraph = { roots: scene.drawRuns.map((_run, runIndex) => ({ kind: "group", alpha: 1,
+    isolated: true, knockout: false, blendMode: "Darken", children: [{ kind: "draw", runIndex }] })) };
+  const before = snapshot(scene), levels = buildVectorStrokeLodScenes(scene);
+  const fine = levels.find(level => level.tolerance === .5 && !level.overview);
+  assert(fine, "weighted dots retain an actual fine LOD beside long overlapping strokes");
+  assert.equal(fine.scene.segmentCount, 33, "fine LOD preserves 32 independent long paints and one weighted dot");
+  assert.equal(weights(fine.scene).reduce((sum, count) => sum + count, 0), marks.length,
+    "fine LOD retains every source paint's coverage multiplicity");
+  for (const units of [.4, 1, 4]) for (const x of [2, 8, 12]) for (const y of [-.2, .2, .6]) {
+    assert(Math.abs(sample(scene, x, y, units) - sample(fine.scene, x, y, units)) < 3e-13,
+      "coincident and partial-overlap AA coverage survives fine simplification");
+  }
+  assert.deepEqual(snapshot(scene), before);
 }
 
 for (const change of [ { alpha: .5 }, { knockout: true }, { blendMode: "Multiply" },

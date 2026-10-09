@@ -2558,7 +2558,6 @@ export class WebGpuFloorplanRenderer {
     validateVectorDrawRuns(scene);
     this.scenePaintVisibility = new ScenePaintVisibility(scene);
     this.scenePaintVisibility.setVisibility(this.optionalContentVisibility);
-    this.orderedRunCuller = scene.drawRuns ? new VectorDrawRunCuller(scene) : null;
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
@@ -4036,7 +4035,8 @@ export class WebGpuFloorplanRenderer {
         () => { this.frameDrawCalls += 1; });
       const parentPass = pass;
       try {
-        const segments = scenePaintSpanSegments(this.scene!);
+        const colorBatchingEnabled = plan?.colorBatchingEnabled ?? false;
+        const segments = scenePaintSpanSegments(this.scene!, colorBatchingEnabled);
         this.paintCompositor.render(this.scene!, parentPass, this.paintViewportWidth, this.paintViewportHeight,
           (spanRuns, target, shapeOnly) => {
             pass = shapeOnly ? new Proxy(target, { get: (object, key) => key === "setPipeline"
@@ -4065,7 +4065,7 @@ export class WebGpuFloorplanRenderer {
               pass = target;
               try { draw(run); } finally { this.paintFolds?.end(); }
             }
-          });
+          }, colorBatchingEnabled);
       } finally { pass = parentPass; this.vectorClipIndex = -1; }
       return strokes;
     }
@@ -4514,6 +4514,8 @@ export class WebGpuFloorplanRenderer {
     this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+    this.orderedRunCuller = this.orderedBatches?.createRunCuller() ?? null;
+    if (this.orderedTextLod) this.orderedRunCuller?.includeTextLod(this.orderedTextLod.data);
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
       !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));
     this.orderedInstanceBuffer?.destroy();

@@ -3195,7 +3195,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
           materialLayerViewport.width, materialLayerViewport.height,
           condition => this.layerVisibility.isVisible(condition),
           bounds => projectThreePdfCompositeBounds(bounds, this.clipFromDataMatrix, materialLayerViewport.width, materialLayerViewport.height, this.rendererType),
-          this.clipFromDataMatrix, this.layerVisibility.revision);
+          this.clipFromDataMatrix, this.layerVisibility.revision, this.drawPlan?.colorBatchingEnabled ?? true);
       }
     } else if (this.paintCompositor) this.paintCompositor.mesh.visible = false;
   }

@@ -207,6 +207,56 @@ try {
   assert.equal(new ThreeVectorDrawPlan(reversed).update(0.01), false,
     "an arbitrary graph visiting source paints backwards keeps its graph order");
 
+  // CAD exports wrap each stroke in Darken even when thousands share RGB.
+  // Their merged effect span must batch before any camera reorders its paints.
+  const darkened = createInterleavedScene();
+  darkened.drawRuns = Array.from({ length: darkened.segmentCount }, (_, first) =>
+    ({ kind: "stroke", first, count: 1, clipIndex: first % 2 }));
+  darkened.paintGraph = { roots: darkened.drawRuns.map((_run, runIndex) => ({
+    kind: "group", isolated: false, knockout: false, alpha: 1, blendMode: "Darken",
+    children: [{ kind: "draw", runIndex }]
+  })) };
+  const darkPlan = new ThreeVectorDrawPlan(darkened);
+  const darkLayer = createLayer(darkened, "stroke", "aSegmentIndex", darkened.segmentCount, darkPlan);
+  assert.equal(darkPlan.version, 0);
+  assert.equal(darkLayer.mesh.children.length, 1, "a canonical Darken span shares one instanced mesh across clip roots");
+  assert.equal(darkLayer.mesh.children[0].geometry.instanceCount, darkened.segmentCount);
+  assert.deepEqual(Array.from(darkLayer.mesh.children[0].geometry.getAttribute("aVectorClipIndex").array),
+    darkened.drawRuns.map(run => run.clipIndex + 1));
+  darkPlan.setColorCommutationEnabled(false);
+  refresh(darkLayer);
+  assert.equal(darkLayer.mesh.children.length, darkened.segmentCount,
+    "primitive recoloring restores individual Darken effects even without a change in paint order");
+  darkPlan.setColorCommutationEnabled(true);
+  refresh(darkLayer);
+  assert.equal(darkLayer.mesh.children.length, 1, "restoring source colors restores batching");
+  const alternate = { ...darkened, styles: darkened.styles.slice() };
+  alternate.styles[1] = 1;
+  darkPlan.setStrokeSource({ count: darkened.segmentCount, segments: [{ first: 0, count: darkened.segmentCount, scene: alternate }] },
+    Uint32Array.from({ length: darkened.segmentCount }, (_value, index) => index));
+  refresh(darkLayer);
+  assert.equal(darkPlan.colorBatchingEnabled, false);
+  assert.equal(darkLayer.mesh.children.length, darkened.segmentCount,
+    "dormant LOD colors that differ from their origins invalidate the group color proof");
+  darkLayer.runs.dispose(); darkLayer.clipTexture.dispose();
+  const backwardsDarkened = { ...darkened, paintGraph: { roots: [...darkened.paintGraph.roots].reverse() } };
+  const backwardsLayer = createLayer(backwardsDarkened, "stroke", "aSegmentIndex", darkened.segmentCount,
+    new ThreeVectorDrawPlan(backwardsDarkened));
+  assert.equal(backwardsLayer.mesh.children.length, darkened.segmentCount,
+    "a reversed public graph cannot batch through a canonical effect span");
+  backwardsLayer.runs.dispose(); backwardsLayer.clipTexture.dispose();
+
+  const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
+  const nativePlan = new VectorOrderedBatches(darkened, null);
+  nativePlan.update(darkened.drawRuns, null);
+  assert.equal(nativePlan.batches.length, 1);
+  nativePlan.setColorCommutationEnabled(false);
+  nativePlan.update(darkened.drawRuns, null);
+  assert.equal(nativePlan.batches.length, darkened.segmentCount);
+  nativePlan.setColorCommutationEnabled(true);
+  nativePlan.update(darkened.drawRuns, null);
+  assert.equal(nativePlan.batches.length, 1, "native spans also follow the primitive color proof");
+
   function createLayer(sceneData, kind, attribute, count, drawPlan) {
     const geometry = new THREE.InstancedBufferGeometry();
     geometry.setAttribute("aCorner", new THREE.Float32BufferAttribute([-1, -1, 1, -1, 1, 1, -1, 1], 2));

@@ -30,6 +30,7 @@ export class ThreeScenePaintPlan {
   private width = 0;
   private height = 0;
   private blendsPasses: boolean | undefined;
+  private colorBatchingEnabled: boolean | undefined;
   private selected: Uint8Array | null = null;
   /** Whether the last execution reused its graph operations. */
   reused = false;
@@ -38,16 +39,17 @@ export class ThreeScenePaintPlan {
 
   execute<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAdapter<Surface>, backdrop: Surface,
     visible: (condition?: number) => boolean, selected: Uint8Array | null,
-    revision: number | undefined, structure: number, width: number, height: number): Surface {
+    revision: number | undefined, structure: number, width: number, height: number,
+    colorBatchingEnabled = true): Surface {
     // Callers without an explicit visibility revision keep the ordinary path.
     // A callback's identity cannot identify its mutable visibility state.
     if (revision === undefined || (globalThis as { HEPR_DEBUG_COMPOSITE_STATS?: boolean }).HEPR_DEBUG_COMPOSITE_STATS) {
       this.clear();
-      return compositeScenePaintGraph(scene, adapter, backdrop, visible, selected, true);
+      return compositeScenePaintGraph(scene, adapter, backdrop, visible, selected, true, colorBatchingEnabled);
     }
     const compatible = this.plan && this.scene === scene && this.roots === scene.paintGraph && this.runs === scene.drawRuns &&
       this.revision === revision && this.structure === structure && this.width === width && this.height === height &&
-      this.blendsPasses === adapter.blendsPasses &&
+      this.blendsPasses === adapter.blendsPasses && this.colorBatchingEnabled === colorBatchingEnabled &&
       sameSelection(this.selected, selected) && this.plan.capabilities.every(capability =>
         (capability.maskRun ? adapter.canFoldMaskPaint?.(capability.run, capability.maskRun) : adapter.canFold?.(capability.run)) ===
           capability.accepted);
@@ -55,10 +57,11 @@ export class ThreeScenePaintPlan {
     if (!compatible) {
       // Commit only a completely built plan; a failed graph must not remain cached.
       this.plan = null;
-      const plan = recordPlan(scene, adapter, visible, selected);
+      const plan = recordPlan(scene, adapter, visible, selected, colorBatchingEnabled);
       this.scene = scene; this.roots = scene.paintGraph; this.runs = scene.drawRuns;
       this.revision = revision; this.structure = structure; this.width = width; this.height = height;
       this.blendsPasses = adapter.blendsPasses;
+      this.colorBatchingEnabled = colorBatchingEnabled;
       this.selected = selected?.slice() ?? null;
       this.plan = plan;
     }
@@ -78,7 +81,7 @@ function sameSelection(previous: Uint8Array | null, selected: Uint8Array | null)
 }
 
 function recordPlan<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAdapter<Surface>,
-  visible: (condition?: number) => boolean, selected: Uint8Array | null): Plan {
+  visible: (condition?: number) => boolean, selected: Uint8Array | null, colorBatchingEnabled: boolean): Plan {
   const operations: Operation[] = [], capabilities: Capability[] = [];
   let nextSurface = 0;
   const recording: ScenePaintCompositorAdapter<number> = {
@@ -100,7 +103,7 @@ function recordPlan<Surface>(scene: VectorScene, adapter: ScenePaintCompositorAd
       operations.push({ kind: "fold", run, destination, opacity, mask, content, maskRun });
     })
   };
-  const result = compositeScenePaintGraph(scene, recording, 0, visible, selected, true);
+  const result = compositeScenePaintGraph(scene, recording, 0, visible, selected, true, colorBatchingEnabled);
   return { operations, capabilities, result };
 }
 

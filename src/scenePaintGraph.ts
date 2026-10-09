@@ -165,6 +165,37 @@ export function planScenePaintPasses(scene: VectorScene, visible: (condition?: n
 }
 
 const normalizedGraphs = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
+const normalizedGraphsWithoutColorBatching = new WeakMap<VectorScene, readonly ScenePaintNode[]>();
+
+/** Exact uploaded RGB of a Normal vector paint, or null for mixed/unknown colors. */
+function uniformDrawColor(scene: VectorScene, runIndex: number): readonly number[] | null {
+  const run = scene.drawRuns?.[runIndex];
+  if (!run || run.blendMode || run.count <= 0 ||
+      (run.kind !== "stroke" && run.kind !== "fill" && run.kind !== "text")) return null;
+  let color: number[] | null = null;
+  for (let primitive = run.first; primitive < run.first + run.count; primitive++) {
+    const offset = primitive * 4;
+    let red: number, green: number, blue: number;
+    if (run.kind === "stroke") {
+      red = scene.styles?.[offset + 1]; green = scene.styles?.[offset + 2]; blue = scene.styles?.[offset + 3];
+    } else if (run.kind === "fill") {
+      red = scene.fillPathMetaB?.[offset + 2]; green = scene.fillPathMetaB?.[offset + 3]; blue = scene.fillPathMetaC?.[offset + 2];
+    } else {
+      red = scene.textInstanceC?.[offset]; green = scene.textInstanceC?.[offset + 1]; blue = scene.textInstanceC?.[offset + 2];
+    }
+    if (!Number.isFinite(red) || !Number.isFinite(green) || !Number.isFinite(blue)) return null;
+    // Glyph colors are uploaded as RGBA8_UNORM; strokes and fills stay float32.
+    if (run.kind === "text") {
+      red = Math.fround(Math.round(Math.max(0, Math.min(1, red)) * 255) / 255);
+      green = Math.fround(Math.round(Math.max(0, Math.min(1, green)) * 255) / 255);
+      blue = Math.fround(Math.round(Math.max(0, Math.min(1, blue)) * 255) / 255);
+    }
+    if (color) {
+      if (red !== color[0] || green !== color[1] || blue !== color[2]) return null;
+    } else color = [red, green, blue];
+  }
+  return color;
+}
 
 /**
  * Whether every paint under these nodes reaches its backdrop through plain
@@ -200,42 +231,84 @@ function paintsSourceOverOnly(scene: VectorScene, nodes: readonly ScenePaintNode
  *   - but the compositor can then accumulate it into a single surface whose
  *   own alpha is the group alpha, instead of a backdrop copy plus a separate
  *   alpha accumulator.
+ * - Consecutive singleton Darken groups with the same exact vector RGB and
+ *   upload format accumulate their paints into one isolated source, then Darken once.
+ *   Coverage alpha still aggregates as source-over, including on translucent
+ *   backdrops. Color overrides or differing LOD RGB disable this optimization.
  *
  * A spliced child inherits its group's optional-content condition if it has no
  * condition of its own. A different child condition keeps the group intact:
  * both must hold, and a node has room for only one condition. Run conditions
  * are checked independently, so they do not prevent this inheritance.
  */
-export function normalizeScenePaintGraph(scene: VectorScene): readonly ScenePaintNode[] {
+export function normalizeScenePaintGraph(scene: VectorScene, colorBatchingEnabled = true): readonly ScenePaintNode[] {
   if (!scene.paintGraph) return [];
-  const cached = normalizedGraphs.get(scene);
+  const cache = colorBatchingEnabled ? normalizedGraphs : normalizedGraphsWithoutColorBatching;
+  const cached = cache.get(scene);
   if (cached) return cached;
-  const rewrite = (nodes: readonly ScenePaintNode[], depth: number, knockoutParent: boolean): ScenePaintNode[] => {
+  const colors = new Map<number, readonly number[] | null>();
+  const colorOf = (runIndex: number): readonly number[] | null => {
+    if (!colors.has(runIndex)) colors.set(runIndex, uniformDrawColor(scene, runIndex));
+    return colors.get(runIndex)!;
+  };
+  const rewrite = (nodes: readonly ScenePaintNode[], depth: number, knockoutParent: boolean,
+    knockoutAncestor: boolean): ScenePaintNode[] => {
     const result: ScenePaintNode[] = [];
+    let previousBatch: { group: ScenePaintGroup; kind: string; color: readonly number[]; copied: boolean } | null = null;
+    const append = (node: ScenePaintNode): void => {
+      const child = node.kind === "group" && node.children.length === 1 ? node.children[0] : null;
+      const run = child?.kind === "draw" ? scene.drawRuns?.[child.runIndex] : null;
+      const color = colorBatchingEnabled && !knockoutAncestor && node.kind === "group" &&
+        node.alpha === 1 && !node.softMask && !node.knockout && node.blendMode === "Darken" &&
+        child?.kind === "draw" ? colorOf(child.runIndex) : null;
+      if (color && run && node.kind === "group") {
+        // Stroke/fill shaders share float RGB and vector tint. Text has its
+        // own byte upload and appearance controls, so retains its boundaries.
+        const kind = run.kind === "text" ? "text" : "vector";
+        if (previousBatch && previousBatch.kind === kind &&
+            previousBatch.group.optionalContent === node.optionalContent &&
+            previousBatch.group.alphaIsShape === node.alphaIsShape &&
+            color.every((value, index) => value === previousBatch!.color[index])) {
+          // Equal-RGB Darken paints aggregate alpha just like source-over,
+          // even over a translucent backdrop. Accumulate their source once,
+          // then Darken once, retaining every paint's own clip and visibility.
+          if (!previousBatch.copied) {
+            previousBatch.group = { ...previousBatch.group, children: [...previousBatch.group.children] };
+            result[result.length - 1] = previousBatch.group;
+            previousBatch.copied = true;
+          }
+          previousBatch.group.children.push(child!);
+          return;
+        }
+        previousBatch = { group: node, kind, color, copied: false };
+      } else previousBatch = null;
+      result.push(node);
+    };
     for (const node of nodes) {
-      if (node.kind !== "group") { result.push(node); continue; }
+      if (node.kind !== "group") { append(node); continue; }
       const sourceOverOnly = !node.knockout && paintsSourceOverOnly(scene, node.children, 0);
-      const children = rewrite(node.children, depth + 1, node.knockout);
+      const children = rewrite(node.children, depth + 1, node.knockout, knockoutAncestor || node.knockout);
       if (!knockoutParent && node.alpha === 1 && !node.softMask &&
           !node.knockout && node.blendMode === "Normal" && (!node.isolated || sourceOverOnly) &&
           (node.optionalContent === undefined || children.every(child =>
             child.optionalContent === undefined || child.optionalContent === node.optionalContent))) {
-        for (const child of children) result.push(node.optionalContent !== undefined && child.optionalContent === undefined
+        for (const child of children) append(node.optionalContent !== undefined && child.optionalContent === undefined
           ? { ...child, optionalContent: node.optionalContent } : child);
         continue;
       }
       const softMask = node.softMask
-        ? { ...node.softMask, children: rewrite(node.softMask.children, depth + 1, false) } : undefined;
-      result.push({ ...node, children, softMask, isolated: node.isolated || sourceOverOnly });
+        ? { ...node.softMask, children: rewrite(node.softMask.children, depth + 1, false, false) } : undefined;
+      append({ ...node, children, softMask, isolated: node.isolated || sourceOverOnly });
     }
     return result;
   };
-  const roots = rewrite(scene.paintGraph.roots, 0, false);
-  normalizedGraphs.set(scene, roots);
+  const roots = rewrite(scene.paintGraph.roots, 0, false, false);
+  cache.set(scene, roots);
   return roots;
 }
 
 const spanSegments = new WeakMap<VectorScene, Uint32Array>();
+const spanSegmentsWithoutColorBatching = new WeakMap<VectorScene, Uint32Array>();
 
 /**
  * The span each canonical draw run paints in, numbered in graph order.
@@ -253,9 +326,10 @@ const spanSegments = new WeakMap<VectorScene, Uint32Array>();
  * boundaries only cost batching, never correctness, so list starts and group
  * edges each take one rather than being computed exactly.
  */
-export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
+export function scenePaintSpanSegments(scene: VectorScene, colorBatchingEnabled = true): Uint32Array | null {
   if (!scene.paintGraph || !scene.drawRuns) return null;
-  const cached = spanSegments.get(scene);
+  const cache = colorBatchingEnabled ? spanSegments : spanSegmentsWithoutColorBatching;
+  const cached = cache.get(scene);
   if (cached) return cached;
   const runs = scene.drawRuns;
   const segments = new Uint32Array(runs.length);
@@ -284,8 +358,8 @@ export function scenePaintSpanSegments(scene: VectorScene): Uint32Array | null {
     }
     current++;
   };
-  visit(normalizeScenePaintGraph(scene), 0);
-  spanSegments.set(scene, segments);
+  visit(normalizeScenePaintGraph(scene, colorBatchingEnabled), 0);
+  cache.set(scene, segments);
   return segments;
 }
 
@@ -296,6 +370,7 @@ export interface ScenePaintExtents {
   runs: Float64Array | null;
 }
 const nodeBounds = new WeakMap<VectorScene, ScenePaintExtents>();
+const nodeBoundsWithoutColorBatching = new WeakMap<VectorScene, ScenePaintExtents>();
 const UNBOUNDED: Bounds = { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity };
 
 /**
@@ -310,18 +385,19 @@ const UNBOUNDED: Bounds = { minX: -Infinity, minY: -Infinity, maxX: Infinity, ma
  * lookup. A paint whose extent is unknown reports an unbounded rectangle, so a
  * group containing one is never restricted.
  */
-export function scenePaintNodeBounds(scene: VectorScene): ScenePaintExtents {
-  const cached = nodeBounds.get(scene);
+export function scenePaintNodeBounds(scene: VectorScene, colorBatchingEnabled = true): ScenePaintExtents {
+  const cache = colorBatchingEnabled ? nodeBounds : nodeBoundsWithoutColorBatching;
+  const cached = cache.get(scene);
   if (cached) return cached;
   const result: ScenePaintExtents = { nodes: new Map<readonly ScenePaintNode[], Bounds>(), runs: null };
   const runs = scene.drawRuns;
-  if (!runs || !scene.paintGraph) { nodeBounds.set(scene, result); return result; }
+  if (!runs || !scene.paintGraph) { cache.set(scene, result); return result; }
   // Bounds are only ever an optimization, so a scene this cannot measure -
   // a synthetic one without the geometry stores, above all - simply reports
   // nothing and every pass covers its whole surface, as it always did.
   let culler: VectorDrawRunCuller;
   try { culler = new VectorDrawRunCuller(scene); }
-  catch { nodeBounds.set(scene, result); return result; }
+  catch { cache.set(scene, result); return result; }
   const box = [0, 0, 0, 0];
   const perRun = new Float64Array(runs.length * 4);
   const retainedRuns = new Map<number, number>();
@@ -352,8 +428,8 @@ export function scenePaintNodeBounds(scene: VectorScene): ScenePaintExtents {
     return bounds;
   };
   perRun.fill(Infinity);
-  visit(normalizeScenePaintGraph(scene), 0);
+  visit(normalizeScenePaintGraph(scene, colorBatchingEnabled), 0);
   result.runs = perRun;
-  nodeBounds.set(scene, result);
+  cache.set(scene, result);
   return result;
 }

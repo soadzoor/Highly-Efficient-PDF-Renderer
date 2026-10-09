@@ -3,14 +3,16 @@ import { HepArchive } from "./hepContainer";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
   getStoredVectorStrokeLod, buildVectorStrokeLodForStorage, storeVectorStrokeLod, rebuildStoredVectorStrokeLodIndexes,
-  type StoredVectorStrokeLod
+  VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS, type StoredVectorStrokeLod
 } from "./vectorStrokeLodCore";
+import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
+import { strokeLodOverviewAllowed } from "./vectorStrokePaintOrder";
 import { prebuildTextLod, storePrebuiltTextLod } from "./textLodCore";
 import type { TextLodBuildData } from "./textGreekLod";
 import { resolveHepLodOptions } from "./hepLodOptions";
 
 // Bump independently when a build algorithm or its persisted representation changes.
-export const HEP_VECTOR_LOD_VERSION = 3;
+export const HEP_VECTOR_LOD_VERSION = 4;
 export const HEP_TEXT_LOD_VERSION = 3;
 export interface HepLodOptions {
   /** Embed vector LOD geometry, building it if absent; rebuild spatial indexes on load. @default true */
@@ -71,18 +73,28 @@ export async function readHepLod(archive: HepArchive, scene: VectorScene, metada
     try {
       signal?.throwIfAborted();
       const version = kind === "vector" ? HEP_VECTOR_LOD_VERSION : HEP_TEXT_LOD_VERSION;
-      if (descriptor?.version !== version && descriptor?.version !== 1 && descriptor?.version !== 2) throw new Error(`stored version ${descriptor?.version}, current version ${version}`);
+      if (!Number.isInteger(descriptor?.version) || descriptor.version < 1 || descriptor.version > version) throw new Error(`stored version ${descriptor?.version}, current version ${version}`);
       const prefix = `lod-${kind}`;
       if (descriptor.file !== `${prefix}/index.json`) throw new Error("invalid cache descriptor");
+      if (kind === "vector" && descriptor.version < 4 &&
+          scene.segmentCount > VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS &&
+          sceneRequiresPaintCompositing(scene) && strokeLodOverviewAllowed(scene)) {
+        // Older builders disabled overview levels for every composite scene.
+        // Their otherwise-valid caches would keep newly eligible Darken scenes
+        // above the draw target. Rebuild at preparation without decoding them.
+        console.warn("[HEP] Rebuilding older vector LOD for compatible composite paints; " +
+          "the stored hierarchy has no budget-oriented overview levels.");
+        continue;
+      }
       let data = await readData(archive, prefix, signal);
       if (kind === "text" && descriptor.version === 3) requireValid((data as { textEncoding?: string }).textEncoding === "predictive");
-      if (kind === "vector" && descriptor.version === 3) requireValid((data as { tileIndexes?: string }).tileIndexes === "rebuild");
+      if (kind === "vector" && descriptor.version >= 3) requireValid((data as { tileIndexes?: string }).tileIndexes === "rebuild");
       if (descriptor.version >= 2) data = kind === "vector"
         ? unpackVectorLod(scene, data as Parameters<typeof unpackVectorLod>[1])
         : unpackTextLod(data as Parameters<typeof unpackTextLod>[0], scene, signal);
       if (kind === "vector") {
-        validateVector(scene, data as StoredVectorStrokeLod, descriptor.version !== 3);
-        if (descriptor.version === 3) data = await rebuildStoredVectorStrokeLodIndexes(scene, data as StoredVectorStrokeLod, signal);
+        validateVector(scene, data as StoredVectorStrokeLod, descriptor.version < 3);
+        if (descriptor.version >= 3) data = await rebuildStoredVectorStrokeLodIndexes(scene, data as StoredVectorStrokeLod, signal);
         storeVectorStrokeLod(scene, data as StoredVectorStrokeLod);
       } else {
         if (descriptor.version === 1) {
@@ -106,7 +118,7 @@ export async function readHepLod(archive: HepArchive, scene: VectorScene, metada
         validateText(scene, data as TextLodBuildData);
         storePrebuiltTextLod(scene, { data: data as TextLodBuildData, fallbackReason: null, buildTimeMs: 0 });
       }
-      if (descriptor.version < version) console.warn(`[HEP] Using older ${kind} LOD storage. ` +
+      if (descriptor.version < (kind === "vector" ? 3 : version)) console.warn(`[HEP] Using older ${kind} LOD storage. ` +
         "Re-export or repack this HEP for smaller LOD storage; no LOD simplification is needed.");
     } catch (error) {
       signal?.throwIfAborted();

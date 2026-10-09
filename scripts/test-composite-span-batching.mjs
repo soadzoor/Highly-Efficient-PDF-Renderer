@@ -8,7 +8,7 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
 try {
   const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
   const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
-  const { normalizeScenePaintGraph, planScenePaintPasses, scenePaintSpanSegments } = await import("../src/scenePaintGraph.ts");
+  const { normalizeScenePaintGraph, planScenePaintPasses, scenePaintSpanSegments, scenePaintNodeBounds } = await import("../src/scenePaintGraph.ts");
   const { compositeScenePaintGraph } = await import("../src/scenePaintCompositor.ts");
   const { ScenePaintVisibility } = await import("../src/scenePaintVisibility.ts");
   const { buildCanonicalRunLookup, submitPaintSpan } = await import("../src/scenePaintSpanDraws.ts");
@@ -146,6 +146,108 @@ try {
     assert.deepEqual(actual, expected, "the compositor paints exactly the visible source paints");
     assert.equal(layerSpans.length, layerVisible ? 2 : 1, "only the real opacity effect splits visible spans");
   }
+
+  // Technical drawings can wrap every stroke/fill in a singleton Darken
+  // group. Equal source colors can share one group without changing a run,
+  // clip, optional-content condition, or the canonical source graph.
+  const darkenScene = createEmptyVectorScene();
+  const darkenCount = 256;
+  darkenScene.pageRects = Float32Array.of(0, 0, darkenCount * 3, 10);
+  darkenScene.fillPathCount = darkenCount;
+  for (const key of ["fillPathMetaA", "fillPathMetaB", "fillPathMetaC"]) darkenScene[key] = new Float32Array(darkenCount * 4);
+  darkenScene.drawRuns = Array.from({ length: darkenCount }, (_value, index) => ({ kind: "fill", first: index, count: 1 }));
+  for (let index = 0; index < darkenCount; index++) {
+    darkenScene.fillPathMetaA.set([0, 0, index * 3, 0], index * 4);
+    darkenScene.fillPathMetaB.set([index * 3 + 1, 1, 0.25, 0.5], index * 4);
+    darkenScene.fillPathMetaC.set([0, 0, 0.75, 0.5], index * 4);
+  }
+  darkenScene.paintGraph = { roots: freezeNodes(darkenScene.drawRuns.map((_run, index) =>
+    group([{ ...draw(index), optionalContent: index % 2 }], { blendMode: "Darken" }))) };
+  const darkenSource = structuredClone(darkenScene);
+  const mergedDarken = normalizeScenePaintGraph(darkenScene);
+  assert.equal(mergedDarken.length, 1, "long equal-color Darken spans group without a paint-count limit");
+  assert.deepEqual(mergedDarken[0].children, darkenScene.paintGraph.roots.map(node => node.children[0]),
+    "merged sources retain every child condition and paint in source order");
+  const separateDarken = normalizeScenePaintGraph(darkenScene, false);
+  assert.equal(separateDarken.length, darkenCount, "disabled color batching retains singleton groups");
+  assert.equal(normalizeScenePaintGraph(darkenScene), mergedDarken, "enabled normalization retains its own cached graph");
+  assert.equal(normalizeScenePaintGraph(darkenScene, false), separateDarken, "disabled normalization retains its own cached graph");
+  assert.equal(new Set(scenePaintSpanSegments(darkenScene)).size, 1, "the merged Darken source has one batchable span");
+  assert.equal(new Set(scenePaintSpanSegments(darkenScene, false)).size, darkenCount, "disabled spans keep every blend boundary");
+  const mergedBounds = scenePaintNodeBounds(darkenScene), separateBounds = scenePaintNodeBounds(darkenScene, false);
+  assert(mergedBounds.nodes.has(mergedDarken[0].children), "bounds address the enabled graph's merged child list");
+  assert(separateBounds.nodes.has(separateDarken[0].children), "bounds address the disabled graph's original child lists");
+  assert.notEqual(mergedBounds, separateBounds, "group extent caches follow color-batching eligibility");
+  assert.deepEqual(darkenScene, darkenSource, "normalization never rewrites canonical paints or metadata");
+  for (const change of [
+    target => { target.fillPathMetaB[6] = 0.5; },
+    target => { target.fillPathMetaC[6] = NaN; },
+    target => { target.paintGraph.roots[1].alpha = 0.5; },
+    target => { target.paintGraph.roots[1].softMask = { children: [], subtype: "Alpha" }; },
+    target => { target.paintGraph.roots[1].knockout = true; },
+    target => { target.paintGraph.roots[1].optionalContent = 1; },
+    target => { target.paintGraph.roots[1].alphaIsShape = true; },
+    target => { target.drawRuns[1].blendMode = "Multiply"; },
+    target => { target.fillPathMetaC = new Float32Array(0); },
+    target => { target.drawRuns[1].count = 2; target.fillPathMetaB[10] = 0.5; },
+    target => {
+      target.fillPathMetaB[2] = target.fillPathMetaB[3] = target.fillPathMetaC[2] = 0;
+      target.drawRuns[1] = { kind: "text", first: 0, count: 1 };
+      target.textInstanceC = Float32Array.of(0, 0, 0, 0.5);
+    }
+  ]) {
+    const barrier = structuredClone(darkenScene);
+    barrier.drawRuns = barrier.drawRuns.slice(0, 2);
+    barrier.paintGraph.roots = barrier.paintGraph.roots.slice(0, 2);
+    change(barrier);
+    assert.equal(normalizeScenePaintGraph(barrier).length, 2,
+      "color differences, unknown colors, effects and differing group conditions retain boundaries");
+  }
+  const knockedDarken = structuredClone(darkenScene);
+  knockedDarken.paintGraph.roots = [group([group(knockedDarken.paintGraph.roots, { alpha: 0.5 })], { knockout: true })];
+  assert.equal(normalizeScenePaintGraph(knockedDarken)[0].children[0].children.length, darkenCount,
+    "Darken groups never merge under a knockout ancestor");
+  const textDarken = structuredClone(darkenScene);
+  textDarken.drawRuns = [0, 1].map(first => ({ kind: "text", first, count: 1 }));
+  textDarken.paintGraph.roots = textDarken.paintGraph.roots.slice(0, 2);
+  textDarken.textInstanceC = Float32Array.of(0.501, 0.501, 0.501, 0.5, 128 / 255, 128 / 255, 128 / 255, 0.5);
+  assert.equal(normalizeScenePaintGraph(textDarken).length, 1,
+    "text color equivalence uses the uploaded RGBA8_UNORM values");
+  const crossKindDarken = structuredClone(darkenScene);
+  crossKindDarken.segmentCount = darkenCount / 2;
+  crossKindDarken.fillPathCount = darkenCount / 2;
+  for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) crossKindDarken[key] = new Float32Array(crossKindDarken.segmentCount * 4);
+  crossKindDarken.drawRuns = Array.from({ length: darkenCount }, (_value, index) =>
+    ({ kind: index % 2 ? "stroke" : "fill", first: Math.floor(index / 2), count: 1 }));
+  for (let index = 0; index < crossKindDarken.segmentCount; index++) {
+    const x = index * 3, offset = index * 4;
+    crossKindDarken.endpoints.set([x, 0, x + 1, 1], offset);
+    crossKindDarken.primitiveMeta.set([x + 1, 1, 0, 0], offset);
+    crossKindDarken.primitiveBounds.set([x, 0, x + 1, 1], offset);
+    crossKindDarken.styles.set([0.5, 0.25, 0.5, 0.75], offset);
+  }
+  const crossKindPlan = new VectorOrderedBatches(crossKindDarken, null);
+  crossKindPlan.update(crossKindDarken.drawRuns, 0.1);
+  assert.equal(normalizeScenePaintGraph(crossKindDarken).length, 1,
+    "equal float RGB stroke/fill sources share one Darken composite");
+  assert.equal(crossKindPlan.batches.length, 2, "interleaved stroke/fill sources batch into one draw per program");
+  const assertCrossKindInstances = () => {
+    for (const kind of ["stroke", "fill"]) {
+      const ids = crossKindPlan.batches.filter(batch => batch.kind === kind).flatMap(batch =>
+        Array.from({ length: batch.count }, (_value, index) => crossKindPlan.uintInstances[(batch.first + index) * 2]));
+      assert.deepEqual(ids, Array.from({ length: darkenCount / 2 }, (_value, index) => index),
+        "cross-kind batching draws every canonical primitive exactly once");
+    }
+  };
+  assertCrossKindInstances();
+  crossKindPlan.setColorCommutationEnabled(false);
+  crossKindPlan.update(crossKindDarken.drawRuns, 0.1);
+  assert.equal(crossKindPlan.batches.length, darkenCount, "color overrides restore each stroke/fill Darken effect");
+  assertCrossKindInstances();
+  crossKindPlan.setColorCommutationEnabled(true);
+  crossKindPlan.update(crossKindDarken.drawRuns, 0.1);
+  assert.equal(crossKindPlan.batches.length, 2, "restoring source colors regroups cross-kind draws");
+  assertCrossKindInstances();
 
   // Every surface a group composites through is transparent outside the group's
   // own paints, so all but the root's backdrop copy carry a rectangle, and none

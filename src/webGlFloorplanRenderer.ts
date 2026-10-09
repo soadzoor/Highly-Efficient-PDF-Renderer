@@ -1829,7 +1829,6 @@ export class WebGlFloorplanRenderer {
     this.scenePaintVisibility = new ScenePaintVisibility(scene);
     this.scenePaintVisibility.setVisibility(this.optionalContentVisibility);
     this.uploadVectorClips(scene);
-    this.orderedRunCuller = scene.drawRuns ? new VectorDrawRunCuller(scene) : null;
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
     this.fillPathCount = scene.fillPathCount;
@@ -1838,6 +1837,7 @@ export class WebGlFloorplanRenderer {
     this.pageBackgroundSourceRects = null;
     this.pageTextRanges = normalizePageTextRanges(scene, this.pageRects, this.textInstanceCount);
     this.textLodRuntime?.dispose();
+    this.orderedTextLod = null;
     const lodStarted = performance.now();
     const textLodBuildResult = this.scenePaintVisibility.requiresCompositing ? null : this.textLodMode === "auto"
       ? getOrBuildTextLod(scene)
@@ -3898,7 +3898,8 @@ export class WebGlFloorplanRenderer {
           }
         }
       } : null;
-      const segments = scenePaintSpanSegments(this.scene!);
+      const colorBatchingEnabled = plan?.colorBatchingEnabled ?? false;
+      const segments = scenePaintSpanSegments(this.scene!, colorBatchingEnabled);
       try {
         this.paintCompositor.render(this.scene!, width, height, (spanRuns, shapeOnly) => {
           this.invalidateOrderedState();
@@ -3925,7 +3926,7 @@ export class WebGlFloorplanRenderer {
           scissor: false, blend: true, depth: false, program: null, vao: null,
           blendFunction: [this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA, this.gl.ONE, this.gl.ONE_MINUS_SRC_ALPHA],
           blendEquation: [this.gl.FUNC_ADD, this.gl.FUNC_ADD]
-        }, folding);
+        }, folding, colorBatchingEnabled);
       } finally {
         this.paintShapeOnly = false; this.vectorClipIndex = -1;
         profile?.endSection("drawSubmission");
@@ -5537,6 +5538,8 @@ export class WebGlFloorplanRenderer {
     this.vectorLodStats = null;
     this.orderedBatches = scene.drawRuns ? new VectorOrderedBatches(scene,
       this.vectorLodRuntime && this.vectorLodRuntime.levels.length > 1 ? this.vectorLodRuntime : null) : null;
+    this.orderedRunCuller = this.orderedBatches?.createRunCuller() ?? null;
+    if (this.orderedTextLod) this.orderedRunCuller?.includeTextLod(this.orderedTextLod.data);
     this.runLookup = buildCanonicalRunLookup(scene);
     this.orderedBatches?.setColorCommutationEnabled(!this.primitiveColors?.has("stroke") &&
       !this.primitiveColors?.has("fill") && !this.primitiveColors?.has("text"));

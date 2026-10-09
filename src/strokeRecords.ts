@@ -38,6 +38,21 @@ export function sceneStrokeRecords(scene: VectorScene): StrokeRecords {
   return { count, segments: [{ first: 0, count, scene }] };
 }
 
+/** Color-dependent group batching must also hold for every dormant LOD record. */
+export function strokeRecordsMatchSourceColors(scene: VectorScene, records: StrokeRecords, origins: Uint32Array): boolean {
+  for (const segment of records.segments) {
+    for (let index = 0; index < segment.count; index++) {
+      const source = origins[segment.first + index] * 4;
+      const offset = index * 4;
+      for (let channel = 1; channel < 4; channel++) {
+        const value = segment.scene.styles[offset + channel];
+        if (!Number.isFinite(value) || value !== scene.styles[source + channel]) return false;
+      }
+    }
+  }
+  return true;
+}
+
 export function strokeSourceRecords(source: StrokeRecordSource): StrokeRecords {
   return source.records ?? sceneStrokeRecords(source.scene!);
 }

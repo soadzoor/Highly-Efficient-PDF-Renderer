@@ -51,6 +51,7 @@ try {
   const text = await import(`${suffix}textLodCore.${extension}`);
   const { buildTextLodAsync } = await import(`${suffix}textGreekLod.${extension}`);
   const { buildVectorLodInWorker } = await import(`${suffix}lodWorkerClient.${extension}`);
+  const { strokePaintGroups, strokeLodOverviewAllowed } = await import(`${suffix}vectorStrokePaintOrder.${extension}`);
   const { createEmptyVectorScene } = await import(`${suffix}emptyVectorScene.${extension}`);
   assert.equal(workers.length, 0, "Importing preparation APIs must not start workers");
 
@@ -136,6 +137,38 @@ try {
   const recoveredStoredRuntime = vector.takePrebuiltVectorStrokeLodRuntime(storedCallbackScene);
   assert(recoveredStoredRuntime, "A failed completion callback keeps the complete stored runtime reusable");
   assert.equal(recoveredStoredRuntime.levels[0].scene, storedCallbackScene);
+
+  const darken = darkenStrokeScene(createEmptyVectorScene);
+  const darkenExpected = new vector.VectorStrokeLodRuntime(darken);
+  assert(strokeLodOverviewAllowed(darken), "Safe Darken groups permit density and overview simplification");
+  assert(darkenExpected.levels.some(level => level.segmentCount < darken.segmentCount),
+    "Consecutive singleton Darken paints must simplify across their source draw runs");
+  const paintGroups = strokePaintGroups(darken);
+  assert.equal(paintGroups[0], paintGroups[127]);
+  for (const boundary of [128, 256, 384]) assert.notEqual(paintGroups[boundary - 1], paintGroups[boundary],
+    "Intervening paints and both run/group OCG conditions are simplification barriers");
+  const darkenSnapshot = darken.endpoints.slice();
+  const darkenPrepared = await buildVectorLodInWorker(darken, undefined, {});
+  assert.deepEqual(darkenPrepared.data, vector.getStoredVectorStrokeLod(darken),
+    "Worker simplification retains full-scene Darken, intervening paint and OCG boundaries");
+  const darkenRequest = workers.at(-1).request;
+  assert.deepEqual(darkenRequest.paintGroups, paintGroups,
+    "Precomputed paint groups retain barriers omitted from the minimal worker scene");
+  assert.equal(darkenRequest.scene.drawRuns.length, darken.drawRuns.length - 1);
+  assert(!("paintGraph" in darkenRequest.scene) && !("optionalContent" in darkenRequest.scene));
+  assert.deepEqual(darken.endpoints, darkenSnapshot, "Worker preparation preserves canonical buffer ownership");
+  const storedPrepared = await buildVectorLodInWorker(darken, vector.getStoredVectorStrokeLod(darken), {});
+  assert.deepEqual(storedPrepared.allLevelBounds, darkenPrepared.allLevelBounds);
+  assert.equal(workers.at(-1).request.paintGroups, undefined,
+    "Stored bounds-only preparation does not clone paint groups");
+  const unsupportedEffect = darkenStrokeScene(createEmptyVectorScene);
+  unsupportedEffect.paintGraph.roots[0].blendMode = "Multiply";
+  new vector.VectorStrokeLodRuntime(unsupportedEffect);
+  const effectPrepared = await buildVectorLodInWorker(unsupportedEffect, undefined, {});
+  assert.equal(workers.at(-1).request.overviewAllowed, false,
+    "The minimal worker scene retains full-scene effect restrictions");
+  assert.deepEqual(effectPrepared.data, vector.getStoredVectorStrokeLod(unsupportedEffect),
+    "An unsupported blend preserves direct/worker conservative simplification parity");
 
   const denseText = textScene(50_000, createEmptyVectorScene);
   const expectedText = await buildTextLodAsync(denseText);
@@ -243,6 +276,32 @@ function strokeScene(count, empty, spacing = 2) {
     scene.primitiveMeta.set([x + 1, y, 0, 1], index * 4);
     scene.primitiveBounds.set([x, y, x + 1, y], index * 4);
     scene.styles.set([0.1, 0, 0, 0], index * 4);
+  }
+  return scene;
+}
+
+function darkenStrokeScene(empty) {
+  const scene = strokeScene(512, empty, 1);
+  scene.drawRuns = [];
+  scene.paintGraph = { roots: [] };
+  scene.optionalContent = { groups: [], conditions: [0, 1].map(() => ({ kind: "constant", value: true })),
+    order: [], radioGroups: [] };
+  scene.fillPathCount = 1;
+  scene.fillPathMetaB = Float32Array.of(1000, 1000, 1, 0);
+  scene.fillPathMetaC = Float32Array.of(0, 0, 0, 1);
+  for (let index = 0; index < scene.segmentCount; index++) {
+    scene.endpoints.set([.005, .011, .018, .011], index * 4);
+    scene.primitiveMeta.set([.018, .011, 0, 1], index * 4);
+    scene.primitiveBounds.set([.005, .011, .018, .011], index * 4);
+    if (index === 128) {
+      scene.paintGraph.roots.push({ kind: "draw", runIndex: scene.drawRuns.length });
+      scene.drawRuns.push({ kind: "fill", first: 0, count: 1 });
+    }
+    const runIndex = scene.drawRuns.length;
+    scene.drawRuns.push({ kind: "stroke", first: index, count: 1,
+      ...(index >= 256 ? { optionalContent: 0 } : {}) });
+    scene.paintGraph.roots.push({ kind: "group", alpha: 1, isolated: true, knockout: false, blendMode: "Darken",
+      children: [{ kind: "draw", runIndex }], ...(index >= 384 ? { optionalContent: 1 } : {}) });
   }
   return scene;
 }

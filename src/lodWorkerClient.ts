@@ -2,8 +2,7 @@ import type { VectorScene } from "./pdfVectorExtractor";
 import type { PreparedVectorStrokeLod, StoredVectorStrokeLod, VectorStrokeLodBoundsSource,
   VectorStrokeLodAsyncBuildOptions } from "./vectorStrokeLodCore";
 import type { TextLodAsyncBuildOptions, TextLodBuildResult } from "./textGreekLod";
-import { explicitStrokePaintOrigins } from "./vectorStrokePaintOrder";
-import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
+import { explicitStrokePaintOrigins, strokeLodOverviewAllowed, strokePaintGroups } from "./vectorStrokePaintOrder";
 
 type StrokeInputs = Pick<VectorScene, "bounds" | "maxHalfWidth" | "segmentCount" |
   "endpoints" | "primitiveMeta" | "primitiveBounds" | "styles" | "drawRuns">;
@@ -12,7 +11,8 @@ type TextInputs = Pick<VectorScene, "bounds" | "pageCount" | "pageRects" | "page
   "textGlyphCount" | "textGlyphMetaA" | "textGlyphMetaB" | "textGlyphSegmentsA" | "textGlyphSegmentsB" | "drawRuns">;
 
 export type LodWorkerRequest =
-  | { type: "vector"; scene: StrokeInputs; stored?: VectorStrokeLodBoundsSource; origins?: Uint32Array; overviewAllowed: boolean }
+  | { type: "vector"; scene: StrokeInputs; stored?: VectorStrokeLodBoundsSource; origins?: Uint32Array;
+      paintGroups?: Uint32Array; overviewAllowed: boolean }
   | { type: "text"; scene: TextInputs };
 export type LodWorkerResponse =
   | { type: "progress"; value: number; message: string }
@@ -26,7 +26,10 @@ export async function buildVectorLodInWorker(scene: VectorScene, stored: StoredV
     type: "vector", stored: stored && { literals: stored.literals, origins: stored.origins,
       levels: stored.levels.map(level => ({ segmentCount: level.segmentCount, records: level.records })) },
     origins: explicitStrokePaintOrigins(scene),
-    overviewAllowed: !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode),
+    // Stroke-only worker inputs omit the graph and intervening paints. Preserve
+    // their simplification barriers without cloning those unrelated payloads.
+    paintGroups: stored ? undefined : strokePaintGroups(scene),
+    overviewAllowed: strokeLodOverviewAllowed(scene),
     scene: {
       bounds: scene.bounds, maxHalfWidth: scene.maxHalfWidth, segmentCount: scene.segmentCount,
       endpoints: scene.endpoints, primitiveMeta: scene.primitiveMeta,

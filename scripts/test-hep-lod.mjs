@@ -178,13 +178,13 @@ try {
     let restoredViewers;
     const loaded = await withForbiddenWorker(async () => {
       const loaded = await loadSceneFromHep(bytes);
-      if (withVectorLod) restoredViewers = await reserveWithoutGeometryReads(loaded, "v3 lossless round trip");
+      if (withVectorLod) restoredViewers = await reserveWithoutGeometryReads(loaded, "v4 lossless round trip");
       return loaded;
-    }, "v3 round trip");
+    }, "v4 round trip");
     assert.equal(Boolean(vector.getStoredVectorStrokeLod(loaded)), withVectorLod);
     assert.equal(Boolean(text.getCachedTextLod(loaded)), withTextLod);
     if (withVectorLod) {
-      assert.equal(manifest.lod.vector.version, 3);
+      assert.equal(manifest.lod.vector.version, 4);
       const disk = JSON.parse(await archive.file("lod-vector/index.json").async("string"));
       assert.equal(disk.tileIndexes, "rebuild");
       for (const level of disk.levels) for (const key of ["tileOffsets", "tileCounts", "tileSegmentIds"]) assert(!(key in level));
@@ -213,6 +213,7 @@ try {
         selected[i], "another viewer's selection cannot mutate the first viewer"));
     }
     if (withTextLod) {
+      assert.equal(manifest.lod.text.version, 3, "vector build upgrades leave text storage unchanged");
       const result = await text.prebuildTextLod(loaded);
       assert.equal(result.buildTimeMs, 0);
       assert.deepEqual(result.data, originalText.data);
@@ -241,7 +242,7 @@ try {
   const denseBytes = await (await buildHep(denseCanonical, { withVectorLod: true, vectorLodPrecision: "lossless" })).arrayBuffer();
   await withForbiddenWorker(async () => {
     const loaded = await loadSceneFromHep(denseBytes);
-    const [restored] = await reserveWithoutGeometryReads(loaded, "worker-sized v3 round trip");
+    const [restored] = await reserveWithoutGeometryReads(loaded, "worker-sized v4 round trip");
     assert.deepEqual(restored.levels[0].segmentMinX, denseOriginal.levels[0].segmentMinX);
     for (const runtime of [restored, denseOriginal]) {
       runtime.updateForLocalUnitsPerPixel(2);
@@ -250,10 +251,90 @@ try {
     assert.deepEqual(restored.getStats(), denseOriginal.getStats());
     restored.levels.forEach((level, i) => assert.deepEqual(level.visibleSegmentIds.subarray(0, level.visibleSegmentCount),
       denseOriginal.levels[i].visibleSegmentIds.subarray(0, denseOriginal.levels[i].visibleSegmentCount)));
-  }, "worker-sized v3 round trip");
+  }, "worker-sized v4 round trip");
   // Compact positions are bounded; exact geometry, styles and clip windows stay intact.
   const { compactVectorLod, deduplicateVectorLod, packVectorLod, unpackVectorLod, packTextLod, unpackTextLod } =
     await import("../src/hepLodEncoding.ts");
+  // Large Darken graphs formerly stored only conservative levels. Existing HEPs
+  // must rebuild those levels, while current and ordinary older caches stay fast.
+  const darkenCount = 60_000;
+  const darken = { ...dense, segmentCount: darkenCount,
+    drawRuns: Array.from({ length: darkenCount }, (_, first) => ({ kind: "stroke", first, count: 1 })),
+    paintGraph: { roots: Array.from({ length: darkenCount }, (_, runIndex) => ({
+      kind: "group", children: [{ kind: "draw", runIndex }], alpha: 1,
+      isolated: false, knockout: false, blendMode: "Darken"
+    })) } };
+  for (const field of geometryFields) darken[field] = dense[field].slice(0, darkenCount * 4);
+  for (let i = 0; i < darkenCount; i++) {
+    const x = i % 250 * 4, y = Math.floor(i / 250) * 4;
+    const endX = i === 0 ? x + 100 : x + .25;
+    darken.endpoints.set([x, y, endX, y], i * 4);
+    darken.primitiveMeta.set([endX, y, 0, 1], i * 4);
+    darken.primitiveBounds.set([x, y, endX, y], i * 4);
+  }
+  const darkenCanonical = prepareSceneForHepRendering(darken);
+  const darkenOriginal = new vector.VectorStrokeLodRuntime(darkenCanonical);
+  assert(darkenOriginal.levels.some(level => level.overview), "compatible Darken scopes build overview levels");
+  const darkenBytes = await (await buildHep(darkenCanonical, {
+    withVectorLod: true, withTextLod: false, vectorLodPrecision: "lossless"
+  })).arrayBuffer();
+  vector.resetVectorStrokeLodBuildTiming();
+  await withForbiddenWorker(async () => {
+    const loaded = await loadSceneFromHep(darkenBytes);
+    const [restored] = await reserveWithoutGeometryReads(loaded, "v4 Darken adoption");
+    assert(restored.levels.some(level => level.overview));
+    assert.equal(vector.consumeVectorStrokeLodBuildTiming().buildCount, 0, "v4 Darken caches never rebuild");
+  }, "v4 Darken adoption");
+  const conservative = { ...vector.getStoredVectorStrokeLod(darkenCanonical),
+    levels: [vector.getStoredVectorStrokeLod(darkenCanonical).levels[0]],
+    literals: { segmentCount: 0, ...Object.fromEntries(geometryFields.map(field => [field, new Float32Array()])) },
+    origins: new Uint32Array()
+  };
+  const upgradeWarnings = [], previousWarn = console.warn;
+  console.warn = message => upgradeWarnings.push(message);
+  try {
+    for (const version of [1, 2, 3]) {
+      const archive = await HepArchive.loadAsync(darkenBytes);
+      const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+      const data = version === 1 ? conservative : packVectorLod(darkenCanonical, conservative, version === 2);
+      let arrayIndex = 0;
+      archive.file("lod-vector/index.json", JSON.stringify(data, (_key, value) => {
+        if (!ArrayBuffer.isView(value)) return value;
+        const file = `lod-vector/${arrayIndex++}.bin`, raw = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        const bytes = new Uint8Array(raw.length), width = value.BYTES_PER_ELEMENT;
+        for (let i = 0; i < value.length; i++) for (let byte = 0; byte < width; byte++) bytes[byte * value.length + i] = raw[i * width + byte];
+        archive.file(file, bytes);
+        return { array: value instanceof Float64Array ? "f64" : value instanceof Float32Array ? "f32" : "u32", file, length: value.length };
+      }));
+      manifest.lod.vector.version = version;
+      archive.file("manifest.json", JSON.stringify(manifest));
+      vector.resetVectorStrokeLodBuildTiming();
+      const loaded = await loadSceneFromHep(await archive.generateAsync({ type: "uint8array", compression: "STORE" }));
+      assert.equal(vector.getStoredVectorStrokeLod(loaded), null, `v${version} conservative Darken cache is skipped`);
+      assert.equal(vector.consumeVectorStrokeLodBuildTiming().buildCount, 0, "loading does not eagerly rebuild");
+      const rebuilt = await vector.prebuildVectorStrokeLodRuntime(loaded, "force", "webgl");
+      assert.equal(vector.consumeVectorStrokeLodBuildTiming().buildCount, 1, "viewer preparation rebuilds once");
+      assert(rebuilt.levels.some(level => level.overview), `v${version} upgrades to overview levels`);
+      rebuilt.updateForLocalUnitsPerPixel(2);
+      rebuilt.update({ cameraCenterX: 100, cameraCenterY: 1, zoom: .5 }, { width: 640, height: 480 });
+      assert(rebuilt.getStats().renderedSegments < vector.VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS,
+        "upgraded overview draws fit the visible target");
+      for (const field of geometryFields) assert.deepEqual(loaded[field], darkenCanonical[field], "canonical strokes survive the upgrade");
+    }
+    const ordinary = await HepArchive.loadAsync(denseBytes);
+    const manifest = JSON.parse(await ordinary.file("manifest.json").async("string"));
+    manifest.lod.vector.version = 3;
+    ordinary.file("manifest.json", JSON.stringify(manifest));
+    vector.resetVectorStrokeLodBuildTiming();
+    await withForbiddenWorker(async () => {
+      const loaded = await loadSceneFromHep(await ordinary.generateAsync({ type: "uint8array", compression: "STORE" }));
+      await reserveWithoutGeometryReads(loaded, "ordinary v3 cache adoption");
+      assert.equal(vector.consumeVectorStrokeLodBuildTiming().buildCount, 0, "ordinary v3 caches do not rebuild");
+    }, "ordinary v3 cache adoption");
+  } finally { console.warn = previousWarn; }
+  assert.equal(upgradeWarnings.filter(message => /Rebuilding older vector LOD/.test(message)).length, 3);
+  assert.equal(upgradeWarnings.filter(message => /Using older vector LOD storage/.test(message)).length, 0,
+    "v3 storage already matches v4 and does not need a repack warning");
   // Corrections preserve text caches even when canonical quantization or a
   // previous builder made their derived geometry differ from today's predictor.
   const correctedText = structuredClone(originalText.data);
@@ -377,9 +458,9 @@ try {
   const compactBlob = await buildHep(canonical, { withVectorLod: true }); // Compact is the API/CLI default.
   const compactScene = await withForbiddenWorker(async () => {
     const loaded = await loadSceneFromHep(await compactBlob.arrayBuffer());
-    await reserveWithoutGeometryReads(loaded, "v3 compact round trip");
+    await reserveWithoutGeometryReads(loaded, "v4 compact round trip");
     return loaded;
-  }, "v3 compact round trip");
+  }, "v4 compact round trip");
   assert(vector.getStoredVectorStrokeLod(compactScene).positionQuanta);
   for (const key of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) assert.deepEqual(compactScene[key], canonical[key]);
   assert.equal(parsePdfToHepArguments(["--vector-lod-precision=compact", "input.pdf"]).vectorLodPrecision, "compact");
@@ -464,7 +545,7 @@ try {
   for (const level of v2Expected.levels) for (const key of ["overview", "records"]) if (level[key] === undefined) delete level[key];
   assert.deepEqual(vector.getStoredVectorStrokeLod(v2Scene), v2Expected);
   const upgraded = await repackHepLodBytes(v2Bytes); // Compact is also the repacker default.
-  assert.deepEqual(await repackHepLodBytes(upgraded, { vectorLodPrecision: "compact" }), upgraded, "v3 repacking is idempotent");
+  assert.deepEqual(await repackHepLodBytes(upgraded, { vectorLodPrecision: "compact" }), upgraded, "v4 repacking is idempotent");
   assert(vector.getStoredVectorStrokeLod(await loadSceneFromHep(upgraded)).positionQuanta);
 
   // Rebuilding indexes yields to the event loop and cancels without installing a partial cache.
@@ -556,5 +637,5 @@ try {
   const controller = new AbortController(); controller.abort();
   await assert.rejects(buildHep(canonical, { withVectorLod: true, signal: controller.signal }), { name: "AbortError" });
   await assert.rejects(buildHep(canonical, { withVectorLod: "yes" }), /boolean/);
-  console.log("HEP LOD: v3 shared geometry, predictive text, adaptive precision, reconstructed indexes, legacy compatibility, selection parity, corruption, and cancellation passed.");
+  console.log("HEP LOD: v4 composite overview upgrades, shared geometry, predictive text, adaptive precision, reconstructed indexes, legacy compatibility, selection parity, corruption, and cancellation passed.");
 } finally { hooks.deregister(); }

@@ -31,6 +31,8 @@ try {
   render.foldedContent = 0;
   render.maskPaints = false;
   render.maskPaintFolds = 0;
+  render.canonicalColors = false;
+  render.colorBatchingEnabled = true;
   function render(roots, paints, backdrop = [1,1,1,1], visible = () => true, failAt = -1, selected = null, reuseBackdrop = false) {
     const alive = new Set(); let draws=0;
     render.spans=[]; render.passes=0; render.surfaces=0; render.folds=0;
@@ -91,10 +93,19 @@ try {
       } : {})
     };
     const scene={paintGraph:{roots},drawRuns:paints.map((p,i)=>({kind:"fill",first:i,count:1,blendMode:p.blendMode,optionalContent:p.condition}))};
+    if (render.canonicalColors) {
+      scene.fillPathMetaB = new Float32Array(paints.length * 4);
+      scene.fillPathMetaC = new Float32Array(paints.length * 4);
+      paints.forEach((paint, index) => {
+        const alpha = paint.color[3], rgb = paint.color.slice(0, 3).map(value => alpha > 0 ? value / alpha : 0);
+        scene.fillPathMetaB.set([0, 0, rgb[0], rgb[1]], index * 4);
+        scene.fillPathMetaC[index * 4 + 2] = rgb[2];
+      });
+    }
     const initial = { pixel: [...backdrop] };
     if (reuseBackdrop) alive.add(initial);
     try {
-      const result=compositeScenePaintGraph(scene,adapter,initial,visible,selected,reuseBackdrop);
+      const result=compositeScenePaintGraph(scene,adapter,initial,visible,selected,reuseBackdrop,render.colorBatchingEnabled);
       if (reuseBackdrop) assert.equal(result, initial, "the root returns its borrowed scratch backdrop");
       else close(initial.pixel, backdrop, 0.000000001);
       const pixel=[...result.pixel]; adapter.release(result); assert.equal(alive.size,0); return pixel;
@@ -196,6 +207,30 @@ try {
     [red,{color:[0,1,0,1],shape:1}]),[1,0.59,0.59,1]);
   close(render([g([d(0)],{optionalContent:0,softMask:mask})],
     [red,{color:[0,1,0,1],shape:1}],undefined,id=>id!==0),[1,1,1,1]);
+  // Repeated equal-RGB Darken paints have source-over's alpha aggregation,
+  // including antialiasing coverage and translucent or transparent backdrops.
+  // They can accumulate once in an isolated source, then Darken just once.
+  render.canonicalColors = true;
+  for (const rgb of [[0.25, 0.5, 0.75], [1, 0.25, 0.5]]) {
+    const equalColorPaints = [0.17, 0.4, 0.81].map(alpha => ({ color: [...rgb.map(value => value * alpha), alpha], shape: alpha }));
+    const darkenRoots = equalColorPaints.map((_paint, index) => g([d(index)], { isolated: false, blendMode: "Darken" }));
+    for (const backdrop of [[0, 0, 0, 0], [0.1, 0.2, 0.3, 0.5], [1, 1, 1, 1], [0.75, 0.2, 0.5, 1]]) {
+      const expected = equalColorPaints.reduce((pixel, paint) => compositePdfPixel(pixel, paint.color, "Darken"), backdrop);
+      close(render(darkenRoots, equalColorPaints, backdrop), expected);
+      assert.deepEqual({ spans: render.spans, passes: render.passes }, { spans: [1], passes: 1 },
+        "equal-color Darken siblings share one draw and one composite");
+      render.colorBatchingEnabled = false;
+      close(render(darkenRoots, equalColorPaints, backdrop), expected);
+      assert.deepEqual({ spans: render.spans, passes: render.passes }, { spans: [1, 1, 1], passes: 3 },
+        "disabling color batching restores each source group boundary");
+      render.colorBatchingEnabled = true;
+    }
+  }
+  const darkenColors = [{ color: [0.5, 0, 0, 0.5], shape: 0.5 }, { color: [0, 0, 0.5, 0.5], shape: 0.5 }];
+  close(render(darkenColors.map((_paint, index) => g([d(index)], { blendMode: "Darken" })), darkenColors), [0.5, 0.25, 0.5, 1]);
+  assert.deepEqual(render.spans, [1, 1], "different source RGB remains a Darken group barrier");
+  // One merged source would instead produce [0.5, 0.25, 0.75, 1].
+  render.canonicalColors = false;
   // An isolated source-over group accumulates into one surface, so its own alpha
   // is the group alpha and its opacity scales that surface inside the composite
   // that reads it - no separate alpha accumulator, no extraction pass.

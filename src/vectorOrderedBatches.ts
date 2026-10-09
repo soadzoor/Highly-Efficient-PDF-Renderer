@@ -11,8 +11,9 @@ import {
   vectorStrokeLodStorageLayout, vectorStrokeLodStorageOrigins, vectorStrokeLodStorageRecords,
   type VectorStrokeLodStorageLayout
 } from "./vectorStrokeLodStorage";
-import { sceneStrokeRecords, type StrokeRecords } from "./strokeRecords";
+import { sceneStrokeRecords, strokeRecordsMatchSourceColors, type StrokeRecords } from "./strokeRecords";
 import { vectorDrawRunsShareSubmission } from "./vectorDrawOrder";
+import { VectorDrawRunCuller } from "./vectorDrawRunCulling";
 
 /** Instanced draws retain overlapping paint order; clip roots travel with each instance. */
 export class VectorOrderedBatches {
@@ -37,7 +38,7 @@ export class VectorOrderedBatches {
    * them itself rather than look for batches that do not exist.
    */
   readonly scheduledRuns: Uint8Array;
-  private readonly scheduledSpanPrefix: Uint32Array;
+  private scheduledSpanPrefix = new Uint32Array(0);
   private floatInstanceData = new Float32Array(0);
   private uintInstanceData = new Uint32Array(2);
   private floatInstancesDirty = true;
@@ -83,8 +84,11 @@ export class VectorOrderedBatches {
   private readonly sourceRuns: readonly VectorDrawRun[];
   private readonly runRanges: Uint32Array;
   private readonly visiblePaints: number[] = [];
-  private readonly scheduler: VectorPageDrawScheduler | null;
-  private readonly segments: Uint32Array | null;
+  private scheduler: VectorPageDrawScheduler | null = null;
+  segments: Uint32Array | null = null;
+  private readonly scene: VectorScene;
+  private readonly strokeSourceRuns: Uint32Array;
+  private readonly strokeColorsMatchSource: boolean;
   private readonly clipElision: VectorRunClipElision | null;
   private readonly redundancy: VectorStrokeRedundancy;
   private redundancyIds = new Uint32Array(0);
@@ -99,7 +103,10 @@ export class VectorOrderedBatches {
   private textSelection: OrderedTextLodSelection | null = null;
   private textSelectionRevision = 0;
 
+  get colorBatchingEnabled(): boolean { return this.redundancyEnabled && this.strokeColorsMatchSource; }
+
   constructor(scene: VectorScene, runtime: VectorStrokeLodRuntime | null) {
+    this.scene = scene;
     this.runtime = runtime;
     this.cullingPadding = (runtime?.levels.at(-1)?.tolerance ?? 0) * 2;
     const runs = scene.drawRuns!;
@@ -152,14 +159,12 @@ export class VectorOrderedBatches {
       this.idToRank[id] = rank;
       strokeSourceRuns[id] = sourceRun[origin];
     }
+    this.strokeSourceRuns = strokeSourceRuns;
+    this.strokeColorsMatchSource = !runtime || strokeRecordsMatchSourceColors(scene, this.strokeRecords, origins);
     // Paints reorder only within a compositor span. A page that never reaches
     // the compositor is one span whatever its graph says, so it keeps the whole
     // page to reorder in.
-    this.segments = sceneRequiresPaintCompositing(scene) ? scenePaintSpanSegments(scene) : null;
-    let maxSpan = 0;
-    for (const span of this.segments ?? []) maxSpan = Math.max(maxSpan, span);
-    this.scheduledSpanPrefix = new Uint32Array(maxSpan + 2);
-    this.scheduler = VectorPageDrawScheduler.create(scene, this.strokeRecords, strokeSourceRuns, this.segments);
+    this.rebuildScheduler();
     this.clipElision = VectorRunClipElision.create(scene, { records: this.strokeRecords, sourceRuns: strokeSourceRuns });
     this.redundancy = new VectorStrokeRedundancy(scene, { records: this.strokeRecords, sourceRuns: strokeSourceRuns });
     this.scheduledRuns = new Uint8Array(runs.length);
@@ -168,6 +173,12 @@ export class VectorOrderedBatches {
   /** Number of complete canonical runs represented by a span interval. */
   scheduledSpanRunCount(first: number, last: number): number {
     return this.scheduledSpanPrefix[last + 1] - this.scheduledSpanPrefix[first];
+  }
+
+  /** A merged LOD stroke can reach beyond the canonical run owning its origin. */
+  createRunCuller(): VectorDrawRunCuller {
+    return new VectorDrawRunCuller(this.scene, this.runtime
+      ? { records: this.strokeRecords, sourceRuns: this.strokeSourceRuns } : undefined);
   }
 
   invalidate(): void { this.dirty = true; }
@@ -182,11 +193,25 @@ export class VectorOrderedBatches {
   }
 
   setColorCommutationEnabled(enabled: boolean): void {
-    const changed = this.scheduler?.setColorCommutationEnabled(enabled) ?? false;
-    if (!changed && this.redundancyEnabled === enabled) return;
+    if (this.redundancyEnabled === enabled) return;
     this.redundancyEnabled = enabled;
+    const segments = sceneRequiresPaintCompositing(this.scene)
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+    if (segments !== this.segments) this.rebuildScheduler();
+    else this.scheduler?.setColorCommutationEnabled(enabled);
     this.orderDirty = true;
     this.dirty = true;
+  }
+
+  private rebuildScheduler(): void {
+    this.segments = sceneRequiresPaintCompositing(this.scene)
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+    let maxSpan = 0;
+    for (const span of this.segments ?? []) maxSpan = Math.max(maxSpan, span);
+    this.scheduledSpanPrefix = new Uint32Array(maxSpan + 2);
+    this.scheduler = VectorPageDrawScheduler.create(this.scene, this.strokeRecords, this.strokeSourceRuns, this.segments);
+    this.scheduler?.setColorCommutationEnabled(this.redundancyEnabled);
+    if (this.textSelection) this.scheduler?.includeTextLod(this.textSelection.data);
   }
 
   /** Returns true only when instance data needs uploading again. */

@@ -7,6 +7,10 @@ try {
   const { VectorDrawRunCuller, vectorViewBounds } = await import("../src/vectorDrawRunCulling.ts");
   const { WebGlFloorplanRenderer } = await import("../src/webGlFloorplanRenderer.ts");
   const { WebGpuFloorplanRenderer } = await import("../src/webGpuFloorplanRenderer.ts");
+  const { createEmptyVectorScene } = await import("../src/emptyVectorScene.ts");
+  const { VectorOrderedBatches } = await import("../src/vectorOrderedBatches.ts");
+  const { VectorStrokeLodRuntime, buildRuntimeTileBuckets, storePrebuiltVectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
+  const { strokePaintOrigins, setStrokePaintOrigins } = await import("../src/vectorStrokePaintOrder.ts");
   const scene = fixture();
   const culler = new VectorDrawRunCuller(scene);
   const view = { minX: -2, minY: -2, maxX: 12, maxY: 12 };
@@ -72,6 +76,79 @@ try {
   assert.equal(nearClipCuller.select(overview, 0.1).length, 0,
     "zooming back refreshes the nonempty overview list too");
   assert.deepEqual(vectorViewBounds(20, 40, 5, 6, 2), { minX: 0, minY: -4, maxX: 10, maxY: 16 });
+
+  // A merged line belongs to its first paint, but reaches through many later
+  // singleton paints. Panning onto its far end must retain that first paint
+  // even after its canonical source segment has left the viewport.
+  const count = 512;
+  const merged = { ...createEmptyVectorScene(), segmentCount: count, maxHalfWidth: .5,
+    bounds: { minX: 0, minY: -1, maxX: count * 20, maxY: 1 },
+    drawRuns: Array.from({ length: count }, (_, first) => ({ kind: "stroke", first, count: 1 })) };
+  for (const field of ["endpoints", "primitiveMeta", "primitiveBounds", "styles"]) merged[field] = new Float32Array(count * 4);
+  for (let id = 0; id < count; id++) {
+    const x0 = id * 20, x1 = x0 + 20;
+    merged.endpoints.set([x0, 0, x1, 0], id * 4);
+    merged.primitiveMeta.set([x1, 0, 0, 1], id * 4);
+    merged.primitiveBounds.set([x0, 0, x1, 0], id * 4);
+    merged.styles.set([.5, 0, 0, 0], id * 4);
+  }
+  merged.paintGraph = { roots: merged.drawRuns.map((_run, runIndex) => ({ kind: "group", alpha: 1,
+    isolated: true, knockout: false, blendMode: "Darken", children: [{ kind: "draw", runIndex }] })) };
+  const coarseScene = { ...merged, segmentCount: 1, endpoints: Float32Array.of(0, 0, 640, 0),
+    primitiveMeta: Float32Array.of(640, 0, 0, 1), primitiveBounds: Float32Array.of(0, 0, 640, 0),
+    styles: Float32Array.of(.5, 0, 0, 0) };
+  setStrokePaintOrigins(coarseScene, Uint32Array.of(0));
+  const grid = { columns: 1, rows: 1, ...merged.bounds, tileWidth: count * 20, tileHeight: 2,
+    xEdges: Float64Array.of(0, count * 20), yEdges: Float64Array.of(-1, 1) };
+  const mergedRuntime = new VectorStrokeLodRuntime(merged, { tileGrid: grid, elapsedMs: 0,
+    levels: [{ scene: merged, segmentCount: count, tolerance: 0, ...buildRuntimeTileBuckets(merged, grid) },
+      { scene: coarseScene, segmentCount: 1, tolerance: 1, overview: true, ...buildRuntimeTileBuckets(coarseScene, grid) }] });
+  const coarse = mergedRuntime.levels.at(-1);
+  assert(coarse.tolerance > 0 && coarse.segmentCount < count);
+  const origin = strokePaintOrigins(coarse.scene)[0], paint = merged.drawRuns[origin];
+  const farX = coarse.scene.primitiveMeta[0] - 1;
+  const farView = { minX: farX, minY: -.25, maxX: farX + 1, maxY: .25 };
+  const mergedPlan = new VectorOrderedBatches(merged, mergedRuntime);
+  const canonicalCuller = new VectorDrawRunCuller(merged);
+  assert(!canonicalCuller.select(farView, .01, mergedPlan.cullingPadding).includes(paint),
+    "the far-end fixture lies beyond the original paint and the LOD tolerance margin");
+  const mergedCuller = mergedPlan.createRunCuller();
+  assert(mergedCuller.select({ minX: 0, minY: -.25, maxX: 1, maxY: .25 }, .01,
+    mergedPlan.cullingPadding).includes(paint), "the merged paint starts visible at its canonical origin");
+  assert(mergedCuller.select(farView, .01, mergedPlan.cullingPadding).includes(paint),
+    "paint culling includes every dormant LOD representative's actual reach");
+  for (const level of mergedRuntime.levels) level.visibleSegmentCount = level === coarse ? 1 : 0;
+  coarse.visibleSegmentIds[0] = 0;
+  mergedPlan.update(mergedCuller.select(farView, .01, mergedPlan.cullingPadding), .01);
+  assert.equal(mergedPlan.instanceCount, 1, "panning onto the merged line's far end still submits its selected representative");
+  const outside = { minX: merged.bounds.maxX + 1000, minY: 0, maxX: merged.bounds.maxX + 1010, maxY: 1 };
+  assert.equal(mergedCuller.select(outside, .01, mergedPlan.cullingPadding).length, 0,
+    "expanded paint bounds still cull views outside all source and derived geometry");
+
+  // Both production LOD rebuild paths install these bounds, and disabling LOD
+  // restores the smaller canonical paint extents without changing origins.
+  const usageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "GPUBufferUsage");
+  Object.defineProperty(globalThis, "GPUBufferUsage", { configurable: true, value: { STORAGE: 1, COPY_DST: 2 } });
+  try {
+    for (const Renderer of [WebGlFloorplanRenderer, WebGpuFloorplanRenderer]) {
+      const renderer = Object.create(Renderer.prototype);
+      Object.assign(renderer, { scene: merged, vectorLodMode: "force", orderedInstanceBuffer: { destroy() {} },
+        gpuDevice: { createBuffer: () => ({ destroy() {} }) },
+        uploadSegments() {}, uploadVectorLodLevels() {}, uploadVectorClips() {}, destroyVectorLodResources() {} });
+      const rebuild = Renderer === WebGlFloorplanRenderer ? "rebuildVectorLod" : "prepareVectorLod";
+      storePrebuiltVectorStrokeLodRuntime(merged, mergedRuntime);
+      assert(renderer[rebuild](merged));
+      assert(renderer.orderedRunCuller.select(farView, .01, renderer.orderedBatches.cullingPadding).includes(paint),
+        `${Renderer.name} uses derived geometry when culling canonical paints`);
+      renderer.vectorLodMode = "off";
+      assert.equal(renderer[rebuild](merged), false);
+      assert(!renderer.orderedRunCuller.select(farView, .01).includes(paint),
+        `${Renderer.name} restores canonical culling with Vector LOD off`);
+    }
+  } finally {
+    if (usageDescriptor) Object.defineProperty(globalThis, "GPUBufferUsage", usageDescriptor);
+    else delete globalThis.GPUBufferUsage;
+  }
 
   // Production submission paths use the filtered list, in its original order.
   const gl = Object.create(WebGlFloorplanRenderer.prototype);

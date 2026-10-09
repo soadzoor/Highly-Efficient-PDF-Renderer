@@ -1,7 +1,7 @@
 import { normalizeScenePaintGraph, scenePaintSpanSegments, type ScenePaintNode } from "./scenePaintGraph";
 import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import { VectorPageDrawScheduler } from "./vectorPageDrawScheduler";
-import { sceneStrokeRecords, type StrokeRecords } from "./strokeRecords";
+import { sceneStrokeRecords, strokeRecordsMatchSourceColors, type StrokeRecords } from "./strokeRecords";
 import type { TextLodBuildData } from "./textLodCore";
 import type { VectorScene } from "./pdfVectorExtractor";
 
@@ -21,14 +21,19 @@ const plans = new WeakMap<VectorScene, ThreeVectorDrawPlan>();
  * constrains reordering to source-over spans, preserving every effect boundary.
  */
 export class ThreeVectorDrawPlan {
-  /** Bumped whenever {@link order} changes, so layers can rebuild their batches. */
+  /** Bumped when submission order or effect spans change, so layers rebuild their batches. */
   version = 0;
   private scheduler: VectorPageDrawScheduler | null;
-  readonly segments: Uint32Array | null;
+  segments: Uint32Array | null;
+  /** Public graphs that visit runs backwards keep their graph-neighbour batching. */
+  readonly spanOrdered: boolean;
   private readonly scene: VectorScene;
   private readonly independentPageRuns: Uint16Array | null;
   private unitsPerPixel: number | null = null;
   private colorCommutationEnabled = true;
+  private strokeColorsMatchSource = true;
+  private strokes: StrokeRecords;
+  private sourceRuns: Uint32Array;
   private textLodEnabled = false;
   private textLodData: TextLodBuildData | null = null;
   private readonly all: readonly number[];
@@ -47,7 +52,10 @@ export class ThreeVectorDrawPlan {
     this.positionOfRun = new Int32Array(runs.length);
     for (let index = 0; index < runs.length; index++) this.positionOfRun[index] = index;
     this.segments = sceneRequiresPaintCompositing(scene) ? scenePaintSpanSegments(scene) : null;
-    this.scheduler = this.createScheduler(sceneStrokeRecords(scene), strokeSourceRuns(scene));
+    this.spanOrdered = !this.segments || graphRunsInOrder(scene);
+    this.strokes = sceneStrokeRecords(scene);
+    this.sourceRuns = strokeSourceRuns(scene);
+    this.scheduler = this.createScheduler();
   }
 
   /** Scheduled run indices; canonical order until a pixel scale is supplied. */
@@ -55,6 +63,8 @@ export class ThreeVectorDrawPlan {
 
   /** Submission position of each canonical run, for `renderOrder` assignment. */
   get positions(): Int32Array { return this.positionOfRun; }
+
+  get colorBatchingEnabled(): boolean { return this.colorCommutationEnabled && this.strokeColorsMatchSource; }
 
   /** True while minification holds the scheduler's coverage margin. */
   get paintOrderApproximated(): boolean { return (!this.textLodEnabled || !!this.textLodData) && (this.scheduler?.paintOrderApproximated ?? false); }
@@ -77,9 +87,16 @@ export class ThreeVectorDrawPlan {
 
   /** Temporary primitive colors invalidate the source-color commutation proof. */
   setColorCommutationEnabled(enabled: boolean): boolean {
+    if (this.colorCommutationEnabled === enabled) return false;
     this.colorCommutationEnabled = enabled;
-    if (!this.scheduler?.setColorCommutationEnabled(enabled)) return false;
-    return this.reschedule();
+    const segments = sceneRequiresPaintCompositing(this.scene)
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+    if (segments === this.segments) {
+      this.scheduler?.setColorCommutationEnabled(enabled);
+      return this.reschedule();
+    }
+    this.rebuildScheduler();
+    return true;
   }
 
   /**
@@ -96,20 +113,30 @@ export class ThreeVectorDrawPlan {
   /** Include every LOD level in the commutation proof, even while it is dormant. */
   setStrokeSource(strokes: StrokeRecords, origins: Uint32Array): void {
     const canonical = strokeSourceRuns(this.scene);
-    const sourceRuns = Uint32Array.from(origins, origin => canonical[origin]);
-    this.scheduler = this.createScheduler(strokes, sourceRuns);
+    this.strokes = strokes;
+    this.sourceRuns = Uint32Array.from(origins, origin => canonical[origin]);
+    this.strokeColorsMatchSource = strokeRecordsMatchSourceColors(this.scene, strokes, origins);
+    this.rebuildScheduler();
+  }
+
+  private rebuildScheduler(): void {
+    this.segments = sceneRequiresPaintCompositing(this.scene)
+      ? scenePaintSpanSegments(this.scene, this.colorBatchingEnabled) : null;
+    this.scheduler = this.createScheduler();
     if (this.textLodData) this.scheduler?.includeTextLod(this.textLodData);
     this.scheduler?.setColorCommutationEnabled(this.colorCommutationEnabled);
     this.scheduler?.updateScale(this.unitsPerPixel);
+    // Even unchanged run order needs new meshes when effect boundaries change.
+    this.version++;
     this.reschedule();
   }
 
-  private createScheduler(strokes: StrokeRecords, sourceRuns: Uint32Array): VectorPageDrawScheduler | null {
+  private createScheduler(): VectorPageDrawScheduler | null {
     // Arbitrary public graphs can visit canonical runs backwards. Such graphs
     // retain their source submissions rather than feeding a non-monotonic span
     // sequence to the scheduler.
-    if (this.segments && !graphRunsInOrder(this.scene)) return null;
-    return VectorPageDrawScheduler.create(this.scene, strokes, sourceRuns, this.segments, this.independentPageRuns);
+    if (!this.spanOrdered) return null;
+    return VectorPageDrawScheduler.create(this.scene, this.strokes, this.sourceRuns, this.segments, this.independentPageRuns);
   }
 
   private reschedule(): boolean {

@@ -1,6 +1,6 @@
 import { createEmptyVectorScene } from "./emptyVectorScene";
 import { prepareVectorStrokeLodData } from "./vectorStrokeLodCore";
-import { setStrokePaintOrigins } from "./vectorStrokePaintOrder";
+import { setStrokePaintGroups, setStrokePaintOrigins } from "./vectorStrokePaintOrder";
 import { buildTextLodAsync } from "./textGreekLod";
 import type { LodWorkerRequest, LodWorkerResponse } from "./lodWorkerClient";
 
@@ -20,6 +20,7 @@ scope.addEventListener("message", async (event) => {
     let response: LodWorkerResponse;
     if (request.type === "vector") {
       setStrokePaintOrigins(scene, request.origins);
+      setStrokePaintGroups(scene, request.paintGroups);
       response = { type: "vector",
         result: await prepareVectorStrokeLodData(scene, request.stored, request.overviewAllowed, { onProgress }) };
     } else response = { type: "text", result: await buildTextLodAsync(scene, { onProgress }) };

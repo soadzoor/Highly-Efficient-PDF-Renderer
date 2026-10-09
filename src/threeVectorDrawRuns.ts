@@ -272,7 +272,7 @@ export class ThreeVectorDrawRuns {
   private canBatch(previous: VectorDrawRun, previousIndex: number, next: VectorDrawRun, nextIndex: number, end: number): boolean {
     if (previous.kind !== next.kind || next.blendMode) return false;
     if (this.neighbours === null) return true;
-    if (this.plan.segments && this.plan.version > 0) {
+    if (this.plan.segments && this.plan.spanOrdered) {
       return this.plan.segments[previousIndex] === this.plan.segments[nextIndex];
     }
     // Compositing keeps the canonical order and its transparency groups, so a

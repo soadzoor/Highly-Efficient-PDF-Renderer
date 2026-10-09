@@ -5,12 +5,11 @@ import {
 } from "./vectorStrokeIntervalGroups";
 import {
   explicitStrokePaintOrigins, hasStrokePaintOrigins, releaseStrokePaintGroups, setStrokePaintOrigins,
-  strokePaintGroups, strokePaintOrigin
+  strokePaintGroups, strokePaintOrigin, strokeLodOverviewAllowed
 } from "./vectorStrokePaintOrder";
 import {
   materializeVectorStrokeLodLevel, vectorStrokeLodLevelScene, type VectorStrokeLodRecordStore
 } from "./vectorStrokeLodStorage";
-import { sceneRequiresPaintCompositing } from "./scenePaintVisibility";
 import type {Bounds, VectorScene} from "./pdfVectorExtractor";
 import type {ViewState} from "./webGlFloorplanRenderer";
 
@@ -1262,7 +1261,7 @@ export function shouldUseVectorStrokeLod(mode: VectorLodMode, rendererType: "web
 
 function strokeLodBuildSteps(scene: VectorScene, overviewAllowed?: boolean): Array<{ tolerance: number; overview: boolean }> {
   const overview = scene.segmentCount > VECTOR_STROKE_LOD_TARGET_VISIBLE_SEGMENTS &&
-    (overviewAllowed ?? (!sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)));
+    (overviewAllowed ?? strokeLodOverviewAllowed(scene));
   // Preserve a fine, coverage-weighted level before generating lossy overview
   // levels. Small/effect scenes keep the existing conservative hierarchy.
   return [
@@ -1344,7 +1343,8 @@ async function runStrokeLodBuildAsync<T>(build: StrokeLodBuild<T>, scheduler: Ve
  * geometry bits, paint origins and the level acceptance rule are those of a
  * standalone per-level build; only unchanged canonical strokes are shared.
  */
-function* buildStrokeLodHierarchy(scene: VectorScene, overviewAllowed?: boolean): StrokeLodBuild<StrokeLodHierarchy> {
+function* buildStrokeLodHierarchy(scene: VectorScene,
+  overviewAllowed = strokeLodOverviewAllowed(scene)): StrokeLodBuild<StrokeLodHierarchy> {
   const baseCount = Math.max(0, scene.segmentCount | 0);
   const sink = new StrokeLodRecordSink(scene);
   const levels: StrokeLodHierarchyLevel[] = [
@@ -1360,7 +1360,7 @@ function* buildStrokeLodHierarchy(scene: VectorScene, overviewAllowed?: boolean)
       const startValue = 0.06 + i / toleranceCount * 0.62;
       const endValue = 0.06 + (i + 1) / toleranceCount * 0.62;
       yield { value: startValue, message: `Simplifying Vector LOD ${i + 1}/${toleranceCount}`, yieldable: false };
-      const simplified = yield* simplifyStrokeLevel(scene, tolerance, overview, sink, startValue, endValue);
+      const simplified = yield* simplifyStrokeLevel(scene, tolerance, overview, sink, startValue, endValue, overviewAllowed);
       const keep = simplified !== null && simplified.segmentCount > 0 &&
         simplified.segmentCount < previousCount * MIN_LEVEL_REDUCTION_RATIO;
       const records = sink.endLevel(keep);
@@ -1732,7 +1732,8 @@ function* simplifyStrokeLevel(
   overview: boolean,
   sink: StrokeLodRecordSink,
   startValue: number,
-  endValue: number
+  endValue: number,
+  densityAllowed: boolean
 ): StrokeLodBuild<SimplifiedStrokeLevel | null> {
   sink.beginLevel();
   const segmentCount = Math.max(0, scene.segmentCount | 0);
@@ -1745,8 +1746,16 @@ function* simplifyStrokeLevel(
   const progress = (fraction: number, message: string): StrokeLodBuildStep =>
     ({ value: startValue + (endValue - startValue) * fraction, message, yieldable: true });
   const grid = createTileGrid(scene.bounds, tolerance);
-  const groups = new CompactStrokeIntervalGroups(tolerance, overview, index => readStrokePrimitive(scene, index));
-  const densityGroups = !overview && !sceneRequiresPaintCompositing(scene) && !scene.drawRuns?.some(run => run.blendMode)
+  // Fine interval unions cannot preserve repeated AA coverage across separate
+  // paint operations. Weighted density aggregation can retain that multiplicity.
+  const intervalPaintGroups = overview ? undefined : strokePaintGroups(scene, false);
+  const readIntervalPrimitive = (index: number): StrokePrimitive | null => {
+    const primitive = readStrokePrimitive(scene, index);
+    if (primitive && intervalPaintGroups) primitive.paintGroup = intervalPaintGroups[index];
+    return primitive;
+  };
+  const groups = new CompactStrokeIntervalGroups(tolerance, overview, readIntervalPrimitive);
+  const densityGroups = !overview && densityAllowed
     ? new DenseStrokeGroups() : null;
   const outBounds = createEmptyBounds();
   let maxHalfWidth = 0;
@@ -1822,7 +1831,7 @@ function* simplifyStrokeLevel(
       scene.bounds,
       grid
     );
-    groups.add(primitive, index, tileIndex);
+    groups.add(intervalPaintGroups ? { ...primitive, paintGroup: intervalPaintGroups[index] } : primitive, index, tileIndex);
     maxHalfWidth = Math.max(maxHalfWidth, primitive.halfWidth);
   }
 

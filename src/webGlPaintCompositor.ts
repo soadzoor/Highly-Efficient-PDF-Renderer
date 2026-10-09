@@ -122,7 +122,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
     draw: (runs: readonly VectorDrawRun[], shapeOnly: boolean) => void,
     visible: (condition?: number) => boolean, selected: Uint8Array | null = null,
     project: PdfCompositeProjector | null = null, knownState?: WebGlPaintCompositorState,
-    folding: WebGlPaintFolding | null = null): void {
+    folding: WebGlPaintFolding | null = null, colorBatchingEnabled = true): void {
     const gl = this.gl;
     const size = choosePdfCompositeResolution(scene, width, height);
     if (size.scale < 1 && !this.approximationReported) {
@@ -145,7 +145,7 @@ export class WebGlPaintCompositor implements ScenePaintCompositorAdapter<Surface
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, backdrop.framebuffer);
       gl.blitFramebuffer(viewport[0], viewport[1], viewport[0] + width, viewport[1] + height,
         0, 0, this.width, this.height, gl.COLOR_BUFFER_BIT, gl.LINEAR);
-      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true);
+      result = compositeScenePaintGraph(scene, this, backdrop, visible, selected, true, colorBatchingEnabled);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, result.framebuffer);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebuffer);
       gl.blitFramebuffer(0, 0, this.width, this.height, viewport[0], viewport[1], viewport[0] + width, viewport[1] + height,

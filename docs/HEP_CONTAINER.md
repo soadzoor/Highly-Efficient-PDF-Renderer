@@ -594,11 +594,11 @@ This additive metadata changes no container or scene version.
 For older files or custom scenes, callers can supply the original PDF length.
 
 The optional top-level `manifest.lod` object has independent `vector` and `text`
-entries: vector currently uses `{ "version": 3, "file": "lod-vector/index.json" }`,
+entries: vector currently uses `{ "version": 4, "file": "lod-vector/index.json" }`,
 and text uses `{ "version": 3, "file": "lod-text/index.json" }`. These additive caches do not require a container or
 scene-schema bump: the canonical scene is unchanged and older readers ignore
 unknown sections. Bump the corresponding cache version when its build algorithm
-or representation changes. Readers accept vector v1/v2/v3 and text v1/v2/v3, warning when an older encoding
+or representation changes. Readers accept vector v1/v2/v3/v4 and text v1/v2/v3, warning when an older encoding
 can be repacked for smaller files. Other
 versions or malformed caches fall back independently to normal LOD generation
 with a console warning. Generic container repacking preserves caches as-is;
@@ -725,3 +725,23 @@ rounding or bound growth. A v2 scalar `positionQuantum` can be retained when
 repacking without additional rounding; explicitly choosing compact upgrades it
 to adaptive grids. Out-of-range coordinates retain their existing precision with
 a warning. Text caches continue using v2 without additional loss.
+
+### Vector LOD build v4
+
+The v3 storage representation is retained. Compatible neighboring Darken paint
+groups now share density and overview simplification boundaries; fine interval
+merging keeps the original paint-operation boundaries. Large scenes whose normalized
+paint graph has only supported source-over or Darken scopes can use overview
+levels. Exact geometry, paint origins, clipping, and optional-content boundaries
+remain in the canonical scene; the overview hierarchy may approximate tiny marks
+under the existing screen-space error budget.
+
+When a scene exceeds the visible-stroke target and its composite paint graph is
+newly eligible for overview levels, readers skip vector v1/v2/v3 caches with a
+diagnostic and rebuild the hierarchy during normal viewer or export preparation.
+Existing HEPs therefore gain the new levels without re-exporting or parsing the PDF.
+Ordinary older caches remain usable, text caches are unaffected, and vector v4
+caches are adopted without simplification.
+
+The LOD repacker only changes existing encoding, so it refuses affected stale
+caches rather than marking an obsolete hierarchy as v4 without rebuilding it.

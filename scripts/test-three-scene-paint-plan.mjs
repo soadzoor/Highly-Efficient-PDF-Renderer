@@ -103,6 +103,33 @@ try {
   }
 
   const state = { blendsPasses: true, canFold: true, canFoldMask: true, projection: 0, visible: true };
+  const monochrome = Object.assign(createEmptyVectorScene(), {
+    fillPathCount: 2,
+    fillPathMetaA: Float32Array.of(0, 0, 0, 0, 0, 0, 1, 1),
+    fillPathMetaB: Float32Array.of(10, 10, .5, .5, 11, 11, .5, .5),
+    fillPathMetaC: Float32Array.of(0, 0, .5, .6, 0, 0, .5, .7),
+    drawRuns: [{ kind: "fill", first: 0, count: 1 }, { kind: "fill", first: 1, count: 1 }],
+    paintGraph: { roots: [group([draw(0)], { blendMode: "Darken" }), group([draw(1)], { blendMode: "Darken" })] }
+  });
+  const colorPlan = new ThreeScenePaintPlan();
+  const batched = executePlan(colorPlan, monochrome, state, () => true, null);
+  assert.deepEqual(batched, executeOriginal(monochrome, state, () => true, null));
+  assert.equal(batched.filter(operation => operation[0] === "draw").length, 1,
+    "equal-color Darken groups share one draw span");
+  executePlan(colorPlan, monochrome, state, () => true, null);
+  assert.equal(colorPlan.reused, true);
+  const unbatched = executePlan(colorPlan, monochrome, state, () => true, null, 0, 0, 64, false);
+  assert.deepEqual(unbatched, executeOriginal(monochrome, state, () => true, null, false));
+  assert.equal(colorPlan.reused, false, "primitive color changes invalidate cached color-dependent group batching");
+  assert.equal(unbatched.filter(operation => operation[0] === "draw").length, 2,
+    "disabled color batching retains separate Darken groups");
+  executePlan(colorPlan, monochrome, state, () => true, null, 0, 0, 64, false);
+  assert.equal(colorPlan.reused, true);
+  assert.deepEqual(executePlan(colorPlan, monochrome, state, () => true, null), batched);
+  assert.equal(colorPlan.reused, false, "restored source colors rebuild the batched plan");
+  assert.deepEqual(executePlan(colorPlan, monochrome, state, () => true, null, undefined, 0, 64, false), unbatched,
+    "uncached plans also respect disabled color batching");
+
   const plan = new ThreeScenePaintPlan();
   executePlan(plan, scene, state, () => true, null);
   const failing = makeAdapter(state);
@@ -113,17 +140,17 @@ try {
   assert.equal(plan.operations, 0);
   console.log("Three scene paint plans passed: exact operation/lifetime parity, dynamic mask projections, visibility/culling/scene/proxy/resize/capability invalidation and failure cleanup.");
 
-  function executePlan(plan, input, state, visible, selected, revision, structure = 0, width = 64) {
+  function executePlan(plan, input, state, visible, selected, revision, structure = 0, width = 64, colorBatchingEnabled = true) {
     if (arguments.length < 6) revision = 0;
     const host = makeAdapter(state);
-    const result = plan.execute(input, host.adapter, { id: 0 }, visible, selected, revision, structure, width, 32);
+    const result = plan.execute(input, host.adapter, { id: 0 }, visible, selected, revision, structure, width, 32, colorBatchingEnabled);
     host.live.delete(result.id);
     assert.equal(host.live.size, 0);
     return host.operations;
   }
-  function executeOriginal(input, state, visible, selected) {
+  function executeOriginal(input, state, visible, selected, colorBatchingEnabled = true) {
     const host = makeAdapter(state);
-    const result = compositeScenePaintGraph(input, host.adapter, { id: 0 }, visible, selected, true);
+    const result = compositeScenePaintGraph(input, host.adapter, { id: 0 }, visible, selected, true, colorBatchingEnabled);
     host.live.delete(result.id);
     assert.equal(host.live.size, 0);
     return host.operations;
