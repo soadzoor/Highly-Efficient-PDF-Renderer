@@ -18,7 +18,8 @@ try {
   const { buildHep } = await import("../src/hepBuilder.ts");
   const { packVectorClips } = await import("../src/vectorClips.ts");
   const { loadSceneFromHep, prepareSceneForHepRendering } = await import("../src/hep.ts");
-  const { buildVectorStrokeLodScenes, VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
+  const { buildVectorStrokeLodScenes, getStoredVectorStrokeLod,
+    VectorStrokeLodRuntime } = await import("../src/vectorStrokeLodCore.ts");
 
   // A floorplan-sized extent with closely spaced hatch lines. Tiny coordinate
   // shifts change LOD merge buckets even when the movement is subpixel.
@@ -118,11 +119,14 @@ try {
     }
   }
 
-  const options = { sourceLabel: "fixture.pdf", compression: "store" };
+  // Exact runtime parity requires lossless derived geometry. Default compact
+  // caches add their coordinate-rounding allowance to selection tolerances.
+  const options = { sourceLabel: "fixture.pdf", compression: "store", vectorLodPrecision: "lossless" };
   const blob = await buildHep(scene, options);
   const rawZip = await HepArchive.loadAsync(await blob.arrayBuffer());
   const rawManifest = JSON.parse(await rawZip.file("manifest.json").async("string"));
   assert.equal(rawManifest.formatVersion, 9);
+  assert.equal(rawManifest.lod.vector.precision, "lossless");
   assert.equal(rawManifest.strokeGeometry.endpointsFile, "geometry/stroke-endpoints.csq16");
   assert.equal(rawManifest.strokeGeometry.encoding, undefined, "keep the existing compact format");
   assert.equal(rawManifest.strokeGeometry.boundsFile, undefined, "do not add full float32 bounds");
@@ -147,6 +151,33 @@ try {
       exportedScene = await loadSceneFromHep(await exported.arrayBuffer());
       assertBuffersEqual(exportedScene, prepared, visualFields, `round ${round}, ${compression}`);
       assert.deepEqual(exportedScene.textIndex, prepared.textIndex);
+      assertLodEqual(exportedScene, prepared);
+    }
+  }
+
+  // Default compact caches preserve canonical geometry and retain the same
+  // rounding allowance, derived geometry and tile selection on re-export.
+  const compactBlob = await buildHep(prepared, { sourceLabel: "fixture.pdf", compression: "store" });
+  const compactZip = await HepArchive.loadAsync(await compactBlob.arrayBuffer());
+  const compactManifest = JSON.parse(await compactZip.file("manifest.json").async("string"));
+  assert.equal(compactManifest.lod.vector.precision, "compact");
+  const compactScene = await loadSceneFromHep(await compactBlob.arrayBuffer());
+  assertBuffersEqual(compactScene, prepared, visualFields, "default compact HEP");
+  assert.deepEqual(compactScene.textIndex, prepared.textIndex);
+  const compactLod = getStoredVectorStrokeLod(compactScene);
+  assert.ok(compactLod?.positionQuanta instanceof Float32Array, "compact cache must be adopted");
+  assert.ok(compactLod.levels[1].tolerance > getStoredVectorStrokeLod(loaded).levels[1].tolerance,
+    "compact selection tolerance must include the coordinate-rounding allowance");
+  for (const compression of ["store", "deflate"]) {
+    let exportedScene = compactScene;
+    for (let round = 0; round < 2; round += 1) {
+      const exported = await buildHep(exportedScene, { compression });
+      exportedScene = await loadSceneFromHep(await exported.arrayBuffer());
+      assertBuffersEqual(exportedScene, prepared, visualFields, `compact round ${round}, ${compression}`);
+      assert.deepEqual(exportedScene.textIndex, prepared.textIndex);
+      assert.deepEqual(getStoredVectorStrokeLod(exportedScene), compactLod,
+        "compact re-export must not accumulate coordinate, tolerance or bounds rounding");
+      assertLodEqual(exportedScene, compactScene);
     }
   }
 

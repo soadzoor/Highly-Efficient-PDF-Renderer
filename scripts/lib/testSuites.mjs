@@ -19,6 +19,7 @@ export const fastTests = [
   "hep-api",
   "large-bit-addresses",
   "hep-lod",
+  "hep-scene-parity",
   "hep-lod-export-memory",
   "hep-lod-repack-budget",
   "hep-lod-examples",
@@ -242,7 +243,6 @@ export const explicitSuites = {
   conversion: [
     "hep",
     "hep-package",
-    "hep-scene-parity",
     "hep-v6-native-raster-recovery",
     "pdf-to-hep-cli",
     "raster-image-hep"
