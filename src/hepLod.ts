@@ -1,4 +1,4 @@
-import { prepareVectorLodForStorage, packVectorLod, unpackVectorLod, packTextLod, unpackTextLod } from "./hepLodEncoding";
+import { prepareVectorLodForStorage, packVectorLod, packVectorLodWithPointRecipes, unpackVectorLod, packTextLod, unpackTextLod } from "./hepLodEncoding";
 import { HepArchive } from "./hepContainer";
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import {
@@ -12,7 +12,7 @@ import type { TextLodBuildData } from "./textGreekLod";
 import { resolveHepLodOptions } from "./hepLodOptions";
 
 // Bump independently when a build algorithm or its persisted representation changes.
-export const HEP_VECTOR_LOD_VERSION = 4;
+export const HEP_VECTOR_LOD_VERSION = 5;
 export const HEP_TEXT_LOD_VERSION = 3;
 export interface HepLodOptions {
   /** Embed vector LOD geometry, building it if absent; rebuild spatial indexes on load. @default true */
@@ -44,8 +44,11 @@ export async function writeHepLod(archive: HepArchive, scene: VectorScene,
     }
     options.signal?.throwIfAborted();
     if (data) data = prepareVectorLodForStorage(data, (options.vectorLodPrecision ?? "compact") === "compact");
-    if (data) result.vector = { ...writeData(archive, "lod-vector", HEP_VECTOR_LOD_VERSION, packVectorLod(scene, data)),
-      precision: data.positionQuantum || data.positionQuanta ? "compact" : "lossless" };
+    if (data) {
+      const packed = await packVectorLodWithPointRecipes(scene, packVectorLod(scene, data), options.signal);
+      result.vector = { ...writeData(archive, "lod-vector", packed.pointRecipes ? 5 : 4, packed),
+        precision: data.positionQuantum || data.positionQuanta ? "compact" : "lossless" };
+    }
     options.onProgress?.(1 / steps, "vector-lod");
   }
   if (text) {
@@ -89,6 +92,9 @@ export async function readHepLod(archive: HepArchive, scene: VectorScene, metada
       let data = await readData(archive, prefix, signal);
       if (kind === "text" && descriptor.version === 3) requireValid((data as { textEncoding?: string }).textEncoding === "predictive");
       if (kind === "vector" && descriptor.version >= 3) requireValid((data as { tileIndexes?: string }).tileIndexes === "rebuild");
+      if (kind === "vector") requireValid(descriptor.version === 5
+        ? (data as { pointRecipes?: unknown }).pointRecipes !== undefined
+        : (data as { pointRecipes?: unknown }).pointRecipes === undefined);
       if (descriptor.version >= 2) data = kind === "vector"
         ? unpackVectorLod(scene, data as Parameters<typeof unpackVectorLod>[1])
         : unpackTextLod(data as Parameters<typeof unpackTextLod>[0], scene, signal);

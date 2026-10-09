@@ -1,10 +1,10 @@
-# HEP container versions 1–3
+# HEP container versions 1–4
 
 The `.hep` file is a binary container with MIME type `application/x-hep`. Container
-versions **1–3** wrap **scene schema versions 9–13**, recorded in
+versions **1–4** wrap **scene schema versions 9–13**, recorded in
 `manifest.json`. These version numbers evolve independently. The page-based v8
 document model is a different thing; it is not this container's scene schema.
-Readers support all three container versions and scene v9–v13; files using older
+Readers support all four container versions and scene v9–v13; files using older
 scene schemas must be regenerated from their original PDF. Writers use scene
 v13 when repeated paint-group metadata is compacted, v12 for transposed binary
 runs, v10 for plain packed monochrome rasters, otherwise v9. Legacy v11 JBIG2
@@ -25,7 +25,7 @@ The first 32 bytes are:
 | Offset | Type | Value |
 | --- | --- | --- |
 | 0 | 4 bytes | `48 45 50 00` (`HEP\0`) |
-| 4 | uint16 | Container version: `1`, `2` or `3` |
+| 4 | uint16 | Container version: `1`, `2`, `3` or `4` |
 | 6 | uint16 | Flags: `0` |
 | 8 | uint32 | Entry count |
 | 12 | uint32 | Chunk count |
@@ -43,7 +43,7 @@ records; its length is divisible by four. Each chunk record is 20 bytes:
 | 4 | uint32 | Stored payload length, excluding external padding |
 | 8 | uint32 | Decoded payload length, including internal alignment gaps |
 | 12 | uint32 | CRC32 of the complete decoded chunk |
-| 16 | uint8 | Codec: `0` = stored, `1` = zlib-wrapped DEFLATE, `2` = DEFLATE with exact vec4 palette (container v2–v3), `3` = DEFLATE with exact integer varints (container v3) |
+| 16 | uint8 | Codec: `0` = stored, `1` = zlib-wrapped DEFLATE, `2` = DEFLATE with exact vec4 palette (container v2–v4), `3` = DEFLATE with exact integer varints (container v3–v4), `4` = DEFLATE with exact connected paths (container v4) |
 | 17 | 3 bytes | Reserved: all zero |
 
 Each variable-length entry record has this layout:
@@ -164,6 +164,42 @@ unchanged chunk layout makes this a whole-file size guarantee. Global or
 per-entry `STORE` bypasses the transform. Existing LOD arrays and their index
 JSON remain byte identical after decoding; both the canonical scene and the
 precomputed hierarchy are preserved.
+
+## Connected path chunks (container v4)
+
+Container v4 adds codec `4` for standalone `geometry/clip-paths.d512` sections.
+It stores connected outlines without repeating each edge's endpoints as
+independent coordinates. It changes only physical storage: the original path
+records, parent references, fill rules, ordering and all section bytes are
+reconstructed exactly. It neither parses PDFs nor builds LOD geometry. Other
+codecs and earlier container versions remain readable.
+
+The zlib-wrapped DEFLATE payload inflates to:
+
+1. Mode byte `0`.
+2. Canonical uint32 varint giving the original section prefix length.
+3. That exact prefix: path count, per-path parent/fill-rule/edge-count records,
+   and the four original coordinate-column byte lengths.
+4. Four canonical uint32 varints giving the new column byte lengths.
+5. Four zigzag-varint coordinate columns: `sx - previousEx`,
+   `sy - previousEy`, `ex - sx`, and `ey - sy`.
+
+Coordinates are integers on the existing 1/512 grid. The preceding endpoint
+starts at `(0,0)` and advances across the complete section, including path
+boundaries and discontinuities. Decoding reconstructs the original independent
+coordinate deltas, their canonical varints and original column lengths.
+
+Inflation is bounded by `5 * decodedLength + 26`: each original coordinate needs
+at least one byte and each chained coordinate at most five; extra framing uses
+at most 26 bytes. Before allocating the reconstructed section, the decoder
+validates canonical varints, parent references, fill rules, edge counts, fixed
+coordinate ranges, all column lengths and trailing bytes. Normal decoded-length
+and CRC checks then apply. Caller-supplied section limits remain supported.
+
+The writer selects codec 4 only when the compressed payload, padded to four
+bytes, is strictly smaller than the existing candidate. Unsupported original
+path encodings retain their prior codec. Global/per-entry `STORE` bypasses this
+transform. Files containing codec 4 require an updated container v4 reader.
 
 ## Annotation metadata
 
@@ -829,3 +865,37 @@ caches are adopted without simplification.
 
 The LOD repacker only changes existing encoding, so it refuses affected stale
 caches rather than marking an obsolete hierarchy as v4 without rebuilding it.
+
+### Vector LOD point recipes v5
+
+Vector v5 retains the existing hierarchy but stores derived start/end points as
+references to canonical shape geometry where possible. It does not fit curves,
+change precision or simplify levels. The runtime still receives the same
+Float32 records after one expansion during loading. Existing v1–v4 caches remain
+readable; new exports retain v4 when recipes do not reduce the complete compressed
+vector-cache storage, including descriptors, index records and padding.
+
+The index adds `pointRecipes: { version: 1, start, end }`. Each point recipe
+contains Uint32 `references` of length `literals.segmentCount` and Uint32
+`residuals` containing two component-major coordinate columns for explicit
+points. A reference code of zero consumes the next explicit residual pair.
+Nonzero codes encode `zigzag(sourcePointId - predictedPointId) + 1`.
+Canonical point ID `2 * strokeId` addresses that stroke's start; ID
+`2 * strokeId + 1` addresses its end. The predicted point is
+`2 * origins[record]` for a start recipe and one greater for an end recipe.
+References use the closest matching canonical point to keep the delta small.
+
+In compact mode, a match uses the existing record's quantum to round both source
+coordinates. The decoder reconstructs the original modular residual against
+the origin's corresponding canonical point. Lossless mode matches exact Float32
+word pairs and reconstructs their XOR residuals, including signed zero.
+Unmatched points preserve both original residual words.
+
+`literals.endpoints` keeps only its last two component columns (control-point
+corrections); `literals.primitiveMeta` keeps only its last two columns (type and
+alpha/flags corrections). Expansion restores the original four-column arrays
+before the usual v2 decoder runs. Bounds, styles, paint origins, membership,
+ordering, tolerances and compact grids are unchanged. Source IDs, array lengths
+and residual counts are validated before allocating expanded arrays. Caches
+without origins retain v4. Older viewers ignore optional v5 caches and may
+rebuild LODs; updated viewers adopt them without simplification.

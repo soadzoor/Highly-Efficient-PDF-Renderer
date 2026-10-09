@@ -11,9 +11,9 @@ const digest = bytes => createHash("sha256").update(bytes).digest("hex");
 const usage = "Usage: node --experimental-strip-types scripts/repack-hep-storage.mjs [--write] [--timeout-ms=N] <HEP-file-or-directory>...\n" +
   "Default: measure only. --write atomically replaces each file only if smaller, after verifying section bytes.\n" +
   "Preserves all scene and LOD data, indexes and precision. No PDFs are parsed and no LOD levels are recalculated.\n" +
-  "Compacted files require a reader supporting HEP container version 3.";
+  "Compacted files require a reader supporting HEP container version 4.";
 
-/** Preserve original chunks unless a lossless integer representation is smaller. */
+/** Preserve original chunks unless a lossless integer or path representation is smaller. */
 export async function repackHepStorageBytes(input, { signal } = {}) {
   const hooks = registerHooks({ resolve(specifier, context, next) {
     return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)
@@ -22,6 +22,7 @@ export async function repackHepStorageBytes(input, { signal } = {}) {
   try {
     const { HepArchive, crc32 } = await import("../src/hepContainer.ts");
     const { chooseHepIntegerEncoding } = await import("../src/hepContainerIntegers.ts");
+    const { chooseHepPathEncoding } = await import("../src/hepContainerPaths.ts");
     const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
     const archive = await HepArchive.loadAsync(bytes, { signal });
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -44,24 +45,28 @@ export async function repackHepStorageBytes(input, { signal } = {}) {
     for (let index = 0; index < chunks.length; index++) {
       signal?.throwIfAborted();
       const chunk = chunks[index];
-      if (chunk.names.length !== 1 || !/^lod-vector\/[^/]+\.bin$/.test(chunk.names[0])) continue;
+      if (chunk.names.length !== 1) continue;
+      const isPath = chunk.names[0] === "geometry/clip-paths.d512";
+      if (!isPath && !/^lod-vector\/[^/]+\.bin$/.test(chunk.names[0])) continue;
       const name = chunk.names[0], decoded = await archive.file(name).async("uint8array");
-      const candidate = await chooseHepIntegerEncoding(decoded, chunk.length, signal);
+      const candidate = await (isPath ? chooseHepPathEncoding : chooseHepIntegerEncoding)(decoded, chunk.length, signal);
       if (candidate) {
-        replacements.set(index, candidate);
+        replacements.set(index, { payload: candidate, codec: isPath ? 4 : 3 });
         expected.set(name, digest(decoded));
       }
     }
     if (!replacements.size) return { bytes, changedChunks: 0 };
     const header = new Uint8Array(bytes.subarray(0, indexEnd)), outputView = new DataView(header.buffer);
-    outputView.setUint16(4, 3, true);
+    let version = view.getUint16(4, true);
+    for (const candidate of replacements.values()) version = Math.max(version, candidate.codec);
+    outputView.setUint16(4, version, true);
     let size = indexEnd;
     for (let index = 0; index < chunks.length; index++) {
       const chunk = chunks[index], candidate = replacements.get(index), at = 32 + index * 20;
       outputView.setUint32(at, size, true);
-      outputView.setUint32(at + 4, candidate?.length ?? chunk.length, true);
-      outputView.setUint8(at + 16, candidate ? 3 : chunk.codec);
-      size = align4(size + (candidate?.length ?? chunk.length));
+      outputView.setUint32(at + 4, candidate?.payload.length ?? chunk.length, true);
+      outputView.setUint8(at + 16, candidate?.codec ?? chunk.codec);
+      size = align4(size + (candidate?.payload.length ?? chunk.length));
     }
     outputView.setUint32(20, crc32(header.subarray(32)), true);
     const output = new Uint8Array(size);
@@ -69,7 +74,7 @@ export async function repackHepStorageBytes(input, { signal } = {}) {
     cursor = indexEnd;
     for (let index = 0; index < chunks.length; index++) {
       const chunk = chunks[index];
-      const payload = replacements.get(index) ?? bytes.subarray(chunk.offset, chunk.offset + chunk.length);
+      const payload = replacements.get(index)?.payload ?? bytes.subarray(chunk.offset, chunk.offset + chunk.length);
       output.set(payload, cursor);
       cursor = align4(cursor + payload.length);
     }

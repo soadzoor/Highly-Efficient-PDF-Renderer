@@ -1,6 +1,7 @@
 import type { VectorScene } from "./pdfVectorExtractor";
 import type { StoredVectorStrokeLod } from "./vectorStrokeLodCore";
 import type { TextLodBuildData } from "./textGreekLod";
+import { decodeVectorLodPointRecipes, encodeVectorLodPointRecipes, type VectorLodPointRecipes } from "./hepLodPointRecipes";
 
 /** Legacy v2 fixed-point grid; v3 derives a grid for each literal. */
 export const COMPACT_VECTOR_LOD_QUANTUM = 1 / 512;
@@ -99,8 +100,9 @@ export function prepareVectorLodForStorage(data: StoredVectorStrokeLod, compact 
 
 const FIELDS = ["endpoints", "primitiveMeta", "primitiveBounds", "styles"] as const;
 type Field = typeof FIELDS[number];
-interface PackedVector extends Omit<StoredVectorStrokeLod, "literals" | "levels"> {
+export interface PackedVector extends Omit<StoredVectorStrokeLod, "literals" | "levels"> {
   tileIndexes?: "rebuild";
+  pointRecipes?: VectorLodPointRecipes;
   levels: (Omit<StoredVectorStrokeLod["levels"][number], "tileOffsets" | "tileCounts" | "tileSegmentIds"> &
     Partial<Pick<StoredVectorStrokeLod["levels"][number], "tileOffsets" | "tileCounts" | "tileSegmentIds">>)[];
   literals: { segmentCount: number } & Record<Field, Uint32Array>;
@@ -130,6 +132,7 @@ export function packVectorLod(scene: VectorScene, data: StoredVectorStrokeLod, i
 
 /** Dependencies decode before their residual consumers; canonical arrays stay untouched. */
 export function unpackVectorLod(scene: VectorScene, data: PackedVector): StoredVectorStrokeLod {
+  data = decodeVectorLodPointRecipes(scene, data);
   const count = data?.literals?.segmentCount;
   check(data.positionQuantum === undefined || data.positionQuantum === COMPACT_VECTOR_LOD_QUANTUM);
   check(Number.isSafeInteger(count) && count >= 0 && count <= 0x3fffffff);
@@ -158,6 +161,11 @@ export function unpackVectorLod(scene: VectorScene, data: PackedVector): StoredV
     result.literals[field] = new Float32Array(output.buffer);
   }
   return result;
+}
+
+/** Existing packed caches can adopt source-point recipes without rebuilding any level. */
+export async function packVectorLodWithPointRecipes(scene: VectorScene, data: PackedVector, signal?: AbortSignal): Promise<PackedVector> {
+  return encodeVectorLodPointRecipes(scene, data, signal);
 }
 
 function quantumAt(data: StoredVectorStrokeLod, index: number): number {

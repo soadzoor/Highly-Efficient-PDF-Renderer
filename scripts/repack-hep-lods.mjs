@@ -20,7 +20,8 @@ export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "c
     const { writeHepLod, HEP_VECTOR_LOD_VERSION, HEP_TEXT_LOD_VERSION } = await import("../src/hepLod.ts");
     const { validateSourcePdfByteLength, warnIfHepSizeExceedsPdf } = await import("../src/hepSizePolicy.ts");
     const archive = await HepArchive.loadAsync(bytes, { signal });
-    const manifest = JSON.parse(await archive.file("manifest.json").async("string"));
+    const originalManifestJson = await archive.file("manifest.json").async("string");
+    const manifest = JSON.parse(originalManifestJson);
     validateSourcePdfByteLength(manifest.sourcePdfByteLength);
     validateSourcePdfByteLength(sourcePdfByteLength);
     sourcePdfByteLength = sourcePdfByteLength === undefined ? manifest.sourcePdfByteLength
@@ -60,6 +61,11 @@ export async function repackHepLodBytes(bytes, { signal, vectorLodPrecision = "c
         (manifest.lod?.text && !isDeepStrictEqual(text, getCachedTextLod(restored)?.data))) {
       throw new Error("Repacking changed LOD data");
     }
+    // v4 remains current storage when point recipes lose the size comparison.
+    // Keep the original archive when an attempted upgrade changes no cache or
+    // metadata and its different chunk ordering would not save any bytes.
+    if (output.byteLength >= bytes.byteLength && JSON.stringify(manifest) === originalManifestJson &&
+        (!withVectorLod || isDeepStrictEqual(expectedVector, vector))) return bytes;
     return output;
   } finally { hooks.deregister(); }
 }

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { HepArchive } from "./lib/hepContainer.mjs";
 import { repackHepStorageBytes, repackHepStorage } from "./repack-hep-storage.mjs";
+const { encodeSceneClipPaths } = await import("../src/hepSceneSections.ts");
 
 const bytePlanes = words => {
   const bytes = new Uint8Array(words.length * 4);
@@ -21,15 +22,24 @@ archive.file("lod-vector/2.bin", bytePlanes(Uint32Array.from({ length: 8192 }, (
   index % 8 < 4 ? (index % 129) - 64 : 0)), { compression: "STORE" });
 archive.file("lod-vector/6.bin", bytePlanes(Uint32Array.from({ length: 8192 }, (_value, index) =>
   index * 17)), { compression: "STORE" });
-archive.file("geometry/clip-paths.d512", Uint8Array.of(1, 7, 31, 255));
+const clipEdges = new Float32Array(40000);
+let random = 0x12345678, x = 0, y = 0;
+for (let i = 0; i < clipEdges.length; i += 4) {
+  random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+  const nx = x + (random & 1023) - 512, ny = y + ((random >>> 10) & 1023) - 512;
+  clipEdges.set([x, y, nx, ny], i); x = nx; y = ny;
+}
+archive.file("geometry/clip-paths.d512", encodeSceneClipPaths([{ parent: -1, fillRule: 0, edges: clipEdges }]),
+  { compression: "STORE" });
+archive.file("geometry/sentinel", Uint8Array.of(1, 7, 31, 255));
 archive.file("raster/0.png", Uint8Array.of(137, 80, 78, 71, 1, 2, 3), { compression: "STORE" });
 archive.file("empty", new Uint8Array());
 const original = await archive.generateAsync({ type: "uint8array", compression: "DEFLATE" });
 const inputCopy = original.slice();
 const result = await repackHepStorageBytes(original);
 assert(result.bytes.length < original.length);
-assert.equal(result.changedChunks, 2);
-assert.equal(new DataView(result.bytes.buffer).getUint16(4, true), 3);
+assert.equal(result.changedChunks, 3);
+assert.equal(new DataView(result.bytes.buffer).getUint16(4, true), 4);
 assert.deepEqual(original, inputCopy, "repacking cannot mutate the caller's original file");
 const buffer = Buffer.alloc(original.length + 23, 0xab);
 buffer.set(original, 11);
@@ -46,9 +56,22 @@ for (const name of Object.keys(archive.files)) {
 const unchanged = await repackHepStorageBytes(result.bytes);
 assert.equal(unchanged.changedChunks, 0, "already compacted chunks are never rewritten without a size improvement");
 assert.deepEqual(unchanged.bytes, result.bytes);
+const mixed = new HepArchive();
+mixed.file("geometry/clip-paths.d512", await archive.file("geometry/clip-paths.d512").async("uint8array"));
+mixed.file("lod-vector/2.bin", await archive.file("lod-vector/2.bin").async("uint8array"), { compression: "STORE" });
+const mixedBytes = await mixed.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+assert.equal(new DataView(mixedBytes.buffer).getUint16(4, true), 4);
+const mixedResult = await repackHepStorageBytes(mixedBytes);
+assert.equal(mixedResult.changedChunks, 1, "an existing path chunk is retained when only integer storage improves");
+assert.equal(new DataView(mixedResult.bytes.buffer).getUint16(4, true), 4, "repacking cannot downgrade an existing v4 archive");
+const mixedRestored = await HepArchive.loadAsync(mixedResult.bytes);
+for (const name of Object.keys(mixed.files)) {
+  assert.deepEqual(await mixedRestored.file(name).async("uint8array"), await mixed.file(name).async("uint8array"));
+}
 const plain = new HepArchive();
 plain.file("manifest.json", "{}");
 plain.file("geometry/strokes.bin", new Uint8Array(2048));
+plain.file("geometry/clip-paths.d512", Uint8Array.of(1, 7, 31, 255));
 plain.file("\uFEFFlod-vector/2.bin", new Uint8Array(8192), { compression: "STORE" });
 const withoutLod = await plain.generateAsync({ type: "uint8array", compression: "DEFLATE" });
 assert.deepEqual(await repackHepStorageBytes(withoutLod), { bytes: withoutLod, changedChunks: 0 },

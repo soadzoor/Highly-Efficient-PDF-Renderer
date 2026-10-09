@@ -21,6 +21,7 @@ import {
 } from "./hepContainerShared";
 import { BYTES_PER_ITEM, decodePaletteBytes } from "./hepContainerPalette";
 import { bytePlaneVarintMaxLength, decodeBytePlaneVarints } from "./hepContainerIntegers";
+import { pathChainMaxLength, decodePathChains } from "./hepContainerPaths";
 import type { HepArchiveLoadOptions, HepArchiveWriteOptions, HepArchiveProgress, EntryRecord, ChunkRecord } from "./hepContainerShared";
 import { waitForLoad } from "./loadCancellation";
 
@@ -87,7 +88,7 @@ export class HepArchive {
     if (!hasHepSignature(bytes) || bytes.length < HEADER_BYTES) fail("missing or truncated HEP header.");
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const version = view.getUint16(4, true);
-    if (version !== 1 && version !== 2 && version !== 3) fail("unsupported container version.");
+    if (version !== 1 && version !== 2 && version !== 3 && version !== 4) fail("unsupported container version.");
     if (view.getUint16(6, true) !== 0 || view.getUint32(24, true) !== 0 || view.getUint32(28, true) !== 0) {
       fail("unsupported header flags or reserved fields.");
     }
@@ -110,13 +111,15 @@ export class HepArchive {
         entries: []
       };
       requireZero(bytes, cursor + 17, cursor + 20, "chunk reserved fields");
-      if (chunk.codec !== 0 && chunk.codec !== 1 && !(version >= 2 && chunk.codec === 2) && !(version === 3 && chunk.codec === 3)) {
+      if (chunk.codec !== 0 && chunk.codec !== 1 && !(version >= 2 && chunk.codec === 2) &&
+          !(version >= 3 && chunk.codec === 3) && !(version === 4 && chunk.codec === 4)) {
         fail("unsupported chunk codec.");
       }
       if (chunk.codec === 2 && chunk.decodedLength % BYTES_PER_ITEM !== 0) {
         fail("palette chunk length must contain complete vec4 items.");
       }
       if (chunk.codec === 3) bytePlaneVarintMaxLength(chunk.decodedLength);
+      if (chunk.codec === 4) pathChainMaxLength(chunk.decodedLength);
       if (chunk.offset % 4 !== 0 || chunk.offset < indexEnd || chunk.storedLength === 0 ||
           chunk.offset + chunk.storedLength > bytes.length) fail("invalid chunk offset or stored length.");
       if (chunk.decodedLength === 0) fail("invalid decoded chunk length.");
@@ -186,10 +189,12 @@ export class HepArchive {
     const decodeChunk = async (chunk: ChunkRecord): Promise<Uint8Array> => {
       options.signal?.throwIfAborted();
       const stored = bytes.subarray(chunk.offset, chunk.offset + chunk.storedLength);
-      const maxInflatedLength = chunk.codec === 3 ? bytePlaneVarintMaxLength(chunk.decodedLength) : chunk.decodedLength;
+      const maxInflatedLength = chunk.codec === 3 ? bytePlaneVarintMaxLength(chunk.decodedLength)
+        : chunk.codec === 4 ? pathChainMaxLength(chunk.decodedLength) : chunk.decodedLength;
       const inflated = chunk.codec === 0 ? stored : await transformBytes(stored, false, maxInflatedLength, options.signal);
       const decoded = chunk.codec === 2 ? decodePaletteBytes(inflated, chunk.decodedLength)
-        : chunk.codec === 3 ? decodeBytePlaneVarints(inflated, chunk.decodedLength) : inflated;
+        : chunk.codec === 3 ? decodeBytePlaneVarints(inflated, chunk.decodedLength)
+        : chunk.codec === 4 ? decodePathChains(inflated, chunk.decodedLength) : inflated;
       options.signal?.throwIfAborted();
       if (decoded.length !== chunk.decodedLength) fail("decoded chunk length mismatch.");
       if (crc32(decoded) !== chunk.checksum) fail("chunk checksum mismatch.");

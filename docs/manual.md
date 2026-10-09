@@ -1003,10 +1003,13 @@ Text caches include runs, clusters and
 coarse instances. Export reuses an available build or creates the requested
 LOD. Text caches are omitted when the scene does not qualify for text LOD.
 
-Stored vector LODs default to compact precision; text LODs remain lossless. Vector cache v3 omits tile indexes and
-shares identical derived records; text cache v2 remains unchanged. Encoding predicts repeated
-coordinates/bounds from existing strokes and packs text metadata into numeric
-columns. Both caches and compact vector precision are automatic when applicable:
+Stored vector LODs default to compact precision; text LODs remain lossless. Vector
+caches omit tile indexes and share identical derived records. Vector v5 also
+references canonical shape points instead of repeating their coordinates, when
+this reduces actual compressed storage; other exports retain v4. Encoding
+predicts repeated coordinates/bounds from existing strokes and packs text
+metadata into numeric columns. Both caches and compact vector precision are
+automatic when applicable:
 
 ```ts
 const hep = await buildHep(pdf.sceneData);
@@ -1028,6 +1031,12 @@ integer range retain lossless storage with a warning. Re-exporting a compact
 cache preserves its existing rounding; selecting lossless does not recover
 precision already discarded. Rebuild from the original PDF or compact HEP
 without LODs to recover the original LOD geometry.
+
+Source-point recipes preserve all existing derived geometry, paint order, styles
+and LOD levels. They expand once during loading, with no work added to the render
+loop and no LOD simplification. This storage is shared by native and Three WebGL
+and WebGPU backends. Existing HEPs can adopt it through the LOD repacker below;
+the storage-only repacker changes physical codecs and leaves LOD schemas intact.
 
 Text LOD v3 predicts run transforms and bounds from the canonical glyphs, then
 stores exact XOR corrections. Coarse glyph transforms and colors reuse those
@@ -1078,13 +1087,14 @@ The builder accepts `signal` and `onProgress`, including LOD building, raster en
 container build progress. Browser and Node exports use the same format but may
 differ in encoded image bytes.
 
-The loader supports HEP containers v1–v3 with scene schemas v9–v13. Scene v13
+The loader supports HEP containers v1–v4 with scene schemas v9–v13. Scene v13
 stores repeated transparency wrappers and matching draw-run metadata compactly,
 preserving the original group boundaries and paint order exactly. Exports use it
 when repeated wrappers can share storage. New exports use v2 when an exact
 stroke-style palette saves space, or v3 when lossless integer encoding shrinks
-the existing vector LOD bytes. These files require an updated viewer. Existing
-v1 and v2 files remain supported. Both encodings preserve every decoded section
+the existing vector LOD bytes. Connected clip outlines use v4 when endpoint
+chaining reduces storage. These files require an updated viewer. Existing
+v1–v3 files remain supported. These encodings preserve every decoded section
 byte; optional LOD caches are separate sections. Earlier scene schemas
 must be regenerated from the original PDF; repacking a container cannot restore
 layer definitions or content omitted by an earlier conversion. The
@@ -1216,8 +1226,8 @@ node --experimental-strip-types scripts/repack-hep-storage.mjs /path/to/heps
 It measures only by default. Add `--write` to atomically replace files that become
 smaller, after verifying the changed sections. It accepts individual HEP files
 or directories, never parses PDFs or recalculates LODs, and leaves unrelated
-sections in their original encoding. New integer chunks require a viewer that
-supports HEP container v3. Use Ctrl+C to cancel, or `--timeout-ms=N` for an optional
+sections in their original encoding. New integer chunks require HEP container
+v3 support; connected-path chunks require v4. Use Ctrl+C to cancel, or `--timeout-ms=N` for an optional
 per-file deadline.
 
 To shrink already-generated example caches by sharing geometry and changing

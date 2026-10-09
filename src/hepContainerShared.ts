@@ -1,4 +1,4 @@
-/** HEP container versions 1–3. See docs/HEP_CONTAINER.md for the wire format. */
+/** HEP container versions 1–4. See docs/HEP_CONTAINER.md for the wire format. */
 export const HEADER_BYTES = 32;
 export const CHUNK_RECORD_BYTES = 20;
 export const EMPTY_CHUNK = 0xffffffff;
