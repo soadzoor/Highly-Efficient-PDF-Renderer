@@ -104,8 +104,12 @@ export function buildVectorPathCells(segmentsA: Float32Array, segmentsB: Float32
     const columns = Math.max(1, Math.ceil((maxX - minX) / size));
     const rows = Math.max(1, Math.ceil((maxY - minY) / size));
     if (columns * rows > MAX_CELLS_PER_LEVEL) break;
+    const remaining = maxTexels - pieces - cells - pairs - levels.length - 1;
     const level = buildLevel(segmentsA, segmentsB, start, count, minX, minY, size, columns, rows, curveThreshold,
-      keepHorizontal);
+      keepHorizontal, remaining);
+    // A level that exceeds the construction budget is optional. Earlier,
+    // complete levels still cover the whole path without dropping geometry.
+    if (!level) break;
     const levelPieces = level.pieces.length / 8, levelPairs = level.closures.length / 4;
     // Pieces occupy a texel in each store texture; records and closures in one.
     if (pieces + levelPieces + cells + columns * rows + pairs + levelPairs + levels.length + 1 > maxTexels) break;
@@ -140,7 +144,10 @@ class PieceBuffer {
 
 function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: number, count: number,
   originX: number, originY: number, size: number, columns: number, rows: number,
-  curveThreshold: number, keepHorizontal: boolean): VectorCellLevel {
+  curveThreshold: number, keepHorizontal: boolean, maxTexels: number): VectorCellLevel | null {
+  const cellCount = columns * rows;
+  const maxPieces = maxTexels - cellCount;
+  if (maxPieces < 0) return null;
   const edgeX = (column: number): number => Math.fround(originX + column * size);
   const edgeY = (row: number): number => Math.fround(originY + row * size);
   const columnOf = (x: number): number => Math.max(0, Math.min(columns - 1, Math.floor((x - originX) / size)));
@@ -158,6 +165,7 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
     const low = Math.min(x0, cx, x2), high = Math.max(x0, cx, x2);
     // Most segments lie within one column and need no splitting.
     if (columns === 1 || Math.floor((low - originX) / size) === Math.floor((high - originX) / size)) {
+      if (buffer.count >= maxPieces) return null;
       buffer.push(x0, y0, cx, cy, x2, y2, flag, columnOf(curve ? 0.25 * (x0 + 2 * cx + x2) : 0.5 * (x0 + x2)));
       continue;
     }
@@ -183,6 +191,7 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
       }
     }
     if (!splits.length) {
+      if (buffer.count >= maxPieces) return null;
       buffer.push(x0, y0, cx, cy, x2, y2, flag, columnOf(curve ? 0.25 * (x0 + 2 * cx + x2) : 0.5 * (x0 + x2)));
       continue;
     }
@@ -192,8 +201,9 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
     order.sort((p, q) => splits[p] - splits[q]);
     const pointX = (t: number): number => (1 - t) * (1 - t) * x0 + 2 * (1 - t) * t * cx + t * t * x2;
     const pointY = (t: number): number => (1 - t) * (1 - t) * y0 + 2 * (1 - t) * t * cy + t * t * y2;
-    const emit = (t0: number, t1: number, px: number, py: number, qx: number, qy: number): void => {
-      if (px === qx && py === qy) return;
+    const emit = (t0: number, t1: number, px: number, py: number, qx: number, qy: number): boolean => {
+      if (px === qx && py === qy) return true;
+      if (buffer.count >= maxPieces) return false;
       let controlX = px, controlY = py;
       if (curve) {
         const s0 = 1 - t0, s1 = 1 - t1, blend = s0 * t1 + t0 * s1;
@@ -201,6 +211,7 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
         controlY = Math.fround(s0 * s1 * y0 + blend * cy + t0 * t1 * y2);
       }
       buffer.push(px, py, controlX, controlY, qx, qy, flag, columnOf(curve ? pointX(0.5 * (t0 + t1)) : 0.5 * (px + qx)));
+      return true;
     };
     let previousT = 0, previousX = x0, previousY = y0;
     for (const index of order) {
@@ -208,10 +219,10 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
       if (t - previousT < 1e-9) continue;
       // The split point sits exactly on the column edge, shared by both pieces.
       const y = Math.fround(curve ? pointY(t) : y0 + t * (y2 - y0));
-      emit(previousT, t, previousX, previousY, x, y);
+      if (!emit(previousT, t, previousX, previousY, x, y)) return null;
       previousT = t; previousX = x; previousY = y;
     }
-    emit(previousT, 1, previousX, previousY, x2, y2);
+    if (!emit(previousT, 1, previousX, previousY, x2, y2)) return null;
   }
 
   // Stable counting sort of the pieces by column.
@@ -228,6 +239,7 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
   // then accumulate right to left.
   const rightYs: Float64Array[] = new Array(columns), rightWeights: Float64Array[] = new Array(columns);
   let accumulatedYs: Float64Array = new Float64Array(0), accumulatedWeights: Float64Array = new Float64Array(0);
+  let retainedEndpoints = 0;
   rightYs[columns - 1] = accumulatedYs; rightWeights[columns - 1] = accumulatedWeights;
   for (let column = columns - 1; column >= 1; column--) {
     const first = columnStart[column], total = columnStart[column + 1] - first;
@@ -239,6 +251,12 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
     starts.sort(); ends.sort();
     const [residueYs, residueWeights] = netWeights(starts, ends);
     [accumulatedYs, accumulatedWeights] = mergeWeights(accumulatedYs, accumulatedWeights, residueYs, residueWeights);
+    // Columns can share the same arrays. Count only new retained arrays so
+    // open/disjoint paths cannot grow an unbounded intermediate endpoint store.
+    if (accumulatedYs !== rightYs[column]) {
+      retainedEndpoints += accumulatedYs.length;
+      if (retainedEndpoints > 2 * maxTexels) return null;
+    }
     rightYs[column - 1] = accumulatedYs; rightWeights[column - 1] = accumulatedWeights;
   }
 
@@ -247,13 +265,16 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
   const margin = (Math.abs(originY) + rows * size) * 2 ** -18;
   const rowOf = (y: number): number => Math.max(0, Math.min(rows - 1, Math.floor((y - originY) / size)));
   const pieceRows = new Int32Array(pieceCount * 2);
-  const cellCount = columns * rows;
   const cellStart = new Int32Array(cellCount + 1);
+  let duplicatedPieces = 0;
   for (let piece = 0; piece < pieceCount; piece++) {
     const at = piece * 7, column = buffer.columns[piece];
     const low = Math.min(values[at + 1], values[at + 3], values[at + 5]);
     const high = Math.max(values[at + 1], values[at + 3], values[at + 5]);
     const first = rowOf(low - margin), last = rowOf(high + margin);
+    duplicatedPieces += last - first + 1;
+    // Check before incrementing rows or allocating their duplicated geometry.
+    if (duplicatedPieces > maxPieces) return null;
     pieceRows[piece * 2] = first; pieceRows[piece * 2 + 1] = last;
     for (let row = first; row <= last; row++) cellStart[row * columns + column + 1]++;
   }
@@ -271,9 +292,12 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
 
   const cells = new Uint32Array(cellCount * 4);
   let closures = new Float32Array(1024), closureLength = 0;
-  const pushClosure = (y: number, weight: number): void => {
+  const maxClosureFloats = (maxTexels - cellCount - duplicatedPieces) * 4;
+  const pushClosure = (y: number, weight: number): boolean => {
+    if (closureLength + 2 > maxClosureFloats) return false;
     if (closureLength + 2 > closures.length) { const grown = new Float32Array(closures.length * 2); grown.set(closures); closures = grown; }
     closures[closureLength++] = y; closures[closureLength++] = weight;
+    return true;
   };
   const lowerBound = (ys: Float64Array, value: number): number => {
     let low = 0, high = ys.length;
@@ -292,9 +316,9 @@ function buildLevel(segmentsA: Float32Array, segmentsB: Float32Array, start: num
       let below = 0;
       for (let index = 0; index < first; index++) below += ws[index];
       const begin = closureLength;
-      if (below !== 0) pushClosure(CELL_CLOSURE_BELOW, below);
-      for (let index = first; index < last; index++) pushClosure(ys[index], ws[index]);
-      if ((closureLength - begin) % 4) pushClosure(0, 0);
+      if (below !== 0 && !pushClosure(CELL_CLOSURE_BELOW, below)) return null;
+      for (let index = first; index < last; index++) if (!pushClosure(ys[index], ws[index])) return null;
+      if ((closureLength - begin) % 4 && !pushClosure(0, 0)) return null;
       cells[cell * 4 + 2] = begin / 4;
       cells[cell * 4 + 3] = (closureLength - begin) / 4;
     }

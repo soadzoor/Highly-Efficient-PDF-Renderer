@@ -817,7 +817,12 @@ rounding. The index is built when a scene is uploaded (about 0.3 s for the
 Broschuere HEP). A fill store's index may add up to four texels per segment;
 paths are indexed from the largest down, and a path left out keeps its bands.
 A clip polygon's index may use twelve texels per edge within the clip
-texture's limit, else it keeps bands too. Native WebGPU passes the cell
+texture's limit, else it keeps bands too. Clips with up to 65,536 edges can
+use cells, including large collections of small contours whose bands still
+scan hundreds of unrelated edges at close zoom. Larger clips retain bands
+or the complete edge scan. Cell construction stops before exceeding its
+index budget, bounds intermediate storage relative to that budget, and keeps
+any complete coarser levels already built. Native WebGPU passes the cell
 headers in its camera uniforms, Three's WebGL materials set `uFillCellHeaders`
 and its node materials take `fillCellBase`. Three's layers do not know the
 device's texture limit, so their stores stay within 2048 × 2048 texels and a

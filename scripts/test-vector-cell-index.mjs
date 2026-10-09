@@ -12,7 +12,7 @@ try {
   const { VECTOR_CELL_COVERAGE_GLSL, VECTOR_CELL_COVERAGE_WGSL } = await import("../src/vectorCellShaders.ts");
   const { vectorPathCellStore, vectorIndexedPathStore, buildVectorPathCells } = await import("../src/vectorCellIndex.ts");
   const { buildVectorFillBandIndex } = await import("../src/vectorFillBands.ts");
-  const { packVectorClips } = await import("../src/vectorClips.ts");
+  const { packVectorClips, MAX_CELL_INDEXED_CLIP_EDGES } = await import("../src/vectorClips.ts");
   const { CORE_FILL_VERTEX_SHADER_SOURCE } = await import("../src/webGlFloorplanRenderer.ts");
   const { GRADIENT_FILL_VERTEX_SHADER_SOURCE } = await import("../src/nativeGradientWebGlShaders.ts");
 
@@ -313,6 +313,229 @@ try {
     const [x1, y1] = points[(index + 1) % points.length];
     return [x0, y0, x1, y1];
   })));
+  const rectangle = (x0, y0, x1, y1) => [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  const originalWinding = (edges, [x, y]) => {
+    let winding = 0;
+    for (let edge = 0; edge < edges.length; edge += 4) {
+      const y0 = edges[edge + 1], y1 = edges[edge + 3];
+      if ((y0 > y) !== (y1 > y) && edges[edge] + (y - y0) / (y1 - y0) * (edges[edge + 2] - edges[edge]) > x) {
+        winding += y1 > y0 ? 1 : -1;
+      }
+    }
+    return winding;
+  };
+  const originalContains = (clips, root, point) => {
+    for (let node = root; node >= 0; node = clips[node].parent) {
+      const winding = originalWinding(clips[node].edges, point);
+      if (clips[node].fillRule ? Math.abs(winding) % 2 !== 1 : winding === 0) return false;
+    }
+    return true;
+  };
+  const packedContains = (data, root, point) => {
+    for (let index = root; index >= 0;) {
+      const node = [...data.subarray(index * 4, index * 4 + 4)];
+      if (node[2] < 0) {
+        const [x0, y0, x1, y1] = data.subarray(node[1] * 4, node[1] * 4 + 4);
+        if (!(point[0] >= x0 && point[0] < x1 && point[1] >= y0 && point[1] < y1)) return false;
+      } else {
+        const winding = clipWinding(data, node, point, 0).winding;
+        if (node[3] & 1 ? Math.abs(winding) % 2 !== 1 : winding === 0) return false;
+      }
+      index = node[0];
+    }
+    return true;
+  };
+  const originalMask = (clips, root, point, width) => {
+    let mask = 0;
+    for (let row = 0; row < 4; row++) for (let column = 0; column < 4; column++) {
+      if (originalContains(clips, root, [point[0] + SAMPLE_OFFSETS[column] * width,
+        point[1] + SAMPLE_OFFSETS[row] * width])) mask |= 1 << (4 * row + column);
+    }
+    return mask;
+  };
+  const packedMask = (data, root, point, width) => {
+    let mask = 0xffff;
+    for (let index = root; index >= 0;) {
+      const node = [...data.subarray(index * 4, index * 4 + 4)];
+      if (node[2] < 0) {
+        const [x0, y0, x1, y1] = data.subarray(node[1] * 4, node[1] * 4 + 4);
+        for (let row = 0; row < 4; row++) for (let column = 0; column < 4; column++) {
+          const x = point[0] + SAMPLE_OFFSETS[column] * width, y = point[1] + SAMPLE_OFFSETS[row] * width;
+          if (!(x >= x0 && x < x1 && y >= y0 && y < y1)) mask &= ~(1 << (4 * row + column));
+        }
+      } else mask &= sampleMask(data, node, point, width);
+      index = node[0];
+    }
+    return mask;
+  };
+
+  // Technical drawings can have tens of thousands of tiny disconnected clip
+  // contours. Bands still scan a whole row at high zoom; cells localize both
+  // point winding and the shared 4x4 samples to the visible column as well.
+  let largeClipPixels = 0;
+  for (const [edgeCount, columns] of [[16_000, 64], [36_000, 96]]) {
+    const contours = Array.from({ length: edgeCount / 4 }, (_, index) => {
+      const x = index % columns * 4, y = Math.floor(index / columns) * 4;
+      return rectangle(x, y, x + 2, y + 2);
+    });
+    // One redundant nested contour and one opposite-winding hole distinguish
+    // fill rules as well as islands and gaps. All coordinates are exact Float32.
+    contours[1] = rectangle(0.5, 0.5, 1.5, 1.5);
+    contours[3] = rectangle(8.5, 0.5, 9.5, 1.5).reverse();
+    const edges = edgesOf(contours), rows = Math.ceil(contours.length / columns);
+    const clips = [
+      { parent: -1, fillRule: 0, edges: edgesOf([rectangle(-4, -4, columns * 4, rows * 4)]) },
+      { parent: 0, fillRule: 0, edges },
+      { parent: 0, fillRule: 1, edges: new Float32Array(edges) },
+      { parent: 1, fillRule: 0, edges: edgesOf([rectangle(0, -4, 1.25, rows * 4)]) },
+      { parent: 2, fillRule: 0, edges: edgesOf([rectangle(0, -4, 1.25, rows * 4)]) }
+    ];
+    const snapshot = structuredClone(clips);
+    let stats;
+    const packed = packVectorClips(clips, undefined, { cells: true, onStats: value => { stats = value; } });
+    const bands = packVectorClips(clips);
+    assert.equal(edges.length / 4, edgeCount);
+    assert(edgeCount > 8192 && edgeCount <= MAX_CELL_INDEXED_CLIP_EDGES);
+    assert.equal(packed[7], 4, `${edgeCount} edges: large nonzero polygon uses cells`);
+    assert.equal(packed[11], 5, `${edgeCount} edges: large even-odd polygon uses cells`);
+    assert.equal(packed[5], packed[9], "copied geometry shares one cell payload across fill rules");
+    assert.equal(packed[13], packed[17], "identical nested rectangles share their payload");
+    assert.notEqual(packed[12], packed[16], "shared nested rectangles keep their distinct polygon parents");
+    assert.equal(stats.cellIndexedNodes, 2); assert.equal(stats.sharedPayloads, 2);
+    assert.equal(bands[7], 2); assert.equal(bands[11], 3);
+    const points = [[1, 1], [9, 1], [2.5, 1], [1.25, 1], [0, 1], [8.5, 1],
+      [17, 1], [columns * 4 - 2.5, rows * 4 - 2.5], [-0.25, 1]];
+    for (let trial = 0; trial < 24; trial++) {
+      const contour = contours[4 + Math.floor(random() * (contours.length - 4))];
+      points.push([contour[0][0] + (trial % 3 === 0 ? 2.125 : 1), contour[0][1] + 1]);
+    }
+    for (const point of points) for (const root of [1, 2, 3, 4]) {
+      assert.equal(packedContains(packed, root, point), originalContains(clips, root, point),
+        `${edgeCount} edges: clip chain ${root} point winding at ${point}`);
+    }
+    assert.equal(packedContains(packed, 1, [1, 1]), true, "nonzero keeps redundant nested contour");
+    assert.equal(packedContains(packed, 2, [1, 1]), false, "even-odd cuts the same nested contour");
+    for (const root of [1, 2]) assert.equal(packedContains(packed, root, [9, 1]), false, "opposite winding cuts a hole");
+    for (const width of [0.0625, 0.25, 0.5]) for (const point of points.slice(0, 8)) {
+      for (const root of [1, 2, 3, 4]) {
+        const truth = originalMask(clips, root, point, width);
+        assert.equal(packedMask(packed, root, point, width), truth,
+          `${edgeCount} edges: cells preserve chain ${root} AA samples at ${point}, width ${width}`);
+        assert.equal(packedMask(bands, root, point, width), truth,
+          `${edgeCount} edges: bands preserve chain ${root} AA samples at ${point}, width ${width}`);
+        largeClipPixels++;
+      }
+    }
+    const texel = (data, index) => [...data.subarray(index * 4, index * 4 + 4)];
+    const cells = texel(packed, packed[5]), origin = texel(packed, packed[5] + 1), grid = texel(packed, cells[0]);
+    const bandInfo = texel(bands, bands[5]);
+    let cellVisits = 0, bandVisits = 0;
+    for (const point of points) {
+      const column = Math.min(Math.max(Math.floor((point[0] - origin[0]) / cells[2]), 0), grid[1] - 1);
+      const row = Math.min(Math.max(Math.floor((point[1] - origin[1]) / cells[2]), 0), grid[2] - 1);
+      const cell = texel(packed, grid[0] + row * grid[1] + column);
+      cellVisits += cell[1] + cell[3];
+      const band = Math.min(Math.max(Math.floor((point[1] - bandInfo[1]) / bandInfo[2]), 0), bandInfo[3] - 1);
+      bandVisits += texel(bands, bandInfo[0] + band)[1];
+    }
+    assert(cellVisits * 4 < bandVisits, `${edgeCount} edges: close zoom reduces ${bandVisits} band candidates to ${cellVisits} cell pieces/closures`);
+    assert(cellVisits / points.length < edgeCount / 100, "close zoom visits a bounded fraction of the original edges");
+    // A capacity equal to the band payload preserves that useful fallback;
+    // the exact shared-edge capacity retains every edge in the raw layout.
+    const constrained = packVectorClips(clips, bands.length / 4, { cells: true });
+    assert.deepEqual(constrained, bands, `${edgeCount} edges: capacity pressure preserves bands`);
+    const rawCapacity = clips.length + edgeCount + 2;
+    const raw = packVectorClips(clips, rawCapacity, { cells: true });
+    assert.equal(raw.length / 4, rawCapacity); assert.equal(raw[7], 0); assert.equal(raw[11], 1);
+    assert.deepEqual(raw.subarray(raw[5] * 4, (raw[5] + edgeCount) * 4), edges, "raw fallback keeps all shared source edges");
+    assert.throws(() => packVectorClips(clips, rawCapacity - 1, { cells: true }), /capacity/i);
+    assert.deepEqual(clips, snapshot, "large clip indexing preserves canonical geometry");
+  }
+  assert.equal(MAX_CELL_INDEXED_CLIP_EDGES, 65_536, "cell construction has an explicit large-clip work limit");
+  {
+    const edges = edgesOf(Array.from({ length: MAX_CELL_INDEXED_CLIP_EDGES / 4 + 1 }, (_, index) => {
+      const x = index % 128 * 4, y = Math.floor(index / 128) * 4;
+      return rectangle(x, y, x + 2, y + 2);
+    }));
+    const clips = [0, 1].map(fillRule => ({ parent: -1, fillRule, edges }));
+    const atLimitEdges = edges.subarray(0, MAX_CELL_INDEXED_CLIP_EDGES * 4);
+    const atLimit = packVectorClips([0, 1].map(fillRule => ({ parent: -1, fillRule, edges: atLimitEdges })),
+      undefined, { cells: true });
+    assert.equal(atLimit[3], 4); assert.equal(atLimit[7], 5);
+    assert.equal(atLimit[1], atLimit[5], "the inclusive cell work limit retains a shared cell index");
+    const bands = packVectorClips(clips), guarded = packVectorClips(clips, undefined, { cells: true });
+    assert.equal(edges.length / 4, MAX_CELL_INDEXED_CLIP_EDGES + 4);
+    assert.deepEqual(guarded, bands, "clips above the cell work limit keep their exact beneficial band index");
+    assert.equal(guarded[3], 2); assert.equal(guarded[7], 3); assert.equal(guarded[1], guarded[5]);
+    const raw = packVectorClips(clips, 2 + edges.length / 4, { cells: true });
+    assert.equal(raw[3], 0); assert.equal(raw[7], 1); assert.equal(raw[1], raw[5]);
+    assert.deepEqual(raw.subarray(8), edges, "above-limit raw fallback preserves every source edge");
+    for (const point of [[1, 1], [2, 1], [3, 1], [1, 513]]) for (const root of [0, 1]) {
+      const truth = originalMask(clips, root, point, 0.25);
+      assert.equal(packedMask(guarded, root, point, 0.25), truth, "above-limit bands preserve AA samples");
+      assert.equal(packedMask(raw, root, point, 0.25), truth, "above-limit raw storage preserves AA samples");
+    }
+  }
+
+  // Long edges duplicate into many rows or split into many columns. A tiny
+  // construction budget must abandon that level while retaining complete
+  // coarser levels, with no change to their winding or the source arrays.
+  for (const [name, contour, points] of [
+    ["many-row vertical edges", rectangle(0, 0, 0.25, 1024), [[0.125, 512], [0.5, 512], [0.125, -1]]],
+    ["many-column horizontal edges", rectangle(0, 0, 1024, 1), [[512, 0.5], [512, 1.5], [-1, 0.5]]],
+    ["many-column diagonal edges", [[0, 0], [1024, 0.25], [1024, 1], [0, 0.75]], [[512, 0.5], [512, 0.0625], [-1, 0.5]]]
+  ]) {
+    const paths = merged(Array.from({ length: 6 }, () => contour));
+    const snapshot = structuredClone(paths), edges = edgesOf(Array.from({ length: 6 }, () => contour));
+    const bounds = [paths.pathMetaA[2], paths.pathMetaA[3], paths.pathMetaB[0], paths.pathMetaB[1]];
+    const options = { targetPieces: 1, keepHorizontal: true, texelsPerSegment: 12 };
+    const cells = buildVectorPathCells(paths.segmentsA, paths.segmentsB, 0, paths.segmentCount, bounds, 0.5, options);
+    if (name === "many-row vertical edges") {
+      // A 16-row level fits; the next 256-row level would allocate thousands
+      // of duplicate pieces before the old builder rejected its final size.
+      // Observe allocations during construction, not just the retained index.
+      const NativeFloat32Array = globalThis.Float32Array, allocations = [];
+      let coarse;
+      try {
+        globalThis.Float32Array = new Proxy(NativeFloat32Array, { construct(target, args) {
+          if (typeof args[0] === "number") allocations.push(args[0]);
+          return Reflect.construct(target, args);
+        } });
+        coarse = buildVectorPathCells(paths.segmentsA, paths.segmentsB, 0, paths.segmentCount, bounds, 0.5,
+          { ...options, levelStep: 4 });
+      } finally { globalThis.Float32Array = NativeFloat32Array; }
+      assert(coarse && coarse.levels.length === 1, "allocation guard retains the complete 16-row coarse level");
+      assert(allocations.length > 0, "construction allocation instrumentation observed a piece payload");
+      assert(Math.max(...allocations) <= Math.max(1024, paths.segmentCount * options.texelsPerSegment * 8),
+        "an abandoned refinement never allocates geometry beyond the path budget (apart from the fixed closure buffer)");
+    }
+    assert(cells && cells.levels.length > 0, `${name}: retain a complete coarse index`);
+    const texels = cells.pieceCount + cells.cellCount + cells.closurePairCount + cells.levels.length;
+    assert(texels <= paths.segmentCount * options.texelsPerSegment, `${name}: construction remains within budget`);
+    assert(cells.levels.length < 8, `${name}: stop refinement when duplicated or split pieces exceed the budget`);
+    for (let level = 0; level < cells.levels.length; level++) {
+      const grid = cells.levels[level], size = cells.cellSize * 2 ** (level * cells.levelStep);
+      for (const point of points) {
+        const column = Math.min(Math.max(Math.floor((point[0] - cells.originX) / size), 0), grid.columns - 1);
+        const row = Math.min(Math.max(Math.floor((point[1] - cells.originY) / size), 0), grid.rows - 1);
+        const cell = (row * grid.columns + column) * 4;
+        let winding = 0;
+        for (let piece = grid.cells[cell]; piece < grid.cells[cell] + grid.cells[cell + 1]; piece++) {
+          const at = piece * 8;
+          winding += originalWinding(Float32Array.of(grid.pieces[at], grid.pieces[at + 1],
+            grid.pieces[at + 4], grid.pieces[at + 5]), point);
+        }
+        for (let pair = grid.cells[cell + 2]; pair < grid.cells[cell + 2] + grid.cells[cell + 3]; pair++) {
+          if (grid.closures[pair * 4] <= point[1]) winding -= grid.closures[pair * 4 + 1];
+          if (grid.closures[pair * 4 + 2] <= point[1]) winding -= grid.closures[pair * 4 + 3];
+        }
+        assert.equal(winding, originalWinding(edges, point), `${name}: coarse level ${level} retains exact winding`);
+      }
+    }
+    assert.equal(buildVectorPathCells(paths.segmentsA, paths.segmentsB, 0, paths.segmentCount, bounds, 0.5,
+      { ...options, texelsPerSegment: 1 }), null, `${name}: no complete level fits a one-texel-per-edge budget`);
+    assert.deepEqual(paths, snapshot, `${name}: aborted construction preserves source geometry`);
+  }
   const clipFixtures = [
     ["dense oval", edgesOf([ring(2048, 125, 0, 0, v => f32(v)).map(([x, y]) => [x, f32(y * 0.56)])])],
     ["oval with a hole", edgesOf([ring(1024, 90), ring(512, 35).reverse()])],
@@ -436,5 +659,5 @@ try {
   assert(partialMasks > 1000, `boundary pixels mix inside and outside samples (${partialMasks})`);
   assert(coarsenedFixtures >= 3, "several polygon types exercise coarser indexes under budget pressure");
   assert(clipPoints > 5000 && probes > 5000, "clip fixtures exercise thousands of points");
-  console.log(`Vector cell index: exact dyadic coverage, bounded work, float32 and curve tolerances, store budgets, ${clipPoints} clip winding/probe points and ${sampledPixels} sampled boundary pixels passed`);
+  console.log(`Vector cell index: exact dyadic coverage, bounded work, float32 and curve tolerances, store budgets, ${clipPoints} clip winding/probe points, ${sampledPixels} sampled boundary pixels and ${largeClipPixels} large-clip chain AA masks passed`);
 } finally { hooks.deregister(); }

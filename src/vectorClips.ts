@@ -3,6 +3,8 @@ import { buildVectorPathCells, type VectorPathCells } from "./vectorCellIndex";
 
 /** Prefer indexing large clips; shaders can still scan their complete edges. */
 export const TARGET_VECTOR_CLIP_EDGES = 8192;
+/** Bound cell-index construction; larger polygons retain exact bands or edges. */
+export const MAX_CELL_INDEXED_CLIP_EDGES = 65_536;
 /** Absolute texel addresses in the GPU format must remain exact Float32 integers. */
 export const MAX_VECTOR_CLIP_TEXELS = 2 ** 24;
 
@@ -290,17 +292,12 @@ export function packVectorClips(clips: readonly VectorClipPath[] = [], maxTexels
   // storage another clip needs to render, regardless of its edge count.
   for (const payload of payloads) {
     const original = payload.edges.length / 4;
-    if (original > TARGET_VECTOR_CLIP_EDGES) {
-      const bands = buildClipBands(payload.edges);
-      const extra = bands ? 1 + bands.counts.length + bands.entries - original : 0;
-      if (bands && count + extra <= maxTexels) {
-        payload.bands = bands; count += extra; continue;
-      }
-      // Building a multi-level cell index for an enormous clip can cost more
-      // than its exact scan. A smaller upload still retains every source edge.
-      continue;
-    }
-    const fullCells = options.cells && !payload.rectangle ? buildClipCells(payload.edges) : null;
+    // Dense technical drawings can cover the viewport with a rectangle clipped
+    // by thousands of small contours. Bands still scan unrelated contours at
+    // close zoom; cells restrict the search in both axes. Keep construction
+    // bounded for enormous polygons and retain their exact band/scan fallback.
+    const fullCells = options.cells && !payload.rectangle && original <= MAX_CELL_INDEXED_CLIP_EDGES
+      ? buildClipCells(payload.edges) : null;
     const capacity = maxTexels - count + original;
     if (fullCells && clipCellTexels(fullCells) <= capacity) {
       payload.cells = fullCells;
