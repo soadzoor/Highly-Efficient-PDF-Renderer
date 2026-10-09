@@ -987,9 +987,17 @@ class NativePdfSession implements NativeVectorPdfSession {
     timings?: NativeVectorCompileTimings, reusePageResources = true, reuseCompositeSurfaces = true,
     boundCompositeWork = true
   ): Promise<VectorScene> {
+    options = { ...options, ...(options.limits ? { limits: { ...options.limits } } : {}) };
+    const hadOptionalContent = this.optionalContent.groupCount > 0;
     const annotations = await this.annotationMetadata.getPageAnnotations(sourcePageIndex, signal);
-    const scene = await this.compileVectorPageContentUnlocked(sourcePageIndex, options, signal,
+    let scene = await this.compileVectorPageContentUnlocked(sourcePageIndex, options, signal,
       timings, reusePageResources, reuseCompositeSurfaces, boundCompositeWork);
+    if (!hadOptionalContent && this.optionalContent.groupCount > 0 && options.retainOptionalContent !== false) {
+      // Missing catalog groups may be discovered only while compiling paint.
+      // Recompile with their scopes retained instead of dropping layer controls.
+      scene = await this.compileVectorPageContentUnlocked(sourcePageIndex, options, signal,
+        timings, reusePageResources, reuseCompositeSurfaces, boundCompositeWork);
+    }
     if (annotations.length > (options.limits?.maxCommandsPerPage ?? this.document.limits.maxCommandsPerPage)) {
       throw new PdfError("resource-limit", "Annotations exceed the page command limit.", { pageIndex: sourcePageIndex });
     }

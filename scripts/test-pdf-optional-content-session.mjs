@@ -233,6 +233,109 @@ EMC
     await unresolvedOcSession.close();
   }
 
+  const recoveredLayersSession = await openPdf({
+    kind: "bytes",
+    bytes: missingCatalogGroupsFixture(),
+    label: "missing-catalog-groups.pdf"
+  });
+  try {
+    const { OptionalContentController, getOptionalContentGroupIds, validateSceneOptionalContentReferences } = await import("../src/optionalContent.ts");
+    const page = await recoveredLayersSession.compilePage(0);
+    validateHeprPageData(page);
+    assert.deepEqual(page.stores.optionalContent.names, [
+      "Membership Layer", "ref:20:0", "Late Layer", "Expression Layer", "ref:21:0"
+    ], "recovered groups retain their names when memberships precede later groups");
+    assert.ok(page.stores.optionalContent.defaultVisible.every(value => value === 1),
+      "content-referenced layers absent from the catalog start visible");
+    const rootCommands = page.displayProgram.groups[page.displayProgram.rootGroupIndex].commands;
+    assert.equal(rootCommands.length, 4, "static compilation retains all recovered-layer paints");
+    assert.deepEqual(rootCommands.map(command => command.optionalContentIndex), [1, 2, 4, 1],
+      "late group memberships use their own indexes after the first OCMD");
+
+    const scene = await recoveredLayersSession.compileVectorPage(0, { vectorFallback: "error" });
+    validateSceneOptionalContentReferences(scene);
+    assert.equal(scene.fillPathCount, 3, "all recovered-layer rectangles retain vector geometry");
+    assert.equal(scene.segmentCount, 1, "the Form's recovered OCMD retains its vector stroke");
+    assert.deepEqual(scene.optionalContent.groups.map(group => group.name), [
+      "Membership Layer", "Late Layer", "Expression Layer"
+    ]);
+    assert.ok(scene.optionalContent.groups.every(group => group.defaultVisible));
+    const [membershipLayer, lateLayer, expressionLayer] = scene.optionalContent.groups;
+    const lateRun = scene.drawRuns.find(run => {
+      const ids = getOptionalContentGroupIds(scene.optionalContent, run.optionalContent);
+      return ids.length === 1 && ids[0] === lateLayer.id;
+    });
+    const expressionRun = scene.drawRuns.find(run =>
+      getOptionalContentGroupIds(scene.optionalContent, run.optionalContent).includes(expressionLayer.id));
+    const formRun = scene.drawRuns.find(run => run.kind === "stroke");
+    assert.ok(lateRun, "the late direct OCG remains independently addressable");
+    assert.ok(expressionRun, "the visibility expression retains its recovered operand");
+    assert.deepEqual(new Set(getOptionalContentGroupIds(scene.optionalContent, expressionRun.optionalContent)),
+      new Set([lateLayer.id, expressionLayer.id]));
+    assert.deepEqual(getOptionalContentGroupIds(scene.optionalContent, formRun.optionalContent),
+      [membershipLayer.id], "Form /OC references retain the initial OCMD membership");
+    const visibility = new OptionalContentController(scene);
+    try {
+      assert.ok(scene.drawRuns.every(run => visibility.isVisible(run.optionalContent)));
+      await visibility.setLayerVisibility(lateLayer.id, false);
+      assert.equal(visibility.isVisible(lateRun.optionalContent), false);
+      assert.equal(visibility.isVisible(expressionRun.optionalContent), false,
+        "the VE uses the late group's membership index rather than its group index");
+      assert.equal(visibility.isVisible(formRun.optionalContent), true);
+      await visibility.setLayerVisibility(lateLayer.id, true);
+      await visibility.setLayerVisibility(expressionLayer.id, false);
+      assert.equal(visibility.isVisible(lateRun.optionalContent), true);
+      assert.equal(visibility.isVisible(expressionRun.optionalContent), false);
+    } finally {
+      visibility.dispose();
+    }
+    await recoveredLayersSession.compilePage(0);
+    const warnings = recoveredLayersSession.getDiagnostics().filter(diagnostic =>
+      diagnostic.code === "optional-content.missing-catalog-group");
+    assert.equal(warnings.length, 3,
+      "repeated static and vector compilation emits only one warning per recovered group");
+    assert.ok(warnings.every(warning => warning.severity === "warning"));
+  } finally {
+    await recoveredLayersSession.close();
+  }
+
+  const recoveredVectorSession = await openPdf({
+    kind: "bytes",
+    bytes: missingCatalogGroupsFixture(),
+    label: "missing-catalog-groups-vector-first.pdf"
+  });
+  try {
+    const { OptionalContentController, getOptionalContentGroupIds, validateSceneOptionalContentReferences } = await import("../src/optionalContent.ts");
+    const scene = await recoveredVectorSession.compileVectorPage(0, { vectorFallback: "error" });
+    validateSceneOptionalContentReferences(scene);
+    assert.equal(scene.fillPathCount, 3);
+    assert.equal(scene.segmentCount, 1);
+    assert.deepEqual(scene.optionalContent.groups.map(group => group.name), [
+      "Membership Layer", "Late Layer", "Expression Layer"
+    ]);
+    assert.ok(scene.drawRuns.every(run => run.optionalContent >= 0),
+      "vector-first compilation retains layer conditions discovered during content preparation");
+    const lateLayer = scene.optionalContent.groups.find(group => group.name === "Late Layer");
+    const lateRun = scene.drawRuns.find(run => {
+      const ids = getOptionalContentGroupIds(scene.optionalContent, run.optionalContent);
+      return ids.length === 1 && ids[0] === lateLayer.id;
+    });
+    assert.ok(lateRun, "a recovered layer is addressable without prior static compilation");
+    const visibility = new OptionalContentController(scene);
+    try {
+      assert.equal(visibility.isVisible(lateRun.optionalContent), true);
+      await visibility.setLayerVisibility(lateLayer.id, false);
+      assert.equal(visibility.isVisible(lateRun.optionalContent), false);
+    } finally {
+      visibility.dispose();
+    }
+    assert.equal(recoveredVectorSession.getDiagnostics().filter(diagnostic =>
+      diagnostic.code === "optional-content.missing-catalog-group").length, 3,
+    "vector-first discovery does not duplicate recovery diagnostics");
+  } finally {
+    await recoveredVectorSession.close();
+  }
+
   const layersFixture = writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R /OCProperties 10 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 2 /Kids [3 0 R 6 0 R] >>" },
@@ -323,4 +426,34 @@ function unresolvedFormPropertyFixture(tag) {
       { number: 6, body: "<< /Type /ExtGState /CA 1 /ca 1 >>" }
     ]
   });
+}
+
+function missingCatalogGroupsFixture() {
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    {
+      number: 3,
+      body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Properties << /Membership 20 0 R /Late 12 0 R /Expression 21 0 R >> /XObject << /Fm 30 0 R >> >> /Contents 4 0 R >>"
+    },
+    {
+      number: 4,
+      body: tinyPdfStream("", [
+        "/OC /Membership BDC 0 0 10 10 re f EMC",
+        "/OC /Late BDC 20 0 10 10 re f EMC",
+        "/OC /Expression BDC 40 0 10 10 re f EMC",
+        "/Fm Do"
+      ].join("\n"))
+    },
+    { number: 11, body: "<< /Type /OCG /Name (Membership Layer) >>" },
+    { number: 12, body: "<< /Type /OCG /Name (Late Layer) >>" },
+    { number: 13, body: "<< /Type /OCG /Name (Expression Layer) >>" },
+    { number: 20, body: "<< /Type /OCMD /OCGs [11 0 R] /P /AllOn >>" },
+    { number: 21, body: "<< /Type /OCMD /VE [/And 12 0 R 13 0 R] >>" },
+    {
+      number: 30,
+      body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 100 100] /OC 20 0 R /Resources << >>",
+        "0 60 m 30 60 l S")
+    }
+  ] });
 }

@@ -15,6 +15,7 @@ import type { OptionalContentCondition, OptionalContentOrderNode, SceneOptionalC
 
 export const NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES = Object.freeze({
   HiddenDefault: "optional-content.hidden",
+  MissingCatalogGroup: "optional-content.missing-catalog-group",
   UnresolvedOptionalProperty: "optional-content.unresolved-property",
   UnresolvedMetadataProperty: "marked-content.unresolved-property"
 } as const);
@@ -108,6 +109,7 @@ export interface NativeOptionalContentPageProperty {
 
 interface GroupDraft {
   readonly index: number;
+  readonly membershipIndex: number;
   readonly identity: string;
   readonly name: string;
   readonly intents: readonly string[];
@@ -164,6 +166,7 @@ export class NativeOptionalContentRegistry {
   private operationTail: Promise<void> = Promise.resolve();
   private initialized = false;
   private defaultConfiguration: PdfValue | undefined;
+  private configurationIntents: ReadonlySet<string> = new Set(["View"]);
   private readonly combinedMemberships = new Map<string, number>();
 
   constructor(
@@ -232,30 +235,7 @@ export class NativeOptionalContentRegistry {
       if (!isPdfName(type, "OCG")) {
         throw invalidOptionalContent(`The catalog /OCGs entry ${index} is not an /OCG dictionary.`);
       }
-      const nameValue = await this.resolver.resolveValue(dictionary.get("Name"), signal);
-      if (!isPdfString(nameValue)) {
-        throw invalidOptionalContent(`Optional-content group ${identity} has no string /Name.`);
-      }
-      const name = decodePdfTextString(nameValue.bytes);
-      if (name.length === 0) {
-        throw invalidOptionalContent(`Optional-content group ${identity} has an empty /Name.`);
-      }
-      const intents = await this.readIntentNames(
-        dictionary.get("Intent"),
-        `Optional-content group ${identity} /Intent`,
-        ["View"],
-        signal
-      );
-      const draft: GroupDraft = {
-        index,
-        identity,
-        name,
-        intents,
-        usage: dictionary.get("Usage"),
-        configuredVisible: true,
-        usedInDefaultView: true,
-        defaultVisible: true
-      };
+      const draft = await this.readGroupDraft(dictionary, identity, index, signal);
       this.groupDrafts.push(draft);
       this.groupByIdentity.set(identity, draft);
     }
@@ -267,20 +247,7 @@ export class NativeOptionalContentRegistry {
     this.defaultConfiguration = defaultConfiguration;
     await this.applyDefaultConfiguration(defaultConfiguration, signal);
     for (const group of this.groupDrafts) {
-      const publicGroup = this.freezeGroup(group);
-      const membership: NativeOptionalContentMembership = Object.freeze({
-        index: group.index,
-        identity: group.identity,
-        kind: "ocg",
-        policy: "Identity",
-        groupIndices: Object.freeze([group.index]),
-        expression: null,
-        defaultVisible: group.defaultVisible
-      });
-      this.memberships.push(membership);
-      this.membershipEffects.push(group.usedInDefaultView);
-      this.membershipByIdentity.set(group.identity, Promise.resolve(membership));
-      if (!publicGroup.defaultVisible) this.emitHiddenDiagnostic(membership, publicGroup.name);
+      this.publishGroupMembership(group);
     }
     this.initialized = true;
     return this;
@@ -341,7 +308,7 @@ export class NativeOptionalContentRegistry {
     const expressionIndex = (expression: NativeOptionalContentExpression): number => {
       if (!affects(expression)) return append({ kind: "constant", value: true });
       if (expression.kind === "membership") return expression.membershipIndex;
-      if (expression.kind === "group") return expression.groupIndex;
+      if (expression.kind === "group") return this.groupDrafts[expression.groupIndex].membershipIndex;
       if (expression.kind === "not") return append({ kind: "not", operand: expressionIndex(expression.operand) });
       return append({ kind: expression.kind, operands: expression.operands.filter(affects).map(expressionIndex) });
     };
@@ -358,7 +325,10 @@ export class NativeOptionalContentRegistry {
         const groups = membership.groupIndices.filter(index => this.groupDrafts[index].usedInDefaultView);
         const off = membership.policy === "AnyOff" || membership.policy === "AllOff";
         conditions[membership.index] = { kind: membership.policy === "AllOn" || membership.policy === "AllOff" ? "and" : "or",
-          operands: groups.map(index => off ? append({ kind: "not", operand: index }) : index) };
+          operands: groups.map(index => {
+            const membershipIndex = this.groupDrafts[index].membershipIndex;
+            return off ? append({ kind: "not", operand: membershipIndex }) : membershipIndex;
+          }) };
       }
     }
     const config = this.defaultConfiguration === undefined ? new Map<string, PdfValue>() :
@@ -700,6 +670,7 @@ export class NativeOptionalContentRegistry {
     );
     const allIntents = configurationIntents.includes("All");
     const intentSet = new Set(configurationIntents);
+    this.configurationIntents = intentSet;
     for (const group of this.groupDrafts) {
       group.usedInDefaultView = allIntents
         ? group.intents.length > 0
@@ -945,7 +916,7 @@ export class NativeOptionalContentRegistry {
     signal?.throwIfAborted();
     const identity = this.identityOf(rawValue, "optional-content membership");
     const group = this.groupByIdentity.get(identity);
-    if (group !== undefined) return this.memberships[group.index];
+    if (group !== undefined) return this.memberships[group.membershipIndex];
     if (context.activeMemberships.has(identity)) {
       throw invalidOptionalContent(`Optional-content membership cycle detected at ${identity}.`);
     }
@@ -994,9 +965,8 @@ export class NativeOptionalContentRegistry {
     );
     const type = await this.resolver.resolveValue(dictionary.get("Type"), signal);
     if (isPdfName(type, "OCG")) {
-      throw unsupportedOptionalContent(
-        `Optional-content group ${identity} is referenced but absent from the catalog /OCGs array.`
-      );
+      const group = await this.recoverMissingGroup(dictionary, identity, signal);
+      return this.memberships[group.membershipIndex];
     }
     if (!isPdfName(type, "OCMD")) {
       throw invalidOptionalContent(`Optional-content membership ${identity} is not an /OCG or /OCMD.`);
@@ -1097,11 +1067,15 @@ export class NativeOptionalContentRegistry {
         );
       }
       const identity = this.identityOf(rawGroup, `${membershipIdentity} /OCGs[${index}]`);
-      const group = this.groupByIdentity.get(identity);
+      let group = this.groupByIdentity.get(identity);
       if (group === undefined) {
-        throw unsupportedOptionalContent(
-          `Optional-content membership ${membershipIdentity} references ${identity}, which is absent from /OCGs.`
-        );
+        const type = await this.resolver.resolveValue(resolvedGroup.get("Type"), signal);
+        if (!isPdfName(type, "OCG")) {
+          throw invalidOptionalContent(
+            `Optional-content membership ${membershipIdentity} /OCGs entry ${index} is not an /OCG dictionary.`
+          );
+        }
+        group = await this.recoverMissingGroup(resolvedGroup, identity, signal);
       }
       if (seen.has(identity)) {
         throw invalidOptionalContent(
@@ -1256,6 +1230,103 @@ export class NativeOptionalContentRegistry {
     return resolved;
   }
 
+  private async readGroupDraft(
+    dictionary: PdfDictionary,
+    identity: string,
+    membershipIndex: number,
+    signal?: AbortSignal
+  ): Promise<GroupDraft> {
+    const nameValue = await this.resolver.resolveValue(dictionary.get("Name"), signal);
+    if (!isPdfString(nameValue)) {
+      throw invalidOptionalContent(`Optional-content group ${identity} has no string /Name.`);
+    }
+    const name = decodePdfTextString(nameValue.bytes);
+    if (name.length === 0) {
+      throw invalidOptionalContent(`Optional-content group ${identity} has an empty /Name.`);
+    }
+    const intents = await this.readIntentNames(
+      dictionary.get("Intent"),
+      `Optional-content group ${identity} /Intent`,
+      ["View"],
+      signal
+    );
+    return {
+      index: this.groupDrafts.length,
+      membershipIndex,
+      identity,
+      name,
+      intents,
+      usage: dictionary.get("Usage"),
+      configuredVisible: true,
+      usedInDefaultView: true,
+      defaultVisible: true
+    };
+  }
+
+  private publishGroupMembership(group: GroupDraft): void {
+    const membership: NativeOptionalContentMembership = Object.freeze({
+      index: group.membershipIndex,
+      identity: group.identity,
+      kind: "ocg",
+      policy: "Identity",
+      groupIndices: Object.freeze([group.index]),
+      expression: null,
+      defaultVisible: group.defaultVisible
+    });
+    this.memberships.push(membership);
+    this.membershipEffects.push(group.usedInDefaultView);
+    this.membershipByIdentity.set(group.identity, Promise.resolve(membership));
+    if (!group.defaultVisible) this.emitHiddenDiagnostic(membership, group.name);
+  }
+
+  private async recoverMissingGroup(
+    dictionary: PdfDictionary,
+    identity: string,
+    signal?: AbortSignal
+  ): Promise<GroupDraft> {
+    signal?.throwIfAborted();
+    if (this.groupDrafts.length >= this.limits.maxGroups) {
+      throw optionalContentLimit(`Optional-content group count exceeds limit ${this.limits.maxGroups}.`);
+    }
+    if (this.memberships.length >= this.limits.maxMemberships) {
+      throw optionalContentLimit(
+        `Optional-content membership count exceeds limit ${this.limits.maxMemberships}.`
+      );
+    }
+    const draft = await this.readGroupDraft(dictionary, identity, this.memberships.length, signal);
+    signal?.throwIfAborted();
+    // Synchronous scope combinations can append memberships while group
+    // metadata resolves, so reserve the index and check capacity at publish.
+    if (this.memberships.length >= this.limits.maxMemberships) {
+      throw optionalContentLimit(
+        `Optional-content membership count exceeds limit ${this.limits.maxMemberships}.`
+      );
+    }
+    const group: GroupDraft = { ...draft, membershipIndex: this.memberships.length };
+    group.usedInDefaultView = this.configurationIntents.has("All")
+      ? group.intents.length > 0
+      : group.intents.some((intent) => this.configurationIntents.has(intent));
+    // An unlisted group has no reliable catalog visibility configuration.
+    // Retain its initial ON state so malformed layer metadata cannot omit paint.
+    this.groupDrafts.push(group);
+    this.groupByIdentity.set(identity, group);
+    this.publishGroupMembership(group);
+    const diagnostic: PdfDiagnostic = Object.freeze({
+      code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup,
+      severity: "warning",
+      message: `Optional-content group ${identity} is absent from the catalog /OCGs array; it was recovered as visible and layer visibility may differ.`,
+      details: Object.freeze({
+        groupIdentity: identity,
+        groupName: group.name,
+        membershipIndex: group.membershipIndex,
+        defaultVisible: true
+      })
+    });
+    this.diagnostics.push(diagnostic);
+    this.onDiagnostic?.(diagnostic);
+    return group;
+  }
+
   private identityOf(value: PdfValue, label: string): string {
     if (isPdfRef(value)) return `ref:${pdfRefKey(value)}`;
     if (isPdfDictionary(value)) {
@@ -1294,7 +1365,7 @@ export class NativeOptionalContentRegistry {
   private freezeGroup(group: GroupDraft): NativeOptionalContentGroup {
     return Object.freeze({
       index: group.index,
-      membershipIndex: group.index,
+      membershipIndex: group.membershipIndex,
       identity: group.identity,
       name: group.name,
       defaultVisible: group.defaultVisible

@@ -244,18 +244,19 @@ await withRegistry(primary, {}, async ({ document, registry, emitted }) => {
   assert.equal(firstInline, secondInline, "a direct inline BDC dictionary has stable identity caching");
   assert.equal(firstInline.index, byName.Inline.membershipIndex);
 
-  await assert.rejects(
-    registry.resolvePageProperties(document.getPage(0).resources, ["Rogue"]),
-    pdfError("unsupported-content", /absent from the catalog \/OCGs/)
-  );
-  assert.equal(registry.membershipCount, 15, "failed and unused properties publish no membership");
+  const [rogue] = await registry.resolvePageProperties(document.getPage(0).resources, ["Rogue"]);
+  assert.equal(rogue.defaultVisible, true, "unlisted groups retain paint despite the default OFF state");
+  assert.equal(rogue.membershipIndex, 15);
+  assert.equal(registry.membershipCount, 16, "unused properties publish no membership");
   assert.equal("setGroupVisible" in registry, false, "the static registry exposes no layer editing");
 
   const diagnostics = registry.getDiagnostics();
-  assert.equal(diagnostics.length, 5);
-  assert.ok(diagnostics.every(({ code, severity }) =>
+  assert.equal(diagnostics.length, 6);
+  assert.ok(diagnostics.slice(0, 5).every(({ code, severity }) =>
     code === NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.HiddenDefault && severity === "info"
   ));
+  assert.equal(diagnostics[5].code, NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup);
+  assert.equal(diagnostics[5].severity, "warning");
   assert.deepEqual(
     emitted.map(({ message }) => message),
     diagnostics.map(({ message }) => message),
@@ -435,15 +436,174 @@ const lazyOcRequestFailures = optionalContentPdf({
   ]
 });
 await withRegistry(lazyOcRequestFailures, {}, async ({ document, registry }) => {
-  await assert.rejects(
-    registry.resolvePageProperties(document.getPage(0).resources, ["Missing"]),
-    pdfError("unsupported-content", /absent from \/OCGs/)
-  );
+  const [missing] = await registry.resolvePageProperties(document.getPage(0).resources, ["Missing"]);
+  assert.equal(missing.defaultVisible, true);
+  assert.deepEqual(missing.membership.groupIndices, [2], "policy memberships recover unlisted OCGs");
   await assert.rejects(
     registry.resolvePageProperties(document.getPage(0).resources, ["Duplicate"]),
     pdfError("invalid-object", /repeats group ref:11:0/)
   );
 });
+
+const recoveredGroups = optionalContentPdf({
+  defaultConfiguration: "<< /BaseState /OFF >>",
+  pageProperties: [
+    "/Early 20 0 R /Repeated 21 0 R /Late 30 0 R /Wrapped << /OC 30 0 R >> " +
+    "/Off 22 0 R /Not 23 0 R /Direct << /Type /OCG /Name (Direct) >>"
+  ],
+  extraObjects: [
+    { number: 20, body: "<< /Type /OCMD /OCGs 11 0 R >>" },
+    { number: 21, body: "<< /Type /OCMD /VE [/And 30 0 R 30 0 R] >>" },
+    { number: 22, body: "<< /Type /OCMD /OCGs 30 0 R /P /AnyOff >>" },
+    { number: 23, body: "<< /Type /OCMD /VE [/Not 30 0 R] >>" },
+    { number: 30, body: "<< /Type /OCG /Name (Unlisted) >>" }
+  ]
+});
+await withRegistry(recoveredGroups, {}, async ({ document, registry, emitted }) => {
+  const names = ["Early", "Repeated", "Late", "Wrapped", "Off", "Not", "Direct"];
+  const properties = await registry.resolvePageProperties(document.getPage(0).resources, names);
+  const byName = Object.fromEntries(properties.map(property => [property.name, property]));
+  assert.deepEqual(properties.map(property => property.membershipIndex), [2, 4, 3, 3, 5, 6, 7]);
+  assert.deepEqual(properties.map(property => property.defaultVisible), [false, true, true, true, false, false, true]);
+  assert.deepEqual(registry.listGroups().map(({ index, membershipIndex }) => [index, membershipIndex]),
+    [[0, 0], [1, 1], [2, 3], [3, 7]], "group indexes remain distinct from lazy membership indexes");
+  assert.deepEqual(byName.Repeated.membership.groupIndices, [2]);
+  assert.equal(byName.Repeated.membership.expression.operands[0].membershipIndex, 3);
+  assert.equal(byName.Repeated.membership.expression.operands[1].groupIndex, 2,
+    "a repeated VE operand reuses the group recovered by its first operand");
+  assert.deepEqual(byName.Off.membership.groupIndices, [2]);
+
+  const resources = await document.resolveValue(document.getPage(0).resources);
+  const resourceProperties = await document.resolveValue(resources.get("Properties"));
+  const direct = resourceProperties.get("Direct");
+  assert.equal((await registry.resolvePropertyValue(direct)).index, 7);
+  const wrappedDirect = new Map([["OC", direct]]);
+  assert.equal((await registry.resolvePropertyValue(wrappedDirect)).index, 7);
+  const repeated = await registry.resolvePageProperties(document.getPage(0).resources, names);
+  assert.deepEqual(repeated.map(property => property.membershipIndex), properties.map(property => property.membershipIndex));
+  assert.equal(registry.membershipCount, 8, "repeated, direct and wrapped references keep stable identities");
+  const warnings = emitted.filter(({ code }) => code === NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup);
+  assert.equal(warnings.length, 2, "each recovered indirect or direct group emits one warning");
+  assert.deepEqual(warnings.map(({ details }) => [details.groupName, details.membershipIndex]),
+    [["Unlisted", 3], ["Direct", 7]]);
+  assert.ok(warnings.every(({ severity, message }) => severity === "warning" && /recovered as visible/.test(message)));
+
+  const [{ createEmptyVectorScene }, { createDefaultOptionalContentSnapshot, validateSceneOptionalContent }] = await Promise.all([
+    import("../src/emptyVectorScene.ts"), import("../src/optionalContent.ts")
+  ]);
+  const data = await registry.sceneData();
+  validateSceneOptionalContent(data);
+  const snapshot = createDefaultOptionalContentSnapshot({ ...createEmptyVectorScene(), optionalContent: data });
+  for (const property of properties) {
+    assert.equal(snapshot.conditions[property.membershipIndex] === 1, property.defaultVisible,
+      `${property.name}: exported conditions preserve recovered group and membership indexes`);
+  }
+  assert.deepEqual(data.conditions[3], { kind: "group", groupId: "ref:30:0" });
+});
+
+for (const [body, pattern] of [
+  ["<< /Type /Other /Name (Wrong type) >>", /not an \/OCG or \/OCMD/],
+  ["<< /Type /OCG /Name 42 >>", /no string \/Name/],
+  ["<< /Type /OCG /Name () >>", /empty \/Name/],
+  ["<< /Type /OCG /Name (Bad intent) /Intent 42 >>", /Intent/]
+]) {
+  await withRegistry(optionalContentPdf({
+    pageProperties: ["/Malformed << /OC 30 0 R >>"],
+    extraObjects: [{ number: 30, body }]
+  }), {}, async ({ document, registry, emitted }) => {
+    await assert.rejects(registry.resolvePageProperties(document.getPage(0).resources, ["Malformed"]),
+      pdfError("invalid-object", pattern));
+    assert.equal(registry.groupCount, 2);
+    assert.equal(registry.membershipCount, 2);
+    assert.equal(emitted.length, 0, "invalid groups are not recovered or diagnosed as accepted");
+  });
+}
+
+const recoveryLimits = optionalContentPdf({
+  pageProperties: ["/Late 30 0 R /Policy 20 0 R /Nested 21 0 R"],
+  extraObjects: [
+    { number: 20, body: "<< /Type /OCMD /OCGs 30 0 R >>" },
+    { number: 21, body: "<< /Type /OCMD /VE [/And 20 0 R] >>" },
+    { number: 30, body: "<< /Type /OCG /Name (Unlisted) >>" }
+  ]
+});
+for (const limit of ["maxGroups", "maxMemberships"]) {
+  await withRegistry(recoveryLimits, { limits: { [limit]: 2 } }, async ({ document, registry, emitted }) => {
+    await assert.rejects(registry.resolvePageProperties(document.getPage(0).resources, ["Late"]),
+      pdfError("resource-limit", /exceeds limit 2/));
+    assert.equal(registry.groupCount, 2);
+    assert.equal(registry.membershipCount, 2);
+    assert.equal(emitted.length, 0);
+  });
+}
+for (const [maxMemberships, name] of [[3, "Policy"], [4, "Nested"]]) {
+  await withRegistry(recoveryLimits, { limits: { maxMemberships } }, async ({ document, registry }) => {
+    await assert.rejects(registry.resolvePageProperties(document.getPage(0).resources, [name]),
+      pdfError("resource-limit", new RegExp(`exceeds limit ${maxMemberships}`)));
+    assert.equal(registry.membershipCount, maxMemberships,
+      "recovering groups and nested memberships cannot bypass the parent's publication limit");
+    const [late] = await registry.resolvePageProperties(document.getPage(0).resources, ["Late"]);
+    assert.equal(late.membershipIndex, 2, "a published recovery remains usable after its parent hits a limit");
+    assert.equal(late.defaultVisible, true);
+  });
+}
+await withRegistry(recoveryLimits, {}, async ({ document, registry, emitted }) => {
+  const reason = new PdfError("aborted", "unlisted group recovery cancelled");
+  await assert.rejects(registry.resolvePageProperties(document.getPage(0).resources, ["Late"],
+    AbortSignal.abort(reason)), error => error === reason);
+  assert.equal(registry.groupCount, 2);
+  assert.equal(registry.membershipCount, 2);
+  assert.equal(emitted.length, 0, "cancelled requests do not recover groups");
+});
+
+for (const mode of ["recovered", "limited", "aborted"]) {
+  const document = await openNativePdfDocument({ kind: "bytes", bytes: optionalContentPdf({
+    extraObjects: [{ number: 30, body: "<< /Type /OCG /Name (Delayed) /Intent /View >>" }]
+  }) });
+  try {
+    const lateRef = { kind: "ref", objectNumber: 30, generation: 0 };
+    const late = await document.resolveValue(lateRef);
+    const delayedValue = late.get(mode === "aborted" ? "Intent" : "Name");
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    const emitted = [];
+    const registry = await createNativeOptionalContentRegistry({
+      catalog: document.catalog,
+      async resolveValue(value, signal) {
+        if (value === delayedValue) {
+          entered.resolve();
+          await release.promise;
+          return value;
+        }
+        return await document.resolveValue(value, signal);
+      }
+    }, {
+      limits: mode === "limited" ? { maxMemberships: 3 } : undefined,
+      onDiagnostic: diagnostic => emitted.push(diagnostic)
+    });
+    const controller = new AbortController();
+    const reason = new PdfError("aborted", "delayed unlisted group cancelled");
+    const pending = registry.resolvePropertyValue(lateRef, controller.signal);
+    await entered.promise;
+    assert.equal(registry.combineMemberships(0, 1), 2);
+    if (mode === "aborted") controller.abort(reason);
+    release.resolve();
+    if (mode === "recovered") {
+      assert.equal((await pending).index, 3, "recovery uses the membership index available after metadata resolves");
+      assert.equal(registry.getGroup(2).membershipIndex, 3);
+      assert.equal(registry.membershipCount, 4);
+      assert.equal(emitted.length, 1);
+    } else {
+      await assert.rejects(pending, mode === "limited"
+        ? pdfError("resource-limit", /exceeds limit 3/) : error => error === reason);
+      assert.equal(registry.groupCount, 2);
+      assert.equal(registry.membershipCount, 3);
+      assert.equal(emitted.length, 0, "publication rechecks capacity and cancellation after metadata resolves");
+    }
+    assert.equal(registry.getMembership(2).identity, "scope:0:1", "recovery preserves the concurrent combined scope");
+  } finally {
+    await document.close();
+  }
+}
 
 const expressionCycle = optionalContentPdf({
   pageProperties: ["/Cycle 20 0 R"],
