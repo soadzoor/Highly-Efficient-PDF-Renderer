@@ -359,6 +359,7 @@ function testPdfEmbeddedSubsetCompatibility() {
     );
     assert.deepEqual(font.getGlyphOutline(1).bounds, [0, 0, 200, 100]);
     assert.equal(font.diagnostics[0]?.details?.reason, "hmtx-trailing-bytes");
+    assert.equal(font.diagnostics[0]?.severity, "info", "ignoring unreachable metrics bytes is informational");
     assert.equal(font.diagnostics[0]?.details?.ignoredByteCount, trailingByteCount);
   }
 
@@ -469,7 +470,7 @@ function testBinaryHmtxNormalizationFixtures() {
     "an unreachable bounded hmtx tail cannot alter count-derived metrics"
   );
   assert.equal(overCount.diagnostics[0]?.details?.reason, "hmtx-trailing-bytes");
-  assert.equal(overCount.diagnostics[0]?.severity, "warning");
+  assert.equal(overCount.diagnostics[0]?.severity, "info");
   assert.equal(overCount.diagnostics[0]?.details?.ignoredByteCount, 2);
 
   const missingInvariant = hmtxUnderCountFixture.slice();

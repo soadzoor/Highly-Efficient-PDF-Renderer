@@ -2889,7 +2889,7 @@ function embeddedHmtxDiagnostic(
       });
   return Object.freeze({
     code: "font.sfnt-horizontal-metrics-normalized",
-    severity: missing && recoveredExactly ? "info" : "warning",
+    severity: missing && !recoveredExactly ? "warning" : "info",
     message: missing
       ? recoveredExactly
         ? "An embedded sfnt omitted trailing horizontal bearings; exact values were recovered from glyph xMin bounds."
