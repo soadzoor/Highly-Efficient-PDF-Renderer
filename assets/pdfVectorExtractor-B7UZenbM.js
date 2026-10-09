@@ -1,1 +1,0 @@
-let e;function t(){return e??=n()?import(`./nodePdfSource-Dy-stX2N.js`).then(({createNodeBundledStandardFontResolver:e})=>e()):import(`./standardFontResolver-Bxrsmetj.js`).then(({createBundledStandardFontResolver:e})=>e()),e}function n(){return typeof globalThis.process?.versions?.node==`string`}export{t as nativeVectorMissingFontResolver};
