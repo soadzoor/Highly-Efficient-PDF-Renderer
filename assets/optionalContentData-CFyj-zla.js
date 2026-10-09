@@ -1,0 +1,1 @@
+var e=4294967295,t=2**31;export{e as n,t};
