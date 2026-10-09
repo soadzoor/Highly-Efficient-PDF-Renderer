@@ -4186,7 +4186,7 @@ class DenseContentCompiler {
       role
     );
     this.glyphPaints.push({
-      ...(this.state.lineWidth === 0 && [1, 2, 5, 6].includes(renderingMode)
+      ...(strokes
         ? { strokeTransform: [...this.state.matrix] as DensePdfMatrix } : {}),
       renderingMode,
       ...(patternColorApproximation ? { patternColorApproximation: true } : {}),

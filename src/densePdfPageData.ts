@@ -938,7 +938,7 @@ export function createHeprPageDataFromDense(
               ], strokeComposite))
         : -1,
       strokeStyleIndex: strokes ? appendTextStrokeStyle(state) : -1,
-      strokeTransformIndex: strokes && state.lineWidth === 0 && paint.strokeTransform
+      strokeTransformIndex: strokes && paint.strokeTransform
         ? appendTransform(paint.strokeTransform)
         : undefined,
       wrapperComposite: Object.freeze({

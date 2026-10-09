@@ -110,6 +110,20 @@ try {
     const { renderHeprPageToCanvas2d } = await import("../src/heprCanvas2dRenderer.ts");
     const page = await groupSession.compilePage(0);
     assert.equal(page.displayProgram.groups.length, 7, "fixture must exercise six separate alpha groups");
+    // Compare with direct Canvas compositing of an unreleased opaque layer.
+    // Eight-bit rounding differs between backends; ideal alpha is 251.015625.
+    const reference = createCanvas(20, 20);
+    const referenceContext = reference.getContext("2d");
+    const layer = createCanvas(20, 20);
+    const layerContext = layer.getContext("2d");
+    layerContext.fillStyle = "red";
+    layerContext.fillRect(0, 10, 10, 10);
+    referenceContext.globalAlpha = .5;
+    for (let paint = 0; paint < 6; paint++) referenceContext.drawImage(layer, 0, 0);
+    const expectedPixel = [...referenceContext.getImageData(5, 15, 1, 1).data];
+    assert.deepEqual(expectedPixel.slice(0, 3), [255, 0, 0]);
+    assert(Math.abs(expectedPixel[3] - 255 * (1 - .5 ** 6)) <= 1,
+      "the reference agrees with six ordered half-opacity paints within eight-bit rounding");
     canvases.length = 0;
     peakCanvasPixels = 0;
     const factory = await createNativeCompositeSurfaceFactory();
@@ -120,7 +134,7 @@ try {
         "only the output and current group retain full page-sized backing stores");
       assert(canvases.slice(1).every(canvas => canvas.width === 1 && canvas.height === 1),
         "completed group buffers are released before readback or factory cleanup");
-      assert.deepEqual([...rendered.surface.context.getImageData(5, 15, 1, 1).data], [255, 0, 0, 252],
+      assert.deepEqual([...rendered.surface.context.getImageData(5, 15, 1, 1).data], expectedPixel,
         "releasing group buffers preserves ordered alpha compositing");
       assert.equal(rendered.surface.context.getImageData(15, 5, 1, 1).data[3], 0,
         "the live output keeps its transparent background");

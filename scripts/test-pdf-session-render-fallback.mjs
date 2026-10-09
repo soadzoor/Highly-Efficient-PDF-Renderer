@@ -73,6 +73,55 @@ try {
     } finally { await session.close(); }
   }
 
+  // Equivalent ordinary paths are an independent oracle for text pen widths
+  // and dash distances, including text transforms and reusable Form placement.
+  const { encodeHeprPageData, decodeHeprPageData } = await import("../src/heprPageEncoding.ts");
+  for (const [name, text, path, style, form] of [
+    ["font size", "/F 100 Tf 1 Tr 10 10 Td", "10 10 m 20 10 l 10 20 l h S", ".8 w 1 J 1 j [2 1] .5 d"],
+    ["horizontal scale and text matrix", "/F 200 Tf 50 Tz 1 Tr 1 0 0 .5 10 10 Tm",
+      "10 10 m 20 10 l 10 20 l h S", ".8 w 1 J 1 j [2 1] .5 d"],
+    ["nonuniform graphics transform", "/F 60 Tf 65 Tz 2 Tr .8 .25 -.1 1.2 7 8 Tm",
+      "7 8 m 10.12 8.975 l 6.4 15.2 l h B", "1.6 .2 .35 .7 6 12 cm .8 w 1 J 1 j [2 1] .5 d"],
+    ["hairline under text shear", "/F 100 Tf 70 Tz 1 Tr 1 .3 -.2 1 10 10 Tm",
+      "10 10 m 17 12.1 l 8 20 l h S", "0 w [2 1] .5 d"],
+    ["reusable Form", "/F 100 Tf 1 Tr 10 10 Td", "10 10 m 20 10 l 10 20 l h S",
+      ".8 w 1 J 1 j [2 1] .5 d", true]
+  ]) {
+    const bytes = content => form ? glyphFormFixture(content) : fixture({ width: 80, height: 60, font: true, content });
+    const prefix = `1 0 0 rg 0 0 1 RG ${style} `;
+    const session = await openPdf({ kind: "bytes", bytes: bytes(`${prefix}BT ${text} (A) Tj ET`) }, fontOptions);
+    const reference = await openPdf({ kind: "bytes", bytes: bytes(`${prefix}${path}`) });
+    try {
+      const page = await session.compilePage(0);
+      const command = [...page.displayProgram.groups, ...page.displayProgram.programs]
+        .flatMap(program => program.commands).find(command => command.source === "glyphs");
+      assert(command?.strokeTransformIndex >= 0, `${name}: text retains its graphics-state pen transform`);
+      const restored = decodeHeprPageData(encodeHeprPageData(page));
+      assert.deepEqual(restored, page, `${name}: pen transforms survive serialization`);
+      const expectedPage = await reference.compilePage(0);
+      for (const scale of [1, 4]) {
+        const actual = await renderHeprPageToCanvas2d(restored, { scale, surfaceFactory });
+        const expected = await renderHeprPageToCanvas2d(expectedPage, { scale, surfaceFactory });
+        const pixels = result => result.surface.context.getImageData(0, 0, result.width, result.height).data;
+        const actualPixels = pixels(actual), expectedPixels = pixels(expected);
+        // Compare premultiplied color and alpha coverage, allowing small edge
+        // rounding differences without letting transparent page area hide errors.
+        let error = 0, coverage = 0;
+        for (let offset = 0; offset < actualPixels.length; offset += 4) {
+          const alpha = actualPixels[offset + 3], expectedAlpha = expectedPixels[offset + 3];
+          coverage += expectedAlpha;
+          error += Math.abs(alpha - expectedAlpha);
+          for (let channel = 0; channel < 3; channel++) {
+            error += Math.abs(actualPixels[offset + channel] * alpha -
+              expectedPixels[offset + channel] * expectedAlpha) / 255;
+          }
+        }
+        assert(coverage > 0, `${name}: the reference stroke is visible`);
+        assert(error / (coverage * 4) < .02, `${name} at ${scale}x: glyph strokes match the ordinary path`);
+      }
+    } finally { await reference.close(); await session.close(); }
+  }
+
   {
     const name = "finely dashed glyph stroke", style = ".4 w [.01 .01] 0 d";
     const warnings = [];
@@ -260,6 +309,16 @@ try {
 function surfaceFactory(width, height) {
   const canvas = createCanvas(width, height);
   return { canvas, context: canvas.getContext("2d") };
+}
+function glyphFormFixture(content) {
+  return writeTinyPdf({ objects: [
+    { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+    { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 60] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>" },
+    { number: 4, body: tinyPdfStream("", "1.2 .15 -.2 .9 10 5 cm /Fm Do") },
+    { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 40 40] /Matrix [.9 .1 -.15 1.1 0 0] /Resources << /Font << /F 6 0 R >> >>", content) },
+    { number: 6, body: "<< /Type /Font /Subtype /TrueType /BaseFont /FallbackFixture /Encoding /WinAnsiEncoding >>" }
+  ] });
 }
 function assertRenderedPixel(rendered, x, y, expected) {
   assert.deepEqual([...rendered.surface.context.getImageData(Math.floor(x * rendered.scale),

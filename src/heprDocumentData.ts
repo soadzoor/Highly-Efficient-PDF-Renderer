@@ -692,7 +692,7 @@ export interface HeprGlyphDrawRun extends HeprCommandBase {
   strokePaintIndex: number;
   strokeStyleIndex: number;
   /**
-   * Graphics-state transform in resource space for hairline pen/dash distances,
+   * Graphics-state transform in resource space for pen widths and dash distances,
    * independent of the glyph/text matrix. Compose the execution transform outside it.
    */
   strokeTransformIndex?: number;

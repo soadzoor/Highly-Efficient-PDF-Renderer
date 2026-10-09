@@ -1111,25 +1111,42 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         }
       }
       if (stroke?.visible) {
+        const penTransform = command.strokeTransformIndex === undefined
+          ? null
+          : readTransform(this.page, command.strokeTransformIndex);
+        const strokeTransform = penTransform === null
+          ? transform
+          : multiplyHeprMatrices(execution.state.transform, penTransform);
+        const localStrokeTransform = penTransform === null
+          ? localTransform
+          : multiplyHeprMatrices(readTransform(this.page, command.transformIndex), penTransform);
+        const canvasStrokeTransform = multiplyHeprMatrices(this.deviceMatrix, strokeTransform);
+        const glyphToPen = penTransform === null ? undefined : multiplyHeprMatrices(
+          invertCanvasMatrix(penTransform, `${execution.commandPath}.strokeTransformIndex`),
+          glyphTransform
+        );
         context.save();
         try {
           this.applyClips(context, execution.state.clips);
-          setCanvasTransform(context, canvasTransform);
+          setCanvasTransform(context, canvasStrokeTransform);
           context.beginPath();
           for (let pathIndex = pathStart; pathIndex < pathStart + pathCount; pathIndex += 1) {
-            appendStoredPath(context, this.page, pathIndex);
+            // Place glyph coordinates in pen space before appending the path.
+            // The text matrix scales the glyph independently of stroke widths
+            // and dashes, without changing Canvas transforms mid-path.
+            appendStoredPath(context, this.page, pathIndex, glyphToPen);
           }
           this.applyGenericStrokeStyle(
             context,
             command.strokeStyleIndex,
-            canvasTransform,
+            canvasStrokeTransform,
             execution.commandPath
           );
           await this.strokeCurrentPath(
             context,
             stroke,
-            transform,
-            localTransform,
+            strokeTransform,
+            localStrokeTransform,
             `${execution.commandPath}.strokePaintIndex`
           );
         } finally {
@@ -3275,8 +3292,26 @@ function clearSurface(surface: HeprCanvas2dSurface): void {
 function appendStoredPath(
   context: CanvasRenderingContext2D,
   page: HeprPageData,
-  pathIndex: number
+  pathIndex: number,
+  transform?: PdfMatrix
 ): void {
+  if (transform !== undefined) {
+    visitHeprPath(page.stores.paths, pathIndex, {
+      moveTo: (x, y) => context.moveTo(...transformCanvasPoint(transform, x, y)),
+      lineTo: (x, y) => context.lineTo(...transformCanvasPoint(transform, x, y)),
+      quadraticTo: (controlX, controlY, x, y) => context.quadraticCurveTo(
+        ...transformCanvasPoint(transform, controlX, controlY),
+        ...transformCanvasPoint(transform, x, y)
+      ),
+      cubicTo: (control1X, control1Y, control2X, control2Y, x, y) => context.bezierCurveTo(
+        ...transformCanvasPoint(transform, control1X, control1Y),
+        ...transformCanvasPoint(transform, control2X, control2Y),
+        ...transformCanvasPoint(transform, x, y)
+      ),
+      close: () => context.closePath()
+    });
+    return;
+  }
   visitHeprPath(page.stores.paths, pathIndex, {
     moveTo: (x, y) => context.moveTo(x, y),
     lineTo: (x, y) => context.lineTo(x, y),
