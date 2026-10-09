@@ -1139,6 +1139,7 @@ npx @soadzoor/hepr --without-vector-lod --without-text-lod --output-dir=./heps .
 npx @soadzoor/hepr --without-text-lod --vector-lod-precision=lossless --output-dir=./heps-vector-lod ./pdfs
 npx @soadzoor/hepr --force ./pdfs
 npx @soadzoor/hepr --workers=4 --output-dir=./heps ./pdfs
+npx @soadzoor/hepr --log-file=./conversion.log ./pdfs
 npx @soadzoor/hepr --annotation-appearances=none ./pdfs
 HEPR_PDF_PASSWORD='secret' npx @soadzoor/hepr ./protected.pdf
 ```
@@ -1170,15 +1171,23 @@ conversions. Each PDF gets a fresh child process to release its memory after
 conversion. A single PDF still uses one conversion
 process. `--workers=<count>` accepts a positive integer to override the automatic
 count; use it to reduce concurrency, or `--workers=1` to run serially.
-Progress lines identify their PDF, and the final summary includes per-file
-durations and batch wall time. Summed conversion durations overlap in parallel
-and can exceed wall time.
+Progress lines identify their PDF. The terminal ends with a table showing only
+the filename, conversion status, duration, PDF size, HEP size, and percentage size
+change. Smaller HEPs appear green and larger HEPs red when the terminal supports
+color and `NO_COLOR` is unset. The final metrics table reports attempted,
+successful, failed and skipped counts, warning and raster-fallback counts, total
+conversion time, average and median attempted conversion times, batch wall time,
+and original PDF and saved HEP size totals for successful conversions. Existing
+output skips are excluded from timing and size comparisons. Summed conversion
+durations overlap in parallel and can exceed wall time.
 
-The final **Raster fallback by PDF** section lists successful conversions that
-needed selective raster layers or whole-page raster rendering, with affected
-page numbers and diagnostic reasons. It reports when none occurred. Original
-PDF images, font/color approximations, and failed conversion attempts are not
-counted as raster fallback in generated HEPs.
+Detailed worker output, warnings, errors, and full file paths are saved to
+`pdf-to-hep-<timestamp>-<unique>.log` in the current working directory. The terminal
+prints its location. Use `--log-file=<path>` to choose a different file; an
+existing file is appended to. The log groups diagnostics by PDF, including
+affected pages and reasons for selective raster layers or whole-page raster
+rendering. Original PDF images, font/color approximations, and failed conversion
+attempts are not counted as raster fallback in generated HEPs.
 
 Each child retains its own heap limit of 12288 MiB by default (not preallocated).
 `HEPR_PDF_TO_HEP_HEAP_MB` or the parent's `--max-old-space-size` overrides this

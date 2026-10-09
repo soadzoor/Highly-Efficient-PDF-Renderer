@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
@@ -9,6 +9,7 @@ import { setImmediate as waitForImmediate } from "node:timers/promises";
 import {
   assertSupportedNodeVersion,
   assertUniqueHepOutputs,
+  createPdfToHepDiagnosticLog,
   discoverPdfFiles,
   formatPdfToHepDuration,
   formatPdfToHepSummary,
@@ -78,6 +79,10 @@ assert.throws(
   () => parsePdfToHepArguments(["--output-dir=one", "--output-dir=two", "input"]),
   /exactly one/
 );
+assert.equal(parsePdfToHepArguments(["--log-file=./logs/conversion.log", "./pdfs"]).logFile,
+  path.resolve("./logs/conversion.log"));
+assert.throws(() => parsePdfToHepArguments(["--log-file=", "input"]), /non-empty/);
+assert.throws(() => parsePdfToHepArguments(["--log-file=one", "--log-file=two", "input"]), /exactly one/);
 
 assert.deepEqual(parsePdfToHepArguments(["--force", "--keep-unchanged", "./pdfs"]), {
   force: true,
@@ -355,6 +360,13 @@ const batchCleanupCalls = [];
 const batchSignalTarget = new EventEmitter();
 const batchLog = [];
 const batchError = [];
+const batchDiagnostics = [];
+let batchLogClosed = false;
+const batchDiagnosticLog = {
+  path: "/synthetic/batch-diagnostics.log", fd: 99,
+  write: (message) => batchDiagnostics.push(String(message)),
+  async close() { batchLogClosed = true; }
+};
 const originalConsoleLogForBatch = console.log;
 const originalConsoleErrorForBatch = console.error;
 let batchNow = 0;
@@ -370,6 +382,7 @@ try {
       heapMb: 8_192,
       signalTarget: batchSignalTarget,
       now: () => batchNow,
+      createDiagnosticLog: async () => batchDiagnosticLog,
       startWorker(item, force, heapMb) {
         assert.equal(item, batchItems[batchChildren.length]);
         assert.equal(force, false);
@@ -410,24 +423,22 @@ assert.ok(batchCleanupCalls.every(([, pid, token]) =>
 assert.ok(batchError.some((message) =>
   message.includes("after 0h 00m 03s") && message.includes("Continuing with the next PDF")
 ));
+assert.equal(batchLogClosed, true);
+assert.match(batchDiagnostics.join("\n"), /batch-2.pdf: exit code 1/);
+const expectedBatchTimings = [
+  { ...batchItems[0], status: "generated", durationMs: 1000 },
+  { ...batchItems[1], status: "failed", durationMs: 2500, errorMessage: "exit code 1" },
+  { ...batchItems[2], status: "skipped", durationMs: 3700 }
+];
 assert.deepEqual(batchLog, [
+  "Diagnostics log: /synthetic/batch-diagnostics.log",
   "Converting 3 PDF(s) with up to 1 worker(s).",
-  `[1/3] Converted ${batchItems[0].pdfPath} in 0h 00m 01s`,
-  `[3/3] Skipped ${batchItems[2].pdfPath} after 0h 00m 04s`,
+  "[1/3] Converted batch-1.pdf in 0h 00m 01s",
+  "[3/3] Skipped batch-3.pdf after 0h 00m 04s",
   "Finished: 1 generated, 3 skipped, 1 failed.",
-  [
-    "Conversion time summary:",
-    `  [1/3] ${batchItems[0].pdfPath}: 0h 00m 01s (generated)`,
-    `  [2/3] ${batchItems[1].pdfPath}: 0h 00m 03s (failed)`,
-    `  [3/3] ${batchItems[2].pdfPath}: 0h 00m 04s (skipped)`,
-    "  Total attempted conversion time: 0h 00m 07s"
-  ].join("\n"),
-  "Batch wall time: 0h 00m 07s",
-  formatPdfToHepSummary([
-    { ...batchItems[0], status: "generated" },
-    { ...batchItems[1], status: "failed", errorMessage: "exit code 1" },
-    { ...batchItems[2], status: "skipped" }
-  ], 3)
+  formatPdfToHepTimingSummary(expectedBatchTimings),
+  "Diagnostics log: /synthetic/batch-diagnostics.log",
+  formatPdfToHepSummary(expectedBatchTimings, 3, 0, { wallTimeMs: 7200 })
 ]);
 assert.equal(batchSignalTarget.listenerCount("SIGINT"), 0);
 assert.equal(batchSignalTarget.listenerCount("SIGTERM"), 0);
@@ -436,6 +447,8 @@ const interruptSignalTarget = new EventEmitter();
 const interruptChildren = [];
 const forwardedSignals = [];
 const interruptLog = [];
+const interruptDiagnostics = [];
+let interruptLogClosed = false;
 let interruptNow = 0;
 let interruptResult;
 const originalConsoleErrorForInterrupt = console.error;
@@ -451,6 +464,11 @@ try {
       heapMb: 8_192,
       signalTarget: interruptSignalTarget,
       now: () => interruptNow,
+      createDiagnosticLog: async () => ({
+        path: "/synthetic/interrupt-diagnostics.log", fd: 99,
+        write: (message) => interruptDiagnostics.push(String(message)),
+        async close() { await waitForImmediate(); interruptLogClosed = true; }
+      }),
       cleanupWorkerTemps: async () => {},
       startWorker(item, force, heapMb) {
         const child = new FakeChild();
@@ -476,13 +494,16 @@ try {
   console.log = originalConsoleLogForInterrupt;
 }
 assert.equal(interruptResult, 130);
-assert.deepEqual(interruptLog, ["Converting 3 PDF(s) with up to 1 worker(s).", [
-  "Conversion time summary:",
-  `  [1/3] ${batchItems[0].pdfPath}: 0h 00m 05s (interrupted)`,
-  "  Total attempted conversion time: 0h 00m 05s"
-].join("\n"), "Batch wall time: 0h 00m 05s", formatPdfToHepSummary([
-  { ...batchItems[0], status: "interrupted" }
-], 0, 2)]);
+const expectedInterruptTimings = [{ ...batchItems[0], status: "interrupted", durationMs: 5000 }];
+assert.deepEqual(interruptLog, [
+  "Diagnostics log: /synthetic/interrupt-diagnostics.log",
+  "Converting 3 PDF(s) with up to 1 worker(s).",
+  formatPdfToHepTimingSummary(expectedInterruptTimings),
+  "Diagnostics log: /synthetic/interrupt-diagnostics.log",
+  formatPdfToHepSummary(expectedInterruptTimings, 0, 2, { wallTimeMs: 5000 })
+]);
+assert.equal(interruptLogClosed, true, "interruption waits for pending log writes");
+assert.match(interruptDiagnostics.join("\n"), /interrupted/);
 assert.equal(interruptChildren.length, 1, "interruption must prevent later workers from starting");
 assert.equal(interruptSignalTarget.listenerCount("SIGINT"), 0);
 assert.equal(interruptSignalTarget.listenerCount("SIGTERM"), 0);
@@ -528,6 +549,9 @@ try {
 
   const existingHepPath = hepOutputPathForPdf(topPdf);
   await writeFile(existingHepPath, "existing HEP sentinel");
+  await assert.rejects(runPdfToHep([`--log-file=${existingHepPath}`, temporaryRoot]), /PDF|HEP|input|output|overwrite/i,
+    "the log destination is validated against skipped HEPs before any pending worker starts");
+  assert.equal(await readFile(existingHepPath, "utf8"), "existing HEP sentinel");
   const originalConsoleLog = console.log;
   const existingSkipLog = [];
   try {
@@ -715,6 +739,10 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
       async buildHep(_bytes, options) {
         console.warn("synthetic IPC warning");
         console.warn("synthetic IPC warning");
+        process.stdout.write("synthetic raw stdout\\n");
+        process.stderr.write("synthetic raw stderr\\n");
+        console.error("synthetic console error");
+        options.onProgress({ value: 0.5, stage: "synthetic-build" });
         for (let index = 0; index < 2; index++) options.onDiagnostic({
           severity: "warning", code: "page-raster-fallback", pageIndex: 2,
           message: "synthetic IPC raster fallback", details: { reason: "synthetic page reason" }
@@ -726,15 +754,46 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
   }
 });
 `);
-  const ipcWorker = startPdfToHepWorker({
-    pdfPath: reportPdf,
-    outputPath: reportOutput,
-    fileNumber: 1,
-    fileCount: 1
-  }, true, 512, (command, args, options) => spawn(command, args, {
-    ...options, stdio: ["ignore", "ignore", "ignore", "ipc"]
-  }), ipcWorkerScript);
-  assert.deepEqual(await ipcWorker.completion, { code: 0, signal: null });
+  const ipcLogPath = path.join(temporaryRoot, "diagnostics", "ipc-worker.log");
+  const ipcLog = await createPdfToHepDiagnosticLog({ logFile: ipcLogPath }, [{ pdfPath: reportPdf, outputPath: reportOutput }]);
+  assert.equal(ipcLog.path, ipcLogPath);
+  assert(Number.isSafeInteger(ipcLog.fd));
+  ipcLog.write("parent log marker before worker");
+  let ipcSpawnOptions;
+  const ipcProgress = [];
+  const originalIpcConsoleError = console.error;
+  let ipcWorker;
+  try {
+    console.error = (message) => ipcProgress.push(String(message));
+    ipcWorker = startPdfToHepWorker({
+      pdfPath: reportPdf,
+      outputPath: reportOutput,
+      fileNumber: 1,
+      fileCount: 1
+    }, true, 512, (command, args, options) => {
+      ipcSpawnOptions = options;
+      return spawn(command, args, options);
+    }, ipcWorkerScript, ipcLog);
+    assert.deepEqual(await ipcWorker.completion, { code: 0, signal: null });
+  } finally {
+    console.error = originalIpcConsoleError;
+  }
+  assert.deepEqual(ipcProgress, ["[1/1] report.pdf: 50% synthetic-build"], "live progress stays visible through IPC");
+  assert.deepEqual(ipcSpawnOptions.stdio, ["inherit", ipcLog.fd, ipcLog.fd, "ipc"]);
+  ipcLog.write("parent log marker after worker");
+  await ipcLog.close();
+  const ipcLogContents = await readFile(ipcLogPath, "utf8");
+  assert(!ipcLogContents.includes("50% synthetic-build"), "routine progress does not fill the diagnostics log");
+  for (const message of ["synthetic raw stdout", "synthetic raw stderr", "synthetic console error",
+    "synthetic IPC warning", "parent log marker before worker", "parent log marker after worker"]) {
+    assert(ipcLogContents.includes(message), `diagnostic log preserves ${message}`);
+  }
+  const appendedLog = await createPdfToHepDiagnosticLog({ logFile: ipcLogPath }, []);
+  appendedLog.write("second batch marker");
+  await appendedLog.close();
+  const appendedContents = await readFile(ipcLogPath, "utf8");
+  assert(appendedContents.includes(ipcLogContents), "reusing an explicit log path appends rather than truncates");
+  assert(appendedContents.includes("second batch marker"));
   assert.deepEqual(ipcWorker.report, {
     warnings: [
       { message: "synthetic IPC warning", count: 2 },
@@ -745,6 +804,26 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
     rasterFallbacks: [{ code: "page-raster-fallback", message: "synthetic IPC raster fallback",
       pageIndex: 2, reason: "synthetic page reason", count: 2 }]
   });
+
+  const logInputs = [{ pdfPath: reportPdf, outputPath: reportOutput }];
+  for (const target of [reportPdf, reportOutput]) {
+    await assert.rejects(createPdfToHepDiagnosticLog({ logFile: target }, logInputs), /PDF|HEP|input|output|overwrite/i,
+      "a diagnostic log must not overwrite a source PDF or generated HEP");
+    const linkedLog = `${target}.log-hardlink`;
+    await link(target, linkedLog);
+    await assert.rejects(createPdfToHepDiagnosticLog({ logFile: linkedLog }, logInputs), /PDF|HEP|input|output|overwrite/i,
+      "a hardlink log alias must not mutate a source PDF or generated HEP");
+    const symbolicLog = `${target}.log-symlink`;
+    try {
+      await symlink(target, symbolicLog);
+      await assert.rejects(createPdfToHepDiagnosticLog({ logFile: symbolicLog }, logInputs), /PDF|HEP|input|output|overwrite|regular file|symlink/i,
+        "a symlink log alias must not mutate a source PDF or generated HEP");
+    } catch (error) {
+      if (error?.code !== "EPERM" && error?.code !== "EACCES") throw error;
+    }
+  }
+  await assert.rejects(createPdfToHepDiagnosticLog({ logFile: nestedDirectory }, []), /regular file|directory|EISDIR/i,
+    "log destinations must be regular files");
 
   const collisionA = path.join(temporaryRoot, "A B.pdf");
   const collisionB = path.join(temporaryRoot, "A_B.PDF");
@@ -808,5 +887,5 @@ process.exitCode = await runPdfToHep(process.argv.slice(2), {
 }
 
 console.log(
-  "PDF-to-HEP CLI argument, timing, worker reporting/IPC, source-loader, unchanged-HEP, filesystem, and atomic-write tests passed."
+  "PDF-to-HEP CLI argument, timing, worker reporting/IPC, diagnostics logging, source-loader, unchanged-HEP, filesystem, and atomic-write tests passed."
 );

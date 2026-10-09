@@ -171,13 +171,18 @@ The CLI requires Node.js 22.15+, 23.5+, or 24+. It writes
 `<name>-parsed-data.hep` and supports the same conversion flags as the repository's
 `node PDFtoHEP.js` command. After installing the package in a project, use
 `npx -- pdf-to-hep --help` to see all options.
-Each run ends with attempted, successful, failed and skipped counts, total original
-PDF and generated HEP sizes for successful conversions, and warnings and failures
-grouped by PDF. The timing report includes per-file sizes. Existing-file skips
-are excluded from the size comparison; `--force --keep-unchanged` conversions
-count as successful even when the existing HEP is kept.
-The final raster-fallback section lists successful PDFs, affected pages, and
-reasons when vector content required raster rendering.
+Conversion batches save detailed worker output, warnings, errors, full file paths, and
+raster-fallback diagnostics to `pdf-to-hep-<timestamp>-<unique>.log` in the current
+directory. Use `--log-file=./conversion.log` to choose a log file; an existing file
+is appended to. The terminal shows progress, followed by a table of filenames,
+statuses, durations, PDF and HEP sizes, and percentage size changes. Smaller HEPs
+are green and larger HEPs are red when the terminal supports color and `NO_COLOR`
+is unset. The final metrics table includes attempted, successful, failed and
+skipped counts, warning and raster-fallback counts, total conversion time, average
+and median attempted conversion times, batch wall time, and successful size
+totals. Existing-file skips are excluded from timing and size comparisons;
+`--force --keep-unchanged` conversions count as successful even when the existing
+HEP is kept. Summed conversion times can exceed wall time when workers overlap.
 Conversion requires `@napi-rs/canvas`, which npm installs as an optional dependency
 by default. If its installation fails or optional dependencies were omitted,
 install both packages with `npm install @soadzoor/hepr @napi-rs/canvas` and run

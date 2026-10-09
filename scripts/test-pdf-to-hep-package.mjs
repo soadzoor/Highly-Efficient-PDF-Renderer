@@ -81,6 +81,7 @@ try {
   assert.match(help, /pdf-to-hep .*<pdf-or-directory>/);
   assert.match(help, /--workers=<count>/);
   assert.match(help, /--output-dir=<directory>/);
+  assert.match(help, /--log-file=<path>/);
   assert.match(help, /--without-vector-lod/);
   assert.match(help, /--without-text-lod/);
   assert.doesNotMatch(help, /--with-(?:vector|text)-lod/);
@@ -115,10 +116,12 @@ try {
   // Deliberately omit native canvas in this unpacked consumer. A real batch
   // child must launch the packaged bin and stop before PDF parsing begins.
   await writeFile(resolve(consumer, "unconverted.pdf"), "PDF fixture must not be parsed");
+  const missingCanvasLogPath = resolve(fixture, "missing-canvas.log");
   const missingCanvas = await command(process.execPath,
-    [binLink, "--workers=1", "unconverted.pdf"], 1);
-  assert.match(missingCanvas, /@napi-rs\/canvas could not be loaded/);
-  assert.match(missingCanvas, /npm install @soadzoor\/hepr @napi-rs\/canvas/);
+    [binLink, "--workers=1", `--log-file=${missingCanvasLogPath}`, "unconverted.pdf"], 1);
+  const missingCanvasLog = await readFile(missingCanvasLogPath, "utf8");
+  assert.match(missingCanvasLog, /@napi-rs\/canvas could not be loaded/);
+  assert.match(missingCanvasLog, /npm install @soadzoor\/hepr @napi-rs\/canvas/);
   assert.match(missingCanvas, /0 generated, 0 skipped, 1 failed/);
   await assert.rejects(access(resolve(consumer, "unconverted-parsed-data.hep")), error => error.code === "ENOENT");
 
@@ -148,8 +151,10 @@ try {
   // parser worker, while rejecting before any HEP is generated.
   await symlink(resolve(root, "node_modules/@napi-rs"), resolve(consumer, "node_modules/@napi-rs"), "junction");
   await writeFile(resolve(consumer, "invalid.pdf"), "%PDF-1.7\nstartxref\ninvalid\n%%EOF\n");
-  const invalidPdf = await command(process.execPath, [binLink, "--workers=1", "invalid.pdf"], 1);
-  assert.match(invalidPdf, /PDF repair found no indirect objects/);
+  const invalidPdfLogPath = resolve(fixture, "invalid-pdf.log");
+  const invalidPdf = await command(process.execPath,
+    [binLink, "--workers=1", `--log-file=${invalidPdfLogPath}`, "invalid.pdf"], 1);
+  assert.match(await readFile(invalidPdfLogPath, "utf8"), /PDF repair found no indirect objects/);
   assert.match(invalidPdf, /0 generated, 0 skipped, 1 failed/);
   await assert.rejects(access(resolve(consumer, "invalid-parsed-data.hep")), error => error.code === "ENOENT");
 
