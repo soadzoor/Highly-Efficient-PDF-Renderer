@@ -161,6 +161,7 @@ export class NativeOptionalContentRegistry {
   private readonly directIdentities = new WeakMap<PdfDictionary, string>();
   private readonly diagnostics: PdfDiagnostic[] = [];
   private readonly diagnosedHidden = new Set<string>();
+  private readonly recoveredGroups = new Set<string>();
   private readonly diagnosedUnresolvedMetadataProperties = new Set<string>();
   private nextDirectIdentity = 0;
   private initialization: Promise<this> | null = null;
@@ -168,6 +169,7 @@ export class NativeOptionalContentRegistry {
   private initialized = false;
   private defaultConfiguration: PdfValue | undefined;
   private configurationIntents: ReadonlySet<string> = new Set(["View"]);
+  private configurationBaseVisible = true;
   private readonly combinedMemberships = new Map<string, number>();
 
   constructor(
@@ -312,6 +314,15 @@ export class NativeOptionalContentRegistry {
   async sceneData(signal?: AbortSignal): Promise<SceneOptionalContent | undefined> {
     this.assertInitialized();
     if (!this.groupDrafts.length) return undefined;
+    const config = this.defaultConfiguration === undefined ? new Map<string, PdfValue>() :
+      await this.resolveDictionary(this.defaultConfiguration, signal, "Default layer configuration");
+    const locked = await this.readConfigurationGroupSet(config.get("Locked"), "/D /Locked", signal);
+    const rawRadio = await this.resolver.resolveValue(config.get("RBGroups"), signal);
+    const radioGroups: string[][] = [];
+    if (rawRadio != null) {
+      if (!Array.isArray(rawRadio)) throw invalidOptionalContent("Layer radio groups must be arrays.");
+      for (const raw of rawRadio) radioGroups.push([...await this.readConfigurationGroupSet(raw, "/D /RBGroups", signal)]);
+    }
     const conditions: OptionalContentCondition[] = this.memberships.map(() => ({ kind: "constant", value: true }));
     const append = (condition: OptionalContentCondition): number => { conditions.push(condition); return conditions.length - 1; };
     const affects = (expression: NativeOptionalContentExpression): boolean => expression.kind === "group"
@@ -343,15 +354,6 @@ export class NativeOptionalContentRegistry {
             return off ? append({ kind: "not", operand: membershipIndex }) : membershipIndex;
           }) };
       }
-    }
-    const config = this.defaultConfiguration === undefined ? new Map<string, PdfValue>() :
-      await this.resolveDictionary(this.defaultConfiguration, signal, "Default layer configuration");
-    const locked = await this.readConfigurationGroupSet(config.get("Locked"), "/D /Locked", signal);
-    const rawRadio = await this.resolver.resolveValue(config.get("RBGroups"), signal);
-    const radioGroups: string[][] = [];
-    if (rawRadio != null) {
-      if (!Array.isArray(rawRadio)) throw invalidOptionalContent("Layer radio groups must be arrays.");
-      for (const raw of rawRadio) radioGroups.push([...await this.readConfigurationGroupSet(raw, "/D /RBGroups", signal)]);
     }
     let order: OptionalContentOrderNode[] = [];
     const rawOrder = config.get("Order");
@@ -706,6 +708,7 @@ export class NativeOptionalContentRegistry {
     // At document open there is no previous mutable layer state; /Unchanged
     // therefore retains the PDF initial state, which is ON for every OCG.
     const baseVisible = baseState !== "OFF";
+    this.configurationBaseVisible = baseVisible;
     for (const group of this.groupDrafts) group.configuredVisible = baseVisible;
 
     const onGroups = await this.readConfigurationGroupSet(configuration.get("ON"), "/D /ON", signal);
@@ -909,9 +912,17 @@ export class NativeOptionalContentRegistry {
       const rawGroup = resolved[index];
       const identity = this.identityOf(rawGroup, `${label}[${index}]`);
       if (!this.groupByIdentity.has(identity)) {
-        throw unsupportedOptionalContent(
-          `The optional-content ${label} entry references ${identity}, which is absent from /OCGs.`
+        const dictionary = await this.resolveDictionary(
+          rawGroup, signal, `The optional-content ${label} entry ${index}`
         );
+        const type = await this.resolver.resolveValue(dictionary.get("Type"), signal);
+        if (!isPdfName(type, "OCG")) {
+          throw invalidOptionalContent(`The optional-content ${label} entry ${index} is not an /OCG dictionary.`);
+        }
+        // A catalog may omit a valid OCG still referenced by its default
+        // configuration. Recover it before publishing immutable memberships,
+        // so /OFF and /Usage /ViewState still control its initial visibility.
+        await this.recoverMissingGroup(dictionary, identity, signal);
       }
       if (identities.has(identity)) {
         throw invalidOptionalContent(`The optional-content ${label} entry repeats ${identity}.`);
@@ -1290,6 +1301,21 @@ export class NativeOptionalContentRegistry {
     this.membershipEffects.push(group.usedInDefaultView);
     this.membershipByIdentity.set(group.identity, Promise.resolve(membership));
     if (!group.defaultVisible) this.emitHiddenDiagnostic(membership, group.name);
+    if (this.recoveredGroups.has(group.identity)) {
+      const diagnostic: PdfDiagnostic = Object.freeze({
+        code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup,
+        severity: "warning",
+        message: `Optional-content group ${group.identity} is absent from the catalog /OCGs array; it was recovered as ${group.defaultVisible ? "visible" : "hidden"} and layer visibility may differ.`,
+        details: Object.freeze({
+          groupIdentity: group.identity,
+          groupName: group.name,
+          membershipIndex: group.membershipIndex,
+          defaultVisible: group.defaultVisible
+        })
+      });
+      this.diagnostics.push(diagnostic);
+      this.onDiagnostic?.(diagnostic);
+    }
   }
 
   private async recoverMissingGroup(
@@ -1301,42 +1327,34 @@ export class NativeOptionalContentRegistry {
     if (this.groupDrafts.length >= this.limits.maxGroups) {
       throw optionalContentLimit(`Optional-content group count exceeds limit ${this.limits.maxGroups}.`);
     }
-    if (this.memberships.length >= this.limits.maxMemberships) {
+    const membershipCount = this.initialized ? this.memberships.length : this.groupDrafts.length;
+    if (membershipCount >= this.limits.maxMemberships) {
       throw optionalContentLimit(
         `Optional-content membership count exceeds limit ${this.limits.maxMemberships}.`
       );
     }
-    const draft = await this.readGroupDraft(dictionary, identity, this.memberships.length, signal);
+    const draft = await this.readGroupDraft(dictionary, identity, membershipCount, signal);
     signal?.throwIfAborted();
     // Synchronous scope combinations can append memberships while group
     // metadata resolves, so reserve the index and check capacity at publish.
-    if (this.memberships.length >= this.limits.maxMemberships) {
+    const membershipIndex = this.initialized ? this.memberships.length : this.groupDrafts.length;
+    if (membershipIndex >= this.limits.maxMemberships) {
       throw optionalContentLimit(
         `Optional-content membership count exceeds limit ${this.limits.maxMemberships}.`
       );
     }
-    const group: GroupDraft = { ...draft, membershipIndex: this.memberships.length };
+    const group: GroupDraft = { ...draft, membershipIndex };
     group.usedInDefaultView = this.configurationIntents.has("All")
       ? group.intents.length > 0
       : group.intents.some((intent) => this.configurationIntents.has(intent));
-    // An unlisted group has no reliable catalog visibility configuration.
-    // Retain its initial ON state so malformed layer metadata cannot omit paint.
+    // During initialization the configuration still supplies reliable states
+    // for an unlisted group. Groups found only in content retain initial ON.
+    group.configuredVisible = this.initialized || this.configurationBaseVisible;
+    group.defaultVisible = !group.usedInDefaultView || group.configuredVisible;
     this.groupDrafts.push(group);
     this.groupByIdentity.set(identity, group);
-    this.publishGroupMembership(group);
-    const diagnostic: PdfDiagnostic = Object.freeze({
-      code: NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup,
-      severity: "warning",
-      message: `Optional-content group ${identity} is absent from the catalog /OCGs array; it was recovered as visible and layer visibility may differ.`,
-      details: Object.freeze({
-        groupIdentity: identity,
-        groupName: group.name,
-        membershipIndex: group.membershipIndex,
-        defaultVisible: true
-      })
-    });
-    this.diagnostics.push(diagnostic);
-    this.onDiagnostic?.(diagnostic);
+    this.recoveredGroups.add(identity);
+    if (this.initialized) this.publishGroupMembership(group);
     return group;
   }
 

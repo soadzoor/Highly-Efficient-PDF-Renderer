@@ -420,6 +420,71 @@ const failureCases = [
   }
 ];
 
+// A real merged PDF lists only the final-notes layer in /OCGs, while its
+// default View application still references an older, explicitly hidden OCG.
+await withRegistry(optionalContentPdf({
+  ocgs: "11 0 R",
+  defaultConfiguration: "<< /AS [<< /Event /View /OCGs [12 0 R] /Category [/View] >>] >>",
+  groups: [
+    { number: 11, body: "<< /Type /OCG /Name (Final notes) >>" },
+    { number: 12, body: "<< /Type /OCG /Name (Completed comments) /Usage << /View << /ViewState /OFF >> >> >>" }
+  ],
+  pageProperties: ["/Old 12 0 R /Final 11 0 R"]
+}), {}, async ({ document, registry, emitted }) => {
+  assert.deepEqual(registry.listGroups().map(group => [group.membershipIndex, group.defaultVisible]),
+    [[0, true], [1, false]], "recovered configuration groups honor their View usage state");
+  const properties = await registry.resolvePageProperties(document.getPage(0).resources, ["Old", "Final"]);
+  assert.deepEqual(properties.map(property => property.defaultVisible), [false, true]);
+  const warnings = emitted.filter(diagnostic => diagnostic.code === NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup);
+  assert.equal(warnings.length, 1, "configuration recovery diagnoses once despite later page use");
+  assert.equal(warnings[0].details.defaultVisible, false, "diagnostics report the final configured state");
+  assert.match(warnings[0].message, /recovered as hidden/);
+  const { validateSceneOptionalContent } = await import("../src/optionalContent.ts");
+  const data = await registry.sceneData();
+  validateSceneOptionalContent(data);
+  assert.deepEqual(data.conditions[1], { kind: "group", groupId: "ref:12:0" });
+});
+
+await withRegistry(optionalContentPdf({
+  ocgs: "11 0 R",
+  defaultConfiguration: "<< /BaseState /OFF /ON [12 0 R] /OFF [30 0 R] /AS [<< /Event /View /OCGs [31 0 R 32 0 R] /Category [/View] >>] >>",
+  extraObjects: [
+    { number: 30, body: "<< /Type /OCG /Name (Explicitly off) >>" },
+    { number: 31, body: "<< /Type /OCG /Name (Base off) >>" },
+    { number: 32, body: "<< /Type /OCG /Name (Design intent) /Intent /Design >>" }
+  ]
+}), {}, async ({ registry, emitted }) => {
+  assert.deepEqual(registry.listGroups().map(group => [group.identity, group.membershipIndex, group.defaultVisible]),
+    [["ref:11:0", 0, false], ["ref:12:0", 1, true], ["ref:30:0", 2, false],
+      ["ref:31:0", 3, false], ["ref:32:0", 4, true]],
+    "unlisted configuration groups retain base state, explicit overrides, intent and stable membership indexes");
+  assert.equal(emitted.filter(diagnostic => diagnostic.code === NATIVE_OPTIONAL_CONTENT_DIAGNOSTIC_CODES.MissingCatalogGroup).length, 4);
+});
+
+await withRegistry(optionalContentPdf({
+  defaultConfiguration: "<< /Locked [30 0 R] /RBGroups [[11 0 R 30 0 R]] >>",
+  extraObjects: [{ number: 30, body: "<< /Type /OCG /Name (Unlisted control) >>" }]
+}), {}, async ({ registry }) => {
+  const { validateSceneOptionalContent } = await import("../src/optionalContent.ts");
+  const data = await registry.sceneData();
+  validateSceneOptionalContent(data);
+  assert.equal(data.groups[2].locked, true);
+  assert.deepEqual(data.conditions[2], { kind: "group", groupId: "ref:30:0" },
+    "control-only recovered groups are included before the condition snapshot");
+  assert.deepEqual(data.radioGroups, [["ref:11:0", "ref:30:0"]]);
+});
+
+for (const limit of ["maxGroups", "maxMemberships"]) {
+  await assert.rejects(withRegistry(optionalContentPdf({
+    ocgs: "11 0 R",
+    defaultConfiguration: "<< /OFF [12 0 R] >>"
+  }), { limits: { [limit]: 1 } }, async () => undefined), pdfError("resource-limit", /exceeds limit 1/));
+}
+await assert.rejects(withRegistry(optionalContentPdf({
+  defaultConfiguration: "<< /OFF [30 0 R] >>",
+  extraObjects: [{ number: 30, body: "<< /Type /OCMD /OCGs [11 0 R] >>" }]
+}), {}, async () => undefined), pdfError("invalid-object", /not an \/OCG dictionary/));
+
 for (const { bytes, code, pattern } of failureCases) {
   await assert.rejects(
     withRegistry(bytes, {}, async () => undefined),

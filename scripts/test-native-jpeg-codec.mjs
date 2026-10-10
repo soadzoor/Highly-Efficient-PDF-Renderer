@@ -39,6 +39,33 @@ try {
   const rgbResult = await resolveBundledImageCodec(request(rgb, 3));
   assertConstantPixels(rgbResult, [16, 85, 204]);
 
+  const encoderParameters = {
+    Blend: 1,
+    ColorTransform: 1,
+    Colors: 3,
+    Columns: 8,
+    HSamples: [2, 1, 1, 2],
+    QFactor: 0.800003,
+    Rows: 8,
+    VSamples: [2, 1, 1, 2]
+  };
+  const encoderParameterResult = await resolveBundledImageCodec({
+    ...request(rgb, 3),
+    decodeParameters: encoderParameters
+  });
+  assert.deepEqual(encoderParameterResult.samples, rgbResult.samples,
+    "PostScript encoder settings in DecodeParms do not change decoded JPEG samples");
+  for (const ColorTransform of [2, "1"]) {
+    await assert.rejects(
+      resolveBundledImageCodec({
+        ...request(rgb, 3),
+        decodeParameters: { ...encoderParameters, ColorTransform }
+      }),
+      (error) => unsupportedImage(error) && error.details?.reason === "invalid-color-transform",
+      "ignoring encoder settings must still validate the PDF decoder's ColorTransform"
+    );
+  }
+
   const grayResult = await resolveBundledImageCodec(request(gray, 1));
   assertConstantPixels(grayResult, [64]);
 
@@ -162,6 +189,21 @@ try {
     assert.deepEqual([...page.stores.images.data.subarray(0, 4)], [16, 85, 204, 255]);
   } finally {
     await session.close();
+  }
+
+  const encoderParameterSession = await openPdf({
+    kind: "bytes",
+    bytes: jpegPdfFixture(rgb, 8, 8,
+      "/Blend 1 /ColorTransform 1 /Colors 3 /Columns 8 /HSamples [2 1 1 2] /QFactor 0.800003 /Rows 8 /VSamples [2 1 1 2]")
+  });
+  try {
+    const page = await encoderParameterSession.compilePage(0, { optimization: "none" });
+    assert.equal(page.stores.images.data.length, 8 * 8 * 4);
+    for (let offset = 0; offset < page.stores.images.data.length; offset += 4) {
+      assert.deepEqual([...page.stores.images.data.subarray(offset, offset + 4)], [16, 85, 204, 255]);
+    }
+  } finally {
+    await encoderParameterSession.close();
   }
 
   const app14DecodeSession = await openPdf({
@@ -402,7 +444,8 @@ function manyScanJpeg(frameMarker, scans) {
   return Uint8Array.from(output);
 }
 
-function jpegPdfFixture(jpeg, width = 8, height = 8) {
+function jpegPdfFixture(jpeg, width = 8, height = 8, decodeParameters = "") {
+  const decodeParametersEntry = decodeParameters ? ` /DecodeParms << ${decodeParameters} >>` : "";
   return writeTinyPdf({ objects: [
     { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
     { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
@@ -414,7 +457,7 @@ function jpegPdfFixture(jpeg, width = 8, height = 8) {
     {
       number: 5,
       body: tinyPdfStream(
-        `/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /DCTDecode`,
+        `/Type /XObject /Subtype /Image /Width ${width} /Height ${height} /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /DCTDecode${decodeParametersEntry}`,
         jpeg
       )
     }

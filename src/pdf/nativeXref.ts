@@ -138,17 +138,18 @@ export async function repairNativeXref(
 
 async function findStartXref(
   reader: PdfRandomAccessReader,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  sourceByteLength = reader.byteLength
 ): Promise<number> {
-  const maximumLength = Math.min(reader.byteLength, MAX_STARTXREF_TAIL_BYTES);
+  const maximumLength = Math.min(sourceByteLength, MAX_STARTXREF_TAIL_BYTES);
   let length = Math.min(maximumLength, INITIAL_STARTXREF_TAIL_BYTES);
-  let offset = reader.byteLength - length;
+  let offset = sourceByteLength - length;
   throwIfAborted(signal);
   let text = binaryString(await reader.read(offset, length, signal));
   throwIfAborted(signal);
 
   while (true) {
-    const parsed = parseStartXrefTail(text, offset, reader.byteLength);
+    const parsed = parseStartXrefTail(text, offset, sourceByteLength);
     if (parsed.kind === "found") return parsed.value;
     if (parsed.kind === "invalid-eof") {
       throw new PdfError("invalid-xref", "The PDF does not end with a valid %%EOF marker.", {
@@ -172,7 +173,7 @@ async function findStartXref(
 
     throwIfAborted(signal);
     const nextLength = Math.min(maximumLength, Math.max(length + 1, length * 2));
-    const nextOffset = reader.byteLength - nextLength;
+    const nextOffset = sourceByteLength - nextLength;
     const prefix = await reader.read(nextOffset, offset - nextOffset, signal);
     throwIfAborted(signal);
     text = binaryString(prefix) + text;
@@ -279,11 +280,10 @@ async function readRevisionChain(
     }
     if (section.previousOffset !== undefined && section.previousOffset >= revisionOffset) {
       const isLinearizedForwardLink =
-        revisions === 1 &&
         !acceptedLinearizedForwardLink &&
         await validatesLinearizedForwardLink(
           reader,
-          startXref,
+          revisionOffset,
           section.previousOffset,
           limits,
           signal
@@ -339,7 +339,8 @@ async function readRevisionChain(
  * /Prev ordering: the final startxref names the first-page xref near the front,
  * whose /Prev names the main xref near the end. Keep this exception narrow by
  * validating the first indirect object's linearization dictionary and its main
- * xref hint before following the forward edge.
+ * xref hint before following the forward edge. Incremental updates can leave
+ * that edge in an older revision whose original /L ends before the current EOF.
  */
 async function validatesLinearizedForwardLink(
   reader: PdfRandomAccessReader,
@@ -370,15 +371,21 @@ async function validatesLinearizedForwardLink(
     const mainXrefHint = dictionary.get("T");
     const firstPageEnd = dictionary.get("E");
     const pageCount = dictionary.get("N");
-    return typeof linearized === "number" && linearized > 0 &&
-      length === reader.byteLength &&
+    const validHints = typeof linearized === "number" && linearized > 0 &&
+      typeof length === "number" && Number.isSafeInteger(length) &&
+      length > linkedOffset && length <= reader.byteLength &&
       typeof mainXrefHint === "number" && Number.isSafeInteger(mainXrefHint) &&
       // /T names the white space before the main xref's first entry: after
       // the `xref` header of a table, but often just before the object
       // header of an xref stream.
       Math.abs(mainXrefHint - linkedOffset) <= 256 &&
-      typeof firstPageEnd === "number" && firstPageEnd > startXref &&
+      typeof firstPageEnd === "number" && firstPageEnd > startXref && firstPageEnd <= length &&
       typeof pageCount === "number" && Number.isSafeInteger(pageCount) && pageCount > 0;
+    if (!validHints) return false;
+    // A stale /L is legitimate only if it identifies a complete original
+    // revision whose startxref names this first-page section. Keep arbitrary
+    // forward pointers, truncated originals and cycles invalid.
+    return await findStartXref(reader, signal, length) === startXref;
   } catch (error) {
     if (signal?.aborted || (error instanceof PdfError && error.code === "aborted")) throw error;
     return false;

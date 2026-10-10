@@ -324,16 +324,10 @@ function validateRequest(request: Readonly<NativeImageCodecRequest>): void {
       }
     });
   }
-  const parameterNames = Object.keys(request.decodeParameters);
-  for (const name of parameterNames) {
-    if (name !== "ColorTransform") {
-      throw jpegError(
-        `JPEG DecodeParms /${name} is unsupported by the bundled codec.`,
-        "unsupported-decode-parameter",
-        { parameter: name }
-      );
-    }
-  }
+  // PDF DCTDecode defines only ColorTransform. Some producers also retain
+  // PostScript encoder settings such as Blend, QFactor, and sampling factors.
+  // JPEG markers already describe their encoded result; those settings and
+  // other private dictionary entries must not prevent decoding the image.
   const colorTransform = request.decodeParameters.ColorTransform;
   if (
     colorTransform !== undefined &&

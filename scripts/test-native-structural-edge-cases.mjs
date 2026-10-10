@@ -178,6 +178,50 @@ async function testLinearizedForwardRevisionChain() {
     await hintBefore.close();
   }
 
+  // Incremental updates retain the original linearization dictionary and its
+  // forward /Prev edge. /L still bounds that original revision, not the update.
+  const updated = appendNoopRevision(valid, findFinalStartXref(valid));
+  const twiceUpdated = appendNoopRevision(updated, findFinalStartXref(updated));
+  const streamHintBase = linearizedForwardFixture({ hintBeforeMainXref: true });
+  for (const fixture of [updated, twiceUpdated, appendNoopRevision(streamHintBase, findFinalStartXref(streamHintBase))]) {
+    const document = await openStrict(fixture);
+    try {
+      assert.equal(document.info.pageCount, 1);
+      assert.equal(document.info.repaired, false, "indexed older revisions must not require a structural scan");
+      assert.equal(document.info.linearized, false, "the original fast-web-view hints are stale after an update");
+      assert.ok(document.getDiagnostics().some(({ code }) => code === "linearization.invalid"));
+    } finally {
+      await document.close();
+    }
+  }
+
+  const replacement = new Builder();
+  replacement.append(valid);
+  const pageOffset = replacement.length;
+  replacement.append("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] >>\nendobj\n");
+  const replacementXref = replacement.length;
+  replacement.append("xref\n3 1\n" + xrefInUse(pageOffset));
+  replacement.append(`trailer\n<< /Size 5 /Root 1 0 R /Prev ${findFinalStartXref(valid)} >>\nstartxref\n${replacementXref}\n%%EOF\n`);
+  const replaced = await openStrict(replacement.build());
+  try {
+    assert.deepEqual(replaced.getPage(0).mediaBox, [0, 0, 20, 30],
+      "the updated page must override definitions in both original xref sections");
+  } finally {
+    await replaced.close();
+  }
+
+  const staleUpdated = appendNoopRevision(
+    linearizedForwardFixture({ staleLength: true }), findFinalStartXref(valid)
+  );
+  await assert.rejects(openStrict(staleUpdated), hasPdfError("invalid-xref", /earlier structural section/),
+    "an older /L must identify a complete revision before its forward link is accepted");
+  const cyclicBase = linearizedForwardFixture({ cycle: true });
+  await assert.rejects(openStrict(appendNoopRevision(cyclicBase, findFinalStartXref(cyclicBase))),
+    hasPdfError("invalid-xref", /contains a cycle/));
+  await assert.rejects(openNativePdfDocument({ kind: "bytes", bytes: twiceUpdated },
+    { repair: "off", limits: { maxIncrementalRevisions: 3 } }),
+    hasPdfError("resource-limit", /too many incremental revisions/));
+
   await assert.rejects(
     openStrict(linearizedForwardFixture({ staleLength: true })),
     hasPdfError("invalid-xref", /earlier structural section/)
