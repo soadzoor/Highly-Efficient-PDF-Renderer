@@ -23,7 +23,7 @@
 - Don't introduce hardcoded _resource_ limits, like maximum number of segments, or maximum edge-clips. It if doesn't work on a weak device, it shouldn't mean it should fail on a powerful PC just because we added a hardcoded limit - let the user try, even if it might fail. If needed, they can add those limits manually with flags - although we've proven that in a lot of cases, the rasterization fallback is actually more resource-hungry than the vector processing, even with large numbers.
 - Treat this compatibility preference as the default development direction, including PDF parsing, viewing, and PDF-to-HEP conversion. It does not override cancellation, resource limits, or validation needed to process data safely.
 
-- Make focused, minimal changes that directly address the task.
+- Make focused, minimal changes that directly address the task. With that being said, if you find an obvious, straightforward bug meanwhile reading the files, let the user know, and offer to fix it as a next step
 - Prefer explaining assumptions before making broad changes.
 - Preserve existing code style and project conventions.
 - When unsure, inspect nearby files for patterns before editing.
