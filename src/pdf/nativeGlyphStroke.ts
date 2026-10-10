@@ -123,13 +123,17 @@ export function buildNativeGlyphStroke(
     } else if (command.kind === "close") {
       // Closing an empty or already closed subpath has no effect. Generic
       // retained PDF paths can include another close from their paint operator.
-      if (!current) continue;
+      if (!current || current.closed) continue;
       if (current.points.length > 1 && same(current.points[0], current.points.at(-1)!)) current.points.pop();
       current.closed = true;
       current.hasSegment = true;
-      current = null;
     } else {
       if (!current) throw unsupported("Glyph stroke contains a segment outside a contour.");
+      // A segment after closepath starts a new subpath at the closed path's start.
+      if (current.closed) {
+        current = { points: [current.points[0]], closed: false };
+        contours.push(current);
+      }
       const end = transform(local, command.x, command.y);
       if (command.kind === "line") append(end);
       else {

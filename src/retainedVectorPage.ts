@@ -370,9 +370,11 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
     const quadratic = (cx: number, cy: number, nx: number, ny: number): void => { a.push(x, y, cx, cy); b.push(nx, ny, 1, 0); include(bounds, x, y); include(bounds, cx, cy); include(bounds, nx, ny); x = nx; y = ny; };
     for (const index of indices) visitHeprPath(page.stores.paths, index, {
       moveTo: (px, py) => { if (open) line(sx, sy); [x, y] = point(matrix, px, py); sx = x; sy = y; open = true; },
-      lineTo: (px, py) => line(...point(matrix, px, py)),
-      quadraticTo: (cx, cy, px, py) => quadratic(...point(matrix, cx, cy), ...point(matrix, px, py)),
-      cubicTo: (c1x, c1y, c2x, c2y, px, py) => emitCubicAsQuadratics(x, y, ...point(matrix, c1x, c1y), ...point(matrix, c2x, c2y), ...point(matrix, px, py), quadratic),
+      // A segment following closepath reopens a subpath at the retained start.
+      // Fill and clip geometry must include its eventual closing edge as well.
+      lineTo: (px, py) => { open = true; line(...point(matrix, px, py)); },
+      quadraticTo: (cx, cy, px, py) => { open = true; quadratic(...point(matrix, cx, cy), ...point(matrix, px, py)); },
+      cubicTo: (c1x, c1y, c2x, c2y, px, py) => { open = true; emitCubicAsQuadratics(x, y, ...point(matrix, c1x, c1y), ...point(matrix, c2x, c2y), ...point(matrix, px, py), quadratic); },
       close: () => { if (open) line(sx, sy); open = false; }
     });
     if (open) line(sx, sy);

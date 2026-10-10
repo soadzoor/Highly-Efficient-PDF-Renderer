@@ -41,6 +41,15 @@ try {
   assert.equal(square.approximated, false, "line join approximation is distinct from curve approximation");
   assert.deepEqual(build([close, move(1, 2), line(5, 2), line(5, 6), line(1, 6), close, close]), square,
     "empty and redundant closes preserve exactly the same hairline geometry");
+  for (const options of [{}, { dashArray: [2, 1], dashPhase: .5 }, { lineCap: 1 }]) {
+    for (const continuation of [line(9, 2), { kind: "quadratic", controlX: 7, controlY: 8, x: 9, y: 2 },
+      { kind: "cubic", control1X: 3, control1Y: 8, control2X: 7, control2Y: 8, x: 9, y: 2 }]) {
+      const closed = [move(1, 2), line(5, 2), line(5, 6), close];
+      assert.deepEqual(build([...closed, close, continuation], options),
+        build([...closed, move(1, 2), continuation], options),
+        "segments after closepath restart at its initial point and reset the dash phase");
+    }
+  }
 
   const cubic = build([move(0, 0),
     { kind: "cubic", control1X: 0, control1Y: 100, control2X: 100, control2Y: 100, x: 100, y: 0 }]);

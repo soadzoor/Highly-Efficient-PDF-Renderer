@@ -91,6 +91,14 @@ try {
     "redundant closes keep the same silhouette and match the reference canvas");
   assert.equal(buildNativeGlyphStroke([close, close], identity, defaults), null,
     "closing an empty path does not paint");
+  for (const options of [{}, { dashArray: [7, 3], dashPhase: .5 }, { lineCap: 1 }]) {
+    for (const continuation of [line(90, 40), { kind: "quadratic", controlX: 40, controlY: 80, x: 90, y: 40 },
+      { kind: "cubic", control1X: 30, control1Y: 80, control2X: 60, control2Y: 80, x: 90, y: 40 }]) {
+      const geometry = compare("segment after closepath", [...square, close, continuation], options);
+      assert.deepEqual(geometry, buildNativeGlyphStroke([...square, move(20, 20), continuation], identity,
+        { ...defaults, ...options }), "closepath retains its start for an implicit following subpath");
+    }
+  }
   for (const lineJoin of [0, 1, 2]) {
     for (const lineCap of [0, 1, 2]) compare(`join ${lineJoin}, cap ${lineCap}`, corners, { lineJoin, lineCap });
   }

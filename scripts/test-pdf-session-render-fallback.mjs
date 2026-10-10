@@ -122,6 +122,31 @@ try {
     } finally { await reference.close(); await session.close(); }
   }
 
+  for (const [width, operator] of [[0, "S"], [2, "S"], [0, "f"], [0, "f*"]]) {
+    const fixture = continuation => writeTinyPdf({ objects: [
+      { number: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
+      { number: 2, body: "<< /Type /Pages /Count 1 /Kids [3 0 R] >>" },
+      { number: 3, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 30 20] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>" },
+      { number: 4, body: tinyPdfStream("", "/Fm Do") },
+      { number: 5, body: tinyPdfStream("/Type /XObject /Subtype /Form /BBox [0 0 30 20] /Group << /S /Transparency /I true /K true >> /Resources << /ExtGState << /G 6 0 R >> >>",
+        `0 0 1 rg 0 0 1 RG ${width} w /G gs 5 5 m 15 5 l 15 15 l h ${continuation}20 10 l 20 15 l ${operator}`) },
+      { number: 6, body: "<< /Type /ExtGState /CA .5 >>" }
+    ] });
+    const session = await openPdf({ kind: "bytes", bytes: fixture("") });
+    const reference = await openPdf({ kind: "bytes", bytes: fixture("5 5 m ") });
+    try {
+      const options = { vectorFallback: "error", optimization: "none" };
+      const actual = await session.compileVectorPage(0, options);
+      const expected = await reference.compileVectorPage(0, options);
+      assert.equal(actual.rasterLayers.length, 0, "continued paths in transparency Forms remain vectors");
+      assert(actual.segmentCount + actual.fillPathCount > 0, "the continued path remains visible");
+      for (const key of ["endpoints", "primitiveMeta", "fillSegmentsA", "fillSegmentsB", "paintGraph"]) {
+        assert.deepEqual(actual[key], expected[key], `a ${width}-width ${operator} path after closepath starts at its initial point`);
+      }
+      assert(!session.getDiagnostics().some(d => d.code.endsWith("raster-fallback")));
+    } finally { await reference.close(); await session.close(); }
+  }
+
   {
     const name = "finely dashed glyph stroke", style = ".4 w [.01 .01] 0 d";
     const warnings = [];

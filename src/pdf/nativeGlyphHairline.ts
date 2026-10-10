@@ -61,12 +61,18 @@ export function buildNativeGlyphHairline(
     } else if (command.kind === "close") {
       // Closing an empty or already closed subpath has no effect. Generic
       // retained PDF paths can include another close from their paint operator.
-      if (!current) continue;
+      if (!current || current.closed) continue;
       if (!same(current.end, current.start) || !current.segments.length) append([current.end, current.start]);
       current.closed = true;
-      current = null;
     } else {
       if (!current) throw unsupported("Hairline glyph contains a segment outside a contour.");
+      // PDF closepath leaves the current point at the closed subpath's start.
+      // A following segment begins another subpath there, including its dash phase.
+      if (current.closed) {
+        const start: Point = current.start;
+        current = { start, end: start, segments: [], closed: false };
+        contours.push(current);
+      }
       const end = transform(local, command.x, command.y);
       if (command.kind === "line") append([current.end, end]);
       else if (command.kind === "quadratic") {
