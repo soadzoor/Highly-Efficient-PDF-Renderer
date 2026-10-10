@@ -2,7 +2,15 @@ import type {
   NativeGlyphOutline,
   NativeGlyphPathCommand
 } from "./nativeFont";
-import { PdfError } from "./nativeTypes";
+import { PdfError, throwIfAborted } from "./nativeTypes";
+import type { PdfDiagnostic } from "./nativeTypes";
+import {
+  CFF_EXPERT_CHARSET,
+  CFF_EXPERT_ENCODING,
+  CFF_EXPERT_SUBSET_CHARSET
+} from "./nativeCffExpertData";
+import { evaluateNativeType1CharString } from "./nativeType1";
+import type { NativeType1ParserLimits } from "./nativeType1";
 
 /** Optional caller ceilings for the CFF and Type 2 interpreters. */
 export interface NativeCffParserLimits {
@@ -38,18 +46,21 @@ interface CffFontDictionary {
   readonly localSubrs: readonly Uint8Array[];
   readonly defaultWidthX: number;
   readonly nominalWidthX: number;
+  readonly initialRandomSeed: number;
   readonly fontMatrix: CffMatrix;
 }
 
 interface RawGlyphOutline {
   readonly commands: readonly NativeGlyphPathCommand[];
   readonly advanceWidth: number;
+  readonly advanceY?: number;
 }
 
 interface Type2Budget {
   executedBytes: number;
   operators: number;
   subrCalls: number;
+  readonly signal?: AbortSignal;
 }
 
 interface Type2Seac {
@@ -60,10 +71,10 @@ interface Type2Seac {
 }
 
 /**
- * Bounds-checked CFF v1, name-keyed and CID-keyed Type 2 outline provider.
+ * Bounds-checked CFF v1, name-keyed and CID-keyed outline provider.
  *
- * CFF2, Multiple Master blend programs, and deterministically
- * unsafe Type 2 operations fail with typed errors instead of being omitted.
+ * CFF2 and uninstantiated Multiple Master blend programs fail with typed
+ * errors instead of silently losing visible glyphs.
  */
 export class NativeCffFont {
   readonly unitsPerEm = 1000;
@@ -72,6 +83,7 @@ export class NativeCffFont {
   readonly builtInGlyphNames: readonly (string | null)[];
 
   private readonly charStrings: readonly Uint8Array[];
+  private readonly charStringType: number;
   private readonly globalSubrs: readonly Uint8Array[];
   private readonly fontDictionaries: readonly CffFontDictionary[];
   private readonly fdSelect: Uint8Array;
@@ -80,9 +92,12 @@ export class NativeCffFont {
   private readonly glyphIdsByName: ReadonlyMap<string, number>;
   private readonly rawOutlineCache = new Map<number, RawGlyphOutline>();
   private readonly outlineCache = new Map<number, NativeGlyphOutline>();
+  private diagnosticData: readonly PdfDiagnostic[];
+  private readonly unknownType1OtherSubrs = new Set<number>();
 
   private constructor(options: {
     readonly charStrings: readonly Uint8Array[];
+    readonly charStringType: number;
     readonly globalSubrs: readonly Uint8Array[];
     readonly glyphNames: readonly string[];
     readonly builtInGlyphNames: readonly (string | null)[];
@@ -90,8 +105,10 @@ export class NativeCffFont {
     readonly fdSelect: Uint8Array;
     readonly glyphIdsByCid: ReadonlyMap<number, number> | null;
     readonly limits: Readonly<NativeCffParserLimits>;
+    readonly diagnostics: readonly PdfDiagnostic[];
   }) {
     this.charStrings = options.charStrings;
+    this.charStringType = options.charStringType;
     this.globalSubrs = options.globalSubrs;
     this.glyphNames = options.glyphNames;
     this.builtInGlyphNames = options.builtInGlyphNames;
@@ -99,6 +116,7 @@ export class NativeCffFont {
     this.fdSelect = options.fdSelect;
     this.glyphIdsByCid = options.glyphIdsByCid;
     this.limits = options.limits;
+    this.diagnosticData = options.diagnostics;
     this.numGlyphs = options.charStrings.length;
     const glyphIds = new Map<string, number>();
     for (let glyphId = 0; glyphId < options.glyphNames.length; glyphId += 1) {
@@ -114,8 +132,11 @@ export class NativeCffFont {
 
   static parse(
     sourceBytes: Uint8Array,
-    limitOverrides: Partial<NativeCffParserLimits> = {}
+    limitOverrides: Partial<NativeCffParserLimits> = {},
+    fontName?: string,
+    signal?: AbortSignal
   ): NativeCffFont {
+    throwIfAborted(signal);
     const limits = mergeCffLimits(limitOverrides);
     if (!(sourceBytes instanceof Uint8Array)) {
       throw new TypeError("CFF source must be a Uint8Array.");
@@ -141,19 +162,20 @@ export class NativeCffFont {
       throw cffUnsupported("The CFF header has invalid bounds.", "cff-header-bounds");
     }
 
-    const reader = new CffReader(sourceBytes, limits);
+    const reader = new CffReader(sourceBytes, limits, signal);
     const names = reader.readIndex(headerSize, "Name INDEX");
-    if (names.objects.length !== 1) {
+    if (names.objects.length === 0) {
       throw cffUnsupported(
-        "An embedded CFF program must contain exactly one font.",
+        "A CFF FontSet must contain at least one font.",
         "cff-font-count"
       );
     }
-    readCffName(names.objects[0], "CFF font name");
+    const fontNames = names.objects.map(bytes => readCffName(bytes, "CFF font name"));
+    const fontIndex = selectCffFont(fontNames, fontName);
     const topIndexes = reader.readIndex(names.end, "Top DICT INDEX");
-    if (topIndexes.objects.length !== 1) {
+    if (topIndexes.objects.length !== names.objects.length) {
       throw cffUnsupported(
-        "An embedded CFF program must contain exactly one Top DICT.",
+        "The CFF Name and Top DICT INDEX counts disagree.",
         "cff-top-dict-count"
       );
     }
@@ -168,7 +190,9 @@ export class NativeCffFont {
       return readCffString(bytes);
     });
     const globalSubrsIndex = reader.readIndex(stringsIndex.end, "Global Subrs INDEX");
-    const top = parseCffDict(topIndexes.objects[0], "Top DICT", TOP_DICT_OPERATORS);
+    const selectedTop = parseCffDict(topIndexes.objects[fontIndex], "Top DICT", TOP_DICT_OPERATORS);
+    const top = resolveCffSyntheticBase(selectedTop, topIndexes.objects, fontIndex);
+    const diagnostics = readCffApproximationDiagnostics(top, customStrings);
 
     const ros = top.get(dictOperator(12, 30));
     const cidKeyed = ros !== undefined;
@@ -178,18 +202,10 @@ export class NativeCffFont {
     if (!cidKeyed && (top.has(dictOperator(12, 36)) || top.has(dictOperator(12, 37)))) {
       throw cffUnsupported("A CFF Font DICT array requires ROS.", "cff-cid-ros");
     }
-    // 12 20 is SyntheticBase: those glyphs are defined against another font and
-    // cannot be read from this CharStrings INDEX alone. 12 23 is BaseFontBlend,
-    // a delta left behind by Multiple Master tooling that carries no blend axes
-    // and no interpolation state, so a font holding it is read normally.
-    if (top.has(dictOperator(12, 20))) {
-      throw cffUnsupported(
-        "Synthetic CFF fonts are not supported.",
-        "cff-synthetic-not-supported"
-      );
-    }
+    // BaseFontBlend (12 23) records the user design vector of an already
+    // instantiated Multiple Master font. Its ordinary CharStrings are usable.
     const charStringType = readOptionalSingleton(top, dictOperator(12, 6), 2, "CharstringType");
-    if (charStringType !== 2) {
+    if (charStringType !== 1 && charStringType !== 2) {
       throw cffUnsupported(
         `CFF CharstringType ${charStringType} is not supported.`,
         "cff-charstring-type"
@@ -253,18 +269,24 @@ export class NativeCffFont {
 
     return new NativeCffFont({
       charStrings: charStringsIndex.objects,
+      charStringType,
       globalSubrs: globalSubrsIndex.objects,
       glyphNames,
       builtInGlyphNames,
       fontDictionaries,
       fdSelect,
       glyphIdsByCid,
-      limits
+      limits,
+      diagnostics
     });
   }
 
   glyphIdForName(name: string | null): number {
     return name === null ? 0 : this.glyphIdsByName.get(name) ?? 0;
+  }
+
+  get diagnostics(): readonly PdfDiagnostic[] {
+    return this.diagnosticData;
   }
 
   glyphIdForCid(cid: number): number {
@@ -273,21 +295,22 @@ export class NativeCffFont {
       : this.glyphIdsByCid.get(cid) ?? 0;
   }
 
-  getGlyphOutline(glyphId: number): NativeGlyphOutline {
+  getGlyphOutline(glyphId: number, signal?: AbortSignal): NativeGlyphOutline {
+    throwIfAborted(signal);
     if (!Number.isSafeInteger(glyphId) || glyphId < 0 || glyphId >= this.numGlyphs) {
       throw cffUnsupported(`CFF glyph ${glyphId} is outside the CharStrings INDEX.`,
         "cff-glyph-index");
     }
     const cached = this.outlineCache.get(glyphId);
     if (cached) return cached;
-    const budget: Type2Budget = { executedBytes: 0, operators: 0, subrCalls: 0 };
+    const budget: Type2Budget = { executedBytes: 0, operators: 0, subrCalls: 0, signal };
     const raw = this.evaluateRawGlyph(glyphId, new Set(), 0, budget);
     const fontMatrix = this.fontDictionaries[this.fdSelect[glyphId]].fontMatrix;
     const commands = Object.freeze(raw.commands.map((command) =>
       Object.freeze(transformCommand(command, fontMatrix))
     ));
     const bounds = measureCommands(commands);
-    const advanceWidth = transformWidth(raw.advanceWidth, fontMatrix);
+    const advanceWidth = transformWidth(raw.advanceWidth, fontMatrix, raw.advanceY);
     const outline: NativeGlyphOutline = Object.freeze({
       glyphId,
       commands,
@@ -305,6 +328,7 @@ export class NativeCffFont {
     glyphDepth: number,
     budget: Type2Budget
   ): RawGlyphOutline {
+    throwIfAborted(budget.signal);
     const cached = this.rawOutlineCache.get(glyphId);
     if (cached) return cached;
     if (glyphDepth > this.limits.maxType2SubrDepth) {
@@ -318,6 +342,49 @@ export class NativeCffFont {
     glyphAncestry.add(glyphId);
     try {
       const dictionary = this.fontDictionaries[this.fdSelect[glyphId]];
+      if (this.charStringType === 1) {
+        const interpreted = evaluateNativeType1CharString(this.charStrings[glyphId], {
+          glyphId,
+          subrs: dictionary.localSubrs,
+          lenIV: -1,
+          signal: budget.signal,
+          budget,
+          onUnknownOtherSubr: index => {
+            if (this.unknownType1OtherSubrs.has(index)) return;
+            this.unknownType1OtherSubrs.add(index);
+            this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+              code: "font.type1-othersubr-approximated",
+              severity: "warning" as const,
+              message: `CFF Type 1 OtherSubr ${index} uses the required argument-preserving fallback; custom PostScript effects may differ.`,
+              details: Object.freeze({ reason: "type1-unknown-othersubr", othersubr: index, approximate: true })
+            })]);
+          },
+          limits: type1LimitsFromCff(this.limits),
+          resolveComposite: (baseCode, accentCode, accentX, accentY) => {
+            const baseName = standardEncodingGlyphName(baseCode);
+            const accentName = standardEncodingGlyphName(accentCode);
+            const baseId = baseName === null ? undefined : this.glyphIdsByName.get(baseName);
+            const accentId = accentName === null ? undefined : this.glyphIdsByName.get(accentName);
+            if (this.glyphIdsByCid !== null || baseId === undefined || accentId === undefined) {
+              throw cffUnsupported("A CFF Type 1 composite references a missing StandardEncoding glyph.",
+                "type1-seac-missing-glyph");
+            }
+            const base = this.evaluateRawGlyph(baseId, glyphAncestry, glyphDepth + 1, budget);
+            const accent = this.evaluateRawGlyph(accentId, glyphAncestry, glyphDepth + 1, budget);
+            const commands = [...base.commands,
+              ...accent.commands.map(command => translateCommand(command, accentX, accentY))];
+            if (commands.length > this.limits.maxType2PathCommands) {
+              throw cffLimit("CFF composite glyph path commands exceed the configured limit.",
+                "type2-path-command-limit", this.limits.maxType2PathCommands);
+            }
+            return commands;
+          }
+        });
+        const result = Object.freeze({ commands: interpreted.commands,
+          advanceWidth: interpreted.advanceWidth, advanceY: interpreted.advanceY });
+        this.rawOutlineCache.set(glyphId, result);
+        return result;
+      }
       const interpreter = new Type2Interpreter({
         glyphId,
         charString: this.charStrings[glyphId],
@@ -325,6 +392,7 @@ export class NativeCffFont {
         globalSubrs: this.globalSubrs,
         defaultWidthX: dictionary.defaultWidthX,
         nominalWidthX: dictionary.nominalWidthX,
+        initialRandomSeed: dictionary.initialRandomSeed,
         limits: this.limits,
         budget
       });
@@ -380,14 +448,17 @@ export class NativeCffFont {
 class CffReader {
   private readonly bytes: Uint8Array;
   private readonly limits: Readonly<NativeCffParserLimits>;
+  private readonly signal?: AbortSignal;
   private indexEntryCount = 0;
 
-  constructor(bytes: Uint8Array, limits: Readonly<NativeCffParserLimits>) {
+  constructor(bytes: Uint8Array, limits: Readonly<NativeCffParserLimits>, signal?: AbortSignal) {
     this.bytes = bytes;
     this.limits = limits;
+    this.signal = signal;
   }
 
   readIndex(offset: number, label: string): CffIndex {
+    throwIfAborted(this.signal);
     const count = this.u16(offset, label);
     if (count === 0) return Object.freeze({ objects: Object.freeze([]), end: offset + 2 });
     this.indexEntryCount = checkedAdd(this.indexEntryCount, count, "CFF INDEX entry count");
@@ -478,6 +549,7 @@ class Type2Interpreter {
   private stemCount = 0;
   private widthResolved = false;
   private advanceWidth: number;
+  private randomState: number;
   private seac: Type2Seac | null = null;
 
   constructor(options: {
@@ -487,6 +559,7 @@ class Type2Interpreter {
     readonly globalSubrs: readonly Uint8Array[];
     readonly defaultWidthX: number;
     readonly nominalWidthX: number;
+    readonly initialRandomSeed: number;
     readonly limits: Readonly<NativeCffParserLimits>;
     readonly budget: Type2Budget;
   }) {
@@ -498,6 +571,12 @@ class Type2Interpreter {
     this.limits = options.limits;
     this.budget = options.budget;
     this.advanceWidth = options.defaultWidthX;
+    // Adobe specifies the random range, not a particular PRNG sequence.
+    // Reset a seeded xorshift32 per glyph so cache order and parallelism cannot
+    // change an outline. Fold both halves of fractional/large seeds as well.
+    const seed = new DataView(new ArrayBuffer(8));
+    seed.setFloat64(0, options.initialRandomSeed, true);
+    this.randomState = (seed.getUint32(0, true) ^ seed.getUint32(4, true)) || 0x7384;
   }
 
   run(): {
@@ -538,6 +617,7 @@ class Type2Interpreter {
 
     let offset = 0;
     while (offset < bytes.length) {
+      throwIfAborted(this.budget.signal);
       const byte = bytes[offset++];
       if (isType2NumberByte(byte)) {
         const number = readType2Number(bytes, offset - 1);
@@ -611,6 +691,9 @@ class Type2Interpreter {
           }
           this.finishEndChar();
           return "endchar";
+        case 16: // obsolete Multiple Master blend (Adobe TN 5177 Appendix D)
+          throw cffUnsupported("CFF Multiple Master blend requires interpolation state that is not supported.",
+            "cff-multiple-master-not-supported");
         case 19:
         case 20: { // hintmask / cntrmask
           this.consumeStemArguments(true);
@@ -761,6 +844,10 @@ class Type2Interpreter {
       case 5: // not
         this.push(this.pop("not") === 0 ? 1 : 0);
         break;
+      case 8: // obsolete Multiple Master store/load
+      case 13:
+        throw cffUnsupported("CFF Multiple Master storage requires interpolation state that is not supported.",
+          "cff-multiple-master-not-supported");
       case 9: // abs
         this.push(Math.abs(this.pop("abs")));
         break;
@@ -816,9 +903,15 @@ class Type2Interpreter {
         this.push(comparisonLeft <= comparisonRight ? trueValue : falseValue);
         break;
       }
-      case 23:
-        this.invalid("Type 2 random is not deterministic and is not supported.");
+      case 23: { // random: Adobe TN 5177 section 4.4, range (0,1]
+        let state = this.randomState;
+        state ^= state << 13;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        this.randomState = state >>> 0;
+        this.push((this.randomState + 1) / 0x100000000);
         break;
+      }
       case 24: { // mul
         const [left, right] = this.popBinary("mul");
         this.pushFinite(left * right, "mul");
@@ -844,8 +937,9 @@ class Type2Interpreter {
         break;
       }
       case 29: { // index
-        const index = this.popInteger("index operand");
-        if (index < 0 || index >= this.stack.length) {
+        // Negative indices copy the top element (Adobe TN 5177 section 4.4).
+        const index = Math.max(0, this.popInteger("index operand"));
+        if (index >= this.stack.length) {
           this.invalid("Type 2 index operand is outside the argument stack.");
         }
         this.push(this.stack[this.stack.length - 1 - index]);
@@ -1100,6 +1194,99 @@ class Type2Interpreter {
 
 type CffDictionary = Map<number, readonly number[]>;
 
+function selectCffFont(names: readonly string[], requestedName: string | undefined): number {
+  // Embedded subsets often rename their single program independently of the
+  // PDF BaseFont. No selection is necessary in that unambiguous case.
+  if (names.length === 1) return 0;
+  const exact = names.flatMap((name, index) => name === requestedName ? [index] : []);
+  if (exact.length === 1) return exact[0];
+  const stripSubset = (name: string): string => name.replace(/^[A-Z]{6}\+/, "");
+  const matches = requestedName === undefined ? [] : names.flatMap((name, index) =>
+    stripSubset(name) === stripSubset(requestedName) ? [index] : []);
+  if (matches.length === 1) return matches[0];
+  throw cffUnsupported(
+    "The CFF FontSet requires an unambiguous font name selection.", "cff-font-selection"
+  );
+}
+
+function resolveCffSyntheticBase(
+  selected: CffDictionary,
+  topDicts: readonly Uint8Array[],
+  selectedIndex: number
+): CffDictionary {
+  const synthetic = selected.get(dictOperator(12, 20));
+  if (synthetic === undefined) return selected;
+  if (selected.keys().next().value !== dictOperator(12, 20)) {
+    throw cffUnsupported("A CFF synthetic Top DICT must begin with SyntheticBase.",
+      "cff-synthetic-base");
+  }
+  if (synthetic.length !== 1 || !Number.isSafeInteger(synthetic[0]) || synthetic[0] < 0 ||
+      synthetic[0] >= topDicts.length || synthetic[0] === selectedIndex) {
+    throw cffUnsupported("The CFF SyntheticBase index is invalid or cyclic.", "cff-synthetic-base");
+  }
+  const base = parseCffDict(topDicts[synthetic[0]], "Synthetic base Top DICT", TOP_DICT_OPERATORS);
+  // Adobe TN 5176 section 17 forbids a CID-keyed or synthetic base. Rejecting
+  // those cases also prevents indirect base cycles before any glyph executes.
+  if (base.has(dictOperator(12, 20)) || base.has(dictOperator(12, 30))) {
+    throw cffUnsupported("A CFF synthetic font requires a regular, non-synthetic base.",
+      "cff-synthetic-base");
+  }
+  const allowed = new Set([2, 16, dictOperator(12, 2), dictOperator(12, 7), dictOperator(12, 20)]);
+  for (const operator of selected.keys()) {
+    if (!allowed.has(operator)) {
+      throw cffUnsupported("A CFF synthetic font contains an unsupported Top DICT override.",
+        "cff-synthetic-override");
+    }
+  }
+  const effective = new Map(base);
+  for (const [operator, operands] of selected) {
+    if (operator !== dictOperator(12, 20)) effective.set(operator, operands);
+  }
+  return effective;
+}
+
+function type1LimitsFromCff(limits: Readonly<NativeCffParserLimits>): Partial<NativeType1ParserLimits> {
+  return {
+    maxType1CharStringBytes: limits.maxType2CharStringBytes,
+    maxType1Operators: limits.maxType2Operators,
+    maxType1SubrDepth: limits.maxType2SubrDepth,
+    maxType1SubrCalls: limits.maxType2SubrCalls,
+    maxType1PathCommands: limits.maxType2PathCommands
+  };
+}
+
+function readCffApproximationDiagnostics(
+  dictionary: CffDictionary,
+  customStrings: readonly string[]
+): readonly PdfDiagnostic[] {
+  const diagnostics: PdfDiagnostic[] = [];
+  const paint = dictionary.get(dictOperator(12, 5));
+  if (paint !== undefined && (paint.length !== 1 || paint[0] !== 0)) {
+    diagnostics.push(Object.freeze({
+      code: "font.cff-paint-type-approximation",
+      severity: "warning" as const,
+      message: "The CFF font uses a non-default PaintType; its contours are retained as filled outlines, so stroked glyph appearance may differ."
+    }));
+  }
+  const postScript = dictionary.get(dictOperator(12, 21));
+  if (postScript !== undefined) {
+    const sid = postScript.length === 1 ? postScript[0] : -1;
+    const text = Number.isSafeInteger(sid) && sid >= 0 && sid <= 64_999
+      ? CFF_STANDARD_STRINGS[sid] ?? customStrings[sid - CFF_STANDARD_STRINGS.length]
+      : undefined;
+    // PostScript strings contain code, not glyph names. Retain ordinary
+    // outlines, report unknown behavior, and never execute embedded code.
+    if (text === undefined || text.trim().length !== 0) {
+      diagnostics.push(Object.freeze({
+        code: "font.cff-postscript-approximation",
+        severity: "warning" as const,
+        message: "Embedded CFF PostScript is not executed; ordinary glyph outlines are retained, but font behavior and appearance may differ."
+      }));
+    }
+  }
+  return Object.freeze(diagnostics);
+}
+
 const TOP_DICT_OPERATORS = new Set([
   0, 1, 2, 3, 4, 5, 13, 14, 15, 16, 17, 18,
   dictOperator(12, 0), dictOperator(12, 1), dictOperator(12, 2),
@@ -1238,6 +1425,7 @@ function readCffPrivateDictionary(
     localSubrs,
     defaultWidthX: readOptionalSingleton(privateDictionary, dictOperator(20), 0, "defaultWidthX"),
     nominalWidthX: readOptionalSingleton(privateDictionary, dictOperator(21), 0, "nominalWidthX"),
+    initialRandomSeed: readOptionalSingleton(privateDictionary, dictOperator(12, 19), 0, "initialRandomSeed"),
     fontMatrix
   });
 }
@@ -1330,10 +1518,12 @@ function readCffCharset(
     return Object.freeze(CFF_STANDARD_STRINGS.slice(0, glyphCount));
   }
   if (charsetOffset === 1 || charsetOffset === 2) {
-    throw cffUnsupported(
-      "Predefined Expert CFF charsets are not supported by the native name-keyed engine.",
-      "cff-expert-charset-not-supported"
-    );
+    const charset = charsetOffset === 1 ? CFF_EXPERT_CHARSET : CFF_EXPERT_SUBSET_CHARSET;
+    if (glyphCount > charset.length) {
+      throw cffUnsupported("The predefined Expert charset is shorter than the CharStrings INDEX.",
+        "cff-charset-length");
+    }
+    return Object.freeze(charset.slice(0, glyphCount));
   }
   return Object.freeze(readCffCharsetValues(reader, charsetOffset, glyphCount)
     .map(sid => resolveCffSid(sid, customStrings)));
@@ -1388,10 +1578,7 @@ function readCffEncoding(
     return Object.freeze(names);
   }
   if (encodingOffset === 1) {
-    throw cffUnsupported(
-      "The predefined Expert CFF encoding is not supported by the native name-keyed engine.",
-      "cff-expert-encoding-not-supported"
-    );
+    return Object.freeze(CFF_EXPERT_ENCODING.map(name => name !== null && glyphIds.has(name) ? name : null));
   }
   const rawFormat = reader.u8(encodingOffset, "CFF Encoding");
   const hasSupplements = (rawFormat & 0x80) !== 0;
@@ -1542,9 +1729,10 @@ function transformCffPoint(
 
 function transformWidth(
   width: number,
-  matrix: readonly [number, number, number, number, number, number]
+  matrix: readonly [number, number, number, number, number, number],
+  advanceY = 0
 ): number {
-  return finiteResult(matrix[0] * 1000 * width, "CFF transformed glyph width");
+  return finiteResult((matrix[0] * width + matrix[2] * advanceY) * 1000, "CFF transformed glyph width");
 }
 
 function measureCommands(

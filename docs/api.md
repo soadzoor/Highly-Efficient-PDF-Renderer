@@ -1146,9 +1146,19 @@ result, preserving overlap between its children.
 
 Embedded sfnt subsets may retain unused horizontal-metric bytes; HEPR ignores
 these bounded tails with a normalization warning. Embedded PFA/PFB Type1 fonts
-use the configured substitute-font resolver and emit `font.type1-substituted`.
-Explicit PDF character widths take precedence, but glyph shapes and mappings
-for opaque names may be approximate. Path, clip, glyph and resource complexity
+retain their original used glyph outlines, including built-in encodings and
+PDF encoding differences. Explicit PDF character widths take precedence, and
+Unicode mappings remain independent of painted glyph selection. Unsupported or
+damaged Type1 programs can still use the configured substitute-font resolver;
+`font.type1-substituted` includes the font-program failure reason and marks the
+result as approximate. Unknown custom OtherSubrs use the Type1 format's
+argument-preserving fallback with `font.type1-othersubr-approximated` diagnostics.
+The CFF v1 engine also supports Expert encodings and
+charsets, Type1 and Type2 charstrings, deterministic Type2 `random`, named
+FontSets and SyntheticBase inheritance. CFF2 and uninstantiated Multiple Master
+programs remain unsupported. Stroked CFF fonts and embedded PostScript retain
+the available outlines with fidelity warnings (`font.cff-paint-type-approximation`
+and `font.cff-postscript-approximation`). Path, clip, glyph and resource complexity
 has no default admission budget: conversion attempts vector processing on the
 host device. Caller-supplied resource limits remain available. Typed-array and
 wire-format ranges, allocation failures, cancellation and malformed-data checks

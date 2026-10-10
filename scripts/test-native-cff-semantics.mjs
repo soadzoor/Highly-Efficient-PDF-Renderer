@@ -96,17 +96,270 @@ function testLatin1StringsAreAccepted() {
   assert.deepEqual(latin1.getGlyphOutline(1), baseline.getGlyphOutline(1));
 }
 
-function testSyntheticBaseRemainsUnsupported() {
-  const syntheticBase = concat(dictInteger(0), Uint8Array.of(12, 20));
-  const baseFontBlend = concat(dictInteger(408), dictInteger(-397), Uint8Array.of(12, 23));
-  for (const topDictExtra of [syntheticBase, concat(syntheticBase, baseFontBlend)]) {
-    assert.throws(() => NativeCffFont.parse(buildCffFixture({ topDictExtra })), (error) => {
+function testPredefinedExpertCharsetsAndEncoding() {
+  const emptyGlyph = type2(["endchar"]);
+  const expert = NativeCffFont.parse(buildCffFixture({
+    charStrings: Array(166).fill(emptyGlyph), predefinedCharset: 1, predefinedEncoding: 1
+  }));
+  assert.equal(expert.numGlyphs, 166);
+  assert.deepEqual(expert.glyphNames.slice(0, 5),
+    [".notdef", "space", "exclamsmall", "Hungarumlautsmall", "dollaroldstyle"]);
+  assert.equal(expert.glyphNames[15], "fraction");
+  assert.equal(expert.glyphNames[46], "fi");
+  assert.equal(expert.glyphNames[165], "Ydieresissmall");
+  for (const [code, name] of [[32, "space"], [48, "zerooldstyle"], [87, "fi"],
+    [97, "Asmall"], [188, "onequarter"], [201, "onesuperior"], [255, "Ydieresissmall"]]) {
+    assert.equal(expert.builtInGlyphNames[code], name);
+    assert.notEqual(expert.glyphIdForName(name), 0);
+  }
+  for (const code of [0, 31, 35, 64, 70, 92, 127, 160, 164, 198, 199]) {
+    assert.equal(expert.builtInGlyphNames[code], null, `Expert code ${code} is unassigned`);
+  }
+  const subset = NativeCffFont.parse(buildCffFixture({
+    charStrings: Array(87).fill(emptyGlyph), predefinedCharset: 2, predefinedEncoding: 1
+  }));
+  assert.deepEqual(subset.glyphNames.slice(0, 6),
+    [".notdef", "space", "dollaroldstyle", "dollarsuperior", "parenleftsuperior", "parenrightsuperior"]);
+  assert.equal(subset.glyphNames[86], "commainferior");
+  assert.equal(subset.builtInGlyphNames[36], "dollaroldstyle");
+  assert.equal(subset.builtInGlyphNames[33], null, "ExpertEncoding does not invent glyphs outside ExpertSubset");
+  assert.equal(subset.builtInGlyphNames[97], null);
+  for (const [predefinedCharset, count] of [[0, 230], [1, 167], [2, 88]]) {
+    expectPdf(() => NativeCffFont.parse(buildCffFixture({
+      charStrings: Array(count).fill(emptyGlyph), predefinedCharset, predefinedEncoding: 1
+    })), "unsupported-font", /charset.*shorter/i);
+  }
+}
+
+function testSeededRandomAndStackOperators() {
+  const random = { bytes: [12, 23] }, mul = { bytes: [12, 24] };
+  const direct = type2([0, 0, "rmoveto", random, 100, mul, random, 100, mul, "rlineto", "endchar"]);
+  const withSeed = seed => buildCffFixture({
+    aCharString: direct, privateExtra: concat(dictReal(seed), Uint8Array.of(12, 19))
+  });
+  const baseline = NativeCffFont.parse(withSeed(42)).getGlyphOutline(1);
+  const line = baseline.commands[1];
+  assert.equal(line.kind, "line");
+  assert(line.x > 0 && line.x <= 100 && line.y > 0 && line.y <= 100);
+  assert.notEqual(line.x, line.y, "each random operator advances its state");
+  assert.deepEqual(NativeCffFont.parse(withSeed(42)).getGlyphOutline(1), baseline,
+    "fresh parses produce exactly repeatable vector geometry");
+  assert.notDeepEqual(NativeCffFont.parse(withSeed(43)).getGlyphOutline(1), baseline,
+    "initialRandomSeed affects the resulting outline");
+  assert.notDeepEqual(NativeCffFont.parse(withSeed(42.25)).getGlyphOutline(1), baseline,
+    "a fractional seed is retained rather than silently truncated");
+  const subroutine = NativeCffFont.parse(buildCffFixture({
+    privateExtra: concat(dictInteger(42), Uint8Array.of(12, 19)),
+    aCharString: type2([0, 0, "rmoveto", random, 100, mul, -107, "callsubr", "rlineto", "endchar"]),
+    localSubrs: [type2([random, 100, mul, "return"])]
+  }));
+  assert.deepEqual(subroutine.getGlyphOutline(1), baseline, "subroutines share the glyph's PRNG state");
+  const order = NativeCffFont.parse(withSeed(42));
+  order.getGlyphOutline(4);
+  assert.deepEqual(order.getGlyphOutline(1), baseline, "other glyph evaluation cannot change random geometry");
+  const negativeIndex = NativeCffFont.parse(buildCffFixture({
+    aCharString: type2([0, 0, "rmoveto", 20, -5, { bytes: [12, 29] }, "rlineto", "endchar"])
+  }));
+  assert.deepEqual(negativeIndex.getGlyphOutline(1).commands[1], { kind: "line", x: 20, y: 20 },
+    "negative Type 2 index copies the top stack value, per Adobe TN 5177 section 4.4");
+  expectPdf(() => NativeCffFont.parse(withSeed(42), { maxType2Operators: 2 }).getGlyphOutline(1),
+    "resource-limit", /operator/i);
+  expectPdf(() => NativeCffFont.parse(buildCffFixture({
+    aCharString: type2([...Array(49).fill(random), "endchar"])
+  })).getGlyphOutline(1), "unsupported-font", /stack.*48/i);
+  expectPdf(() => NativeCffFont.parse(buildCffFixture({
+    aCharString: type2([20, 1, { bytes: [12, 29] }, "endchar"])
+  })).getGlyphOutline(1), "unsupported-font", /index.*stack/i);
+  expectPdf(() => NativeCffFont.parse(buildCffFixture({
+    privateExtra: concat(dictInteger(1), dictInteger(2), Uint8Array.of(12, 19))
+  })), "unsupported-font", /initialRandomSeed/i);
+}
+
+function testSyntheticFontSets() {
+  const bytes = buildSyntheticCffFixture();
+  expectPdf(() => NativeCffFont.parse(bytes), "unsupported-font", /unambiguous.*name/i);
+  expectPdf(() => NativeCffFont.parse(bytes, {}, "Missing"), "unsupported-font", /unambiguous.*name/i);
+  const base = NativeCffFont.parse(bytes, {}, "Base");
+  const synthetic = NativeCffFont.parse(bytes, {}, "Synthetic");
+  assert.deepEqual(synthetic.glyphNames, base.glyphNames, "synthetic charset is inherited from its base");
+  assert.equal(base.builtInGlyphNames[65], "A");
+  assert.equal(synthetic.builtInGlyphNames[66], "A", "synthetic Encoding overrides the base encoding");
+  assert.equal(synthetic.builtInGlyphNames[65], null);
+  assert.deepEqual(synthetic.getGlyphOutline(1).bounds, [20, 0, 140, 100]);
+  assert.deepEqual(base.getGlyphOutline(1).bounds, [0, 0, 100, 100]);
+  assert.equal(synthetic.getGlyphOutline(1).advanceWidth, 600, "synthetic glyph inherits Private DICT width");
+  assert.deepEqual(NativeCffFont.parse(bytes, {}, "ABCDEF+Synthetic").getGlyphOutline(1),
+    synthetic.getGlyphOutline(1), "PDF subset prefixes do not hide a unique FontSet name");
+  assert.deepEqual(NativeCffFont.parse(buildCffFixture(), {}, "RenamedSubset").glyphNames,
+    NativeCffFont.parse(buildCffFixture()).glyphNames, "a single font remains unambiguous despite renaming");
+  const inherited = NativeCffFont.parse(buildSyntheticCffFixture({ omitMatrix: true, omitEncoding: true }), {}, "Synthetic");
+  assert.deepEqual(inherited.getGlyphOutline(1), base.getGlyphOutline(1),
+    "an omitted synthetic FontMatrix inherits the base matrix");
+  assert.deepEqual(inherited.builtInGlyphNames, base.builtInGlyphNames,
+    "an omitted synthetic Encoding inherits the base encoding");
+  const ambiguous = buildSyntheticCffFixture({ names: ["AAAAAA+Synthetic", "BBBBBB+Synthetic"] });
+  expectPdf(() => NativeCffFont.parse(ambiguous, {}, "Synthetic"), "unsupported-font", /unambiguous/i);
+  assert.deepEqual(NativeCffFont.parse(ambiguous, {}, "BBBBBB+Synthetic").getGlyphOutline(1),
+    synthetic.getGlyphOutline(1), "an exact name wins over ambiguous subset-stripped names");
+  for (const options of [{ baseIndex: 1 }, { baseIndex: 2 }, { baseIndex: -1 }, { baseIsSynthetic: true },
+    { baseIsCid: true }, { syntheticHasPrivate: true }, { syntheticNotFirst: true }]) {
+    expectPdf(() => NativeCffFont.parse(buildSyntheticCffFixture(options), {}, "Synthetic"),
+      "unsupported-font", /synthetic|SyntheticBase/i);
+  }
+}
+
+function testCancellation() {
+  const controller = new AbortController();
+  controller.abort();
+  expectPdf(() => NativeCffFont.parse(buildCffFixture(), {}, undefined, controller.signal), "aborted", /aborted/i);
+  const font = NativeCffFont.parse(buildCffFixture());
+  font.getGlyphOutline(1);
+  expectPdf(() => font.getGlyphOutline(1, controller.signal), "aborted", /aborted/i);
+  let polls = 0;
+  const duringExecution = { get aborted() { return ++polls === 12; }, reason: controller.signal.reason };
+  expectPdf(() => NativeCffFont.parse(buildCffFixture()).getGlyphOutline(1, duringExecution),
+    "aborted", /aborted/i);
+}
+
+function testApproximationDiagnosticsAndUnsupportedMasterPrograms() {
+  const baseline = NativeCffFont.parse(buildCffFixture());
+  assert.deepEqual(baseline.diagnostics, []);
+  const approximate = NativeCffFont.parse(buildCffFixture({
+    topDictExtra: concat(dictInteger(2), Uint8Array.of(12, 5), dictInteger(392), Uint8Array.of(12, 21)),
+    extraStrings: [ascii("/SomeFontBehavior 1 def")]
+  }));
+  assert.deepEqual(approximate.getGlyphOutline(1), baseline.getGlyphOutline(1),
+    "unsupported font-level behavior preserves usable outlines instead of refusing the font");
+  assert.deepEqual(approximate.diagnostics.map(d => d.code),
+    ["font.cff-paint-type-approximation", "font.cff-postscript-approximation"]);
+  assert(approximate.diagnostics.every(d => d.severity === "warning"));
+  assert(Object.isFrozen(approximate.diagnostics) && approximate.diagnostics.every(Object.isFrozen));
+  const emptyPostScript = NativeCffFont.parse(buildCffFixture({
+    topDictExtra: concat(dictInteger(0), Uint8Array.of(12, 5), dictInteger(392), Uint8Array.of(12, 21)),
+    extraStrings: [ascii(" \n\t")]
+  }));
+  assert.deepEqual(emptyPostScript.diagnostics, [], "empty embedded PostScript and normal PaintType need no warning");
+  const invalidPostScriptSid = NativeCffFont.parse(buildCffFixture({
+    topDictExtra: concat(dictInteger(999), Uint8Array.of(12, 21))
+  }));
+  assert.equal(invalidPostScriptSid.diagnostics[0].code, "font.cff-postscript-approximation");
+  assert.deepEqual(invalidPostScriptSid.getGlyphOutline(1), baseline.getGlyphOutline(1));
+  for (const bytes of [[16], [12, 8], [12, 13]]) {
+    const font = NativeCffFont.parse(buildCffFixture({ aCharString: Uint8Array.of(...bytes, 14) }));
+    assert.throws(() => font.getGlyphOutline(1), error => {
       assert(error instanceof PdfError);
       assert.equal(error.code, "unsupported-font");
-      assert.equal(error.details?.reason, "cff-synthetic-not-supported");
+      assert.equal(error.details.reason, "cff-multiple-master-not-supported");
+      assert.match(error.message, /Multiple Master/);
       return true;
     });
   }
+}
+
+async function testPdfSyntheticFontSetSelection() {
+  const name = value => ({ kind: "name", value });
+  const font = await parseNativePdfFont(new Map([
+    ["Subtype", name("Type1")], ["BaseFont", name("ABCDEF+Synthetic")],
+    ["FirstChar", 66], ["Widths", [600]],
+    ["FontDescriptor", new Map([["Flags", 32], ["FontFile3", {
+      kind: "stream", dictionary: new Map([["Subtype", name("Type1C")]]), bytes: buildSyntheticCffFixture()
+    }]])]
+  ]), { async resolveValue(value) { return value; }, async decodeStream(value) { return value.bytes; } });
+  const mapped = font.decode(Uint8Array.of(66));
+  assert.equal(mapped.glyphName, "A");
+  assert.equal(mapped.glyphId, 1);
+  assert.equal(mapped.unicode, "A");
+  assert.deepEqual(font.getGlyphOutline(mapped.glyphId).bounds, [20, 0, 140, 100]);
+  assert.equal(font.substitution, null);
+}
+
+async function testCffDiagnosticPropagation() {
+  const approximate = buildCffFixture({
+    topDictExtra: concat(dictInteger(2), Uint8Array.of(12, 5), dictInteger(392), Uint8Array.of(12, 21)),
+    extraStrings: [ascii("/SomeFontBehavior 1 def")]
+  });
+  const unknownOtherSubr = type1([0, 500, "hsbw", 10, 20, 2, 9, "callothersubr", "pop", "pop",
+    "rmoveto", 40, 0, "rlineto", "endchar"]);
+  const type1Cff = buildCffFixture({
+    topDictExtra: concat(dictInteger(1), Uint8Array.of(12, 6)),
+    charStrings: [type1([0, 500, "hsbw", "endchar"]), ...Array(4).fill(unknownOtherSubr)], localSubrs: []
+  });
+  const direct = NativeCffFont.parse(type1Cff);
+  assert.deepEqual(direct.diagnostics, []);
+  assert.deepEqual(direct.getGlyphOutline(1).commands[0], { kind: "move", x: 10, y: 20 });
+  direct.getGlyphOutline(2);
+  assert.deepEqual(direct.diagnostics.map(d => d.code), ["font.type1-othersubr-approximated"],
+    "unknown OtherSubr behavior is diagnosed once per extension across glyphs");
+
+  const name = value => ({ kind: "name", value });
+  const resolver = { async resolveValue(value) { return value; }, async decodeStream(value) { return value.bytes; } };
+  for (const [program, expectedCodes] of [
+    [approximate, ["font.cff-paint-type-approximation", "font.cff-postscript-approximation"]],
+    [type1Cff, ["font.type1-othersubr-approximated"]]
+  ]) {
+    for (const openType of [false, true]) {
+      const events = [];
+      const font = await parseNativePdfFont(new Map([
+        ["Subtype", name("Type1")], ["BaseFont", name("FixtureCff")],
+        ["Encoding", new Map([["BaseEncoding", name("WinAnsiEncoding")], ["Differences", [65, name("A")]]])],
+        ["FontDescriptor", new Map([["Flags", 32], ["FontFile3", {
+          kind: "stream", dictionary: new Map([["Subtype", name(openType ? "OpenType" : "Type1C")]]),
+          bytes: openType ? wrapOpenTypeCff(program) : program
+        }]])]
+      ]), resolver, { onDiagnostic: diagnostic => events.push(diagnostic) });
+      const mapped = font.decode(Uint8Array.of(65));
+      font.getGlyphOutline(mapped.glyphId);
+      font.getGlyphOutline(mapped.glyphId);
+      assert.deepEqual(font.diagnostics.map(d => d.code), expectedCodes,
+        `${openType ? "OpenType" : "direct"} CFF warnings survive both eager and lazy font parsing`);
+      assert.deepEqual(events.map(d => d.code), expectedCodes,
+        `${openType ? "OpenType" : "direct"} CFF diagnostic events are delivered once`);
+    }
+  }
+}
+
+function testCffType1CharStrings() {
+  const options = {
+    topDictExtra: concat(dictInteger(1), Uint8Array.of(12, 6)),
+    charStrings: [
+      type1([0, 500, "hsbw", "endchar"]),
+      type1([20, 600, "hsbw", 0, 0, "rmoveto", 0, "callsubr", 100, 0, "rlineto", "closepath", "endchar"]),
+      type1([0, 100, "hsbw", 0, 0, "rmoveto", 10, 20, "rlineto", "endchar"]),
+      type1([20, 600, "hsbw", 0, 30, 150, 65, 194, "seac"]),
+      type1([15, 25, 600, 20, "sbw", 0, 0, "rmoveto", 30, 40, "rlineto", "endchar"])
+    ],
+    localSubrs: [type1([0, 100, "rlineto", "return"])]
+  };
+  const font = NativeCffFont.parse(buildCffFixture(options));
+  const a = font.getGlyphOutline(1);
+  assert.equal(a.advanceWidth, 600, "Type 1 hsbw width is not adjusted by Type 2 nominalWidthX");
+  assert.deepEqual(a.commands, [
+    { kind: "move", x: 20, y: 0 }, { kind: "line", x: 20, y: 100 },
+    { kind: "line", x: 120, y: 100 }, { kind: "close" }
+  ], "plaintext Type 1 charstrings use zero-biased CFF local subroutines");
+  assert.deepEqual(font.getGlyphOutline(3).commands.slice(-3), [
+    { kind: "move", x: 50, y: 150 }, { kind: "line", x: 60, y: 170 }, { kind: "close" }
+  ], "Type 1 seac applies the accent side bearing correction and resolves the CFF charset");
+  assert.deepEqual(font.getGlyphOutline(3).bounds, [20, 0, 120, 170]);
+  assert.deepEqual(font.getGlyphOutline(4).bounds, [15, 25, 45, 65], "Type 1 sbw keeps both side bearing coordinates");
+  const transformed = NativeCffFont.parse(buildCffFixture({ ...options,
+    fontMatrix: [0.001, 0, 0.0005, 0.001, 0.01, 0]
+  }));
+  assert.equal(transformed.getGlyphOutline(4).advanceWidth, 610,
+    "FontMatrix transforms the complete Type 1 advance vector, without translating it");
+  assert.deepEqual(transformed.getGlyphOutline(1).commands[0], { kind: "move", x: 30, y: 0 });
+  expectPdf(() => NativeCffFont.parse(buildCffFixture(options), { maxType2Operators: 10 }).getGlyphOutline(3),
+    "resource-limit", /operator/i, "composite components share the caller's execution budget");
+  const repeated = { ...options, charStrings: [...options.charStrings] };
+  repeated.charStrings[1] = type1([0, 600, "hsbw", 0, 0, "rmoveto", 0, "callsubr", 0, "callsubr", "endchar"]);
+  expectPdf(() => NativeCffFont.parse(buildCffFixture(repeated), { maxType2SubrCalls: 1 }).getGlyphOutline(1),
+    "resource-limit", /subr.*calls/i);
+  const recursive = { ...options, localSubrs: [type1([0, "callsubr", "return"])] };
+  expectPdf(() => NativeCffFont.parse(buildCffFixture(recursive)).getGlyphOutline(1),
+    "unsupported-font", /cycle/i);
+  const malformed = { ...options, charStrings: [options.charStrings[0], type1([0, 600, "hsbw", 2, "callsubr", "endchar"])] };
+  expectPdf(() => NativeCffFont.parse(buildCffFixture({ ...malformed, predefinedCharset: 0, predefinedEncoding: 0 })).getGlyphOutline(1),
+    "unsupported-font", /subroutine.*missing|subroutine.*bounds/i);
 }
 
 function testFontMatrixNormalization() {
@@ -352,7 +605,7 @@ function buildCffFixture(options = {}) {
     50, 0, 50, 100, 50, 0, "rrcurveto",
     "endchar"
   ]);
-  const charStrings = [
+  const charStrings = options.charStrings ?? [
     type2(["endchar"]),
     aCharString,
     type2([50, 0, "rmoveto", 0, 50, "rlineto", "endchar"]),
@@ -373,12 +626,12 @@ function buildCffFixture(options = {}) {
 
   // Long DICT integers make all offset-bearing fields fixed-width, so one
   // placeholder pass is sufficient and cannot move the later data again.
-  const privateDictionary = concat(
+  const privatePrefix = concat(
     dictInteger(500), Uint8Array.of(20),
     dictInteger(100), Uint8Array.of(21),
-    dictInteger(18), Uint8Array.of(19)
+    options.privateExtra ?? new Uint8Array()
   );
-  assert.equal(privateDictionary.length, 18);
+  const privateDictionary = concat(privatePrefix, dictInteger(privatePrefix.length + 6), Uint8Array.of(19));
   const localSubrsIndex = cffIndex(localSubrs);
   const fontMatrix = options.fontMatrix ?? null;
   const topDictExtra = options.topDictExtra ?? new Uint8Array();
@@ -391,8 +644,8 @@ function buildCffFixture(options = {}) {
   const charStringsOffset = charsetOffset + charset.length;
   const privateOffset = charStringsOffset + charStringsIndex.length;
   const top = topDictionary(
-    charsetOffset,
-    encodingOffset,
+    options.predefinedCharset ?? charsetOffset,
+    options.predefinedEncoding ?? encodingOffset,
     charStringsOffset,
     privateDictionary.length,
     privateOffset,
@@ -428,6 +681,43 @@ function topDictionary(charset, encoding, charStrings, privateSize, privateOffse
     dictInteger(charStrings), Uint8Array.of(17),
     dictInteger(privateSize), dictInteger(privateOffset), Uint8Array.of(18)
   );
+}
+
+function buildSyntheticCffFixture(options = {}) {
+  const header = Uint8Array.of(1, 0, 4, 4);
+  const names = cffIndex((options.names ?? ["Base", "Synthetic"]).map(ascii));
+  const strings = cffIndex([]);
+  const globalSubrs = cffIndex([]);
+  const baseEncoding = Uint8Array.of(0, 1, 65);
+  const syntheticEncoding = Uint8Array.of(0, 1, 66);
+  const charset = Uint8Array.of(0, 0, 34);
+  const charStrings = cffIndex([type2(["endchar"]),
+    type2([0, 0, "rmoveto", 100, 100, "rlineto", "endchar"])]);
+  const privateDictionary = concat(dictInteger(600), Uint8Array.of(20));
+  const buildTop = (encodingOffset, syntheticEncodingOffset, charsetOffset, charStringsOffset, privateOffset) => {
+    const baseExtra = options.baseIsSynthetic ? concat(dictInteger(1), Uint8Array.of(12, 20)) :
+      options.baseIsCid ? concat(dictInteger(0), dictInteger(0), dictInteger(0), Uint8Array.of(12, 30)) : new Uint8Array();
+    const base = topDictionary(charsetOffset, encodingOffset, charStringsOffset,
+      privateDictionary.length, privateOffset, null, baseExtra);
+    const syntheticBase = concat(dictInteger(options.baseIndex ?? 0), Uint8Array.of(12, 20));
+    const matrix = options.omitMatrix ? new Uint8Array() :
+      concat(...[0.001, 0, 0.0002, 0.001, 0.02, 0].map(dictReal), Uint8Array.of(12, 7));
+    const synthetic = concat(options.syntheticNotFirst ? matrix : new Uint8Array(), syntheticBase,
+      options.syntheticNotFirst ? new Uint8Array() : matrix,
+      options.omitEncoding ? new Uint8Array() : concat(dictInteger(syntheticEncodingOffset), Uint8Array.of(16)),
+      options.syntheticHasPrivate ? concat(dictInteger(0), dictInteger(0), Uint8Array.of(18)) : new Uint8Array());
+    return cffIndex([base, synthetic]);
+  };
+  const topPlaceholder = buildTop(0, 0, 0, 0, 0);
+  const encodingOffset = header.length + names.length + topPlaceholder.length + strings.length + globalSubrs.length;
+  const syntheticEncodingOffset = encodingOffset + baseEncoding.length;
+  const charsetOffset = syntheticEncodingOffset + syntheticEncoding.length;
+  const charStringsOffset = charsetOffset + charset.length;
+  const privateOffset = charStringsOffset + charStrings.length;
+  const top = buildTop(encodingOffset, syntheticEncodingOffset, charsetOffset, charStringsOffset, privateOffset);
+  assert.equal(top.length, topPlaceholder.length);
+  return concat(header, names, top, strings, globalSubrs, baseEncoding, syntheticEncoding,
+    charset, charStrings, privateDictionary);
 }
 
 function cffIndex(objects) {
@@ -490,6 +780,28 @@ function type2(tokens) {
     else chunks.push(Uint8Array.from(token.bytes));
   }
   return concat(...chunks);
+}
+
+function type1(tokens) {
+  const operators = { hsbw: [13], sbw: [12, 7], seac: [12, 6], closepath: [9],
+    rmoveto: [21], rlineto: [5], callsubr: [10], return: [11], endchar: [14],
+    callothersubr: [12, 16], pop: [12, 17] };
+  return concat(...tokens.map(token => {
+    if (typeof token === "string") return Uint8Array.from(operators[token]);
+    if (token >= -107 && token <= 107) return Uint8Array.of(token + 139);
+    if (token >= 108 && token <= 1131) {
+      const delta = token - 108;
+      return Uint8Array.of(247 + (delta >> 8), delta & 255);
+    }
+    if (token >= -1131 && token <= -108) {
+      const delta = -token - 108;
+      return Uint8Array.of(251 + (delta >> 8), delta & 255);
+    }
+    const bytes = new Uint8Array(5);
+    bytes[0] = 255;
+    new DataView(bytes.buffer).setInt32(1, token, false);
+    return bytes;
+  }));
 }
 
 const TYPE2_OPERATORS = Object.freeze({
@@ -705,9 +1017,16 @@ async function testCidCffOutlinesAndPdfSelection() {
 testCffStructureAndType2Outlines();
 testFontMatrixNormalization();
 testBaseFontBlendIsNotMultipleMaster();
-testSyntheticBaseRemainsUnsupported();
+testPredefinedExpertCharsetsAndEncoding();
+testSeededRandomAndStackOperators();
+testSyntheticFontSets();
+testCancellation();
+testCffType1CharStrings();
+testApproximationDiagnosticsAndUnsupportedMasterPrograms();
 testLatin1StringsAreAccepted();
 await testPdfFontSelectionIsSeparateFromToUnicode();
+await testPdfSyntheticFontSetSelection();
+await testCffDiagnosticPropagation();
 await testOpenTypeCffOutlines();
 await testCidCffOutlinesAndPdfSelection();
 testMalformedProgramsAndLimits();

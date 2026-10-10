@@ -42,6 +42,11 @@ import {
   NativeCffFont,
   type NativeCffParserLimits
 } from "./nativeCff";
+import {
+  DEFAULT_NATIVE_TYPE1_PARSER_LIMITS,
+  NativeType1Font,
+  type NativeType1ParserLimits
+} from "./nativeType1";
 
 /** Minimal resolver surface needed by the font engine. */
 export interface NativePdfFontResolver {
@@ -173,7 +178,7 @@ export interface NativeSfntParserLimits {
   readonly maxGlyphInstructionBytes: number;
 }
 
-export interface NativePdfFontParserLimits extends NativeSfntParserLimits, NativeCffParserLimits {
+export interface NativePdfFontParserLimits extends NativeSfntParserLimits, NativeCffParserLimits, NativeType1ParserLimits {
   readonly maxCMapBytes: number;
   readonly maxCMapMappings: number;
   readonly maxCMapTokens: number;
@@ -221,6 +226,7 @@ export interface NativePdfFont {
   readonly unitsPerEm: number;
   readonly sfnt: NativeSfntFont | null;
   readonly cff: NativeCffFont | null;
+  readonly type1?: NativeType1Font | null;
   readonly substitution: NativeFontSubstitution | null;
   readonly diagnostics: readonly PdfDiagnostic[];
   decode(bytes: Uint8Array, offset?: number): NativeMappedCharacter;
@@ -314,6 +320,7 @@ export const DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS: Readonly<NativePdfFontParser
   maxType2SubrDepth: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2SubrDepth,
   maxType2SubrCalls: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2SubrCalls,
   maxType2PathCommands: DEFAULT_NATIVE_CFF_PARSER_LIMITS.maxType2PathCommands,
+  ...DEFAULT_NATIVE_TYPE1_PARSER_LIMITS,
   maxSfntFaces: Number.MAX_SAFE_INTEGER,
   maxSfntTables: Number.MAX_SAFE_INTEGER,
   maxSfntCmapRecords: Number.MAX_SAFE_INTEGER,
@@ -416,9 +423,12 @@ class ParsedNativeFont implements NativePdfFont {
   readonly unitsPerEm: number;
   readonly sfnt: NativeSfntFont | null;
   readonly cff: NativeCffFont | null;
+  readonly type1: NativeType1Font | null;
   readonly substitution: NativeFontSubstitution | null;
   private diagnosticData: readonly PdfDiagnostic[];
   private sfntDiagnosticCount: number;
+  private cffDiagnosticCount: number;
+  private type1DiagnosticCount: number;
   private readonly decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter;
   private readonly unsupportedOutlineReason: string | null;
   private readonly onDiagnostic: ParseNativePdfFontOptions["onDiagnostic"];
@@ -436,7 +446,8 @@ class ParsedNativeFont implements NativePdfFont {
     diagnostics: readonly PdfDiagnostic[],
     decodeCharacter: (bytes: Uint8Array, offset: number) => NativeMappedCharacter,
     unsupportedOutlineReason: string | null,
-    onDiagnostic?: ParseNativePdfFontOptions["onDiagnostic"]
+    onDiagnostic?: ParseNativePdfFontOptions["onDiagnostic"],
+    type1: NativeType1Font | null = null
   ) {
     this.subtype = subtype;
     this.baseFont = baseFont;
@@ -446,9 +457,12 @@ class ParsedNativeFont implements NativePdfFont {
     this.unitsPerEm = unitsPerEm;
     this.sfnt = sfnt;
     this.cff = cff;
+    this.type1 = type1;
     this.substitution = substitution;
     this.diagnosticData = diagnostics;
     this.sfntDiagnosticCount = sfnt?.diagnostics.length ?? 0;
+    this.cffDiagnosticCount = cff?.diagnostics.length ?? 0;
+    this.type1DiagnosticCount = type1?.diagnostics.length ?? 0;
     this.decodeCharacter = decodeCharacter;
     this.unsupportedOutlineReason = unsupportedOutlineReason;
     this.onDiagnostic = onDiagnostic;
@@ -457,12 +471,20 @@ class ParsedNativeFont implements NativePdfFont {
   /** Outlines are lazy, so normalization warnings can arrive after font parsing. */
   get diagnostics(): readonly PdfDiagnostic[] {
     const sfntDiagnostics = this.sfnt?.diagnostics ?? EMPTY_DIAGNOSTICS;
-    if (sfntDiagnostics.length > this.sfntDiagnosticCount) {
+    const cffDiagnostics = this.cff?.diagnostics ?? EMPTY_DIAGNOSTICS;
+    const type1Diagnostics = this.type1?.diagnostics ?? EMPTY_DIAGNOSTICS;
+    if (sfntDiagnostics.length > this.sfntDiagnosticCount ||
+        cffDiagnostics.length > this.cffDiagnosticCount ||
+        type1Diagnostics.length > this.type1DiagnosticCount) {
       this.diagnosticData = Object.freeze([
         ...this.diagnosticData,
-        ...sfntDiagnostics.slice(this.sfntDiagnosticCount)
+        ...sfntDiagnostics.slice(this.sfntDiagnosticCount),
+        ...cffDiagnostics.slice(this.cffDiagnosticCount),
+        ...type1Diagnostics.slice(this.type1DiagnosticCount)
       ]);
       this.sfntDiagnosticCount = sfntDiagnostics.length;
+      this.cffDiagnosticCount = cffDiagnostics.length;
+      this.type1DiagnosticCount = type1Diagnostics.length;
     }
     return this.diagnosticData;
   }
@@ -471,22 +493,29 @@ class ParsedNativeFont implements NativePdfFont {
     if (!Number.isSafeInteger(offset) || offset < 0 || offset >= bytes.length) {
       throw new RangeError("PDF font decode offset is outside the source string.");
     }
-    return this.decodeCharacter(bytes, offset);
+    const previousDiagnosticCount = this.diagnostics.length;
+    const character = this.decodeCharacter(bytes, offset);
+    this.reportNewDiagnostics(previousDiagnosticCount);
+    return character;
   }
 
   getGlyphOutline(glyphId: number): NativeGlyphOutline {
-    if (this.sfnt) {
-      const previousCount = this.sfnt.diagnostics.length;
-      const outline = this.sfnt.getGlyphOutline(glyphId);
-      const diagnostics = this.sfnt.diagnostics;
-      for (let index = previousCount; index < diagnostics.length; index++) this.onDiagnostic?.(diagnostics[index]);
+    const provider = this.sfnt ?? this.cff ?? this.type1;
+    if (provider) {
+      const previousCount = this.diagnostics.length;
+      const outline = provider.getGlyphOutline(glyphId);
+      this.reportNewDiagnostics(previousCount);
       return outline;
     }
-    if (this.cff) return this.cff.getGlyphOutline(glyphId);
     throw unsupportedFont(
       this.unsupportedOutlineReason ??
       `Font ${this.baseFont || "(unnamed)"} has no embedded outline program; a deterministic substitute is required.`
     );
+  }
+
+  private reportNewDiagnostics(previousCount: number): void {
+    const diagnostics = this.diagnostics;
+    for (let index = previousCount; index < diagnostics.length; index++) this.onDiagnostic?.(diagnostics[index]);
   }
 }
 
@@ -514,15 +543,47 @@ async function parseSimpleFont(
     parserLimits,
     signal
   );
+  let embeddedType1: NativeType1Font | null = null;
+  let type1Failure: PdfError | undefined;
+  if (descriptor.embeddedKind === "type1") {
+    try {
+      embeddedType1 = await readEmbeddedType1(dictionary, resolver, parserLimits, signal);
+    } catch (error) {
+      // Retain the existing readable substitute for unsupported/damaged font
+      // programs. Cancellation and caller resource ceilings remain authoritative.
+      if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+      type1Failure = error;
+    }
+  }
   reportFontDiagnostics(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
+  reportFontDiagnostics(embeddedCff?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
   const encoding = await parseSimpleEncoding(
     dictionary.get("Encoding"),
     baseFont,
     resolver,
     parserLimits,
     signal,
-    embeddedCff?.builtInGlyphNames
+    embeddedCff?.builtInGlyphNames ?? embeddedType1?.builtInGlyphNames
   );
+  if (embeddedType1) {
+    try {
+      // Validate the glyphs reachable through this simple font's Encoding
+      // while asynchronous substitution is still possible. Outlines are
+      // cached, and unused glyph programs need not be executed. This also
+      // catches unsupported OtherSubrs and cyclic composite/subroutine calls.
+      const type1 = embeddedType1;
+      const glyphIds = new Set(encoding.glyphNames.map(name => type1.glyphIdForName(name)));
+      for (const glyphId of glyphIds) {
+        throwIfAborted(signal);
+        embeddedType1.getGlyphOutline(glyphId);
+      }
+    } catch (error) {
+      if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+      type1Failure = error;
+      embeddedType1 = null;
+    }
+  }
+  reportFontDiagnostics(embeddedType1?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
   const toUnicode = await readToUnicode(
     dictionary.get("ToUnicode"),
     resolver,
@@ -544,7 +605,7 @@ async function parseSimpleFont(
     descriptor,
     simpleWidthsSuggestFixedPitch(widths, encoding.glyphNames)
   );
-  const replacement = embeddedSfnt === null && embeddedCff === null &&
+  const replacement = embeddedSfnt === null && embeddedCff === null && embeddedType1 === null &&
     (descriptor.embeddedKind === null || descriptor.embeddedKind === "type1") &&
     subtype !== "Type3"
     ? await resolveMissingSfnt({
@@ -555,12 +616,12 @@ async function parseSimpleFont(
         writingMode: 0,
         descriptor,
         style
-      }, options)
+      }, options, type1Failure)
     : null;
   const sfnt = embeddedSfnt ?? replacement?.sfnt ?? null;
   const approximateType1 = replacement !== null && descriptor.embeddedKind === "type1";
   const type3Matrix = subtype === "Type3" ? readNumberArray(dictionary.get("FontMatrix"), 6) : null;
-  const unitsPerEm = sfnt?.unitsPerEm ?? embeddedCff?.unitsPerEm ?? (
+  const unitsPerEm = sfnt?.unitsPerEm ?? embeddedCff?.unitsPerEm ?? embeddedType1?.unitsPerEm ?? (
     type3Matrix && type3Matrix[0] !== 0 ? Math.max(1, Math.round(1 / Math.abs(type3Matrix[0]))) : 1000
   );
   const type3Widths = subtype === "Type3";
@@ -579,7 +640,7 @@ async function parseSimpleFont(
       : descriptor.embeddedKind === "cff"
         ? "The embedded CFF outline program could not be retained."
         : descriptor.embeddedKind === "type1"
-          ? "PFA/PFB Type1 outlines require the native Type1 engine, which is not available."
+          ? `The embedded Type1 outline program could not be decoded${type1Failure ? `: ${type1Failure.message}` : "."}`
           : subtype === "Type1" || subtype === "MMType1"
             ? "A nonembedded Type1 font requires a deterministic substitute."
         : null;
@@ -596,6 +657,8 @@ async function parseSimpleFont(
     replacement?.substitution ?? null,
     Object.freeze([
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...(embeddedCff?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...(embeddedType1?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS)
     ]),
@@ -608,7 +671,11 @@ async function parseSimpleFont(
       const unicode = mappedUnicode ?? encoding.unicode[code] ??
         (glyphName ? glyphNameToUnicodeForFont(glyphName, baseFont) : null);
       let glyphId = code;
-      if (embeddedCff) {
+      if (embeddedType1) {
+        // Original Type1 paint follows Encoding/built-in glyph names, even
+        // when ToUnicode is absent or intentionally describes different text.
+        glyphId = embeddedType1.glyphIdForName(glyphName);
+      } else if (embeddedCff) {
         // Name-keyed CFF selection follows the PDF Encoding glyph name. An
         // unrelated ToUnicode value must never redirect painted geometry.
         glyphId = embeddedCff.glyphIdForName(glyphName);
@@ -633,11 +700,14 @@ async function parseSimpleFont(
       if (
         !widths.has(code) && standardWidth === null && width === 0 &&
         ((sfnt !== null && glyphId < sfnt.numGlyphs) ||
-          (embeddedCff !== null && glyphId < embeddedCff.numGlyphs))
+          (embeddedCff !== null && glyphId < embeddedCff.numGlyphs) ||
+          (embeddedType1 !== null && glyphId < embeddedType1.numGlyphs))
       ) {
         width = sfnt
           ? sfnt.getHorizontalMetric(glyphId).advanceWidth * 1000 / sfnt.unitsPerEm
-          : embeddedCff!.getGlyphOutline(glyphId).advanceWidth * 1000 / embeddedCff!.unitsPerEm;
+          : embeddedType1
+            ? embeddedType1.getGlyphOutline(glyphId).advanceWidth * 1000 / embeddedType1.unitsPerEm
+            : embeddedCff!.getGlyphOutline(glyphId).advanceWidth * 1000 / embeddedCff!.unitsPerEm;
       }
       if (type3Widths && type3Matrix) {
         // Type3 widths are expressed through FontMatrix; normalize to the same
@@ -656,7 +726,8 @@ async function parseSimpleFont(
       };
     },
     outlineReason,
-    options.onDiagnostic
+    options.onDiagnostic,
+    embeddedType1
   );
 }
 
@@ -718,6 +789,7 @@ async function parseCompositeFont(
     descendant, descriptor, resolver, parserLimits, signal
   );
   reportFontDiagnostics(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
+  reportFontDiagnostics(embeddedCff?.diagnostics ?? EMPTY_DIAGNOSTICS, options);
   const replacement = embeddedSfnt === null && embeddedCff === null && descriptor.embeddedKind === null
     ? await resolveMissingSfnt({
         baseFont,
@@ -771,6 +843,7 @@ async function parseCompositeFont(
     replacement?.substitution ?? null,
     Object.freeze([
       ...(embeddedSfnt?.diagnostics ?? EMPTY_DIAGNOSTICS),
+      ...(embeddedCff?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(replacement?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...(toUnicode?.diagnostics ?? EMPTY_DIAGNOSTICS),
       ...encodingDiagnostics,
@@ -2701,7 +2774,8 @@ interface ResolvedMissingSfnt {
 
 async function resolveMissingSfnt(
   requestValue: NativeMissingFontRequest,
-  options: ParseNativePdfFontOptions
+  options: ParseNativePdfFontOptions,
+  outlineFailure?: PdfError
 ): Promise<ResolvedMissingSfnt | null> {
   const missingFontResolver = options.missingFontResolver;
   if (!missingFontResolver) return null;
@@ -2784,7 +2858,11 @@ async function resolveMissingSfnt(
       faceIndex,
       byteLength: ownedBytes.length,
       ...(approximateType1 ? {
-        reason: "unsupported-type1-outlines",
+        reason: "unavailable-type1-outlines",
+        ...(outlineFailure ? {
+          fontProgramReason: outlineFailure.details?.reason ?? "type1-invalid-program",
+          fontProgramMessage: outlineFailure.message
+        } : {}),
         embeddedKind: "type1",
         approximate: true
       } : {})
@@ -2860,6 +2938,35 @@ async function readEmbeddedSfnt(
   return NativeSfntFont.parse(bytes, 0, limits, "pdf-embedded");
 }
 
+async function readEmbeddedType1(
+  fontDictionary: PdfDictionary,
+  resolver: NativePdfFontResolver,
+  limits: Readonly<NativeType1ParserLimits>,
+  signal?: AbortSignal
+): Promise<NativeType1Font | null> {
+  const descriptorValue = fontDictionary.get("FontDescriptor");
+  if (descriptorValue === undefined) return null;
+  const descriptor = await requireDictionary(
+    descriptorValue, resolver, signal, "font descriptor"
+  );
+  const value = descriptor.get("FontFile");
+  if (value === undefined) return null;
+  const stream = await resolver.resolveValue(value, signal);
+  if (!isPdfStream(stream)) throw unsupportedFont("An embedded Type1 font file is not a stream.");
+  const bytes = await resolver.decodeStream(stream, signal);
+  throwIfAborted(signal);
+  const framing: { length1?: number; length2?: number; length3?: number; signal?: AbortSignal } = { signal };
+  for (const [key, field] of [["Length1", "length1"], ["Length2", "length2"], ["Length3", "length3"]] as const) {
+    if (!stream.dictionary.has(key)) continue;
+    const length = await resolver.resolveValue(stream.dictionary.get(key), signal);
+    if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) {
+      throw unsupportedFont(`An embedded Type1 /${key} must be a nonnegative integer.`);
+    }
+    framing[field] = length;
+  }
+  return NativeType1Font.parse(bytes, limits, framing);
+}
+
 async function readEmbeddedCff(
   fontDictionary: PdfDictionary,
   descriptor: NativeFontDescriptor,
@@ -2888,7 +2995,7 @@ async function readEmbeddedCff(
   }
   const bytes = await resolver.decodeStream(stream, signal);
   throwIfAborted(signal);
-  return NativeCffFont.parse(bytes, limits);
+  return NativeCffFont.parse(bytes, limits, optionalName(fontDictionary.get("BaseFont")) ?? undefined, signal);
 }
 
 function reportFontDiagnostics(
@@ -3391,8 +3498,18 @@ export class NativeSfntFont {
           throw unsupportedFont("The OpenType CFF CharStrings count disagrees with maxp.numGlyphs.");
         }
         this.cffFont = cff;
+        if (cff.diagnostics.length) {
+          this.diagnosticData = Object.freeze([...this.diagnosticData, ...cff.diagnostics]);
+        }
       }
+      const previousDiagnosticCount = this.cffFont.diagnostics.length;
       const source = this.cffFont.getGlyphOutline(glyphId);
+      if (this.cffFont.diagnostics.length > previousDiagnosticCount) {
+        this.diagnosticData = Object.freeze([
+          ...this.diagnosticData,
+          ...this.cffFont.diagnostics.slice(previousDiagnosticCount)
+        ]);
+      }
       const scale = this.unitsPerEm / this.cffFont.unitsPerEm;
       const metric = this.getHorizontalMetric(glyphId);
       const outline: NativeGlyphOutline = Object.freeze({
@@ -5138,6 +5255,7 @@ function mergeFontParserLimits(
 ): Readonly<NativePdfFontParserLimits> {
   const defaults = DEFAULT_NATIVE_PDF_FONT_PARSER_LIMITS;
   return Object.freeze({
+    ...mergeType1ParserLimits(overrides),
     maxCMapBytes: boundedParserLimit(overrides?.maxCMapBytes, defaults.maxCMapBytes, "maxCMapBytes"),
     maxCMapMappings: boundedParserLimit(
       overrides?.maxCMapMappings,
@@ -5203,6 +5321,16 @@ function mergeFontParserLimits(
     ),
     ...mergeSfntParserLimits(overrides)
   });
+}
+
+function mergeType1ParserLimits(
+  overrides: Partial<NativeType1ParserLimits> | undefined
+): NativeType1ParserLimits {
+  const limits = { ...DEFAULT_NATIVE_TYPE1_PARSER_LIMITS };
+  for (const key of Object.keys(limits) as (keyof NativeType1ParserLimits)[]) {
+    limits[key] = boundedParserLimit(overrides?.[key], limits[key], key);
+  }
+  return limits;
 }
 
 function mergeSfntParserLimits(

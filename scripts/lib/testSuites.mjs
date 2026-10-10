@@ -135,6 +135,8 @@ export const fastTests = [
   "native-font-text",
   "native-sfnt-semantics",
   "native-type1-substitution",
+  "native-type1",
+  "native-cff-semantics",
   "pdf-actual-text",
   "pdf-session-ext-gstate-font",
   "native-image-codecs",
