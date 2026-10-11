@@ -35,6 +35,7 @@ export function validatePagePrimitiveRanges(scene: VectorScene): void {
 }
 
 export interface ScenePageView {
+  /** Read-only page payload; immutable stores may share canonical document buffers. */
   scene: VectorScene;
   /** Paint extents without the background, for transformed-page depth safety. */
   paintBounds: Bounds;
@@ -200,13 +201,22 @@ export class ScenePageViews {
     compactGradientMeshes(source, scene, gradients);
 
     scene.textInstanceCount = scene.sourceTextCount = scene.textInPageCount = primitives.text.length; scene.textOutOfPageCount = 0;
-    scene.textInstanceA = take("textInstanceA", primitives.text); scene.textInstanceB = take("textInstanceB", primitives.text); scene.textInstanceC = take("textInstanceC", primitives.text);
+    // Canonical text is immutable. Contiguous page ranges can keep views into
+    // the document instead of retaining another complete copy across pages.
+    const takeText = (key: "textInstanceA" | "textInstanceB" | "textInstanceC"): Float32Array => {
+      const ids = primitives.text, data = source[key], first = ids[0] ?? 0, end = first + ids.length;
+      return (!ids.length || ids[ids.length - 1] === end - 1) && end * 4 <= data.length
+        ? data.subarray(first * 4, end * 4) : take(key, ids);
+    };
+    scene.textInstanceA = takeText("textInstanceA"); scene.textInstanceB = takeText("textInstanceB"); scene.textInstanceC = takeText("textInstanceC");
     // Glyph outlines are font data: every page keeps the document's immutable
     // glyph store, so pages share one glyph atlas instead of rasterizing their own.
     const textClips: number[] = [], textClipMap = new Map<number, number>();
     for (let i = 0; i < scene.textInstanceB.length; i += 4) {
       const clip = scene.textInstanceB[i + 3] - 1;
       if (clip >= 0) {
+        // Clip IDs become page-local, so detach only the array we must rewrite.
+        if (scene.textInstanceB.buffer === source.textInstanceB.buffer) scene.textInstanceB = scene.textInstanceB.slice();
         if (!textClipMap.has(clip)) { textClipMap.set(clip, textClips.length); textClips.push(clip); }
         scene.textInstanceB[i + 3] = textClipMap.get(clip)! + 1;
       }

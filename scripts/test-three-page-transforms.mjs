@@ -37,6 +37,8 @@ try {
     const native = mockNative();
     const pdf = await createThreePdfObject({ scene, sourceLabel: 'pages.hep', sourceKind: 'hep' },
       { rendererType: backend, vectorLod: 'off', textLod: 'off', threeColorCompositing: 'display' }, undefined, undefined, () => native);
+    const atlas = pdf.textMaterialLayer.textRasterAtlasTexture;
+    let atlasDisposals = 0; atlas.addEventListener('dispose', () => atlasDisposals++);
     assert.equal(pdf.pageViews, null, 'default document keeps its batched path');
     const fullBackground = pdf.rasterMaterialLayer.group.children[0];
     assert.equal(fullBackground.geometry.instanceCount, 3);
@@ -53,15 +55,20 @@ try {
     const stopProgress = pdf.subscribePagePreparationProgress(value => progress.push(value));
     const [pages, second] = await Promise.all([pdf.getPages(), pdf.getPage(1)]);
     stopProgress();
-    assert.deepEqual(progress, [null, 0, 25, 50, 75, 95, null], 'page preparation reports ordered integer progress and ends idle');
-    const atlas = pdf.textMaterialLayer.textRasterAtlasTexture;
-    let atlasDisposals = 0; atlas.addEventListener('dispose', () => atlasDisposals++);
-    assert(pages.every(page => page.textMaterialLayer.textRasterAtlasTexture === atlas), 'page views share the document glyph atlas');
+    assert.equal(progress[0], null, 'page preparation begins idle');
+    assert.equal(progress.at(-1), null, 'page preparation returns to idle when complete');
+    const percentages = progress.slice(1, -1);
+    assert.equal(percentages[0], 0, 'page preparation reports its start before allocating resources');
+    assert(percentages.length >= pages.length + 2, 'shared resources and individual page handles report progress');
+    assert(percentages.every((value, index) => Number.isInteger(value) && value >= 0 && value <= 100 &&
+      (!index || value > percentages[index - 1])), 'page preparation reports increasing, bounded integer percentages');
+    assert(percentages.at(-1) >= 95, 'page preparation reaches the final installation phase');
+    assert(pages.every(page => page.deferredMaterials && !page.textMaterialLayer), 'page views defer independent paint resources');
     assert.equal(pdf.pageBatch.textMaterialLayer.textRasterAtlasTexture, atlas, 'shared batches reuse the same glyph atlas');
     assert.equal(second, pages[1]); assert.equal(await pdf.getPage(1), second);
     assert.equal(pages.length, 3); assert(Object.isFrozen(pages));
     assert.equal(native.uploads, 0, 'independent Three resources do not upload native geometry');
-    assert.equal(pdf.rasterMaterialLayer.group.visible, false);
+    assert.equal(pdf.materialPipelineActive, false);
     assert.equal(pdf.pageMesh.visible, false, 'the original document depth rectangle cannot occlude moved pages');
     assert(pages.every(page => page.searchHighlightGroup?.visible), 'pre-existing find highlights migrate to pages');
     assert(pages.every(page=>page.primitiveAppearance.getHighlights()?.selectionCount===1),'annotation selection migrates to every page occurrence');
@@ -92,6 +99,7 @@ try {
       camera.position.set(0,0,250); camera.lookAt(0,0,0); camera.updateMatrixWorld(true);
       parent.updateMatrixWorld(true);
       hostScene.onBeforeRender(host,hostScene,camera,null);
+      assert(pages.every(page => page.textMaterialLayer.textRasterAtlasTexture === atlas), 'materialized page views share the document glyph atlas');
       assert.equal(pdf.getPageBatchingStats().reason, 'overlapping-page-paints');
       assert.equal(pdf.pageMesh.visible, false);
       assert.deepEqual(pages[0].matrix.elements,untouched.elements,'moving one page leaves its sibling transform unchanged');

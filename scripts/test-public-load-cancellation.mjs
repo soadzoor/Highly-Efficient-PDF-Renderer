@@ -76,7 +76,7 @@ try {
 
   await testPublicPipeline(reason);
   await testLateRendererCleanup(reason);
-  await testConsumedReservationCleanup();
+  await testConsumedReservationCleanup(reason);
   await testCancelledFrame(reason);
   // The helper must drain a rejection even if given an already-aborted signal.
   await assert.rejects(waitForLoad(Promise.reject(new Error("late host error")), aborted.signal),
@@ -203,45 +203,59 @@ async function testLateRendererCleanup(reason) {
   assert.equal(disposed, 1, "a renderer resolving after cancellation must release its resources");
 }
 
-async function testConsumedReservationCleanup() {
+async function testConsumedReservationCleanup(reason) {
   const source = await readFile(new URL("../src/threePdfObject.ts", import.meta.url), "utf8");
-  const scene = {};
-  const failure = new Error("text layer initialization failed");
-  let owned = true;
-  let layerDisposals = 0;
-  let rendererDisposals = 0;
-  const reservation = {
-    take(ownerScene) { assert.equal(ownerScene, scene); assert(owned); owned = false; },
-    release() { assert.equal(owned, false, "the layer already consumed this reservation"); }
-  };
-  const context = vm.createContext({
-    createLoadYielder, waitForLoad, document: { createElement: () => ({}) },
-    normalizeBounds: bounds => bounds,
-    resolveSceneFitBounds: () => ({ minX: 0, minY: 0, maxX: 10, maxY: 10 }),
-    computeInitialCanvasSize: () => ({ width: 10, height: 10 }),
-    normalizeRendererConfig: () => ({}), shouldUseVectorStrokeLod: () => true,
-    DEFAULT_FIT_PADDING_PIXELS: 10,
-    createNativeRenderer: async () => ({ dispose: () => { rendererDisposals++; } }),
-    applyRendererConfig() {}, deferRendererSceneUpload() {}, applyThreePdfOverlayPaintOrder() {},
-    ThreeMaterialRasterLayer: class {}, ThreeMaterialFillLayer: class {},
-    ThreeMaterialGradientLayer: class { getOrderedPaintMeshes() { return []; } },
-    ThreeVectorLodStrokeLayer: class {
-      constructor(ownerScene, _options, prepared) {
-        assert.equal(prepared, reservation);
-        prepared.take(ownerScene);
-      }
-      dispose() { layerDisposals++; }
-    },
-    sceneRequiresPaintCompositing: () => false,
-    ThreeTextLodLayer: { create() { throw failure; } }
-  });
-  vm.runInContext(sourceFunction(source, "createThreePdfContent"), context);
-  vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
-  await assert.rejects(context.createThreePdfObject({ scene }, {}, undefined, reservation),
-    error => error === failure);
-  reservation.release();
-  assert.equal(layerDisposals, 1, "initialization failure disposes the runtime's new owner");
-  assert.equal(rendererDisposals, 1);
+  for (const outcome of ["failed", "cancelled"]) {
+    const scene = {};
+    const failure = new Error("text layer initialization failed");
+    const controller = new AbortController();
+    let owned = true;
+    const layerDisposals = [];
+    let rendererDisposals = 0;
+    const reservation = {
+      take(ownerScene) { assert.equal(ownerScene, scene); assert(owned); owned = false; },
+      release() { assert.equal(owned, false, "the layer already consumed this reservation"); }
+    };
+    const context = vm.createContext({
+      createLoadYielder, waitForLoad, document: { createElement: () => ({}) },
+      normalizeBounds: bounds => bounds,
+      resolveSceneFitBounds: () => ({ minX: 0, minY: 0, maxX: 10, maxY: 10 }),
+      computeInitialCanvasSize: () => ({ width: 10, height: 10 }),
+      normalizeRendererConfig: () => ({}), shouldUseVectorStrokeLod: () => true,
+      DEFAULT_FIT_PADDING_PIXELS: 10,
+      createNativeRenderer: async () => ({ dispose: () => { rendererDisposals++; } }),
+      applyRendererConfig() {}, deferRendererSceneUpload() {}, applyThreePdfOverlayPaintOrder() {},
+      ThreeMaterialRasterLayer: class { dispose() { layerDisposals.push("raster"); } },
+      ThreeMaterialFillLayer: class { dispose() { layerDisposals.push("fill"); } },
+      ThreeMaterialGradientLayer: class {
+        getOrderedPaintMeshes() { return []; }
+        dispose() { layerDisposals.push("gradient"); }
+      },
+      ThreeVectorLodStrokeLayer: class {
+        constructor(ownerScene, _options, prepared) {
+          assert.equal(prepared, reservation);
+          prepared.take(ownerScene);
+        }
+        dispose() { layerDisposals.push("vector-lod"); }
+      },
+      sceneRequiresPaintCompositing: () => false,
+      ThreeTextLodLayer: { create() {
+        assert.equal(outcome, "failed", "Cancellation at a layer yield must stop further construction");
+        throw failure;
+      } }
+    });
+    vm.runInContext(sourceFunction(source, "createThreePdfMaterialSteps"), context);
+    vm.runInContext(sourceFunction(source, "createThreePdfContent"), context);
+    vm.runInContext(sourceFunction(source, "createThreePdfObject"), context);
+    await assert.rejects(context.createThreePdfObject({ scene }, {}, controller.signal, reservation,
+      undefined, undefined, async () => {
+        if (outcome === "cancelled" && !owned) controller.abort(reason);
+      }), error => error === (outcome === "failed" ? failure : reason));
+    reservation.release();
+    assert.deepEqual(layerDisposals, ["vector-lod", "fill", "gradient", "raster"],
+      `${outcome}: every partially constructed layer is disposed once, including the consumed runtime's new owner`);
+    assert.equal(rendererDisposals, 1);
+  }
 }
 
 async function testCancelledFrame(reason) {

@@ -11,6 +11,7 @@ import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationIntera
 import * as THREE from "three";
 import { waitForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
+import { createThreeExampleLoadDiagnostics } from "./threeExampleLoadDiagnostics";
 import { WebGPURenderer } from "three/webgpu";
 import { MapControls } from "three/addons/controls/MapControls.js";
 
@@ -230,6 +231,10 @@ const pageLayoutProgressBarElement = pageLayoutProgressBar;
 const pageLayoutProgressTextElement = pageLayoutProgressText;
 const lifetimeAbortController = new AbortController();
 const lifetimeSignal = lifetimeAbortController.signal;
+const loadDiagnostics = createThreeExampleLoadDiagnostics(lifetimeSignal, () => ({
+  loadToken, sourceLoading: sourceLoadController !== null, documentLoaded: currentPdfObject !== null,
+  backend: activeThreeRendererBackend, layout: activePageLayout
+}));
 const drawCallMeter = createDrawCallMeter(drawCallsValue, { signal: lifetimeSignal });
 const drawCallCounter = createThreeDrawCallCounter();
 let loadToken = 0;
@@ -537,6 +542,7 @@ function createWebGlThreeRenderer(targetCanvas: HTMLCanvasElement): THREE.WebGLR
     powerPreference: "high-performance"
   });
   configureThreeRenderer(nextRenderer, THREE.SRGBColorSpace);
+  loadDiagnostics.monitorRenderer(nextRenderer, targetCanvas);
   return nextRenderer;
 }
 
@@ -560,6 +566,7 @@ async function createWebGpuThreeRenderer(targetCanvas: HTMLCanvasElement): Promi
   configureThreeRenderer(nextRenderer, THREE.LinearSRGBColorSpace);
   try {
     await nextRenderer.init();
+    loadDiagnostics.monitorRenderer(nextRenderer, targetCanvas);
     stopThreeInternalAnimationLoop(nextRenderer);
     return nextRenderer;
   } catch (error) {
@@ -1619,7 +1626,9 @@ const performanceCapture = {
   json(): string { return JSON.stringify(performanceCapture.report(), null, 2); }
 };
 // Temporary, opt-in console diagnostics. Nothing is captured until start().
-Object.assign(window, { heprPerf: performanceCapture });
+Object.assign(window, { heprPerf: performanceCapture, heprLoad: {
+  report: () => loadDiagnostics.report(), json: () => loadDiagnostics.json()
+} });
 // `?perf=1` starts the capture before the first frame, so the first
 // interactions with a freshly loaded document are already in the report.
 if (new URLSearchParams(window.location.search).get("perf") === "1") {
@@ -1707,6 +1716,17 @@ async function loadSource(
   const backend = readBackendMode();
   const sourceLabel = typeof source === "string" ? source : source.name;
   const objectOptions = readThreeObjectOptions();
+  // Diagnostic A/B: bypass Reader page resource preparation while keeping the
+  // same document, LOD and rendering backend. The ordinary default is Reader.
+  const initialPageLayout = new URLSearchParams(window.location.search).get("initialLayout") === "grid" ? "grid" : "reader";
+  loadDiagnostics.begin(activeLoadToken, {
+    operation: "open", document: typeof source === "string" ? filenameFromUrl(source, "document") : source.name,
+    sourceFileBytes: typeof source === "string" ? null : source.size,
+    backend: `three-${backend}`, threeRevision: THREE.REVISION,
+    initialPageLayout, options: objectOptions, replacingDocument: Boolean(currentPdfObject),
+    canvasPixels: [canvasElement.width, canvasElement.height]
+  });
+  if (currentPdfObject) loadDiagnostics.checkpoint(activeLoadToken, "previous-document", currentPdfObject, renderer);
   const previousPdfObject = currentPdfObject;
   const previousDownloadablePdf = lastDownloadablePdf;
   let pendingObject: HeprThreePdfObject | null = null;
@@ -1756,6 +1776,7 @@ async function loadSource(
       }
     }
     pendingObject = nextObject;
+    loadDiagnostics.checkpoint(activeLoadToken, "object-ready", nextObject, renderer);
     const objectReadyMs = performance.now() - loadStart;
     const lodTiming = consumeVectorStrokeLodBuildTiming();
 
@@ -1776,8 +1797,19 @@ async function loadSource(
     });
     const firstSubmitStart = performance.now();
     let initialLayout: PageLayoutView | null = null;
-    if (nextObject.pageCount > 1) {
-      const stopProgress = nextObject.subscribePagePreparationProgress(setPageLayoutProgress);
+    loadDiagnostics.checkpoint(activeLoadToken, "reader-pages-start");
+    if (nextObject.pageCount > 1 && initialPageLayout === "reader") {
+      setLoadingProgress(true, "Preparing Reader pages…");
+      let lastRecordedPagePercent = -1;
+      const stopProgress = nextObject.subscribePagePreparationProgress(percentage => {
+        setPageLayoutProgress(percentage);
+        if (percentage !== null && Math.floor(percentage / 5) !== lastRecordedPagePercent) {
+          lastRecordedPagePercent = Math.floor(percentage / 5);
+          loadDiagnostics.checkpoint(activeLoadToken, "reader-pages-progress", undefined, undefined, {
+            percentage, pageCount: nextObject.pageCount
+          });
+        }
+      });
       try {
         initialLayout = createPageLayoutView(nextObject, await nextObject.getPages({ signal: controller.signal }));
         initialLayout.layout = "reader";
@@ -1789,10 +1821,15 @@ async function loadSource(
         console.warn("[Three Example] Reader page preparation failed; opening the grid instead.", error);
       } finally { stopProgress(); setPageLayoutProgress(null); }
     }
+    loadDiagnostics.checkpoint(activeLoadToken, "reader-pages-ready", nextObject, renderer, {
+      prepared: Boolean(initialLayout), pageCount: nextObject.pageCount
+    });
     controller.signal.throwIfAborted();
     if (activeLoadToken !== loadToken) return;
+    loadDiagnostics.checkpoint(activeLoadToken, "renderer-prepare-start");
     preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
     const submitRenderer = preparedBackend?.renderer ?? renderer;
+    loadDiagnostics.checkpoint(activeLoadToken, "renderer-ready");
     const submitCamera = camera.clone();
     submitCamera.coordinateSystem = backend === "webgpu" ? THREE.WebGPUCoordinateSystem : THREE.WebGLCoordinateSystem;
     submitCamera.updateProjectionMatrix();
@@ -1800,10 +1837,14 @@ async function loadSource(
     // while leaving the old document's camera and controls alone.
     if (initialLayout) applyReaderCameraView(getInitialReaderView(nextObject), nextObject, submitCamera);
     else fitCameraToObject(nextObject, true, submitCamera);
+    setLoadingProgress(true, "Preparing shaders and GPU resources…");
+    loadDiagnostics.checkpoint(activeLoadToken, "shader-compile-start");
     await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
+    loadDiagnostics.checkpoint(activeLoadToken, "shader-compile-ready", nextObject, submitRenderer);
     controller.signal.throwIfAborted();
     if (activeLoadToken !== loadToken) return;
     if (preparedBackend) {
+      loadDiagnostics.checkpoint(activeLoadToken, "preview-submit-start");
       const previewScene = new THREE.Scene();
       previewScene.add(nextObject);
       try {
@@ -1813,6 +1854,8 @@ async function loadSource(
       installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
       preparedBackend = null;
     }
+    setLoadingProgress(true, "Rendering first frame…");
+    loadDiagnostics.checkpoint(activeLoadToken, "first-frame-start");
     replacePdfObject(nextObject, { pageLayoutView: initialLayout });
     pendingObject = null;
     lastLoadedSource = source;
@@ -1823,14 +1866,21 @@ async function loadSource(
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
+    loadDiagnostics.checkpoint(activeLoadToken, "first-frame-ready", nextObject, renderer);
+    setLoadingProgress(true, "Warming rendering…");
+    loadDiagnostics.checkpoint(activeLoadToken, "warmup-start");
     await warmThreeRenderer(activeLoadToken, controller.signal);
     if (activeLoadToken !== loadToken) return;
+    loadDiagnostics.checkpoint(activeLoadToken, "warmup-ready");
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(totalLoadMs, lodTiming.elapsedMs, lodTiming.buildCount, firstSubmitMs, objectReadyMs);
     if (nextObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
     else clearLoadedStatus();
     updateSceneMetrics(nextObject);
+    loadDiagnostics.finish(activeLoadToken, "complete");
   } catch (error) {
+    loadDiagnostics.finish(activeLoadToken, controller.signal.aborted ? "cancelled" : "failed",
+      error instanceof Error ? error.message : String(error));
     if (activeLoadToken !== loadToken) {
       return;
     }
@@ -1871,6 +1921,14 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
   const readerSnapshot = reader.snapshot();
   const layoutSnapshot = activePageLayout;
   const objectOptions = readThreeObjectOptions();
+  loadDiagnostics.begin(activeLoadToken, {
+    operation: reparseSource ? "reparse" : "switch-backend",
+    document: filenameFromUrl(previousObject.sourceLabel, "document"),
+    backend: `three-${backend}`, previousBackend: `three-${previousBackend}`, threeRevision: THREE.REVISION,
+    initialPageLayout: layoutSnapshot, options: objectOptions, replacingDocument: true,
+    canvasPixels: [canvasElement.width, canvasElement.height]
+  });
+  loadDiagnostics.checkpoint(activeLoadToken, "previous-document", previousObject, renderer);
   let nextObject: HeprThreePdfObject | null = null;
   let preparedBackend: PreparedThreeRendererBackend | null = null;
   let targetInstalled = false;
@@ -1926,6 +1984,7 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
       vectorLodReservation
     );
     const objectReadyMs = performance.now() - loadStart;
+    loadDiagnostics.checkpoint(activeLoadToken, "object-ready", nextObject, renderer);
     const lodTiming = consumeVectorStrokeLodBuildTiming();
     if (activeLoadToken !== loadToken) {
       nextObject.dispose();
@@ -1933,9 +1992,12 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
       return;
     }
 
+    loadDiagnostics.checkpoint(activeLoadToken, "reader-pages-start");
+    setLoadingProgress(true, "Preparing page layout…");
     await layerControls.prepareReplacement(nextObject, controller.signal);
     controller.signal.throwIfAborted();
     const pageLayoutReplacement = await preparePageLayoutReplacement(nextObject, controller.signal);
+    loadDiagnostics.checkpoint(activeLoadToken, "reader-pages-ready", nextObject, renderer);
     controller.signal.throwIfAborted();
     updateLoadingProgress(activeLoadToken, {
       value: 1,
@@ -1945,9 +2007,11 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
     // Include shader preparation and the detached first submit in the upload
     // timing. Keep the old canvas displayed until its successor has a frame.
     const firstSubmitStart = performance.now();
+    loadDiagnostics.checkpoint(activeLoadToken, "renderer-prepare-start");
     preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
     controller.signal.throwIfAborted();
     const submitRenderer = preparedBackend?.renderer ?? renderer;
+    loadDiagnostics.checkpoint(activeLoadToken, "renderer-ready");
     // WebGPU updates camera clip conventions. A detached camera lets the old
     // renderer continue drawing while asynchronous compilation is pending.
     const submitCamera = camera.clone();
@@ -1960,9 +2024,13 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
     const previewScene = new THREE.Scene();
     previewScene.add(nextObject);
     try {
+      setLoadingProgress(true, "Preparing shaders and GPU resources…");
+      loadDiagnostics.checkpoint(activeLoadToken, "shader-compile-start");
       await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
+      loadDiagnostics.checkpoint(activeLoadToken, "shader-compile-ready", nextObject, submitRenderer);
       controller.signal.throwIfAborted();
       if (preparedBackend) {
+        loadDiagnostics.checkpoint(activeLoadToken, "preview-submit-start");
         prepareThreeRendererFrame(submitRenderer);
         submitRenderer.render(previewScene, submitCamera);
       }
@@ -1975,6 +2043,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
       installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
       preparedBackend = null;
     }
+    setLoadingProgress(true, "Rendering first frame…");
+    loadDiagnostics.checkpoint(activeLoadToken, "first-frame-start");
     replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement, layout: layoutSnapshot });
     targetInstalled = true;
     const installedObject = nextObject;
@@ -1986,8 +2056,12 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
     const firstSubmitMs = performance.now() - firstSubmitStart;
+    loadDiagnostics.checkpoint(activeLoadToken, "first-frame-ready", installedObject, renderer);
+    setLoadingProgress(true, "Warming rendering…");
+    loadDiagnostics.checkpoint(activeLoadToken, "warmup-start");
     await warmThreeRenderer(activeLoadToken, controller.signal);
     if (activeLoadToken !== loadToken) return;
+    loadDiagnostics.checkpoint(activeLoadToken, "warmup-ready");
     const totalLoadMs = performance.now() - loadStart;
     lastLoadTimingText = formatLoadTiming(
       totalLoadMs,
@@ -2001,7 +2075,10 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
     setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
     if (installedObject.sourceOptions?.ocrTextOnly) setStatus("Text-only view: pictures and diagrams are omitted. Pages without stored text are blank.");
     else clearLoadedStatus();
+    loadDiagnostics.finish(activeLoadToken, "complete");
   } catch (error) {
+    loadDiagnostics.finish(activeLoadToken, controller.signal.aborted ? "cancelled" : "failed",
+      error instanceof Error ? error.message : String(error));
     if (nextObject && currentPdfObject === nextObject) {
       targetInstalled = true;
       nextObject = null;
@@ -2460,6 +2537,7 @@ function updateLoadingProgress(token: number, progress: PDFLoadProgress): void {
   if (token !== loadToken) {
     return;
   }
+  loadDiagnostics.progress(token, progress);
   const stageLabel = formatLoadProgressStage(progress.stage);
   const value = Math.max(0, Math.min(1, Number(progress.value) || 0));
   setLoadingProgress(true, `${(value * 100).toFixed(2)}% ${stageLabel}`);

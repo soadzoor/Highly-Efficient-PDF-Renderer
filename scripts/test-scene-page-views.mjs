@@ -63,6 +63,12 @@ try {
     assert(scene.drawRuns.every(run=>run.clipIndex===1));
     assert.deepEqual([...scene.textIndex.pages[0].charInstance],[0]);
     assert.equal(scene.textInstanceB[2],0);assert.equal(scene.textInstanceB[3],1);
+    for (const key of ['textInstanceA','textInstanceC']) {
+      assert.equal(scene[key].buffer,source[key].buffer,'contiguous immutable page text shares document storage');
+      assert.equal(scene[key].byteOffset,source[key].byteOffset+page*16);
+      assert.equal(scene[key].length,4);
+    }
+    assert.notEqual(scene.textInstanceB.buffer,source.textInstanceB.buffer,'page-local clip remapping owns its text array');
     assert.equal(scene.textGlyphMetaA[0],0);assert.equal(scene.fillPathMetaA[0],0);
     for (const key of ['textGlyphMetaA','textGlyphMetaB','textGlyphSegmentsA','textGlyphSegmentsB'])
       assert.equal(scene[key],source[key],'pages share the immutable document glyph store and its atlas');
@@ -74,6 +80,28 @@ try {
     assert.equal(scene.rasterLayers[0].data,source.rasterLayers[page].data,'immutable image pixels are shared');
   }
   assert.deepEqual(source,canonical,'extraction never edits the source');
+  const unclipped={...source,textInstanceB:source.textInstanceB.slice(),textClipRects:undefined};
+  for(let i=3;i<unclipped.textInstanceB.length;i+=4)unclipped.textInstanceB[i]=0;
+  const unclippedPartition=new ScenePageViews(unclipped);
+  for(let page=0;page<2;page++)for(const key of ['textInstanceA','textInstanceB','textInstanceC']){
+    const local=unclippedPartition.extract(page).scene[key];
+    assert.equal(local.buffer,unclipped[key].buffer,'unclipped text shares every contiguous instance store');
+    assert.equal(local.byteOffset,unclipped[key].byteOffset+page*16);
+    assert.deepEqual(local,unclipped[key].slice(page*4,page*4+4));
+  }
+  const shortText={...unclipped,textInstanceA:unclipped.textInstanceA.slice(0,4)};
+  const padded=new ScenePageViews(shortText).extract(1).scene.textInstanceA;
+  assert.notEqual(padded.buffer,shortText.textInstanceA.buffer,'undersized stores keep the copying fallback');
+  assert.deepEqual([...padded],[0,0,0,0]);
+  const interleaved={...unclipped,pagePrimitiveRanges:undefined,pageTextRanges:Uint32Array.of(0,4,1,2),
+    textInstanceCount:4,sourceTextCount:4,textInPageCount:4,textIndex:null,drawRuns:undefined,clipPaths:undefined,paintGraph:undefined};
+  for(const key of ['textInstanceA','textInstanceB','textInstanceC'])interleaved[key]=f([...unclipped[key],...unclipped[key]]);
+  const scattered=new ScenePageViews(interleaved).extract(0);
+  assert.deepEqual([...scattered.primitives.text],[0,3],'legacy ownership can select noncontiguous text');
+  for(const key of ['textInstanceA','textInstanceB','textInstanceC']){
+    assert.notEqual(scattered.scene[key].buffer,interleaved[key].buffer,'noncontiguous text is compacted into private storage');
+    assert.deepEqual([...scattered.scene[key]],[...interleaved[key].subarray(0,4),...interleaved[key].subarray(12,16)]);
+  }
   const nested=composeVectorScenesInGrid([source,source],2);
   assert.equal(nested.pageCount,4);validatePagePrimitiveRanges(nested);
   assert.equal(composeVectorScenesInGrid([nested],1).pageCount,4);
@@ -103,5 +131,5 @@ try {
   }finally{console.warn=warn;}
   assert.equal(warnings.length,1,'ambiguous legacy ownership is diagnosed once');
   assert.match(warnings[0],/1 stroke\/fill primitive\(s\) reach past their nearest page/);
-  console.log('Scene page views: all paint kinds, exact ownership, compact references, clips/graphs, annotations, source preservation and HEP round trip passed.');
+  console.log('Scene page views: all paint kinds, shared contiguous text, compact references, clips/graphs, annotations, source preservation and HEP round trip passed.');
 }finally{hooks.deregister();}

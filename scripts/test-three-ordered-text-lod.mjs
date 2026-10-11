@@ -53,11 +53,18 @@ try {
   const canonical = structuredClone(scene);
   function create(backend, mode, data = scene) {
     const plan = new ThreeVectorDrawPlan(data);
-    const options = { drawPlan: plan,materialBackend: backend, webGpu,colorCompositing: "display",strokeCurveEnabled: true,
+    const options = { sourceScene: data,drawPlan: plan,materialBackend: backend, webGpu,colorCompositing: "display",strokeCurveEnabled: true,
       textVectorOnly: true,vectorOverride: [0,0,0,0],pageBackground: [1,1,1,1],rasterAtlasGlyphCount: data.textGlyphCount };
     const lod = ThreeTextLodLayer.create(data, sceneRequiresPaintCompositing(data) ? "off" : mode);
-    const text = new ThreeMaterialTextLayer(lod.getRenderScene(), options);
+    const payload = lod.getRenderScene();
+    const text = new ThreeMaterialTextLayer(payload, options);
     lod.releaseRenderSceneReference();
+    assert.equal(text.orderedRuns.scene,data,"paint batches must retain canonical metadata instead of temporary combined Text LOD instance arrays");
+    assert.equal(text.orderedRuns.visibility.scene,data,"paint visibility must not retain the combined payload either");
+    if (payload !== data) {
+      assert.notEqual(payload.textInstanceA,data.textInstanceA,"the residency regression must exercise an allocated combined payload");
+      assert.equal(lod.renderScene,null,"the LOD adapter must release its own temporary payload reference");
+    }
     let viewState = { zoom: .02,cameraCenterX: 250,cameraCenterY: 120 };
     const native = new Proxy({ getViewState: () => viewState,getPresentedViewState: () => viewState,hasUploadedScene: () => false,
       setViewState: value => { viewState = value; },getPresentedFrameSerial: () => 0,
@@ -114,6 +121,8 @@ try {
         const previous = object.textMaterialLayer;
         object.setTextLodMode("auto"); frame();
         assert.notEqual(object.textMaterialLayer,previous,"Off-to-Auto installs the combined material lazily");
+        assert.equal(object.textMaterialLayer.orderedRuns.scene,scene,"lazy materials also release the combined payload through canonical paint metadata");
+        assert.equal(object.textMaterialLayer.orderedRuns.visibility.scene,scene);
       }
       const selected = object.getTextInstanceStats().rendered;
       assert(selected > 0 && selected < count / 10, `${backend}/${mode}: ordered text uses LOD`);

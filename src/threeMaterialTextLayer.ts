@@ -32,6 +32,8 @@ import type { ThreeColorCompositing } from "./threeWebGpuColorSpace";
 import type { ViewState } from "./webGlFloorplanRenderer";
 
 interface TextLayerOptions {
+  /** Canonical paints must not retain the temporary combined Text LOD arrays. */
+  sourceScene?: VectorScene;
   pageTransforms?: ThreePageTransforms;
   drawPlan?: ThreeVectorDrawPlan;
   materialBackend?: "webgl" | "webgpu";
@@ -308,7 +310,7 @@ export class ThreeMaterialTextLayer {
       this.mesh = new THREE.Mesh(geometry, material);
       this.mesh.frustumCulled = false;
       this.mesh.renderOrder = HEPR_THREE_LAYER_ORDER_TEXT;
-      this.orderedRuns = ThreeVectorDrawRuns.create(scene, "text", this.mesh, "aTextInstanceIndex", options.drawPlan);
+      this.orderedRuns = ThreeVectorDrawRuns.create(options.sourceScene ?? scene, "text", this.mesh, "aTextInstanceIndex", options.drawPlan);
     } catch (error) {
       clips.release();
       throw error;

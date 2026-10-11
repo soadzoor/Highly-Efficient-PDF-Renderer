@@ -1566,7 +1566,10 @@ async function testThreeBackendReplacement() {
 
 function demoHost() {
   return {
-    performance, AbortController, waitForLoad,
+    performance, AbortController, waitForLoad, URLSearchParams,
+    window: { location: { search: "" } }, canvasElement: { width: 800, height: 600 },
+    filenameFromUrl: (source) => source,
+    loadDiagnostics: { begin: noop, checkpoint: noop, progress: noop, finish: noop },
     loadedCompressScansPreference: false, compressScansCheckboxElement: { checked: false },
     annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop }, annotationInteraction: null,
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,

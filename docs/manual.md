@@ -646,7 +646,60 @@ times need that flag. The Three example on WebGPU uses Three's own timestamps:
 its `gpu.frameMs` is the sum of the frame's render passes, without the gaps
 between them.
 
-The Three example also exposes `heprPerf`. Reports with
+For loading stalls or tab reloads in the Three example, expand **Settings**,
+enable **Record loading diagnostics** before opening the document, then tap
+**Copy load report**. **Show load report** exposes selectable text if clipboard
+access is unavailable. Alternatively, open `three-example.html?loadDiagnostics=1`
+to enable recording for that page load. After an unexpected reload, return to
+Settings and copy the recovered report; a retry includes the previous attempt.
+The console equivalents are `heprLoad.report()` and `heprLoad.json()`.
+
+Reports with `capture.uiVersion: 2` also include the current checkbox state,
+whether recording was enabled at the last load hook, the number of load-hook
+calls, and current viewer/loading state. Show/copy feedback identifies reports
+without load checkpoints explicitly. These fields help diagnose an empty report
+without attributing it to a crash or memory exhaustion. Enabling diagnostics
+during a load arms the next load; reopen the document to capture it from the start.
+
+These opt-in reports include parsing progress, Reader page preparation, shader
+compilation, first submission, warm-up, and browser error or device-loss events.
+Resource snapshots count deduplicated CPU backing buffers and estimate exposed
+geometry/texture payloads, including dormant owned layers, without reading pixels
+or querying the GPU. GPU byte estimates describe the footprint if these resources
+are uploaded, rather than current GPU allocations. They omit
+JavaScript objects, strings, workers, driver memory, render targets and some
+WebGPU-private resources. `jsHeap` is null when the browser does not expose heap
+statistics. Resource scan time is recorded as `snapshotMs`; saving checkpoints
+also adds overhead. Times include async
+waits and command submission; they do not measure GPU execution.
+
+Checkpoints are saved in this tab's session storage on phase changes and at
+throttled progress intervals; the report says when storage is unavailable.
+Recovery is best effort: an interrupted record does not prove a crash or memory
+exhaustion. Reports include the file name, browser and settings, without document
+text or pixels. Recording is disabled by default and checking the box arms the
+next load; use the URL option to keep it enabled after reload.
+
+To isolate initial Reader preparation, compare the same document/backend with
+`three-example.html?loadDiagnostics=1&initialLayout=grid`. This diagnostic option
+starts in Grid and avoids creating all independent page views and shared page
+batches during loading. Changing to Reader later still prepares them. Reader is
+the normal multipage default.
+
+Reader page views reuse contiguous canonical text buffers; clip-index remapping
+keeps a private copy where needed. Shader preparation follows the rendering path
+selected by the current page transforms and appearance, including page overlays.
+For compatible static documents, page handles retain transforms, picking and
+interaction state without allocating independent paint textures or materials.
+Shared page batches also release the dormant original document materials.
+Independent rendering constructs the required materials synchronously before
+the page's first frame, replaying current appearance and layer settings; returning
+to the canonical document layout reconstructs its original materials as needed.
+Changing layouts or page appearance can therefore add preparation on first use.
+Streaming documents and documents requiring paint compositing keep their existing
+preparation path.
+
+The Three example also exposes `heprPerf` for render captures. Reports with
 `context.diagnosticsVersion: 3` include the source kind (PDF/HEP), scene
 geometry/clip/raster counts, transparency-group structure, Three revision,
 browser and shader-error-check setting. These describe the loaded scene, without

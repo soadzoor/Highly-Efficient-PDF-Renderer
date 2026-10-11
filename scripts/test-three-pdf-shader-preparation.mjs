@@ -14,6 +14,7 @@ globalThis.document = { createElement: () => ({ width: 1, height: 1, style: {}, 
 
 try {
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
+  const { composeVectorScenesInGrid } = await import("../src/pdfVectorExtractor.ts");
   const { createThreePdfObject } = await import("../src/threePdfObject.ts");
   for (const backend of ["webgl", "webgpu"]) {
     const scene = fixture(buildStrokeScene);
@@ -191,11 +192,127 @@ try {
       "independent page presentation compiles with its projected page-plane depth");
     assert.equal(pages[0].paintCompositor.surfaces.size, 0);
     multi.dispose(); pageTarget.dispose();
+
+    const plainPage = fixture(buildStrokeScene);
+    delete plainPage.paintGraph;
+    const shared = await createThreePdfObject({ scene: composeVectorScenesInGrid([plainPage, plainPage], 2),
+      sourceLabel: "shared page shader preparation", sourceKind: "scene" },
+      { rendererType: backend, vectorLod: "off", textLod: "off", threeColorCompositing: "display" },
+      undefined, undefined, () => native, undefined, async () => {});
+    const sharedScene = new THREE.Scene(); sharedScene.add(shared);
+    const sharedPages = await shared.getPages();
+    sharedPages[1].position.z = 1;
+    const sharedCamera = new THREE.OrthographicCamera(-40, 40, 20, -20, 0.1, 100);
+    sharedCamera.coordinateSystem = camera.coordinateSystem;
+    sharedCamera.position.z = 30; sharedCamera.updateProjectionMatrix();
+    const sharedHost = makeHost(backend), sharedTarget = sharedHost.target;
+    const compiledShared = new Set(), calls = { batch: 0, pages: 0 };
+    const batch = shared.pageBatch, originalBatchCompile = batch.compileForThreeRenderer;
+    batch.compileForThreeRenderer = function(...args) {
+      calls.batch++;
+      return originalBatchCompile.apply(this, args);
+    };
+    for (const page of sharedPages) {
+      const original = page.compileForThreeRenderer;
+      page.compileForThreeRenderer = function(...args) {
+        calls.pages++;
+        return original.apply(this, args);
+      };
+    }
+    sharedHost.compileAsync = async function(scene) {
+      assert.equal(this.renders, 0, "selecting a page compilation path never submits a draw");
+      this.compiles.push({ target: this.target });
+      for (const mesh of scene.children) {
+        mesh.onBeforeRender(); mesh.onAfterRender();
+        compiledShared.add(shaderSignature(mesh, backend));
+      }
+    };
+    await shared.compileForThreeRenderer(sharedHost, sharedCamera);
+    assert.deepEqual(calls, { batch: 1, pages: 0 }, "transformed pages prepare only the selected shared content");
+    assert.equal(sharedHost.compiles.length, 1, "shared content compiles in one host call");
+    assert(sharedPages.every(page => !page.materialPipelineActive), "unused independent content stays dormant");
+    assert.equal(sharedHost.target, sharedTarget);
+    shared.prepareFrameForThreeRenderer(sharedHost, sharedCamera);
+    assert.equal(shared.getPageBatchingStats().mode, "pages-batched");
+    assertPreparedVisibleMeshes(shared, compiledShared, backend);
+
+    // Shared paints keep per-page overlays, whose programs must also be warm.
+    const bounds = sharedPages[0].sceneData.pageBounds;
+    sharedPages[0].setTextSelectionHighlights([{ minX: bounds.minX + 1, minY: bounds.minY + 1,
+      maxX: bounds.minX + 2, maxY: bounds.minY + 2 }]);
+    sharedPages[0].setSelection([{ kind: "stroke", index: 0 }]);
+    calls.batch = calls.pages = 0; sharedHost.compiles.length = 0; compiledShared.clear();
+    await shared.compileForThreeRenderer(sharedHost, sharedCamera);
+    assert.deepEqual(calls, { batch: 1, pages: 0 }, "page overlays do not prepare dormant page content");
+    assert.equal(sharedHost.compiles.length, 2, "page overlays compile together after shared content");
+    shared.prepareFrameForThreeRenderer(sharedHost, sharedCamera);
+    assertPreparedVisibleMeshes(shared, compiledShared, backend);
+
+    // A different page appearance needs independent content on the first frame.
+    sharedPages[0].setVectorColorOverride(1, 0, 0, 1);
+    calls.batch = calls.pages = 0; sharedHost.compiles.length = 0; compiledShared.clear();
+    await shared.compileForThreeRenderer(sharedHost, sharedCamera);
+    assert.deepEqual(calls, { batch: 0, pages: 2 }, "appearance fallback prepares only independent content");
+    assert.equal(sharedHost.target, sharedTarget);
+    shared.prepareFrameForThreeRenderer(sharedHost, sharedCamera);
+    assert.equal(shared.getPageBatchingStats().mode, "pages-separate");
+    assert.equal(shared.getPageBatchingStats().reason, "page-appearance");
+    assertPreparedVisibleMeshes(shared, compiledShared, backend);
+
+    sharedPages[0].setVectorColorOverride(0, 0, 0, 0);
+    sharedPages[1].position.copy(sharedPages[0].position);
+    calls.batch = calls.pages = 0;
+    await shared.compileForThreeRenderer(sharedHost, sharedCamera);
+    assert.deepEqual(calls, { batch: 0, pages: 2 }, "coplanar overlap also prepares independent content only");
+    assert.equal(shared.pageBatchReason, "overlapping-page-paints");
+    const cancelledPages = new AbortController(), pageAbortReason = new Error("cancelled page shader preparation");
+    cancelledPages.abort(pageAbortReason);
+    await assert.rejects(shared.compileForThreeRenderer(sharedHost, sharedCamera, cancelledPages.signal), error => error === pageAbortReason);
+    assert.equal(shared.shaderPreparations, 0, "page preparation releases the owner's streaming guard");
+
+    // A caller can dispose while the host's non-cancellable compiler drains,
+    // even without an AbortSignal. Cleared page handles must not be revisited.
+    sharedPages[1].position.x += 20; sharedPages[1].position.z = 1;
+    let finishDisposedCompile, disposedCompileScene, disposedCompileCalls = 0, notifyDisposedCompile;
+    const disposedCompileStarted = new Promise(resolve => { notifyDisposedCompile = resolve; });
+    sharedHost.compileAsync = function(scene) {
+      disposedCompileCalls++;
+      disposedCompileScene = scene;
+      assert.equal(this.target, sharedTarget);
+      const compiling = new Promise(resolve => { finishDisposedCompile = resolve; });
+      notifyDisposedCompile();
+      return compiling;
+    };
+    const disposalPending = shared.compileForThreeRenderer(sharedHost, sharedCamera);
+    await waitForCompilationStart(disposedCompileStarted, disposalPending);
+    assert.equal(shared.shaderPreparations, 2, "the owner and shared batch hold preparation until the host finishes");
+    shared.dispose();
+    assert.equal(shared.pageViews, null);
+    finishDisposedCompile();
+    await disposalPending;
+    assert.equal(disposedCompileCalls, 1, "disposed page overlays are not compiled");
+    assert.equal(disposedCompileScene.children.length, 0, "disposed preparation clears its borrowed stand-ins");
+    assert.equal(shared.shaderPreparations, 0, "disposal still releases both preparation guards");
+    assert.equal(sharedHost.renders, 0);
+    assert.equal(sharedHost.target, sharedTarget);
+    assert.equal(sharedHost.cube, 2); assert.equal(sharedHost.mip, 3);
+    assert.equal(sharedHost.xr.enabled, true); assert.equal(sharedHost.lighting.enabled, true);
+    sharedTarget.dispose();
   }
   console.log("Three PDF shader preparation: inert paint/presentation compilation, restored host state, first-frame shader coverage, deferred native resources and no-op compatibility passed.");
 } finally {
   globalThis.document = previousDocument;
   hooks.deregister();
+}
+
+function assertPreparedVisibleMeshes(object, compiled, backend) {
+  let count = 0;
+  object.traverseVisible(mesh => {
+    if (!mesh.isMesh || mesh.geometry.instanceCount === 0) return;
+    count++;
+    assert(compiled.has(shaderSignature(mesh, backend)), `${backend}: active page/overlay shaders were prepared before the first frame`);
+  });
+  assert(count > 0, "the prepared path contains visible meshes");
 }
 
 function fixture(buildStrokeScene) {
@@ -239,6 +356,7 @@ function makeHost(backend) {
     target: new THREE.RenderTarget(64, 48), cube: 2, mip: 3,
     viewport: new THREE.Vector4(0, 0, 64, 48), scissor: new THREE.Vector4(0, 0, 64, 48), scissorTest: false,
     clearColor: new THREE.Color(), clearAlpha: 1, autoClear: true, xr: { enabled: true }, lighting: { enabled: true },
+    domElement: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 64, height: 48 }) },
     renders: 0, compiles: [],
     getRenderTarget() { return this.target; },
     setRenderTarget(target, cube = 0, mip = 0) { this.target = target; this.cube = cube; this.mip = mip; },

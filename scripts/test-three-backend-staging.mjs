@@ -17,6 +17,7 @@ for (const outcome of ["ready", "cancelled", "failed"]) {
     rejectInitialization = reject;
   });
   let nextRenderer;
+  let monitoredRenderers = 0;
   const previousCanvas = {
     width: 1600, height: 1200, clientWidth: 800, clientHeight: 600,
     cloneNode: () => ({ width: 0, height: 0, classList: { remove: noop } }),
@@ -43,6 +44,12 @@ for (const outcome of ["ready", "cancelled", "failed"]) {
     configureThreeRenderer: (target) => {
       target.viewport = [previousCanvas.clientWidth, previousCanvas.clientHeight];
     },
+    loadDiagnostics: { monitorRenderer: (target, canvas) => {
+      assert.equal(target, nextRenderer);
+      assert.equal(canvas, target.domElement);
+      assert.equal(target._initialized, true, "Monitor a replacement only after its device is initialized");
+      monitoredRenderers++;
+    } },
     stopThreeInternalAnimationLoop: () => events.push("internal animation stopped"),
     activeThreeRendererBackend: "webgl", canvasElement: previousCanvas,
     renderer: previousRenderer, controls: { target: previousTarget, dispose: () => events.push("controls disposed") },
@@ -98,6 +105,7 @@ for (const outcome of ["ready", "cancelled", "failed"]) {
     assert.deepEqual(events, outcome === "cancelled"
       ? ["internal animation stopped", "next renderer disposed"] : ["next device destroyed"]);
   }
+  assert.equal(monitoredRenderers, outcome === "failed" ? 0 : 1);
 }
 
 // Initial preparation and presentation must use the same fit, including the

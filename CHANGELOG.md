@@ -6,6 +6,33 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in loading diagnostics to the Three demo, with copyable phase timings,
+  CPU buffer and partial GPU resource estimates, error/device-loss events, and
+  best-effort checkpoint recovery after a tab reload. Use Settings or
+  `?loadDiagnostics=1`; `&initialLayout=grid` enables a comparison that skips
+  initial Reader page preparation. Reports include recorder and viewer state
+  even when no load checkpoints were captured; show/copy feedback identifies
+  empty captures explicitly.
+
+### Fixed
+
+- Release temporary combined Text LOD arrays after Three material construction
+  instead of retaining them through paint batching and visibility. This reduces
+  memory pressure when opening large text documents in WebGL and WebGPU.
+- Reuse canonical text buffers for contiguous page views, retaining private
+  clip-index arrays when remapping is needed. This reduces Reader memory use
+  without changing page content or appearance overrides.
+- Reduce Three Reader startup memory and preparation by keeping compatible
+  static pages' independent materials lazy and releasing dormant document
+  materials when shared page batches take over. Compile only the selected
+  rendering path; preserve overlays and initialize independent materials when
+  page appearance, layout or host capabilities require them. Streaming and
+  composited documents retain their existing preparation path.
+- Show Reader preparation, shader/resource preparation, first-frame and warm-up
+  stages separately in the Three demo's loading indicator.
+
 ## [0.1.59] - 2026-10-11
 
 ### Changed
