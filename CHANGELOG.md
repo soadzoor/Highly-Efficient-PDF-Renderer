@@ -6,6 +6,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+## [0.1.57] - 2026-10-11
+
 ### Added
 
 - Render embedded PFA/PFB Type1 glyph outlines with their original encodings,
@@ -55,4 +57,5 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   shadings, and physical press calibration are tracked in the
   [follow-up checklist](docs/development.md#font-local-postscript-follow-ups).
 
-[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.56...HEAD
+[Unreleased]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.57...HEAD
+[0.1.57]: https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/compare/v0.1.56...v0.1.57
