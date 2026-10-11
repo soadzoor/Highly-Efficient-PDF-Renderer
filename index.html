@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
-    <script type="module" crossorigin src="./assets/main-DfDg4xD1.js"></script>
+    <script type="module" crossorigin src="./assets/main-DH7VvsUL.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/preload-helper-uBIymjUX.js">
     <link rel="modulepreload" crossorigin href="./assets/annotationData-DX6uTWLN.js">
     <link rel="modulepreload" crossorigin href="./assets/optionalContentData-CFyj-zla.js">
@@ -22,17 +22,23 @@
     <link rel="modulepreload" crossorigin href="./assets/vectorFillBandShaders-CRyg2aoB.js">
     <link rel="modulepreload" crossorigin href="./assets/searchHighlights-BcDDvv0x.js">
     <link rel="modulepreload" crossorigin href="./assets/webGlFloorplanRenderer-D87BFin0.js">
-    <link rel="modulepreload" crossorigin href="./assets/readerViewport-C5TU7My6.js">
+    <link rel="modulepreload" crossorigin href="./assets/readerViewport-wsDKqQ9Y.js">
     <link rel="stylesheet" crossorigin href="./assets/drawCallMetrics-DWXyxfIy.css">
-    <link rel="stylesheet" crossorigin href="./assets/readerViewport-Ce9_6ZpF.css">
-    <link rel="stylesheet" crossorigin href="./assets/main-BAR12hs7.css">
+    <link rel="stylesheet" crossorigin href="./assets/readerViewport-CE-CU39s.css">
+    <link rel="stylesheet" crossorigin href="./assets/main-C1SAtTi7.css">
   </head>
   <body>
     <canvas id="viewport"></canvas>
     <div id="hud" class="panel">
       <div class="panel-header">
-        <div class="toolbar">
-          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.1.58</a>
+        <h2 class="panel-title">Settings</h2>
+        <button id="toggle-hud" class="settings-close" type="button" aria-expanded="true" aria-controls="hud-content" aria-label="Close settings" title="Close settings">
+          <span id="toggle-hud-icon" aria-hidden="true">×</span> Close
+        </button>
+      </div>
+      <div id="hud-content" class="panel-content">
+        <div class="toolbar startup-controls">
+          <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v0.1.59</a>
           <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
           <div id="example-dropdown" class="example-dropdown">
             <button id="example-select" class="example-trigger" type="button" aria-label="Load example PDF or HEP file" aria-haspopup="true" aria-expanded="false" aria-controls="example-menu" disabled>
@@ -41,16 +47,13 @@
             </button>
             <div id="example-menu" class="example-menu" hidden></div>
           </div>
+        </div>
+        <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
+        <div class="toolbar settings-downloads">
           <button id="download-data" type="button" hidden disabled>Download HEP</button>
           <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
           <button id="download-all-data" type="button" hidden disabled>Download All Example HEP Files</button>
-          <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
         </div>
-        <button id="toggle-hud" class="chevron-button" type="button" aria-expanded="true" aria-controls="hud-content" title="Collapse panel">
-          <span id="toggle-hud-icon" aria-hidden="true">▾</span>
-        </button>
-      </div>
-      <div id="hud-content" class="panel-content">
         <div class="number-row search-row">
           <label for="text-search-input">Find Text</label>
           <div class="search-controls">
