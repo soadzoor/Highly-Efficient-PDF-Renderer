@@ -69,6 +69,12 @@
 .reader-toolbar .example-dropdown { position: relative; }
 .reader-toolbar .example-menu { max-height: min(60vh, 440px); }
 .reader-toolbar .example-trigger { max-width: 200px; }
+.reader-toolbar .example-trigger:hover:not(:disabled) {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+}
+.reader-toolbar .example-trigger-count { background: #e2e8f0; color: #334155; }
+.reader-toolbar .example-trigger-chevron { color: #475569; }
 
 .reader-workspace { position: relative; display: flex; flex: 1; min-height: 0; min-width: 0; }
 .reader-scroll { position: relative; flex: 1; min-width: 0; overflow: hidden; outline-offset: -2px; }

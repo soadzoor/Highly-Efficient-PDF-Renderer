@@ -55,10 +55,10 @@ function makeScene(runs, fallback = false) {
   };
 }
 
-function withSelection(scene, check) {
+function withSelection(scene, check, options = {}) {
   const host = installSelectionTestHost();
   let highlights;
-  const controller = createTextSelectionController({ getCanvas: () => host.canvas, adapter: {
+  const controller = createTextSelectionController({ ...options, getCanvas: () => host.canvas, adapter: {
     getScene: () => scene,
     clientToScenePoint: (x, y) => ({ x, y }), sceneToClientPoint: (x, y) => ({ x, y }),
     setSelectionHighlights: rects => { highlights = rects; }
@@ -196,4 +196,67 @@ const rows = makeScene([
 checkDrag(rows, 5, 4, "Header Body", 2);
 checkDrag(rows, 0, rows.textIndex.pages[0].text.length, "Body Footer", 2);
 
-console.log("text selection title-block fields, joined runs, partial/reverse drags, words and visual reading order passed");
+// Text owns mouse/pen pointer events so dragging cannot pan the camera, but a
+// plain click still needs to reach annotation picking for links over text.
+const linkText = makeScene([{ text: "Chapter IX", x: 20, y: 100, height: 10 }]);
+const linkPoint = point(linkText, 0, 0.1);
+for (const pointerType of ["mouse", "pen"]) {
+  const clicks = [];
+  withSelection(linkText, (host, controller) => {
+    const down = host.pointer("pointerdown", ...linkPoint, { pointerType });
+    const up = host.pointer("pointerup", ...linkPoint, { pointerType });
+    assert(down.propagationStopped && up.propagationStopped, "text clicks must keep camera gestures blocked");
+    assert.deepEqual(clicks, [{ x: linkPoint[0], y: linkPoint[1] }], "plain text clicks must be available to annotation picking");
+    assert.equal(controller.getSelectedText(), "");
+    assert.equal(controller.isGestureActive(), false);
+  }, { onTextClick: p => clicks.push(p) });
+  const mixedClicks = [];
+  withSelection(linkText, (host) => {
+    host.pointer("pointerdown", ...linkPoint, { pointerType });
+    host.pointer("pointerdown", ...linkPoint, { pointerType: "touch", pointerId: 2 });
+    host.pointer("pointerup", ...linkPoint, { pointerType });
+    host.pointer("pointerup", ...linkPoint, { pointerType: "touch", pointerId: 2 });
+    assert.deepEqual(mixedClicks, [], "an additional pointer must cancel text link activation");
+  }, { onTextClick: p => mixedClicks.push(p) });
+}
+
+for (const gesture of ["drag", "returning drag", "moved release", "long hold", "cancel", "disabled", "touch tap"]) {
+  const clicks = [];
+  withSelection(linkText, (host, controller) => {
+    const options = gesture === "touch tap" ? { pointerType: "touch" } : {};
+    const down = host.pointer("pointerdown", ...linkPoint, options);
+    let end = linkPoint;
+    if (gesture.includes("drag")) {
+      end = point(linkText, 6, 0.9);
+      host.pointer("pointermove", ...end);
+      if (gesture === "returning drag") {
+        end = linkPoint;
+        host.pointer("pointermove", ...end);
+      }
+    }
+    if (gesture === "moved release") end = [linkPoint[0] + 5, linkPoint[1]];
+    if (gesture === "long hold") host.advanceTime(451);
+    if (gesture === "disabled") controller.disable();
+    host.pointer(gesture === "cancel" ? "pointercancel" : "pointerup", ...end, options);
+    assert.deepEqual(clicks, [], `${gesture} must not activate a text link`);
+    if (gesture === "drag") assert.equal(controller.getSelectedText(), "Chapter");
+    if (gesture === "touch tap") assert.equal(down.propagationStopped, false, "annotation picking already receives touch taps");
+  }, { onTextClick: p => clicks.push(p) });
+}
+
+const wordClicks = [];
+withSelection(linkText, (host, controller) => {
+  host.pointer("pointerdown", ...linkPoint);
+  host.pointer("pointerup", ...linkPoint);
+  host.pointer("pointerdown", ...linkPoint);
+  host.pointer("pointerup", ...linkPoint);
+  assert.equal(controller.getSelectedText(), "Chapter", "double click must still select a word");
+  assert.equal(wordClicks.length, 1, "word selection must not forward the second click");
+  const rightDown = host.pointer("pointerdown", ...linkPoint, { button: 2 });
+  assert(rightDown.propagationStopped, "right click on a selection must still block camera gestures");
+  host.pointer("pointerup", ...linkPoint, { button: 2 });
+  assert.equal(controller.getSelectedText(), "Chapter", "right click must preserve text selection");
+  assert.equal(wordClicks.length, 1, "right click must not activate a link");
+}, { onTextClick: p => wordClicks.push(p) });
+
+console.log("text selection title-block fields, joined runs, partial/reverse drags, words, visual reading order and annotation clicks passed");

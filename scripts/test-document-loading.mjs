@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import vm from "node:vm";
 import { createLoadProgressReporter } from "../src/loadProgress.ts";
 import { waitForLoad } from "../src/loadCancellation.ts";
@@ -21,6 +22,7 @@ const exports = [];
 const statuses = [];
 const downloads = [];
 const exportProgress = [];
+const loaderProgress = [];
 const completeParses = [];
 const hepPrompts = [];
 let exportWarning = null;
@@ -59,7 +61,10 @@ const context = vm.createContext({
   setDownloadPdfButtonState: noop, setDownloadDataButtonState: noop,
   setDownloadAllDataButtonState: noop, setPrimaryLoadControlsEnabled: noop,
   setParsingLoader: visible => nativeLoadEvents.push({ event: visible ? "loading" : "ready", id: uploadedScene?.id }),
-  setMetricPlaceholder: noop, updateParsingLoaderProgress: event => exportProgress.push(event.value),
+  setMetricPlaceholder: noop, updateParsingLoaderProgress: event => {
+    exportProgress.push(event.value);
+    loaderProgress.push(event);
+  },
   logSegmentMergeStats: noop, logInvisibleCullStats: noop, logTextVectorStats: noop,
   logTextureSizeStats: noop, applyTextSearchScene: noop, refreshDropIndicator: noop,
   layerVisibility: { rendererChanged: noop }, textSelection: { refreshHighlights: noop },
@@ -131,6 +136,7 @@ for (const name of [
   "reloadPdfViewingOptions"
 ]) vm.runInContext(sourceFunction(source, name), context);
 
+await testNativeVectorLodProgress();
 await context.loadPdfFile(file("A.pdf", 65));
 assertDocument(65, "A.pdf");
 const originalCache = context.parsedPdfPageCache;
@@ -203,6 +209,14 @@ assert.equal(exports.at(-1).source, undefined);
 assert.equal(context.pendingSourceLoadCount, 0);
 assert.equal(context.activeSceneLoadToken, null);
 assert.equal(context.sourceLoadController, null);
+// HEP orchestration must leave Vector LOD announcements to the eligibility-aware helper.
+const beforeTextHepProgress = loaderProgress.length;
+nextParse = async () => [{ ...scene(77), segmentCount: 0, textInstanceCount: 20 }];
+await context.loadHepFile(file("text-only.hep", 77));
+assert.equal(context.lastParsedScene.id, 77);
+assert.equal(loaderProgress.slice(beforeTextHepProgress).some(event => event.stage.startsWith("vector-lod")), false,
+  "text-only HEP loading never announces a Vector LOD build before the helper checks eligibility");
+nextParse = async (buffer) => [scene(new Uint8Array(buffer)[0])];
 // A page window completes the original document once, never exporting just cached previews.
 let demandClosed = false, demandPaused = false, completePageLoads = 0, demandResumes = 0;
 const completePages = Array.from({ length: 17 }, () => ({ ...scene(73), complete: true }));
@@ -328,6 +342,69 @@ await testRoomDocumentReplacement();
 await testNativeBackendLoading();
 testNativePageDemandFrames();
 console.log("Document replacement, export ownership, upload rollback, and superseded-load cancellation passed.");
+
+async function testNativeVectorLodProgress() {
+  const hooks = registerHooks({ resolve(specifier, context, next) {
+    return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)
+      ? `${specifier}.ts` : specifier, context);
+  } });
+  let core;
+  try { core = await import("../src/vectorStrokeLodCore.ts"); }
+  finally { hooks.deregister(); }
+  const { shouldUseVectorStrokeLod, VECTOR_STROKE_LOD_MIN_SEGMENTS: threshold } = core;
+  const events = [], builds = [];
+  let mode = "auto", backend = "webgl", stored = false, resets = 0, consumes = 0;
+  const host = vm.createContext({
+    shouldUseVectorStrokeLod, loadToken: 7,
+    uiControlManager: { readVectorLodModeInput: () => mode },
+    backendSwitcher: { getActiveBackend: () => backend },
+    hasStoredVectorStrokeLod: () => stored,
+    resetVectorStrokeLodBuildTiming: () => resets++,
+    consumeVectorStrokeLodBuildTiming: () => { consumes++; return timing; },
+    prebuildVectorStrokeLodRuntime: async (...args) => { builds.push(args); },
+    LOAD_PROGRESS_VECTOR_LOD_START: .38, LOAD_PROGRESS_VECTOR_LOD_END: .7
+  });
+  vm.runInContext(sourceFunction(source, "prebuildVectorLodForScene"), host);
+  const progress = { report: (value, detail) => events.push({ value, ...detail }) };
+  for (const [nextMode, segmentCount] of [["auto", 0], ["force", 0], ["off", threshold], ["auto", threshold - 1]]) {
+    mode = nextMode;
+    events.length = builds.length = 0;
+    const beforeReset = resets, beforeConsume = consumes;
+    assert.equal(await host.prebuildVectorLodForScene({ segmentCount, textInstanceCount: 1000 }, progress, "pdf", 7), timing);
+    assert.equal(events.length, 0, `${mode} with ${segmentCount} strokes does not announce Vector LOD`);
+    assert.equal(builds.length, 0, `${mode} with ${segmentCount} strokes skips Vector LOD preparation`);
+    assert.equal(resets, beforeReset + 1, "skipped scenes clear stale timing from previous builds");
+    assert.equal(consumes, beforeConsume + 1);
+  }
+  for (const [nextMode, segmentCount, nextBackend, nextStored, sourceType] of [
+    ["force", 1, "webgl", false, "pdf"], ["auto", threshold, "webgpu", false, "pdf"],
+    ["auto", threshold, "webgl", true, "hep"]
+  ]) {
+    mode = nextMode; backend = nextBackend; stored = nextStored;
+    events.length = builds.length = 0;
+    host.loadToken = 7;
+    const controller = new AbortController(), value = { segmentCount };
+    await host.prebuildVectorLodForScene(value, progress, sourceType, 7, controller.signal);
+    const stage = stored ? "vector-lod-restore" : "vector-lod";
+    assert.deepEqual(events, [{ value: .38, stage, sourceType }]);
+    assert.equal(builds.length, 1);
+    const [builtScene, builtMode, builtBackend, options] = builds[0];
+    assert.equal(builtScene, value);
+    assert.equal(builtMode, mode);
+    assert.equal(builtBackend, backend);
+    assert.equal(options.signal, controller.signal);
+    assert.equal(options.shouldCancel(), false);
+    options.onProgress({ value: .5 });
+    assert.deepEqual(events.at(-1), { value: .54, stage, sourceType }, "build progress retains its stage and source metadata");
+    host.loadToken++;
+    assert.equal(options.shouldCancel(), true, "superseded loads cancel preparation");
+    options.onProgress({ value: 1 });
+    assert.equal(events.length, 2, "superseded loads cannot update loader progress");
+    host.loadToken = 7;
+    controller.abort();
+    assert.equal(options.shouldCancel(), true, "source cancellation reaches Vector LOD preparation");
+  }
+}
 
 async function testScanCompressionPreferences() {
   const pdf = { kind: "pdf", bytes: Uint8Array.of(1), label: "scans.pdf" };

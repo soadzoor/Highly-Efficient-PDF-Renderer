@@ -5,7 +5,7 @@ import { createReaderViewport, type ReaderView } from "./readerViewport";
 import { computeReaderPageRects, readerContentMetrics, readerFitZoom, readerViewFromScroll } from "./readerGeometry";
 import type { VectorScene } from "./pdfVectorExtractor";
 import { createDefaultOptionalContentSnapshot } from "./optionalContent";
-import { createAnnotationOverlay } from "./annotationOverlay";
+import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
 import * as THREE from "three";
@@ -326,6 +326,7 @@ textSelectionCheckboxElement.disabled = false;
 const textSelection = createTextSelectionController({
   getCanvas: () => canvasElement,
   enabled: textSelectionCheckboxElement.checked,
+  onTextClick: point => annotationInteraction?.selectAt(point),
   adapter: {
     getScene: () => currentPdfObject?.sceneData ?? null,
     getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
@@ -415,7 +416,7 @@ const annotationOverlay = createAnnotationOverlay({
     getOptionalContentVisibility: () => currentPdfObject?.getOptionalContentVisibility() ?? null,
     clientToScenePoint: (x, y) => currentPdfObject?.clientToScenePoint(camera, x, y, canvasElement) ?? null,
     sceneToClientPoint: (x, y) => currentPdfObject?.sceneToClientPoint(camera, x, y, canvasElement) ?? null,
-    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.isGestureActive() || textSelection.getSelectedText().length > 0,
     isAnnotationEnabled: annotation => annotationControls.isAnnotationEnabled(annotation)
   },
   onActivate: annotation => linkNavigation.activate(annotation),
@@ -469,7 +470,7 @@ annotationInteraction = createAnnotationInteractionController({
   adapter: createThreeAnnotationInteractionAdapter({
     getCanvas: () => canvasElement, getCamera: () => camera, getPdfObject: () => currentPdfObject, requestRender
   }),
-  isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+  isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.isGestureActive() || textSelection.getSelectedText().length > 0,
   onSelectionChange: (annotation, source, point) => {
     annotationControls.selectAnnotation(annotation?.id ?? null, { reveal: source === "canvas" });
     if (source === "canvas" && annotation && annotationControls.isAnnotationEnabled(annotation) && linkNavigation.activate(annotation)) {
@@ -479,7 +480,9 @@ annotationInteraction = createAnnotationInteractionController({
     } else annotationOverlay.hide();
   },
   onHoverChange: (annotation, point) => {
-    if (annotationInteraction?.getSelection()) return;
+    const selectedId = annotationInteraction?.getSelection();
+    const selected = selectedId ? currentPdfObject?.sceneData.annotations?.find(item => item.id === selectedId) : null;
+    if (selected && !isLinkAnnotation(selected)) return;
     if (annotation && annotationBubblesCheckbox.checked && annotationControls.isAnnotationEnabled(annotation)) annotationOverlay.show(annotation, point);
     else annotationOverlay.hide();
   },

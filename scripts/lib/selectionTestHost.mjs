@@ -1,6 +1,7 @@
 // Minimal DOM/event host for the real selection controller, not a browser or
 // a replacement implementation of its hit-testing, selection or highlighting.
 export function installSelectionTestHost() {
+  let now = 1000;
   class Element {
     style = { setProperty() {}, removeProperty() {} };
     offsetWidth = 80;
@@ -26,7 +27,8 @@ export function installSelectionTestHost() {
       activeElement: null, getSelection: () => null },
     HTMLElement: Element,
     HTMLInputElement: class extends Element {},
-    HTMLTextAreaElement: class extends Element {}
+    HTMLTextAreaElement: class extends Element {},
+    performance: { now: () => now }
   };
   const originals = new Map(Object.keys(globals).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
   for (const [key, value] of Object.entries(globals)) {
@@ -35,13 +37,21 @@ export function installSelectionTestHost() {
   const canvas = new Element();
   return {
     canvas,
-    pointer(type, x, y) {
-      for (const listener of listeners.get(type) ?? []) listener({
+    pointer(type, x, y, options = {}) {
+      const event = {
+        type,
         target: canvas, clientX: x, clientY: y, pointerId: 1,
         pointerType: "mouse", button: 0, isPrimary: true, ctrlKey: false,
-        cancelable: true, stopPropagation() {}, preventDefault() {}
-      });
+        buttons: type === "pointerup" ? 0 : 1,
+        cancelable: true, propagationStopped: false, defaultPrevented: false,
+        ...options,
+        stopPropagation() { this.propagationStopped = true; },
+        preventDefault() { this.defaultPrevented = true; }
+      };
+      for (const listener of listeners.get(type) ?? []) listener(event);
+      return event;
     },
+    advanceTime(elapsed) { now += elapsed; },
     close() {
       for (const [key, descriptor] of originals) {
         if (descriptor) Object.defineProperty(globalThis, key, descriptor);

@@ -86,7 +86,7 @@ try {
     linkNavigation: { activate: () => false, getActivationLabel: () => null },
     annotationBubblesCheckbox: { checked: true },
     drawingSelection: { isEnabled: () => false },
-    textSelection: { getSelectedText: () => "" },
+    textSelection: { getSelectedText: () => "", isGestureActive: () => false },
     annotationControls: { isAnnotationEnabled: () => true },
     fixtureScene: scene,
     fixtureRenderer: { getOptionalContentVisibility: () => visibility,

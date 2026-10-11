@@ -1,7 +1,7 @@
 import { hasSelectedHepLod, promptForHepLod } from "./hepLodPrompt";
 import { resolveHepLodOptions } from "./hepLodOptions";
 import { createViewerLinkNavigation } from "./viewerLinkNavigation";
-import { createAnnotationOverlay } from "./annotationOverlay";
+import { createAnnotationOverlay, isLinkAnnotation } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createNativeAnnotationInteractionAdapter } from "./nativeAnnotationInteraction";
 import "./style.css";
@@ -56,6 +56,7 @@ import {
   hasStoredVectorStrokeLod,
   prebuildVectorStrokeLodRuntime,
   resetVectorStrokeLodBuildTiming,
+  shouldUseVectorStrokeLod,
   type VectorLodMode,
   type VectorStrokeLodBuildTiming
 } from "./vectorStrokeLodCore";
@@ -327,6 +328,7 @@ function applyTextSearchScene(scene: VectorScene): void {
 const textSelection = createTextSelectionController({
   getCanvas: () => canvasElement,
   enabled: textSelectionCheckbox.checked,
+  onTextClick: point => annotationInteraction?.selectAt(point),
   adapter: {
     getScene: () => lastParsedScene,
     getOptionalContentVisibility: () => renderer.getOptionalContentVisibility?.() ?? null,
@@ -405,7 +407,7 @@ const annotationOverlay = createAnnotationOverlay({
     getOptionalContentVisibility: () => renderer.getOptionalContentVisibility?.() ?? null,
     clientToScenePoint: (x, y) => renderer.clientToScenePoint?.(x, y) ?? null,
     sceneToClientPoint: (x, y) => renderer.sceneToClientPoint?.(x, y) ?? null,
-    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+    isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.isGestureActive() || textSelection.getSelectedText().length > 0,
     isAnnotationEnabled: annotation => annotationControls.isAnnotationEnabled(annotation)
   },
   onActivate: annotation => linkNavigation.activate(annotation),
@@ -459,7 +461,7 @@ annotationInteraction = createAnnotationInteractionController({
   adapter: createNativeAnnotationInteractionAdapter({
     getCanvas: () => canvasElement, getScene: () => lastParsedScene, getRenderer: () => renderer
   }),
-  isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.getSelectedText().length > 0,
+  isInteractionSuppressed: () => drawingSelection.isEnabled() || textSelection.isGestureActive() || textSelection.getSelectedText().length > 0,
   onSelectionChange: (annotation, source, point) => {
     annotationControls.selectAnnotation(annotation?.id ?? null, { reveal: source === "canvas" });
     if (source === "canvas" && annotation && annotationControls.isAnnotationEnabled(annotation) && linkNavigation.activate(annotation)) {
@@ -469,7 +471,9 @@ annotationInteraction = createAnnotationInteractionController({
     } else annotationOverlay.hide();
   },
   onHoverChange: (annotation, point) => {
-    if (annotationInteraction?.getSelection()) return;
+    const selectedId = annotationInteraction?.getSelection();
+    const selected = selectedId ? lastParsedScene?.annotations?.find(item => item.id === selectedId) : null;
+    if (selected && !isLinkAnnotation(selected)) return;
     if (annotation && annotationBubblesCheckbox.checked && annotationControls.isAnnotationEnabled(annotation)) annotationOverlay.show(annotation, point);
     else annotationOverlay.hide();
   },
@@ -1530,12 +1534,6 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pageScenes) : canonicalScene;
     const parseEnd = performance.now();
 
-    if (activeLoadToken === loadToken) {
-      progress.report(LOAD_PROGRESS_VECTOR_LOD_START, {
-        stage: hasStoredVectorStrokeLod(scene) ? "vector-lod-restore" : "vector-lod", sourceType: "hep"
-      });
-    }
-
     if (activeLoadToken !== loadToken) {
       return;
     }
@@ -1971,12 +1969,17 @@ async function prebuildVectorLodForScene(
   signal?: AbortSignal
 ): Promise<VectorStrokeLodBuildTiming> {
   resetVectorStrokeLodBuildTiming();
+  const mode = uiControlManager.readVectorLodModeInput();
+  const backend = backendSwitcher?.getActiveBackend() ?? "webgl";
+  if (!shouldUseVectorStrokeLod(mode, backend, scene.segmentCount)) {
+    return consumeVectorStrokeLodBuildTiming();
+  }
   const vectorLodStage = hasStoredVectorStrokeLod(scene) ? "vector-lod-restore" : "vector-lod";
   progress.report(LOAD_PROGRESS_VECTOR_LOD_START, { stage: vectorLodStage, sourceType });
   await prebuildVectorStrokeLodRuntime(
     scene,
-    uiControlManager.readVectorLodModeInput(),
-    backendSwitcher?.getActiveBackend() ?? "webgl",
+    mode,
+    backend,
     {
       yieldIntervalMs: 50,
       signal,

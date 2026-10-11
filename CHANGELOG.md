@@ -13,6 +13,13 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   limits and rounding, with bounded scrollbar ranges and consistent touch,
   wheel and keyboard movement. Prevent finger-lift motion after touchscreen
   pinch zoom from launching unintended inertial scrolling.
+- Activate PDF links when clicking their text with text selection enabled in
+  both demos, while preserving drag and double-click selection. Keep link hover
+  previews available after selecting a link without replacing pinned comments.
+- Improve the Examples dropdown's count, arrow and hover contrast in the shared
+  toolbar, including the Three demo's light toolbar.
+- Skip the native demo's Vector LOD loading stage when no stroke LOD work is
+  needed, including the bundled WarAndPeace example.
 
 ## [0.1.60] - 2026-10-11
 

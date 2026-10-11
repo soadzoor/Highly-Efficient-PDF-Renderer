@@ -17,16 +17,21 @@ globalThis.cancelAnimationFrame = id => frames.delete(id);
 function frame() { const callbacks = [...frames.values()]; frames.clear(); for (const callback of callbacks) callback(); }
 async function settle() { for (let i = 0; i < 5; i++) { frame(); await new Promise(resolve => setTimeout(resolve, 0)); } }
 class Canvas extends EventTarget {
-  width = 100; height = 100; ownerDocument = new EventTarget();
+  width = 100; height = 100; ownerDocument = Object.assign(new EventTarget(), { defaultView: new EventTarget() });
   attributes = new Map();
   setAttribute(name, value) { this.attributes.set(name, value); }
   removeAttribute(name) { this.attributes.delete(name); }
   getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 }; }
 }
+function windowPointerDown(canvas, target = canvas) {
+  const event = new Event("pointerdown"); Object.defineProperty(event, "target", { value: target });
+  canvas.ownerDocument.defaultView.dispatchEvent(event);
+}
 function pointer(canvas, type, x = 20, y = 10, extras = {}) {
   const event = new Event(type);
   Object.assign(event, { clientX: x, clientY: y, pointerId: 1, pointerType: "mouse", button: 0,
     buttons: type === "pointerdown" ? 1 : 0, ...extras });
+  if (type === "pointerdown") windowPointerDown(canvas);
   canvas.dispatchEvent(event);
 }
 function click(canvas, x = 20, y = 10) { pointer(canvas, "pointerdown", x, y); pointer(canvas, "pointerup", x, y); }
@@ -39,6 +44,8 @@ try {
   const { createThreeAnnotationInteractionAdapter } = await import("../src/threeAnnotationInteraction.ts");
   const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
   const { createDefaultOptionalContentSnapshot } = await import("../src/optionalContent.ts");
+  const { createViewerLinkNavigation } = await import("../src/viewerLinkNavigation.ts");
+  const { isLinkAnnotation } = await import("../src/annotationOverlay.ts");
   const a = annotation("a", [10, 5, 90, 15]), b = annotation("b", [45, 8, 55, 12]);
   let scene = { annotations: [a, b] }, canvas = new Canvas(), target = {}, key = "0", blocked = false;
   let selected = null, hovered = null, hit = "a", hold = false, picks = 0;
@@ -58,6 +65,9 @@ try {
   controller.select("a"); assert.deepEqual(selected, ["a"]);
   assert.deepEqual(selectionEvents.at(-1), ["a", "list"]);
   controller.select(null);
+  controller.selectAt({ x: 20, y: 10 }); await settle();
+  assert.deepEqual(selectionEvents.at(-1), ["a", "canvas"], "a host-owned text click uses normal annotation picking");
+  controller.select(null);
   pointer(canvas, "pointermove"); await settle(); assert.equal(hovered, "a");
   assert(canvas.attributes.has("data-hepr-annotation-hover"), "precise hover owns the pointer cursor");
   pointer(canvas, "pointermove", 21, 10); await settle();
@@ -72,7 +82,27 @@ try {
   await settle(); assert.equal(selectionEvents.length, count, "drag, pinch and cancelled gestures do not select");
   blocked = true; controller.onFrame(); click(canvas); await settle();
   assert.equal(selectionEvents.length, count, "text selection and drawing mode suppress canvas picks");
+  controller.selectAt({ x: 20, y: 10 }); await settle();
+  assert.equal(selectionEvents.length, count, "host-owned clicks also respect interaction suppression");
   blocked = false; controller.onFrame(); await settle();
+
+  hold = true; hit = "a"; controller.selectAt({ x: 20, y: 10 }); frame();
+  const blockedPick = waiting.shift(), beforeBlockedPick = selectionEvents.length;
+  blocked = true; blockedPick.resolve(); await settle();
+  assert.equal(selectionEvents.length, beforeBlockedPick, "a text drag suppresses a pending forwarded click without a render frame");
+  blocked = false; hold = false; controller.selectAt({ x: 20, y: 10 }); await settle();
+  assert.deepEqual(selectionEvents.at(-1), ["a", "canvas"], "a later idle text click remains actionable");
+
+  hold = true; controller.selectAt({ x: 20, y: 10 }); frame();
+  const consumedPick = waiting.shift(), beforeConsumedPick = selectionEvents.length;
+  windowPointerDown(canvas);
+  assert(consumedPick.signal.aborted, "a new text-owned pointer press cancels an older annotation pick");
+  consumedPick.resolve(); await settle();
+  assert.equal(selectionEvents.length, beforeConsumedPick, "a consumed press cannot activate an older forwarded click");
+  controller.selectAt({ x: 20, y: 10 }); frame();
+  const outsidePick = waiting.shift(); windowPointerDown(canvas, {});
+  assert(!outsidePick.signal.aborted, "presses outside the canvas do not cancel annotation queries");
+  outsidePick.resolve(); await settle(); hold = false;
 
   hold = true; hit = "b"; click(canvas); frame();
   assert.equal(waiting.length, 1);
@@ -102,6 +132,7 @@ try {
   controller.setInteractionEnabled(true); hit = "b"; click(canvas); await settle(); assert.deepEqual(selected, ["b"]);
   hit = null; click(canvas); await settle(); assert.equal(controller.getSelection(), null, "empty canvas click clears the list");
   controller.dispose(); controller.dispose(); const afterDispose = picks; click(canvas); await settle();
+  controller.selectAt({ x: 20, y: 10 }); await settle();
   assert.equal(picks, afterDispose); assert.deepEqual(errors, []);
 
   // Native adapter uses the same annotation geometry and overlap ordering as the Three API.
@@ -155,11 +186,73 @@ try {
   const binding = source.match(/^annotationInteraction = createAnnotationInteractionController\(\{[\s\S]*?^\}\);/m)[0];
   const startup = vm.createContext({ createAnnotationInteractionController, createNativeAnnotationInteractionAdapter,
     annotationInteraction: undefined, canvasElement: canvas, lastParsedScene: null, renderer: undefined,
-    drawingSelection: { isEnabled: () => false }, textSelection: { getSelectedText: () => "" },
+    drawingSelection: { isEnabled: () => false }, textSelection: { getSelectedText: () => "", isGestureActive: () => false },
     annotationControls: { selectAnnotation: () => {} }, annotationOverlay: { hide: () => {} }, setStatus: () => {} });
   vm.runInContext(stripTypeScriptTypes(binding), startup);
   vm.runInContext("annotationInteraction.dispose()", startup);
-  console.log("Annotation UI interaction passed: synchronized selection, gestures, query races, lifecycle, native/Three adapters and highlight replay.");
+
+  // Execute each demo's actual text-selection and annotation callbacks together.
+  for (const [name, demoSource] of [["native", source], ["Three", await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8")]]) {
+    const link = annotation("first-link", [10, 5, 90, 15], { subtype: "Link",
+      action: { type: "GoTo", destination: { sourcePageIndex: 1, fit: "Fit" } } });
+    const otherLink = { ...link, id: "second-link" }, note = annotation("note", [45, 8, 55, 12]);
+    const demoScene = { annotations: [link, otherLink, note], pageCount: 2,
+      pageRects: Float32Array.of(0, 0, 100, 100, 0, -116, 100, -16),
+      pdfPages: [{ pageIndex: 0, sourcePageIndex: 0, pdfToScene: [1, 0, 0, 1, 0, 0] },
+        { pageIndex: 1, sourcePageIndex: 1, pdfToScene: [1, 0, 0, 1, 0, -116] }] };
+    const demoCanvas = new Canvas(), demoWindow = demoCanvas.ownerDocument.defaultView;
+    demoWindow.matchMedia = () => ({ matches: true });
+    let demoView = { centerX: 50, centerY: 50, zoom: 1 }, cameraMoves = 0, textOptions, textGesture = false;
+    let demoHit = link.id;
+    const overlayEvents = [], demoErrors = [];
+    const navigation = createViewerLinkNavigation({ getCanvas: () => demoCanvas, getScene: () => demoScene,
+      getIdentity: () => demoScene, getView: () => demoView,
+      setView: value => { demoView = value; cameraMoves++; } });
+    const demoAdapter = { getCanvas: () => demoCanvas, getScene: () => demoScene, getTarget: () => demoScene,
+      getViewKey: () => JSON.stringify(demoView), setSelection() {}, setHover() {},
+      async pick() { return { annotationId: demoHit, distancePx: 0 }; } };
+    const context = vm.createContext({ createAnnotationInteractionController, isLinkAnnotation,
+      createNativeAnnotationInteractionAdapter: () => demoAdapter, createThreeAnnotationInteractionAdapter: () => demoAdapter,
+      createTextSelectionController: options => { textOptions = options; return { getSelectedText: () => "", isGestureActive: () => textGesture }; },
+      annotationInteraction: undefined, canvasElement: demoCanvas, lastParsedScene: demoScene,
+      currentPdfObject: { sceneData: demoScene }, renderer: {}, camera: {}, requestRender() {},
+      textSelectionCheckbox: { checked: true }, textSelectionCheckboxElement: { checked: true },
+      drawingSelection: { isEnabled: () => false }, linkNavigation: navigation, annotationBubblesCheckbox: { checked: true },
+      annotationControls: { selectAnnotation() {}, isAnnotationEnabled: () => true },
+      annotationOverlay: { show: item => overlayEvents.push(["show", item.id]), hide: () => overlayEvents.push(["hide"]) },
+      setStatus: error => demoErrors.push(error) });
+    const textBinding = demoSource.match(/^const textSelection = createTextSelectionController\(\{[\s\S]*?^\}\);/m)?.[0];
+    const annotationBinding = demoSource.match(/^annotationInteraction = createAnnotationInteractionController\(\{[\s\S]*?^\}\);/m)?.[0];
+    assert(textBinding && annotationBinding, `${name} demo has text and annotation bindings`);
+    vm.runInContext(stripTypeScriptTypes(textBinding), context);
+    vm.runInContext(stripTypeScriptTypes(annotationBinding), context);
+    const demoInteraction = context.annotationInteraction;
+    try {
+      assert.equal(typeof textOptions.onTextClick, "function", `${name} forwards text-owned clicks to annotations`);
+      textOptions.onTextClick({ x: 20, y: 10 }); await settle();
+      assert.equal(cameraMoves, 1, `${name} text-overlaid PDF link activates navigation`);
+      assert.equal(demoInteraction.getSelection(), link.id);
+      assert.deepEqual(demoView, { centerX: 50, centerY: -66, zoom: .52 }, `${name} navigates to the PDF destination`);
+
+      demoHit = otherLink.id; pointer(demoCanvas, "pointermove", 25, 10); await settle();
+      assert.deepEqual(overlayEvents.at(-1), ["show", otherLink.id], `${name} hovering another link previews it after navigation`);
+      pointer(demoCanvas, "pointerleave"); await settle();
+      assert.deepEqual(overlayEvents.at(-1), ["hide"], `${name} leaving a selected link clears the preview`);
+
+      demoInteraction.select(note.id);
+      const pinnedEvents = overlayEvents.length;
+      pointer(demoCanvas, "pointermove", 25, 10); await settle(); pointer(demoCanvas, "pointerleave"); await settle();
+      assert.equal(overlayEvents.length, pinnedEvents, `${name} link hover preserves a selected comment`);
+      assert.deepEqual(overlayEvents.at(-1), ["show", note.id]);
+
+      textGesture = true; textOptions.onTextClick({ x: 20, y: 10 }); await settle();
+      assert.equal(cameraMoves, 1, `${name} an active text gesture suppresses forwarded link clicks`);
+      textGesture = false; textOptions.onTextClick({ x: 20, y: 10 }); await settle();
+      assert.equal(cameraMoves, 2, `${name} later text clicks still activate links`);
+      assert.deepEqual(demoErrors, []);
+    } finally { demoInteraction.dispose(); navigation.dispose(); }
+  }
+  console.log("Annotation UI interaction passed: text-overlaid link activation, native/Three tooltip callbacks, synchronized selection, gestures, query races, lifecycle, adapters and highlight replay.");
 } finally {
   [globalThis.requestAnimationFrame, globalThis.cancelAnimationFrame] = originals;
   hooks.deregister();

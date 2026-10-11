@@ -69,6 +69,8 @@ export interface TextSelectionOptions {
   /** Finger movement allowed during the long-press. Defaults to 8 px. */
   longPressMoveTolerancePx?: number;
   onSelectionChange?(range: TextSelectionRange | null, selectedText: string): void;
+  /** Plain mouse/pen click on text, in client CSS pixels; hosts can pick PDF links. */
+  onTextClick?(point: TextSelectionPoint): void;
   /** Called after a successful clipboard write. */
   onCopy?(text: string): void;
 }
@@ -321,6 +323,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
   let disposed = false;
   let state: SelectionGestureState = "idle";
   let activePointerId: number | null = null;
+  let mouseClick: { x: number; y: number; time: number; moved: boolean } | null = null;
 
   let lastScene: VectorScene | null = null;
   let lastVisibilityRevision = -1;
@@ -821,6 +824,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     wordAnchor = null;
     wordGranularity = false;
     selectionIsTouch = false;
+    mouseClick = null;
     adapter.setSelectionHighlights(null);
     overlay.hide();
     if (hadSelection && notify) {
@@ -984,6 +988,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     // While a selection gesture owns a pointer, keep every other canvas
     // pointer away from the camera controllers.
     if ((state === "mouseSelecting" || state === "touchSelecting") && event.target === canvas) {
+      if (event.pointerId !== activePointerId) mouseClick = null;
       stopEvent(event);
       return;
     }
@@ -1072,6 +1077,7 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
     overlay.hide();
 
     const now = performance.now();
+    mouseClick = { x: event.clientX, y: event.clientY, time: now, moved: false };
     const isDoubleClick =
       now - lastClickTime <= DOUBLE_CLICK_MS &&
       Math.hypot(event.clientX - lastClickX, event.clientY - lastClickY) <= DOUBLE_CLICK_DISTANCE_PX;
@@ -1103,6 +1109,9 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
         return;
       }
       stopEvent(event);
+      if (mouseClick && Math.hypot(event.clientX - mouseClick.x, event.clientY - mouseClick.y) > 4) {
+        mouseClick.moved = true;
+      }
       const scenePoint = adapter.clientToScenePoint(event.clientX, event.clientY);
       if (!scenePoint) {
         return;
@@ -1149,6 +1158,8 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
 
     if (state === "mouseSelecting" && event.pointerId === activePointerId) {
       stopEvent(event);
+      const click = mouseClick;
+      mouseClick = null;
       const canvas = options.getCanvas();
       if (canvas?.hasPointerCapture(event.pointerId)) {
         try {
@@ -1159,11 +1170,16 @@ export function createTextSelectionController(options: TextSelectionOptions): Te
       }
       state = "idle";
       activePointerId = null;
+      const plainClick = event.type === "pointerup" && !selectionRange && click && !click.moved &&
+        performance.now() - click.time <= 450 && Math.hypot(event.clientX - click.x, event.clientY - click.y) <= 4;
       if (!selectionRange) {
         // Plain click on text without dragging: collapse any prior selection.
         resetSelection(true);
       }
       updateOverlay();
+      // Selection owns the DOM events to prevent camera panning. Forward only
+      // stationary clicks to the host's annotation picker after releasing it.
+      if (plainClick) options.onTextClick?.({ x: event.clientX, y: event.clientY });
       return;
     }
 

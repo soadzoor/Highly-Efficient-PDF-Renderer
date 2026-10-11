@@ -125,6 +125,9 @@ class Element {
     this.listeners.get(type).add(entry);
     options.signal?.addEventListener("abort", () => this.listeners.get(type)?.delete(entry), { once: true });
   }
+  removeEventListener(type, listener) {
+    for (const entry of this.listeners.get(type) ?? []) if (entry.listener === listener) this.listeners.get(type).delete(entry);
+  }
   emit(type, values = {}) {
     const event = { type, target: this, button: 0, pointerType: "mouse", pointerId: 1,
       ctrlKey: false, metaKey: false, shiftKey: false, deltaMode: 0, deltaX: 0, deltaY: 0, ...values,
@@ -196,20 +199,21 @@ class Element {
 }
 
 function environment(width = 700, height = 800, { browserScrollLimit = Infinity, scrollQuantum = 0 } = {}) {
-  const frames = new Map(); let serial = 0;
-  const window = { innerWidth: width, devicePixelRatio: 2, setTimeout,
+  const frames = new Map(); let serial = 0, time = performance.now();
+  const window = Object.assign(new EventTarget(), { innerWidth: width, devicePixelRatio: 2, setTimeout,
+    performance: { now: () => time }, matchMedia: () => ({ matches: false }),
     requestAnimationFrame(callback) { const id = ++serial; frames.set(id, callback); return id; },
-    cancelAnimationFrame(id) { frames.delete(id); } };
-  const document = { viewportWidth: width, viewportHeight: height, browserScrollLimit, scrollQuantum, defaultView: window, activeElement: null,
+    cancelAnimationFrame(id) { frames.delete(id); } });
+  const document = Object.assign(new EventTarget(), { viewportWidth: width, viewportHeight: height, browserScrollLimit, scrollQuantum, defaultView: window, activeElement: null,
     createElement: tag => new Element(tag, document), createDocumentFragment: () => new Element("fragment", document),
-    querySelector: selector => document.body.querySelector(selector) };
+    querySelector: selector => document.body.querySelector(selector) });
   document.documentElement = new Element("html", document);
   document.body = new Element("body", document);
   let canvas = document.createElement("canvas"); canvas.id = "viewport"; document.body.append(canvas);
   const views = [], requests = [];
   const env = { document, window, views, requests, frames, get canvas() { return canvas; },
     replaceCanvas() { const next = document.createElement("canvas"); next.id = "viewport"; canvas.remove(); canvas = next; return next; },
-    flushFrames(timestamp = performance.now()) { const pending = [...frames.values()]; frames.clear(); for (const callback of pending) callback(timestamp); },
+    flushFrames(timestamp = performance.now()) { time = timestamp; const pending = [...frames.values()]; frames.clear(); for (const callback of pending) callback(timestamp); },
     preview: (page, options) => Promise.resolve(pageScene(`page-${page}`)),
     options: { getCanvas: () => canvas, layouts: [{ value: "reader", label: "Reader" }, { value: "grid", label: "Grid" }],
       onLayoutChange() {}, onViewChange: view => views.push(view), onFind() {}, onSettings() {},
@@ -228,6 +232,8 @@ function deferred() { let resolve; const promise = new Promise(done => { resolve
 try {
   const { createReaderViewport } = await import("../src/readerViewport.ts");
   const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
+  const { createViewerLinkNavigation, resolveAnnotationView } = await import("../src/viewerLinkNavigation.ts");
+  const { createAnnotationInteractionController } = await import("../src/annotationInteraction.ts");
   {
     const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
     const scroller = doc.querySelector(".reader-scroll"), sidebar = doc.querySelector(".reader-thumbnails");
@@ -277,6 +283,83 @@ try {
     env.canvas.emit("wheel", { ctrlKey: true, deltaY: -100, clientX: 300, clientY: 300 });
     assert(reader.getView().zoom > replacementView.zoom, "replacement canvas receives zoom controls");
     reader.dispose();
+  }
+  for (const routing of ["native", "reader"]) {
+    for (const compressed of [false, true]) {
+      for (const [fit, touchMovement] of [["Fit", null], ["XYZ", null], ["Fit", 0], ["XYZ", 1]]) {
+        const env = environment(700, 800, { browserScrollLimit: compressed ? 250_000 : Infinity, scrollQuantum: 1 });
+        const rects = pageRects(38), scene = { pageCount: 38, pageRects: rects,
+          pdfPages: Array.from({ length: 38 }, (_, pageIndex) => ({ pageIndex, sourcePageIndex: pageIndex,
+            pdfToScene: [1, 0, 0, 1, -300, -pageIndex * 816 - 800] })) };
+        let nativeView, interaction;
+        env.canvas.width = 1400;
+        const ratio = () => env.canvas.width / env.canvas.getBoundingClientRect().width;
+        const recordView = env.options.onViewChange;
+        env.options.onViewChange = view => {
+          recordView(view);
+          nativeView = { cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio() };
+          interaction?.onFrame();
+        };
+        const reader = createReaderViewport(env.options);
+        reader.setDocument({ identity: scene, pageRects: rects }); reader.setLayout("reader");
+        reader.setView({ centerX: 17.123456, centerY: -1000.123456, zoom: compressed ? 820 * READER_ACTUAL_SIZE_ZOOM : 2 });
+        const navigation = createViewerLinkNavigation({
+          getCanvas: () => env.canvas, getScene: () => scene, getIdentity: () => scene,
+          beforeNavigate: () => reader.cancelActiveGesture(),
+          getView: () => routing === "reader" ? reader.getView()
+            : { centerX: nativeView.cameraCenterX, centerY: nativeView.cameraCenterY, zoom: nativeView.zoom / ratio() },
+          setView: view => {
+            if (routing === "reader") reader.setView(view);
+            else {
+              const rendererView = { cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio() };
+              reader.setView({ centerX: rendererView.cameraCenterX, centerY: rendererView.cameraCenterY, zoom: rendererView.zoom / ratio() });
+            }
+          }
+        });
+        const previousFrames = [globalThis.requestAnimationFrame, globalThis.cancelAnimationFrame];
+        try {
+          const annotation = { id: "reader-link", subtype: "Link", flags: 0,
+            action: { type: "GoTo", destination: { sourcePageIndex: 30, fit, parameters: [423, 567, null] } } };
+          scene.annotations = [annotation];
+          const start = reader.getView(), target = resolveAnnotationView(scene, annotation, start, env.canvas.getBoundingClientRect());
+          const label = `${routing} ${compressed ? "compressed" : "normal"} ${fit} ${touchMovement === null ? "direct" : `${touchMovement}px touch`} link`;
+          assert.equal(navigation.getActivationLabel(annotation), "Go to destination", `${label} is actionable`);
+          if (touchMovement === null) assert(navigation.activate(annotation), `${label} starts navigation`);
+          else {
+            [globalThis.requestAnimationFrame, globalThis.cancelAnimationFrame] = [
+              env.window.requestAnimationFrame.bind(env.window), env.window.cancelAnimationFrame.bind(env.window)];
+            let activations = 0;
+            interaction = createAnnotationInteractionController({ adapter: {
+              getCanvas: () => env.canvas, getScene: () => scene, getTarget: () => scene,
+              getViewKey: () => JSON.stringify(reader.getView()), setSelection() {}, setHover() {},
+              async pick() { return { annotationId: annotation.id, distancePx: 0 }; }
+            }, onSelectionChange: (selected, source) => {
+              if (selected && source === "canvas") { assert(navigation.activate(selected)); activations++; }
+            } });
+            env.canvas.emit("pointerdown", { pointerType: "touch", clientX: 350, clientY: 300, buttons: 1 });
+            if (touchMovement) env.canvas.emit("pointermove", { pointerType: "touch", clientX: 350, clientY: 300 + touchMovement, buttons: 1 });
+            env.canvas.emit("pointerup", { pointerType: "touch", clientX: 350, clientY: 300 + touchMovement, buttons: 0 });
+            for (let frame = 0; activations === 0 && frame < 100; frame++) {
+              env.flushFrames(env.window.performance.now() + 16); await tick();
+            }
+            assert.equal(activations, 1, `${label} activates through canvas annotation selection`);
+          }
+          const scroller = env.document.querySelector(".reader-scroll"), started = env.window.performance.now();
+          env.flushFrames(started + 200);
+          assert(Math.abs(reader.getView().centerY - start.centerY) > 10, `${label} moves the camera during the flight`);
+          for (let elapsed = 216; env.frames.size && elapsed <= 1500; elapsed += 16) {
+            scroller.emit("scroll"); env.flushFrames(started + elapsed); await tick();
+          }
+          assert.equal(env.frames.size, 0, `${label} finishes its animated flight`);
+          for (const key of ["centerX", "centerY", "zoom"]) close(reader.getView()[key], target[key], `${label} reaches the destination ${key}`);
+          for (let event = 0; event < 3; event++) { scroller.emit("scroll"); env.flushFrames(started + 1600 + event * 16); }
+          for (const key of ["centerX", "centerY", "zoom"]) close(reader.getView()[key], target[key], `${label} remains at the destination after scroll readback ${key}`);
+        } finally {
+          interaction?.dispose(); navigation.dispose(); reader.dispose();
+          [globalThis.requestAnimationFrame, globalThis.cancelAnimationFrame] = previousFrames;
+        }
+      }
+    }
   }
   {
     const env = environment(700, 800, { browserScrollLimit: 33_554_432 });
@@ -771,7 +854,7 @@ try {
       assert.deepEqual([...scene.rasterLayers[0].data], [255,0,0,255], "thumbnail replay preserves canonical document pixels");
     } finally { reader.dispose(); }
   }
-  console.log("Reader viewport: bounded scroll/camera mapping, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
+  console.log("Reader viewport: bounded scroll/camera mapping, animated internal links, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
 } finally {
   globalThis.ResizeObserver = previousObserver; delete globalThis.__readerViewportGpu; hooks.deregister();
 }

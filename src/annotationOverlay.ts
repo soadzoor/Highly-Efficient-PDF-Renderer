@@ -43,7 +43,7 @@ export interface AnnotationOverlay {
   dispose(): void;
 }
 
-function isLink(annotation: SceneAnnotation): boolean {
+export function isLinkAnnotation(annotation: SceneAnnotation): boolean {
   return annotation.subtype === "Link" || annotation.destination !== undefined ||
     annotation.action?.type === "URI" || annotation.action?.type === "GoTo" || annotation.action?.type === "GoToR";
 }
@@ -202,7 +202,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   }
   function clearPointer(): void {
     pointer = null; setPointerCursor(false);
-    if (active && isLink(active)) hide();
+    if (active && isLinkAnnotation(active)) hide();
   }
   function hide(): void { active = null; pinned = false; panel.hidden = true; }
   function sceneChanged(): void {
@@ -220,7 +220,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     const minX = Math.max(b.minX, rects[offset]), maxX = Math.min(b.maxX, rects[offset + 2]);
     const minY = Math.max(b.minY, rects[offset + 1]), maxY = Math.min(b.maxY, rects[offset + 3]);
     if (minX > maxX || minY > maxY) { hide(); return; }
-    const link = isLink(active);
+    const link = isLinkAnnotation(active);
     if (link && !pointer) { hide(); return; }
     const anchor = link ? pointer : adapter.sceneToClientPoint((minX + maxX) / 2, maxY);
     const viewport = options.getCanvas()?.getBoundingClientRect();
@@ -242,7 +242,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
       content.replaceChildren();
       (options.renderContent ?? renderDefaultContent)(annotation, content);
     }
-    const link = isLink(annotation);
+    const link = isLinkAnnotation(annotation);
     const label = !link && options.onActivate ? options.getActivationLabel?.(annotation) : null;
     activate.hidden = !label; activate.textContent = label ?? "";
     close.hidden = link;
@@ -276,7 +276,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   window.addEventListener("pointerdown", event => {
     sceneChanged();
     clearPointer();
-    if (insidePanel(event)) { if (active && !isLink(active)) pinned = true; else hide(); return; }
+    if (insidePanel(event)) { if (active && !isLinkAnnotation(active)) pinned = true; else hide(); return; }
     if (event.target !== options.getCanvas()) { hide(); return; }
     if (options.pointerInteraction === false) return;
     pointers.add(event.pointerId);
@@ -316,7 +316,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     sceneChanged();
     if (!scene) return;
     const annotation = pickSceneAnnotation(scene, event.clientX, event.clientY, adapter);
-    if (annotation && !options.onActivate?.(annotation) && !isLink(annotation)) display(annotation, true);
+    if (annotation && !options.onActivate?.(annotation) && !isLinkAnnotation(annotation)) display(annotation, true);
     else { clearPointer(); hide(); }
   }, eventOptions);
   window.addEventListener("pointercancel", () => { gesture = null; pointers.clear(); clearPointer(); if (!pinned) hide(); }, eventOptions);
@@ -327,7 +327,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
     else if (event.key === "Enter" && event.target === options.getCanvas() && active && !suppressed()) {
       event.preventDefault();
       const annotation = active;
-      if (options.onActivate?.(annotation) || isLink(annotation)) { clearPointer(); hide(); }
+      if (options.onActivate?.(annotation) || isLinkAnnotation(annotation)) { clearPointer(); hide(); }
       else { pinned = true; close.focus(); }
     }
   }, eventOptions);
@@ -337,7 +337,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
   panel.addEventListener("pointerdown", event => event.stopPropagation(), { signal: lifetime.signal });
   activate.addEventListener("click", () => {
     sceneChanged();
-    if (active && !isLink(active) && !suppressed() && shown(active) &&
+    if (active && !isLinkAnnotation(active) && !suppressed() && shown(active) &&
       options.onActivate?.(active)) { clearPointer(); hide(); options.getCanvas()?.focus(); }
   }, { signal: lifetime.signal });
   close.addEventListener("click", () => { clearPointer(); hide(); options.getCanvas()?.focus(); }, { signal: lifetime.signal });
@@ -349,7 +349,7 @@ export function createAnnotationOverlay(options: AnnotationOverlayOptions): Anno
       sceneChanged();
       if (options.pointerInteraction === false) pointer = clientPoint ?? null;
       if (!suppressed() && scene?.annotations?.includes(annotation) && adapter.isAnnotationEnabled?.(annotation) !== false &&
-        (!isLink(annotation) || pointer && (options.pointerInteraction === false ||
+        (!isLinkAnnotation(annotation) || pointer && (options.pointerInteraction === false ||
           pickSceneAnnotation(scene, pointer.x, pointer.y, adapter) === annotation))) display(annotation, true);
       else if (options.pointerInteraction === false) hide();
     },

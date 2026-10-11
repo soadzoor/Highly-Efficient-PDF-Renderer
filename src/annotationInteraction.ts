@@ -100,6 +100,11 @@ export function createAnnotationInteractionController(options: AnnotationInterac
     if (downs.size > 1) for (const d of downs.values()) d.moved = true;
     hover(null);
   }
+  function captureDown(event: PointerEvent): void {
+    // Text selection can consume the canvas event, but a new press must still
+    // cancel an older asynchronous click before it activates a link.
+    if (event.target === canvas) cancel();
+  }
   function move(event: PointerEvent): void {
     const point = { x: event.clientX, y: event.clientY }, d = downs.get(event.pointerId);
     if (d && Math.hypot(point.x - d.x, point.y - d.y) > 4) d.moved = true;
@@ -133,6 +138,7 @@ export function createAnnotationInteractionController(options: AnnotationInterac
     canvas.removeEventListener("pointerdown", down); canvas.removeEventListener("pointermove", move);
     canvas.removeEventListener("pointerup", up); canvas.removeEventListener("pointerleave", leave);
     canvas.removeEventListener("pointercancel", cancelled); canvas.removeEventListener("lostpointercapture", lostCapture);
+    canvas.ownerDocument.defaultView?.removeEventListener("pointerdown", captureDown, true);
     canvas.ownerDocument.removeEventListener("keydown", escape);
     canvas = null; downs.clear();
   }
@@ -143,6 +149,7 @@ export function createAnnotationInteractionController(options: AnnotationInterac
     canvas.addEventListener("pointerdown", down); canvas.addEventListener("pointermove", move);
     canvas.addEventListener("pointerup", up); canvas.addEventListener("pointerleave", leave);
     canvas.addEventListener("pointercancel", cancelled); canvas.addEventListener("lostpointercapture", lostCapture);
+    canvas.ownerDocument.defaultView?.addEventListener("pointerdown", captureDown, { capture: true });
     canvas.ownerDocument.addEventListener("keydown", escape);
   }
   function sceneChanged(): void {
@@ -175,6 +182,8 @@ export function createAnnotationInteractionController(options: AnnotationInterac
     sceneChanged,
     refresh,
     select(id: string | null): void { sceneChanged(); cancel(); selection(id, id === null ? "clear" : "list"); },
+    /** Pick a click consumed by another controller, such as stationary text selection. */
+    selectAt(point: PrimitivePoint): void { sceneChanged(); schedule({ point, select: true }); },
     hover(id: string | null): void { sceneChanged(); cancel(); if (id !== null && !annotations.has(id)) throw new RangeError(`Unknown annotation: ${id}`); hover(id); },
     getSelection: () => selected,
     setInteractionEnabled(enabled: boolean): void {
