@@ -1,4 +1,5 @@
-import type { NativeGlyphPathCommand, NativeGlyphPostScriptPaint, NativeGlyphPostScriptImagePaint } from "./nativeFont";
+import type { NativeGlyphPathCommand, NativeGlyphPostScriptPaint, NativeGlyphPostScriptImagePaint,
+  NativeGlyphPostScriptPattern } from "./nativeFont";
 import type { DensePdfExtGStateDefinition } from "./nativeContentCompiler";
 import type { PdfStream, PdfValue } from "./nativeCos";
 import { PdfError, throwIfAborted } from "./nativeTypes";
@@ -16,10 +17,12 @@ export function serializeNativeGlyphPostScriptPaints(
   readonly extGStates: ReadonlyMap<string, DensePdfExtGStateDefinition>;
   readonly inheritsPaint: boolean;
   readonly images: ReadonlyMap<string, NativeGlyphPostScriptImagePaint>;
+  readonly patterns: ReadonlyMap<string, PdfValue>;
 } {
   const tokens: string[] = [];
   const extGStates = new Map<string, DensePdfExtGStateDefinition>();
   const images = new Map<string, NativeGlyphPostScriptImagePaint>();
+  const patterns = new Map<string, PdfValue>(), patternNames = new Map<NativeGlyphPostScriptPattern, string>();
   let inheritsPaint = false;
   for (const paint of paints) {
     throwIfAborted(signal);
@@ -39,6 +42,16 @@ export function serializeNativeGlyphPostScriptPaints(
         tokens.push(`/${resourceName} gs`);
       }
     } else if (paint.kind !== "image" || paint.imageMask) inheritsPaint = true;
+    if (paint.pattern && (paint.kind !== "image" || paint.imageMask)) {
+      let name = patternNames.get(paint.pattern);
+      if (!name) {
+        name = `PSPattern${patterns.size}`; patternNames.set(paint.pattern, name);
+        patterns.set(name, nativeGlyphPostScriptPatternStream(paint.pattern, signal));
+      }
+      const stroke = paint.kind === "stroke", uncolored = paint.pattern.paintType === 2;
+      tokens.push(`/${uncolored ? "PSPatternRGB" : "PSPattern"} ${stroke ? "CS" : "cs"}`,
+        `${uncolored ? (paint.color ?? [0, 0, 0]).slice(0, 3).map(number).join(" ") + " " : ""}/${name} ${stroke ? "SCN" : "scn"}`);
+    }
     if (paint.kind === "image") {
       const name = `PSImage${images.size}`, [a, b, c, d, e, f] = paint.transform;
       images.set(name, paint);
@@ -63,7 +76,25 @@ export function serializeNativeGlyphPostScriptPaints(
     }
     tokens.push("Q");
   }
-  return Object.freeze({ bytes: new TextEncoder().encode(tokens.join("\n")), extGStates, inheritsPaint, images });
+  return Object.freeze({ bytes: new TextEncoder().encode(tokens.join("\n")), extGStates, inheritsPaint, images, patterns });
+}
+
+/** Reuse the ordinary vector pattern compiler, including its cell cache. */
+function nativeGlyphPostScriptPatternStream(pattern: NativeGlyphPostScriptPattern, signal?: AbortSignal): PdfValue {
+  if ("shading" in pattern) return new Map<string, PdfValue>([
+    ["Type", { kind: "name", value: "Pattern" }], ["PatternType", 2], ["Matrix", [...pattern.matrix]], ["Shading", pattern.shading]
+  ]);
+  const content = serializeNativeGlyphPostScriptPaints(pattern.paints, 1, signal), resources = new Map<string, PdfValue>();
+  if (content.images.size) resources.set("XObject", new Map([...content.images].map(([name, image]) => [name, nativeGlyphPostScriptImageStream(image, signal)])));
+  if (content.patterns.size) resources.set("Pattern", new Map(content.patterns));
+  if (content.extGStates.size) resources.set("ExtGState", new Map([...content.extGStates].map(([name, state]) => [name,
+    new Map<string, PdfValue>([["ca", state.fillAlpha ?? 1], ["CA", state.strokeAlpha ?? 1]])])));
+  resources.set("ColorSpace", new Map<string, PdfValue>([["PSPattern", { kind: "name", value: "Pattern" }],
+    ["PSPatternRGB", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceRGB" }]]]));
+  return { kind: "stream", bytes: content.bytes, dictionary: new Map<string, PdfValue>([
+    ["Type", { kind: "name", value: "Pattern" }], ["PatternType", 1], ["PaintType", pattern.paintType], ["TilingType", pattern.tilingType],
+    ["BBox", [...pattern.bbox]], ["XStep", pattern.xStep], ["YStep", pattern.yStep], ["Matrix", [...pattern.matrix]], ["Resources", resources]
+  ]) };
 }
 
 /** Image XObjects reuse native PDF decoding and retained image storage. */
@@ -91,10 +122,23 @@ export function nativeGlyphPostScriptImageStream(image: NativeGlyphPostScriptIma
     alpha[i] = image.rgba[i * 4 + 3]; transparent ||= alpha[i] !== 255;
   }
   dictionary.set("BitsPerComponent", 8); dictionary.set("ColorSpace", { kind: "name", value: "DeviceRGB" });
-  if (transparent) dictionary.set("SMask", { kind: "stream", bytes: alpha,
+  let mask = image.softMask;
+  if (mask && transparent) {
+    const combined = new Uint8Array(mask.data.length);
+    for (let y = 0; y < mask.height; y++) {
+      throwIfAborted(signal);
+      for (let x = 0; x < mask.width; x++) {
+        const source = Math.min(image.height - 1, Math.floor((y + .5) * image.height / mask.height)) * image.width +
+          Math.min(image.width - 1, Math.floor((x + .5) * image.width / mask.width));
+        combined[y * mask.width + x] = Math.round(mask.data[y * mask.width + x] * alpha[source] / 255);
+      }
+    }
+    mask = { ...mask, data: combined };
+  }
+  if (mask || transparent) dictionary.set("SMask", { kind: "stream", bytes: mask?.data ?? alpha,
     dictionary: new Map<string, PdfValue>([["Type", { kind: "name", value: "XObject" }],
-      ["Subtype", { kind: "name", value: "Image" }], ["Width", image.width], ["Height", image.height],
-      ["BitsPerComponent", 8], ["ColorSpace", { kind: "name", value: "DeviceGray" }], ["Interpolate", image.interpolate]]) });
+      ["Subtype", { kind: "name", value: "Image" }], ["Width", mask?.width ?? image.width], ["Height", mask?.height ?? image.height],
+      ["BitsPerComponent", 8], ["ColorSpace", { kind: "name", value: "DeviceGray" }], ["Interpolate", mask?.interpolate ?? image.interpolate]]) });
   return { kind: "stream", dictionary, bytes };
 }
 

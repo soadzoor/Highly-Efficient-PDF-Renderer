@@ -149,8 +149,7 @@ const MODE_CODES = buildCodeTrie<ModeValue>("two-dimensional", [
   ["0000010", { kind: "vertical", delta: -3 }],
   ["0001", { kind: "pass" }],
   ["001", { kind: "horizontal" }],
-  // T.4/T.6 reserves the following prefix for extension modes. PDF does not
-  // provide semantics for them, so recognizing it must produce a typed error.
+  // T.4/T.6 extension selector 111 enters uncompressed mode; others remain reserved.
   ["0000001", { kind: "extension" }]
 ]);
 
@@ -203,6 +202,7 @@ function decodeCcittReader(reader: MsbBitReader, params: NormalizedParameters,
   let pendingMode: "1d" | "2d" | null = null;
   let damagedRows = 0;
   let terminatedBy: NativeCcittDecodeResult["terminatedBy"] | null = null;
+  const uncompressed: UncompressedState = { active: false, white: 0, black: false };
 
   while (terminatedBy === null) {
     throwIfAborted(options.signal);
@@ -222,6 +222,7 @@ function decodeCcittReader(reader: MsbBitReader, params: NormalizedParameters,
     try {
       let mode = pendingMode;
       pendingMode = null;
+      if (mode === null && uncompressed.active) mode = "2d";
       if (mode === null) {
         const start = readLineStart(reader, params, decodedRows, options);
         if (start === "end-of-block") {
@@ -241,8 +242,11 @@ function decodeCcittReader(reader: MsbBitReader, params: NormalizedParameters,
       recoveryFloor = reader.position;
       enforceNextDecodedRow(output.rowCount, params, limits);
       decoded = mode === "1d"
-        ? decodeOneDimensionalRow(reader, params.columns, budget)
-        : decodeTwoDimensionalRow(reader, params.columns, reference?.transitions ?? [], budget);
+        ? decodeOneDimensionalRow(reader, params.columns, budget, uncompressed)
+        : decodeTwoDimensionalRow(reader, params.columns, reference?.transitions ?? [], budget, uncompressed);
+      if (uncompressed.active && params.k >= 0) {
+        throw malformed(reader, "Group 3 uncompressed data crosses its scan-line boundary.", "ccitt-uncompressed-cross-line");
+      }
     } catch (cause) {
       if (!isRecoverableRowError(cause) || params.damagedRowsBeforeError === 0) throw cause;
       damagedRows += 1;
@@ -265,6 +269,7 @@ function decodeCcittReader(reader: MsbBitReader, params: NormalizedParameters,
         ? cloneDecodedRow(reference)
         : whiteRow(params.rowStride);
       previousWasDamaged = true;
+      uncompressed.active = false; uncompressed.white = 0; uncompressed.black = false; uncompressed.exitTag = undefined;
       appendDecodedRow(output, decoded, params, limits);
       reference = decoded;
       if (synchronization.endOfBlock) terminatedBy = "end-of-block";
@@ -513,18 +518,25 @@ interface DecodedRow {
 function decodeOneDimensionalRow(
   reader: MsbBitReader,
   columns: number,
-  budget: TransitionBudget
+  budget: TransitionBudget,
+  uncompressed: UncompressedState
 ): DecodedRow {
   const row = allocateBytes(Math.ceil(columns / 8), "CCITT scan line");
   const transitions: number[] = [];
   let position = 0;
   let black = false;
   while (position < columns) {
-    const run = decodeRun(reader, black, columns - position, budget);
+    const decoded = decodeRunOrExtension(reader, black, columns - position, budget);
+    const run = typeof decoded === "number" ? decoded : decoded.makeup;
     const end = position + run;
     if (black) setBlackRange(row, position, end, budget);
-    if (end < columns) toggleTransition(transitions, end, budget);
+    if (end < columns && typeof decoded === "number") toggleTransition(transitions, end, budget);
     position = end;
+    if (typeof decoded !== "number") {
+      uncompressed.active = true;
+      ({ position, black } = decodeUncompressedRow(reader, row, transitions, position, black, columns, budget, uncompressed));
+      continue;
+    }
     black = !black;
   }
   return { blackBits: row, transitions };
@@ -534,7 +546,8 @@ function decodeTwoDimensionalRow(
   reader: MsbBitReader,
   columns: number,
   reference: readonly number[],
-  budget: TransitionBudget
+  budget: TransitionBudget,
+  uncompressed: UncompressedState
 ): DecodedRow {
   const row = allocateBytes(Math.ceil(columns / 8), "CCITT scan line");
   const transitions: number[] = [];
@@ -545,13 +558,17 @@ function decodeTwoDimensionalRow(
   // allows b1 to sit on column 0; afterwards a0 is the last decoded position.
   let atRowStart = true;
   while (position < columns) {
+    if (uncompressed.active) {
+      ({ position, black } = decodeUncompressedRow(reader, row, transitions, position, black, columns, budget, uncompressed));
+      if (position > 0) atRowStart = false;
+      continue;
+    }
     budget.consume();
     const mode = decodeCode(reader, MODE_CODES, 7, "two-dimensional mode");
     if (mode.kind === "extension") {
-      throw new PdfError("unsupported-filter", "CCITT extension and uncompressed modes are unsupported.", {
-        offset: reader.byteOffset,
-        details: { reason: "ccitt-extension-mode", bitOffset: reader.position }
-      });
+      readUncompressedSelector(reader);
+      uncompressed.active = true;
+      continue;
     }
     const a0 = atRowStart ? -1 : position;
     atRowStart = false;
@@ -615,6 +632,14 @@ function decodeRun(
   remaining: number,
   budget: TransitionBudget
 ): number {
+  const run = decodeRunOrExtension(reader, black, remaining, budget);
+  if (typeof run !== "number") throw malformed(reader,
+    "A CCITT horizontal run uses a one-dimensional uncompressed entrance.", "ccitt-horizontal-extension");
+  return run;
+}
+
+function decodeRunOrExtension(reader: MsbBitReader, black: boolean, remaining: number,
+  budget: TransitionBudget): number | { readonly makeup: number } {
   let total = 0;
   while (true) {
     budget.consume();
@@ -625,10 +650,8 @@ function decodeRun(
       black ? "black run" : "white run"
     );
     if (value === RUN_EXTENSION) {
-      throw new PdfError("unsupported-filter", "CCITT one-dimensional extension modes are unsupported.", {
-        offset: reader.byteOffset,
-        details: { reason: "ccitt-1d-extension-mode", bitOffset: reader.position }
-      });
+      readUncompressedSelector(reader);
+      return { makeup: total };
     }
     total = checkedAdd(total, value, "CCITT run length");
     if (total > remaining) {
@@ -636,6 +659,57 @@ function decodeRun(
     }
     if (value < 64) return total;
   }
+}
+
+interface UncompressedState {
+  active: boolean;
+  white: number;
+  black: boolean;
+  exitTag?: boolean;
+}
+
+function readUncompressedSelector(reader: MsbBitReader): void {
+  let selector = 0;
+  for (let bit = 0; bit < 3; bit += 1) selector = selector * 2 + reader.readRequired("Truncated CCITT extension selector.");
+  if (selector !== 7) throw new PdfError("unsupported-filter", "The CCITT extension selector is reserved.", {
+    offset: reader.byteOffset, details: { reason: "ccitt-extension-mode", selector, bitOffset: reader.position }
+  });
+}
+
+/** ITU-T T.4 table 4 / T.6 table 4. T.6 concatenates literal patterns across rows. */
+function decodeUncompressedRow(reader: MsbBitReader, row: Uint8Array, transitions: number[],
+  position: number, black: boolean, columns: number, budget: TransitionBudget,
+  state: UncompressedState): { readonly position: number; readonly black: boolean } {
+  const setColor = (next: boolean): void => {
+    if (next !== black && position < columns) toggleTransition(transitions, position, budget);
+    black = next;
+  };
+  const token = (): void => {
+    budget.consume();
+    let zeros = 0;
+    while (reader.readRequired("Truncated CCITT uncompressed code.") === 0) {
+      if (++zeros > 10) throw malformed(reader, "Malformed CCITT uncompressed code.", "ccitt-uncompressed-code");
+    }
+    state.white = zeros < 6 ? zeros : zeros - 6;
+    state.black = zeros < 5;
+    if (zeros >= 6) state.exitTag = reader.readRequired("Truncated CCITT uncompressed exit tag.") === 1;
+  };
+  while (state.active) {
+    if (state.white > 0 && position < columns) {
+      const count = Math.min(state.white, columns - position);
+      setColor(false); state.white -= count; position += count;
+    } else if (state.black && position < columns) {
+      setColor(true); setBlackRange(row, position, position + 1, budget);
+      position += 1; state.black = false;
+    } else if (state.white === 0 && !state.black && state.exitTag !== undefined) {
+      setColor(state.exitTag); state.exitTag = undefined; state.active = false;
+    } else if (state.white === 0 && !state.black) token();
+    else break;
+    // Read the next token at a row boundary to distinguish an empty exit from
+    // a literal pattern continued on the following Group 4 scan line.
+    if (position === columns && (state.white > 0 || state.black)) break;
+  }
+  return { position, black };
 }
 
 function decodeCode<T>(

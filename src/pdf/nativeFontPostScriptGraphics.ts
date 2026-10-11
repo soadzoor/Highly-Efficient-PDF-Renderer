@@ -1,5 +1,5 @@
 import type { NativeGlyphPathCommand, NativeGlyphPostScriptClip, NativeGlyphPostScriptPaint,
-  NativeGlyphPostScriptFinalState, NativeGlyphPostScriptStrokeField } from "./nativeFont";
+  NativeGlyphPostScriptFinalState, NativeGlyphPostScriptStrokeField, NativeGlyphPostScriptPattern } from "./nativeFont";
 import { nativeFontPostScriptIdentityMatrix, nativeFontPostScriptTransform,
   nativeFontPostScriptConcatMatrices } from "./nativeFontPostScriptMatrix";
 import type { NativeFontPostScriptMatrix } from "./nativeFontPostScriptMatrix";
@@ -22,6 +22,7 @@ export interface NativeFontPostScriptGraphicsState {
   readonly stroke: Stroke;
   readonly color: Color;
   readonly sourceColor: SourceColor | null;
+  readonly pattern?: NativeGlyphPostScriptPattern | null;
   readonly changedStrokeFields: readonly NativeGlyphPostScriptStrokeField[];
   /** Present on VM save snapshots; ordinary gsave records omit this stack. */
   readonly savedStates?: readonly NativeFontPostScriptGraphicsState[];
@@ -47,6 +48,10 @@ export interface NativeFontPostScriptImageOptions {
   readonly mask?: boolean;
   readonly polarity?: boolean;
   readonly interpolate?: boolean;
+  /** Raw-sample component ranges, tested before Decode (ImageType 4). */
+  readonly colorKey?: readonly number[];
+  /** Explicit coverage at its original, independently sampled resolution. */
+  readonly softMask?: { readonly width: number; readonly height: number; readonly data: Uint8Array; readonly interpolate: boolean };
   readonly convertColor?: (values: readonly number[]) => readonly [number, number, number, number];
 }
 
@@ -66,6 +71,8 @@ export class NativeFontPostScriptGlyphContext {
     dashArray: Object.freeze([]), dashPhase: 0, transform: nativeFontPostScriptIdentityMatrix() });
   private paintColor: Color = null;
   private sourceColor: SourceColor | null = null;
+  private pattern: NativeGlyphPostScriptPattern | null = null;
+  private colorLocked = false;
   private changedStrokeFields = new Set<NativeGlyphPostScriptStrokeField>();
   private readonly paints: NativeGlyphPostScriptPaint[] = [];
   private retainedCommands = 0;
@@ -90,12 +97,14 @@ export class NativeFontPostScriptGlyphContext {
   get paintRecords(): readonly NativeGlyphPostScriptPaint[] { return Object.freeze([...this.paints]); }
   get diagnostics(): readonly PdfDiagnostic[] { return Object.freeze([...this.notices]); }
   get metrics(): NativeFontPostScriptGlyphMetrics | undefined { return this.glyphMetrics; }
+  createPatternContext(): NativeFontPostScriptGlyphContext { return new NativeFontPostScriptGlyphContext(this.options); }
   get strokeStyle(): Stroke { return this.stroke; }
   get color(): Color { return this.paintColor; }
   get finalState(): NativeGlyphPostScriptFinalState | undefined {
     const transformed = this.stroke.transform.some((value, index) => value !== (index === 0 || index === 3 ? 1 : 0));
-    if (!this.clips.length && this.paintColor === null && !this.changedStrokeFields.size && !transformed) return undefined;
+    if (!this.clips.length && this.paintColor === null && !this.pattern && !this.changedStrokeFields.size && !transformed) return undefined;
     return Object.freeze({ clips: this.clips, color: this.paintColor,
+      ...(this.pattern ? { pattern: this.pattern } : {}),
       ...(this.changedStrokeFields.size || transformed ? { stroke: this.stroke,
         changedStrokeFields: Object.freeze([...this.changedStrokeFields]) } : {}) });
   }
@@ -301,19 +310,23 @@ export class NativeFontPostScriptGlyphContext {
     this.changedStrokeFields.add("dashArray"); this.changedStrokeFields.add("dashPhase");
   }
   setColorRGB(r: number, g: number, b: number): void {
+    this.checkColor(); this.pattern = null;
     const values = Object.freeze([unit(r), unit(g), unit(b)]); this.paintColor = Object.freeze([...values, 1]) as NonNullable<Color>;
     this.sourceColor = Object.freeze({ space: "DeviceRGB", values });
   }
   setColorGray(gray: number): void {
+    this.checkColor(); this.pattern = null;
     gray = unit(gray); this.paintColor = Object.freeze([gray, gray, gray, 1]);
     this.sourceColor = Object.freeze({ space: "DeviceGray", values: Object.freeze([gray]) });
   }
   setColorCMYK(c: number, m: number, y: number, k: number): void {
+    this.checkColor(); this.pattern = null;
     c = unit(c); m = unit(m); y = unit(y); k = unit(k);
     this.paintColor = Object.freeze([1 - Math.min(1, c + k), 1 - Math.min(1, m + k), 1 - Math.min(1, y + k), 1]);
     this.sourceColor = Object.freeze({ space: "DeviceCMYK", values: Object.freeze([c, m, y, k]) });
   }
   setColorHSB(h: number, s: number, b: number): void {
+    this.checkColor(); this.pattern = null;
     h = unit(h); s = unit(s); b = unit(b); const sector = h * 6, index = Math.floor(sector) % 6, fraction = sector - Math.floor(sector);
     const p = b * (1 - s), q = b * (1 - s * fraction), t = b * (1 - s * (1 - fraction));
     const rgb = [[b, t, p], [q, b, p], [p, b, t], [p, q, b], [t, p, b], [b, p, q]][index];
@@ -323,6 +336,7 @@ export class NativeFontPostScriptGlyphContext {
   }
   setColorSpaceColor(space: string, values: readonly number[], color: readonly [number, number, number, number],
     deviceSpace?: SourceColor["deviceSpace"], deviceValues?: readonly number[], deviceCmyk?: SourceColor["deviceCmyk"]): void {
+    this.checkColor(); this.pattern = null;
     values.forEach(finite); color.forEach(finite);
     this.paintColor = Object.freeze([...color]) as NonNullable<Color>;
     this.sourceColor = Object.freeze({ space, values: Object.freeze([...values]), deviceSpace,
@@ -330,11 +344,17 @@ export class NativeFontPostScriptGlyphContext {
       ...(deviceCmyk ? { deviceCmyk: Object.freeze([...deviceCmyk]) as SourceColor["deviceCmyk"] } : {}) });
   }
   noteColorApproximation(code: string, message: string): void { this.notice(code, message); }
+  setPattern(pattern: NativeGlyphPostScriptPattern | null): void { this.checkColor(); this.pattern = pattern; }
+  lockPatternColor(): void { this.colorLocked = true; }
+  private checkColor(): void {
+    if (this.colorLocked) throw unsupported("An uncolored pattern PaintProc cannot specify colors.", "undefined");
+  }
   paint(kind: "fill" | "eofill" | "stroke", matrix: NativeFontPostScriptMatrix): void {
     throwIfAborted(this.options.signal);
     if (this.commands.some(command => command.kind !== "move" && command.kind !== "close")) this.paints.push(Object.freeze({
       kind: kind === "stroke" ? "stroke" : "fill", commands: this.pathCommands, fillRule: kind === "eofill" ? 1 : 0,
       clips: this.clips, color: this.paintColor,
+      ...(this.pattern ? { pattern: this.pattern } : {}),
       ...(kind === "stroke" ? { stroke: Object.freeze({ ...this.stroke, transform: Object.freeze([...matrix]) }),
         changedStrokeFields: Object.freeze([...this.changedStrokeFields]) } : {})
     }));
@@ -352,6 +372,7 @@ export class NativeFontPostScriptGlyphContext {
    */
   image(options: NativeFontPostScriptImageOptions): void {
     throwIfAborted(this.options.signal);
+    if (this.colorLocked && !options.mask) throw unsupported("An uncolored PostScript pattern cannot paint a color image.", "undefined");
     const { width, height, bitsPerComponent: bits, components, data } = options;
     if (!Number.isSafeInteger(width) || width < 0 || !Number.isSafeInteger(height) || height < 0 ||
       ![1, 2, 4, 8, 12].includes(bits) || !Number.isSafeInteger(components) || components < 1 ||
@@ -362,6 +383,13 @@ export class NativeFontPostScriptGlyphContext {
     if (!Number.isSafeInteger(needed)) throw new PdfError("resource-limit", "PostScript glyph image byte count is not representable.");
     const decode = options.decode ?? Array.from({ length: components * 2 }, (_, index) => index % 2);
     if (decode.length !== components * 2 || decode.some(value => !Number.isFinite(value))) throw unsupported("Invalid PostScript image Decode array.", "rangecheck");
+    if (options.colorKey && (options.colorKey.length !== components * 2 || options.colorKey.some(value => !Number.isSafeInteger(value)))) throw unsupported("Invalid PostScript image color key.", "rangecheck");
+    const softMask = options.softMask;
+    if (softMask && (!Number.isSafeInteger(softMask.width) || softMask.width <= 0 || !Number.isSafeInteger(softMask.height) || softMask.height <= 0 ||
+      !Number.isSafeInteger(softMask.width * softMask.height) || softMask.data.length !== softMask.width * softMask.height)) throw unsupported("Invalid PostScript explicit image mask.", "rangecheck");
+    if (softMask && (softMask.width !== width || softMask.height !== height || softMask.interpolate || options.interpolate === true)) {
+      this.notice("font.postscript-image-mask-resampled", "The explicit PostScript image mask retains its own resolution and interpolation; HEP combines its coverage on the color image grid, which can change mask edges.");
+    }
     const transform = nativeFontPostScriptConcatMatrices(inverse(options.imageMatrix), options.ctm);
     const maximum = 2 ** bits - 1;
     if (!options.mask || options.interpolate) {
@@ -370,7 +398,20 @@ export class NativeFontPostScriptGlyphContext {
       const tailWidth = Math.min(width, Math.floor(remaining * 8 / (components * bits)));
       const retain = (imageWidth: number, imageHeight: number, firstRow: number): void => {
         if (imageWidth === 0 || imageHeight === 0) return;
-        const byteLength = imageWidth * imageHeight * 4;
+        let retainedMask = softMask;
+        if (softMask && (imageWidth !== width || imageHeight !== height || firstRow !== 0)) {
+          // A truncated color source is cropped, so crop the coverage to the
+          // same extent; missing color samples are never invented or painted.
+          const coverage = new Uint8Array(imageWidth * imageHeight);
+          for (let y = 0; y < imageHeight; y++) {
+            throwIfAborted(this.options.signal);
+            const row = Math.min(softMask.height - 1, Math.floor((firstRow + y + .5) * softMask.height / height));
+            for (let x = 0; x < imageWidth; x++) coverage[y * imageWidth + x] = softMask.data[row * softMask.width +
+              Math.min(softMask.width - 1, Math.floor((x + .5) * softMask.width / width))];
+          }
+          retainedMask = { width: imageWidth, height: imageHeight, data: coverage, interpolate: softMask.interpolate };
+        }
+        const byteLength = imageWidth * imageHeight * 4 + (retainedMask?.data.length ?? 0);
         if (!Number.isSafeInteger(byteLength) || byteLength > (this.options.maxImageBytes ?? Number.MAX_SAFE_INTEGER) - this.retainedImageBytes) {
           throw new PdfError("resource-limit", "PostScript glyph exceeds its configured decoded-image byte limit.", {
             details: { reason: "font-postscript-image-byte-limit", maxImageBytes: this.options.maxImageBytes ?? null }
@@ -378,7 +419,7 @@ export class NativeFontPostScriptGlyphContext {
         }
         this.checkCount(this.commands.length + 5);
         let rgba: Uint8Array;
-        try { rgba = new Uint8Array(byteLength); }
+        try { rgba = new Uint8Array(imageWidth * imageHeight * 4); }
         catch (cause) { throw new PdfError("resource-limit", "Cannot allocate PostScript glyph image pixels.", { cause }); }
         const values = new Array<number>(components);
         let maskSample = 0;
@@ -386,12 +427,14 @@ export class NativeFontPostScriptGlyphContext {
           throwIfAborted(this.options.signal);
           for (let x = 0; x < imageWidth; x++) {
             if ((x & 255) === 0) throwIfAborted(this.options.signal);
+            let keyed = options.colorKey !== undefined;
             for (let component = 0; component < components; component++) {
               const bit = (firstRow + y) * rowBytes * 8 + (x * components + component) * bits;
               let sample = 0;
               for (let offset = 0; offset < bits; offset++) sample = sample * 2 +
                 ((data[Math.floor((bit + offset) / 8)] >>> (7 - ((bit + offset) % 8))) & 1);
               if (options.mask) maskSample = sample;
+              if (options.colorKey && (sample < options.colorKey[component * 2] || sample > options.colorKey[component * 2 + 1])) keyed = false;
               values[component] = finite(decode[component * 2] + sample / maximum * (decode[component * 2 + 1] - decode[component * 2]));
             }
             const offset = (y * imageWidth + x) * 4;
@@ -406,6 +449,7 @@ export class NativeFontPostScriptGlyphContext {
                     1 - Math.min(1, unit(values[1]) + unit(values[3])),
                     1 - Math.min(1, unit(values[2]) + unit(values[3])), 1]);
               for (let channel = 0; channel < 4; channel++) rgba[offset + channel] = Math.round(unit(color[channel]) * 255);
+              if (keyed) rgba[offset + 3] = 0;
             }
           }
         }
@@ -413,7 +457,8 @@ export class NativeFontPostScriptGlyphContext {
         this.paints.push(Object.freeze({ kind: "image", width: imageWidth, height: imageHeight,
           rgba, transform: Object.freeze([...placed]) as NativeFontPostScriptMatrix,
           interpolate: options.interpolate === true, clips: this.clips,
-          color: options.mask ? this.paintColor : null, ...(options.mask ? { imageMask: true } : {}) }));
+          color: options.mask ? this.paintColor : null, ...(options.mask ? { imageMask: true, ...(this.pattern ? { pattern: this.pattern } : {}) } : {}),
+          ...(retainedMask ? { softMask: Object.freeze(retainedMask) } : {}) }));
         this.retainedCommands += 5; this.retainedImageBytes += byteLength;
       };
       retain(width, completeRows, 0);
@@ -472,7 +517,8 @@ export class NativeFontPostScriptGlyphContext {
         commands.push(Object.freeze({ kind: "move", x: a[0], y: a[1] }), Object.freeze({ kind: "line", x: b[0], y: b[1] }),
           Object.freeze({ kind: "line", x: c[0], y: c[1] }), Object.freeze({ kind: "line", x: d[0], y: d[1] }), Object.freeze({ kind: "close" }));
       }
-      this.paints.push(Object.freeze({ kind: "fill", commands: Object.freeze(commands), fillRule: 0, clips: this.clips, color: group.color }));
+      this.paints.push(Object.freeze({ kind: "fill", commands: Object.freeze(commands), fillRule: 0, clips: this.clips, color: group.color,
+        ...(this.pattern ? { pattern: this.pattern } : {}) }));
     }
     this.retainedCommands += rectangleCount * 5;
     if (data.length < needed) this.notice("font.postscript-image-truncated", "PostScript image data ended early; only available samples were painted.");
@@ -486,11 +532,13 @@ export class NativeFontPostScriptGlyphContext {
   private localState(): NativeFontPostScriptGraphicsState {
     return Object.freeze({ commands: this.pathCommands, currentPoint: this.point, startPoint: this.start,
       pathOpen: this.open, clips: this.clips, stroke: this.stroke, color: this.paintColor, sourceColor: this.sourceColor,
+      pattern: this.pattern,
       changedStrokeFields: Object.freeze([...this.changedStrokeFields]) });
   }
   restoreState(state: NativeFontPostScriptGraphicsState): void {
     this.commands = [...state.commands]; this.point = state.currentPoint; this.start = state.startPoint;
     this.open = state.pathOpen; this.clips = state.clips; this.stroke = state.stroke; this.paintColor = state.color; this.sourceColor = state.sourceColor;
+    this.pattern = state.pattern ?? null;
     this.changedStrokeFields = new Set(state.changedStrokeFields);
     if (state.savedStates) { this.states.length = 0; for (const saved of state.savedStates) this.states.push(saved); }
   }
@@ -528,9 +576,11 @@ export function transformNativeGlyphPostScriptPaints(records: readonly NativeGly
   return Object.freeze(records.map(record => {
     const clips = Object.freeze(record.clips.map(clip => Object.freeze({ ...clip,
       commands: transformCommands(clip.commands, matrix) })));
-    if (record.kind === "image") return Object.freeze({ ...record, clips,
+    const pattern = record.pattern ? Object.freeze({ ...record.pattern,
+      matrix: nativeFontPostScriptConcatMatrices(record.pattern.matrix, matrix) }) : undefined;
+    if (record.kind === "image") return Object.freeze({ ...record, clips, ...(pattern ? { pattern } : {}),
       transform: nativeFontPostScriptConcatMatrices(record.transform, matrix) });
-    return Object.freeze({ ...record, clips, commands: transformCommands(record.commands, matrix),
+    return Object.freeze({ ...record, clips, ...(pattern ? { pattern } : {}), commands: transformCommands(record.commands, matrix),
       ...(record.stroke ? { stroke: Object.freeze({ ...record.stroke,
         transform: nativeFontPostScriptConcatMatrices(record.stroke.transform, matrix) }) } : {}) });
   }));
@@ -538,6 +588,8 @@ export function transformNativeGlyphPostScriptPaints(records: readonly NativeGly
 export function transformNativeGlyphPostScriptFinalState(state: NativeGlyphPostScriptFinalState,
   matrix: NativeFontPostScriptMatrix): NativeGlyphPostScriptFinalState {
   return Object.freeze({ ...state,
+    ...(state.pattern ? { pattern: Object.freeze({ ...state.pattern,
+      matrix: nativeFontPostScriptConcatMatrices(state.pattern.matrix, matrix) }) } : {}),
     clips: Object.freeze(state.clips.map(clip => Object.freeze({ ...clip, commands: transformCommands(clip.commands, matrix) }))),
     ...(state.stroke ? { stroke: Object.freeze({ ...state.stroke,
       transform: nativeFontPostScriptConcatMatrices(state.stroke.transform, matrix) }) } : {})

@@ -66,8 +66,8 @@ try {
   // A mask at a different resolution is sampled across the image's own grid.
   const scaled = await compile(fixture(true, 4));
   const scaledLayer = scaled.scene.rasterLayers.find(entry => entry.width === 2 && entry.height === 2);
-  assert.deepEqual([...scaledLayer.data].filter((_, index) => index % 4 === 3), [0, 34, 136, 170],
-    "a mask of another size is point-sampled, not stretched or refused");
+  assert.deepEqual([...scaledLayer.data].filter((_, index) => index % 4 === 3), [85, 119, 221, 255],
+    "a mask of another size is point-sampled at color pixel centers");
 
   // Without a mask the image keeps full alpha, and the page still lowers.
   const plain = await compile(fixture(false));

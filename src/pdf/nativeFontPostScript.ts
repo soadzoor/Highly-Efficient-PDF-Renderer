@@ -8,9 +8,14 @@ import { createNativeFontPostScriptMemoryFile, createNativeFontPostScriptFilter,
 import type { NativeFontPostScriptFile, NativeFontPostScriptFilterParameters } from "./nativeFontPostScriptFile";
 import { createNativeFontPostScriptProcedureFile, snapshotNativeFontPostScriptProcedureFile,
   restoreNativeFontPostScriptProcedureFile } from "./nativeFontPostScriptProcedureFile";
-import type { NativeFontPostScriptGlyphContext, NativeFontPostScriptGraphicsState } from "./nativeFontPostScriptGraphics";
+import { NativeFontPostScriptGlyphContext, transformNativeGlyphPostScriptPaints } from "./nativeFontPostScriptGraphics";
+import type { NativeFontPostScriptGraphicsState } from "./nativeFontPostScriptGraphics";
+import type { NativeGlyphPostScriptPattern } from "./nativeFont";
+import { nativeFontPostScriptShading } from "./nativeFontPostScriptShading";
 import { parseNativeFontPostScriptColorSpace } from "./nativeFontPostScriptColor";
 import type { NativeFontPostScriptColorSpace } from "./nativeFontPostScriptColor";
+import { createNativeFontPostScriptDefaultColorRendering, parseNativeFontPostScriptColorRendering } from "./nativeFontPostScriptColorRendering";
+import type { NativeFontPostScriptColorRendering } from "./nativeFontPostScriptColorRendering";
 
 export interface NativeFontPostScriptName { readonly kind: "name"; readonly value: string; readonly literal: boolean; }
 export interface NativeFontPostScriptProcedure { readonly kind: "procedure"; readonly tokens: readonly NativeFontPostScriptValue[]; }
@@ -24,6 +29,10 @@ export type NativeFontPostScriptValue = number | boolean | null | Uint8Array |
 type Value = NativeFontPostScriptValue;
 type Dictionary = Map<string, Value>;
 type Procedure = NativeFontPostScriptProcedure;
+
+// Instantiated cells contain immutable native marks. VM dictionary clones share
+// these marks while preserving their own source dictionary identities.
+const patternInstances = new WeakMap<Dictionary, NativeGlyphPostScriptPattern>();
 
 export interface NativeFontPostScriptOptions {
   readonly signal?: AbortSignal;
@@ -97,7 +106,9 @@ interface VmSnapshot {
   readonly objects: Map<object, { readonly value: Value; readonly contents?: Value[] | Uint8Array | [string, Value][]; readonly access: Access; readonly capacity?: number }>;
   readonly matrix: NativeFontPostScriptMatrix;
   readonly matrixKnown: boolean;
-  readonly graphics: readonly { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState }[];
+  readonly graphics: readonly { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState; colorRendering: Dictionary; colorRenderer?: NativeFontPostScriptColorRendering }[];
+  readonly colorRendering: Dictionary;
+  readonly colorRenderer?: NativeFontPostScriptColorRendering;
   readonly definedFont: Dictionary | null;
   readonly resources: readonly [string, Dictionary][];
   readonly createdCount: number;
@@ -132,9 +143,15 @@ class FontPostScriptVm {
   private readonly saves: PsSave[] = [];
   private readonly colorSpaces = new WeakMap<readonly number[], Value>();
   private readonly colorModels = new WeakMap<readonly number[], NativeFontPostScriptColorSpace>();
+  private defaultColorRendering = createNativeFontPostScriptDefaultColorRendering();
+  private colorRendering = this.defaultColorRendering;
+  private colorRenderer?: NativeFontPostScriptColorRendering;
+  private readonly colorPatterns = new WeakMap<readonly number[], Dictionary>();
+  private patternContext?: NativeFontPostScriptGlyphContext;
+  private get currentGlyphContext(): NativeFontPostScriptGlyphContext | undefined { return this.patternContext ?? this.options.glyphContext; }
   private matrix: NativeFontPostScriptMatrix;
   private matrixKnown: boolean;
-  private readonly graphics: { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState }[] = [];
+  private readonly graphics: { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState; colorRendering: Dictionary; colorRenderer?: NativeFontPostScriptColorRendering }[] = [];
   private randomSeed = 1;
   private packing = false;
   private globalMode = false;
@@ -160,6 +177,25 @@ class FontPostScriptVm {
     this.system.set("$error", this.errors);
     this.errors.set("newerror", false);
     this.resources.set("Font", this.localFonts); this.globalResources.set("Font", this.globalDirectory);
+    this.globalResources.set("ColorRendering", new Map([["DefaultColorRendering", this.defaultColorRendering]]));
+    const colorRenderingProcedures = new Map<string, Value>([
+      ["GetPageDeviceName", { kind: "procedure", tokens: [literalName("none")] }],
+      ["GetHalftoneName", { kind: "procedure", tokens: [literalName("none")] }],
+      ["GetSubstituteCRD", { kind: "procedure", tokens: [{ kind: "operator", name: "pop" }, literalName("DefaultColorRendering")] }]
+    ]);
+    this.globalResources.set("ProcSet", new Map([["ColorRendering", colorRenderingProcedures]]));
+    for (const directory of this.globalResources.values()) globalAttributes.set(directory, true);
+    for (const root of [this.defaultColorRendering, colorRenderingProcedures]) {
+      this.registerGraph(root, true);
+      const pending: Value[] = [root], seen = new Set<object>();
+      while (pending.length) {
+        const value = pending.pop()!;
+        if (!isComposite(value) || seen.has(value)) continue;
+        seen.add(value); accessAttributes.set(value, 2);
+        if (value instanceof Map) pending.push(...value.values());
+        else if (sequence(value)) pending.push(...sequence(value)!);
+      }
+    }
     this.system.set("StandardEncoding", reduceAccess(encoding(options.standardEncoding), 2));
     this.system.set("ExpertEncoding", reduceAccess(encoding(options.expertEncoding), 2));
     this.system.set("version", new TextEncoder().encode("3010"));
@@ -188,13 +224,14 @@ class FontPostScriptVm {
   // OtherSubrs. This does not grant explicit PS get/put/begin extra access.
   enterDictionary(dictionary: Dictionary): void { this.dictionaries.push(dictionary); this.privilegedDictionaries.add(dictionary); }
   beginGlyphState(): void {
-    if (this.options.glyphContext) { this.matrix = this.readMatrix([...this.options.glyphContext.strokeStyle.transform]); this.matrixKnown = true; }
+    if (this.currentGlyphContext) { this.matrix = this.readMatrix([...this.currentGlyphContext.strokeStyle.transform]); this.matrixKnown = true; }
   }
-  finishGlyphState(): void { this.options.glyphContext?.setCurrentMatrix(this.matrix); }
+  finishGlyphState(): void { this.currentGlyphContext?.setCurrentMatrix(this.matrix); }
 
   glyphEnvironment(dictionary: Dictionary): Dictionary {
     return new Map<string, Value>([["font", dictionary], ["system", this.system], ["errors", this.errors], ["user", this.user], ["global", this.global], ["directory", this.directory],
-      ["localFonts", this.localFonts], ["globalDirectory", this.globalDirectory], ["resources", new Map(this.resources)], ["globalResources", new Map(this.globalResources)]]);
+      ["localFonts", this.localFonts], ["globalDirectory", this.globalDirectory], ["resources", new Map(this.resources)], ["globalResources", new Map(this.globalResources)],
+      ["colorRendering", this.colorRendering], ["defaultColorRendering", this.defaultColorRendering]]);
   }
   seedGlyphEnvironment(environment: Dictionary): void {
     // Adopt graph roots rather than copying their entries: immediately
@@ -207,6 +244,8 @@ class FontPostScriptVm {
     this.directory = environment.get("directory") as Dictionary;
     this.localFonts = environment.get("localFonts") as Dictionary;
     this.globalDirectory = environment.get("globalDirectory") as Dictionary;
+    this.colorRendering = environment.get("colorRendering") as Dictionary;
+    this.defaultColorRendering = environment.get("defaultColorRendering") as Dictionary;
     this.dictionaries.splice(0, 3, this.system, this.global, this.user);
     this.resources.clear(); for (const [key, value] of environment.get("resources") as Dictionary) this.resources.set(key, value as Dictionary);
     this.globalResources.clear(); for (const [key, value] of environment.get("globalResources") as Dictionary) this.globalResources.set(key, value as Dictionary);
@@ -399,8 +438,8 @@ class FontPostScriptVm {
     return this.matrix;
   }
   private glyphContext(operator: string): NativeFontPostScriptGlyphContext {
-    if (!this.options.glyphContext) throw unsupported("PostScript painting requires a glyph graphics context.", operator);
-    return this.options.glyphContext;
+    if (!this.currentGlyphContext) throw unsupported("PostScript painting requires a glyph graphics context.", operator);
+    return this.currentGlyphContext;
   }
   private currentColorSpace(): Value {
     const context = this.glyphContext("currentcolorspace"), values = context.sourceColorValues, space = context.sourceColorSpace;
@@ -409,12 +448,172 @@ class FontPostScriptVm {
     if (!array) { array = reduceAccess([literalName(space)], 2); this.register(array, true); this.colorSpaces.set(values, array); }
     return array;
   }
+  private patternSpace(value: Value): readonly Value[] | null {
+    if (isComposite(value)) requireAccess(value, 2);
+    const entries = isName(value) ? [value] : arraySequence(value);
+    if (!entries || !isName(entries[0]) || entries[0].value !== "Pattern") return null;
+    if (entries.length !== 1 && entries.length !== 2) throw unsupported("A Pattern color space requires zero or one base space.", "setcolorspace", "rangecheck");
+    if (entries.length === 2) this.colorModel(entries[1]);
+    return entries;
+  }
+  private selectPatternSpace(value: Value): void {
+    const context = this.glyphContext("setcolorspace");
+    const space = isName(value) ? reduceAccess([literalName("Pattern")], 2) : value;
+    if (isName(value)) this.register(space, true);
+    context.setColorSpaceColor("Pattern", [], [0, 0, 0, 0]);
+    this.colorSpaces.set(context.sourceColorValues!, space);
+  }
+  private setPatternColor(): void {
+    const dictionary = this.pop();
+    if (!(dictionary instanceof Map)) throw unsupported("PostScript setpattern requires an instantiated pattern dictionary.", "setcolor", "typecheck");
+    requireAccess(dictionary, 2);
+    const pattern = patternInstances.get(dictionary);
+    if (!pattern) throw unsupported("PostScript patterns must first be instantiated by makepattern.", "setcolor", "rangecheck");
+    const space = this.currentColorSpace(), entries = this.patternSpace(space)!;
+    let values: readonly number[] = [], color: readonly [number, number, number, number] = [0, 0, 0, 1];
+    if (pattern.paintType === 2) {
+      if (entries.length !== 2) throw unsupported("An uncolored pattern requires a base color space.", "setcolor", "rangecheck");
+      const model = this.colorModel(entries[1]), components: number[] = [];
+      for (let i = 0; i < model.components; i++) components.unshift(this.number());
+      values = model.normalize(components); color = model.convert(values).rgba;
+    }
+    const context = this.glyphContext("setcolor");
+    context.setColorSpaceColor("Pattern", values, color); context.setPattern(pattern);
+    this.colorSpaces.set(context.sourceColorValues!, space); this.colorPatterns.set(context.sourceColorValues!, dictionary);
+  }
+  private makePattern(): void {
+    const operand = this.readMatrix(this.pop()), source = this.pop();
+    if (!(source instanceof Map)) throw unsupported("PostScript makepattern requires a dictionary.", "makepattern", "typecheck");
+    requireAccess(source, 2);
+    if (source.has("Implementation")) throw unsupported("PostScript makepattern requires a prototype pattern.", "makepattern", "rangecheck");
+    if (source.get("PatternType") === 2) {
+      const dictionary = new Map(source);
+      dictionary.set("Implementation", reduceAccess([], 1)); this.register(dictionary, false); reduceAccess(dictionary, 2);
+      patternInstances.set(dictionary, Object.freeze({ paintType: 1, matrix: nativeFontPostScriptConcatMatrices(operand, this.matrix),
+        shading: this.shading(source.get("Shading") ?? null) }));
+      this.push(dictionary); return;
+    }
+    if (source.get("PatternType") !== 1) throw unsupported("Invalid PostScript pattern type.", "makepattern", "rangecheck");
+    const paintType = requireNumber(source.get("PaintType") ?? null), tilingType = requireNumber(source.get("TilingType") ?? null);
+    const boxValue = source.get("BBox") ?? null; requireAccess(boxValue, 2);
+    const bbox = arraySequence(boxValue)?.map(requireNumber), xStep = requireNumber(source.get("XStep") ?? null), yStep = requireNumber(source.get("YStep") ?? null);
+    if ((paintType !== 1 && paintType !== 2) || ![1, 2, 3].includes(tilingType) || !bbox || bbox.length !== 4 ||
+      bbox[0] > bbox[2] || bbox[1] > bbox[3] || !xStep || !yStep || ![...bbox, xStep, yStep].every(Number.isFinite)) {
+      throw unsupported("Invalid PostScript tiling pattern parameters.", "makepattern", "rangecheck");
+    }
+    const procedure = source.get("PaintProc");
+    if (!isProcedure(procedure)) throw unsupported("PostScript pattern PaintProc requires a procedure.", "makepattern", "typecheck");
+    const matrix = nativeFontPostScriptConcatMatrices(operand, this.matrix);
+    let inverse: NativeFontPostScriptMatrix;
+    try { inverse = nativeFontPostScriptInvertMatrix(matrix); }
+    catch (error) {
+      if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
+      throw unsupported("PostScript makepattern requires an invertible pattern matrix.", "makepattern", "undefinedresult");
+    }
+    const dictionary = new Map(source);
+    this.register(dictionary, false);
+    dictionary.set("Implementation", reduceAccess([], 1)); reduceAccess(dictionary, 2);
+    const parent = this.currentGlyphContext;
+    const context = parent?.createPatternContext() ?? new NativeFontPostScriptGlyphContext({ signal: this.options.signal });
+    if (parent) context.restoreState({ ...parent.captureState(), commands: [], currentPoint: null, startPoint: null,
+      pathOpen: false, clips: [], pattern: null, savedStates: [] });
+    if (paintType === 2) {
+      context.restoreState({ ...context.captureState(), color: null, sourceColor: null });
+      context.lockPatternColor();
+    }
+    context.setCurrentMatrix(matrix);
+    context.moveTo(bbox[0], bbox[1], matrix); context.lineTo(bbox[2], bbox[1], matrix);
+    context.lineTo(bbox[2], bbox[3], matrix); context.lineTo(bbox[0], bbox[3], matrix); context.closePath(); context.clip(0); context.newPath();
+    const boundary: Task = { kind: "source-boundary" }, depth = this.tasks.length, command = this.activeCommand;
+    const previousContext = this.patternContext, graphics = [...this.graphics], dictionaries = [...this.dictionaries], operands = [...this.stack];
+    this.operator("gsave"); const saved = this.graphics.at(-1)!;
+    this.patternContext = context; this.matrix = matrix; this.matrixKnown = true; this.graphics.length = 0;
+    this.tasks.push(boundary);
+    try {
+      this.push(dictionary); this.schedule(procedure); this.run(boundary);
+      if (this.stack.length !== operands.length || this.stack.some((value, index) => value !== operands[index]) ||
+        this.dictionaries.length !== dictionaries.length || this.dictionaries.some((value, index) => value !== dictionaries[index])) {
+        throw unsupported("PostScript pattern PaintProc must preserve its operand and dictionary stacks.", "makepattern", "rangecheck");
+      }
+      patternInstances.set(dictionary, Object.freeze({ paintType: paintType as 1 | 2, tilingType: tilingType as 1 | 2 | 3,
+        bbox: Object.freeze(bbox) as unknown as readonly [number, number, number, number], xStep, yStep, matrix,
+        paints: transformNativeGlyphPostScriptPaints(context.paintRecords, inverse) }));
+      for (const diagnostic of context.diagnostics) parent?.noteColorApproximation(diagnostic.code, diagnostic.message);
+    } finally {
+      this.unwindTasks(depth); this.activeCommand = command; this.patternContext = previousContext;
+      this.stack.splice(0, this.stack.length, ...operands); this.dictionaries.splice(0, this.dictionaries.length, ...dictionaries);
+      this.graphics.splice(0, this.graphics.length, ...graphics, saved); this.operator("grestore");
+    }
+    this.push(dictionary);
+  }
+  private shading(value: Value) {
+    return nativeFontPostScriptShading(value, { read: value => { if (isComposite(value)) requireAccess(value, 2); },
+      signal: this.options.signal,
+      data: value => {
+        if (value instanceof Uint8Array) { requireAccess(value, 2); return value.slice(); }
+        const source = this.imageSource(value), bytes: number[] = [];
+        for (let byte; (byte = source.readByte()) >= 0;) { throwIfAborted(this.options.signal); checkStringLength(bytes.length + 1, this.options.maxStringBytes); bytes.push(byte); }
+        return Uint8Array.from(bytes);
+      }
+    });
+  }
+  private shade(): void {
+    const value = this.pop(), context = this.glyphContext("shfill"), matrix = this.contextMatrix("shfill");
+    const shading = this.shading(value);
+    if (!(value instanceof Map)) throw unsupported("PostScript shfill requires a shading dictionary.", "shfill", "typecheck");
+    let bounds: number[] | undefined;
+    const box = value.get("BBox");
+    if (box !== undefined) { requireAccess(box, 2); bounds = arraySequence(box)?.map(requireNumber); }
+    else {
+      const fontBox = this.fontDictionary().get("FontBBox");
+      if (fontBox !== undefined) { requireAccess(fontBox, 2); bounds = arraySequence(fontBox)?.map(requireNumber); }
+      if (bounds) context.noteColorApproximation("font.postscript-shading-bounds-approximated", "PostScript shfill without BBox uses the font bounding box as its finite painting extent.");
+    }
+    if (!bounds || bounds.length !== 4 || bounds.some(value => !Number.isFinite(value)) || bounds[0] > bounds[2] || bounds[1] > bounds[3]) {
+      throw unsupported("Font-local shfill requires a finite shading or font bounding box.", "shfill", "rangecheck");
+    }
+    const state = context.captureState();
+    try {
+      context.newPath(); context.moveTo(bounds[0], bounds[1], matrix); context.lineTo(bounds[2], bounds[1], matrix);
+      context.lineTo(bounds[2], bounds[3], matrix); context.lineTo(bounds[0], bounds[3], matrix); context.closePath();
+      context.setColorSpaceColor("Pattern", [], [0, 0, 0, 1]); context.setPattern({ paintType: 1, matrix, shading }); context.paint("fill", matrix);
+    } finally { context.restoreState(state); }
+  }
   private colorModel(value: Value): NativeFontPostScriptColorSpace {
     return parseNativeFontPostScriptColorSpace(value, {
-      read: value => { if (isComposite(value)) requireAccess(value, 2); },
+      read: value => { throwIfAborted(this.options.signal); if (isComposite(value)) requireAccess(value, 2); },
       call: (procedure, values, outputs) => this.executeColorProcedure(procedure, values, outputs),
-      notice: (code, message) => this.glyphContext("setcolorspace").noteColorApproximation(code, message)
+      notice: (code, message) => this.glyphContext("setcolorspace").noteColorApproximation(code, message),
+      render: (xyz, white, black) => {
+        if (this.colorRendering === this.defaultColorRendering) this.currentGlyphContext?.noteColorApproximation("font.postscript-cie-rendering-approximated", "PostScript CIE colors use the canonical sRGB color-rendering dictionary because no calibrated printer profile was supplied.");
+        return (this.colorRenderer ??= this.colorRenderingModel(this.colorRendering)).convert(xyz, white, black);
+      }
     });
+  }
+  private colorRenderingModel(dictionary: Dictionary) {
+    return parseNativeFontPostScriptColorRendering(dictionary, {
+      read: value => { throwIfAborted(this.options.signal); if (isComposite(value)) requireAccess(value, 2); },
+      call: (procedure, values, outputs) => this.executeColorProcedure(procedure, values, outputs),
+      notice: (code, message) => this.currentGlyphContext?.noteColorApproximation(code, message)
+    });
+  }
+  private findColorRendering(intent: Value): void {
+    const intentName = key(intent), procedureSet = this.findResource("ProcSet", "ColorRendering");
+    if (!(procedureSet instanceof Map)) throw unsupported("The PostScript ColorRendering procedure set is unavailable.", "findcolorrendering", "undefinedresource");
+    requireAccess(procedureSet, 2);
+    const call = (name: string, args: readonly Value[] = []): Value => {
+      const procedure = procedureSet.get(name);
+      if (!isProcedure(procedure)) throw unsupported(`PostScript ColorRendering ${name} requires a procedure.`, "findcolorrendering", "typecheck");
+      return this.executeColorValues(procedure, args, 1)[0];
+    };
+    const device = key(call("GetPageDeviceName")), halftone = key(call("GetHalftoneName"));
+    const exact = `${intentName}.${device}.${halftone}`;
+    if (this.findResource("ColorRendering", exact) !== undefined) { this.push(literalName(exact)); this.push(true); return; }
+    const substitute = call("GetSubstituteCRD", [intent]);
+    const substituteName = key(substitute);
+    if (this.findResource("ColorRendering", substituteName) === undefined) throw unsupported(`PostScript ColorRendering resource ${substituteName} is unavailable.`, "findcolorrendering", "undefinedresource");
+    this.currentGlyphContext?.noteColorApproximation("font.postscript-rendering-intent-substituted", `No font-local color-rendering profile matches ${exact}; ${substituteName} is used as the proposed alternate.`);
+    this.push(literalName(substituteName)); this.push(false);
   }
   private currentColorModel(): NativeFontPostScriptColorSpace {
     const values = this.glyphContext("setcolor").sourceColorValues;
@@ -436,79 +635,200 @@ class FontPostScriptVm {
   }
   private image(name: "image" | "imagemask" | "colorimage"): void {
     const context = this.glyphContext(name), ctm = this.contextMatrix(name);
-    let width: number, height: number, bits: number, matrix: NativeFontPostScriptMatrix;
-    let components = 1, sources: Value[], decode: number[] | undefined, interpolate = false, polarity = true;
-    let convertColor: ((values: readonly number[]) => readonly [number, number, number, number]) | undefined;
-    const dictionary = this.stack.at(-1);
-    if (dictionary instanceof Map && name !== "colorimage") {
-      this.pop(); requireAccess(dictionary, 2);
-      if (dictionary.get("ImageType") !== 1) throw unsupported("Only sampled Type 1 PostScript image dictionaries are supported.", name);
-      width = requireNumber(dictionary.get("Width") ?? null); height = requireNumber(dictionary.get("Height") ?? null);
-      bits = requireNumber(dictionary.get("BitsPerComponent") ?? (name === "imagemask" ? 1 : null));
-      matrix = this.readMatrix(dictionary.get("ImageMatrix") ?? null);
-      const decodeValue = dictionary.get("Decode");
-      if (decodeValue === undefined) throw unsupported("A PostScript image dictionary requires Decode.", name);
-      requireAccess(decodeValue, 2); const decodeArray = arraySequence(decodeValue);
-      if (!decodeArray) throw unsupported("PostScript image Decode requires an array.", name); decode = decodeArray.map(requireNumber);
-      if (name === "imagemask") {
-        if (decode.length !== 2 || !((decode[0] === 0 && decode[1] === 1) || (decode[0] === 1 && decode[1] === 0))) throw unsupported("PostScript imagemask Decode must be [0 1] or [1 0].", name, "rangecheck");
-        polarity = decode[0] === 1;
-      } else {
-        if (!context.sourceColorSpace) throw unsupported("PostScript image needs an explicit color space.", name);
-        const model = this.currentColorModel(); components = model.components;
-        convertColor = values => model.convert(values).rgba;
+    type Image = { width: number; height: number; bits: number; matrix: NativeFontPostScriptMatrix;
+      components: number; sources: Value[]; decode?: number[]; interpolate: boolean; multiple: boolean };
+    const numbers = (value: Value | undefined, key: string): number[] => {
+      if (value === undefined) throw unsupported(`A PostScript image dictionary requires ${key}.`, name);
+      requireAccess(value, 2); const array = arraySequence(value);
+      if (!array) throw unsupported(`PostScript image ${key} requires an array.`, name);
+      return array.map(requireNumber);
+    };
+    const parse = (value: Value, components: number, sourceRequired = true): Image => {
+      if (!(value instanceof Map)) throw unsupported("PostScript image data and mask dictionaries are required.", name);
+      requireAccess(value, 2);
+      if (value.get("ImageType") !== 1 && !(value === dictionary && value.get("ImageType") === 4)) {
+        throw unsupported("PostScript subsidiary image dictionaries must have ImageType 1.", name);
       }
-      const interpolation = dictionary.get("Interpolate") ?? false;
-      if (typeof interpolation !== "boolean") throw unsupported("PostScript image Interpolate requires a boolean.", name); interpolate = interpolation;
-      const multiple = dictionary.get("MultipleDataSources") ?? false;
-      if (typeof multiple !== "boolean" || (name === "imagemask" && multiple)) throw unsupported("Invalid PostScript MultipleDataSources.", name);
-      const source = dictionary.get("DataSource") ?? null;
-      if (multiple) { requireAccess(source, 2); const array = arraySequence(source); if (!array || array.length !== components) throw unsupported("PostScript image needs one data source per color component.", name); sources = [...array]; }
-      else sources = [source];
-    } else {
-      if (name === "colorimage") {
-        const count = this.integer(), multiple = this.pop();
-        if (![1, 3, 4].includes(count) || typeof multiple !== "boolean") throw unsupported("Invalid PostScript colorimage components or source organization.", name);
-        components = count as 1 | 3 | 4; sources = [];
-        for (let i = 0; i < (multiple ? count : 1); i++) sources.unshift(this.pop());
-      } else sources = [this.pop()];
-      matrix = this.readMatrix(this.pop());
-      if (name === "imagemask") { const value = this.pop(); if (typeof value !== "boolean") throw unsupported("PostScript imagemask polarity requires a boolean.", name); polarity = value; bits = 1; }
-      else bits = this.integer();
-      height = this.integer(); width = this.integer();
-    }
-    if (!Number.isSafeInteger(width) || width < 0 || !Number.isSafeInteger(height) || height < 0 || ![1, 2, 4, 8, 12].includes(bits) || (name === "imagemask" && bits !== 1)) throw unsupported("Invalid PostScript image dimensions or bit depth.", name, "rangecheck");
-    if (decode && (decode.length !== components * 2 || decode.some(value => !Number.isFinite(value)))) throw unsupported("Invalid PostScript image Decode array.", name, "rangecheck");
-    // Validate the matrix before consuming inline bytes from currentfile.
-    nativeFontPostScriptInvertMatrix(matrix);
-    if (width === 0 || height === 0) return;
-    const rowBytes = Math.ceil(width * components * bits / 8), length = rowBytes * height;
-    const data = allocatedBytes(length, this.options.maxStringBytes), readers = sources.map(source => this.imageSource(source));
-    let used = 0;
-    if (readers.length === 1) used = readers[0].readInto(data);
-    else {
-      const planeRowBytes = Math.ceil(width * bits / 8), planes = readers.map(() => allocatedBytes(planeRowBytes, this.options.maxStringBytes));
-      rows: for (let y = 0; y < height; y++) {
+      const multiple = value.get("MultipleDataSources") ?? false, interpolate = value.get("Interpolate") ?? false;
+      if (typeof multiple !== "boolean" || typeof interpolate !== "boolean") throw unsupported("Invalid PostScript image source organization or interpolation.", name);
+      const source = value.get("DataSource"); let sources: Value[] = [];
+      if (sourceRequired) {
+        if (source === undefined) throw unsupported("A PostScript image dictionary requires DataSource.", name);
+        if (multiple) {
+          requireAccess(source, 2); const array = arraySequence(source);
+          if (!array || array.length !== components) throw unsupported("PostScript image needs one data source per color component.", name);
+          sources = [...array];
+        } else sources = [source];
+      } else if (source !== undefined) throw unsupported("An interleaved PostScript image mask must not have DataSource.", name);
+      return { width: requireNumber(value.get("Width") ?? null), height: requireNumber(value.get("Height") ?? null),
+        bits: requireNumber(value.get("BitsPerComponent") ?? (name === "imagemask" ? 1 : null)),
+        matrix: this.readMatrix(value.get("ImageMatrix") ?? null), components, sources,
+        decode: numbers(value.get("Decode"), "Decode"), interpolate, multiple };
+    };
+    const validate = (image: Image, mask = false): void => {
+      if (!Number.isSafeInteger(image.width) || image.width < 0 || !Number.isSafeInteger(image.height) || image.height < 0 ||
+        ![1, 2, 4, 8, 12].includes(image.bits) || (mask && image.bits !== 1)) throw unsupported("Invalid PostScript image dimensions or bit depth.", name, "rangecheck");
+      if (image.decode && (image.decode.length !== image.components * 2 || image.decode.some(value => !Number.isFinite(value)))) throw unsupported("Invalid PostScript image Decode array.", name, "rangecheck");
+      // Validate every matrix before consuming bytes from currentfile.
+      nativeFontPostScriptInvertMatrix(image.matrix);
+    };
+    const rowBytes = (image: Image) => Math.ceil(image.width * image.components * image.bits / 8);
+    const allocate = (image: Image) => allocatedBytes(rowBytes(image) * image.height, this.options.maxStringBytes);
+    const read = (image: Image): Uint8Array => {
+      const data = allocate(image), readers = image.sources.map(source => this.imageSource(source));
+      if (readers.length === 1) return data.subarray(0, readers[0].readInto(data));
+      const planeRowBytes = Math.ceil(image.width * image.bits / 8), planes = readers.map(() => allocatedBytes(planeRowBytes, this.options.maxStringBytes));
+      let used = 0;
+      rows: for (let y = 0; y < image.height; y++) {
         throwIfAborted(this.options.signal);
-        // Round-robin byte reads preserve procedure call order when component
-        // procedures obtain successive same-size strings from one input file.
+        // Component procedures may share a file and return one row each.
         for (let byte = 0; byte < planeRowBytes; byte++) for (let component = 0; component < readers.length; component++) {
           const value = readers[component].readByte(); if (value < 0) break rows;
           planes[component][byte] = value;
         }
-        for (let x = 0; x < width; x++) {
+        for (let x = 0; x < image.width; x++) {
           if ((x & 255) === 0) throwIfAborted(this.options.signal);
-          for (let component = 0; component < components; component++) for (let bit = 0; bit < bits; bit++) {
-            const sourceBit = x * bits + bit, destinationBit = y * rowBytes * 8 + (x * components + component) * bits + bit;
+          for (let component = 0; component < image.components; component++) for (let bit = 0; bit < image.bits; bit++) {
+            const sourceBit = x * image.bits + bit, destinationBit = y * rowBytes(image) * 8 + (x * image.components + component) * image.bits + bit;
             data[Math.floor(destinationBit / 8)] |= ((planes[component][Math.floor(sourceBit / 8)] >>> (7 - sourceBit % 8)) & 1) << (7 - destinationBit % 8);
           }
         }
-        used += rowBytes;
+        used += rowBytes(image);
+      }
+      return data.subarray(0, used);
+    };
+    const sample = (data: Uint8Array, bit: number, bits: number): number => {
+      let value = 0;
+      for (let offset = 0; offset < bits; offset++) value = value * 2 + ((data[Math.floor((bit + offset) / 8)] >>> (7 - (bit + offset) % 8)) & 1);
+      return value;
+    };
+    const dictionary = this.stack.at(-1);
+    let image: Image, maskImage: Image | undefined, interleave = 0, polarity = true;
+    let colorKey: number[] | undefined, convertColor: ((values: readonly number[]) => readonly [number, number, number, number]) | undefined;
+    if (dictionary instanceof Map && name !== "colorimage") {
+      this.pop(); requireAccess(dictionary, 2);
+      const type = dictionary.get("ImageType");
+      if (![1, 3, 4].includes(type as number) || (name === "imagemask" && type !== 1)) throw unsupported(`Unsupported PostScript ImageType ${String(type)}.`, name);
+      let components = 1;
+      if (name !== "imagemask") {
+        if (!context.sourceColorSpace) throw unsupported("PostScript image needs an explicit color space.", name);
+        const model = this.currentColorModel(); components = model.components; convertColor = values => model.convert(values).rgba;
+      }
+      if (type === 3) {
+        interleave = requireNumber(dictionary.get("InterleaveType") ?? null);
+        if (![1, 2, 3].includes(interleave)) throw unsupported("Invalid PostScript image InterleaveType.", name, "rangecheck");
+        image = parse(dictionary.get("DataDict") ?? null, components);
+        maskImage = parse(dictionary.get("MaskDict") ?? null, 1, interleave === 3);
+        validate(maskImage);
+        if (maskImage.multiple || (interleave !== 3 && image.multiple) ||
+          maskImage.bits !== (interleave === 1 ? image.bits : 1) ||
+          (interleave === 1 && (maskImage.width !== image.width || maskImage.height !== image.height)) ||
+          (interleave === 2 && image.height && maskImage.height &&
+            image.height % maskImage.height !== 0 && maskImage.height % image.height !== 0)) {
+          throw unsupported("Inconsistent PostScript explicit-mask image dictionaries.", name);
+        }
+      } else image = parse(dictionary, components);
+      if (name === "imagemask" || maskImage) {
+        const decode = (maskImage ?? image).decode!;
+        if (decode.length !== 2 || !((decode[0] === 0 && decode[1] === 1) || (decode[0] === 1 && decode[1] === 0))) throw unsupported("PostScript image mask Decode must be [0 1] or [1 0].", name, "rangecheck");
+        polarity = decode[0] === 1;
+        if (image.multiple && name === "imagemask") throw unsupported("A PostScript imagemask requires one data source.", name);
+      }
+      if (type === 4) {
+        const colors = numbers(dictionary.get("MaskColor"), "MaskColor");
+        if ((colors.length !== components && colors.length !== components * 2) || colors.some(value => !Number.isSafeInteger(value))) throw unsupported("Invalid PostScript image MaskColor array.", name, "rangecheck");
+        colorKey = colors.length === components ? colors.flatMap(value => [value, value]) : colors;
+      }
+    } else {
+      let components = 1, sources: Value[] = [];
+      if (name === "colorimage") {
+        const count = this.integer(), multiple = this.pop();
+        if (![1, 3, 4].includes(count) || typeof multiple !== "boolean") throw unsupported("Invalid PostScript colorimage components or source organization.", name);
+        components = count;
+        for (let i = 0; i < (multiple ? count : 1); i++) sources.unshift(this.pop());
+      } else sources = [this.pop()];
+      const matrix = this.readMatrix(this.pop()); let bits: number;
+      if (name === "imagemask") { const value = this.pop(); if (typeof value !== "boolean") throw unsupported("PostScript imagemask polarity requires a boolean.", name); polarity = value; bits = 1; }
+      else bits = this.integer();
+      const height = this.integer(), width = this.integer();
+      image = { width, height, bits, matrix, components, sources, interpolate: false, multiple: sources.length > 1 };
+    }
+    validate(image, name === "imagemask");
+    if (maskImage) {
+      if ((image.width && image.height) && (!maskImage.width || !maskImage.height)) throw unsupported("A nonempty PostScript image requires a nonempty explicit mask.", name);
+      const imageInverse = nativeFontPostScriptInvertMatrix(image.matrix), maskInverse = nativeFontPostScriptInvertMatrix(maskImage.matrix);
+      for (const [x, y] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+        const a = nativeFontPostScriptTransform(image.width * x, image.height * y, imageInverse);
+        const b = nativeFontPostScriptTransform(maskImage.width * x, maskImage.height * y, maskInverse);
+        if (a.some((value, axis) => Math.abs(value - b[axis]) > 1e-10 * Math.max(1, Math.abs(value), Math.abs(b[axis])))) throw unsupported("PostScript explicit image mask corners must coincide with the sampled image.", name);
       }
     }
-    context.image({ width, height, bitsPerComponent: bits as 1 | 2 | 4 | 8 | 12, components,
-      data: data.subarray(0, used), imageMatrix: matrix, ctm, decode, mask: name === "imagemask", polarity, interpolate,
-      ...(convertColor ? { convertColor } : {}) });
+    if (image.width === 0 || image.height === 0) return;
+    let data: Uint8Array, softMask: { width: number; height: number; data: Uint8Array; interpolate: boolean } | undefined;
+    if (!maskImage) data = read(image);
+    else {
+      const maskData = allocate(maskImage); let maskUsed = 0;
+      if (interleave === 3) {
+        // Independent mask sources are consumed before color sources, as in
+        // the reference interpreter. No source is read past its image extent.
+        maskUsed = this.imageSource(maskImage.sources[0]).readInto(maskData); data = read(image);
+      } else if (interleave === 2) {
+        const reader = this.imageSource(image.sources[0]), colors = allocate(image);
+        const blocks = Math.min(image.height, maskImage.height), maskRows = maskImage.height / blocks, colorRows = image.height / blocks;
+        let used = 0;
+        for (let block = 0; block < blocks; block++) {
+          throwIfAborted(this.options.signal);
+          const maskLength = rowBytes(maskImage) * maskRows, colorLength = rowBytes(image) * colorRows;
+          const m = reader.readInto(maskData.subarray(maskUsed, maskUsed + maskLength)); maskUsed += m;
+          if (m !== maskLength) break;
+          const n = reader.readInto(colors.subarray(used, used + colorLength)); used += n;
+          if (n !== colorLength) break;
+        }
+        data = colors.subarray(0, used);
+      } else {
+        const combined = { ...image, components: image.components + 1 }, packed = read(combined), colors = allocate(image);
+        let used = 0;
+        for (let y = 0; y < image.height; y++) {
+          throwIfAborted(this.options.signal);
+          let complete = 0;
+          for (let x = 0; x < image.width; x++) {
+            if ((x & 255) === 0) throwIfAborted(this.options.signal);
+            const begin = y * rowBytes(combined) * 8 + x * combined.components * image.bits;
+            if (begin + combined.components * image.bits > packed.length * 8) break;
+            // Nonuniform mask samples are defined to be all ones (PLRM 4.22).
+            if (sample(packed, begin, image.bits)) {
+              const bit = y * rowBytes(maskImage) * 8 + x * image.bits;
+              for (let b = 0; b < image.bits; b++) maskData[Math.floor((bit + b) / 8)] |= 1 << (7 - (bit + b) % 8);
+            }
+            for (let component = 0; component < image.components; component++) for (let b = 0; b < image.bits; b++) {
+              const from = begin + (component + 1) * image.bits + b, to = y * rowBytes(image) * 8 + (x * image.components + component) * image.bits + b;
+              colors[Math.floor(to / 8)] |= ((packed[Math.floor(from / 8)] >>> (7 - from % 8)) & 1) << (7 - to % 8);
+            }
+            complete++;
+          }
+          used += Math.ceil(complete * image.components * image.bits / 8);
+          maskUsed += Math.ceil(complete * maskImage.bits / 8);
+          if (complete !== image.width) break;
+        }
+        data = colors.subarray(0, used);
+      }
+      const coverage = allocatedBytes(maskImage.width * maskImage.height, this.options.maxStringBytes);
+      for (let y = 0; y < maskImage.height; y++) {
+        throwIfAborted(this.options.signal);
+        for (let x = 0; x < maskImage.width; x++) {
+          if ((x & 255) === 0) throwIfAborted(this.options.signal);
+          const bit = y * rowBytes(maskImage) * 8 + x * maskImage.bits;
+          if (bit + maskImage.bits <= maskUsed * 8) coverage[y * maskImage.width + x] =
+            (sample(maskData, bit, maskImage.bits) !== 0) === polarity ? 255 : 0;
+        }
+      }
+      if (maskUsed < maskData.length) context.noteColorApproximation("font.postscript-image-truncated", "PostScript explicit image mask data ended early; missing mask samples remain transparent.");
+      softMask = { width: maskImage.width, height: maskImage.height, data: coverage, interpolate: maskImage.interpolate };
+    }
+    context.image({ width: image.width, height: image.height, bitsPerComponent: image.bits as 1 | 2 | 4 | 8 | 12,
+      components: image.components, data, imageMatrix: image.matrix, ctm, decode: image.decode,
+      mask: name === "imagemask", polarity, interpolate: image.interpolate,
+      ...(colorKey ? { colorKey } : {}), ...(softMask ? { softMask } : {}), ...(convertColor ? { convertColor } : {}) });
   }
   private resource(category: string, global = this.globalMode): Dictionary {
     const resources = global ? this.globalResources : this.resources;
@@ -557,24 +877,29 @@ class FontPostScriptVm {
       throw error;
     } finally { this.unwindTasks(depth); this.activeCommand = command; }
   }
-  private executeColorProcedure(procedure: Procedure, values: readonly number[], outputs: number): readonly number[] {
+  private executeColorProcedure(procedure: Procedure, values: readonly Value[], outputs: number): readonly number[] {
+    return Object.freeze(this.executeColorValues(procedure, values, outputs).map(requireNumber));
+  }
+  private executeColorValues(procedure: Procedure, values: readonly Value[], outputs: number): readonly Value[] {
     const boundary: Task = { kind: "source-boundary" }, depth = this.tasks.length, stackDepth = this.stack.length;
     const command = this.activeCommand;
     this.tasks.push(boundary);
     try {
-      for (const value of values) this.push(value);
+      for (const value of values) { this.registerGraph(value, this.globalMode); this.push(value); }
       this.schedule(procedure); this.run(boundary);
       if (this.stack.length !== stackDepth + outputs) throw unsupported("A PostScript color procedure returned the wrong number of components.", "setcolor", "rangecheck");
-      return Object.freeze(this.stack.splice(stackDepth).map(requireNumber));
+      return this.stack.splice(stackDepth);
     } finally { this.unwindTasks(depth); this.activeCommand = command; }
   }
   private save(): PsSave {
     const objects: VmSnapshot["objects"] = new Map();
-    const pending: Value[] = [...this.dictionaries, this.directory, this.localFonts, this.globalDirectory, this.errors, ...this.resources.values(), ...this.globalResources.values(), ...this.stack];
-    for (const values of [this.options.glyphContext?.sourceColorValues,
+    const pending: Value[] = [...this.dictionaries, this.directory, this.localFonts, this.globalDirectory, this.errors, this.colorRendering, ...this.graphics.map(state => state.colorRendering), ...this.resources.values(), ...this.globalResources.values(), ...this.stack];
+    for (const values of [this.currentGlyphContext?.sourceColorValues,
       ...this.graphics.map(state => state.glyphState?.sourceColor?.values)]) {
       const space = values ? this.colorSpaces.get(values) : undefined;
       if (space) pending.push(space);
+      const pattern = values ? this.colorPatterns.get(values) : undefined;
+      if (pattern) pending.push(pattern);
     }
     for (const task of this.tasks) {
       if (task.kind === "tokens") pending.push(task.tokens as Value[]);
@@ -594,7 +919,7 @@ class FontPostScriptVm {
       else if (isProcedure(value)) pending.push(value.tokens as Value[]);
       objects.set(value, { value, contents, access: accessOf(value), capacity: value instanceof Map ? dictionaryCapacities.get(value) : undefined });
     }
-    const save: PsSave = { kind: "save", owner: this, snapshot: { objects, matrix: this.matrix, matrixKnown: this.matrixKnown, graphics: [...this.graphics], definedFont: this.definedFont, resources: [...this.resources], createdCount: this.created.length, packing: this.packing, globalMode: this.globalMode, glyphState: this.options.glyphContext?.captureState() } };
+    const save: PsSave = { kind: "save", owner: this, snapshot: { objects, matrix: this.matrix, matrixKnown: this.matrixKnown, graphics: [...this.graphics], colorRendering: this.colorRendering, colorRenderer: this.colorRenderer, definedFont: this.definedFont, resources: [...this.resources], createdCount: this.created.length, packing: this.packing, globalMode: this.globalMode, glyphState: this.currentGlyphContext?.captureState() } };
     this.saves.push(save); return save;
   }
   private restore(value: Value): void {
@@ -616,8 +941,10 @@ class FontPostScriptVm {
     }
     this.matrix = save.snapshot.matrix;
     this.matrixKnown = save.snapshot.matrixKnown;
+    this.colorRendering = save.snapshot.colorRendering;
+    this.colorRenderer = save.snapshot.colorRenderer;
     this.graphics.splice(0, this.graphics.length, ...save.snapshot.graphics);
-    if (save.snapshot.glyphState) this.options.glyphContext?.restoreState(save.snapshot.glyphState);
+    if (save.snapshot.glyphState) this.currentGlyphContext?.restoreState(save.snapshot.glyphState);
     // A globally registered font survives local VM rollback, including the
     // font engine's result pointer. Merely allocating its dictionary globally
     // does not make a registration in the local Font resource survive.
@@ -807,10 +1134,10 @@ class FontPostScriptVm {
         const y = this.number(), x = this.number(); const [tx, ty] = nativeFontPostScriptTransform(x, y, matrix, name === "dtransform" || name === "idtransform", name === "itransform" || name === "idtransform");
         this.push(tx); this.push(ty); break;
       }
-      case "gsave": this.graphics.push({ matrix: this.matrix, known: this.matrixKnown, glyphState: this.options.glyphContext?.captureState() }); break;
+      case "gsave": this.graphics.push({ matrix: this.matrix, known: this.matrixKnown, glyphState: this.currentGlyphContext?.captureState(), colorRendering: this.colorRendering, colorRenderer: this.colorRenderer }); break;
       case "grestore": case "grestoreall": {
         const state = name === "grestoreall" ? this.graphics[0] : this.graphics.pop();
-        if (state) { this.matrix = state.matrix; this.matrixKnown = state.known; if (state.glyphState) this.options.glyphContext?.restoreState(state.glyphState); }
+        if (state) { this.matrix = state.matrix; this.matrixKnown = state.known; this.colorRendering = state.colorRendering; this.colorRenderer = state.colorRenderer; if (state.glyphState) this.currentGlyphContext?.restoreState(state.glyphState); }
         if (name === "grestoreall") this.graphics.length = 0;
         break;
       }
@@ -908,8 +1235,32 @@ class FontPostScriptVm {
       case "currentcolorspace": {
         this.push(this.currentColorSpace()); break;
       }
+      case "currentcolorrendering": this.push(this.colorRendering); break;
+      case "setcolorrendering": {
+        const value = this.pop();
+        if (!(value instanceof Map)) throw unsupported("PostScript setcolorrendering requires a dictionary.", name, "typecheck");
+        const renderer = this.colorRenderingModel(value), previous = this.colorRendering, previousRenderer = this.colorRenderer;
+        this.colorRendering = value; this.colorRenderer = renderer;
+        try {
+          const values = this.currentGlyphContext?.sourceColorValues;
+          if (values && !this.patternSpace(this.currentColorSpace())) this.setColor(this.currentColorModel(), this.currentColorSpace(), values);
+        } catch (error) { this.colorRendering = previous; this.colorRenderer = previousRenderer; throw error; }
+        break;
+      }
+      case "findcolorrendering": this.findColorRendering(this.pop()); break;
+      case "makepattern": this.makePattern(); break;
+      case "shfill": this.shade(); break;
+      case "setpattern": {
+        const context = this.glyphContext(name);
+        if (context.sourceColorSpace !== "Pattern") {
+          const base = context.sourceColorValues ? this.currentColorSpace() : [literalName("DeviceGray")];
+          const space = [literalName("Pattern"), base]; this.register(space, false); this.selectPatternSpace(space);
+        }
+        this.setPatternColor(); break;
+      }
       case "setcolorspace": {
         const value = this.pop(); if (isComposite(value)) requireAccess(value, 2);
+        if (this.patternSpace(value)) { this.selectPatternSpace(value); break; }
         const model = this.colorModel(value);
         // The name shorthand returns an array, as with the device setters.
         const space = isName(value) ? reduceAccess([literalName(value.value)], 2) : value;
@@ -920,9 +1271,12 @@ class FontPostScriptVm {
       case "currentcolor": {
         const values = this.glyphContext(name).sourceColorValues;
         if (!values) throw unsupported("The enclosing PDF glyph color is unavailable during cached font execution.", name);
-        for (const value of values) this.push(value); break;
+        for (const value of values) this.push(value);
+        if (this.glyphContext(name).sourceColorSpace === "Pattern") this.push(this.colorPatterns.get(values) ?? null);
+        break;
       }
       case "setcolor": {
+        if (this.glyphContext(name).sourceColorSpace === "Pattern") { this.setPatternColor(); break; }
         const colorSpace = this.currentColorSpace(), model = this.currentColorModel(), values: number[] = [];
         for (let i = 0; i < model.components; i++) values.unshift(this.number());
         this.setColor(model, colorSpace, values); break;
@@ -1014,7 +1368,7 @@ setglobal currentglobal gcheck
 matrix identmatrix currentmatrix defaultmatrix setmatrix initmatrix concat concatmatrix invertmatrix translate scale rotate transform dtransform itransform idtransform gsave grestore grestoreall
 newpath moveto rmoveto lineto rlineto curveto rcurveto closepath currentpoint pathbbox arc arcn arcto flattenpath reversepath pathforall fill eofill stroke clip eoclip rectclip rectfill rectstroke
 setlinewidth setlinecap setlinejoin setmiterlimit setdash currentlinewidth currentlinecap currentlinejoin currentmiterlimit currentdash setgray setrgbcolor setcmykcolor sethsbcolor currentrgbcolor currentgray currentcmykcolor currenthsbcolor setcharwidth setcachedevice
-image imagemask colorimage setcolorspace currentcolorspace setcolor currentcolor
+image imagemask colorimage setcolorspace currentcolorspace setcolor currentcolor makepattern setpattern shfill setcolorrendering currentcolorrendering findcolorrendering
 currentfile read readstring readhexstring readline bytesavailable fileposition setfileposition resetfile flushfile status token filter closefile eexec definefont findfont undefinefont defineresource findresource resourcestatus undefineresource resourceforall currentpacking setpacking packedarray`).split(/\s+/);
 
 function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPostScriptFilterParameters {
@@ -1434,7 +1788,10 @@ function cloneValue(root: Value, signal: AbortSignal | undefined, maxStringBytes
       const parent = byteViews.get(source);
       target = parent ? byteView(create(parent.source) as Uint8Array, parent.start, source.length) : source.slice();
     }
-    else if (source instanceof Map) target = new Map();
+    else if (source instanceof Map) {
+      target = new Map();
+      const pattern = patternInstances.get(source); if (pattern) patternInstances.set(target, pattern);
+    }
     else if (Array.isArray(source)) {
       const parent = arrayViews.get(source);
       target = parent ? arrayView(create(parent.source) as Value[], parent.start, source.length) : allocatedArray(source.length);

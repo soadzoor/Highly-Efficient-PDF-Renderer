@@ -124,20 +124,33 @@ export interface RetainedVectorPageOptions {
  * Folds an image's /SMask into its alpha, in place, over straight RGBA8.
  *
  * The mask's gray samples are the image's alpha, and the two are independent
- * rasters that need not share a size, so the mask is point-sampled across the
- * base's grid. Any alpha the base already carries is kept: the two multiply,
+ * rasters that need not share a size, so the mask is sampled at base pixel
+ * centers using its own interpolation policy. Existing source alpha multiplies,
  * as a mask and a source-alpha do when both apply.
  */
 function applyHeprImageSoftMask(base: Uint8Array, width: number, height: number,
-  mask: Uint8Array, maskWidth: number, maskHeight: number, signal?: AbortSignal): Uint8Array {
+  mask: Uint8Array, maskWidth: number, maskHeight: number, interpolate: boolean, signal?: AbortSignal): Uint8Array {
   if (maskWidth <= 0 || maskHeight <= 0 || width <= 0 || height <= 0) return base;
+  const clampX = (x: number) => Math.max(0, Math.min(maskWidth - 1, x));
+  const clampY = (y: number) => Math.max(0, Math.min(maskHeight - 1, y));
+  const coverage = (x: number, y: number) => {
+    const offset = (clampY(y) * maskWidth + clampX(x)) * 4;
+    return mask[offset] * mask[offset + 3] / 255;
+  };
   for (let y = 0; y < height; y++) {
     signal?.throwIfAborted();
-    const row = Math.min(maskHeight - 1, Math.floor(y * maskHeight / height)) * maskWidth;
     for (let x = 0; x < width; x++) {
-      const column = Math.min(maskWidth - 1, Math.floor(x * maskWidth / width));
+      const sourceX = (x + .5) * maskWidth / width, sourceY = (y + .5) * maskHeight / height;
+      let factor: number;
+      if (!interpolate) factor = coverage(Math.floor(sourceX), Math.floor(sourceY));
+      else {
+        const left = Math.floor(sourceX - .5), top = Math.floor(sourceY - .5);
+        const tx = sourceX - .5 - left, ty = sourceY - .5 - top;
+        factor = (coverage(left, top) * (1 - tx) + coverage(left + 1, top) * tx) * (1 - ty) +
+          (coverage(left, top + 1) * (1 - tx) + coverage(left + 1, top + 1) * tx) * ty;
+      }
       const offset = (y * width + x) * 4;
-      base[offset + 3] = Math.round(base[offset + 3] * mask[(row + column) * 4] / 255);
+      base[offset + 3] = Math.round(base[offset + 3] * factor / 255);
     }
   }
   return base;
@@ -1027,7 +1040,7 @@ export async function lowerRetainedPageToVectorScene(source: HeprPageData, optio
             // An Rgba8 store widens to itself, so the alpha is written into a
             // copy rather than back into the page's own image bytes.
             data = applyHeprImageSoftMask(owned ? data : Uint8Array.from(data), width, height,
-              mask, images.widths[maskIndex], images.heights[maskIndex], signal);
+              mask, images.widths[maskIndex], images.heights[maskIndex], images.interpolate[maskIndex] !== 0, signal);
           }
           imagePixels.set(key, pixels = { data, width, height });
         }

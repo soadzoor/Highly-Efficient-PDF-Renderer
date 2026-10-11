@@ -469,8 +469,8 @@ function testMalformedInputs() {
     hasPdfError("invalid-object", /Truncated CCITT white run code/)
   );
   assert.throws(
-    () => decode(bits("000000001 111"), { Columns: 8, Rows: 1, EndOfBlock: false }),
-    hasPdfError("unsupported-filter", /one-dimensional extension/)
+    () => decode(bits("000000001 000"), { Columns: 8, Rows: 1, EndOfBlock: false }),
+    hasPdfError("unsupported-filter", /extension selector is reserved/)
   );
   assert.throws(
     () => decode(bits("00000001"), { Columns: 8, Rows: 1, EndOfBlock: false }),

@@ -425,7 +425,7 @@ export class NativeType1Font {
         const changed = state?.changedStrokeFields ?? [];
         const stroke = state?.stroke;
         return Object.freeze({ kind: "stroke" as const, commands: record.commands, fillRule: 0 as const,
-          clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null,
+          clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null, ...(state?.pattern ? { pattern: state.pattern } : {}),
           changedStrokeFields: Object.freeze([...new Set(["width" as const, ...changed])]),
           stroke: Object.freeze({ width: changed.includes("width") && stroke ? stroke.width : Math.abs(this.strokeWidth),
             lineCap: stroke?.lineCap ?? 0, lineJoin: stroke?.lineJoin ?? 0, miterLimit: stroke?.miterLimit ?? 10,
@@ -433,7 +433,7 @@ export class NativeType1Font {
             transform: stroke?.transform ?? Object.freeze([1, 0, 0, 1, 0, 0]) }) });
       }
       return Object.freeze({ kind: "fill" as const, commands: record.commands, fillRule: 0 as const,
-        clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null });
+        clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null, ...(state?.pattern ? { pattern: state.pattern } : {}) });
     }) ?? raw.postScriptPaints;
     const postScriptPaints = materializedPaints ? transformNativeGlyphPostScriptPaints(materializedPaints, transform as Type1Matrix) : undefined;
     let normalBounds = painted.bounds ?? measureBounds(commands);

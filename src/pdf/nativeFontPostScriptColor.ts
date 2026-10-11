@@ -18,8 +18,9 @@ export interface NativeFontPostScriptColorSpace {
 }
 interface ColorOptions {
   readonly read: (value: Value) => void;
-  readonly call: (procedure: Procedure, values: readonly number[], outputs: number) => readonly number[];
+  readonly call: (procedure: Procedure, values: readonly Value[], outputs: number) => readonly number[];
   readonly notice: (code: string, message: string) => void;
+  readonly render?: (xyz: readonly number[], white: readonly number[], black: readonly number[]) => NativeFontPostScriptConvertedColor;
 }
 const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1] as const;
 const unitRange = (count: number): number[] => Array.from({ length: count * 2 }, (_, index) => index % 2);
@@ -137,10 +138,11 @@ export function parseNativeFontPostScriptColorSpace(value: Value, options: Color
         const abcToRgb = (values: readonly number[]): NativeFontPostScriptConvertedColor => {
           const decoded = decode(clip(values, abcRange), abcDecode), lmn = scalar ? abcMatrix.map(value => value * decoded[0]) : multiply(abcMatrix, decoded);
           const xyz = multiply(lmnMatrix, decode(clip(lmn, lmnRange), lmnDecode));
+          if (options.render) return options.render(xyz, white, black);
+          options.notice("font.postscript-cie-rendering-approximated", "PostScript CIE colors use the canonical sRGB display conversion because no color-rendering dictionary was supplied.");
+          if (black.some(value => value !== 0)) options.notice("font.postscript-cie-blackpoint-approximated", "PostScript CIE source black-point compensation is unavailable without a color-rendering dictionary.");
           return { rgba: [...xyzToSrgb(xyz, white), 1] };
         };
-        options.notice("font.postscript-cie-rendering-approximated", "PostScript CIE colors use the canonical sRGB display conversion; printer color-rendering dictionaries and device gamut mapping are not executed.");
-        if (black.some(value => value !== 0)) options.notice("font.postscript-cie-blackpoint-approximated", "PostScript CIE source black-point compensation is unavailable in the canonical sRGB conversion.");
         if (scalar || name === "CIEBasedABC") return model(name, abcRange, abcToRgb);
         const count = name === "CIEBasedDEF" ? 3 : 4, suffix = count === 3 ? "DEF" : "DEFG", intermediate = count === 3 ? "HIJ" : "HIJK";
         const range = ranges(dictionary.get("Range" + suffix), count), procedures = decoders(dictionary.get("Decode" + suffix), count), inputRange = ranges(dictionary.get("Range" + intermediate), count);

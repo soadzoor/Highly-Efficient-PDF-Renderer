@@ -1,4 +1,4 @@
-import { throwIfAborted } from "../nativeTypes";
+import { PdfError, throwIfAborted } from "../nativeTypes";
 import { JBIG2_MAX_WORK, jbig2ResourceError } from "./jbig2Preflight";
 
 export const BUNDLED_JBIG2_CODEC_ASSET = Object.freeze({
@@ -11,6 +11,8 @@ const PAGE_BYTES = 65536;
 const BATCH_SIZE = 1024;
 let assetPromise: Promise<Uint8Array<ArrayBuffer>> | undefined;
 const modules = new Map<number, Promise<WebAssembly.Module>>();
+const preparedModules = new Map<number, WebAssembly.Module>();
+let preparedAsset: Uint8Array<ArrayBuffer> | undefined;
 
 interface Jbig2Exports extends WebAssembly.Exports {
   i: WebAssembly.Memory;
@@ -28,14 +30,45 @@ interface Jbig2Exports extends WebAssembly.Exports {
 export async function decodePdfiumJbig2(encoded: Uint8Array, globals: Uint8Array, width: number, height: number,
   maxBytes: number, signal?: AbortSignal, maximumWork = JBIG2_MAX_WORK): Promise<Uint8Array> {
   throwIfAborted(signal);
+  const module = await withAbort(loadModule(maximumHeapPages(encoded, globals, width, height, maxBytes)), signal);
+  return decodePdfiumJbig2WithModule(module, encoded, globals, width, height, maxBytes, signal, maximumWork);
+}
+
+/** Share the package asset/module with synchronous font-local PostScript. */
+export async function preparePdfiumJbig2(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  await withAbort(loadModule(65536), signal);
+  throwIfAborted(signal);
+}
+
+export function decodePdfiumJbig2Sync(encoded: Uint8Array, globals: Uint8Array, width: number, height: number,
+  maxBytes: number, signal?: AbortSignal, maximumWork = JBIG2_MAX_WORK): Uint8Array {
+  throwIfAborted(signal);
+  if (!preparedAsset) throw new PdfError("unsupported-image", "The JBIG2 codec must be prepared before synchronous font decoding.",
+    { details: { codec: "jbig2", reason: "codec-not-prepared" } });
+  const pages = maximumHeapPages(encoded, globals, width, height, maxBytes);
+  let module = preparedModules.get(pages);
+  if (!module) {
+    module = new WebAssembly.Module(capJbig2WasmMemory(preparedAsset, pages));
+    cachePreparedModule(pages, module);
+  }
+  return decodePdfiumJbig2WithModule(module, encoded, globals, width, height, maxBytes, signal, maximumWork);
+}
+
+function maximumHeapPages(encoded: Uint8Array, globals: Uint8Array, width: number, height: number, maxBytes: number): number {
   const outputBytes = Math.ceil(width / 8) * height;
   // Reserve caller data and bridge output outside the operation-local heap.
   // A memory32 module can address at most 65,536 pages; growth below that
   // capacity follows the caller's allowance and actual host allocation.
-  const maximumPages = Math.floor(Math.min(maxBytes - encoded.length - globals.length - outputBytes - 65536,
+  return Math.floor(Math.min(maxBytes - encoded.length - globals.length - outputBytes - 65536,
     65536 * PAGE_BYTES) / PAGE_BYTES);
-  const module = await withAbort(loadModule(maximumPages), signal);
+}
+
+function decodePdfiumJbig2WithModule(module: WebAssembly.Module, encoded: Uint8Array, globals: Uint8Array,
+  width: number, height: number, maxBytes: number, signal: AbortSignal | undefined, maximumWork: number): Uint8Array {
   throwIfAborted(signal);
+  const outputBytes = Math.ceil(width / 8) * height;
+  const maximumPages = maximumHeapPages(encoded, globals, width, height, maxBytes);
   let wasm: Jbig2Exports, samples: Uint8Array | undefined, work = 0, heapLimitHit = false;
   const checkWork = (): void => {
     throwIfAborted(signal);
@@ -97,13 +130,21 @@ export async function decodePdfiumJbig2(encoded: Uint8Array, globals: Uint8Array
 }
 
 function loadModule(maximumPages: number): Promise<WebAssembly.Module> {
+  const ready = preparedModules.get(maximumPages);
+  if (ready) return Promise.resolve(ready);
   const cached = modules.get(maximumPages);
   if (cached) return cached;
-  const pending = loadAsset().then(bytes => WebAssembly.compile(capJbig2WasmMemory(bytes, maximumPages)));
+  const pending = loadAsset().then(bytes => WebAssembly.compile(capJbig2WasmMemory(bytes, maximumPages))).then(module => {
+    cachePreparedModule(maximumPages, module); return module;
+  });
   if (modules.size >= 4) modules.delete(modules.keys().next().value!);
   modules.set(maximumPages, pending);
   void pending.catch(() => { if (modules.get(maximumPages) === pending) modules.delete(maximumPages); });
   return pending;
+}
+function cachePreparedModule(pages: number, module: WebAssembly.Module): void {
+  if (preparedModules.size >= 4) preparedModules.delete(preparedModules.keys().next().value!);
+  preparedModules.set(pages, module);
 }
 function loadAsset(): Promise<Uint8Array<ArrayBuffer>> {
   if (assetPromise) return assetPromise;
@@ -120,6 +161,7 @@ function loadAsset(): Promise<Uint8Array<ArrayBuffer>> {
       bytes = new Uint8Array(await response.arrayBuffer());
     }
     if (bytes.length !== BUNDLED_JBIG2_CODEC_ASSET.byteLength) throw new Error("Invalid bundled JBIG2 asset length.");
+    preparedAsset = bytes;
     return bytes;
   })();
   assetPromise = pending;

@@ -146,6 +146,9 @@ try {
     assert.equal(extension.format, HEPR_IMAGE_FORMAT.Ccitt);
     assert.equal(extension.codecRequest?.codec, "ccitt");
     assert.equal(unpackNativeImageCodecRequest(extension.data).codec, "ccitt");
+    const uncompressed = images.describe(await images.add(ref(44)));
+    assert.deepEqual([...uncompressed.data], rgbaBits([1, 1, 1, 0, 1, 1, 1, 1]),
+      "standard uncompressed literals decode natively without a codec envelope");
     const unknownParameter = images.describe(await images.add(ref(34)));
     assert.equal(unknownParameter.codecRequest?.codec, "ccitt");
     assert.equal(codecRequests.length, 2, "only explicitly unsupported fax capabilities use envelopes");
@@ -233,7 +236,7 @@ function ccittImageFixture() {
   const eofb = `${eol}${eol}`;
   const group4Black = packBits(`001 00110101 000101 1 1 ${eofb}`);
   const group4White = packBits(`1 ${eofb}`);
-  const extension = packBits("000000001 111");
+  const extension = packBits("000000001 110"); // Reserved selector; 111 is standard uncompressed mode.
   const defaultColumnsWhite = packBits("010011011 00110101"); // white makeup(1728) + term(0)
   const byteAligned = packBits(`1 0000000 1 0000000 ${eofb}`);
   const damaged = packBits(`${eol} 00000000 ${eol} 00110101 000101`);
@@ -290,6 +293,7 @@ function ccittImageFixture() {
       )
     },
     { number: 21, body: image(g3Entries(), Uint8Array.of(0)) },
+    { number: 44, body: image(g3Entries(), packBits("0111 000000001111 01 00000010 1011")) },
     {
       number: 22,
       body: image(

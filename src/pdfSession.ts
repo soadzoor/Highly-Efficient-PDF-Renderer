@@ -5421,6 +5421,8 @@ async function compileNativeType3Programs(
   };
 
   const postScriptImageIndices = new WeakMap<Uint8Array, Map<string, Promise<number>>>();
+  const postScriptMaskIds = new WeakMap<Uint8Array, number>();
+  let nextPostScriptMaskId = 0;
   const compilePostScriptPaints = async (
     resource: NativeTextFontResource,
     glyphId: number,
@@ -5469,14 +5471,21 @@ async function compileNativeType3Programs(
         };
       }
       paints.push({ kind: intrinsic ? "stroke" : "fill", commands, fillRule: 0,
-        clips: finalState.clips, color: finalState.color, ...(stroke ? { stroke } : {}) });
+        clips: finalState.clips, color: finalState.color, ...(finalState.pattern ? { pattern: finalState.pattern } : {}),
+        ...(stroke ? { stroke } : {}) });
     }
     const content = serializeNativeGlyphPostScriptPaints(paints, initialGraphicsState.fillAlpha, signal);
     const imageXObjects = new Map<string, number>();
     for (const [name, image] of content.images) {
       let variants = postScriptImageIndices.get(image.rgba);
       if (!variants) postScriptImageIndices.set(image.rgba, variants = new Map());
-      const key = `${image.width}:${image.height}:${image.interpolate}:${image.imageMask === true}`;
+      let maskKey = "";
+      if (image.softMask) {
+        let id = postScriptMaskIds.get(image.softMask.data);
+        if (id === undefined) postScriptMaskIds.set(image.softMask.data, id = ++nextPostScriptMaskId);
+        maskKey = `:${id}:${image.softMask.width}:${image.softMask.height}:${image.softMask.interpolate}`;
+      }
+      const key = `${image.width}:${image.height}:${image.interpolate}:${image.imageMask === true}${maskKey}`;
       let index = variants.get(key);
       if (!index) {
         index = resources.registry.add(nativeGlyphPostScriptImageStream(image, signal), undefined, signal);
@@ -5484,6 +5493,16 @@ async function compileNativeType3Programs(
       }
       imageXObjects.set(name, await index);
     }
+    const patternResources = new Map<string, PdfValue>([
+      ["Pattern", new Map(content.patterns)], ["ColorSpace", new Map<string, PdfValue>([
+        ["PSPattern", { kind: "name", value: "Pattern" }],
+        ["PSPatternRGB", [{ kind: "name", value: "Pattern" }, { kind: "name", value: "DeviceRGB" }]]
+      ])]
+    ]);
+    const patternDefinitions = await loadPatternDefinitions(resources.patterns, resources.extGStates,
+      patternResources, [...content.patterns.keys()], signal);
+    const patternColors = await loadScopedColorResolver(document, patternResources, resources.registry.colors,
+      resources.colorSpaceResolver, content.patterns.size ? ["PSPattern", "PSPatternRGB"] : [], pageIndex, signal);
     const inheritedState: DensePdfInitialGraphicsState = {
       ...initialGraphicsState,
       // PostScript has a single current color. Its inherited strokes use
@@ -5508,6 +5527,8 @@ async function compileNativeType3Programs(
       extGStates: [...content.extGStates.values()],
       imageXObjects,
       colorSpaceResolver: resources.colorSpaceResolver,
+      patterns: patternDefinitions,
+      patternColorSpaces: patternColors.patternColorSpaces,
       ...densePathCompileLimits(document, options),
       enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
       enableInvisibleCull: false,

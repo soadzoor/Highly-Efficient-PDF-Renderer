@@ -3634,8 +3634,8 @@ function sampleMask(
   const sourceY = (y + 0.5) * image.height / targetHeight - 0.5;
   const x0 = clampInteger(Math.floor(sourceX), 0, image.width - 1);
   const y0 = clampInteger(Math.floor(sourceY), 0, image.height - 1);
-  const x1 = Math.min(image.width - 1, x0 + 1);
-  const y1 = Math.min(image.height - 1, y0 + 1);
+  const x1 = clampInteger(Math.floor(sourceX) + 1, 0, image.width - 1);
+  const y1 = clampInteger(Math.floor(sourceY) + 1, 0, image.height - 1);
   const tx = clamp01(sourceX - Math.floor(sourceX));
   const ty = clamp01(sourceY - Math.floor(sourceY));
   const top = maskPixel(image, x0, y0) * (1 - tx) + maskPixel(image, x1, y0) * tx;

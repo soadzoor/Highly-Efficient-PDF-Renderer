@@ -1161,10 +1161,15 @@ subset supports font data, arithmetic and control flow, strings and token
 conversion, dictionary stacks, matrices, local/global resources and VM allocation,
 `stopped` error handling and `save`/`restore`. Memory-backed files and lazy
 procedure sources support ASCIIHex, ASCII85, RunLength, LZW, Flate with predictors,
-JPEG DCT, CCITT Group 3/4 fax, SubFile, reusable-stream and `eexec` decoding.
-JPEG uses the existing bundled decoder, prepared asynchronously during PDF font
+JPEG DCT, CCITT Group 3/4 fax (including standard uncompressed mode), SubFile,
+reusable-stream and `eexec` decoding. The additional `JBIG2Decode` extension accepts
+self-contained sequential pages; a bounded SubFile source is required when font
+code follows the encoded data, since this filter consumes through source EOF.
+JPEG and JBIG2 reuse the bundled decoders, prepared asynchronously during PDF font
 loading; standalone synchronous font/VM callers must first await
-`prepareBundledJpegCodec`. Unavailable preparation retains a diagnosed fallback.
+`prepareBundledJpegCodec` or `prepareBundledJbig2Codec`, respectively. Preparation
+caches compiled modules without allocating a persistent decoding heap.
+Unavailable preparation retains a diagnosed fallback.
 Retained streams preserve their
 positions within each glyph and start independently for subsequent glyphs.
 Glyph path, clipping, color and line-style operations retain ordered vector paint
@@ -1183,19 +1188,37 @@ file or repeating-string sources. Dictionary images use the current color space,
 including Indexed string/procedure palettes, Separation/DeviceN alternate tint
 procedures, and CIEBasedA/ABC/DEF/DEFG decoding, matrices and interpolated lookup
 tables. These color spaces also support `setcolor`, source component queries and
-graphics-state restoration. CIE output uses the canonical sRGB conversion;
-printer color-rendering dictionaries, gamut mapping and nonzero source black-point
-compensation remain diagnosed approximations.
+graphics-state restoration. Standard Type 1 color-rendering dictionaries support
+PQR white/black-point adaptation, LMN/ABC matrices and encode/range procedures,
+RGB/CMYK RenderTables and their channel transforms. `currentcolorrendering`,
+`setcolorrendering` and the ColorRendering resource/procedure-set lookup preserve
+VM and graphics-state identity. The default is a canonical sRGB CRD with source
+black-point compensation. Missing printer profiles/rendering intents and physical
+CMYK output still receive display-approximation diagnostics.
+Colored and uncolored tiling patterns retain reusable vector cells, locked pattern
+matrices, clipping, strokes and implicit charstring paint. Shading patterns and
+`shfill` reuse ordinary PDF shading resources for device color spaces, standard
+function dictionaries (types 0, 2 and 3) and encoded meshes. Shading data files
+must have an EOF boundary; array-backed mesh data and CIE shading spaces remain
+unsupported. Without an explicit shading BBox, font-local `shfill` uses the font
+bounding box and diagnoses that finite-extent approximation.
 Sampled images retain reusable RGBA image assets, clipping and source transforms,
 with interpolation preserved through HEP save/reload and GPU texture sampling.
 Noninterpolated stencils retain coalesced vector runs; interpolated stencils retain
 image masks and inherit the invoking paint. Smooth interpolation algorithms can
 differ between viewers, as permitted by the PostScript image specification.
+ImageType 3 explicit masks support sample-, row- and separate-source interleaving,
+independent mask resolution and mask interpolation. ImageType 4 color keys compare
+raw samples before Decode. The retained page preserves separate mask assets;
+HEP folds coverage into the source image grid. Different mask resolutions or
+interpolation on either image emit `font.postscript-image-mask-resampled`, since
+this folding can change mask-edge sampling.
 Access permissions, caller limits and cancellation
 remain enforced. Device-dependent matrix queries require an explicit execution context.
-Host filesystem access, printer/device control, Pattern painting, masked/composite
-image dictionaries and other filter codecs remain unsupported; this is not a
-general PostScript engine.
+Host filesystem access, printer/device control, arbitrary image/mask matrix
+misalignment, striped/random-access JBIG2 font streams and the nonstandard
+`JPXDecode` font filter remain unsupported; this is not a general PostScript
+engine. Ordinary PDF JPEG 2000 images remain supported by the asynchronous codec.
 Unsupported PostScript retains available geometry with diagnostics identifying
 the failing operator.
 Unsupported Type1 loader code that leaves readable declarative records uses
