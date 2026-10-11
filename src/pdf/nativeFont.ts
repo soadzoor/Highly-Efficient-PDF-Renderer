@@ -47,6 +47,7 @@ import {
   NativeType1Font,
   type NativeType1ParserLimits
 } from "./nativeType1";
+import { transformNativeGlyphPostScriptPaints, transformNativeGlyphPostScriptFinalState } from "./nativeFontPostScriptGraphics";
 
 /** Minimal resolver surface needed by the font engine. */
 export interface NativePdfFontResolver {
@@ -219,12 +220,54 @@ export interface NativeGlyphOutline {
   readonly bounds: readonly [number, number, number, number];
   readonly advanceWidth: number;
   readonly leftSideBearing: number;
+  /** Explicit font-local PostScript paints, in source order before endchar. */
+  readonly postScriptPaints?: readonly NativeGlyphPostScriptPaint[];
+  /** State applying to the final implicit endchar paint, while commands remain
+   * available independently for PDF text stroking and clipping. */
+  readonly postScriptFinalState?: NativeGlyphPostScriptFinalState;
   /** PaintType 2 centerline and pen in the font's original character space. */
   readonly intrinsicStroke?: {
     readonly width: number;
     readonly transform: readonly number[];
     readonly commands: readonly NativeGlyphPathCommand[];
   };
+}
+
+export interface NativeGlyphPostScriptClip {
+  readonly commands: readonly NativeGlyphPathCommand[];
+  readonly fillRule: 0 | 1;
+}
+
+export interface NativeGlyphPostScriptPaint {
+  readonly kind: "fill" | "stroke";
+  readonly commands: readonly NativeGlyphPathCommand[];
+  readonly fillRule: 0 | 1;
+  readonly clips: readonly NativeGlyphPostScriptClip[];
+  /** Null inherits the enclosing PDF glyph's paint. */
+  readonly color: readonly [number, number, number, number] | null;
+  /** Present for promoted intrinsic component strokes; other fields inherit
+   * the invoking PDF stroke style. Width is always explicitly supplied. */
+  readonly changedStrokeFields?: readonly NativeGlyphPostScriptStrokeField[];
+  readonly stroke?: {
+    readonly width: number;
+    readonly lineCap: 0 | 1 | 2;
+    readonly lineJoin: 0 | 1 | 2;
+    readonly miterLimit: number;
+    readonly dashArray: readonly number[];
+    readonly dashPhase: number;
+    readonly transform: readonly number[];
+  };
+}
+
+export type NativeGlyphPostScriptStrokeField = "width" | "lineCap" | "lineJoin" | "miterLimit" | "dashArray" | "dashPhase";
+export interface NativeGlyphPostScriptFinalState {
+  readonly clips: readonly NativeGlyphPostScriptClip[];
+  readonly color: NativeGlyphPostScriptPaint["color"];
+  readonly stroke?: NonNullable<NativeGlyphPostScriptPaint["stroke"]>;
+  /** Only these explicitly changed fields override the invoking PDF style. */
+  readonly changedStrokeFields?: readonly NativeGlyphPostScriptStrokeField[];
+  /** Composite component paints already include each final implicit paint. */
+  readonly omitFinalPaint?: true;
 }
 
 export interface NativePdfFont {
@@ -3570,6 +3613,10 @@ export class NativeSfntFont {
           : freezeBounds(source.bounds.map(value => value * scale), "OpenType CFF glyph"),
         advanceWidth: metric.advanceWidth,
         leftSideBearing: metric.leftSideBearing,
+        ...(source.postScriptPaints ? { postScriptPaints: scale === 1 ? source.postScriptPaints
+          : transformNativeGlyphPostScriptPaints(source.postScriptPaints, [scale, 0, 0, scale, 0, 0]) } : {}),
+        ...(source.postScriptFinalState ? { postScriptFinalState: scale === 1 ? source.postScriptFinalState
+          : transformNativeGlyphPostScriptFinalState(source.postScriptFinalState, [scale, 0, 0, scale, 0, 0]) } : {}),
         ...(source.intrinsicStroke ? {
           intrinsicStroke: Object.freeze({ ...source.intrinsicStroke,
             transform: scale === 1 ? source.intrinsicStroke.transform

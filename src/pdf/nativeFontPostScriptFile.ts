@@ -1,4 +1,6 @@
 import { PdfError, throwIfAborted } from "./nativeTypes";
+import { createNativeFontPostScriptCompressionDecoder } from "./nativeFontPostScriptCompression";
+import type { NativeFontPostScriptByteDecoder, NativeFontPostScriptCompressionParameters } from "./nativeFontPostScriptCompression";
 
 export interface NativeFontPostScriptFileOptions {
   readonly signal?: AbortSignal;
@@ -6,7 +8,7 @@ export interface NativeFontPostScriptFileOptions {
   readonly maxDecodedBytes?: number;
 }
 
-export interface NativeFontPostScriptFilterParameters {
+export interface NativeFontPostScriptFilterParameters extends NativeFontPostScriptCompressionParameters {
   readonly CloseSource?: boolean;
   readonly EODCount?: number;
   readonly EODString?: Uint8Array;
@@ -46,7 +48,7 @@ abstract class InputFile implements NativeFontPostScriptFile {
   protected isClosed = false;
   protected lookahead: number | undefined;
   protected readonly source?: NativeFontPostScriptFile;
-  private readonly closeSource: boolean;
+  protected readonly closeSource: boolean;
   private readonly autoClose: boolean;
 
   constructor(options: NativeFontPostScriptFileOptions, source?: NativeFontPostScriptFile,
@@ -139,6 +141,13 @@ abstract class InputFile implements NativeFontPostScriptFile {
   }
 
   protected abstract readDecodedByte(): number;
+  abstract cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    cloneBytes: (bytes: Uint8Array) => Uint8Array, options?: NativeFontPostScriptFileOptions): InputFile;
+  sourceFile(): NativeFontPostScriptFile | null { return this.source ?? null; }
+  protected copyState<T extends InputFile>(target: T): T {
+    target.position = this.position; target.encounteredEof = this.encounteredEof;
+    target.isClosed = this.isClosed; target.lookahead = this.lookahead; return target;
+  }
 }
 
 class MemoryFile extends InputFile {
@@ -146,8 +155,9 @@ class MemoryFile extends InputFile {
   private readonly bytes: Uint8Array;
   private readonly reusable: boolean;
 
-  constructor(bytes: Uint8Array, options: NativeFontPostScriptFileOptions, reusable = false) {
-    super(options, undefined, false, false);
+  constructor(bytes: Uint8Array, options: NativeFontPostScriptFileOptions, reusable = false,
+    source?: NativeFontPostScriptFile, closeSource = false) {
+    super(options, source, closeSource, false);
     this.bytes = bytes;
     this.reusable = reusable;
   }
@@ -178,6 +188,12 @@ class MemoryFile extends InputFile {
     this.lookahead = undefined;
     this.isClosed = snapshot.closed;
     this.encounteredEof = snapshot.encounteredEof;
+  }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): MemoryFile {
+    const result = new MemoryFile(cloneBytes(this.bytes), options, this.reusable,
+      this.source ? cloneSource(this.source) : undefined, this.closeSource);
+    result.offset = this.offset; return this.copyState(result);
   }
 }
 
@@ -219,6 +235,11 @@ class AsciiHexFile extends InputFile {
       else return high * 16 + digit;
     }
   }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    _cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): AsciiHexFile {
+    const result = new AsciiHexFile(options, cloneSource(this.source!), this.closeSource);
+    result.ended = this.ended; return this.copyState(result);
+  }
 }
 
 class Ascii85File extends InputFile {
@@ -255,6 +276,11 @@ class Ascii85File extends InputFile {
     this.outputOffset = 1;
     return this.output[0];
   }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    _cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): Ascii85File {
+    const result = new Ascii85File(options, cloneSource(this.source!), this.closeSource);
+    result.output = [...this.output]; result.outputOffset = this.outputOffset; result.ended = this.ended; return this.copyState(result);
+  }
 }
 
 class RunLengthFile extends InputFile {
@@ -274,6 +300,11 @@ class RunLengthFile extends InputFile {
     const value = this.repeat < 0 ? this.source!.readByte() : this.repeat;
     if (value < 0) throw invalid("A RunLengthDecode font literal is truncated.", "ioerror");
     return value;
+  }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    _cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): RunLengthFile {
+    const result = new RunLengthFile(options, cloneSource(this.source!), this.closeSource);
+    result.remaining = this.remaining; result.repeat = this.repeat; result.ended = this.ended; return this.copyState(result);
   }
 }
 
@@ -318,6 +349,13 @@ class SubFile extends InputFile {
         }
       }
     }
+  }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): SubFile {
+    const result = new SubFile(cloneSource(this.source!), { EODCount: this.remaining, EODString: cloneBytes(this.marker),
+      CloseSource: this.closeSource }, options);
+    result.pending = [...this.pending]; result.output = [...this.output]; result.outputOffset = this.outputOffset;
+    result.ended = this.ended; return this.copyState(result);
   }
 }
 
@@ -366,6 +404,42 @@ class EexecFile extends InputFile {
     this.key = ((cipher + this.key) * 52845 + 22719) & 0xffff;
     return plain;
   }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    _cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): EexecFile {
+    const result = new EexecFile(options, cloneSource(this.source!), this.closeSource);
+    result.initialized = this.initialized; result.hexadecimal = this.hexadecimal;
+    result.ciphertext = [...this.ciphertext]; result.key = this.key; return this.copyState(result);
+  }
+}
+
+class CompressionFile extends InputFile {
+  private decoder: NativeFontPostScriptByteDecoder;
+  readonly filterName: "LZWDecode" | "FlateDecode";
+  readonly parameters: NativeFontPostScriptFilterParameters;
+  constructor(source: NativeFontPostScriptFile, filterName: "LZWDecode" | "FlateDecode",
+    parameters: NativeFontPostScriptFilterParameters, options: NativeFontPostScriptFileOptions) {
+    super(options, source, parameters.CloseSource);
+    this.filterName = filterName; this.parameters = parameters;
+    this.decoder = createNativeFontPostScriptCompressionDecoder(() => source.readByte(), filterName, parameters, options);
+  }
+  protected readDecodedByte(): number { return this.decoder.readByte(); }
+  cloneFile(cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+    _cloneBytes: (bytes: Uint8Array) => Uint8Array, options = this.options): CompressionFile {
+    const source = cloneSource(this.source!), result = new CompressionFile(source, this.filterName, { ...this.parameters }, options);
+    result.decoder = this.decoder.clone(() => source.readByte(), options); return this.copyState(result);
+  }
+}
+
+/** The caller memoizes sources and byte views to preserve its complete VM graph. */
+export function cloneNativeFontPostScriptFile(file: NativeFontPostScriptFile,
+  cloneSource: (file: NativeFontPostScriptFile) => NativeFontPostScriptFile,
+  cloneBytes: (bytes: Uint8Array) => Uint8Array = bytes => bytes.slice(),
+  options?: NativeFontPostScriptFileOptions): NativeFontPostScriptFile | null {
+  return file instanceof InputFile ? file.cloneFile(cloneSource, cloneBytes, options) : null;
+}
+
+export function sourceNativeFontPostScriptFile(file: NativeFontPostScriptFile): NativeFontPostScriptFile | null {
+  return file instanceof InputFile ? file.sourceFile() : null;
 }
 
 export function createNativeFontPostScriptEexecFile(source: NativeFontPostScriptFile | Uint8Array,
@@ -382,6 +456,7 @@ export function createNativeFontPostScriptFilter(source: NativeFontPostScriptFil
     case "ASCII85Decode": return new Ascii85File(options, input, parameters.CloseSource);
     case "RunLengthDecode": return new RunLengthFile(options, input, parameters.CloseSource);
     case "SubFileDecode": return new SubFile(input, parameters, options);
+    case "LZWDecode": case "FlateDecode": return new CompressionFile(input, name, parameters, options);
     case "ReusableStreamDecode": {
       let decoded = input;
       const filters = typeof parameters.Filter === "string" ? [parameters.Filter] : parameters.Filter ?? [];
@@ -395,12 +470,7 @@ export function createNativeFontPostScriptFilter(source: NativeFontPostScriptFil
         if (output.length >= (options.maxDecodedBytes ?? Number.MAX_SAFE_INTEGER)) throw limited();
         output.push(value);
       }
-      const memory = new MemoryFile(Uint8Array.from(output), options, true);
-      if (parameters.CloseSource) {
-        const close = memory.close.bind(memory);
-        memory.close = () => { close(); input.close(); };
-      }
-      return memory;
+      return new MemoryFile(Uint8Array.from(output), options, true, input, parameters.CloseSource);
     }
     default: throw invalid(`PostScript font filter ${name} is unavailable.`, "filter");
   }

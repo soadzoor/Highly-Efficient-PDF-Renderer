@@ -91,7 +91,7 @@ try {
       /innerDefinitionGone /duringInner where { pop false } { true } ifelse def
     `).dictionary;
     assert.deepEqual(dict.get("storage"), [1, 2, 3]); assert.deepEqual(dict.get("observed"), [2, 3]);
-    assert.equal(text(dict.get("stringStorage")), "abc"); assert.equal(text(dict.get("stringObserved")), "bc");
+    assert.equal(text(dict.get("stringStorage")), "aZc"); assert.equal(text(dict.get("stringObserved")), "Zc");
     assert.equal(dict.get("sharedDict").get("value"), 5); assert.equal(dict.get("dictWritable"), true);
     assert.equal(dict.get("packingRestored"), false);
     assert.equal(dict.get("temporaryGone"), true); assert.equal(dict.get("innerDefinitionGone"), true);

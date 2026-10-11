@@ -111,7 +111,7 @@ import {
   type PdfValue
 } from "./pdf/nativePdf";
 import type { NativeOptionalContentRegistry } from "./pdf/nativeOptionalContent";
-import type { NativeEmbeddedFontPaint, NativeMissingFontResolver } from "./pdf/nativeFont";
+import type { NativeEmbeddedFontPaint, NativeMissingFontResolver, NativeGlyphPostScriptPaint } from "./pdf/nativeFont";
 import { NativePageFontRegistry } from "./pdf/nativeFontResources";
 import {
   NativeTextCompiler,
@@ -120,6 +120,9 @@ import {
   type NativeTextFontResource
 } from "./pdf/nativeText";
 import { buildNativePageTextResources } from "./pdf/nativePageText";
+import { serializeNativeGlyphPostScriptPaints } from "./pdf/nativeFontPostScriptContent";
+import { nativeGlyphPostScriptPaintBounds } from "./pdf/nativeFontPostScriptGraphics";
+import { paintNativeGlyphCommands } from "./pdf/nativeGlyphPaint";
 import { computeNativePdfPageGeometry } from "./pdf/nativePageGeometry";
 import {
   NativePdfType3Registry,
@@ -4963,6 +4966,7 @@ async function compileNativeType3Programs(
     ? Array.from(initialType3.glyphProgramIndices)
     : [];
   const fontGlyphProgramIndices = new Map(initialType3?.fontGlyphProgramIndices);
+  const implicitFillGlyphs = new Set(initialType3?.implicitFillGlyphs);
   const programs: DensePdfType3ProgramData[] = [...(initialType3?.programs ?? [])];
   const programByDefinition = new Map(initialType3?.programByDefinition);
   const preparedByCharProc = new Map<string, NativeInlineImageResult>();
@@ -4975,6 +4979,7 @@ async function compileNativeType3Programs(
   let forms = initialForms;
 
   const glyphInitialStates: Array<DensePdfInitialGraphicsState | undefined> = [];
+  const glyphRenderingModes: number[] = [];
   const registeredTextSources = new WeakMap<DensePdfCompiledPage, Set<number>>();
   const registerTextSource = (compiled: DensePdfCompiledPage, glyphOffset: number): void => {
     let offsets = registeredTextSources.get(compiled);
@@ -5004,6 +5009,7 @@ async function compileNativeType3Programs(
           });
         }
         glyphInitialStates[index] = paint.initialGraphicsState;
+        glyphRenderingModes[index] = paint.renderingMode;
       }
     }
     if (glyphPaintIndex !== compiled.glyphPaints.length) {
@@ -5414,15 +5420,114 @@ async function compileNativeType3Programs(
     return localProgramIndex;
   };
 
+  const compilePostScriptPaints = async (
+    resource: NativeTextFontResource,
+    glyphId: number,
+    initialGraphicsState: DensePdfInitialGraphicsState
+  ): Promise<{ readonly index: number; readonly includesImplicitFill: boolean } | null> => {
+    const outline = resource.font.getGlyphOutline(glyphId);
+    const finalState = outline.postScriptFinalState;
+    if (!outline.postScriptPaints?.length && !finalState) return null;
+    const definitionKey = `font-postscript:${resource.fontIndex}:${glyphId}|${type3SpecializationKey(initialGraphicsState)}`;
+    const cached = programByDefinition.get(definitionKey);
+    if (cached !== undefined) return { index: cached, includesImplicitFill: finalState !== undefined };
+    if (programs.length >= 0x7fffffff) {
+      throw new PdfError("resource-limit", "Font PostScript programs exceed the Int32 binding range.", {
+        pageIndex, details: { reason: "font-postscript-program-count" }
+      });
+    }
+    const paints: NativeGlyphPostScriptPaint[] = (outline.postScriptPaints ?? []).map(paint => {
+      if (!paint.stroke || !paint.changedStrokeFields) return paint;
+      const changed = new Set(paint.changedStrokeFields), stroke = paint.stroke;
+      return { ...paint, stroke: { ...stroke,
+        width: changed.has("width") ? stroke.width : initialGraphicsState.lineWidth,
+        lineCap: changed.has("lineCap") ? stroke.lineCap : initialGraphicsState.lineCap as 0 | 1 | 2,
+        lineJoin: changed.has("lineJoin") ? stroke.lineJoin : initialGraphicsState.lineJoin ?? 0,
+        miterLimit: changed.has("miterLimit") ? stroke.miterLimit : initialGraphicsState.miterLimit ?? 10,
+        dashArray: changed.has("dashArray") ? stroke.dashArray : initialGraphicsState.lineDash,
+        dashPhase: changed.has("dashPhase") ? stroke.dashPhase : initialGraphicsState.dashPhase
+      } };
+    });
+    if (finalState && !finalState.omitFinalPaint) {
+      const intrinsic = outline.intrinsicStroke;
+      const commands = intrinsic
+        ? paintNativeGlyphCommands(intrinsic.commands, 0, 0, { transform: intrinsic.transform, signal }).commands
+        : outline.commands;
+      let stroke: NativeGlyphPostScriptPaint["stroke"];
+      if (intrinsic) {
+        const changed = new Set(finalState.changedStrokeFields);
+        const explicit = finalState.stroke;
+        stroke = {
+          width: explicit && changed.has("width") ? explicit.width : intrinsic.width,
+          transform: explicit?.transform ?? intrinsic.transform,
+          lineCap: explicit && changed.has("lineCap") ? explicit.lineCap : initialGraphicsState.lineCap as 0 | 1 | 2,
+          lineJoin: explicit && changed.has("lineJoin") ? explicit.lineJoin : initialGraphicsState.lineJoin ?? 0,
+          miterLimit: explicit && changed.has("miterLimit") ? explicit.miterLimit : initialGraphicsState.miterLimit ?? 10,
+          dashArray: explicit && changed.has("dashArray") ? explicit.dashArray : initialGraphicsState.lineDash,
+          dashPhase: explicit && changed.has("dashPhase") ? explicit.dashPhase : initialGraphicsState.dashPhase
+        };
+      }
+      paints.push({ kind: intrinsic ? "stroke" : "fill", commands, fillRule: 0,
+        clips: finalState.clips, color: finalState.color, ...(stroke ? { stroke } : {}) });
+    }
+    const content = serializeNativeGlyphPostScriptPaints(paints, initialGraphicsState.fillAlpha, signal);
+    const inheritedState: DensePdfInitialGraphicsState = {
+      ...initialGraphicsState,
+      // PostScript has a single current color. Its inherited strokes use
+      // the enclosing PDF text's nonstroking paint, like inherited fills.
+      strokeColor: initialGraphicsState.fillColor,
+      strokeColorSpace: initialGraphicsState.fillColorSpace,
+      strokeAlpha: initialGraphicsState.fillAlpha,
+      strokeOverprint: initialGraphicsState.fillOverprint,
+      fillPaintInherited: true,
+      strokePaintInherited: true
+    };
+    const paintBounds = nativeGlyphPostScriptPaintBounds(paints);
+    const glyphBounds = paintBounds ? Object.freeze([
+      Math.min(outline.bounds[0], paintBounds[0]), Math.min(outline.bounds[1], paintBounds[1]),
+      Math.max(outline.bounds[2], paintBounds[2]), Math.max(outline.bounds[3], paintBounds[3])
+    ]) as readonly [number, number, number, number] : outline.bounds;
+    const [minX, minY, maxX, maxY] = glyphBounds;
+    const compiled = await compileDensePdfContent(content.bytes, {
+      pageMatrix: [1, 0, 0, 1, 0, 0],
+      pageBounds: { minX, minY, maxX, maxY },
+      initialGraphicsState: inheritedState,
+      extGStates: [...content.extGStates.values()],
+      colorSpaceResolver: resources.colorSpaceResolver,
+      ...densePathCompileLimits(document, options),
+      enableSegmentMerge: nativeVectorSegmentMergeEnabled(options),
+      enableInvisibleCull: false,
+      output: "display-program",
+      type3PaintMode: "colored",
+      totalBytes: content.bytes.length,
+      signal
+    });
+    commandCount += compiled.paintRuns.length / 3;
+    if (commandCount > maxCommands) {
+      throw new PdfError("resource-limit", "Font PostScript programs exceed the page command limit.", {
+        pageIndex, details: { reason: "font-postscript-command-count", commandCount, maxCommands }
+      });
+    }
+    const index = programs.length;
+    programs.push(Object.freeze({
+      compiled,
+      glyphOffset: textAccumulator.glyphCount,
+      invocationProgramIndices: new Uint32Array(0),
+      matrix: [1, 0, 0, 1, 0, 0] as DensePdfMatrix,
+      bounds: glyphBounds,
+      resourceName: `${resource.font.baseFont || "Font"}/PostScript/${glyphId}`,
+      colored: true,
+      inheritedPaintRole: content.inheritsPaint ? "fill" : "none"
+    }));
+    programByDefinition.set(definitionKey, index);
+    return { index, includesImplicitFill: finalState !== undefined };
+  };
+
   const accumulatedGlyphs = textAccumulator.glyphView();
   let glyphIndex = glyphProgramIndices.length;
   while (glyphIndex < accumulatedGlyphs.glyphIds.length) {
     signal.throwIfAborted();
     glyphProgramIndices.push(-1);
-    if ((accumulatedGlyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Type3) === 0) {
-      glyphIndex += 1;
-      continue;
-    }
     // Invisible OCR text advances and remains indexed without decoding a
     // potentially malformed CharProc that has no default-view paint effect.
     if ((accumulatedGlyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Invisible) !== 0) {
@@ -5431,6 +5536,24 @@ async function compileNativeType3Programs(
     }
     const fontIndex = accumulatedGlyphs.fontIndices[glyphIndex];
     const resource = fontRegistry.resources[fontIndex];
+    if ((accumulatedGlyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Type3) === 0) {
+      const mode = glyphRenderingModes[glyphIndex];
+      if (resource && (mode === 0 || mode === 2 || mode === 4 || mode === 6)) {
+        const initialGraphicsState = glyphInitialStates[glyphIndex];
+        if (!initialGraphicsState) {
+          throw new PdfError("invalid-object", "A font PostScript glyph has no source graphics state.", {
+            pageIndex, details: { reason: "font-postscript-glyph-paint-state", glyphIndex }
+          });
+        }
+        const program = await compilePostScriptPaints(resource, accumulatedGlyphs.glyphIds[glyphIndex], initialGraphicsState);
+        if (program !== null) {
+          glyphProgramIndices[glyphIndex] = program.index;
+          if (program.includesImplicitFill) implicitFillGlyphs.add(glyphIndex);
+        }
+      }
+      glyphIndex += 1;
+      continue;
+    }
     if (!resource || resource.fontIndex !== fontIndex || !resource.type3) {
       throw new PdfError("unsupported-font", "A Type3 glyph references an unprepared page font.", {
         pageIndex,
@@ -5462,6 +5585,7 @@ async function compileNativeType3Programs(
     type3: Object.freeze({
       glyphProgramIndices: Int32Array.from(glyphProgramIndices),
       programs: Object.freeze(programs),
+      implicitFillGlyphs,
       fontGlyphProgramIndices,
       programByDefinition
     }),

@@ -106,9 +106,8 @@ try {
   assert.deepEqual(glyph(5, []), [200], "cloning retains access attributes and interval storage aliases");
   assert.deepEqual(privateFont.createOtherSubrExecutor()(4, []), [11]);
   const retainedInput = execute(`/savedFile currentfile def /Private << /OtherSubrs [{} {} {} {} {1}] >> def`);
-  assert.throws(() => retainedInput.createOtherSubrExecutor(),
-    error => error instanceof PdfError && error.code === "unsupported-font",
-    "retained font input cursors cannot leak mutable state between glyphs");
+  assert.deepEqual(retainedInput.createOtherSubrExecutor()(4, []), [1],
+    "retained input cursors are copied into independent glyph environments");
 
   console.log("Font PostScript access tests passed: reference attributes, shared dictionaries, aliases, execution, binding, private consumption and typed access failures.");
 } finally { hooks.deregister(); }

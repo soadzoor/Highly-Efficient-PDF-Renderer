@@ -1,9 +1,11 @@
-import type { NativeGlyphOutline, NativeGlyphPathCommand } from "./nativeFont";
+import type { NativeGlyphOutline, NativeGlyphPathCommand, NativeGlyphPostScriptPaint, NativeGlyphPostScriptFinalState } from "./nativeFont";
 import { PdfError, throwIfAborted, type PdfDiagnostic } from "./nativeTypes";
 import { CFF_EXPERT_ENCODING } from "./nativeCffExpertData";
 import { executeNativeFontPostScript, type NativeFontPostScriptResult, type NativeFontPostScriptValue } from "./nativeFontPostScript";
 import { createNativeFontPostScriptFilter, createNativeFontPostScriptMemoryFile } from "./nativeFontPostScriptFile";
 import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
+import { NativeFontPostScriptGlyphContext, transformNativeGlyphPostScriptPaints, nativeGlyphPostScriptPaintBounds,
+  nativeGlyphPostScriptCommandCount, transformNativeGlyphPostScriptFinalState } from "./nativeFontPostScriptGraphics";
 
 /** Caller-selected ceilings; defaults do not impose machine-dependent limits. */
 export interface NativeType1ParserLimits {
@@ -47,7 +49,18 @@ export interface NativeType1RawOutline {
   readonly leftSideBearing: number;
   readonly advanceY: number;
   readonly sideBearingY: number;
+  readonly postScriptPaints?: readonly NativeGlyphPostScriptPaint[];
+  readonly postScriptFinalState?: NativeGlyphPostScriptFinalState;
+  /** Composite component implicit paints materialize after the PDF/font
+   * PaintType policy is selected, preserving raw contours in both modes. */
+  readonly postScriptPaintSequence?: readonly NativeType1PaintSequenceEntry[];
+  readonly postScriptDiagnostics?: readonly PdfDiagnostic[];
 }
+type NativeType1PaintSequenceEntry = NativeGlyphPostScriptPaint | {
+  readonly kind: "implicit";
+  readonly commands: readonly NativeGlyphPathCommand[];
+  readonly finalState?: NativeGlyphPostScriptFinalState;
+};
 
 export interface NativeType1CharStringOptions {
   readonly subrs?: readonly Uint8Array[] | ReadonlyMap<number, Uint8Array>;
@@ -59,7 +72,7 @@ export interface NativeType1CharStringOptions {
   readonly budget?: NativeType1Budget;
   readonly onUnknownOtherSubr?: (index: number) => void;
   readonly blendWeights?: readonly number[];
-  readonly executeOtherSubr?: (index: number, args: readonly number[]) => readonly number[] | null;
+  readonly executeOtherSubr?: (index: number, args: readonly number[], context: NativeFontPostScriptGlyphContext) => readonly number[] | null;
   /** Return base commands followed by accent commands translated by (x,y). */
   readonly resolveComposite?: (
     baseCode: number, accentCode: number, x: number, y: number
@@ -396,11 +409,51 @@ export class NativeType1Font {
       })]);
     }
     const commands = painted.commands;
-    const bounds = painted.bounds ?? measureBounds(commands);
+    const materializedPaints: readonly NativeGlyphPostScriptPaint[] | undefined = raw.postScriptPaintSequence?.map(record => {
+      if (record.kind !== "implicit") return record;
+      const state = record.finalState;
+      if (paintType === 2) {
+        const changed = state?.changedStrokeFields ?? [];
+        const stroke = state?.stroke;
+        return Object.freeze({ kind: "stroke" as const, commands: record.commands, fillRule: 0 as const,
+          clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null,
+          changedStrokeFields: Object.freeze([...new Set(["width" as const, ...changed])]),
+          stroke: Object.freeze({ width: changed.includes("width") && stroke ? stroke.width : Math.abs(this.strokeWidth),
+            lineCap: stroke?.lineCap ?? 0, lineJoin: stroke?.lineJoin ?? 0, miterLimit: stroke?.miterLimit ?? 10,
+            dashArray: stroke?.dashArray ?? Object.freeze([]), dashPhase: stroke?.dashPhase ?? 0,
+            transform: stroke?.transform ?? Object.freeze([1, 0, 0, 1, 0, 0]) }) });
+      }
+      return Object.freeze({ kind: "fill" as const, commands: record.commands, fillRule: 0 as const,
+        clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null });
+    }) ?? raw.postScriptPaints;
+    const postScriptPaints = materializedPaints ? transformNativeGlyphPostScriptPaints(materializedPaints, transform as Type1Matrix) : undefined;
+    let normalBounds = painted.bounds ?? measureBounds(commands);
+    if (paintType === 2 && raw.postScriptFinalState && !raw.postScriptFinalState.omitFinalPaint) {
+      const state = raw.postScriptFinalState, stroke = state.stroke;
+      const centerline = paintNativeGlyphCommands(raw.commands, 0, 0, { transform, signal: this.signal,
+        maxPathCommands: this.limits.maxType1PathCommands }).commands;
+      const finalStroke = transformNativeGlyphPostScriptFinalState({ ...state, stroke: {
+        width: state.changedStrokeFields?.includes("width") && stroke ? stroke.width : Math.abs(this.strokeWidth),
+        lineCap: stroke?.lineCap ?? 0, lineJoin: stroke?.lineJoin ?? 0, miterLimit: stroke?.miterLimit ?? 10,
+        dashArray: stroke?.dashArray ?? [], dashPhase: stroke?.dashPhase ?? 0,
+        transform: stroke?.transform ?? [1, 0, 0, 1, 0, 0]
+      } }, transform as Type1Matrix).stroke;
+      const finalBounds = nativeGlyphPostScriptPaintBounds([{ kind: "stroke", commands: centerline,
+        fillRule: 0, clips: [], color: null, stroke: finalStroke }]);
+      if (finalBounds) normalBounds = Object.freeze([Math.min(normalBounds[0], finalBounds[0]), Math.min(normalBounds[1], finalBounds[1]),
+        Math.max(normalBounds[2], finalBounds[2]), Math.max(normalBounds[3], finalBounds[3])]);
+    }
+    const explicitBounds = postScriptPaints ? nativeGlyphPostScriptPaintBounds(postScriptPaints) : null;
+    const bounds = explicitBounds ? Object.freeze([Math.min(commands.length ? normalBounds[0] : Infinity, explicitBounds[0]),
+      Math.min(commands.length ? normalBounds[1] : Infinity, explicitBounds[1]),
+      Math.max(commands.length ? normalBounds[2] : -Infinity, explicitBounds[2]),
+      Math.max(commands.length ? normalBounds[3] : -Infinity, explicitBounds[3])]) as readonly [number, number, number, number] : normalBounds;
     const [leftSideBearing] = transformPoint(raw.leftSideBearing, raw.sideBearingY, this.matrix);
     const outline = Object.freeze({ glyphId, commands, bounds,
       advanceWidth: finite(this.matrix[0] * 1000 * raw.advanceWidth + this.matrix[2] * 1000 * raw.advanceY),
       leftSideBearing,
+      ...(postScriptPaints?.length ? { postScriptPaints } : {}),
+      ...(raw.postScriptFinalState ? { postScriptFinalState: transformNativeGlyphPostScriptFinalState(raw.postScriptFinalState, transform as Type1Matrix) } : {}),
       ...(paintType === 2 ? { intrinsicStroke: Object.freeze({ width: this.strokeWidth, transform, commands: raw.commands }) } : {}) });
     cache.set(glyphId, outline);
     return outline;
@@ -421,14 +474,15 @@ export class NativeType1Font {
       let entry = evaluated.get(id);
       if (!entry) {
         const composite: { value?: Composite } = {};
-        const executeOtherSubr = this.otherSubrExecutorFactory?.(this.signal);
+        const executorFactory = this.otherSubrExecutorFactory;
+        let executeOtherSubr: ReturnType<NonNullable<typeof executorFactory>> | undefined;
         let otherSubrFailure: PdfError | undefined;
         const raw = evaluateNativeType1CharString(this.charStrings[id], {
           subrs: this.subrs, glyphId: id, limits: this.limits, signal: this.signal, budget,
           ...(this.blendWeights ? { blendWeights: this.blendWeights } : {}),
-          executeOtherSubr: executeOtherSubr ? (index, args) => {
+          executeOtherSubr: executorFactory ? (index, args, context) => {
             otherSubrFailure = undefined;
-            try { return executeOtherSubr(index, args); }
+            try { executeOtherSubr ??= executorFactory(this.signal, context); return executeOtherSubr(index, args); }
             catch (error) { if (!isUnsupported(error)) throw error; otherSubrFailure = error; return null; }
           } : undefined,
           onUnknownOtherSubr: index => {
@@ -450,6 +504,9 @@ export class NativeType1Font {
             return [];
           }
         });
+        for (const diagnostic of raw.postScriptDiagnostics ?? []) {
+          if (!this.fontDiagnostics.some(existing => existing.code === diagnostic.code)) this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, diagnostic]);
+        }
         entry = { raw, composite: composite.value };
         evaluated.set(id, entry);
       }
@@ -460,7 +517,37 @@ export class NativeType1Font {
         if (base && accent) {
           const commands = [...base.commands, ...accent.commands.map(command => Object.freeze(translateCommand(command, x, y)))];
           ceiling(commands.length, this.limits.maxType1PathCommands, "path-commands");
-          this.rawCache.set(id, Object.freeze({ ...entry.raw, commands: Object.freeze(commands) }));
+          const promoteFinal = Boolean(base.postScriptFinalState || accent.postScriptFinalState);
+          if (promoteFinal && entry.raw.postScriptFinalState &&
+            !this.fontDiagnostics.some(diagnostic => diagnostic.code === "font.type1-seac-state-approximated")) {
+            this.fontDiagnostics = Object.freeze([...this.fontDiagnostics, Object.freeze({
+              code: "font.type1-seac-state-approximated", severity: "warning" as const,
+              message: "A Type1 seac parent's PostScript state is not fully inherited by its separately evaluated components; component paints are retained approximately.",
+              details: Object.freeze({ reason: "type1-seac-parent-state", approximate: true })
+            })]);
+          }
+          const componentSequence = (component: NativeType1RawOutline): readonly NativeType1PaintSequenceEntry[] => [
+            ...(component.postScriptPaintSequence ?? component.postScriptPaints ?? []),
+            ...(!component.postScriptFinalState?.omitFinalPaint && component.commands.length ? [Object.freeze({
+              kind: "implicit" as const, commands: component.commands,
+              ...(component.postScriptFinalState ? { finalState: component.postScriptFinalState } : {}) })] : [])];
+          const translatedSequence = (sequence: readonly NativeType1PaintSequenceEntry[]): readonly NativeType1PaintSequenceEntry[] => sequence.map(record =>
+            record.kind === "implicit" ? Object.freeze({ ...record, commands: Object.freeze(record.commands.map(command => Object.freeze(translateCommand(command, x, y)))),
+              ...(record.finalState ? { finalState: transformNativeGlyphPostScriptFinalState(record.finalState, [1, 0, 0, 1, x, y]) } : {}) })
+              : transformNativeGlyphPostScriptPaints([record], [1, 0, 0, 1, x, y])[0]);
+          const postScriptPaintSequence = promoteFinal ? Object.freeze([...(entry.raw.postScriptPaintSequence ?? entry.raw.postScriptPaints ?? []),
+            ...componentSequence(base), ...translatedSequence(componentSequence(accent))]) : undefined;
+          const postScriptPaints = postScriptPaintSequence ? undefined : Object.freeze([...(entry.raw.postScriptPaints ?? []), ...(base.postScriptPaints ?? []),
+            ...transformNativeGlyphPostScriptPaints(accent.postScriptPaints ?? [], [1, 0, 0, 1, x, y])]);
+          const postScriptFinalState: NativeGlyphPostScriptFinalState | undefined = promoteFinal
+            ? Object.freeze({ clips: Object.freeze([]), color: null, omitFinalPaint: true }) : entry.raw.postScriptFinalState;
+          const sequenceCount = postScriptPaintSequence?.reduce((count, record) => count + (record.kind === "implicit"
+            ? record.commands.length + nativeGlyphPostScriptCommandCount([], record.finalState)
+            : nativeGlyphPostScriptCommandCount([record])), 0) ?? nativeGlyphPostScriptCommandCount(postScriptPaints ?? [], postScriptFinalState);
+          ceiling(commands.length + sequenceCount, this.limits.maxType1PathCommands, "path-commands");
+          this.rawCache.set(id, Object.freeze({ ...entry.raw, commands: Object.freeze(commands),
+            ...(postScriptPaints?.length ? { postScriptPaints } : {}), ...(postScriptPaintSequence ? { postScriptPaintSequence } : {}),
+            ...(postScriptFinalState ? { postScriptFinalState } : {}) }));
           continue;
         }
         // Push one dependency at a time so shared siblings are not mistaken for cycles.
@@ -487,6 +574,7 @@ export function evaluateNativeType1CharString(
   const activeSubrs = new Set<number>();
   const stack: number[] = [], results: number[] = [];
   const commands: NativeGlyphPathCommand[] = [];
+  let graphics: NativeFontPostScriptGlyphContext | undefined;
   let x = 0, y = 0, sbx = 0, sby = 0, wx = 0, wy = 0;
   let metrics = false, open = false, ended = false;
   let flex: { x: number; y: number }[] | null = null;
@@ -507,14 +595,17 @@ export function evaluateNativeType1CharString(
   };
   const close = () => { if (open) { append({ kind: "close" }); open = false; } };
   const move = (dx: number, dy: number) => {
+    graphics?.noteCharStringPath();
     x = finite(x + dx); y = finite(y + dy);
     if (!flex) { close(); append({ kind: "move", x, y }); open = true; }
   };
   const line = (dx: number, dy: number) => {
+    graphics?.noteCharStringPath();
     if (!open || flex) fail("A line occurs outside an ordinary contour.");
     x = finite(x + dx); y = finite(y + dy); append({ kind: "line", x, y });
   };
   const curve = (dx1: number, dy1: number, dx2: number, dy2: number, dx3: number, dy3: number) => {
+    graphics?.noteCharStringPath();
     if (!open || flex) fail("A curve occurs outside an ordinary contour.");
     const control1X = finite(x + dx1), control1Y = finite(y + dy1);
     const control2X = finite(control1X + dx2), control2Y = finite(control1Y + dy2);
@@ -600,7 +691,17 @@ export function evaluateNativeType1CharString(
               results.push(value);
             }
           } else {
-            const executed = options.executeOtherSubr?.(other, values);
+            let executed: readonly number[] | null | undefined;
+            if (options.executeOtherSubr) {
+              graphics ??= new NativeFontPostScriptGlyphContext({ signal: options.signal, maxPathCommands: limits.maxType1PathCommands });
+              graphics.replacePath(commands, commands.length ? undefined : [x, y]);
+              if (!graphics.metrics) graphics.setMetrics(wx, wy);
+              executed = options.executeOtherSubr(other, values, graphics);
+              commands.length = 0;
+              for (const command of graphics.pathCommands) append(command);
+              open = graphics.pathOpen;
+              if (graphics.metrics) [wx, wy] = graphics.metrics.width;
+            }
             if (executed !== null && executed !== undefined) {
               for (const value of executed) results.push(finite(value));
               break;
@@ -654,8 +755,15 @@ export function evaluateNativeType1CharString(
     }
   }
   if (!ended || !metrics) fail("The charstring has no complete outline definition.");
+  const postScriptPaints = graphics?.paintRecords;
+  const postScriptFinalState = graphics?.finalState;
+  const totalCommands = commands.length + nativeGlyphPostScriptCommandCount(postScriptPaints ?? [], postScriptFinalState);
+  ceiling(totalCommands, limits.maxType1PathCommands, "path-commands");
   return Object.freeze({ commands: Object.freeze(commands.map(command => Object.freeze(command))),
-    advanceWidth: wx, leftSideBearing: sbx, advanceY: wy, sideBearingY: sby });
+    advanceWidth: wx, leftSideBearing: sbx, advanceY: wy, sideBearingY: sby,
+    ...(postScriptPaints?.length ? { postScriptPaints } : {}),
+    ...(postScriptFinalState ? { postScriptFinalState } : {}),
+    ...(graphics?.diagnostics.length ? { postScriptDiagnostics: graphics.diagnostics } : {}) });
 }
 
 class PsLexer {

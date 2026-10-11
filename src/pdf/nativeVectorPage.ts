@@ -987,7 +987,12 @@ function buildVectorText(
       }
       const fontIndex = compilation.glyphs.fontIndices[glyph];
       const glyphId = compilation.glyphs.glyphIds[glyph];
-      const intrinsicStroke = paintsFill ? fonts[fontIndex].getGlyphOutline(glyphId).intrinsicStroke : undefined;
+      const outline = paintsFill ? fonts[fontIndex].getGlyphOutline(glyphId) : undefined;
+      if (outline?.postScriptPaints?.length || outline?.postScriptFinalState) {
+        throw unsupported("PostScript glyph paints require the retained graphics renderer.",
+          pageIndex, "legacy-vector-postscript-glyph");
+      }
+      const intrinsicStroke = outline?.intrinsicStroke;
       const visuallyPainted = paintsFill && !(renderingMode === 0 && intrinsicStroke?.width === 0);
       const glyphTransform = readGlyphTransform(compilation, glyph, pageIndex);
       const vertical = (flags & GLYPH_FLAG_VERTICAL) !== 0;

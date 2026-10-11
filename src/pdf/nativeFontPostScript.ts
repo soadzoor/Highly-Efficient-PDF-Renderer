@@ -4,8 +4,11 @@ import { nativeFontPostScriptIdentityMatrix, nativeFontPostScriptConcatMatrices,
   nativeFontPostScriptRotation, nativeFontPostScriptTransform } from "./nativeFontPostScriptMatrix";
 import type { NativeFontPostScriptMatrix } from "./nativeFontPostScriptMatrix";
 import { createNativeFontPostScriptMemoryFile, createNativeFontPostScriptFilter,
-  createNativeFontPostScriptEexecFile } from "./nativeFontPostScriptFile";
+  createNativeFontPostScriptEexecFile, cloneNativeFontPostScriptFile } from "./nativeFontPostScriptFile";
 import type { NativeFontPostScriptFile, NativeFontPostScriptFilterParameters } from "./nativeFontPostScriptFile";
+import { createNativeFontPostScriptProcedureFile, snapshotNativeFontPostScriptProcedureFile,
+  restoreNativeFontPostScriptProcedureFile } from "./nativeFontPostScriptProcedureFile";
+import type { NativeFontPostScriptGlyphContext, NativeFontPostScriptGraphicsState } from "./nativeFontPostScriptGraphics";
 
 export interface NativeFontPostScriptName { readonly kind: "name"; readonly value: string; readonly literal: boolean; }
 export interface NativeFontPostScriptProcedure { readonly kind: "procedure"; readonly tokens: readonly NativeFontPostScriptValue[]; }
@@ -31,20 +34,23 @@ export interface NativeFontPostScriptOptions {
   readonly initialDictionary?: Dictionary;
   /** Device-dependent matrix reads require the caller's actual context. */
   readonly initialMatrix?: NativeFontPostScriptMatrix;
+  /** Glyph-space path and ordered device marks shared with the charstring. */
+  readonly glyphContext?: NativeFontPostScriptGlyphContext;
 }
 
 export interface NativeFontPostScriptResult {
   readonly dictionary: Dictionary;
   /** Create independent glyph state, shared by that glyph's OtherSubr calls. */
-  createOtherSubrExecutor(signal?: AbortSignal): (index: number, args: readonly number[]) => readonly number[] | null;
+  createOtherSubrExecutor(signal?: AbortSignal, context?: NativeFontPostScriptGlyphContext): (index: number, args: readonly number[]) => readonly number[] | null;
   /** Arguments enter the PS stack in reverse order (Type1 specification 6.4). */
   executeOtherSubr(index: number, args: readonly number[], signal?: AbortSignal): readonly number[] | null;
 }
 
 /**
- * Font-local PostScript data interpreter (PLRM, chapters 3 and 8). It has no
- * host files, processes, networking or device operators. Unknown operators
- * fail explicitly so the caller can retain its diagnosed font fallback.
+ * Font-local PostScript interpreter (PLRM, chapters 3, 4 and 8). Glyph imaging
+ * is captured as ordered retained vector marks. It has no host files,
+ * processes, networking or printer control. Unknown operators fail explicitly
+ * so the caller can retain its diagnosed font fallback.
  * https://www.adobe.com/jp/print/postscript/pdfs/PLRM.pdf
  */
 export function executeNativeFontPostScript(cleartext: Uint8Array, privatePlaintext?: Uint8Array,
@@ -53,10 +59,10 @@ export function executeNativeFontPostScript(cleartext: Uint8Array, privatePlaint
   vm.runBytes(cleartext);
   if (privatePlaintext) vm.runBytes(privatePlaintext);
   const dictionary = vm.fontDictionary();
-  const createOtherSubrExecutor = (signal: AbortSignal | undefined = options.signal) => {
+  const createOtherSubrExecutor = (signal: AbortSignal | undefined = options.signal, context?: NativeFontPostScriptGlyphContext) => {
     // Glyphs own their mutable state, while successive calls within one glyph
     // share Private variables and arrays as required by custom OtherSubrs.
-    const { dictionary: owned, vm: local } = vmForGlyph(vm, dictionary, signal, options);
+    const { dictionary: owned, vm: local } = vmForGlyph(vm, dictionary, signal, { ...options, glyphContext: context ?? options.glyphContext });
     const copiedPrivate = owned.get("Private");
     const copiedSubrs = copiedPrivate instanceof Map ? copiedPrivate.get("OtherSubrs") : owned.get("OtherSubrs");
     if (copiedPrivate instanceof Map) local.enterDictionary(copiedPrivate);
@@ -66,7 +72,7 @@ export function executeNativeFontPostScript(cleartext: Uint8Array, privatePlaint
       try {
         local.runProcedure(procedure, [...args].reverse());
         return Object.freeze([...local.stack].reverse().map(value => requireNumber(value)));
-      } finally { local.stack.length = 0; }
+      } finally { local.finishGlyphState(); local.stack.length = 0; }
     };
   };
   return Object.freeze({ dictionary, createOtherSubrExecutor,
@@ -81,19 +87,28 @@ type Task = { kind: "input"; reader: FontPostScriptLexer; sourceFile?: boolean }
   { kind: "for"; current: number; increment: number; limit: number; procedure: Procedure } |
   { kind: "forall"; values: readonly (readonly Value[])[]; source?: Value[] | Uint8Array; index: number; procedure: Procedure } |
   { kind: "resourceforall"; keys: readonly string[]; scratch: Uint8Array; index: number; procedure: Procedure } |
-  { kind: "loop"; procedure: Procedure } | { kind: "stopped" } | { kind: "eexec-end"; dictionaryDepth: number };
+  { kind: "pathforall"; entries: readonly { args: readonly number[]; procedure: Procedure }[]; index: number } |
+  { kind: "loop"; procedure: Procedure } | { kind: "stopped" } | { kind: "source-boundary" } | { kind: "eexec-end"; dictionaryDepth: number };
 
 interface VmSnapshot {
   readonly objects: Map<object, { readonly value: Value; readonly contents?: Value[] | Uint8Array | [string, Value][]; readonly access: Access; readonly capacity?: number }>;
   readonly matrix: NativeFontPostScriptMatrix;
   readonly matrixKnown: boolean;
-  readonly graphics: readonly { matrix: NativeFontPostScriptMatrix; known: boolean }[];
+  readonly graphics: readonly { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState }[];
   readonly definedFont: Dictionary | null;
   readonly resources: readonly [string, Dictionary][];
   readonly createdCount: number;
   readonly packing: boolean;
+  readonly globalMode: boolean;
+  readonly glyphState?: NativeFontPostScriptGraphicsState;
 }
 class PostScriptStop extends Error {}
+class PostScriptSourceFailure extends Error {
+  readonly error: PdfError;
+  readonly operands: readonly Value[];
+  readonly command?: Value;
+  constructor(error: PdfError, operands: readonly Value[], command?: Value) { super(error.message); this.error = error; this.operands = operands; this.command = command; }
+}
 
 class FontPostScriptVm {
   readonly stack: Value[] = [];
@@ -102,17 +117,23 @@ class FontPostScriptVm {
   private readonly privilegedDictionaries = new Set<Dictionary>();
   private readonly created: Dictionary[] = [];
   private readonly tasks: Task[] = [];
-  private readonly system: Dictionary = new Map();
-  private readonly user: Dictionary = new Map();
-  private readonly directory: Dictionary = new Map();
+  private system: Dictionary = new Map();
+  private user: Dictionary = new Map();
+  private global: Dictionary = new Map();
+  private directory: Dictionary = new Map();
+  private localFonts: Dictionary = new Map();
+  private globalDirectory: Dictionary = new Map();
   private readonly resources = new Map<string, Dictionary>();
-  private readonly errors: Dictionary = new Map();
+  private readonly globalResources = new Map<string, Dictionary>();
+  private errors: Dictionary = new Map();
   private readonly saves: PsSave[] = [];
+  private readonly colorSpaces = new WeakMap<readonly number[], Value>();
   private matrix: NativeFontPostScriptMatrix;
   private matrixKnown: boolean;
-  private readonly graphics: { matrix: NativeFontPostScriptMatrix; known: boolean }[] = [];
+  private readonly graphics: { matrix: NativeFontPostScriptMatrix; known: boolean; glyphState?: NativeFontPostScriptGraphicsState }[] = [];
   private randomSeed = 1;
   private packing = false;
+  private globalMode = false;
   private activeCommand: Value | undefined;
   private operations = 0;
   private definedFont: Dictionary | null = null;
@@ -122,7 +143,7 @@ class FontPostScriptVm {
     this.options = options;
     this.splitEexec = splitEexec;
     this.matrix = options.initialMatrix ?? nativeFontPostScriptIdentityMatrix();
-    this.matrixKnown = options.initialMatrix !== undefined;
+    this.matrixKnown = options.initialMatrix !== undefined || options.glyphContext !== undefined;
     for (const key of ["maxOperations", "maxStack", "maxStringBytes"] as const) {
       const value = options[key];
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new RangeError(`Invalid PostScript ${key}.`);
@@ -130,21 +151,26 @@ class FontPostScriptVm {
     for (const name of OPERATOR_NAMES) this.system.set(name, { kind: "operator", name });
     this.system.set("true", true); this.system.set("false", false); this.system.set("null", null);
     this.system.set("systemdict", this.system); this.system.set("userdict", this.user);
-    this.system.set("FontDirectory", this.directory); this.system.set("globaldict", this.user);
+    this.system.set("FontDirectory", this.directory); this.system.set("GlobalFontDirectory", this.globalDirectory);
+    this.system.set("globaldict", this.global);
     this.system.set("$error", this.errors);
     this.errors.set("newerror", false);
-    this.resources.set("Font", this.directory);
+    this.resources.set("Font", this.localFonts); this.globalResources.set("Font", this.globalDirectory);
     this.system.set("StandardEncoding", reduceAccess(encoding(options.standardEncoding), 2));
     this.system.set("ExpertEncoding", reduceAccess(encoding(options.expertEncoding), 2));
     this.system.set("version", new TextEncoder().encode("3010"));
     this.system.set("languagelevel", 3);
     accessAttributes.set(this.system, 2);
-    this.dictionaries = [this.system, this.user];
-    if (options.initialDictionary) this.dictionaries.push(options.initialDictionary);
+    for (const value of [this.system, this.global, this.globalDirectory]) globalAttributes.set(value, true);
+    for (const value of [this.user, this.directory, this.localFonts, this.errors]) globalAttributes.set(value, false);
+    for (const name of ["StandardEncoding", "ExpertEncoding", "version"]) globalAttributes.set(storageOf(this.system.get(name)! as Value & object), true);
+    accessAttributes.set(this.directory, 2); accessAttributes.set(this.globalDirectory, 2);
+    this.dictionaries = [this.system, this.global, this.user];
+    if (options.initialDictionary) { this.registerGraph(options.initialDictionary, false); this.dictionaries.push(options.initialDictionary); }
   }
 
   runBytes(bytes: Uint8Array): void {
-    const reader = new FontPostScriptLexer(bytes, this.options.signal, this.options.maxStringBytes, name => this.lookup(name));
+    const reader = this.lexer(bytes);
     this.tasks.push({ kind: "input", reader });
     this.run();
   }
@@ -157,16 +183,27 @@ class FontPostScriptVm {
   // Font engines can inspect an opaque Private dictionary while executing its
   // OtherSubrs. This does not grant explicit PS get/put/begin extra access.
   enterDictionary(dictionary: Dictionary): void { this.dictionaries.push(dictionary); this.privilegedDictionaries.add(dictionary); }
+  finishGlyphState(): void { this.options.glyphContext?.setCurrentMatrix(this.matrix); }
 
   glyphEnvironment(dictionary: Dictionary): Dictionary {
-    return new Map<string, Value>([["font", dictionary], ["user", this.user], ["directory", this.directory], ["resources", new Map(this.resources)]]);
+    return new Map<string, Value>([["font", dictionary], ["system", this.system], ["errors", this.errors], ["user", this.user], ["global", this.global], ["directory", this.directory],
+      ["localFonts", this.localFonts], ["globalDirectory", this.globalDirectory], ["resources", new Map(this.resources)], ["globalResources", new Map(this.globalResources)]]);
   }
   seedGlyphEnvironment(environment: Dictionary): void {
-    for (const [key, value] of environment.get("user") as Dictionary) this.user.set(key, value);
-    for (const [key, value] of environment.get("directory") as Dictionary) this.directory.set(key, value);
-    for (const [key, value] of environment.get("resources") as Dictionary) {
-      if (key !== "Font") this.resources.set(key, value as Dictionary);
-    }
+    // Adopt graph roots rather than copying their entries: immediately
+    // evaluated //userdict, //globaldict and shared resource references must
+    // alias the same dictionaries seen by name lookup in this glyph.
+    this.system = environment.get("system") as Dictionary;
+    this.errors = environment.get("errors") as Dictionary;
+    this.user = environment.get("user") as Dictionary;
+    this.global = environment.get("global") as Dictionary;
+    this.directory = environment.get("directory") as Dictionary;
+    this.localFonts = environment.get("localFonts") as Dictionary;
+    this.globalDirectory = environment.get("globalDirectory") as Dictionary;
+    this.dictionaries.splice(0, 3, this.system, this.global, this.user);
+    this.resources.clear(); for (const [key, value] of environment.get("resources") as Dictionary) this.resources.set(key, value as Dictionary);
+    this.globalResources.clear(); for (const [key, value] of environment.get("globalResources") as Dictionary) this.globalResources.set(key, value as Dictionary);
+    this.system.set("FontDirectory", this.directory);
   }
 
   fontDictionary(): Dictionary {
@@ -178,12 +215,14 @@ class FontPostScriptVm {
     return font;
   }
 
-  private run(): void {
+  private run(boundary?: Task): void {
+    const floor = boundary ? this.tasks.indexOf(boundary) : -1;
     while (this.tasks.length) {
       throwIfAborted(this.options.signal);
       if (++this.operations > (this.options.maxOperations ?? Number.MAX_SAFE_INTEGER)) throw limited("operation");
       const task = this.tasks.at(-1)!;
-      const operands = this.tasks.some(item => item.kind === "stopped") ? this.stack.slice() : [];
+      if (task === boundary) { this.tasks.pop(); return; }
+      const operands = boundary || this.tasks.some(item => item.kind === "stopped") ? this.stack.slice() : [];
       let value: Value | undefined;
       this.activeCommand = undefined;
       try {
@@ -211,27 +250,46 @@ class FontPostScriptVm {
           if (name.length > task.scratch.length) throw unsupported("PostScript resourceforall scratch string is too small.", "resourceforall", "rangecheck");
           for (let i = 0; i < name.length; i++) task.scratch[i] = name.charCodeAt(i);
           this.push(byteView(task.scratch, 0, name.length)); this.schedule(task.procedure); continue;
+        } else if (task.kind === "pathforall") {
+          if (task.index === task.entries.length) { this.tasks.pop(); continue; }
+          const entry = task.entries[task.index++];
+          for (const item of entry.args) this.push(item);
+          this.schedule(entry.procedure); continue;
         } else if (task.kind === "stopped") { this.tasks.pop(); this.push(false); continue; }
         else if (task.kind === "eexec-end") { this.tasks.pop(); this.dictionaries.splice(task.dictionaryDepth); continue; }
+        else if (task.kind === "source-boundary") throw unsupported("An unexpected procedure-source execution boundary was encountered.");
         else { this.schedule(task.procedure); continue; }
         if (isName(value) && !value.literal) this.execute(this.lookup(value.value), value.value);
         else if (isOperator(value)) { this.activeCommand = value; this.operator(value.name); }
         else this.push(value);
-      } catch (error) {
+      } catch (caught) {
+        const failure = caught instanceof PostScriptSourceFailure ? caught : undefined;
+        const sourceError = failure?.error ?? caught;
+        const command = isName(value) ? value.value : isOperator(value) ? value.name : undefined;
+        // Low-level graphics/stream helpers know the language error; the VM
+        // knows which resolved operator caused it. Preserve both facts.
+        const error = sourceError instanceof PdfError && typeof sourceError.details?.operator === "string" &&
+          POST_SCRIPT_ERROR_NAMES.has(sourceError.details.operator)
+          ? new PdfError(sourceError.code, sourceError.message, { cause: sourceError, details: {
+            ...sourceError.details, postScriptError: sourceError.details.operator,
+            operator: isOperator(this.activeCommand) ? this.activeCommand.name : command ?? sourceError.details.operator
+          } }) : sourceError;
         const catchable = error instanceof PdfError && error.code === "unsupported-font" &&
           (error.details?.reason === "font-postscript-unsupported" || error.details?.reason === "font-postscript-file");
-        const command = isName(value) ? value.value : isOperator(value) ? value.name : undefined;
         const barrier = lastIndex(this.tasks, item => item.kind === "stopped");
-        if (barrier < 0 || (!(error instanceof PostScriptStop) && !catchable)) {
+        if (barrier <= floor || (!(error instanceof PostScriptStop) && !catchable)) {
+          if (boundary && catchable) throw failure ?? new PostScriptSourceFailure(error, operands, this.activeCommand ?? value);
+          if (boundary && error instanceof PostScriptStop) throw error;
           if (catchable && command && !error.details?.operator) throw new PdfError(error.code, error.message, { cause: error, details: { ...error.details, operator: command } });
           if (error instanceof PostScriptStop) throw unsupported("PostScript stop occurs outside stopped.", "stop");
           throw error;
         }
         if (!(error instanceof PostScriptStop)) {
-          this.stack.length = 0; for (const operand of operands) this.push(operand);
+          this.setGlobal(false);
+          this.stack.length = 0; for (const operand of failure?.operands ?? operands) this.push(operand);
           this.errors.set("newerror", true);
           this.errors.set("errorname", literalName(postScriptErrorName(error)));
-          if (value !== undefined) this.errors.set("command", this.activeCommand ?? value);
+          if (failure?.command ?? this.activeCommand ?? value) this.errors.set("command", failure?.command ?? this.activeCommand ?? value!);
         }
         this.unwindTasks(barrier);
         this.push(true);
@@ -251,7 +309,7 @@ class FontPostScriptVm {
     else if ((value instanceof Uint8Array || tagged(value, "file")) && isExecutable(value)) {
       requireAccess(value, 1);
       this.tasks.push({ kind: "input", reader: value instanceof Uint8Array
-        ? new FontPostScriptLexer(value, this.options.signal, this.options.maxStringBytes, name => this.lookup(name)) : (value as PsFile).reader, sourceFile: !(value instanceof Uint8Array) });
+        ? this.lexer(value) : (value as PsFile).reader, sourceFile: !(value instanceof Uint8Array) });
     }
     else this.push(value);
   }
@@ -263,7 +321,37 @@ class FontPostScriptVm {
   private push(value: Value): void {
     if (this.stack.length >= (this.options.maxStack ?? Number.MAX_SAFE_INTEGER)) throw limited("operand-stack");
     if (typeof value === "number") finite(value);
-    this.stack.push(value);
+    this.register(value, this.globalMode); this.stack.push(value);
+  }
+  private register(value: Value, global: boolean): void {
+    if (!isComposite(value)) return;
+    const storage = storageOf(value);
+    if (globalAttributes.has(storage)) return;
+    globalAttributes.set(storage, global);
+    if (isProcedure(value)) this.register(value.tokens as Value[], global);
+    if (global) {
+      if (value instanceof Map) for (const item of value.values()) requireGlobalReference(value, item);
+      else if (arraySequence(value)) for (const item of arraySequence(value)!) requireGlobalReference(value, item);
+    }
+  }
+  private registerGraph(root: Value, global: boolean): void {
+    const pending = [root], seen = new Set<object>();
+    while (pending.length) {
+      throwIfAborted(this.options.signal); const value = pending.pop()!;
+      if (!isComposite(value) || seen.has(value)) continue;
+      seen.add(value); if (!globalAttributes.has(storageOf(value))) globalAttributes.set(storageOf(value), global);
+      if (value instanceof Map) for (const item of value.values()) pending.push(item);
+      else if (sequence(value)) for (const item of sequence(value)!) pending.push(item);
+    }
+  }
+  lexer(bytes: Uint8Array | NativeFontPostScriptFile): FontPostScriptLexer {
+    const lexer = new FontPostScriptLexer(bytes, this.options.signal, this.options.maxStringBytes, name => this.lookup(name), value => this.register(value, this.globalMode));
+    if (!globalAttributes.has(lexer.file)) globalAttributes.set(lexer.file, this.globalMode);
+    return lexer;
+  }
+  private setGlobal(global: boolean): void {
+    this.globalMode = global;
+    this.system.set("FontDirectory", global ? this.globalDirectory : this.directory);
   }
   private pop(): Value { if (!this.stack.length) throw unsupported("PostScript operand stack underflow."); return this.stack.pop()!; }
   private number(): number { return requireNumber(this.pop()); }
@@ -303,10 +391,121 @@ class FontPostScriptVm {
     if (!this.matrixKnown) throw unsupported("Device-dependent PostScript matrix reads require an explicit font context.", operator);
     return this.matrix;
   }
-  private resource(category: string): Dictionary {
-    let directory = this.resources.get(category);
-    if (!directory) { directory = new Map(); this.resources.set(category, directory); }
+  private glyphContext(operator: string): NativeFontPostScriptGlyphContext {
+    if (!this.options.glyphContext) throw unsupported("PostScript painting requires a glyph graphics context.", operator);
+    return this.options.glyphContext;
+  }
+  private currentColorSpace(): Value {
+    const context = this.glyphContext("currentcolorspace"), values = context.sourceColorValues, space = context.sourceColorSpace;
+    if (!values || !space) throw unsupported("The enclosing PDF glyph color space is unavailable during cached font execution.", "currentcolorspace");
+    let array = this.colorSpaces.get(values);
+    if (!array) { array = reduceAccess([literalName(space)], 2); this.register(array, true); this.colorSpaces.set(values, array); }
+    return array;
+  }
+  private imageSource(value: Value): NativeFontPostScriptFile {
+    if (value instanceof Uint8Array) {
+      requireAccess(value, 2);
+      // Image strings repeat; filter strings instead end when exhausted.
+      return createNativeFontPostScriptProcedureFile({ kind: "procedure", tokens: [] }, () => value, this.fileOptions());
+    }
+    if (isProcedure(value)) { requireAccess(value, 1); return createNativeFontPostScriptProcedureFile(value, procedure => this.executeSource(procedure), this.fileOptions()); }
+    return this.file(value).reader.file;
+  }
+  private image(name: "image" | "imagemask" | "colorimage"): void {
+    const context = this.glyphContext(name), ctm = this.contextMatrix(name);
+    let width: number, height: number, bits: number, matrix: NativeFontPostScriptMatrix;
+    let components: 1 | 3 | 4 = 1, sources: Value[], decode: number[] | undefined, interpolate = false, polarity = true;
+    const dictionary = this.stack.at(-1);
+    if (dictionary instanceof Map && name !== "colorimage") {
+      this.pop(); requireAccess(dictionary, 2);
+      if (dictionary.get("ImageType") !== 1) throw unsupported("Only sampled Type 1 PostScript image dictionaries are supported.", name);
+      width = requireNumber(dictionary.get("Width") ?? null); height = requireNumber(dictionary.get("Height") ?? null);
+      bits = requireNumber(dictionary.get("BitsPerComponent") ?? (name === "imagemask" ? 1 : null));
+      matrix = this.readMatrix(dictionary.get("ImageMatrix") ?? null);
+      const decodeValue = dictionary.get("Decode");
+      if (decodeValue === undefined) throw unsupported("A PostScript image dictionary requires Decode.", name);
+      requireAccess(decodeValue, 2); const decodeArray = arraySequence(decodeValue);
+      if (!decodeArray) throw unsupported("PostScript image Decode requires an array.", name); decode = decodeArray.map(requireNumber);
+      if (name === "imagemask") {
+        if (decode.length !== 2 || !((decode[0] === 0 && decode[1] === 1) || (decode[0] === 1 && decode[1] === 0))) throw unsupported("PostScript imagemask Decode must be [0 1] or [1 0].", name, "rangecheck");
+        polarity = decode[0] === 1;
+      } else {
+        const space = context.sourceColorSpace;
+        if (!space) throw unsupported("PostScript image needs an explicit DeviceGray, DeviceRGB or DeviceCMYK color space.", name);
+        components = space === "DeviceGray" ? 1 : space === "DeviceRGB" ? 3 : 4;
+      }
+      const interpolation = dictionary.get("Interpolate") ?? false;
+      if (typeof interpolation !== "boolean") throw unsupported("PostScript image Interpolate requires a boolean.", name); interpolate = interpolation;
+      const multiple = dictionary.get("MultipleDataSources") ?? false;
+      if (typeof multiple !== "boolean" || (name === "imagemask" && multiple)) throw unsupported("Invalid PostScript MultipleDataSources.", name);
+      const source = dictionary.get("DataSource") ?? null;
+      if (multiple) { requireAccess(source, 2); const array = arraySequence(source); if (!array || array.length !== components) throw unsupported("PostScript image needs one data source per color component.", name); sources = [...array]; }
+      else sources = [source];
+    } else {
+      if (name === "colorimage") {
+        const count = this.integer(), multiple = this.pop();
+        if (![1, 3, 4].includes(count) || typeof multiple !== "boolean") throw unsupported("Invalid PostScript colorimage components or source organization.", name);
+        components = count as 1 | 3 | 4; sources = [];
+        for (let i = 0; i < (multiple ? count : 1); i++) sources.unshift(this.pop());
+      } else sources = [this.pop()];
+      matrix = this.readMatrix(this.pop());
+      if (name === "imagemask") { const value = this.pop(); if (typeof value !== "boolean") throw unsupported("PostScript imagemask polarity requires a boolean.", name); polarity = value; bits = 1; }
+      else bits = this.integer();
+      height = this.integer(); width = this.integer();
+    }
+    if (!Number.isSafeInteger(width) || width < 0 || !Number.isSafeInteger(height) || height < 0 || ![1, 2, 4, 8, 12].includes(bits) || (name === "imagemask" && bits !== 1)) throw unsupported("Invalid PostScript image dimensions or bit depth.", name, "rangecheck");
+    // Validate the matrix before consuming inline bytes from currentfile.
+    nativeFontPostScriptInvertMatrix(matrix);
+    if (width === 0 || height === 0) return;
+    const rowBytes = Math.ceil(width * components * bits / 8), length = rowBytes * height;
+    const data = allocatedBytes(length, this.options.maxStringBytes), readers = sources.map(source => this.imageSource(source));
+    let used = 0;
+    if (readers.length === 1) used = readers[0].readInto(data);
+    else {
+      const planeRowBytes = Math.ceil(width * bits / 8), planes = readers.map(() => allocatedBytes(planeRowBytes, this.options.maxStringBytes));
+      rows: for (let y = 0; y < height; y++) {
+        throwIfAborted(this.options.signal);
+        // Round-robin byte reads preserve procedure call order when component
+        // procedures obtain successive same-size strings from one input file.
+        for (let byte = 0; byte < planeRowBytes; byte++) for (let component = 0; component < readers.length; component++) {
+          const value = readers[component].readByte(); if (value < 0) break rows;
+          planes[component][byte] = value;
+        }
+        for (let x = 0; x < width; x++) {
+          if ((x & 255) === 0) throwIfAborted(this.options.signal);
+          for (let component = 0; component < components; component++) for (let bit = 0; bit < bits; bit++) {
+            const sourceBit = x * bits + bit, destinationBit = y * rowBytes * 8 + (x * components + component) * bits + bit;
+            data[Math.floor(destinationBit / 8)] |= ((planes[component][Math.floor(sourceBit / 8)] >>> (7 - sourceBit % 8)) & 1) << (7 - destinationBit % 8);
+          }
+        }
+        used += rowBytes;
+      }
+    }
+    context.image({ width, height, bitsPerComponent: bits as 1 | 2 | 4 | 8 | 12, components,
+      data: data.subarray(0, used), imageMatrix: matrix, ctm, decode, mask: name === "imagemask", polarity, interpolate });
+  }
+  private resource(category: string, global = this.globalMode): Dictionary {
+    const resources = global ? this.globalResources : this.resources;
+    let directory = resources.get(category);
+    if (!directory) { directory = new Map(); globalAttributes.set(directory, global); resources.set(category, directory); }
     return directory;
+  }
+  private findResource(category: string, key: string): Value | undefined {
+    return (!this.globalMode ? this.resources.get(category)?.get(key) : undefined) ?? this.globalResources.get(category)?.get(key);
+  }
+  private resourceKeys(category: string): readonly string[] {
+    return [...new Set([...(this.globalResources.get(category)?.keys() ?? []), ...(!this.globalMode ? this.resources.get(category)?.keys() ?? [] : [])])];
+  }
+  private defineResource(category: string, key: string, instance: Value): void {
+    if (this.globalMode && !isGlobal(instance)) throw unsupported("A local PostScript resource cannot be registered globally.", "invalidaccess");
+    if (this.globalMode) this.resource(category, false).delete(key);
+    this.resource(category).set(key, instance);
+    if (category === "Font") this.rebuildFontDirectory();
+  }
+  private rebuildFontDirectory(): void {
+    this.directory.clear();
+    for (const [key, value] of this.globalDirectory) this.directory.set(key, value);
+    for (const [key, value] of this.localFonts) this.directory.set(key, value);
   }
   private unwindTasks(index: number): void {
     for (let i = this.tasks.length - 1; i >= index; i--) {
@@ -319,14 +518,33 @@ class FontPostScriptVm {
     requireAccess(value, 2); return value as PsFile;
   }
   private fileOptions() { return { signal: this.options.signal, maxDecodedBytes: this.options.maxStringBytes }; }
+  executeSource(procedure: Procedure): Uint8Array {
+    const boundary: Task = { kind: "source-boundary" }, depth = this.tasks.length;
+    const command = this.activeCommand;
+    this.tasks.push(boundary);
+    try {
+      this.schedule(procedure); this.run(boundary);
+      const result = this.pop(); if (!(result instanceof Uint8Array)) throw unsupported("A PostScript data source must return a string.", undefined, "typecheck");
+      requireAccess(result, 2); return result;
+    } catch (error) {
+      if (error instanceof RangeError && /call stack/i.test(error.message)) throw new PdfError("resource-limit", "The host stack cannot execute this nested PostScript stream chain.", { cause: error });
+      throw error;
+    } finally { this.unwindTasks(depth); this.activeCommand = command; }
+  }
   private save(): PsSave {
     const objects: VmSnapshot["objects"] = new Map();
-    const pending: Value[] = [...this.dictionaries, this.directory, this.errors, ...this.resources.values(), ...this.stack];
+    const pending: Value[] = [...this.dictionaries, this.directory, this.localFonts, this.globalDirectory, this.errors, ...this.resources.values(), ...this.globalResources.values(), ...this.stack];
+    for (const values of [this.options.glyphContext?.sourceColorValues,
+      ...this.graphics.map(state => state.glyphState?.sourceColor?.values)]) {
+      const space = values ? this.colorSpaces.get(values) : undefined;
+      if (space) pending.push(space);
+    }
     for (const task of this.tasks) {
       if (task.kind === "tokens") pending.push(task.tokens as Value[]);
       if ("procedure" in task) pending.push(task.procedure);
       if (task.kind === "forall") { if (task.source) pending.push(task.source); else for (const values of task.values) for (const value of values) pending.push(value); }
       if (task.kind === "resourceforall") pending.push(task.scratch);
+      if (task.kind === "pathforall") for (const entry of task.entries) pending.push(entry.procedure);
     }
     while (pending.length) {
       throwIfAborted(this.options.signal);
@@ -334,12 +552,12 @@ class FontPostScriptVm {
       if (!isComposite(value) || objects.has(value)) continue;
       let contents: Value[] | Uint8Array | [string, Value][] | undefined;
       if (value instanceof Map) { contents = [...value]; for (const item of value.values()) pending.push(item); }
-      else if (value instanceof Uint8Array) { contents = value.slice(); const parent = byteViews.get(value); if (parent) pending.push(parent.source); }
+      else if (value instanceof Uint8Array) { const parent = byteViews.get(value); if (parent) pending.push(parent.source); }
       else if (Array.isArray(value)) { contents = [...value]; for (const item of value) pending.push(item); const parent = arrayViews.get(value); if (parent) pending.push(parent.source); }
       else if (isProcedure(value)) pending.push(value.tokens as Value[]);
       objects.set(value, { value, contents, access: accessOf(value), capacity: value instanceof Map ? dictionaryCapacities.get(value) : undefined });
     }
-    const save: PsSave = { kind: "save", owner: this, snapshot: { objects, matrix: this.matrix, matrixKnown: this.matrixKnown, graphics: [...this.graphics], definedFont: this.definedFont, resources: [...this.resources], createdCount: this.created.length, packing: this.packing } };
+    const save: PsSave = { kind: "save", owner: this, snapshot: { objects, matrix: this.matrix, matrixKnown: this.matrixKnown, graphics: [...this.graphics], definedFont: this.definedFont, resources: [...this.resources], createdCount: this.created.length, packing: this.packing, globalMode: this.globalMode, glyphState: this.options.glyphContext?.captureState() } };
     this.saves.push(save); return save;
   }
   private restore(value: Value): void {
@@ -348,13 +566,13 @@ class FontPostScriptVm {
     if (save.owner !== this || index < 0) throw unsupported("The PostScript save object is no longer valid.", "invalidrestore");
     const { objects } = save.snapshot;
     for (const reference of [...this.stack, ...this.dictionaries]) {
-      if (isComposite(reference) && !objects.has(storageOf(reference))) throw unsupported("A newer composite object remains on a PostScript stack.", "invalidrestore");
+      if (isComposite(reference) && !isGlobal(reference) && !objects.has(storageOf(reference))) throw unsupported("A newer composite object remains on a PostScript stack.", "invalidrestore");
     }
-    for (const task of this.tasks) if (task.kind === "tokens" && !objects.has(storageOf(task.tokens as Value[]))) throw unsupported("A newer procedure remains on the PostScript execution stack.", "invalidrestore");
+    for (const task of this.tasks) if (task.kind === "tokens" && !isGlobal(task.tokens as Value[]) && !objects.has(storageOf(task.tokens as Value[]))) throw unsupported("A newer procedure remains on the PostScript execution stack.", "invalidrestore");
     for (const { value: target, contents, access, capacity } of objects.values()) {
       throwIfAborted(this.options.signal);
+      if (isGlobal(target)) continue;
       if (target instanceof Map) { target.clear(); for (const [key, item] of contents as [string, Value][]) target.set(key, item); }
-      else if (target instanceof Uint8Array) target.set(contents as Uint8Array);
       else if (Array.isArray(target)) for (let i = 0; i < target.length; i++) target[i] = (contents as Value[])[i];
       accessAttributes.set(target as object, access);
       if (target instanceof Map) { if (capacity === undefined) dictionaryCapacities.delete(target); else dictionaryCapacities.set(target, capacity); }
@@ -362,10 +580,18 @@ class FontPostScriptVm {
     this.matrix = save.snapshot.matrix;
     this.matrixKnown = save.snapshot.matrixKnown;
     this.graphics.splice(0, this.graphics.length, ...save.snapshot.graphics);
-    this.definedFont = save.snapshot.definedFont;
+    if (save.snapshot.glyphState) this.options.glyphContext?.restoreState(save.snapshot.glyphState);
+    // A globally registered font survives local VM rollback, including the
+    // font engine's result pointer. Merely allocating its dictionary globally
+    // does not make a registration in the local Font resource survive.
+    if (!this.definedFont || ![...this.globalDirectory.values()].includes(this.definedFont)) {
+      this.definedFont = save.snapshot.definedFont;
+    }
     this.created.length = save.snapshot.createdCount;
     this.packing = save.snapshot.packing;
+    this.setGlobal(save.snapshot.globalMode);
     this.resources.clear(); for (const [key, directory] of save.snapshot.resources) this.resources.set(key, directory);
+    this.rebuildFontDirectory();
     this.saves.splice(index);
   }
 
@@ -395,7 +621,7 @@ class FontPostScriptVm {
       case "string": this.push(allocatedBytes(this.count(), this.options.maxStringBytes)); break;
       case "dict": { const capacity = this.count(), dict = new Map<string, Value>(); dictionaryCapacities.set(dict, capacity); this.created.push(dict); this.push(dict); break; }
       case "begin": { const dict = this.dictionary(); requireAccess(dict, 2); this.dictionaries.push(dict); break; }
-      case "end": if (this.dictionaries.length <= 2) throw unsupported("PostScript dictionary stack underflow."); else this.dictionaries.pop(); break;
+      case "end": if (this.dictionaries.length <= 3) throw unsupported("PostScript dictionary stack underflow."); else this.dictionaries.pop(); break;
       case "currentdict": this.push(this.dictionaries.at(-1)!); break;
       case "countdictstack": this.push(this.dictionaries.length); break;
       case "dictstack": {
@@ -403,10 +629,10 @@ class FontPostScriptVm {
         if (!arraySequence(target) || arraySequence(target)!.length < this.dictionaries.length) throw unsupported("PostScript dictstack destination is too small.");
         this.dictionaries.forEach((dict, i) => put(target, i, dict)); this.push(sequenceView(target, 0, this.dictionaries.length)); break;
       }
-      case "cleardictstack": this.dictionaries.splice(2); break;
+      case "cleardictstack": this.dictionaries.splice(3); break;
       case "maxlength": { const dict = this.dictionary(); requireAccess(dict, 2); this.push(Math.max(dictionaryCapacities.get(dict) ?? 0, dict.size)); break; }
-      case "def": { const value = this.pop(), k = this.name(), dict = this.dictionaries.at(-1)!; requireAccess(dict, 3); dict.set(k, value); break; }
-      case "store": { const value = this.pop(), k = this.name(); const dict = [...this.dictionaries].reverse().find(d => { this.requireDictionaryLookup(d); return d.has(k); }) ?? this.dictionaries.at(-1)!; requireAccess(dict, 3); dict.set(k, value); break; }
+      case "def": { const value = this.pop(), k = this.name(), dict = this.dictionaries.at(-1)!; requireAccess(dict, 3); requireGlobalReference(dict, value); dict.set(k, value); break; }
+      case "store": { const value = this.pop(), k = this.name(); const dict = [...this.dictionaries].reverse().find(d => { this.requireDictionaryLookup(d); return d.has(k); }) ?? this.dictionaries.at(-1)!; requireAccess(dict, 3); requireGlobalReference(dict, value); dict.set(k, value); break; }
       case "load": { const k = this.name(), value = this.lookup(k); if (value === undefined) throw unsupported(`PostScript name ${k} is undefined.`, k); this.push(value); break; }
       case "where": { const k = this.name(), dict = [...this.dictionaries].reverse().find(d => { this.requireDictionaryLookup(d); return d.has(k); }); if (dict) this.push(dict); this.push(dict !== undefined); break; }
       case "known": { const k = this.name(), dict = this.dictionary(); requireAccess(dict, 2); this.push(dict.has(k)); break; }
@@ -426,15 +652,16 @@ class FontPostScriptVm {
         requireAccess(source, 2); requireAccess(target, 3);
         const sourceItems = sequence(source), targetItems = sequence(target);
         if (!sourceItems || !targetItems || (source instanceof Uint8Array) !== (target instanceof Uint8Array) || start + sourceItems.length > targetItems.length) throw unsupported("PostScript putinterval has invalid ranges.");
-        const values = Array.from(sourceItems); for (let i = 0; i < values.length; i++) put(target, start + i, values[i]); break;
+        const values = Array.from(sourceItems); for (const item of values) requireGlobalReference(target, item);
+        for (let i = 0; i < values.length; i++) put(target, start + i, values[i]); break;
       }
       case "aload": { const value = this.pop(); requireAccess(value, 2); const items = arraySequence(value); if (!items) throw unsupported("PostScript aload requires an array."); for (const item of items) this.push(item); this.push(value); break; }
-      case "astore": { const value = this.pop(); requireAccess(value, 3); const array = arraySequence(value); if (!array || array.length > this.stack.length) throw unsupported("PostScript astore has invalid operands."); const items = this.stack.splice(this.stack.length - array.length); for (let i = 0; i < items.length; i++) array[i] = items[i]; this.push(value); break; }
+      case "astore": { const value = this.pop(); requireAccess(value, 3); const array = arraySequence(value); if (!array || array.length > this.stack.length) throw unsupported("PostScript astore has invalid operands."); const items = this.stack.slice(this.stack.length - array.length); for (const item of items) requireGlobalReference(value, item); this.stack.length -= array.length; for (let i = 0; i < items.length; i++) array[i] = items[i]; this.push(value); break; }
       case "copy": {
         const target = this.pop();
         if (typeof target === "number") { if (!Number.isSafeInteger(target) || target < 0 || target > this.stack.length) throw unsupported("PostScript copy count is invalid."); for (const item of this.stack.slice(this.stack.length - target)) this.push(item); }
-        else { const source = this.pop(); requireAccess(source, 2); requireAccess(target, 3); if (target instanceof Map && source instanceof Map) { for (const [k, value] of source) target.set(k, value); this.push(target); }
-          else if (sequence(target) && sequence(source) && (target instanceof Uint8Array) === (source instanceof Uint8Array) && sequence(source)!.length <= sequence(target)!.length) { const items = Array.from(sequence(source)!); for (let i = 0; i < items.length; i++) put(target, i, items[i]); this.push(sequenceView(target, 0, items.length)); }
+        else { const source = this.pop(); requireAccess(source, 2); requireAccess(target, 3); if (target instanceof Map && source instanceof Map) { for (const value of source.values()) requireGlobalReference(target, value); for (const [k, value] of source) target.set(k, value); this.push(target); }
+          else if (sequence(target) && sequence(source) && (target instanceof Uint8Array) === (source instanceof Uint8Array) && sequence(source)!.length <= sequence(target)!.length) { const items = Array.from(sequence(source)!); for (const item of items) requireGlobalReference(target, item); for (let i = 0; i < items.length; i++) put(target, i, items[i]); this.push(sequenceView(target, 0, items.length)); }
           else throw unsupported("PostScript copy operands are incompatible."); } break;
       }
       case "add": case "sub": case "mul": case "div": case "idiv": case "mod": case "exp": case "atan": {
@@ -501,7 +728,7 @@ class FontPostScriptVm {
       }
       case "loop": this.tasks.push({ kind: "loop", procedure: this.procedure() }); break;
       case "exit": {
-        const i = lastIndex(this.tasks, task => ["for", "forall", "resourceforall", "repeat", "loop", "stopped"].includes(task.kind) || (task.kind === "input" && task.sourceFile !== false));
+        const i = lastIndex(this.tasks, task => ["for", "forall", "resourceforall", "pathforall", "repeat", "loop", "stopped"].includes(task.kind) || (task.kind === "input" && task.sourceFile !== false));
         if (i < 0 || this.tasks[i].kind === "stopped" || this.tasks[i].kind === "input") throw unsupported("PostScript exit occurs outside an enclosing loop.", "invalidexit");
         this.unwindTasks(i); break;
       }
@@ -509,6 +736,9 @@ class FontPostScriptVm {
       case "stop": throw new PostScriptStop();
       case "save": this.push(this.save()); break;
       case "restore": this.restore(this.pop()); break;
+      case "setglobal": { const value = this.pop(); if (typeof value !== "boolean") throw unsupported("PostScript setglobal requires a boolean."); this.setGlobal(value); break; }
+      case "currentglobal": this.push(this.globalMode); break;
+      case "gcheck": this.push(isGlobal(this.pop())); break;
       case "rand": this.randomSeed = (this.randomSeed * 16807) % 2147483647; this.push(this.randomSeed); break;
       case "srand": { const seed = this.integer(); this.randomSeed = seed <= 0 ? 1 - seed : seed === 2147483647 ? 2147483646 : seed; break; }
       case "rrand": this.push(this.randomSeed); break;
@@ -540,13 +770,136 @@ class FontPostScriptVm {
         const y = this.number(), x = this.number(); const [tx, ty] = nativeFontPostScriptTransform(x, y, matrix, name === "dtransform" || name === "idtransform", name === "itransform" || name === "idtransform");
         this.push(tx); this.push(ty); break;
       }
-      case "gsave": this.graphics.push({ matrix: this.matrix, known: this.matrixKnown }); break;
-      case "grestore": if (this.graphics.length) { const state = this.graphics.pop()!; this.matrix = state.matrix; this.matrixKnown = state.known; } break;
-      case "grestoreall": if (this.graphics.length) { this.matrix = this.graphics[0].matrix; this.matrixKnown = this.graphics[0].known; this.graphics.length = 0; } break;
+      case "gsave": this.graphics.push({ matrix: this.matrix, known: this.matrixKnown, glyphState: this.options.glyphContext?.captureState() }); break;
+      case "grestore": case "grestoreall": {
+        const state = name === "grestoreall" ? this.graphics[0] : this.graphics.pop();
+        if (state) { this.matrix = state.matrix; this.matrixKnown = state.known; if (state.glyphState) this.options.glyphContext?.restoreState(state.glyphState); }
+        if (name === "grestoreall") this.graphics.length = 0;
+        break;
+      }
+      case "newpath": this.glyphContext(name).newPath(); break;
+      case "moveto": case "rmoveto": case "lineto": case "rlineto": {
+        const y = this.number(), x = this.number(), context = this.glyphContext(name);
+        if (name.endsWith("moveto")) context.moveTo(x, y, this.contextMatrix(name), name === "rmoveto");
+        else context.lineTo(x, y, this.contextMatrix(name), name === "rlineto");
+        break;
+      }
+      case "curveto": case "rcurveto": {
+        const y = this.number(), x = this.number(), c2y = this.number(), c2x = this.number(), c1y = this.number(), c1x = this.number();
+        this.glyphContext(name).curveTo(c1x, c1y, c2x, c2y, x, y, this.contextMatrix(name), name === "rcurveto"); break;
+      }
+      case "closepath": this.glyphContext(name).closePath(); break;
+      case "currentpoint": for (const coordinate of this.glyphContext(name).currentPoint(this.contextMatrix(name))) this.push(coordinate); break;
+      case "pathbbox": for (const coordinate of this.glyphContext(name).pathBBox(this.contextMatrix(name))) this.push(coordinate); break;
+      case "arc": case "arcn": {
+        const end = this.number(), start = this.number(), radius = this.number(), y = this.number(), x = this.number();
+        this.glyphContext(name).arc(x, y, radius, start, end, this.contextMatrix(name), name === "arcn"); break;
+      }
+      case "arcto": {
+        const radius = this.number(), y2 = this.number(), x2 = this.number(), y1 = this.number(), x1 = this.number();
+        for (const coordinate of this.glyphContext(name).arcTo(x1, y1, x2, y2, radius, this.contextMatrix(name))) this.push(coordinate); break;
+      }
+      case "flattenpath": this.glyphContext(name).flattenPath(); break;
+      case "reversepath": this.glyphContext(name).reversePath(); break;
+      case "pathforall": {
+        const close = this.procedure(), curve = this.procedure(), line = this.procedure(), move = this.procedure();
+        for (const procedure of [close, curve, line, move]) requireAccess(procedure, 1);
+        let x = 0, y = 0;
+        const entries = this.glyphContext(name).pathElements(this.contextMatrix(name)).map(command => {
+          if (command.kind === "close") return { args: [], procedure: close };
+          const args = command.kind === "move" || command.kind === "line" ? [command.x, command.y]
+            : command.kind === "cubic" ? [command.control1X, command.control1Y, command.control2X, command.control2Y, command.x, command.y]
+            : [x + 2 / 3 * (command.controlX - x), y + 2 / 3 * (command.controlY - y),
+              command.x + 2 / 3 * (command.controlX - command.x), command.y + 2 / 3 * (command.controlY - command.y), command.x, command.y];
+          x = command.x; y = command.y;
+          return { args, procedure: command.kind === "move" ? move : command.kind === "line" ? line : curve };
+        });
+        this.tasks.push({ kind: "pathforall", entries, index: 0 }); break;
+      }
+      case "fill": case "eofill": case "stroke": this.glyphContext(name).paint(name, this.contextMatrix(name)); break;
+      case "clip": case "eoclip": this.glyphContext(name).clip(name === "clip" ? 0 : 1); break;
+      case "rectclip": case "rectfill": case "rectstroke": {
+        const pen = name === "rectstroke" && arraySequence(this.stack.at(-1) ?? null)?.length === 6 ? this.readMatrix(this.pop()) : null;
+        const operand = this.pop(); let values: readonly number[];
+        const array = arraySequence(operand);
+        if (array) { requireAccess(operand, 2); values = array.map(requireNumber); }
+        else if (typeof operand === "number") { const height = requireNumber(operand), width = this.number(), y = this.number(), x = this.number(); values = [x, y, width, height]; }
+        else throw unsupported("PostScript rectangles require numbers or a numeric array; encoded number strings are unavailable.", name);
+        if (values.length % 4) throw unsupported("PostScript rectangle arrays require groups of four numbers.", name, "rangecheck");
+        const context = this.glyphContext(name), state = context.captureState(), matrix = this.contextMatrix(name);
+        context.newPath();
+        try {
+          for (let i = 0; i < values.length; i += 4) {
+            const [x, y, width, height] = values.slice(i, i + 4), left = Math.min(x, x + width), right = Math.max(x, x + width), bottom = Math.min(y, y + height), top = Math.max(y, y + height);
+            context.moveTo(left, bottom, matrix); context.lineTo(right, bottom, matrix); context.lineTo(right, top, matrix); context.lineTo(left, top, matrix); context.closePath();
+          }
+          if (name === "rectclip") { context.clip(0); context.newPath(); }
+          else context.paint(name === "rectfill" ? "fill" : "stroke", pen ? nativeFontPostScriptConcatMatrices(pen, matrix) : matrix);
+        } finally { if (name !== "rectclip") context.restoreState(state); }
+        break;
+      }
+      case "setlinewidth": this.glyphContext(name).setLineWidth(this.number()); break;
+      case "setlinecap": this.glyphContext(name).setLineCap(this.integer()); break;
+      case "setlinejoin": this.glyphContext(name).setLineJoin(this.integer()); break;
+      case "setmiterlimit": this.glyphContext(name).setMiterLimit(this.number()); break;
+      case "setdash": {
+        const phase = this.number(), value = this.pop(); requireAccess(value, 2);
+        const array = arraySequence(value); if (!array) throw unsupported("PostScript setdash requires an array.");
+        this.glyphContext(name).setDash(array.map(requireNumber), phase); break;
+      }
+      case "currentlinewidth": this.push(this.glyphContext(name).strokeStyle.width); break;
+      case "currentlinecap": this.push(this.glyphContext(name).strokeStyle.lineCap); break;
+      case "currentlinejoin": this.push(this.glyphContext(name).strokeStyle.lineJoin); break;
+      case "currentmiterlimit": this.push(this.glyphContext(name).strokeStyle.miterLimit); break;
+      case "currentdash": { const style = this.glyphContext(name).strokeStyle; this.push([...style.dashArray]); this.push(style.dashPhase); break; }
+      case "setgray": this.glyphContext(name).setColorGray(this.number()); break;
+      case "setrgbcolor": { const b = this.number(), g = this.number(), r = this.number(); this.glyphContext(name).setColorRGB(r, g, b); break; }
+      case "setcmykcolor": { const k = this.number(), y = this.number(), m = this.number(), c = this.number(); this.glyphContext(name).setColorCMYK(c, m, y, k); break; }
+      case "sethsbcolor": {
+        const b = this.number(), s = this.number(), h = this.number(); this.glyphContext(name).setColorHSB(h, s, b); break;
+      }
+      case "currentrgbcolor": for (const value of this.glyphContext(name).currentRGB) this.push(value); break;
+      case "currentgray": this.push(this.glyphContext(name).currentGray); break;
+      case "currentcmykcolor": for (const value of this.glyphContext(name).currentCMYK) this.push(value); break;
+      case "currenthsbcolor": for (const value of this.glyphContext(name).currentHSB) this.push(value); break;
+      case "setcharwidth": { const y = this.number(), x = this.number(); this.glyphContext(name).setMetrics(x, y); break; }
+      case "setcachedevice": {
+        const top = this.number(), right = this.number(), bottom = this.number(), left = this.number(), wy = this.number(), wx = this.number();
+        this.glyphContext(name).setMetrics(wx, wy, [left, bottom, right, top]); break;
+      }
+      case "image": case "imagemask": case "colorimage": this.image(name); break;
+      case "currentcolorspace": {
+        this.push(this.currentColorSpace()); break;
+      }
+      case "setcolorspace": {
+        const value = this.pop(); if (isComposite(value)) requireAccess(value, 2);
+        const sequence = arraySequence(value), space = isName(value) ? value.value : sequence?.length === 1 && isName(sequence[0]) ? sequence[0].value : null;
+        const context = this.glyphContext(name);
+        if (space === "DeviceGray") context.setColorGray(0);
+        else if (space === "DeviceRGB") context.setColorRGB(0, 0, 0);
+        else if (space === "DeviceCMYK") context.setColorCMYK(0, 0, 0, 1);
+        else throw unsupported("PostScript glyph colors support DeviceGray, DeviceRGB and DeviceCMYK.", name);
+        if (sequence) this.colorSpaces.set(context.sourceColorValues!, value);
+        break;
+      }
+      case "currentcolor": {
+        const values = this.glyphContext(name).sourceColorValues;
+        if (!values) throw unsupported("The enclosing PDF glyph color is unavailable during cached font execution.", name);
+        for (const value of values) this.push(value); break;
+      }
+      case "setcolor": {
+        const context = this.glyphContext(name), space = context.sourceColorSpace;
+        const colorSpace = this.currentColorSpace();
+        if (space === "DeviceGray") context.setColorGray(this.number());
+        else if (space === "DeviceRGB") { const b = this.number(), g = this.number(), r = this.number(); context.setColorRGB(r, g, b); }
+        else if (space === "DeviceCMYK") { const k = this.number(), y = this.number(), m = this.number(), c = this.number(); context.setColorCMYK(c, m, y, k); }
+        else throw unsupported("PostScript setcolor requires an explicit color space in the cached glyph context.", name);
+        this.colorSpaces.set(context.sourceColorValues!, colorSpace); break;
+      }
       case "currentfile": {
         const active = [...this.tasks].reverse().find(task => task.kind === "input" && task.sourceFile !== false);
         if (!active || active.kind !== "input") throw unsupported("No font input file is active.");
-        const file: PsFile = { kind: "file", reader: active.reader }; accessAttributes.set(file, 2); this.push(file); break;
+        const file: PsFile = { kind: "file", reader: active.reader }; accessAttributes.set(file, 2); globalAttributes.set(file, globalAttributes.get(active.reader.file) ?? false); this.push(file); break;
       }
       case "read": { const byte = this.file(this.pop()).reader.file.readByte(); if (byte >= 0) this.push(byte); this.push(byte >= 0); break; }
       case "readstring": case "readhexstring": case "readline": {
@@ -567,7 +920,7 @@ class FontPostScriptVm {
       case "token": {
         const source = this.pop();
         if (source instanceof Uint8Array) {
-          requireAccess(source, 2); const reader = new FontPostScriptLexer(source, this.options.signal, this.options.maxStringBytes, name => this.lookup(name));
+          requireAccess(source, 2); const reader = this.lexer(source);
           const token = reader.next();
           if (token !== undefined) { const offset = reader.file.tell(); this.push(byteView(source, offset, source.length - offset)); this.push(token); this.push(true); } else this.push(false);
         } else { const token = this.file(source).reader.next(); if (token !== undefined) this.push(token); this.push(token !== undefined); } break;
@@ -576,9 +929,12 @@ class FontPostScriptVm {
         const filter = this.name(); const parameters = this.stack.at(-1) instanceof Map ? this.dictionary() : null;
         const source = this.pop(); let input;
         if (source instanceof Uint8Array) { requireAccess(source, 2); input = createNativeFontPostScriptMemoryFile(source, { signal: this.options.signal }); }
+        else if (isProcedure(source)) { requireAccess(source, 1); input = createNativeFontPostScriptProcedureFile(source, procedure => this.executeSource(procedure), { signal: this.options.signal }); }
         else input = this.file(source).reader.file;
         const decoded = createNativeFontPostScriptFilter(input, filter, postScriptFilterParameters(parameters), this.fileOptions());
-        const file: PsFile = { kind: "file", reader: new FontPostScriptLexer(decoded, this.options.signal, this.options.maxStringBytes, name => this.lookup(name)) };
+        const eod = parameters?.get("EODString");
+        globalAttributes.set(decoded, isGlobal(source) && (eod === undefined || isGlobal(eod)));
+        const file: PsFile = { kind: "file", reader: this.lexer(decoded) }; globalAttributes.set(file, globalAttributes.get(decoded)!);
         accessAttributes.set(file, 2); this.push(file); break;
       }
       case "closefile": this.file(this.pop()).reader.close(); break;
@@ -587,26 +943,28 @@ class FontPostScriptVm {
         if (this.splitEexec) { this.file(source).reader.close(); break; }
         const input = source instanceof Uint8Array ? (requireAccess(source, 2), createNativeFontPostScriptMemoryFile(source, { signal: this.options.signal })) : this.file(source).reader.file;
         const decoded = createNativeFontPostScriptEexecFile(input, this.fileOptions());
+        globalAttributes.set(decoded, isGlobal(source));
         this.tasks.push({ kind: "eexec-end", dictionaryDepth: this.dictionaries.length }); this.dictionaries.push(this.system);
-        this.tasks.push({ kind: "input", reader: new FontPostScriptLexer(decoded, this.options.signal, this.options.maxStringBytes, name => this.lookup(name)) }); break;
+        this.tasks.push({ kind: "input", reader: this.lexer(decoded) }); break;
       }
-      case "definefont": { const dict = this.dictionary(), fontName = this.name(); requireAccess(dict, 2); reduceAccess(dict, 2); this.directory.set(fontName, dict); this.definedFont = dict; this.push(dict); break; }
-      case "findfont": { const fontName = this.name(), dict = this.directory.get(fontName); if (!(dict instanceof Map)) throw unsupported(`PostScript font ${fontName} is unavailable.`); this.push(dict); break; }
+      case "definefont": { const dict = this.dictionary(), fontName = this.name(); requireAccess(dict, 2); this.defineResource("Font", fontName, dict); reduceAccess(dict, 2); this.definedFont = dict; this.push(dict); break; }
+      case "findfont": { const fontName = this.name(), dict = this.findResource("Font", fontName); if (!(dict instanceof Map)) throw unsupported(`PostScript font ${fontName} is unavailable.`); this.push(dict); break; }
+      case "undefinefont": { const fontName = this.name(); this.resource("Font").delete(fontName); this.rebuildFontDirectory(); break; }
       case "defineresource": {
         const category = this.name(); let instance = this.pop(); const key = this.name();
         if (category === "Font") { if (!(instance instanceof Map)) throw unsupported("PostScript Font resources require a font dictionary."); requireAccess(instance, 2); this.definedFont = instance; }
         if (isComposite(instance)) instance = reduceAccess(instance, 2);
-        this.resource(category).set(key, instance); this.push(instance); break;
+        this.defineResource(category, key, instance); this.push(instance); break;
       }
-      case "findresource": { const category = this.name(), key = this.name(), instance = this.resource(category).get(key); if (instance === undefined) throw unsupported(`PostScript ${category} resource ${key} is unavailable.`, "undefinedresource"); this.push(instance); break; }
-      case "resourcestatus": { const category = this.name(), key = this.name(); if (this.resource(category).has(key)) { this.push(0); this.push(-1); this.push(true); } else this.push(false); break; }
-      case "undefineresource": { const category = this.name(), key = this.name(); this.resource(category).delete(key); break; }
+      case "findresource": { const category = this.name(), key = this.name(), instance = this.findResource(category, key); if (instance === undefined) throw unsupported(`PostScript ${category} resource ${key} is unavailable.`, "undefinedresource"); this.push(instance); break; }
+      case "resourcestatus": { const category = this.name(), key = this.name(); if (this.findResource(category, key) !== undefined) { this.push(0); this.push(-1); this.push(true); } else this.push(false); break; }
+      case "undefineresource": { const category = this.name(), key = this.name(); this.resource(category).delete(key); if (category === "Font") this.rebuildFontDirectory(); break; }
       case "resourceforall": {
         const category = this.name(), scratch = this.pop(), procedure = this.procedure(), pattern = this.pop();
         if (!(pattern instanceof Uint8Array) || !(scratch instanceof Uint8Array)) throw unsupported("PostScript resourceforall requires pattern and scratch strings.");
         requireAccess(pattern, 2); requireAccess(scratch, 3);
         const matcher = postScriptPattern(byteString(pattern), this.options.signal);
-        const keys = [...this.resource(category).keys()].filter(key => matcher.test(key));
+        const keys = this.resourceKeys(category).filter(key => matcher.test(key));
         this.tasks.push({ kind: "resourceforall", keys, scratch, index: 0, procedure }); break;
       }
       case "currentpacking": this.push(this.packing); break;
@@ -621,8 +979,12 @@ const OPERATOR_NAMES = (`[ ] << >> mark pop dup exch index roll clear count clea
 array string dict begin end currentdict countdictstack dictstack cleardictstack maxlength def store load where known undef get put length getinterval putinterval aload astore copy
 add sub mul div idiv mod exp atan neg abs sqrt ln log sin cos floor ceiling round truncate cvi cvr cvs cvrs search anchorsearch eq ne lt le gt ge
 and or xor not bitshift if ifelse repeat for forall loop exit stopped stop save restore rand srand rrand exec bind readonly executeonly noaccess cvlit cvx cvn type xcheck rcheck wcheck
+setglobal currentglobal gcheck
 matrix identmatrix currentmatrix defaultmatrix setmatrix initmatrix concat concatmatrix invertmatrix translate scale rotate transform dtransform itransform idtransform gsave grestore grestoreall
-currentfile read readstring readhexstring readline bytesavailable fileposition setfileposition resetfile flushfile status token filter closefile eexec definefont findfont defineresource findresource resourcestatus undefineresource resourceforall currentpacking setpacking packedarray`).split(/\s+/);
+newpath moveto rmoveto lineto rlineto curveto rcurveto closepath currentpoint pathbbox arc arcn arcto flattenpath reversepath pathforall fill eofill stroke clip eoclip rectclip rectfill rectstroke
+setlinewidth setlinecap setlinejoin setmiterlimit setdash currentlinewidth currentlinecap currentlinejoin currentmiterlimit currentdash setgray setrgbcolor setcmykcolor sethsbcolor currentrgbcolor currentgray currentcmykcolor currenthsbcolor setcharwidth setcachedevice
+image imagemask colorimage setcolorspace currentcolorspace setcolor currentcolor
+currentfile read readstring readhexstring readline bytesavailable fileposition setfileposition resetfile flushfile status token filter closefile eexec definefont findfont undefinefont defineresource findresource resourcestatus undefineresource resourceforall currentpacking setpacking packedarray`).split(/\s+/);
 
 function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPostScriptFilterParameters {
   if (!dictionary) return {};
@@ -632,6 +994,8 @@ function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPo
     if (key === "CloseSource") { if (typeof value !== "boolean") throw unsupported("PostScript CloseSource requires a boolean."); parameters[key] = value; }
     else if (key === "EODCount") { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw unsupported("PostScript EODCount requires a nonnegative integer."); parameters[key] = value; }
     else if (key === "EODString") { if (!(value instanceof Uint8Array)) throw unsupported("PostScript EODString requires a string."); requireAccess(value, 2); parameters[key] = value; }
+    else if (["EarlyChange", "Predictor", "Colors", "BitsPerComponent", "Columns", "UnitLength"].includes(key)) { if (typeof value !== "number" || !Number.isSafeInteger(value)) throw unsupported(`PostScript ${key} requires an integer.`); parameters[key] = value; }
+    else if (key === "LowBitFirst") { if (typeof value !== "boolean") throw unsupported("PostScript LowBitFirst requires a boolean."); parameters[key] = value; }
     else if (key === "Filter") { if (isName(value)) parameters[key] = value.value; else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript Filter requires a name or name array."); parameters[key] = value.map(item => { if (!isName(item)) throw unsupported("PostScript Filter array requires names."); return item.value; }); } }
     else if (key === "DecodeParms") { if (value instanceof Map) parameters[key] = postScriptFilterParameters(value); else { requireAccess(value, 2); if (!Array.isArray(value)) throw unsupported("PostScript DecodeParms requires a dictionary or array."); parameters[key] = value.map(item => item === null ? null : item instanceof Map ? postScriptFilterParameters(item) : (() => { throw unsupported("PostScript DecodeParms array requires dictionaries."); })()); } }
   }
@@ -639,9 +1003,11 @@ function postScriptFilterParameters(dictionary: Dictionary | null): NativeFontPo
 }
 
 function vmForGlyph(vm: FontPostScriptVm, dictionary: Dictionary, signal: AbortSignal | undefined, options: NativeFontPostScriptOptions): { dictionary: Dictionary; vm: FontPostScriptVm } {
-  const environment = cloneValue(vm.glyphEnvironment(dictionary), signal, options.maxStringBytes) as Dictionary;
+  let local: FontPostScriptVm;
+  const environment = cloneValue(vm.glyphEnvironment(dictionary), signal, options.maxStringBytes,
+    procedure => local.executeSource(procedure), file => local.lexer(file)) as Dictionary;
   const owned = environment.get("font") as Dictionary;
-  const local = new FontPostScriptVm({ ...options, signal, initialDictionary: owned });
+  local = new FontPostScriptVm({ ...options, signal, initialDictionary: owned });
   local.seedGlyphEnvironment(environment);
   return { dictionary: owned, vm: local };
 }
@@ -676,10 +1042,12 @@ function postScriptPattern(pattern: string, signal?: AbortSignal): { test(value:
     return token === tokens.length;
   } };
 }
+const POST_SCRIPT_ERROR_NAMES = new Set(["invalidaccess", "invalidrestore", "invalidexit", "undefinedresource",
+  "nocurrentpoint", "rangecheck", "undefinedresult", "typecheck", "ioerror", "limitcheck", "stackunderflow", "undefined"]);
 function postScriptErrorName(error: PdfError): string {
   if (typeof error.details?.postScriptError === "string") return error.details.postScriptError;
   const operator = error.details?.operator;
-  if (typeof operator === "string" && ["invalidaccess", "invalidrestore", "invalidexit", "undefinedresource"].includes(operator)) return operator;
+  if (typeof operator === "string" && POST_SCRIPT_ERROR_NAMES.has(operator)) return operator;
   if (/underflow/.test(error.message)) return "stackunderflow";
   if (/nonfinite|zero|arithmetic/.test(error.message)) return "undefinedresult";
   if (/unavailable|undefined/.test(error.message)) return "undefined";
@@ -692,14 +1060,16 @@ class FontPostScriptLexer {
   private readonly signal?: AbortSignal;
   private readonly maxStringBytes?: number;
   private readonly resolveImmediate?: (name: string) => Value | undefined;
+  private readonly allocated?: (value: Value) => void;
   private readonly procedureDelimiters = new WeakSet<object>();
 
   constructor(bytes: Uint8Array | NativeFontPostScriptFile, signal?: AbortSignal, maxStringBytes?: number,
-    resolveImmediate?: (name: string) => Value | undefined) {
+    resolveImmediate?: (name: string) => Value | undefined, allocated?: (value: Value) => void) {
     this.file = bytes instanceof Uint8Array ? createNativeFontPostScriptMemoryFile(bytes, { signal }) : bytes;
     this.signal = signal;
     this.maxStringBytes = maxStringBytes;
     this.resolveImmediate = resolveImmediate;
+    this.allocated = allocated;
   }
   close(): void { this.file.close(); }
   raw(length: number): Uint8Array {
@@ -714,7 +1084,7 @@ class FontPostScriptLexer {
         const value = this.token(); if (value === undefined) throw unsupported("An unterminated PostScript procedure was encountered.");
         if (this.isProcedureDelimiter(value, "{")) frames.push([]);
         else if (this.isProcedureDelimiter(value, "}")) {
-          const procedure: Procedure = { kind: "procedure", tokens: frames.pop()! };
+          const procedure: Procedure = { kind: "procedure", tokens: frames.pop()! }; this.allocated?.(procedure);
           if (!frames.length) return procedure;
           frames.at(-1)!.push(procedure);
         } else frames.at(-1)!.push(value);
@@ -727,6 +1097,9 @@ class FontPostScriptLexer {
     return isName(value) && value.value === token && this.procedureDelimiters.has(value);
   }
   private token(): Value | undefined {
+    const value = this.readToken(); if (value !== undefined) this.allocated?.(value); return value;
+  }
+  private readToken(): Value | undefined {
     const file = this.file;
     while (true) {
       throwIfAborted(this.signal);
@@ -835,6 +1208,11 @@ type Access = 0 | 1 | 2 | 3;
 const accessAttributes = new WeakMap<object, Access>();
 const executableReferences = new WeakMap<object, boolean>();
 const dictionaryCapacities = new WeakMap<Dictionary, number>();
+const globalAttributes = new WeakMap<object, boolean>();
+function isGlobal(value: Value): boolean { return !isComposite(value) || globalAttributes.get(storageOf(value)) === true; }
+function requireGlobalReference(target: Value, value: Value): void {
+  if (isGlobal(target) && !isGlobal(value)) throw unsupported("A local composite cannot be stored in global PostScript VM.", "invalidaccess");
+}
 function isComposite(value: Value): value is Value & object {
   return value instanceof Map || Array.isArray(value) || value instanceof Uint8Array || isProcedure(value) || tagged(value, "file");
 }
@@ -845,6 +1223,7 @@ function requireAccess(value: Value, minimum: Access): void {
 }
 function copyAttributes(source: Value & object, target: Value & object): void {
   accessAttributes.set(target, accessOf(source));
+  if (globalAttributes.has(storageOf(source))) globalAttributes.set(storageOf(target), globalAttributes.get(storageOf(source))!);
   if (source instanceof Map && target instanceof Map && dictionaryCapacities.has(source)) dictionaryCapacities.set(target, dictionaryCapacities.get(source)!);
   if (executableReferences.has(source)) executableReferences.set(target, executableReferences.get(source)!);
 }
@@ -901,6 +1280,7 @@ function get(source: Value, index: Value): Value {
 }
 function put(target: Value, index: Value, value: Value): void {
   requireAccess(target, 3);
+  requireGlobalReference(target, value);
   if (target instanceof Map) { target.set(key(index), value); return; }
   const items = sequence(target);
   if (!items || typeof index !== "number" || !Number.isSafeInteger(index) || index < 0 || index >= items.length) throw unsupported("A PostScript put index is invalid.");
@@ -993,8 +1373,26 @@ function bindProcedure(procedure: Procedure, lookup: (name: string) => Value | u
   }
   return procedure;
 }
-function cloneValue(root: Value, signal?: AbortSignal, maxStringBytes?: number): Value {
+function cloneValue(root: Value, signal: AbortSignal | undefined, maxStringBytes: number | undefined,
+  executeSource: (procedure: Procedure) => Uint8Array,
+  lexer: (file: NativeFontPostScriptFile) => FontPostScriptLexer): Value {
   const seen = new Map<object, Value>(), pending: { source: Value; target: Value }[] = [];
+  const files = new Map<NativeFontPostScriptFile, NativeFontPostScriptFile>();
+  const cloneFile = (source: NativeFontPostScriptFile): NativeFontPostScriptFile => {
+    const cached = files.get(source); if (cached) return cached;
+    let target = cloneNativeFontPostScriptFile(source, cloneFile, bytes => create(bytes) as Uint8Array,
+      { signal, maxDecodedBytes: maxStringBytes });
+    if (!target) {
+      const snapshot = snapshotNativeFontPostScriptProcedureFile(source);
+      if (!snapshot) throw unsupported("An unknown PostScript file cannot be isolated for glyph execution.", "currentfile");
+      target = restoreNativeFontPostScriptProcedureFile({ ...snapshot,
+        procedure: create(snapshot.procedure) as Procedure, chunk: create(snapshot.chunk) as Uint8Array },
+        executeSource, { signal, maxDecodedBytes: maxStringBytes });
+    }
+    files.set(source, target);
+    globalAttributes.set(target, globalAttributes.get(source) ?? false);
+    return target;
+  };
   const create = (source: Value): Value => {
     throwIfAborted(signal);
     if (source === null || typeof source !== "object") return source;
@@ -1011,7 +1409,15 @@ function cloneValue(root: Value, signal?: AbortSignal, maxStringBytes?: number):
       target = parent ? arrayView(create(parent.source) as Value[], parent.start, source.length) : allocatedArray(source.length);
     }
     else if (isProcedure(source)) target = { kind: "procedure", tokens: create(source.tokens as Value[]) as Value[] };
-    else if (tagged(source, "file")) throw unsupported("Custom font procedures cannot retain a font input file between glyph executions.", "currentfile");
+    else if (tagged(source, "file")) {
+      // Bind cloned readers lazily: the complete environment must exist before
+      // a procedure source can execute against its new glyph VM.
+      let file: NativeFontPostScriptFile;
+      let reader: FontPostScriptLexer | undefined;
+      target = { kind: "file", get reader() { return reader ??= lexer(file); } };
+      seen.set(source, target);
+      file = cloneFile((source as PsFile).reader.file);
+    }
     else target = source;
     seen.set(source, target);
     if (isComposite(source) && isComposite(target)) copyAttributes(source, target);

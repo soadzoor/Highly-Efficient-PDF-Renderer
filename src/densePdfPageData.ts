@@ -190,8 +190,10 @@ export interface DensePdfType3ProgramData {
 }
 
 export interface DensePdfType3PageData {
-  /** One local program index per glyph instance, or -1 for non-Type3/invisible glyphs. */
+  /** One local program index per glyph instance, or -1 when no reusable paint is needed. */
   readonly glyphProgramIndices: Int32Array;
+  /** Transient ordinary-font bindings whose final fill is in their imaging program. */
+  readonly implicitFillGlyphs?: ReadonlySet<number>;
   /** Array position is the local Type3 program index. */
   readonly programs: readonly DensePdfType3ProgramData[];
 }
@@ -419,6 +421,13 @@ export function createHeprPageDataFromDense(
     for (const index of options.type3.glyphProgramIndices) {
       if (index < -1 || index >= options.type3.programs.length) {
         throw new TypeError("A glyph references an invalid local Type3 program.");
+      }
+    }
+    for (const glyph of options.type3.implicitFillGlyphs ?? []) {
+      if (!Number.isSafeInteger(glyph) || glyph < 0 || glyph >= stores.glyphs.glyphIds.length ||
+          options.type3.glyphProgramIndices[glyph] < 0 ||
+          (stores.glyphs.flags[glyph] & HEPR_GLYPH_FLAG.Type3) !== 0) {
+        throw new TypeError("A font imaging program has an invalid implicit-fill binding.");
       }
     }
   }
@@ -1234,6 +1243,58 @@ export function createHeprPageDataFromDense(
     };
   };
 
+  const appendFontPostScriptCommand = (
+    target: HeprDisplayCommand[],
+    glyphIndex: number,
+    paint: DensePdfCompiledPage["glyphPaints"][number],
+    commandState: ReturnType<typeof commandScope>
+  ): boolean => {
+    const localProgramIndex = options.type3?.glyphProgramIndices[glyphIndex];
+    if (localProgramIndex === undefined || localProgramIndex < 0) return false;
+    const program = options.type3?.programs[localProgramIndex];
+    if (!program || (program.inheritedPaintRole !== "none" && program.inheritedPaintRole !== "fill")) {
+      throw new DensePdfUnsupportedError("A font PostScript glyph references an invalid imaging program.");
+    }
+    target.push({
+      kind: "invoke-program",
+      ...commandState,
+      transformIndex: stores.glyphs.transformIndices[glyphIndex],
+      programIndex: (options.forms?.programs.length ?? 0) + localProgramIndex,
+      // Source alpha is already on every specialized program paint/group.
+      // Late-bind an opaque color to avoid applying the caller alpha twice.
+      type3PaintIndex: program.inheritedPaintRole === "fill" && paint.fillPaintInherited !== true
+        ? solidPaint([paint.fill[0], paint.fill[1], paint.fill[2], 1], {
+            alpha: 1, alphaIsShape: false, blendMode: "Normal", softMaskIndex: -1,
+            overprint: paint.initialGraphicsState.fillOverprint ?? false,
+            overprintMode: paint.initialGraphicsState.overprintMode ?? 0
+          }) : -1,
+      viewTransformFlags: 0
+    });
+    return true;
+  };
+
+  const appendFontPostScriptRemainder = (
+    target: HeprDisplayCommand[],
+    glyphIndex: number,
+    renderingMode: number,
+    resources: ReturnType<typeof glyphPaintResources>,
+    commandState: ReturnType<typeof commandScope>
+  ): boolean => {
+    if (!options.type3?.implicitFillGlyphs?.has(glyphIndex)) return false;
+    // A lasting PostScript color/clip governs the implicit font fill. The
+    // independent PDF character stroke and text clip still use the raw path.
+    if (renderingMode === 2 || renderingMode === 6) {
+      appendPaintCommand(target, {
+        kind: "draw", ...commandState, source: "glyphs", first: glyphIndex, count: 1,
+        fillPaintIndex: -1, strokePaintIndex: resources.strokePaintIndex,
+        strokeStyleIndex: resources.strokeStyleIndex,
+        ...(resources.strokeTransformIndex === undefined ? {} : { strokeTransformIndex: resources.strokeTransformIndex }),
+        renderingMode: renderingMode === 2 ? 1 : 5
+      }, resources.wrapperComposite, true);
+    }
+    return true;
+  };
+
   const appendPaintCommand = (
     target: HeprDisplayCommand[],
     command: HeprDisplayCommand,
@@ -1372,6 +1433,13 @@ export function createHeprPageDataFromDense(
       for (let glyphIndex = first; glyphIndex < first + count; glyphIndex += 1) {
         const isType3 = (stores.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Type3) !== 0;
         if (!isType3) {
+          if ((textRun.renderingMode === 0 || textRun.renderingMode === 2 ||
+              textRun.renderingMode === 4 || textRun.renderingMode === 6) &&
+              (options.type3?.glyphProgramIndices[glyphIndex] ?? -1) >= 0) {
+            flushOrdinary(glyphIndex);
+            appendFontPostScriptCommand(commands, glyphIndex, paint, commandState);
+            if (appendFontPostScriptRemainder(commands, glyphIndex, textRun.renderingMode, paintResources, commandState)) continue;
+          }
           if (options.text?.intrinsicGlyphStrokes?.has(`${stores.glyphs.fontIndices[glyphIndex]}:${stores.glyphs.glyphIds[glyphIndex]}`) &&
               (textRun.renderingMode === 0 || textRun.renderingMode === 4)) {
             flushOrdinary(glyphIndex);
@@ -1620,6 +1688,13 @@ export function createHeprPageDataFromDense(
     };
     for (let glyphIndex = globalFirst; glyphIndex < globalFirst + count; glyphIndex += 1) {
       if ((stores.glyphs.flags[glyphIndex] & HEPR_GLYPH_FLAG.Type3) === 0) {
+        if ((textRun.renderingMode === 0 || textRun.renderingMode === 2 ||
+            textRun.renderingMode === 4 || textRun.renderingMode === 6) &&
+            (options.type3?.glyphProgramIndices[glyphIndex] ?? -1) >= 0) {
+          flushOrdinary(glyphIndex);
+          appendFontPostScriptCommand(target, glyphIndex, paint, commandState);
+          if (appendFontPostScriptRemainder(target, glyphIndex, textRun.renderingMode, paintResources, commandState)) continue;
+        }
         if (options.text?.intrinsicGlyphStrokes?.has(`${stores.glyphs.fontIndices[glyphIndex]}:${stores.glyphs.glyphIds[glyphIndex]}`) &&
             (textRun.renderingMode === 0 || textRun.renderingMode === 4)) {
           flushOrdinary(glyphIndex);

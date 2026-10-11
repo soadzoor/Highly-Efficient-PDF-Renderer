@@ -1154,18 +1154,33 @@ damaged Type1 programs can still use the configured substitute-font resolver;
 result as approximate. Type1 Multiple Master programs use the embedded
 WeightVector, including standard blending OtherSubrs. Computed font records and
 custom OtherSubrs can execute in a font-local PostScript interpreter; mutable
-private state is shared within each glyph and isolated between glyphs. Unknown
+font state is shared within each glyph and isolated between glyphs. Unknown
 custom OtherSubrs retain the Type1 format's argument-preserving fallback with
 `font.type1-othersubr-approximated` diagnostics. The interpreter's font-local
 subset supports font data, arithmetic and control flow, strings and token
-conversion, dictionary stacks, matrices, local Font resources, `stopped` error
-handling and local `save`/`restore`. Memory-backed font files and ASCIIHex,
-ASCII85, RunLength, SubFile, reusable-stream and `eexec` decoding can feed
-computed font records;
-access permissions, caller limits and cancellation remain enforced. Implicit
-device matrix queries require an explicit execution context. Host filesystem
-access, device imaging, global VM, procedure-backed streams and other decoding
-filters remain unsupported; this is not a general PostScript engine.
+conversion, dictionary stacks, matrices, local/global resources and VM allocation,
+`stopped` error handling and `save`/`restore`. Memory-backed files and lazy
+procedure sources support ASCIIHex, ASCII85, RunLength, LZW, Flate with predictors,
+SubFile, reusable-stream and `eexec` decoding. Retained streams preserve their
+positions within each glyph and start independently for subsequent glyphs.
+Glyph path, clipping, color and line-style operations retain ordered vector paint
+records alongside the charstring outline. Lasting color, clip and stroke changes
+also apply to the final implicit glyph paint; composite components retain their
+individual states under the selected embedded-font paint policy. Conflicting
+parent and component `seac` states are diagnosed when full inheritance cannot
+be reproduced. Stroke settings not changed by the program inherit the invoking
+PDF state. A lasting PostScript CTM change followed by charstring path construction is diagnosed
+when that later construction cannot reproduce the altered transform.
+Sampled `image`, `imagemask` and
+`colorimage` operations support 1-, 2-, 4-, 8- and 12-bit components, DeviceGray,
+DeviceRGB and DeviceCMYK, and procedure, file or repeating-string sources.
+Pixels retain vector rectangles with equal runs coalesced; detailed images can
+increase HEP size and pixel-edge antialiasing can differ, as reported by
+`font.postscript-image-vectorized`. Smooth interpolation uses a diagnosed
+nearest-pixel approximation. Access permissions, caller limits and cancellation
+remain enforced. Device-dependent matrix queries require an explicit execution context.
+Host filesystem access, printer/device control, other image/color-space forms
+and other filter codecs remain unsupported; this is not a general PostScript engine.
 Unsupported PostScript retains available geometry with diagnostics identifying
 the failing operator.
 Unsupported Type1 loader code that leaves readable declarative records uses

@@ -108,7 +108,7 @@ export function callerOrdinaryPaintIsDisjointFromForm(
       // outline, so its complete paint cannot be bounded by this proof.
       if (!fontResource || fontResource.type3) return false;
       const outline = fontResource.font.getGlyphOutline(glyphs.glyphIds[glyphIndex]);
-      if (!outline) return false;
+      if (!outline || outline.postScriptPaints?.length || outline.postScriptFinalState) return false;
       if (outline.commands.length === 0) continue;
       const transformOffset = glyphs.transformIndices[glyphIndex] * 6;
       const glyphBounds = transformRectangleBounds(

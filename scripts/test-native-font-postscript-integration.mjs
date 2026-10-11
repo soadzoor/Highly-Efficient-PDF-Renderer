@@ -24,6 +24,9 @@ try {
   const at = (actual, expected) => assert(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
   const first = font => font.getGlyphOutline(font.glyphIdForName("A")).commands[0];
   const parseType1 = code => NativeType1Font.parse(buildType1Fixture({clearExtra: code}).bytes);
+  const procedureMatrixCode="/FontMatrix 5 dict begin /parts [(2e)(303032)(>)] def /cursor [0] def " +
+    "/stream { cursor 0 get parts length lt { parts cursor 0 get get cursor 0 cursor 0 get 1 add put } { () } ifelse } " +
+    "/ASCIIHexDecode filter def [stream 16 string readstring pop cvr 0 0 .003 0 0] end def";
   const matrixCases = [
     ["explicit stop", "{ stop } stopped { /FontMatrix [.002 0 0 .003 0 0] def } if", [100, 0]],
     ["normal stopped completion", "{ /FontMatrix [.002 0 0 .003 0 0] def } stopped { stop } if", [100, 0]],
@@ -34,6 +37,7 @@ try {
     ["numeric string conversion", "/FontMatrix [(.002) cvr 0 0 (3e-3) cvr 0 0] def", [100, 0]],
     ["immediate name lookup", "/computedMatrix [.002 0 0 .003 0 0] def /FontMatrix //computedMatrix def", [100, 0]],
     ["ASCII85 numeric string conversion", "/FontMatrix [<~/het7~> cvr 0 0 <~/het8~> cvr 0 0] def", [100, 0]],
+    ["procedure-backed matrix strings", procedureMatrixCode, [100, 0]],
     ["dictionary stack lookup", "countdictstack array dictstack dup length 1 sub get /FontMatrix [.002 0 0 .003 0 0] put", [100, 0]],
     ["missing font resource fallback", "/NotARegisteredIntegrationFont /Font resourcestatus { pop pop } { /FontMatrix [.002 0 0 .003 0 0] def } ifelse", [100, 0]],
     ["explicit scale matrix", "/FontMatrix 2 3 matrix scale [.001 0 0 .001 0 0] matrix concatmatrix def", [100, 0]]
@@ -66,6 +70,12 @@ try {
     {kind:"move", x:100, y:50}, {kind:"line", x:300, y:50}, {kind:"line", x:300, y:350}, {kind:"close"}
   ], "token-built byte strings replace the actual CharStrings program");
   assert.deepEqual(computedGlyph.diagnostics, []);
+  const procedureGlyph=NativeType1Font.parse(amendPrivate(fixture,
+    `dup begin CharStrings /A { (${Buffer.from(replacement).toString("hex")}> ) } /ASCIIHexDecode filter ${replacement.length} string readstring pop put end`,true));
+  assert.deepEqual(procedureGlyph.getGlyphOutline(procedureGlyph.glyphIdForName("A")).commands,
+    computedGlyph.getGlyphOutline(computedGlyph.glyphIdForName("A")).commands,
+    "procedure-backed decoding feeds Type1 CharStrings bytes");
+  assert.deepEqual(procedureGlyph.diagnostics,[]);
   const ascii85Fixture=buildType1Fixture({clearExtra:"/FontMatrix [<~/het7~> cvr 0 0 <~/het8~> cvr 0 0] def"});
   assert.equal(first(NativeType1Font.parse(ascii85Fixture.bytes,{},
     {length1:ascii85Fixture.length1,length2:ascii85Fixture.length2})).x,100,
@@ -100,6 +110,9 @@ try {
   const cff = NativeCffFont.parse(buildCff(cffCode));
   assert.deepEqual(cff.getGlyphOutline(1).commands[0], {kind:"move",x:200,y:150});
   assert.deepEqual(cff.diagnostics, [], "CFF AppendixF uses the same expanded font-local language");
+  const procedureCff=NativeCffFont.parse(buildCff(procedureMatrixCode));
+  assert.deepEqual(procedureCff.getGlyphOutline(1).commands[0],{kind:"move",x:200,y:150});
+  assert.deepEqual(procedureCff.diagnostics,[],"CFF AppendixF can compute matrices from procedure-backed streams");
   const resolver={async resolveValue(value){return value;},async decodeStream(value){return value.bytes;}};
   const name=value=>({kind:"name",value});
   const pdfFont=async(bytes,subtype,framing={})=>parseNativePdfFont(new Map([
@@ -112,6 +125,13 @@ try {
   assert.deepEqual(pdfType1.getGlyphOutline(pdfType1.decode(Uint8Array.of(65)).glyphId).commands,
     computedGlyph.getGlyphOutline(computedGlyph.glyphIdForName("A")).commands);
   assert.equal(pdfType1.substitution,null,"PDF font integration uses computed original Type1 programs");
+  const pdfProcedureType1=await pdfFont(buildType1Fixture({clearExtra:procedureMatrixCode}).bytes);
+  assert.equal(pdfProcedureType1.substitution,null);
+  assert.equal(pdfProcedureType1.getGlyphOutline(pdfProcedureType1.decode(Uint8Array.of(65)).glyphId).commands[0].x,100);
+  const pdfProcedureCff=await pdfFont(buildCff(procedureMatrixCode),"Type1C");
+  assert.equal(pdfProcedureCff.substitution,null);
+  assert.deepEqual(pdfProcedureCff.getGlyphOutline(pdfProcedureCff.decode(Uint8Array.of(65)).glyphId).commands[0],
+    {kind:"move",x:200,y:150},"PDF FontFile3 retains procedure-computed CFF outlines");
   const pdfAscii85=await pdfFont(ascii85Fixture.bytes,undefined,{Length1:ascii85Fixture.length1,Length2:ascii85Fixture.length2});
   assert.equal(pdfAscii85.substitution,null,"PDF FontFile parsing reaches expanded cleartext literal syntax");
   assert.equal(pdfAscii85.getGlyphOutline(pdfAscii85.decode(Uint8Array.of(65)).glyphId).commands[0].x,100);

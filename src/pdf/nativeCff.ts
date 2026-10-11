@@ -1,6 +1,8 @@
 import type {
   NativeGlyphOutline,
-  NativeGlyphPathCommand
+  NativeGlyphPathCommand,
+  NativeGlyphPostScriptPaint,
+  NativeGlyphPostScriptFinalState
 } from "./nativeFont";
 import { PdfError, throwIfAborted } from "./nativeTypes";
 import type { PdfDiagnostic } from "./nativeTypes";
@@ -14,6 +16,8 @@ import type { NativeType1ParserLimits } from "./nativeType1";
 import { paintNativeGlyphCommands } from "./nativeGlyphPaint";
 import { executeNativeFontPostScript } from "./nativeFontPostScript";
 import type { NativeFontPostScriptResult, NativeFontPostScriptValue } from "./nativeFontPostScript";
+import { nativeGlyphPostScriptCommandCount, nativeGlyphPostScriptPaintBounds,
+  transformNativeGlyphPostScriptPaints, transformNativeGlyphPostScriptFinalState } from "./nativeFontPostScriptGraphics";
 import { blendCffOperands, NativeCffVariationStore } from "./nativeCffVariation";
 import type { NativeCffVariationOptions } from "./nativeCffVariation";
 export type { NativeCffVariationOptions } from "./nativeCffVariation";
@@ -74,7 +78,16 @@ interface RawGlyphOutline {
   readonly commands: readonly NativeGlyphPathCommand[];
   readonly advanceWidth: number;
   readonly advanceY?: number;
+  readonly postScriptPaints?: readonly NativeGlyphPostScriptPaint[];
+  readonly postScriptFinalState?: NativeGlyphPostScriptFinalState;
+  readonly postScriptPaintSequence?: readonly CffPostScriptPaintSequenceItem[];
 }
+
+type CffPostScriptPaintSequenceItem = NativeGlyphPostScriptPaint | {
+  readonly kind: "implicit";
+  readonly commands: readonly NativeGlyphPathCommand[];
+  readonly finalState?: NativeGlyphPostScriptFinalState;
+};
 
 interface Type2Budget {
   executedBytes: number;
@@ -457,13 +470,29 @@ export class NativeCffFont {
       transform, signal, maxPathCommands: this.limits.maxType2PathCommands
     });
     const commands = painted.commands;
+    const rawPaints = raw.postScriptPaintSequence
+      ? materializeCffPostScriptPaintSequence(raw.postScriptPaintSequence, paintType, dictionary.strokeWidth ?? 0)
+      : raw.postScriptPaints;
+    const postScriptPaints = rawPaints?.length
+      ? transformNativeGlyphPostScriptPaints(rawPaints, transform as CffMatrix) : undefined;
+    const postScriptFinalState = raw.postScriptFinalState
+      ? transformNativeGlyphPostScriptFinalState(raw.postScriptFinalState, transform as CffMatrix) : undefined;
     if (painted.approximated && !this.diagnosticData.some(diagnostic => diagnostic.code === "font.cff-stroke-approximation")) {
       this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
         code: "font.cff-stroke-approximation", severity: "warning" as const,
         message: "Stroked CFF glyph curves use a vector approximation within 0.01 raw font character-space units before FontMatrix."
       })]);
     }
-    const bounds = painted.bounds ?? measureCommands(commands);
+    const ordinaryBounds = painted.bounds ?? measureCommands(commands);
+    const finalStrokePaints = paintType === 2 && raw.postScriptFinalState && !raw.postScriptFinalState.omitFinalPaint
+      ? transformNativeGlyphPostScriptPaints(materializeCffPostScriptPaintSequence([
+        { kind: "implicit", commands: raw.commands, finalState: raw.postScriptFinalState }
+      ], paintType, dictionary.strokeWidth ?? 0), transform as CffMatrix) : [];
+    const paintBounds = nativeGlyphPostScriptPaintBounds([...(postScriptPaints ?? []), ...finalStrokePaints]);
+    const bounds = paintBounds ? commands.length ? Object.freeze([
+      Math.min(ordinaryBounds[0], paintBounds[0]), Math.min(ordinaryBounds[1], paintBounds[1]),
+      Math.max(ordinaryBounds[2], paintBounds[2]), Math.max(ordinaryBounds[3], paintBounds[3])
+    ]) as readonly [number, number, number, number] : paintBounds : ordinaryBounds;
     const advanceWidth = transformWidth(raw.advanceWidth, fontMatrix, raw.advanceY);
     const outline: NativeGlyphOutline = Object.freeze({
       glyphId,
@@ -471,6 +500,8 @@ export class NativeCffFont {
       bounds,
       advanceWidth,
       leftSideBearing: bounds[0],
+      ...(postScriptPaints ? { postScriptPaints } : {}),
+      ...(postScriptFinalState ? { postScriptFinalState } : {}),
       ...(paintType === 2 ? { intrinsicStroke: Object.freeze({ width: dictionary.strokeWidth ?? 0,
         transform, commands: raw.commands }) } : {})
     });
@@ -499,7 +530,9 @@ export class NativeCffFont {
     try {
       const dictionary = this.fontDictionaries[this.fdSelect[glyphId]];
       if (this.charStringType === 1) {
-        const executeOtherSubr = this.otherSubrExecutorFactory?.(budget.signal);
+        let executeOtherSubr: ReturnType<NativeFontPostScriptResult["createOtherSubrExecutor"]> | undefined;
+        let compositePaints: readonly NativeGlyphPostScriptPaint[] = [];
+        let compositeSequence: readonly CffPostScriptPaintSequenceItem[] | undefined;
         let otherSubrFailure: PdfError | undefined;
         const interpreted = evaluateNativeType1CharString(this.charStrings[glyphId], {
           glyphId,
@@ -508,9 +541,12 @@ export class NativeCffFont {
           signal: budget.signal,
           budget,
           blendWeights: this.legacyMasterState?.registers[0].slice(0, this.legacyMasterState.masterCount),
-          executeOtherSubr: executeOtherSubr ? (index, args) => {
+          executeOtherSubr: this.otherSubrExecutorFactory ? (index, args, context) => {
             otherSubrFailure = undefined;
-            try { return executeOtherSubr(index, args); }
+            try {
+              executeOtherSubr ??= this.otherSubrExecutorFactory!(budget.signal, context);
+              return executeOtherSubr(index, args);
+            }
             catch (error) {
               if (!(error instanceof PdfError) || error.code !== "unsupported-font") throw error;
               otherSubrFailure = error;
@@ -540,6 +576,13 @@ export class NativeCffFont {
             }
             const base = this.evaluateRawGlyph(baseId, glyphAncestry, glyphDepth + 1, budget);
             const accent = this.evaluateRawGlyph(accentId, glyphAncestry, glyphDepth + 1, budget);
+            if (base.postScriptFinalState || accent.postScriptFinalState || base.postScriptPaintSequence || accent.postScriptPaintSequence) {
+              compositeSequence = Object.freeze([...cffComponentPaintSequence(base),
+                ...translateCffPaintSequence(cffComponentPaintSequence(accent), accentX, accentY)]);
+            } else {
+              compositePaints = Object.freeze([...(base.postScriptPaints ?? []),
+                ...transformNativeGlyphPostScriptPaints(accent.postScriptPaints ?? [], [1, 0, 0, 1, accentX, accentY])]);
+            }
             const commands = [...base.commands,
               ...accent.commands.map(command => translateCommand(command, accentX, accentY))];
             if (commands.length > this.limits.maxType2PathCommands) {
@@ -549,8 +592,37 @@ export class NativeCffFont {
             return commands;
           }
         });
+        for (const diagnostic of interpreted.postScriptDiagnostics ?? []) {
+          if (!this.diagnosticData.some(existing => existing.code === diagnostic.code)) {
+            this.diagnosticData = Object.freeze([...this.diagnosticData, diagnostic]);
+          }
+        }
+        const postScriptPaints = Object.freeze([...(interpreted.postScriptPaints ?? []), ...compositePaints]);
+        const postScriptPaintSequence = compositeSequence
+          ? Object.freeze([...(interpreted.postScriptPaints ?? []), ...compositeSequence]) : undefined;
+        if (compositeSequence && interpreted.postScriptFinalState &&
+          !this.diagnosticData.some(diagnostic => diagnostic.code === "font.type1-seac-state-approximated")) {
+          this.diagnosticData = Object.freeze([...this.diagnosticData, Object.freeze({
+            code: "font.type1-seac-state-approximated", severity: "warning" as const,
+            message: "A Type1 seac parent's PostScript state is not fully inherited by its separately evaluated components; component paints are retained approximately.",
+            details: Object.freeze({ reason: "type1-seac-parent-state", approximate: true })
+          })]);
+        }
+        const postScriptFinalState: NativeGlyphPostScriptFinalState | undefined = compositeSequence
+          ? Object.freeze({ clips: Object.freeze([]), color: null, omitFinalPaint: true }) : interpreted.postScriptFinalState;
+        const countedPaints = postScriptPaintSequence
+          ? materializeCffPostScriptPaintSequence(postScriptPaintSequence, 0, 0) : postScriptPaints;
+        const retainedCommands = checkedAdd(interpreted.commands.length, nativeGlyphPostScriptCommandCount(countedPaints, postScriptFinalState),
+          "CFF PostScript paint commands");
+        if (retainedCommands > this.limits.maxType2PathCommands) {
+          throw cffLimit("CFF glyph outlines and PostScript paints exceed the configured path command limit.",
+            "type2-path-command-limit", this.limits.maxType2PathCommands);
+        }
         const result = Object.freeze({ commands: interpreted.commands,
-          advanceWidth: interpreted.advanceWidth, advanceY: interpreted.advanceY });
+          advanceWidth: interpreted.advanceWidth, advanceY: interpreted.advanceY,
+          ...(postScriptPaints.length ? { postScriptPaints } : {}),
+          ...(postScriptFinalState ? { postScriptFinalState } : {}),
+          ...(postScriptPaintSequence ? { postScriptPaintSequence } : {}) });
         this.rawOutlineCache.set(glyphId, result);
         return result;
       }
@@ -616,6 +688,43 @@ export class NativeCffFont {
       glyphAncestry.delete(glyphId);
     }
   }
+}
+
+function cffComponentPaintSequence(outline: RawGlyphOutline): readonly CffPostScriptPaintSequenceItem[] {
+  if (outline.postScriptPaintSequence) return outline.postScriptPaintSequence;
+  return Object.freeze([...(outline.postScriptPaints ?? []), ...(outline.postScriptFinalState?.omitFinalPaint ? [] : [
+    Object.freeze({ kind: "implicit" as const, commands: outline.commands,
+      ...(outline.postScriptFinalState ? { finalState: outline.postScriptFinalState } : {}) })
+  ])]);
+}
+
+function translateCffPaintSequence(sequence: readonly CffPostScriptPaintSequenceItem[], x: number, y: number): readonly CffPostScriptPaintSequenceItem[] {
+  const matrix: CffMatrix = [1, 0, 0, 1, x, y];
+  return Object.freeze(sequence.map(item => item.kind === "implicit" ? Object.freeze({ ...item,
+    commands: Object.freeze(item.commands.map(command => translateCommand(command, x, y))),
+    ...(item.finalState ? { finalState: transformNativeGlyphPostScriptFinalState(item.finalState, matrix) } : {})
+  }) : transformNativeGlyphPostScriptPaints([item], matrix)[0]));
+}
+
+function materializeCffPostScriptPaintSequence(sequence: readonly CffPostScriptPaintSequenceItem[], paintType: number,
+  strokeWidth: number): readonly NativeGlyphPostScriptPaint[] {
+  const identity: CffMatrix = [1, 0, 0, 1, 0, 0];
+  return Object.freeze(sequence.flatMap(item => {
+    if (item.kind !== "implicit") return [item];
+    if (item.finalState?.omitFinalPaint || item.commands.length === 0) return [];
+    const state = item.finalState;
+    const changed = state?.changedStrokeFields ?? [];
+    return [Object.freeze({ kind: paintType === 2 ? "stroke" as const : "fill" as const,
+      commands: item.commands, fillRule: 0 as const, clips: state?.clips ?? Object.freeze([]), color: state?.color ?? null,
+      ...(paintType === 2 ? {
+        stroke: Object.freeze({ width: changed.includes("width") ? state!.stroke!.width : Math.abs(strokeWidth),
+          lineCap: state?.stroke?.lineCap ?? 0, lineJoin: state?.stroke?.lineJoin ?? 0,
+          miterLimit: state?.stroke?.miterLimit ?? 10, dashArray: state?.stroke?.dashArray ?? Object.freeze([]),
+          dashPhase: state?.stroke?.dashPhase ?? 0, transform: state?.stroke?.transform ?? identity }),
+        changedStrokeFields: Object.freeze([...new Set(["width" as const, ...changed])])
+      } : {})
+    })];
+  }));
 }
 
 class CffReader {
