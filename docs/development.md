@@ -46,6 +46,10 @@ timeouts, CI coverage, and manual browser checks. Corpus tests, conversion runs,
 and visual comparisons are separate from the default fast checks and can be
 expensive. Select those checks deliberately for the change you are making.
 
+Record user-facing changes in [the changelog](../CHANGELOG.md) under `Unreleased`.
+Follow the [release workflow](development-validation.md#releases-and-changelog)
+when preparing a new version.
+
 For rendering changes, manually check both demos and backends with representative
 PDFs. Exercise pan/zoom, text search and selection, document switching, and HEP
 export/reload. The [visual regression guide](visual-regressions.md) lists specific

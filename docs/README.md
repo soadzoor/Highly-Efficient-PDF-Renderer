@@ -1,6 +1,6 @@
 # Documentation
 
-[Project home](../README.md) · [Examples](examples.md) · [Manual](manual.md) · [API](api.md)
+[Project home](../README.md) · [Examples](examples.md) · [Manual](manual.md) · [API](api.md) · [Changelog](../CHANGELOG.md)
 
 Start with the [quick start](../README.md#quick-start) to render a document, then
 choose a guide for the task at hand.
@@ -11,6 +11,7 @@ choose a guide for the task at hand.
 | [Manual](manual.md) | Choose inputs, pages, rendering options, and a PDF-to-HEP workflow. |
 | [API reference](api.md) | Find public functions, types, and methods. |
 | [Development](development.md) | Set up the repository, build it, and run checks. |
+| [Changelog](../CHANGELOG.md) | Review release changes, compatibility notes, and upgrade guidance. |
 
 ## How rendering works
 
@@ -61,6 +62,7 @@ usage and the [container specification](HEP_CONTAINER.md) for the wire format.
 
 - [HEP container specification](HEP_CONTAINER.md): layout, compression, checksums, and resource limits.
 - [Development validation](development-validation.md): test suites, CI scope, and manual checks.
+- [Release workflow](development-validation.md#releases-and-changelog): prepare curated notes, bump versions, and publish.
 - [Font-local PostScript follow-ups](development.md#font-local-postscript-follow-ups): open JPX, spot-shading and press-calibration tasks.
 - [Parser benchmarks](parser-benchmark.md): measurement commands, recorded results, and remaining validation gates.
 - [Visual regression checks](visual-regressions.md): appearance checkpoints and renderer statistics.

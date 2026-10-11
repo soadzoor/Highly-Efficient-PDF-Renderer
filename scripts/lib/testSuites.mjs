@@ -7,6 +7,7 @@ export const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
 // silently add servers, corpus work, or PDF-to-HEP conversions to npm test.
 export const fastTests = [
   "test-runner",
+  "changelog",
   "document-loading",
   "viewer-render-warmup",
   "viewer-render-warmup-integration",

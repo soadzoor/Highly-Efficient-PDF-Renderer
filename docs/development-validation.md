@@ -61,15 +61,69 @@ npm run test:file -- scripts/test-hep-package.mjs
 
 The `Validate` GitHub workflow uses Node 24 and runs `npm test` plus
 `npm run build:all` for pull requests, main-branch pushes, and manual dispatch.
-The npm `prepublishOnly` hook runs the same checks. No server is started by
-these commands. Dependencies currently use `npm install` because the repository
-does not track a lockfile.
+The npm `prepublishOnly` hook also validates the released changelog entry before
+running the same checks. No server is started by these commands. Dependencies
+currently use `npm install` because the repository does not track a lockfile.
 
-`npm run release-new-version` runs `npm test` and `npm run build:all` before
-bumping the patch version and pushing its tag. The fast suite includes real
-Node worker startup with process-wide flags from CI, covering the native PDF
-worker. A successful local release command means the tag was pushed; check the
-separate **Publish to npm** workflow for publishing success.
+The fast suite includes real Node worker startup with process-wide flags from
+CI, covering the native PDF worker.
+
+## Releases and changelog
+
+Maintain [CHANGELOG.md](../CHANGELOG.md) alongside user-facing changes. Add
+concise notes under `Unreleased`, grouped into `Added`, `Changed` or `Fixed` as
+appropriate. Include upgrade guidance and known limitations when they affect
+users. Describe the resulting behavior rather than copying commit subjects.
+Older releases without curated notes remain available through Git tags.
+
+Review the pending notes without changing files:
+
+```bash
+npm run changelog:check
+npm run changelog:preview
+```
+
+`changelog:check` validates the changelog structure and links, allowing an empty
+`Unreleased` section after a release. The release preflight additionally requires
+pending notes. `changelog:preview` prints those notes for review.
+
+Commit the implementation and reviewed `Unreleased` notes first. npm requires a
+clean working tree before creating its version commit. Then run:
+
+```bash
+npm run release-new-version
+```
+
+This command uses `npm version patch` and pushes the resulting commit and tag
+with `git push --follow-tags`. The npm lifecycle performs these steps:
+
+1. `preversion` validates nonempty `Unreleased` notes and runs `npm test`.
+2. npm bumps the package version.
+3. `version` runs `npm run build:all` with the new version, moves the pending
+   notes into a dated version section using the current UTC date, updates the
+   comparison links, and stages the changelog for npm's version commit.
+4. npm commits the package version and changelog together, creates its tag, and
+   the release command pushes them.
+
+The next patch after `0.1.56` is `0.1.57`; the release command determines and
+writes the version, so leave pending notes under `Unreleased` until then. The
+finalizer leaves an empty `Unreleased` section ready for subsequent changes.
+
+If a build or version hook fails after the version bump, stop and inspect the
+working tree: the package version may already be modified. Resolve the failure
+and review that state before retrying; rerunning blindly can bump it again.
+A push failure can likewise leave a completed local release commit and tag.
+
+On a release tag, CI checks that the tag, package version and latest dated
+changelog version agree. The **Publish to npm** workflow publishes the package,
+then creates or updates the GitHub Release with that version's curated notes.
+The npm package includes `CHANGELOG.md`. Publishing failures do not create a
+GitHub Release; check the workflow result even after the local command succeeds.
+If npm publication succeeded but the GitHub Release step failed, rerun that
+workflow job. It skips npm publication only when the registry identifies the
+same version and source commit, then retries the release notes. Other registry
+errors or mismatched commits stop the job. Stable versions use npm's `latest`
+tag; prerelease versions use `next` and create GitHub prereleases.
 
 ## Manual checks
 

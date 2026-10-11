@@ -4,7 +4,7 @@ GPU rendering for detailed floorplans, technical drawings, and entire books — 
 
 HEPR brings PDF vector content, text, and embedded images to the GPU. WebGL and WebGPU backends, adaptive level of detail, and a reusable `.hep` document format help keep detailed documents practical to explore.
 
-**[Live demo](https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/)** · **[Examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md)** · **[Manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md)** · **[API](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md)** · **[Documentation](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/README.md)**
+**[Live demo](https://soadzoor.github.io/Highly-Efficient-PDF-Renderer/)** · **[Examples](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/examples.md)** · **[Manual](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/manual.md)** · **[API](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md)** · **[Documentation](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/README.md)** · **[Changelog](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/CHANGELOG.md)**
 
 ## Try it
 
@@ -201,6 +201,7 @@ visibility and primitive colors remain per-view settings.
 | [API reference](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/api.md) | Public functions, options, and object methods. |
 | [Documentation](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/README.md) | How rendering works and links to technical references. |
 | [Development](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/docs/development.md) | Local setup, builds, tests, and example assets. |
+| [Changelog](https://github.com/soadzoor/Highly-Efficient-PDF-Renderer/blob/main/CHANGELOG.md) | Release notes, compatibility changes, and upgrade guidance. |
 
 ## Requirements and scope
 
