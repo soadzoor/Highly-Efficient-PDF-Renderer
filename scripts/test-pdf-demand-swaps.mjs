@@ -62,17 +62,17 @@ try {
 
   // Execute the native viewer's actual orchestration with a deterministic host.
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
-  let timer, idle, current = true, commits = 0, disposals = 0, swaps = 0, resolvePreparation;
+  let timer, idle, current = true, preparations = 0, commits = 0, disposals = 0, swaps = 0, resolvePreparation;
   const scanUpdate = { layers: new Map(), rasterPages: new Set([0]) }, nativeScene = {};
   const fakeLoader = { getDisplayUpdate: () => scanUpdate, isDisplayUpdateCurrent: () => current };
   const context = vm.createContext({ performance, console,
     window: { setTimeout(callback) { timer = callback; return 1; } },
     activePdfPageLoader: fakeLoader, activeSceneLoadToken: null, pendingSourceLoadCount: 0,
-    activeHepExportController: null, lastParsedScene: nativeScene,
+    activeHepExportController: null, layoutChangeRunning: false, lastParsedScene: nativeScene,
     demandPdfUpdatePending: false, demandPdfUpdateTimer: null, demandPdfUpdateRunning: false,
     backendSwitcher: { runWhenIdle(callback) { return idle = callback(); } },
     renderer: { prepareRasterLayerUpdates() { throw Error("must use async preparation"); },
-      prepareRasterLayerUpdatesAsync: () => new Promise(resolve => { resolvePreparation = () => resolve({
+      prepareRasterLayerUpdatesAsync: () => new Promise(resolve => { preparations++; resolvePreparation = () => resolve({
         commit() { commits++; }, dispose() { disposals++; }
       }); }), setPageRasterVisibility() { swaps++; }, recordPerformanceTransition() {} },
     composeVectorScenesInGrid() { throw Error("warm swaps must not compose the document"); },
@@ -80,6 +80,11 @@ try {
     applyTextSearchScene() { throw Error("warm swaps must preserve search data"); }, setStatus() {}
   });
   vm.runInContext(sourceFunction(source, "scheduleDemandPdfUpdate"), context);
+  context.layoutChangeRunning = true;
+  context.scheduleDemandPdfUpdate(); timer();
+  assert.equal(preparations, 0, "layout changes defer page-swap preparation");
+  assert(context.demandPdfUpdatePending, "the deferred update remains pending until the layout settles");
+  context.layoutChangeRunning = false;
   context.scheduleDemandPdfUpdate(); timer();
   assert.equal(commits, 0, "old representation stays visible while preparation runs");
   resolvePreparation(); await idle; await new Promise(resolve => setTimeout(resolve, 0));
@@ -90,5 +95,19 @@ try {
   assert.equal(disposals, 2); assert.equal(swaps, 1);
   assert.equal(context.lastParsedScene, nativeScene);
   assert(context.demandPdfUpdatePending, "an obsolete transaction schedules the latest view");
-  console.log("PDF demand swaps: stable scan slots, OCR policy, fractional identities, snapshot binding, warm native path and stale zoom cancellation passed.");
+  current = true;
+  context.scheduleDemandPdfUpdate(); timer();
+  context.layoutChangeRunning = true;
+  resolvePreparation(); await idle; await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(commits, 1, "a layout change during preparation discards the old page swap");
+  assert.equal(disposals, 3); assert.equal(swaps, 1);
+  assert(context.demandPdfUpdatePending, "discarded layout work schedules a fresh page swap");
+  context.layoutChangeRunning = false;
+  context.scheduleDemandPdfUpdate(); timer();
+  resolvePreparation(); await idle; await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(commits, 2, "page swaps resume after the layout settles");
+  assert.equal(disposals, 4); assert.equal(swaps, 2);
+  assert.equal(context.lastParsedScene, nativeScene);
+  assert.equal(context.demandPdfUpdatePending, false);
+  console.log("PDF demand swaps: stable scan slots, OCR policy, fractional identities, snapshot binding, warm native path, stale zoom cancellation and layout-change deferral passed.");
 } finally { hooks.deregister(); }

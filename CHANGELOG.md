@@ -33,6 +33,9 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
+- Update the native PDF demand-swap test fixture for Reader layout state, fixing
+  its release-preflight failure and covering deferred and cancelled page swaps
+  during layout changes.
 - Keep the previous document and reading position usable when replacement
   preparation fails or is cancelled. Restore the native scene, camera, layers
   and highlights after failed or cancelled warm-up; reconnect Reader input
