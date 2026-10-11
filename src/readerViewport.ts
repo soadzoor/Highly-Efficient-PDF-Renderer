@@ -28,6 +28,10 @@ export interface ReaderViewportOptions {
   onSettings(): void;
 }
 
+// Bound only the DOM representation to retain browser layout/scroll precision.
+// Document dimensions and camera zoom remain independent of this coordinate window.
+const READER_SCROLL_SURFACE_SIZE = 1_000_000;
+
 /** Shared DOM navigation; the host remains responsible for rendering its GPU canvas. */
 export function createReaderViewport(options: ReaderViewportOptions) {
   const document = options.getCanvas().ownerDocument, window = document.defaultView!;
@@ -90,6 +94,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   let savedView: ReaderCameraView | null = null;
   let navigationTarget: { page: number; top: number } | null = null;
   let metrics: ReaderMetrics = readerContentMetrics(rects, zoom, 1, 1);
+  let logicalScroll = { left: 0, top: 0 }, domScroll = { left: 0, top: 0 };
   let resizeFrame = 0, scrollFrame = 0, inertiaFrame = 0;
   let thumbnailRevision = 0, thumbnailRunning = false;
   const thumbnailWanted = new Set<number>(), thumbnailCanvases = new Map<number, HTMLCanvasElement>();
@@ -103,7 +108,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
 
   const isActive = (): boolean => active;
   function getView(): ReaderView {
-    return active ? readerViewFromScroll(metrics, scroller.scrollLeft, scroller.scrollTop)
+    return active ? readerViewFromScroll(metrics, logicalScroll.left, logicalScroll.top)
       : { ...(savedView ?? readerViewFromScroll(metrics, 0, 0)), width: scroller.clientWidth, height: scroller.clientHeight };
   }
   function updateToolbar(): void {
@@ -125,12 +130,12 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     const maxScroll = metrics.surfaceHeight - metrics.height;
     // Explicit navigation can reach a short final page without aligning its top.
     // Retain that selection until the user actually moves the vertical scrollbar.
-    const page = navigationTarget && Math.abs(scroller.scrollTop - navigationTarget.top) < .5
+    const page = navigationTarget && Math.abs(logicalScroll.top - navigationTarget.top) < .5
       ? navigationTarget.page
-      : maxScroll > 0 && scroller.scrollTop >= maxScroll - .5 ? rects.length / 4 - 1
+      : maxScroll > 0 && logicalScroll.top >= maxScroll - .5 ? rects.length / 4 - 1
         : readerPageAtPoint(rects, (rects[0] + rects[2]) / 2,
           view.centerY + (view.height / 2 - READER_MARGIN) / view.zoom);
-    if (navigationTarget && Math.abs(scroller.scrollTop - navigationTarget.top) >= .5) navigationTarget = null;
+    if (navigationTarget && Math.abs(logicalScroll.top - navigationTarget.top) >= .5) navigationTarget = null;
     if (page !== currentPage) {
       rows[currentPage]?.removeAttribute("aria-current"); currentPage = page;
       rows[currentPage]?.setAttribute("aria-current", "page");
@@ -149,23 +154,45 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     for (let pass = 0; pass < 3; pass++) {
       if (fit && rects.length) zoom = readerFitZoom(rects, currentPage, width, height, fit);
       metrics = readerContentMetrics(rects, zoom, width, height);
-      surface.style.width = active ? `${metrics.surfaceWidth}px` : "100%";
-      surface.style.height = active ? `${metrics.surfaceHeight}px` : "100%";
+      surface.style.width = active ? `${Math.max(width, Math.min(metrics.surfaceWidth, READER_SCROLL_SURFACE_SIZE))}px` : "100%";
+      surface.style.height = active ? `${Math.max(height, Math.min(metrics.surfaceHeight, READER_SCROLL_SURFACE_SIZE))}px` : "100%";
       const nextWidth = Math.max(1, scroller.clientWidth), nextHeight = Math.max(1, scroller.clientHeight);
       if (nextWidth === width && nextHeight === height) break;
       width = nextWidth; height = nextHeight;
     }
     const canvas = options.getCanvas();
     canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+    domScroll = { left: scroller.scrollLeft, top: scroller.scrollTop };
+  }
+  function positionScroll(left: number, top: number): void {
+    const maxLeft = Math.max(0, metrics.surfaceWidth - metrics.width), maxTop = Math.max(0, metrics.surfaceHeight - metrics.height);
+    logicalScroll = { left: Math.max(0, Math.min(maxLeft, left)), top: Math.max(0, Math.min(maxTop, top)) };
+    scroller.scrollLeft = maxLeft > 0 ? logicalScroll.left / maxLeft * Math.max(0, scroller.scrollWidth - scroller.clientWidth) : 0;
+    scroller.scrollTop = maxTop > 0 ? logicalScroll.top / maxTop * Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
+    // A later scroll event must not feed rounded DOM offsets back into the camera.
+    domScroll = { left: scroller.scrollLeft, top: scroller.scrollTop };
+  }
+  function readNativeScroll(): void {
+    if (!active) return;
+    const left = scroller.scrollLeft, top = scroller.scrollTop;
+    if (left === domScroll.left && top === domScroll.top) return;
+    stopInertia();
+    const maxLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth), maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (left !== domScroll.left) logicalScroll.left = maxLeft > 0 ? Math.max(0, Math.min(1, left / maxLeft)) * (metrics.surfaceWidth - metrics.width) : 0;
+    if (top !== domScroll.top) logicalScroll.top = maxTop > 0 ? Math.max(0, Math.min(1, top / maxTop)) * (metrics.surfaceHeight - metrics.height) : 0;
+    domScroll = { left, top };
+  }
+  function scrollBy(left: number, top: number): void {
+    positionScroll(logicalScroll.left + left, logicalScroll.top + top);
   }
   function positionView(view: ReaderCameraView): void {
     const scroll = readerScrollFromView(metrics, view);
-    scroller.scrollLeft = scroll.left; scroller.scrollTop = scroll.top;
+    positionScroll(scroll.left, scroll.top);
   }
   function resize(): void {
     if (disposed) return;
     const before = getView();
-    const targetPage = navigationTarget && Math.abs(scroller.scrollTop - navigationTarget.top) < .5 ? navigationTarget.page : null;
+    const targetPage = navigationTarget && Math.abs(logicalScroll.top - navigationTarget.top) < .5 ? navigationTarget.page : null;
     sizeSurface();
     if (active && rects.length) {
       if (initialView) {
@@ -174,7 +201,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
           centerY: rects[i + 3] - (metrics.height / 2 - READER_MARGIN) / zoom, zoom });
         initialView = false;
       } else positionView({ ...before, zoom });
-      if (targetPage !== null) navigationTarget = { page: targetPage, top: scroller.scrollTop };
+      if (targetPage !== null) navigationTarget = { page: targetPage, top: logicalScroll.top };
       present();
     }
     updateThumbnails();
@@ -224,7 +251,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     const i = currentPage * 4;
     positionView({ centerX: (rects[i] + rects[i + 2]) / 2,
       centerY: rects[i + 3] - (metrics.height / 2 - READER_MARGIN) / zoom, zoom });
-    navigationTarget = { page: targetPage, top: scroller.scrollTop };
+    navigationTarget = { page: targetPage, top: logicalScroll.top };
     fit = previousFit; initialView = false; present();
     rows.forEach((row, page) => page === currentPage ? row.setAttribute("aria-current", "page") : row.removeAttribute("aria-current"));
     updateToolbar();
@@ -242,7 +269,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     sidebar.hidden = !active || !sidebarOpen;
     cancelActiveGesture();
     if (!active) {
-      scroller.scrollLeft = scroller.scrollTop = 0;
+      positionScroll(0, 0);
       for (const job of thumbnailJobs.values()) job.abort();
       releaseScratch();
     }
@@ -267,7 +294,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     if (!same) {
       currentPage = 0; zoom = READER_ACTUAL_SIZE_ZOOM; fit = "width";
       initialView = true; savedView = null; sidebarOpen = window.innerWidth >= 800;
-      scroller.scrollLeft = scroller.scrollTop = sidebar.scrollTop = 0;
+      positionScroll(0, 0); sidebar.scrollTop = 0;
     }
     sidebar.hidden = !active || !sidebarOpen;
     rows.length = rowTops.length = 0; sidebar.replaceChildren();
@@ -418,7 +445,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       } else {
         const dx = previous.x - event.clientX, dy = previous.y - event.clientY;
         const now = performance.now(), elapsed = Math.max(1, now - lastTouchTime);
-        scroller.scrollLeft += dx; scroller.scrollTop += dy;
+        scrollBy(dx, dy);
         velocityX = dx / elapsed; velocityY = dy / elapsed; lastTouchTime = now;
         present();
       }
@@ -438,11 +465,11 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       const glide = (now: number): void => {
         inertiaFrame = 0;
         const elapsed = Math.min(32, now - last); last = now;
-        const oldLeft = scroller.scrollLeft, oldTop = scroller.scrollTop;
-        scroller.scrollLeft += velocityX * elapsed; scroller.scrollTop += velocityY * elapsed;
+        const oldLeft = logicalScroll.left, oldTop = logicalScroll.top;
+        scrollBy(velocityX * elapsed, velocityY * elapsed);
         const decay = Math.exp(-elapsed / 180); velocityX *= decay; velocityY *= decay;
-        if (scroller.scrollLeft === oldLeft) velocityX = 0;
-        if (scroller.scrollTop === oldTop) velocityY = 0;
+        if (logicalScroll.left === oldLeft) velocityX = 0;
+        if (logicalScroll.top === oldTop) velocityY = 0;
         present();
         if (active && Math.hypot(velocityX, velocityY) > .02) inertiaFrame = window.requestAnimationFrame(glide);
       };
@@ -482,26 +509,35 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   }, { signal: lifetime.signal });
   sidebar.addEventListener("scroll", updateThumbnails, { passive: true, signal: lifetime.signal });
   scroller.addEventListener("scroll", () => {
+    readNativeScroll();
     if (!scrollFrame) scrollFrame = window.requestAnimationFrame(() => { scrollFrame = 0; present(); });
   }, { passive: true, signal: lifetime.signal });
-  scroller.addEventListener("wheel", () => { stopInertia(); }, { passive: true, signal: lifetime.signal });
+  scroller.addEventListener("wheel", event => {
+    stopInertia();
+    if (!active || event.defaultPrevented || event.ctrlKey || event.metaKey) return;
+    if (metrics.surfaceWidth <= scroller.scrollWidth + 1 && metrics.surfaceHeight <= scroller.scrollHeight + 1) return;
+    event.preventDefault();
+    const unit = event.deltaMode === 1 ? 16 : 1;
+    const left = event.shiftKey && !event.deltaX ? event.deltaY : event.deltaX;
+    const top = event.shiftKey && !event.deltaX ? 0 : event.deltaY;
+    scrollBy(left * (event.deltaMode === 2 ? metrics.width : unit), top * (event.deltaMode === 2 ? metrics.height : unit)); present();
+  }, { passive: false, signal: lifetime.signal });
   scroller.addEventListener("keydown", event => {
     if (!active || event.target !== scroller) return;
     let top: number | undefined, left: number | undefined;
     switch (event.key) {
-      case "ArrowDown": top = scroller.scrollTop + 40; break;
-      case "ArrowUp": top = scroller.scrollTop - 40; break;
-      case "ArrowLeft": left = scroller.scrollLeft - 40; break;
-      case "ArrowRight": left = scroller.scrollLeft + 40; break;
-      case "PageDown": case " ": top = scroller.scrollTop + metrics.height * (event.shiftKey ? -.9 : .9); break;
-      case "PageUp": top = scroller.scrollTop - metrics.height * .9; break;
+      case "ArrowDown": top = logicalScroll.top + 40; break;
+      case "ArrowUp": top = logicalScroll.top - 40; break;
+      case "ArrowLeft": left = logicalScroll.left - 40; break;
+      case "ArrowRight": left = logicalScroll.left + 40; break;
+      case "PageDown": case " ": top = logicalScroll.top + metrics.height * (event.shiftKey ? -.9 : .9); break;
+      case "PageUp": top = logicalScroll.top - metrics.height * .9; break;
       case "Home": top = 0; break;
       case "End": top = metrics.surfaceHeight; break;
       default: return;
     }
     event.preventDefault(); stopInertia();
-    if (top !== undefined) scroller.scrollTop = top;
-    if (left !== undefined) scroller.scrollLeft = left;
+    positionScroll(left ?? logicalScroll.left, top ?? logicalScroll.top);
     present();
   }, { signal: lifetime.signal });
   const submitPage = (): void => {
@@ -530,7 +566,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     zoom = state.view.zoom; fit = state.fit; sidebarOpen = state.sidebarOpen; savedView = state.view; initialView = false;
     if (state.pageIndex !== undefined) currentPage = Math.max(0, Math.min(rects.length / 4 - 1, state.pageIndex));
     sidebar.hidden = !active || !sidebarOpen; sizeSurface(); positionView(state.view);
-    navigationTarget = state.pageIndex === undefined ? null : { page: currentPage, top: scroller.scrollTop };
+    navigationTarget = state.pageIndex === undefined ? null : { page: currentPage, top: logicalScroll.top };
     rows.forEach((row, page) => page === currentPage ? row.setAttribute("aria-current", "page") : row.removeAttribute("aria-current"));
     present(); updateThumbnails();
   }

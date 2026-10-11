@@ -72,7 +72,7 @@
 
 .reader-workspace { position: relative; display: flex; flex: 1; min-height: 0; min-width: 0; }
 .reader-scroll { position: relative; flex: 1; min-width: 0; overflow: hidden; outline-offset: -2px; }
-.reader-active .reader-scroll { overflow: auto; overscroll-behavior: contain; }
+.reader-active .reader-scroll { overflow: auto; overflow-anchor: none; overscroll-behavior: contain; }
 .reader-surface { position: relative; width: 100%; height: 100%; }
 .reader-shell #viewport {
   position: sticky;

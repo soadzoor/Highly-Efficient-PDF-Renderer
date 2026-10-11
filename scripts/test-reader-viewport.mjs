@@ -127,11 +127,11 @@ class Element {
   }
   emit(type, values = {}) {
     const event = { type, target: this, button: 0, pointerType: "mouse", pointerId: 1,
-      ctrlKey: false, metaKey: false, shiftKey: false, deltaMode: 0, ...values,
+      ctrlKey: false, metaKey: false, shiftKey: false, deltaMode: 0, deltaX: 0, deltaY: 0, ...values,
       preventDefault() { this.defaultPrevented = true; } };
     for (let node = this; node; node = node.parentElement) {
       for (const { listener } of [...node.listeners.get(type) ?? []]) listener(event);
-      if (["scroll", "pointermove", "pointerup", "pointercancel", "lostpointercapture", "wheel", "keydown"].includes(type)) break;
+      if (["scroll", "pointermove", "pointerup", "pointercancel", "lostpointercapture", "keydown"].includes(type)) break;
     }
     return event;
   }
@@ -150,15 +150,24 @@ class Element {
     }
     return Number.parseFloat(this.style.height) || this.height;
   }
-  get scrollWidth() { return Number.parseFloat(this.querySelector(".reader-surface")?.style.width) || this.clientWidth; }
+  get scrollWidth() {
+    const width = Number.parseFloat(this.querySelector(".reader-surface")?.style.width) || this.clientWidth;
+    return this.classList.contains("reader-scroll") ? Math.min(width, this.ownerDocument.browserScrollLimit) : width;
+  }
   get scrollHeight() {
     if (this.classList.contains("reader-thumbnails")) return 12 + this.children.reduce((height, row) => height + row.offsetHeight + 12, 0);
-    return Number.parseFloat(this.querySelector(".reader-surface")?.style.height) || this.clientHeight;
+    const height = Number.parseFloat(this.querySelector(".reader-surface")?.style.height) || this.clientHeight;
+    return this.classList.contains("reader-scroll") ? Math.min(height, this.ownerDocument.browserScrollLimit) : height;
   }
-  get scrollLeft() { return this._left; }
-  set scrollLeft(value) { this._left = Math.max(0, Math.min(Number(value) || 0, this.scrollWidth - this.clientWidth)); }
-  get scrollTop() { return this._top; }
-  set scrollTop(value) { this._top = Math.max(0, Math.min(Number(value) || 0, this.scrollHeight - this.clientHeight)); }
+  get scrollLeft() { return Math.max(0, Math.min(this._left, this.scrollWidth - this.clientWidth)); }
+  set scrollLeft(value) { this._left = this.roundScroll(value, this.scrollWidth - this.clientWidth); }
+  get scrollTop() { return Math.max(0, Math.min(this._top, this.scrollHeight - this.clientHeight)); }
+  set scrollTop(value) { this._top = this.roundScroll(value, this.scrollHeight - this.clientHeight); }
+  roundScroll(value, maximum) {
+    const quantum = this.ownerDocument.scrollQuantum;
+    const offset = Math.max(0, Math.min(Number(value) || 0, Math.max(0, maximum)));
+    return quantum > 0 ? Math.min(Math.max(0, maximum), Math.round(offset / quantum) * quantum) : offset;
+  }
   get offsetHeight() { return Number.parseFloat(this.style.height) || this.clientHeight; }
   get offsetTop() {
     if (!this.parentElement) return 0;
@@ -186,12 +195,12 @@ class Element {
   }
 }
 
-function environment(width = 700, height = 800) {
+function environment(width = 700, height = 800, { browserScrollLimit = Infinity, scrollQuantum = 0 } = {}) {
   const frames = new Map(); let serial = 0;
   const window = { innerWidth: width, devicePixelRatio: 2, setTimeout,
     requestAnimationFrame(callback) { const id = ++serial; frames.set(id, callback); return id; },
     cancelAnimationFrame(id) { frames.delete(id); } };
-  const document = { viewportWidth: width, viewportHeight: height, defaultView: window, activeElement: null,
+  const document = { viewportWidth: width, viewportHeight: height, browserScrollLimit, scrollQuantum, defaultView: window, activeElement: null,
     createElement: tag => new Element(tag, document), createDocumentFragment: () => new Element("fragment", document),
     querySelector: selector => document.body.querySelector(selector) };
   document.documentElement = new Element("html", document);
@@ -218,6 +227,7 @@ function deferred() { let resolve; const promise = new Promise(done => { resolve
 
 try {
   const { createReaderViewport } = await import("../src/readerViewport.ts");
+  const { READER_ACTUAL_SIZE_ZOOM, readerContentMetrics, readerViewFromScroll } = await import("../src/readerGeometry.ts");
   {
     const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
     const scroller = doc.querySelector(".reader-scroll"), sidebar = doc.querySelector(".reader-thumbnails");
@@ -266,6 +276,126 @@ try {
     assert.deepEqual(reader.getView(), replacementView, "canvas replacement removes old interaction handlers");
     env.canvas.emit("wheel", { ctrlKey: true, deltaY: -100, clientX: 300, clientY: 300 });
     assert(reader.getView().zoom > replacementView.zoom, "replacement canvas receives zoom controls");
+    reader.dispose();
+  }
+  {
+    const env = environment(700, 800, { browserScrollLimit: 33_554_432 });
+    const reader = createReaderViewport(env.options), doc = env.document, rects = pageRects(38);
+    reader.setDocument({ identity: "high-zoom-browser-range", pageRects: rects }); reader.setLayout("reader");
+    reader.setView({ centerX: 17.123456, centerY: -30800.123456, zoom: 800 * READER_ACTUAL_SIZE_ZOOM });
+    const initial = reader.getView(), input = doc.querySelector(".reader-zoom"), scroller = doc.querySelector(".reader-scroll");
+    for (const percentage of [80500, 81000, 81500, 82000, 81500, 81000, 80500, 80000]) {
+      input.value = `${percentage}%`; input.emit("change");
+      const view = reader.getView();
+      close(view.zoom, percentage / 100 * READER_ACTUAL_SIZE_ZOOM, "Reader accepts extreme zoom percentages");
+      close(view.centerX, initial.centerX, "crossing the browser scroll range keeps horizontal focus");
+      close(view.centerY, initial.centerY, "crossing 80000–82000% keeps vertical focus");
+      scroller.emit("scroll"); env.flushFrames();
+      close(reader.getView().centerY, initial.centerY, "deferred programmatic scroll events keep extreme zoom focus");
+    }
+    const canvas = env.canvas, bounds = canvas.getBoundingClientRect(), x = 200, y = 270;
+    const anchorX = initial.centerX + (x - initial.width / 2) / initial.zoom;
+    const anchorY = initial.centerY - (y - initial.height / 2) / initial.zoom;
+    const delta = -Math.log(820 / 800) / .002;
+    for (const deltaY of [delta, -delta]) {
+      canvas.emit("wheel", { ctrlKey: true, deltaY, clientX: bounds.left + x, clientY: bounds.top + y });
+      const view = reader.getView();
+      close(view.centerX + (x - view.width / 2) / view.zoom, anchorX, "extreme zoom preserves the cursor's document X");
+      close(view.centerY - (y - view.height / 2) / view.zoom, anchorY, "extreme zoom preserves the cursor's document Y");
+    }
+    canvas.emit("pointerdown", { pointerId: 1, pointerType: "touch", clientX: 250, clientY: 300 });
+    canvas.emit("pointerdown", { pointerId: 2, pointerType: "touch", clientX: 450, clientY: 300 });
+    const beforePinch = reader.getView(), pinchY = beforePinch.centerY - (300 - bounds.top - beforePinch.height / 2) / beforePinch.zoom;
+    for (let round = 0; round < 3; round++) {
+      canvas.emit("pointermove", { pointerId: 2, pointerType: "touch", clientX: 455, clientY: 300 });
+      scroller.emit("scroll"); env.flushFrames();
+      const expanded = reader.getView();
+      close(expanded.centerY - (300 - bounds.top - expanded.height / 2) / expanded.zoom, pinchY,
+        "pinching beyond 80000% retains the document anchor");
+      canvas.emit("pointermove", { pointerId: 2, pointerType: "touch", clientX: 450, clientY: 300 });
+      close(reader.getView().centerY, beforePinch.centerY, "repeated high zoom pinches return to the same focus");
+    }
+    reader.dispose();
+  }
+  {
+    const env = environment(700, 800, { browserScrollLimit: 250_000, scrollQuantum: 1 });
+    const reader = createReaderViewport(env.options), doc = env.document, rects = pageRects(38);
+    reader.setDocument({ identity: "quantized-virtual-scroll", pageRects: rects }); reader.setLayout("reader");
+    const scroller = doc.querySelector(".reader-scroll"), center = { centerX: 17.123456, centerY: -24000.123456, zoom: 820 * READER_ACTUAL_SIZE_ZOOM };
+    const sameCamera = (actual, expected, label) => {
+      for (const key of ["centerX", "centerY", "zoom"]) close(actual[key], expected[key], `${label}: ${key}`);
+    };
+    reader.setView(center);
+    sameCamera(reader.getView(), center, "integer DOM offsets do not round the precise camera");
+    for (let i = 0; i < 5; i++) {
+      scroller.emit("scroll"); env.flushFrames();
+      sameCamera(reader.getView(), center, "programmatic scroll readback does not feed rounding back into the camera");
+    }
+    const saved = reader.snapshot();
+    doc.querySelector('[data-reader="hide-toolbar"]').emit("click");
+    sameCamera(reader.getView(), center, "hiding the toolbar retains the exact extreme zoom view");
+    doc.querySelector('[data-reader="show-toolbar"]').emit("click");
+    sameCamera(reader.getView(), center, "showing the toolbar retains the exact extreme zoom view");
+    doc.querySelector('[data-reader="thumbnails"]').emit("click");
+    sameCamera(reader.getView(), center, "resizing for thumbnails retains the exact extreme zoom view");
+    reader.setLayout("grid"); reader.setLayout("reader");
+    sameCamera(reader.getView(), center, "layout round trips retain the precise camera");
+    doc.querySelector(".reader-zoom").value = "100%"; doc.querySelector(".reader-zoom").emit("change");
+    reader.goToPage(0); reader.restore(saved);
+    sameCamera(reader.getView(), center, "snapshot restoration retains the precise camera");
+    env.replaceCanvas(); reader.canvasChanged();
+    sameCamera(reader.getView(), center, "canvas replacement retains the precise camera");
+    scroller.emit("scroll"); env.flushFrames();
+    sameCamera(reader.getView(), center, "restored programmatic scroll events do not drift");
+
+    const metrics = readerContentMetrics(rects, center.zoom, scroller.clientWidth, scroller.clientHeight);
+    assert(metrics.surfaceWidth > scroller.scrollWidth && metrics.surfaceHeight > scroller.scrollHeight,
+      "the test covers compressed scroll ranges on both axes");
+    scroller.scrollTop = (scroller.scrollHeight - scroller.clientHeight) / 2;
+    const expectedMiddle = readerViewFromScroll(metrics, 0,
+      scroller.scrollTop / (scroller.scrollHeight - scroller.clientHeight) * (metrics.surfaceHeight - metrics.height));
+    scroller.emit("scroll"); env.flushFrames();
+    close(reader.getView().centerY, expectedMiddle.centerY, "native thumb movement maps through the measured browser range");
+    close(reader.getView().centerX, center.centerX, "vertical native scrolling keeps the precise horizontal camera");
+    scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
+    scroller.emit("scroll"); env.flushFrames();
+    const expectedEnd = readerViewFromScroll(metrics, metrics.surfaceWidth - metrics.width, metrics.surfaceHeight - metrics.height);
+    sameCamera(reader.getView(), expectedEnd, "native scrollbar endpoints reach the full document");
+    assert.equal(doc.querySelector(".reader-page-number").value, "38", "scrolling to the end selects the final page");
+    scroller.scrollLeft = scroller.scrollTop = 0; scroller.emit("scroll"); env.flushFrames();
+    sameCamera(reader.getView(), readerViewFromScroll(metrics, 0, 0), "native scrollbar origin reaches the start");
+
+    reader.setView(center);
+    const canvas = env.canvas;
+    canvas.emit("pointerdown", { pointerId: 1, pointerType: "touch", clientX: 350, clientY: 400 });
+    canvas.emit("pointermove", { pointerId: 1, pointerType: "touch", clientX: 320, clientY: 350 });
+    close(reader.getView().centerX, center.centerX + 30 / center.zoom, "touch drag uses horizontal viewport pixels under compression");
+    close(reader.getView().centerY, center.centerY - 50 / center.zoom, "touch drag uses vertical viewport pixels under compression");
+    reader.cancelActiveGesture();
+    reader.setView(center);
+    const wheel = canvas.emit("wheel", { deltaX: 30, deltaY: 120 });
+    assert(wheel.defaultPrevented, "compressed wheel scrolling replaces browser pixel deltas");
+    close(reader.getView().centerX, center.centerX + 30 / center.zoom, "wheel uses horizontal viewport pixels under compression");
+    close(reader.getView().centerY, center.centerY - 120 / center.zoom, "wheel uses vertical viewport pixels under compression");
+    const beforeLines = reader.getView();
+    canvas.emit("wheel", { deltaY: 3, deltaMode: 1 });
+    close(reader.getView().centerY, beforeLines.centerY - 48 / center.zoom, "compressed wheel line deltas retain normal scroll distance");
+    const beforePages = reader.getView();
+    canvas.emit("wheel", { deltaX: 1, deltaY: 1, deltaMode: 2 });
+    close(reader.getView().centerX, beforePages.centerX + beforePages.width / center.zoom,
+      "compressed wheel page deltas use the horizontal viewport width");
+    close(reader.getView().centerY, beforePages.centerY - beforePages.height / center.zoom,
+      "compressed wheel page deltas use the vertical viewport height");
+    const beforeKeys = reader.getView();
+    scroller.emit("keydown", { key: "ArrowDown" });
+    scroller.emit("keydown", { key: "ArrowRight" });
+    close(reader.getView().centerX, beforeKeys.centerX + 40 / center.zoom, "keyboard uses horizontal viewport pixels under compression");
+    close(reader.getView().centerY, beforeKeys.centerY - 40 / center.zoom, "keyboard uses vertical viewport pixels under compression");
+    const beforePage = reader.getView();
+    scroller.emit("keydown", { key: "PageDown" });
+    close(reader.getView().centerY, beforePage.centerY - beforePage.height * .9 / center.zoom,
+      "PageDown advances one viewport under compression");
     reader.dispose();
   }
   {
@@ -641,7 +771,7 @@ try {
       assert.deepEqual([...scene.rasterLayers[0].data], [255,0,0,255], "thumbnail replay preserves canonical document pixels");
     } finally { reader.dispose(); }
   }
-  console.log("Reader viewport: scroll/camera mapping, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
+  console.log("Reader viewport: bounded scroll/camera mapping, extreme zoom and rounded offsets, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
 } finally {
   globalThis.ResizeObserver = previousObserver; delete globalThis.__readerViewportGpu; hooks.deregister();
 }

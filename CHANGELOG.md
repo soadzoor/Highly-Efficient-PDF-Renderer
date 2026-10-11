@@ -8,9 +8,11 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ### Fixed
 
-- Keep touchscreen pinch zoom focused on the original document point in Reader,
-  including at scroll boundaries, and prevent finger-lift motion from launching
-  unintended inertial scrolling in both demos.
+- Keep Reader zoom focused through scroll boundaries and high magnification in
+  both demos. Preserve precise camera positions independently of browser scroll
+  limits and rounding, with bounded scrollbar ranges and consistent touch,
+  wheel and keyboard movement. Prevent finger-lift motion after touchscreen
+  pinch zoom from launching unintended inertial scrolling.
 
 ## [0.1.60] - 2026-10-11
 
