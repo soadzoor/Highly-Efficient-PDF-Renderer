@@ -34,6 +34,14 @@
   - any checks that still need to be run manually,
   - recommended commit message.
 
+## Changelog
+
+- Automatically update `CHANGELOG.md` under `Unreleased` before finishing every task that changes code, documentation, configuration, or repository instructions. Do not wait for the user to request release notes or start a release.
+- Derive concise notes from the final implemented changes and their effects on users or maintainers. Use the existing `Added`, `Changed`, and `Fixed` categories as appropriate; include compatibility guidance or known limitations when relevant. Do not claim planned work or unperformed verification as completed.
+- Preserve existing pending notes and all released entries. Refine or merge notes for the same feature instead of adding duplicate entries after follow-up tasks.
+- Run `npm run changelog:check -- --unreleased` after updating the notes, and mention the changelog update in the final summary.
+- Leave version bumps, release dates, changelog finalization, commits, tags, pushes, and release commands to the user. The existing release script finalizes the accumulated `Unreleased` notes.
+
 ## Testing and Validation
 
 - Run relevant tests, linters, type checks, or formatters when they do not require starting a dev server.

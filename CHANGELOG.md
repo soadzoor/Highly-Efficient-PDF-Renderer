@@ -6,6 +6,45 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Added
+
+- Add a Reader layout to the native and Three demos, with vertically stacked
+  pages, scrollbars, page navigation, zoom controls, Fit Width and Fit Page.
+  Support keyboard scrolling, touch dragging and flicking, and pointer-anchored
+  wheel and pinch zoom. Search and internal PDF links navigate through the
+  scrolling viewport; text selection, annotations and drawing selection remain
+  available.
+- Add lazy, clickable page thumbnails, including HEPs without their source PDF.
+  Expose cancellable previews through
+  `HeprThreePdfObject.getPagePreviewScene(index, { maximumDimension, signal? })`,
+  prioritize main-view loading, and preserve scan appearance while honoring
+  explicitly selected OCR-only mode and optional-layer visibility.
+
+### Changed
+
+- Open multipage PDFs and HEPs in Reader at page 1 with Fit Width. Initially show
+  thumbnails on screens at least 800 pixels wide and collapse advanced settings
+  and diagnostics. Retain Grid, Three's Sphere and Helix, and the existing
+  single-page default. Restore Reader position and zoom across layout changes,
+  streaming updates, backend replacement and same-document reloads.
+- Refresh the bundled Leo brochure and TIKA-2848 HEP examples.
+- Require coding agents to maintain `Unreleased` notes automatically after each
+  task that changes repository files, based on the implemented changes.
+
+### Fixed
+
+- Keep the previous document and reading position usable when replacement
+  preparation fails or is cancelled. Restore the native scene, camera, layers
+  and highlights after failed or cancelled warm-up; reconnect Reader input
+  handlers to the restored canvas after a failed backend switch.
+
+### Upgrade notes and limitations
+
+- Reader is a demo presentation mode. Package loading defaults, the HEP format
+  and canonical document layouts saved by HEP export remain unchanged.
+- Update separately deployed parser-worker assets alongside the library; the
+  worker protocol is now version 15 to support scan-appearance previews.
+
 ## [0.1.57] - 2026-10-11
 
 ### Added
