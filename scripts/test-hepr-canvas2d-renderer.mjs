@@ -102,6 +102,32 @@ try {
   assert.equal(pagePixel(shadingResult, 14, 5)[3], 255, "triangle mesh remains visible");
   assert.equal(pagePixel(shadingResult, 18, 5)[3], 255, "Coons patch tessellation remains visible");
 
+  // Two triangles form one translucent shading. Shared edges and strip
+  // boundaries must neither expose the backdrop nor apply opacity twice.
+  const seamBytes = packRecords([2,8,8,8,8,8], [
+    [0,0,0,255,0,0], [0,255,0,255,0,0], [0,0,255,255,0,0], [1,255,255,255,0,0]
+  ]);
+  const seamSession = await openPdf({ kind: "bytes", bytes: writeTinyPdf({objects:[
+    {number:1,body:"<< /Type /Catalog /Pages 2 0 R >>"},
+    {number:2,body:"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"},
+    {number:3,body:"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Resources << /Shading << /S 5 0 R >> /ExtGState << /Half << /ca .5 >> /Mul << /BM /Multiply /ca .5 >> >> >> /Contents 4 0 R >>"},
+    {number:4,body:tinyPdfStream("","0 0 1 rg 0 0 80 80 re f q 5 5 30 70 re W n /Half gs /S sh Q q 45 5 30 70 re W n /Mul gs /S sh Q")},
+    {number:5,body:tinyPdfStream("/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 2 /Decode [0 80 0 80 0 1 0 1 0 1]",seamBytes)}
+  ]}) });
+  let seamPage;
+  try { seamPage = await seamSession.compilePage(0,{optimization:"none"}); } finally { await seamSession.close(); }
+  const seamResult=await renderHeprPageToCanvas2d(seamPage,{surfaceFactory});
+  for(let y=6;y<74;y++) {
+    assertPixelNear(pagePixel(seamResult,20,y),[128,0,127,255],2,"mesh shared edges, opacity and coverage strips");
+    assertPixelNear(pagePixel(seamResult,60,y),[0,0,127,255],2,"mesh Multiply applies once");
+    assertPixelNear(pagePixel(seamResult,40,y),[0,0,255,255],0,"mesh retains the caller clip");
+  }
+  const transparentSeamPage=structuredClone(seamPage);
+  transparentSeamPage.displayProgram.groups[transparentSeamPage.displayProgram.rootGroupIndex].commands.shift();
+  const transparentSeam=await renderHeprPageToCanvas2d(transparentSeamPage,{surfaceFactory});
+  assertPixelNear(pagePixel(transparentSeam,20,60),[255,0,0,128],2,"shared diagonal preserves transparent coverage");
+  await assert.rejects(renderHeprPageToCanvas2d(seamPage,{surfaceFactory,maxWorkingPixels:20000}),isCanvasError(HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit));
+
   const gradientPaintPage = structuredClone(shadingPage);
   const greenCommand = gradientPaintPage.displayProgram.groups[
     gradientPaintPage.displayProgram.rootGroupIndex

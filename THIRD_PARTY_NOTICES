@@ -672,9 +672,13 @@ https://github.com/mozilla/pdf.js/tree/v6.4.299/external/openjpeg
 Wrapper source: https://github.com/mozilla/pdf.js.openjpeg
 OpenJPEG source: https://github.com/uclouvain/openjpeg
 
-HEPR changes: package-relative WASM URL; declared WASM memory maximum lowered
-to 512 MiB, with a further per-operation cap at runtime. No decoder
-instructions were changed.
+HEPR changes: package-relative WASM URL; the shipped WASM declares a 512 MiB
+memory maximum, which the loader replaces with the operation's configured
+ceiling within Wasm32 address capacity. No decoder instructions were changed.
+The generated host uses unsigned Wasm32 addresses,
+supports synchronous startup from a compiled module with a fresh heap, and
+provides an optional raw-plane callback for PostScript sample packing before
+the host's eight-bit pixel copy.
 Original WASM SHA-256:
 95e5002597af0824004aa57b1900fe019715db389e37640b1e58395e42f00cc5
 Shipped WASM SHA-256:

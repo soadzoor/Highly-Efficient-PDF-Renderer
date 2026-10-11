@@ -101,6 +101,7 @@ interface ColorParseStack {
   readonly objects: ReadonlySet<object>;
   readonly resourceNames: ReadonlySet<string>;
   readonly depth: number;
+  readonly resolvingOutputIntent?: boolean;
 }
 
 const DEFAULT_MAX_ICC_PROFILE_BYTES = Number.MAX_SAFE_INTEGER;
@@ -131,6 +132,7 @@ export class NativePdfColorRegistry {
   private readonly refCache = new Map<string, Promise<number>>();
   private readonly objectCache = new WeakMap<object, Map<number, Promise<number>>>();
   private readonly deviceCache = new Map<string, number>();
+  private outputIntentCmyk?: Promise<number | null>;
   private readonly resourceCache = new WeakMap<PdfDictionary, Map<string, Promise<number>>>();
   private readonly scopeIds = new WeakMap<PdfDictionary, number>();
   private nextScopeId = 1;
@@ -650,6 +652,10 @@ export class NativePdfColorRegistry {
       return index;
     }
     if (normalized) {
+      if (normalized === "DeviceCMYK" && !stack.resolvingOutputIntent) {
+        const profiled = await this.loadOutputIntentCmyk(stack, signal);
+        if (profiled !== null) return profiled;
+      }
       const cached = this.deviceCache.get(normalized);
       if (cached !== undefined) return cached;
       const index = this.append({
@@ -680,6 +686,57 @@ export class NativePdfColorRegistry {
       });
     }
     return await this.addResourceName(name.value, resources, stack, signal);
+  }
+
+  /** An embedded PDF/X or PDF/A output profile characterizes uncalibrated
+   * process CMYK. Explicit resource defaults still take precedence. This is
+   * display color management, not simulation of unrecorded press properties. */
+  private loadOutputIntentCmyk(stack: ColorParseStack, signal?: AbortSignal): Promise<number | null> {
+    if (this.outputIntentCmyk) return this.outputIntentCmyk;
+    const pending = (async (): Promise<number | null> => {
+      const raw = this.document.catalog.get("OutputIntents");
+      if (raw === undefined || raw === null) return null;
+      const ignored = (message: string): void => this.onDiagnostic?.({
+        code: "color.output-intent-ignored", severity: "warning", message
+      });
+      const intents = await this.document.resolveValue(raw, signal);
+      if (!Array.isArray(intents)) { ignored("The PDF OutputIntents entry is not an array; device CMYK uses its ordinary fallback."); return null; }
+      for (let index = 0; index < intents.length; index++) {
+        throwIfAborted(signal);
+        try {
+          const intent = await this.document.resolveDictionary(intents[index], signal);
+          const subtype = await this.document.resolveValue(intent.get("S"), signal);
+          if (!isPdfName(subtype) || !["GTS_PDFX", "GTS_PDFA1", "ISO_PDFE1"].includes(subtype.value)) continue;
+          const profile = await this.document.resolveValue(intent.get("DestOutputProfile"), signal);
+          if (!isPdfStream(profile)) {
+            if (profile !== undefined && profile !== null) ignored("An output-intent profile is not a stream and was skipped.");
+            continue; // External profiles are not fetched.
+          }
+          const count = await this.document.resolveValue(profile.dictionary.get("N"), signal);
+          if (count !== 4) continue;
+          const result = await this.addInternal([{ kind: "name", value: "ICCBased" }, profile], undefined,
+            { ...stack, resolvingOutputIntent: true, depth: stack.depth + 1 }, signal);
+          this.onDiagnostic?.({ code: "color.output-intent-profile", severity: "info",
+            message: "Device CMYK uses the embedded output-intent ICC profile for display conversion.",
+            details: { outputIntentIndex: index, subtype: subtype.value } });
+          return result;
+        } catch (cause) {
+          throwIfAborted(signal);
+          if (cause instanceof PdfError && ["resource-limit", "aborted", "closed"].includes(cause.code)) throw cause;
+          ignored("An unusable output-intent profile was skipped; available device CMYK rendering is retained.");
+        }
+      }
+      return null;
+    })().catch(cause => {
+      throwIfAborted(signal);
+      if (cause instanceof PdfError && ["resource-limit", "aborted", "closed"].includes(cause.code)) throw cause;
+      this.onDiagnostic?.({ code: "color.output-intent-ignored", severity: "warning",
+        message: "The PDF output intents could not be resolved; available device CMYK rendering is retained." });
+      return null;
+    });
+    this.outputIntentCmyk = pending;
+    void pending.catch(() => { if (this.outputIntentCmyk === pending) this.outputIntentCmyk = undefined; });
+    return pending;
   }
 
   private async addResourceName(

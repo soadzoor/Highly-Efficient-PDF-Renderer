@@ -1163,11 +1163,16 @@ conversion, dictionary stacks, matrices, local/global resources and VM allocatio
 procedure sources support ASCIIHex, ASCII85, RunLength, LZW, Flate with predictors,
 JPEG DCT, CCITT Group 3/4 fax (including standard uncompressed mode), SubFile,
 reusable-stream and `eexec` decoding. The additional `JBIG2Decode` extension accepts
-self-contained sequential pages, and `JPXDecode` accepts boxed/raw eight-bit
-JPEG 2000 with color output or a separate `Alpha` plane. Both consume through
+self-contained sequential pages, and `JPXDecode` accepts boxed/raw JPEG 2000
+with 1-, 2-, 4-, 8-, 12- and 16-bit signed/unsigned samples, color output or a
+separate `Alpha` plane. Subsampled components and YCbCr conversion are supported.
+Low-bit rows are padded to byte boundaries; twelve-bit samples occupy sixteen
+bits in big-endian order, matching the Ghostscript filter extension. Both consume through
 source EOF; use a bounded SubFile source when executable font code follows the
-encoded data. JPX alpha must be an unassociated last channel; higher precision, signed samples, other alpha layouts and raw
-two-component streams without channel definitions retain a diagnosed fallback.
+encoded data. JPX supports a single alpha channel in any position, including
+premultiplied samples (the filter preserves the source color values), and raw
+two-component streams. Palette/channel-map expansion, multiple alpha planes,
+mixed precisions and more than four codestream components retain diagnosed fallback.
 JPEG, JBIG2 and JPX reuse the bundled decoders, prepared asynchronously during
 PDF font loading; standalone synchronous font/VM callers must first await
 `prepareBundledJpegCodec`, `prepareBundledJbig2Codec` or
@@ -1187,7 +1192,7 @@ changed by the program inherit the invoking PDF state. Type1 charstring
 coordinates retain the character-space mapping established at glyph entry;
 local PostScript CTMs transform explicit PostScript marks and stroke pens.
 Sampled `image`, `imagemask` and
-`colorimage` operations support 1-, 2-, 4-, 8- and 12-bit components and procedure,
+`colorimage` operations support 1-, 2-, 4-, 8-, 12- and 16-bit components and procedure,
 file or repeating-string sources. Dictionary images use the current color space,
 including Indexed string/procedure palettes, Separation/DeviceN alternate tint
 procedures, and CIEBasedA/ABC/DEF/DEFG decoding, matrices and interpolated lookup
@@ -1199,7 +1204,12 @@ RGB/CMYK RenderTables and their channel transforms. `currentcolorrendering`,
 VM and graphics-state identity. The default is a canonical sRGB CRD with source
 black-point compensation. CMYK device values from vector paints and CRDs remain
 available to the PDF page's `DefaultCMYK` ICC profile, including final glyph
-paints, stencils and pattern/shading colors. This preserves supplied calibration
+paints, stencils and pattern/shading colors. Without `DefaultCMYK`, an embedded
+CMYK output-intent profile from PDF/X, PDF/A or PDF/E supplies display calibration
+to device paints, images and font programs. The first supported embedded profile
+is used; external profiles are not fetched. `color.output-intent-profile` identifies
+the selection, and unusable intent entries receive `color.output-intent-ignored`.
+This preserves supplied calibration
 rather than flattening it to unprofiled RGB. The standalone VM preview and sampled
 color images still use display approximations; missing profiles, physical inks,
 paper and screening cannot be reconstructed from font data.
@@ -1209,13 +1219,20 @@ matrices, clipping, strokes and implicit charstring paint. Shading patterns and
 function dictionaries (types 0, 2 and 3), encoded meshes and numeric array meshes
 (types 4–7, including reused triangle/patch edges). Numeric meshes stay vector;
 32-bit coordinates and 16-bit components emit `font.postscript-mesh-quantized`.
-CIE and spot shading spaces with unit component ranges use a sampled source/CRD
+CIE and spot shading spaces use a sampled source/CRD
 transform, with `font.postscript-shading-color-sampled` for nonlinear or sharp
 transition differences. The sampling grids have 257 points for one component,
 17 per axis for two/three components, and 9 per axis for four components. Nonunit
-ranges, transparent spot shadings and transforms with more than four inputs
+CIE ranges are remapped to PDF unit tints through affine function outputs and
+mesh Decode arrays, retaining interpolation, function clipping and vector geometry.
+Transparent spot shadings and transforms with more than four inputs
 retain diagnosed fallback. Shading data files must have an EOF boundary. Without
 an explicit shading BBox, font-local `shfill` uses the font bounding box and diagnoses that finite-extent approximation.
+The Canvas2D preview rasterizes mesh source components with 2x2 subpixel coverage
+in sequential 32-row strips and composites each pixel once. This removes seams
+from independent triangle antialiasing while preserving clipping, opacity and
+blend modes. Temporary surfaces and sample buffers count toward `maxWorkingPixels`;
+HEP mesh geometry remains vector. Boundary coverage can differ from other viewers.
 Sampled images retain reusable RGBA image assets, clipping and source transforms,
 with interpolation preserved through HEP save/reload and GPU texture sampling.
 Noninterpolated stencils retain coalesced vector runs; interpolated stencils retain

@@ -676,7 +676,7 @@ class FontPostScriptVm {
     };
     const validate = (image: Image, mask = false): void => {
       if (!Number.isSafeInteger(image.width) || image.width < 0 || !Number.isSafeInteger(image.height) || image.height < 0 ||
-        ![1, 2, 4, 8, 12].includes(image.bits) || (mask && image.bits !== 1)) throw unsupported("Invalid PostScript image dimensions or bit depth.", name, "rangecheck");
+        ![1, 2, 4, 8, 12, 16].includes(image.bits) || (mask && image.bits !== 1)) throw unsupported("Invalid PostScript image dimensions or bit depth.", name, "rangecheck");
       if (image.decode && (image.decode.length !== image.components * 2 || image.decode.some(value => !Number.isFinite(value)))) throw unsupported("Invalid PostScript image Decode array.", name, "rangecheck");
       // Validate every matrix before consuming bytes from currentfile.
       nativeFontPostScriptInvertMatrix(image.matrix);
@@ -837,7 +837,7 @@ class FontPostScriptVm {
       softMask = { width: maskImage.width, height: maskImage.height, data: coverage, interpolate: maskImage.interpolate,
         ...(misalignedMask ? { imageMatrix: maskImage.matrix } : {}) };
     }
-    context.image({ width: image.width, height: image.height, bitsPerComponent: image.bits as 1 | 2 | 4 | 8 | 12,
+    context.image({ width: image.width, height: image.height, bitsPerComponent: image.bits as 1 | 2 | 4 | 8 | 12 | 16,
       components: image.components, data, imageMatrix: image.matrix, ctm, decode: image.decode,
       mask: name === "imagemask", polarity, interpolate: image.interpolate,
       ...(colorKey ? { colorKey } : {}), ...(softMask ? { softMask } : {}), ...(convertColor ? { convertColor } : {}) });

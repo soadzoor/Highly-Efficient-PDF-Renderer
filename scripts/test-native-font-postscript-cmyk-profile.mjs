@@ -29,8 +29,8 @@ try {
       /Function << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> /Extend [true true] >> shfill
     .4 .2 .6 .1 setcmykcolor end }] def`, glyphs: [[".notdef", cs(0,1000,"hsbw","endchar")],
       ["A", cs(0,1000,"hsbw",0,500,"rmoveto",400,0,"rlineto",0,400,"rlineto",-400,0,"rlineto","closepath",0,4,"callothersubr","endchar")]] });
-  const fixture = (reference, calibrated = true) => writeTinyPdf({objects:[
-    {number:1,body:"<< /Type /Catalog /Pages 2 0 R >>"}, {number:2,body:"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"},
+  const fixture = (reference, calibrated = true, outputIntent = "") => writeTinyPdf({objects:[
+    {number:1,body:`<< /Type /Catalog /Pages 2 0 R ${outputIntent ? `/OutputIntents [${outputIntent}]` : ""} >>`}, {number:2,body:"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"},
     {number:3,body:`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 70 70] /Resources << /Font << /F 5 0 R >> ${calibrated ? "/ColorSpace << /DefaultCMYK [/ICCBased 8 0 R] >>" : ""} >> /Contents 4 0 R >>`},
     {number:4,body:tinyPdfStream("",reference ? `q .05 0 0 .05 10 10 cm .2 .4 .6 ${26/255} k .2 .4 .6 ${26/255} K 0 0 400 400 re f
       30 w 500 0 400 400 re S 500 500 200 400 re f 0 1000 400 100 re f 500 1000 400 100 re f 1000 0 100 400 re f .4 .2 .6 .1 k 0 500 400 400 re f Q` : "BT /F 50 Tf 10 10 Td (A) Tj ET")},
@@ -49,7 +49,27 @@ try {
   assert(delta < 1e-7, `CRD, patterns/shadings, explicit stroke/stencil and final CMYK fill must match profiled ordinary PDF paints: ${delta}`);
   const unprofiled=pixels(await render(await compile(fixture(false,false))));
   assert(difference(actualPixels,unprofiled)>.001,"the supplied profile actually changes visible output");
-  const blob=await buildHep(fixture(false),{compression:"deflate",withTextLod:true,withVectorLod:true}), bytes=new Uint8Array(await blob.arrayBuffer());
+  const intent="<< /Type /OutputIntent /S /GTS_PDFX /OutputConditionIdentifier (Synthetic) /DestOutputProfile 8 0 R >>";
+  for(const reference of [false,true]){
+    const profiled=pixels(await render(await compile(fixture(reference,false,intent))));
+    assert(difference(profiled,actualPixels)<1e-7,"embedded output intent supplies CMYK calibration to fonts and ordinary PDF paints");
+  }
+  const ignored="<< /S /GTS_PDFX /DestOutputProfile 42 >>";
+  assert(difference(pixels(await render(await compile(fixture(false,false,ignored)))),unprofiled)<1e-7,"unusable intent retains ordinary device rendering");
+  assert(difference(pixels(await render(await compile(fixture(false,true,ignored)))),actualPixels)<1e-7,"explicit DefaultCMYK takes precedence over output intents");
+  const retryIntent="<< /S /GTS_PDFX /DestOutputProfile << /N 4 >> >> "+intent;
+  assert(difference(pixels(await render(await compile(fixture(false,false,retryIntent)))),actualPixels)<1e-7,"skip unusable candidates before a usable intent");
+  const {NativePdfDocument}=await import("../src/pdf/nativeDocument.ts"),{NativePdfColorRegistry}=await import("../src/pdf/nativeColor.ts");
+  const intentDocument=await NativePdfDocument.open({kind:"bytes",bytes:fixture(false,false,intent)}),diagnostics=[];
+  const registry=new NativePdfColorRegistry(intentDocument,undefined,{onDiagnostic:value=>diagnostics.push(value)}),device={kind:"name",value:"DeviceCMYK"};
+  const color=await registry.add(device);assert.equal(registry.describe(color).kind,"ICCBased");
+  assert.equal(await registry.add(device),color);assert.equal(diagnostics.filter(value=>value.code==="color.output-intent-profile").length,1);
+  const limited=new NativePdfColorRegistry(intentDocument,undefined,{maxIccProfileBytes:128});
+  await assert.rejects(limited.add(device),error=>error.code==="resource-limit","output intents retain ICC byte limits");
+  intentDocument.catalog.set("OutputIntents",42);
+  const brokenDiagnostics=[],broken=new NativePdfColorRegistry(intentDocument,undefined,{onDiagnostic:value=>brokenDiagnostics.push(value)});
+  assert.equal(broken.describe(await broken.add(device)).kind,"DeviceCMYK");assert(brokenDiagnostics.some(value=>value.code==="color.output-intent-ignored"));
+  const blob=await buildHep(fixture(false,false,intent),{compression:"deflate",withTextLod:true,withVectorLod:true}), bytes=new Uint8Array(await blob.arrayBuffer());
   const scene=await loadSceneFromHep(bytes);assert.equal(scene.rasterLayers.length,0);assert(scene.fillPathCount>0);
   console.log(`PostScript CMYK profile passed: CRD/device paints, patterns/shadings, explicit strokes/stencils and final fill match ordinary DefaultCMYK PDF output; vector HEP ${bytes.length} bytes.`);
 } finally {hooks.deregister();}

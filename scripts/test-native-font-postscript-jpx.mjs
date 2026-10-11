@@ -71,11 +71,56 @@ try {
       if (!name.endsWith("a")) assert(alpha.every(x => x === 255));
     }
     const gray = fixture("gray");
+    const ycc = new Uint8Array(readFileSync(new URL("./fixtures/codecs/ycc420-6x4.jp2", import.meta.url)));
+    compareGs(ycc, "", all(filter(ycc, "JPXDecode")));
+    assert.equal(all(filter(ycc, "JPXDecode")).length, 6 * 4 * 3);
+    compareGs(fixture("gray16"), "", all(filter(fixture("gray16"), "JPXDecode")));
+    for (const name of ["gray1", "gray2", "gray4", "gray8s", "gray12", "gray12s", "gray16s"]) {
+      const bytes = new Uint8Array(readFileSync(new URL(`./fixtures/codecs/${name}-3x2.jp2`, import.meta.url)));
+      const samples = all(filter(bytes, "JPXDecode"));
+      compareGs(bytes, "", samples);
+      compareGs(bytes, "/Alpha true", all(filter(bytes, "JPXDecode", { Alpha: true })));
+      const bits = Number(name.match(/\d+/)[0]), packedBits = bits === 12 ? 16 : bits;
+      assert.equal(samples.length, 2 * Math.ceil(3 * packedBits / 8));
+      failure(() => all(filter(bytes, "JPXDecode", {}, { maxDecodedBytes: samples.length - 1 })), "resource-limit");
+    }
+    // Premultiplied color bytes retain their source values. CDEF can place
+    // opacity before the colors; the associations restore RGB output order.
+    const rgba = fixture("rgba"), cdef = Buffer.from(rgba).indexOf("cdef");
+    const premultiplied = rgba.slice();
+    new DataView(premultiplied.buffer).setUint16(cdef + 4 + 2 + 3 * 6 + 2, 2);
+    compareGs(premultiplied, "", all(filter(premultiplied, "JPXDecode")));
+    compareGs(premultiplied, "/Alpha true", all(filter(premultiplied, "JPXDecode", { Alpha: true })));
+    const reordered = rgba.slice(), definitions = new DataView(reordered.buffer);
+    // Declare the first raw channel alpha, with G,B,A as the three colors.
+    for (let channel = 0; channel < 4; channel++) {
+      const offset = cdef + 6 + channel * 6;
+      definitions.setUint16(offset + 2, channel === 0 ? 1 : 0);
+      definitions.setUint16(offset + 4, channel === 0 ? 0 : channel);
+    }
+    compareGs(reordered, "", all(filter(reordered, "JPXDecode")));
+    // OpenJPEG 2.5's CDEF reordering loses this leading alpha flag in GS.
+    // Check the declared source channel directly instead.
+    assert(all(filter(reordered, "JPXDecode", { Alpha: true })).every(value => value === 16));
+    const { executeNativeFontPostScript } = await import("../src/pdf/nativeFontPostScript.ts");
+    const { NativeFontPostScriptGlyphContext } = await import("../src/pdf/nativeFontPostScriptGraphics.ts");
+    const gray16 = fixture("gray16"), context = new NativeFontPostScriptGlyphContext();
+    executeNativeFontPostScript(new TextEncoder().encode(`/DeviceGray setcolorspace
+      << /ImageType 1 /Width 8 /Height 8 /BitsPerComponent 16 /ImageMatrix [8 0 0 -8 0 8] /Decode [0 1]
+      /DataSource <${Buffer.from(gray16).toString("hex")}> /JPXDecode filter >> image`), undefined, { glyphContext: context, initialMatrix: [1,0,0,1,0,0], initialDictionary: new Map([["FontType",1]]) });
+    const gray16Samples=all(filter(gray16,"JPXDecode")), rgba16=context.paintRecords[0].rgba;
+    assert(rgba16.every((value,index)=>value===(index%4===3?255:Math.round((gray16Samples[Math.floor(index/4)*2]*256+gray16Samples[Math.floor(index/4)*2+1])/65535*255))),"16-bit filter samples remain usable by font image operators");
     compareGs(gray, "/ColorSpace /Indexed", all(filter(gray, "JPXDecode", { ColorSpace: "Indexed" })));
     const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
     let offset = 0; while (view.getUint32(offset + 4) !== 0x6a703263) offset += view.getUint32(offset);
     const raw = encoded.subarray(offset + 8, offset + view.getUint32(offset));
     assert.deepEqual(all(filter(raw, "JPXDecode")), rgb); compareGs(raw, "", rgb);
+    const graya = fixture("graya"), grayaView = new DataView(graya.buffer);
+    let grayaOffset=0;while(grayaView.getUint32(grayaOffset+4)!==0x6a703263)grayaOffset+=grayaView.getUint32(grayaOffset);
+    const rawPair=graya.subarray(grayaOffset+8,grayaOffset+grayaView.getUint32(grayaOffset));
+    const pair=all(filter(rawPair,"JPXDecode"));assert.equal(pair.length,128);
+    assert(pair.every((value,index)=>value===(index%2===0?64:128)));
+    compareGs(rawPair,"",pair);
     const source = memory(Uint8Array.from([...encoded, 116, 97, 105, 108]));
     const bounded = filter(source, "SubFileDecode", { EODCount: encoded.length, EODString: new Uint8Array() });
     const original = filter(bounded, "JPXDecode"); assert.equal(source.tell(), 0);
@@ -91,7 +136,6 @@ try {
     assert.deepEqual(all(reusable), rgb); reusable.seek(0); assert.deepEqual(all(reusable), rgb);
     const closed = memory(encoded); all(filter(closed, "JPXDecode", { CloseSource: true })); assert(closed.closed);
     failure(() => all(filter(encoded, "JPXDecode", {}, { maxDecodedBytes: 191 })), "resource-limit");
-    failure(() => all(filter(fixture("gray16"), "JPXDecode")), "unsupported-font", "font-postscript-image-filter");
     failure(() => all(filter(encoded.subarray(0, 10), "JPXDecode")), "unsupported-font");
     const aborted = new AbortController(); aborted.abort();
     failure(() => filter(encoded, "JPXDecode", {}, { signal: aborted.signal }).readByte(), "aborted");

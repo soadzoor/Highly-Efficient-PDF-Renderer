@@ -39,7 +39,7 @@ export interface NativeFontPostScriptGraphicsOptions {
 export interface NativeFontPostScriptImageOptions {
   readonly width: number;
   readonly height: number;
-  readonly bitsPerComponent: 1 | 2 | 4 | 8 | 12;
+  readonly bitsPerComponent: 1 | 2 | 4 | 8 | 12 | 16;
   readonly components: number;
   readonly data: Uint8Array;
   readonly decode?: readonly number[];
@@ -388,7 +388,7 @@ export class NativeFontPostScriptGlyphContext {
     if (this.colorLocked && !options.mask) throw unsupported("An uncolored PostScript pattern cannot paint a color image.", "undefined");
     const { width, height, bitsPerComponent: bits, components, data } = options;
     if (!Number.isSafeInteger(width) || width < 0 || !Number.isSafeInteger(height) || height < 0 ||
-      ![1, 2, 4, 8, 12].includes(bits) || !Number.isSafeInteger(components) || components < 1 ||
+      ![1, 2, 4, 8, 12, 16].includes(bits) || !Number.isSafeInteger(components) || components < 1 ||
       (!options.convertColor && ![1, 3, 4].includes(components)) || !(data instanceof Uint8Array) ||
       (options.mask && (bits !== 1 || components !== 1))) throw unsupported("Invalid PostScript glyph image dimensions or samples.", "rangecheck");
     if (width === 0 || height === 0) return;

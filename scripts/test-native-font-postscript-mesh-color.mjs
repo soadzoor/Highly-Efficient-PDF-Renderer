@@ -63,9 +63,34 @@ try {
   const document=await NativePdfDocument.open({kind:"bytes",bytes:writeTinyPdf({objects:[{number:1,body:"<< /Type /Catalog /Pages 2 0 R >>"},{number:2,body:"<< /Type /Pages /Count 0 /Kids [] >>"}]})});
   const registry=new NativePdfColorRegistry(document),index=await registry.add(stream.get("ColorSpace"));
   const rgb=registry.convertToSrgb(index,[.5]);assert(Math.abs(rgb[0]-.25)<.001);assert(Math.abs(rgb[1]-.75)<.001);assert(rgb[2]<.001);
-  assert.throws(()=>run(axial("[/CIEBasedA << /WhitePoint [1 1 1] /RangeA [-1 1] >>]")+" shfill"),e=>e.code==="unsupported-font");
+  const rangedSpace="[/CIEBasedA << /WhitePoint [.95047 1 1.08883] /RangeA [-1 1] /DecodeA {1 add 2 div} /MatrixA [.95047 1 1.08883] >>]";
+  const ranged=axial(rangedSpace).replace("/C0 [0] /C1 [1]", "/C0 [-1] /C1 [1]");
+  const rangedShading=run(ranged+" shfill").paintRecords[0].pattern.shading;
+  assert.deepEqual(rangedShading.get("Function").get("C0"),[0]);
+  assert.deepEqual(rangedShading.get("Function").get("C1"),[1]);
+  const rangedIndex=await registry.add(rangedShading.get("ColorSpace"));
+  const unitIndex=await registry.add(cieContext.paintRecords[0].pattern.shading.get("ColorSpace"));
+  for(const t of [0,.125,.5,.875,1])assert(registry.convertToSrgb(rangedIndex,[t]).every((value,i)=>Math.abs(value-registry.convertToSrgb(unitIndex,[t])[i])<.0001));
+  const rangedMesh=`<< /ShadingType 5 /BBox [0 0 100 100] /ColorSpace ${rangedSpace} /VerticesPerRow 2 /Background [-1] /DataSource [0 0 -1 100 0 1 0 100 -1 100 100 1] >>`;
+  const meshDefinition=run(rangedMesh+" shfill").paintRecords[0].pattern.shading;
+  assert.deepEqual(meshDefinition.dictionary.get("Decode"),[0,100,0,100,0,1]);
+  assert.deepEqual(meshDefinition.dictionary.get("Background"),[0]);
+  const encodedMesh=run(`<< /ShadingType 5 /BBox [0 0 100 100] /ColorSpace ${rangedSpace} /VerticesPerRow 2
+    /BitsPerCoordinate 8 /BitsPerComponent 8 /Decode [0 100 0 100 -1 1] /DataSource <000000ff00ff00ff00ffffff> >> shfill`).paintRecords[0].pattern.shading;
+  assert.deepEqual(encodedMesh.dictionary.get("Decode"),[0,100,0,100,0,1]);
+  for(const fn of [
+    "<< /FunctionType 0 /Domain [0 1] /Range [-1 1] /Size [2] /BitsPerSample 8 /DataSource <00ff> >>",
+    "<< /FunctionType 3 /Domain [0 1] /Functions [<< /FunctionType 2 /Domain [0 1] /C0 [-1] /C1 [1] /N 1 >>] /Bounds [] /Encode [0 1] >>",
+    "[<< /FunctionType 2 /Domain [0 1] /C0 [-1] /C1 [1] /Range [-.5 .5] /N 1 >>]"
+  ]){
+    const definition=ranged.replace(/<< \/FunctionType 2.*?\/N 1 >>/,fn);
+    const normalized=run(definition+" shfill").paintRecords[0].pattern.shading;
+    const {NativePdfFunctionRegistry}=await import("../src/pdf/nativeFunctions.ts");
+    const functions=new NativePdfFunctionRegistry(document),index=await functions.add(Array.isArray(normalized.get("Function"))?normalized.get("Function")[0]:normalized.get("Function"));
+    for(const t of [0,.5,1])assert(Math.abs(functions.evaluate(index,[t])[0]-(fn.startsWith("[")?Math.max(.25,Math.min(.75,t)):t))<.001);
+  }
   assert.throws(()=>run(axial("[/Separation /None /DeviceRGB {pop 1 0 0}]")+" shfill"),e=>e.code==="unsupported-font");
-  const pieces=[...meshes.map(dictionary),cie,spot], marks=pieces.map((value,index)=>`gsave ${index*110} 0 translate ${value} shfill grestore`).join("\n");
+  const pieces=[...meshes.map(dictionary),ranged,spot], marks=pieces.map((value,index)=>`gsave ${index*110} 0 translate ${value} shfill grestore`).join("\n");
   const font=buildType1Fixture({privateExtra:`/OtherSubrs [{} {} {} {} {${marks}}] def`,glyphs:[[".notdef",cs(0,700,"hsbw","endchar")],["A",cs(0,700,"hsbw",0,4,"callothersubr","endchar")]]});
   const pdf=writeTinyPdf({objects:[
     {number:1,body:"<< /Type /Catalog /Pages 2 0 R >>"},{number:2,body:"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"},
@@ -103,11 +128,11 @@ try {
   assert(a.every((value,i)=>value===b[i]),"font shading must match ordinary PDF shading without pixel-array pretty-diff on failure");
   const oracle=spawnSync("gs",["--version"],{encoding:"utf8"});
   if(oracle.status===0){
-    // Compare both inputs with the independent interpreter. This isolates
-    // transcode fidelity from the existing Canvas2D mesh-edge antialiasing.
+    // Check both the transcode and the Canvas2D preview against the interpreter.
     const directory=await mkdtemp(join(tmpdir(),"hep-font-mesh-")),filename=join(directory,"reference.pdf");await writeFile(filename,referencePdf);
+    const psFilename=join(directory,"reference.ps");await writeFile(psFilename,`<< /PageSize [670 120] >> setpagedevice 10 10 translate ${marks} showpage`);
     const args=["-q","-dBATCH","-dNOPAUSE","-sDEVICE=png16m","-r72","-sOutputFile=%stdout"];
-    const ps=spawnSync("gs",[...args,"-c",`<< /PageSize [670 120] >> setpagedevice 10 10 translate ${marks} showpage`],{timeout:10000,maxBuffer:5*1024*1024});
+    const ps=spawnSync("gs",[...args,psFilename],{timeout:10000,maxBuffer:5*1024*1024});
     const pdf=spawnSync("gs",[...args,filename],{timeout:10000,maxBuffer:5*1024*1024});
     for(const result of [ps,pdf])assert.equal(result.status,0,result.stderr.toString());
     const pixels=async bytes=>{const canvas=createCanvas(670,120),ctx=canvas.getContext("2d");ctx.drawImage(await loadImage(bytes),0,0);return ctx.getImageData(0,0,670,120).data;};
@@ -115,6 +140,8 @@ try {
     for(let panel=0;panel<pieces.length;panel++){
       let sum=0;for(let row=20;row<100;row++)for(let col=20+panel*110;col<100+panel*110;col++){const i=(row*670+col)*4;for(let c=0;c<3;c++)sum+=Math.abs(x[i+c]-y[i+c]);}
       const delta=sum/(80*80*3*255);assert(delta<(panel===4?.02:.01),`PostScript-to-PDF mesh/color transcode panel ${panel} error ${delta}`);
+      let previewSum=0;for(let row=20;row<100;row++)for(let col=20+panel*110;col<100+panel*110;col++){const i=(row*670+col)*4;for(let c=0;c<3;c++)previewSum+=Math.abs(x[i+c]-a[i+c]);}
+      const previewDelta=previewSum/(80*80*3*255);assert(previewDelta<.02,`Canvas2D mesh/color panel ${panel} error ${previewDelta}`);
     }
   }
   const blob=await buildHep(pdf,{compression:"deflate",withTextLod:true,withVectorLod:true}),bytes=new Uint8Array(await blob.arrayBuffer()),scene=await loadSceneFromHep(bytes);

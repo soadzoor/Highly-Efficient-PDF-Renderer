@@ -55,6 +55,52 @@ export function decodeBundledJpxSync(request: Readonly<NativeImageCodecRequest>,
   return decodeWithModule(module, request, outputBytes, signal);
 }
 
+/** The PostScript filter exposes packed source samples, including signed and
+ * high precision data. Indexed mode bypasses the wrapper's eight-bit scaling
+ * and JP2 channel remapping; the caller handles the channel definitions. The
+ * plane views are valid only during consume, before OpenJPEG frees its image. */
+export function decodeBundledJpxRawSync(encoded: Uint8Array,
+  consume: (planes: readonly Int32Array[]) => Uint8Array, signal?: AbortSignal): Uint8Array {
+  throwIfAborted(signal);
+  const metadata = readJpxProperties(encoded);
+  if (metadata.components > 4) throw codecError("The bundled raw JPX bridge supports at most four codestream components.", "unsupported-jpx-font-layout");
+  if (!preparedAsset) throw codecError("The JPEG 2000 codec must be prepared before synchronous font decoding.", "codec-not-prepared");
+  let module = preparedModules.get(65536);
+  if (!module) { module = new WebAssembly.Module(capWasmMemory(preparedAsset, 65536)); cachePreparedModule(65536, module); }
+  let output: Uint8Array | undefined;
+  try {
+    const kernel = OpenJPEG({ compiledModule: module, warn: (_message: string) => {},
+      copyRawPixels(heap: Int32Array, pointers: readonly number[], pixelCount: number) {
+        throwIfAborted(signal);
+        if (pixelCount !== metadata.samples[0].width * metadata.samples[0].height || pointers.length !== metadata.components) {
+          throw codecError("JPX decoded planes disagree with the codestream header.", "invalid-jpx-data");
+        }
+        const planes = pointers.map((pointer, component) => {
+          const start = (pointer >>> 0) / 4;
+          const count = metadata.samples[component].width * metadata.samples[component].height;
+          if (!Number.isInteger(start) || !Number.isSafeInteger(count) || start + count > heap.length) throw codecError("Invalid JPX component plane.", "invalid-jpx-data");
+          return heap.subarray(start, start + count);
+        });
+        output = consume(planes);
+      }
+    }) as unknown as JpxKernel;
+    const pointer = kernel._malloc(encoded.length) >>> 0;
+    if (!pointer) throw new PdfError("resource-limit", "JPEG 2000 input allocation failed.");
+    try {
+      kernel.writeArrayToMemory(encoded, pointer);
+      const failed = kernel._jp2_decode(pointer, encoded.length, metadata.components === 2 ? 0 : metadata.components,
+        true, metadata.components === 2, 0);
+      throwIfAborted(signal);
+      if (failed || !output) throw codecError(kernel.errorMessages ?? "Unable to decode raw JPEG 2000 samples.", "invalid-jpx-data");
+      return output;
+    } finally { kernel._free(pointer); }
+  } catch (cause) {
+    throwIfAborted(signal);
+    if (cause instanceof PdfError) throw cause;
+    throw codecError("Unable to decode raw JPEG 2000 samples.", "invalid-jpx-data", cause);
+  }
+}
+
 function validateRequest(request: Readonly<NativeImageCodecRequest>, maxBytes: number, signal?: AbortSignal) {
   throwIfAborted(signal);
   const metadata = readJpxProperties(request.encoded);
@@ -121,7 +167,8 @@ function decodeWithModule(module: WebAssembly.Module, request: Readonly<NativeIm
 }
 
 /** Read the mandatory SIZ marker before allowing any decoder allocations. */
-export function readJpxProperties(bytes: Uint8Array): { width: number; height: number; components: number; singleUnsignedByte: boolean; unsignedBytes: boolean } {
+export function readJpxProperties(bytes: Uint8Array): { width: number; height: number; components: number; singleUnsignedByte: boolean; unsignedBytes: boolean;
+  samples: readonly { precision: number; signed: boolean; dx: number; dy: number; width: number; height: number }[] } {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let start = 0, end = bytes.length;
   if (bytes[0] !== 0xff || bytes[1] !== 0x4f) {
@@ -148,12 +195,19 @@ export function readJpxProperties(bytes: Uint8Array): { width: number; height: n
   const length = view.getUint16(start + 4);
   const width = view.getUint32(start + 8) - view.getUint32(start + 16);
   const height = view.getUint32(start + 12) - view.getUint32(start + 20);
-  if (width <= 0 || height <= 0 || components < 1 || components > 4 ||
+  if (width <= 0 || height <= 0 || components < 1 ||
       length !== 38 + components * 3 || start + 4 + length > end) {
     throw codecError("Invalid JPEG 2000 dimensions or SIZ length.", "invalid-jpx-header");
   }
-  return { width, height, components, singleUnsignedByte: components === 1 && bytes[start + 42] === 7,
-    unsignedBytes: Array.from({ length: components }, (_, i) => bytes[start + 42 + i * 3]).every(value => value === 7) };
+  const samples = Array.from({ length: components }, (_, i) => {
+    const dx = bytes[start + 43 + i * 3], dy = bytes[start + 44 + i * 3];
+    return { precision: (bytes[start + 42 + i * 3] & 127) + 1, signed: (bytes[start + 42 + i * 3] & 128) !== 0, dx, dy,
+      width: Math.ceil(view.getUint32(start + 8) / dx) - Math.ceil(view.getUint32(start + 16) / dx),
+      height: Math.ceil(view.getUint32(start + 12) / dy) - Math.ceil(view.getUint32(start + 20) / dy) };
+  });
+  if (samples.some(sample => !sample.dx || !sample.dy || sample.width <= 0 || sample.height <= 0)) throw codecError("Invalid JPEG 2000 sampling grid.", "invalid-jpx-header");
+  return { width, height, components, samples, singleUnsignedByte: components === 1 && bytes[start + 42] === 7,
+    unsignedBytes: samples.every(sample => sample.precision === 8 && !sample.signed) };
 }
 
 function loadModule(maximumPages: number): Promise<WebAssembly.Module> {

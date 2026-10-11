@@ -136,13 +136,13 @@ export interface HeprCanvas2dBackendOptions {
   readonly maxGradientSubdivisionDepth?: number;
   /** Maximum nonlinear sRGB interpolation error between generated gradient stops. */
   readonly gradientColorTolerance?: number;
-  /** Aggregate solid vector triangles emitted for mesh shadings during one render. */
+  /** Aggregate triangle count, including tessellated patches, during one render. */
   readonly maxMeshTriangles?: number;
-  /** Maximum recursive subdivision depth used to approximate Gouraud interpolation. */
+  /** Subdivision depth allowance for patch tessellation. */
   readonly maxMeshSubdivisionDepth?: number;
-  /** Maximum per-channel sRGB variation within one emitted solid mesh triangle. */
+  /** Legacy compatibility option; triangle colors now use per-sample interpolation. */
   readonly meshColorTolerance?: number;
-  /** Maximum patch-geometry deviation in device pixels before Gouraud subdivision. */
+  /** Maximum patch-geometry deviation in device pixels before coverage sampling. */
   readonly patchFlatnessPixels?: number;
   /** Maximum nesting depth of tiling/shading pattern paints. */
   readonly maxPatternDepth?: number;
@@ -359,7 +359,6 @@ interface MeshVertex {
   readonly y: number;
   readonly components: readonly number[];
   readonly functionInput: number | null;
-  readonly rgb: readonly [number, number, number];
 }
 
 interface PatternTile {
@@ -498,7 +497,6 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
   private colorEvaluator: HeprColorEvaluator | null = null;
   private liveWorkingPixels = 0;
   private emittedMeshTriangles = 0;
-  private diagnosedMeshPrecision = false;
   private diagnosedHairlineApproximation = false;
   private rootCompleted = false;
   private disposed = false;
@@ -2372,27 +2370,15 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
         x: meshes.positions[positionOffset],
         y: meshes.positions[positionOffset + 1],
         components,
-        functionInput,
-        rgb: this.convertColorToSrgb(colorSpaceIndex, components, path)
+        functionInput
       };
     };
-    setCanvasTransform(context, multiplyHeprMatrices(this.deviceMatrix, ownerTransform));
-    context.globalAlpha = alpha;
-    for (let index = indexStart; index < indexEnd; index += 3) {
-      this.options.signal?.throwIfAborted();
-      this.drawGouraudTriangle(
-        context,
-        [
-          readVertex(meshes.indices[index]),
-          readVertex(meshes.indices[index + 1]),
-          readVertex(meshes.indices[index + 2])
-        ],
-        colorSpaceIndex,
-        functionIndices,
-        0,
-        path
-      );
-    }
+    this.drawGouraudMesh(context, function* () {
+      for (let index = indexStart; index < indexEnd; index += 3) {
+        yield [readVertex(meshes.indices[index]), readVertex(meshes.indices[index + 1]),
+          readVertex(meshes.indices[index + 2])] as const;
+      }
+    }, ownerTransform, alpha, colorSpaceIndex, functionIndices, path);
   }
 
   private drawPatchMesh(
@@ -2436,128 +2422,122 @@ export class HeprCanvas2dBackend implements HeprDisplayBackend {
       }
       throw cause;
     }
-    setCanvasTransform(context, localToDevice);
-    context.globalAlpha = alpha;
     const componentCount = tessellation.componentCount;
-    for (let triangle = 0; triangle < tessellation.positions.length / 6; triangle += 1) {
-      this.options.signal?.throwIfAborted();
-      const vertices: MeshVertex[] = [];
-      for (let localVertex = 0; localVertex < 3; localVertex += 1) {
-        const vertex = triangle * 3 + localVertex;
-        const positionOffset = vertex * 2;
-        const componentOffset = vertex * componentCount;
-        const components = [...tessellation.components.subarray(
-          componentOffset,
-          componentOffset + componentCount
-        )];
-        const functionInput = tessellation.functionInputs.length > 0
-          ? tessellation.functionInputs[vertex]
-          : null;
-        vertices.push({
-          x: tessellation.positions[positionOffset],
-          y: tessellation.positions[positionOffset + 1],
-          components,
-          functionInput,
-          rgb: this.convertColorToSrgb(metadata.colorSpaceIndex, components, path)
-        });
+    this.drawGouraudMesh(context, function* () {
+      for (let triangle = 0; triangle < tessellation.positions.length / 6; triangle++) {
+        const vertices: MeshVertex[] = [];
+        for (let localVertex = 0; localVertex < 3; localVertex++) {
+          const vertex = triangle * 3 + localVertex;
+          vertices.push({
+            x: tessellation.positions[vertex * 2], y: tessellation.positions[vertex * 2 + 1],
+            components: [...tessellation.components.subarray(vertex * componentCount, (vertex + 1) * componentCount)],
+            functionInput: tessellation.functionInputs.length > 0 ? tessellation.functionInputs[vertex] : null
+          });
+        }
+        yield vertices as [MeshVertex, MeshVertex, MeshVertex];
       }
-      this.drawGouraudTriangle(
-        context,
-        vertices as [MeshVertex, MeshVertex, MeshVertex],
-        metadata.colorSpaceIndex,
-        metadata.functionIndices,
-        0,
-        path
-      );
-    }
+    }, ownerTransform, alpha, metadata.colorSpaceIndex, metadata.functionIndices, path);
   }
 
-  private drawGouraudTriangle(
+  /** Paint a mesh as one shading. Independent Canvas fills antialias every
+   * internal edge against the backdrop, producing bright seams. Instead assign
+   * each subpixel to one triangle, interpolate source components before color
+   * conversion, then composite coverage once. Small sequential strips keep the
+   * temporary memory proportional to visible width rather than page area. */
+  private drawGouraudMesh(
     context: CanvasRenderingContext2D,
-    vertices: readonly [MeshVertex, MeshVertex, MeshVertex],
+    triangles: () => Iterable<readonly [MeshVertex, MeshVertex, MeshVertex]>,
+    ownerTransform: PdfMatrix,
+    alpha: number,
     colorSpaceIndex: number,
     functionIndices: readonly number[],
-    depth: number,
     path: string
   ): void {
-    this.options.signal?.throwIfAborted();
-    const variation = triangleColorVariation(vertices);
-    if (variation <= this.options.meshColorTolerance) {
-      this.emitSolidTriangle(context, vertices, path);
-      return;
-    }
-    if (depth >= this.options.maxMeshSubdivisionDepth) {
-      throw canvasError(
+    const matrix = multiplyHeprMatrices(this.deviceMatrix, ownerTransform);
+    let left = this.width, top = this.height, right = 0, bottom = 0;
+    for (const vertices of triangles()) {
+      this.options.signal?.throwIfAborted();
+      this.emittedMeshTriangles++;
+      if (this.emittedMeshTriangles > this.options.maxMeshTriangles) throw canvasError(
         HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit,
-        "A mesh shading cannot meet its color tolerance within the subdivision-depth limit.",
-        path
-      );
-    }
-    const midpoint = (first: MeshVertex, second: MeshVertex): MeshVertex => {
-      const functionInput = first.functionInput !== null && second.functionInput !== null
-        ? (first.functionInput + second.functionInput) / 2
-        : null;
-      const components = functionInput === null
-        ? first.components.map((value, index) => (value + second.components[index]) / 2)
-        : this.evaluateFunctions(functionIndices, [functionInput], path);
-      return {
-        x: (first.x + second.x) / 2,
-        y: (first.y + second.y) / 2,
-        components,
-        functionInput,
-        rgb: this.convertColorToSrgb(colorSpaceIndex, components, path)
-      };
-    };
-    const ab = midpoint(vertices[0], vertices[1]);
-    const bc = midpoint(vertices[1], vertices[2]);
-    const ca = midpoint(vertices[2], vertices[0]);
-    const sameVertex = (first: MeshVertex, second: MeshVertex): boolean =>
-      first.x === second.x && first.y === second.y && first.functionInput === second.functionInput &&
-      first.components.every((value, index) => value === second.components[index]);
-    if ([ab, bc, ca].every(middle => vertices.some(vertex => sameVertex(middle, vertex)))) {
-      if (!this.diagnosedMeshPrecision) {
-        this.diagnosedMeshPrecision = true;
-        this.options.onDiagnostic?.({
-          code: "mesh-approximation", severity: "warning", pageIndex: this.page.pageInfo.sourcePageIndex,
-          message: "Mesh subdivision reached numeric precision; colors may differ.",
-          details: { variation, tolerance: this.options.meshColorTolerance }
-        });
+        `Mesh rendering exceeds the aggregate triangle limit ${this.options.maxMeshTriangles}.`, path);
+      for (const vertex of vertices) {
+        const [x, y] = transformCanvasPoint(matrix, vertex.x, vertex.y);
+        left = Math.min(left, x); top = Math.min(top, y);
+        right = Math.max(right, x); bottom = Math.max(bottom, y);
       }
-      this.emitSolidTriangle(context, vertices, path);
-      return;
     }
-    this.drawGouraudTriangle(context, [vertices[0], ab, ca], colorSpaceIndex, functionIndices, depth + 1, path);
-    this.drawGouraudTriangle(context, [ab, vertices[1], bc], colorSpaceIndex, functionIndices, depth + 1, path);
-    this.drawGouraudTriangle(context, [ca, bc, vertices[2]], colorSpaceIndex, functionIndices, depth + 1, path);
-    this.drawGouraudTriangle(context, [ab, bc, ca], colorSpaceIndex, functionIndices, depth + 1, path);
-  }
-
-  private emitSolidTriangle(
-    context: CanvasRenderingContext2D,
-    vertices: readonly [MeshVertex, MeshVertex, MeshVertex],
-    path: string
-  ): void {
-    this.emittedMeshTriangles += 1;
-    if (this.emittedMeshTriangles > this.options.maxMeshTriangles) {
-      throw canvasError(
-        HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit,
-        `Mesh rendering exceeds the aggregate triangle limit ${this.options.maxMeshTriangles}.`,
-        path
-      );
+    left = Math.max(0, Math.floor(left)); top = Math.max(0, Math.floor(top));
+    right = Math.min(this.width, Math.ceil(right)); bottom = Math.min(this.height, Math.ceil(bottom));
+    if (!(right > left && bottom > top)) return;
+    const width = right - left, stripHeight = Math.min(32, bottom - top), sampling = 2;
+    const layer = this.allocateSurface("mesh coverage strip", width * sampling, stripHeight * sampling);
+    const cpuPixels = layer.accountedPixels;
+    if (cpuPixels > this.options.maxWorkingPixels - this.liveWorkingPixels - (this.sharedImages?.pixelCount ?? 0)) {
+      this.releaseSurface(layer);
+      throw canvasError(HEPR_CANVAS_2D_ERROR_CODES.ResourceLimit, "Mesh sample buffer exceeds the Canvas2D working-pixel limit.", path);
     }
-    const rgb: [number, number, number] = [0, 0, 0];
-    for (const vertex of vertices) {
-      rgb[0] += vertex.rgb[0] / 3;
-      rgb[1] += vertex.rgb[1] / 3;
-      rgb[2] += vertex.rgb[2] / 3;
+    this.liveWorkingPixels += cpuPixels;
+    context.save();
+    try {
+      const image = layer.surface.context.createImageData(width * sampling, stripHeight * sampling);
+      const pixels = image.data, stride = width * sampling;
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.globalAlpha = alpha;
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "low";
+      for (let row = top; row < bottom; row += stripHeight) {
+        const rows = Math.min(stripHeight, bottom - row);
+        pixels.fill(0);
+        for (const source of triangles()) {
+          this.options.signal?.throwIfAborted();
+          const points = source.map(vertex => transformCanvasPoint(matrix, vertex.x, vertex.y));
+          // Reversing an edge negates the same coefficients, so adjacent
+          // triangles agree on ownership even with fractional coordinates.
+          const edge = (a: readonly number[], b: readonly number[], x: number, y: number): number =>
+            (a[1] - b[1]) * x + (b[0] - a[0]) * y + (a[0] * b[1] - a[1] * b[0]);
+          let area = edge(points[0], points[1], points[2][0], points[2][1]);
+          if (!Number.isFinite(area) || area === 0) continue;
+          const vertices = [...source];
+          if (area < 0) { [points[1], points[2]] = [points[2], points[1]]; [vertices[1], vertices[2]] = [vertices[2], vertices[1]]; area = -area; }
+          const minX = Math.max(0, Math.floor((Math.min(...points.map(p => p[0])) - left) * sampling));
+          const maxX = Math.min(stride, Math.ceil((Math.max(...points.map(p => p[0])) - left) * sampling));
+          const minY = Math.max(0, Math.floor((Math.min(...points.map(p => p[1])) - row) * sampling));
+          const maxY = Math.min(rows * sampling, Math.ceil((Math.max(...points.map(p => p[1])) - row) * sampling));
+          const inclusive = points.map((a, index) => {
+            const b = points[(index + 1) % 3];
+            return b[1] > a[1] || (b[1] === a[1] && b[0] < a[0]);
+          });
+          const components = Array(vertices[0].components.length).fill(0);
+          for (let y = minY; y < maxY; y++) {
+            this.options.signal?.throwIfAborted();
+            for (let x = minX; x < maxX; x++) {
+              const px = left + (x + 0.5) / sampling, py = row + (y + 0.5) / sampling;
+              const ab = edge(points[0], points[1], px, py), bc = edge(points[1], points[2], px, py), ca = edge(points[2], points[0], px, py);
+              if (ab < 0 || bc < 0 || ca < 0 || (ab === 0 && !inclusive[0]) || (bc === 0 && !inclusive[1]) || (ca === 0 && !inclusive[2])) continue;
+              const weights = [bc / area, ca / area, ab / area];
+              let values: readonly number[];
+              if (vertices[0].functionInput !== null) {
+                const input = vertices.reduce((sum, vertex, index) => sum + vertex.functionInput! * weights[index], 0);
+                values = this.evaluateFunctions(functionIndices, [input], path);
+              } else {
+                for (let component = 0; component < components.length; component++) components[component] = vertices.reduce((sum, vertex, index) => sum + vertex.components[component] * weights[index], 0);
+                values = components;
+              }
+              const rgb = this.convertColorToSrgb(colorSpaceIndex, values, path), offset = (y * stride + x) * 4;
+              pixels[offset] = Math.round(clamp01(rgb[0]) * 255); pixels[offset + 1] = Math.round(clamp01(rgb[1]) * 255);
+              pixels[offset + 2] = Math.round(clamp01(rgb[2]) * 255); pixels[offset + 3] = 255;
+            }
+          }
+        }
+        layer.surface.context.putImageData(image, 0, 0);
+        context.drawImage(layer.surface.canvas, 0, 0, stride, rows * sampling, left, row, width, rows);
+      }
+    } finally {
+      context.restore();
+      this.releasePixels(cpuPixels);
+      this.releaseSurface(layer);
     }
-    context.beginPath();
-    context.moveTo(vertices[0].x, vertices[0].y);
-    context.lineTo(vertices[1].x, vertices[1].y);
-    context.lineTo(vertices[2].x, vertices[2].y);
-    context.closePath();
-    context.fillStyle = rgbCss(...rgb);
-    context.fill("nonzero");
   }
 
   private evaluateFunctions(
@@ -3730,22 +3710,6 @@ function stopInterpolationError(
     );
   }
   return error;
-}
-
-function triangleColorVariation(
-  vertices: readonly [MeshVertex, MeshVertex, MeshVertex]
-): number {
-  let variation = 0;
-  for (let component = 0; component < 3; component += 1) {
-    const first = vertices[0].rgb[component];
-    const second = vertices[1].rgb[component];
-    const third = vertices[2].rgb[component];
-    variation = Math.max(
-      variation,
-      Math.max(first, second, third) - Math.min(first, second, third)
-    );
-  }
-  return variation;
 }
 
 function deviceCorners(width: number, height: number): readonly (readonly [number, number])[] {
