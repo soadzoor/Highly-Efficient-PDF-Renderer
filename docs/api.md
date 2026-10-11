@@ -1260,6 +1260,9 @@ Unsupported Type1 loader code that leaves readable declarative records uses
 `font.type1-postscript-approximated`; failures computing required records can
 still use the configured substitute resolver.
 
+Track remaining JPX, spot-shading and physical press-calibration work in the
+[font-local PostScript follow-up checklist](development.md#font-local-postscript-follow-ups).
+
 The CFF v1 engine also supports Expert encodings and charsets, Type1 and Type2
 charstrings, deterministic Type2 `random`, named FontSets, SyntheticBase
 inheritance and legacy Multiple Master interpolation. CFF2 supports variation

@@ -122,6 +122,59 @@ recorded results and limits.
 
 ## Performance and fidelity
 
+### Font-local PostScript follow-ups
+
+Open as of 2026-10-11. These are remaining compatibility and fidelity tasks for
+embedded font programs, not a commitment to a general PostScript interpreter.
+The [API reference](api.md#rendering-compatibility-and-diagnostics) describes current support.
+
+- [ ] **JPX palette/channel mappings:** expand JP2 `pclr`/`cmap` mappings into
+  the correct output channels, while preserving the intentional raw-index
+  behavior of `/ColorSpace /Indexed`. Check palette precision, signed entries,
+  channel order and interactions with opacity definitions.
+- [ ] **JPX multiple alpha planes:** define selection/compositing semantics for
+  multiple opacity planes and their channel associations. The current `Alpha`
+  filter parameter exposes one plane; do not silently collapse distinct planes
+  into one or apply opacity to unrelated color channels.
+- [ ] **JPX mixed component precision:** define the filter's output packing for
+  components with different precisions and signedness, then preserve those
+  samples or diagnose any necessary conversion. Current support requires a
+  common precision across components.
+- [ ] **JPX more than four codestream components:** extend the bundled raw-plane
+  bridge, including cases such as CMYK plus alpha, and retain all required
+  color/opacity channels. The current four-component restriction is a bridge
+  capability gap, not a configurable memory-budget policy.
+- [ ] **Transparent spot shadings:** preserve nonpainting colorants such as
+  Separation `/None` and any resulting coverage through shading compilation,
+  compositing and HEP export/reload. Do not replace transparent regions with
+  opaque RGB colors.
+- [ ] **High-dimensional spot shadings:** support source/CRD transforms with
+  more than four inputs. Avoid unrestricted exponential sampling; investigate
+  adaptive or alternative representations that honor caller byte/operation
+  budgets and cancellation without adding a fixed component-count resource cap.
+- [ ] **Physical press simulation beyond supplied profiles:** obtain suitable
+  printer/ink/paper calibration data and independent reference output before
+  defining additional proofing behavior, including screening where applicable.
+  Existing CRD handling, `DefaultCMYK` and embedded output-intent profiles provide
+  display calibration; they cannot reconstruct unrecorded physical conditions.
+  This item depends on external calibration evidence as well as implementation.
+
+Start JPX work in [`nativeFontPostScriptJpx.ts`](../src/pdf/nativeFontPostScriptJpx.ts)
+and [`nativeJpxCodec.ts`](../src/pdf/nativeJpxCodec.ts), shading work in
+[`nativeFontPostScriptShading.ts`](../src/pdf/nativeFontPostScriptShading.ts), and
+profile work in [`nativeColor.ts`](../src/pdf/nativeColor.ts). Existing focused
+regressions are [`test-native-font-postscript-jpx.mjs`](../scripts/test-native-font-postscript-jpx.mjs),
+[`test-native-font-postscript-mesh-color.mjs`](../scripts/test-native-font-postscript-mesh-color.mjs)
+and [`test-native-font-postscript-cmyk-profile.mjs`](../scripts/test-native-font-postscript-cmyk-profile.mjs).
+
+For each completed item, add small synthetic fixtures and check decoded samples
+or pixels against an independent decoder/interpreter where it supports the case.
+Verify PDF-to-HEP export/reload, diagnostics, caller limits and cancellation.
+Keep validation sequential with memory measurements; real-PDF batch conversion
+and browser/GPU visual checks remain manual. Update the API limitations and this
+checklist together when support lands. Unsupported cases should continue to
+retain usable content with diagnostics where possible.
+
 ### Manual PDF layer and effect checks
 
 After running type checking and the fast synthetic suites, manually check both

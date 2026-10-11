@@ -61,6 +61,7 @@ usage and the [container specification](HEP_CONTAINER.md) for the wire format.
 
 - [HEP container specification](HEP_CONTAINER.md): layout, compression, checksums, and resource limits.
 - [Development validation](development-validation.md): test suites, CI scope, and manual checks.
+- [Font-local PostScript follow-ups](development.md#font-local-postscript-follow-ups): open JPX, spot-shading and press-calibration tasks.
 - [Parser benchmarks](parser-benchmark.md): measurement commands, recorded results, and remaining validation gates.
 - [Visual regression checks](visual-regressions.md): appearance checkpoints and renderer statistics.
 - [Room detector quality](room-detector-quality.md): evaluation results and known limits.
