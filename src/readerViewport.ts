@@ -97,6 +97,8 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   const rows: HTMLButtonElement[] = [], rowTops: number[] = [];
   let scratchCanvas: HTMLCanvasElement | null = null, scratchRenderer: WebGlFloorplanRenderer | null = null;
   const pointers = new Map<number, { x: number; y: number }>();
+  let pinch: { distance: number; zoom: number; x: number; y: number } | null = null;
+  let pinched = false;
   let lastTouchTime = 0, velocityX = 0, velocityY = 0;
 
   const isActive = (): boolean => active;
@@ -200,12 +202,15 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     for (const pointerId of pointers.keys()) {
       if (attachedCanvas?.hasPointerCapture(pointerId)) attachedCanvas.releasePointerCapture(pointerId);
     }
-    pointers.clear(); velocityX = velocityY = 0;
+    pointers.clear(); pinch = null; pinched = false; velocityX = velocityY = 0;
+  }
+  function prepareZoom(nextZoom: number): void {
+    stopInertia(); navigationTarget = null; fit = null; zoom = nextZoom; initialView = false;
+    sizeSurface();
   }
   function setView(view: ReaderCameraView): void {
     if (!Number.isFinite(view.zoom) || view.zoom <= 0 || !Number.isFinite(view.centerX) || !Number.isFinite(view.centerY)) return;
-    stopInertia(); navigationTarget = null; fit = null; zoom = view.zoom; initialView = false; savedView = view;
-    sizeSurface(); positionView(view); present();
+    savedView = view; prepareZoom(view.zoom); positionView(view); present();
   }
   function zoomAt(nextZoom: number, x = metrics.width / 2, y = metrics.height / 2): void {
     setView(readerZoomAt(getView(), nextZoom, x, y));
@@ -358,6 +363,17 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     }
     void pumpThumbnails();
   }
+  function beginPinch(): void {
+    pinch = null;
+    const [first, second] = pointers.values();
+    if (!first || !second) return;
+    const distance = Math.hypot(first.x - second.x, first.y - second.y);
+    if (distance <= 0) return;
+    const view = getView(), bounds = attachedCanvas!.getBoundingClientRect();
+    pinch = { distance, zoom: view.zoom,
+      x: view.centerX + ((first.x + second.x) / 2 - bounds.left - view.width / 2) / view.zoom,
+      y: view.centerY - ((first.y + second.y) / 2 - bounds.top - view.height / 2) / view.zoom };
+  }
   function canvasChanged(): void {
     cancelActiveGesture(); canvasLifetime?.abort();
     attachedCanvas = options.getCanvas(); surface.append(attachedCanvas);
@@ -373,25 +389,30 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     attachedCanvas.addEventListener("pointerdown", event => {
       if (!active || event.button !== 0) return;
       stopInertia(); scroller.focus({ preventScroll: true });
+      if (!pointers.size) pinched = false;
       pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pointers.size === 2) { pinched = true; beginPinch(); }
       lastTouchTime = performance.now(); velocityX = velocityY = 0;
       attachedCanvas!.setPointerCapture(event.pointerId);
     }, { signal });
     attachedCanvas.addEventListener("pointermove", event => {
       const previous = pointers.get(event.pointerId);
       if (!active || !previous) return;
-      const oldPoints = [...pointers.values()];
       pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       const points = [...pointers.values()];
       if (points.length >= 2) {
-        const oldDistance = Math.hypot(oldPoints[0].x - oldPoints[1].x, oldPoints[0].y - oldPoints[1].y);
         const distance = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
-        const oldX = (oldPoints[0].x + oldPoints[1].x) / 2, oldY = (oldPoints[0].y + oldPoints[1].y) / 2;
         const x = (points[0].x + points[1].x) / 2, y = (points[0].y + points[1].y) / 2;
-        scroller.scrollLeft -= x - oldX; scroller.scrollTop -= y - oldY;
-        if (oldDistance > 0 && distance > 0) {
+        if (!pinch) beginPinch();
+        if (pinch && distance > 0) {
+          const nextZoom = pinch.zoom * distance / pinch.distance;
+          if (!Number.isFinite(nextZoom) || nextZoom <= 0) return;
+          // Solve from the original document anchor, without accumulating clamped scroll offsets.
+          prepareZoom(nextZoom);
           const bounds = attachedCanvas!.getBoundingClientRect();
-          zoomAt(zoom * distance / oldDistance, x - bounds.left, y - bounds.top);
+          positionView({ centerX: pinch.x - (x - bounds.left - metrics.width / 2) / zoom,
+            centerY: pinch.y + (y - bounds.top - metrics.height / 2) / zoom, zoom });
+          present();
         }
         velocityX = velocityY = 0;
       } else {
@@ -403,8 +424,15 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       }
     }, { signal });
     const end = (event: PointerEvent): void => {
+      const [first, second] = pointers.keys();
       if (!pointers.delete(event.pointerId)) return;
       if (attachedCanvas?.hasPointerCapture(event.pointerId)) attachedCanvas.releasePointerCapture(event.pointerId);
+      if (pinched) {
+        if (event.pointerId === first || event.pointerId === second) beginPinch();
+        lastTouchTime = performance.now(); velocityX = velocityY = 0;
+        // Finger-lift motion at the end of a pinch must not launch a scrolling flick.
+        return;
+      }
       if (event.pointerType !== "touch" || pointers.size || event.type !== "pointerup" || performance.now() - lastTouchTime > 100) return;
       let last = performance.now();
       const glide = (now: number): void => {

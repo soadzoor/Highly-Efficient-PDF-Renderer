@@ -385,6 +385,109 @@ try {
     reader.cancelActiveGesture(); assert.equal(env.frames.size,0,"gesture cancellation stops pending inertial scrolling");
     reader.dispose();
   }
+  for (const edge of ["top", "bottom"]) {
+    const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
+    reader.setDocument({identity:`pinch-${edge}-edge`,pageRects:pageRects(4)}); reader.setLayout("reader");
+    reader.setView({centerX:0,centerY:edge === "top" ? 0 : -3248,zoom:2});
+    const scroller = doc.querySelector(".reader-scroll"), canvas = env.canvas, bounds = canvas.getBoundingClientRect();
+    const initial = reader.getView();
+    assert.equal(scroller.scrollTop, edge === "top" ? 0 : scroller.scrollHeight-scroller.clientHeight);
+    const anchorX = initial.centerX + (350-bounds.left-initial.width/2)/initial.zoom;
+    const anchorY = initial.centerY - (300-bounds.top-initial.height/2)/initial.zoom;
+    canvas.emit("pointerdown", {pointerId:1,pointerType:"touch",clientX:250,clientY:300});
+    canvas.emit("pointerdown", {pointerId:2,pointerType:"touch",clientX:450,clientY:300});
+    const movedY = edge === "top" ? 350 : 250;
+    canvas.emit("pointermove", {pointerId:2,pointerType:"touch",clientX:500,clientY:movedY});
+    const pinched = reader.getView(), midpointY = (300+movedY)/2;
+    close(pinched.zoom, initial.zoom*Math.hypot(250,50)/200, `${edge} edge pinch uses the finger distance`);
+    close(pinched.centerX + (375-bounds.left-pinched.width/2)/pinched.zoom, anchorX,
+      `${edge} edge applies pinch translation and zoom together horizontally`);
+    close(pinched.centerY - (midpointY-bounds.top-pinched.height/2)/pinched.zoom, anchorY,
+      `${edge} edge applies pinch translation and zoom together vertically`);
+    reader.dispose();
+  }
+  {
+    const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
+    reader.setDocument({identity:"pinch-clamped-round-trip",pageRects:pageRects(10)}); reader.setLayout("reader");
+    reader.setView({centerX:80,centerY:-5000,zoom:2});
+    const initial = reader.getView(), scroller = doc.querySelector(".reader-scroll"), canvas = env.canvas;
+    canvas.emit("pointerdown", {pointerId:1,pointerType:"touch",clientX:250,clientY:300});
+    canvas.emit("pointerdown", {pointerId:2,pointerType:"touch",clientX:450,clientY:300});
+    for (let round = 0; round < 3; round++) {
+      for (const [pointerId,clientX,clientY] of [[1,300,330],[2,430,280],[1,348,300],[2,352,300]]) {
+        canvas.emit("pointermove", {pointerId,pointerType:"touch",clientX,clientY});
+      }
+      assert.equal(scroller.scrollTop, 0, "zooming far out temporarily fits the entire document");
+      assert.equal(scroller.scrollLeft, 0, "zooming far out temporarily fits the document width");
+      if (round === 0) {
+        canvas.emit("pointerdown", {pointerId:3,pointerType:"touch",clientX:500,clientY:500});
+        canvas.emit("pointermove", {pointerId:3,pointerType:"touch",clientX:520,clientY:510});
+        canvas.emit("pointerup", {pointerId:3,pointerType:"touch",clientX:520,clientY:510});
+      }
+      for (const [pointerId,clientX,clientY] of [[2,480,320],[1,220,280],[2,450,300],[1,250,300]]) {
+        canvas.emit("pointermove", {pointerId,pointerType:"touch",clientX,clientY});
+      }
+      const restored = reader.getView();
+      close(restored.zoom, initial.zoom, "returning both fingers restores the original zoom");
+      close(restored.centerX, initial.centerX, "alternating finger moves restore horizontal focus after clamping");
+      close(restored.centerY, initial.centerY, "alternating finger moves restore vertical focus after clamping");
+    }
+    reader.cancelActiveGesture();
+    const cancelledView = reader.getView();
+    canvas.emit("pointermove", {pointerId:1,pointerType:"touch",clientX:200,clientY:300});
+    canvas.emit("pointerup", {pointerId:2,pointerType:"touch",clientX:450,clientY:300});
+    env.flushFrames(performance.now()+16);
+    assert.deepEqual(reader.getView(), cancelledView, "cancelled pinches ignore subsequent pointer events");
+    assert(!canvas.hasPointerCapture(1) && !canvas.hasPointerCapture(2));
+    reader.dispose();
+  }
+  {
+    const env = environment(), reader = createReaderViewport(env.options);
+    reader.setDocument({identity:"pinch-coincident-fingers",pageRects:pageRects(4)}); reader.setLayout("reader");
+    reader.setView({centerX:0,centerY:-1000,zoom:2});
+    const canvas = env.canvas, initial = reader.getView();
+    canvas.emit("pointerdown", {pointerId:1,pointerType:"touch",clientX:350,clientY:300});
+    canvas.emit("pointerdown", {pointerId:2,pointerType:"touch",clientX:350,clientY:300});
+    canvas.emit("pointermove", {pointerId:1,pointerType:"touch",clientX:300,clientY:300});
+    assert.deepEqual(reader.getView(), initial, "coincident fingers establish a finite baseline when they separate");
+    canvas.emit("pointermove", {pointerId:2,pointerType:"touch",clientX:400,clientY:300});
+    const expanded = reader.getView();
+    close(expanded.zoom, initial.zoom*2, "a pinch starting at zero distance can zoom after separation");
+    canvas.emit("pointermove", {pointerId:1,pointerType:"touch",clientX:400,clientY:300});
+    assert.deepEqual(reader.getView(), expanded, "crossing through zero finger distance preserves the last valid view");
+    canvas.emit("pointermove", {pointerId:1,pointerType:"touch",clientX:300,clientY:300});
+    assert.deepEqual(reader.getView(), expanded, "separating again restores the same pinch focus and zoom");
+    reader.cancelActiveGesture();
+    env.flushFrames(performance.now()+16);
+    assert.deepEqual(reader.getView(), expanded, "cancelling a degenerate pinch leaves its valid view stable");
+    assert.equal(env.frames.size, 0);
+    reader.dispose();
+  }
+  for (const firstLift of [1,2]) {
+    const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
+    reader.setDocument({identity:`pinch-lift-${firstLift}`,pageRects:pageRects(10)}); reader.setLayout("reader");
+    reader.setView({centerX:0,centerY:-3000,zoom:2});
+    const scroller = doc.querySelector(".reader-scroll"), canvas = env.canvas;
+    canvas.emit("pointerdown", {pointerId:1,pointerType:"touch",clientX:250,clientY:300});
+    canvas.emit("pointerdown", {pointerId:2,pointerType:"touch",clientX:450,clientY:300});
+    canvas.emit("pointermove", {pointerId:2,pointerType:"touch",clientX:500,clientY:300});
+    canvas.emit("pointerup", {pointerId:firstLift,pointerType:"touch",clientX:firstLift === 1 ? 250 : 500,clientY:300});
+    const remaining = firstLift === 1 ? 2 : 1, clientX = remaining === 1 ? 250 : 500;
+    canvas.emit("pointermove", {pointerId:remaining,pointerType:"touch",clientX,clientY:299});
+    const beforeRelease = reader.getView();
+    canvas.emit("pointerup", {pointerId:remaining,pointerType:"touch",clientX,clientY:299});
+    env.flushFrames(performance.now()+16);
+    assert.deepEqual(reader.getView(), beforeRelease, "lifting either finger after a pinch does not launch inertial scrolling");
+    assert.equal(env.frames.size, 0, "pinch release does not leave an inertial scrolling frame");
+    assert(!canvas.hasPointerCapture(1) && !canvas.hasPointerCapture(2));
+    const beforeFlick = scroller.scrollTop;
+    canvas.emit("pointerdown", {pointerId:3,pointerType:"touch",clientX:350,clientY:400});
+    canvas.emit("pointermove", {pointerId:3,pointerType:"touch",clientX:350,clientY:390});
+    canvas.emit("pointerup", {pointerId:3,pointerType:"touch",clientX:350,clientY:390});
+    env.flushFrames(performance.now()+16);
+    assert(scroller.scrollTop > beforeFlick+10, "a new single-finger gesture still produces normal flick inertia after a pinch");
+    reader.dispose();
+  }
   {
     const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
     reader.setDocument({ identity: "one-page", pageRects: pageRects(1, 400) }); reader.setLayout("reader");

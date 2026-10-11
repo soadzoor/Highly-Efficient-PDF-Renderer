@@ -6,6 +6,12 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep touchscreen pinch zoom focused on the original document point in Reader,
+  including at scroll boundaries, and prevent finger-lift motion from launching
+  unintended inertial scrolling in both demos.
+
 ## [0.1.60] - 2026-10-11
 
 ### Added
