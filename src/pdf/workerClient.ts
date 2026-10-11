@@ -589,6 +589,7 @@ class PdfWorkerConnection {
       options: {
         ...(options.ocrTextOnly === undefined ? {} : { ocrTextOnly: options.ocrTextOnly }),
         ...(options.previewMaxDimension === undefined ? {} : { previewMaxDimension: options.previewMaxDimension }),
+        ...(options.previewAppearance === undefined ? {} : { previewAppearance: options.previewAppearance }),
         limits: options.limits,
         optimization: options.optimization,
         enableSegmentMerge: options.enableSegmentMerge,

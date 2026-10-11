@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import * as THREE from "three";
-import {
+registerHooks({ resolve(specifier, context, next) {
+  return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) &&
+    !/\.[a-z0-9]+$/i.test(specifier) ? `${specifier}.ts` : specifier, context);
+} });
+const {
   applyExamplePageLayout,
   computeExamplePageLayout,
   easeOutExpo,
   ExamplePageLayoutAnimator,
-  interpolateExamplePageLayout
-} from "../src/examplePageLayouts.ts";
+  interpolateExamplePageLayout,
+  READER_PAGE_GAP
+} = await import("../src/examplePageLayouts.ts");
 
 const A4 = { width: 595, height: 842 };
 const front = new THREE.Vector3(0, 0, 1);
@@ -36,6 +42,26 @@ function minCenterDistance(targets) {
     for (let b = a + 1; b < targets.length; b++) min = Math.min(min, targets[a].position.distanceTo(targets[b].position));
   }
   return min;
+}
+
+// Reader pages form one centered, front-facing column with exact gaps.
+{
+  const pages = gridPages(4, 2, index => index === 1 ? { width: 1200, height: 400 } : A4);
+  const targets = computeExamplePageLayout("reader", pages);
+  assertFinite(targets);
+  assert.equal(targets[0].position.y + pages[0].height / 2, 0, "the first page begins at the reader's top");
+  targets.forEach((target, index) => {
+    assert.equal(target.position.x, 0);
+    assert.equal(target.position.z, 0);
+    assert.ok(target.quaternion.equals(new THREE.Quaternion()));
+    if (index > 0) {
+      const previousBottom = targets[index - 1].position.y - pages[index - 1].height / 2;
+      const currentTop = target.position.y + pages[index].height / 2;
+      assert.equal(previousBottom - currentTop, READER_PAGE_GAP);
+    }
+  });
+  assert.deepEqual(computeExamplePageLayout("reader", []), []);
+  assert.equal(computeExamplePageLayout("reader", gridPages(1, 1))[0].position.y, -A4.height / 2);
 }
 
 // Grid is the loaded layout, unrotated.

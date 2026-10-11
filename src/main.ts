@@ -16,8 +16,9 @@ import { createPdfAnnotationControls } from "./pdfAnnotationControls";
 import { waitForLoad, yieldAfterPaint, yieldForLoad } from "./loadCancellation";
 import { warmViewerRendering } from "./viewerRenderWarmup";
 
-import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
+import { WebGlFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlFloorplanRenderer";
 import {
+  composeVectorScenesInColumn,
   composeVectorScenesInGrid,
   extractPdfPageScenes,
   type Bounds,
@@ -78,6 +79,11 @@ import {
 } from "./sceneStatistics";
 import type { SearchHighlightSet } from "./rendererTypes";
 import { createDrawCallMeter } from "./drawCallMetrics";
+import { ScenePageViews } from "./scenePageViews";
+import { createReaderViewport, type ReaderView, type ReaderViewportSnapshot } from "./readerViewport";
+import { computeReaderPageRects, readerCaptureAnchor } from "./readerGeometry";
+import { createDefaultOptionalContentSnapshot } from "./optionalContent";
+import { buildRasterScenePreview } from "./pageRasterPreview";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#viewport");
 const hudElement = document.querySelector<HTMLDivElement>("#hud");
@@ -230,6 +236,24 @@ const vectorOpacityInputElement = vectorOpacityInput;
 let renderer: RendererApi;
 let webGpuRendererClass: typeof import("./webGpuFloorplanRenderer").WebGpuFloorplanRenderer | null = null;
 let lastParsedScene: VectorScene | null = null;
+// Reader transforms are presentation state. HEP exports keep the original grid.
+let lastCanonicalScene: VectorScene | null = null;
+let documentPageScenes: VectorScene[] | null = null;
+let canonicalPagesPerRow = 1;
+let nativeLayout: "reader" | "grid" = "grid";
+let readerViewport: ReturnType<typeof createReaderViewport> | null = null;
+let layoutChangeRunning = false;
+let gridViewState: ViewState | null = null;
+let readerViewState: ReaderViewportSnapshot | null = null;
+interface NativeLoadPreparation {
+  scene: VectorScene;
+  pageLoader: PdfPageDemandLoader | null;
+  identity: unknown;
+  commit(): void;
+  rollback(): void;
+}
+let nativeLoadPreparation: NativeLoadPreparation | null = null;
+const thumbnailPartitions = new WeakMap<VectorScene, ScenePageViews>();
 let activePdfPageLoader: PdfPageDemandLoader | null = null;
 let demandPdfUpdateTimer: number | null = null;
 let demandPdfUpdateRunning = false;
@@ -283,7 +307,8 @@ textSearchController = createTextSearchController({
   getRenderer: () => renderer,
   getCanvas: () => canvasElement,
   onStateChange: (state) => textSearchWidget.applyState(state),
-  onMatchesChange: applySearchHighlights
+  onMatchesChange: applySearchHighlights,
+  navigateToView: navigateNativeView
 });
 
 function applyTextSearchScene(scene: VectorScene): void {
@@ -311,6 +336,7 @@ const textSelection = createTextSelectionController({
     setCameraInteractionEnabled: (interactionEnabled) => {
       if (!interactionEnabled) {
         canvasInteractionController.cancelActiveGesture();
+        readerViewport?.cancelActiveGesture();
       }
     }
   }
@@ -345,6 +371,7 @@ const drawingSelection = createDrawingSelectionControls({
     if (enabled) {
       textSelection.disable();
       canvasInteractionController.cancelActiveGesture();
+      readerViewport?.cancelActiveGesture();
     } else if (textSelectionCheckbox.checked) textSelection.enable();
   }
 });
@@ -355,7 +382,10 @@ const linkNavigation = createViewerLinkNavigation({
   getScene: () => lastParsedScene,
   getIdentity: () => renderer,
   getSourceUrl: () => lastDownloadablePdf?.url,
-  beforeNavigate: () => canvasInteractionController.cancelActiveGesture(),
+  beforeNavigate: () => {
+    canvasInteractionController.cancelActiveGesture();
+    readerViewport?.cancelActiveGesture();
+  },
   getView: () => {
     if (!renderer) return null;
     const view = renderer.getViewState();
@@ -364,7 +394,7 @@ const linkNavigation = createViewerLinkNavigation({
   },
   setView: view => {
     const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
-    renderer.setViewState({ cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio });
+    navigateNativeView({ cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio });
   }
 });
 const annotationOverlay = createAnnotationOverlay({
@@ -399,6 +429,7 @@ const layerVisibility = createLayerVisibilityController({
     drawingSelection.onFrame();
     annotationInteraction?.onFrame();
     annotationOverlay.onFrame();
+    readerViewport?.invalidateThumbnails();
   }
 });
 const pdfLayerControls = createPdfLayerControls({
@@ -448,7 +479,7 @@ annotationInteraction = createAnnotationInteractionController({
 let lastRuntimeTextUpdate = -Infinity;
 function onRendererFrame(stats: DrawStats): void {
   const now = performance.now();
-  if (activePdfPageLoader && lastParsedScene && activeSceneLoadToken === null &&
+  if (activePdfPageLoader && lastParsedScene && activeSceneLoadToken === null && !layoutChangeRunning &&
       pendingSourceLoadCount === 0 && activeHepExportController === null) {
     // Demand follows every presented frame, including the final frame of a short zoom.
     // Scene uploads remain coalesced separately by scheduleDemandPdfUpdate.
@@ -490,12 +521,12 @@ function scheduleDemandPdfUpdate(): void {
   demandPdfUpdateTimer = window.setTimeout(() => {
     demandPdfUpdateTimer = null;
     const loader = activePdfPageLoader;
-    if (!loader || activePdfPageLoader !== loader || activeSceneLoadToken !== null ||
+    if (!loader || activePdfPageLoader !== loader || activeSceneLoadToken !== null || layoutChangeRunning ||
         pendingSourceLoadCount > 0 || activeHepExportController !== null) return;
     demandPdfUpdatePending = false;
     demandPdfUpdateRunning = true;
     void backendSwitcher!.runWhenIdle(async () => {
-      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || activeHepExportController !== null) {
+      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || layoutChangeRunning || pendingSourceLoadCount > 0 || activeHepExportController !== null) {
         demandPdfUpdatePending = true; return;
       }
       const transitionStarted = performance.now();
@@ -504,7 +535,9 @@ function scheduleDemandPdfUpdate(): void {
         const staged = renderer.prepareRasterLayerUpdatesAsync
           ? await renderer.prepareRasterLayerUpdatesAsync(update.layers) : renderer.prepareRasterLayerUpdates(update.layers);
         try {
-          if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+          if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || layoutChangeRunning) {
+            demandPdfUpdatePending = true; return;
+          }
           if (!lastParsedScene || !loader.isDisplayUpdateCurrent(lastParsedScene, update)) {
             demandPdfUpdatePending = true; return;
           }
@@ -516,20 +549,26 @@ function scheduleDemandPdfUpdate(): void {
       }
       const composeStarted = performance.now();
       const pageScenes = loader.displayPageScenes;
-      const composed = composeVectorScenesInGrid(pageScenes, computeAutoPagesPerRow(loader.pageCount));
+      const composed = nativeLayout === "reader" ? composeVectorScenesInColumn(pageScenes)
+        : composeVectorScenesInGrid(pageScenes, canonicalPagesPerRow);
       renderer.recordPerformanceTransition?.("pageSwap.compose", performance.now() - composeStarted);
       const prepareStarted = performance.now();
-      const scene = prepareSceneForHepRendering(composed);
+      const scene = nativeLayout === "reader" ? composed : prepareSceneForHepRendering(composed);
       renderer.recordPerformanceTransition?.("pageSwap.prepareScene", performance.now() - prepareStarted);
       await prebuildTextLod(scene);
-      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0) return;
+      if (activePdfPageLoader !== loader || activeSceneLoadToken !== null || pendingSourceLoadCount > 0 || layoutChangeRunning) {
+        demandPdfUpdatePending = true; return;
+      }
       const started = performance.now();
       const stats = uploadSceneWithRollback(renderer, scene, true, true);
       lastParsedScene = scene;
+      documentPageScenes = pageScenes;
+      if (nativeLayout === "grid") lastCanonicalScene = scene;
       loader.bindDisplayScene(scene, pageScenes);
       await layerVisibility.sceneChanged(true);
       if (activePdfPageLoader !== loader || lastParsedScene !== scene) return;
       applyTextSearchScene(scene);
+      readerViewport?.invalidateThumbnails();
       const initialUpdate = loader.getDisplayUpdate(scene);
       if (initialUpdate && renderer.prepareRasterLayerUpdates) {
         const staged = renderer.prepareRasterLayerUpdatesAsync
@@ -598,6 +637,141 @@ async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<Re
 }
 
 renderer = createWebGlRenderer(canvasElement);
+
+readerViewport = createReaderViewport({
+  getCanvas: () => canvasElement,
+  layouts: [{ value: "reader", label: "Reader" }, { value: "grid", label: "Grid" }],
+  onLayoutChange: changeNativeLayout,
+  onViewChange: applyReaderView,
+  getPagePreviewScene: async (pageIndex, options) => {
+    const pageLoader = nativeLoadPreparation ? nativeLoadPreparation.pageLoader : activePdfPageLoader;
+    if (pageLoader) return pageLoader.getPagePreviewScene(pageIndex, options);
+    const scene = nativeLoadPreparation?.scene ?? lastParsedScene;
+    if (!scene) throw new Error("No document is loaded.");
+    let pages = thumbnailPartitions.get(scene);
+    if (!pages) { pages = new ScenePageViews(scene); thumbnailPartitions.set(scene, pages); }
+    options.signal?.throwIfAborted();
+    return buildRasterScenePreview(pages.extract(pageIndex).scene, options.maximumDimension);
+  },
+  configureThumbnailRenderer: (target, scene) => {
+    const background = uiControlManager.readPageBackgroundColorInput();
+    target.setPageBackgroundColor(...background);
+    target.setVectorColorOverride(...uiControlManager.readVectorColorOverrideInput());
+    const applied = nativeLoadPreparation && nativeLoadPreparation.identity !== lastLoadedSource?.bytes
+      ? null : layerVisibility.getOptionalContentVisibility();
+    if (applied && scene.optionalContent) {
+      const visible = new Map(applied.layers.map(layer => [layer.id, layer.visible]));
+      target.setOptionalContentVisibility?.(createDefaultOptionalContentSnapshot({ ...scene, optionalContent: {
+        ...scene.optionalContent,
+        groups: scene.optionalContent.groups.map(group => ({ ...group, defaultVisible: visible.get(group.id) ?? group.defaultVisible }))
+      } }));
+    }
+  },
+  onFind: () => { setHudCollapsed(false); textSearchWidget.focusInput(); },
+  onSettings: () => setHudCollapsed(!hudPanelElement.classList.contains("collapsed"))
+});
+
+function applyReaderView(view: ReaderView): void {
+  if (!readerViewport?.isActive()) return;
+  renderer.resize();
+  const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+  renderer.setViewState({ cameraCenterX: view.centerX, cameraCenterY: view.centerY, zoom: view.zoom * ratio });
+}
+
+function navigateNativeView(view: ViewState): void {
+  if (readerViewport?.isActive()) {
+    const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+    readerViewport.setView({ centerX: view.cameraCenterX, centerY: view.cameraCenterY, zoom: view.zoom / ratio });
+  } else renderer.setViewState(view);
+}
+
+function nativeReaderRects(pages: VectorScene[]): Float32Array {
+  return computeReaderPageRects(pages.map(page => ({ width: page.pageBounds.maxX - page.pageBounds.minX,
+    height: page.pageBounds.maxY - page.pageBounds.minY })));
+}
+
+function updateNativePresentation(layout: "reader" | "grid", pages: VectorScene[], identity: unknown): void {
+  nativeLayout = layout;
+  if (layout === "grid") readerViewport!.setLayout(layout);
+  if (layout === "reader") canvasInteractionController.detach();
+  else canvasInteractionController.attach(canvasElement);
+  readerViewport!.setDocument({ identity, pageRects: nativeReaderRects(pages) });
+  readerViewport!.setLayout(layout);
+  readerViewport!.canvasChanged();
+  if (layout === "reader") setHudCollapsed(true);
+}
+
+async function changeNativeLayout(value: string): Promise<void> {
+  const nextLayout = value === "reader" ? "reader" : "grid";
+  if (nextLayout === nativeLayout) return;
+  if (!lastParsedScene || !documentPageScenes || layoutChangeRunning || activeSceneLoadToken !== null ||
+      pendingSourceLoadCount > 0 || activeHepExportController !== null || backendSwitcher?.isSwitchInFlight()) {
+    readerViewport?.setLayout(nativeLayout);
+    return;
+  }
+  layoutChangeRunning = true;
+  updateBackendSelectDisabledState();
+  const source = lastLoadedSource;
+  const previousScene = lastParsedScene;
+  const previousPages = documentPageScenes;
+  const previousCanonicalScene = lastCanonicalScene;
+  const previousReaderState = readerViewport!.snapshot();
+  const previousGridView = gridViewState;
+  const previousSavedReaderView = readerViewState;
+  const previousView = renderer.getViewState();
+  const previousLayout = nativeLayout;
+  const ratio = canvasElement.width / Math.max(1, canvasElement.getBoundingClientRect().width);
+  const anchor = readerCaptureAnchor(previousScene.pageRects, { centerX: previousView.cameraCenterX,
+    centerY: previousView.cameraCenterY, zoom: previousView.zoom / ratio });
+  try {
+    const pages = activePdfPageLoader?.displayPageScenes ?? documentPageScenes;
+    const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pages)
+      : activePdfPageLoader ? prepareSceneForHepRendering(composeVectorScenesInGrid(pages, canonicalPagesPerRow))
+        : lastCanonicalScene!;
+    await prebuildVectorStrokeLodRuntime(scene, uiControlManager.readVectorLodModeInput(),
+      backendSwitcher?.getActiveBackend() ?? "webgl", { shouldCancel: () => lastLoadedSource !== source || pendingSourceLoadCount > 0 });
+    await prebuildTextLod(scene);
+    if (lastLoadedSource !== source || lastParsedScene !== previousScene || pendingSourceLoadCount > 0) return;
+    const stats = uploadSceneWithRollback(renderer, scene, true);
+    if (previousLayout === "grid") gridViewState = previousView;
+    else readerViewState = previousReaderState;
+    lastParsedScene = scene;
+    documentPageScenes = pages;
+    if (nextLayout === "grid" && activePdfPageLoader) lastCanonicalScene = scene;
+    activePdfPageLoader?.bindDisplayScene(scene, pages);
+    updateNativePresentation(nextLayout, pages, source?.bytes);
+    if (nextLayout === "reader") {
+      if (readerViewState) readerViewport!.restore(readerViewState);
+      else readerViewport!.goToPage(anchor.pageIndex);
+    } else {
+      if (gridViewState) renderer.setViewState(gridViewState);
+      else renderer.fitToBounds(resolveSceneFitBounds(scene), 64);
+    }
+    await layerVisibility.sceneChanged(true);
+    if (lastLoadedSource !== source || lastParsedScene !== scene) return;
+    applyTextSearchScene(scene);
+    updateMetricsPanel(lastParsedSceneLabel ?? "Document", scene, stats, 0, 0, null, null);
+  } catch (error) {
+    if (lastLoadedSource === source) {
+      lastParsedScene = previousScene;
+      lastCanonicalScene = previousCanonicalScene;
+      documentPageScenes = previousPages;
+      gridViewState = previousGridView;
+      readerViewState = previousSavedReaderView;
+      renderer.setScene(previousScene);
+      activePdfPageLoader?.bindDisplayScene(previousScene, previousPages);
+      updateNativePresentation(previousLayout, previousPages, source?.bytes);
+      readerViewport!.restore(previousReaderState);
+      renderer.setViewState(previousView);
+      await layerVisibility.sceneChanged(true);
+      applyTextSearchScene(previousScene);
+      setStatus(`Failed to change layout: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } finally {
+    layoutChangeRunning = false;
+    updateBackendSelectDisabledState();
+  }
+}
 
 let baseStatus = "Waiting for PDF or HEP file...";
 type LoadedSourceKind = "pdf" | "hep";
@@ -723,17 +897,21 @@ backendSwitcher = createBackendSwitcher({
     drawingSelection.rendererChanged();
     annotationControls.sceneChanged();
     annotationInteraction?.refresh();
+    readerViewport?.canvasChanged();
   },
   getCanvasElement: () => canvasElement,
   setCanvasElement: (nextCanvas) => {
     canvasElement = nextCanvas;
     canvasResizeObserver.disconnect();
     canvasResizeObserver.observe(nextCanvas);
+    // Backend rollback restores the canvas after restoring the renderer.
+    readerViewport?.canvasChanged();
   },
   createWebGlRenderer,
   createWebGpuRenderer,
   attachCanvasInteractionListeners: (targetCanvas) => {
-    canvasInteractionController.attach(targetCanvas);
+    if (nativeLayout === "reader") canvasInteractionController.detach();
+    else canvasInteractionController.attach(targetCanvas);
   },
   resetPointerInteractionState: () => {
     canvasInteractionController.resetState();
@@ -741,7 +919,7 @@ backendSwitcher = createBackendSwitcher({
   isOperationActive: () =>
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
-    activeHepExportController !== null,
+    activeHepExportController !== null || layoutChangeRunning,
   getSceneSnapshot: () => ({
     scene: lastParsedScene,
     label: lastParsedSceneLabel,
@@ -790,6 +968,7 @@ downloadAllDataButtonElement.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  readerViewport?.dispose();
   drawCallMeter.dispose();
   annotationInteraction?.dispose();
   drawingSelection.dispose();
@@ -836,6 +1015,11 @@ uiControlManager.bindEventListeners({
   }
 });
 
+for (const input of [pageBackgroundColorInputElement, pageBackgroundOpacitySliderElement, pageBackgroundOpacityInputElement,
+  vectorColorInputElement, vectorOpacitySliderElement, vectorOpacityInputElement]) {
+  input.addEventListener("input", () => readerViewport?.invalidateThumbnails());
+}
+
 function applyVectorLodMode(mode: VectorLodMode): void {
   renderer.setVectorLodMode?.(mode);
 }
@@ -848,6 +1032,7 @@ canvasInteractionController.attach(canvasElement);
 
 window.addEventListener("resize", () => {
   renderer.resize();
+  readerViewport?.resize();
 });
 
 // Mobile browsers can fire the window "resize" event before an orientation
@@ -856,6 +1041,7 @@ window.addEventListener("resize", () => {
 // ResizeObserver callbacks are delivered after layout with final geometry.
 const canvasResizeObserver = new ResizeObserver(() => {
   renderer.resize();
+  readerViewport?.resize();
 });
 canvasResizeObserver.observe(canvasElement);
 
@@ -1154,9 +1340,11 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     }
   });
   let demandLoader: PdfPageDemandLoader | null = null;
+  let preparation: ReturnType<typeof prepareNativeSceneLoad> | null = null;
 
   try {
     let scene: VectorScene;
+    let pageScenes: VectorScene[] = cachedPageScenes ?? [];
     let parsedPages: VectorScene[] | null = null;
     let parseMs = 0;
 
@@ -1178,7 +1366,6 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       setStatus(
         `Parsing ${label}... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
-      let pageScenes: VectorScene[];
       const parseOptions = { ...extractionOptions, password: options.password,
         onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "pdf" }).toCallback() };
       if (extractionOptions.compressScans) {
@@ -1219,8 +1406,10 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
 
-    scene = prepareSceneForHepRendering(scene);
-    demandLoader?.bindDisplayScene(scene);
+    const canonicalScene = prepareSceneForHepRendering(scene);
+    const nextLayout = options.preserveView ? nativeLayout : pageScenes.length > 1 ? "reader" : "grid";
+    scene = nextLayout === "reader" ? composeVectorScenesInColumn(pageScenes) : canonicalScene;
+    demandLoader?.bindDisplayScene(scene, pageScenes);
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
     if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer && !demandLoader && !extractionOptions.ocrTextOnly) {
@@ -1247,7 +1436,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const uploadStart = performance.now();
     const targetRenderer = renderer;
     options.signal.throwIfAborted();
-    const sceneStats = uploadSceneWithRollback(targetRenderer, scene, options.preserveView);
+    preparation = prepareNativeSceneLoad(targetRenderer, scene, pageScenes, nextLayout, options, demandLoader);
+    const sceneStats = preparation.stats;
     const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
@@ -1270,6 +1460,9 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     logTextureSizeStats(label, scene, sceneStats);
 
     lastParsedScene = scene;
+    lastCanonicalScene = canonicalScene;
+    documentPageScenes = pageScenes;
+    canonicalPagesPerRow = canonicalScene.pagesPerRow;
     lastParsedSceneLabel = label;
     commitLoadedSource(options, extractionOptions.ocrTextOnly === true, streaming, extractionOptions.compressScans === true);
     const previousPageLoader = activePdfPageLoader;
@@ -1279,6 +1472,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     void previousPageLoader?.close();
     if (activePdfPageLoader) parsedPdfPageCache = null;
     if (parsedPages) storeCachedPdfPageScenes(options.source, pageSceneOptionsKey, parsedPages);
+    if (!options.preserveView) { gridViewState = null; readerViewState = null; }
+    preparation.commit();
     applyTextSearchScene(scene);
     if (activePdfPageLoader) textSearchWidget.setAvailability("ready");
     refreshDropIndicator();
@@ -1298,6 +1493,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to render PDF: ${message}`);
   } finally {
+    preparation?.rollback();
     await demandLoader?.close();
     finishSceneLoad(activeLoadToken);
   }
@@ -1319,15 +1515,20 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       updateParsingLoaderProgress(payload);
     }
   });
+  let preparation: ReturnType<typeof prepareNativeSceneLoad> | null = null;
 
   try {
     const parseStart = performance.now();
     setParsingLoader(true, "0.00% Parsing / loading");
     setStatus(`Loading parsed data from ${label}...`);
-    const scene = await loadSceneFromHep(buffer, {
+    const canonicalScene = await loadSceneFromHep(buffer, {
       signal: options.signal,
       onProgress: progress.child(0, LOAD_PROGRESS_PARSE_END, { sourceType: "hep" }).toCallback()
     });
+    const partition = new ScenePageViews(canonicalScene);
+    const pageScenes = Array.from({ length: partition.pageCount }, (_, index) => partition.extract(index).scene);
+    const nextLayout = options.preserveView ? nativeLayout : pageScenes.length > 1 ? "reader" : "grid";
+    const scene = nextLayout === "reader" ? composeVectorScenesInColumn(pageScenes) : canonicalScene;
     const parseEnd = performance.now();
 
     if (activeLoadToken === loadToken) {
@@ -1366,7 +1567,8 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const uploadStart = performance.now();
     const targetRenderer = renderer;
     options.signal.throwIfAborted();
-    const sceneStats = uploadSceneWithRollback(targetRenderer, scene, options.preserveView);
+    preparation = prepareNativeSceneLoad(targetRenderer, scene, pageScenes, nextLayout, options, null);
+    const sceneStats = preparation.stats;
     const fallbackLodTiming = consumeVectorStrokeLodBuildTiming();
     const lodTiming = combineVectorLodTimings(prebuildLodTiming, fallbackLodTiming);
     const uploadEnd = performance.now();
@@ -1389,12 +1591,17 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     logTextureSizeStats(label, scene, sceneStats);
 
     lastParsedScene = scene;
+    lastCanonicalScene = canonicalScene;
+    documentPageScenes = pageScenes;
+    canonicalPagesPerRow = canonicalScene.pagesPerRow;
     lastParsedSceneLabel = label;
     commitLoadedSource(options);
     const previousPageLoader = activePdfPageLoader;
     activePdfPageLoader = null;
     void previousPageLoader?.close();
     parsedPdfPageCache = null;
+    if (!options.preserveView) { gridViewState = null; readerViewState = null; }
+    preparation.commit();
     applyTextSearchScene(scene);
     refreshDropIndicator();
     setDownloadDataButtonState(true);
@@ -1410,6 +1617,7 @@ async function loadHepBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load HEP file: ${message}`);
   } finally {
+    preparation?.rollback();
     finishSceneLoad(activeLoadToken);
   }
 }
@@ -1431,6 +1639,60 @@ function commitLoadedSource(options: LoadPdfOptions, ocrTextOnly = false, stream
   pageStreamingCheckbox!.disabled = options.source.kind !== "pdf";
   lastDownloadablePdf = options.downloadablePdf;
   setDownloadPdfButtonState(Boolean(lastDownloadablePdf));
+}
+
+/** Prepare the actual reading camera before any replacement frame is submitted. */
+function prepareNativeSceneLoad(target: RendererApi, scene: VectorScene, pages: VectorScene[],
+  layout: "reader" | "grid", options: LoadPdfOptions, pageLoader: PdfPageDemandLoader | null):
+  { stats: SceneStats; commit(): void; rollback(): void } {
+  // A cancelled warm-up may still be settling when a newer source reaches upload.
+  // Its restoration must finish before the next transaction takes ownership.
+  nativeLoadPreparation?.rollback();
+  const previousScene = lastParsedScene;
+  const previousPages = documentPageScenes;
+  const previousIdentity = lastLoadedSource?.bytes;
+  const previousLayout = nativeLayout;
+  const previousReader = readerViewport?.snapshot();
+  const previousView = target.getViewState();
+  const release = (): void => {
+    options.signal.removeEventListener("abort", rollback);
+    nativeLoadPreparation = null;
+  };
+  const rollback = (): void => {
+    if (nativeLoadPreparation !== owner) return;
+    release();
+    if (target !== renderer) return;
+    try {
+      target.setScene(previousScene ?? composeVectorScenesInGrid([], 1), { preserveRasterResolution: true });
+    } catch (error) {
+      console.warn("[HEPR] Failed to restore the previous scene after cancelled loading.", error);
+    }
+    try {
+      updateNativePresentation(previousLayout, previousPages ?? [], previousIdentity);
+      if (previousReader) readerViewport?.restore(previousReader);
+      target.setViewState(previousView);
+      layerVisibility.rendererChanged();
+      target.setSearchHighlights?.(lastSearchHighlights);
+      textSelection.refreshHighlights();
+      drawingSelection.rendererChanged();
+      annotationInteraction?.refresh();
+    } catch (error) {
+      console.warn("[HEPR] Failed to restore the previous document view after cancelled loading.", error);
+    }
+  };
+  const commit = (): void => { if (nativeLoadPreparation === owner) release(); };
+  const owner: NativeLoadPreparation = { scene, pageLoader, identity: options.source.bytes, rollback, commit };
+  nativeLoadPreparation = owner;
+  options.signal.addEventListener("abort", rollback, { once: true });
+  try {
+    options.signal.throwIfAborted();
+    const stats = uploadSceneWithRollback(target, scene, options.preserveView || layout === "reader");
+    updateNativePresentation(layout, pages, options.source.bytes);
+    return { stats, rollback, commit };
+  } catch (error) {
+    rollback();
+    throw error;
+  }
 }
 
 /** Keep native frame pacing while warming the view that will become interactive. */
@@ -1686,9 +1948,9 @@ function updateBackendSelectDisabledState(): void {
   backendSelectElement.disabled =
     pendingSourceLoadCount > 0 ||
     activeSceneLoadToken !== null ||
-    activeHepExportController !== null;
+    activeHepExportController !== null || layoutChangeRunning;
   if (activePdfPageLoader) {
-    if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null) activePdfPageLoader.pause();
+    if (pendingSourceLoadCount > 0 || activeSceneLoadToken !== null || activeHepExportController !== null || layoutChangeRunning) activePdfPageLoader.pause();
     else {
       activePdfPageLoader.resume();
       if (demandPdfUpdatePending) scheduleDemandPdfUpdate();
@@ -1909,6 +2171,10 @@ async function downloadAllExampleHeps(): Promise<void> {
 }
 
 async function downloadHep(): Promise<boolean> {
+  if (layoutChangeRunning) {
+    setStatus("Wait for the layout change to finish before exporting parsed data.");
+    return false;
+  }
   if (backendSwitcher?.isSwitchInFlight()) {
     setStatus("Wait for the renderer backend switch to finish before exporting parsed data.");
     return false;
@@ -1929,11 +2195,12 @@ async function downloadHep(): Promise<boolean> {
     return false;
   }
 
-  const scene = lastParsedScene;
+  const scene = lastCanonicalScene ?? lastParsedScene;
   const label = lastParsedSceneLabel;
   const pageLoader = activePdfPageLoader;
   const source = lastLoadedSource;
   const password = lastLoadedPdfPassword;
+  const exportPagesPerRow = canonicalPagesPerRow;
   const needsCompleteScene = Boolean(pageLoader || (loadedOcrTextOnly && source?.kind === "pdf"));
 
   const previousStatusText = statusTextElement.textContent;
@@ -1974,11 +2241,11 @@ async function downloadHep(): Promise<boolean> {
       const pages = await pageLoader.loadCompletePageScenes({ signal: exportController.signal, onProgress: onSceneProgress });
       exportController.signal.throwIfAborted();
       if (activeHepExportController !== exportController) return false;
-      exportScene = prepareSceneForHepRendering(composeVectorScenesInGrid(pages, scene.pagesPerRow));
+      exportScene = prepareSceneForHepRendering(composeVectorScenesInGrid(pages, exportPagesPerRow));
     } else if (needsCompleteScene && source?.kind === "pdf") {
       // Text-only eager views omitted images; complete extraction is needed for export.
       exportScene = (await loadPdfSceneFromSource(source.bytes, { sourceLabel: label, password,
-        ocrTextOnly: false, maxPagesPerRow: scene.pagesPerRow, signal: exportController.signal,
+        ocrTextOnly: false, maxPagesPerRow: exportPagesPerRow, signal: exportController.signal,
         onProgress: onSceneProgress })).scene;
     }
     exportController.signal.throwIfAborted();

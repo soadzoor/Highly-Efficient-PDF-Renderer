@@ -2,6 +2,8 @@ import { MathUtils, Vector3, type PerspectiveCamera } from "three";
 import type { MapControls } from "three/examples/jsm/controls/MapControls.js";
 import type { HeprThreePdfObject } from "./threePdfObject";
 import { createViewerLinkNavigation } from "./viewerLinkNavigation";
+import type { LinkCameraView } from "./viewerLinkNavigation";
+import type { VectorScene } from "./pdfVectorExtractor";
 
 /** Shared camera adapter for the Three and room-detection examples. */
 export function createThreeLinkNavigation(options: {
@@ -10,6 +12,10 @@ export function createThreeLinkNavigation(options: {
   camera: PerspectiveCamera;
   getControls(): MapControls;
   getSourceUrl?(): string | undefined;
+  /** Reader hosts map canonical scene coordinates through their page arrangement. */
+  getReaderView?(): LinkCameraView | null;
+  setReaderView?(view: LinkCameraView): void;
+  getReaderScene?(): VectorScene | null;
   onCameraChange(): void;
 }) {
   const { camera } = options;
@@ -42,10 +48,12 @@ export function createThreeLinkNavigation(options: {
   }
   return createViewerLinkNavigation({
     getCanvas: options.getCanvas,
-    getScene: () => options.getPdfObject()?.sceneData ?? null,
+    getScene: () => options.getReaderScene?.() ?? options.getPdfObject()?.sceneData ?? null,
     getIdentity: () => options.getPdfObject(),
     getSourceUrl: options.getSourceUrl,
     getView() {
+      const readerView = options.getReaderView?.();
+      if (readerView) return readerView;
       const frame = objectFrame();
       if (!frame) return null;
       const controls = options.getControls();
@@ -54,6 +62,10 @@ export function createThreeLinkNavigation(options: {
         zoom: frame.pixelsAtUnitDistance / Math.max(1e-6, camera.position.distanceTo(controls.target)) };
     },
     setView(view) {
+      if (options.getReaderView?.()) {
+        options.setReaderView?.(view);
+        return;
+      }
       const frame = objectFrame();
       if (!frame) return;
       const controls = options.getControls();

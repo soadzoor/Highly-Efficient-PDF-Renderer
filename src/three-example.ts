@@ -1,6 +1,10 @@
 import { hasSelectedHepLod, promptForHepLod } from "./hepLodPrompt";
 import { resolveHepLodOptions } from "./hepLodOptions";
 import { createThreeLinkNavigation } from "./threeLinkNavigation";
+import { createReaderViewport, type ReaderView } from "./readerViewport";
+import { computeReaderPageRects, readerContentMetrics, readerFitZoom, readerViewFromScroll } from "./readerGeometry";
+import type { VectorScene } from "./pdfVectorExtractor";
+import { createDefaultOptionalContentSnapshot } from "./optionalContent";
 import { createAnnotationOverlay } from "./annotationOverlay";
 import { createAnnotationInteractionController, type AnnotationInteractionController } from "./annotationInteraction";
 import { createThreeAnnotationInteractionAdapter } from "./threeAnnotationInteraction";
@@ -301,10 +305,16 @@ interface PageLayoutView {
 }
 
 let activePageLayout: ExamplePageLayout = "grid";
+let cameraInteractionEnabled = true;
+let controlsConnected = true;
 let pageLayoutView: PageLayoutView | null = null;
 let pageLayoutRequest = 0;
 let pageLayoutWarmingUp = false;
 const pageLayoutAnimator = new ExamplePageLayoutAnimator();
+let readerPageRects: Float32Array = new Float32Array();
+let readerNavigationSource: VectorScene | null = null;
+let readerNavigationScene: VectorScene | null = null;
+let readerDocumentIdentity: unknown = null;
 
 // Drawing selection always starts off, even if the browser restores form state.
 textSelectionCheckboxElement.disabled = false;
@@ -323,7 +333,9 @@ const textSelection = createTextSelectionController({
       requestRender();
     },
     setCameraInteractionEnabled: (interactionEnabled) => {
-      controls.enabled = interactionEnabled;
+      cameraInteractionEnabled = interactionEnabled;
+      controls.enabled = interactionEnabled && activePageLayout !== "reader";
+      if (!interactionEnabled && activePageLayout === "reader") reader.cancelActiveGesture();
     }
   }
 });
@@ -371,6 +383,7 @@ const drawingSelection = createDrawingSelectionControls({
     onError: error => setStatus(`Drawing selection failed: ${error instanceof Error ? error.message : String(error)}`)
   }),
   onEnabledChange: enabled => {
+    if (enabled && activePageLayout === "reader") reader.cancelActiveGesture();
     annotationInteraction?.setInteractionEnabled(!enabled);
     textSelectionCheckboxElement.disabled = enabled;
     if (enabled || !textSelectionCheckboxElement.checked) textSelection.disable();
@@ -384,6 +397,9 @@ const linkNavigation = createThreeLinkNavigation({
   camera,
   getControls: () => controls,
   getSourceUrl: () => lastDownloadablePdf?.url,
+  getReaderView: () => reader.isActive() ? reader.getView() : null,
+  setReaderView: view => reader.setView(view),
+  getReaderScene: () => reader.isActive() ? getReaderNavigationScene() : null,
   onCameraChange: () => { updateCameraClipping(true); requestRender(); }
 });
 const annotationOverlay = createAnnotationOverlay({
@@ -413,6 +429,7 @@ const layerControls = createThreePdfLayerControls({
   getPdfObject: () => currentPdfObject,
   requestRender,
   onVisibilityChange: () => {
+    reader.invalidateThumbnails();
     textSelection.clearSelection();
     refreshSearchAvailability();
     runSearch(textSearchInputElement.value, false);
@@ -438,6 +455,7 @@ const annotationControls = createPdfAnnotationControls({
     if (!drawingSelection.isEnabled()) annotationInteraction?.hover(annotation?.id ?? null);
   },
   onChange: () => {
+    reader.invalidateThumbnails();
     annotationInteraction?.refresh();
     annotationOverlay.onFrame();
   }
@@ -464,6 +482,44 @@ annotationInteraction = createAnnotationInteractionController({
 });
 
 initializeBackendSelect();
+const reader = createReaderViewport({
+  getCanvas: () => canvasElement,
+  layouts: [
+    { value: "reader", label: "Reader" },
+    { value: "grid", label: "Grid" },
+    { value: "sphere", label: "Sphere" },
+    { value: "helix", label: "Helix" }
+  ],
+  onLayoutChange: layout => setPageLayout(readPageLayout(layout)),
+  onViewChange: view => {
+    if (activePageLayout !== "reader" || !currentPdfObject) return;
+    applyReaderCameraView(view, currentPdfObject);
+    requestRender();
+  },
+  getPagePreviewScene: async (pageIndex, options) => {
+    const object = currentPdfObject;
+    if (!object) throw new DOMException("No document is loaded.", "AbortError");
+    return object.getPagePreviewScene(pageIndex, options);
+  },
+  configureThumbnailRenderer: (thumbnailRenderer, scene) => {
+    const background = readPageBackgroundColor();
+    const vector = readVectorOverrideColor();
+    thumbnailRenderer.setPageBackgroundColor(...background);
+    thumbnailRenderer.setVectorColorOverride(...vector);
+    const visibility = currentPdfObject?.getOptionalContentVisibility();
+    if (visibility) {
+      const values = new Map(visibility.layers.map(layer => [layer.id, layer.visible]));
+      const local = createDefaultOptionalContentSnapshot({ ...scene,
+        optionalContent: scene.optionalContent ? { ...scene.optionalContent,
+          groups: scene.optionalContent.groups.map(group => ({ ...group, defaultVisible: values.get(group.id) ?? group.defaultVisible }))
+        } : undefined });
+      thumbnailRenderer.setOptionalContentVisibility?.({ ...local, revision: visibility.revision });
+    }
+  },
+  onFind: () => { setPanelCollapsed(false); textSearchInputElement.focus(); },
+  onSettings: () => setPanelCollapsed(!panelElement.classList.contains("collapsed"))
+});
+
 setPanelCollapsed(false);
 setDownloadDataButtonState(false);
 setDownloadPdfButtonState(false);
@@ -646,7 +702,10 @@ function installThreeRendererBackend(
   captureProfiler = null;
   drawCallMeter.reset();
   controls = createMapControls();
+  controlsConnected = true;
   controls.target.copy(previousControlsTarget);
+  syncPageCameraControls();
+  reader.canvasChanged();
   camera.coordinateSystem = prepared.renderer.coordinateSystem;
   updatePerspectiveCameraProjection();
   updateCameraClipping();
@@ -677,7 +736,7 @@ function renderFrame(now: number = performance.now()): void {
   // Crossing pages keep shared batches while moving; the settled layout is exact.
   pageLayoutView?.object.setPageOverlapMode(pageLayoutAnimating || pageLayoutWarmingUp ? "fast" : "exact");
   profile?.beginSection("controls");
-  const controlsChanged = controls.update();
+  const controlsChanged = activePageLayout === "reader" ? false : controls.update();
   updateCameraClipping();
   profile?.endSection("controls");
   prepareThreeRendererFrame(renderer);
@@ -780,6 +839,7 @@ requestRender();
 syncTouchRotateVisibility();
 
 function handleViewportResize(): void {
+  reader.resize();
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
   updatePerspectiveCameraProjection();
@@ -919,15 +979,28 @@ for (const button of pageLayoutButtons) {
 // position/quaternion from the render loop, like three.js' css3d periodic table.
 async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
   const pdfObject = currentPdfObject;
-  if (!pdfObject || pdfObject.pageCount <= 1) {
+  if (!pdfObject) {
     return;
   }
+  const previousLayout = activePageLayout;
   const request = ++pageLayoutRequest;
-  activePageLayout = layout;
-  syncPageLayoutControls();
+  if (pdfObject.pageCount <= 1) {
+    activePageLayout = layout === "reader" ? "reader" : "grid";
+    reader.setLayout(activePageLayout);
+    syncPageCameraControls();
+    if (activePageLayout === "reader") applyReaderCameraView(reader.getView(), pdfObject);
+    else fitCameraToPdfObject(pdfObject);
+    syncPageLayoutControls();
+    requestRender();
+    return;
+  }
   // Grid is the loaded layout. A document that never left it keeps its
   // ordinary document rendering path instead of preparing page views.
   if (!pageLayoutView && layout === "grid") {
+    activePageLayout = layout;
+    syncPageLayoutControls();
+    reader.setLayout(layout);
+    syncPageCameraControls();
     setStatus("Page layout set to Grid.");
     return;
   }
@@ -951,8 +1024,28 @@ async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
     }
     const view = pageLayoutView;
     const loaded = view.targets;
+    const targets = computeExamplePageLayout(layout, view.layoutPages);
     view.layout = layout;
-    view.targets = computeExamplePageLayout(layout, view.layoutPages);
+    view.targets = targets;
+    activePageLayout = layout;
+    syncPageLayoutControls();
+    if (layout === "reader" || previousLayout === "reader") {
+      pageLayoutAnimator.cancel();
+      applyExamplePageLayout(view.pages, view.targets);
+      reader.setLayout(layout);
+      syncPageCameraControls();
+      if (layout === "reader") {
+        setPanelCollapsed(true);
+        applyReaderCameraView(reader.getView(), pdfObject);
+      } else {
+        fitPageLayoutToCamera(view);
+      }
+      setStatus(`Page layout set to ${formatPageLayout(layout)}.`);
+      requestRender();
+      return;
+    }
+    reader.setLayout(layout);
+    syncPageCameraControls();
     includePageLayoutInClipRange(view);
     if (warmUp) {
       // Pages in the loaded layout draw as the document itself. Leaving it
@@ -979,8 +1072,9 @@ async function setPageLayout(layout: ExamplePageLayout): Promise<void> {
     if (request !== pageLayoutRequest || pdfObject !== currentPdfObject) {
       return;
     }
-    // Page views are only missing here, so the document is still on its grid.
-    activePageLayout = "grid";
+    activePageLayout = previousLayout;
+    reader.setLayout(previousLayout);
+    syncPageCameraControls();
     syncPageLayoutControls();
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to prepare pages: ${message}`);
@@ -1030,6 +1124,9 @@ async function preparePageLayoutReplacement(
     return view;
   } catch (error) {
     signal.throwIfAborted();
+    // Reader's scroll camera depends on the column transforms. Keep the current
+    // renderer and its usable view if the replacement cannot prepare them.
+    if (activePageLayout === "reader") throw error;
     // Switching the renderer matters more than the arrangement; use the grid.
     console.warn("[Three Example] Failed to restore page layout:", error);
     return null;
@@ -1046,6 +1143,19 @@ function resetPageLayout(view: PageLayoutView | null = null): void {
   pageLayoutView = view;
   activePageLayout = view?.layout ?? "grid";
   syncPageLayoutControls();
+  syncPageCameraControls();
+}
+
+/** Reader input and MapControls never own the camera at the same time. */
+function syncPageCameraControls(): void {
+  controls.enabled = cameraInteractionEnabled && activePageLayout !== "reader";
+  if (activePageLayout === "reader" && controlsConnected) {
+    controls.disconnect();
+    controlsConnected = false;
+  } else if (activePageLayout !== "reader" && !controlsConnected) {
+    controls.connect(canvasElement);
+    controlsConnected = true;
+  }
 }
 
 function setPageLayoutProgress(percentage: number | null): void {
@@ -1063,15 +1173,113 @@ function syncPageLayoutControls(): void {
 }
 
 function readPageLayout(value: string | undefined): ExamplePageLayout {
-  return value === "sphere" || value === "helix" ? value : "grid";
+  return value === "reader" || value === "sphere" || value === "helix" ? value : "grid";
 }
 
 function formatPageLayout(layout: ExamplePageLayout): string {
-  return layout === "sphere" ? "Sphere" : layout === "helix" ? "Helix" : "Grid";
+  return layout === "reader" ? "Reader" : layout === "sphere" ? "Sphere" : layout === "helix" ? "Helix" : "Grid";
 }
 
 function readPageExtent(value: number): number {
   return Number.isFinite(value) ? Math.max(MIN_OBJECT_EXTENT, Math.abs(value)) : MIN_OBJECT_EXTENT;
+}
+
+function getReaderPageRects(object: HeprThreePdfObject): Float32Array {
+  const rects = object.sceneData.pageRects;
+  const sizes = Array.from({ length: object.pageCount }, (_, index) => ({
+    width: readPageExtent(rects[index * 4 + 2] - rects[index * 4]),
+    height: readPageExtent(rects[index * 4 + 3] - rects[index * 4 + 1])
+  }));
+  if (sizes.length === 1) {
+    const { width, height } = sizes[0];
+    return Float32Array.of(-width / 2, -height / 2, width / 2, height / 2);
+  }
+  return computeReaderPageRects(sizes);
+}
+
+function getInitialReaderView(object: HeprThreePdfObject): ReaderView {
+  const rects = getReaderPageRects(object);
+  const width = Math.max(1, canvasElement.clientWidth);
+  const height = Math.max(1, canvasElement.clientHeight);
+  const zoom = readerFitZoom(rects, 0, width, height, "width");
+  const metrics = readerContentMetrics(rects, zoom, width, height);
+  return readerViewFromScroll(metrics, Math.max(0, (metrics.surfaceWidth - width) / 2), 0);
+}
+
+function applyReaderCameraView(view: ReaderView, object: HeprThreePdfObject, targetCamera = camera): void {
+  object.updateWorldMatrix(true, false);
+  const center = object.localToWorld(new THREE.Vector3(view.centerX, view.centerY, 0));
+  const direction = new THREE.Vector3(0, 0, 1).transformDirection(object.matrixWorld);
+  const scale = object.getWorldScale(new THREE.Vector3());
+  const distance = view.height * Math.abs(scale.y) /
+    (2 * Math.tan(THREE.MathUtils.degToRad(targetCamera.fov) / 2) * view.zoom);
+  targetCamera.aspect = Math.max(1, view.width) / Math.max(1, view.height);
+  targetCamera.zoom = 1;
+  targetCamera.up.set(0, 1, 0).transformDirection(object.matrixWorld);
+  targetCamera.position.copy(center).addScaledVector(direction, distance);
+  targetCamera.lookAt(center);
+  // The column's height changes screen extent, never its depth.
+  targetCamera.near = Math.max(Number.EPSILON, distance * .01);
+  targetCamera.far = Math.max(targetCamera.near + 1, distance * 2 + 1);
+  targetCamera.updateProjectionMatrix();
+  targetCamera.updateMatrixWorld(true);
+  if (targetCamera === camera) controls.target.copy(center);
+}
+
+/** Navigation metadata in Reader coordinates; the canonical scene remains untouched. */
+function getReaderNavigationScene(): VectorScene | null {
+  const source = currentPdfObject?.sceneData;
+  if (!source) return null;
+  if (source === readerNavigationSource && readerNavigationScene) return readerNavigationScene;
+  const rects = readerPageRects;
+  const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (let i = 0; i + 3 < rects.length; i += 4) {
+    bounds.minX = Math.min(bounds.minX, rects[i]); bounds.minY = Math.min(bounds.minY, rects[i + 1]);
+    bounds.maxX = Math.max(bounds.maxX, rects[i + 2]); bounds.maxY = Math.max(bounds.maxY, rects[i + 3]);
+  }
+  readerNavigationSource = source;
+  readerNavigationScene = {
+    ...source, pageRects: rects, bounds, pageBounds: bounds,
+    pdfPages: source.pdfPages?.map(page => {
+      const i = page.pageIndex * 4;
+      const dx = (rects[i] + rects[i + 2] - source.pageRects[i] - source.pageRects[i + 2]) / 2;
+      const dy = (rects[i + 1] + rects[i + 3] - source.pageRects[i + 1] - source.pageRects[i + 3]) / 2;
+      const [a, b, c, d, e, f] = page.pdfToScene;
+      return { ...page, pdfToScene: [a, b, c, d, e + dx, f + dy] };
+    })
+  };
+  return readerNavigationScene;
+}
+
+/** Leaving Reader shows the requested arrangement in one stable camera frame. */
+function fitPageLayoutToCamera(view: PageLayoutView): void {
+  view.object.updateWorldMatrix(true, false);
+  tempObjectBounds.makeEmpty();
+  view.targets.forEach((target, index) => {
+    const page = view.layoutPages[index];
+    for (const x of [-page.width / 2, page.width / 2]) {
+      for (const y of [-page.height / 2, page.height / 2]) {
+        const point = new THREE.Vector3(x, y, 0).applyQuaternion(target.quaternion).add(target.position);
+        tempObjectBounds.expandByPoint(point.applyMatrix4(view.object.matrixWorld));
+      }
+    }
+  });
+  if (tempObjectBounds.isEmpty()) return;
+  tempObjectBounds.getCenter(tempObjectCenter);
+  tempObjectBounds.getSize(tempObjectSize);
+  updatePerspectiveCameraProjection();
+  const width = Math.max(1, canvasElement.clientWidth - CAMERA_FIT_PADDING_PIXELS * 2);
+  const height = Math.max(1, canvasElement.clientHeight - CAMERA_FIT_PADDING_PIXELS * 2);
+  const tan = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+  const distance = Math.max(tempObjectSize.y * canvasElement.clientHeight / height,
+    tempObjectSize.x * canvasElement.clientWidth / width / camera.aspect) / (2 * tan) + tempObjectSize.z / 2;
+  controls.target.copy(tempObjectCenter);
+  camera.up.set(0, 1, 0);
+  camera.position.copy(tempObjectCenter).add(new THREE.Vector3(0, 0, Math.max(1, distance)));
+  camera.lookAt(tempObjectCenter);
+  updateClipAnchor(tempObjectCenter, Math.max(MIN_OBJECT_EXTENT, tempObjectSize.length() / 2));
+  updateCameraClipping(true);
+  controls.update();
 }
 
 window.addEventListener("pointerdown", (event) => {
@@ -1234,6 +1442,15 @@ function clearSearch(): void {
 function flyToMatch(match: HeprTextSearchMatch): void {
   const pdfObject = currentPdfObject;
   if (!pdfObject) {
+    return;
+  }
+  if (activePageLayout === "reader") {
+    const i = match.pageIndex * 4;
+    const original = pdfObject.sceneData.pageRects;
+    const dx = (readerPageRects[i] + readerPageRects[i + 2] - original[i] - original[i + 2]) / 2;
+    const dy = (readerPageRects[i + 1] + readerPageRects[i + 3] - original[i + 1] - original[i + 3]) / 2;
+    reader.setView({ centerX: (match.bounds.minX + match.bounds.maxX) / 2 + dx,
+      centerY: (match.bounds.minY + match.bounds.maxY) / 2 + dy, zoom: reader.getView().zoom });
     return;
   }
   scene.updateMatrixWorld(true);
@@ -1455,8 +1672,9 @@ function disposeExample(): void {
   annotationOverlay.dispose();
   linkNavigation.dispose();
   textSelection.dispose();
-  controls.dispose();
   disposeCurrentObject();
+  controls.dispose();
+  reader.dispose();
   renderer.dispose();
 }
 
@@ -1558,6 +1776,22 @@ async function loadSource(
       sourceType: nextObject.sourceKind === "pdf" ? "pdf" : "hep"
     });
     const firstSubmitStart = performance.now();
+    let initialLayout: PageLayoutView | null = null;
+    if (nextObject.pageCount > 1) {
+      const stopProgress = nextObject.subscribePagePreparationProgress(setPageLayoutProgress);
+      try {
+        initialLayout = createPageLayoutView(nextObject, await nextObject.getPages({ signal: controller.signal }));
+        initialLayout.layout = "reader";
+        initialLayout.targets = computeExamplePageLayout("reader", initialLayout.layoutPages);
+        applyExamplePageLayout(initialLayout.pages, initialLayout.targets);
+      } catch (error) {
+        controller.signal.throwIfAborted();
+        initialLayout = null;
+        console.warn("[Three Example] Reader page preparation failed; opening the grid instead.", error);
+      } finally { stopProgress(); setPageLayoutProgress(null); }
+    }
+    controller.signal.throwIfAborted();
+    if (activeLoadToken !== loadToken) return;
     preparedBackend = await prepareThreeRendererBackend(backend, controller.signal);
     const submitRenderer = preparedBackend?.renderer ?? renderer;
     const submitCamera = camera.clone();
@@ -1565,7 +1799,8 @@ async function loadSource(
     submitCamera.updateProjectionMatrix();
     // Compile the clip/LOD variants selected by the view that will be shown,
     // while leaving the old document's camera and controls alone.
-    fitCameraToObject(nextObject, true, submitCamera);
+    if (initialLayout) applyReaderCameraView(getInitialReaderView(nextObject), nextObject, submitCamera);
+    else fitCameraToObject(nextObject, true, submitCamera);
     await nextObject.compileForThreeRenderer(submitRenderer, submitCamera, controller.signal);
     controller.signal.throwIfAborted();
     if (activeLoadToken !== loadToken) return;
@@ -1579,7 +1814,7 @@ async function loadSource(
       installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
       preparedBackend = null;
     }
-    replacePdfObject(nextObject);
+    replacePdfObject(nextObject, { pageLayoutView: initialLayout });
     pendingObject = null;
     lastLoadedSource = source;
     lastDownloadablePdf = downloadablePdf;
@@ -1634,6 +1869,8 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
   sourceLoadController = controller;
   const previousBackend = activeThreeRendererBackend;
   const cameraSnapshot = captureCameraSnapshot();
+  const readerSnapshot = reader.snapshot();
+  const layoutSnapshot = activePageLayout;
   const objectOptions = readThreeObjectOptions();
   let nextObject: HeprThreePdfObject | null = null;
   let preparedBackend: PreparedThreeRendererBackend | null = null;
@@ -1739,11 +1976,13 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
       installThreeRendererBackend(preparedBackend, { disposeCurrentPdfObject: false });
       preparedBackend = null;
     }
-    replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement });
+    replacePdfObject(nextObject, { fitCamera: false, pageLayoutView: pageLayoutReplacement, layout: layoutSnapshot });
     targetInstalled = true;
     const installedObject = nextObject;
     nextObject = null;
     restoreCameraSnapshot(cameraSnapshot);
+    reader.restore(readerSnapshot);
+    if (activePageLayout === "reader") applyReaderCameraView(reader.getView(), currentPdfObject!);
     requestRender();
     await waitForLoad(waitForNextRenderedFrame(activeLoadToken), controller.signal);
     if (activeLoadToken !== loadToken) return;
@@ -1812,9 +2051,10 @@ async function reloadSourceWithBackend(backend: HeprRendererType, reparseSource 
 
 function replacePdfObject(
   nextObject: HeprThreePdfObject,
-  options: { fitCamera?: boolean; pageLayoutView?: PageLayoutView | null } = {}
+  options: { fitCamera?: boolean; pageLayoutView?: PageLayoutView | null; layout?: ExamplePageLayout } = {}
 ): void {
   const previousObject = currentPdfObject;
+  const previousReaderIdentity = readerDocumentIdentity;
   const sameScene = previousObject?.sceneData === nextObject.sceneData;
   nextObject.renderer.setInteractionViewportProvider(() => renderer.domElement.getBoundingClientRect());
   lastNativeDrawStats = null;
@@ -1836,15 +2076,27 @@ function replacePdfObject(
       refreshSearchAvailability();
       if (textSearchInputElement.value.trim()) runSearch(textSearchInputElement.value, false);
     }
+    if (event.reason === "pages-loaded" || event.reason === "raster-ready") reader.invalidateThumbnails();
     requestRender();
   });
   resetPageLayout(options.pageLayoutView);
+  if (options.layout === "reader" && nextObject.pageCount <= 1) activePageLayout = "reader";
+  readerPageRects = getReaderPageRects(nextObject);
+  readerNavigationSource = null;
+  readerNavigationScene = null;
+  readerDocumentIdentity = options.fitCamera === false ? previousReaderIdentity ?? nextObject : nextObject;
+  reader.setDocument({ identity: readerDocumentIdentity, pageRects: readerPageRects });
+  reader.setLayout(activePageLayout);
+  syncPageCameraControls();
   layerControls.objectChanged();
   scene.add(nextObject);
   resetFpsMeter();
   drawCallMeter.reset();
   refreshDropIndicator();
-  if (options.fitCamera !== false) {
+  if (activePageLayout === "reader") {
+    applyReaderCameraView(reader.getView(), nextObject);
+    if (options.fitCamera !== false) setPanelCollapsed(true);
+  } else if (options.fitCamera !== false) {
     fitCameraToPdfObject(nextObject);
   }
   updateCameraClipping(true);
@@ -1882,6 +2134,10 @@ function disposeCurrentObject(options: { clearMetrics?: boolean } = {}): void {
   const previousObject = currentPdfObject;
   currentPdfObject = null;
   resetPageLayout();
+  reader.setLayout("grid");
+  reader.setDocument({ identity: null, pageRects: new Float32Array() });
+  readerPageRects = new Float32Array();
+  readerNavigationSource = readerNavigationScene = null;
   layerControls.objectChanged();
   drawingSelection.sceneChanged();
   annotationOverlay.sceneChanged();
@@ -2232,12 +2488,14 @@ function readVectorOverrideColor(): [number, number, number, number] {
 function applyPageBackgroundFromControls(): void {
   const color = readPageBackgroundColor();
   currentPdfObject?.setPageBackgroundColor(color[0], color[1], color[2], color[3]);
+  reader.invalidateThumbnails();
   requestRender();
 }
 
 function applyVectorOverrideFromControls(): void {
   const color = readVectorOverrideColor();
   currentPdfObject?.setVectorColorOverride(color[0], color[1], color[2], color[3]);
+  reader.invalidateThumbnails();
   requestRender();
 }
 
@@ -2573,7 +2831,7 @@ function restoreCameraSnapshot(snapshot: CameraSnapshot): void {
   currentContentRadius = snapshot.clipRadius;
   updatePerspectiveCameraProjection();
   updateCameraClipping(true);
-  controls.update();
+  if (activePageLayout !== "reader") controls.update();
 }
 
 function fitCameraToObject(targetObject: THREE.Object3D, updateClipForTarget: boolean, previewCamera?: THREE.PerspectiveCamera): void {
@@ -2630,6 +2888,10 @@ function updateClipAnchor(center: THREE.Vector3, radius: number): void {
 
 function updateCameraClipping(force = false, targetCamera = camera, target = controls.target,
   contentCenter = currentContentCenter, contentRadius = currentContentRadius): void {
+  if (activePageLayout === "reader" && targetCamera === camera && currentPdfObject) {
+    applyReaderCameraView(reader.getView(), currentPdfObject);
+    return;
+  }
   const distanceToTarget = targetCamera.position.distanceTo(target);
   const targetOffset = tempClipDelta.subVectors(contentCenter, target).length();
   const span = Math.max(MIN_OBJECT_EXTENT, contentRadius + targetOffset);

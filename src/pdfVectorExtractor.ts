@@ -787,6 +787,12 @@ export function composeVectorScenesInGrid(pageScenes: VectorScene[], requestedPa
   return composeScenesInGrid(pageScenes, requestedPagesPerRow, onDiagnostic);
 }
 
+/** Presentation-only reader column: centered pages, with a 16-point gap. */
+export function composeVectorScenesInColumn(pageScenes: VectorScene[],
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void): VectorScene {
+  return composeScenesInGrid(pageScenes, 1, onDiagnostic, false, true);
+}
+
 /** Internal page alternatives share one origin instead of being laid out in separate grid cells. */
 export function composeOverlappingVectorScenes(pageScenes: VectorScene[]): VectorScene {
   return composeScenesInGrid(pageScenes, 1, undefined, true);
@@ -889,12 +895,12 @@ interface PagePlacement {
 }
 
 function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: number,
-  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, overlap = false): VectorScene {
+  onDiagnostic?: (diagnostic: PdfDiagnostic) => void, overlap = false, column = false): VectorScene {
   if (pageScenes.length === 0) {
     return createEmptyVectorScene();
   }
 
-  if (pageScenes.length === 1) {
+  if (pageScenes.length === 1 && !column) {
     return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(pageScenes[0])) as VectorScene, {
       pageCount: Math.max(1, pageScenes[0].pageRects.length / 4),
       pagesPerRow: 1,
@@ -903,8 +909,13 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   }
 
   const pagesPerRow = normalizePositiveInt(requestedPagesPerRow, 10, 1, 100);
-  const placements = computeGridPlacements(pageScenes, pagesPerRow);
+  const placements = column ? computeColumnPlacements(pageScenes) : computeGridPlacements(pageScenes, pagesPerRow);
   if (overlap) for (const placement of placements) { placement.translateX = 0; placement.translateY = 0; }
+  const firstPage = pageScenes[0];
+  const sharedGlyphs = column && pageScenes.every(scene => scene.textGlyphCount === firstPage.textGlyphCount &&
+    scene.textGlyphSegmentCount === firstPage.textGlyphSegmentCount && scene.textGlyphMetaA === firstPage.textGlyphMetaA &&
+    scene.textGlyphMetaB === firstPage.textGlyphMetaB && scene.textGlyphSegmentsA === firstPage.textGlyphSegmentsA &&
+    scene.textGlyphSegmentsB === firstPage.textGlyphSegmentsB);
 
   let totalFillPathCount = 0;
   let totalFillSegmentCount = 0;
@@ -918,8 +929,8 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let totalMergedSegmentCount = 0;
   let totalSourceTextCount = 0;
   let totalTextInstanceCount = 0;
-  let totalTextGlyphCount = 0;
-  let totalTextGlyphSegmentCount = 0;
+  let totalTextGlyphCount = sharedGlyphs ? firstPage.textGlyphCount : 0;
+  let totalTextGlyphSegmentCount = sharedGlyphs ? firstPage.textGlyphSegmentCount : 0;
   let totalTextClipRectCount = 0;
   let totalTextInPageCount = 0;
   let totalTextOutOfPageCount = 0;
@@ -947,8 +958,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     totalMergedSegmentCount += scene.mergedSegmentCount;
     totalSourceTextCount += scene.sourceTextCount;
     totalTextInstanceCount += scene.textInstanceCount;
-    totalTextGlyphCount += scene.textGlyphCount;
-    totalTextGlyphSegmentCount += scene.textGlyphSegmentCount;
+    if (!sharedGlyphs) {
+      totalTextGlyphCount += scene.textGlyphCount;
+      totalTextGlyphSegmentCount += scene.textGlyphSegmentCount;
+    }
     totalTextClipRectCount += Math.floor((scene.textClipRects?.length ?? 0) / 4);
     totalTextInPageCount += scene.textInPageCount;
     totalTextOutOfPageCount += scene.textOutOfPageCount;
@@ -1000,10 +1013,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   const textInstanceB = new Float32Array(totalTextInstanceCount * 4);
   const textInstanceC = new Float32Array(totalTextInstanceCount * 4);
   const textClipRects = new Float32Array(totalTextClipRectCount * 4);
-  const textGlyphMetaA = new Float32Array(totalTextGlyphCount * 4);
-  const textGlyphMetaB = new Float32Array(totalTextGlyphCount * 4);
-  const textGlyphSegmentsA = new Float32Array(totalTextGlyphSegmentCount * 4);
-  const textGlyphSegmentsB = new Float32Array(totalTextGlyphSegmentCount * 4);
+  const textGlyphMetaA = sharedGlyphs ? firstPage.textGlyphMetaA : new Float32Array(totalTextGlyphCount * 4);
+  const textGlyphMetaB = sharedGlyphs ? firstPage.textGlyphMetaB : new Float32Array(totalTextGlyphCount * 4);
+  const textGlyphSegmentsA = sharedGlyphs ? firstPage.textGlyphSegmentsA : new Float32Array(totalTextGlyphSegmentCount * 4);
+  const textGlyphSegmentsB = sharedGlyphs ? firstPage.textGlyphSegmentsB : new Float32Array(totalTextGlyphSegmentCount * 4);
   const pageRects = new Float32Array(totalPageRectCount * 4);
   const pendingPagePreviews = pageScenes.some(scene => scene.pendingPagePreviews?.some(Boolean))
     ? new Uint8Array(totalPageRectCount) : undefined;
@@ -1025,7 +1038,12 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
   let combinedBounds: Bounds | null = null;
   let combinedPageBounds: Bounds | null = null;
 
-  const layers = composeOptionalContent(pageScenes.map(scene => scene.optionalContent));
+  // Independent views of a HEP retain the same document-wide condition table.
+  // Reuse it instead of repeating every document condition for every page.
+  const sharedLayers = column && pageScenes.every(scene => scene.optionalContent === pageScenes[0].optionalContent);
+  const layers = sharedLayers
+    ? { data: pageScenes[0].optionalContent, offsets: pageScenes.map(() => 0), droppedAnnotationLayers: 0 }
+    : composeOptionalContent(pageScenes.map(scene => scene.optionalContent));
   if (layers.droppedAnnotationLayers) onDiagnostic?.({ code: "annotation.layer-limit", severity: "warning",
     message: `${layers.droppedAnnotationLayers} annotation appearance(s) exceed the scene's layer limit and cannot be hidden individually.`,
     details: { annotationCount: layers.droppedAnnotationLayers } });
@@ -1309,7 +1327,7 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       textClipRectOffset += sceneClipRects.length / 4;
     }
 
-    for (let i = 0; i < scene.textGlyphCount; i += 1) {
+    for (let i = 0; !sharedGlyphs && i < scene.textGlyphCount; i += 1) {
       const src = i * 4;
       const dst = (textGlyphOffset + i) * 4;
       textGlyphMetaA[dst] = scene.textGlyphMetaA[src] + textGlyphSegmentOffset;
@@ -1323,8 +1341,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
       textGlyphMetaB[dst + 3] = scene.textGlyphMetaB[src + 3];
     }
 
-    textGlyphSegmentsA.set(scene.textGlyphSegmentsA, textGlyphSegmentOffset * 4);
-    textGlyphSegmentsB.set(scene.textGlyphSegmentsB, textGlyphSegmentOffset * 4);
+    if (!sharedGlyphs) {
+      textGlyphSegmentsA.set(scene.textGlyphSegmentsA, textGlyphSegmentOffset * 4);
+      textGlyphSegmentsB.set(scene.textGlyphSegmentsB, textGlyphSegmentOffset * 4);
+    }
 
     const scenePageRects = scene.pageRects;
     if (scenePageRects.length >= 4) {
@@ -1391,8 +1411,10 @@ function composeScenesInGrid(pageScenes: VectorScene[], requestedPagesPerRow: nu
     gradientStrokeSegmentOffset += scene.gradientStrokeSegmentCount;
     segmentOffset += scene.segmentCount;
     textInstanceOffset += scene.textInstanceCount;
-    textGlyphOffset += scene.textGlyphCount;
-    textGlyphSegmentOffset += scene.textGlyphSegmentCount;
+    if (!sharedGlyphs) {
+      textGlyphOffset += scene.textGlyphCount;
+      textGlyphSegmentOffset += scene.textGlyphSegmentCount;
+    }
   }
 
   const primaryRasterLayer = rasterLayers[0] ?? null;
@@ -1877,6 +1899,16 @@ function computeGridPlacements(pageScenes: VectorScene[], pagesPerRow: number): 
   }
 
   return placements;
+}
+
+function computeColumnPlacements(pageScenes: VectorScene[]): PagePlacement[] {
+  let top = 0;
+  return pageScenes.map(scene => {
+    const bounds = normalizeSceneBounds(scene.pageBounds, scene.bounds);
+    const placement = { translateX: -(bounds.minX + bounds.maxX) / 2, translateY: top - bounds.maxY };
+    top -= Math.max(bounds.maxY - bounds.minY, 1e-3) + 16;
+    return placement;
+  });
 }
 
 function normalizeSceneBounds(primary: Bounds, fallback: Bounds): Bounds {

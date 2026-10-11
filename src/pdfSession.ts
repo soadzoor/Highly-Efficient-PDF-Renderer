@@ -228,6 +228,8 @@ export interface NativeVectorCompileOptions extends PdfCompileOptions {
   readonly ocrTextOnly?: boolean;
   /** Content-aware overview: preserve vectors, use OCR for scans, bound scans without OCR. */
   readonly previewMaxDimension?: number;
+  /** Thumbnails retain scan appearance instead of substituting stored OCR text. */
+  readonly previewAppearance?: boolean;
   /** Internal capability probes can require direct vector output. Normal loading falls back to pixels. */
   readonly vectorFallback?: "raster" | "error";
   /** Internal compatibility retry for features still using the grouped bridge. */
@@ -566,6 +568,7 @@ class NativePdfSession implements NativeVectorPdfSession {
           this.appendDiagnostics([{ code: "page-overview-inspection-unavailable", severity: "warning", pageIndex: sourcePageIndex,
             message: "Page content could not be classified for an overview; using the normal compatibility renderer.", details: { reason: error.message } }]);
         }
+        if (overviewKind === "ocr" && options.previewAppearance) overviewKind = "raster";
         if (overviewKind === "ocr") {
           try {
             const { compileNativeOcrTextPage } = await import("./pdf/nativeOcrText");

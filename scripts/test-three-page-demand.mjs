@@ -98,6 +98,11 @@ try {
   camera.zoom = 1; camera.updateProjectionMatrix(); object.updatePageDemand(host, camera); await flush();
   assert.equal(object.rasterMaterialLayer.appliedRasterLayers[1].width, 1024);
   assert.equal(calls.length, 2, "cached detail returns without another parse");
+  const callsBeforeThumbnail = calls.length, sceneBeforeThumbnail = object.sceneData;
+  const cachedThumbnail = await object.getPagePreviewScene(0, { maximumDimension: 144 });
+  assert.equal(cachedThumbnail.rasterLayers[0].width, 144);
+  assert.equal(calls.length, callsBeforeThumbnail, "Three thumbnails reuse resident original pixels");
+  assert.equal(object.sceneData, sceneBeforeThumbnail, "Three thumbnail extraction preserves the displayed scene");
   assert(changes.filter(reason => reason === "pages-loaded").length >= 3);
 
   for (let completion = 0; completion < 2; completion++) {
@@ -144,6 +149,23 @@ try {
   assert.equal(session.closed, true);
   assert.equal(disposed, 1);
   await assert.rejects(object.loadCompleteScene(), /disposed|closed/i);
+  await assert.rejects(object.getPagePreviewScene(0, { maximumDimension: 144 }), /disposed|closed/i);
+
+  const { buildStrokeScene } = await import("../src/strokeSceneBuilder.ts");
+  const hepScene = composeVectorScenesInGrid([buildStrokeScene([{ points:[[0,0],[10,10]] }]),
+    buildStrokeScene([{ points:[[0,0],[20,20]] }])], 2);
+  const hepObject = await createThreePdfObject({ scene: hepScene, sourceKind: "hep", sourceLabel: "source-free HEP" },
+    { vectorLod: "off", textLod: "off" }, undefined, undefined, () => native);
+  try {
+    assert.equal(hepObject.sourceBytes, undefined);
+    const preview = await hepObject.getPagePreviewScene(1, { maximumDimension: 144 });
+    assert.equal(preview.pageCount, 1); assert.equal(preview.segmentCount, 1);
+    assert.deepEqual(preview.endpoints, hepScene.endpoints.slice(4,8), "HEP thumbnail keeps exact page vectors without original PDF bytes");
+    assert.equal(hepObject.sceneData, hepScene);
+    await assert.rejects(hepObject.getPagePreviewScene(2, { maximumDimension: 144 }), RangeError);
+    const cancelled = new AbortController(); cancelled.abort(Error("sidebar hidden"));
+    await assert.rejects(hepObject.getPagePreviewScene(0, { maximumDimension: 144, signal: cancelled.signal }), /sidebar hidden/);
+  } finally { hepObject.dispose(); }
 
   let enterExport;
   const exportEntered = new Promise(resolve => { enterExport = resolve; });

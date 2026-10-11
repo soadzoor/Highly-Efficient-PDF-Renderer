@@ -40,7 +40,8 @@ import type {
 // Version 12 requires workers to honor text-only viewing instead of decoding scans.
 // Version 13 preserves vector overviews and substitutes OCR before scan decoding.
 // Version 14 requires workers to honor the embedded-font painting policy.
-export const PDF_WORKER_PROTOCOL_VERSION = 14 as const;
+// Version 15 preserves scan appearance for independent page thumbnails.
+export const PDF_WORKER_PROTOCOL_VERSION = 15 as const;
 
 /** Clone-safe subset of RequestInit used by the worker's GET-only URL reader. */
 export interface PdfWorkerRequestInit {
@@ -97,6 +98,7 @@ export interface PdfWorkerCompileOptions {
 export interface PdfWorkerVectorCompileOptions extends PdfWorkerCompileOptions {
   readonly ocrTextOnly?: boolean;
   readonly previewMaxDimension?: number;
+  readonly previewAppearance?: boolean;
   readonly vectorFallback?: NativeVectorCompileOptions["vectorFallback"];
   readonly enableSegmentMerge?: NativeVectorCompileOptions["enableSegmentMerge"];
   readonly enableInvisibleCull?: NativeVectorCompileOptions["enableInvisibleCull"];

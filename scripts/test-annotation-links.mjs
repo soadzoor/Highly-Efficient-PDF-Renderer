@@ -192,6 +192,7 @@ try {
   let nativeView = { cameraCenterX: 0, cameraCenterY: 0, zoom: 4 };
   const context = vm.createContext({ createViewerLinkNavigation, canvasElement: canvas, lastParsedScene: scene,
     renderer: { getViewState: () => nativeView, setViewState: v => { nativeView = v; } },
+    navigateNativeView: value => { nativeView = value; }, readerViewport: null,
     lastDownloadablePdf: undefined, canvasInteractionController: { cancelActiveGesture() {} }, target });
   window.reducedMotion = true;
   vm.runInContext(stripTypeScriptTypes(binding[0]), context);

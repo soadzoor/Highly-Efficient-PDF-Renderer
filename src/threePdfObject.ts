@@ -26,7 +26,8 @@ import { composeVectorScenesInGrid, type RasterLayer } from "./pdfVectorExtracto
 import { copyRasterLayer } from "./monochromeRaster";
 import { hasVisiblePagePlaceholders, pagePlaceholderAnimationEnabled } from "./pageLoadingPlaceholder";
 import { prepareSceneForHepRendering } from "./hepShared";
-import type { PdfPageDemandLoader } from "./pdfPageDemand";
+import type { PagePreviewSceneOptions, PdfPageDemandLoader } from "./pdfPageDemand";
+import { buildRasterScenePreview } from "./pageRasterPreview";
 import type { LoadedPdfScene } from "./pdfObjectGenerator";
 import type { LoadProgressCallback } from "./loadProgress";
 import type { RendererApi } from "./rendererTypes";
@@ -769,6 +770,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   readonly sourceBytes: Uint8Array | undefined;
   readonly sourceOptions: LoadedPdfScene["sourceOptions"];
   private readonly pageDemand: PdfPageDemandLoader | undefined;
+  private previewPagePartition: ScenePageViews | null = null;
   private loadingAnimationActive = false;
   private demandUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private demandUpdatePending = false;
@@ -1096,6 +1098,24 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
   }
   pausePageLoading(): void { this.pageDemand?.pause(); }
   resumePageLoading(): void { this.pageDemand?.resume(); }
+
+  /** A small, self-contained page scene for thumbnails, including HEPs without source PDF bytes. */
+  async getPagePreviewScene(index: number, options: PagePreviewSceneOptions): Promise<LoadedPdfScene["scene"]> {
+    const signal = options.signal ? AbortSignal.any([options.signal, this.pagePreparationAbort.signal])
+      : this.pagePreparationAbort.signal;
+    signal.throwIfAborted();
+    if (!Number.isInteger(index) || index < 0 || index >= this.pageCount) throw new RangeError("Invalid page index.");
+    if (!Number.isSafeInteger(options.maximumDimension) || options.maximumDimension < 16 || options.maximumDimension > 4096) {
+      throw new RangeError("Page preview dimensions must be integers from 16 through 4096.");
+    }
+    if (this.pageDemand) return await this.pageDemand.getPagePreviewScene(index, { ...options, signal });
+    const partition = this.pagePartition?.scene === this.sceneData ? this.pagePartition
+      : this.previewPagePartition?.scene === this.sceneData ? this.previewPagePartition
+      : this.previewPagePartition = new ScenePageViews(this.sceneData);
+    const scene = buildRasterScenePreview(partition.extract(index).scene, options.maximumDimension);
+    signal.throwIfAborted();
+    return scene;
+  }
 
   /** Complete geometry for analysis/export, reusing loaded canonical pages and the active PDF session. */
   async loadCompleteScene(options: { signal?: AbortSignal; pages?: string; onProgress?: LoadProgressCallback } = {}): Promise<LoadedPdfScene["scene"]> {
@@ -2599,7 +2619,7 @@ export class HeprThreePdfObject extends THREE.Group<HeprThreePdfObjectEventMap> 
     for (const page of this.pageViews ?? []) { page.object.removeFromParent(); page.object.dispose(); }
     this.pageBatch?.removeFromParent(); this.pageBatch?.dispose(); this.pageBatch = null; this.pageBatchActive = false;
     this.pageTransforms?.dispose();
-    this.pageViews = null; this.pagePartition = null; this.pagePreparation = null;
+    this.pageViews = null; this.pagePartition = null; this.previewPagePartition = null; this.pagePreparation = null;
     this.searchHighlightMatches = []; this.textSelectionHighlightRects = [];
     this.primitivePicker?.dispose();
     this.annotationIndex?.dispose(); this.annotationIndex = null;

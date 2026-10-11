@@ -4,7 +4,7 @@ registerHooks({ resolve(specifier, context, next) {
   return next(context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)
     ? `${specifier}.ts` : specifier, context);
 } });
-const { createSceneTextSearcher, createSearchHighlightSet, flattenSearchMatchHighlightBounds } = await import("../src/textSearch.ts");
+const { createSceneTextSearcher, createSearchHighlightSet, flattenSearchMatchHighlightBounds, createTextSearchController } = await import("../src/textSearch.ts");
 const { prepareSearchHighlights } = await import("../src/searchHighlights.ts");
 
 function createFallbackScene(text, positionForChar) {
@@ -247,4 +247,20 @@ assert.equal(
   "an unknown fallback direction must not merge aligned glyphs across a separator"
 );
 
-console.log("Text search highlight geometry checks passed.");
+// A scrolling host owns navigation when supplied; legacy consumers still move their renderer.
+globalThis.window = { devicePixelRatio: 2 };
+const rendererViews = [], delegatedViews = [];
+const renderer = { getViewState: () => ({ cameraCenterX: 0, cameraCenterY: 0, zoom: 1 }),
+  setViewState: view => rendererViews.push(view) };
+const controllerOptions = { getRenderer: () => renderer, getCanvas: () => ({ width: 1600, height: 1200 }),
+  onStateChange() {}, onMatchesChange() {} };
+const legacy = createTextSearchController(controllerOptions);
+legacy.setScene(oneGlyphWrapScene); legacy.setQuery("a");
+assert.equal(rendererViews.length, 1);
+const scrolling = createTextSearchController({ ...controllerOptions, navigateToView: view => delegatedViews.push(view) });
+scrolling.setScene(oneGlyphWrapScene); scrolling.setQuery("a");
+assert.equal(rendererViews.length, 1, "delegation avoids bypassing the scroll controller");
+assert.deepEqual(delegatedViews[0], rendererViews[0], "both paths receive the same backing-pixel camera view");
+delete globalThis.window;
+
+console.log("Text search highlight geometry and navigation checks passed.");

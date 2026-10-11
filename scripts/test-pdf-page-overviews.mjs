@@ -49,6 +49,20 @@ try {
     assert.equal(overview.rasterLayers.length, 0);
   } finally { await worker.close(); }
 
+  for (const open of [openPdf, openPdfInNodeWorker]) {
+    const scan = await open({ kind: "bytes", bytes: fixture(imageSize), ownership: "copy" });
+    try {
+      const appearance = await scan.compileVectorPage(0, { previewMaxDimension: 64, previewAppearance: true });
+      assert.equal(appearance.pdfOverviewKind, "raster", "thumbnail preview keeps the original scan instead of substituting OCR");
+      assert.equal(appearance.rasterLayers[0].width, 64);
+      assert.equal(appearance.rasterLayers[0].height, 32);
+      assert.equal(appearance.textInstanceCount, 0, "invisible OCR remains invisible in the appearance preview");
+      const textOnly = await scan.compileVectorPage(0, { previewMaxDimension: 64, previewAppearance: true, ocrTextOnly: true });
+      assert.equal(textOnly.textInstanceCount, 2, "explicit text-only viewing takes precedence over thumbnail appearance");
+      assert.equal(textOnly.rasterLayers.length, 0);
+    } finally { await scan.close(); }
+  }
+
   for (const options of [{ content: "" }, { toUnicode: false }]) {
     const scan = await openPdf({ kind: "bytes", bytes: fixture({ ...imageSize, ...options }) });
     try {

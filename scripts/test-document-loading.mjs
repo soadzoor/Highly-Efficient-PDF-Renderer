@@ -39,6 +39,9 @@ const context = vm.createContext({
   loadToken: 0, activeSceneLoadToken: null, pendingSourceLoadCount: 0, sourceLoadSerial: 0,
   sourceLoadController: null, activeHepExportController: null,
   activePdfPageLoader: null, demandPdfUpdatePending: false,
+  layoutChangeRunning: false, nativeLayout: "grid", readerViewport: null, gridViewState: null, readerViewState: null,
+  nativeLoadPreparation: null,
+  lastCanonicalScene: null, documentPageScenes: null, canonicalPagesPerRow: 1,
   lastLoadedSource: null, lastDownloadablePdf: null, lastParsedScene: null,
   lastLoadedPdfPassword: undefined, loadedOcrTextOnly: false, ocrTextCheckbox: { checked: false, disabled: false },
   loadedPageStreaming: false, pageStreamingCheckbox: { checked: false, disabled: false },
@@ -59,6 +62,8 @@ const context = vm.createContext({
   setMetricPlaceholder: noop, updateParsingLoaderProgress: event => exportProgress.push(event.value),
   logSegmentMergeStats: noop, logInvisibleCullStats: noop, logTextVectorStats: noop,
   logTextureSizeStats: noop, applyTextSearchScene: noop, refreshDropIndicator: noop,
+  layerVisibility: { rendererChanged: noop }, textSelection: { refreshHighlights: noop },
+  drawingSelection: { rendererChanged: noop }, annotationInteraction: null, lastSearchHighlights: null,
   updateMetricsPanel: (_label, value) => nativeLoadEvents.push({ event: "metrics", id: value.id }),
   warmNativeRenderer: async (target, signal) => {
     assert.equal(target, context.renderer);
@@ -78,6 +83,12 @@ const context = vm.createContext({
   loadSceneFromHep: async (buffer, options) => (await nextParse(buffer, {}, options.signal))[0],
   computeAutoPagesPerRow: () => 1,
   composeVectorScenesInGrid: (pages) => pages[0],
+  composeVectorScenesInColumn: pages => ({ ...pages[0], pagesPerRow: 1, presentation: "reader" }),
+  ScenePageViews: class {
+    constructor(scene) { this.scene = scene; this.pageCount = scene.pageCount; }
+    extract() { return { scene: this.scene }; }
+  },
+  updateNativePresentation: layout => { context.nativeLayout = layout; },
   prepareSceneForHepRendering: (value) => value,
   listSceneRasterLayers: () => [], resolveSceneFitBounds: () => ({}),
   hasStoredVectorStrokeLod: () => false,
@@ -115,7 +126,7 @@ const context = vm.createContext({
 for (const name of [
   "loadExampleSelection", "loadPdfFile", "loadHepFile", "loadPdfBuffer", "loadHepBuffer",
   "getExtractionOptions", "buildPdfPageCacheKey", "getCachedPdfPageScenes", "storeCachedPdfPageScenes",
-  "commitLoadedSource", "uploadSceneWithRollback", "beginSourceLoad", "finishSourceLoad",
+  "commitLoadedSource", "uploadSceneWithRollback", "prepareNativeSceneLoad", "beginSourceLoad", "finishSourceLoad",
   "isCurrentSourceLoad", "beginSceneLoad", "finishSceneLoad", "updateBackendSelectDisabledState", "downloadHep",
   "reloadPdfViewingOptions"
 ]) vm.runInContext(sourceFunction(source, name), context);
@@ -307,6 +318,8 @@ assert.deepEqual(view, beforeOcrView);
 
 await testThreeDocumentReplacement();
 await testNativeWarmupLoads();
+await testNativeReaderLoadPreparation();
+await testNativeReaderExports();
 await testScanCompressionPreferences();
 await testThreeHepExports();
 await testHepLodPrompt();
@@ -325,7 +338,7 @@ async function testScanCompressionPreferences() {
     ocrTextCheckbox: { checked: false }, pageStreamingCheckbox: { checked: false },
     compressScansCheckbox: { checked: true }, backendSelectElement: {},
     lastLoadedSource: null, lastLoadedPdfPassword: undefined, lastDownloadablePdf: null,
-    pendingSourceLoadCount: 0, activeSceneLoadToken: null, activeHepExportController: null,
+    pendingSourceLoadCount: 0, activeSceneLoadToken: null, activeHepExportController: null, layoutChangeRunning: false,
     activePdfPageLoader: null, sourceLoadController: null,
     setDownloadPdfButtonState: noop, cancelActiveHepExport: noop,
     beginSourceLoad: () => { host.sourceLoadController = new AbortController(); return 1; },
@@ -431,6 +444,9 @@ async function testScanCompressionPreferences() {
   const threeSource = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
   const three = vm.createContext({
     currentPdfObject: null, loadedCompressScansPreference: true, lastNativeDrawStats: null,
+    activePageLayout: "grid", readerDocumentIdentity: null, readerPageRects: new Float32Array(),
+    readerNavigationSource: null, readerNavigationScene: null, reader: threeReaderMock(),
+    getReaderPageRects: () => new Float32Array(), syncPageCameraControls: noop,
     ocrTextCheckboxElement: { checked: false }, pageStreamingCheckboxElement: { checked: false },
     compressScansCheckboxElement: { checked: true }, openButtonElement: {}, fileInputElement: {},
     exampleDropdown: { setDisabled: noop }, pageLayoutButtons: [],
@@ -546,7 +562,7 @@ function testNativePageDemandFrames() {
   const host = vm.createContext({
     performance: { now: () => now }, activePdfPageLoader: { update: view => views.push(view) },
     lastParsedScene: { pageRects: Float32Array.of(0, 0, 600, 800) },
-    activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
+    activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null, layoutChangeRunning: false,
     lastRuntimeTextUpdate: now,
     renderer: { getPresentedViewState: () => ({ cameraCenterX: 300, cameraCenterY: 400, zoom }) },
     canvasElement: { width: 400, height: 500 }, updateFpsMetric: noop, drawCallMeter: { update: noop },
@@ -576,7 +592,7 @@ async function openShortDocument(buffer, options) {
     async close() {} };
 }
 function scene(id) {
-  return { id, segmentCount: 1, textInstanceCount: 0, fillPathCount: 0 };
+  return { id, segmentCount: 1, textInstanceCount: 0, fillPathCount: 0, pageCount: 1, pagesPerRow: 1 };
 }
 function assertDocument(id, label) {
   assert.equal(context.lastParsedScene.id, id);
@@ -598,6 +614,87 @@ async function assertExport(id, label) {
   assert.equal(exports.at(-1).options.withVectorLod, true);
   assert.equal(exports.at(-1).options.withTextLod, true);
   assert.deepEqual(downloads.slice(downloadCount), [`${label}-parsed-data-lod.hep`]);
+}
+
+async function testNativeReaderExports() {
+  const prior = { nextParse, grid: context.composeVectorScenesInGrid, column: context.composeVectorScenesInColumn,
+    auto: context.computeAutoPagesPerRow };
+  const canonical = { ...scene(94), pageCount: 2, pagesPerRow: 2 };
+  const reader = { ...canonical, pagesPerRow: 1, presentation: "reader" };
+  try {
+    nextParse = async () => [scene(94), scene(94)];
+    context.compressScansCheckbox.checked = true;
+    context.ocrTextCheckbox.checked = false;
+    context.pageStreamingCheckbox.checked = false;
+    context.computeAutoPagesPerRow = () => 2;
+    context.composeVectorScenesInGrid = (_pages, rows) => { assert.equal(rows, 2); return canonical; };
+    context.composeVectorScenesInColumn = () => reader;
+    await context.loadPdfFile(file("reader-book.pdf", 94));
+    assert.equal(context.nativeLayout, "reader", "multi-page PDF opens in Reader");
+    assert.equal(context.lastParsedScene, reader, "Reader uploads its presentation scene");
+    assert.equal(context.lastCanonicalScene, canonical, "saved grid remains independent of Reader");
+    await assertExport(94, "reader-book.pdf");
+    assert.equal(exports.at(-1).scene, canonical, "Reader export serializes the canonical grid by reference");
+    nextParse = async () => { throw new Error("broken replacement"); };
+    await context.loadPdfFile(file("broken-reader.pdf", 95));
+    assert.equal(context.lastParsedScene, reader);
+    assert.equal(context.lastCanonicalScene, canonical, "failed sources preserve the canonical export scene");
+    assert.equal(context.nativeLayout, "reader");
+
+    context.loadedOcrTextOnly = true;
+    nextParse = async () => [{ ...canonical, complete: true }];
+    await context.downloadHep();
+    assert.equal(completeParses.at(-1).options.maxPagesPerRow, 2,
+      "OCR completion exports the canonical row count instead of Reader's one column");
+    context.loadedOcrTextOnly = false;
+
+    nextParse = async () => [canonical];
+    await context.loadHepFile(file("reader-book.hep", 94));
+    assert.equal(context.nativeLayout, "reader", "multi-page HEP opens in Reader");
+    assert.equal(context.lastCanonicalScene, canonical, "HEP retains its exact decoded scene");
+    await context.downloadHep();
+    assert.equal(exports.at(-1).scene, canonical, "HEP export reuses its exact saved layout");
+
+    const readerState = { view: { centerX: 0, centerY: -900, zoom: 2 }, fit: "width", sidebarOpen: true };
+    const restored = [], uploads = [], cameraViews = [];
+    const controls = { snapshot: () => readerState, restore: state => restored.push(state), setLayout: noop,
+      goToPage: () => assert.fail("returning to Reader must restore its saved scroll and fit state") };
+    const host = vm.createContext({
+      lastParsedScene: reader, lastCanonicalScene: canonical, documentPageScenes: [scene(94), scene(94)],
+      lastLoadedSource: { bytes: Uint8Array.of(94) }, lastParsedSceneLabel: "reader-book.hep", nativeLayout: "reader",
+      layoutChangeRunning: false, activeSceneLoadToken: null, pendingSourceLoadCount: 0, activeHepExportController: null,
+      activePdfPageLoader: null, canonicalPagesPerRow: 2, gridViewState: null, readerViewState: null,
+      backendSwitcher: { isSwitchInFlight: () => false, getActiveBackend: () => "webgl" },
+      readerViewport: controls, canvasElement: { width: 800, getBoundingClientRect: () => ({ width: 800 }) },
+      renderer: { getViewState: () => ({ cameraCenterX: 0, cameraCenterY: 0, zoom: 1 }),
+        setViewState: state => cameraViews.push(state), fitToBounds: noop },
+      resolveSceneFitBounds: () => ({}),
+      readerCaptureAnchor: () => ({}), readerRestoreAnchor: (_rects, _anchor, zoom) => ({ centerX: 0, centerY: 0, zoom }),
+      uiControlManager: { readVectorLodModeInput: () => "auto" }, prebuildVectorStrokeLodRuntime: async () => {},
+      prebuildTextLod: async () => {}, updateBackendSelectDisabledState: noop,
+      composeVectorScenesInColumn: () => reader,
+      uploadSceneWithRollback: (_renderer, value) => { uploads.push(value); return stats; },
+      updateNativePresentation: layout => { host.nativeLayout = layout; },
+      layerVisibility: { sceneChanged: async preserve => assert.equal(preserve, true) },
+      applyTextSearchScene: noop, updateMetricsPanel: noop, setStatus: message => assert.fail(message)
+    });
+    vm.runInContext(sourceFunction(source, "changeNativeLayout"), host);
+    await host.changeNativeLayout("grid");
+    assert.equal(host.lastParsedScene, canonical, "switching HEP to Grid restores the original scene object");
+    assert.equal(host.nativeLayout, "grid");
+    await host.changeNativeLayout("reader");
+    assert.equal(host.lastParsedScene, reader);
+    assert.equal(restored.at(-1), readerState, "returning to Reader restores its scroll, fit and sidebar state");
+    const gridState = host.gridViewState;
+    await host.changeNativeLayout("grid");
+    assert.equal(cameraViews.at(-1), gridState, "returning to Grid restores its saved camera");
+    assert.deepEqual(uploads, [canonical, reader, canonical]);
+  } finally {
+    nextParse = prior.nextParse;
+    context.composeVectorScenesInGrid = prior.grid;
+    context.composeVectorScenesInColumn = prior.column;
+    context.computeAutoPagesPerRow = prior.auto;
+  }
 }
 
 async function testNativeHepExports() {
@@ -891,6 +988,29 @@ async function testNativeBackendLoading() {
   assert.equal(renderer.canvas, canvas);
   assert.deepEqual(initialized, [renderer]);
   assert(renderer instanceof host.webGpuRendererClass, "Capture retains the loaded constructor for profiler checks");
+
+  const backendSource = await readFile(new URL("../src/backendSwitcher.ts", import.meta.url), "utf8");
+  const previousCanvas = {}, replacementCanvas = { replaceWith: noop };
+  const previousRenderer = {}, provisionalRenderer = {};
+  let attachedCanvas = replacementCanvas;
+  const rollbackHost = vm.createContext({
+    canvasElement: replacementCanvas, canvasResizeObserver: { disconnect: noop, observe: noop },
+    readerViewport: { canvasChanged: () => { attachedCanvas = rollbackHost.canvasElement; } }
+  });
+  const canvasHook = source.match(/setCanvasElement: \(nextCanvas\) => \{([\s\S]*?)\n  \},/);
+  assert(canvasHook, "native backend canvas hook is present");
+  vm.runInContext(`function setCanvasElement(nextCanvas) {${canvasHook[1]}\n}`, rollbackHost);
+  vm.runInContext(sourceFunction(backendSource, "restorePreviousRendererAndCanvas"), rollbackHost);
+  let activeRenderer = provisionalRenderer;
+  assert.equal(rollbackHost.restorePreviousRendererAndCanvas({
+    getRenderer: () => activeRenderer,
+    setRenderer: next => { activeRenderer = next; rollbackHost.readerViewport.canvasChanged(); },
+    getCanvasElement: () => rollbackHost.canvasElement,
+    setCanvasElement: rollbackHost.setCanvasElement,
+    attachCanvasInteractionListeners: noop, resetPointerInteractionState: noop
+  }, previousRenderer, previousCanvas, replacementCanvas, true, provisionalRenderer), null);
+  assert.equal(attachedCanvas, previousCanvas,
+    "backend rollback reattaches Reader gestures to the restored canvas after restoring its renderer");
 }
 
 async function testThreeDocumentReplacement() {
@@ -915,8 +1035,13 @@ async function testThreeDocumentReplacement() {
     pdfObjectGenerator: async (name, options) => {
       options.signal.throwIfAborted();
       const object = demoObject(name);
+      object.pageCount = 2;
+      object.subscribePagePreparationProgress = () => noop;
+      object.getPages = async ({ signal }) => { signal.throwIfAborted(); return [object]; };
       object.compileForThreeRenderer = async (renderer, _camera, signal) => {
         assert.equal(renderer, host.renderer);
+        assert.equal(object.preparedLayout, "reader", "multi-page documents are arranged before shader preparation");
+        assert.equal(_camera.readerView.zoom, 1, "first-submit shaders prepare the readable Reader camera");
         if (name === "D") { compileStarted(); await compilation; }
         signal.throwIfAborted();
         if (name === "F") throw new Error("shader compilation failed");
@@ -931,7 +1056,14 @@ async function testThreeDocumentReplacement() {
       }
       return { label: name };
     },
-    replacePdfObject: (object) => {
+    createPageLayoutView: (object, pages) => ({ object, pages, layoutPages: [], layout: "grid", targets: [] }),
+    computeExamplePageLayout: layout => [layout],
+    applyExamplePageLayout: (pages, targets) => { pages[0].preparedLayout = targets[0]; },
+    getInitialReaderView: () => ({ centerX: 0, centerY: -200, zoom: 1, width: 800, height: 600 }),
+    applyReaderCameraView: (view, _object, camera) => { camera.readerView = view; },
+    setPageLayoutProgress: noop,
+    replacePdfObject: (object, options) => {
+      assert.equal(options.pageLayoutView.layout, "reader", "the first presented document installs its prepared Reader layout");
       host.currentPdfObject.dispose();
       host.currentPdfObject = object;
     },
@@ -1070,6 +1202,83 @@ async function testNativeWarmupLoads() {
   }
 }
 
+async function testNativeReaderLoadPreparation() {
+  const previous = { nextParse, presentation: context.updateNativePresentation, viewport: context.readerViewport };
+  let identity = context.lastLoadedSource.bytes;
+  let controls = { view: { centerX: 0, centerY: -480, zoom: 1.5 }, fit: "width", sidebarOpen: true, pageIndex: 0 };
+  const fitCamera = { cameraCenterX: 0, cameraCenterY: -480, zoom: 1.5 };
+  context.readerViewport = {
+    snapshot: () => controls,
+    restore: state => { controls = state; view = { cameraCenterX: state.view.centerX,
+      cameraCenterY: state.view.centerY, zoom: state.view.zoom }; }
+  };
+  context.updateNativePresentation = (layout, _pages, sourceIdentity) => {
+    context.nativeLayout = layout;
+    if (identity !== sourceIdentity) {
+      controls = { view: { centerX: 0, centerY: -480, zoom: 1.5 }, fit: "width", sidebarOpen: true, pageIndex: 0 };
+      identity = sourceIdentity;
+    }
+    if (layout === "reader") view = fitCamera;
+  };
+  nextParse = async buffer => {
+    const value = { ...scene(new Uint8Array(buffer)[0]), pageCount: 2 };
+    return [value, value];
+  };
+  try {
+    for (const kind of ["pdf", "hep"]) {
+      const id = kind === "pdf" ? 96 : 97;
+      duringNativeWarmup = value => {
+        if (value.id !== id) return;
+        assert.equal(context.nativeLayout, "reader", "Reader presentation is installed before its first warm frame");
+        assert.equal(identity[0], id, "the staged controller belongs to the document being warmed");
+        assert.deepEqual(view, fitCamera, "the first visible Reader camera fits the first page instead of the entire column");
+        assert.equal(context.nativeLoadPreparation.scene, uploadedScene);
+        assert.notEqual(context.lastLoadedSource.bytes[0], id, "source ownership is committed after warm-up");
+      };
+      await (kind === "pdf" ? context.loadPdfFile(file("prepared.pdf", id)) : context.loadHepFile(file("prepared.hep", id)));
+      assert.equal(context.lastLoadedSource.bytes[0], id);
+      assert.equal(context.nativeLoadPreparation, null);
+
+      const committedScene = context.lastParsedScene, canonical = context.lastCanonicalScene;
+      const committedIdentity = identity;
+      const saved = { view: { centerX: 15, centerY: -1230, zoom: 2.25 }, fit: null, sidebarOpen: false, pageIndex: 1 };
+      controls = saved;
+      view = { cameraCenterX: saved.view.centerX, cameraCenterY: saved.view.centerY, zoom: saved.view.zoom };
+      const camera = { ...view };
+      duringNativeWarmup = () => { throw new Error("frame preparation failed"); };
+      await (kind === "pdf" ? context.loadPdfFile(file("failed-warm.pdf", id + 2)) : context.loadHepFile(file("failed-warm.hep", id + 2)));
+      assert.equal(uploadedScene, committedScene, "warm-up failure restores the previous GPU scene");
+      assert.equal(context.lastParsedScene, committedScene);
+      assert.equal(context.lastCanonicalScene, canonical);
+      assert.equal(identity, committedIdentity, "warm-up failure restores the previous controller source");
+      assert.equal(controls, saved, "rollback restores page, fit, zoom and sidebar snapshot");
+      assert.deepEqual(view, camera, "rollback restores the previous camera exactly");
+
+      let enterWarmup, finishWarmup;
+      const started = new Promise(resolve => { enterWarmup = resolve; });
+      const pending = new Promise(resolve => { finishWarmup = resolve; });
+      duringNativeWarmup = () => { enterWarmup(); return pending; };
+      const loading = kind === "pdf" ? context.loadPdfFile(file("cancel-warm.pdf", id + 4))
+        : context.loadHepFile(file("cancel-warm.hep", id + 4));
+      await started;
+      await context.loadPdfFile({ name: "unreadable-replacement.pdf", arrayBuffer: async () => { throw new Error("read failed"); } });
+      await loading;
+      assert.equal(uploadedScene, committedScene, "cancelling preparation restores the old GPU scene even if the newer source fails to read");
+      assert.equal(context.lastLoadedSource.bytes, committedIdentity);
+      assert.equal(controls, saved);
+      assert.deepEqual(view, camera);
+      finishWarmup();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(uploadedScene, committedScene, "late cancelled warm-up cannot replace the restored document");
+    }
+  } finally {
+    nextParse = previous.nextParse;
+    duringNativeWarmup = null;
+    context.updateNativePresentation = previous.presentation;
+    context.readerViewport = previous.viewport;
+  }
+}
+
 async function testRoomDocumentReplacement() {
   const source = await readFile(new URL("../src/room-overlay-demo.ts", import.meta.url), "utf8");
   const host = demoHost();
@@ -1117,11 +1326,12 @@ async function testRoomDocumentReplacement() {
 
 async function testThreeBackendReplacement() {
   const source = await readFile(new URL("../src/three-example.ts", import.meta.url), "utf8");
-  for (const failure of ["none", "renderer", "layers", "text-view", "compile", "cancel"]) {
+  for (const failure of ["none", "renderer", "layers", "text-view", "compile", "cancel", "reader-layout"]) {
     const reparseSource = failure === "text-view";
     const targetBackend = reparseSource ? "webgl" : "webgpu";
     const failRenderer = failure === "renderer";
-    const failed = ["renderer", "layers", "compile", "cancel"].includes(failure);
+    const failed = ["renderer", "layers", "compile", "cancel", "reader-layout"].includes(failure);
+    const layout = failure === "reader-layout" ? "reader" : "sphere";
     const host = demoHost();
     const canonicalScene = scene("same artifact");
     const previous = host.currentPdfObject;
@@ -1170,7 +1380,7 @@ async function testThreeBackendReplacement() {
       signal.throwIfAborted();
       compilationFinished = true;
     };
-    const previousPageLayout = { object: previous, layout: "sphere" };
+    const previousPageLayout = { object: previous, layout };
     const replacementPages = [{ id: "page 1" }, { id: "page 2" }];
     const arrangedPages = [];
     replacement.pageCount = replacementPages.length;
@@ -1182,6 +1392,7 @@ async function testThreeBackendReplacement() {
     replacement.getPages = async ({ signal }) => {
       assert.equal(signal, host.sourceLoadController.signal);
       assert.equal(host.currentPdfObject, previous, "Arrange replacement pages before installing the replacement");
+      if (failure === "reader-layout") throw new Error("Reader page preparation failed");
       return replacementPages;
     };
     replacement.resetLayerVisibility = async () => {
@@ -1303,7 +1514,8 @@ async function testThreeBackendReplacement() {
       },
       formatLoadTiming: () => "timing",
       updateSceneMetrics: noop, formatBackendLabel: value => value,
-      activePageLayout: "sphere", pageLayoutView: previousPageLayout, pageLayoutRequest: 0,
+      activePageLayout: layout, pageLayoutView: previousPageLayout, pageLayoutRequest: 0,
+      syncPageCameraControls: noop, getReaderPageRects: () => new Float32Array(),
       pageLayoutAnimator: { cancel: noop }, pageLayoutRowElement: { hidden: true }, pageLayoutButtons: [],
       setPageLayoutProgress: noop,
       createPageLayoutView: (object, pages) => ({ object, pages, layoutPages: [], layout: "grid", targets: [] }),
@@ -1338,12 +1550,17 @@ async function testThreeBackendReplacement() {
     assert.equal(host.activeThreeRendererBackend, failed ? "webgl" : targetBackend, "Preparation failure leaves the old renderer and document intact");
     assert.deepEqual(resourceReleases, ["compile", "cancel"].includes(failure) ? ["object", "renderer"] : failed ? ["object"] : [],
       "Release a cancelled replacement's PDF resources before its staged GPU context");
-    assert.equal(host.activePageLayout, "sphere", "Backend switches keep the page layout");
+    assert.equal(host.activePageLayout, layout, "Backend switches keep the page layout");
     assert.equal(host.pageLayoutView.object, failed ? previous : replacement);
-    assert.equal(host.pageLayoutView.layout, "sphere");
-    assert.deepEqual(arrangedPages, failure === "layers" ? [] : [{ pages: replacementPages, targets: ["sphere targets"] }]);
+    assert.equal(host.pageLayoutView.layout, layout);
+    assert.deepEqual(arrangedPages, ["layers", "reader-layout"].includes(failure) ? [] : [{ pages: replacementPages, targets: ["sphere targets"] }]);
     assert.equal(host.pageLayoutRowElement.hidden, failed, "Multi-page replacements show the page layout controls");
     assert.deepEqual(pageProgress, failure === "layers" ? [] : ['subscribed', 'unsubscribed'], "Replacement page preparation reports progress until it settles");
+    if (failure === "reader-layout") {
+      assert.equal(host.pageLayoutView, previousPageLayout, "failed Reader preparation retains the original column and camera");
+      assert(finalStatuses.some(message => /Failed to switch renderer: (?:Error: )?Reader page preparation failed/.test(message)),
+        `Reader fallback reports the failed switch while leaving the old document usable: ${finalStatuses.join("; ")}`);
+    }
   }
 }
 
@@ -1353,10 +1570,17 @@ function demoHost() {
     loadedCompressScansPreference: false, compressScansCheckboxElement: { checked: false },
     annotationOverlay: { sceneChanged: noop }, annotationControls: { sceneChanged: noop }, annotationInteraction: null,
     currentPdfObject: demoObject("A"), loadToken: 0, sourceLoadController: null,
+    reader: threeReaderMock(), readerDocumentIdentity: "original", readerPageRects: new Float32Array(),
+    readerNavigationSource: null, readerNavigationScene: null,
     setStatus: noop, clearLoadedStatus: noop, requestRender: noop,
     drawCallMeter: { reset: noop }, drawCallCounter: { recordNativeFrame: noop },
     backendSelectElement: {}, vectorLodSelectElement: {}, textLodSelectElement: {}
   };
+}
+function threeReaderMock() {
+  const snapshot = { view: { centerX: 0, centerY: -200, zoom: 1 }, fit: "width", sidebarOpen: true };
+  return { snapshot: () => snapshot, restore: noop, setDocument: noop, setLayout: noop,
+    invalidateThumbnails: noop, getView: () => ({ ...snapshot.view, width: 800, height: 600 }) };
 }
 function demoObject(id) {
   return {

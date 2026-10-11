@@ -1,10 +1,12 @@
 import * as THREE from "three";
+import { computeReaderPageRects } from "./readerGeometry";
+export { READER_PAGE_GAP } from "./readerGeometry";
 
 /**
  * Page arrangements for the Three.js example, after three.js' css3d periodic
  * table demo. "grid" is the loaded document layout.
  */
-export type ExamplePageLayout = "grid" | "sphere" | "helix";
+export type ExamplePageLayout = "reader" | "grid" | "sphere" | "helix";
 
 export interface ExamplePageLayoutPage {
   /** Page center in the loaded layout, in document-local units. */
@@ -33,6 +35,13 @@ export function computeExamplePageLayout(
   layout: ExamplePageLayout,
   pages: readonly ExamplePageLayoutPage[]
 ): ExamplePageLayoutTarget[] {
+  if (layout === "reader") {
+    const rects = computeReaderPageRects(pages);
+    return pages.map((_, index) => ({
+      position: new THREE.Vector3(0, (rects[index * 4 + 1] + rects[index * 4 + 3]) / 2, 0),
+      quaternion: new THREE.Quaternion()
+    }));
+  }
   if (layout === "sphere") return computeSphereLayout(pages);
   if (layout === "helix") return computeHelixLayout(pages);
   return pages.map(page => ({ position: page.gridPosition.clone(), quaternion: new THREE.Quaternion() }));

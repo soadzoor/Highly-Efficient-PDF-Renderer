@@ -4,13 +4,26 @@ import { createOcrDemandScene, createOcrDetailDemandScene, needsOcrDetailGeometr
 import { createLoadProgressReporter, type LoadProgressCallback, type LoadProgressReporter } from "./loadProgress";
 import type { NativeVectorPdfSession } from "./pdfSession";
 import { automaticRasterMemoryBudget } from "./rasterMemoryBudget";
-import { sceneCpuBytes } from "./pageRasterPreview";
+import { buildRasterScenePreview, sceneCpuBytes } from "./pageRasterPreview";
 import type { RasterResolutionView } from "./rasterResolution";
 
 const PREVIEW_DIMENSION = 96;
 const MAX_DETAILED_PAGES = 12;
 
 interface CachedPage { scene: VectorScene; bytes: number }
+
+export interface PagePreviewSceneOptions {
+  maximumDimension: number;
+  signal?: AbortSignal;
+}
+
+interface PagePreviewRequest {
+  index: number;
+  maximumDimension: number;
+  resolve: (scene: VectorScene) => void;
+  reject: (error: unknown) => void;
+  cleanup: () => void;
+}
 
 /** One sequential worker, bounded page caches, and metadata-only placeholders for unloaded pages. */
 export class PdfPageDemandLoader {
@@ -40,6 +53,8 @@ export class PdfPageDemandLoader {
   private running: Promise<void> | null = null;
   private operation: AbortController | null = null;
   private completeOperation: AbortController | null = null;
+  private readonly pagePreviewRequests = new Set<PagePreviewRequest>();
+  private activePagePreview: PagePreviewRequest | null = null;
   private readonly session: NativeVectorPdfSession;
   private onChange: () => void | Promise<void>;
   private onTiming: ((name: string, durationMs: number) => void) | null = null;
@@ -79,6 +94,32 @@ export class PdfPageDemandLoader {
   }
   get pageScenes(): VectorScene[] {
     return this.placeholders.map((_, index) => this.pageScene(index));
+  }
+
+  /** Independent appearance previews never change the document's displayed page tiers. */
+  async getPagePreviewScene(index: number, options: PagePreviewSceneOptions): Promise<VectorScene> {
+    options.signal?.throwIfAborted();
+    if (this.closed) throw new Error("The PDF page loader is closed.");
+    if (!Number.isInteger(index) || index < 0 || index >= this.pageCount) throw new RangeError("Invalid page index.");
+    if (!Number.isSafeInteger(options.maximumDimension) || options.maximumDimension < 16 || options.maximumDimension > 4096) {
+      throw new RangeError("Page preview dimensions must be integers from 16 through 4096.");
+    }
+    const cached = this.pagePreviewSource(index);
+    if (cached) return buildRasterScenePreview(cached, options.maximumDimension);
+    return await new Promise<VectorScene>((resolve, reject) => {
+      const abort = (): void => {
+        this.pagePreviewRequests.delete(request);
+        request.cleanup();
+        if (this.activePagePreview === request) this.operation?.abort(options.signal?.reason);
+        reject(options.signal?.reason ?? new DOMException("Page preview cancelled.", "AbortError"));
+      };
+      const request: PagePreviewRequest = { index, maximumDimension: options.maximumDimension, resolve, reject,
+        cleanup: () => options.signal?.removeEventListener("abort", abort) };
+      this.pagePreviewRequests.add(request);
+      options.signal?.addEventListener("abort", abort, { once: true });
+      if (options.signal?.aborted) abort();
+      else this.start();
+    });
   }
 
   /** Stable OCR geometry: changing its selected representation does not replace a page scene. */
@@ -149,6 +190,11 @@ export class PdfPageDemandLoader {
       this.previews.get(index)?.scene ?? this.detailed.get(index)?.scene ?? this.placeholders[index];
   }
 
+  private pagePreviewSource(index: number): VectorScene | undefined {
+    return this.detailed.get(index)?.scene ??
+      (this.overviewKinds.get(index) === "vector" || this.options.ocrTextOnly ? this.previews.get(index)?.scene : undefined);
+  }
+
   update(view: RasterResolutionView, pageRects: Float32Array): void {
     if (this.closed || !(view.zoom > 0)) return;
     const halfWidth = view.width / view.zoom / 2, halfHeight = view.height / view.zoom / 2;
@@ -192,6 +238,7 @@ export class PdfPageDemandLoader {
     }
     this.detailCandidates = visible.filter(page => page.detail).map(page => page.index);
     this.refreshDetailDemand();
+    if (this.activePagePreview && this.next()) this.operation?.abort();
     this.start();
   }
 
@@ -214,7 +261,11 @@ export class PdfPageDemandLoader {
   }
 
   /** Search can fill the document's preview text index while visible detail retains priority. */
-  requestAllPreviews(): void { this.allPreviews = true; this.start(); }
+  requestAllPreviews(): void {
+    this.allPreviews = true;
+    if (this.activePagePreview && this.next()) this.operation?.abort();
+    this.start();
+  }
   /** Collect the initial scene without per-page uploads or frame waits; scans still decode on zoom. */
   async loadInitialOverviews(signal?: AbortSignal, retainAll = false): Promise<void> {
     signal?.throwIfAborted();
@@ -296,13 +347,18 @@ export class PdfPageDemandLoader {
     this.closed = true;
     this.operation?.abort();
     this.completeOperation?.abort(new DOMException("PDF page loader closed.", "AbortError"));
+    for (const request of this.pagePreviewRequests) {
+      request.cleanup();
+      request.reject(new DOMException("PDF page loader closed.", "AbortError"));
+    }
+    this.pagePreviewRequests.clear();
     try { await this.session.close(); }
     finally { await this.running; this.previews.clear(); this.detailed.clear(); this.overviewKinds.clear();
       this.displayPages.clear(); this.boundDisplayPages = null; this.boundDisplayScene = null; this.onTiming = null; }
   }
 
   /** Test/host synchronization without polling or forcing additional pages. */
-  async whenIdle(): Promise<void> { await this.running; }
+  async whenIdle(): Promise<void> { while (this.running) await this.running; }
 
   private async notifyChange(): Promise<void> {
     try { await this.onChange(); }
@@ -311,7 +367,10 @@ export class PdfPageDemandLoader {
 
   private start(): void {
     if (this.running || this.closed || this.paused || this.completeOperation) return;
-    this.running = this.pump().finally(() => { this.running = null; });
+    this.running = this.pump().finally(() => {
+      this.running = null;
+      if (this.next() || this.pagePreviewRequests.size) this.start();
+    });
     // A host callback failure is reported, never an unhandled promise rejection.
     void this.running.catch(error => console.warn("[HEPR] Demand-driven PDF page update failed.", error));
   }
@@ -332,7 +391,12 @@ export class PdfPageDemandLoader {
   private async pump(): Promise<void> {
     while (!this.closed && !this.paused) {
       const request = this.next();
-      if (!request) return;
+      if (!request) {
+        const preview = this.pagePreviewRequests.values().next().value;
+        if (!preview) return;
+        await this.loadPagePreview(preview);
+        continue;
+      }
       const { index, detail } = request;
       if (detail) this.attempted.add(index);
       const operation = this.operation = new AbortController();
@@ -385,6 +449,31 @@ export class PdfPageDemandLoader {
       // Streaming offers a paint opportunity; initial full-document work goes straight to the next page.
       if (!progress) await new Promise<void>(resolve => setTimeout(resolve, 0));
     }
+  }
+
+  private async loadPagePreview(request: PagePreviewRequest): Promise<void> {
+    const operation = this.operation = new AbortController();
+    this.activePagePreview = request;
+    try {
+      const scene = this.pagePreviewSource(request.index) ?? await this.session.compileVectorPage(this.sourcePages[request.index], {
+        signal: operation.signal, optimization: "safe", ocrTextOnly: this.options.ocrTextOnly,
+        previewMaxDimension: request.maximumDimension, previewAppearance: true,
+        enableSegmentMerge: this.options.enableSegmentMerge !== false,
+        enableInvisibleCull: this.options.enableInvisibleCull !== false,
+        ...(this.options.annotationAppearances ? { annotationAppearances: this.options.annotationAppearances } : {})
+      });
+      // A higher-priority viewport request can interrupt and retry a thumbnail later.
+      if (operation.signal.aborted || !this.pagePreviewRequests.has(request)) return;
+      const preview = buildRasterScenePreview(scene, request.maximumDimension);
+      this.pagePreviewRequests.delete(request); request.cleanup(); request.resolve(preview);
+    } catch (error) {
+      if (operation.signal.aborted || !this.pagePreviewRequests.has(request)) return;
+      this.pagePreviewRequests.delete(request); request.cleanup(); request.reject(error);
+    } finally {
+      if (this.operation === operation) this.operation = null;
+      this.activePagePreview = null;
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
   }
 
   private trim(cache: Map<number, CachedPage>, detail: boolean): void {

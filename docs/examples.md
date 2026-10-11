@@ -11,6 +11,19 @@ Start with a live viewer, then adapt the examples below to your application.
 
 Both viewers support PDF and HEP loading, PDF layer controls, text search, text selection, and rendering diagnostics. The [room overlay demo](../room-overlay-demo.html) also includes the shared PDF Layers panel; its room and TSV overlays have separate visibility controls. See [room-overlay-demo.ts](../src/room-overlay-demo.ts) for that workflow.
 
+Multipage PDFs and HEPs open in **Reader**, a continuous vertical column with
+scrollbars and a thumbnail sidebar. The toolbar provides page navigation, zoom,
+Fit Width, Fit Page, Find, and Settings. Scroll normally to read; use
+Ctrl/Cmd+wheel or pinch to zoom. Touch dragging and flicking scroll the document.
+Thumbnails open initially on screens at least 800 pixels wide and can be toggled
+at any width. Select a thumbnail to jump to its page.
+
+Choose **Grid** for the previous overview, or **Sphere** / **Helix** in the Three
+demo. Returning to Reader restores your reading position. Single-page files keep
+their previous default and can also use Reader. Reader changes presentation only;
+Download HEP retains the document's canonical layout. Advanced settings and
+diagnostics remain available under Settings.
+
 ## Responsive three.js viewer
 
 This browser TypeScript module fills the window and adds mouse/touch pan and zoom. Use it in an application with a bundler after installing `@soadzoor/hepr` and `three`. Replace `/drawing.pdf` with a PDF or HEP URL served by your application.

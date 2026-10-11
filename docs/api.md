@@ -406,6 +406,7 @@ Exporting such a HEP again stores exact ownership. Transforms are runtime presen
 | --- | --- |
 | `pageCount` | Number of displayed pages. |
 | `getPage(index, options?)` / `getPages(options?)` | Prepare and return independent page objects with automatic shared batching. |
+| `getPagePreviewScene(index, { maximumDimension, signal? })` | Return a page's appearance as a `Promise<VectorScene>` for rendering thumbnails. Uses zero-based loaded-page indices, supports cancellation and source-free HEPs, and keeps sidebar work below main-view demand. `maximumDimension` is an integer from 16 through 4096 and bounds raster preview dimensions; vector geometry remains accurate. |
 | `getPageBatchingStats()` | Report the current batching mode, page count and fallback reason. |
 | `subscribePagePreparationProgress(listener)` | Observe page view preparation as an integer percentage, or `null` when idle; returns an unsubscribe function. |
 | `setPageOverlapMode(mode)` / `getPageOverlapMode()` | `"exact"` (default) or `"fast"`: keep opaque overlapping pages batched even where depth cannot order them, e.g. while animating a layout. |

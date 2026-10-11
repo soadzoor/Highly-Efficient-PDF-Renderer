@@ -51,6 +51,7 @@ for (const outcome of ["ready", "cancelled", "failed"]) {
     canvasResizeObserver: { disconnect: noop, observe: noop },
     resetFpsMeter: noop, captureGlCalls: null, captureProfiler: null, drawCallMeter: { reset: noop },
     createMapControls: () => ({ target: { copy: noop, clone: () => ({}) }, dispose: noop }),
+    controlsConnected: true, syncPageCameraControls: noop, reader: { canvasChanged: noop },
     camera: { coordinateSystem: 2000 },
     updatePerspectiveCameraProjection: () => assert.equal(host.camera.coordinateSystem, host.renderer.coordinateSystem, "Rebuild the camera projection with the replacement renderer's clip convention"),
     updateCameraClipping: noop,
@@ -114,7 +115,7 @@ for (const coordinateSystem of [THREE.WebGLCoordinateSystem, THREE.WebGPUCoordin
   const previousTarget = new THREE.Vector3(10, 5, 0);
   const controls = { target: previousTarget.clone(), update: noop };
   const host = vm.createContext({
-    THREE, scene, camera, controls, currentPdfObject: object,
+    THREE, scene, camera, controls, currentPdfObject: object, activePageLayout: "grid",
     tempObjectBounds: new THREE.Box3(), tempObjectSize: new THREE.Vector3(), tempObjectCenter: new THREE.Vector3(),
     tempViewDirection: new THREE.Vector3(), tempClipDelta: new THREE.Vector3(), tempClipForward: new THREE.Vector3(),
     currentContentCenter: new THREE.Vector3(), currentContentRadius: 1,
@@ -133,6 +134,115 @@ for (const coordinateSystem of [THREE.WebGLCoordinateSystem, THREE.WebGPUCoordin
   assert(preview.position.equals(camera.position), "Precompile selects the first presented view");
   assert(preview.projectionMatrix.equals(camera.projectionMatrix), "Precompile includes the presented near/far and clip convention");
   object.geometry.dispose(); object.material.dispose();
+}
+
+// Reader projection is perpendicular and depends on CSS zoom and page depth,
+// rather than the complete height of a long document.
+for (const coordinateSystem of [THREE.WebGLCoordinateSystem, THREE.WebGPUCoordinateSystem]) {
+  const camera = new THREE.PerspectiveCamera(45, 1, .01, 1000);
+  camera.coordinateSystem = coordinateSystem;
+  const object = new THREE.Group();
+  const controls = { target: new THREE.Vector3() };
+  const host = vm.createContext({ THREE, camera, controls });
+  vm.runInContext(sourceFunction(source, "applyReaderCameraView"), host);
+  const view = { centerX: 30, centerY: -100000, zoom: 2, width: 900, height: 600 };
+  host.applyReaderCameraView(view, object);
+  assert.equal(camera.aspect, 1.5);
+  assert.equal(camera.position.x, view.centerX);
+  assert.equal(camera.position.y, view.centerY);
+  const pagePoint = new THREE.Vector3(view.centerX + 10, view.centerY + 10, 0).project(camera);
+  assert(Math.abs(pagePoint.x * view.width / 2 - 20) < 1e-8);
+  assert(Math.abs(pagePoint.y * view.height / 2 - 20) < 1e-8);
+  assert(camera.near < camera.position.z && camera.far > camera.position.z);
+  const clipping = [camera.near, camera.far];
+  host.applyReaderCameraView({ ...view, centerY: -10000000 }, object);
+  assert.deepEqual([camera.near, camera.far], clipping, "moving through a long column preserves depth precision");
+  assert(controls.target.equals(new THREE.Vector3(view.centerX, -10000000, 0)));
+}
+
+{
+  let disconnected = 0, connected = 0;
+  const host = vm.createContext({
+    activePageLayout: "reader", cameraInteractionEnabled: true, controlsConnected: true, canvasElement: {},
+    controls: { enabled: true, disconnect: () => disconnected++, connect: () => connected++ }
+  });
+  vm.runInContext(sourceFunction(source, "syncPageCameraControls"), host);
+  host.syncPageCameraControls();
+  host.syncPageCameraControls();
+  assert.equal(host.controls.enabled, false);
+  assert.equal(disconnected, 1, "Reader removes MapControls input handlers once");
+  host.activePageLayout = "sphere";
+  host.cameraInteractionEnabled = false;
+  host.syncPageCameraControls();
+  assert.equal(connected, 1);
+  assert.equal(host.controls.enabled, false, "layout switches preserve selection's interaction lock");
+}
+
+{
+  const canonical = {
+    pageRects: Float32Array.of(0, 0, 100, 200, 150, 0, 450, 100),
+    pdfPages: [
+      { pageIndex: 0, sourcePageIndex: 0, pdfToScene: [1, 0, 0, 1, 0, 0] },
+      { pageIndex: 1, sourcePageIndex: 1, pdfToScene: [1, 0, 0, 1, 150, 0] }
+    ]
+  };
+  const before = structuredClone(canonical);
+  const host = vm.createContext({
+    currentPdfObject: { sceneData: canonical }, readerNavigationSource: null, readerNavigationScene: null,
+    readerPageRects: Float32Array.of(-50, -200, 50, 0, -150, -316, 150, -216)
+  });
+  vm.runInContext(sourceFunction(source, "getReaderNavigationScene"), host);
+  const navigation = host.getReaderNavigationScene();
+  assert.deepEqual(Array.from(navigation.pdfPages[0].pdfToScene), [1, 0, 0, 1, -50, -200]);
+  assert.deepEqual(Array.from(navigation.pdfPages[1].pdfToScene), [1, 0, 0, 1, -150, -316]);
+  assert.deepEqual(canonical, before, "Reader destinations use detached metadata and preserve canonical export coordinates");
+  assert.equal(host.getReaderNavigationScene(), navigation, "link flights keep a stable scene identity");
+}
+
+// Lazy page preparation keeps the committed Grid camera and controls until
+// Reader can install its complete column; failure or a newer choice keeps it.
+for (const outcome of ["ready", "failed", "superseded"]) {
+  let resolvePages, rejectPages;
+  const preparation = new Promise((resolve, reject) => { resolvePages = resolve; rejectPages = reject; });
+  const events = [], statuses = [];
+  const object = { pageCount: 2, subscribePagePreparationProgress: () => noop, getPages: () => preparation };
+  const host = vm.createContext({
+    currentPdfObject: object, activePageLayout: "grid", pageLayoutRequest: 0, pageLayoutView: null,
+    lifetimeSignal: new AbortController().signal,
+    syncPageLayoutControls: () => events.push(`controls:${host.activePageLayout}`),
+    syncPageCameraControls: () => events.push(`camera-controls:${host.activePageLayout}`),
+    reader: { setLayout: layout => events.push(`reader:${layout}`), getView: () => ({}) },
+    setStatus: message => statuses.push(message), setPageLayoutProgress: noop,
+    createPageLayoutView: (owner, pages) => ({ object: owner, pages, layoutPages: [], layout: "grid", targets: ["grid"] }),
+    computeExamplePageLayout: layout => [layout],
+    applyExamplePageLayout: (_pages, targets) => events.push(`apply:${targets[0]}`),
+    pageLayoutAnimator: { cancel: () => events.push("cancel-tween") },
+    setPanelCollapsed: noop,
+    applyReaderCameraView: () => events.push(`camera:${host.activePageLayout}`),
+    formatPageLayout: layout => layout, requestRender: noop
+  });
+  vm.runInContext(sourceFunction(source, "setPageLayout"), host);
+  const changing = host.setPageLayout("reader");
+  assert.equal(host.activePageLayout, "grid", "pending Reader preparation leaves the committed mode unchanged");
+  assert.deepEqual(events, [], "pending preparation does not expose Reader controls or move its camera");
+  if (outcome === "failed") rejectPages(new Error("Page resources unavailable"));
+  else {
+    if (outcome === "superseded") await host.setPageLayout("grid");
+    resolvePages([{}, {}]);
+  }
+  await changing;
+  if (outcome === "ready") {
+    assert.equal(host.activePageLayout, "reader");
+    assert(events.indexOf("apply:reader") < events.indexOf("reader:reader"), "the complete column precedes Reader presentation");
+    assert(events.includes("cancel-tween"));
+    assert(events.includes("camera:reader"));
+  } else {
+    assert.equal(host.activePageLayout, "grid");
+    assert(!events.includes("reader:reader"));
+    assert(!events.includes("camera:reader"));
+    assert.equal(host.pageLayoutView, null);
+    if (outcome === "failed") assert(statuses.some(message => message.includes("Page resources unavailable")));
+  }
 }
 
 console.log("Three renderer staging preserves the displayed canvas until install, matches the first camera fit and releases cancelled/failed GPU contexts.");

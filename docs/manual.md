@@ -102,6 +102,22 @@ choose a compact layout.
 Page selection and grid options apply when loading a PDF. A HEP file contains
 an already-composed scene, so these options do not change its pages or layout.
 
+The native and Three demos initially show multipage PDFs and HEPs in **Reader**:
+a centered vertical column with ordinary scrolling and lazy page thumbnails.
+Use the compact toolbar to jump to a page, enter a zoom percentage, fit the page
+width or whole page, find text, or open advanced settings. Ctrl/Cmd+wheel and
+pinch zoom the document; unmodified wheel and touch dragging scroll. The
+thumbnail sidebar initially opens at viewport widths of 800 pixels or more.
+Focus the document viewport to scroll with the arrow keys, Page Up/Down, Home,
+and End; editing the page number, zoom, or search field keeps normal input behavior.
+Reader can also be selected for single-page documents, which retain their
+existing default view.
+
+The demos retain **Grid**, and the Three demo also retains **Sphere** and
+**Helix**. Switching back to Reader restores its zoom and reading position.
+Reader does not change package loading defaults or the canonical layout saved
+by Download HEP.
+
 Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.

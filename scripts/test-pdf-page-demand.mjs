@@ -21,7 +21,7 @@ try {
       closed: false, active: 0, maximumActive: 0,
       async compileVectorPage(index, options) {
         calls.push({ index, preview: options.previewMaxDimension, signal: options.signal,
-          ocrTextOnly: options.ocrTextOnly });
+          ocrTextOnly: options.ocrTextOnly, appearance: options.previewAppearance });
         this.maximumActive = Math.max(this.maximumActive, ++this.active);
         try {
           await this.block?.(index, options);
@@ -45,6 +45,87 @@ try {
     for (let index = 0; index < pageCount; index++) rectangles.set([index * 1000, 0, index * 1000 + 600, 800], index * 4);
     return { loader, session, calls, completed, rectangles, get changes() { return changes; } };
   };
+
+  {
+    const f = fixture(3);
+    const display = f.loader.pageScenes;
+    const thumbnail = await f.loader.getPagePreviewScene(2, { maximumDimension: 144 });
+    assert.equal(thumbnail.pageCount, 1);
+    assert.deepEqual(f.calls.map(call => [call.index, call.preview, call.appearance]), [[2,144,true]]);
+    assert.equal(f.loader.previewCount, 0, "thumbnail scenes do not fill document overview caches");
+    assert.equal(f.loader.detailedCount, 0);
+    assert.deepEqual(f.loader.pageScenes, display, "sidebar requests do not replace document display tiers");
+    assert.equal(f.changes, 0, "sidebar completion never recomposes or uploads the main document");
+    await assert.rejects(f.loader.getPagePreviewScene(3, { maximumDimension: 144 }), RangeError);
+    await assert.rejects(f.loader.getPagePreviewScene(0, { maximumDimension: 0 }), RangeError);
+    const controller = new AbortController(), reason = Error("sidebar closed");
+    controller.abort(reason);
+    await assert.rejects(f.loader.getPagePreviewScene(0, { maximumDimension: 144, signal: controller.signal }), error => error === reason);
+    assert.equal(f.calls.length, 1, "already cancelled requests never enter the worker");
+    await f.loader.close();
+  }
+
+  {
+    const f = fixture(3);
+    let enter;
+    const entered = new Promise(resolve => { enter = resolve; });
+    let interruptOnce = true;
+    f.session.block = async (_index, options) => {
+      if (!options.previewAppearance || !interruptOnce) return;
+      interruptOnce = false; enter();
+      await new Promise((resolve, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true }));
+    };
+    const thumbnail = f.loader.getPagePreviewScene(2, { maximumDimension: 144 });
+    await entered;
+    f.loader.update(baseView, f.rectangles);
+    await thumbnail; await f.loader.whenIdle();
+    assert.deepEqual(f.calls.map(call => [call.index, call.appearance ?? false, call.preview]),
+      [[2,true,144],[0,false,96],[0,false,undefined],[2,true,144]], "viewport demand preempts and then resumes the sidebar request");
+    assert.equal(f.session.maximumActive, 1, "sidebar and viewport work share one sequential worker");
+    const before = f.calls.length;
+    await f.loader.getPagePreviewScene(0, { maximumDimension: 144 });
+    assert.equal(f.calls.length, before, "resident detailed content supplies thumbnails without compiling again");
+    await f.loader.close();
+  }
+
+  {
+    const f = fixture(3);
+    let enter;
+    const entered = new Promise(resolve => { enter = resolve; });
+    f.session.block = async (_index, options) => {
+      if (!options.previewAppearance) return;
+      enter();
+      await new Promise((resolve, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true }));
+    };
+    const controller = new AbortController(), reason = Error("hide thumbnails");
+    const thumbnail = f.loader.getPagePreviewScene(2, { maximumDimension: 144, signal: controller.signal });
+    await entered; controller.abort(reason);
+    await assert.rejects(thumbnail, error => error === reason);
+    await f.loader.whenIdle();
+    f.loader.update({ ...baseView, cameraCenterX: 2300 }, f.rectangles); await f.loader.whenIdle();
+    assert.equal(f.loader.previewCount, 1, "cancelling a thumbnail does not fail its document page");
+    const queuedController = new AbortController();
+    f.loader.pause();
+    const queued = f.loader.getPagePreviewScene(1, { maximumDimension: 144, signal: queuedController.signal });
+    queuedController.abort(reason); await assert.rejects(queued, error => error === reason);
+    const closed = f.loader.getPagePreviewScene(1, { maximumDimension: 144 });
+    const rejected = assert.rejects(closed, /closed/i);
+    await f.loader.close(); await rejected;
+  }
+
+  {
+    const f = fixture(2, 1024, 4, { ocrTextOnly: true });
+    let fail = true;
+    f.session.block = async (_index, options) => {
+      if (fail && options.previewAppearance) { fail = false; throw Error("thumbnail decode failed"); }
+    };
+    await assert.rejects(f.loader.getPagePreviewScene(1, { maximumDimension: 144 }), /thumbnail decode failed/);
+    await f.loader.getPagePreviewScene(1, { maximumDimension: 144 });
+    assert(f.calls.every(call => call.ocrTextOnly === true), "appearance previews honor explicit text-only viewing");
+    f.loader.update({ ...baseView, cameraCenterX: 1300 }, f.rectangles); await f.loader.whenIdle();
+    assert.equal(f.loader.previewCount, 1, "thumbnail failure remains local and does not suppress main page loading");
+    await f.loader.close();
+  }
 
   {
     const f = fixture(4, 1024, 6 * 1024 * 1024);

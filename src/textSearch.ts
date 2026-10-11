@@ -2,6 +2,7 @@ import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import type { RendererApi, SearchHighlightSet } from "./rendererTypes";
 import { computeCharRangeHighlightBounds } from "./sceneTextGeometry";
 import type { OptionalContentSnapshot } from "./optionalContent";
+import type { ViewState } from "./webGlFloorplanRenderer";
 import { isSceneTextCharVisible } from "./optionalContentText";
 
 export interface TextSearchMatch {
@@ -47,6 +48,8 @@ export interface TextSearchControllerOptions {
   getCanvas: () => HTMLCanvasElement | null;
   onStateChange: (state: TextSearchState) => void;
   onMatchesChange: (current: TextSearchMatch | null, all: TextSearchMatch[]) => void;
+  /** Override camera navigation, for example to synchronize a scrolling reader. */
+  navigateToView?: (view: ViewState) => void;
 }
 
 const MAX_MATCHES = 5_000;
@@ -323,11 +326,13 @@ export function createTextSearchController(options: TextSearchControllerOptions)
     const readableAtCurrent = (height * view.zoom) / devicePixelRatio >= MIN_READABLE_MATCH_CSS_PX;
     const zoom = fitsViewport && readableAtCurrent ? view.zoom : targetZoom;
 
-    renderer.setViewState({
+    const nextView = {
       cameraCenterX: (bounds.minX + bounds.maxX) * 0.5,
       cameraCenterY: (bounds.minY + bounds.maxY) * 0.5,
       zoom
-    });
+    };
+    if (options.navigateToView) options.navigateToView(nextView);
+    else renderer.setViewState(nextView);
   };
 
   const runSearch = (moveCamera: boolean): void => {
