@@ -221,6 +221,7 @@ export const fastTests = [
   "text-lod-core",
   "lod-worker",
   "text-lod-foreshortening",
+  "native-text-lod",
   "native-ordered-text-lod",
   "three-ordered-text-lod",
   "ordered-gradient-paint",

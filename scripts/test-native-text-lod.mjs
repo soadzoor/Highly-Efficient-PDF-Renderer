@@ -2,21 +2,23 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-
-import {
-  isNativeTextHeavyStrokeFreeScene,
-  NATIVE_VECTOR_MINIFY_ENABLED
-} from "../src/nativeRenderPolicy.ts";
-import { buildSingleChannelUint8MipChain } from "../src/singleChannelMipChain.ts";
 import { registerHooks } from "node:module";
+
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.includes("/src/") && /^\.\.?\//.test(specifier) && !/\.[a-z0-9]+$/i.test(specifier)) {
     return next(`${specifier}.ts`, context);
   }
   return next(specifier, context);
 } });
-const { TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE } = await import("../src/textRasterAtlas.ts");
-hooks.deregister();
+const [
+  { isNativeTextHeavyStrokeFreeScene, NATIVE_VECTOR_MINIFY_ENABLED },
+  { buildSingleChannelUint8MipChain },
+  { TEXT_RASTER_ATLAS_MAX_TEXTURE_SIZE }
+] = await Promise.all([
+  import("../src/nativeRenderPolicy.ts"),
+  import("../src/singleChannelMipChain.ts"),
+  import("../src/textRasterAtlas.ts")
+]).finally(() => hooks.deregister());
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const webGl = await readFile(path.resolve(scriptDir, "../src/webGlFloorplanRenderer.ts"), "utf8")
@@ -169,10 +171,20 @@ assert.match(
 );
 assert.match(webGpu, /pass\.draw\(4,\s*textDrawCount,\s*0,\s*0\)/, "WebGPU must submit one selected text draw");
 assert.match(webGpu, /maxAnisotropy:\s*16/, "WebGPU must enable glyph-atlas anisotropy");
+const webGpuR8Upload = webGpu.slice(
+  webGpu.indexOf("private createR8Texture("),
+  webGpu.indexOf("private createMonochromeTextures(")
+);
 assert.match(
-  webGpu,
-  /const mipChain = buildSingleChannelUint8MipChain\(source, width, height\)/,
-  "WebGPU must upload the shared deterministic glyph-atlas mip chain"
+  webGpuR8Upload,
+  /const mipChain = preparedMips \?\? buildSingleChannelUint8MipChain\(source, width, height\)/,
+  "WebGPU must reuse prepared mips or build the shared deterministic glyph-atlas mip chain"
+);
+assert.match(webGpuR8Upload, /mipLevelCount:\s*mipChain\.length/, "WebGPU must allocate every glyph-atlas mip");
+assert.match(
+  webGpuR8Upload,
+  /for \(let mipLevel = 0; mipLevel < mipChain\.length; mipLevel \+= 1\) \{\s*const level = mipChain\[mipLevel\];\s*const padded = createPaddedByteTextureData\(level\.data, level\.width, level\.height, 1\);\s*this\.writeR8Texture\(texture, level\.width, level\.height, padded, mipLevel\)/,
+  "WebGPU must explicitly upload every prepared or freshly built glyph-atlas mip"
 );
 assert.match(
   webGpuTextShader,
