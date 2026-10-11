@@ -49,6 +49,11 @@ body {
   gap: 10px;
 }
 
+.panel-title {
+  margin: 0;
+  font-size: 16px;
+}
+
 #hud {
   max-height: calc(100vh - 50px);
   overflow-y: auto;
@@ -60,11 +65,6 @@ body {
 }
 
 .panel.collapsed {
-  width: auto;
-  max-width: calc(100vw - 32px);
-}
-
-.panel.collapsed .panel-content {
   display: none;
 }
 
@@ -79,14 +79,21 @@ body {
   display: none;
 }
 
-.chevron-button {
+.has-reader-toolbar .startup-controls {
+  display: none;
+}
+
+.settings-downloads {
+  margin-bottom: 8px;
+}
+
+.settings-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  min-width: 30px;
+  gap: 6px;
   height: 30px;
-  padding: 0;
+  padding: 0 8px;
   border: 1px solid rgba(15, 23, 42, 0.45);
   background: rgba(15, 23, 42, 0.08);
   color: #0f172a;
@@ -94,7 +101,7 @@ body {
   line-height: 1;
 }
 
-.chevron-button:hover {
+.settings-close:hover {
   background: rgba(15, 23, 42, 0.16);
 }
 

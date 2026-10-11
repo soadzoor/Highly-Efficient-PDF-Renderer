@@ -118,6 +118,11 @@ The demos retain **Grid**, and the Three demo also retains **Sphere** and
 Reader does not change package loading defaults or the canonical layout saved
 by Download HEP.
 
+Download PDF and Download HEP are available inside the expanded Settings panel.
+Close Settings to hide the entire panel. Select **Hide toolbar** to reclaim its
+screen space while keeping your reading position and zoom; use the floating
+**Show toolbar** button to bring the controls back.
+
 Search and selection APIs return zero-based page indexes within the composed
 subset. Page-scoped progress includes `pageIndex` / `pageCount` for that subset
 and `sourcePageIndex` / `sourcePageCount` for the original PDF.

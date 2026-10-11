@@ -982,8 +982,7 @@ window.addEventListener("beforeunload", () => {
 }, { once: true });
 
 toggleHudButtonElement.addEventListener("click", () => {
-  const currentlyCollapsed = hudPanelElement.classList.contains("collapsed");
-  setHudCollapsed(!currentlyCollapsed);
+  setHudCollapsed(true);
 });
 
 fileInputElement.addEventListener("change", async () => {
@@ -2070,8 +2069,8 @@ function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
 function setHudCollapsed(collapsed: boolean): void {
   hudPanelElement.classList.toggle("collapsed", collapsed);
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
-  toggleHudButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
-  toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
+  toggleHudButtonElement.title = "Close settings";
+  toggleHudIconElement.textContent = "×";
 }
 
 async function downloadAllExampleHeps(): Promise<void> {

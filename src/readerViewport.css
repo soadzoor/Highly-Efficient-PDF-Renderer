@@ -21,6 +21,24 @@
   box-shadow: 0 1px 4px #0f172a12;
 }
 
+.reader-toolbar[hidden], .reader-toolbar-restore[hidden] { display: none; }
+.reader-toolbar-restore {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 31;
+  height: 30px;
+  padding: 3px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #f8fafc;
+  color: #1f2937;
+  box-shadow: 0 1px 4px #0f172a26;
+  font: inherit;
+  cursor: pointer;
+}
+.reader-toolbar-restore:hover { background: #e2e8f0; }
+
 .reader-primary-controls, .reader-reading-controls, .reader-layout-label {
   display: flex;
   align-items: center;

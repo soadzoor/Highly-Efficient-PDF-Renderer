@@ -6,6 +6,14 @@ moves those notes into a dated version section and uses them for the GitHub Rele
 
 ## [Unreleased]
 
+### Changed
+
+- Keep PDF and HEP download controls inside the expanded Settings panel in both
+  demos, and hide the entire panel when closed.
+- Add Hide toolbar and a compact floating Show toolbar control to both demos,
+  reclaiming screen space while preserving Reader position and zoom. Fit modes
+  adjust to the available viewport size.
+
 ## [0.1.58] - 2026-10-11
 
 ### Added

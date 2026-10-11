@@ -58,23 +58,23 @@
       }
 
       #panel.collapsed {
-        width: auto;
-        max-width: calc(100vw - 32px);
-      }
-
-      #panel.collapsed .panel-content {
         display: none;
       }
 
       .panel-header {
         display: flex;
-        align-items: flex-start;
+        align-items: center;
         justify-content: space-between;
         gap: 10px;
       }
 
       .panel-content {
         margin-top: 8px;
+      }
+
+      .panel-title {
+        margin: 0;
+        font-size: 16px;
       }
 
       .row,
@@ -103,8 +103,8 @@
         flex-wrap: wrap;
       }
 
-      .panel-header .toolbar {
-        margin-bottom: 0;
+      .has-reader-toolbar .startup-controls {
+        display: none;
       }
 
       select,
@@ -125,14 +125,13 @@
         cursor: default;
       }
 
-      .chevron-button {
+      .settings-close {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 30px;
-        min-width: 30px;
+        gap: 6px;
         height: 30px;
-        padding: 0;
+        padding: 5px 8px;
         line-height: 1;
       }
 
@@ -544,7 +543,14 @@
 
     <div id="panel" role="group" aria-label="Three.js HEPR controls">
       <div class="panel-header">
-        <div class="toolbar">
+        <h2 class="panel-title">Settings</h2>
+        <button id="toggle-panel" class="settings-close" type="button" aria-expanded="true" aria-controls="panel-content" aria-label="Close settings" title="Close settings">
+          <span id="toggle-panel-icon" aria-hidden="true">×</span>
+          <span>Close</span>
+        </button>
+      </div>
+      <div id="panel-content" class="panel-content">
+        <div class="toolbar startup-controls">
           <a class="package-version" href="https://www.npmjs.com/package/@soadzoor/hepr" target="_blank" rel="noopener noreferrer" title="HEPR package version used by this build">npm v%HEPR_PACKAGE_VERSION%</a>
           <button id="open-file" type="button" title="Open a PDF or HEPR-exported .hep file">Open PDF / HEP</button>
           <div id="example-dropdown" class="example-dropdown">
@@ -554,15 +560,12 @@
             </button>
             <div id="example-menu" class="example-menu" hidden></div>
           </div>
+        </div>
+        <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
+        <div class="toolbar settings-downloads">
           <button id="download-data" type="button" hidden disabled>Download HEP</button>
           <button id="download-pdf" type="button" hidden disabled>Download PDF</button>
-          <input id="file-input" type="file" accept=".pdf,.hep,application/pdf,application/x-hep" hidden />
         </div>
-        <button id="toggle-panel" class="chevron-button" type="button" aria-expanded="true" aria-controls="panel-content" title="Collapse panel">
-          <span id="toggle-panel-icon" aria-hidden="true">▾</span>
-        </button>
-      </div>
-      <div id="panel-content" class="panel-content">
       <div class="toggles">
         <label class="toggle">
           <input id="text-selection-checkbox" type="checkbox" checked />

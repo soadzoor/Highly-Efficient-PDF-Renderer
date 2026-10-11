@@ -864,8 +864,7 @@ openButtonElement.addEventListener("click", () => {
 }, { signal: lifetimeSignal });
 
 togglePanelButtonElement.addEventListener("click", () => {
-  const currentlyCollapsed = panelElement.classList.contains("collapsed");
-  setPanelCollapsed(!currentlyCollapsed);
+  setPanelCollapsed(true);
 }, { signal: lifetimeSignal });
 
 downloadDataButtonElement.addEventListener("click", () => {
@@ -2175,8 +2174,8 @@ function clearLoadedStatus(): void {
 function setPanelCollapsed(collapsed: boolean): void {
   panelElement.classList.toggle("collapsed", collapsed);
   togglePanelButtonElement.setAttribute("aria-expanded", String(!collapsed));
-  togglePanelButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
-  togglePanelIconElement.textContent = collapsed ? "▸" : "▾";
+  togglePanelButtonElement.title = "Close settings";
+  togglePanelIconElement.textContent = "×";
 }
 
 function setLoadControlsEnabled(enabled: boolean): void {

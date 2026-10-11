@@ -23,6 +23,8 @@ demo. Returning to Reader restores your reading position. Single-page files keep
 their previous default and can also use Reader. Reader changes presentation only;
 Download HEP retains the document's canonical layout. Advanced settings and
 diagnostics remain available under Settings.
+Download PDF and Download HEP are inside Settings. Use **Hide toolbar** to give
+the document more space; a small **Show toolbar** button restores the controls.
 
 ## Responsive three.js viewer
 

@@ -34,7 +34,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   const lifetime = new AbortController();
   const shell = document.createElement("div");
   shell.className = "reader-shell";
-  shell.innerHTML = `<div class="reader-toolbar" role="toolbar" aria-label="Document controls">
+  shell.innerHTML = `<div id="reader-toolbar" class="reader-toolbar" role="toolbar" aria-label="Document controls">
     <div class="reader-primary-controls"></div>
     <label class="reader-layout-label">Layout <select class="reader-layout" aria-label="Page layout"></select></label>
     <div class="reader-reading-controls">
@@ -51,8 +51,9 @@ export function createReaderViewport(options: ReaderViewportOptions) {
     </div>
     <button type="button" data-reader="find">Find</button>
     <button type="button" data-reader="settings">Settings</button>
+    <button type="button" data-reader="hide-toolbar" aria-controls="reader-toolbar" aria-expanded="true">Hide toolbar</button>
     <span class="reader-announcement" role="status" aria-live="polite"></span>
-  </div><div class="reader-workspace">
+  </div><button type="button" class="reader-toolbar-restore" data-reader="show-toolbar" aria-controls="reader-toolbar" aria-expanded="false" hidden>Show toolbar</button><div class="reader-workspace">
     <aside class="reader-thumbnails" aria-label="Page thumbnails" hidden></aside>
     <div class="reader-scroll" tabindex="0" role="region" aria-label="Document pages">
       <div class="reader-surface"></div>
@@ -60,6 +61,8 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   </div>`;
   const query = <T extends HTMLElement>(selector: string): T => shell.querySelector<T>(selector)!;
   const toolbar = query<HTMLDivElement>(".reader-toolbar");
+  const hideToolbar = query<HTMLButtonElement>('[data-reader="hide-toolbar"]');
+  const showToolbar = query<HTMLButtonElement>('[data-reader="show-toolbar"]');
   const scroller = query<HTMLDivElement>(".reader-scroll"), surface = query<HTMLDivElement>(".reader-surface");
   const sidebar = query<HTMLElement>(".reader-thumbnails");
   const layoutSelect = query<HTMLSelectElement>(".reader-layout");
@@ -160,6 +163,7 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   function resize(): void {
     if (disposed) return;
     const before = getView();
+    const targetPage = navigationTarget && Math.abs(scroller.scrollTop - navigationTarget.top) < .5 ? navigationTarget.page : null;
     sizeSurface();
     if (active && rects.length) {
       if (initialView) {
@@ -168,11 +172,24 @@ export function createReaderViewport(options: ReaderViewportOptions) {
           centerY: rects[i + 3] - (metrics.height / 2 - READER_MARGIN) / zoom, zoom });
         initialView = false;
       } else positionView({ ...before, zoom });
+      if (targetPage !== null) navigationTarget = { page: targetPage, top: scroller.scrollTop };
       present();
     }
     updateThumbnails();
   }
   function stopInertia(): void { if (inertiaFrame) window.cancelAnimationFrame(inertiaFrame); inertiaFrame = 0; }
+  function updateToolbarOffset(): void {
+    document.documentElement.style.setProperty("--reader-toolbar-height", `${toolbar.hidden ? 16 : toolbar.getBoundingClientRect().height + 16}px`);
+  }
+  function setToolbarVisible(visible: boolean): void {
+    cancelActiveGesture();
+    toolbar.hidden = !visible;
+    showToolbar.hidden = visible;
+    hideToolbar.setAttribute("aria-expanded", String(visible));
+    showToolbar.setAttribute("aria-expanded", String(visible));
+    updateToolbarOffset(); resize();
+    (visible ? hideToolbar : showToolbar).focus({ preventScroll: true });
+  }
   function releaseScratch(): void {
     scratchRenderer?.dispose(); scratchRenderer = null;
     if (scratchCanvas) scratchCanvas.width = scratchCanvas.height = 0;
@@ -427,8 +444,10 @@ export function createReaderViewport(options: ReaderViewportOptions) {
       case "fit-page": chooseFit("page"); break;
       case "find": options.onFind(); break;
       case "settings": options.onSettings(); break;
+      case "hide-toolbar": setToolbarVisible(false); break;
     }
   }, { signal: lifetime.signal });
+  showToolbar.addEventListener("click", () => setToolbarVisible(true), { signal: lifetime.signal });
   sidebar.addEventListener("click", event => {
     const row = (event.target as HTMLElement).closest<HTMLButtonElement>(".reader-thumbnail");
     if (row) goToPage(Number(row.dataset.page));
@@ -472,12 +491,12 @@ export function createReaderViewport(options: ReaderViewportOptions) {
   zoomInput.addEventListener("change", submitZoom, { signal: lifetime.signal });
   zoomInput.addEventListener("keydown", event => { if (event.key === "Enter") { submitZoom(); scroller.focus(); } }, { signal: lifetime.signal });
   const observer = new ResizeObserver(() => {
-    document.documentElement.style.setProperty("--reader-toolbar-height", `${toolbar.getBoundingClientRect().height + 16}px`);
+    updateToolbarOffset();
     if (!resizeFrame) resizeFrame = window.requestAnimationFrame(() => { resizeFrame = 0; resize(); });
   });
   observer.observe(scroller);
   observer.observe(toolbar);
-  canvasChanged(); setLayout("grid");
+  canvasChanged(); setLayout("grid"); updateToolbarOffset();
   function snapshot(): ReaderViewportSnapshot { return { view: getView(), fit, sidebarOpen, pageIndex: currentPage }; }
   function restore(state: ReaderViewportSnapshot): void {
     zoom = state.view.zoom; fit = state.fit; sidebarOpen = state.sidebarOpen; savedView = state.view; initialView = false;

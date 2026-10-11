@@ -42,7 +42,9 @@ const previousObserver = globalThis.ResizeObserver;
 globalThis.ResizeObserver = class { observe() {} disconnect() {} };
 
 class Element {
-  children = []; parentElement = null; style = {}; dataset = {}; attributes = new Map(); listeners = new Map();
+  children = []; parentElement = null;
+  style = { setProperty(name, value) { this[name] = String(value); }, getPropertyValue(name) { return this[name] ?? ""; } };
+  dataset = {}; attributes = new Map(); listeners = new Map();
   className = ""; hidden = false; value = ""; disabled = false; textContent = ""; title = "";
   width = 300; height = 150; captures = new Set(); _left = 0; _top = 0;
   constructor(tag, ownerDocument) { this.tagName = tag; this.ownerDocument = ownerDocument; }
@@ -81,13 +83,32 @@ class Element {
     const create = (tag, className, parent = this) => { const node = this.ownerDocument.createElement(tag); node.className = className; parent.append(node); return node; };
     if (html.includes("reader-toolbar")) {
       const toolbar = create("div", "reader-toolbar");
+      if (html.includes('id="reader-toolbar"')) toolbar.id = "reader-toolbar";
       create("div", "reader-primary-controls", toolbar); create("select", "reader-layout", toolbar);
       const reading = create("div", "reader-reading-controls", toolbar);
-      for (const action of ["thumbnails", "previous", "next", "zoom-out", "zoom-in", "fit-width", "fit-page", "find", "settings"]) {
+      const actions = ["thumbnails", "previous", "next", "zoom-out", "zoom-in", "fit-width", "fit-page", "find", "settings"];
+      if (html.includes('data-reader="hide-toolbar"')) actions.push("hide-toolbar");
+      for (const action of actions) {
         const button = create("button", "", toolbar); button.dataset.reader = action;
+        button.textContent = html.match(new RegExp(`<button\\b[^>]*data-reader="${action}"[^>]*>([^<]*)</button>`))?.[1] ?? "";
+        const markup = html.match(new RegExp(`<button\\b[^>]*data-reader="${action}"[^>]*>`))?.[0] ?? "";
+        for (const name of ["aria-controls", "aria-expanded"]) {
+          const attribute = markup.match(new RegExp(`${name}="([^"]+)"`));
+          if (attribute) button.setAttribute(name, attribute[1]);
+        }
       }
       create("input", "reader-page-number", reading); create("span", "reader-page-count", reading);
       create("input", "reader-zoom", reading); create("span", "reader-announcement", toolbar);
+      if (html.includes('data-reader="show-toolbar"')) {
+        const restore = create("button", "reader-toolbar-restore"); restore.dataset.reader = "show-toolbar";
+        const markup = html.match(/<button\b[^>]*data-reader="show-toolbar"[^>]*>/)[0];
+        restore.textContent = html.match(/<button\b[^>]*data-reader="show-toolbar"[^>]*>([^<]*)<\/button>/)?.[1] ?? "";
+        restore.hidden = /\bhidden\b/.test(markup);
+        for (const name of ["aria-controls", "aria-expanded"]) {
+          const attribute = markup.match(new RegExp(`${name}="([^"]+)"`));
+          if (attribute) restore.setAttribute(name, attribute[1]);
+        }
+      }
       const workspace = create("div", "reader-workspace");
       const sidebar = create("aside", "reader-thumbnails", workspace); sidebar.hidden = true;
       const scroller = create("div", "reader-scroll", workspace); create("div", "reader-surface", scroller);
@@ -123,8 +144,9 @@ class Element {
     return Number.parseFloat(this.style.width) || this.width;
   }
   get clientHeight() {
+    if (this.classList.contains("reader-toolbar")) return this.hidden ? 0 : 64;
     if (this.classList.contains("reader-scroll") || this.classList.contains("reader-thumbnails")) {
-      return this.hidden ? 0 : this.ownerDocument.viewportHeight - 64;
+      return this.hidden ? 0 : this.ownerDocument.viewportHeight - (this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64);
     }
     return Number.parseFloat(this.style.height) || this.height;
   }
@@ -143,8 +165,13 @@ class Element {
     return 12 + this.parentElement.children.slice(0, this.parentElement.children.indexOf(this)).reduce((top, row) => top + row.offsetHeight + 12, 0);
   }
   getBoundingClientRect() {
+    if (this.classList.contains("reader-toolbar")) {
+      return { left:0,top:0,width:this.ownerDocument.viewportWidth,height:this.clientHeight,
+        right:this.ownerDocument.viewportWidth,bottom:this.clientHeight };
+    }
     const scroller = this.ownerDocument.querySelector(".reader-scroll");
-    const left = this.ownerDocument.viewportWidth - (scroller?.clientWidth ?? this.clientWidth), top = 64;
+    const left = this.ownerDocument.viewportWidth - (scroller?.clientWidth ?? this.clientWidth);
+    const top = this.ownerDocument.querySelector(".reader-toolbar")?.clientHeight ?? 64;
     const width = Number.parseFloat(this.style.width) || scroller?.clientWidth || this.clientWidth;
     const height = Number.parseFloat(this.style.height) || scroller?.clientHeight || this.clientHeight;
     return { left, top, width, height, right: left + width, bottom: top + height };
@@ -167,6 +194,7 @@ function environment(width = 700, height = 800) {
   const document = { viewportWidth: width, viewportHeight: height, defaultView: window, activeElement: null,
     createElement: tag => new Element(tag, document), createDocumentFragment: () => new Element("fragment", document),
     querySelector: selector => document.body.querySelector(selector) };
+  document.documentElement = new Element("html", document);
   document.body = new Element("body", document);
   let canvas = document.createElement("canvas"); canvas.id = "viewport"; document.body.append(canvas);
   const views = [], requests = [];
@@ -238,6 +266,82 @@ try {
     assert.deepEqual(reader.getView(), replacementView, "canvas replacement removes old interaction handlers");
     env.canvas.emit("wheel", { ctrlKey: true, deltaY: -100, clientX: 300, clientY: 300 });
     assert(reader.getView().zoom > replacementView.zoom, "replacement canvas receives zoom controls");
+    reader.dispose();
+  }
+  {
+    const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
+    reader.setDocument({ identity:"toolbar-visibility",pageRects:pageRects(4) }); reader.setLayout("reader");
+    reader.setView({centerX:0,centerY:-1000,zoom:2});
+    const toolbar = doc.querySelector(".reader-toolbar"), scroller = doc.querySelector(".reader-scroll");
+    const hide = doc.querySelector('[data-reader="hide-toolbar"]'), show = doc.querySelector('[data-reader="show-toolbar"]');
+    assert(hide && show, "toolbar has hide and restore controls");
+    assert.equal(toolbar.id, "reader-toolbar");
+    assert.equal(show.getAttribute("aria-controls"), toolbar.id);
+    assert.equal(hide.getAttribute("aria-controls"), toolbar.id); assert.equal(hide.getAttribute("aria-expanded"), "true");
+    assert.equal(show.hidden, true); assert.equal(show.getAttribute("aria-expanded"), "false");
+    assert.equal(hide.textContent, "Hide toolbar"); assert.equal(show.textContent, "Show toolbar");
+    assert.equal(scroller.clientHeight, 736);
+    const original = reader.getView(), visibleSnapshot = reader.snapshot();
+    hide.focus(); hide.emit("click");
+    assert.equal(toolbar.hidden, true); assert.equal(show.hidden, false);
+    assert.equal(doc.activeElement, show, "hiding focuses the available restore control");
+    assert.equal(show.getAttribute("aria-expanded"), "false");
+    assert.equal(hide.getAttribute("aria-expanded"), "false");
+    assert.equal(scroller.clientHeight, 800, "hiding the whole toolbar expands the document viewport");
+    assert.equal(env.canvas.getBoundingClientRect().top, 0);
+    assert.equal(env.canvas.style.height, "800px");
+    const hiddenView = reader.getView();
+    close(hiddenView.centerX, original.centerX, "hiding retains the document's horizontal center");
+    close(hiddenView.centerY, original.centerY, "hiding retains the document's vertical center");
+    close(hiddenView.zoom, original.zoom, "hiding retains explicit zoom");
+    assert.equal(reader.snapshot().fit, null);
+    const hiddenOffset = doc.documentElement.style.getPropertyValue("--reader-toolbar-height");
+    assert.equal(hiddenOffset, "16px", "floating panels follow the collapsed toolbar offset");
+    reader.setLayout("grid");
+    assert(toolbar.hidden && !show.hidden, "toolbar visibility persists outside Reader");
+    reader.setLayout("reader");
+    close(reader.getView().centerY, original.centerY, "layout round trips retain the expanded viewport's reading position");
+    reader.restore(visibleSnapshot);
+    assert(toolbar.hidden && !show.hidden, "backend snapshot restoration preserves the current toolbar preference");
+    close(reader.getView().centerY, original.centerY, "snapshot restoration retains the reading anchor while hidden");
+    const oldCanvas = env.canvas; env.replaceCanvas(); reader.canvasChanged();
+    assert(toolbar.hidden && !show.hidden, "replacing the rendering canvas preserves toolbar visibility");
+    assert.equal(env.canvas.style.height, "800px");
+    close(reader.getView().zoom, original.zoom, "canvas replacement retains explicit zoom");
+    oldCanvas.emit("wheel", {ctrlKey:true,deltaY:-100,clientX:300,clientY:300});
+    close(reader.getView().zoom, original.zoom, "hidden toolbar does not retain old canvas interaction handlers");
+    show.emit("click");
+    assert.equal(toolbar.hidden, false); assert.equal(show.hidden, true);
+    assert.equal(doc.activeElement, hide, "restoring returns focus to the hide control");
+    assert.equal(show.getAttribute("aria-expanded"), "true"); assert.equal(hide.getAttribute("aria-expanded"), "true");
+    assert.equal(scroller.clientHeight, 736); assert.equal(env.canvas.getBoundingClientRect().top, 64);
+    assert.equal(env.canvas.style.height, "736px");
+    close(reader.getView().centerY, original.centerY, "restoring retains the document's vertical center");
+    close(reader.getView().zoom, original.zoom, "restoring retains explicit zoom");
+    assert.equal(doc.documentElement.style.getPropertyValue("--reader-toolbar-height"), "80px");
+    hide.emit("click"); reader.setDocument({identity:"replacement-with-hidden-toolbar",pageRects:pageRects(2)});
+    assert(toolbar.hidden && !show.hidden, "opening another document preserves toolbar visibility");
+    assert.equal(scroller.clientHeight, 800); assert.equal(env.canvas.style.height, "800px");
+    show.emit("click"); assert.equal(doc.activeElement, hide);
+    reader.dispose();
+  }
+  for (const [action, mode] of [["fit-width","width"],["fit-page","page"]]) {
+    const env = environment(), reader = createReaderViewport(env.options), doc = env.document;
+    reader.setDocument({identity:`toolbar-${mode}`,pageRects:pageRects(4)}); reader.setLayout("reader");
+    reader.goToPage(1); doc.querySelector(`[data-reader="${action}"]`).emit("click");
+    const original = reader.getView();
+    doc.querySelector('[data-reader="hide-toolbar"]').emit("click");
+    const expanded = reader.getView();
+    close(expanded.centerX, original.centerX, `${mode} fit retains horizontal document center when toolbar hides`);
+    close(expanded.centerY, original.centerY, `${mode} fit retains vertical document center when toolbar hides`);
+    close(expanded.zoom, Math.min((700-48)/600, mode === "page" ? (800-48)/800 : Infinity),
+      `${mode} fit uses the expanded viewport`);
+    assert.equal(reader.snapshot().fit, mode, "toolbar visibility does not change fit mode");
+    assert.equal(doc.querySelector(".reader-page-number").value, "2", "toolbar resizing retains the explicitly selected page");
+    doc.querySelector('[data-reader="show-toolbar"]').emit("click");
+    close(reader.getView().centerY, original.centerY, `${mode} fit restores the document center`);
+    close(reader.getView().zoom, original.zoom, `${mode} fit restores the toolbar-height zoom`);
+    assert.equal(reader.snapshot().fit, mode); assert.equal(doc.querySelector(".reader-page-number").value, "2");
     reader.dispose();
   }
   {
@@ -434,7 +538,7 @@ try {
       assert.deepEqual([...scene.rasterLayers[0].data], [255,0,0,255], "thumbnail replay preserves canonical document pixels");
     } finally { reader.dispose(); }
   }
-  console.log("Reader viewport: scroll/camera mapping, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
+  console.log("Reader viewport: scroll/camera mapping, toolbar visibility, zoom anchors, sidebar/layout restore, gestures, canvas replacement, lazy thumbnails, cancellation, local failures and GPU-to-2D copies passed.");
 } finally {
   globalThis.ResizeObserver = previousObserver; delete globalThis.__readerViewportGpu; hooks.deregister();
 }
