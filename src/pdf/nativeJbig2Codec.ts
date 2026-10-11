@@ -1,5 +1,6 @@
 import type { NativeImageCodecRequest, NativeImageCodecResult } from "./nativeImage";
 import { PdfError, throwIfAborted } from "./nativeTypes";
+import { registerNativeFontPostScriptJbig2Codec } from "./nativeFontPostScriptCodecs";
 import { JBIG2_MAX_WORK, preflightJbig2, stripJbig2FileHeader } from "./codecs/jbig2Preflight";
 import { tryDecodeJbig2Symbols } from "./codecs/jbig2SymbolKernel";
 import { decodePdfiumJbig2, decodePdfiumJbig2Sync, preparePdfiumJbig2 } from "./codecs/jbig2Wasm";
@@ -11,6 +12,8 @@ export async function prepareBundledJbig2Codec(signal?: AbortSignal): Promise<vo
     if (cause instanceof PdfError) throw cause;
     throw codecError("Unable to prepare the bundled JBIG2 codec.", "codec-load-failed", cause);
   }
+  throwIfAborted(signal);
+  registerNativeFontPostScriptJbig2Codec({ decodeBundledJbig2Sync });
 }
 
 /** Same validated codec as PDF images, after asynchronous document preparation. */

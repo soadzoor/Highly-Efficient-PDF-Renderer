@@ -49,9 +49,7 @@ import {
   type NativeType1ParserLimits
 } from "./nativeType1";
 import { transformNativeGlyphPostScriptPaints, transformNativeGlyphPostScriptFinalState } from "./nativeFontPostScriptGraphics";
-import { prepareBundledJpegCodec } from "./nativeJpegCodec";
-import { prepareBundledJpxCodec } from "./nativeJpxCodec";
-import { prepareBundledJbig2Codec } from "./nativeJbig2Codec";
+import { prepareNativeFontPostScriptCodecs } from "./nativeFontPostScriptCodecs";
 
 /** Minimal resolver surface needed by the font engine. */
 export interface NativePdfFontResolver {
@@ -3132,11 +3130,11 @@ async function preparePostScriptFontCodecs<T extends { readonly usesPostScript: 
   try { font = parse(); }
   catch (error) {
     if (!(error instanceof PdfError) || error.code !== "unsupported-font" || error.details?.reason !== "font-postscript-codec-not-prepared") throw error;
-    await Promise.all([prepareBundledJpegCodec(signal), prepareBundledJbig2Codec(signal), prepareBundledJpxCodec(signal)]);
+    await prepareNativeFontPostScriptCodecs(signal);
     return parse();
   }
   if (!font.usesPostScript) return font;
-  try { await Promise.all([prepareBundledJpegCodec(signal), prepareBundledJbig2Codec(signal), prepareBundledJpxCodec(signal)]); }
+  try { await prepareNativeFontPostScriptCodecs(signal); }
   catch (error) {
     // An unavailable optional image codec must not prevent ordinary font-local
     // vector programs from opening. Actual DCT uses retain typed diagnostics.

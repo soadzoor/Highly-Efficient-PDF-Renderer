@@ -1,5 +1,6 @@
 import type { NativeImageCodecRequest, NativeImageCodecResult } from "./nativeImage";
 import { PdfError, throwIfAborted } from "./nativeTypes";
+import { registerNativeFontPostScriptJpxCodec } from "./nativeFontPostScriptCodecs";
 import OpenJPEG from "./codecs/openJpegKernel";
 
 export const BUNDLED_JPX_CODEC_ASSET = Object.freeze({
@@ -33,6 +34,7 @@ export async function prepareBundledJpxCodec(signal?: AbortSignal): Promise<void
     throw codecError("Unable to prepare the bundled JPEG 2000 codec.", "codec-load-failed", cause);
   }
   throwIfAborted(signal);
+  registerNativeFontPostScriptJpxCodec({ readJpxProperties, decodeBundledJpxRawSync });
 }
 
 /** Focused OpenJPEG kernel, loaded only for JPEG 2000 images. */

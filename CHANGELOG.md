@@ -36,6 +36,8 @@ moves those notes into a dated version section and uses them for the GitHub Rele
   while retaining vector mesh geometry in HEP files.
 - Preserve more font-local image interpolation, composite glyph state,
   transformed paints, nonunit CIE shading ranges and CMYK profile information.
+- Keep JPEG 2000 and JBIG2 decoders loaded on demand when using embedded font
+  programs, avoiding extra code in the parser worker's initial load.
 - Build releases after the version bump so the viewer displays the new version.
 
 ### Upgrade notes and limitations

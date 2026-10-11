@@ -1,4 +1,4 @@
-import { decodeBundledJpxRawSync, readJpxProperties } from "./nativeJpxCodec";
+import { requireNativeFontPostScriptJpxCodec } from "./nativeFontPostScriptCodecs";
 import { PdfError, throwIfAborted } from "./nativeTypes";
 
 /** Ghostscript's JPXDecode extension returns packed, row-padded color samples
@@ -8,6 +8,7 @@ export function decodeNativeFontPostScriptJpx(encoded: Uint8Array, parameters: {
   readonly Alpha?: boolean; readonly ColorSpace?: string;
 }, maxBytes: number, signal?: AbortSignal): Uint8Array {
   throwIfAborted(signal);
+  const { decodeBundledJpxRawSync, readJpxProperties } = requireNativeFontPostScriptJpxCodec();
   const properties = readJpxProperties(encoded), { components } = properties;
   const width = Math.max(...properties.samples.map(sample => sample.width)), height = Math.max(...properties.samples.map(sample => sample.height));
   const precision = properties.samples[0].precision, bits = precision === 12 ? 16 : precision;

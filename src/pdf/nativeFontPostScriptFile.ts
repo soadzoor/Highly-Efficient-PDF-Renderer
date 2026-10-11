@@ -5,7 +5,7 @@ import { decodeNativeCcittFaxSource } from "./nativeCcitt";
 import type { NativeCcittParameters } from "./nativeCcitt";
 import { decodeBundledJpegSync } from "./nativeJpegCodec";
 import { decodeNativeFontPostScriptJpx } from "./nativeFontPostScriptJpx";
-import { decodeBundledJbig2Sync } from "./nativeJbig2Codec";
+import { requireNativeFontPostScriptJbig2Codec } from "./nativeFontPostScriptCodecs";
 import { stripJbig2FileHeader } from "./codecs/jbig2Preflight";
 
 export interface NativeFontPostScriptFileOptions {
@@ -470,7 +470,7 @@ class ImageCodecFile extends InputFile {
           const { width, height } = readJbig2Dimensions(encoded, this.options.signal);
           const outputBytes = Math.ceil(width / 8) * height;
           if (!Number.isSafeInteger(outputBytes) || outputBytes > (this.options.maxDecodedBytes ?? Number.MAX_SAFE_INTEGER)) throw limited();
-          this.output = decodeBundledJbig2Sync({ codec: "jbig2", encoded, globals: new Uint8Array(), width, height,
+          this.output = requireNativeFontPostScriptJbig2Codec().decodeBundledJbig2Sync({ codec: "jbig2", encoded, globals: new Uint8Array(), width, height,
             components: 1, bitsPerComponent: 1, imageMask: false, decodeParameters: {} }, Number.MAX_SAFE_INTEGER, this.options.signal).samples;
         } else {
           this.output = decodeBundledJpegSync(this.encoded ??= readJpegThroughEoi(this.source!, this.options.signal),
